@@ -1,0 +1,255 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-09-04T20:57:18.497942+00:00",
+  "title": "Design System: Relay native",
+  "extensions": {
+    "colorMeta": {
+      "wall": {
+        "role": "neutral",
+        "displayName": "Wall",
+        "tonalRamp": [
+          "oklch(15.00% 0.00415 285.94)",
+          "oklch(26.43% 0.00415 285.94)",
+          "oklch(37.86% 0.00415 285.94)",
+          "oklch(49.29% 0.00415 285.94)",
+          "oklch(60.71% 0.00415 285.94)",
+          "oklch(72.14% 0.00415 285.94)",
+          "oklch(83.57% 0.00415 285.94)",
+          "oklch(95.00% 0.00415 285.94)"
+        ]
+      },
+      "console": {
+        "role": "neutral",
+        "displayName": "Console",
+        "tonalRamp": [
+          "oklch(15.00% 0.00399 286.02)",
+          "oklch(26.43% 0.00399 286.02)",
+          "oklch(37.86% 0.00399 286.02)",
+          "oklch(49.29% 0.00399 286.02)",
+          "oklch(60.71% 0.00399 286.02)",
+          "oklch(72.14% 0.00399 286.02)",
+          "oklch(83.57% 0.00399 286.02)",
+          "oklch(95.00% 0.00399 286.02)"
+        ]
+      },
+      "slab": {
+        "role": "neutral",
+        "displayName": "Slab",
+        "tonalRamp": [
+          "oklch(15.00% 0.00577 285.92)",
+          "oklch(26.43% 0.00577 285.92)",
+          "oklch(37.86% 0.00577 285.92)",
+          "oklch(49.29% 0.00577 285.92)",
+          "oklch(60.71% 0.00577 285.92)",
+          "oklch(72.14% 0.00577 285.92)",
+          "oklch(83.57% 0.00577 285.92)",
+          "oklch(95.00% 0.00577 285.92)"
+        ]
+      },
+      "wash": {
+        "role": "neutral",
+        "displayName": "Wash",
+        "tonalRamp": [
+          "oklch(15.00% 0.00743 285.87)",
+          "oklch(26.43% 0.00743 285.87)",
+          "oklch(37.86% 0.00743 285.87)",
+          "oklch(49.29% 0.00743 285.87)",
+          "oklch(60.71% 0.00743 285.87)",
+          "oklch(72.14% 0.00743 285.87)",
+          "oklch(83.57% 0.00743 285.87)",
+          "oklch(95.00% 0.00743 285.87)"
+        ]
+      },
+      "screen": {
+        "role": "neutral",
+        "displayName": "Screen",
+        "tonalRamp": [
+          "oklch(15.00% 0.00213 286.13)",
+          "oklch(26.43% 0.00213 286.13)",
+          "oklch(37.86% 0.00213 286.13)",
+          "oklch(49.29% 0.00213 286.13)",
+          "oklch(60.71% 0.00213 286.13)",
+          "oklch(72.14% 0.00213 286.13)",
+          "oklch(83.57% 0.00213 286.13)",
+          "oklch(95.00% 0.00213 286.13)"
+        ]
+      },
+      "ink": {
+        "role": "primary",
+        "displayName": "Ink",
+        "tonalRamp": [
+          "oklch(15.00% 0.00267 106.45)",
+          "oklch(26.43% 0.00267 106.45)",
+          "oklch(37.86% 0.00267 106.45)",
+          "oklch(49.29% 0.00267 106.45)",
+          "oklch(60.71% 0.00267 106.45)",
+          "oklch(72.14% 0.00267 106.45)",
+          "oklch(83.57% 0.00267 106.45)",
+          "oklch(95.00% 0.00267 106.45)"
+        ]
+      },
+      "secondary": {
+        "role": "neutral",
+        "displayName": "Secondary",
+        "tonalRamp": [
+          "oklch(15.00% 0.00285 106.47)",
+          "oklch(26.43% 0.00285 106.47)",
+          "oklch(37.86% 0.00285 106.47)",
+          "oklch(49.29% 0.00285 106.47)",
+          "oklch(60.71% 0.00285 106.47)",
+          "oklch(72.14% 0.00285 106.47)",
+          "oklch(83.57% 0.00285 106.47)",
+          "oklch(95.00% 0.00285 106.47)"
+        ]
+      },
+      "edge": {
+        "role": "neutral",
+        "displayName": "Edge",
+        "tonalRamp": [
+          "oklch(15.00% 0.00737 285.89)",
+          "oklch(26.43% 0.00737 285.89)",
+          "oklch(37.86% 0.00737 285.89)",
+          "oklch(49.29% 0.00737 285.89)",
+          "oklch(60.71% 0.00737 285.89)",
+          "oklch(72.14% 0.00737 285.89)",
+          "oklch(83.57% 0.00737 285.89)",
+          "oklch(95.00% 0.00737 285.89)"
+        ]
+      },
+      "live": {
+        "role": "secondary",
+        "displayName": "Live",
+        "tonalRamp": [
+          "oklch(15.00% 0.17834 151.37)",
+          "oklch(26.43% 0.17834 151.37)",
+          "oklch(37.86% 0.17834 151.37)",
+          "oklch(49.29% 0.17834 151.37)",
+          "oklch(60.71% 0.17834 151.37)",
+          "oklch(72.14% 0.17834 151.37)",
+          "oklch(83.57% 0.17834 151.37)",
+          "oklch(95.00% 0.17834 151.37)"
+        ]
+      },
+      "held": {
+        "role": "secondary",
+        "displayName": "Held",
+        "tonalRamp": [
+          "oklch(15.00% 0.21061 28.51)",
+          "oklch(26.43% 0.21061 28.51)",
+          "oklch(37.86% 0.21061 28.51)",
+          "oklch(49.29% 0.21061 28.51)",
+          "oklch(60.71% 0.21061 28.51)",
+          "oklch(72.14% 0.21061 28.51)",
+          "oklch(83.57% 0.21061 28.51)",
+          "oklch(95.00% 0.21061 28.51)"
+        ]
+      },
+      "waiting": {
+        "role": "secondary",
+        "displayName": "Waiting",
+        "tonalRamp": [
+          "oklch(15.00% 0.15428 75.63)",
+          "oklch(26.43% 0.15428 75.63)",
+          "oklch(37.86% 0.15428 75.63)",
+          "oklch(49.29% 0.15428 75.63)",
+          "oklch(60.71% 0.15428 75.63)",
+          "oklch(72.14% 0.15428 75.63)",
+          "oklch(83.57% 0.15428 75.63)",
+          "oklch(95.00% 0.15428 75.63)"
+        ]
+      }
+    },
+    "shadows": [],
+    "motion": [],
+    "breakpoints": []
+  },
+  "components": [
+    {
+      "name": "Key",
+      "kind": "button",
+      "refersTo": "button",
+      "description": "Static HTML translation of the native GTK key; GTK owns production sizing and behavior.",
+      "html": "<button class=\"ds-button\">Reconnect</button>",
+      "css": ".ds-button{font-family:\"Fira Sans\",\"Noto Sans\",sans-serif;font-size:12px;min-height:28px;padding:0 10px;border:0;border-radius:2px;box-shadow:none;background:#1b1b1e;color:#ececea}.ds-button:hover{background:#232327;color:#ececea}.ds-button:focus-visible{outline:2px solid #ececea;outline-offset:-2px}.ds-button:disabled{opacity:.45}"
+    },
+    {
+      "name": "Primary key",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Static HTML translation of the native GTK key; GTK owns production sizing and behavior.",
+      "html": "<button class=\"ds-button-primary\">+ Session</button>",
+      "css": ".ds-button-primary{font-family:\"Fira Sans\",\"Noto Sans\",sans-serif;font-size:12px;min-height:28px;padding:0 10px;border:0;border-radius:2px;box-shadow:none;background:#ececea;color:#0e0e10}.ds-button-primary:hover{background:white;color:#0e0e10}.ds-button-primary:focus-visible{outline:2px solid #ececea;outline-offset:-2px}.ds-button-primary:disabled{opacity:.45}"
+    },
+    {
+      "name": "Quiet key",
+      "kind": "button",
+      "refersTo": "button-quiet",
+      "description": "Static HTML translation of the native GTK key; GTK owns production sizing and behavior.",
+      "html": "<button class=\"ds-button-quiet\">Reconnect</button>",
+      "css": ".ds-button-quiet{font-family:\"Fira Sans\",\"Noto Sans\",sans-serif;font-size:12px;min-height:28px;padding:0 10px;border:0;border-radius:2px;box-shadow:none;background:transparent;color:#a5a5a3}.ds-button-quiet:hover{background:#232327;color:#ececea}.ds-button-quiet:focus-visible{outline:2px solid #ececea;outline-offset:-2px}.ds-button-quiet:disabled{opacity:.45}"
+    },
+    {
+      "name": "Text entry",
+      "kind": "input",
+      "refersTo": "field",
+      "description": "Visual translation of a GTK entry; native editing and sizing remain GTK-owned.",
+      "html": "<input class=\"ds-field\" aria-label=\"Session name\" placeholder=\"Session name\">",
+      "css": ".ds-field{background:#0a0a0b;color:#ececea;caret-color:#ececea;border:1px solid #252529;border-radius:2px;min-height:30px;font:13px \"Fira Sans\",\"Noto Sans\",sans-serif}.ds-field:focus-visible{outline:none;border-color:#a5a5a3}"
+    },
+    {
+      "name": "Sidebar navigation",
+      "kind": "nav",
+      "refersTo": "navigation",
+      "description": "Square native rows with a selected neutral wash.",
+      "html": "<nav class=\"ds-nav\"><button aria-current=\"page\">Dashboard</button><button>Code</button><button>Board</button></nav>",
+      "css": ".ds-nav{background:#141416;width:200px}.ds-nav button{display:block;width:100%;text-align:left;background:transparent;color:#a5a5a3;border:0;border-radius:0;min-height:30px;padding:0 10px;font:12px \"Fira Sans\",\"Noto Sans\",sans-serif}.ds-nav button:hover,.ds-nav button[aria-current]{background:#232327;color:#ececea}.ds-nav button:focus-visible{outline:2px solid #ececea;outline-offset:-2px}"
+    },
+    {
+      "name": "Record",
+      "kind": "card",
+      "refersTo": "record",
+      "description": "Flat, noninteractive native record container; action keys live inside it.",
+      "html": "<article class=\"ds-record\">Review native foundation</article>",
+      "css": ".ds-record{background:#1b1b1e;color:#ececea;border-radius:0;padding:12px;font:13px \"Fira Sans\",\"Noto Sans\",sans-serif}"
+    },
+    {
+      "name": "Live terminal plate",
+      "kind": "custom",
+      "refersTo": "terminal-plate",
+      "description": "Static anatomy preview of the top 26px UMD strip and neutral frame. Production rendering uses separate GTK widgets and VTE.",
+      "html": "<section class=\"ds-plate\"><header class=\"ds-strip\"><span class=\"ds-lamp\" aria-label=\"Running\">\u25cf</span><strong>proud-otter</strong><span>codex \u00b7 builder</span><span>RUNNING</span></header><pre class=\"ds-output\">Session: proud-otter\nReady for input</pre></section>",
+      "css": ".ds-plate{background:#0a0a0b;color:#ececea;border:1px solid #252529;border-radius:0}.ds-output{min-height:140px;margin:8px 2px 4px 10px;font:10pt \"Fira Mono\",monospace;white-space:pre-wrap}.ds-strip{display:flex;align-items:center;gap:8px;min-height:26px;padding:0 8px;background:#141416;border-bottom:1px solid #252529;font:12px \"Fira Sans\",\"Noto Sans\",sans-serif}.ds-strip strong{flex:1;font-weight:600}.ds-strip span{color:#a5a5a3}.ds-strip .ds-lamp{color:#2ec469}"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Multiviewer",
+    "overview": "Relay is a compact console surrounding a wall of agent terminals. Screen-black\nplates, narrow gutters and persistent top identity strips make sessions\nreadable at a glance. In Operate mode, terminal work and attention states lead.\n\nVisual authority is Relay-2 at `1745dd3f68b7bc786f48142ad7da591537aeb057`, especially\nits `theme.ts`, `TerminalPane.svelte`, `AgentsWall.svelte`, `Icon.svelte` and\nshell components. Rendered component anatomy takes precedence over stale prose. The user\nexplicitly requested this identity and layout; V3's UI is not the reference.\nThe native theme lives in `apps/relay-native/src/theme.css`, with runtime palette\nand wallpaper application in `shell.rs`. This records the implemented GTK4\nsurfaces; it does not certify complete feature parity, visual fidelity or device\nruntime behavior. Validation and remaining coverage belong in\n`docs/VERIFICATION.md` and `docs/PARITY.md`.",
+    "keyCharacteristics": [
+      "Screen-black square plates with top session identity strips.",
+      "Compact neutral console, off-white primary keys and state-only color.",
+      "Fira reading text, condensed labels and monospace terminals.",
+      "Native GTK controls, VTE terminals and GtkSourceView source editing.",
+      "Sidebar navigation, worktree tools and persistent note tabs/satellites.",
+      "Matte, Dark and OLED palettes with optional wallpaper controls."
+    ],
+    "rules": [
+      {
+        "name": "The Tally Rule",
+        "body": "Chrome color communicates state. Primary actions stay off-white; ANSI and syntax colors remain inside their content surfaces.",
+        "section": "colors"
+      }
+    ],
+    "dos": [
+      "Do preserve the compact console and square terminal plate anatomy.",
+      "Do keep session identity visible above terminal content in its top strip.",
+      "Do use off-white primary keys and state color only where it has meaning.",
+      "Do preserve native keyboard focus, selection and clipboard behavior."
+    ],
+    "donts": [
+      "Don't add decorative accent colors, pill surfaces or idle animation.",
+      "Don't copy web layout rules into GTK without checking native behavior.",
+      "Don't treat imported roadmap surfaces as implemented UI.",
+      "Don't claim full parity, sustained performance or complete accessibility from screenshots alone."
+    ]
+  }
+}

@@ -46,12 +46,13 @@ impl Instance {
     pub fn accepts_test_actor(self) -> bool {
         !matches!(self, Instance::Stable)
     }
-    /// `~/.local/share/relay/<instance>/`
+    /// V4 is isolated from the Relay-2/V3 engine and store.
+    /// `~/.local/share/relay-v4/<instance>/`
     pub fn data_dir(self) -> PathBuf {
         let base = directories::BaseDirs::new()
             .map(|b| b.data_local_dir().to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."));
-        base.join("relay").join(self.as_str())
+        base.join("relay-v4").join(self.as_str())
     }
     pub fn store_path(self) -> PathBuf {
         self.data_dir().join("store.db")
@@ -62,15 +63,15 @@ impl Instance {
     pub fn log_dir(self) -> PathBuf {
         self.data_dir().join("logs")
     }
-    /// `$XDG_RUNTIME_DIR/relay/` (falls back to `/tmp/relay-<uid>/`).
+    /// `$XDG_RUNTIME_DIR/relay-v4/` (falls back to `/tmp/relay-v4-<uid>/`).
     pub fn runtime_dir(self) -> PathBuf {
         let base = directories::BaseDirs::new()
             .and_then(|b| b.runtime_dir().map(|p| p.to_path_buf()))
             .unwrap_or_else(|| {
                 let uid = unsafe { libc::getuid() };
-                std::env::temp_dir().join(format!("relay-{uid}"))
+                std::env::temp_dir().join(format!("relay-v4-{uid}"))
             });
-        base.join("relay")
+        base.join("relay-v4")
     }
     pub fn socket_path(self) -> PathBuf {
         self.runtime_dir().join(format!("{}.sock", self.as_str()))

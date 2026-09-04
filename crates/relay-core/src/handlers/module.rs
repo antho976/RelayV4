@@ -143,7 +143,19 @@ pub fn register(e: &mut Engine) {
         })
     });
     e.register::<List>(|ctx,p|{crate::handlers::workspace::get_project(ctx.tx(),p.project_id)?;let sql=if p.include_archived.unwrap_or(false){"SELECT * FROM modules WHERE project_id=?1 AND deleted_at IS NULL ORDER BY completed_at IS NOT NULL,ord,id"}else{"SELECT * FROM modules WHERE project_id=?1 AND deleted_at IS NULL AND completed_at IS NULL ORDER BY ord,id"};let mut stmt=ctx.tx().prepare(sql).bus()?;let modules=stmt.query_map([p.project_id],module_row).bus()?.collect::<rusqlite::Result<Vec<_>>>().bus()?.into_iter().map(|m|summary(ctx.tx(),m)).collect::<Result<Vec<_>,_>>()?;Ok(ListOut{modules,header:header(ctx.tx(),p.project_id)?})});
-    e.register::<Update>(|ctx:&mut Ctx,p|{let before=get_module(ctx.tx(),p.module_id,false)?;let name=p.name.as_deref().unwrap_or(&before.name).trim();if name.is_empty(){return Err(BusError::invalid("module.name","module name cannot be empty"))}let icon=p.icon.unwrap_or(before.icon.clone());ctx.tx().execute("UPDATE modules SET name=?1,icon=?2,priority=?3,ord=?4,updated_at=?5 WHERE id=?6",params![name,icon,priority_str(p.priority.unwrap_or(before.priority)),p.order.unwrap_or(before.order),ctx.now,before.id]).bus()?;let module=get_module(ctx.tx(),before.id,false)?;ctx.set_undo("module.update",json!({"module_id":before.id,"name":before.name,"icon":before.icon,"priority":priority_str(before.priority),"order":before.order}),Some(json!({"updated_at":module.updated_at})));emit_module(ctx,&module)?;Ok(module)});
+    e.register::<Update>(|ctx:&mut Ctx,p|{let before=get_module(ctx.tx(),p.module_id,false)?;
+        if let Some(expected) = &p.expected {
+            let current = serde_json::to_value(&before).bus()?;
+            for (field, value) in expected {
+                if !["name", "icon", "priority", "order"].contains(&field.as_str()) {
+                    return Err(BusError::invalid("module.expected_field", format!("{field} is not an editable module field")));
+                }
+                if current.get(field) != Some(value) {
+                    return Err(BusError::conflict("module.edit_conflict", format!("Module {field} changed elsewhere; your draft was not saved")));
+                }
+            }
+        }
+        let name=p.name.as_deref().unwrap_or(&before.name).trim();if name.is_empty(){return Err(BusError::invalid("module.name","module name cannot be empty"))}let icon=p.icon.unwrap_or(before.icon.clone());ctx.tx().execute("UPDATE modules SET name=?1,icon=?2,priority=?3,ord=?4,updated_at=?5 WHERE id=?6",params![name,icon,priority_str(p.priority.unwrap_or(before.priority)),p.order.unwrap_or(before.order),ctx.now,before.id]).bus()?;let module=get_module(ctx.tx(),before.id,false)?;ctx.set_undo("module.update",json!({"module_id":before.id,"name":before.name,"icon":before.icon,"priority":priority_str(before.priority),"order":before.order}),Some(json!({"updated_at":module.updated_at})));emit_module(ctx,&module)?;Ok(module)});
     e.register::<Complete>(|ctx: &mut Ctx, p| {
         let before = get_module(ctx.tx(), p.module_id, false)?;
         if before.completed_at.is_some() {

@@ -1,112 +1,101 @@
-# Native rebuild verification
+# Native parity verification
 
 Verified on 2026-09-04 on the local Linux desktop, using GTK 4.22.4,
 VTE 0.84.1 and GtkSourceView 5.20.0.
 
-## UI parity follow-up
+## Integration of the UI parity pass
 
-The shell now follows the pinned Relay-2 TopBar, Sidebar, TerminalPane,
-StatusBar and Board card geometry more closely. Page navigation moved into
-the sidebar, projects are grouped by workspace, used icons preserve Relay-2's
-SVG paths, terminal labels sit above the screens, and state uses small tally
-lights. The Board has full-height bordered lanes, task IDs and agent rows.
-The launch sheet overlays the wall instead of expanding a compact window.
-
-Follow-up checks: native build, both native unit tests, native Clippy with
-warnings denied, formatting and diff whitespace checks. The display harness
-covers eight captures at 1440×900 and 1024×768, including three columns with the
-sidebar hidden and the compact launch sheet. Assertions cover actual capture
-size, long project names, sidebar toggling, all three layout controls, retained
-terminal widgets, a visible launch form and disabled background controls.
-The existing six-provider paste/echo, window-close survival and editor-save
-checks remain in the harness. Run one affected view with
-`python3 scripts/native-smoke.py launch`, or omit arguments for the whole run.
-
-The generic design detector flags the selected project's 2px white edge;
-this intentionally matches Relay-2 Sidebar.svelte. There are no stylesheet
-parsing errors. The host AT-SPI registry failure remains, so screen-reader
-operation is still unverified.
-
-This is a UI parity increment. Missing native pages and richer Relay-2 flows
-listed below still prevent a full 1:1 claim. GTK window controls and editor
-highlighting still use native styling.
+The UI pass is integrated with the expanded native workflows. The merge retains
+Relay-V4's isolated engine/store, launch recovery, task/note editing, device
+ownership, saved layouts and worktree tools. Compact shell styling, CSS-colored
+Relay-2 icons, top terminal metadata, Board card styling and the launch overlay
+are adapted to those implementations. The smoke harness includes long repository
+names, retained panes across Grid/Focus/Review, exact screenshot dimensions, and
+a compact launch preview alongside the upstream edit/launch/burst checks.
 
 ## Automated checks
 
 | Check | Result |
 | --- | --- |
 | `cargo build -p relay-native -p relay-cli --offline` | Passed |
-| `cargo test --workspace --offline` | 162 passed, 1 ignored |
+| `cargo test --workspace --offline` | 173 passed, 1 ignored |
 | `cargo fmt -p relay-native --check` | Passed |
-| `cargo clippy -p relay-native --all-targets --offline -- -D warnings` | Passed |
-| Generated bus schema drift test | Passed with `guardrail.hold.get` included |
+| `cargo clippy -p relay-native --all-targets --offline -- -D warnings -A deprecated` | Passed |
+| Generated bus schema drift test | Passed |
 | `python3 scripts/native-smoke.py` | Passed |
+| `python3 scripts/test-launcher.py` | Passed |
+| `python3 scripts/test-launcher-real.py` | Passed |
 
-Tests cover the inherited agent surface, mailbox, priority hints, claims,
-role gates, review groups, guardrails, sessions and task lifecycle. The new
-hold-inspection assertions verify the frozen payload, open state, token
-removal and agent refusal. Native tests cover response correlation with
-interleaved events, cancellation on disconnect, and terminal sequence handling.
+The launcher regression test opens the actual GTK window twice with an isolated
+engine and a legacy socket present. Both windows verify their engine connection,
+the second launch reuses the same process, and all data stays under `relay-v4`.
+A stale `RELAY_NATIVE_SOCKET` is cleared. The workspace suite was rerun after
+separating V4's engine socket and store from Relay-2/V3.
 
-This machine has `/tmp/.git`, which contaminates an inherited workspace
-discovery test. The successful full run used `TMPDIR=/dev/shm`; no production
-behavior or assertions were changed to conceal that environment condition.
-The tests need permission to create local sockets and launch fixture processes.
+The inherited engine tests cover agent roles, mailbox priority, review groups,
+claims, guardrails, task approvals, provider lifecycle and native bus contracts.
+New tests cover atomic expected-field updates (including concurrent writers),
+expected-content file saves, assignment recovery after partial launch, mirror
+socket cleanup, watcher ownership and input-overflow reset. Native tests also
+cover transport correlation, terminal sequence handling, draft conflicts,
+shortcuts, decoder dimensions and generated audio samples.
+
+GTK's ComboBoxText and Dialog APIs remain supported in the pinned GTK4 version
+but are deprecated. The native lint command permits those deprecation warnings;
+this is not a clean default `-D warnings` result.
+
+Tests requiring Unix sockets and fixture subprocesses ran outside the restricted
+sandbox. Its synthetic `/tmp/.git` also changes one inherited workspace-discovery
+fixture's ancestry. No production behavior or test expectation was changed to
+hide those environment restrictions.
 
 ## Display and interaction evidence
 
-The smoke harness starts an isolated engine with a temporary repository and
-six fake provider processes. No paid provider or user store is used.
+The harness creates a disposable engine, store, repositories and fake providers.
+It captures the wall at 1440×900 and 1024×768, plus Board, Mailbox, Guardrails,
+Code, Notes, Plan, Modules, Settings, Skills, Dashboard, Notifications and Devices.
 
-- Captured the terminal wall at 1440×900 and 1024×768.
-- Captured Board, Mailbox, Guardrails and Code. Code includes a loaded,
-  highlighted README and an edit saved through `file.write`.
-- Sent paste text through each VTE widget and verified the provider's echo in
-  engine scrollback for all six sessions.
-- Asserted the editor disables editing, Save and Discard during load/save.
-- Confirmed all six sessions remain running after native windows close, then
-  parked the disposable fixture processes.
-- The final CSS produced no parsing errors and the application did not panic.
+It verifies:
 
-Screenshots and logs are local artifacts in `.impeccable/review/`. The host's
-AT-SPI registry service failed to activate and GTK logged accessibility-bus
-warnings. Screen-reader operation is therefore **not verified**. No desktop
-accessibility settings were changed.
+- Native task and note edits are saved through their real controls.
+- GtkSourceView saves an edited README into the selected checkout.
+- Six initial VTE widgets send paste input and receive provider echoes.
+- The native launch sheet creates two builders and a reviewer with one shared
+  worktree and a staged task queue.
+- All eleven fixture sessions remain alive after native windows close.
+- Eleven simultaneous bursts of 2,048 lines each reach native VTE tail markers
+  within a five-second completion budget. This checks delivery to the renderer,
+  not only bytes received by the engine.
+
+Screenshots/logs are local artifacts in `.impeccable/review/`. The host AT-SPI
+registry failed to activate, so screen-reader operation remains unverified.
+No desktop accessibility settings were changed.
 
 ## Performance evidence and limits
 
-The final smoke run measured the native client, with six quiet fixture
-terminals, for one three-second interval after startup: **0.0% CPU at the
-kernel tick resolution, 213.8 MiB RSS**. An earlier run measured 276.1 MiB RSS.
-These are short debug-build observations, not stable benchmark distributions.
-They exclude the engine and agent processes. The fixture's output is quiet,
-so this does not establish throughput, input-latency percentiles, startup
-budgets, or eleven-pane sustained streaming performance.
+A three-second sample with six quiet fixture terminals measured **0.0% CPU at
+kernel tick resolution and 213.0 MiB RSS** for the debug native client. This is a
+short observation, not a stable benchmark distribution; it excludes engine and
+provider processes. The separate eleven-pane burst establishes completion within
+its budget, not exact latency, sustained throughput, frame timing or losslessness
+of every intermediate line.
 
-The code enforces bounded queues, separate terminal/control connections,
-output-driven drains and event-driven refresh. Those properties support the
-performance direction but are not substituted for measurements.
+Queues and rendered logs are bounded. Terminal/video streams use dedicated
+connections; refreshes are event-driven, and device monitoring is released when
+its view or connection closes. These code properties are not substituted for
+measurements.
 
-## Review corrections
+## Review and boundaries
 
-Independent review identified four asynchronous data-loss paths. The fixes
-freeze the editor during file operations, check revision/project identity
-before applying results, retain dirty state when a discard reload fails,
-recheck dirty state after repository registration, and preserve form input
-entered while a previous submission is awaiting a response.
-The reviewer scored all four findings resolved after the fix batch and
-recapture. That verdict covers those findings, not full application readiness.
+Independent review found and corrected partial-launch recovery, stale-write
+races, hidden note-window shutdown, cross-project navigation, device form
+initialization, compact pane sizing and dropped mirror touch-release events.
+The final bounded review cleared those fixes and the corrected icon geometry
+in the desktop and compact captures, with no introduced regression found.
+The full current surface is not certified as a pixel-identical Relay-2 clone.
 
-## Scope still ahead
-
-This is the rebuilt native foundation, not a finished parity or release claim.
-The archived V3 roadmap remains intact for full docking/undocking, saved window
-layouts, richer task editing, worktree-aware Code/Git tools, Notes satellite,
-skills/settings, devices and packaging. Engine behavior and agent contracts
-carry over; native widgets for every existing operation do not yet exist.
-
-Editor saves detect existing external changes but the read/write pair is not
-an atomic compare-and-swap against arbitrary external filesystem writers.
-The current editor targets the project checkout and limits editable reads to
-1 MiB. Real-provider TUI interactions, prolonged streaming, full accessibility
-and daily-driver acceptance remain unverified.
+Physical Android operation, release signing/upload, real-provider TUIs,
+wallpaper file-picker interaction, actual audio output and prolonged runtime
+remain unverified. File editing remains bounded to 1 MiB, and the external-file
+check cannot prevent a separate non-Relay process writing between verification
+and rename. [PARITY.md](PARITY.md) separates native coverage from later roadmap work.

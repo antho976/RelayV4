@@ -16,7 +16,13 @@ payload!(#[schemars(rename = "ModuleListIn")] ListIn { pub project_id: Id, pub i
 result!(#[schemars(rename = "ModuleListOut")] ListOut { pub modules: Vec<ModuleSummary>, pub header: ModuleHeader });
 op!(List, "module.list", ListIn => ListOut, OpMeta::query(Scope::Project, 7, "Modules index: list + header stats"));
 
-payload!(#[schemars(rename = "ModuleUpdateIn")] UpdateIn { pub module_id: Id, pub name: Option<String>, #[serde(default, deserialize_with = "crate::nullable")] pub icon: Option<Option<String>>, pub priority: Option<Priority>, pub order: Option<i64> });
+payload!(#[schemars(rename = "ModuleUpdateIn")] UpdateIn {
+    pub module_id: Id, pub name: Option<String>,
+    #[serde(default, deserialize_with = "crate::nullable")] pub icon: Option<Option<String>>,
+    pub priority: Option<Priority>, pub order: Option<i64>,
+    /// Original editable field values; every supplied value must still match atomically.
+    pub expected: Option<serde_json::Map<String, serde_json::Value>>,
+});
 op!(Update, "module.update", UpdateIn => Module,
     OpMeta::mutation(Scope::Project, 7, "Patch a module").undo(Undo::Inverse).emits(&["module.changed"]));
 op!(Complete, "module.complete", IdIn => Module,
@@ -35,4 +41,15 @@ payload!(#[schemars(rename = "ModuleChangelogDraftIn")] ChangelogDraftIn { pub m
 result!(#[schemars(rename = "ModuleChangelogDraftOut")] ChangelogDraftOut { pub markdown: String, pub tasks: Vec<Id> });
 op!(ChangelogDraft, "module.changelog.draft", ChangelogDraftIn => ChangelogDraftOut, OpMeta::query(Scope::Project, 7, "Draft patch notes from done tasks' changelog fields"));
 
-entries!(Create, Get, List, Update, Complete, Reopen, Delete, Restore, Stats, ChangelogDraft);
+entries!(
+    Create,
+    Get,
+    List,
+    Update,
+    Complete,
+    Reopen,
+    Delete,
+    Restore,
+    Stats,
+    ChangelogDraft
+);

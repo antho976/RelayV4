@@ -43,9 +43,11 @@ pub struct Pane {
     pub terminal: vte4::Terminal,
     pub caption: gtk::Label,
     pub actions: gtk::Box,
-    pub identity: gtk::Label,
-    pub branch: gtk::Label,
-    pub state: gtk::Label,
+    pub header: gtk::Box,
+    metadata: gtk::Label,
+    state: gtk::Label,
+    lamp: gtk::Box,
+    branch: gtk::Label,
     status: gtk::Label,
     name: String,
     path: PathBuf,
@@ -71,7 +73,7 @@ impl Pane {
         terminal.set_font(Some(&gtk::pango::FontDescription::from_string(
             "Fira Mono 10",
         )));
-        terminal.set_color_foreground(&gtk::gdk::RGBA::parse("#dcdcda").unwrap());
+        terminal.set_color_foreground(&gtk::gdk::RGBA::parse("#ececea").unwrap());
         terminal.set_color_background(&gtk::gdk::RGBA::parse("#0a0a0b").unwrap());
         terminal.set_cursor_blink_mode(vte4::CursorBlinkMode::Off);
         terminal.set_margin_start(10);
@@ -81,36 +83,34 @@ impl Pane {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
         root.add_css_class("terminal-plate");
         root.set_size_request(280, 280);
-
         let footer = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         footer.add_css_class("umd");
+        let lamp = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        lamp.set_valign(gtk::Align::Center);
+        lamp.add_css_class("lamp");
+        footer.append(&lamp);
         let caption = gtk::Label::new(Some(name));
         caption.set_xalign(0.0);
         caption.set_max_width_chars(24);
         caption.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
         caption.add_css_class("session-name");
-        let identity = gtk::Label::new(None);
-        identity.add_css_class("session-identity");
-        identity.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        let status = gtk::Label::new(Some("Connecting"));
+        status.add_css_class("dim");
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        footer.append(&caption);
+        let metadata = gtk::Label::new(None);
+        metadata.add_css_class("dim");
+        metadata.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        metadata.set_hexpand(true);
+        metadata.set_xalign(0.0);
+        footer.append(&metadata);
         let branch = gtk::Label::new(None);
         branch.add_css_class("session-branch");
         branch.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
         branch.set_max_width_chars(24);
+        footer.append(&branch);
         let state = gtk::Label::new(None);
         state.add_css_class("session-state");
-        let lamp = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        lamp.add_css_class("lamp");
-        lamp.set_valign(gtk::Align::Center);
-        let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        spacer.set_hexpand(true);
-        let status = gtk::Label::new(Some("Connecting"));
-        status.add_css_class("dim");
-        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 2);
-        footer.append(&lamp);
-        footer.append(&caption);
-        footer.append(&identity);
-        footer.append(&branch);
-        footer.append(&spacer);
         footer.append(&state);
         footer.append(&actions);
         root.append(&footer);
@@ -125,9 +125,11 @@ impl Pane {
             terminal,
             caption,
             actions,
-            identity,
-            branch,
+            header: footer,
+            metadata,
             state,
+            lamp,
+            branch,
             status,
             name: name.into(),
             path,
@@ -206,6 +208,53 @@ impl Pane {
         });
         pane.terminal.add_controller(keys);
         pane
+    }
+
+    pub fn apply_appearance(&self, mode: &str, points: f64) {
+        let background = match mode {
+            "oled" => "#000000",
+            "dark" => "#08090a",
+            _ => "#0a0a0b",
+        };
+        self.terminal
+            .set_color_background(&gtk::gdk::RGBA::parse(background).unwrap());
+        self.terminal
+            .set_font(Some(&gtk::pango::FontDescription::from_string(&format!(
+                "Fira Mono {}",
+                points.clamp(8.0, 24.0)
+            ))));
+    }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn update_session(&self, session: &serde_json::Value) {
+        use crate::app::text;
+        self.caption.set_text(text(session, "name"));
+        self.metadata.set_text(&format!(
+            "{} · {}",
+            text(session, "provider"),
+            text(session, "role")
+        ));
+        self.branch.set_text(text(session, "branch"));
+        self.header.set_tooltip_text(Some(&format!(
+            "{}\n{}\n{}",
+            text(session, "branch"),
+            text(session, "worktree"),
+            text(session, "intent")
+        )));
+        let state = text(session, "state");
+        self.state.set_text(&state.to_uppercase());
+        for class in ["live", "held", "waiting"] {
+            self.root.remove_css_class(class);
+            self.lamp.remove_css_class(class);
+        }
+        let class = match state {
+            "running" | "spawning" => "live",
+            "blocked" => "held",
+            _ => "waiting",
+        };
+        self.root.add_css_class(class);
+        self.lamp.add_css_class(class);
     }
 
     pub fn set_active(self: &Rc<Self>, active: bool) {
@@ -310,7 +359,7 @@ impl Pane {
                 return;
             };
             p.resize_pending.set(false);
-            p.identity.set_visible(p.root.width() > 420);
+            p.metadata.set_visible(p.root.width() > 420);
             p.branch.set_visible(p.root.width() > 600);
             if !p.active.get() || !p.terminal.is_mapped() {
                 return;

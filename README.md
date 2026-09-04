@@ -11,43 +11,46 @@ this rebuild from that backlog.
 
 ## Run
 
-Requires GTK 4.22+, VTE 0.84+ and GtkSourceView 5.18+. Build both binaries:
+Requires GTK 4.22+, VTE 0.84+ and GtkSourceView 5.18+. From this checkout:
 
 ```fish
-cargo build -p relay-cli -p relay-native
-set -x RELAY_INSTANCE dev
-./target/debug/relay --instance dev serve
+./run.sh
 ```
 
-In a second terminal, with the same instance:
+The launcher builds incrementally, starts the `dev` engine if needed, waits for
+it to respond, and opens the window. It also works by absolute path from any
+directory. Use `./run.sh stable` or `./run.sh test` to select another instance.
+Engine startup logs go to `target/engine-<instance>.log`.
+Compiler output is saved to `target/launcher-build.log` and shown on build failure.
 
-```fish
-set -x RELAY_INSTANCE dev
-./target/debug/relay-native
-```
+V4 uses `$XDG_RUNTIME_DIR/relay-v4/` for engine sockets and
+`~/.local/share/relay-v4/<instance>/` for data (or `$XDG_DATA_HOME/relay-v4/`).
+This keeps it independent of a running Relay-2/V3 engine. Existing Relay-2/V3
+projects and sessions stay in their original store; V4 starts with its own registry.
 
-An existing engine for that instance can be used instead of starting another.
-The matching rebuilt engine provides `guardrail.hold.get`; an older engine
-can render the shell but cannot provide exact hold review. The client never
-silently replaces a running engine. Closing it keeps sessions and worktrees.
+A running engine is reused without replacement; after engine code changes,
+it needs a deliberate restart to pick them up. Closing the window keeps the
+engine, sessions and worktrees alive.
 
-Open a repository from the sidebar, then add a solo builder or a builder with
-a reviewer. The Code tab currently edits the project checkout. Agents work in
-their own engine-managed worktrees. Tasks, mailbox, holds and project notes
-use the same bus as the CLI.
+Open a repository from the sidebar, then add solo agents or a group of
+one or two builders sharing a reviewer. Code can edit the primary checkout or
+an agent worktree. Board, Notes, Skills, Settings, usage and Android device tools
+use the same bus as the CLI. [Parity coverage](docs/PARITY.md) records the current
+implementation and validation boundaries. Mirroring and notification audio use
+the installed FFmpeg tools (`ffmpeg` and `ffplay`).
 
 ## Verify
 
 ```fish
 cargo test --workspace
 cargo fmt -p relay-native --check
-cargo clippy -p relay-native --all-targets -- -D warnings
+cargo clippy -p relay-native --all-targets -- -D warnings -A deprecated
 python3 scripts/native-smoke.py
 ```
 
 The display smoke test creates its own temporary store, repository and fake
 provider executables. It opens the GTK application at two desktop sizes and
-checks that six sessions survive window closure. It never launches a paid
+checks saves, a review-group launch and eleven-session output delivery. It never launches a paid
 model or touches the user's project store. Screenshots go under
 `.impeccable/review/`.
 

@@ -575,7 +575,12 @@ impl Engine {
     /// callers that need to tell an unknown session from an unspawned one must ask the store.
     pub fn pty_named(&self, name: &str) -> Option<(Id, Arc<Pty>)> {
         let id = *self.pty_ids.lock().unwrap().get(name)?;
-        self.ptys.lock().unwrap().get(&id).cloned().map(|pty| (id, pty))
+        self.ptys
+            .lock()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .map(|pty| (id, pty))
     }
     pub fn set_pty(&self, session_id: Id, name: &str, pty: Arc<Pty>) -> Option<Arc<Pty>> {
         self.pty_ids
@@ -585,7 +590,10 @@ impl Engine {
         self.ptys.lock().unwrap().insert(session_id, pty)
     }
     pub fn take_pty(&self, session_id: Id) -> Option<Arc<Pty>> {
-        self.pty_ids.lock().unwrap().retain(|_, id| *id != session_id);
+        self.pty_ids
+            .lock()
+            .unwrap()
+            .retain(|_, id| *id != session_id);
         self.ptys.lock().unwrap().remove(&session_id)
     }
     pub fn live_pty_count(&self) -> usize {
@@ -715,8 +723,16 @@ impl Engine {
 
     /// The pipeline. Synchronous; holds the store lock for the handler's duration.
     pub fn dispatch(&self, req: Request, door: Door) -> Response {
+        self.dispatch_with_watch_state(req, door, None)
+    }
+
+    pub(crate) fn dispatch_device_watch(&self, req: Request, already_watching: bool) -> Response {
+        self.dispatch_with_watch_state(req, Door::Socket, Some(already_watching))
+    }
+
+    fn dispatch_with_watch_state(&self, req: Request, door: Door, watching: Option<bool>) -> Response {
         let id = req.id;
-        let mut response = match self.dispatch_inner(&req, door) {
+        let mut response = match self.dispatch_inner(&req, door, watching) {
             Ok(resp) => resp,
             Err(e) => Response::err(id, e),
         };
@@ -733,7 +749,7 @@ impl Engine {
         response
     }
 
-    fn dispatch_inner(&self, req: &Request, door: Door) -> Result<Response, BusError> {
+    fn dispatch_inner(&self, req: &Request, door: Door, watching: Option<bool>) -> Result<Response, BusError> {
         // envelope
         if req.v != ENVELOPE_V {
             return Err(BusError::envelope(format!(
@@ -807,13 +823,20 @@ impl Engine {
                 return Err(err);
             }
         }
+        // Socket watch leases are idempotent, but even duplicate calls must pass the
+        // complete envelope, schema and actor checks above before becoming a no-op.
+        if entry.name == "device.watch" && watching.is_some() && watching == req.payload["on"].as_bool() {
+            return Ok(Response::ok(req.id, serde_json::json!({})));
+        }
         // Keystrokes never touch SQLite (D148). The store is one connection behind one mutex, so
         // a per-character request that opened a transaction queued behind whatever slow op held
         // it — which is exactly why typing stalled while a git scan or `adb devices` ran. Both
         // ops are `UserOnly` with `AgentOnly` audit, so by this point nothing is left to
         // persist: the envelope, door, payload and actor allowlist checks have all run, the
         // actor is privileged (never a session), and `audited` is false.
-        if matches!(entry.name, "session.input" | "session.resize") && !audited && session_id.is_none()
+        if matches!(entry.name, "session.input" | "session.resize")
+            && !audited
+            && session_id.is_none()
         {
             if let Some(result) = self.pty_fast_path(entry.name, &req.payload)? {
                 return Ok(Response::ok(req.id, result));
@@ -1062,7 +1085,9 @@ impl Engine {
         entry: &relay_bus::registry::OpEntry,
         session_id: Option<Id>,
     ) -> Result<Option<Request>, BusError> {
-        let Some(session_id) = session_id else { return Ok(None) };
+        let Some(session_id) = session_id else {
+            return Ok(None);
+        };
         let object = req.payload.as_object().expect("payload is an object");
         let registry = Registry::global();
         let wants = |field: &str| {
@@ -1134,7 +1159,10 @@ impl Engine {
     /// typed error for that case.
     fn pty_fast_path(&self, op: &str, payload: &Value) -> Result<Option<Value>, BusError> {
         use relay_bus::ops::session::{InputIn, ResizeIn};
-        let name = payload.get("session").and_then(Value::as_str).unwrap_or_default();
+        let name = payload
+            .get("session")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let Some((session_id, pty)) = self.pty_named(name) else {
             return Ok(None);
         };

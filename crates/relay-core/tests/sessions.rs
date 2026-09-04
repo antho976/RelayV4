@@ -763,6 +763,78 @@ fn clear_restorable_fresh_starts_the_same_terminal_without_saved_context() {
 }
 
 #[test]
+fn allocated_assignments_survive_partial_launch_and_omitted_spawn_prompt() {
+    let f = fixture();
+    let provider = fake_discovery_provider(&f.root, "claude", "claude 1.0.0");
+    ok(
+        &f.engine,
+        "settings.set",
+        json!({"path":"providers.claude.path","value":provider}),
+    );
+    for (override_prompt, expected) in [
+        (None, Some("preserved assignment")),
+        (
+            Some("replacement assignment"),
+            Some("replacement assignment"),
+        ),
+        (Some(""), None),
+    ] {
+        let session = ok(
+            &f.engine,
+            "session.create",
+            json!({"project_id":1,"provider":"claude","prompt":"preserved assignment"}),
+        );
+        let id = session["id"].as_i64().unwrap();
+        let stored = || {
+            f.engine
+                .store
+                .lock()
+                .query_row(
+                    "SELECT launch_prompt FROM sessions WHERE id=?1",
+                    [id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(stored().as_deref(), Some("preserved assignment"));
+        // A later allocation can fail without losing the already allocated assignment.
+        assert!(
+            !call(
+                &f.engine,
+                "session.create",
+                json!({"project_id":1,"provider":"claude","worktree":"invalid-relative-worktree"})
+            )
+            .ok
+        );
+        let mut spawn = json!({"session":session["name"]});
+        if let Some(prompt) = override_prompt {
+            spawn["prompt"] = json!(prompt);
+        }
+        ok(&f.engine, "session.spawn", spawn);
+        assert_eq!(stored().as_deref(), expected);
+        if let Some(prompt) = expected {
+            wait_until("allocated assignment reaches fake provider", || {
+                ok(
+                    &f.engine,
+                    "session.scrollback",
+                    json!({"session":session["name"]}),
+                )["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!(
+                        "echo:Call session.bootstrap first, then begin this assignment: {prompt}"
+                    ))
+            });
+        }
+        ok(
+            &f.engine,
+            "session.close",
+            json!({"session":session["name"]}),
+        );
+    }
+}
+
+#[test]
 fn pair_sessions_share_checkout_and_teardown_safely() {
     let f = fixture();
     let provider = fake_discovery_provider(&f.root, "claude", "claude 1.0.0");

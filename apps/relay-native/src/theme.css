@@ -94,3 +94,12 @@ button.quiet.selected { background: @wash; color: @ink; }
 .task-agent { border-top: 1px solid @edge; padding-top: 5px; color: @secondary; font-size: 11px; }
 
 button.launch-scrim, button.launch-scrim:hover { background: alpha(#060607, 0.62); border-radius: 0; }
+
+.settings-key { margin: 8px; }
+.nav-label { font-size: 13px; font-weight: 500; }
+.focus-tabs { background: @console; padding: 2px; }
+button.quiet.selected { color: @ink; background: @wash; }
+.statusbar .statusbar { border: 0; padding: 0; }
+.statusbar button { min-height: 22px; font-size: 11px; }
+
+.wallpaper-dim { background: black; }
