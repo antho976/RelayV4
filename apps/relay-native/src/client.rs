@@ -201,8 +201,13 @@ impl Client {
         }
         let _remove = Remove(self.0.pending.clone(), id);
         let tx = self.0.tx.clone();
+        let timeout = if op == "project.clone" {
+            Duration::from_secs(1800)
+        } else {
+            Duration::from_secs(30)
+        };
         rt.spawn(async move {
-            tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::time::timeout(timeout, async {
                 tx.send(request).await.map_err(|_| Error::Disconnected)?;
                 reply.await.map_err(|_| Error::Disconnected)?
             })

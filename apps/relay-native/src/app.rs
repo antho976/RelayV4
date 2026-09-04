@@ -10,6 +10,8 @@ use std::rc::Rc;
 use tokio::runtime::Handle;
 #[path = "launch.rs"]
 mod launch;
+#[path = "onboarding.rs"]
+mod onboarding;
 #[path = "shell.rs"]
 mod shell;
 #[path = "status.rs"]
@@ -109,6 +111,7 @@ pub struct Ui {
     status: gtk::Label,
     usage_meters: gtk::Box,
     device_status: gtk::Label,
+    setup_checked: Cell<bool>,
     status_project: gtk::Label,
     status_branch: gtk::Label,
     sidebar: gtk::Box,
@@ -454,6 +457,7 @@ impl Ui {
             status,
             usage_meters,
             device_status,
+            setup_checked: Cell::new(false),
             status_project,
             status_branch,
             sidebar,
@@ -957,6 +961,9 @@ impl Ui {
                     ui.editor.reset();
                 }
                 ui.render_projects();
+                if !ui.setup_checked.replace(true) && ui.projects.borrow().is_empty() {
+                    ui.open_repository();
+                }
                 let project = ui.project.get();
                 if project == 0 {
                     ui.sessions.borrow_mut().clear();
@@ -1160,55 +1167,11 @@ impl Ui {
             ui.page_pending.set(false);
         });
     }
-    fn open_repository(self: &Rc<Self>) {
-        if self.editor.is_dirty() {
-            self.show_error(
-                "Save or discard your editor changes before opening another repository.",
-            );
+    pub fn open_repository(self: &Rc<Self>) {
+        if self.editor.is_dirty() || !self.dismiss_panels() {
+            self.show_error("Save or discard your changes before adding a project.");
             return;
         }
-        let chooser = gtk::FileDialog::builder()
-            .title("Open a Git repository")
-            .build();
-        let ui = self.clone();
-        glib::spawn_future_local(async move {
-            let Ok(file) = chooser.select_folder_future(Some(&ui.window)).await else {
-                return;
-            };
-            let Some(path) = file.path() else {
-                return;
-            };
-            let parent = path.parent().unwrap_or(&path);
-            let result = async {
-                let listed = ui.call("workspace.list", json!({})).await?;
-                let workspace = if let Some(existing) = rows(&listed, "workspaces")
-                    .into_iter()
-                    .find(|w| text(w, "path") == parent.to_string_lossy())
-                {
-                    existing
-                } else {
-                    ui.call("workspace.create", json!({"path":parent})).await?
-                };
-                ui.call(
-                    "project.add",
-                    json!({"workspace_id":workspace["id"],"path":path}),
-                )
-                .await
-            }
-            .await;
-            match result {
-                Ok(p) => {
-                    if ui.editor.is_dirty() {
-                        ui.show_error("Repository added. The current project was kept because the editor has changes or a file operation in progress.");
-                        ui.refresh();
-                        return;
-                    }
-                    ui.project.set(p["id"].as_i64().unwrap_or(0));
-                    ui.editor.reset();
-                    ui.refresh();
-                }
-                Err(e) => ui.show_error(&e.to_string()),
-            }
-        });
+        onboarding::open(self);
     }
 }

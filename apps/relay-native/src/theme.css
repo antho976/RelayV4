@@ -145,8 +145,10 @@ button.launch-choice:checked { border-color: @ink; background: @wash; }
 .resource-row { border-bottom: 1px solid @edge; padding: 6px 0; font-size: 11px; }
 .resource-chart { border: 1px solid @edge; padding: 6px; font-size: 10px; }
 
-.utility-panel stackswitcher button:checked { background: @ink; color: @wall; }
+.utility-panel stackswitcher button:checked, .setup-body stackswitcher button:checked { background: @ink; color: @wall; }
 .utility-panel stackswitcher button { min-height: 24px; }
 .utility-panel .title { font-size: 13px; }
 .utility-panel .body { font-size: 12px; }
 .usage-meter progress, .resource-meter progress { background-image: none; border: 0; box-shadow: none; }
+.setup-body { padding: 24px 0; }
+.setup-body > .title { font-size: 22px; }
