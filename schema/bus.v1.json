@@ -3132,14 +3132,14 @@
       }
     },
     "device.mirror.start": {
-      "summary": "Start a scrcpy-class H.264 mirror; frames on a Tauri channel",
+      "summary": "Start a scrcpy-class H.264 mirror; frames on a dedicated native or Tauri connection",
       "kind": "mutation",
       "audit": "always",
       "undo": "none",
       "scope": "global",
       "executor": "core",
       "actors": "user_only",
-      "doors": "tauri_only",
+      "doors": "all",
       "emits": [
         "mirror.changed"
       ],
@@ -3266,7 +3266,7 @@
       "scope": "project",
       "executor": "core",
       "actors": "user_only",
-      "doors": "tauri_only",
+      "doors": "all",
       "emits": [
         "device.signing.changed"
       ],
@@ -6758,6 +6758,14 @@
               "type": "null"
             }
           ]
+        },
+        "expected": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true,
+          "description": "Original editable field values; every supplied value must still match atomically."
         }
       },
       "required": [
@@ -7163,6 +7171,13 @@
             "boolean",
             "null"
           ]
+        },
+        "prompt": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Persist the initial assignment before spawning, so a partial launch can recover it."
         }
       },
       "required": [
@@ -7780,6 +7795,14 @@
             "null"
           ],
           "format": "int64"
+        },
+        "expected": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true,
+          "description": "Original editable field values; every supplied value must still match atomically."
         }
       },
       "required": [
@@ -7983,6 +8006,14 @@
             "boolean",
             "null"
           ]
+        },
+        "expected": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true,
+          "description": "Original editable field values; every supplied value must still match atomically."
         }
       },
       "required": [
@@ -8320,7 +8351,8 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "description": "Omitted preserves the allocated assignment; an empty string explicitly clears it."
         }
       },
       "required": [
@@ -11175,6 +11207,12 @@
         },
         "text": {
           "type": "string"
+        },
+        "expected_sha256": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [

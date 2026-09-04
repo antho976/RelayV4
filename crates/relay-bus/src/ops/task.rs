@@ -41,6 +41,8 @@ payload!(#[schemars(rename = "TaskUpdateIn")] UpdateIn {
     pub task_id: Id, pub title: Option<String>, pub body: Option<String>, pub priority: Option<Priority>,
     #[serde(default, deserialize_with = "crate::nullable")] pub size: Option<Option<Size>>, #[serde(default, deserialize_with = "crate::nullable")] pub module_id: Option<Option<Id>>, pub state: Option<TaskState>, pub changelog: Option<String>,
     #[serde(rename = "type")] #[schemars(rename = "type")] pub task_type: Option<TaskType>,
+    /// Original editable field values; every supplied value must still match atomically.
+    pub expected: Option<serde_json::Map<String, serde_json::Value>>,
 });
 op!(Update, "task.update", UpdateIn => Task,
     OpMeta::mutation(Scope::Project, 7, "Patch a task (agents: own task, body/changelog only)").undo(Undo::Inverse).emits(&["task.changed"]));
@@ -120,4 +122,26 @@ op!(Unrelate, "task.unrelate", RelateIn => Task,
 result!(#[schemars(rename = "TaskCopyTextOut")] CopyTextOut { pub text: String });
 op!(CopyText, "task.copy_text", IdIn => CopyTextOut, OpMeta::query(Scope::Project, 7, "The copy-button text: title + body + id"));
 
-entries!(Create, Get, List, Update, Move, Delete, Restore, LinkCommit, ChangelogWrite, Attach, Detach, ParentSet, Children, LabelAdd, LabelRemove, LabelList, Relate, Unrelate, Dispatch, Approve, CopyText);
+entries!(
+    Create,
+    Get,
+    List,
+    Update,
+    Move,
+    Delete,
+    Restore,
+    LinkCommit,
+    ChangelogWrite,
+    Attach,
+    Detach,
+    ParentSet,
+    Children,
+    LabelAdd,
+    LabelRemove,
+    LabelList,
+    Relate,
+    Unrelate,
+    Dispatch,
+    Approve,
+    CopyText
+);

@@ -13,7 +13,7 @@
 window { background: @wall; color: @ink; font-family: 'Fira Sans', 'Noto Sans', sans-serif; font-size: 13px; }
 window > box, stack, scrolledwindow { background: @wall; }
 .titlebar { background: @console; padding: 0; border: 0; box-shadow: none; }
-.topbar { min-height: 40px; padding: 0 8px; background: @console; border-bottom: 1px solid @edge; }
+.topbar { min-height: 42px; padding: 0 8px; background: @console; border-bottom: 1px solid @edge; }
 .brand-mark { background: @ink; color: @wall; font-weight: 700; padding: 2px 6px; }
 .brand, .section-label, .tab { font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; }
 .brand { letter-spacing: 0.16em; }
@@ -30,7 +30,7 @@ button.quiet, button.tab, button.nav, button.project, button.file { background: 
 button.quiet:hover, button.tab:hover, button.nav:hover, button.project:hover, button.file:hover { background: @wash; color: @ink; }
 button.nav, button.project, button.file { border-radius: 0; }
 button.nav { min-height: 30px; }
-button.project { min-height: 44px; padding: 4px 12px; }
+button.project { min-height: 30px; padding: 3px 8px 3px 22px; }
 button.project.selected { background: @wash; color: @ink; border-left: 2px solid @ink; }
 .topbar windowcontrols { padding: 0; }
 .topbar windowcontrols button { min-height: 40px; min-width: 32px; padding: 0; }
@@ -42,12 +42,12 @@ button.nav.selected { background: @wash; color: @ink; }
 .statusbar { background: @console; color: @secondary; min-height: 24px; padding: 0 12px; border-top: 1px solid @edge; font-size: 11px; }
 .notice { background: @slab; border-bottom: 1px solid @held; color: @ink; padding: 8px 12px; }
 .terminal-plate { background: @screen; border: 1px solid @edge; }
-.terminal-plate.live { border-color: @live; }
-.terminal-plate.held { border-color: @held; }
+.terminal-plate.live { border-color: @edge; }
+.terminal-plate.held { border-color: @edge; }
 .terminal-plate.waiting { border-color: @edge; }
-.umd { background: @console; padding: 0 8px; min-height: 28px; border-top: 1px solid @edge; }
-.live .umd { border-top-color: @live; }
-.held .umd { border-top-color: @held; }
+.umd { background: @console; padding: 0 8px; min-height: 26px; border-bottom: 1px solid @edge; }
+.lamp.live { color: @live; }
+.lamp.held { color: @held; }
 .held .session-name { color: @held; }
 .session-name { font-size: 12px; font-weight: 600; }
 .umd button { min-height: 24px; padding: 0 6px; font-size: 11px; }
@@ -65,3 +65,17 @@ popover contents { background: @slab; color: @ink; border: 1px solid @edge; }
 scrollbar { background: @console; }
 scrollbar slider { min-width: 6px; min-height: 6px; background: #3f3f45; border-radius: 2px; }
 .file-tree { background: @console; padding: 8px 0; }
+
+.icon-key { min-width: 24px; padding: 0 4px; }
+.workspace-row { padding: 8px 4px 2px 10px; min-height: 28px; }
+.sidebar .nav { margin: 0 8px; min-height: 28px; }
+.sidebar .nav:first-child { margin-top: 8px; }
+.nav-label { font-size: 12px; font-weight: 500; }
+.session-state { font-family: "Fira Sans Condensed", sans-serif; font-size: 10px; letter-spacing: 0.08em; color: @secondary; }
+.lamp.waiting { color: @secondary; }
+.focus-tabs { background: @console; padding: 2px; }
+button.quiet.selected { color: @ink; background: @wash; }
+.statusbar .statusbar { border: 0; padding: 0; }
+.statusbar button { min-height: 22px; font-size: 11px; }
+
+.wallpaper-dim { background: black; }

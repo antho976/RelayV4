@@ -42,13 +42,16 @@ print("Session: " + os.environ.get("RELAY_SESSION", "fixture"), flush=True)
 print("\\nEngine owns this PTY. VTE renders its output.", flush=True)
 print("  [ok] isolated worktree\\n  [ok] ordered output\\n  [ok] waiting for input", flush=True)
 for line in sys.stdin:
-    print("echo: " + line.rstrip(), flush=True)
+    if line.strip()=="native-burst":
+        for i in range(2048): print(f"B{i:06d} " + "x"*88)
+        print("BURST-END-"+os.environ["RELAY_SESSION"],flush=True)
+    else: print("echo: " + line.rstrip(), flush=True)
 ''')
     provider.chmod(0o755)
     log = (OUT / "engine.log").open("w")
     engine = subprocess.Popen([str(ENGINE), "--instance", "test", "serve"], env=env, stdout=log, stderr=log)
     connection = socket.socket(socket.AF_UNIX)
-    path = runtime / "relay/test.sock"
+    path = runtime / "relay-v4/test.sock"
     try:
         deadline = time.monotonic() + 15
         while True:
@@ -102,11 +105,13 @@ for line in sys.stdin:
         desktop_env = dict(os.environ, RELAY_NATIVE_SOCKET=str(path), RELAY_INSTANCE="test")
         for key in ("RELAY_SESSION", "RELAY_TOKEN", "RELAY_BRIEF"):
             desktop_env.pop(key, None)
+        initial_names={s["name"] for s in call("session.list",{"project_id":project["id"]})["sessions"]}
         measurements=[]
-        for viewport, size, page in (("desktop", "1440,900", "agents"), ("compact", "1024,768", "agents"), ("board", "1440,900", "board"), ("mailbox", "1024,768", "mailbox"), ("guardrails", "1024,768", "guardrails"), ("code", "1440,900", "code")):
+        for viewport, size, page in (("desktop", "1440,900", "agents"), ("compact", "1024,768", "agents"), ("board", "1440,900", "board"), ("mailbox", "1024,768", "mailbox"), ("guardrails", "1024,768", "guardrails"), ("code", "1440,900", "code"), *((name,"1440,900",name) for name in ("notes","plan","modules","settings","skills","dashboard","notifications","devices","launch"))):
             output = OUT / f"{viewport}.png"
+            output.unlink(missing_ok=True)
             native_env = dict(desktop_env, RELAY_NATIVE_SCREENSHOT=str(output), RELAY_NATIVE_SIZE=size, RELAY_NATIVE_FIXTURE="1",
-                              RELAY_NATIVE_PAGE=page, RELAY_NATIVE_SMOKE_SECONDS="8" if viewport=="desktop" else "4")
+                              RELAY_NATIVE_PAGE=page, RELAY_NATIVE_SMOKE_SECONDS="8" if viewport in ("desktop","launch") else "5")
             with (OUT / f"{viewport}.log").open("w") as native_log:
                 native=subprocess.Popen([str(NATIVE)], env=native_env, stdout=native_log, stderr=native_log)
                 if viewport=="desktop":
@@ -119,19 +124,44 @@ for line in sys.stdin:
                     end_ticks,rss=sample();elapsed=time.monotonic()-started
                     measurements.append(dict(cpu_percent=round((end_ticks-ticks)/os.sysconf("SC_CLK_TCK")/elapsed*100,2),
                                              rss_mib=round(rss/1024/1024,1), sample_seconds=round(elapsed,2)))
-                assert native.wait(timeout=30)==0
+                try:
+                    assert native.wait(timeout=30)==0
+                finally:
+                    if native.poll() is None:
+                        native.terminate()
+                        native.wait(timeout=5)
             assert output.is_file(), f"No screenshot at {output}"
         (OUT/"measurements.json").write_text(json.dumps(measurements,indent=2)+"\n")
         live = call("session.list", {"project_id": project["id"]})["sessions"]
-        assert len(live) == 6 and all(s["state"] == "running" for s in live), live
+        assert len(live) == 9 and all(s["state"] == "running" for s in live), live
+        builders = [s for s in live if s["role"]=="builder"]
+        reviewers = [s for s in live if s["role"]=="reviewer"]
+        assert len(builders)==5 and len(reviewers)==4, live
+        launched=[s for s in live if s["name"] not in initial_names]
+        assert len(launched)==3 and len({s["worktree"] for s in launched})==1, launched
+        assert any(s["task_id"] is not None for s in launched), launched
+        assert any(t["title"]=="Native task edit verified" for t in call("task.list",{"project_id":project["id"]})["tasks"])
+        assert any(n["body"]=="Native note save verified." for n in call("notes.list",{"project_id":project["id"]})["notes"])
+        for _ in range(2):
+            extra=call("session.create",{"project_id":project["id"],"provider":"claude","role":"builder"})
+            call("session.spawn",{"session":extra["name"]})
+        burst_env=dict(desktop_env,RELAY_NATIVE_SCREENSHOT=str(OUT/"burst.png"),RELAY_NATIVE_SIZE="1440,900",RELAY_NATIVE_FIXTURE="1",RELAY_NATIVE_PAGE="agents",RELAY_NATIVE_BURST="1",RELAY_NATIVE_SMOKE_SECONDS="7")
+        with (OUT/"burst.log").open("w") as burst_log:
+            burst=subprocess.Popen([str(NATIVE)],env=burst_env,stdout=burst_log,stderr=burst_log)
+            try: assert burst.wait(timeout=20)==0
+            finally:
+                if burst.poll() is None: burst.terminate();burst.wait(timeout=5)
+        assert "BURST_RENDERED=11" in (OUT/"burst.log").read_text()
+        live=call("session.list",{"project_id":project["id"]})["sessions"]
         for session in live:
             output=call("session.scrollback", {"session": session["name"]})["text"]
-            assert f"echo: native-paste-check-{session['name']}" in output, output
+            if session["name"] in initial_names:
+                assert f"echo: native-paste-check-{session['name']}" in output, output
             call("session.input", {"session": session["name"], "data": "survived-window-close\n"})
             call("session.park", {"session": session["name"]})
         saved=call("file.read", {"project_id":project["id"],"path":"README.md"})["text"]
         assert "Native editor save verified." in saved, saved
-        print(json.dumps({"screenshots": ["desktop.png", "compact.png", "board.png", "mailbox.png", "guardrails.png", "code.png"], "sessions_survived_window_close": len(live), "native_paste_echoes_verified":6,"native_editor_saved":True,"real_provider_calls": 0}))
+        print(json.dumps({"screenshots": [p.name for p in sorted(OUT.glob("*.png"))], "sessions_survived_window_close": len(live), "native_paste_echoes_verified":6,"native_editor_saved":True,"native_task_saved":True,"native_note_saved":True,"native_review_group_launched":True,"burst_native_tail_markers":11,"burst_lines_per_session":2048,"burst_completion_budget_seconds":5,"real_provider_calls": 0}))
     finally:
         connection.close()
         engine.terminate()

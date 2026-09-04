@@ -11,7 +11,13 @@ op!(Get, "notes.get", IdIn => Note, OpMeta::query(Scope::Project, 5, "One note")
 payload!(#[schemars(rename = "NotesCreateIn")] CreateIn { pub project_id: Id, pub title: Option<String>, pub body: String, pub pinned: Option<bool> });
 op!(Create, "notes.create", CreateIn => Note,
     OpMeta::mutation(Scope::Project, 5, "Create a note").undo(Undo::Inverse).emits(&["notes.changed"]));
-payload!(#[schemars(rename = "NotesUpdateIn")] UpdateIn { pub note_id: Id, #[serde(default, deserialize_with = "crate::nullable")] pub title: Option<Option<String>>, pub body: Option<String>, pub pinned: Option<bool> });
+payload!(#[schemars(rename = "NotesUpdateIn")] UpdateIn {
+    pub note_id: Id,
+    #[serde(default, deserialize_with = "crate::nullable")] pub title: Option<Option<String>>,
+    pub body: Option<String>, pub pinned: Option<bool>,
+    /// Original editable field values; every supplied value must still match atomically.
+    pub expected: Option<serde_json::Map<String, serde_json::Value>>,
+});
 op!(Update, "notes.update", UpdateIn => Note,
     OpMeta::mutation(Scope::Project, 5, "Patch a note").undo(Undo::Inverse).emits(&["notes.changed"]));
 payload!(#[schemars(rename = "NotesAppendIn")] AppendIn { pub note_id: Option<Id>, pub project_id: Option<Id>, pub target: Option<String>, pub text: String });
@@ -58,4 +64,18 @@ payload!(#[schemars(rename = "NotesAckIn")] AckIn { pub message_id: Id });
 op!(MailboxAck, "mailbox.ack", AckIn => Empty,
     OpMeta::mutation(Scope::Project, 5, "Mark a message read").audit(Audit::AgentOnly).emits(&["mailbox.changed"]));
 
-entries!(List, Get, Create, Update, Append, Pin, Delete, Restore, Standing, MailboxSend, MailboxList, MailboxOutbox, MailboxAck);
+entries!(
+    List,
+    Get,
+    Create,
+    Update,
+    Append,
+    Pin,
+    Delete,
+    Restore,
+    Standing,
+    MailboxSend,
+    MailboxList,
+    MailboxOutbox,
+    MailboxAck
+);

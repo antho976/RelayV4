@@ -27,24 +27,32 @@ pub struct DeviceWatchState {
 }
 
 impl DeviceWatchRuntime {
-    pub fn stopped(&self) -> bool { self.stop.load(Ordering::Relaxed) }
+    pub fn stopped(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
     pub fn install(&self, mut child: Child) -> bool {
         let mut slot = self.child.lock().unwrap();
-        if self.stopped() { let _ = child.kill(); return false; }
+        if self.stopped() {
+            let _ = child.kill();
+            return false;
+        }
         *slot = Some(child);
         true
     }
     pub fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
-        if let Some(child) = self.child.lock().unwrap().as_mut() { let _ = child.kill(); }
+        if let Some(child) = self.child.lock().unwrap().as_mut() {
+            let _ = child.kill();
+        }
     }
     pub fn finish(&self) {
-        if let Some(mut child) = self.child.lock().unwrap().take() { let _ = child.wait(); }
+        if let Some(mut child) = self.child.lock().unwrap().take() {
+            let _ = child.wait();
+        }
     }
 }
 
-/// Point the headless device runtime at the Tauri-bundled scrcpy server. The source-tree
-/// fallback below keeps tests and `tauri dev` self-contained.
+/// Point the engine at a bundled scrcpy server. Native development also has a source-tree fallback.
 pub fn configure_mirror_server(path: PathBuf) {
     if path.is_file() {
         let _ = MIRROR_SERVER.set(path);
@@ -54,7 +62,7 @@ pub fn configure_mirror_server(path: PathBuf) {
 pub fn mirror_server_path() -> Option<PathBuf> {
     MIRROR_SERVER.get().cloned().or_else(|| {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../apps/relay-app/src-tauri/resources/scrcpy-server-v4.1");
+            .join("../../apps/relay-native/resources/scrcpy-server-v4.1");
         path.is_file().then_some(path)
     })
 }

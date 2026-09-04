@@ -9,6 +9,7 @@ use relay_bus::ops::file::*;
 use relay_bus::types::{Entry, EntryKind, GateKind, Id};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use similar::{ChangeTag, TextDiff};
 use std::collections::HashMap;
 use std::fs;
@@ -68,7 +69,23 @@ pub fn register(e: &mut Engine) {
         let (project, root) = root(ctx, p.project_id, p.worktree.as_deref())?;
         let rel = rel(&p.path, false)?;
         let path = safe_join(&root, &rel, true)?;
-        let old = fs::read_to_string(&path).unwrap_or_default();
+        let old = fs::read_to_string(&path);
+        if let Some(expected) = &p.expected_sha256 {
+            let matches = old.as_ref().is_ok_and(|text| {
+                Sha256::digest(text.as_bytes())
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+                    == *expected
+            });
+            if !matches {
+                return Err(BusError::conflict(
+                    "file.edit_conflict",
+                    "File changed or was removed. Your draft has not been written.",
+                ));
+            }
+        }
+        let old = old.unwrap_or_default();
         guardrail::enforce(
             ctx,
             project.id,
@@ -394,8 +411,7 @@ pub(crate) fn root_verify(
     chosen: PathBuf,
     code: &'static str,
 ) -> Result<PathBuf, BusError> {
-    let chosen =
-        fs::canonicalize(&chosen).map_err(|e| BusError::invalid(code, e.to_string()))?;
+    let chosen = fs::canonicalize(&chosen).map_err(|e| BusError::invalid(code, e.to_string()))?;
     let valid = crate::worktree::contains(Path::new(&project.path), &chosen)
         .map_err(|e| BusError::unavailable("worktree.list_failed", e.to_string()))?;
     if !valid {
@@ -415,8 +431,7 @@ fn root(
     project_id: Id,
     requested: Option<&str>,
 ) -> Result<(relay_bus::types::Project, PathBuf), BusError> {
-    let (project, chosen) =
-        root_choice(ctx.tx(), ctx.actor_session_id(), project_id, requested)?;
+    let (project, chosen) = root_choice(ctx.tx(), ctx.actor_session_id(), project_id, requested)?;
     let chosen = root_verify(&project, chosen, "file.worktree")?;
     Ok((project, chosen))
 }
@@ -428,7 +443,8 @@ pub(crate) fn root_unlocked(
     requested: Option<&str>,
 ) -> Result<(relay_bus::types::Project, PathBuf), BusError> {
     let session_id = ctx.actor_session_id();
-    let (project, chosen) = ctx.read(|conn| root_choice(conn, session_id, project_id, requested))?;
+    let (project, chosen) =
+        ctx.read(|conn| root_choice(conn, session_id, project_id, requested))?;
     let chosen = root_verify(&project, chosen, "file.worktree")?;
     Ok((project, chosen))
 }

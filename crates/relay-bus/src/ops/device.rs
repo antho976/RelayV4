@@ -1,5 +1,5 @@
 //! `device.*` — BUS.md §10.14. `avd.*` is reserved for post-4.0.
-use crate::registry::{Actors, Audit, Doors, OpMeta, Scope};
+use crate::registry::{Actors, Audit, OpMeta, Scope};
 use crate::types::{Avd, Device, Id, Run};
 use crate::{op, Empty};
 use serde_json::Value;
@@ -12,7 +12,7 @@ op!(Watch, "device.watch", WatchIn => Empty,
 payload!(#[schemars(rename = "DeviceMirrorStartIn")] MirrorStartIn { pub device: String, pub max_size: Option<u32>, pub bitrate: Option<u32> });
 result!(#[schemars(rename = "DeviceMirrorStartOut")] MirrorStartOut { pub mirror_id: Id, pub width: u32, pub height: u32 });
 op!(MirrorStart, "device.mirror.start", MirrorStartIn => MirrorStartOut,
-    OpMeta::mutation(Scope::Global, 10, "Start a scrcpy-class H.264 mirror; frames on a Tauri channel").actors(Actors::UserOnly).stream("mirror").doors(Doors::TauriOnly).emits(&["mirror.changed"]));
+    OpMeta::mutation(Scope::Global, 10, "Start a scrcpy-class H.264 mirror; frames on a dedicated native or Tauri connection").actors(Actors::UserOnly).stream("mirror").emits(&["mirror.changed"]));
 payload!(#[schemars(rename = "DeviceMirrorIdIn")] MirrorIdIn { pub mirror_id: Id });
 op!(MirrorStop, "device.mirror.stop", MirrorIdIn => Empty, OpMeta::mutation(Scope::Global, 10, "Stop a mirror").actors(Actors::UserOnly).emits(&["mirror.changed"]));
 payload!(#[schemars(rename = "DeviceMirrorInputIn")] MirrorInputIn { pub mirror_id: Id, pub event: Value });
@@ -36,7 +36,7 @@ op!(SigningGet, "device.signing.get", SigningGetIn => SigningProfileOut,
 payload!(#[schemars(rename = "DeviceSigningCreateIn")] SigningCreateIn { pub project_id: Id, pub key_alias: String, pub password: String });
 op!(SigningCreate, "device.signing.create", SigningCreateIn => SigningProfileOut,
     OpMeta::mutation(Scope::Project, 10, "Create a Relay-owned Android release key and save its password in Linux Secret Service")
-        .audit(Audit::Never).actors(Actors::UserOnly).doors(Doors::TauriOnly).emits(&["device.signing.changed"]));
+        .audit(Audit::Never).actors(Actors::UserOnly).emits(&["device.signing.changed"]));
 payload!(#[schemars(rename = "DeviceSigningSetEnabledIn")] SigningSetEnabledIn { pub project_id: Id, pub enabled: bool });
 op!(SigningSetEnabled, "device.signing.set_enabled", SigningSetEnabledIn => SigningProfileOut,
     OpMeta::mutation(Scope::Project, 10, "Choose Relay-owned or project-owned Android release signing")
