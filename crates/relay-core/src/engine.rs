@@ -410,6 +410,8 @@ pub struct Engine {
     pub(crate) watcher_registrations: std::sync::Mutex<HashSet<String>>,
     pub(crate) ui: std::sync::Mutex<UiRuntime>,
     pub(crate) resource_watch: AtomicBool,
+    pub(crate) resource_watch_clients: std::sync::Mutex<usize>,
+    pub(crate) resource_watch_epoch: AtomicI64,
     pub(crate) resource_cpu: std::sync::Mutex<HashMap<i64, (u64, Instant)>>,
     pub(crate) resource_disk: std::sync::Mutex<HashMap<String, (f64, Option<f64>)>>,
 }
@@ -440,6 +442,8 @@ impl Engine {
             watcher_registrations: std::sync::Mutex::new(HashSet::new()),
             ui: std::sync::Mutex::new(UiRuntime::default()),
             resource_watch: AtomicBool::new(false),
+            resource_watch_clients: std::sync::Mutex::new(0),
+            resource_watch_epoch: AtomicI64::new(0),
             resource_cpu: std::sync::Mutex::new(HashMap::new()),
             resource_disk: std::sync::Mutex::new(HashMap::new()),
         };
@@ -726,7 +730,7 @@ impl Engine {
         self.dispatch_with_watch_state(req, door, None)
     }
 
-    pub(crate) fn dispatch_device_watch(&self, req: Request, already_watching: bool) -> Response {
+    pub(crate) fn dispatch_socket_watch(&self, req: Request, already_watching: bool) -> Response {
         self.dispatch_with_watch_state(req, Door::Socket, Some(already_watching))
     }
 
@@ -825,7 +829,7 @@ impl Engine {
         }
         // Socket watch leases are idempotent, but even duplicate calls must pass the
         // complete envelope, schema and actor checks above before becoming a no-op.
-        if entry.name == "device.watch" && watching.is_some() && watching == req.payload["on"].as_bool() {
+        if matches!(entry.name, "device.watch" | "app.resources.watch") && watching.is_some() && watching == req.payload["on"].as_bool() {
             return Ok(Response::ok(req.id, serde_json::json!({})));
         }
         // Keystrokes never touch SQLite (D148). The store is one connection behind one mutex, so
