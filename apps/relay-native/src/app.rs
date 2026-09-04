@@ -8,6 +8,10 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use tokio::runtime::Handle;
+#[path = "launch.rs"]
+mod launch;
+#[path = "shell.rs"]
+mod shell;
 
 pub fn text<'a>(v: &'a Value, key: &str) -> &'a str {
     v[key].as_str().unwrap_or("")
@@ -29,6 +33,25 @@ pub fn button(text: &str, class: &str) -> gtk::Button {
             l.set_xalign(0.0);
         }
     }
+    b
+}
+pub fn icon_button(icon: &str, caption: &str) -> gtk::Button {
+    let b = gtk::Button::new();
+    b.set_child(Some(&crate::icons::image(icon, 16)));
+    b.add_css_class("quiet");
+    b.add_css_class("icon-key");
+    b.set_tooltip_text(Some(caption));
+    b.update_property(&[gtk::accessible::Property::Label(caption)]);
+    b
+}
+pub fn nav_button(caption: &str, icon: &str) -> gtk::Button {
+    let b = button("", "nav");
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 9);
+    let image = crate::icons::image(icon, 14);
+    image.set_pixel_size(14);
+    row.append(&image);
+    row.append(&label(caption, "nav-label"));
+    b.set_child(Some(&row));
     b
 }
 pub fn clear(container: &gtk::Box) {
@@ -74,13 +97,33 @@ pub struct Ui {
     pub sessions: RefCell<Vec<Value>>,
     pub projects: RefCell<Vec<Value>>,
     pub page: RefCell<String>,
+    applying_ui: Cell<bool>,
     pub content: gtk::Stack,
     pub pages: BTreeMap<String, gtk::Box>,
     pub page_projects: RefCell<BTreeMap<String, i64>>,
     pub notice: gtk::Label,
     status: gtk::Label,
+    sidebar: gtk::Box,
+    focus_tabs: gtk::Box,
+    mode: RefCell<String>,
+    satellites: RefCell<BTreeMap<String, gtk::Window>>,
+    registry_dirty: Cell<bool>,
+    workspaces: RefCell<Vec<Value>>,
+    rendered_sessions: RefCell<BTreeMap<String, Value>>,
+    restored_project: Cell<i64>,
+    appearance: gtk::CssProvider,
+    wallpaper: gtk::Picture,
+    wallpaper_dim: gtk::Box,
+    font_size: Cell<f64>,
+    palette: RefCell<String>,
+    pub keybindings: RefCell<Value>,
+    pub sound_busy: Cell<bool>,
     projects_box: gtk::Box,
     wall: gtk::Grid,
+    wall_right: gtk::Grid,
+    wall_split: gtk::Paned,
+    wall_files: gtk::Box,
+    file_tree_revision: Cell<u64>,
     wall_stack: gtk::Stack,
     panes: RefCell<BTreeMap<String, Rc<Pane>>>,
     ordered: RefCell<Vec<String>>,
@@ -92,8 +135,11 @@ pub struct Ui {
     page_dirty: Cell<bool>,
     connected: Cell<bool>,
     launch: gtk::Revealer,
+    launch_busy: Cell<bool>,
     launch_box: gtk::Box,
     pub editor: Rc<crate::editor::Editor>,
+    pub note_tabs: gtk::Notebook,
+    pub note_drafts: RefCell<BTreeMap<i64, Rc<crate::pages::Draft>>>,
 }
 
 pub fn run(rt: Handle) -> glib::ExitCode {
@@ -121,6 +167,9 @@ pub fn run(rt: Handle) -> glib::ExitCode {
         if let Some(window) = app.active_window() {
             window.present();
             return;
+        }
+        if let Some(settings) = gtk::Settings::default() {
+            settings.set_gtk_icon_theme_name(Some("Adwaita"));
         }
         let provider = gtk::CssProvider::new();
         provider.connect_parsing_error(|_, _, e| tracing::error!("stylesheet: {e}"));
@@ -151,6 +200,8 @@ impl Ui {
         let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
         let top = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         top.add_css_class("topbar");
+        let sidebar_key = icon_button("sidebar-show-symbolic", "Toggle sidebar");
+        top.append(&sidebar_key);
         let mark = label("R", "brand-mark");
         mark.set_valign(gtk::Align::Center);
         top.append(&mark);
@@ -159,9 +210,15 @@ impl Ui {
         tabs.set_halign(gtk::Align::Center);
         tabs.set_hexpand(true);
         top.append(&tabs);
-        let reconnect = button("Reconnect", "quiet");
+        let palette_key = icon_button("system-search-symbolic", "Command palette · Ctrl K");
+        let layouts_key = icon_button("view-grid-symbolic", "Window presets");
+        let notifications_key = icon_button("alarm-symbolic", "Notifications");
+        for key in [&palette_key, &layouts_key, &notifications_key] {
+            top.append(key);
+        }
+        let reconnect = icon_button("view-refresh-symbolic", "Reconnect to engine");
         top.append(&reconnect);
-        let launch_key = button("+ Session", "primary");
+        let launch_key = button("+ New session", "primary");
         top.append(&launch_key);
         top.append(&gtk::WindowControls::new(gtk::PackType::End));
         let handle = gtk::WindowHandle::new();
@@ -184,7 +241,8 @@ impl Ui {
         sidebar.append(&scrolled(&projects_box));
         let add_project = button("+ Open repository", "quiet");
         sidebar.append(&add_project);
-        sidebar.append(&label("Claude  ·  Codex", "sidebar-footer"));
+        let settings_key = button("Settings", "nav");
+        sidebar.append(&settings_key);
         body.append(&sidebar);
         let content = gtk::Stack::new();
         content.set_hexpand(true);
@@ -200,7 +258,21 @@ impl Ui {
             .build();
         let wall_stack = gtk::Stack::new();
         wall_stack.set_vexpand(true);
-        let wall_scroll = scrolled(&wall);
+        let wall_right = gtk::Grid::builder()
+            .hexpand(true)
+            .vexpand(true)
+            .row_homogeneous(true)
+            .row_spacing(2)
+            .build();
+        let wall_split = gtk::Paned::new(gtk::Orientation::Horizontal);
+        wall_split.set_start_child(Some(&wall));
+        wall_split.set_end_child(Some(&wall_right));
+        wall_split.set_position(600);
+        wall_split.set_shrink_start_child(false);
+        wall_split.set_shrink_end_child(false);
+        wall.set_size_request(280, -1);
+        wall_right.set_size_request(280, -1);
+        let wall_scroll = scrolled(&wall_split);
         wall_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
         wall_stack.add_named(&wall_scroll, Some("wall"));
         let empty = gtk::Box::new(gtk::Orientation::Vertical, 12);
@@ -216,24 +288,38 @@ impl Ui {
         wall_stack.add_named(&empty, Some("empty"));
         wall_stack.set_visible_child_name("empty");
         let agents = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        let wall_tools = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        wall_tools.add_css_class("toolbar");
-        let heading = label("Agents", "title");
-        heading.set_hexpand(true);
-        wall_tools.append(&heading);
-        let one = button("Single", "quiet");
-        let two = button("Split", "quiet");
-        let grid = button("Grid", "quiet");
-        for b in [&one, &two, &grid] {
-            wall_tools.append(b);
-        }
-        agents.append(&wall_tools);
-        agents.append(&wall_stack);
+        let focus_tabs = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        focus_tabs.add_css_class("focus-tabs");
+        agents.append(&focus_tabs);
+        let wall_body = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        let files = icon_button("view-list-symbolic", "Show agent file tree");
+        files.set_valign(gtk::Align::Start);
+        files.add_css_class("files-rail");
+        wall_body.append(&files);
+        let wall_files = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        wall_files.set_size_request(220, -1);
+        wall_files.set_visible(false);
+        wall_body.append(&wall_files);
+        wall_body.append(&wall_stack);
+        agents.append(&wall_body);
         content.add_named(&agents, Some("agents"));
         let editor = crate::editor::Editor::new();
         content.add_named(&editor.root, Some("code"));
         let mut pages = BTreeMap::new();
-        for name in ["board", "mailbox", "guardrails", "notes"] {
+        for name in [
+            "board",
+            "modules",
+            "plan",
+            "mailbox",
+            "guardrails",
+            "notes",
+            "dashboard",
+            "settings",
+            "skills",
+            "plugins",
+            "notifications",
+            "devices",
+        ] {
             let page = gtk::Box::new(gtk::Orientation::Vertical, 12);
             page.add_css_class("page");
             content.add_named(&scrolled(&page), Some(name));
@@ -249,8 +335,30 @@ impl Ui {
         body.append(&launch);
         outer.append(&body);
         let status = label("Engine disconnected", "statusbar");
-        outer.append(&status);
-        window.set_child(Some(&outer));
+        let bottom = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        bottom.add_css_class("statusbar");
+        status.set_hexpand(true);
+        bottom.append(&status);
+        let devices_key = button("Devices", "quiet");
+        let usage_key = button("Usage", "quiet");
+        let resources_key = button("Resources", "quiet");
+        bottom.append(&usage_key);
+        bottom.append(&resources_key);
+        bottom.append(&devices_key);
+        outer.append(&bottom);
+        let wallpaper = gtk::Picture::new();
+        wallpaper.set_can_shrink(true);
+        wallpaper.set_content_fit(gtk::ContentFit::Cover);
+        let backdrop = gtk::Overlay::new();
+        backdrop.set_child(Some(&wallpaper));
+        let wallpaper_dim = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        wallpaper_dim.add_css_class("wallpaper-dim");
+        wallpaper_dim.set_can_target(false);
+        backdrop.add_overlay(&wallpaper_dim);
+        backdrop.add_overlay(&outer);
+        outer.set_hexpand(true);
+        outer.set_vexpand(true);
+        window.set_child(Some(&backdrop));
         let ui = Rc::new(Self {
             window,
             rt,
@@ -261,13 +369,33 @@ impl Ui {
             sessions: RefCell::default(),
             projects: RefCell::default(),
             page: RefCell::new("agents".into()),
+            applying_ui: Cell::new(false),
             content,
             pages,
             page_projects: RefCell::default(),
             notice,
             status,
+            sidebar,
+            focus_tabs,
+            mode: RefCell::new("grid".into()),
+            satellites: RefCell::default(),
+            registry_dirty: Cell::new(true),
+            workspaces: RefCell::default(),
+            rendered_sessions: RefCell::default(),
+            restored_project: Cell::new(0),
+            appearance: gtk::CssProvider::new(),
+            wallpaper,
+            wallpaper_dim,
+            font_size: Cell::new(10.0),
+            palette: RefCell::new("matte".into()),
+            keybindings: RefCell::new(json!({})),
+            sound_busy: Cell::new(false),
             projects_box,
             wall,
+            wall_right,
+            wall_split,
+            wall_files,
+            file_tree_revision: Cell::new(0),
             wall_stack,
             panes: RefCell::default(),
             ordered: RefCell::default(),
@@ -279,32 +407,25 @@ impl Ui {
             page_dirty: Cell::new(false),
             connected: Cell::new(false),
             launch,
+            launch_busy: Cell::new(false),
             launch_box,
             editor,
+            note_tabs: gtk::Notebook::new(),
+            note_drafts: RefCell::default(),
         });
-        for (name, caption) in [
-            ("agents", "AGENTS"),
-            ("code", "CODE"),
-            ("board", "BOARD"),
-            ("notes", "NOTES"),
+        for (name, caption, icon) in [
+            ("dashboard", "Dashboard", "view-app-grid-symbolic"),
+            ("skills", "Skills", "applications-science-symbolic"),
+            ("plugins", "Plugins", "application-x-addon-symbolic"),
+            ("code", "Code", "text-x-generic-symbolic"),
+            ("board", "Board", "view-list-symbolic"),
+            ("plan", "Plan", "document-edit-symbolic"),
+            ("notes", "Notes", "accessories-text-editor-symbolic"),
+            ("agents", "Agents", "utilities-terminal-symbolic"),
+            ("mailbox", "Mailbox", "mail-unread-symbolic"),
+            ("guardrails", "Guardrails", "security-high-symbolic"),
         ] {
-            let b = button(caption, "tab");
-            track_navigation(&ui.content, &b, name);
-            tabs.append(&b);
-            let weak = Rc::downgrade(&ui);
-            b.connect_clicked(move |_| {
-                if let Some(ui) = weak.upgrade() {
-                    ui.navigate(name);
-                }
-            });
-        }
-        for (name, caption) in [
-            ("agents", "Agents"),
-            ("board", "Tasks & reviews"),
-            ("mailbox", "Mailbox"),
-            ("guardrails", "Guardrails"),
-        ] {
-            let b = button(caption, "nav");
+            let b = nav_button(caption, icon);
             track_navigation(&ui.content, &b, name);
             nav.append(&b);
             let weak = Rc::downgrade(&ui);
@@ -314,15 +435,66 @@ impl Ui {
                 }
             });
         }
-        for (b, cols) in [(one, 1), (two, 2), (grid, 3)] {
+        for (key, page) in [
+            (settings_key, "settings"),
+            (devices_key, "devices"),
+            (notifications_key, "notifications"),
+        ] {
             let weak = Rc::downgrade(&ui);
-            b.connect_clicked(move |_| {
+            key.connect_clicked(move |_| {
                 if let Some(ui) = weak.upgrade() {
-                    ui.columns.set(cols);
-                    ui.focused.borrow_mut().take();
-                    ui.layout();
+                    ui.navigate(page);
                 }
             });
+        }
+        let weak = Rc::downgrade(&ui);
+        sidebar_key.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                ui.sidebar.set_visible(!ui.sidebar.is_visible());
+                ui.save_layout();
+            }
+        });
+        let weak = Rc::downgrade(&ui);
+        palette_key.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                ui.command_palette();
+            }
+        });
+        let weak = Rc::downgrade(&ui);
+        layouts_key.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                ui.layout_menu();
+            }
+        });
+        let weak = Rc::downgrade(&ui);
+        resources_key.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                ui.resources();
+            }
+        });
+        let weak = Rc::downgrade(&ui);
+        files.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                let show = !ui.wall_files.is_visible();
+                ui.wall_files.set_visible(show);
+                if show {
+                    ui.load_wall_files(String::new());
+                }
+            }
+        });
+        let weak = Rc::downgrade(&ui);
+        usage_key.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                ui.usage();
+            }
+        });
+        ui.install_shortcuts();
+        if let Some(display) = gtk::gdk::Display::default() {
+            gtk::style_context_add_provider_for_display(
+                &display,
+                &ui.appearance,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+            );
         }
         for b in [launch_key, empty_launch] {
             let weak = Rc::downgrade(&ui);
@@ -350,6 +522,13 @@ impl Ui {
                 let weak = weak.clone();
                 surface.connect_layout(move |_, _, _| {
                     if let Some(ui) = weak.upgrade() {
+                        let width = ui.wall_split.width();
+                        if width >= 560 && ui.wall_right.is_visible() {
+                            let position = ui.wall_split.position().clamp(280, width - 280);
+                            if position != ui.wall_split.position() {
+                                ui.wall_split.set_position(position);
+                            }
+                        }
                         for p in ui.panes.borrow().values() {
                             p.schedule_resize();
                         }
@@ -359,9 +538,30 @@ impl Ui {
         });
         let owned = ui.clone();
         ui.window.connect_close_request(move |_| {
+            if owned.launch_busy.get() {
+                owned.show_error("Wait for agent launch to finish before closing.");
+                return glib::Propagation::Stop;
+            }
+            if owned
+                .note_drafts
+                .borrow()
+                .values()
+                .any(|d| d.busy.get() || d.dirty())
+            {
+                owned.show_error("Save or discard note changes before closing.");
+                return glib::Propagation::Stop;
+            }
             if owned.editor.is_dirty() {
                 owned.show_error("Save or discard your editor changes before closing.");
                 return glib::Propagation::Stop;
+            }
+            let drafts: Vec<_> = owned.note_drafts.borrow().values().cloned().collect();
+            for draft in drafts {
+                draft.close();
+            }
+            let satellites = std::mem::take(&mut *owned.satellites.borrow_mut());
+            for w in satellites.values() {
+                w.destroy();
             }
             owned.generation.set(owned.generation.get() + 1);
             owned.connected.set(false);
@@ -396,6 +596,8 @@ impl Ui {
         });
     }
     fn connect(self: &Rc<Self>) {
+        self.registry_dirty.set(true);
+        self.rendered_sessions.borrow_mut().clear();
         self.generation.set(self.generation.get() + 1);
         let generation = self.generation.get();
         self.client.borrow_mut().take();
@@ -415,10 +617,15 @@ impl Ui {
                         return;
                     }
                     *ui.client.borrow_mut() = Some(client);
-                    if let Err(e)=ui.call("bus.subscribe",json!({"events":["project.changed","project.deleted","workspace.changed","session.changed","task.changed","task.deleted","mailbox.new","mailbox.changed","guardrail.held","guardrail.resolved","overlap.changed","notes.changed","file.changed"]})).await { ui.show_error(&e.to_string()); return; }
+                    if let Err(e)=ui.call("bus.subscribe",json!({"events":["project.changed","project.deleted","workspace.changed","session.changed","task.changed","task.deleted","mailbox.new","mailbox.changed","guardrail.held","guardrail.resolved","overlap.changed","notes.changed","file.changed","git.changed","worktree.changed","module.changed","module.deleted","skill.changed","skill.deleted","settings.changed","notify.new","notify.changed","device.changed","run.changed","run.crash","device.signing.changed","avd.changed","layout.changed","ui.changed","ui.toast","usage.changed","integration.changed","integration.result"]})).await { ui.show_error(&e.to_string()); return; }
                     ui.connected.set(true);
                     ui.notice.set_visible(false);
                     ui.refresh();
+                    ui.load_appearance();
+                    ui.load_keybindings();
+                    if *ui.page.borrow() == "devices" {
+                        let _ = ui.call("device.watch", json!({"on":true})).await;
+                    }
                     let weak = Rc::downgrade(&ui);
                     drop(ui);
                     while let Ok(notice) = notices.recv().await {
@@ -430,18 +637,54 @@ impl Ui {
                         }
                         match notice {
                             Notice::Event(e) => {
+                                if e.ev == "notify.new" {
+                                    crate::sounds::notify(&ui, &e.payload);
+                                }
                                 if e.project_id.is_some_and(|id| id != ui.project.get())
                                     && !e.ev.starts_with("project.")
+                                    && !matches!(
+                                        ui.page.borrow().as_str(),
+                                        "dashboard" | "notifications"
+                                    )
                                 {
                                     continue;
                                 }
-                                if e.ev.starts_with("session.")
-                                    || e.ev.starts_with("project.")
-                                    || e.ev.starts_with("workspace.")
-                                {
+                                if e.ev.starts_with("project.") || e.ev.starts_with("workspace.") {
+                                    ui.registry_dirty.set(true);
                                     ui.refresh();
-                                } else if e.ev == "file.changed" {
+                                } else if e.ev.starts_with("session.") {
+                                    ui.refresh();
+                                } else if matches!(
+                                    e.ev.as_str(),
+                                    "file.changed"
+                                        | "git.changed"
+                                        | "worktree.changed"
+                                        | "integration.changed"
+                                        | "integration.result"
+                                ) {
                                     ui.editor.invalidate(&ui);
+                                    if ui.wall_files.is_visible() {
+                                        ui.load_wall_files(String::new());
+                                    }
+                                } else if e.ev == "layout.changed"
+                                    && e.payload["action"] == "applied"
+                                {
+                                    ui.apply_layout(&e.payload["state"]);
+                                } else if e.ev == "ui.toast" {
+                                    ui.show_error(text(&e.payload, "text"));
+                                } else if e.ev == "ui.changed" {
+                                    ui.apply_ui_event(&e.payload);
+                                } else if e.ev == "settings.changed" {
+                                    let path = text(&e.payload, "path");
+                                    if path.starts_with("keybindings") || path.is_empty() {
+                                        ui.load_keybindings();
+                                    }
+                                    if path.starts_with("appearance.")
+                                        || path == "terminal.font_size"
+                                        || path.is_empty()
+                                    {
+                                        ui.load_appearance();
+                                    }
                                 } else {
                                     ui.refresh_page();
                                 }
@@ -466,8 +709,53 @@ impl Ui {
         });
     }
     pub fn navigate(self: &Rc<Self>, page: &str) {
+        if self.content.child_by_name(page).is_none() {
+            return;
+        }
+        if !self.applying_ui.get()
+            && self.connected.get()
+            && matches!(
+                page,
+                "agents"
+                    | "code"
+                    | "board"
+                    | "modules"
+                    | "plan"
+                    | "notes"
+                    | "dashboard"
+                    | "skills"
+                    | "plugins"
+                    | "settings"
+            )
+        {
+            let ui = self.clone();
+            let page = page.to_string();
+            let project = self.project.get();
+            glib::spawn_future_local(async move {
+                if let Err(e) = ui
+                    .call(
+                        "ui.page.switch",
+                        json!({"page":page,"project_id":if project>0 {Some(project)} else {None}}),
+                    )
+                    .await
+                {
+                    ui.show_error(&e.to_string());
+                }
+            });
+        }
+        let previous = self.page.borrow().clone();
+        if (previous == "devices") != (page == "devices") && self.connected.get() {
+            let ui = self.clone();
+            let on = page == "devices";
+            glib::spawn_future_local(async move {
+                if let Err(e) = ui.call("device.watch", json!({"on":on})).await {
+                    ui.show_error(&e.to_string());
+                }
+            });
+        }
         *self.page.borrow_mut() = page.into();
         self.content.set_visible_child_name(page);
+        self.save_layout();
         self.layout();
         if page == "code" {
             self.editor.load_tree(self, None);
@@ -484,45 +772,45 @@ impl Ui {
         glib::spawn_future_local(async move {
             while ui.refresh_dirty.replace(false) {
                 let generation = ui.generation.get();
-                let result = ui.call("project.list", json!({})).await;
-                if generation != ui.generation.get() {
-                    continue;
-                }
-                let projects = match result {
-                    Ok(v) => rows(&v, "projects"),
-                    Err(e) => {
-                        ui.show_error(&e.to_string());
-                        break;
+                if ui.registry_dirty.replace(false) {
+                    let (projects, workspaces) = tokio::join!(
+                        ui.call("project.list", json!({})),
+                        ui.call("workspace.list", json!({}))
+                    );
+                    if generation != ui.generation.get() {
+                        continue;
                     }
-                };
-                *ui.projects.borrow_mut() = projects.clone();
-                if !projects
+                    match (projects, workspaces) {
+                        (Ok(p), Ok(w)) => {
+                            *ui.projects.borrow_mut() = rows(&p, "projects");
+                            *ui.workspaces.borrow_mut() = rows(&w, "workspaces");
+                        }
+                        (Err(e), _) | (_, Err(e)) => {
+                            ui.show_error(&e.to_string());
+                            break;
+                        }
+                    }
+                }
+                if !ui
+                    .projects
+                    .borrow()
                     .iter()
                     .any(|p| p["id"].as_i64() == Some(ui.project.get()))
                 {
-                    ui.project
-                        .set(projects.first().and_then(|p| p["id"].as_i64()).unwrap_or(0));
-                }
-                clear(&ui.projects_box);
-                for p in &projects {
-                    let id = p["id"].as_i64().unwrap_or(0);
-                    let b = button(
-                        &format!("{}\n{}", text(p, "name"), text(p, "base_branch")),
-                        "project",
-                    );
-                    if id == ui.project.get() {
-                        b.add_css_class("selected");
+                    if ui.editor.is_dirty() {
+                        ui.show_error("The selected project was removed. Save or copy your editor changes before selecting another project.");
+                        break;
                     }
-                    let weak = Rc::downgrade(&ui);
-                    b.connect_clicked(move |_| {
-                        if let Some(ui)=weak.upgrade() {
-                            if ui.project.get()==id { return; }
-                            if ui.editor.is_dirty() { ui.show_error("Save or discard your editor changes before switching projects."); return; }
-                            ui.project.set(id); ui.editor.reset(); ui.refresh(); ui.refresh_page();
-                        }
-                    });
-                    ui.projects_box.append(&b);
+                    ui.project.set(
+                        ui.projects
+                            .borrow()
+                            .first()
+                            .and_then(|p| p["id"].as_i64())
+                            .unwrap_or(0),
+                    );
+                    ui.editor.reset();
                 }
+                ui.render_projects();
                 let project = ui.project.get();
                 if project == 0 {
                     ui.sessions.borrow_mut().clear();
@@ -543,14 +831,24 @@ impl Ui {
                     Ok(_) => {}
                     Err(e) => ui.show_error(&e.to_string()),
                 }
-                ui.refresh_page();
+                ui.restore_layout().await;
+                if matches!(ui.page.borrow().as_str(), "board" | "dashboard") {
+                    ui.refresh_page();
+                }
             }
             ui.refresh_pending.set(false);
         });
     }
     fn reconcile(self: &Rc<Self>) {
         let sessions = self.sessions.borrow().clone();
-        let names: Vec<String> = sessions.iter().map(|s| text(s, "name").into()).collect();
+        let available: Vec<String> = sessions.iter().map(|s| text(s, "name").into()).collect();
+        let mut names = self.ordered.borrow().clone();
+        names.retain(|n| available.contains(n));
+        for n in available {
+            if !names.contains(&n) {
+                names.push(n);
+            }
+        }
         let old: Vec<String> = self
             .panes
             .borrow()
@@ -561,8 +859,12 @@ impl Ui {
         for n in old {
             if let Some(p) = self.panes.borrow_mut().remove(&n) {
                 p.stop();
-                if p.root.parent().is_some() {
-                    self.wall.remove(&p.root);
+                if let Some(window) = self.satellites.borrow_mut().remove(&n) {
+                    window.set_child(gtk::Widget::NONE);
+                    window.destroy();
+                }
+                if let Some(grid) = p.root.parent().and_downcast::<gtk::Grid>() {
+                    grid.remove(&p.root);
                 }
             }
         }
@@ -570,54 +872,19 @@ impl Ui {
             let name = text(s, "name");
             if !self.panes.borrow().contains_key(name) {
                 let pane = Pane::new(name, self.path.clone(), self.rt.clone());
+                self.install_pane_controls(&pane, name);
+                pane.apply_appearance(&self.palette.borrow(), self.font_size.get());
                 self.panes.borrow_mut().insert(name.into(), pane);
             }
             let pane = self.panes.borrow().get(name).cloned().unwrap();
-            pane.caption
-                .set_text(&format!("{}  ·  {}", name, text(s, "role")));
-            pane.caption.set_tooltip_text(Some(&format!(
-                "{}\n{}\n{}",
-                text(s, "branch"),
-                text(s, "worktree"),
-                text(s, "intent")
-            )));
-            for class in ["live", "held", "waiting"] {
-                pane.root.remove_css_class(class);
+            let signature = json!({"state":s["state"], "role":s["role"], "provider":s["provider"], "branch":s["branch"], "intent":s["intent"], "pair_with":s["pair_with"]});
+            if self.rendered_sessions.borrow().get(name) != Some(&signature) {
+                pane.update_session(s);
+                self.session_actions(&pane, s);
+                self.rendered_sessions
+                    .borrow_mut()
+                    .insert(name.into(), signature);
             }
-            let state = text(s, "state");
-            let class = match state {
-                "running" | "spawning" => "live",
-                "blocked" => "held",
-                _ => "waiting",
-            };
-            pane.root.add_css_class(class);
-            clear(&pane.actions);
-            let focus = button("Focus", "quiet");
-            let weak = Rc::downgrade(self);
-            let n = name.to_string();
-            focus.connect_clicked(move |_| {
-                if let Some(ui) = weak.upgrade() {
-                    let already = ui.focused.borrow().as_ref() == Some(&n);
-                    *ui.focused.borrow_mut() = if already { None } else { Some(n.clone()) };
-                    ui.layout();
-                }
-            });
-            pane.actions.append(&focus);
-            let (caption, op) = match state {
-                "created" => ("Start", "session.spawn"),
-                "parked" => ("Wake", "session.wake"),
-                "restorable" | "exited" => ("Resume", "session.resume"),
-                _ => ("Park", "session.park"),
-            };
-            let action = button(caption, "quiet");
-            let weak = Rc::downgrade(self);
-            let n = name.to_string();
-            action.connect_clicked(move |b| {
-                if let Some(ui) = weak.upgrade() {
-                    ui.mutate(op, json!({"session":n}), b);
-                }
-            });
-            pane.actions.append(&action);
         }
         if *self.ordered.borrow() != names {
             *self.ordered.borrow_mut() = names;
@@ -649,10 +916,13 @@ impl Ui {
     }
     fn update_attachments(&self) {
         let focus = self.focused.borrow();
+        let mode = self.mode.borrow();
         for s in self.sessions.borrow().iter() {
             if let Some(p) = self.panes.borrow().get(text(s, "name")) {
-                let active = *self.page.borrow() == "agents"
-                    && focus.as_ref().is_none_or(|n| n == text(s, "name"))
+                let active = (self.satellites.borrow().contains_key(text(s, "name"))
+                    || (*self.page.borrow() == "agents"
+                        && (mode.as_str() != "focus"
+                            || focus.as_ref().is_none_or(|n| n == text(s, "name")))))
                     && !matches!(
                         text(s, "state"),
                         "created" | "parked" | "restorable" | "exited"
@@ -668,39 +938,31 @@ impl Ui {
                 .paste_text(&format!("native-paste-check-{name}\n"));
         }
     }
-    fn layout(&self) {
-        while let Some(w) = self.wall.first_child() {
-            self.wall.remove(&w);
-        }
-        if self
-            .focused
-            .borrow()
-            .as_ref()
-            .is_some_and(|n| !self.ordered.borrow().contains(n))
-        {
-            self.focused.borrow_mut().take();
-        }
-        let names = self.ordered.borrow();
-        let focus = self.focused.borrow();
-        let columns = if focus.is_some() {
-            1
-        } else {
-            self.columns.get()
-        };
-        let mut index = 0;
-        for name in names.iter() {
-            if let Some(p) = self.panes.borrow().get(name) {
-                if focus.as_ref().is_some_and(|n| n != name) {
-                    continue;
-                }
-                self.wall
-                    .attach(&p.root, index % columns, index / columns, 1, 1);
-                p.schedule_resize();
-                index += 1;
+    pub fn verify_burst(&self, check: bool) {
+        use vte4::prelude::TerminalExt;
+        assert_eq!(self.panes.borrow().len(), 11);
+        for (name, pane) in self.panes.borrow().iter() {
+            if check {
+                let (_, row) = pane.terminal.cursor_position();
+                let (tail, _) = pane.terminal.text_range_format(
+                    vte4::Format::Text,
+                    (row - 10).max(0),
+                    0,
+                    row,
+                    200,
+                );
+                assert!(
+                    tail.unwrap_or_default()
+                        .contains(&format!("BURST-END-{name}")),
+                    "No native tail marker for {name}"
+                );
+            } else {
+                pane.terminal.paste_text("native-burst\n");
             }
         }
-        drop(focus);
-        self.update_attachments();
+        if check {
+            println!("BURST_RENDERED=11");
+        }
     }
     pub fn refresh_page(self: &Rc<Self>) {
         self.page_dirty.set(true);
@@ -712,10 +974,17 @@ impl Ui {
             while ui.page_dirty.replace(false) {
                 let page = ui.page.borrow().clone();
                 let project = ui.project.get();
-                if project == 0 || matches!(page.as_str(), "agents" | "code") {
+                if matches!(page.as_str(), "agents" | "code") {
                     continue;
                 }
-                crate::pages::refresh(&ui, &page, project).await;
+                if matches!(
+                    page.as_str(),
+                    "dashboard" | "settings" | "skills" | "plugins" | "notifications" | "devices"
+                ) {
+                    crate::tools::refresh(&ui, &page, project).await;
+                } else if project != 0 {
+                    crate::pages::refresh(&ui, &page, project).await;
+                }
             }
             ui.page_pending.set(false);
         });
@@ -769,69 +1038,6 @@ impl Ui {
                 }
                 Err(e) => ui.show_error(&e.to_string()),
             }
-        });
-    }
-    pub fn show_launch(self: &Rc<Self>, task: Option<i64>) {
-        if self.project.get() == 0 {
-            self.show_error("Open a repository before adding agents.");
-            return;
-        }
-        clear(&self.launch_box);
-        self.launch.set_reveal_child(true);
-        self.launch_box.append(&label("Add agents", "title"));
-        let provider = gtk::DropDown::from_strings(&["Claude", "Codex"]);
-        field("Builder", &provider, &self.launch_box);
-        let model = gtk::Entry::builder()
-            .placeholder_text("Provider default")
-            .build();
-        field("Model (optional)", &model, &self.launch_box);
-        let pair = gtk::CheckButton::with_label("Add a reviewer in the same worktree");
-        self.launch_box.append(&pair);
-        let reviewer = gtk::DropDown::from_strings(&["Codex", "Claude"]);
-        field("Reviewer", &reviewer, &self.launch_box);
-        let prompt = gtk::TextView::new();
-        prompt.set_wrap_mode(gtk::WrapMode::WordChar);
-        prompt.set_size_request(-1, 180);
-        field("Assignment", &prompt, &self.launch_box);
-        if let Some(task) = task {
-            self.launch_box
-                .append(&label(&format!("Task #{task}"), "dim"));
-        }
-        let hint=label("Each builder gets an isolated worktree. Reviewers share that worktree with read-only authority. Task approval stays with you.","dim");
-        hint.set_wrap(true);
-        self.launch_box.append(&hint);
-        let start = button("Launch", "primary");
-        let cancel = button("Cancel", "quiet");
-        self.launch_box.append(&start);
-        self.launch_box.append(&cancel);
-        let weak = Rc::downgrade(self);
-        cancel.connect_clicked(move |_| {
-            if let Some(ui) = weak.upgrade() {
-                ui.launch.set_reveal_child(false);
-            }
-        });
-        let weak = Rc::downgrade(self);
-        let project = self.project.get();
-        start.connect_clicked(move |b| {
-            let Some(ui)=weak.upgrade() else{return;}; b.set_sensitive(false); let key=b.clone();
-            let provider=if provider.selected()==0{"claude"}else{"codex"};
-            let reviewer=if reviewer.selected()==0{"codex"}else{"claude"}; let paired=pair.is_active();
-            let model=model.text().to_string(); let buffer=prompt.buffer();let prompt=buffer.text(&buffer.start_iter(),&buffer.end_iter(),false).to_string();
-            glib::spawn_future_local(async move {
-                let result=async {
-                    let builder=ui.call("session.create",json!({"project_id":project,"provider":provider,"role":"builder","model":if model.is_empty(){None}else{Some(model)},"task_id":task})).await?;
-                    let name=text(&builder,"name");
-                    let review=if paired {
-                        let review=ui.call("session.create",json!({"project_id":project,"provider":reviewer,"role":"reviewer","pair_with":name,"task_id":task})).await?;
-                        Some(review)
-                    }else{None};
-                    if let Some(task)=task {ui.call("task.dispatch",json!({"task_id":task,"session":name,"start":false})).await?;}
-                    if let Some(review)=review{ui.call("session.spawn",json!({"session":review["name"],"prompt":format!("Review the paired builder's work. Coordinate through Relay mailbox. Assignment: {prompt}")})).await?;}
-                    ui.call("session.spawn",json!({"session":name,"prompt":prompt})).await
-                }.await;
-                match result {Ok(_)=>{ui.launch.set_reveal_child(false);ui.navigate("agents");},Err(e)=>ui.show_error(&format!("Launch incomplete: {e}. Allocated sessions are preserved on the wall; inspect them before retrying."))}
-                key.set_sensitive(true);ui.refresh();
-            });
         });
     }
 }

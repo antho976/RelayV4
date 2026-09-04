@@ -82,35 +82,43 @@ components:
 **Creative North Star: "The Multiviewer"**
 
 Relay is a compact console surrounding a wall of agent terminals. Screen-black
-plates, narrow gutters and persistent bottom identity strips make sessions
+plates, narrow gutters and persistent top identity strips make sessions
 readable at a glance. In Operate mode, terminal work and attention states lead.
 
 Visual authority is Relay-2 at `1745dd3f68b7bc786f48142ad7da591537aeb057`, especially
-its `DESIGN.md`, `theme.ts`, `AgentsWall.svelte` and shell components. The user
+its `theme.ts`, `TerminalPane.svelte`, `AgentsWall.svelte`, `Icon.svelte` and
+shell components. Rendered component anatomy takes precedence over stale prose. The user
 explicitly requested this identity and layout; V3's UI is not the reference.
-The native theme lives in `apps/relay-native/src/theme.css`. This documents the
-built GTK4 foundation, not full Relay-2 feature parity.
+The native theme lives in `apps/relay-native/src/theme.css`, with runtime palette
+and wallpaper application in `shell.rs`. This records the implemented GTK4
+surfaces; it does not certify complete feature parity, visual fidelity or device
+runtime behavior. Validation and remaining coverage belong in
+`docs/VERIFICATION.md` and `docs/PARITY.md`.
 
 **Key Characteristics:**
-- Screen-black square plates with bottom session identity strips.
+- Screen-black square plates with top session identity strips.
 - Compact neutral console, off-white primary keys and state-only color.
 - Fira reading text, condensed labels and monospace terminals.
 - Native GTK controls, VTE terminals and GtkSourceView source editing.
+- Sidebar navigation, worktree tools and persistent note tabs/satellites.
+- Matte, Dark and OLED palettes with optional wallpaper controls.
 
 ## Colors
 
-Frontmatter records the native theme palette; names below describe its roles.
+Frontmatter records the default Matte palette; names below describe its roles.
+Dark and OLED modes replace the neutral palette through the same semantic roles.
+Live and held colors retain their meanings in every mode.
 
 ### Primary
-- **Lit Ink** (`ink`): primary text, primary action fill and selected top tabs.
+- **Lit Ink** (`ink`): primary text and primary action fill.
   Primary keys use `wall` text and brighten to white on hover.
 
 ### Secondary
-- **Live Green** (`live`): running terminal frame and identity-strip top rule.
-- **Attention Red** (`held`): held terminal frame, strip rule and session name;
+- **Live Green** (`live`): running session lamp.
+- **Attention Red** (`held`): held session lamp and session name;
   also the notice underline.
 - **Waiting Amber** (`waiting`): reserved in the theme for waiting states.
-  Waiting terminal frames currently remain neutral; amber is not yet applied.
+  Waiting lamps currently use secondary ink. All terminal frames remain neutral.
 
 ### Neutral
 - **Wall**: canvas and gaps between plates. **Console**: bars, sidebar and strips.
@@ -124,8 +132,9 @@ Frontmatter records the native theme palette; names below describe its roles.
 ## Typography
 
 Fira Sans carries reading text; Fira Sans Condensed carries tracked navigation
-labels. Fonts use installed Linux fallbacks. VTE requests Fira Mono at 10pt,
-which is a Pango point size, not a CSS pixel size. GTK owns scaling and metrics.
+labels. Fonts use installed Linux fallbacks. VTE requests Fira Mono at 10pt by
+default, adjustable from 8pt to 24pt in Settings. These are Pango point sizes,
+not CSS pixels. GTK owns scaling and metrics.
 
 Body, titles, controls and labels use their frontmatter roles. Status text is
 11px plain sans; session names are 12px semibold. The RELAY wordmark increases
@@ -135,16 +144,28 @@ Relay-2 editor palette.
 
 ## Layout
 
-The sidebar requests 200px. The top bar has a 40px minimum height, the status
+The sidebar requests 200px. The top bar has a 42px minimum height, the status
 line 24px and toolbars 38px; native theme metrics can increase these minimums.
 The default window is 1440 by 900. Pages and the right-side launch sheet use
 20px insets; the sheet requests 380px width.
 
-Terminal plates form an equal-cell GTK grid with 2px gutters. Single, Split and
-Grid select one, two or three columns; Focus shows one session. Plates request
-at least 280 by 280 and the wall scrolls vertically. There are no automatic
-breakpoints or mobile layouts in this foundation. The Code view uses a native
-resizable split initially positioned at 240px for the tree.
+Navigation lives in the sidebar, followed by projects grouped under workspaces.
+Settings sits in its footer. The top bar carries identity and utility controls,
+without a second row of page tabs. The bottom status bar exposes resource and
+device tools.
+
+Grid mode uses square terminal plates with 2px gutters and one, two or three
+columns. The two-column wall has a draggable divider. Focus shows one session
+with session tabs; Review places the focused session beside the remaining
+stack. Plates request at least 280 by 280 and the wall scrolls vertically.
+Sessions can be reordered and moved to separate native windows. A collapsible
+file rail sits beside the wall. Layout selection, order and split position can
+be saved. There are no automatic mobile breakpoints.
+
+Code uses resizable file-tree, editor and Git regions with a worktree selector.
+Its tree split starts at 240px; file and Git regions can be hidden. Notes uses a
+list beside a scrollable native tab strip and editor. Tabs identify project and
+note, can reorder, and can open in separate windows.
 
 ## Elevation & Depth
 
@@ -153,11 +174,18 @@ titlebar suppress shadows. Popovers use slab fill and an edge stroke; remaining
 popup decoration belongs to GTK. No custom shadow or motion token system is
 implemented. Launch reveal duration is zero and VTE cursor blinking is off.
 
+Optional PNG/JPEG wallpaper fills the window with cover sizing, beneath a black
+dim layer. Settings exposes a wallpaper library, panel opacity, wallpaper dim
+and content contrast. Increasing content contrast raises effective panel
+opacity; terminal and text-entry grounds remain opaque for legibility. The
+Matte default uses fully opaque panels.
+
 ## Shapes
 
 Plates, records and navigation rows are square. Keys and entries use the small
-key radius. Terminal boundaries and strip top rules are 1px strokes; live and
-held states change their color without changing their width.
+key radius. Terminal boundaries and strip separators are neutral 1px strokes
+in every session state. Live and held lamps carry the tally color; held session
+names also turn red.
 
 ## Components
 
@@ -173,9 +201,16 @@ the stroke to secondary. Native text views have 8px padding and ink carets.
 GTK supplies editing, selection and accessibility semantics.
 
 ### Navigation
-Top tabs invert when selected. Sidebar navigation selects with wash and ink.
-Project rows have a 44px minimum height; the active project adds a 2px ink rail.
-GTK owns window controls and menus.
+Sidebar navigation selects with wash and ink. Compact project rows have a 30px
+minimum height; the active project adds a 2px ink rail. Focus-session tabs use
+neutral wash for selection. GTK owns window controls and menus.
+
+### Icons
+`apps/relay-native/src/icons.rs` carries the pinned Relay-2 SVG path geometry.
+Shared shell/action icons use a 16-unit view box, 1.5-unit strokes and rounded
+stroke caps and joins, rendered by GTK's SVG paintable. Preserve that geometry
+when adding native controls. Native widget fallback icons remain GTK-owned;
+matching path geometry alone is not proof of complete rendering fidelity.
 
 ### Records / Containers
 Records are flat square slabs with 12px padding. Board lanes use console fill
@@ -183,24 +218,36 @@ and 4px padding. Notices use slab, ink and an attention-colored bottom rule.
 
 ### Terminal plate
 VTE owns rendering and scrolling. Terminal margins are 10px left, 2px right,
-8px top and 4px bottom. The bottom identity strip uses console fill, 8px side
-padding and a 28px minimum height. Session names ellipsize in the middle; status
-and compact action keys follow. Identity remains visible while terminals are
+8px top and 4px bottom. The top identity strip uses console fill, 8px side
+padding and a 26px minimum height, with a neutral bottom separator. A colored
+lamp leads the session name, provider/role metadata, state and compact actions.
+Session names ellipsize in the middle. Identity remains visible while terminals are
 busy. VTE supports Ctrl+Shift+C/V, preserves scroll position on output and
 scrolls on keystrokes.
+
+### Code and notes
+GtkSourceView provides the Code gutter, highlighting, find/replace and native
+text editing. Worktree selection scopes the file tree, content search, file
+operations and Git controls. Read-only comparisons sit beside editable source;
+staging, commits, history and branch tools stay in the Git region.
+
+Notes uses native text editing with Markdown tools and find/replace. Open drafts
+remain mounted in tabs or satellite windows, with explicit Save and Discard
+controls and dirty-close protection. Plan uses the same editor with its title
+fixed. Preserve project identity when a tab outlives navigation.
 
 ### Native adaptations
 Mail composition remains mounted while messages refresh. Message/error text is
 selectable. Approval controls distinguish task approval from permission to
-execute a held action. GtkSourceView owns highlighting and the gutter.
-Full docking, worktree-aware Code tools, Notes satellite, skills/settings and
-other future surfaces remain in the imported roadmap.
+execute a held action. Task details, skills, settings, launch profiles and
+device tooling use native controls. Imported roadmap documents are future
+requirements, not evidence that every corresponding surface is complete.
 
 ## Do's and Don'ts
 
 ### Do:
 - Do preserve the compact console and square terminal plate anatomy.
-- Do keep session identity visible beneath terminal content.
+- Do keep session identity visible above terminal content in its top strip.
 - Do use off-white primary keys and state color only where it has meaning.
 - Do preserve native keyboard focus, selection and clipboard behavior.
 
@@ -208,4 +255,4 @@ other future surfaces remain in the imported roadmap.
 - Don't add decorative accent colors, pill surfaces or idle animation.
 - Don't copy web layout rules into GTK without checking native behavior.
 - Don't treat imported roadmap surfaces as implemented UI.
-- Don't claim full parity, sustained performance or complete accessibility from foundation captures.
+- Don't claim full parity, sustained performance or complete accessibility from screenshots alone.

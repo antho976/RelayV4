@@ -5,6 +5,18 @@ use serde_json::{json, Value};
 use std::cell::RefCell;
 use std::rc::Rc;
 
+#[path = "note_pages.rs"]
+mod note_pages;
+#[path = "task_pages.rs"]
+mod task_pages;
+pub use task_pages::Draft;
+pub fn open_note(ui: &Rc<Ui>, note: Value) {
+    note_pages::edit(ui, note);
+}
+pub fn open_task(ui: &Rc<Ui>, id: i64) {
+    task_pages::open(ui, id);
+}
+
 fn paragraph(value: &str) -> gtk::Label {
     let l = label(value, "body");
     l.set_wrap(true);
@@ -17,10 +29,16 @@ pub async fn refresh(ui: &Rc<Ui>, name: &str, project: i64) {
         "board" => ("task.list", "tasks"),
         "mailbox" => ("mailbox.list", "messages"),
         "guardrails" => ("guardrail.holds.list", "holds"),
-        "notes" => ("notes.list", "notes"),
+        "notes" | "plan" => ("notes.list", "notes"),
+        "modules" => ("module.list", "modules"),
         _ => return,
     };
-    let result = ui.call(op, json!({"project_id":project})).await;
+    let payload = if name == "modules" {
+        json!({"project_id":project,"include_archived":true})
+    } else {
+        json!({"project_id":project})
+    };
+    let result = ui.call(op, payload).await;
     if ui.project.get() != project || *ui.page.borrow() != name {
         return;
     }
@@ -31,6 +49,10 @@ pub async fn refresh(ui: &Rc<Ui>, name: &str, project: i64) {
             return;
         }
     };
+    if matches!(name, "notes" | "plan") {
+        note_pages::workspace(ui, name, project, &data);
+        return;
+    }
     let page = &ui.pages[name];
     // Keep forms mounted while events update the list below them.
     let owner = ui.page_projects.borrow().get(name).copied();
@@ -42,6 +64,8 @@ pub async fn refresh(ui: &Rc<Ui>, name: &str, project: i64) {
                 "board" => "Tasks & reviews",
                 "mailbox" => "Mailbox",
                 "guardrails" => "Guardrails",
+                "modules" => "Modules",
+                "plan" => "Plan",
                 _ => "Notes",
             },
             "title",
@@ -50,6 +74,8 @@ pub async fn refresh(ui: &Rc<Ui>, name: &str, project: i64) {
             "mailbox" => mail_composer(ui, page, project),
             "board" => task_composer(ui, page, project),
             "notes" => note_composer(ui, page, project),
+            "modules" => note_pages::module_composer(ui, page, project),
+            "plan" => {}
             _ => page.append(&paragraph(
                 "Decide which held actions may proceed. Refused actions cannot be approved here.",
             )),
@@ -115,13 +141,11 @@ pub async fn refresh(ui: &Rc<Ui>, name: &str, project: i64) {
         }
         "notes" => {
             for note in data {
-                let row = gtk::Box::new(gtk::Orientation::Vertical, 6);
-                row.add_css_class("record");
-                row.append(&label(text(&note, "title"), "title"));
-                row.append(&paragraph(text(&note, "body")));
-                body.append(&row);
+                note_pages::note_row(ui, &body, note);
             }
         }
+        "plan" => note_pages::plan(ui, &body, &data, project),
+        "modules" => note_pages::modules(ui, &body, &data),
         _ => {}
     }
 }
@@ -135,6 +159,36 @@ fn task_composer(ui: &Rc<Ui>, page: &gtk::Box, project: i64) {
     row.append(&title);
     row.append(&add);
     page.append(&row);
+    let filters = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let query = gtk::SearchEntry::builder()
+        .placeholder_text("Search tasks, labels, or session")
+        .hexpand(true)
+        .build();
+    query.set_widget_name("board-query");
+    filters.append(&query);
+    let kind = task_pages::choose(&["", "task", "feature", "bug", "chore", "spike"], "");
+    kind.set_widget_name("board-kind");
+    kind.set_tooltip_text(Some("Filter task type"));
+    filters.append(&kind);
+    let priority = task_pages::choose(&["", "low", "medium", "high", "urgent"], "");
+    priority.set_widget_name("board-priority");
+    priority.set_tooltip_text(Some("Filter task priority"));
+    filters.append(&priority);
+    let page_weak = page.downgrade();
+    query.connect_search_changed(move |_| {
+        if let Some(page) = page_weak.upgrade() {
+            filter_board(&page)
+        }
+    });
+    for control in [&kind, &priority] {
+        let page_weak = page.downgrade();
+        control.connect_changed(move |_| {
+            if let Some(page) = page_weak.upgrade() {
+                filter_board(&page)
+            }
+        });
+    }
+    page.append(&filters);
     let weak = Rc::downgrade(ui);
     add.connect_clicked(move |b| {
         let Some(ui) = weak.upgrade() else {
@@ -180,6 +234,37 @@ fn board(ui: &Rc<Ui>, body: &gtk::Box, tasks: &[Value]) {
     ] {
         let lane = gtk::Box::new(gtk::Orientation::Vertical, 8);
         lane.add_css_class("board-lane");
+        let drop = gtk::DropTarget::new(String::static_type(), gtk::gdk::DragAction::MOVE);
+        let weak = Rc::downgrade(ui);
+        let project = ui.project.get();
+        drop.connect_drop(move |_, value, _, _| {
+            let Some(ui) = weak.upgrade() else {
+                return false;
+            };
+            let Ok(token) = value.get::<String>() else {
+                return false;
+            };
+            let Some(id) = token
+                .strip_prefix("relay-task:")
+                .and_then(|s| s.parse::<i64>().ok())
+            else {
+                return false;
+            };
+            if ui.project.get() != project {
+                return false;
+            }
+            glib::spawn_future_local(async move {
+                if let Err(e) = ui
+                    .call("task.move", json!({"task_id":id,"column":name}))
+                    .await
+                {
+                    ui.show_error(&e.to_string());
+                }
+                ui.refresh_page();
+            });
+            true
+        });
+        lane.add_controller(drop);
         lane.append(&label(
             &format!(
                 "{title}  {}",
@@ -191,7 +276,59 @@ fn board(ui: &Rc<Ui>, body: &gtk::Box, tasks: &[Value]) {
         for task in tasks.iter().filter(|t| text(t, "column") == name) {
             let row = gtk::Box::new(gtk::Orientation::Vertical, 8);
             row.add_css_class("record");
-            row.append(&paragraph(text(task, "title")));
+            row.set_widget_name("task-card");
+            let terms = format!(
+                "{} {} {} {} {}",
+                task["id"],
+                text(task, "title"),
+                text(task, "body"),
+                task["labels"],
+                task["sessions"]
+            );
+            row.set_tooltip_text(Some(&format!(
+                "{}\n{}\n{}",
+                text(task, "type"),
+                text(task, "priority"),
+                terms
+            )));
+            let open = button(
+                &format!("#{}  {}", task["id"], text(task, "title")),
+                "quiet",
+            );
+            if let Some(label) = open.child().and_downcast::<gtk::Label>() {
+                label.set_wrap(true);
+                label.set_xalign(0.0);
+            }
+            let weak = Rc::downgrade(ui);
+            let task_id = task["id"].as_i64().unwrap_or(0);
+            let drag = gtk::DragSource::new();
+            drag.set_actions(gtk::gdk::DragAction::MOVE);
+            drag.connect_prepare(move |_, _, _| {
+                Some(gtk::gdk::ContentProvider::for_value(
+                    &format!("relay-task:{task_id}").to_value(),
+                ))
+            });
+            row.add_controller(drag);
+            open.connect_clicked(move |_| {
+                if let Some(ui) = weak.upgrade() {
+                    task_pages::open(&ui, task_id)
+                }
+            });
+            row.append(&open);
+            row.append(&label(
+                &format!("{} · {}", text(task, "type"), text(task, "priority")),
+                "dim",
+            ));
+            if let Some(tags) = task["labels"].as_array() {
+                let tags = tags
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                if !tags.is_empty() {
+                    row.append(&paragraph(&tags));
+                }
+            }
             let detail = gtk::Expander::builder().label("Details").build();
             let details = gtk::Box::new(gtk::Orientation::Vertical, 6);
             details.append(&paragraph(text(task, "body")));
@@ -235,6 +372,49 @@ fn board(ui: &Rc<Ui>, body: &gtk::Box, tasks: &[Value]) {
             }
             lane.append(&row);
         }
+    }
+    if let Some(page) = body.parent().and_downcast::<gtk::Box>() {
+        filter_board(&page);
+    }
+}
+fn widgets(root: &impl IsA<gtk::Widget>) -> Vec<gtk::Widget> {
+    let mut result = Vec::new();
+    let mut child = root.first_child();
+    while let Some(widget) = child {
+        child = widget.next_sibling();
+        result.extend(widgets(&widget));
+        result.push(widget);
+    }
+    result
+}
+fn filter_board(page: &gtk::Box) {
+    let controls = widgets(page);
+    let query = controls
+        .iter()
+        .find(|w| w.widget_name() == "board-query")
+        .and_then(|w| w.clone().downcast::<gtk::SearchEntry>().ok())
+        .map(|w| w.text().trim().to_lowercase())
+        .unwrap_or_default();
+    let selected = |name: &str| {
+        controls
+            .iter()
+            .find(|w| w.widget_name() == name)
+            .and_then(|w| w.clone().downcast::<gtk::ComboBoxText>().ok())
+            .map(|w| task_pages::chosen(&w))
+            .unwrap_or_default()
+    };
+    let kind = selected("board-kind");
+    let priority = selected("board-priority");
+    for card in controls.iter().filter(|w| w.widget_name() == "task-card") {
+        let metadata = card.tooltip_text().unwrap_or_default();
+        let mut lines = metadata.lines();
+        let card_kind = lines.next().unwrap_or("");
+        let card_priority = lines.next().unwrap_or("");
+        card.set_visible(
+            (kind.is_empty() || kind == card_kind)
+                && (priority.is_empty() || priority == card_priority)
+                && metadata.to_lowercase().contains(&query),
+        );
     }
 }
 fn mail_composer(ui: &Rc<Ui>, page: &gtk::Box, project: i64) {

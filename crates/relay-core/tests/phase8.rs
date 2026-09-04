@@ -514,3 +514,42 @@ fn a_held_commit_still_commits_when_confirmed() {
         .unwrap();
     assert_eq!(log["commits"][0]["subject"], "Too big");
 }
+#[test]
+fn file_save_expectation_rejects_stale_content_and_deleted_files() {
+    use sha2::{Digest, Sha256};
+    let e = engine();
+    let (ws, repo) = real_repo();
+    add_project(&e, &ws, &repo);
+    let expected = Sha256::digest(b"# Relay\n")
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let payload =
+        json!({"project_id":1,"path":"README.md","text":"my draft","expected_sha256":expected});
+    std::fs::write(
+        std::path::Path::new(&repo).join("README.md"),
+        "newer agent edit",
+    )
+    .unwrap();
+    assert_eq!(
+        err(&call(&e, "file.write", payload.clone())).code,
+        "file.edit_conflict"
+    );
+    assert_eq!(
+        std::fs::read_to_string(std::path::Path::new(&repo).join("README.md")).unwrap(),
+        "newer agent edit"
+    );
+    std::fs::remove_file(std::path::Path::new(&repo).join("README.md")).unwrap();
+    assert_eq!(
+        err(&call(&e, "file.write", payload)).code,
+        "file.edit_conflict"
+    );
+    std::fs::write(std::path::Path::new(&repo).join("README.md"), "# Relay\n").unwrap();
+    call(
+        &e,
+        "file.write",
+        json!({"project_id":1,"path":"README.md","text":"saved","expected_sha256":expected}),
+    )
+    .into_result()
+    .unwrap();
+}

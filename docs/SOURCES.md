@@ -9,7 +9,10 @@ Inspected on 2026-09-04:
 
 `crates/` and `schema/` originate from the pinned Relay-2 revision. Any subsequent
 changes appear in this repository's history. `apps/relay-native/src/` is written
-fresh here; V3's application implementation was not copied.
+fresh here; V3's application implementation was not copied. Relay-2's
+`Icon.svelte` geometry is ported directly into native `icons.rs`. The bundled
+scrcpy server and its upstream license are documented in
+`apps/relay-native/resources/README.md`.
 
 `docs/upstream-v3/` is a verbatim snapshot. Its dates, task numbers, paths,
 completed gates, decisions, ownership rules and instructions describe V3, not

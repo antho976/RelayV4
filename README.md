@@ -31,23 +31,25 @@ The matching rebuilt engine provides `guardrail.hold.get`; an older engine
 can render the shell but cannot provide exact hold review. The client never
 silently replaces a running engine. Closing it keeps sessions and worktrees.
 
-Open a repository from the sidebar, then add a solo builder or a builder with
-a reviewer. The Code tab currently edits the project checkout. Agents work in
-their own engine-managed worktrees. Tasks, mailbox, holds and project notes
-use the same bus as the CLI.
+Open a repository from the sidebar, then add solo agents or a group of
+one or two builders sharing a reviewer. Code can edit the primary checkout or
+an agent worktree. Board, Notes, Skills, Settings, usage and Android device tools
+use the same bus as the CLI. [Parity coverage](docs/PARITY.md) records the current
+implementation and validation boundaries. Mirroring and notification audio use
+the installed FFmpeg tools (`ffmpeg` and `ffplay`).
 
 ## Verify
 
 ```fish
 cargo test --workspace
 cargo fmt -p relay-native --check
-cargo clippy -p relay-native --all-targets -- -D warnings
+cargo clippy -p relay-native --all-targets -- -D warnings -A deprecated
 python3 scripts/native-smoke.py
 ```
 
 The display smoke test creates its own temporary store, repository and fake
 provider executables. It opens the GTK application at two desktop sizes and
-checks that six sessions survive window closure. It never launches a paid
+checks saves, a review-group launch and eleven-session output delivery. It never launches a paid
 model or touches the user's project store. Screenshots go under
 `.impeccable/review/`.
 

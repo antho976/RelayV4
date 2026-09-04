@@ -77,6 +77,146 @@ impl Fixture {
 }
 
 #[test]
+fn task_note_and_module_draft_expectations_reject_stale_writes_atomically() {
+    let f = Fixture::new();
+    for (kind, id_key, field, original) in [
+        (
+            "task",
+            "task_id",
+            "body",
+            f.task("Draft", json!({"body":"original"})),
+        ),
+        (
+            "notes",
+            "note_id",
+            "body",
+            ok(
+                &f.engine,
+                "notes.create",
+                json!({"project_id":1,"body":"original"}),
+            ),
+        ),
+        (
+            "module",
+            "module_id",
+            "name",
+            ok(
+                &f.engine,
+                "module.create",
+                json!({"project_id":1,"name":"original"}),
+            ),
+        ),
+    ] {
+        let op = format!("{kind}.update");
+        let gate = Arc::new(std::sync::Barrier::new(3));
+        let mut writers = Vec::new();
+        for body in ["first writer", "second writer"] {
+            let engine = f.engine.clone();
+            let gate = gate.clone();
+            let op = op.clone();
+            let payload = json!({id_key:original["id"],field:body,"expected":{field:"original"}});
+            writers.push(std::thread::spawn(move || {
+                gate.wait();
+                call(&engine, Actor::User, &op, payload)
+            }));
+        }
+        gate.wait();
+        let replies: Vec<_> = writers.into_iter().map(|w| w.join().unwrap()).collect();
+        assert_eq!(replies.iter().filter(|r| r.ok).count(), 1);
+        assert_eq!(
+            replies
+                .iter()
+                .filter(|r| !r.ok)
+                .next()
+                .unwrap()
+                .error
+                .as_ref()
+                .unwrap()
+                .code,
+            format!("{kind}.edit_conflict")
+        );
+        let winner = &replies
+            .iter()
+            .find(|r| r.ok)
+            .unwrap()
+            .result
+            .as_ref()
+            .unwrap()[field];
+        assert_eq!(
+            ok(
+                &f.engine,
+                &format!("{kind}.get"),
+                json!({id_key:original["id"]})
+            )[field],
+            *winner
+        );
+
+        // A legacy caller can still patch, while a stale editor cannot overwrite its change.
+        ok(
+            &f.engine,
+            &op,
+            json!({id_key:original["id"],field:"legacy edit"}),
+        );
+        assert_eq!(
+            code(call(
+                &f.engine,
+                Actor::User,
+                &op,
+                json!({id_key:original["id"],field:"stale draft","expected":{field:winner}})
+            )),
+            format!("{kind}.edit_conflict")
+        );
+        assert_eq!(
+            code(call(
+                &f.engine,
+                Actor::User,
+                &op,
+                json!({id_key:original["id"],"expected":{"typo":null}})
+            )),
+            format!("{kind}.expected_field")
+        );
+    }
+}
+
+#[test]
+fn draft_expectations_preserve_nulls_and_ignore_unmentioned_fields() {
+    let f = Fixture::new();
+    let task = f.task("Draft", json!({}));
+    ok(
+        &f.engine,
+        "task.update",
+        json!({"task_id":task["id"],"priority":"high"}),
+    );
+    let updated = ok(
+        &f.engine,
+        "task.update",
+        json!({"task_id":task["id"],"body":"edited","expected":{"body":"","size":null,"module_id":null,"type":task["type"]}}),
+    );
+    assert_eq!(updated["priority"], "high");
+    let note = ok(
+        &f.engine,
+        "notes.create",
+        json!({"project_id":1,"body":"original"}),
+    );
+    assert!(note["title"].is_null());
+    let updated = ok(
+        &f.engine,
+        "notes.update",
+        json!({"note_id":note["id"],"title":"Named","expected":{"title":null,"pinned":false}}),
+    );
+    assert_eq!(updated["title"], "Named");
+    assert_eq!(
+        code(call(
+            &f.engine,
+            Actor::User,
+            "notes.update",
+            json!({"note_id":note["id"],"title":null,"expected":{"title":null}})
+        )),
+        "notes.edit_conflict"
+    );
+}
+
+#[test]
 fn sub_tasks_roll_up_and_stay_real_cards() {
     let f = Fixture::new();
     let e = &f.engine;

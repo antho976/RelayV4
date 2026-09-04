@@ -38,11 +38,17 @@ fn next_queued_task(
          ORDER BY ts.queue_ord,t.position,t.id LIMIT 1",
         params![session_id, completed_task_id],
         |row| Ok((row.get(0)?, row.get(1)?)),
-    ).optional().bus()
+    )
+    .optional()
+    .bus()
 }
 
 fn launch_nudge(row: &Row_) -> Option<String> {
-    if let Some(assignment) = row.launch_prompt.as_deref().filter(|text| !text.trim().is_empty()) {
+    if let Some(assignment) = row
+        .launch_prompt
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+    {
         return Some(format!(
             "Call session.bootstrap first, then begin this assignment: {}",
             assignment.trim(),
@@ -89,12 +95,14 @@ fn assert_own(ctx: &Ctx, row: &Row_, reads_ok_for_pair: bool) -> Result<(), BusE
 fn actor_project(ctx: &Ctx) -> Result<Option<Id>, BusError> {
     let Some(sid) = ctx.actor_session_id() else {
         if ctx.actor.is_agent() {
-            return Err(BusError::actor("agent actor is not bound to a live session"));
+            return Err(BusError::actor(
+                "agent actor is not bound to a live session",
+            ));
         }
         return Ok(None);
     };
-    let own = sessions::by_id(ctx.tx(), sid)?
-        .ok_or_else(|| BusError::actor("bound session vanished"))?;
+    let own =
+        sessions::by_id(ctx.tx(), sid)?.ok_or_else(|| BusError::actor("bound session vanished"))?;
     Ok(Some(own.session.project_id))
 }
 
@@ -102,7 +110,9 @@ fn actor_project(ctx: &Ctx) -> Result<Option<Id>, BusError> {
 /// keep using [`assert_own`].
 fn assert_same_project(ctx: &Ctx, row: &Row_) -> Result<(), BusError> {
     match actor_project(ctx)? {
-        Some(project_id) if project_id != row.session.project_id => Err(BusError::not_own("project")),
+        Some(project_id) if project_id != row.session.project_id => {
+            Err(BusError::not_own("project"))
+        }
         _ => Ok(()),
     }
 }
@@ -111,7 +121,11 @@ fn assert_same_project(ctx: &Ctx, row: &Row_) -> Result<(), BusError> {
 /// report; without this, an unhooked provider reads as a session that has never done anything.
 fn overlay_live_output(ctx: &Ctx, sessions: &mut [Session]) {
     for session in sessions {
-        if let Some(at) = ctx.engine().pty(session.id).and_then(|pty| pty.last_output_at()) {
+        if let Some(at) = ctx
+            .engine()
+            .pty(session.id)
+            .and_then(|pty| pty.last_output_at())
+        {
             session.last_output_at = Some(at);
         }
     }
@@ -122,7 +136,9 @@ fn claim_path(raw: &str) -> Result<String, BusError> {
     let path = Path::new(raw.trim());
     if raw.trim().is_empty()
         || path.is_absolute()
-        || path.components().any(|c| matches!(c, std::path::Component::ParentDir))
+        || path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
     {
         return Err(BusError::invalid(
             "session.claim_path",
@@ -135,49 +151,79 @@ fn claim_path(raw: &str) -> Result<String, BusError> {
 fn emit_session(ctx: &mut Ctx, s: &Session) {
     ctx.set_project(s.project_id);
     ctx.set_session(s.id);
-    ctx.emit("session.changed", serde_json::to_value(s).unwrap_or(Value::Null));
+    ctx.emit(
+        "session.changed",
+        serde_json::to_value(s).unwrap_or(Value::Null),
+    );
 }
 
 fn notify_completion(ctx: &mut Ctx, s: &Session, summary: &str) -> Result<(), BusError> {
     let link = done_link(s);
-    ctx.tx().execute(
-        "INSERT INTO notifications(project_id, category, title, body, link, read, created_at)
+    ctx.tx()
+        .execute(
+            "INSERT INTO notifications(project_id, category, title, body, link, read, created_at)
          VALUES (?1, 'agent_done', ?2, ?3, ?4, 0, ?5)",
-        params![s.project_id, format!("{} finished", s.name), summary, link, ctx.now],
-    ).bus()?;
+            params![
+                s.project_id,
+                format!("{} finished", s.name),
+                summary,
+                link,
+                ctx.now
+            ],
+        )
+        .bus()?;
     if let Some(message) = crate::handlers::notes::send_system(
-        ctx.tx(), s.project_id, "*", &format!("{} finished: {}", s.name, summary), s.task_id, &ctx.now,
+        ctx.tx(),
+        s.project_id,
+        "*",
+        &format!("{} finished: {}", s.name, summary),
+        s.task_id,
+        &ctx.now,
     )? {
         ctx.emit("mailbox.new", serde_json::to_value(message).bus()?);
     }
-    ctx.emit("notify.new", json!({"category":"agent_done", "project_id":s.project_id, "session":s.name}));
+    ctx.emit(
+        "notify.new",
+        json!({"category":"agent_done", "project_id":s.project_id, "session":s.name}),
+    );
     Ok(())
 }
 
 #[derive(Clone, Copy)]
-enum LaunchKind { Fresh, Resume }
+enum LaunchKind {
+    Fresh,
+    Resume,
+}
 
-fn write_session_file(worktree: &Path, relative: &str, text: &str, code: &'static str) -> Result<(), BusError> {
+fn write_session_file(
+    worktree: &Path,
+    relative: &str,
+    text: &str,
+    code: &'static str,
+) -> Result<(), BusError> {
     let path = worktree.join(relative);
-    let parent = path.parent().ok_or_else(|| BusError::internal("session brief path has no parent"))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| BusError::internal("session brief path has no parent"))?;
     fs::create_dir_all(parent).map_err(|error| {
-        BusError::unavailable(
-            code,
-            format!("cannot create {}: {error}", parent.display()),
-        )
+        BusError::unavailable(code, format!("cannot create {}: {error}", parent.display()))
     })?;
     fs::write(&path, text).map_err(|error| {
-        BusError::unavailable(
-            code,
-            format!("cannot write {}: {error}", path.display()),
-        )
+        BusError::unavailable(code, format!("cannot write {}: {error}", path.display()))
     })
 }
 
 fn uninstall_git_chain(tx: &Transaction, repo: &Path, worktree: &Path) -> Result<(), BusError> {
-    let mut stmt = tx.prepare_cached("SELECT name FROM sessions WHERE worktree=?1 ORDER BY id DESC").bus()?;
-    let names = stmt.query_map([worktree.display().to_string()], |row| row.get::<_, String>(0)).bus()?
-        .collect::<rusqlite::Result<Vec<_>>>().bus()?;
+    let mut stmt = tx
+        .prepare_cached("SELECT name FROM sessions WHERE worktree=?1 ORDER BY id DESC")
+        .bus()?;
+    let names = stmt
+        .query_map([worktree.display().to_string()], |row| {
+            row.get::<_, String>(0)
+        })
+        .bus()?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .bus()?;
     for name in names {
         crate::hooks::uninstall_git(repo, worktree, &name).bus()?;
     }
@@ -188,7 +234,10 @@ fn launch(ctx: &mut Ctx, row: &Row_, kind: LaunchKind) -> Result<Session, BusErr
     let cmd = crate::providers::executable(ctx.tx(), row.session.provider)?;
     let cwd = PathBuf::from(&row.session.worktree);
     if !cwd.is_dir() {
-        return Err(BusError::conflict("session.worktree_missing", format!("worktree {} is gone", cwd.display())));
+        return Err(BusError::conflict(
+            "session.worktree_missing",
+            format!("worktree {} is gone", cwd.display()),
+        ));
     }
     let relay_bin = crate::hooks::relay_bin();
     let project = crate::handlers::workspace::get_project(ctx.tx(), row.session.project_id)?;
@@ -208,12 +257,16 @@ fn launch(ctx: &mut Ctx, row: &Row_, kind: LaunchKind) -> Result<Session, BusErr
     // Every enabled skill becomes a real provider skill folder in this worktree, whatever
     // project it belongs to (D147). A skill folder that cannot be written is never worth
     // failing a launch over, so this reports and continues.
-    if let Err(error) = crate::skills::materialize(ctx.tx(), &ctx.engine().store, &cwd, row.session.project_id) {
+    if let Err(error) =
+        crate::skills::materialize(ctx.tx(), &ctx.engine().store, &cwd, row.session.project_id)
+    {
         tracing::warn!(session = %row.session.name, error = %error, "materializing skills");
     }
     // Codex reads skills only from its own home, so the checkout alone would leave a Codex
     // session with nothing registered (D147).
-    if let Err(error) = crate::skills::materialize_user(ctx.tx(), &ctx.engine().store, ctx.instance()) {
+    if let Err(error) =
+        crate::skills::materialize_user(ctx.tx(), &ctx.engine().store, ctx.instance())
+    {
         tracing::warn!(session = %row.session.name, error = %error, "materializing user skills");
     }
     // The brief is delivered on *every* spawn, not only with a dispatched task: an agent with
@@ -224,13 +277,22 @@ fn launch(ctx: &mut Ctx, row: &Row_, kind: LaunchKind) -> Result<Session, BusErr
     // The file lives inside the private worktree, so it may carry the launch assignment. The
     // injected copy may not: for Codex it ends up in argv, which anyone can read with `ps`.
     let mut on_disk = brief.compact.clone();
-    if let Some(assignment) = row.launch_prompt.as_deref().filter(|text| !text.trim().is_empty()) {
+    if let Some(assignment) = row
+        .launch_prompt
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+    {
         on_disk.push_str(&format!("\n\nLaunch assignment:\n{assignment}"));
     }
     let brief_path = crate::awareness::session_brief_path(&row.session.name);
     let role_path = crate::providers::role_instructions_relative(&row.session.name);
     write_session_file(&cwd, &brief_path, &on_disk, "session.brief_write_failed")?;
-    write_session_file(&cwd, SESSION_SKILLS_PATH, &brief.parts.skills, "session.brief_write_failed")?;
+    write_session_file(
+        &cwd,
+        SESSION_SKILLS_PATH,
+        &brief.parts.skills,
+        "session.brief_write_failed",
+    )?;
     let instructions = format!(
         "{}\n\n{}",
         crate::providers::role_instructions(row.session.role),
@@ -244,21 +306,29 @@ fn launch(ctx: &mut Ctx, row: &Row_, kind: LaunchKind) -> Result<Session, BusErr
     )?;
     let mut args = match kind {
         LaunchKind::Fresh => crate::providers::driver(row.session.provider).args(
-            &row.session, crate::providers::Launch::Fresh, Some(&brief.compact),
+            &row.session,
+            crate::providers::Launch::Fresh,
+            Some(&brief.compact),
         ),
         LaunchKind::Resume => crate::providers::driver(row.session.provider).args(
             &row.session,
-            crate::providers::Launch::Resume { provider_ref: row.session.provider_ref.as_deref() },
+            crate::providers::Launch::Resume {
+                provider_ref: row.session.provider_ref.as_deref(),
+            },
             Some(&brief.compact),
         ),
     };
     if row.session.provider == Provider::Codex {
-        args.extend(["--config".into(), crate::providers::codex_notify_config(&relay_bin)]);
+        args.extend([
+            "--config".into(),
+            crate::providers::codex_notify_config(&relay_bin),
+        ]);
     }
     let initial_scrollback = match kind {
         LaunchKind::Fresh => Vec::new(),
         LaunchKind::Resume => sessions::load_scrollback(ctx.tx(), row.session.id)?
-            .map(|saved| saved.0.into_bytes()).unwrap_or_default(),
+            .map(|saved| saved.0.into_bytes())
+            .unwrap_or_default(),
     };
     let epoch = row.epoch + 1;
     let spec = SpawnSpec {
@@ -272,7 +342,10 @@ fn launch(ctx: &mut Ctx, row: &Row_, kind: LaunchKind) -> Result<Session, BusErr
             ("RELAY_WORKTREE".into(), row.session.worktree.clone()),
             ("RELAY_BRIEF".into(), brief_path),
             ("RELAY_BIN".into(), relay_bin.display().to_string()),
-            ("RELAY_STORE".into(), ctx.engine().store.path().display().to_string()),
+            (
+                "RELAY_STORE".into(),
+                ctx.engine().store.path().display().to_string(),
+            ),
         ],
         cwd,
         cols: 120,
@@ -320,7 +393,9 @@ fn launch(ctx: &mut Ctx, row: &Row_, kind: LaunchKind) -> Result<Session, BusErr
          exit_code=NULL,restore_reason=NULL,updated_at=?3 WHERE id=?4",
         params![pty.pid() as i64, epoch as i64, ctx.now, sid],
     ).bus()?;
-    if let Some(old) = ctx.engine().set_pty(sid, &row.session.name, pty) { old.kill(Duration::from_millis(500)); }
+    if let Some(old) = ctx.engine().set_pty(sid, &row.session.name, pty) {
+        old.kill(Duration::from_millis(500));
+    }
     if matches!(kind, LaunchKind::Fresh) {
         if let Some(prompt) = launch_nudge(row) {
             ctx.after_commit(move |engine| {
@@ -332,7 +407,8 @@ fn launch(ctx: &mut Ctx, row: &Row_, kind: LaunchKind) -> Result<Session, BusErr
             });
         }
     }
-    let updated = sessions::by_id(ctx.tx(), sid)?.ok_or_else(|| BusError::internal("session vanished"))?;
+    let updated =
+        sessions::by_id(ctx.tx(), sid)?.ok_or_else(|| BusError::internal("session vanished"))?;
     emit_session(ctx, &updated.session);
     Ok(updated.session)
 }
@@ -439,11 +515,12 @@ pub fn register(e: &mut Engine) {
         ).bus()?;
         ctx.tx().execute(
             "INSERT INTO sessions(name, project_id, provider, role, model, effort, branch, worktree, task_id, module_id, pair_with,
-                                  bus_writes, allow_ui, state, token, epoch, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'created', ?14, 0, ?15, ?15)",
+                                  bus_writes, allow_ui, state, token, epoch, created_at, updated_at, launch_prompt)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'created', ?14, 0, ?15, ?15, ?16)",
             params![name, project.id, sessions::provider_str(p.provider), sessions::role_str(p.role.unwrap_or(relay_bus::types::Role::Builder)),
                     p.model, p.effort, branch, worktree_path, p.task_id, p.module_id, p.pair_with,
-                    p.bus_writes.unwrap_or(false) as i64, p.allow_ui.unwrap_or(false) as i64, token, ctx.now],
+                    p.bus_writes.unwrap_or(false) as i64, p.allow_ui.unwrap_or(false) as i64, token, ctx.now,
+                    p.prompt.filter(|prompt| !prompt.trim().is_empty())],
         ).bus()?;
         let id = ctx.tx().last_insert_rowid();
         if let Some(pair) = &pair {
@@ -469,24 +546,45 @@ pub fn register(e: &mut Engine) {
         let row = sessions::by_name(ctx.tx(), &p.session)?;
         match row.session.state {
             SessionState::Created => {
-                let launch_prompt = p.prompt.filter(|prompt| !prompt.trim().is_empty());
-                ctx.tx().execute(
-                    "UPDATE sessions SET launch_prompt=?1,updated_at=?2 WHERE id=?3",
-                    params![launch_prompt, ctx.now, row.session.id],
-                ).bus()?;
+                if let Some(prompt) = p.prompt {
+                    let launch_prompt = (!prompt.trim().is_empty()).then_some(prompt);
+                    ctx.tx()
+                        .execute(
+                            "UPDATE sessions SET launch_prompt=?1,updated_at=?2 WHERE id=?3",
+                            params![launch_prompt, ctx.now, row.session.id],
+                        )
+                        .bus()?;
+                }
                 let updated = sessions::by_id(ctx.tx(), row.session.id)?
                     .ok_or_else(|| BusError::internal("session vanished"))?;
                 launch(ctx, &updated, LaunchKind::Fresh)
             }
-            s if sessions::is_live(s) => Err(BusError::conflict("session.already_spawned", format!("session {} is {}", row.session.name, sessions::state_str(s)))),
-            s => Err(BusError::conflict("session.state", format!("session {} is {}; use session.resume or session.wake", row.session.name, sessions::state_str(s)))),
+            s if sessions::is_live(s) => Err(BusError::conflict(
+                "session.already_spawned",
+                format!("session {} is {}", row.session.name, sessions::state_str(s)),
+            )),
+            s => Err(BusError::conflict(
+                "session.state",
+                format!(
+                    "session {} is {}; use session.resume or session.wake",
+                    row.session.name,
+                    sessions::state_str(s)
+                ),
+            )),
         }
     });
 
     e.register::<Resume>(|ctx: &mut Ctx, p| {
         let row = sessions::by_name(ctx.tx(), &p.session)?;
         if row.session.state != SessionState::Restorable {
-            return Err(BusError::conflict("session.state", format!("session {} is {}; only restorable sessions resume", row.session.name, sessions::state_str(row.session.state))));
+            return Err(BusError::conflict(
+                "session.state",
+                format!(
+                    "session {} is {}; only restorable sessions resume",
+                    row.session.name,
+                    sessions::state_str(row.session.state)
+                ),
+            ));
         }
         launch(ctx, &row, LaunchKind::Resume)
     });
@@ -530,7 +628,14 @@ pub fn register(e: &mut Engine) {
     e.register::<Wake>(|ctx: &mut Ctx, p| {
         let row = sessions::by_name(ctx.tx(), &p.session)?;
         if row.session.state != SessionState::Parked {
-            return Err(BusError::conflict("session.state", format!("session {} is {}; only parked sessions wake", row.session.name, sessions::state_str(row.session.state))));
+            return Err(BusError::conflict(
+                "session.state",
+                format!(
+                    "session {} is {}; only parked sessions wake",
+                    row.session.name,
+                    sessions::state_str(row.session.state)
+                ),
+            ));
         }
         launch(ctx, &row, LaunchKind::Resume)
     });
@@ -548,23 +653,37 @@ pub fn register(e: &mut Engine) {
         // project and nothing outside it (D106). `session.get` draws the same line.
         let scope = actor_project(ctx)?;
         if let (Some(own), Some(asked)) = (scope, p.project_id) {
-            if own != asked { return Err(BusError::not_own("project")); }
+            if own != asked {
+                return Err(BusError::not_own("project"));
+            }
         }
         let project_id = scope.or(p.project_id);
         let mut sql = String::from("SELECT * FROM sessions WHERE 1=1");
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        if let Some(pid) = project_id { sql.push_str(" AND project_id = ?"); args.push(Box::new(pid)); }
-        if !p.include_closed.unwrap_or(false) { sql.push_str(" AND state != 'closed'"); }
+        if let Some(pid) = project_id {
+            sql.push_str(" AND project_id = ?");
+            args.push(Box::new(pid));
+        }
+        if !p.include_closed.unwrap_or(false) {
+            sql.push_str(" AND state != 'closed'");
+        }
         if let Some(states) = &p.state {
             if !states.is_empty() {
                 let marks = states.iter().map(|_| "?").collect::<Vec<_>>().join(",");
                 sql.push_str(&format!(" AND state IN ({marks})"));
-                for s in states { args.push(Box::new(sessions::state_str(*s).to_string())); }
+                for s in states {
+                    args.push(Box::new(sessions::state_str(*s).to_string()));
+                }
             }
         }
         sql.push_str(" ORDER BY id");
         let mut st = ctx.tx().prepare(&sql).bus()?;
-        let rows = st.query_map(rusqlite::params_from_iter(args.iter().map(|b| b.as_ref())), sessions::row).bus()?
+        let rows = st
+            .query_map(
+                rusqlite::params_from_iter(args.iter().map(|b| b.as_ref())),
+                sessions::row,
+            )
+            .bus()?
             .collect::<rusqlite::Result<Vec<_>>>();
         let mut sessions: Vec<Session> = rows.bus()?.into_iter().map(|r| r.session).collect();
         overlay_live_output(ctx, &mut sessions);
@@ -572,7 +691,8 @@ pub fn register(e: &mut Engine) {
     });
 
     e.register::<Peers>(|ctx, p| {
-        let (project_id, except): (Id, Option<String>) = match (p.session.as_deref(), p.project_id) {
+        let (project_id, except): (Id, Option<String>) = match (p.session.as_deref(), p.project_id)
+        {
             (Some(name), None) => {
                 let row = sessions::by_name(ctx.tx(), name)?;
                 assert_own(ctx, &row, true)?;
@@ -581,11 +701,16 @@ pub fn register(e: &mut Engine) {
             (None, Some(project_id)) => {
                 crate::handlers::workspace::get_project(ctx.tx(), project_id)?;
                 if let Some(sid) = ctx.actor_session_id() {
-                    let own = sessions::by_id(ctx.tx(), sid)?.ok_or_else(|| BusError::actor("bound session vanished"))?;
-                    if own.session.project_id != project_id { return Err(BusError::not_own("project")); }
+                    let own = sessions::by_id(ctx.tx(), sid)?
+                        .ok_or_else(|| BusError::actor("bound session vanished"))?;
+                    if own.session.project_id != project_id {
+                        return Err(BusError::not_own("project"));
+                    }
                     (project_id, Some(own.session.name))
                 } else if ctx.actor.is_agent() {
-                    return Err(BusError::actor("agent actor is not bound to a live session"));
+                    return Err(BusError::actor(
+                        "agent actor is not bound to a live session",
+                    ));
                 } else {
                     (project_id, None)
                 }
@@ -594,14 +719,32 @@ pub fn register(e: &mut Engine) {
             // which project, when it only ever has one, was pure ceremony.
             (None, None) => match ctx.actor_session_id() {
                 Some(sid) => {
-                    let own = sessions::by_id(ctx.tx(), sid)?.ok_or_else(|| BusError::actor("bound session vanished"))?;
+                    let own = sessions::by_id(ctx.tx(), sid)?
+                        .ok_or_else(|| BusError::actor("bound session vanished"))?;
                     (own.session.project_id, Some(own.session.name))
                 }
-                None => return Err(BusError::invalid("session.peers_target", "provide exactly one of session or project_id")),
+                None => {
+                    return Err(BusError::invalid(
+                        "session.peers_target",
+                        "provide exactly one of session or project_id",
+                    ))
+                }
             },
-            _ => return Err(BusError::invalid("session.peers_target", "provide exactly one of session or project_id")),
+            _ => {
+                return Err(BusError::invalid(
+                    "session.peers_target",
+                    "provide exactly one of session or project_id",
+                ))
+            }
         };
-        Ok(PeersOut { peers: crate::awareness::peers(ctx.tx(), project_id, except.as_deref(), Some(ctx.engine()))? })
+        Ok(PeersOut {
+            peers: crate::awareness::peers(
+                ctx.tx(),
+                project_id,
+                except.as_deref(),
+                Some(ctx.engine()),
+            )?,
+        })
     });
 
     e.register::<Brief>(|ctx, p| {
@@ -612,7 +755,8 @@ pub fn register(e: &mut Engine) {
     });
 
     e.register::<Bootstrap>(|ctx, _| {
-        let session_id = ctx.actor_session_id()
+        let session_id = ctx
+            .actor_session_id()
             .ok_or_else(|| BusError::actor("session.bootstrap requires a bound agent session"))?;
         let row = sessions::by_id(ctx.tx(), session_id)?
             .ok_or_else(|| BusError::actor("bound session vanished"))?;
@@ -737,13 +881,18 @@ pub fn register(e: &mut Engine) {
         assert_own(ctx, &row, false)?;
         let text = p.text.trim();
         if text.chars().count() > 200 {
-            return Err(BusError::invalid("session.intent", "intent is one line: 200 characters at most"));
+            return Err(BusError::invalid(
+                "session.intent",
+                "intent is one line: 200 characters at most",
+            ));
         }
         let intent = (!text.is_empty()).then(|| text.to_string());
-        ctx.tx().execute(
-            "UPDATE sessions SET intent=?1, updated_at=?2 WHERE id=?3",
-            params![intent, ctx.now, row.session.id],
-        ).bus()?;
+        ctx.tx()
+            .execute(
+                "UPDATE sessions SET intent=?1, updated_at=?2 WHERE id=?3",
+                params![intent, ctx.now, row.session.id],
+            )
+            .bus()?;
         let updated = sessions::by_id(ctx.tx(), row.session.id)?
             .ok_or_else(|| BusError::internal("session vanished"))?;
         emit_session(ctx, &updated.session);
@@ -811,27 +960,40 @@ pub fn register(e: &mut Engine) {
     });
 
     e.register::<Release>(|ctx: &mut Ctx, p| {
-        let session_id = ctx.actor_session_id()
+        let session_id = ctx
+            .actor_session_id()
             .ok_or_else(|| BusError::actor("session.release requires a bound agent session"))?;
         let own = sessions::by_id(ctx.tx(), session_id)?
-            .ok_or_else(|| BusError::actor("bound session vanished"))?.session;
+            .ok_or_else(|| BusError::actor("bound session vanished"))?
+            .session;
         let released = match &p.paths {
-            None => ctx.tx().execute("DELETE FROM claims WHERE session_id=?1", [session_id]).bus()?,
+            None => ctx
+                .tx()
+                .execute("DELETE FROM claims WHERE session_id=?1", [session_id])
+                .bus()?,
             Some(paths) => {
                 let mut removed = 0;
                 for raw in paths {
                     let path = claim_path(raw)?;
-                    removed += ctx.tx().execute(
-                        "DELETE FROM claims WHERE session_id=?1 AND path=?2",
-                        params![session_id, path],
-                    ).bus()?;
+                    removed += ctx
+                        .tx()
+                        .execute(
+                            "DELETE FROM claims WHERE session_id=?1 AND path=?2",
+                            params![session_id, path],
+                        )
+                        .bus()?;
                 }
                 removed
             }
         };
         ctx.set_project(own.project_id);
-        ctx.emit("overlap.changed", json!({"project_id": own.project_id, "session": own.name, "released": released}));
-        Ok(ReleaseOut { released: released as u32 })
+        ctx.emit(
+            "overlap.changed",
+            json!({"project_id": own.project_id, "session": own.name, "released": released}),
+        );
+        Ok(ReleaseOut {
+            released: released as u32,
+        })
     });
 
     e.register::<Report>(|ctx: &mut Ctx, p| {
@@ -955,13 +1117,33 @@ pub fn register(e: &mut Engine) {
     });
 
     e.register::<RestorableList>(|ctx, _| {
-        let mut stmt = ctx.tx().prepare_cached("SELECT * FROM sessions WHERE state='restorable' ORDER BY id").bus()?;
-        let rows = stmt.query_map([], sessions::row).bus()?.collect::<rusqlite::Result<Vec<_>>>().bus()?;
+        let mut stmt = ctx
+            .tx()
+            .prepare_cached("SELECT * FROM sessions WHERE state='restorable' ORDER BY id")
+            .bus()?;
+        let rows = stmt
+            .query_map([], sessions::row)
+            .bus()?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .bus()?;
         let mut out = Vec::new();
         for row in rows {
-            let reason: Option<String> = ctx.tx().query_row("SELECT restore_reason FROM sessions WHERE id=?1", [row.session.id], |r| r.get(0)).bus()?;
-            let dirty = gix::open(&row.session.worktree).ok().is_some_and(|repo| worktree::is_dirty(&repo));
-            out.push(Restorable { session: row.session, reason: reason.unwrap_or_else(|| "app_restart".into()), worktree_dirty: dirty });
+            let reason: Option<String> = ctx
+                .tx()
+                .query_row(
+                    "SELECT restore_reason FROM sessions WHERE id=?1",
+                    [row.session.id],
+                    |r| r.get(0),
+                )
+                .bus()?;
+            let dirty = gix::open(&row.session.worktree)
+                .ok()
+                .is_some_and(|repo| worktree::is_dirty(&repo));
+            out.push(Restorable {
+                session: row.session,
+                reason: reason.unwrap_or_else(|| "app_restart".into()),
+                worktree_dirty: dirty,
+            });
         }
         Ok(RestorableOut { sessions: out })
     });
@@ -1079,7 +1261,14 @@ pub fn register(e: &mut Engine) {
         let row = sessions::by_name(ctx.tx(), &p.session)?;
         assert_own(ctx, &row, true)?;
         if ctx.engine().pty(row.session.id).is_none() {
-            return Err(BusError::conflict("session.not_spawned", format!("session {} has no PTY (state {})", row.session.name, sessions::state_str(row.session.state))));
+            return Err(BusError::conflict(
+                "session.not_spawned",
+                format!(
+                    "session {} has no PTY (state {})",
+                    row.session.name,
+                    sessions::state_str(row.session.state)
+                ),
+            ));
         }
         Ok(Empty {})
     });
@@ -1090,24 +1279,43 @@ pub fn register(e: &mut Engine) {
     });
     e.register::<Input>(|ctx, p| {
         let row = sessions::by_name(ctx.tx(), &p.session)?;
-        let pty = ctx.engine().pty(row.session.id)
-            .ok_or_else(|| BusError::conflict("session.not_spawned", format!("session {} has no PTY", row.session.name)))?;
+        let pty = ctx.engine().pty(row.session.id).ok_or_else(|| {
+            BusError::conflict(
+                "session.not_spawned",
+                format!("session {} has no PTY", row.session.name),
+            )
+        })?;
         if pty.exited() {
-            return Err(BusError::conflict("session.exited", format!("session {} has exited", row.session.name)));
+            return Err(BusError::conflict(
+                "session.exited",
+                format!("session {} has exited", row.session.name),
+            ));
         }
-        pty.write(p.data.as_bytes()).map_err(|e| BusError::conflict("session.io", e.to_string()))?;
+        pty.write(p.data.as_bytes())
+            .map_err(|e| BusError::conflict("session.io", e.to_string()))?;
         if row.session.state == SessionState::Idle && !p.data.is_empty() {
-            ctx.tx().execute("UPDATE sessions SET state='running',updated_at=?1 WHERE id=?2", params![ctx.now, row.session.id]).bus()?;
-            let updated = sessions::by_id(ctx.tx(), row.session.id)?.ok_or_else(|| BusError::internal("session vanished"))?;
+            ctx.tx()
+                .execute(
+                    "UPDATE sessions SET state='running',updated_at=?1 WHERE id=?2",
+                    params![ctx.now, row.session.id],
+                )
+                .bus()?;
+            let updated = sessions::by_id(ctx.tx(), row.session.id)?
+                .ok_or_else(|| BusError::internal("session vanished"))?;
             emit_session(ctx, &updated.session);
         }
         Ok(Empty {})
     });
     e.register::<Resize>(|ctx, p| {
         let row = sessions::by_name(ctx.tx(), &p.session)?;
-        let pty = ctx.engine().pty(row.session.id)
-            .ok_or_else(|| BusError::conflict("session.not_spawned", format!("session {} has no PTY", row.session.name)))?;
-        pty.resize(p.cols, p.rows).map_err(|e| BusError::conflict("session.io", e.to_string()))?;
+        let pty = ctx.engine().pty(row.session.id).ok_or_else(|| {
+            BusError::conflict(
+                "session.not_spawned",
+                format!("session {} has no PTY", row.session.name),
+            )
+        })?;
+        pty.resize(p.cols, p.rows)
+            .map_err(|e| BusError::conflict("session.io", e.to_string()))?;
         Ok(Empty {})
     });
     e.register::<Scrollback>(|ctx, p| {
@@ -1117,7 +1325,15 @@ pub fn register(e: &mut Engine) {
             Some(pty) => pty.scrollback(p.lines.map(|n| n as usize)),
             None => {
                 let (text, epoch, seq) = sessions::load_scrollback(ctx.tx(), row.session.id)?
-                    .ok_or_else(|| BusError::conflict("session.not_spawned", format!("session {} has no PTY or saved scrollback", row.session.name)))?;
+                    .ok_or_else(|| {
+                        BusError::conflict(
+                            "session.not_spawned",
+                            format!(
+                                "session {} has no PTY or saved scrollback",
+                                row.session.name
+                            ),
+                        )
+                    })?;
                 let text = match p.lines {
                     Some(lines) => {
                         let all = text.lines().collect::<Vec<_>>();
@@ -1137,7 +1353,8 @@ pub fn pty_by_name(engine: &Engine, name: &str) -> Result<(Id, Arc<Pty>), BusErr
     let conn = engine.store.lock();
     let row = sessions::by_name(&conn, name)?;
     drop(conn);
-    let pty = engine.pty(row.session.id)
-        .ok_or_else(|| BusError::conflict("session.not_spawned", format!("session {name} has no PTY")))?;
+    let pty = engine.pty(row.session.id).ok_or_else(|| {
+        BusError::conflict("session.not_spawned", format!("session {name} has no PTY"))
+    })?;
     Ok((row.session.id, pty))
 }

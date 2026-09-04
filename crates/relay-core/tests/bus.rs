@@ -293,29 +293,54 @@ fn device_release_build_records_its_artifact() {
     let mut permissions = std::fs::metadata(&apksigner).unwrap().permissions();
     permissions.set_mode(0o755);
     std::fs::set_permissions(&apksigner, permissions).unwrap();
-    call(&e, Actor::User, "settings.set", json!({"path":"device.sdk_path","value":sdk.path()})).into_result().unwrap();
+    call(
+        &e,
+        Actor::User,
+        "settings.set",
+        json!({"path":"device.sdk_path","value":sdk.path()}),
+    )
+    .into_result()
+    .unwrap();
 
     let (workspace, repo) = tmp_repo();
-    let initialized = std::process::Command::new("git").args(["-C", &repo, "init", "-b", "trunk"]).output().unwrap();
+    let initialized = std::process::Command::new("git")
+        .args(["-C", &repo, "init", "-b", "trunk"])
+        .output()
+        .unwrap();
     assert!(initialized.status.success());
-    let workspace_path = std::fs::canonicalize(workspace.path()).unwrap().display().to_string();
-    call(&e, Actor::User, "workspace.create", json!({"path":workspace_path})).into_result().unwrap();
-    let project = call(&e, Actor::User, "project.add", json!({"workspace_id":1,"path":repo})).into_result().unwrap();
+    let workspace_path = std::fs::canonicalize(workspace.path())
+        .unwrap()
+        .display()
+        .to_string();
+    call(
+        &e,
+        Actor::User,
+        "workspace.create",
+        json!({"path":workspace_path}),
+    )
+    .into_result()
+    .unwrap();
+    let project = call(
+        &e,
+        Actor::User,
+        "project.add",
+        json!({"workspace_id":1,"path":repo}),
+    )
+    .into_result()
+    .unwrap();
     let project_id = project["id"].as_i64().unwrap();
     let root = std::path::Path::new(project["path"].as_str().unwrap()).to_path_buf();
 
-    let signing = call(&e, Actor::User, "device.signing.get", json!({"project_id":project_id})).into_result().unwrap();
+    let signing = call(
+        &e,
+        Actor::User,
+        "device.signing.get",
+        json!({"project_id":project_id}),
+    )
+    .into_result()
+    .unwrap();
     assert_eq!(signing["configured"], false);
     assert_eq!(signing["enabled"], false);
-    let over_socket = e.dispatch(
-        Request::new(
-            Actor::User,
-            "device.signing.create",
-            json!({"project_id":project_id,"key_alias":"other","password":"another-secret"}),
-        ),
-        Door::Socket,
-    );
-    assert_eq!(err(&over_socket).code, "bus.door", "passwords only cross the Tauri door");
 
     // The wrapper records the task Relay chose — asserting on that log cannot silently skip
     // the way reading a finished run's buffer can — and leaves the artifact AGP would.
@@ -349,7 +374,14 @@ esac
     permissions.set_mode(0o755);
     std::fs::set_permissions(&wrapper, permissions).unwrap();
 
-    let build = call(&e, Actor::User, "device.build", json!({"project_id":project_id})).into_result().unwrap();
+    let build = call(
+        &e,
+        Actor::User,
+        "device.build",
+        json!({"project_id":project_id}),
+    )
+    .into_result()
+    .unwrap();
     assert_eq!(build["kind"], "build");
     assert_eq!(build["device"], "");
     assert_eq!(build["state"], "building");
@@ -362,7 +394,14 @@ esac
 
     let mut finished = json!(null);
     wait_until("the release build to finish", || {
-        let result = call(&e, Actor::User, "device.run.list", json!({"project_id":project_id})).into_result().unwrap();
+        let result = call(
+            &e,
+            Actor::User,
+            "device.run.list",
+            json!({"project_id":project_id}),
+        )
+        .into_result()
+        .unwrap();
         finished = result["runs"][0].clone();
         finished["state"] == "finished" || finished["state"] == "failed"
     });
@@ -370,44 +409,77 @@ esac
     assert_eq!(finished["id"].as_i64().unwrap(), build_id);
     assert_eq!(
         finished["artifact"].as_str().unwrap(),
-        root.join("app/build/outputs/apk/release/app-release.apk").display().to_string()
+        root.join("app/build/outputs/apk/release/app-release.apk")
+            .display()
+            .to_string()
     );
     assert_eq!(finished["signing"], "signed");
 
     // The task Relay handed Gradle, and the SDK it handed with it.
     let tasks = std::fs::read_to_string(root.join("tasks.log")).unwrap();
     assert!(
-        tasks.lines().any(|line| line == format!("assembleRelease|{}||bad|", sdk.path().display())),
+        tasks
+            .lines()
+            .any(|line| line == format!("assembleRelease|{}||bad|", sdk.path().display())),
         "{tasks}"
     );
 
     // Opting into Relay signing creates one private profile, never audits the password, and
     // adds a temporary init script plus secret environment only to later release builds.
-    let signing = call(
-        &e,
-        Actor::User,
-        "device.signing.create",
-        json!({"project_id":project_id,"key_alias":"upload","password":"test-secret-123"}),
-    )
-    .into_result()
-    .unwrap();
+    let signing = e
+        .dispatch(
+            Request::new(
+                Actor::User,
+                "device.signing.create",
+                json!({"project_id":project_id,"key_alias":"upload","password":"test-secret-123"}),
+            ),
+            Door::Socket,
+        )
+        .into_result()
+        .unwrap();
     assert_eq!(signing["configured"], true);
     assert_eq!(signing["enabled"], true);
     assert_eq!(signing["key_alias"], "upload");
     assert!(std::path::Path::new(signing["keystore"].as_str().unwrap()).is_file());
-    assert!(audit_rows(&e).iter().all(|row| row["op"] != "device.signing.create"), "password-bearing operations are never audited");
-    let profile_build = call(&e, Actor::User, "device.build", json!({"project_id":project_id})).into_result().unwrap();
+    assert!(
+        audit_rows(&e)
+            .iter()
+            .all(|row| row["op"] != "device.signing.create"),
+        "password-bearing operations are never audited"
+    );
+    let profile_build = call(
+        &e,
+        Actor::User,
+        "device.build",
+        json!({"project_id":project_id}),
+    )
+    .into_result()
+    .unwrap();
     let profile_build_id = profile_build["id"].as_i64().unwrap();
     wait_until("the Relay-signed build to finish", || {
-        let result = call(&e, Actor::User, "device.run.list", json!({"project_id":project_id})).into_result().unwrap();
-        result["runs"][0]["id"].as_i64() == Some(profile_build_id) && result["runs"][0]["state"] == "finished"
+        let result = call(
+            &e,
+            Actor::User,
+            "device.run.list",
+            json!({"project_id":project_id}),
+        )
+        .into_result()
+        .unwrap();
+        result["runs"][0]["id"].as_i64() == Some(profile_build_id)
+            && result["runs"][0]["state"] == "finished"
     });
     let tasks = std::fs::read_to_string(root.join("tasks.log")).unwrap();
     assert!(
-        tasks.lines().any(|line| line.starts_with(&format!("assembleRelease|{}|upload|set|--init-script", sdk.path().display()))),
+        tasks.lines().any(|line| line.starts_with(&format!(
+            "assembleRelease|{}|upload|set|--init-script",
+            sdk.path().display()
+        ))),
         "{tasks}"
     );
-    assert!(!tasks.contains("test-secret-123"), "the signing password must not enter build output");
+    assert!(
+        !tasks.contains("test-secret-123"),
+        "the signing password must not enter build output"
+    );
 
     // A generated key can be parked without deleting it when Google Play already expects the
     // project's established upload key. The next build then uses Gradle signing unchanged.
@@ -421,14 +493,36 @@ esac
     .unwrap();
     assert_eq!(disabled["configured"], true);
     assert_eq!(disabled["enabled"], false);
-    let gradle_build = call(&e, Actor::User, "device.build", json!({"project_id":project_id})).into_result().unwrap();
+    let gradle_build = call(
+        &e,
+        Actor::User,
+        "device.build",
+        json!({"project_id":project_id}),
+    )
+    .into_result()
+    .unwrap();
     let gradle_build_id = gradle_build["id"].as_i64().unwrap();
     wait_until("the Gradle-signed build to finish", || {
-        let result = call(&e, Actor::User, "device.run.list", json!({"project_id":project_id})).into_result().unwrap();
-        result["runs"][0]["id"].as_i64() == Some(gradle_build_id) && result["runs"][0]["state"] == "finished"
+        let result = call(
+            &e,
+            Actor::User,
+            "device.run.list",
+            json!({"project_id":project_id}),
+        )
+        .into_result()
+        .unwrap();
+        result["runs"][0]["id"].as_i64() == Some(gradle_build_id)
+            && result["runs"][0]["state"] == "finished"
     });
     let tasks = std::fs::read_to_string(root.join("tasks.log")).unwrap();
-    assert_eq!(tasks.lines().filter(|line| line.starts_with("assembleRelease|")).next_back().unwrap(), format!("assembleRelease|{}||bad|", sdk.path().display()));
+    assert_eq!(
+        tasks
+            .lines()
+            .filter(|line| line.starts_with("assembleRelease|"))
+            .next_back()
+            .unwrap(),
+        format!("assembleRelease|{}||bad|", sdk.path().display())
+    );
     let enabled = call(
         &e,
         Actor::User,
@@ -440,54 +534,138 @@ esac
     assert_eq!(enabled["enabled"], true);
 
     // A bundle asks for a different Gradle task, and this wrapper only answers assembleRelease.
-    let bundle = call(&e, Actor::User, "device.build", json!({"project_id":project_id,"format":"bundle"})).into_result().unwrap();
+    let bundle = call(
+        &e,
+        Actor::User,
+        "device.build",
+        json!({"project_id":project_id,"format":"bundle"}),
+    )
+    .into_result()
+    .unwrap();
     let bundle_id = bundle["id"].as_i64().unwrap();
     wait_until("the bundle build to fail", || {
-        let result = call(&e, Actor::User, "device.run.list", json!({"project_id":project_id})).into_result().unwrap();
-        result["runs"][0]["id"].as_i64() == Some(bundle_id) && result["runs"][0]["state"] == "failed"
+        let result = call(
+            &e,
+            Actor::User,
+            "device.run.list",
+            json!({"project_id":project_id}),
+        )
+        .into_result()
+        .unwrap();
+        result["runs"][0]["id"].as_i64() == Some(bundle_id)
+            && result["runs"][0]["state"] == "failed"
     });
 
     // The Play half: the same run row, a different Gradle task, an .aab artifact. Gradle Play
     // Publisher does the upload, so this is the whole of Relay's part in publishing.
-    let published = call(&e, Actor::User, "device.build", json!({"project_id":project_id,"format":"bundle","publish":true})).into_result().unwrap();
+    let published = call(
+        &e,
+        Actor::User,
+        "device.build",
+        json!({"project_id":project_id,"format":"bundle","publish":true}),
+    )
+    .into_result()
+    .unwrap();
     let published_id = published["id"].as_i64().unwrap();
     let mut row = json!(null);
     wait_until("the publishing build to finish", || {
-        let result = call(&e, Actor::User, "device.run.list", json!({"project_id":project_id})).into_result().unwrap();
+        let result = call(
+            &e,
+            Actor::User,
+            "device.run.list",
+            json!({"project_id":project_id}),
+        )
+        .into_result()
+        .unwrap();
         row = result["runs"][0].clone();
-        row["id"].as_i64() == Some(published_id) && (row["state"] == "finished" || row["state"] == "failed")
+        row["id"].as_i64() == Some(published_id)
+            && (row["state"] == "finished" || row["state"] == "failed")
     });
     assert_eq!(row["state"], "finished", "{row}");
-    assert!(row["artifact"].as_str().unwrap().ends_with("app-release.aab"), "{row}");
+    assert!(
+        row["artifact"]
+            .as_str()
+            .unwrap()
+            .ends_with("app-release.aab"),
+        "{row}"
+    );
     assert_eq!(row["variant"], "release");
     assert_eq!(row["format"], "bundle");
     assert_eq!(row["publish"], true);
     assert_eq!(row["signing"], "unverified");
     let tasks = std::fs::read_to_string(root.join("tasks.log")).unwrap();
-    assert!(tasks.lines().any(|line| line.starts_with("publishReleaseBundle|")), "{tasks}");
+    assert!(
+        tasks
+            .lines()
+            .any(|line| line.starts_with("publishReleaseBundle|")),
+        "{tasks}"
+    );
 
     // A build is stoppable mid-flight like a run: the command reaches the tile while it is
     // live, and device.run.stop leaves the row stopped rather than failed.
-    let held = call(&e, Actor::User, "device.build", json!({"project_id":project_id,"variant":"hold"})).into_result().unwrap();
+    let held = call(
+        &e,
+        Actor::User,
+        "device.build",
+        json!({"project_id":project_id,"variant":"hold"}),
+    )
+    .into_result()
+    .unwrap();
     let held_id = held["id"].as_i64().unwrap();
     wait_until("the held build to stream its command", || {
-        relay_core::handlers::device::run_by_id(&e, held_id)
-            .is_ok_and(|runtime| runtime.attach().1.iter().any(|line| line.line.contains("$ ./gradlew assembleHold")))
+        relay_core::handlers::device::run_by_id(&e, held_id).is_ok_and(|runtime| {
+            runtime
+                .attach()
+                .1
+                .iter()
+                .any(|line| line.line.contains("$ ./gradlew assembleHold"))
+        })
     });
-    call(&e, Actor::User, "device.run.stop", json!({"run_id":held_id})).into_result().unwrap();
-    let stopped = call(&e, Actor::User, "device.run.list", json!({"project_id":project_id})).into_result().unwrap();
+    call(
+        &e,
+        Actor::User,
+        "device.run.stop",
+        json!({"run_id":held_id}),
+    )
+    .into_result()
+    .unwrap();
+    let stopped = call(
+        &e,
+        Actor::User,
+        "device.run.list",
+        json!({"project_id":project_id}),
+    )
+    .into_result()
+    .unwrap();
     assert_eq!(stopped["runs"][0]["id"].as_i64(), Some(held_id));
     assert_eq!(stopped["runs"][0]["state"], "stopped");
 
     // Typed refusals, not a shell surprise.
-    let bad_format = call(&e, Actor::User, "device.build", json!({"project_id":project_id,"format":"ipa"}));
+    let bad_format = call(
+        &e,
+        Actor::User,
+        "device.build",
+        json!({"project_id":project_id,"format":"ipa"}),
+    );
     assert_eq!(err(&bad_format).code, "device.format");
-    let bad_variant = call(&e, Actor::User, "device.build", json!({"project_id":project_id,"variant":"release; rm -rf /"}));
+    let bad_variant = call(
+        &e,
+        Actor::User,
+        "device.build",
+        json!({"project_id":project_id,"variant":"release; rm -rf /"}),
+    );
     assert_eq!(err(&bad_variant).code, "device.variant");
-    let agent = call(&e, Actor::Agent("merry-badger".into()), "device.build", json!({"project_id":project_id}));
+    let agent = call(
+        &e,
+        Actor::Agent("merry-badger".into()),
+        "device.build",
+        json!({"project_id":project_id}),
+    );
     assert!(!agent.ok, "a release build is user-only");
 
-    let signing_dir = std::path::Path::new(signing["keystore"].as_str().unwrap()).parent().unwrap();
+    let signing_dir = std::path::Path::new(signing["keystore"].as_str().unwrap())
+        .parent()
+        .unwrap();
     std::fs::remove_dir_all(signing_dir).unwrap();
 }
 
@@ -872,4 +1050,67 @@ async fn socket_door_round_trip_and_events() {
     tokio::time::timeout(std::time::Duration::from_secs(1), e.wait_quit()).await.unwrap();
     drop(server);
     assert!(!dir.path().join("test.sock").exists(), "socket unlinked on drop");
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_mirror_socket_stream_and_disconnect_cleanup() {
+    use base64::Engine as _;
+    use relay_core::socket::{Client, Line, SocketServer};
+    let e = engine(Instance::Test);
+    let fixture = tempfile::tempdir().unwrap();
+    let adb = fake_adb(fixture.path());
+    call(
+        &e,
+        Actor::User,
+        "settings.set",
+        json!({"path":"device.adb_path","value":adb}),
+    )
+    .into_result()
+    .unwrap();
+    let server = SocketServer::start_in(e.clone(), fixture.path().join("socket"))
+        .await
+        .unwrap();
+    let mut client = Client::connect(&server.path).await.unwrap();
+    let result = client
+        .call(
+            &Request::new(
+                Actor::User,
+                "device.mirror.start",
+                json!({"device":"relay-phone","max_size":1024}),
+            ),
+            |_| {},
+        )
+        .await
+        .unwrap()
+        .into_result()
+        .unwrap();
+    let id = result["mirror_id"].as_i64().unwrap();
+    let runtime = relay_core::handlers::device::mirror_by_id(&e, id).unwrap();
+    runtime.push(vec![3, 0, 0, 0, 1, 7]);
+    let frame = tokio::time::timeout(Duration::from_secs(2), client.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    match frame {
+        Line::Frame(frame) => {
+            assert_eq!(frame.stream, "mirror");
+            assert_eq!(frame.mirror_id, Some(id));
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD
+                    .decode(frame.data.as_str().unwrap())
+                    .unwrap(),
+                vec![3, 0, 0, 0, 1, 7]
+            );
+        }
+        _ => panic!("expected native mirror frame"),
+    }
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !runtime.stopped() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(relay_core::handlers::device::mirror_by_id(&e, id).is_err());
 }

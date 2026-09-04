@@ -8,7 +8,6 @@ use anyhow::{Context, Result};
 use relay_bus::envelope::{Event, Frame, Response};
 use relay_bus::error::BusError;
 use relay_bus::ops::bus::{SubscribeIn, SubscribeOut, WaitIn, WaitOut};
-use std::time::Duration;
 use relay_bus::registry::Op;
 use relay_bus::{Empty, Request};
 use std::fs::{File, OpenOptions};
@@ -16,6 +15,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
@@ -177,7 +177,56 @@ impl Filter {
     }
 }
 
+// A native mirror belongs to its transport connection. Drop also runs on I/O error
+// and task cancellation, so a vanished window cannot leave capture running.
+struct MirrorAttachment {
+    engine: Arc<Engine>,
+    runtime: Arc<crate::device::MirrorRuntime>,
+    task: JoinHandle<()>,
+}
+impl Drop for MirrorAttachment {
+    fn drop(&mut self) {
+        self.task.abort();
+        self.runtime.stop();
+        self.engine.mirrors.lock().unwrap().remove(&self.runtime.id);
+        self.engine.emit_system(
+            "mirror.changed",
+            serde_json::json!({"mirror_id":self.runtime.id,"state":"stopped"}),
+        );
+    }
+}
+
+struct DeviceWatchLease {
+    engine: Arc<Engine>,
+    active: std::sync::Mutex<bool>,
+}
+impl Drop for DeviceWatchLease {
+    fn drop(&mut self) {
+        if !*self.active.lock().unwrap() {
+            return;
+        }
+        let runtime = {
+            let mut watch = self.engine.device_watch.lock().unwrap();
+            watch.clients = watch.clients.saturating_sub(1);
+            if watch.clients == 0 {
+                watch.runtime.take()
+            } else {
+                None
+            }
+        };
+        if let Some(runtime) = runtime {
+            runtime.stop();
+        }
+    }
+}
+
 async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) -> Result<()> {
+    // The blocking dispatch keeps this Arc until its ownership update completes,
+    // even if the socket task is cancelled while that dispatch is in flight.
+    let device_watch = Arc::new(DeviceWatchLease {
+        engine: engine.clone(),
+        active: std::sync::Mutex::new(false),
+    });
     let (r, mut w) = stream.into_split();
     let (out_tx, mut out_rx) = mpsc::channel::<String>(1024);
     let writer = tokio::spawn(async move {
@@ -197,6 +246,9 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) -> Result<()> {
     let mut attached_runs: std::collections::HashMap<relay_bus::types::Id, JoinHandle<()>> =
         std::collections::HashMap::new();
 
+    let mut attached_mirrors: std::collections::HashMap<relay_bus::types::Id, MirrorAttachment> =
+        std::collections::HashMap::new();
+
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
             continue;
@@ -208,7 +260,19 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) -> Result<()> {
                 continue;
             }
         };
-        let resp = if req.op == relay_bus::ops::bus::Subscribe::NAME {
+        let resp = if req.op == relay_bus::ops::device::Watch::NAME {
+            let lease = device_watch.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut active = lease.active.lock().unwrap();
+                let on = req.payload["on"].as_bool();
+                let response = lease.engine.dispatch_device_watch(req, *active);
+                if response.ok {
+                    *active = on.expect("successful Watch validated its boolean payload");
+                }
+                response
+            })
+            .await?
+        } else if req.op == relay_bus::ops::bus::Subscribe::NAME {
             match serde_json::from_value::<SubscribeIn>(req.payload.clone()) {
                 Err(e) => Response::err(req.id, BusError::schema(&req.op, e)),
                 Ok(p) => {
@@ -352,6 +416,73 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) -> Result<()> {
                 }
             }
             resp
+        } else if req.op == relay_bus::ops::device::MirrorStart::NAME {
+            let e = engine.clone();
+            let request = req.clone();
+            let response =
+                tokio::task::spawn_blocking(move || e.dispatch(request, Door::Socket)).await?;
+            if response.ok {
+                if let Some(id) = response
+                    .result
+                    .as_ref()
+                    .and_then(|v| v["mirror_id"].as_i64())
+                {
+                    if let Ok(runtime) = crate::handlers::device::mirror_by_id(&engine, id) {
+                        let (cursor, history, mut rx) = runtime.attach();
+                        let tx = out_tx.clone();
+                        let task = tokio::spawn(async move {
+                            use base64::Engine as _;
+                            let frame = |item: crate::device::MirrorChunk| {
+                                serde_json::to_string(&Frame {
+                                    v: 1,
+                                    stream: "mirror".into(),
+                                    session: None,
+                                    run_id: None,
+                                    mirror_id: Some(id),
+                                    epoch: None,
+                                    seq: item.seq,
+                                    data: serde_json::Value::String(
+                                        base64::engine::general_purpose::STANDARD
+                                            .encode(&*item.data),
+                                    ),
+                                })
+                            };
+                            for item in history {
+                                if let Ok(line) = frame(item) {
+                                    if tx.send(line).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            loop {
+                                match rx.recv().await {
+                                    Ok(item) if item.seq > cursor => {
+                                        if let Ok(line) = frame(item) {
+                                            if tx.send(line).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    Ok(_) => {}
+                                    Err(_) => {
+                                        let _=tx.send(serde_json::to_string(&Frame{v:1,stream:"mirror".into(),session:None,run_id:None,mirror_id:Some(id),epoch:None,seq:0,data:serde_json::json!({"error":"Mirror stream interrupted; close and reopen it."})}).unwrap()).await;
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+                        attached_mirrors.insert(
+                            id,
+                            MirrorAttachment {
+                                engine: engine.clone(),
+                                runtime,
+                                task,
+                            },
+                        );
+                    }
+                }
+            }
+            response
         } else if req.op == relay_bus::ops::device::RunOp::NAME
             || req.op == relay_bus::ops::device::Build::NAME
         {
@@ -455,6 +586,8 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) -> Result<()> {
     for (_, h) in attached_runs.drain() {
         h.abort();
     }
+    attached_mirrors.clear();
+    drop(device_watch);
     drop(out_tx);
     let _ = writer.await;
     Ok(())
@@ -523,4 +656,121 @@ pub enum Line {
     Response(Response),
     Event(Event),
     Frame(Frame),
+}
+
+#[cfg(test)]
+mod watch_tests {
+    use super::*;
+    use relay_bus::Actor;
+    use serde_json::{json, Value};
+    use std::os::unix::fs::PermissionsExt;
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_device_watch_leases_are_owned_idempotent_and_validated() {
+        async fn request(client: &mut Client, actor: Actor, payload: Value) -> Response {
+            client
+                .call(&Request::new(actor, "device.watch", payload), |_| {})
+                .await
+                .unwrap()
+        }
+        async fn until_clients(engine: &Engine, count: usize) {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while engine.device_watch.lock().unwrap().clients != count {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        let e = Engine::new(crate::Instance::Test, crate::Store::open_memory().unwrap());
+        let fixture = tempfile::tempdir().unwrap();
+        let adb = fixture.path().join("adb");
+        std::fs::write(
+            &adb,
+            "#!/bin/sh\nprintf 'fake-phone device\\n'\nexec sleep 20\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&adb, std::fs::Permissions::from_mode(0o755)).unwrap();
+        e.dispatch(
+            Request::new(
+                Actor::User,
+                "settings.set",
+                json!({"path":"device.adb_path","value":adb}),
+            ),
+            Door::InProcess,
+        )
+        .into_result()
+        .unwrap();
+        let server = SocketServer::start_in(e.clone(), fixture.path().join("socket"))
+            .await
+            .unwrap();
+        let mut first = Client::connect(&server.path).await.unwrap();
+        let mut second = Client::connect(&server.path).await.unwrap();
+        assert!(
+            request(&mut first, Actor::User, json!({"on":true}))
+                .await
+                .ok
+        );
+        let runtime = e.device_watch.lock().unwrap().runtime.clone().unwrap();
+        assert!(
+            request(&mut first, Actor::User, json!({"on":true}))
+                .await
+                .ok
+        );
+        assert_eq!(e.device_watch.lock().unwrap().clients, 1);
+        assert!(
+            request(&mut second, Actor::User, json!({"on":false}))
+                .await
+                .ok
+        );
+        assert_eq!(e.device_watch.lock().unwrap().clients, 1);
+        assert!(!runtime.stopped());
+        assert!(
+            request(&mut second, Actor::User, json!({"on":true}))
+                .await
+                .ok
+        );
+        assert_eq!(e.device_watch.lock().unwrap().clients, 2);
+        // Neither the duplicate path nor a lease release skips schema or actor validation.
+        for on in [true, false] {
+            let malformed = request(&mut first, Actor::User, json!({"on":on,"bogus":1})).await;
+            assert_eq!(malformed.error.unwrap().code, "bus.schema");
+            assert!(
+                !request(&mut first, Actor::agent("unbound"), json!({"on":on}))
+                    .await
+                    .ok
+            );
+            assert_eq!(e.device_watch.lock().unwrap().clients, 2);
+            assert!(!runtime.stopped());
+        }
+        assert!(
+            !request(&mut first, Actor::User, json!({"on":"yes"}))
+                .await
+                .ok
+        );
+        assert!(
+            request(&mut second, Actor::User, json!({"on":false}))
+                .await
+                .ok
+        );
+        assert!(
+            request(&mut second, Actor::User, json!({"on":false}))
+                .await
+                .ok
+        );
+        drop(second);
+        assert_eq!(e.device_watch.lock().unwrap().clients, 1);
+        let mut third = Client::connect(&server.path).await.unwrap();
+        assert!(
+            request(&mut third, Actor::User, json!({"on":true}))
+                .await
+                .ok
+        );
+        drop(first);
+        until_clients(&e, 1).await;
+        assert!(!runtime.stopped(), "another window still owns the watcher");
+        drop(third);
+        until_clients(&e, 0).await;
+        assert!(runtime.stopped());
+        assert!(e.device_watch.lock().unwrap().runtime.is_none());
+    }
 }

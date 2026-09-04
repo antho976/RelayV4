@@ -11,11 +11,17 @@ payload!(#[schemars(rename = "SessionCreateIn")] CreateIn {
     pub worktree: Option<String>,
     pub task_id: Option<Id>, pub module_id: Option<Id>, pub pair_with: Option<String>,
     pub bus_writes: Option<bool>, pub allow_ui: Option<bool>,
+    /// Persist the initial assignment before spawning, so a partial launch can recover it.
+    pub prompt: Option<String>,
 });
 op!(Create, "session.create", CreateIn => Session,
     OpMeta::mutation(Scope::Project, 3, "Allocate a session (name, worktree, token); spawns nothing").actors(Actors::UserOnly).emits(&["session.changed"]));
 
-payload!(#[schemars(rename = "SessionSpawnIn")] SpawnIn { pub session: String, pub prompt: Option<String> });
+payload!(#[schemars(rename = "SessionSpawnIn")] SpawnIn {
+    pub session: String,
+    /// Omitted preserves the allocated assignment; an empty string explicitly clears it.
+    pub prompt: Option<String>,
+});
 op!(Spawn, "session.spawn", SpawnIn => Session,
     OpMeta::mutation(Scope::Session, 3, "Start the provider CLI in the worktree with the brief").actors(Actors::UserOnly).emits(&["session.changed"]));
 payload!(#[schemars(rename = "SessionNameIn")] NameIn { pub session: String });
@@ -158,4 +164,30 @@ op!(RestorableList, "session.restorable", Empty => RestorableOut, OpMeta::query(
 op!(DiscardRestorable, "session.discard_restorable", NameIn => Empty,
     OpMeta::mutation(Scope::Session, 6, "Decline resume: clean the session").actors(Actors::UserOnly).emits(&["session.changed"]));
 
-entries!(Create, Spawn, Resume, ClearRestorable, Park, Wake, Close, Done, Intent, Claim, Release, Get, List, Peers, Brief, Bootstrap, Update, Report, Attach, Detach, Input, Resize, Scrollback, RestorableList, DiscardRestorable);
+entries!(
+    Create,
+    Spawn,
+    Resume,
+    ClearRestorable,
+    Park,
+    Wake,
+    Close,
+    Done,
+    Intent,
+    Claim,
+    Release,
+    Get,
+    List,
+    Peers,
+    Brief,
+    Bootstrap,
+    Update,
+    Report,
+    Attach,
+    Detach,
+    Input,
+    Resize,
+    Scrollback,
+    RestorableList,
+    DiscardRestorable
+);

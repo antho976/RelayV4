@@ -137,7 +137,8 @@ fn recipients_of(tx: &Transaction, message_id: Id) -> Result<Vec<Recipient>, Bus
             Ok(Recipient {
                 session: row.get("session")?,
                 state: sessions::parse_state(
-                    &row.get::<_, Option<String>>("state")?.unwrap_or_else(|| "closed".into()),
+                    &row.get::<_, Option<String>>("state")?
+                        .unwrap_or_else(|| "closed".into()),
                 ),
                 acked_at: row.get("acked_at")?,
             })
@@ -187,7 +188,9 @@ pub(crate) fn send_system(
     re_task: Option<Id>,
     now: &str,
 ) -> Result<Option<Message>, BusError> {
-    send(tx, project_id, "system", to, text, re_task, false, now, true)
+    send(
+        tx, project_id, "system", to, text, re_task, false, now, true,
+    )
 }
 
 /// Guardrail decisions need prompt attention, but still wait for the agent's next chosen call.
@@ -298,7 +301,9 @@ fn send(
                     "mailbox.priority_pending",
                     format!("{session:?} already has unread priority mail from {from:?}"),
                 )
-                .with_hint("wait for the recipient to acknowledge it before prioritizing another message"));
+                .with_hint(
+                    "wait for the recipient to acknowledge it before prioritizing another message",
+                ));
             }
         }
     }
@@ -371,6 +376,17 @@ pub fn register(e: &mut Engine) {
     e.register::<Update>(|ctx: &mut Ctx, p| {
         let (before, standing, suggestions) = get_note(ctx.tx(), p.note_id, false)?;
         assert_actor_project(ctx, before.project_id)?;
+        if let Some(expected) = &p.expected {
+            let current = serde_json::to_value(&before).bus()?;
+            for (field, value) in expected {
+                if !["title", "body", "pinned"].contains(&field.as_str()) {
+                    return Err(BusError::invalid("notes.expected_field", format!("{field} is not an editable note field")));
+                }
+                if current.get(field) != Some(value) {
+                    return Err(BusError::conflict("notes.edit_conflict", format!("Note {field} changed elsewhere; your draft was not saved")));
+                }
+            }
+        }
         let title = if suggestions {
             Some("Agent suggestions".to_string())
         } else {
@@ -607,17 +623,24 @@ pub fn register(e: &mut Engine) {
         let delivery = delivery_hint(&recipients);
         ctx.set_project(p.project_id);
         ctx.emit("mailbox.new", serde_json::to_value(&message).bus()?);
-        Ok(SendOut { message, recipients, delivery })
+        Ok(SendOut {
+            message,
+            recipients,
+            delivery,
+        })
     });
     e.register::<MailboxOutbox>(|ctx, p| {
         assert_actor_project(ctx, p.project_id)?;
         let from = actor_name(ctx)?;
         let limit = p.limit.unwrap_or(100).min(1000);
-        let mut stmt = ctx.tx().prepare_cached(
-            "SELECT m.*, NULL AS acked_at FROM messages m
+        let mut stmt = ctx
+            .tx()
+            .prepare_cached(
+                "SELECT m.*, NULL AS acked_at FROM messages m
              WHERE m.project_id = ?1 AND m.from_session = ?2 AND (?3 IS NULL OR m.sent_at >= ?3)
              ORDER BY m.sent_at DESC, m.id DESC LIMIT ?4",
-        ).bus()?;
+            )
+            .bus()?;
         let messages = stmt
             .query_map(params![p.project_id, from, p.since, limit], message_row)
             .bus()?
@@ -627,7 +650,10 @@ pub fn register(e: &mut Engine) {
         let mut sent = Vec::with_capacity(messages.len());
         for message in messages {
             let recipients = recipients_of(ctx.tx(), message.id)?;
-            sent.push(OutboxEntry { message, recipients });
+            sent.push(OutboxEntry {
+                message,
+                recipients,
+            });
         }
         Ok(OutboxOut { sent })
     });

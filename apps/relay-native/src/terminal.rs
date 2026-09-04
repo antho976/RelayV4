@@ -43,6 +43,10 @@ pub struct Pane {
     pub terminal: vte4::Terminal,
     pub caption: gtk::Label,
     pub actions: gtk::Box,
+    pub header: gtk::Box,
+    metadata: gtk::Label,
+    state: gtk::Label,
+    lamp: gtk::Image,
     status: gtk::Label,
     name: String,
     path: PathBuf,
@@ -78,26 +82,43 @@ impl Pane {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
         root.add_css_class("terminal-plate");
         root.set_size_request(280, 280);
-        root.append(&terminal);
         let footer = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         footer.add_css_class("umd");
+        let lamp = gtk::Image::from_icon_name("media-record-symbolic");
+        lamp.set_pixel_size(8);
+        lamp.add_css_class("lamp");
+        footer.append(&lamp);
         let caption = gtk::Label::new(Some(name));
         caption.set_xalign(0.0);
-        caption.set_hexpand(true);
+        caption.set_max_width_chars(24);
         caption.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
         caption.add_css_class("session-name");
         let status = gtk::Label::new(Some("Connecting"));
         status.add_css_class("dim");
         let actions = gtk::Box::new(gtk::Orientation::Horizontal, 2);
         footer.append(&caption);
+        let metadata = gtk::Label::new(None);
+        metadata.add_css_class("dim");
+        metadata.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        metadata.set_hexpand(true);
+        metadata.set_xalign(0.0);
+        footer.append(&metadata);
         footer.append(&status);
+        let state = gtk::Label::new(None);
+        state.add_css_class("session-state");
+        footer.append(&state);
         footer.append(&actions);
         root.append(&footer);
+        root.append(&terminal);
         let pane = Rc::new(Self {
             root,
             terminal,
             caption,
             actions,
+            header: footer,
+            metadata,
+            state,
+            lamp,
             status,
             name: name.into(),
             path,
@@ -178,6 +199,52 @@ impl Pane {
         pane
     }
 
+    pub fn apply_appearance(&self, mode: &str, points: f64) {
+        let background = match mode {
+            "oled" => "#000000",
+            "dark" => "#08090a",
+            _ => "#0a0a0b",
+        };
+        self.terminal
+            .set_color_background(&gtk::gdk::RGBA::parse(background).unwrap());
+        self.terminal
+            .set_font(Some(&gtk::pango::FontDescription::from_string(&format!(
+                "Fira Mono {}",
+                points.clamp(8.0, 24.0)
+            ))));
+    }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn update_session(&self, session: &serde_json::Value) {
+        use crate::app::text;
+        self.caption.set_text(text(session, "name"));
+        self.metadata.set_text(&format!(
+            "{} · {}",
+            text(session, "provider"),
+            text(session, "role")
+        ));
+        self.header.set_tooltip_text(Some(&format!(
+            "{}\n{}\n{}",
+            text(session, "branch"),
+            text(session, "worktree"),
+            text(session, "intent")
+        )));
+        let state = text(session, "state");
+        self.state.set_text(&state.to_uppercase());
+        for class in ["live", "held", "waiting"] {
+            self.root.remove_css_class(class);
+            self.lamp.remove_css_class(class);
+        }
+        let class = match state {
+            "running" | "spawning" => "live",
+            "blocked" => "held",
+            _ => "waiting",
+        };
+        self.root.add_css_class(class);
+        self.lamp.add_css_class(class);
+    }
+
     pub fn set_active(self: &Rc<Self>, active: bool) {
         if self.active.replace(active) == active {
             return;
@@ -187,7 +254,7 @@ impl Pane {
                 task.abort();
             }
             self.client.borrow_mut().take(); // socket EOF releases only this attachment
-            self.status.set_text("Detached");
+            self.status.set_text("");
             return;
         }
         let weak = Rc::downgrade(self);
@@ -226,7 +293,7 @@ impl Pane {
         *self.client.borrow_mut() = Some(client);
         self.size.set((0, 0));
         self.schedule_resize();
-        self.status.set_text("Attached");
+        self.status.set_text("");
         let mut bytes = 0;
         while let Ok(notice) = rx.recv().await {
             match notice {

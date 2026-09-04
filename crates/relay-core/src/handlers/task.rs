@@ -164,7 +164,9 @@ fn depth_of(tx: &Transaction, task_id: Id) -> rusqlite::Result<i64> {
 
 fn child_ids(tx: &Transaction, task_id: Id) -> Result<Vec<Id>, BusError> {
     let mut stmt = tx
-        .prepare("SELECT id FROM tasks WHERE parent_id=?1 AND deleted_at IS NULL ORDER BY position,id")
+        .prepare(
+            "SELECT id FROM tasks WHERE parent_id=?1 AND deleted_at IS NULL ORDER BY position,id",
+        )
         .bus()?;
     let values = stmt
         .query_map([task_id], |r| r.get(0))
@@ -178,7 +180,11 @@ fn child_ids(tx: &Transaction, task_id: Id) -> Result<Vec<Id>, BusError> {
 /// `assert_parent` refuses cycles on every write path; the visited set is what stops a
 /// hand-edited store from blowing the stack inside a request transaction.
 fn subtree_height(tx: &Transaction, task_id: Id) -> Result<i64, BusError> {
-    fn walk(tx: &Transaction, id: Id, seen: &mut std::collections::HashSet<Id>) -> Result<i64, BusError> {
+    fn walk(
+        tx: &Transaction,
+        id: Id,
+        seen: &mut std::collections::HashSet<Id>,
+    ) -> Result<i64, BusError> {
         if !seen.insert(id) {
             return Ok(0);
         }
@@ -244,7 +250,8 @@ pub(crate) fn row_task(tx: &Transaction, row: &Row) -> Result<Task, rusqlite::Er
         values
     };
     let attachments = {
-        let mut stmt = tx.prepare_cached("SELECT * FROM attachments WHERE task_id=?1 ORDER BY id")?;
+        let mut stmt =
+            tx.prepare_cached("SELECT * FROM attachments WHERE task_id=?1 ORDER BY id")?;
         let values = stmt
             .query_map([id], attachment_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -533,9 +540,15 @@ fn assign_session(ctx: &mut Ctx, name: &str, task: &Task) -> Result<(), BusError
             "task and session belong to different projects",
         ));
     }
-    let mut stmt = ctx.tx().prepare_cached("SELECT id FROM sessions WHERE worktree=?1 AND state!='closed' ORDER BY id").bus()?;
-    let ids = stmt.query_map([&row.session.worktree], |record| record.get::<_, Id>(0)).bus()?
-        .collect::<rusqlite::Result<Vec<_>>>().bus()?;
+    let mut stmt = ctx
+        .tx()
+        .prepare_cached("SELECT id FROM sessions WHERE worktree=?1 AND state!='closed' ORDER BY id")
+        .bus()?;
+    let ids = stmt
+        .query_map([&row.session.worktree], |record| record.get::<_, Id>(0))
+        .bus()?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .bus()?;
     for id in ids {
         ctx.tx()
             .execute(
@@ -609,30 +622,66 @@ fn dispatch_task(
     start: bool,
 ) -> Result<(Task, relay_bus::types::Session), BusError> {
     let (mut session, mut create) = (session, create);
-    let before=get_task(ctx.tx(),task_id,false)?;
-    if before.column==Column::Done { return Err(BusError::conflict("task.column_transition","done tasks cannot be dispatched")) }
+    let before = get_task(ctx.tx(), task_id, false)?;
+    if before.column == Column::Done {
+        return Err(BusError::conflict(
+            "task.column_transition",
+            "done tasks cannot be dispatched",
+        ));
+    }
     ctx.tx().execute("UPDATE tasks SET col='active',position=?1,state='dispatched',updated_at=?2 WHERE id=?3",params![next_position(ctx.tx(),before.project_id,Column::Active)?,ctx.now,before.id]).bus()?;
-    let active=get_task(ctx.tx(),before.id,false)?;
-    let name=if let Some(name)=session.take() { assign_session(ctx,&name,&active)?; name } else {
-        let mut create=create.take().expect("validated");
-        if create.project_id!=active.project_id { return Err(BusError::invalid("task.dispatch_project","created session must use the task project")) }
-        create.task_id=Some(active.id); create.module_id=active.module_id;
-        let value=ctx.invoke_registered("session.create",serde_json::to_value(create).bus()?)?;
-        let name = serde_json::from_value::<relay_bus::types::Session>(value).bus()?.name;
+    let active = get_task(ctx.tx(), before.id, false)?;
+    let name = if let Some(name) = session.take() {
+        assign_session(ctx, &name, &active)?;
+        name
+    } else {
+        let mut create = create.take().expect("validated");
+        if create.project_id != active.project_id {
+            return Err(BusError::invalid(
+                "task.dispatch_project",
+                "created session must use the task project",
+            ));
+        }
+        create.task_id = Some(active.id);
+        create.module_id = active.module_id;
+        let value = ctx.invoke_registered("session.create", serde_json::to_value(create).bus()?)?;
+        let name = serde_json::from_value::<relay_bus::types::Session>(value)
+            .bus()?
+            .name;
         // A create payload may add the second half of a PAIR. Assign both identities to
         // the task so own-task authorization and injected peer context agree.
         assign_session(ctx, &name, &active)?;
         name
     };
-    let row=sessions::by_name(ctx.tx(),&name)?;
-    let launch_op=match row.session.state { relay_bus::types::SessionState::Created=>Some("session.spawn"),relay_bus::types::SessionState::Parked=>Some("session.wake"),relay_bus::types::SessionState::Restorable=>Some("session.resume"),relay_bus::types::SessionState::Running|relay_bus::types::SessionState::Idle|relay_bus::types::SessionState::Blocked=>None,_=>return Err(BusError::conflict("task.session_state",format!("session {name} cannot be dispatched while {}",sessions::state_str(row.session.state)))) };
+    let row = sessions::by_name(ctx.tx(), &name)?;
+    let launch_op = match row.session.state {
+        relay_bus::types::SessionState::Created => Some("session.spawn"),
+        relay_bus::types::SessionState::Parked => Some("session.wake"),
+        relay_bus::types::SessionState::Restorable => Some("session.resume"),
+        relay_bus::types::SessionState::Running
+        | relay_bus::types::SessionState::Idle
+        | relay_bus::types::SessionState::Blocked => None,
+        _ => {
+            return Err(BusError::conflict(
+                "task.session_state",
+                format!(
+                    "session {name} cannot be dispatched while {}",
+                    sessions::state_str(row.session.state)
+                ),
+            ))
+        }
+    };
     if start {
-        if let Some(op)=launch_op { ctx.invoke_registered(op,json!({"session":name}))?; }
+        if let Some(op) = launch_op {
+            ctx.invoke_registered(op, json!({"session":name}))?;
+        }
     }
-    let task=get_task(ctx.tx(),active.id,false)?; let launched=sessions::by_name(ctx.tx(),&name)?.session;
+    let task = get_task(ctx.tx(), active.id, false)?;
+    let launched = sessions::by_name(ctx.tx(), &name)?.session;
     ctx.set_project(task.project_id);
-    ctx.emit("session.changed",serde_json::to_value(&launched).bus()?);
-    emit_task(ctx,&task)?; Ok((task,launched))
+    ctx.emit("session.changed", serde_json::to_value(&launched).bus()?);
+    emit_task(ctx, &task)?;
+    Ok((task, launched))
 }
 
 pub fn register(e: &mut Engine) {
@@ -701,6 +750,17 @@ pub fn register(e: &mut Engine) {
         let before=get_task(ctx.tx(),p.task_id,false)?;
         if ctx.actor.is_agent() && (p.title.is_some() || p.priority.is_some() || p.size.is_some() || p.module_id.is_some() || p.state.is_some() || p.task_type.is_some()) {
             return Err(BusError::refused("actor.allowlist", "agents may update only their task body and changelog"));
+        }
+        if let Some(expected) = &p.expected {
+            let current = serde_json::to_value(&before).bus()?;
+            for (field, value) in expected {
+                if !["title", "body", "priority", "size", "module_id", "state", "changelog", "type"].contains(&field.as_str()) {
+                    return Err(BusError::invalid("task.expected_field", format!("{field} is not an editable task field")));
+                }
+                if current.get(field) != Some(value) {
+                    return Err(BusError::conflict("task.edit_conflict", format!("Task {field} changed elsewhere; your draft was not saved")));
+                }
+            }
         }
         let title=p.title.as_deref().unwrap_or(&before.title).trim();
         if title.is_empty() { return Err(BusError::invalid("task.title", "task title cannot be empty")) }
@@ -867,11 +927,19 @@ pub fn register(e: &mut Engine) {
         Ok(Empty {})
     });
     e.register::<Dispatch>(|ctx: &mut Ctx, p| {
-        if p.session.is_some()==p.create.is_some() { return Err(BusError::invalid("task.dispatch_target","provide exactly one of session or create")) }
+        if p.session.is_some() == p.create.is_some() {
+            return Err(BusError::invalid(
+                "task.dispatch_target",
+                "provide exactly one of session or create",
+            ));
+        }
         let fanout = p.fanout.unwrap_or(false);
         let start = p.start.unwrap_or(true);
         if fanout && p.create.is_none() {
-            return Err(BusError::invalid("task.fanout_target", "fanout needs create: one session cannot hold several tasks"));
+            return Err(BusError::invalid(
+                "task.fanout_target",
+                "fanout needs create: one session cannot hold several tasks",
+            ));
         }
         let template = p.create.clone();
         let (task, session) = dispatch_task(ctx, p.task_id, p.session, p.create, start)?;
@@ -879,7 +947,9 @@ pub fn register(e: &mut Engine) {
         if fanout {
             for id in descendants(ctx.tx(), task.id)? {
                 let child = get_task(ctx.tx(), id, false)?;
-                if child.column == Column::Done { continue }
+                if child.column == Column::Done {
+                    continue;
+                }
                 let (task, session) = dispatch_task(ctx, id, None, template.clone(), start)?;
                 fanned.push(Dispatched { task, session });
             }
@@ -887,7 +957,11 @@ pub fn register(e: &mut Engine) {
         // Re-read: fanning out to a child does not change the parent row, but its roll-up and
         // its children's states did move, and the caller reads them off this Task.
         let task = get_task(ctx.tx(), task.id, false)?;
-        Ok(DispatchOut { task, session, fanned })
+        Ok(DispatchOut {
+            task,
+            session,
+            fanned,
+        })
     });
     e.register::<Approve>(|ctx: &mut Ctx, p| {
         let before = get_task(ctx.tx(), p.task_id, false)?;
