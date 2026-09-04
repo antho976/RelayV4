@@ -2,11 +2,12 @@
 use crate::app::{button, clear, icon_button, label, scrolled, Ui};
 use gtk::prelude::*;
 use gtk4 as gtk;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 
 pub struct Panel {
     pub body: gtk::Box,
+    modal: Cell<bool>,
     layer: gtk::Overlay,
     frame: gtk::Box,
     scroll: gtk::ScrolledWindow,
@@ -68,6 +69,7 @@ impl Panel {
         layer.add_overlay(&frame);
         let panel = Rc::new(Self {
             body,
+            modal: Cell::new(true),
             layer,
             frame,
             scroll,
@@ -127,6 +129,21 @@ impl Panel {
             .set_min_content_height(height.min((self.host.height() - 160).max(200)));
     }
 
+    pub fn bottom(&self, height: i32) {
+        self.modal.set(false);
+        self.layer.add_css_class("utility-layer");
+        self.frame.add_css_class("utility-panel");
+        self.frame.set_valign(gtk::Align::End);
+        self.frame.set_margin_end(6);
+        self.frame.set_margin_bottom(6);
+        self.scroll.set_vexpand(false);
+        self.scroll
+            .set_min_content_height(height.min((self.host.height() - 100).max(200)));
+        self.scroll
+            .set_max_content_height((self.host.height() - 70).max(200));
+        self.scroll.set_propagate_natural_height(true);
+    }
+
     pub fn set_guard(&self, guard: impl Fn() -> bool + 'static) {
         *self.guard.borrow_mut() = Some(Box::new(guard));
     }
@@ -147,8 +164,10 @@ impl Panel {
             if let Some(previous) = panels.borrow().last() {
                 previous.layer.set_sensitive(false);
             }
-            if let Some(content) = self.host.child() {
-                content.set_sensitive(false);
+            if self.modal.get() {
+                if let Some(content) = self.host.child() {
+                    content.set_sensitive(false);
+                }
             }
             self.host.add_overlay(&self.layer);
             panels.borrow_mut().push(self.clone());
@@ -166,7 +185,11 @@ impl Panel {
             if let Some(previous) = panels.borrow().last() {
                 previous.layer.set_sensitive(true);
             }
-            if !panels.borrow().iter().any(|panel| panel.host == self.host) {
+            if !panels
+                .borrow()
+                .iter()
+                .any(|panel| panel.host == self.host && panel.modal.get())
+            {
                 if let Some(content) = self.host.child() {
                     content.set_sensitive(true);
                 }

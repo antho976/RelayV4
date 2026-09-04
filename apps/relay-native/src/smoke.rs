@@ -178,6 +178,76 @@ pub fn install(ui: &Rc<Ui>) {
             toggle.emit_clicked();
         }
         if let Ok(page) = std::env::var("RELAY_NATIVE_PAGE") {
+            if matches!(page.as_str(), "device-run" | "device-release" | "resources") {
+                if page == "resources" {
+                    navigate.resources();
+                } else {
+                    crate::tools::devices::open(&navigate);
+                    if page == "device-release" {
+                        named(&navigate.window, "device-tabs")
+                            .unwrap()
+                            .downcast::<gtk::Stack>()
+                            .unwrap()
+                            .set_visible_child_name("release");
+                    }
+                }
+                return;
+            }
+            if page.starts_with("setup") {
+                if named(&navigate.window, "setup-continue").is_none() {
+                    navigate.open_repository();
+                }
+                if page == "setup" {
+                    return;
+                }
+                if let Ok(path) = std::env::var("RELAY_NATIVE_SETUP_PATH") {
+                    named(&navigate.window, "setup-path")
+                        .unwrap()
+                        .downcast::<gtk::Entry>()
+                        .unwrap()
+                        .set_text(&path);
+                }
+                named(&navigate.window, "setup-continue")
+                    .unwrap()
+                    .downcast::<gtk::Button>()
+                    .unwrap()
+                    .emit_clicked();
+                let ui = navigate.clone();
+                glib::timeout_add_local_once(Duration::from_millis(500), move || {
+                    if page.starts_with("setup-github") {
+                        named(&ui.window, "setup-source")
+                            .unwrap()
+                            .downcast::<gtk::Stack>()
+                            .unwrap()
+                            .set_visible_child_name("github");
+                    }
+                    if page.contains("connect") {
+                        let pending = ui.clone();
+                        glib::timeout_add_local_once(Duration::from_millis(250), move || {
+                            named(&pending.window, "setup-connect")
+                                .unwrap()
+                                .downcast::<gtk::Button>()
+                                .unwrap()
+                                .emit_clicked();
+                        });
+                    }
+                    if page.ends_with("submit") {
+                        glib::timeout_add_local_once(Duration::from_millis(1000), move || {
+                            let key = named(&ui.window, "setup-add")
+                                .unwrap()
+                                .downcast::<gtk::Button>()
+                                .unwrap();
+                            assert!(
+                                key.is_sensitive(),
+                                "A selected repository must be actionable"
+                            );
+                            key.emit_clicked();
+                        });
+                    }
+                });
+                return;
+            }
+
             if matches!(page.as_str(), "palette" | "layouts") {
                 named(
                     &navigate.window,

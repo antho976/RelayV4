@@ -196,13 +196,24 @@ impl Drop for MirrorAttachment {
     }
 }
 
-struct DeviceWatchLease {
+struct WatchLease {
+    resources: bool,
     engine: Arc<Engine>,
     active: std::sync::Mutex<bool>,
 }
-impl Drop for DeviceWatchLease {
+impl Drop for WatchLease {
     fn drop(&mut self) {
         if !*self.active.lock().unwrap() {
+            return;
+        }
+        if self.resources {
+            let mut clients = self.engine.resource_watch_clients.lock().unwrap();
+            *clients = clients.saturating_sub(1);
+            if *clients == 0 {
+                self.engine
+                    .resource_watch
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+            }
             return;
         }
         let runtime = {
@@ -223,7 +234,13 @@ impl Drop for DeviceWatchLease {
 async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) -> Result<()> {
     // The blocking dispatch keeps this Arc until its ownership update completes,
     // even if the socket task is cancelled while that dispatch is in flight.
-    let device_watch = Arc::new(DeviceWatchLease {
+    let device_watch = Arc::new(WatchLease {
+        resources: false,
+        engine: engine.clone(),
+        active: std::sync::Mutex::new(false),
+    });
+    let resource_watch = Arc::new(WatchLease {
+        resources: true,
         engine: engine.clone(),
         active: std::sync::Mutex::new(false),
     });
@@ -260,12 +277,16 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) -> Result<()> {
                 continue;
             }
         };
-        let resp = if req.op == relay_bus::ops::device::Watch::NAME {
-            let lease = device_watch.clone();
+        let resp = if matches!(req.op.as_str(), "device.watch" | "app.resources.watch") {
+            let lease = if req.op == "device.watch" {
+                device_watch.clone()
+            } else {
+                resource_watch.clone()
+            };
             tokio::task::spawn_blocking(move || {
                 let mut active = lease.active.lock().unwrap();
                 let on = req.payload["on"].as_bool();
-                let response = lease.engine.dispatch_device_watch(req, *active);
+                let response = lease.engine.dispatch_socket_watch(req, *active);
                 if response.ok {
                     *active = on.expect("successful Watch validated its boolean payload");
                 }
@@ -588,6 +609,7 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) -> Result<()> {
     }
     attached_mirrors.clear();
     drop(device_watch);
+    drop(resource_watch);
     drop(out_tx);
     let _ = writer.await;
     Ok(())
@@ -664,6 +686,67 @@ mod watch_tests {
     use relay_bus::Actor;
     use serde_json::{json, Value};
     use std::os::unix::fs::PermissionsExt;
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resource_watch_leases_stop_on_disconnect_and_preserve_other_clients() {
+        async fn watch(client: &mut Client, on: Value) -> Response {
+            client
+                .call(
+                    &Request::new(Actor::User, "app.resources.watch", json!({"on":on})),
+                    |_| {},
+                )
+                .await
+                .unwrap()
+        }
+        async fn count(engine: &Engine, expected: usize) {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while *engine.resource_watch_clients.lock().unwrap() != expected {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        let engine = Engine::new(crate::Instance::Test, crate::Store::open_memory().unwrap());
+        let fixture = tempfile::tempdir().unwrap();
+        let server = SocketServer::start_in(engine.clone(), fixture.path().join("socket"))
+            .await
+            .unwrap();
+        let mut first = Client::connect(&server.path).await.unwrap();
+        let mut second = Client::connect(&server.path).await.unwrap();
+        assert!(watch(&mut first, json!(true)).await.ok);
+        let epoch = engine
+            .resource_watch_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert!(watch(&mut first, json!(true)).await.ok);
+        assert!(!watch(&mut first, json!("yes")).await.ok);
+        count(&engine, 1).await;
+        assert!(watch(&mut second, json!(true)).await.ok);
+        count(&engine, 2).await;
+        drop(first);
+        count(&engine, 1).await;
+        assert!(engine
+            .resource_watch
+            .load(std::sync::atomic::Ordering::SeqCst));
+        assert!(watch(&mut second, json!(false)).await.ok);
+        assert!(watch(&mut second, json!(false)).await.ok);
+        count(&engine, 0).await;
+        assert!(!engine
+            .resource_watch
+            .load(std::sync::atomic::Ordering::SeqCst));
+        assert!(watch(&mut second, json!(true)).await.ok);
+        assert!(
+            engine
+                .resource_watch_epoch
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > epoch
+        );
+        drop(second);
+        count(&engine, 0).await;
+        assert!(!engine
+            .resource_watch
+            .load(std::sync::atomic::Ordering::SeqCst));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn native_device_watch_leases_are_owned_idempotent_and_validated() {
         async fn request(client: &mut Client, actor: Actor, payload: Value) -> Response {

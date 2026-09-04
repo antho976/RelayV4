@@ -830,7 +830,11 @@ impl Ui {
         });
     }
     pub(super) fn usage(self: &Rc<Self>) {
+        if !self.dismiss_panels() {
+            return;
+        }
         let (window, body) = self.sheet("Provider usage", 400, 420);
+        window.bottom(380);
         let refresh = button("Refresh", "quiet");
         body.append(&refresh);
         let list = gtk::Box::new(gtk::Orientation::Vertical, 8);
@@ -887,51 +891,6 @@ impl Ui {
         });
         refresh.emit_clicked();
         window.present();
-    }
-    pub(super) fn resources(self: &Rc<Self>) {
-        let (w, b) = self.sheet("Resources", 440, 360);
-        let ui = self.clone();
-        glib::spawn_future_local(async move {
-            match ui.call("app.resources.get", json!({})).await {
-                Ok(v) => {
-                    b.append(&label(
-                        &format!(
-                            "{:.0} MB agents · {:.0} MB Relay",
-                            v["total_rss_mb"].as_f64().unwrap_or(0.),
-                            v["relay"]["rss_mb"].as_f64().unwrap_or(0.)
-                        ),
-                        "title",
-                    ));
-                    for p in rows(&v, "panes") {
-                        b.append(&label(
-                            &format!(
-                                "{} · {:.0} MB · {:.1}% CPU",
-                                text(&p, "session"),
-                                p["rss_mb"].as_f64().unwrap_or(0.),
-                                p["cpu_pct"].as_f64().unwrap_or(0.)
-                            ),
-                            "body",
-                        ));
-                    }
-                    b.append(&label(
-                        &format!("{:.1} MB Relay store", v["store_mb"].as_f64().unwrap_or(0.)),
-                        "dim",
-                    ));
-                    for wt in rows(&v, "worktrees") {
-                        b.append(&label(
-                            &format!(
-                                "{} · {:.0} MB",
-                                text(&wt, "path"),
-                                wt["disk_mb"].as_f64().unwrap_or(0.)
-                            ),
-                            "dim",
-                        ));
-                    }
-                }
-                Err(e) => ui.show_error(&e.to_string()),
-            }
-        });
-        w.present();
     }
     pub(super) fn load_wall_files(self: &Rc<Self>, directory: String) {
         self.file_tree_revision

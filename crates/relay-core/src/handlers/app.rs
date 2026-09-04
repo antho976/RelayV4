@@ -83,17 +83,24 @@ pub fn register(e: &mut Engine) {
         Ok(snapshot)
     });
     e.register::<ResourcesWatch>(|ctx: &mut Ctx, p| {
-        let changed = ctx.engine().resource_watch.swap(p.on, Ordering::SeqCst) != p.on;
-        if changed && p.on {
-            ctx.after_commit(|engine| {
+        let on = {
+            let mut clients = ctx.engine().resource_watch_clients.lock().unwrap();
+            *clients = if p.on { *clients + 1 } else { clients.saturating_sub(1) };
+            let on = *clients > 0;
+            let changed = ctx.engine().resource_watch.swap(on, Ordering::SeqCst) != on;
+            changed && on
+        };
+        if on {
+            let epoch = ctx.engine().resource_watch_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+            ctx.after_commit(move |engine| {
                 let Ok(handle) = tokio::runtime::Handle::try_current() else { return };
                 handle.spawn(async move {
                     // CPU and RSS are two /proc reads and refresh every tick. Disk is a tree walk,
                     // so it re-measures every 15th tick (30 s) on a blocking worker instead.
                     let mut tick: u32 = 0;
-                    while engine.resource_watch.load(Ordering::SeqCst) {
+                    while engine.resource_watch.load(Ordering::SeqCst) && engine.resource_watch_epoch.load(Ordering::SeqCst) == epoch {
                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        if !engine.resource_watch.load(Ordering::SeqCst) { break; }
+                        if !engine.resource_watch.load(Ordering::SeqCst) || engine.resource_watch_epoch.load(Ordering::SeqCst) != epoch { break; }
                         tick = tick.wrapping_add(1);
                         if tick.is_multiple_of(15) {
                             let engine = engine.clone();

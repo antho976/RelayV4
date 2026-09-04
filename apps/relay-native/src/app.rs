@@ -10,8 +10,12 @@ use std::rc::Rc;
 use tokio::runtime::Handle;
 #[path = "launch.rs"]
 mod launch;
+#[path = "onboarding.rs"]
+mod onboarding;
 #[path = "shell.rs"]
 mod shell;
+#[path = "status.rs"]
+mod status;
 
 pub fn text<'a>(v: &'a Value, key: &str) -> &'a str {
     v[key].as_str().unwrap_or("")
@@ -105,6 +109,9 @@ pub struct Ui {
     pub page_projects: RefCell<BTreeMap<String, i64>>,
     pub notice: gtk::Label,
     status: gtk::Label,
+    usage_meters: gtk::Box,
+    device_status: gtk::Label,
+    setup_checked: Cell<bool>,
     status_project: gtk::Label,
     status_branch: gtk::Label,
     sidebar: gtk::Box,
@@ -400,12 +407,24 @@ impl Ui {
         bottom.append(&spacer);
         let status = label("Engine disconnected", "");
         bottom.append(&status);
-        let devices_key = button("Devices", "quiet");
-        let usage_key = button("Usage", "quiet");
-        let resources_key = button("Resources", "quiet");
+        let usage_key = button("", "quiet");
+        usage_key.set_tooltip_text(Some("Provider usage"));
+        let usage_meters = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        usage_key.set_child(Some(&usage_meters));
+        let devices_key = button("", "quiet");
+        devices_key.set_widget_name("status-devices");
+        let device_status = label("No device", "mono");
+        let device_content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        device_content.append(&crate::icons::image("device", 12));
+        device_content.append(&device_status);
+        devices_key.set_child(Some(&device_content));
+        let resources_key = icon_button("cpu", "Resources");
+        resources_key.set_widget_name("status-resources");
         bottom.append(&usage_key);
-        bottom.append(&resources_key);
+        bottom.append(&gtk::Separator::new(gtk::Orientation::Vertical));
         bottom.append(&devices_key);
+        bottom.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+        bottom.append(&resources_key);
         outer.append(&bottom);
         let wallpaper = gtk::Picture::new();
         wallpaper.set_can_shrink(true);
@@ -436,6 +455,9 @@ impl Ui {
             page_projects: RefCell::default(),
             notice,
             status,
+            usage_meters,
+            device_status,
+            setup_checked: Cell::new(false),
             status_project,
             status_branch,
             sidebar,
@@ -504,7 +526,6 @@ impl Ui {
         }
         for (key, page) in [
             (settings_key, "settings"),
-            (devices_key, "devices"),
             (notifications_key, "notifications"),
         ] {
             let weak = Rc::downgrade(&ui);
@@ -531,6 +552,12 @@ impl Ui {
         layouts_key.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
                 ui.layout_menu();
+            }
+        });
+        let weak = Rc::downgrade(&ui);
+        devices_key.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                crate::tools::devices::open(&ui);
             }
         });
         let weak = Rc::downgrade(&ui);
@@ -720,6 +747,8 @@ impl Ui {
                     *ui.client.borrow_mut() = Some(client);
                     if let Err(e)=ui.call("bus.subscribe",json!({"events":["project.changed","project.deleted","workspace.changed","session.changed","task.changed","task.deleted","mailbox.new","mailbox.changed","guardrail.held","guardrail.resolved","overlap.changed","notes.changed","file.changed","git.changed","worktree.changed","module.changed","module.deleted","skill.changed","skill.deleted","settings.changed","notify.new","notify.changed","device.changed","run.changed","run.crash","device.signing.changed","avd.changed","layout.changed","ui.changed","ui.toast","usage.changed","integration.changed","integration.result"]})).await { ui.show_error(&e.to_string()); return; }
                     ui.connected.set(true);
+                    ui.status.set_text("");
+                    ui.refresh_status();
                     ui.notice.set_visible(false);
                     ui.refresh();
                     ui.load_appearance();
@@ -738,6 +767,12 @@ impl Ui {
                         }
                         match notice {
                             Notice::Event(e) => {
+                                if matches!(
+                                    e.ev.as_str(),
+                                    "usage.changed" | "device.changed" | "run.changed"
+                                ) {
+                                    ui.refresh_status();
+                                }
                                 if e.ev == "notify.new" {
                                     crate::sounds::notify(&ui, &e.payload);
                                 }
@@ -926,6 +961,9 @@ impl Ui {
                     ui.editor.reset();
                 }
                 ui.render_projects();
+                if !ui.setup_checked.replace(true) && ui.projects.borrow().is_empty() {
+                    ui.open_repository();
+                }
                 let project = ui.project.get();
                 if project == 0 {
                     ui.sessions.borrow_mut().clear();
@@ -1003,14 +1041,6 @@ impl Ui {
         } else {
             self.update_attachments();
         }
-        let live = sessions
-            .iter()
-            .filter(|s| matches!(text(s, "state"), "running" | "spawning"))
-            .count();
-        let held = sessions
-            .iter()
-            .filter(|s| text(s, "state") == "blocked")
-            .count();
         let name = self
             .projects
             .borrow()
@@ -1027,8 +1057,7 @@ impl Ui {
                 .map(|p| text(p, "base_branch"))
                 .unwrap_or(""),
         );
-        self.status
-            .set_text(&format!("{held} needs you  ·  {live} live"));
+
         self.wall_stack
             .set_visible_child_name(if sessions.is_empty() { "empty" } else { "wall" });
     }
@@ -1138,55 +1167,11 @@ impl Ui {
             ui.page_pending.set(false);
         });
     }
-    fn open_repository(self: &Rc<Self>) {
-        if self.editor.is_dirty() {
-            self.show_error(
-                "Save or discard your editor changes before opening another repository.",
-            );
+    pub fn open_repository(self: &Rc<Self>) {
+        if self.editor.is_dirty() || !self.dismiss_panels() {
+            self.show_error("Save or discard your changes before adding a project.");
             return;
         }
-        let chooser = gtk::FileDialog::builder()
-            .title("Open a Git repository")
-            .build();
-        let ui = self.clone();
-        glib::spawn_future_local(async move {
-            let Ok(file) = chooser.select_folder_future(Some(&ui.window)).await else {
-                return;
-            };
-            let Some(path) = file.path() else {
-                return;
-            };
-            let parent = path.parent().unwrap_or(&path);
-            let result = async {
-                let listed = ui.call("workspace.list", json!({})).await?;
-                let workspace = if let Some(existing) = rows(&listed, "workspaces")
-                    .into_iter()
-                    .find(|w| text(w, "path") == parent.to_string_lossy())
-                {
-                    existing
-                } else {
-                    ui.call("workspace.create", json!({"path":parent})).await?
-                };
-                ui.call(
-                    "project.add",
-                    json!({"workspace_id":workspace["id"],"path":path}),
-                )
-                .await
-            }
-            .await;
-            match result {
-                Ok(p) => {
-                    if ui.editor.is_dirty() {
-                        ui.show_error("Repository added. The current project was kept because the editor has changes or a file operation in progress.");
-                        ui.refresh();
-                        return;
-                    }
-                    ui.project.set(p["id"].as_i64().unwrap_or(0));
-                    ui.editor.reset();
-                    ui.refresh();
-                }
-                Err(e) => ui.show_error(&e.to_string()),
-            }
-        });
+        onboarding::open(self);
     }
 }
