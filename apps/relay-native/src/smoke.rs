@@ -76,7 +76,7 @@ fn edit_fixture(ui: Rc<Ui>, page: String) {
                         widget
                             .downcast::<gtk::Entry>()
                             .unwrap()
-                            .set_text("Native task edit verified");
+                            .set_text("Unsaved task fixture");
                     } else {
                         widget
                             .downcast::<gtk::TextView>()
@@ -96,6 +96,11 @@ fn edit_fixture(ui: Rc<Ui>, page: String) {
                             !ui.panels.borrow().is_empty(),
                             "A dirty task must not close"
                         );
+                        named(&window, "task-title")
+                            .unwrap()
+                            .downcast::<gtk::Entry>()
+                            .unwrap()
+                            .set_text("Native task edit verified");
                     }
                     named(&window, "draft-save")
                         .unwrap()
@@ -173,6 +178,21 @@ pub fn install(ui: &Rc<Ui>) {
             toggle.emit_clicked();
         }
         if let Ok(page) = std::env::var("RELAY_NATIVE_PAGE") {
+            if matches!(page.as_str(), "palette" | "layouts") {
+                named(
+                    &navigate.window,
+                    if page == "palette" {
+                        "command-palette"
+                    } else {
+                        "window-presets"
+                    },
+                )
+                .unwrap()
+                .downcast::<gtk::Button>()
+                .unwrap()
+                .emit_clicked();
+                return;
+            }
             if page == "launch-preview" {
                 navigate.show_launch(None);
                 return;
@@ -210,9 +230,6 @@ pub fn install(ui: &Rc<Ui>) {
         if fixture && std::env::var("RELAY_NATIVE_BURST").as_deref() == Ok("1") {
             ui.verify_burst(true);
         }
-        if fixture && std::env::var("RELAY_NATIVE_PAGE").as_deref() == Ok("launch-preview") {
-            ui.verify_launch();
-        }
         assert_eq!(
             gtk::Window::list_toplevels()
                 .iter()
@@ -246,6 +263,9 @@ pub fn install(ui: &Rc<Ui>) {
                 .save_to_png(&path)
                 .expect("Save screenshot");
             println!("Screenshot saved: {path}");
+            if fixture && std::env::var("RELAY_NATIVE_PAGE").as_deref() == Ok("launch-preview") {
+                ui.verify_launch();
+            }
             ui.window.close();
             assert!(
                 !ui.window.is_visible(),

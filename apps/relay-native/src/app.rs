@@ -111,11 +111,14 @@ pub struct Ui {
     focus_tabs: gtk::Box,
     mode: RefCell<String>,
     pub overlay: gtk::Overlay,
+    pub page_overlay: gtk::Overlay,
     pub panels: Rc<RefCell<Vec<Rc<crate::panel::Panel>>>>,
     registry_dirty: Cell<bool>,
     workspaces: RefCell<Vec<Value>>,
     rendered_sessions: RefCell<BTreeMap<String, Value>>,
     restored_project: Cell<i64>,
+    layout_saves: RefCell<BTreeMap<i64, Value>>,
+    layout_saving: Cell<bool>,
     appearance: gtk::CssProvider,
     wallpaper: gtk::Picture,
     wallpaper_dim: gtk::Box,
@@ -216,7 +219,9 @@ impl Ui {
         brand.set_hexpand(true);
         top.append(&brand);
         let palette_key = icon_button("system-search-symbolic", "Command palette · Ctrl K");
+        palette_key.set_widget_name("command-palette");
         let layouts_key = icon_button("view-grid-symbolic", "Window presets");
+        layouts_key.set_widget_name("window-presets");
         let notifications_key = icon_button("alarm-symbolic", "Notifications");
         for key in [&palette_key, &layouts_key, &notifications_key] {
             top.append(key);
@@ -267,7 +272,9 @@ impl Ui {
         let content = gtk::Stack::new();
         content.set_hexpand(true);
         content.set_vexpand(true);
-        body.append(&content);
+        let page_overlay = gtk::Overlay::new();
+        page_overlay.set_child(Some(&content));
+        body.append(&page_overlay);
         let wall = gtk::Grid::builder()
             .hexpand(true)
             .vexpand(true)
@@ -348,13 +355,13 @@ impl Ui {
         }
         let launch_box = gtk::Box::new(gtk::Orientation::Vertical, 12);
         launch_box.add_css_class("launch");
-        launch_box.set_size_request(380, -1);
+        launch_box.set_size_request(780, -1);
         let launch = gtk::Revealer::new();
         launch.set_transition_duration(0);
         launch.set_hexpand(false);
-        launch.set_child(Some(&scrolled(&launch_box)));
+        launch.set_child(Some(&launch_box));
         launch.set_halign(gtk::Align::End);
-        launch.set_size_request(420, -1);
+        launch.set_size_request(780, -1);
         let overlay = gtk::Overlay::new();
         overlay.set_child(Some(&body));
         let scrim = gtk::Button::new();
@@ -435,11 +442,14 @@ impl Ui {
             focus_tabs,
             mode: RefCell::new("grid".into()),
             overlay: panel_host,
+            page_overlay,
             panels: Rc::default(),
             registry_dirty: Cell::new(true),
             workspaces: RefCell::default(),
             rendered_sessions: RefCell::default(),
             restored_project: Cell::new(0),
+            layout_saves: RefCell::default(),
+            layout_saving: Cell::new(false),
             appearance: gtk::CssProvider::new(),
             wallpaper,
             wallpaper_dim,
@@ -799,7 +809,21 @@ impl Ui {
             }
         });
     }
+    pub fn dismiss_panels(&self) -> bool {
+        let panels = self.panels.borrow().clone();
+        if panels.iter().any(|panel| !panel.can_close()) {
+            self.show_error("Save or discard your changes before leaving this page.");
+            return false;
+        }
+        for panel in panels.iter().rev() {
+            panel.close();
+        }
+        true
+    }
     pub fn navigate(self: &Rc<Self>, page: &str) {
+        if *self.page.borrow() != page && !self.dismiss_panels() {
+            return;
+        }
         if self.content.child_by_name(page).is_none() {
             return;
         }
@@ -1042,8 +1066,10 @@ impl Ui {
     pub fn verify_launch(&self) {
         assert!(self.launch.reveals_child());
         assert!(
-            self.launch.width() >= 400 && self.launch_box.width() >= 350,
-            "Launch form must be visible"
+            self.launch.width() == 780 && self.launch_box.width() == 779,
+            "Launch dimensions: sheet={}, form={}",
+            self.launch.width(),
+            self.launch_box.width()
         );
         assert!(
             !self.sidebar.is_sensitive(),
@@ -1060,6 +1086,9 @@ impl Ui {
     pub fn verify_burst(&self, check: bool) {
         use vte4::prelude::TerminalExt;
         assert_eq!(self.panes.borrow().len(), 11);
+        if !check {
+            println!("Burst layout: {}", self.mode.borrow());
+        }
         for (name, pane) in self.panes.borrow().iter() {
             if check {
                 let (_, row) = pane.terminal.cursor_position();

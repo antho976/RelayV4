@@ -79,7 +79,8 @@ impl Draft {
                 .default_height(720)
                 .build()
         });
-        let panel = (!note).then(|| crate::panel::Panel::new(ui, title, 780));
+        let panel = (!note).then(|| crate::panel::Panel::page(ui, title));
+        form.set_valign(gtk::Align::Start);
         let layout = gtk::Box::new(gtk::Orientation::Vertical, 10);
         layout.set_margin_top(16);
         layout.set_margin_bottom(16);
@@ -305,8 +306,10 @@ fn detail(ui: &Rc<Ui>, task: Value, modules: Vec<Value>, tasks: Vec<Value>) {
     }
     form.append(&meta);
     let body = multiline(text(&task, "body"), 180);
+    body.set_vexpand(false);
     field("Description · Markdown", &body, &form);
     let changelog = multiline(text(&task, "changelog"), 65);
+    changelog.set_vexpand(false);
     field("Changelog sentence", &changelog, &form);
     let snapshot: Rc<dyn Fn() -> Value> = Rc::new(
         move || json!({"title":title.text().trim(),"body":buffer_text(&body.buffer()),"changelog":buffer_text(&changelog.buffer()),"priority":chosen(&priority),"state":chosen(&state),"type":chosen(&kind),"size":if chosen(&size).is_empty(){Value::Null}else{json!(chosen(&size))},"module_id":chosen(&module).parse::<i64>().ok()}),
@@ -604,6 +607,59 @@ fn detail(ui: &Rc<Ui>, task: Value, modules: Vec<Value>, tasks: Vec<Value>) {
         move || json!({"task_id":id}),
         None,
     );
+    // Relay-2 keeps editing on the left and relationships/actions on the right.
+    let edit = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    edit.set_hexpand(true);
+    edit.set_valign(gtk::Align::Start);
+    edit.add_css_class("task-edit");
+    let side = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    side.set_valign(gtk::Align::Start);
+    side.add_css_class("task-relations");
+    let mut relations = false;
+    while let Some(child) = d.form.first_child() {
+        relations |= child == transitions.clone().upcast::<gtk::Widget>();
+        d.form.remove(&child);
+        if relations {
+            side.append(&child);
+        } else {
+            edit.append(&child);
+        }
+    }
+    d.layout.remove(&d.status);
+    d.layout.remove(&d.footer);
+    edit.append(&d.status);
+    edit.append(&d.footer);
+    d.form.set_spacing(20);
+    d.form.set_orientation(if ui.window.width() >= 1200 {
+        gtk::Orientation::Horizontal
+    } else {
+        gtk::Orientation::Vertical
+    });
+    d.form.append(&edit);
+    d.form.append(&side);
+    if let Some(scroll) = d.layout.first_child().and_downcast::<gtk::ScrolledWindow>() {
+        scroll.set_child(gtk::Widget::NONE);
+        d.layout.remove(&scroll);
+        d.layout.append(&d.form);
+    }
+    if let (Some(surface), Some(panel)) = (ui.window.surface(), &d.panel) {
+        let weak = d.form.downgrade();
+        let handler = surface.connect_layout(move |_, width, _| {
+            if let Some(form) = weak.upgrade() {
+                form.set_orientation(if width >= 1200 {
+                    gtk::Orientation::Horizontal
+                } else {
+                    gtk::Orientation::Vertical
+                });
+            }
+        });
+        let handler = RefCell::new(Some(handler));
+        panel.on_closed(move || {
+            if let Some(handler) = handler.borrow_mut().take() {
+                surface.disconnect(handler);
+            }
+        });
+    }
     d.present();
 }
 // Auxiliary changes never invalidate an unsaved editor. Successful actions reopen

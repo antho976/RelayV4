@@ -108,7 +108,7 @@ for line in sys.stdin:
             desktop_env.pop(key, None)
         initial_names={s["name"] for s in call("session.list",{"project_id":project["id"]})["sessions"]}
         measurements=[]
-        for viewport, size, page in (("desktop", "1440,900", "agents"), ("compact", "1024,768", "agents"), ("launch-preview", "1024,768", "launch-preview"), ("board", "1440,900", "board"), ("mailbox", "1024,768", "mailbox"), ("guardrails", "1024,768", "guardrails"), ("code", "1440,900", "code"), *((name,"1440,900",name) for name in ("notes","plan","modules","settings","skills","dashboard","notifications","devices","launch"))):
+        for viewport, size, page in (("desktop", "1440,900", "agents"), ("compact", "1024,768", "agents"), ("launch-preview", "1024,768", "launch-preview"), ("palette", "1024,768", "palette"), ("layouts", "1024,768", "layouts"), ("board", "1440,900", "board"), ("board-compact", "1024,768", "board"), ("mailbox", "1024,768", "mailbox"), ("guardrails", "1024,768", "guardrails"), ("code", "1440,900", "code"), *((name,"1440,900",name) for name in ("notes","plan","modules","settings","skills","dashboard","notifications","devices","launch"))):
             output = OUT / f"{viewport}.png"
             output.unlink(missing_ok=True)
             native_env = dict(desktop_env, RELAY_NATIVE_SCREENSHOT=str(output), RELAY_NATIVE_SIZE=size, RELAY_NATIVE_FIXTURE="1",
@@ -135,6 +135,8 @@ for line in sys.stdin:
             assert struct.unpack(">II", output.read_bytes()[16:24]) == tuple(map(int, size.split(","))), viewport
             contents = (OUT / f"{viewport}.log").read_text()
             assert "Shell layouts verified" in contents, contents
+            saved_layout = call("settings.get", {"path": f"native.layout.current.{project['id']}"})["value"]
+            assert saved_layout["agent_layout"] == "grid", saved_layout
             assert "stylesheet:" not in contents and "gtk_widget_add_css_class:" not in contents, contents
         (OUT/"measurements.json").write_text(json.dumps(measurements,indent=2)+"\n")
         live = call("session.list", {"project_id": project["id"]})["sessions"]

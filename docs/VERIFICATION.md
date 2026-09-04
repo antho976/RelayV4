@@ -13,6 +13,14 @@ are adapted to those implementations. The smoke harness includes long repository
 names, retained panes across Grid/Focus/Review, exact screenshot dimensions, and
 a compact launch preview alongside the upstream edit/launch/burst checks.
 
+The follow-up removes separate task, module, skill, registry, Git and build-log
+windows. Notes and the emulator remain detachable. Task details use the content
+page, with editing and relationships side by side at desktop width and stacked
+at compact width. The command palette and layout menu remain inside the shell.
+The launch sheet matches the reference's 780px width, provider SVGs, choice cards
+and fixed action footer. Layout saves are serialized and coalesced per project
+so rapid Grid/Focus/Review changes persist the latest selection.
+
 ## Automated checks
 
 | Check | Result |
@@ -40,7 +48,7 @@ socket cleanup, watcher ownership and input-overflow reset. Native tests also
 cover transport correlation, terminal sequence handling, draft conflicts,
 shortcuts, decoder dimensions and generated audio samples.
 
-GTK's ComboBoxText and Dialog APIs remain supported in the pinned GTK4 version
+GTK's ComboBoxText APIs remain supported in the pinned GTK4 version
 but are deprecated. The native lint command permits those deprecation warnings;
 this is not a clean default `-D warnings` result.
 
@@ -53,11 +61,15 @@ hide those environment restrictions.
 
 The harness creates a disposable engine, store, repositories and fake providers.
 It captures the wall at 1440×900 and 1024×768, plus Board, Mailbox, Guardrails,
-Code, Notes, Plan, Modules, Settings, Skills, Dashboard, Notifications and Devices.
+Code, Notes, Plan, Modules, Settings, Skills, Dashboard, Notifications and Devices,
+plus the command palette, layout menu and compact launch preview.
 
 It verifies:
 
 - Native task and note edits are saved through their real controls.
+- Unsaved task dismissal is refused; app-owned flows keep one visible GTK window.
+- In-app confirmations return the correct result for both accept and cancel.
+- Rapid layout changes retain the final saved mode.
 - GtkSourceView saves an edited README into the selected checkout.
 - Six initial VTE widgets send paste input and receive provider echoes.
 - The native launch sheet creates two builders and a reviewer with one shared
@@ -73,7 +85,7 @@ No desktop accessibility settings were changed.
 
 ## Performance evidence and limits
 
-A three-second sample with six quiet fixture terminals measured **0.0% CPU at
+The earlier implementation's three-second sample with six quiet fixture terminals measured **0.0% CPU at
 kernel tick resolution and 213.0 MiB RSS** for the debug native client. This is a
 short observation, not a stable benchmark distribution; it excludes engine and
 provider processes. The separate eleven-pane burst establishes completion within
@@ -87,7 +99,7 @@ measurements.
 
 ## Review and boundaries
 
-Independent review found and corrected partial-launch recovery, stale-write
+The earlier implementation's independent review found and corrected partial-launch recovery, stale-write
 races, hidden note-window shutdown, cross-project navigation, device form
 initialization, compact pane sizing and dropped mirror touch-release events.
 The final bounded review cleared those fixes and the corrected icon geometry

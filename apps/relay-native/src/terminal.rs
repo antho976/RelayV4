@@ -101,7 +101,7 @@ impl Pane {
         let metadata = gtk::Label::new(None);
         metadata.add_css_class("dim");
         metadata.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        metadata.set_hexpand(true);
+
         metadata.set_xalign(0.0);
         footer.append(&metadata);
         let branch = gtk::Label::new(None);
@@ -111,6 +111,9 @@ impl Pane {
         footer.append(&branch);
         let state = gtk::Label::new(None);
         state.add_css_class("session-state");
+        let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        spacer.set_hexpand(true);
+        footer.append(&spacer);
         footer.append(&state);
         footer.append(&actions);
         root.append(&footer);
@@ -227,8 +230,9 @@ impl Pane {
     pub fn verify_ready(&self) {
         assert!(
             self.active.get() && self.client.borrow().is_some(),
-            "{} has no ready terminal attachment",
-            self.name
+            "{} has no ready terminal attachment (active={})",
+            self.name,
+            self.active.get()
         );
     }
     pub fn name(&self) -> &str {

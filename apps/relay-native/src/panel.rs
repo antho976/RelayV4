@@ -9,6 +9,7 @@ pub struct Panel {
     pub body: gtk::Box,
     layer: gtk::Overlay,
     frame: gtk::Box,
+    scroll: gtk::ScrolledWindow,
     host: gtk::Overlay,
     panels: Weak<RefCell<Vec<Rc<Panel>>>>,
     guard: RefCell<Option<Box<dyn Fn() -> bool>>>,
@@ -18,6 +19,14 @@ pub struct Panel {
 
 impl Panel {
     pub fn new(ui: &Ui, title: &str, width: i32) -> Rc<Self> {
+        Self::build(ui, title, width, &ui.overlay, false)
+    }
+
+    pub fn page(ui: &Ui, title: &str) -> Rc<Self> {
+        Self::build(ui, title, -1, &ui.page_overlay, true)
+    }
+
+    fn build(ui: &Ui, title: &str, width: i32, host: &gtk::Overlay, page: bool) -> Rc<Self> {
         let layer = gtk::Overlay::new();
         let scrim = button("", "panel-scrim");
         scrim.set_focusable(false);
@@ -26,7 +35,11 @@ impl Panel {
         let frame = gtk::Box::new(gtk::Orientation::Vertical, 0);
         frame.add_css_class("app-panel");
         frame.set_widget_name("app-panel");
-        frame.set_halign(gtk::Align::End);
+        frame.set_halign(if page {
+            gtk::Align::Fill
+        } else {
+            gtk::Align::End
+        });
         frame.set_size_request(width.min(780), -1);
         frame.set_focusable(true);
         let heading = gtk::Box::new(gtk::Orientation::Horizontal, 12);
@@ -34,20 +47,31 @@ impl Panel {
         let title = label(title, "section-title");
         title.set_hexpand(true);
         title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        let close = icon_button(
+            if page { "arrow-left" } else { "close" },
+            if page { "Back" } else { "Close panel" },
+        );
+        if page {
+            heading.append(&close);
+            frame.add_css_class("detail-page");
+        }
         heading.append(&title);
-        let close = icon_button("close", "Close panel");
         close.set_widget_name("panel-close");
-        heading.append(&close);
+        if !page {
+            heading.append(&close);
+        }
         frame.append(&heading);
         let body = gtk::Box::new(gtk::Orientation::Vertical, 10);
         body.add_css_class("panel-body");
-        frame.append(&scrolled(&body));
+        let scroll = scrolled(&body);
+        frame.append(&scroll);
         layer.add_overlay(&frame);
         let panel = Rc::new(Self {
             body,
             layer,
             frame,
-            host: ui.overlay.clone(),
+            scroll,
+            host: host.clone(),
             panels: Rc::downgrade(&ui.panels),
             guard: RefCell::default(),
             closed: RefCell::default(),
@@ -61,7 +85,46 @@ impl Panel {
                 }
             });
         }
+        let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak = Rc::downgrade(&panel);
+        keys.connect_key_pressed(move |_, key, _, modifiers| {
+            if matches!(key, gtk::gdk::Key::Tab | gtk::gdk::Key::ISO_Left_Tab) {
+                if let Some(panel) = weak.upgrade() {
+                    let direction = if modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
+                        gtk::DirectionType::TabBackward
+                    } else {
+                        gtk::DirectionType::TabForward
+                    };
+                    if !panel.frame.child_focus(direction) {
+                        panel.frame.grab_focus();
+                        panel.frame.child_focus(direction);
+                    }
+                    return glib::Propagation::Stop;
+                }
+            }
+            glib::Propagation::Proceed
+        });
+        panel.layer.add_controller(keys);
         panel
+    }
+
+    pub fn compact(&self, centered: bool, height: i32) {
+        self.frame.add_css_class("compact-panel");
+        self.frame.set_valign(gtk::Align::Start);
+        self.frame.set_halign(if centered {
+            gtk::Align::Center
+        } else {
+            gtk::Align::End
+        });
+        self.frame.set_margin_top(if centered {
+            self.host.height() * 12 / 100
+        } else {
+            0
+        });
+        self.frame.set_margin_end(if centered { 0 } else { 126 });
+        self.scroll
+            .set_min_content_height(height.min((self.host.height() - 160).max(200)));
     }
 
     pub fn set_guard(&self, guard: impl Fn() -> bool + 'static) {
@@ -102,8 +165,11 @@ impl Panel {
             panels.borrow_mut().retain(|p| p.layer != self.layer);
             if let Some(previous) = panels.borrow().last() {
                 previous.layer.set_sensitive(true);
-            } else if let Some(content) = self.host.child() {
-                content.set_sensitive(true);
+            }
+            if !panels.borrow().iter().any(|panel| panel.host == self.host) {
+                if let Some(content) = self.host.child() {
+                    content.set_sensitive(true);
+                }
             }
         }
         for callback in self.closed.borrow_mut().drain(..) {
@@ -140,6 +206,7 @@ impl Panel {
         self.on_closed(move || {
             let _ = send.try_send(false);
         });
+        self.compact(true, 280);
         self.present();
         cancel.grab_focus();
         let accepted = recv.recv().await.unwrap_or(false);

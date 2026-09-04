@@ -23,7 +23,9 @@ The archived V3 roadmap remains unchanged; its completion marks describe V3.
 | Plugins | Reserved extension surface, as in the reference |
 
 App-owned editors, confirmations, registry controls, usage and build logs stay
-inside the main window. Only Notes and the emulator/mirror detach; native file
+inside the main window. Task/module details use the content page; command and
+layout menus use compact in-app surfaces. The launch sheet uses the Relay-2
+780px width, provider marks, choice cards and fixed footer. Only Notes and the emulator/mirror detach; native file
 pickers still use the desktop file chooser. Dirty task, module, skill and note
 drafts block dismissal and application closure until saved or discarded.
 

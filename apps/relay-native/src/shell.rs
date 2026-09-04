@@ -4,6 +4,9 @@ use vte4::prelude::*;
 impl Ui {
     pub fn open_project(self: &Rc<Self>, project: i64, page: &str) {
         if project != self.project.get() {
+            if !self.dismiss_panels() {
+                return;
+            }
             if self.editor.is_dirty() {
                 self.show_error("Save or discard editor changes before switching projects.");
                 return;
@@ -294,18 +297,28 @@ impl Ui {
         {
             return;
         }
-        let state = self.layout_state();
+        self.layout_saves
+            .borrow_mut()
+            .insert(project, self.layout_state());
+        if self.layout_saving.replace(true) {
+            return;
+        }
         let ui = self.clone();
         glib::spawn_future_local(async move {
-            if let Err(e) = ui
-                .call(
-                    "settings.set",
-                    json!({"path":format!("native.layout.current.{project}"),"value":state}),
-                )
-                .await
-            {
-                ui.show_error(&e.to_string());
+            loop {
+                let next = ui.layout_saves.borrow_mut().pop_first();
+                let Some((project, state)) = next else { break };
+                if let Err(e) = ui
+                    .call(
+                        "settings.set",
+                        json!({"path":format!("native.layout.current.{project}"),"value":state}),
+                    )
+                    .await
+                {
+                    ui.show_error(&e.to_string());
+                }
             }
+            ui.layout_saving.set(false);
         });
     }
     fn layout_state(&self) -> Value {
@@ -409,6 +422,7 @@ impl Ui {
     }
     pub(super) fn layout_menu(self: &Rc<Self>) {
         let (window, body) = self.sheet("Window presets", 390, 420);
+        window.compact(false, 420);
         let modes = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         body.append(&modes);
         for (mode, caption) in [("grid", "Grid"), ("focus", "Focus"), ("review", "Review")] {
@@ -704,7 +718,8 @@ impl Ui {
         window.present();
     }
     pub(super) fn command_palette(self: &Rc<Self>) {
-        let (window, body) = self.sheet("Command palette", 520, 480);
+        let (window, body) = self.sheet("Command palette", 560, 480);
+        window.compact(true, 400);
         let search = gtk::SearchEntry::new();
         body.append(&search);
         let list = gtk::Box::new(gtk::Orientation::Vertical, 2);

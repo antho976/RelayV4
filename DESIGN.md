@@ -146,8 +146,12 @@ Relay-2 editor palette.
 
 The sidebar requests 200px. The top bar has a 42px minimum height, the status
 line 24px and toolbars 38px; native theme metrics can increase these minimums.
+Task and module details occupy the content page. The command palette is centered
+inside the app and window presets open below the title bar. Only Notes and the
+emulator use separate app windows.
+
 The default window is 1440 by 900. Pages and the right-side launch sheet use
-20px insets; the sheet overlays the wall at 420px including its insets. It does not shrink
+20px insets; the sheet overlays the wall at 780px including its insets. It does not shrink
 the terminal wall. A scrim blocks background actions and Escape dismisses an idle sheet.
 
 Navigation lives in the sidebar, followed by projects grouped under workspaces.
@@ -159,7 +163,7 @@ Grid mode uses square terminal plates with 2px gutters and one, two or three
 columns. The two-column wall has a draggable divider. Focus shows one session
 with session tabs; Review places the focused session beside the remaining
 stack. Plates request at least 280 by 280 and the wall scrolls vertically.
-Sessions can be reordered and moved to separate native windows. A collapsible
+Sessions can be reordered or focused within the wall. A collapsible
 file rail sits beside the wall. Layout selection, order and split position can
 be saved. There are no automatic mobile breakpoints.
 
@@ -171,9 +175,8 @@ note, can reorder, and can open in separate windows.
 ## Elevation & Depth
 
 Depth comes from tonal surface steps and thin dividers. Custom buttons and the
-titlebar suppress shadows. Popovers use slab fill and an edge stroke; remaining
-popup decoration belongs to GTK. No custom shadow or motion token system is
-implemented. Launch reveal duration is zero and VTE cursor blinking is off.
+titlebar suppress shadows. Compact in-app panels use a thin edge and a restrained
+shadow; OS file choosers keep their native decoration. Launch reveal duration is zero and VTE cursor blinking is off.
 
 Optional PNG/JPEG wallpaper fills the window with cover sizing, beneath a black
 dim layer. Settings exposes a wallpaper library, panel opacity, wallpaper dim

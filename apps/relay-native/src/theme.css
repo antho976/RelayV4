@@ -48,7 +48,7 @@ button.nav.selected { background: @wash; color: @ink; }
 .page { padding: 20px; }
 .record { background: @slab; padding: 12px; }
 .board-lane { background: @console; border: 1px solid @edge; }
-.launch { background: @console; padding: 20px; border-left: 1px solid @edge; }
+.launch { background: @console; border-left: 1px solid @edge; }
 entry, textview, textview text { background: @screen; color: @ink; caret-color: @ink; }
 entry { border: 1px solid @edge; border-radius: 2px; min-height: 30px; }
 textview { padding: 8px; }
@@ -107,6 +107,27 @@ button.quiet.selected { color: @ink; background: @wash; }
 /* App-owned details stay inside the shell, matching Relay-2's panels. */
 .panel-scrim { border: 0; border-radius: 0; background: rgba(0, 0, 0, .35); }
 .panel-scrim:hover, .panel-scrim:active { background: rgba(0, 0, 0, .35); }
-.app-panel { background: #181a1d; border-left: 1px solid #30343a; }
-.panel-heading { min-height: 42px; padding: 0 16px; border-bottom: 1px solid #30343a; }
+.app-panel { background: @console; border-left: 1px solid @edge; }
+.panel-heading { min-height: 42px; padding: 0 16px; border-bottom: 1px solid @edge; }
 .panel-body { padding: 16px; }
+
+.compact-panel { border: 1px solid @edge; box-shadow: 0 8px 28px alpha(black, .35); }
+.detail-page { border-left: 0; }
+.detail-page .panel-heading { min-height: 52px; }
+.detail-page .panel-body { padding: 4px; }
+
+.launch-heading { min-height: 56px; padding: 0 20px; border-bottom: 1px solid @edge; }
+.launch-body { padding: 16px 20px; }
+.launch-body .section-label { padding: 0; }
+.launch-profile { padding-top: 4px; }
+button.launch-choice { min-height: 62px; padding: 10px 11px; border: 1px solid @edge; background: @console; }
+button.launch-choice:checked { border-color: @ink; background: @wash; }
+.choice-title { font-size: 13px; font-weight: 600; }
+.member-rail button { min-height: 54px; border: 1px solid @edge; background: @console; }
+.member-rail button:checked { border-color: @ink; background: @wash; }
+.launch-footer { min-height: 64px; padding: 0 20px; border-top: 1px solid @edge; background: @console; }
+.launch-footer button.primary { min-width: 156px; min-height: 34px; }
+.launch-task { padding: 10px; border: 1px solid @edge; background: @slab; }
+
+.task-edit { padding: 12px; border: 1px solid @edge; background: @console; }
+.task-relations { padding: 12px 0; }
