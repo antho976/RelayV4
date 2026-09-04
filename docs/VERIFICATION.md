@@ -13,6 +13,14 @@ VTE 0.84.1 and GtkSourceView 5.20.0.
 | `cargo clippy -p relay-native --all-targets --offline -- -D warnings -A deprecated` | Passed |
 | Generated bus schema drift test | Passed |
 | `python3 scripts/native-smoke.py` | Passed |
+| `python3 scripts/test-launcher.py` | Passed |
+| `python3 scripts/test-launcher-real.py` | Passed |
+
+The launcher regression test opens the actual GTK window twice with an isolated
+engine and a legacy socket present. Both windows verify their engine connection,
+the second launch reuses the same process, and all data stays under `relay-v4`.
+A stale `RELAY_NATIVE_SOCKET` is cleared. The workspace suite was rerun after
+separating V4's engine socket and store from Relay-2/V3.
 
 The inherited engine tests cover agent roles, mailbox priority, review groups,
 claims, guardrails, task approvals, provider lifecycle and native bus contracts.

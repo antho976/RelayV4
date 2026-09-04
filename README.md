@@ -21,6 +21,12 @@ The launcher builds incrementally, starts the `dev` engine if needed, waits for
 it to respond, and opens the window. It also works by absolute path from any
 directory. Use `./run.sh stable` or `./run.sh test` to select another instance.
 Engine startup logs go to `target/engine-<instance>.log`.
+Compiler output is saved to `target/launcher-build.log` and shown on build failure.
+
+V4 uses `$XDG_RUNTIME_DIR/relay-v4/` for engine sockets and
+`~/.local/share/relay-v4/<instance>/` for data (or `$XDG_DATA_HOME/relay-v4/`).
+This keeps it independent of a running Relay-2/V3 engine. Existing Relay-2/V3
+projects and sessions stay in their original store; V4 starts with its own registry.
 
 A running engine is reused without replacement; after engine code changes,
 it needs a deliberate restart to pick them up. Closing the window keeps the

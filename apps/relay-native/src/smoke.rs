@@ -139,6 +139,14 @@ pub fn install(ui: &Rc<Ui>) {
         }
     });
     glib::timeout_add_local_once(Duration::from_secs(duration), move || {
+        if std::env::var("RELAY_NATIVE_VERIFY_CONNECTION").as_deref() == Ok("1") {
+            assert!(
+                ui.client.borrow().is_some() && !ui.notice.is_visible(),
+                "Native engine connection failed: {}",
+                ui.notice.text()
+            );
+            println!("Native engine connection verified: {}", ui.path.display());
+        }
         if fixture && std::env::var("RELAY_NATIVE_BURST").as_deref() == Ok("1") {
             ui.verify_burst(true);
         }

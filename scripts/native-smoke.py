@@ -51,7 +51,7 @@ for line in sys.stdin:
     log = (OUT / "engine.log").open("w")
     engine = subprocess.Popen([str(ENGINE), "--instance", "test", "serve"], env=env, stdout=log, stderr=log)
     connection = socket.socket(socket.AF_UNIX)
-    path = runtime / "relay/test.sock"
+    path = runtime / "relay-v4/test.sock"
     try:
         deadline = time.monotonic() + 15
         while True:

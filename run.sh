@@ -8,8 +8,19 @@ if [[ $# -gt 1 || ! "$RELAY_INSTANCE" =~ ^(dev|stable|test)$ ]]; then
     exit 2
 fi
 
+# Never inherit a stale screenshot/test socket when launching the actual app.
+unset RELAY_NATIVE_SOCKET
+
 # Keep the build and executable paths together, including with Cargo overrides.
-cargo build --target-dir "$PWD/target" -p relay-cli -p relay-native
+mkdir -p target
+echo "Building Relay (compiler output: $PWD/target/launcher-build.log)…"
+if cargo build --target-dir "$PWD/target" -p relay-cli -p relay-native >target/launcher-build.log 2>&1; then
+    echo "Opening Relay V4 ($RELAY_INSTANCE)…"
+else
+    result=$?
+    cat target/launcher-build.log >&2
+    exit "$result"
+fi
 relay="$PWD/target/debug/relay"
 ready() { timeout 2 "$relay" --instance "$RELAY_INSTANCE" ping >/dev/null 2>&1; }
 

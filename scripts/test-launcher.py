@@ -30,8 +30,9 @@ case "$3" in
         ;;
 esac
 ''')
-    executable(binaries / "relay-native", 'echo "$RELAY_INSTANCE" >> windows\n')
-    env = dict(os.environ, PATH=f"{fake_bin}:{os.environ['PATH']}")
+    executable(binaries / "relay-native", '[[ -z "${RELAY_NATIVE_SOCKET+x}" ]]\necho "$RELAY_INSTANCE" >> windows\n')
+    env = dict(os.environ, PATH=f"{fake_bin}:{os.environ['PATH']}",
+               RELAY_NATIVE_SOCKET="/tmp/stale-fixture.sock")
 
     def launch(*args, **overrides):
         return subprocess.run([str(root / "run.sh"), *args], cwd="/tmp",

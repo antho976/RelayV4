@@ -156,7 +156,7 @@ pub fn run(rt: Handle) -> glib::ExitCode {
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             PathBuf::from(runtime_dir)
-                .join("relay")
+                .join("relay-v4")
                 .join(format!("{instance}.sock"))
         });
     let app = gtk::Application::builder()
