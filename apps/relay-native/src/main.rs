@@ -4,6 +4,7 @@ mod editor;
 mod icons;
 mod mirror;
 mod pages;
+mod panel;
 mod shortcuts;
 mod smoke;
 mod sounds;

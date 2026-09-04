@@ -119,7 +119,7 @@ fn editor(ui: &Rc<Ui>, note: Value) -> Rc<Draft> {
     let snapshot: Rc<dyn Fn() -> Value> = Rc::new(
         move || json!({"title":if title.text().trim().is_empty(){Value::Null}else{json!(title.text().trim())},"body":buffer_text(&body.buffer()),"pinned":pin.is_active()}),
     );
-    let draft = Draft::new(
+    let draft = Draft::new_note(
         ui,
         if text(&note, "title") == "Plan" {
             "Plan"
@@ -148,14 +148,17 @@ pub fn edit(ui: &Rc<Ui>, note: Value) {
         if let Some(page) = ui.note_tabs.page_num(&d.layout) {
             ui.note_tabs.set_current_page(Some(page));
         } else {
-            d.window.present();
+            d.present();
         }
         return;
     }
     let d = editor(ui, note.clone());
-    d.window.set_modal(false);
-    d.window.set_application(ui.window.application().as_ref());
-    d.window.set_child(gtk::Widget::NONE);
+    d.window.as_ref().unwrap().set_modal(false);
+    d.window
+        .as_ref()
+        .unwrap()
+        .set_application(ui.window.application().as_ref());
+    d.window.as_ref().unwrap().set_child(gtk::Widget::NONE);
     let title = if text(&note, "title").is_empty() {
         "Untitled"
     } else {
@@ -198,8 +201,12 @@ pub fn edit(ui: &Rc<Ui>, note: Value) {
             if let Some(page) = ui.note_tabs.page_num(&draft.layout) {
                 ui.note_tabs.remove_page(Some(page));
             }
-            draft.window.set_child(Some(&draft.layout));
-            draft.window.present();
+            draft
+                .window
+                .as_ref()
+                .unwrap()
+                .set_child(Some(&draft.layout));
+            draft.present();
         }
     });
     ui.note_drafts.borrow_mut().insert(id, d);
@@ -577,5 +584,5 @@ fn module_detail(ui: &Rc<Ui>, module: Value) {
         move || json!({"module_id":id}),
         None,
     );
-    d.window.present();
+    d.present();
 }

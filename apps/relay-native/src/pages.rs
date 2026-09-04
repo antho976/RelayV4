@@ -61,7 +61,7 @@ pub async fn refresh(ui: &Rc<Ui>, name: &str, project: i64) {
         ui.page_projects.borrow_mut().insert(name.into(), project);
         page.append(&label(
             match name {
-                "board" => "Tasks & reviews",
+                "board" => "Board",
                 "mailbox" => "Mailbox",
                 "guardrails" => "Guardrails",
                 "modules" => "Modules",
@@ -224,6 +224,7 @@ fn task_composer(ui: &Rc<Ui>, page: &gtk::Box, project: i64) {
 fn board(ui: &Rc<Ui>, body: &gtk::Box, tasks: &[Value]) {
     let grid = gtk::Box::new(gtk::Orientation::Horizontal, 2);
     grid.set_homogeneous(true);
+    grid.set_vexpand(true);
     body.append(&grid);
     for (name, title) in [
         ("backlog", "BACKLOG"),
@@ -234,6 +235,7 @@ fn board(ui: &Rc<Ui>, body: &gtk::Box, tasks: &[Value]) {
     ] {
         let lane = gtk::Box::new(gtk::Orientation::Vertical, 8);
         lane.add_css_class("board-lane");
+        lane.set_size_request(190, 320);
         let drop = gtk::DropTarget::new(String::static_type(), gtk::gdk::DragAction::MOVE);
         let weak = Rc::downgrade(ui);
         let project = ui.project.get();
@@ -270,12 +272,12 @@ fn board(ui: &Rc<Ui>, body: &gtk::Box, tasks: &[Value]) {
                 "{title}  {}",
                 tasks.iter().filter(|t| text(t, "column") == name).count()
             ),
-            "section-label",
+            "lane-heading",
         ));
         grid.append(&lane);
         for task in tasks.iter().filter(|t| text(t, "column") == name) {
             let row = gtk::Box::new(gtk::Orientation::Vertical, 8);
-            row.add_css_class("record");
+            row.add_css_class("task-card");
             row.set_widget_name("task-card");
             let terms = format!(
                 "{} {} {} {} {}",
@@ -369,6 +371,19 @@ fn board(ui: &Rc<Ui>, body: &gtk::Box, tasks: &[Value]) {
                     }
                 });
                 row.append(&key);
+            }
+            let agents = rows(task, "sessions");
+            if !agents.is_empty() {
+                let names = agents
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                let session = label(&names, "task-agent");
+                session.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                session.set_max_width_chars(25);
+                session.set_tooltip_text(Some(&names));
+                row.append(&session);
             }
             lane.append(&row);
         }

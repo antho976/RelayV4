@@ -46,7 +46,8 @@ pub struct Pane {
     pub header: gtk::Box,
     metadata: gtk::Label,
     state: gtk::Label,
-    lamp: gtk::Image,
+    lamp: gtk::Box,
+    branch: gtk::Label,
     status: gtk::Label,
     name: String,
     path: PathBuf,
@@ -84,8 +85,8 @@ impl Pane {
         root.set_size_request(280, 280);
         let footer = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         footer.add_css_class("umd");
-        let lamp = gtk::Image::from_icon_name("media-record-symbolic");
-        lamp.set_pixel_size(8);
+        let lamp = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        lamp.set_valign(gtk::Align::Center);
         lamp.add_css_class("lamp");
         footer.append(&lamp);
         let caption = gtk::Label::new(Some(name));
@@ -100,16 +101,28 @@ impl Pane {
         let metadata = gtk::Label::new(None);
         metadata.add_css_class("dim");
         metadata.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        metadata.set_hexpand(true);
+
         metadata.set_xalign(0.0);
         footer.append(&metadata);
-        footer.append(&status);
+        let branch = gtk::Label::new(None);
+        branch.add_css_class("session-branch");
+        branch.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        branch.set_max_width_chars(24);
+        footer.append(&branch);
         let state = gtk::Label::new(None);
         state.add_css_class("session-state");
+        let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        spacer.set_hexpand(true);
+        footer.append(&spacer);
         footer.append(&state);
         footer.append(&actions);
         root.append(&footer);
         root.append(&terminal);
+        status.set_wrap(true);
+        status.set_max_width_chars(40);
+        status.add_css_class("terminal-status");
+        status.connect_label_notify(|label| label.set_visible(!label.text().is_empty()));
+        root.append(&status);
         let pane = Rc::new(Self {
             root,
             terminal,
@@ -119,6 +132,7 @@ impl Pane {
             metadata,
             state,
             lamp,
+            branch,
             status,
             name: name.into(),
             path,
@@ -213,6 +227,14 @@ impl Pane {
                 points.clamp(8.0, 24.0)
             ))));
     }
+    pub fn verify_ready(&self) {
+        assert!(
+            self.active.get() && self.client.borrow().is_some(),
+            "{} has no ready terminal attachment (active={})",
+            self.name,
+            self.active.get()
+        );
+    }
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -224,6 +246,7 @@ impl Pane {
             text(session, "provider"),
             text(session, "role")
         ));
+        self.branch.set_text(text(session, "branch"));
         self.header.set_tooltip_text(Some(&format!(
             "{}\n{}\n{}",
             text(session, "branch"),
@@ -347,6 +370,8 @@ impl Pane {
                 return;
             };
             p.resize_pending.set(false);
+            p.metadata.set_visible(p.root.width() > 420);
+            p.branch.set_visible(p.root.width() > 600);
             if !p.active.get() || !p.terminal.is_mapped() {
                 return;
             }

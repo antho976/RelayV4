@@ -1,5 +1,44 @@
 use super::*;
 
+fn choice_cards(control: &gtk::DropDown, choices: &[(&str, &str, &str)]) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 7);
+    row.set_homogeneous(true);
+    let mut buttons: Vec<gtk::ToggleButton> = Vec::new();
+    for (index, (icon, title, copy)) in choices.iter().enumerate() {
+        let key = gtk::ToggleButton::new();
+        key.add_css_class("launch-choice");
+        if let Some(first) = buttons.first() {
+            key.set_group(Some(first));
+        }
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        content.append(&crate::icons::image(icon, 24));
+        let words = gtk::Box::new(gtk::Orientation::Vertical, 3);
+        words.append(&label(title, "choice-title"));
+        let copy = label(copy, "dim");
+        copy.set_wrap(true);
+        words.append(&copy);
+        content.append(&words);
+        key.set_child(Some(&content));
+        key.set_active(control.selected() == index as u32);
+        let selected = control.downgrade();
+        key.connect_toggled(move |key| {
+            if key.is_active() {
+                if let Some(selected) = selected.upgrade() {
+                    selected.set_selected(index as u32);
+                }
+            }
+        });
+        row.append(&key);
+        buttons.push(key);
+    }
+    control.connect_selected_notify(move |control| {
+        for (index, key) in buttons.iter().enumerate() {
+            key.set_active(control.selected() == index as u32);
+        }
+    });
+    row
+}
+
 struct Profile {
     root: gtk::Box,
     provider: gtk::DropDown,
@@ -11,7 +50,7 @@ struct Profile {
     writes: gtk::CheckButton,
     ui_access: gtk::CheckButton,
     tasks: RefCell<Vec<(i64, gtk::CheckButton)>>,
-    task_box: gtk::Box,
+    task_box: gtk::Grid,
 }
 impl Profile {
     fn new(index: usize) -> Rc<Self> {
@@ -20,34 +59,59 @@ impl Profile {
         if index == 2 {
             provider.set_selected(1);
         }
-        field("Provider", &provider, &root);
+        root.add_css_class("launch-profile");
+        let configuration = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        let providers = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        providers.set_hexpand(true);
+        providers.append(&label("PROVIDER", "section-label"));
+        providers.append(&choice_cards(
+            &provider,
+            &[
+                ("claude", "Claude", "Anthropic"),
+                ("codex", "Codex", "OpenAI"),
+            ],
+        ));
+        provider.set_visible(false);
+        providers.append(&provider);
+        configuration.append(&providers);
+        let controls = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        controls.set_size_request(230, -1);
         let role = gtk::DropDown::from_strings(&["Builder", "Reviewer", "Docs"]);
-        field("Role", &role, &root);
+        field("Role", &role, &controls);
         let model = gtk::Entry::builder()
             .placeholder_text("Provider default")
             .build();
-        field("Model", &model, &root);
+        field("Model", &model, &controls);
         let effort =
             gtk::DropDown::from_strings(&["Default", "low", "medium", "high", "xhigh", "max"]);
-        field("Reasoning effort", &effort, &root);
+        field("Reasoning effort", &effort, &controls);
+        configuration.append(&controls);
+        root.append(&configuration);
+        let prompt = gtk::TextView::new();
+        prompt.set_wrap_mode(gtk::WrapMode::WordChar);
+        prompt.set_size_request(-1, 100);
+        field("Assignment", &prompt, &root);
+        let advanced = gtk::Expander::new(Some("Worktree and permissions"));
+        let options = gtk::Box::new(gtk::Orientation::Vertical, 8);
         let worktree = gtk::Entry::builder()
             .text("new")
             .placeholder_text("new, primary, or absolute worktree path")
             .build();
-        field("Worktree", &worktree, &root);
-        let prompt = gtk::TextView::new();
-        prompt.set_wrap_mode(gtk::WrapMode::WordChar);
-        prompt.set_size_request(-1, 120);
-        field("Assignment", &prompt, &root);
+        field("Worktree", &worktree, &options);
         let writes = gtk::CheckButton::with_label("Allow agent bus writes");
         writes.set_active(true);
-        root.append(&writes);
+        options.append(&writes);
         let ui_access = gtk::CheckButton::with_label("Allow UI control");
-        root.append(&ui_access);
-        let expander = gtk::Expander::new(Some("Task queue"));
-        let task_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        expander.set_child(Some(&task_box));
-        root.append(&expander);
+        options.append(&ui_access);
+        advanced.set_child(Some(&options));
+        root.append(&advanced);
+        root.append(&label("TASK QUEUE", "section-label"));
+        let task_box = gtk::Grid::builder()
+            .column_homogeneous(true)
+            .column_spacing(6)
+            .row_spacing(6)
+            .build();
+        root.append(&task_box);
         Rc::new(Self {
             root,
             provider,
@@ -101,37 +165,81 @@ impl Ui {
             self.show_error("A launch is in progress. Allocated sessions will appear on the wall.");
             return;
         }
+        if !self.dismiss_panels() {
+            return;
+        }
         clear(&self.launch_box);
         self.launch.set_reveal_child(true);
-        self.launch_box.append(&label("New session", "title"));
+        let heading = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        heading.add_css_class("launch-heading");
+        let title = label("New session", "title");
+        title.set_hexpand(true);
+        heading.append(&title);
+        let close = icon_button("close", "Close new session");
+        heading.append(&close);
+        let weak = Rc::downgrade(self);
+        close.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                if !ui.launch_busy.get() {
+                    ui.launch.set_reveal_child(false);
+                }
+            }
+        });
+        self.launch_box.append(&heading);
+        let body = gtk::Box::new(gtk::Orientation::Vertical, 14);
+        body.add_css_class("launch-body");
+        self.launch_box.append(&scrolled(&body));
+
         let mode = gtk::DropDown::from_strings(&["Solo agents", "Review group"]);
         mode.set_widget_name("launch-mode");
-        field("Launch", &mode, &self.launch_box);
+        body.append(&choice_cards(
+            &mode,
+            &[
+                ("user", "Solo agents", "Independent agents and worktrees"),
+                ("merge", "Review group", "Builders and a shared reviewer"),
+            ],
+        ));
+        mode.set_visible(false);
+        body.append(&mode);
+        let members = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        let members_title = label("MEMBERS", "section-label");
+        members_title.set_hexpand(true);
+        members.append(&members_title);
+        body.append(&members);
         let count = gtk::SpinButton::with_range(1.0, 11.0, 1.0);
         count.set_value(1.0);
-        field("Solo agents", &count, &self.launch_box);
+        members.append(&count);
         let builders =
             gtk::DropDown::from_strings(&["One builder + reviewer", "Two builders + reviewer"]);
-        field("Review group", &builders, &self.launch_box);
+        members.append(&builders);
         let profiles: Rc<Vec<_>> = Rc::new((0..11).map(Profile::new).collect());
         let stack = gtk::Stack::new();
         let selector = gtk::StackSwitcher::new();
         selector.set_stack(Some(&stack));
-        self.launch_box.append(&selector);
-        self.launch_box.append(&stack);
+        selector.add_css_class("member-rail");
+        body.append(&selector);
+        body.append(&stack);
         for (i, p) in profiles.iter().enumerate() {
             stack.add_titled(&p.root, Some(&format!("agent-{i}")), &format!("{}", i + 1));
         }
         let update: Rc<dyn Fn()> = Rc::new({
             let profiles = profiles.clone();
-            let mode = mode.clone();
-            let count = count.clone();
-            let builders = builders.clone();
-            let stack = stack.clone();
+            let mode = mode.downgrade();
+            let count = count.downgrade();
+            let builders = builders.downgrade();
+            let stack = stack.downgrade();
             move || {
+                let (Some(mode), Some(count), Some(builders), Some(stack)) = (
+                    mode.upgrade(),
+                    count.upgrade(),
+                    builders.upgrade(),
+                    stack.upgrade(),
+                ) else {
+                    return;
+                };
                 let group = mode.selected() == 1;
-                count.set_sensitive(!group);
-                builders.set_sensitive(group);
+                count.set_visible(!group);
+                builders.set_visible(group);
                 for (i, p) in profiles.iter().enumerate() {
                     let visible = if group {
                         i == 0 || i == 2 || (i == 1 && builders.selected() == 1)
@@ -139,6 +247,11 @@ impl Ui {
                         i < count.value_as_int() as usize
                     };
                     stack.page(&p.root).set_visible(visible);
+                    stack.page(&p.root).set_title(&format!(
+                        "{}\n{}",
+                        i + 1,
+                        if group && i == 2 { "Reviewer" } else { "Agent" }
+                    ));
                     p.role.set_sensitive(!group);
                     p.worktree.set_sensitive(!group || i == 0);
                     if group {
@@ -157,17 +270,23 @@ impl Ui {
         update();
         let hint=label("Each solo agent has its own worktree. A review group shares one branch, with a separate reviewer and one or two builders. Choose the group's task queue on agent 1.","dim");
         hint.set_wrap(true);
-        self.launch_box.append(&hint);
+        body.append(&hint);
+        let footer = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        footer.add_css_class("launch-footer");
+        self.launch_box.append(&footer);
         let progress = label("Loading open tasks…", "dim");
         progress.set_wrap(true);
-        self.launch_box.append(&progress);
+        progress.set_hexpand(true);
+        footer.append(&progress);
         builders.set_widget_name("launch-builders");
         let start = button("Launch", "primary");
+        start.set_valign(gtk::Align::Center);
         start.set_widget_name("launch-start");
         start.set_sensitive(false);
-        self.launch_box.append(&start);
+        footer.append(&start);
         let cancel = button("Cancel", "quiet");
-        self.launch_box.append(&cancel);
+        cancel.set_valign(gtk::Align::Center);
+        footer.append(&cancel);
         let weak = Rc::downgrade(self);
         cancel.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
@@ -184,7 +303,11 @@ impl Ui {
                 Ok(v) => {
                     let tasks = rows(&v, "tasks");
                     for profile in p.iter() {
-                        for row in tasks.iter().filter(|t| text(t, "column") != "done") {
+                        for (index, row) in tasks
+                            .iter()
+                            .filter(|t| text(t, "column") != "done")
+                            .enumerate()
+                        {
                             let id = row["id"].as_i64().unwrap_or(0);
                             let check = gtk::CheckButton::with_label(&format!(
                                 "#{} {}",
@@ -192,13 +315,22 @@ impl Ui {
                                 text(row, "title")
                             ));
                             check.set_active(task == Some(id));
-                            profile.task_box.append(&check);
+                            check.add_css_class("launch-task");
+                            if let Some(label) = check.child().and_downcast::<gtk::Label>() {
+                                label.set_wrap(true);
+                                label.set_max_width_chars(38);
+                            }
+                            profile.task_box.attach(
+                                &check,
+                                (index % 2) as i32,
+                                (index / 2) as i32,
+                                1,
+                                1,
+                            );
                             profile.tasks.borrow_mut().push((id, check));
                         }
                     }
-                    status.set_text(
-                        "All identities and task queues are prepared before agents start.",
-                    );
+                    status.set_text("Ready to launch");
                     ready.set_sensitive(true);
                 }
                 Err(e) => status.set_text(&e.to_string()),
