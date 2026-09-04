@@ -13,48 +13,42 @@
 window { background: @wall; color: @ink; font-family: 'Fira Sans', 'Noto Sans', sans-serif; font-size: 13px; }
 window > box, stack, scrolledwindow { background: @wall; }
 .titlebar { background: @console; padding: 0; border: 0; box-shadow: none; }
-.topbar { min-height: 42px; padding: 0 8px; background: @console; border-bottom: 1px solid @edge; }
-.brand-mark { background: @ink; color: @wall; font-weight: 700; padding: 2px 6px; }
-.brand, .section-label, .tab { font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; }
-.brand { letter-spacing: 0.16em; }
+.topbar { min-height: 42px; padding: 0 0 0 6px; background: @console; border-bottom: 1px solid @edge; }
+.brand-mark { background: @ink; color: @wall; font-family: "Fira Sans Condensed"; font-size: 12px; font-weight: 700; min-width: 20px; min-height: 20px; border-radius: 2px; margin: 0 8px 0 7px; }
+.brand, .section-label { font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; }
+.brand { font-size: 12px; letter-spacing: 0.16em; }
 .sidebar { background: @console; border-right: 1px solid @edge; }
 .sidebar scrolledwindow, .sidebar viewport { background: @console; }
-.sidebar-footer, .section-label { padding: 12px 10px 8px; color: @secondary; }
+.section-label { padding: 12px 10px 8px; color: @secondary; }
 button { min-height: 28px; padding: 0 10px; border: 0; border-radius: 2px; box-shadow: none; background: @slab; color: @ink; font-size: 12px; }
 button:hover { background: @wash; }
 button:focus-visible { outline: 2px solid @ink; outline-offset: -2px; }
 button:disabled { opacity: 0.45; }
 button.primary { background: @ink; color: @wall; }
 button.primary:hover { background: white; }
-button.quiet, button.tab, button.nav, button.project, button.file { background: transparent; color: @secondary; }
-button.quiet:hover, button.tab:hover, button.nav:hover, button.project:hover, button.file:hover { background: @wash; color: @ink; }
+button.quiet, button.nav, button.project, button.file { background: transparent; color: @secondary; }
+button.quiet:hover, button.nav:hover, button.project:hover, button.file:hover { background: @wash; color: @ink; }
 button.nav, button.project, button.file { border-radius: 0; }
-button.nav { min-height: 30px; }
-button.project { min-height: 30px; padding: 3px 8px 3px 22px; }
-button.project.selected { background: @wash; color: @ink; border-left: 2px solid @ink; }
+button.nav { min-height: 28px; padding: 0 8px; font-size: 13px; font-weight: 500; border-radius: 2px; }
+button.project { min-height: 30px; padding: 0 10px 0 22px; font-size: 13px; }
+button.project.selected { min-height: 0; padding: 6px 10px 6px 20px; background: alpha(@ink, 0.08); color: @ink; border-left: 2px solid @ink; }
 .topbar windowcontrols { padding: 0; }
-.topbar windowcontrols button { min-height: 40px; min-width: 32px; padding: 0; }
-button.tab.selected { background: @ink; color: @wall; }
+.topbar windowcontrols button { background: transparent; min-height: 42px; min-width: 40px; padding: 0; }
 button.nav.selected { background: @wash; color: @ink; }
 .title { font-size: 15px; font-weight: 600; }
 .dim { color: @secondary; font-size: 12px; }
 .toolbar { min-height: 38px; padding: 0 12px; background: @console; border-bottom: 1px solid @edge; }
 .statusbar { background: @console; color: @secondary; min-height: 24px; padding: 0 12px; border-top: 1px solid @edge; font-size: 11px; }
 .notice { background: @slab; border-bottom: 1px solid @held; color: @ink; padding: 8px 12px; }
-.terminal-plate { background: @screen; border: 1px solid @edge; }
-.terminal-plate.live { border-color: @edge; }
-.terminal-plate.held { border-color: @edge; }
-.terminal-plate.waiting { border-color: @edge; }
+.terminal-plate { background: @screen; }
 .umd { background: @console; padding: 0 8px; min-height: 26px; border-bottom: 1px solid @edge; }
-.lamp.live { color: @live; }
-.lamp.held { color: @held; }
 .held .session-name { color: @held; }
-.session-name { font-size: 12px; font-weight: 600; }
-.umd button { min-height: 24px; padding: 0 6px; font-size: 11px; }
+.session-name { font-size: 13px; font-weight: 600; }
+.umd button { min-height: 22px; min-width: 22px; padding: 0; font-size: 11px; }
 .page { padding: 20px; }
 .record { background: @slab; padding: 12px; }
-.board-lane { background: @console; padding: 4px; }
-.launch { background: @console; padding: 20px; border-left: 1px solid @edge; }
+.board-lane { background: @console; border: 1px solid @edge; }
+.launch { background: @console; border-left: 1px solid @edge; }
 entry, textview, textview text { background: @screen; color: @ink; caret-color: @ink; }
 entry { border: 1px solid @edge; border-radius: 2px; min-height: 30px; }
 textview { padding: 8px; }
@@ -66,16 +60,74 @@ scrollbar { background: @console; }
 scrollbar slider { min-width: 6px; min-height: 6px; background: #3f3f45; border-radius: 2px; }
 .file-tree { background: @console; padding: 8px 0; }
 
-.icon-key { min-width: 24px; padding: 0 4px; }
-.workspace-row { padding: 8px 4px 2px 10px; min-height: 28px; }
-.sidebar .nav { margin: 0 8px; min-height: 28px; }
-.sidebar .nav:first-child { margin-top: 8px; }
-.nav-label { font-size: 12px; font-weight: 500; }
-.session-state { font-family: "Fira Sans Condensed", sans-serif; font-size: 10px; letter-spacing: 0.08em; color: @secondary; }
-.lamp.waiting { color: @secondary; }
+.navigation { padding: 8px 8px 6px; border-bottom: 1px solid @edge; }
+.workspace-heading { padding: 8px 8px 4px 12px; }
+.workspace-heading .section-label { padding: 0; }
+.workspace-row { min-height: 30px; padding: 0 10px; color: @secondary; }
+.project-name { font-weight: 500; }
+.project-branch { color: @secondary; font-size: 11px; }
+.mono, .session-branch { font-family: 'Fira Mono', monospace; font-size: 11px; }
+button.icon-key { min-width: 28px; min-height: 28px; padding: 0; }
+.topbar > button.icon-key { margin: 6px 0; }
+.launch-key { margin: 0 6px 0 8px; }
+.layout-menu > button { background: transparent; min-width: 28px; min-height: 28px; padding: 0; }
+.layout-menu > button:hover { background: @wash; }
+button.quiet.selected { background: @wash; color: @ink; }
+.statusbar separator { min-width: 1px; min-height: 12px; margin: 6px 0; background: #37373c; }
+.status-project { color: @ink; font-weight: 500; }
+.lamp { min-width: 6px; min-height: 6px; border: 1px solid #77777a; border-radius: 50%; }
+.live .umd .lamp, .lamp.live { background: @live; border-color: @live; }
+.held .umd .lamp, .lamp.held { background: @held; border-color: @held; }
+.session-identity, .session-branch { color: @secondary; font-size: 11px; }
+.session-state { color: @secondary; font-family: 'Fira Sans Condensed'; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; }
+.held .session-state { color: @held; }
+.terminal-status { background: @console; padding: 4px 8px; }
+
+.topbar windowcontrols button { margin: 0; }
+.topbar windowcontrols button:hover { background: @wash; }
+.lane-heading { padding: 9px 10px 8px; border-bottom: 1px solid @edge; font-family: 'Fira Sans Condensed'; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; color: @secondary; }
+.task-card { margin: 0 6px; padding: 8px 10px; background: @slab; border: 1px solid @edge; }
+.task-card:hover { border-color: #37373c; }
+.task-card .mono { color: @secondary; }
+.task-title { font-size: 13px; font-weight: 500; }
+.task-priority { color: @secondary; font-size: 11px; }
+.task-agent { border-top: 1px solid @edge; padding-top: 5px; color: @secondary; font-size: 11px; }
+
+button.launch-scrim, button.launch-scrim:hover { background: alpha(#060607, 0.62); border-radius: 0; }
+
+.settings-key { margin: 8px; }
+.nav-label { font-size: 13px; font-weight: 500; }
 .focus-tabs { background: @console; padding: 2px; }
 button.quiet.selected { color: @ink; background: @wash; }
 .statusbar .statusbar { border: 0; padding: 0; }
 .statusbar button { min-height: 22px; font-size: 11px; }
 
 .wallpaper-dim { background: black; }
+
+/* App-owned details stay inside the shell, matching Relay-2's panels. */
+.panel-scrim { border: 0; border-radius: 0; background: rgba(0, 0, 0, .35); }
+.panel-scrim:hover, .panel-scrim:active { background: rgba(0, 0, 0, .35); }
+.app-panel { background: @console; border-left: 1px solid @edge; }
+.panel-heading { min-height: 42px; padding: 0 16px; border-bottom: 1px solid @edge; }
+.panel-body { padding: 16px; }
+
+.compact-panel { border: 1px solid @edge; box-shadow: 0 8px 28px alpha(black, .35); }
+.detail-page { border-left: 0; }
+.detail-page .panel-heading { min-height: 52px; }
+.detail-page .panel-body { padding: 4px; }
+
+.launch-heading { min-height: 56px; padding: 0 20px; border-bottom: 1px solid @edge; }
+.launch-body { padding: 16px 20px; }
+.launch-body .section-label { padding: 0; }
+.launch-profile { padding-top: 4px; }
+button.launch-choice { min-height: 62px; padding: 10px 11px; border: 1px solid @edge; background: @console; }
+button.launch-choice:checked { border-color: @ink; background: @wash; }
+.choice-title { font-size: 13px; font-weight: 600; }
+.member-rail button { min-height: 54px; border: 1px solid @edge; background: @console; }
+.member-rail button:checked { border-color: @ink; background: @wash; }
+.launch-footer { min-height: 64px; padding: 0 20px; border-top: 1px solid @edge; background: @console; }
+.launch-footer button.primary { min-width: 156px; min-height: 34px; }
+.launch-task { padding: 10px; border: 1px solid @edge; background: @slab; }
+
+.task-edit { padding: 12px; border: 1px solid @edge; background: @console; }
+.task-relations { padding: 12px 0; }

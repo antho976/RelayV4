@@ -30,10 +30,11 @@ pub fn multiline(value: &str, height: i32) -> gtk::TextView {
     view
 }
 
-// Dialog-local drafts stay alive while project lists refresh. A close request cannot
+// Editor-local drafts stay alive while project lists refresh. A close request cannot
 // drop a changed draft, and controls are locked while its save is in flight.
 pub struct Draft {
-    pub window: gtk::Window,
+    pub window: Option<gtk::Window>,
+    panel: Option<Rc<crate::panel::Panel>>,
     pub layout: gtk::Box,
     pub form: gtk::Box,
     pub status: gtk::Label,
@@ -51,13 +52,35 @@ impl Draft {
         snapshot: Rc<dyn Fn() -> Value>,
         form: gtk::Box,
     ) -> Rc<Self> {
-        let window = gtk::Window::builder()
-            .title(title)
-            .transient_for(&ui.window)
-            .modal(true)
-            .default_width(780)
-            .default_height(720)
-            .build();
+        Self::build(ui, title, base, snapshot, form, false)
+    }
+    pub fn new_note(
+        ui: &Rc<Ui>,
+        title: &str,
+        base: Value,
+        snapshot: Rc<dyn Fn() -> Value>,
+        form: gtk::Box,
+    ) -> Rc<Self> {
+        Self::build(ui, title, base, snapshot, form, true)
+    }
+    fn build(
+        ui: &Rc<Ui>,
+        title: &str,
+        base: Value,
+        snapshot: Rc<dyn Fn() -> Value>,
+        form: gtk::Box,
+        note: bool,
+    ) -> Rc<Self> {
+        let window = note.then(|| {
+            gtk::Window::builder()
+                .title(title)
+                .transient_for(&ui.window)
+                .default_width(780)
+                .default_height(720)
+                .build()
+        });
+        let panel = (!note).then(|| crate::panel::Panel::page(ui, title));
+        form.set_valign(gtk::Align::Start);
         let layout = gtk::Box::new(gtk::Orientation::Vertical, 10);
         layout.set_margin_top(16);
         layout.set_margin_bottom(16);
@@ -68,9 +91,15 @@ impl Draft {
         layout.append(&scrolled(&form));
         layout.append(&status);
         layout.append(&footer);
-        window.set_child(Some(&layout));
+        if let Some(window) = &window {
+            window.set_child(Some(&layout));
+        }
+        if let Some(panel) = &panel {
+            panel.body.append(&layout);
+        }
         let draft = Rc::new(Self {
             window,
+            panel,
             layout,
             form,
             status,
@@ -80,41 +109,65 @@ impl Draft {
             snapshot,
             on_close: RefCell::new(None),
         });
-        let weak = Rc::downgrade(&draft);
-        draft.window.connect_close_request(move |_| {
-            if let Some(d) = weak.upgrade() {
-                if d.busy.get() || d.dirty() {
-                    d.status
-                        .set_text("Save your changes or choose Discard and close.");
-                    return glib::Propagation::Stop;
+        if let Some(window) = &draft.window {
+            let weak = Rc::downgrade(&draft);
+            window.connect_close_request(move |_| {
+                if let Some(d) = weak.upgrade() {
+                    if !d.can_close() {
+                        return glib::Propagation::Stop;
+                    }
+                    d.cleanup();
                 }
-                if let Some(close) = d.on_close.borrow_mut().take() {
-                    close();
+                glib::Propagation::Proceed
+            });
+        }
+        if let Some(panel) = &draft.panel {
+            let weak = Rc::downgrade(&draft);
+            panel.set_guard(move || weak.upgrade().is_none_or(|d| d.can_close()));
+            let weak = Rc::downgrade(&draft);
+            panel.on_closed(move || {
+                if let Some(d) = weak.upgrade() {
+                    d.cleanup();
                 }
-            }
-            glib::Propagation::Proceed
-        });
-        let weak = Rc::downgrade(&draft);
-        draft.window.connect_hide(move |_| {
-            if let Some(d) = weak.upgrade() {
-                clear(&d.footer);
-                clear(&d.form);
-            }
-        });
+            });
+        }
         draft
     }
-    pub fn close(&self) {
+    fn can_close(&self) -> bool {
         if self.busy.get() || self.dirty() {
             self.status
                 .set_text("Save your changes or choose Discard and close.");
-            return;
+            false
+        } else {
+            true
         }
+    }
+    fn cleanup(&self) {
         if let Some(close) = self.on_close.borrow_mut().take() {
             close();
         }
-        self.window.destroy();
         clear(&self.footer);
         clear(&self.form);
+    }
+    pub fn present(&self) {
+        if let Some(panel) = &self.panel {
+            panel.present();
+        }
+        if let Some(window) = &self.window {
+            window.present();
+        }
+    }
+    pub fn close(&self) {
+        if !self.can_close() {
+            return;
+        }
+        if let Some(panel) = &self.panel {
+            panel.close();
+        }
+        if let Some(window) = &self.window {
+            self.cleanup();
+            window.destroy();
+        }
     }
     pub fn dirty(&self) -> bool {
         let current = (self.snapshot)();
@@ -253,8 +306,10 @@ fn detail(ui: &Rc<Ui>, task: Value, modules: Vec<Value>, tasks: Vec<Value>) {
     }
     form.append(&meta);
     let body = multiline(text(&task, "body"), 180);
+    body.set_vexpand(false);
     field("Description · Markdown", &body, &form);
     let changelog = multiline(text(&task, "changelog"), 65);
+    changelog.set_vexpand(false);
     field("Changelog sentence", &changelog, &form);
     let snapshot: Rc<dyn Fn() -> Value> = Rc::new(
         move || json!({"title":title.text().trim(),"body":buffer_text(&body.buffer()),"changelog":buffer_text(&changelog.buffer()),"priority":chosen(&priority),"state":chosen(&state),"type":chosen(&kind),"size":if chosen(&size).is_empty(){Value::Null}else{json!(chosen(&size))},"module_id":chosen(&module).parse::<i64>().ok()}),
@@ -552,7 +607,60 @@ fn detail(ui: &Rc<Ui>, task: Value, modules: Vec<Value>, tasks: Vec<Value>) {
         move || json!({"task_id":id}),
         None,
     );
-    d.window.present();
+    // Relay-2 keeps editing on the left and relationships/actions on the right.
+    let edit = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    edit.set_hexpand(true);
+    edit.set_valign(gtk::Align::Start);
+    edit.add_css_class("task-edit");
+    let side = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    side.set_valign(gtk::Align::Start);
+    side.add_css_class("task-relations");
+    let mut relations = false;
+    while let Some(child) = d.form.first_child() {
+        relations |= child == transitions.clone().upcast::<gtk::Widget>();
+        d.form.remove(&child);
+        if relations {
+            side.append(&child);
+        } else {
+            edit.append(&child);
+        }
+    }
+    d.layout.remove(&d.status);
+    d.layout.remove(&d.footer);
+    edit.append(&d.status);
+    edit.append(&d.footer);
+    d.form.set_spacing(20);
+    d.form.set_orientation(if ui.window.width() >= 1200 {
+        gtk::Orientation::Horizontal
+    } else {
+        gtk::Orientation::Vertical
+    });
+    d.form.append(&edit);
+    d.form.append(&side);
+    if let Some(scroll) = d.layout.first_child().and_downcast::<gtk::ScrolledWindow>() {
+        scroll.set_child(gtk::Widget::NONE);
+        d.layout.remove(&scroll);
+        d.layout.append(&d.form);
+    }
+    if let (Some(surface), Some(panel)) = (ui.window.surface(), &d.panel) {
+        let weak = d.form.downgrade();
+        let handler = surface.connect_layout(move |_, width, _| {
+            if let Some(form) = weak.upgrade() {
+                form.set_orientation(if width >= 1200 {
+                    gtk::Orientation::Horizontal
+                } else {
+                    gtk::Orientation::Vertical
+                });
+            }
+        });
+        let handler = RefCell::new(Some(handler));
+        panel.on_closed(move || {
+            if let Some(handler) = handler.borrow_mut().take() {
+                surface.disconnect(handler);
+            }
+        });
+    }
+    d.present();
 }
 // Auxiliary changes never invalidate an unsaved editor. Successful actions reopen
 // a fresh detail, so labels, relations and state always reflect the engine response.

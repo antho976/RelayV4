@@ -22,7 +22,9 @@ pub fn rows(v: &Value, key: &str) -> Vec<Value> {
 pub fn label(text: &str, class: &str) -> gtk::Label {
     let l = gtk::Label::new(Some(text));
     l.set_xalign(0.0);
-    l.add_css_class(class);
+    if !class.is_empty() {
+        l.add_css_class(class);
+    }
     l
 }
 pub fn button(text: &str, class: &str) -> gtk::Button {
@@ -103,14 +105,20 @@ pub struct Ui {
     pub page_projects: RefCell<BTreeMap<String, i64>>,
     pub notice: gtk::Label,
     status: gtk::Label,
+    status_project: gtk::Label,
+    status_branch: gtk::Label,
     sidebar: gtk::Box,
     focus_tabs: gtk::Box,
     mode: RefCell<String>,
-    satellites: RefCell<BTreeMap<String, gtk::Window>>,
+    pub overlay: gtk::Overlay,
+    pub page_overlay: gtk::Overlay,
+    pub panels: Rc<RefCell<Vec<Rc<crate::panel::Panel>>>>,
     registry_dirty: Cell<bool>,
     workspaces: RefCell<Vec<Value>>,
     rendered_sessions: RefCell<BTreeMap<String, Value>>,
     restored_project: Cell<i64>,
+    layout_saves: RefCell<BTreeMap<i64, Value>>,
+    layout_saving: Cell<bool>,
     appearance: gtk::CssProvider,
     wallpaper: gtk::Picture,
     wallpaper_dim: gtk::Box,
@@ -198,27 +206,35 @@ impl Ui {
             .default_height(900)
             .build();
         let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        let top = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let top = gtk::Box::new(gtk::Orientation::Horizontal, 2);
         top.add_css_class("topbar");
         let sidebar_key = icon_button("sidebar-show-symbolic", "Toggle sidebar");
+        sidebar_key.set_widget_name("sidebar-toggle");
         top.append(&sidebar_key);
         let mark = label("R", "brand-mark");
         mark.set_valign(gtk::Align::Center);
+        mark.set_xalign(0.5);
         top.append(&mark);
-        top.append(&label("RELAY", "brand"));
-        let tabs = gtk::Box::new(gtk::Orientation::Horizontal, 2);
-        tabs.set_halign(gtk::Align::Center);
-        tabs.set_hexpand(true);
-        top.append(&tabs);
+        let brand = label("RELAY", "brand");
+        brand.set_hexpand(true);
+        top.append(&brand);
         let palette_key = icon_button("system-search-symbolic", "Command palette · Ctrl K");
+        palette_key.set_widget_name("command-palette");
         let layouts_key = icon_button("view-grid-symbolic", "Window presets");
+        layouts_key.set_widget_name("window-presets");
         let notifications_key = icon_button("alarm-symbolic", "Notifications");
         for key in [&palette_key, &layouts_key, &notifications_key] {
             top.append(key);
         }
         let reconnect = icon_button("view-refresh-symbolic", "Reconnect to engine");
         top.append(&reconnect);
-        let launch_key = button("+ New session", "primary");
+        let launch_key = button("New session", "primary");
+        let launch_label = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        launch_label.append(&crate::icons::image("plus", 14));
+        launch_label.append(&label("New session", ""));
+        launch_key.set_child(Some(&launch_label));
+        launch_key.set_valign(gtk::Align::Center);
+        launch_key.add_css_class("launch-key");
         top.append(&launch_key);
         top.append(&gtk::WindowControls::new(gtk::PackType::End));
         let handle = gtk::WindowHandle::new();
@@ -230,24 +246,35 @@ impl Ui {
         outer.append(&notice);
         let body = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         body.set_vexpand(true);
-        let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 0);
         sidebar.set_size_request(200, -1);
         sidebar.set_hexpand(false);
         sidebar.add_css_class("sidebar");
-        let nav = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        let nav = gtk::Box::new(gtk::Orientation::Vertical, 1);
+        nav.add_css_class("navigation");
         sidebar.append(&nav);
-        sidebar.append(&label("WORKSPACES", "section-label"));
-        let projects_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        sidebar.append(&scrolled(&projects_box));
-        let add_project = button("+ Open repository", "quiet");
-        sidebar.append(&add_project);
-        let settings_key = button("Settings", "nav");
+        let section = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        section.add_css_class("workspace-heading");
+        let heading = label("WORKSPACES", "section-label");
+        heading.set_hexpand(true);
+        section.append(&heading);
+        let add_project = icon_button("plus", "Open repository");
+        section.append(&add_project);
+        sidebar.append(&section);
+        let projects_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let project_scroll = scrolled(&projects_box);
+        project_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        sidebar.append(&project_scroll);
+        let settings_key = nav_button("Settings", "settings");
+        settings_key.add_css_class("settings-key");
         sidebar.append(&settings_key);
         body.append(&sidebar);
         let content = gtk::Stack::new();
         content.set_hexpand(true);
         content.set_vexpand(true);
-        body.append(&content);
+        let page_overlay = gtk::Overlay::new();
+        page_overlay.set_child(Some(&content));
+        body.append(&page_overlay);
         let wall = gtk::Grid::builder()
             .hexpand(true)
             .vexpand(true)
@@ -322,22 +349,56 @@ impl Ui {
         ] {
             let page = gtk::Box::new(gtk::Orientation::Vertical, 12);
             page.add_css_class("page");
+            page.set_vexpand(true);
             content.add_named(&scrolled(&page), Some(name));
             pages.insert(name.into(), page);
         }
         let launch_box = gtk::Box::new(gtk::Orientation::Vertical, 12);
         launch_box.add_css_class("launch");
-        launch_box.set_size_request(380, -1);
+        launch_box.set_size_request(780, -1);
         let launch = gtk::Revealer::new();
         launch.set_transition_duration(0);
         launch.set_hexpand(false);
-        launch.set_child(Some(&scrolled(&launch_box)));
-        body.append(&launch);
-        outer.append(&body);
-        let status = label("Engine disconnected", "statusbar");
-        let bottom = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        launch.set_child(Some(&launch_box));
+        launch.set_halign(gtk::Align::End);
+        launch.set_size_request(780, -1);
+        let overlay = gtk::Overlay::new();
+        overlay.set_child(Some(&body));
+        let scrim = gtk::Button::new();
+        scrim.add_css_class("launch-scrim");
+        scrim.set_visible(false);
+        scrim.update_property(&[gtk::accessible::Property::Label("Close new session")]);
+        overlay.add_overlay(&scrim);
+        overlay.add_overlay(&launch);
+        let weak_body = body.downgrade();
+        let weak_scrim = scrim.downgrade();
+        launch.connect_child_revealed_notify(move |launch| {
+            if let Some(scrim) = weak_scrim.upgrade() {
+                scrim.set_visible(launch.reveals_child());
+            }
+            if let Some(body) = weak_body.upgrade() {
+                body.set_sensitive(!launch.reveals_child());
+            }
+        });
+        let panel_host = gtk::Overlay::new();
+        panel_host.set_child(Some(&overlay));
+        outer.append(&panel_host);
+        let bottom = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         bottom.add_css_class("statusbar");
-        status.set_hexpand(true);
+        let status_project = label("No project", "status-project");
+        status_project.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        status_project.set_max_width_chars(24);
+        let status_branch = label("", "mono");
+        status_branch.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        status_branch.set_max_width_chars(18);
+        bottom.append(&status_project);
+        bottom.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+        bottom.append(&crate::icons::image("branch", 11));
+        bottom.append(&status_branch);
+        let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        spacer.set_hexpand(true);
+        bottom.append(&spacer);
+        let status = label("Engine disconnected", "");
         bottom.append(&status);
         let devices_key = button("Devices", "quiet");
         let usage_key = button("Usage", "quiet");
@@ -375,14 +436,20 @@ impl Ui {
             page_projects: RefCell::default(),
             notice,
             status,
+            status_project,
+            status_branch,
             sidebar,
             focus_tabs,
             mode: RefCell::new("grid".into()),
-            satellites: RefCell::default(),
+            overlay: panel_host,
+            page_overlay,
+            panels: Rc::default(),
             registry_dirty: Cell::new(true),
             workspaces: RefCell::default(),
             rendered_sessions: RefCell::default(),
             restored_project: Cell::new(0),
+            layout_saves: RefCell::default(),
+            layout_saving: Cell::new(false),
             appearance: gtk::CssProvider::new(),
             wallpaper,
             wallpaper_dim,
@@ -517,6 +584,36 @@ impl Ui {
             }
         });
         let weak = Rc::downgrade(&ui);
+        scrim.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                if !ui.launch_busy.get() {
+                    ui.launch.set_reveal_child(false);
+                }
+            }
+        });
+        let keys = gtk::EventControllerKey::new();
+        let weak = Rc::downgrade(&ui);
+        keys.connect_key_pressed(move |_, key, _, _| {
+            if let Some(ui) = weak.upgrade() {
+                if key == gtk::gdk::Key::Escape {
+                    let panel = ui.panels.borrow().last().cloned();
+                    if let Some(panel) = panel {
+                        panel.close();
+                        return glib::Propagation::Stop;
+                    }
+                }
+                if key == gtk::gdk::Key::Escape
+                    && ui.launch.reveals_child()
+                    && !ui.launch_busy.get()
+                {
+                    ui.launch.set_reveal_child(false);
+                    return glib::Propagation::Stop;
+                }
+            }
+            glib::Propagation::Proceed
+        });
+        ui.window.add_controller(keys);
+        let weak = Rc::downgrade(&ui);
         ui.window.connect_realize(move |w| {
             if let Some(surface) = w.surface() {
                 let weak = weak.clone();
@@ -555,13 +652,17 @@ impl Ui {
                 owned.show_error("Save or discard your editor changes before closing.");
                 return glib::Propagation::Stop;
             }
+            let panels = owned.panels.borrow().clone();
+            if panels.iter().any(|panel| !panel.can_close()) {
+                owned.show_error("Save or discard panel changes before closing.");
+                return glib::Propagation::Stop;
+            }
+            for panel in panels.iter().rev() {
+                panel.close();
+            }
             let drafts: Vec<_> = owned.note_drafts.borrow().values().cloned().collect();
             for draft in drafts {
                 draft.close();
-            }
-            let satellites = std::mem::take(&mut *owned.satellites.borrow_mut());
-            for w in satellites.values() {
-                w.destroy();
             }
             owned.generation.set(owned.generation.get() + 1);
             owned.connected.set(false);
@@ -708,7 +809,21 @@ impl Ui {
             }
         });
     }
+    pub fn dismiss_panels(&self) -> bool {
+        let panels = self.panels.borrow().clone();
+        if panels.iter().any(|panel| !panel.can_close()) {
+            self.show_error("Save or discard your changes before leaving this page.");
+            return false;
+        }
+        for panel in panels.iter().rev() {
+            panel.close();
+        }
+        true
+    }
     pub fn navigate(self: &Rc<Self>, page: &str) {
+        if *self.page.borrow() != page && !self.dismiss_panels() {
+            return;
+        }
         if self.content.child_by_name(page).is_none() {
             return;
         }
@@ -859,10 +974,6 @@ impl Ui {
         for n in old {
             if let Some(p) = self.panes.borrow_mut().remove(&n) {
                 p.stop();
-                if let Some(window) = self.satellites.borrow_mut().remove(&n) {
-                    window.set_child(gtk::Widget::NONE);
-                    window.destroy();
-                }
                 if let Some(grid) = p.root.parent().and_downcast::<gtk::Grid>() {
                     grid.remove(&p.root);
                 }
@@ -907,10 +1018,17 @@ impl Ui {
             .find(|p| p["id"].as_i64() == Some(self.project.get()))
             .map(|p| text(p, "name").to_string())
             .unwrap_or_else(|| "No project".into());
-        self.status.set_text(&format!(
-            "{name}     │     {held} needs you  ·  {live} live  ·  {} sessions     │     Native",
-            sessions.len()
-        ));
+        self.status_project.set_text(&name);
+        self.status_branch.set_text(
+            self.projects
+                .borrow()
+                .iter()
+                .find(|p| p["id"].as_i64() == Some(self.project.get()))
+                .map(|p| text(p, "base_branch"))
+                .unwrap_or(""),
+        );
+        self.status
+            .set_text(&format!("{held} needs you  ·  {live} live"));
         self.wall_stack
             .set_visible_child_name(if sessions.is_empty() { "empty" } else { "wall" });
     }
@@ -919,10 +1037,9 @@ impl Ui {
         let mode = self.mode.borrow();
         for s in self.sessions.borrow().iter() {
             if let Some(p) = self.panes.borrow().get(text(s, "name")) {
-                let active = (self.satellites.borrow().contains_key(text(s, "name"))
-                    || (*self.page.borrow() == "agents"
-                        && (mode.as_str() != "focus"
-                            || focus.as_ref().is_none_or(|n| n == text(s, "name")))))
+                let active = (*self.page.borrow() == "agents"
+                    && (mode.as_str() != "focus"
+                        || focus.as_ref().is_none_or(|n| n == text(s, "name"))))
                     && !matches!(
                         text(s, "state"),
                         "created" | "parked" | "restorable" | "exited"
@@ -930,6 +1047,34 @@ impl Ui {
                 p.set_active(active);
             }
         }
+    }
+    pub fn verify_shell(self: &Rc<Self>) {
+        let panes = self.panes.borrow().clone();
+        let mode = self.mode.borrow().clone();
+        for mode in ["grid", "focus", "review"] {
+            self.set_mode(mode);
+            for (name, pane) in &panes {
+                assert!(
+                    Rc::ptr_eq(pane, &self.panes.borrow()[name]),
+                    "Layout replaced a terminal"
+                );
+            }
+        }
+        self.set_mode(&mode);
+        println!("Shell layouts verified: grid, focus, review, retained terminals");
+    }
+    pub fn verify_launch(&self) {
+        assert!(self.launch.reveals_child());
+        assert!(
+            self.launch.width() == 780 && self.launch_box.width() == 779,
+            "Launch dimensions: sheet={}, form={}",
+            self.launch.width(),
+            self.launch_box.width()
+        );
+        assert!(
+            !self.sidebar.is_sensitive(),
+            "The launch sheet must block background actions"
+        );
     }
     pub fn verify_terminal_input(&self) {
         use vte4::prelude::TerminalExt;
@@ -941,6 +1086,9 @@ impl Ui {
     pub fn verify_burst(&self, check: bool) {
         use vte4::prelude::TerminalExt;
         assert_eq!(self.panes.borrow().len(), 11);
+        if !check {
+            println!("Burst layout: {}", self.mode.borrow());
+        }
         for (name, pane) in self.panes.borrow().iter() {
             if check {
                 let (_, row) = pane.terminal.cursor_position();
@@ -957,6 +1105,7 @@ impl Ui {
                     "No native tail marker for {name}"
                 );
             } else {
+                pane.verify_ready();
                 pane.terminal.paste_text("native-burst\n");
             }
         }

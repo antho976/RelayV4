@@ -4,6 +4,9 @@ use vte4::prelude::*;
 impl Ui {
     pub fn open_project(self: &Rc<Self>, project: i64, page: &str) {
         if project != self.project.get() {
+            if !self.dismiss_panels() {
+                return;
+            }
             if self.editor.is_dirty() {
                 self.show_error("Save or discard editor changes before switching projects.");
                 return;
@@ -165,35 +168,30 @@ impl Ui {
         });
         window.present();
     }
-    pub(super) fn sheet(&self, title: &str, width: i32, height: i32) -> (gtk::Window, gtk::Box) {
-        let window = gtk::Window::builder()
-            .title(title)
-            .transient_for(&self.window)
-            .application(&self.window.application().unwrap())
-            .default_width(width)
-            .default_height(height)
-            .build();
-        let body = gtk::Box::new(gtk::Orientation::Vertical, 10);
-        body.add_css_class("page");
-        window.set_child(Some(&scrolled(&body)));
-        (window, body)
+    pub(super) fn sheet(
+        &self,
+        title: &str,
+        width: i32,
+        _height: i32,
+    ) -> (Rc<crate::panel::Panel>, gtk::Box) {
+        let panel = crate::panel::Panel::new(self, title, width);
+        let body = panel.body.clone();
+        (panel, body)
     }
     fn confirm_mutation(
         self: &Rc<Self>,
         message: &str,
         op: &'static str,
         payload: Value,
-        parent: Option<gtk::Window>,
+        parent: Option<Rc<crate::panel::Panel>>,
     ) {
-        let dialog = gtk::AlertDialog::builder()
-            .message(message)
-            .buttons(["Cancel", "Confirm"])
-            .cancel_button(0)
-            .default_button(0)
-            .build();
+        let dialog = crate::panel::Panel::new(self, "Confirm action", 520);
+        let copy = label(message, "body");
+        copy.set_wrap(true);
+        dialog.body.append(&copy);
         let ui = self.clone();
         glib::spawn_future_local(async move {
-            if dialog.choose_future(Some(&ui.window)).await == Ok(1) {
+            if dialog.response("Confirm").await {
                 match ui.call(op, payload).await {
                     Ok(_) => {
                         if let Some(w) = parent {
@@ -214,13 +212,7 @@ impl Ui {
         while let Some(w) = self.wall_right.first_child() {
             self.wall_right.remove(&w);
         }
-        let names: Vec<_> = self
-            .ordered
-            .borrow()
-            .iter()
-            .filter(|n| !self.satellites.borrow().contains_key(*n))
-            .cloned()
-            .collect();
+        let names: Vec<_> = self.ordered.borrow().iter().cloned().collect();
         if self
             .focused
             .borrow()
@@ -305,18 +297,28 @@ impl Ui {
         {
             return;
         }
-        let state = self.layout_state();
+        self.layout_saves
+            .borrow_mut()
+            .insert(project, self.layout_state());
+        if self.layout_saving.replace(true) {
+            return;
+        }
         let ui = self.clone();
         glib::spawn_future_local(async move {
-            if let Err(e) = ui
-                .call(
-                    "settings.set",
-                    json!({"path":format!("native.layout.current.{project}"),"value":state}),
-                )
-                .await
-            {
-                ui.show_error(&e.to_string());
+            loop {
+                let next = ui.layout_saves.borrow_mut().pop_first();
+                let Some((project, state)) = next else { break };
+                if let Err(e) = ui
+                    .call(
+                        "settings.set",
+                        json!({"path":format!("native.layout.current.{project}"),"value":state}),
+                    )
+                    .await
+                {
+                    ui.show_error(&e.to_string());
+                }
             }
+            ui.layout_saving.set(false);
         });
     }
     fn layout_state(&self) -> Value {
@@ -420,6 +422,7 @@ impl Ui {
     }
     pub(super) fn layout_menu(self: &Rc<Self>) {
         let (window, body) = self.sheet("Window presets", 390, 420);
+        window.compact(false, 420);
         let modes = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         body.append(&modes);
         for (mode, caption) in [("grid", "Grid"), ("focus", "Focus"), ("review", "Review")] {
@@ -643,15 +646,6 @@ impl Ui {
                 }
             });
         }
-        let pop = button("Open in separate window", "quiet");
-        body.append(&pop);
-        let weak = Rc::downgrade(self);
-        let n = name.clone();
-        pop.connect_clicked(move |_| {
-            if let Some(ui) = weak.upgrade() {
-                ui.popout(&n);
-            }
-        });
         let brief = button("Inspect launch brief", "quiet");
         body.append(&brief);
         let weak = Rc::downgrade(self);
@@ -723,53 +717,9 @@ impl Ui {
         close.connect_clicked(move |_|{if let Some(ui)=weak.upgrade(){ui.confirm_mutation("Close this session and stop its process? The worktree and branch will be kept.","session.close",json!({"session":name,"remove_worktree":false,"purge_build":false}),Some(w.clone()));}});
         window.present();
     }
-    fn popout(self: &Rc<Self>, name: &str) {
-        if let Some(w) = self.satellites.borrow().get(name) {
-            w.present();
-            return;
-        }
-        let Some(p) = self.panes.borrow().get(name).cloned() else {
-            return;
-        };
-        if let Some(grid) = p.root.parent().and_downcast::<gtk::Grid>() {
-            grid.remove(&p.root);
-        }
-        let window = gtk::Window::builder()
-            .application(&self.window.application().unwrap())
-            .title(name)
-            .default_width(900)
-            .default_height(650)
-            .build();
-        window.set_child(Some(&p.root));
-        self.satellites
-            .borrow_mut()
-            .insert(name.into(), window.clone());
-        let weak = Rc::downgrade(self);
-        let n = name.to_string();
-        window.connect_close_request(move |w| {
-            w.set_child(gtk::Widget::NONE);
-            if let Some(ui) = weak.upgrade() {
-                ui.satellites.borrow_mut().remove(&n);
-                ui.layout();
-            }
-            glib::Propagation::Proceed
-        });
-        let weak = Rc::downgrade(&p);
-        window.connect_realize(move |w| {
-            if let Some(surface) = w.surface() {
-                let weak = weak.clone();
-                surface.connect_layout(move |_, _, _| {
-                    if let Some(p) = weak.upgrade() {
-                        p.schedule_resize();
-                    }
-                });
-            }
-        });
-        window.present();
-        self.layout();
-    }
     pub(super) fn command_palette(self: &Rc<Self>) {
-        let (window, body) = self.sheet("Command palette", 520, 480);
+        let (window, body) = self.sheet("Command palette", 560, 480);
+        window.compact(true, 400);
         let search = gtk::SearchEntry::new();
         body.append(&search);
         let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
@@ -836,6 +786,9 @@ impl Ui {
             let Some(ui) = weak.upgrade() else {
                 return glib::Propagation::Proceed;
             };
+            if !ui.panels.borrow().is_empty() {
+                return glib::Propagation::Proceed;
+            }
             for (action, _, fallback) in crate::shortcuts::DEFAULTS {
                 let bindings = ui.keybindings.borrow();
                 let chord = bindings[action].as_str().unwrap_or(fallback);
@@ -855,7 +808,7 @@ impl Ui {
                 }
                 return glib::Propagation::Stop;
             }
-            if key == gtk::gdk::Key::Escape && ui.launch.reveals_child() {
+            if key == gtk::gdk::Key::Escape && ui.launch.reveals_child() && !ui.launch_busy.get() {
                 ui.launch.set_reveal_child(false);
                 return glib::Propagation::Stop;
             }

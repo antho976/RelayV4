@@ -865,21 +865,12 @@ impl Editor {
             "file.rename" => "Rename file",
             _ => "Move file to Relay trash",
         };
-        let dialog = gtk::Dialog::builder()
-            .transient_for(&ui.window)
-            .modal(true)
-            .title(title)
-            .default_width(480)
-            .build();
-        dialog.add_button("Cancel", gtk::ResponseType::Cancel);
-        dialog.add_button(
-            if op == "file.delete" {
-                "Move to trash"
-            } else {
-                "Apply"
-            },
-            gtk::ResponseType::Accept,
-        );
+        let dialog = crate::panel::Panel::new(ui, title, 480);
+        let caption = if op == "file.delete" {
+            "Move to trash"
+        } else {
+            "Apply"
+        };
         let entry = gtk::Entry::new();
         entry.set_placeholder_text(Some(if op == "file.create" {
             "relative/path.rs"
@@ -893,7 +884,7 @@ impl Editor {
                 "body",
             );
             copy.set_wrap(true);
-            dialog.content_area().append(&copy);
+            dialog.body.append(&copy);
         } else {
             if op == "file.rename" {
                 entry.set_text(
@@ -903,9 +894,9 @@ impl Editor {
                         .unwrap_or(""),
                 );
             }
-            dialog.content_area().append(&entry);
+            dialog.body.append(&entry);
             if op == "file.create" {
-                dialog.content_area().append(&folder);
+                dialog.body.append(&folder);
             }
         }
         let project = ui.project.get();
@@ -913,12 +904,8 @@ impl Editor {
         let e = self.clone();
         let ui = ui.clone();
         glib::spawn_future_local(async move {
-            let response = dialog.run_future().await;
-            dialog.close();
-            if response != gtk::ResponseType::Accept
-                || !e.matches(&ui, project, &worktree)
-                || e.is_dirty()
-            {
+            let accepted = dialog.response(caption).await;
+            if !accepted || !e.matches(&ui, project, &worktree) || e.is_dirty() {
                 return;
             }
             let value = entry.text().trim().to_string();
