@@ -11,25 +11,20 @@ this rebuild from that backlog.
 
 ## Run
 
-Requires GTK 4.22+, VTE 0.84+ and GtkSourceView 5.18+. Build both binaries:
+Requires GTK 4.22+, VTE 0.84+ and GtkSourceView 5.18+. From this checkout:
 
 ```fish
-cargo build -p relay-cli -p relay-native
-set -x RELAY_INSTANCE dev
-./target/debug/relay --instance dev serve
+./run.sh
 ```
 
-In a second terminal, with the same instance:
+The launcher builds incrementally, starts the `dev` engine if needed, waits for
+it to respond, and opens the window. It also works by absolute path from any
+directory. Use `./run.sh stable` or `./run.sh test` to select another instance.
+Engine startup logs go to `target/engine-<instance>.log`.
 
-```fish
-set -x RELAY_INSTANCE dev
-./target/debug/relay-native
-```
-
-An existing engine for that instance can be used instead of starting another.
-The matching rebuilt engine provides `guardrail.hold.get`; an older engine
-can render the shell but cannot provide exact hold review. The client never
-silently replaces a running engine. Closing it keeps sessions and worktrees.
+A running engine is reused without replacement; after engine code changes,
+it needs a deliberate restart to pick them up. Closing the window keeps the
+engine, sessions and worktrees alive.
 
 Open a repository from the sidebar, then add solo agents or a group of
 one or two builders sharing a reviewer. Code can edit the primary checkout or
