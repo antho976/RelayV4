@@ -1,6 +1,7 @@
 mod app;
 mod client;
 mod editor;
+mod icons;
 mod pages;
 mod smoke;
 mod terminal;

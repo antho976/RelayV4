@@ -30,7 +30,20 @@ pub fn install(ui: &Rc<Ui>) {
         .unwrap_or(4);
     let navigate = ui.clone();
     glib::timeout_add_local_once(Duration::from_secs(2), move || {
+        if fixture {
+            navigate.verify_shell();
+        }
+        if let Ok(columns) = std::env::var("RELAY_NATIVE_COLUMNS") {
+            navigate.set_columns(columns.parse::<i32>().unwrap().clamp(1, 3));
+        }
+        if std::env::var("RELAY_NATIVE_HIDE_SIDEBAR").as_deref() == Ok("1") {
+            navigate.toggle_sidebar();
+        }
         if let Ok(page) = std::env::var("RELAY_NATIVE_PAGE") {
+            if page == "launch" {
+                navigate.show_launch(None);
+                return;
+            }
             navigate.navigate(&page);
             if page == "code" && fixture {
                 navigate.editor.verify_open(&navigate);
@@ -42,6 +55,9 @@ pub fn install(ui: &Rc<Ui>) {
         }
     });
     glib::timeout_add_local_once(Duration::from_secs(duration), move || {
+        if fixture && std::env::var("RELAY_NATIVE_PAGE").as_deref() == Ok("launch") {
+            ui.verify_launch();
+        }
         let paintable = gtk::WidgetPaintable::new(Some(&ui.window));
         let snapshot = gtk::Snapshot::new();
         paintable.snapshot(

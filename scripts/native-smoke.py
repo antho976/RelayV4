@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 import socket
 import subprocess
+import struct
+import sys
 import tempfile
 import time
 import uuid
@@ -69,7 +71,7 @@ for line in sys.stdin:
             return response["result"]
 
         workspace = base / "workspace"
-        repo = workspace / "Native verification"
+        repo = workspace / "Native verification with a long repository name"
         repo.mkdir(parents=True)
         git(repo, "init", "-q", "-b", "main")
         git(repo, "config", "user.name", "Native fixture")
@@ -103,10 +105,16 @@ for line in sys.stdin:
         for key in ("RELAY_SESSION", "RELAY_TOKEN", "RELAY_BRIEF"):
             desktop_env.pop(key, None)
         measurements=[]
-        for viewport, size, page in (("desktop", "1440,900", "agents"), ("compact", "1024,768", "agents"), ("board", "1440,900", "board"), ("mailbox", "1024,768", "mailbox"), ("guardrails", "1024,768", "guardrails"), ("code", "1440,900", "code")):
+        screenshots=[]
+        for viewport, size, page in (("desktop", "1440,900", "agents"), ("compact", "1024,768", "agents"), ("board", "1440,900", "board"), ("mailbox", "1024,768", "mailbox"), ("guardrails", "1024,768", "guardrails"), ("code", "1440,900", "code"), ("wide-grid", "1440,900", "agents"), ("launch", "1024,768", "launch")):
+            if sys.argv[1:] and viewport not in sys.argv[1:]:
+                continue
             output = OUT / f"{viewport}.png"
+            screenshots.append(output.name)
             native_env = dict(desktop_env, RELAY_NATIVE_SCREENSHOT=str(output), RELAY_NATIVE_SIZE=size, RELAY_NATIVE_FIXTURE="1",
                               RELAY_NATIVE_PAGE=page, RELAY_NATIVE_SMOKE_SECONDS="8" if viewport=="desktop" else "4")
+            if viewport == "wide-grid":
+                native_env.update(RELAY_NATIVE_COLUMNS="3", RELAY_NATIVE_HIDE_SIDEBAR="1")
             with (OUT / f"{viewport}.log").open("w") as native_log:
                 native=subprocess.Popen([str(NATIVE)], env=native_env, stdout=native_log, stderr=native_log)
                 if viewport=="desktop":
@@ -121,7 +129,15 @@ for line in sys.stdin:
                                              rss_mib=round(rss/1024/1024,1), sample_seconds=round(elapsed,2)))
                 assert native.wait(timeout=30)==0
             assert output.is_file(), f"No screenshot at {output}"
-        (OUT/"measurements.json").write_text(json.dumps(measurements,indent=2)+"\n")
+            actual_size = struct.unpack(">II", output.read_bytes()[16:24])
+            assert actual_size == tuple(map(int, size.split(","))), (viewport, actual_size, size)
+            native_output = (OUT / f"{viewport}.log").read_text()
+            assert "Shell controls verified" in native_output, native_output
+            for error in ("stylesheet:", "gtk_widget_add_css_class:", "panicked at"):
+                assert error not in native_output, native_output
+        if measurements:
+            (OUT/"measurements.json").write_text(json.dumps(measurements,indent=2)+"\n")
+        assert screenshots, "No matching smoke view"
         live = call("session.list", {"project_id": project["id"]})["sessions"]
         assert len(live) == 6 and all(s["state"] == "running" for s in live), live
         for session in live:
@@ -130,8 +146,9 @@ for line in sys.stdin:
             call("session.input", {"session": session["name"], "data": "survived-window-close\n"})
             call("session.park", {"session": session["name"]})
         saved=call("file.read", {"project_id":project["id"],"path":"README.md"})["text"]
-        assert "Native editor save verified." in saved, saved
-        print(json.dumps({"screenshots": ["desktop.png", "compact.png", "board.png", "mailbox.png", "guardrails.png", "code.png"], "sessions_survived_window_close": len(live), "native_paste_echoes_verified":6,"native_editor_saved":True,"real_provider_calls": 0}))
+        if "code.png" in screenshots:
+            assert "Native editor save verified." in saved, saved
+        print(json.dumps({"screenshots": screenshots, "sessions_survived_window_close": len(live), "native_paste_echoes_verified":6,"native_editor_saved":"code.png" in screenshots,"real_provider_calls": 0}))
     finally:
         connection.close()
         engine.terminate()

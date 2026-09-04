@@ -3,6 +3,34 @@
 Verified on 2026-09-04 on the local Linux desktop, using GTK 4.22.4,
 VTE 0.84.1 and GtkSourceView 5.20.0.
 
+## UI parity follow-up
+
+The shell now follows the pinned Relay-2 TopBar, Sidebar, TerminalPane,
+StatusBar and Board card geometry more closely. Page navigation moved into
+the sidebar, projects are grouped by workspace, used icons preserve Relay-2's
+SVG paths, terminal labels sit above the screens, and state uses small tally
+lights. The Board has full-height bordered lanes, task IDs and agent rows.
+The launch sheet overlays the wall instead of expanding a compact window.
+
+Follow-up checks: native build, both native unit tests, native Clippy with
+warnings denied, formatting and diff whitespace checks. The display harness
+covers eight captures at 1440×900 and 1024×768, including three columns with the
+sidebar hidden and the compact launch sheet. Assertions cover actual capture
+size, long project names, sidebar toggling, all three layout controls, retained
+terminal widgets, a visible launch form and disabled background controls.
+The existing six-provider paste/echo, window-close survival and editor-save
+checks remain in the harness. Run one affected view with
+`python3 scripts/native-smoke.py launch`, or omit arguments for the whole run.
+
+The generic design detector flags the selected project's 2px white edge;
+this intentionally matches Relay-2 Sidebar.svelte. There are no stylesheet
+parsing errors. The host AT-SPI registry failure remains, so screen-reader
+operation is still unverified.
+
+This is a UI parity increment. Missing native pages and richer Relay-2 flows
+listed below still prevent a full 1:1 claim. GTK window controls and editor
+highlighting still use native styling.
+
 ## Automated checks
 
 | Check | Result |

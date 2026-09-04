@@ -43,6 +43,9 @@ pub struct Pane {
     pub terminal: vte4::Terminal,
     pub caption: gtk::Label,
     pub actions: gtk::Box,
+    pub identity: gtk::Label,
+    pub branch: gtk::Label,
+    pub state: gtk::Label,
     status: gtk::Label,
     name: String,
     path: PathBuf,
@@ -68,7 +71,7 @@ impl Pane {
         terminal.set_font(Some(&gtk::pango::FontDescription::from_string(
             "Fira Mono 10",
         )));
-        terminal.set_color_foreground(&gtk::gdk::RGBA::parse("#ececea").unwrap());
+        terminal.set_color_foreground(&gtk::gdk::RGBA::parse("#dcdcda").unwrap());
         terminal.set_color_background(&gtk::gdk::RGBA::parse("#0a0a0b").unwrap());
         terminal.set_cursor_blink_mode(vte4::CursorBlinkMode::Off);
         terminal.set_margin_start(10);
@@ -78,26 +81,53 @@ impl Pane {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
         root.add_css_class("terminal-plate");
         root.set_size_request(280, 280);
-        root.append(&terminal);
+
         let footer = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         footer.add_css_class("umd");
         let caption = gtk::Label::new(Some(name));
         caption.set_xalign(0.0);
-        caption.set_hexpand(true);
+        caption.set_max_width_chars(24);
         caption.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
         caption.add_css_class("session-name");
+        let identity = gtk::Label::new(None);
+        identity.add_css_class("session-identity");
+        identity.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        let branch = gtk::Label::new(None);
+        branch.add_css_class("session-branch");
+        branch.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        branch.set_max_width_chars(24);
+        let state = gtk::Label::new(None);
+        state.add_css_class("session-state");
+        let lamp = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        lamp.add_css_class("lamp");
+        lamp.set_valign(gtk::Align::Center);
+        let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        spacer.set_hexpand(true);
         let status = gtk::Label::new(Some("Connecting"));
         status.add_css_class("dim");
         let actions = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        footer.append(&lamp);
         footer.append(&caption);
-        footer.append(&status);
+        footer.append(&identity);
+        footer.append(&branch);
+        footer.append(&spacer);
+        footer.append(&state);
         footer.append(&actions);
         root.append(&footer);
+        root.append(&terminal);
+        status.set_wrap(true);
+        status.set_max_width_chars(40);
+        status.add_css_class("terminal-status");
+        status.connect_label_notify(|label| label.set_visible(!label.text().is_empty()));
+        root.append(&status);
         let pane = Rc::new(Self {
             root,
             terminal,
             caption,
             actions,
+            identity,
+            branch,
+            state,
             status,
             name: name.into(),
             path,
@@ -187,7 +217,7 @@ impl Pane {
                 task.abort();
             }
             self.client.borrow_mut().take(); // socket EOF releases only this attachment
-            self.status.set_text("Detached");
+            self.status.set_text("");
             return;
         }
         let weak = Rc::downgrade(self);
@@ -226,7 +256,7 @@ impl Pane {
         *self.client.borrow_mut() = Some(client);
         self.size.set((0, 0));
         self.schedule_resize();
-        self.status.set_text("Attached");
+        self.status.set_text("");
         let mut bytes = 0;
         while let Ok(notice) = rx.recv().await {
             match notice {
@@ -280,6 +310,8 @@ impl Pane {
                 return;
             };
             p.resize_pending.set(false);
+            p.identity.set_visible(p.root.width() > 420);
+            p.branch.set_visible(p.root.width() > 600);
             if !p.active.get() || !p.terminal.is_mapped() {
                 return;
             }
