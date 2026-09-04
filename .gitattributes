@@ -1,0 +1,2 @@
+# Preserve upstream Markdown snapshots byte-for-byte, including hard line breaks.
+docs/upstream-v3/** whitespace=-blank-at-eol,-blank-at-eof

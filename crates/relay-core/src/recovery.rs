@@ -1,0 +1,214 @@
+//! Crash recovery on launch (SPEC §14): reap orphaned provider processes, fsck the sessions
+//! table against live PIDs, flag dirty worktrees, list tasks stuck in `active` with no live
+//! session. Logs what it did to `meta.recovery.last` (`app.recovery.last`).
+
+use crate::engine::Engine;
+use crate::pty;
+
+use anyhow::Result;
+use relay_bus::ops::app::RecoveryReport;
+use relay_bus::types::Id;
+use rusqlite::params;
+use serde_json::Value;
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+/// How long an audit row survives when settings say nothing. Well past any undo grace, and past
+/// any window in which `audit.list` is still how someone reconstructs what happened.
+const DEFAULT_AUDIT_RETENTION_DAYS: i64 = 180;
+
+fn kill_wait(pid: u32) {
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGTERM);
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while pty::pid_alive(pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if pty::pid_alive(pid) {
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+    }
+}
+
+/// Run once at engine start, before the doors open. Returns the report it also stored.
+pub fn run(engine: &Engine) -> Result<RecoveryReport> {
+    let now = crate::time::now();
+    let instance = engine.instance.as_str();
+    let mut report = RecoveryReport {
+        at: now.clone(),
+        reaped_pids: vec![],
+        fsck_fixes: vec![],
+        dirty_worktrees: vec![],
+        tasks_reset_offered: vec![],
+    };
+
+    // 1. orphans: any live process carrying our instance's RELAY_SESSION was spawned by a
+    //    previous engine. Nothing can reattach to it — reap it; its session becomes restorable.
+    let store_path = engine.store.path().display().to_string();
+    let orphans = pty::relay_children(instance, &store_path);
+    for (pid, name) in &orphans {
+        kill_wait(*pid);
+        report.reaped_pids.push(*pid as i64);
+        report
+            .fsck_fixes
+            .push(format!("reaped orphan pid {pid} (session {name})"));
+    }
+
+    let mut conn = engine.store.lock();
+    let tx = conn.transaction()?;
+    // 2. sessions that claim to be live: their pid is dead (or was just reaped) → restorable
+    {
+        let mut st = tx.prepare_cached("SELECT id, name, state, pid FROM sessions WHERE state IN ('spawning','running','idle','blocked')")?;
+        let rows: Vec<(Id, String, String, Option<i64>)> = st
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<Result<_, _>>()?;
+        for (id, name, state, pid) in rows {
+            let why = match pid {
+                Some(p) if pty::pid_alive(p as u32) => {
+                    // alive but not ours (we just started) — reap unless it was already
+                    kill_wait(p as u32);
+                    if !report.reaped_pids.contains(&p) {
+                        report.reaped_pids.push(p);
+                    }
+                    format!("pid {p} still alive from a previous engine; reaped")
+                }
+                Some(p) => format!("pid {p} is dead"),
+                None => "no pid recorded".to_string(),
+            };
+            tx.execute("UPDATE sessions SET state='restorable',pid=NULL,restore_reason='crash',updated_at=?1 WHERE id=?2", params![now, id])?;
+            report
+                .fsck_fixes
+                .push(format!("session {name}: {state} → restorable ({why})"));
+        }
+    }
+    // 3. dirty worktrees per project (gix is_dirty; no spawn)
+    {
+        let mut st = tx.prepare_cached("SELECT path FROM projects")?;
+        let repos: Vec<String> = st.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+        for repo in repos {
+            if let Ok(wts) = crate::worktree::list(Path::new(&repo)) {
+                for w in wts.into_iter().filter(|w| w.dirty) {
+                    // the primary checkout being dirty is normal; pooled ones with changes are worth a flag
+                    if w.path.starts_with(
+                        &crate::worktree::pool_dir(Path::new(&repo))
+                            .display()
+                            .to_string(),
+                    ) {
+                        report.dirty_worktrees.push(w.path);
+                    }
+                }
+            }
+        }
+    }
+    // 4. requested device runs are process-backed and cannot survive an engine restart.
+    //    Preserve the durable record, but close its lifecycle instead of showing it as live.
+    {
+        let changed = tx.execute(
+            "UPDATE device_runs SET state='stopped',finished_at=?1 WHERE state IN ('building','running')",
+            [&now],
+        )?;
+        if changed > 0 {
+            report
+                .fsck_fixes
+                .push(format!("closed {changed} interrupted device run(s)"));
+        }
+    }
+    // 5. generated hook directories with no session behind them. Stale ones accumulate one
+    //    per closed session and make `.relay/hooks` misreport the live fleet.
+    {
+        let mut st = tx.prepare_cached(
+            "SELECT p.path, COALESCE(GROUP_CONCAT(s.name, char(10)), '') FROM projects p
+             LEFT JOIN sessions s ON s.project_id = p.id AND s.state != 'closed'
+             GROUP BY p.id",
+        )?;
+        let repos = st
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(st);
+        let mut swept = 0;
+        for (repo, live) in repos {
+            let live: Vec<String> = live.lines().map(str::to_string).collect();
+            swept += crate::hooks::sweep_hook_dirs(Path::new(&repo), &live);
+        }
+        if swept > 0 {
+            report.fsck_fixes.push(format!("removed {swept} stale hook director(ies)"));
+        }
+    }
+    // 6. tasks stuck in active with no live session (phase 7 offers the reset in the UI)
+    {
+        let mut st = tx.prepare_cached(
+            "SELECT t.id FROM tasks t WHERE t.col = 'active' AND t.deleted_at IS NULL AND NOT EXISTS (
+                SELECT 1 FROM task_sessions ts JOIN sessions s ON s.id = ts.session_id
+                WHERE ts.task_id = t.id AND s.state IN ('spawning','running','idle','blocked','parked'))")?;
+        report.tasks_reset_offered = st.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+    }
+    // 7. audit retention (SPEC §14). The log is append-only within its window, not forever: a
+    //    long-lived store is mostly old rows nothing can act on any more, and every one of them
+    //    is a page the connection pages past. Rows that are half of an undo pair are kept
+    //    whatever their age — that link is the record of what was reversed.
+    let pruned = {
+        let days: i64 = tx
+            .query_row(
+                "SELECT value FROM settings WHERE path='audit.retention_days'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|value| serde_json::from_str::<i64>(&value).ok())
+            .unwrap_or(DEFAULT_AUDIT_RETENTION_DAYS);
+        if days > 0 {
+            let cutoff = crate::time::days_ago(days);
+            tx.execute(
+                "DELETE FROM audit
+                  WHERE ts < ?1
+                    AND undo_of IS NULL
+                    AND undone_by IS NULL
+                    AND id NOT IN (SELECT undo_of FROM audit WHERE undo_of IS NOT NULL)",
+                [&cutoff],
+            )?
+        } else {
+            0
+        }
+    };
+    if pruned > 0 {
+        report
+            .fsck_fixes
+            .push(format!("pruned {pruned} audit row(s) past the retention window"));
+    }
+    let json = serde_json::to_string(&report)?;
+    tx.execute("INSERT INTO meta(key, value) VALUES ('recovery.last', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [json])?;
+    tx.commit()?;
+    // Deleted pages are free space, not reclaimed space. Compact only when a prune actually
+    // happened, so the usual launch pays nothing for it.
+    if pruned > 0 {
+        if let Err(error) = conn.execute_batch("VACUUM") {
+            tracing::warn!(error = %error, "could not compact the store after pruning the audit log");
+        }
+    }
+    drop(conn);
+    if !report.reaped_pids.is_empty() || !report.fsck_fixes.is_empty() {
+        tracing::info!(
+            reaped = report.reaped_pids.len(),
+            fixes = report.fsck_fixes.len(),
+            "crash recovery acted"
+        );
+    }
+    Ok(report)
+}
+
+pub fn last(conn: &rusqlite::Connection) -> Result<Option<RecoveryReport>> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'recovery.last'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    Ok(raw
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| serde_json::from_value(v).ok()))
+}

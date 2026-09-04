@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = ["crates/relay-bus", "crates/relay-core", "crates/relay-cli", "apps/relay-native"]
+# Engine checks stay headless; build the GTK client with `-p relay-native`.
+default-members = ["crates/relay-bus", "crates/relay-core", "crates/relay-cli"]
+
+[workspace.package]
+version = "4.0.0-dev"
+edition = "2021"
+license = "UNLICENSED"
+publish = false
+
+[workspace.dependencies]
+relay-bus = { path = "crates/relay-bus" }
+relay-core = { path = "crates/relay-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+schemars = { version = "1", features = ["uuid1", "preserve_order"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process", "signal", "fs"] }
+rusqlite = { version = "0.40", features = ["bundled", "backup"] }
+sha2 = "0.11"
+jiff = { version = "0.2", features = ["serde"] }
+directories = "6"
+clap = { version = "4", features = ["derive", "env"] }
+libc = "0.2"
+rand = "0.9"
+portable-pty = "0.9"
+base64 = "0.23"
+gix = { version = "0.86", features = ["status", "worktree-mutation", "revision"] }
+which = "8"
+tree-sitter = "0.26"
+tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"
+tree-sitter-svelte = { package = "tree-sitter-svelte-next", version = "0.1" }
+tree-sitter-kotlin = { package = "tree-sitter-kotlin-ng", version = "1.1" }
+notify = "8"
+regex = "1"
+similar = "2"
+
+[profile.release]
+strip = "symbols"

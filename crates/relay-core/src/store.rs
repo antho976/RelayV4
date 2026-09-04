@@ -1,0 +1,593 @@
+//! The single `store.db` (SPEC §1): WAL, `user_version`-numbered migrations, indexes on every
+//! FK and every WHERE column, one connection behind a mutex (writes are serial by design,
+//! BUS.md §5.1). Later phases append migrations; every prior version stays openable
+//! (SPEC §16 migration tests).
+
+use anyhow::{Context, Result};
+use rusqlite::{Connection, OpenFlags, Transaction};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
+
+/// The schema version this build knows. Bump when appending to [`MIGRATIONS`].
+pub const SCHEMA_VERSION: i64 = 18;
+
+/// Numbered migrations; index 0 brings a fresh DB to `user_version = 1`.
+pub const MIGRATIONS: &[&str] = &[
+    // v1 — phase 1: what the bus itself needs (BUS.md §13) plus workspaces/projects, which
+    // phase 1 already executes (BUS.md §15).
+    r#"
+    CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+
+    CREATE TABLE audit (
+      id INTEGER PRIMARY KEY, ts TEXT NOT NULL, req_id TEXT NOT NULL UNIQUE, parent_req TEXT,
+      actor TEXT NOT NULL, on_behalf_of TEXT, session_id INTEGER, op TEXT NOT NULL, project_id INTEGER,
+      kind TEXT NOT NULL CHECK (kind IN ('ok','held','refused','error')), code TEXT, hold_id INTEGER,
+      payload_hash TEXT NOT NULL, payload TEXT, result_summary TEXT,
+      undo_op TEXT, undo_of INTEGER REFERENCES audit(id), undone_by INTEGER REFERENCES audit(id)
+    );
+    CREATE INDEX audit_ts ON audit(ts);
+    CREATE INDEX audit_actor_ts ON audit(actor, ts);
+    CREATE INDEX audit_session_ts ON audit(session_id, ts);
+    CREATE INDEX audit_op_ts ON audit(op, ts);
+    CREATE INDEX audit_project_ts ON audit(project_id, ts);
+    CREATE INDEX audit_parent ON audit(parent_req);
+    CREATE INDEX audit_undo_of ON audit(undo_of);
+
+    CREATE TABLE holds (
+      id INTEGER PRIMARY KEY, project_id INTEGER, session_id INTEGER, session TEXT, actor TEXT NOT NULL,
+      op TEXT NOT NULL, envelope TEXT NOT NULL, policy TEXT NOT NULL, details TEXT NOT NULL,
+      state TEXT NOT NULL DEFAULT 'open', created_at TEXT NOT NULL, resolved_at TEXT, resolved_by TEXT
+    );
+    CREATE INDEX holds_state ON holds(state, created_at);
+    CREATE INDEX holds_session ON holds(session_id);
+
+    CREATE TABLE settings (path TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
+
+    CREATE TABLE workspaces (
+      id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, name TEXT NOT NULL, ord INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE projects (
+      id INTEGER PRIMARY KEY, workspace_id INTEGER NOT NULL REFERENCES workspaces(id),
+      path TEXT NOT NULL UNIQUE, name TEXT NOT NULL, base_branch TEXT NOT NULL DEFAULT 'main',
+      build_cmd TEXT, run_cmd TEXT, protected_paths TEXT NOT NULL DEFAULT '[]', critical_files TEXT NOT NULL DEFAULT '[]',
+      ord INTEGER NOT NULL DEFAULT 0, pinned INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE INDEX projects_workspace ON projects(workspace_id, ord);
+    "#,
+    // v2 — phase 2: the entities the v3 importer fills (BUS.md §11). Ids are AUTOINCREMENT
+    // (v3's D85 lesson: a task's id names things on disk; a bare rowid recycles a deleted
+    // id into the next insert). Sessions carry their token/epoch columns now so phase 3
+    // does not need to ALTER.
+    r#"
+    CREATE TABLE modules (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL REFERENCES projects(id),
+      name TEXT NOT NULL, icon TEXT, priority TEXT NOT NULL DEFAULT 'medium', ord INTEGER NOT NULL DEFAULT 0,
+      completed_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT
+    );
+    CREATE INDEX modules_project ON modules(project_id, deleted_at, ord);
+
+    CREATE TABLE tasks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL REFERENCES projects(id),
+      module_id INTEGER REFERENCES modules(id),
+      title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '', changelog TEXT NOT NULL DEFAULT '',
+      col TEXT NOT NULL DEFAULT 'backlog' CHECK (col IN ('backlog','in_review','ready','active','done')),
+      position INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL DEFAULT 'none',
+      priority TEXT NOT NULL DEFAULT 'medium', size TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT
+    );
+    CREATE INDEX tasks_project_col ON tasks(project_id, deleted_at, col, position);
+    CREATE INDEX tasks_module ON tasks(module_id);
+    CREATE INDEX tasks_state ON tasks(project_id, state);
+
+    CREATE TABLE sessions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, project_id INTEGER NOT NULL REFERENCES projects(id),
+      provider TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'builder', model TEXT, effort TEXT,
+      branch TEXT NOT NULL DEFAULT '', worktree TEXT NOT NULL DEFAULT '',
+      task_id INTEGER REFERENCES tasks(id), module_id INTEGER REFERENCES modules(id), pair_with TEXT,
+      bus_writes INTEGER NOT NULL DEFAULT 0, allow_ui INTEGER NOT NULL DEFAULT 0,
+      state TEXT NOT NULL DEFAULT 'created', pid INTEGER, exit_code INTEGER, provider_ref TEXT,
+      token TEXT NOT NULL DEFAULT '', epoch INTEGER NOT NULL DEFAULT 0,
+      spawned_at TEXT, last_output_at TEXT, usage TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL, closed_at TEXT
+    );
+    CREATE UNIQUE INDEX sessions_live_name ON sessions(name) WHERE state != 'closed';
+    CREATE INDEX sessions_project_state ON sessions(project_id, state);
+    CREATE INDEX sessions_task ON sessions(task_id);
+
+    CREATE TABLE task_sessions (
+      task_id INTEGER NOT NULL REFERENCES tasks(id), session_id INTEGER NOT NULL REFERENCES sessions(id),
+      ord INTEGER NOT NULL, PRIMARY KEY (task_id, session_id)
+    );
+    CREATE INDEX task_sessions_session ON task_sessions(session_id);
+
+    CREATE TABLE task_commits (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL REFERENCES tasks(id),
+      sha TEXT NOT NULL, branch TEXT, linked_at TEXT NOT NULL, UNIQUE (task_id, sha)
+    );
+    CREATE INDEX task_commits_task ON task_commits(task_id, id);
+
+    CREATE TABLE attachments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL REFERENCES tasks(id),
+      name TEXT NOT NULL, mime TEXT NOT NULL, bytes INTEGER NOT NULL, path TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX attachments_task ON attachments(task_id, id);
+
+    CREATE TABLE notes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL REFERENCES projects(id),
+      title TEXT, body TEXT NOT NULL DEFAULT '', pinned INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT
+    );
+    CREATE INDEX notes_project ON notes(project_id, deleted_at, pinned, updated_at);
+    CREATE INDEX sessions_module ON sessions(module_id);
+
+    -- v1 forgot one FK index (the migration test now checks every FK):
+    CREATE INDEX audit_undone_by ON audit(undone_by);
+    "#,
+    // v3 — phase 4: guardrail holds are already a phase-1 bus table; notifications land
+    // now because a hold/refusal must survive a restart even before the phase-9 chrome exists.
+    r#"
+    CREATE TABLE notifications (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER REFERENCES projects(id),
+      category TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL, link TEXT,
+      read INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
+    );
+    CREATE INDEX notifications_project ON notifications(project_id, read, created_at);
+    CREATE INDEX notifications_category ON notifications(category, read, created_at);
+    "#,
+    // v4 — phase 5: project standing context, a persistent per-recipient mailbox,
+    // explicit claims, and durable overlap findings.
+    r#"
+    ALTER TABLE notes ADD COLUMN standing INTEGER NOT NULL DEFAULT 0;
+    CREATE UNIQUE INDEX notes_one_standing
+      ON notes(project_id) WHERE standing = 1 AND deleted_at IS NULL;
+
+    CREATE TABLE messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id INTEGER NOT NULL REFERENCES projects(id),
+      from_session TEXT NOT NULL, to_spec TEXT NOT NULL, text TEXT NOT NULL,
+      re_task INTEGER REFERENCES tasks(id), sent_at TEXT NOT NULL
+    );
+    CREATE INDEX messages_project_sent ON messages(project_id, sent_at, id);
+    CREATE INDEX messages_re_task ON messages(re_task);
+
+    CREATE TABLE message_recipients (
+      message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+      session_id INTEGER NOT NULL REFERENCES sessions(id),
+      session TEXT NOT NULL, acked_at TEXT,
+      PRIMARY KEY (message_id, session_id)
+    );
+    CREATE INDEX message_recipients_session_ack
+      ON message_recipients(session_id, acked_at, message_id);
+
+    CREATE TABLE claims (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id INTEGER NOT NULL REFERENCES projects(id),
+      session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      session TEXT NOT NULL, path TEXT NOT NULL, symbol TEXT NOT NULL DEFAULT '', note TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+      UNIQUE(session_id, path, symbol)
+    );
+    CREATE INDEX claims_project_path ON claims(project_id, path, symbol);
+    CREATE INDEX claims_session ON claims(session_id);
+
+    CREATE TABLE overlaps (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id INTEGER NOT NULL REFERENCES projects(id),
+      fingerprint TEXT NOT NULL UNIQUE, sessions TEXT NOT NULL, path TEXT NOT NULL,
+      symbol TEXT, kind TEXT NOT NULL CHECK (kind IN ('file','symbol','claim')),
+      acked_by TEXT NOT NULL DEFAULT '[]', active INTEGER NOT NULL DEFAULT 1,
+      first_seen TEXT NOT NULL, last_seen TEXT NOT NULL
+    );
+    CREATE INDEX overlaps_project_active ON overlaps(project_id, active, last_seen);
+    "#,
+    // v5 — phase 6: cached provider discovery and lifecycle state that does not belong in
+    // the public Session entity. Scrollback is snapshotted on park/app shutdown.
+    r#"
+    CREATE TABLE provider_cache (
+      provider TEXT PRIMARY KEY CHECK (provider IN ('claude','codex')),
+      path TEXT, version TEXT, signed_in_as TEXT, last_seen_version TEXT,
+      spawn_profile TEXT NOT NULL, detected_at TEXT NOT NULL
+    );
+
+    ALTER TABLE sessions ADD COLUMN restore_reason TEXT;
+
+    CREATE TABLE session_scrollback (
+      session_id INTEGER PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+      text BLOB NOT NULL, epoch INTEGER NOT NULL, seq INTEGER NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE INDEX session_scrollback_session ON session_scrollback(session_id);
+    "#,
+    // v6 — phase 7: deleting a module unlinks its board tasks, but undo must restore the
+    // exact membership without clobbering tasks the user reassigned in the meantime.
+    r#"
+    CREATE TABLE module_unlinked_tasks (
+      module_id INTEGER NOT NULL REFERENCES modules(id) ON DELETE CASCADE,
+      task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      PRIMARY KEY (module_id, task_id)
+    );
+    CREATE INDEX module_unlinked_tasks_task ON module_unlinked_tasks(task_id);
+    "#,
+    // v7 - phase 8: recoverable file deletion and durable integration runs.
+    r#"
+    CREATE TABLE file_trash (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id INTEGER NOT NULL REFERENCES projects(id),
+      worktree TEXT NOT NULL, original_path TEXT NOT NULL, trash_path TEXT NOT NULL,
+      created_at TEXT NOT NULL, restored_at TEXT
+    );
+    CREATE INDEX file_trash_project ON file_trash(project_id, restored_at, id);
+
+    CREATE TABLE integrations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id INTEGER NOT NULL REFERENCES projects(id),
+      branches TEXT NOT NULL, worktree TEXT, state TEXT NOT NULL,
+      conflict TEXT, log_tail TEXT NOT NULL DEFAULT '', build INTEGER NOT NULL DEFAULT 0,
+      deploy TEXT, started_at TEXT, finished_at TEXT, created_at TEXT NOT NULL
+    );
+    CREATE INDEX integrations_project ON integrations(project_id, id DESC);
+    CREATE INDEX integrations_state ON integrations(state, id);
+    "#,
+    // v8 — phase 9: named shell arrangements are durable per project.
+    r#"
+    CREATE TABLE ui_layouts (
+      project_id INTEGER NOT NULL REFERENCES projects(id), name TEXT NOT NULL,
+      state TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+      PRIMARY KEY(project_id, name)
+    );
+    CREATE INDEX ui_layouts_project_updated ON ui_layouts(project_id, updated_at);
+    "#,
+    // v9 — phase 10: device runs survive reloads; mirrors stay runtime-only because an
+    // H.264 producer cannot survive the process that owns its ADB transport.
+    r#"
+    CREATE TABLE device_runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id INTEGER NOT NULL REFERENCES projects(id),
+      device TEXT NOT NULL, worktree TEXT NOT NULL, state TEXT NOT NULL,
+      started_at TEXT NOT NULL, finished_at TEXT
+    );
+    CREATE INDEX device_runs_project ON device_runs(project_id, id DESC);
+    CREATE INDEX device_runs_state ON device_runs(state, id);
+    "#,
+    // v10 - phase 11: skills are global markdown instructions with per-project enables.
+    // Deleted rows stay addressable so audit undo can restore the same id and enable set.
+    r#"
+    CREATE TABLE skills (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL COLLATE NOCASE UNIQUE, body TEXT NOT NULL,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT
+    );
+    CREATE INDEX skills_deleted_name ON skills(deleted_at, name);
+
+    CREATE TABLE skill_projects (
+      skill_id INTEGER NOT NULL REFERENCES skills(id) ON DELETE CASCADE,
+      project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      PRIMARY KEY(skill_id, project_id)
+    );
+    CREATE INDEX skill_projects_project ON skill_projects(project_id, skill_id);
+    "#,
+    // v11 - phase 12: GitHub is the source of truth for installed skills.
+    r#"
+    ALTER TABLE skills ADD COLUMN source_url TEXT;
+    ALTER TABLE skills ADD COLUMN source_path TEXT;
+    ALTER TABLE skills ADD COLUMN revision TEXT;
+    CREATE UNIQUE INDEX skills_source ON skills(source_url, source_path) WHERE source_url IS NOT NULL;
+    "#,
+    // v12 - launch text is durable bootstrap data, never a positional provider prompt.
+    r#"
+    ALTER TABLE sessions ADD COLUMN launch_prompt TEXT;
+    "#,
+    // v13 — one line of self-declared intent per session, so peers can coordinate on what a
+    // session is doing rather than inferring it from a branch name.
+    r#"
+    ALTER TABLE sessions ADD COLUMN intent TEXT;
+    "#,
+    // v14 - preserve per-session task queue order independently of the per-task agent order.
+    // Existing assignments get a deterministic task-id order; new assignments append in the
+    // order the user selected them.
+    r#"
+    ALTER TABLE task_sessions ADD COLUMN queue_ord INTEGER NOT NULL DEFAULT 0;
+    UPDATE task_sessions SET queue_ord=task_id;
+    CREATE INDEX task_sessions_queue ON task_sessions(session_id, queue_ord, task_id);
+    "#,
+    // v15 - priority mail is a live response hint, while suggestions are deliberately kept
+    // out of the standing note that is injected into every dispatch.
+    r#"
+    ALTER TABLE messages ADD COLUMN priority INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE notes ADD COLUMN suggestions INTEGER NOT NULL DEFAULT 0;
+    CREATE UNIQUE INDEX notes_one_suggestions
+      ON notes(project_id) WHERE suggestions = 1 AND deleted_at IS NULL;
+    "#,
+    // v16 - the board grows the GitHub-issues model: a first-class type, parent/child
+    // sub-tasks with a depth cap, free-form labels, and stored blocked-by / duplicate-of
+    // edges. Existing rows become type 'task', parentless, unlabelled and unrelated, so a
+    // v15 store reads identically after the upgrade (D139).
+    r#"
+    ALTER TABLE tasks ADD COLUMN kind TEXT NOT NULL DEFAULT 'task'
+      CHECK (kind IN ('task','feature','bug','chore','spike'));
+    ALTER TABLE tasks ADD COLUMN parent_id INTEGER REFERENCES tasks(id);
+    CREATE INDEX tasks_parent ON tasks(parent_id, position, id);
+    CREATE INDEX tasks_kind ON tasks(project_id, kind);
+
+    CREATE TABLE labels (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id INTEGER NOT NULL REFERENCES projects(id),
+      name TEXT NOT NULL, created_at TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX labels_project_name ON labels(project_id, name COLLATE NOCASE);
+
+    CREATE TABLE task_labels (
+      task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      label_id INTEGER NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
+      PRIMARY KEY(task_id, label_id)
+    );
+    CREATE INDEX task_labels_label ON task_labels(label_id, task_id);
+
+    CREATE TABLE task_relations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      from_task INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      to_task INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      rel TEXT NOT NULL CHECK (rel IN ('blocked_by','duplicate_of')),
+      created_at TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX task_relations_edge ON task_relations(from_task, to_task, rel);
+    CREATE INDEX task_relations_to ON task_relations(to_task, rel);
+    "#,
+    // v17 - device_runs also holds device-less release builds: `kind` separates them from
+    // install-and-launch runs and `artifact` records the APK / AAB a finished build produced.
+    // Existing rows become kind 'run' with no artifact, so a v16 store reads identically (D152).
+    r#"
+    ALTER TABLE device_runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'run'
+      CHECK (kind IN ('run','build'));
+    ALTER TABLE device_runs ADD COLUMN artifact TEXT;
+    "#,
+    // v18 - keep enough release metadata to explain an active or historical build without
+    // parsing its Gradle log. Signing is verified from the artifact; credentials stay in Gradle.
+    r#"
+    ALTER TABLE device_runs ADD COLUMN variant TEXT;
+    ALTER TABLE device_runs ADD COLUMN format TEXT
+      CHECK (format IS NULL OR format IN ('apk','bundle'));
+    ALTER TABLE device_runs ADD COLUMN publish INTEGER NOT NULL DEFAULT 0
+      CHECK (publish IN (0,1));
+    ALTER TABLE device_runs ADD COLUMN signing TEXT
+      CHECK (signing IS NULL OR signing IN ('signed','unsigned','unverified'));
+    "#,
+];
+
+pub struct Store {
+    conn: Mutex<Connection>,
+    path: PathBuf,
+}
+
+impl Store {
+    /// Open (creating if needed) and migrate. `exclusive` takes SQLite's EXCLUSIVE locking
+    /// mode — the engine does (BUS.md §6.2); tests and tools do not.
+    pub fn open(path: &Path, exclusive: bool) -> Result<Store> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("opening {}", path.display()))?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.pragma_update(None, "busy_timeout", 5000)?;
+        if exclusive {
+            conn.pragma_update(None, "locking_mode", "EXCLUSIVE")?;
+        }
+        tune(&conn)?;
+        let store = Store {
+            conn: Mutex::new(conn),
+            path: path.to_path_buf(),
+        };
+        store.migrate()?;
+        Ok(store)
+    }
+
+    /// An in-memory store (tests).
+    pub fn open_memory() -> Result<Store> {
+        let conn = Connection::open_in_memory()?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        tune(&conn)?;
+        let store = Store {
+            conn: Mutex::new(conn),
+            path: PathBuf::from(":memory:"),
+        };
+        store.migrate()?;
+        Ok(store)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn migrate(&self) -> Result<()> {
+        let mut conn = self.lock();
+        let mut v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        anyhow::ensure!(
+            v <= SCHEMA_VERSION,
+            "store is schema v{v} but this build knows only v{SCHEMA_VERSION}; refusing to open"
+        );
+        if v > 0 && (v as usize) < MIGRATIONS.len() && self.path.is_file() {
+            // SPEC §14: store.db copied on every version upgrade.
+            let dir = self
+                .path
+                .parent()
+                .map(|d| d.join("backups"))
+                .unwrap_or_else(|| PathBuf::from("backups"));
+            match backup_to(&conn, &dir, "upgrade") {
+                Ok(p) => {
+                    tracing::info!(backup = %p.display(), from = v, to = SCHEMA_VERSION, "store backed up before upgrade")
+                }
+                Err(e) => anyhow::bail!(
+                    "refusing to migrate v{v} → v{SCHEMA_VERSION}: pre-upgrade backup failed: {e}"
+                ),
+            }
+        }
+        while (v as usize) < MIGRATIONS.len() {
+            let tx = conn.transaction()?;
+            tx.execute_batch(MIGRATIONS[v as usize])?;
+            v += 1;
+            tx.pragma_update(None, "user_version", v)?;
+            if v == 1 {
+                tx.execute(
+                    "INSERT INTO meta(key, value) VALUES ('created_at', ?1)",
+                    [crate::time::now()],
+                )?;
+            }
+            tx.commit()?;
+        }
+        Ok(())
+    }
+
+    pub fn version(&self) -> Result<i64> {
+        Ok(self
+            .lock()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))?)
+    }
+
+    /// Lock the connection. Held for the duration of one request (BUS.md §5.1).
+    pub fn lock(&self) -> MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Run `f` inside a transaction; commit on Ok, roll back on Err.
+    pub fn with_tx<T>(&self, f: impl FnOnce(&Transaction) -> Result<T>) -> Result<T> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let out = f(&tx)?;
+        tx.commit()?;
+        Ok(out)
+    }
+
+    /// Size on disk in MiB (0 for memory).
+    pub fn size_mb(&self) -> f64 {
+        std::fs::metadata(&self.path)
+            .map(|m| m.len() as f64 / (1024.0 * 1024.0))
+            .unwrap_or(0.0)
+    }
+
+    /// The backups directory beside the store.
+    pub fn backup_dir(&self) -> PathBuf {
+        self.path
+            .parent()
+            .map(|d| d.join("backups"))
+            .unwrap_or_else(|| PathBuf::from("backups"))
+    }
+
+    /// Where installed skill folders live, beside the store: one folder per skill id, copied
+    /// into every project root and session worktree by [`crate::skills`].
+    pub fn skills_dir(&self) -> PathBuf {
+        match self.path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+            Some(dir) => dir.join("skills"),
+            None => std::env::temp_dir().join(format!("relay-skills-{}", std::process::id())),
+        }
+    }
+
+    /// Copy the live database (SQLite online backup) into `backups/`, keep the newest
+    /// [`KEEP_BACKUPS`]. Returns the new file. Takes the store lock — do not call from inside
+    /// a handler; use [`Store::backup_with`] with the request's connection there.
+    pub fn backup(&self, reason: &str) -> Result<PathBuf> {
+        let conn = self.lock();
+        backup_to(&conn, &self.backup_dir(), reason)
+    }
+
+    /// Same, using a connection the caller already holds (a handler's transaction).
+    pub fn backup_with(&self, conn: &Connection, reason: &str) -> Result<PathBuf> {
+        backup_to(conn, &self.backup_dir(), reason)
+    }
+
+    /// Existing backups, newest first: (path, bytes, created_at, reason).
+    pub fn list_backups(&self) -> Result<Vec<BackupInfo>> {
+        list_backups(&self.backup_dir())
+    }
+}
+
+/// Read tuning applied to every connection.
+///
+/// Handlers reach for `prepare_cached`, which keys compiled statements on their SQL text. Relay
+/// has ~50 distinct literal statements and rusqlite's default cache holds 16, so without this the
+/// cache thrashes and recompiles the same query on the next call. The page cache and mmap window
+/// are sized for a store measured in tens of MB — small enough to hold hot pages outright.
+fn tune(conn: &Connection) -> Result<()> {
+    conn.set_prepared_statement_cache_capacity(128);
+    conn.pragma_update(None, "cache_size", -32_000)?; // negative = KiB, so 32 MB
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
+    // mmap is a read path only; writes still go through the WAL.
+    conn.pragma_update(None, "mmap_size", 268_435_456i64)?;
+    Ok(())
+}
+
+/// How many backups `backups/` keeps (SPEC §14).
+pub const KEEP_BACKUPS: usize = 5;
+
+#[derive(Debug, Clone)]
+pub struct BackupInfo {
+    pub path: PathBuf,
+    pub bytes: u64,
+    pub created_at: String,
+    pub reason: String,
+}
+
+fn backup_to(conn: &Connection, dir: &Path, reason: &str) -> Result<PathBuf> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let stamp = crate::time::now().replace(':', "-");
+    let dest = dir.join(format!("store-{stamp}-{reason}.db"));
+    let mut out = Connection::open(&dest)?;
+    {
+        let bk = rusqlite::backup::Backup::new(conn, &mut out)?;
+        bk.run_to_completion(256, std::time::Duration::from_millis(0), None)?;
+    }
+    drop(out);
+    // prune
+    let mut all = list_backups(dir)?;
+    while all.len() > KEEP_BACKUPS {
+        if let Some(old) = all.pop() {
+            let _ = std::fs::remove_file(&old.path);
+        }
+    }
+    Ok(dest)
+}
+
+fn list_backups(dir: &Path) -> Result<Vec<BackupInfo>> {
+    let mut v = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Ok(v);
+    };
+    for e in rd.flatten() {
+        let path = e.path();
+        let name = e.file_name().to_string_lossy().to_string();
+        let Some(rest) = name
+            .strip_prefix("store-")
+            .and_then(|n| n.strip_suffix(".db"))
+        else {
+            continue;
+        };
+        // "<stamp>-<reason>": the stamp is RFC 3339 with ':' → '-', ends in 'Z'
+        let Some(zi) = rest.find('Z') else { continue };
+        let stamp = &rest[..=zi];
+        let reason = rest[zi + 1..].trim_start_matches('-').to_string();
+        let created_at = {
+            // restore the colons in the time part: 2026-08-17T19-42-21.123Z
+            let (date, time) = stamp.split_at(stamp.find('T').unwrap_or(stamp.len()));
+            format!("{date}{}", time.replacen('-', ":", 2))
+        };
+        let bytes = e.metadata().map(|m| m.len()).unwrap_or(0);
+        v.push(BackupInfo {
+            path,
+            bytes,
+            created_at,
+            reason,
+        });
+    }
+    v.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    Ok(v)
+}

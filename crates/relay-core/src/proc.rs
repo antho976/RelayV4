@@ -1,0 +1,99 @@
+//! Bounded subprocess execution.
+//!
+//! Handlers run with the store mutex held (BUS.md §5.1), so a child process that never returns
+//! freezes the whole bus — including PTY keystrokes. Every subprocess Relay forks from inside a
+//! handler goes through [`output_with_timeout`], which kills the child at the deadline and reports
+//! a timeout the caller can turn into a typed refusal (D144).
+//!
+//! Long-running work belongs on a worker thread after commit, not here. This is for the short
+//! probes — `adb devices`, `<provider> --version` — that are logically synchronous.
+
+use std::io;
+use std::process::{Command, ExitStatus, Output, Stdio};
+use std::time::{Duration, Instant};
+
+/// How often the wait loop re-checks a child that has not exited yet.
+const POLL: Duration = Duration::from_millis(5);
+
+/// Run `cmd` to completion, or kill it once `timeout` elapses.
+///
+/// Returns `Ok(None)` when the child outlived the deadline. `stdin` is closed and both output
+/// pipes are drained on their own threads, so a child that writes more than a pipe buffer can
+/// never deadlock the wait.
+pub fn output_with_timeout(cmd: &mut Command, timeout: Duration) -> io::Result<Option<Output>> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let stdout = child.stdout.take().map(drain);
+    let stderr = child.stderr.take().map(drain);
+
+    let deadline = Instant::now() + timeout;
+    let status: Option<ExitStatus> = loop {
+        match child.try_wait()? {
+            Some(status) => break Some(status),
+            None if Instant::now() < deadline => std::thread::sleep(POLL),
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+
+    let collect = |handle: Option<std::thread::JoinHandle<Vec<u8>>>| {
+        handle.and_then(|h| h.join().ok()).unwrap_or_default()
+    };
+    Ok(status.map(|status| Output {
+        status,
+        stdout: collect(stdout),
+        stderr: collect(stderr),
+    }))
+}
+
+fn drain<R: io::Read + Send + 'static>(mut reader: R) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = io::Read::read_to_end(&mut reader, &mut buf);
+        buf
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_child_that_finishes_returns_its_output() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf hello"]);
+        let out = output_with_timeout(&mut cmd, Duration::from_secs(5))
+            .unwrap()
+            .expect("the child exited well inside the deadline");
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "hello");
+    }
+
+    #[test]
+    fn a_child_that_hangs_is_killed_at_the_deadline() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 30"]);
+        let started = Instant::now();
+        let out = output_with_timeout(&mut cmd, Duration::from_millis(150)).unwrap();
+        assert!(out.is_none(), "a hung child must report a timeout");
+        assert!(started.elapsed() < Duration::from_secs(5), "the wait must not outlive the deadline");
+    }
+
+    #[test]
+    fn output_larger_than_a_pipe_buffer_does_not_deadlock() {
+        // 1 MiB is well past the 64 KiB pipe buffer: without the draining threads this hangs.
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "yes 0123456789 | head -c 1048576"]);
+        let out = output_with_timeout(&mut cmd, Duration::from_secs(10))
+            .unwrap()
+            .expect("draining the pipes keeps the child from blocking on write");
+        assert_eq!(out.stdout.len(), 1_048_576);
+    }
+}

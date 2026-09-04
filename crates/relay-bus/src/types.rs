@@ -1,0 +1,811 @@
+//! Entity shapes returned by ops (BUS.md §11) and the small enums they share.
+//!
+//! Timestamps are RFC 3339 UTC strings so this crate stays free of a time dependency;
+//! `relay-core` produces them.
+
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+/// Store row id (`i64` autoincrement, BUS.md §2).
+pub type Id = i64;
+/// RFC 3339 UTC.
+pub type Ts = String;
+
+// ---------------------------------------------------------------- enums
+
+/// SPEC §6: five hardcoded columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Column {
+    Backlog,
+    InReview,
+    Ready,
+    Active,
+    Done,
+}
+
+/// Agent lifecycle on a task, independent of column (BUS.md §11.1, confirmed 2026-08-17).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskState {
+    None,
+    Dispatched,
+    Running,
+    Blocked,
+    Failed,
+    AwaitingReview,
+}
+
+/// BUS.md §11.1 (confirmed 2026-08-17).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Priority {
+    Low,
+    Medium,
+    High,
+    Urgent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub enum Size {
+    S,
+    M,
+    L,
+}
+
+/// A first-class classification, separate from the free-form `labels` (BUS.md §11.1).
+/// `Task` is the neutral default and is what every pre-v16 row migrated to; the other four
+/// are the vocabulary the board filters on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskType {
+    Task,
+    Feature,
+    Bug,
+    Chore,
+    Spike,
+}
+
+/// Task-to-task edges other than parent/child (BUS.md §11.1). Only these two are stored;
+/// `blocks` is the inverse read of `blocked_by` and never has a row of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRelation {
+    BlockedBy,
+    DuplicateOf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Provider {
+    Claude,
+    Codex,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Role {
+    Builder,
+    Reviewer,
+    Docs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionState {
+    Created,
+    Spawning,
+    Running,
+    Idle,
+    Blocked,
+    Parked,
+    Restorable,
+    Exited,
+    Closed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HoldState {
+    Open,
+    Confirmed,
+    Rejected,
+    Expired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditKind {
+    Ok,
+    Held,
+    Refused,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NotifyCategory {
+    AgentDone,
+    AgentBlocked,
+    Guardrail,
+    Integration,
+    Provider,
+    Disk,
+    System,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrationState {
+    Queued,
+    Merging,
+    Building,
+    Deploying,
+    Passed,
+    Failed,
+    Conflict,
+    Discarded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    Allow,
+    Refuse,
+    Hold,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GateKind {
+    Write,
+    Commit,
+    Exec,
+}
+
+/// Per-task change caps (SPEC §5).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GuardrailCaps {
+    pub files: u32,
+    pub lines: u32,
+}
+
+/// A write is destructive when either threshold is exceeded.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DestructiveWrite {
+    pub min_removed_lines: u32,
+    pub min_removed_pct: f64,
+    /// The percentage rule is skipped for files shorter than this. A percentage of a very
+    /// short file measures nothing: one line of a one-line file is 100%.
+    #[serde(default = "default_min_file_lines")]
+    pub min_file_lines: u32,
+    /// Let a large rewrite through when git can put the file back — committed and unmodified,
+    /// or ignored entirely. Set false to hold on volume alone.
+    #[serde(default = "default_true")]
+    pub allow_if_recoverable: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_min_file_lines() -> u32 {
+    30
+}
+
+/// A built-in validator attached to one critical, worktree-relative path.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ShapeGate {
+    pub path: String,
+    /// `non_empty` | `json` | `json_non_empty_array` | `json_non_empty_object`.
+    pub validator: String,
+}
+
+/// Role allow-sets are configurable, but the defaults are the baseline in BUS.md §9.1.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RoleAllowlist {
+    pub builder: Vec<String>,
+    pub reviewer: Vec<String>,
+    pub docs: Vec<String>,
+}
+
+/// Effective guardrail configuration after global + project merge.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GuardrailConfig {
+    pub caps: GuardrailCaps,
+    pub destructive_write: DestructiveWrite,
+    pub protected_paths: Vec<String>,
+    pub shape_gates: Vec<ShapeGate>,
+    /// Command patterns refused for `kind: exec`. Matched against the *parsed argv* of each
+    /// command in the line, never as a raw substring, so quoted data mentioning one is fine.
+    pub denied_commands: Vec<String>,
+    /// Absolute roots an agent may write to outside its worktree — scratch space, which is
+    /// not a repo-integrity concern. `$TMPDIR` is always honoured in addition to these.
+    #[serde(default)]
+    pub allowed_write_roots: Vec<String>,
+    pub roles: RoleAllowlist,
+}
+
+// ---------------------------------------------------------------- entities
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Workspace {
+    pub id: Id,
+    pub path: String,
+    pub name: String,
+    pub order: i64,
+    pub created_at: Ts,
+    pub updated_at: Ts,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Project {
+    pub id: Id,
+    pub workspace_id: Id,
+    pub path: String,
+    pub name: String,
+    pub base_branch: String,
+    pub build_cmd: Option<String>,
+    pub run_cmd: Option<String>,
+    pub protected_paths: Vec<String>,
+    pub critical_files: Vec<String>,
+    pub order: i64,
+    pub pinned: bool,
+    pub created_at: Ts,
+    pub updated_at: Ts,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Attachment {
+    pub id: Id,
+    pub task_id: Id,
+    pub name: String,
+    pub mime: String,
+    pub bytes: i64,
+    /// Path under the store's attachment dir.
+    pub path: String,
+    pub created_at: Ts,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct TaskCommit {
+    pub sha: String,
+    pub branch: Option<String>,
+    pub linked_at: Ts,
+}
+
+/// Roll-up of a parent's descendants (BUS.md §11.1). Counts the whole subtree, not just the
+/// direct children, so a grandparent reads as one body of work. Zero `total` = a leaf.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct TaskRollup {
+    pub total: i64,
+    pub done: i64,
+}
+
+/// A free-form supplementary tag, scoped to a project. Types classify; labels annotate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Label {
+    pub id: Id,
+    pub project_id: Id,
+    pub name: String,
+    pub created_at: Ts,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Task {
+    pub id: Id,
+    pub project_id: Id,
+    pub module_id: Option<Id>,
+    pub title: String,
+    pub body: String,
+    pub changelog: String,
+    pub column: Column,
+    pub position: i64,
+    pub state: TaskState,
+    pub priority: Priority,
+    pub size: Option<Size>,
+    #[serde(rename = "type")]
+    #[schemars(rename = "type")]
+    pub task_type: TaskType,
+    /// Parent task, if this is a sub-task. Nesting is capped at [`TASK_DEPTH_MAX`] levels.
+    pub parent_id: Option<Id>,
+    /// 0 for a root task, 1 for its child, and so on — never above `TASK_DEPTH_MAX - 1`.
+    pub depth: i64,
+    /// Direct children, in board order. Children stay real tasks with their own cards.
+    pub children: Vec<Id>,
+    /// Progress over the whole subtree, for the parent's `n/m done` badge.
+    pub rollup: TaskRollup,
+    /// Free-form tags, sorted; the supplementary layer under `type`.
+    pub labels: Vec<String>,
+    /// Tasks this one waits on (stored edges).
+    pub blocked_by: Vec<Id>,
+    /// Tasks waiting on this one (the inverse read of `blocked_by`).
+    pub blocks: Vec<Id>,
+    /// The task this duplicates, if any.
+    pub duplicate_of: Option<Id>,
+    /// Every session ever dispatched to it, in order; a PAIR adds two.
+    pub sessions: Vec<String>,
+    pub commits: Vec<TaskCommit>,
+    pub attachments: Vec<Attachment>,
+    pub created_at: Ts,
+    pub updated_at: Ts,
+    pub deleted_at: Option<Ts>,
+}
+
+/// How deep sub-tasks may nest: a root plus two levels of children. GitHub allows 8; a board
+/// that must stay readable as columns of cards does not, so the bus refuses the fourth level
+/// with `task.depth`.
+pub const TASK_DEPTH_MAX: i64 = 3;
+
+/// How many direct children one parent may hold, matching GitHub's sub-issue cap.
+pub const TASK_CHILDREN_MAX: i64 = 100;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Module {
+    pub id: Id,
+    pub project_id: Id,
+    pub name: String,
+    pub icon: Option<String>,
+    pub priority: Priority,
+    pub order: i64,
+    pub completed_at: Option<Ts>,
+    pub created_at: Ts,
+    pub updated_at: Ts,
+    pub deleted_at: Option<Ts>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ModuleSummary {
+    #[serde(flatten)]
+    pub module: Module,
+    /// Task counts by column.
+    pub counts: std::collections::BTreeMap<Column, i64>,
+    pub progress_pct: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ModuleHeader {
+    pub count: i64,
+    pub in_flight: i64,
+    pub issues: i64,
+    pub completed: i64,
+    pub completion_pct: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Note {
+    pub id: Id,
+    pub project_id: Id,
+    pub title: Option<String>,
+    pub body: String,
+    pub pinned: bool,
+    pub created_at: Ts,
+    pub updated_at: Ts,
+    pub deleted_at: Option<Ts>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Message {
+    pub id: Id,
+    pub project_id: Id,
+    pub from: String,
+    /// Session name or `*`.
+    pub to: String,
+    pub text: String,
+    pub re_task: Option<Id>,
+    #[serde(default)]
+    pub priority: bool,
+    pub sent_at: Ts,
+    pub acked_at: Option<Ts>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Session {
+    pub id: Id,
+    pub name: String,
+    /// One line of what this session is doing, in its own words (`session.intent`).
+    #[serde(default)]
+    pub intent: Option<String>,
+    pub project_id: Id,
+    pub provider: Provider,
+    pub role: Role,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub branch: String,
+    pub worktree: String,
+    pub task_id: Option<Id>,
+    pub module_id: Option<Id>,
+    pub pair_with: Option<String>,
+    pub bus_writes: bool,
+    pub allow_ui: bool,
+    pub state: SessionState,
+    pub pid: Option<i64>,
+    pub exit_code: Option<i64>,
+    /// Provider's own resume handle.
+    pub provider_ref: Option<String>,
+    pub spawned_at: Option<Ts>,
+    pub last_output_at: Option<Ts>,
+    /// Provider units, opaque.
+    pub usage: Option<Value>,
+    pub created_at: Ts,
+    pub updated_at: Ts,
+    pub closed_at: Option<Ts>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Peer {
+    pub session: String,
+    pub provider: Provider,
+    pub role: Role,
+    pub branch: String,
+    pub state: SessionState,
+    pub task_title: Option<String>,
+    pub claimed: Vec<String>,
+    pub last_output_at: Option<Ts>,
+    /// One line of what this peer is doing, in its own words (`session.intent`). Coordination
+    /// needs to know what a peer is *up to*, which no amount of state and branch names says.
+    pub intent: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Overlap {
+    pub id: Id,
+    pub project_id: Id,
+    pub sessions: Vec<String>,
+    pub path: String,
+    pub symbol: Option<String>,
+    pub kind: OverlapKind,
+    pub acked_by: Vec<String>,
+    pub first_seen: Ts,
+    pub last_seen: Ts,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OverlapKind {
+    File,
+    Symbol,
+    Claim,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Hold {
+    pub id: Id,
+    pub project_id: Option<Id>,
+    pub session_id: Option<Id>,
+    pub session: Option<String>,
+    pub actor: crate::envelope::Actor,
+    pub op: String,
+    pub payload_hash: String,
+    pub policy: String,
+    pub details: Value,
+    pub state: HoldState,
+    pub created_at: Ts,
+    pub resolved_at: Option<Ts>,
+    pub resolved_by: Option<crate::envelope::Actor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct UndoOp {
+    pub op: String,
+    pub payload: Value,
+    /// `{updated_at}` of the entity after the op; `audit.undo` refuses on mismatch (§5.5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct AuditRow {
+    pub id: Id,
+    pub ts: Ts,
+    pub req_id: String,
+    pub parent_req: Option<String>,
+    pub actor: crate::envelope::Actor,
+    pub on_behalf_of: Option<crate::envelope::Actor>,
+    pub session_id: Option<Id>,
+    pub op: String,
+    pub project_id: Option<Id>,
+    pub kind: AuditKind,
+    pub code: Option<String>,
+    pub hold_id: Option<Id>,
+    pub payload_hash: String,
+    /// `null` when the payload was larger than 64 KiB.
+    pub payload: Option<Value>,
+    pub result_summary: Option<Value>,
+    pub undo_op: Option<UndoOp>,
+    pub undo_of: Option<Id>,
+    pub undone_by: Option<Id>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Notification {
+    pub id: Id,
+    pub project_id: Option<Id>,
+    pub category: NotifyCategory,
+    pub title: String,
+    pub body: String,
+    /// Deep link: an op to run when clicked.
+    pub link: Option<crate::error::Confirm>,
+    pub read: bool,
+    pub created_at: Ts,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Worktree {
+    pub path: String,
+    pub branch: String,
+    pub head: String,
+    pub session: Option<String>,
+    pub dirty: bool,
+    pub disk_mb: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Integration {
+    pub id: Id,
+    pub project_id: Id,
+    pub branches: Vec<String>,
+    pub worktree: Option<String>,
+    pub state: IntegrationState,
+    pub conflict: Option<(String, String)>,
+    pub log_tail: String,
+    pub started_at: Option<Ts>,
+    pub finished_at: Option<Ts>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ProviderInfo {
+    pub provider: Provider,
+    pub installed: bool,
+    pub path: Option<String>,
+    pub version: Option<String>,
+    pub signed_in_as: Option<String>,
+    pub last_seen_version: Option<String>,
+    /// How Relay spawns it: flags, env, hook file layout. Opaque, for display and diagnosis.
+    pub spawn_profile: Value,
+    /// Whether this provider supports Relay's `PreToolUse` guardrail and lifecycle adapters.
+    /// Provider-native trust may still require one explicit approval before a generated hook runs.
+    pub guarded: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Usage {
+    pub provider: Provider,
+    /// Provider's own units and windows, opaque; the UI knows each provider's shape.
+    pub windows: Value,
+    pub taken_at: Ts,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Skill {
+    pub id: Id,
+    pub name: String,
+    pub body: String,
+    pub source_url: Option<String>,
+    pub source_path: Option<String>,
+    pub revision: Option<String>,
+    pub enabled_in: Vec<Id>,
+    pub created_at: Ts,
+    pub updated_at: Ts,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct GitHubStatus {
+    pub installed: bool,
+    pub connected: bool,
+    pub login: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct GitHubRepo {
+    pub name: String,
+    pub full_name: String,
+    pub description: Option<String>,
+    pub clone_url: String,
+    pub ssh_url: String,
+    pub private: bool,
+    pub archived: bool,
+    pub updated_at: Option<Ts>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct LocalRepo {
+    pub path: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Device {
+    pub serial: String,
+    pub model: String,
+    pub kind: DeviceKind,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceKind {
+    Usb,
+    Avd,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Avd {
+    pub name: String,
+    pub device: Option<String>,
+    pub package: Option<String>,
+    pub path: Option<String>,
+    pub running_serial: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Run {
+    pub id: Id,
+    pub project_id: Id,
+    /// `run` installs and launches on `device`; `build` produces an artifact and
+    /// leaves `device` empty (D152).
+    pub kind: String,
+    pub device: String,
+    pub worktree: String,
+    pub state: String,
+    /// Absolute path of the APK / AAB a finished `build` produced.
+    pub artifact: Option<String>,
+    /// Gradle variant and artifact format for a release build; absent for device runs.
+    pub variant: Option<String>,
+    pub format: Option<String>,
+    /// True when this build was also handed to Gradle Play Publisher.
+    pub publish: bool,
+    /// `signed`, `unsigned`, or `unverified` after Relay inspects the artifact.
+    pub signing: Option<String>,
+    pub started_at: Ts,
+    pub finished_at: Option<Ts>,
+}
+
+// ---------------------------------------------------------------- git / files
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct FileStatus {
+    pub path: String,
+    /// Porcelain-style: `M`, `A`, `D`, `R`, `?`, `!`, `U`.
+    pub index: String,
+    pub worktree: String,
+    pub renamed_from: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct DiffFile {
+    pub path: String,
+    pub old_path: Option<String>,
+    pub status: String,
+    pub added: i64,
+    pub removed: i64,
+    pub binary: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Hunk {
+    pub old_start: i64,
+    pub old_lines: i64,
+    pub new_start: i64,
+    pub new_lines: i64,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Commit {
+    pub sha: String,
+    pub parents: Vec<String>,
+    pub author: String,
+    pub email: String,
+    pub at: Ts,
+    pub subject: String,
+    pub body: String,
+    pub refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Branch {
+    pub name: String,
+    pub head: String,
+    pub upstream: Option<String>,
+    pub ahead: i64,
+    pub behind: i64,
+    pub merged: bool,
+    pub session: Option<String>,
+    pub current: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Entry {
+    /// Relative to the worktree root.
+    pub path: String,
+    pub name: String,
+    pub kind: EntryKind,
+    pub size: Option<i64>,
+    pub modified_at: Option<Ts>,
+    /// Git status badge, if any (`M`, `A`, `D`, `?`).
+    pub badge: Option<String>,
+    pub children: Option<Vec<Entry>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryKind {
+    File,
+    Dir,
+    Symlink,
+}
+
+// ---------------------------------------------------------------- ui
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneKind {
+    Terminal,
+    Notes,
+    Log,
+    Editor,
+    Diff,
+    Files,
+    Git,
+    Mirror,
+    Run,
+}
+
+/// What a pane shows; shape depends on `PaneKind`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PaneTarget {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note_id: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirror_id: Option<Id>,
+}
+
+/// A pane handle: the UI's id for it, stable for the pane's life.
+pub type PaneRef = String;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct PaneInfo {
+    pub pane: PaneRef,
+    pub kind: PaneKind,
+    pub target: PaneTarget,
+    pub window_id: String,
+    pub focused: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct WindowInfo {
+    pub window_id: String,
+    pub main: bool,
+    pub panes: Vec<PaneRef>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Page {
+    Agents,
+    Code,
+    Board,
+    Modules,
+    Plan,
+    Notes,
+    Dashboard,
+    Skills,
+    Plugins,
+    Settings,
+}

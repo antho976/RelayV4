@@ -1,0 +1,67 @@
+@define-color wall #0e0e10;
+@define-color console #141416;
+@define-color slab #1b1b1e;
+@define-color wash #232327;
+@define-color screen #0a0a0b;
+@define-color ink #ececea;
+@define-color secondary #a5a5a3;
+@define-color edge #252529;
+@define-color live #2ec469;
+@define-color held #e5382e;
+@define-color waiting #f0a828;
+* { -gtk-icon-style: symbolic; }
+window { background: @wall; color: @ink; font-family: 'Fira Sans', 'Noto Sans', sans-serif; font-size: 13px; }
+window > box, stack, scrolledwindow { background: @wall; }
+.titlebar { background: @console; padding: 0; border: 0; box-shadow: none; }
+.topbar { min-height: 40px; padding: 0 8px; background: @console; border-bottom: 1px solid @edge; }
+.brand-mark { background: @ink; color: @wall; font-weight: 700; padding: 2px 6px; }
+.brand, .section-label, .tab { font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; }
+.brand { letter-spacing: 0.16em; }
+.sidebar { background: @console; border-right: 1px solid @edge; }
+.sidebar scrolledwindow, .sidebar viewport { background: @console; }
+.sidebar-footer, .section-label { padding: 12px 10px 8px; color: @secondary; }
+button { min-height: 28px; padding: 0 10px; border: 0; border-radius: 2px; box-shadow: none; background: @slab; color: @ink; font-size: 12px; }
+button:hover { background: @wash; }
+button:focus-visible { outline: 2px solid @ink; outline-offset: -2px; }
+button:disabled { opacity: 0.45; }
+button.primary { background: @ink; color: @wall; }
+button.primary:hover { background: white; }
+button.quiet, button.tab, button.nav, button.project, button.file { background: transparent; color: @secondary; }
+button.quiet:hover, button.tab:hover, button.nav:hover, button.project:hover, button.file:hover { background: @wash; color: @ink; }
+button.nav, button.project, button.file { border-radius: 0; }
+button.nav { min-height: 30px; }
+button.project { min-height: 44px; padding: 4px 12px; }
+button.project.selected { background: @wash; color: @ink; border-left: 2px solid @ink; }
+.topbar windowcontrols { padding: 0; }
+.topbar windowcontrols button { min-height: 40px; min-width: 32px; padding: 0; }
+button.tab.selected { background: @ink; color: @wall; }
+button.nav.selected { background: @wash; color: @ink; }
+.title { font-size: 15px; font-weight: 600; }
+.dim { color: @secondary; font-size: 12px; }
+.toolbar { min-height: 38px; padding: 0 12px; background: @console; border-bottom: 1px solid @edge; }
+.statusbar { background: @console; color: @secondary; min-height: 24px; padding: 0 12px; border-top: 1px solid @edge; font-size: 11px; }
+.notice { background: @slab; border-bottom: 1px solid @held; color: @ink; padding: 8px 12px; }
+.terminal-plate { background: @screen; border: 1px solid @edge; }
+.terminal-plate.live { border-color: @live; }
+.terminal-plate.held { border-color: @held; }
+.terminal-plate.waiting { border-color: @edge; }
+.umd { background: @console; padding: 0 8px; min-height: 28px; border-top: 1px solid @edge; }
+.live .umd { border-top-color: @live; }
+.held .umd { border-top-color: @held; }
+.held .session-name { color: @held; }
+.session-name { font-size: 12px; font-weight: 600; }
+.umd button { min-height: 24px; padding: 0 6px; font-size: 11px; }
+.page { padding: 20px; }
+.record { background: @slab; padding: 12px; }
+.board-lane { background: @console; padding: 4px; }
+.launch { background: @console; padding: 20px; border-left: 1px solid @edge; }
+entry, textview, textview text { background: @screen; color: @ink; caret-color: @ink; }
+entry { border: 1px solid @edge; border-radius: 2px; min-height: 30px; }
+textview { padding: 8px; }
+entry:focus-within { border-color: @secondary; }
+selection { background: @wash; color: @ink; }
+dropdown > button { background: @slab; }
+popover contents { background: @slab; color: @ink; border: 1px solid @edge; }
+scrollbar { background: @console; }
+scrollbar slider { min-width: 6px; min-height: 6px; background: #3f3f45; border-radius: 2px; }
+.file-tree { background: @console; padding: 8px 0; }

@@ -1,0 +1,157 @@
+//! Event-driven worktree watchers. A short trailing debounce folds editor saves and git's
+//! lock/rename sequence into one refresh event without introducing an idle polling loop.
+
+use crate::engine::{Ctx, Engine, Unlocked};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use serde_json::json;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+/// Both request contexts can defer work: [`Ctx`] until after its transaction commits, [`Unlocked`]
+/// until its handler returns. Watcher registration only cares that the store lock is not held.
+pub(crate) trait Defer {
+    fn defer(&mut self, f: Box<dyn FnOnce(Arc<Engine>) + Send + 'static>);
+}
+impl Defer for Ctx<'_> {
+    fn defer(&mut self, f: Box<dyn FnOnce(Arc<Engine>) + Send + 'static>) {
+        self.after_commit(f);
+    }
+}
+impl Defer for Unlocked<'_> {
+    fn defer(&mut self, f: Box<dyn FnOnce(Arc<Engine>) + Send + 'static>) {
+        self.after_commit(f);
+    }
+}
+
+/// Recursive inotify registration may enumerate a large worktree. Start it after the current bus
+/// transaction releases the store lock so first-time registration cannot block PTY or UI requests.
+pub(crate) fn ensure_after_commit(
+    ctx: &mut impl Defer,
+    root: PathBuf,
+    project_id: relay_bus::types::Id,
+) {
+    let root = std::fs::canonicalize(&root).unwrap_or(root);
+    ctx.defer(Box::new(move |engine| {
+        let key = root.display().to_string();
+        if engine.watchers.lock().unwrap().contains_key(&key) {
+            return;
+        }
+        if !engine.watcher_registrations.lock().unwrap().insert(key.clone()) {
+            return;
+        }
+        let thread_engine = engine.clone();
+        if std::thread::Builder::new()
+            .name("watch-register".into())
+            .spawn(move || ensure(&thread_engine, &root, project_id))
+            .is_err()
+        {
+            engine.watcher_registrations.lock().unwrap().remove(&key);
+        }
+    }));
+}
+
+pub fn ensure(engine: &Engine, root: &Path, project_id: relay_bus::types::Id) {
+    let key = std::fs::canonicalize(root)
+        .unwrap_or_else(|_| root.to_path_buf())
+        .display()
+        .to_string();
+    let Some(engine) = engine.arc() else { return };
+    let weak = Arc::downgrade(&engine);
+    let pending = Arc::new(AtomicBool::new(false));
+    let pending_cb = pending.clone();
+    let root = PathBuf::from(&key);
+    let callback_root = root.clone();
+    let watcher: notify::Result<RecommendedWatcher> =
+        notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+            let Ok(event) = event else { return };
+            if event
+                .paths
+                .iter()
+                .all(|path| is_generated_path(&callback_root, path))
+                || pending_cb.swap(true, Ordering::SeqCst)
+            {
+                return;
+            }
+            let weak = weak.clone();
+            let pending = pending_cb.clone();
+            let root = callback_root.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(125));
+                pending.store(false, Ordering::SeqCst);
+                if let Some(engine) = weak.upgrade() {
+                    let payload =
+                        json!({"project_id": project_id, "worktree": root.display().to_string()});
+                    // A filesystem mutation makes both the tree and Git projection stale. One
+                    // scoped event lets the Code workspace refresh both without a guaranteed
+                    // duplicate pass. Explicit git.* mutations still emit git.changed.
+                    engine.emit_system("file.changed", payload);
+                }
+            });
+        });
+    let registered = if let Ok(mut watcher) = watcher {
+        if watcher.watch(&root, RecursiveMode::Recursive).is_ok() {
+            let mut watchers = engine.watchers.lock().unwrap();
+            if watchers.contains_key(&key) {
+                false
+            } else {
+                watchers.insert(key.clone(), watcher);
+                true
+            }
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    engine.watcher_registrations.lock().unwrap().remove(&key);
+    if registered {
+        engine.emit_system("file.changed", json!({"project_id": project_id, "worktree": root.display().to_string()}));
+    }
+}
+
+/// Build caches can change hundreds of times per second while Relay itself is compiling. They are
+/// never useful refresh signals for the source tree and would otherwise keep the single bus busy.
+pub(crate) fn is_generated_path(root: &Path, path: &Path) -> bool {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    relative.components().any(|component| {
+        let value = component.as_os_str().to_string_lossy();
+        matches!(
+            value.as_ref(),
+            ".relay"
+                | "node_modules"
+                | "target"
+                | "build"
+                | ".gradle"
+                | ".svelte-kit"
+                | ".next"
+                | "dist"
+                | "coverage"
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_generated_path;
+    use std::path::Path;
+
+    #[test]
+    fn generated_build_paths_do_not_refresh_the_code_workspace() {
+        let root = Path::new("/repo");
+        assert!(is_generated_path(root, Path::new("/repo/target/debug/app")));
+        assert!(is_generated_path(
+            root,
+            Path::new("/repo/apps/web/node_modules/pkg/index.js")
+        ));
+        assert!(is_generated_path(
+            root,
+            Path::new("/repo/app/build/generated/source.kt")
+        ));
+        assert!(!is_generated_path(
+            root,
+            Path::new("/repo/apps/web/src/App.svelte")
+        ));
+        assert!(!is_generated_path(root, Path::new("/repo/.git/HEAD")));
+    }
+}

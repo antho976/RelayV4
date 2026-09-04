@@ -1,0 +1,23 @@
+[package]
+name = "relay-cli"
+description = "`relay` — the CLI door of the RELAY v4 bus (BUS.md §8)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "relay"
+path = "src/main.rs"
+
+[dependencies]
+relay-bus.workspace = true
+relay-core.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+base64.workspace = true
