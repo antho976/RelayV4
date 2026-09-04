@@ -178,6 +178,21 @@ pub fn install(ui: &Rc<Ui>) {
             toggle.emit_clicked();
         }
         if let Ok(page) = std::env::var("RELAY_NATIVE_PAGE") {
+            if matches!(page.as_str(), "device-run" | "device-release" | "resources") {
+                if page == "resources" {
+                    navigate.resources();
+                } else {
+                    crate::tools::devices::open(&navigate);
+                    if page == "device-release" {
+                        named(&navigate.window, "device-tabs")
+                            .unwrap()
+                            .downcast::<gtk::Stack>()
+                            .unwrap()
+                            .set_visible_child_name("release");
+                    }
+                }
+                return;
+            }
             if matches!(page.as_str(), "palette" | "layouts") {
                 named(
                     &navigate.window,

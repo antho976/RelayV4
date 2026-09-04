@@ -12,6 +12,8 @@ use tokio::runtime::Handle;
 mod launch;
 #[path = "shell.rs"]
 mod shell;
+#[path = "status.rs"]
+mod status;
 
 pub fn text<'a>(v: &'a Value, key: &str) -> &'a str {
     v[key].as_str().unwrap_or("")
@@ -105,6 +107,8 @@ pub struct Ui {
     pub page_projects: RefCell<BTreeMap<String, i64>>,
     pub notice: gtk::Label,
     status: gtk::Label,
+    usage_meters: gtk::Box,
+    device_status: gtk::Label,
     status_project: gtk::Label,
     status_branch: gtk::Label,
     sidebar: gtk::Box,
@@ -400,12 +404,24 @@ impl Ui {
         bottom.append(&spacer);
         let status = label("Engine disconnected", "");
         bottom.append(&status);
-        let devices_key = button("Devices", "quiet");
-        let usage_key = button("Usage", "quiet");
-        let resources_key = button("Resources", "quiet");
+        let usage_key = button("", "quiet");
+        usage_key.set_tooltip_text(Some("Provider usage"));
+        let usage_meters = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        usage_key.set_child(Some(&usage_meters));
+        let devices_key = button("", "quiet");
+        devices_key.set_widget_name("status-devices");
+        let device_status = label("No device", "mono");
+        let device_content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        device_content.append(&crate::icons::image("device", 12));
+        device_content.append(&device_status);
+        devices_key.set_child(Some(&device_content));
+        let resources_key = icon_button("cpu", "Resources");
+        resources_key.set_widget_name("status-resources");
         bottom.append(&usage_key);
-        bottom.append(&resources_key);
+        bottom.append(&gtk::Separator::new(gtk::Orientation::Vertical));
         bottom.append(&devices_key);
+        bottom.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+        bottom.append(&resources_key);
         outer.append(&bottom);
         let wallpaper = gtk::Picture::new();
         wallpaper.set_can_shrink(true);
@@ -436,6 +452,8 @@ impl Ui {
             page_projects: RefCell::default(),
             notice,
             status,
+            usage_meters,
+            device_status,
             status_project,
             status_branch,
             sidebar,
@@ -504,7 +522,6 @@ impl Ui {
         }
         for (key, page) in [
             (settings_key, "settings"),
-            (devices_key, "devices"),
             (notifications_key, "notifications"),
         ] {
             let weak = Rc::downgrade(&ui);
@@ -531,6 +548,12 @@ impl Ui {
         layouts_key.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
                 ui.layout_menu();
+            }
+        });
+        let weak = Rc::downgrade(&ui);
+        devices_key.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                crate::tools::devices::open(&ui);
             }
         });
         let weak = Rc::downgrade(&ui);
@@ -720,6 +743,8 @@ impl Ui {
                     *ui.client.borrow_mut() = Some(client);
                     if let Err(e)=ui.call("bus.subscribe",json!({"events":["project.changed","project.deleted","workspace.changed","session.changed","task.changed","task.deleted","mailbox.new","mailbox.changed","guardrail.held","guardrail.resolved","overlap.changed","notes.changed","file.changed","git.changed","worktree.changed","module.changed","module.deleted","skill.changed","skill.deleted","settings.changed","notify.new","notify.changed","device.changed","run.changed","run.crash","device.signing.changed","avd.changed","layout.changed","ui.changed","ui.toast","usage.changed","integration.changed","integration.result"]})).await { ui.show_error(&e.to_string()); return; }
                     ui.connected.set(true);
+                    ui.status.set_text("");
+                    ui.refresh_status();
                     ui.notice.set_visible(false);
                     ui.refresh();
                     ui.load_appearance();
@@ -738,6 +763,12 @@ impl Ui {
                         }
                         match notice {
                             Notice::Event(e) => {
+                                if matches!(
+                                    e.ev.as_str(),
+                                    "usage.changed" | "device.changed" | "run.changed"
+                                ) {
+                                    ui.refresh_status();
+                                }
                                 if e.ev == "notify.new" {
                                     crate::sounds::notify(&ui, &e.payload);
                                 }
@@ -1003,14 +1034,6 @@ impl Ui {
         } else {
             self.update_attachments();
         }
-        let live = sessions
-            .iter()
-            .filter(|s| matches!(text(s, "state"), "running" | "spawning"))
-            .count();
-        let held = sessions
-            .iter()
-            .filter(|s| text(s, "state") == "blocked")
-            .count();
         let name = self
             .projects
             .borrow()
@@ -1027,8 +1050,7 @@ impl Ui {
                 .map(|p| text(p, "base_branch"))
                 .unwrap_or(""),
         );
-        self.status
-            .set_text(&format!("{held} needs you  ·  {live} live"));
+
         self.wall_stack
             .set_visible_child_name(if sessions.is_empty() { "empty" } else { "wall" });
     }

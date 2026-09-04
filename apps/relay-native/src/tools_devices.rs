@@ -460,3 +460,202 @@ fn signing_form(ui: &Rc<Ui>, row: &gtk::Box, project: i64) {
         });
     });
 }
+
+/// Footer utility. The full device page retains build history and advanced controls.
+pub fn open(ui: &Rc<Ui>) {
+    if !ui.dismiss_panels() {
+        return;
+    }
+    let panel = crate::panel::Panel::new(ui, "Device control", 420);
+    panel.bottom(340);
+    let tabs = gtk::Stack::new();
+    tabs.set_widget_name("device-tabs");
+    let switch = gtk::StackSwitcher::new();
+    switch.set_stack(Some(&tabs));
+    switch.set_halign(gtk::Align::Fill);
+    panel.body.append(&switch);
+    let run = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    let release = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    tabs.add_titled(&run, Some("run"), "RUN");
+    tabs.add_titled(&release, Some("release"), "RELEASE");
+    panel.body.append(&tabs);
+    run.append(&paragraph("Loading devices…"));
+    release.append(&paragraph("Loading worktrees…"));
+    let ui = ui.clone();
+    let task = glib::spawn_future_local(async move {
+        let project = ui.project.get();
+        let (devices, trees) = tokio::join!(
+            ui.call("device.list", json!({})),
+            ui.call("worktree.list", json!({"project_id":project}))
+        );
+        clear(&run);
+        clear(&release);
+        let devices = match devices {
+            Ok(v) => rows(&v, "devices"),
+            Err(e) => {
+                run.append(&paragraph(&e.to_string()));
+                Vec::new()
+            }
+        };
+        let trees = trees.map(|v| rows(&v, "worktrees")).unwrap_or_default();
+        let reload = button("Refresh devices", "quiet");
+        let weak = Rc::downgrade(&ui);
+        reload.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                open(&ui);
+            }
+        });
+        run.append(&reload);
+        avd_form(&ui, &run);
+        if let Ok(v) = ui.call("avd.list", json!({})).await {
+            for avd in rows(&v, "avds") {
+                let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+                let name = label(text(&avd, "name"), "body");
+                name.set_hexpand(true);
+                row.append(&name);
+                if avd["running_serial"].is_string() {
+                    row.append(&label("Running", "dim"));
+                } else {
+                    action(
+                        &ui,
+                        &row,
+                        "Boot",
+                        "avd.boot",
+                        json!({"name":avd["name"],"cold":false}),
+                    );
+                }
+                run.append(&row);
+            }
+        }
+        if devices.is_empty() {
+            let empty = gtk::Box::new(gtk::Orientation::Vertical, 8);
+            empty.set_margin_top(20);
+            empty.set_margin_bottom(20);
+            empty.append(&crate::icons::image("device", 24));
+            let title = label("No Android device", "title");
+            title.set_xalign(0.5);
+            empty.append(&title);
+            let copy = paragraph("Connect a phone with USB debugging enabled, or boot an AVD above. A release build needs no device.");
+            copy.set_justify(gtk::Justification::Center);
+            empty.append(&copy);
+            run.append(&empty);
+        }
+        release.append(&label("Release artifact", "title"));
+        release.append(&paragraph(
+            "Build the selected worktree with its Gradle release configuration.",
+        ));
+        for (form, is_release) in [(&run, false), (&release, true)] {
+            if project <= 0 {
+                form.append(&paragraph("Select a project to build."));
+                continue;
+            }
+            let tree = gtk::ComboBoxText::new();
+            tree.append(Some(""), "Primary · project branch");
+            for wt in &trees {
+                tree.append(Some(text(wt, "path")), text(wt, "branch"));
+            }
+            tree.set_active(Some(0));
+            field("Build from", &tree, form);
+            let target = gtk::ComboBoxText::new();
+            for device in &devices {
+                if text(device, "state") == "device" {
+                    target.append(
+                        Some(text(device, "serial")),
+                        &format!("{} · {}", text(device, "model"), text(device, "serial")),
+                    );
+                }
+            }
+            target.set_active(Some(0));
+            if !is_release && !devices.is_empty() {
+                field("Device", &target, form);
+                let mirror = button("Open mirror", "quiet");
+                form.append(&mirror);
+                let weak = Rc::downgrade(&ui);
+                let target = target.clone();
+                mirror.connect_clicked(move |_| {
+                    if let (Some(ui), Some(serial)) = (weak.upgrade(), target.active_id()) {
+                        crate::mirror::open(&ui, serial.to_string());
+                    }
+                });
+            }
+            let format = gtk::ComboBoxText::new();
+            format.append(Some("aab"), "Android App Bundle (.aab) · Google Play");
+            format.append(Some("apk"), "Android package (.apk)");
+            format.set_active(Some(0));
+            if is_release {
+                field("Artifact", &format, form);
+                if let Ok(signing) = ui
+                    .call("device.signing.get", json!({"project_id":project}))
+                    .await
+                {
+                    if signing["configured"] == true {
+                        form.append(&label(
+                            if signing["enabled"] == true {
+                                "Relay signing configured"
+                            } else {
+                                "Gradle signing"
+                            },
+                            "body",
+                        ));
+                        action(
+                            &ui,
+                            form,
+                            if signing["enabled"] == true {
+                                "Use Gradle signing"
+                            } else {
+                                "Use Relay signing"
+                            },
+                            "device.signing.set_enabled",
+                            json!({"project_id":project,"enabled":signing["enabled"] != true}),
+                        );
+                    } else {
+                        form.append(&label("Gradle signing", "body"));
+                        signing_form(&ui, form, project);
+                    }
+                }
+            }
+            let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            form.append(&actions);
+            for publish in [false, true] {
+                if publish && !is_release {
+                    continue;
+                }
+                let key = button(
+                    if publish {
+                        "Build and publish"
+                    } else if is_release {
+                        "Build release"
+                    } else {
+                        "Run debug"
+                    },
+                    if publish { "quiet" } else { "primary" },
+                );
+                key.set_sensitive(is_release || target.active_id().is_some());
+                actions.append(&key);
+                let weak = Rc::downgrade(&ui);
+                let tree = tree.clone();
+                let target = target.clone();
+                let format = format.clone();
+                key.connect_clicked(move |_| {
+                    let Some(ui) = weak.upgrade() else { return; };
+                    let path=tree.active_id().map(|s|s.to_string()).filter(|s|!s.is_empty());
+                    let mut payload=json!({"project_id":project,"worktree":path,"variant":if is_release {"release"} else {"debug"}});
+                    if is_release { payload["format"]=json!(format.active_id().map(|s|s.to_string())); payload["publish"]=json!(publish); }
+                    else { let Some(serial)=target.active_id() else {return;}; payload["device"]=json!(serial.as_str()); }
+                    run_window(&ui, if is_release {"device.build"} else {"device.run"}, payload, if is_release {"Release build"} else {"Run debug"});
+                });
+            }
+        }
+        let history = button("Build history and advanced controls", "quiet");
+        release.append(&history);
+        let weak = Rc::downgrade(&ui);
+        history.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                ui.dismiss_panels();
+                ui.navigate("devices");
+            }
+        });
+    });
+    panel.on_closed(move || task.abort());
+    panel.present();
+}

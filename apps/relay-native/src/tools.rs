@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use std::rc::Rc;
 
 #[path = "tools_devices.rs"]
-mod devices;
+pub(crate) mod devices;
 #[path = "tools_settings.rs"]
 mod settings;
 #[path = "tools_skills.rs"]
