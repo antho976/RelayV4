@@ -512,13 +512,7 @@ impl Editor {
                 .await
             {
                 Ok(v) if ui.project.get() == project => {
-                    let dialog = gtk::Dialog::builder()
-                        .title("Commit details")
-                        .transient_for(&ui.window)
-                        .default_width(720)
-                        .default_height(500)
-                        .build();
-                    dialog.add_button("Close", gtk::ResponseType::Close);
+                    let dialog = crate::panel::Panel::new(&ui, "Commit details", 720);
                     let view = gtk::TextView::new();
                     view.set_editable(false);
                     view.set_monospace(true);
@@ -542,8 +536,7 @@ impl Editor {
                         ));
                     }
                     view.buffer().set_text(&copy);
-                    dialog.content_area().append(&scrolled(&view));
-                    dialog.connect_response(|d, _| d.close());
+                    dialog.body.append(&scrolled(&view));
                     dialog.present();
                 }
                 Ok(_) => {}
@@ -554,24 +547,14 @@ impl Editor {
 }
 
 async fn confirm(ui: &Ui, title: &str, copy: &str) -> bool {
-    let dialog = gtk::Dialog::builder()
-        .title(title)
-        .transient_for(&ui.window)
-        .modal(true)
-        .default_width(620)
-        .default_height(360)
-        .build();
-    dialog.add_button("Cancel", gtk::ResponseType::Cancel);
-    dialog.add_button("Continue", gtk::ResponseType::Accept);
+    let dialog = crate::panel::Panel::new(ui, title, 620);
     let view = gtk::TextView::new();
     view.set_editable(false);
     view.set_monospace(true);
     view.set_wrap_mode(gtk::WrapMode::WordChar);
     view.buffer().set_text(copy);
-    dialog.content_area().append(&scrolled(&view));
-    let response = dialog.run_future().await;
-    dialog.close();
-    response == gtk::ResponseType::Accept
+    dialog.body.append(&scrolled(&view));
+    dialog.response("Continue").await
 }
 
 async fn guarded(ui: &Ui, op: &str, payload: Value) -> Result<Option<Value>, Error> {

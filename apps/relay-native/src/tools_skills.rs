@@ -180,23 +180,16 @@ fn install_form(ui: &Rc<Ui>, page: &gtk::Box) {
 }
 
 fn edit(ui: &Rc<Ui>, skill: Option<Value>) {
-    let window = gtk::Window::builder()
-        .transient_for(&ui.window)
-        .modal(true)
-        .title(if skill.is_some() {
+    let window = crate::panel::Panel::new(
+        ui,
+        if skill.is_some() {
             "Edit skill"
         } else {
             "New skill"
-        })
-        .default_width(700)
-        .default_height(560)
-        .build();
-    let page = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    page.set_margin_top(16);
-    page.set_margin_bottom(16);
-    page.set_margin_start(16);
-    page.set_margin_end(16);
-    window.set_child(Some(&page));
+        },
+        700,
+    );
+    let page = window.body.clone();
     let name = gtk::Entry::builder()
         .text(skill.as_ref().map(|v| text(v, "name")).unwrap_or(""))
         .build();
@@ -225,15 +218,15 @@ fn edit(ui: &Rc<Ui>, skill: Option<Value>) {
     let changed = dirty.clone();
     let running = busy.clone();
     let message = status.clone();
-    window.connect_close_request(move |_| {
+    window.set_guard(move || {
         if changed.get() || running.get() {
             message.set_text("Save your changes or choose Discard and close.");
-            glib::Propagation::Stop
+            false
         } else {
-            glib::Propagation::Proceed
+            true
         }
     });
-    let weak_window = window.downgrade();
+    let weak_window = Rc::downgrade(&window);
     let changed = dirty.clone();
     discard.connect_clicked(move |_| {
         changed.set(false);
@@ -242,7 +235,7 @@ fn edit(ui: &Rc<Ui>, skill: Option<Value>) {
         }
     });
     let weak = Rc::downgrade(ui);
-    let weak_window = window.downgrade();
+    let weak_window = Rc::downgrade(&window);
     save.connect_clicked(move |key| {
         let Some(ui) = weak.upgrade() else {
             return;

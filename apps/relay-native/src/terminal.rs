@@ -224,6 +224,13 @@ impl Pane {
                 points.clamp(8.0, 24.0)
             ))));
     }
+    pub fn verify_ready(&self) {
+        assert!(
+            self.active.get() && self.client.borrow().is_some(),
+            "{} has no ready terminal attachment",
+            self.name
+        );
+    }
     pub fn name(&self) -> &str {
         &self.name
     }

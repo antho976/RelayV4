@@ -110,7 +110,8 @@ pub struct Ui {
     sidebar: gtk::Box,
     focus_tabs: gtk::Box,
     mode: RefCell<String>,
-    satellites: RefCell<BTreeMap<String, gtk::Window>>,
+    pub overlay: gtk::Overlay,
+    pub panels: Rc<RefCell<Vec<Rc<crate::panel::Panel>>>>,
     registry_dirty: Cell<bool>,
     workspaces: RefCell<Vec<Value>>,
     rendered_sessions: RefCell<BTreeMap<String, Value>>,
@@ -372,7 +373,9 @@ impl Ui {
                 body.set_sensitive(!launch.reveals_child());
             }
         });
-        outer.append(&overlay);
+        let panel_host = gtk::Overlay::new();
+        panel_host.set_child(Some(&overlay));
+        outer.append(&panel_host);
         let bottom = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         bottom.add_css_class("statusbar");
         let status_project = label("No project", "status-project");
@@ -431,7 +434,8 @@ impl Ui {
             sidebar,
             focus_tabs,
             mode: RefCell::new("grid".into()),
-            satellites: RefCell::default(),
+            overlay: panel_host,
+            panels: Rc::default(),
             registry_dirty: Cell::new(true),
             workspaces: RefCell::default(),
             rendered_sessions: RefCell::default(),
@@ -581,6 +585,13 @@ impl Ui {
         let weak = Rc::downgrade(&ui);
         keys.connect_key_pressed(move |_, key, _, _| {
             if let Some(ui) = weak.upgrade() {
+                if key == gtk::gdk::Key::Escape {
+                    let panel = ui.panels.borrow().last().cloned();
+                    if let Some(panel) = panel {
+                        panel.close();
+                        return glib::Propagation::Stop;
+                    }
+                }
                 if key == gtk::gdk::Key::Escape
                     && ui.launch.reveals_child()
                     && !ui.launch_busy.get()
@@ -631,13 +642,17 @@ impl Ui {
                 owned.show_error("Save or discard your editor changes before closing.");
                 return glib::Propagation::Stop;
             }
+            let panels = owned.panels.borrow().clone();
+            if panels.iter().any(|panel| !panel.can_close()) {
+                owned.show_error("Save or discard panel changes before closing.");
+                return glib::Propagation::Stop;
+            }
+            for panel in panels.iter().rev() {
+                panel.close();
+            }
             let drafts: Vec<_> = owned.note_drafts.borrow().values().cloned().collect();
             for draft in drafts {
                 draft.close();
-            }
-            let satellites = std::mem::take(&mut *owned.satellites.borrow_mut());
-            for w in satellites.values() {
-                w.destroy();
             }
             owned.generation.set(owned.generation.get() + 1);
             owned.connected.set(false);
@@ -935,10 +950,6 @@ impl Ui {
         for n in old {
             if let Some(p) = self.panes.borrow_mut().remove(&n) {
                 p.stop();
-                if let Some(window) = self.satellites.borrow_mut().remove(&n) {
-                    window.set_child(gtk::Widget::NONE);
-                    window.destroy();
-                }
                 if let Some(grid) = p.root.parent().and_downcast::<gtk::Grid>() {
                     grid.remove(&p.root);
                 }
@@ -1002,10 +1013,9 @@ impl Ui {
         let mode = self.mode.borrow();
         for s in self.sessions.borrow().iter() {
             if let Some(p) = self.panes.borrow().get(text(s, "name")) {
-                let active = (self.satellites.borrow().contains_key(text(s, "name"))
-                    || (*self.page.borrow() == "agents"
-                        && (mode.as_str() != "focus"
-                            || focus.as_ref().is_none_or(|n| n == text(s, "name")))))
+                let active = (*self.page.borrow() == "agents"
+                    && (mode.as_str() != "focus"
+                        || focus.as_ref().is_none_or(|n| n == text(s, "name"))))
                     && !matches!(
                         text(s, "state"),
                         "created" | "parked" | "restorable" | "exited"
@@ -1066,6 +1076,7 @@ impl Ui {
                     "No native tail marker for {name}"
                 );
             } else {
+                pane.verify_ready();
                 pane.terminal.paste_text("native-burst\n");
             }
         }

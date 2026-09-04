@@ -84,6 +84,19 @@ fn edit_fixture(ui: Rc<Ui>, page: String) {
                             .buffer()
                             .set_text("Native note save verified.");
                     }
+                    if page == "board" {
+                        let panel = ui
+                            .panels
+                            .borrow()
+                            .last()
+                            .cloned()
+                            .expect("Task editor is in the main window");
+                        panel.close();
+                        assert!(
+                            !ui.panels.borrow().is_empty(),
+                            "A dirty task must not close"
+                        );
+                    }
                     named(&window, "draft-save")
                         .unwrap()
                         .downcast::<gtk::Button>()
@@ -93,6 +106,32 @@ fn edit_fixture(ui: Rc<Ui>, page: String) {
                 }
             }
         });
+    });
+}
+
+fn verify_confirmations(ui: Rc<Ui>) {
+    glib::spawn_future_local(async move {
+        for accept in [false, true] {
+            let panel = crate::panel::Panel::new(&ui, "Confirmation fixture", 480);
+            panel
+                .body
+                .append(&gtk::Label::new(Some("Fixture only. No mutation.")));
+            let pending = panel.clone();
+            glib::idle_add_local_once(move || {
+                if accept {
+                    named(&pending.body, "panel-accept")
+                        .unwrap()
+                        .downcast::<gtk::Button>()
+                        .unwrap()
+                        .emit_clicked();
+                } else {
+                    pending.close();
+                }
+            });
+            assert_eq!(panel.response("Confirm").await, accept);
+            assert!(ui.panels.borrow().is_empty());
+        }
+        println!("In-app confirmation accept and cancel verified");
     });
 }
 
@@ -123,6 +162,9 @@ pub fn install(ui: &Rc<Ui>) {
     glib::timeout_add_local_once(Duration::from_secs(2), move || {
         if fixture {
             navigate.verify_shell();
+            if std::env::var("RELAY_NATIVE_PAGE").as_deref() == Ok("agents") {
+                verify_confirmations(navigate.clone());
+            }
             let toggle = named(&navigate.window, "sidebar-toggle")
                 .unwrap()
                 .downcast::<gtk::Button>()
@@ -140,7 +182,12 @@ pub fn install(ui: &Rc<Ui>) {
                 edit_fixture(navigate.clone(), page.clone());
             }
             if fixture && std::env::var("RELAY_NATIVE_BURST").as_deref() == Ok("1") {
-                navigate.verify_burst(false);
+                let ui = navigate.clone();
+                // Layout checks reconnect hidden panes. Wait for their fixture sockets
+                // before feeding input, just as a user waits for a ready terminal.
+                glib::timeout_add_local_once(Duration::from_millis(500), move || {
+                    ui.verify_burst(false)
+                });
             }
             if page == "code" && fixture {
                 navigate.editor.verify_open(&navigate);
@@ -166,22 +213,46 @@ pub fn install(ui: &Rc<Ui>) {
         if fixture && std::env::var("RELAY_NATIVE_PAGE").as_deref() == Ok("launch-preview") {
             ui.verify_launch();
         }
-        let paintable = gtk::WidgetPaintable::new(Some(&ui.window));
-        let snapshot = gtk::Snapshot::new();
-        paintable.snapshot(
-            &snapshot,
-            ui.window.width() as f64,
-            ui.window.height() as f64,
+        assert_eq!(
+            gtk::Window::list_toplevels()
+                .iter()
+                .filter(|w| w.is_visible())
+                .count(),
+            1,
+            "App flows must stay inside the main window"
         );
-        if let (Some(node), Some(renderer)) = (snapshot.to_node(), ui.window.renderer()) {
-            let texture = renderer.render_texture(&node, None);
-            match texture.save_to_png(&path) {
-                Ok(()) => println!("Screenshot saved: {path}"),
-                Err(e) => eprintln!("Screenshot failed: {e}"),
-            }
-        } else {
-            eprintln!("Screenshot failed: window has no render node");
-        }
-        ui.window.close();
+        // WidgetPaintable can have no node between invalidation and GTK's next
+        // frame (notably after a Code save). Capture a rendered frame, bounded.
+        let mut attempts = 0;
+        glib::timeout_add_local(Duration::from_millis(50), move || {
+            attempts += 1;
+            let paintable = gtk::WidgetPaintable::new(Some(&ui.window));
+            let snapshot = gtk::Snapshot::new();
+            paintable.snapshot(
+                &snapshot,
+                ui.window.width() as f64,
+                ui.window.height() as f64,
+            );
+            let (Some(node), Some(renderer)) = (snapshot.to_node(), ui.window.renderer()) else {
+                assert!(
+                    attempts < 40,
+                    "Screenshot failed: no rendered frame after two seconds"
+                );
+                ui.window.queue_draw();
+                return glib::ControlFlow::Continue;
+            };
+            renderer
+                .render_texture(&node, None)
+                .save_to_png(&path)
+                .expect("Save screenshot");
+            println!("Screenshot saved: {path}");
+            ui.window.close();
+            assert!(
+                !ui.window.is_visible(),
+                "Native close blocked: {}",
+                ui.notice.text()
+            );
+            glib::ControlFlow::Break
+        });
     });
 }

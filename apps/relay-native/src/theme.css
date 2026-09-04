@@ -103,3 +103,10 @@ button.quiet.selected { color: @ink; background: @wash; }
 .statusbar button { min-height: 22px; font-size: 11px; }
 
 .wallpaper-dim { background: black; }
+
+/* App-owned details stay inside the shell, matching Relay-2's panels. */
+.panel-scrim { border: 0; border-radius: 0; background: rgba(0, 0, 0, .35); }
+.panel-scrim:hover, .panel-scrim:active { background: rgba(0, 0, 0, .35); }
+.app-panel { background: #181a1d; border-left: 1px solid #30343a; }
+.panel-heading { min-height: 42px; padding: 0 16px; border-bottom: 1px solid #30343a; }
+.panel-body { padding: 16px; }

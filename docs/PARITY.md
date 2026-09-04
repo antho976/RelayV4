@@ -9,7 +9,7 @@ The archived V3 roadmap remains unchanged; its completion marks describe V3.
 | Relay-2 surface | Native implementation |
 | --- | --- |
 | Shell and project registry | Compact title bar, sidebar navigation, grouped workspaces, project selection, registration, rename, pinning, base/build/run settings and confirmed registry removal |
-| Terminal wall | Retained VTE widgets; Grid, Focus and Review modes; resizable columns; ordering; terminal satellites; file rail; named layout save/apply/delete |
+| Terminal wall | Retained VTE widgets; Grid, Focus and Review modes; resizable columns; ordering; file rail; named layout save/apply/delete |
 | Launch and review groups | 1–11 solo profiles or one/two builders sharing a reviewer; provider/model/effort, worktree, assignment, write/UI rights and task queue controls; allocations and queues precede spawning; reviewer starts first |
 | Session lifecycle | Start, park, wake, resume, fresh restart, brief inspection, pre-spawn configuration, confirmed close and optional worktree/build cleanup |
 | Coordination and safety | Existing engine role boundaries, claims, mailbox priority, review routing, task approval and exact held-operation inspection; agent permission and human task approval remain distinct |
@@ -18,9 +18,14 @@ The archived V3 roadmap remains unchanged; its completion marks describe V3.
 | Code and Git | Primary/agent checkout selection, expandable tree, content search, file creation/rename/trash/restore, highlighted editing, find/replace, dirty protection, worktree diff, staging, commits, history, branch management, fetch/push/PR and disposable merge tests |
 | Dashboard and notifications | Cross-project overview, correct project/task/session destinations, read acknowledgements, category settings, generated audio patterns, volume and preview |
 | Skills | Local editing, GitHub installation and replacement, source refresh, per-project enablement and deletion |
-| Settings and usage | Relay-2 palettes and SVG geometry, wallpaper library, opacity/dimming/contrast, terminal font, configurable Relay-2 shortcuts, provider/device paths, parking, guardrail configuration, backups and provider usage windows |
+| Settings and usage | Relay-2 palettes and SVG geometry, wallpaper library, opacity/dimming/contrast, terminal font, configurable Relay-2 shortcuts, provider/device paths, parking, guardrail configuration, backups and provider usage panels |
 | Android | Device/AVD listing, boot/create, selected-worktree run/build, APK/AAB, optional publishing, signing configuration, bounded logs and native mirror/control/capture |
 | Plugins | Reserved extension surface, as in the reference |
+
+App-owned editors, confirmations, registry controls, usage and build logs stay
+inside the main window. Only Notes and the emulator/mirror detach; native file
+pickers still use the desktop file chooser. Dirty task, module, skill and note
+drafts block dismissal and application closure until saved or discarded.
 
 ## Reliability changes
 

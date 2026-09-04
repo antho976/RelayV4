@@ -359,15 +359,9 @@ fn avd_form(ui: &Rc<Ui>, page: &gtk::Box) {
 
 // A separate socket keeps noisy Gradle/logcat output away from the UI control plane.
 fn run_window(ui: &Rc<Ui>, op: &'static str, payload: Value, title: &str) {
-    let window = gtk::Window::builder()
-        .transient_for(&ui.window)
-        .title(title)
-        .default_width(900)
-        .default_height(580)
-        .build();
-    let page = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    window.set_child(Some(&page));
-    page.append(&paragraph("Closing this log window leaves the build or run active. Use Stop in device history to stop it."));
+    let window = crate::panel::Panel::new(ui, title, 780);
+    let page = window.body.clone();
+    page.append(&paragraph("Closing this log panel leaves the build or run active. Use Stop in device history to stop it."));
     let output = gtk::TextView::new();
     output.set_editable(false);
     output.set_monospace(true);
@@ -418,10 +412,7 @@ fn run_window(ui: &Rc<Ui>, op: &'static str, payload: Value, title: &str) {
             Err(error) => status.set_text(&error.to_string()),
         }
     });
-    window.connect_close_request(move |_| {
-        task.abort();
-        glib::Propagation::Proceed
-    });
+    window.on_closed(move || task.abort());
     window.present();
 }
 
