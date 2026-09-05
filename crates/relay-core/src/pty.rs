@@ -129,6 +129,9 @@ impl Pty {
         cmd.cwd(&spec.cwd);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
+        // The daemon may have been started by a noninteractive, monochrome tool.
+        // Its log preference must not disable colors in an interactive agent PTY.
+        cmd.env_remove("NO_COLOR");
         for (k, v) in &spec.env {
             cmd.env(k, v);
         }

@@ -116,6 +116,7 @@ impl Editor {
         split.set_position(260);
         split.set_resize_start_child(false);
         split.set_shrink_start_child(false);
+        split.set_shrink_end_child(false);
         split.set_vexpand(true);
         let tree = gtk::Box::new(gtk::Orientation::Vertical, 2);
         tree.add_css_class("file-tree");

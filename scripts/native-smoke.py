@@ -21,13 +21,18 @@ def git(repo, *args):
     subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
 
 
+def check_gtk_log(contents):
+    for message in ("Trying to measure GtkPaned", "reported min width -", "Unable to register the application"):
+        assert message not in contents, contents
+
+
 with tempfile.TemporaryDirectory(prefix="relay-native-smoke-") as temporary:
     base = Path(temporary)
     runtime = base / "runtime"
     runtime.mkdir(mode=0o700)
     env = dict(os.environ, XDG_DATA_HOME=str(base / "data"),
                XDG_CONFIG_HOME=str(base / "config"), XDG_CACHE_HOME=str(base / "cache"),
-               XDG_RUNTIME_DIR=str(runtime), RELAY_INSTANCE="test", RELAY_BIN=str(ENGINE))
+               XDG_RUNTIME_DIR=str(runtime), RELAY_INSTANCE="test", RELAY_BIN=str(ENGINE), NO_COLOR="1")
     for key in ("RELAY_SESSION", "RELAY_TOKEN", "RELAY_BRIEF"):
         env.pop(key, None)
     provider = base / "provider"
@@ -37,7 +42,10 @@ if "--version" in sys.argv:
     print("native-smoke 1.0"); sys.exit()
 if "auth" in sys.argv or "login" in sys.argv:
     print('{"loggedIn":true}'); sys.exit()
-print("\\033[1;37mRELAY NATIVE VERIFICATION\\033[0m", flush=True)
+assert "NO_COLOR" not in os.environ, "Daemon log settings leaked into the interactive PTY"
+assert os.environ["TERM"] == "xterm-256color" and os.environ["COLORTERM"] == "truecolor"
+print("\\033[1;36mRELAY NATIVE VERIFICATION\\033[0m", flush=True)
+print("\\033[31mRed \\033[32mGreen \\033[34mBlue \\033[38;2;217;119;87mTruecolor\\033[0m", flush=True)
 print("Disposable provider fixture, no model connected.", flush=True)
 print("Session: " + os.environ.get("RELAY_SESSION", "fixture"), flush=True)
 print("\\nEngine owns this PTY. VTE renders its output.", flush=True)
@@ -107,6 +115,15 @@ for line in sys.stdin:
         for key in ("RELAY_SESSION", "RELAY_TOKEN", "RELAY_BRIEF"):
             desktop_env.pop(key, None)
         initial_names={s["name"] for s in call("session.list",{"project_id":project["id"]})["sessions"]}
+        for name in initial_names:
+            deadline = time.monotonic() + 5
+            while True:
+                output = call("session.scrollback", {"session": name})["text"]
+                if "Truecolor" in output:
+                    break
+                assert time.monotonic() < deadline, output
+                time.sleep(0.05)
+            assert "\x1b[31mRed" in output and "\x1b[38;2;217;119;87mTruecolor" in output, output
         if os.environ.get("RELAY_SMOKE_ROADMAP_ONLY"):
             for part in os.environ["RELAY_SMOKE_ROADMAP_ONLY"].split(","):
                 with (OUT / f"roadmap-{part}.log").open("w") as native_log:
@@ -121,6 +138,7 @@ for line in sys.stdin:
                             native.terminate()
                             native.wait(timeout=5)
                 assert f"ROADMAP_OK={part}" in (OUT / f"roadmap-{part}.log").read_text(), part
+                check_gtk_log((OUT / f"roadmap-{part}.log").read_text())
             print("Roadmap native regressions passed: " + os.environ["RELAY_SMOKE_ROADMAP_ONLY"])
             raise SystemExit(0)
         measurements=[]
@@ -153,6 +171,7 @@ for line in sys.stdin:
             expected_size = (1080, 760) if page == "notes" else tuple(map(int, size.split(",")))
             assert struct.unpack(">II", output.read_bytes()[16:24]) == expected_size, viewport
             contents = (OUT / f"{viewport}.log").read_text()
+            check_gtk_log(contents)
             assert "Shell layouts verified" in contents, contents
             saved_layout = call("settings.get", {"path": f"native.layout.current.{project['id']}"})["value"]
             assert saved_layout["agent_layout"] == "grid", saved_layout

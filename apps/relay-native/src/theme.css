@@ -61,6 +61,8 @@ popover contents { background: @slab; color: @ink; border: 1px solid @edge; }
 scrollbar { background: transparent; }
 scrollbar slider { min-width: 4px; min-height: 4px; margin: 2px; background: #2c2c30; border: 0; border-radius: 0; }
 scrollbar slider:hover { background: #3f3f45; }
+/* Breeze's negative fill margins rely on borders that Relay removes. */
+progressbar progress, scale highlight { margin: 0; }
 .file-tree { background: @console; padding: 8px 0; }
 
 .navigation { padding: 8px 8px 6px; border-bottom: 1px solid @edge; }

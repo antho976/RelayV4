@@ -19,7 +19,6 @@ impl NotesWindow {
             .title("Notes · Relay")
             .default_width(1080)
             .default_height(760)
-            .decorated(false)
             .build();
         window.add_css_class("notes-window");
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -55,7 +54,8 @@ impl NotesWindow {
         }
         let handle = gtk::WindowHandle::new();
         handle.set_child(Some(&chrome));
-        root.append(&handle);
+        // Keep GTK's resize edges while drawing our own compact titlebar.
+        window.set_titlebar(Some(&handle));
         let content = &ui.pages["notes"];
         content.set_vexpand(true);
         content.append(&label("Opening Notes…", "notes-window-loading"));
