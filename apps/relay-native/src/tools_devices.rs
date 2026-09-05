@@ -463,10 +463,9 @@ fn signing_form(ui: &Rc<Ui>, row: &gtk::Box, project: i64) {
 
 /// Footer utility. The full device page retains build history and advanced controls.
 pub fn open(ui: &Rc<Ui>) {
-    if !ui.dismiss_panels() {
+    let Some(panel) = crate::panel::Panel::toggle(ui, "Device control", 420) else {
         return;
-    }
-    let panel = crate::panel::Panel::new(ui, "Device control", 420);
+    };
     panel.bottom(340);
     let tabs = gtk::Stack::new();
     tabs.set_widget_name("device-tabs");
@@ -500,9 +499,12 @@ pub fn open(ui: &Rc<Ui>) {
         let trees = trees.map(|v| rows(&v, "worktrees")).unwrap_or_default();
         let reload = button("Refresh devices", "quiet");
         let weak = Rc::downgrade(&ui);
+        reload.set_widget_name("device-refresh");
         reload.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
-                open(&ui);
+                if ui.dismiss_panels() {
+                    open(&ui);
+                }
             }
         });
         run.append(&reload);

@@ -104,7 +104,11 @@ impl Ui {
         }
     }
     fn registry_editor(self: &Rc<Self>, value: Value, workspace: bool) {
-        let (window, body) = self.sheet(if workspace { "Workspace" } else { "Project" }, 420, 480);
+        let Some((window, body)) =
+            self.sheet(if workspace { "Workspace" } else { "Project" }, 420, 480)
+        else {
+            return;
+        };
         let name = gtk::Entry::builder().text(text(&value, "name")).build();
         field("Name", &name, &body);
         let path = label(text(&value, "path"), "dim");
@@ -173,10 +177,10 @@ impl Ui {
         title: &str,
         width: i32,
         _height: i32,
-    ) -> (Rc<crate::panel::Panel>, gtk::Box) {
-        let panel = crate::panel::Panel::new(self, title, width);
+    ) -> Option<(Rc<crate::panel::Panel>, gtk::Box)> {
+        let panel = crate::panel::Panel::toggle(self, title, width)?;
         let body = panel.body.clone();
-        (panel, body)
+        Some((panel, body))
     }
     fn confirm_mutation(
         self: &Rc<Self>,
@@ -421,7 +425,9 @@ impl Ui {
         self.applying_ui.set(false);
     }
     pub(super) fn layout_menu(self: &Rc<Self>) {
-        let (window, body) = self.sheet("Window presets", 390, 420);
+        let Some((window, body)) = self.sheet("Window presets", 390, 420) else {
+            return;
+        };
         window.compact(false, 420);
         let modes = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         body.append(&modes);
@@ -610,7 +616,9 @@ impl Ui {
     }
     fn session_menu(self: &Rc<Self>, session: Value) {
         let name = text(&session, "name").to_string();
-        let (window, body) = self.sheet(&name, 440, 620);
+        let Some((window, body)) = self.sheet(&name, 440, 620) else {
+            return;
+        };
         body.append(&label(
             &format!(
                 "{} · {} · {}",
@@ -656,7 +664,9 @@ impl Ui {
                 glib::spawn_future_local(async move {
                     match ui.call("session.brief", json!({"session":n})).await {
                         Ok(v) => {
-                            let (w, b) = ui.sheet("Session brief", 760, 640);
+                            let Some((w, b)) = ui.sheet("Session brief", 760, 640) else {
+                                return;
+                            };
                             let t = gtk::TextView::new();
                             t.set_editable(false);
                             t.set_monospace(true);
@@ -718,7 +728,9 @@ impl Ui {
         window.present();
     }
     pub(super) fn command_palette(self: &Rc<Self>) {
-        let (window, body) = self.sheet("Command palette", 560, 480);
+        let Some((window, body)) = self.sheet("Command palette", 560, 480) else {
+            return;
+        };
         window.compact(true, 400);
         let search = gtk::SearchEntry::new();
         body.append(&search);
@@ -830,15 +842,21 @@ impl Ui {
         });
     }
     pub(super) fn usage(self: &Rc<Self>) {
-        if !self.dismiss_panels() {
+        let Some((window, body)) = self.sheet("Provider usage", 400, 420) else {
             return;
-        }
-        let (window, body) = self.sheet("Provider usage", 400, 420);
+        };
         window.bottom(380);
         let refresh = button("Refresh", "quiet");
         body.append(&refresh);
         let list = gtk::Box::new(gtk::Orientation::Vertical, 8);
         body.append(&list);
+        let pending = Rc::new(RefCell::new(None::<glib::JoinHandle<()>>));
+        let closing = pending.clone();
+        window.on_closed(move || {
+            if let Some(task) = closing.borrow_mut().take() {
+                task.abort();
+            }
+        });
         let weak = Rc::downgrade(self);
         refresh.connect_clicked(move |key| {
             let Some(ui) = weak.upgrade() else {
@@ -847,7 +865,7 @@ impl Ui {
             let key = key.clone();
             let list = list.clone();
             key.set_sensitive(false);
-            glib::spawn_future_local(async move {
+            *pending.borrow_mut() = Some(glib::spawn_future_local(async move {
                 clear(&list);
                 match ui.call("usage.get", json!({})).await {
                     Ok(v) => {
@@ -887,7 +905,7 @@ impl Ui {
                     Err(e) => ui.show_error(&e.to_string()),
                 }
                 key.set_sensitive(true);
-            });
+            }));
         });
         refresh.emit_clicked();
         window.present();
