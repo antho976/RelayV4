@@ -75,6 +75,8 @@ with tempfile.TemporaryDirectory(prefix="relay-setup-") as temporary:
                     auth.unlink()
                 output = OUT / f"{page}.png"
                 runenv = dict(os.environ, RELAY_NATIVE_SOCKET=str(path), RELAY_INSTANCE="test", RELAY_NATIVE_SCREENSHOT=str(output), RELAY_NATIVE_SIZE="1024,768", RELAY_NATIVE_PAGE=page, RELAY_NATIVE_SETUP_PATH=str(workspace), RELAY_NATIVE_SMOKE_SECONDS="5")
+                if os.environ.get("RELAY_SETUP_POINTERS"):
+                    runenv.update(GDK_BACKEND="x11", RELAY_NATIVE_POINTER_DRIVER=str(ROOT / "scripts/native-pointer-click.py"))
                 with (OUT / f"{page}.log").open("w") as native_log:
                     subprocess.run([str(ROOT / "target/debug/relay-native")], env=runenv, stdout=native_log, stderr=native_log, timeout=20, check=True)
                 assert output.is_file()

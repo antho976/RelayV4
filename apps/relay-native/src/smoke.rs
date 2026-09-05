@@ -21,6 +21,49 @@ fn named(root: &impl IsA<gtk::Widget>, name: &str) -> Option<gtk::Widget> {
     None
 }
 
+fn verify_pointer_target(ui: &Ui, name: &str) {
+    let target = named(&ui.window, name).unwrap();
+    assert!(
+        target.is_sensitive() && target.is_mapped(),
+        "{name} must be interactive"
+    );
+    let bounds = target.compute_bounds(&ui.window).unwrap();
+    let hit = ui
+        .window
+        .pick(
+            (bounds.x() + bounds.width() / 2.0) as f64,
+            (bounds.y() + bounds.height() / 2.0) as f64,
+            gtk::PickFlags::DEFAULT,
+        )
+        .expect("Control center must hit a widget");
+    assert!(
+        hit == target || hit.is_ancestor(&target),
+        "{name} is blocked by {} ({})",
+        hit.type_().name(),
+        hit.widget_name()
+    );
+    println!("Pointer target verified: {name}");
+}
+
+fn click_control(ui: &Ui, name: &str) {
+    verify_pointer_target(ui, name);
+    let target = named(&ui.window, name).unwrap();
+    if let Some(driver) = std::env::var_os("RELAY_NATIVE_POINTER_DRIVER") {
+        let bounds = target.compute_bounds(&ui.window).unwrap();
+        let status = std::process::Command::new("python3")
+            .arg(driver)
+            .arg(ui.window.title().unwrap())
+            .arg(((bounds.x() + bounds.width() / 2.0) as i32).to_string())
+            .arg(((bounds.y() + bounds.height() / 2.0) as i32).to_string())
+            .status()
+            .unwrap();
+        assert!(status.success(), "Pointer injection failed for {name}");
+        println!("Mouse click sent: {name}");
+    } else {
+        target.downcast::<gtk::Button>().unwrap().emit_clicked();
+    }
+}
+
 fn verify_control_contrast(root: &impl IsA<gtk::Widget>) {
     fn walk(widget: &gtk::Widget, highlighted: bool, light_tabs: bool) {
         let light_tabs = light_tabs
@@ -238,6 +281,10 @@ pub fn install(ui: &Rc<Ui>) {
     let Ok(path) = std::env::var("RELAY_NATIVE_SCREENSHOT") else {
         return;
     };
+    if std::env::var_os("RELAY_NATIVE_POINTER_DRIVER").is_some() {
+        ui.window
+            .set_title(Some(&format!("Relay pointer smoke {}", std::process::id())));
+    }
     if let Ok(size) = std::env::var("RELAY_NATIVE_SIZE") {
         if let Some((w, h)) = size.split_once(',') {
             if let (Ok(w), Ok(h)) = (w.parse::<i32>(), h.parse::<i32>()) {
@@ -298,7 +345,7 @@ pub fn install(ui: &Rc<Ui>) {
                         key.is_sensitive(),
                         "The discovered local project must be actionable"
                     );
-                    key.emit_clicked();
+                    click_control(&ui, "setup-add");
                 });
                 return;
             }
@@ -315,7 +362,7 @@ pub fn install(ui: &Rc<Ui>) {
                         .downcast::<gtk::Button>()
                         .unwrap();
                     assert!(start.is_sensitive());
-                    start.emit_clicked();
+                    click_control(&ui, "launch-start");
                 });
                 return;
             }
@@ -362,50 +409,49 @@ pub fn install(ui: &Rc<Ui>) {
                 if page == "setup" {
                     return;
                 }
-                if let Ok(path) = std::env::var("RELAY_NATIVE_SETUP_PATH") {
-                    named(&navigate.window, "setup-path")
-                        .unwrap()
-                        .downcast::<gtk::Entry>()
-                        .unwrap()
-                        .set_text(&path);
-                }
-                named(&navigate.window, "setup-continue")
-                    .unwrap()
-                    .downcast::<gtk::Button>()
-                    .unwrap()
-                    .emit_clicked();
-                let ui = navigate.clone();
-                glib::timeout_add_local_once(Duration::from_millis(500), move || {
-                    if page.starts_with("setup-github") {
-                        named(&ui.window, "setup-source")
+                let navigate = navigate.clone();
+                glib::timeout_add_local_once(Duration::from_millis(100), move || {
+                    if let Ok(path) = std::env::var("RELAY_NATIVE_SETUP_PATH") {
+                        named(&navigate.window, "setup-path")
                             .unwrap()
-                            .downcast::<gtk::Stack>()
+                            .downcast::<gtk::Entry>()
                             .unwrap()
-                            .set_visible_child_name("github");
+                            .set_text(&path);
                     }
-                    if page.contains("connect") {
-                        let pending = ui.clone();
-                        glib::timeout_add_local_once(Duration::from_millis(250), move || {
-                            named(&pending.window, "setup-connect")
+                    click_control(&navigate, "setup-continue");
+                    let ui = navigate.clone();
+                    glib::timeout_add_local_once(Duration::from_millis(500), move || {
+                        if page.starts_with("setup-github") {
+                            named(&ui.window, "setup-source")
                                 .unwrap()
-                                .downcast::<gtk::Button>()
+                                .downcast::<gtk::Stack>()
                                 .unwrap()
-                                .emit_clicked();
-                        });
-                    }
-                    if page.ends_with("submit") {
-                        glib::timeout_add_local_once(Duration::from_millis(1000), move || {
-                            let key = named(&ui.window, "setup-add")
-                                .unwrap()
-                                .downcast::<gtk::Button>()
-                                .unwrap();
-                            assert!(
-                                key.is_sensitive(),
-                                "A selected repository must be actionable"
-                            );
-                            key.emit_clicked();
-                        });
-                    }
+                                .set_visible_child_name("github");
+                        }
+                        if page.contains("connect") {
+                            let pending = ui.clone();
+                            glib::timeout_add_local_once(Duration::from_millis(250), move || {
+                                named(&pending.window, "setup-connect")
+                                    .unwrap()
+                                    .downcast::<gtk::Button>()
+                                    .unwrap()
+                                    .emit_clicked();
+                            });
+                        }
+                        if page.ends_with("submit") {
+                            glib::timeout_add_local_once(Duration::from_millis(1000), move || {
+                                let key = named(&ui.window, "setup-add")
+                                    .unwrap()
+                                    .downcast::<gtk::Button>()
+                                    .unwrap();
+                                assert!(
+                                    key.is_sensitive(),
+                                    "A selected repository must be actionable"
+                                );
+                                click_control(&ui, "setup-add");
+                            });
+                        }
+                    });
                 });
                 return;
             }
@@ -451,6 +497,16 @@ pub fn install(ui: &Rc<Ui>) {
         }
     });
     glib::timeout_add_local_once(Duration::from_secs(duration), move || {
+        for name in [
+            "setup-continue",
+            "setup-path",
+            "setup-local-path",
+            "setup-add",
+        ] {
+            if named(&ui.window, name).is_some_and(|w| w.is_mapped() && w.is_sensitive()) {
+                verify_pointer_target(&ui, name);
+            }
+        }
         if std::env::var_os("RELAY_NATIVE_VERIFY_CONTRAST").is_some() {
             verify_control_contrast(&ui.window);
         }
