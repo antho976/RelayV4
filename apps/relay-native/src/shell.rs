@@ -40,6 +40,16 @@ impl Ui {
             caption.set_ellipsize(gtk::pango::EllipsizeMode::End);
             row.append(&crate::icons::image("chevron-down", 14));
             row.append(&caption);
+            let add = icon_button("plus", "Add project to this workspace");
+            add.set_widget_name(&format!("workspace-add-{}", workspace["id"]));
+            row.append(&add);
+            let weak = Rc::downgrade(self);
+            let target = workspace.clone();
+            add.connect_clicked(move |_| {
+                if let Some(ui) = weak.upgrade() {
+                    ui.open_repository_in(Some(target.clone()));
+                }
+            });
             let manage = icon_button("view-more-symbolic", "Workspace settings");
             row.append(&manage);
             let weak = Rc::downgrade(self);

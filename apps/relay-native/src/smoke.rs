@@ -21,6 +21,47 @@ fn named(root: &impl IsA<gtk::Widget>, name: &str) -> Option<gtk::Widget> {
     None
 }
 
+fn verify_control_contrast(root: &impl IsA<gtk::Widget>) {
+    fn walk(widget: &gtk::Widget, highlighted: bool, light_tabs: bool) {
+        let light_tabs = light_tabs
+            || widget.has_css_class("utility-panel")
+            || widget.has_css_class("setup-body");
+        let highlighted = highlighted
+            || (widget.is::<gtk::Button>() && widget.has_css_class("primary"))
+            || (light_tabs
+                && widget.is::<gtk::Button>()
+                && widget.state_flags().contains(gtk::StateFlags::CHECKED)
+                && widget
+                    .parent()
+                    .is_some_and(|p| p.is::<gtk::StackSwitcher>()));
+        if highlighted && (widget.is::<gtk::Label>() || widget.is::<gtk::Image>()) {
+            let original = widget.state_flags();
+            for state in [
+                gtk::StateFlags::NORMAL,
+                gtk::StateFlags::BACKDROP,
+                gtk::StateFlags::PRELIGHT,
+                gtk::StateFlags::ACTIVE,
+                gtk::StateFlags::INSENSITIVE,
+            ] {
+                widget.set_state_flags(original | state, true);
+                let color = widget.style_context().color();
+                assert!(
+                    color.red().max(color.green()).max(color.blue()) < 0.3 && color.alpha() > 0.95,
+                    "Light button content must stay dark in {state:?}: {color:?}"
+                );
+            }
+            widget.set_state_flags(original, true);
+        }
+        let mut child = widget.first_child();
+        while let Some(item) = child {
+            walk(&item, highlighted, light_tabs);
+            child = item.next_sibling();
+        }
+    }
+    walk(root.as_ref(), false, false);
+    println!("Primary and selected-tab contrast verified in normal, inactive, hover, pressed and disabled states");
+}
+
 fn verify_panel_toggles(ui: &Rc<Ui>) {
     fn click(ui: &Ui, name: &str) {
         named(&ui.window, name)
@@ -231,6 +272,54 @@ pub fn install(ui: &Rc<Ui>) {
             toggle.emit_clicked();
         }
         if let Ok(page) = std::env::var("RELAY_NATIVE_PAGE") {
+            if page == "workspace-project-submit" {
+                named(&navigate.window, "new-session")
+                    .unwrap()
+                    .downcast::<gtk::Button>()
+                    .unwrap()
+                    .emit_clicked();
+                assert!(
+                    named(&navigate.window, "setup-local-path").is_some(),
+                    "New Session must guide an empty workspace to project selection"
+                );
+                navigate.dismiss_panels();
+                named(&navigate.window, "workspace-add-1")
+                    .unwrap()
+                    .downcast::<gtk::Button>()
+                    .unwrap()
+                    .emit_clicked();
+                let ui = navigate.clone();
+                glib::timeout_add_local_once(Duration::from_millis(700), move || {
+                    let key = named(&ui.window, "setup-add")
+                        .unwrap()
+                        .downcast::<gtk::Button>()
+                        .unwrap();
+                    assert!(
+                        key.is_sensitive(),
+                        "The discovered local project must be actionable"
+                    );
+                    key.emit_clicked();
+                });
+                return;
+            }
+            if page == "project-launch" {
+                named(&navigate.window, "new-session")
+                    .unwrap()
+                    .downcast::<gtk::Button>()
+                    .unwrap()
+                    .emit_clicked();
+                let ui = navigate.clone();
+                glib::timeout_add_local_once(Duration::from_millis(700), move || {
+                    let start = named(&ui.window, "launch-start")
+                        .unwrap()
+                        .downcast::<gtk::Button>()
+                        .unwrap();
+                    assert!(start.is_sensitive());
+                    start.emit_clicked();
+                });
+                return;
+            }
+
             if page == "toggles" {
                 verify_panel_toggles(&navigate);
                 return;
@@ -362,6 +451,10 @@ pub fn install(ui: &Rc<Ui>) {
         }
     });
     glib::timeout_add_local_once(Duration::from_secs(duration), move || {
+        if std::env::var_os("RELAY_NATIVE_VERIFY_CONTRAST").is_some() {
+            verify_control_contrast(&ui.window);
+        }
+
         if std::env::var("RELAY_NATIVE_VERIFY_CONNECTION").as_deref() == Ok("1") {
             assert!(
                 ui.client.borrow().is_some() && !ui.notice.is_visible(),

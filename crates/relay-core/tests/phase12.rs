@@ -79,3 +79,41 @@ fn avd_catalog_create_list_and_boot_use_configured_sdk_tools() {
     assert_eq!(created["name"], "New_API_35");
     ok(&engine, "avd.boot", json!({"name":"Pixel_9_API_35","cold":true}));
 }
+
+#[test]
+fn clone_uses_workspace_when_engine_directory_was_removed() {
+    // CWD is process-wide. Reproduce the removed launcher worktree in a child.
+    if std::env::var_os("RELAY_TEST_DELETED_CWD").is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "clone_uses_workspace_when_engine_directory_was_removed", "--nocapture"])
+            .env("RELAY_TEST_DELETED_CWD", "1")
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "protocol.ext.allow")
+            .env("GIT_CONFIG_VALUE_0", "always")
+            .output().unwrap();
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    let engine = engine();
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let workspace = root.path().join("workspace");
+    let removed = root.path().join("removed-launch-worktree");
+    for path in [&source, &workspace, &removed] { fs::create_dir(path).unwrap(); }
+    command(&source, &["init", "-b", "main"]);
+    command(&source, &["-c", "user.name=Fixture", "-c", "user.email=fixture@relay.test", "commit", "--allow-empty", "-m", "Initial"]);
+    let helper = root.path().join("upload");
+    // A local transport reproduces remote helpers needing a readable CWD, without GitHub/network.
+    fs::write(&helper, format!("#!/usr/bin/env python3\nimport os\nassert os.getcwd() == {}\nos.execvp('git', ['git', 'upload-pack', {}])\n",
+        serde_json::to_string(&workspace).unwrap(), serde_json::to_string(&source).unwrap())).unwrap();
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+    let ws = ok(&engine, "workspace.create", json!({"path":workspace}));
+    std::env::set_current_dir(&removed).unwrap();
+    fs::remove_dir(&removed).unwrap();
+    assert!(std::env::current_dir().is_err());
+    let result = call(&engine, "project.clone", json!({"workspace_id":ws["id"],"url":format!("ext::{}",helper.display()),"dest":"cloned"}));
+    std::env::set_current_dir(root.path()).unwrap();
+    let project = result.into_result().unwrap();
+    assert!(workspace.join("cloned/.git").is_dir());
+    assert_eq!(project["project"]["workspace_id"], ws["id"]);
+}
