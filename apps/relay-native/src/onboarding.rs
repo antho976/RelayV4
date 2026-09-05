@@ -17,7 +17,7 @@ struct Setup {
     destination: gtk::Entry,
 }
 
-pub fn open(ui: &Rc<Ui>) {
+pub fn open(ui: &Rc<Ui>, workspace: Option<Value>) {
     let first = ui.projects.borrow().is_empty();
     let panel = crate::panel::Panel::page(
         ui,
@@ -58,7 +58,12 @@ pub fn open(ui: &Rc<Ui>) {
     panel.on_closed(move || {
         clear(&keep.body);
     });
-    setup.workspace_step(first);
+    if let Some(workspace) = workspace {
+        *setup.workspace.borrow_mut() = workspace;
+        setup.project_step();
+    } else {
+        setup.workspace_step(first);
+    }
     panel.present();
 }
 

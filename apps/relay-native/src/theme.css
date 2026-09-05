@@ -24,7 +24,7 @@ button { min-height: 28px; padding: 0 10px; border: 0; border-radius: 2px; box-s
 button:hover { background: @wash; }
 button:focus-visible { outline: 2px solid @ink; outline-offset: -2px; }
 button:disabled { opacity: 0.45; }
-button.primary { background: @ink; color: @wall; }
+button.primary { background: @ink; color: @screen; }
 button.primary:hover { background: white; }
 button.quiet, button.nav, button.project, button.file { background: transparent; color: @secondary; }
 button.quiet:hover, button.nav:hover, button.project:hover, button.file:hover { background: @wash; color: @ink; }
@@ -152,3 +152,9 @@ button.launch-choice:checked { border-color: @ink; background: @wash; }
 .usage-meter progress, .resource-meter progress { background-image: none; border: 0; box-shadow: none; }
 .setup-body { padding: 24px 0; }
 .setup-body > .title { font-size: 22px; }
+
+/* Breeze sets label colors directly in backdrop/disabled states. Keep light
+   actions readable even when their containing window loses focus. */
+button.primary label, button.primary image,
+.utility-panel stackswitcher button:checked label,
+.setup-body stackswitcher button:checked label { color: @screen; }

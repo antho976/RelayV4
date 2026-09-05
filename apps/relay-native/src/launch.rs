@@ -158,7 +158,8 @@ impl Profile {
 impl Ui {
     pub fn show_launch(self: &Rc<Self>, task: Option<i64>) {
         if self.project.get() == 0 {
-            self.show_error("Open a repository before adding agents.");
+            let workspace = self.workspaces.borrow().first().cloned();
+            self.open_repository_in(workspace);
             return;
         }
         if self.launch_busy.get() {

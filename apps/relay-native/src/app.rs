@@ -236,6 +236,7 @@ impl Ui {
         let reconnect = icon_button("view-refresh-symbolic", "Reconnect to engine");
         top.append(&reconnect);
         let launch_key = button("New session", "primary");
+        launch_key.set_widget_name("new-session");
         let launch_label = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         launch_label.append(&crate::icons::image("plus", 14));
         launch_label.append(&label("New session", ""));
@@ -1178,10 +1179,13 @@ impl Ui {
         });
     }
     pub fn open_repository(self: &Rc<Self>) {
+        self.open_repository_in(None);
+    }
+    fn open_repository_in(self: &Rc<Self>, workspace: Option<Value>) {
         if self.editor.is_dirty() || !self.dismiss_panels() {
             self.show_error("Save or discard your changes before adding a project.");
             return;
         }
-        onboarding::open(self);
+        onboarding::open(self, workspace);
     }
 }
