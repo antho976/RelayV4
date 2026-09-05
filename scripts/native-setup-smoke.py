@@ -60,7 +60,7 @@ with tempfile.TemporaryDirectory(prefix="relay-setup-") as temporary:
                 assert result["ok"], result
                 return result["result"]
             assert call("app.first_run.state")["needed"]
-            for page in ("setup", "setup-local", "setup-github", "setup-github-connect-submit", "setup-local-submit", "device-run", "device-release", "resources"):
+            for page in ("setup", "setup-local", "setup-github", "setup-github-connect-submit", "setup-local-submit", "device-run", "device-release", "resources", "toggles"):
                 if page == "setup-github-connect-submit":
                     auth.unlink()
                 output = OUT / f"{page}.png"
@@ -71,6 +71,8 @@ with tempfile.TemporaryDirectory(prefix="relay-setup-") as temporary:
                 contents = (OUT / f"{page}.log").read_text()
                 assert "panicked" not in contents and "stylesheet:" not in contents, contents
                 assert all("org.a11y.atspi.Registry" in line for line in contents.splitlines() if "CRITICAL" in line), contents
+                if page == "toggles":
+                    assert "Panel toggles verified" in contents
                 if page == "setup":
                     assert not call("workspace.list")["workspaces"]
                 elif page == "setup-github-connect-submit":

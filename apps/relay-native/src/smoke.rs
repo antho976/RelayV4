@@ -21,6 +21,59 @@ fn named(root: &impl IsA<gtk::Widget>, name: &str) -> Option<gtk::Widget> {
     None
 }
 
+fn verify_panel_toggles(ui: &Rc<Ui>) {
+    fn click(ui: &Ui, name: &str) {
+        named(&ui.window, name)
+            .unwrap()
+            .downcast::<gtk::Button>()
+            .unwrap()
+            .emit_clicked();
+    }
+    for control in [
+        "status-usage",
+        "status-resources",
+        "status-devices",
+        "command-palette",
+        "window-presets",
+    ] {
+        for index in 0..50 {
+            click(ui, control);
+            assert_eq!(
+                ui.panels.borrow().len(),
+                (index + 1) % 2,
+                "{control} must toggle, never stack"
+            );
+        }
+        click(ui, control);
+        click(ui, "panel-close");
+        assert!(ui.panels.borrow().is_empty(), "One X closes {control}");
+    }
+    click(ui, "status-usage");
+    click(ui, "status-resources");
+    assert_eq!(
+        ui.panels.borrow().len(),
+        1,
+        "Different controls replace the old panel"
+    );
+    let guarded = ui.panels.borrow().last().unwrap().clone();
+    guarded.set_guard(|| false);
+    click(ui, "status-resources");
+    click(ui, "window-presets");
+    assert_eq!(
+        ui.panels.borrow().len(),
+        1,
+        "Busy or dirty panels cannot be replaced"
+    );
+    assert!(Rc::ptr_eq(ui.panels.borrow().last().unwrap(), &guarded));
+    guarded.set_guard(|| true);
+    guarded.close();
+    click(ui, "nav-board");
+    assert_eq!(ui.page.borrow().as_str(), "board");
+    click(ui, "nav-board");
+    assert_eq!(ui.page.borrow().as_str(), "agents");
+    println!("Panel toggles verified: 50 clicks per control, one-close, switching, guards and page toggle");
+}
+
 fn edit_fixture(ui: Rc<Ui>, page: String) {
     glib::spawn_future_local(async move {
         let project = ui.project.get();
@@ -178,11 +231,31 @@ pub fn install(ui: &Rc<Ui>) {
             toggle.emit_clicked();
         }
         if let Ok(page) = std::env::var("RELAY_NATIVE_PAGE") {
+            if page == "toggles" {
+                verify_panel_toggles(&navigate);
+                return;
+            }
+
             if matches!(page.as_str(), "device-run" | "device-release" | "resources") {
                 if page == "resources" {
                     navigate.resources();
                 } else {
                     crate::tools::devices::open(&navigate);
+                    if page == "device-run" {
+                        let ui = navigate.clone();
+                        glib::timeout_add_local_once(Duration::from_millis(700), move || {
+                            named(&ui.window, "device-refresh")
+                                .unwrap()
+                                .downcast::<gtk::Button>()
+                                .unwrap()
+                                .emit_clicked();
+                            assert_eq!(
+                                ui.panels.borrow().len(),
+                                1,
+                                "Device refresh must keep a panel open"
+                            );
+                        });
+                    }
                     if page == "device-release" {
                         named(&navigate.window, "device-tabs")
                             .unwrap()

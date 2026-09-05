@@ -409,6 +409,7 @@ impl Ui {
         bottom.append(&status);
         let usage_key = button("", "quiet");
         usage_key.set_tooltip_text(Some("Provider usage"));
+        usage_key.set_widget_name("status-usage");
         let usage_meters = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         usage_key.set_child(Some(&usage_meters));
         let devices_key = button("", "quiet");
@@ -515,12 +516,13 @@ impl Ui {
             ("guardrails", "Guardrails", "security-high-symbolic"),
         ] {
             let b = nav_button(caption, icon);
+            b.set_widget_name(&format!("nav-{name}"));
             track_navigation(&ui.content, &b, name);
             nav.append(&b);
             let weak = Rc::downgrade(&ui);
             b.connect_clicked(move |_| {
                 if let Some(ui) = weak.upgrade() {
-                    ui.navigate(name);
+                    ui.toggle_page(name);
                 }
             });
         }
@@ -531,7 +533,7 @@ impl Ui {
             let weak = Rc::downgrade(&ui);
             key.connect_clicked(move |_| {
                 if let Some(ui) = weak.upgrade() {
-                    ui.navigate(page);
+                    ui.toggle_page(page);
                 }
             });
         }
@@ -594,7 +596,11 @@ impl Ui {
             let weak = Rc::downgrade(&ui);
             b.connect_clicked(move |_| {
                 if let Some(ui) = weak.upgrade() {
-                    ui.show_launch(None);
+                    if ui.launch.reveals_child() && !ui.launch_busy.get() {
+                        ui.launch.set_reveal_child(false);
+                    } else {
+                        ui.show_launch(None);
+                    }
                 }
             });
         }
@@ -854,6 +860,10 @@ impl Ui {
             panel.close();
         }
         true
+    }
+    pub fn toggle_page(self: &Rc<Self>, page: &str) {
+        let active = *self.page.borrow() == page;
+        self.navigate(if active { "agents" } else { page });
     }
     pub fn navigate(self: &Rc<Self>, page: &str) {
         if *self.page.borrow() != page && !self.dismiss_panels() {

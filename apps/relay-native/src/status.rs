@@ -74,10 +74,9 @@ impl Ui {
     }
 
     pub fn resources(self: &Rc<Self>) {
-        if !self.dismiss_panels() {
+        let Some(panel) = crate::panel::Panel::toggle(self, "Resources", 460) else {
             return;
-        }
-        let panel = crate::panel::Panel::new(self, "Resources", 460);
+        };
         panel.bottom(260);
         let body = panel.body.clone();
         body.append(&label("Connecting…", "dim"));

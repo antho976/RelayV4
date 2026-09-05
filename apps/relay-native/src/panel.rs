@@ -7,6 +7,7 @@ use std::rc::{Rc, Weak};
 
 pub struct Panel {
     pub body: gtk::Box,
+    title: String,
     modal: Cell<bool>,
     layer: gtk::Overlay,
     frame: gtk::Box,
@@ -21,6 +22,15 @@ pub struct Panel {
 impl Panel {
     pub fn new(ui: &Ui, title: &str, width: i32) -> Rc<Self> {
         Self::build(ui, title, width, &ui.overlay, false)
+    }
+
+    /// Repeated activation closes the current surface before any work is started.
+    pub fn toggle(ui: &Ui, title: &str, width: i32) -> Option<Rc<Self>> {
+        let open = ui.panels.borrow().iter().any(|panel| panel.title == title);
+        if !ui.dismiss_panels() || open {
+            return None;
+        }
+        Some(Self::new(ui, title, width))
     }
 
     pub fn page(ui: &Ui, title: &str) -> Rc<Self> {
@@ -45,6 +55,7 @@ impl Panel {
         frame.set_focusable(true);
         let heading = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         heading.add_css_class("panel-heading");
+        let title_text = title.to_string();
         let title = label(title, "section-title");
         title.set_hexpand(true);
         title.set_ellipsize(gtk::pango::EllipsizeMode::End);
@@ -69,6 +80,7 @@ impl Panel {
         layer.add_overlay(&frame);
         let panel = Rc::new(Self {
             body,
+            title: title_text,
             modal: Cell::new(true),
             layer,
             frame,
