@@ -9,6 +9,7 @@ use serde_json::json;
 use std::collections::BTreeMap;
 
 pub fn register(e: &mut Engine) {
+    crate::provider_updates::register(e);
     e.register_unlocked::<List>(|ctx, _| {
         Ok(ListOut {
             providers: ctx.read(crate::providers::list)?,

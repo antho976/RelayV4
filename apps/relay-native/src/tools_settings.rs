@@ -3,7 +3,32 @@ use crate::app::{button, clear, field, label, rows, text, Ui};
 use gtk::prelude::*;
 use gtk4 as gtk;
 use serde_json::{json, Value};
+use std::cell::RefCell;
 use std::rc::Rc;
+
+pub(crate) struct WallpaperDraft {
+    state: Rc<RefCell<Value>>,
+    saved: Rc<RefCell<Value>>,
+    gallery: glib::WeakRef<gtk::Box>,
+}
+
+pub(crate) fn sync_wallpaper(ui: &Rc<Ui>, image: &Value) {
+    let draft = ui.wallpaper_draft.borrow();
+    let Some(draft) = draft.as_ref() else {
+        return;
+    };
+    if draft.saved.borrow()["wallpaper"] == *image {
+        return;
+    }
+    let dirty = draft.state.borrow()["wallpaper"] != draft.saved.borrow()["wallpaper"];
+    draft.saved.borrow_mut()["wallpaper"] = image.clone();
+    if !dirty {
+        draft.state.borrow_mut()["wallpaper"] = image.clone();
+        if let Some(gallery) = draft.gallery.upgrade() {
+            render_wallpapers(ui, &gallery, &draft.state);
+        }
+    }
+}
 
 pub async fn refresh(ui: &Rc<Ui>, project: i64) {
     if ui.page_projects.borrow().get("settings") == Some(&project) {
@@ -23,6 +48,8 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
             "appearance.wallpaper_dim",
             "appearance.content_contrast",
             "appearance.wallpapers",
+            "appearance.wallpaper",
+            "appearance.wallpaper_rotation",
             "terminal.font_size",
         ] {
             data[path] = ui.call("settings.get", json!({"path":path})).await?["value"].clone();
@@ -43,100 +70,304 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
             return;
         }
     };
+    let wallpapers = Rc::new(RefCell::new(
+        json!({"wallpapers":data["appearance.wallpapers"],"wallpaper":data["appearance.wallpaper"]}),
+    ));
+    let saved_wallpapers = Rc::new(RefCell::new(wallpapers.borrow().clone()));
+    // Keep the saved baseline null so Save persists offered presets, but never
+    // select a wallpaper or replace an explicitly empty/custom library here.
+    wallpapers.borrow_mut()["wallpapers"] =
+        crate::wallpaper_rotation::library_or_defaults(&data["appearance.wallpapers"]);
     let page = &ui.pages["settings"];
     clear(page);
+    page.add_css_class("settings-page");
+    page.set_spacing(0);
     ui.page_projects
         .borrow_mut()
         .insert("settings".into(), project);
-    let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let title = label("Settings", "title");
+    let header = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    header.add_css_class("settings-head");
+    let title = gtk::Box::new(gtk::Orientation::Vertical, 2);
     title.set_hexpand(true);
+    title.append(&label("Settings", "title"));
+    title.append(&label("Relay preferences and local tooling.", "dim"));
     header.append(&title);
-    let reload = button("Reload saved values", "quiet");
+    let search = gtk::SearchEntry::new();
+    search.set_widget_name("settings-search");
+    search.set_placeholder_text(Some("Search settings"));
+    search.set_size_request(230, -1);
+    search.set_valign(gtk::Align::Center);
+    header.append(&search);
+    let reload = button("Save changes", "primary");
+    reload.add_css_class("settings-small-key");
+    let save_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    save_row.append(&crate::icons::image("save", 13));
+    let save_caption = label("Save changes", "");
+    save_row.append(&save_caption);
+    reload.set_child(Some(&save_row));
+    reload.set_widget_name("settings-save");
+    reload.set_valign(gtk::Align::Center);
     header.append(&reload);
     page.append(&header);
+    let target = page.downgrade();
     let weak = Rc::downgrade(ui);
+    let wallpaper_state = wallpapers.clone();
+    let saved_for_save = saved_wallpapers.clone();
     reload.connect_clicked(move |_| {
-        if let Some(ui) = weak.upgrade() {
-            ui.page_projects.borrow_mut().remove("settings");
-            ui.refresh_page();
+        let (Some(ui), Some(page)) = (weak.upgrade(), target.upgrade()) else {
+            return;
+        };
+        let mut settings = Vec::new();
+        let mut notifications = json!({"categories":{}});
+        let mut guardrails = json!({"caps":{},"destructive_write":{}});
+        if let Err(error) = collect_settings(
+            page.upcast_ref(),
+            &mut settings,
+            &mut notifications,
+            &mut guardrails,
+        ) {
+            ui.show_error(&error);
+            return;
         }
+        let wallpaper_snapshot = wallpaper_state.borrow().clone();
+        for field in ["wallpapers", "wallpaper"] {
+            if wallpaper_snapshot[field] != saved_for_save.borrow()[field] {
+                settings.push((
+                    "settings.set",
+                    json!({"path":format!("appearance.{field}"),"value":wallpaper_snapshot[field]}),
+                ));
+            }
+        }
+        let saved_wallpapers = saved_for_save.clone();
+        settings.push(("notify.settings.set", json!({"patch":notifications})));
+        settings.push(("guardrail.config.set", json!({"patch":guardrails})));
+        let save_caption = save_caption.clone();
+        page.set_sensitive(false);
+        save_caption.set_text("Saving…");
+        glib::spawn_future_local(async move {
+            let mut error = None;
+            for (op, payload) in settings {
+                if let Err(e) = ui.call(op, payload).await {
+                    error = Some(e.to_string());
+                    break;
+                }
+            }
+            page.set_sensitive(true);
+            save_caption.set_text("Save changes");
+            if let Some(error) = error {
+                ui.show_error(&error);
+            } else {
+                *saved_wallpapers.borrow_mut() = wallpaper_snapshot;
+                ui.refresh();
+            }
+        });
     });
-    let shell = gtk::Box::new(gtk::Orientation::Horizontal, 16);
+    let shell = gtk::Box::new(gtk::Orientation::Horizontal, 18);
+    shell.add_css_class("settings-body");
+    shell.set_halign(gtk::Align::Start);
+    shell.set_size_request(ui.window.width().clamp(748, 1180), -1);
     let stack = gtk::Stack::new();
     stack.set_hexpand(true);
     stack.set_vexpand(true);
-    let nav = gtk::StackSidebar::new();
-    nav.set_stack(&stack);
-    nav.set_size_request(160, -1);
+    let nav = gtk::Box::new(gtk::Orientation::Vertical, 3);
+    nav.add_css_class("settings-categories");
+    nav.set_size_request(230, -1);
+    nav.set_valign(gtk::Align::Start);
+    let mut first = None::<gtk::ToggleButton>;
+    for (name, title, icon, eyebrow, _, _) in CATEGORIES {
+        let key = gtk::ToggleButton::new();
+        key.add_css_class("settings-category");
+        if let Some(first) = &first {
+            key.set_group(Some(first));
+        } else {
+            first = Some(key.clone());
+        }
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        row.append(&crate::icons::image(icon, 16));
+        let copy = gtk::Box::new(gtk::Orientation::Vertical, 1);
+        copy.append(&label(title, "body"));
+        let hint = match name {
+            "appearance" => "Theme, opacity, wallpaper",
+            "notifications" => "Sounds and categories",
+            "agents" => "Providers and parking",
+            "safety" => "Caps and protected paths",
+            "android" => "SDK and device tools",
+            "keyboard" => "Global shortcuts",
+            _ => eyebrow,
+        };
+        copy.append(&label(hint, "faint"));
+        row.append(&copy);
+        key.set_child(Some(&row));
+        let target = stack.downgrade();
+        key.connect_toggled(move |key| {
+            if key.is_active() {
+                if let Some(stack) = target.upgrade() {
+                    if stack.child_by_name(name).is_some() {
+                        stack.set_visible_child_name(name);
+                    }
+                }
+            }
+        });
+        key.set_active(name == "appearance");
+        nav.append(&key);
+    }
     shell.append(&nav);
     shell.append(&stack);
     page.append(&shell);
 
     let appearance = category(&stack, "appearance", "Appearance");
     appearance.append(&paragraph(
-        "Relay-2 console palettes and native terminal typography.",
+        "Choose a theme and adjust how much wallpaper shows behind your editor and terminals.",
     ));
-    let modes = gtk::ComboBoxText::new();
-    for (id, title) in [("matte", "Matte"), ("dark", "Dark"), ("oled", "OLED")] {
-        modes.append(Some(id), title);
-    }
-    modes.set_active_id(Some(data["appearance.mode"].as_str().unwrap_or("matte")));
-    field("Console palette", &modes, &appearance);
-    let save = button("Apply palette", "primary");
-    appearance.append(&save);
-    let weak = Rc::downgrade(ui);
-    save.connect_clicked(move |key| {if let Some(ui)=weak.upgrade(){ui.mutate("settings.set",json!({"path":"appearance.mode","value":modes.active_id().map(|v|v.to_string()).unwrap_or_else(||"matte".into())}),key);}});
-    setting_number(
-        ui,
-        &appearance,
-        "Terminal font size (points)",
-        "terminal.font_size",
-        data["terminal.font_size"].as_f64().unwrap_or(10.),
-        8.,
-        24.,
-    );
-
-    for (path, title, default, min, max) in [
-        ("appearance.panel_alpha", "Panel opacity", 1., 0.5, 1.),
+    let mode_field = gtk::Box::new(gtk::Orientation::Vertical, 5);
+    mode_field.append(&label("MODE", "section-label"));
+    let modes = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    modes.set_homogeneous(true);
+    let mut first = None::<gtk::ToggleButton>;
+    for (id, title, hint, background, plate) in [
         (
-            "appearance.wallpaper_dim",
-            "Wallpaper dimming",
-            0.28,
-            0.,
-            0.85,
+            "matte",
+            "Matte",
+            "Neutral console around black plates.",
+            (0.055, 0.055, 0.063),
+            (0.039, 0.039, 0.043),
         ),
         (
+            "dark",
+            "Dark",
+            "Cooler, higher contrast.",
+            (0.051, 0.059, 0.071),
+            (0.027, 0.031, 0.039),
+        ),
+        (
+            "oled",
+            "OLED",
+            "True black; the wall disappears.",
+            (0., 0., 0.),
+            (0., 0., 0.),
+        ),
+    ] {
+        let key = gtk::ToggleButton::new();
+        key.add_css_class("settings-mode");
+        key.set_widget_name(&format!("setting:appearance.mode={id}"));
+        if let Some(first) = &first {
+            key.set_group(Some(first));
+        } else {
+            first = Some(key.clone());
+        }
+        let card = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        let swatch = gtk::DrawingArea::new();
+        swatch.set_content_height(28);
+        swatch.set_margin_bottom(4);
+        swatch.set_hexpand(true);
+        swatch.set_draw_func(move |_, cr, w, h| {
+            cr.set_source_rgb(background.0, background.1, background.2);
+            let _ = cr.paint();
+            cr.set_source_rgb(plate.0, plate.1, plate.2);
+            cr.rectangle(
+                5.,
+                5.,
+                (w as f64 * 0.7 - 5.).max(0.),
+                (h - 10).max(0) as f64,
+            );
+            let _ = cr.fill();
+            cr.set_source_rgb(0.22, 0.22, 0.24);
+            cr.set_line_width(1.);
+            cr.rectangle(0.5, 0.5, (w - 1) as f64, (h - 1) as f64);
+            let _ = cr.stroke();
+        });
+        card.append(&swatch);
+        card.append(&label(title, "settings-mode-title"));
+        let copy = label(hint, "faint");
+        copy.set_wrap(true);
+        card.append(&copy);
+        key.set_child(Some(&card));
+        key.set_active(data["appearance.mode"].as_str().unwrap_or("matte") == id);
+        modes.append(&key);
+    }
+    mode_field.append(&modes);
+    appearance.append(&mode_field);
+    let legibility = gtk::Box::new(gtk::Orientation::Horizontal, 16);
+    legibility.set_homogeneous(true);
+    legibility.add_css_class("settings-legibility");
+    for (path, title, default, min, max) in [
+        ("appearance.panel_alpha", "PANEL OPACITY", 1., 0.72, 1.),
+        ("appearance.wallpaper_dim", "WALLPAPER DIM", 0.28, 0., 0.75),
+        (
             "appearance.content_contrast",
-            "Content contrast",
+            "CONTENT PROTECTION",
             0.,
             0.,
             1.,
         ),
     ] {
+        let field_box = gtk::Box::new(gtk::Orientation::Vertical, 5);
+        field_box.set_hexpand(true);
         let input = gtk::Scale::with_range(gtk::Orientation::Horizontal, min, max, 0.01);
+        input.set_widget_name(&format!("setting:{path}"));
         input.set_value(data[path].as_f64().unwrap_or(default));
         input.set_hexpand(true);
-        input.set_draw_value(true);
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        row.append(&input);
-        let save = button("Apply", "quiet");
-        row.append(&save);
-        field(title, &row, &appearance);
-        let weak = Rc::downgrade(ui);
-        save.connect_clicked(move |key| {
-            if let Some(ui) = weak.upgrade() {
-                ui.mutate(
-                    "settings.set",
-                    json!({"path":path,"value":input.value()}),
-                    key,
-                );
-            }
+        input.set_draw_value(false);
+        let caption = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        caption.append(&label(title, "section-label"));
+        let value = label(
+            &format!("{:.0}%", input.value() * 100.),
+            "settings-field-value",
+        );
+        caption.append(&value);
+        input.connect_value_changed(move |input| {
+            value.set_text(&format!("{:.0}%", input.value() * 100.))
         });
+        field_box.append(&caption);
+        field_box.append(&input);
+        if path == "appearance.panel_alpha" {
+            appearance.append(&field_box);
+        } else {
+            legibility.append(&field_box);
+        }
     }
-    wallpaper_library(ui, &appearance, &data["appearance.wallpapers"]);
+    let legibility_group = gtk::Box::new(gtk::Orientation::Vertical, 7);
+    legibility_group.append(&legibility);
+    legibility_group.append(&label("Dim controls the image itself. Content protection strengthens panels independently so text stays readable over bright wallpaper areas.","settings-legibility-copy"));
+    let gallery = wallpaper_library(ui, &appearance, &wallpapers);
+    *ui.wallpaper_draft.borrow_mut() = Some(WallpaperDraft {
+        state: wallpapers.clone(),
+        saved: saved_wallpapers,
+        gallery: gallery.downgrade(),
+    });
+    let rotation = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    rotation.add_css_class("settings-wallpaper-rotation");
+    let enabled = gtk::CheckButton::with_label("Rotate wallpapers randomly");
+    enabled.set_widget_name("setting:appearance.wallpaper_rotation.enabled");
+    enabled.set_active(data["appearance.wallpaper_rotation"]["enabled"] == true);
+    enabled.set_hexpand(true);
+    rotation.append(&enabled);
+    rotation.append(&label("Every", "dim"));
+    let minutes = gtk::SpinButton::with_range(1., 1440., 1.);
+    minutes.set_widget_name("setting:appearance.wallpaper_rotation.interval_minutes");
+    minutes.set_value(
+        data["appearance.wallpaper_rotation"]["interval_minutes"]
+            .as_f64()
+            .unwrap_or(15.)
+            .clamp(1., 1440.),
+    );
+    rotation.append(&minutes);
+    rotation.append(&label("minutes", "dim"));
+    appearance.append(&rotation);
+    appearance.append(&paragraph("Uses your saved library and skips the current image. Add at least two wallpapers to rotate."));
+    appearance.append(&legibility_group);
 
     let agents = category(&stack, "agents", "Agents");
+    setting_number(
+        ui,
+        &agents,
+        "Terminal font size (points)",
+        "terminal.font_size",
+        data["terminal.font_size"].as_f64().unwrap_or(9.75),
+        8.,
+        24.,
+    );
+
     agents.append(&paragraph(
         "Provider discovery, executable overrides and process parking.",
     ));
@@ -172,6 +403,22 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
         json!({}),
     );
     for provider in ["claude", "codex"] {
+        let updates = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        let automatic = gtk::CheckButton::with_label(&format!("Update {provider} at startup"));
+        automatic.set_widget_name(&format!("setting:providers.{provider}.auto_update"));
+        automatic.set_active(data["providers"][provider]["auto_update"] == true);
+        automatic.set_hexpand(true);
+        updates.append(&automatic);
+        let update = button("Update now", "quiet");
+        update.set_widget_name(&format!("provider-update-{provider}"));
+        let weak = Rc::downgrade(ui);
+        update.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                crate::provider_updates::update(&ui, provider);
+            }
+        });
+        updates.append(&update);
+        agents.append(&updates);
         setting_entry(
             ui,
             &agents,
@@ -223,8 +470,10 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
             .position(|s| Some(*s) == data["notifications"]["sound"].as_str())
             .unwrap_or(1) as u32,
     );
+    sound.set_widget_name("notify:sound");
     field("Sound", &sound, &notifications);
     let volume = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0., 1., 0.01);
+    volume.set_widget_name("notify:volume");
     volume.set_value(data["notifications"]["volume"].as_f64().unwrap_or(0.7));
     field("Volume", &volume, &notifications);
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -239,10 +488,6 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
             crate::sounds::play(&ui, sounds[s.selected() as usize], v.value());
         }
     });
-    let save = button("Save audio", "quiet");
-    row.append(&save);
-    let weak = Rc::downgrade(ui);
-    save.connect_clicked(move|key|{if let Some(ui)=weak.upgrade(){ui.mutate("notify.settings.set",json!({"patch":{"sound":sounds[sound.selected() as usize],"volume":volume.value()}}),key);}});
     for category in [
         "agent_done",
         "agent_blocked",
@@ -257,28 +502,8 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
             .unwrap_or(true);
         let check = gtk::CheckButton::with_label(&category.replace('_', " "));
         check.set_active(enabled);
+        check.set_widget_name(&format!("notify:category:{category}"));
         notifications.append(&check);
-        let weak = Rc::downgrade(ui);
-        check.connect_toggled(move |check| {
-            let Some(ui) = weak.upgrade() else {
-                return;
-            };
-            let enabled = check.is_active();
-            let check = check.clone();
-            check.set_sensitive(false);
-            glib::spawn_future_local(async move {
-                if let Err(error) = ui
-                    .call(
-                        "notify.settings.set",
-                        json!({"patch":{"categories":{category:enabled}}}),
-                    )
-                    .await
-                {
-                    ui.show_error(&error.to_string());
-                }
-                check.set_sensitive(true);
-            });
-        });
     }
     let maintenance = category(&stack, "maintenance", "Storage");
     maintenance.append(&paragraph(
@@ -312,67 +537,262 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
     for (name, title, fallback) in crate::shortcuts::DEFAULTS {
         let input = gtk::Entry::new();
         input.set_text(data["keybindings"][name].as_str().unwrap_or(fallback));
+        input.set_widget_name(&format!("setting:keybindings.{name}"));
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         row.append(&input);
-        let save = button("Save", "quiet");
-        row.append(&save);
         field(title, &row, &keyboard);
-        let weak = Rc::downgrade(ui);
-        save.connect_clicked(move |key| {
-            if let Some(ui) = weak.upgrade() {
-                let chord = input.text();
-                if !chord.is_empty() && !crate::shortcuts::valid(&chord) {
-                    ui.show_error("Use a modified key such as Ctrl+K, or leave empty to disable.");
-                    return;
-                }
-                ui.mutate(
-                    "settings.set",
-                    json!({"path":format!("keybindings.{name}"),"value":chord.as_str()}),
-                    key,
-                );
-            }
-        });
     }
     keyboard.append(&paragraph("Escape closes the session sheet. Ctrl+Shift+C / Ctrl+Shift+V copies and pastes in terminals."));
+    let no_results = paragraph("No settings match your search.");
+    no_results.set_visible(false);
+    no_results.set_hexpand(true);
+    no_results.set_valign(gtk::Align::Start);
+    shell.append(&no_results);
+    let mut keys = Vec::new();
+    let mut child = nav.first_child();
+    for (name, ..) in CATEGORIES {
+        let Some(key) = child.take().and_downcast::<gtk::ToggleButton>() else {
+            break;
+        };
+        child = key.next_sibling();
+        let text = stack
+            .child_by_name(name)
+            .map(|page| settings_search_text(&page))
+            .unwrap_or_default();
+        keys.push((name, key, text));
+    }
+    let weak_stack = stack.downgrade();
+    search.connect_search_changed(move |search| {
+        let Some(stack) = weak_stack.upgrade() else {
+            return;
+        };
+        let query = search.text().to_lowercase();
+        let words: Vec<_> = query.split_whitespace().collect();
+        let mut first = None;
+        let mut current_matches = false;
+        for (name, key, text) in &keys {
+            let matches = words.iter().all(|word| text.contains(word));
+            key.set_visible(matches);
+            if matches {
+                first.get_or_insert(key);
+                current_matches |= stack.visible_child_name().as_deref() == Some(*name);
+            }
+        }
+        stack.set_visible(first.is_some());
+        no_results.set_visible(first.is_none());
+        if !current_matches {
+            if let Some(first) = first {
+                first.set_active(true);
+            }
+        }
+    });
 }
 
+fn settings_search_text(widget: &gtk::Widget) -> String {
+    let mut result = String::new();
+    if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+        result.push_str(&label.text());
+    }
+    if widget.widget_name().starts_with("setting:") {
+        result.push_str(&widget.widget_name());
+    }
+    let mut child = widget.first_child();
+    while let Some(widget) = child {
+        result.push(' ');
+        result.push_str(&settings_search_text(&widget));
+        child = widget.next_sibling();
+    }
+    result.to_lowercase()
+}
+
+fn collect_settings(
+    widget: &gtk::Widget,
+    settings: &mut Vec<(&'static str, Value)>,
+    notifications: &mut Value,
+    guardrails: &mut Value,
+) -> Result<(), String> {
+    let name = widget.widget_name();
+    if let Some(path) = name.strip_prefix("setting:") {
+        let value = if let Some(key) = widget.downcast_ref::<gtk::ToggleButton>() {
+            if key.is_active() {
+                let (_, mode) = path.split_once('=').ok_or("Invalid palette control")?;
+                Some(json!(mode))
+            } else {
+                None
+            }
+        } else if let Some(input) = widget.downcast_ref::<gtk::CheckButton>() {
+            Some(json!(input.is_active()))
+        } else if let Some(input) = widget.downcast_ref::<gtk::SpinButton>() {
+            Some(if path == "terminal.font_size" {
+                json!(input.value())
+            } else {
+                json!(input.value_as_int())
+            })
+        } else if let Some(input) = widget.downcast_ref::<gtk::Scale>() {
+            Some(json!(input.value()))
+        } else if let Some(input) = widget.downcast_ref::<gtk::Entry>() {
+            let value = input.text();
+            let value = value.trim();
+            if path.starts_with("keybindings.")
+                && !value.is_empty()
+                && !crate::shortcuts::valid(value)
+            {
+                return Err(format!(
+                    "Invalid shortcut for {}. Use Ctrl+Key notation or leave it empty.",
+                    path.trim_start_matches("keybindings.")
+                ));
+            }
+            Some(if value.is_empty() && !path.starts_with("keybindings.") {
+                Value::Null
+            } else {
+                json!(value)
+            })
+        } else {
+            None
+        };
+        if let Some(value) = value {
+            settings.push((
+                "settings.set",
+                json!({"path":path.split('=').next().unwrap_or(path),"value":value}),
+            ));
+        }
+    } else if name == "notify:sound" {
+        let input = widget.downcast_ref::<gtk::DropDown>().unwrap();
+        notifications["sound"] =
+            json!(["off", "chime", "glass", "pulse", "signal"][input.selected() as usize]);
+    } else if name == "notify:volume" {
+        notifications["volume"] = json!(widget.downcast_ref::<gtk::Scale>().unwrap().value());
+    } else if let Some(category) = name.strip_prefix("notify:category:") {
+        notifications["categories"][category] = json!(widget
+            .downcast_ref::<gtk::CheckButton>()
+            .unwrap()
+            .is_active());
+    } else if let Some(path) = name.strip_prefix("guardrail:") {
+        if let Some(input) = widget.downcast_ref::<gtk::SpinButton>() {
+            let (group, key) = path.split_once('.').ok_or("Invalid guardrail control")?;
+            guardrails[group][key] = if key == "min_removed_pct" {
+                json!(input.value())
+            } else {
+                json!(input.value_as_int())
+            };
+        } else if let Some(input) = widget.downcast_ref::<gtk::TextView>() {
+            let b = input.buffer();
+            let text = b.text(&b.start_iter(), &b.end_iter(), false);
+            guardrails[path] = json!(text
+                .lines()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>());
+        }
+    }
+    let mut child = widget.first_child();
+    while let Some(widget) = child {
+        child = widget.next_sibling();
+        collect_settings(&widget, settings, notifications, guardrails)?;
+    }
+    Ok(())
+}
+
+const CATEGORIES: [(&str, &str, &str, &str, &str, &str); 7] = [
+    (
+        "appearance",
+        "Appearance",
+        "layout",
+        "Visual system",
+        "Make the workspace yours",
+        "Theme, wallpaper, panel density, and safeguards for text over bright images.",
+    ),
+    (
+        "notifications",
+        "Notifications",
+        "bell",
+        "Attention",
+        "Choose what can interrupt you",
+        "Keep high-signal agent events audible and let routine activity stay quiet.",
+    ),
+    (
+        "agents",
+        "Agents",
+        "terminal",
+        "Runtime",
+        "Provider and session behavior",
+        "Local CLI discovery, authentication state, executable overrides, and process parking.",
+    ),
+    (
+        "safety",
+        "Guardrails",
+        "sliders",
+        "Enforcement",
+        "Set hard operating boundaries",
+        "These are typed core limits, not prompt suggestions that an agent can ignore.",
+    ),
+    (
+        "android",
+        "Android",
+        "device",
+        "Android",
+        "Connect the local toolchain",
+        "Relay resolves standard SDK locations first; overrides are for unusual installations.",
+    ),
+    (
+        "keyboard",
+        "Keyboard",
+        "code",
+        "Workflow",
+        "Keep navigation under your hands",
+        "Shortcuts are global, durable, and use familiar Ctrl+Key notation.",
+    ),
+    (
+        "maintenance",
+        "Storage",
+        "folder",
+        "Backups",
+        "Keep a recovery copy",
+        "Create a database backup before major workflow changes.",
+    ),
+];
+
 fn category(stack: &gtk::Stack, name: &str, title: &str) -> gtk::Box {
-    let page = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    let outer = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    if let Some((_, _, icon, eyebrow, heading, hint)) = CATEGORIES.iter().find(|c| c.0 == name) {
+        let hero = gtk::Box::new(gtk::Orientation::Horizontal, 16);
+        hero.add_css_class("settings-hero");
+        let mark = crate::icons::image(icon, 22);
+        mark.add_css_class("settings-hero-icon");
+        mark.set_valign(gtk::Align::Center);
+        mark.set_halign(gtk::Align::Center);
+        hero.append(&mark);
+        let copy = gtk::Box::new(gtk::Orientation::Vertical, 3);
+        copy.append(&label(eyebrow, "section-label"));
+        copy.append(&label(heading, "settings-hero-title"));
+        let hint = paragraph(hint);
+        hint.set_max_width_chars(75);
+        copy.append(&hint);
+        hero.append(&copy);
+        outer.append(&hero);
+    }
+    let page = gtk::Box::new(gtk::Orientation::Vertical, 13);
+    page.add_css_class("settings-panel");
     page.append(&label(title, "title"));
-    let scroll = crate::app::scrolled(&page);
+    outer.append(&page);
+    let scroll = crate::app::scrolled(&outer);
+    scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
     stack.add_titled(&scroll, Some(name), title);
     page
 }
 
-fn setting_entry(ui: &Rc<Ui>, parent: &gtk::Box, title: &str, path: &str, value: &str) {
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+fn setting_entry(_ui: &Rc<Ui>, parent: &gtk::Box, title: &str, path: &str, value: &str) {
     let input = gtk::Entry::builder()
         .text(value)
         .hexpand(true)
         .placeholder_text("Automatic")
         .build();
-    row.append(&input);
-    let save = button("Save", "quiet");
-    row.append(&save);
-    field(title, &row, parent);
-    let weak = Rc::downgrade(ui);
-    let path = path.to_string();
-    save.connect_clicked(move |key| {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        let value = input.text().trim().to_string();
-        let value = if value.is_empty() {
-            Value::Null
-        } else {
-            json!(value)
-        };
-        ui.mutate("settings.set", json!({"path":path,"value":value}), key);
-    });
+    input.set_widget_name(&format!("setting:{path}"));
+    field(title, &input, parent);
 }
 
 fn setting_number(
-    ui: &Rc<Ui>,
+    _ui: &Rc<Ui>,
     parent: &gtk::Box,
     title: &str,
     path: &str,
@@ -380,28 +800,15 @@ fn setting_number(
     min: f64,
     max: f64,
 ) {
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let input = gtk::SpinButton::with_range(min, max, 1.);
+    let fractional = path == "terminal.font_size";
+    let input = gtk::SpinButton::with_range(min, max, if fractional { 0.25 } else { 1. });
+    input.set_digits(if fractional { 2 } else { 0 });
     input.set_value(value);
-    row.append(&input);
-    let save = button("Save", "quiet");
-    row.append(&save);
-    field(title, &row, parent);
-    let weak = Rc::downgrade(ui);
-    let path = path.to_string();
-    save.connect_clicked(move |key| {
-        if let Some(ui) = weak.upgrade() {
-            ui.mutate(
-                "settings.set",
-                json!({"path":path,"value":input.value_as_int()}),
-                key,
-            );
-        }
-    });
+    input.set_widget_name(&format!("setting:{path}"));
+    field(title, &input, parent);
 }
 
-fn guardrails(ui: &Rc<Ui>, page: &gtk::Box, data: &Value) {
-    let mut numbers = Vec::new();
+fn guardrails(_ui: &Rc<Ui>, page: &gtk::Box, data: &Value) {
     for (group, key, title, max) in [
         ("caps", "files", "Maximum changed files", 1_000_000.),
         ("caps", "lines", "Maximum changed lines", 100_000_000.),
@@ -418,17 +825,19 @@ fn guardrails(ui: &Rc<Ui>, page: &gtk::Box, data: &Value) {
             100.,
         ),
     ] {
-        let input = gtk::SpinButton::with_range(0., max, 1.);
+        let fractional = key == "min_removed_pct";
+        let input = gtk::SpinButton::with_range(0., max, if fractional { 0.1 } else { 1. });
+        input.set_digits(if fractional { 2 } else { 0 });
+        input.set_widget_name(&format!("guardrail:{group}.{key}"));
         input.set_value(data[group][key].as_f64().unwrap_or(0.));
         field(title, &input, page);
-        numbers.push((group, key, input));
     }
-    let mut lists = Vec::new();
     for (key, title) in [
         ("protected_paths", "Protected paths, one per line"),
         ("denied_commands", "Denied commands, one per line"),
     ] {
         let view = gtk::TextView::new();
+        view.set_widget_name(&format!("guardrail:{key}"));
         view.set_monospace(true);
         view.set_wrap_mode(gtk::WrapMode::WordChar);
         view.set_top_margin(8);
@@ -449,74 +858,196 @@ fn guardrails(ui: &Rc<Ui>, page: &gtk::Box, data: &Value) {
         scroll.set_min_content_height(110);
         scroll.set_vexpand(false);
         field(title, &scroll, page);
-        lists.push((key, view));
     }
-    let save = button("Save guardrail limits", "primary");
-    page.append(&save);
-    let weak = Rc::downgrade(ui);
-    save.connect_clicked(move |key| {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        let mut patch = json!({"caps":{},"destructive_write":{}});
-        for (group, name, input) in &numbers {
-            patch[*group][*name] = json!(input.value_as_int());
-        }
-        for (name, input) in &lists {
-            let buffer = input.buffer();
-            let content = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
-            patch[*name] = json!(content
-                .lines()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .collect::<Vec<_>>());
-        }
-        ui.mutate("guardrail.config.set", json!({"patch":patch}), key);
-    });
 }
 
-fn wallpaper_library(ui: &Rc<Ui>, parent: &gtk::Box, value: &Value) {
-    let block = section(parent, "Wallpapers");
-    let library = value.as_array().cloned().unwrap_or_default();
+fn wallpaper_library(ui: &Rc<Ui>, parent: &gtk::Box, state: &Rc<RefCell<Value>>) -> gtk::Box {
+    let block = gtk::Box::new(gtk::Orientation::Vertical, 13);
+    parent.append(&block);
+    render_wallpapers(ui, &block, state);
+    block
+}
+
+fn render_wallpapers(ui: &Rc<Ui>, block: &gtk::Box, state: &Rc<RefCell<Value>>) {
+    // Native selection follows the canonical image. Legacy wallpaper_id/preview are unused.
+    clear(block);
+    let library = state.borrow()["wallpapers"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let active = state.borrow()["wallpaper"].clone();
+    let gallery = gtk::FlowBox::new();
+    gallery.set_selection_mode(gtk::SelectionMode::None);
+    gallery.set_min_children_per_line(2);
+    gallery.set_max_children_per_line(5);
+    gallery.set_column_spacing(7);
+    gallery.set_row_spacing(7);
+    gallery.add_css_class("settings-wallpapers");
     for (index, item) in library.iter().enumerate() {
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        row.append(&label(text(item, "name"), "dim"));
-        action(
-            ui,
-            &row,
-            "Use",
-            "settings.set",
-            json!({"path":"appearance.wallpaper","value":item["image"]}),
-        );
-        let remove = button("Remove", "quiet");
-        row.append(&remove);
-        let mut remaining = library.clone();
-        remaining.remove(index);
-        let weak = Rc::downgrade(ui);
-        remove.connect_clicked(move |key| {
-            if let Some(ui) = weak.upgrade() {
-                ui.page_projects.borrow_mut().remove("settings");
-                ui.mutate(
-                    "settings.set",
-                    json!({"path":"appearance.wallpapers","value":remaining}),
-                    key,
-                );
+        let card = gtk::Box::new(gtk::Orientation::Vertical, 5);
+        card.add_css_class("settings-wallpaper");
+        card.set_size_request(132, -1);
+        let pick = gtk::Button::new();
+        pick.add_css_class("quiet");
+        let words = gtk::Box::new(gtk::Orientation::Vertical, 5);
+        if let Some(encoded) = item["preview"]
+            .as_str()
+            .or(item["image"].as_str())
+            .and_then(|s| s.split_once(',').map(|(_, data)| data))
+        {
+            use base64::Engine;
+            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded) {
+                if let Ok(texture) = gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes))
+                {
+                    let picture = gtk::Picture::for_paintable(&texture);
+                    picture.set_content_fit(gtk::ContentFit::Cover);
+                    picture.set_size_request(132, 66);
+                    picture.set_can_shrink(true);
+                    words.append(&picture);
+                }
             }
+        }
+        let name = label(text(item, "name"), "body");
+        name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        words.append(&name);
+        pick.set_child(Some(&words));
+        card.append(&pick);
+        pick.set_widget_name(&format!("settings-wallpaper-pick-{index}"));
+        if item["image"] == active {
+            pick.add_css_class("active");
+        }
+        let weak = Rc::downgrade(ui);
+        let target = block.downgrade();
+        let staged = state.clone();
+        let item = item.clone();
+        pick.connect_clicked(move |_| {
+            let (Some(ui), Some(block)) = (weak.upgrade(), target.upgrade()) else {
+                return;
+            };
+            staged.borrow_mut()["wallpaper"] = item["image"].clone();
+            render_wallpapers(&ui, &block, &staged);
         });
-        block.append(&row);
+        let remove = button("Remove", "quiet");
+        card.append(&remove);
+        let weak = Rc::downgrade(ui);
+        let target = block.downgrade();
+        let staged = state.clone();
+        remove.connect_clicked(move |_| {
+            let (Some(ui), Some(block)) = (weak.upgrade(), target.upgrade()) else {
+                return;
+            };
+            let mut value = staged.borrow_mut();
+            let removed = value["wallpapers"].as_array_mut().unwrap().remove(index);
+            if value["wallpaper"] == removed["image"] {
+                value["wallpaper"] = Value::Null;
+            }
+            drop(value);
+            render_wallpapers(&ui, &block, &staged);
+        });
+        gallery.insert(&card, -1);
     }
-    action(
-        ui,
-        &block,
-        "Clear background",
-        "settings.set",
-        json!({"path":"appearance.wallpaper","value":null}),
+    let wall = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    wall.add_css_class("settings-wallpaper-empty");
+    let current_image = active.as_str().unwrap_or("");
+    let current = library
+        .iter()
+        .find(|item| item["image"].as_str() == Some(current_image));
+    let name = current
+        .and_then(|item| item["name"].as_str())
+        .unwrap_or("Wallpaper");
+    let texture = wallpaper_texture(current_image);
+    let empty = label(
+        if texture.is_some() {
+            name
+        } else {
+            "No wallpaper"
+        },
+        "dim",
     );
+    empty.add_css_class("settings-wallpaper-caption");
+    empty.set_halign(gtk::Align::Center);
+    empty.set_valign(gtk::Align::Center);
+    empty.set_hexpand(true);
+    wall.append(&empty);
+    if let Some(texture) = texture {
+        let preview = gtk::Overlay::new();
+        preview.set_widget_name("settings-wallpaper-preview");
+        let picture = gtk::Picture::for_paintable(&texture);
+        picture.set_content_fit(gtk::ContentFit::Cover);
+        picture.set_can_shrink(true);
+        picture.set_size_request(-1, 140);
+        preview.set_child(Some(&picture));
+        wall.remove_css_class("settings-wallpaper-empty");
+        wall.set_valign(gtk::Align::End);
+        preview.add_overlay(&wall);
+        let open = button("Full preview", "quiet");
+        open.set_widget_name("settings-wallpaper-open");
+        open.set_halign(gtk::Align::End);
+        open.set_valign(gtk::Align::Start);
+        open.set_margin_top(8);
+        open.set_margin_end(8);
+        let weak = Rc::downgrade(ui);
+        let name = name.to_string();
+        open.connect_clicked(move |_| {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let window = gtk::Window::builder()
+                .title(&name)
+                .transient_for(&ui.window)
+                .modal(true)
+                .default_width((ui.window.width() - 80).clamp(480, 1200))
+                .default_height((ui.window.height() - 80).clamp(320, 800))
+                .build();
+            let picture = gtk::Picture::for_paintable(&texture);
+            picture.set_content_fit(gtk::ContentFit::Contain);
+            picture.set_can_shrink(true);
+            window.set_child(Some(&picture));
+            window.present();
+        });
+        preview.add_overlay(&open);
+        block.prepend(&preview);
+    } else {
+        block.prepend(&wall);
+    }
+    let library_head = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let title = label(
+        &format!("WALLPAPER LIBRARY   {}", library.len()),
+        "section-label",
+    );
+    title.set_hexpand(true);
+    library_head.append(&title);
+    block.append(&library_head);
+    if !library.is_empty() {
+        block.append(&gallery);
+    }
+    if active.is_string() {
+        let clear = button("Clear background", "quiet");
+        let weak = Rc::downgrade(ui);
+        let target = block.downgrade();
+        let staged = state.clone();
+        clear.connect_clicked(move |_| {
+            let (Some(ui), Some(block)) = (weak.upgrade(), target.upgrade()) else {
+                return;
+            };
+            staged.borrow_mut()["wallpaper"] = Value::Null;
+            render_wallpapers(&ui, &block, &staged);
+        });
+        block.append(&clear);
+    }
     let add = button("Add wallpaper", "quiet");
-    block.append(&add);
+    add.add_css_class("settings-small-key");
+    let add_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    add_row.append(&crate::icons::image("plus", 12));
+    add_row.append(&label("Add wallpaper", ""));
+    add.set_child(Some(&add_row));
+    library_head.append(&add);
     let weak = Rc::downgrade(ui);
+    let target = block.downgrade();
+    let staged = state.clone();
     add.connect_clicked(move|key|{
-        let Some(ui)=weak.upgrade()else{return;}; let key=key.clone(); key.set_sensitive(false);
+        let (Some(ui),Some(block))=(weak.upgrade(),target.upgrade())else{return;}; let key=key.clone(); key.set_sensitive(false);
+        let staged=staged.clone();
         glib::spawn_future_local(async move{
             let result=async{
                 let dialog=gtk::FileDialog::builder().title("Choose wallpaper").build();
@@ -531,16 +1062,24 @@ fn wallpaper_library(ui: &Rc<Ui>, parent: &gtk::Box, value: &Value) {
                 }).await.map_err(|e|e.to_string())??;
                 use base64::Engine;
                 let image=format!("data:image/jpeg;base64,{}",base64::engine::general_purpose::STANDARD.encode(bytes));
-                let value=ui.call("settings.get",json!({"path":"appearance.wallpapers"})).await.map_err(|e|e.to_string())?;
-                let mut library=value["value"].as_array().cloned().unwrap_or_default();
+                let mut library=staged.borrow()["wallpapers"].as_array().cloned().unwrap_or_default();
                 library.push(json!({"id":uuid::Uuid::new_v4().to_string(),"name":name,"image":image,"preview":image}));
                 if serde_json::to_vec(&library).unwrap_or_default().len()>1500000{return Err("Wallpaper library is full. Remove an image before adding another.".into());}
-                ui.call("settings.set",json!({"path":"appearance.wallpapers","value":library})).await.map_err(|e|e.to_string())?;
-                ui.call("settings.set",json!({"path":"appearance.wallpaper","value":image})).await.map_err(|e|e.to_string())?;
+                staged.borrow_mut()["wallpapers"]=json!(library);
+                staged.borrow_mut()["wallpaper"]=json!(image);
                 Ok::<(),String>(())
             }.await;
-            if let Err(e)=result {ui.show_error(&e);} else {ui.page_projects.borrow_mut().remove("settings");ui.refresh_page();}
+            if let Err(e)=result {ui.show_error(&e);} else {render_wallpapers(&ui,&block,&staged);}
             key.set_sensitive(true);
         });
     });
+}
+
+fn wallpaper_texture(image: &str) -> Option<gtk::gdk::Texture> {
+    use base64::Engine;
+    let (_, encoded) = image.split_once(',')?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)).ok()
 }

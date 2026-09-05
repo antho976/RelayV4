@@ -532,7 +532,7 @@ fn link_commit(
     Ok(())
 }
 
-fn assign_session(ctx: &mut Ctx, name: &str, task: &Task) -> Result<(), BusError> {
+fn assign_session(ctx: &mut Ctx, name: &str, task: &Task) -> Result<Vec<Id>, BusError> {
     let row = sessions::by_name(ctx.tx(), name)?;
     if row.session.project_id != task.project_id {
         return Err(BusError::conflict(
@@ -549,13 +549,8 @@ fn assign_session(ctx: &mut Ctx, name: &str, task: &Task) -> Result<(), BusError
         .bus()?
         .collect::<rusqlite::Result<Vec<_>>>()
         .bus()?;
+    let mut newly_current = Vec::new();
     for id in ids {
-        ctx.tx()
-            .execute(
-                "UPDATE sessions SET task_id=?1,module_id=?2,updated_at=?3 WHERE id=?4",
-                params![task.id, task.module_id, ctx.now, id],
-            )
-            .bus()?;
         let ord: i64 = ctx
             .tx()
             .query_row(
@@ -578,8 +573,18 @@ fn assign_session(ctx: &mut Ctx, name: &str, task: &Task) -> Result<(), BusError
                 params![task.id, id, ord, queue_ord],
             )
             .bus()?;
+        let next: Option<(Id,Option<Id>)> = ctx.tx().query_row(
+            "SELECT t.id,t.module_id FROM task_sessions ts JOIN tasks t ON t.id=ts.task_id WHERE ts.session_id=?1 AND ts.completed_at IS NULL AND t.deleted_at IS NULL AND t.col='active' ORDER BY ts.queue_ord,t.id LIMIT 1",
+            [id],|row|Ok((row.get(0)?,row.get(1)?))).optional().bus()?;
+        if let Some((task_id,module_id)) = next {
+            let changed = ctx.tx().execute(
+                "UPDATE sessions SET task_id=?1,module_id=?2,updated_at=?3 WHERE id=?4
+                 AND (task_id IS NULL OR NOT EXISTS(SELECT 1 FROM tasks WHERE id=sessions.task_id AND deleted_at IS NULL AND col!='done'))",
+                params![task_id,module_id,ctx.now,id]).bus()?;
+            if changed > 0 { newly_current.push(id); }
+        }
     }
-    Ok(())
+    Ok(newly_current)
 }
 
 /// Bump `updated_at` for edits that live in a side table (labels, relations) so the row the
@@ -629,10 +634,14 @@ fn dispatch_task(
             "done tasks cannot be dispatched",
         ));
     }
+    if before.column == Column::InReview {
+        ctx.tx().execute("UPDATE task_sessions SET completed_at=NULL WHERE task_id=?1",[before.id]).bus()?;
+    }
     ctx.tx().execute("UPDATE tasks SET col='active',position=?1,state='dispatched',updated_at=?2 WHERE id=?3",params![next_position(ctx.tx(),before.project_id,Column::Active)?,ctx.now,before.id]).bus()?;
     let active = get_task(ctx.tx(), before.id, false)?;
+    let mut newly_current = Vec::new();
     let name = if let Some(name) = session.take() {
-        assign_session(ctx, &name, &active)?;
+        newly_current = assign_session(ctx, &name, &active)?;
         name
     } else {
         let mut create = create.take().expect("validated");
@@ -650,7 +659,7 @@ fn dispatch_task(
             .name;
         // A create payload may add the second half of a PAIR. Assign both identities to
         // the task so own-task authorization and injected peer context agree.
-        assign_session(ctx, &name, &active)?;
+        newly_current.extend(assign_session(ctx, &name, &active)?);
         name
     };
     let row = sessions::by_name(ctx.tx(), &name)?;
@@ -674,6 +683,13 @@ fn dispatch_task(
     if start {
         if let Some(op) = launch_op {
             ctx.invoke_registered(op, json!({"session":name}))?;
+        }
+        for id in newly_current {
+            if let Some(assigned) = sessions::by_id(ctx.tx(), id)? {
+                if matches!(assigned.session.state, relay_bus::types::SessionState::Idle | relay_bus::types::SessionState::Running | relay_bus::types::SessionState::Blocked) {
+                    if let Some(task_id) = assigned.session.task_id { crate::handlers::session::announce_assignment(ctx, &assigned.session, task_id, false)?; }
+                }
+            }
         }
     }
     let task = get_task(ctx.tx(), active.id, false)?;
@@ -711,6 +727,78 @@ pub fn register(e: &mut Engine) {
         Ok(task)
     });
 
+    e.register::<Activity>(|ctx, p| {
+        let task = get_task(ctx.tx(), p.task_id, false)?;
+        let limit = p.limit.unwrap_or(100).clamp(1, 500) as usize;
+        let mut stmt = ctx
+            .tx()
+            .prepare_cached(
+                "SELECT id FROM audit WHERE project_id = ?1 AND (?3 IS NULL OR id < ?3)
+             AND ((op LIKE 'task.%' AND json_extract(payload, '$.task_id') = ?2)
+               OR (op = 'task.create' AND json_extract(result_summary, '$.id') = ?2)
+               OR json_extract(result_summary, '$.task.id') = ?2)
+             ORDER BY id DESC LIMIT ?4",
+            )
+            .bus()?;
+        let ids = stmt
+            .query_map(
+                params![task.project_id, task.id, p.before_audit, (limit + 1) as i64],
+                |row| row.get::<_, i64>(0),
+            )
+            .bus()?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .bus()?;
+        let next_audit = (ids.len() > limit).then(|| ids[limit - 1]);
+        let history = ids
+            .into_iter()
+            .take(limit)
+            .map(|id| {
+                crate::audit::get(ctx.tx(), id).bus().and_then(|row| {
+                    row.ok_or_else(|| BusError::internal("task audit row disappeared"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut stmt = ctx
+            .tx()
+            .prepare_cached(
+                "SELECT * FROM messages WHERE project_id = ?1 AND re_task = ?2
+             AND (?3 IS NULL OR id < ?3) ORDER BY id DESC LIMIT ?4",
+            )
+            .bus()?;
+        let mut messages = stmt
+            .query_map(
+                params![
+                    task.project_id,
+                    task.id,
+                    p.before_message,
+                    (limit + 1) as i64
+                ],
+                |row| {
+                    Ok(relay_bus::types::Message {
+                        id: row.get("id")?,
+                        project_id: row.get("project_id")?,
+                        from: row.get("from_session")?,
+                        to: row.get("to_spec")?,
+                        text: row.get("text")?,
+                        re_task: row.get("re_task")?,
+                        priority: row.get::<_, i64>("priority")? != 0,
+                        sent_at: row.get("sent_at")?,
+                        acked_at: None,
+                    })
+                },
+            )
+            .bus()?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .bus()?;
+        let next_message = (messages.len() > limit).then(|| messages[limit - 1].id);
+        messages.truncate(limit);
+        Ok(ActivityOut {
+            history,
+            messages,
+            next_audit,
+            next_message,
+        })
+    });
     e.register::<Get>(|ctx, p| get_task(ctx.tx(), p.task_id, false));
 
     e.register::<List>(|ctx, p| {

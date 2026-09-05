@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 /// The schema version this build knows. Bump when appending to [`MIGRATIONS`].
-pub const SCHEMA_VERSION: i64 = 18;
+pub const SCHEMA_VERSION: i64 = 19;
 
 /// Numbered migrations; index 0 brings a fresh DB to `user_version = 1`.
 pub const MIGRATIONS: &[&str] = &[
@@ -354,6 +354,11 @@ pub const MIGRATIONS: &[&str] = &[
       CHECK (publish IN (0,1));
     ALTER TABLE device_runs ADD COLUMN signing TEXT
       CHECK (signing IS NULL OR signing IN ('signed','unsigned','unverified'));
+    "#,
+    // v19 - completion belongs to a participant's assignment, not the shared task alone.
+    r#"
+    ALTER TABLE task_sessions ADD COLUMN completed_at TEXT;
+    ALTER TABLE sessions ADD COLUMN done_pending_stop INTEGER;
     "#,
 ];
 

@@ -611,17 +611,17 @@ fn multi_task_launch_stages_the_queue_and_prompts_each_current_task() {
     }));
     assert_eq!(staged_first["session"]["state"], "created");
     assert_eq!(staged_second["session"]["state"], "created");
-    assert_eq!(staged_second["session"]["task_id"], second["id"]);
+    assert_eq!(staged_second["session"]["task_id"], first["id"]);
 
     ok(&f.engine, "session.spawn", json!({"session":name}));
     wait_until("current-task start prompt", || {
         ok(&f.engine, "session.scrollback", json!({"session":name}))["text"]
-            .as_str().unwrap().contains(&format!("echo:Call session.bootstrap first, then begin current Task #{}", second["id"]))
+            .as_str().unwrap().contains(&format!("echo:Call session.bootstrap first, then begin current Task #{}", first["id"]))
     });
     let brief = ok(&f.engine, "session.brief", json!({"session":name}));
     assert!(brief["text"].as_str().unwrap().contains("assigned_tasks: 2"));
-    assert!(brief["text"].as_str().unwrap().contains(&format!("Task #{} [CURRENT]", second["id"])));
-    assert!(brief["text"].as_str().unwrap().contains(&format!("Task #{} [QUEUED]", first["id"])));
+    assert!(brief["text"].as_str().unwrap().contains(&format!("Task #{} [CURRENT]", first["id"])));
+    assert!(brief["text"].as_str().unwrap().contains(&format!("Task #{} [QUEUED]", second["id"])));
 
     let advanced = f.engine.dispatch(
         Request::new(Actor::agent(&name), "session.done", json!({
@@ -629,17 +629,64 @@ fn multi_task_launch_stages_the_queue_and_prompts_each_current_task() {
         })),
         Door::InProcess,
     ).into_result().unwrap();
-    assert_eq!(advanced["task_id"], first["id"]);
-    assert_eq!(ok(&f.engine, "task.get", json!({"task_id":second["id"]}))["column"], "in_review");
-    assert_eq!(ok(&f.engine, "task.get", json!({"task_id":first["id"]}))["column"], "active");
+    assert_eq!(advanced["task_id"], second["id"]);
+    assert_eq!(ok(&f.engine, "task.get", json!({"task_id":first["id"]}))["column"], "in_review");
+    assert_eq!(ok(&f.engine, "task.get", json!({"task_id":second["id"]}))["column"], "active");
+    let next_prompt = format!("echo:Your current assignment is Task #{}.", second["id"]);
+    assert!(!ok(&f.engine, "session.scrollback", json!({"session":name}))["text"].as_str().unwrap().contains(&next_prompt), "Done must not inject into its own unfinished provider turn");
+    // Providers can emit another tool event while finishing the Done turn. It must
+    // not clear the marker or make that turn's Stop complete the next assignment.
+    ok(&f.engine, "session.report", json!({"session":name,"kind":"tool_use"}));
+    ok(&f.engine, "session.report", json!({"session":name,"kind":"stop"}));
+    assert_eq!(f.engine.store.lock().query_row(
+        "SELECT COUNT(*) FROM notifications WHERE category='agent_done'", [], |row| row.get::<_, i64>(0),
+    ).unwrap(), 1, "the trailing Stop belongs to the first task");
+    assert_eq!(ok(&f.engine, "session.get", json!({"session":name}))["state"], "running");
     wait_until("next-task prompt", || {
         ok(&f.engine, "session.scrollback", json!({"session":name}))["text"]
             .as_str().unwrap().contains(&format!(
-                "echo:Task #{} is recorded for review. Call session.bootstrap, then continue with current Task #{}",
-                second["id"], first["id"],
+                "echo:Your current assignment is Task #{}.",
+                second["id"],
             ))
     });
+    let mail_count: i64 = f.engine.store.lock().query_row(
+        "SELECT COUNT(*) FROM messages WHERE re_task=?1 AND text LIKE 'Your current assignment is Task #%';", [second["id"].as_i64().unwrap()], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(mail_count, 1, "deferred delivery must not duplicate assignment mail");
+    ok(&f.engine, "session.report", json!({"session":name,"kind":"tool_use"}));
+    ok(&f.engine, "session.report", json!({"session":name,"kind":"stop","data":{"message":"Second work finished"}}));
+    let (count, body): (i64, String) = f.engine.store.lock().query_row(
+        "SELECT COUNT(*),MAX(body) FROM notifications WHERE category='agent_done' AND json_extract(link,'$.payload.task_id')=?1", [second["id"].as_i64().unwrap()], |row| Ok((row.get(0)?,row.get(1)?)),
+    ).unwrap();
+    assert_eq!((count,body),(1,"Second work finished".into()));
     ok(&f.engine, "session.close", json!({"session":name}));
+}
+
+#[test]
+fn unassigned_done_stop_marker_is_consumed_once_and_reset_on_session_start() {
+    let f = fixture();
+    let created = ok(&f.engine, "session.create", json!({"project_id":1,"provider":"claude"}));
+    let name = created["name"].as_str().unwrap();
+    let report = |kind: &str| ok(&f.engine, "session.report", json!({"session":name,"kind":kind}));
+    let complete = || f.engine.dispatch(Request::new(Actor::agent(name), "session.done", json!({"session":name,"summary":"Finished"})), Door::InProcess).into_result().unwrap();
+    let unread = || ok(&f.engine,"notify.list",json!({"unread_only":true}))["notifications"].as_array().unwrap().clone();
+    let ack = || { for notification in unread() { ok(&f.engine,"notify.ack",json!({"notification_id":notification["id"]})); } };
+    report("session_start");
+    complete();
+    ack();
+    report("tool_use");
+    report("stop");
+    assert!(unread().is_empty(), "acknowledged Done must not be resent by its trailing Stop");
+    report("tool_use");
+    report("stop");
+    assert_eq!(unread().len(),1,"marker must be consumed, allowing a later real turn completion");
+    ack();
+    complete();
+    ack();
+    report("session_start");
+    report("stop");
+    assert_eq!(unread().len(),1,"a fresh provider session must not inherit an old pending Stop");
+    ok(&f.engine,"session.close",json!({"session":name}));
 }
 
 #[test]
@@ -899,4 +946,42 @@ fn pair_sessions_share_checkout_and_teardown_safely() {
     assert!(ok(&f.engine, "session.get", json!({"session": second_builder_name}))["pair_with"].is_null());
     ok(&f.engine, "session.close", json!({"session": second_builder_name}));
     assert!(!worktree.exists());
+}
+
+#[test]
+fn review_group_keeps_shared_worktree_until_every_participant_finishes_then_advances_fifo() {
+    let f = fixture();
+    let first = ok(&f.engine,"task.create",json!({"project_id":1,"title":"First group task"}));
+    let second = ok(&f.engine,"task.create",json!({"project_id":1,"title":"Second group task"}));
+    let b1 = ok(&f.engine,"session.create",json!({"project_id":1,"provider":"codex","role":"builder"}));
+    let reviewer = ok(&f.engine,"session.create",json!({"project_id":1,"provider":"codex","role":"reviewer","pair_with":b1["name"]}));
+    let b2 = ok(&f.engine,"session.create",json!({"project_id":1,"provider":"codex","role":"builder","pair_with":reviewer["name"]}));
+    let names: Vec<_> = [&b1,&b2,&reviewer].into_iter().map(|s|s["name"].as_str().unwrap().to_string()).collect();
+    for task in [&first,&second] { ok(&f.engine,"task.dispatch",json!({"task_id":task["id"],"session":names[0],"start":false})); }
+    let current = |name: &str| ok(&f.engine,"session.get",json!({"session":name}))["task_id"].clone();
+    let done = |name: &str,status: &str| f.engine.dispatch(Request::new(Actor::agent(name),"session.done",json!({"session":name,"status":status,"summary":"fixture report","blockers":if status == "completed" {vec![]} else {vec!["fixture blocker"]}})),Door::InProcess);
+    for name in &names { assert_eq!(current(name),first["id"],"staging must preserve FIFO current"); }
+    assert_eq!(code(done(&names[2],"completed")),"session.review_not_ready");
+    done(&names[0],"completed").into_result().unwrap();
+    // A repeated report before the barrier cannot count as the other builder's work.
+    done(&names[0],"completed").into_result().unwrap();
+    assert_eq!(ok(&f.engine,"task.get",json!({"task_id":first["id"]}))["column"],"active");
+    for name in &names { assert_eq!(current(name),first["id"]); }
+    done(&names[1],"partial").into_result().unwrap();
+    assert_eq!(ok(&f.engine,"task.get",json!({"task_id":first["id"]}))["state"],"blocked");
+    done(&names[1],"completed").into_result().unwrap();
+    assert_eq!(ok(&f.engine,"task.get",json!({"task_id":first["id"]}))["column"],"in_review");
+    for name in &names { assert_eq!(current(name),first["id"],"review must retain a stable shared worktree"); }
+    let mail = ok(&f.engine,"mailbox.list",json!({"project_id":1,"session":names[2]}));
+    assert_eq!(mail["messages"].as_array().unwrap().iter().filter(|m|m["re_task"] == first["id"] && m["text"].as_str().unwrap().starts_with("All builders finished")).count(),1);
+    done(&names[2],"blocked").into_result().unwrap();
+    for name in &names { assert_eq!(current(name),first["id"]); }
+    done(&names[2],"completed").into_result().unwrap();
+    for name in &names {
+        assert_eq!(current(name),second["id"]);
+        let mail = ok(&f.engine,"mailbox.list",json!({"project_id":1,"session":name}));
+        assert_eq!(mail["messages"].as_array().unwrap().iter().filter(|m|m["re_task"] == second["id"] && m["text"].as_str().unwrap().starts_with("Your current assignment")).count(),1,"each participant must get a durable next assignment");
+    }
+    // A new taskless Done after this point names the new current task by contract.
+    // Only reusing the original req_id is replay-idempotent across an advancement.
 }

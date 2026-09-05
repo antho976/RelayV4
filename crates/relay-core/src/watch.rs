@@ -37,7 +37,12 @@ pub(crate) fn ensure_after_commit(
         if engine.watchers.lock().unwrap().contains_key(&key) {
             return;
         }
-        if !engine.watcher_registrations.lock().unwrap().insert(key.clone()) {
+        if !engine
+            .watcher_registrations
+            .lock()
+            .unwrap()
+            .insert(key.clone())
+        {
             return;
         }
         let thread_engine = engine.clone();
@@ -65,10 +70,16 @@ pub fn ensure(engine: &Engine, root: &Path, project_id: relay_bus::types::Id) {
     let watcher: notify::Result<RecommendedWatcher> =
         notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
             let Ok(event) = event else { return };
-            if event
-                .paths
-                .iter()
-                .all(|path| is_generated_path(&callback_root, path))
+            // Refreshing the tree and Git state reads these same watched files.
+            // Access notifications must not turn one mutation into an idle refresh loop.
+            if matches!(event.kind, notify::EventKind::Access(_)) && !event.need_rescan() {
+                return;
+            }
+            if (!event.need_rescan()
+                && event
+                    .paths
+                    .iter()
+                    .all(|path| is_generated_path(&callback_root, path)))
                 || pending_cb.swap(true, Ordering::SeqCst)
             {
                 return;
@@ -106,7 +117,10 @@ pub fn ensure(engine: &Engine, root: &Path, project_id: relay_bus::types::Id) {
     };
     engine.watcher_registrations.lock().unwrap().remove(&key);
     if registered {
-        engine.emit_system("file.changed", json!({"project_id": project_id, "worktree": root.display().to_string()}));
+        engine.emit_system(
+            "file.changed",
+            json!({"project_id": project_id, "worktree": root.display().to_string()}),
+        );
     }
 }
 
@@ -135,6 +149,78 @@ pub(crate) fn is_generated_path(root: &Path, path: &Path) -> bool {
 mod tests {
     use super::is_generated_path;
     use std::path::Path;
+
+    #[tokio::test]
+    async fn reading_the_tree_does_not_refresh_it_but_writing_does() {
+        use std::time::Duration;
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("source.txt");
+        std::fs::write(&file, "before").unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["add", "."],
+            vec![
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@relay.test",
+                "commit",
+                "-qm",
+                "Fixture",
+            ],
+        ] {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(directory.path())
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let engine =
+            crate::Engine::new(crate::Instance::Test, crate::Store::open_memory().unwrap());
+        let mut events = engine.subscribe();
+        super::ensure(&engine, directory.path(), 1);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), events.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .ev,
+            "file.changed"
+        );
+        for _ in 0..10 {
+            std::fs::read(&file).unwrap();
+            std::fs::read_dir(directory.path())
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(std::process::Command::new("git")
+                .env("GIT_OPTIONAL_LOCKS", "0")
+                .arg("-C")
+                .arg(directory.path())
+                .args(["status", "--porcelain"])
+                .output()
+                .unwrap()
+                .status
+                .success());
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(400), events.recv())
+                .await
+                .is_err(),
+            "Read-only refresh caused another refresh"
+        );
+        std::fs::write(&file, "after").unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), events.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .ev,
+            "file.changed"
+        );
+    }
 
     #[test]
     fn generated_build_paths_do_not_refresh_the_code_workspace() {

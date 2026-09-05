@@ -337,6 +337,46 @@ fn branch_create_validates_names_reports_conflicts_and_survives_repeated_dispatc
 }
 
 #[test]
+fn branch_switch_keeps_dirty_and_session_owned_checkouts() {
+    let e = engine();
+    let (ws, repo) = real_repo();
+    add_project(&e, &ws, &repo);
+    let root = std::path::Path::new(&repo);
+    git(root, &["branch", "feature/switch"]);
+    call(&e, "git.branch.switch", json!({"project_id":1,"name":"feature/switch"})).into_result().unwrap();
+    assert_eq!(call(&e,"git.status",json!({"project_id":1})).into_result().unwrap()["branch"],"feature/switch");
+    std::fs::write(root.join("README.md"), "keep dirty text").unwrap();
+    assert_eq!(err(&call(&e,"git.branch.switch",json!({"project_id":1,"name":"main"}))).code,"git.checkout_dirty");
+    assert_eq!(std::fs::read_to_string(root.join("README.md")).unwrap(),"keep dirty text");
+    git(root, &["add", "README.md"]);
+    git(root, &["commit", "-m", "save"]);
+    let session = call(&e,"session.create",json!({"project_id":1,"provider":"codex","worktree":"primary"})).into_result().unwrap();
+    assert_eq!(session["worktree"], repo);
+    assert_eq!(err(&call(&e,"git.branch.switch",json!({"project_id":1,"name":"main"}))).code,"git.checkout_session_owned");
+}
+
+#[test]
+fn branch_switch_preserves_ignored_files_that_target_would_overwrite() {
+    let e = engine();
+    let (ws, repo) = real_repo();
+    add_project(&e, &ws, &repo);
+    let root=std::path::Path::new(&repo);
+    std::fs::write(root.join(".gitignore"), "private.bin\n").unwrap();
+    git(root, &["add", ".gitignore"]);
+    git(root, &["commit", "-m", "Ignore local file"]);
+    git(root, &["switch", "-c", "feature/tracked"]);
+    std::fs::write(root.join("private.bin"), "tracked on target").unwrap();
+    git(root, &["add", "-f", "private.bin"]);
+    git(root, &["commit", "-m", "Target file"]);
+    git(root, &["switch", "main"]);
+    std::fs::write(root.join("private.bin"), "personal ignored data").unwrap();
+    let result=call(&e,"git.branch.switch",json!({"project_id":1,"name":"feature/tracked"}));
+    assert_eq!(err(&result).code,"git.branch_switch_failed");
+    assert_eq!(std::fs::read_to_string(root.join("private.bin")).unwrap(),"personal ignored data");
+    assert_eq!(call(&e,"git.status",json!({"project_id":1})).into_result().unwrap()["branch"],"main");
+}
+
+#[test]
 fn branch_listing_follows_the_selected_worktree_and_delete_keeps_unsafe_branches() {
     let e = engine();
     let (ws, repo) = real_repo();
@@ -375,6 +415,12 @@ fn branch_listing_follows_the_selected_worktree_and_delete_keeps_unsafe_branches
         json!({"project_id":1,"name":"feature/secondary"}),
     );
     assert_eq!(err(&checked_out).code, "git.branch_checked_out");
+    for dry_run in [true, false] {
+        let cleaned = call(&e, "git.branch.clean_merged", json!({"project_id":1,"dry_run":dry_run}))
+            .into_result().unwrap();
+        assert!(!cleaned["deleted"].as_array().unwrap().iter().any(|name| name == "feature/secondary"));
+    }
+    assert!(linked.exists());
 
     git(repo_path, &["worktree", "remove", linked.to_str().unwrap()]);
     call(
@@ -552,4 +598,47 @@ fn file_save_expectation_rejects_stale_content_and_deleted_files() {
     )
     .into_result()
     .unwrap();
+}
+
+#[test]
+fn filesystem_reads_do_not_retrigger_refresh_but_writes_do() {
+    use std::time::{Duration, Instant};
+    let e = engine();
+    let (ws, repo) = real_repo();
+    add_project(&e, &ws, &repo);
+    let mut events = e.subscribe();
+    call(&e, "file.tree", json!({"project_id":1,"depth":1}))
+        .into_result()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if events.try_recv().is_ok_and(|event| event.ev == "file.changed") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "watcher did not register");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(250));
+    while events.try_recv().is_ok() {}
+    for _ in 0..3 {
+        call(&e, "file.tree", json!({"project_id":1,"depth":1}))
+            .into_result().unwrap();
+        call(&e, "file.read", json!({"project_id":1,"path":"README.md"}))
+            .into_result().unwrap();
+        call(&e, "git.status", json!({"project_id":1}))
+            .into_result().unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(350));
+    while let Ok(event) = events.try_recv() {
+        assert_ne!(event.ev, "file.changed", "read-only refresh retriggered watcher");
+    }
+    std::fs::write(std::path::Path::new(&repo).join("README.md"), "changed\n").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if events.try_recv().is_ok_and(|event| event.ev == "file.changed") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "real write did not invalidate files");
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }

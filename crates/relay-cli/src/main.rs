@@ -182,6 +182,11 @@ async fn run(cli: Cli) -> Result<u8> {
     let instance = Instance::parse(&cli.instance).ok_or_else(|| anyhow!("bad --instance {:?}", cli.instance))?;
     match cli.cmd {
         Command::Serve { store } => {
+            // The engine outlives launcher worktrees. Git libraries and remote helpers
+            // still consult process CWD even when given absolute repository paths.
+            let store = store.map(std::path::absolute).transpose()?;
+            let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
+            std::env::set_current_dir(&home).context("entering the engine home directory")?;
             tracing_subscriber::fmt()
                 .with_env_filter(tracing_subscriber::EnvFilter::try_from_env("RELAY_LOG").unwrap_or_else(|_| "info".into()))
                 .init();

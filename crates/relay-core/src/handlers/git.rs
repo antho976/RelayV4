@@ -37,7 +37,9 @@ pub fn worktree_owners(
     project_id: relay_bus::types::Id,
 ) -> Result<Vec<(String, String)>, BusError> {
     let mut st = conn
-        .prepare_cached("SELECT name, worktree FROM sessions WHERE project_id = ?1 AND state != 'closed'")
+        .prepare_cached(
+            "SELECT name, worktree FROM sessions WHERE project_id = ?1 AND state != 'closed'",
+        )
         .bus()?;
     let owners = st
         .query_map([project_id], |r| {
@@ -77,7 +79,7 @@ pub fn list_with_owners(
     worktrees_owned_by(&owners, repo, include_dirty)
 }
 
-/// How long `gh pr list` may take before Relay stops waiting on the network.
+/// How long the paginated GitHub lookup may take before Relay stops waiting on the network.
 const PR_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub fn register(e: &mut Engine) {
@@ -344,10 +346,15 @@ pub fn register(e: &mut Engine) {
                 format!("branch {name} already exists"),
             ));
         }
-        let start = p.start_point.as_deref().map(str::trim).filter(|value| !value.is_empty());
+        let start = p
+            .start_point
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
         if let Some(revision) = start {
-            repo.rev_parse_single(revision)
-                .map_err(|_| BusError::invalid("git.start_point", format!("unknown start point {revision}")))?;
+            repo.rev_parse_single(revision).map_err(|_| {
+                BusError::invalid("git.start_point", format!("unknown start point {revision}"))
+            })?;
         }
         let mut args = if p.checkout.unwrap_or(true) {
             vec!["switch", "-c", name.as_str()]
@@ -361,7 +368,29 @@ pub fn register(e: &mut Engine) {
         let repo = gix::open(&root).map_err(gix_err("git.open_failed"))?;
         let head = repo.head_id().map_err(gix_err("git.head"))?.to_string();
         changed(ctx, project.id, &root);
-        Ok(BranchCreateOut { name, head, worktree: root.display().to_string() })
+        Ok(BranchCreateOut {
+            name,
+            head,
+            worktree: root.display().to_string(),
+        })
+    });
+    e.register::<BranchSwitch>(|ctx: &mut Ctx, p| {
+        let (project, root) = resolve_root(ctx, p.project_id, p.worktree.as_deref())?;
+        let name = validate_branch_name(&root, &p.name)?;
+        let owned: bool = ctx.tx().query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE project_id=?1 AND worktree=?2 AND state!='closed')",
+            rusqlite::params![project.id, root.to_string_lossy()], |row| row.get(0),
+        ).bus()?;
+        if owned { return Err(BusError::conflict("git.checkout_session_owned", "This checkout belongs to a live session; select another checkout")); }
+        if !status_files(&root)?.is_empty() {
+            return Err(BusError::conflict("git.checkout_dirty", "Commit or discard checkout changes before switching branches"));
+        }
+        let repo = gix::open(&root).map_err(gix_err("git.open_failed"))?;
+        repo.find_reference(format!("refs/heads/{name}").as_str())
+            .map_err(|_| BusError::not_found("git.branch_not_found", format!("no local branch {name}")))?;
+        worktree::git_mutate(&root, &["switch", "--no-overwrite-ignore", "--", &name]).map_err(git_mutation("git.branch_switch_failed"))?;
+        changed(ctx, project.id, &root);
+        Ok(relay_bus::Empty {})
     });
     e.register::<BranchDelete>(|ctx: &mut Ctx, p| {
         let project = get_project(ctx.tx(), p.project_id)?;
@@ -378,7 +407,9 @@ pub fn register(e: &mut Engine) {
             .branches
             .iter()
             .find(|branch| branch.name == name)
-            .ok_or_else(|| BusError::not_found("git.branch_not_found", format!("no local branch {name}")))?;
+            .ok_or_else(|| {
+                BusError::not_found("git.branch_not_found", format!("no local branch {name}"))
+            })?;
         if let Some(session) = &branch.session {
             return Err(BusError::conflict(
                 "git.branch_session_owned",
@@ -499,8 +530,7 @@ pub fn register(e: &mut Engine) {
     e.register_staged::<Fetch, _>(
         |ctx, p| {
             let project = ctx.read(|conn| get_project(conn, p.project_id))?;
-            worktree::git_mutate(Path::new(&project.path), &["fetch", "--all", "--prune"])
-                .map_err(git_mutation("git.fetch_failed"))?;
+            fetch_remote(Path::new(&project.path))?;
             let repo = gix::open(&project.path).map_err(gix_err("git.open_failed"))?;
             let branch = repo
                 .head_name()
@@ -545,37 +575,7 @@ pub fn register(e: &mut Engine) {
     e.register_unlocked::<PrList>(|ctx, p| {
         let project = ctx.read(|conn| get_project(conn, p.project_id))?;
         let gh = crate::github::gh_path()?;
-        let mut command = std::process::Command::new(gh);
-        command.current_dir(&project.path).args([
-            "pr",
-            "list",
-            "--state",
-            "open",
-            "--limit",
-            "100",
-            "--json",
-            "number,headRefName,isDraft,url,title",
-        ]);
-        // `gh` talks to github.com. An unbounded wait on a flaky network used to be an unbounded
-        // wait for every other bus op behind it; the lock is gone now, but the caller still gets
-        // an answer either way (D144).
-        let out = crate::proc::output_with_timeout(&mut command, PR_LIST_TIMEOUT)
-            .map_err(|error| BusError::unavailable("git.pr_list_failed", error.to_string()))?
-            .ok_or_else(|| {
-                BusError::unavailable(
-                    "git.pr_list_timeout",
-                    format!("gh did not answer within {}s", PR_LIST_TIMEOUT.as_secs()),
-                )
-            })?;
-        if !out.status.success() {
-            return Err(BusError::unavailable(
-                "git.pr_list_failed",
-                String::from_utf8_lossy(&out.stderr).trim().to_string(),
-            ));
-        }
-        Ok(PrListOut {
-            pull_requests: decode_pull_requests(&out.stdout)?,
-        })
+        list_pull_requests(&gh, Path::new(&project.path))
     });
     e.register::<PrOpen>(|ctx: &mut Ctx, p| {
         let (project, root) = resolve_root(ctx, p.project_id, p.worktree.as_deref())?;
@@ -607,11 +607,17 @@ pub fn register(e: &mut Engine) {
     e.register::<CleanMerged>(|ctx: &mut Ctx, p| {
         let project = get_project(ctx.tx(), p.project_id)?;
         let branches = branches_for(ctx.tx(), &project)?;
+        let checked_out = worktree::list(Path::new(&project.path))
+            .map_err(|error| BusError::unavailable("worktree.list_failed", error.to_string()))?;
         let candidates: Vec<String> = branches
             .branches
             .into_iter()
             .filter(|b| {
-                b.merged && !b.current && b.session.is_none() && b.name != project.base_branch
+                b.merged
+                    && !b.current
+                    && b.session.is_none()
+                    && b.name != project.base_branch
+                    && !checked_out.iter().any(|worktree| worktree.branch == b.name)
             })
             .map(|b| b.name)
             .collect();
@@ -741,9 +747,8 @@ fn resolve_root_unlocked(
     requested: Option<&str>,
 ) -> Result<(relay_bus::types::Project, PathBuf), BusError> {
     let session_id = ctx.actor_session_id();
-    let (project, chosen) = ctx.read(|conn| {
-        crate::handlers::file::root_choice(conn, session_id, project_id, requested)
-    })?;
+    let (project, chosen) = ctx
+        .read(|conn| crate::handlers::file::root_choice(conn, session_id, project_id, requested))?;
     let chosen = crate::handlers::file::root_verify(&project, chosen, "git.worktree")?;
     Ok((project, chosen))
 }
@@ -865,12 +870,15 @@ fn commit_from_gix(c: gix::Commit<'_>) -> Result<Commit, BusError> {
         refs: Vec::new(),
     })
 }
-fn upstream_metrics(repo: &gix::Repository, branch: &str) -> (Option<String>, i64, i64) {
+fn upstream_metrics(
+    repo: &gix::Repository,
+    branch: &str,
+) -> (Option<String>, Option<i64>, Option<i64>) {
     let Ok(reference) = repo.find_reference(branch) else {
-        return (None, 0, 0);
+        return (None, None, None);
     };
     let Some(Ok(name)) = reference.remote_tracking_ref_name(gix::remote::Direction::Fetch) else {
-        return (None, 0, 0);
+        return (None, None, None);
     };
     let display = name
         .as_bstr()
@@ -878,47 +886,207 @@ fn upstream_metrics(repo: &gix::Repository, branch: &str) -> (Option<String>, i6
         .trim_start_matches("refs/remotes/")
         .to_string();
     let Ok(upstream) = repo.find_reference(name.as_bstr()) else {
-        return (Some(display), 0, 0);
+        return (Some(display), None, None);
     };
-    let local = reference.id().detach();
-    let remote = upstream.id().detach();
-    let ahead = repo
-        .rev_walk([local])
-        .with_hidden([remote])
-        .all()
-        .map(|w| w.filter(Result::is_ok).count() as i64)
-        .unwrap_or(0);
-    let behind = repo
-        .rev_walk([remote])
-        .with_hidden([local])
-        .all()
-        .map(|w| w.filter(Result::is_ok).count() as i64)
-        .unwrap_or(0);
-    (Some(display), ahead, behind)
+    let (Some(local), Some(remote)) = (reference.try_id(), upstream.try_id()) else {
+        return (Some(display), None, None);
+    };
+    let counts = divergence(repo, local.detach(), remote.detach());
+    (Some(display), counts.map(|v| v.0), counts.map(|v| v.1))
+}
+
+fn divergence(
+    repo: &gix::Repository,
+    local: gix::ObjectId,
+    remote: gix::ObjectId,
+) -> Option<(i64, i64)> {
+    let count = |from, hidden| {
+        repo.rev_walk([from])
+            .with_hidden([hidden])
+            .all()
+            .ok()?
+            .try_fold(0_i64, |count, item| item.ok().map(|_| count + 1))
+    };
+    Some((count(local, remote)?, count(remote, local)?))
+}
+
+/// Bounded network preflight, called outside the store transaction.
+pub fn fetch_remote(root: &Path) -> Result<(), BusError> {
+    let mut command = std::process::Command::new("git");
+    command
+        .current_dir(root)
+        .args(["fetch", "--all", "--prune"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null());
+    let output = crate::proc::output_with_timeout(&mut command, std::time::Duration::from_secs(20))
+        .map_err(|error| BusError::unavailable("git.fetch_failed", error.to_string()))?
+        .ok_or_else(|| {
+            BusError::unavailable(
+                "git.fetch_timeout",
+                "Fetch timed out; cached refs are still available",
+            )
+        })?;
+    if !output.status.success() {
+        return Err(BusError::unavailable(
+            "git.fetch_failed",
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Start at the fetched upstream only when it contains every local base commit.
+/// This never moves the existing base branch or changes its working tree.
+pub fn new_worktree_base(root: &Path, base: &str) -> Option<String> {
+    if base.is_empty() {
+        return None;
+    }
+    let repo = gix::open(root).ok()?;
+    let local = repo.find_reference(base).ok()?;
+    let fallback = Some(base.to_owned());
+    let Some(Ok(name)) = local.remote_tracking_ref_name(gix::remote::Direction::Fetch) else {
+        return fallback;
+    };
+    let Ok(remote) = repo.find_reference(name.as_bstr()) else {
+        return fallback;
+    };
+    let (Some(local), Some(remote)) = (local.try_id(), remote.try_id()) else {
+        return fallback;
+    };
+    if repo
+        .merge_base(local.detach(), remote.detach())
+        .ok()
+        .is_some_and(|id| id.detach() == local.detach())
+    {
+        Some(name.as_bstr().to_string())
+    } else {
+        fallback
+    }
+}
+
+/// Cached Git context only: generating a brief must never make a network request.
+pub fn briefing_state(root: &Path, branch: &str, base: &str) -> String {
+    let Ok(repo) = gix::open(root) else {
+        return "git: unavailable".into();
+    };
+    let (upstream, ahead, behind) = upstream_metrics(&repo, branch);
+    let (base_upstream, base_ahead, base_behind) = upstream_metrics(&repo, base);
+    let count = |value: Option<i64>| {
+        value
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "unknown".into())
+    };
+    let base_counts = repo.rev_parse_single(branch).ok().and_then(|local| {
+        repo.rev_parse_single(base)
+            .ok()
+            .and_then(|remote| divergence(&repo, local.detach(), remote.detach()))
+    });
+    let fetched = std::fs::metadata(repo.common_dir().join("FETCH_HEAD"))
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|time| time.elapsed().ok())
+        .map(|age| {
+            format!(
+                "FETCH_HEAD updated {}s ago; cached snapshot, not proof of a successful fetch",
+                age.as_secs()
+            )
+        })
+        .unwrap_or_else(|| "unknown; offline cached refs only".into());
+    format!(
+        "git_upstream: {}\ngit_ahead: {}\ngit_behind: {}\ngit_base: {}\ngit_base_ahead: {}\ngit_base_behind: {}\ngit_base_upstream: {}\ngit_base_upstream_ahead: {}\ngit_base_upstream_behind: {}\ngit_last_fetch: {}",
+        upstream.as_deref().unwrap_or("none"),
+        count(ahead),
+        count(behind),
+        base,
+        count(base_counts.map(|v| v.0)),
+        count(base_counts.map(|v| v.1)),
+        base_upstream.as_deref().unwrap_or("none"),
+        count(base_ahead),
+        count(base_behind),
+        fetched
+    )
 }
 
 #[derive(Deserialize)]
 struct GhPullRequest {
     number: u64,
-    #[serde(rename = "headRefName")]
-    branch: String,
-    #[serde(rename = "isDraft")]
+    head: GhBranch,
+    base: GhBranch,
+    #[serde(default)]
     draft: bool,
-    url: String,
+    html_url: String,
     title: String,
+    state: String,
+    merged_at: Option<String>,
+}
+#[derive(Deserialize)]
+struct GhBranch {
+    #[serde(rename = "ref")]
+    branch: String,
+    repo: Option<GhRepo>,
+}
+#[derive(Deserialize)]
+struct GhRepo {
+    full_name: String,
+}
+
+fn list_pull_requests(gh: &Path, root: &Path) -> Result<PrListOut, BusError> {
+    let mut command = std::process::Command::new(gh);
+    command.current_dir(root).args([
+        "api",
+        "--paginate",
+        "--slurp",
+        "repos/{owner}/{repo}/pulls?state=all&per_page=100&sort=updated&direction=desc",
+    ]);
+    // `gh` talks to github.com. An unbounded wait on a flaky network used to be an unbounded
+    // wait for every other bus op behind it; the lock is gone now, but the caller still gets
+    // an answer either way (D144).
+    let out = crate::proc::output_with_timeout(&mut command, PR_LIST_TIMEOUT)
+        .map_err(|error| BusError::unavailable("git.pr_list_failed", error.to_string()))?
+        .ok_or_else(|| {
+            BusError::unavailable(
+                "git.pr_list_timeout",
+                format!("gh did not answer within {}s", PR_LIST_TIMEOUT.as_secs()),
+            )
+        })?;
+    if !out.status.success() {
+        return Err(BusError::unavailable(
+            "git.pr_list_failed",
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ));
+    }
+    Ok(PrListOut {
+        pull_requests: decode_pull_requests(&out.stdout)?,
+        complete: true,
+    })
 }
 
 fn decode_pull_requests(bytes: &[u8]) -> Result<Vec<PullRequest>, BusError> {
-    let rows: Vec<GhPullRequest> = serde_json::from_slice(bytes)
+    let pages: Vec<Vec<GhPullRequest>> = serde_json::from_slice(bytes)
         .map_err(|error| BusError::internal(format!("decoding GitHub pull requests: {error}")))?;
-    Ok(rows
+    Ok(pages
         .into_iter()
-        .map(|row| PullRequest {
-            number: row.number,
-            branch: row.branch,
-            draft: row.draft,
-            url: row.url,
-            title: row.title,
+        .flatten()
+        .map(|row| {
+            let same_repository = row
+                .head
+                .repo
+                .as_ref()
+                .zip(row.base.repo.as_ref())
+                .is_some_and(|(head, base)| head.full_name == base.full_name);
+            PullRequest {
+                number: row.number,
+                branch: row.head.branch,
+                draft: row.draft,
+                url: row.html_url,
+                title: row.title,
+                state: if row.merged_at.is_some() {
+                    "merged".into()
+                } else {
+                    row.state
+                },
+                same_repository,
+            }
         })
         .collect())
 }
@@ -1043,7 +1211,10 @@ fn changed(ctx: &mut Ctx, project_id: relay_bus::types::Id, root: &Path) {
 fn validate_branch_name(root: &Path, value: &str) -> Result<String, BusError> {
     let name = value.trim();
     if name.is_empty() {
-        return Err(BusError::invalid("git.branch_name", "branch name cannot be empty"));
+        return Err(BusError::invalid(
+            "git.branch_name",
+            "branch name cannot be empty",
+        ));
     }
     let out = std::process::Command::new("git")
         .arg("-C")
@@ -1135,14 +1306,145 @@ mod tests {
     use super::*;
 
     #[test]
-    fn github_pull_request_rows_decode_to_bus_shape() {
-        let rows = decode_pull_requests(
-            br#"[{"number":8,"headRefName":"relay/spry-gecko","isDraft":false,"url":"https://github.com/antho976/Relay-2/pull/8","title":"Launch sheet"}]"#,
+    fn github_pull_requests_cover_all_pages_and_lifecycle_states() {
+        let row = |number, state: &str, merged_at: serde_json::Value, repository: &str| {
+            json!({
+                "number":number,"head":{"ref":"feature","repo":{"full_name":repository}},
+                "base":{"ref":"main","repo":{"full_name":"owner/repo"}},
+                "draft":false,"html_url":"https://example.test/pr","title":"Changes",
+                "state":state,"merged_at":merged_at
+            })
+        };
+        let fixture = json!([
+            [row(1, "open", serde_json::Value::Null, "owner/repo")],
+            [
+                row(2, "closed", json!("2026-09-05T00:00:00Z"), "owner/repo"),
+                row(3, "closed", serde_json::Value::Null, "other/fork")
+            ]
+        ]);
+        let rows = decode_pull_requests(&serde_json::to_vec(&fixture).unwrap()).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows.iter().map(|pr| pr.state.as_str()).collect::<Vec<_>>(),
+            ["open", "merged", "closed"]
+        );
+        assert!(rows[1].same_repository);
+        assert!(!rows[2].same_repository);
+        assert!(decode_pull_requests(b"[[]").is_err());
+    }
+
+    #[test]
+    fn github_cli_paginates_and_failure_is_not_an_empty_list() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let gh = dir.path().join("gh");
+        std::fs::write(&gh, "#!/usr/bin/env python3\nimport sys\nassert sys.argv[1:4] == ['api','--paginate','--slurp']\nassert 'state=all' in sys.argv[4]\nprint('[[], []]')\n").unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let result = list_pull_requests(&gh, dir.path()).unwrap();
+        assert!(result.complete && result.pull_requests.is_empty());
+        std::fs::write(
+            &gh,
+            "#!/usr/bin/env python3\nimport sys\nprint('[[]]')\nsys.exit(1)\n",
         )
         .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].number, 8);
-        assert_eq!(rows[0].branch, "relay/spry-gecko");
-        assert!(!rows[0].draft);
+        assert!(list_pull_requests(&gh, dir.path()).is_err());
+    }
+
+    fn git(root: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    #[test]
+    fn local_remote_fetch_refreshes_new_worktree_without_moving_primary() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = dir.path().join("origin");
+        let checkout = dir.path().join("checkout");
+        std::fs::create_dir(&origin).unwrap();
+        git(&origin, &["init", "-b", "main"]);
+        git(&origin, &["config", "user.name", "Fixture"]);
+        git(&origin, &["config", "user.email", "fixture@example.test"]);
+        git(&origin, &["commit", "--allow-empty", "-m", "initial"]);
+        git(
+            dir.path(),
+            &[
+                "clone",
+                origin.to_str().unwrap(),
+                checkout.to_str().unwrap(),
+            ],
+        );
+        let original = git(&checkout, &["rev-parse", "HEAD"]);
+        git(
+            &origin,
+            &["commit", "--allow-empty", "-m", "remote advance"],
+        );
+        let advanced = git(&origin, &["rev-parse", "HEAD"]);
+        fetch_remote(&checkout).unwrap();
+        let from = new_worktree_base(&checkout, "main").unwrap();
+        let new_path = dir.path().join("new-session");
+        worktree::create(&checkout, &new_path, "relay/fixture", Some(&from)).unwrap();
+        assert_eq!(git(&new_path, &["rev-parse", "HEAD"]), advanced);
+        assert_eq!(git(&checkout, &["rev-parse", "HEAD"]), original);
+        let brief = briefing_state(&new_path, "relay/fixture", "main");
+        assert!(brief.contains("git_base_upstream_behind: 1"));
+        assert!(brief.contains("cached snapshot"));
+    }
+
+    #[test]
+    fn missing_upstream_is_unknown_and_fetched_base_preserves_local_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-b", "main"]);
+        git(root, &["config", "user.name", "Fixture"]);
+        git(root, &["config", "user.email", "fixture@example.test"]);
+        git(root, &["commit", "--allow-empty", "-m", "base"]);
+        let base = git(root, &["rev-parse", "HEAD"]);
+        let metrics = || upstream_metrics(&gix::open(root).unwrap(), "main");
+        assert_eq!(metrics(), (None, None, None));
+        git(root, &["config", "branch.main.remote", "origin"]);
+        git(root, &["config", "branch.main.merge", "refs/heads/main"]);
+        git(
+            root,
+            &["config", "remote.origin.url", "/nonexistent/relay-fixture"],
+        );
+        git(
+            root,
+            &[
+                "config",
+                "remote.origin.fetch",
+                "+refs/heads/*:refs/remotes/origin/*",
+            ],
+        );
+        assert_eq!(metrics(), (Some("origin/main".into()), None, None));
+        assert!(briefing_state(root, "main", "main").contains("git_ahead: unknown"));
+        git(root, &["update-ref", "refs/remotes/origin/main", &base]);
+        assert_eq!(metrics(), (Some("origin/main".into()), Some(0), Some(0)));
+        git(root, &["checkout", "-b", "remote-fixture"]);
+        git(root, &["commit", "--allow-empty", "-m", "remote"]);
+        let remote = git(root, &["rev-parse", "HEAD"]);
+        git(root, &["update-ref", "refs/remotes/origin/main", &remote]);
+        git(root, &["checkout", "main"]);
+        assert_eq!(
+            new_worktree_base(root, "main"),
+            Some("refs/remotes/origin/main".into())
+        );
+        assert_eq!(git(root, &["rev-parse", "main"]), base);
+        git(root, &["commit", "--allow-empty", "-m", "local"]);
+        assert_eq!(metrics(), (Some("origin/main".into()), Some(1), Some(1)));
+        assert_eq!(new_worktree_base(root, "main"), Some("main".into()));
+        let local = git(root, &["rev-parse", "main"]);
+        assert!(fetch_remote(root).is_err());
+        assert_eq!(git(root, &["rev-parse", "main"]), local);
+        assert_eq!(new_worktree_base(root, "main"), Some("main".into()));
     }
 }

@@ -566,3 +566,93 @@ fn existing_tasks_keep_neutral_board_defaults() {
     assert!(reread["duplicate_of"].is_null());
     assert_eq!(reread["rollup"], json!({"total":0,"done":0}));
 }
+
+#[test]
+fn task_activity_is_exactly_scoped_paginated_and_read_only_for_agents() {
+    let f = Fixture::new();
+    let e = &f.engine;
+    let first = f.task("First task", json!({}));
+    let other = f.task("Other task", json!({}));
+    let session = ok(
+        e,
+        "session.create",
+        json!({"project_id":1,"provider":"codex","role":"builder"}),
+    );
+    let name = session["name"].as_str().unwrap();
+    for column in ["ready", "active", "backlog"] {
+        ok(
+            e,
+            "task.move",
+            json!({"task_id":first["id"],"column":column}),
+        );
+        ok(
+            e,
+            "task.move",
+            json!({"task_id":other["id"],"column":column}),
+        );
+    }
+    for index in 0..3 {
+        ok(
+            e,
+            "mailbox.send",
+            json!({"project_id":1,"to":name,"text":format!("first {index}"),"re_task":first["id"]}),
+        );
+        ok(
+            e,
+            "mailbox.send",
+            json!({"project_id":1,"to":name,"text":format!("other {index}"),"re_task":other["id"]}),
+        );
+    }
+    ok(
+        e,
+        "mailbox.send",
+        json!({"project_id":1,"to":name,"text":"not task scoped"}),
+    );
+    let mut before_audit = Value::Null;
+    let mut before_message = Value::Null;
+    let mut audit_ids = std::collections::BTreeSet::new();
+    let mut message_ids = std::collections::BTreeSet::new();
+    loop {
+        let page = ok(
+            e,
+            "task.activity",
+            json!({"task_id":first["id"],"limit":1,"before_audit":before_audit,"before_message":before_message}),
+        );
+        for row in page["history"].as_array().unwrap() {
+            assert!(
+                audit_ids.insert(row["id"].as_i64().unwrap()),
+                "history cursor repeated a row"
+            );
+            assert!(
+                row["payload"]["task_id"] == first["id"]
+                    || (row["op"] == "task.create" && row["result_summary"]["id"] == first["id"])
+            );
+        }
+        for message in page["messages"].as_array().unwrap() {
+            assert_eq!(message["re_task"], first["id"]);
+            assert!(
+                message_ids.insert(message["id"].as_i64().unwrap()),
+                "message cursor repeated a row"
+            );
+        }
+        if page["next_audit"].is_null() && page["next_message"].is_null() {
+            break;
+        }
+        before_audit = page["next_audit"].as_i64().map_or(json!(0), |id| json!(id));
+        before_message = page["next_message"]
+            .as_i64()
+            .map_or(json!(0), |id| json!(id));
+    }
+    assert_eq!(audit_ids.len(), 4, "creation plus three moves");
+    assert_eq!(message_ids.len(), 3);
+    let response = call(
+        e,
+        Actor::Agent(name.to_string()),
+        "task.activity",
+        json!({"task_id":first["id"]}),
+    );
+    assert!(
+        response.error.is_some(),
+        "agent cannot read user-wide task conversations"
+    );
+}

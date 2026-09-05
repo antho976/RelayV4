@@ -44,8 +44,12 @@ peer already holding them — and one line of what you are doing with `session.i
 starting sizeable work, call `guardrail.explain` with structured paths, lines, and commands; \
 `guardrail.check` tests one command or write. `bus.wait` blocks until something happens, so \
 never poll. Work on `task` first; `tasks` is the remaining ordered queue. Report each current \
-task through `session.done` with `status` `completed`, `blocked` or `partial`; completion moves \
-only that task to review and Relay advances the next queued task. When you stopped short, include \
+task through `session.done` with `status` `completed`, `blocked` or `partial`. All builders must \
+finish before the task enters review. A shared-worktree group stays on that task until every \
+reviewer finishes; do not begin queued work while peers are still building or reviewing. Relay \
+then advances the group FIFO and sends the next assignment through mailbox. After reporting \
+completion, wait for that assignment and read `session.bootstrap`; do not repeat `session.done`. \
+When you stopped short, include \
 the `blockers` that stopped you. Relay responses may carry `mail.priority`; when it is nonzero \
 and you are not already handling mail, finish the current atomic action, call `mailbox.list` with \
 `unread_only: true`, process the priority messages, and `mailbox.ack` each one. If \

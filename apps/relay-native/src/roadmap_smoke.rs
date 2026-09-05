@@ -1,0 +1,453 @@
+//! Opt-in checks against the isolated native smoke engine, never installed providers.
+use crate::app::Ui;
+use gtk::prelude::*;
+use gtk4 as gtk;
+use serde_json::{json, Value};
+use std::rc::Rc;
+use std::time::Duration;
+
+fn named(root: &impl IsA<gtk::Widget>, name: &str) -> Option<gtk::Widget> {
+    let root = root.as_ref();
+    if root.widget_name() == name {
+        return Some(root.clone());
+    }
+    let mut child = root.first_child();
+    while let Some(widget) = child {
+        if let Some(found) = named(&widget, name) {
+            return Some(found);
+        }
+        child = widget.next_sibling();
+    }
+    None
+}
+
+async fn wait(mut ready: impl FnMut() -> bool, message: &str) {
+    for _ in 0..250 {
+        if ready() {
+            return;
+        }
+        glib::timeout_future(Duration::from_millis(20)).await;
+    }
+    panic!("Roadmap smoke timed out: {message}");
+}
+
+async fn call(ui: &Rc<Ui>, op: &str, payload: Value) -> Value {
+    ui.call(op, payload)
+        .await
+        .unwrap_or_else(|error| panic!("{op}: {error}"))
+}
+
+fn selected_tasks(root: &gtk::Widget) -> usize {
+    let own = usize::from(
+        root.has_css_class("launch-task")
+            && root
+                .downcast_ref::<gtk::ToggleButton>()
+                .is_some_and(|key| key.is_active()),
+    );
+    let mut count = own;
+    let mut child = root.first_child();
+    while let Some(widget) = child {
+        count += selected_tasks(&widget);
+        child = widget.next_sibling();
+    }
+    count
+}
+
+pub(crate) async fn run(ui: &Rc<Ui>) -> Value {
+    assert_eq!(std::env::var("RELAY_INSTANCE").as_deref(), Ok("test"));
+    assert_eq!(std::env::var("RELAY_NATIVE_FIXTURE").as_deref(), Ok("1"));
+    assert!(
+        ui.path.starts_with(std::env::temp_dir()),
+        "Regression writes require a temporary fixture socket"
+    );
+    let project = ui.project.get();
+    let workspace = ui
+        .workspaces
+        .borrow()
+        .first()
+        .cloned()
+        .expect("Fixture workspace");
+    let root = std::path::PathBuf::from(workspace["path"].as_str().unwrap())
+        .join(format!("roadmap-{}", uuid::Uuid::new_v4()));
+    assert!(
+        root.starts_with(std::env::temp_dir()),
+        "Fixture repository must be temporary"
+    );
+    std::fs::create_dir_all(&root).unwrap();
+    for args in [
+        vec!["init", "-b", "main"],
+        vec![
+            "-c",
+            "user.name=Native Smoke",
+            "-c",
+            "user.email=smoke@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "Fixture",
+        ],
+    ] {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "Fixture git: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let other = call(
+        ui,
+        "project.add",
+        json!({"workspace_id":workspace["id"],"path":root,"name":"Roadmap scope with a deliberately very long project name that must remain inside its sidebar"}),
+    )
+    .await;
+    let other = other["id"].as_i64().unwrap();
+    ui.refresh();
+    wait(
+        || {
+            ui.projects
+                .borrow()
+                .iter()
+                .any(|p| p["id"].as_i64() == Some(other))
+        },
+        "second fixture project",
+    )
+    .await;
+    let task = call(
+        ui,
+        "task.create",
+        json!({"project_id":project,"title":"Roadmap launch selection","column":"ready"}),
+    )
+    .await;
+    ui.navigate("agents");
+    ui.show_launch(task["id"].as_i64());
+    wait(
+        || named(&ui.window, "launch-start").is_some_and(|w| w.is_sensitive()),
+        "launch tasks",
+    )
+    .await;
+    for index in 0..11 {
+        let profile = named(&ui.window, &format!("launch-profile-{index}")).unwrap();
+        assert_eq!(
+            selected_tasks(&profile),
+            usize::from(index == 0),
+            "Only agent1 gets an initial assignment"
+        );
+        let provider = named(&ui.window, &format!("launch-provider-{index}"))
+            .unwrap()
+            .downcast::<gtk::DropDown>()
+            .unwrap();
+        assert_eq!(provider.selected(), 0, "Every agent defaults to Claude");
+    }
+    let provider = named(&ui.window, "launch-provider-0")
+        .unwrap()
+        .downcast::<gtk::DropDown>()
+        .unwrap();
+    let effort = named(&ui.window, "launch-effort-0")
+        .unwrap()
+        .downcast::<gtk::DropDown>()
+        .unwrap();
+    effort.set_selected(5);
+    provider.set_selected(1);
+    assert_eq!(effort.selected(), 3, "Codex cannot inherit max effort");
+    effort.set_selected(0);
+    provider.set_selected(0);
+    assert_eq!(effort.selected(), 3, "Claude cannot inherit minimal effort");
+    let model = named(&ui.window, "launch-model-0")
+        .unwrap()
+        .downcast::<gtk::Entry>()
+        .unwrap();
+    assert!(
+        model.is_mapped(),
+        "Model selection is visible without expanding advanced controls"
+    );
+    model.set_text("fixture-model-id");
+    let stale_submit = named(&ui.window, "launch-start")
+        .unwrap()
+        .downcast::<gtk::Button>()
+        .unwrap();
+    let before = call(ui, "session.list", json!({"project_id":project})).await["sessions"]
+        .as_array()
+        .unwrap()
+        .len();
+    ui.open_project(other, "agents");
+    stale_submit.emit_clicked();
+    glib::timeout_future(Duration::from_millis(120)).await;
+    assert_eq!(
+        call(ui, "session.list", json!({"project_id":project})).await["sessions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        before,
+        "Old launch callback cannot create a session after switching projects"
+    );
+    assert!(
+        call(ui, "session.list", json!({"project_id":other})).await["sessions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    ui.open_project(project, "agents");
+
+    crate::tools::devices::verify_worktree_picker(ui).await;
+    let skill = call(
+        ui,
+        "skill.create",
+        json!({"name":"Roadmap scope fixture","body":"# Scope fixture\nInstructions."}),
+    )
+    .await;
+    for project_id in [project, other] {
+        call(
+            ui,
+            "skill.enable",
+            json!({"skill_id":skill["id"],"project_id":project_id,"enabled":true}),
+        )
+        .await;
+    }
+    ui.navigate("skills");
+    wait(
+        || named(&ui.window, "skills-project").is_some(),
+        "Skills project picker",
+    )
+    .await;
+    let split = named(&ui.window, "skills-split")
+        .unwrap()
+        .downcast::<gtk::Paned>()
+        .unwrap();
+    let position = split.position();
+    split.set_position(position + 40);
+    assert_eq!(split.position(), position + 40);
+    assert!(split.vexpands());
+    let picker = named(&ui.window, "skills-project")
+        .unwrap()
+        .downcast::<gtk::DropDown>()
+        .unwrap();
+    let other_index = ui
+        .projects
+        .borrow()
+        .iter()
+        .position(|p| p["id"].as_i64() == Some(other))
+        .unwrap();
+    picker.set_selected(other_index as u32);
+    let picker = named(&ui.window, "skills-project")
+        .unwrap()
+        .downcast::<gtk::DropDown>()
+        .unwrap();
+    assert!(
+        picker.measure(gtk::Orientation::Horizontal, -1).0 < 220,
+        "Long project names must ellipsize inside the Skills library"
+    );
+    let toggle_name = format!("skill-enabled-{}", skill["id"]);
+    let toggle = named(&ui.window, &toggle_name)
+        .unwrap()
+        .downcast::<gtk::Switch>()
+        .unwrap();
+    assert!(toggle.is_active());
+    toggle.set_active(false);
+    wait(|| toggle.is_sensitive(), "Skills enablement save").await;
+    let listed = call(ui, "skill.list", json!({})).await;
+    let listed = listed["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == skill["id"])
+        .unwrap();
+    assert!(listed["enabled_in"]
+        .as_array()
+        .unwrap()
+        .contains(&json!(project)));
+    assert!(
+        !listed["enabled_in"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(other)),
+        "Project picker must bind the toggle to its chosen project"
+    );
+
+    let paths = [
+        "appearance.wallpapers",
+        "appearance.wallpaper",
+        "appearance.wallpaper_rotation",
+        "appearance.panel_alpha",
+    ];
+    let mut saved = Vec::new();
+    for path in paths {
+        saved.push((
+            path,
+            call(ui, "settings.get", json!({"path":path})).await["value"].clone(),
+        ));
+    }
+    let library = crate::wallpaper_rotation::library_or_defaults(&Value::Null);
+    let presets = library.as_array().unwrap();
+    assert_eq!(presets.len(), 3);
+    let mut decoded = Vec::new();
+    for preset in presets {
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(
+                preset["image"]
+                    .as_str()
+                    .unwrap()
+                    .strip_prefix("data:image/png;base64,")
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(
+            !decoded.contains(&bytes),
+            "Bundled wallpapers must be distinct"
+        );
+        let texture = gtk::gdk::Texture::from_bytes(&glib::Bytes::from(bytes.as_slice())).unwrap();
+        assert_eq!((texture.width(), texture.height()), (384, 240));
+        decoded.push(bytes);
+    }
+    let second = presets[1]["image"].clone();
+    call(
+        ui,
+        "settings.set",
+        json!({"path":"appearance.wallpapers","value":null}),
+    )
+    .await;
+    call(
+        ui,
+        "settings.set",
+        json!({"path":"appearance.wallpaper","value":null}),
+    )
+    .await;
+    call(ui, "settings.set", json!({"path":"appearance.wallpaper_rotation","value":{"enabled":false,"interval_minutes":15}})).await;
+    ui.page_projects.borrow_mut().remove("settings");
+    ui.navigate("settings");
+    wait(
+        || named(&ui.window, "settings-wallpaper-pick-2").is_some(),
+        "Settings offers three bundled wallpapers for an unset library",
+    )
+    .await;
+    assert!(named(&ui.window, "settings-wallpaper-pick-3").is_none());
+    assert!(
+        call(ui, "settings.get", json!({"path":"appearance.wallpapers"})).await["value"].is_null()
+    );
+    assert!(
+        call(ui, "settings.get", json!({"path":"appearance.wallpaper"})).await["value"].is_null(),
+        "Opening Settings keeps an unset background plain"
+    );
+    let search = named(&ui.window, "settings-search")
+        .unwrap()
+        .downcast::<gtk::SearchEntry>()
+        .unwrap();
+    search.set_text("Android SDK");
+    wait(
+        || named(&ui.window, "setting:device.sdk_path").is_some_and(|w| w.is_mapped()),
+        "Settings search finds Android field",
+    )
+    .await;
+    search.set_text("wallpaper");
+    wait(
+        || named(&ui.window, "settings-wallpaper-pick-1").is_some_and(|w| w.is_mapped()),
+        "Settings search returns Appearance",
+    )
+    .await;
+    let alpha = named(&ui.window, "setting:appearance.panel_alpha")
+        .unwrap()
+        .downcast::<gtk::Scale>()
+        .unwrap();
+    alpha.set_value(0.81);
+    named(&ui.window, "settings-wallpaper-pick-1")
+        .unwrap()
+        .downcast::<gtk::Button>()
+        .unwrap()
+        .emit_clicked();
+    assert_eq!(
+        alpha.value(),
+        0.81,
+        "Wallpaper selection preserves another staged field"
+    );
+    assert_eq!(
+        call(ui, "settings.get", json!({"path":"appearance.wallpaper"})).await["value"],
+        Value::Null,
+        "Wallpaper selection is staged until Save"
+    );
+    assert!(named(&ui.window, "settings-wallpaper-preview").is_some());
+    named(&ui.window, "settings-wallpaper-open")
+        .unwrap()
+        .downcast::<gtk::Button>()
+        .unwrap()
+        .emit_clicked();
+    let preview = gtk::Window::list_toplevels()
+        .into_iter()
+        .filter_map(|w| w.downcast::<gtk::Window>().ok())
+        .find(|w| w.title().as_deref() == presets[1]["name"].as_str())
+        .expect("Full wallpaper preview window");
+    let picture = preview.child().unwrap().downcast::<gtk::Picture>().unwrap();
+    assert_eq!(
+        picture.content_fit(),
+        gtk::ContentFit::Contain,
+        "Full preview must show the entire image"
+    );
+    assert!(picture.paintable().is_some());
+    preview.close();
+    let rotation = named(&ui.window, "setting:appearance.wallpaper_rotation.enabled")
+        .unwrap()
+        .downcast::<gtk::CheckButton>()
+        .unwrap();
+    rotation.set_active(true);
+    named(&ui.window, "settings-save")
+        .unwrap()
+        .downcast::<gtk::Button>()
+        .unwrap()
+        .emit_clicked();
+    wait(
+        || ui.pages["settings"].is_sensitive(),
+        "Settings Save changes",
+    )
+    .await;
+    assert_eq!(
+        call(ui, "settings.get", json!({"path":"appearance.wallpapers"})).await["value"],
+        library,
+        "Save persists the offered preset library"
+    );
+    assert_eq!(
+        call(ui, "settings.get", json!({"path":"appearance.wallpaper"})).await["value"],
+        second
+    );
+    assert_eq!(
+        call(ui, "settings.get", json!({"path":"appearance.panel_alpha"})).await["value"],
+        0.81
+    );
+    glib::timeout_future(Duration::from_millis(120)).await;
+    assert!(
+        crate::wallpaper_rotation::rotate_once(ui).await.unwrap(),
+        "Enabled rotation must select a distinct next image"
+    );
+    let rotated =
+        call(ui, "settings.get", json!({"path":"appearance.wallpaper"})).await["value"].clone();
+    assert_ne!(rotated, second);
+    let selected = presets
+        .iter()
+        .position(|preset| preset["image"] == rotated)
+        .expect("Rotation chooses another bundled wallpaper");
+    wait(
+        || {
+            named(&ui.window, &format!("settings-wallpaper-pick-{selected}"))
+                .is_some_and(|w| w.has_css_class("active"))
+        },
+        "Canonical rotation updates the retained Settings selection",
+    )
+    .await;
+    assert_eq!(
+        call(ui, "settings.get", json!({"path":"appearance.panel_alpha"})).await["value"],
+        0.81,
+        "Rotation must not overwrite appearance edits"
+    );
+    for (path, value) in saved {
+        call(ui, "settings.set", json!({"path":path,"value":value})).await;
+    }
+    call(ui, "skill.delete", json!({"skill_id":skill["id"]})).await;
+    call(ui, "project.remove", json!({"project_id":other})).await;
+    std::fs::remove_dir_all(root).unwrap();
+    ui.page_projects.borrow_mut().remove("settings");
+    ui.open_project(project, "agents");
+    json!({"launch_scope":true,"all_claude":true,"provider_effort":true,"device_selector":true,"skills_project":true,"settings_search":true,"wallpaper_staging":true,"wallpaper_presets":true,"wallpaper_rotation":true})
+}

@@ -208,7 +208,7 @@ pub fn register(e: &mut Engine) {
         if destination.exists() {
             return Err(BusError::conflict("project.clone_destination", format!("{} already exists", destination.display())));
         }
-        let output = Command::new("git").arg("clone").arg("--").arg(&p.url).arg(&destination).output()
+        let output = Command::new("git").current_dir(&workspace.path).arg("clone").arg("--").arg(&p.url).arg(&destination).output()
             .map_err(|error| BusError::unavailable("project.git_missing", format!("cannot start git: {error}")))?;
         if !output.status.success() {
             return Err(BusError::unavailable("project.clone_failed", String::from_utf8_lossy(&output.stderr).trim().to_string()));

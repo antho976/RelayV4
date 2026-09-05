@@ -2,8 +2,8 @@
 
 use crate::engine::IntoBus;
 use crate::sessions;
-use relay_bus::error::BusError;
 use relay_bus::envelope::Actor;
+use relay_bus::error::BusError;
 use relay_bus::ops::session::{
     BootstrapGuardrails, BootstrapOut, BootstrapPair, BootstrapTask, BriefOut, BriefParts,
 };
@@ -25,19 +25,31 @@ struct AssignedTask {
 /// `sessions.task_id` is the current task, while `task_sessions` is the ordered queue.
 /// Done tasks are historical links, not launch work.
 fn assigned_tasks(conn: &Connection, session_id: Id) -> Result<Vec<AssignedTask>, BusError> {
-    let mut stmt = conn.prepare(
-        "SELECT t.id,t.title,t.body,t.changelog,t.col,t.state,t.module_id
+    let mut stmt = conn
+        .prepare(
+            "SELECT t.id,t.title,t.body,t.changelog,t.col,t.state,t.module_id
          FROM task_sessions ts JOIN tasks t ON t.id=ts.task_id
          WHERE ts.session_id=?1 AND t.deleted_at IS NULL AND t.col!='done'
          ORDER BY CASE WHEN t.id=(SELECT task_id FROM sessions WHERE id=?1) THEN 0 ELSE 1 END,
                   CASE t.col WHEN 'active' THEN 0 WHEN 'in_review' THEN 1 ELSE 2 END,
                   ts.queue_ord,t.position,t.id",
-    ).bus()?;
-    let tasks = stmt.query_map([session_id], |record| Ok(AssignedTask {
-        id: record.get(0)?, title: record.get(1)?, body: record.get(2)?,
-        changelog: record.get(3)?, column: record.get(4)?, state: record.get(5)?,
-        module_id: record.get(6)?,
-    })).bus()?.collect::<rusqlite::Result<Vec<_>>>().bus()?;
+        )
+        .bus()?;
+    let tasks = stmt
+        .query_map([session_id], |record| {
+            Ok(AssignedTask {
+                id: record.get(0)?,
+                title: record.get(1)?,
+                body: record.get(2)?,
+                changelog: record.get(3)?,
+                column: record.get(4)?,
+                state: record.get(5)?,
+                module_id: record.get(6)?,
+            })
+        })
+        .bus()?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .bus()?;
     Ok(tasks)
 }
 
@@ -146,9 +158,15 @@ pub fn brief(
     let session = &row.session;
     let project = conn
         .query_row(
-            "SELECT name, path FROM projects WHERE id=?1",
+            "SELECT name, path, base_branch FROM projects WHERE id=?1",
             [session.project_id],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            },
         )
         .optional()
         .bus()?
@@ -160,7 +178,8 @@ pub fn brief(
         })?;
 
     let tasks = assigned_tasks(conn, session.id)?;
-    let task = session.task_id
+    let task = session
+        .task_id
         .and_then(|id| tasks.iter().find(|task| task.id == id))
         .or_else(|| tasks.first());
     let module_id = session
@@ -188,6 +207,12 @@ pub fn brief(
         session.worktree,
         session.branch,
     );
+    state.push('\n');
+    state.push_str(&crate::handlers::git::briefing_state(
+        std::path::Path::new(&session.worktree),
+        &session.branch,
+        &project.2,
+    ));
     if let Some(module) = &module_name {
         state.push_str(&format!("\nmodule: {module}"));
     }
@@ -222,7 +247,11 @@ pub fn brief(
     // assignment stays out of it: `ps` is world-readable, and `session.bootstrap` — which
     // every role is told to call first — is the private channel that already carries it.
     let state_public = state.clone();
-    if let Some(assignment) = row.launch_prompt.as_deref().filter(|text| !text.trim().is_empty()) {
+    if let Some(assignment) = row
+        .launch_prompt
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+    {
         state.push_str(&format!("\n\nLaunch assignment:\n{assignment}"));
     }
 
@@ -308,9 +337,13 @@ pub fn brief(
              ORDER BY s.name COLLATE NOCASE,s.id",
         )
         .bus()?;
-    let skill_rows = skill_stmt.query_map([session.project_id], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    }).bus()?.collect::<rusqlite::Result<Vec<_>>>().bus()?;
+    let skill_rows = skill_stmt
+        .query_map([session.project_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .bus()?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .bus()?;
     // The injected half names the skills and where they are registered rather than the file
     // they were dumped into (D147): a path to 27 KB of bodies tells an agent nothing about
     // what it may load, and nothing makes it read the file before the work the skill covers.
@@ -321,7 +354,11 @@ pub fn brief(
             .iter()
             .map(|(name, _)| {
                 let dir = crate::skills::folder_name(name);
-                format!("- {name} — {}/{dir}/, {}/{dir}/", crate::skills::TARGETS[0], crate::skills::TARGETS[1])
+                format!(
+                    "- {name} — {}/{dir}/, {}/{dir}/",
+                    crate::skills::TARGETS[0],
+                    crate::skills::TARGETS[1]
+                )
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -332,8 +369,11 @@ pub fn brief(
     let skills = if skill_rows.is_empty() {
         "No enabled Relay skills.".to_string()
     } else {
-        skill_rows.into_iter().map(|(name, body)| format!("### {name}\n\n{body}"))
-            .collect::<Vec<_>>().join("\n\n")
+        skill_rows
+            .into_iter()
+            .map(|(name, body)| format!("### {name}\n\n{body}"))
+            .collect::<Vec<_>>()
+            .join("\n\n")
     };
     let parts = BriefParts {
         state,
@@ -350,7 +390,11 @@ pub fn brief(
         "# Relay session brief\n\n## Current state\n{}\n\n## Live peers\n{}\n\n## Standing notes\n{}\n\n## Adjacent tasks\n{}\n\n## Comms\n{}\n\n## Enabled skills\n{}",
         parts.state, parts.peers, parts.notes, parts.adjacent, COMMS_HINT, parts.skills,
     );
-    Ok(BriefOut { text, compact, parts })
+    Ok(BriefOut {
+        text,
+        compact,
+        parts,
+    })
 }
 
 /// The actor-bound startup payload: identity, the live peer table, the ops this session may
@@ -364,13 +408,20 @@ pub fn bootstrap(
 ) -> Result<BootstrapOut, BusError> {
     let row = sessions::by_name(conn, session_name)?;
     let session = &row.session;
-    let (project, base_branch) = conn.query_row(
-        "SELECT name,base_branch FROM projects WHERE id=?1",
-        [session.project_id],
-        |record| Ok((record.get::<_, String>(0)?, record.get::<_, String>(1)?)),
-    ).optional().bus()?.ok_or_else(|| {
-        BusError::not_found("project.not_found", format!("no project {}", session.project_id))
-    })?;
+    let (project, base_branch) = conn
+        .query_row(
+            "SELECT name,base_branch FROM projects WHERE id=?1",
+            [session.project_id],
+            |record| Ok((record.get::<_, String>(0)?, record.get::<_, String>(1)?)),
+        )
+        .optional()
+        .bus()?
+        .ok_or_else(|| {
+            BusError::not_found(
+                "project.not_found",
+                format!("no project {}", session.project_id),
+            )
+        })?;
 
     let pair_row = match session.pair_with.as_deref() {
         Some(name) => conn.query_row(
@@ -393,19 +444,25 @@ pub fn bootstrap(
     });
 
     let assigned = assigned_tasks(conn, session.id)?;
-    let task_id = session.task_id.or_else(|| pair_row.as_ref().and_then(|peer| peer.5));
+    let task_id = session
+        .task_id
+        .or_else(|| pair_row.as_ref().and_then(|peer| peer.5));
     let task_row = task_id
         .and_then(|id| assigned.iter().find(|task| task.id == id))
         .or_else(|| assigned.first());
-    let module_id = session.module_id
+    let module_id = session
+        .module_id
         .or_else(|| task_row.and_then(|task| task.module_id))
         .or_else(|| pair_row.as_ref().and_then(|peer| peer.6));
     let module = match module_id {
-        Some(id) => conn.query_row(
-            "SELECT name FROM modules WHERE id=?1 AND deleted_at IS NULL",
-            [id],
-            |record| record.get::<_, String>(0),
-        ).optional().bus()?,
+        Some(id) => conn
+            .query_row(
+                "SELECT name FROM modules WHERE id=?1 AND deleted_at IS NULL",
+                [id],
+                |record| record.get::<_, String>(0),
+            )
+            .optional()
+            .bus()?,
         None => None,
     };
     let task = task_row.map(bootstrap_task);

@@ -48,6 +48,12 @@ pub struct Pane {
     state: gtk::Label,
     lamp: gtk::Box,
     branch: gtk::Label,
+    branch_row: gtk::Box,
+    lane: gtk::DrawingArea,
+    pub slate_actions: gtk::Box,
+    slate: gtk::Box,
+    slate_state: gtk::Label,
+    slate_hint: gtk::Label,
     status: gtk::Label,
     name: String,
     path: PathBuf,
@@ -70,9 +76,10 @@ impl Pane {
         terminal.set_scrollback_lines(10_000);
         terminal.set_scroll_on_output(false);
         terminal.set_scroll_on_keystroke(true);
-        terminal.set_font(Some(&gtk::pango::FontDescription::from_string(
-            "Fira Mono 10",
-        )));
+        let mut font = gtk::pango::FontDescription::from_string("Fira Mono");
+        font.set_absolute_size(13.0 * gtk::pango::SCALE as f64);
+        terminal.set_font(Some(&font));
+        terminal.set_cell_height_scale(1.25);
         terminal.set_color_foreground(&gtk::gdk::RGBA::parse("#ececea").unwrap());
         terminal.set_color_background(&gtk::gdk::RGBA::parse("#0a0a0b").unwrap());
         terminal.set_cursor_blink_mode(vte4::CursorBlinkMode::Off);
@@ -92,14 +99,14 @@ impl Pane {
         let caption = gtk::Label::new(Some(name));
         caption.set_xalign(0.0);
         caption.set_max_width_chars(24);
-        caption.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        caption.set_ellipsize(gtk::pango::EllipsizeMode::End);
         caption.add_css_class("session-name");
         let status = gtk::Label::new(Some("Connecting"));
         status.add_css_class("dim");
         let actions = gtk::Box::new(gtk::Orientation::Horizontal, 2);
         footer.append(&caption);
         let metadata = gtk::Label::new(None);
-        metadata.add_css_class("dim");
+        metadata.add_css_class("terminal-identity");
         metadata.set_ellipsize(gtk::pango::EllipsizeMode::End);
 
         metadata.set_xalign(0.0);
@@ -108,7 +115,15 @@ impl Pane {
         branch.add_css_class("session-branch");
         branch.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
         branch.set_max_width_chars(24);
-        footer.append(&branch);
+        let branch_row = gtk::Box::new(gtk::Orientation::Horizontal, 5);
+        branch_row.add_css_class("session-branch");
+        let lane = gtk::DrawingArea::new();
+        lane.set_content_width(6);
+        lane.set_content_height(6);
+        lane.set_valign(gtk::Align::Center);
+        branch_row.append(&lane);
+        branch_row.append(&branch);
+        footer.append(&branch_row);
         let state = gtk::Label::new(None);
         state.add_css_class("session-state");
         let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -117,7 +132,39 @@ impl Pane {
         footer.append(&state);
         footer.append(&actions);
         root.append(&footer);
-        root.append(&terminal);
+        let screen = gtk::Overlay::new();
+        screen.set_vexpand(true);
+        let terminal_body = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        terminal_body.append(&terminal);
+        let scroll =
+            gtk::Scrollbar::new(gtk::Orientation::Vertical, terminal.vadjustment().as_ref());
+        scroll.add_css_class("terminal-scrollbar");
+        scroll.set_widget_name("terminal-scrollback");
+        terminal_body.append(&scroll);
+        screen.set_child(Some(&terminal_body));
+        let slate = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        slate.add_css_class("session-slate");
+        slate.set_halign(gtk::Align::Fill);
+        slate.set_valign(gtk::Align::Fill);
+        let slate_content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        slate_content.set_halign(gtk::Align::Center);
+        slate_content.set_valign(gtk::Align::Center);
+        slate_content.set_vexpand(true);
+        let slate_state = gtk::Label::new(None);
+        slate_state.add_css_class("slate-state");
+        slate_content.append(&slate_state);
+        let slate_hint = gtk::Label::new(None);
+        slate_hint.add_css_class("slate-hint");
+        slate_hint.set_wrap(true);
+        slate_hint.set_max_width_chars(44);
+        slate_hint.set_justify(gtk::Justification::Center);
+        slate_content.append(&slate_hint);
+        let slate_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        slate_actions.set_halign(gtk::Align::Center);
+        slate_content.append(&slate_actions);
+        slate.append(&slate_content);
+        screen.add_overlay(&slate);
+        root.append(&screen);
         status.set_wrap(true);
         status.set_max_width_chars(40);
         status.add_css_class("terminal-status");
@@ -133,6 +180,12 @@ impl Pane {
             state,
             lamp,
             branch,
+            branch_row,
+            lane,
+            slate_actions,
+            slate,
+            slate_state,
+            slate_hint,
             status,
             name: name.into(),
             path,
@@ -219,13 +272,25 @@ impl Pane {
             "dark" => "#08090a",
             _ => "#0a0a0b",
         };
+        let color = |value: &str| gtk::gdk::RGBA::parse(value).expect("Relay terminal color");
+        let palette = [
+            "#1a1a1d", "#e5382e", "#3fbf74", "#e0b04a", "#5b9cf6", "#c979d6", "#3ec5cf", "#c8c8c6",
+            "#5c5c60", "#ff6b5f", "#5fe08c", "#f2cf6b", "#8ab8ff", "#e19bea", "#68dfe8", "#f2f2f0",
+        ]
+        .map(color);
+        self.terminal.set_colors(
+            Some(&color("#dcdcda")),
+            Some(&color(background)),
+            &palette.iter().collect::<Vec<_>>(),
+        );
+        self.terminal.set_color_cursor(Some(&color("#ececea")));
         self.terminal
-            .set_color_background(&gtk::gdk::RGBA::parse(background).unwrap());
+            .set_color_cursor_foreground(Some(&color(background)));
         self.terminal
-            .set_font(Some(&gtk::pango::FontDescription::from_string(&format!(
-                "Fira Mono {}",
-                points.clamp(8.0, 24.0)
-            ))));
+            .set_color_highlight(Some(&color("rgba(236,236,234,0.22)")));
+        let mut font = gtk::pango::FontDescription::from_string("Fira Mono");
+        font.set_absolute_size(points.clamp(8.0, 24.0) * 96.0 / 72.0 * gtk::pango::SCALE as f64);
+        self.terminal.set_font(Some(&font));
     }
     pub fn verify_ready(&self) {
         assert!(
@@ -241,12 +306,46 @@ impl Pane {
     pub fn update_session(&self, session: &serde_json::Value) {
         use crate::app::text;
         self.caption.set_text(text(session, "name"));
-        self.metadata.set_text(&format!(
-            "{} · {}",
-            text(session, "provider"),
-            text(session, "role")
-        ));
+        let pair = text(session, "pair_with");
+        let intent = text(session, "intent").trim();
+        self.metadata.set_text(
+            &format!(
+                "{} · {}{}",
+                text(session, "provider"),
+                text(session, "role"),
+                if !intent.is_empty() {
+                    format!(" · {intent}")
+                } else if pair.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · pair {pair}")
+                }
+            )
+            .to_uppercase(),
+        );
         self.branch.set_text(text(session, "branch"));
+        let lane_key = if text(session, "worktree").is_empty() {
+            text(session, "branch")
+        } else {
+            text(session, "worktree")
+        };
+        let hash = lane_key.encode_utf16().fold(0_i32, |hash, unit| {
+            hash.wrapping_mul(31).wrapping_add(unit as i32)
+        });
+        let color = gtk::gdk::RGBA::parse(
+            ["#4f8fd9", "#c9a13b", "#a56cd6", "#3fb0a5", "#d97a4f"]
+                [hash.unsigned_abs() as usize % 5],
+        )
+        .unwrap();
+        self.lane.set_draw_func(move |_, cr, width, height| {
+            cr.set_source_rgb(
+                color.red() as f64,
+                color.green() as f64,
+                color.blue() as f64,
+            );
+            cr.rectangle(0.0, 0.0, width as f64, height as f64);
+            let _ = cr.fill();
+        });
         self.header.set_tooltip_text(Some(&format!(
             "{}\n{}\n{}",
             text(session, "branch"),
@@ -254,15 +353,30 @@ impl Pane {
             text(session, "intent")
         )));
         let state = text(session, "state");
-        self.state.set_text(&state.to_uppercase());
-        for class in ["live", "held", "waiting"] {
+        let state_label = match state {
+            "running" => String::from("LIVE"),
+            "blocked" => String::from("NEEDS YOU"),
+            _ => state.to_uppercase(),
+        };
+        self.state.set_text(&state_label);
+        let live = matches!(state, "spawning" | "running" | "idle" | "blocked");
+        self.slate.set_visible(!live);
+        self.slate_state.set_text(&state_label);
+        self.slate_hint.set_text(match state {
+            "parked" => "Process released. Scrollback and worktree kept; wake respawns with provider resume.",
+            "restorable" => "The previous process ended. Resume restores scrollback and the worktree.",
+            "created" => "The launch was interrupted before the provider started.",
+            _ => "No signal from this session.",
+        });
+        for class in ["live", "held", "waiting", "off"] {
             self.root.remove_css_class(class);
             self.lamp.remove_css_class(class);
         }
         let class = match state {
             "running" | "spawning" => "live",
             "blocked" => "held",
-            _ => "waiting",
+            "restorable" => "waiting",
+            _ => "off",
         };
         self.root.add_css_class(class);
         self.lamp.add_css_class(class);
@@ -371,7 +485,7 @@ impl Pane {
             };
             p.resize_pending.set(false);
             p.metadata.set_visible(p.root.width() > 420);
-            p.branch.set_visible(p.root.width() > 600);
+            p.branch_row.set_visible(p.root.width() > 600);
             if !p.active.get() || !p.terminal.is_mapped() {
                 return;
             }

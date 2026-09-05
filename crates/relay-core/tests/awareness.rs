@@ -290,13 +290,13 @@ fn notes_mailbox_and_brief_are_persistent_and_scoped() {
     assert_eq!(staged["session"]["state"], "created");
     let multi = ok(e, Actor::agent(f.a_name()), "session.bootstrap", json!({}));
     let task_ids: Vec<i64> = multi["tasks"].as_array().unwrap().iter().map(|task| task["id"].as_i64().unwrap()).collect();
-    assert_eq!(task_ids, [2, 1]);
-    assert_eq!(multi["task"]["id"], 2, "the current task stays compatible with scalar clients");
+    assert_eq!(task_ids, [1, 2]);
+    assert_eq!(multi["task"]["id"], 1, "the current task stays compatible with scalar clients");
     let multi_brief = ok(e, Actor::agent(f.a_name()), "session.brief", json!({"session":f.a_name()}));
     assert!(multi_brief["text"].as_str().unwrap().contains("assigned_tasks: 2"));
-    assert!(multi_brief["text"].as_str().unwrap().contains("current_task: #2"));
-    assert!(multi_brief["text"].as_str().unwrap().contains("Task #2 [CURRENT]: Adjacent task"));
-    assert!(multi_brief["text"].as_str().unwrap().contains("Task #1 [QUEUED]: Build awareness"));
+    assert!(multi_brief["text"].as_str().unwrap().contains("current_task: #1"));
+    assert!(multi_brief["text"].as_str().unwrap().contains("Task #2 [QUEUED]: Adjacent task"));
+    assert!(multi_brief["text"].as_str().unwrap().contains("Task #1 [CURRENT]: Build awareness"));
 }
 
 #[test]
@@ -582,4 +582,32 @@ fn lifecycle_stop_notifies_once_when_agent_omits_done() {
     assert_eq!(e.store.lock().query_row(
      "SELECT COUNT(*) FROM notifications WHERE category='agent_done'", [], |row| row.get::<_, i64>(0),
     ).unwrap(), 1);
+}
+
+#[test]
+fn repeated_reports_coalesce_unread_cards_and_do_not_replay_alerts() {
+    let f = Fixture::new();
+    let mut events = f.engine.subscribe();
+    for pass in 0..6 {
+        ok(&f.engine, Actor::agent(f.b_name()), "session.report", json!({"session":f.b_name(),"kind":"tool_use"}));
+        ok(&f.engine, Actor::agent(f.b_name()), "session.done", json!({"session":f.b_name(),"summary":format!("Result {pass}")}));
+        ok(&f.engine, Actor::agent(f.b_name()), "session.report", json!({"session":f.b_name(),"kind":"tool_use"}));
+        ok(&f.engine, Actor::agent(f.b_name()), "session.report", json!({"session":f.b_name(),"kind":"stop"}));
+    }
+    let mut alerts = 0;
+    let mut broadcasts = 0;
+    while let Ok(event) = events.try_recv() {
+        alerts += usize::from(event.ev == "notify.new");
+        broadcasts += usize::from(event.ev == "mailbox.new");
+    }
+    assert_eq!((alerts, broadcasts), (1, 1));
+    let cards = ok(&f.engine, Actor::User, "notify.list", json!({"unread_only":true}));
+    assert_eq!(cards["notifications"].as_array().unwrap().len(), 1);
+    assert_eq!(cards["notifications"][0]["body"], "Result 5");
+    ok(&f.engine, Actor::User, "notify.ack", json!({"notification_id":cards["notifications"][0]["id"]}));
+    ok(&f.engine, Actor::agent(f.b_name()), "session.report", json!({"session":f.b_name(),"kind":"tool_use"}));
+    ok(&f.engine, Actor::agent(f.b_name()), "session.report", json!({"session":f.b_name(),"kind":"stop","data":{"message":"New work finished"}}));
+    let unread = ok(&f.engine, Actor::User, "notify.list", json!({"unread_only":true}));
+    assert_eq!(unread["notifications"].as_array().unwrap().len(), 1);
+    assert_eq!(unread["notifications"][0]["body"], "New work finished");
 }
