@@ -365,6 +365,8 @@ impl Ui {
         launch_box.add_css_class("launch");
         launch_box.set_size_request(780, -1);
         let launch = gtk::Revealer::new();
+        // Its fixed-width allocation remains above the page when collapsed.
+        launch.set_can_target(false);
         launch.set_transition_duration(0);
         launch.set_hexpand(false);
         launch.set_child(Some(&launch_box));
@@ -381,6 +383,7 @@ impl Ui {
         let weak_body = body.downgrade();
         let weak_scrim = scrim.downgrade();
         launch.connect_child_revealed_notify(move |launch| {
+            launch.set_can_target(launch.reveals_child());
             if let Some(scrim) = weak_scrim.upgrade() {
                 scrim.set_visible(launch.reveals_child());
             }
