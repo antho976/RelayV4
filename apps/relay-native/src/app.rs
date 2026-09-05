@@ -382,7 +382,9 @@ impl Ui {
         wall.set_size_request(280, -1);
         wall_right.set_size_request(280, -1);
         let wall_scroll = scrolled(&wall_split);
-        wall_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        // Files and Git can leave less room than the terminal panes' minimum.
+        // Keep their content reachable instead of allocating below that minimum.
+        wall_scroll.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Automatic);
         wall_scroll.set_overlay_scrolling(false);
         wall_stack.add_named(&wall_scroll, Some("wall"));
         let empty = gtk::Box::new(gtk::Orientation::Vertical, 6);

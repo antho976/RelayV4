@@ -61,9 +61,37 @@ pub async fn run(ui: &Rc<Ui>) -> Result<(), String> {
     )
     .await?;
     require(
-        !owner.window.is_decorated(),
-        "Notes must use its own chrome",
+        owner.window.is_decorated()
+            && owner.window.is_resizable()
+            && owner
+                .window
+                .titlebar()
+                .is_some_and(|bar| bar.is::<gtk::WindowHandle>()),
+        "Notes must retain native resize edges around its custom titlebar",
     )?;
+    wait_for(
+        || owner.window.is_mapped() && owner.window.width() > 120 && owner.window.height() > 80,
+        "Notes window allocated",
+    )
+    .await?;
+    let initial_size = (owner.window.width(), owner.window.height());
+    println!("NOTES_RESIZE_INITIAL={}x{}", initial_size.0, initial_size.1);
+    owner
+        .window
+        .set_default_size(initial_size.0 - 120, initial_size.1 - 80);
+    wait_for(
+        || owner.window.width() < initial_size.0 && owner.window.height() < initial_size.1,
+        "Notes window shrank",
+    )
+    .await?;
+    owner
+        .window
+        .set_default_size(initial_size.0, initial_size.1);
+    wait_for(
+        || owner.window.width() == initial_size.0 && owner.window.height() == initial_size.1,
+        "Notes window grew back",
+    )
+    .await?;
     let draft = ui
         .note_drafts
         .borrow()
@@ -222,6 +250,6 @@ pub async fn run(ui: &Rc<Ui>) -> Result<(), String> {
     ui.call("notes.delete", json!({"note_id":id}))
         .await
         .map_err(|e| e.to_string())?;
-    println!("NOTES_TASK_LIFECYCLE_OK: retained window, dirty reopen, rail persistence, ordinary Plan, task message guard");
+    println!("NOTES_TASK_LIFECYCLE_OK: custom titlebar, resize, retained window, dirty reopen, rail persistence, ordinary Plan, task message guard");
     Ok(())
 }
