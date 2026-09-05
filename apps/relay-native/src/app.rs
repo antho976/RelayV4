@@ -4,7 +4,7 @@ use gtk::prelude::*;
 use gtk4 as gtk;
 use serde_json::{json, Value};
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use tokio::runtime::Handle;
@@ -33,7 +33,9 @@ pub fn label(text: &str, class: &str) -> gtk::Label {
 }
 pub fn button(text: &str, class: &str) -> gtk::Button {
     let b = gtk::Button::with_label(text);
-    b.add_css_class(class);
+    if !class.is_empty() {
+        b.add_css_class(class);
+    }
     if matches!(class, "nav" | "project" | "file") {
         if let Some(l) = b.child().and_downcast::<gtk::Label>() {
             l.set_xalign(0.0);
@@ -53,8 +55,7 @@ pub fn icon_button(icon: &str, caption: &str) -> gtk::Button {
 pub fn nav_button(caption: &str, icon: &str) -> gtk::Button {
     let b = button("", "nav");
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 9);
-    let image = crate::icons::image(icon, 14);
-    image.set_pixel_size(14);
+    let image = crate::icons::image(icon, 16);
     row.append(&image);
     row.append(&label(caption, "nav-label"));
     b.set_child(Some(&row));
@@ -101,9 +102,13 @@ pub struct Ui {
     pub project: Cell<i64>,
     pub generation: Cell<u64>,
     pub sessions: RefCell<Vec<Value>>,
+    sidebar_sessions: RefCell<Vec<Value>>,
     pub projects: RefCell<Vec<Value>>,
     pub page: RefCell<String>,
     applying_ui: Cell<bool>,
+    navigation_pending: RefCell<Option<(i64, String)>>,
+    navigation_sending: Cell<bool>,
+    navigation_echoes: RefCell<BTreeSet<uuid::Uuid>>,
     pub content: gtk::Stack,
     pub pages: BTreeMap<String, gtk::Box>,
     pub page_projects: RefCell<BTreeMap<String, i64>>,
@@ -111,19 +116,24 @@ pub struct Ui {
     status: gtk::Label,
     usage_meters: gtk::Box,
     device_status: gtk::Label,
+    pub(super) resource_status: gtk::Box,
+    notification_count: gtk::Label,
+    notification_revision: Cell<u64>,
     setup_checked: Cell<bool>,
     status_project: gtk::Label,
     status_branch: gtk::Label,
-    sidebar: gtk::Box,
+    pub(crate) sidebar: gtk::Box,
+    settings_sidebar: Cell<bool>,
     focus_tabs: gtk::Box,
     mode: RefCell<String>,
     pub overlay: gtk::Overlay,
     pub page_overlay: gtk::Overlay,
     pub panels: Rc<RefCell<Vec<Rc<crate::panel::Panel>>>>,
     registry_dirty: Cell<bool>,
-    workspaces: RefCell<Vec<Value>>,
+    pub(crate) workspaces: RefCell<Vec<Value>>,
     rendered_sessions: RefCell<BTreeMap<String, Value>>,
     restored_project: Cell<i64>,
+    layout_revision: Cell<u64>,
     layout_saves: RefCell<BTreeMap<i64, Value>>,
     layout_saving: Cell<bool>,
     appearance: gtk::CssProvider,
@@ -137,9 +147,8 @@ pub struct Ui {
     wall: gtk::Grid,
     wall_right: gtk::Grid,
     wall_split: gtk::Paned,
-    wall_files: gtk::Box,
-    file_tree_revision: Cell<u64>,
     wall_stack: gtk::Stack,
+    empty_title: gtk::Label,
     panes: RefCell<BTreeMap<String, Rc<Pane>>>,
     ordered: RefCell<Vec<String>>,
     columns: Cell<i32>,
@@ -150,11 +159,16 @@ pub struct Ui {
     page_dirty: Cell<bool>,
     connected: Cell<bool>,
     launch: gtk::Revealer,
+    launch_caption: gtk::Label,
     launch_busy: Cell<bool>,
     launch_box: gtk::Box,
     pub editor: Rc<crate::editor::Editor>,
     pub note_tabs: gtk::Notebook,
     pub note_drafts: RefCell<BTreeMap<i64, Rc<crate::pages::Draft>>>,
+    pub notes_window: RefCell<Option<Rc<crate::pages::NotesWindow>>>,
+    pub(crate) wallpaper_rotation: RefCell<crate::wallpaper_rotation::Rotation>,
+    pub(crate) wallpaper_draft: RefCell<Option<crate::tools::settings::WallpaperDraft>>,
+    pub(crate) provider_updates_checked: Cell<bool>,
 }
 
 pub fn run(rt: Handle) -> glib::ExitCode {
@@ -198,6 +212,7 @@ pub fn run(rt: Handle) -> glib::ExitCode {
         }
         let ui = Ui::build(app, rt.clone(), path.clone());
         ui.window.present();
+        crate::pages::show_notes(&ui);
         ui.connect();
         crate::smoke::install(&ui);
     });
@@ -212,39 +227,92 @@ impl Ui {
             .default_width(1440)
             .default_height(900)
             .build();
+        crate::fonts::install(&window);
+        crate::icons::install_app_icon(&window);
         let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
         let top = gtk::Box::new(gtk::Orientation::Horizontal, 2);
         top.add_css_class("topbar");
         let sidebar_key = icon_button("sidebar-show-symbolic", "Toggle sidebar");
         sidebar_key.set_widget_name("sidebar-toggle");
-        top.append(&sidebar_key);
+        let top_left = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        top_left.add_css_class("topbar-left");
+        top_left.set_size_request(194, -1);
+        sidebar_key.set_child(Some(&crate::icons::image("sidebar", 14)));
+        top_left.append(&sidebar_key);
         let mark = label("R", "brand-mark");
         mark.set_valign(gtk::Align::Center);
         mark.set_xalign(0.5);
-        top.append(&mark);
+        top_left.append(&mark);
         let brand = label("RELAY", "brand");
-        brand.set_hexpand(true);
-        top.append(&brand);
+        top_left.append(&brand);
+        top.append(&top_left);
+        let top_space = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        top_space.set_hexpand(true);
+        top.append(&top_space);
+        let top_actions = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        top_actions.add_css_class("topbar-actions");
+        top.append(&top_actions);
         let palette_key = icon_button("system-search-symbolic", "Command palette · Ctrl K");
         palette_key.set_widget_name("command-palette");
         let layouts_key = icon_button("view-grid-symbolic", "Window presets");
         layouts_key.set_widget_name("window-presets");
+        let skills_key = icon_button("skills", "Skills for this project");
         let notifications_key = icon_button("alarm-symbolic", "Notifications");
-        for key in [&palette_key, &layouts_key, &notifications_key] {
-            top.append(key);
+        let bell = gtk::Overlay::new();
+        bell.set_child(Some(&crate::icons::image("bell", 16)));
+        let notification_count = label("", "notification-count");
+        notification_count.set_halign(gtk::Align::End);
+        notification_count.set_valign(gtk::Align::Start);
+        notification_count.set_visible(false);
+        notification_count.set_can_target(false);
+        bell.add_overlay(&notification_count);
+        notifications_key.set_child(Some(&bell));
+        for key in [&palette_key, &skills_key, &layouts_key, &notifications_key] {
+            top_actions.append(key);
         }
         let reconnect = icon_button("view-refresh-symbolic", "Reconnect to engine");
-        top.append(&reconnect);
+        top_actions.append(&reconnect);
+        reconnect.set_visible(false);
         let launch_key = button("New session", "primary");
         launch_key.set_widget_name("new-session");
         let launch_label = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        launch_label.append(&crate::icons::image("plus", 14));
-        launch_label.append(&label("New session", ""));
+        launch_label.append(&crate::icons::image_with_stroke("plus", 14, 2.0));
+        let launch_caption = label("New session", "");
+        launch_label.append(&launch_caption);
         launch_key.set_child(Some(&launch_label));
         launch_key.set_valign(gtk::Align::Center);
         launch_key.add_css_class("launch-key");
-        top.append(&launch_key);
-        top.append(&gtk::WindowControls::new(gtk::PackType::End));
+        top_actions.append(&launch_key);
+        let window_controls = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        window_controls.add_css_class("window-controls");
+        for (icon, caption, size) in [
+            ("minimize", "Minimize", 14),
+            ("maximize", "Maximize", 12),
+            ("close", "Close", 14),
+        ] {
+            let key = icon_button(icon, caption);
+            key.remove_css_class("icon-key");
+            key.add_css_class("window-control");
+            key.set_margin_top(0);
+            key.set_margin_bottom(0);
+            key.set_child(Some(&crate::icons::image(icon, size)));
+            if icon == "close" {
+                key.add_css_class("window-close");
+            }
+            let window = window.downgrade();
+            key.connect_clicked(move |_| {
+                if let Some(window) = window.upgrade() {
+                    match icon {
+                        "minimize" => window.minimize(),
+                        "maximize" if window.is_maximized() => window.unmaximize(),
+                        "maximize" => window.maximize(),
+                        _ => window.close(),
+                    }
+                }
+            });
+            window_controls.append(&key);
+        }
+        top.append(&window_controls);
         let handle = gtk::WindowHandle::new();
         handle.set_child(Some(&top));
         window.set_titlebar(Some(&handle));
@@ -275,9 +343,14 @@ impl Ui {
         sidebar.append(&project_scroll);
         let settings_key = nav_button("Settings", "settings");
         settings_key.add_css_class("settings-key");
-        sidebar.append(&settings_key);
+        let sidebar_footer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        sidebar_footer.add_css_class("sidebar-footer");
+        sidebar_footer.append(&settings_key);
+        sidebar.append(&sidebar_footer);
         body.append(&sidebar);
         let content = gtk::Stack::new();
+        content.set_hhomogeneous(false);
+        content.set_vhomogeneous(false);
         content.set_hexpand(true);
         content.set_vexpand(true);
         let page_overlay = gtk::Overlay::new();
@@ -300,6 +373,7 @@ impl Ui {
             .row_spacing(2)
             .build();
         let wall_split = gtk::Paned::new(gtk::Orientation::Horizontal);
+        wall_split.add_css_class("wall-split");
         wall_split.set_start_child(Some(&wall));
         wall_split.set_end_child(Some(&wall_right));
         wall_split.set_position(600);
@@ -309,16 +383,32 @@ impl Ui {
         wall_right.set_size_request(280, -1);
         let wall_scroll = scrolled(&wall_split);
         wall_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        wall_scroll.set_overlay_scrolling(false);
         wall_stack.add_named(&wall_scroll, Some("wall"));
-        let empty = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        let empty = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        empty.add_css_class("wall-empty");
         empty.set_valign(gtk::Align::Center);
         empty.set_halign(gtk::Align::Center);
-        empty.append(&label("Your agents, in one place", "title"));
-        empty.append(&label(
-            "Choose a project and add an agent to start working.",
-            "dim",
-        ));
-        let empty_launch = button("Add an agent", "primary");
+        let empty_glyph = crate::icons::image_with_stroke("grid", 28, 1.0);
+        empty_glyph.add_css_class("empty-glyph");
+        empty.append(&empty_glyph);
+        let empty_title = label("No sessions", "title");
+        empty_title.set_halign(gtk::Align::Center);
+        empty.append(&empty_title);
+        let empty_description = label(
+            "Launch a solo agent in its own worktree, or a builder–reviewer pair on one branch. Each session lands here as a tile.",
+            "empty-description",
+        );
+        empty_description.set_wrap(true);
+        empty_description.set_max_width_chars(52);
+        empty_description.set_justify(gtk::Justification::Center);
+        empty.append(&empty_description);
+        let empty_launch = button("", "primary");
+        let empty_action = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        empty_action.append(&crate::icons::image_with_stroke("plus", 14, 2.0));
+        empty_action.append(&label("Session", ""));
+        empty_launch.set_child(Some(&empty_action));
+        empty_launch.set_halign(gtk::Align::Center);
         empty.append(&empty_launch);
         wall_stack.add_named(&empty, Some("empty"));
         wall_stack.set_visible_child_name("empty");
@@ -327,24 +417,15 @@ impl Ui {
         focus_tabs.add_css_class("focus-tabs");
         agents.append(&focus_tabs);
         let wall_body = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        let files = icon_button("view-list-symbolic", "Show agent file tree");
-        files.set_valign(gtk::Align::Start);
-        files.add_css_class("files-rail");
-        wall_body.append(&files);
-        let wall_files = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        wall_files.set_size_request(220, -1);
-        wall_files.set_visible(false);
-        wall_body.append(&wall_files);
         wall_body.append(&wall_stack);
         agents.append(&wall_body);
-        content.add_named(&agents, Some("agents"));
         let editor = crate::editor::Editor::new();
-        content.add_named(&editor.root, Some("code"));
+        editor.mount_agents(&agents);
+        content.add_named(&editor.root, Some("agents"));
         let mut pages = BTreeMap::new();
         for name in [
             "board",
             "modules",
-            "plan",
             "mailbox",
             "guardrails",
             "notes",
@@ -358,7 +439,13 @@ impl Ui {
             let page = gtk::Box::new(gtk::Orientation::Vertical, 12);
             page.add_css_class("page");
             page.set_vexpand(true);
-            content.add_named(&scrolled(&page), Some(name));
+            if name == "notes" {
+                // The Notes workspace lives in its own retained native window.
+            } else if name == "board" {
+                content.add_named(&page, Some(name));
+            } else {
+                content.add_named(&scrolled(&page), Some(name));
+            }
             pages.insert(name.into(), page);
         }
         let launch_box = gtk::Box::new(gtk::Orientation::Vertical, 12);
@@ -406,6 +493,8 @@ impl Ui {
         bottom.append(&gtk::Separator::new(gtk::Orientation::Vertical));
         bottom.append(&crate::icons::image("branch", 11));
         bottom.append(&status_branch);
+        bottom.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+        bottom.append(&label("linux · local", "status-platform"));
         let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         spacer.set_hexpand(true);
         bottom.append(&spacer);
@@ -425,6 +514,11 @@ impl Ui {
         devices_key.set_child(Some(&device_content));
         let resources_key = icon_button("cpu", "Resources");
         resources_key.set_widget_name("status-resources");
+        let resource_content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        resource_content.append(&crate::icons::image("cpu", 12));
+        let resource_status = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        resource_content.append(&resource_status);
+        resources_key.set_child(Some(&resource_content));
         bottom.append(&usage_key);
         bottom.append(&gtk::Separator::new(gtk::Orientation::Vertical));
         bottom.append(&devices_key);
@@ -452,9 +546,13 @@ impl Ui {
             project: Cell::new(0),
             generation: Cell::new(0),
             sessions: RefCell::default(),
+            sidebar_sessions: RefCell::default(),
             projects: RefCell::default(),
             page: RefCell::new("agents".into()),
             applying_ui: Cell::new(false),
+            navigation_pending: RefCell::default(),
+            navigation_sending: Cell::new(false),
+            navigation_echoes: RefCell::default(),
             content,
             pages,
             page_projects: RefCell::default(),
@@ -462,10 +560,14 @@ impl Ui {
             status,
             usage_meters,
             device_status,
+            resource_status,
+            notification_count,
+            notification_revision: Cell::new(0),
             setup_checked: Cell::new(false),
             status_project,
             status_branch,
             sidebar,
+            settings_sidebar: Cell::new(true),
             focus_tabs,
             mode: RefCell::new("grid".into()),
             overlay: panel_host,
@@ -475,12 +577,13 @@ impl Ui {
             workspaces: RefCell::default(),
             rendered_sessions: RefCell::default(),
             restored_project: Cell::new(0),
+            layout_revision: Cell::new(0),
             layout_saves: RefCell::default(),
             layout_saving: Cell::new(false),
             appearance: gtk::CssProvider::new(),
             wallpaper,
             wallpaper_dim,
-            font_size: Cell::new(10.0),
+            font_size: Cell::new(9.75),
             palette: RefCell::new("matte".into()),
             keybindings: RefCell::new(json!({})),
             sound_busy: Cell::new(false),
@@ -488,9 +591,8 @@ impl Ui {
             wall,
             wall_right,
             wall_split,
-            wall_files,
-            file_tree_revision: Cell::new(0),
             wall_stack,
+            empty_title,
             panes: RefCell::default(),
             ordered: RefCell::default(),
             columns: Cell::new(2),
@@ -501,23 +603,23 @@ impl Ui {
             page_dirty: Cell::new(false),
             connected: Cell::new(false),
             launch,
+            launch_caption,
             launch_busy: Cell::new(false),
             launch_box,
             editor,
             note_tabs: gtk::Notebook::new(),
             note_drafts: RefCell::default(),
+            notes_window: RefCell::default(),
+            wallpaper_rotation: RefCell::default(),
+            wallpaper_draft: RefCell::default(),
+            provider_updates_checked: Cell::new(false),
         });
         for (name, caption, icon) in [
             ("dashboard", "Dashboard", "view-app-grid-symbolic"),
             ("skills", "Skills", "applications-science-symbolic"),
             ("plugins", "Plugins", "application-x-addon-symbolic"),
-            ("code", "Code", "text-x-generic-symbolic"),
             ("board", "Board", "view-list-symbolic"),
-            ("plan", "Plan", "document-edit-symbolic"),
             ("notes", "Notes", "accessories-text-editor-symbolic"),
-            ("agents", "Agents", "utilities-terminal-symbolic"),
-            ("mailbox", "Mailbox", "mail-unread-symbolic"),
-            ("guardrails", "Guardrails", "security-high-symbolic"),
         ] {
             let b = nav_button(caption, icon);
             b.set_widget_name(&format!("nav-{name}"));
@@ -542,10 +644,55 @@ impl Ui {
             });
         }
         let weak = Rc::downgrade(&ui);
+        skills_key.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                ui.project_skills();
+            }
+        });
+        let settings_return = Rc::new(RefCell::new((String::from("agents"), true)));
+        let return_state = settings_return.clone();
+        let weak = Rc::downgrade(&ui);
+        let back_key = sidebar_key.clone();
+        let mut_previous = Rc::new(RefCell::new(String::from("agents")));
+        ui.content.connect_visible_child_name_notify(move |stack| {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let page = stack.visible_child_name().unwrap_or_default();
+            let settings = page == "settings";
+            if settings && mut_previous.borrow().as_str() != "settings" {
+                ui.settings_sidebar.set(ui.sidebar.is_visible());
+                *return_state.borrow_mut() =
+                    (mut_previous.borrow().clone(), ui.sidebar.is_visible());
+                ui.sidebar.set_visible(false);
+            } else if !settings && mut_previous.borrow().as_str() == "settings" {
+                ui.sidebar.set_visible(ui.settings_sidebar.get());
+            }
+            brand.set_text(if settings { "SETTINGS" } else { "RELAY" });
+            back_key.set_child(Some(&crate::icons::image(
+                if settings { "chevron-left" } else { "sidebar" },
+                14,
+            )));
+            back_key.set_tooltip_text(Some(if settings {
+                "Back from settings"
+            } else {
+                "Toggle sidebar"
+            }));
+            top_actions.set_visible(!settings);
+            bottom.set_visible(!settings);
+            skills_key.set_visible(page == "agents");
+            *mut_previous.borrow_mut() = page.into();
+        });
+        let weak = Rc::downgrade(&ui);
         sidebar_key.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
-                ui.sidebar.set_visible(!ui.sidebar.is_visible());
-                ui.save_layout();
+                if ui.page.borrow().as_str() == "settings" {
+                    let page = settings_return.borrow().0.clone();
+                    ui.navigate(&page);
+                } else {
+                    ui.sidebar.set_visible(!ui.sidebar.is_visible());
+                    ui.save_layout();
+                }
             }
         });
         let weak = Rc::downgrade(&ui);
@@ -573,13 +720,9 @@ impl Ui {
             }
         });
         let weak = Rc::downgrade(&ui);
-        files.connect_clicked(move |_| {
+        ui.editor.connect_view_changed(move || {
             if let Some(ui) = weak.upgrade() {
-                let show = !ui.wall_files.is_visible();
-                ui.wall_files.set_visible(show);
-                if show {
-                    ui.load_wall_files(String::new());
-                }
+                ui.update_attachments();
             }
         });
         let weak = Rc::downgrade(&ui);
@@ -609,6 +752,13 @@ impl Ui {
             });
         }
         let weak = Rc::downgrade(&ui);
+        let recovery_label_key = reconnect.clone();
+        ui.notice.connect_label_notify(move |notice| {
+            recovery_label_key.set_visible(!notice.text().is_empty());
+        });
+        let recovery_key = reconnect.clone();
+        ui.notice
+            .connect_visible_notify(move |notice| recovery_key.set_visible(notice.is_visible()));
         reconnect.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
                 ui.connect();
@@ -701,6 +851,9 @@ impl Ui {
             for draft in drafts {
                 draft.close();
             }
+            if let Some(notes) = owned.notes_window.borrow_mut().take() {
+                notes.window.destroy();
+            }
             owned.generation.set(owned.generation.get() + 1);
             owned.connected.set(false);
             owned.client.borrow_mut().take();
@@ -734,6 +887,7 @@ impl Ui {
         });
     }
     fn connect(self: &Rc<Self>) {
+        self.navigation_echoes.borrow_mut().clear();
         self.registry_dirty.set(true);
         self.rendered_sessions.borrow_mut().clear();
         self.generation.set(self.generation.get() + 1);
@@ -755,10 +909,12 @@ impl Ui {
                         return;
                     }
                     *ui.client.borrow_mut() = Some(client);
-                    if let Err(e)=ui.call("bus.subscribe",json!({"events":["project.changed","project.deleted","workspace.changed","session.changed","task.changed","task.deleted","mailbox.new","mailbox.changed","guardrail.held","guardrail.resolved","overlap.changed","notes.changed","file.changed","git.changed","worktree.changed","module.changed","module.deleted","skill.changed","skill.deleted","settings.changed","notify.new","notify.changed","device.changed","run.changed","run.crash","device.signing.changed","avd.changed","layout.changed","ui.changed","ui.toast","usage.changed","integration.changed","integration.result"]})).await { ui.show_error(&e.to_string()); return; }
+                    if let Err(e)=ui.call("bus.subscribe",json!({"events":["project.changed","project.deleted","workspace.changed","session.changed","task.changed","task.deleted","mailbox.new","mailbox.changed","guardrail.held","guardrail.resolved","overlap.changed","notes.changed","notes.deleted","file.changed","git.changed","worktree.changed","module.changed","module.deleted","skill.changed","skill.deleted","settings.changed","provider.update.changed","notify.new","notify.changed","device.changed","run.changed","run.crash","device.signing.changed","avd.changed","layout.changed","ui.changed","ui.toast","usage.changed","integration.changed","integration.result"]})).await { ui.show_error(&e.to_string()); return; }
                     ui.connected.set(true);
+                    crate::provider_updates::startup(&ui);
                     ui.status.set_text("");
                     ui.refresh_status();
+                    ui.refresh_notification_count();
                     ui.notice.set_visible(false);
                     ui.refresh();
                     ui.load_appearance();
@@ -777,6 +933,15 @@ impl Ui {
                         }
                         match notice {
                             Notice::Event(e) => {
+                                // Local navigation already updated the widgets. Consume its
+                                // echo before project filtering, including a project just left.
+                                if e.ev == "ui.changed"
+                                    && e.cause.is_some_and(|id| {
+                                        ui.navigation_echoes.borrow_mut().remove(&id)
+                                    })
+                                {
+                                    continue;
+                                }
                                 if matches!(
                                     e.ev.as_str(),
                                     "usage.changed" | "device.changed" | "run.changed"
@@ -786,8 +951,21 @@ impl Ui {
                                 if e.ev == "notify.new" {
                                     crate::sounds::notify(&ui, &e.payload);
                                 }
+                                if e.ev.starts_with("notify.") {
+                                    ui.refresh_notification_count();
+                                }
+                                if e.ev == "provider.update.changed" {
+                                    crate::provider_updates::event(&ui, &e.payload);
+                                    continue;
+                                }
+                                // Notes retains its own project when the main window switches.
+                                if matches!(e.ev.as_str(), "notes.changed" | "notes.deleted") {
+                                    crate::pages::refresh_notes(&ui);
+                                    continue;
+                                }
                                 if e.project_id.is_some_and(|id| id != ui.project.get())
                                     && !e.ev.starts_with("project.")
+                                    && !e.ev.starts_with("session.")
                                     && !matches!(
                                         ui.page.borrow().as_str(),
                                         "dashboard" | "notifications"
@@ -809,9 +987,6 @@ impl Ui {
                                         | "integration.result"
                                 ) {
                                     ui.editor.invalidate(&ui);
-                                    if ui.wall_files.is_visible() {
-                                        ui.load_wall_files(String::new());
-                                    }
                                 } else if e.ev == "layout.changed"
                                     && e.payload["action"] == "applied"
                                 {
@@ -836,6 +1011,7 @@ impl Ui {
                                 }
                             }
                             Notice::Disconnected(e) => {
+                                ui.navigation_echoes.borrow_mut().clear();
                                 ui.connected.set(false);
                                 ui.client.borrow_mut().take();
                                 ui.status.set_text(
@@ -870,6 +1046,12 @@ impl Ui {
         self.navigate(if active { "agents" } else { page });
     }
     pub fn navigate(self: &Rc<Self>, page: &str) {
+        if page == "notes" {
+            crate::pages::show_notes(self);
+            return;
+        }
+        let files = page == "code";
+        let page = if files { "agents" } else { page };
         if *self.page.borrow() != page && !self.dismiss_panels() {
             return;
         }
@@ -884,28 +1066,13 @@ impl Ui {
                     | "code"
                     | "board"
                     | "modules"
-                    | "plan"
-                    | "notes"
                     | "dashboard"
                     | "skills"
                     | "plugins"
                     | "settings"
             )
         {
-            let ui = self.clone();
-            let page = page.to_string();
-            let project = self.project.get();
-            glib::spawn_future_local(async move {
-                if let Err(e) = ui
-                    .call(
-                        "ui.page.switch",
-                        json!({"page":page,"project_id":if project>0 {Some(project)} else {None}}),
-                    )
-                    .await
-                {
-                    ui.show_error(&e.to_string());
-                }
-            });
+            self.sync_navigation(page);
         }
         let previous = self.page.borrow().clone();
         if (previous == "devices") != (page == "devices") && self.connected.get() {
@@ -919,13 +1086,17 @@ impl Ui {
         }
         *self.page.borrow_mut() = page.into();
         self.content.set_visible_child_name(page);
+        if page == "agents" {
+            self.editor.prepare_project(self);
+            if files {
+                self.editor.show_files();
+            } else {
+                self.editor.show_agents();
+            }
+        }
         self.save_layout();
         self.layout();
-        if page == "code" {
-            self.editor.load_tree(self, None);
-        } else {
-            self.refresh_page();
-        }
+        self.refresh_page();
     }
     pub fn refresh(self: &Rc<Self>) {
         self.refresh_dirty.set(true);
@@ -936,6 +1107,7 @@ impl Ui {
         glib::spawn_future_local(async move {
             while ui.refresh_dirty.replace(false) {
                 let generation = ui.generation.get();
+                let layout_revision = ui.layout_revision.get();
                 if ui.registry_dirty.replace(false) {
                     let (projects, workspaces) = tokio::join!(
                         ui.call("project.list", json!({})),
@@ -973,6 +1145,7 @@ impl Ui {
                             .unwrap_or(0),
                     );
                     ui.editor.reset();
+                    ui.editor.prepare_project(&ui);
                 }
                 ui.render_projects();
                 if !ui.setup_checked.replace(true) && ui.projects.borrow().is_empty() {
@@ -985,20 +1158,25 @@ impl Ui {
                     continue;
                 }
                 match ui
-                    .call(
-                        "session.list",
-                        json!({"project_id":project,"include_closed":false}),
-                    )
+                    .call("session.list", json!({"include_closed":false}))
                     .await
                 {
                     Ok(v) if ui.project.get() == project && generation == ui.generation.get() => {
-                        *ui.sessions.borrow_mut() = rows(&v, "sessions");
+                        let all = rows(&v, "sessions");
+                        *ui.sessions.borrow_mut() = all
+                            .iter()
+                            .filter(|s| s["project_id"].as_i64() == Some(project))
+                            .cloned()
+                            .collect();
+                        *ui.sidebar_sessions.borrow_mut() = all;
+                        ui.render_projects();
                         ui.reconcile();
                     }
                     Ok(_) => {}
                     Err(e) => ui.show_error(&e.to_string()),
                 }
-                ui.restore_layout().await;
+                ui.restore_layout(layout_revision).await;
+                crate::pages::refresh_notes(&ui);
                 if matches!(ui.page.borrow().as_str(), "board" | "dashboard") {
                     ui.refresh_page();
                 }
@@ -1007,7 +1185,13 @@ impl Ui {
         });
     }
     fn reconcile(self: &Rc<Self>) {
+        self.render_status_counts();
         let sessions = self.sessions.borrow().clone();
+        self.launch_caption.set_text(if sessions.is_empty() {
+            "New session"
+        } else {
+            "Add agents"
+        });
         let available: Vec<String> = sessions.iter().map(|s| text(s, "name").into()).collect();
         let mut names = self.ordered.borrow().clone();
         names.retain(|n| available.contains(n));
@@ -1063,6 +1247,7 @@ impl Ui {
             .map(|p| text(p, "name").to_string())
             .unwrap_or_else(|| "No project".into());
         self.status_project.set_text(&name);
+        self.empty_title.set_text(&format!("No sessions in {name}"));
         self.status_branch.set_text(
             self.projects
                 .borrow()
@@ -1081,6 +1266,7 @@ impl Ui {
         for s in self.sessions.borrow().iter() {
             if let Some(p) = self.panes.borrow().get(text(s, "name")) {
                 let active = (*self.page.borrow() == "agents"
+                    && self.editor.agents_visible()
                     && (mode.as_str() != "focus"
                         || focus.as_ref().is_none_or(|n| n == text(s, "name"))))
                     && !matches!(
@@ -1094,7 +1280,7 @@ impl Ui {
     pub fn verify_shell(self: &Rc<Self>) {
         let panes = self.panes.borrow().clone();
         let mode = self.mode.borrow().clone();
-        for mode in ["grid", "focus", "review"] {
+        for mode in ["grid", "focus", "review", "mosaic"] {
             self.set_mode(mode);
             for (name, pane) in &panes {
                 assert!(
@@ -1104,7 +1290,7 @@ impl Ui {
             }
         }
         self.set_mode(&mode);
-        println!("Shell layouts verified: grid, focus, review, retained terminals");
+        println!("Shell layouts verified: grid, focus, review, mosaic, retained terminals");
     }
     pub fn verify_launch(&self) {
         assert!(self.launch.reveals_child());

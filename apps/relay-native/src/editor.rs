@@ -1,8 +1,10 @@
-use crate::app::{button, clear, label, rows, scrolled, text, Ui};
+use crate::app::{Ui, button, clear, label, rows, scrolled, text};
 use gtk4 as gtk;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 #[path = "code_git.rs"]
 mod code_git;
+#[path = "project_files.rs"]
+mod project_files;
 use sourceview5::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -11,29 +13,38 @@ pub struct Editor {
     pub root: gtk::Box,
     tree: gtk::Box,
     expanded: RefCell<std::collections::BTreeSet<String>>,
-    scope: gtk::ComboBoxText,
+    scope: gtk::MenuButton,
+    scope_label: gtk::Label,
+    file_sidebar: gtk::Box,
+    files_split: gtk::Paned,
+    git_split: gtk::Paned,
+    document_tools: gtk::Box,
+    selected_path: RefCell<String>,
+    selected_directory: Cell<bool>,
     worktree: RefCell<String>,
     worktrees: RefCell<Vec<Value>>,
-    scope_loading: Cell<bool>,
+
     scope_project: Cell<i64>,
     scope_revision: Cell<u64>,
     search: gtk::SearchEntry,
     git: gtk::Box,
     git_revision: Cell<u64>,
     git_busy: Cell<bool>,
-    commit_message: gtk::Entry,
+    commit_message: gtk::TextView,
     branch_name: gtk::Entry,
     branch_start: gtk::Entry,
     invalidate_pending: Cell<bool>,
     diff: Cell<bool>,
     before: sourceview5::Buffer,
     before_scroll: gtk::ScrolledWindow,
+    content_stack: gtk::Stack,
     position: gtk::Label,
     find_bar: gtk::Box,
     find: gtk::Entry,
     replacement: gtk::Entry,
     search_context: sourceview5::SearchContext,
     file_actions: gtk::Box,
+    file_undo: gtk::Box,
     buffer: sourceview5::Buffer,
     view: sourceview5::View,
     caption: gtk::Label,
@@ -46,56 +57,104 @@ pub struct Editor {
     discard: gtk::Button,
     handlers: Cell<bool>,
     busy: Cell<bool>,
-    tree_revision: Cell<u64>,
+    pub(crate) tree_revision: Cell<u64>,
 }
 impl Editor {
+    pub fn set_palette(&self, mode: &str) {
+        let manager = sourceview5::StyleSchemeManager::default();
+        if let Some(scheme) = manager
+            .scheme(&format!("relay-{mode}"))
+            .or_else(|| manager.scheme("relay-matte"))
+        {
+            self.buffer.set_style_scheme(Some(&scheme));
+            self.before.set_style_scheme(Some(&scheme));
+        }
+    }
+
     pub fn new() -> Rc<Self> {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        let tools = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let tools = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         tools.add_css_class("toolbar");
-        let scope = gtk::ComboBoxText::new();
-        scope.set_tooltip_text(Some("Select a project checkout or agent worktree"));
-        scope.append(Some(""), "Primary checkout");
-        scope.set_active(Some(0));
-        tools.append(&scope);
-        let caption = label("Open a file", "title");
+        tools.add_css_class("code-bar");
+        let scope = gtk::MenuButton::new();
+        scope.set_widget_name("project-scope");
+        scope.set_valign(gtk::Align::Center);
+        scope.set_tooltip_text(Some("Search projects and checkouts"));
+        let scope_label = label("Select a project", "mono");
+        scope_label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        scope_label.set_max_width_chars(42);
+        let scope_content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        scope_content.append(&crate::icons::image("branch", 13));
+        scope_content.append(&scope_label);
+        scope_content.append(&crate::icons::image("chevron-down", 12));
+        scope.set_child(Some(&scope_content));
+        let project_tools = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        project_tools.add_css_class("code-bar");
+        project_tools.append(&scope);
+        let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        spacer.set_hexpand(true);
+        project_tools.append(&spacer);
+        let agents_button = button("Agents", "quiet");
+        agents_button.set_widget_name("project-agents");
+        project_tools.append(&agents_button);
+        let document_button = button("Editor", "quiet");
+        document_button.set_widget_name("project-editor");
+        project_tools.append(&document_button);
+        root.append(&project_tools);
+
+        let caption = label("No file open", "title");
         caption.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
         caption.set_hexpand(true);
         tools.append(&caption);
         let save = button("Save", "primary");
-        let discard = button("Discard changes", "quiet");
+        save.set_widget_name("project-save");
+        let discard = crate::app::icon_button("undo", "Discard changes");
         tools.append(&discard);
         tools.append(&save);
-        root.append(&tools);
+
         let split = gtk::Paned::new(gtk::Orientation::Horizontal);
-        split.set_position(240);
+        split.set_position(260);
+        split.set_resize_start_child(false);
+        split.set_shrink_start_child(false);
         split.set_vexpand(true);
         let tree = gtk::Box::new(gtk::Orientation::Vertical, 2);
         tree.add_css_class("file-tree");
         let file_sidebar = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        file_sidebar.set_size_request(180, -1);
+        file_sidebar.set_size_request(260, -1);
+        file_sidebar.set_spacing(0);
+        file_sidebar.add_css_class("code-files");
+        let file_header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        file_header.add_css_class("code-bar");
+        file_header.append(&label("FILES", "section-label"));
+        file_sidebar.append(&file_header);
         let search = gtk::SearchEntry::new();
         search.set_placeholder_text(Some("Search in worktree"));
         search.set_tooltip_text(Some(
             "Search file contents; press Enter to search, Escape to return to files",
         ));
+        search.add_css_class("code-search");
         file_sidebar.append(&search);
         let file_actions = gtk::Box::new(gtk::Orientation::Horizontal, 2);
         file_sidebar.append(&file_actions);
+        let file_undo = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        file_sidebar.append(&file_undo);
         file_sidebar.append(&scrolled(&tree));
         split.set_start_child(Some(&file_sidebar));
         let buffer = sourceview5::Buffer::new(None);
         let view = sourceview5::View::with_buffer(&buffer);
+        view.set_widget_name("project-source");
         view.set_monospace(true);
+        view.add_css_class("code-source");
         view.set_show_line_numbers(true);
         view.set_highlight_current_line(true);
         view.set_tab_width(4);
         view.set_auto_indent(true);
         view.set_editable(false);
-        if let Some(scheme) = sourceview5::StyleSchemeManager::default().scheme("Adwaita-dark") {
+        if let Some(scheme) = sourceview5::StyleSchemeManager::default().scheme("relay-matte") {
             buffer.set_style_scheme(Some(&scheme));
         }
         let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        content.append(&tools);
         let find_bar = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         find_bar.add_css_class("toolbar");
         let find = gtk::Entry::new();
@@ -115,6 +174,7 @@ impl Editor {
         before.set_style_scheme(buffer.style_scheme().as_ref());
         let before_view = sourceview5::View::with_buffer(&before);
         before_view.set_monospace(true);
+        before_view.add_css_class("code-source");
         before_view.set_show_line_numbers(true);
         before_view.set_editable(false);
         let before_scroll = scrolled(&before_view);
@@ -126,34 +186,70 @@ impl Editor {
         compare.set_resize_end_child(true);
         compare.set_position(360);
         compare.set_vexpand(true);
-        content.append(&compare);
+        let content_stack = gtk::Stack::new();
+        content_stack.set_hhomogeneous(false);
+        content_stack.set_vhomogeneous(false);
+        content_stack.set_vexpand(true);
+        content_stack.add_named(&compare, Some("source"));
+        let empty = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        empty.set_halign(gtk::Align::Center);
+        empty.set_valign(gtk::Align::Start);
+        empty.set_margin_top(38);
+        empty.add_css_class("code-empty");
+        let glyph = crate::icons::image("code", 28);
+        glyph.set_halign(gtk::Align::Center);
+        glyph.add_css_class("faint");
+        empty.append(&glyph);
+        let title = label("Code, review, integrate", "title");
+        title.set_xalign(0.5);
+        title.set_margin_top(12);
+        empty.append(&title);
+        let hint = label(
+            "Open a file from the tree, a change from the git panel, or a commit from a task. Saves go through the bus; guardrails apply to your edits too.",
+            "dim",
+        );
+        hint.set_wrap(true);
+        hint.set_max_width_chars(58);
+        hint.set_justify(gtk::Justification::Center);
+        hint.set_xalign(0.5);
+        empty.append(&hint);
+        content_stack.add_named(&empty, Some("empty"));
+        content_stack.set_visible_child_name("empty");
+        content.append(&content_stack);
         let position = label("Select a file to edit", "dim");
-        position.add_css_class("toolbar");
+        position.add_css_class("code-position");
         content.append(&position);
         let workspace = gtk::Paned::new(gtk::Orientation::Horizontal);
         workspace.set_start_child(Some(&content));
         workspace.set_resize_start_child(true);
+        workspace.set_shrink_start_child(false);
         workspace.set_resize_end_child(false);
         workspace.set_position(760);
-        let git = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        git.set_size_request(290, -1);
+        let git = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        git.set_vexpand(true);
+        git.set_size_request(320, -1);
         git.add_css_class("code-git");
-        let git_panel = scrolled(&git);
-        git_panel.set_min_content_width(290);
+        let git_panel = git.clone();
         workspace.set_shrink_end_child(false);
         workspace.set_end_child(Some(&git_panel));
         split.set_end_child(Some(&workspace));
-        let find_button = button("Find", "quiet");
+        let find_button = crate::app::icon_button("search", "Find in file");
         tools.append(&find_button);
         let files_button = button("Files", "quiet");
-        tools.append(&files_button);
-        files_button.connect_clicked(move |_| file_sidebar.set_visible(!file_sidebar.is_visible()));
-        let edit_button = button("Edit file", "quiet");
+        files_button.set_widget_name("project-files");
+        project_tools.append(&files_button);
+        let edit_button = crate::app::icon_button("edit", "Edit file");
         tools.append(&edit_button);
         let git_button = button("Git", "quiet");
-        tools.append(&git_button);
-        let git_scroll = workspace.end_child().unwrap();
-        git_button.connect_clicked(move |_| git_scroll.set_visible(!git_scroll.is_visible()));
+        git_button.set_widget_name("project-git");
+        project_tools.append(&git_button);
+        let mut control = tools.first_child();
+        while let Some(widget) = control {
+            control = widget.next_sibling();
+            widget.set_valign(gtk::Align::Center);
+        }
+        file_sidebar.set_visible(false);
+        git.set_visible(false);
         root.append(&split);
         save.set_sensitive(false);
         discard.set_sensitive(false);
@@ -162,28 +258,36 @@ impl Editor {
             tree,
             expanded: RefCell::default(),
             scope,
+            scope_label,
+            file_sidebar,
+            files_split: split,
+            git_split: workspace,
+            document_tools: tools,
+            selected_path: RefCell::default(),
+            selected_directory: Cell::new(false),
             worktree: RefCell::default(),
             worktrees: RefCell::default(),
-            scope_loading: Cell::new(false),
             scope_project: Cell::new(0),
             scope_revision: Cell::new(0),
             search,
             git,
             git_revision: Cell::new(0),
             git_busy: Cell::new(false),
-            commit_message: gtk::Entry::new(),
+            commit_message: gtk::TextView::new(),
             branch_name: gtk::Entry::new(),
             branch_start: gtk::Entry::new(),
             invalidate_pending: Cell::new(false),
             diff: Cell::new(false),
             before,
             before_scroll,
+            content_stack,
             position,
             find_bar,
             find,
             replacement,
             search_context,
             file_actions,
+            file_undo,
             buffer,
             view,
             caption,
@@ -239,6 +343,43 @@ impl Editor {
                 }
             }
         });
+        let weak = Rc::downgrade(&editor);
+        agents_button.connect_clicked(move |_| {
+            if let Some(editor) = weak.upgrade() {
+                editor.show_agents();
+            }
+        });
+        let weak = Rc::downgrade(&editor);
+        document_button.connect_clicked(move |_| {
+            if let Some(editor) = weak.upgrade() {
+                editor.show_files();
+            }
+        });
+        let weak = Rc::downgrade(&editor);
+        files_button.connect_clicked(move |_| {
+            if let Some(editor) = weak.upgrade() {
+                editor.toggle_files();
+            }
+        });
+        let weak = Rc::downgrade(&editor);
+        git_button.connect_clicked(move |_| {
+            if let Some(editor) = weak.upgrade() {
+                editor.toggle_git();
+            }
+        });
+        let weak = Rc::downgrade(&editor);
+        editor
+            .content_stack
+            .connect_visible_child_name_notify(move |_| {
+                if let Some(editor) = weak.upgrade() {
+                    let document = !editor.agents_visible();
+                    editor.document_tools.set_visible(document);
+                    editor.position.set_visible(document);
+                    if !document {
+                        editor.find_bar.set_visible(false);
+                    }
+                }
+            });
         editor.setup_find();
         editor
     }
@@ -247,6 +388,14 @@ impl Editor {
     }
     fn set_busy(&self, busy: bool) {
         self.busy.set(busy);
+        if busy || !self.agents_visible() {
+            self.content_stack
+                .set_visible_child_name(if busy || !self.path.borrow().is_empty() {
+                    "source"
+                } else {
+                    "empty"
+                });
+        }
         self.view
             .set_editable(!busy && !self.diff.get() && !self.path.borrow().is_empty());
         self.save.set_sensitive(!busy && self.buffer.is_modified());
@@ -256,23 +405,22 @@ impl Editor {
     pub fn reset(&self) {
         self.scope_revision.set(self.scope_revision.get() + 1);
         self.git_revision.set(self.git_revision.get() + 1);
+        clear(&self.file_undo);
         self.scope_project.set(0);
-        self.commit_message.set_text("");
+        self.selected_path.borrow_mut().clear();
+        self.expanded.borrow_mut().clear();
+        self.show_agents();
+        self.commit_message.buffer().set_text("");
         self.branch_name.set_text("");
         self.branch_start.set_text("");
         self.worktree.borrow_mut().clear();
         self.worktrees.borrow_mut().clear();
-        self.scope_loading.set(true);
-        self.scope.remove_all();
-        self.scope.append(Some(""), "Primary checkout");
-        self.scope.set_active(Some(0));
-        self.scope_loading.set(false);
+        self.scope_label.set_text("Select a project");
         clear(&self.git);
         self.search.set_text("");
         self.clear_document();
     }
     fn clear_document(&self) {
-        self.expanded.borrow_mut().clear();
         self.diff.set(false);
         self.before_scroll.set_visible(false);
         self.revision.set(self.revision.get() + 1);
@@ -288,13 +436,15 @@ impl Editor {
         self.caption.set_text("Open a file");
     }
     pub fn invalidate(self: &Rc<Self>, ui: &Rc<Ui>) {
-        if *ui.page.borrow() == "code" && !self.invalidate_pending.replace(true) {
+        if matches!(ui.page.borrow().as_str(), "code" | "agents")
+            && !self.invalidate_pending.replace(true)
+        {
             let weak = Rc::downgrade(ui);
             let e = self.clone();
-            glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
+            glib::timeout_add_local_once(std::time::Duration::from_millis(1000), move || {
                 e.invalidate_pending.set(false);
                 if let Some(ui) = weak.upgrade() {
-                    if *ui.page.borrow() == "code" {
+                    if matches!(ui.page.borrow().as_str(), "code" | "agents") {
                         let directory = e.directory.borrow().clone();
                         if e.search.text().trim().is_empty() {
                             e.load_tree(&ui, Some(directory));
@@ -427,6 +577,8 @@ impl Editor {
                     e.buffer.set_modified(false);
                     e.project.set(project);
                     *e.path.borrow_mut() = path.clone();
+                    *e.selected_path.borrow_mut() = path.clone();
+                    e.selected_directory.set(false);
                     *e.original.borrow_mut() = content.into();
                     e.set_busy(false);
                     let manager = sourceview5::LanguageManager::default();
@@ -511,12 +663,17 @@ impl Editor {
             let path = text(&entry, "path").to_string();
             let title = format!("{} {}", text(&entry, "name"), text(&entry, "badge"));
             if text(&entry, "kind") == "dir" {
-                let children = gtk::Box::new(gtk::Orientation::Vertical, 2);
-                children.set_margin_start(12);
+                let children = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                children.set_margin_start(14);
                 let row = gtk::Expander::builder()
                     .label(&title)
                     .child(&children)
                     .build();
+                row.add_css_class("code-folder");
+                let heading = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+                heading.append(&crate::icons::image("folder", 13));
+                heading.append(&label(&title, "code-file-name"));
+                row.set_label_widget(Some(&heading));
                 let loaded = Rc::new(Cell::new(false));
                 let e = self.clone();
                 let weak = Rc::downgrade(ui);
@@ -555,21 +712,31 @@ impl Editor {
                         }
                     });
                 });
+                self.bind_tree_row(ui, &row, &path, true);
                 target.append(&row);
                 let expand = self.expanded.borrow().contains(&path);
                 row.set_expanded(expand);
             } else {
-                let row = button(&title, "file");
+                let row = button("", "file");
+                row.add_css_class("code-file");
                 row.set_tooltip_text(Some(&path));
-                if let Some(label) = row.child().and_downcast::<gtk::Label>() {
-                    label.set_xalign(0.0);
-                    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-                }
+                let content = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+                content.append(&crate::icons::image(project_files::file_icon(&path), 13));
+                let name = label(text(&entry, "name"), "code-file-name");
+                name.set_hexpand(true);
+                name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                content.append(&name);
+                let badge = label(text(&entry, "badge"), "dim");
+                content.append(&badge);
+                row.set_child(Some(&content));
+                self.bind_tree_row(ui, &row, &path, false);
                 let e = self.clone();
                 let weak = Rc::downgrade(ui);
                 row.connect_clicked(move |_| {
                     if let Some(ui) = weak.upgrade() {
-                        e.open(&ui, path.clone());
+                        *e.selected_path.borrow_mut() = path.clone();
+                        e.selected_directory.set(false);
+                        e.open_path(&ui, path.clone(), None);
                     }
                 });
                 target.append(&row);
@@ -623,23 +790,8 @@ impl Editor {
             match result {
                 Ok(v) => {
                     let items = rows(&v, "worktrees");
-                    e.scope_loading.set(true);
-                    e.scope.remove_all();
-                    e.scope.append(Some(""), "Primary checkout");
-                    for item in &items {
-                        let path = text(item, "path");
-                        e.scope.append(
-                            Some(path),
-                            &format!(
-                                "{} · {}",
-                                item["session"].as_str().unwrap_or("Primary"),
-                                text(item, "branch")
-                            ),
-                        );
-                    }
-                    e.scope.set_active_id(Some(&e.worktree.borrow()));
                     *e.worktrees.borrow_mut() = items;
-                    e.scope_loading.set(false);
+                    e.update_scope_label(&ui);
                 }
                 Err(err) => ui.show_error(&err.to_string()),
             }
@@ -648,33 +800,12 @@ impl Editor {
     fn bind_controls(self: &Rc<Self>, ui: &Rc<Ui>) {
         let e = self.clone();
         let weak = Rc::downgrade(ui);
-        self.scope.connect_changed(move |scope| {
-            if e.scope_loading.get() {
-                return;
+        self.scope.set_create_popup_func(move |button| {
+            if let Some(ui) = weak.upgrade() {
+                e.scope_picker(&ui, button);
             }
-            let Some(ui) = weak.upgrade() else {
-                return;
-            };
-            let selected = scope.active_id().map(|s| s.to_string()).unwrap_or_default();
-            if selected == *e.worktree.borrow() {
-                return;
-            }
-            if e.is_dirty() {
-                e.scope_loading.set(true);
-                scope.set_active_id(Some(&e.worktree.borrow()));
-                e.scope_loading.set(false);
-                ui.show_error("Save or discard your changes before switching worktrees.");
-                return;
-            }
-            e.clear_document();
-            e.commit_message.set_text("");
-            e.branch_name.set_text("");
-            e.branch_start.set_text("");
-            *e.worktree.borrow_mut() = selected;
-            e.search.set_text("");
-            e.load_tree(&ui, None);
-            e.refresh_git(&ui);
         });
+        self.bind_tree_drop(ui, &self.tree, "");
         let e = self.clone();
         let weak = Rc::downgrade(ui);
         self.search.connect_activate(move |_| {
@@ -696,6 +827,7 @@ impl Editor {
             ("Trash", "file.delete"),
         ] {
             let action = button(title, "quiet");
+            action.set_widget_name(&format!("project-{op}"));
             let e = self.clone();
             let weak = Rc::downgrade(ui);
             action.connect_clicked(move |_| {
@@ -855,9 +987,13 @@ impl Editor {
             ui.show_error("Save or discard the current file before changing files.");
             return;
         }
-        let path = self.path.borrow().clone();
+        let path = if self.selected_path.borrow().is_empty() {
+            self.path.borrow().clone()
+        } else {
+            self.selected_path.borrow().clone()
+        };
         if op != "file.create" && path.is_empty() {
-            ui.show_error("Open a file first.");
+            ui.show_error("Select a file or folder first.");
             return;
         }
         let title = match op {
@@ -872,12 +1008,28 @@ impl Editor {
             "Apply"
         };
         let entry = gtk::Entry::new();
+        entry.set_widget_name("project-file-path");
         entry.set_placeholder_text(Some(if op == "file.create" {
             "relative/path.rs"
         } else {
             "new-name.rs"
         }));
+        if op == "file.create" && !path.is_empty() {
+            let directory = if self.selected_directory.get() {
+                path.clone()
+            } else {
+                std::path::Path::new(&path)
+                    .parent()
+                    .unwrap_or(std::path::Path::new(""))
+                    .to_string_lossy()
+                    .to_string()
+            };
+            if !directory.is_empty() {
+                entry.set_text(&format!("{directory}/"));
+            }
+        }
         let folder = gtk::CheckButton::with_label("Create a folder");
+        folder.set_widget_name("project-file-folder");
         if op == "file.delete" {
             let copy = label(
                 &format!("{path}\nThe file can be restored from Relay trash."),
@@ -928,6 +1080,27 @@ impl Editor {
             }
             match result {
                 Ok(v) => {
+                    if op == "file.rename" && text(&v, "kind") == "dir" {
+                        let new_path = text(&v, "path");
+                        let expanded = e
+                            .expanded
+                            .borrow()
+                            .iter()
+                            .map(|item| {
+                                item.strip_prefix(&path)
+                                    .filter(|suffix| suffix.is_empty() || suffix.starts_with('/'))
+                                    .map(|suffix| format!("{new_path}{suffix}"))
+                                    .unwrap_or_else(|| item.clone())
+                            })
+                            .collect();
+                        *e.expanded.borrow_mut() = expanded;
+                    }
+                    *e.selected_path.borrow_mut() = if op == "file.delete" {
+                        String::new()
+                    } else {
+                        text(&v, "path").to_owned()
+                    };
+                    e.selected_directory.set(text(&v, "kind") == "dir");
                     e.clear_document();
                     e.load_tree(&ui, None);
                     e.refresh_git(&ui);
@@ -935,6 +1108,7 @@ impl Editor {
                         // The ID is also kept by the engine; no permanent deletion is offered here.
                         let id = v["trash_id"].as_i64().unwrap_or(0);
                         let restore = button("Undo trash", "quiet");
+                        restore.set_widget_name("project-file-undo");
                         let weak = Rc::downgrade(&ui);
                         let ed = e.clone();
                         restore.connect_clicked(move |button| {
@@ -967,8 +1141,8 @@ impl Editor {
                                 }
                             });
                         });
-                        e.tree.prepend(&restore);
-                    } else if !folder.is_active() {
+                        e.file_undo.append(&restore);
+                    } else if text(&v, "kind") != "dir" {
                         e.open(&ui, text(&v, "path").to_string());
                     }
                 }

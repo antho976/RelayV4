@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Relay
+Comment=Local workspace for coding agents
+Exec=relay-native
+Icon=com.quietsoftware.Relay4
+Categories=Development;IDE;
+Terminal=false
+StartupWMClass=com.quietsoftware.Relay4

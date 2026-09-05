@@ -1,6 +1,10 @@
 //! Relay-2 Icon.svelte geometry, pinned source revision in docs/SOURCES.md.
 use gtk4::{self as gtk, prelude::*};
 pub fn image(name: &str, size: i32) -> gtk::Image {
+    image_with_stroke(name, size, 1.5)
+}
+
+pub fn image_with_stroke(name: &str, size: i32, stroke: f64) -> gtk::Image {
     let name = match name {
         "sidebar-show-symbolic" => "sidebar",
         "system-search-symbolic" => "search",
@@ -123,8 +127,14 @@ pub fn image(name: &str, size: i32) -> gtk::Image {
     image.set_pixel_size(size);
     let paint = move |image: &gtk::Image| {
         let color = image.color();
+        let background = image
+            .style_context()
+            .lookup_color("console")
+            .map(|color| color.to_string())
+            .unwrap_or_else(|| "#141416".into());
+        let geometry = geometry.replace("#141416", &background);
         let document = format!(
-            r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" color="{color}" stroke="{color}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">{geometry}</svg>"##
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" color="{color}" stroke="{color}" stroke-width="{stroke}" stroke-linecap="round" stroke-linejoin="round">{geometry}</svg>"##
         );
         let svg = gtk::Svg::from_bytes(&glib::Bytes::from_owned(document.into_bytes()));
         image.set_paintable(Some(&svg));
@@ -133,4 +143,26 @@ pub fn image(name: &str, size: i32) -> gtk::Image {
     image.connect_map(paint);
     image.connect_state_flags_changed(move |image, _| paint(image));
     image
+}
+
+/// Register the bundled mark with GTK without changing the desktop icon theme.
+pub fn install_app_icon(window: &gtk::ApplicationWindow) {
+    let directory = glib::user_cache_dir().join("relay-v4/icons");
+    let path = directory.join("com.quietsoftware.Relay4.svg");
+    let bytes = include_bytes!("../resources/com.quietsoftware.Relay4.svg");
+    let result = std::fs::create_dir_all(&directory).and_then(|_| {
+        if std::fs::read(&path).ok().as_deref() == Some(bytes.as_slice()) {
+            Ok(())
+        } else {
+            std::fs::write(&path, bytes)
+        }
+    });
+    if let Err(error) = result {
+        tracing::warn!(%error, "Could not load Relay icon");
+        return;
+    }
+    gtk::IconTheme::for_display(&gtk::prelude::WidgetExt::display(window))
+        .add_search_path(&directory);
+    gtk::Window::set_default_icon_name("com.quietsoftware.Relay4");
+    window.set_icon_name(Some("com.quietsoftware.Relay4"));
 }

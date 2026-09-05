@@ -4,7 +4,7 @@
   "title": "RELAY v4 command bus",
   "description": "Generated from crates/relay-bus by `relay schema`. Do not edit; see docs/BUS.md.",
   "version": 1,
-  "op_count": 207,
+  "op_count": 210,
   "envelope": {
     "request": {
       "$ref": "#/$defs/Request"
@@ -735,6 +735,25 @@
       },
       "result": {
         "$ref": "#/$defs/Task"
+      }
+    },
+    "task.activity": {
+      "summary": "Task-scoped audit history and explicitly associated messages, newest first",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "project",
+      "executor": "core",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 7,
+      "payload": {
+        "$ref": "#/$defs/TaskActivityIn"
+      },
+      "result": {
+        "$ref": "#/$defs/TaskActivityOut"
       }
     },
     "task.list": {
@@ -1744,7 +1763,7 @@
       }
     },
     "session.done": {
-      "summary": "Agent self-report: completed moves a builder's task to in_review; blocked and partial leave it and say why",
+      "summary": "Record completion; all builders finish before review, and all reviewers finish before the group advances. Blocked/partial retain the assignment.",
       "kind": "mutation",
       "audit": "always",
       "undo": "none",
@@ -1755,7 +1774,9 @@
       "emits": [
         "session.changed",
         "task.changed",
-        "notify.new"
+        "notify.new",
+        "notify.changed",
+        "mailbox.new"
       ],
       "since": "1.0",
       "phase": 5,
@@ -2584,6 +2605,27 @@
         "$ref": "#/$defs/GitBranchCreateOut"
       }
     },
+    "git.branch.switch": {
+      "summary": "Switch a clean checkout without a live session to an existing local branch",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "project",
+      "executor": "core",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "git.changed"
+      ],
+      "since": "1.0",
+      "phase": 8,
+      "payload": {
+        "$ref": "#/$defs/GitBranchSwitchIn"
+      },
+      "result": {
+        "$ref": "#/$defs/Empty"
+      }
+    },
     "git.branch.delete": {
       "summary": "Delete one merged local branch that is not checked out or owned by a session",
       "kind": "mutation",
@@ -2707,7 +2749,7 @@
       }
     },
     "git.pr.list": {
-      "summary": "Open pull requests for the project",
+      "summary": "All pull request states for the project, across every page",
       "kind": "query",
       "audit": "never",
       "undo": "none",
@@ -3458,6 +3500,27 @@
       },
       "result": {
         "$ref": "#/$defs/ProviderListOut"
+      }
+    },
+    "provider.update": {
+      "summary": "Update a supported user-installed provider in the background",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "executor": "core",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "provider.update.changed"
+      ],
+      "since": "1.0",
+      "phase": 6,
+      "payload": {
+        "$ref": "#/$defs/ProviderUpdateIn"
+      },
+      "result": {
+        "$ref": "#/$defs/ProviderUpdateOut"
       }
     },
     "usage.get": {
@@ -6575,6 +6638,127 @@
         "task_id"
       ]
     },
+    "TaskActivityIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "task_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "before_audit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "before_message": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "task_id"
+      ]
+    },
+    "TaskActivityOut": {
+      "type": "object",
+      "properties": {
+        "history": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AuditRow"
+          }
+        },
+        "messages": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Message"
+          }
+        },
+        "next_audit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "next_message": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        }
+      },
+      "required": [
+        "history",
+        "messages"
+      ]
+    },
+    "Message": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "project_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "from": {
+          "type": "string"
+        },
+        "to": {
+          "type": "string",
+          "description": "Session name or `*`."
+        },
+        "text": {
+          "type": "string"
+        },
+        "re_task": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "priority": {
+          "type": "boolean",
+          "default": false
+        },
+        "sent_at": {
+          "type": "string"
+        },
+        "acked_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "project_id",
+        "from",
+        "to",
+        "text",
+        "sent_at"
+      ]
+    },
     "TaskListIn": {
       "type": "object",
       "additionalProperties": false,
@@ -8148,57 +8332,6 @@
         "message",
         "recipients",
         "delivery"
-      ]
-    },
-    "Message": {
-      "type": "object",
-      "properties": {
-        "id": {
-          "type": "integer",
-          "format": "int64"
-        },
-        "project_id": {
-          "type": "integer",
-          "format": "int64"
-        },
-        "from": {
-          "type": "string"
-        },
-        "to": {
-          "type": "string",
-          "description": "Session name or `*`."
-        },
-        "text": {
-          "type": "string"
-        },
-        "re_task": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "int64"
-        },
-        "priority": {
-          "type": "boolean",
-          "default": false
-        },
-        "sent_at": {
-          "type": "string"
-        },
-        "acked_at": {
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "id",
-        "project_id",
-        "from",
-        "to",
-        "text",
-        "sent_at"
       ]
     },
     "MailboxRecipient": {
@@ -10152,11 +10285,17 @@
           ]
         },
         "ahead": {
-          "type": "integer",
+          "type": [
+            "integer",
+            "null"
+          ],
           "format": "int64"
         },
         "behind": {
-          "type": "integer",
+          "type": [
+            "integer",
+            "null"
+          ],
           "format": "int64"
         },
         "files": {
@@ -10168,8 +10307,6 @@
       },
       "required": [
         "branch",
-        "ahead",
-        "behind",
         "files"
       ]
     },
@@ -10528,11 +10665,17 @@
           ]
         },
         "ahead": {
-          "type": "integer",
+          "type": [
+            "integer",
+            "null"
+          ],
           "format": "int64"
         },
         "behind": {
-          "type": "integer",
+          "type": [
+            "integer",
+            "null"
+          ],
           "format": "int64"
         },
         "merged": {
@@ -10551,8 +10694,6 @@
       "required": [
         "name",
         "head",
-        "ahead",
-        "behind",
         "merged",
         "current"
       ]
@@ -10609,6 +10750,29 @@
         "name",
         "head",
         "worktree"
+      ]
+    },
+    "GitBranchSwitchIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "project_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "worktree": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id",
+        "name"
       ]
     },
     "GitBranchDeleteIn": {
@@ -10698,18 +10862,20 @@
       "type": "object",
       "properties": {
         "ahead": {
-          "type": "integer",
+          "type": [
+            "integer",
+            "null"
+          ],
           "format": "int64"
         },
         "behind": {
-          "type": "integer",
+          "type": [
+            "integer",
+            "null"
+          ],
           "format": "int64"
         }
-      },
-      "required": [
-        "ahead",
-        "behind"
-      ]
+      }
     },
     "GitPushIn": {
       "type": "object",
@@ -10744,10 +10910,14 @@
           "items": {
             "$ref": "#/$defs/GitPullRequest"
           }
+        },
+        "complete": {
+          "type": "boolean"
         }
       },
       "required": [
-        "pull_requests"
+        "pull_requests",
+        "complete"
       ]
     },
     "GitPullRequest": {
@@ -10769,6 +10939,12 @@
         },
         "title": {
           "type": "string"
+        },
+        "state": {
+          "type": "string"
+        },
+        "same_repository": {
+          "type": "boolean"
         }
       },
       "required": [
@@ -10776,7 +10952,9 @@
         "branch",
         "draft",
         "url",
-        "title"
+        "title",
+        "state",
+        "same_repository"
       ]
     },
     "GitPrOpenIn": {
@@ -12044,6 +12222,43 @@
       },
       "required": [
         "providers"
+      ]
+    },
+    "ProviderUpdateIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "provider": {
+          "$ref": "#/$defs/Provider"
+        },
+        "automatic": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "provider"
+      ]
+    },
+    "ProviderUpdateOut": {
+      "type": "object",
+      "properties": {
+        "started": {
+          "type": "boolean"
+        },
+        "method": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "started",
+        "method",
+        "message"
       ]
     },
     "UsageGetIn": {

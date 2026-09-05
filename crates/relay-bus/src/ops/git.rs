@@ -1,7 +1,7 @@
 //! `worktree.*` / `git.*` / `integration.*` — BUS.md §10.12.
 use crate::registry::{Actors, Audit, OpMeta, Scope};
 use crate::types::{Branch, Commit, DiffFile, FileStatus, Hunk, Id, Integration, Worktree};
-use crate::{op, Empty};
+use crate::{Empty, op};
 
 payload!(#[schemars(rename = "GitProjectIn")] ProjectIn { pub project_id: Id });
 payload!(#[schemars(rename = "WorktreeListIn")] WorktreeListIn { pub project_id: Id, pub include_dirty: Option<bool> });
@@ -18,7 +18,7 @@ result!(#[schemars(rename = "WorktreeDiskOut")] WorktreeDiskOut { pub worktrees:
 op!(WorktreeDisk, "worktree.disk", ProjectIn => WorktreeDiskOut, OpMeta::query(Scope::Project, 3, "Disk per worktree, build output separately"));
 
 payload!(#[schemars(rename = "GitWtIn")] WtIn { pub project_id: Id, pub worktree: Option<String> });
-result!(#[schemars(rename = "GitStatusOut")] StatusOut { pub branch: String, pub upstream: Option<String>, pub ahead: i64, pub behind: i64, pub files: Vec<FileStatus> });
+result!(#[schemars(rename = "GitStatusOut")] StatusOut { pub branch: String, pub upstream: Option<String>, pub ahead: Option<i64>, pub behind: Option<i64>, pub files: Vec<FileStatus> });
 op!(Status, "git.status", WtIn => StatusOut, OpMeta::query(Scope::Project, 8, "Working tree status (gix)"));
 payload!(#[schemars(rename = "GitDiffIn")] DiffIn { pub project_id: Id, pub worktree: Option<String>, pub base: Option<String>, pub staged: Option<bool> });
 result!(#[schemars(rename = "GitDiffOut")] DiffOut { pub files: Vec<DiffFile> });
@@ -48,6 +48,11 @@ result!(#[schemars(rename = "GitBranchCreateOut")] BranchCreateOut {
 });
 op!(BranchCreate, "git.branch.create", BranchCreateIn => BranchCreateOut,
     OpMeta::mutation(Scope::Project, 8, "Create a branch in a project worktree and optionally check it out").actors(Actors::UserOnly).emits(&["git.changed"]));
+payload!(#[schemars(rename = "GitBranchSwitchIn")] BranchSwitchIn {
+    pub project_id: Id, pub worktree: Option<String>, pub name: String,
+});
+op!(BranchSwitch, "git.branch.switch", BranchSwitchIn => Empty,
+    OpMeta::mutation(Scope::Project, 8, "Switch a clean checkout without a live session to an existing local branch").actors(Actors::UserOnly).emits(&["git.changed"]));
 payload!(#[schemars(rename = "GitBranchDeleteIn")] BranchDeleteIn { pub project_id: Id, pub name: String });
 op!(BranchDelete, "git.branch.delete", BranchDeleteIn => Empty,
     OpMeta::mutation(Scope::Project, 8, "Delete one merged local branch that is not checked out or owned by a session").actors(Actors::UserOnly).emits(&["git.changed"]));
@@ -58,7 +63,7 @@ payload!(#[schemars(rename = "GitCommitIn")] CommitIn { pub project_id: Id, pub 
 result!(#[schemars(rename = "GitCommitOut")] CommitOut { pub sha: String });
 op!(CommitOp, "git.commit", CommitIn => CommitOut,
     OpMeta::mutation(Scope::Project, 8, "Commit (caps and protected paths apply)").emits(&["git.changed"]));
-result!(#[schemars(rename = "GitFetchOut")] FetchOut { pub ahead: i64, pub behind: i64 });
+result!(#[schemars(rename = "GitFetchOut")] FetchOut { pub ahead: Option<i64>, pub behind: Option<i64> });
 op!(Fetch, "git.fetch", ProjectIn => FetchOut, OpMeta::mutation(Scope::Project, 8, "Fetch upstream").audit(Audit::AgentOnly).emits(&["git.changed"]));
 payload!(#[schemars(rename = "GitPushIn")] PushIn { pub project_id: Id, pub worktree: Option<String>, pub set_upstream: Option<bool> });
 op!(Push, "git.push", PushIn => Empty, OpMeta::mutation(Scope::Project, 8, "Push (system git)").emits(&["git.changed"]));
@@ -68,9 +73,11 @@ result!(#[schemars(rename = "GitPullRequest")] PullRequest {
     pub draft: bool,
     pub url: String,
     pub title: String,
+    pub state: String,
+    pub same_repository: bool,
 });
-result!(#[schemars(rename = "GitPrListOut")] PrListOut { pub pull_requests: Vec<PullRequest> });
-op!(PrList, "git.pr.list", ProjectIn => PrListOut, OpMeta::query(Scope::Project, 8, "Open pull requests for the project"));
+result!(#[schemars(rename = "GitPrListOut")] PrListOut { pub pull_requests: Vec<PullRequest>, pub complete: bool });
+op!(PrList, "git.pr.list", ProjectIn => PrListOut, OpMeta::query(Scope::Project, 8, "All pull request states for the project, across every page"));
 payload!(#[schemars(rename = "GitPrOpenIn")] PrOpenIn { pub project_id: Id, pub worktree: Option<String>, pub title: Option<String>, pub body: Option<String> });
 result!(#[schemars(rename = "GitPrOpenOut")] PrOpenOut { pub url: String });
 op!(PrOpen, "git.pr.open", PrOpenIn => PrOpenOut, OpMeta::mutation(Scope::Project, 8, "Open a PR for the branch"));
@@ -94,4 +101,31 @@ op!(IntegrationList, "integration.list", ProjectIn => IntegrationListOut, OpMeta
 op!(IntegrationDiscard, "integration.discard", IntegrationIdIn => Empty,
     OpMeta::mutation(Scope::Project, 8, "Remove the throwaway worktree").actors(Actors::UserOnly).emits(&["integration.changed"]));
 
-entries!(WorktreeList, WorktreeCreate, WorktreeRemove, WorktreeDisk, Status, Diff, DiffFileOp, Log, Show, Branches, BranchCreate, BranchDelete, Stage, Unstage, CommitOp, Fetch, Push, PrList, PrOpen, CleanMerged, SuggestMessage, IntegrationRequest, IntegrationGet, IntegrationList, IntegrationDiscard);
+entries!(
+    WorktreeList,
+    WorktreeCreate,
+    WorktreeRemove,
+    WorktreeDisk,
+    Status,
+    Diff,
+    DiffFileOp,
+    Log,
+    Show,
+    Branches,
+    BranchCreate,
+    BranchSwitch,
+    BranchDelete,
+    Stage,
+    Unstage,
+    CommitOp,
+    Fetch,
+    Push,
+    PrList,
+    PrOpen,
+    CleanMerged,
+    SuggestMessage,
+    IntegrationRequest,
+    IntegrationGet,
+    IntegrationList,
+    IntegrationDiscard
+);

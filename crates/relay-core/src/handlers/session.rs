@@ -34,13 +34,101 @@ fn next_queued_task(
     conn.query_row(
         "SELECT t.id,t.module_id
          FROM task_sessions ts JOIN tasks t ON t.id=ts.task_id
-         WHERE ts.session_id=?1 AND t.id!=?2 AND t.deleted_at IS NULL AND t.col='active'
+         WHERE ts.session_id=?1 AND t.id!=?2 AND t.deleted_at IS NULL AND t.col='active' AND ts.completed_at IS NULL
          ORDER BY ts.queue_ord,t.position,t.id LIMIT 1",
         params![session_id, completed_task_id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )
     .optional()
     .bus()
+}
+
+fn assignment_text(task_id: Id, review: bool) -> String {
+    if review {
+        format!("All builders finished Task #{task_id}. Review the current task in the shared worktree; report your review outcome before the group advances.")
+    } else {
+        format!("Your current assignment is Task #{task_id}. Read session.bootstrap for the task and group context before continuing.")
+    }
+}
+
+pub(crate) fn announce_assignment(ctx: &mut Ctx, session: &Session, task_id: Id, review: bool) -> Result<(), BusError> {
+    let text = assignment_text(task_id, review);
+    if let Some(message) = crate::handlers::notes::send_system(ctx.tx(), session.project_id, &session.name, &text, Some(task_id), &ctx.now)? {
+        ctx.emit("mailbox.new", serde_json::to_value(message).bus()?);
+    }
+    deliver_assignment(ctx, session, task_id, review)
+}
+
+fn deliver_assignment(ctx: &mut Ctx, session: &Session, task_id: Id, review: bool) -> Result<(), BusError> {
+    // Done runs inside the provider's old turn. Its trailing Stop is the safe handoff
+    // edge; hookless providers retain the assignment in durable mail instead.
+    let awaiting_stop: bool = ctx.tx().query_row(
+        "SELECT done_pending_stop IS NOT NULL FROM sessions WHERE id=?1", [session.id], |row| row.get(0),
+    ).bus()?;
+    if awaiting_stop { return Ok(()); }
+    let text = assignment_text(task_id, review);
+    let (id, project) = (session.id, session.project_id);
+    ctx.after_commit(move |engine| {
+        let Some(pty) = engine.pty(id) else { return; };
+        if !pty.claim_idle_edge() { return; }
+        let changed = engine.system_write("session.assignment.ready", None, Some(project), Some(id), json!({"task_id":task_id}), |tx, now| {
+            let changed = tx.execute("UPDATE sessions SET state='running',updated_at=?1 WHERE id=?2 AND task_id=?3 AND state='idle' AND done_pending_stop IS NULL", params![now,id,task_id]).bus()?;
+            let mut events = Vec::new();
+            if changed > 0 {
+                if let Some(row) = sessions::by_id(tx,id)? { events.push(("session.changed".into(),serde_json::to_value(row.session).bus()?)); }
+            }
+            Ok((changed > 0, events))
+        });
+        if matches!(changed, Ok(true)) {
+            if let Err(error) = pty.write(format!("{text}\r").as_bytes()) {
+                tracing::warn!(session_id=id, %error, "assignment remains available in Relay mailbox");
+            }
+        }
+    });
+    Ok(())
+}
+
+fn complete_group_assignment(ctx: &mut Ctx, session: &Session, task_id: Id, sha: Option<&str>) -> Result<(), BusError> {
+    if session.role == Role::Reviewer {
+        let ready: bool = ctx.tx().query_row("SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1 AND col IN ('in_review','done') AND deleted_at IS NULL)",[task_id],|row|row.get(0)).bus()?;
+        if !ready { return Err(BusError::conflict("session.review_not_ready", "Builders must finish the current task before its review can complete")); }
+    }
+    ctx.tx().execute("UPDATE task_sessions SET completed_at=COALESCE(completed_at,?1) WHERE task_id=?2 AND session_id=?3",params![ctx.now,task_id,session.id]).bus()?;
+    if let Some(sha) = sha.filter(|sha| !sha.trim().is_empty()) {
+        ctx.tx().execute("INSERT OR IGNORE INTO task_commits(task_id,sha,branch,linked_at) VALUES (?1,?2,?3,?4)",params![task_id,sha,session.branch,ctx.now]).bus()?;
+    }
+    let builders_left: i64 = ctx.tx().query_row(
+        "SELECT COUNT(*) FROM task_sessions ts JOIN sessions s ON s.id=ts.session_id WHERE ts.task_id=?1 AND s.worktree=?2 AND s.role='builder' AND s.state!='closed' AND ts.completed_at IS NULL",
+        params![task_id,session.worktree],|row|row.get(0)).bus()?;
+    if builders_left != 0 { return Ok(()); }
+    let changed = ctx.tx().execute("UPDATE tasks SET col='in_review',state='awaiting_review',updated_at=?1 WHERE id=?2 AND col='active' AND deleted_at IS NULL",params![ctx.now,task_id]).bus()?;
+    let mut stmt = ctx.tx().prepare_cached("SELECT s.id FROM sessions s JOIN task_sessions ts ON ts.session_id=s.id WHERE ts.task_id=?1 AND s.worktree=?2 AND s.state!='closed' ORDER BY s.id").bus()?;
+    let ids = stmt.query_map(params![task_id,session.worktree],|row|row.get::<_,Id>(0)).bus()?.collect::<rusqlite::Result<Vec<_>>>().bus()?;
+    drop(stmt);
+    if changed > 0 {
+        ctx.emit("task.changed",json!({"task_id":task_id,"col":"in_review","state":"awaiting_review"}));
+        for id in &ids {
+            if let Some(row) = sessions::by_id(ctx.tx(),*id)? {
+                if row.session.role == Role::Reviewer { announce_assignment(ctx,&row.session,task_id,true)?; }
+            }
+        }
+    }
+    let reviewers_left: i64 = ctx.tx().query_row(
+        "SELECT COUNT(*) FROM task_sessions ts JOIN sessions s ON s.id=ts.session_id WHERE ts.task_id=?1 AND s.worktree=?2 AND s.role='reviewer' AND s.state!='closed' AND ts.completed_at IS NULL",
+        params![task_id,session.worktree],|row|row.get(0)).bus()?;
+    if reviewers_left != 0 { return Ok(()); }
+    let next = next_queued_task(ctx.tx(),session.id,task_id)?;
+    for id in ids {
+        let changed = ctx.tx().execute("UPDATE sessions SET task_id=?1,module_id=?2,updated_at=?3 WHERE id=?4 AND task_id=?5",params![next.map(|v|v.0),next.and_then(|v|v.1),ctx.now,id,task_id]).bus()?;
+        if changed > 0 {
+            if let Some(row) = sessions::by_id(ctx.tx(),id)? {
+                emit_session(ctx,&row.session);
+                if let Some((next_id,_)) = next { announce_assignment(ctx,&row.session,next_id,false)?; }
+            }
+        }
+    }
+    Ok(())
+
 }
 
 fn launch_nudge(row: &Row_) -> Option<String> {
@@ -157,21 +245,32 @@ fn emit_session(ctx: &mut Ctx, s: &Session) {
     );
 }
 
+// Hooks and explicit reports can describe the same result more than once.
+// Keep one unread card per result, without replaying its sound or peer broadcast.
+fn record_agent_notification(ctx: &mut Ctx, s: &Session, category: &str, title: &str, body: &str, link: &str) -> Result<bool, BusError> {
+    let existing = ctx.tx().query_row(
+        "SELECT id FROM notifications WHERE project_id=?1 AND category=?2 AND title=?3 AND link=?4 AND read=0 ORDER BY id DESC LIMIT 1",
+        params![s.project_id, category, title, link], |row| row.get::<_, i64>(0),
+    ).optional().bus()?;
+    if let Some(id) = existing {
+        if body != "Agent turn completed" {
+            ctx.tx().execute("UPDATE notifications SET body=?1 WHERE id=?2", params![body, id]).bus()?;
+            ctx.emit("notify.changed", json!({"notification_id":id,"project_id":s.project_id}));
+        }
+        return Ok(false);
+    }
+    ctx.tx().execute(
+        "INSERT INTO notifications(project_id,category,title,body,link,read,created_at) VALUES (?1,?2,?3,?4,?5,0,?6)",
+        params![s.project_id, category, title, body, link, ctx.now],
+    ).bus()?;
+    Ok(true)
+}
+
 fn notify_completion(ctx: &mut Ctx, s: &Session, summary: &str) -> Result<(), BusError> {
     let link = done_link(s);
-    ctx.tx()
-        .execute(
-            "INSERT INTO notifications(project_id, category, title, body, link, read, created_at)
-         VALUES (?1, 'agent_done', ?2, ?3, ?4, 0, ?5)",
-            params![
-                s.project_id,
-                format!("{} finished", s.name),
-                summary,
-                link,
-                ctx.now
-            ],
-        )
-        .bus()?;
+    if !record_agent_notification(ctx, s, "agent_done", &format!("{} finished", s.name), summary, &link)? {
+        return Ok(());
+    }
     if let Some(message) = crate::handlers::notes::send_system(
         ctx.tx(),
         s.project_id,
@@ -390,7 +489,7 @@ fn launch(ctx: &mut Ctx, row: &Row_, kind: LaunchKind) -> Result<Session, BusErr
     }).map_err(|error| BusError::unavailable("session.spawn_failed", error.to_string()))?;
     ctx.tx().execute(
         "UPDATE sessions SET state='running',pid=?1,epoch=?2,spawned_at=COALESCE(spawned_at,?3),
-         exit_code=NULL,restore_reason=NULL,updated_at=?3 WHERE id=?4",
+         exit_code=NULL,restore_reason=NULL,done_pending_stop=NULL,updated_at=?3 WHERE id=?4",
         params![pty.pid() as i64, epoch as i64, ctx.now, sid],
     ).bus()?;
     if let Some(old) = ctx.engine().set_pty(sid, &row.session.name, pty) {
@@ -482,8 +581,8 @@ pub fn register(e: &mut Engine) {
                 let branch = p.branch.clone().unwrap_or_else(|| worktree::branch_for(&name));
                 let path = worktree::pooled_path(repo, &name);
                 let base = project.base_branch.clone();
-                let from = if base.is_empty() { None } else { Some(base.as_str()) };
-                let wt = worktree::create(repo, &path, &branch, from)
+                let from = super::git::new_worktree_base(repo, &base);
+                let wt = worktree::create(repo, &path, &branch, from.as_deref())
                     .or_else(|_| worktree::create(repo, &path, &branch, None))
                     .map_err(|e| BusError::conflict("worktree.create_failed", e.to_string()))?;
                 (wt.path, wt.branch)
@@ -785,40 +884,15 @@ pub fn register(e: &mut Engine) {
             ));
         }
         let current_task_id = s.task_id;
-        if s.role == Role::Builder && status == "completed" {
+        if status == "completed" {
+            ctx.tx().execute("UPDATE sessions SET done_pending_stop=?1 WHERE id=?2", params![current_task_id.unwrap_or(0),s.id]).bus()?;
+        }
+        if matches!(s.role, Role::Builder | Role::Reviewer) && status == "completed" {
+            if let Some(task_id) = current_task_id { complete_group_assignment(ctx,s,task_id,p.sha.as_deref())?; }
+        }
+        if status != "completed" {
             if let Some(task_id) = current_task_id {
-                let changed = ctx.tx().execute(
-                    "UPDATE tasks SET col='in_review', state='awaiting_review', updated_at=?1
-                     WHERE id=?2 AND project_id=?3 AND deleted_at IS NULL AND col='active'",
-                    params![ctx.now, task_id, s.project_id],
-                ).bus()?;
-                if changed > 0 {
-                    ctx.emit("task.changed", json!({"task_id": task_id, "col": "in_review", "state": "awaiting_review"}));
-                    if let Some(sha) = p.sha.as_deref().filter(|sha| !sha.trim().is_empty()) {
-                        ctx.tx().execute(
-                            "INSERT OR IGNORE INTO task_commits(task_id, sha, branch, linked_at) VALUES (?1, ?2, ?3, ?4)",
-                            params![task_id, sha, s.branch, ctx.now],
-                        ).bus()?;
-                    }
-                    if let Some((next_task_id, next_module_id)) = next_queued_task(ctx.tx(), s.id, task_id)? {
-                        ctx.tx().execute(
-                            "UPDATE sessions SET task_id=?1,module_id=?2,updated_at=?3
-                             WHERE worktree=?4 AND state!='closed'",
-                            params![next_task_id, next_module_id, ctx.now, s.worktree],
-                        ).bus()?;
-                        let session_id = s.id;
-                        ctx.after_commit(move |engine| {
-                            if let Some(pty) = engine.pty(session_id) {
-                                let prompt = format!(
-                                    "Task #{task_id} is recorded for review. Call session.bootstrap, then continue with current Task #{next_task_id}."
-                                );
-                                if let Err(error) = pty.write(format!("{prompt}\r").as_bytes()) {
-                                    tracing::warn!(session_id, error = %error, "could not prompt the next queued task");
-                                }
-                            }
-                        });
-                    }
-                }
+                ctx.tx().execute("UPDATE task_sessions SET completed_at=NULL WHERE task_id=?1 AND session_id=?2",params![task_id,s.id]).bus()?;
             }
         }
         // A builder that stopped short leaves its task visible as stopped, not silently active.
@@ -859,19 +933,19 @@ pub fn register(e: &mut Engine) {
             "blocked" => format!("{} is blocked", s.name),
             _ => format!("{} finished part of its work", s.name),
         };
-        ctx.tx().execute(
-            "INSERT INTO notifications(project_id, category, title, body, link, read, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
-            params![s.project_id, category, headline, summary, link, ctx.now],
-        ).bus()?;
-        if let Some(message) = crate::handlers::notes::send_system(
+        let fresh_notification = record_agent_notification(ctx, s, category, &headline, summary, &link)?;
+        if fresh_notification {
+          if let Some(message) = crate::handlers::notes::send_system(
             ctx.tx(), s.project_id, "*", &format!("{headline}: {summary}"), s.task_id, &ctx.now,
-        )? {
+          )? {
             ctx.emit("mailbox.new", serde_json::to_value(message).bus()?);
+          }
         }
         let updated = sessions::by_id(ctx.tx(), s.id)?.ok_or_else(|| BusError::internal("session vanished"))?;
         emit_session(ctx, &updated.session);
-        ctx.emit("notify.new", json!({"category":category, "project_id":s.project_id, "session":s.name, "status":status}));
+        if fresh_notification {
+            ctx.emit("notify.new", json!({"category":category, "project_id":s.project_id, "session":s.name, "status":status}));
+        }
         Ok(updated.session)
     });
 
@@ -1001,7 +1075,10 @@ pub fn register(e: &mut Engine) {
         assert_own(ctx, &row, false)?;
         let s = &row.session;
         let data = p.data.unwrap_or_else(|| json!({}));
-        let completed_without_done = p.kind == "stop" && s.state == SessionState::Running;
+        let pending_stop: Option<Id> = ctx.tx().query_row(
+            "SELECT done_pending_stop FROM sessions WHERE id=?1", [s.id], |row| row.get(0),
+        ).bus()?;
+        let completed_without_done = p.kind == "stop" && pending_stop.is_none() && s.state == SessionState::Running;
         let provider_ref = data.get("session_id").or_else(|| data.get("provider_ref")).and_then(Value::as_str);
         let state = match p.kind.as_str() {
             "session_start" | "tool_use" => "running",
@@ -1019,7 +1096,15 @@ pub fn register(e: &mut Engine) {
             "UPDATE sessions SET state=?1, provider_ref=COALESCE(?2, provider_ref), last_output_at=?3, updated_at=?3 WHERE id=?4",
             params![state, provider_ref, ctx.now, s.id],
         ).bus()?;
+        if matches!(p.kind.as_str(), "stop" | "session_start") {
+            ctx.tx().execute("UPDATE sessions SET done_pending_stop=NULL WHERE id=?1", [s.id]).bus()?;
+        }
         note_pty_state(ctx, s.id, state);
+        if p.kind == "stop" {
+            if let (Some(completed), Some(current)) = (pending_stop, s.task_id) {
+                if completed != current { deliver_assignment(ctx, s, current, false)?; }
+            }
+        }
         ctx.set_project(s.project_id);
         if s.role == Role::Builder {
             let task_state = match state { "running" => Some("running"), "blocked" => Some("blocked"), _ => None };
@@ -1037,16 +1122,13 @@ pub fn register(e: &mut Engine) {
         if blocked && state_changed {
             let body = data.get("message").and_then(Value::as_str).unwrap_or("Agent needs attention");
             let link = json!({"op":"session.get", "payload":{"session":s.name}}).to_string();
-            ctx.tx().execute(
-                "INSERT INTO notifications(project_id, category, title, body, link, read, created_at)
-                 VALUES (?1, 'agent_blocked', ?2, ?3, ?4, 0, ?5)",
-                params![s.project_id, format!("{} needs attention", s.name), body, link, ctx.now],
-            ).bus()?;
+            if record_agent_notification(ctx, s, "agent_blocked", &format!("{} needs attention", s.name), body, &link)? {
             ctx.emit("notify.new", json!({"category":"agent_blocked", "project_id":s.project_id, "session":s.name}));
             if let Some(message) = crate::handlers::notes::send_system(
                 ctx.tx(), s.project_id, "*", &format!("{} is blocked: {}", s.name, body), s.task_id, &ctx.now,
             )? {
                 ctx.emit("mailbox.new", serde_json::to_value(message).bus()?);
+            }
             }
         }
         if completed_without_done {

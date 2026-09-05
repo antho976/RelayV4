@@ -5,6 +5,8 @@ use gtk4 as gtk;
 use serde_json::json;
 use std::rc::Rc;
 use std::time::Duration;
+#[path = "smoke_notes.rs"]
+mod notes;
 
 fn named(root: &impl IsA<gtk::Widget>, name: &str) -> Option<gtk::Widget> {
     let root = root.as_ref();
@@ -19,6 +21,162 @@ fn named(root: &impl IsA<gtk::Widget>, name: &str) -> Option<gtk::Widget> {
         child = widget.next_sibling();
     }
     None
+}
+
+fn record_geometry(ui: &Ui, screenshot: &str) {
+    if let Ok(requested) = std::env::var("RELAY_NATIVE_PAGE") {
+        if matches!(
+            requested.as_str(),
+            "board" | "modules" | "settings" | "skills" | "dashboard"
+        ) {
+            assert_eq!(
+                *ui.page.borrow(),
+                requested,
+                "Capture must show the requested page"
+            );
+        }
+    }
+    fn collect(
+        widget: &gtk::Widget,
+        window: &gtk::ApplicationWindow,
+        rows: &mut Vec<serde_json::Value>,
+    ) {
+        if !widget.is_mapped() {
+            return;
+        }
+        if let Some(bounds) = widget.compute_bounds(window) {
+            rows.push(json!({
+                "type": widget.type_().name(), "name": widget.widget_name().to_string(),
+                "classes": widget.css_classes().iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                "text": widget.downcast_ref::<gtk::Label>().map(|l| l.text().to_string()),
+                "x": bounds.x(), "y": bounds.y(), "width": bounds.width(), "height": bounds.height()
+            }));
+        }
+        let mut child = widget.first_child();
+        while let Some(item) = child {
+            child = item.next_sibling();
+            collect(&item, window, rows);
+        }
+    }
+    let context = ui.window.pango_context();
+    let font = context
+        .load_font(&gtk::pango::FontDescription::from_string("Fira Mono 10"))
+        .expect("Bundled monospace font must load");
+    assert_eq!(
+        font.describe().family().as_deref(),
+        Some("Fira Mono"),
+        "Do not silently substitute a different terminal font"
+    );
+    let mut widgets = Vec::new();
+    collect(ui.window.upcast_ref(), &ui.window, &mut widgets);
+    for (class, dimension, expected) in [
+        ("topbar", "height", 42.),
+        ("statusbar", "height", 24.),
+        ("files-rail", "width", 28.),
+        ("umd", "height", 26.),
+    ] {
+        for widget in &widgets {
+            if widget["classes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c == class)
+            {
+                assert_eq!(
+                    widget[dimension].as_f64(),
+                    Some(expected),
+                    "Reference shell geometry: {class}"
+                );
+            }
+        }
+    }
+    if *ui.page.borrow() == "settings" {
+        assert!(
+            !widgets.iter().any(|w| w["classes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c == "sidebar")),
+            "Settings owns the full workspace"
+        );
+    }
+    if *ui.page.borrow() == "plan" {
+        assert!(
+            !widgets.iter().any(|w| w["name"] == "note-title"),
+            "Plan must not expose another document's title editor"
+        );
+    }
+    if *ui.page.borrow() == "dashboard" {
+        let page = widgets
+            .iter()
+            .find(|w| {
+                w["classes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|c| c == "dashboard-page")
+            })
+            .unwrap();
+        assert!(
+            page["x"].as_f64().unwrap() + page["width"].as_f64().unwrap()
+                <= f64::from(ui.window.width()),
+            "Dashboard must fit beside the sidebar"
+        );
+    }
+    let path = std::path::Path::new(screenshot).with_extension("geometry.json");
+    std::fs::write(path, serde_json::to_vec_pretty(&widgets).unwrap())
+        .expect("Save widget geometry");
+}
+
+fn verify_settings_save(ui: Rc<Ui>) {
+    let font = named(&ui.window, "setting:terminal.font_size")
+        .unwrap()
+        .downcast::<gtk::SpinButton>()
+        .unwrap();
+    let opacity = named(&ui.window, "setting:appearance.panel_alpha")
+        .unwrap()
+        .downcast::<gtk::Scale>()
+        .unwrap();
+    let threshold = named(&ui.window, "guardrail:destructive_write.min_removed_pct")
+        .unwrap()
+        .downcast::<gtk::SpinButton>()
+        .unwrap();
+    font.set_value(9.75);
+    opacity.set_value(0.96);
+    threshold.set_value(62.5);
+    named(&ui.window, "settings-save")
+        .unwrap()
+        .downcast::<gtk::Button>()
+        .unwrap()
+        .emit_clicked();
+    assert!(
+        !ui.pages["settings"].is_sensitive(),
+        "Save must lock its snapshot while persisting"
+    );
+    glib::timeout_add_local_once(Duration::from_millis(900), move || {
+        glib::spawn_future_local(async move {
+            assert!(
+                ui.pages["settings"].is_sensitive(),
+                "Settings save must finish"
+            );
+            let font = ui
+                .call("settings.get", json!({"path":"terminal.font_size"}))
+                .await
+                .unwrap();
+            let opacity = ui
+                .call("settings.get", json!({"path":"appearance.panel_alpha"}))
+                .await
+                .unwrap();
+            let guardrails = ui.call("guardrail.config.get", json!({})).await.unwrap();
+            assert_eq!(font["value"].as_f64(), Some(9.75));
+            assert_eq!(opacity["value"].as_f64(), Some(0.96));
+            assert_eq!(
+                guardrails["destructive_write"]["min_removed_pct"].as_f64(),
+                Some(62.5)
+            );
+            println!("Settings save verified across categories, including fractional values");
+        });
+    });
 }
 
 fn verify_pointer_target(ui: &Ui, name: &str) {
@@ -281,6 +439,13 @@ pub fn install(ui: &Rc<Ui>) {
     let Ok(path) = std::env::var("RELAY_NATIVE_SCREENSHOT") else {
         return;
     };
+    // A panic in a detached GLib future must fail the fixture, rather than leave
+    // an idle window until the harness timeout.
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        previous(info);
+        std::process::exit(1);
+    }));
     if std::env::var_os("RELAY_NATIVE_POINTER_DRIVER").is_some() {
         ui.window
             .set_title(Some(&format!("Relay pointer smoke {}", std::process::id())));
@@ -294,7 +459,38 @@ pub fn install(ui: &Rc<Ui>) {
     }
     let ui = ui.clone();
     let fixture = std::env::var("RELAY_NATIVE_FIXTURE").as_deref() == Ok("1");
+    if let Ok(part) = std::env::var("RELAY_NATIVE_ROADMAP") {
+        assert!(fixture && std::env::var("RELAY_INSTANCE").as_deref() == Ok("test"));
+        glib::timeout_add_local_once(Duration::from_secs(2), move || {
+            glib::spawn_future_local(async move {
+                let result = match part.as_str() {
+                    "notes" => notes::run(&ui).await,
+                    "files" => crate::smoke_project_files::run(&ui).await,
+                    "lifecycle" => crate::smoke_project_files::profile_lifecycle(&ui).await,
+                    "registry" => crate::smoke_registry::run(&ui).await,
+                    "tools" => {
+                        let value = crate::roadmap_smoke::run(&ui).await;
+                        println!("ROADMAP_TOOLS={value}");
+                        Ok(())
+                    }
+                    _ => Err(format!("Unknown roadmap smoke part: {part}")),
+                };
+                if let Err(error) = result {
+                    panic!("Roadmap regression {part}: {error}");
+                }
+                ui.window.close();
+                assert!(
+                    !ui.window.is_visible(),
+                    "Roadmap test left a dirty draft: {}",
+                    ui.notice.text()
+                );
+                println!("ROADMAP_OK={part}");
+            });
+        });
+        return;
+    }
     if fixture {
+        crate::pages::verify_note_tools();
         let input = ui.clone();
         glib::timeout_add_local_once(Duration::from_secs(1), move || {
             input.verify_terminal_input()
@@ -307,6 +503,9 @@ pub fn install(ui: &Rc<Ui>) {
     let navigate = ui.clone();
     glib::timeout_add_local_once(Duration::from_secs(2), move || {
         if fixture {
+            // In Settings this control is Back. Enter the wall before testing
+            // the sidebar toggle, then navigate to the requested capture page.
+            navigate.navigate("agents");
             navigate.verify_shell();
             if std::env::var("RELAY_NATIVE_PAGE").as_deref() == Ok("agents") {
                 verify_confirmations(navigate.clone());
@@ -315,8 +514,10 @@ pub fn install(ui: &Rc<Ui>) {
                 .unwrap()
                 .downcast::<gtk::Button>()
                 .unwrap();
+            let visible = navigate.sidebar.is_visible();
             toggle.emit_clicked();
             toggle.emit_clicked();
+            assert_eq!(navigate.sidebar.is_visible(), visible);
         }
         if let Ok(page) = std::env::var("RELAY_NATIVE_PAGE") {
             if page == "workspace-project-submit" {
@@ -326,26 +527,31 @@ pub fn install(ui: &Rc<Ui>) {
                     .unwrap()
                     .emit_clicked();
                 assert!(
-                    named(&navigate.window, "setup-local-path").is_some(),
+                    named(&navigate.window, "setup-local-repos").is_some(),
                     "New Session must guide an empty workspace to project selection"
                 );
-                navigate.dismiss_panels();
-                named(&navigate.window, "workspace-add-1")
-                    .unwrap()
-                    .downcast::<gtk::Button>()
-                    .unwrap()
-                    .emit_clicked();
-                let ui = navigate.clone();
-                glib::timeout_add_local_once(Duration::from_millis(700), move || {
-                    let key = named(&ui.window, "setup-add")
+                if let Ok(path) = std::env::var("RELAY_NATIVE_SETUP_PATH") {
+                    named(&navigate.window, "setup-path")
                         .unwrap()
-                        .downcast::<gtk::Button>()
-                        .unwrap();
-                    assert!(
-                        key.is_sensitive(),
-                        "The discovered local project must be actionable"
-                    );
-                    click_control(&ui, "setup-add");
+                        .downcast::<gtk::Entry>()
+                        .unwrap()
+                        .set_text(&path);
+                }
+                let ui = navigate.clone();
+                glib::timeout_add_local_once(Duration::from_millis(100), move || {
+                    // Let GTK allocate the newly mounted setup form before pointer checks.
+                    click_control(&ui, "setup-scan");
+                    glib::timeout_add_local_once(Duration::from_millis(700), move || {
+                        let key = named(&ui.window, "setup-add")
+                            .unwrap()
+                            .downcast::<gtk::Button>()
+                            .unwrap();
+                        assert!(
+                            key.is_sensitive(),
+                            "The discovered local project must be actionable"
+                        );
+                        click_control(&ui, "setup-add");
+                    });
                 });
                 return;
             }
@@ -403,7 +609,7 @@ pub fn install(ui: &Rc<Ui>) {
                 return;
             }
             if page.starts_with("setup") {
-                if named(&navigate.window, "setup-continue").is_none() {
+                if named(&navigate.window, "setup-add").is_none() {
                     navigate.open_repository();
                 }
                 if page == "setup" {
@@ -418,7 +624,7 @@ pub fn install(ui: &Rc<Ui>) {
                             .unwrap()
                             .set_text(&path);
                     }
-                    click_control(&navigate, "setup-continue");
+                    click_control(&navigate, "setup-scan");
                     let ui = navigate.clone();
                     glib::timeout_add_local_once(Duration::from_millis(500), move || {
                         if page.starts_with("setup-github") {
@@ -494,15 +700,22 @@ pub fn install(ui: &Rc<Ui>) {
                     ui.editor.verify_save(&ui)
                 });
             }
+            if page == "settings" && fixture {
+                let ui = navigate.clone();
+                glib::timeout_add_local_once(Duration::from_millis(700), move || {
+                    verify_settings_save(ui)
+                });
+            }
         }
     });
     glib::timeout_add_local_once(Duration::from_secs(duration), move || {
-        for name in [
-            "setup-continue",
-            "setup-path",
-            "setup-local-path",
-            "setup-add",
-        ] {
+        if fixture && *ui.page.borrow() == "board" {
+            assert!(
+                ui.dismiss_panels(),
+                "Saved task should close back to the board"
+            );
+        }
+        for name in ["setup-scan", "setup-path", "setup-local-path", "setup-add"] {
             if named(&ui.window, name).is_some_and(|w| w.is_mapped() && w.is_sensitive()) {
                 verify_pointer_target(&ui, name);
             }
@@ -527,22 +740,35 @@ pub fn install(ui: &Rc<Ui>) {
                 .iter()
                 .filter(|w| w.is_visible())
                 .count(),
-            1,
-            "App flows must stay inside the main window"
+            1 + usize::from(
+                ui.notes_window
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|w| w.window.is_visible())
+            ),
+            "Only the main workspace and retained Notes window may be visible"
         );
         // WidgetPaintable can have no node between invalidation and GTK's next
         // frame (notably after a Code save). Capture a rendered frame, bounded.
         let mut attempts = 0;
         glib::timeout_add_local(Duration::from_millis(50), move || {
             attempts += 1;
-            let paintable = gtk::WidgetPaintable::new(Some(&ui.window));
+            let target: gtk::Window =
+                if std::env::var("RELAY_NATIVE_PAGE").as_deref() == Ok("notes") {
+                    ui.notes_window
+                        .borrow()
+                        .as_ref()
+                        .expect("Notes window")
+                        .window
+                        .clone()
+                        .upcast()
+                } else {
+                    ui.window.clone().upcast()
+                };
+            let paintable = gtk::WidgetPaintable::new(Some(&target));
             let snapshot = gtk::Snapshot::new();
-            paintable.snapshot(
-                &snapshot,
-                ui.window.width() as f64,
-                ui.window.height() as f64,
-            );
-            let (Some(node), Some(renderer)) = (snapshot.to_node(), ui.window.renderer()) else {
+            paintable.snapshot(&snapshot, target.width() as f64, target.height() as f64);
+            let (Some(node), Some(renderer)) = (snapshot.to_node(), target.renderer()) else {
                 assert!(
                     attempts < 40,
                     "Screenshot failed: no rendered frame after two seconds"
@@ -554,6 +780,7 @@ pub fn install(ui: &Rc<Ui>) {
                 .render_texture(&node, None)
                 .save_to_png(&path)
                 .expect("Save screenshot");
+            record_geometry(&ui, &path);
             println!("Screenshot saved: {path}");
             if fixture && std::env::var("RELAY_NATIVE_PAGE").as_deref() == Ok("launch-preview") {
                 ui.verify_launch();

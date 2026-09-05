@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Relay-2 theme.ts SYN_MATTE, shared by its three palettes. -->
+<style-scheme id="relay-RELAY_MODE" name="Relay RELAY_MODE" version="1.0" parent-scheme="Adwaita-dark">
+  <style name="text" foreground="#dcdcda" background="RELAY_BACKGROUND"/>
+  <style name="selection" background="#3c3c3b"/>
+  <style name="cursor" foreground="#ececea"/>
+  <style name="current-line" background="#101012"/>
+  <style name="line-numbers" foreground="#77777a" background="RELAY_BACKGROUND"/>
+  <style name="current-line-number" foreground="#ececea" background="RELAY_BACKGROUND"/>
+  <style name="def:keyword" foreground="#c979d6" bold="false"/>
+  <style name="def:statement" foreground="#c979d6" bold="false"/>
+  <style name="def:type" foreground="#3ec5cf"/>
+  <style name="def:function" foreground="#5b9cf6"/>
+  <style name="def:string" foreground="#e0b04a"/>
+  <style name="def:character" foreground="#e0b04a"/>
+  <style name="def:number" foreground="#f2cf6b"/>
+  <style name="def:decimal" foreground="#f2cf6b"/>
+  <style name="def:base-n-integer" foreground="#f2cf6b"/>
+  <style name="def:floating-point" foreground="#f2cf6b"/>
+  <style name="def:boolean" foreground="#f2cf6b"/>
+  <style name="def:comment" foreground="#6e6e70" italic="false"/>
+  <style name="def:doc-comment" foreground="#6e6e70"/>
+  <style name="def:operator" foreground="#a5a5a3"/>
+  <style name="def:identifier" foreground="#dcdcda"/>
+  <style name="def:preprocessor" foreground="#c979d6"/>
+  <style name="def:error" foreground="#e5382e"/>
+</style-scheme>

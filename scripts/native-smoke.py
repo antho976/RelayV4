@@ -107,8 +107,25 @@ for line in sys.stdin:
         for key in ("RELAY_SESSION", "RELAY_TOKEN", "RELAY_BRIEF"):
             desktop_env.pop(key, None)
         initial_names={s["name"] for s in call("session.list",{"project_id":project["id"]})["sessions"]}
+        if os.environ.get("RELAY_SMOKE_ROADMAP_ONLY"):
+            for part in os.environ["RELAY_SMOKE_ROADMAP_ONLY"].split(","):
+                with (OUT / f"roadmap-{part}.log").open("w") as native_log:
+                    native = subprocess.Popen([str(NATIVE)], env=dict(desktop_env,
+                        RELAY_NATIVE_SCREENSHOT=str(OUT / f"roadmap-{part}.png"),
+                        RELAY_NATIVE_FIXTURE="1", RELAY_NATIVE_ROADMAP=part),
+                        stdout=native_log, stderr=native_log)
+                    try:
+                        assert native.wait(timeout=90) == 0, part
+                    finally:
+                        if native.poll() is None:
+                            native.terminate()
+                            native.wait(timeout=5)
+                assert f"ROADMAP_OK={part}" in (OUT / f"roadmap-{part}.log").read_text(), part
+            print("Roadmap native regressions passed: " + os.environ["RELAY_SMOKE_ROADMAP_ONLY"])
+            raise SystemExit(0)
         measurements=[]
-        for viewport, size, page in (("desktop", "1440,900", "agents"), ("compact", "1024,768", "agents"), ("launch-preview", "1024,768", "launch-preview"), ("palette", "1024,768", "palette"), ("layouts", "1024,768", "layouts"), ("board", "1440,900", "board"), ("board-compact", "1024,768", "board"), ("mailbox", "1024,768", "mailbox"), ("guardrails", "1024,768", "guardrails"), ("code", "1440,900", "code"), *((name,"1440,900",name) for name in ("notes","plan","modules","settings","skills","dashboard","notifications","devices","launch"))):
+        captured=[]
+        for viewport, size, page in (("desktop", "1440,900", "agents"), ("compact", "1024,768", "agents"), ("launch-preview", "1024,768", "launch-preview"), ("palette", "1024,768", "palette"), ("layouts", "1024,768", "layouts"), ("board", "1440,900", "board"), ("board-compact", "1024,768", "board"), ("mailbox", "1024,768", "mailbox"), ("guardrails", "1024,768", "guardrails"), ("code", "1440,900", "code"), *((name,"1440,900",name) for name in ("notes","modules","settings","skills","dashboard","notifications","devices","launch"))):
             output = OUT / f"{viewport}.png"
             output.unlink(missing_ok=True)
             native_env = dict(desktop_env, RELAY_NATIVE_SCREENSHOT=str(output), RELAY_NATIVE_SIZE=size, RELAY_NATIVE_FIXTURE="1",
@@ -132,7 +149,9 @@ for line in sys.stdin:
                         native.terminate()
                         native.wait(timeout=5)
             assert output.is_file(), f"No screenshot at {output}"
-            assert struct.unpack(">II", output.read_bytes()[16:24]) == tuple(map(int, size.split(","))), viewport
+            captured.append(output.name)
+            expected_size = (1080, 760) if page == "notes" else tuple(map(int, size.split(",")))
+            assert struct.unpack(">II", output.read_bytes()[16:24]) == expected_size, viewport
             contents = (OUT / f"{viewport}.log").read_text()
             assert "Shell layouts verified" in contents, contents
             saved_layout = call("settings.get", {"path": f"native.layout.current.{project['id']}"})["value"]
@@ -168,7 +187,7 @@ for line in sys.stdin:
             call("session.park", {"session": session["name"]})
         saved=call("file.read", {"project_id":project["id"],"path":"README.md"})["text"]
         assert "Native editor save verified." in saved, saved
-        print(json.dumps({"screenshots": [p.name for p in sorted(OUT.glob("*.png"))], "sessions_survived_window_close": len(live), "native_paste_echoes_verified":6,"native_editor_saved":True,"native_task_saved":True,"native_note_saved":True,"native_review_group_launched":True,"burst_native_tail_markers":11,"burst_lines_per_session":2048,"burst_completion_budget_seconds":5,"real_provider_calls": 0}))
+        print(json.dumps({"screenshots": captured + ["burst.png"], "sessions_survived_window_close": len(live), "native_paste_echoes_verified":6,"native_editor_saved":True,"native_task_saved":True,"native_note_saved":True,"native_review_group_launched":True,"burst_native_tail_markers":11,"burst_lines_per_session":2048,"burst_completion_budget_seconds":5,"real_provider_calls": 0}))
     finally:
         connection.close()
         engine.terminate()

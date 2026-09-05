@@ -85,8 +85,8 @@ with tempfile.TemporaryDirectory(prefix="relay-setup-") as temporary:
                 assert all("org.a11y.atspi.Registry" in line for line in contents.splitlines() if "CRITICAL" in line), contents
                 if page == "toggles":
                     assert "Panel toggles verified" in contents
-                if page == "setup":
-                    assert not call("workspace.list")["workspaces"]
+                if page in ("setup", "setup-local", "setup-github"):
+                    assert not call("workspace.list")["workspaces"], "Browsing the single setup surface must not create a workspace"
                 elif page == "setup-github-connect-submit":
                     assert auth.exists(), "Connect must complete the GitHub browser flow"
                     assert (workspace / "github-project/.git").exists()
@@ -95,6 +95,7 @@ with tempfile.TemporaryDirectory(prefix="relay-setup-") as temporary:
                 elif page == "workspace-project-submit":
                     projects = call("project.list")["projects"]
                     assert len(projects) == 1 and projects[0]["path"] == str(repo), projects
+                    assert len(call("workspace.list")["workspaces"]) == 1, "One submit creates the workspace and project together"
                 elif page == "project-launch":
                     sessions = call("session.list", {"project_id":1})["sessions"]
                     assert len(sessions) == 1 and sessions[0]["state"] == "running", sessions

@@ -15,7 +15,9 @@ pub type Ts = String;
 // ---------------------------------------------------------------- enums
 
 /// SPEC §6: five hardcoded columns.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Column {
     Backlog,
@@ -38,7 +40,9 @@ pub enum TaskState {
 }
 
 /// BUS.md §11.1 (confirmed 2026-08-17).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Priority {
     Low,
@@ -714,8 +718,8 @@ pub struct Branch {
     pub name: String,
     pub head: String,
     pub upstream: Option<String>,
-    pub ahead: i64,
-    pub behind: i64,
+    pub ahead: Option<i64>,
+    pub behind: Option<i64>,
     pub merged: bool,
     pub session: Option<String>,
     pub current: bool,

@@ -11,7 +11,65 @@ fn percent(item: &Value) -> Option<f64> {
 }
 
 impl Ui {
+    pub(super) fn render_status_counts(&self) {
+        clear(&self.resource_status);
+        let sessions = self.sessions.borrow();
+        let blocked = sessions
+            .iter()
+            .filter(|s| text(s, "state") == "blocked")
+            .count();
+        let live = sessions
+            .iter()
+            .filter(|s| matches!(text(s, "state"), "spawning" | "running" | "idle"))
+            .count();
+        let parked = sessions
+            .iter()
+            .filter(|s| text(s, "state") == "parked")
+            .count();
+        for (count, caption, color) in [
+            (blocked, "needs you", (0.898, 0.22, 0.18)),
+            (
+                live,
+                "live",
+                if live > 0 {
+                    (0.18, 0.77, 0.41)
+                } else {
+                    (0.35, 0.35, 0.37)
+                },
+            ),
+            (parked, "parked", (0.47, 0.47, 0.48)),
+        ] {
+            if count == 0 && caption != "live" {
+                continue;
+            }
+            if self.resource_status.first_child().is_some() {
+                self.resource_status.append(&label("·", "faint"));
+            }
+            if caption != "parked" {
+                let lamp = gtk::DrawingArea::new();
+                lamp.set_content_width(6);
+                lamp.set_content_height(6);
+                lamp.set_valign(gtk::Align::Center);
+                lamp.set_draw_func(move |_, cr, _, _| {
+                    cr.set_source_rgb(color.0, color.1, color.2);
+                    cr.arc(3., 3., 3., 0., std::f64::consts::TAU);
+                    let _ = cr.fill();
+                });
+                self.resource_status.append(&lamp);
+            }
+            self.resource_status.append(&label(
+                &format!("{count} {caption}"),
+                if caption == "parked" {
+                    "faint"
+                } else {
+                    "status-count"
+                },
+            ));
+        }
+    }
+
     pub(super) fn refresh_status(self: &Rc<Self>) {
+        self.render_status_counts();
         let ui = self.clone();
         glib::spawn_future_local(async move {
             let generation = ui.generation.get();
@@ -44,6 +102,9 @@ impl Ui {
                     bar.add_css_class("usage-meter");
                     bar.set_valign(gtk::Align::Center);
                     bar.set_fraction(pct.unwrap_or(0.) / 100.);
+                    if pct.is_some_and(|pct| pct >= 85.) {
+                        bar.add_css_class("hot");
+                    }
                     meter.append(&bar);
                     meter.append(&label(
                         &pct.map(|n| format!("{n:.0}%"))
@@ -78,6 +139,7 @@ impl Ui {
             return;
         };
         panel.bottom(260);
+        panel.add_css_class("resources-panel");
         let body = panel.body.clone();
         body.append(&label("Connecting…", "dim"));
         let ui = self.clone();
@@ -134,7 +196,7 @@ impl Ui {
 }
 
 fn resource_row(body: &gtk::Box, name: &str, detail: &str, fraction: f64, value: &str, size: f64) {
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     row.add_css_class("resource-row");
     let title = gtk::Box::new(gtk::Orientation::Vertical, 2);
     title.set_hexpand(true);
@@ -150,13 +212,14 @@ fn resource_row(body: &gtk::Box, name: &str, detail: &str, fraction: f64, value:
     bar.set_valign(gtk::Align::Center);
     bar.set_fraction(fraction.clamp(0., 1.));
     bar.add_css_class("resource-meter");
+    bar.set_size_request(80, -1);
     row.append(&bar);
     let value = label(value, "mono");
-    value.set_width_chars(8);
+    value.set_size_request(56, -1);
     value.set_xalign(1.);
     row.append(&value);
     let size = label(&format!("{size:.0} MB"), "mono");
-    size.set_width_chars(8);
+    size.set_size_request(76, -1);
     size.set_xalign(1.);
     row.append(&size);
     body.append(&row);
@@ -171,6 +234,14 @@ fn render_resources(body: &gtk::Box, v: &Value, history: &mut VecDeque<[f64; 3]>
         .sum::<f64>()
         + v["relay"]["cpu_pct"].as_f64().unwrap_or(0.);
     let memory = v["total_rss_mb"].as_f64().unwrap_or(0.);
+    let max_rss = panes
+        .iter()
+        .map(|p| p["rss_mb"].as_f64().unwrap_or(0.))
+        .fold(1., f64::max);
+    let max_disk = trees
+        .iter()
+        .map(|p| p["disk_mb"].as_f64().unwrap_or(0.))
+        .fold(1., f64::max);
     let disk = trees
         .iter()
         .map(|t| t["disk_mb"].as_f64().unwrap_or(0.))
@@ -226,7 +297,8 @@ fn render_resources(body: &gtk::Box, v: &Value, history: &mut VecDeque<[f64; 3]>
         body,
         "Relay engine",
         &format!("pid {}", relay["pid"]),
-        1.,
+        relay["rss_mb"].as_f64().unwrap_or(0.)
+            / max_rss.max(relay["rss_mb"].as_f64().unwrap_or(0.)),
         &format!("{:.1}%", relay["cpu_pct"].as_f64().unwrap_or(0.)),
         relay["rss_mb"].as_f64().unwrap_or(0.),
     );
@@ -243,7 +315,7 @@ fn render_resources(body: &gtk::Box, v: &Value, history: &mut VecDeque<[f64; 3]>
                 .as_i64()
                 .map(|pid| format!("pid {pid}"))
                 .unwrap_or_else(|| "parked".into()),
-            rss / memory.max(1.),
+            rss / max_rss,
             &format!("{:.1}%", p["cpu_pct"].as_f64().unwrap_or(0.)),
             rss,
         );
@@ -258,7 +330,7 @@ fn render_resources(body: &gtk::Box, v: &Value, history: &mut VecDeque<[f64; 3]>
             body,
             path.rsplit('/').next().unwrap_or(path),
             path,
-            t["disk_mb"].as_f64().unwrap_or(0.) / disk.max(1.),
+            t["disk_mb"].as_f64().unwrap_or(0.) / max_disk,
             &t["build_mb"]
                 .as_f64()
                 .map(|n| format!("{n:.0} build"))

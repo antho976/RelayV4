@@ -14,8 +14,8 @@ The archived V3 roadmap remains unchanged; its completion marks describe V3.
 | Session lifecycle | Start, park, wake, resume, fresh restart, brief inspection, pre-spawn configuration, confirmed close and optional worktree/build cleanup |
 | Coordination and safety | Existing engine role boundaries, claims, mailbox priority, review routing, task approval and exact held-operation inspection; agent permission and human task approval remain distinct |
 | Board | Five columns, search/type/priority filtering, drag moves, task editor, metadata, labels, subtasks, dependencies, duplicates, changelog, commit links, attachments, dispatch and approval |
-| Modules, Plan and Notes | Module editing/archive, changelog generation, Plan note, searchable note list, persistent editor tabs, formatting, find/replace, dirty-close protection and note satellites |
-| Code and Git | Primary/agent checkout selection, expandable tree, content search, file creation/rename/trash/restore, highlighted editing, find/replace, dirty protection, worktree diff, staging, commits, history, branch management, fetch/push/PR and disposable merge tests |
+| Modules and Notes | Module editing/archive, changelog generation, separate retained Notes workspace, searchable library, persistent editor tabs, formatting, find/replace and dirty-close protection; former Plan documents are ordinary notes |
+| Project Files and Git | Primary/agent checkout selection, expandable tree, content search, file creation/rename/trash/restore, drag/move, highlighted editing, find/replace, dirty protection, worktree diff, staging, commits, history, branch management, fetch/push/PR and disposable merge tests; separate Code navigation removed |
 | Dashboard and notifications | Cross-project overview, correct project/task/session destinations, read acknowledgements, category settings, generated audio patterns, volume and preview |
 | Skills | Local editing, GitHub installation and replacement, source refresh, per-project enablement and deletion |
 | Settings and usage | Relay-2 palettes and SVG geometry, wallpaper library, opacity/dimming/contrast, terminal font, configurable Relay-2 shortcuts, provider/device paths, parking, guardrail configuration, backups and provider usage panels |
@@ -42,8 +42,8 @@ drafts block dismissal and application closure until saved or discarded.
   stops capture rather than silently losing a touch release.
 - Device watchers are leased per socket. Duplicate requests retain all schema and
   actor validation; disconnect releases only that connection's watcher.
-- Hidden note windows are destroyed on closure. Drafts remain explicit and
-  project-qualified when navigating between projects.
+- Closing Notes hides its retained window and preserves drafts. The main
+  window destroys it only after dirty-draft checks. Drafts remain project-qualified.
 
 ## Validation and remaining acceptance
 
@@ -56,7 +56,20 @@ build/signing/mirror behavior, external publishing, notification audio on the
 user's sound setup, accessibility and prolonged performance. No real provider,
 release upload, signing identity or user-store migration was used for smoke tests.
 
-The reference's first-run wizard is adapted to direct repository registration
-and Settings. Git history uses native rows rather than the reference's graph
-presentation. Advanced docking trees, packaging, migration and subsequent
-product features stay in the imported roadmap.
+The first-run surface now groups workspace creation, provider detection and
+local/GitHub repository selection. Git history draws branch and merge lanes
+from commit parent SHAs. Advanced docking trees, packaging, migration and
+subsequent product features stay in the imported roadmap.
+
+The September 4 UI pass uses the reference's bundled Fira fonts, SVG geometry,
+palette, compact shell dimensions and page compositions. Native screenshots
+and widget bounds are recorded in `.impeccable/review/`; rendered reference
+screenshots are in its `reference/` directory. Smoke checks assert the 42px
+top bar, 24px status bar, 28px Files rail and 26px terminal headers, as well as
+the requested visible page. These measured surfaces do not establish pixel
+identity across every content state, display scale or compositor.
+
+The subsequent chat-roadmap implementation is recorded in
+[native-roadmap-results.md](../outputs/native-roadmap-results.md). It supersedes
+the original Files rail, Plan navigation, and in-app Notes composition. The
+42px main top bar, 24px status bar and 26px terminal headers remain measured.

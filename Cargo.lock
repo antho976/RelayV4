@@ -2597,6 +2597,7 @@ dependencies = [
  "base64",
  "glib",
  "gtk4",
+ "pango",
  "relay-bus",
  "serde",
  "serde_json",

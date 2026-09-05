@@ -8,6 +8,10 @@ result!(#[schemars(rename = "ProviderListOut")] ListOut { pub providers: Vec<Pro
 op!(List, "provider.list", Empty => ListOut, OpMeta::query(Scope::Global, 6, "Installed / version / auth / spawn profile per provider"));
 op!(Refresh, "provider.refresh", Empty => ListOut,
     OpMeta::mutation(Scope::Global, 6, "Re-detect providers now").audit(Audit::Never).actors(Actors::UserOnly).emits(&["provider.version"]));
+payload!(#[schemars(rename = "ProviderUpdateIn")] UpdateIn { pub provider: Provider, pub automatic: Option<bool> });
+result!(#[schemars(rename = "ProviderUpdateOut")] UpdateOut { pub started: bool, pub method: String, pub message: String });
+op!(Update, "provider.update", UpdateIn => UpdateOut,
+    OpMeta::mutation(Scope::Global, 6, "Update a supported user-installed provider in the background").actors(Actors::UserOnly).emits(&["provider.update.changed"]));
 payload!(#[schemars(rename = "UsageGetIn")] UsageGetIn { pub provider: Option<Provider> });
 result!(#[schemars(rename = "UsageGetOut")] UsageGetOut { pub usage: Vec<Usage> });
 op!(UsageGet, "usage.get", UsageGetIn => UsageGetOut, OpMeta::query(Scope::Global, 9, "Per-provider usage in its own units"));
@@ -52,4 +56,4 @@ op!(GitHubRepoList, "github.repo.list", Empty => GitHubRepoListOut,
 result!(#[schemars(rename = "PluginListOut")] PluginListOut { pub plugins: Vec<Value> });
 op!(PluginList, "plugin.list", Empty => PluginListOut, OpMeta::query(Scope::Global, 11, "Stub in 4.0: always empty"));
 
-entries!(List, Refresh, UsageGet, UsageReport, SkillList, SkillCreate, SkillUpdate, SkillDelete, SkillEnable, SkillInstall, GitHubStatusOp, GitHubConnect, GitHubRepoList, PluginList);
+entries!(List, Refresh, Update, UsageGet, UsageReport, SkillList, SkillCreate, SkillUpdate, SkillDelete, SkillEnable, SkillInstall, GitHubStatusOp, GitHubConnect, GitHubRepoList, PluginList);

@@ -1,7 +1,8 @@
 //! `task.*` — BUS.md §10.5.
 use crate::registry::{Actors, OpMeta, Scope, Undo};
 use crate::types::{
-    Attachment, Column, Id, Label, Priority, Session, Size, Task, TaskRelation, TaskState, TaskType,
+    Attachment, AuditRow, Column, Id, Label, Message, Priority, Session, Size, Task, TaskRelation,
+    TaskState, TaskType,
 };
 use crate::{op, Empty};
 
@@ -22,6 +23,16 @@ op!(Create, "task.create", CreateIn => Task,
 
 payload!(#[schemars(rename = "TaskGetIn")] GetIn { pub task_id: Id });
 op!(Get, "task.get", GetIn => Task, OpMeta::query(Scope::Project, 7, "One task with attachments and commits"));
+
+payload!(#[schemars(rename = "TaskActivityIn")] ActivityIn {
+    pub task_id: Id, pub before_audit: Option<Id>, pub before_message: Option<Id>, pub limit: Option<u32>,
+});
+result!(#[schemars(rename = "TaskActivityOut")] ActivityOut {
+    pub history: Vec<AuditRow>, pub messages: Vec<Message>,
+    pub next_audit: Option<Id>, pub next_message: Option<Id>,
+});
+op!(Activity, "task.activity", ActivityIn => ActivityOut,
+    OpMeta::query(Scope::Project, 7, "Task-scoped audit history and explicitly associated messages, newest first").actors(Actors::UserOnly));
 
 payload!(#[schemars(rename = "TaskListIn")] ListIn {
     pub project_id: Option<Id>, pub column: Option<Column>, pub state: Option<TaskState>, pub module_id: Option<Id>,
@@ -125,6 +136,7 @@ op!(CopyText, "task.copy_text", IdIn => CopyTextOut, OpMeta::query(Scope::Projec
 entries!(
     Create,
     Get,
+    Activity,
     List,
     Update,
     Move,

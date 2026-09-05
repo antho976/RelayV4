@@ -185,11 +185,21 @@ impl Client {
     }
 
     pub async fn request(&self, rt: &Handle, op: &str, payload: Value) -> Result<Value, Error> {
+        self.request_with_id(rt, op, payload, Uuid::new_v4()).await
+    }
+
+    pub async fn request_with_id(
+        &self,
+        rt: &Handle,
+        op: &str,
+        payload: Value,
+        id: Uuid,
+    ) -> Result<Value, Error> {
         if self.0.notices.is_closed() {
             return Err(Error::Disconnected);
         }
-        let request = Request::new(Actor::User, op, payload);
-        let id = request.id;
+        let mut request = Request::new(Actor::User, op, payload);
+        request.id = id;
         let (send, reply) = oneshot::channel();
         self.0.pending.lock().unwrap().insert(id, send);
         // Clean up even if the GTK future is cancelled while awaiting an answer.
@@ -230,6 +240,7 @@ mod tests {
         let server = UnixListener::bind(&path).unwrap();
         let rt = Handle::current();
         let (client, notices) = Client::connect(&rt, path.clone()).await.unwrap();
+        let request_id = Uuid::new_v4();
         let fixture = tokio::spawn(async move {
             let (socket, _) = server.accept().await.unwrap();
             let (read, mut write) = socket.into_split();
@@ -238,6 +249,8 @@ mod tests {
                 serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
             let b: Request =
                 serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            let tagged = if a.op == "a" { &a } else { &b };
+            assert_eq!(tagged.id, request_id);
             assert_eq!(a.actor, Actor::User);
             assert!(a.token.is_none());
             let event = serde_json::json!({"v":1,"ev":"task.changed","ts":"2026-09-04T00:00:00Z","actor":"user","payload":{}});
@@ -255,7 +268,7 @@ mod tests {
                 serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
         });
         let (a, b) = tokio::join!(
-            client.request(&rt, "a", Value::Null),
+            client.request_with_id(&rt, "a", Value::Null, request_id),
             client.request(&rt, "b", Value::Null)
         );
         assert_eq!(a.unwrap(), "a");

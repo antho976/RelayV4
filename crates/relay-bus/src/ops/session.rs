@@ -46,7 +46,7 @@ payload!(#[schemars(rename = "SessionDoneIn")] DoneIn {
     pub blockers: Option<Vec<String>>,
 });
 op!(Done, "session.done", DoneIn => Session,
-    OpMeta::mutation(Scope::Session, 5, "Agent self-report: completed moves a builder's task to in_review; blocked and partial leave it and say why").actors(Actors::AgentOnly).emits(&["session.changed", "task.changed", "notify.new"]));
+    OpMeta::mutation(Scope::Session, 5, "Record completion; all builders finish before review, and all reviewers finish before the group advances. Blocked/partial retain the assignment.").actors(Actors::AgentOnly).emits(&["session.changed", "task.changed", "notify.new", "notify.changed", "mailbox.new"]));
 payload!(#[schemars(rename = "SessionIntentIn")] IntentIn {
     pub session: String,
     /// One line, present tense. Empty clears it.

@@ -1,15 +1,21 @@
 mod app;
 mod client;
 mod editor;
+mod fonts;
 mod icons;
 mod mirror;
 mod pages;
 mod panel;
+mod provider_updates;
+mod roadmap_smoke;
 mod shortcuts;
 mod smoke;
+mod smoke_project_files;
+mod smoke_registry;
 mod sounds;
 mod terminal;
 mod tools;
+mod wallpaper_rotation;
 
 fn main() -> glib::ExitCode {
     tracing_subscriber::fmt()

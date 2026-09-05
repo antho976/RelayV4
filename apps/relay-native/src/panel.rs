@@ -51,7 +51,7 @@ impl Panel {
         } else {
             gtk::Align::End
         });
-        frame.set_size_request(width.min(780), -1);
+        frame.set_size_request(width, -1);
         frame.set_focusable(true);
         let heading = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         heading.add_css_class("panel-heading");
@@ -141,19 +141,57 @@ impl Panel {
             .set_min_content_height(height.min((self.host.height() - 160).max(200)));
     }
 
+    pub fn centered(&self, height: i32) {
+        self.frame.set_halign(gtk::Align::Center);
+        self.frame.set_valign(gtk::Align::Center);
+        self.scroll.set_vexpand(false);
+        self.scroll
+            .set_max_content_height(height.min((self.host.height() - 48).max(200)));
+        self.scroll.set_propagate_natural_height(true);
+    }
+
+    pub fn header_action(&self, widget: &impl IsA<gtk::Widget>) {
+        if let Some(heading) = self.frame.first_child().and_downcast::<gtk::Box>() {
+            let previous = heading.last_child().and_then(|close| close.prev_sibling());
+            heading.insert_child_after(widget, previous.as_ref());
+        }
+    }
+
+    pub fn top(&self, height: i32) {
+        self.modal.set(false);
+        self.layer.add_css_class("utility-layer");
+        self.frame.add_css_class("utility-panel");
+        self.frame.set_valign(gtk::Align::Start);
+        self.frame.set_margin_end(8);
+        self.scroll.set_vexpand(false);
+        self.scroll
+            .set_max_content_height(height.min((self.host.height() - 16).max(200)));
+        self.scroll.set_propagate_natural_height(true);
+    }
+
     pub fn bottom(&self, height: i32) {
         self.modal.set(false);
         self.layer.add_css_class("utility-layer");
         self.frame.add_css_class("utility-panel");
         self.frame.set_valign(gtk::Align::End);
-        self.frame.set_margin_end(6);
-        self.frame.set_margin_bottom(6);
+        self.frame.set_margin_end(8);
+        let footer = self
+            .host
+            .next_sibling()
+            .filter(|widget| widget.is_visible())
+            .map(|widget| widget.height())
+            .unwrap_or(0);
+        self.frame.set_margin_bottom((30 - footer).max(0));
         self.scroll.set_vexpand(false);
         self.scroll
             .set_min_content_height(height.min((self.host.height() - 100).max(200)));
         self.scroll
             .set_max_content_height((self.host.height() - 70).max(200));
         self.scroll.set_propagate_natural_height(true);
+    }
+
+    pub fn add_css_class(&self, name: &str) {
+        self.frame.add_css_class(name);
     }
 
     pub fn set_guard(&self, guard: impl Fn() -> bool + 'static) {

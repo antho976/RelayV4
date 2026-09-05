@@ -15,6 +15,7 @@ unset RELAY_NATIVE_SOCKET
 mkdir -p target
 echo "Building Relay (compiler output: $PWD/target/launcher-build.log)…"
 if cargo build --target-dir "$PWD/target" -p relay-cli -p relay-native >target/launcher-build.log 2>&1; then
+    python3 scripts/install-native-desktop.py "$RELAY_INSTANCE"
     echo "Opening Relay V4 ($RELAY_INSTANCE)…"
 else
     result=$?
