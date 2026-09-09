@@ -1210,6 +1210,7 @@ impl Ui {
             .cloned()
             .collect();
         for n in old {
+            self.rendered_sessions.borrow_mut().remove(&n);
             if let Some(p) = self.panes.borrow_mut().remove(&n) {
                 p.stop();
                 if let Some(grid) = p.root.parent().and_downcast::<gtk::Grid>() {
@@ -1219,15 +1220,18 @@ impl Ui {
         }
         for s in &sessions {
             let name = text(s, "name");
-            if !self.panes.borrow().contains_key(name) {
+            let new_pane = !self.panes.borrow().contains_key(name);
+            if new_pane {
                 let pane = Pane::new(name, self.path.clone(), self.rt.clone());
                 self.install_pane_controls(&pane, name);
                 pane.apply_appearance(&self.palette.borrow(), self.font_size.get());
                 self.panes.borrow_mut().insert(name.into(), pane);
             }
             let pane = self.panes.borrow().get(name).cloned().unwrap();
-            let signature = json!({"state":s["state"], "role":s["role"], "provider":s["provider"], "branch":s["branch"], "intent":s["intent"], "pair_with":s["pair_with"]});
-            if self.rendered_sessions.borrow().get(name) != Some(&signature) {
+            let signature = json!({"state":s["state"], "role":s["role"], "provider":s["provider"], "branch":s["branch"], "worktree":s["worktree"], "intent":s["intent"], "pair_with":s["pair_with"]});
+            // Render signatures describe widgets, not just sessions. A recreated pane has
+            // an empty header and visible slate even when the session itself is unchanged.
+            if new_pane || self.rendered_sessions.borrow().get(name) != Some(&signature) {
                 pane.update_session(s);
                 self.session_actions(&pane, s);
                 self.rendered_sessions
@@ -1281,6 +1285,9 @@ impl Ui {
     }
     pub fn verify_shell(self: &Rc<Self>) {
         let panes = self.panes.borrow().clone();
+        for session in self.sessions.borrow().iter() {
+            panes[text(session, "name")].verify_session_rendered(session);
+        }
         let mode = self.mode.borrow().clone();
         for mode in ["grid", "focus", "review", "mosaic"] {
             self.set_mode(mode);
@@ -1313,6 +1320,15 @@ impl Ui {
             pane.terminal
                 .paste_text(&format!("native-paste-check-{name}\n"));
         }
+    }
+    pub fn terminal_contents_contain(&self, marker: &str) -> bool {
+        use vte4::prelude::TerminalExt;
+        let panes = self.panes.borrow();
+        !panes.is_empty() && panes.values().all(|pane| {
+            let (_, row) = pane.terminal.cursor_position();
+            let (text, _) = pane.terminal.text_range_format(vte4::Format::Text, 0, 0, row, 500);
+            pane.terminal.is_mapped() && text.is_some_and(|text| text.contains(marker))
+        })
     }
     pub fn verify_burst(&self, check: bool) {
         use vte4::prelude::TerminalExt;

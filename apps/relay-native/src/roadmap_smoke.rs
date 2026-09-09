@@ -193,6 +193,20 @@ pub(crate) async fn run(ui: &Rc<Ui>) -> Value {
     );
     ui.open_project(project, "agents");
 
+    // Revisit unchanged sessions: their widgets were destroyed while the render signatures
+    // used to survive. A fresh pane must initialize its header and dismiss the blank slate.
+    for _ in 0..3 {
+        wait(|| ui.sessions.borrow().len() == before, "returning session panels").await;
+        ui.verify_shell();
+        ui.open_project(other, "agents");
+        wait(|| ui.sessions.borrow().is_empty(), "empty project panels").await;
+        ui.open_project(project, "agents");
+    }
+    wait(|| ui.sessions.borrow().len() == before, "final session panels").await;
+    ui.verify_shell();
+    wait(|| ui.terminal_contents_contain("RELAY NATIVE VERIFICATION"), "terminal output after project switches").await;
+    println!("TERMINAL_PROJECT_ROUNDTRIPS=4");
+
     crate::tools::devices::verify_worktree_picker(ui).await;
     let skill = call(
         ui,

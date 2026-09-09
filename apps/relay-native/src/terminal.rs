@@ -300,6 +300,13 @@ impl Pane {
             self.active.get()
         );
     }
+    pub fn verify_session_rendered(&self, session: &serde_json::Value) {
+        let state = crate::app::text(session, "state");
+        assert!(!self.state.text().is_empty(), "{} has an uninitialized header", self.name);
+        assert!(!self.metadata.text().is_empty(), "{} has no provider metadata", self.name);
+        assert_eq!(self.slate.is_visible(), !matches!(state, "spawning" | "running" | "idle" | "blocked"),
+            "{} has an incorrect terminal overlay", self.name);
+    }
     pub fn name(&self) -> &str {
         &self.name
     }
