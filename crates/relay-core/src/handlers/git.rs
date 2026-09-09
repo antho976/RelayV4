@@ -110,7 +110,13 @@ pub fn register(e: &mut Engine) {
                     format!("{} already exists", path.display()),
                 ));
             }
-            let wt = worktree::create(repo, &path, &p.branch, p.from.as_deref())
+            let from = if p.from.is_none() && !existing_worktree_branch(repo, Some(&p.branch))? {
+                refresh_new_worktree(repo, Some(&p.branch))?;
+                new_worktree_base(repo, &project.base_branch)?
+            } else {
+                p.from.clone()
+            };
+            let wt = worktree::create(repo, &path, &p.branch, from.as_deref())
                 .map_err(|e| BusError::conflict("worktree.create_failed", e.to_string()))?;
             Ok((project, wt))
         },
@@ -935,33 +941,59 @@ pub fn fetch_remote(root: &Path) -> Result<(), BusError> {
     Ok(())
 }
 
-/// Start at the fetched upstream only when it contains every local base commit.
-/// This never moves the existing base branch or changes its working tree.
-pub fn new_worktree_base(root: &Path, base: &str) -> Option<String> {
-    if base.is_empty() {
-        return None;
+pub(super) fn existing_worktree_branch(root: &Path, branch: Option<&str>) -> Result<bool, BusError> {
+    let repo = gix::open(root).map_err(gix_err("git.open_failed"))?;
+    Ok(branch.is_some_and(|branch| repo.find_reference(format!("refs/heads/{branch}").as_str()).is_ok()))
+}
+
+/// Only new branches need refreshing. Reattaching an existing branch preserves its work,
+/// including offline sessions. A failed fetch must never silently launch from stale refs.
+pub(super) fn refresh_new_worktree(root: &Path, branch: Option<&str>) -> Result<(), BusError> {
+    if !existing_worktree_branch(root, branch)? {
+        fetch_remote(root)?;
     }
-    let repo = gix::open(root).ok()?;
-    let local = repo.find_reference(base).ok()?;
-    let fallback = Some(base.to_owned());
-    let Some(Ok(name)) = local.remote_tracking_ref_name(gix::remote::Direction::Fetch) else {
-        return fallback;
-    };
-    let Ok(remote) = repo.find_reference(name.as_bstr()) else {
-        return fallback;
-    };
-    let (Some(local), Some(remote)) = (local.try_id(), remote.try_id()) else {
-        return fallback;
-    };
-    if repo
-        .merge_base(local.detach(), remote.detach())
-        .ok()
-        .is_some_and(|id| id.detach() == local.detach())
+    Ok(())
+}
+
+/// Pin the freshest base commit without moving the primary checkout. Preserve local-only
+/// commits; refuse divergent histories instead of silently omitting remote changes.
+pub fn new_worktree_base(root: &Path, base: &str) -> Result<Option<String>, BusError> {
+    let repo = gix::open(root).map_err(gix_err("git.open_failed"))?;
+    let local_name = format!("refs/heads/{}", base.trim_start_matches("refs/heads/"));
+    let local = repo.find_reference(local_name.as_str()).ok();
+    let upstream = local.as_ref().and_then(|reference| {
+        reference.remote_tracking_ref_name(gix::remote::Direction::Fetch)
+    }).transpose().map_err(gix_err("git.base_invalid"))?;
+    let remote_name = upstream.map(|name| name.as_bstr().to_string()).or_else(|| {
+        let name = format!("refs/remotes/origin/{}", base.trim_start_matches("refs/heads/"));
+        repo.find_reference(name.as_str()).ok().map(|_| name)
+    });
+    let remote = remote_name.as_ref().map(|name| {
+        repo.rev_parse_single(name.as_str()).map(|id| id.detach())
+            .map_err(gix_err("git.base_upstream_missing"))
+    }).transpose()?;
+    let local = local.and_then(|reference| reference.try_id().map(|id| id.detach()));
+    // A repository before its first commit has a valid unborn base, but no commit to pin.
+    if local.is_none() && remote.is_none()
+        && repo.head().is_ok_and(|head| head.is_unborn())
+        && repo.head_name().ok().flatten().is_some_and(|name| name.as_bstr().to_string() == local_name)
     {
-        Some(name.as_bstr().to_string())
-    } else {
-        fallback
+        return Ok(None);
     }
+    let selected = match (local, remote) {
+        (Some(local), Some(remote)) if local != remote => {
+            match repo.merge_base(local, remote).ok().map(|id| id.detach()) {
+                Some(common) if common == local => remote,
+                Some(common) if common == remote => local,
+                _ => return Err(BusError::conflict("git.base_diverged", format!(
+                    "Base branch {base} and its upstream have diverged; reconcile them before creating a new agent branch"
+                ))),
+            }
+        }
+        (Some(id), _) | (_, Some(id)) => id,
+        _ => return Err(BusError::conflict("git.base_missing", format!("Base branch {base:?} does not exist"))),
+    };
+    Ok(Some(selected.to_string()))
 }
 
 /// Cached Git context only: generating a brief must never make a network request.
@@ -1390,7 +1422,7 @@ mod tests {
         );
         let advanced = git(&origin, &["rev-parse", "HEAD"]);
         fetch_remote(&checkout).unwrap();
-        let from = new_worktree_base(&checkout, "main").unwrap();
+        let from = new_worktree_base(&checkout, "main").unwrap().unwrap();
         let new_path = dir.path().join("new-session");
         worktree::create(&checkout, &new_path, "relay/fixture", Some(&from)).unwrap();
         assert_eq!(git(&new_path, &["rev-parse", "HEAD"]), advanced);
@@ -1435,16 +1467,16 @@ mod tests {
         git(root, &["update-ref", "refs/remotes/origin/main", &remote]);
         git(root, &["checkout", "main"]);
         assert_eq!(
-            new_worktree_base(root, "main"),
-            Some("refs/remotes/origin/main".into())
+            new_worktree_base(root, "main").unwrap(),
+            Some(remote)
         );
         assert_eq!(git(root, &["rev-parse", "main"]), base);
         git(root, &["commit", "--allow-empty", "-m", "local"]);
         assert_eq!(metrics(), (Some("origin/main".into()), Some(1), Some(1)));
-        assert_eq!(new_worktree_base(root, "main"), Some("main".into()));
+        assert_eq!(new_worktree_base(root, "main").unwrap_err().code, "git.base_diverged");
         let local = git(root, &["rev-parse", "main"]);
         assert!(fetch_remote(root).is_err());
         assert_eq!(git(root, &["rev-parse", "main"]), local);
-        assert_eq!(new_worktree_base(root, "main"), Some("main".into()));
+        assert_eq!(new_worktree_base(root, "main").unwrap_err().code, "git.base_diverged");
     }
 }

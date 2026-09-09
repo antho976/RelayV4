@@ -57,6 +57,94 @@ fn fixture() -> Fixture {
     Fixture { _root: tmp, root, repo, engine }
 }
 
+fn head(repo: &Path, reference: &str) -> String {
+    let out = Command::new("git").arg("-C").arg(repo)
+        .args(["rev-parse", reference]).output().unwrap();
+    assert!(out.status.success());
+    String::from_utf8(out.stdout).unwrap().trim().to_owned()
+}
+
+fn advancing_remote(f: &Fixture, tracking: bool) -> PathBuf {
+    let origin = f.root.join("remote");
+    git(&f.root, &["clone", f.repo.to_str().unwrap(), origin.to_str().unwrap()]);
+    git(&origin, &["config", "user.email", "t@t"]);
+    git(&origin, &["config", "user.name", "t"]);
+    git(&f.repo, &["remote", "add", "origin", origin.to_str().unwrap()]);
+    git(&f.repo, &["fetch", "origin"]);
+    if tracking {
+        git(&f.repo, &["branch", "--set-upstream-to=origin/main", "main"]);
+    }
+    std::fs::write(origin.join("latest.txt"), "remote change\n").unwrap();
+    git(&origin, &["add", "latest.txt"]);
+    git(&origin, &["commit", "-qm", "remote advance"]);
+    origin
+}
+
+#[test]
+fn new_sessions_fetch_remote_commits_without_touching_primary() {
+    for tracking in [true, false] {
+        let f = fixture();
+        let origin = advancing_remote(&f, tracking);
+        let original = head(&f.repo, "HEAD");
+        std::fs::write(f.repo.join("README.md"), "uncommitted primary work\n").unwrap();
+        for round in 0..2 {
+            git(&origin, &["commit", "--allow-empty", "-qm", &format!("advance {round}")]);
+            let session = ok(&f.engine, "session.create", json!({"project_id":1,"provider":"codex"}));
+            let checkout = Path::new(session["worktree"].as_str().unwrap());
+            assert_eq!(head(checkout, "HEAD"), head(&origin, "HEAD"));
+            assert!(checkout.join("latest.txt").exists());
+            assert_eq!(head(&f.repo, "HEAD"), original);
+            assert_eq!(std::fs::read_to_string(f.repo.join("README.md")).unwrap(), "uncommitted primary work\n");
+        }
+    }
+}
+
+#[test]
+fn new_worktree_defaults_fetch_but_explicit_revisions_and_existing_branches_are_preserved() {
+    let f = fixture();
+    let origin = advancing_remote(&f, true);
+    let original = head(&f.repo, "HEAD");
+    let worktree = ok(&f.engine, "worktree.create", json!({"project_id":1,"branch":"relay/fresh"}));
+    assert_eq!(head(Path::new(worktree["path"].as_str().unwrap()), "HEAD"), head(&origin, "HEAD"));
+    git(&f.repo, &["remote", "set-url", "origin", f.root.join("missing").to_str().unwrap()]);
+    let pinned = ok(&f.engine, "worktree.create", json!({"project_id":1,"branch":"relay/pinned","from":original}));
+    assert_eq!(head(Path::new(pinned["path"].as_str().unwrap()), "HEAD"), original);
+    git(&f.repo, &["branch", "relay/existing", &original]);
+    let existing = ok(&f.engine, "session.create", json!({"project_id":1,"provider":"codex","branch":"relay/existing"}));
+    assert_eq!(head(Path::new(existing["worktree"].as_str().unwrap()), "HEAD"), original);
+    let pair = ok(&f.engine, "session.create", json!({"project_id":1,"provider":"claude","role":"reviewer","pair_with":existing["name"]}));
+    assert_eq!(pair["worktree"], existing["worktree"]);
+}
+
+#[test]
+fn new_sessions_refuse_failed_fetch_and_divergence_without_stale_fallback() {
+    let f = fixture();
+    advancing_remote(&f, true);
+    git(&f.repo, &["commit", "--allow-empty", "-qm", "local advance"]);
+    let original = head(&f.repo, "HEAD");
+    assert_eq!(code(call(&f.engine, "session.create", json!({"project_id":1,"provider":"codex"}))), "git.base_diverged");
+    git(&f.repo, &["remote", "set-url", "origin", f.root.join("missing").to_str().unwrap()]);
+    assert_eq!(code(call(&f.engine, "session.create", json!({"project_id":1,"provider":"codex"}))), "git.fetch_failed");
+    assert_eq!(head(&f.repo, "HEAD"), original);
+    assert_eq!(ok(&f.engine, "worktree.list", json!({"project_id":1}))["worktrees"].as_array().unwrap().len(), 1);
+    assert!(ok(&f.engine, "session.list", json!({"project_id":1}))["sessions"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn new_sessions_preserve_local_ahead_base_and_reject_missing_base() {
+    let f = fixture();
+    let origin = advancing_remote(&f, true);
+    git(&f.repo, &["fetch", "origin"]);
+    git(&f.repo, &["merge", "--ff-only", "origin/main"]);
+    git(&f.repo, &["commit", "--allow-empty", "-qm", "local only"]);
+    let local = head(&f.repo, "HEAD");
+    assert_ne!(local, head(&origin, "HEAD"));
+    let session = ok(&f.engine, "session.create", json!({"project_id":1,"provider":"codex"}));
+    assert_eq!(head(Path::new(session["worktree"].as_str().unwrap()), "HEAD"), local);
+    ok(&f.engine, "project.update", json!({"project_id":1,"base_branch":"missing"}));
+    assert_eq!(code(call(&f.engine, "session.create", json!({"project_id":1,"provider":"codex"}))), "git.base_missing");
+}
+
 /// A stand-in provider CLI: greets, echoes lines, exits 3 on "exit". Its `sleep` child is
 /// what the teardown test looks for.
 fn fake_provider(dir: &Path, with_child: bool) -> PathBuf {

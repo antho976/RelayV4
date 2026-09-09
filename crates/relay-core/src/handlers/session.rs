@@ -522,7 +522,14 @@ fn note_pty_state(ctx: &Ctx, session_id: Id, state: &str) {
 }
 
 pub fn register(e: &mut Engine) {
-    e.register::<Create>(|ctx: &mut Ctx, p| {
+    e.register_staged::<Create, _>(|ctx, p| {
+        // Fetch before taking the store transaction: slow remotes must not freeze the bus.
+        if p.pair_with.is_none() && p.worktree.as_deref().unwrap_or("new") == "new" {
+            let project = ctx.read(|conn| crate::handlers::workspace::get_project(conn, p.project_id))?;
+            super::git::refresh_new_worktree(Path::new(&project.path), p.branch.as_deref())?;
+        }
+        Ok(())
+    }, |ctx: &mut Ctx, p, ()| {
         let project = crate::handlers::workspace::get_project(ctx.tx(), p.project_id)?;
         crate::providers::validate_options(p.provider, p.model.as_deref(), p.effort.as_deref())?;
         if let Some(task_id) = p.task_id {
@@ -581,9 +588,12 @@ pub fn register(e: &mut Engine) {
                 let branch = p.branch.clone().unwrap_or_else(|| worktree::branch_for(&name));
                 let path = worktree::pooled_path(repo, &name);
                 let base = project.base_branch.clone();
-                let from = super::git::new_worktree_base(repo, &base);
+                let from = if super::git::existing_worktree_branch(repo, Some(&branch))? {
+                    None
+                } else {
+                    super::git::new_worktree_base(repo, &base)?
+                };
                 let wt = worktree::create(repo, &path, &branch, from.as_deref())
-                    .or_else(|_| worktree::create(repo, &path, &branch, None))
                     .map_err(|e| BusError::conflict("worktree.create_failed", e.to_string()))?;
                 (wt.path, wt.branch)
             }
