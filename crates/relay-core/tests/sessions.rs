@@ -596,6 +596,54 @@ fn recovery_reaps_orphans_and_fscks() {
 }
 
 #[test]
+fn recovery_releases_legacy_claims_but_preserves_new_work() {
+    let f = fixture();
+    let create = || ok(&f.engine, "session.create", json!({"project_id":1,"provider":"codex"}));
+    let done = create();
+    let closed = create();
+    let working = create();
+    let archived = create();
+    f.engine.dispatch(Request::new(Actor::agent(done["name"].as_str().unwrap()),
+        "session.done", json!({"summary":"Finished before upgrade"})), Door::InProcess).into_result().unwrap();
+    ok(&f.engine, "session.close", json!({"session":closed["name"],"remove_worktree":false}));
+    let task = ok(&f.engine,"task.create",json!({"project_id":1,"title":"Completed before audit retention"}));
+    ok(&f.engine,"task.dispatch",json!({"task_id":task["id"],"session":archived["name"],"start":false}));
+    f.engine.dispatch(Request::new(Actor::agent(archived["name"].as_str().unwrap()),
+        "session.done", json!({"summary":"Archived completion"})), Door::InProcess).into_result().unwrap();
+    {
+        let conn = f.engine.store.lock();
+        conn.execute("DELETE FROM audit WHERE op='session.done' AND session_id=?1", [archived["id"].as_i64().unwrap()]).unwrap();
+        // Reconstruct rows the old build failed to delete, plus a renewed claim
+        // and unfinished work whose claims must remain reserved.
+        for (session, path, updated) in [
+            (&done,"old.rs","2000-01-01T00:00:00Z"),
+            (&done,"renewed.rs","2999-01-01T00:00:00Z"),
+            (&closed,"closed.rs","2000-01-01T00:00:00Z"),
+            (&working,"working.rs","2000-01-01T00:00:00Z"),
+            (&archived,"archived.rs","2000-01-01T00:00:00Z"),
+        ] {
+            conn.execute("INSERT INTO claims(project_id,session_id,session,path,created_at,updated_at) VALUES(1,?1,?2,?3,'2000-01-01T00:00:00Z',?4)",
+                rusqlite::params![session["id"].as_i64().unwrap(),session["name"].as_str().unwrap(),path,updated]).unwrap();
+            conn.execute("INSERT INTO overlaps(project_id,fingerprint,sessions,path,kind,first_seen,last_seen) VALUES(1,?1,?2,?1,'claim','2000-01-01T00:00:00Z','2000-01-01T00:00:00Z')",
+                rusqlite::params![path,json!([session["name"]]).to_string()]).unwrap();
+        }
+    }
+    let report = relay_core::recovery::run(&f.engine).unwrap();
+    assert!(report.fsck_fixes.iter().any(|fix| fix == "released 3 stale file claim(s)"), "{report:?}");
+    {
+        let conn = f.engine.store.lock();
+        let remaining: Vec<String> = conn.prepare("SELECT path FROM claims ORDER BY path").unwrap()
+            .query_map([], |row| row.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+        assert_eq!(remaining, ["renewed.rs", "working.rs"]);
+        let overlaps: Vec<String> = conn.prepare("SELECT path FROM overlaps WHERE active=1 ORDER BY path").unwrap()
+            .query_map([], |row| row.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+        assert_eq!(overlaps, remaining);
+    }
+    let again = relay_core::recovery::run(&f.engine).unwrap();
+    assert!(!again.fsck_fixes.iter().any(|fix| fix.contains("stale file claim")));
+}
+
+#[test]
 fn provider_discovery_is_explicit_cached_and_reports_version_changes() {
     let f = fixture();
     let claude = fake_discovery_provider(&f.root, "claude", "claude 1.0.0");

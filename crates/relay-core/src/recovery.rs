@@ -146,6 +146,33 @@ pub fn run(engine: &Engine) -> Result<RecoveryReport> {
                 WHERE ts.task_id = t.id AND s.state IN ('spawning','running','idle','blocked','parked'))")?;
         report.tasks_reset_offered = st.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
     }
+    // Repair claims left by older builds before pruning their completion evidence.
+    // A later claim renewal belongs to new work and must survive an older Done.
+    {
+        let mut statement = tx.prepare_cached(
+            "DELETE FROM claims WHERE session_id IN (SELECT id FROM sessions WHERE state='closed')
+             OR EXISTS (SELECT 1 FROM audit a WHERE a.session_id=claims.session_id
+                 AND a.op='session.done' AND a.kind='ok' AND a.ts>=claims.updated_at)
+             OR EXISTS (SELECT 1 FROM task_sessions ts WHERE ts.session_id=claims.session_id
+                 AND ts.completed_at>=claims.updated_at)
+             RETURNING project_id,session,path",
+        )?;
+        let released = statement.query_map([], |row| Ok((
+            row.get::<_, Id>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
+        )))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        for (project, session, path) in &released {
+            tx.execute(
+                "UPDATE overlaps SET active=0,last_seen=?1 WHERE project_id=?2 AND path=?3
+                 AND kind='claim' AND active=1
+                 AND EXISTS (SELECT 1 FROM json_each(overlaps.sessions) WHERE value=?4)",
+                params![now, project, path, session],
+            )?;
+        }
+        if !released.is_empty() {
+            report.fsck_fixes.push(format!("released {} stale file claim(s)", released.len()));
+        }
+    }
     // 7. audit retention (SPEC §14). The log is append-only within its window, not forever: a
     //    long-lived store is mostly old rows nothing can act on any more, and every one of them
     //    is a page the connection pages past. Rows that are half of an undo pair are kept
