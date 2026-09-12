@@ -175,6 +175,8 @@ pub(crate) async fn run(ui: &Rc<Ui>) -> Value {
         .unwrap()
         .len();
     ui.open_project(other, "agents");
+    assert!(ui.sessions.borrow().is_empty(), "Old project sessions must disappear before the next bus response");
+    ui.verify_shell();
     stale_submit.emit_clicked();
     glib::timeout_future(Duration::from_millis(120)).await;
     assert_eq!(
@@ -193,6 +195,32 @@ pub(crate) async fn run(ui: &Rc<Ui>) -> Value {
     );
     ui.open_project(project, "agents");
 
+    // Exercise the visible count keys after show_launch has returned. An unowned
+    // backing DropDown used to be destroyed, silently leaving the count at one.
+    ui.show_launch(None);
+    wait(|| named(&ui.window, "launch-start").is_some_and(|w| w.is_sensitive()), "multi-agent form").await;
+    let control = named(&ui.window, "launch-count-control").unwrap();
+    let mut sibling = control.next_sibling();
+    let mut count_keys = None;
+    while let Some(widget) = sibling {
+        if widget.has_css_class("launch-count") { count_keys = Some(widget); break; }
+        sibling = widget.next_sibling();
+    }
+    let second = count_keys.unwrap().first_child().unwrap().next_sibling().unwrap()
+        .downcast::<gtk::ToggleButton>().unwrap();
+    second.set_active(true);
+    assert_eq!(control.downcast::<gtk::DropDown>().unwrap().selected(), 1);
+    let submit = named(&ui.window, "launch-start").unwrap().downcast::<gtk::Button>().unwrap();
+    let started = std::time::Instant::now();
+    submit.emit_clicked();
+    wait(|| submit.is_sensitive(), "two-agent launch").await;
+    let all = call(ui, "session.list", json!({"project_id":project})).await;
+    assert_eq!(all["sessions"].as_array().unwrap().len(), before + 2, "Count keys must launch two agents");
+    // Both new sessions are running even if event refresh already cached them.
+    assert!(all["sessions"].as_array().unwrap().iter().all(|s| s["state"] != "created"));
+    println!("TWO_AGENT_LAUNCH_MS={}", started.elapsed().as_millis());
+    let before = before + 2;
+
     // Revisit unchanged sessions: their widgets were destroyed while the render signatures
     // used to survive. A fresh pane must initialize its header and dismiss the blank slate.
     for _ in 0..3 {
@@ -206,6 +234,24 @@ pub(crate) async fn run(ui: &Rc<Ui>) -> Value {
     ui.verify_shell();
     wait(|| ui.terminal_contents_contain("RELAY NATIVE VERIFICATION"), "terminal output after project switches").await;
     println!("TERMINAL_PROJECT_ROUNDTRIPS=4");
+
+    call(ui, "git.branch.create", json!({"project_id":other,"name":"switch-fixture","checkout":false})).await;
+    ui.open_project(other, "files");
+    wait(|| named(&ui.window, "branch-switch-switch-fixture").is_some(), "branch switch control").await;
+    let switch = named(&ui.window, "branch-switch-switch-fixture").unwrap().downcast::<gtk::Button>().unwrap();
+    assert!(switch.is_sensitive());
+    switch.emit_clicked();
+    let mut switched = false;
+    for _ in 0..100 {
+        if call(ui, "git.status", json!({"project_id":other})).await["branch"] == "switch-fixture" {
+            switched = true;
+            break;
+        }
+        glib::timeout_future(Duration::from_millis(20)).await;
+    }
+    assert!(switched, "Switch button must check out its branch");
+    println!("BRANCH_SWITCH_CONTROL=ok");
+    ui.open_project(project, "agents");
 
     crate::tools::devices::verify_worktree_picker(ui).await;
     let skill = call(

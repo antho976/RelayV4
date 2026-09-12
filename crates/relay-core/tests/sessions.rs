@@ -241,6 +241,53 @@ fn worktree_ops() {
 }
 
 #[test]
+fn launch_passes_configured_and_memory_write_roots_to_both_providers() {
+    for provider in ["claude", "codex"] {
+        let f = fixture();
+        let binary = fake_discovery_provider(&f.root, provider, "fixture 1.0");
+        ok(&f.engine, "settings.set", json!({"path":format!("providers.{provider}.path"),"value":binary}));
+        let extra = f.root.join("agent notes");
+        std::fs::create_dir_all(&extra).unwrap();
+        ok(&f.engine, "settings.set", json!({"path":"guardrails.allowed_write_roots","value":[extra]}));
+        let session = ok(&f.engine, "session.create", json!({"project_id":1,"provider":provider}));
+        let worktree = PathBuf::from(session["worktree"].as_str().unwrap());
+        ok(&f.engine, "session.spawn", json!({"session":session["name"]}));
+        let captured = worktree.join(".relay/provider-args.txt");
+        wait_until("provider argv", || captured.is_file());
+        let args = std::fs::read_to_string(captured).unwrap();
+        let args: Vec<_> = args.lines().collect();
+        let cfg = relay_core::guardrail::config(&f.engine.store.lock(), Some(1)).unwrap();
+        let roots = relay_core::guardrail::write_roots(&cfg, &worktree);
+        assert!(roots.iter().any(|path| path.ends_with("memories")));
+        assert!(roots.iter().any(|path| path.ends_with("memory")));
+        for root in roots.iter().skip(1) {
+            assert!(args.windows(2).any(|pair| pair == ["--add-dir", root.to_str().unwrap()]), "{provider}: missing {root:?}");
+            let verdict = f.engine.dispatch(Request::new(Actor::agent(session["name"].as_str().unwrap()), "guardrail.check", json!({
+                "project_id":1,"kind":"write","path":root.join("note.md"),"new_text":"note"
+            })), Door::InProcess).into_result().unwrap();
+            assert_eq!(verdict["verdict"], "allow");
+        }
+        ok(&f.engine, "session.close", json!({"session":session["name"]}));
+    }
+}
+
+#[test]
+fn closing_a_provider_that_ignores_term_is_bounded_and_preserves_its_worktree() {
+    let f = fixture();
+    let provider = fake_provider(&f.root, false);
+    std::fs::write(&provider, "#!/bin/sh\ntrap '' TERM\necho ready\nwhile IFS= read -r line; do :; done\n").unwrap();
+    ok(&f.engine, "settings.set", json!({"path":"providers.claude.path","value":provider}));
+    let session = ok(&f.engine, "session.create", json!({"project_id":1,"provider":"claude"}));
+    let spawned = ok(&f.engine, "session.spawn", json!({"session":session["name"]}));
+    wait_until("ignoring TERM", || ok(&f.engine,"session.scrollback",json!({"session":session["name"]}))["text"].as_str().unwrap().contains("ready"));
+    let start = Instant::now();
+    ok(&f.engine, "session.close", json!({"session":session["name"],"remove_worktree":false}));
+    assert!(start.elapsed() < Duration::from_secs(1), "close took {:?}", start.elapsed());
+    assert!(!alive(spawned["pid"].as_i64().unwrap()));
+    assert!(Path::new(session["worktree"].as_str().unwrap()).join("README.md").is_file());
+}
+
+#[test]
 fn session_create_and_worktree_ownership() {
     let f = fixture();
     let e = &f.engine;
@@ -546,6 +593,54 @@ fn recovery_reaps_orphans_and_fscks() {
     assert_eq!(last["reaped_pids"], json!(report.reaped_pids));
     // dirty pooled worktree gets flagged (child.pid is untracked)
     assert!(report.dirty_worktrees.iter().any(|d| d == &wt.display().to_string()), "{report:?}");
+}
+
+#[test]
+fn recovery_releases_legacy_claims_but_preserves_new_work() {
+    let f = fixture();
+    let create = || ok(&f.engine, "session.create", json!({"project_id":1,"provider":"codex"}));
+    let done = create();
+    let closed = create();
+    let working = create();
+    let archived = create();
+    f.engine.dispatch(Request::new(Actor::agent(done["name"].as_str().unwrap()),
+        "session.done", json!({"summary":"Finished before upgrade"})), Door::InProcess).into_result().unwrap();
+    ok(&f.engine, "session.close", json!({"session":closed["name"],"remove_worktree":false}));
+    let task = ok(&f.engine,"task.create",json!({"project_id":1,"title":"Completed before audit retention"}));
+    ok(&f.engine,"task.dispatch",json!({"task_id":task["id"],"session":archived["name"],"start":false}));
+    f.engine.dispatch(Request::new(Actor::agent(archived["name"].as_str().unwrap()),
+        "session.done", json!({"summary":"Archived completion"})), Door::InProcess).into_result().unwrap();
+    {
+        let conn = f.engine.store.lock();
+        conn.execute("DELETE FROM audit WHERE op='session.done' AND session_id=?1", [archived["id"].as_i64().unwrap()]).unwrap();
+        // Reconstruct rows the old build failed to delete, plus a renewed claim
+        // and unfinished work whose claims must remain reserved.
+        for (session, path, updated) in [
+            (&done,"old.rs","2000-01-01T00:00:00Z"),
+            (&done,"renewed.rs","2999-01-01T00:00:00Z"),
+            (&closed,"closed.rs","2000-01-01T00:00:00Z"),
+            (&working,"working.rs","2000-01-01T00:00:00Z"),
+            (&archived,"archived.rs","2000-01-01T00:00:00Z"),
+        ] {
+            conn.execute("INSERT INTO claims(project_id,session_id,session,path,created_at,updated_at) VALUES(1,?1,?2,?3,'2000-01-01T00:00:00Z',?4)",
+                rusqlite::params![session["id"].as_i64().unwrap(),session["name"].as_str().unwrap(),path,updated]).unwrap();
+            conn.execute("INSERT INTO overlaps(project_id,fingerprint,sessions,path,kind,first_seen,last_seen) VALUES(1,?1,?2,?1,'claim','2000-01-01T00:00:00Z','2000-01-01T00:00:00Z')",
+                rusqlite::params![path,json!([session["name"]]).to_string()]).unwrap();
+        }
+    }
+    let report = relay_core::recovery::run(&f.engine).unwrap();
+    assert!(report.fsck_fixes.iter().any(|fix| fix == "released 3 stale file claim(s)"), "{report:?}");
+    {
+        let conn = f.engine.store.lock();
+        let remaining: Vec<String> = conn.prepare("SELECT path FROM claims ORDER BY path").unwrap()
+            .query_map([], |row| row.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+        assert_eq!(remaining, ["renewed.rs", "working.rs"]);
+        let overlaps: Vec<String> = conn.prepare("SELECT path FROM overlaps WHERE active=1 ORDER BY path").unwrap()
+            .query_map([], |row| row.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+        assert_eq!(overlaps, remaining);
+    }
+    let again = relay_core::recovery::run(&f.engine).unwrap();
+    assert!(!again.fsck_fixes.iter().any(|fix| fix.contains("stale file claim")));
 }
 
 #[test]

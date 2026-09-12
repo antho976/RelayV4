@@ -662,6 +662,27 @@ impl Editor {
                 _ => "Not published".into(),
             };
             row.append(&label(&counts, "dim"));
+            if branch["current"] != true {
+                let switch = button("Switch", "quiet");
+                switch.set_widget_name(&format!("branch-switch-{name}"));
+                let checked_out = self.worktrees.borrow().iter()
+                    .any(|worktree| text(worktree, "branch") == name);
+                switch.set_sensitive(!checked_out);
+                switch.set_tooltip_text(Some(if checked_out {
+                    "Already checked out. Select its worktree to work on this branch."
+                } else {
+                    "Switch this checkout to the branch"
+                }));
+                let e = self.clone();
+                let weak = Rc::downgrade(ui);
+                let target = name.clone();
+                switch.connect_clicked(move |_| {
+                    if let Some(ui) = weak.upgrade() {
+                        e.git_action(&ui, "git.branch.switch", json!({"name":target}), None);
+                    }
+                });
+                row.append(&switch);
+            }
             let deletable = branch["merged"] == true
                 && branch["session"].is_null()
                 && branch["current"] != true

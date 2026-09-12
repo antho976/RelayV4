@@ -435,6 +435,11 @@ impl Ui {
         count.set_visible(false);
         members.append(&count);
         let count_select = gtk::DropDown::from_strings(&["1", "2", "3", "4", "5", "6"]);
+        // Segmented keys hold weak references to their backing control. Keep it owned
+        // by the form, just like the mode and builder controls.
+        count_select.set_visible(false);
+        count_select.set_widget_name("launch-count-control");
+        members.append(&count_select);
         let count_keys = segments(&count_select, &["1", "2", "3", "4", "5", "6"]);
         count_keys.add_css_class("launch-count");
         let spin = count.clone();
@@ -782,12 +787,7 @@ impl Ui {
             key.set_sensitive(false);let key=key.clone();ui.launch_box.set_sensitive(false);let progress=progress.clone();
             glib::spawn_future_local(async move{
                 let result=async{
-                    if profiles_data.iter().any(|(payload,_,_)| text(payload,"worktree")=="new") {
-                        progress.set_text("Checking remote changes…");
-                        if let Err(error)=ui.call("git.fetch",json!({"project_id":project})).await {
-                            ui.show_error(&format!("Remote check failed: {error}. Launching with cached local refs."));
-                        }
-                    }
+                    // session.create refreshes new-branch refs before allocation.
                     let mut allocated: Vec<(Value, Vec<i64>, String)> = Vec::new();
                     for (index,(mut payload,tasks,prompt)) in profiles_data.into_iter().enumerate(){
                         progress.set_text(&format!("Allocating agent {}",index+1));

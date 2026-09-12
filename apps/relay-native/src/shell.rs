@@ -17,6 +17,13 @@ impl Ui {
             }
             self.launch.set_reveal_child(false);
             self.project.set(project);
+            // Switch the visible wall synchronously. The registry already contains
+            // all projects' sessions; a slow refresh must never leave the old CLI here.
+            *self.sessions.borrow_mut() = self.sidebar_sessions.borrow().iter()
+                .filter(|session| session["project_id"].as_i64() == Some(project))
+                .cloned().collect();
+            self.ordered.borrow_mut().clear();
+            self.reconcile();
             self.editor.reset();
             self.restored_project.set(0);
             self.refresh();
