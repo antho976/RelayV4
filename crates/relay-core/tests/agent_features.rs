@@ -120,6 +120,24 @@ fn claims_are_declarable_releasable_and_report_who_else_holds_the_file() {
 
 /// A one-line answer to "what is that session doing?", which no amount of branch name gives.
 #[test]
+fn finishing_or_closing_releases_claims_for_the_next_agent() {
+    for action in ["done", "close", "discard"] {
+        let f = Fixture::new();
+        ok(&f.engine, f.me(), "session.claim", json!({"paths":["src/lib.rs"]}));
+        match action {
+            "done" => { ok(&f.engine, f.me(), "session.done", json!({"summary":"Finished"})); }
+            "close" => { ok(&f.engine, Actor::User, "session.close", json!({"session":f.my_name(),"remove_worktree":false})); }
+            _ => {
+                f.engine.store.lock().execute("UPDATE sessions SET state='restorable' WHERE name=?1", [f.my_name()]).unwrap();
+                ok(&f.engine, Actor::User, "session.discard_restorable", json!({"session":f.my_name()}));
+            }
+        }
+        let claim = ok(&f.engine, f.peer(), "session.claim", json!({"paths":["src/lib.rs"],"exclusive":true}));
+        assert!(claim["collisions"].as_array().unwrap().is_empty(), "{action}");
+    }
+}
+
+#[test]
 fn intent_is_one_line_and_reaches_the_peer_table() {
     let f = Fixture::new();
     ok(&f.engine, f.me(), "session.intent", json!({"text": "extracting the parser from lib.rs"}));

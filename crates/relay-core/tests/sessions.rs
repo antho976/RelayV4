@@ -241,6 +241,53 @@ fn worktree_ops() {
 }
 
 #[test]
+fn launch_passes_configured_and_memory_write_roots_to_both_providers() {
+    for provider in ["claude", "codex"] {
+        let f = fixture();
+        let binary = fake_discovery_provider(&f.root, provider, "fixture 1.0");
+        ok(&f.engine, "settings.set", json!({"path":format!("providers.{provider}.path"),"value":binary}));
+        let extra = f.root.join("agent notes");
+        std::fs::create_dir_all(&extra).unwrap();
+        ok(&f.engine, "settings.set", json!({"path":"guardrails.allowed_write_roots","value":[extra]}));
+        let session = ok(&f.engine, "session.create", json!({"project_id":1,"provider":provider}));
+        let worktree = PathBuf::from(session["worktree"].as_str().unwrap());
+        ok(&f.engine, "session.spawn", json!({"session":session["name"]}));
+        let captured = worktree.join(".relay/provider-args.txt");
+        wait_until("provider argv", || captured.is_file());
+        let args = std::fs::read_to_string(captured).unwrap();
+        let args: Vec<_> = args.lines().collect();
+        let cfg = relay_core::guardrail::config(&f.engine.store.lock(), Some(1)).unwrap();
+        let roots = relay_core::guardrail::write_roots(&cfg, &worktree);
+        assert!(roots.iter().any(|path| path.ends_with("memories")));
+        assert!(roots.iter().any(|path| path.ends_with("memory")));
+        for root in roots.iter().skip(1) {
+            assert!(args.windows(2).any(|pair| pair == ["--add-dir", root.to_str().unwrap()]), "{provider}: missing {root:?}");
+            let verdict = f.engine.dispatch(Request::new(Actor::agent(session["name"].as_str().unwrap()), "guardrail.check", json!({
+                "project_id":1,"kind":"write","path":root.join("note.md"),"new_text":"note"
+            })), Door::InProcess).into_result().unwrap();
+            assert_eq!(verdict["verdict"], "allow");
+        }
+        ok(&f.engine, "session.close", json!({"session":session["name"]}));
+    }
+}
+
+#[test]
+fn closing_a_provider_that_ignores_term_is_bounded_and_preserves_its_worktree() {
+    let f = fixture();
+    let provider = fake_provider(&f.root, false);
+    std::fs::write(&provider, "#!/bin/sh\ntrap '' TERM\necho ready\nwhile IFS= read -r line; do :; done\n").unwrap();
+    ok(&f.engine, "settings.set", json!({"path":"providers.claude.path","value":provider}));
+    let session = ok(&f.engine, "session.create", json!({"project_id":1,"provider":"claude"}));
+    let spawned = ok(&f.engine, "session.spawn", json!({"session":session["name"]}));
+    wait_until("ignoring TERM", || ok(&f.engine,"session.scrollback",json!({"session":session["name"]}))["text"].as_str().unwrap().contains("ready"));
+    let start = Instant::now();
+    ok(&f.engine, "session.close", json!({"session":session["name"],"remove_worktree":false}));
+    assert!(start.elapsed() < Duration::from_secs(1), "close took {:?}", start.elapsed());
+    assert!(!alive(spawned["pid"].as_i64().unwrap()));
+    assert!(Path::new(session["worktree"].as_str().unwrap()).join("README.md").is_file());
+}
+
+#[test]
 fn session_create_and_worktree_ownership() {
     let f = fixture();
     let e = &f.engine;

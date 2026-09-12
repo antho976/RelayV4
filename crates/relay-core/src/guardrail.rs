@@ -426,6 +426,24 @@ enum WriteTarget {
 /// always included, which is where every provider harness puts its own scratchpad.
 pub fn write_roots(cfg: &GuardrailConfig, worktree: &Path) -> Vec<PathBuf> {
     let mut roots = vec![worktree.to_path_buf()];
+    if let Some(home) = directories::BaseDirs::new() {
+        let codex = std::env::var_os("CODEX_HOME").map(PathBuf::from)
+            .unwrap_or_else(|| home.home_dir().join(".codex"));
+        roots.push(codex.join("memories"));
+        let claude = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from)
+            .unwrap_or_else(|| home.home_dir().join(".claude"));
+        // Claude shares auto-memory across a repository's worktrees. Keep the
+        // older per-checkout location usable too, without granting transcripts.
+        // https://code.claude.com/docs/en/memory
+        let primary = gix::open(worktree).ok().and_then(|repo|
+            repo.common_dir().parent().map(Path::to_path_buf));
+        for project in std::iter::once(worktree).chain(primary.as_deref()) {
+            let project = std::fs::canonicalize(project).unwrap_or_else(|_| project.to_path_buf());
+            let project_key: String = project.to_string_lossy().chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+            roots.push(claude.join("projects").join(project_key).join("memory"));
+        }
+    }
     roots.extend(cfg.allowed_write_roots.iter().map(PathBuf::from).filter(|path| path.is_absolute()));
     roots.push(std::env::temp_dir());
     let mut seen = std::collections::HashSet::new();

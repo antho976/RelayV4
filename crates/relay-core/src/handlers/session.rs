@@ -245,6 +245,17 @@ fn emit_session(ctx: &mut Ctx, s: &Session) {
     );
 }
 
+fn release_claims(ctx: &mut Ctx, session: &Session) -> Result<(), BusError> {
+    ctx.tx().execute("DELETE FROM claims WHERE session_id=?1", [session.id]).bus()?;
+    ctx.tx().execute(
+        "UPDATE overlaps SET active=0,last_seen=?1 WHERE project_id=?2 AND active=1
+         AND EXISTS (SELECT 1 FROM json_each(overlaps.sessions) WHERE value=?3)",
+        params![ctx.now, session.project_id, session.name],
+    ).bus()?;
+    ctx.emit("overlap.changed", json!({"project_id":session.project_id,"session":session.name}));
+    Ok(())
+}
+
 // Hooks and explicit reports can describe the same result more than once.
 // Keep one unread card per result, without replaying its sound or peer broadcast.
 fn record_agent_notification(ctx: &mut Ctx, s: &Session, category: &str, title: &str, body: &str, link: &str) -> Result<bool, BusError> {
@@ -423,6 +434,17 @@ fn launch(ctx: &mut Ctx, row: &Row_, kind: LaunchKind) -> Result<Session, BusErr
             crate::providers::codex_notify_config(&relay_bin),
         ]);
     }
+    let cfg = crate::guardrail::config(ctx.tx(), Some(row.session.project_id))?;
+    for root in crate::guardrail::write_roots(&cfg, &cwd).into_iter().filter(|root| root != &cwd) {
+        // Provider directory grants need a real directory. Test engines never
+        // create directories in the user's provider homes.
+        if ctx.instance() != crate::Instance::Test && !root.is_dir() {
+            fs::create_dir_all(&root).map_err(|error| BusError::unavailable(
+                "session.write_root", format!("cannot prepare {}: {error}", root.display()),
+            ))?;
+        }
+        args.extend(["--add-dir".into(), root.display().to_string()]);
+    }
     let initial_scrollback = match kind {
         LaunchKind::Fresh => Vec::new(),
         LaunchKind::Resume => sessions::load_scrollback(ctx.tx(), row.session.id)?
@@ -580,7 +602,7 @@ pub fn register(e: &mut Engine) {
         let requested_worktree = p.worktree.as_deref().or(pair_worktree).unwrap_or("new");
         let (worktree_path, branch) = match requested_worktree {
             "primary" => {
-                let all = worktree::list(repo).bus()?;
+                let all = worktree::list_with_dirty(repo, false).bus()?;
                 let primary = all.first().ok_or_else(|| BusError::internal("no primary worktree"))?;
                 (primary.path.clone(), primary.branch.clone())
             }
@@ -602,7 +624,7 @@ pub fn register(e: &mut Engine) {
                 if !path.is_absolute() || !path.join(".git").exists() {
                     return Err(BusError::invalid("session.worktree", format!("{other:?} is not an existing worktree path")));
                 }
-                let all = worktree::list(repo).bus()?;
+                let all = worktree::list_with_dirty(repo, false).bus()?;
                 let want = std::fs::canonicalize(path).map(|p| p.display().to_string()).unwrap_or(other.to_string());
                 let wt = all.into_iter().find(|w| w.path == want)
                     .ok_or_else(|| BusError::invalid("session.worktree", format!("{other:?} is not a worktree of this project")))?;
@@ -919,6 +941,7 @@ pub fn register(e: &mut Engine) {
             }
         }
         let session_state = if status == "completed" { "idle" } else { "blocked" };
+        release_claims(ctx, s)?;
         ctx.tx().execute(
             "UPDATE sessions SET state=?1, last_output_at=?2, updated_at=?2 WHERE id=?3",
             params![session_state, ctx.now, s.id],
@@ -1266,6 +1289,7 @@ pub fn register(e: &mut Engine) {
             }
         }
         ctx.tx().execute("UPDATE sessions SET state='closed',pid=NULL,closed_at=?1,updated_at=?1 WHERE id=?2", params![ctx.now,s.id]).bus()?;
+        release_claims(ctx, s)?;
         ctx.tx().execute("UPDATE sessions SET pair_with=NULL,updated_at=?1 WHERE pair_with=?2 AND state!='closed'", params![ctx.now,s.name]).bus()?;
         ctx.tx().execute("DELETE FROM session_scrollback WHERE session_id=?1", [s.id]).bus()?;
         let updated = sessions::by_id(ctx.tx(), s.id)?.ok_or_else(|| BusError::internal("session vanished"))?;
@@ -1288,7 +1312,14 @@ pub fn register(e: &mut Engine) {
         if let Some(pty) = ctx.engine().take_pty(s.id) {
             let (text, epoch, seq) = pty.scrollback(None);
             sessions::save_scrollback(ctx.tx(), s.id, &text, epoch, seq, &ctx.now)?;
-            pty.kill(Duration::from_secs(3));
+            if p.remove_worktree.unwrap_or(true) {
+                // Stop writers before deleting their checkout, with a bounded grace period.
+                pty.kill(Duration::from_millis(150));
+            } else {
+                // Provider shutdown hooks may need the bus. Let them run after the
+                // transaction unlocks instead of waiting on them while holding it.
+                ctx.after_commit(move |_| pty.kill(Duration::from_millis(150)));
+            }
         }
         let mut freed = 0u64;
         let repo = Path::new(&project.path);
@@ -1325,12 +1356,7 @@ pub fn register(e: &mut Engine) {
         ctx.tx().execute("UPDATE sessions SET state = 'closed', pid = NULL, closed_at = ?1, updated_at = ?1 WHERE id = ?2", params![ctx.now, s.id]).bus()?;
         ctx.tx().execute("UPDATE sessions SET pair_with=NULL,updated_at=?1 WHERE pair_with=?2 AND state!='closed'", params![ctx.now, s.name]).bus()?;
         ctx.tx().execute("DELETE FROM session_scrollback WHERE session_id=?1", [s.id]).bus()?;
-        ctx.tx().execute("DELETE FROM claims WHERE session_id = ?1", [s.id]).bus()?;
-        ctx.tx().execute(
-            "UPDATE overlaps SET active=0, last_seen=?1
-             WHERE project_id=?2 AND active=1 AND EXISTS (SELECT 1 FROM json_each(overlaps.sessions) WHERE value=?3)",
-            params![ctx.now, s.project_id, s.name],
-        ).bus()?;
+        release_claims(ctx, s)?;
         let expired = ctx.tx().execute(
             "UPDATE holds SET state = 'expired', resolved_at = ?1, resolved_by = 'system'
              WHERE session_id = ?2 AND state = 'open'",

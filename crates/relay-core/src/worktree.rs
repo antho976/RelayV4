@@ -153,7 +153,7 @@ pub fn create(repo: &Path, path: &Path, branch: &str, from: Option<&str>) -> Res
         if let Some(f) = from { args.push(f); }
         git(repo, &args)?;
     }
-    let all = list(repo)?;
+    let all = list_with_dirty(repo, false)?;
     let want = canon(path);
     all.into_iter().find(|w| w.path == want).ok_or_else(|| anyhow!("worktree {} not listed after add", path.display()))
 }
