@@ -18,6 +18,30 @@ type Pending = Arc<Mutex<HashMap<Uuid, oneshot::Sender<Result<Value, Error>>>>>;
 const QUEUE: usize = 64;
 const MAX_LINE: usize = 2 * 1024 * 1024;
 
+pub fn is_lifecycle_request(op: &str) -> bool {
+    matches!(
+        op,
+        "session.create"
+            | "session.close"
+            | "session.park"
+            | "session.wake"
+            | "session.resume"
+            | "session.spawn"
+            | "session.clear_restorable"
+            | "session.discard_restorable"
+            | "task.dispatch"
+    )
+}
+
+fn request_timeout(op: &str) -> Duration {
+    match op {
+        "project.clone" => Duration::from_secs(1800),
+        // A new checkout may hydrate large LFS assets after the bounded fetch.
+        "session.create" | "git.worktree.create" | "task.dispatch" => Duration::from_secs(180),
+        _ => Duration::from_secs(30),
+    }
+}
+
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum Error {
     #[error("{0}")]
@@ -69,7 +93,10 @@ impl Client {
     /// Session lifecycle actions must not sit behind slow reads on the UI socket.
     /// This connection has no subscriptions and exists only for this one action.
     pub async fn lifecycle_request(
-        rt: &Handle, path: PathBuf, op: &str, payload: Value,
+        rt: &Handle,
+        path: PathBuf,
+        op: &str,
+        payload: Value,
     ) -> Result<Value, Error> {
         let (client, _notices) = Self::connect(rt, path).await?;
         client.request(rt, op, payload).await
@@ -220,11 +247,7 @@ impl Client {
         }
         let _remove = Remove(self.0.pending.clone(), id);
         let tx = self.0.tx.clone();
-        let timeout = if op == "project.clone" {
-            Duration::from_secs(1800)
-        } else {
-            Duration::from_secs(30)
-        };
+        let timeout = request_timeout(op);
         rt.spawn(async move {
             tokio::time::timeout(timeout, async {
                 tx.send(request).await.map_err(|_| Error::Disconnected)?;
@@ -244,7 +267,13 @@ mod tests {
     use tokio::net::UnixListener;
 
     #[tokio::test]
-    async fn close_bypasses_a_stalled_status_request() {
+    async fn lifecycle_actions_bypass_a_stalled_status_request() {
+        for op in ["session.close", "session.create", "task.dispatch"] {
+            lifecycle_bypasses_a_stalled_status_request(op).await;
+        }
+    }
+
+    async fn lifecycle_bypasses_a_stalled_status_request(op: &'static str) {
         let path = std::env::temp_dir().join(format!("relay-lifecycle-{}.sock", Uuid::new_v4()));
         let server = UnixListener::bind(&path).unwrap();
         let rt = Handle::current();
@@ -255,25 +284,70 @@ mod tests {
             let (socket, _) = server.accept().await.unwrap();
             let (read, mut write) = socket.into_split();
             let mut lines = BufReader::new(read).lines();
-            let slow: Request = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            let slow: Request =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
             assert_eq!(slow.op, "git.status");
             started.send(()).unwrap();
             let (action, _) = server.accept().await.unwrap();
             let (read, mut action_write) = action.into_split();
             let mut lines = BufReader::new(read).lines();
-            let close: Request = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
-            assert_eq!(close.op, "session.close");
-            action_write.write_all(format!("{}\n", serde_json::to_string(&Response::ok(close.id, serde_json::json!({}))).unwrap()).as_bytes()).await.unwrap();
+            let close: Request =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(close.op, op);
+            action_write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        serde_json::to_string(&Response::ok(close.id, serde_json::json!({})))
+                            .unwrap()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
             released.await.unwrap();
-            write.write_all(format!("{}\n", serde_json::to_string(&Response::ok(slow.id, serde_json::json!({}))).unwrap()).as_bytes()).await.unwrap();
+            write
+                .write_all(
+                    format!(
+                        "{}\n",
+                        serde_json::to_string(&Response::ok(slow.id, serde_json::json!({})))
+                            .unwrap()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
         });
         let handle = rt.clone();
-        let slow = tokio::spawn(async move { client.request(&handle, "git.status", serde_json::json!({})).await });
+        let action_client = client.clone();
+        let slow = tokio::spawn(async move {
+            client
+                .request(&handle, "git.status", serde_json::json!({}))
+                .await
+        });
         blocked.await.unwrap();
-        tokio::time::timeout(Duration::from_millis(500),
-            Client::lifecycle_request(&rt, path.clone(), "session.close", serde_json::json!({"session":"fixture"})))
-            .await.expect("Close queued behind slow Git read").unwrap();
-        assert!(!slow.is_finished(), "The status request must still be blocked");
+        tokio::time::timeout(Duration::from_millis(500), async {
+            if is_lifecycle_request(op) {
+                Client::lifecycle_request(
+                    &rt,
+                    path.clone(),
+                    op,
+                    serde_json::json!({"session":"fixture"}),
+                )
+                .await
+            } else {
+                action_client
+                    .request(&rt, op, serde_json::json!({"session":"fixture"}))
+                    .await
+            }
+        })
+        .await
+        .expect("Lifecycle action queued behind slow Git read")
+        .unwrap();
+        assert!(
+            !slow.is_finished(),
+            "The status request must still be blocked"
+        );
         release.send(()).unwrap();
         slow.await.unwrap().unwrap();
         fixture.await.unwrap();

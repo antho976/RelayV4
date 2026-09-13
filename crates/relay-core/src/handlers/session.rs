@@ -543,30 +543,81 @@ fn note_pty_state(ctx: &Ctx, session_id: Id, state: &str) {
     }
 }
 
+/// Reserve the public name across the unlocked checkout phase. A failed checkout
+/// releases the name reservation but preserves any files Git already created.
+struct PreparedCreate {
+    engine: std::sync::Weak<Engine>,
+    name: String,
+    project: relay_bus::types::Project,
+    worktree: Option<relay_bus::types::Worktree>,
+}
+
+impl Drop for PreparedCreate {
+    fn drop(&mut self) {
+        if let Some(engine) = self.engine.upgrade() {
+            engine.creating_sessions.lock().unwrap().remove(&self.name);
+        }
+    }
+}
+
+fn validate_create(conn: &Connection, p: &CreateIn) -> Result<relay_bus::types::Project, BusError> {
+    let project = crate::handlers::workspace::get_project(conn, p.project_id)?;
+    crate::providers::validate_options(p.provider, p.model.as_deref(), p.effort.as_deref())?;
+    if let Some(task_id) = p.task_id {
+        let valid: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1 AND project_id=?2 AND deleted_at IS NULL)",
+            params![task_id, project.id], |row| row.get(0),
+        ).bus()?;
+        if !valid { return Err(BusError::not_found("task.not_found", format!("no task {task_id} in project {}", project.id))); }
+    }
+    if let Some(module_id) = p.module_id {
+        let valid: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM modules WHERE id=?1 AND project_id=?2 AND deleted_at IS NULL)",
+            params![module_id, project.id], |row| row.get(0),
+        ).bus()?;
+        if !valid { return Err(BusError::not_found("module.not_found", format!("no module {module_id} in project {}", project.id))); }
+    }
+    Ok(project)
+}
+
 pub fn register(e: &mut Engine) {
     e.register_staged::<Create, _>(|ctx, p| {
-        // Fetch before taking the store transaction: slow remotes must not freeze the bus.
+        let mut prepared = ctx.read(|conn| {
+            let project = validate_create(conn, p)?;
+            let mut reservations = ctx.engine().creating_sessions.lock().unwrap();
+            for _ in 0..200 {
+                let name = sessions::new_name(conn).bus()?;
+                if worktree::pooled_path(Path::new(&project.path), &name).exists()
+                    || !reservations.insert(name.clone()) { continue; }
+                return Ok(PreparedCreate {
+                    engine: Arc::downgrade(&ctx.engine().arc().ok_or_else(|| BusError::internal("engine unavailable"))?),
+                    name, project, worktree: None,
+                });
+            }
+            Err(BusError::conflict("session.names_busy", "Could not reserve a free session name"))
+        })?;
+        // Fetch AND checkout can invoke slow network/LFS filters. Neither belongs
+        // under the global store mutex: existing sessions must remain responsive.
         if p.pair_with.is_none() && p.worktree.as_deref().unwrap_or("new") == "new" {
-            let project = ctx.read(|conn| crate::handlers::workspace::get_project(conn, p.project_id))?;
-            super::git::refresh_new_worktree(Path::new(&project.path), p.branch.as_deref())?;
+            let repo = Path::new(&prepared.project.path);
+            super::git::refresh_new_worktree(repo, p.branch.as_deref())?;
+            let branch = p.branch.clone().unwrap_or_else(|| worktree::branch_for(&prepared.name));
+            let path = worktree::pooled_path(repo, &prepared.name);
+            let from = if super::git::existing_worktree_branch(repo, Some(&branch))? {
+                None
+            } else {
+                super::git::new_worktree_base(repo, &prepared.project.base_branch)?
+            };
+            prepared.worktree = Some(worktree::create(repo, &path, &branch, from.as_deref())
+                .map_err(|e| BusError::conflict("worktree.create_failed", e.to_string()))?);
         }
-        Ok(())
-    }, |ctx: &mut Ctx, p, ()| {
-        let project = crate::handlers::workspace::get_project(ctx.tx(), p.project_id)?;
-        crate::providers::validate_options(p.provider, p.model.as_deref(), p.effort.as_deref())?;
-        if let Some(task_id) = p.task_id {
-            let valid: bool = ctx.tx().query_row(
-                "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1 AND project_id=?2 AND deleted_at IS NULL)",
-                params![task_id, project.id], |row| row.get(0),
-            ).bus()?;
-            if !valid { return Err(BusError::not_found("task.not_found", format!("no task {task_id} in project {}", project.id))); }
-        }
-        if let Some(module_id) = p.module_id {
-            let valid: bool = ctx.tx().query_row(
-                "SELECT EXISTS(SELECT 1 FROM modules WHERE id=?1 AND project_id=?2 AND deleted_at IS NULL)",
-                params![module_id, project.id], |row| row.get(0),
-            ).bus()?;
-            if !valid { return Err(BusError::not_found("module.not_found", format!("no module {module_id} in project {}", project.id))); }
+        Ok(prepared)
+    }, |ctx: &mut Ctx, p, mut prepared| {
+        // Recheck mutable records after the external work completes.
+        let project = validate_create(ctx.tx(), &p)?;
+        if project.path != prepared.project.path || project.base_branch != prepared.project.base_branch {
+            return Err(BusError::conflict("session.project_changed",
+                "Project changed during creation; any created worktree is preserved"));
         }
         let pair = match p.pair_with.as_deref() {
             Some(name) => {
@@ -595,7 +646,7 @@ pub fn register(e: &mut Engine) {
             }
             None => None,
         };
-        let name = sessions::new_name(ctx.tx()).bus()?;
+        let name = prepared.name.clone();
         let token = sessions::new_token();
         let repo = Path::new(&project.path);
         let pair_worktree = pair.as_ref().map(|row| row.session.worktree.as_str());
@@ -607,16 +658,7 @@ pub fn register(e: &mut Engine) {
                 (primary.path.clone(), primary.branch.clone())
             }
             "new" => {
-                let branch = p.branch.clone().unwrap_or_else(|| worktree::branch_for(&name));
-                let path = worktree::pooled_path(repo, &name);
-                let base = project.base_branch.clone();
-                let from = if super::git::existing_worktree_branch(repo, Some(&branch))? {
-                    None
-                } else {
-                    super::git::new_worktree_base(repo, &base)?
-                };
-                let wt = worktree::create(repo, &path, &branch, from.as_deref())
-                    .map_err(|e| BusError::conflict("worktree.create_failed", e.to_string()))?;
+                let wt = prepared.worktree.take().ok_or_else(|| BusError::internal("checkout was not prepared"))?;
                 (wt.path, wt.branch)
             }
             other => {

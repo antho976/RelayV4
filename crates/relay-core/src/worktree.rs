@@ -180,12 +180,19 @@ pub fn create(repo: &Path, path: &Path, branch: &str, from: Option<&str>) -> Res
     }
     let path_s = path.display().to_string();
     let exists = git(repo, &["show-ref", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok();
-    if exists {
-        git(repo, &["worktree", "add", &path_s, branch])?;
+    let args = if exists {
+        vec!["worktree", "add", &path_s, branch]
     } else {
         let mut args = vec!["worktree", "add", "-b", branch, &path_s];
         if let Some(f) = from { args.push(f); }
-        git(repo, &args)?;
+        args
+    };
+    let mut command = Command::new("git");
+    command.arg("-C").arg(repo).args(args).env("GIT_TERMINAL_PROMPT", "0");
+    let output = crate::proc::output_with_timeout(&mut command, std::time::Duration::from_secs(120))?
+        .ok_or_else(|| anyhow!("Worktree creation timed out after 120 seconds; partial files are preserved at {}", path.display()))?;
+    if !output.status.success() {
+        return Err(anyhow!("Worktree creation failed at {}: {}", path.display(), String::from_utf8_lossy(&output.stderr).trim()));
     }
     let all = list_with_dirty(repo, false)?;
     let want = canon(path);
