@@ -90,6 +90,15 @@ impl Drop for Connection {
 pub struct Client(Arc<Connection>);
 
 impl Client {
+    /// Binary file responses use a separate bounded connection. Keep the normal
+    /// control/event channel's 2 MiB limit and responsiveness unchanged.
+    pub async fn image_read(rt: &Handle, path: PathBuf, payload: Value) -> Result<Value, Error> {
+        let (client, _notices) = rt
+            .spawn(async move { Self::open_with_limit(path, 24 * 1024 * 1024).await })
+            .await
+            .map_err(|e| Error::Io(e.to_string()))??;
+        client.request(rt, "file.read", payload).await
+    }
     /// Session lifecycle actions must not sit behind slow reads on the UI socket.
     /// This connection has no subscriptions and exists only for this one action.
     pub async fn lifecycle_request(
@@ -112,6 +121,13 @@ impl Client {
     }
 
     async fn open(path: PathBuf) -> Result<(Self, async_channel::Receiver<Notice>), Error> {
+        Self::open_with_limit(path, MAX_LINE).await
+    }
+
+    async fn open_with_limit(
+        path: PathBuf,
+        max_line: usize,
+    ) -> Result<(Self, async_channel::Receiver<Notice>), Error> {
         let socket = UnixStream::connect(&path)
             .await
             .map_err(|e| Error::Io(format!("Cannot connect to {}: {e}", path.display())))?;
@@ -139,8 +155,11 @@ impl Client {
                             .iter()
                             .position(|b| *b == b'\n')
                             .map_or(available.len(), |n| n + 1);
-                        if line.len() + n > MAX_LINE {
-                            return Err(Error::Protocol("frame exceeds 2 MiB".into()));
+                        if line.len() + n > max_line {
+                            return Err(Error::Protocol(format!(
+                                "frame exceeds {} MiB",
+                                max_line / 1024 / 1024
+                            )));
                         }
                         let complete = available[n - 1] == b'\n';
                         line.extend_from_slice(&available[..n]);
