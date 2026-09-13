@@ -845,6 +845,8 @@ impl Editor {
                         return;
                     }
                     e.diff.set(true);
+                    e.image_mode.set(false);
+                    e.image.clear();
                     e.before.set_text(old);
                     e.buffer.set_text(new);
                     e.buffer.set_modified(false);

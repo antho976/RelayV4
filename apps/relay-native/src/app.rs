@@ -873,10 +873,7 @@ impl Ui {
     }
     pub async fn call(&self, op: &str, payload: Value) -> Result<Value, Error> {
         let client = self.client.borrow().clone().ok_or(Error::Disconnected)?;
-        if matches!(op, "session.close" | "session.park" | "session.wake"
-            | "session.resume" | "session.spawn" | "session.clear_restorable"
-            | "session.discard_restorable")
-        {
+        if crate::client::is_lifecycle_request(op) {
             return Client::lifecycle_request(&self.rt, self.path.clone(), op, payload).await;
         }
         client.request(&self.rt, op, payload).await

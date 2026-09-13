@@ -1168,3 +1168,36 @@ fn review_group_keeps_shared_worktree_until_every_participant_finishes_then_adva
     // A new taskless Done after this point names the new current task by contract.
     // Only reusing the original req_id is replay-idempotent across an advancement.
 }
+
+#[test]
+fn slow_checkout_does_not_hold_the_store_lock() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fixture();
+    let marker = f.root.join("checkout-started");
+    let filter = f.root.join("slow-filter");
+    std::fs::write(&filter, format!(
+        "#!/bin/sh\ntouch '{}'\nsleep 2\ncat\n", marker.display(),
+    )).unwrap();
+    std::fs::set_permissions(&filter, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(f.repo.join(".gitattributes"), "README.md filter=slow\n").unwrap();
+    git(&f.repo, &["config", "filter.slow.smudge", filter.to_str().unwrap()]);
+    git(&f.repo, &["config", "filter.slow.clean", "cat"]);
+    git(&f.repo, &["config", "filter.slow.required", "true"]);
+    git(&f.repo, &["add", ".gitattributes"]);
+    git(&f.repo, &["commit", "-qm", "slow checkout fixture"]);
+    let engine = f.engine.clone();
+    let creating = std::thread::spawn(move || ok(&engine, "session.create",
+        json!({"project_id":1, "provider":"codex", "worktree":"new"})));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !marker.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(marker.exists(), "Git did not start the slow checkout filter");
+    let started = Instant::now();
+    ok(&f.engine, "app.status", json!({}));
+    let elapsed = started.elapsed();
+    let session = creating.join().unwrap();
+    assert_eq!(session["state"], "created");
+    assert_eq!(std::fs::read_to_string(Path::new(session["worktree"].as_str().unwrap()).join("README.md")).unwrap(), "hi\n");
+    assert!(elapsed < Duration::from_millis(500), "app.status blocked behind checkout for {elapsed:?}");
+}

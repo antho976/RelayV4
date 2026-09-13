@@ -408,6 +408,7 @@ pub struct Engine {
     pub(crate) next_mirror: AtomicI64,
     pub(crate) watchers: std::sync::Mutex<HashMap<String, notify::RecommendedWatcher>>,
     pub(crate) provider_updates: std::sync::Mutex<HashSet<String>>,
+    pub(crate) creating_sessions: std::sync::Mutex<HashSet<String>>,
     pub(crate) watcher_registrations: std::sync::Mutex<HashSet<String>>,
     pub(crate) ui: std::sync::Mutex<UiRuntime>,
     pub(crate) resource_watch: AtomicBool,
@@ -415,6 +416,7 @@ pub struct Engine {
     pub(crate) resource_watch_epoch: AtomicI64,
     pub(crate) resource_cpu: std::sync::Mutex<HashMap<i64, (u64, Instant)>>,
     pub(crate) resource_disk: std::sync::Mutex<HashMap<String, (f64, Option<f64>)>>,
+    pub(crate) resource_disk_refresh: std::sync::Mutex<(bool, Option<Instant>)>,
 }
 
 impl Engine {
@@ -441,6 +443,7 @@ impl Engine {
             next_mirror: AtomicI64::new(1),
             watchers: std::sync::Mutex::new(HashMap::new()),
             provider_updates: std::sync::Mutex::new(HashSet::new()),
+            creating_sessions: std::sync::Mutex::new(HashSet::new()),
             watcher_registrations: std::sync::Mutex::new(HashSet::new()),
             ui: std::sync::Mutex::new(UiRuntime::default()),
             resource_watch: AtomicBool::new(false),
@@ -448,6 +451,7 @@ impl Engine {
             resource_watch_epoch: AtomicI64::new(0),
             resource_cpu: std::sync::Mutex::new(HashMap::new()),
             resource_disk: std::sync::Mutex::new(HashMap::new()),
+            resource_disk_refresh: std::sync::Mutex::new((false, None)),
         };
         crate::handlers::register_all(&mut engine);
         let arc = Arc::new(engine);

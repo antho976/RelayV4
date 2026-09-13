@@ -22,6 +22,8 @@ impl Editor {
         self.content_stack
             .set_visible_child_name(if self.path.borrow().is_empty() {
                 "empty"
+            } else if self.image_mode.get() {
+                "image"
             } else {
                 "source"
             });
