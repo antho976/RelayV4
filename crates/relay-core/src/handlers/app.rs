@@ -139,6 +139,22 @@ pub(crate) fn resources(conn: &Connection, engine: &Engine) -> Result<ResourcesO
 /// Re-measure every live worktree and publish the result. Walks the filesystem — call this from a
 /// worker thread only, never with the store mutex held.
 pub(crate) fn refresh_disk_cache(engine: &Engine) {
+    // UI refreshes and resource-watch ticks can arrive together. At most one scan
+    // runs, with a cooldown after completion rather than a pile-up of tree walks.
+    {
+        let mut refresh = engine.resource_disk_refresh.lock().unwrap();
+        if refresh.0 || refresh.1.is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(30)) {
+            return;
+        }
+        refresh.0 = true;
+    }
+    struct Refresh<'a>(&'a Engine);
+    impl Drop for Refresh<'_> {
+        fn drop(&mut self) {
+            *self.0.resource_disk_refresh.lock().unwrap() = (false, Some(Instant::now()));
+        }
+    }
+    let _refresh = Refresh(engine);
     let rows = {
         let conn = engine.store.lock();
         resource_rows(&conn).ok()
@@ -174,10 +190,9 @@ fn resource_snapshot(rows: Vec<ResourceRow>, engine: &Engine, refresh_disk: bool
         total_rss_mb += rss_mb;
         panes.push(PaneResource { session, pid, rss_mb, cpu_pct });
     }
-    let missing = {
-        let cache = engine.resource_disk.lock().unwrap();
-        worktree_paths.iter().filter(|path| refresh_disk || !cache.contains_key(*path)).cloned().collect::<Vec<_>>()
-    };
+    // A cold cache is still a cache-only read. Missing entries arrive from the
+    // background scan, never from the request holding the global store mutex.
+    let missing = if refresh_disk { worktree_paths.iter().cloned().collect::<Vec<_>>() } else { Vec::new() };
     if !missing.is_empty() {
         let measured = missing.into_iter().map(|path| {
             let (disk, build) = dir_usage(Path::new(&path));
@@ -259,6 +274,35 @@ fn cpu_pct(engine: &Engine, pid: i64, ticks: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cold_resource_snapshot_leaves_disk_work_to_the_background() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("asset"), b"asset").unwrap();
+        let engine = Engine::new(crate::Instance::Test, crate::Store::open_memory().unwrap());
+        let rows = vec![("fixture".into(), None, root.path().display().to_string())];
+        let snapshot = resource_snapshot(rows.clone(), &engine, false).unwrap();
+        assert_eq!(snapshot.panes.len(), 1);
+        assert!(snapshot.worktrees.is_empty(), "cache-only snapshot walked the worktree");
+        assert!(engine.resource_disk.lock().unwrap().is_empty());
+        let measured = resource_snapshot(rows.clone(), &engine, true).unwrap();
+        assert_eq!(measured.worktrees[0].disk_mb, bytes_mb(5));
+        std::fs::write(root.path().join("asset"), b"asset changed").unwrap();
+        let cached = resource_snapshot(rows, &engine, false).unwrap();
+        assert_eq!(cached.worktrees[0].disk_mb, bytes_mb(5));
+    }
+
+    #[test]
+    fn disk_refreshes_do_not_overlap_or_repeat_inside_the_cooldown() {
+        let engine = Engine::new(crate::Instance::Test, crate::Store::open_memory().unwrap());
+        *engine.resource_disk_refresh.lock().unwrap() = (true, None);
+        refresh_disk_cache(&engine);
+        assert_eq!(*engine.resource_disk_refresh.lock().unwrap(), (true, None));
+        let completed = Instant::now();
+        *engine.resource_disk_refresh.lock().unwrap() = (false, Some(completed));
+        refresh_disk_cache(&engine);
+        assert_eq!(*engine.resource_disk_refresh.lock().unwrap(), (false, Some(completed)));
+    }
 
     #[test]
     fn disk_usage_counts_total_and_build_bytes_in_one_walk() {

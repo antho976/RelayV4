@@ -873,6 +873,9 @@ impl Ui {
     }
     pub async fn call(&self, op: &str, payload: Value) -> Result<Value, Error> {
         let client = self.client.borrow().clone().ok_or(Error::Disconnected)?;
+        if crate::client::is_lifecycle_request(op) {
+            return Client::lifecycle_request(&self.rt, self.path.clone(), op, payload).await;
+        }
         client.request(&self.rt, op, payload).await
     }
     pub fn mutate(self: &Rc<Self>, op: &'static str, payload: Value, key: &gtk::Button) {

@@ -1,9 +1,23 @@
 use super::*;
 use crate::client::Error;
 
+struct GitRefreshGuard(Rc<Editor>, Rc<Ui>);
+impl Drop for GitRefreshGuard {
+    fn drop(&mut self) {
+        self.0.git_refresh_pending.set(false);
+        if self.0.git_refresh_dirty.replace(false) {
+            self.0.refresh_git(&self.1);
+        }
+    }
+}
+
 impl Editor {
     pub(super) fn refresh_git(self: &Rc<Self>, ui: &Rc<Ui>) {
         if ui.project.get() == 0 {
+            return;
+        }
+        if self.git_refresh_pending.replace(true) {
+            self.git_refresh_dirty.set(true);
             return;
         }
         self.git_revision.set(self.git_revision.get() + 1);
@@ -14,6 +28,7 @@ impl Editor {
         let e = self.clone();
         let ui = ui.clone();
         glib::spawn_future_local(async move {
+            let _pending = GitRefreshGuard(e.clone(), ui.clone());
             let result = ui.call("git.status", payload.clone()).await;
             if !e.matches(&ui, project, &worktree) || revision != e.git_revision.get() {
                 return;
@@ -830,6 +845,8 @@ impl Editor {
                         return;
                     }
                     e.diff.set(true);
+                    e.image_mode.set(false);
+                    e.image.clear();
                     e.before.set_text(old);
                     e.buffer.set_text(new);
                     e.buffer.set_modified(false);

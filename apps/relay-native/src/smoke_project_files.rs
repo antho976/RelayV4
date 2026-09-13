@@ -245,6 +245,7 @@ pub async fn run(ui: &Rc<Ui>) -> Result<(), String> {
         ui.page.borrow().as_str() == "agents",
         "File operations stay in project view",
     )?;
+    image_preview(ui).await?;
     println!(
         "Project Files/Git/Agents, retained draft, save, create, folder, scoped move, rename, trash/undo, and refresh coalescing verified"
     );
@@ -342,5 +343,56 @@ pub async fn profile_lifecycle(ui: &Rc<Ui>) -> Result<(), String> {
         "TERMINAL_LIFECYCLE={}",
         json!({"samples":results,"median":medians,"fixture":"tiny local repository, fake provider, five warm app iterations"})
     );
+    Ok(())
+}
+
+
+async fn image_preview(ui: &Rc<Ui>) -> Result<(), String> {
+    let project = ui.call("project.get", json!({"project_id":ui.project.get()})).await.map_err(|e|e.to_string())?;
+    let root = std::path::Path::new(project["path"].as_str().ok_or("Fixture project path")?);
+    // An uncompressed PNG exceeds the ordinary 2 MiB bus frame limit.
+    let pixels = (0..1024 * 768 * 3).map(|n| ((n * 73 + n / 29) % 256) as u8).collect::<Vec<_>>();
+    let bytes = glib::Bytes::from_owned(pixels);
+    let image = gtk::gdk_pixbuf::Pixbuf::from_bytes(&bytes,
+        gtk::gdk_pixbuf::Colorspace::Rgb, false, 8, 1024, 768, 1024 * 3);
+    let png = image.save_to_bufferv("png", &[("compression", "0")]).map_err(|e|e.to_string())?;
+    require(png.len() > 2 * 1024 * 1024, "Image exercises the separate binary transport")?;
+    std::fs::write(root.join("preview.PNG"), &png).map_err(|e|e.to_string())?;
+    std::fs::write(root.join("broken.png"), b"not an image").map_err(|e|e.to_string())?;
+    ui.editor.show_files();
+    ui.editor.load_tree(ui, None);
+    wait_for(|| named(&ui.window, "project-file:preview.PNG").is_some(), "Image file in tree").await?;
+    click(ui, "project-file:preview.PNG")?;
+    let picture = named(&ui.window, "project-image").ok_or("Preview widget")?.downcast::<gtk::Picture>().map_err(|_| "Picture type")?;
+    wait_for(|| picture.is_mapped() && picture.paintable().is_some(), "Picture rendered").await?;
+    require(!ui.editor.is_dirty(), "Image does not create an editable draft")?;
+    let texture = picture.paintable().unwrap().downcast::<gtk::gdk::MemoryTexture>().map_err(|_| "Preview texture")?;
+    require(texture.width() == 1024 && texture.height() == 768, "Image dimensions")?;
+    require(!named(&ui.window, "project-save").unwrap().is_sensitive(), "Image cannot be saved as text")?;
+    click(ui, "project-agents")?;
+    click(ui, "project-editor")?;
+    require(picture.is_mapped(), "Returning to editor restores image")?;
+    // Capture the actual editor preview, including fit and surrounding chrome.
+    glib::timeout_future(Duration::from_millis(150)).await;
+    if let Ok(path) = std::env::var("RELAY_NATIVE_SCREENSHOT") {
+        let paintable = gtk::WidgetPaintable::new(Some(&ui.window));
+        let snapshot = gtk::Snapshot::new();
+        paintable.snapshot(&snapshot, ui.window.width() as f64, ui.window.height() as f64);
+        let node = snapshot.to_node().ok_or("Preview snapshot")?;
+        ui.window.renderer().ok_or("Preview renderer")?.render_texture(&node, None).save_to_png(path).map_err(|e| e.to_string())?;
+    }
+    click(ui, "project-file:broken.png")?;
+    let message = named(&ui.window, "project-image-message").unwrap().downcast::<gtk::Label>().unwrap();
+    wait_for(|| message.text().starts_with("Cannot preview image"), "Invalid image error").await?;
+    require(picture.paintable().is_none(), "Invalid image clears previous picture")?;
+    click(ui, "project-file:README.md")?;
+    let view = named(&ui.window, "project-source").unwrap().downcast::<sourceview5::View>().unwrap();
+    wait_for(|| view.is_mapped() && view.is_editable(), "Text editor after image").await?;
+    view.buffer().insert_at_cursor("keep this draft");
+    click(ui, "project-file:preview.PNG")?;
+    require(view.buffer().is_modified() && view.is_mapped(), "Image click preserves unsaved text")?;
+    click(ui, "project-discard")?;
+    wait_for(|| !ui.editor.is_dirty(), "Discard fixture draft").await?;
+    println!("IMAGE_PREVIEW_OK=large_png,fit,agents_roundtrip,invalid_image,source_return,dirty_draft");
     Ok(())
 }

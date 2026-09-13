@@ -8,6 +8,22 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+// A status refresh can rewrite only index stat fields. Compare the staged tree
+// rather than index bytes so this cache maintenance does not trigger another scan.
+fn index_signature(root: &Path) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let repo = gix::open(root).ok()?;
+    let index = repo.index().ok()?;
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    for entry in index.entries() {
+        entry.path(&index).hash(&mut hash);
+        entry.id.hash(&mut hash);
+        entry.mode.bits().hash(&mut hash);
+        entry.flags.bits().hash(&mut hash);
+    }
+    Some(hash.finish())
+}
+
 /// Both request contexts can defer work: [`Ctx`] until after its transaction commits, [`Unlocked`]
 /// until its handler returns. Watcher registration only cares that the store lock is not held.
 pub(crate) trait Defer {
@@ -67,6 +83,7 @@ pub fn ensure(engine: &Engine, root: &Path, project_id: relay_bus::types::Id) {
     let pending_cb = pending.clone();
     let root = PathBuf::from(&key);
     let callback_root = root.clone();
+    let mut last_index = index_signature(&root);
     let watcher: notify::Result<RecommendedWatcher> =
         notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
             let Ok(event) = event else { return };
@@ -79,7 +96,16 @@ pub fn ensure(engine: &Engine, root: &Path, project_id: relay_bus::types::Id) {
                 && event
                     .paths
                     .iter()
-                    .all(|path| is_generated_path(&callback_root, path)))
+                    .all(|path| {
+                        if path == &callback_root.join(".git/index") {
+                            let next = index_signature(&callback_root);
+                            let unchanged = next.is_some() && next == last_index;
+                            last_index = next;
+                            unchanged
+                        } else {
+                            is_generated_path(&callback_root, path)
+                        }
+                    }))
                 || pending_cb.swap(true, Ordering::SeqCst)
             {
                 return;
@@ -128,6 +154,15 @@ pub fn ensure(engine: &Engine, root: &Path, project_id: relay_bus::types::Id) {
 /// never useful refresh signals for the source tree and would otherwise keep the single bus busy.
 pub(crate) fn is_generated_path(root: &Path, path: &Path) -> bool {
     let relative = path.strip_prefix(root).unwrap_or(path);
+    // Status filters may write .git/lfs and objects; these writes are not source
+    // edits and must not start another status scan. Keep real index/ref changes.
+    if let Ok(git_path) = relative.strip_prefix(".git") {
+        return !(git_path == Path::new("index")
+            || git_path == Path::new("HEAD")
+            || git_path == Path::new("packed-refs")
+            || git_path == Path::new("config")
+            || (git_path.starts_with("refs") && !git_path.to_string_lossy().ends_with(".lock")));
+    }
     relative.components().any(|component| {
         let value = component.as_os_str().to_string_lossy();
         matches!(
@@ -141,6 +176,10 @@ pub(crate) fn is_generated_path(root: &Path, path: &Path) -> bool {
                 | ".next"
                 | "dist"
                 | "coverage"
+                | "Intermediate"
+                | "Saved"
+                | "DerivedDataCache"
+                | "Binaries"
         )
     })
 }
@@ -239,5 +278,12 @@ mod tests {
             Path::new("/repo/apps/web/src/App.svelte")
         ));
         assert!(!is_generated_path(root, Path::new("/repo/.git/HEAD")));
+        for path in [".git/lfs/tmp/asset", ".git/objects/ab/object", ".git/index.lock",
+            "Saved/Logs/Unreal.log", "Intermediate/Build/file", "DerivedDataCache/cache", "Binaries/Linux/game"] {
+            assert!(is_generated_path(root, &root.join(path)), "{path}");
+        }
+        for path in [".git/index", ".git/refs/heads/main", "Content/Level.umap"] {
+            assert!(!is_generated_path(root, &root.join(path)), "{path}");
+        }
     }
 }

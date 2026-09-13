@@ -46,7 +46,11 @@ pub fn register(e: &mut Engine) {
             return Err(BusError::invalid("file.type", "path is not a file"));
         }
         let limit = p.max_bytes.unwrap_or(4 * 1024 * 1024).min(32 * 1024 * 1024);
-        let mut bytes = fs::read(&path).map_err(|e| io_err("file.read_failed", &rel, e))?;
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        fs::File::open(&path)
+            .and_then(|file| file.take(limit + 1).read_to_end(&mut bytes))
+            .map_err(|e| io_err("file.read_failed", &rel, e))?;
         let truncated = bytes.len() as u64 > limit;
         bytes.truncate(limit as usize);
         let mime = mime(&rel);
