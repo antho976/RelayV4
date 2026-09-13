@@ -21,12 +21,18 @@ const POLL: Duration = Duration::from_millis(5);
 /// pipes are drained on their own threads, so a child that writes more than a pipe buffer can
 /// never deadlock the wait.
 pub fn output_with_timeout(cmd: &mut Command, timeout: Duration) -> io::Result<Option<Output>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
 
+    let pid = child.id();
     let stdout = child.stdout.take().map(drain);
     let stderr = child.stderr.take().map(drain);
 
@@ -36,6 +42,8 @@ pub fn output_with_timeout(cmd: &mut Command, timeout: Duration) -> io::Result<O
             Some(status) => break Some(status),
             None if Instant::now() < deadline => std::thread::sleep(POLL),
             None => {
+                #[cfg(unix)]
+                unsafe { libc::kill(-(pid as i32), libc::SIGKILL); }
                 let _ = child.kill();
                 let _ = child.wait();
                 break None;
@@ -43,13 +51,18 @@ pub fn output_with_timeout(cmd: &mut Command, timeout: Duration) -> io::Result<O
         }
     };
 
+    // A short-lived probe must not leave descendants holding its pipes open.
+    #[cfg(unix)]
+    unsafe { libc::kill(-(pid as i32), libc::SIGKILL); }
     let collect = |handle: Option<std::thread::JoinHandle<Vec<u8>>>| {
         handle.and_then(|h| h.join().ok()).unwrap_or_default()
     };
+    let stdout = collect(stdout);
+    let stderr = collect(stderr);
     Ok(status.map(|status| Output {
         status,
-        stdout: collect(stdout),
-        stderr: collect(stderr),
+        stdout,
+        stderr,
     }))
 }
 
@@ -95,5 +108,15 @@ mod tests {
             .unwrap()
             .expect("draining the pipes keeps the child from blocking on write");
         assert_eq!(out.stdout.len(), 1_048_576);
+    }
+
+    #[test]
+    fn descendants_cannot_keep_probe_pipes_open_after_parent_exit() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 30 & echo done"]);
+        let started = Instant::now();
+        let out = output_with_timeout(&mut cmd, Duration::from_millis(150)).unwrap().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(String::from_utf8_lossy(&out.stdout).contains("done"));
     }
 }

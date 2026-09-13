@@ -66,6 +66,15 @@ impl Drop for Connection {
 pub struct Client(Arc<Connection>);
 
 impl Client {
+    /// Session lifecycle actions must not sit behind slow reads on the UI socket.
+    /// This connection has no subscriptions and exists only for this one action.
+    pub async fn lifecycle_request(
+        rt: &Handle, path: PathBuf, op: &str, payload: Value,
+    ) -> Result<Value, Error> {
+        let (client, _notices) = Self::connect(rt, path).await?;
+        client.request(rt, op, payload).await
+    }
+
     pub async fn connect(
         rt: &Handle,
         path: PathBuf,
@@ -233,6 +242,43 @@ impl Client {
 mod tests {
     use super::*;
     use tokio::net::UnixListener;
+
+    #[tokio::test]
+    async fn close_bypasses_a_stalled_status_request() {
+        let path = std::env::temp_dir().join(format!("relay-lifecycle-{}.sock", Uuid::new_v4()));
+        let server = UnixListener::bind(&path).unwrap();
+        let rt = Handle::current();
+        let (client, _notices) = Client::connect(&rt, path.clone()).await.unwrap();
+        let (started, blocked) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        let fixture = tokio::spawn(async move {
+            let (socket, _) = server.accept().await.unwrap();
+            let (read, mut write) = socket.into_split();
+            let mut lines = BufReader::new(read).lines();
+            let slow: Request = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(slow.op, "git.status");
+            started.send(()).unwrap();
+            let (action, _) = server.accept().await.unwrap();
+            let (read, mut action_write) = action.into_split();
+            let mut lines = BufReader::new(read).lines();
+            let close: Request = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(close.op, "session.close");
+            action_write.write_all(format!("{}\n", serde_json::to_string(&Response::ok(close.id, serde_json::json!({}))).unwrap()).as_bytes()).await.unwrap();
+            released.await.unwrap();
+            write.write_all(format!("{}\n", serde_json::to_string(&Response::ok(slow.id, serde_json::json!({}))).unwrap()).as_bytes()).await.unwrap();
+        });
+        let handle = rt.clone();
+        let slow = tokio::spawn(async move { client.request(&handle, "git.status", serde_json::json!({})).await });
+        blocked.await.unwrap();
+        tokio::time::timeout(Duration::from_millis(500),
+            Client::lifecycle_request(&rt, path.clone(), "session.close", serde_json::json!({"session":"fixture"})))
+            .await.expect("Close queued behind slow Git read").unwrap();
+        assert!(!slow.is_finished(), "The status request must still be blocked");
+        release.send(()).unwrap();
+        slow.await.unwrap().unwrap();
+        fixture.await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[tokio::test]
     async fn correlates_out_of_order_replies_events_and_disconnect() {

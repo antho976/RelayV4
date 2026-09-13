@@ -1231,26 +1231,15 @@ pub fn register(e: &mut Engine) {
         Ok(updated.session)
     });
 
-    e.register::<RestorableList>(|ctx, _| {
-        let mut stmt = ctx
-            .tx()
-            .prepare_cached("SELECT * FROM sessions WHERE state='restorable' ORDER BY id")
-            .bus()?;
-        let rows = stmt
-            .query_map([], sessions::row)
-            .bus()?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .bus()?;
+    e.register_unlocked::<RestorableList>(|ctx, _| {
+        let rows = ctx.read(|conn| {
+            let mut stmt = conn.prepare_cached("SELECT * FROM sessions WHERE state='restorable' ORDER BY id").bus()?;
+            let rows = stmt.query_map([], |row| Ok((sessions::row(row)?, row.get::<_, Option<String>>("restore_reason")?)))
+                .bus()?.collect::<rusqlite::Result<Vec<_>>>().bus()?;
+            Ok(rows)
+        })?;
         let mut out = Vec::new();
-        for row in rows {
-            let reason: Option<String> = ctx
-                .tx()
-                .query_row(
-                    "SELECT restore_reason FROM sessions WHERE id=?1",
-                    [row.session.id],
-                    |r| r.get(0),
-                )
-                .bus()?;
+        for (row, reason) in rows {
             let dirty = gix::open(&row.session.worktree)
                 .ok()
                 .is_some_and(|repo| worktree::is_dirty(&repo));

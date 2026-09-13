@@ -632,6 +632,15 @@ fn filesystem_reads_do_not_retrigger_refresh_but_writes_do() {
     while let Ok(event) = events.try_recv() {
         assert_ne!(event.ev, "file.changed", "read-only refresh retriggered watcher");
     }
+    let root = std::path::Path::new(&repo);
+    for path in [".git/lfs/tmp/filter-output", "Saved/Logs/Unreal.log"] {
+        std::fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+        std::fs::write(root.join(path), "generated output").unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(350));
+    while let Ok(event) = events.try_recv() {
+        assert_ne!(event.ev, "file.changed", "LFS or Unreal output retriggered watcher");
+    }
     std::fs::write(std::path::Path::new(&repo).join("README.md"), "changed\n").unwrap();
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
@@ -639,6 +648,15 @@ fn filesystem_reads_do_not_retrigger_refresh_but_writes_do() {
             break;
         }
         assert!(Instant::now() < deadline, "real write did not invalidate files");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Index metadata refreshes are ignored, but actual staging still refreshes Git.
+    assert!(std::process::Command::new("git").arg("-C").arg(&repo)
+        .args(["add", "README.md"]).status().unwrap().success());
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if events.try_recv().is_ok_and(|event| event.ev == "file.changed") { break; }
+        assert!(Instant::now() < deadline, "staging did not invalidate Git");
         std::thread::sleep(Duration::from_millis(10));
     }
 }
