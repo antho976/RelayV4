@@ -11,7 +11,7 @@ use rusqlite::{Connection, Transaction};
 use serde::Deserialize;
 use serde_json::json;
 use similar::{ChangeTag, TextDiff};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Live sessions of a project as (branch, name), for `git.branches`.
@@ -144,7 +144,7 @@ pub fn register(e: &mut Engine) {
     });
     e.register_unlocked::<WorktreeDisk>(|ctx, p| {
         let project = ctx.read(|conn| get_project(conn, p.project_id))?;
-        let wts = worktree::list(Path::new(&project.path))
+        let wts = worktree::list_with_dirty(Path::new(&project.path), false)
             .map_err(|e| BusError::unavailable("worktree.list_failed", e.to_string()))?;
         let worktrees = wts
             .iter()
@@ -428,7 +428,7 @@ pub fn register(e: &mut Engine) {
                 format!("branch {name} is not merged into {}", project.base_branch),
             ));
         }
-        if worktree::list(root)
+        if worktree::list_with_dirty(root, false)
             .map_err(|error| BusError::unavailable("worktree.list_failed", error.to_string()))?
             .iter()
             .any(|worktree| worktree.branch == name)
@@ -613,7 +613,7 @@ pub fn register(e: &mut Engine) {
     e.register::<CleanMerged>(|ctx: &mut Ctx, p| {
         let project = get_project(ctx.tx(), p.project_id)?;
         let branches = branches_for(ctx.tx(), &project)?;
-        let checked_out = worktree::list(Path::new(&project.path))
+        let checked_out = worktree::list_with_dirty(Path::new(&project.path), false)
             .map_err(|error| BusError::unavailable("worktree.list_failed", error.to_string()))?;
         let candidates: Vec<String> = branches
             .branches
@@ -665,69 +665,7 @@ pub fn status_badges(root: &Path) -> Result<HashMap<String, String>, BusError> {
 }
 
 fn status_files(root: &Path) -> Result<Vec<FileStatus>, BusError> {
-    let repo = gix::open(root).map_err(gix_err("git.open_failed"))?;
-    let platform = repo
-        .status(gix::progress::Discard)
-        .map_err(gix_err("git.status_failed"))?
-        .untracked_files(gix::status::UntrackedFiles::Files);
-    let iter = platform
-        .into_iter(Vec::<gix::bstr::BString>::new())
-        .map_err(gix_err("git.status_failed"))?;
-    let mut files: BTreeMap<String, FileStatus> = BTreeMap::new();
-    for item in iter {
-        let item = item.map_err(gix_err("git.status_failed"))?;
-        match item {
-            gix::status::Item::IndexWorktree(change) => {
-                let path = change.rela_path().to_string();
-                let summary = format!("{:?}", change.summary());
-                let wt = if summary.contains("Added") {
-                    "?"
-                } else if summary.contains("Removed") {
-                    "D"
-                } else if summary.contains("Conflict") {
-                    "U"
-                } else if summary.contains("Renamed") {
-                    "R"
-                } else {
-                    "M"
-                };
-                let renamed_from = match &change {
-                    gix::status::index_worktree::Item::Rewrite { source, .. } => {
-                        Some(source.rela_path().to_string())
-                    }
-                    _ => None,
-                };
-                let row = files.entry(path.clone()).or_insert(FileStatus {
-                    path,
-                    index: String::new(),
-                    worktree: String::new(),
-                    renamed_from: None,
-                });
-                row.worktree = wt.into();
-                row.renamed_from = renamed_from;
-            }
-            gix::status::Item::TreeIndex(change) => {
-                let path = change.location().to_string();
-                let (idx, renamed_from) = match &change {
-                    gix::diff::index::Change::Addition { .. } => ("A", None),
-                    gix::diff::index::Change::Deletion { .. } => ("D", None),
-                    gix::diff::index::Change::Modification { .. } => ("M", None),
-                    gix::diff::index::Change::Rewrite {
-                        source_location, ..
-                    } => ("R", Some(source_location.to_string())),
-                };
-                let row = files.entry(path.clone()).or_insert(FileStatus {
-                    path,
-                    index: String::new(),
-                    worktree: String::new(),
-                    renamed_from: None,
-                });
-                row.index = idx.into();
-                row.renamed_from = renamed_from;
-            }
-        }
-    }
-    Ok(files.into_values().collect())
+    worktree::status_files(root).map_err(git_mutation("git.status_failed"))
 }
 
 fn resolve_root(

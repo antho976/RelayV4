@@ -29,6 +29,10 @@ pub struct Editor {
     search: gtk::SearchEntry,
     git: gtk::Box,
     git_revision: Cell<u64>,
+    git_refresh_pending: Cell<bool>,
+    git_refresh_dirty: Cell<bool>,
+    tree_load_pending: Cell<bool>,
+    tree_load_next: RefCell<Option<String>>,
     git_busy: Cell<bool>,
     commit_message: gtk::TextView,
     branch_name: gtk::Entry,
@@ -59,6 +63,17 @@ pub struct Editor {
     busy: Cell<bool>,
     pub(crate) tree_revision: Cell<u64>,
 }
+struct TreeLoadGuard(Rc<Editor>, Rc<Ui>);
+impl Drop for TreeLoadGuard {
+    fn drop(&mut self) {
+        self.0.tree_load_pending.set(false);
+        let next = self.0.tree_load_next.borrow_mut().take();
+        if let Some(directory) = next {
+            self.0.load_tree(&self.1, Some(directory));
+        }
+    }
+}
+
 impl Editor {
     pub fn set_palette(&self, mode: &str) {
         let manager = sourceview5::StyleSchemeManager::default();
@@ -278,6 +293,10 @@ impl Editor {
             branch_name: gtk::Entry::new(),
             branch_start: gtk::Entry::new(),
             invalidate_pending: Cell::new(false),
+            git_refresh_pending: Cell::new(false),
+            git_refresh_dirty: Cell::new(false),
+            tree_load_pending: Cell::new(false),
+            tree_load_next: RefCell::new(None),
             diff: Cell::new(false),
             before,
             before_scroll,
@@ -466,6 +485,11 @@ impl Editor {
         if ui.project.get() == 0 {
             return;
         }
+        if self.tree_load_pending.replace(true) {
+            self.tree_revision.set(self.tree_revision.get() + 1);
+            *self.tree_load_next.borrow_mut() = Some(directory.unwrap_or_default());
+            return;
+        }
         if !self.handlers.replace(true) {
             let weak = Rc::downgrade(ui);
             let editor = self.clone();
@@ -499,6 +523,7 @@ impl Editor {
         let e = self.clone();
         let ui = ui.clone();
         glib::spawn_future_local(async move {
+            let _pending = TreeLoadGuard(e.clone(), ui.clone());
             let result = ui
                 .call(
                     "file.tree",
