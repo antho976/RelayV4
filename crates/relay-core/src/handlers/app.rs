@@ -282,6 +282,11 @@ fn cpu_pct(engine: &Engine, pid: i64, ticks: u64) -> f64 {
     result
 }
 
+
+
+#[allow(dead_code)]
+fn _ctx(_: &Ctx) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,6 +330,3 @@ mod tests {
         assert_eq!(dir_usage(root.path()), (18, 12));
     }
 }
-
-#[allow(dead_code)]
-fn _ctx(_: &Ctx) {}

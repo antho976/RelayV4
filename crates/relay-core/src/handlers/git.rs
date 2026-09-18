@@ -914,7 +914,7 @@ pub fn new_worktree_base(root: &Path, base: &str) -> Result<Option<String>, BusE
     // A repository before its first commit has a valid unborn base, but no commit to pin.
     if local.is_none() && remote.is_none()
         && repo.head().is_ok_and(|head| head.is_unborn())
-        && repo.head_name().ok().flatten().is_some_and(|name| name.as_bstr().to_string() == local_name)
+        && repo.head_name().ok().flatten().is_some_and(|name| *name.as_bstr() == local_name)
     {
         return Ok(None);
     }

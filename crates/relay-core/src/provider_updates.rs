@@ -191,15 +191,22 @@ mod tests {
     }
     #[test]
     fn updater_kills_a_hung_process_group_and_bounds_output() {
+        // Both bounds below are deliberately far looser than the work they wrap. What this
+        // test proves is that a hung group is killed rather than waited on, and that output is
+        // truncated — neither claim is about how fast the machine is. Tight wall-clock budgets
+        // made this the one test that failed at random when the suite runs in parallel, and a
+        // test that fails at random teaches people to ignore the suite.
         let root = tempfile::tempdir().unwrap();
         let path = script(root.path(), "sleep 60 &\nwait");
         let started = Instant::now();
         assert!(run(&path, Duration::from_millis(100))
             .unwrap_err()
             .contains("timed out"));
-        assert!(started.elapsed() < Duration::from_secs(2));
+        // The child sleeps for 60s; returning in under 10 proves it was not waited on.
+        assert!(started.elapsed() < Duration::from_secs(10));
         script(root.path(), "head -c 200000 /dev/zero | tr '\\000' x");
-        assert!(run(&path, Duration::from_secs(2)).unwrap().len() <= 1000);
+        // Milliseconds of work. The timeout only has to be long enough not to fire.
+        assert!(run(&path, Duration::from_secs(30)).unwrap().len() <= 1000);
     }
 
     #[test]
