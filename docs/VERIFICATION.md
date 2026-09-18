@@ -124,17 +124,36 @@ profile, which is the other half of this pass. These are microbenchmarks of
 `Ring` alone, not end-to-end terminal latency.
 
 Engine request pipeline, in process, median of three interleaved rounds of the
-same harness run against both trees:
+same harness run against both trees, both at the new profile:
 
-| Op | Before | After |
-| --- | --- | --- |
-| `bus.ping` | 1.85 µs | 1.63 µs |
-| `session.list` | 18.20 µs | 2.03 µs |
-| `settings.set` (audited mutation) | 109.63 µs | 84.00 µs |
-| `Engine::parse`, 8 KiB payload | 2.25 µs | 1.40 µs |
+| Op | Before | After | |
+| --- | --- | --- | --- |
+| `bus.ping` | 1.85 µs | 1.63 µs | 1.1× |
+| `session.list` | 18.20 µs | 2.03 µs | 9.0× |
+| `settings.set` (audited mutation) | 109.63 µs | 84.00 µs | 1.3× |
+| `Engine::parse`, 8 KiB payload | 2.25 µs | 1.40 µs | 1.6× |
 
 `session.list` is dominated by re-compiling its built SQL on every call; it is
 the op the shell re-runs on every `session.changed`.
+
+Individual changes the two harnesses above do not isolate, old implementation
+against new in one binary, at both profiles:
+
+| Change | Old profile | New profile |
+| --- | --- | --- |
+| `pty` frame encode, 4 KiB | ~6–12× | ~2–3× |
+| `pty` frame encode, 64 KiB | ~10× | ~2–2.5× |
+| Socket line classify + parse, 4 KiB | 1.2× | 2.0× |
+| Socket line classify + parse, 64 KiB | 1.1× | 1.0× |
+| Hex of a 32-byte digest | 4.0× | 8.9× |
+| Worktree disk walk, 3600 files, warm cache, 4 cores | 2.3× | 2.2× |
+| Subprocess wait for a child that exits at once | 3.4× (5.45 → 1.62 ms) | 3.6× (5.43 → 1.49 ms) |
+
+This machine is noisy enough that the frame-encode ratios moved between runs, so
+they are given as ranges. The disk-walk figure is warm-cache on four cores and
+says nothing about a cold one. The subprocess figure is the poll interval, not
+the child: it is the latency every short `git status` or `adb devices` used to
+be billed for.
 
 What changed, and why each one is on a hot path:
 
@@ -167,9 +186,13 @@ What changed, and why each one is on a hot path:
 - **Worktree disk sizing** walks with a shared work stack across threads.
 - **Icons** cache their rendered paintable; they repaint on every state change,
   and each repaint re-parsed the same SVG.
-- **The native client** reads each socket line with one non-allocating pass to
-  classify it and one typed parse to keep it, instead of building a whole
-  `serde_json::Value` and re-walking it into the envelope.
+- **The native client** recognizes a socket line's shape from its leading bytes
+  and parses it once, where it used to stage every line through a
+  `serde_json::Value` and then walk that into the envelope. Each envelope
+  declares its distinguishing key second, so the prefix identifies the shape and
+  proves the version; a line that does not match falls back to the old path, and
+  a test in `relay-bus` asserts the three prefixes, so a reordered field turns
+  the fast path off rather than breaking a reader.
 
 No claim is made about end-to-end frame latency, sustained throughput under
 load, or GTK rendering cost, none of which this pass measured.
