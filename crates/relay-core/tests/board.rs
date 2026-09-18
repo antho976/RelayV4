@@ -39,6 +39,26 @@ fn ids(value: &Value) -> Vec<i64> {
         .collect()
 }
 
+/// A provider that answers the discovery probe and then echoes, so a dispatch can reach a PTY
+/// without the machine having a real one.
+///
+/// `task.dispatch` refuses with `provider.not_installed` unless a provider resolves, and
+/// resolving it from `PATH` means the test passes or fails on what happens to be installed —
+/// it passed on developer machines and on agent containers, where `claude` is present, and
+/// failed the first time CI ran it anywhere else. `sessions.rs` already fakes providers this
+/// way; the board should not be the one file that does not.
+fn fake_provider(dir: &Path, binary: &str) -> std::path::PathBuf {
+    let path = dir.join(binary);
+    std::fs::write(
+        &path,
+        "#!/bin/sh\ncase \"${1:-}\" in\n  --version) echo 'fixture 1.0'; exit 0;;\n  auth|login) echo '{\"loggedIn\":true}'; exit 0;;\nesac\necho hello-from-pty\nwhile IFS= read -r line; do echo \"echo:$line\"; done\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
 struct Fixture {
     _root: tempfile::TempDir,
     engine: Arc<Engine>,
@@ -61,6 +81,8 @@ impl Fixture {
         );
         ok(&engine, "workspace.create", json!({"path":ws}));
         ok(&engine, "project.add", json!({"workspace_id":1,"path":repo}));
+        let claude = fake_provider(root.path(), "claude");
+        ok(&engine, "settings.set", json!({"path":"providers.claude.path","value":claude}));
         Self {
             _root: root,
             engine,
