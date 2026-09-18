@@ -199,11 +199,14 @@ pub fn create(repo: &Path, path: &Path, branch: &str, from: Option<&str>) -> Res
     all.into_iter().find(|w| w.path == want).ok_or_else(|| anyhow!("worktree {} not listed after add", path.display()))
 }
 
-/// How many threads share a disk walk. A `target/` or `node_modules/` tree is hundreds of
-/// thousands of `statx` calls, and the walk is latency-bound on the kernel rather than on this
-/// process, so a handful of workers is worth far more than their scheduling cost. Capped: the
-/// point is to keep the Code page responsive, not to saturate the machine.
-const WALK_THREADS: usize = 8;
+/// How many threads share a disk walk.
+///
+/// A `target/` or `node_modules/` tree is hundreds of thousands of `statx` calls, and the walk
+/// is latency-bound on the kernel rather than on this process, so a few workers are worth far
+/// more than their scheduling cost. The cap is deliberately well under the core count and the
+/// helpers run niced: this is background work, and taking every core for a short burst is a
+/// worse neighbour to a game or a build than taking a few for slightly longer.
+const WALK_THREADS: usize = 4;
 
 /// Bytes under `dir` (no symlink following).
 ///
@@ -234,7 +237,7 @@ fn dir_size_all(roots: &[PathBuf]) -> u64 {
     // the walk is done when nothing is queued and nobody is still producing.
     let stack = Arc::new((Mutex::new(pending), Condvar::new()));
     let busy = Arc::new(AtomicUsize::new(0));
-    let threads = WALK_THREADS.min(std::thread::available_parallelism().map_or(4, |n| n.get()) * 2);
+    let threads = WALK_THREADS.min(std::thread::available_parallelism().map_or(2, |n| n.get()));
 
     let worker = {
         let total = total.clone();
@@ -287,10 +290,18 @@ fn dir_size_all(roots: &[PathBuf]) -> u64 {
         }
     };
 
+    // The helpers step down; the calling thread does not, because it belongs to a pool that
+    // will run ordinary requests again as soon as this returns.
     let mut handles = Vec::with_capacity(threads.saturating_sub(1));
     for _ in 1..threads {
         let worker = worker.clone();
-        match std::thread::Builder::new().name("relay-disk-walk".into()).spawn(worker) {
+        let spawned = std::thread::Builder::new()
+            .name("relay-disk-walk".into())
+            .spawn(move || {
+                crate::background_priority();
+                worker()
+            });
+        match spawned {
             Ok(handle) => handles.push(handle),
             Err(_) => break,
         }

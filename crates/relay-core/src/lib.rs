@@ -34,6 +34,23 @@ pub use engine::{Door, Engine};
 pub use paths::Instance;
 pub use store::Store;
 
+/// How far below normal a background worker runs.
+const BACKGROUND_NICE: i32 = 10;
+
+/// Drop the calling thread to background priority.
+///
+/// Relay runs beside whatever else the machine is doing — a game, a compile, a call — and its
+/// filesystem walks are the part that will use every core it is handed. On Linux
+/// `setpriority(PRIO_PROCESS, 0, …)` applies to the calling thread alone, so a worker can step
+/// down without the rest of the process following it. Raising a nice value never requires
+/// privilege, and failing to raise it only costs the courtesy, so the result is ignored.
+pub fn background_priority() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, 0, BACKGROUND_NICE);
+    }
+}
+
 /// Lowercase hex for a byte string, in one allocation.
 ///
 /// Session tokens and every audit payload hash go through here. `bytes.iter().map(|b|

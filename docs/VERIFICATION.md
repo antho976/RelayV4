@@ -194,8 +194,42 @@ What changed, and why each one is on a hot path:
   a test in `relay-bus` asserts the three prefixes, so a reordered field turns
   the fast path off rather than breaking a reader.
 
+### Cost while the machine is doing something else
+
+Relay is meant to sit beside a game, a build or a call, so a second pass went
+after what it spends in the background rather than what it spends per call.
+
+It already has no idle cost worth naming: the only recurring timers in the
+application are the opt-in wallpaper rotation and one-shot debounces, and the
+resource sampler runs only while its panel is open. What remained was work that
+runs whether or not anyone is looking at it.
+
+- **Terminals detach when the window is not on screen.** Panes tracked the
+  visible page and the pane layout, but not the window, so an agent printing
+  output behind a fullscreen game still paid for every frame: socket read, JSON
+  parse, VTE feed and a redraw. The compositor already reports this —
+  `GDK_TOPLEVEL_STATE_SUSPENDED` for minimized, covered or another workspace,
+  with `MINIMIZED` for backends that do not send it — and the engine keeps the
+  scrollback ring regardless, so a hidden window detaches and re-attaches from
+  its last sequence with bounded catch-up, the same path a reconnect takes.
+- **Disk walks are background work and now run like it.** The walk takes at most
+  four threads rather than up to eight, and its helpers run niced, so the
+  scheduler hands the cores back the moment anything else wants them. The
+  thirty-second worktree pass behind the resources panel moved off the blocking
+  pool onto its own niced thread, so a pool thread is not left demoted for
+  whatever runs there next. On Linux `setpriority(PRIO_PROCESS, 0, …)` is
+  per-thread, so the rest of the process is unaffected.
+- **Keystrokes no longer visit the blocking pool.** `session.input` against a
+  live PTY touches no SQLite (D148) but still crossed to a pool thread and back
+  to find that out. Measured at **24.7 µs per keystroke, 27.4 µs with the pool
+  under load, against 0.024 µs for the work itself.** A door now answers such a
+  request inline, gated on checks that are all lock-free, and only for writes
+  small enough that they cannot park on the child's input queue. The gate
+  decides where a request runs, never whether it is answered.
+
 No claim is made about end-to-end frame latency, sustained throughput under
-load, or GTK rendering cost, none of which this pass measured.
+load, GTK rendering cost, or the effect on any particular game, none of which
+this pass measured.
 
 ## Review and boundaries
 

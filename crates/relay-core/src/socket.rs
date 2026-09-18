@@ -638,6 +638,11 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) -> Result<()> {
                 }
             }
             resp
+        } else if engine.answers_from_memory(&req) {
+            // A keystroke is the one request whose latency a person can feel, and it is also the
+            // one that never reaches the store. Answer it here rather than paying a trip to the
+            // blocking pool and back for a map lookup and a write.
+            engine.dispatch(req, Door::Socket)
         } else {
             let e = engine.clone();
             tokio::task::spawn_blocking(move || e.dispatch(req, Door::Socket)).await?
