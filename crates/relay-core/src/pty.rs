@@ -50,26 +50,45 @@ struct Ring {
 }
 
 impl Ring {
+    /// Append one frame and trim both rings back to their caps. Trimming is a single bulk
+    /// `drain`, never a per-element `pop_front` loop: a provider that writes 64 KiB at a time
+    /// would otherwise pay 65 536 individual ring operations for every read once the byte ring
+    /// is full, which is the whole cost of the terminal data plane at steady state.
     fn push(&mut self, seq: u64, data: &[u8]) {
         let start = self.base + self.buf.len() as u64;
         self.frames.push_back((seq, start));
-        while self.frames.len() > FRAME_INDEX {
-            self.frames.pop_front();
+        if self.frames.len() > FRAME_INDEX {
+            let excess = self.frames.len() - FRAME_INDEX;
+            self.frames.drain(..excess);
         }
+        // `extend` from a slice copies in bulk; `data.iter().copied()` would not.
         self.buf.extend(data);
-        while self.buf.len() > SCROLLBACK_BYTES {
-            self.buf.pop_front();
-            self.base += 1;
+        if self.buf.len() > SCROLLBACK_BYTES {
+            let excess = self.buf.len() - SCROLLBACK_BYTES;
+            self.buf.drain(..excess);
+            self.base += excess as u64;
         }
     }
-    /// Bytes from absolute offset `from` (clamped to what we still have).
+    /// Bytes from absolute offset `from` (clamped to what we still have). Copied through the
+    /// deque's two contiguous halves — an element-wise iterator over 8 MiB is the same answer
+    /// an order of magnitude slower.
     fn bytes_from(&self, from: u64) -> Vec<u8> {
-        let skip = from.saturating_sub(self.base) as usize;
-        self.buf.iter().skip(skip.min(self.buf.len())).copied().collect()
+        let skip = from.saturating_sub(self.base).min(self.buf.len() as u64) as usize;
+        let (head, tail) = self.buf.as_slices();
+        let mut out = Vec::with_capacity(self.buf.len() - skip);
+        if skip < head.len() {
+            out.extend_from_slice(&head[skip..]);
+            out.extend_from_slice(tail);
+        } else {
+            out.extend_from_slice(&tail[skip - head.len()..]);
+        }
+        out
     }
-    /// The first frame boundary after `seq`, if we still know it.
+    /// The first frame boundary after `seq`, if we still know it. Both `seq` and the offsets
+    /// increase with every push, so the index is sorted and a scan is never needed.
     fn offset_after(&self, seq: u64) -> Option<u64> {
-        self.frames.iter().find(|(s, _)| *s > seq).map(|(_, o)| *o)
+        let at = self.frames.partition_point(|(s, _)| *s <= seq);
+        self.frames.get(at).map(|(_, offset)| *offset)
     }
     fn end(&self) -> u64 {
         self.base + self.buf.len() as u64
@@ -77,8 +96,31 @@ impl Ring {
     fn bounded_bytes_from(&self, from: u64) -> Vec<u8> {
         let earliest = self.end().saturating_sub(ATTACH_CATCHUP_BYTES as u64);
         let requested = from.max(earliest);
-        let aligned = self.frames.iter().find_map(|(_, offset)| (*offset >= requested).then_some(*offset)).unwrap_or(requested);
+        let at = self.frames.partition_point(|(_, offset)| *offset < requested);
+        let aligned = self.frames.get(at).map(|(_, offset)| *offset).unwrap_or(requested);
         self.bytes_from(aligned)
+    }
+    /// The bytes covering the last `lines` newline-terminated lines, so reading a short tail
+    /// out of an 8 MiB ring costs the tail rather than the ring.
+    fn tail_lines(&self, lines: usize) -> Vec<u8> {
+        let (head, tail) = self.buf.as_slices();
+        let mut seen = 0usize;
+        let mut start = None;
+        // Walk backwards through the two halves, stopping at the newline that opens the
+        // (lines)-th line from the end.
+        'scan: for (part, base) in [(tail, head.len()), (head, 0)] {
+            for (i, byte) in part.iter().enumerate().rev() {
+                if *byte == b'\n' {
+                    seen += 1;
+                    if seen > lines {
+                        start = Some(base + i + 1);
+                        break 'scan;
+                    }
+                }
+            }
+        }
+        let start = start.unwrap_or(0);
+        self.bytes_from(self.base + start as u64)
     }
 }
 
@@ -262,13 +304,17 @@ impl Pty {
         Attached { epoch: self.shared.epoch, seq, catch_up, rx }
     }
 
-    /// The scrollback as text (last `lines` if given) and where it ends.
+    /// The scrollback as text (last `lines` if given) and where it ends. A bounded request
+    /// reads only the tail it asks for: the ring holds 8 MiB, and `session.scrollback {lines}`
+    /// is a UI-facing read that must not copy all of it to keep twenty lines.
     pub fn scrollback(&self, lines: Option<usize>) -> (String, u64, u64) {
         let ring = self.shared.ring.lock().unwrap();
-        let bytes = ring.bytes_from(0);
-        let _ = ring.end();
+        let bytes = match lines {
+            Some(n) => ring.tail_lines(n),
+            None => ring.bytes_from(0),
+        };
         drop(ring);
-        let text = String::from_utf8_lossy(&bytes).to_string();
+        let text = String::from_utf8_lossy(&bytes).into_owned();
         let text = match lines {
             Some(n) => {
                 let v: Vec<&str> = text.lines().collect();
@@ -328,6 +374,87 @@ mod tests {
         let catch_up = ring.bounded_bytes_from(0);
         assert_eq!(catch_up.len(), ATTACH_CATCHUP_BYTES);
         assert_eq!(catch_up.len() % 1024, 0);
+    }
+
+    fn ring() -> Ring {
+        Ring { buf: VecDeque::new(), base: 0, frames: VecDeque::new() }
+    }
+
+    #[test]
+    fn bulk_trimming_keeps_the_same_window_and_offsets_as_a_byte_at_a_time_ring() {
+        let mut r = ring();
+        let chunk = 64 * 1024;
+        let pushes = (SCROLLBACK_BYTES / chunk) + 3;
+        for seq in 1..=pushes as u64 {
+            r.push(seq, &vec![(seq % 251) as u8; chunk]);
+        }
+        assert_eq!(r.buf.len(), SCROLLBACK_BYTES);
+        assert_eq!(r.base, (pushes * chunk - SCROLLBACK_BYTES) as u64);
+        assert_eq!(r.end(), (pushes * chunk) as u64);
+        // Every byte still in the window is the one its absolute offset names.
+        let all = r.bytes_from(0);
+        assert_eq!(all.len(), SCROLLBACK_BYTES);
+        let first_seq = (r.base as usize / chunk) as u64 + 1;
+        assert_eq!(all[0], (first_seq % 251) as u8);
+        assert_eq!(*all.last().unwrap(), (pushes as u64 % 251) as u8);
+        // A partial read lands on the same byte the offset names.
+        let tail = r.bytes_from(r.end() - 10);
+        assert_eq!(tail, vec![(pushes as u64 % 251) as u8; 10]);
+    }
+
+    #[test]
+    fn a_single_push_larger_than_the_ring_keeps_its_tail() {
+        let mut r = ring();
+        let huge = SCROLLBACK_BYTES + 4096;
+        r.push(0, &vec![7u8; huge]);
+        assert_eq!(r.buf.len(), SCROLLBACK_BYTES);
+        assert_eq!(r.base, 4096);
+        assert_eq!(r.end(), huge as u64);
+    }
+
+    #[test]
+    fn frame_lookup_matches_a_linear_scan() {
+        let mut r = ring();
+        for seq in 1..=500u64 {
+            r.push(seq, &vec![0u8; 16]);
+        }
+        for seq in 0..=501u64 {
+            let scanned = r.frames.iter().find(|(s, _)| *s > seq).map(|(_, o)| *o);
+            assert_eq!(r.offset_after(seq), scanned, "seq {seq}");
+        }
+    }
+
+    #[test]
+    fn a_bounded_tail_read_returns_the_same_lines_as_the_whole_ring() {
+        let mut r = ring();
+        for seq in 1..=400u64 {
+            r.push(seq, format!("line {seq}\n").as_bytes());
+        }
+        let whole = String::from_utf8(r.bytes_from(0)).unwrap();
+        for lines in [1usize, 5, 399, 400, 4000] {
+            let tail = String::from_utf8(r.tail_lines(lines)).unwrap();
+            let expect: Vec<&str> = whole.lines().collect();
+            let expect = expect[expect.len().saturating_sub(lines)..].join("\n");
+            let got: Vec<&str> = tail.lines().collect();
+            let got = got[got.len().saturating_sub(lines)..].join("\n");
+            assert_eq!(got, expect, "{lines} lines");
+        }
+    }
+
+    #[test]
+    fn a_tail_read_survives_a_wrapped_ring_without_splitting_a_line() {
+        let mut r = ring();
+        let filler = vec![b'z'; 1024];
+        let mut seq = 0u64;
+        while r.end() < SCROLLBACK_BYTES as u64 + 2048 {
+            seq += 1;
+            let mut line = filler.clone();
+            line.push(b'\n');
+            r.push(seq, &line);
+        }
+        let tail = String::from_utf8(r.tail_lines(3)).unwrap();
+        assert_eq!(tail.lines().count(), 3);
+        assert!(tail.lines().all(|l| l.len() == 1024));
     }
 }
 

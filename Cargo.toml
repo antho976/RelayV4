@@ -42,5 +42,23 @@ notify = "8"
 regex = "1"
 similar = "2"
 
+# `run.sh` launches `target/debug`, so the dev profile is the one the application actually runs
+# in. Unoptimized dependencies are what that costs: SQLite, base64, serde, regex, tree-sitter and
+# the GTK stack all sit on the hot paths, and an `-O0` `sqlite3.c` or byte-at-a-time ring copy is
+# the difference between a responsive terminal wall and a sluggish one. Dependencies are built
+# once and cached, so paying full optimization for them is nearly free; workspace crates stay at
+# `opt-level = 1`, which removes the worst of the debug-build overhead while keeping incremental
+# rebuilds quick. Debug assertions, overflow checks and debug info are all unchanged.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+# Cross-crate inlining matters here: the bus, the engine and the client are separate crates on
+# one request path, and the generic serde/rusqlite/gix code they call cannot be inlined across
+# the boundary without LTO. Release builds are rare enough to afford it.
 [profile.release]
 strip = "symbols"
+lto = "fat"
+codegen-units = 1

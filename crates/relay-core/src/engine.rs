@@ -205,7 +205,10 @@ pub struct Ctx<'a> {
     pub req_id: Uuid,
     pub now: String,
     pub op: &'static str,
-    payload: Value,
+    /// The request's payload. Borrowed from the request on the ordinary path — only one
+    /// handler ever reads it back (`guardrail.gate`, to freeze the envelope), and copying
+    /// every payload on the chance that it would was a second deep clone per request.
+    payload: std::borrow::Cow<'a, Value>,
     skip_policy: Option<String>,
     events: Vec<Event>,
     undo: Option<UndoOp>,
@@ -343,10 +346,11 @@ impl<'a> Ctx<'a> {
             None => None,
         };
         let prior = self.op;
-        let prior_payload = std::mem::replace(&mut self.payload, payload.clone());
+        let prior_payload =
+            std::mem::replace(&mut self.payload, std::borrow::Cow::Owned(payload.clone()));
         let prior_staged = std::mem::replace(&mut self.staged, staged);
         self.op = entry.name;
-        let result = handler(self, payload);
+        let result = handler(self, &payload);
         self.op = prior;
         self.payload = prior_payload;
         self.staged = prior_staged;
@@ -369,13 +373,16 @@ impl<'a> Ctx<'a> {
     }
 }
 
-type HandlerFn = Arc<dyn Fn(&mut Ctx, Value) -> Result<Value, BusError> + Send + Sync>;
+/// Handlers read their payload *through* the request's copy: a `Value` passed by value had to
+/// be cloned for every request, and the clone was thrown away the moment the typed payload
+/// came out of it.
+type HandlerFn = Arc<dyn Fn(&mut Ctx, &Value) -> Result<Value, BusError> + Send + Sync>;
 
 struct Handler {
     call: HandlerFn,
 }
 
-type UnlockedFn = Arc<dyn Fn(&mut Unlocked, Value) -> Result<Value, BusError> + Send + Sync>;
+type UnlockedFn = Arc<dyn Fn(&mut Unlocked, &Value) -> Result<Value, BusError> + Send + Sync>;
 
 type PrepareFn =
     Arc<dyn Fn(&mut Unlocked, &Value) -> Result<Box<dyn Any + Send>, BusError> + Send + Sync>;
@@ -470,9 +477,9 @@ impl Engine {
             "{} is not in the registry",
             O::NAME
         );
-        let call: HandlerFn = Arc::new(move |ctx: &mut Ctx, v: Value| {
+        let call: HandlerFn = Arc::new(move |ctx: &mut Ctx, v: &Value| {
             let p: O::Payload =
-                serde_json::from_value(v).map_err(|e| BusError::schema(O::NAME, e))?;
+                serde::Deserialize::deserialize(v).map_err(|e| BusError::schema(O::NAME, e))?;
             let r = f(ctx, p)?;
             serde_json::to_value(r)
                 .map_err(|e| BusError::internal(format!("serializing {} result: {e}", O::NAME)))
@@ -496,9 +503,9 @@ impl Engine {
             "{} mutates; it cannot run outside the transaction",
             O::NAME
         );
-        let call: UnlockedFn = Arc::new(move |ctx: &mut Unlocked, v: Value| {
+        let call: UnlockedFn = Arc::new(move |ctx: &mut Unlocked, v: &Value| {
             let p: O::Payload =
-                serde_json::from_value(v).map_err(|e| BusError::schema(O::NAME, e))?;
+                serde::Deserialize::deserialize(v).map_err(|e| BusError::schema(O::NAME, e))?;
             let r = f(ctx, p)?;
             serde_json::to_value(r)
                 .map_err(|e| BusError::internal(format!("serializing {} result: {e}", O::NAME)))
@@ -525,13 +532,13 @@ impl Engine {
         );
         let stage: PrepareFn = Arc::new(move |ctx: &mut Unlocked, v: &Value| {
             let p: O::Payload =
-                serde_json::from_value(v.clone()).map_err(|e| BusError::schema(O::NAME, e))?;
+                serde::Deserialize::deserialize(v).map_err(|e| BusError::schema(O::NAME, e))?;
             Ok(Box::new(prepare(ctx, &p)?) as Box<dyn Any + Send>)
         });
         self.prepares.insert(O::NAME, stage);
-        let call: HandlerFn = Arc::new(move |ctx: &mut Ctx, v: Value| {
+        let call: HandlerFn = Arc::new(move |ctx: &mut Ctx, v: &Value| {
             let p: O::Payload =
-                serde_json::from_value(v).map_err(|e| BusError::schema(O::NAME, e))?;
+                serde::Deserialize::deserialize(v).map_err(|e| BusError::schema(O::NAME, e))?;
             let staged = ctx.take_staged::<S>()?;
             let r = finish(ctx, p, staged)?;
             serde_json::to_value(r)
@@ -714,6 +721,16 @@ impl Engine {
 
     /// Parse a raw line/JSON into a request, or the `bus.parse` response for it (§1.2).
     pub fn parse(raw: &str) -> Result<Request, Response> {
+        // The common case is one parse straight into the envelope. Building a `Value` first
+        // cost every request a second full parse and a throwaway tree; that work now happens
+        // only on the failing path, where it buys the request id to answer with.
+        match serde_json::from_str::<Request>(raw) {
+            Ok(r) => return Ok(r),
+            Err(e) if e.is_syntax() || e.is_eof() => {
+                return Err(Response::unparsed(BusError::parse(e)))
+            }
+            Err(_) => {}
+        }
         let v: Value = match serde_json::from_str(raw) {
             Ok(v) => v,
             Err(e) => return Err(Response::unparsed(BusError::parse(e))),
@@ -749,14 +766,34 @@ impl Engine {
         // Priority mail is current session state, not part of an operation's typed result or
         // audit record. Resolve the actor again after the transaction so acknowledgements and
         // idempotent replays always carry the live count. Authentication failures get no hint.
-        if let Ok(Some(session_id)) = self.resolve_actor(&req, door) {
-            if let Ok(priority) = self.unread_priority_count(session_id) {
-                if priority > 0 {
-                    response.mail = Some(MailHint { priority });
-                }
+        response.mail = self.mail_hint(&req, door);
+        response
+    }
+
+    /// The post-commit `mail` sideband: the same authentication [`Engine::resolve_actor`] does,
+    /// and the count, under one acquisition of the store lock rather than two. A request that
+    /// cannot be attributed to a live, authenticated session gets no hint, exactly as before.
+    fn mail_hint(&self, req: &Request, door: Door) -> Option<MailHint> {
+        let name = req.actor.session_name()?;
+        if matches!(door, Door::Tauri) {
+            return None;
+        }
+        let conn = self.store.lock();
+        let row = crate::sessions::by_name(&conn, name).ok()?;
+        if matches!(door, Door::Socket) {
+            let token = req.token.as_deref()?;
+            if row.token.is_empty() || row.token != token {
+                return None;
             }
         }
-        response
+        let count: i64 = conn
+            .prepare_cached(UNREAD_PRIORITY_SQL)
+            .ok()?
+            .query_row([row.session.id], |row| row.get(0))
+            .ok()?;
+        (count > 0).then(|| MailHint {
+            priority: u32::try_from(count).unwrap_or(u32::MAX),
+        })
     }
 
     fn dispatch_inner(&self, req: &Request, door: Door, watching: Option<bool>) -> Result<Response, BusError> {
@@ -913,7 +950,7 @@ impl Engine {
             req_id: req.id,
             now: now.clone(),
             op: entry.name,
-            payload: req.payload.clone(),
+            payload: std::borrow::Cow::Borrowed(&req.payload),
             skip_policy: None,
             events: staged_events,
             undo: None,
@@ -928,7 +965,7 @@ impl Engine {
             after_commit: staged_after,
             staged,
         };
-        let outcome = (h.call)(&mut ctx, req.payload.clone());
+        let outcome = (h.call)(&mut ctx, &req.payload);
         let Ctx {
             events,
             undo,
@@ -1059,12 +1096,10 @@ impl Engine {
         let now = crate::time::now();
         let mut conn = self.store.lock();
         let project_id = session_id.and_then(|session_id| {
-            conn.query_row(
-                "SELECT project_id FROM sessions WHERE id = ?1",
-                [session_id],
-                |row| row.get(0),
-            )
-            .ok()
+            conn.prepare_cached("SELECT project_id FROM sessions WHERE id = ?1")
+                .ok()?
+                .query_row([session_id], |row| row.get(0))
+                .ok()
         });
         let tx = conn.transaction().map_err(internal)?;
         let e = AuditEntry {
@@ -1144,7 +1179,7 @@ impl Engine {
             events: Vec::new(),
             deferred: Vec::new(),
         };
-        let outcome = h(&mut ctx, req.payload.clone());
+        let outcome = h(&mut ctx, &req.payload);
         let Unlocked {
             events, deferred, ..
         } = ctx;
@@ -1278,20 +1313,11 @@ impl Engine {
         Ok(Some(row.session.id))
     }
 
-    fn unread_priority_count(&self, session_id: Id) -> Result<u32, BusError> {
-        let conn = self.store.lock();
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM message_recipients r
-                 JOIN messages m ON m.id = r.message_id
-                 WHERE r.session_id = ?1 AND r.acked_at IS NULL AND m.priority = 1",
-                [session_id],
-                |row| row.get(0),
-            )
-            .map_err(internal)?;
-        Ok(u32::try_from(count).unwrap_or(u32::MAX))
-    }
 }
+
+const UNREAD_PRIORITY_SQL: &str = "SELECT COUNT(*) FROM message_recipients r
+     JOIN messages m ON m.id = r.message_id
+     WHERE r.session_id = ?1 AND r.acked_at IS NULL AND m.priority = 1";
 
 /// BUS.md §5.1a.
 pub fn should_audit(entry: &OpEntry, actor: &Actor) -> bool {

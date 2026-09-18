@@ -199,24 +199,107 @@ pub fn create(repo: &Path, path: &Path, branch: &str, from: Option<&str>) -> Res
     all.into_iter().find(|w| w.path == want).ok_or_else(|| anyhow!("worktree {} not listed after add", path.display()))
 }
 
+/// How many threads share a disk walk. A `target/` or `node_modules/` tree is hundreds of
+/// thousands of `statx` calls, and the walk is latency-bound on the kernel rather than on this
+/// process, so a handful of workers is worth far more than their scheduling cost. Capped: the
+/// point is to keep the Code page responsive, not to saturate the machine.
+const WALK_THREADS: usize = 8;
+
 /// Bytes under `dir` (no symlink following).
+///
+/// Directories are handed out from a shared stack, so every worker keeps finding new subtrees
+/// instead of waiting on whoever drew the deep one.
 pub fn dir_size(dir: &Path) -> u64 {
-    let mut total = 0u64;
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&d) else { continue };
-        for e in rd.flatten() {
-            let Ok(md) = e.metadata() else { continue };
-            if md.file_type().is_symlink() { continue; }
-            if md.is_dir() { stack.push(e.path()); } else { total += md.len(); }
-        }
-    }
-    total
+    dir_size_all(std::slice::from_ref(&dir.to_path_buf()))
 }
 
-/// Size of the purge-able build dirs inside a worktree.
+/// Size of the purge-able build dirs inside a worktree. One walk over all of them together:
+/// `target/` is usually far bigger than the rest put together, so walking them in sequence
+/// means waiting for it alone.
 pub fn build_size(wt: &Path) -> u64 {
-    BUILD_DIRS.iter().map(|d| dir_size(&wt.join(d))).sum()
+    let roots: Vec<PathBuf> = BUILD_DIRS.iter().map(|d| wt.join(d)).collect();
+    dir_size_all(&roots)
+}
+
+fn dir_size_all(roots: &[PathBuf]) -> u64 {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+
+    let pending: Vec<PathBuf> = roots.iter().filter(|r| r.is_dir()).cloned().collect();
+    if pending.is_empty() {
+        return 0;
+    }
+    let total = Arc::new(AtomicU64::new(0));
+    // `stack` plus `busy` (workers holding a directory) is the whole termination condition:
+    // the walk is done when nothing is queued and nobody is still producing.
+    let stack = Arc::new((Mutex::new(pending), Condvar::new()));
+    let busy = Arc::new(AtomicUsize::new(0));
+    let threads = WALK_THREADS.min(std::thread::available_parallelism().map_or(4, |n| n.get()) * 2);
+
+    let worker = {
+        let total = total.clone();
+        let stack = stack.clone();
+        let busy = busy.clone();
+        move || {
+            let (queue, wake) = &*stack;
+            loop {
+                let dir = {
+                    let mut queue = queue.lock().unwrap_or_else(|p| p.into_inner());
+                    loop {
+                        if let Some(dir) = queue.pop() {
+                            busy.fetch_add(1, Ordering::AcqRel);
+                            break Some(dir);
+                        }
+                        if busy.load(Ordering::Acquire) == 0 {
+                            break None;
+                        }
+                        queue = wake.wait(queue).unwrap_or_else(|p| p.into_inner());
+                    }
+                };
+                let Some(dir) = dir else {
+                    wake.notify_all();
+                    return;
+                };
+                let mut bytes = 0u64;
+                let mut found = Vec::new();
+                if let Ok(entries) = std::fs::read_dir(&dir) {
+                    for entry in entries.flatten() {
+                        let Ok(meta) = entry.metadata() else { continue };
+                        if meta.file_type().is_symlink() {
+                            continue;
+                        }
+                        if meta.is_dir() {
+                            found.push(entry.path());
+                        } else {
+                            bytes += meta.len();
+                        }
+                    }
+                }
+                if bytes > 0 {
+                    total.fetch_add(bytes, Ordering::Relaxed);
+                }
+                let mut queue = queue.lock().unwrap_or_else(|p| p.into_inner());
+                queue.append(&mut found);
+                busy.fetch_sub(1, Ordering::AcqRel);
+                drop(queue);
+                wake.notify_all();
+            }
+        }
+    };
+
+    let mut handles = Vec::with_capacity(threads.saturating_sub(1));
+    for _ in 1..threads {
+        let worker = worker.clone();
+        match std::thread::Builder::new().name("relay-disk-walk".into()).spawn(worker) {
+            Ok(handle) => handles.push(handle),
+            Err(_) => break,
+        }
+    }
+    worker();
+    for handle in handles {
+        let _ = handle.join();
+    }
+    total.load(Ordering::Acquire)
 }
 
 /// Delete build output. Returns bytes freed.
@@ -311,5 +394,47 @@ mod status_tests {
         assert_eq!(status_files(root).unwrap()[0].worktree, "M");
         git(root, &["add", "asset.bin"]).unwrap();
         assert_eq!(status_files(root).unwrap()[0].index, "M");
+    }
+
+    /// The shared-stack walk must total exactly what a single-threaded walk would, terminate
+    /// with every worker parked on the condvar at some point, and ignore symlinks.
+    #[test]
+    fn a_parallel_disk_walk_totals_the_same_bytes_as_a_serial_one() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        let mut expected = 0u64;
+        // Deep on one side, wide on the other: both starve a walk that hands out one subtree.
+        let mut deep = root.to_path_buf();
+        for level in 0..40 {
+            deep = deep.join(format!("level{level}"));
+            std::fs::create_dir_all(&deep).unwrap();
+            let body = vec![b'd'; level + 1];
+            std::fs::write(deep.join("file.bin"), &body).unwrap();
+            expected += body.len() as u64;
+        }
+        for branch in 0..50 {
+            let wide = root.join(format!("wide{branch}"));
+            std::fs::create_dir_all(&wide).unwrap();
+            for file in 0..10 {
+                let body = vec![b'w'; branch + file + 1];
+                std::fs::write(wide.join(format!("f{file}")), &body).unwrap();
+                expected += body.len() as u64;
+            }
+        }
+        std::fs::write(root.join("top"), b"top").unwrap();
+        expected += 3;
+        #[cfg(unix)]
+        {
+            // A symlink to a real file must not be counted, and a loop must not hang the walk.
+            std::os::unix::fs::symlink(root.join("top"), root.join("link")).unwrap();
+            std::os::unix::fs::symlink(root, root.join("loop")).unwrap();
+        }
+        assert_eq!(dir_size(root), expected);
+        // Idempotent, and empty or missing roots are zero.
+        assert_eq!(dir_size(root), expected);
+        assert_eq!(dir_size(&root.join("does-not-exist")), 0);
+        let empty = root.join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        assert_eq!(dir_size(&empty), 0);
     }
 }

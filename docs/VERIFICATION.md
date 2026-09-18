@@ -97,6 +97,83 @@ connections; refreshes are event-driven, and device monitoring is released when
 its view or connection closes. These code properties are not substituted for
 measurements.
 
+### Optimization pass
+
+Two things were changed together: the build profiles, and the hot paths.
+
+`run.sh` launches `target/debug`, so the dev profile is the profile the
+application runs in. Dependencies now build at `opt-level = 3` and workspace
+crates at `opt-level = 1`; debug assertions, overflow checks and debug info are
+unchanged. `[profile.dev.package."*"]` also sets `OPT_LEVEL=3` for dependency
+build scripts, so the bundled `sqlite3.c` is compiled optimized rather than at
+`-O0`. Release builds add fat LTO and a single codegen unit.
+
+Measured, on this workstation, with the same source compiled at the same
+optimization level on both sides so that only the code differs:
+
+Scrollback ring, at the optimization level the application used to run at:
+
+| Path | Before | After |
+| --- | --- | --- |
+| Ring append, 4000 × 8 KiB through a full 8 MiB ring | 200.7 ms | 10.9 ms |
+| Whole-ring read (`park`, `session.resume`) | 39.4 ms | 4.7 ms |
+| Terminal attach catch-up, ×200 | 257.1 ms | 1.1 ms |
+
+At `opt-level = 3` the same three changes are 1.9×, ~1× and 1.5×; the gap is the
+profile, which is the other half of this pass. These are microbenchmarks of
+`Ring` alone, not end-to-end terminal latency.
+
+Engine request pipeline, in process, median of three interleaved rounds of the
+same harness run against both trees:
+
+| Op | Before | After |
+| --- | --- | --- |
+| `bus.ping` | 1.85 µs | 1.63 µs |
+| `session.list` | 18.20 µs | 2.03 µs |
+| `settings.set` (audited mutation) | 109.63 µs | 84.00 µs |
+| `Engine::parse`, 8 KiB payload | 2.25 µs | 1.40 µs |
+
+`session.list` is dominated by re-compiling its built SQL on every call; it is
+the op the shell re-runs on every `session.changed`.
+
+What changed, and why each one is on a hot path:
+
+- **Scrollback ring.** Trimming used one `pop_front` per byte, so a 64 KiB read
+  cost 65 536 ring operations once the ring was full; reads copied element by
+  element, and the frame index was scanned linearly. Trimming is now one bulk
+  `drain`, reads copy through the deque's two contiguous halves, and the index
+  is binary-searched. `session.scrollback {lines}` reads only the tail it asks
+  for instead of materializing all 8 MiB.
+- **Frame encoding.** `pty` frames are formatted straight into their wire line.
+  Base64's alphabet contains nothing JSON must escape, so the payload is encoded
+  once, in place, instead of being allocated, wrapped in a `Value` and re-scanned
+  by `serde_json`. A test asserts the result is byte-identical to what `serde_json`
+  produces for the same `Frame`, for empty, escaping, binary and 64 KiB payloads.
+- **Socket writes** coalesce whatever is already queued into one `write_all`
+  rather than one syscall per frame.
+- **Request pipeline.** Envelopes parse once into `Request` instead of into a
+  `Value` and then out of it again; payload validation and handler dispatch read
+  *through* the request's payload instead of each cloning it; the post-commit
+  `mail` sideband takes the store lock once rather than twice.
+- **SQLite.** The statements every request runs — session by id and by name,
+  project by id, the audit idempotency probe and insert, session state and
+  scrollback — go through the connection's prepared-statement cache instead of
+  re-compiling their SQL per call. The audit log hashes the payload copy it is
+  about to store rather than serializing the payload a second time.
+- **Guardrails** read a memoized default settings tree, cloning only the
+  `guardrails` branch they overlay, on every audited agent mutation.
+- **Subprocess waits** back off from 150 µs rather than sleeping a flat 5 ms, so
+  a `git status` that finishes in 3 ms is not billed for 5.
+- **Worktree disk sizing** walks with a shared work stack across threads.
+- **Icons** cache their rendered paintable; they repaint on every state change,
+  and each repaint re-parsed the same SVG.
+- **The native client** reads each socket line with one non-allocating pass to
+  classify it and one typed parse to keep it, instead of building a whole
+  `serde_json::Value` and re-walking it into the envelope.
+
+No claim is made about end-to-end frame latency, sustained throughput under
+load, or GTK rendering cost, none of which this pass measured.
+
 ## Review and boundaries
 
 The earlier implementation's independent review found and corrected partial-launch recovery, stale-write

@@ -15,6 +15,22 @@ use tokio::task::AbortHandle;
 use uuid::Uuid;
 
 type Pending = Arc<Mutex<HashMap<Uuid, oneshot::Sender<Result<Value, Error>>>>>;
+
+/// Which of the three line shapes just arrived, read without building any of them.
+///
+/// Every PTY frame the engine sends lands here. Parsing each line into a `serde_json::Value`
+/// and then re-walking that tree into the typed envelope meant two passes and a tree of
+/// allocations — including a fresh `String` for the base64 payload — before a single byte
+/// reached the terminal. `IgnoredAny` skips past values without allocating, so this first pass
+/// is a lexical scan and the typed parse that follows is the only one that keeps anything.
+#[derive(serde::Deserialize)]
+struct LineKind {
+    v: u32,
+    #[serde(default)]
+    ev: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    stream: Option<serde::de::IgnoredAny>,
+}
 const QUEUE: usize = 64;
 const MAX_LINE: usize = 2 * 1024 * 1024;
 
@@ -168,27 +184,27 @@ impl Client {
                             break;
                         }
                     }
-                    let value: Value = serde_json::from_slice(&line)
+                    let kind: LineKind = serde_json::from_slice(&line)
                         .map_err(|e| Error::Protocol(e.to_string()))?;
-                    if value["v"].as_u64() != Some(ENVELOPE_V.into()) {
+                    if kind.v != ENVELOPE_V {
                         return Err(Error::Protocol("unsupported envelope version".into()));
                     }
-                    if value.get("ev").is_some() {
-                        let event = serde_json::from_value(value)
+                    if kind.ev.is_some() {
+                        let event = serde_json::from_slice(&line)
                             .map_err(|e| Error::Protocol(e.to_string()))?;
                         reader_notices
                             .send(Notice::Event(event))
                             .await
                             .map_err(|_| Error::Disconnected)?;
-                    } else if value.get("stream").is_some() {
-                        let frame = serde_json::from_value(value)
+                    } else if kind.stream.is_some() {
+                        let frame = serde_json::from_slice(&line)
                             .map_err(|e| Error::Protocol(e.to_string()))?;
                         reader_notices
                             .send(Notice::Frame(frame))
                             .await
                             .map_err(|_| Error::Disconnected)?;
                     } else {
-                        let response: Response = serde_json::from_value(value)
+                        let response: Response = serde_json::from_slice(&line)
                             .map_err(|e| Error::Protocol(e.to_string()))?;
                         let id = response
                             .id

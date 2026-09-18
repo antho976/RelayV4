@@ -12,8 +12,13 @@ use std::io;
 use std::process::{Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
-/// How often the wait loop re-checks a child that has not exited yet.
-const POLL: Duration = Duration::from_millis(5);
+/// The longest the wait loop sleeps between checks on a child that has not exited yet.
+const POLL_MAX: Duration = Duration::from_millis(5);
+/// The first sleep. Most of what goes through here — `git status`, `adb devices`,
+/// `<provider> --version` — finishes in single-digit milliseconds, and a flat 5 ms poll made
+/// every one of them cost a 5 ms sleep it had already outlived. The interval doubles from here,
+/// so a long-running child still settles onto the cheap `POLL_MAX` cadence.
+const POLL_MIN: Duration = Duration::from_micros(150);
 
 /// Run `cmd` to completion, or kill it once `timeout` elapses.
 ///
@@ -37,10 +42,14 @@ pub fn output_with_timeout(cmd: &mut Command, timeout: Duration) -> io::Result<O
     let stderr = child.stderr.take().map(drain);
 
     let deadline = Instant::now() + timeout;
+    let mut interval = POLL_MIN;
     let status: Option<ExitStatus> = loop {
         match child.try_wait()? {
             Some(status) => break Some(status),
-            None if Instant::now() < deadline => std::thread::sleep(POLL),
+            None if Instant::now() < deadline => {
+                std::thread::sleep(interval);
+                interval = (interval * 2).min(POLL_MAX);
+            }
             None => {
                 #[cfg(unix)]
                 unsafe { libc::kill(-(pid as i32), libc::SIGKILL); }

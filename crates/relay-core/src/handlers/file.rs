@@ -310,6 +310,9 @@ pub fn register(e: &mut Engine) {
         let limit = p.limit.unwrap_or(200).min(2000) as usize;
         let mut hits = Vec::new();
         let mut stack = vec![root.clone()];
+        // One buffer for the whole walk: `read_to_string` allocated, grew and freed a fresh
+        // `String` for every file in the tree, most of which contribute no hits at all.
+        let mut buffer: Vec<u8> = Vec::new();
         while let Some(dir) = stack.pop() {
             for e in fs::read_dir(&dir)
                 .map_err(|e| io_err("file.search_failed", &dir, e))?
@@ -328,7 +331,14 @@ pub fn register(e: &mut Engine) {
                         continue;
                     }
                 }
-                let Ok(text) = fs::read_to_string(&path) else {
+                buffer.clear();
+                let read = fs::File::open(&path)
+                    .and_then(|mut file| std::io::Read::read_to_end(&mut file, &mut buffer));
+                if read.is_err() {
+                    continue;
+                }
+                // Same rule as `read_to_string`: what is not text is not searched.
+                let Ok(text) = std::str::from_utf8(&buffer) else {
                     continue;
                 };
                 for (n, line) in text.lines().enumerate() {

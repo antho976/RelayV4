@@ -1,5 +1,30 @@
 //! Relay-2 Icon.svelte geometry, pinned source revision in docs/SOURCES.md.
 use gtk4::{self as gtk, prelude::*};
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+thread_local! {
+    /// Rendered icons, by their exact SVG document.
+    ///
+    /// Icons repaint on map *and on every state change* — hover, focus, pressed, insensitive —
+    /// and the shell has dozens of them, several per session row. Re-parsing the same handful
+    /// of documents on each of those was work the toolkit did not need to see; the set is tiny
+    /// and bounded by the pinned geometry above, so it is simply kept.
+    static RENDERED: RefCell<HashMap<String, gtk::Svg>> = RefCell::new(HashMap::new());
+}
+
+fn rendered(document: String) -> gtk::Svg {
+    RENDERED.with(|cache| {
+        let hit = cache.borrow().get(&document).cloned();
+        if let Some(svg) = hit {
+            return svg;
+        }
+        let svg = gtk::Svg::from_bytes(&glib::Bytes::from_owned(document.clone().into_bytes()));
+        cache.borrow_mut().insert(document, svg.clone());
+        svg
+    })
+}
+
 pub fn image(name: &str, size: i32) -> gtk::Image {
     image_with_stroke(name, size, 1.5)
 }
@@ -132,12 +157,15 @@ pub fn image_with_stroke(name: &str, size: i32, stroke: f64) -> gtk::Image {
             .lookup_color("console")
             .map(|color| color.to_string())
             .unwrap_or_else(|| "#141416".into());
-        let geometry = geometry.replace("#141416", &background);
+        let geometry = if geometry.contains("#141416") {
+            std::borrow::Cow::Owned(geometry.replace("#141416", &background))
+        } else {
+            std::borrow::Cow::Borrowed(geometry)
+        };
         let document = format!(
             r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" color="{color}" stroke="{color}" stroke-width="{stroke}" stroke-linecap="round" stroke-linejoin="round">{geometry}</svg>"##
         );
-        let svg = gtk::Svg::from_bytes(&glib::Bytes::from_owned(document.into_bytes()));
-        image.set_paintable(Some(&svg));
+        image.set_paintable(Some(&rendered(document)));
     };
     // GTK 4.22 SVG paintables do not inherit currentColor from their widget.
     image.connect_map(paint);

@@ -33,3 +33,28 @@ pub mod worktree;
 pub use engine::{Door, Engine};
 pub use paths::Instance;
 pub use store::Store;
+
+/// Lowercase hex for a byte string, in one allocation.
+///
+/// Session tokens and every audit payload hash go through here. `bytes.iter().map(|b|
+/// format!("{b:02x}")).collect()` is the same string built out of one heap allocation per byte.
+pub fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(DIGITS[(byte >> 4) as usize] as char);
+        out.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+#[cfg(test)]
+mod hex_tests {
+    #[test]
+    fn hex_matches_the_per_byte_formatter() {
+        for case in [vec![], vec![0u8], vec![0x0f, 0xf0, 0xff], (0u8..=255).collect::<Vec<_>>()] {
+            let expected: String = case.iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(super::hex(&case), expected);
+        }
+    }
+}
