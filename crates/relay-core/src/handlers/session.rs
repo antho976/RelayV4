@@ -850,7 +850,9 @@ pub fn register(e: &mut Engine) {
             }
         }
         sql.push_str(" ORDER BY id");
-        let mut st = ctx.tx().prepare(&sql).bus()?;
+        // The shell re-lists sessions on every `session.changed`. The filter combinations are
+        // a bounded handful, so the built SQL is cached like any fixed statement.
+        let mut st = ctx.tx().prepare_cached(&sql).bus()?;
         let rows = st
             .query_map(
                 rusqlite::params_from_iter(args.iter().map(|b| b.as_ref())),

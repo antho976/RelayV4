@@ -27,10 +27,16 @@ fn store_limit(op: &str) -> usize {
 }
 
 pub fn payload_hash(payload: &Value) -> String {
-    let bytes = serde_json::to_vec(payload).unwrap_or_default();
+    hash_json(&serde_json::to_vec(payload).unwrap_or_default())
+}
+
+/// The same hash, over a payload that has already been serialized. `to_vec` and `to_string`
+/// emit identical bytes, so [`append`] hashes the copy it is about to store rather than
+/// serializing the payload a second time to produce the same digest.
+fn hash_json(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
-    h.update(&bytes);
-    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    h.update(bytes);
+    crate::hex(&h.finalize())
 }
 
 /// What the pipeline records for one request.
@@ -74,10 +80,17 @@ fn kind_str(k: AuditKind) -> &'static str {
 /// Append one row inside the caller's transaction. Returns the row id.
 pub fn append(tx: &Transaction, e: &AuditEntry) -> Result<Id> {
     let payload_json = serde_json::to_string(e.payload)?;
+    let payload_hash = hash_json(payload_json.as_bytes());
     // Over the limit the row keeps a marker rather than NULL: "we chose not to store this" and
-    // "there was nothing to store" are different answers to `audit.get`.
-    let oversize = serde_json::json!({"truncated": true, "bytes": payload_json.len()}).to_string();
-    let payload_col = if payload_json.len() <= store_limit(e.op) { &payload_json } else { &oversize };
+    // "there was nothing to store" are different answers to `audit.get`. Built only when the
+    // payload is actually over the limit, which is the rare case.
+    let oversize;
+    let payload_col = if payload_json.len() <= store_limit(e.op) {
+        &payload_json
+    } else {
+        oversize = serde_json::json!({"truncated": true, "bytes": payload_json.len()}).to_string();
+        &oversize
+    };
     let (kind, code, summary) = match e.outcome {
         Ok(v) => {
             let s = serde_json::to_string(v)?;
@@ -86,10 +99,12 @@ pub fn append(tx: &Transaction, e: &AuditEntry) -> Result<Id> {
         }
         Err(err) => (kind_of(e.outcome), Some(err.code.clone()), Some(serde_json::to_string(err)?)),
     };
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO audit (ts, req_id, parent_req, actor, on_behalf_of, session_id, op, project_id, kind, code, hold_id,
                             payload_hash, payload, result_summary, undo_op, undo_of)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+    )?
+    .execute(
         params![
             e.ts,
             e.req_id.to_string(),
@@ -102,7 +117,7 @@ pub fn append(tx: &Transaction, e: &AuditEntry) -> Result<Id> {
             kind_str(kind),
             code,
             e.hold_id,
-            payload_hash(e.payload),
+            payload_hash,
             payload_col.as_str(),
             summary,
             e.undo_op.map(|u| serde_json::to_string(u).unwrap_or_default()),
@@ -119,9 +134,10 @@ pub struct Recorded {
 }
 
 pub fn lookup(conn: &Connection, req_id: Uuid) -> Result<Option<Recorded>> {
+    // Runs before every audited mutation, to answer "have I already done this?".
     let row = conn
+        .prepare_cached("SELECT payload_hash, kind, result_summary FROM audit WHERE req_id = ?1")?
         .query_row(
-            "SELECT payload_hash, kind, result_summary FROM audit WHERE req_id = ?1",
             [req_id.to_string()],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?)),
         )

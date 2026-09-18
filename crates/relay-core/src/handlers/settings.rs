@@ -8,37 +8,43 @@ use serde_json::{json, Map, Value};
 
 /// Defaults for the top-level keys BUS.md §10.16 names. Each feature fills its subtree in
 /// when it lands; unknown paths are allowed (settings are a tree, not a schema).
-pub fn defaults() -> Value {
-    json!({
-        "appearance": { "mode": "dark", "panel_alpha": 1.0, "wallpaper": null, "wallpaper_preview": null },
-        "notifications": { "sound": "chime", "volume": 0.7, "categories": {} },
-        "providers": { "claude": { "path": null }, "codex": { "path": null } },
-        "device": { "sdk_path": null, "adb_path": null, "emulator_path": null, "avdmanager_path": null },
-        "guardrails": {
-            "caps": { "files": 40, "lines": 2000 },
-            "destructive_write": { "min_removed_lines": 50, "min_removed_pct": 40, "min_file_lines": 30, "allow_if_recoverable": true },
-            "protected_paths": [],
-            "shape_gates": [],
-            "denied_commands": ["rm -rf", "git reset --hard", "git clean -fd", "git push --force"],
-            "allowed_write_roots": [],
-            "roles": {
-                "builder": ["task.move", "task.link_commit", "task.changelog.write", "task.update", "mailbox.*", "notes.append", "overlap.flag", "overlap.ack", "integration.request", "session.done", "session.report", "session.intent", "session.claim", "session.release", "usage.report", "guardrail.gate"],
-                "reviewer": ["mailbox.*", "notes.append", "overlap.flag", "task.changelog.write", "session.done", "session.report", "session.intent", "session.claim", "session.release", "usage.report"],
-                "docs": ["task.move", "task.changelog.write", "task.update", "mailbox.*", "notes.append", "notes.create", "notes.update", "overlap.flag", "overlap.ack", "session.done", "session.report", "session.intent", "session.claim", "session.release", "usage.report", "guardrail.gate"]
+///
+/// Guardrail evaluation reads this for every audited agent mutation, so the tree is built
+/// once and handed out by reference; callers clone only the branch they overlay.
+pub fn defaults() -> &'static Value {
+    static DEFAULTS: std::sync::LazyLock<Value> = std::sync::LazyLock::new(|| {
+        json!({
+            "appearance": { "mode": "dark", "panel_alpha": 1.0, "wallpaper": null, "wallpaper_preview": null },
+            "notifications": { "sound": "chime", "volume": 0.7, "categories": {} },
+            "providers": { "claude": { "path": null }, "codex": { "path": null } },
+            "device": { "sdk_path": null, "adb_path": null, "emulator_path": null, "avdmanager_path": null },
+            "guardrails": {
+                "caps": { "files": 40, "lines": 2000 },
+                "destructive_write": { "min_removed_lines": 50, "min_removed_pct": 40, "min_file_lines": 30, "allow_if_recoverable": true },
+                "protected_paths": [],
+                "shape_gates": [],
+                "denied_commands": ["rm -rf", "git reset --hard", "git clean -fd", "git push --force"],
+                "allowed_write_roots": [],
+                "roles": {
+                    "builder": ["task.move", "task.link_commit", "task.changelog.write", "task.update", "mailbox.*", "notes.append", "overlap.flag", "overlap.ack", "integration.request", "session.done", "session.report", "session.intent", "session.claim", "session.release", "usage.report", "guardrail.gate"],
+                    "reviewer": ["mailbox.*", "notes.append", "overlap.flag", "task.changelog.write", "session.done", "session.report", "session.intent", "session.claim", "session.release", "usage.report"],
+                    "docs": ["task.move", "task.changelog.write", "task.update", "mailbox.*", "notes.append", "notes.create", "notes.update", "overlap.flag", "overlap.ack", "session.done", "session.report", "session.intent", "session.claim", "session.release", "usage.report", "guardrail.gate"]
+                },
+                "projects": {},
             },
-            "projects": {},
-        },
-        "undo": { "grace_days": 7 },
-        "audit": { "retention_days": 180 },
-        "parking": { "idle_minutes": 30 },
-        "layout": {},
-        "theme": {},
-        "keybindings": {
-            "palette": "Ctrl+K", "agents": "Ctrl+1", "code": "Ctrl+2", "board": "Ctrl+3",
-            "new_session": "Ctrl+N", "settings": "Ctrl+,", "sidebar": "Ctrl+Shift+B"
-        },
-        "roles": {},
-    })
+            "undo": { "grace_days": 7 },
+            "audit": { "retention_days": 180 },
+            "parking": { "idle_minutes": 30 },
+            "layout": {},
+            "theme": {},
+            "keybindings": {
+                "palette": "Ctrl+K", "agents": "Ctrl+1", "code": "Ctrl+2", "board": "Ctrl+3",
+                "new_session": "Ctrl+N", "settings": "Ctrl+,", "sidebar": "Ctrl+Shift+B"
+            },
+            "roles": {},
+        })
+    });
+    &DEFAULTS
 }
 
 /// `""` is the root (whole tree); otherwise dotted segments of `[A-Za-z0-9_-]`.
@@ -116,7 +122,7 @@ fn get_at<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
 
 /// The full effective tree: defaults overlaid with stored leaves.
 pub fn tree(tx: &Transaction) -> Result<Value, BusError> {
-    let mut root = defaults();
+    let mut root = defaults().clone();
     let mut stmt = tx.prepare_cached("SELECT path, value FROM settings ORDER BY path").bus()?;
     let rows = stmt
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
@@ -138,7 +144,7 @@ pub fn tree(tx: &Transaction) -> Result<Value, BusError> {
 /// past. Ordering by path keeps the ancestor-then-descendant application order [`tree`] relies on
 /// (a prefix always sorts before the paths it prefixes).
 fn subtree(tx: &Transaction, path: &str) -> Result<Value, BusError> {
-    let mut root = defaults();
+    let mut root = defaults().clone();
     let ancestors: Vec<String> = path
         .match_indices('.')
         .map(|(i, _)| path[..i].to_string())

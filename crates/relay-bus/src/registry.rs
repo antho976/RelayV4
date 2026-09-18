@@ -215,7 +215,10 @@ impl OpEntry {
             result_type: std::any::type_name::<O::Result>(),
             payload_schema: |g| g.subschema_for::<O::Payload>(),
             result_schema: |g| g.subschema_for::<O::Result>(),
-            validate: |v| serde_json::from_value::<O::Payload>(v.clone()).map(|_| ()).map_err(|e| e.to_string()),
+            // Deserialized *through* the value, not out of a clone of it: validation runs on
+            // every request, implemented op or not, and cloning the payload to throw the copy
+            // away doubled what a large `file.write` or `session.report` cost to check.
+            validate: |v| serde::Deserialize::deserialize(v).map(|_: O::Payload| ()).map_err(|e: serde_json::Error| e.to_string()),
         }
     }
     pub fn namespace(&self) -> &'static str {

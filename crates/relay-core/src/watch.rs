@@ -84,6 +84,9 @@ pub fn ensure(engine: &Engine, root: &Path, project_id: relay_bus::types::Id) {
     let root = PathBuf::from(&key);
     let callback_root = root.clone();
     let mut last_index = index_signature(&root);
+    // A build touches thousands of files, and every one of them arrives here as a path to
+    // compare. Build the path being compared against once, not once per event path.
+    let index_path = root.join(".git/index");
     let watcher: notify::Result<RecommendedWatcher> =
         notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
             let Ok(event) = event else { return };
@@ -97,7 +100,7 @@ pub fn ensure(engine: &Engine, root: &Path, project_id: relay_bus::types::Id) {
                     .paths
                     .iter()
                     .all(|path| {
-                        if path == &callback_root.join(".git/index") {
+                        if path == &index_path {
                             let next = index_signature(&callback_root);
                             let unchanged = next.is_some() && next == last_index;
                             last_index = next;

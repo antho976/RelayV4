@@ -106,19 +106,46 @@ fn changed_files(worktree: &Path) -> Result<BTreeSet<String>, BusError> {
     Ok(files)
 }
 
-fn language(path: &Path) -> Option<Language> {
+fn language(path: &Path) -> Option<(&'static str, Language)> {
     match path
         .extension()
         .and_then(|s| s.to_str())
         .unwrap_or_default()
     {
-        "rs" => Some(tree_sitter_rust::LANGUAGE.into()),
-        "ts" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
-        "tsx" => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
-        "svelte" => Some(tree_sitter_svelte::LANGUAGE.into()),
-        "kt" | "kts" => Some(tree_sitter_kotlin::LANGUAGE.into()),
+        "rs" => Some(("rs", tree_sitter_rust::LANGUAGE.into())),
+        "ts" => Some(("ts", tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())),
+        "tsx" => Some(("tsx", tree_sitter_typescript::LANGUAGE_TSX.into())),
+        "svelte" => Some(("svelte", tree_sitter_svelte::LANGUAGE.into())),
+        "kt" | "kts" => Some(("kt", tree_sitter_kotlin::LANGUAGE.into())),
         _ => None,
     }
+}
+
+thread_local! {
+    /// One parser per language, kept between files.
+    ///
+    /// `Parser::set_language` builds the grammar's whole lexer state; a scan that touches a
+    /// hundred changed files paid for that a hundred times. Parsers are explicitly reusable
+    /// across parses, and there are five of them at most.
+    static PARSERS: std::cell::RefCell<std::collections::HashMap<&'static str, Parser>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Run `f` with a parser already configured for `path`'s language, or `None` if there is none.
+fn with_parser<T>(path: &Path, f: impl FnOnce(&mut Parser) -> T) -> Option<T> {
+    let (key, language) = language(path)?;
+    PARSERS.with(|parsers| {
+        let mut parsers = parsers.borrow_mut();
+        let parser = match parsers.entry(key) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let mut parser = Parser::new();
+                parser.set_language(&language).ok()?;
+                entry.insert(parser)
+            }
+        };
+        Some(f(parser))
+    })
 }
 
 fn is_symbol(kind: &str) -> bool {
@@ -162,24 +189,14 @@ fn node_name(node: Node<'_>, source: &[u8]) -> Option<String> {
 }
 
 fn hash_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    crate::hex(&Sha256::digest(bytes))
 }
 
 fn symbols(path: &Path, source: &[u8]) -> BTreeMap<String, String> {
     if source.len() > 2 * 1024 * 1024 {
         return BTreeMap::new();
     }
-    let Some(language) = language(path) else {
-        return BTreeMap::new();
-    };
-    let mut parser = Parser::new();
-    if parser.set_language(&language).is_err() {
-        return BTreeMap::new();
-    }
-    let Some(tree) = parser.parse(source, None) else {
+    let Some(Some(tree)) = with_parser(path, |parser| parser.parse(source, None)) else {
         return BTreeMap::new();
     };
     let mut stack = vec![tree.root_node()];

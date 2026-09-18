@@ -204,11 +204,11 @@ pub fn authorize(
         }
     }
     if let Some(task_id) = payload.get("task_id").and_then(Value::as_i64) {
-        let assigned: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM task_sessions WHERE session_id=?1 AND task_id=?2)",
-            rusqlite::params![session.id, task_id],
-            |record| record.get(0),
-        ).map_err(crate::engine::internal)?;
+        let assigned: bool = conn
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM task_sessions WHERE session_id=?1 AND task_id=?2)")
+            .map_err(crate::engine::internal)?
+            .query_row(rusqlite::params![session.id, task_id], |record| record.get(0))
+            .map_err(crate::engine::internal)?;
         if !assigned {
             return Err(BusError::not_own("task"));
         }

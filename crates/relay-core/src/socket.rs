@@ -5,7 +5,7 @@
 use crate::engine::{Door, Engine};
 use crate::paths::Instance;
 use anyhow::{Context, Result};
-use relay_bus::envelope::{Event, Frame, Response};
+use relay_bus::envelope::{Event, Frame, Response, ENVELOPE_V};
 use relay_bus::error::BusError;
 use relay_bus::ops::bus::{SubscribeIn, SubscribeOut, WaitIn, WaitOut};
 use relay_bus::registry::Op;
@@ -160,6 +160,34 @@ pub async fn probe(path: &Path) -> bool {
     )
 }
 
+/// How much queued output one `write_all` may carry. Large enough to swallow a burst from
+/// every attached terminal, small enough that a slow reader never parks megabytes here.
+const WRITE_BATCH_BYTES: usize = 256 * 1024;
+
+/// The constant prefix of every `pty` frame on one attachment: the session name is escaped
+/// once, here, rather than on every frame.
+fn pty_frame_head(session: &str) -> String {
+    let name = serde_json::to_string(session).unwrap_or_else(|_| String::from("\"\""));
+    format!("{{\"v\":{ENVELOPE_V},\"stream\":\"pty\",\"session\":{name}")
+}
+
+/// One `pty` frame as its wire line, formatted in a single pass over its own bytes.
+///
+/// `serde_json` would first allocate a `String` for the base64 payload, wrap it in a `Value`,
+/// then re-scan all of it looking for characters JSON must escape. Base64's alphabet contains
+/// none of them and every other field here is a number or a fixed token, so the line can be
+/// built directly — on the one path that carries every byte every agent ever prints.
+fn pty_frame_line(head: &str, epoch: u64, seq: u64, data: &[u8]) -> String {
+    use base64::Engine as _;
+    use std::fmt::Write as _;
+    let mut line = String::with_capacity(head.len() + 48 + data.len().div_ceil(3) * 4);
+    line.push_str(head);
+    let _ = write!(line, ",\"epoch\":{epoch},\"seq\":{seq},\"data\":\"");
+    base64::engine::general_purpose::STANDARD.encode_string(data, &mut line);
+    line.push_str("\"}");
+    line
+}
+
 /// Event filter for `bus.subscribe {events}`: exact, `prefix.*`, or `*`. Empty = everything.
 #[derive(Clone, Default)]
 struct Filter(Vec<String>);
@@ -247,10 +275,29 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) -> Result<()> {
     let (r, mut w) = stream.into_split();
     let (out_tx, mut out_rx) = mpsc::channel::<String>(1024);
     let writer = tokio::spawn(async move {
-        while let Some(mut line) = out_rx.recv().await {
-            line.push('\n');
-            if w.write_all(line.as_bytes()).await.is_err() {
+        // Terminal output arrives as a burst of small lines, one per PTY read across every
+        // attached session. Writing each of them separately is one syscall per frame; whatever
+        // is already queued behind the first goes out with it instead.
+        let mut batch: Vec<u8> = Vec::with_capacity(WRITE_BATCH_BYTES);
+        while let Some(line) = out_rx.recv().await {
+            batch.clear();
+            batch.extend_from_slice(line.as_bytes());
+            batch.push(b'\n');
+            while batch.len() < WRITE_BATCH_BYTES {
+                match out_rx.try_recv() {
+                    Ok(next) => {
+                        batch.extend_from_slice(next.as_bytes());
+                        batch.push(b'\n');
+                    }
+                    Err(_) => break,
+                }
+            }
+            if w.write_all(&batch).await.is_err() {
                 break;
+            }
+            // One oversized frame must not hold its buffer for the rest of the connection.
+            if batch.capacity() > WRITE_BATCH_BYTES * 4 {
+                batch = Vec::with_capacity(WRITE_BATCH_BYTES);
             }
         }
     });
@@ -394,19 +441,18 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) -> Result<()> {
                         let tx = out_tx.clone();
                         let name = p.session.clone();
                         attached.insert(p.session.clone(), tokio::spawn(async move {
-                            use base64::Engine as _;
-                            let b64 = base64::engine::general_purpose::STANDARD;
+                            let head = pty_frame_head(&name);
                             let mut rx = att.rx;
                             if !att.catch_up.is_empty() {
-                                let f = Frame { v: 1, stream: "pty".into(), session: Some(name.clone()), run_id: None, mirror_id: None, epoch: Some(att.epoch), seq: att.seq, data: serde_json::Value::String(b64.encode(&att.catch_up)) };
-                                if let Ok(s) = serde_json::to_string(&f) { if tx.send(s).await.is_err() { return; } }
+                                let line = pty_frame_line(&head, att.epoch, att.seq, &att.catch_up);
+                                if tx.send(line).await.is_err() { return; }
                             }
                             loop {
                                 match rx.recv().await {
                                     Ok(fr) => {
                                         if fr.seq <= att.seq && fr.epoch == att.epoch { continue; } // already in catch-up
-                                        let f = Frame { v: 1, stream: "pty".into(), session: Some(name.clone()), run_id: None, mirror_id: None, epoch: Some(fr.epoch), seq: fr.seq, data: serde_json::Value::String(b64.encode(&fr.data)) };
-                                        if let Ok(s) = serde_json::to_string(&f) { if tx.send(s).await.is_err() { break; } }
+                                        let line = pty_frame_line(&head, fr.epoch, fr.seq, &fr.data);
+                                        if tx.send(line).await.is_err() { break; }
                                     }
                                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                                         tracing::warn!(lagged = n, session = %name, "pty subscriber lagged; frames dropped — client should re-attach from its last seq");
@@ -592,6 +638,11 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) -> Result<()> {
                 }
             }
             resp
+        } else if engine.answers_from_memory(&req) {
+            // A keystroke is the one request whose latency a person can feel, and it is also the
+            // one that never reaches the store. Answer it here rather than paying a trip to the
+            // blocking pool and back for a map lookup and a write.
+            engine.dispatch(req, Door::Socket)
         } else {
             let e = engine.clone();
             tokio::task::spawn_blocking(move || e.dispatch(req, Door::Socket)).await?
@@ -855,5 +906,56 @@ mod watch_tests {
         until_clients(&e, 0).await;
         assert!(runtime.stopped());
         assert!(e.device_watch.lock().unwrap().runtime.is_none());
+    }
+}
+
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+    use base64::Engine as _;
+
+    /// The hand-written encoder must be byte-for-byte what `serde_json` would have produced
+    /// for the same `Frame`, or a client that trusts the schema is reading a different protocol.
+    #[test]
+    fn hand_written_pty_lines_match_serde_exactly() {
+        let bodies: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            b"hello".to_vec(),
+            b"\x1b[32mgreen\x1b[0m \"quoted\" \\ backslash\n\t".to_vec(),
+            (0u8..=255).collect(),
+            vec![0xff; 64 * 1024],
+        ];
+        // Names that would break a formatter that forgot to escape.
+        for session in ["brisk-otter", "quote\"name", "back\\slash", "new\nline", "unicode-é"] {
+            let head = pty_frame_head(session);
+            for (i, body) in bodies.iter().enumerate() {
+                let epoch = i as u64 + 3;
+                let seq = (i as u64 + 1) * 1_000_000;
+                let expected = serde_json::to_string(&Frame {
+                    v: ENVELOPE_V,
+                    stream: "pty".into(),
+                    session: Some(session.to_string()),
+                    run_id: None,
+                    mirror_id: None,
+                    epoch: Some(epoch),
+                    seq,
+                    data: serde_json::Value::String(
+                        base64::engine::general_purpose::STANDARD.encode(body),
+                    ),
+                })
+                .unwrap();
+                let actual = pty_frame_line(&head, epoch, seq, body);
+                assert_eq!(actual, expected, "session {session:?}, body #{i}");
+                // And it still parses back into the same frame.
+                let parsed: Frame = serde_json::from_str(&actual).unwrap();
+                assert_eq!(parsed.seq, seq);
+                assert_eq!(parsed.epoch, Some(epoch));
+                assert_eq!(parsed.session.as_deref(), Some(session));
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(parsed.data.as_str().unwrap())
+                    .unwrap();
+                assert_eq!(&decoded, body);
+            }
+        }
     }
 }

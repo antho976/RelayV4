@@ -34,8 +34,11 @@ pub fn get_workspace(tx: &Connection, id: Id) -> Result<Workspace, BusError> {
         .ok_or_else(|| BusError::not_found("workspace.not_found", format!("no workspace {id}")))
 }
 
+/// Nearly every project-scoped op starts here, so the statement is cached rather than
+/// re-compiled per call.
 pub fn get_project(tx: &Connection, id: Id) -> Result<Project, BusError> {
-    tx.query_row("SELECT * FROM projects WHERE id = ?1", [id], project_row).optional().bus()?
+    tx.prepare_cached("SELECT * FROM projects WHERE id = ?1").bus()?
+        .query_row([id], project_row).optional().bus()?
         .ok_or_else(|| BusError::not_found("project.not_found", format!("no project {id}")))
 }
 

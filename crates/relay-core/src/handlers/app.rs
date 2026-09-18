@@ -77,7 +77,10 @@ pub fn register(e: &mut Engine) {
         ctx.after_commit(|engine| {
             std::thread::Builder::new()
                 .name("resource-disk".into())
-                .spawn(move || refresh_disk_cache(&engine))
+                .spawn(move || {
+                    crate::background_priority();
+                    refresh_disk_cache(&engine)
+                })
                 .ok();
         });
         Ok(snapshot)
@@ -103,8 +106,16 @@ pub fn register(e: &mut Engine) {
                         if !engine.resource_watch.load(Ordering::SeqCst) || engine.resource_watch_epoch.load(Ordering::SeqCst) != epoch { break; }
                         tick = tick.wrapping_add(1);
                         if tick.is_multiple_of(15) {
+                            // Its own thread rather than a pool one, so the walk can run niced
+                            // without leaving a pool thread demoted for whatever runs there next.
                             let engine = engine.clone();
-                            tokio::task::spawn_blocking(move || refresh_disk_cache(&engine));
+                            std::thread::Builder::new()
+                                .name("resource-disk".into())
+                                .spawn(move || {
+                                    crate::background_priority();
+                                    refresh_disk_cache(&engine)
+                                })
+                                .ok();
                             continue;
                         }
                         let rows = {

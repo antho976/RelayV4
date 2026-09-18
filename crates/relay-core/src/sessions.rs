@@ -77,7 +77,8 @@ pub fn new_name(conn: &Connection) -> Result<String> {
     for _ in 0..200 {
         let name = format!("{}-{}", ADJECTIVES.choose(&mut rng).unwrap(), ANIMALS.choose(&mut rng).unwrap());
         let taken: bool = conn
-            .query_row("SELECT 1 FROM sessions WHERE name = ?1 AND state != 'closed'", [&name], |_| Ok(()))
+            .prepare_cached("SELECT 1 FROM sessions WHERE name = ?1 AND state != 'closed'")?
+            .query_row([&name], |_| Ok(()))
             .optional()?
             .is_some();
         if !taken {
@@ -91,7 +92,7 @@ pub fn new_token() -> String {
     use rand::RngCore;
     let mut b = [0u8; 24];
     rand::rng().fill_bytes(&mut b);
-    b.iter().map(|x| format!("{x:02x}")).collect()
+    crate::hex(&b)
 }
 
 /// A session row plus the columns the bus type does not carry.
@@ -139,20 +140,31 @@ pub fn row(r: &Row) -> rusqlite::Result<Row_> {
     })
 }
 
+// Every request that carries an agent actor looks a session up at least twice — to
+// authenticate it, then again to authorize the op. `Connection::query_row` re-compiles its SQL
+// on each call; these go through the connection's prepared-statement cache instead.
 pub fn by_id(conn: &Connection, id: Id) -> Result<Option<Row_>, BusError> {
-    conn.query_row("SELECT * FROM sessions WHERE id = ?1", [id], row).optional().map_err(crate::engine::internal)
+    conn.prepare_cached("SELECT * FROM sessions WHERE id = ?1")
+        .map_err(crate::engine::internal)?
+        .query_row([id], row)
+        .optional()
+        .map_err(crate::engine::internal)
 }
 
 /// The non-closed session with this name (names are unique among live sessions).
 pub fn by_name(conn: &Connection, name: &str) -> Result<Row_, BusError> {
-    conn.query_row("SELECT * FROM sessions WHERE name = ?1 AND state != 'closed' ORDER BY id DESC LIMIT 1", [name], row)
+    conn.prepare_cached("SELECT * FROM sessions WHERE name = ?1 AND state != 'closed' ORDER BY id DESC LIMIT 1")
+        .map_err(crate::engine::internal)?
+        .query_row([name], row)
         .optional()
         .map_err(crate::engine::internal)?
         .ok_or_else(|| BusError::not_found("session.not_found", format!("no live session named {name:?}")))
 }
 
 pub fn set_state(conn: &Connection, id: Id, state: SessionState, now: &str) -> Result<(), BusError> {
-    conn.execute("UPDATE sessions SET state = ?1, updated_at = ?2 WHERE id = ?3", params![state_str(state), now, id])
+    conn.prepare_cached("UPDATE sessions SET state = ?1, updated_at = ?2 WHERE id = ?3")
+        .map_err(crate::engine::internal)?
+        .execute(params![state_str(state), now, id])
         .map(|_| ())
         .map_err(crate::engine::internal)
 }
@@ -169,20 +181,24 @@ pub fn save_scrollback(
     seq: u64,
     now: &str,
 ) -> Result<(), BusError> {
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO session_scrollback(session_id,text,epoch,seq,updated_at) VALUES (?1,?2,?3,?4,?5)
          ON CONFLICT(session_id) DO UPDATE SET text=excluded.text,epoch=excluded.epoch,seq=excluded.seq,updated_at=excluded.updated_at",
-        params![session_id, text.as_bytes(), epoch as i64, seq as i64, now],
-    ).map(|_| ()).map_err(crate::engine::internal)
+    )
+    .map_err(crate::engine::internal)?
+    .execute(params![session_id, text.as_bytes(), epoch as i64, seq as i64, now])
+    .map(|_| ())
+    .map_err(crate::engine::internal)
 }
 
 pub fn load_scrollback(conn: &Connection, session_id: Id) -> Result<Option<(String, u64, u64)>, BusError> {
-    conn.query_row(
-        "SELECT text,epoch,seq FROM session_scrollback WHERE session_id=?1",
+    conn.prepare_cached("SELECT text,epoch,seq FROM session_scrollback WHERE session_id=?1")
+        .map_err(crate::engine::internal)?
+        .query_row(
         [session_id],
         |row| {
             let bytes: Vec<u8> = row.get(0)?;
-            Ok((String::from_utf8_lossy(&bytes).to_string(), row.get::<_, i64>(1)? as u64, row.get::<_, i64>(2)? as u64))
+            Ok((String::from_utf8_lossy(&bytes).into_owned(), row.get::<_, i64>(1)? as u64, row.get::<_, i64>(2)? as u64))
         },
     ).optional().map_err(crate::engine::internal)
 }

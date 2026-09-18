@@ -105,6 +105,11 @@ pub struct Ui {
     sidebar_sessions: RefCell<Vec<Value>>,
     pub projects: RefCell<Vec<Value>>,
     pub page: RefCell<String>,
+    /// Whether the compositor still shows this window. A terminal that nobody can see does not
+    /// need its output: the engine keeps the scrollback ring either way, so detaching costs
+    /// nothing and saves the whole per-frame chain — socket read, parse, VTE feed and redraw —
+    /// for as long as the window is minimized or covered.
+    window_visible: Cell<bool>,
     applying_ui: Cell<bool>,
     navigation_pending: RefCell<Option<(i64, String)>>,
     navigation_sending: Cell<bool>,
@@ -211,6 +216,7 @@ pub fn run(rt: Handle) -> glib::ExitCode {
             );
         }
         let ui = Ui::build(app, rt.clone(), path.clone());
+        ui.track_window_visibility();
         ui.window.present();
         crate::pages::show_notes(&ui);
         ui.connect();
@@ -551,6 +557,7 @@ impl Ui {
             sidebar_sessions: RefCell::default(),
             projects: RefCell::default(),
             page: RefCell::new("agents".into()),
+            window_visible: Cell::new(true),
             applying_ui: Cell::new(false),
             navigation_pending: RefCell::default(),
             navigation_sending: Cell::new(false),
@@ -1269,12 +1276,45 @@ impl Ui {
         self.wall_stack
             .set_visible_child_name(if sessions.is_empty() { "empty" } else { "wall" });
     }
+    /// Follow the compositor's own view of whether this window is on screen.
+    ///
+    /// `SUSPENDED` is the compositor saying the surface is not visible — minimized, fully
+    /// covered, or on another workspace — and `MINIMIZED` covers the backends that do not send
+    /// it. Either way the terminals detach, and re-attach from their last sequence with bounded
+    /// catch-up when the window comes back, which is the same path a reconnect already takes.
+    /// The surface only exists once the window is realized, so this is installed from there.
+    pub fn track_window_visibility(self: &Rc<Self>) {
+        let ui = self.clone();
+        self.window.connect_realize(move |window| {
+            let Some(toplevel) = window
+                .surface()
+                .and_then(|surface| surface.downcast::<gtk::gdk::Toplevel>().ok())
+            else {
+                return;
+            };
+            let hidden = |state: gtk::gdk::ToplevelState| {
+                state.contains(gtk::gdk::ToplevelState::MINIMIZED)
+                    || state.contains(gtk::gdk::ToplevelState::SUSPENDED)
+            };
+            ui.window_visible.set(!hidden(toplevel.state()));
+            ui.update_attachments();
+            let weak = Rc::downgrade(&ui);
+            toplevel.connect_state_notify(move |toplevel| {
+                let Some(ui) = weak.upgrade() else { return };
+                let visible = !hidden(toplevel.state());
+                if ui.window_visible.replace(visible) != visible {
+                    ui.update_attachments();
+                }
+            });
+        });
+    }
     fn update_attachments(&self) {
         let focus = self.focused.borrow();
         let mode = self.mode.borrow();
         for s in self.sessions.borrow().iter() {
             if let Some(p) = self.panes.borrow().get(text(s, "name")) {
-                let active = (*self.page.borrow() == "agents"
+                let active = (self.window_visible.get()
+                    && *self.page.borrow() == "agents"
                     && self.editor.agents_visible()
                     && (mode.as_str() != "focus"
                         || focus.as_ref().is_none_or(|n| n == text(s, "name"))))

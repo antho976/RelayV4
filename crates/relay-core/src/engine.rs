@@ -70,6 +70,10 @@ impl Default for UiRuntime {
 /// handler, it just says which op did it (D144).
 const LOCK_BUDGET: std::time::Duration = std::time::Duration::from_millis(16);
 
+/// The largest `session.input` a door may answer without leaving its own thread. Comfortably
+/// above any keystroke and below a terminal's input queue, so the write cannot park there.
+const INLINE_INPUT_BYTES: usize = 1024;
+
 /// Store-lock accounting for one request. `wait` is how long it queued behind other handlers;
 /// `held` is how long it kept every other op — keystrokes included — out of the connection.
 /// Reports on `finish`, or on drop for the paths that leave the lock to scope exit.
@@ -205,7 +209,10 @@ pub struct Ctx<'a> {
     pub req_id: Uuid,
     pub now: String,
     pub op: &'static str,
-    payload: Value,
+    /// The request's payload. Borrowed from the request on the ordinary path — only one
+    /// handler ever reads it back (`guardrail.gate`, to freeze the envelope), and copying
+    /// every payload on the chance that it would was a second deep clone per request.
+    payload: std::borrow::Cow<'a, Value>,
     skip_policy: Option<String>,
     events: Vec<Event>,
     undo: Option<UndoOp>,
@@ -343,10 +350,11 @@ impl<'a> Ctx<'a> {
             None => None,
         };
         let prior = self.op;
-        let prior_payload = std::mem::replace(&mut self.payload, payload.clone());
+        let prior_payload =
+            std::mem::replace(&mut self.payload, std::borrow::Cow::Owned(payload.clone()));
         let prior_staged = std::mem::replace(&mut self.staged, staged);
         self.op = entry.name;
-        let result = handler(self, payload);
+        let result = handler(self, &payload);
         self.op = prior;
         self.payload = prior_payload;
         self.staged = prior_staged;
@@ -369,13 +377,16 @@ impl<'a> Ctx<'a> {
     }
 }
 
-type HandlerFn = Arc<dyn Fn(&mut Ctx, Value) -> Result<Value, BusError> + Send + Sync>;
+/// Handlers read their payload *through* the request's copy: a `Value` passed by value had to
+/// be cloned for every request, and the clone was thrown away the moment the typed payload
+/// came out of it.
+type HandlerFn = Arc<dyn Fn(&mut Ctx, &Value) -> Result<Value, BusError> + Send + Sync>;
 
 struct Handler {
     call: HandlerFn,
 }
 
-type UnlockedFn = Arc<dyn Fn(&mut Unlocked, Value) -> Result<Value, BusError> + Send + Sync>;
+type UnlockedFn = Arc<dyn Fn(&mut Unlocked, &Value) -> Result<Value, BusError> + Send + Sync>;
 
 type PrepareFn =
     Arc<dyn Fn(&mut Unlocked, &Value) -> Result<Box<dyn Any + Send>, BusError> + Send + Sync>;
@@ -470,9 +481,9 @@ impl Engine {
             "{} is not in the registry",
             O::NAME
         );
-        let call: HandlerFn = Arc::new(move |ctx: &mut Ctx, v: Value| {
+        let call: HandlerFn = Arc::new(move |ctx: &mut Ctx, v: &Value| {
             let p: O::Payload =
-                serde_json::from_value(v).map_err(|e| BusError::schema(O::NAME, e))?;
+                serde::Deserialize::deserialize(v).map_err(|e| BusError::schema(O::NAME, e))?;
             let r = f(ctx, p)?;
             serde_json::to_value(r)
                 .map_err(|e| BusError::internal(format!("serializing {} result: {e}", O::NAME)))
@@ -496,9 +507,9 @@ impl Engine {
             "{} mutates; it cannot run outside the transaction",
             O::NAME
         );
-        let call: UnlockedFn = Arc::new(move |ctx: &mut Unlocked, v: Value| {
+        let call: UnlockedFn = Arc::new(move |ctx: &mut Unlocked, v: &Value| {
             let p: O::Payload =
-                serde_json::from_value(v).map_err(|e| BusError::schema(O::NAME, e))?;
+                serde::Deserialize::deserialize(v).map_err(|e| BusError::schema(O::NAME, e))?;
             let r = f(ctx, p)?;
             serde_json::to_value(r)
                 .map_err(|e| BusError::internal(format!("serializing {} result: {e}", O::NAME)))
@@ -525,13 +536,13 @@ impl Engine {
         );
         let stage: PrepareFn = Arc::new(move |ctx: &mut Unlocked, v: &Value| {
             let p: O::Payload =
-                serde_json::from_value(v.clone()).map_err(|e| BusError::schema(O::NAME, e))?;
+                serde::Deserialize::deserialize(v).map_err(|e| BusError::schema(O::NAME, e))?;
             Ok(Box::new(prepare(ctx, &p)?) as Box<dyn Any + Send>)
         });
         self.prepares.insert(O::NAME, stage);
-        let call: HandlerFn = Arc::new(move |ctx: &mut Ctx, v: Value| {
+        let call: HandlerFn = Arc::new(move |ctx: &mut Ctx, v: &Value| {
             let p: O::Payload =
-                serde_json::from_value(v).map_err(|e| BusError::schema(O::NAME, e))?;
+                serde::Deserialize::deserialize(v).map_err(|e| BusError::schema(O::NAME, e))?;
             let staged = ctx.take_staged::<S>()?;
             let r = finish(ctx, p, staged)?;
             serde_json::to_value(r)
@@ -714,6 +725,16 @@ impl Engine {
 
     /// Parse a raw line/JSON into a request, or the `bus.parse` response for it (§1.2).
     pub fn parse(raw: &str) -> Result<Request, Response> {
+        // The common case is one parse straight into the envelope. Building a `Value` first
+        // cost every request a second full parse and a throwaway tree; that work now happens
+        // only on the failing path, where it buys the request id to answer with.
+        match serde_json::from_str::<Request>(raw) {
+            Ok(r) => return Ok(r),
+            Err(e) if e.is_syntax() || e.is_eof() => {
+                return Err(Response::unparsed(BusError::parse(e)))
+            }
+            Err(_) => {}
+        }
         let v: Value = match serde_json::from_str(raw) {
             Ok(v) => v,
             Err(e) => return Err(Response::unparsed(BusError::parse(e))),
@@ -749,14 +770,34 @@ impl Engine {
         // Priority mail is current session state, not part of an operation's typed result or
         // audit record. Resolve the actor again after the transaction so acknowledgements and
         // idempotent replays always carry the live count. Authentication failures get no hint.
-        if let Ok(Some(session_id)) = self.resolve_actor(&req, door) {
-            if let Ok(priority) = self.unread_priority_count(session_id) {
-                if priority > 0 {
-                    response.mail = Some(MailHint { priority });
-                }
+        response.mail = self.mail_hint(&req, door);
+        response
+    }
+
+    /// The post-commit `mail` sideband: the same authentication [`Engine::resolve_actor`] does,
+    /// and the count, under one acquisition of the store lock rather than two. A request that
+    /// cannot be attributed to a live, authenticated session gets no hint, exactly as before.
+    fn mail_hint(&self, req: &Request, door: Door) -> Option<MailHint> {
+        let name = req.actor.session_name()?;
+        if matches!(door, Door::Tauri) {
+            return None;
+        }
+        let conn = self.store.lock();
+        let row = crate::sessions::by_name(&conn, name).ok()?;
+        if matches!(door, Door::Socket) {
+            let token = req.token.as_deref()?;
+            if row.token.is_empty() || row.token != token {
+                return None;
             }
         }
-        response
+        let count: i64 = conn
+            .prepare_cached(UNREAD_PRIORITY_SQL)
+            .ok()?
+            .query_row([row.session.id], |row| row.get(0))
+            .ok()?;
+        (count > 0).then(|| MailHint {
+            priority: u32::try_from(count).unwrap_or(u32::MAX),
+        })
     }
 
     fn dispatch_inner(&self, req: &Request, door: Door, watching: Option<bool>) -> Result<Response, BusError> {
@@ -913,7 +954,7 @@ impl Engine {
             req_id: req.id,
             now: now.clone(),
             op: entry.name,
-            payload: req.payload.clone(),
+            payload: std::borrow::Cow::Borrowed(&req.payload),
             skip_policy: None,
             events: staged_events,
             undo: None,
@@ -928,7 +969,7 @@ impl Engine {
             after_commit: staged_after,
             staged,
         };
-        let outcome = (h.call)(&mut ctx, req.payload.clone());
+        let outcome = (h.call)(&mut ctx, &req.payload);
         let Ctx {
             events,
             undo,
@@ -1059,12 +1100,10 @@ impl Engine {
         let now = crate::time::now();
         let mut conn = self.store.lock();
         let project_id = session_id.and_then(|session_id| {
-            conn.query_row(
-                "SELECT project_id FROM sessions WHERE id = ?1",
-                [session_id],
-                |row| row.get(0),
-            )
-            .ok()
+            conn.prepare_cached("SELECT project_id FROM sessions WHERE id = ?1")
+                .ok()?
+                .query_row([session_id], |row| row.get(0))
+                .ok()
         });
         let tx = conn.transaction().map_err(internal)?;
         let e = AuditEntry {
@@ -1144,7 +1183,7 @@ impl Engine {
             events: Vec::new(),
             deferred: Vec::new(),
         };
-        let outcome = h(&mut ctx, req.payload.clone());
+        let outcome = h(&mut ctx, &req.payload);
         let Unlocked {
             events, deferred, ..
         } = ctx;
@@ -1161,6 +1200,43 @@ impl Engine {
             }
         }
         Ok(Response::ok(req.id, result))
+    }
+
+    /// Whether this request is certain to be answered from memory alone, so a door can run it
+    /// on the thread it arrived on instead of handing it to the blocking pool.
+    ///
+    /// True only for the two ops [`Engine::pty_fast_path`] serves, from an actor that is not a
+    /// session, against a PTY that is in the map right now — every one of those a lock-free
+    /// check. The hop costs about 25 µs and a thread wake-up, which is most of what a keystroke
+    /// spends before reaching the terminal. Being wrong is not a correctness problem: the
+    /// request simply takes the ordinary pipeline, inline, and the two ops it admits never do
+    /// more than one write to a file descriptor.
+    pub fn answers_from_memory(&self, req: &Request) -> bool {
+        if req.actor.is_agent() {
+            return false;
+        }
+        match req.op.as_str() {
+            // A resize is an ioctl; it cannot block.
+            "session.resize" => {}
+            // A keystroke is a handful of bytes, but a paste can exceed the child's input
+            // queue, and that write blocks until the child drains it. Only the small case is
+            // safe to run on a thread the runtime shares.
+            "session.input" => {
+                let small = req
+                    .payload
+                    .get("data")
+                    .and_then(Value::as_str)
+                    .is_some_and(|data| data.len() <= INLINE_INPUT_BYTES);
+                if !small {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+        req.payload
+            .get("session")
+            .and_then(Value::as_str)
+            .is_some_and(|name| self.pty_ids.lock().unwrap().contains_key(name))
     }
 
     /// `session.input` / `session.resize` against a live PTY, with no store lock and no
@@ -1278,20 +1354,11 @@ impl Engine {
         Ok(Some(row.session.id))
     }
 
-    fn unread_priority_count(&self, session_id: Id) -> Result<u32, BusError> {
-        let conn = self.store.lock();
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM message_recipients r
-                 JOIN messages m ON m.id = r.message_id
-                 WHERE r.session_id = ?1 AND r.acked_at IS NULL AND m.priority = 1",
-                [session_id],
-                |row| row.get(0),
-            )
-            .map_err(internal)?;
-        Ok(u32::try_from(count).unwrap_or(u32::MAX))
-    }
 }
+
+const UNREAD_PRIORITY_SQL: &str = "SELECT COUNT(*) FROM message_recipients r
+     JOIN messages m ON m.id = r.message_id
+     WHERE r.session_id = ?1 AND r.acked_at IS NULL AND m.priority = 1";
 
 /// BUS.md §5.1a.
 pub fn should_audit(entry: &OpEntry, actor: &Actor) -> bool {
@@ -1316,5 +1383,82 @@ pub trait IntoBus<T> {
 impl<T, E: std::fmt::Display> IntoBus<T> for Result<T, E> {
     fn bus(self) -> Result<T, BusError> {
         self.map_err(internal)
+    }
+}
+
+#[cfg(test)]
+mod inline_path_tests {
+    use super::*;
+    use relay_bus::Request;
+    use serde_json::json;
+
+    fn engine() -> Arc<Engine> {
+        Engine::new(crate::Instance::Test, crate::Store::open_memory().unwrap())
+    }
+
+    fn input(session: &str, data: &str) -> Request {
+        Request::new(Actor::User, "session.input", json!({"session":session,"data":data}))
+    }
+
+    /// The gate decides only *where* a request runs, so every case it turns down still has to
+    /// be answered — by the ordinary pipeline, on the blocking pool.
+    #[test]
+    fn only_memory_resolvable_keystrokes_skip_the_blocking_pool() {
+        let e = engine();
+        // Nothing is spawned yet, so even a well-formed keystroke has no PTY to reach.
+        assert!(!e.answers_from_memory(&input("brisk-otter", "a")));
+
+        let pty = crate::pty::Pty::spawn(
+            crate::pty::SpawnSpec {
+                cmd: "/bin/cat".into(),
+                args: Vec::new(),
+                env: Vec::new(),
+                cwd: std::env::temp_dir(),
+                cols: 80,
+                rows: 24,
+                epoch: 1,
+                initial_scrollback: Vec::new(),
+            },
+            |_| {},
+        )
+        .unwrap();
+        e.set_pty(1, "brisk-otter", pty);
+
+        assert!(e.answers_from_memory(&input("brisk-otter", "a")));
+        assert!(e.answers_from_memory(&input("brisk-otter", "")));
+        assert!(e.answers_from_memory(&Request::new(
+            Actor::User,
+            "session.resize",
+            json!({"session":"brisk-otter","cols":100,"rows":40}),
+        )));
+
+        // A session nobody has spawned, an op that reaches the store, and an agent actor —
+        // whose keystroke is audited and authorized against its session row — all take the pool.
+        assert!(!e.answers_from_memory(&input("quiet-lemur", "a")));
+        assert!(!e.answers_from_memory(&Request::new(
+            Actor::User,
+            "session.list",
+            json!({"session":"brisk-otter"}),
+        )));
+        assert!(!e.answers_from_memory(&Request::new(
+            Actor::agent("brisk-otter"),
+            "session.input",
+            json!({"session":"brisk-otter","data":"a"}),
+        )));
+
+        // A paste large enough to block on the child's input queue does not run inline.
+        let big = "x".repeat(INLINE_INPUT_BYTES + 1);
+        assert!(!e.answers_from_memory(&input("brisk-otter", &big)));
+        assert!(e.answers_from_memory(&input("brisk-otter", &"x".repeat(INLINE_INPUT_BYTES))));
+
+        // A malformed payload is the handler's error to report, not the gate's to guess at.
+        assert!(!e.answers_from_memory(&Request::new(Actor::User, "session.input", json!({}))));
+        assert!(!e.answers_from_memory(&Request::new(
+            Actor::User,
+            "session.input",
+            json!({"session":"brisk-otter","data":7}),
+        )));
+
+        e.shutdown();
     }
 }

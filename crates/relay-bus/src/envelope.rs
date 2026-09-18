@@ -283,3 +283,37 @@ pub enum WireLine {
     Event(Event),
     Frame(Frame),
 }
+
+#[cfg(test)]
+mod wire_prefix_tests {
+    use super::*;
+
+    /// Readers tell the three line shapes apart from the key that follows `v`, which lets a
+    /// socket line be parsed once instead of being staged through a `serde_json::Value` first.
+    /// That only holds while each envelope declares that key second, so it is asserted here
+    /// rather than assumed at the reader. A reader that stops recognizing a prefix falls back
+    /// to the general path, so this failing means "the fast path went quiet", not "it broke".
+    #[test]
+    fn each_envelope_leads_with_the_key_that_identifies_it() {
+        let event = Event::new("session.changed", "2026-01-01T00:00:00Z".into(), Actor::User, serde_json::json!({}));
+        assert!(serde_json::to_string(&event).unwrap().starts_with(r#"{"v":1,"ev""#));
+
+        let frame = Frame {
+            v: ENVELOPE_V,
+            stream: "pty".into(),
+            session: Some("brisk-otter".into()),
+            run_id: None,
+            mirror_id: None,
+            epoch: Some(1),
+            seq: 2,
+            data: serde_json::Value::String("aGk=".into()),
+        };
+        assert!(serde_json::to_string(&frame).unwrap().starts_with(r#"{"v":1,"stream""#));
+
+        // Both the answered and the unparseable response, whose id is null rather than absent.
+        let answered = Response::ok(Uuid::nil(), serde_json::json!({}));
+        assert!(serde_json::to_string(&answered).unwrap().starts_with(r#"{"v":1,"id""#));
+        let unparsed = Response::unparsed(BusError::internal("x"));
+        assert!(serde_json::to_string(&unparsed).unwrap().starts_with(r#"{"v":1,"id""#));
+    }
+}

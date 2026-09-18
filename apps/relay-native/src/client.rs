@@ -15,6 +15,35 @@ use tokio::task::AbortHandle;
 use uuid::Uuid;
 
 type Pending = Arc<Mutex<HashMap<Uuid, oneshot::Sender<Result<Value, Error>>>>>;
+
+/// Which of the three line shapes a socket line carries.
+enum Shape {
+    Event,
+    Frame,
+    Response,
+}
+
+/// The shape of `line`, read from its leading bytes.
+///
+/// Every PTY frame the engine sends lands here, and a frame's payload is the bulk of the line,
+/// so the cost that matters is how many times the line is scanned. Each envelope serializes its
+/// fields in declaration order, which puts a distinguishing key first and lets the common case
+/// be exactly one typed parse. `None` means "not recognizable from the prefix", and the caller
+/// falls back to a `serde_json::Value` to decide — so a reordered field costs a little speed
+/// and never correctness. A matched prefix has also proven the envelope version.
+fn shape(line: &[u8]) -> Option<Shape> {
+    let rest = line.strip_prefix(br#"{"v":1,""#)?;
+    if rest.starts_with(br#"ev""#) {
+        Some(Shape::Event)
+    } else if rest.starts_with(br#"stream""#) {
+        Some(Shape::Frame)
+    } else if rest.starts_with(br#"id""#) {
+        Some(Shape::Response)
+    } else {
+        None
+    }
+}
+
 const QUEUE: usize = 64;
 const MAX_LINE: usize = 2 * 1024 * 1024;
 
@@ -168,27 +197,41 @@ impl Client {
                             break;
                         }
                     }
-                    let value: Value = serde_json::from_slice(&line)
-                        .map_err(|e| Error::Protocol(e.to_string()))?;
-                    if value["v"].as_u64() != Some(ENVELOPE_V.into()) {
-                        return Err(Error::Protocol("unsupported envelope version".into()));
-                    }
-                    if value.get("ev").is_some() {
-                        let event = serde_json::from_value(value)
+                    let shape = match shape(&line) {
+                        Some(shape) => shape,
+                        None => {
+                            let value: Value = serde_json::from_slice(&line)
+                                .map_err(|e| Error::Protocol(e.to_string()))?;
+                            if value["v"].as_u64() != Some(ENVELOPE_V.into()) {
+                                return Err(Error::Protocol(
+                                    "unsupported envelope version".into(),
+                                ));
+                            }
+                            if value.get("ev").is_some() {
+                                Shape::Event
+                            } else if value.get("stream").is_some() {
+                                Shape::Frame
+                            } else {
+                                Shape::Response
+                            }
+                        }
+                    };
+                    if matches!(shape, Shape::Event) {
+                        let event = serde_json::from_slice(&line)
                             .map_err(|e| Error::Protocol(e.to_string()))?;
                         reader_notices
                             .send(Notice::Event(event))
                             .await
                             .map_err(|_| Error::Disconnected)?;
-                    } else if value.get("stream").is_some() {
-                        let frame = serde_json::from_value(value)
+                    } else if matches!(shape, Shape::Frame) {
+                        let frame = serde_json::from_slice(&line)
                             .map_err(|e| Error::Protocol(e.to_string()))?;
                         reader_notices
                             .send(Notice::Frame(frame))
                             .await
                             .map_err(|_| Error::Disconnected)?;
                     } else {
-                        let response: Response = serde_json::from_value(value)
+                        let response: Response = serde_json::from_slice(&line)
                             .map_err(|e| Error::Protocol(e.to_string()))?;
                         let id = response
                             .id
