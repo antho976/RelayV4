@@ -363,6 +363,58 @@ fn unix_millis() -> u64 {
         .unwrap_or(0)
 }
 
+
+
+impl Drop for Pty {
+    fn drop(&mut self) {
+        // last handle gone: make sure nothing lingers
+        if !self.exited() {
+            unsafe {
+                libc::kill(-(self.pid as i32), libc::SIGKILL);
+                libc::kill(self.pid as i32, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+/// Is `pid` alive? (signal 0)
+pub fn pid_alive(pid: u32) -> bool {
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+/// Environment of a live process, from /proc.
+pub fn proc_env(pid: u32) -> Option<Vec<(String, String)>> {
+    let raw = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    Some(raw.split(|b| *b == 0).filter_map(|kv| {
+        let s = String::from_utf8_lossy(kv);
+        let (k, v) = s.split_once('=')?;
+        Some((k.to_string(), v.to_string()))
+    }).collect())
+}
+
+/// Every live pid whose environment carries `RELAY_SESSION` for `instance` **and** this
+/// store (`RELAY_STORE`) — Relay's own children (and theirs), regardless of which engine
+/// process spawned them. The store filter keeps a test engine from reaping a real one.
+pub fn relay_children(instance: &str, store: &str) -> Vec<(u32, String)> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir("/proc") else { return out };
+    let me = std::process::id();
+    for e in rd.flatten() {
+        let Ok(pid) = e.file_name().to_string_lossy().parse::<u32>() else { continue };
+        if pid == me { continue; }
+        let Some(env) = proc_env(pid) else { continue };
+        let inst = env.iter().find(|(k, _)| k == "RELAY_INSTANCE").map(|(_, v)| v.as_str());
+        let st = env.iter().find(|(k, _)| k == "RELAY_STORE").map(|(_, v)| v.as_str());
+        let sess = env.iter().find(|(k, _)| k == "RELAY_SESSION").map(|(_, v)| v.clone());
+        if inst == Some(instance) && st == Some(store) {
+            if let Some(s) = sess {
+                out.push((pid, s));
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,7 +468,7 @@ mod tests {
     fn frame_lookup_matches_a_linear_scan() {
         let mut r = ring();
         for seq in 1..=500u64 {
-            r.push(seq, &vec![0u8; 16]);
+            r.push(seq, &[0u8; 16]);
         }
         for seq in 0..=501u64 {
             let scanned = r.frames.iter().find(|(s, _)| *s > seq).map(|(_, o)| *o);
@@ -456,54 +508,4 @@ mod tests {
         assert_eq!(tail.lines().count(), 3);
         assert!(tail.lines().all(|l| l.len() == 1024));
     }
-}
-
-impl Drop for Pty {
-    fn drop(&mut self) {
-        // last handle gone: make sure nothing lingers
-        if !self.exited() {
-            unsafe {
-                libc::kill(-(self.pid as i32), libc::SIGKILL);
-                libc::kill(self.pid as i32, libc::SIGKILL);
-            }
-        }
-    }
-}
-
-/// Is `pid` alive? (signal 0)
-pub fn pid_alive(pid: u32) -> bool {
-    unsafe { libc::kill(pid as i32, 0) == 0 }
-}
-
-/// Environment of a live process, from /proc.
-pub fn proc_env(pid: u32) -> Option<Vec<(String, String)>> {
-    let raw = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
-    Some(raw.split(|b| *b == 0).filter_map(|kv| {
-        let s = String::from_utf8_lossy(kv);
-        let (k, v) = s.split_once('=')?;
-        Some((k.to_string(), v.to_string()))
-    }).collect())
-}
-
-/// Every live pid whose environment carries `RELAY_SESSION` for `instance` **and** this
-/// store (`RELAY_STORE`) — Relay's own children (and theirs), regardless of which engine
-/// process spawned them. The store filter keeps a test engine from reaping a real one.
-pub fn relay_children(instance: &str, store: &str) -> Vec<(u32, String)> {
-    let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir("/proc") else { return out };
-    let me = std::process::id();
-    for e in rd.flatten() {
-        let Ok(pid) = e.file_name().to_string_lossy().parse::<u32>() else { continue };
-        if pid == me { continue; }
-        let Some(env) = proc_env(pid) else { continue };
-        let inst = env.iter().find(|(k, _)| k == "RELAY_INSTANCE").map(|(_, v)| v.as_str());
-        let st = env.iter().find(|(k, _)| k == "RELAY_STORE").map(|(_, v)| v.as_str());
-        let sess = env.iter().find(|(k, _)| k == "RELAY_SESSION").map(|(_, v)| v.clone());
-        if inst == Some(instance) && st == Some(store) {
-            if let Some(s) = sess {
-                out.push((pid, s));
-            }
-        }
-    }
-    out
 }

@@ -1,0 +1,61 @@
+name: CI
+
+# The engine, the bus and the CLI are checked on every push and every pull request.
+# `relay-native` is not — see the note at the bottom of this file.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  engine:
+    name: engine, bus and CLI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned rather than `stable`: a toolchain bump can introduce new lints, and a build
+      # that goes red because Rust shipped on a Tuesday teaches people to ignore the build.
+      # Bumping this line is how a new toolchain gets adopted — deliberately, in its own PR.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `--locked` fails if Cargo.lock would have to change, so a dependency cannot drift in
+      # through a build that happened to resolve differently.
+      - name: Test
+        run: cargo test --locked
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+# `relay-native` is deliberately absent, and this is the honest reason rather than an
+# oversight to rediscover later.
+#
+# The crate pins GTK 4.22, VTE 0.84, GtkSourceView 5.18 and pango 1.56. `ubuntu-latest`
+# currently carries GTK 4.14 and pango 1.52, so `cargo check -p relay-native` stops at
+# `pango-sys` before it compiles a line of Relay's own code. The same gap applies to agent
+# sessions run against an Ubuntu image, which is why changes to the native client have to be
+# verified on a developer machine today.
+#
+# Covering it needs a runner image that actually carries those versions — a container with a
+# current GNOME stack, or a self-hosted runner. Whoever adds that job should confirm the
+# image's `pkg-config --modversion gtk4 pango vte-2.91-gtk4 gtksourceview-5` before wiring it
+# up, and can then add `cargo clippy -p relay-native --all-targets -- -D warnings -A deprecated`
+# and `cargo fmt -p relay-native --check` from the README's verification list.
+#
+# `cargo fmt --check` is absent for a different reason: the workspace is not rustfmt-clean and
+# deliberately so in places (~900 hunks differ from rustfmt's default). Enforcing it would be a
+# reformat of the repository, which is a decision to take on purpose and not a side effect of
+# turning CI on.

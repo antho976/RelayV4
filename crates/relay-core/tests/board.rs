@@ -126,8 +126,7 @@ fn task_note_and_module_draft_expectations_reject_stale_writes_atomically() {
         assert_eq!(
             replies
                 .iter()
-                .filter(|r| !r.ok)
-                .next()
+                .find(|r| !r.ok)
                 .unwrap()
                 .error
                 .as_ref()

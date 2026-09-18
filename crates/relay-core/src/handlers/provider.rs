@@ -101,7 +101,7 @@ pub fn register(e: &mut Engine) {
         if let Some(enabled) = payload.enabled {
             skills.retain(|skill| match payload.project_id {
                 Some(project_id) => skill.enabled_in.contains(&project_id) == enabled,
-                None => (!skill.enabled_in.is_empty()) == enabled,
+                None => skill.enabled_in.is_empty() != enabled,
             });
         }
         Ok(SkillListOut { skills })

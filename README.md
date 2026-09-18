@@ -48,6 +48,14 @@ cargo clippy -p relay-native --all-targets -- -D warnings -A deprecated
 python3 scripts/native-smoke.py
 ```
 
+CI runs the engine, bus and CLI half of that list — `cargo test --locked` and
+`cargo clippy --locked --all-targets -- -D warnings` — on every push and pull
+request. The native client is not covered: it pins GTK 4.22, VTE 0.84,
+GtkSourceView 5.18 and pango 1.56, which the hosted runners do not carry, so its
+checks and the display smoke test still have to be run on a machine that has
+them. `.github/workflows/ci.yml` records what a runner would need to close that
+gap.
+
 The display smoke test creates its own temporary store, repository and fake
 provider executables. It opens the GTK application at two desktop sizes and
 checks saves, a review-group launch and eleven-session output delivery. It never launches a paid

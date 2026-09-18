@@ -518,8 +518,7 @@ esac
     assert_eq!(
         tasks
             .lines()
-            .filter(|line| line.starts_with("assembleRelease|"))
-            .next_back()
+            .rfind(|line| line.starts_with("assembleRelease|"))
             .unwrap(),
         format!("assembleRelease|{}||bad|", sdk.path().display())
     );
