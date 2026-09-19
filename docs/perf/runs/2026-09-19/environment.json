@@ -1,0 +1,19 @@
+{
+  "date": "2026-09-19",
+  "git_sha": "842daf33ce7e02b50d6c95fba1321667a92d71c0",
+  "git_branch": "claude/app-performance-baseline-74jqdt",
+  "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)",
+  "profile": "dev (opt-level 1 workspace, 3 dependencies; the profile run.sh launches)",
+  "kernel": "6.18.44-fc-v37",
+  "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+  "cores": 4,
+  "mem_gib": 15.7,
+  "valgrind": "valgrind-3.22.0",
+  "strace": "strace -- version 6.8",
+  "load_at_start": [
+    0.34375,
+    0.8681640625,
+    0.90771484375
+  ],
+  "container": false
+}

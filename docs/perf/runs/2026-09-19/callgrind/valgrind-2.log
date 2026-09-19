@@ -1,0 +1,207 @@
+==17960== Callgrind, a call-graph generating cache profiler
+==17960== Copyright (C) 2002-2017, and GNU GPL'd, by Josef Weidendorfer et al.
+==17960== Using Valgrind-3.22.0 and LibVEX; rerun with -h for copyright info
+==17960== Command: /home/user/RelayV4/target/debug/examples/perf run op.bus.schema.whole op.app.version op.app.resources.watch op.app.backup.now op.app.first_run.state op.audit.get op.workspace.discover op.workspace.remove op.project.list op.project.remove op.task.get op.task.list.filtered op.task.delete op.task.changelog.write op.task.parent.set op.task.label.remove op.task.unrelate op.task.copy_text op.module.list op.module.reopen op.module.stats op.notes.get op.notes.append op.notes.restore op.mailbox.send.priority op.mailbox.ack op.session.resume op.session.wake op.session.done op.session.release op.session.list.all op.session.bootstrap op.session.attach op.session.input.paste_4k op.session.scrollback.tail op.overlap.list op.overlap.scan op.guardrail.gate.hold op.guardrail.confirm op.guardrail.config.set op.worktree.list op.worktree.remove op.git.diff op.git.log op.git.branches op.git.branch.delete op.git.commit op.git.pr.list op.git.suggest_message op.integration.list op.file.tree.deep op.file.write.4k op.file.rename op.file.restore op.file.search op.device.watch op.device.mirror.input op.device.signing.get op.device.run.stop op.avd.catalog op.provider.list op.usage.get op.skill.create op.skill.enable op.github.connect op.notify.list op.notify.settings.get op.settings.get.path op.dashboard.get op.ui.pane.open op.ui.pane.move op.ui.layout.apply op.ui.window.close op.os.reveal path.store.open_existing path.recovery.run path.response.serialize.session_list path.socket.bus.unsubscribe path.socket.keystroke path.pty.burst_1mib path.session.lifecycle path.guardrail.config_load --callgrind --iters-div 10 --warmup 1 --out docs/perf/runs/2026-09-19/callgrind/rows-2.jsonl
+==17960== 
+==17960== For interactive control, run 'callgrind_control -h'.
+op.bus.schema.whole                       1721642.8 µs  3 ok  {}
+op.app.version                              41552.6 µs  20 ok  {}
+op.app.resources.watch                      33668.7 µs  3 ok  {}
+op.app.backup.now                          232416.5 µs  1 ok  {}
+op.app.first_run.state                     127525.5 µs  20 ok  {}
+op.audit.get                               121208.5 µs  20 ok  {}
+op.workspace.discover                       58543.4 µs  3 ok  {}
+op.workspace.remove                        280429.8 µs  3 ok  {}
+op.project.list                             90258.0 µs  20 ok  {}
+op.project.remove                          550322.6 µs  3 ok  {}
+op.task.get                                237894.3 µs  20 ok  {}
+op.task.list.filtered                      318697.7 µs  20 ok  {}
+op.task.delete                             338853.5 µs  20 ok  {}
+op.task.changelog.write                    356626.1 µs  20 ok  {}
+op.task.parent.set                         398834.1 µs  20 ok  {}
+op.task.label.remove                       404156.8 µs  20 ok  {}
+op.task.unrelate                           394531.3 µs  20 ok  {}
+op.task.copy_text                          234030.8 µs  20 ok  {}
+op.module.list                             279649.3 µs  20 ok  {}
+op.module.reopen                           236217.9 µs  20 ok  {}
+op.module.stats                            220942.5 µs  20 ok  {}
+op.notes.get                               130383.8 µs  20 ok  {}
+op.notes.append                            256816.2 µs  20 ok  {}
+op.notes.restore                           253953.9 µs  20 ok  {}
+op.mailbox.send.priority                   309778.7 µs  3 ok  {}
+op.mailbox.ack                             374428.2 µs  3 ok  {}
+op.session.resume                          151393.9 µs  0 ok  {"session.state":3}
+op.session.wake                           1498953.8 µs  1 ok  {}
+op.session.done                            480793.3 µs  3 ok  {}
+op.session.release                         381429.3 µs  20 ok  {}
+op.session.list.all                        102155.4 µs  20 ok  {}
+op.session.bootstrap                       586774.3 µs  20 ok  {}
+op.session.attach                           78395.2 µs  20 ok  {}
+op.session.input.paste_4k                   29165.9 µs  20 ok  {}
+op.session.scrollback.tail                  97217.2 µs  20 ok  {}
+op.overlap.list                             83247.8 µs  20 ok  {}
+op.overlap.scan                           2117510.4 µs  1 ok  {}
+op.guardrail.gate.hold                     394883.5 µs  0 ok  {"guardrail.user_bypass":3}
+op.guardrail.confirm                       488616.5 µs  3 ok  {}
+op.guardrail.config.set                    444250.8 µs  20 ok  {}
+op.worktree.list                           790430.7 µs  3 ok  {}
+op.worktree.list.dirty                    1145722.8 µs  3 ok  {}
+op.worktree.remove                         650588.1 µs  1 ok  {}
+op.git.diff                                496541.8 µs  3 ok  {}
+op.git.diff.staged                         420449.5 µs  3 ok  {}
+op.git.diff.file                           586430.6 µs  3 ok  {}
+op.git.log                                 569347.4 µs  3 ok  {}
+op.git.log.graph                           575034.1 µs  3 ok  {}
+op.git.branches                            684921.4 µs  3 ok  {}
+op.git.branch.delete                      1418418.9 µs  3 ok  {}
+op.git.commit                             1705465.3 µs  3 ok  {}
+op.git.pr.list                              67812.6 µs  0 ok  {"github.gh_missing":3}
+op.git.suggest_message                     432222.9 µs  3 ok  {}
+op.integration.list                         83704.0 µs  20 ok  {}
+op.file.tree.deep                          874909.5 µs  3 ok  {}
+op.file.write.4k                           597388.1 µs  3 ok  {}
+op.file.rename                             568015.2 µs  20 ok  {}
+op.file.restore                            292727.7 µs  20 ok  {}
+op.file.restore_head                       684048.0 µs  3 ok  {}
+op.file.search                             975129.9 µs  3 ok  {}
+op.file.search.regex                       637506.8 µs  3 ok  {}
+op.device.watch                            102927.0 µs  0 ok  {"device.adb_missing":3}
+op.device.mirror.input                      45854.8 µs  0 ok  {"device.mirror_not_found":20}
+op.device.signing.get                       92211.8 µs  20 ok  {}
+op.device.run.stop                         187865.0 µs  0 ok  {"device.run_not_found":20}
+op.avd.catalog                             104731.0 µs  0 ok  {"avd.sdk_missing":3}
+op.provider.list                           168238.2 µs  20 ok  {}
+op.usage.get                                57263.0 µs  3 ok  {}
+op.skill.create                            314077.5 µs  3 ok  {}
+op.skill.enable                            276501.6 µs  3 ok  {}
+op.github.connect                           46950.2 µs  0 ok  {"github.gh_missing":3}
+op.notify.list                             185797.7 µs  20 ok  {}
+op.notify.settings.get                     222060.2 µs  20 ok  {}
+op.settings.get.path                       246463.4 µs  20 ok  {}
+op.dashboard.get                           442082.0 µs  20 ok  {}
+op.ui.pane.open                             68323.0 µs  20 ok  {}
+op.ui.pane.move                             40198.0 µs  0 ok  {"ui.pane_not_found":20}
+op.ui.layout.apply                         148661.0 µs  20 ok  {}
+op.ui.window.close                          38010.6 µs  0 ok  {"ui.window_not_found":20}
+op.os.reveal                             ==22352== 
+==22352== Events    : Ir
+==22352== Collected : 1722837562
+==22352== 
+==22352== I   refs:      1,722,837,562
+==22412== 
+==22412== Events    : Ir
+==22412== Collected : 1722862588
+==22412== 
+==22412== I   refs:      1,722,862,588
+==22423== 
+==22423== Events    : Ir
+==22423== Collected : 1722894753
+==22423== 
+==22423== I   refs:      1,722,894,753
+==22436== 
+==22436== Events    : Ir
+==22436== Collected : 1722926921
+==22436== 
+==22436== I   refs:      1,722,926,921
+==22457== 
+==22457== Events    : Ir
+==22457== Collected : 1722959199
+==22457== 
+==22457== I   refs:      1,722,959,199
+==22496== 
+==22496== Events    : Ir
+==22496== Collected : 1722991093
+==22496== 
+==22496== I   refs:      1,722,991,093
+==22530== 
+==22530== Events    : Ir
+==22530== Collected : 1723023171
+==22530== 
+==22530== I   refs:      1,723,023,171
+==22572== 
+==22572== Events    : Ir
+==22572== Collected : 1723055312
+==22572== 
+==22572== I   refs:      1,723,055,312
+==22609== 
+==22609== Events    : Ir
+==22609== Collected : 1723085516
+==22609== 
+==22609== I   refs:      1,723,085,516
+==22642== 
+==22642== Events    : Ir
+==22642== Collected : 1723118509
+==22642== 
+==22642== I   refs:      1,723,118,509
+==22677== 
+==22677== Events    : Ir
+==22677== Collected : 1723150221
+==22677== 
+==22677== I   refs:      1,723,150,221
+==22697== 
+==22697== Events    : Ir
+==22697== Collected : 1723180742
+==22697== 
+==22697== I   refs:      1,723,180,742
+==22710== 
+==22710== Events    : Ir
+==22710== Collected : 1723213447
+==22710== 
+==22710== I   refs:      1,723,213,447
+==22723== 
+==22723== Events    : Ir
+==22723== Collected : 1723245203
+==22723== 
+==22723== I   refs:      1,723,245,203
+==22739== 
+==22739== Events    : Ir
+==22739== Collected : 1723276681
+==22739== 
+==22739== I   refs:      1,723,276,681
+==22750== 
+==22750== Events    : Ir
+==22750== Collected : 1723308295
+==22750== 
+==22750== I   refs:      1,723,308,295
+==22763== 
+==22763== Events    : Ir
+==22763== Collected : 1723338683
+==22763== 
+==22763== I   refs:      1,723,338,683
+==22781== 
+==22781== Events    : Ir
+==22781== Collected : 1723371678
+==22781== 
+==22781== I   refs:      1,723,371,678
+==22806== 
+==22806== Events    : Ir
+==22806== Collected : 1723403156
+==22806== 
+==22806== I   refs:      1,723,403,156
+==22829== 
+==22829== Events    : Ir
+==22829== Collected : 1723433673
+==22829== 
+==22829== I   refs:      1,723,433,673
+==22850== 
+==22850== Events    : Ir
+==22850== Collected : 1723466378
+==22850== 
+==22850== I   refs:      1,723,466,378
+ 1874745.2 µs  20 ok  {}
+path.store.open_existing                   229883.2 µs  3 ok  {}
+path.recovery.run                         1422380.4 µs  3 ok  {}
+path.response.serialize.session_list        11628.3 µs  20 ok  {}
+path.socket.bus.unsubscribe                 73699.9 µs  20 ok  {}
+path.socket.keystroke                       95818.0 µs  20 ok  {}
+path.pty.burst_1mib                      ==17960== brk segment overflow in thread #1: can't grow to 0x48f2000
+==17960== (see section Limitations in user manual)
+==17960== NOTE: further instances of this message will not be shown
+  210477.7 µs  1 ok  {}
+path.session.lifecycle                    4997130.8 µs  1 ok  {}
+path.guardrail.config_load                 200013.0 µs  20 ok  {}
+==17960== 
+==17960== Events    : Ir
+==17960== Collected : 1860808505
+==17960== 
+==17960== I   refs:      1,860,808,505

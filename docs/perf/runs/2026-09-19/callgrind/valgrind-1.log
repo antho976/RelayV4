@@ -1,0 +1,74 @@
+==17961== Callgrind, a call-graph generating cache profiler
+==17961== Copyright (C) 2002-2017, and GNU GPL'd, by Josef Weidendorfer et al.
+==17961== Using Valgrind-3.22.0 and LibVEX; rerun with -h for copyright info
+==17961== Command: /home/user/RelayV4/target/debug/examples/perf run op.bus.schema op.bus.whoami op.app.resources.get op.app.log.tail op.app.import.v3 op.audit.list op.workspace.create op.workspace.update op.project.clone op.project.update op.task.create op.task.list op.task.move op.task.link_commit op.task.detach op.task.label.add op.task.relate op.task.approve op.module.get op.module.complete op.module.restore op.notes.list op.notes.update op.notes.delete op.mailbox.send op.mailbox.outbox op.session.spawn op.session.park op.session.close.created op.session.claim op.session.list op.session.brief op.session.report op.session.input op.session.scrollback op.session.discard_restorable op.overlap.ack op.guardrail.gate.refused op.guardrail.hold.get op.guardrail.config.get op.guardrail.explain op.worktree.create op.git.status op.git.diff.file op.git.show op.git.branch.switch op.git.unstage op.git.push op.git.branch.clean_merged op.integration.get op.file.tree op.file.read.1mib op.file.create op.file.delete op.file.import op.device.list op.device.mirror.stop op.device.build op.device.signing.set_enabled op.avd.list op.avd.boot op.provider.update op.skill.list op.skill.delete op.github.status op.plugin.list op.notify.ack_all op.settings.get op.settings.reset op.ui.page.switch op.ui.pane.focus op.ui.layout.save op.ui.window.popout op.ui.toast path.store.open_fresh path.engine.startup path.request.parse_8k path.socket.bus.subscribe path.socket.task_list path.event.roundtrip path.pty.time_to_first_output path.worktree.status_files --callgrind --iters-div 10 --warmup 1 --out docs/perf/runs/2026-09-19/callgrind/rows-1.jsonl
+==17961== 
+==17961== For interactive control, run 'callgrind_control -h'.
+op.bus.schema                              144106.4 µs  20 ok  {}
+op.bus.schema.whole                       1645789.1 µs  3 ok  {}
+op.bus.whoami                              458144.2 µs  20 ok  {}
+op.app.resources.get                       129523.1 µs  20 ok  {}
+op.app.log.tail                             39961.2 µs  20 ok  {}
+op.app.import.v3                           167504.6 µs  0 ok  {"import.source":20}
+op.audit.list                              287315.9 µs  20 ok  {}
+op.workspace.create                        277945.9 µs  3 ok  {}
+op.workspace.update                        230160.0 µs  20 ok  {}
+op.project.clone                           592886.1 µs  1 ok  {}
+op.project.update                          236439.1 µs  20 ok  {}
+op.task.create                             447450.3 µs  20 ok  {}
+op.task.list                               420403.7 µs  20 ok  {}
+op.task.list.filtered                      320540.4 µs  20 ok  {}
+op.task.move                               407129.1 µs  20 ok  {}
+op.task.link_commit                        377989.2 µs  20 ok  {}
+op.task.detach                             361148.3 µs  20 ok  {}
+op.task.label.add                          368370.3 µs  20 ok  {}
+op.task.relate                             385310.1 µs  20 ok  {}
+op.task.approve                            298407.7 µs  0 ok  {"task.column_transition":20}
+op.module.get                              436379.7 µs  20 ok  {}
+op.module.complete                         243872.9 µs  20 ok  {}
+op.module.restore                          289814.3 µs  20 ok  {}
+op.notes.list                              186449.4 µs  20 ok  {}
+op.notes.update                            256025.5 µs  20 ok  {}
+op.notes.delete                            252566.9 µs  20 ok  {}
+op.mailbox.send                            299986.1 µs  3 ok  {}
+op.mailbox.send.priority                   342751.9 µs  3 ok  {}
+op.mailbox.outbox                          209931.5 µs  20 ok  {}
+op.session.spawn                          1528783.1 µs  1 ok  {}
+op.session.park                            255039.3 µs  1 ok  {}
+op.session.close.created                   959326.4 µs  3 ok  {}
+op.session.claim                           399959.3 µs  20 ok  {}
+op.session.list                            118902.8 µs  20 ok  {}
+op.session.list.all                        109984.1 µs  20 ok  {}
+op.session.brief                           649585.7 µs  20 ok  {}
+op.session.report                          394477.0 µs  20 ok  {}
+op.session.input                            50554.2 µs  20 ok  {}
+op.session.input.paste_4k                   46401.4 µs  20 ok  {}
+op.session.scrollback                      142331.1 µs  20 ok  {}
+op.session.scrollback.tail                  94540.6 µs  20 ok  {}
+op.session.discard_restorable              162821.6 µs  0 ok  {"session.state":20}
+op.overlap.ack                             372230.8 µs  1 ok  {}
+op.guardrail.gate.refused                  377346.1 µs  0 ok  {"guardrail.protected_path":3}
+op.guardrail.hold.get                      163364.5 µs  3 ok  {}
+op.guardrail.config.get                    231298.8 µs  20 ok  {}
+op.guardrail.explain                       477790.5 µs  20 ok  {}
+op.worktree.create                        1670431.7 µs  1 ok  {}
+op.git.status                              621953.7 µs  3 ok  {}
+op.git.diff.file                           354215.4 µs  3 ok  {}
+op.git.show                              ==17961== brk segment overflow in thread #1: can't grow to 0x4893000
+==17961== (see section Limitations in user manual)
+==17961== NOTE: further instances of this message will not be shown
+ 1026300.4 µs  3 ok  {}
+op.git.branch.switch                      1059606.7 µs  3 ok  {}
+op.git.unstage                             520210.7 µs  3 ok  {}
+op.git.push                                746727.7 µs  3 ok  {}
+op.git.branch.clean_merged                 703519.3 µs  3 ok  {}
+op.integration.get                         118782.4 µs  20 ok  {}
+op.file.tree                               533827.9 µs  3 ok  {}
+op.file.tree.deep                          985713.2 µs  3 ok  {}
+op.file.read.1mib                          402468.2 µs  3 ok  {}
+op.file.create                             563192.5 µs  20 ok  {}
+op.file.delete                             600705.1 µs  20 ok  {}
+op.file.import                             562599.6 µs  20 ok  {}
+op.device.list                              95012.3 µs  0 ok  {"device.adb_missing":3}
+op.device.mirror.stop                      157212.1 µs  0 ok  {"device.mirror_not_found":20}
+op.device.build                          
