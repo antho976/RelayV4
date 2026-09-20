@@ -143,6 +143,8 @@ struct Fixture {
     /// drained, uncounted, before the next iteration and after the loop, so the store a case
     /// sees is the fixture and not the residue of every case before it.
     cleanup: Mutex<Vec<(Actor, &'static str, Value)>>,
+    /// Threads a measured region started and must not wait for inside the measurement.
+    joins: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
 fn git(repo: &Path, args: &[&str]) {
@@ -280,6 +282,7 @@ impl Fixture {
             counter: AtomicUsize::new(0),
             scale,
             cleanup: Mutex::new(Vec::new()),
+            joins: Mutex::new(Vec::new()),
         };
         fx.populate();
         // The temp dir must outlive `keep`; leaking it is the point.
@@ -316,7 +319,14 @@ impl Fixture {
     fn close_later(&self, session: String) {
         self.later(Actor::User, "session.close", json!({"session": session, "remove_worktree": true}));
     }
+    fn join_later(&self, handle: std::thread::JoinHandle<()>) {
+        self.joins.lock().unwrap().push(handle);
+    }
     fn drain_cleanup(&self) {
+        let joins: Vec<std::thread::JoinHandle<()>> = std::mem::take(&mut *self.joins.lock().unwrap());
+        for handle in joins {
+            let _ = handle.join();
+        }
         let pending: Vec<(Actor, &'static str, Value)> = std::mem::take(&mut *self.cleanup.lock().unwrap());
         for (actor, op, payload) in pending {
             let _ = self.call(actor, op, payload);
@@ -1083,7 +1093,7 @@ fn cases() -> Vec<Case> {
         Box::new(move || {
             let store = Store::open(&path, false).unwrap();
             let engine = Engine::new(Instance::Test, store);
-            let _ = relay_core::recovery::run(&engine);
+            let _ = relay_core::recovery::run_with(&engine, relay_core::recovery::DirtyScan::Deferred);
             relay_core::skills::refresh_all(&engine);
             engine.shutdown();
             drop(engine);
@@ -1093,7 +1103,7 @@ fn cases() -> Vec<Case> {
     path_case(&mut c, "recovery.run", Mid, |fx| {
         let engine = Engine::new(Instance::Test, Store::open(&store_copy(fx), false).unwrap());
         Box::new(move || {
-            let r = relay_core::recovery::run(&engine);
+            let r = relay_core::recovery::run_with(&engine, relay_core::recovery::DirtyScan::Deferred);
             engine.shutdown();
             Outcome::plain(r.is_ok() as usize)
         })
@@ -1221,6 +1231,55 @@ fn cases() -> Vec<Case> {
             let name = spawned_session(&fx);
             fx.user("session.close", json!({"session": name}));
             Outcome::plain(0)
+        })
+    });
+    // What the shell pays while something else is running: the other op starts on a second
+    // thread, and the measured region is one request issued a few milliseconds into it. An op
+    // that holds the store mutex makes every locked request wait for all of it; a keystroke
+    // never waits (D148), a session list or a scrollback tail does.
+    let during = |c: &mut Vec<Case>, name: &str, other: &'static str, payload: Value, measured: &'static str, measured_payload: fn(&Fixture) -> Value| {
+        path_case(c, name, Mid, move |fx| {
+            let fx = fx.clone();
+            let runner = fx.clone();
+            let payload = payload.clone();
+            let running = std::thread::spawn(move || {
+                runner.call(Actor::User, other, payload);
+            });
+            std::thread::sleep(Duration::from_millis(5));
+            Box::new(move || {
+                let out = Outcome::of(&fx.call(Actor::User, measured, measured_payload(&fx)));
+                fx.join_later(running);
+                out
+            })
+        });
+    };
+    let keystroke = |fx: &Fixture| json!({"session": fx.builder, "data": "k"});
+    let tail = |fx: &Fixture| json!({"session": fx.builder, "lines": 20});
+    let sessions = |_: &Fixture| json!({"project_id": 1});
+    during(&mut c, "keystroke.during_overlap_scan", "overlap.scan", json!({"project_id": 1}), "session.input", keystroke);
+    during(&mut c, "keystroke.during_file_search", "file.search", json!({"project_id": 1, "query": "nothing-matches-this", "limit": 10}), "session.input", keystroke);
+    during(&mut c, "session_list.during_overlap_scan", "overlap.scan", json!({"project_id": 1}), "session.list", sessions);
+    during(&mut c, "session_list.during_file_search", "file.search", json!({"project_id": 1, "query": "nothing-matches-this", "limit": 10}), "session.list", sessions);
+    during(&mut c, "session_list.during_git_status", "git.status", json!({"project_id": 1}), "session.list", sessions);
+    during(&mut c, "session_list.during_task_list", "task.list", json!({"project_id": 1}), "session.list", sessions);
+    during(&mut c, "scrollback_tail.during_overlap_scan", "overlap.scan", json!({"project_id": 1}), "session.scrollback", tail);
+    during(&mut c, "scrollback_tail.during_device_build", "device.build", json!({"project_id": 1}), "session.scrollback", tail);
+    path_case(&mut c, "keystroke.during_busy_thread", Mid, |fx| {
+        // The control: a thread that only burns CPU for 30 ms, no engine involved.
+        let fx = fx.clone();
+        let busy = std::thread::spawn(|| {
+            let t0 = Instant::now();
+            let mut x = 0u64;
+            while t0.elapsed() < Duration::from_millis(30) {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+            }
+            std::hint::black_box(x);
+        });
+        std::thread::sleep(Duration::from_millis(5));
+        Box::new(move || {
+            let out = Outcome::of(&fx.call(Actor::User, "session.input", json!({"session": fx.builder, "data": "k"})));
+            fx.join_later(busy);
+            out
         })
     });
     path_case(&mut c, "worktree.dir_size", Mid, |fx| {

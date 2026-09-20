@@ -1203,6 +1203,30 @@ fn validate_branch_name(root: &Path, value: &str) -> Result<String, BusError> {
 fn git_mutation(code: &'static str) -> impl Fn(anyhow::Error) -> BusError {
     move |e| BusError::conflict(code, e.to_string())
 }
+/// The tips among `tips` that the base's ancestry reaches, from a single walk that ends as soon
+/// as the last of them is found — or when history runs out, which is the cost `git branch
+/// --merged` pays too.
+fn merged_tips(
+    repo: &gix::Repository,
+    head: Option<gix::ObjectId>,
+    tips: impl IntoIterator<Item = gix::ObjectId>,
+) -> std::collections::HashSet<gix::ObjectId> {
+    let mut pending: std::collections::HashSet<gix::ObjectId> = tips.into_iter().collect();
+    let mut merged = std::collections::HashSet::new();
+    let Some(head) = head else { return merged };
+    let Ok(walk) = repo.rev_walk([head]).all() else { return merged };
+    for info in walk {
+        let Ok(info) = info else { break };
+        if pending.remove(&info.id) {
+            merged.insert(info.id);
+        }
+        if pending.is_empty() {
+            break;
+        }
+    }
+    merged
+}
+
 fn gix_err<E: std::fmt::Display>(code: &'static str) -> impl Fn(E) -> BusError {
     move |e| BusError::unavailable(code, e.to_string())
 }
@@ -1211,7 +1235,9 @@ fn branches_for(
     tx: &Transaction,
     project: &relay_bus::types::Project,
 ) -> Result<BranchesOut, BusError> {
-    let repo = gix::open(&project.path).map_err(gix_err("git.open_failed"))?;
+    let mut repo = gix::open(&project.path).map_err(gix_err("git.open_failed"))?;
+    // Every walk below decompresses commits; without a cache each branch paid for its own.
+    repo.object_cache_size_if_unset(16 * 1024 * 1024);
     let current = repo
         .head_name()
         .ok()
@@ -1235,7 +1261,7 @@ fn branches_for(
         let (b, n) = row.bus()?;
         owners.insert(b, n);
     }
-    let mut branches = Vec::new();
+    let mut tips = Vec::new();
     let platform = repo.references().map_err(gix_err("git.branches_failed"))?;
     let refs = platform
         .local_branches()
@@ -1248,14 +1274,18 @@ fn branches_for(
             .to_string()
             .trim_start_matches("refs/heads/")
             .to_string();
-        let Some(id) = reference.try_id() else {
-            continue;
-        };
-        let merged = head
-            .as_ref()
-            .and_then(|h| repo.merge_base(*h, id.detach()).ok())
-            .map(|base| base.detach() == id.detach())
-            .unwrap_or(false);
+        if let Some(id) = reference.try_id() {
+            tips.push((name, id.detach()));
+        }
+    }
+    // One walk from the base, stopping once every tip has been seen, decides "merged" for all
+    // branches. A merge-base per branch was branches × distance to the base, with every
+    // commit on the way inflated once per branch: 520 ms and 545 MB for ~150 branches and 65
+    // commits (PERF §1.3).
+    let merged_tips = merged_tips(&repo, head, tips.iter().map(|(_, id)| *id));
+    let mut branches = Vec::new();
+    for (name, id) in tips {
+        let merged = merged_tips.contains(&id);
         let (upstream, ahead, behind) = upstream_metrics(&repo, &name);
         branches.push(Branch {
             name: name.clone(),

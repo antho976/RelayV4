@@ -20,7 +20,7 @@ pub async fn start(instance: Instance, store_path: Option<PathBuf>) -> Result<Se
     let path = store_path.unwrap_or_else(|| instance.store_path());
     let store = Store::open(&path, true).map_err(BindError::Other)?;
     let engine = Engine::new(instance, store);
-    if let Err(e) = crate::recovery::run(&engine) {
+    if let Err(e) = crate::recovery::run_with(&engine, crate::recovery::DirtyScan::Deferred) {
         tracing::warn!(error = %e, "crash recovery failed; continuing");
     }
     // Every checkout picks up the app-wide skill folders once at start, so a workspace that

@@ -35,7 +35,22 @@ fn kill_wait(pid: u32) {
 }
 
 /// Run once at engine start, before the doors open. Returns the report it also stored.
+/// When the dirty-worktree flagging (step 3) happens.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DirtyScan {
+    /// In the call, before the report is stored: what tests want.
+    Inline,
+    /// On a worker after the report is stored, filling `dirty_worktrees` in when it is done:
+    /// what `relay serve` wants, because the flag is advisory and the scan is a `git status`
+    /// per checkout, which was most of a 160 ms startup (PERF §1.5).
+    Deferred,
+}
+
 pub fn run(engine: &Engine) -> Result<RecoveryReport> {
+    run_with(engine, DirtyScan::Inline)
+}
+
+pub fn run_with(engine: &Engine, dirty_scan: DirtyScan) -> Result<RecoveryReport> {
     let now = crate::time::now();
     let instance = engine.instance.as_str();
     let mut report = RecoveryReport {
@@ -85,24 +100,12 @@ pub fn run(engine: &Engine) -> Result<RecoveryReport> {
                 .push(format!("session {name}: {state} → restorable ({why})"));
         }
     }
-    // 3. dirty worktrees per project (gix is_dirty; no spawn)
-    {
-        let mut st = tx.prepare_cached("SELECT path FROM projects")?;
-        let repos: Vec<String> = st.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
-        for repo in repos {
-            if let Ok(wts) = crate::worktree::list(Path::new(&repo)) {
-                for w in wts.into_iter().filter(|w| w.dirty) {
-                    // the primary checkout being dirty is normal; pooled ones with changes are worth a flag
-                    if w.path.starts_with(
-                        &crate::worktree::pool_dir(Path::new(&repo))
-                            .display()
-                            .to_string(),
-                    ) {
-                        report.dirty_worktrees.push(w.path);
-                    }
-                }
-            }
-        }
+    // 3. dirty worktrees per project: inline, or on a worker once the report is stored
+    let mut st = tx.prepare_cached("SELECT path FROM projects")?;
+    let repos: Vec<String> = st.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+    drop(st);
+    if dirty_scan == DirtyScan::Inline {
+        report.dirty_worktrees = dirty_worktrees(&repos);
     }
     // 4. requested device runs are process-backed and cannot survive an engine restart.
     //    Preserve the durable record, but close its lifecycle instead of showing it as live.
@@ -217,6 +220,31 @@ pub fn run(engine: &Engine) -> Result<RecoveryReport> {
         }
     }
     drop(conn);
+    if dirty_scan == DirtyScan::Deferred {
+        match engine.arc() {
+            Some(engine) => {
+                let mut deferred = report.clone();
+                std::thread::Builder::new()
+                    .name("recovery-dirty-scan".into())
+                    .spawn(move || {
+                        crate::background_priority();
+                        deferred.dirty_worktrees = dirty_worktrees(&repos);
+                        if deferred.dirty_worktrees.is_empty() {
+                            return;
+                        }
+                        if let Ok(json) = serde_json::to_string(&deferred) {
+                            let conn = engine.store.lock();
+                            let _ = conn.execute(
+                                "INSERT INTO meta(key, value) VALUES ('recovery.last', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                                [json],
+                            );
+                        }
+                    })
+                    .ok();
+            }
+            None => report.dirty_worktrees = dirty_worktrees(&repos),
+        }
+    }
     if !report.reaped_pids.is_empty() || !report.fsck_fixes.is_empty() {
         tracing::info!(
             reaped = report.reaped_pids.len(),
@@ -225,6 +253,19 @@ pub fn run(engine: &Engine) -> Result<RecoveryReport> {
         );
     }
     Ok(report)
+}
+
+/// Pooled checkouts with uncommitted changes. The primary checkout being dirty is normal;
+/// pooled ones with changes are worth a flag. A `git status` per checkout.
+fn dirty_worktrees(repos: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for repo in repos {
+        if let Ok(wts) = crate::worktree::list(Path::new(repo)) {
+            let pool = crate::worktree::pool_dir(Path::new(repo)).display().to_string();
+            out.extend(wts.into_iter().filter(|w| w.dirty && w.path.starts_with(&pool)).map(|w| w.path));
+        }
+    }
+    out
 }
 
 pub fn last(conn: &rusqlite::Connection) -> Result<Option<RecoveryReport>> {

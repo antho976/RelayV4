@@ -147,9 +147,8 @@ fn depth_of(tx: &Transaction, task_id: Id) -> rusqlite::Result<i64> {
     let mut depth = 0;
     let mut cursor = task_id;
     while let Some(parent) = tx
-        .query_row("SELECT parent_id FROM tasks WHERE id=?1", [cursor], |r| {
-            r.get::<_, Option<Id>>(0)
-        })
+        .prepare_cached("SELECT parent_id FROM tasks WHERE id=?1")?
+        .query_row([cursor], |r| r.get::<_, Option<Id>>(0))
         .optional()?
         .flatten()
     {
@@ -164,7 +163,7 @@ fn depth_of(tx: &Transaction, task_id: Id) -> rusqlite::Result<i64> {
 
 fn child_ids(tx: &Transaction, task_id: Id) -> Result<Vec<Id>, BusError> {
     let mut stmt = tx
-        .prepare(
+        .prepare_cached(
             "SELECT id FROM tasks WHERE parent_id=?1 AND deleted_at IS NULL ORDER BY position,id",
         )
         .bus()?;
@@ -225,6 +224,8 @@ fn attachment_row(row: &Row) -> rusqlite::Result<Attachment> {
     })
 }
 
+/// Every statement here is `prepare_cached`: a task list hydrates each row with seven of them,
+/// and compiling five of those per row was 61 % of `task.list` (PERF §1.2).
 pub(crate) fn row_task(tx: &Transaction, row: &Row) -> Result<Task, rusqlite::Error> {
     let id: Id = row.get("id")?;
     let sessions = {
@@ -258,14 +259,14 @@ pub(crate) fn row_task(tx: &Transaction, row: &Row) -> Result<Task, rusqlite::Er
         values
     };
     let labels = {
-        let mut stmt = tx.prepare("SELECT l.name FROM task_labels tl JOIN labels l ON l.id=tl.label_id WHERE tl.task_id=?1 ORDER BY l.name COLLATE NOCASE")?;
+        let mut stmt = tx.prepare_cached("SELECT l.name FROM task_labels tl JOIN labels l ON l.id=tl.label_id WHERE tl.task_id=?1 ORDER BY l.name COLLATE NOCASE")?;
         let values = stmt
             .query_map([id], |r| r.get(0))?
             .collect::<rusqlite::Result<Vec<String>>>()?;
         values
     };
     let edges = |sql: &str| -> rusqlite::Result<Vec<Id>> {
-        let mut stmt = tx.prepare(sql)?;
+        let mut stmt = tx.prepare_cached(sql)?;
         let values = stmt.query_map([id], |r| r.get(0))?.collect();
         values
     };
@@ -275,7 +276,7 @@ pub(crate) fn row_task(tx: &Transaction, row: &Row) -> Result<Task, rusqlite::Er
         .into_iter()
         .next();
     let children = {
-        let mut stmt = tx.prepare(
+        let mut stmt = tx.prepare_cached(
             "SELECT id FROM tasks WHERE parent_id=?1 AND deleted_at IS NULL ORDER BY position,id",
         )?;
         let values = stmt
@@ -293,9 +294,10 @@ pub(crate) fn row_task(tx: &Transaction, row: &Row) -> Result<Task, rusqlite::Er
             continue;
         }
         let (col, kids) = {
-            let column: String =
-                tx.query_row("SELECT col FROM tasks WHERE id=?1", [current], |r| r.get(0))?;
-            let mut stmt = tx.prepare(
+            let column: String = tx
+                .prepare_cached("SELECT col FROM tasks WHERE id=?1")?
+                .query_row([current], |r| r.get(0))?;
+            let mut stmt = tx.prepare_cached(
                 "SELECT id FROM tasks WHERE parent_id=?1 AND deleted_at IS NULL ORDER BY position,id",
             )?;
             let kids = stmt
@@ -827,7 +829,9 @@ pub fn register(e: &mut Engine) {
             "updated" => sql.push_str(" ORDER BY updated_at DESC,id DESC"),
             _ => sql.push_str(" ORDER BY CASE col WHEN 'backlog' THEN 0 WHEN 'in_review' THEN 1 WHEN 'ready' THEN 2 WHEN 'active' THEN 3 ELSE 4 END,position,id"),
         }
-        let mut stmt=ctx.tx().prepare(&sql).bus()?;
+        // A dozen filter shapes at most, and the store's statement cache holds 128: the built
+        // statement is compiled once per shape, not once per call.
+        let mut stmt=ctx.tx().prepare_cached(&sql).bus()?;
         let mut rows=stmt.query(rusqlite::params_from_iter(args.iter().map(|v| v.as_ref()))).bus()?;
         let mut tasks=Vec::new();
         while let Some(row)=rows.next().bus()? { tasks.push(row_task(ctx.tx(), row).bus()?); }
@@ -1203,7 +1207,7 @@ pub fn register(e: &mut Engine) {
         crate::handlers::workspace::get_project(ctx.tx(), p.project_id)?;
         let mut stmt = ctx
             .tx()
-            .prepare("SELECT id,project_id,name,created_at FROM labels WHERE project_id=?1 ORDER BY name COLLATE NOCASE")
+            .prepare_cached("SELECT id,project_id,name,created_at FROM labels WHERE project_id=?1 ORDER BY name COLLATE NOCASE")
             .bus()?;
         let labels = stmt
             .query_map([p.project_id], |r| {

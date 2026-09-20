@@ -62,11 +62,17 @@ fn list(tx: &Transaction, project_id: Id) -> Result<Vec<Overlap>, BusError> {
 }
 
 fn actor_session(ctx: &Ctx, project_id: Id) -> Result<crate::sessions::Row_, BusError> {
-    let id = ctx
-        .actor_session_id()
+    actor_session_in(ctx.tx(), ctx.actor_session_id(), project_id)
+}
+
+fn actor_session_in(
+    conn: &rusqlite::Connection,
+    session_id: Option<Id>,
+    project_id: Id,
+) -> Result<crate::sessions::Row_, BusError> {
+    let id = session_id
         .ok_or_else(|| BusError::actor("overlap mutation requires a bound agent session"))?;
-    let row =
-        sessions::by_id(ctx.tx(), id)?.ok_or_else(|| BusError::actor("bound session vanished"))?;
+    let row = sessions::by_id(conn, id)?.ok_or_else(|| BusError::actor("bound session vanished"))?;
     if row.session.project_id != project_id {
         return Err(BusError::not_own("project"));
     }
@@ -270,25 +276,31 @@ fn fingerprint(project_id: Id, finding: &Finding) -> String {
     hash_hex(raw.as_bytes())
 }
 
-fn scan_project(tx: &Transaction, project_id: Id, now: &str) -> Result<Vec<Overlap>, BusError> {
-    crate::handlers::workspace::get_project(tx, project_id)?;
-    let mut stmt = tx.prepare_cached(
-        "SELECT id, name, worktree FROM sessions WHERE project_id=?1 AND state!='closed' ORDER BY name, id",
+/// Per session: the files its checkout changed, and per changed file the symbols that differ
+/// from HEAD.
+type Changes = BTreeMap<String, (BTreeSet<String>, BTreeMap<String, BTreeSet<String>>)>;
+
+/// The store half of a scan: which live checkouts to read. Cheap.
+fn scan_targets(conn: &rusqlite::Connection, project_id: Id) -> Result<Vec<(String, String)>, BusError> {
+    crate::handlers::workspace::get_project(conn, project_id)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT name, worktree FROM sessions WHERE project_id=?1 AND state!='closed' ORDER BY name, id",
     ).bus()?;
-    let sessions = stmt
-        .query_map([project_id], |r| {
-            Ok((
-                r.get::<_, Id>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        })
+    let rows = stmt
+        .query_map([project_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
         .bus()?
         .collect::<rusqlite::Result<Vec<_>>>()
         .bus()?;
-    let mut changes =
-        BTreeMap::<String, (BTreeSet<String>, BTreeMap<String, BTreeSet<String>>)>::new();
-    for (_, name, worktree) in &sessions {
+    Ok(rows)
+}
+
+/// The expensive half, and the reason both callers are staged: a status of every checkout and
+/// a parse of every changed file. It ran inside the transaction, so a flag from one agent held
+/// the store mutex — and every keystroke — for 30 ms with two sessions and for seconds with a
+/// busy wall (PERF §1.1). Now it runs with no lock held (BUS.md §5.1, D149).
+fn collect_changes(targets: &[(String, String)]) -> Result<Changes, BusError> {
+    let mut changes = Changes::new();
+    for (name, worktree) in targets {
         let path = Path::new(worktree);
         if !path.is_dir() {
             continue;
@@ -297,7 +309,13 @@ fn scan_project(tx: &Transaction, project_id: Id, now: &str) -> Result<Vec<Overl
         let symbols = changed_symbols(path, &files);
         changes.insert(name.clone(), (files, symbols));
     }
+    Ok(changes)
+}
 
+/// The store half again: cross the collected changes with the claims and write the findings.
+/// A session that closed while the scan ran simply has no row to collide with.
+fn apply_scan(tx: &Transaction, project_id: Id, now: &str, changes: Changes) -> Result<Vec<Overlap>, BusError> {
+    crate::handlers::workspace::get_project(tx, project_id)?;
     let mut findings = BTreeMap::<String, Finding>::new();
     let names = changes.keys().cloned().collect::<Vec<_>>();
     for left in 0..names.len() {
@@ -434,23 +452,34 @@ pub fn register(e: &mut Engine) {
             overlaps: list(ctx.tx(), p.project_id)?,
         })
     });
-    e.register::<Flag>(|ctx: &mut Ctx, p| {
-        let own = actor_session(ctx, p.project_id)?;
-        let path = relative_path(&p.path)?;
-        let symbol = p.symbol.unwrap_or_default().trim().to_string();
-        ctx.tx().execute(
-            "INSERT INTO claims(project_id, session_id, session, path, symbol, note, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
-             ON CONFLICT(session_id, path, symbol) DO UPDATE SET note=excluded.note, updated_at=excluded.updated_at",
-            params![p.project_id, own.session.id, own.session.name, path, symbol, p.note, ctx.now],
-        ).bus()?;
-        let overlaps = scan_project(ctx.tx(), p.project_id, &ctx.now)?;
-        let overlap = overlaps.into_iter().find(|overlap| overlap.kind == OverlapKind::Claim && overlap.path == path && overlap.sessions.contains(&own.session.name))
-            .ok_or_else(|| BusError::internal("claim did not produce an overlap row"))?;
-        ctx.set_project(p.project_id);
-        ctx.emit("overlap.changed", serde_json::to_value(&overlap).bus()?);
-        Ok(overlap)
-    });
+    e.register_staged::<Flag, Changes>(
+        |ctx, p| {
+            let session_id = ctx.actor_session_id();
+            relative_path(&p.path)?;
+            let targets = ctx.read(|conn| {
+                actor_session_in(conn, session_id, p.project_id)?;
+                scan_targets(conn, p.project_id)
+            })?;
+            collect_changes(&targets)
+        },
+        |ctx: &mut Ctx, p, changes| {
+            let own = actor_session(ctx, p.project_id)?;
+            let path = relative_path(&p.path)?;
+            let symbol = p.symbol.unwrap_or_default().trim().to_string();
+            ctx.tx().execute(
+                "INSERT INTO claims(project_id, session_id, session, path, symbol, note, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+                 ON CONFLICT(session_id, path, symbol) DO UPDATE SET note=excluded.note, updated_at=excluded.updated_at",
+                params![p.project_id, own.session.id, own.session.name, path, symbol, p.note, ctx.now],
+            ).bus()?;
+            let overlaps = apply_scan(ctx.tx(), p.project_id, &ctx.now, changes)?;
+            let overlap = overlaps.into_iter().find(|overlap| overlap.kind == OverlapKind::Claim && overlap.path == path && overlap.sessions.contains(&own.session.name))
+                .ok_or_else(|| BusError::internal("claim did not produce an overlap row"))?;
+            ctx.set_project(p.project_id);
+            ctx.emit("overlap.changed", serde_json::to_value(&overlap).bus()?);
+            Ok(overlap)
+        },
+    );
     e.register::<Ack>(|ctx: &mut Ctx, p| {
         let project_id: Id = ctx
             .tx()
@@ -499,13 +528,19 @@ pub fn register(e: &mut Engine) {
         ctx.emit("overlap.changed", serde_json::to_value(&overlap).bus()?);
         Ok(overlap)
     });
-    e.register::<Scan>(|ctx: &mut Ctx, p| {
-        let overlaps = scan_project(ctx.tx(), p.project_id, &ctx.now)?;
-        ctx.set_project(p.project_id);
-        ctx.emit(
-            "overlap.changed",
-            serde_json::json!({"project_id":p.project_id, "count":overlaps.len()}),
-        );
-        Ok(ListOut { overlaps })
-    });
+    e.register_staged::<Scan, Changes>(
+        |ctx, p| {
+            let targets = ctx.read(|conn| scan_targets(conn, p.project_id))?;
+            collect_changes(&targets)
+        },
+        |ctx: &mut Ctx, p, changes| {
+            let overlaps = apply_scan(ctx.tx(), p.project_id, &ctx.now, changes)?;
+            ctx.set_project(p.project_id);
+            ctx.emit(
+                "overlap.changed",
+                serde_json::json!({"project_id":p.project_id, "count":overlaps.len()}),
+            );
+            Ok(ListOut { overlaps })
+        },
+    );
 }

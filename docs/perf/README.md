@@ -3,6 +3,8 @@
 `BASELINE-<date>.md` is the reading: every path in the application, what it costs, where the
 cost goes, and whether that is the work or overhead. `runs/<date>/` is the evidence behind
 one reading: JSON from the harness and the generated `report.md` with every table.
+`FIXES-<date>.md` records what was changed after a reading, with the same scenarios measured
+before and after.
 
 ## Rerun
 
