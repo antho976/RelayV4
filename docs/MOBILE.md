@@ -23,7 +23,13 @@ With an engine running (`relay serve`, or the desktop app):
 relay remote serve --pair
 ```
 
-That listens on `0.0.0.0:7420` for phones on the network, opens a ten-minute pairing window
+Or start both in one process, which is what a login service wants:
+
+```fish
+relay serve --remote            # engine + phone door; `deploy/relay-remote.service` runs this
+```
+
+`relay remote serve` listens on `0.0.0.0:7420` for phones on the network, opens a ten-minute pairing window
 and prints a QR code. Scan it from the app's **PC** tab. To pair another phone later, in a
 second terminal:
 
@@ -56,6 +62,11 @@ Tailscale node):
 ```fish
 relay remote rendezvous --bind 0.0.0.0:7430
 ```
+
+`deploy/rendezvous.Dockerfile` builds it as a container and `deploy/relay-rendezvous.service`
+runs the binary under systemd; both bind loopback and expect a TLS proxy in front. The PC
+pings the server every 30 s and redials after 90 s of silence, so a dropped NAT flow does not
+leave phones told "offline" for long.
 
 Put TLS in front of it. The phone sends its pairing code and, once, receives its token over
 this link; `wss://` keeps that between the phone and the PC. A Caddyfile is enough:
@@ -93,6 +104,15 @@ Everything goes through existing bus ops, so the list is the bus's:
   priority, which reaches a busy agent at its next bus call.
 - **Sessions**: the wall as a list with Relay's lamps; open one for its terminal
   (`session.scrollback` + `session.attach`), type to it (`session.input`), park, wake, resume.
+- **Board**: `task.list` by column; `task.approve` from in review, `task.dispatch` from
+  backlog or ready.
+- **Changes**: a session's worktree through `git.status`, `git.diff` and `git.diff.file`.
+- **Needs you, while away**: the phone turns `guardrail.held` and `notify.new`
+  (`agent_done`, `agent_blocked`) into local notifications when the app is in the background.
+  They ride the same socket; no push service is involved.
+- **On-device summary**: the phone's own model reads a terminal's text and says what the
+  agent did. Nothing is sent anywhere; the PC is not involved beyond the output it already
+  streamed.
 - **Needs you**: open guardrail holds with *Allow once* / *Deny* (`guardrail.confirm` /
   `guardrail.reject`), unread notifications, the count of tasks in review.
 - The phone's own chats and on-device models never touch this link.

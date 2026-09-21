@@ -72,6 +72,61 @@ fn print_pair_link(link: &PairLink) {
     println!("\nScan the code from the Relay app's PC tab, or type the link:\n{}\n", link.to_url());
 }
 
+/// `relay serve --remote`: the engine and its phone door in one process, so a machine that
+/// starts Relay at login is reachable from the phone without a second command.
+pub async fn serve_with_door(
+    instance: Instance,
+    store: Option<std::path::PathBuf>,
+    bind: &str,
+) -> std::result::Result<(), relay_core::socket::BindError> {
+    let addr: SocketAddr = bind
+        .parse()
+        .with_context(|| format!("bad --remote-bind {bind:?}"))
+        .map_err(relay_core::socket::BindError::Other)?;
+    let served = relay_core::serve::start(instance, store).await?;
+    tracing::info!(instance = %instance, store = %served.engine.store.path().display(), "engine up");
+    let ctx = Arc::new(Ctx {
+        instance,
+        registry_path: Registry::path_for(instance),
+        socket_path: served.socket.path.clone(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    });
+    let door = DirectServer::bind(ctx.clone(), addr)
+        .await
+        .map_err(relay_core::socket::BindError::Other)?;
+    let mut registry = Registry::load(&ctx.registry_path).map_err(relay_core::socket::BindError::Other)?;
+    registry.direct_port = Some(door.local_addr.port());
+    registry.save(&ctx.registry_path).map_err(relay_core::socket::BindError::Other)?;
+    let tunnel = registry
+        .rendezvous
+        .as_ref()
+        .map(|r| relay_remote::tunnel::spawn(ctx.clone(), r.clone()));
+    println!("relay serve: phone door on {} ({}); `relay remote pair` adds a phone", door.local_addr,
+        match &registry.rendezvous { Some(r) => format!("dialing {}", r.url), None => "no rendezvous".to_string() });
+    let quit = served.engine.clone();
+    tokio::select! {
+        _ = quit.wait_quit() => tracing::info!("app.quit received"),
+        _ = tokio::signal::ctrl_c() => tracing::info!("SIGINT"),
+        _ = sigterm() => tracing::info!("SIGTERM"),
+    }
+    if let Some(t) = tunnel {
+        t.abort();
+    }
+    drop(door);
+    served.engine.shutdown();
+    drop(served);
+    Ok(())
+}
+
+async fn sigterm() {
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(mut s) => {
+            s.recv().await;
+        }
+        Err(_) => std::future::pending::<()>().await,
+    }
+}
+
 pub async fn run(instance: Instance, cmd: RemoteCommand) -> Result<u8> {
     let ctx = Arc::new(Ctx::for_instance(instance));
     match cmd {

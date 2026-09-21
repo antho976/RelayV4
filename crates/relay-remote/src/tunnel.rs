@@ -45,6 +45,12 @@ pub fn spawn(ctx: Arc<Ctx>, rendezvous: Rendezvous) -> JoinHandle<()> {
     })
 }
 
+/// How often the host pings the server, and how long silence may last before the socket is
+/// declared dead. A NAT or a mobile hop that drops the connection without a FIN would
+/// otherwise leave the host believing it is reachable while every phone is told "offline".
+const PING_EVERY: Duration = Duration::from_secs(30);
+const SILENCE_LIMIT: Duration = Duration::from_secs(90);
+
 /// One connection's lifetime. `Ok` means the server closed cleanly.
 pub async fn connect_once(ctx: Arc<Ctx>, rendezvous: &Rendezvous) -> Result<()> {
     let url = host_url(rendezvous);
@@ -54,18 +60,39 @@ pub async fn connect_once(ctx: Arc<Ctx>, rendezvous: &Rendezvous) -> Result<()> 
     tracing::info!(url = %rendezvous.url, room = %rendezvous.room, "rendezvous connected");
     let (mut sink, mut source) = ws.split();
 
-    // Every lane's outbound lines funnel through one sender to the socket.
-    let (to_server, mut from_lanes) = mpsc::channel::<String>(1024);
+    // Every lane's outbound lines funnel through one sender to the socket, pings included.
+    let (to_server, mut from_lanes) = mpsc::channel::<Message>(1024);
     let writer = tokio::spawn(async move {
-        while let Some(line) = from_lanes.recv().await {
-            if sink.send(Message::text(line)).await.is_err() {
+        while let Some(msg) = from_lanes.recv().await {
+            if sink.send(msg).await.is_err() {
                 break;
             }
         }
     });
 
     let mut lanes: HashMap<String, (mpsc::Sender<String>, JoinHandle<()>)> = HashMap::new();
-    while let Some(msg) = source.next().await {
+    let mut ping = tokio::time::interval(PING_EVERY);
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_heard = tokio::time::Instant::now();
+    loop {
+        let msg = tokio::select! {
+            next = source.next() => next,
+            _ = ping.tick() => {
+                if last_heard.elapsed() > SILENCE_LIMIT {
+                    for (_, (_, task)) in lanes.drain() {
+                        task.abort();
+                    }
+                    writer.abort();
+                    anyhow::bail!("no traffic from the rendezvous for {}s", SILENCE_LIMIT.as_secs());
+                }
+                if to_server.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    break;
+                }
+                continue;
+            }
+        };
+        let Some(msg) = msg else { break };
+        last_heard = tokio::time::Instant::now();
         let text = match msg {
             Ok(Message::Text(t)) => t.to_string(),
             Ok(Message::Close(_)) => break,
@@ -94,7 +121,8 @@ pub async fn connect_once(ctx: Arc<Ctx>, rendezvous: &Rendezvous) -> Result<()> 
                         let id = id.clone();
                         tokio::spawn(async move {
                             while let Some(l) = out_rx.recv().await {
-                                if to_server.send(Lane::Data { c: id.clone(), l }.to_line()).await.is_err() {
+                                let line = Lane::Data { c: id.clone(), l }.to_line();
+                                if to_server.send(Message::text(line)).await.is_err() {
                                     break;
                                 }
                             }
@@ -104,7 +132,7 @@ pub async fn connect_once(ctx: Arc<Ctx>, rendezvous: &Rendezvous) -> Result<()> 
                         tracing::debug!(lane = %id, error = %e, "lane ended");
                     }
                     let _ = forward.await;
-                    let _ = to_server.send(Lane::Close { c: id }.to_line()).await;
+                    let _ = to_server.send(Message::text(Lane::Close { c: id }.to_line())).await;
                 });
                 lanes.insert(c, (in_tx, task));
             }

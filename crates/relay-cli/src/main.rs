@@ -58,6 +58,12 @@ enum Command {
     Serve {
         #[arg(long)]
         store: Option<PathBuf>,
+        /// Also open the phone door (`relay remote serve`) in this process
+        #[arg(long)]
+        remote: bool,
+        /// Address the phone door listens on, with --remote
+        #[arg(long, default_value_t = format!("0.0.0.0:{}", relay_remote::DEFAULT_PORT))]
+        remote_bind: String,
     },
     /// Serve callable bus ops as MCP tools over stdio
     Mcp,
@@ -187,7 +193,7 @@ async fn connect(instance: Instance) -> Result<Client> {
 async fn run(cli: Cli) -> Result<u8> {
     let instance = Instance::parse(&cli.instance).ok_or_else(|| anyhow!("bad --instance {:?}", cli.instance))?;
     match cli.cmd {
-        Command::Serve { store } => {
+        Command::Serve { store, remote, remote_bind } => {
             // The engine outlives launcher worktrees. Git libraries and remote helpers
             // still consult process CWD even when given absolute repository paths.
             let store = store.map(std::path::absolute).transpose()?;
@@ -196,7 +202,12 @@ async fn run(cli: Cli) -> Result<u8> {
             tracing_subscriber::fmt()
                 .with_env_filter(tracing_subscriber::EnvFilter::try_from_env("RELAY_LOG").unwrap_or_else(|_| "info".into()))
                 .init();
-            match relay_core::serve::serve(instance, store).await {
+            let served = if remote {
+                remote::serve_with_door(instance, store, &remote_bind).await
+            } else {
+                relay_core::serve::serve(instance, store).await
+            };
+            match served {
                 Ok(()) => Ok(0),
                 Err(relay_core::socket::BindError::AlreadyRunning { instance, pid, socket }) => {
                     eprintln!("relay: engine already running for instance {instance} (pid {}) at {}", pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into()), socket.display());
