@@ -91,18 +91,28 @@ pub async fn serve_with_door(
         socket_path: served.socket.path.clone(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     });
-    let door = DirectServer::bind(ctx.clone(), addr)
-        .await
-        .map_err(relay_core::socket::BindError::Other)?;
+    // The door is a convenience on top of the engine, never a reason for the engine not to
+    // start: a port already taken by another instance's door is logged and skipped.
+    let door = match DirectServer::bind(ctx.clone(), addr).await {
+        Ok(door) => Some(door),
+        Err(e) => {
+            eprintln!("relay serve: phone door not opened ({e:#}); the engine runs without it — `relay remote serve --bind <addr>` opens one later");
+            None
+        }
+    };
     let mut registry = Registry::load(&ctx.registry_path).map_err(relay_core::socket::BindError::Other)?;
-    registry.direct_port = Some(door.local_addr.port());
+    if let Some(door) = &door {
+        registry.direct_port = Some(door.local_addr.port());
+    }
     registry.save(&ctx.registry_path).map_err(relay_core::socket::BindError::Other)?;
     let tunnel = registry
         .rendezvous
         .as_ref()
         .map(|r| relay_remote::tunnel::spawn(ctx.clone(), r.clone()));
-    println!("relay serve: phone door on {} ({}); `relay remote pair` adds a phone", door.local_addr,
-        match &registry.rendezvous { Some(r) => format!("dialing {}", r.url), None => "no rendezvous".to_string() });
+    if let Some(door) = &door {
+        println!("relay serve: phone door on {} ({}); `relay remote pair` adds a phone", door.local_addr,
+            match &registry.rendezvous { Some(r) => format!("dialing {}", r.url), None => "no rendezvous".to_string() });
+    }
     let quit = served.engine.clone();
     tokio::select! {
         _ = quit.wait_quit() => tracing::info!("app.quit received"),
