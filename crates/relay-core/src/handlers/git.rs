@@ -81,6 +81,8 @@ pub fn list_with_owners(
 
 /// How long the paginated GitHub lookup may take before Relay stops waiting on the network.
 const PR_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// `gh pr create` may push first, so it gets the same budget as a push.
+const PR_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 pub fn register(e: &mut Engine) {
     e.register_unlocked::<WorktreeList>(|ctx, p| {
@@ -583,33 +585,47 @@ pub fn register(e: &mut Engine) {
         let gh = crate::github::gh_path()?;
         list_pull_requests(&gh, Path::new(&project.path))
     });
-    e.register::<PrOpen>(|ctx: &mut Ctx, p| {
-        let (project, root) = resolve_root(ctx, p.project_id, p.worktree.as_deref())?;
-        let gh = crate::github::gh_path()?;
-        let mut cmd = std::process::Command::new(gh);
-        cmd.current_dir(&root).args(["pr", "create"]);
-        if let Some(title) = &p.title {
-            cmd.args(["--title", title]);
-        }
-        if let Some(body) = &p.body {
-            cmd.args(["--body", body]);
-        } else {
-            cmd.arg("--fill");
-        }
-        let out = cmd
-            .output()
-            .map_err(|e| BusError::unavailable("git.gh_unavailable", e.to_string()))?;
-        if !out.status.success() {
-            return Err(BusError::conflict(
-                "git.pr_failed",
-                String::from_utf8_lossy(&out.stderr).trim().to_string(),
-            ));
-        }
-        changed(ctx, project.id, &root);
-        Ok(PrOpenOut {
-            url: String::from_utf8_lossy(&out.stdout).trim().to_string(),
-        })
-    });
+    // `gh pr create` pushes the branch when it has no upstream and then talks to github.com:
+    // it is the network twice over, so it runs before the transaction opens, like `git.push`.
+    e.register_staged::<PrOpen, _>(
+        |ctx, p| {
+            let (project, root) = resolve_root_unlocked(ctx, p.project_id, p.worktree.as_deref())?;
+            let gh = crate::github::gh_path()?;
+            let mut cmd = std::process::Command::new(gh);
+            cmd.current_dir(&root)
+                .args(["pr", "create"])
+                .env("GH_PROMPT_DISABLED", "1")
+                .env("GIT_TERMINAL_PROMPT", "0");
+            if let Some(title) = &p.title {
+                cmd.args(["--title", title]);
+            }
+            if let Some(body) = &p.body {
+                cmd.args(["--body", body]);
+            } else {
+                cmd.arg("--fill");
+            }
+            let out = crate::proc::output_with_timeout(&mut cmd, PR_OPEN_TIMEOUT)
+                .map_err(|e| BusError::unavailable("git.gh_unavailable", e.to_string()))?
+                .ok_or_else(|| {
+                    BusError::unavailable(
+                        "git.pr_timeout",
+                        format!("gh did not finish within {}s", PR_OPEN_TIMEOUT.as_secs()),
+                    )
+                })?;
+            if !out.status.success() {
+                return Err(BusError::conflict(
+                    "git.pr_failed",
+                    String::from_utf8_lossy(&out.stderr).trim().to_string(),
+                ));
+            }
+            let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            Ok((project, root, url))
+        },
+        |ctx: &mut Ctx, _p, (project, root, url)| {
+            changed(ctx, project.id, &root);
+            Ok(PrOpenOut { url })
+        },
+    );
     e.register::<CleanMerged>(|ctx: &mut Ctx, p| {
         let project = get_project(ctx.tx(), p.project_id)?;
         let branches = branches_for(ctx.tx(), &project)?;
