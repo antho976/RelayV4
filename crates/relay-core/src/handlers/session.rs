@@ -534,6 +534,23 @@ fn launch(ctx: &mut Ctx, row: &Row_, kind: LaunchKind) -> Result<Session, BusErr
     Ok(updated.session)
 }
 
+/// Whether `worktree` is one of Relay's pooled checkouts under `repo`, i.e. one a close may
+/// delete. The primary checkout and a user-supplied path are never removed.
+fn pooled_under(repo: &Path, worktree: &Path) -> bool {
+    worktree.starts_with(worktree::pool_dir(repo))
+}
+
+/// The slow half of closing a session: delete its pooled checkout. Runs after the commit that
+/// closed the row, with nothing locked (D144) — the tree walk and `rm -rf` of a `target/` took
+/// seconds to minutes with the store mutex held, and every keystroke waited on it. The PTY was
+/// killed inside the transaction, so nothing is writing into the directory any more.
+fn remove_worktree_after_commit(engine: &Engine, project_id: Id, session: &str, repo: &Path, wt: &Path, purge: bool) {
+    if let Err(error) = worktree::remove(repo, wt, purge) {
+        tracing::warn!(session, worktree = %wt.display(), %error, "removing a closed session's worktree");
+    }
+    engine.emit_system("worktree.changed", json!({ "project_id": project_id }));
+}
+
 /// Mirror the session state we just persisted onto its live PTY. `session.input` reads this
 /// instead of the session row, so the idle→running edge still produces exactly one write while
 /// every other keystroke stays off the store entirely (D148).
@@ -1317,8 +1334,9 @@ pub fn register(e: &mut Engine) {
             if ctx.tx().query_row("SELECT EXISTS(SELECT 1 FROM sessions WHERE worktree=?1 AND provider='codex')", [&s.worktree], |r| r.get::<_,bool>(0)).bus()? {
                 crate::hooks::uninstall_codex(wt).bus()?;
             }
-            if wt.starts_with(worktree::pool_dir(repo)) {
-                worktree::remove(repo, wt, true).map_err(|error| BusError::conflict("worktree.remove_failed", error.to_string()))?;
+            if pooled_under(repo, wt) {
+                let (repo, wt, project_id, name) = (repo.to_path_buf(), wt.to_path_buf(), s.project_id, s.name.clone());
+                ctx.after_commit(move |engine| remove_worktree_after_commit(&engine, project_id, &name, &repo, &wt, true));
             }
         }
         ctx.tx().execute("UPDATE sessions SET state='closed',pid=NULL,closed_at=?1,updated_at=?1 WHERE id=?2", params![ctx.now,s.id]).bus()?;
@@ -1331,7 +1349,22 @@ pub fn register(e: &mut Engine) {
         Ok(Empty {})
     });
 
-    e.register::<Close>(|ctx: &mut Ctx, p| {
+    e.register_staged::<Close, _>(|ctx, p| {
+        // What the close will free, measured with nothing locked. The deletion itself waits
+        // for the commit (the PTY must be dead and the row closed first); the walk is the
+        // only part of it that has a result to report, so it happens here.
+        let (project, worktree) = ctx.read(|conn| {
+            let row = sessions::by_name(conn, &p.session)?;
+            let project = crate::handlers::workspace::get_project(conn, row.session.project_id)?;
+            Ok((project, PathBuf::from(&row.session.worktree)))
+        })?;
+        let freed = if p.remove_worktree.unwrap_or(true) && pooled_under(Path::new(&project.path), &worktree) {
+            worktree::dir_size(&worktree)
+        } else {
+            0
+        };
+        Ok(freed)
+    }, |ctx: &mut Ctx, p, freed: u64| {
         let row = sessions::by_name(ctx.tx(), &p.session)?;
         let s = &row.session;
         let project = crate::handlers::workspace::get_project(ctx.tx(), s.project_id)?;
@@ -1354,7 +1387,6 @@ pub fn register(e: &mut Engine) {
                 ctx.after_commit(move |_| pty.kill(Duration::from_millis(150)));
             }
         }
-        let mut freed = 0u64;
         let repo = Path::new(&project.path);
         let wt = Path::new(&s.worktree);
         let other_sessions: i64 = ctx.tx().query_row(
@@ -1378,10 +1410,10 @@ pub fn register(e: &mut Engine) {
                 crate::hooks::uninstall_codex(wt).bus()?;
             }
         }
-        let pooled = wt.starts_with(worktree::pool_dir(repo));
-        if pooled && p.remove_worktree.unwrap_or(true) {
-            freed = worktree::remove(repo, wt, p.purge_build.unwrap_or(true))
-                .map_err(|e| BusError::conflict("worktree.remove_failed", e.to_string()))?;
+        if pooled_under(repo, wt) && p.remove_worktree.unwrap_or(true) {
+            let (repo, wt, purge) = (repo.to_path_buf(), wt.to_path_buf(), p.purge_build.unwrap_or(true));
+            let (project_id, name) = (project.id, s.name.clone());
+            ctx.after_commit(move |engine| remove_worktree_after_commit(&engine, project_id, &name, &repo, &wt, purge));
         }
         // The generated hook directory outlives nothing: leaving one per dead session behind
         // makes `.relay/hooks` read like a fleet that never shut down.

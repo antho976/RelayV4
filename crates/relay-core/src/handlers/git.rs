@@ -128,22 +128,31 @@ pub fn register(e: &mut Engine) {
             Ok(wt)
         },
     );
-    e.register::<WorktreeRemove>(|ctx: &mut Ctx, p| {
-        let project = get_project(ctx.tx(), p.project_id)?;
-        let repo = Path::new(&project.path);
-        let want = std::fs::canonicalize(&p.path).map(|c| c.display().to_string()).unwrap_or(p.path.clone());
-        let owner: Option<String> = ctx.tx().query_row(
-            "SELECT name FROM sessions WHERE project_id = ?1 AND worktree = ?2 AND state != 'closed'",
-            rusqlite::params![project.id, want], |r| r.get(0)).ok();
-        if let Some(name) = owner {
-            return Err(BusError::conflict("worktree.owned", format!("session {name} owns {want}")).with_hint("session.close it first"));
-        }
-        let freed = worktree::remove(repo, Path::new(&want), p.purge_build.unwrap_or(true))
-            .map_err(|e| BusError::conflict("worktree.remove_failed", e.to_string()))?;
-        ctx.set_project(project.id);
-        ctx.emit("worktree.changed", json!({ "project_id": project.id }));
-        Ok(FreedOut { freed_mb: freed as f64 / (1024.0 * 1024.0) })
-    });
+    // Removing a checkout walks and deletes its whole tree; that is the prepare phase, with
+    // nothing locked (D144). The transaction only announces the result.
+    e.register_staged::<WorktreeRemove, _>(
+        |ctx, p| {
+            let want = std::fs::canonicalize(&p.path).map(|c| c.display().to_string()).unwrap_or(p.path.clone());
+            let project = ctx.read(|conn| {
+                let project = get_project(conn, p.project_id)?;
+                let owner: Option<String> = conn.query_row(
+                    "SELECT name FROM sessions WHERE project_id = ?1 AND worktree = ?2 AND state != 'closed'",
+                    rusqlite::params![project.id, want], |r| r.get(0)).ok();
+                if let Some(name) = owner {
+                    return Err(BusError::conflict("worktree.owned", format!("session {name} owns {want}")).with_hint("session.close it first"));
+                }
+                Ok(project)
+            })?;
+            let freed = worktree::remove(Path::new(&project.path), Path::new(&want), p.purge_build.unwrap_or(true))
+                .map_err(|e| BusError::conflict("worktree.remove_failed", e.to_string()))?;
+            Ok((project, freed))
+        },
+        |ctx: &mut Ctx, _p, (project, freed): (relay_bus::types::Project, u64)| {
+            ctx.set_project(project.id);
+            ctx.emit("worktree.changed", json!({ "project_id": project.id }));
+            Ok(FreedOut { freed_mb: freed as f64 / (1024.0 * 1024.0) })
+        },
+    );
     e.register_unlocked::<WorktreeDisk>(|ctx, p| {
         let project = ctx.read(|conn| get_project(conn, p.project_id))?;
         let wts = worktree::list_with_dirty(Path::new(&project.path), false)
