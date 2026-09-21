@@ -34,8 +34,9 @@ engine, sessions and worktrees alive.
 
 The engine `run.sh` starts also carries the phone door, so a phone can reach it
 on the LAN directly (`relay remote pair` prints the QR code), or from anywhere
-through a rendezvous server you host. See [docs/MOBILE.md](docs/MOBILE.md); the
-app is the `antho976/ChatterUI` fork.
+through a rendezvous server you host. The phone app lives in `apps/relay-mobile`
+(Expo / React Native; built by the **Mobile APK** workflow). See
+[docs/MOBILE.md](docs/MOBILE.md).
 
 Open a repository from the sidebar, then add solo agents or a group of
 one or two builders sharing a reviewer. Code can edit the primary checkout or

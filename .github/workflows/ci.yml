@@ -1,7 +1,7 @@
 name: CI
 
-# The engine, the bus and the CLI are checked on every push and every pull request.
-# `relay-native` is not — see the note at the bottom of this file.
+# The engine, the bus and the CLI, and the mobile app's typecheck and lint, are checked on
+# every push and every pull request. `relay-native` is not — see the note at the bottom.
 
 on:
   push:
@@ -39,6 +39,32 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
+
+  mobile:
+    name: mobile app (typecheck and lint)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/relay-mobile
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/relay-mobile/package-lock.json
+
+      - name: Install
+        run: npm ci --no-audit --no-fund
+
+      # The Android build itself is `mobile-apk.yml`, on demand or on a `mobile-v*` tag; a
+      # Gradle build on every push would cost twenty minutes for what these two catch first.
+      - name: Typecheck
+        run: npx tsc --noEmit -p tsconfig.json
+
+      - name: Lint
+        run: npm run lint
 
 # `relay-native` is deliberately absent, and this is the honest reason rather than an
 # oversight to rediscover later.

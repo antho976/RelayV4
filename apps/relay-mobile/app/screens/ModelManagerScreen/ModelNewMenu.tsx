@@ -1,0 +1,53 @@
+import { useTranslation } from 'react-i18next'
+import { View } from 'react-native'
+
+import ContextMenu from '@components/views/ContextMenu'
+import { Model } from '@lib/engine/Local/Model'
+
+type ModelNewMenuProps = {
+    modelImporting: boolean
+    setModelImporting: (b: boolean) => void
+}
+
+const ModelNewMenu: React.FC<ModelNewMenuProps> = ({ modelImporting, setModelImporting }) => {
+    const { t } = useTranslation()
+    const handleSetExternal = async (close: () => void) => {
+        close()
+        if (modelImporting) return
+        setModelImporting(true)
+        await Model.linkModelExternal()
+        setModelImporting(false)
+    }
+
+    const handleImportModel = async (close: () => void) => {
+        close()
+        if (modelImporting) return
+        setModelImporting(true)
+        await Model.importModel()
+        setModelImporting(false)
+    }
+
+    return (
+        <View>
+            <ContextMenu
+                placement="bottom"
+                triggerIcon="file-add"
+                disabled={modelImporting}
+                buttons={[
+                    {
+                        label: t('model.copymodel'),
+                        icon: 'download',
+                        onPress: handleImportModel,
+                    },
+                    {
+                        label: t('model.externalmodel'),
+                        icon: 'link',
+                        onPress: handleSetExternal,
+                    },
+                ]}
+            />
+        </View>
+    )
+}
+
+export default ModelNewMenu

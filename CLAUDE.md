@@ -16,6 +16,21 @@ test runs. Plain `cargo test` uses the default members, which are exactly the
 four headless crates (`relay-bus`, `relay-core`, `relay-cli`, `relay-remote`).
 The full list in `README.md` is for a developer machine with GTK.
 
+## The mobile app: `apps/relay-mobile`
+
+An Expo / React Native app with its own toolchain, independent of Cargo. Verify a change with
+
+```fish
+cd apps/relay-mobile && npm ci && npx tsc --noEmit -p tsconfig.json && npm run lint
+```
+
+Both run in CI. The Android build (`mobile-apk.yml`) runs on demand from the Actions tab or
+on a `mobile-v*` tag; an agent session has no Android SDK, so a change there is typechecked
+and linted, not run, and the summary must say so. Its PC-facing code is `lib/engine/Relay/`;
+the door it talks to is `crates/relay-remote`, whose integration tests exercise every bus
+payload the phone sends. The new screens use literal English strings; the rest of the app
+is localized (`i18n/`), so `i18next/no-literal-string` warns on them.
+
 ## The native client cannot be built everywhere
 
 `apps/relay-native` pins GTK 4.22, VTE 0.84, GtkSourceView 5.18 and pango 1.56.

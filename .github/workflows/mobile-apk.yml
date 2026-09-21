@@ -1,0 +1,135 @@
+name: Mobile APK
+
+# Builds an installable Android APK of apps/relay-mobile on GitHub's runners, which ship
+# with the Android SDK and NDK. Run it manually from the Actions tab, or push a tag such as
+# mobile-v0.10.0 to build and attach the APK to a GitHub release.
+#
+# The engine, bus and CLI are checked by ci.yml; the desktop client cannot be built on
+# these runners (see the note at the bottom of ci.yml). This job is the phone's build.
+#
+# Signing: by default the APK is signed with the standard Android debug key,
+# which installs fine but cannot update an APK signed with a different key.
+# To sign with your own key, add these repository secrets:
+#   ANDROID_KEYSTORE_BASE64  - your .keystore/.jks file, base64 encoded
+#   ANDROID_KEYSTORE_PASSWORD
+#   ANDROID_KEY_ALIAS
+#   ANDROID_KEY_PASSWORD
+
+on:
+    workflow_dispatch:
+        inputs:
+            architectures:
+                description: 'CPU architectures to build (comma separated: arm64-v8a, armeabi-v7a, x86_64, x86)'
+                required: true
+                default: 'arm64-v8a'
+    push:
+        tags:
+            - 'mobile-v*'
+
+permissions:
+    contents: write
+
+jobs:
+    build-apk:
+        runs-on: ubuntu-latest
+        timeout-minutes: 120
+        env:
+            ARCHS: ${{ github.event.inputs.architectures || 'arm64-v8a,armeabi-v7a' }}
+            HAS_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+        defaults:
+            run:
+                working-directory: apps/relay-mobile
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+
+            - name: Set up JDK 17
+              uses: actions/setup-java@v4
+              with:
+                  distribution: temurin
+                  java-version: '17'
+
+            - name: Set up Node
+              uses: actions/setup-node@v4
+              with:
+                  node-version: '22'
+                  cache: npm
+                  cache-dependency-path: apps/relay-mobile/package-lock.json
+
+            - name: Set up Gradle cache
+              uses: gradle/actions/setup-gradle@v4
+
+            - name: Install dependencies
+              run: npm ci
+
+            - name: Generate native project
+              run: npx expo prebuild --platform android --no-install
+
+            - name: Configure release signing
+              if: ${{ env.HAS_KEYSTORE == 'true' }}
+              env:
+                  KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+                  KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+                  KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+                  KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+              run: |
+                  echo "$KEYSTORE_BASE64" | base64 -d > android/app/release.keystore
+                  cat >> android/gradle.properties <<EOF
+                  RELEASE_STORE_FILE=release.keystore
+                  RELEASE_STORE_PASSWORD=$KEYSTORE_PASSWORD
+                  RELEASE_KEY_ALIAS=$KEY_ALIAS
+                  RELEASE_KEY_PASSWORD=$KEY_PASSWORD
+                  EOF
+                  node - <<'EOF'
+                  const fs = require('fs')
+                  const file = 'android/app/build.gradle'
+                  let gradle = fs.readFileSync(file, 'utf8')
+                  gradle = gradle.replace(
+                      /signingConfigs \{\n(\s+)debug \{/,
+                      (match, indent) =>
+                          `signingConfigs {\n${indent}release {\n` +
+                          `${indent}    storeFile file(RELEASE_STORE_FILE)\n` +
+                          `${indent}    storePassword RELEASE_STORE_PASSWORD\n` +
+                          `${indent}    keyAlias RELEASE_KEY_ALIAS\n` +
+                          `${indent}    keyPassword RELEASE_KEY_PASSWORD\n` +
+                          `${indent}}\n${indent}debug {`
+                  )
+                  gradle = gradle.replace(
+                      /release \{\n([\s\S]*?)signingConfig signingConfigs\.debug/,
+                      (match, body) => `release {\n${body}signingConfig signingConfigs.release`
+                  )
+                  fs.writeFileSync(file, gradle)
+                  console.log('Release signing configured')
+                  EOF
+
+            - name: Build release APK
+              working-directory: apps/relay-mobile/android
+              run: |
+                  sed -i 's/^org.gradle.jvmargs=.*/org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m/' gradle.properties
+                  ./gradlew :app:assembleRelease -PreactNativeArchitectures="$ARCHS" --no-daemon
+
+            - name: Collect APK
+              id: collect
+              run: |
+                  VERSION=$(node -p "require('./app.config.js').expo.version")
+                  ARCH_TAG=$(echo "$ARCHS" | tr ',' '-')
+                  mkdir -p dist
+                  APK=$(ls android/app/build/outputs/apk/release/*.apk | head -n 1)
+                  OUT="dist/relay-mobile-v${VERSION}-${ARCH_TAG}.apk"
+                  cp "$APK" "$OUT"
+                  # Paths in later steps are relative to the repository root.
+                  echo "apk=apps/relay-mobile/$OUT" >> "$GITHUB_OUTPUT"
+                  ls -la dist
+
+            - name: Upload APK artifact
+              uses: actions/upload-artifact@v4
+              with:
+                  name: ${{ github.ref_type == 'tag' && format('relay-mobile-{0}', github.ref_name) || 'relay-mobile-apk' }}
+                  path: ${{ steps.collect.outputs.apk }}
+                  if-no-files-found: error
+
+            - name: Attach APK to release
+              if: ${{ github.ref_type == 'tag' }}
+              uses: softprops/action-gh-release@v2
+              with:
+                  files: ${{ steps.collect.outputs.apk }}
