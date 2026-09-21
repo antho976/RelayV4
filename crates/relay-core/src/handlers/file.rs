@@ -341,28 +341,32 @@ pub fn register(e: &mut Engine) {
                 let Ok(text) = std::str::from_utf8(&buffer) else {
                     continue;
                 };
-                for (n, line) in text.lines().enumerate() {
-                    let found = regex
-                        .as_ref()
-                        .and_then(|r| r.find(line).map(|m| m.start()))
-                        .or_else(|| {
-                            if regex.is_none() {
-                                line.find(&p.query)
-                            } else {
-                                None
-                            }
-                        });
-                    if let Some(col) = found {
-                        hits.push(Hit {
-                            path: relp.to_string_lossy().to_string(),
-                            line: n as u32 + 1,
-                            col: col as u32 + 1,
-                            text: line.to_string(),
-                        });
-                    }
+                // The whole file is searched in one pass and hits are mapped back to lines,
+                // one per line as before. Searching line by line built a fresh substring
+                // searcher for every line of every file, a fifth of the op (PERF §1.7).
+                let mut from = 0usize;
+                let mut line = 1u32;
+                let mut counted_to = 0usize;
+                while from < text.len() {
+                    let found = match &regex {
+                        Some(r) => r.find_at(text, from).map(|m| m.start()),
+                        None => text[from..].find(&p.query).map(|i| from + i),
+                    };
+                    let Some(at) = found else { break };
+                    line += text[counted_to..at].bytes().filter(|b| *b == b'\n').count() as u32;
+                    counted_to = at;
+                    let start = text[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                    let end = text[at..].find('\n').map(|i| at + i).unwrap_or(text.len());
+                    hits.push(Hit {
+                        path: relp.to_string_lossy().to_string(),
+                        line,
+                        col: (at - start) as u32 + 1,
+                        text: text[start..end].trim_end_matches('\r').to_string(),
+                    });
                     if hits.len() >= limit {
                         return Ok(SearchOut { hits });
                     }
+                    from = end + 1;
                 }
             }
         }

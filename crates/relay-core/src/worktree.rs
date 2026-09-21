@@ -154,17 +154,39 @@ pub fn list_with_dirty(repo: &Path, include_dirty: bool) -> Result<Vec<Worktree>
     Ok(out)
 }
 
-/// Validate worktree membership without dirty-scanning every checkout.
+/// Validate worktree membership without dirty-scanning every checkout, and without opening
+/// the repository: every project-scoped file and git op calls this to check its root, and a
+/// `gix::open` plus a worktree enumeration was a third of a tree listing (PERF §1.6). The
+/// primary checkout is the project path; a linked checkout's `.git` is a file pointing at its
+/// slot under the common dir's `worktrees/`, which is exactly what `git worktree list` reads.
 pub fn contains(repo: &Path, candidate: &Path) -> Result<bool> {
-    let r = gix::open(repo).with_context(|| format!("opening {}", repo.display()))?;
     let want = canon(candidate);
-    let primary = r.workdir().map(Path::to_path_buf).unwrap_or_else(|| repo.to_path_buf());
-    if canon(&primary) == want { return Ok(true); }
-    for proxy in r.worktrees().context("listing worktrees")? {
-        let Ok(base) = proxy.base() else { continue };
-        if base.exists() && canon(&base) == want { return Ok(true); }
+    if canon(repo) == want { return Ok(true); }
+    let Ok(pointer) = std::fs::read_to_string(Path::new(&want).join(".git")) else { return Ok(false) };
+    let Some(gitdir) = pointer.trim().strip_prefix("gitdir:") else { return Ok(false) };
+    let gitdir = PathBuf::from(gitdir.trim());
+    let gitdir = if gitdir.is_absolute() { gitdir } else { Path::new(&want).join(gitdir) };
+    let slots = canon(&common_dir(repo)?.join("worktrees"));
+    Ok(canon(&gitdir).starts_with(&slots) && gitdir.join("gitdir").is_file())
+}
+
+/// The common git dir of `repo` from its `.git` alone; gix only when that is not a plain
+/// directory or pointer file.
+fn common_dir(repo: &Path) -> Result<PathBuf> {
+    let dotgit = repo.join(".git");
+    if dotgit.is_dir() { return Ok(dotgit); }
+    if let Ok(pointer) = std::fs::read_to_string(&dotgit) {
+        if let Some(gitdir) = pointer.trim().strip_prefix("gitdir:") {
+            let gitdir = PathBuf::from(gitdir.trim());
+            let gitdir = if gitdir.is_absolute() { gitdir } else { repo.join(gitdir) };
+            if let Ok(common) = std::fs::read_to_string(gitdir.join("commondir")) {
+                let common = PathBuf::from(common.trim());
+                return Ok(if common.is_absolute() { common } else { gitdir.join(common) });
+            }
+            return Ok(gitdir);
+        }
     }
-    Ok(false)
+    git_dir_of(repo)
 }
 
 fn canon(p: &Path) -> String {

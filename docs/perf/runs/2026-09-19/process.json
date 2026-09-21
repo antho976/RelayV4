@@ -1,0 +1,96 @@
+{
+  "window_seconds": 30,
+  "phases": {
+    "idle_six_quiet_sessions": {
+      "seconds": 30.0,
+      "cpu_percent": 0.0,
+      "cpu_ms_total": 0.0,
+      "wakeups_per_s": 0.0,
+      "preemptions_per_s": 0.0,
+      "rss_mb": 22.0,
+      "threads": 17
+    },
+    "idle_resources_watch_on": {
+      "seconds": 30.0,
+      "cpu_percent": 0.033,
+      "cpu_ms_total": 10.0,
+      "wakeups_per_s": 1.2,
+      "preemptions_per_s": 0.0,
+      "rss_mb": 22.2,
+      "threads": 17
+    },
+    "output_60_lines_per_s_unattached": {
+      "seconds": 30.0,
+      "cpu_percent": 0.133,
+      "cpu_ms_total": 40.0,
+      "wakeups_per_s": 66.7,
+      "preemptions_per_s": 1.4,
+      "rss_mb": 22.3,
+      "threads": 17
+    },
+    "output_60_lines_per_s_attached": {
+      "seconds": 30.0,
+      "cpu_percent": 0.533,
+      "cpu_ms_total": 160.0,
+      "wakeups_per_s": 177.5,
+      "preemptions_per_s": 8.3,
+      "rss_mb": 23.0,
+      "threads": 17,
+      "client_frames": 1926,
+      "client_bytes": 507777
+    },
+    "burst_50k_lines_attached": {
+      "seconds_until_stream_quiet": 3.976,
+      "engine_cpu_ms": 140.0,
+      "payload_bytes": 4900000,
+      "payload_bytes_received": 1194990,
+      "wire_bytes_received": 1782295,
+      "frames": 2414,
+      "mib_per_s_to_client": 0.4
+    }
+  },
+  "startup_s_fresh_store": 0.028,
+  "rss_mb_fresh": 15.7,
+  "rss_mb_six_sessions": 22.0,
+  "recovery_report": {
+    "at": "2026-09-19T19:52:17.007504279Z",
+    "reaped_pids": [
+      17325
+    ],
+    "fsck_fixes": [
+      "session quiet-heron: running \u2192 restorable (pid 17325 still alive from a previous engine; reaped)",
+      "session keen-gecko: running \u2192 restorable (pid 17346 is dead)",
+      "session sly-osprey: running \u2192 restorable (pid 17367 is dead)",
+      "session cobalt-bison: running \u2192 restorable (pid 17388 is dead)",
+      "session lucky-heron: running \u2192 restorable (pid 17410 is dead)",
+      "session coral-seal: running \u2192 restorable (pid 17431 is dead)"
+    ],
+    "dirty_worktrees": [],
+    "tasks_reset_offered": []
+  },
+  "restart_s": {
+    "with_six_live_sessions": 1.508,
+    "clean": [
+      0.037,
+      0.032
+    ]
+  },
+  "cli": {
+    "ping": {
+      "min_ms": 3.58,
+      "p50_ms": 3.82,
+      "max_ms": 4.13
+    },
+    "q_session_list": {
+      "min_ms": 4.06,
+      "p50_ms": 4.44,
+      "max_ms": 4.95
+    },
+    "q_app_status": {
+      "min_ms": 3.93,
+      "p50_ms": 4.27,
+      "max_ms": 4.63
+    }
+  },
+  "engine_binary_bytes": 311823784
+}

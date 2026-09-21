@@ -1,0 +1,20 @@
+==26435== Callgrind, a call-graph generating cache profiler
+==26435== Copyright (C) 2002-2017, and GNU GPL'd, by Josef Weidendorfer et al.
+==26435== Using Valgrind-3.22.0 and LibVEX; rerun with -h for copyright info
+==26435== Command: /home/user/RelayV4/target/debug/examples/perf run op.device.build op.avd.boot op.skill.delete op.settings.get op.ui.pane.focus op.ui.toast path.request.parse_8k path.event.roundtrip --callgrind --iters-div 20 --warmup 1 --out /home/user/RelayV4/docs/perf/runs/2026-09-19/callgrind-extra/rows-0.jsonl
+==26435== 
+==26435== For interactive control, run 'callgrind_control -h'.
+op.device.build                            524341.9 µs  0 ok  {"device.gradle_missing":1}
+op.avd.boot                                180284.7 µs  0 ok  {"avd.tool_missing":1}
+op.skill.delete                            358119.9 µs  1 ok  {}
+op.settings.get                            104440.3 µs  10 ok  {}
+op.settings.get.path                       227662.1 µs  10 ok  {}
+op.ui.pane.focus                            35315.0 µs  0 ok  {"ui.pane_not_found":10}
+op.ui.toast                                 41763.6 µs  10 ok  {}
+path.request.parse_8k                       28465.6 µs  10 ok  {}
+path.event.roundtrip                       431982.0 µs  10 ok  {}
+==26435== 
+==26435== Events    : Ir
+==26435== Collected : 23283510
+==26435== 
+==26435== I   refs:      23,283,510

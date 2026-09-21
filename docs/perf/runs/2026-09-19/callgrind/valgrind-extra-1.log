@@ -1,0 +1,19 @@
+==26436== Callgrind, a call-graph generating cache profiler
+==26436== Copyright (C) 2002-2017, and GNU GPL'd, by Josef Weidendorfer et al.
+==26436== Using Valgrind-3.22.0 and LibVEX; rerun with -h for copyright info
+==26436== Command: /home/user/RelayV4/target/debug/examples/perf run op.device.signing.set_enabled op.provider.update op.github.status op.settings.reset op.ui.layout.save path.store.open_fresh path.socket.bus.subscribe path.pty.time_to_first_output --callgrind --iters-div 20 --warmup 1 --out /home/user/RelayV4/docs/perf/runs/2026-09-19/callgrind-extra/rows-1.jsonl
+==26436== 
+==26436== For interactive control, run 'callgrind_control -h'.
+op.device.signing.set_enabled              150590.8 µs  0 ok  {"device.signing_missing":10}
+op.provider.update                         197487.8 µs  1 ok  {}
+op.github.status                            34255.2 µs  1 ok  {}
+op.settings.reset                          312492.2 µs  10 ok  {}
+op.ui.layout.save                          254651.3 µs  10 ok  {}
+path.store.open_fresh                      949039.2 µs  1 ok  {}
+path.socket.bus.subscribe                  110503.2 µs  10 ok  {}
+path.pty.time_to_first_output             1201854.9 µs  1 ok  {}
+==26436== 
+==26436== Events    : Ir
+==26436== Collected : 81060571
+==26436== 
+==26436== I   refs:      81,060,571

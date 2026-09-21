@@ -912,10 +912,10 @@ fn resolve_run_root(
     };
     let selected = std::fs::canonicalize(&selected)
         .map_err(|e| BusError::invalid("device.worktree", e.to_string()))?;
-    if !worktree::list(Path::new(project_path))
+    // Membership only. Listing the worktrees with a dirty check ran a `git status` per checkout
+    // before a build had even looked for its Gradle wrapper (PERF §1.4).
+    if !worktree::contains(Path::new(project_path), &selected)
         .map_err(|e| BusError::unavailable("worktree.list_failed", e.to_string()))?
-        .iter()
-        .any(|item| Path::new(&item.path) == selected)
     {
         return Err(BusError::invalid(
             "device.worktree",
