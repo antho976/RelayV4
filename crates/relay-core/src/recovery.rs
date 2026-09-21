@@ -83,13 +83,19 @@ pub fn run_with(engine: &Engine, dirty_scan: DirtyScan) -> Result<RecoveryReport
             .collect::<Result<_, _>>()?;
         for (id, name, state, pid) in rows {
             let why = match pid {
-                Some(p) if pty::pid_alive(p as u32) => {
-                    // alive but not ours (we just started) — reap unless it was already
+                // Alive, and its environment says it is this session's provider: a child of a
+                // previous engine that step 1 has not finished off yet. Reap it.
+                Some(p) if pty::owned_by_session(p as u32, instance, &store_path, &name) => {
                     kill_wait(p as u32);
                     if !report.reaped_pids.contains(&p) {
                         report.reaped_pids.push(p);
                     }
                     format!("pid {p} still alive from a previous engine; reaped")
+                }
+                // Alive, but not ours: the number was recycled onto some other process since
+                // the row was written. It is left strictly alone; the row is still stale.
+                Some(p) if pty::pid_alive(p as u32) => {
+                    format!("pid {p} now belongs to another process; left alone")
                 }
                 Some(p) => format!("pid {p} is dead"),
                 None => "no pid recorded".to_string(),

@@ -571,6 +571,15 @@ fn recovery_reaps_orphans_and_fscks() {
         "INSERT INTO sessions(name, project_id, provider, role, branch, worktree, state, pid, token, epoch, created_at, updated_at)
          VALUES ('ghost-heron', 1, 'claude', 'builder', 'x', '/tmp', 'running', 999999, 't', 1, 'now', 'now');
          INSERT INTO tasks(project_id, title, col, created_at, updated_at) VALUES (1, 'stuck', 'active', 'now', 'now');").unwrap();
+    // A row whose pid is alive but was recycled onto a process that is not Relay's. After a
+    // reboot every stored pid looks like this; recovery must fix the row and touch nothing.
+    let mut bystander = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+    let bystander_pid = bystander.id() as i64;
+    f.engine.store.lock().execute(
+        "INSERT INTO sessions(name, project_id, provider, role, branch, worktree, state, pid, token, epoch, created_at, updated_at)
+         VALUES ('stale-newt', 1, 'claude', 'builder', 'x', '/tmp', 'running', ?1, 't', 1, 'now', 'now')",
+        [bystander_pid],
+    ).unwrap();
     // "crash": leak the PTY handle so the child outlives the engine, then drop the engine
     let leaked = f.engine.take_pty(1).unwrap();
     std::mem::forget(leaked);
@@ -585,6 +594,12 @@ fn recovery_reaps_orphans_and_fscks() {
     wait_until("orphan and its child gone", || !alive(pid) && !alive(child));
     assert!(report.fsck_fixes.iter().any(|x| x.contains(&name) && x.contains("restorable")), "{report:?}");
     assert!(report.fsck_fixes.iter().any(|x| x.contains("ghost-heron") && x.contains("dead")), "{report:?}");
+    assert!(report.fsck_fixes.iter().any(|x| x.contains("stale-newt") && x.contains("left alone")), "{report:?}");
+    assert!(!report.reaped_pids.contains(&bystander_pid), "{report:?}");
+    assert!(bystander.try_wait().unwrap().is_none(), "recovery killed a process that was never Relay's");
+    let _ = bystander.kill();
+    let _ = bystander.wait();
+    assert_eq!(ok(&e2, "session.get", json!({"session": "stale-newt"}))["state"], "restorable");
     assert_eq!(report.tasks_reset_offered, vec![1]);
     let s = ok(&e2, "session.get", json!({"session": name}));
     assert_eq!(s["state"], "restorable");

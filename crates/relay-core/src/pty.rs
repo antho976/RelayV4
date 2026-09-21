@@ -403,6 +403,19 @@ pub fn proc_env(pid: u32) -> Option<Vec<(String, String)>> {
     }).collect())
 }
 
+/// Is `pid` a Relay child of *this* engine's store, spawned for `session`? Read from its
+/// environment, the same way [`relay_children`] finds orphans. A pid recorded in the sessions
+/// table outlives the process it named: after a reboot, or once the kernel has cycled through
+/// its pid space, that number belongs to whatever process happens to hold it now, and the
+/// number alone must never be reason to kill it.
+pub fn owned_by_session(pid: u32, instance: &str, store: &str, session: &str) -> bool {
+    let Some(env) = proc_env(pid) else { return false };
+    let var = |key: &str| env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
+    var("RELAY_INSTANCE") == Some(instance)
+        && var("RELAY_STORE") == Some(store)
+        && var("RELAY_SESSION") == Some(session)
+}
+
 /// Every live pid whose environment carries `RELAY_SESSION` for `instance` **and** this
 /// store (`RELAY_STORE`) — Relay's own children (and theirs), regardless of which engine
 /// process spawned them. The store filter keeps a test engine from reaping a real one.
