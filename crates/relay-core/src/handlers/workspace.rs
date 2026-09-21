@@ -11,6 +11,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// The longest `project.clone` waits on the remote. Generous, because a large repository over
+/// a slow link is a legitimate clone; bounded, because the request must come back with an
+/// answer and the checkout it leaves behind must be whole or gone.
+const CLONE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 fn ws_row(r: &Row) -> rusqlite::Result<Workspace> {
     Ok(Workspace {
         id: r.get("id")?, path: r.get("path")?, name: r.get("name")?, order: r.get("ord")?,
@@ -205,27 +210,46 @@ pub fn register(e: &mut Engine) {
         ctx.emit("project.changed", serde_json::to_value(&pr).bus()?);
         Ok(pr)
     });
-    e.register::<ProjectClone>(|ctx: &mut Ctx, p| {
-        let workspace = get_workspace(ctx.tx(), p.workspace_id)?;
-        let destination = clone_destination(&workspace.path, &p.url, p.dest.as_deref())?;
-        if destination.exists() {
-            return Err(BusError::conflict("project.clone_destination", format!("{} already exists", destination.display())));
-        }
-        let output = Command::new("git").current_dir(&workspace.path).arg("clone").arg("--").arg(&p.url).arg(&destination).output()
-            .map_err(|error| BusError::unavailable("project.git_missing", format!("cannot start git: {error}")))?;
-        if !output.status.success() {
-            return Err(BusError::unavailable("project.clone_failed", String::from_utf8_lossy(&output.stderr).trim().to_string()));
-        }
-        let added = ctx.invoke_registered("project.add", json!({"workspace_id":workspace.id,"path":destination}))
-            .and_then(|value| serde_json::from_value::<Project>(value).map_err(|error| BusError::internal(error.to_string())));
-        match added {
-            Ok(project) => Ok(ProjectCloneOut { project }),
-            Err(error) => {
-                let _ = fs::remove_dir_all(&destination);
-                Err(error)
+    // A clone is the network for as long as the remote takes. It runs in the prepare phase
+    // with nothing locked (D144); only registering the resulting checkout is a transaction.
+    e.register_staged::<ProjectClone, _>(
+        |ctx, p| {
+            let workspace = ctx.read(|conn| get_workspace(conn, p.workspace_id))?;
+            let destination = clone_destination(&workspace.path, &p.url, p.dest.as_deref())?;
+            if destination.exists() {
+                return Err(BusError::conflict("project.clone_destination", format!("{} already exists", destination.display())));
             }
-        }
-    });
+            let mut command = Command::new("git");
+            command.current_dir(&workspace.path).arg("clone").arg("--").arg(&p.url).arg(&destination)
+                .env("GIT_TERMINAL_PROMPT", "0");
+            let output = crate::proc::output_with_timeout(&mut command, CLONE_TIMEOUT)
+                .map_err(|error| BusError::unavailable("project.git_missing", format!("cannot start git: {error}")))?;
+            let Some(output) = output else {
+                // git tidies up after its own failures, but not after a SIGKILL.
+                let _ = fs::remove_dir_all(&destination);
+                return Err(BusError::unavailable(
+                    "project.clone_timeout",
+                    format!("git clone did not finish within {} seconds", CLONE_TIMEOUT.as_secs()),
+                ));
+            };
+            if !output.status.success() {
+                return Err(BusError::unavailable("project.clone_failed", String::from_utf8_lossy(&output.stderr).trim().to_string()));
+            }
+            Ok((workspace, destination))
+        },
+        |ctx: &mut Ctx, _p, (workspace, destination)| {
+            let added = get_workspace(ctx.tx(), workspace.id)
+                .and_then(|_| ctx.invoke_registered("project.add", json!({"workspace_id":workspace.id,"path":destination})))
+                .and_then(|value| serde_json::from_value::<Project>(value).map_err(|error| BusError::internal(error.to_string())));
+            match added {
+                Ok(project) => Ok(ProjectCloneOut { project }),
+                Err(error) => {
+                    let _ = fs::remove_dir_all(&destination);
+                    Err(error)
+                }
+            }
+        },
+    );
     e.register::<ProjectList>(|ctx, p| {
         let projects = match p.workspace_id {
             Some(w) => {
