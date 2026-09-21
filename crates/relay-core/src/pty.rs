@@ -208,9 +208,18 @@ impl Pty {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         sh.last_output_ms.store(unix_millis(), Ordering::Relaxed);
-                        let seq = sh.seq.fetch_add(1, Ordering::SeqCst) + 1;
                         let data = buf[..n].to_vec();
-                        sh.ring.lock().unwrap().push(seq, &data);
+                        // `seq` advances under the ring lock, in the same critical section as
+                        // the push. `attach` reads both while holding that lock, so the seq it
+                        // reports is always the last frame its catch-up bytes contain — bumping
+                        // the counter first let it label a catch-up "through N" that ended at
+                        // N-1, and the forwarder then dropped frame N as already delivered.
+                        let seq = {
+                            let mut ring = sh.ring.lock().unwrap();
+                            let seq = sh.seq.fetch_add(1, Ordering::SeqCst) + 1;
+                            ring.push(seq, &data);
+                            seq
+                        };
                         let _ = sh.tx.send(Arc::new(Frame { epoch: sh.epoch, seq, data }));
                     }
                 }
@@ -293,6 +302,8 @@ impl Pty {
     pub fn attach(&self, from_epoch: Option<u64>, from_seq: Option<u64>) -> Attached {
         let rx = self.shared.tx.subscribe();
         let ring = self.shared.ring.lock().unwrap();
+        // Read under the ring lock: the reader thread bumps the counter and pushes the frame
+        // in one critical section, so this seq names exactly the last frame in `ring`.
         let seq = self.seq();
         let catch_up = match (from_epoch, from_seq) {
             (Some(e), Some(s)) if e == self.shared.epoch => {
