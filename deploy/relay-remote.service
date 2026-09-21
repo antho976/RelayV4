@@ -1,0 +1,15 @@
+# systemd --user unit for the PC: engine and phone door together, from login.
+#   mkdir -p ~/.config/systemd/user && cp deploy/relay-remote.service ~/.config/systemd/user/
+#   systemctl --user enable --now relay-remote
+# The desktop app reuses a running engine, so it keeps working as before.
+[Unit]
+Description=Relay engine with the phone door
+
+[Service]
+ExecStart=%h/.cargo/bin/relay serve --remote
+Restart=on-failure
+RestartSec=2
+Environment=RELAY_LOG=info
+
+[Install]
+WantedBy=default.target

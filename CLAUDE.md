@@ -13,8 +13,8 @@ caught before it is merged rather than in use.
 **Do not run `cargo test --workspace` in a headless environment.** The workspace
 includes `relay-native`, and building it stops at `pango-sys` long before any
 test runs. Plain `cargo test` uses the default members, which are exactly the
-three headless crates. The full list in `README.md` is for a developer machine
-with GTK.
+four headless crates (`relay-bus`, `relay-core`, `relay-cli`, `relay-remote`).
+The full list in `README.md` is for a developer machine with GTK.
 
 ## The native client cannot be built everywhere
 

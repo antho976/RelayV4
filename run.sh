@@ -27,7 +27,9 @@ ready() { timeout 2 "$relay" --instance "$RELAY_INSTANCE" ping >/dev/null 2>&1; 
 
 if ! ready; then
     log="$PWD/target/engine-$RELAY_INSTANCE.log"
-    nohup "$relay" --instance "$RELAY_INSTANCE" serve >>"$log" 2>&1 </dev/null &
+    # --remote also opens the phone door (docs/MOBILE.md): the desktop and the phone share
+    # this engine, and pairing is `relay remote pair` with nothing else to start.
+    nohup "$relay" --instance "$RELAY_INSTANCE" serve --remote >>"$log" 2>&1 </dev/null &
     engine_pid=$!
     deadline=$((SECONDS + 15))
     until ready; do

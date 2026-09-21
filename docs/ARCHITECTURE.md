@@ -53,3 +53,12 @@ checks the current disk contents before writing through `file.write`. This is
 optimistic conflict detection, not an atomic filesystem compare-and-swap; an
 external writer can still race the two bus operations. Full worktree selection
 and richer conflict handling remain in the Code roadmap.
+
+## Remote door
+
+`relay remote serve` (`crates/relay-remote`) fronts the same socket door for a paired
+phone over a WebSocket: directly on the LAN, or through a rendezvous server the person
+hosts (`relay remote rendezvous`) that the engine dials out to. Every line a phone sends is
+gated to actor `user` and then written to the Unix socket unchanged; every line back is
+forwarded as-is, `pty` frames included. The door adds pairing and a per-connection proof of
+the device token; it adds no ops. See `docs/MOBILE.md`.

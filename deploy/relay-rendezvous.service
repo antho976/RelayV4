@@ -1,0 +1,22 @@
+# systemd unit for the rendezvous server on a small VPS.
+#   install -m 755 target/release/relay /usr/local/bin/relay
+#   cp deploy/relay-rendezvous.service /etc/systemd/system/
+#   systemctl enable --now relay-rendezvous
+[Unit]
+Description=Relay rendezvous (phone door, away from home)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/relay remote rendezvous --bind 127.0.0.1:7430
+Restart=always
+RestartSec=2
+DynamicUser=yes
+Environment=RELAY_LOG=info
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
