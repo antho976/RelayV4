@@ -6,6 +6,7 @@ use anyhow::{anyhow, Context, Result};
 use relay_bus::types::{FileStatus, Worktree};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 /// Directories that are build output and safe to purge before removing a worktree
 /// (SPEC §8: "gradlew clean / target purge — the 73GB problem, closed").
@@ -23,9 +24,17 @@ pub fn branch_for(name: &str) -> String {
     format!("relay/{name}")
 }
 
+/// The longest one system-git call may run. Several callers hold the store mutex while they
+/// wait (`git commit`, `git switch`, `git worktree remove`), so a git that blocks on a lock
+/// file, a hook, or a credential prompt must come back with an answer rather than never.
+const GIT_TIMEOUT: Duration = Duration::from_secs(120);
+
 fn git(repo: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git").arg("-C").arg(repo).args(args).output()
-        .with_context(|| format!("running git {}", args.join(" ")))?;
+    let mut command = Command::new("git");
+    command.arg("-C").arg(repo).args(args).env("GIT_TERMINAL_PROMPT", "0");
+    let out = crate::proc::output_with_timeout(&mut command, GIT_TIMEOUT)
+        .with_context(|| format!("running git {}", args.join(" ")))?
+        .ok_or_else(|| anyhow!("git {} did not finish within {} seconds", args.join(" "), GIT_TIMEOUT.as_secs()))?;
     if !out.status.success() {
         return Err(anyhow!("git {} failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim()));
     }
@@ -88,7 +97,7 @@ pub fn status_files(root: &Path) -> Result<Vec<FileStatus>> {
     command.arg("-C").arg(root)
         .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
         .env("GIT_OPTIONAL_LOCKS", "1");
-    let output = crate::proc::output_with_timeout(&mut command, std::time::Duration::from_secs(10))?
+    let output = crate::proc::output_with_timeout(&mut command, Duration::from_secs(10))?
         .ok_or_else(|| anyhow!("Git status timed out after 10 seconds; check repository filters and retry"))?;
     if !output.status.success() {
         return Err(anyhow!("Git status failed: {}", String::from_utf8_lossy(&output.stderr).trim()));
@@ -211,7 +220,7 @@ pub fn create(repo: &Path, path: &Path, branch: &str, from: Option<&str>) -> Res
     };
     let mut command = Command::new("git");
     command.arg("-C").arg(repo).args(args).env("GIT_TERMINAL_PROMPT", "0");
-    let output = crate::proc::output_with_timeout(&mut command, std::time::Duration::from_secs(120))?
+    let output = crate::proc::output_with_timeout(&mut command, GIT_TIMEOUT)?
         .ok_or_else(|| anyhow!("Worktree creation timed out after 120 seconds; partial files are preserved at {}", path.display()))?;
     if !output.status.success() {
         return Err(anyhow!("Worktree creation failed at {}: {}", path.display(), String::from_utf8_lossy(&output.stderr).trim()));

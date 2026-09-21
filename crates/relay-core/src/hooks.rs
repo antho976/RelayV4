@@ -9,6 +9,14 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
+
+/// Bound on the `git config` / `rev-parse` calls the installers make. They run while a launch
+/// holds the request transaction, so a git that never answers would freeze the bus.
+const GIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bound on a user-owned pre-commit hook. It normally runs with nothing locked, but a hook
+/// that hangs still has to hand `git.commit` an answer.
+const USER_HOOK_TIMEOUT: Duration = Duration::from_secs(120);
 
 const CLAUDE_HOOK_MARKER: &str = "hook claude-";
 const CLAUDE_PRE_TOOL: &str = "hook claude-pre-tool";
@@ -198,10 +206,11 @@ pub fn run_user_pre_commit(repo: &Path, worktree: &Path) -> Result<()> {
     };
     let hook = user_dir.join("pre-commit");
     if !is_executable(&hook) { return Ok(()) }
-    let output = Command::new(&hook)
-        .current_dir(worktree)
-        .output()
-        .with_context(|| format!("running {}", hook.display()))?;
+    let mut command = Command::new(&hook);
+    command.current_dir(worktree);
+    let output = crate::proc::output_with_timeout(&mut command, USER_HOOK_TIMEOUT)
+        .with_context(|| format!("running {}", hook.display()))?
+        .ok_or_else(|| anyhow!("{} did not finish within {} seconds", hook.display(), USER_HOOK_TIMEOUT.as_secs()))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -237,11 +246,13 @@ pub fn uninstall_git(repo: &Path, worktree: &Path, session: &str) -> Result<()> 
             )?;
         }
         _ => {
-            let output = Command::new("git")
+            let mut command = Command::new("git");
+            command
                 .arg("-C")
                 .arg(worktree)
-                .args(["config", "--worktree", "--unset", "core.hooksPath"])
-                .output()?;
+                .args(["config", "--worktree", "--unset", "core.hooksPath"]);
+            let output = crate::proc::output_with_timeout(&mut command, GIT_TIMEOUT)?
+                .ok_or_else(|| anyhow!("git config --worktree --unset core.hooksPath did not finish within {} seconds", GIT_TIMEOUT.as_secs()))?;
             if !output.status.success() && output.status.code() != Some(5) {
                 return Err(anyhow!(
                     "git config --worktree --unset core.hooksPath failed: {}",
@@ -520,12 +531,11 @@ fn claude_statusline_script() -> &'static str {
 }
 
 fn git(repo: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .with_context(|| format!("running git {}", args.join(" ")))?;
+    let mut command = Command::new("git");
+    command.arg("-C").arg(repo).args(args);
+    let output = crate::proc::output_with_timeout(&mut command, GIT_TIMEOUT)
+        .with_context(|| format!("running git {}", args.join(" ")))?
+        .ok_or_else(|| anyhow!("git {} did not finish within {} seconds", args.join(" "), GIT_TIMEOUT.as_secs()))?;
     if !output.status.success() {
         return Err(anyhow!(
             "git {} failed: {}",

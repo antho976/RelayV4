@@ -15,6 +15,12 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
+
+/// The longest a git probe may run. `guardrail.gate` evaluates inside the request transaction,
+/// so a `git status` stuck behind a slow clean filter or a stale `index.lock` would otherwise
+/// hold the store mutex — and every keystroke — for as long as git chose to wait (D144).
+const GIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Result of pure policy evaluation. A hold names the one policy confirmation may skip.
 ///
@@ -494,13 +500,15 @@ fn write_target(
 /// an ignored file is build output or scratch, not repository content. Untracked or modified
 /// files carry work that exists nowhere else — those are the ones worth stopping (D114).
 fn recoverable(worktree: &Path, path: &Path) -> Option<&'static str> {
-    let out = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(worktree)
         .args(["status", "--porcelain", "--ignored=matching", "--untracked-files=all", "--"])
-        .arg(path)
-        .output()
-        .ok()?;
+        .arg(path);
+    // A probe that times out answers "unknown", and unknown means the write is not provably
+    // recoverable — the hold stands, which is the safe side.
+    let out = crate::proc::output_with_timeout(&mut command, GIT_TIMEOUT).ok()??;
     if !out.status.success() {
         return None;
     }
@@ -853,12 +861,20 @@ fn changed_line_counts(old: &str, new: &str) -> (u32, u32) {
 }
 
 fn git_output(worktree: &Path, args: &[&str]) -> Result<String, BusError> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(worktree)
-        .args(args)
-        .output()
-        .map_err(|e| BusError::unavailable("git.unavailable", e.to_string()))?;
+    let mut command = Command::new("git");
+    command.arg("-C").arg(worktree).args(args);
+    let out = crate::proc::output_with_timeout(&mut command, GIT_TIMEOUT)
+        .map_err(|e| BusError::unavailable("git.unavailable", e.to_string()))?
+        .ok_or_else(|| {
+            BusError::unavailable(
+                "git.timeout",
+                format!(
+                    "git {} did not finish within {} seconds",
+                    args.join(" "),
+                    GIT_TIMEOUT.as_secs()
+                ),
+            )
+        })?;
     if !out.status.success() {
         return Err(BusError::conflict(
             "git.failed",
