@@ -25,12 +25,21 @@ on:
     push:
         tags:
             - 'mobile-v*'
+        # A manual run is only offered once this file is on the default branch. Until then, and
+        # for a branch that wants an APK without a tag, a push whose message contains `[apk]`
+        # builds one (the job-level `if` below skips every other push).
+        branches:
+            - '**'
+        paths:
+            - 'apps/relay-mobile/**'
+            - '.github/workflows/mobile-apk.yml'
 
 permissions:
     contents: write
 
 jobs:
     build-apk:
+        if: ${{ github.event_name != 'push' || github.ref_type == 'tag' || contains(github.event.head_commit.message, '[apk]') }}
         runs-on: ubuntu-latest
         timeout-minutes: 120
         env:
