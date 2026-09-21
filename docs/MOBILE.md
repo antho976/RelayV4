@@ -1,7 +1,7 @@
 # Relay from a phone
 
-The Relay mobile app (the `antho976/ChatterUI` fork, "Relay" on the phone) reaches the engine
-on this machine through `crates/relay-remote`: the same bus lines the desktop client and the
+The Relay mobile app (`apps/relay-mobile`, "Relay" on the phone) reaches the engine on this
+machine through `crates/relay-remote`: the same bus lines the desktop client and the
 CLI speak (`BUS.md` §6.2), carried over a WebSocket to a phone that paired once.
 
 Two routes, tried in privacy order by the phone:
@@ -24,7 +24,9 @@ the phone door (`relay serve --remote`), so there is nothing else to keep runnin
 ./target/debug/relay remote pair              # prints the QR code (finds the dev engine on its own)
 ```
 
-On the phone: install the app, open the drawer, tap **PC**, **Pair a PC**, scan. If the
+On the phone: install the app (the `relay-mobile-apk` artifact of the **Mobile APK** workflow,
+run from the Actions tab, or `npm run android` in `apps/relay-mobile` with the Android SDK),
+open the drawer, tap **PC**, **Pair a PC**, scan. If the
 engine was already running from before this change, restart it once (close the app, then
 `./target/debug/relay --instance dev cmd app.quit '{}'`, then `./run.sh`), or run
 `./target/debug/relay remote serve --pair` alongside it instead. For the phone to reach the
