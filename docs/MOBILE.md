@@ -15,6 +15,20 @@ Both end in `bridge.rs` on the PC, which checks the phone's credential and forwa
 requests to the socket door as actor `user` — the same door, the same rights, the same
 guardrails and audit rows as the CLI. There is no third route and no third party.
 
+## 0. Tonight, in three steps
+
+On the PC, from the RelayV4 checkout, with the desktop app already open (`./run.sh` runs the
+`dev` engine; the commands below find it on their own):
+
+```fish
+cargo build -p relay-cli                      # once; run.sh already did this
+./target/debug/relay remote serve --pair      # opens the WiFi door and prints a QR code
+```
+
+On the phone: install the app, open the drawer, tap **PC**, **Pair a PC**, scan. Leave that
+terminal running; `./target/debug/relay remote pair` in another terminal adds a second phone.
+For the phone to reach the PC when you are out, see §2.
+
 ## 1. Serve the door on the PC
 
 With an engine running (`relay serve`, or the desktop app):

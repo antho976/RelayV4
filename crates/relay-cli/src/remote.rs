@@ -127,7 +127,34 @@ async fn sigterm() {
     }
 }
 
-pub async fn run(instance: Instance, cmd: RemoteCommand) -> Result<u8> {
+/// The desktop launcher runs the `dev` engine by default and `relay` defaults to `stable`, so
+/// the first thing a person types would otherwise be answered with "no engine". When the
+/// asked-for instance has no engine and exactly one other does, use that one and say so;
+/// `remote.json` is per instance, so pairing follows the engine it belongs to.
+async fn resolve_instance(requested: Instance) -> Instance {
+    if relay_core::socket::probe(&requested.socket_path()).await {
+        return requested;
+    }
+    let mut alive = Vec::new();
+    for candidate in [Instance::Stable, Instance::Dev, Instance::Test] {
+        if candidate != requested && relay_core::socket::probe(&candidate.socket_path()).await {
+            alive.push(candidate);
+        }
+    }
+    match alive.as_slice() {
+        [only] => {
+            eprintln!("relay remote: no {requested} engine is running; using the {only} engine (pass --instance to choose)");
+            *only
+        }
+        _ => requested,
+    }
+}
+
+pub async fn run(requested: Instance, cmd: RemoteCommand) -> Result<u8> {
+    let instance = match cmd {
+        RemoteCommand::Rendezvous { .. } => requested,
+        _ => resolve_instance(requested).await,
+    };
     let ctx = Arc::new(Ctx::for_instance(instance));
     match cmd {
         RemoteCommand::Serve { bind, pair, no_rendezvous } => {
@@ -135,7 +162,7 @@ pub async fn run(instance: Instance, cmd: RemoteCommand) -> Result<u8> {
             let addr: SocketAddr = bind.parse().with_context(|| format!("bad --bind {bind:?}"))?;
             if !relay_core::socket::probe(&ctx.socket_path).await {
                 eprintln!(
-                    "relay remote: no engine answering at {} — start one with `relay serve` or the desktop app first",
+                    "relay remote: no engine answering at {} — start one with `./run.sh`, `relay serve`, or `relay serve --remote` (which needs no second command)",
                     ctx.socket_path.display()
                 );
                 return Ok(5);
