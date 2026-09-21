@@ -37,13 +37,27 @@ on:
 permissions:
     contents: write
 
+# One APK build per branch at a time; a newer push supersedes the one still compiling.
+concurrency:
+    group: mobile-apk-${{ github.ref }}
+    cancel-in-progress: true
+
 jobs:
     build-apk:
         if: ${{ github.event_name != 'push' || github.ref_type == 'tag' || contains(github.event.head_commit.message, '[apk]') }}
         runs-on: ubuntu-latest
         timeout-minutes: 120
         env:
-            ARCHS: ${{ github.event.inputs.architectures || 'arm64-v8a,armeabi-v7a' }}
+            # arm64-v8a is every phone sold in the last decade; armeabi-v7a doubles the native
+            # build for devices that could not run an on-device model anyway.
+            ARCHS: ${{ github.event.inputs.architectures || 'arm64-v8a' }}
+            # cui-llama.rn ships no prebuilt libraries in this version and compiles llama.cpp
+            # once per CPU-feature variant. All seven variants for two ABIs took the runner
+            # down after 70 minutes. Three cover the fleet: the generic library every device
+            # loads, dotprod for phones from ~2018, and dotprod+i8mm for those from ~2020.
+            # The loader in RNLlama.java falls back from the fastest present to the generic
+            # one, so a phone never sees a missing variant.
+            RNLLAMA_VARIANTS: rnllama,rnllama_v8_2_dotprod,rnllama_v8_2_dotprod_i8mm
             HAS_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
         defaults:
             run:
@@ -67,6 +81,14 @@ jobs:
 
             - name: Set up Gradle cache
               uses: gradle/actions/setup-gradle@v4
+
+            # cui-llama.rn's CMake picks up ccache when it is on PATH, so a rebuild after a
+            # JavaScript-only change compiles almost nothing.
+            - name: Set up compiler cache
+              uses: hendrikmuhs/ccache-action@v1.2
+              with:
+                  key: mobile-apk-${{ env.ARCHS }}
+                  max-size: 1G
 
             - name: Install dependencies
               run: npm ci
@@ -115,7 +137,10 @@ jobs:
               working-directory: apps/relay-mobile/android
               run: |
                   sed -i 's/^org.gradle.jvmargs=.*/org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m/' gradle.properties
-                  ./gradlew :app:assembleRelease -PreactNativeArchitectures="$ARCHS" --no-daemon
+                  ./gradlew :app:assembleRelease \
+                      -PreactNativeArchitectures="$ARCHS" \
+                      -PrnllamaVariants="$RNLLAMA_VARIANTS" \
+                      --no-daemon
 
             - name: Collect APK
               id: collect
