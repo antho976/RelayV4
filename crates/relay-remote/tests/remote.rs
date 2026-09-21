@@ -301,4 +301,30 @@ async fn a_terminal_streams_to_the_phone() {
     let listed = call(&mut ws, "session.list", json!({})).await;
     assert_eq!(listed["ok"], true, "{listed}");
     assert_eq!(listed["result"]["sessions"].as_array().map(|s| s.len()), Some(0));
+
+    // The phone's "New request": exactly the payloads the app sends, so a schema drift on
+    // either side fails here rather than on a phone. `start: false` stages the dispatch
+    // without needing a provider binary on the test machine.
+    let project_id = project["result"]["id"].clone();
+    let task = call(&mut ws, "task.create", json!({"project_id": project_id, "title": "Fix the flaky login test", "body": "Fix the flaky login test\nand explain what was wrong."})).await;
+    assert_eq!(task["ok"], true, "{task}");
+    let dispatched = call(&mut ws, "task.dispatch", json!({
+        "task_id": task["result"]["id"],
+        "create": {"project_id": project_id, "provider": "claude", "role": "builder"},
+        "start": false,
+    })).await;
+    assert_eq!(dispatched["ok"], true, "{dispatched}");
+    let name = dispatched["result"]["session"]["name"].as_str().unwrap().to_string();
+    assert_eq!(dispatched["result"]["task"]["column"], "active");
+
+    // The one-off shape: a session with the text as its opening prompt.
+    let created = call(&mut ws, "session.create", json!({"project_id": project_id, "provider": "codex", "role": "docs", "prompt": "Write the README."})).await;
+    assert_eq!(created["ok"], true, "{created}");
+
+    // Mail to the dispatched session, as the terminal's "mail" action sends it.
+    let mailed = call(&mut ws, "mailbox.send", json!({"project_id": project_id, "to": name, "text": "Also update the changelog.", "priority": true})).await;
+    assert_eq!(mailed["ok"], true, "{mailed}");
+
+    let listed = call(&mut ws, "session.list", json!({})).await;
+    assert_eq!(listed["result"]["sessions"].as_array().map(|s| s.len()), Some(2));
 }

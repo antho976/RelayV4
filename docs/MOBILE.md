@@ -87,6 +87,10 @@ the PC that holds the secret can host it, and a restart forgets nothing worth ke
 
 Everything goes through existing bus ops, so the list is the bus's:
 
+- **Requests**: a project, a piece of text, and an agent starts on it — `task.create` and
+  `task.dispatch` with a fresh session by default, or `session.create` + `session.spawn`
+  with the text as the opening prompt. **Mail** to a running session is `mailbox.send` with
+  priority, which reaches a busy agent at its next bus call.
 - **Sessions**: the wall as a list with Relay's lamps; open one for its terminal
   (`session.scrollback` + `session.attach`), type to it (`session.input`), park, wake, resume.
 - **Needs you**: open guardrail holds with *Allow once* / *Deny* (`guardrail.confirm` /
