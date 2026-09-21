@@ -32,6 +32,10 @@ A running engine is reused without replacement; after engine code changes,
 it needs a deliberate restart to pick them up. Closing the window keeps the
 engine, sessions and worktrees alive.
 
+A phone can reach the same engine through `relay remote serve`: on the LAN
+directly, or from anywhere through a rendezvous server you host. See
+[docs/MOBILE.md](docs/MOBILE.md); the app is the `antho976/ChatterUI` fork.
+
 Open a repository from the sidebar, then add solo agents or a group of
 one or two builders sharing a reviewer. Code can edit the primary checkout or
 an agent worktree. Board, Notes, Skills, Settings, usage and Android device tools

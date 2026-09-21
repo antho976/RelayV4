@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 mod mcp;
+mod remote;
 
 #[derive(Parser)]
 #[command(name = "relay", version, about = "RELAY v4 command bus CLI", long_about = None)]
@@ -60,6 +61,11 @@ enum Command {
     },
     /// Serve callable bus ops as MCP tools over stdio
     Mcp,
+    /// The phone door: pair a phone, serve it on the LAN or through a rendezvous you host
+    Remote {
+        #[command(subcommand)]
+        remote: remote::RemoteCommand,
+    },
     /// Internal provider hook adapters. Enforcement fails closed; lifecycle reports are best-effort.
     #[command(hide = true)]
     Hook {
@@ -203,6 +209,7 @@ async fn run(cli: Cli) -> Result<u8> {
             let (actor, token) = actor_from_env(cli.actor.as_deref())?;
             mcp::serve(instance, actor, token).await
         }
+        Command::Remote { remote } => remote::run(instance, remote).await,
         Command::Schema { op } => {
             match op {
                 None => print!("{}", relay_bus::schema::render_pretty()),
