@@ -806,11 +806,13 @@ fn a_plugin_that_is_on_reaches_every_agent_of_its_project() {
     assert_eq!(ok(&f.engine, "plugin.list", json!({}))["plugins"][0]["suggested_for"], json!([]));
     // The refresh runs after commit on its own thread; the running agent's checkout gets the
     // skill folders without a relaunch.
-    let skill = off_tree.join(".claude/skills/unreal-fundamentals/SKILL.md");
-    wait_until("plugin skills in a running worktree", || skill.is_file());
-    assert!(std::fs::read_to_string(&skill).unwrap().starts_with("---\nname: unreal-fundamentals"));
-    assert!(off_tree.join(".agents/skills/unreal-editor-automation/SKILL.md").is_file());
-    wait_until("plugin skills in the project root", || f.repo.join(".claude/skills/unreal-cpp/SKILL.md").is_file());
+    // Each folder's marker is written last, and `.agents/` after `.claude/`, so wait on markers.
+    let marker = relay_core::skills::MARKER;
+    let skill = off_tree.join(".claude/skills/unreal-fundamentals");
+    wait_until("plugin skills in a running worktree", || skill.join(marker).is_file());
+    assert!(std::fs::read_to_string(skill.join("SKILL.md")).unwrap().starts_with("---\nname: unreal-fundamentals"));
+    wait_until("plugin skills in .agents", || off_tree.join(".agents/skills/unreal-editor-automation").join(marker).is_file());
+    wait_until("plugin skills in the project root", || f.repo.join(".claude/skills/unreal-cpp").join(marker).is_file());
     ok(&f.engine, "session.close", json!({"session": off_name}));
 
     let created = ok(&f.engine, "session.create", json!({"project_id": 1, "provider": "claude"}));
