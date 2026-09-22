@@ -6,7 +6,7 @@ parented to `ORG-`/`MCH-` bones rather than to each other. A deform-only FBX exp
 non-deform ancestor of a deform bone, so exporting `rig` directly gives a messy hierarchy with
 extra roots. The procedure below builds a separate armature from the `DEF-` bones with a proper
 parent chain and a single `root`, drives it from the Rigify rig, and that armature is what you
-bake actions onto and export.
+bake actions onto and export (object `Armature`, armature data `SK_Hero`).
 
 Every `blender_python` call that touches Rigify needs `addons: ["rigify"]` (Blender runs with
 factory settings). Third-party add-ons automate the same idea; they are not bundled, so do not
@@ -67,7 +67,9 @@ rest = {n: (rig.data.edit_bones[n].head.copy(), rig.data.edit_bones[n].tail.copy
             rig.data.edit_bones[n].roll) for n in keep}
 bpy.ops.object.mode_set(mode="OBJECT")
 
-exp = bpy.data.objects.new("SK_Hero", bpy.data.armatures.new("SK_Hero"))
+# Object named "Armature": Unreal drops that FBX node instead of adding an extra root bone
+# (see blender-to-unreal). Only one object can have the name - rename any other first.
+exp = bpy.data.objects.new("Armature", bpy.data.armatures.new("SK_Hero"))
 bpy.context.scene.collection.objects.link(exp)
 exp.matrix_world = rig.matrix_world.copy()
 bpy.context.view_layer.objects.active = exp
@@ -110,7 +112,7 @@ export skeleton with visual keying. The Copy Transforms constraints stay (`clear
 so the next action bakes the same way:
 
 ```python
-rig, exp = bpy.data.objects["rig"], bpy.data.objects["SK_Hero"]
+rig, exp = bpy.data.objects["rig"], bpy.data.objects["Armature"]
 src = bpy.data.actions["A_Hero_Wave_ctrl"]          # the action authored on the Rigify rig
 rig.animation_data.action = src
 f0, f1 = map(int, src.frame_range)
@@ -132,15 +134,15 @@ print(baked.name, tuple(baked.frame_range), len(baked.fcurves))
 Name the control-rig actions differently from the baked ones (here `_ctrl`) so nobody exports
 the wrong one. `all_actions` only exports actions whose F-curve paths all resolve on the exported
 armature, so `_ctrl` actions are skipped by it - but a baked action of another character with the
-same bone names is not. Export `SK_Hero`, never `rig`:
-`blender_export {objects: ["SK_Hero"], kind: "skeletal"}`, or `kind: "animation"` with `action`.
+same bone names is not. Export `Armature`, never `rig`:
+`blender_export {objects: ["Armature"], kind: "skeletal"}`, or `kind: "animation"` with `action`.
 
 **Mute the constraints before exporting.** The FBX exporter samples the evaluated pose, so with
 the Copy Transforms constraints live every exported take would show whatever action `rig` has
 assigned, not the baked one. Mute them (and save with `save_as`), export, and unmute to bake more:
 
 ```python
-exp = bpy.data.objects["SK_Hero"]
+exp = bpy.data.objects["Armature"]
 for pb in exp.pose.bones:
     for c in pb.constraints:
         if c.type == "COPY_TRANSFORMS":
@@ -149,8 +151,8 @@ for pb in exp.pose.bones:
 
 ## 4. Check
 
-- `blender_rig_check {armature: "SK_Hero"}`: one root, no vertex groups without bones.
-- `blender_anim_inspect {armature: "SK_Hero", action: "A_Hero_Wave", track: ["hand.L", "hand.R"]}`
+- `blender_rig_check {armature: "Armature"}`: one root, no vertex groups without bones.
+- `blender_anim_inspect {armature: "Armature", action: "A_Hero_Wave", track: ["hand.L", "hand.R"]}`
   and the same call on `rig` (with `action: "A_Hero_Wave_ctrl"`, `track: ["DEF-hand.L", "DEF-hand.R"]`):
   the positions must match at every sample.
 - `blender_render {objects: [<mesh>], action: "A_Hero_Wave", frames: [...]}` at the key frames.

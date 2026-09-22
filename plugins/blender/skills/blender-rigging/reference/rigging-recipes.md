@@ -57,6 +57,10 @@ print(sorted(b.name for b in arm.data.bones))
 ```
 
 Roll types: `bpy.ops.armature.calculate_roll.get_rna_type().properties["type"].enum_items.keys()`.
+Symmetrize rebuilds the twin bones from the source side, including pose settings such as
+rotation mode: in testing, an existing action keying `upper_arm.R` Euler rotation stopped moving
+the arm because the rebuilt bone was back in quaternion mode. Symmetrize before animating, or
+re-check every action afterwards.
 
 ## 4. Mirror report: positions and rolls of .L/.R pairs
 

@@ -34,7 +34,9 @@ in code; say so if asked.
 - **One root bone at the origin**, named `root`, head at (0,0,0), everything parented under it.
   Unreal takes the first bone as the root; two top-level bones are a hard failure
   (`blender_rig_check` flags it). The root is where root motion lives.
-- **Armature object at the origin with identity transform** (location 0, rotation 0, scale 1).
+- **Armature object named `Armature`, at the origin with identity transform** (location 0,
+  rotation 0, scale 1). Another object name can become an extra root bone in Unreal
+  (`blender-to-unreal`); the examples here use `Hero` only for readability.
   Apply scale and rotation to the armature *and its meshes together* (recipe 2). An unapplied
   0.01 or 100 scale is the classic "character is 100x" / "root bone scale is not 1" import.
 - **Character faces -Y, Z up, feet on Z=0.** Rest pose is a clean T- or A-pose.
@@ -207,7 +209,7 @@ hierarchy is not a clean game skeleton. Options:
 | Wrist or forearm collapses when the hand twists | No twist bones | Section 7 |
 | Mirrored pose bends the other side the wrong way | Rolls not mirrored; right side built by hand | Delete the right side, symmetrize; run the mirror report |
 | Import is 100x or root bone scale 0.01 | Scale not applied (armature or meshes) | Apply rotation+scale to armature and meshes together, re-export |
-| Extra root bone named after the armature in Unreal | FBX armature node treated as a bone | Check the imported skeleton; the common fix is naming the armature object `Armature`; verify with `blender_to_unreal` |
+| Extra root bone named after the armature in Unreal | Armature object not named `Armature`, so its FBX node becomes a bone | Name the armature object `Armature` (`blender-to-unreal`); verify with `blender_to_unreal` |
 | Vertices stay behind at the origin | Unweighted verts | Count them; weight or merge |
 | Spiky deformation | Tiny stray weights on far bones | Clean < 0.01, limit total, normalize |
 | Mesh doubles/offsets when posed | Mesh parented with an unapplied or non-identity offset | Apply the mesh transform, re-parent (keep transform) |
