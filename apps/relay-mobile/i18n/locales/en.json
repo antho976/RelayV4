@@ -19,8 +19,8 @@
     },
     "appMode": {
         "options": {
-            "local": "Local",
-            "remote": "Remote"
+            "local": "On device",
+            "remote": "API"
         },
         "title": "App Mode"
     },

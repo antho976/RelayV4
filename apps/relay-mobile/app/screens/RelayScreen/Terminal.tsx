@@ -17,6 +17,7 @@ import { TerminalText } from '@lib/engine/Relay/Terminal'
 import { Logger } from '@lib/state/Logger'
 import { Theme } from '@lib/theme/ThemeManager'
 
+import { palette } from './console'
 import Lamp from './Lamp'
 import SummarySheet, { SummarySheetRef } from './SummarySheet'
 
@@ -268,49 +269,48 @@ const Strip: React.FC<{
 }> = ({ session, onLifecycle, onMail, onChanges, onSummarize }) => {
     const styles = useStyles()
     if (!session) return null
-    const canMail =
+    const awake =
         session.state === 'running' || session.state === 'idle' || session.state === 'blocked'
-    const canPark =
-        session.state === 'running' || session.state === 'idle' || session.state === 'blocked'
-    const canWake = session.state === 'parked'
-    const canResume = session.state === 'restorable'
+    // The actions that apply right now, in the order a person reaches for them.
+    const actions: { label: string; onPress: () => void }[] = [
+        { label: 'Summary', onPress: onSummarize },
+        { label: 'Changes', onPress: onChanges },
+        ...(awake ? [{ label: 'Mail', onPress: onMail }] : []),
+        ...(awake ? [{ label: 'Park', onPress: () => onLifecycle('session.park') }] : []),
+        ...(session.state === 'parked'
+            ? [{ label: 'Wake', onPress: () => onLifecycle('session.wake') }]
+            : []),
+        ...(session.state === 'restorable'
+            ? [{ label: 'Resume', onPress: () => onLifecycle('session.resume') }]
+            : []),
+    ]
     return (
         <View style={styles.strip}>
-            <Lamp state={session.state} />
-            <Text
-                numberOfLines={1}
-                style={[styles.stripName, session.state === 'blocked' && styles.held]}>
-                {session.name}
-            </Text>
-            <Text style={styles.stripMeta}>
-                {session.provider} · {session.role} · {session.state}
-            </Text>
-            <TouchableOpacity onPress={onSummarize}>
-                <Text style={styles.stripAction}>sum</Text>
-            </TouchableOpacity>
-            <TouchableOpacity onPress={onChanges}>
-                <Text style={styles.stripAction}>diff</Text>
-            </TouchableOpacity>
-            {canMail && (
-                <TouchableOpacity onPress={onMail}>
-                    <Text style={styles.stripAction}>mail</Text>
-                </TouchableOpacity>
-            )}
-            {canPark && (
-                <TouchableOpacity onPress={() => onLifecycle('session.park')}>
-                    <Text style={styles.stripAction}>park</Text>
-                </TouchableOpacity>
-            )}
-            {canWake && (
-                <TouchableOpacity onPress={() => onLifecycle('session.wake')}>
-                    <Text style={styles.stripAction}>wake</Text>
-                </TouchableOpacity>
-            )}
-            {canResume && (
-                <TouchableOpacity onPress={() => onLifecycle('session.resume')}>
-                    <Text style={styles.stripAction}>resume</Text>
-                </TouchableOpacity>
-            )}
+            <View style={styles.identity}>
+                <Lamp state={session.state} />
+                <Text
+                    numberOfLines={1}
+                    style={[styles.stripName, session.state === 'blocked' && styles.held]}>
+                    {session.name}
+                </Text>
+                <Text numberOfLines={1} style={styles.stripMeta}>
+                    {session.provider} · {session.role} · {session.state}
+                </Text>
+            </View>
+            <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                contentContainerStyle={styles.actions}>
+                {actions.map((action) => (
+                    <TouchableOpacity
+                        key={action.label}
+                        style={styles.action}
+                        hitSlop={6}
+                        onPress={action.onPress}>
+                        <Text style={styles.actionText}>{action.label}</Text>
+                    </TouchableOpacity>
+                ))}
+            </ScrollView>
         </View>
     )
 }
@@ -319,14 +319,17 @@ const useStyles = () => {
     const { color, spacing, fontSize } = Theme.useTheme()
     return StyleSheet.create({
         strip: {
-            flexDirection: 'row',
-            alignItems: 'center',
-            columnGap: spacing.m,
+            rowGap: spacing.s,
             paddingHorizontal: spacing.m,
-            minHeight: 30,
+            paddingVertical: spacing.s,
             backgroundColor: color.neutral._200,
             borderBottomColor: color.neutral._400,
             borderBottomWidth: 1,
+        },
+        identity: {
+            flexDirection: 'row',
+            alignItems: 'center',
+            columnGap: spacing.m,
         },
         stripName: {
             flexShrink: 1,
@@ -341,16 +344,22 @@ const useStyles = () => {
             color: color.text._400,
             fontSize: fontSize.s,
         },
-        stripAction: {
+        actions: {
+            columnGap: spacing.s,
+        },
+        action: {
+            paddingHorizontal: spacing.m,
+            paddingVertical: 3,
+            borderRadius: 12,
+            backgroundColor: color.neutral._300,
+        },
+        actionText: {
             color: color.text._200,
             fontSize: fontSize.s,
-            paddingHorizontal: spacing.s,
-            letterSpacing: 0.8,
-            textTransform: 'uppercase',
         },
         screen: {
             flex: 1,
-            backgroundColor: '#0a0a0b',
+            backgroundColor: palette.ink,
         },
         screenContent: {
             paddingLeft: 10,
@@ -359,7 +368,7 @@ const useStyles = () => {
             paddingBottom: 12,
         },
         mono: {
-            color: '#ececea',
+            color: palette.paper,
             fontFamily: 'monospace',
             fontSize: 12,
             lineHeight: 16,
@@ -402,7 +411,7 @@ const useStyles = () => {
             minHeight: 36,
             maxHeight: 120,
             color: color.text._100,
-            backgroundColor: '#0a0a0b',
+            backgroundColor: palette.ink,
             borderColor: color.neutral._500,
             borderWidth: 1,
             borderRadius: 2,
