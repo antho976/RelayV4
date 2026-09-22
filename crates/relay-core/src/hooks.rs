@@ -389,7 +389,7 @@ pub fn install_claude(worktree: &Path, instance: Instance, relay: &Path) -> Resu
 /// [`install_claude`] (D159). Relay's own `relay` entry is never replaced.
 pub fn add_claude_mcp_servers(
     worktree: &Path,
-    servers: &[(String, String, Vec<String>, std::collections::BTreeMap<String, String>)],
+    servers: &[crate::plugins::LaunchServer],
 ) -> Result<()> {
     if servers.is_empty() {
         return Ok(());

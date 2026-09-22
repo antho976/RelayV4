@@ -301,6 +301,7 @@ well, so keep branching conversations in Data Assets, or put choices in a second
 ## 5. Barks
 
 ```cpp
+// #include "Engine/DataTable.h", "GameplayTagContainer.h", "StoryStateSubsystem.h"
 USTRUCT(BlueprintType)
 struct FBarkRow : public FTableRowBase
 {
@@ -319,8 +320,8 @@ struct FBarkRow : public FTableRowBase
 Selection (inside a `UBarkSubsystem : UWorldSubsystem`, with `TMap<FName, double> LastPlayed` per row and
 `TMap<TWeakObjectPtr<AActor>, double> SpeakerBusyUntil`):
 1. Reject the request if the speaker is busy (unless its priority is higher than the playing bark's) or the global cap is reached (for example 2 barks at once).
-2. Candidates are the rows whose `Context` matches the request (`MatchesTag`, so `Bark.Combat.Reload.Shotgun` can fall
-   back to `Bark.Combat.Reload`), whose `Speaker` matches, whose `Condition` passes, and that are off cooldown.
+2. Candidates are the rows where `RequestTag.MatchesTag(Row.Context)` is true (so a `Bark.Combat.Reload.Shotgun` request
+   also accepts generic `Bark.Combat.Reload` rows), whose `Speaker` matches, whose `Condition` passes, and that are off cooldown.
 3. Remove the row played most recently by this speaker (no back-to-back repeats).
 4. Pick a weighted random row (`FMath::FRandRange(0, TotalWeight)`), play it attached to the speaker
    (`UGameplayStatics::SpawnSoundAttached`), show a world-space or subtitle line, and record the times.

@@ -256,14 +256,17 @@ pub fn docs(plugin: &Loaded) -> Vec<PluginDoc> {
         .collect()
 }
 
+/// One plugin MCP server ready for a provider configuration: name, command, args, env.
+pub type LaunchServer = (String, String, Vec<String>, BTreeMap<String, String>);
+
 /// The MCP servers every enabled plugin contributes to a project, as `(name, command, args,
 /// env)` ready for a provider configuration. `relay` resolves to this Relay binary.
 pub fn mcp_servers(
     conn: &Connection,
     project_id: Id,
     relay: &Path,
-) -> Result<Vec<(String, String, Vec<String>, BTreeMap<String, String>)>> {
-    let mut out: Vec<(String, String, Vec<String>, BTreeMap<String, String>)> = Vec::new();
+) -> Result<Vec<LaunchServer>> {
+    let mut out: Vec<LaunchServer> = Vec::new();
     for plugin in enabled_for(conn, project_id)? {
         for server in &plugin.manifest.mcp_servers {
             // `relay` is reserved for the bus's own server; a plugin cannot shadow it.
