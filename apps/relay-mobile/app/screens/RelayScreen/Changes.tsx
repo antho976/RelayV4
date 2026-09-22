@@ -7,6 +7,8 @@ import HeaderTitle from '@components/views/HeaderTitle'
 import { relay, useRelayStore } from '@lib/engine/Relay/RelayClient'
 import { Theme } from '@lib/theme/ThemeManager'
 
+import { palette } from './console'
+
 type DiffFile = {
     path: string
     old_path: string | null
@@ -145,7 +147,7 @@ const ChangesScreen = () => {
                                 <Text style={styles.meta}>binary</Text>
                             ) : (
                                 <Text style={styles.counts}>
-                                    <Text style={{ color: '#2ec469' }}>+{file.added}</Text>{' '}
+                                    <Text style={{ color: palette.live }}>+{file.added}</Text>{' '}
                                     <Text style={{ color: color.error._300 }}>-{file.removed}</Text>
                                 </Text>
                             )}
@@ -245,7 +247,7 @@ const useStyles = () => {
             fontSize: fontSize.s,
         },
         diff: {
-            backgroundColor: '#0a0a0b',
+            backgroundColor: palette.ink,
             paddingHorizontal: spacing.m,
             paddingVertical: spacing.s,
             marginBottom: spacing.s,
@@ -257,13 +259,13 @@ const useStyles = () => {
             marginTop: spacing.s,
         },
         line: {
-            color: '#dcdcda',
+            color: palette.paper,
             fontFamily: 'monospace',
             fontSize: 11,
             lineHeight: 15,
         },
         added: {
-            color: '#2ec469',
+            color: palette.live,
         },
         removed: {
             color: color.error._200,

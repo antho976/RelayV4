@@ -118,7 +118,8 @@ const useStyles = () => {
     const { color, spacing, fontSize } = Theme.useTheme()
     return StyleSheet.create({
         record: {
-            backgroundColor: color.neutral._300,
+            backgroundColor: color.neutral._200,
+            borderRadius: 12,
             padding: spacing.l,
             rowGap: spacing.m,
         },

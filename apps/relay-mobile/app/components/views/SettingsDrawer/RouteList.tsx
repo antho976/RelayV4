@@ -101,6 +101,10 @@ const useStyles = () => {
     })
 }
 
+/**
+ * Two things a person does here, then what shapes the model, then the app itself. Every
+ * entry is one tap deep: a group with a single child is a tap for nothing.
+ */
 const getPaths = (remote: boolean, t: (input: string) => string): ButtonData[] => [
     {
         name: 'PC',
@@ -129,15 +133,9 @@ const getPaths = (remote: boolean, t: (input: string) => string): ButtonData[] =
         icon: 'profile',
     },
     {
-        name: t('navigation.dataSources'),
-        path: [
-            {
-                name: t('navigation.lorebooks'),
-                path: '/screens/LorebookManagerScreen',
-                icon: 'book',
-            },
-        ],
-        icon: 'file-search',
+        name: t('navigation.lorebooks'),
+        path: '/screens/LorebookManagerScreen',
+        icon: 'book',
     },
     {
         name: t('navigation.tts'),
