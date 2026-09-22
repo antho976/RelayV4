@@ -395,11 +395,15 @@ fn to_unreal(root: &Path, args: &Value) -> Result<Value> {
         "problems": checks, "passed": checks.is_empty()}))
 }
 
-/// What should survive the trip: height (Z is up on both sides), a root bone scale of 1, and a
-/// character that still has its hands on the right sides.
+/// What should survive the trip: height (Z is up on both sides), a root bone scale of 1, and the
+/// character's facing. Sides are worked out from bone names on both sides, so a mirrored rig
+/// would still look right-handed; the facing is what changes. Blender's (x, y, z) arrives in
+/// Unreal as (x, -y, z) with the export's default axes.
 fn compare(exported: &Value, imported: &Value) -> Vec<String> {
     let mut problems = Vec::new();
     let blender_height = exported["size_cm"][2].as_f64();
+    let expected_forward = exported["forward_world"].as_array()
+        .and_then(|f| Some([f.first()?.as_f64()?, -f.get(1)?.as_f64()?, f.get(2)?.as_f64()?]));
     for asset in imported["imported"].as_array().cloned().unwrap_or_default() {
         let path = asset["path"].as_str().unwrap_or("?");
         if let (Some(b), Some(u)) = (blender_height, asset["size_cm"][2].as_f64()) {
@@ -422,12 +426,15 @@ fn compare(exported: &Value, imported: &Value) -> Vec<String> {
                 problems.push(format!("{path}: root bone scale is {scale:?}, not 1; animations and attachments will be scaled. Apply scale in Blender and export with apply_scale_options FBX_SCALE_ALL"));
             }
         }
-        if let Some(sides) = asset["hand_sides"].as_object() {
-            for (bone, side) in sides {
-                let expected = if bone.ends_with("_l") || bone.ends_with(".L") || bone.ends_with("_L") || bone.contains("Left") || bone.contains("left") { "left" } else { "right" };
-                if side != expected {
-                    problems.push(format!("{path}: {bone} ends up on the character's {side} side; the character is mirrored (check export axes and negative scale)"));
-                }
+        let actual = asset["forward_axis_in_mesh_space"].as_array()
+            .and_then(|f| Some([f.first()?.as_f64()?, f.get(1)?.as_f64()?, f.get(2)?.as_f64()?]));
+        if let (Some(e), Some(a)) = (expected_forward, actual) {
+            let dot = e[0] * a[0] + e[1] * a[1] + e[2] * a[2];
+            if dot < 0.9 {
+                problems.push(format!(
+                    "{path}: the character faces {a:?} in Unreal's mesh space, expected {e:?} from Blender; {}",
+                    if dot < -0.9 { "it is mirrored or turned around - check negative scale, swapped .L/.R names and the export axes" } else { "it is rotated - apply rotation in Blender and check the export axes" }
+                ));
             }
         }
     }
@@ -459,15 +466,17 @@ mod tests {
     }
 
     #[test]
-    fn a_round_trip_flags_units_root_scale_and_mirroring() {
-        let exported = json!({"size_cm": [60.0, 20.0, 178.0]});
-        let good = json!({"imported": [{"path": "/Game/Hero", "size_cm": [60.0, 20.0, 178.2], "root_bone_scale": [1.0, 1.0, 1.0], "hand_sides": {"hand_l": "left", "hand_r": "right"}}]});
-        assert!(compare(&exported, &good).is_empty());
-        let bad = json!({"imported": [{"path": "/Game/Hero", "size_cm": [6000.0, 2000.0, 17800.0], "root_bone_scale": [100.0, 100.0, 100.0], "hand_sides": {"hand_l": "right", "hand_r": "left"}}]});
+    fn a_round_trip_flags_units_root_scale_and_facing() {
+        let exported = json!({"size_cm": [60.0, 20.0, 178.0], "forward_world": [0.0, -1.0, 0.0]});
+        let good = json!({"imported": [{"path": "/Game/Hero", "size_cm": [60.0, 20.0, 178.2], "root_bone_scale": [1.0, 1.0, 1.0], "forward_axis_in_mesh_space": [0.0, 1.0, 0.0]}]});
+        assert!(compare(&exported, &good).is_empty(), "{:?}", compare(&exported, &good));
+        let bad = json!({"imported": [{"path": "/Game/Hero", "size_cm": [6000.0, 2000.0, 17800.0], "root_bone_scale": [100.0, 100.0, 100.0], "forward_axis_in_mesh_space": [0.0, -1.0, 0.0]}]});
         let problems = compare(&exported, &bad);
         assert!(problems[0].contains("unit mismatch"), "{problems:?}");
         assert!(problems.iter().any(|p| p.contains("root bone scale")));
-        assert_eq!(problems.iter().filter(|p| p.contains("mirrored")).count(), 2);
+        assert!(problems.iter().any(|p| p.contains("mirrored or turned around")));
+        let turned = json!({"imported": [{"path": "/Game/Hero", "size_cm": [60.0, 20.0, 178.0], "forward_axis_in_mesh_space": [1.0, 0.0, 0.0]}]});
+        assert!(compare(&exported, &turned)[0].contains("rotated"));
     }
 
     /// Runs every Blender script against a fixture built by `blender_py/tests/make_fixture.py`,

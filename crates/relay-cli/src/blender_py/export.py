@@ -65,7 +65,12 @@ if "FINISHED" not in result:
     raise RuntimeError("the FBX exporter returned %s" % result)
 meshes = [o for o in selected if o.type == "MESH" and not o.name.startswith(("UCX_", "UBX_", "USP_"))]
 lo, hi = world_bbox(meshes) if meshes else (None, None)
-emit({"path": path, "bytes": os.path.getsize(path), "kind": kind,
+facing = None
+if arm is not None and kind != "static":
+    f = body_frame(arm)
+    if f["pairs"]:
+        facing = rnd(f["forward"], 3)
+emit({"path": path, "bytes": os.path.getsize(path), "kind": kind, "forward_world": facing,
       "objects": sorted(o.name for o in selected),
       "sockets": sorted(o.name for o in selected if o.type == "EMPTY" and o.name.startswith("SOCKET_")),
       "collision": sorted(o.name for o in selected if o.name.startswith(("UCX_", "UBX_", "USP_"))),
