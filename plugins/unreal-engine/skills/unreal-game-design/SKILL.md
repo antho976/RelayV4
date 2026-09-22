@@ -11,7 +11,8 @@ cheapest prototype that answers the open question, and measure the result. This 
 design side. For implementation, see `unreal-gameplay-framework`, `unreal-cpp`,
 `unreal-blueprints`, `unreal-gas` (abilities, attributes, effects), `unreal-multiplayer`,
 `unreal-level-environment` (spaces), `unreal-narrative` (story, quests, dialogue),
-`unreal-audio` and `unreal-materials-vfx` (feedback).
+`unreal-audio` and `unreal-materials-vfx` (feedback), `unreal-ui-umg` (HUD, menus, settings screens),
+`unreal-ai` (enemy behavior) and `unreal-performance` (frame budgets).
 
 Reference files. Read each one when its topic comes up:
 - `reference/gdd-template.md`: read it before you write or restructure a GDD, a one-page design or a feature spec.

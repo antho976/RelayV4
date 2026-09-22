@@ -17,7 +17,8 @@ Reference files. Read each one when its topic comes up:
 Related skills: `unreal-game-design` (pillars, loops, pacing), `unreal-level-environment`
 (environmental storytelling spaces, Data Layers for world states), `unreal-audio` (VO playback,
 concurrency, ducking), `unreal-gameplay-framework` (subsystems, game instance, save flow),
-`unreal-cpp`, `unreal-blueprints`, and `unreal-multiplayer` (where story state is authoritative).
+`unreal-ui-umg` (dialogue, subtitle and journal widgets), `unreal-animation` (cinematic and dialogue
+animation), `unreal-cpp`, `unreal-blueprints`, and `unreal-multiplayer` (where story state is authoritative).
 
 ## 1. Story structure, adapted for play
 

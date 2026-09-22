@@ -18,7 +18,9 @@ Reference files. Read each one when its topic comes up:
 Related skills: `unreal-game-design` (what the level must teach and test), `unreal-narrative`
 (environmental storytelling beats, trigger volumes for story), `unreal-materials-vfx` (landscape
 and master materials, decals), `unreal-gameplay-framework` (game mode, spawning, triggers),
-`unreal-multiplayer` (replicated level actors), and `unreal-audio` (ambient zones).
+`unreal-multiplayer` (replicated level actors), `unreal-audio` (ambient zones), `unreal-ai` (navigation
+use), `unreal-performance` (profiling), `unreal-editor-automation` (general editor Python) and
+`unreal-source-control` (committing OFPA files).
 
 ## 1. Workflow order
 
