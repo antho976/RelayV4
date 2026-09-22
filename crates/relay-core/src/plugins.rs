@@ -47,6 +47,11 @@ pub struct Manifest {
     pub detect: Vec<String>,
     #[serde(default)]
     pub mcp_servers: Vec<McpServer>,
+    /// Where a new agent of an enabled project works when `session.create` names no checkout:
+    /// `"primary"` for tools that act on one shared checkout (a running Unreal editor has
+    /// exactly one project open). Absent means Relay's default, a new worktree.
+    #[serde(default)]
+    pub default_checkout: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -198,6 +203,15 @@ pub fn projects_for(conn: &Connection, plugin_id: &str) -> Result<Vec<Id>> {
     )?;
     let ids = stmt.query_map([plugin_id], |row| row.get(0))?.collect::<rusqlite::Result<Vec<Id>>>()?;
     Ok(ids)
+}
+
+/// The checkout a new session of this project gets when the request names none: `"primary"`
+/// when an enabled plugin asks for it (D160), otherwise a new worktree.
+pub fn default_checkout(conn: &Connection, project_id: Id) -> Result<&'static str> {
+    let primary = enabled_for(conn, project_id)?
+        .iter()
+        .any(|plugin| plugin.manifest.default_checkout.as_deref() == Some("primary"));
+    Ok(if primary { "primary" } else { "new" })
 }
 
 /// Whether a checkout root looks like this plugin's kind of project: one directory listing,

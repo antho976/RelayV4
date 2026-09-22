@@ -34,10 +34,18 @@ The live tools (`ue_python`, `ue_call`, `ue_property`, `ue_search_assets`, `ue_l
 3. **Allow remote Python.** Recent engine versions gate Python execution over Remote Control behind
    a setting in *Project Settings → Plugins → Remote Control*. If `ue_setup_check` reports that the
    editor answers but remote Python fails, that setting is the usual cause.
-4. **Optional:** a different port or host goes in **`UE_REMOTE_CONTROL_URL`**, and a passphrase, if
+4. **Keep the editor responsive in the background.** Turn off *Editor Preferences → General →
+   Performance → Use Less CPU when in Background*. Otherwise the editor barely ticks while you are
+   in another window, and animation previews capture poses late.
+5. **Optional:** a different port or host goes in **`UE_REMOTE_CONTROL_URL`**, and a passphrase, if
    you configured one, in **`UE_REMOTE_CONTROL_PASSPHRASE`**.
 
 Run `ue_setup_check` (or ask an agent to) at any time: it lists what is missing and what to do.
+
+## Which checkout the editor opens
+
+Open the project's **main checkout** in the editor. With the plugin on, new agents start there too,
+and the live tools refuse to act when the editor has a different copy of the project open.
 
 ## Security
 

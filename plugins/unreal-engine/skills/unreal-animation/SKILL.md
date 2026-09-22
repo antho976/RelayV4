@@ -290,7 +290,18 @@ layout, IK Rig chain setup, Control Rig graphs, Sequencer keyframes. Give precis
 - Root motion with "Root Motion from Everything" in multiplayer: desync and corrections.
 - Retargeted animations with bent limbs: retarget pose not matching (A-pose vs T-pose) or chain mapping wrong.
 
+
+## Checking the result
+
+Animation work is spatial and you cannot watch it play. Before reporting any animation,
+attachment, retarget or two-character interaction as done, load `unreal-animation-verification`
+and follow its loop: measure with `ue_anim_inspect`, look with `ue_anim_preview`, fix, repeat.
+Items on the wrong side, items pointing the wrong way, grips off the palm and clipping are
+caught there, not by reading the Animation Blueprint.
+
 ## Verify your work
+
+- [ ] `unreal-animation-verification` loop run: `ue_anim_inspect` passes and `ue_anim_preview` images checked.
 
 - [ ] C++ builds (`ue_build`) and the AnimBP compiles without thread-safety warnings (`ue_log`).
 - [ ] In PIE, open the AnimBP debug (select the character instance in the AnimBP editor's debug

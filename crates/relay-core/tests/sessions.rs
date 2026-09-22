@@ -815,8 +815,14 @@ fn a_plugin_that_is_on_reaches_every_agent_of_its_project() {
     wait_until("plugin skills in the project root", || f.repo.join(".claude/skills/unreal-cpp").join(marker).is_file());
     ok(&f.engine, "session.close", json!({"session": off_name}));
 
+    // The editor has one project open, so the plugin starts new agents in the main checkout
+    // (D160); an explicit worktree request still gets one.
     let created = ok(&f.engine, "session.create", json!({"project_id": 1, "provider": "claude"}));
     let name = created["name"].as_str().unwrap().to_string();
+    assert_eq!(PathBuf::from(created["worktree"].as_str().unwrap()), f.repo, "an Unreal agent did not start in the main checkout");
+    let own = ok(&f.engine, "session.create", json!({"project_id": 1, "provider": "claude", "worktree": "new"}));
+    assert_ne!(PathBuf::from(own["worktree"].as_str().unwrap()), f.repo);
+    ok(&f.engine, "session.close", json!({"session": own["name"]}));
     let running = ok(&f.engine, "session.spawn", json!({"session": name}));
     let worktree = PathBuf::from(running["worktree"].as_str().unwrap());
     let mcp: Value = serde_json::from_str(&std::fs::read_to_string(worktree.join(".relay/relay.mcp.json")).unwrap()).unwrap();
@@ -835,6 +841,8 @@ fn a_plugin_that_is_on_reaches_every_agent_of_its_project() {
     // Codex has no MCP config file; the server travels as --config overrides.
     let created = ok(&f.engine, "session.create", json!({"project_id": 1, "provider": "codex"}));
     let codex_name = created["name"].as_str().unwrap().to_string();
+    // It shares the main checkout with the Claude agent above; drop that agent's recorded args.
+    let _ = std::fs::remove_file(f.repo.join(".relay/provider-args.txt"));
     let running = ok(&f.engine, "session.spawn", json!({"session": codex_name}));
     let codex_tree = PathBuf::from(running["worktree"].as_str().unwrap());
     wait_until("codex args", || codex_tree.join(".relay/provider-args.txt").is_file());

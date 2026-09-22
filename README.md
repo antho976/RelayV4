@@ -47,7 +47,7 @@ the installed FFmpeg tools (`ffmpeg` and `ffplay`).
 
 **Plugins** bundle skills, standing agent rules, documentation and MCP servers, and are switched
 on per project from the Plugins page or the plugin key on a project's sidebar row. The first is
-[Unreal Engine](plugins/unreal-engine/README.md): 19 game-development skills (design, levels,
+[Unreal Engine](plugins/unreal-engine/README.md): 20 game-development skills (design, levels,
 narrative, UI, animation, AI, C++, Blueprints, GAS, networking and more) and `relay unreal-mcp`,
 which builds the project, reads its log and drives a running editor through Remote Control and
 Python. New plugins are folders under `plugins/`, compiled into the engine.

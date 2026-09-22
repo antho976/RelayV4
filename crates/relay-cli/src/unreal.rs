@@ -28,6 +28,22 @@ const BRIDGE_PLUGINS: [&str; 3] = ["RemoteControl", "PythonScriptPlugin", "Edito
 /// Folders a project scan never enters: generated, cached or version-control state.
 const SKIP_DIRS: [&str; 7] = ["Binaries", "Intermediate", "Saved", "DerivedDataCache", ".git", "node_modules", ".relay"];
 const MAX_OUTPUT: usize = 60_000;
+/// Tools that act on the running editor. Each first checks the editor has this checkout's
+/// project open: an agent in a worktree would otherwise edit assets in a different copy.
+const LIVE: [&str; 10] = ["ue_python", "ue_call", "ue_property", "ue_search_assets", "ue_level_actors", "ue_console",
+    "ue_screenshot", "ue_anim_inspect", "ue_anim_preview", "ue_editor_lock"];
+/// Live tools that change editor state, and so need the editor lock.
+const MUTATING: [&str; 6] = ["ue_python", "ue_call", "ue_console", "ue_screenshot", "ue_anim_preview", "ue_property"];
+/// A lock nobody has used for this long is free to take.
+const LOCK_IDLE: Duration = Duration::from_secs(15 * 60);
+/// Images one call may return; each is a full PNG in the agent's context.
+const MAX_IMAGES: usize = 16;
+
+const PY_COMMON: &str = include_str!("unreal_py/common.py");
+const PY_PROJECT_CHECK: &str = include_str!("unreal_py/project_check.py");
+const PY_CAPTURE: &str = include_str!("unreal_py/capture.py");
+const PY_ANIM_INSPECT: &str = include_str!("unreal_py/anim_inspect.py");
+const PY_ANIM_PREVIEW: &str = include_str!("unreal_py/anim_preview.py");
 
 pub fn serve() -> Result<u8> {
     let stdin = std::io::stdin();
@@ -159,10 +175,74 @@ fn tools() -> Vec<Value> {
         tool("ue_console",
             "Run a console command in the editor world, e.g. 'stat unit', 'r.ScreenPercentage 75', 'obj list class=StaticMesh'. Output goes to the log; read it with ue_log.",
             json!({"command":{"type":"string"}}), &["command"], false),
+        tool("ue_screenshot",
+            "Look at the level: render PNG images you can see. Frame one or more actors from named views (front/back/left/right/top/three_quarter, relative to the first actor's facing), or use an explicit camera, or the current editor viewport when neither is given. isolate=true renders only the framed actors on black, which makes silhouettes, hands and attachments easy to judge.",
+            json!({
+                "actors":{"type":"array","items":{"type":"string"},"description":"Actor labels or paths to frame"},
+                "views":{"type":"array","items":{"type":"string","enum":["front","back","left","right","top","three_quarter","three_quarter_left"]},"description":"Default front, right, three_quarter"},
+                "camera":{"type":"object","properties":{"location":{"type":"array","items":{"type":"number"}},"rotation":{"type":"array","items":{"type":"number"},"description":"[pitch, yaw, roll]"}}},
+                "forward":{"type":"array","items":{"type":"number"},"description":"Override the facing used for named views"},
+                "isolate":{"type":"boolean"},
+                "width":{"type":"integer","minimum":64,"maximum":1920},
+                "height":{"type":"integer","minimum":64,"maximum":1080},
+                "fov":{"type":"number","minimum":10,"maximum":120}
+            }), &[], false),
+        tool("ue_anim_inspect",
+            "Measure an animation instead of eyeballing it. Poses a skeletal mesh at sample times straight from the animation data and reports, in the character's own frame ([forward, right, up] cm, left/right detected from the skeleton's bone pairs): where tracked bones, sockets and attached items are and which side they are on; grip distances between item sockets and hands; clearance of attached items to the body and of hands, feet, head and items to a partner character; expected contacts (touch or stay apart); feet below ground. Works for any skeleton and any item (weapon, tool, shield, prop, bag, instrument). Returns problems[] and passed.",
+            json!({
+                "mesh":{"type":"string","description":"Skeletal mesh asset path"},
+                "animation":{"type":"string","description":"Animation sequence path; omit for the reference pose"},
+                "times":{"type":"array","items":{"type":"number"}},
+                "samples":{"type":"integer","minimum":2,"maximum":60,"description":"Evenly spaced samples when times is omitted, default 9"},
+                "track":{"type":"array","items":{"type":"string"},"description":"Points to report: bone or socket, partner:<bone>, item:<name>:<socket|end_a|end_b|origin|center>"},
+                "attachments":{"type":"array","items":{"type":"object","properties":{
+                    "name":{"type":"string"},"mesh":{"type":"string","description":"Static or skeletal mesh of the item"},
+                    "socket":{"type":"string","description":"Character bone or socket it hangs from"},
+                    "location":{"type":"array","items":{"type":"number"}},"rotation":{"type":"array","items":{"type":"number"},"description":"[pitch, yaw, roll] offset"},
+                    "grips":{"type":"array","items":{"type":"object","properties":{"socket":{"type":"string"},"bone":{"type":"string"},"tolerance":{"type":"number"}}}}
+                },"required":["name","mesh","socket"]}},
+                "partner":{"type":"object","properties":{
+                    "mesh":{"type":"string"},"animation":{"type":"string"},
+                    "location":{"type":"array","items":{"type":"number"},"description":"In this character's mesh space, cm"},
+                    "yaw":{"type":"number","description":"Degrees, default 180 (facing back)"},
+                    "time_offset":{"type":"number"}
+                },"required":["mesh"]},
+                "contacts":{"type":"array","items":{"type":"object","properties":{
+                    "a":{"type":"string"},"b":{"type":"string"},"expect":{"type":"string","enum":["touch","apart"]},
+                    "distance":{"type":"number"},"window":{"type":"array","items":{"type":"number"},"description":"[start, end] seconds"}
+                },"required":["a","b"]}},
+                "body_radius":{"type":"number","description":"Body thickness around bones for clipping, default 8 cm"},
+                "touch_distance":{"type":"number","description":"Default 5 cm"}
+            }), &["mesh"], true),
+        tool("ue_anim_preview",
+            "See an animation: spawns a temporary copy of the character (with attached items and an optional partner, same arguments as ue_anim_inspect) in the open level, poses it at each sample time and returns images from the chosen views. Removes the preview actors afterwards; the level is left marked modified, so do not save the map because of it.",
+            json!({
+                "mesh":{"type":"string"},"animation":{"type":"string"},
+                "times":{"type":"array","items":{"type":"number"}},
+                "samples":{"type":"integer","minimum":1,"maximum":8,"description":"Default 4"},
+                "attachments":{"type":"array","items":{"type":"object"}},
+                "partner":{"type":"object"},
+                "views":{"type":"array","items":{"type":"string"},"description":"Default front and right"},
+                "location":{"type":"array","items":{"type":"number"},"description":"Where to spawn; default 6 m in front of the editor camera"},
+                "isolate":{"type":"boolean","description":"Render only the preview actors (default true)"},
+                "settle_ms":{"type":"integer","minimum":50,"maximum":5000,"description":"Wait for the editor to apply each pose, default 400"},
+                "width":{"type":"integer","minimum":64,"maximum":1280},"height":{"type":"integer","minimum":64,"maximum":1080}
+            }), &["mesh"], false),
+        tool("ue_editor_lock",
+            "Who is driving the editor. Live tools that change the editor take this lock automatically, so two agents never script the one editor at once; it frees itself after 15 idle minutes. action=release gives it up when you are done.",
+            json!({"action":{"type":"string","enum":["status","release"]}}), &[], false),
     ]
 }
 
 fn call(name: &str, args: &Value) -> Result<Value> {
+    if LIVE.contains(&name) {
+        let project = Project::find()?;
+        guard_project(&project)?;
+        let writes = MUTATING.contains(&name) && (name != "ue_property" || args.get("value").is_some());
+        if writes {
+            acquire_lock(&project, &holder_id())?;
+        }
+    }
     match name {
         "ue_project_info" => project_info(&Project::find()?),
         "ue_setup_check" => setup_check(&Project::find()?, args["fix"].as_bool().unwrap_or(false)),
@@ -206,8 +286,220 @@ fn call(name: &str, args: &Value) -> Result<Value> {
             );
             python(&code, Duration::from_secs(60))
         }
+        "ue_screenshot" => {
+            let project = Project::find()?;
+            let dir = capture_dir(&project)?;
+            let mut script_args = args.clone();
+            script_args["out_dir"] = json!(dir);
+            script_args["prefix"] = json!("shot");
+            let result = python_json(&script(PY_CAPTURE, &script_args), Duration::from_secs(120));
+            with_images(result, &dir)
+        }
+        "ue_anim_inspect" => python_json(&script(PY_ANIM_INSPECT, args), Duration::from_secs(300)),
+        "ue_anim_preview" => anim_preview(&Project::find()?, args),
+        "ue_editor_lock" => {
+            let project = Project::find()?;
+            if args["action"].as_str() == Some("release") {
+                release_lock(&project, &holder_id())?;
+            }
+            Ok(json!({"lock": read_lock(&project), "you": holder_id()}))
+        }
         other => bail!("unknown tool {other}"),
     }
+}
+
+/// `ARGS_JSON` first, then the shared helpers, then the tool's own script.
+fn script(body: &str, args: &Value) -> String {
+    format!("ARGS_JSON = {}\n{PY_COMMON}\n{body}", py_str(&args.to_string()))
+}
+
+// ---------------------------------------------------------------- which editor, and who drives it
+
+/// Refuse live tools when the editor has another project open. The common case is an agent in
+/// a git worktree while the human's editor is on the main checkout: its C++ would land in one
+/// copy and its asset edits in the other.
+fn guard_project(project: &Project) -> Result<()> {
+    if std::env::var("UE_ALLOW_PROJECT_MISMATCH").is_ok_and(|v| v == "1") {
+        return Ok(());
+    }
+    let open = editor_project()?;
+    if same_file(&open, &project.uproject) {
+        return Ok(());
+    }
+    bail!(
+        "the editor has {} open, but this agent works in {}. Changes made through the editor would land in a different copy of the project than your files. Ask the human to start this agent in the project's main checkout (the Unreal plugin does that by default for new agents), or to open this checkout's .uproject in the editor. UE_ALLOW_PROJECT_MISMATCH=1 overrides this check.",
+        open.display(), project.uproject.display()
+    )
+}
+
+fn editor_project() -> Result<PathBuf> {
+    use std::sync::Mutex;
+    static CACHE: Mutex<Option<(std::time::Instant, PathBuf)>> = Mutex::new(None);
+    if let Some((at, path)) = CACHE.lock().unwrap().clone() {
+        if at.elapsed() < Duration::from_secs(30) {
+            return Ok(path);
+        }
+    }
+    let result = python_json(&script(PY_PROJECT_CHECK, &json!({})), Duration::from_secs(20))?;
+    let path = PathBuf::from(result["project"].as_str().ok_or_else(|| anyhow!("the editor reported no project"))?);
+    *CACHE.lock().unwrap() = Some((std::time::Instant::now(), path.clone()));
+    Ok(path)
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+fn holder_id() -> String {
+    std::env::var("RELAY_SESSION").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| format!("pid {}", std::os::unix::process::parent_id()))
+}
+
+fn lock_path(project: &Project) -> PathBuf {
+    project.root.join("Saved/Relay/editor-lock.json")
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn read_lock(project: &Project) -> Value {
+    let Ok(raw) = std::fs::read_to_string(lock_path(project)) else { return Value::Null };
+    let mut lock: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+    if let Some(last) = lock["last_used"].as_u64() {
+        let idle = now_secs().saturating_sub(last);
+        lock["idle_s"] = json!(idle);
+        lock["expired"] = json!(idle >= LOCK_IDLE.as_secs());
+    }
+    lock
+}
+
+/// One agent drives the editor at a time. The lock is a file in the project's `Saved/`, which
+/// every agent sharing the checkout sees and git ignores.
+fn acquire_lock(project: &Project, me: &str) -> Result<()> {
+    let lock = read_lock(project);
+    if let Some(holder) = lock["holder"].as_str() {
+        if holder != me && lock["expired"] != true {
+            bail!(
+                "the editor is being driven by {holder} (idle {}s). Do offline work (C++, config, data files) or wait; the lock frees itself after {} idle minutes, or when {holder} runs ue_editor_lock with action=release.",
+                lock["idle_s"].as_u64().unwrap_or(0), LOCK_IDLE.as_secs() / 60
+            );
+        }
+    }
+    let path = lock_path(project);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let since = if lock["holder"].as_str() == Some(me) { lock["since"].as_u64().unwrap_or(now_secs()) } else { now_secs() };
+    std::fs::write(&path, json!({"holder": me, "since": since, "last_used": now_secs()}).to_string())?;
+    Ok(())
+}
+
+fn release_lock(project: &Project, me: &str) -> Result<()> {
+    let lock = read_lock(project);
+    match lock["holder"].as_str() {
+        Some(holder) if holder != me && lock["expired"] != true => bail!("the lock belongs to {holder}, not to you"),
+        Some(_) => {
+            std::fs::remove_file(lock_path(project))?;
+            Ok(())
+        }
+        None => Ok(()),
+    }
+}
+
+// ---------------------------------------------------------------- seeing
+
+fn capture_dir(project: &Project) -> Result<PathBuf> {
+    let dir = project.root.join("Saved/Relay/Captures").join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    Ok(dir)
+}
+
+/// Attach the PNGs a capture script wrote as `_images`, which the MCP layer turns into image
+/// content, then delete the folder.
+fn with_images(result: Result<Value>, dir: &Path) -> Result<Value> {
+    let mut value = match result {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(dir);
+            return Err(error);
+        }
+    };
+    let mut images = Vec::new();
+    for file in value["files"].as_array().cloned().unwrap_or_default() {
+        let path = PathBuf::from(file["file"].as_str().unwrap_or(""));
+        // Some engine versions append the extension themselves.
+        let found = [path.clone(), path.with_extension("png.png")].into_iter().find(|p| p.is_file());
+        match found {
+            Some(found) => images.push(json!({"label": file["view"], "path": found})),
+            None => images.push(json!({"label": file["view"], "missing": path})),
+        }
+    }
+    value["_images"] = json!(images);
+    value["_cleanup"] = json!(dir);
+    Ok(value)
+}
+
+fn anim_preview(project: &Project, args: &Value) -> Result<Value> {
+    let dir = capture_dir(project)?;
+    let mut base = args.clone();
+    if base.get("samples").is_none() && base.get("times").is_none() {
+        base["samples"] = json!(4);
+    }
+    let run = |action: &str, extra: Value| -> Result<Value> {
+        let mut a = base.clone();
+        a["action"] = json!(action);
+        if let (Some(target), Some(extra)) = (a.as_object_mut(), extra.as_object()) {
+            for (k, v) in extra {
+                target.insert(k.clone(), v.clone());
+            }
+        }
+        python_json(&script(PY_ANIM_PREVIEW, &a), Duration::from_secs(120))
+    };
+    let outcome = (|| -> Result<Value> {
+        let setup = run("setup", json!({}))?;
+        let times: Vec<f64> = setup["times"].as_array().cloned().unwrap_or_default().iter().filter_map(Value::as_f64).take(8).collect();
+        let settle = Duration::from_millis(args["settle_ms"].as_u64().unwrap_or(400).clamp(50, 5000));
+        let mut files = Vec::new();
+        let mut poses = Vec::new();
+        for (i, t) in times.iter().enumerate() {
+            run("pose", json!({"time": t}))?;
+            // The editor applies a pose on its next tick; check before taking the picture.
+            let mut check = Value::Null;
+            for _ in 0..8 {
+                std::thread::sleep(settle);
+                check = run("check", json!({"time": t}))?;
+                if check["off_by_cm"].as_f64().unwrap_or(f64::MAX) <= 1.5 {
+                    break;
+                }
+            }
+            poses.push(json!({"time": t, "pose_applied": check["off_by_cm"].as_f64().unwrap_or(f64::MAX) <= 1.5, "off_by_cm": check["off_by_cm"]}));
+            let capture_args = json!({
+                "actors": setup["actors"], "forward": setup["forward"],
+                "views": args.get("views").cloned().unwrap_or(json!(["front", "right"])),
+                "isolate": args["isolate"].as_bool().unwrap_or(true),
+                "width": args.get("width").cloned().unwrap_or(json!(480)),
+                "height": args.get("height").cloned().unwrap_or(json!(480)),
+                "out_dir": dir, "prefix": format!("t{i}_{t:.3}s"),
+            });
+            let shot = python_json(&script(PY_CAPTURE, &capture_args), Duration::from_secs(120))?;
+            files.extend(shot["files"].as_array().cloned().unwrap_or_default());
+        }
+        let stale = poses.iter().any(|p| p["pose_applied"] == false);
+        Ok(json!({
+            "files": files,
+            "poses": poses,
+            "warning": if stale { json!("Some poses had not been applied when captured: the editor may be throttled in the background (Editor Preferences > General > Performance > Use Less CPU when in Background). Raise settle_ms or keep the editor focused, and trust ue_anim_inspect's numbers over these images.") } else { Value::Null },
+        }))
+    })();
+    let cleanup = run("cleanup", json!({}));
+    let mut value = with_images(outcome, &dir)?;
+    if let Err(error) = cleanup {
+        value["cleanup_error"] = json!(format!("{error:#}"));
+    }
+    Ok(value)
 }
 
 fn required(args: &Value, key: &str) -> Result<String> {
@@ -574,7 +866,16 @@ fn editor_status() -> Result<Value> {
     match remote("GET", "/remote/info", None, Duration::from_secs(3)) {
         Ok(info) => {
             let routes = info["HttpRoutes"].as_array().map(|r| r.len());
-            Ok(json!({"reachable": true, "url": remote_base(), "routes": routes, "info": info}))
+            // Which project is open matters as much as whether the editor answers.
+            let open = editor_project().ok();
+            let ours = Project::find().ok().map(|p| p.uproject);
+            let matches = match (&open, &ours) {
+                (Some(open), Some(ours)) => Some(same_file(open, ours)),
+                _ => None,
+            };
+            let lock = Project::find().map(|p| read_lock(&p)).unwrap_or(Value::Null);
+            Ok(json!({"reachable": true, "url": remote_base(), "editor_project": open, "this_checkout": ours,
+                "same_project": matches, "editor_lock": lock, "routes": routes, "info": info}))
         }
         Err(error) => Ok(json!({
             "reachable": false,
@@ -765,9 +1066,29 @@ fn dechunk(mut raw: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
-fn tool_result(value: Value, is_error: bool) -> Value {
+fn tool_result(mut value: Value, is_error: bool) -> Value {
+    let images = value.as_object_mut().and_then(|o| o.remove("_images")).and_then(|v| v.as_array().cloned()).unwrap_or_default();
+    let cleanup = value.as_object_mut().and_then(|o| o.remove("_cleanup"));
+    let mut content = Vec::new();
+    let mut shown = Vec::new();
+    for image in images.iter().take(MAX_IMAGES) {
+        let Some(path) = image["path"].as_str() else { continue };
+        if let Ok(bytes) = std::fs::read(path) {
+            use base64::Engine as _;
+            content.push(json!({"type":"text","text":format!("Image: {}", image["label"].as_str().unwrap_or(""))}));
+            content.push(json!({"type":"image","data":base64::engine::general_purpose::STANDARD.encode(bytes),"mimeType":"image/png"}));
+            shown.push(image["label"].clone());
+        }
+    }
+    if !images.is_empty() {
+        value["images"] = json!({"shown": shown, "requested": images.len(), "limit": MAX_IMAGES});
+    }
+    if let Some(dir) = cleanup.as_ref().and_then(Value::as_str) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
     let text = serde_json::to_string_pretty(&value).unwrap_or_default();
-    let mut result = json!({"content":[{"type":"text","text":text}],"isError":is_error});
+    content.insert(0, json!({"type":"text","text":text}));
+    let mut result = json!({"content":content,"isError":is_error});
     if !is_error {
         result["structuredContent"] = value;
     }
@@ -805,7 +1126,7 @@ mod tests {
         let init = handle(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}})).unwrap();
         assert_eq!(init["result"]["serverInfo"]["name"], "unreal");
         let listed = handle(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list"})).unwrap();
-        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 11);
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 15);
         assert!(handle(&json!({"jsonrpc":"2.0","method":"notifications/initialized"})).is_none());
         let unknown = handle(&json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"nope"}})).unwrap();
         assert_eq!(unknown["error"]["code"], -32602);
@@ -890,6 +1211,69 @@ mod tests {
         assert!(request.contains("ExecutePythonCommandEx"));
         assert_eq!(result["ReturnValue"], true);
         assert_eq!(result["LogOutput"][0]["Output"], "RELAY_JSON:{\"count\":1}");
+    }
+
+    fn bare_project(root: &Path) -> Project {
+        Project { uproject: root.join("Game.uproject"), root: root.to_path_buf(), name: "Game".into(), descriptor: json!({}) }
+    }
+
+    #[test]
+    fn one_agent_drives_the_editor_at_a_time() {
+        let root = tempfile::tempdir().unwrap();
+        let project = bare_project(root.path());
+        acquire_lock(&project, "calm-otter").unwrap();
+        acquire_lock(&project, "calm-otter").expect("the holder keeps its own lock");
+        let refused = acquire_lock(&project, "brisk-fox").unwrap_err().to_string();
+        assert!(refused.contains("calm-otter"), "{refused}");
+        assert!(release_lock(&project, "brisk-fox").is_err(), "only the holder releases");
+        release_lock(&project, "calm-otter").unwrap();
+        acquire_lock(&project, "brisk-fox").unwrap();
+
+        // An abandoned lock frees itself.
+        std::fs::write(lock_path(&project), json!({"holder":"brisk-fox","since":1,"last_used":1}).to_string()).unwrap();
+        assert_eq!(read_lock(&project)["expired"], true);
+        acquire_lock(&project, "calm-otter").unwrap();
+        assert_eq!(read_lock(&project)["holder"], "calm-otter");
+    }
+
+    #[test]
+    fn captured_images_become_image_content_and_the_folder_is_removed() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("cap");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("shot_front.png"), b"\x89PNG fake").unwrap();
+        let value = with_images(Ok(json!({"files":[
+            {"view":"front","file":dir.join("shot_front.png")},
+            {"view":"right","file":dir.join("shot_right.png")}
+        ]})), &dir).unwrap();
+        let result = tool_result(value, false);
+        let content = result["content"].as_array().unwrap();
+        let images: Vec<&Value> = content.iter().filter(|c| c["type"] == "image").collect();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0]["mimeType"], "image/png");
+        assert_eq!(result["structuredContent"]["images"]["shown"], json!(["front"]));
+        assert!(result["structuredContent"].get("_images").is_none());
+        assert!(!dir.exists(), "capture folder left behind");
+    }
+
+    #[test]
+    fn scripts_carry_their_arguments_and_the_shared_helpers() {
+        let code = script(PY_ANIM_INSPECT, &json!({"mesh":"/Game/It's"}));
+        assert!(code.starts_with("ARGS_JSON = \"{\\\"mesh\\\":\\\"/Game/It's\\\"}\"\n"), "{}", &code[..80]);
+        assert!(code.contains("def body_frame(skel):"));
+        assert!(code.trim_end().ends_with("})"));
+    }
+
+    /// The pose maths is Python that runs inside the editor; `tests/run_inspect.py` runs it
+    /// against a stand-in `unreal` module. Skipped only where no python3 exists.
+    #[test]
+    fn animation_checks_hold_against_a_stand_in_editor() {
+        let runner = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/unreal_py/tests/run_inspect.py");
+        let Ok(output) = Command::new("python3").arg(&runner).output() else {
+            eprintln!("python3 not found; skipping");
+            return;
+        };
+        assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
     }
 
     #[test]

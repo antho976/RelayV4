@@ -9,9 +9,16 @@ plugin key on the project's row in the sidebar. Relay suggests it for any projec
 
 | Piece | Where it lands | When |
 | --- | --- | --- |
-| 19 Unreal skills | `.claude/skills/unreal-*/` and `.agents/skills/unreal-*/` in the project root and in every agent worktree (git-excluded), plus the provider homes for Codex | The moment you switch the plugin on, including for agents already running |
+| 20 Unreal skills | `.claude/skills/unreal-*/` and `.agents/skills/unreal-*/` in the project root and in every agent worktree (git-excluded), plus the provider homes for Codex | The moment you switch the plugin on, including for agents already running |
 | Working rules (`instructions.md`) | The agent's session brief, injected into its system prompt | Every start, wake and resume |
-| `unreal` MCP server (11 tools) | `.relay/relay.mcp.json` for Claude Code, `--config mcp_servers.unreal.*` for Codex | Every start, wake and resume |
+| `unreal` MCP server (15 tools) | `.relay/relay.mcp.json` for Claude Code, `--config mcp_servers.unreal.*` for Codex | Every start, wake and resume |
+
+**Where agents work.** An Unreal editor has one project open, so with the plugin on, a new
+agent starts in the project's main checkout (the one your editor opens) instead of its own git
+worktree. Live editor tools also refuse to act when the editor has a different copy of the project
+open, and one agent drives the editor at a time (the others get a clear "busy" answer and do
+offline work). To give an agent its own worktree anyway, create the session with `"worktree": "new"` in
+`session.create` (bus, CLI or MCP) and keep it to C++ and config work.
 
 Switching the plugin off removes its skill folders from every checkout and leaves it out of the next
 launch. Folders you wrote yourself, or skills your repository checks in, are never touched.
@@ -29,6 +36,7 @@ launch. Folders you wrote yourself, or skills your repository checks in, are nev
 | `unreal-narrative` | Story structure, branching dialogue, quests, barks, localization, Sequencer, story state |
 | `unreal-ui-umg` | UMG, CommonUI, MVVM, input modes, focus and gamepad navigation, HUDs, menus, UI performance |
 | `unreal-animation` | Animation Blueprints, state machines, blend spaces, montages, IK Rig/Retargeter, Control Rig, Motion Matching |
+| `unreal-animation-verification` | Checking animation physically: axes and handedness, sockets and grips for any held or worn item, IK contacts, two-character interactions, clipping, flow; the measure-look-fix loop |
 | `unreal-ai` | AIController, Behavior Trees, StateTree, EQS, perception, navigation, Smart Objects |
 | `unreal-gas` | Gameplay Ability System: ASC, attributes, effects, abilities, tags, cues |
 | `unreal-multiplayer` | Replication, RPCs, ownership, relevancy, prediction, sessions, PIE network testing |

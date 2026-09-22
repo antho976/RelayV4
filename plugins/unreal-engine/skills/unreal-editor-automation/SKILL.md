@@ -36,7 +36,10 @@ Reference files:
    along the lines of "Enable Remote Python Execution"; type "Python" in the settings search
    box). Some versions have a similar switch for remote console commands. If the setting is
    saved to a `Config/*.ini`, commit that ini.
-5. Run `ue_editor_status`. When it answers, you are live.
+5. Run `ue_editor_status`. When it answers and reports `same_project: true`, you are live. Live
+   tools refuse to act on an editor that has a different copy of the project open (typically: you
+   are in a git worktree and the editor is on the main checkout) and take a shared lock so only one
+   agent drives the editor at a time; a "being driven by" refusal means do offline work and retry later.
 
 If a call is refused (HTTP 4xx, "not allowed", "remote python execution is disabled", or
 connection refused), do not retry in a loop. Tell the human exactly which of steps 2-4 is
@@ -64,6 +67,9 @@ Live (editor open, web server running):
 | `ue_property` | Read or write one property on one object by path | `{"object_path": "/Game/Maps/Main.Main:PersistentLevel.PointLight_0.LightComponent0", "property": "Intensity", "value": 5000}` |
 | `ue_call` | Call one UFUNCTION by path (static library functions via their CDO) | `{"object_path": "/Script/EditorScriptingUtilities.Default__EditorAssetLibrary", "function": "DoesAssetExist", "parameters": {"AssetPath": "/Game/Maps/Main"}}` |
 | `ue_console` | Console commands: `stat unit`, `r.` cvars, `t.MaxFPS 60`, `WebControl.StartServer` | `{"command": "stat unit"}` |
+| `ue_screenshot` | See the level: images of actors from named views, a camera, or the viewport | `{"actors": ["BP_Door_2"], "views": ["front", "top"], "isolate": true}` |
+| `ue_anim_inspect` / `ue_anim_preview` | Measure and see animations, attachments and interactions (load `unreal-animation-verification`) | see that skill |
+| `ue_editor_lock` | Who drives the editor; release it when your editor work is done | `{"action": "release"}` |
 
 Decision rules:
 - Reading one property or calling one function: `ue_property` / `ue_call`. Anything with a

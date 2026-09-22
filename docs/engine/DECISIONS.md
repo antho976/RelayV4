@@ -927,3 +927,17 @@ The *why* behind anything surprising. Append; never rewrite history. Reference a
   from `relay unreal-mcp`: a stdio MCP server independent of the bus that reads the project on
   disk, runs UnrealBuildTool through `proc::output_with_timeout`, and reaches a running editor
   through the Remote Control HTTP API and `PythonScriptLibrary.ExecutePythonCommandEx`.
+- **D160 A plugin can choose the checkout, and the Unreal bridge refuses the wrong one.** An
+  Unreal editor has exactly one project open, normally the main checkout, while Relay's default
+  gives each agent a new worktree: an agent's C++ landed in its worktree and its editor edits in
+  the main checkout. A plugin manifest may now set `default_checkout: "primary"`; `session.create`
+  without an explicit `worktree` then uses the primary checkout for projects with that plugin on
+  (read once in the prepare phase so both phases agree). An explicit `worktree` still wins. The
+  `unreal-mcp` live tools independently ask the editor for its open `.uproject` and refuse on a
+  mismatch, and serialize editor-changing tools through a lease file in the project's `Saved/`
+  (session name as holder, 15 idle minutes to expire), since agents sharing one checkout also
+  share one editor. Animation checks are measurement first: `ue_anim_inspect` poses skeletons
+  from animation data in editor Python and reports sides, grips, clearances and contacts in a
+  frame derived from the skeleton's own left/right bone pairs, so it holds for any skeleton,
+  item or mesh orientation; `ue_anim_preview` adds images, confirming each pose was applied
+  before capture because the editor applies poses on its tick.

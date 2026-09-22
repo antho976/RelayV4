@@ -3,15 +3,16 @@
   "name": "Unreal Engine",
   "version": "1.0.0",
   "category": "Game engine",
-  "summary": "Makes every agent in the project an Unreal Engine 5 developer: 19 skills, standing rules, an editor bridge and a build/log toolchain.",
-  "description": "Turn it on for a project that holds a .uproject. Every agent launched there gets the Unreal skills as real skill folders (fundamentals, C++, Blueprints, gameplay framework, game design, level and environment art, narrative, UI, animation, AI, GAS, multiplayer, materials and VFX, audio, editor automation, performance, build and packaging, testing, source control), the plugin's working rules in its brief, and the `unreal` MCP server: project inspection, UnrealBuildTool builds and log reading offline, and Python, Remote Control calls, asset search, level queries and console commands against the running editor.",
+  "summary": "Makes every agent in the project an Unreal Engine 5 developer: 20 skills, standing rules, an editor bridge and a build/log toolchain.",
+  "description": "Turn it on for a project that holds a .uproject. Every agent launched there gets the Unreal skills as real skill folders (fundamentals, C++, Blueprints, gameplay framework, game design, level and environment art, narrative, UI, animation, animation verification and attachments, AI, GAS, multiplayer, materials and VFX, audio, editor automation, performance, build and packaging, testing, source control), the plugin's working rules in its brief, and the `unreal` MCP server: project inspection, UnrealBuildTool builds and log reading offline; and against the running editor, Python, Remote Control calls, asset search, level queries, console commands, screenshots, and animation measurement and preview. New agents start in the project's main checkout, the one the editor has open.",
   "instructions": "instructions.md",
   "docs": ["README.md", "docs/setup.md", "docs/mcp-tools.md", "docs/agent-workflow.md"],
   "detect": [".uproject"],
+  "default_checkout": "primary",
   "mcp_servers": [
     {
       "name": "unreal",
-      "description": "Unreal Engine bridge. Offline: project facts, builds, the editor log. Live (editor open with the Remote Control web server): Python editor scripting, UFUNCTION calls, properties, asset search, level actors, console commands.",
+      "description": "Unreal Engine bridge. Offline: project facts, builds, the editor log. Live (editor open with the Remote Control web server): Python editor scripting, UFUNCTION calls, properties, asset search, level actors, console commands, screenshots, and animation measurement and preview. Live tools refuse to act on an editor that has a different copy of the project open, and one agent drives the editor at a time.",
       "command": "relay",
       "args": ["unreal-mcp"],
       "tools": [
@@ -25,7 +26,11 @@
         "ue_property",
         "ue_search_assets",
         "ue_level_actors",
-        "ue_console"
+        "ue_console",
+        "ue_screenshot",
+        "ue_anim_inspect",
+        "ue_anim_preview",
+        "ue_editor_lock"
       ]
     }
   ]

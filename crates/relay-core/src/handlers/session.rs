@@ -556,6 +556,9 @@ struct PreparedCreate {
     name: String,
     project: relay_bus::types::Project,
     worktree: Option<relay_bus::types::Worktree>,
+    /// Read once in the prepare phase, so both phases agree even if a plugin is switched
+    /// meanwhile (D160).
+    default_checkout: &'static str,
 }
 
 impl Drop for PreparedCreate {
@@ -590,6 +593,7 @@ pub fn register(e: &mut Engine) {
     e.register_staged::<Create, _>(|ctx, p| {
         let mut prepared = ctx.read(|conn| {
             let project = validate_create(conn, p)?;
+            let default_checkout = crate::plugins::default_checkout(conn, project.id).bus()?;
             let mut reservations = ctx.engine().creating_sessions.lock().unwrap();
             for _ in 0..200 {
                 let name = sessions::new_name(conn).bus()?;
@@ -597,14 +601,14 @@ pub fn register(e: &mut Engine) {
                     || !reservations.insert(name.clone()) { continue; }
                 return Ok(PreparedCreate {
                     engine: Arc::downgrade(&ctx.engine().arc().ok_or_else(|| BusError::internal("engine unavailable"))?),
-                    name, project, worktree: None,
+                    name, project, worktree: None, default_checkout,
                 });
             }
             Err(BusError::conflict("session.names_busy", "Could not reserve a free session name"))
         })?;
         // Fetch AND checkout can invoke slow network/LFS filters. Neither belongs
         // under the global store mutex: existing sessions must remain responsive.
-        if p.pair_with.is_none() && p.worktree.as_deref().unwrap_or("new") == "new" {
+        if p.pair_with.is_none() && p.worktree.as_deref().unwrap_or(prepared.default_checkout) == "new" {
             let repo = Path::new(&prepared.project.path);
             super::git::refresh_new_worktree(repo, p.branch.as_deref())?;
             let branch = p.branch.clone().unwrap_or_else(|| worktree::branch_for(&prepared.name));
@@ -656,7 +660,7 @@ pub fn register(e: &mut Engine) {
         let token = sessions::new_token();
         let repo = Path::new(&project.path);
         let pair_worktree = pair.as_ref().map(|row| row.session.worktree.as_str());
-        let requested_worktree = p.worktree.as_deref().or(pair_worktree).unwrap_or("new");
+        let requested_worktree = p.worktree.as_deref().or(pair_worktree).unwrap_or(prepared.default_checkout);
         let (worktree_path, branch) = match requested_worktree {
             "primary" => {
                 let all = worktree::list_with_dirty(repo, false).bus()?;

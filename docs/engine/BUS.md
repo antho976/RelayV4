@@ -682,7 +682,7 @@ are `user_only` (§9.1). Agents get `done`, `report`, `attach`/`scrollback`, `bo
 
 | op | attrs | payload → result |
 |---|---|---|
-| `session.create` | mutation · always · project | `SessionCreateIn = { project_id, provider: Provider, role?: Role = "builder", model?, effort?, branch?, worktree?: "new"\|"primary"\|path, task_id?, module_id?, pair_with?: string }` → `Session` — allocates name + worktree, spawns nothing; one reviewer may share that PAIR worktree with at most two builders (`conflict`/`session.review_group_full`) |
+| `session.create` | mutation · always · project | `SessionCreateIn = { project_id, provider: Provider, role?: Role = "builder", model?, effort?, branch?, worktree?: "new"\|"primary"\|path, task_id?, module_id?, pair_with?: string }` → `Session` — allocates name + worktree, spawns nothing; an omitted `worktree` is `"new"` unless a plugin on for the project sets `default_checkout: "primary"` (D160); one reviewer may share that PAIR worktree with at most two builders (`conflict`/`session.review_group_full`) |
 | `session.spawn` | mutation · always · session | `{ session, prompt?: string }` → `Session` — stores optional launch text, writes the inspectable brief and provider role instructions, starts the CLI with no positional argument, then types one private bootstrap/start turn when a task or launch prompt exists; `conflict`/`session.already_spawned` |
 | `session.resume` | mutation · always | `{ session }` → `Session` — provider resume of a `restorable` session |
 | `session.clear_restorable` | mutation · always | `{ session }` → `Session` — drop saved provider context and fresh-spawn the same restorable session/worktree |

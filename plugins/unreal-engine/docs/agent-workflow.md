@@ -25,6 +25,8 @@ what a human reviewer should expect to see.
 - C++: edit → `ue_build` (editor closed) or Live Coding → `ue_log` with `Error|Warning`.
 - Editor: one `ue_python` script per logical change, inside `unreal.ScopedEditorTransaction`,
   ending with an explicit save and a printed summary of what changed.
+- Animation, attachments and character interactions: the `unreal-animation-verification` loop
+  (`ue_anim_inspect` numbers, `ue_anim_preview` images) before and after each change.
 - Keep the game playable after every step; prefer a greybox that works to a polished piece that
   does not.
 
@@ -33,6 +35,7 @@ what a human reviewer should expect to see.
 - Build succeeds; the log has no new errors.
 - Automation tests pass where the project has them (`unreal-testing-debugging`).
 - For gameplay: describe exactly how to test it in PIE, and what the player should see.
+- For animation work: `ue_anim_inspect` passes and the preview images match the design.
 - For performance-sensitive work: numbers from `stat unit` / Unreal Insights, not impressions.
 
 ## 5. Hand over

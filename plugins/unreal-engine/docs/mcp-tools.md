@@ -34,6 +34,15 @@ regex first. Typical filters: `Error|Warning`, `LogBlueprint`, `LogPython`, `Log
 
 All need the editor running with the Remote Control web server (see [setup](setup.md)).
 
+**Same project.** Before acting, every live tool asks the editor which `.uproject` it has open and
+refuses if it is not the one in the agent's checkout (for example, the agent is in a git worktree
+while the editor is on the main checkout). `UE_ALLOW_PROJECT_MISMATCH=1` overrides this.
+
+**One driver.** Live tools that change the editor (`ue_python`, `ue_call`, `ue_property` writes,
+`ue_console`, `ue_screenshot`, `ue_anim_preview`) take a lock in `Saved/Relay/editor-lock.json`,
+held by the agent's session name. Another agent gets a clear refusal naming the holder. The lock
+frees itself after 15 idle minutes.
+
 ### `ue_editor_status` — `{}`
 `reachable`, the endpoint and the server's route list.
 
@@ -60,3 +69,40 @@ Actors of the open level with label, class, object path, outliner folder and loc
 
 ### `ue_console` — `{ command }`
 Runs a console command in the editor world. Output lands in the log; read it with `ue_log`.
+
+### `ue_editor_status` also reports
+`editor_project`, `this_checkout`, `same_project` and the current `editor_lock`.
+
+### `ue_editor_lock` — `{ action?: "status" | "release" }`
+Who holds the editor lock; `release` gives up your own.
+
+## Seeing and measuring
+
+### `ue_screenshot` — `{ actors?, views?, camera?, forward?, isolate?, width?, height?, fov? }`
+Renders PNGs with a temporary scene capture and returns them as images the agent can see.
+Frame actors from named views (`front`, `back`, `left`, `right`, `top`, `three_quarter`,
+`three_quarter_left`, relative to the first actor's facing), or give an explicit `camera`
+(`location`, `rotation` as `[pitch, yaw, roll]`), or omit both for the editor viewport.
+`isolate` renders only the framed actors on black.
+
+### `ue_anim_inspect` — `{ mesh, animation?, times?, samples?, track?, attachments?, partner?, contacts?, body_radius?, touch_distance? }`
+Poses the skeleton at sample times directly from the animation data (no level, no ticking) and
+measures, in the character's own frame (`[forward, right, up]` cm; left and right found from the
+skeleton's `_l`/`_r`-style bone pairs, so any skeleton and mesh orientation works):
+- where tracked bones, sockets and item points are, and which side they are on;
+- for each attached item (any static or skeletal mesh on any bone or socket, with an optional
+  offset): its side, long axis and ends, grip distances to hands or palm sockets, and clearance of
+  its ends to the character's own body;
+- for a `partner` character: clearance of hands, feet, head and items to the partner's body;
+- `contacts` that must touch or stay apart, optionally inside a time window;
+- feet below the reference ground.
+
+Returns `problems`, `passed`, `closest_approach` and per-sample details. It reads the animation
+asset, not the Animation Blueprint, so runtime IK is not included.
+
+### `ue_anim_preview` — `{ mesh, animation?, times?, samples?, attachments?, partner?, views?, location?, isolate?, settle_ms?, width?, height? }`
+Spawns temporary `RelayPreview` actors (character, attached items, partner), poses them at each
+time (up to 8), confirms the editor applied the pose, and returns images from the chosen views
+(default `front` and `right`, isolated). The actors are removed afterwards; the level stays marked
+modified, so do not save it for this. If poses lag, the editor is throttled in the background:
+see [setup](setup.md).
