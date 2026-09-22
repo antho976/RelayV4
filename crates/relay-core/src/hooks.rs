@@ -385,6 +385,37 @@ pub fn install_claude(worktree: &Path, instance: Instance, relay: &Path) -> Resu
     Ok(())
 }
 
+/// Add the MCP servers of the project's enabled plugins to the per-launch config written by
+/// [`install_claude`] (D159). Relay's own `relay` entry is never replaced.
+pub fn add_claude_mcp_servers(
+    worktree: &Path,
+    servers: &[crate::plugins::LaunchServer],
+) -> Result<()> {
+    if servers.is_empty() {
+        return Ok(());
+    }
+    let mcp_path = worktree.join(MCP_CONFIG_RELATIVE);
+    let raw = fs::read_to_string(&mcp_path).with_context(|| format!("reading {}", mcp_path.display()))?;
+    let mut config: Value = serde_json::from_str(&raw).with_context(|| format!("parsing {}", mcp_path.display()))?;
+    let Some(entries) = config.get_mut("mcpServers").and_then(Value::as_object_mut) else {
+        anyhow::bail!("{} has no mcpServers", mcp_path.display());
+    };
+    for (name, command, args, env) in servers {
+        if name == "relay" {
+            continue;
+        }
+        let mut entry = json!({"command": command, "args": args});
+        if !env.is_empty() {
+            entry["env"] = json!(env);
+        }
+        entries.insert(name.clone(), entry);
+    }
+    let mcp_tmp = mcp_path.with_extension("json.relay-tmp");
+    fs::write(&mcp_tmp, format!("{}\n", serde_json::to_string_pretty(&config)?))?;
+    fs::rename(&mcp_tmp, &mcp_path)?;
+    Ok(())
+}
+
 /// Remove only Relay's Claude handlers; all user/project-local settings survive.
 pub fn uninstall_claude(worktree: &Path) -> Result<()> {
     let _ = fs::remove_file(worktree.join(MCP_CONFIG_RELATIVE));

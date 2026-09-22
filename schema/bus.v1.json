@@ -4,7 +4,7 @@
   "title": "RELAY v4 command bus",
   "description": "Generated from crates/relay-bus by `relay schema`. Do not edit; see docs/BUS.md.",
   "version": 1,
-  "op_count": 210,
+  "op_count": 212,
   "envelope": {
     "request": {
       "$ref": "#/$defs/Request"
@@ -3747,7 +3747,7 @@
       }
     },
     "plugin.list": {
-      "summary": "Stub in 4.0: always empty",
+      "summary": "Bundled plugins (skills, agent instructions, docs, MCP servers) and the projects they are on for",
       "kind": "query",
       "audit": "never",
       "undo": "none",
@@ -3757,12 +3757,52 @@
       "doors": "all",
       "emits": [],
       "since": "1.0",
-      "phase": 11,
+      "phase": 12,
       "payload": {
-        "$ref": "#/$defs/Empty"
+        "$ref": "#/$defs/PluginListIn"
       },
       "result": {
         "$ref": "#/$defs/PluginListOut"
+      }
+    },
+    "plugin.get": {
+      "summary": "One plugin with its agent instructions, documentation and optionally one skill body",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "executor": "core",
+      "actors": "all",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/PluginGetIn"
+      },
+      "result": {
+        "$ref": "#/$defs/PluginGetOut"
+      }
+    },
+    "plugin.enable": {
+      "summary": "Switch a plugin on or off for a project",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "inverse",
+      "scope": "project",
+      "executor": "core",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "plugin.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/PluginEnableIn"
+      },
+      "result": {
+        "$ref": "#/$defs/Plugin"
       }
     },
     "notify.list": {
@@ -8874,6 +8914,10 @@
         },
         "skills": {
           "type": "string"
+        },
+        "plugins": {
+          "type": "string",
+          "default": ""
         }
       },
       "required": [
@@ -12620,16 +12664,236 @@
         "archived"
       ]
     },
+    "PluginListIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "project_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        }
+      }
+    },
     "PluginListOut": {
       "type": "object",
       "properties": {
         "plugins": {
           "type": "array",
-          "items": true
+          "items": {
+            "$ref": "#/$defs/Plugin"
+          }
         }
       },
       "required": [
         "plugins"
+      ]
+    },
+    "Plugin": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        },
+        "category": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "skills": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginSkill"
+          }
+        },
+        "mcp_servers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginMcpServer"
+          }
+        },
+        "docs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Documentation files, relative to the plugin root; `plugin.get` returns their text."
+        },
+        "enabled_in": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "description": "Projects the plugin is switched on for."
+        },
+        "suggested_for": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "description": "Projects whose checkout looks like this plugin's kind of project (for Unreal Engine, a\n`.uproject` at the root) and that do not have it on yet."
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "version",
+        "category",
+        "summary",
+        "description",
+        "skills",
+        "mcp_servers",
+        "docs",
+        "enabled_in",
+        "suggested_for"
+      ],
+      "description": "A plugin bundled with Relay: skills, always-on agent instructions, documentation and MCP\nservers that reach every agent of a project the plugin is switched on for (D159)."
+    },
+    "PluginSkill": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "The skill's folder name, which is also its provider-visible name."
+        },
+        "description": {
+          "type": "string"
+        },
+        "files": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "description": "Files in the skill folder, `SKILL.md` included."
+        }
+      },
+      "required": [
+        "name",
+        "description",
+        "files"
+      ]
+    },
+    "PluginMcpServer": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "tools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "name",
+        "description",
+        "tools"
+      ]
+    },
+    "PluginGetIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "plugin_id": {
+          "type": "string"
+        },
+        "skill": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Also return this skill's SKILL.md."
+        }
+      },
+      "required": [
+        "plugin_id"
+      ]
+    },
+    "PluginGetOut": {
+      "type": "object",
+      "properties": {
+        "plugin": {
+          "$ref": "#/$defs/Plugin"
+        },
+        "instructions": {
+          "type": "string",
+          "description": "The instructions every agent of an enabled project receives in its brief."
+        },
+        "docs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PluginDoc"
+          }
+        },
+        "skill": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PluginDoc"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "plugin",
+        "instructions",
+        "docs"
+      ]
+    },
+    "PluginDoc": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "body": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "body"
+      ]
+    },
+    "PluginEnableIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "plugin_id": {
+          "type": "string"
+        },
+        "project_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "plugin_id",
+        "project_id",
+        "enabled"
       ]
     },
     "NotifyListIn": {

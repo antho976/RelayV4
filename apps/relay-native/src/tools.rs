@@ -7,6 +7,8 @@ use std::rc::Rc;
 
 #[path = "tools_devices.rs"]
 pub(crate) mod devices;
+#[path = "tools_plugins.rs"]
+pub(crate) mod plugins;
 #[path = "tools_settings.rs"]
 pub(crate) mod settings;
 #[path = "tools_skills.rs"]
@@ -52,6 +54,7 @@ pub async fn refresh(ui: &Rc<Ui>, name: &str, project: i64) {
     match name {
         "settings" => return settings::refresh(ui, project).await,
         "skills" => return skills::refresh(ui, project).await,
+        "plugins" => return plugins::refresh(ui, project).await,
         "devices" => return devices::refresh(ui, project).await,
         _ => {}
     }
@@ -59,7 +62,6 @@ pub async fn refresh(ui: &Rc<Ui>, name: &str, project: i64) {
     let (op, payload) = match name {
         "dashboard" => ("dashboard.get", json!({})),
         "notifications" => ("notify.list", json!({"limit": 200})),
-        "plugins" => ("plugin.list", json!({})),
         _ => return,
     };
     let result = ui.call(op, payload).await;
@@ -78,31 +80,6 @@ pub async fn refresh(ui: &Rc<Ui>, name: &str, project: i64) {
     match name {
         "dashboard" => dashboard(ui, page, &data),
         "notifications" => notifications(ui, page, &data),
-        "plugins" => {
-            page.add_css_class("plugins-page");
-            let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
-            content.add_css_class("plugins-content");
-            content.set_halign(gtk::Align::Center);
-            content.set_valign(gtk::Align::Center);
-            content.set_vexpand(true);
-            let icon = crate::icons::image("plugins", 28);
-            icon.set_halign(gtk::Align::Start);
-            content.append(&icon);
-            content.append(&label("Plugins", "title"));
-            let plugins = rows(&data, "plugins");
-            let copy = if plugins.is_empty() {
-                "The extension surface is reserved for after 4.0. The bus contract is live and intentionally returns an empty list.".to_string()
-            } else {
-                format!("{} plugin records.", plugins.len())
-            };
-            let copy = paragraph(&copy);
-            copy.set_max_width_chars(52);
-            content.append(&copy);
-            let chip = label("4.0 stub", "task-chip");
-            chip.set_halign(gtk::Align::Start);
-            content.append(&chip);
-            page.append(&content);
-        }
         _ => {}
     }
 }

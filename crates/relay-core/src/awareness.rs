@@ -375,20 +375,24 @@ pub fn brief(
             .collect::<Vec<_>>()
             .join("\n\n")
     };
+    // A plugin that is on is a standing rule, not an option: its instructions travel in the
+    // injected half so the agent works through it from the first turn (D159).
+    let plugins = crate::plugins::brief_section(conn, session.project_id).bus()?;
     let parts = BriefParts {
         state,
         peers: peers_text,
         notes,
         adjacent,
         skills,
+        plugins,
     };
     let compact = format!(
-        "# Relay session brief\n\n## Current state\n{}\n\n## Live peers\n{}\n\n## Standing notes\n{}\n\n## Adjacent tasks\n{}\n\n## Comms\n{}\n\n## Assignment\nRun `session.bootstrap` for your launch assignment and current task.\n\n## Enabled skills\n{}",
-        state_public, parts.peers, parts.notes, parts.adjacent, COMMS_HINT, skills_summary,
+        "# Relay session brief\n\n## Current state\n{}\n\n## Live peers\n{}\n\n## Standing notes\n{}\n\n## Adjacent tasks\n{}\n\n## Comms\n{}\n\n## Assignment\nRun `session.bootstrap` for your launch assignment and current task.\n\n## Enabled skills\n{}\n\n## Enabled plugins\n{}",
+        state_public, parts.peers, parts.notes, parts.adjacent, COMMS_HINT, skills_summary, parts.plugins,
     );
     let text = format!(
-        "# Relay session brief\n\n## Current state\n{}\n\n## Live peers\n{}\n\n## Standing notes\n{}\n\n## Adjacent tasks\n{}\n\n## Comms\n{}\n\n## Enabled skills\n{}",
-        parts.state, parts.peers, parts.notes, parts.adjacent, COMMS_HINT, parts.skills,
+        "# Relay session brief\n\n## Current state\n{}\n\n## Live peers\n{}\n\n## Standing notes\n{}\n\n## Adjacent tasks\n{}\n\n## Comms\n{}\n\n## Enabled skills\n{}\n\n## Enabled plugins\n{}",
+        parts.state, parts.peers, parts.notes, parts.adjacent, COMMS_HINT, parts.skills, parts.plugins,
     );
     Ok(BriefOut {
         text,

@@ -907,3 +907,50 @@ The *why* behind anything surprising. Append; never rewrite history. Reference a
   disabled profile falls back to the project's normal Gradle release signing. The temporary init
   script registers through Gradle's `beforeProject` lifecycle so AGP's `finalizeDsl` callback is in
   place before Android finalizes signing configs, including on AGP 9.
+- **D159 Plugins are bundled bundles, switched on per project.** D48 kept `plugin.list` as a real,
+  empty query. A plugin is now a folder under `plugins/<id>/` — a `plugin.json` manifest, always-on
+  agent instructions, skill folders, documentation and MCP server declarations — compiled into the
+  engine by `relay-core/build.rs`, so the content and the code that delivers it ship at one
+  revision with nothing to install. Schema v20 stores only the `plugin_projects` edge; an id a
+  later build stops bundling is ignored rather than failing a launch. Plugins are off by default
+  (unlike installed skills, D147), because they change how every agent in a project works;
+  `plugin.list` reports `suggested_for` from one directory listing per project root, read with
+  the store lock released. Switching a plugin on reaches agents through the existing channels
+  only: its skills join the D147 materializer (an installed skill with the same folder name wins,
+  and the stamp carries the bundle digest so a rebuilt engine rewrites stale folders), its
+  instructions and skill descriptions join the injected half of the D101 brief under "Enabled
+  plugins", and its MCP servers are merged into `.relay/relay.mcp.json` for Claude and passed as
+  `--config mcp_servers.<name>.*` overrides to Codex on every start and resume. A manifest command
+  of `relay` means this Relay binary; a plugin can never replace the `relay` server. Skill folders
+  update in running checkouts at once; the brief and MCP servers apply on the next start or
+  resume, which is when a provider reads them. The first plugin, Unreal Engine, serves its tools
+  from `relay unreal-mcp`: a stdio MCP server independent of the bus that reads the project on
+  disk, runs UnrealBuildTool through `proc::output_with_timeout`, and reaches a running editor
+  through the Remote Control HTTP API and `PythonScriptLibrary.ExecutePythonCommandEx`.
+- **D160 A plugin can choose the checkout, and the Unreal bridge refuses the wrong one.** An
+  Unreal editor has exactly one project open, normally the main checkout, while Relay's default
+  gives each agent a new worktree: an agent's C++ landed in its worktree and its editor edits in
+  the main checkout. A plugin manifest may now set `default_checkout: "primary"`; `session.create`
+  without an explicit `worktree` then uses the primary checkout for projects with that plugin on
+  (read once in the prepare phase so both phases agree). An explicit `worktree` still wins. The
+  `unreal-mcp` live tools independently ask the editor for its open `.uproject` and refuse on a
+  mismatch, and serialize editor-changing tools through a lease file in the project's `Saved/`
+  (session name as holder, 15 idle minutes to expire), since agents sharing one checkout also
+  share one editor. Animation checks are measurement first: `ue_anim_inspect` poses skeletons
+  from animation data in editor Python and reports sides, grips, clearances and contacts in a
+  frame derived from the skeleton's own left/right bone pairs, so it holds for any skeleton,
+  item or mesh orientation; `ue_anim_preview` adds images, confirming each pose was applied
+  before capture because the editor applies poses on its tick.
+- **D161 The Blender plugin runs Blender headless, one process per call.** Game art tools usually
+  bridge to a running Blender through an add-on and a socket; that needs a window, an installed
+  add-on and one shared session. `relay blender-mcp` instead starts `blender -b <file>
+  --factory-startup` per call with a script from `relay-cli/src/blender_py/`, arguments in a JSON
+  file and one `RELAY_JSON:` result line, under `proc::output_with_timeout`. Calls are
+  independent, work with no Blender open, never load the user's add-ons (bundled ones can be
+  enabled per call), and cannot leave state behind. Files are resolved inside the agent's
+  checkout. Renders return as MCP image content, as `ue_screenshot` does, so the agent can see
+  its work; the rig check and `blender_anim_inspect` use the same character frame (from the rig's
+  own `.L`/`.R` pairs) as the Unreal checks, so a problem is caught before export and
+  measured again after import. `blender_to_unreal` calls the Unreal bridge in-process, sharing its
+  project guard and editor lock, and compares height, root bone scale and hand sides across the
+  handoff. The Blender tests run against real Blender when it is installed and skip otherwise.

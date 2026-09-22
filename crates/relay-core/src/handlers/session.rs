@@ -359,8 +359,11 @@ fn launch(ctx: &mut Ctx, row: &Row_, kind: LaunchKind) -> Result<Session, BusErr
         &relay_bin,
     )
     .bus()?;
+    // A plugin that is on brings its MCP servers to every agent of the project (D159).
+    let plugin_servers = crate::plugins::mcp_servers(ctx.tx(), row.session.project_id, &relay_bin).bus()?;
     if row.session.provider == Provider::Claude {
         crate::hooks::install_claude(&cwd, ctx.instance(), &relay_bin).bus()?;
+        crate::hooks::add_claude_mcp_servers(&cwd, &plugin_servers).bus()?;
     } else if row.session.provider == Provider::Codex {
         crate::hooks::install_codex(&cwd, ctx.instance(), &relay_bin).bus()?;
     }
@@ -433,6 +436,9 @@ fn launch(ctx: &mut Ctx, row: &Row_, kind: LaunchKind) -> Result<Session, BusErr
             "--config".into(),
             crate::providers::codex_notify_config(&relay_bin),
         ]);
+        for (name, command, server_args, env) in &plugin_servers {
+            args.extend(crate::providers::codex_mcp_config(name, command, server_args, env));
+        }
     }
     let cfg = crate::guardrail::config(ctx.tx(), Some(row.session.project_id))?;
     for root in crate::guardrail::write_roots(&cfg, &cwd).into_iter().filter(|root| root != &cwd) {
@@ -550,6 +556,9 @@ struct PreparedCreate {
     name: String,
     project: relay_bus::types::Project,
     worktree: Option<relay_bus::types::Worktree>,
+    /// Read once in the prepare phase, so both phases agree even if a plugin is switched
+    /// meanwhile (D160).
+    default_checkout: &'static str,
 }
 
 impl Drop for PreparedCreate {
@@ -584,6 +593,7 @@ pub fn register(e: &mut Engine) {
     e.register_staged::<Create, _>(|ctx, p| {
         let mut prepared = ctx.read(|conn| {
             let project = validate_create(conn, p)?;
+            let default_checkout = crate::plugins::default_checkout(conn, project.id).bus()?;
             let mut reservations = ctx.engine().creating_sessions.lock().unwrap();
             for _ in 0..200 {
                 let name = sessions::new_name(conn).bus()?;
@@ -591,14 +601,14 @@ pub fn register(e: &mut Engine) {
                     || !reservations.insert(name.clone()) { continue; }
                 return Ok(PreparedCreate {
                     engine: Arc::downgrade(&ctx.engine().arc().ok_or_else(|| BusError::internal("engine unavailable"))?),
-                    name, project, worktree: None,
+                    name, project, worktree: None, default_checkout,
                 });
             }
             Err(BusError::conflict("session.names_busy", "Could not reserve a free session name"))
         })?;
         // Fetch AND checkout can invoke slow network/LFS filters. Neither belongs
         // under the global store mutex: existing sessions must remain responsive.
-        if p.pair_with.is_none() && p.worktree.as_deref().unwrap_or("new") == "new" {
+        if p.pair_with.is_none() && p.worktree.as_deref().unwrap_or(prepared.default_checkout) == "new" {
             let repo = Path::new(&prepared.project.path);
             super::git::refresh_new_worktree(repo, p.branch.as_deref())?;
             let branch = p.branch.clone().unwrap_or_else(|| worktree::branch_for(&prepared.name));
@@ -650,7 +660,7 @@ pub fn register(e: &mut Engine) {
         let token = sessions::new_token();
         let repo = Path::new(&project.path);
         let pair_worktree = pair.as_ref().map(|row| row.session.worktree.as_str());
-        let requested_worktree = p.worktree.as_deref().or(pair_worktree).unwrap_or("new");
+        let requested_worktree = p.worktree.as_deref().or(pair_worktree).unwrap_or(prepared.default_checkout);
         let (worktree_path, branch) = match requested_worktree {
             "primary" => {
                 let all = worktree::list_with_dirty(repo, false).bus()?;

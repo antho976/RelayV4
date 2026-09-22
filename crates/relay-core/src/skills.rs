@@ -27,10 +27,18 @@ const MAX_DEPTH: usize = 12;
 
 /// One enabled skill as the materializer needs it.
 struct Row {
-    id: Id,
     dir: String,
     body: String,
     stamp: String,
+    source: Source,
+}
+
+/// Where a skill folder's files come from.
+enum Source {
+    /// An installed skill: its library folder beside the store, if it has one.
+    Library(Id),
+    /// A skill of a bundled plugin (D159): files relative to the skill folder.
+    Plugin(Vec<(&'static str, &'static [u8])>),
 }
 
 /// `<store dir>/skills/<skill id>/` — the app-wide copy of one skill's folder.
@@ -116,7 +124,26 @@ fn enabled(conn: &Connection, project_id: Id) -> Result<Vec<Row>> {
          ORDER BY s.name COLLATE NOCASE,s.id",
     )?;
     let rows = stmt.query_map([project_id], row_of)?.collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
+    Ok(with_plugins(rows, &crate::plugins::enabled_for(conn, project_id)?))
+}
+
+/// Add the skills of enabled plugins. An installed skill with the same folder name wins: the
+/// user put it there on purpose, and two writers of one folder would rewrite it forever.
+fn with_plugins(mut rows: Vec<Row>, plugins: &[&'static crate::plugins::Loaded]) -> Vec<Row> {
+    for plugin in plugins {
+        for skill in &plugin.skills {
+            if rows.iter().any(|row| row.dir == skill.dir) {
+                continue;
+            }
+            rows.push(Row {
+                dir: skill.dir.clone(),
+                body: skill.body.clone(),
+                stamp: format!("plugin {} {} {}\n", plugin.id(), plugin.bundle.digest, skill.dir),
+                source: Source::Plugin(skill.files.clone()),
+            });
+        }
+    }
+    rows
 }
 
 fn row_of(row: &rusqlite::Row) -> rusqlite::Result<Row> {
@@ -125,10 +152,10 @@ fn row_of(row: &rusqlite::Row) -> rusqlite::Result<Row> {
     let updated_at: String = row.get(3)?;
     let revision: String = row.get(4)?;
     Ok(Row {
-        id,
         dir: folder_name(&name),
         body: row.get(2)?,
         stamp: format!("{id} {updated_at} {revision}\n"),
+        source: Source::Library(id),
     })
 }
 
@@ -142,7 +169,7 @@ fn enabled_anywhere(conn: &Connection) -> Result<Vec<Row>> {
          ORDER BY s.name COLLATE NOCASE,s.id",
     )?;
     let rows = stmt.query_map([], row_of)?.collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
+    Ok(with_plugins(rows, &crate::plugins::enabled_anywhere(conn)?))
 }
 
 /// The machine-wide skill folders. Codex is the reason this exists: it reads skills only from
@@ -213,7 +240,7 @@ pub fn apply(plan: &Plan, store: &crate::Store) -> Result<()> {
                     }
                 }
                 Ok(false) => {}
-                Err(error) => tracing::warn!(skill = row.id, error = %error, "materializing skill"),
+                Err(error) => tracing::warn!(skill = %row.dir, error = %error, "materializing skill"),
             }
         }
     }
@@ -297,11 +324,18 @@ fn write_skill(store: &crate::Store, row: &Row, dest: &Path) -> Result<bool> {
 
 fn fill(store: &crate::Store, row: &Row, dest: &Path) -> Result<()> {
     let _ = fs::remove_dir_all(dest);
-    let library = library_dir(store, row.id);
-    if library.is_dir() {
-        copy_bounded(&library, dest)?;
-    } else {
-        fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
+    match &row.source {
+        Source::Library(id) if library_dir(store, *id).is_dir() => copy_bounded(&library_dir(store, *id), dest)?,
+        Source::Library(_) => fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?,
+        Source::Plugin(files) => {
+            for (relative, bytes) in files {
+                let path = dest.join(relative);
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+                }
+                fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))?;
+            }
+        }
     }
     let instructions = dest.join("SKILL.md");
     if !instructions.is_file() {

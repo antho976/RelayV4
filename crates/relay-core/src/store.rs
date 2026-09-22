@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 /// The schema version this build knows. Bump when appending to [`MIGRATIONS`].
-pub const SCHEMA_VERSION: i64 = 19;
+pub const SCHEMA_VERSION: i64 = 20;
 
 /// Numbered migrations; index 0 brings a fresh DB to `user_version = 1`.
 pub const MIGRATIONS: &[&str] = &[
@@ -359,6 +359,17 @@ pub const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE task_sessions ADD COLUMN completed_at TEXT;
     ALTER TABLE sessions ADD COLUMN done_pending_stop INTEGER;
+    "#,
+    // v20 - bundled plugins are switched on per project (D159). The plugin itself lives in the
+    // binary, so only the edge is stored; an id this build no longer bundles is simply ignored.
+    r#"
+    CREATE TABLE plugin_projects (
+      plugin_id TEXT NOT NULL,
+      project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      enabled_at TEXT NOT NULL,
+      PRIMARY KEY(plugin_id, project_id)
+    );
+    CREATE INDEX plugin_projects_project ON plugin_projects(project_id, plugin_id);
     "#,
 ];
 

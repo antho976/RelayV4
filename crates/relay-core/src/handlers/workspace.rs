@@ -310,6 +310,7 @@ pub fn register(e: &mut Engine) {
             "DELETE FROM ui_layouts WHERE project_id=?1",
             "DELETE FROM device_runs WHERE project_id=?1",
             "DELETE FROM skill_projects WHERE project_id=?1",
+            "DELETE FROM plugin_projects WHERE project_id=?1",
         ] {
             ctx.tx().execute(sql, [pr.id]).bus()?;
         }

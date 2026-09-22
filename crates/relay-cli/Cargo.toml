@@ -22,3 +22,8 @@ clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 base64.workspace = true
+regex.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

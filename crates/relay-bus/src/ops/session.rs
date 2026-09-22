@@ -88,7 +88,7 @@ op!(List, "session.list", ListIn => ListOut, OpMeta::query(Scope::Global, 3, "Se
 payload!(#[schemars(rename = "SessionPeersIn")] PeersIn { pub session: Option<String>, pub project_id: Option<Id> });
 result!(#[schemars(rename = "SessionPeersOut")] PeersOut { pub peers: Vec<Peer> });
 op!(Peers, "session.peers", PeersIn => PeersOut, OpMeta::query(Scope::Project, 5, "The live peer table"));
-result!(#[schemars(rename = "SessionBriefParts")] BriefParts { pub state: String, pub peers: String, pub notes: String, pub adjacent: String, pub skills: String });
+result!(#[schemars(rename = "SessionBriefParts")] BriefParts { pub state: String, pub peers: String, pub notes: String, pub adjacent: String, pub skills: String, #[serde(default)] pub plugins: String });
 result!(#[schemars(rename = "SessionBriefOut")] BriefOut {
     /// Everything, skills included. What the UI shows.
     pub text: String,

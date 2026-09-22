@@ -318,7 +318,7 @@ provider-neutral snapshot is written to `.relay/sessions/<session>/session-brief
   previously removed name restores its hidden row; a genuine visible name collision identifies
   both sources and offers review, refresh, or an explicit atomic replacement.
   Relay does not present a local skill-authoring surface.
-- **Plugins tab** — future extension list; stub page in v4.0.
+- **Plugins tab** — bundled plugins (skills + agent rules + docs + MCP servers, D159), each with a switch per project; every project row in the sidebar also opens its own plugin switches.
 - **Editor / Diff / Files / Git / Mirror / Run** — per §8-9.
 
 ═══════════════════════════════════════════════════════════════════

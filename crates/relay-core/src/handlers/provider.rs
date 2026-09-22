@@ -3,7 +3,7 @@
 use crate::engine::{Ctx, Engine, IntoBus};
 use crate::github::DownloadedSkill;
 use relay_bus::ops::provider::*;
-use relay_bus::types::{Id, Skill, Usage};
+use relay_bus::types::{Id, PluginDoc, Skill, Usage};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -264,11 +264,92 @@ pub fn register(e: &mut Engine) {
             repositories: crate::github::repositories()?,
         })
     });
-    e.register::<PluginList>(|_, _| {
-        Ok(PluginListOut {
-            plugins: Vec::new(),
+    // Detection lists each project root once; that is filesystem work, so it runs with the
+    // store lock released and only the enable edges are read under it (D144).
+    e.register_unlocked::<PluginList>(|ctx, payload| {
+        let (projects, edges) = ctx.read(|conn| {
+            let mut stmt = conn.prepare_cached("SELECT id,path FROM projects ORDER BY id").bus()?;
+            let projects = stmt
+                .query_map([], |row| Ok((row.get::<_, Id>(0)?, row.get::<_, String>(1)?)))
+                .bus()?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .bus()?;
+            let mut edges = BTreeMap::<String, Vec<Id>>::new();
+            for plugin in crate::plugins::all() {
+                edges.insert(plugin.id().to_string(), crate::plugins::projects_for(conn, plugin.id()).bus()?);
+            }
+            Ok((projects, edges))
+        })?;
+        let plugins = crate::plugins::all()
+            .iter()
+            .map(|plugin| {
+                let enabled_in = edges.get(plugin.id()).cloned().unwrap_or_default();
+                let suggested_for = projects
+                    .iter()
+                    .filter(|(id, _)| !enabled_in.contains(id))
+                    .filter(|(id, _)| payload.project_id.is_none_or(|only| only == *id))
+                    .filter(|(_, path)| crate::plugins::detect(plugin, std::path::Path::new(path)))
+                    .map(|(id, _)| *id)
+                    .collect();
+                crate::plugins::to_bus(plugin, enabled_in, suggested_for)
+            })
+            .collect();
+        Ok(PluginListOut { plugins })
+    });
+    e.register_unlocked::<PluginGet>(|ctx, payload| {
+        let plugin = find_plugin(&payload.plugin_id)?;
+        let enabled_in = ctx.read(|conn| crate::plugins::projects_for(conn, plugin.id()).bus())?;
+        let skill = match payload.skill.as_deref() {
+            None => None,
+            Some(name) => {
+                let skill = plugin.skills.iter().find(|skill| skill.dir == name).ok_or_else(|| {
+                    relay_bus::BusError::not_found("plugin.skill_not_found", format!("{} has no skill {name:?}", plugin.id()))
+                })?;
+                Some(PluginDoc { path: format!("skills/{}/SKILL.md", skill.dir), body: skill.body.clone() })
+            }
+        };
+        Ok(PluginGetOut {
+            plugin: crate::plugins::to_bus(plugin, enabled_in, Vec::new()),
+            instructions: plugin.instructions(),
+            docs: crate::plugins::docs(plugin),
+            skill,
         })
     });
+    e.register::<PluginEnable>(|ctx: &mut Ctx, payload| {
+        let plugin = find_plugin(&payload.plugin_id)?;
+        crate::handlers::workspace::get_project(ctx.tx(), payload.project_id)?;
+        let was_enabled = crate::plugins::projects_for(ctx.tx(), plugin.id()).bus()?.contains(&payload.project_id);
+        if payload.enabled {
+            ctx.tx().execute(
+                "INSERT OR IGNORE INTO plugin_projects(plugin_id,project_id,enabled_at) VALUES (?1,?2,?3)",
+                params![plugin.id(), payload.project_id, ctx.now],
+            ).bus()?;
+        } else {
+            ctx.tx().execute(
+                "DELETE FROM plugin_projects WHERE plugin_id=?1 AND project_id=?2",
+                params![plugin.id(), payload.project_id],
+            ).bus()?;
+        }
+        ctx.set_project(payload.project_id);
+        let enabled_in = crate::plugins::projects_for(ctx.tx(), plugin.id()).bus()?;
+        let out = crate::plugins::to_bus(plugin, enabled_in, Vec::new());
+        ctx.set_undo(
+            "plugin.enable",
+            json!({"plugin_id":plugin.id(),"project_id":payload.project_id,"enabled":was_enabled}),
+            None,
+        );
+        ctx.emit("plugin.changed", json!({"id":plugin.id(),"project_id":payload.project_id,"enabled":payload.enabled}));
+        // Skill folders reach existing checkouts now; MCP servers and the brief reach each agent
+        // on its next start or resume, which is when a provider reads them.
+        refresh_checkouts(ctx);
+        Ok(out)
+    });
+}
+
+fn find_plugin(id: &str) -> Result<&'static crate::plugins::Loaded, relay_bus::BusError> {
+    crate::plugins::get(id).ok_or_else(|| {
+        relay_bus::BusError::not_found("plugin.not_found", format!("no bundled plugin {id:?}"))
+    })
 }
 
 /// Repositories commonly publish the same skill under both `.agents/skills` and

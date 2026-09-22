@@ -15,6 +15,7 @@ pub mod handlers;
 pub mod hooks;
 pub mod mirror;
 pub mod paths;
+pub mod plugins;
 pub mod proc;
 pub mod providers;
 mod provider_updates;
