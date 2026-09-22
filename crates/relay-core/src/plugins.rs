@@ -367,6 +367,24 @@ mod tests {
     }
 
     #[test]
+    fn the_blender_plugin_is_bundled_and_complete() {
+        let plugin = get("blender").expect("blender is bundled");
+        assert!(!plugin.instructions().is_empty());
+        for doc in &plugin.manifest.docs {
+            assert!(plugin.file(doc).is_some(), "manifest names a missing doc {doc}");
+        }
+        assert_eq!(plugin.manifest.mcp_servers[0].args, vec!["blender-mcp".to_string()]);
+        for skill in &plugin.skills {
+            assert_eq!(frontmatter(&skill.body, "name").as_deref(), Some(skill.dir.as_str()));
+            assert!(!skill.description.is_empty(), "{} has no description", skill.dir);
+        }
+        // Two plugins on at once must not collide on skill folders or server names.
+        let unreal = get("unreal-engine").unwrap();
+        assert!(plugin.skills.iter().all(|s| unreal.skills.iter().all(|u| u.dir != s.dir)));
+        assert_ne!(plugin.manifest.mcp_servers[0].name, unreal.manifest.mcp_servers[0].name);
+    }
+
+    #[test]
     fn frontmatter_reads_single_line_values_only_inside_the_block() {
         let body = "---\nname: unreal-ai\ndescription: \"Behavior trees, EQS\"\n---\n\ndescription: not this\n";
         assert_eq!(frontmatter(body, "name").as_deref(), Some("unreal-ai"));

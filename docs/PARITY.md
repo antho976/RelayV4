@@ -20,7 +20,7 @@ The archived V3 roadmap remains unchanged; its completion marks describe V3.
 | Skills | Local editing, GitHub installation and replacement, source refresh, per-project enablement and deletion |
 | Settings and usage | Relay-2 palettes and SVG geometry, wallpaper library, opacity/dimming/contrast, terminal font, configurable Relay-2 shortcuts, provider/device paths, parking, guardrail configuration, backups and provider usage panels |
 | Android | Device/AVD listing, boot/create, selected-worktree run/build, APK/AAB, optional publishing, signing configuration, bounded logs and native mirror/control/capture |
-| Plugins | Bundled plugins switched on per project (D159); the Unreal Engine plugin ships 20 skills, agent rules, docs and the `relay unreal-mcp` server |
+| Plugins | Bundled plugins switched on per project (D159); the Unreal Engine plugin ships 20 skills, agent rules, docs and the `relay unreal-mcp` server; the Blender plugin ships 6 skills and `relay blender-mcp` |
 
 App-owned editors, confirmations, registry controls, usage and build logs stay
 inside the main window. Task/module details use the content page; command and

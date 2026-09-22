@@ -270,6 +270,14 @@ Unreal Insights (`-trace=default`).
 - Playtesting only in PIE, where frame pacing and loading differ from a packaged build.
 - Hit-stop through `SetGlobalTimeDilation` in multiplayer. Time dilation is per world, so it affects everyone. Use per-actor `CustomTimeDilation`.
 
+## Relay tools for this work
+
+- `ue_data_table` exports Data Tables to CSV/JSON files in the repository and imports them back:
+  balance numbers, loot and progression stay reviewable text.
+- `ue_play` is the smallest playtest: play for a few seconds, capture screenshots, probe values
+  (health, positions, timers) with Python, read the log. It does not replace a human playtest of
+  feel; it catches broken rules before one.
+
 ## 11. Verify your work
 
 - [ ] Pillars, verbs and loops are written in the design doc, and the new feature maps to them.

@@ -76,6 +76,55 @@ Runs a console command in the editor world. Output lands in the log; read it wit
 ### `ue_editor_lock` — `{ action?: "status" | "release" }`
 Who holds the editor lock; `release` gives up your own.
 
+## Playing, testing and profiling
+
+### `ue_play` — `{ mode?, seconds?, checkpoints?, screenshots?, width?, height?, console?, probe?, log_filter?, stop?, stop_existing? }`
+Starts Play In Editor (`mode: "simulate"` for Simulate), waits until it runs, runs `console`
+commands, and at each checkpoint (seconds after start; default the end) takes an in-game
+screenshot (`HighResShot`) and runs `probe` — Python with `unreal` and `world` (the game world) in
+scope, whose printed output is returned. Then it stops the session and returns the screenshots as
+images, the probe output, and the log lines written while playing (default filter: errors,
+warnings, ensures, "Accessed None", Blueprint user messages). On engine versions whose Python has
+no play-in-editor request it falls back to Simulate and says so.
+
+### `ue_run_tests` — `{ filter, in_editor?, timeout_s? }`
+Headless by default: runs `UnrealEditor-Cmd` on the project with
+`-ExecCmds="Automation RunTests <filter>;Quit" -nullrhi -unattended` and a report folder, and
+returns each test's state and error/warning messages. `in_editor: true` runs the tests in the open
+editor and reads the results from the log.
+
+### `ue_profile` — `{ seconds?, warmup?, play?, console? }`
+Starts Play In Editor (unless `play: false`), waits `warmup` seconds, records `csvprofile` for
+`seconds`, stops, and summarises the newest CSV in `Saved/Profiling/CSV`: frames, average fps, and
+average / 95th percentile / worst for FrameTime, GameThreadTime, RenderThreadTime, GPUTime (and
+RHIThreadTime when present), plus the five worst frames.
+
+### `ue_crash` — `{ index? }`
+The newest (or `index`-th newest) folder in `Saved/Crashes`: error message, crash type, call stack,
+engine version, build configuration and the tail of its log. Works without the editor.
+
+## Assets and data
+
+### `ue_blueprint_info` — `{ paths? | folder?, compile?, limit? }`
+Parent class and Asset Registry tags, variables (with default values) and functions/events that
+the Blueprint adds over its native parent, components, and event-graph nodes where the engine
+exposes them to Python (the `notes` say what could not be read). `compile: true` compiles and adds
+the compiler's log lines.
+
+### `ue_asset_audit` — `{ path?, checks?, limit? }`
+Textures (non-power-of-two, over 4096, normal maps without Normalmap compression, masks in sRGB,
+Never Stream on large textures, world textures without mips), static meshes (no simple collision,
+over 50k vertices with one LOD and no Nanite), references to missing assets, and redirectors. Each
+finding has a fix. Loads assets, bounded by `limit` per class.
+
+### `ue_asset_refs` — `{ path, depth? }`
+Dependencies and referencers, level by level.
+
+### `ue_data_table` — `{ action, path, file?, format? }`
+`export` returns the Data Table as CSV (default) or JSON and writes it to `file` in the checkout;
+`import` fills the table from `file` and saves it (the engine's error for a bad row or column is
+returned with the log lines).
+
 ## Seeing and measuring
 
 ### `ue_screenshot` — `{ actors?, views?, camera?, forward?, isolate?, width?, height?, fov? }`

@@ -13,6 +13,7 @@ use std::process::ExitCode;
 
 mod mcp;
 mod unreal;
+mod blender;
 mod remote;
 
 #[derive(Parser)]
@@ -70,6 +71,8 @@ enum Command {
     Mcp,
     /// The Unreal Engine plugin's MCP server (stdio): project, build, log and live-editor tools
     UnrealMcp,
+    /// The Blender plugin's MCP server (stdio): background Blender on the checkout's .blend files
+    BlenderMcp,
     /// The phone door: pair a phone, serve it on the LAN or through a rendezvous you host
     Remote {
         #[command(subcommand)]
@@ -224,6 +227,7 @@ async fn run(cli: Cli) -> Result<u8> {
             mcp::serve(instance, actor, token).await
         }
         Command::UnrealMcp => unreal::serve(),
+        Command::BlenderMcp => blender::serve(),
         Command::Remote { remote } => remote::run(instance, remote).await,
         Command::Schema { op } => {
             match op {

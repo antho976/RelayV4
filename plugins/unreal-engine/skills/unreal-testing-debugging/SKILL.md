@@ -277,6 +277,24 @@ client; forward to the server with a Server RPC (`unreal-multiplayer`).
 | Multiplayer only bug | Authority checks, replication conditions, RPC ownership (`unreal-multiplayer`) |
 | Hitch/slowness | `unreal-performance` |
 
+## Relay tools for this work
+
+- `ue_run_tests {filter}` runs automation tests headless (a separate editor process, safe while the
+  human's editor is open) and returns pass/fail per test with messages; `in_editor: true` runs them
+  in the open editor instead.
+- `ue_play` plays the game in the editor for N seconds, takes screenshots, runs a Python probe
+  against the game world at checkpoints, and returns the log lines produced while playing
+  (errors, warnings, ensures, "Accessed None"). Use it to reproduce runtime bugs and to prove fixes.
+- `ue_crash` reads the latest crash report (error, call stack, log tail).
+- `ue_log` with a filter for everything else.
+
+**Know when to stop.** If a problem reproduces in an empty level or a fresh template project, only
+on one engine version, or its call stack is entirely in engine modules with no project frames,
+suspect an engine bug. Spend at most two focused attempts on it, then stop and hand it to the
+human: the exact steps to reproduce, the engine version, the log and call stack, and the
+workarounds you tried. Do not rewrite working systems to route around a suspected engine bug
+without agreement.
+
 ## Verify your work
 
 - [ ] New logic has an automation test (pure logic) or a functional test (in-world), and

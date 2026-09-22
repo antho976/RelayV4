@@ -285,6 +285,14 @@ collision generation, lighting setup and saving under OFPA are all in `reference
 - Complex collision on the player's walkable surfaces, which causes snagging. Missing collision on small ledges, where players get stuck.
 - Navmesh not rebuilt, or bounds not covering new areas. Press P to check.
 
+## Relay tools for this work
+
+- `ue_asset_audit {path}` before a lighting or streaming investigation: textures that cannot
+  stream (not power of two, Never Stream), wrong compression, meshes without collision, dense
+  meshes without Nanite or LODs, missing references and redirectors. The World Partition texture
+  problems that look like engine bugs are usually one of these.
+- `ue_screenshot` and `ue_play` to see the level from the player's height.
+
 ## 15. Verify your work
 
 - [ ] `ue_level_actors` shows the expected actors, labels and folders, and there are no stray actors at the origin.

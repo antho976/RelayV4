@@ -324,6 +324,15 @@ then verify via `ue_python` (compile status, CDO values) and `ue_log`.
 - Circular Blueprint dependencies (BP_A casts to BP_B and vice versa) cause long load/compile
   times; break them with interfaces or C++ bases.
 
+## Relay tools for this work
+
+- `ue_blueprint_info {paths | folder, compile?}` reads Blueprints as text: parent class,
+  interfaces, variables with defaults, functions and events, components, and graph nodes where the
+  engine exposes them. `compile: true` compiles and returns the compiler's log lines. Read a
+  Blueprint before changing it or describing a change to the human.
+- `ue_asset_refs` before renaming or deleting a Blueprint.
+- `ue_play` to check that the Blueprint behaves at runtime.
+
 ## Verify your work
 
 - [ ] Every created/modified asset compiled (no errors in `ue_log`) and saved; the human has the

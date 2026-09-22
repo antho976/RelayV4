@@ -311,6 +311,15 @@ Pitfalls:
   level: this hides the problem on high-end and breaks the look.
 - Leaving debug cvars in `DefaultEngine.ini` `[SystemSettings]`. Review ini diffs.
 
+## Relay tools for this work
+
+- `ue_profile {seconds, warmup, play}` starts Play In Editor, records Unreal's CSV profiler and
+  returns average, 95th percentile and worst frame, game thread, render thread and GPU times and
+  the slowest frames. Measure before and after every optimisation, with the same map and camera.
+- `ue_asset_audit` finds oversized or non-streaming textures and dense meshes without Nanite or
+  LODs, which are the usual memory and streaming culprits.
+- `ue_console` for `stat` commands; `ue_play` screenshots show hitches in context.
+
 ## Verify your work
 
 - [ ] Before/after numbers from the same scenario and build type are recorded.

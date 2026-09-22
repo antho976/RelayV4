@@ -173,6 +173,13 @@ LFS locking support) and Perforce: File/toolbar **Revision Control** menu > Conn
 a provider connected the editor shows lock/checkout state on assets and offers check out
 on edit. Whether it is configured is the human's choice; the git CLI rules above work either way.
 
+## Relay tools for this work
+
+- `ue_asset_refs {path}` before moving, renaming or deleting anything: it lists what depends on the
+  asset, so the commit can include every referencer that has to be resaved.
+- `ue_asset_audit` with `checks: ["redirectors", "references"]` finds redirectors to fix up and
+  references to missing assets before a commit.
+
 ## Verify your work
 
 - [ ] `git status` shows only files you meant to change; unrelated dirty `.uasset`s were reverted.

@@ -30,10 +30,12 @@ const SKIP_DIRS: [&str; 7] = ["Binaries", "Intermediate", "Saved", "DerivedDataC
 const MAX_OUTPUT: usize = 60_000;
 /// Tools that act on the running editor. Each first checks the editor has this checkout's
 /// project open: an agent in a worktree would otherwise edit assets in a different copy.
-const LIVE: [&str; 10] = ["ue_python", "ue_call", "ue_property", "ue_search_assets", "ue_level_actors", "ue_console",
-    "ue_screenshot", "ue_anim_inspect", "ue_anim_preview", "ue_editor_lock"];
+const LIVE: [&str; 16] = ["ue_python", "ue_call", "ue_property", "ue_search_assets", "ue_level_actors", "ue_console",
+    "ue_screenshot", "ue_anim_inspect", "ue_anim_preview", "ue_editor_lock", "ue_play", "ue_blueprint_info",
+    "ue_asset_audit", "ue_asset_refs", "ue_data_table", "ue_profile"];
 /// Live tools that change editor state, and so need the editor lock.
-const MUTATING: [&str; 6] = ["ue_python", "ue_call", "ue_console", "ue_screenshot", "ue_anim_preview", "ue_property"];
+const MUTATING: [&str; 10] = ["ue_python", "ue_call", "ue_console", "ue_screenshot", "ue_anim_preview", "ue_property",
+    "ue_play", "ue_profile", "ue_data_table", "ue_blueprint_info"];
 /// A lock nobody has used for this long is free to take.
 const LOCK_IDLE: Duration = Duration::from_secs(15 * 60);
 /// Images one call may return; each is a full PNG in the agent's context.
@@ -44,6 +46,12 @@ const PY_PROJECT_CHECK: &str = include_str!("unreal_py/project_check.py");
 const PY_CAPTURE: &str = include_str!("unreal_py/capture.py");
 const PY_ANIM_INSPECT: &str = include_str!("unreal_py/anim_inspect.py");
 const PY_ANIM_PREVIEW: &str = include_str!("unreal_py/anim_preview.py");
+const PY_PLAY: &str = include_str!("unreal_py/play.py");
+const PY_BLUEPRINT_INFO: &str = include_str!("unreal_py/blueprint_info.py");
+const PY_ASSET_AUDIT: &str = include_str!("unreal_py/asset_audit.py");
+const PY_ASSET_REFS: &str = include_str!("unreal_py/asset_refs.py");
+const PY_DATA_TABLE: &str = include_str!("unreal_py/data_table.py");
+const PY_IMPORT_FBX: &str = include_str!("unreal_py/import_fbx.py");
 
 pub fn serve() -> Result<u8> {
     let stdin = std::io::stdin();
@@ -100,7 +108,7 @@ fn handle(message: &Value) -> Option<Value> {
     Some(json!({"jsonrpc":"2.0","id":id,"result":result}))
 }
 
-fn tool(name: &str, description: &str, properties: Value, required: &[&str], read_only: bool) -> Value {
+pub(crate) fn tool(name: &str, description: &str, properties: Value, required: &[&str], read_only: bool) -> Value {
     json!({
         "name": name,
         "description": description,
@@ -228,6 +236,64 @@ fn tools() -> Vec<Value> {
                 "settle_ms":{"type":"integer","minimum":50,"maximum":5000,"description":"Wait for the editor to apply each pose, default 400"},
                 "width":{"type":"integer","minimum":64,"maximum":1280},"height":{"type":"integer","minimum":64,"maximum":1080}
             }), &["mesh"], false),
+        tool("ue_play",
+            "Play the game in the editor and watch it: starts Play In Editor (or Simulate), waits for it to run, takes in-game screenshots and runs your Python probe (with `world` = the game world) at checkpoints, then stops and returns the screenshots, probe output and the log lines (errors, warnings, ensures, 'Accessed None') produced while playing. Use it to check gameplay, runtime IK and anything that only happens at runtime.",
+            json!({
+                "mode":{"type":"string","enum":["pie","simulate"],"description":"Default pie"},
+                "seconds":{"type":"number","minimum":1,"maximum":300,"description":"How long to play, default 5"},
+                "checkpoints":{"type":"array","items":{"type":"number"},"description":"Seconds after start to screenshot and probe; default the end"},
+                "screenshots":{"type":"boolean","description":"Default true"},
+                "width":{"type":"integer"},"height":{"type":"integer"},
+                "console":{"type":"array","items":{"type":"string"},"description":"Console commands to run right after play starts, e.g. cheats or 'slomo 0.5'"},
+                "probe":{"type":"string","description":"Python run at each checkpoint with `unreal` and `world` (the game world); print what you want to see"},
+                "log_filter":{"type":"string","description":"Regex over new log lines; default errors, warnings, ensures and Blueprint runtime errors"},
+                "stop":{"type":"boolean","description":"Stop at the end (default true)"},
+                "stop_existing":{"type":"boolean","description":"End a session that is already running first"}
+            }), &[], false),
+        tool("ue_blueprint_info",
+            "Read Blueprints as text: parent class, interfaces, variables with default values, functions and events, components, and graph nodes where this engine version exposes them. compile=true compiles them and returns the compiler's log lines. Give paths, or a folder to read every Blueprint in it.",
+            json!({
+                "paths":{"type":"array","items":{"type":"string"}},
+                "folder":{"type":"string"},
+                "compile":{"type":"boolean"},
+                "limit":{"type":"integer","minimum":1,"maximum":500,"description":"Default 50"}
+            }), &[], true),
+        tool("ue_asset_audit",
+            "Find asset problems with facts: textures (not power of two, oversized, normal maps with the wrong compression, masks in sRGB, Never Stream, no mips), static meshes (no collision, dense without Nanite or LODs), references to missing assets, and redirectors. Each finding says how to fix it.",
+            json!({
+                "path":{"type":"string","description":"Folder, default /Game"},
+                "checks":{"type":"array","items":{"type":"string","enum":["textures","meshes","references","redirectors"]}},
+                "limit":{"type":"integer","minimum":1,"maximum":5000,"description":"Assets loaded per class, default 400"}
+            }), &[], true),
+        tool("ue_asset_refs",
+            "What an asset depends on and what depends on it (up to 4 levels). Run it before renaming, moving or deleting anything.",
+            json!({"path":{"type":"string"},"depth":{"type":"integer","minimum":1,"maximum":4}}), &["path"], true),
+        tool("ue_data_table",
+            "Data Tables as text. export writes the table to a CSV or JSON file in the checkout (and returns it); import fills the table from such a file and saves the asset. Keeps balancing, dialogue and loot data diffable.",
+            json!({
+                "action":{"type":"string","enum":["export","import"]},
+                "path":{"type":"string","description":"Data Table asset path"},
+                "file":{"type":"string","description":"File in the checkout, relative to the project root"},
+                "format":{"type":"string","enum":["csv","json"]}
+            }), &["action","path"], false),
+        tool("ue_profile",
+            "Measure performance: plays (or uses the running editor world with play=false), records Unreal's CSV profiler for the given seconds, and returns average, 95th percentile and worst frame, game thread, render thread and GPU times, plus the slowest frames.",
+            json!({
+                "seconds":{"type":"number","minimum":2,"maximum":120,"description":"Default 10"},
+                "warmup":{"type":"number","minimum":0,"maximum":60,"description":"Seconds before recording, default 3"},
+                "play":{"type":"boolean","description":"Start Play In Editor first, default true"},
+                "console":{"type":"array","items":{"type":"string"}}
+            }), &[], false),
+        tool("ue_run_tests",
+            "Run automation tests and return pass/fail per test with error messages. Headless by default (a separate editor process with no window; works while your editor is open); in_editor=true runs them in the open editor instead.",
+            json!({
+                "filter":{"type":"string","description":"Test path prefix, e.g. Project. or MyGame.Inventory"},
+                "in_editor":{"type":"boolean"},
+                "timeout_s":{"type":"integer","minimum":30,"maximum":7200}
+            }), &["filter"], false),
+        tool("ue_crash",
+            "The most recent crash: error message, call stack and the last log lines, from Saved/Crashes.",
+            json!({"index":{"type":"integer","minimum":0,"description":"0 = most recent"}}), &[], true),
         tool("ue_editor_lock",
             "Who is driving the editor. Live tools that change the editor take this lock automatically, so two agents never script the one editor at once; it frees itself after 15 idle minutes. action=release gives it up when you are done.",
             json!({"action":{"type":"string","enum":["status","release"]}}), &[], false),
@@ -238,7 +304,10 @@ fn call(name: &str, args: &Value) -> Result<Value> {
     if LIVE.contains(&name) {
         let project = Project::find()?;
         guard_project(&project)?;
-        let writes = MUTATING.contains(&name) && (name != "ue_property" || args.get("value").is_some());
+        let writes = MUTATING.contains(&name)
+            && (name != "ue_property" || args.get("value").is_some())
+            && (name != "ue_data_table" || args["action"] == "import")
+            && (name != "ue_blueprint_info" || args["compile"] == true);
         if writes {
             acquire_lock(&project, &holder_id())?;
         }
@@ -297,6 +366,22 @@ fn call(name: &str, args: &Value) -> Result<Value> {
         }
         "ue_anim_inspect" => python_json(&script(PY_ANIM_INSPECT, args), Duration::from_secs(300)),
         "ue_anim_preview" => anim_preview(&Project::find()?, args),
+        "ue_play" => play(&Project::find()?, args),
+        "ue_blueprint_info" => {
+            let project = Project::find()?;
+            let start = log_len(&project);
+            let mut value = python_json(&script(PY_BLUEPRINT_INFO, args), Duration::from_secs(600))?;
+            if args["compile"] == true {
+                value["compiler_log"] = json!(log_since(&project, start, Some(r"LogBlueprint|Error|Warning")));
+            }
+            Ok(value)
+        }
+        "ue_asset_audit" => python_json(&script(PY_ASSET_AUDIT, args), Duration::from_secs(1800)),
+        "ue_asset_refs" => python_json(&script(PY_ASSET_REFS, args), Duration::from_secs(120)),
+        "ue_data_table" => data_table(&Project::find()?, args),
+        "ue_profile" => profile(&Project::find()?, args),
+        "ue_run_tests" => run_tests(&Project::find()?, args),
+        "ue_crash" => crash(&Project::find()?, args["index"].as_u64().unwrap_or(0) as usize),
         "ue_editor_lock" => {
             let project = Project::find()?;
             if args["action"].as_str() == Some("release") {
@@ -305,6 +390,23 @@ fn call(name: &str, args: &Value) -> Result<Value> {
             Ok(json!({"lock": read_lock(&project), "you": holder_id()}))
         }
         other => bail!("unknown tool {other}"),
+    }
+}
+
+/// Import an FBX into the editor's project and measure what arrived (used by the Blender
+/// plugin's `blender_to_unreal`). Same project guard and editor lock as every live tool.
+pub(crate) fn import_fbx(fbx: &Path, mut args: Value) -> Result<Value> {
+    let project = Project::find()?;
+    guard_project(&project)?;
+    acquire_lock(&project, &holder_id())?;
+    args["fbx"] = json!(fbx);
+    let start = log_len(&project);
+    match python_json(&script(PY_IMPORT_FBX, &args), Duration::from_secs(600)) {
+        Ok(mut value) => {
+            value["import_log"] = json!(log_since(&project, start, Some(r"LogFbx|Interchange|Error|Warning")));
+            Ok(value)
+        }
+        Err(error) => bail!("{error:#}\n{}", log_since(&project, start, Some(r"LogFbx|Interchange|Error|Warning")).join("\n")),
     }
 }
 
@@ -407,6 +509,345 @@ fn release_lock(project: &Project, me: &str) -> Result<()> {
         }
         None => Ok(()),
     }
+}
+
+// ---------------------------------------------------------------- playing, testing, measuring
+
+fn log_len(project: &Project) -> u64 {
+    std::fs::metadata(project.log_path()).map(|m| m.len()).unwrap_or(0)
+}
+
+/// Log lines written since byte offset `start`, optionally filtered, last 300 kept.
+fn log_since(project: &Project, start: u64, filter: Option<&str>) -> Vec<String> {
+    let Ok(bytes) = std::fs::read(project.log_path()) else { return Vec::new() };
+    let start = (start as usize).min(bytes.len());
+    let text = String::from_utf8_lossy(&bytes[start..]);
+    let re = filter.and_then(|f| regex::Regex::new(f).ok());
+    let lines: Vec<String> = text.lines().filter(|l| re.as_ref().is_none_or(|re| re.is_match(l))).map(str::to_string).collect();
+    lines[lines.len().saturating_sub(300)..].to_vec()
+}
+
+fn play_step(action: &str, extra: Value) -> Result<Value> {
+    let mut args = extra;
+    args["action"] = json!(action);
+    python_json(&script(PY_PLAY, &args), Duration::from_secs(60))
+}
+
+fn wait_for_play(on: bool) -> Result<()> {
+    for _ in 0..120 {
+        if play_step("status", json!({}))?["in_play"] == on {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    bail!("the play session did not {} within 30 s", if on { "start" } else { "stop" })
+}
+
+fn pngs_under(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else { return out };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(pngs_under(&path));
+        } else if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("png")) {
+            out.push(path);
+        }
+    }
+    out
+}
+
+const DEFAULT_PLAY_LOG: &str = r"Error|Warning|[Ee]nsure|Accessed None|Script Msg|LogBlueprintUserMessages|Assertion";
+
+fn play(project: &Project, args: &Value) -> Result<Value> {
+    let seconds = args["seconds"].as_f64().unwrap_or(5.0).clamp(1.0, 300.0);
+    let mut checkpoints: Vec<f64> = args["checkpoints"].as_array()
+        .map(|a| a.iter().filter_map(Value::as_f64).filter(|t| *t >= 0.0 && *t <= seconds).collect())
+        .unwrap_or_else(|| vec![seconds]);
+    checkpoints.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    checkpoints.truncate(12);
+    let screenshots = args["screenshots"].as_bool().unwrap_or(true);
+    let shots_dir = project.root.join("Saved/Screenshots");
+    let before: std::collections::HashSet<PathBuf> = pngs_under(&shots_dir).into_iter().collect();
+    if args["stop_existing"] == true {
+        play_step("stop", json!({}))?;
+        wait_for_play(false)?;
+    }
+    let log_start = log_len(project);
+    let started = play_step("start", json!({"mode": args["mode"].as_str().unwrap_or("pie")}))?;
+    wait_for_play(true)?;
+    let t0 = std::time::Instant::now();
+    let outcome = (|| -> Result<Vec<Value>> {
+        if let Some(commands) = args["console"].as_array() {
+            play_step("console", json!({"commands": commands}))?;
+        }
+        let mut probes = Vec::new();
+        for at in &checkpoints {
+            let wait = Duration::from_secs_f64(*at).saturating_sub(t0.elapsed());
+            std::thread::sleep(wait);
+            if screenshots {
+                play_step("shot", json!({"width": args["width"].as_u64().unwrap_or(1280), "height": args["height"].as_u64().unwrap_or(720)}))?;
+            }
+            if let Some(code) = args["probe"].as_str() {
+                let out = python(&format!("ARGS_JSON = {}\n{PY_COMMON}\nworld = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_game_world()\n{code}", py_str("{}")), Duration::from_secs(60));
+                probes.push(match out {
+                    Ok(v) => json!({"at": at, "output": v["output"]}),
+                    Err(e) => json!({"at": at, "error": format!("{e:#}")}),
+                });
+            }
+        }
+        std::thread::sleep(Duration::from_secs_f64(seconds).saturating_sub(t0.elapsed()));
+        Ok(probes)
+    })();
+    let stopped = if args["stop"].as_bool().unwrap_or(true) {
+        play_step("stop", json!({})).and_then(|_| wait_for_play(false)).err().map(|e| format!("{e:#}"))
+    } else {
+        None
+    };
+    let probes = outcome?;
+    // High-resolution screenshots are written a frame or two after the request.
+    let mut shots = Vec::new();
+    for _ in 0..20 {
+        shots = pngs_under(&shots_dir).into_iter().filter(|p| !before.contains(p)).collect::<Vec<_>>();
+        if !screenshots || shots.len() >= checkpoints.len() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    shots.sort();
+    let filter = args["log_filter"].as_str().unwrap_or(DEFAULT_PLAY_LOG);
+    let log = log_since(project, log_start, Some(filter));
+    let errors = log.iter().filter(|l| l.contains("Error") || l.contains("Accessed None") || l.to_lowercase().contains("ensure")).count();
+    Ok(json!({
+        "mode": started["requested"],
+        "played_s": t0.elapsed().as_secs_f64().min(seconds + 5.0),
+        "checkpoints": checkpoints,
+        "probes": probes,
+        "log": log,
+        "error_lines": errors,
+        "stop_error": stopped,
+        "files": shots.iter().enumerate().map(|(i, p)| json!({"view": format!("checkpoint {}", checkpoints.get(i).map(|t| format!("{t}s")).unwrap_or_default()), "file": p})).collect::<Vec<_>>(),
+        "_keep_files": true,
+    }))
+    .map(|mut v| {
+        // Screenshots live in the project's own folder; show them but leave them in place.
+        let files = v["files"].clone();
+        v["_images"] = json!(files.as_array().unwrap().iter().map(|f| json!({"label": f["view"], "path": f["file"]})).collect::<Vec<_>>());
+        v.as_object_mut().unwrap().remove("_keep_files");
+        v
+    })
+}
+
+fn data_table(project: &Project, args: &Value) -> Result<Value> {
+    let format = args["format"].as_str().unwrap_or("csv");
+    let file = args["file"].as_str().map(|f| {
+        anyhow::ensure!(!f.contains("..") && !Path::new(f).is_absolute(), "file must be relative to the project root");
+        Ok(project.root.join(f))
+    }).transpose()?;
+    match args["action"].as_str() {
+        Some("export") => {
+            let mut value = python_json(&script(PY_DATA_TABLE, &json!({"action":"export","path":args["path"],"format":format})), Duration::from_secs(120))?;
+            if let Some(file) = &file {
+                if let Some(parent) = file.parent() { std::fs::create_dir_all(parent)?; }
+                std::fs::write(file, value["text"].as_str().unwrap_or(""))?;
+                value["written"] = json!(file);
+            }
+            Ok(value)
+        }
+        Some("import") => {
+            let file = file.ok_or_else(|| anyhow!("import needs file"))?;
+            let text = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
+            let start = log_len(project);
+            let result = python_json(&script(PY_DATA_TABLE, &json!({"action":"import","path":args["path"],"format":format,"text":text})), Duration::from_secs(120));
+            match result {
+                Ok(v) => Ok(v),
+                Err(e) => bail!("{e:#}\n{}", log_since(project, start, Some("LogDataTable|Error|Warning")).join("\n")),
+            }
+        }
+        _ => bail!("action must be export or import"),
+    }
+}
+
+/// Averages, 95th percentiles and maxima of the timing columns of an Unreal CSV profile.
+fn summarize_csv(text: &str) -> Value {
+    let mut lines = text.lines();
+    let Some(header) = lines.next() else { return json!({"error":"empty profile"}) };
+    let columns: Vec<&str> = header.split(',').map(str::trim).collect();
+    let wanted: Vec<usize> = columns.iter().enumerate()
+        .filter(|(_, c)| ["FrameTime", "GameThreadTime", "RenderThreadTime", "GPUTime", "RHIThreadTime"].contains(c) || c.starts_with("GPU/") && c.len() < 40)
+        .map(|(i, _)| i).collect();
+    let mut rows: Vec<Vec<f64>> = Vec::new();
+    for line in lines {
+        let cells: Vec<&str> = line.split(',').collect();
+        if cells.len() != columns.len() {
+            continue;
+        }
+        let values: Option<Vec<f64>> = wanted.iter().map(|i| cells[*i].trim().parse().ok()).collect();
+        if let Some(values) = values { rows.push(values); }
+    }
+    let mut stats = Map::new();
+    for (k, i) in wanted.iter().enumerate() {
+        let mut v: Vec<f64> = rows.iter().map(|r| r[k]).collect();
+        if v.is_empty() { continue; }
+        let avg = v.iter().sum::<f64>() / v.len() as f64;
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p95 = v[((v.len() as f64 * 0.95) as usize).min(v.len() - 1)];
+        stats.insert(columns[*i].to_string(), json!({"avg_ms": (avg * 100.0).round() / 100.0, "p95_ms": (p95 * 100.0).round() / 100.0, "max_ms": (v[v.len()-1] * 100.0).round() / 100.0}));
+    }
+    let frame = columns.iter().position(|c| *c == "FrameTime").and_then(|i| wanted.iter().position(|w| *w == i));
+    let mut worst: Vec<(usize, f64)> = frame.map(|k| rows.iter().enumerate().map(|(n, r)| (n, r[k])).collect()).unwrap_or_default();
+    worst.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    let fps = stats.get("FrameTime").and_then(|f| f["avg_ms"].as_f64()).filter(|ms| *ms > 0.0).map(|ms| (1000.0 / ms * 10.0).round() / 10.0);
+    json!({"frames": rows.len(), "avg_fps": fps, "stats": stats,
+        "worst_frames": worst.iter().take(5).map(|(n, ms)| json!({"frame": n, "ms": ms})).collect::<Vec<_>>()})
+}
+
+fn profile(project: &Project, args: &Value) -> Result<Value> {
+    let seconds = args["seconds"].as_f64().unwrap_or(10.0).clamp(2.0, 120.0);
+    let warmup = args["warmup"].as_f64().unwrap_or(3.0).clamp(0.0, 60.0);
+    let play = args["play"].as_bool().unwrap_or(true);
+    let dir = project.root.join("Saved/Profiling/CSV");
+    let before: std::collections::HashSet<PathBuf> = std::fs::read_dir(&dir).map(|e| e.flatten().map(|e| e.path()).collect()).unwrap_or_default();
+    if play {
+        play_step("start", json!({"mode":"pie"}))?;
+        wait_for_play(true)?;
+    }
+    let run = (|| -> Result<()> {
+        if let Some(commands) = args["console"].as_array() {
+            play_step("console", json!({"commands": commands}))?;
+        }
+        std::thread::sleep(Duration::from_secs_f64(warmup));
+        play_step("console", json!({"commands": ["csvprofile start"]}))?;
+        std::thread::sleep(Duration::from_secs_f64(seconds));
+        play_step("console", json!({"commands": ["csvprofile stop"]}))?;
+        Ok(())
+    })();
+    if play {
+        let _ = play_step("stop", json!({})).and_then(|_| wait_for_play(false));
+    }
+    run?;
+    let mut file = None;
+    for _ in 0..40 {
+        file = std::fs::read_dir(&dir).ok().and_then(|e| e.flatten().map(|e| e.path())
+            .filter(|p| !before.contains(p) && p.extension().is_some_and(|x| x == "csv")).max());
+        if file.is_some() { break; }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let file = file.ok_or_else(|| anyhow!("no CSV profile appeared in {} (csvprofile needs a Development or Test build of the editor)", dir.display()))?;
+    // The profiler finishes writing on a worker thread.
+    std::thread::sleep(Duration::from_millis(750));
+    let text = std::fs::read_to_string(&file)?;
+    let mut summary = summarize_csv(&text);
+    summary["file"] = json!(file);
+    summary["recorded_s"] = json!(seconds);
+    summary["budget_hint"] = json!("60 fps is 16.7 ms per frame, 30 fps is 33.3 ms. The largest of game thread, render thread and GPU is what limits the frame.");
+    Ok(summary)
+}
+
+fn editor_cmd(engine: &Path) -> PathBuf {
+    let bin = engine.join("Engine/Binaries");
+    if cfg!(target_os = "windows") {
+        bin.join("Win64/UnrealEditor-Cmd.exe")
+    } else if cfg!(target_os = "macos") {
+        bin.join("Mac/UnrealEditor-Cmd")
+    } else {
+        bin.join("Linux/UnrealEditor-Cmd")
+    }
+}
+
+fn run_tests(project: &Project, args: &Value) -> Result<Value> {
+    let filter = required(args, "filter")?;
+    anyhow::ensure!(!filter.contains(';') && !filter.contains('"'), "filter must be a test path prefix");
+    if args["in_editor"] == true {
+        guard_project(project)?;
+        acquire_lock(project, &holder_id())?;
+        let start = log_len(project);
+        play_step("console", json!({"commands": [format!("Automation RunTests {filter}")]}))?;
+        let deadline = std::time::Instant::now() + secs(args, "timeout_s", 1800);
+        loop {
+            let lines = log_since(project, start, Some("LogAutomation"));
+            if lines.iter().any(|l| l.contains("Automation Test Queue Empty") || l.contains("No automation tests matched")) {
+                return Ok(test_lines(&lines));
+            }
+            if std::time::Instant::now() > deadline {
+                bail!("tests did not finish before the timeout; partial results:\n{}", lines.join("\n"));
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+    let engine = engine_root(project)?;
+    let cmd = editor_cmd(&engine);
+    anyhow::ensure!(cmd.is_file(), "{} does not exist (build the editor, or use in_editor=true)", cmd.display());
+    let report = project.root.join("Saved/Relay/TestReport").join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&report)?;
+    let mut command = Command::new(&cmd);
+    command
+        .arg(&project.uproject)
+        .arg(format!("-ExecCmds=Automation RunTests {filter};Quit"))
+        .arg(format!("-ReportExportPath={}", report.display()))
+        .args(["-unattended", "-nopause", "-nosplash", "-nullrhi", "-NoSound", "-stdout", "-FullStdOutLogOutput"]);
+    let started = std::time::Instant::now();
+    let output = relay_core::proc::output_with_timeout(&mut command, secs(args, "timeout_s", 1800))?
+        .ok_or_else(|| anyhow!("the test run did not finish within its timeout and was stopped"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let index = std::fs::read_to_string(report.join("index.json")).ok()
+        .and_then(|raw| serde_json::from_str::<Value>(raw.trim_start_matches('\u{feff}')).ok());
+    let mut value = match index {
+        Some(index) => {
+            let tests: Vec<Value> = index["tests"].as_array().cloned().unwrap_or_default().iter().map(|t| {
+                let errors: Vec<Value> = t["entries"].as_array().cloned().unwrap_or_default().iter()
+                    .filter(|e| e["event"]["type"] == "Error" || e["event"]["type"] == "Warning")
+                    .map(|e| json!(format!("{}: {}", e["event"]["type"].as_str().unwrap_or(""), e["event"]["message"].as_str().unwrap_or(""))))
+                    .take(20).collect();
+                json!({"test": t["fullTestPath"], "state": t["state"], "messages": errors})
+            }).collect();
+            json!({"succeeded": index["succeeded"], "failed": index["failed"], "tests": tests})
+        }
+        None => test_lines(&stdout.lines().filter(|l| l.contains("LogAutomation")).map(str::to_string).collect::<Vec<_>>()),
+    };
+    value["exit_code"] = json!(output.status.code());
+    value["seconds"] = json!(started.elapsed().as_secs());
+    let _ = std::fs::remove_dir_all(&report);
+    Ok(value)
+}
+
+/// Results from `LogAutomationController` lines: `Test Completed. Result={Success} Name={..} Path={..}`.
+fn test_lines(lines: &[String]) -> Value {
+    let re = regex::Regex::new(r"Result=\{(\w+)\}\s+Name=\{([^}]*)\}\s+Path=\{([^}]*)\}").unwrap();
+    let tests: Vec<Value> = lines.iter().filter_map(|l| re.captures(l)).map(|c| json!({"test": &c[3], "name": &c[2], "state": &c[1]})).collect();
+    let failed = tests.iter().filter(|t| t["state"] != "Success").count();
+    json!({"succeeded": tests.len() - failed, "failed": failed, "tests": tests,
+        "errors": lines.iter().filter(|l| l.contains("Error")).take(50).collect::<Vec<_>>()})
+}
+
+fn crash(project: &Project, index: usize) -> Result<Value> {
+    let dir = project.root.join("Saved/Crashes");
+    let mut crashes: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(&dir)
+        .with_context(|| format!("no crash reports in {}", dir.display()))?
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+        .collect();
+    crashes.sort_by(|a, b| b.0.cmp(&a.0));
+    let (_, folder) = crashes.get(index).cloned().ok_or_else(|| anyhow!("there are {} crash reports", crashes.len()))?;
+    let context = std::fs::read_to_string(folder.join("CrashContext.runtime-xml")).unwrap_or_default();
+    let field = |name: &str| -> Option<String> {
+        let re = regex::Regex::new(&format!(r"(?s)<{name}>(.*?)</{name}>")).ok()?;
+        re.captures(&context).map(|c| c[1].trim().replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&").replace("&quot;", "\"").replace("&apos;", "'"))
+    };
+    let log = std::fs::read_dir(&folder).ok().and_then(|e| e.flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|x| x == "log")));
+    let log_tail = log.and_then(|p| std::fs::read_to_string(p).ok()).map(|t| tail(&t, 80));
+    Ok(json!({
+        "folder": folder,
+        "of": crashes.len(),
+        "error": field("ErrorMessage"),
+        "crash_type": field("CrashType"),
+        "callstack": field("CallStack").map(|c| tail(&c, 60)),
+        "engine_version": field("EngineVersion"),
+        "build_configuration": field("BuildConfiguration"),
+        "log_tail": log_tail,
+        "hint": "Read the first frames of the call stack that are in your project's modules; engine frames below them are usually the consequence.",
+    }))
 }
 
 // ---------------------------------------------------------------- seeing
@@ -1066,7 +1507,7 @@ fn dechunk(mut raw: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
-fn tool_result(mut value: Value, is_error: bool) -> Value {
+pub(crate) fn tool_result(mut value: Value, is_error: bool) -> Value {
     let images = value.as_object_mut().and_then(|o| o.remove("_images")).and_then(|v| v.as_array().cloned()).unwrap_or_default();
     let cleanup = value.as_object_mut().and_then(|o| o.remove("_cleanup"));
     let mut content = Vec::new();
@@ -1095,7 +1536,7 @@ fn tool_result(mut value: Value, is_error: bool) -> Value {
     result
 }
 
-fn rpc_error(id: Value, code: i64, message: &str, data: Option<Value>) -> Value {
+pub(crate) fn rpc_error(id: Value, code: i64, message: &str, data: Option<Value>) -> Value {
     let mut error = json!({"code":code,"message":message});
     if let Some(data) = data {
         error["data"] = data;
@@ -1126,7 +1567,7 @@ mod tests {
         let init = handle(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}})).unwrap();
         assert_eq!(init["result"]["serverInfo"]["name"], "unreal");
         let listed = handle(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list"})).unwrap();
-        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 15);
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 23);
         assert!(handle(&json!({"jsonrpc":"2.0","method":"notifications/initialized"})).is_none());
         let unknown = handle(&json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"nope"}})).unwrap();
         assert_eq!(unknown["error"]["code"], -32602);
@@ -1274,6 +1715,53 @@ mod tests {
             return;
         };
         assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[test]
+    fn profiles_summarize_timing_columns_and_skip_metadata_rows() {
+        let csv = "FrameTime,GameThreadTime,RenderThreadTime,GPUTime,Other\n\
+                   16.0,10.0,8.0,15.0,1\n\
+                   18.0,12.0,8.0,17.0,1\n\
+                   40.0,30.0,9.0,20.0,1\n\
+                   [HasHeaderRowAtEnd],1\n\
+                   FrameTime,GameThreadTime,RenderThreadTime,GPUTime,Other\n";
+        let s = summarize_csv(csv);
+        assert_eq!(s["frames"], 3);
+        assert_eq!(s["stats"]["FrameTime"]["max_ms"], 40.0);
+        assert_eq!(s["stats"]["GameThreadTime"]["avg_ms"], 17.33);
+        assert!(s["stats"].get("Other").is_none());
+        assert_eq!(s["worst_frames"][0]["ms"], 40.0);
+    }
+
+    #[test]
+    fn in_editor_test_results_are_read_from_the_log() {
+        let lines = vec![
+            "LogAutomationController: Display: Test Completed. Result={Success} Name={Adds} Path={Project.Inventory.Adds}".to_string(),
+            "LogAutomationController: Error: Test Completed. Result={Fail} Name={Stacks} Path={Project.Inventory.Stacks}".to_string(),
+            "LogAutomationController: Display: ...Automation Test Queue Empty 2 tests performed.".to_string(),
+        ];
+        let v = test_lines(&lines);
+        assert_eq!(v["succeeded"], 1);
+        assert_eq!(v["failed"], 1);
+        assert_eq!(v["tests"][1]["test"], "Project.Inventory.Stacks");
+    }
+
+    #[test]
+    fn crashes_are_read_newest_first() {
+        let root = tempfile::tempdir().unwrap();
+        let project = bare_project(root.path());
+        let old = root.path().join("Saved/Crashes/UECC-old");
+        let new = root.path().join("Saved/Crashes/UECC-new");
+        std::fs::create_dir_all(&old).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::write(new.join("CrashContext.runtime-xml"), "<Root><ErrorMessage>Assertion failed: Health &gt; 0</ErrorMessage><CallStack>MyGame!AHero::Tick()\nUnrealEditor-Engine!AActor::Tick()</CallStack></Root>").unwrap();
+        std::fs::write(new.join("Game.log"), "line 1\nFatal error\n").unwrap();
+        let c = crash(&project, 0).unwrap();
+        assert_eq!(c["error"], "Assertion failed: Health > 0");
+        assert!(c["callstack"].as_str().unwrap().starts_with("MyGame!AHero::Tick()"));
+        assert!(c["log_tail"].as_str().unwrap().contains("Fatal error"));
+        assert_eq!(c["of"], 2);
     }
 
     #[test]

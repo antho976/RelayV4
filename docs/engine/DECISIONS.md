@@ -941,3 +941,16 @@ The *why* behind anything surprising. Append; never rewrite history. Reference a
   frame derived from the skeleton's own left/right bone pairs, so it holds for any skeleton,
   item or mesh orientation; `ue_anim_preview` adds images, confirming each pose was applied
   before capture because the editor applies poses on its tick.
+- **D161 The Blender plugin runs Blender headless, one process per call.** Game art tools usually
+  bridge to a running Blender through an add-on and a socket; that needs a window, an installed
+  add-on and one shared session. `relay blender-mcp` instead starts `blender -b <file>
+  --factory-startup` per call with a script from `relay-cli/src/blender_py/`, arguments in a JSON
+  file and one `RELAY_JSON:` result line, under `proc::output_with_timeout`. Calls are
+  independent, work with no Blender open, never load the user's add-ons (bundled ones can be
+  enabled per call), and cannot leave state behind. Files are resolved inside the agent's
+  checkout. Renders return as MCP image content, as `ue_screenshot` does, so the agent can see
+  its work; the rig check and `blender_anim_inspect` use the same character frame (from the rig's
+  own `.L`/`.R` pairs) as the Unreal checks, so a problem is caught before export and
+  measured again after import. `blender_to_unreal` calls the Unreal bridge in-process, sharing its
+  project guard and editor lock, and compares height, root bone scale and hand sides across the
+  handoff. The Blender tests run against real Blender when it is installed and skip otherwise.

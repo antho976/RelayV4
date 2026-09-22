@@ -50,7 +50,11 @@ on per project from the Plugins page or the plugin key on a project's sidebar ro
 [Unreal Engine](plugins/unreal-engine/README.md): 20 game-development skills (design, levels,
 narrative, UI, animation, AI, C++, Blueprints, GAS, networking and more) and `relay unreal-mcp`,
 which builds the project, reads its log and drives a running editor through Remote Control and
-Python. New plugins are folders under `plugins/`, compiled into the engine.
+Python: play sessions with screenshots, tests, profiling, Blueprint reading, asset audits, and
+animation checks. The second is [Blender](plugins/blender/README.md): 6 skills and
+`relay blender-mcp`, which runs Blender in background mode to inspect, render, rig-check,
+measure, export and hand art to a running Unreal editor. New plugins are folders under
+`plugins/`, compiled into the engine.
 
 ## Verify
 

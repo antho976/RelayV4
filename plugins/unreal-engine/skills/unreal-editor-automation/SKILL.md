@@ -250,6 +250,14 @@ some editor-mode tools). Then: prefer moving the logic to C++; otherwise give th
 precise steps ("Content Browser > right-click `/Game/Props` > Fix Up Redirectors").
 For HTTP details see `reference/remote-control-api.md`.
 
+## Relay tools for this work
+
+Beyond `ue_python`, prefer the purpose-built tools: `ue_play` (runtime checks), `ue_blueprint_info`
+(reading Blueprints), `ue_asset_audit` (texture/mesh/reference problems), `ue_asset_refs` (before a
+rename, move or delete), `ue_data_table` (tables as CSV/JSON files), `ue_profile` (performance
+numbers), `ue_run_tests` and `ue_crash`. They return structured results and handle timing (play
+sessions, screenshots written a frame late) that a one-off script gets wrong.
+
 ## Verify your work
 
 - [ ] `ue_editor_status` answered and scripts returned without Python tracebacks.
