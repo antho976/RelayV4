@@ -1,0 +1,32 @@
+{
+  "id": "unreal-engine",
+  "name": "Unreal Engine",
+  "version": "1.0.0",
+  "category": "Game engine",
+  "summary": "Makes every agent in the project an Unreal Engine 5 developer: 19 skills, standing rules, an editor bridge and a build/log toolchain.",
+  "description": "Turn it on for a project that holds a .uproject. Every agent launched there gets the Unreal skills as real skill folders (fundamentals, C++, Blueprints, gameplay framework, game design, level and environment art, narrative, UI, animation, AI, GAS, multiplayer, materials and VFX, audio, editor automation, performance, build and packaging, testing, source control), the plugin's working rules in its brief, and the `unreal` MCP server: project inspection, UnrealBuildTool builds and log reading offline, and Python, Remote Control calls, asset search, level queries and console commands against the running editor.",
+  "instructions": "instructions.md",
+  "docs": ["README.md", "docs/setup.md", "docs/mcp-tools.md", "docs/agent-workflow.md"],
+  "detect": [".uproject"],
+  "mcp_servers": [
+    {
+      "name": "unreal",
+      "description": "Unreal Engine bridge. Offline: project facts, builds, the editor log. Live (editor open with the Remote Control web server): Python editor scripting, UFUNCTION calls, properties, asset search, level actors, console commands.",
+      "command": "relay",
+      "args": ["unreal-mcp"],
+      "tools": [
+        "ue_project_info",
+        "ue_setup_check",
+        "ue_build",
+        "ue_log",
+        "ue_editor_status",
+        "ue_python",
+        "ue_call",
+        "ue_property",
+        "ue_search_assets",
+        "ue_level_actors",
+        "ue_console"
+      ]
+    }
+  ]
+}

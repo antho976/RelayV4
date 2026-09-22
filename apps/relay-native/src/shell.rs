@@ -193,6 +193,19 @@ impl Ui {
                         );
                     }
                 });
+                // Per-project plugin switches (D159), one click from the project itself.
+                let plugins = icon_button("plugins", "Plugins for this project");
+                plugins.set_child(Some(&crate::icons::image("plugins", 12)));
+                plugins.add_css_class("small-key");
+                plugins.add_css_class("manage");
+                plugins.set_widget_name(&format!("project-plugins-{id}"));
+                controls.append(&plugins);
+                let weak = Rc::downgrade(self);
+                plugins.connect_clicked(move |_| {
+                    if let Some(ui) = weak.upgrade() {
+                        ui.project_plugins(id);
+                    }
+                });
                 let menu = self.registry_menu(project, false);
                 menu.add_css_class("small-key");
                 menu.add_css_class("manage");
@@ -1305,6 +1318,103 @@ impl Ui {
                             }
                             glib::Propagation::Proceed
                         });
+                    }
+                }
+                Err(error) => {
+                    clear(&list);
+                    feedback.set_text(&error.to_string());
+                    feedback.set_visible(true);
+                }
+            }
+        });
+    }
+    /// The plugin switches of one project, opened from its row in the sidebar.
+    pub(super) fn project_plugins(self: &Rc<Self>, project: i64) {
+        let Some((panel, body)) = self.sheet("Plugins", 420, 560) else {
+            return;
+        };
+        panel.top(560);
+        panel.add_css_class("agent-skills-popover");
+        let name = self
+            .projects
+            .borrow()
+            .iter()
+            .find(|p| p["id"].as_i64() == Some(project))
+            .map(|p| text(p, "name").to_owned())
+            .unwrap_or_else(|| "No project".into());
+        body.set_spacing(0);
+        body.append(&label(&name.to_uppercase(), "section-label"));
+        let intro = label(
+            "A plugin that is on gives every agent here its skills, standing rules and MCP tools. Skills reach running agents now; rules and tools apply when an agent starts or resumes.",
+            "agent-skills-intro",
+        );
+        intro.set_wrap(true);
+        body.append(&intro);
+        let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        list.append(&label("Loading plugins…", "dim"));
+        body.append(&list);
+        let feedback = label("", "dim");
+        feedback.set_wrap(true);
+        feedback.set_visible(false);
+        body.append(&feedback);
+        let footer = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        footer.add_css_class("agent-skills-footer");
+        let scope = label("THIS PROJECT", "section-label");
+        scope.set_hexpand(true);
+        footer.append(&scope);
+        let manage = button("All plugins", "quiet");
+        footer.append(&manage);
+        body.append(&footer);
+        let weak = Rc::downgrade(self);
+        let panel_weak = Rc::downgrade(&panel);
+        manage.connect_clicked(move |_| {
+            if let Some(panel) = panel_weak.upgrade() {
+                panel.close();
+            }
+            if let Some(ui) = weak.upgrade() {
+                ui.navigate("plugins");
+            }
+        });
+        panel.present();
+        let ui = self.clone();
+        glib::spawn_future_local(async move {
+            match ui.call("plugin.list", json!({"project_id":project})).await {
+                Ok(result) => {
+                    clear(&list);
+                    let plugins = rows(&result, "plugins");
+                    if plugins.is_empty() {
+                        list.append(&label("This build bundles no plugins.", "dim"));
+                    }
+                    for plugin in plugins {
+                        let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+                        row.add_css_class("agent-skill-row");
+                        let words = gtk::Box::new(gtk::Orientation::Vertical, 2);
+                        words.set_hexpand(true);
+                        let title = label(text(&plugin, "name"), "skill-title");
+                        title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                        words.append(&title);
+                        let suggested = plugin["suggested_for"]
+                            .as_array()
+                            .is_some_and(|ids| ids.iter().any(|id| id.as_i64() == Some(project)));
+                        let detail = if suggested {
+                            format!("Suggested for this project · {}", text(&plugin, "summary"))
+                        } else {
+                            text(&plugin, "summary").to_string()
+                        };
+                        let detail = label(&detail, "skill-source");
+                        detail.set_wrap(true);
+                        detail.set_xalign(0.);
+                        words.append(&detail);
+                        row.append(&words);
+                        let toggle = crate::tools::plugins::switch(
+                            &ui,
+                            &plugin,
+                            project,
+                            Some(feedback.clone()),
+                        );
+                        toggle.set_sensitive(project > 0);
+                        row.append(&toggle);
+                        list.append(&row);
                     }
                 }
                 Err(error) => {

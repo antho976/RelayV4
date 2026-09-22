@@ -1,6 +1,6 @@
 //! `provider.*` / `usage.*` / `skill.*` / `plugin.*` — BUS.md §10.15.
 use crate::registry::{Actors, Audit, OpMeta, Scope, Undo};
-use crate::types::{GitHubRepo, GitHubStatus, Id, Provider, ProviderInfo, Skill, Usage};
+use crate::types::{GitHubRepo, GitHubStatus, Id, Plugin, PluginDoc, Provider, ProviderInfo, Skill, Usage};
 use crate::{op, Empty};
 use serde_json::Value;
 
@@ -53,7 +53,26 @@ op!(GitHubConnect, "github.connect", Empty => GitHubConnectOut,
 result!(#[schemars(rename = "GitHubRepoListOut")] GitHubRepoListOut { pub repositories: Vec<GitHubRepo> });
 op!(GitHubRepoList, "github.repo.list", Empty => GitHubRepoListOut,
     OpMeta::query(Scope::Global, 12, "All GitHub repositories available to the connected account"));
-result!(#[schemars(rename = "PluginListOut")] PluginListOut { pub plugins: Vec<Value> });
-op!(PluginList, "plugin.list", Empty => PluginListOut, OpMeta::query(Scope::Global, 11, "Stub in 4.0: always empty"));
+payload!(#[schemars(rename = "PluginListIn")] PluginListIn { pub project_id: Option<Id> });
+result!(#[schemars(rename = "PluginListOut")] PluginListOut { pub plugins: Vec<Plugin> });
+op!(PluginList, "plugin.list", PluginListIn => PluginListOut,
+    OpMeta::query(Scope::Global, 12, "Bundled plugins (skills, agent instructions, docs, MCP servers) and the projects they are on for"));
+payload!(#[schemars(rename = "PluginGetIn")] PluginGetIn {
+    pub plugin_id: String,
+    /// Also return this skill's SKILL.md.
+    pub skill: Option<String>
+});
+result!(#[schemars(rename = "PluginGetOut")] PluginGetOut {
+    pub plugin: Plugin,
+    /// The instructions every agent of an enabled project receives in its brief.
+    pub instructions: String,
+    pub docs: Vec<PluginDoc>,
+    pub skill: Option<PluginDoc>
+});
+op!(PluginGet, "plugin.get", PluginGetIn => PluginGetOut,
+    OpMeta::query(Scope::Global, 12, "One plugin with its agent instructions, documentation and optionally one skill body"));
+payload!(#[schemars(rename = "PluginEnableIn")] PluginEnableIn { pub plugin_id: String, pub project_id: Id, pub enabled: bool });
+op!(PluginEnable, "plugin.enable", PluginEnableIn => Plugin,
+    OpMeta::mutation(Scope::Project, 12, "Switch a plugin on or off for a project").actors(Actors::UserOnly).undo(Undo::Inverse).emits(&["plugin.changed"]));
 
-entries!(List, Refresh, Update, UsageGet, UsageReport, SkillList, SkillCreate, SkillUpdate, SkillDelete, SkillEnable, SkillInstall, GitHubStatusOp, GitHubConnect, GitHubRepoList, PluginList);
+entries!(List, Refresh, Update, UsageGet, UsageReport, SkillList, SkillCreate, SkillUpdate, SkillDelete, SkillEnable, SkillInstall, GitHubStatusOp, GitHubConnect, GitHubRepoList, PluginList, PluginGet, PluginEnable);

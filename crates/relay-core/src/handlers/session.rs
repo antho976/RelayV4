@@ -359,8 +359,11 @@ fn launch(ctx: &mut Ctx, row: &Row_, kind: LaunchKind) -> Result<Session, BusErr
         &relay_bin,
     )
     .bus()?;
+    // A plugin that is on brings its MCP servers to every agent of the project (D159).
+    let plugin_servers = crate::plugins::mcp_servers(ctx.tx(), row.session.project_id, &relay_bin).bus()?;
     if row.session.provider == Provider::Claude {
         crate::hooks::install_claude(&cwd, ctx.instance(), &relay_bin).bus()?;
+        crate::hooks::add_claude_mcp_servers(&cwd, &plugin_servers).bus()?;
     } else if row.session.provider == Provider::Codex {
         crate::hooks::install_codex(&cwd, ctx.instance(), &relay_bin).bus()?;
     }
@@ -433,6 +436,9 @@ fn launch(ctx: &mut Ctx, row: &Row_, kind: LaunchKind) -> Result<Session, BusErr
             "--config".into(),
             crate::providers::codex_notify_config(&relay_bin),
         ]);
+        for (name, command, server_args, env) in &plugin_servers {
+            args.extend(crate::providers::codex_mcp_config(name, command, server_args, env));
+        }
     }
     let cfg = crate::guardrail::config(ctx.tx(), Some(row.session.project_id))?;
     for root in crate::guardrail::write_roots(&cfg, &cwd).into_iter().filter(|root| root != &cwd) {

@@ -841,7 +841,9 @@ All paths are relative to the worktree root; `..` and absolute paths are `invali
 | `github.status` | query | `{}` → `{ installed, connected, login? }` |
 | `github.connect` | mutation · never | `{}` → `{ started }`; launches GitHub CLI browser auth and emits `github.changed` when it finishes; Relay stores no token |
 | `github.repo.list` | query | `{}` → `{ repositories: GitHubRepo[] }`; all repositories the connected account can access |
-| `plugin.list` | query | `{}` → `{ plugins: [] }` — stub in 4.0 |
+| `plugin.list` | query | `{ project_id? }` → `{ plugins: Plugin[] }` — the plugins this build bundles (D159) with their skills, MCP servers and docs, `enabled_in` project ids, and `suggested_for` (projects whose root matches the manifest's `detect` suffixes, e.g. a `.uproject`; limited to `project_id` when given). Runs with the store lock released |
+| `plugin.get` | query | `{ plugin_id, skill? }` → `{ plugin, instructions, docs: PluginDoc[], skill?: PluginDoc }` — the always-on agent rules, every documentation file, and optionally one skill's `SKILL.md`; `plugin.not_found`, `plugin.skill_not_found` |
+| `plugin.enable` | mutation · always · inverse · user | `{ plugin_id, project_id, enabled: bool }` → `Plugin`; emits `plugin.changed`. Off by default. When on, every agent of the project gets the plugin's skills as folders (materialized at once into the root and live worktrees, like installed skills; an installed skill with the same folder name wins), its instructions and skill list under "Enabled plugins" in the injected brief, and its MCP servers in `.relay/relay.mcp.json` (Claude) or as `--config mcp_servers.<name>.*` (Codex) on each start and resume |
 
 ### 10.16 notify / settings
 

@@ -599,6 +599,49 @@ pub struct Skill {
     pub updated_at: Ts,
 }
 
+/// A plugin bundled with Relay: skills, always-on agent instructions, documentation and MCP
+/// servers that reach every agent of a project the plugin is switched on for (D159).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Plugin {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub category: String,
+    pub summary: String,
+    pub description: String,
+    pub skills: Vec<PluginSkill>,
+    pub mcp_servers: Vec<PluginMcpServer>,
+    /// Documentation files, relative to the plugin root; `plugin.get` returns their text.
+    pub docs: Vec<String>,
+    /// Projects the plugin is switched on for.
+    pub enabled_in: Vec<Id>,
+    /// Projects whose checkout looks like this plugin's kind of project (for Unreal Engine, a
+    /// `.uproject` at the root) and that do not have it on yet.
+    pub suggested_for: Vec<Id>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct PluginSkill {
+    /// The skill's folder name, which is also its provider-visible name.
+    pub name: String,
+    pub description: String,
+    /// Files in the skill folder, `SKILL.md` included.
+    pub files: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct PluginMcpServer {
+    pub name: String,
+    pub description: String,
+    pub tools: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct PluginDoc {
+    pub path: String,
+    pub body: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct GitHubStatus {
     pub installed: bool,

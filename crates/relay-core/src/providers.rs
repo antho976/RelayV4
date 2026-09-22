@@ -91,6 +91,33 @@ pub fn codex_notify_config(relay: &Path) -> String {
     format!("notify={}", serde_json::to_string(&command).expect("Codex notify command serializes"))
 }
 
+/// `--config` overrides that register one plugin MCP server with Codex, which takes no MCP
+/// config file (D159). Values are JSON strings and arrays, which TOML reads identically; a
+/// name that is not a bare TOML key is refused rather than quoted into a different key.
+pub fn codex_mcp_config(
+    name: &str,
+    command: &str,
+    args: &[String],
+    env: &std::collections::BTreeMap<String, String>,
+) -> Vec<String> {
+    let bare = |key: &str| !key.is_empty() && key.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-');
+    if !bare(name) || !env.keys().all(|key| bare(key)) {
+        return Vec::new();
+    }
+    let quote = |text: &str| serde_json::to_string(text).expect("a string serializes");
+    let mut out = vec![
+        "--config".into(),
+        format!("mcp_servers.{name}.command={}", quote(command)),
+        "--config".into(),
+        format!("mcp_servers.{name}.args={}", serde_json::to_string(args).expect("strings serialize")),
+    ];
+    if !env.is_empty() {
+        let pairs = env.iter().map(|(key, value)| format!("{key}={}", quote(value))).collect::<Vec<_>>().join(",");
+        out.extend(["--config".into(), format!("mcp_servers.{name}.env={{{pairs}}}")]);
+    }
+    out
+}
+
 pub trait Driver: Sync {
     fn provider(&self) -> Provider;
     fn binary(&self) -> &'static str;

@@ -1,4 +1,4 @@
-//! Phase 11: durable project skills, plugin stub, and first-run workspace creation.
+//! Phase 11: durable project skills, bundled plugins, and first-run workspace creation.
 
 use relay_bus::{Actor, Request, Response};
 use relay_core::engine::{Door, Engine};
@@ -65,7 +65,10 @@ fn skills_crud_filter_enable_delete_and_undo() {
     assert_eq!(restored["id"], id);
     assert_eq!(restored["enabled_in"], json!([1]), "delete undo preserves project enables");
 
-    assert!(ok(&engine, "plugin.list", json!({}))["plugins"].as_array().unwrap().is_empty());
+    // Bundled plugins are listed but off until a project switches them on (D159).
+    let plugins = ok(&engine, "plugin.list", json!({}));
+    let unreal = plugins["plugins"].as_array().unwrap().iter().find(|p| p["id"] == "unreal-engine").cloned().unwrap();
+    assert_eq!(unreal["enabled_in"], json!([]));
 }
 
 #[test]

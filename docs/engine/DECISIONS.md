@@ -907,3 +907,23 @@ The *why* behind anything surprising. Append; never rewrite history. Reference a
   disabled profile falls back to the project's normal Gradle release signing. The temporary init
   script registers through Gradle's `beforeProject` lifecycle so AGP's `finalizeDsl` callback is in
   place before Android finalizes signing configs, including on AGP 9.
+- **D159 Plugins are bundled bundles, switched on per project.** D48 kept `plugin.list` as a real,
+  empty query. A plugin is now a folder under `plugins/<id>/` — a `plugin.json` manifest, always-on
+  agent instructions, skill folders, documentation and MCP server declarations — compiled into the
+  engine by `relay-core/build.rs`, so the content and the code that delivers it ship at one
+  revision with nothing to install. Schema v20 stores only the `plugin_projects` edge; an id a
+  later build stops bundling is ignored rather than failing a launch. Plugins are off by default
+  (unlike installed skills, D147), because they change how every agent in a project works;
+  `plugin.list` reports `suggested_for` from one directory listing per project root, read with
+  the store lock released. Switching a plugin on reaches agents through the existing channels
+  only: its skills join the D147 materializer (an installed skill with the same folder name wins,
+  and the stamp carries the bundle digest so a rebuilt engine rewrites stale folders), its
+  instructions and skill descriptions join the injected half of the D101 brief under "Enabled
+  plugins", and its MCP servers are merged into `.relay/relay.mcp.json` for Claude and passed as
+  `--config mcp_servers.<name>.*` overrides to Codex on every start and resume. A manifest command
+  of `relay` means this Relay binary; a plugin can never replace the `relay` server. Skill folders
+  update in running checkouts at once; the brief and MCP servers apply on the next start or
+  resume, which is when a provider reads them. The first plugin, Unreal Engine, serves its tools
+  from `relay unreal-mcp`: a stdio MCP server independent of the bus that reads the project on
+  disk, runs UnrealBuildTool through `proc::output_with_timeout`, and reaches a running editor
+  through the Remote Control HTTP API and `PythonScriptLibrary.ExecutePythonCommandEx`.

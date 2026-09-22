@@ -775,6 +775,88 @@ fn skills_are_app_wide_folders_in_every_checkout() {
 }
 
 #[test]
+fn a_plugin_that_is_on_reaches_every_agent_of_its_project() {
+    let f = fixture();
+    let claude = fake_discovery_provider(&f.root, "claude", "claude 1.0.0");
+    let codex = fake_discovery_provider(&f.root, "codex", "codex-cli 1.0.0");
+    ok(&f.engine, "settings.set", json!({"path": "providers.claude.path", "value": claude}));
+    ok(&f.engine, "settings.set", json!({"path": "providers.codex.path", "value": codex}));
+    std::fs::write(f.repo.join("Arena.uproject"), "{\"FileVersion\":3}").unwrap();
+    git(&f.repo, &["add", "."]);
+    git(&f.repo, &["commit", "-q", "-m", "an unreal project"]);
+
+    // Off by default, and suggested because the root holds a .uproject.
+    let listed = ok(&f.engine, "plugin.list", json!({}));
+    let unreal = listed["plugins"].as_array().unwrap().iter().find(|p| p["id"] == "unreal-engine").unwrap();
+    assert_eq!(unreal["enabled_in"], json!([]));
+    assert_eq!(unreal["suggested_for"], json!([1]));
+    assert!(unreal["skills"].as_array().unwrap().iter().any(|s| s["name"] == "unreal-fundamentals"));
+    assert_eq!(unreal["mcp_servers"][0]["name"], "unreal");
+
+    let off = ok(&f.engine, "session.create", json!({"project_id": 1, "provider": "claude"}));
+    let off_name = off["name"].as_str().unwrap().to_string();
+    let running = ok(&f.engine, "session.spawn", json!({"session": off_name}));
+    let off_tree = PathBuf::from(running["worktree"].as_str().unwrap());
+    assert!(!off_tree.join(".claude/skills/unreal-fundamentals").exists(), "a plugin that is off wrote skills");
+    let mcp = std::fs::read_to_string(off_tree.join(".relay/relay.mcp.json")).unwrap();
+    assert!(!mcp.contains("unreal-mcp"), "a plugin that is off registered its MCP server");
+
+    let on = ok(&f.engine, "plugin.enable", json!({"plugin_id": "unreal-engine", "project_id": 1, "enabled": true}));
+    assert_eq!(on["enabled_in"], json!([1]));
+    assert_eq!(ok(&f.engine, "plugin.list", json!({}))["plugins"][0]["suggested_for"], json!([]));
+    // The refresh runs after commit on its own thread; the running agent's checkout gets the
+    // skill folders without a relaunch.
+    let skill = off_tree.join(".claude/skills/unreal-fundamentals/SKILL.md");
+    wait_until("plugin skills in a running worktree", || skill.is_file());
+    assert!(std::fs::read_to_string(&skill).unwrap().starts_with("---\nname: unreal-fundamentals"));
+    assert!(off_tree.join(".agents/skills/unreal-editor-automation/SKILL.md").is_file());
+    wait_until("plugin skills in the project root", || f.repo.join(".claude/skills/unreal-cpp/SKILL.md").is_file());
+    ok(&f.engine, "session.close", json!({"session": off_name}));
+
+    let created = ok(&f.engine, "session.create", json!({"project_id": 1, "provider": "claude"}));
+    let name = created["name"].as_str().unwrap().to_string();
+    let running = ok(&f.engine, "session.spawn", json!({"session": name}));
+    let worktree = PathBuf::from(running["worktree"].as_str().unwrap());
+    let mcp: Value = serde_json::from_str(&std::fs::read_to_string(worktree.join(".relay/relay.mcp.json")).unwrap()).unwrap();
+    assert_eq!(mcp["mcpServers"]["unreal"]["args"], json!(["unreal-mcp"]));
+    assert_eq!(mcp["mcpServers"]["unreal"]["command"], mcp["mcpServers"]["relay"]["command"], "`relay` is this binary");
+    assert!(mcp["mcpServers"]["relay"]["args"].as_array().unwrap().iter().any(|a| a == "mcp"), "the bus server was replaced");
+    let role = std::fs::read_to_string(worktree.join(format!(".relay/sessions/{name}/role-instructions.md"))).unwrap();
+    assert!(role.contains("## Enabled plugins"), "the brief never names the plugin");
+    assert!(role.contains("Start every task with `ue_project_info`"), "the plugin's rules are not in the injected brief");
+    assert!(role.contains("- unreal-animation — "), "plugin skills are not listed with their descriptions");
+    let status = Command::new("git").arg("-C").arg(&worktree).args(["status", "--porcelain"]).output().unwrap();
+    let status = String::from_utf8_lossy(&status.stdout);
+    assert!(status.trim().is_empty(), "plugin skills dirty the worktree: {status}");
+    ok(&f.engine, "session.close", json!({"session": name}));
+
+    // Codex has no MCP config file; the server travels as --config overrides.
+    let created = ok(&f.engine, "session.create", json!({"project_id": 1, "provider": "codex"}));
+    let codex_name = created["name"].as_str().unwrap().to_string();
+    let running = ok(&f.engine, "session.spawn", json!({"session": codex_name}));
+    let codex_tree = PathBuf::from(running["worktree"].as_str().unwrap());
+    wait_until("codex args", || codex_tree.join(".relay/provider-args.txt").is_file());
+    let args = std::fs::read_to_string(codex_tree.join(".relay/provider-args.txt")).unwrap();
+    assert!(args.contains("mcp_servers.unreal.args=[\"unreal-mcp\"]"), "{args}");
+    assert!(args.contains("mcp_servers.unreal.command=\""));
+    ok(&f.engine, "session.close", json!({"session": codex_name}));
+
+    // Switching it off takes the folders out of the project root again; undo brings it back.
+    ok(&f.engine, "plugin.enable", json!({"plugin_id": "unreal-engine", "project_id": 1, "enabled": false}));
+    wait_until("plugin skills pruned", || !f.repo.join(".claude/skills/unreal-cpp").exists());
+    let audit = ok(&f.engine, "audit.list", json!({"op_prefix": "plugin.enable", "limit": 1}));
+    ok(&f.engine, "audit.undo", json!({"audit_id": audit["rows"][0]["id"]}));
+    assert_eq!(ok(&f.engine, "plugin.get", json!({"plugin_id": "unreal-engine"}))["plugin"]["enabled_in"], json!([1]));
+
+    let detail = ok(&f.engine, "plugin.get", json!({"plugin_id": "unreal-engine", "skill": "unreal-gas"}));
+    assert!(detail["instructions"].as_str().unwrap().contains("ue_project_info"));
+    assert!(detail["docs"].as_array().unwrap().iter().any(|d| d["path"] == "docs/setup.md"));
+    assert!(detail["skill"]["body"].as_str().unwrap().contains("name: unreal-gas"));
+    assert_eq!(code(call(&f.engine, "plugin.get", json!({"plugin_id": "nope"}))), "plugin.not_found");
+    assert_eq!(code(call(&f.engine, "plugin.enable", json!({"plugin_id": "unreal-engine", "project_id": 9, "enabled": true}))), "project.not_found");
+}
+
+#[test]
 fn multi_task_launch_stages_the_queue_and_prompts_each_current_task() {
     let f = fixture();
     let provider = fake_discovery_provider(&f.root, "claude", "claude 1.0.0");
