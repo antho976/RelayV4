@@ -406,16 +406,32 @@ impl Pane {
             let Some(p) = weak.upgrade() else {
                 return;
             };
+            // An attach can fail for a moment (a slow engine, a PTY being replaced, an engine
+            // restart). Keep trying while the pane is shown: 1 s, 2 s, 4 s, then every 10 s.
+            let mut delay = 1u64;
             loop {
                 let result = p.attach_and_render().await;
                 p.client.borrow_mut().take();
                 match result {
                     Ok(()) => {
                         p.status.set_text("Recovering output");
+                        delay = 1;
+                    }
+                    Err(Error::Bus(e)) if e.code.ends_with(".not_found") => {
+                        // The session is gone; the next refresh removes this pane. Leave it
+                        // inactive so a later set_active(true) can try again.
+                        p.status.set_text(&e.message);
+                        p.active.set(false);
+                        break;
                     }
                     Err(e) => {
-                        p.status.set_text(&e.to_string());
-                        break;
+                        p.status
+                            .set_text(&format!("{e} · retrying in {delay} s"));
+                        glib::timeout_future(std::time::Duration::from_secs(delay)).await;
+                        if !p.active.get() {
+                            break;
+                        }
+                        delay = (delay * 2).min(10);
                     }
                 }
             }
@@ -423,7 +439,7 @@ impl Pane {
     }
 
     async fn attach_and_render(self: &Rc<Self>) -> Result<(), Error> {
-        let (client, rx) = Client::connect(&self.rt, self.path.clone()).await?;
+        let (client, rx) = Client::connect_terminal(&self.rt, self.path.clone()).await?;
         let last = self.sequence.borrow().last;
         self.sequence.borrow_mut().catch_up = true;
         client
@@ -474,6 +490,8 @@ impl Pane {
                         bytes = 0;
                     }
                 }
+                // Frames were dropped to keep input replies moving: resume from the last fed.
+                Notice::Lagged => return Ok(()),
                 Notice::Disconnected(e) => return Err(e),
                 _ => {}
             }

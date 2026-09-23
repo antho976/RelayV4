@@ -468,8 +468,118 @@ pub fn edit(ui: &Rc<Ui>, note: Value) {
     ui.note_drafts.borrow_mut().insert(id, d);
 }
 
+/// The Notes window's document library for one project. When only its notes change, this
+/// is refilled in place: the page, the search text and the open editors stay where they are.
+#[derive(Clone)]
+pub struct NotesRail {
+    project: i64,
+    list: gtk::Box,
+    count: gtk::Label,
+    search: gtk::SearchEntry,
+    welcome: gtk::Box,
+    filters: Rc<RefCell<Vec<(String, gtk::Button)>>>,
+}
+
+fn fill_rail(ui: &Rc<Ui>, rail: &NotesRail, notes: &[Value]) {
+    clear(&rail.list);
+    rail.count.set_text(&notes.len().to_string());
+    let mut filters = Vec::new();
+    for note in notes {
+        let title = text(note, "title");
+        let b = button("", "document-row");
+        let row = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        row.append(&label(
+            if title.is_empty() { "Untitled" } else { title },
+            "document-row-title",
+        ));
+        let preview = text(note, "body")
+            .lines()
+            .next()
+            .unwrap_or("Empty document");
+        let preview = label(preview, "document-preview");
+        preview.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        preview.set_max_width_chars(32);
+        row.append(&preview);
+        let date = glib::DateTime::from_iso8601(text(note, "updated_at"), None)
+            .and_then(|date| date.to_local())
+            .and_then(|date| date.format("%b %-d"))
+            .map(|date| date.to_string())
+            .unwrap_or_else(|_| text(note, "updated_at").to_string());
+        row.append(&label(&date, "document-date"));
+        if note["pinned"] == true {
+            b.add_css_class("pinned");
+        }
+        b.set_child(Some(&row));
+        rail.list.append(&b);
+        filters.push((
+            format!("{} {}", title, text(note, "body")).to_lowercase(),
+            b.clone(),
+        ));
+        let weak = Rc::downgrade(ui);
+        let note = note.clone();
+        b.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                edit(&ui, note.clone());
+            }
+        });
+    }
+    // Keep what the person searched for across the refill.
+    let query = rail.search.text().to_lowercase();
+    for (haystack, b) in &filters {
+        b.set_visible(haystack.contains(&query));
+    }
+    *rail.filters.borrow_mut() = filters;
+}
+
+/// Show the drafts that belong to `project`, and open one when the project just changed.
+fn show_documents(ui: &Rc<Ui>, project: i64, notes: &[Value], welcome: &gtk::Box) {
+    let owner = ui.notes_window.borrow().clone();
+    let changed_project = owner
+        .as_ref()
+        .is_some_and(|w| w.rendered_project.replace(project) != project);
+    let mut selected = None;
+    for draft in ui.note_drafts.borrow().values() {
+        let belongs = draft.base.borrow()["project_id"].as_i64() == Some(project);
+        draft.layout.set_visible(belongs);
+        if belongs && selected.is_none() {
+            selected = ui.note_tabs.page_num(&draft.layout);
+        }
+    }
+    if changed_project {
+        if let Some(page) = selected {
+            ui.note_tabs.set_current_page(Some(page));
+        } else if let Some(note) = notes.first() {
+            edit(ui, note.clone());
+        }
+    }
+    let has_document = ui
+        .note_drafts
+        .borrow()
+        .values()
+        .any(|draft| draft.base.borrow()["project_id"].as_i64() == Some(project));
+    ui.note_tabs.set_visible(has_document);
+    welcome.set_visible(!has_document);
+}
+
 pub fn workspace(ui: &Rc<Ui>, name: &str, project: i64, notes: &[Value]) {
     let page = &ui.pages[name];
+    // Same project, already built: refill only the library. Rebuilding the page would detach
+    // the open editors (taking focus from the note being typed in), clear the search and
+    // scroll the library back to the top.
+    if name == "notes" {
+        let owner = ui.notes_window.borrow().clone();
+        let rail = owner.as_ref().and_then(|window| window.rail.borrow().clone());
+        if let (Some(window), Some(rail)) = (owner, rail) {
+            if rail.project == project
+                && window.rendered_project.get() == project
+                && rail.list.is_ancestor(page)
+            {
+                fill_rail(ui, &rail, notes);
+                show_documents(ui, project, notes, &rail.welcome);
+                return;
+            }
+        }
+    }
     page.add_css_class("notes-page");
     page.set_spacing(0);
     ui.note_tabs.set_show_tabs(true);
@@ -570,57 +680,20 @@ pub fn workspace(ui: &Rc<Ui>, name: &str, project: i64, notes: &[Value]) {
     let documents = label("Documents", "dim");
     documents.set_hexpand(true);
     library_head.append(&documents);
-    library_head.append(&label(&notes.len().to_string(), "dim"));
+    let count = label("", "dim");
+    library_head.append(&count);
     sidebar.append(&library_head);
     let search = gtk::SearchEntry::new();
     search.set_placeholder_text(Some("Search notes"));
     sidebar.append(&search);
     let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
     sidebar.append(&crate::app::scrolled(&list));
-    let mut filters = Vec::new();
-    for note in notes {
-        let title = text(note, "title");
-        let b = button("", "document-row");
-        let row = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        row.append(&label(
-            if title.is_empty() { "Untitled" } else { title },
-            "document-row-title",
-        ));
-        let preview = text(note, "body")
-            .lines()
-            .next()
-            .unwrap_or("Empty document");
-        let preview = label(preview, "document-preview");
-        preview.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        preview.set_max_width_chars(32);
-        row.append(&preview);
-        let date = glib::DateTime::from_iso8601(text(note, "updated_at"), None)
-            .and_then(|date| date.to_local())
-            .and_then(|date| date.format("%b %-d"))
-            .map(|date| date.to_string())
-            .unwrap_or_else(|_| text(note, "updated_at").to_string());
-        row.append(&label(&date, "document-date"));
-        if note["pinned"] == true {
-            b.add_css_class("pinned");
-        }
-        b.set_child(Some(&row));
-        list.append(&b);
-        filters.push((
-            format!("{} {}", title, text(note, "body")).to_lowercase(),
-            b.clone(),
-        ));
-        let weak = Rc::downgrade(ui);
-        let note = note.clone();
-        b.connect_clicked(move |_| {
-            if let Some(ui) = weak.upgrade() {
-                edit(&ui, note.clone());
-            }
-        });
-    }
+    let filters: Rc<RefCell<Vec<(String, gtk::Button)>>> = Rc::default();
+    let shown = filters.clone();
     search.connect_search_changed(move |s| {
         let query = s.text().to_lowercase();
-        for (text, b) in &filters {
-            b.set_visible(text.contains(&query));
+        for (haystack, b) in shown.borrow().iter() {
+            b.set_visible(haystack.contains(&query));
         }
     });
     split.set_start_child(Some(&sidebar));
@@ -640,31 +713,22 @@ pub fn workspace(ui: &Rc<Ui>, name: &str, project: i64, notes: &[Value]) {
     editor_host.append(&welcome);
     split.set_end_child(Some(&editor_host));
     page.append(&split);
-    let changed_project = owner
-        .as_ref()
-        .is_some_and(|w| w.rendered_project.replace(project) != project);
-    let mut selected = None;
-    for draft in ui.note_drafts.borrow().values() {
-        let belongs = draft.base.borrow()["project_id"].as_i64() == Some(project);
-        draft.layout.set_visible(belongs);
-        if belongs && selected.is_none() {
-            selected = ui.note_tabs.page_num(&draft.layout);
+    let rail = NotesRail {
+        project,
+        list,
+        count,
+        search,
+        welcome,
+        filters,
+    };
+    fill_rail(ui, &rail, notes);
+    // Record the library before opening a document, which may ask for another refresh.
+    if name == "notes" {
+        if let Some(window) = owner.as_ref() {
+            *window.rail.borrow_mut() = Some(rail.clone());
         }
     }
-    if changed_project {
-        if let Some(page) = selected {
-            ui.note_tabs.set_current_page(Some(page));
-        } else if let Some(note) = notes.first() {
-            edit(ui, note.clone());
-        }
-    }
-    let has_document = ui
-        .note_drafts
-        .borrow()
-        .values()
-        .any(|draft| draft.base.borrow()["project_id"].as_i64() == Some(project));
-    ui.note_tabs.set_visible(has_document);
-    welcome.set_visible(!has_document);
+    show_documents(ui, project, notes, &rail.welcome);
 }
 
 pub fn note_row(ui: &Rc<Ui>, body: &gtk::Box, note: Value) {

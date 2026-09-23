@@ -333,7 +333,7 @@ fn build_form(ui: &Rc<Ui>, page: &gtk::Box, project: i64, devices: &[Value], wor
         let publish = publish.clone();
         key.connect_clicked(move |_|{
             let Some(ui)=weak.upgrade()else{return;};let selected=tree.active_id().map(|v|v.to_string()).unwrap_or_default();let variant=variant.text().trim().to_string();
-            if variant.is_empty(){ui.show_error("Enter the Gradle variant to build.");return;}
+            if variant.is_empty(){ui.show_info("Enter the Gradle variant to build.");return;}
             let mut payload=json!({"project_id":project,"worktree":if selected.is_empty(){None}else{Some(selected)},"variant":variant});
             if op=="device.run"{let Some(device)=target.active_id()else{return;};payload["device"]=json!(device.as_str());}
             else{payload["format"]=json!(format.active_id().map(|v|v.to_string()).unwrap_or_else(||"apk".into()));payload["publish"]=json!(publish.is_active());}
@@ -401,11 +401,11 @@ fn avd_form(ui: &Rc<Ui>, page: &gtk::Box) {
         if let Some(ui) = weak.upgrade() {
             let title = name.text().trim().to_string();
             let Some(package) = image.active_id() else {
-                ui.show_error("Load and select an installed system image first.");
+                ui.show_info("Load and select an installed system image first.");
                 return;
             };
             if title.is_empty() {
-                ui.show_error("Enter an AVD name.");
+                ui.show_info("Enter an AVD name.");
                 return;
             }
             let device = profile
@@ -509,11 +509,11 @@ fn signing_form(ui: &Rc<Ui>, row: &gtk::Box, project: i64) {
         let alias = alias.text().trim().to_string();
         let secret = password.text().to_string();
         if secret != confirmation.text() {
-            ui.show_error("Passwords do not match.");
+            ui.show_info("Passwords do not match.");
             return;
         }
         if alias.is_empty() || secret.len() < 6 {
-            ui.show_error("Enter a key alias and a password of at least six characters.");
+            ui.show_info("Enter a key alias and a password of at least six characters.");
             return;
         }
         key.set_sensitive(false);

@@ -46,6 +46,16 @@ fn shape(line: &[u8]) -> Option<Shape> {
 
 const QUEUE: usize = 64;
 const MAX_LINE: usize = 2 * 1024 * 1024;
+/// How much of an oversized line is kept: enough to read a reply's request id.
+const OVERSIZED_HEAD: usize = 96;
+
+/// The request id of a reply whose line was too long to keep. A reply serializes
+/// `{"v":1,"id":"<uuid>",…` (fields in declaration order), so the id sits in the first bytes.
+fn oversized_reply_id(head: &[u8]) -> Option<Uuid> {
+    let rest = head.strip_prefix(br#"{"v":1,"id":""#)?;
+    let id = std::str::from_utf8(rest.get(..36)?).ok()?;
+    Uuid::parse_str(id).ok()
+}
 
 pub fn is_lifecycle_request(op: &str) -> bool {
     matches!(
@@ -95,6 +105,9 @@ impl From<BusError> for Error {
 pub enum Notice {
     Event(Event),
     Frame(Frame),
+    /// Only on a terminal connection: frames were dropped because the reader fell behind.
+    /// Re-attach from the last frame fed; the engine replays the rest from its ring.
+    Lagged,
     Disconnected(Error),
 }
 
@@ -149,6 +162,18 @@ impl Client {
             .map_err(|e| Error::Io(e.to_string()))?
     }
 
+    /// A terminal attachment. Its PTY frames never hold up the replies to its own keystrokes
+    /// and resizes: when the notice queue is full a frame is dropped instead of waited for,
+    /// and one `Notice::Lagged` follows so the pane re-attaches from its last sequence.
+    pub async fn connect_terminal(
+        rt: &Handle,
+        path: PathBuf,
+    ) -> Result<(Self, async_channel::Receiver<Notice>), Error> {
+        rt.spawn(async move { Self::open_with(path, MAX_LINE, true).await })
+            .await
+            .map_err(|e| Error::Io(e.to_string()))?
+    }
+
     async fn open(path: PathBuf) -> Result<(Self, async_channel::Receiver<Notice>), Error> {
         Self::open_with_limit(path, MAX_LINE).await
     }
@@ -156,6 +181,14 @@ impl Client {
     async fn open_with_limit(
         path: PathBuf,
         max_line: usize,
+    ) -> Result<(Self, async_channel::Receiver<Notice>), Error> {
+        Self::open_with(path, max_line, false).await
+    }
+
+    async fn open_with(
+        path: PathBuf,
+        max_line: usize,
+        lossy_frames: bool,
     ) -> Result<(Self, async_channel::Receiver<Notice>), Error> {
         let socket = UnixStream::connect(&path)
             .await
@@ -166,12 +199,15 @@ impl Client {
         let (notices, receiver) = async_channel::bounded(QUEUE);
         let waiting = pending.clone();
         let reader_notices = notices.clone();
+        let lag_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let reader = tokio::spawn(async move {
             let mut reader = BufReader::new(read);
             let outcome: Result<(), Error> = async {
                 loop {
                     // read_until alone has no size limit. Bound the frame before allocation.
+                    // A longer line is read to its end and dropped, keeping only its head.
                     let mut line = Vec::new();
+                    let mut oversized = false;
                     loop {
                         let available = reader
                             .fill_buf()
@@ -184,18 +220,39 @@ impl Client {
                             .iter()
                             .position(|b| *b == b'\n')
                             .map_or(available.len(), |n| n + 1);
-                        if line.len() + n > max_line {
-                            return Err(Error::Protocol(format!(
-                                "frame exceeds {} MiB",
-                                max_line / 1024 / 1024
-                            )));
-                        }
                         let complete = available[n - 1] == b'\n';
-                        line.extend_from_slice(&available[..n]);
+                        if !oversized && line.len() + n > max_line {
+                            oversized = true;
+                            let keep = n.min(OVERSIZED_HEAD.saturating_sub(line.len()));
+                            line.extend_from_slice(&available[..keep]);
+                            line.truncate(OVERSIZED_HEAD);
+                        } else if !oversized {
+                            line.extend_from_slice(&available[..n]);
+                        }
                         reader.consume(n);
                         if complete {
                             break;
                         }
+                    }
+                    if oversized {
+                        // Fail only the request this reply belongs to; the connection, its
+                        // subscriptions and every other request carry on.
+                        let reply = oversized_reply_id(&line)
+                            .and_then(|id| waiting.lock().unwrap().remove(&id));
+                        match reply {
+                            Some(reply) => {
+                                let _ = reply.send(Err(Error::Protocol(format!(
+                                    "the reply is larger than {} MiB and was dropped",
+                                    max_line / 1024 / 1024
+                                ))));
+                            }
+                            None => tracing::warn!(
+                                "dropped an engine line over {} MiB: {}",
+                                max_line / 1024 / 1024,
+                                String::from_utf8_lossy(&line)
+                            ),
+                        }
+                        continue;
                     }
                     let shape = match shape(&line) {
                         Some(shape) => shape,
@@ -226,10 +283,24 @@ impl Client {
                     } else if matches!(shape, Shape::Frame) {
                         let frame = serde_json::from_slice(&line)
                             .map_err(|e| Error::Protocol(e.to_string()))?;
-                        reader_notices
-                            .send(Notice::Frame(frame))
-                            .await
-                            .map_err(|_| Error::Disconnected)?;
+                        if !lossy_frames {
+                            reader_notices
+                                .send(Notice::Frame(frame))
+                                .await
+                                .map_err(|_| Error::Disconnected)?;
+                        } else if let Err(error) = reader_notices.try_send(Notice::Frame(frame)) {
+                            if error.is_closed() {
+                                return Err(Error::Disconnected);
+                            }
+                            // Full: never wait here, or replies queued behind this frame wait
+                            // too. One lag notice at a time, delivered when there is room.
+                            if !lag_pending.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                                let notices = reader_notices.clone();
+                                tokio::spawn(async move {
+                                    let _ = notices.send(Notice::Lagged).await;
+                                });
+                            }
+                        }
                     } else {
                         let response: Response = serde_json::from_slice(&line)
                             .map_err(|e| Error::Protocol(e.to_string()))?;
@@ -327,6 +398,15 @@ impl Client {
 mod tests {
     use super::*;
     use tokio::net::UnixListener;
+
+    #[test]
+    fn an_oversized_reply_names_its_request() {
+        let id = Uuid::new_v4();
+        let line = serde_json::to_vec(&Response::ok(id, serde_json::json!("x".repeat(200))))
+            .unwrap();
+        assert_eq!(oversized_reply_id(&line[..OVERSIZED_HEAD]), Some(id));
+        assert_eq!(oversized_reply_id(br#"{"v":1,"ev":"file.changed"}"#), None);
+    }
 
     #[tokio::test]
     async fn lifecycle_actions_bypass_a_stalled_status_request() {

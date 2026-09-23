@@ -68,19 +68,47 @@ impl Ui {
         }
     }
 
-    pub(super) fn refresh_status(self: &Rc<Self>) {
+    /// Coalesced like `refresh`: one pass at a time, and events that arrive meanwhile ask for
+    /// exactly one more. Passes run in order, so an older reply never lands after a newer one.
+    /// `devices` also lists devices, which starts an `adb` process; only device events and the
+    /// first load need that.
+    pub(super) fn refresh_status(self: &Rc<Self>, devices: bool) {
         self.render_status_counts();
+        if devices {
+            self.status_devices.set(true);
+        }
+        self.status_dirty.set(true);
+        if self.status_pending.replace(true) {
+            return;
+        }
         let ui = self.clone();
         glib::spawn_future_local(async move {
-            let generation = ui.generation.get();
-            let (usage, devices, providers) = tokio::join!(
-                ui.call("usage.get", json!({})),
-                ui.call("device.list", json!({})),
-                ui.call("provider.list", json!({}))
-            );
-            if generation != ui.generation.get() {
-                return;
+            while ui.status_dirty.replace(false) {
+                ui.refresh_status_once().await;
             }
+            ui.status_pending.set(false);
+        });
+    }
+
+    async fn refresh_status_once(self: &Rc<Self>) {
+        let ui = self;
+        let generation = ui.generation.get();
+        let list_devices = ui.status_devices.replace(false);
+        let (usage, devices, providers) = tokio::join!(
+            ui.call("usage.get", json!({})),
+            async {
+                if list_devices {
+                    Some(ui.call("device.list", json!({})).await)
+                } else {
+                    None
+                }
+            },
+            ui.call("provider.list", json!({}))
+        );
+        if generation != ui.generation.get() {
+            return;
+        }
+        {
             if let Ok(v) = usage {
                 clear(&ui.usage_meters);
                 let mut usage = rows(&v, "usage");
@@ -123,15 +151,20 @@ impl Ui {
                 ui.usage_meters
                     .append(&crate::icons::image("chevron-down", 10));
             }
-            if let Ok(v) = devices {
-                let n = rows(&v, "devices").len();
-                ui.device_status.set_text(&match n {
-                    0 => "No device".into(),
-                    1 => "1 device".into(),
-                    _ => format!("{n} devices"),
-                });
+            match devices {
+                Some(Ok(v)) => {
+                    let n = rows(&v, "devices").len();
+                    ui.device_status.set_text(&match n {
+                        0 => "No device".into(),
+                        1 => "1 device".into(),
+                        _ => format!("{n} devices"),
+                    });
+                }
+                // Try again on the next pass rather than leaving a stale count.
+                Some(Err(_)) => ui.status_devices.set(true),
+                None => {}
             }
-        });
+        }
     }
 
     pub fn resources(self: &Rc<Self>) {

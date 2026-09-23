@@ -11,7 +11,7 @@ mod note_pages;
 mod notes_window;
 #[path = "task_pages.rs"]
 mod task_pages;
-pub use notes_window::{refresh_notes, show_notes, NotesWindow};
+pub use notes_window::{catch_up_notes, mark_notes_stale, refresh_notes, show_notes, NotesWindow};
 pub use task_pages::Draft;
 pub fn verify_note_tools() {
     note_pages::verify_tools();
@@ -1228,14 +1228,14 @@ fn mail_composer(ui: &Rc<Ui>, page: &gtk::Box, project: i64) {
             .text(&buffer.start_iter(), &buffer.end_iter(), false)
             .to_string();
         if recipient.is_empty() || text.trim().is_empty() {
-            ui.show_error("Enter a recipient and a message.");
+            ui.show_info("Enter a recipient and a message.");
             return;
         }
         let priority_control = priority.clone();
         let recipient_control = to.clone();
         let priority = priority.is_active();
         if priority && recipient == "*" {
-            ui.show_error("Priority mail needs one session name.");
+            ui.show_info("Priority mail needs one session name.");
             return;
         }
         b.set_sensitive(false);

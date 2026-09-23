@@ -147,7 +147,6 @@ fn render_library(ui: &Rc<Ui>, list: &gtk::Box, preview: &gtk::Box, data: &[Valu
     let weak = Rc::downgrade(ui);
     let target_list = list.downgrade();
     let target_preview = preview.downgrade();
-    let data_copy = data.to_vec();
     picker.connect_selected_notify(move |picker| {
         let (Some(ui), Some(list), Some(preview)) = (
             weak.upgrade(),
@@ -160,7 +159,21 @@ fn render_library(ui: &Rc<Ui>, list: &gtk::Box, preview: &gtk::Box, data: &[Valu
             .get(picker.selected() as usize)
             .and_then(|p| p["id"].as_i64())
         {
-            render_library(&ui, &list, &preview, &data_copy, project);
+            // Enablement changes for other projects are not in this page's snapshot: read the
+            // library again. The scope is recorded first so a page refresh keeps it too.
+            let scope = format!("skills-scope-{project}");
+            list.set_widget_name(&scope);
+            glib::spawn_future_local(async move {
+                let generation = ui.generation.get();
+                let result = ui.call("skill.list", json!({})).await;
+                if generation != ui.generation.get() || list.widget_name() != scope {
+                    return;
+                }
+                match result {
+                    Ok(v) => render_library(&ui, &list, &preview, &rows(&v, "skills"), project),
+                    Err(e) => ui.show_error(&e.to_string()),
+                }
+            });
         }
     });
     scope.append(&picker);

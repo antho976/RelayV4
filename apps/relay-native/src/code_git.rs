@@ -170,6 +170,12 @@ impl Editor {
                 summary.set_max_width_chars(42);
                 changes_section.append(&summary);
             }
+            if status["truncated"] == true {
+                // The engine caps very large change sets; the list below is only the head of it.
+                let note = label(&format!("Showing the first {} changes", changes.len()), "code-git-hint");
+                note.set_wrap(true);
+                changes_section.append(&note);
+            }
             if changes.is_empty() {
                 changes_section.append(&label("Working tree clean.", "code-git-hint"));
             }
@@ -298,7 +304,7 @@ impl Editor {
                     if let Some(ui) = weak.upgrade() {
                         let content = commit_text(&message).trim().to_string();
                         if content.is_empty() {
-                            ui.show_error("Enter a commit message first.");
+                            ui.show_info("Enter a commit message first.");
                             return;
                         }
                         ed.git_action(
@@ -525,7 +531,7 @@ impl Editor {
                     .map(|(n, _)| n.clone())
                     .collect();
                 if selected.len() < 2 {
-                    ui.show_error("Select at least two agents to test together.");
+                    ui.show_info("Select at least two agents to test together.");
                     return;
                 }
                 key.set_sensitive(false);
@@ -737,7 +743,7 @@ impl Editor {
         let weak = Rc::downgrade(ui);
         create.connect_clicked(move |_|{
             let Some(ui)=weak.upgrade()else{return;};
-            if name.text().trim().is_empty(){ui.show_error("Enter a branch name.");return;}
+            if name.text().trim().is_empty(){ui.show_info("Enter a branch name.");return;}
             e.git_action(&ui,"git.branch.create",json!({"name":name.text().trim(),"start_point":optional_scope(start.text().trim()),"checkout":true}),Some(name.clone()));
         });
         container.append(&create);
@@ -753,7 +759,7 @@ impl Editor {
             return;
         }
         if self.is_dirty() {
-            ui.show_error("Save or discard your editor changes before changing Git state.");
+            ui.show_info("Save or discard your editor changes before changing Git state.");
             return;
         }
         let mut payload = self.payload(ui, extra);
@@ -816,7 +822,7 @@ impl Editor {
     }
     fn open_diff(self: &Rc<Self>, ui: &Rc<Ui>, path: String) {
         if self.is_dirty() {
-            ui.show_error("Save or discard your edits before opening a diff.");
+            ui.show_info("Save or discard your edits before opening a diff.");
             return;
         }
         self.revision.set(self.revision.get() + 1);
@@ -837,11 +843,32 @@ impl Editor {
                 return;
             }
             match result {
+                Ok(v) if v["binary"] == true || v["too_large"] == true => {
+                    // The engine sends no text for these; show why instead of an empty diff.
+                    let message = if v["binary"] == true {
+                        "Binary file — no text diff"
+                    } else {
+                        "File too large to diff"
+                    };
+                    e.diff.set(true);
+                    e.image_mode.set(false);
+                    e.image.clear();
+                    e.before.set_text("");
+                    e.buffer.set_language(None);
+                    e.buffer.set_text(message);
+                    e.buffer.set_modified(false);
+                    e.before_scroll.set_visible(false);
+                    *e.path.borrow_mut() = path.clone();
+                    e.project.set(project);
+                    e.set_busy(false);
+                    e.caption.set_text(&format!("{path} · {message}"));
+                    e.position.set_text(message);
+                }
                 Ok(v) => {
                     let old = text(&v, "old");
                     let new = text(&v, "new");
                     if old.len() + new.len() > 1048576 {
-                        ui.show_error("Diff exceeds the 1 MiB editor limit.");
+                        ui.show_info("Diff exceeds the 1 MiB editor limit.");
                         return;
                     }
                     e.diff.set(true);

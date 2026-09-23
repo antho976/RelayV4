@@ -3,13 +3,89 @@ use crate::app::{button, clear, field, label, rows, text, Ui};
 use gtk::prelude::*;
 use gtk4 as gtk;
 use serde_json::{json, Value};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+
+/// What the page's controls held when it was built or last saved: `settings.set` calls,
+/// the notification patch and the guardrail patch. Save sends only what differs from it.
+type Collected = (Vec<(&'static str, Value)>, Value, Value);
 
 pub(crate) struct WallpaperDraft {
     state: Rc<RefCell<Value>>,
     saved: Rc<RefCell<Value>>,
     gallery: glib::WeakRef<gtk::Box>,
+    baseline: Rc<RefCell<Option<Collected>>>,
+    saving: Rc<Cell<bool>>,
+}
+
+fn collect_page(ui: &Ui) -> Option<Collected> {
+    let mut collected = (
+        Vec::new(),
+        json!({"categories":{}}),
+        json!({"caps":{},"destructive_write":{}}),
+    );
+    collect_settings(
+        ui.pages["settings"].upcast_ref(),
+        &mut collected.0,
+        &mut collected.1,
+        &mut collected.2,
+    )
+    .ok()?;
+    Some(collected)
+}
+
+/// The part of `current` that differs from `base`, recursing into objects. `None` when equal.
+fn changed(current: &Value, base: &Value) -> Option<Value> {
+    if current == base {
+        return None;
+    }
+    match (current, base) {
+        (Value::Object(now), Value::Object(before)) => {
+            let mut out = serde_json::Map::new();
+            for (key, value) in now {
+                if let Some(diff) = changed(value, before.get(key).unwrap_or(&Value::Null)) {
+                    out.insert(key.clone(), diff);
+                }
+            }
+            (!out.is_empty()).then_some(Value::Object(out))
+        }
+        _ => Some(current.clone()),
+    }
+}
+
+/// A `settings.changed` event from elsewhere (the CLI, the phone, an agent). Rebuild the page
+/// from the engine when it shows that setting, holds a different value and has no unsaved edits.
+pub(crate) fn external_change(ui: &Rc<Ui>, path: &str, value: &Value) {
+    let reload = {
+        let draft = ui.wallpaper_draft.borrow();
+        let Some(draft) = draft.as_ref() else {
+            return;
+        };
+        if draft.saving.get() {
+            return;
+        }
+        let baseline = draft.baseline.borrow();
+        let Some(base) = baseline.as_ref() else {
+            return;
+        };
+        let prefix = format!("{path}.");
+        let shown = base.0.iter().any(|(_, payload)| {
+            let control = text(payload, "path");
+            path.is_empty() || control == path || control.starts_with(&prefix)
+        });
+        let known = base.0.iter().any(|(op, payload)| {
+            *op == "settings.set" && text(payload, "path") == path && payload["value"] == *value
+        });
+        let wallpaper_dirty = draft.state.borrow()["wallpaper"] != draft.saved.borrow()["wallpaper"]
+            || draft.state.borrow()["wallpapers"] != draft.saved.borrow()["wallpapers"];
+        shown && !known && !wallpaper_dirty && collect_page(ui).as_ref() == Some(base)
+    };
+    if reload {
+        ui.page_projects.borrow_mut().remove("settings");
+        if *ui.page.borrow() == "settings" {
+            ui.refresh_page();
+        }
+    }
 }
 
 pub(crate) fn sync_wallpaper(ui: &Rc<Ui>, image: &Value) {
@@ -74,6 +150,8 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
         json!({"wallpapers":data["appearance.wallpapers"],"wallpaper":data["appearance.wallpaper"]}),
     ));
     let saved_wallpapers = Rc::new(RefCell::new(wallpapers.borrow().clone()));
+    let baseline: Rc<RefCell<Option<Collected>>> = Rc::default();
+    let saving = Rc::new(Cell::new(false));
     // Keep the saved baseline null so Save persists offered presets, but never
     // select a wallpaper or replace an explicitly empty/custom library here.
     wallpapers.borrow_mut()["wallpapers"] =
@@ -113,6 +191,8 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
     let weak = Rc::downgrade(ui);
     let wallpaper_state = wallpapers.clone();
     let saved_for_save = saved_wallpapers.clone();
+    let baseline_for_save = baseline.clone();
+    let saving_for_save = saving.clone();
     reload.connect_clicked(move |_| {
         let (Some(ui), Some(page)) = (weak.upgrade(), target.upgrade()) else {
             return;
@@ -129,6 +209,17 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
             ui.show_error(&error);
             return;
         }
+        // Send only what changed since the page was built, so values changed elsewhere in the
+        // meantime (CLI, phone, agents) are not overwritten with this page's stale copy.
+        let full: Collected = (settings.clone(), notifications.clone(), guardrails.clone());
+        let base = baseline_for_save.borrow().clone();
+        let (notify_patch, guard_patch) = match &base {
+            Some((before, notify, guard)) => {
+                settings.retain(|entry| !before.contains(entry));
+                (changed(&notifications, notify), changed(&guardrails, guard))
+            }
+            None => (Some(notifications), Some(guardrails)),
+        };
         let wallpaper_snapshot = wallpaper_state.borrow().clone();
         for field in ["wallpapers", "wallpaper"] {
             if wallpaper_snapshot[field] != saved_for_save.borrow()[field] {
@@ -139,9 +230,16 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
             }
         }
         let saved_wallpapers = saved_for_save.clone();
-        settings.push(("notify.settings.set", json!({"patch":notifications})));
-        settings.push(("guardrail.config.set", json!({"patch":guardrails})));
+        if let Some(patch) = notify_patch {
+            settings.push(("notify.settings.set", json!({"patch":patch})));
+        }
+        if let Some(patch) = guard_patch {
+            settings.push(("guardrail.config.set", json!({"patch":patch})));
+        }
         let save_caption = save_caption.clone();
+        let baseline = baseline_for_save.clone();
+        let saving = saving_for_save.clone();
+        saving.set(true);
         page.set_sensitive(false);
         save_caption.set_text("Saving…");
         glib::spawn_future_local(async move {
@@ -154,10 +252,12 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
             }
             page.set_sensitive(true);
             save_caption.set_text("Save changes");
+            saving.set(false);
             if let Some(error) = error {
                 ui.show_error(&error);
             } else {
                 *saved_wallpapers.borrow_mut() = wallpaper_snapshot;
+                *baseline.borrow_mut() = Some(full);
                 ui.refresh();
             }
         });
@@ -334,6 +434,8 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
         state: wallpapers.clone(),
         saved: saved_wallpapers,
         gallery: gallery.downgrade(),
+        baseline: baseline.clone(),
+        saving,
     });
     let rotation = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     rotation.add_css_class("settings-wallpaper-rotation");
@@ -586,6 +688,7 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
             }
         }
     });
+    *baseline.borrow_mut() = collect_page(ui);
 }
 
 fn settings_search_text(widget: &gtk::Widget) -> String {

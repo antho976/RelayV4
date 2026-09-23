@@ -174,6 +174,19 @@ pub struct Ui {
     pub(crate) wallpaper_rotation: RefCell<crate::wallpaper_rotation::Rotation>,
     pub(crate) wallpaper_draft: RefCell<Option<crate::tools::settings::WallpaperDraft>>,
     pub(crate) provider_updates_checked: Cell<bool>,
+    /// Status-bar refreshes coalesce like `refresh`; `status_devices` asks the next pass to
+    /// run `device.list` too (an `adb` process), which only device events and the first load do.
+    status_pending: Cell<bool>,
+    status_dirty: Cell<bool>,
+    status_devices: Cell<bool>,
+    /// Per-project lamp and live count in the sidebar, updated in place on session changes.
+    project_live: RefCell<BTreeMap<i64, (gtk::Box, gtk::Label)>>,
+    reconnect_timer: RefCell<Option<glib::SourceId>>,
+    reconnect_attempt: Cell<u32>,
+    /// Hash of the wallpaper value last decoded, so an unchanged image is not decoded again.
+    wallpaper_key: Cell<u64>,
+    /// Palette and font size last applied to the panes.
+    pane_style: RefCell<(String, f64)>,
 }
 
 pub fn run(rt: Handle) -> glib::ExitCode {
@@ -622,6 +635,14 @@ impl Ui {
             wallpaper_rotation: RefCell::default(),
             wallpaper_draft: RefCell::default(),
             provider_updates_checked: Cell::new(false),
+            status_pending: Cell::new(false),
+            status_dirty: Cell::new(false),
+            status_devices: Cell::new(false),
+            project_live: RefCell::default(),
+            reconnect_timer: RefCell::new(None),
+            reconnect_attempt: Cell::new(0),
+            wallpaper_key: Cell::new(0),
+            pane_style: RefCell::new((String::new(), 0.0)),
         });
         for (name, caption, icon) in [
             ("dashboard", "Dashboard", "view-app-grid-symbolic"),
@@ -761,15 +782,19 @@ impl Ui {
             });
         }
         let weak = Rc::downgrade(&ui);
+        // Information (`show_info`) carries the "info" class and never offers Reconnect.
         let recovery_label_key = reconnect.clone();
         ui.notice.connect_label_notify(move |notice| {
-            recovery_label_key.set_visible(!notice.text().is_empty());
+            recovery_label_key
+                .set_visible(!notice.text().is_empty() && !notice.has_css_class("info"));
         });
         let recovery_key = reconnect.clone();
-        ui.notice
-            .connect_visible_notify(move |notice| recovery_key.set_visible(notice.is_visible()));
+        ui.notice.connect_visible_notify(move |notice| {
+            recovery_key.set_visible(notice.is_visible() && !notice.has_css_class("info"))
+        });
         reconnect.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
+                ui.reconnect_attempt.set(0);
                 ui.connect();
             }
         });
@@ -832,7 +857,7 @@ impl Ui {
         let owned = ui.clone();
         ui.window.connect_close_request(move |_| {
             if owned.launch_busy.get() {
-                owned.show_error("Wait for agent launch to finish before closing.");
+                owned.show_info("Wait for agent launch to finish before closing.");
                 return glib::Propagation::Stop;
             }
             if owned
@@ -841,16 +866,16 @@ impl Ui {
                 .values()
                 .any(|d| d.busy.get() || d.dirty())
             {
-                owned.show_error("Save or discard note changes before closing.");
+                owned.show_info("Save or discard note changes before closing.");
                 return glib::Propagation::Stop;
             }
             if owned.editor.is_dirty() {
-                owned.show_error("Save or discard your editor changes before closing.");
+                owned.show_info("Save or discard your editor changes before closing.");
                 return glib::Propagation::Stop;
             }
             let panels = owned.panels.borrow().clone();
             if panels.iter().any(|panel| !panel.can_close()) {
-                owned.show_error("Save or discard panel changes before closing.");
+                owned.show_info("Save or discard panel changes before closing.");
                 return glib::Propagation::Stop;
             }
             for panel in panels.iter().rev() {
@@ -875,8 +900,30 @@ impl Ui {
         ui
     }
     pub fn show_error(&self, message: &str) {
+        self.notice.remove_css_class("info");
         self.notice.set_text(message);
         self.notice.set_visible(true);
+    }
+    /// A message that needs no recovery: no Reconnect key, and it clears itself.
+    pub fn show_info(&self, message: &str) {
+        self.notice_info(message, true);
+    }
+    fn notice_info(&self, message: &str, expire: bool) {
+        self.notice.add_css_class("info");
+        self.notice.set_text(message);
+        self.notice.set_visible(true);
+        if !expire {
+            return;
+        }
+        let notice = self.notice.downgrade();
+        let shown = message.to_string();
+        glib::timeout_add_local_once(std::time::Duration::from_secs(8), move || {
+            if let Some(notice) = notice.upgrade() {
+                if notice.has_css_class("info") && notice.text() == shown {
+                    notice.set_visible(false);
+                }
+            }
+        });
     }
     pub async fn call(&self, op: &str, payload: Value) -> Result<Value, Error> {
         let client = self.client.borrow().clone().ok_or(Error::Disconnected)?;
@@ -898,7 +945,32 @@ impl Ui {
             ui.refresh_page();
         });
     }
+    /// After the engine goes away, try again on our own: 1 s, 2 s, 4 s … up to 30 s. The
+    /// Reconnect key stays available and resets the delay.
+    fn schedule_reconnect(self: &Rc<Self>) {
+        if let Some(timer) = self.reconnect_timer.borrow_mut().take() {
+            timer.remove();
+        }
+        let attempt = self.reconnect_attempt.get();
+        self.reconnect_attempt.set(attempt.saturating_add(1));
+        let delay = (1u64 << attempt.min(5)).min(30);
+        let weak = Rc::downgrade(self);
+        *self.reconnect_timer.borrow_mut() = Some(glib::timeout_add_local_once(
+            std::time::Duration::from_secs(delay),
+            move || {
+                if let Some(ui) = weak.upgrade() {
+                    ui.reconnect_timer.borrow_mut().take();
+                    if !ui.connected.get() {
+                        ui.connect();
+                    }
+                }
+            },
+        ));
+    }
     fn connect(self: &Rc<Self>) {
+        if let Some(timer) = self.reconnect_timer.borrow_mut().take() {
+            timer.remove();
+        }
         self.navigation_echoes.borrow_mut().clear();
         self.registry_dirty.set(true);
         self.rendered_sessions.borrow_mut().clear();
@@ -906,13 +978,14 @@ impl Ui {
         let generation = self.generation.get();
         self.client.borrow_mut().take();
         self.connected.set(false);
+        // Keep the panes: each owns its own attachment and remembers the last sequence it
+        // fed, so re-attaching resumes the output instead of replaying only the engine's
+        // bounded tail into a fresh terminal. `reconcile` drops panes whose session is gone.
         for p in self.panes.borrow().values() {
-            p.stop();
+            p.set_active(false);
         }
-        self.panes.borrow_mut().clear();
-        self.ordered.borrow_mut().clear();
-        self.layout();
-        self.show_error("Connecting to the Relay engine…");
+        crate::pages::mark_notes_stale(self);
+        self.notice_info("Connecting to the Relay engine…", false);
         let ui = self.clone();
         glib::spawn_future_local(async move {
             match Client::connect(&ui.rt, ui.path.clone()).await {
@@ -921,15 +994,16 @@ impl Ui {
                         return;
                     }
                     *ui.client.borrow_mut() = Some(client);
-                    if let Err(e)=ui.call("bus.subscribe",json!({"events":["project.changed","project.deleted","workspace.changed","session.changed","task.changed","task.deleted","mailbox.new","mailbox.changed","guardrail.held","guardrail.resolved","overlap.changed","notes.changed","notes.deleted","file.changed","git.changed","worktree.changed","module.changed","module.deleted","skill.changed","skill.deleted","plugin.changed","settings.changed","provider.update.changed","notify.new","notify.changed","device.changed","run.changed","run.crash","device.signing.changed","avd.changed","layout.changed","ui.changed","ui.toast","usage.changed","integration.changed","integration.result"]})).await { ui.show_error(&e.to_string()); return; }
+                    if let Err(e)=ui.call("bus.subscribe",json!({"events":["project.changed","project.deleted","workspace.changed","session.changed","task.changed","task.deleted","mailbox.new","mailbox.changed","guardrail.held","guardrail.resolved","overlap.changed","notes.changed","notes.deleted","file.changed","git.changed","worktree.changed","module.changed","module.deleted","skill.changed","skill.deleted","plugin.changed","settings.changed","provider.update.changed","notify.new","notify.changed","device.changed","run.changed","run.crash","device.signing.changed","avd.changed","layout.changed","ui.changed","ui.toast","usage.changed","integration.changed","integration.result"]})).await { ui.show_error(&e.to_string()); ui.client.borrow_mut().take(); ui.schedule_reconnect(); return; }
                     ui.connected.set(true);
+                    ui.reconnect_attempt.set(0);
                     crate::provider_updates::startup(&ui);
                     ui.status.set_text("");
-                    ui.refresh_status();
+                    ui.refresh_status(true);
                     ui.refresh_notification_count();
                     ui.notice.set_visible(false);
                     ui.refresh();
-                    ui.load_appearance();
+                    ui.load_appearance("");
                     ui.load_keybindings();
                     if *ui.page.borrow() == "devices" {
                         let _ = ui.call("device.watch", json!({"on":true})).await;
@@ -958,7 +1032,7 @@ impl Ui {
                                     e.ev.as_str(),
                                     "usage.changed" | "device.changed" | "run.changed"
                                 ) {
-                                    ui.refresh_status();
+                                    ui.refresh_status(e.ev == "device.changed");
                                 }
                                 if e.ev == "notify.new" {
                                     crate::sounds::notify(&ui, &e.payload);
@@ -975,9 +1049,14 @@ impl Ui {
                                     crate::pages::refresh_notes(&ui);
                                     continue;
                                 }
+                                // The Skills and Plugins pages switch every project, so they
+                                // need enablement changes for projects other than the current.
+                                let catalog = matches!(ui.page.borrow().as_str(), "skills" | "plugins")
+                                    && (e.ev.starts_with("skill.") || e.ev.starts_with("plugin."));
                                 if e.project_id.is_some_and(|id| id != ui.project.get())
                                     && !e.ev.starts_with("project.")
                                     && !e.ev.starts_with("session.")
+                                    && !catalog
                                     && !matches!(
                                         ui.page.borrow().as_str(),
                                         "dashboard" | "notifications"
@@ -998,13 +1077,13 @@ impl Ui {
                                         | "integration.changed"
                                         | "integration.result"
                                 ) {
-                                    ui.editor.invalidate(&ui);
+                                    ui.editor.invalidate_for(&ui, &e.ev, &e.payload);
                                 } else if e.ev == "layout.changed"
                                     && e.payload["action"] == "applied"
                                 {
                                     ui.apply_layout(&e.payload["state"]);
                                 } else if e.ev == "ui.toast" {
-                                    ui.show_error(text(&e.payload, "text"));
+                                    ui.show_info(text(&e.payload, "text"));
                                 } else if e.ev == "ui.changed" {
                                     ui.apply_ui_event(&e.payload);
                                 } else if e.ev == "settings.changed" {
@@ -1012,12 +1091,26 @@ impl Ui {
                                     if path.starts_with("keybindings") || path.is_empty() {
                                         ui.load_keybindings();
                                     }
-                                    if path.starts_with("appearance.")
-                                        || path == "terminal.font_size"
+                                    if path.starts_with("appearance")
+                                        || path.starts_with("terminal")
                                         || path.is_empty()
                                     {
-                                        ui.load_appearance();
+                                        ui.load_appearance(path);
                                     }
+                                    crate::tools::settings::external_change(
+                                        &ui,
+                                        path,
+                                        &e.payload["value"],
+                                    );
+                                    if *ui.page.borrow() == "plugins"
+                                        && (path.is_empty() || path == "mcp" || path.starts_with("mcp."))
+                                    {
+                                        ui.refresh_page();
+                                    }
+                                } else if *ui.page.borrow() == "plugins"
+                                    && !e.ev.starts_with("plugin.")
+                                {
+                                    // Nothing else changes what the Plugins page shows.
                                 } else {
                                     ui.refresh_page();
                                 }
@@ -1029,23 +1122,30 @@ impl Ui {
                                 ui.status.set_text(
                                     "Engine disconnected · sessions remain owned by the engine",
                                 );
-                                ui.show_error(&e.to_string());
+                                ui.show_error(&format!("Engine connection lost: {e} Reconnecting automatically…"));
+                                ui.schedule_reconnect();
                                 break;
                             }
                             _ => {}
                         }
                     }
                 }
-                Err(e) => ui.show_error(&format!(
-                    "{e}. Start relay serve for this instance, then reconnect."
-                )),
+                Err(e) => {
+                    if generation != ui.generation.get() {
+                        return;
+                    }
+                    ui.show_error(&format!(
+                        "{e}. Start relay serve for this instance; Relay keeps trying to reconnect."
+                    ));
+                    ui.schedule_reconnect();
+                }
             }
         });
     }
     pub fn dismiss_panels(&self) -> bool {
         let panels = self.panels.borrow().clone();
         if panels.iter().any(|panel| !panel.can_close()) {
-            self.show_error("Save or discard your changes before leaving this page.");
+            self.show_info("Save or discard your changes before leaving this page.");
             return false;
         }
         for panel in panels.iter().rev() {
@@ -1146,7 +1246,7 @@ impl Ui {
                     .any(|p| p["id"].as_i64() == Some(ui.project.get()))
                 {
                     if ui.editor.is_dirty() {
-                        ui.show_error("The selected project was removed. Save or copy your editor changes before selecting another project.");
+                        ui.show_info("The selected project was removed. Save or copy your editor changes before selecting another project.");
                         break;
                     }
                     ui.project.set(
@@ -1159,6 +1259,7 @@ impl Ui {
                     ui.editor.reset();
                     ui.editor.prepare_project(&ui);
                 }
+                // Structure only when the registry changed; live counts update in place.
                 ui.render_projects();
                 if !ui.setup_checked.replace(true) && ui.projects.borrow().is_empty() {
                     ui.open_repository();
@@ -1181,14 +1282,15 @@ impl Ui {
                             .cloned()
                             .collect();
                         *ui.sidebar_sessions.borrow_mut() = all;
-                        ui.render_projects();
+                        ui.update_project_live();
                         ui.reconcile();
                     }
                     Ok(_) => {}
                     Err(e) => ui.show_error(&e.to_string()),
                 }
                 ui.restore_layout(layout_revision).await;
-                crate::pages::refresh_notes(&ui);
+                // Notes follow notes.* events; this only covers its first load and a reconnect.
+                crate::pages::catch_up_notes(&ui);
                 if matches!(ui.page.borrow().as_str(), "board" | "dashboard") {
                     ui.refresh_page();
                 }
@@ -1238,7 +1340,8 @@ impl Ui {
                 self.panes.borrow_mut().insert(name.into(), pane);
             }
             let pane = self.panes.borrow().get(name).cloned().unwrap();
-            let signature = json!({"state":s["state"], "role":s["role"], "provider":s["provider"], "branch":s["branch"], "worktree":s["worktree"], "intent":s["intent"], "pair_with":s["pair_with"]});
+            // Everything the pane and its session menu show, including the menu's switches.
+            let signature = json!({"state":s["state"], "role":s["role"], "provider":s["provider"], "branch":s["branch"], "worktree":s["worktree"], "intent":s["intent"], "pair_with":s["pair_with"], "bus_writes":s["bus_writes"], "allow_ui":s["allow_ui"], "model":s["model"], "effort":s["effort"], "spawned_at":s["spawned_at"]});
             // Render signatures describe widgets, not just sessions. A recreated pane has
             // an empty header and visible slate even when the session itself is unchanged.
             if new_pane || self.rendered_sessions.borrow().get(name) != Some(&signature) {
@@ -1433,7 +1536,7 @@ impl Ui {
     }
     fn open_repository_in(self: &Rc<Self>, workspace: Option<Value>) {
         if self.editor.is_dirty() || !self.dismiss_panels() {
-            self.show_error("Save or discard your changes before adding a project.");
+            self.show_info("Save or discard your changes before adding a project.");
             return;
         }
         onboarding::open(self, workspace);

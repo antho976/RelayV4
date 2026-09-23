@@ -469,6 +469,45 @@ impl Editor {
         self.caption.set_text("Open a file");
     }
     pub fn invalidate(self: &Rc<Self>, ui: &Rc<Ui>) {
+        self.invalidate_for(ui, "", &Value::Null);
+    }
+    /// The root this editor shows: the selected worktree, or the project's primary checkout.
+    fn root(&self, ui: &Ui) -> String {
+        let worktree = self.worktree.borrow().clone();
+        if !worktree.is_empty() {
+            return worktree;
+        }
+        ui.projects
+            .borrow()
+            .iter()
+            .find(|p| p["id"].as_i64() == Some(ui.project.get()))
+            .map(|p| text(p, "path").to_string())
+            .unwrap_or_default()
+    }
+    /// `file.changed` names its worktree and, unless too many changed, the relative paths.
+    /// Other events (Git, worktrees, integrations) always refresh.
+    pub fn invalidate_for(self: &Rc<Self>, ui: &Rc<Ui>, event: &str, payload: &Value) {
+        let file_event = event == "file.changed";
+        let same = |a: &str, b: &str| a.trim_end_matches('/') == b.trim_end_matches('/');
+        if file_event {
+            if let Some(changed) = payload["worktree"].as_str() {
+                let root = self.root(ui);
+                // Skip only a worktree that is known and is not the one shown. An unknown
+                // spelling of a path refreshes, so a mismatch can never hide a real change.
+                let known = self.worktrees.borrow().iter().any(|w| same(text(w, "path"), changed))
+                    || ui.projects.borrow().iter().any(|p| same(text(p, "path"), changed));
+                if known && !root.is_empty() && !same(&root, changed) {
+                    return;
+                }
+            }
+        }
+        // `paths` absent means "anything may have changed".
+        let paths: Option<Vec<String>> = payload["paths"].as_array().map(|items| {
+            items.iter().filter_map(|p| p.as_str()).map(|p| p.trim_start_matches("./").to_string()).collect()
+        });
+        if file_event && paths.as_ref().is_some_and(|p| p.is_empty()) {
+            return;
+        }
         if matches!(ui.page.borrow().as_str(), "code" | "agents")
             && !self.invalidate_pending.replace(true)
         {
@@ -490,8 +529,18 @@ impl Editor {
                 }
             });
         }
-        if !self.path.borrow().is_empty() && !self.busy.get() && self.buffer.is_modified() {
-            ui.show_error("Files changed on disk. Save checks for conflicting edits; discard reloads the file.");
+        let open = self.path.borrow().clone();
+        let touches_open = match &paths {
+            Some(paths) => paths.contains(&open),
+            None => true,
+        };
+        if matches!(event, "" | "file.changed" | "git.changed")
+            && touches_open
+            && !open.is_empty()
+            && !self.busy.get()
+            && self.buffer.is_modified()
+        {
+            ui.show_info("Files changed on disk. Save checks for conflicting edits; discard reloads the file.");
         }
     }
     pub fn load_tree(self: &Rc<Self>, ui: &Rc<Ui>, directory: Option<String>) {
@@ -579,7 +628,7 @@ impl Editor {
     }
     fn read_file(self: &Rc<Self>, ui: &Rc<Ui>, path: String, discard: bool) {
         if self.busy.get() || (self.buffer.is_modified() && !discard) {
-            ui.show_error("Save or discard this file's changes before opening another file.");
+            ui.show_info("Save or discard this file's changes before opening another file.");
             return;
         }
         if image_preview::is_image(&path) {
@@ -610,7 +659,7 @@ impl Editor {
             match result {
                 Ok(v) => {
                     if v["truncated"] == true || v["text"].as_str().is_none() {
-                        ui.show_error("This file is binary or exceeds the 1 MiB editor limit. It was not opened for editing.");
+                        ui.show_info("This file is binary or exceeds the 1 MiB editor limit. It was not opened for editing.");
                         return;
                     }
                     e.diff.set(false);
@@ -715,6 +764,10 @@ impl Editor {
                     .child(&children)
                     .build();
                 row.add_css_class("code-folder");
+                if entry["generated"] == true {
+                    row.add_css_class("code-generated");
+                    row.set_tooltip_text(Some("Generated or build output"));
+                }
                 let heading = gtk::Box::new(gtk::Orientation::Horizontal, 4);
                 heading.append(&crate::icons::image("folder", 13));
                 heading.append(&label(&title, "code-file-name"));
@@ -765,6 +818,9 @@ impl Editor {
                 let row = button("", "file");
                 row.add_css_class("code-file");
                 row.set_tooltip_text(Some(&path));
+                if entry["generated"] == true {
+                    row.add_css_class("code-generated");
+                }
                 let content = gtk::Box::new(gtk::Orientation::Horizontal, 4);
                 content.append(&crate::icons::image(project_files::file_icon(&path), 13));
                 let name = label(text(&entry, "name"), "code-file-name");
@@ -801,7 +857,7 @@ impl Editor {
     /// Used by session file rails and task links. A dirty document always keeps its scope.
     pub fn open_path(self: &Rc<Self>, ui: &Rc<Ui>, path: String, worktree: Option<String>) {
         if self.is_dirty() {
-            ui.show_error("Save or discard your changes before opening another file or worktree.");
+            ui.show_info("Save or discard your changes before opening another file or worktree.");
             return;
         }
         if let Some(worktree) = worktree {
@@ -1030,7 +1086,7 @@ impl Editor {
     }
     fn file_action(self: &Rc<Self>, ui: &Rc<Ui>, op: &'static str) {
         if self.is_dirty() {
-            ui.show_error("Save or discard the current file before changing files.");
+            ui.show_info("Save or discard the current file before changing files.");
             return;
         }
         let path = if self.selected_path.borrow().is_empty() {
@@ -1039,7 +1095,7 @@ impl Editor {
             self.selected_path.borrow().clone()
         };
         if op != "file.create" && path.is_empty() {
-            ui.show_error("Select a file or folder first.");
+            ui.show_info("Select a file or folder first.");
             return;
         }
         let title = match op {
@@ -1108,7 +1164,7 @@ impl Editor {
             }
             let value = entry.text().trim().to_string();
             if op != "file.delete" && value.is_empty() {
-                ui.show_error("Enter a file name.");
+                ui.show_info("Enter a file name.");
                 return;
             }
             let extra = match op {
