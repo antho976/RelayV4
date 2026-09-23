@@ -30,14 +30,25 @@ const SKIP_DIRS: [&str; 7] = ["Binaries", "Intermediate", "Saved", "DerivedDataC
 const MAX_OUTPUT: usize = 60_000;
 /// Tools that act on the running editor. Each first checks the editor has this checkout's
 /// project open: an agent in a worktree would otherwise edit assets in a different copy.
-const LIVE: [&str; 16] = ["ue_python", "ue_call", "ue_property", "ue_search_assets", "ue_level_actors", "ue_console",
-    "ue_screenshot", "ue_anim_inspect", "ue_anim_preview", "ue_editor_lock", "ue_play", "ue_blueprint_info",
+/// `ue_editor_lock` is not one: the lock is a file, and it must be readable and releasable
+/// while the editor is down (after a crash, most of all).
+const LIVE: [&str; 15] = ["ue_python", "ue_call", "ue_property", "ue_search_assets", "ue_level_actors", "ue_console",
+    "ue_screenshot", "ue_anim_inspect", "ue_anim_preview", "ue_play", "ue_blueprint_info",
     "ue_asset_audit", "ue_asset_refs", "ue_data_table", "ue_profile"];
 /// Live tools that change editor state, and so need the editor lock.
 const MUTATING: [&str; 10] = ["ue_python", "ue_call", "ue_console", "ue_screenshot", "ue_anim_preview", "ue_property",
     "ue_play", "ue_profile", "ue_data_table", "ue_blueprint_info"];
 /// A lock nobody has used for this long is free to take.
 const LOCK_IDLE: Duration = Duration::from_secs(15 * 60);
+/// A lock-file guard older than this was left by a process that died inside the few
+/// microseconds it is held, and may be broken.
+const GUARD_STALE: Duration = Duration::from_secs(10);
+/// A tool result whose JSON is larger than this is written to a file; the reply carries the
+/// path and a preview. MCP clients cap what they put in context well below what a Data Table
+/// export or a folder of Blueprints can produce.
+const MAX_INLINE_RESULT: usize = 200_000;
+/// How much of a log `ue_log` reads back from its end at most, looking for enough lines.
+const MAX_LOG_SCAN: u64 = 64 << 20;
 /// Images one call may return; each is a full PNG in the agent's context.
 const MAX_IMAGES: usize = 16;
 
@@ -147,7 +158,8 @@ fn tools() -> Vec<Value> {
             "Run Python in the running editor (import unreal). Returns printed output, log lines and the result. Wrap asset or level changes in `with unreal.ScopedEditorTransaction(\"...\"):` and save what you change.",
             json!({
                 "code":{"type":"string","description":"Python source; multiple lines are fine"},
-                "timeout_s":{"type":"integer","minimum":5,"maximum":1800,"description":"Default 120"}
+                "timeout_s":{"type":"integer","minimum":5,"maximum":1800,"description":"Default 120"},
+                "transaction":{"type":"boolean","description":"Wrap the whole call in one undo transaction (default true); pass false for read-only queries so they stay out of the editor's undo history"}
             }), &["code"], false),
         tool("ue_call",
             "Call a UFUNCTION on an object through Remote Control (PUT /remote/object/call). Object paths look like /Game/Maps/Main.Main:PersistentLevel.Door_2 or, for static functions, /Script/Module.Default__Class.",
@@ -320,7 +332,7 @@ fn call(name: &str, args: &Value) -> Result<Value> {
         "ue_editor_status" => editor_status(),
         "ue_python" => {
             let code = args["code"].as_str().ok_or_else(|| anyhow!("code is required"))?;
-            python(code, secs(args, "timeout_s", 120))
+            python(code, secs(args, "timeout_s", 120), args["transaction"].as_bool().unwrap_or(true))
         }
         "ue_call" => {
             let mut body = json!({
@@ -345,15 +357,15 @@ fn call(name: &str, args: &Value) -> Result<Value> {
             }
             remote("PUT", "/remote/object/property", Some(&body), Duration::from_secs(30))
         }
-        "ue_search_assets" => python_json(&search_assets_script(args), Duration::from_secs(120)),
-        "ue_level_actors" => python_json(&level_actors_script(args), Duration::from_secs(60)),
+        "ue_search_assets" => python_json(&search_assets_script(args), Duration::from_secs(120), false),
+        "ue_level_actors" => python_json(&level_actors_script(args), Duration::from_secs(60), false),
         "ue_console" => {
             let command = required(args, "command")?;
             let code = format!(
                 "import unreal\nworld = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()\nunreal.SystemLibrary.execute_console_command(world, {})\nprint('ran', {})\n",
                 py_str(&command), py_str(&command)
             );
-            python(&code, Duration::from_secs(60))
+            python(&code, Duration::from_secs(60), true)
         }
         "ue_screenshot" => {
             let project = Project::find()?;
@@ -361,23 +373,24 @@ fn call(name: &str, args: &Value) -> Result<Value> {
             let mut script_args = args.clone();
             script_args["out_dir"] = json!(dir);
             script_args["prefix"] = json!("shot");
-            let result = python_json(&script(PY_CAPTURE, &script_args), Duration::from_secs(120));
+            let result = python_json(&script(PY_CAPTURE, &script_args), Duration::from_secs(120), true);
             with_images(result, &dir)
         }
-        "ue_anim_inspect" => python_json(&script(PY_ANIM_INSPECT, args), Duration::from_secs(300)),
+        "ue_anim_inspect" => python_json(&script(PY_ANIM_INSPECT, args), Duration::from_secs(300), false),
         "ue_anim_preview" => anim_preview(&Project::find()?, args),
         "ue_play" => play(&Project::find()?, args),
         "ue_blueprint_info" => {
             let project = Project::find()?;
             let start = log_len(&project);
-            let mut value = python_json(&script(PY_BLUEPRINT_INFO, args), Duration::from_secs(600))?;
+            let compile = args["compile"] == true;
+            let mut value = python_json(&script(PY_BLUEPRINT_INFO, args), Duration::from_secs(600), compile)?;
             if args["compile"] == true {
                 value["compiler_log"] = json!(log_since(&project, start, Some(r"LogBlueprint|Error|Warning")));
             }
             Ok(value)
         }
-        "ue_asset_audit" => python_json(&script(PY_ASSET_AUDIT, args), Duration::from_secs(1800)),
-        "ue_asset_refs" => python_json(&script(PY_ASSET_REFS, args), Duration::from_secs(120)),
+        "ue_asset_audit" => python_json(&script(PY_ASSET_AUDIT, args), Duration::from_secs(1800), false),
+        "ue_asset_refs" => python_json(&script(PY_ASSET_REFS, args), Duration::from_secs(120), false),
         "ue_data_table" => data_table(&Project::find()?, args),
         "ue_profile" => profile(&Project::find()?, args),
         "ue_run_tests" => run_tests(&Project::find()?, args),
@@ -395,19 +408,29 @@ fn call(name: &str, args: &Value) -> Result<Value> {
 
 /// Import an FBX into the editor's project and measure what arrived (used by the Blender
 /// plugin's `blender_to_unreal`). Same project guard and editor lock as every live tool.
-pub(crate) fn import_fbx(fbx: &Path, mut args: Value) -> Result<Value> {
-    let project = Project::find()?;
+/// `uproject` is the project the caller named (a `.uproject`, or a folder to search); without
+/// one, `UE_PROJECT` and then the usual search from the checkout decide.
+pub(crate) fn import_fbx(fbx: &Path, mut args: Value, uproject: Option<&Path>) -> Result<Value> {
+    let project = Project::find_from(uproject)?;
     guard_project(&project)?;
     acquire_lock(&project, &holder_id())?;
     args["fbx"] = json!(fbx);
     let start = log_len(&project);
-    match python_json(&script(PY_IMPORT_FBX, &args), Duration::from_secs(600)) {
+    match python_json(&script(PY_IMPORT_FBX, &args), Duration::from_secs(600), true) {
         Ok(mut value) => {
             value["import_log"] = json!(log_since(&project, start, Some(r"LogFbx|Interchange|Error|Warning")));
             Ok(value)
         }
         Err(error) => bail!("{error:#}\n{}", log_since(&project, start, Some(r"LogFbx|Interchange|Error|Warning")).join("\n")),
     }
+}
+
+/// The `.uproject` an import from another tool goes to: `explicit` (a `.uproject` or a folder
+/// to search), then `UE_PROJECT`, then the checkout. Checked before any slow export runs.
+pub(crate) fn project_file(explicit: Option<&Path>) -> Result<PathBuf> {
+    Project::find_from(explicit).map(|p| p.uproject).context(
+        "cannot find the Unreal project to import into. If it is in a different checkout from the Blender files, pass uproject (its .uproject or its folder) or set UE_PROJECT for the Blender plugin"
+    )
 }
 
 /// `ARGS_JSON` first, then the shared helpers, then the tool's own script.
@@ -442,7 +465,7 @@ fn editor_project() -> Result<PathBuf> {
             return Ok(path);
         }
     }
-    let result = python_json(&script(PY_PROJECT_CHECK, &json!({})), Duration::from_secs(20))?;
+    let result = python_json(&script(PY_PROJECT_CHECK, &json!({})), Duration::from_secs(20), false)?;
     let path = PathBuf::from(result["project"].as_str().ok_or_else(|| anyhow!("the editor reported no project"))?);
     *CACHE.lock().unwrap() = Some((std::time::Instant::now(), path.clone()));
     Ok(path)
@@ -478,37 +501,75 @@ fn read_lock(project: &Project) -> Value {
     lock
 }
 
-/// One agent drives the editor at a time. The lock is a file in the project's `Saved/`, which
-/// every agent sharing the checkout sees and git ignores.
-fn acquire_lock(project: &Project, me: &str) -> Result<()> {
-    let lock = read_lock(project);
-    if let Some(holder) = lock["holder"].as_str() {
-        if holder != me && lock["expired"] != true {
-            bail!(
-                "the editor is being driven by {holder} (idle {}s). Do offline work (C++, config, data files) or wait; the lock frees itself after {} idle minutes, or when {holder} runs ue_editor_lock with action=release.",
-                lock["idle_s"].as_u64().unwrap_or(0), LOCK_IDLE.as_secs() / 60
-            );
-        }
-    }
+/// Hold `<lock>.guard` across the read-decide-write of the lock file. The guard is created
+/// with `create_new` (O_EXCL), so of two agents deciding at the same moment one waits for the
+/// other and then sees its lock. It is held for microseconds; one older than `GUARD_STALE`
+/// was left by a process that died holding it and is broken.
+fn with_lock_file<T>(project: &Project, body: impl FnOnce(&Path) -> Result<T>) -> Result<T> {
     let path = lock_path(project);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let since = if lock["holder"].as_str() == Some(me) { lock["since"].as_u64().unwrap_or(now_secs()) } else { now_secs() };
-    std::fs::write(&path, json!({"holder": me, "since": since, "last_used": now_secs()}).to_string())?;
+    let guard = path.with_extension("json.guard");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&guard) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let age = std::fs::metadata(&guard).and_then(|m| m.modified()).ok().and_then(|m| m.elapsed().ok());
+                if age.is_some_and(|age| age > GUARD_STALE) {
+                    let _ = std::fs::remove_file(&guard);
+                    continue;
+                }
+                anyhow::ensure!(std::time::Instant::now() < deadline, "{} has been held for 5 s; if no agent is using the editor, delete it", guard.display());
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(error) => return Err(error).with_context(|| format!("creating {}", guard.display())),
+        }
+    }
+    let result = body(&path);
+    let _ = std::fs::remove_file(&guard);
+    result
+}
+
+/// Replace the lock file in one step, so a reader never sees half of it.
+fn write_lock(path: &Path, lock: &Value) -> Result<()> {
+    let temp = path.with_extension(format!("json.{}", uuid::Uuid::new_v4().simple()));
+    std::fs::write(&temp, lock.to_string())?;
+    if let Err(error) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error.into());
+    }
     Ok(())
 }
 
-fn release_lock(project: &Project, me: &str) -> Result<()> {
-    let lock = read_lock(project);
-    match lock["holder"].as_str() {
-        Some(holder) if holder != me && lock["expired"] != true => bail!("the lock belongs to {holder}, not to you"),
-        Some(_) => {
-            std::fs::remove_file(lock_path(project))?;
-            Ok(())
+/// One agent drives the editor at a time. The lock is a file in the project's `Saved/`, which
+/// every agent sharing the checkout sees and git ignores.
+fn acquire_lock(project: &Project, me: &str) -> Result<()> {
+    with_lock_file(project, |path| {
+        let lock = read_lock(project);
+        if let Some(holder) = lock["holder"].as_str() {
+            if holder != me && lock["expired"] != true {
+                bail!(
+                    "the editor is being driven by {holder} (idle {}s). Do offline work (C++, config, data files) or wait; the lock frees itself after {} idle minutes, or when {holder} runs ue_editor_lock with action=release.",
+                    lock["idle_s"].as_u64().unwrap_or(0), LOCK_IDLE.as_secs() / 60
+                );
+            }
         }
-        None => Ok(()),
-    }
+        let since = if lock["holder"].as_str() == Some(me) { lock["since"].as_u64().unwrap_or(now_secs()) } else { now_secs() };
+        write_lock(path, &json!({"holder": me, "since": since, "last_used": now_secs()}))
+    })
+}
+
+fn release_lock(project: &Project, me: &str) -> Result<()> {
+    with_lock_file(project, |path| {
+        let lock = read_lock(project);
+        match lock["holder"].as_str() {
+            Some(holder) if holder != me && lock["expired"] != true => bail!("the lock belongs to {holder}, not to you"),
+            Some(_) => Ok(std::fs::remove_file(path)?),
+            None => Ok(()),
+        }
+    })
 }
 
 // ---------------------------------------------------------------- playing, testing, measuring
@@ -517,20 +578,59 @@ fn log_len(project: &Project) -> u64 {
     std::fs::metadata(project.log_path()).map(|m| m.len()).unwrap_or(0)
 }
 
-/// Log lines written since byte offset `start`, optionally filtered, last 300 kept.
+/// Log lines written since byte offset `start`, optionally filtered, last 300 kept. Reads only
+/// the bytes after `start`; editor logs reach hundreds of MB.
 fn log_since(project: &Project, start: u64, filter: Option<&str>) -> Vec<String> {
-    let Ok(bytes) = std::fs::read(project.log_path()) else { return Vec::new() };
-    let start = (start as usize).min(bytes.len());
-    let text = String::from_utf8_lossy(&bytes[start..]);
     let re = filter.and_then(|f| regex::Regex::new(f).ok());
-    let lines: Vec<String> = text.lines().filter(|l| re.as_ref().is_none_or(|re| re.is_match(l))).map(str::to_string).collect();
+    let mut cursor = LogCursor { path: project.log_path(), offset: start, partial: Vec::new() };
+    let mut lines = cursor.read_new(re.as_ref());
+    lines.extend(cursor.rest().filter(|l| re.as_ref().is_none_or(|re| re.is_match(l))));
     lines[lines.len().saturating_sub(300)..].to_vec()
+}
+
+/// Follows a log file: each read returns only the complete lines appended since the last one.
+/// A file shorter than the offset was rotated or truncated (the editor restarted), and is
+/// read again from its start.
+struct LogCursor {
+    path: PathBuf,
+    offset: u64,
+    /// The unterminated last line of the previous read.
+    partial: Vec<u8>,
+}
+
+impl LogCursor {
+    fn read_new(&mut self, filter: Option<&regex::Regex>) -> Vec<String> {
+        use std::io::{Seek, SeekFrom};
+        let Ok(mut file) = std::fs::File::open(&self.path) else { return Vec::new() };
+        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        if len < self.offset {
+            self.offset = 0;
+            self.partial.clear();
+        }
+        let mut bytes = std::mem::take(&mut self.partial);
+        let before = bytes.len();
+        if file.seek(SeekFrom::Start(self.offset)).is_err() || file.read_to_end(&mut bytes).is_err() {
+            bytes.truncate(before);
+            self.partial = bytes;
+            return Vec::new();
+        }
+        self.offset += (bytes.len() - before) as u64;
+        let complete = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+        self.partial = bytes.split_off(complete);
+        String::from_utf8_lossy(&bytes).lines().filter(|l| filter.is_none_or(|re| re.is_match(l))).map(str::to_string).collect()
+    }
+
+    /// The unterminated line held back so far, for a final read.
+    fn rest(&mut self) -> Option<String> {
+        let rest = std::mem::take(&mut self.partial);
+        (!rest.is_empty()).then(|| String::from_utf8_lossy(&rest).trim_end().to_string())
+    }
 }
 
 fn play_step(action: &str, extra: Value) -> Result<Value> {
     let mut args = extra;
     args["action"] = json!(action);
-    python_json(&script(PY_PLAY, &args), Duration::from_secs(60))
+    python_json(&script(PY_PLAY, &args), Duration::from_secs(60), action != "status")
 }
 
 fn wait_for_play(on: bool) -> Result<()> {
@@ -589,7 +689,7 @@ fn play(project: &Project, args: &Value) -> Result<Value> {
                 play_step("shot", json!({"width": args["width"].as_u64().unwrap_or(1280), "height": args["height"].as_u64().unwrap_or(720)}))?;
             }
             if let Some(code) = args["probe"].as_str() {
-                let out = python(&format!("ARGS_JSON = {}\n{PY_COMMON}\nworld = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_game_world()\n{code}", py_str("{}")), Duration::from_secs(60));
+                let out = python(&format!("ARGS_JSON = {}\n{PY_COMMON}\nworld = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_game_world()\n{code}", py_str("{}")), Duration::from_secs(60), true);
                 probes.push(match out {
                     Ok(v) => json!({"at": at, "output": v["output"]}),
                     Err(e) => json!({"at": at, "error": format!("{e:#}")}),
@@ -646,7 +746,7 @@ fn data_table(project: &Project, args: &Value) -> Result<Value> {
     }).transpose()?;
     match args["action"].as_str() {
         Some("export") => {
-            let mut value = python_json(&script(PY_DATA_TABLE, &json!({"action":"export","path":args["path"],"format":format})), Duration::from_secs(120))?;
+            let mut value = python_json(&script(PY_DATA_TABLE, &json!({"action":"export","path":args["path"],"format":format})), Duration::from_secs(120), false)?;
             if let Some(file) = &file {
                 if let Some(parent) = file.parent() { std::fs::create_dir_all(parent)?; }
                 std::fs::write(file, value["text"].as_str().unwrap_or(""))?;
@@ -658,7 +758,7 @@ fn data_table(project: &Project, args: &Value) -> Result<Value> {
             let file = file.ok_or_else(|| anyhow!("import needs file"))?;
             let text = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
             let start = log_len(project);
-            let result = python_json(&script(PY_DATA_TABLE, &json!({"action":"import","path":args["path"],"format":format,"text":text})), Duration::from_secs(120));
+            let result = python_json(&script(PY_DATA_TABLE, &json!({"action":"import","path":args["path"],"format":format,"text":text})), Duration::from_secs(120), true);
             match result {
                 Ok(v) => Ok(v),
                 Err(e) => bail!("{e:#}\n{}", log_since(project, start, Some("LogDataTable|Error|Warning")).join("\n")),
@@ -761,11 +861,14 @@ fn run_tests(project: &Project, args: &Value) -> Result<Value> {
     if args["in_editor"] == true {
         guard_project(project)?;
         acquire_lock(project, &holder_id())?;
-        let start = log_len(project);
+        let mut cursor = LogCursor { path: project.log_path(), offset: log_len(project), partial: Vec::new() };
         play_step("console", json!({"commands": [format!("Automation RunTests {filter}")]}))?;
         let deadline = std::time::Instant::now() + secs(args, "timeout_s", 1800);
+        let automation = regex::Regex::new("LogAutomation").unwrap();
+        let mut lines = Vec::new();
         loop {
-            let lines = log_since(project, start, Some("LogAutomation"));
+            // Only what the editor appended since the last second's read.
+            lines.extend(cursor.read_new(Some(&automation)));
             if lines.iter().any(|l| l.contains("Automation Test Queue Empty") || l.contains("No automation tests matched")) {
                 return Ok(test_lines(&lines));
             }
@@ -897,7 +1000,7 @@ fn anim_preview(project: &Project, args: &Value) -> Result<Value> {
                 target.insert(k.clone(), v.clone());
             }
         }
-        python_json(&script(PY_ANIM_PREVIEW, &a), Duration::from_secs(120))
+        python_json(&script(PY_ANIM_PREVIEW, &a), Duration::from_secs(120), action != "check")
     };
     let outcome = (|| -> Result<Value> {
         let setup = run("setup", json!({}))?;
@@ -925,7 +1028,7 @@ fn anim_preview(project: &Project, args: &Value) -> Result<Value> {
                 "height": args.get("height").cloned().unwrap_or(json!(480)),
                 "out_dir": dir, "prefix": format!("t{i}_{t:.3}s"),
             });
-            let shot = python_json(&script(PY_CAPTURE, &capture_args), Duration::from_secs(120))?;
+            let shot = python_json(&script(PY_CAPTURE, &capture_args), Duration::from_secs(120), true)?;
             files.extend(shot["files"].as_array().cloned().unwrap_or_default());
         }
         let stale = poses.iter().any(|p| p["pose_applied"] == false);
@@ -967,8 +1070,19 @@ struct Project {
 
 impl Project {
     fn find() -> Result<Project> {
-        let uproject = match std::env::var_os("UE_PROJECT") {
-            Some(path) => PathBuf::from(path),
+        Project::find_from(None)
+    }
+
+    /// `explicit` (a `.uproject`, or a folder to search) first, then `UE_PROJECT`, then a
+    /// search from the checkout.
+    fn find_from(explicit: Option<&Path>) -> Result<Project> {
+        let explicit = match explicit {
+            Some(path) if path.is_dir() => Some(find_uproject(path).ok_or_else(|| anyhow!("no .uproject within three folders of {}", path.display()))?),
+            Some(path) => Some(path.to_path_buf()),
+            None => None,
+        };
+        let uproject = match explicit.or_else(|| std::env::var_os("UE_PROJECT").map(PathBuf::from)) {
+            Some(path) => path,
             None => {
                 let start = std::env::var_os("RELAY_WORKTREE").map(PathBuf::from)
                     .filter(|p| p.is_dir())
@@ -1184,7 +1298,7 @@ fn setup_check(project: &Project, fix: bool) -> Result<Value> {
     }
     let editor = remote("GET", "/remote/info", None, Duration::from_secs(3));
     let python_ok = match &editor {
-        Ok(_) => python("print('relay-python-ok')", Duration::from_secs(20))
+        Ok(_) => python("print('relay-python-ok')", Duration::from_secs(20), false)
             .map(|v| v.to_string().contains("relay-python-ok"))
             .map_err(|e| e.to_string()),
         Err(_) => Err("editor not reachable".into()),
@@ -1281,20 +1395,53 @@ fn log(project: &Project, args: &Value) -> Result<Value> {
         }
         None => project.log_path(),
     };
-    let bytes = std::fs::read(&path).with_context(|| format!("reading {} — has the editor or game run yet?", path.display()))?;
-    let text = String::from_utf8_lossy(&bytes);
     let lines = args["lines"].as_u64().unwrap_or(200).clamp(1, 5000) as usize;
     let filter = match args["filter"].as_str().filter(|f| !f.is_empty()) {
         Some(pattern) => Some(regex::Regex::new(pattern).with_context(|| format!("bad filter regex {pattern:?}"))?),
         None => None,
     };
-    let kept: Vec<&str> = text.lines().filter(|line| filter.as_ref().is_none_or(|re| re.is_match(line))).collect();
-    let total = kept.len();
+    let scan = tail_lines(&path, lines, filter.as_ref(), MAX_LOG_SCAN)
+        .with_context(|| format!("reading {} — has the editor or game run yet?", path.display()))?;
     Ok(json!({
         "file": path,
-        "matching_lines": total,
-        "lines": tail(&kept.join("\n"), lines),
+        "matching_lines": scan.matching,
+        "whole_file_scanned": scan.from == 0,
+        "scanned_from_byte": scan.from,
+        "file_bytes": scan.len,
+        "lines": tail(&scan.kept.join("\n"), lines),
     }))
+}
+
+struct LogTail {
+    /// Matching lines in the part of the file that was read.
+    kept: Vec<String>,
+    matching: usize,
+    from: u64,
+    len: u64,
+}
+
+/// The last `want` lines matching `filter`, reading back from the end of the file in growing
+/// windows (1 MB, then 4x) instead of reading all of it, and never more than `max_scan` bytes.
+fn tail_lines(path: &Path, want: usize, filter: Option<&regex::Regex>, max_scan: u64) -> Result<LogTail> {
+    use std::io::{Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let mut window: u64 = 1 << 20;
+    loop {
+        let from = len.saturating_sub(window.min(max_scan));
+        file.seek(SeekFrom::Start(from))?;
+        let mut bytes = Vec::with_capacity((len - from) as usize);
+        (&mut file).take(len - from).read_to_end(&mut bytes)?;
+        // A window that starts mid-file starts mid-line: drop that fragment.
+        let start = if from == 0 { 0 } else { bytes.iter().position(|b| *b == b'\n').map_or(bytes.len(), |i| i + 1) };
+        let text = String::from_utf8_lossy(&bytes[start..]);
+        let kept: Vec<String> = text.lines().filter(|l| filter.is_none_or(|re| re.is_match(l))).map(str::to_string).collect();
+        if kept.len() >= want || from == 0 || window >= max_scan {
+            let matching = kept.len();
+            return Ok(LogTail { kept: kept[kept.len().saturating_sub(want)..].to_vec(), matching, from: from + start as u64, len });
+        }
+        window = window.saturating_mul(4);
+    }
 }
 
 // ---------------------------------------------------------------- the running editor
@@ -1328,15 +1475,17 @@ fn editor_status() -> Result<Value> {
 }
 
 /// Run editor Python through `ExecutePythonCommandEx`, which returns the command's log output
-/// alongside its result instead of only a success flag.
-fn python(code: &str, timeout: Duration) -> Result<Value> {
+/// alongside its result instead of only a success flag. `transaction` wraps the call in an
+/// undo transaction; read-only queries pass false so they stay out of the undo history.
+/// Returns the whole output, untrimmed, and the command result.
+fn python_raw(code: &str, timeout: Duration, transaction: bool) -> Result<(String, Value)> {
     let body = json!({
         "objectPath": PYTHON_LIBRARY,
         "functionName": "ExecutePythonCommandEx",
         "parameters": {"PythonCommand": code, "ExecutionMode": "ExecuteFile", "FileExecutionScope": "Private"},
-        "generateTransaction": true,
+        "generateTransaction": transaction,
     });
-    let response = remote("PUT", "/remote/object/call", Some(&body), timeout)?;
+    let mut response = remote("PUT", "/remote/object/call", Some(&body), timeout)?;
     let output: Vec<String> = response["LogOutput"]
         .as_array()
         .map(|entries| entries.iter().map(|e| {
@@ -1345,28 +1494,46 @@ fn python(code: &str, timeout: Duration) -> Result<Value> {
             if kind == "Info" { text.to_string() } else { format!("[{kind}] {text}") }
         }).collect())
         .unwrap_or_default();
-    let ok = response["ReturnValue"].as_bool().unwrap_or(false);
-    let result = json!({
-        "ok": ok,
-        "output": tail(&output.join("\n"), 2000),
-        "result": response["CommandResult"],
-    });
-    if !ok {
-        bail!("Python failed:\n{}", serde_json::to_string_pretty(&result)?);
+    let output = output.join("\n");
+    if response["ReturnValue"].as_bool() != Some(true) {
+        let shown = json!({"ok": false, "output": shown_output(&output), "result": response["CommandResult"]});
+        bail!("Python failed:\n{}", serde_json::to_string_pretty(&shown)?);
     }
-    Ok(result)
+    Ok((output, response["CommandResult"].take()))
+}
+
+fn python(code: &str, timeout: Duration, transaction: bool) -> Result<Value> {
+    let (output, result) = python_raw(code, timeout, transaction)?;
+    Ok(json!({"ok": true, "output": shown_output(&output), "result": result}))
+}
+
+/// What an agent is shown of editor output: the last 2000 lines within `MAX_OUTPUT` bytes,
+/// with any long `RELAY_JSON:` result line reduced to its size (the result is returned
+/// parsed, and one such line alone can exceed the whole budget).
+fn shown_output(output: &str) -> String {
+    let lines: Vec<std::borrow::Cow<str>> = output.lines().map(|line| match line.trim().strip_prefix("RELAY_JSON:") {
+        Some(json) if json.len() > 2000 => format!("RELAY_JSON:<{} bytes>", json.len()).into(),
+        _ => line.into(),
+    }).collect();
+    tail(&lines.join("\n"), 2000)
 }
 
 /// Run a script that prints one line `RELAY_JSON:<json>` and return that JSON.
-fn python_json(code: &str, timeout: Duration) -> Result<Value> {
-    let result = python(code, timeout)?;
-    let output = result["output"].as_str().unwrap_or("");
+fn python_json(code: &str, timeout: Duration, transaction: bool) -> Result<Value> {
+    let (output, _) = python_raw(code, timeout, transaction)?;
+    relay_json(&output)
+}
+
+/// The last `RELAY_JSON:` line of the full, untrimmed output. It is searched before anything
+/// is cut to size: a Data Table export or an audit of a large folder prints one line of
+/// hundreds of KB, and trimming first would cut off its prefix.
+fn relay_json(output: &str) -> Result<Value> {
     let line = output
         .lines()
         .rev()
         .find_map(|line| line.trim().strip_prefix("RELAY_JSON:"))
-        .ok_or_else(|| anyhow!("the editor script printed no result:\n{output}"))?;
-    Ok(serde_json::from_str(line)?)
+        .ok_or_else(|| anyhow!("the editor script printed no result:\n{}", shown_output(output)))?;
+    serde_json::from_str(line).with_context(|| format!("the editor script's result ({} bytes) is not valid JSON", line.len()))
 }
 
 fn search_assets_script(args: &Value) -> String {
@@ -1460,8 +1627,7 @@ fn remote_at(base: &str, method: &str, path: &str, body: Option<&Value>, timeout
     request.push_str("\r\n");
     stream.write_all(request.as_bytes())?;
     stream.write_all(&payload)?;
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).context("reading the editor's reply (a long editor operation may need a larger timeout)")?;
+    let raw = read_response(&mut stream).context("reading the editor's reply (a long editor operation may need a larger timeout)")?;
     let (status, body) = parse_response(&raw)?;
     let text = String::from_utf8_lossy(&body).into_owned();
     let value: Value = if text.trim().is_empty() { json!({}) } else { serde_json::from_str(&text).unwrap_or(json!({"body": text})) };
@@ -1469,6 +1635,70 @@ fn remote_at(base: &str, method: &str, path: &str, body: Option<&Value>, timeout
         bail!("Remote Control answered HTTP {status}: {}", serde_json::to_string(&value)?);
     }
     Ok(value)
+}
+
+/// Read one HTTP reply and stop when it is complete: at `Content-Length` bytes of body, at the
+/// last chunk of a chunked body, or else at end of stream. A server that keeps the connection
+/// open despite `Connection: close` would otherwise hold every call until the read timeout.
+fn read_response(stream: &mut impl Read) -> Result<Vec<u8>> {
+    let mut raw = Vec::new();
+    let mut buffer = vec![0u8; 64 * 1024];
+    let mut expected: Option<Option<usize>> = None; // None: head not yet read; Some(None): no length
+    let mut chunked = false;
+    loop {
+        if expected.is_none() {
+            if let Some(split) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&raw[..split]).to_ascii_lowercase();
+                chunked = head.lines().any(|l| l.starts_with("transfer-encoding:") && l.contains("chunked"));
+                let length = head.lines().find_map(|l| l.strip_prefix("content-length:")).and_then(|v| v.trim().parse::<usize>().ok());
+                let status = head.lines().next().and_then(|l| l.split_whitespace().nth(1)).and_then(|c| c.parse::<u16>().ok());
+                // No body: 1xx, 204 and 304 replies.
+                let bodiless = status.is_some_and(|s| (100..200).contains(&s) || s == 204 || s == 304);
+                expected = Some(if chunked { None } else if bodiless { Some(split + 4) } else { length.map(|n| split + 4 + n) });
+            }
+        }
+        match expected {
+            Some(Some(total)) if raw.len() >= total => {
+                raw.truncate(total);
+                return Ok(raw);
+            }
+            Some(None) if chunked => {
+                let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(0);
+                if chunked_complete(&raw[split + 4..]) {
+                    return Ok(raw);
+                }
+            }
+            _ => {}
+        }
+        let n = match stream.read(&mut buffer) {
+            Ok(n) => n,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if n == 0 {
+            return Ok(raw);
+        }
+        raw.extend_from_slice(&buffer[..n]);
+    }
+}
+
+/// Whether a chunked body has reached its terminating zero-size chunk and the blank line
+/// after its (optional) trailers.
+fn chunked_complete(mut raw: &[u8]) -> bool {
+    loop {
+        let Some(end) = raw.windows(2).position(|w| w == b"\r\n") else { return false };
+        let size_text = String::from_utf8_lossy(&raw[..end]);
+        let Ok(size) = usize::from_str_radix(size_text.split(';').next().unwrap_or("").trim(), 16) else { return false };
+        raw = &raw[end + 2..];
+        if size == 0 {
+            // Trailers, if any, end with an empty line.
+            return raw.starts_with(b"\r\n") || raw.windows(4).any(|w| w == b"\r\n\r\n");
+        }
+        if raw.len() < size + 2 {
+            return false;
+        }
+        raw = &raw[size + 2..];
+    }
 }
 
 fn parse_response(raw: &[u8]) -> Result<(u16, Vec<u8>)> {
@@ -1527,13 +1757,65 @@ pub(crate) fn tool_result(mut value: Value, is_error: bool) -> Value {
     if let Some(dir) = cleanup.as_ref().and_then(Value::as_str) {
         let _ = std::fs::remove_dir_all(dir);
     }
-    let text = serde_json::to_string_pretty(&value).unwrap_or_default();
+    let mut text = serde_json::to_string_pretty(&value).unwrap_or_default();
+    if text.len() > MAX_INLINE_RESULT {
+        if let Ok(summary) = spill_result(&value, &text) {
+            value = summary;
+            text = serde_json::to_string_pretty(&value).unwrap_or_default();
+        }
+    }
     content.insert(0, json!({"type":"text","text":text}));
     let mut result = json!({"content":content,"isError":is_error});
     if !is_error {
         result["structuredContent"] = value;
     }
     result
+}
+
+/// Where results too large to return inline are written: the checkout's `.relay/` (which
+/// Relay keeps out of git) when running under Relay, the system temp folder otherwise.
+fn results_dir() -> PathBuf {
+    match std::env::var_os("RELAY_WORKTREE").map(PathBuf::from).filter(|p| p.is_dir()) {
+        Some(worktree) => worktree.join(".relay/tool-results"),
+        None => std::env::temp_dir().join("relay-tool-results"),
+    }
+}
+
+/// Write a large result to a file and return what the agent sees instead: the path, the size,
+/// the top-level shape and the start of the JSON. Files older than a day are removed.
+fn spill_result(value: &Value, text: &str) -> Result<Value> {
+    let dir = results_dir();
+    std::fs::create_dir_all(&dir)?;
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let old = entry.metadata().and_then(|m| m.modified()).ok().and_then(|m| m.elapsed().ok());
+            if old.is_some_and(|age| age > Duration::from_secs(24 * 3600)) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    let file = dir.join(format!("{}.json", uuid::Uuid::new_v4()));
+    std::fs::write(&file, text)?;
+    let shape: Map<String, Value> = value.as_object().map(|o| o.iter().map(|(k, v)| {
+        let described = match v {
+            Value::Array(a) => json!(format!("array of {}", a.len())),
+            Value::Object(o) => json!(format!("object with {} keys", o.len())),
+            Value::String(s) if s.len() > 200 => json!(format!("string of {} bytes", s.len())),
+            other => other.clone(),
+        };
+        (k.clone(), described)
+    }).collect()).unwrap_or_default();
+    let mut cut = 20_000.min(text.len());
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    Ok(json!({
+        "result_file": file,
+        "result_bytes": text.len(),
+        "note": format!("The result is {} KB, too large to return inline; the full JSON is in result_file. Read or search that file (e.g. with jq) for what you need.", text.len() / 1024),
+        "shape": shape,
+        "preview": &text[..cut],
+    }))
 }
 
 pub(crate) fn rpc_error(id: Value, code: i64, message: &str, data: Option<Value>) -> Value {
@@ -1675,6 +1957,185 @@ mod tests {
         assert_eq!(read_lock(&project)["expired"], true);
         acquire_lock(&project, "calm-otter").unwrap();
         assert_eq!(read_lock(&project)["holder"], "calm-otter");
+    }
+
+    #[test]
+    fn concurrent_acquirers_never_both_hold_the_lock() {
+        for round in 0..20 {
+            let root = tempfile::tempdir().unwrap();
+            let project = std::sync::Arc::new(bare_project(root.path()));
+            if round % 2 == 1 {
+                // Half the rounds race to take over an abandoned lock rather than a free one.
+                std::fs::create_dir_all(lock_path(&project).parent().unwrap()).unwrap();
+                std::fs::write(lock_path(&project), json!({"holder":"gone","since":1,"last_used":1}).to_string()).unwrap();
+            }
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+            let winners: Vec<String> = (0..8).map(|i| {
+                let (project, barrier) = (project.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    let me = format!("agent-{i}");
+                    barrier.wait();
+                    acquire_lock(&project, &me).ok().map(|_| me)
+                })
+            }).collect::<Vec<_>>().into_iter().filter_map(|t| t.join().unwrap()).collect();
+            assert_eq!(winners.len(), 1, "round {round}: {winners:?}");
+            assert_eq!(read_lock(&project)["holder"], winners[0].as_str());
+            assert!(!lock_path(&project).with_extension("json.guard").exists(), "guard left behind");
+        }
+    }
+
+    #[test]
+    fn a_guard_left_by_a_dead_process_is_broken() {
+        let root = tempfile::tempdir().unwrap();
+        let project = bare_project(root.path());
+        let guard = lock_path(&project).with_extension("json.guard");
+        std::fs::create_dir_all(guard.parent().unwrap()).unwrap();
+        let file = std::fs::File::create(&guard).unwrap();
+        file.set_modified(std::time::SystemTime::now() - Duration::from_secs(60)).unwrap();
+        acquire_lock(&project, "calm-otter").unwrap();
+        assert_eq!(read_lock(&project)["holder"], "calm-otter");
+    }
+
+    #[test]
+    fn the_lock_tool_works_with_no_editor() {
+        assert!(!LIVE.contains(&"ue_editor_lock"));
+        let root = tempfile::tempdir().unwrap();
+        project(root.path(), "Game", json!({}));
+        let project = bare_project(root.path());
+        acquire_lock(&project, &holder_id()).unwrap();
+        // SAFETY: only this test sets UE_PROJECT.
+        unsafe { std::env::set_var("UE_PROJECT", root.path().join("Game.uproject")) };
+        let status = call("ue_editor_lock", &json!({})).unwrap();
+        assert_eq!(status["lock"]["holder"], holder_id());
+        let released = call("ue_editor_lock", &json!({"action":"release"})).unwrap();
+        unsafe { std::env::remove_var("UE_PROJECT") };
+        assert_eq!(released["lock"], Value::Null);
+    }
+
+    #[test]
+    fn an_import_can_name_a_project_in_another_checkout() {
+        let game = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(game.path().join("Game")).unwrap();
+        project(&game.path().join("Game"), "Shooter", json!({}));
+        let wanted = game.path().join("Game/Shooter.uproject");
+        assert_eq!(project_file(Some(game.path())).unwrap(), wanted, "a folder is searched");
+        assert_eq!(project_file(Some(&wanted)).unwrap(), wanted);
+        let art = tempfile::tempdir().unwrap();
+        let error = format!("{:#}", project_file(Some(art.path())).unwrap_err());
+        assert!(error.contains("pass uproject") && error.contains("UE_PROJECT"), "{error}");
+    }
+
+    #[test]
+    fn a_long_result_line_is_found_in_the_untrimmed_output() {
+        let rows: Vec<Value> = (0..2000).map(|i| json!({"row": i, "text": "x".repeat(40)})).collect();
+        let result = json!({"rows": rows});
+        let line = format!("RELAY_JSON:{result}");
+        assert!(line.len() > 100_000);
+        let before: Vec<String> = (0..500).map(|i| format!("LogPython: loading {i}")).collect();
+        let output = format!("{}\n{line}\n[Warning] LogPython: after the result\nLogTemp: done", before.join("\n"));
+        assert!(output.len() > MAX_OUTPUT);
+        assert_eq!(relay_json(&output).unwrap(), result);
+        // What is shown stays within budget and does not repeat the result.
+        let shown = shown_output(&output);
+        assert!(shown.len() <= MAX_OUTPUT);
+        assert!(shown.contains(&format!("RELAY_JSON:<{} bytes>", line.len() - "RELAY_JSON:".len())), "{}", &shown[shown.len() - 200..]);
+        assert!(shown.ends_with("LogTemp: done"));
+        // The last result wins; a missing one is an error that shows the output.
+        assert_eq!(relay_json("RELAY_JSON:{\"a\":1}\nRELAY_JSON:{\"a\":2}").unwrap(), json!({"a":2}));
+        let missing = relay_json("Traceback: boom").unwrap_err().to_string();
+        assert!(missing.contains("printed no result") && missing.contains("boom"), "{missing}");
+    }
+
+    #[test]
+    fn oversized_results_are_written_to_a_file_with_a_preview() {
+        let big = json!({"text": "row,value\n".repeat(40_000), "rows": 40_000});
+        let result = tool_result(big.clone(), false);
+        let summary = &result["structuredContent"];
+        let file = summary["result_file"].as_str().expect("spilled to a file");
+        let written: Value = serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap();
+        assert_eq!(written, big);
+        assert_eq!(summary["shape"]["rows"], 40_000);
+        assert_eq!(summary["shape"]["text"], "string of 400000 bytes");
+        assert!(result["content"][0]["text"].as_str().unwrap().len() < 60_000);
+        let _ = std::fs::remove_file(file);
+        let small = tool_result(json!({"ok": true}), false);
+        assert_eq!(small["structuredContent"], json!({"ok": true}));
+    }
+
+    #[test]
+    fn log_cursor_reads_only_what_was_appended_and_survives_rotation() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("Game.log");
+        std::fs::write(&path, "LogInit: old line\n").unwrap();
+        let mut cursor = LogCursor { path: path.clone(), offset: std::fs::metadata(&path).unwrap().len(), partial: Vec::new() };
+        assert!(cursor.read_new(None).is_empty());
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"LogAutomation: one\nLogOther: skip\nLogAutomation: tw").unwrap();
+        let re = regex::Regex::new("LogAutomation").unwrap();
+        assert_eq!(cursor.read_new(Some(&re)), vec!["LogAutomation: one"], "a half-written line waits");
+        file.write_all(b"o\n").unwrap();
+        assert_eq!(cursor.read_new(Some(&re)), vec!["LogAutomation: two"]);
+        // The editor restarted and began a new, shorter log.
+        std::fs::write(&path, "LogAutomation: fresh\n").unwrap();
+        assert_eq!(cursor.read_new(Some(&re)), vec!["LogAutomation: fresh"]);
+
+        let project = bare_project(root.path());
+        std::fs::create_dir_all(root.path().join("Saved/Logs")).unwrap();
+        std::fs::write(project.log_path(), "before\nLogBlueprint: a\nLogBlueprint: b").unwrap();
+        assert_eq!(log_since(&project, 7, Some("LogBlueprint")), vec!["LogBlueprint: a", "LogBlueprint: b"]);
+        assert_eq!(log_since(&project, 10_000, None), vec!["before", "LogBlueprint: a", "LogBlueprint: b"], "a shorter file was rotated");
+    }
+
+    #[test]
+    fn log_tail_reads_back_from_the_end() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("Game.log");
+        let mut text = String::new();
+        for i in 0..100_000 {
+            text.push_str(&format!("{} line {i}\n", if i % 1000 == 0 { "LogRare:" } else { "LogTemp:" }));
+        }
+        std::fs::write(&path, &text).unwrap();
+        let last = tail_lines(&path, 3, None, MAX_LOG_SCAN).unwrap();
+        assert_eq!(last.kept, vec!["LogTemp: line 99997", "LogTemp: line 99998", "LogTemp: line 99999"]);
+        assert!(last.from > 0, "a 3-line tail must not read the whole file");
+        let re = regex::Regex::new("LogRare").unwrap();
+        let rare = tail_lines(&path, 50, Some(&re), MAX_LOG_SCAN).unwrap();
+        assert_eq!(rare.kept.len(), 50);
+        assert_eq!(rare.kept[49], "LogRare: line 99000");
+        let everything = tail_lines(&path, 5000, Some(&re), MAX_LOG_SCAN).unwrap();
+        assert_eq!((everything.from, everything.matching), (0, 100));
+        let bounded = tail_lines(&path, 5000, Some(&re), 1 << 20).unwrap();
+        assert!(bounded.from > 0 && bounded.matching < 100);
+    }
+
+    #[test]
+    fn replies_end_at_content_length_on_a_kept_alive_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            for chunked in [false, true] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = vec![0u8; 8192];
+                let _ = stream.read(&mut buffer).unwrap();
+                let body = r#"{"ReturnValue":true}"#;
+                let reply = if chunked {
+                    format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n", body.len())
+                } else {
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}", body.len())
+                };
+                stream.write_all(reply.as_bytes()).unwrap();
+                // Keep the connection open until the client hangs up.
+                while stream.read(&mut buffer).map(|n| n > 0).unwrap_or(false) {}
+            }
+        });
+        let url = format!("http://127.0.0.1:{port}");
+        for _ in 0..2 {
+            let started = std::time::Instant::now();
+            let result = remote_at(&url, "GET", "/remote/info", None, Duration::from_secs(10)).unwrap();
+            assert_eq!(result["ReturnValue"], true);
+            assert!(started.elapsed() < Duration::from_secs(3), "waited for the read timeout");
+        }
+        server.join().unwrap();
     }
 
     #[test]

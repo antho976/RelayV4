@@ -29,6 +29,8 @@ Defaults: the `*Editor` target, the host platform, `Development`, one hour. Retu
 ### `ue_log` — `{ lines?, filter?, file? }`
 The tail of `Saved/Logs/<Project>.log` (or another file in `Saved/Logs`), optionally filtered by a
 regex first. Typical filters: `Error|Warning`, `LogBlueprint`, `LogPython`, `LogTemp`.
+Reads back from the end of the file only as far as it needs for `lines` matches (at most 64 MB), so
+`matching_lines` counts the part that was read; `whole_file_scanned` says whether that was all of it.
 
 ## Live editor tools
 
@@ -46,10 +48,17 @@ frees itself after 15 idle minutes.
 ### `ue_editor_status` — `{}`
 `reachable`, the endpoint and the server's route list.
 
-### `ue_python` — `{ code, timeout_s? }`
+### `ue_python` — `{ code, timeout_s?, transaction? }`
 Runs the code as a file through `PythonScriptLibrary.ExecutePythonCommandEx`. Returns `ok`, the
 printed `output` (warnings and errors are prefixed with their type) and the command `result`.
-A Python exception is a tool error carrying the traceback.
+A Python exception is a tool error carrying the traceback. The call is wrapped in one undo
+transaction unless `transaction: false`; pass that for read-only queries. The built-in read-only
+tools (search, level actors, inspections, audits, references, Blueprint reads, Data Table exports)
+never open one.
+
+**Large results.** A result whose JSON is over 200 KB (a big Data Table export, an audit of a large
+folder) is written to `.relay/tool-results/` in the checkout (the system temp folder outside Relay)
+and the reply carries `result_file`, its size, the top-level `shape` and a `preview`.
 
 ### `ue_call` — `{ object_path, function, parameters?, transaction? }`
 `PUT /remote/object/call`. For a static `BlueprintCallable` function, call it on the class default
@@ -74,7 +83,8 @@ Runs a console command in the editor world. Output lands in the log; read it wit
 `editor_project`, `this_checkout`, `same_project` and the current `editor_lock`.
 
 ### `ue_editor_lock` — `{ action?: "status" | "release" }`
-Who holds the editor lock; `release` gives up your own.
+Who holds the editor lock; `release` gives up your own. Works with the editor closed (after a crash,
+for instance): the lock is only a file.
 
 ## Playing, testing and profiling
 

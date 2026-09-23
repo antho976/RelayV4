@@ -173,7 +173,8 @@ fn tools() -> Vec<Value> {
                 "name":{"type":"string","description":"Asset name in Unreal"},
                 "skeleton":{"type":"string","description":"Existing Skeleton asset, for animations and shared rigs"},
                 "fbx_path":{"type":"string","description":"Where to keep the FBX, relative to the checkout; default Saved/Relay/Exports/<name>.fbx"},
-                "materials":{"type":"boolean"}
+                "materials":{"type":"boolean"},
+                "uproject":{"type":"string","description":"The Unreal project to import into, when it is not in this checkout: its .uproject or its folder (absolute, or relative to the checkout). Default: UE_PROJECT, then a .uproject found in this checkout"}
             }), &["file","kind","destination"], false),
     ]
 }
@@ -377,6 +378,10 @@ fn tail(text: &str, lines: usize) -> String {
 fn to_unreal(root: &Path, args: &Value) -> Result<Value> {
     let file = resolve(root, required(args, "file")?)?;
     let kind = required(args, "kind")?;
+    // Find the Unreal project before the (slow) export. It may be a separate checkout.
+    let explicit = args["uproject"].as_str().filter(|p| !p.trim().is_empty())
+        .map(|p| if Path::new(p).is_absolute() { PathBuf::from(p) } else { root.join(p) });
+    let uproject = crate::unreal::project_file(explicit.as_deref())?;
     let stem = args["name"].as_str().map(str::to_string)
         .or_else(|| args["objects"][0].as_str().map(str::to_string))
         .unwrap_or_else(|| file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Export".into()));
@@ -389,7 +394,7 @@ fn to_unreal(root: &Path, args: &Value) -> Result<Value> {
     let imported = crate::unreal::import_fbx(&fbx, json!({
         "kind": kind, "destination": required(args, "destination")?, "name": args["name"],
         "skeleton": args["skeleton"], "animations": args["animations"], "materials": args["materials"],
-    }))?;
+    }), Some(&uproject))?;
     let checks = compare(&exported, &imported);
     Ok(json!({"fbx": fbx, "exported": exported, "imported": imported["imported"], "import_log": imported["import_log"],
         "problems": checks, "passed": checks.is_empty()}))
