@@ -7,9 +7,6 @@
 # unless importer="interchange"; "Import Normals and Tangents" on a Blender FBX gave a mesh that
 # drew only its shadow, so normals are imported and tangents computed; and a re-import kept the
 # old asset's import settings unless told to replace them.
-#
-# Sockets from Blender SOCKET_ empties arrive at 100x scale with a -90 degree roll; both are
-# undone here and saved with the mesh (fix_sockets=false keeps them as imported).
 
 kind = ARGS["kind"]
 CVAR = "Interchange.FeatureFlags.Import.FBX"
@@ -67,34 +64,6 @@ def run_import(destination, name):
     return [str(p) for p in task.get_editor_property("imported_object_paths")]
 
 
-def fix_sockets(path):
-    try:
-        return undo_socket_import(path)
-    except Exception as error:
-        return [{"error": str(error)}]
-
-
-def undo_socket_import(path):
-    a = unreal.load_asset(path)
-    if not isinstance(a, unreal.StaticMesh):
-        return []
-    fixed = []
-    for socket in a.get_editor_property("sockets") or []:
-        change = undo_blender_socket_transform(socket)
-        if change:
-            change["socket"] = str(socket.get_editor_property("socket_name"))
-            fixed.append(change)
-    if fixed:
-        try:
-            a.modify()
-        except Exception:
-            pass
-        if not save_asset(a):
-            for change in fixed:
-                change["saved"] = False
-    return fixed
-
-
 def measure(path):
     a = unreal.load_asset(path)
     if a is None:
@@ -146,6 +115,46 @@ def remove(paths):
     return removed
 
 
+def fix_sockets(paths):
+    """Sockets that came from empties arrive with the FBX axis conversion's roll (-90 degrees)
+    on them, which turns whatever is attached. Put back what the empties meant: no rotation for
+    an empty with none of its own (or for every socket with socket_rotation="zero"). They also
+    arrive at 100x scale from the unit conversion, which scales whatever is attached; that is
+    divided back for every socket unless socket_rotation="keep"."""
+    mode = ARGS.get("socket_rotation", "match")
+    if mode == "keep" or kind != "static":
+        return []
+    meant = dict((s["name"].lower(), s) for s in ARGS.get("sockets") or [])
+    fixed = []
+    for path in paths:
+        mesh = unreal.load_asset(path)
+        if not isinstance(mesh, unreal.StaticMesh):
+            continue
+        changed = False
+        for socket in mesh.get_editor_property("sockets"):
+            name = str(socket.get_editor_property("socket_name"))
+            scale = undo_blender_socket_scale(socket)
+            if scale:
+                fixed.append({"mesh": path, "socket": name, "scale": scale})
+                changed = True
+            key = name.lower()
+            key = key[len("socket_"):] if key.startswith("socket_") else key
+            spec = meant.get(key)
+            if mode == "zero" or (spec is not None and spec.get("identity")):
+                before = socket.get_editor_property("relative_rotation")
+                if abs(before.roll) + abs(before.pitch) + abs(before.yaw) > 0.01:
+                    socket.set_editor_property("relative_rotation", unreal.Rotator(roll=0.0, pitch=0.0, yaw=0.0))
+                    fixed.append({"mesh": path, "socket": name, "was": [round(before.pitch, 2), round(before.yaw, 2), round(before.roll, 2)]})
+                    changed = True
+            elif spec is not None:
+                r = socket.get_editor_property("relative_rotation")
+                fixed.append({"mesh": path, "socket": name, "left_as_imported": [round(r.pitch, 2), round(r.yaw, 2), round(r.roll, 2)],
+                              "blender_rotation_deg": spec.get("rotation_deg"), "note": "rotated in Blender; check it with ue_screenshot"})
+        if changed:
+            save_asset(mesh)
+    return fixed
+
+
 importer = ARGS.get("importer", "legacy")
 previous = cvar_int(CVAR)
 attempts = []
@@ -155,11 +164,7 @@ try:
         if previous is not None:
             set_cvar(CVAR, 1 if attempt == "interchange" else 0)
         paths = run_import(ARGS["destination"], ARGS.get("name"))
-        socket_fixes = dict((p, fix_sockets(p)) for p in paths) if ARGS.get("fix_sockets", True) else {}
         measured = [measure(p) for p in paths]
-        for m in measured:
-            if socket_fixes.get(m["path"]):
-                m["sockets_fixed"] = socket_fixes[m["path"]]
         broken = [m["path"] for m in measured if m.get("empty") or m.get("error") or m.get("transient_materials")]
         attempts.append({"importer": attempt, "imported": measured, "broken": broken})
         if paths and not broken:
@@ -171,6 +176,8 @@ finally:
         set_cvar(CVAR, previous)
 
 final = attempts[-1]
+sockets_fixed = fix_sockets([m["path"] for m in final["imported"]]) if not final.get("cleaned_up") else []
 emit({"imported": final["imported"] if not final.get("cleaned_up") else [], "importer": final["importer"],
+      "sockets": sockets_fixed,
       "attempts": attempts, "interchange_fbx_cvar": previous,
       "failed": bool(final.get("cleaned_up")) or not final["imported"]})

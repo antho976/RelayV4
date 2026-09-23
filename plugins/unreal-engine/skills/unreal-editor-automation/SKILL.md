@@ -267,15 +267,24 @@ These cost hours once. Check here before debugging them again.
   plugins to the `.uproject` and writes `Config/DefaultRemoteControl.ini` (web server at start-up,
   remote Python, console commands, remote function calls; keys are checked against the engine's
   own `RemoteControlSettings.h`). Restart the editor afterwards.
+- *Quitting takes a while.* `ue_editor_quit` saves, asks the editor to quit, sends a terminate
+  signal if it is still running 20 s later, and reports a `timing` breakdown (save and request,
+  signal, exit, port free) so a slow step can be named.
 - *The port stays held after the editor closes.* A quick relaunch then fails to bind with one log
   line, and `WebControl.StartServer` alone does nothing: run `WebControl.StopServer` first. Use
   `ue_editor_quit` and `ue_editor_launch`, which wait for the port and read the log for a failed
   bind; `ue_editor_status` explains which of the three unreachable cases you are in.
-- *The editor throttles itself in the background* (a few fps). `ue_play` and `ue_profile` turn
-  `throttle_cpu_when_not_foreground` off for the session and report `average_fps`; below 20 fps a
-  timed test means nothing. Switched off in memory or in Editor Preferences, it came back on after
-  every editor restart; `ue_setup_check {"fix": true}` writes it to
-  `Config/DefaultEditorPerProjectUserSettings.ini` (and the saved per-user file) so it stays off.
+- *The editor throttles itself in the background* (a few fps), and the setting comes back on
+  every start. `ue_editor_launch` starts the editor with it overridden off; `ue_play` and
+  `ue_profile` also turn it off (and save it where the engine allows) and report `average_fps`;
+  below 20 fps a timed test means nothing. `ue_editor_launch` also writes the setting off into
+  the project's saved per-project user settings before starting the editor, so it survives
+  restarts. For an editor started by hand, `ue_setup_check {"fix": true}` writes it to
+  `Config/DefaultEditorPerProjectUserSettings.ini` (and the saved per-user file) and turns it off
+  in the running editor.
+- *Seeing the game from outside the player's camera.* Python cannot spawn into a running game;
+  `ue_play` with `outside` places a capture in the level before play and moves it around the
+  player at each checkpoint, showing first-person arms and guns from the side or front.
 - *Play screenshots* are taken after the checkpoint's probe and matched to their own file, so
   images and probe output describe the same moment.
 - *"Cancelling Open Transaction 'Remote Call Transaction Wrap'"* at play start is harmless; the

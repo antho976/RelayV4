@@ -254,7 +254,14 @@ fn tools() -> Vec<Value> {
                 "probe":{"type":"string","description":"Python run at each checkpoint with `unreal` and `world` (the game world); print what you want to see"},
                 "log_filter":{"type":"string","description":"Regex over new log lines; default errors, warnings, ensures and Blueprint runtime errors"},
                 "stop":{"type":"boolean","description":"Stop at the end (default true)"},
-                "stop_existing":{"type":"boolean","description":"End a session that is already running first"}
+                "stop_existing":{"type":"boolean","description":"End a session that is already running first"},
+                "outside":{"type":"object","description":"Also render the game from outside the player's camera at each checkpoint: first-person arms and guns seen from the side or front. A capture placed in the level before play follows the target; 'only owner see' parts are shown for the capture.","properties":{
+                    "target":{"type":"string","description":"'player' (default: the player's pawn), or an actor label, name or class fragment"},
+                    "views":{"type":"array","items":{"type":"string","enum":["front","back","left","right","top","three_quarter","three_quarter_left"]},"description":"Default right and front"},
+                    "offset":{"type":"array","items":{"type":"number"},"description":"Camera at [forward, right, up] cm from the look-at point, in the target's frame"},
+                    "look_at":{"type":"array","items":{"type":"number"},"description":"Point looked at, [forward, right, up] cm from the target's origin; default [30, 0, 50], where first-person hands and guns sit"},
+                    "distance":{"type":"number","description":"For named views, default 150 cm"},
+                    "fov":{"type":"number"},"width":{"type":"integer"},"height":{"type":"integer"}}}
             }), &[], false),
         tool("ue_blueprint_info",
             "Read Blueprints as text: parent class, interfaces, variables with default values, functions and events, components, and graph nodes where this engine version exposes them. compile=true compiles them and returns the compiler's log lines. Give paths, or a folder to read every Blueprint in it.",
@@ -302,7 +309,7 @@ fn tools() -> Vec<Value> {
             json!({"index":{"type":"integer","minimum":0,"description":"0 = most recent"}}), &[], true),
         tool("ue_editor_launch",
             "Start the Unreal editor on this checkout's project with the Remote Control server enabled: waits until the port is free (a closed editor holds it for a while), launches, and waits until Remote Control answers, reporting a failed bind from the new log. Returns when the editor is ready.",
-            json!({"timeout_s":{"type":"integer","minimum":30,"maximum":3600,"description":"Default 900; first starts compile shaders"},"extra_args":{"type":"array","items":{"type":"string"}}}), &[], false),
+            json!({"timeout_s":{"type":"integer","minimum":30,"maximum":3600,"description":"Default 900; first starts compile shaders"},"extra_args":{"type":"array","items":{"type":"string"}},"keep_background_throttle":{"type":"boolean","description":"Leave 'Use Less CPU when in Background' as configured (default: off for this session)"}}), &[], false),
         tool("ue_editor_quit",
             "Quit the editor cleanly (saving dirty packages unless save=false), wait for the process to exit and for the Remote Control port to be released. Use before builds; ue_build restart_editor=true does quit, build and relaunch in one call.",
             json!({"save":{"type":"boolean"}}), &[], false),
@@ -574,30 +581,41 @@ fn quit_editor(project: &Project, save: bool) -> Result<Value> {
                 "import unreal\n{}unreal.SystemLibrary.quit_editor()\nprint('quitting')\n",
                 if save { "unreal.EditorLoadingAndSavingUtils.save_dirty_packages(True, True)\n" } else { "" }
             );
-            if let Err(error) = python_tx(&code, Duration::from_secs(120), false) {
+            // The editor may stop answering while it shuts down; do not wait on the reply.
+            if let Err(error) = python_tx(&code, Duration::from_secs(20), false) {
                 notes.push(format!("quit request: {error:#}"));
             }
         }
         Err(_) => notes.push("the editor did not answer; asking the process to terminate instead (unsaved changes are lost)".into()),
     }
+    let requested = started.elapsed();
     let deadline = std::time::Instant::now() + Duration::from_secs(90);
-    let mut signalled = false;
+    let mut signalled = None;
     while !crate::unreal_process::editors_for(&project.uproject).is_empty() {
         if std::time::Instant::now() >= deadline {
             bail!("the editor is still running after 90 s; close it by hand");
         }
-        if !signalled && (notes.iter().any(|n| n.contains("terminate")) || started.elapsed() > Duration::from_secs(45)) {
+        // Everything is saved by now; an editor that lingers in shutdown gets a terminate
+        // signal (a normal shutdown request) rather than a long wait.
+        if signalled.is_none() && (notes.iter().any(|n| n.contains("terminate")) || started.elapsed() > requested + Duration::from_secs(20)) {
             for pid in &before {
                 crate::unreal_process::kill(*pid);
             }
-            signalled = true;
+            signalled = Some((started.elapsed().as_secs_f64() * 10.0).round() / 10.0);
         }
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(250));
     }
+    let exited = started.elapsed();
     let port = crate::unreal_process::port_of(&remote_base());
     let port_free = crate::unreal_process::wait_port_free(port, Duration::from_secs(90));
     let _ = release_lock(project, &holder_id());
-    Ok(json!({"stopped": before, "saved": save, "port_free": port_free, "seconds": started.elapsed().as_secs(), "notes": notes}))
+    let round = |d: Duration| (d.as_secs_f64() * 10.0).round() / 10.0;
+    Ok(json!({
+        "stopped": before, "saved": save, "port_free": port_free, "notes": notes,
+        "seconds": round(started.elapsed()),
+        // Where the time went, so a slow quit can be told apart from a slow port.
+        "timing": {"save_and_request_s": round(requested), "terminate_signal_at_s": signalled, "exited_at_s": round(exited), "port_free_at_s": round(started.elapsed())},
+    }))
 }
 
 /// Launch the editor on this checkout's project once the port is free, then wait until Remote
@@ -612,12 +630,28 @@ fn launch_editor(project: &Project, args: &Value) -> Result<Value> {
     let port = crate::unreal_process::port_of(&remote_base());
     let started = std::time::Instant::now();
     let extra: Vec<String> = args["extra_args"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
+    let mut extra = extra;
+    // "Use Less CPU when in Background" comes back on every start, and a throttled editor runs
+    // agent play sessions at a few frames per second. Write it off in the saved per-project user
+    // settings (the editor is not running, so nothing overwrites it) and override it on the
+    // command line as well.
+    if args["keep_background_throttle"] != true {
+        let platform_dir = if cfg!(target_os = "windows") { "WindowsEditor" } else if cfg!(target_os = "macos") { "MacEditor" } else { "LinuxEditor" };
+        let ini = project.root.join("Saved/Config").join(platform_dir).join("EditorPerProjectUserSettings.ini");
+        let text = std::fs::read_to_string(&ini).unwrap_or_default();
+        let merged = merge_ini(&text, "[/Script/UnrealEd.EditorPerformanceSettings]", &[("bThrottleCPUWhenNotForeground".to_string(), "False".to_string())]);
+        if merged != text {
+            if let Some(parent) = ini.parent() { let _ = std::fs::create_dir_all(parent); }
+            let _ = std::fs::write(&ini, merged);
+        }
+        extra.push("-ini:EditorPerProjectUserSettings:[/Script/UnrealEd.EditorPerformanceSettings]:bThrottleCPUWhenNotForeground=False".to_string());
+    }
     let pid = crate::unreal_process::launch(&engine, &project.uproject, port, &extra)?;
     let timeout = Duration::from_secs(args["timeout_s"].as_u64().unwrap_or(900).clamp(30, 3600));
     loop {
         if remote("GET", "/remote/info", None, Duration::from_secs(3)).is_ok() {
             // The editor now owns the project; tell the next status call to ask again.
-            return Ok(json!({"pid": pid, "reachable": true, "seconds": started.elapsed().as_secs(), "engine": engine}));
+            return Ok(json!({"pid": pid, "reachable": true, "seconds": started.elapsed().as_secs(), "engine": engine, "args": extra}));
         }
         let lines = log_since(project, 0, None);
         let bind = crate::unreal_process::bind_failures(&lines);
@@ -815,6 +849,15 @@ fn play(project: &Project, args: &Value) -> Result<Value> {
         play_step("stop", json!({}))?;
         wait_for_play(false)?;
     }
+    let outside = args.get("outside").filter(|o| o.is_object()).cloned();
+    let outside_dir = match &outside {
+        Some(_) => {
+            // Placed in the level now so the game world, a copy of the level, contains it.
+            play_step("prepare_outside", json!({}))?;
+            Some(capture_dir(project)?)
+        }
+        None => None,
+    };
     let log_start = log_len(project);
     let started = play_step("start", json!({"mode": args["mode"].as_str().unwrap_or("pie")}))?;
     wait_for_play(true)?;
@@ -857,6 +900,19 @@ fn play(project: &Project, args: &Value) -> Result<Value> {
                     std::thread::sleep(Duration::from_millis(100));
                 }
             }
+            if let (Some(spec), Some(dir)) = (&outside, &outside_dir) {
+                let mut a = spec.clone();
+                a["out_dir"] = json!(dir);
+                a["prefix"] = json!(format!("outside_{at}s"));
+                match play_step("outside_capture", a) {
+                    Ok(v) => {
+                        for f in v["files"].as_array().cloned().unwrap_or_default() {
+                            shots.push(json!({"view": format!("checkpoint {at}s, {}", f["view"].as_str().unwrap_or("outside")), "file": f["file"]}));
+                        }
+                    }
+                    Err(e) => shots.push(json!({"view": format!("checkpoint {at}s outside"), "error": format!("{e:#}")})),
+                }
+            }
         }
         std::thread::sleep(Duration::from_secs_f64(seconds).saturating_sub(t0.elapsed()));
         Ok(probes)
@@ -867,6 +923,9 @@ fn play(project: &Project, args: &Value) -> Result<Value> {
     } else {
         None
     };
+    if outside.is_some() {
+        let _ = play_step("cleanup_outside", json!({}));
+    }
     let probes = outcome?;
     // Frames per wall-clock second over the session: a throttled or overloaded editor shows
     // here before it shows as a flaky test.
@@ -891,7 +950,9 @@ fn play(project: &Project, args: &Value) -> Result<Value> {
         "error_lines": errors,
         "stop_error": stopped,
         // Screenshots live in the project's own folder; show them but leave them in place.
+        // Outside captures live in a scratch folder that goes once they are read.
         "_images": images,
+        "_cleanup": outside_dir,
     }))
 }
 

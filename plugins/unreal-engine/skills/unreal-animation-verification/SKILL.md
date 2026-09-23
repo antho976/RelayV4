@@ -41,6 +41,13 @@ Run this for every change, and first on the existing state when you are asked to
    which images you checked, and anything that needs a human (new animation, rig change in a
    DCC tool).
 
+**Runtime check.** `ue_anim_inspect` reads animation files; what the player sees also depends on
+the Animation Blueprint's IK, attachment code and first-person camera setup. For first-person
+hands and weapons, finish with `ue_play` using `outside` (for example `{"views": ["right",
+"front"], "distance": 80}`) to look at the live arms and gun from outside the camera, and a
+`probe` that prints the hand and weapon socket locations (`get_socket_location`) at the same
+checkpoints.
+
 Pass criteria to use unless the design says otherwise:
 
 | Check | Pass |
