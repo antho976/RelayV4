@@ -779,6 +779,10 @@ pub struct Entry {
     /// Git status badge, if any (`M`, `A`, `D`, `?`).
     pub badge: Option<String>,
     pub children: Option<Vec<Entry>>,
+    /// Build output or an engine cache (`Saved`, `Binaries`, `Intermediate`, `DerivedDataCache`,
+    /// `build`, `dist`, …) or anything under one. Listed so it can be browsed, marked so it can be dimmed.
+    #[serde(default)]
+    pub generated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]

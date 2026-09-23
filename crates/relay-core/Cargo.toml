@@ -33,4 +33,5 @@ tree-sitter-kotlin.workspace = true
 notify.workspace = true
 regex.workspace = true
 similar.workspace = true
+ignore.workspace = true
 tempfile = "3"

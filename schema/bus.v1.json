@@ -10347,6 +10347,11 @@
           "items": {
             "$ref": "#/$defs/FileStatus"
           }
+        },
+        "truncated": {
+          "type": "boolean",
+          "description": "`files` stops at a fixed count so the reply stays under a client's frame limit; set when\nentries were left out (a first commit of an asset-heavy tree, a repo with no .gitignore).",
+          "default": false
         }
       },
       "required": [
@@ -10503,6 +10508,16 @@
           "items": {
             "$ref": "#/$defs/Hunk"
           }
+        },
+        "binary": {
+          "type": "boolean",
+          "description": "Either side has a NUL byte in its first 8 KiB; `old`/`new` are empty and `hunks` is empty.",
+          "default": false
+        },
+        "too_large": {
+          "type": "boolean",
+          "description": "Either side is over 1 MiB; `old`/`new` are empty and `hunks` is empty.",
+          "default": false
         }
       },
       "required": [
@@ -11330,6 +11345,11 @@
           "items": {
             "$ref": "#/$defs/Entry"
           }
+        },
+        "generated": {
+          "type": "boolean",
+          "description": "Build output or an engine cache (`Saved`, `Binaries`, `Intermediate`, `DerivedDataCache`,\n`build`, `dist`, …) or anything under one. Listed so it can be browsed, marked so it can be dimmed.",
+          "default": false
         }
       },
       "required": [

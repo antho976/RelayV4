@@ -417,7 +417,7 @@ pub struct Engine {
     pub(crate) device_runs: std::sync::Mutex<HashMap<Id, Arc<RunRuntime>>>,
     pub(crate) device_watch: std::sync::Mutex<DeviceWatchState>,
     pub(crate) next_mirror: AtomicI64,
-    pub(crate) watchers: std::sync::Mutex<HashMap<String, notify::RecommendedWatcher>>,
+    pub(crate) watchers: std::sync::Mutex<crate::watch::Watchers>,
     pub(crate) provider_updates: std::sync::Mutex<HashSet<String>>,
     pub(crate) creating_sessions: std::sync::Mutex<HashSet<String>>,
     pub(crate) watcher_registrations: std::sync::Mutex<HashSet<String>>,
@@ -452,7 +452,7 @@ impl Engine {
             device_runs: std::sync::Mutex::new(HashMap::new()),
             device_watch: std::sync::Mutex::new(DeviceWatchState::default()),
             next_mirror: AtomicI64::new(1),
-            watchers: std::sync::Mutex::new(HashMap::new()),
+            watchers: std::sync::Mutex::new(crate::watch::Watchers::default()),
             provider_updates: std::sync::Mutex::new(HashSet::new()),
             creating_sessions: std::sync::Mutex::new(HashSet::new()),
             watcher_registrations: std::sync::Mutex::new(HashSet::new()),
@@ -563,6 +563,13 @@ impl Engine {
     /// Emit a system-originated event (reconcile, watchers). Never fails.
     pub fn emit_system(&self, ev: &str, payload: Value) {
         let e = Event::new(ev, crate::time::now(), Actor::System, payload);
+        let _ = self.events_tx.send(e);
+    }
+    /// [`Engine::emit_system`] for one project, so a client's project filter sees it (a
+    /// worktree watcher's `file.changed`).
+    pub fn emit_system_project(&self, ev: &str, project_id: Id, payload: Value) {
+        let mut e = Event::new(ev, crate::time::now(), Actor::System, payload);
+        e.project_id = Some(project_id);
         let _ = self.events_tx.send(e);
     }
     pub fn request_quit(&self) {

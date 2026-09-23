@@ -1,12 +1,52 @@
 //! Event-driven worktree watchers. A short trailing debounce folds editor saves and git's
 //! lock/rename sequence into one refresh event without introducing an idle polling loop.
+//!
+//! Each directory is watched on its own (non-recursive inotify watches placed by our own walk),
+//! so build output, engine caches and `.git/objects` never take a watch: inotify's recursive
+//! mode has no filter, and an Unreal tree's `Intermediate/` and `DerivedDataCache/` alone could
+//! use up `max_user_watches` for every other program on the machine. Directories created later
+//! are added as their creation is seen.
 
 use crate::engine::{Ctx, Engine, Unlocked};
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use notify::event::{CreateKind, ModifyKind, RenameMode};
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde_json::json;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// Worktrees watched at once. Past this the least recently used one is dropped; its tree still
+/// works, with badges refreshed on a short timer instead of by events.
+const MAX_ROOTS: usize = 16;
+/// Directories watched per worktree. A tree past this is only partly watched, and says so once.
+const MAX_DIRS: usize = 20_000;
+/// A worktree whose watch failed (usually `max_user_watches`) is not retried before this.
+const RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
+/// Changed paths reported in one `file.changed`. Past this `paths` is left out, which means
+/// "anything in this worktree may have changed".
+const MAX_PATHS: usize = 256;
+const DEBOUNCE: Duration = Duration::from_millis(125);
+
+struct Root {
+    watcher: Arc<Mutex<RecommendedWatcher>>,
+    dirs: Arc<AtomicUsize>,
+    used: Instant,
+}
+
+/// The engine's worktree watchers, by canonical root.
+#[derive(Default)]
+pub(crate) struct Watchers {
+    roots: HashMap<String, Root>,
+    /// Roots whose registration failed, and when; see [`RETRY_AFTER`].
+    failed: HashMap<String, Instant>,
+}
+
+/// Whether `root` (canonical, as the file handlers resolve it) has a live watcher.
+pub(crate) fn is_watched(engine: &Engine, root: &Path) -> bool {
+    engine.watchers.lock().unwrap().roots.contains_key(&root.display().to_string())
+}
 
 // A status refresh can rewrite only index stat fields. Compare the staged tree
 // rather than index bytes so this cache maintenance does not trigger another scan.
@@ -40,8 +80,8 @@ impl Defer for Unlocked<'_> {
     }
 }
 
-/// Recursive inotify registration may enumerate a large worktree. Start it after the current bus
-/// transaction releases the store lock so first-time registration cannot block PTY or UI requests.
+/// Watch registration walks the worktree. Start it after the current bus transaction releases
+/// the store lock so first-time registration cannot block PTY or UI requests.
 pub(crate) fn ensure_after_commit(
     ctx: &mut impl Defer,
     root: PathBuf,
@@ -50,8 +90,17 @@ pub(crate) fn ensure_after_commit(
     let root = std::fs::canonicalize(&root).unwrap_or(root);
     ctx.defer(Box::new(move |engine| {
         let key = root.display().to_string();
-        if engine.watchers.lock().unwrap().contains_key(&key) {
-            return;
+        {
+            let mut watchers = engine.watchers.lock().unwrap();
+            if let Some(watched) = watchers.roots.get_mut(&key) {
+                watched.used = Instant::now();
+                return;
+            }
+            // A failed watch is not retried on every tree request: each retry walked the whole
+            // tree again, and the limit it hit has not gone away.
+            if watchers.failed.get(&key).is_some_and(|at| at.elapsed() < RETRY_AFTER) {
+                return;
+            }
         }
         if !engine
             .watcher_registrations
@@ -72,6 +121,16 @@ pub(crate) fn ensure_after_commit(
     }));
 }
 
+/// What one debounce window collected.
+#[derive(Default)]
+struct Batch {
+    scheduled: bool,
+    paths: BTreeSet<String>,
+    /// More than [`MAX_PATHS`] changed, or the kernel queue overflowed: report no `paths`.
+    overflow: bool,
+    new_dirs: Vec<PathBuf>,
+}
+
 pub fn ensure(engine: &Engine, root: &Path, project_id: relay_bus::types::Id) {
     let key = std::fs::canonicalize(root)
         .unwrap_or_else(|_| root.to_path_buf())
@@ -79,10 +138,11 @@ pub fn ensure(engine: &Engine, root: &Path, project_id: relay_bus::types::Id) {
         .to_string();
     let Some(engine) = engine.arc() else { return };
     let weak = Arc::downgrade(&engine);
-    let pending = Arc::new(AtomicBool::new(false));
-    let pending_cb = pending.clone();
+    let batch = Arc::new(Mutex::new(Batch::default()));
+    let dirs = Arc::new(AtomicUsize::new(0));
     let root = PathBuf::from(&key);
     let callback_root = root.clone();
+    let callback_key = key.clone();
     let mut last_index = index_signature(&root);
     // A build touches thousands of files, and every one of them arrives here as a path to
     // compare. Build the path being compared against once, not once per event path.
@@ -92,65 +152,205 @@ pub fn ensure(engine: &Engine, root: &Path, project_id: relay_bus::types::Id) {
             let Ok(event) = event else { return };
             // Refreshing the tree and Git state reads these same watched files.
             // Access notifications must not turn one mutation into an idle refresh loop.
-            if matches!(event.kind, notify::EventKind::Access(_)) && !event.need_rescan() {
+            let rescan = event.need_rescan();
+            if matches!(event.kind, EventKind::Access(_)) && !rescan {
                 return;
             }
-            if (!event.need_rescan()
-                && event
-                    .paths
-                    .iter()
-                    .all(|path| {
-                        if path == &index_path {
-                            let next = index_signature(&callback_root);
-                            let unchanged = next.is_some() && next == last_index;
-                            last_index = next;
-                            unchanged
-                        } else {
-                            is_generated_path(&callback_root, path)
-                        }
-                    }))
-                || pending_cb.swap(true, Ordering::SeqCst)
-            {
+            let relevant: Vec<&PathBuf> = event
+                .paths
+                .iter()
+                .filter(|path| {
+                    if **path == index_path {
+                        let next = index_signature(&callback_root);
+                        let unchanged = next.is_some() && next == last_index;
+                        last_index = next;
+                        !unchanged
+                    } else {
+                        !is_generated_path(&callback_root, path)
+                    }
+                })
+                .collect();
+            if !rescan && relevant.is_empty() {
                 return;
             }
+            // Right away, not after the debounce: a tree request in the next 125 ms must not
+            // be answered from badges computed before this change.
+            crate::handlers::git::invalidate_badges(&callback_root);
+            let may_add_dir = matches!(
+                event.kind,
+                EventKind::Create(CreateKind::Folder | CreateKind::Any)
+                    | EventKind::Modify(ModifyKind::Name(RenameMode::To | RenameMode::Both))
+            );
+            let mut pending = batch.lock().unwrap();
+            pending.overflow |= rescan;
+            for path in relevant {
+                if !pending.overflow {
+                    let relative = path.strip_prefix(&callback_root).unwrap_or(path);
+                    pending.paths.insert(relative.to_string_lossy().replace('\\', "/"));
+                    if pending.paths.len() > MAX_PATHS {
+                        pending.overflow = true;
+                        pending.paths.clear();
+                    }
+                }
+                if may_add_dir && should_watch(&callback_root, path) && path.is_dir() {
+                    pending.new_dirs.push(path.clone());
+                }
+            }
+            if std::mem::replace(&mut pending.scheduled, true) {
+                return;
+            }
+            drop(pending);
             let weak = weak.clone();
-            let pending = pending_cb.clone();
+            let batch = batch.clone();
             let root = callback_root.clone();
+            let key = callback_key.clone();
             std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(125));
-                pending.store(false, Ordering::SeqCst);
+                std::thread::sleep(DEBOUNCE);
+                let taken = std::mem::take(&mut *batch.lock().unwrap());
                 if let Some(engine) = weak.upgrade() {
-                    let payload =
+                    if !taken.new_dirs.is_empty() {
+                        watch_new_dirs(&engine, &key, &root, taken.new_dirs);
+                    }
+                    let mut payload =
                         json!({"project_id": project_id, "worktree": root.display().to_string()});
+                    if !taken.overflow {
+                        payload["paths"] = json!(taken.paths);
+                    }
                     // A filesystem mutation makes both the tree and Git projection stale. One
                     // scoped event lets the Code workspace refresh both without a guaranteed
                     // duplicate pass. Explicit git.* mutations still emit git.changed.
-                    engine.emit_system("file.changed", payload);
+                    engine.emit_system_project("file.changed", project_id, payload);
                 }
             });
         });
-    let registered = if let Ok(mut watcher) = watcher {
-        if watcher.watch(&root, RecursiveMode::Recursive).is_ok() {
+    let registered = match watcher.and_then(|mut watcher| {
+        add_tree(&mut watcher, &root, &root, &dirs)?;
+        Ok(watcher)
+    }) {
+        Ok(watcher) => {
+            let mut evicted = Vec::new();
             let mut watchers = engine.watchers.lock().unwrap();
-            if watchers.contains_key(&key) {
-                false
-            } else {
-                watchers.insert(key.clone(), watcher);
-                true
+            watchers.failed.remove(&key);
+            let fresh = !watchers.roots.contains_key(&key);
+            if fresh {
+                // Removed worktrees first, then the least recently used, so the count stays bounded.
+                let gone: Vec<String> =
+                    watchers.roots.keys().filter(|k| !Path::new(k).exists()).cloned().collect();
+                evicted.extend(gone.iter().filter_map(|k| watchers.roots.remove(k)));
+                while watchers.roots.len() >= MAX_ROOTS {
+                    let Some(oldest) =
+                        watchers.roots.iter().min_by_key(|(_, r)| r.used).map(|(k, _)| k.clone())
+                    else {
+                        break;
+                    };
+                    evicted.extend(watchers.roots.remove(&oldest));
+                }
+                watchers.roots.insert(
+                    key.clone(),
+                    Root { watcher: Arc::new(Mutex::new(watcher)), dirs, used: Instant::now() },
+                );
             }
-        } else {
+            drop(watchers);
+            drop(evicted);
+            fresh
+        }
+        Err(error) => {
+            tracing::warn!(
+                root = %key, error = %error,
+                "cannot watch worktree; file changes refresh on demand, retrying in 5 minutes"
+            );
+            engine.watchers.lock().unwrap().failed.insert(key.clone(), Instant::now());
             false
         }
-    } else {
-        false
     };
     engine.watcher_registrations.lock().unwrap().remove(&key);
     if registered {
-        engine.emit_system(
+        // No `paths`: anything may have changed between the caller's read and the watch.
+        engine.emit_system_project(
             "file.changed",
+            project_id,
             json!({"project_id": project_id, "worktree": root.display().to_string()}),
         );
     }
+}
+
+/// Watch directories created (or moved in) after registration, with everything already inside.
+fn watch_new_dirs(engine: &Engine, key: &str, root: &Path, new_dirs: Vec<PathBuf>) {
+    let Some((watcher, dirs)) = engine
+        .watchers
+        .lock()
+        .unwrap()
+        .roots
+        .get(key)
+        .map(|r| (r.watcher.clone(), r.dirs.clone()))
+    else {
+        return;
+    };
+    let mut watcher = watcher.lock().unwrap();
+    for dir in new_dirs {
+        if let Err(error) = add_tree(&mut watcher, root, &dir, &dirs) {
+            tracing::warn!(root = %key, error = %error, "cannot watch a new directory; it refreshes on demand");
+            return;
+        }
+    }
+}
+
+/// Place one non-recursive watch on `start` and on every directory below it that
+/// [`should_watch`] allows. A subdirectory that vanished or cannot be read is skipped; running out
+/// of watches is an error, and the caller decides what that costs.
+fn add_tree(
+    watcher: &mut RecommendedWatcher,
+    root: &Path,
+    start: &Path,
+    dirs: &AtomicUsize,
+) -> notify::Result<()> {
+    let mut stack = vec![start.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if dirs.load(Ordering::Relaxed) >= MAX_DIRS {
+            return Ok(());
+        }
+        match watcher.watch(&dir, RecursiveMode::NonRecursive) {
+            Ok(()) => {}
+            Err(error) if dir != start && skippable(&error) => continue,
+            Err(error) => return Err(error),
+        }
+        if dirs.fetch_add(1, Ordering::Relaxed) + 1 == MAX_DIRS {
+            tracing::warn!(root = %root.display(), limit = MAX_DIRS, "worktree has too many directories; the rest are not watched");
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            // `DirEntry::file_type` does not follow links, so a linked directory is not entered.
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                let path = entry.path();
+                if should_watch(root, &path) {
+                    stack.push(path);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn skippable(error: &notify::Error) -> bool {
+    match &error.kind {
+        notify::ErrorKind::PathNotFound => true,
+        notify::ErrorKind::Io(io) => matches!(
+            io.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+        ),
+        _ => false,
+    }
+}
+
+/// Whether a directory gets a watch. Of `.git`, only the directory itself (index, `HEAD`,
+/// `packed-refs`, config) and `refs/`; never objects, logs or LFS. Nested repositories' `.git`
+/// and everything [`is_generated_path`] filters out of events are not watched either.
+fn should_watch(root: &Path, path: &Path) -> bool {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    if let Ok(git) = relative.strip_prefix(".git") {
+        return git.as_os_str().is_empty() || git.starts_with("refs");
+    }
+    !relative.components().any(|c| c.as_os_str() == ".git") && !is_generated_path(root, path)
 }
 
 /// Build caches can change hundreds of times per second while Relay itself is compiling. They are
@@ -262,6 +462,18 @@ mod tests {
                 .ev,
             "file.changed"
         );
+    }
+
+    #[test]
+    fn watches_skip_git_internals_nested_repositories_and_build_output() {
+        let root = Path::new("/repo");
+        for path in ["", ".git", ".git/refs", ".git/refs/heads/feature", "Content/Maps", "Source/Game"] {
+            assert!(super::should_watch(root, &root.join(path)), "{path}");
+        }
+        for path in [".git/objects", ".git/objects/ab", ".git/logs", ".git/lfs/tmp", "Plugins/Sub/.git",
+            "Intermediate", "Plugins/Foo/Binaries", "DerivedDataCache", "Saved/Logs", "node_modules/pkg", "target"] {
+            assert!(!super::should_watch(root, &root.join(path)), "{path}");
+        }
     }
 
     #[test]

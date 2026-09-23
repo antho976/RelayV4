@@ -18,13 +18,20 @@ result!(#[schemars(rename = "WorktreeDiskOut")] WorktreeDiskOut { pub worktrees:
 op!(WorktreeDisk, "worktree.disk", ProjectIn => WorktreeDiskOut, OpMeta::query(Scope::Project, 3, "Disk per worktree, build output separately"));
 
 payload!(#[schemars(rename = "GitWtIn")] WtIn { pub project_id: Id, pub worktree: Option<String> });
-result!(#[schemars(rename = "GitStatusOut")] StatusOut { pub branch: String, pub upstream: Option<String>, pub ahead: Option<i64>, pub behind: Option<i64>, pub files: Vec<FileStatus> });
+result!(#[schemars(rename = "GitStatusOut")] StatusOut { pub branch: String, pub upstream: Option<String>, pub ahead: Option<i64>, pub behind: Option<i64>, pub files: Vec<FileStatus>,
+    /// `files` stops at a fixed count so the reply stays under a client's frame limit; set when
+    /// entries were left out (a first commit of an asset-heavy tree, a repo with no .gitignore).
+    #[serde(default)] pub truncated: bool });
 op!(Status, "git.status", WtIn => StatusOut, OpMeta::query(Scope::Project, 8, "Working tree status (gix)"));
 payload!(#[schemars(rename = "GitDiffIn")] DiffIn { pub project_id: Id, pub worktree: Option<String>, pub base: Option<String>, pub staged: Option<bool> });
 result!(#[schemars(rename = "GitDiffOut")] DiffOut { pub files: Vec<DiffFile> });
 op!(Diff, "git.diff", DiffIn => DiffOut, OpMeta::query(Scope::Project, 8, "Changed files with counts"));
 payload!(#[schemars(rename = "GitDiffFileIn")] DiffFileIn { pub project_id: Id, pub worktree: Option<String>, pub path: String, pub base: Option<String> });
-result!(#[schemars(rename = "GitDiffFileOut")] DiffFileOut { pub old: String, pub new: String, pub hunks: Vec<Hunk> });
+result!(#[schemars(rename = "GitDiffFileOut")] DiffFileOut { pub old: String, pub new: String, pub hunks: Vec<Hunk>,
+    /// Either side has a NUL byte in its first 8 KiB; `old`/`new` are empty and `hunks` is empty.
+    #[serde(default)] pub binary: bool,
+    /// Either side is over 1 MiB; `old`/`new` are empty and `hunks` is empty.
+    #[serde(default)] pub too_large: bool });
 op!(DiffFileOp, "git.diff.file", DiffFileIn => DiffFileOut, OpMeta::query(Scope::Project, 8, "One file's old/new text and hunks (for @codemirror/merge)"));
 payload!(#[schemars(rename = "GitLogIn")] LogIn { pub project_id: Id, pub worktree: Option<String>, pub branch: Option<String>, pub limit: Option<u32>, pub graph: Option<bool> });
 result!(#[schemars(rename = "GitLogOut")] LogOut { pub commits: Vec<Commit> });

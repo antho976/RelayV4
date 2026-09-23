@@ -112,7 +112,8 @@ pub fn register(e: &mut Engine) {
         ctx.emit("workspace.changed", serde_json::to_value(&ws).bus()?);
         Ok(ws)
     });
-    e.register::<WsDiscover>(|_, p| {
+    // A four-level directory walk, and onboarding runs it unprompted: it must not hold the store.
+    e.register_unlocked::<WsDiscover>(|_, p| {
         let path = if p.path.as_deref().is_none_or(|path| path.trim().is_empty()) {
             suggested_workspace()?
         } else {
@@ -324,18 +325,21 @@ pub fn register(e: &mut Engine) {
 }
 
 fn discover_repositories(root: &Path) -> Result<Vec<relay_bus::types::LocalRepo>, BusError> {
+    // Only the root must be readable. A directory below it that cannot be listed (permissions, a
+    // dangling mount, a race with a delete) is skipped: one bad folder used to fail the whole walk.
     fn walk(path: &Path, depth: usize, out: &mut Vec<relay_bus::types::LocalRepo>) -> std::io::Result<()> {
         if path.join(".git").exists() {
             out.push(relay_bus::types::LocalRepo { path: path.display().to_string(), name: name_of(path) });
             return Ok(());
         }
         if depth >= 4 { return Ok(()); }
-        for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() || entry.file_type()?.is_symlink() { continue; }
+        for entry in fs::read_dir(path)?.flatten() {
+            let Ok(kind) = entry.file_type() else { continue };
+            if !kind.is_dir() || kind.is_symlink() { continue; }
             let name = entry.file_name();
-            if matches!(name.to_str(), Some(".git" | ".relay" | "node_modules" | "target" | "build" | ".gradle")) { continue; }
-            walk(&entry.path(), depth + 1, out)?;
+            if matches!(name.to_str(), Some(".git" | ".relay" | "node_modules" | "target" | "build" | ".gradle"
+                | "Intermediate" | "DerivedDataCache" | "Binaries" | "Saved")) { continue; }
+            let _ = walk(&entry.path(), depth + 1, out);
         }
         Ok(())
     }
@@ -383,5 +387,20 @@ mod tests {
         let directory = root.path().join("projects");
         fs::create_dir_all(&directory).unwrap();
         assert_eq!(suggested_workspace_from(&directory), directory);
+    }
+
+    #[test]
+    fn discovery_skips_folders_it_cannot_read_instead_of_failing() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("game/.git")).unwrap();
+        fs::create_dir_all(root.path().join("locked/inner")).unwrap();
+        fs::create_dir_all(root.path().join("Project/Intermediate/nested/.git")).unwrap();
+        fs::set_permissions(root.path().join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+        let found = discover_repositories(root.path());
+        fs::set_permissions(root.path().join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
+        let found = found.unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].path.ends_with("game"));
     }
 }

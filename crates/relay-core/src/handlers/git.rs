@@ -13,6 +13,8 @@ use serde_json::json;
 use similar::{ChangeTag, TextDiff};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Live sessions of a project as (branch, name), for `git.branches`.
 fn worktree_owners_by_branch(
@@ -170,12 +172,16 @@ pub fn register(e: &mut Engine) {
             .map(|n| n.shorten().to_string())
             .unwrap_or_else(|| "HEAD".into());
         let (upstream, ahead, behind) = upstream_metrics(&repo, &branch);
+        let mut files = status_files(&root)?;
+        let truncated = files.len() > STATUS_REPLY_CAP;
+        files.truncate(STATUS_REPLY_CAP);
         Ok(StatusOut {
             branch,
             upstream,
             ahead,
             behind,
-            files: status_files(&root)?,
+            files,
+            truncated,
         })
     });
     e.register_unlocked::<Diff>(|ctx, p| {
@@ -200,17 +206,29 @@ pub fn register(e: &mut Engine) {
         } else {
             Vec::new()
         };
-        for status in status_files(&root)? {
+        let statuses = status_files(&root)?;
+        // One repository, one revision tree and one index for the whole list, not one per file.
+        let repo = gix::open(&root).map_err(gix_err("git.open_failed"))?;
+        let old_tree = if statuses.is_empty() {
+            None
+        } else {
+            revision_tree(&repo, p.base.as_deref().unwrap_or("HEAD"))?
+        };
+        let index = if p.staged == Some(true) {
+            Some(repo.index_or_empty().map_err(gix_err("git.index"))?)
+        } else {
+            None
+        };
+        for status in statuses {
             if p.staged == Some(true) && status.index.is_empty() {
                 continue;
             }
-            let old = revision_text(&root, p.base.as_deref().unwrap_or("HEAD"), &status.path)?;
-            let new = if p.staged == Some(true) {
-                index_text(&root, &status.path)?
-            } else {
-                working_text(&root, &status.path)?
+            let old = tree_side(&repo, old_tree.as_ref(), &status.path, COUNT_CAP)?;
+            let new = match &index {
+                Some(index) => index_side(&repo, index, &status.path, COUNT_CAP),
+                None => working_side(&root, &status.path, COUNT_CAP)?,
             };
-            let (added, removed) = counts(&old, &new);
+            let (added, removed) = side_counts(&old, &new);
             let file = DiffFile {
                 path: status.path,
                 old_path: status.renamed_from,
@@ -221,7 +239,7 @@ pub fn register(e: &mut Engine) {
                 },
                 added,
                 removed,
-                binary: old.contains('\0') || new.contains('\0'),
+                binary: old.binary || new.binary,
             };
             if let Some(existing) = files.iter_mut().find(|existing| existing.path == file.path) {
                 *existing = file;
@@ -235,8 +253,22 @@ pub fn register(e: &mut Engine) {
     e.register_unlocked::<DiffFileOp>(|ctx, p| {
         let (_project, root) = resolve_root_unlocked(ctx, p.project_id, p.worktree.as_deref())?;
         validate_path(&p.path)?;
-        let old = revision_text(&root, p.base.as_deref().unwrap_or("HEAD"), &p.path)?;
-        let new = working_text(&root, &p.path)?;
+        let repo = gix::open(&root).map_err(gix_err("git.open_failed"))?;
+        let tree = revision_tree(&repo, p.base.as_deref().unwrap_or("HEAD"))?;
+        let old = tree_side(&repo, tree.as_ref(), &p.path, DIFF_TEXT_CAP)?;
+        let new = working_side(&root, &p.path, DIFF_TEXT_CAP)?;
+        // Nothing of a binary or oversized file is sent: the client could not show it, and a
+        // whole `.uasset` in one reply used to cost the desktop app its connection.
+        if old.skipped() || new.skipped() {
+            return Ok(DiffFileOut {
+                old: String::new(),
+                new: String::new(),
+                hunks: Vec::new(),
+                binary: old.binary || new.binary,
+                too_large: old.too_large || new.too_large,
+            });
+        }
+        let (old, new) = (old.text, new.text);
         let hunks = if old == new {
             Vec::new()
         } else {
@@ -251,7 +283,7 @@ pub fn register(e: &mut Engine) {
                     .to_string(),
             }]
         };
-        Ok(DiffFileOut { old, new, hunks })
+        Ok(DiffFileOut { old, new, hunks, binary: false, too_large: false })
     });
     e.register_unlocked::<Log>(|ctx, p| {
         let (_project, root) = resolve_root_unlocked(ctx, p.project_id, p.worktree.as_deref())?;
@@ -664,6 +696,61 @@ pub fn status_badges(root: &Path) -> Result<HashMap<String, String>, BusError> {
         .collect())
 }
 
+/// How long `file.tree` badges are reused. A watched root is invalidated by its watcher, so the
+/// long figure is only a backstop; an unwatched one has nothing telling it the tree changed.
+const BADGES_TTL_WATCHED: std::time::Duration = std::time::Duration::from_secs(30);
+const BADGES_TTL_UNWATCHED: std::time::Duration = std::time::Duration::from_secs(2);
+
+type Badges = Arc<HashMap<String, String>>;
+/// A scan's outcome, the generation it was computed in, and when.
+type BadgeScan = (u64, std::time::Instant, Result<Badges, BusError>);
+
+/// One root's memoized `git status`. `generation` moves on every invalidation; a result is reused
+/// only while it was computed in the current generation, so a scan that raced a write is not kept.
+#[derive(Default)]
+struct BadgeSlot {
+    generation: AtomicU64,
+    last: Mutex<Option<BadgeScan>>,
+}
+
+fn badge_slots() -> &'static Mutex<HashMap<PathBuf, Arc<BadgeSlot>>> {
+    static SLOTS: OnceLock<Mutex<HashMap<PathBuf, Arc<BadgeSlot>>>> = OnceLock::new();
+    SLOTS.get_or_init(Default::default)
+}
+
+/// Forget `root`'s badges: its watcher saw a change, or a bus op changed files or the index.
+pub(crate) fn invalidate_badges(root: &Path) {
+    if let Some(slot) = badge_slots().lock().unwrap().get(root) {
+        slot.generation.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// [`status_badges`] for `file.tree`, which asks on every folder expand: after an invalidation the
+/// client re-expands K folders at once, and that was K concurrent `git status` runs contending for
+/// `index.lock`. Callers for the same root now share one run (they queue on the slot) and reuse
+/// its result until the root changes. A failure is kept as briefly as a result, so the callers
+/// queued behind a timed-out scan do not each wait out their own.
+pub(crate) fn status_badges_cached(root: &Path, watched: bool) -> Result<Badges, BusError> {
+    let slot = {
+        let mut slots = badge_slots().lock().unwrap();
+        if slots.len() > 64 {
+            slots.retain(|_, slot| Arc::strong_count(slot) > 1);
+        }
+        slots.entry(root.to_path_buf()).or_default().clone()
+    };
+    let mut last = slot.last.lock().unwrap();
+    let generation = slot.generation.load(Ordering::SeqCst);
+    if let Some((computed_in, at, result)) = last.as_ref() {
+        let ttl = if watched && result.is_ok() { BADGES_TTL_WATCHED } else { BADGES_TTL_UNWATCHED };
+        if *computed_in == generation && at.elapsed() < ttl {
+            return result.clone();
+        }
+    }
+    let result = status_badges(root).map(Arc::new);
+    *last = Some((generation, std::time::Instant::now(), result.clone()));
+    result
+}
+
 fn status_files(root: &Path) -> Result<Vec<FileStatus>, BusError> {
     worktree::status_files(root).map_err(git_mutation("git.status_failed"))
 }
@@ -719,11 +806,63 @@ fn validate_path(path: &str) -> Result<(), BusError> {
     }
 }
 
-fn revision_text(root: &Path, revision: &str, path: &str) -> Result<String, BusError> {
-    let repo = gix::open(root).map_err(gix_err("git.open_failed"))?;
+/// `git.diff.file` returns both sides whole, and the desktop client drops its connection on a
+/// frame over 2 MiB and refuses to show more than 1 MiB anyway. Past this, neither side is sent.
+pub(crate) const DIFF_TEXT_CAP: u64 = 1024 * 1024;
+/// Line counts (`git.diff`, `git.show`, the commit gate's numstat) read further, but not without
+/// bound: a staged multi-GB asset is counted like a binary one, `-` in `git diff --numstat`.
+const COUNT_CAP: u64 = 8 * 1024 * 1024;
+/// Git's own heuristic: a NUL in the first 8000 bytes means binary. Same order of magnitude here.
+const BINARY_PROBE: usize = 8 * 1024;
+/// `git.status` stops listing here so its reply stays well under a client's 2 MiB frame limit.
+/// Internal callers read [`status_files`] directly and always see everything.
+pub(crate) const STATUS_REPLY_CAP: usize = 5000;
+
+pub(crate) fn looks_binary(bytes: &[u8]) -> bool {
+    bytes[..bytes.len().min(BINARY_PROBE)].contains(&0)
+}
+
+/// One side of a diff: its text, or why there is none to show.
+#[derive(Debug, Default)]
+struct Side {
+    text: String,
+    binary: bool,
+    too_large: bool,
+}
+
+impl Side {
+    fn of(bytes: &[u8]) -> Side {
+        if looks_binary(bytes) {
+            Side { binary: true, ..Side::default() }
+        } else {
+            Side { text: String::from_utf8_lossy(bytes).into_owned(), ..Side::default() }
+        }
+    }
+    fn skipped(&self) -> bool {
+        self.binary || self.too_large
+    }
+}
+
+/// A blob by id, loaded only when its header says it is under `cap`.
+fn blob_side(repo: &gix::Repository, id: gix::ObjectId, cap: u64) -> Side {
+    match repo.find_header(id) {
+        Ok(header) if header.kind() != gix::object::Kind::Blob => Side::default(),
+        Ok(header) if header.size() > cap => Side { too_large: true, ..Side::default() },
+        Ok(_) => repo
+            .find_object(id)
+            .ok()
+            .and_then(|object| object.try_into_blob().ok())
+            .map(|blob| Side::of(&blob.data))
+            .unwrap_or_default(),
+        Err(_) => Side::default(),
+    }
+}
+
+/// The tree a revision names, or `None` for an unborn `HEAD` (everything reads as added).
+fn revision_tree<'r>(repo: &'r gix::Repository, revision: &str) -> Result<Option<gix::Tree<'r>>, BusError> {
     let id = match repo.rev_parse_single(revision) {
         Ok(id) => id,
-        Err(_) if revision == "HEAD" => return Ok(String::new()),
+        Err(_) if revision == "HEAD" => return Ok(None),
         Err(error) => return Err(BusError::unavailable("git.revision", error.to_string())),
     };
     let tree = id
@@ -733,40 +872,61 @@ fn revision_text(root: &Path, revision: &str, path: &str) -> Result<String, BusE
         .map_err(gix_err("git.object"))?
         .tree()
         .map_err(gix_err("git.object"))?;
-    let Some(entry) = tree
-        .lookup_entry_by_path(path)
-        .map_err(gix_err("git.object"))?
-    else {
-        return Ok(String::new());
-    };
-    let object = entry.object().map_err(gix_err("git.object"))?;
-    let Ok(blob) = object.try_into_blob() else {
-        return Ok(String::new());
-    };
-    Ok(String::from_utf8_lossy(&blob.data).to_string())
+    Ok(Some(tree))
 }
 
-fn index_text(root: &Path, path: &str) -> Result<String, BusError> {
-    use gix::bstr::ByteSlice;
-    let repo = gix::open(root).map_err(gix_err("git.open_failed"))?;
-    let index = repo.index_or_empty().map_err(gix_err("git.index"))?;
-    let Some(entry) = index.entry_by_path(path.as_bytes().as_bstr()) else {
-        return Ok(String::new());
+fn tree_side(repo: &gix::Repository, tree: Option<&gix::Tree<'_>>, path: &str, cap: u64) -> Result<Side, BusError> {
+    let Some(tree) = tree else { return Ok(Side::default()) };
+    let Some(entry) = tree.lookup_entry_by_path(path).map_err(gix_err("git.object"))? else {
+        return Ok(Side::default());
     };
-    let obj = repo.find_object(entry.id).map_err(gix_err("git.object"))?;
-    let Ok(blob) = obj.try_into_blob() else {
-        return Ok(String::new());
-    };
-    Ok(String::from_utf8_lossy(&blob.data).to_string())
+    Ok(blob_side(repo, entry.object_id(), cap))
 }
-fn working_text(root: &Path, path: &str) -> Result<String, BusError> {
+
+fn index_side(repo: &gix::Repository, index: &gix::index::File, path: &str, cap: u64) -> Side {
+    use gix::bstr::ByteSlice;
+    match index.entry_by_path(path.as_bytes().as_bstr()) {
+        Some(entry) => blob_side(repo, entry.id, cap),
+        None => Side::default(),
+    }
+}
+
+fn working_side(root: &Path, path: &str, cap: u64) -> Result<Side, BusError> {
+    use std::io::Read;
     validate_path(path)?;
-    match std::fs::read(root.join(path)) {
-        Ok(v) => Ok(String::from_utf8_lossy(&v).to_string()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+    let full = root.join(path);
+    let read = std::fs::metadata(&full).and_then(|metadata| {
+        if !metadata.is_file() {
+            return Ok(Side::default());
+        }
+        if metadata.len() > cap {
+            // Still say "binary" when it is: that is the more useful of the two for an asset.
+            let mut probe = Vec::with_capacity(BINARY_PROBE);
+            std::fs::File::open(&full)?.take(BINARY_PROBE as u64).read_to_end(&mut probe)?;
+            return Ok(Side { binary: looks_binary(&probe), too_large: true, ..Side::default() });
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        std::fs::File::open(&full)?.take(cap + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > cap {
+            return Ok(Side { too_large: true, ..Side::default() });
+        }
+        Ok(Side::of(&bytes))
+    });
+    match read {
+        Ok(side) => Ok(side),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Side::default()),
         Err(e) => Err(BusError::unavailable("git.read_failed", e.to_string())),
     }
 }
+
+/// `(added, removed)`; a binary or oversized side counts `0/0`, as `git diff --numstat` prints `-`.
+fn side_counts(old: &Side, new: &Side) -> (i64, i64) {
+    if old.skipped() || new.skipped() {
+        return (0, 0);
+    }
+    counts(&old.text, &new.text)
+}
+
 fn counts(old: &str, new: &str) -> (i64, i64) {
     let (mut a, mut r) = (0, 0);
     for c in TextDiff::from_lines(old, new).iter_all_changes() {
@@ -778,16 +938,31 @@ fn counts(old: &str, new: &str) -> (i64, i64) {
     }
     (a, r)
 }
+
+/// `HEAD` against the index for every staged path, in `git diff --cached --numstat` form. The
+/// repository, `HEAD`'s tree and the index are opened once, not once per file; binary and
+/// oversized blobs are neither loaded nor line-diffed and print as `-\t-`, as git prints them.
 fn staged_numstat(root: &Path) -> Result<String, BusError> {
+    let statuses = status_files(root)?;
     let mut out = String::new();
-    for s in status_files(root)? {
+    if statuses.iter().all(|s| s.index.is_empty()) {
+        return Ok(out);
+    }
+    let repo = gix::open(root).map_err(gix_err("git.open_failed"))?;
+    let head = revision_tree(&repo, "HEAD")?;
+    let index = repo.index_or_empty().map_err(gix_err("git.index"))?;
+    for s in statuses {
         if s.index.is_empty() {
             continue;
         }
-        let old = revision_text(root, "HEAD", &s.path)?;
-        let new = index_text(root, &s.path)?;
-        let (a, r) = counts(&old, &new);
-        out.push_str(&format!("{a}\t{r}\t{}\n", s.path));
+        let old = tree_side(&repo, head.as_ref(), &s.path, COUNT_CAP)?;
+        let new = index_side(&repo, &index, &s.path, COUNT_CAP);
+        if old.skipped() || new.skipped() {
+            out.push_str(&format!("-\t-\t{}\n", s.path));
+        } else {
+            let (a, r) = counts(&old.text, &new.text);
+            out.push_str(&format!("{a}\t{r}\t{}\n", s.path));
+        }
     }
     Ok(out)
 }
@@ -1095,23 +1270,15 @@ fn tree_diff_files(
                     location.to_string(),
                     None,
                     "A",
-                    String::new(),
-                    repo.find_object(id.detach())
-                        .ok()
-                        .and_then(|o| o.try_into_blob().ok())
-                        .map(|b| String::from_utf8_lossy(&b.data).to_string())
-                        .unwrap_or_default(),
+                    Side::default(),
+                    blob_side(repo, id.detach(), COUNT_CAP),
                 ),
                 Change::Deletion { location, id, .. } => (
                     location.to_string(),
                     None,
                     "D",
-                    repo.find_object(id.detach())
-                        .ok()
-                        .and_then(|o| o.try_into_blob().ok())
-                        .map(|b| String::from_utf8_lossy(&b.data).to_string())
-                        .unwrap_or_default(),
-                    String::new(),
+                    blob_side(repo, id.detach(), COUNT_CAP),
+                    Side::default(),
                 ),
                 Change::Modification {
                     location,
@@ -1122,16 +1289,8 @@ fn tree_diff_files(
                     location.to_string(),
                     None,
                     "M",
-                    repo.find_object(previous_id.detach())
-                        .ok()
-                        .and_then(|o| o.try_into_blob().ok())
-                        .map(|b| String::from_utf8_lossy(&b.data).to_string())
-                        .unwrap_or_default(),
-                    repo.find_object(id.detach())
-                        .ok()
-                        .and_then(|o| o.try_into_blob().ok())
-                        .map(|b| String::from_utf8_lossy(&b.data).to_string())
-                        .unwrap_or_default(),
+                    blob_side(repo, previous_id.detach(), COUNT_CAP),
+                    blob_side(repo, id.detach(), COUNT_CAP),
                 ),
                 Change::Rewrite {
                     source_location,
@@ -1143,27 +1302,19 @@ fn tree_diff_files(
                     location.to_string(),
                     Some(source_location.to_string()),
                     "R",
-                    repo.find_object(source_id.detach())
-                        .ok()
-                        .and_then(|o| o.try_into_blob().ok())
-                        .map(|b| String::from_utf8_lossy(&b.data).to_string())
-                        .unwrap_or_default(),
-                    repo.find_object(id.detach())
-                        .ok()
-                        .and_then(|o| o.try_into_blob().ok())
-                        .map(|b| String::from_utf8_lossy(&b.data).to_string())
-                        .unwrap_or_default(),
+                    blob_side(repo, source_id.detach(), COUNT_CAP),
+                    blob_side(repo, id.detach(), COUNT_CAP),
                 ),
             };
             if !path.is_empty() {
-                let (added, removed) = counts(&old, &new);
+                let (added, removed) = side_counts(&old, &new);
                 files.push(DiffFile {
                     path,
                     old_path,
                     status: status.into(),
                     added,
                     removed,
-                    binary: old.contains('\0') || new.contains('\0'),
+                    binary: old.binary || new.binary,
                 });
             }
             Ok::<_, std::io::Error>(std::ops::ControlFlow::Continue(()))
@@ -1172,6 +1323,7 @@ fn tree_diff_files(
     Ok(files)
 }
 fn changed(ctx: &mut Ctx, project_id: relay_bus::types::Id, root: &Path) {
+    invalidate_badges(root);
     ctx.set_project(project_id);
     ctx.emit(
         "git.changed",
@@ -1446,5 +1598,25 @@ mod tests {
         assert!(fetch_remote(root).is_err());
         assert_eq!(git(root, &["rev-parse", "main"]), local);
         assert_eq!(new_worktree_base(root, "main").unwrap_err().code, "git.base_diverged");
+    }
+
+    #[test]
+    fn staged_numstat_matches_git_and_prints_binary_as_dashes() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        git(root, &["config", "user.name", "Relay Test"]);
+        git(root, &["config", "user.email", "relay@example.test"]);
+        std::fs::write(root.join("code.rs"), "one\ntwo\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "Initial"]);
+        std::fs::write(root.join("code.rs"), "one\nthree\nfour\n").unwrap();
+        std::fs::write(root.join("Hero.uasset"), b"asset\0\x01\x02\n").unwrap();
+        git(root, &["add", "."]);
+        let ours: std::collections::BTreeSet<String> = staged_numstat(root).unwrap().lines().map(str::to_owned).collect();
+        let theirs: std::collections::BTreeSet<String> =
+            git(root, &["diff", "--cached", "--numstat"]).lines().map(str::to_owned).collect();
+        assert_eq!(ours, theirs);
+        assert!(ours.contains("-\t-\tHero.uasset"), "{ours:?}");
     }
 }
