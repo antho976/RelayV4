@@ -115,6 +115,40 @@ def remove(paths):
     return removed
 
 
+def fix_sockets(paths):
+    """Sockets that came from empties arrive with the FBX axis conversion's roll (-90 degrees)
+    on them, which turns whatever is attached. Put back what the empties meant: no rotation for
+    an empty with none of its own (or for every socket with socket_rotation="zero")."""
+    mode = ARGS.get("socket_rotation", "match")
+    if mode == "keep" or kind != "static":
+        return []
+    meant = dict((s["name"].lower(), s) for s in ARGS.get("sockets") or [])
+    fixed = []
+    for path in paths:
+        mesh = unreal.load_asset(path)
+        if not isinstance(mesh, unreal.StaticMesh):
+            continue
+        changed = False
+        for socket in mesh.get_editor_property("sockets"):
+            name = str(socket.get_editor_property("socket_name"))
+            key = name.lower()
+            key = key[len("socket_"):] if key.startswith("socket_") else key
+            spec = meant.get(key)
+            if mode == "zero" or (spec is not None and spec.get("identity")):
+                before = socket.get_editor_property("relative_rotation")
+                if abs(before.roll) + abs(before.pitch) + abs(before.yaw) > 0.01:
+                    socket.set_editor_property("relative_rotation", unreal.Rotator(roll=0.0, pitch=0.0, yaw=0.0))
+                    fixed.append({"mesh": path, "socket": name, "was": [round(before.pitch, 2), round(before.yaw, 2), round(before.roll, 2)]})
+                    changed = True
+            elif spec is not None:
+                r = socket.get_editor_property("relative_rotation")
+                fixed.append({"mesh": path, "socket": name, "left_as_imported": [round(r.pitch, 2), round(r.yaw, 2), round(r.roll, 2)],
+                              "blender_rotation_deg": spec.get("rotation_deg"), "note": "rotated in Blender; check it with ue_screenshot"})
+        if changed:
+            save_asset(mesh)
+    return fixed
+
+
 importer = ARGS.get("importer", "legacy")
 previous = cvar_int(CVAR)
 attempts = []
@@ -136,6 +170,8 @@ finally:
         set_cvar(CVAR, previous)
 
 final = attempts[-1]
+sockets_fixed = fix_sockets([m["path"] for m in final["imported"]]) if not final.get("cleaned_up") else []
 emit({"imported": final["imported"] if not final.get("cleaned_up") else [], "importer": final["importer"],
+      "sockets": sockets_fixed,
       "attempts": attempts, "interchange_fbx_cvar": previous,
       "failed": bool(final.get("cleaned_up")) or not final["imported"]})

@@ -51,7 +51,11 @@ left out), deform bones only, no leaf bones. `animation`: the armature's action 
 `fbx_options` overrides any exporter option. Returns the objects exported, sockets, collision and
 the size in cm.
 
-### `blender_to_unreal` — `{ file, objects?, kind, action?, animations?, destination, name?, skeleton?, fbx_path?, materials? }`
+### `blender_to_unreal` — `{ file, objects?, kind, action?, animations?, destination, name?, skeleton?, fbx_path?, materials?, socket_rotation?, importer?, normals?, allow_problems? }`
+Sockets from `SOCKET_` empties arrive with a -90° roll from the axis conversion; with
+`socket_rotation: "match"` (default) a socket whose empty had no rotation of its own is set back to
+zero and the mesh saved (`zero` resets all, `keep` leaves them).
+
 Exports (to `Saved/Relay/Exports/<name>.fbx` unless `fbx_path` says otherwise), imports into the
 running Unreal editor through the Unreal plugin (same project guard and editor lock), and
 compares: height in Unreal against Blender (a x100 difference is a unit problem), a skeletal
