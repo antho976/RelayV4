@@ -24,6 +24,29 @@ def load(path, what="asset"):
     return asset
 
 
+def asset_exists(package):
+    """Whether a package holds an asset, from the Asset Registry. EditorAssetLibrary's path
+    functions (does_asset_exist, save_asset, delete_asset) were seen returning False for every
+    asset for the rest of a session after a failed import; the registry kept answering."""
+    registry = unreal.AssetRegistryHelpers.get_asset_registry()
+    package = str(package).split(".")[0]
+    try:
+        return len(registry.get_assets_by_package_name(package)) > 0
+    except Exception:
+        return bool(unreal.EditorAssetLibrary.does_asset_exist(package))
+
+
+def save_asset(asset):
+    """Save one loaded asset, falling back to saving its package directly."""
+    try:
+        if unreal.EditorAssetLibrary.save_loaded_asset(asset, False):
+            return True
+    except Exception:
+        pass
+    package = asset.get_outermost()
+    return bool(unreal.EditorLoadingAndSavingUtils.save_packages([package], False))
+
+
 def find_actor(key):
     for actor in actor_subsystem().get_all_level_actors():
         if actor.get_actor_label() == key or actor.get_path_name() == key or actor.get_name() == key:

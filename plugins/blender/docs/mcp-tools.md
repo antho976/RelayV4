@@ -30,6 +30,12 @@ materials. Other meshes are hidden unless `isolate` is false. The file is not mo
 left/right pairs, facing, height, and per skinned mesh the unweighted vertices, influence counts,
 non-manifold edges, loose vertices and degenerate faces.
 
+### `blender_mesh_check` — `{ file, objects? }`
+On the evaluated meshes (modifiers applied): zero-area faces, zero-length edges and inside-out
+normals are problems; loose vertices, n-gons (tangents are then skipped by the FBX exporter) and
+missing UVs are warnings. `blender_export` runs it and refuses broken meshes unless
+`allow_problems` is set.
+
 ### `blender_anim_inspect` — `{ file, armature?, action?, frames?, samples?, track?, attachments?, partner?, contacts?, body_radius?, touch_distance? }`
 The Blender twin of `ue_anim_inspect`, run before export. References: `bone`, `bone:tail`,
 `obj:<object or empty>`, `item:<attachment>:<end_a|end_b|center|origin>`, `partner:<bone>`.

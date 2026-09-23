@@ -47,6 +47,8 @@
         "ue_profile",
         "ue_run_tests",
         "ue_crash",
+        "ue_editor_launch",
+        "ue_editor_quit",
         "ue_editor_lock"
       ]
     }

@@ -29,6 +29,7 @@ const PY_RENDER: &str = include_str!("blender_py/render.py");
 const PY_RIG_CHECK: &str = include_str!("blender_py/rig_check.py");
 const PY_ANIM_INSPECT: &str = include_str!("blender_py/anim_inspect.py");
 const PY_EXPORT: &str = include_str!("blender_py/export.py");
+const PY_MESH_CHECK: &str = include_str!("blender_py/mesh_check.py");
 
 pub fn serve() -> Result<u8> {
     let stdin = std::io::stdin();
@@ -132,6 +133,9 @@ fn tools() -> Vec<Value> {
         tool("blender_rig_check",
             "Check a rig and its skin before export: applied transforms, a single root bone, deform bones, leftover _end bones, left/right symmetry and naming, facing (-Y is Blender's front), skinned meshes with unweighted vertices, too many influences, weights on non-deform bones, stray vertex groups, missing UVs, non-manifold or inside-out geometry, and height in cm. Returns problems (must fix), warnings and passed.",
             json!({"file": file_arg(), "armature":{"type":"string"}, "meshes":{"type":"array","items":{"type":"string"}}}), &["file"], true),
+        tool("blender_mesh_check",
+            "Check meshes as they will be exported (modifiers applied): zero-area faces (e.g. a bevel wider than a thin part), zero-length edges, inside-out normals are problems; loose vertices, n-gons (the FBX exporter then skips tangents) and missing UVs are warnings. blender_export runs the same check and refuses to write a broken mesh.",
+            json!({"file": file_arg(), "objects":{"type":"array","items":{"type":"string"}}}), &["file"], true),
         tool("blender_anim_inspect",
             "Measure an action before export, like ue_anim_inspect: at sampled frames, where tracked bones and objects are in the character's frame ([forward, right, up] cm, sides from the rig's .L/.R pairs); attached items (objects parented to a bone) with grip distances and clearance to the body; a partner armature's clearance; expected contacts (touch or apart, with a frame window); feet below the ground. Returns problems and passed.",
             json!({
@@ -159,7 +163,8 @@ fn tools() -> Vec<Value> {
                 "action":{"type":"string"},
                 "animations":{"type":"boolean"},
                 "all_actions":{"type":"boolean","description":"One take per action (fake-user actions included)"},
-                "fbx_options":{"type":"object"}
+                "fbx_options":{"type":"object"},
+                "allow_problems":{"type":"boolean","description":"Export even when the mesh check or armature scale finds problems"}
             }), &["file","path"], false),
         tool("blender_to_unreal",
             "Export from Blender and import into the running Unreal editor in one step, then measure the result: imported assets, their size against the Blender size (a 100x difference means a unit problem), a skeletal mesh's root bone scale and which way it faces, and which hand ends up on which side. Needs the Unreal plugin on and the editor open.",
@@ -173,7 +178,10 @@ fn tools() -> Vec<Value> {
                 "name":{"type":"string","description":"Asset name in Unreal"},
                 "skeleton":{"type":"string","description":"Existing Skeleton asset, for animations and shared rigs"},
                 "fbx_path":{"type":"string","description":"Where to keep the FBX, relative to the checkout; default Saved/Relay/Exports/<name>.fbx"},
-                "materials":{"type":"boolean"}
+                "materials":{"type":"boolean"},
+                "allow_problems":{"type":"boolean","description":"Export even when the mesh check finds problems"},
+                "importer":{"type":"string","enum":["legacy","interchange"],"description":"Default legacy: Interchange FBX produced empty meshes and transient materials on UE 5.8. The other is tried if the first fails."},
+                "normals":{"type":"string","enum":["FBXNIM_IMPORT_NORMALS","FBXNIM_IMPORT_NORMALS_AND_TANGENTS","FBXNIM_COMPUTE_NORMALS"],"description":"Default FBXNIM_IMPORT_NORMALS (tangents computed): imported tangents from Blender gave a mesh that drew only its shadow"}
             }), &["file","kind","destination"], false),
     ]
 }
@@ -188,7 +196,11 @@ fn call(name: &str, args: &Value) -> Result<Value> {
         "blender_python" => {
             let mut a = args.clone();
             if let Some(save_as) = args["save_as"].as_str() {
-                a["save_as"] = json!(resolve_new(&root, save_as, "blend")?);
+                let target = resolve_new(&root, save_as, "blend")?;
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+                }
+                a["save_as"] = json!(target);
             }
             let file = args["file"].as_str().filter(|f| !f.is_empty()).map(|f| resolve(&root, f)).transpose()?;
             run(PY_RUN, &a, file.as_deref(), secs(args, 300))
@@ -214,6 +226,7 @@ fn call(name: &str, args: &Value) -> Result<Value> {
                 }
             }
         }
+        "blender_mesh_check" => run(PY_MESH_CHECK, args, Some(&resolve(&root, required(args, "file")?)?), secs(args, 300)),
         "blender_rig_check" => run(PY_RIG_CHECK, args, Some(&resolve(&root, required(args, "file")?)?), secs(args, 300)),
         "blender_anim_inspect" => run(PY_ANIM_INSPECT, args, Some(&resolve(&root, required(args, "file")?)?), secs(args, 300)),
         "blender_export" => {
@@ -385,14 +398,23 @@ fn to_unreal(root: &Path, args: &Value) -> Result<Value> {
     let exported = run(PY_EXPORT, &json!({
         "objects": args["objects"], "path": fbx, "kind": kind, "action": args["action"],
         "animations": args["animations"].as_bool().unwrap_or(kind == "animation"),
+        "allow_problems": args["allow_problems"],
     }), Some(&file), Duration::from_secs(600))?;
-    let imported = crate::unreal::import_fbx(&fbx, json!({
+    let mut import_args = json!({
         "kind": kind, "destination": required(args, "destination")?, "name": args["name"],
         "skeleton": args["skeleton"], "animations": args["animations"], "materials": args["materials"],
-    }))?;
+    });
+    for key in ["importer", "normals"] {
+        if let Some(v) = args.get(key).filter(|v| v.is_string()) {
+            import_args[key] = v.clone();
+        }
+    }
+    let imported = crate::unreal::import_fbx(&fbx, import_args)?;
     let checks = compare(&exported, &imported);
-    Ok(json!({"fbx": fbx, "exported": exported, "imported": imported["imported"], "import_log": imported["import_log"],
-        "problems": checks, "passed": checks.is_empty()}))
+    Ok(json!({"fbx": fbx, "exported": exported, "imported": imported["imported"], "importer": imported["importer"],
+        "attempts": imported["attempts"], "render_check": imported["render_check"], "import_log": imported["import_log"],
+        "problems": checks, "passed": checks.is_empty(),
+        "_images": imported["_images"], "_cleanup": imported["_cleanup"]}))
 }
 
 /// What should survive the trip: height (Z is up on both sides), a root bone scale of 1, and the
@@ -401,6 +423,20 @@ fn to_unreal(root: &Path, args: &Value) -> Result<Value> {
 /// Unreal as (x, -y, z) with the export's default axes.
 fn compare(exported: &Value, imported: &Value) -> Vec<String> {
     let mut problems = Vec::new();
+    if imported["failed"] == true {
+        problems.push(format!(
+            "the import failed with every importer tried and the broken assets were deleted again: {}",
+            serde_json::to_string(&imported["attempts"]).unwrap_or_default()
+        ));
+    }
+    for check in imported["render_check"].as_array().cloned().unwrap_or_default() {
+        if check["renders"] == false {
+            problems.push(format!(
+                "{} does not render (coverage {}): typically broken normals or tangents - re-export after blender_mesh_check, and import with normals=FBXNIM_IMPORT_NORMALS",
+                check["path"].as_str().unwrap_or("?"), check["coverage"]
+            ));
+        }
+    }
     let blender_height = exported["size_cm"][2].as_f64();
     let expected_forward = exported["forward_world"].as_array()
         .and_then(|f| Some([f.first()?.as_f64()?, -f.get(1)?.as_f64()?, f.get(2)?.as_f64()?]));
@@ -420,6 +456,9 @@ fn compare(exported: &Value, imported: &Value) -> Vec<String> {
                     ));
                 }
             }
+        }
+        if let Some(mats) = asset["transient_materials"].as_array().filter(|m| !m.is_empty()) {
+            problems.push(format!("{path}: materials {mats:?} are not saved assets, so the mesh cannot be saved; import with materials=false and assign project materials"));
         }
         if let Some(scale) = asset["root_bone_scale"].as_array() {
             if scale.iter().filter_map(Value::as_f64).any(|s| (s - 1.0).abs() > 0.01) {
@@ -531,6 +570,21 @@ mod tests {
 
         let script = run(PY_RUN, &json!({"code": "print(len(bpy.data.objects))"}), Some(&fixture), t).unwrap();
         assert_eq!(script["output"].as_str().unwrap().lines().last(), Some("6"));
+
+        // A bevel wider than a thin plate collapses faces: the check sees it on the evaluated mesh
+        // and export refuses to write it.
+        let plate = dir.path().join("sub/dir/plate.blend");
+        let made = run(PY_RUN, &json!({
+            "code": "import bmesh\nbpy.ops.wm.read_factory_settings(use_empty=True)\nme = bpy.data.meshes.new('Plate')\nbm = bmesh.new()\nbmesh.ops.create_cube(bm, size=1.0)\nfor v in bm.verts:\n    v.co.z *= 0.002\nbm.to_mesh(me)\nbm.free()\no = bpy.data.objects.new('Plate', me)\nbpy.context.scene.collection.objects.link(o)\nm = o.modifiers.new('Bevel', 'BEVEL')\nm.width = 0.3\nm.segments = 3\nm.limit_method = 'NONE'\nprint('made')",
+            "save_as": plate,
+        }), None, t).unwrap();
+        assert_eq!(made["output"].as_str().unwrap().trim(), "made");
+        assert!(plate.is_file(), "save_as did not create its folders");
+        let check = run(PY_MESH_CHECK, &json!({}), Some(&plate), t).unwrap();
+        assert_eq!(check["passed"], false, "{check}");
+        assert!(check["meshes"][0]["degenerate_faces"].as_u64().unwrap() > 0 || check["meshes"][0]["zero_length_edges"].as_u64().unwrap() > 0, "{check}");
+        let refused = run(PY_EXPORT, &json!({"path": dir.path().join("plate.fbx"), "kind": "static"}), Some(&plate), t).unwrap_err();
+        assert!(format!("{refused:#}").contains("not exported"), "{refused:#}");
 
         let broken = run(PY_RUN, &json!({"code": "raise ValueError('nope')"}), None, t).unwrap_err();
         assert!(format!("{broken:#}").contains("ValueError: nope"), "{broken:#}");

@@ -188,6 +188,17 @@ Export:
 - Skeletal exports carry deform bones only; control bones' motion must already be on deform
   bones (baked).
 
+## Pitfalls seen in real exports
+
+- **The UE mannequin comes into Blender at scale 0.01.** Apply the scale to the armature, its
+  meshes and its actions before animating for export; `blender_export` refuses a rig whose object
+  scale is not 1.
+- **Keys on IK and control bones** do not export: only the evaluated pose of deform bones does.
+  Bake to the deform bones (`nla.bake` with visual keying) when in doubt, and check the baked
+  result with `blender_anim_inspect`; `blender_export` warns when an action keys non-deform bones.
+- **Retarget source**: an animation made on one body plays wrongly on a skeleton with other
+  proportions. Retarget in Unreal (IK Retargeter) instead of importing onto the other skeleton.
+
 ## 10. Verify your work
 
 For every action, before export:

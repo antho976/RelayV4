@@ -11,7 +11,7 @@ plugin key on the project's row in the sidebar. Relay suggests it for any projec
 | --- | --- | --- |
 | 20 Unreal skills | `.claude/skills/unreal-*/` and `.agents/skills/unreal-*/` in the project root and in every agent worktree (git-excluded), plus the provider homes for Codex | The moment you switch the plugin on, including for agents already running |
 | Working rules (`instructions.md`) | The agent's session brief, injected into its system prompt | Every start, wake and resume |
-| `unreal` MCP server (23 tools) | `.relay/relay.mcp.json` for Claude Code, `--config mcp_servers.unreal.*` for Codex | Every start, wake and resume |
+| `unreal` MCP server (25 tools) | `.relay/relay.mcp.json` for Claude Code, `--config mcp_servers.unreal.*` for Codex | Every start, wake and resume |
 
 **Where agents work.** An Unreal editor has one project open, so with the plugin on, a new
 agent starts in the project's main checkout (the one your editor opens) instead of its own git

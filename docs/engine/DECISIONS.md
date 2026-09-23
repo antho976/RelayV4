@@ -954,3 +954,21 @@ The *why* behind anything surprising. Append; never rewrite history. Reference a
   measured again after import. `blender_to_unreal` calls the Unreal bridge in-process, sharing its
   project guard and editor lock, and compares height, root bone scale and hand sides across the
   handoff. The Blender tests run against real Blender when it is installed and skip otherwise.
+- **D162 The Unreal bridge owns the editor process, and imports verify that they draw.** A real
+  game session on UE 5.8/Linux showed the failures were at the edges of the tools, not in them:
+  builds without `UE_ROOT`, a leftover crash reporter turning a build into an unloaded hot-reload
+  module, a Remote Control port held after quitting, an editor throttled in the background, a
+  scene-capture show-only list that crashed the editor, Interchange importing empty meshes and
+  transient materials, imported tangents that made a mesh invisible, and EditorAssetLibrary path
+  functions failing for a whole session after a failed import. The bridge now finds the engine
+  from a running editor, the project log, a source tree, `Install.ini` (GUID or version) or common
+  folders; stops crash reporters and refuses to build under a running editor, reading
+  `UnrealEditor.modules` afterwards; launches and quits the editor itself, waiting for the port
+  and reading the log for a failed bind (`ue_build restart_editor` is the Linux C++ loop); writes
+  `DefaultRemoteControl.ini` keys checked against the engine header; turns the background
+  throttle off during play and reports frames per second; pairs each play screenshot with its
+  own file after the probe; isolates by hiding neighbours and previews away from the level;
+  imports with the legacy FBX importer, normals only and replaced settings, deletes and retries a
+  broken result, and renders every imported mesh once to measure its coverage. Registry lookups
+  replace path-function checks. On the Blender side, export refuses meshes the check finds broken
+  on the evaluated mesh and rigs not at scale 1.

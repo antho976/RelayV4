@@ -6,19 +6,28 @@
   "summary": "Makes every agent in the project able to build, check and ship game art in Blender: 6 skills, standing rules, and a background Blender toolchain with renders it can see.",
   "description": "Turn it on for a project that keeps .blend files. Every agent launched there gets Blender skills (fundamentals and bpy, game-ready modeling, rigging and skinning, animation, materials and baking, and the Blender-to-Unreal pipeline), the plugin's rules in its brief, and the `blender` MCP server, which runs Blender in background mode on the checkout's files - no Blender window needed: file inspection, Python, renders from any angle and frame returned as images, rig and skin checks, animation measurement (sides, grips, clearance, contacts), FBX export with Unreal's conventions, and a one-step export-import-verify into a running Unreal editor when the Unreal Engine plugin is on too.",
   "instructions": "instructions.md",
-  "docs": ["README.md", "docs/setup.md", "docs/mcp-tools.md"],
-  "detect": [".blend"],
+  "docs": [
+    "README.md",
+    "docs/setup.md",
+    "docs/mcp-tools.md"
+  ],
+  "detect": [
+    ".blend"
+  ],
   "mcp_servers": [
     {
       "name": "blender",
       "description": "Background Blender on .blend files in this checkout: inspect, run Python, render images, check rigs and skinning, measure actions, export FBX for Unreal, and export-import-verify into a running Unreal editor.",
       "command": "relay",
-      "args": ["blender-mcp"],
+      "args": [
+        "blender-mcp"
+      ],
       "tools": [
         "blender_info",
         "blender_python",
         "blender_render",
         "blender_rig_check",
+        "blender_mesh_check",
         "blender_anim_inspect",
         "blender_export",
         "blender_to_unreal"

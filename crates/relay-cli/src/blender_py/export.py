@@ -34,6 +34,24 @@ if arm is not None and ARGS.get("action"):
 if kind == "animation":
     selected = set([arm])
 
+# Check what will be written before writing it: a broken mesh exports "fine" and then imports
+# empty, invisible or shaded wrong.
+mesh_checks = [mesh_report(o) for o in selected if o.type == "MESH" and not o.name.startswith(("UCX_", "UBX_", "USP_"))]
+export_problems = [dict(object=r["object"], problem=p) for r in mesh_checks for p in r["problems"]]
+export_warnings = [dict(object=r["object"], problem=p) for r in mesh_checks for p in r["warnings"]]
+if arm is not None:
+    if any(abs(c - 1.0) > 1e-3 for c in arm.scale):
+        export_problems.append(dict(object=arm.name, problem="armature object scale is %s (the UE mannequin imports at 0.01): apply scale (with its meshes and actions) so the rig exports at 1" % rnd(arm.scale, 3)))
+    act = arm.animation_data.action if arm.animation_data else None
+    if act is not None and kind != "static":
+        deform = set(b.name for b in arm.data.bones if b.use_deform)
+        keyed = set(fc.data_path.split('"')[1] for fc in act.fcurves if fc.data_path.startswith("pose.bones["))
+        control = sorted(keyed - deform)
+        if control:
+            export_warnings.append(dict(object=arm.name, problem="action %s keys non-deform bones %s (IK or controls): only the evaluated pose of deform bones is exported - check the result with blender_anim_inspect, or bake to deform bones (nla.bake with visual keying) first" % (act.name, ", ".join(control[:8]))))
+if export_problems and not ARGS.get("allow_problems"):
+    raise RuntimeError("not exported, the result would be broken in Unreal: %s. Fix them (or pass allow_problems=true)." % json.dumps(export_problems))
+
 for o in scene.objects:
     o.select_set(False)
 for o in selected:
@@ -71,6 +89,7 @@ if arm is not None and kind != "static":
     if f["pairs"]:
         facing = rnd(f["forward"], 3)
 emit({"path": path, "bytes": os.path.getsize(path), "kind": kind, "forward_world": facing,
+      "mesh_checks": mesh_checks, "problems": export_problems, "warnings": export_warnings,
       "objects": sorted(o.name for o in selected),
       "sockets": sorted(o.name for o in selected if o.type == "EMPTY" and o.name.startswith("SOCKET_")),
       "collision": sorted(o.name for o in selected if o.name.startswith(("UCX_", "UBX_", "USP_"))),

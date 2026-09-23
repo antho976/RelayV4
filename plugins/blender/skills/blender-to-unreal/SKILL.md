@@ -195,6 +195,24 @@ Scene, Force Front X Axis and Convert Scene Unit live there). Signs: `Interchang
 asset, inspect it, and only then batch. Leave Force Front X Axis off with these export
 settings. Record in the project docs which importer and settings the project uses.
 
+## What the handoff now does for you
+
+- **Before export**: `blender_export` runs `blender_mesh_check` on the evaluated meshes and refuses
+  to write zero-area faces (typically a bevel wider than a thin part), zero-length edges or
+  inside-out normals; n-gons are a warning because the FBX exporter then skips tangents. It also
+  refuses an armature whose object scale is not 1 (the UE mannequin imports into Blender at 0.01:
+  apply scale to the rig, its meshes and its actions first) and warns when an action keys
+  non-deform (IK or control) bones.
+- **Import**: the legacy FBX importer by default, normals imported and tangents computed, import
+  settings replaced on re-import, materials checked for transient instances.
+- **After import**: every mesh is rendered once and its screen coverage measured; a mesh that
+  does not draw is reported, and broken results are deleted again.
+
+**Animations onto an existing Unreal skeleton**: check the retarget source. An animation authored
+on one body and imported onto a skeleton with other proportions needs the IK Retargeter (or the
+right retarget source on the sequence), not a direct import; verify with `ue_anim_inspect` after
+import.
+
 ## Verify your work
 
 - [ ] `blender_info`: no unapplied rotation/scale on exported objects; sizes plausible in cm.
