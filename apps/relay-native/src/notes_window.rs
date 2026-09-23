@@ -11,6 +11,12 @@ pub struct NotesWindow {
     pending: Cell<bool>,
     restored: Cell<bool>,
     persist_timer: RefCell<Option<glib::SourceId>>,
+    /// Events may have been missed (a reconnect); reload once the registry is back.
+    stale: Cell<bool>,
+    /// A reload was asked for while the window was hidden; it runs when the window shows.
+    deferred: Cell<bool>,
+    /// The document library of the rendered project, rebuilt alone when only notes change.
+    pub(super) rail: RefCell<Option<super::note_pages::NotesRail>>,
 }
 impl NotesWindow {
     fn new(ui: &Rc<Ui>) -> Rc<Self> {
@@ -71,6 +77,22 @@ impl NotesWindow {
             pending: Cell::new(false),
             restored: Cell::new(false),
             persist_timer: RefCell::new(None),
+            stale: Cell::new(false),
+            deferred: Cell::new(false),
+            rail: RefCell::new(None),
+        });
+        let weak = Rc::downgrade(ui);
+        owned.window.connect_show(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                let deferred = ui
+                    .notes_window
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|window| window.deferred.replace(false));
+                if deferred {
+                    refresh_notes(&ui);
+                }
+            }
         });
         let weak = Rc::downgrade(ui);
         owned.window.connect_close_request(move |window| {
@@ -130,6 +152,22 @@ pub fn show_project(ui: &Rc<Ui>, project: i64) {
     window.window.present();
     refresh_notes(ui);
 }
+/// Called from the main refresh loop: load the Notes window the first time a project is
+/// known, and once after a reconnect. Note edits arrive as notes.* events instead, so agent
+/// state changes never rebuild this window.
+pub fn catch_up_notes(ui: &Rc<Ui>) {
+    let Some(window) = ui.notes_window.borrow().clone() else {
+        return;
+    };
+    if window.rendered_project.get() == 0 || window.stale.replace(false) {
+        refresh_notes(ui);
+    }
+}
+pub fn mark_notes_stale(ui: &Rc<Ui>) {
+    if let Some(window) = ui.notes_window.borrow().as_ref() {
+        window.stale.set(true);
+    }
+}
 pub fn refresh_notes(ui: &Rc<Ui>) {
     let Some(window) = ui.notes_window.borrow().clone() else {
         return;
@@ -138,6 +176,11 @@ pub fn refresh_notes(ui: &Rc<Ui>) {
         window.project.set(ui.project.get());
     }
     if window.project.get() == 0 {
+        return;
+    }
+    // Nobody sees a hidden window; rebuild it when it shows instead of taking focus now.
+    if !window.window.is_visible() {
+        window.deferred.set(true);
         return;
     }
     window.pending.set(true);

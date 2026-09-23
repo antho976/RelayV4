@@ -22,7 +22,7 @@ pub(crate) fn startup(ui: &Rc<Ui>) {
                     .await
                 {
                     Ok(result) if result["started"] != true => {
-                        ui.show_error(&format!("{provider}: {}", text(&result, "message")))
+                        ui.show_info(&format!("{provider}: {}", text(&result, "message")))
                     }
                     Err(error) => ui.show_error(&format!("{provider} update: {error}")),
                     _ => {}
@@ -39,14 +39,14 @@ pub(crate) fn update(ui: &Rc<Ui>, provider: &'static str) {
             .call("provider.update", json!({"provider":provider}))
             .await
         {
-            Ok(result) => ui.show_error(text(&result, "message")),
+            Ok(result) => ui.show_info(text(&result, "message")),
             Err(error) => ui.show_error(&format!("{provider} update: {error}")),
         }
     });
 }
 
 pub(crate) fn event(ui: &Rc<Ui>, value: &Value) {
-    ui.show_error(&format!(
+    ui.show_info(&format!(
         "{}: {}",
         text(value, "provider"),
         text(value, "message")

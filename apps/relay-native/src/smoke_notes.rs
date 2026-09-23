@@ -159,14 +159,14 @@ pub async fn run(ui: &Rc<Ui>) -> Result<(), String> {
     toggle.emit_clicked();
     require(owner.rail_collapsed.get(), "Library did not collapse")?;
     crate::pages::refresh_notes(ui);
-    wait_for(
-        || {
-            named(&owner.window, "notes-library-split")
-                .is_some_and(|new| new != split.clone().upcast::<gtk::Widget>())
-        },
-        "Notes refresh completed",
-    )
-    .await?;
+    // A refresh for the same project refills the library in place; the split, and with it
+    // the open editors, stays mounted.
+    glib::timeout_future(Duration::from_millis(300)).await;
+    require(
+        named(&owner.window, "notes-library-split")
+            .is_some_and(|same| same == split.clone().upcast::<gtk::Widget>()),
+        "Refresh rebuilt the Notes page instead of the library",
+    )?;
     require(
         owner.rail_collapsed.get(),
         "Refresh reset collapsed library",

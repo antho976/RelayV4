@@ -89,7 +89,7 @@ impl Editor {
             return;
         }
         if self.is_dirty() {
-            ui.show_error("Save or discard your changes before switching checkouts.");
+            ui.show_info("Save or discard your changes before switching checkouts.");
             return;
         }
         let agents = self.agents_visible();

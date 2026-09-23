@@ -8,11 +8,11 @@ impl Ui {
                 return;
             }
             if self.editor.is_dirty() {
-                self.show_error("Save or discard editor changes before switching projects.");
+                self.show_info("Save or discard editor changes before switching projects.");
                 return;
             }
             if self.launch_busy.get() {
-                self.show_error("Wait for agent creation to finish before switching projects.");
+                self.show_info("Wait for agent creation to finish before switching projects.");
                 return;
             }
             self.launch.set_reveal_child(false);
@@ -30,24 +30,49 @@ impl Ui {
         }
         self.navigate(page);
     }
+    /// Each project's lamp and live-session count, updated in place. Session state changes
+    /// every time an agent goes idle or busy; rebuilding the tree for that would close an
+    /// open project menu and redo every row, menu and drag source.
+    pub(super) fn update_project_live(&self) {
+        let sessions = self.sidebar_sessions.borrow();
+        for (id, (lamp, count)) in self.project_live.borrow().iter() {
+            let mine: Vec<&Value> = sessions
+                .iter()
+                .filter(|s| s["project_id"].as_i64() == Some(*id))
+                .collect();
+            let live = mine
+                .iter()
+                .filter(|s| matches!(text(s, "state"), "spawning" | "running" | "idle" | "blocked"))
+                .count();
+            lamp.remove_css_class("held");
+            lamp.remove_css_class("live");
+            if mine.iter().any(|s| text(s, "state") == "blocked") {
+                lamp.add_css_class("held");
+            } else if mine
+                .iter()
+                .any(|s| matches!(text(s, "state"), "running" | "spawning"))
+            {
+                lamp.add_css_class("live");
+            }
+            count.set_text(&live.to_string());
+            count.set_visible(live > 0);
+        }
+    }
     pub(super) fn render_projects(self: &Rc<Self>) {
-        // Only registry or visible session state changes rebuild the project tree.
+        // Only the registry and the selected project rebuild the tree; see update_project_live.
         let signature = format!(
-            "{}:{}:{}:{:?}",
+            "{}:{}:{}",
             self.project.get(),
             serde_json::to_string(&*self.projects.borrow()).unwrap_or_default(),
             serde_json::to_string(&*self.workspaces.borrow()).unwrap_or_default(),
-            self.sidebar_sessions
-                .borrow()
-                .iter()
-                .map(|s| (s["project_id"].as_i64(), text(s, "state").to_owned()))
-                .collect::<Vec<_>>()
         );
         if self.projects_box.widget_name() == signature {
+            self.update_project_live();
             return;
         }
         self.projects_box.set_widget_name(&signature);
         clear(&self.projects_box);
+        self.project_live.borrow_mut().clear();
         let projects = self.projects.borrow().clone();
         for workspace in self.workspaces.borrow().iter() {
             let row = gtk::Box::new(gtk::Orientation::Horizontal, 5);
@@ -100,41 +125,20 @@ impl Ui {
                     .row_spacing(2)
                     .build();
                 content.add_css_class("project-content");
-                let sessions = self.sidebar_sessions.borrow();
-                let mine: Vec<_> = sessions
-                    .iter()
-                    .filter(|s| s["project_id"].as_i64() == Some(id))
-                    .collect();
-                let live = mine
-                    .iter()
-                    .filter(|s| {
-                        matches!(
-                            text(s, "state"),
-                            "spawning" | "running" | "idle" | "blocked"
-                        )
-                    })
-                    .count();
                 let lamp = gtk::Box::new(gtk::Orientation::Horizontal, 0);
                 lamp.add_css_class("lamp");
                 lamp.add_css_class("small-lamp");
                 lamp.set_valign(gtk::Align::Center);
-                if mine.iter().any(|s| text(s, "state") == "blocked") {
-                    lamp.add_css_class("held");
-                } else if mine
-                    .iter()
-                    .any(|s| matches!(text(s, "state"), "running" | "spawning"))
-                {
-                    lamp.add_css_class("live");
-                }
                 content.attach(&lamp, 0, 0, 1, 1);
                 let title = label(name, "project-name");
                 title.set_hexpand(true);
                 title.set_width_chars(1);
                 title.set_ellipsize(gtk::pango::EllipsizeMode::End);
                 content.attach(&title, 1, 0, 1, 1);
-                if live > 0 {
-                    content.attach(&label(&live.to_string(), "project-count"), 2, 0, 1, 1);
-                }
+                let count = label("", "project-count");
+                count.set_visible(false);
+                content.attach(&count, 2, 0, 1, 1);
+                self.project_live.borrow_mut().insert(id, (lamp, count));
                 if id == self.project.get() {
                     b.add_css_class("selected");
                     row.add_css_class("selected");
@@ -214,6 +218,7 @@ impl Ui {
                 self.projects_box.append(&row);
             }
         }
+        self.update_project_live();
     }
     fn registry_menu(self: &Rc<Self>, value: &Value, workspace: bool) -> gtk::MenuButton {
         let menu = gtk::MenuButton::new();
@@ -327,7 +332,7 @@ impl Ui {
                 )
             });
             let Some(index) = items.iter().position(|p| p["id"] == from) else {
-                ui.show_error("Reorder projects within the same workspace and pinned group.");
+                ui.show_info("Reorder projects within the same workspace and pinned group.");
                 return false;
             };
             let item = items.remove(index);
@@ -407,7 +412,7 @@ impl Ui {
         let weak = Rc::downgrade(self);
         let win = window.clone();
         let v = value.clone();
-        save.connect_clicked(move|key|{let Some(ui)=weak.upgrade()else{return;};let name=name.text().trim().to_string();if name.is_empty(){ui.show_error("Enter a name.");return;}
+        save.connect_clicked(move|key|{let Some(ui)=weak.upgrade()else{return;};let name=name.text().trim().to_string();if name.is_empty(){ui.show_info("Enter a name.");return;}
             let payload=if workspace{json!({"workspace_id":v["id"],"name":name})}else{json!({"project_id":v["id"],"name":name,"base_branch":branch.text().as_str(),"build_cmd":build.text().as_str(),"run_cmd":run.text().as_str(),"pinned":pinned.is_active()})};
             let win=win.clone();let key=key.clone();key.set_sensitive(false);
             glib::spawn_future_local(async move{match ui.call(if workspace{"workspace.update"}else{"project.update"},payload).await{Ok(_)=>{ui.registry_dirty.set(true);ui.refresh();win.close();},Err(e)=>ui.show_error(&e.to_string())}key.set_sensitive(true);});
@@ -1061,7 +1066,17 @@ impl Ui {
         let session = session.clone();
         menu.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
-                ui.session_menu(session.clone());
+                // The row as of now, not as of the last render: saving sends both switches,
+                // so a stale copy would quietly undo a change made since.
+                let name = text(&session, "name");
+                let current = ui
+                    .sessions
+                    .borrow()
+                    .iter()
+                    .find(|s| text(s, "name") == name)
+                    .cloned()
+                    .unwrap_or_else(|| session.clone());
+                ui.session_menu(current);
             }
         });
         pane.actions.append(&menu);
@@ -1607,11 +1622,25 @@ impl Ui {
         refresh.emit_clicked();
         window.present();
     }
-    pub(super) fn load_appearance(self: &Rc<Self>) {
-        crate::wallpaper_rotation::refresh(self);
+    /// Apply appearance settings. `changed` is the settings path that changed ("" for all):
+    /// the wallpaper (up to a megabyte) and the rotation library are read again only when
+    /// their own paths change, and the image is decoded off the GTK thread.
+    pub(super) fn load_appearance(self: &Rc<Self>, changed: &str) {
+        let covers = |path: &str| {
+            changed.is_empty()
+                || changed == path
+                || path.starts_with(&format!("{changed}."))
+                || changed.starts_with(&format!("{path}."))
+        };
+        if covers("appearance.wallpaper_rotation") || covers("appearance.wallpapers") {
+            crate::wallpaper_rotation::refresh(self);
+        }
+        let read_image = covers("appearance.wallpaper");
         let ui = self.clone();
         glib::spawn_future_local(async move {
             let generation = ui.generation.get();
+            // These are separate leaves: their shared parent, `appearance`, also holds the
+            // wallpaper library, which is far larger than all six together.
             let (mode, size, alpha, contrast, image, dim) = tokio::join!(
                 ui.call("settings.get", json!({"path":"appearance.mode"})),
                 ui.call("settings.get", json!({"path":"terminal.font_size"})),
@@ -1620,7 +1649,13 @@ impl Ui {
                     "settings.get",
                     json!({"path":"appearance.content_contrast"})
                 ),
-                ui.call("settings.get", json!({"path":"appearance.wallpaper"})),
+                async {
+                    if read_image {
+                        Some(ui.call("settings.get", json!({"path":"appearance.wallpaper"})).await)
+                    } else {
+                        None
+                    }
+                },
                 ui.call("settings.get", json!({"path":"appearance.wallpaper_dim"}))
             );
             if generation != ui.generation.get() {
@@ -1701,32 +1736,81 @@ impl Ui {
                     .unwrap_or(0.28)
                     .clamp(0., 0.85),
             );
-            if let Ok(v) = image {
+            if let Some(Ok(v)) = image {
                 crate::tools::settings::sync_wallpaper(&ui, &v["value"]);
-                use base64::Engine;
-                if let Some(data) = v["value"].as_str().and_then(|s| {
-                    s.strip_prefix("data:image/jpeg;base64,")
-                        .or_else(|| s.strip_prefix("data:image/png;base64,"))
-                }) {
-                    match base64::engine::general_purpose::STANDARD
-                        .decode(data)
-                        .ok()
-                        .and_then(|bytes| {
-                            gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)).ok()
-                        }) {
-                        Some(texture) => ui.wallpaper.set_paintable(Some(&texture)),
-                        None => ui.show_error("The saved wallpaper could not be decoded."),
-                    }
-                } else {
-                    ui.wallpaper.set_paintable(gtk::gdk::Paintable::NONE);
+                let key = {
+                    use std::hash::{Hash, Hasher};
+                    let mut hash = std::collections::hash_map::DefaultHasher::new();
+                    v["value"].as_str().unwrap_or("").hash(&mut hash);
+                    hash.finish()
+                };
+                if ui.wallpaper_key.replace(key) != key {
+                    ui.apply_wallpaper(&v["value"], key).await;
                 }
             }
 
             ui.editor.set_palette(&ui.palette.borrow());
-            for p in ui.panes.borrow().values() {
-                p.apply_appearance(&ui.palette.borrow(), ui.font_size.get());
-                p.schedule_resize();
+            // Restyling resizes every terminal; do it only when the palette or size moved.
+            let style = (ui.palette.borrow().clone(), ui.font_size.get());
+            if *ui.pane_style.borrow() != style {
+                for p in ui.panes.borrow().values() {
+                    p.apply_appearance(&style.0, style.1);
+                    p.schedule_resize();
+                }
+                *ui.pane_style.borrow_mut() = style;
             }
         });
+    }
+    /// Decode a `data:image/…;base64,` wallpaper on a worker thread into raw pixels, then
+    /// wrap them in a texture here: GDK textures may only be created on the GTK thread.
+    async fn apply_wallpaper(self: &Rc<Self>, value: &Value, key: u64) {
+        let Some(data) = value.as_str().and_then(|s| {
+            s.strip_prefix("data:image/jpeg;base64,")
+                .or_else(|| s.strip_prefix("data:image/png;base64,"))
+        }) else {
+            self.wallpaper.set_paintable(gtk::gdk::Paintable::NONE);
+            return;
+        };
+        let data = data.to_string();
+        let decoded = self
+            .rt
+            .spawn_blocking(move || {
+                use base64::Engine;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .ok()?;
+                let image =
+                    gtk::gdk_pixbuf::Pixbuf::from_read(std::io::Cursor::new(bytes)).ok()?;
+                Some((
+                    image.width(),
+                    image.height(),
+                    image.rowstride(),
+                    image.has_alpha(),
+                    image.read_pixel_bytes(),
+                ))
+            })
+            .await
+            .ok()
+            .flatten();
+        // A newer wallpaper was requested while this one decoded.
+        if self.wallpaper_key.get() != key {
+            return;
+        }
+        match decoded {
+            Some((width, height, stride, alpha, pixels)) => {
+                let format = if alpha {
+                    gtk::gdk::MemoryFormat::R8g8b8a8
+                } else {
+                    gtk::gdk::MemoryFormat::R8g8b8
+                };
+                let texture =
+                    gtk::gdk::MemoryTexture::new(width, height, format, &pixels, stride as usize);
+                self.wallpaper.set_paintable(Some(&texture));
+            }
+            None => {
+                self.wallpaper_key.set(0);
+                self.show_info("The saved wallpaper could not be decoded.");
+            }
+        }
     }
 }

@@ -359,7 +359,7 @@ impl Ui {
             return;
         }
         if self.launch_busy.get() {
-            self.show_error("A launch is in progress. Allocated sessions will appear on the wall.");
+            self.show_info("A launch is in progress. Allocated sessions will appear on the wall.");
             return;
         }
         if !self.dismiss_panels() {
@@ -780,8 +780,8 @@ impl Ui {
             let group=mode.selected()==1;let two=builders.selected()==1;let indexes=if group{if two{vec![0,2,1]}else{vec![0,2]}}else{(0..count.value_as_int()as usize).collect()};
             let mut profiles_data=Vec::new();
             for index in indexes{
-                let p=&profiles[index];if !p.provider_cards[p.provider.selected() as usize].0.is_sensitive(){ui.launch_busy.set(false);ui.show_error("Choose an installed provider for every agent.");return;}let payload=p.payload(project,if group{Some(if index==2{"reviewer"}else{"builder"})}else{None});
-                if text(&payload,"worktree").is_empty(){ui.launch_busy.set(false);ui.show_error("Set a worktree for every agent.");return;}
+                let p=&profiles[index];if !p.provider_cards[p.provider.selected() as usize].0.is_sensitive(){ui.launch_busy.set(false);ui.show_info("Choose an installed provider for every agent.");return;}let payload=p.payload(project,if group{Some(if index==2{"reviewer"}else{"builder"})}else{None});
+                if text(&payload,"worktree").is_empty(){ui.launch_busy.set(false);ui.show_info("Set a worktree for every agent.");return;}
                 let tasks=if !group||index==0{p.selected_tasks()}else{Vec::new()};profiles_data.push((payload,tasks,p.prompt()));
             }
             key.set_sensitive(false);let key=key.clone();ui.launch_box.set_sensitive(false);let progress=progress.clone();
