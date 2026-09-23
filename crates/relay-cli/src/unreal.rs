@@ -52,6 +52,7 @@ const PY_ASSET_AUDIT: &str = include_str!("unreal_py/asset_audit.py");
 const PY_ASSET_REFS: &str = include_str!("unreal_py/asset_refs.py");
 const PY_DATA_TABLE: &str = include_str!("unreal_py/data_table.py");
 const PY_IMPORT_FBX: &str = include_str!("unreal_py/import_fbx.py");
+const PY_PREVIEW_ASSET: &str = include_str!("unreal_py/preview_asset.py");
 
 pub fn serve() -> Result<u8> {
     let stdin = std::io::stdin();
@@ -131,7 +132,10 @@ fn tools() -> Vec<Value> {
                 "target":{"type":"string","description":"Target name, e.g. MyGameEditor, MyGame, MyGameServer"},
                 "platform":{"type":"string","description":"Linux, Win64 or Mac; defaults to the host"},
                 "configuration":{"type":"string","enum":["Debug","DebugGame","Development","Test","Shipping"]},
-                "timeout_s":{"type":"integer","minimum":30,"maximum":7200,"description":"Default 3600"}
+                "timeout_s":{"type":"integer","minimum":30,"maximum":7200,"description":"Default 3600"},
+                "restart_editor":{"type":"boolean","description":"Quit a running editor first (saving), build, then relaunch it and wait until it answers. The way to apply C++ changes on Linux, which has no Live Coding."},
+                "allow_editor_open":{"type":"boolean","description":"Build even though the editor is running (hot-reload module; usually wrong)"},
+                "keep_crash_reporters":{"type":"boolean","description":"Do not stop leftover CrashReportClient processes before building"}
             }), &[], false),
         tool("ue_log",
             "Tail the project's editor/game log (Saved/Logs/<Project>.log), optionally keeping only lines that match a regex such as 'Error|Warning' or 'LogBlueprint'.",
@@ -184,13 +188,14 @@ fn tools() -> Vec<Value> {
             "Run a console command in the editor world, e.g. 'stat unit', 'r.ScreenPercentage 75', 'obj list class=StaticMesh'. Output goes to the log; read it with ue_log.",
             json!({"command":{"type":"string"}}), &["command"], false),
         tool("ue_screenshot",
-            "Look at the level: render PNG images you can see. Frame one or more actors from named views (front/back/left/right/top/three_quarter, relative to the first actor's facing), or use an explicit camera, or the current editor viewport when neither is given. isolate=true renders only the framed actors on black, which makes silhouettes, hands and attachments easy to judge.",
+            "Look at the level: render PNG images you can see. Frame one or more actors from named views (front/back/left/right/top/three_quarter, relative to the first actor's facing), or use an explicit camera, or the current editor viewport when neither is given. isolate=true hides the level actors around them. coverage=true also reports how much of each image the subject covers (0 = it did not render).",
             json!({
                 "actors":{"type":"array","items":{"type":"string"},"description":"Actor labels or paths to frame"},
                 "views":{"type":"array","items":{"type":"string","enum":["front","back","left","right","top","three_quarter","three_quarter_left"]},"description":"Default front, right, three_quarter"},
                 "camera":{"type":"object","properties":{"location":{"type":"array","items":{"type":"number"}},"rotation":{"type":"array","items":{"type":"number"},"description":"[pitch, yaw, roll]"}}},
                 "forward":{"type":"array","items":{"type":"number"},"description":"Override the facing used for named views"},
                 "isolate":{"type":"boolean"},
+                "coverage":{"type":"boolean"},
                 "width":{"type":"integer","minimum":64,"maximum":1920},
                 "height":{"type":"integer","minimum":64,"maximum":1080},
                 "fov":{"type":"number","minimum":10,"maximum":120}
@@ -231,8 +236,9 @@ fn tools() -> Vec<Value> {
                 "attachments":{"type":"array","items":{"type":"object"}},
                 "partner":{"type":"object"},
                 "views":{"type":"array","items":{"type":"string"},"description":"Default front and right"},
-                "location":{"type":"array","items":{"type":"number"},"description":"Where to spawn; default 6 m in front of the editor camera"},
-                "isolate":{"type":"boolean","description":"Render only the preview actors (default true)"},
+                "location":{"type":"array","items":{"type":"number"},"description":"Where to spawn (the camera follows the preview wherever it is)"},
+                "isolate":{"type":"boolean","description":"Hide level actors near the preview (default false: the preview spawns 500 m above the editor camera, clear of the level)"},
+                "altitude":{"type":"number","description":"Height above the editor camera to spawn at when no location is given, default 50000 cm"},
                 "settle_ms":{"type":"integer","minimum":50,"maximum":5000,"description":"Wait for the editor to apply each pose, default 400"},
                 "width":{"type":"integer","minimum":64,"maximum":1280},"height":{"type":"integer","minimum":64,"maximum":1080}
             }), &["mesh"], false),
@@ -294,6 +300,12 @@ fn tools() -> Vec<Value> {
         tool("ue_crash",
             "The most recent crash: error message, call stack and the last log lines, from Saved/Crashes.",
             json!({"index":{"type":"integer","minimum":0,"description":"0 = most recent"}}), &[], true),
+        tool("ue_editor_launch",
+            "Start the Unreal editor on this checkout's project with the Remote Control server enabled: waits until the port is free (a closed editor holds it for a while), launches, and waits until Remote Control answers, reporting a failed bind from the new log. Returns when the editor is ready.",
+            json!({"timeout_s":{"type":"integer","minimum":30,"maximum":3600,"description":"Default 900; first starts compile shaders"},"extra_args":{"type":"array","items":{"type":"string"}}}), &[], false),
+        tool("ue_editor_quit",
+            "Quit the editor cleanly (saving dirty packages unless save=false), wait for the process to exit and for the Remote Control port to be released. Use before builds; ue_build restart_editor=true does quit, build and relaunch in one call.",
+            json!({"save":{"type":"boolean"}}), &[], false),
         tool("ue_editor_lock",
             "Who is driving the editor. Live tools that change the editor take this lock automatically, so two agents never script the one editor at once; it frees itself after 15 idle minutes. action=release gives it up when you are done.",
             json!({"action":{"type":"string","enum":["status","release"]}}), &[], false),
@@ -367,6 +379,8 @@ fn call(name: &str, args: &Value) -> Result<Value> {
         "ue_anim_inspect" => python_json(&script(PY_ANIM_INSPECT, args), Duration::from_secs(300)),
         "ue_anim_preview" => anim_preview(&Project::find()?, args),
         "ue_play" => play(&Project::find()?, args),
+        "ue_editor_launch" => launch_editor(&Project::find()?, args),
+        "ue_editor_quit" => quit_editor(&Project::find()?, args["save"].as_bool().unwrap_or(true)),
         "ue_blueprint_info" => {
             let project = Project::find()?;
             let start = log_len(&project);
@@ -401,13 +415,44 @@ pub(crate) fn import_fbx(fbx: &Path, mut args: Value) -> Result<Value> {
     acquire_lock(&project, &holder_id())?;
     args["fbx"] = json!(fbx);
     let start = log_len(&project);
-    match python_json(&script(PY_IMPORT_FBX, &args), Duration::from_secs(600)) {
-        Ok(mut value) => {
-            value["import_log"] = json!(log_since(&project, start, Some(r"LogFbx|Interchange|Error|Warning")));
-            Ok(value)
+    let import_log = |project: &Project| log_since(project, start, Some(r"LogFbx|Interchange|Error|Warning"));
+    let mut value = match python_json(&script(PY_IMPORT_FBX, &args), Duration::from_secs(900)) {
+        Ok(value) => value,
+        Err(error) => bail!("{error:#}\n{}", import_log(&project).join("\n")),
+    };
+    // Does it draw? An invisible mesh (it happened: only its shadow rendered) passes every
+    // size and axis check.
+    let mut renders = Vec::new();
+    let dir = capture_dir(&project)?;
+    for (n, asset) in value["imported"].as_array().cloned().unwrap_or_default().into_iter().enumerate() {
+        if !matches!(asset["class"].as_str(), Some("StaticMesh") | Some("SkeletalMesh")) {
+            continue;
         }
-        Err(error) => bail!("{error:#}\n{}", log_since(&project, start, Some(r"LogFbx|Interchange|Error|Warning")).join("\n")),
+        let shot = (|| -> Result<Value> {
+            let spawned = python_json(&script(PY_PREVIEW_ASSET, &json!({"action": "spawn", "path": asset["path"]})), Duration::from_secs(60))?;
+            std::thread::sleep(Duration::from_millis(300));
+            python_json(&script(PY_CAPTURE, &json!({
+                "actors": [spawned["actor"]], "center": spawned["center"], "radius": spawned["radius"],
+                "forward": [0.0, 1.0, 0.0], "views": ["front", "three_quarter"], "coverage": true,
+                "width": 320, "height": 320, "out_dir": dir, "prefix": format!("import{n}"),
+            })), Duration::from_secs(120))
+        })();
+        let _ = python_json(&script(PY_PREVIEW_ASSET, &json!({"action": "cleanup"})), Duration::from_secs(60));
+        match shot {
+            Ok(shot) => {
+                let coverage: Vec<f64> = shot["files"].as_array().map(|f| f.iter().filter_map(|x| x["coverage"].as_f64()).collect()).unwrap_or_default();
+                let visible = coverage.is_empty() || coverage.iter().any(|c| *c > 0.002);
+                renders.push(json!({"path": asset["path"], "coverage": coverage, "renders": visible, "files": shot["files"]}));
+            }
+            Err(error) => renders.push(json!({"path": asset["path"], "error": format!("{error:#}")})),
+        }
     }
+    value["_images"] = json!(renders.iter().flat_map(|r| r["files"].as_array().cloned().unwrap_or_default())
+        .map(|f| json!({"label": format!("imported: {}", f["view"].as_str().unwrap_or("")), "path": f["file"]})).collect::<Vec<_>>());
+    value["_cleanup"] = json!(dir);
+    value["render_check"] = json!(renders);
+    value["import_log"] = json!(import_log(&project));
+    Ok(value)
 }
 
 /// `ARGS_JSON` first, then the shared helpers, then the tool's own script.
@@ -513,6 +558,162 @@ fn release_lock(project: &Project, me: &str) -> Result<()> {
 
 // ---------------------------------------------------------------- playing, testing, measuring
 
+// ---------------------------------------------------------------- the editor process
+
+/// Save (optionally), ask the editor to quit, and wait until the process has gone and the
+/// Remote Control port is free again, so the next launch can bind it.
+fn quit_editor(project: &Project, save: bool) -> Result<Value> {
+    acquire_lock(project, &holder_id())?;
+    let started = std::time::Instant::now();
+    let before: Vec<u32> = crate::unreal_process::editors_for(&project.uproject).iter().map(|p| p.pid).collect();
+    let mut notes = Vec::new();
+    match remote("GET", "/remote/info", None, Duration::from_secs(3)) {
+        Ok(_) => {
+            guard_project(project)?;
+            let code = format!(
+                "import unreal\n{}unreal.SystemLibrary.quit_editor()\nprint('quitting')\n",
+                if save { "unreal.EditorLoadingAndSavingUtils.save_dirty_packages(True, True)\n" } else { "" }
+            );
+            if let Err(error) = python_tx(&code, Duration::from_secs(120), false) {
+                notes.push(format!("quit request: {error:#}"));
+            }
+        }
+        Err(_) => notes.push("the editor did not answer; asking the process to terminate instead (unsaved changes are lost)".into()),
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    let mut signalled = false;
+    while !crate::unreal_process::editors_for(&project.uproject).is_empty() {
+        if std::time::Instant::now() >= deadline {
+            bail!("the editor is still running after 90 s; close it by hand");
+        }
+        if !signalled && (notes.iter().any(|n| n.contains("terminate")) || started.elapsed() > Duration::from_secs(45)) {
+            for pid in &before {
+                crate::unreal_process::kill(*pid);
+            }
+            signalled = true;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let port = crate::unreal_process::port_of(&remote_base());
+    let port_free = crate::unreal_process::wait_port_free(port, Duration::from_secs(90));
+    let _ = release_lock(project, &holder_id());
+    Ok(json!({"stopped": before, "saved": save, "port_free": port_free, "seconds": started.elapsed().as_secs(), "notes": notes}))
+}
+
+/// Launch the editor on this checkout's project once the port is free, then wait until Remote
+/// Control answers, watching the new log for a failed bind.
+fn launch_editor(project: &Project, args: &Value) -> Result<Value> {
+    let running = crate::unreal_process::editors_for(&project.uproject);
+    if !running.is_empty() {
+        return Ok(json!({"already_running": running.iter().map(|p| p.pid).collect::<Vec<_>>(), "status": editor_status()?}));
+    }
+    acquire_lock(project, &holder_id())?;
+    let engine = engine_root(project)?;
+    let port = crate::unreal_process::port_of(&remote_base());
+    let started = std::time::Instant::now();
+    let extra: Vec<String> = args["extra_args"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
+    let pid = crate::unreal_process::launch(&engine, &project.uproject, port, &extra)?;
+    let timeout = Duration::from_secs(args["timeout_s"].as_u64().unwrap_or(900).clamp(30, 3600));
+    loop {
+        if remote("GET", "/remote/info", None, Duration::from_secs(3)).is_ok() {
+            // The editor now owns the project; tell the next status call to ask again.
+            return Ok(json!({"pid": pid, "reachable": true, "seconds": started.elapsed().as_secs(), "engine": engine}));
+        }
+        let lines = log_since(project, 0, None);
+        let bind = crate::unreal_process::bind_failures(&lines);
+        if !bind.is_empty() {
+            bail!("the editor started (pid {pid}) but its web server could not bind port {port}: {bind:?}. In the editor console run `WebControl.StopServer` then `WebControl.StartServer`.");
+        }
+        if crate::unreal_process::editors_for(&project.uproject).is_empty() && started.elapsed() > Duration::from_secs(20) {
+            bail!("the editor exited during start-up; read ue_log and ue_crash");
+        }
+        if started.elapsed() > timeout {
+            bail!("the editor (pid {pid}) did not answer on Remote Control within {} s (first starts compile shaders and can take long; raise timeout_s). Check ue_setup_check.", timeout.as_secs());
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+/// `Config/DefaultRemoteControl.ini` settings the bridge needs, merged into the project's file.
+/// Keys are checked against the engine's RemoteControlSettings.h when it can be found, so a
+/// key an engine version does not have is reported instead of written blindly.
+const RC_SECTION: &str = "[/Script/RemoteControlCommon.RemoteControlSettings]";
+const RC_KEYS: [(&str, &str); 4] = [
+    ("bAutoStartWebServer", "True"),
+    ("bEnableRemotePythonExecution", "True"),
+    ("bAllowConsoleCommandRemoteExecution", "True"),
+    ("bAllowAnyRemoteFunctionCall", "True"),
+];
+
+fn rc_header(engine: &Path) -> Option<String> {
+    let direct = engine.join("Engine/Plugins/VirtualProduction/RemoteControl/Source/RemoteControlCommon/Public/RemoteControlSettings.h");
+    if let Ok(text) = std::fs::read_to_string(&direct) {
+        return Some(text);
+    }
+    fn find(dir: &Path, depth: usize) -> Option<PathBuf> {
+        if depth > 7 { return None; }
+        for e in std::fs::read_dir(dir).ok()?.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if let Some(found) = find(&p, depth + 1) { return Some(found); }
+            } else if e.file_name() == "RemoteControlSettings.h" {
+                return Some(p);
+            }
+        }
+        None
+    }
+    find(&engine.join("Engine/Plugins"), 0).and_then(|p| std::fs::read_to_string(p).ok())
+}
+
+fn write_remote_control_ini(project: &Project) -> Result<Value> {
+    let header = engine_root(project).ok().and_then(|e| rc_header(&e));
+    let (keys, unknown): (Vec<_>, Vec<_>) = RC_KEYS.iter().partition(|(k, _)| header.as_ref().is_none_or(|h| h.contains(k)));
+    let path = project.root.join("Config/DefaultRemoteControl.ini");
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let merged = merge_ini(&text, RC_SECTION, &keys.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>());
+    if merged != text {
+        if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+        std::fs::write(&path, &merged)?;
+    }
+    Ok(json!({
+        "file": path, "changed": merged != text,
+        "written": keys.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>(),
+        "not_in_this_engine": unknown.iter().map(|(k, _)| k.to_string()).collect::<Vec<_>>(),
+        "checked_against_engine_source": header.is_some(),
+    }))
+}
+
+/// Set keys inside one ini section, keeping every other line and section as it was.
+fn merge_ini(text: &str, section: &str, keys: &[(String, String)]) -> String {
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let start = lines.iter().position(|l| l.trim() == section);
+    let start = match start {
+        Some(i) => i,
+        None => {
+            if lines.last().is_some_and(|l| !l.trim().is_empty()) { lines.push(String::new()); }
+            lines.push(section.to_string());
+            lines.len() - 1
+        }
+    };
+    let end = lines.iter().enumerate().skip(start + 1).find(|(_, l)| l.trim_start().starts_with('[')).map(|(i, _)| i).unwrap_or(lines.len());
+    let mut insert_at = end;
+    for (key, value) in keys {
+        let found = (start + 1..end).find(|i| lines[*i].split_once('=').is_some_and(|(k, _)| k.trim() == key));
+        match found {
+            Some(i) => lines[i] = format!("{key}={value}"),
+            None => {
+                // Keep the section's block together, before any trailing blank lines.
+                while insert_at > start + 1 && lines[insert_at - 1].trim().is_empty() { insert_at -= 1; }
+                lines.insert(insert_at, format!("{key}={value}"));
+                insert_at += 1;
+            }
+        }
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
+}
+
 fn log_len(project: &Project) -> u64 {
     std::fs::metadata(project.log_path()).map(|m| m.len()).unwrap_or(0)
 }
@@ -530,7 +731,7 @@ fn log_since(project: &Project, start: u64, filter: Option<&str>) -> Vec<String>
 fn play_step(action: &str, extra: Value) -> Result<Value> {
     let mut args = extra;
     args["action"] = json!(action);
-    python_json(&script(PY_PLAY, &args), Duration::from_secs(60))
+    python_json_tx(&script(PY_PLAY, &args), Duration::from_secs(60), false)
 }
 
 fn wait_for_play(on: bool) -> Result<()> {
@@ -559,6 +760,17 @@ fn pngs_under(dir: &Path) -> Vec<PathBuf> {
 
 const DEFAULT_PLAY_LOG: &str = r"Error|Warning|[Ee]nsure|Accessed None|Script Msg|LogBlueprintUserMessages|Assertion";
 
+/// Files written under `dir` that were not in `seen`, oldest first.
+fn new_pngs(dir: &Path, seen: &std::collections::HashSet<PathBuf>) -> Vec<PathBuf> {
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = pngs_under(dir)
+        .into_iter()
+        .filter(|p| !seen.contains(p))
+        .filter_map(|p| Some((std::fs::metadata(&p).ok()?.modified().ok()?, p)))
+        .collect();
+    files.sort();
+    files.into_iter().map(|(_, p)| p).collect()
+}
+
 fn play(project: &Project, args: &Value) -> Result<Value> {
     let seconds = args["seconds"].as_f64().unwrap_or(5.0).clamp(1.0, 300.0);
     let mut checkpoints: Vec<f64> = args["checkpoints"].as_array()
@@ -568,7 +780,7 @@ fn play(project: &Project, args: &Value) -> Result<Value> {
     checkpoints.truncate(12);
     let screenshots = args["screenshots"].as_bool().unwrap_or(true);
     let shots_dir = project.root.join("Saved/Screenshots");
-    let before: std::collections::HashSet<PathBuf> = pngs_under(&shots_dir).into_iter().collect();
+    let mut seen: std::collections::HashSet<PathBuf> = pngs_under(&shots_dir).into_iter().collect();
     if args["stop_existing"] == true {
         play_step("stop", json!({}))?;
         wait_for_play(false)?;
@@ -577,65 +789,80 @@ fn play(project: &Project, args: &Value) -> Result<Value> {
     let started = play_step("start", json!({"mode": args["mode"].as_str().unwrap_or("pie")}))?;
     wait_for_play(true)?;
     let t0 = std::time::Instant::now();
+    let first = play_step("status", json!({})).ok();
+    let mut shots: Vec<Value> = Vec::new();
     let outcome = (|| -> Result<Vec<Value>> {
         if let Some(commands) = args["console"].as_array() {
             play_step("console", json!({"commands": commands}))?;
         }
         let mut probes = Vec::new();
         for at in &checkpoints {
-            let wait = Duration::from_secs_f64(*at).saturating_sub(t0.elapsed());
-            std::thread::sleep(wait);
-            if screenshots {
-                play_step("shot", json!({"width": args["width"].as_u64().unwrap_or(1280), "height": args["height"].as_u64().unwrap_or(720)}))?;
-            }
+            std::thread::sleep(Duration::from_secs_f64(*at).saturating_sub(t0.elapsed()));
+            // Probe first, then capture, then wait for this capture's file: a screenshot is
+            // written a frame or more after the request, and pairing by order let images fall
+            // one checkpoint behind the probes.
             if let Some(code) = args["probe"].as_str() {
-                let out = python(&format!("ARGS_JSON = {}\n{PY_COMMON}\nworld = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_game_world()\n{code}", py_str("{}")), Duration::from_secs(60));
+                let out = python_tx(&format!("ARGS_JSON = {}\n{PY_COMMON}\nworld = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_game_world()\n{code}", py_str("{}")), Duration::from_secs(60), false);
                 probes.push(match out {
                     Ok(v) => json!({"at": at, "output": v["output"]}),
                     Err(e) => json!({"at": at, "error": format!("{e:#}")}),
                 });
             }
+            if screenshots {
+                play_step("shot", json!({"width": args["width"].as_u64().unwrap_or(1280), "height": args["height"].as_u64().unwrap_or(720)}))?;
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                loop {
+                    let fresh = new_pngs(&shots_dir, &seen);
+                    if let Some(file) = fresh.first() {
+                        // Give the writer a moment to finish the file.
+                        std::thread::sleep(Duration::from_millis(150));
+                        seen.insert(file.clone());
+                        shots.push(json!({"view": format!("checkpoint {at}s"), "file": file}));
+                        break;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        shots.push(json!({"view": format!("checkpoint {at}s"), "missing": true}));
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
         }
         std::thread::sleep(Duration::from_secs_f64(seconds).saturating_sub(t0.elapsed()));
         Ok(probes)
     })();
+    let last = play_step("status", json!({})).ok();
     let stopped = if args["stop"].as_bool().unwrap_or(true) {
-        play_step("stop", json!({})).and_then(|_| wait_for_play(false)).err().map(|e| format!("{e:#}"))
+        play_step("stop", json!({"restore_throttle": started["was_throttled"]})).and_then(|_| wait_for_play(false)).err().map(|e| format!("{e:#}"))
     } else {
         None
     };
     let probes = outcome?;
-    // High-resolution screenshots are written a frame or two after the request.
-    let mut shots = Vec::new();
-    for _ in 0..20 {
-        shots = pngs_under(&shots_dir).into_iter().filter(|p| !before.contains(p)).collect::<Vec<_>>();
-        if !screenshots || shots.len() >= checkpoints.len() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
-    shots.sort();
+    // Frames per wall-clock second over the session: a throttled or overloaded editor shows
+    // here before it shows as a flaky test.
+    let fps = match (first.as_ref().and_then(|v| v["frame"].as_u64()), last.as_ref().and_then(|v| v["frame"].as_u64())) {
+        (Some(a), Some(b)) if b > a => Some(((b - a) as f64 / t0.elapsed().as_secs_f64() * 10.0).round() / 10.0),
+        _ => None,
+    };
     let filter = args["log_filter"].as_str().unwrap_or(DEFAULT_PLAY_LOG);
-    let log = log_since(project, log_start, Some(filter));
+    // Harmless: Remote Control wraps calls in a transaction that play start cancels.
+    let log: Vec<String> = log_since(project, log_start, Some(filter)).into_iter().filter(|l| !l.contains("Remote Call Transaction Wrap")).collect();
     let errors = log.iter().filter(|l| l.contains("Error") || l.contains("Accessed None") || l.to_lowercase().contains("ensure")).count();
+    let images: Vec<Value> = shots.iter().filter(|s| s["file"].is_string()).map(|s| json!({"label": s["view"], "path": s["file"]})).collect();
     Ok(json!({
         "mode": started["requested"],
         "played_s": t0.elapsed().as_secs_f64().min(seconds + 5.0),
+        "average_fps": fps,
+        "fps_warning": if fps.is_some_and(|f| f < 20.0) { json!("Under 20 fps: timings, physics and animation in this session are not representative. If the editor window was in the background, check Editor Preferences > Performance > Use Less CPU when in Background.") } else { Value::Null },
         "checkpoints": checkpoints,
         "probes": probes,
+        "screenshots": shots,
         "log": log,
         "error_lines": errors,
         "stop_error": stopped,
-        "files": shots.iter().enumerate().map(|(i, p)| json!({"view": format!("checkpoint {}", checkpoints.get(i).map(|t| format!("{t}s")).unwrap_or_default()), "file": p})).collect::<Vec<_>>(),
-        "_keep_files": true,
-    }))
-    .map(|mut v| {
         // Screenshots live in the project's own folder; show them but leave them in place.
-        let files = v["files"].clone();
-        v["_images"] = json!(files.as_array().unwrap().iter().map(|f| json!({"label": f["view"], "path": f["file"]})).collect::<Vec<_>>());
-        v.as_object_mut().unwrap().remove("_keep_files");
-        v
-    })
+        "_images": images,
+    }))
 }
 
 fn data_table(project: &Project, args: &Value) -> Result<Value> {
@@ -708,8 +935,9 @@ fn profile(project: &Project, args: &Value) -> Result<Value> {
     let play = args["play"].as_bool().unwrap_or(true);
     let dir = project.root.join("Saved/Profiling/CSV");
     let before: std::collections::HashSet<PathBuf> = std::fs::read_dir(&dir).map(|e| e.flatten().map(|e| e.path()).collect()).unwrap_or_default();
+    let mut throttle = Value::Null;
     if play {
-        play_step("start", json!({"mode":"pie"}))?;
+        throttle = play_step("start", json!({"mode":"pie"}))?["was_throttled"].clone();
         wait_for_play(true)?;
     }
     let run = (|| -> Result<()> {
@@ -723,7 +951,7 @@ fn profile(project: &Project, args: &Value) -> Result<Value> {
         Ok(())
     })();
     if play {
-        let _ = play_step("stop", json!({})).and_then(|_| wait_for_play(false));
+        let _ = play_step("stop", json!({"restore_throttle": throttle})).and_then(|_| wait_for_play(false));
     }
     run?;
     let mut file = None;
@@ -919,8 +1147,10 @@ fn anim_preview(project: &Project, args: &Value) -> Result<Value> {
             poses.push(json!({"time": t, "pose_applied": check["off_by_cm"].as_f64().unwrap_or(f64::MAX) <= 1.5, "off_by_cm": check["off_by_cm"]}));
             let capture_args = json!({
                 "actors": setup["actors"], "forward": setup["forward"],
+                "center": check["center"], "radius": check["radius"],
                 "views": args.get("views").cloned().unwrap_or(json!(["front", "right"])),
-                "isolate": args["isolate"].as_bool().unwrap_or(true),
+                // The preview is spawned away from level geometry, so isolation is rarely needed.
+                "isolate": args["isolate"].as_bool().unwrap_or(false),
                 "width": args.get("width").cloned().unwrap_or(json!(480)),
                 "height": args.get("height").cloned().unwrap_or(json!(480)),
                 "out_dir": dir, "prefix": format!("t{i}_{t:.3}s"),
@@ -1018,53 +1248,8 @@ fn find_uproject(start: &Path) -> Option<PathBuf> {
 
 /// The engine directory (the one holding `Engine/`) this project builds with.
 fn engine_root(project: &Project) -> Result<PathBuf> {
-    if let Some(root) = std::env::var_os("UE_ROOT").map(PathBuf::from) {
-        if root.join("Engine").is_dir() {
-            return Ok(root);
-        }
-        bail!("UE_ROOT={} has no Engine folder", root.display());
-    }
     let association = project.descriptor["EngineAssociation"].as_str().unwrap_or("").trim().to_string();
-    // A project inside a source engine tree carries no association.
-    if association.is_empty() {
-        for dir in project.root.ancestors().skip(1) {
-            if dir.join("Engine/Build/BatchFiles").is_dir() {
-                return Ok(dir.to_path_buf());
-            }
-        }
-    }
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    // Launcher and source builds register themselves here on Linux and macOS.
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        for ini in [home.join(".config/Epic/UnrealEngine/Install.ini"), home.join("Library/Application Support/Epic/UnrealEngine/Install.ini")] {
-            if let Ok(text) = std::fs::read_to_string(&ini) {
-                for line in text.lines() {
-                    if let Some((key, value)) = line.split_once('=') {
-                        if key.trim().eq_ignore_ascii_case(&association) {
-                            candidates.push(PathBuf::from(value.trim()));
-                        }
-                    }
-                }
-            }
-        }
-        if !association.is_empty() {
-            candidates.push(home.join(format!("UnrealEngine-{association}")));
-            candidates.push(home.join(format!("UE_{association}")));
-        }
-        candidates.push(home.join("UnrealEngine"));
-    }
-    if !association.is_empty() {
-        candidates.push(PathBuf::from(format!("/opt/UnrealEngine-{association}")));
-        candidates.push(PathBuf::from(format!("/Users/Shared/Epic Games/UE_{association}")));
-        candidates.push(PathBuf::from(format!("C:/Program Files/Epic Games/UE_{association}")));
-    }
-    candidates.push(PathBuf::from("/opt/UnrealEngine"));
-    candidates
-        .into_iter()
-        .find(|dir| dir.join("Engine/Build/BatchFiles").is_dir())
-        .ok_or_else(|| anyhow!(
-            "cannot find the engine for EngineAssociation {association:?} — set UE_ROOT to the folder that contains Engine/"
-        ))
+    crate::unreal_process::engine_root(&project.uproject, &project.root, &association, &project.log_path())
 }
 
 fn host_platform() -> &'static str {
@@ -1182,6 +1367,7 @@ fn setup_check(project: &Project, fix: bool) -> Result<Value> {
         out.extend_from_slice(b"\n");
         std::fs::write(&project.uproject, out).with_context(|| format!("writing {}", project.uproject.display()))?;
     }
+    let ini = if fix { Some(write_remote_control_ini(project)?) } else { None };
     let editor = remote("GET", "/remote/info", None, Duration::from_secs(3));
     let python_ok = match &editor {
         Ok(_) => python("print('relay-python-ok')", Duration::from_secs(20))
@@ -1196,15 +1382,19 @@ fn setup_check(project: &Project, fix: bool) -> Result<Value> {
     if !fixed.is_empty() {
         advice.push("The .uproject now lists the bridge plugins; the editor must be restarted to load them.".to_string());
     }
+    if ini.as_ref().is_some_and(|i| i["changed"] == true) {
+        advice.push("Config/DefaultRemoteControl.ini now enables the web server at start-up, remote Python, console commands and remote function calls; restart the editor (ue_editor_quit, then ue_editor_launch) to apply it.".to_string());
+    }
     if editor.is_err() {
         advice.push("Open the project in the editor and start the Remote Control web server: run `WebControl.StartServer` in the editor console, or turn on auto-start under Project Settings > Plugins > Remote Control. Set UE_REMOTE_CONTROL_URL if it is not on 127.0.0.1:30010.".to_string());
     } else if let Err(error) = &python_ok {
-        advice.push(format!("Remote Python failed ({error}). Make sure the Python Editor Script Plugin is enabled and that Project Settings > Plugins > Remote Control allows remote Python execution."));
+        advice.push(format!("Remote Python failed ({error}). Run ue_setup_check with fix=true (writes Config/DefaultRemoteControl.ini) and restart the editor; make sure the Python Editor Script Plugin is enabled."));
     }
     Ok(json!({
         "uproject": project.uproject,
         "bridge_plugins": BRIDGE_PLUGINS.iter().map(|name| json!({"name": name, "enabled": state(name) == Some(true) || fixed.contains(name)})).collect::<Vec<_>>(),
         "added_to_uproject": fixed,
+        "remote_control_ini": ini,
         "remote_control_url": remote_base(),
         "editor_reachable": editor.is_ok(),
         "editor_error": editor.err().map(|e| e.to_string()),
@@ -1216,6 +1406,20 @@ fn setup_check(project: &Project, fix: bool) -> Result<Value> {
 
 fn build(project: &Project, args: &Value) -> Result<Value> {
     let engine = engine_root(project)?;
+    // A running editor (or a crash reporter left from one) makes UnrealBuildTool build a
+    // numbered hot-reload module that the editor never loads: old code keeps running.
+    let restart = args["restart_editor"] == true;
+    let mut quit = Value::Null;
+    if restart && !crate::unreal_process::editors_for(&project.uproject).is_empty() {
+        quit = quit_editor(project, args["save"].as_bool().unwrap_or(true))?;
+    }
+    let pre = crate::unreal_process::prebuild(&project.uproject, args["keep_crash_reporters"] != true);
+    if pre["editor_running"].as_array().is_some_and(|a| !a.is_empty()) && args["allow_editor_open"] != true {
+        bail!(
+            "the editor is running this project (pid {}). Building now makes a hot-reload module the editor may never load. Use restart_editor=true (quits the editor, builds, relaunches), or quit it with ue_editor_quit first. There is no Live Coding on Linux.",
+            pre["editor_running"]
+        );
+    }
     let script = build_script(&engine);
     anyhow::ensure!(script.is_file(), "{} does not exist", script.display());
     let targets = names_with_suffix(&project.root.join("Source"), ".Target.cs", 0);
@@ -1249,14 +1453,32 @@ fn build(project: &Project, args: &Value) -> Result<Value> {
         })
         .take(200)
         .collect();
+    let manifest = crate::unreal_process::module_manifest(&project.root, &platform);
+    let mut warnings: Vec<String> = Vec::new();
+    if let Some(killed) = pre["killed_crash_reporters"].as_array().filter(|a| !a.is_empty()) {
+        warnings.push(format!("stopped leftover crash reporter(s) {killed:?} that made the build tool think an editor was running"));
+    }
+    if let Some(numbered) = manifest["hot_reload_modules"].as_array().filter(|a| !a.is_empty()) {
+        warnings.push(format!(
+            "UnrealEditor.modules points at numbered hot-reload modules {numbered:?}: the editor may run old code. Quit the editor, delete the numbered files from Binaries/{platform}, and build again."
+        ));
+    }
+    let relaunched = if restart && output.status.success() {
+        Some(launch_editor(project, &json!({"timeout_s": args["launch_timeout_s"]}))?)
+    } else {
+        None
+    };
     Ok(json!({
         "success": output.status.success(),
+        "warnings": warnings,
+        "quit_editor": quit,
+        "relaunched_editor": relaunched,
         "exit_code": output.status.code(),
         "command": format!("{} {target} {platform} {configuration} -Project=\"{}\" -WaitMutex -FromMsBuild", script.display(), project.uproject.display()),
         "seconds": started.elapsed().as_secs(),
         "errors": errors,
         "tail": tail(&text, 150),
-        "hint": if output.status.success() { Value::Null } else { json!("Fix the first error first; later ones often cascade. A 'Unable to build while Live Coding is active' error means the editor is open: close it or build from Live Coding.") },
+        "hint": if output.status.success() { Value::Null } else { json!("Fix the first error first; later ones often cascade. A 'Unable to build while Live Coding is active' error means the editor is open: build with restart_editor=true.") },
     }))
 }
 
@@ -1318,23 +1540,52 @@ fn editor_status() -> Result<Value> {
             Ok(json!({"reachable": true, "url": remote_base(), "editor_project": open, "this_checkout": ours,
                 "same_project": matches, "editor_lock": lock, "routes": routes, "info": info}))
         }
-        Err(error) => Ok(json!({
-            "reachable": false,
-            "url": remote_base(),
-            "error": format!("{error:#}"),
-            "advice": "Open the project in the editor, then run `WebControl.StartServer` in its console (or enable auto-start in Project Settings > Plugins > Remote Control). Run ue_setup_check for the full picture."
-        })),
+        Err(error) => {
+            // Unreachable has three different causes with three different fixes.
+            let project = Project::find().ok();
+            let editors: Vec<u32> = project.as_ref().map(|p| crate::unreal_process::editors_for(&p.uproject).iter().map(|e| e.pid).collect()).unwrap_or_default();
+            let port = crate::unreal_process::port_of(&remote_base());
+            let port_free = crate::unreal_process::port_free(port);
+            let recent: Vec<String> = project.as_ref().map(|p| log_since(p, log_len(p).saturating_sub(400_000), None)).unwrap_or_default();
+            let bind = crate::unreal_process::bind_failures(&recent);
+            let advice = if !bind.is_empty() {
+                format!("The editor is running but its web server could not bind port {port} (a previous editor still held it). In the editor console run `WebControl.StopServer` and then `WebControl.StartServer` (StartServer alone does nothing), or quit the editor, wait for the port, and use ue_editor_launch, which waits for it.")
+            } else if !editors.is_empty() && port_free {
+                "The editor is running but no web server is listening: run `WebControl.StartServer` in its console, or turn on auto-start in Project Settings > Plugins > Remote Control (ue_setup_check with fix=true writes that setting).".to_string()
+            } else if editors.is_empty() && !port_free {
+                format!("No editor is running for this project but port {port} is still held (a closed editor releases it after a while, or another program uses it). ue_editor_launch waits for it to free up.")
+            } else if editors.is_empty() {
+                "No editor is running for this project: start it with ue_editor_launch.".to_string()
+            } else {
+                "Run ue_setup_check for the full picture.".to_string()
+            };
+            Ok(json!({
+                "reachable": false,
+                "url": remote_base(),
+                "error": format!("{error:#}"),
+                "editor_processes": editors,
+                "port_free": port_free,
+                "bind_failures": bind,
+                "advice": advice,
+            }))
+        }
     }
 }
 
 /// Run editor Python through `ExecutePythonCommandEx`, which returns the command's log output
 /// alongside its result instead of only a success flag.
 fn python(code: &str, timeout: Duration) -> Result<Value> {
+    python_tx(code, timeout, true)
+}
+
+/// `transaction: false` for calls around play sessions: starting Play In Editor inside a
+/// Remote Control transaction logs "Cancelling Open Transaction" on every start.
+fn python_tx(code: &str, timeout: Duration, transaction: bool) -> Result<Value> {
     let body = json!({
         "objectPath": PYTHON_LIBRARY,
         "functionName": "ExecutePythonCommandEx",
         "parameters": {"PythonCommand": code, "ExecutionMode": "ExecuteFile", "FileExecutionScope": "Private"},
-        "generateTransaction": true,
+        "generateTransaction": transaction,
     });
     let response = remote("PUT", "/remote/object/call", Some(&body), timeout)?;
     let output: Vec<String> = response["LogOutput"]
@@ -1359,7 +1610,11 @@ fn python(code: &str, timeout: Duration) -> Result<Value> {
 
 /// Run a script that prints one line `RELAY_JSON:<json>` and return that JSON.
 fn python_json(code: &str, timeout: Duration) -> Result<Value> {
-    let result = python(code, timeout)?;
+    python_json_tx(code, timeout, true)
+}
+
+fn python_json_tx(code: &str, timeout: Duration, transaction: bool) -> Result<Value> {
+    let result = python_tx(code, timeout, transaction)?;
     let output = result["output"].as_str().unwrap_or("");
     let line = output
         .lines()
@@ -1567,7 +1822,7 @@ mod tests {
         let init = handle(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}})).unwrap();
         assert_eq!(init["result"]["serverInfo"]["name"], "unreal");
         let listed = handle(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list"})).unwrap();
-        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 23);
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 25);
         assert!(handle(&json!({"jsonrpc":"2.0","method":"notifications/initialized"})).is_none());
         let unknown = handle(&json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"nope"}})).unwrap();
         assert_eq!(unknown["error"]["code"], -32602);
@@ -1715,6 +1970,20 @@ mod tests {
             return;
         };
         assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[test]
+    fn remote_control_settings_merge_into_the_projects_ini() {
+        let keys = vec![("bEnableRemotePythonExecution".to_string(), "True".to_string()), ("bAutoStartWebServer".to_string(), "True".to_string())];
+        let fresh = merge_ini("", RC_SECTION, &keys);
+        assert_eq!(fresh, format!("{RC_SECTION}\nbEnableRemotePythonExecution=True\nbAutoStartWebServer=True\n"));
+        let existing = format!("[Other]\nA=1\n\n{RC_SECTION}\nbEnableRemotePythonExecution=False\nRemoteControlHttpServerPort=30010\n\n[Later]\nB=2\n");
+        let merged = merge_ini(&existing, RC_SECTION, &keys);
+        assert!(merged.contains("bEnableRemotePythonExecution=True\n"));
+        assert!(!merged.contains("=False"));
+        assert!(merged.contains("RemoteControlHttpServerPort=30010\nbAutoStartWebServer=True\n\n[Later]\nB=2"), "{merged}");
+        assert!(merged.starts_with("[Other]\nA=1\n"));
+        assert_eq!(merge_ini(&merged, RC_SECTION, &keys), merged, "merging twice changes nothing");
     }
 
     #[test]

@@ -193,19 +193,6 @@ impl Ui {
                         );
                     }
                 });
-                // Per-project plugin switches (D159), one click from the project itself.
-                let plugins = icon_button("plugins", "Plugins for this project");
-                plugins.set_child(Some(&crate::icons::image("plugins", 12)));
-                plugins.add_css_class("small-key");
-                plugins.add_css_class("manage");
-                plugins.set_widget_name(&format!("project-plugins-{id}"));
-                controls.append(&plugins);
-                let weak = Rc::downgrade(self);
-                plugins.connect_clicked(move |_| {
-                    if let Some(ui) = weak.upgrade() {
-                        ui.project_plugins(id);
-                    }
-                });
                 let menu = self.registry_menu(project, false);
                 menu.add_css_class("small-key");
                 menu.add_css_class("manage");
@@ -1330,10 +1317,12 @@ impl Ui {
     }
     /// The plugin switches of one project, opened from its row in the sidebar.
     pub(super) fn project_plugins(self: &Rc<Self>, project: i64) {
-        let Some((panel, body)) = self.sheet("Plugins", 420, 560) else {
+        let Some((panel, body)) = self.sheet("Plugins", 440, 640) else {
             return;
         };
-        panel.top(560);
+        panel.top(640);
+        // Filled asynchronously; without a floor the panel keeps its "Loading" height.
+        panel.min_height(460);
         panel.add_css_class("agent-skills-popover");
         let name = self
             .projects
@@ -1383,7 +1372,9 @@ impl Ui {
                     clear(&list);
                     let plugins = rows(&result, "plugins");
                     if plugins.is_empty() {
-                        list.append(&label("This build bundles no plugins.", "dim"));
+                        let stale = label(crate::tools::plugins::STALE_ENGINE, "dim");
+                        stale.set_wrap(true);
+                        list.append(&stale);
                     }
                     for plugin in plugins {
                         let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
@@ -1419,7 +1410,7 @@ impl Ui {
                 }
                 Err(error) => {
                     clear(&list);
-                    feedback.set_text(&error.to_string());
+                    feedback.set_text(&crate::tools::plugins::explain(&error.to_string()));
                     feedback.set_visible(true);
                 }
             }

@@ -15,7 +15,7 @@ checkout. You do not need Blender open, and nothing appears on your screen.
 | --- | --- | --- |
 | 6 Blender skills | `.claude/skills/blender-*/`, `.agents/skills/blender-*/` | As soon as the plugin is on |
 | Working rules (`instructions.md`) | The agent's session brief | Every start, wake and resume |
-| `blender` MCP server (7 tools) | `.relay/relay.mcp.json` (Claude), `--config mcp_servers.blender.*` (Codex) | Every start, wake and resume |
+| `blender` MCP server (8 tools) | `.relay/relay.mcp.json` (Claude), `--config mcp_servers.blender.*` (Codex) | Every start, wake and resume |
 
 ## Skills
 
@@ -35,6 +35,7 @@ checkout. You do not need Blender open, and nothing appears on your screen.
 | `blender_info` | Lists the art files, or reports what a `.blend` holds |
 | `blender_python` | Runs bpy code on a file; can save or save as |
 | `blender_render` | Images from named views at chosen frames, returned to the agent |
+| `blender_mesh_check` | Mesh problems as exported (degenerate faces, bad normals, n-gons) |
 | `blender_rig_check` | Rig and skin problems before export |
 | `blender_anim_inspect` | Sides, grips, clearance, contacts and feet across an action |
 | `blender_export` | FBX with Unreal's conventions |

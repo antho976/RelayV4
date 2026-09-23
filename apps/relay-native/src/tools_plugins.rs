@@ -8,6 +8,20 @@ use gtk4 as gtk;
 use serde_json::{json, Value};
 use std::rc::Rc;
 
+/// Every build of the engine bundles plugins, so an empty list or a refused `project_id` means
+/// the engine that is running was started from an older build: `run.sh` reuses a running engine.
+pub(crate) const STALE_ENGINE: &str = "The running Relay engine is older than this app and does not know about plugins yet. Restart it: when your agents are idle, run `target/debug/relay --instance dev q app.quit '{\"force\":true}'` (use your instance name), then ./run.sh again. Live agents come back as restorable; resume them from their tiles.";
+
+pub(crate) fn explain(error: &str) -> String {
+    if error.contains("plugin.")
+        && (error.contains("unknown field") || error.contains("not implemented"))
+    {
+        STALE_ENGINE.to_string()
+    } else {
+        error.to_string()
+    }
+}
+
 pub async fn refresh(ui: &Rc<Ui>, project: i64) {
     let generation = ui.generation.get();
     let result = ui.call("plugin.list", json!({})).await;
@@ -17,7 +31,7 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
     let plugins = match result {
         Ok(value) => rows(&value, "plugins"),
         Err(error) => {
-            ui.show_error(&error.to_string());
+            ui.show_error(&explain(&error.to_string()));
             return;
         }
     };
@@ -33,7 +47,7 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
     head.append(&copy);
     content.append(&head);
     if plugins.is_empty() {
-        content.append(&paragraph("This build bundles no plugins."));
+        content.append(&paragraph(STALE_ENGINE));
     }
     for plugin in &plugins {
         content.append(&card(ui, plugin));

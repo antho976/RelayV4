@@ -246,6 +246,14 @@ Rules:
 - Spawning VFX on a dedicated server - wasted CPU; guard with net mode or use Gameplay Cues/multicast.
 - Enabling Substrate or virtual texturing casually - project-wide shader recompile.
 
+## First-person effects: prefer opaque
+
+Translucent primitives close to a first-person camera (muzzle flashes, tracers, impact cards)
+can white out the whole view when fired: they cover the screen at point-blank range and stack.
+Use opaque or masked materials with emissive for first-person effects, keep translucent sprites
+small and away from the near plane, and check a firing sequence with `ue_play` screenshots
+before calling it done.
+
 ## Verify your work
 
 - [ ] Material compiles (no errors in `ue_log`), assets saved, paths reported to the human.

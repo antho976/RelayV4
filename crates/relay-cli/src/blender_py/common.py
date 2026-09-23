@@ -141,3 +141,41 @@ def sample_frames(arm):
     a, b = action_range(arm)
     n = max(2, min(int(ARGS.get("samples", 9)), 60))
     return sorted(set(int(round(a + (b - a) * i / (n - 1))) for i in range(n)))
+
+
+def mesh_report(o):
+    """Problems in a mesh as it will be exported: modifiers applied (a bevel wider than a thin
+    part only shows up here). `problems` break rendering in Unreal; `warnings` are worth a look."""
+    import bmesh
+    deps = bpy.context.evaluated_depsgraph_get()
+    ev = o.evaluated_get(deps)
+    me = ev.to_mesh()
+    try:
+        bm = bmesh.new()
+        bm.from_mesh(me)
+        degenerate = sum(1 for f in bm.faces if f.calc_area() < 1e-10)
+        zero_edges = sum(1 for e in bm.edges if e.calc_length() < 1e-6)
+        loose = sum(1 for v in bm.verts if not v.link_edges)
+        non_manifold = sum(1 for e in bm.edges if not e.is_manifold)
+        ngons = sum(1 for f in bm.faces if len(f.verts) > 4)
+        closed = non_manifold == 0 and len(bm.faces) > 0
+        volume = bm.calc_volume(signed=True) if closed else None
+        bm.free()
+        problems, warnings = [], []
+        if degenerate:
+            problems.append("%d zero-area faces (often a bevel or solidify wider than a thin part) - lower the modifier's width, or Mesh > Clean Up > Degenerate Dissolve after applying" % degenerate)
+        if zero_edges:
+            problems.append("%d zero-length edges - Mesh > Clean Up > Merge by Distance" % zero_edges)
+        if volume is not None and volume < 0:
+            problems.append("normals point inward (negative volume) - Mesh > Normals > Recalculate Outside")
+        if loose:
+            warnings.append("%d loose vertices - Mesh > Clean Up > Delete Loose" % loose)
+        if ngons:
+            warnings.append("%d n-gons: the FBX exporter skips tangents for this mesh - triangulate or quad them" % ngons)
+        if not me.uv_layers:
+            warnings.append("no UV map: textures and lightmaps need one")
+        return {"object": o.name, "triangles": sum(len(p.vertices) - 2 for p in me.polygons),
+                "degenerate_faces": degenerate, "zero_length_edges": zero_edges, "loose_vertices": loose,
+                "non_manifold_edges": non_manifold, "ngons": ngons, "problems": problems, "warnings": warnings}
+    finally:
+        ev.to_mesh_clear()

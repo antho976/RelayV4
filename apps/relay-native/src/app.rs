@@ -263,6 +263,8 @@ impl Ui {
         let layouts_key = icon_button("view-grid-symbolic", "Window presets");
         layouts_key.set_widget_name("window-presets");
         let skills_key = icon_button("skills", "Skills for this project");
+        let plugins_key = icon_button("plugins", "Plugins for this project");
+        plugins_key.set_widget_name("project-plugins");
         let notifications_key = icon_button("alarm-symbolic", "Notifications");
         let bell = gtk::Overlay::new();
         bell.set_child(Some(&crate::icons::image("bell", 16)));
@@ -273,7 +275,13 @@ impl Ui {
         notification_count.set_can_target(false);
         bell.add_overlay(&notification_count);
         notifications_key.set_child(Some(&bell));
-        for key in [&palette_key, &skills_key, &layouts_key, &notifications_key] {
+        for key in [
+            &palette_key,
+            &skills_key,
+            &plugins_key,
+            &layouts_key,
+            &notifications_key,
+        ] {
             top_actions.append(key);
         }
         let reconnect = icon_button("view-refresh-symbolic", "Reconnect to engine");
@@ -658,6 +666,12 @@ impl Ui {
                 ui.project_skills();
             }
         });
+        let weak = Rc::downgrade(&ui);
+        plugins_key.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                ui.project_plugins(ui.project.get());
+            }
+        });
         let settings_return = Rc::new(RefCell::new((String::from("agents"), true)));
         let return_state = settings_return.clone();
         let weak = Rc::downgrade(&ui);
@@ -690,6 +704,7 @@ impl Ui {
             top_actions.set_visible(!settings);
             bottom.set_visible(!settings);
             skills_key.set_visible(page == "agents");
+            plugins_key.set_visible(page == "agents");
             *mut_previous.borrow_mut() = page.into();
         });
         let weak = Rc::downgrade(&ui);

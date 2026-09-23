@@ -16,11 +16,21 @@ C++ modules (`*.Build.cs`), project plugins (`Plugins/**/*.uplugin`), config fil
 and the log path. **Call it first in every task.**
 
 ### `ue_setup_check` — `{ fix?: bool }`
+With `fix`, also writes `Config/DefaultRemoteControl.ini` (web server at start-up, remote Python,
+console commands, remote function calls), checking each key against the engine's
+`RemoteControlSettings.h` when the engine source is present.
+
 Whether *RemoteControl*, *PythonScriptPlugin* and *EditorScriptingUtilities* are enabled in the
 `.uproject`, whether the editor answers, whether remote Python runs, and a list of `advice` steps.
 `fix: true` adds the missing plugins to the `.uproject` (tab-indented, other fields untouched).
 
-### `ue_build` — `{ target?, platform?, configuration?, timeout_s? }`
+### `ue_build` — `{ target?, platform?, configuration?, timeout_s?, restart_editor?, allow_editor_open?, keep_crash_reporters? }`
+`restart_editor` saves and quits the editor, builds, relaunches it and waits until it answers
+(the C++ loop on Linux, which has no Live Coding). Before building it stops leftover
+CrashReportClient processes and refuses while the editor runs; afterwards it warns when
+`UnrealEditor.modules` names a numbered hot-reload module. The engine is found without `UE_ROOT`
+from a running editor, the project log, a surrounding source tree, `Install.ini` or common folders.
+
 Runs `Engine/Build/BatchFiles/<Linux|Mac>/Build.sh` (or `Build.bat`) with
 `<target> <platform> <configuration> -Project=<uproject> -WaitMutex -FromMsBuild`.
 Defaults: the `*Editor` target, the host platform, `Development`, one hour. Returns `success`,
@@ -69,6 +79,16 @@ Actors of the open level with label, class, object path, outliner folder and loc
 
 ### `ue_console` — `{ command }`
 Runs a console command in the editor world. Output lands in the log; read it with `ue_log`.
+
+### `ue_editor_launch` — `{ timeout_s?, extra_args? }` and `ue_editor_quit` — `{ save? }`
+Launch waits for the Remote Control port to be free, starts the editor with `-RCWebControlEnable`,
+and waits until Remote Control answers, failing early on a bind error in the new log. Quit saves
+dirty packages (unless `save: false`), asks the editor to quit, and waits for the process to exit
+and the port to be released.
+
+When the editor is unreachable, `ue_editor_status` says which case it is: editor running but no
+server, a failed bind (run `WebControl.StopServer` then `WebControl.StartServer`), or the port
+still held with no editor.
 
 ### `ue_editor_status` also reports
 `editor_project`, `this_checkout`, `same_project` and the current `editor_lock`.

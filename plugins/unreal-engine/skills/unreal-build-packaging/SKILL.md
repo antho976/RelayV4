@@ -288,6 +288,25 @@ Plugins/MyTools/
 - Restrict platforms with `"PlatformAllowList": ["Win64", "Linux"]` on a module.
 - Distribute compiled: `RunUAT BuildPlugin -Plugin="<abs>/MyTools.uplugin" -Package="<abs>/Out"`.
 
+## The C++ loop on Linux
+
+There is no Live Coding on Linux: every C++ change means close, build, relaunch (one to five
+minutes). Do it in one call: `ue_build {"restart_editor": true}` saves and quits the editor,
+waits for it to exit and for the Remote Control port to be released, builds, relaunches, and
+waits until the editor answers. Batch C++ changes to pay that cost less often.
+
+Two traps `ue_build` now guards against:
+- A leftover **CrashReportClient** makes UnrealBuildTool think an editor is running, so it builds
+  a numbered hot-reload module (`libUnrealEditor-MyGame-0003.so`) while
+  `Binaries/Linux/UnrealEditor.modules` keeps pointing at the old one, and the editor runs old
+  code. `ue_build` stops leftover crash reporters first and warns when the manifest names a
+  numbered module. If it does: quit the editor, delete the numbered files, build again.
+- Building while the editor is open is refused unless `allow_editor_open` is set.
+
+`ue_build` finds the engine without `UE_ROOT`: from a running editor, the project's last log
+("Base Directory"), a source tree around the project, `Install.ini` (by GUID or by version), and
+common install folders; the error lists what it tried.
+
 ## Verify your work
 
 - [ ] `ue_build` succeeded for the editor target; for runtime-affecting changes also build

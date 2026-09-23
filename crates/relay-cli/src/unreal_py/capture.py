@@ -35,7 +35,24 @@ def views_around(center, radius, forward, right, names):
     return out
 
 
-def capture(shots, show_only):
+def coverage(rt):
+    """Share of sampled pixels that differ from the corner (background) pixel: 0 means the
+    subject did not render (an invisible mesh draws only its shadow, or nothing)."""
+    try:
+        bg = unreal.RenderingLibrary.read_render_target_pixel(world, rt, 1, 1)
+        hits, total = 0, 0
+        for gx in range(1, 24):
+            for gy in range(1, 24):
+                c = unreal.RenderingLibrary.read_render_target_pixel(world, rt, int(width * gx / 24), int(height * gy / 24))
+                total += 1
+                if abs(c.r - bg.r) + abs(c.g - bg.g) + abs(c.b - bg.b) > 24:
+                    hits += 1
+        return round(hits / float(total), 3)
+    except Exception:
+        return None
+
+
+def capture(shots, hidden):
     rt = unreal.RenderingLibrary.create_render_target2d(world, width, height, unreal.TextureRenderTargetFormat.RTF_RGBA8)
     cam = actor_subsystem().spawn_actor_from_class(unreal.SceneCapture2D, unreal.Vector(0, 0, 0), unreal.Rotator())
     files = []
@@ -46,15 +63,19 @@ def capture(shots, show_only):
         comp.set_editor_property("capture_every_frame", False)
         comp.set_editor_property("capture_on_movement", False)
         comp.set_editor_property("fov_angle", fov)
-        if show_only:
-            comp.set_editor_property("primitive_render_mode", unreal.SceneCapturePrimitiveRenderMode.PRM_USE_SHOW_ONLY_LIST)
-            comp.set_editor_property("show_only_actors", show_only)
+        # Isolation hides the actors around the subject. The show-only primitive list was the
+        # first approach and crashed the editor in real use; hidden actors are plain data.
+        if hidden:
+            comp.set_editor_property("hidden_actors", hidden)
         for name, eye, rot in shots:
             cam.set_actor_location_and_rotation(unreal.Vector(*eye), rot, False, True)
             comp.capture_scene()
             file_name = "%s_%s.png" % (ARGS.get("prefix", "shot"), name)
             unreal.RenderingLibrary.export_render_target(world, rt, out_dir, file_name)
-            files.append({"view": name, "file": os.path.join(out_dir, file_name)})
+            entry = {"view": name, "file": os.path.join(out_dir, file_name)}
+            if ARGS.get("coverage"):
+                entry["coverage"] = coverage(rt)
+            files.append(entry)
     finally:
         actor_subsystem().destroy_actor(cam)
     return files
@@ -82,9 +103,37 @@ def target_frame():
     return None
 
 
+def neighbours(targets, center, radius):
+    """Actors near the subject that are not part of it, for isolation (bounded)."""
+    keep = set(a.get_path_name() for a in targets)
+    out = []
+    for a in actor_subsystem().get_all_level_actors():
+        if a.get_path_name() in keep:
+            continue
+        try:
+            origin, extent = a.get_actor_bounds(False)
+        except Exception:
+            continue
+        if length(sub(vec(origin), center)) - length(vec(extent)) < radius * 6.0:
+            out.append(a)
+            if len(out) >= 2000:
+                break
+    return out
+
+
 shots = []
-show_only = []
-if ARGS.get("camera"):
+hidden = []
+if ARGS.get("center") is not None:
+    # Framing given by the caller (animation previews frame the posed skeleton, which actor
+    # bounds do not follow).
+    center = tuple(float(c) for c in ARGS["center"])
+    radius = float(ARGS.get("radius", 100.0))
+    forward = normalize(tuple(ARGS.get("forward") or (1.0, 0.0, 0.0)))
+    right = normalize(cross((0.0, 0.0, 1.0), forward))
+    shots = views_around(center, radius, forward, right, ARGS.get("views") or ["front", "right"])
+    if ARGS.get("isolate") and ARGS.get("actors"):
+        hidden = neighbours([find_actor(a) for a in ARGS["actors"]], center, radius)
+elif ARGS.get("camera"):
     c = ARGS["camera"]
     r = c.get("rotation", [0, 0, 0])
     shots.append(("camera", tuple(float(x) for x in c["location"]), unreal.Rotator(roll=float(r[2]), pitch=float(r[0]), yaw=float(r[1]))))
@@ -97,6 +146,6 @@ else:
         center, radius, forward, right, actors = framed
         shots = views_around(center, radius, forward, right, ARGS.get("views") or ["front", "right", "three_quarter"])
         if ARGS.get("isolate"):
-            show_only = actors
+            hidden = neighbours(actors, center, radius)
 
-emit({"files": capture(shots, show_only), "width": width, "height": height})
+emit({"files": capture(shots, hidden), "width": width, "height": height, "hidden_for_isolation": len(hidden)})

@@ -169,6 +169,12 @@ impl Panel {
         self.scroll.set_propagate_natural_height(true);
     }
 
+    /// A floor for panels whose content arrives after they open.
+    pub fn min_height(&self, height: i32) {
+        self.scroll
+            .set_min_content_height(height.min((self.host.height() - 16).max(200)));
+    }
+
     pub fn bottom(&self, height: i32) {
         self.modal.set(false);
         self.layer.add_css_class("utility-layer");

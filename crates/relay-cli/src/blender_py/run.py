@@ -10,6 +10,8 @@ finally:
     print("RELAY_OUT_END")
 saved = None
 if ARGS.get("save_as"):
+    import os
+    os.makedirs(os.path.dirname(os.path.abspath(ARGS["save_as"])), exist_ok=True)
     bpy.ops.wm.save_as_mainfile(filepath=ARGS["save_as"], copy=False)
     saved = ARGS["save_as"]
 elif ARGS.get("save"):

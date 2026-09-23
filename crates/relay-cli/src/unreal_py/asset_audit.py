@@ -121,7 +121,7 @@ if "references" in checks:
             if not dep.startswith("/Game"):
                 continue
             checked += 1
-            if not unreal.EditorAssetLibrary.does_asset_exist(dep):
+            if not asset_exists(dep):
                 missing += 1
                 finding("reference", str(package), "references missing asset %s" % dep, "restore the asset, or fix the reference in the editor and resave")
     counts["references_checked"] = checked

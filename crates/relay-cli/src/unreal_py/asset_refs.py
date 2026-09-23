@@ -22,7 +22,7 @@ def walk(start, fn):
     return levels
 
 
-if not unreal.EditorAssetLibrary.does_asset_exist(path):
+if not asset_exists(path):
     raise RuntimeError("no asset %s" % path)
 emit({"path": path, "depends_on": walk(path, registry.get_dependencies),
       "referenced_by": walk(path, registry.get_referencers),

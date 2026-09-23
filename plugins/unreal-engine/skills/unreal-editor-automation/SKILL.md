@@ -258,6 +258,63 @@ rename, move or delete), `ue_data_table` (tables as CSV/JSON files), `ue_profile
 numbers), `ue_run_tests` and `ue_crash`. They return structured results and handle timing (play
 sessions, screenshots written a frame late) that a one-off script gets wrong.
 
+## Known gaps and workarounds (from real sessions, UE 5.8 on Linux)
+
+These cost hours once. Check here before debugging them again.
+
+**Editor process and Remote Control**
+- *Remote Control needs project settings.* `ue_setup_check {"fix": true}` adds the bridge
+  plugins to the `.uproject` and writes `Config/DefaultRemoteControl.ini` (web server at start-up,
+  remote Python, console commands, remote function calls; keys are checked against the engine's
+  own `RemoteControlSettings.h`). Restart the editor afterwards.
+- *The port stays held after the editor closes.* A quick relaunch then fails to bind with one log
+  line, and `WebControl.StartServer` alone does nothing: run `WebControl.StopServer` first. Use
+  `ue_editor_quit` and `ue_editor_launch`, which wait for the port and read the log for a failed
+  bind; `ue_editor_status` explains which of the three unreachable cases you are in.
+- *The editor throttles itself in the background* (a few fps). `ue_play` and `ue_profile` turn
+  `throttle_cpu_when_not_foreground` off for the session and report `average_fps`; below 20 fps a
+  timed test means nothing.
+- *Play screenshots* are taken after the checkpoint's probe and matched to their own file, so
+  images and probe output describe the same moment.
+- *"Cancelling Open Transaction 'Remote Call Transaction Wrap'"* at play start is harmless; the
+  tools no longer wrap play calls in a transaction and filter the line from play logs.
+- *Isolation.* A scene capture with a show-only primitive list crashed the editor; `isolate` now
+  hides nearby actors instead, and animation previews spawn 500 m above the camera, clear of the
+  level, so they rarely need isolation at all.
+
+**Python API gaps**
+- *Collision set with `set_collision_enabled` is not saved*: that is a runtime call. For an
+  asset, change the mesh's `body_setup` (and save the mesh); for a placed actor, change the
+  component's `body_instance` struct and set it back with `set_editor_property`, then save the
+  level.
+- *Not exposed to Python*: montage sections, Blueprint graph nodes, `Package.set_dirty_flag`.
+  For saving, `save_loaded_asset(asset, False)` saves whether or not the package is dirty (the
+  common helper falls back to `EditorLoadingAndSavingUtils.save_packages`). Sections and graph
+  wiring go to the human as exact steps, or to a small C++ editor function library in the
+  project.
+- *Actors cannot be spawned into a Play In Editor world from Python.* Place them in the level
+  before `ue_play` (the play world copies the level), or spawn through a cheat or exec function
+  in C++ and call it with `ue_play`'s `console`.
+- *After a failed import, `EditorAssetLibrary` path functions can break for the whole session*:
+  `does_asset_exist`, `save_asset` and `delete_asset` returned False for every asset until a
+  restart, while `save_packages` and the Asset Registry kept working. The tools now ask the
+  registry. If you see it in your own scripts, use the registry, and restart the editor when
+  convenient.
+- *Re-importing over an existing mesh* kept the old import settings and data; consolidating
+  half-worked, and a deleted file stayed on disk until a restart. `blender_to_unreal` imports with
+  `replace_existing_settings`. When a re-import still looks stale, import under a new name and
+  point the references at it (`ue_asset_refs`) rather than fighting the old asset.
+
+**Import (Blender to Unreal, UE 5.8)**
+- *The Interchange FBX importer* produced empty static meshes ("Bad MeshDescription", even for a
+  cube) and a translucent material as a transient instance that made the mesh unsaveable.
+  `blender_to_unreal` uses the legacy importer by default (it sets
+  `Interchange.FeatureFlags.Import.FBX 0` for the import and restores it), retries with the other
+  importer if the first result is broken, and deletes broken results so none stay behind.
+- *"Import Normals and Tangents"* on a Blender FBX gave a mesh that drew only its shadow. The
+  default is "Import Normals" (tangents computed), and every import is rendered once and
+  measured: `render_check.renders: false` means it does not draw.
+
 ## Verify your work
 
 - [ ] `ue_editor_status` answered and scripts returned without Python tracebacks.

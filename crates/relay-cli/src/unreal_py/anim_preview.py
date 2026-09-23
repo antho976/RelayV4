@@ -54,9 +54,10 @@ elif action == "setup":
     if ARGS.get("location"):
         base = tuple(float(c) for c in ARGS["location"])
     else:
+        # High above where the editor camera is: lit by the level's sun and sky, and clear of
+        # walls and props that would block the view.
         loc, rot = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_level_viewport_camera_info()
-        fwd = vec(rot.get_forward_vector())
-        base = add(vec(loc), mul(normalize((fwd[0], fwd[1], 0.0)), 600.0))
+        base = add(vec(loc), (0.0, 0.0, float(ARGS.get("altitude", 50000.0))))
     labels = []
     main = skeletal_actor(PREFIX + " Character", mesh, anim, base, 0.0)
     labels.append(main.get_actor_label())
@@ -109,11 +110,19 @@ elif action in ("pose", "check"):
                 continue
             offset = float((ARGS.get("partner") or {}).get("time_offset", 0.0)) if label.endswith("Partner") else 0.0
             skeletal_component(a).set_position(t + offset, False)
-    expected = skel.point(skel.component_pose(skel.local_pose(anim, t)), probe)[0]
+    pose = skel.component_pose(skel.local_pose(anim, t))
+    expected = skel.point(pose, probe)[0]
     base = vec(main.get_actor_location())
     expected_world = add(base, expected)
     actual = vec(comp.get_socket_location(probe))
+    # Frame the posed skeleton itself (plus a margin for held items), not the actor bounds.
+    pts = [add(base, p[0]) for p in pose.values()]
+    lo = tuple(min(p[i] for p in pts) for i in range(3))
+    hi = tuple(max(p[i] for p in pts) for i in range(3))
+    center = mul(add(lo, hi), 0.5)
+    radius = length(sub(hi, lo)) * 0.5 + float(ARGS.get("margin", 40.0))
     emit({"time": t, "probe": probe, "expected": rnd(expected_world), "actual": rnd(actual),
-          "off_by_cm": round(length(sub(expected_world, actual)), 2)})
+          "off_by_cm": round(length(sub(expected_world, actual)), 2),
+          "center": rnd(center), "radius": round(radius, 1)})
 else:
     raise RuntimeError("unknown action %r" % action)
