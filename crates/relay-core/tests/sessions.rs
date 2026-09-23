@@ -1293,3 +1293,106 @@ fn slow_checkout_does_not_hold_the_store_lock() {
     assert_eq!(std::fs::read_to_string(Path::new(session["worktree"].as_str().unwrap()).join("README.md")).unwrap(), "hi\n");
     assert!(elapsed < Duration::from_millis(500), "app.status blocked behind checkout for {elapsed:?}");
 }
+
+fn hooks_path(worktree: &Path) -> Option<PathBuf> {
+    let out = Command::new("git").arg("-C").arg(worktree)
+        .args(["config", "--worktree", "--get", "core.hooksPath"]).output().unwrap();
+    let value = String::from_utf8(out.stdout).unwrap().trim().to_owned();
+    (!value.is_empty()).then(|| PathBuf::from(value))
+}
+
+/// Several agents in the primary checkout: closing the one that owns `core.hooksPath` hands
+/// it to one that stays instead of deleting the directory git reads hooks from, and closing
+/// one with the default `remove_worktree` is not refused, since nothing would be removed.
+#[test]
+fn closing_one_of_several_primary_checkout_sessions_keeps_the_hooks_running() {
+    let f = fixture();
+    let first = ok(&f.engine, "session.create", json!({"project_id":1,"provider":"codex","worktree":"primary"}));
+    let second = ok(&f.engine, "session.create", json!({"project_id":1,"provider":"codex","worktree":"primary"}));
+    let (first, second) = (first["name"].as_str().unwrap().to_owned(), second["name"].as_str().unwrap().to_owned());
+    // The primary checkout is excluded too, not only pooled worktrees.
+    let exclude = std::fs::read_to_string(f.repo.join(".git/info/exclude")).unwrap();
+    for entry in [".relay/", ".claude/settings.local.json", ".codex/hooks.json"] {
+        assert!(exclude.lines().any(|line| line == entry), "{entry} is not excluded:\n{exclude}");
+    }
+    let status = Command::new("git").arg("-C").arg(&f.repo).args(["status", "--porcelain"]).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&status.stdout).trim(), "");
+
+    assert_eq!(hooks_path(&f.repo), Some(f.repo.join(".relay/hooks").join(&second)));
+    let r = ok(&f.engine, "session.close", json!({"session": second}));
+    assert_eq!(r["freed_mb"], 0.0);
+    let active = hooks_path(&f.repo).expect("the worktree lost its hook path");
+    assert_eq!(active, f.repo.join(".relay/hooks").join(&first));
+    assert!(active.join("pre-commit").is_file(), "core.hooksPath points at a missing directory");
+    assert!(!f.repo.join(".relay/hooks").join(&second).exists());
+
+    ok(&f.engine, "session.close", json!({"session": first}));
+    // The path from before Relay is written back explicitly: git's own default here.
+    assert_eq!(hooks_path(&f.repo), Some(PathBuf::from(".git/hooks")), "the last close did not restore the previous hook path");
+    assert!(!f.repo.join(".relay/hooks").join(&first).exists());
+    assert!(f.repo.join("README.md").is_file());
+}
+
+/// A pooled checkout is measured before the lock and removed after commit, but the reply still
+/// reports what it freed and the checkout is gone when the reply arrives.
+#[test]
+fn closing_a_pooled_session_reports_what_it_freed() {
+    let f = fixture();
+    let session = ok(&f.engine, "session.create", json!({"project_id":1,"provider":"codex","worktree":"new"}));
+    let worktree = PathBuf::from(session["worktree"].as_str().unwrap());
+    std::fs::create_dir_all(worktree.join("Intermediate")).unwrap();
+    std::fs::write(worktree.join("Intermediate/big.bin"), vec![0u8; 512 * 1024]).unwrap();
+    let r = ok(&f.engine, "session.close", json!({"session": session["name"]}));
+    assert!(r["freed_mb"].as_f64().unwrap() > 0.4, "{r}");
+    assert!(!worktree.exists());
+    let audit = ok(&f.engine, "audit.list", json!({"op_prefix": "session.close.worktree", "limit": 1}));
+    assert_eq!(audit["rows"][0]["op"], "session.close.worktree_removed", "{audit}");
+}
+
+/// User-registered MCP servers (D162) reach both providers next to the plugin servers: the
+/// project's entry wins over the global one of the same name, `relay` and a plugin's name
+/// cannot be taken, and a malformed entry is skipped rather than failing the launch.
+#[test]
+fn custom_mcp_servers_reach_every_agent_of_their_project() {
+    let f = fixture();
+    let claude = fake_discovery_provider(&f.root, "claude", "claude 1.0.0");
+    let codex = fake_discovery_provider(&f.root, "codex", "codex-cli 1.0.0");
+    ok(&f.engine, "settings.set", json!({"path": "providers.claude.path", "value": claude}));
+    ok(&f.engine, "settings.set", json!({"path": "providers.codex.path", "value": codex}));
+    assert_eq!(ok(&f.engine, "settings.get", json!({"path": "mcp"}))["value"], json!({"servers": {}, "projects": {}}));
+    ok(&f.engine, "plugin.enable", json!({"plugin_id": "blender", "project_id": 1, "enabled": true}));
+    ok(&f.engine, "settings.set", json!({"path": "mcp.servers", "value": {
+        "docs": {"command": "docs-global", "args": ["--stdio"], "env": {}},
+        "tracker": {"command": "tracker-mcp", "args": ["serve"], "env": {"TRACKER_URL": "http://localhost:9"}},
+        "relay": {"command": "impostor"},
+        "blender": {"command": "not-the-plugin"},
+        "broken": {"args": ["no command"]},
+    }}));
+    ok(&f.engine, "settings.set", json!({"path": "mcp.projects.1.servers", "value": {
+        "docs": {"command": "docs-project", "args": [], "env": {"DOCS_ROOT": "/srv/docs"}},
+        "tracker": null,
+    }}));
+    ok(&f.engine, "settings.set", json!({"path": "mcp.projects.2.servers", "value": {"elsewhere": {"command": "x"}}}));
+
+    let created = ok(&f.engine, "session.create", json!({"project_id": 1, "provider": "claude", "worktree": "new"}));
+    let running = ok(&f.engine, "session.spawn", json!({"session": created["name"]}));
+    let worktree = PathBuf::from(running["worktree"].as_str().unwrap());
+    let mcp: Value = serde_json::from_str(&std::fs::read_to_string(worktree.join(".relay/relay.mcp.json")).unwrap()).unwrap();
+    let servers = &mcp["mcpServers"];
+    assert_eq!(servers["docs"], json!({"command": "docs-project", "args": [], "env": {"DOCS_ROOT": "/srv/docs"}}));
+    assert!(servers.get("tracker").is_none(), "a project's null did not switch the global server off");
+    assert!(servers.get("broken").is_none() && servers.get("elsewhere").is_none());
+    assert!(servers["relay"]["args"].as_array().unwrap().iter().any(|a| a == "mcp"), "the bus server was replaced");
+    assert_eq!(servers["blender"]["args"], json!(["blender-mcp"]), "a custom server replaced the plugin's");
+    ok(&f.engine, "session.close", json!({"session": created["name"]}));
+
+    let created = ok(&f.engine, "session.create", json!({"project_id": 1, "provider": "codex", "worktree": "new"}));
+    let running = ok(&f.engine, "session.spawn", json!({"session": created["name"]}));
+    let worktree = PathBuf::from(running["worktree"].as_str().unwrap());
+    wait_until("codex args", || worktree.join(".relay/provider-args.txt").is_file());
+    let args = std::fs::read_to_string(worktree.join(".relay/provider-args.txt")).unwrap();
+    assert!(args.contains("mcp_servers.docs.command=\"docs-project\""), "{args}");
+    assert!(args.contains("mcp_servers.docs.env={DOCS_ROOT=\"/srv/docs\"}"), "{args}");
+    assert!(!args.contains("impostor") && !args.contains("not-the-plugin") && !args.contains("tracker"), "{args}");
+    ok(&f.engine, "session.close", json!({"session": created["name"]}));
+}

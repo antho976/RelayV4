@@ -954,3 +954,30 @@ The *why* behind anything surprising. Append; never rewrite history. Reference a
   measured again after import. `blender_to_unreal` calls the Unreal bridge in-process, sharing its
   project guard and editor lock, and compares height, root bone scale and hand sides across the
   handoff. The Blender tests run against real Blender when it is installed and skip otherwise.
+- **D162 Your own MCP servers are settings, delivered like a plugin's; Relay's hook directory
+  forwards every hook and outlives its session.** A server added with `claude mcp add` is keyed
+  by directory and an untracked `.mcp.json` never reaches a pooled worktree, so a server added
+  in the main checkout was missing for every other agent. `mcp.servers` (all projects) and
+  `mcp.projects.<project_id>.servers` now map a server name to `{"command", "args", "env"}`, e.g.
+  `relay cmd settings.set '{"path":"mcp.projects.1.servers","value":{"docs":{"command":"docs-mcp","args":["--stdio"],"env":{}}}}'`.
+  A project entry replaces the global one of the same name, and a project `null` switches a
+  global one off there. They join the enabled plugins' servers in `.relay/relay.mcp.json` and in
+  Codex's `--config mcp_servers.<name>.*`, on the next start or resume. A name must be
+  `[A-Za-z0-9_-]` (a bare TOML key and one settings segment), `relay` is reserved, and a name an
+  enabled plugin already serves stays the plugin's: the plugin's tools are what its skills and
+  brief describe. Such entries, and malformed ones, are skipped with a warning; a setting never
+  fails a launch. `command: "relay"` means this binary, as in a manifest. D23's hook directory
+  now also carries a forwarder for every other hook git looks up in `core.hooksPath` that the
+  previous directory has (`pre-push`, `post-checkout`, `post-commit`, `post-merge`, `commit-msg`
+  and the rest), which `exec`s it with the same arguments and stdin; without them Git LFS's hooks
+  stopped running and a push sent pointers without objects. Forwarders are rewritten on every
+  install and commit repair, and a hook another tool wrote into the directory is left alone.
+  Closing one of several sessions in a checkout hands `core.hooksPath` to the newest survivor
+  before its directory goes, since git reads a missing hooks directory as "no hooks"; every
+  install also adds Relay's files to `info/exclude`, so the primary checkout is covered too.
+  `session.close` refuses with `session.pair_live` only when it would delete a pooled checkout,
+  measures that checkout before taking the store lock and deletes it after commit, still before
+  the reply. `freed_mb` is that measurement; a failed removal leaves a closed session and its
+  checkout for `worktree.remove`, and is logged, audited and sent on `worktree.changed` with an
+  `error`. Git run by the hook installer and the worktree helpers goes through
+  `proc::output_with_timeout` with `GIT_TERMINAL_PROMPT=0`.

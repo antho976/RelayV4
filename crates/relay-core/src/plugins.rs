@@ -298,6 +298,79 @@ pub fn mcp_servers(
     Ok(out)
 }
 
+/// A server name that is a bare TOML key, so Codex's `--config mcp_servers.<name>.*` reads
+/// it as one key, and a single settings path segment.
+fn valid_server_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+}
+
+/// One settings entry as a launch server, or why it cannot be one.
+fn custom_server(name: &str, spec: &serde_json::Value, relay: &Path) -> std::result::Result<LaunchServer, String> {
+    let object = spec.as_object().ok_or("is not an object")?;
+    let command = object.get("command").and_then(|v| v.as_str()).map(str::trim).filter(|c| !c.is_empty())
+        .ok_or("has no command")?;
+    let args = match object.get("args") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Array(items)) => items.iter()
+            .map(|item| item.as_str().map(str::to_owned).ok_or("has a non-string arg"))
+            .collect::<std::result::Result<_, _>>()?,
+        Some(_) => return Err("args is not an array".into()),
+    };
+    let mut env = BTreeMap::new();
+    match object.get("env") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::Object(pairs)) => for (key, value) in pairs {
+            if !valid_server_name(key) { return Err(format!("env key {key:?} is not [A-Za-z0-9_-]")); }
+            env.insert(key.clone(), value.as_str().ok_or("has a non-string env value")?.to_owned());
+        },
+        Some(_) => return Err("env is not an object".into()),
+    }
+    let command = if command == "relay" { relay.display().to_string() } else { command.to_owned() };
+    Ok((name.to_owned(), command, args, env))
+}
+
+/// The MCP servers the user registered in settings (D162): `mcp.servers` for every project,
+/// then `mcp.projects.<project_id>.servers`, where an entry replaces a global one of the same
+/// name and `null` switches a global one off for that project. Each entry is `{"command",
+/// "args", "env"}`, delivered exactly like a plugin's server. A name that is not
+/// `[A-Za-z0-9_-]`, the reserved `relay`, a name an enabled plugin already serves (`taken`),
+/// or a malformed entry is skipped with a warning: a bad setting never fails a launch.
+pub fn custom_mcp_servers(
+    tx: &rusqlite::Transaction,
+    project_id: Id,
+    relay: &Path,
+    taken: &[LaunchServer],
+) -> Vec<LaunchServer> {
+    let mut merged: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    for path in ["mcp.servers".to_string(), format!("mcp.projects.{project_id}.servers")] {
+        match crate::handlers::settings::get(tx, Some(&path)) {
+            Ok(serde_json::Value::Object(entries)) => merged.extend(entries),
+            Ok(serde_json::Value::Null) => {}
+            Ok(_) => tracing::warn!(%path, "custom MCP servers: not an object of name -> server"),
+            Err(error) => tracing::warn!(%path, error = %error.message, "custom MCP servers: unreadable"),
+        }
+    }
+    let mut out: Vec<LaunchServer> = Vec::new();
+    for (name, spec) in merged {
+        if spec.is_null() {
+            continue;
+        }
+        if !valid_server_name(&name) || name == "relay" {
+            tracing::warn!(server = %name, "custom MCP server skipped: the name must be [A-Za-z0-9_-] and not `relay`");
+            continue;
+        }
+        if taken.iter().any(|(plugin, ..)| plugin == &name) {
+            tracing::warn!(server = %name, "custom MCP server skipped: an enabled plugin serves that name");
+            continue;
+        }
+        match custom_server(&name, &spec, relay) {
+            Ok(server) => out.push(server),
+            Err(why) => tracing::warn!(server = %name, %why, "custom MCP server skipped"),
+        }
+    }
+    out
+}
+
 /// The brief section that makes an enabled plugin's rules part of every agent's standing
 /// context: its instructions verbatim, then what it installed and where.
 pub fn brief_section(conn: &Connection, project_id: Id) -> Result<String> {

@@ -340,6 +340,54 @@ fn uninstall_git_chain(tx: &Transaction, repo: &Path, worktree: &Path) -> Result
     Ok(())
 }
 
+/// Drop a closing session's generated hook directory without leaving its worktree hookless.
+/// When the session owns the active `core.hooksPath` and others still work there, the path
+/// moves to the newest of them first (its chain still reaches the user's hooks); with nobody
+/// left, [`uninstall_git_chain`] has already put the previous path back. Git reads a missing
+/// hooks directory as "no hooks", so a failed handoff keeps the directory rather than lose the
+/// gate and every user hook.
+fn release_hook_dir(ctx: &Ctx, repo: &Path, wt: &Path, s: &Session) -> Result<(), BusError> {
+    if wt.is_dir() && crate::hooks::active_hook_session(repo, wt).as_deref() == Some(s.name.as_str()) {
+        let survivor: Option<String> = ctx.tx().query_row(
+            "SELECT name FROM sessions WHERE id!=?1 AND worktree=?2 AND state!='closed' ORDER BY id DESC LIMIT 1",
+            params![s.id, s.worktree], |row| row.get(0),
+        ).optional().bus()?;
+        let handoff = match &survivor {
+            Some(name) => crate::hooks::install_git(repo, wt, name, ctx.instance(), &crate::hooks::relay_bin()),
+            None => crate::hooks::uninstall_git(repo, wt, &s.name),
+        };
+        if let Err(error) = handoff.or_else(|_| crate::hooks::uninstall_git(repo, wt, &s.name)) {
+            tracing::warn!(session = %s.name, worktree = %wt.display(), %error, "keeping the hook directory: the worktree still points at it");
+            return Ok(());
+        }
+    }
+    // The generated hook directory outlives nothing: leaving one per dead session behind
+    // makes `.relay/hooks` read like a fleet that never shut down.
+    crate::hooks::remove_hook_dir(repo, &s.name);
+    Ok(())
+}
+
+/// Delete a pooled checkout once the close has committed. The removal is an `rm -rf` of a
+/// whole checkout — tens of GB for an Unreal project — so it runs with the store unlocked,
+/// still before the reply. A failure leaves a closed session and a checkout on disk; it is
+/// logged, audited, and announced on `worktree.changed` with an `error`, and
+/// `worktree.remove` can finish the job.
+fn remove_after_commit(ctx: &mut Ctx, project_id: Id, session_id: Id, repo: &Path, wt: &Path, purge: bool) {
+    let (repo, wt, req) = (repo.to_path_buf(), wt.to_path_buf(), ctx.req_id);
+    ctx.after_commit(move |engine| {
+        let (op, event) = match worktree::discard(&repo, &wt, purge) {
+            Ok(()) => ("session.close.worktree_removed", json!({"project_id":project_id,"path":wt})),
+            Err(error) => {
+                tracing::warn!(worktree = %wt.display(), %error, "removing a closed session's worktree");
+                ("session.close.worktree_remove_failed",
+                    json!({"project_id":project_id,"path":wt,"error":error.to_string()}))
+            }
+        };
+        let _ = engine.system_write(op, Some(req), Some(project_id), Some(session_id), event.clone(),
+            |_, _| Ok(((), vec![("worktree.changed".to_string(), event)])));
+    });
+}
+
 fn launch(ctx: &mut Ctx, row: &Row_, kind: LaunchKind) -> Result<Session, BusError> {
     let cmd = crate::providers::executable(ctx.tx(), row.session.provider)?;
     let cwd = PathBuf::from(&row.session.worktree);
@@ -360,7 +408,10 @@ fn launch(ctx: &mut Ctx, row: &Row_, kind: LaunchKind) -> Result<Session, BusErr
     )
     .bus()?;
     // A plugin that is on brings its MCP servers to every agent of the project (D159).
-    let plugin_servers = crate::plugins::mcp_servers(ctx.tx(), row.session.project_id, &relay_bin).bus()?;
+    let mut plugin_servers = crate::plugins::mcp_servers(ctx.tx(), row.session.project_id, &relay_bin).bus()?;
+    // ...and the servers the user registered in settings, through the same channels (D162).
+    let custom = crate::plugins::custom_mcp_servers(ctx.tx(), row.session.project_id, &relay_bin, &plugin_servers);
+    plugin_servers.extend(custom);
     if row.session.provider == Provider::Claude {
         crate::hooks::install_claude(&cwd, ctx.instance(), &relay_bin).bus()?;
         crate::hooks::add_claude_mcp_servers(&cwd, &plugin_servers).bus()?;
@@ -1328,9 +1379,10 @@ pub fn register(e: &mut Engine) {
                 crate::hooks::uninstall_codex(wt).bus()?;
             }
             if wt.starts_with(worktree::pool_dir(repo)) {
-                worktree::remove(repo, wt, true).map_err(|error| BusError::conflict("worktree.remove_failed", error.to_string()))?;
+                remove_after_commit(ctx, s.project_id, s.id, repo, wt, true);
             }
         }
+        release_hook_dir(ctx, repo, wt, s)?;
         ctx.tx().execute("UPDATE sessions SET state='closed',pid=NULL,closed_at=?1,updated_at=?1 WHERE id=?2", params![ctx.now,s.id]).bus()?;
         release_claims(ctx, s)?;
         ctx.tx().execute("UPDATE sessions SET pair_with=NULL,updated_at=?1 WHERE pair_with=?2 AND state!='closed'", params![ctx.now,s.name]).bus()?;
@@ -1341,7 +1393,23 @@ pub fn register(e: &mut Engine) {
         Ok(Empty {})
     });
 
-    e.register::<Close>(|ctx: &mut Ctx, p| {
+    // Measuring what a pooled checkout frees walks the whole tree, so it happens here with the
+    // store unlocked; the removal itself runs after commit (see `remove_after_commit`).
+    e.register_staged::<Close, _>(|ctx, p| {
+        let (project_path, worktree_path, others) = ctx.read(|conn| {
+            let row = sessions::by_name(conn, &p.session)?;
+            let project = crate::handlers::workspace::get_project(conn, row.session.project_id)?;
+            let others: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE id!=?1 AND worktree=?2 AND state!='closed')",
+                params![row.session.id, row.session.worktree], |row| row.get(0),
+            ).bus()?;
+            Ok((project.path, row.session.worktree, others))
+        })?;
+        let wt = Path::new(&worktree_path);
+        let removes = p.remove_worktree.unwrap_or(true) && !others
+            && wt.starts_with(worktree::pool_dir(Path::new(&project_path)));
+        Ok(if removes { worktree::dir_size(wt) } else { 0 })
+    }, |ctx: &mut Ctx, p, measured: u64| {
         let row = sessions::by_name(ctx.tx(), &p.session)?;
         let s = &row.session;
         let project = crate::handlers::workspace::get_project(ctx.tx(), s.project_id)?;
@@ -1349,13 +1417,19 @@ pub fn register(e: &mut Engine) {
             "SELECT EXISTS(SELECT 1 FROM sessions WHERE id!=?1 AND worktree=?2 AND state!='closed')",
             params![s.id, s.worktree], |row| row.get(0),
         ).bus()?;
-        if pair_live && p.remove_worktree.unwrap_or(true) {
+        let repo = Path::new(&project.path);
+        let wt = Path::new(&s.worktree);
+        let pooled = wt.starts_with(worktree::pool_dir(repo));
+        let remove = p.remove_worktree.unwrap_or(true) && pooled;
+        // Only a removal needs the partner gone: a primary or explicitly chosen checkout is
+        // never deleted, so there is nothing to refuse.
+        if pair_live && remove {
             return Err(BusError::conflict("session.pair_live", "close the PAIR partner first or pass remove_worktree:false"));
         }
         if let Some(pty) = ctx.engine().take_pty(s.id) {
             let (text, epoch, seq) = pty.scrollback(None);
             sessions::save_scrollback(ctx.tx(), s.id, &text, epoch, seq, &ctx.now)?;
-            if p.remove_worktree.unwrap_or(true) {
+            if remove {
                 // Stop writers before deleting their checkout, with a bounded grace period.
                 pty.kill(Duration::from_millis(150));
             } else {
@@ -1364,9 +1438,6 @@ pub fn register(e: &mut Engine) {
                 ctx.after_commit(move |_| pty.kill(Duration::from_millis(150)));
             }
         }
-        let mut freed = 0u64;
-        let repo = Path::new(&project.path);
-        let wt = Path::new(&s.worktree);
         let other_sessions: i64 = ctx.tx().query_row(
             "SELECT COUNT(*) FROM sessions WHERE id!=?1 AND worktree=?2 AND state!='closed'",
             params![s.id, s.worktree], |row| row.get(0),
@@ -1388,14 +1459,12 @@ pub fn register(e: &mut Engine) {
                 crate::hooks::uninstall_codex(wt).bus()?;
             }
         }
-        let pooled = wt.starts_with(worktree::pool_dir(repo));
-        if pooled && p.remove_worktree.unwrap_or(true) {
-            freed = worktree::remove(repo, wt, p.purge_build.unwrap_or(true))
-                .map_err(|e| BusError::conflict("worktree.remove_failed", e.to_string()))?;
-        }
-        // The generated hook directory outlives nothing: leaving one per dead session behind
-        // makes `.relay/hooks` read like a fleet that never shut down.
-        crate::hooks::remove_hook_dir(repo, &s.name);
+        // `pair_live` is false here, so nobody else is left in the checkout.
+        let freed = if remove {
+            remove_after_commit(ctx, project.id, s.id, repo, wt, p.purge_build.unwrap_or(true));
+            measured
+        } else { 0 };
+        release_hook_dir(ctx, repo, wt, s)?;
         ctx.tx().execute("UPDATE sessions SET state = 'closed', pid = NULL, closed_at = ?1, updated_at = ?1 WHERE id = ?2", params![ctx.now, s.id]).bus()?;
         ctx.tx().execute("UPDATE sessions SET pair_with=NULL,updated_at=?1 WHERE pair_with=?2 AND state!='closed'", params![ctx.now, s.name]).bus()?;
         ctx.tx().execute("DELETE FROM session_scrollback WHERE session_id=?1", [s.id]).bus()?;
@@ -1414,7 +1483,10 @@ pub fn register(e: &mut Engine) {
                 "count": expired,
             }));
         }
-        ctx.emit("worktree.changed", json!({ "project_id": project.id }));
+        // A removal announces itself once the checkout is actually gone.
+        if !remove {
+            ctx.emit("worktree.changed", json!({ "project_id": project.id }));
+        }
         Ok(CloseOut { freed_mb: freed as f64 / (1024.0 * 1024.0) })
     });
 

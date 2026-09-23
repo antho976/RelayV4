@@ -42,6 +42,8 @@ pub fn defaults() -> &'static Value {
                 "new_session": "Ctrl+N", "settings": "Ctrl+,", "sidebar": "Ctrl+Shift+B"
             },
             "roles": {},
+            // User-registered MCP servers, name -> {command, args, env} (D162).
+            "mcp": { "servers": {}, "projects": {} },
         })
     });
     &DEFAULTS

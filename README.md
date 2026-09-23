@@ -54,7 +54,9 @@ Python: play sessions with screenshots, tests, profiling, Blueprint reading, ass
 animation checks. The second is [Blender](plugins/blender/README.md): 6 skills and
 `relay blender-mcp`, which runs Blender in background mode to inspect, render, rig-check,
 measure, export and hand art to a running Unreal editor. New plugins are folders under
-`plugins/`, compiled into the engine.
+`plugins/`, compiled into the engine. Your own MCP servers reach every agent the same way from
+settings: `mcp.servers` for all projects, `mcp.projects.<id>.servers` for one, each mapping a name
+to `{"command", "args", "env"}` (`relay cmd settings.set '{"path":"mcp.servers","value":{…}}'`, D162).
 
 ## Verify
 
