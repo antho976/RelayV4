@@ -6,6 +6,12 @@ the work is mostly the Unreal and Blender plugins and MCP servers. **Nothing was
 reading the code. Entries marked ✔ were traced line by line against the source by a second
 reader. Entries marked ~ are likely but depend on behaviour outside this repository.
 
+**Status (2026-09-23):** every item below is fixed on `claude/relay-desktop-bugs-perf-uh2lhp`, except
+**A5** (Codex MCP timeout and environment), which was left out on request. Engine and CLI fixes pass
+`cargo test` and `cargo clippy --all-targets -- -D warnings`. The `apps/relay-native` changes passed a
+type and borrow check against stubbed system libraries, but they were not built against real GTK
+4.22, not run, and not smoke-tested. Some items still remain; see "Left open" at the end.
+
 Severity: **blocker** stops the work, **major** costs real time or data, **minor** is an irritant.
 
 ---
@@ -309,3 +315,17 @@ Details:
 
 Any change under `apps/relay-native/` has to be compiled and smoke-tested on a machine with GTK 4.22;
 none of it can be verified here.
+
+## Left open after the fixes
+
+- **A5**, Codex MCP `tool_timeout_sec` and `env_vars`: left out on request.
+- `guardrail.rs` still reads a target file of up to 64 MiB under the lock, in `file_lines` and
+  `evaluate_write`, on agent writes. The file ops now skip large files before reaching it.
+- `run_user_pre_commit` still runs the user's own pre-commit hook without a timeout, because a
+  pre-commit hook can legitimately take a long time.
+- The `git.diff` file list has no row cap. Each row is now cheap.
+- On the client's main connection, replies can still wait behind a full event queue. Only terminal
+  connections drop frames and re-attach.
+- The six appearance `settings.get` calls stay separate: their shared parent path also holds the
+  wallpaper library.
+- `ue_crash` still reads the whole crash log.
