@@ -6,10 +6,21 @@ use anyhow::{anyhow, Context, Result};
 use relay_bus::types::{FileStatus, Worktree};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 /// Directories that are build output and safe to purge before removing a worktree
-/// (SPEC §8: "gradlew clean / target purge — the 73GB problem, closed").
-pub const BUILD_DIRS: &[&str] = &["target", "build", ".gradle", "app/build", "node_modules/.cache", "dist"];
+/// (SPEC §8: "gradlew clean / target purge — the 73GB problem, closed"). The last three are an
+/// Unreal project's regenerated output, which is most of an Unreal checkout's size; `Saved/`
+/// is not listed, since it holds logs, config and autosaves rather than build output.
+pub const BUILD_DIRS: &[&str] = &["target", "build", ".gradle", "app/build", "node_modules/.cache", "dist",
+    "Binaries", "Intermediate", "DerivedDataCache"];
+
+/// Quick reads and ref edits: a git that waits on `index.lock` or a credential prompt must fail
+/// rather than hold a handler forever.
+const GIT_QUICK: Duration = Duration::from_secs(30);
+/// Ops that move real data — push, fetch, merge, commit, `worktree remove` of a large
+/// checkout. Generous, because an LFS push can legitimately take many minutes, but finite.
+const GIT_LONG: Duration = Duration::from_secs(60 * 60);
 
 pub fn pool_dir(repo: &Path) -> PathBuf {
     repo.join(".relay").join("worktrees")
@@ -23,9 +34,14 @@ pub fn branch_for(name: &str) -> String {
     format!("relay/{name}")
 }
 
-fn git(repo: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git").arg("-C").arg(repo).args(args).output()
-        .with_context(|| format!("running git {}", args.join(" ")))?;
+fn git(repo: &Path, args: &[&str]) -> Result<String> { git_within(repo, args, GIT_QUICK) }
+
+fn git_within(repo: &Path, args: &[&str], timeout: Duration) -> Result<String> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(repo).args(args).env("GIT_TERMINAL_PROMPT", "0");
+    let out = crate::proc::output_with_timeout(&mut command, timeout)
+        .with_context(|| format!("running git {}", args.join(" ")))?
+        .ok_or_else(|| anyhow!("git {} timed out after {} seconds", args.join(" "), timeout.as_secs()))?;
     if !out.status.success() {
         return Err(anyhow!("git {} failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim()));
     }
@@ -33,7 +49,7 @@ fn git(repo: &Path, args: &[&str]) -> Result<String> {
 }
 
 /// Run a mutating system-git operation. Read paths stay in gix-backed helpers.
-pub fn git_mutate(repo: &Path, args: &[&str]) -> Result<String> { git(repo, args) }
+pub fn git_mutate(repo: &Path, args: &[&str]) -> Result<String> { git_within(repo, args, GIT_LONG) }
 
 /// Make sure `.relay/` is excluded in this repo without touching its tracked `.gitignore`.
 pub fn ensure_excluded(repo: &Path) -> Result<()> {
@@ -350,23 +366,37 @@ pub fn purge_build(wt: &Path) -> u64 {
 
 /// Remove a linked worktree (never the primary). Returns bytes freed. The branch is kept.
 pub fn remove(repo: &Path, path: &Path, purge: bool) -> Result<u64> {
+    if canon(repo) == canon(path) {
+        return Err(anyhow!("refusing to remove the primary checkout"));
+    }
+    // Everything under the checkout goes, build output included, so one walk measures it all.
+    let freed = if path.exists() { dir_size(path) } else { 0 };
+    discard(repo, path, purge)?;
+    Ok(freed)
+}
+
+/// [`remove`] without measuring: for callers that sized the checkout earlier, outside the store
+/// lock, or do not report the figure.
+pub fn discard(repo: &Path, path: &Path, purge: bool) -> Result<()> {
     let repo_c = canon(repo);
     let path_c = canon(path);
     if repo_c == path_c {
         return Err(anyhow!("refusing to remove the primary checkout"));
     }
-    let mut freed = 0;
     if path.exists() {
-        if purge { freed += purge_build(path); }
-        freed += dir_size(path);
-        git(repo, &["worktree", "remove", "--force", &path_c])
+        if purge {
+            for d in BUILD_DIRS {
+                let _ = std::fs::remove_dir_all(path.join(d));
+            }
+        }
+        git_within(repo, &["worktree", "remove", "--force", &path_c], GIT_LONG)
             .or_else(|e| {
                 // a half-deleted worktree: remove the dir ourselves and prune
                 std::fs::remove_dir_all(path).map(|_| String::new()).map_err(|io| anyhow!("{e}; and rm -rf failed: {io}"))
             })?;
     }
     let _ = git(repo, &["worktree", "prune"]);
-    Ok(freed)
+    Ok(())
 }
 
 /// Rename the branch checked out by one worktree. Used only before a session's first spawn.

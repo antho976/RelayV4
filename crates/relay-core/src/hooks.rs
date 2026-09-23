@@ -15,6 +15,25 @@ const CLAUDE_PRE_TOOL: &str = "hook claude-pre-tool";
 const CODEX_HOOK_MARKER: &str = "hook codex-";
 const CODEX_PRE_TOOL: &str = "hook codex-pre-tool";
 const PREVIOUS_HOOKS_PATH: &str = ".relay-previous-hooks-path";
+/// First line after the shebang of every forwarder [`install_git`] writes, so a reinstall can
+/// tell its own files from a hook someone else (`git lfs install`) put into the directory.
+const FORWARDER_MARKER: &str = "# relay: forwards to the hook this directory replaced";
+/// Every hook git looks up in `core.hooksPath`, except `pre-commit`, which carries the gate.
+/// Pointing `core.hooksPath` at Relay's directory hides the previous directory from git, so
+/// each of these gets a forwarder when the previous directory has it — Git LFS's `pre-push`,
+/// `post-checkout`, `post-commit` and `post-merge` first among them. `fsmonitor-watchman` is
+/// absent on purpose: git reaches it through `core.fsmonitor`, never through the hooks dir.
+const FORWARDED_HOOKS: &[&str] = &[
+    "applypatch-msg", "pre-applypatch", "post-applypatch", "pre-merge-commit",
+    "prepare-commit-msg", "commit-msg", "post-commit", "pre-rebase", "post-checkout",
+    "post-merge", "pre-push", "pre-receive", "update", "proc-receive", "post-receive",
+    "post-update", "reference-transaction", "push-to-checkout", "pre-auto-gc", "post-rewrite",
+    "sendemail-validate", "post-index-change", "p4-changelist", "p4-prepare-changelist",
+    "p4-post-changelist", "p4-pre-submit",
+];
+/// A git that waits on a credential helper or an `index.lock` must not hold the bus forever
+/// (these run under the store lock during spawn, resume and close).
+const GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 pub const MCP_CONFIG_RELATIVE: &str = ".relay/relay.mcp.json";
 pub const CLAUDE_SETTINGS_RELATIVE: &str = ".relay/relay.settings.json";
 const CLAUDE_STATUSLINE_RELATIVE: &str = ".relay/agent-statusline.sh";
@@ -55,7 +74,8 @@ fn is_executable(path: &Path) -> bool {
 }
 
 /// Give one worktree its own hook path, preserving any pre-existing pre-commit hook by
-/// chaining it before Relay's gate.
+/// chaining it before Relay's gate, and every other hook the previous directory has through a
+/// forwarder that `exec`s it with the same arguments and stdin.
 pub fn install_git(
     repo: &Path,
     worktree: &Path,
@@ -63,6 +83,12 @@ pub fn install_git(
     instance: Instance,
     relay: &Path,
 ) -> Result<()> {
+    // The hook directory and the provider files Relay writes live inside the checkout; the
+    // primary checkout never goes through `worktree::create`, which used to be the only place
+    // that kept them out of `git status` (and out of a `git add -A`).
+    if let Err(error) = crate::worktree::ensure_excluded(repo) {
+        tracing::warn!(repo = %repo.display(), %error, "excluding Relay's files from git");
+    }
     git(repo, &["config", "extensions.worktreeConfig", "true"])?;
 
     let configured = git_optional(
@@ -137,6 +163,10 @@ pub fn install_git(
     let mut permissions = fs::metadata(&hook_path)?.permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&hook_path, permissions)?;
+    let previous_abs = previous_dir
+        .map(|dir| if dir.is_absolute() { dir } else { worktree.join(dir) })
+        .filter(|dir| dir != &hook_dir && !dir.starts_with(&relay_hooks));
+    write_forwarders(&hook_dir, previous_abs.as_deref())?;
 
     let hook_dir_s = hook_dir.display().to_string();
     git(
@@ -146,32 +176,55 @@ pub fn install_git(
     Ok(())
 }
 
+/// One forwarder per hook the previous directory has now; a forwarder whose target has gone
+/// is removed. Hooks that are not Relay forwarders (a tool may install straight into the
+/// active `core.hooksPath`) are left alone.
+fn write_forwarders(hook_dir: &Path, previous: Option<&Path>) -> Result<()> {
+    for name in FORWARDED_HOOKS {
+        let path = hook_dir.join(name);
+        let target = previous.map(|dir| dir.join(name)).filter(|target| is_executable(target));
+        let ours = fs::read_to_string(&path).is_ok_and(|text| text.contains(FORWARDER_MARKER));
+        let Some(target) = target else {
+            if ours { let _ = fs::remove_file(&path); }
+            continue;
+        };
+        if path.exists() && !ours {
+            continue;
+        }
+        // Checked again at run time: a hook deleted after install is a no-op, not a failure.
+        let script = format!(
+            "#!/bin/sh\n{FORWARDER_MARKER}\nprevious={}\nif [ -x \"$previous\" ]; then exec \"$previous\" \"$@\"; fi\nexit 0\n",
+            shell_quote_path(&target),
+        );
+        fs::write(&path, script).with_context(|| format!("writing {}", path.display()))?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(())
+}
+
+/// The session whose generated directory is this worktree's active `core.hooksPath`, if any.
+pub fn active_hook_session(repo: &Path, worktree: &Path) -> Option<String> {
+    let configured = PathBuf::from(git_optional(
+        worktree,
+        &["config", "--worktree", "--get", "core.hooksPath"],
+    )?);
+    let absolute = if configured.is_absolute() { configured } else { worktree.join(configured) };
+    let relative = absolute.strip_prefix(repo.join(".relay").join("hooks")).ok()?;
+    let mut components = relative.components();
+    let Some(std::path::Component::Normal(session)) = components.next() else { return None };
+    if components.next().is_some() {
+        return None;
+    }
+    session.to_str().map(str::to_owned)
+}
+
 /// Rewrite the currently active Relay-owned hook with the current CLI path. Existing worktrees can
 /// outlive the Relay process that created them, so a commit is also a repair point for stale hooks.
 pub fn refresh_git(repo: &Path, worktree: &Path, instance: Instance, relay: &Path) -> Result<bool> {
-    let Some(configured) = git_optional(
-        worktree,
-        &["config", "--worktree", "--get", "core.hooksPath"],
-    ) else {
+    let Some(session) = active_hook_session(repo, worktree) else {
         return Ok(false);
     };
-    let configured = PathBuf::from(configured);
-    let absolute = if configured.is_absolute() { configured } else { worktree.join(configured) };
-    let relay_hooks = repo.join(".relay").join("hooks");
-    let Ok(relative) = absolute.strip_prefix(&relay_hooks) else {
-        return Ok(false);
-    };
-    let mut components = relative.components();
-    let Some(std::path::Component::Normal(session)) = components.next() else {
-        return Ok(false);
-    };
-    if components.next().is_some() {
-        return Ok(false);
-    }
-    let session = session
-        .to_str()
-        .ok_or_else(|| anyhow!("Relay hook session name is not UTF-8"))?;
-    install_git(repo, worktree, session, instance, relay)?;
+    install_git(repo, worktree, &session, instance, relay)?;
     Ok(true)
 }
 
@@ -237,11 +290,7 @@ pub fn uninstall_git(repo: &Path, worktree: &Path, session: &str) -> Result<()> 
             )?;
         }
         _ => {
-            let output = Command::new("git")
-                .arg("-C")
-                .arg(worktree)
-                .args(["config", "--worktree", "--unset", "core.hooksPath"])
-                .output()?;
+            let output = git_output(worktree, &["config", "--worktree", "--unset", "core.hooksPath"])?;
             if !output.status.success() && output.status.code() != Some(5) {
                 return Err(anyhow!(
                     "git config --worktree --unset core.hooksPath failed: {}",
@@ -253,8 +302,10 @@ pub fn uninstall_git(repo: &Path, worktree: &Path, session: &str) -> Result<()> 
     Ok(())
 }
 
-/// Drop one session's generated hook directory. Best-effort: a hook directory that is still
-/// wired into a live worktree is left alone by [`uninstall_git`] before this runs.
+/// Drop one session's generated hook directory. Best-effort. The caller must first make sure no
+/// worktree still points `core.hooksPath` at it — git reads a missing hooks directory as "no
+/// hooks" and silently skips the gate and every user hook ([`uninstall_git`] when the session
+/// was the last one in its worktree, [`install_git`] for a surviving session otherwise).
 pub fn remove_hook_dir(repo: &Path, session: &str) {
     let _ = fs::remove_dir_all(repo.join(".relay").join("hooks").join(session));
 }
@@ -550,13 +601,16 @@ fn claude_statusline_script() -> &'static str {
     "#!/bin/sh\ninput=$(cat)\ncase \"$input\" in\n  *'\"rate_limits\"'*) ;;\n  *) exit 0 ;;\nesac\nout=\"${CLAUDE_CONFIG_DIR:-$HOME}/.claude/relay-usage.json\"\nmkdir -p \"${out%/*}\" 2>/dev/null\nprintf '%s\\n' \"$input\" > \"$out\" 2>/dev/null\nexit 0\n"
 }
 
+fn git_output(repo: &Path, args: &[&str]) -> Result<std::process::Output> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(repo).args(args).env("GIT_TERMINAL_PROMPT", "0");
+    crate::proc::output_with_timeout(&mut command, GIT_TIMEOUT)
+        .with_context(|| format!("running git {}", args.join(" ")))?
+        .ok_or_else(|| anyhow!("git {} timed out after {} seconds", args.join(" "), GIT_TIMEOUT.as_secs()))
+}
+
 fn git(repo: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .with_context(|| format!("running git {}", args.join(" ")))?;
+    let output = git_output(repo, args)?;
     if !output.status.success() {
         return Err(anyhow!(
             "git {} failed: {}",
@@ -652,5 +706,61 @@ mod tests {
         let script = std::fs::read_to_string(&hook).unwrap();
         assert!(script.contains("relay_bin='/bin/true'"));
         assert!(Command::new(&hook).status().unwrap().success());
+    }
+
+    /// Git LFS lives in `pre-push`, `post-checkout`, `post-commit` and `post-merge`; pointing
+    /// `core.hooksPath` at Relay's directory must not switch them off.
+    #[test]
+    fn hooks_other_than_pre_commit_still_run_through_forwarders() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let remote = dir.path().join("remote.git");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |cwd: &Path, args: &[&str]| {
+            let out = Command::new("git").arg("-C").arg(cwd).args(args)
+                .env_remove("RELAY_SESSION").env_remove("RELAY_TOKEN").output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["config", "user.email", "t@t"]);
+        git(&repo, &["config", "user.name", "t"]);
+        git(dir.path(), &["init", "-q", "--bare", remote.to_str().unwrap()]);
+        git(&repo, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        let log = repo.join(".git/hook-log");
+        let hooks = repo.join(".git/hooks");
+        for (name, body) in [
+            ("pre-push", format!("#!/bin/sh\necho \"pre-push $1\" >> '{0}'\ncat >> '{0}'\n", log.display())),
+            ("post-commit", format!("#!/bin/sh\necho post-commit >> '{}'\n", log.display())),
+        ] {
+            std::fs::write(hooks.join(name), body).unwrap();
+            std::fs::set_permissions(hooks.join(name), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // A hook some tool installed straight into the active directory is not Relay's to touch.
+        let own = repo.join(".relay/hooks/lfs-otter");
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::write(own.join("post-merge"), "#!/bin/sh\nexit 0\n").unwrap();
+
+        install_git(&repo, &repo, "lfs-otter", Instance::Test, Path::new("/bin/true")).unwrap();
+        assert!(own.join("pre-push").is_file() && own.join("post-commit").is_file());
+        assert!(!own.join("commit-msg").exists(), "a hook the previous directory lacks got a forwarder");
+        assert_eq!(std::fs::read_to_string(own.join("post-merge")).unwrap(), "#!/bin/sh\nexit 0\n");
+
+        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+        git(&repo, &["add", "a.txt"]);
+        git(&repo, &["commit", "-qm", "a"]);
+        git(&repo, &["push", "-q", "origin", "main"]);
+        let seen = std::fs::read_to_string(&log).unwrap();
+        assert!(seen.contains("post-commit"), "{seen}");
+        assert!(seen.contains("pre-push origin"), "{seen}");
+        assert!(seen.contains("refs/heads/main"), "pre-push lost its stdin: {seen}");
+
+        // A reinstall drops a forwarder whose target has gone, and keeps the rest.
+        std::fs::remove_file(hooks.join("post-commit")).unwrap();
+        assert!(refresh_git(&repo, &repo, Instance::Test, Path::new("/bin/true")).unwrap());
+        assert!(!own.join("post-commit").exists());
+        assert!(own.join("pre-push").is_file());
+        // Relay's own files stay out of `git status` in a primary checkout.
+        let status = Command::new("git").arg("-C").arg(&repo).args(["status", "--porcelain"]).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&status.stdout).trim(), "", "Relay's hook directory is untracked noise");
     }
 }
