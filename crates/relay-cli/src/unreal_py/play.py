@@ -37,6 +37,11 @@ if action == "start":
         settings = perf_settings()
         throttled = bool(settings.get_editor_property("throttle_cpu_when_not_foreground"))
         settings.set_editor_property("throttle_cpu_when_not_foreground", False)
+        # Keep it off in the user's editor settings when this engine exposes save_config, so
+        # it stays off after a restart; then there is nothing to restore at the end.
+        if ARGS.get("persist", True) and hasattr(settings, "save_config"):
+            settings.save_config()
+            throttled = False
     except Exception:
         pass
     mode = ARGS.get("mode", "pie")

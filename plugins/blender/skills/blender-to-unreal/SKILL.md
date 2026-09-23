@@ -205,6 +205,12 @@ settings. Record in the project docs which importer and settings the project use
   non-deform (IK or control) bones.
 - **Import**: the legacy FBX importer by default, normals imported and tangents computed, import
   settings replaced on re-import, materials checked for transient instances.
+- **Sockets**: `SOCKET_` empties arrive in Unreal with a -90° roll from the FBX axis conversion,
+  which turns anything attached to them. The export records how each empty is turned relative to
+  its mesh, and the import sets a socket whose empty had no rotation of its own back to zero
+  (`socket_rotation`: `match` by default, `zero` for all, `keep` to leave them). Empties you did
+  rotate are reported for a check with `ue_screenshot`; keep socket empties unrotated and put
+  the rotation on the attached item's offset where you can.
 - **After import**: every mesh is rendered once and its screen coverage measured; a mesh that
   does not draw is reported, and broken results are deleted again.
 

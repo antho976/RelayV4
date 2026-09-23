@@ -81,10 +81,11 @@ Actors of the open level with label, class, object path, outliner folder and loc
 Runs a console command in the editor world. Output lands in the log; read it with `ue_log`.
 
 ### `ue_editor_launch` — `{ timeout_s?, extra_args? }` and `ue_editor_quit` — `{ save? }`
-Launch waits for the Remote Control port to be free, starts the editor with `-RCWebControlEnable`,
+Launch waits for the Remote Control port to be free, starts the editor with `-RCWebControlEnable`
+(and with "Use Less CPU when in Background" overridden off unless `keep_background_throttle`),
 and waits until Remote Control answers, failing early on a bind error in the new log. Quit saves
-dirty packages (unless `save: false`), asks the editor to quit, and waits for the process to exit
-and the port to be released.
+dirty packages (unless `save: false`), asks the editor to quit, sends a terminate signal if it is
+still running 20 s later, waits for the port to be released, and reports the timing of each step.
 
 When the editor is unreachable, `ue_editor_status` says which case it is: editor running but no
 server, a failed bind (run `WebControl.StopServer` then `WebControl.StartServer`), or the port

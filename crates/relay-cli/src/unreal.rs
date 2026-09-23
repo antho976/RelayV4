@@ -302,7 +302,7 @@ fn tools() -> Vec<Value> {
             json!({"index":{"type":"integer","minimum":0,"description":"0 = most recent"}}), &[], true),
         tool("ue_editor_launch",
             "Start the Unreal editor on this checkout's project with the Remote Control server enabled: waits until the port is free (a closed editor holds it for a while), launches, and waits until Remote Control answers, reporting a failed bind from the new log. Returns when the editor is ready.",
-            json!({"timeout_s":{"type":"integer","minimum":30,"maximum":3600,"description":"Default 900; first starts compile shaders"},"extra_args":{"type":"array","items":{"type":"string"}}}), &[], false),
+            json!({"timeout_s":{"type":"integer","minimum":30,"maximum":3600,"description":"Default 900; first starts compile shaders"},"extra_args":{"type":"array","items":{"type":"string"}},"keep_background_throttle":{"type":"boolean","description":"Leave 'Use Less CPU when in Background' as configured (default: off for this session)"}}), &[], false),
         tool("ue_editor_quit",
             "Quit the editor cleanly (saving dirty packages unless save=false), wait for the process to exit and for the Remote Control port to be released. Use before builds; ue_build restart_editor=true does quit, build and relaunch in one call.",
             json!({"save":{"type":"boolean"}}), &[], false),
@@ -574,30 +574,41 @@ fn quit_editor(project: &Project, save: bool) -> Result<Value> {
                 "import unreal\n{}unreal.SystemLibrary.quit_editor()\nprint('quitting')\n",
                 if save { "unreal.EditorLoadingAndSavingUtils.save_dirty_packages(True, True)\n" } else { "" }
             );
-            if let Err(error) = python_tx(&code, Duration::from_secs(120), false) {
+            // The editor may stop answering while it shuts down; do not wait on the reply.
+            if let Err(error) = python_tx(&code, Duration::from_secs(20), false) {
                 notes.push(format!("quit request: {error:#}"));
             }
         }
         Err(_) => notes.push("the editor did not answer; asking the process to terminate instead (unsaved changes are lost)".into()),
     }
+    let requested = started.elapsed();
     let deadline = std::time::Instant::now() + Duration::from_secs(90);
-    let mut signalled = false;
+    let mut signalled = None;
     while !crate::unreal_process::editors_for(&project.uproject).is_empty() {
         if std::time::Instant::now() >= deadline {
             bail!("the editor is still running after 90 s; close it by hand");
         }
-        if !signalled && (notes.iter().any(|n| n.contains("terminate")) || started.elapsed() > Duration::from_secs(45)) {
+        // Everything is saved by now; an editor that lingers in shutdown gets a terminate
+        // signal (a normal shutdown request) rather than a long wait.
+        if signalled.is_none() && (notes.iter().any(|n| n.contains("terminate")) || started.elapsed() > requested + Duration::from_secs(20)) {
             for pid in &before {
                 crate::unreal_process::kill(*pid);
             }
-            signalled = true;
+            signalled = Some((started.elapsed().as_secs_f64() * 10.0).round() / 10.0);
         }
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(250));
     }
+    let exited = started.elapsed();
     let port = crate::unreal_process::port_of(&remote_base());
     let port_free = crate::unreal_process::wait_port_free(port, Duration::from_secs(90));
     let _ = release_lock(project, &holder_id());
-    Ok(json!({"stopped": before, "saved": save, "port_free": port_free, "seconds": started.elapsed().as_secs(), "notes": notes}))
+    let round = |d: Duration| (d.as_secs_f64() * 10.0).round() / 10.0;
+    Ok(json!({
+        "stopped": before, "saved": save, "port_free": port_free, "notes": notes,
+        "seconds": round(started.elapsed()),
+        // Where the time went, so a slow quit can be told apart from a slow port.
+        "timing": {"save_and_request_s": round(requested), "terminate_signal_at_s": signalled, "exited_at_s": round(exited), "port_free_at_s": round(started.elapsed())},
+    }))
 }
 
 /// Launch the editor on this checkout's project once the port is free, then wait until Remote
@@ -612,12 +623,18 @@ fn launch_editor(project: &Project, args: &Value) -> Result<Value> {
     let port = crate::unreal_process::port_of(&remote_base());
     let started = std::time::Instant::now();
     let extra: Vec<String> = args["extra_args"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
+    let mut extra = extra;
+    // "Use Less CPU when in Background" comes back on every start, and a throttled editor runs
+    // agent play sessions at a few frames per second. Override it for this editor session.
+    if args["keep_background_throttle"] != true {
+        extra.push("-ini:EditorPerProjectUserSettings:[/Script/UnrealEd.EditorPerformanceSettings]:bThrottleCPUWhenNotForeground=False".to_string());
+    }
     let pid = crate::unreal_process::launch(&engine, &project.uproject, port, &extra)?;
     let timeout = Duration::from_secs(args["timeout_s"].as_u64().unwrap_or(900).clamp(30, 3600));
     loop {
         if remote("GET", "/remote/info", None, Duration::from_secs(3)).is_ok() {
             // The editor now owns the project; tell the next status call to ask again.
-            return Ok(json!({"pid": pid, "reachable": true, "seconds": started.elapsed().as_secs(), "engine": engine}));
+            return Ok(json!({"pid": pid, "reachable": true, "seconds": started.elapsed().as_secs(), "engine": engine, "args": extra}));
         }
         let lines = log_since(project, 0, None);
         let bind = crate::unreal_process::bind_failures(&lines);

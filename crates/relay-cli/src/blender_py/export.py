@@ -83,6 +83,17 @@ if "FINISHED" not in result:
     raise RuntimeError("the FBX exporter returned %s" % result)
 meshes = [o for o in selected if o.type == "MESH" and not o.name.startswith(("UCX_", "UBX_", "USP_"))]
 lo, hi = world_bbox(meshes) if meshes else (None, None)
+# How each socket empty is turned relative to its mesh. Unreal receives sockets from empties
+# with a -90 degree roll from the axis conversion, so the import puts back what was meant: an
+# empty with no rotation of its own becomes a socket with no rotation.
+socket_details = []
+for o in selected:
+    if o.type == "EMPTY" and o.name.startswith("SOCKET_"):
+        rel = (o.parent.matrix_world.inverted() @ o.matrix_world) if o.parent else o.matrix_world
+        e = rel.to_euler()
+        socket_details.append({"name": o.name[len("SOCKET_"):], "empty": o.name,
+                               "rotation_deg": rnd([math.degrees(a) for a in e], 2),
+                               "identity": max(abs(a) for a in e) < 1e-3})
 facing = None
 if arm is not None and kind != "static":
     f = body_frame(arm)
@@ -92,6 +103,7 @@ emit({"path": path, "bytes": os.path.getsize(path), "kind": kind, "forward_world
       "mesh_checks": mesh_checks, "problems": export_problems, "warnings": export_warnings,
       "objects": sorted(o.name for o in selected),
       "sockets": sorted(o.name for o in selected if o.type == "EMPTY" and o.name.startswith("SOCKET_")),
+      "socket_details": socket_details,
       "collision": sorted(o.name for o in selected if o.name.startswith(("UCX_", "UBX_", "USP_"))),
       "action": arm.animation_data.action.name if arm is not None and arm.animation_data and arm.animation_data.action else None,
       "size_cm": cm(hi - lo) if lo is not None else None,

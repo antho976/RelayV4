@@ -180,6 +180,7 @@ fn tools() -> Vec<Value> {
                 "fbx_path":{"type":"string","description":"Where to keep the FBX, relative to the checkout; default Saved/Relay/Exports/<name>.fbx"},
                 "materials":{"type":"boolean"},
                 "allow_problems":{"type":"boolean","description":"Export even when the mesh check finds problems"},
+                "socket_rotation":{"type":"string","enum":["match","zero","keep"],"description":"Sockets from SOCKET_ empties arrive with a -90 degree roll from the axis conversion. match (default): a socket whose empty had no rotation of its own gets none; zero: every socket; keep: as imported"},
                 "importer":{"type":"string","enum":["legacy","interchange"],"description":"Default legacy: Interchange FBX produced empty meshes and transient materials on UE 5.8. The other is tried if the first fails."},
                 "normals":{"type":"string","enum":["FBXNIM_IMPORT_NORMALS","FBXNIM_IMPORT_NORMALS_AND_TANGENTS","FBXNIM_COMPUTE_NORMALS"],"description":"Default FBXNIM_IMPORT_NORMALS (tangents computed): imported tangents from Blender gave a mesh that drew only its shadow"}
             }), &["file","kind","destination"], false),
@@ -404,7 +405,8 @@ fn to_unreal(root: &Path, args: &Value) -> Result<Value> {
         "kind": kind, "destination": required(args, "destination")?, "name": args["name"],
         "skeleton": args["skeleton"], "animations": args["animations"], "materials": args["materials"],
     });
-    for key in ["importer", "normals"] {
+    import_args["sockets"] = exported["socket_details"].clone();
+    for key in ["importer", "normals", "socket_rotation"] {
         if let Some(v) = args.get(key).filter(|v| v.is_string()) {
             import_args[key] = v.clone();
         }
@@ -412,7 +414,7 @@ fn to_unreal(root: &Path, args: &Value) -> Result<Value> {
     let imported = crate::unreal::import_fbx(&fbx, import_args)?;
     let checks = compare(&exported, &imported);
     Ok(json!({"fbx": fbx, "exported": exported, "imported": imported["imported"], "importer": imported["importer"],
-        "attempts": imported["attempts"], "render_check": imported["render_check"], "import_log": imported["import_log"],
+        "attempts": imported["attempts"], "render_check": imported["render_check"], "sockets": imported["sockets"], "import_log": imported["import_log"],
         "problems": checks, "passed": checks.is_empty(),
         "_images": imported["_images"], "_cleanup": imported["_cleanup"]}))
 }
@@ -585,6 +587,25 @@ mod tests {
         assert!(check["meshes"][0]["degenerate_faces"].as_u64().unwrap() > 0 || check["meshes"][0]["zero_length_edges"].as_u64().unwrap() > 0, "{check}");
         let refused = run(PY_EXPORT, &json!({"path": dir.path().join("plate.fbx"), "kind": "static"}), Some(&plate), t).unwrap_err();
         assert!(format!("{refused:#}").contains("not exported"), "{refused:#}");
+
+        // Socket empties report how they are turned relative to their mesh, which the import uses
+        // to take the axis conversion's roll back off.
+        let crate_file = dir.path().join("crate.blend");
+        run(PY_RUN, &json!({
+            "code": "import bmesh\nbpy.ops.wm.read_factory_settings(use_empty=True)\nme = bpy.data.meshes.new('SM_Crate')\nbm = bmesh.new()\nbmesh.ops.create_cube(bm, size=1.0)\nbm.to_mesh(me)\nbm.free()\nme.uv_layers.new(name='UVMap')\no = bpy.data.objects.new('SM_Crate', me)\nbpy.context.scene.collection.objects.link(o)\nfor name, yaw in (('SOCKET_Top', 0.0), ('SOCKET_Side', 1.5708)):\n    e = bpy.data.objects.new(name, None)\n    bpy.context.scene.collection.objects.link(e)\n    e.parent = o\n    e.location = (0, 0, 0.5)\n    e.rotation_euler = (0, 0, yaw)",
+            "save_as": crate_file,
+        }), None, t).unwrap();
+        match run(PY_EXPORT, &json!({"path": dir.path().join("crate.fbx"), "objects": ["SM_Crate"], "kind": "static"}), Some(&crate_file), t) {
+            Ok(exported) => {
+                let details = exported["socket_details"].as_array().unwrap();
+                let top = details.iter().find(|d| d["name"] == "Top").unwrap();
+                let side = details.iter().find(|d| d["name"] == "Side").unwrap();
+                assert_eq!(top["identity"], true, "{exported}");
+                assert_eq!(side["identity"], false);
+                assert_eq!(side["rotation_deg"][2], 90.0);
+            }
+            Err(error) => assert!(format!("{error:#}").contains("numpy"), "{error:#}"),
+        }
 
         let broken = run(PY_RUN, &json!({"code": "raise ValueError('nope')"}), None, t).unwrap_err();
         assert!(format!("{broken:#}").contains("ValueError: nope"), "{broken:#}");
