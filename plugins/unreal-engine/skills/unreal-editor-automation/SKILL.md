@@ -277,8 +277,12 @@ These cost hours once. Check here before debugging them again.
 - *The editor throttles itself in the background* (a few fps), and the setting comes back on
   every start. `ue_editor_launch` starts the editor with it overridden off; `ue_play` and
   `ue_profile` also turn it off (and save it where the engine allows) and report `average_fps`;
-  below 20 fps a timed test means nothing. Launch the editor with `ue_editor_launch` rather than
-  by hand to get this.
+  below 20 fps a timed test means nothing. `ue_editor_launch` also writes the setting off into
+  the project's saved per-project user settings before starting the editor, so it survives
+  restarts; launch with `ue_editor_launch` rather than by hand to get this.
+- *Seeing the game from outside the player's camera.* Python cannot spawn into a running game;
+  `ue_play` with `outside` places a capture in the level before play and moves it around the
+  player at each checkpoint, showing first-person arms and guns from the side or front.
 - *Play screenshots* are taken after the checkpoint's probe and matched to their own file, so
   images and probe output describe the same moment.
 - *"Cancelling Open Transaction 'Remote Call Transaction Wrap'"* at play start is harmless; the

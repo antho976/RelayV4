@@ -254,7 +254,14 @@ fn tools() -> Vec<Value> {
                 "probe":{"type":"string","description":"Python run at each checkpoint with `unreal` and `world` (the game world); print what you want to see"},
                 "log_filter":{"type":"string","description":"Regex over new log lines; default errors, warnings, ensures and Blueprint runtime errors"},
                 "stop":{"type":"boolean","description":"Stop at the end (default true)"},
-                "stop_existing":{"type":"boolean","description":"End a session that is already running first"}
+                "stop_existing":{"type":"boolean","description":"End a session that is already running first"},
+                "outside":{"type":"object","description":"Also render the game from outside the player's camera at each checkpoint: first-person arms and guns seen from the side or front. A capture placed in the level before play follows the target; 'only owner see' parts are shown for the capture.","properties":{
+                    "target":{"type":"string","description":"'player' (default: the player's pawn), or an actor label, name or class fragment"},
+                    "views":{"type":"array","items":{"type":"string","enum":["front","back","left","right","top","three_quarter","three_quarter_left"]},"description":"Default right and front"},
+                    "offset":{"type":"array","items":{"type":"number"},"description":"Camera at [forward, right, up] cm from the look-at point, in the target's frame"},
+                    "look_at":{"type":"array","items":{"type":"number"},"description":"Point looked at, [forward, right, up] cm from the target's origin; default [30, 0, 50], where first-person hands and guns sit"},
+                    "distance":{"type":"number","description":"For named views, default 150 cm"},
+                    "fov":{"type":"number"},"width":{"type":"integer"},"height":{"type":"integer"}}}
             }), &[], false),
         tool("ue_blueprint_info",
             "Read Blueprints as text: parent class, interfaces, variables with default values, functions and events, components, and graph nodes where this engine version exposes them. compile=true compiles them and returns the compiler's log lines. Give paths, or a folder to read every Blueprint in it.",
@@ -625,8 +632,18 @@ fn launch_editor(project: &Project, args: &Value) -> Result<Value> {
     let extra: Vec<String> = args["extra_args"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
     let mut extra = extra;
     // "Use Less CPU when in Background" comes back on every start, and a throttled editor runs
-    // agent play sessions at a few frames per second. Override it for this editor session.
+    // agent play sessions at a few frames per second. Write it off in the saved per-project user
+    // settings (the editor is not running, so nothing overwrites it) and override it on the
+    // command line as well.
     if args["keep_background_throttle"] != true {
+        let platform_dir = if cfg!(target_os = "windows") { "WindowsEditor" } else if cfg!(target_os = "macos") { "MacEditor" } else { "LinuxEditor" };
+        let ini = project.root.join("Saved/Config").join(platform_dir).join("EditorPerProjectUserSettings.ini");
+        let text = std::fs::read_to_string(&ini).unwrap_or_default();
+        let merged = merge_ini(&text, "[/Script/UnrealEd.EditorPerformanceSettings]", &[("bThrottleCPUWhenNotForeground".to_string(), "False".to_string())]);
+        if merged != text {
+            if let Some(parent) = ini.parent() { let _ = std::fs::create_dir_all(parent); }
+            let _ = std::fs::write(&ini, merged);
+        }
         extra.push("-ini:EditorPerProjectUserSettings:[/Script/UnrealEd.EditorPerformanceSettings]:bThrottleCPUWhenNotForeground=False".to_string());
     }
     let pid = crate::unreal_process::launch(&engine, &project.uproject, port, &extra)?;
@@ -802,6 +819,15 @@ fn play(project: &Project, args: &Value) -> Result<Value> {
         play_step("stop", json!({}))?;
         wait_for_play(false)?;
     }
+    let outside = args.get("outside").filter(|o| o.is_object()).cloned();
+    let outside_dir = match &outside {
+        Some(_) => {
+            // Placed in the level now so the game world, a copy of the level, contains it.
+            play_step("prepare_outside", json!({}))?;
+            Some(capture_dir(project)?)
+        }
+        None => None,
+    };
     let log_start = log_len(project);
     let started = play_step("start", json!({"mode": args["mode"].as_str().unwrap_or("pie")}))?;
     wait_for_play(true)?;
@@ -844,6 +870,19 @@ fn play(project: &Project, args: &Value) -> Result<Value> {
                     std::thread::sleep(Duration::from_millis(100));
                 }
             }
+            if let (Some(spec), Some(dir)) = (&outside, &outside_dir) {
+                let mut a = spec.clone();
+                a["out_dir"] = json!(dir);
+                a["prefix"] = json!(format!("outside_{at}s"));
+                match play_step("outside_capture", a) {
+                    Ok(v) => {
+                        for f in v["files"].as_array().cloned().unwrap_or_default() {
+                            shots.push(json!({"view": format!("checkpoint {at}s, {}", f["view"].as_str().unwrap_or("outside")), "file": f["file"]}));
+                        }
+                    }
+                    Err(e) => shots.push(json!({"view": format!("checkpoint {at}s outside"), "error": format!("{e:#}")})),
+                }
+            }
         }
         std::thread::sleep(Duration::from_secs_f64(seconds).saturating_sub(t0.elapsed()));
         Ok(probes)
@@ -854,6 +893,9 @@ fn play(project: &Project, args: &Value) -> Result<Value> {
     } else {
         None
     };
+    if outside.is_some() {
+        let _ = play_step("cleanup_outside", json!({}));
+    }
     let probes = outcome?;
     // Frames per wall-clock second over the session: a throttled or overloaded editor shows
     // here before it shows as a flaky test.
@@ -878,7 +920,9 @@ fn play(project: &Project, args: &Value) -> Result<Value> {
         "error_lines": errors,
         "stop_error": stopped,
         // Screenshots live in the project's own folder; show them but leave them in place.
+        // Outside captures live in a scratch folder that goes once they are read.
         "_images": images,
+        "_cleanup": outside_dir,
     }))
 }
 

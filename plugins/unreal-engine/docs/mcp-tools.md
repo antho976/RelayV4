@@ -108,6 +108,14 @@ images, the probe output, and the log lines written while playing (default filte
 warnings, ensures, "Accessed None", Blueprint user messages). On engine versions whose Python has
 no play-in-editor request it falls back to Simulate and says so.
 
+**Outside the player's camera** (`outside`): at each checkpoint the tool also renders the game from
+an offset around the player (or another `target`), with the parts first-person rigs hide from other
+views ("only owner see") shown for the capture. Named `views` (front, right, back, left, top,
+three_quarter) sit `distance` cm from the `look_at` point ([forward, right, up] from the target,
+default [30, 0, 50], where first-person hands and guns sit); `offset` places the camera exactly.
+It works by placing a tagged SceneCapture2D in the level before play (the game world is a copy of
+the level) and removing it afterwards, so the level is left marked modified.
+
 ### `ue_run_tests` — `{ filter, in_editor?, timeout_s? }`
 Headless by default: runs `UnrealEditor-Cmd` on the project with
 `-ExecCmds="Automation RunTests <filter>;Quit" -nullrhi -unattended` and a report folder, and
