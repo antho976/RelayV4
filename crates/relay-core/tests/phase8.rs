@@ -92,11 +92,19 @@ fn file_lifecycle_search_and_confirmation_replay() {
         .unwrap()
         .iter()
         .any(|v| v["path"] == "src"));
-    assert!(!tree["entries"]
+    // Build output is listed, marked, and not descended into unasked (B6).
+    let target = tree["entries"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|v| v["path"] == "target"));
+        .find(|v| v["path"] == "target")
+        .unwrap();
+    assert_eq!(target["generated"], true);
+    assert!(target["children"].is_null());
+    assert_eq!(
+        tree["entries"].as_array().unwrap().iter().find(|v| v["path"] == "src").unwrap()["generated"],
+        false
+    );
     let fast_tree = call(
         &e,
         "file.tree",

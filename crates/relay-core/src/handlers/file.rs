@@ -28,9 +28,15 @@ pub fn register(e: &mut Engine) {
             ));
         }
         let badges = if p.git_badges.unwrap_or(true) {
-            super::git::status_badges(&root).unwrap_or_default()
+            let watched = crate::watch::is_watched(ctx.engine(), &root);
+            super::git::status_badges_cached(&root, watched).unwrap_or_else(|error| {
+                // Badges are decoration, so the tree still loads; but a timed-out status is not
+                // "no changes", and it must not look like one without a trace anywhere.
+                tracing::warn!(root = %root.display(), error = %error, "git status for file.tree failed; badges omitted");
+                Default::default()
+            })
         } else {
-            HashMap::new()
+            Default::default()
         };
         Ok(TreeOut {
             entries: list_dir(&root, &dir, p.depth.unwrap_or(1).min(20), &badges)?,
@@ -113,6 +119,7 @@ pub fn register(e: &mut Engine) {
                 .map_err(|e| io_err("file.write_failed", &rel, e))?;
         }
         fs::rename(&temp, &path).map_err(|e| io_err("file.write_failed", &rel, e))?;
+        super::git::invalidate_badges(&root);
         ctx.set_project(project.id);
         ctx.emit(
             "file.changed",
@@ -259,43 +266,71 @@ pub fn register(e: &mut Engine) {
         changed(ctx, project.id, &root, &p.path);
         entry(&root, &path, &HashMap::new(), 0)
     });
-    e.register::<Import>(|ctx: &mut Ctx, p| {
-        let (project, root) = root(ctx, p.project_id, p.worktree.as_deref())?;
-        let into_rel = rel(&p.into, true)?;
-        let into = safe_join(&root, &into_rel, false)?;
-        if !into.is_dir() {
-            return Err(BusError::invalid(
-                "file.into",
-                "destination is not a directory",
-            ));
-        }
-        let mut entries = Vec::new();
-        for source in &p.sources {
-            let source = Path::new(source);
-            if !source.is_absolute() || !source.exists() {
+    // Copying a dropped-in folder can take as long as the folder is large. The copy lands in a
+    // staging directory inside the worktree with the store lock released; the locked phase is the
+    // guardrail and one same-filesystem rename per source (D149).
+    e.register_staged::<Import, _>(
+        |ctx, p| {
+            let (project, root) = root_unlocked(ctx, p.project_id, p.worktree.as_deref())?;
+            let into_rel = rel(&p.into, true)?;
+            let into = safe_join(&root, &into_rel, false)?;
+            if !into.is_dir() {
                 return Err(BusError::invalid(
-                    "file.source",
-                    format!("{} is not an existing absolute path", source.display()),
+                    "file.into",
+                    "destination is not a directory",
                 ));
             }
-            let name = source
-                .file_name()
-                .ok_or_else(|| BusError::invalid("file.source", "source has no name"))?;
-            let dest = into.join(name);
-            let dest_rel = into_rel.join(name);
-            guard_path_mutation(ctx, project.id, &root, &dest_rel, source)?;
-            if dest.exists() {
-                return Err(BusError::conflict(
-                    "file.exists",
-                    format!("{} already exists", dest_rel.display()),
-                ));
+            let staging = root
+                .join(".relay")
+                .join("tmp")
+                .join(format!("import-{}", uuid::Uuid::new_v4()));
+            let mut items: Vec<Imported> = Vec::new();
+            let staged = (|| {
+                for source in &p.sources {
+                    let source = Path::new(source);
+                    if !source.is_absolute() || !source.exists() {
+                        return Err(BusError::invalid(
+                            "file.source",
+                            format!("{} is not an existing absolute path", source.display()),
+                        ));
+                    }
+                    let name = source
+                        .file_name()
+                        .ok_or_else(|| BusError::invalid("file.source", "source has no name"))?;
+                    let dest = into.join(name);
+                    let dest_rel = into_rel.join(name);
+                    if dest.exists() || items.iter().any(|item| item.dest == dest) {
+                        return Err(BusError::conflict(
+                            "file.exists",
+                            format!("{} already exists", dest_rel.display()),
+                        ));
+                    }
+                    let staged = staging.join(name);
+                    fs::create_dir_all(&staging)
+                        .and_then(|()| copy(source, &staged))
+                        .map_err(|e| io_err("file.import_failed", &dest_rel, e))?;
+                    items.push(Imported { source: source.to_path_buf(), staged, dest, dest_rel });
+                }
+                Ok(())
+            })();
+            if let Err(error) = staged {
+                let _ = fs::remove_dir_all(&staging);
+                return Err(error);
             }
-            copy(source, &dest).map_err(|e| io_err("file.import_failed", &dest_rel, e))?;
-            entries.push(entry(&root, &dest, &HashMap::new(), 0)?);
-        }
-        changed(ctx, project.id, &root, &p.into);
-        Ok(ImportOut { entries })
-    });
+            Ok((project, root, staging, items))
+        },
+        |ctx: &mut Ctx, p, (project, root, staging, items)| {
+            let outcome = finish_import(ctx, project.id, &root, &p.into, &items);
+            // Empty once every item was moved into place. Anything left (a refusal, a hold, a
+            // failed rename) is removed off the request thread, since it can be a whole tree.
+            if fs::remove_dir(&staging).is_err() && staging.exists() {
+                std::thread::spawn(move || {
+                    let _ = fs::remove_dir_all(staging);
+                });
+            }
+            outcome
+        },
+    );
     e.register_unlocked::<Search>(|ctx, p| {
         let (project, root) = root_unlocked(ctx, p.project_id, p.worktree.as_deref())?;
         crate::watch::ensure_after_commit(ctx, root.clone(), project.id);
@@ -309,69 +344,105 @@ pub fn register(e: &mut Engine) {
         };
         let limit = p.limit.unwrap_or(200).min(2000) as usize;
         let mut hits = Vec::new();
-        let mut stack = vec![root.clone()];
         // One buffer for the whole walk: `read_to_string` allocated, grew and freed a fresh
-        // `String` for every file in the tree, most of which contribute no hits at all.
+        // `String` for every file in the tree, most of which contribute no hits at all. It is
+        // bounded by `SEARCH_FILE_CAP`, so one `.pak` no longer pins its size for the rest.
         let mut buffer: Vec<u8> = Vec::new();
-        while let Some(dir) = stack.pop() {
-            for e in fs::read_dir(&dir)
-                .map_err(|e| io_err("file.search_failed", &dir, e))?
-                .flatten()
-            {
-                let path = e.path();
-                let relp = path.strip_prefix(&root).unwrap_or(&path);
-                if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    if !skip_dir(relp) {
-                        stack.push(path);
-                    }
+        for found in search_walk(&root) {
+            // An unreadable directory or entry is skipped; it used to abort the whole search.
+            let Ok(found) = found else { continue };
+            let Some(kind) = found.file_type() else { continue };
+            let path = found.path();
+            if kind.is_symlink() {
+                // Links are not walked; one is read only when it lands on a regular file inside
+                // the worktree, so a search never leaves the tree it was asked about.
+                match fs::canonicalize(path) {
+                    Ok(target) if target.starts_with(&root) && target.is_file() => {}
+                    _ => continue,
+                }
+            } else if !kind.is_file() {
+                // FIFOs, sockets and devices: opening a FIFO blocks until a writer appears.
+                continue;
+            }
+            let relp = path.strip_prefix(&root).unwrap_or(path);
+            if let Some(glob) = &p.glob {
+                if !crate::guardrail::path_matches(glob, relp) {
                     continue;
                 }
-                if let Some(glob) = &p.glob {
-                    if !crate::guardrail::path_matches(glob, relp) {
-                        continue;
-                    }
-                }
-                buffer.clear();
-                let read = fs::File::open(&path)
-                    .and_then(|mut file| std::io::Read::read_to_end(&mut file, &mut buffer));
-                if read.is_err() {
-                    continue;
-                }
-                // Same rule as `read_to_string`: what is not text is not searched.
-                let Ok(text) = std::str::from_utf8(&buffer) else {
-                    continue;
+            }
+            if !read_searchable(path, &mut buffer) {
+                continue;
+            }
+            // Same rule as `read_to_string`: what is not text is not searched.
+            let Ok(text) = std::str::from_utf8(&buffer) else {
+                continue;
+            };
+            // The whole file is searched in one pass and hits are mapped back to lines,
+            // one per line as before. Searching line by line built a fresh substring
+            // searcher for every line of every file, a fifth of the op (PERF §1.7).
+            let mut from = 0usize;
+            let mut line = 1u32;
+            let mut counted_to = 0usize;
+            while from < text.len() {
+                let found = match &regex {
+                    Some(r) => r.find_at(text, from).map(|m| m.start()),
+                    None => text[from..].find(&p.query).map(|i| from + i),
                 };
-                // The whole file is searched in one pass and hits are mapped back to lines,
-                // one per line as before. Searching line by line built a fresh substring
-                // searcher for every line of every file, a fifth of the op (PERF §1.7).
-                let mut from = 0usize;
-                let mut line = 1u32;
-                let mut counted_to = 0usize;
-                while from < text.len() {
-                    let found = match &regex {
-                        Some(r) => r.find_at(text, from).map(|m| m.start()),
-                        None => text[from..].find(&p.query).map(|i| from + i),
-                    };
-                    let Some(at) = found else { break };
-                    line += text[counted_to..at].bytes().filter(|b| *b == b'\n').count() as u32;
-                    counted_to = at;
-                    let start = text[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
-                    let end = text[at..].find('\n').map(|i| at + i).unwrap_or(text.len());
-                    hits.push(Hit {
-                        path: relp.to_string_lossy().to_string(),
-                        line,
-                        col: (at - start) as u32 + 1,
-                        text: text[start..end].trim_end_matches('\r').to_string(),
-                    });
-                    if hits.len() >= limit {
-                        return Ok(SearchOut { hits });
-                    }
-                    from = end + 1;
+                let Some(at) = found else { break };
+                line += text[counted_to..at].bytes().filter(|b| *b == b'\n').count() as u32;
+                counted_to = at;
+                let start = text[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                let end = text[at..].find('\n').map(|i| at + i).unwrap_or(text.len());
+                hits.push(Hit {
+                    path: relp.to_string_lossy().to_string(),
+                    line,
+                    col: (at - start) as u32 + 1,
+                    text: clip_line(&text[start..end], at - start),
+                });
+                if hits.len() >= limit {
+                    return Ok(SearchOut { hits });
                 }
+                from = end + 1;
             }
         }
         Ok(SearchOut { hits })
     });
+}
+
+/// What `file.import`'s staged phase copied, and where it goes.
+struct Imported {
+    source: PathBuf,
+    staged: PathBuf,
+    dest: PathBuf,
+    dest_rel: PathBuf,
+}
+
+/// The locked half of `file.import`: every destination through the guardrail first, so a hold
+/// or refusal leaves nothing half-imported, then each staged copy renamed into place.
+fn finish_import(
+    ctx: &mut Ctx,
+    project_id: Id,
+    root: &Path,
+    into: &str,
+    items: &[Imported],
+) -> Result<ImportOut, BusError> {
+    for item in items {
+        guard_path_mutation(ctx, project_id, root, &item.dest_rel, &item.source)?;
+    }
+    let mut entries = Vec::new();
+    for item in items {
+        if item.dest.exists() {
+            return Err(BusError::conflict(
+                "file.exists",
+                format!("{} already exists", item.dest_rel.display()),
+            ));
+        }
+        fs::rename(&item.staged, &item.dest)
+            .map_err(|e| io_err("file.import_failed", &item.dest_rel, e))?;
+        entries.push(entry(root, &item.dest, &HashMap::new(), 0)?);
+    }
+    changed(ctx, project_id, root, into);
+    Ok(ImportOut { entries })
 }
 
 /// Which tree an omitted `worktree` means. For an agent it is that session's own worktree,
@@ -514,10 +585,9 @@ fn list_dir(
     let mut out = fs::read_dir(dir)
         .map_err(|e| io_err("file.tree_failed", dir, e))?
         .flatten()
-        .filter(|e| {
-            !matches!(e.file_name().to_string_lossy().as_ref(), ".git" | ".relay")
-                && !crate::watch::is_generated_path(root, &e.path())
-        })
+        // Build output and engine caches are listed, marked `generated`, and never descended into
+        // unasked: `Saved/Logs` is the folder an Unreal user most often wants (B6).
+        .filter(|e| !matches!(e.file_name().to_string_lossy().as_ref(), ".git" | ".relay"))
         .map(|e| entry(root, &e.path(), badges, depth.saturating_sub(1)))
         .collect::<Result<Vec<_>, _>>()?;
     out.sort_by_key(|e| (e.kind != EntryKind::Dir, e.name.to_lowercase()));
@@ -543,7 +613,12 @@ fn entry(
     } else {
         EntryKind::File
     };
-    let children = if kind == EntryKind::Dir && child_depth > 0 {
+    let generated = if kind == EntryKind::Dir {
+        crate::watch::is_generated_path(root, path)
+    } else {
+        path.parent().is_some_and(|parent| crate::watch::is_generated_path(root, parent))
+    };
+    let children = if kind == EntryKind::Dir && child_depth > 0 && !generated {
         Some(list_dir(root, path, child_depth, badges)?)
     } else {
         None
@@ -565,8 +640,14 @@ fn entry(
         modified_at,
         badge: badges.get(&rel).cloned(),
         children,
+        generated,
     })
 }
+
+/// Largest file whose text a rename, move, delete or import hands to the guardrail. Past it the
+/// content is not read at all: these handlers hold the store lock, and reading a multi-GB `.umap`
+/// in full (to then fail UTF-8) froze every other request, keystrokes included, while it ran.
+const GUARD_TEXT_CAP: u64 = 1024 * 1024;
 
 fn guard_path_mutation(
     ctx: &mut Ctx,
@@ -575,13 +656,35 @@ fn guard_path_mutation(
     rel: &Path,
     content: &Path,
 ) -> Result<(), BusError> {
-    let text = fs::read_to_string(content).unwrap_or_default();
+    let rel = rel.to_string_lossy();
+    let metadata = fs::metadata(content).ok();
+    if metadata.as_ref().is_some_and(|md| md.is_file() && md.len() > GUARD_TEXT_CAP) {
+        // Moving or trashing a file removes none of its lines, so an empty diff says exactly
+        // that: protected paths are still refused or held, the destructive-write check sees
+        // nothing removed, and a shape gate (which needs full text) holds conservatively.
+        return guardrail::enforce(
+            ctx,
+            project_id,
+            root,
+            GateKind::Write,
+            Some(&rel),
+            None,
+            Some(""),
+            None,
+        );
+    }
+    // Only a regular file is read: `read_to_string` on a FIFO would block the bus forever.
+    let text = if metadata.is_some_and(|md| md.is_file()) {
+        fs::read_to_string(content).unwrap_or_default()
+    } else {
+        String::new()
+    };
     guardrail::enforce(
         ctx,
         project_id,
         root,
         GateKind::Write,
-        Some(&rel.to_string_lossy()),
+        Some(&rel),
         Some(&text),
         None,
         None,
@@ -589,6 +692,7 @@ fn guard_path_mutation(
 }
 
 fn changed(ctx: &mut Ctx, project_id: Id, root: &Path, path: &str) {
+    super::git::invalidate_badges(root);
     ctx.set_project(project_id);
     ctx.emit(
         "file.changed",
@@ -626,13 +730,72 @@ fn copy(from: &Path, to: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn skip_dir(path: &Path) -> bool {
-    path.components().any(|c| {
-        matches!(
-            c.as_os_str().to_string_lossy().as_ref(),
-            ".git" | ".relay" | "node_modules" | "target"
-        )
-    })
+/// Files past this are not searched: a `.pak` or a multi-GB `.umap` has no line anyone is after.
+const SEARCH_FILE_CAP: u64 = 4 * 1024 * 1024;
+/// A hit carries its line, clipped to this many bytes around the match. One hit in a minified
+/// bundle, a source map or a `.gltf` with embedded buffers used to carry megabytes.
+const HIT_TEXT_CAP: usize = 400;
+
+/// Directories never searched, whatever `.gitignore` says: VCS and Relay state, dependency trees,
+/// and the generated binaries of Cargo and Unreal. `Saved/` is not here, since `Saved/Logs` is
+/// worth searching; a project that ignores it in `.gitignore` is honoured.
+fn skip_dir_name(name: &std::ffi::OsStr) -> bool {
+    matches!(
+        name.to_str(),
+        Some(".git" | ".relay" | "node_modules" | "target" | "Intermediate" | "DerivedDataCache" | "Binaries")
+    )
+}
+
+/// The files `file.search` looks at, in a stable order: `.gitignore`, `.ignore` and
+/// `.git/info/exclude` are honoured, hidden files are included, links are not followed.
+fn search_walk(root: &Path) -> ignore::Walk {
+    let mut walk = ignore::WalkBuilder::new(root);
+    walk.hidden(false)
+        .parents(false)
+        .require_git(false)
+        .follow_links(false)
+        .sort_by_file_name(|a, b| a.cmp(b))
+        .filter_entry(|entry| {
+            entry.depth() == 0
+                || !(entry.file_type().is_some_and(|kind| kind.is_dir()) && skip_dir_name(entry.file_name()))
+        });
+    walk.build()
+}
+
+/// Read `path` into `buffer` if it is worth searching: under [`SEARCH_FILE_CAP`] and not binary.
+fn read_searchable(path: &Path, buffer: &mut Vec<u8>) -> bool {
+    use std::io::Read;
+    buffer.clear();
+    if fs::metadata(path).map_or(true, |md| md.len() > SEARCH_FILE_CAP) {
+        return false;
+    }
+    let read = fs::File::open(path).and_then(|file| file.take(SEARCH_FILE_CAP + 1).read_to_end(buffer));
+    matches!(read, Ok(n) if n as u64 <= SEARCH_FILE_CAP) && !super::git::looks_binary(buffer)
+}
+
+/// `line` (without its newline) clipped to about [`HIT_TEXT_CAP`] bytes around the match at byte
+/// `at`, on character boundaries, with `…` where something was cut.
+fn clip_line(line: &str, at: usize) -> String {
+    let line = line.trim_end_matches('\r');
+    if line.len() <= HIT_TEXT_CAP {
+        return line.to_string();
+    }
+    let mut from = at
+        .saturating_sub(HIT_TEXT_CAP / 2)
+        .min(line.len() - HIT_TEXT_CAP);
+    while !line.is_char_boundary(from) {
+        from -= 1;
+    }
+    let mut to = (from + HIT_TEXT_CAP).min(line.len());
+    while !line.is_char_boundary(to) {
+        to -= 1;
+    }
+    format!(
+        "{}{}{}",
+        if from > 0 { "…" } else { "" },
+        &line[from..to],
+        if to < line.len() { "…" } else { "" }
+    )
 }
 
 fn mime(path: &Path) -> String {
@@ -657,4 +820,25 @@ fn mime(path: &Path) -> String {
 
 fn io_err(code: &str, path: impl AsRef<Path>, e: std::io::Error) -> BusError {
     BusError::unavailable(code, format!("{}: {e}", path.as_ref().display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{clip_line, HIT_TEXT_CAP};
+
+    #[test]
+    fn hit_lines_are_clipped_around_the_match_on_character_boundaries() {
+        assert_eq!(clip_line("short line\r", 0), "short line");
+        let line = format!("{}needle{}", "ü".repeat(1000), "€".repeat(1000));
+        let at = line.find("needle").unwrap();
+        let clipped = clip_line(&line, at);
+        assert!(clipped.contains("needle"));
+        assert!(clipped.starts_with('…') && clipped.ends_with('…'));
+        assert!(clipped.len() <= HIT_TEXT_CAP + 2 * '…'.len_utf8());
+        // A match at the very end still gets a full window, only cut on the left.
+        let tail = format!("{}needle", "x".repeat(5000));
+        let clipped = clip_line(&tail, 5000);
+        assert!(clipped.ends_with("needle") && !clipped.ends_with('…'));
+        assert_eq!(clipped.len(), HIT_TEXT_CAP + '…'.len_utf8());
+    }
 }
