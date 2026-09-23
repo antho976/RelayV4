@@ -279,7 +279,9 @@ These cost hours once. Check here before debugging them again.
   `ue_profile` also turn it off (and save it where the engine allows) and report `average_fps`;
   below 20 fps a timed test means nothing. `ue_editor_launch` also writes the setting off into
   the project's saved per-project user settings before starting the editor, so it survives
-  restarts; launch with `ue_editor_launch` rather than by hand to get this.
+  restarts. For an editor started by hand, `ue_setup_check {"fix": true}` writes it to
+  `Config/DefaultEditorPerProjectUserSettings.ini` (and the saved per-user file) and turns it off
+  in the running editor.
 - *Seeing the game from outside the player's camera.* Python cannot spawn into a running game;
   `ue_play` with `outside` places a capture in the level before play and moves it around the
   player at each checkpoint, showing first-person arms and guns from the side or front.

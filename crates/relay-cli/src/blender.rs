@@ -180,7 +180,7 @@ fn tools() -> Vec<Value> {
                 "fbx_path":{"type":"string","description":"Where to keep the FBX, relative to the checkout; default Saved/Relay/Exports/<name>.fbx"},
                 "materials":{"type":"boolean"},
                 "allow_problems":{"type":"boolean","description":"Export even when the mesh check finds problems"},
-                "socket_rotation":{"type":"string","enum":["match","zero","keep"],"description":"Sockets from SOCKET_ empties arrive with a -90 degree roll from the axis conversion. match (default): a socket whose empty had no rotation of its own gets none; zero: every socket; keep: as imported"},
+                "socket_rotation":{"type":"string","enum":["match","zero","keep"],"description":"Sockets from SOCKET_ empties arrive with a -90 degree roll from the axis conversion, and at 100x scale (divided back unless keep). match (default): a socket whose empty had no rotation of its own gets none; zero: every socket; keep: as imported"},
                 "importer":{"type":"string","enum":["legacy","interchange"],"description":"Default legacy: Interchange FBX produced empty meshes and transient materials on UE 5.8. The other is tried if the first fails."},
                 "normals":{"type":"string","enum":["FBXNIM_IMPORT_NORMALS","FBXNIM_IMPORT_NORMALS_AND_TANGENTS","FBXNIM_COMPUTE_NORMALS"],"description":"Default FBXNIM_IMPORT_NORMALS (tangents computed): imported tangents from Blender gave a mesh that drew only its shadow"}
             }), &["file","kind","destination"], false),

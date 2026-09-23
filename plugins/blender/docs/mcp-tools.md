@@ -52,9 +52,10 @@ left out), deform bones only, no leaf bones. `animation`: the armature's action 
 the size in cm.
 
 ### `blender_to_unreal` — `{ file, objects?, kind, action?, animations?, destination, name?, skeleton?, fbx_path?, materials?, socket_rotation?, importer?, normals?, allow_problems? }`
-Sockets from `SOCKET_` empties arrive with a -90° roll from the axis conversion; with
-`socket_rotation: "match"` (default) a socket whose empty had no rotation of its own is set back to
-zero and the mesh saved (`zero` resets all, `keep` leaves them).
+Sockets from `SOCKET_` empties arrive with a -90° roll from the axis conversion and at 100× scale
+from the unit conversion; with `socket_rotation: "match"` (default) a socket whose empty had no
+rotation of its own is set back to zero, every socket's scale is divided back to its Blender
+value, and the mesh is saved (`zero` resets all rotations, `keep` leaves rotation and scale).
 
 Exports (to `Saved/Relay/Exports/<name>.fbx` unless `fbx_path` says otherwise), imports into the
 running Unreal editor through the Unreal plugin (same project guard and editor lock), and
@@ -62,5 +63,6 @@ compares: height in Unreal against Blender (a x100 difference is a unit problem)
 mesh's root bone scale (must be 1), and its facing against the facing recorded at export (a
 reversed facing means mirrored or turned around; sides alone cannot show it, since both sides
 derive left and right from the bone names).
+What was done to each socket is listed in `sockets`.
 Returns `problems` and `passed`. Needs the Unreal Engine plugin on for the project and the editor
 open.

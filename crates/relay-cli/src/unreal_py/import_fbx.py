@@ -118,7 +118,9 @@ def remove(paths):
 def fix_sockets(paths):
     """Sockets that came from empties arrive with the FBX axis conversion's roll (-90 degrees)
     on them, which turns whatever is attached. Put back what the empties meant: no rotation for
-    an empty with none of its own (or for every socket with socket_rotation="zero")."""
+    an empty with none of its own (or for every socket with socket_rotation="zero"). They also
+    arrive at 100x scale from the unit conversion, which scales whatever is attached; that is
+    divided back for every socket unless socket_rotation="keep"."""
     mode = ARGS.get("socket_rotation", "match")
     if mode == "keep" or kind != "static":
         return []
@@ -131,6 +133,10 @@ def fix_sockets(paths):
         changed = False
         for socket in mesh.get_editor_property("sockets"):
             name = str(socket.get_editor_property("socket_name"))
+            scale = undo_blender_socket_scale(socket)
+            if scale:
+                fixed.append({"mesh": path, "socket": name, "scale": scale})
+                changed = True
             key = name.lower()
             key = key[len("socket_"):] if key.startswith("socket_") else key
             spec = meant.get(key)

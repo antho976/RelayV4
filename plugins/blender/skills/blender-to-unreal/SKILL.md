@@ -119,7 +119,9 @@ follow the existing assets when they differ from this table.
   same space as the mesh (parent it and keep its transform applied); no modifiers or materials
   needed. A concave shape = several convex pieces. `blender_info` shows the roles it detected.
 - **SOCKET_ empties** become static-mesh sockets named without the prefix. Skeletal-mesh
-  sockets are made on the Skeleton in Unreal, not from empties.
+  sockets are made on the Skeleton in Unreal, not from empties. The FBX round trip leaves each
+  socket at 100x scale with a -90 degree roll; `blender_to_unreal` fixes both (see Sockets
+  under the pipeline below). A mesh imported any other way needs the same fix by hand.
 - **LODs.** Unreal's classic FBX importer builds LODs from an FBX LOD Group, which Blender's
   exporter does not write. `_LODn` children therefore go into the same FBX, and what Unreal
   does with them depends on the importer and version: read `imported` and look at the LOD
@@ -206,7 +208,8 @@ settings. Record in the project docs which importer and settings the project use
 - **Import**: the legacy FBX importer by default, normals imported and tangents computed, import
   settings replaced on re-import, materials checked for transient instances.
 - **Sockets**: `SOCKET_` empties arrive in Unreal with a -90° roll from the FBX axis conversion,
-  which turns anything attached to them. The export records how each empty is turned relative to
+  which turns anything attached to them, and at 100x scale from the unit conversion, which
+  scales it; the import divides every socket's scale back unless `socket_rotation` is `keep`. The export records how each empty is turned relative to
   its mesh, and the import sets a socket whose empty had no rotation of its own back to zero
   (`socket_rotation`: `match` by default, `zero` for all, `keep` to leave them). Empties you did
   rotate are reported for a check with `ue_screenshot`; keep socket empties unrotated and put

@@ -124,7 +124,7 @@ fn tools() -> Vec<Value> {
             "The Unreal project in this checkout: .uproject fields (engine association, modules, plugins), build targets, C++ modules, project plugins, config files, maps, asset counts, the resolved engine directory and log path. Works without the editor.",
             json!({}), &[], true),
         tool("ue_setup_check",
-            "Whether the editor bridge is ready: the RemoteControl, PythonScriptPlugin and EditorScriptingUtilities plugins in the .uproject, whether the editor's Remote Control server answers, and whether remote Python runs. With fix=true, adds the missing plugins to the .uproject (takes effect after the editor restarts).",
+            "Whether the editor bridge is ready: the RemoteControl, PythonScriptPlugin and EditorScriptingUtilities plugins in the .uproject, whether the editor's Remote Control server answers, and whether remote Python runs. Also whether Use Less CPU when in Background is on. With fix=true, adds the missing plugins to the .uproject (takes effect after the editor restarts), writes the Remote Control settings, and turns the background throttle off in the running editor and in the project's config, so it stays off across restarts.",
             json!({"fix":{"type":"boolean","description":"Add missing bridge plugins to the .uproject"}}), &[], false),
         tool("ue_build",
             "Build with UnrealBuildTool through the engine's Build script. Defaults: the project's Editor target, the host platform, Development. Close the editor first (or use Live Coding in the editor instead). Returns success, the error lines and the tail of the output.",
@@ -715,6 +715,36 @@ fn write_remote_control_ini(project: &Project) -> Result<Value> {
         "not_in_this_engine": unknown.iter().map(|(k, _)| k.to_string()).collect::<Vec<_>>(),
         "checked_against_engine_source": header.is_some(),
     }))
+}
+
+/// "Use Less CPU when in Background", off. Changed only in memory (as `ue_play` does), it comes
+/// back on at the next start, so it goes into the project's default per-user settings, and into
+/// any saved per-user file that already holds it, since that file wins over the default.
+const PERF_SECTION: &str = "[/Script/UnrealEd.EditorPerformanceSettings]";
+const PERF_KEY: &str = "bThrottleCPUWhenNotForeground";
+
+fn write_editor_settings_ini(project: &Project) -> Result<Value> {
+    let keys = [(PERF_KEY.to_string(), "False".to_string())];
+    let mut files = vec![project.root.join("Config/DefaultEditorPerProjectUserSettings.ini")];
+    if let Ok(dirs) = std::fs::read_dir(project.root.join("Saved/Config")) {
+        for dir in dirs.flatten() {
+            let saved = dir.path().join("EditorPerProjectUserSettings.ini");
+            if std::fs::read_to_string(&saved).is_ok_and(|t| t.lines().any(|l| l.split_once('=').is_some_and(|(k, _)| k.trim() == PERF_KEY))) {
+                files.push(saved);
+            }
+        }
+    }
+    let mut changed = Vec::new();
+    for path in &files {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let merged = merge_ini(&text, PERF_SECTION, &keys);
+        if merged != text {
+            if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+            std::fs::write(path, &merged)?;
+            changed.push(path.clone());
+        }
+    }
+    Ok(json!({"files": files, "changed": changed, "written": format!("{PERF_KEY}=False")}))
 }
 
 /// Set keys inside one ini section, keeping every other line and section as it was.
@@ -1429,12 +1459,22 @@ fn setup_check(project: &Project, fix: bool) -> Result<Value> {
         std::fs::write(&project.uproject, out).with_context(|| format!("writing {}", project.uproject.display()))?;
     }
     let ini = if fix { Some(write_remote_control_ini(project)?) } else { None };
+    let editor_ini = if fix { Some(write_editor_settings_ini(project)?) } else { None };
     let editor = remote("GET", "/remote/info", None, Duration::from_secs(3));
     let python_ok = match &editor {
         Ok(_) => python("print('relay-python-ok')", Duration::from_secs(20))
             .map(|v| v.to_string().contains("relay-python-ok"))
             .map_err(|e| e.to_string()),
         Err(_) => Err("editor not reachable".into()),
+    };
+    // The running editor's value; with fix, also switched off now, so the editor writes the
+    // same value back when it quits.
+    let throttled = match &python_ok {
+        Ok(true) => python_json(&format!(
+            "import json, unreal\ns = unreal.get_default_object(unreal.EditorPerformanceSettings)\nwas = bool(s.get_editor_property('throttle_cpu_when_not_foreground'))\n{}print('RELAY_JSON:' + json.dumps(was))\n",
+            if fix { "s.set_editor_property('throttle_cpu_when_not_foreground', False)\n" } else { "" }
+        ), Duration::from_secs(20)).ok().and_then(|v| v.as_bool()),
+        _ => None,
     };
     let mut advice = Vec::new();
     if !missing.is_empty() && fixed.is_empty() {
@@ -1446,6 +1486,9 @@ fn setup_check(project: &Project, fix: bool) -> Result<Value> {
     if ini.as_ref().is_some_and(|i| i["changed"] == true) {
         advice.push("Config/DefaultRemoteControl.ini now enables the web server at start-up, remote Python, console commands and remote function calls; restart the editor (ue_editor_quit, then ue_editor_launch) to apply it.".to_string());
     }
+    if throttled == Some(true) && !fix {
+        advice.push("Use Less CPU when in Background is on: the editor barely ticks while another window has focus. Run ue_setup_check with fix=true to turn it off for good (it writes Config/DefaultEditorPerProjectUserSettings.ini).".to_string());
+    }
     if editor.is_err() {
         advice.push("Open the project in the editor and start the Remote Control web server: run `WebControl.StartServer` in the editor console, or turn on auto-start under Project Settings > Plugins > Remote Control. Set UE_REMOTE_CONTROL_URL if it is not on 127.0.0.1:30010.".to_string());
     } else if let Err(error) = &python_ok {
@@ -1456,6 +1499,7 @@ fn setup_check(project: &Project, fix: bool) -> Result<Value> {
         "bridge_plugins": BRIDGE_PLUGINS.iter().map(|name| json!({"name": name, "enabled": state(name) == Some(true) || fixed.contains(name)})).collect::<Vec<_>>(),
         "added_to_uproject": fixed,
         "remote_control_ini": ini,
+        "background_throttle": {"was_on": throttled, "ini": editor_ini},
         "remote_control_url": remote_base(),
         "editor_reachable": editor.is_ok(),
         "editor_error": editor.err().map(|e| e.to_string()),
@@ -2045,6 +2089,26 @@ mod tests {
         assert!(merged.contains("RemoteControlHttpServerPort=30010\nbAutoStartWebServer=True\n\n[Later]\nB=2"), "{merged}");
         assert!(merged.starts_with("[Other]\nA=1\n"));
         assert_eq!(merge_ini(&merged, RC_SECTION, &keys), merged, "merging twice changes nothing");
+    }
+
+    #[test]
+    fn the_background_throttle_stays_off_across_restarts() {
+        let root = tempfile::tempdir().unwrap();
+        let project = bare_project(root.path());
+        let saved = root.path().join("Saved/Config/LinuxEditor");
+        std::fs::create_dir_all(&saved).unwrap();
+        std::fs::write(saved.join("EditorPerProjectUserSettings.ini"), format!("{PERF_SECTION}\n{PERF_KEY}=True\nbMonitorEditorPerformance=True\n")).unwrap();
+        let other = root.path().join("Saved/Config/WindowsEditor");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("EditorPerProjectUserSettings.ini"), "[Other]\nA=1\n").unwrap();
+        let result = write_editor_settings_ini(&project).unwrap();
+        assert_eq!(result["changed"].as_array().unwrap().len(), 2, "{result}");
+        let default = std::fs::read_to_string(root.path().join("Config/DefaultEditorPerProjectUserSettings.ini")).unwrap();
+        assert_eq!(default, format!("{PERF_SECTION}\n{PERF_KEY}=False\n"));
+        let user = std::fs::read_to_string(saved.join("EditorPerProjectUserSettings.ini")).unwrap();
+        assert!(user.contains(&format!("{PERF_KEY}=False\nbMonitorEditorPerformance=True")), "{user}");
+        assert_eq!(std::fs::read_to_string(other.join("EditorPerProjectUserSettings.ini")).unwrap(), "[Other]\nA=1\n", "a file without the key is left to the default");
+        assert_eq!(write_editor_settings_ini(&project).unwrap()["changed"], json!([]), "a second run changes nothing");
     }
 
     #[test]
