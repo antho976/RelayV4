@@ -7,6 +7,9 @@
 # unless importer="interchange"; "Import Normals and Tangents" on a Blender FBX gave a mesh that
 # drew only its shadow, so normals are imported and tangents computed; and a re-import kept the
 # old asset's import settings unless told to replace them.
+#
+# Sockets from Blender SOCKET_ empties arrive at 100x scale with a -90 degree roll; both are
+# undone here and saved with the mesh (fix_sockets=false keeps them as imported).
 
 kind = ARGS["kind"]
 CVAR = "Interchange.FeatureFlags.Import.FBX"
@@ -62,6 +65,34 @@ def run_import(destination, name):
     task.set_editor_property("options", options())
     unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([task])
     return [str(p) for p in task.get_editor_property("imported_object_paths")]
+
+
+def fix_sockets(path):
+    try:
+        return undo_socket_import(path)
+    except Exception as error:
+        return [{"error": str(error)}]
+
+
+def undo_socket_import(path):
+    a = unreal.load_asset(path)
+    if not isinstance(a, unreal.StaticMesh):
+        return []
+    fixed = []
+    for socket in a.get_editor_property("sockets") or []:
+        change = undo_blender_socket_transform(socket)
+        if change:
+            change["socket"] = str(socket.get_editor_property("socket_name"))
+            fixed.append(change)
+    if fixed:
+        try:
+            a.modify()
+        except Exception:
+            pass
+        if not save_asset(a):
+            for change in fixed:
+                change["saved"] = False
+    return fixed
 
 
 def measure(path):
@@ -124,7 +155,11 @@ try:
         if previous is not None:
             set_cvar(CVAR, 1 if attempt == "interchange" else 0)
         paths = run_import(ARGS["destination"], ARGS.get("name"))
+        socket_fixes = dict((p, fix_sockets(p)) for p in paths) if ARGS.get("fix_sockets", True) else {}
         measured = [measure(p) for p in paths]
+        for m in measured:
+            if socket_fixes.get(m["path"]):
+                m["sockets_fixed"] = socket_fixes[m["path"]]
         broken = [m["path"] for m in measured if m.get("empty") or m.get("error") or m.get("transient_materials")]
         attempts.append({"importer": attempt, "imported": measured, "broken": broken})
         if paths and not broken:

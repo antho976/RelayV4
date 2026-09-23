@@ -179,6 +179,7 @@ fn tools() -> Vec<Value> {
                 "skeleton":{"type":"string","description":"Existing Skeleton asset, for animations and shared rigs"},
                 "fbx_path":{"type":"string","description":"Where to keep the FBX, relative to the checkout; default Saved/Relay/Exports/<name>.fbx"},
                 "materials":{"type":"boolean"},
+                "fix_sockets":{"type":"boolean","description":"Default true: sockets from SOCKET_ empties arrive at 100x scale with a -90 roll; both are undone and saved. False keeps them as imported"},
                 "allow_problems":{"type":"boolean","description":"Export even when the mesh check finds problems"},
                 "importer":{"type":"string","enum":["legacy","interchange"],"description":"Default legacy: Interchange FBX produced empty meshes and transient materials on UE 5.8. The other is tried if the first fails."},
                 "normals":{"type":"string","enum":["FBXNIM_IMPORT_NORMALS","FBXNIM_IMPORT_NORMALS_AND_TANGENTS","FBXNIM_COMPUTE_NORMALS"],"description":"Default FBXNIM_IMPORT_NORMALS (tangents computed): imported tangents from Blender gave a mesh that drew only its shadow"}
@@ -408,6 +409,9 @@ fn to_unreal(root: &Path, args: &Value) -> Result<Value> {
         if let Some(v) = args.get(key).filter(|v| v.is_string()) {
             import_args[key] = v.clone();
         }
+    }
+    if let Some(v) = args.get("fix_sockets").filter(|v| v.is_boolean()) {
+        import_args["fix_sockets"] = v.clone();
     }
     let imported = crate::unreal::import_fbx(&fbx, import_args)?;
     let checks = compare(&exported, &imported);

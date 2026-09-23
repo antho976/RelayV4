@@ -62,4 +62,24 @@ check(sides[0] == "right" and sides[-1] == "left", "the swing crosses the body: 
 partner = inspect({"mesh": "/Game/Manny", "animation": "/Game/Swing", "samples": 5,
                    "partner": {"mesh": "/Game/Manny", "location": [45, 0, 0], "yaw": 0}})
 check(any(p["kind"] == "partner_clipping" for p in partner["problems"]), "hand inside the partner is reported")
+# A socket from a Blender empty: 100x scale and a -90 roll are undone once, and only once.
+import unreal
+helpers = {"ARGS_JSON": "{}"}
+exec(compile(open(os.path.join(SRC, "common.py")).read(), "common.py", "exec"), helpers)
+
+
+class Socket(object):
+    def __init__(s, scale, roll, yaw):
+        s.p = {"relative_scale": unreal.Vector(*scale), "relative_rotation": unreal.Rotator(roll=roll, yaw=yaw)}
+    def get_editor_property(s, k): return s.p[k]
+    def set_editor_property(s, k, v): s.p[k] = v
+
+
+grip = Socket((100, 100, 100), -90.0, 30.0)
+change = helpers["undo_blender_socket_transform"](grip)
+r, sc = grip.p["relative_rotation"], grip.p["relative_scale"]
+check(change and (sc.x, sc.y, sc.z) == (1, 1, 1), "scale back to 1: %s" % change)
+check(abs(r.roll) < 1e-6 and r.yaw == 30.0, "roll undone, yaw kept: %s" % change)
+check(helpers["undo_blender_socket_transform"](grip) is None, "a second pass changes nothing")
+check(helpers["undo_blender_socket_transform"](Socket((1, 1, 1), -90.0, 0.0)) is None, "a socket at scale 1 is left alone")
 print("ok")

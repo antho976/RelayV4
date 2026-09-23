@@ -273,7 +273,9 @@ These cost hours once. Check here before debugging them again.
   bind; `ue_editor_status` explains which of the three unreachable cases you are in.
 - *The editor throttles itself in the background* (a few fps). `ue_play` and `ue_profile` turn
   `throttle_cpu_when_not_foreground` off for the session and report `average_fps`; below 20 fps a
-  timed test means nothing.
+  timed test means nothing. Switched off in memory or in Editor Preferences, it came back on after
+  every editor restart; `ue_setup_check {"fix": true}` writes it to
+  `Config/DefaultEditorPerProjectUserSettings.ini` (and the saved per-user file) so it stays off.
 - *Play screenshots* are taken after the checkpoint's probe and matched to their own file, so
   images and probe output describe the same moment.
 - *"Cancelling Open Transaction 'Remote Call Transaction Wrap'"* at play start is harmless; the

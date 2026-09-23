@@ -75,6 +75,7 @@ call, and compare the numbers. Fix one cause at a time. Python for the fixes:
 | Collision "fills in" a concave shape | one hull around a concave object | split into several convex pieces |
 | Collision offset from the mesh | UCX transform differs (unapplied) or the pivot changed after making it | apply the UCX transform in the mesh's space; rebuild after changing the pivot |
 | Socket missing | empty not named `SOCKET_`, not a child of the mesh, or it is a skeletal mesh | fix name and parent; for skeletal meshes add sockets on the Skeleton in Unreal |
+| Attached item 100x too big, or rolled 90 degrees | the socket kept the FBX unit conversion (scale 100, roll -90) | import with `blender_to_unreal`, which undoes both (`sockets_fixed`); otherwise set the socket's scale to 1 and add 90 to its roll in the Static Mesh editor |
 | LODs arrive as separate assets or merged into LOD0 | importer does not group `_LODn` children | per-LOD export and LOD import in the Static Mesh editor, or Unreal-generated LODs / Nanite |
 | Prop floats above or sinks into the floor when placed | origin not at the base | set origin to the centre of the base, re-export |
 | Held item offset from the hand | pivot not at the grip, or socket not at the palm | origin at the grip (prep recipes); tune the socket (`unreal-animation-verification`) |

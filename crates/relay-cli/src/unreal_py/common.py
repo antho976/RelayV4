@@ -122,6 +122,22 @@ def offset_transform(spec):
     return (loc, q, (1.0, 1.0, 1.0))
 
 
+def undo_blender_socket_transform(socket):
+    """A socket made from a Blender SOCKET_ empty arrives with the exporter's unit conversion
+    left in it: 100x scale and a -90 degree roll on top of the rotation the empty was given.
+    Divide the scale back and turn the roll back. Scale is the marker; a socket without it
+    is left alone, so running this twice changes nothing. Returns what changed, or None."""
+    scale = vec(socket.get_editor_property("relative_scale"))
+    if min(abs(c) for c in scale) < 10.0:
+        return None
+    r = socket.get_editor_property("relative_rotation")
+    roll = (float(r.roll) + 90.0 + 180.0) % 360.0 - 180.0
+    fixed_scale = mul(scale, 0.01)
+    socket.set_editor_property("relative_scale", unreal.Vector(*fixed_scale))
+    socket.set_editor_property("relative_rotation", unreal.Rotator(roll=roll, pitch=float(r.pitch), yaw=float(r.yaw)))
+    return {"scale": [rnd(scale, 3), rnd(fixed_scale, 3)], "roll": [round(float(r.roll), 2), round(roll, 2)]}
+
+
 def rnd(p, digits=1):
     return [round(c, digits) for c in p]
 

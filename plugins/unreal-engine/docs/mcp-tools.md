@@ -18,7 +18,12 @@ and the log path. **Call it first in every task.**
 ### `ue_setup_check` — `{ fix?: bool }`
 With `fix`, also writes `Config/DefaultRemoteControl.ini` (web server at start-up, remote Python,
 console commands, remote function calls), checking each key against the engine's
-`RemoteControlSettings.h` when the engine source is present.
+`RemoteControlSettings.h` when the engine source is present, and turns *Use Less CPU when in
+Background* off for good: `bThrottleCPUWhenNotForeground=False` in
+`Config/DefaultEditorPerProjectUserSettings.ini`, in any `Saved/Config/*/EditorPerProjectUserSettings.ini`
+that already holds the key (it overrides the default), and in the running editor, so the value it
+writes back on quitting is the same. Without `fix`, `background_throttle.was_on` reports the
+running editor's value and `advice` says when it is on.
 
 Whether *RemoteControl*, *PythonScriptPlugin* and *EditorScriptingUtilities* are enabled in the
 `.uproject`, whether the editor answers, whether remote Python runs, and a list of `advice` steps.

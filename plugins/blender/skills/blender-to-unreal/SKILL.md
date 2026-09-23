@@ -119,7 +119,10 @@ follow the existing assets when they differ from this table.
   same space as the mesh (parent it and keep its transform applied); no modifiers or materials
   needed. A concave shape = several convex pieces. `blender_info` shows the roles it detected.
 - **SOCKET_ empties** become static-mesh sockets named without the prefix. Skeletal-mesh
-  sockets are made on the Skeleton in Unreal, not from empties.
+  sockets are made on the Skeleton in Unreal, not from empties. The FBX round trip leaves each
+  socket at 100x scale with a -90 degree roll on top of the empty's rotation; `blender_to_unreal`
+  undoes both and saves the mesh (`imported[].sockets_fixed` lists them; `fix_sockets: false`
+  keeps them as imported). A mesh imported any other way needs the same fix by hand.
 - **LODs.** Unreal's classic FBX importer builds LODs from an FBX LOD Group, which Blender's
   exporter does not write. `_LODn` children therefore go into the same FBX, and what Unreal
   does with them depends on the importer and version: read `imported` and look at the LOD
