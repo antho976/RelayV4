@@ -144,7 +144,9 @@ type RelayState = {
 }
 
 const REQUEST_TIMEOUT_MS = 20_000
-const HANDSHAKE_TIMEOUT_MS = 8_000
+// Generous: the first packet to a Tailscale peer can wait several seconds while the tunnel
+// wakes or is set up through a relay, and a LAN route that cannot answer fails on its own.
+const HANDSHAKE_TIMEOUT_MS = 20_000
 const KEEPALIVE_MS = 25_000
 const RECONNECT_MIN_MS = 1_000
 const RECONNECT_MAX_MS = 30_000
