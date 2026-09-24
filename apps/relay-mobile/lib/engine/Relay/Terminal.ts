@@ -10,11 +10,19 @@ export const TERMINAL_MAX_LINES = 1500
 
 const ESC = '\x1b'
 
+/**
+ * Longest escape sequence kept waiting for its end. An OSC or DCS that never terminates
+ * (a program killed mid-sequence) would otherwise hold the screen and grow without bound.
+ */
+const MAX_ESCAPE = 4096
+
 export class TerminalText {
     private lines: string[] = ['']
     private cursor = 0
     /** Bytes of an escape sequence that arrived split across two frames. */
     private pending = ''
+    /** Inside an over-long OSC (`osc`, ends at BEL or ST) or DCS/PM/APC (`st`, ends at ST). */
+    private swallow?: 'osc' | 'st'
 
     constructor(private readonly maxLines = TERMINAL_MAX_LINES) {}
 
@@ -23,6 +31,7 @@ export class TerminalText {
         this.lines = ['']
         this.cursor = 0
         this.pending = ''
+        this.swallow = undefined
         this.feed(text)
     }
 
@@ -30,11 +39,30 @@ export class TerminalText {
         const data = this.pending + chunk
         this.pending = ''
         let i = 0
+        if (this.swallow) {
+            // The rest of an abandoned sequence is dropped up to its terminator.
+            const end = this.swallowEnd(data)
+            if (end === -1) {
+                // An ESC at the very end may be the first half of ST.
+                if (data.endsWith(ESC)) this.pending = ESC
+                return
+            }
+            this.swallow = undefined
+            i = end
+        }
         while (i < data.length) {
             const ch = data[i]
             if (ch === ESC) {
                 const consumed = this.skipEscape(data, i)
                 if (consumed === -1) {
+                    if (data.length - i > MAX_ESCAPE) {
+                        // Too long to be real: drop what came so far, and for a string
+                        // sequence the rest of it too, instead of waiting on it forever.
+                        const kind = data[i + 1]
+                        if (kind === ']') this.swallow = 'osc'
+                        else if (kind === 'P' || kind === '^' || kind === '_') this.swallow = 'st'
+                        return
+                    }
                     // Sequence continues in the next frame.
                     this.pending = data.slice(i)
                     return
@@ -97,6 +125,15 @@ export class TerminalText {
                 line.slice(0, this.cursor) + run + line.slice(this.cursor + run.length)
         }
         this.cursor += run.length
+    }
+
+    /** Index just past the terminator of the sequence being swallowed, or -1. */
+    private swallowEnd(data: string): number {
+        for (let j = 0; j < data.length; j++) {
+            if (this.swallow === 'osc' && data[j] === '\x07') return j + 1
+            if (data[j] === ESC && data[j + 1] === '\\') return j + 2
+        }
+        return -1
     }
 
     /**
@@ -214,11 +251,46 @@ export const base64Decode = (b64: string): Uint8Array => {
     return Uint8Array.from(out)
 }
 
-/** Decode a base64 PTY frame to text; the engine sends UTF-8 bytes. */
-export const decodeFrame = (b64: string): string => {
-    try {
-        return utf8Decode(base64Decode(b64))
-    } catch {
-        return ''
+/**
+ * UTF-8 across PTY frames. The engine cuts a frame wherever its buffer ends, which can be in
+ * the middle of a character: the bytes of an unfinished character wait for the next frame
+ * instead of turning into `\ufffd`. A stream that starts in the middle of a character (a
+ * catch-up from partway through the engine's buffer) drops the stray continuation bytes.
+ * One per attachment, reset when the session's epoch changes.
+ */
+export class Utf8Stream {
+    private carry = new Uint8Array(0)
+    private fresh = true
+
+    reset() {
+        this.carry = new Uint8Array(0)
+        this.fresh = true
+    }
+
+    decode(chunk: Uint8Array): string {
+        let bytes = chunk
+        if (this.carry.length > 0) {
+            bytes = new Uint8Array(this.carry.length + chunk.length)
+            bytes.set(this.carry)
+            bytes.set(chunk, this.carry.length)
+        }
+        let start = 0
+        if (this.fresh) {
+            // A character is at most four bytes, so at most three can belong to one begun
+            // before the stream did.
+            while (start < bytes.length && start < 3 && (bytes[start] & 0xc0) === 0x80) start++
+            if (start < bytes.length || start === 3) this.fresh = false
+        }
+        // Hold back a lead byte whose continuation bytes have not all arrived.
+        let end = bytes.length
+        for (let back = 1; back <= 3 && back <= end - start; back++) {
+            const b = bytes[end - back]
+            if ((b & 0xc0) === 0x80) continue
+            const need = b >= 0xf0 ? 4 : b >= 0xe0 ? 3 : b >= 0xc0 ? 2 : 1
+            if (need > back) end -= back
+            break
+        }
+        this.carry = bytes.slice(end)
+        return start < end ? utf8Decode(bytes.subarray(start, end)) : ''
     }
 }

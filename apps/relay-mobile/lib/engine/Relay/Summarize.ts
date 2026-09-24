@@ -17,11 +17,45 @@ export const summarizeReason = (): string | undefined => {
     return undefined
 }
 
+/** The summary that has the model now, and the number of the latest one asked for. */
+let current: { id: number; done: Promise<unknown> } | undefined
+let latest = 0
+
+/**
+ * True while a summary holds the local model. A chat started now would run on the same
+ * context mid-completion.
+ */
+export const summarizing = (): boolean => current !== undefined
+
 /**
  * Stream a summary of `terminalText` for the session `name`. Resolves with the full text;
- * `onToken` receives each piece as it arrives.
+ * `onToken` receives each piece as it arrives. One summary runs at a time: a new one stops
+ * the last and waits for the model to be free, and a run overtaken while it waited rejects
+ * with `superseded` without touching the model.
  */
 export const summarizeTerminal = async (
+    name: string,
+    terminalText: string,
+    onToken: (piece: string) => void
+): Promise<string> => {
+    const id = ++latest
+    while (current) {
+        const previous = current
+        await stopSummary().catch(() => {})
+        await previous.done.catch(() => {})
+        if (current === previous) current = undefined
+    }
+    if (id !== latest) throw new Error('superseded')
+    const done = run(name, terminalText, onToken)
+    current = { id: id, done: done }
+    try {
+        return await done
+    } finally {
+        if (current?.id === id) current = undefined
+    }
+}
+
+const run = async (
     name: string,
     terminalText: string,
     onToken: (piece: string) => void

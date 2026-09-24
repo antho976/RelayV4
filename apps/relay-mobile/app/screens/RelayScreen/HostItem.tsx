@@ -50,10 +50,13 @@ const HostItem: React.FC<HostItemProps> = ({ host }) => {
     const status = useRelayStore((state) => state.status)
     const hostId = useRelayStore((state) => state.hostId)
     const routeUrl = useRelayStore((state) => state.routeUrl)
+    const wanted = useRelayStore((state) => state.wanted)
     const { updateHost, removeHost, setActiveHost } = useRelayHostsStore()
     const addSheet = useBottomSheetRef()
     const connected = status === 'online' && hostId === host.id
     const connecting = status === 'connecting' && hostId === host.id
+    // Offline between attempts: the link is still wanted and will try again on its own.
+    const retrying = status === 'offline' && wanted && hostId === host.id
     const routes = routesOf(host)
     const hasTailnet = routes.some((route) => route.kind === 'tailscale')
 
@@ -162,11 +165,17 @@ const HostItem: React.FC<HostItemProps> = ({ host }) => {
                         {host.name}
                     </Text>
                     <Text style={styles.meta} numberOfLines={1}>
-                        {connected ? 'Connected' : connecting ? 'Connecting…' : 'Not connected'} ·{' '}
-                        {host.instance}
+                        {connected
+                            ? 'Connected'
+                            : connecting
+                              ? 'Connecting…'
+                              : retrying
+                                ? 'Retrying'
+                                : 'Not connected'}{' '}
+                        · {host.instance}
                     </Text>
                 </View>
-                {connected ? (
+                {connected || retrying ? (
                     <ThemedButton
                         label="Disconnect"
                         variant="secondary"

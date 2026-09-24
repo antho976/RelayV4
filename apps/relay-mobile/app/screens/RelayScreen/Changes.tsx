@@ -1,5 +1,5 @@
 import { useFocusEffect, useLocalSearchParams } from 'expo-router'
-import React, { useCallback, useState } from 'react'
+import React, { useCallback, useRef, useState } from 'react'
 import { RefreshControl, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native'
 import { SafeAreaView } from 'react-native-safe-area-context'
 
@@ -49,6 +49,8 @@ const ChangesScreen = () => {
     const [hunks, setHunks] = useState<Hunk[]>([])
     const [loading, setLoading] = useState(false)
     const [problem, setProblem] = useState('')
+    // The file whose diff is wanted now; an answer for any other tap is dropped.
+    const wanted = useRef<string | undefined>(undefined)
 
     // Only the scope matters here; the session object itself changes on every state flip.
     const projectId = session?.project_id
@@ -81,10 +83,12 @@ const ChangesScreen = () => {
     const show = async (file: DiffFile) => {
         if (!session) return
         if (selected === file.path) {
+            wanted.current = undefined
             setSelected(undefined)
             setHunks([])
             return
         }
+        wanted.current = file.path
         setSelected(file.path)
         setHunks([])
         if (file.binary) return
@@ -94,9 +98,9 @@ const ChangesScreen = () => {
                 worktree: session.worktree,
                 path: file.path,
             })
-            setHunks(result.hunks)
+            if (wanted.current === file.path) setHunks(result.hunks)
         } catch (e) {
-            setProblem(`${(e as Error).message}`)
+            if (wanted.current === file.path) setProblem(`${(e as Error).message}`)
         }
     }
 

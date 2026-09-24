@@ -16,7 +16,7 @@ import { activeHost, directRoutes, RelayHost, useRelayHostsStore } from '@lib/st
 
 import { attentionFromEvent, ensureNotifyPermission } from './Attention'
 import { PairLink } from './PairLink'
-import { decodeFrame } from './Terminal'
+import { base64Decode, Utf8Stream } from './Terminal'
 
 export type RelayStatus = 'offline' | 'connecting' | 'online'
 export type RelayTransport = 'direct' | 'via'
@@ -119,6 +119,9 @@ type Pending = {
 }
 
 type FrameListener = (frame: PtyFrame, text: string) => void
+
+/** One listener's own decoder: a character split across two frames is joined for it. */
+type Attachment = { decoder: Utf8Stream; epoch?: number }
 type EventListener = (event: BusEvent) => void
 
 type RelayState = {
@@ -169,125 +172,177 @@ const sha256 = (text: string) => Crypto.digestStringAsync(Crypto.CryptoDigestAlg
 /** The device name the PC shows in `relay remote devices`. */
 const deviceLabel = () => Device.deviceName || Device.modelName || 'Phone'
 
-/** Try a single WebSocket route: connect, take the greeting, answer it, wait for the verdict. */
+type Route = { url: string; transport: RelayTransport }
+
+type Greeting = { host: string; host_id: string; instance: string; version: string }
+
+/** A route whose PC has greeted: the socket is open and waits for the phone's hello. */
+type Greeted = { socket: WebSocket; greeting: Greeting; challenge: string; route: Route }
+
 type Opened = {
     socket: WebSocket
     welcome: { ok: boolean; device?: string; token?: string; error?: string }
-    greeting: { host: string; host_id: string; instance: string; version: string }
+    greeting: Greeting
 }
 
-const openRoute = (
-    url: string,
-    hello: (challenge: string) => Promise<Record<string, unknown>>,
-    onLine: (line: string) => void
-): Promise<Opened> =>
-    new Promise((resolve, reject) => {
-        let settled = false
-        let stage: 'greeting' | 'welcome' | 'open' = 'greeting'
-        let greeting: Opened['greeting'] | undefined
-        const socket = new WebSocket(url)
-        const fail = (reason: string) => {
-            if (settled) return
-            settled = true
-            clearTimeout(timer)
-            try {
-                socket.close()
-            } catch {}
-            reject(new Error(reason))
-        }
-        const timer = setTimeout(() => fail(`no answer from ${url}`), HANDSHAKE_TIMEOUT_MS)
-        socket.onerror = () => fail(`cannot reach ${url}`)
-        socket.onclose = () => {
-            if (stage !== 'open') fail(`closed by ${url}`)
-        }
-        socket.onmessage = async (message) => {
-            const line = typeof message.data === 'string' ? message.data : ''
-            if (stage === 'open') {
-                onLine(line)
-                return
-            }
-            let parsed: any
-            try {
-                parsed = JSON.parse(line)
-            } catch {
-                fail('the PC did not speak Relay')
-                return
-            }
-            if (stage === 'greeting') {
-                if (parsed?.relay !== 'remote' || typeof parsed.challenge !== 'string') {
-                    // A rendezvous with no host present answers with a verdict straight away.
-                    if (parsed?.ok === false) fail(String(parsed.error ?? 'refused'))
-                    else fail('the PC did not speak Relay')
-                    return
-                }
-                greeting = parsed
-                stage = 'welcome'
-                try {
-                    socket.send(JSON.stringify(await hello(parsed.challenge)))
-                } catch (e) {
-                    fail(`${e}`)
-                }
-                return
-            }
-            // welcome
-            if (settled) return
-            settled = true
-            clearTimeout(timer)
-            stage = 'open'
-            if (!parsed?.ok) {
-                try {
-                    socket.close()
-                } catch {}
-                reject(new Error(String(parsed?.error ?? 'refused')))
-                return
-            }
-            resolve({ socket: socket, welcome: parsed, greeting: greeting! })
-        }
+/**
+ * Sockets still in their handshake, each with the call that abandons it. Whoever starts a
+ * handshake registers it here, so a teardown can close every one of them at once.
+ */
+type Opening = Map<WebSocket, () => void>
+
+const closeQuietly = (socket: WebSocket) => {
+    socket.onopen = null
+    socket.onclose = null
+    socket.onerror = null
+    socket.onmessage = null
+    try {
+        socket.close()
+    } catch {}
+}
+
+/** Open one route and wait for the PC's greeting. Nothing of the phone's is sent yet. */
+const greetRoute = (route: Route, opening: Opening) => {
+    let settled = false
+    const socket = new WebSocket(route.url)
+    let resolve: (greeted: Greeted) => void = () => {}
+    let reject: (error: Error) => void = () => {}
+    const promise = new Promise<Greeted>((yes, no) => {
+        resolve = yes
+        reject = no
     })
+    const fail = (reason: string) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        opening.delete(socket)
+        closeQuietly(socket)
+        reject(new Error(reason))
+    }
+    const timer = setTimeout(() => fail(`no answer from ${route.url}`), HANDSHAKE_TIMEOUT_MS)
+    opening.set(socket, () => fail('cancelled'))
+    socket.onerror = () => fail(`cannot reach ${route.url}`)
+    socket.onclose = () => fail(`closed by ${route.url}`)
+    socket.onmessage = (message) => {
+        if (settled) return
+        let parsed: any
+        try {
+            parsed = JSON.parse(typeof message.data === 'string' ? message.data : '')
+        } catch {
+            fail('the PC did not speak Relay')
+            return
+        }
+        if (parsed?.relay !== 'remote' || typeof parsed.challenge !== 'string') {
+            // A rendezvous with no host present answers with a verdict straight away.
+            if (parsed?.ok === false) fail(String(parsed.error ?? 'refused'))
+            else fail('the PC did not speak Relay')
+            return
+        }
+        settled = true
+        clearTimeout(timer)
+        // Still in `opening`: `answer` takes it over, and a teardown before then closes it.
+        socket.onmessage = null
+        resolve({ socket: socket, greeting: parsed, challenge: parsed.challenge, route: route })
+    }
+    return { promise: promise, cancel: () => fail('cancelled') }
+}
 
 /**
- * Open the first route of a group that answers, closing the others. A PC lists every LAN
- * address it has, and a phone should not wait out a timeout on each in turn.
+ * Race the routes of a group to their greeting and keep the first; every other socket is
+ * closed at once, answered or not. A PC lists every LAN address it has, and a phone should
+ * not wait out a timeout on each in turn — but it answers on one of them only.
  */
-const openFirst = (
-    candidates: { url: string; transport: RelayTransport }[],
-    hello: (challenge: string) => Promise<Record<string, unknown>>,
-    onLine: (line: string) => void
-): Promise<{ opened: Opened; transport: RelayTransport; url: string }> =>
+const greetFirst = (routes: Route[], opening: Opening): Promise<Greeted> =>
     new Promise((resolve, reject) => {
-        if (candidates.length === 0) {
+        if (routes.length === 0) {
             reject(new Error('no route'))
             return
         }
         let settled = false
         let failures = 0
-        let lastError = new Error('no route')
-        for (const candidate of candidates) {
-            openRoute(candidate.url, hello, onLine)
-                .then((opened) => {
+        const attempts = routes.map((route) => {
+            try {
+                return greetRoute(route, opening)
+            } catch (e) {
+                // A malformed address throws in the WebSocket constructor.
+                return { promise: Promise.reject(e as Error), cancel: () => {} }
+            }
+        })
+        attempts.forEach((attempt) => {
+            attempt.promise
+                .then((greeted) => {
                     if (settled) {
-                        try {
-                            opened.socket.close()
-                        } catch {}
+                        opening.delete(greeted.socket)
+                        closeQuietly(greeted.socket)
                         return
                     }
                     settled = true
-                    resolve({ opened: opened, transport: candidate.transport, url: candidate.url })
+                    for (const other of attempts) if (other !== attempt) other.cancel()
+                    resolve(greeted)
                 })
                 .catch((e: Error) => {
-                    lastError = e
                     failures++
-                    // A refusal from the PC is final for the whole group: every address is
-                    // the same door, and the answer will not change on the next one.
-                    if (
-                        !settled &&
-                        (failures === candidates.length || /^(pair\.|auth\.)/.test(e.message))
-                    ) {
+                    if (!settled && failures === attempts.length) {
                         settled = true
-                        reject(lastError)
+                        reject(e)
                     }
                 })
+        })
+    })
+
+/** Send the hello on a greeted socket and wait for the verdict. */
+const answer = (
+    greeted: Greeted,
+    hello: (challenge: string) => Promise<Record<string, unknown>>,
+    opening: Opening
+): Promise<Opened> =>
+    new Promise((resolve, reject) => {
+        const { socket, route } = greeted
+        let settled = false
+        const fail = (reason: string) => {
+            if (settled) return
+            settled = true
+            clearTimeout(timer)
+            opening.delete(socket)
+            closeQuietly(socket)
+            reject(new Error(reason))
         }
+        const timer = setTimeout(() => fail(`no answer from ${route.url}`), HANDSHAKE_TIMEOUT_MS)
+        opening.set(socket, () => fail('cancelled'))
+        socket.onerror = () => fail(`cannot reach ${route.url}`)
+        socket.onclose = () => fail(`closed by ${route.url}`)
+        socket.onmessage = (message) => {
+            if (settled) return
+            let parsed: any
+            try {
+                parsed = JSON.parse(typeof message.data === 'string' ? message.data : '')
+            } catch {
+                fail('the PC did not speak Relay')
+                return
+            }
+            if (!parsed?.ok) {
+                fail(String(parsed?.error ?? 'refused'))
+                return
+            }
+            settled = true
+            clearTimeout(timer)
+            opening.delete(socket)
+            // The caller adopts the socket in the same turn and sets its own handlers; the
+            // PC sends nothing more until the phone asks.
+            socket.onmessage = null
+            socket.onclose = null
+            socket.onerror = null
+            resolve({ socket: socket, welcome: parsed, greeting: greeted.greeting })
+        }
+        if (socket.readyState !== WebSocket.OPEN) {
+            fail(`closed by ${route.url}`)
+            return
+        }
+        hello(greeted.challenge)
+            .then((line) => {
+                if (!settled) socket.send(JSON.stringify(line))
+            })
+            .catch((e) => fail(`${e}`))
     })
 
 const denialText = (code: string) => {
@@ -307,8 +362,10 @@ const denialText = (code: string) => {
 
 class RelayClient {
     private socket?: WebSocket
+    /** Sockets still in their handshake; a teardown closes them all. */
+    private opening: Opening = new Map()
     private pending = new Map<string, Pending>()
-    private frameListeners = new Map<string, Set<FrameListener>>()
+    private frameListeners = new Map<string, Map<FrameListener, Attachment>>()
     private eventListeners = new Set<EventListener>()
     private keepalive?: ReturnType<typeof setInterval>
     private generation = 0
@@ -316,6 +373,8 @@ class RelayClient {
     private wanted?: RelayHost
     private reconnectTimer?: ReturnType<typeof setTimeout>
     private reconnectDelay = RECONNECT_MIN_MS
+    /** The pairing in flight, so a second scan of the same code joins it instead of racing it. */
+    private pairing?: { code: string; promise: Promise<RelayHost> }
 
     constructor() {
         // A phone that comes back to the foreground reconnects at once instead of waiting
@@ -335,7 +394,9 @@ class RelayClient {
         const host =
             useRelayHostsStore.getState().hosts.find((item) => item.id === this.wanted?.id) ??
             this.wanted
-        this.connect(host, true).catch(() => this.scheduleReconnect())
+        // A failed attempt schedules the next one itself, and only while it is still the
+        // current one; a superseded attempt must not schedule anything.
+        this.connect(host, true).catch(() => {})
     }
 
     private scheduleReconnect() {
@@ -352,7 +413,7 @@ class RelayClient {
      * Route groups for a host, in the order they are tried: every LAN address at once, then
      * the server. A pinned route is its group alone.
      */
-    routeGroups(host: RelayHost): { url: string; transport: RelayTransport }[][] {
+    routeGroups(host: RelayHost): Route[][] {
         const direct = directRoutes(host).map((url) => ({
             url: url,
             transport: 'direct' as const,
@@ -367,9 +428,22 @@ class RelayClient {
 
     /**
      * Pair with a PC from a scanned or typed link. On success the host is stored and the
-     * connection stays open.
+     * connection stays open. A second call with the same code while the first is in flight
+     * gets the first one's answer; the code is single use and is sent once.
      */
-    async pair(link: PairLink): Promise<RelayHost> {
+    pair(link: PairLink): Promise<RelayHost> {
+        if (this.pairing) {
+            if (this.pairing.code === link.code) return this.pairing.promise
+            return Promise.reject(new Error('Already pairing with a PC; wait for it to finish.'))
+        }
+        const promise = this.pairOnce(link).finally(() => {
+            if (this.pairing?.promise === promise) this.pairing = undefined
+        })
+        this.pairing = { code: link.code, promise: promise }
+        return promise
+    }
+
+    private async pairOnce(link: PairLink): Promise<RelayHost> {
         this.disconnect()
         const generation = ++this.generation
         useRelayStore.setState({
@@ -378,6 +452,9 @@ class RelayClient {
             stopped: false,
             error: undefined,
             hostName: link.host,
+            // Whatever PC this turns out to be, the last one's lists are not its lists.
+            projects: [],
+            workspaces: [],
         })
         const groups = [
             link.direct.map((url) => ({ url: url, transport: 'direct' as const })),
@@ -385,42 +462,57 @@ class RelayClient {
         ].filter((group) => group.length > 0)
         let lastError = 'no route'
         for (const group of groups) {
+            // Routes race only to the greeting. The code then goes out on the one socket that
+            // won: the PC spends it on the first hello it reads, so a second route could only
+            // mint a second device or be told the code is wrong.
+            let greeted: Greeted
             try {
-                const { opened, transport, url } = await openFirst(
-                    group,
-                    async () => ({ v: 1, pair: link.code, device_name: deviceLabel() }),
-                    (line) => this.onLine(line)
-                )
-                if (generation !== this.generation) {
-                    opened.socket.close()
-                    throw new Error('cancelled')
-                }
-                const host: RelayHost = {
-                    id: opened.greeting.host_id || link.hostId || uuid(),
-                    name: opened.greeting.host || link.host,
-                    instance: opened.greeting.instance || link.instance,
-                    direct: link.direct,
-                    via: link.via,
-                    deviceId: opened.welcome.device!,
-                    token: opened.welcome.token!,
-                    route: 'auto',
-                    pairedAt: Date.now(),
-                    lastConnectedAt: Date.now(),
-                    lastTransport: transport,
-                }
-                useRelayHostsStore.getState().addHost(host)
-                // A freshly paired PC is one the person wants to stay connected to.
-                this.wanted = host
-                this.reconnectDelay = RECONNECT_MIN_MS
-                this.adopt(opened, host, transport, url)
-                return host
+                greeted = await greetFirst(group, this.opening)
             } catch (e) {
-                lastError = denialText(`${(e as Error).message}`)
-                // A wrong code is final; a route that cannot be reached is not. A newer
-                // connect owns the store now, so a superseded pairing says nothing.
                 if (generation !== this.generation) throw new Error('cancelled')
-                if (/pair\.|expired/.test(lastError)) break
+                lastError = denialText(`${(e as Error).message}`)
+                continue
             }
+            let opened: Opened
+            try {
+                opened = await answer(
+                    greeted,
+                    async () => ({ v: 1, pair: link.code, device_name: deviceLabel() }),
+                    this.opening
+                )
+            } catch (e) {
+                if (generation !== this.generation) throw new Error('cancelled')
+                // Once the code is sent it may be spent, whatever went wrong after; trying it
+                // on another route would only be refused.
+                lastError = denialText(`${(e as Error).message}`)
+                break
+            }
+            const transport = greeted.route.transport
+            const host: RelayHost = {
+                id: opened.greeting.host_id || link.hostId || uuid(),
+                name: opened.greeting.host || link.host,
+                instance: opened.greeting.instance || link.instance,
+                direct: link.direct,
+                via: link.via,
+                deviceId: opened.welcome.device!,
+                token: opened.welcome.token!,
+                route: 'auto',
+                pairedAt: Date.now(),
+                lastConnectedAt: Date.now(),
+                lastTransport: transport,
+            }
+            // The PC has minted this device; keeping the credential costs nothing, even when a
+            // newer connect superseded this pairing.
+            useRelayHostsStore.getState().addHost(host)
+            if (generation !== this.generation) {
+                closeQuietly(opened.socket)
+                throw new Error('cancelled')
+            }
+            // A freshly paired PC is one the person wants to stay connected to.
+            this.wanted = host
+            this.reconnectDelay = RECONNECT_MIN_MS
+            this.adopt(opened, host, transport, greeted.route.url)
+            return host
         }
         useRelayStore.setState({ status: 'offline', wanted: false, error: lastError })
         throw new Error(lastError)
@@ -436,6 +528,7 @@ class RelayClient {
         this.wanted = host
         if (!retrying) this.reconnectDelay = RECONNECT_MIN_MS
         const generation = ++this.generation
+        const previous = useRelayStore.getState().hostId
         useRelayStore.setState({
             status: 'connecting',
             wanted: true,
@@ -443,43 +536,55 @@ class RelayClient {
             error: undefined,
             hostId: host.id,
             hostName: host.name,
+            // Another PC's projects must not stay listed while this one is unreachable.
+            ...(previous !== host.id ? { projects: [], workspaces: [] } : {}),
         })
         const groups = this.routeGroups(host)
         let lastError = 'This PC has no address to connect to; pair it again or add one'
         if (groups.length === 0) this.wanted = undefined
         for (const group of groups) {
+            let greeted: Greeted
+            let opened: Opened
             try {
-                const { opened, transport, url } = await openFirst(
-                    group,
+                // One socket answers: the others are closed as soon as one greets, so the
+                // proof is not sent on every route in parallel.
+                greeted = await greetFirst(group, this.opening)
+                opened = await answer(
+                    greeted,
                     async (challenge) => ({
                         v: 1,
                         device: host.deviceId,
                         proof: await sha256(`${challenge}:${host.token}`),
                     }),
-                    (line) => this.onLine(line)
+                    this.opening
                 )
-                if (generation !== this.generation) {
-                    opened.socket.close()
-                    return
-                }
-                useRelayHostsStore.getState().updateHost(host.id, {
-                    name: opened.greeting.host || host.name,
-                    instance: opened.greeting.instance || host.instance,
-                    lastConnectedAt: Date.now(),
-                    lastTransport: transport,
-                })
-                this.adopt(opened, host, transport, url)
-                this.reconnectDelay = RECONNECT_MIN_MS
-                await this.refresh()
-                return
             } catch (e) {
+                // A newer connect or a disconnect closed this attempt; it has nothing to say.
+                if (generation !== this.generation) return
                 lastError = denialText(`${(e as Error).message}`)
                 // A revoked or broken credential is final; keep retrying anything else.
                 if (/paired|credential/.test(lastError)) {
                     this.wanted = undefined
                     break
                 }
+                continue
             }
+            if (generation !== this.generation) {
+                closeQuietly(opened.socket)
+                return
+            }
+            const transport = greeted.route.transport
+            useRelayHostsStore.getState().updateHost(host.id, {
+                name: opened.greeting.host || host.name,
+                instance: opened.greeting.instance || host.instance,
+                lastConnectedAt: Date.now(),
+                lastTransport: transport,
+            })
+            this.adopt(opened, host, transport, greeted.route.url)
+            // The link is up; a refresh that fails is a failed request, not a failed route.
+            // A link that is really gone reports itself through the socket closing.
+            await this.refresh().catch((e) => Logger.warn(`Relay: refresh failed: ${e}`))
+            return
         }
         if (generation === this.generation) {
             useRelayStore.setState({
@@ -505,6 +610,10 @@ class RelayClient {
         this.generation++
         if (this.keepalive) clearInterval(this.keepalive)
         this.keepalive = undefined
+        // Handshakes still in flight are abandoned: their sockets close now, not whenever
+        // the PC or a timeout gets to them.
+        for (const cancel of [...this.opening.values()]) cancel()
+        this.opening.clear()
         const socket = this.socket
         this.socket = undefined
         for (const [, pending] of this.pending) {
@@ -513,14 +622,7 @@ class RelayClient {
         }
         this.pending.clear()
         this.frameListeners.clear()
-        if (socket) {
-            socket.onclose = null
-            socket.onerror = null
-            socket.onmessage = null
-            try {
-                socket.close()
-            } catch {}
-        }
+        if (socket) closeQuietly(socket)
         useRelayStore.setState({
             status: 'offline',
             transport: undefined,
@@ -533,12 +635,19 @@ class RelayClient {
     }
 
     private adopt(opened: Opened, host: RelayHost, transport: RelayTransport, url: string) {
-        const generation = this.generation
-        this.socket = opened.socket
-        opened.socket.onclose = () => {
-            if (generation !== this.generation) return
+        const socket = opened.socket
+        if (this.keepalive) clearInterval(this.keepalive)
+        this.keepalive = undefined
+        this.socket = socket
+        socket.onmessage = (message) =>
+            this.onLine(typeof message.data === 'string' ? message.data : '')
+        const lost = () => {
+            // Only the live socket speaks for the link: an orphan from an earlier attempt
+            // going away changes nothing.
+            if (this.socket !== socket) return
             this.socket = undefined
             if (this.keepalive) clearInterval(this.keepalive)
+            this.keepalive = undefined
             for (const [, pending] of this.pending) {
                 clearTimeout(pending.timer)
                 pending.reject(new Error('connection closed'))
@@ -552,7 +661,8 @@ class RelayClient {
             })
             if (this.wanted) this.scheduleReconnect()
         }
-        opened.socket.onerror = () => {}
+        socket.onclose = lost
+        socket.onerror = () => {}
         useRelayStore.setState({
             status: 'online',
             transport: transport,
@@ -564,9 +674,13 @@ class RelayClient {
         })
         this.keepalive = setInterval(() => {
             // A ping that times out means the socket is dead without saying so (a NAT that
-            // dropped the flow); closing it hands the drop to the reconnect path.
+            // dropped the flow). Its close event may never come, so the drop is handled here.
             this.request('bus.ping', {}).catch((e: Error) => {
-                if (/timed out/.test(e.message)) opened.socket.close()
+                if (!/timed out/.test(e.message) || this.socket !== socket) return
+                try {
+                    socket.close()
+                } catch {}
+                lost()
             })
         }, KEEPALIVE_MS)
         ensureNotifyPermission()
@@ -589,8 +703,20 @@ class RelayClient {
             if (frame.stream === 'pty' && frame.session) {
                 const listeners = this.frameListeners.get(frame.session)
                 if (listeners && listeners.size > 0) {
-                    const text = decodeFrame(String(frame.data ?? ''))
-                    for (const listener of listeners) listener(frame, text)
+                    let bytes: Uint8Array
+                    try {
+                        bytes = base64Decode(String(frame.data ?? ''))
+                    } catch {
+                        return
+                    }
+                    for (const [listener, attachment] of listeners) {
+                        // A new epoch is a new process, and its bytes a new stream.
+                        if (attachment.epoch !== frame.epoch) {
+                            if (attachment.epoch !== undefined) attachment.decoder.reset()
+                            attachment.epoch = frame.epoch
+                        }
+                        listener(frame, attachment.decoder.decode(bytes))
+                    }
                 }
             }
             return
@@ -607,6 +733,10 @@ class RelayClient {
             if (pending) {
                 this.pending.delete(response.id)
                 clearTimeout(pending.timer)
+                // An answer from the engine proves the link, not just the handshake: only
+                // now does the backoff start over. A door whose engine is down greets and
+                // then closes, and that should back off like any other failure.
+                this.reconnectDelay = RECONNECT_MIN_MS
                 pending.resolve(response)
             }
         }
@@ -677,10 +807,10 @@ class RelayClient {
     ): Promise<() => void> {
         let listeners = this.frameListeners.get(session)
         if (!listeners) {
-            listeners = new Set()
+            listeners = new Map()
             this.frameListeners.set(session, listeners)
         }
-        listeners.add(listener)
+        listeners.set(listener, { decoder: new Utf8Stream(), epoch: from?.epoch })
         const payload: Record<string, unknown> = { session }
         if (from) {
             payload.epoch = from.epoch

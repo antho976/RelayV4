@@ -78,13 +78,14 @@ const TerminalScreen = () => {
     }, [keepOn])
 
     // A session that was just launched has no PTY until it is running; the state change
-    // re-runs this and attaches then.
-    // A boolean, not the state itself: idle/running flips must not rebuild the screen.
-    const sessionState = session?.state
-    const hasPty = sessionState !== 'created' && sessionState !== 'spawning'
+    // re-runs this and attaches then. Park then Wake or Resume starts a new process under
+    // the same name, so the pid is a dependency too: the view re-attaches to the new PTY.
+    // Not the state itself: idle/running flips must not rebuild the screen.
+    const launched = !!session && session.state !== 'created'
+    const pid = session?.pid ?? null
     useEffect(() => {
         if (!name || status !== 'online') return
-        if (!hasPty) return
+        if (!launched) return
         let detach: (() => void) | undefined
         let cancelled = false
         const timer = setInterval(() => {
@@ -125,7 +126,7 @@ const TerminalScreen = () => {
             detach?.()
             setAttached(false)
         }
-    }, [name, status, hasPty])
+    }, [name, status, launched, pid])
 
     const send = useCallback(
         (data: string) => {
