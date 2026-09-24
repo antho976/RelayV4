@@ -1,5 +1,3 @@
-import { getThreads } from '@vali98/react-native-cpu-info'
-import { setTextIntentEnabled, useTextIntentOnForeground } from '@vali98/react-native-process-text'
 import { DeviceType, getDeviceTypeAsync } from 'expo-device'
 import { Directory, File, Paths } from 'expo-file-system'
 import * as KeepAwake from 'expo-keep-awake'
@@ -19,6 +17,11 @@ import { useTTSStore } from '@lib/state/TTS'
 
 import { AppDirectory, listFiles, makeDirectory } from './File'
 import { lockScreenOrientation } from './Screen'
+import {
+    availableThreads,
+    setProcessTextEnabled,
+    useProcessTextOnForeground,
+} from '../../modules/relay-device'
 import { AppSettings, AppSettingsDefault, Global } from '../constants/GlobalValues'
 import { Llama } from '../engine/Local/LlamaLocal'
 import { Characters } from '../state/Characters'
@@ -44,13 +47,12 @@ export const loadChatOnInit = async () => {
 }
 
 export const useTextIntentFocus = () => {
-    return useTextIntentOnForeground(async (text) => {
-        if (!text) return
+    return useProcessTextOnForeground(async (text) => {
         useChatInputTextStore.getState().setText(text)
         if (router.canDismiss()) router.dismissAll()
         router.push('/screens/ChatScreen')
         await loadNewestChat()
-    }, [])
+    })
 }
 
 const setAppDefaultSettings = () => {
@@ -182,7 +184,9 @@ const migrateAppMode_0_8_5_to_0_8_6 = () => {
 const migrateTextIntent_0_8_8_to_0_8_9 = () => {
     if (!mmkv.getBoolean(Global.InstallTextIntentDisable)) {
         mmkv.set(Global.InstallTextIntentDisable, true)
-        setTextIntentEnabled(false)
+        // The relay-device alias already starts disabled, so this only pins that choice. Whether
+        // the old package's menu entry was switched on cannot be known, so it is not carried over.
+        setProcessTextEnabled(false).catch(Logger.warn)
     }
 }
 
@@ -238,7 +242,7 @@ const setCPUThreads = () => {
     if (threads) return
     let newThreads = 8
     try {
-        newThreads = getThreads()
+        newThreads = availableThreads()
     } catch (e) {
         Logger.error('Failed to set CPU Threads: ' + e)
     }

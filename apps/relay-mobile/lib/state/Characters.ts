@@ -1,4 +1,3 @@
-import { extractPngTextChunk, replacePngTextChunk } from '@vali98/react-native-png-utils'
 import { and, asc, desc, eq, gte, inArray, like, notExists, notInArray, sql } from 'drizzle-orm'
 import { Asset } from 'expo-asset'
 import * as DocumentPicker from 'expo-document-picker'
@@ -29,8 +28,10 @@ import {
     saveStringToDownload,
 } from '@lib/utils/File'
 import { replaceMacroBase } from '@lib/utils/Macros'
+import { isPngError, readPngText, writePngText } from '@lib/utils/Png'
 
 import { Logger } from './Logger'
+import { convertImageToPng } from '../../modules/relay-device'
 import { createMMKVStorage } from '../storage/MMKV'
 
 export type CharInfo = {
@@ -858,8 +859,10 @@ export namespace Characters {
                 Logger.errorToast(t('character.editor.errors.createFromImage'))
                 return
             }
-            const chunks = extractPngTextChunk(file, {
+            // cards from other tools sometimes carry stale CRCs, which the old reader ignored too
+            const chunks = readPngText(file, {
                 keywords: CHARACTER_CARD_TEXT_CHUNK_KEYWORDS,
+                crc: 'ignore',
             })
             // a V3 card also carries a V2 copy in `chara`, which every reader understands
             const result =
@@ -872,7 +875,7 @@ export namespace Characters {
                 return
             }
 
-            const card = JSON.parse(result.data)
+            const card = JSON.parse(result.text)
             if (card === undefined) {
                 Logger.errorToast(t('character.editor.errors.cardNoCharacter'))
                 return
@@ -952,16 +955,37 @@ export namespace Characters {
 
         const imagePath = getImageDir(dbcard.image_id)
         if (fileExists(imagePath)) {
-            const fileData = await readBase64Async(imagePath)
-            if (!fileData) return
-            const exportData = replacePngTextChunk(
-                fileData,
-                [{ data: cardString, keyword: 'chara', b64encode: true }],
-                { removeKeywords: CHARACTER_CARD_TEXT_CHUNK_KEYWORDS }
-            )
+            const exportData = await writeCardImage(imagePath, cardString)
+            if (!exportData) return
             await saveStringToDownload(exportData, exportedFileName + '.png', 'base64')
         } else {
             await saveStringToDownload(cardString, exportedFileName + '.json', 'utf8')
+        }
+    }
+
+    /** The card image with `chara` rewritten; a non-PNG avatar is converted to PNG first. */
+    const writeCardImage = async (imagePath: string, cardString: string) => {
+        const write = (png: string) =>
+            writePngText(
+                png,
+                { keyword: 'chara', text: cardString, base64: true },
+                // damaged metadata is dropped rather than re-signed; damaged pixels still fail
+                { removeKeywords: CHARACTER_CARD_TEXT_CHUNK_KEYWORDS, crc: 'drop-ancillary' }
+            )
+        const fileData = await readBase64Async(imagePath)
+        if (!fileData) return
+        try {
+            return write(fileData)
+        } catch (e) {
+            if (!isPngError(e, 'NOT_PNG')) throw e
+        }
+        const converted = `${Paths.cache.uri}card-export.png`
+        try {
+            await convertImageToPng(imagePath, converted)
+            const pngData = await readBase64Async(converted)
+            return pngData ? write(pngData) : undefined
+        } finally {
+            deleteFile(converted)
         }
     }
 

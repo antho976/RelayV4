@@ -1,4 +1,3 @@
-import { closeFd, getContentFd } from '@vali98/react-native-fs'
 import {
     CompletionParams,
     ContextParams,
@@ -16,6 +15,7 @@ import { AppDirectory, fileExists, readableFileSize, writeBase64File } from '@li
 
 import { checkGGMLDeprecated } from './GGML'
 import { KV, Model } from './Model'
+import * as RelayDevice from '../../../modules/relay-device'
 import { AppSettings } from '../../constants/GlobalValues'
 import { Logger } from '../../state/Logger'
 import { createMMKVStorage, mmkv } from '../../storage/MMKV'
@@ -237,7 +237,7 @@ export namespace Llama {
             }
 
             const previousFd = get().mmprojFd
-            if (previousFd) closeFd(previousFd).catch(Logger.error)
+            if (previousFd) RelayDevice.closeContentFd(previousFd)
             set({
                 mmproj: model,
                 mmprojFd: model_path !== model.file_path ? model_path : undefined,
@@ -255,8 +255,8 @@ export namespace Llama {
 
             await get().context?.release()
             const { modelFd, mmprojFd } = get()
-            if (modelFd) closeFd(modelFd).catch(Logger.error)
-            if (mmprojFd) closeFd(mmprojFd).catch(Logger.error)
+            if (modelFd) RelayDevice.closeContentFd(modelFd)
+            if (mmprojFd) RelayDevice.closeContentFd(mmprojFd)
             set({
                 context: undefined,
                 model: undefined,
@@ -274,7 +274,7 @@ export namespace Llama {
                     Logger.errorToast(t('model.toast.failedToUnloadMMPROJ'), e)
                 })
             const mmprojFd = get().mmprojFd
-            if (mmprojFd) closeFd(mmprojFd).catch(Logger.error)
+            if (mmprojFd) RelayDevice.closeContentFd(mmprojFd)
             set({
                 mmproj: undefined,
                 mmprojFd: undefined,
@@ -377,15 +377,19 @@ export namespace Llama {
         },
     }))
 
-    /** A model picked from shared storage is opened as a descriptor path; others load as they are. */
+    /**
+     * A model picked from shared storage is opened as a descriptor and passed as its bare number:
+     * cui-llama.rn's model loader (lm_ggml_fopen) and projector loader (clip_model_loader) both
+     * treat a slash-free, all-digit path as a descriptor. Other models load by path.
+     */
     const openContentFd = async (file_path: string) => {
-        if (!file_path.includes('content://')) return file_path
-        return (await getContentFd(file_path)) ?? file_path
+        if (!file_path.startsWith('content://')) return file_path
+        return String((await RelayDevice.openContentFd(file_path)).fd)
     }
 
     const closeContentFd = (file_path: string, loadable_path: string) => {
         if (loadable_path === file_path) return
-        closeFd(loadable_path).catch(Logger.error)
+        RelayDevice.closeContentFd(loadable_path)
     }
 
     const textTimings = (timings: CompletionTimings) => {

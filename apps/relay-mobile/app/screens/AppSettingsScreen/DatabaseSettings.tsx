@@ -1,4 +1,3 @@
-import { localDownload } from '@vali98/react-native-fs'
 import { reloadAppAsync } from 'expo'
 import { getDocumentAsync } from 'expo-document-picker'
 import { File, Paths } from 'expo-file-system'
@@ -14,6 +13,8 @@ import { migrateData } from '@db/dataMigrations'
 import { sqliteDB } from '@db/db'
 import { Logger } from '@lib/state/Logger'
 import { Theme } from '@lib/theme/ThemeManager'
+
+import { saveToDownloads } from '../../../modules/relay-device'
 
 const appVersion = appConfig.expo.version
 
@@ -59,7 +60,7 @@ const DatabaseSettings = () => {
             // a consistent copy that includes what is still in the WAL
             // eslint-disable-next-line i18next/no-literal-string
             await sqliteDB.execAsync(`VACUUM INTO '${toPath(backup.uri)}'`)
-            await localDownload(toPath(backup.uri))
+            await saveToDownloads(toPath(backup.uri))
             if (notify) Logger.infoToast(t('settings.database.toast.downloadOk'))
             return true
         } catch (e) {

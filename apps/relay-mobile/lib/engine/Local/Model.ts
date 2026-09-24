@@ -1,9 +1,3 @@
-import {
-    closeFd,
-    copyFileSAF,
-    getContentFd,
-    persistContentPermission,
-} from '@vali98/react-native-fs'
 import { loadLlamaModelInfo } from 'cui-llama.rn'
 import { eq, inArray, notInArray } from 'drizzle-orm'
 import { getDocumentAsync } from 'expo-document-picker'
@@ -30,6 +24,12 @@ import {
 } from '@lib/utils/File'
 
 import { GGMLNameMap, GGMLType } from './GGML'
+import {
+    closeContentFd,
+    copyContentToFile,
+    openContentFd,
+    persistContentPermission,
+} from '../../../modules/relay-device'
 
 export type ModelData = Omit<ModelDataType, 'id' | 'create_date' | 'last_modified'>
 export type ModelListQueryType = Omit<
@@ -74,7 +74,7 @@ export namespace Model {
             let success = false
 
             if (file.uri.startsWith('content://') && Platform.OS === 'android') {
-                await copyFileSAF(file.uri, newdir.replace('file://', ''))
+                await copyContentToFile(file.uri, newdir.replace('file://', ''))
                     .then(() => {
                         success = true
                     })
@@ -111,7 +111,7 @@ export namespace Model {
             }
 
             if (await createModelDataExternal(file.uri, file.name)) {
-                persistContentPermission(file.uri)
+                persistContentPermission(file.uri).catch(Logger.warn)
                 Logger.infoToast(t('model.toast.modelImportedSuccessfully'))
             }
         })
@@ -254,11 +254,12 @@ export namespace Model {
 
             Logger.info(t('model.magic', magicInfo))
 
-            if (loadable_path.includes('content://'))
-                loadable_path = (await getContentFd(loadable_path)) ?? loadable_path
+            // a bare descriptor number, which cui-llama.rn's loader accepts as a path
+            if (loadable_path.startsWith('content://'))
+                loadable_path = String((await openContentFd(loadable_path)).fd)
 
             const modelInfo: any = await loadLlamaModelInfo(loadable_path).finally(() => {
-                if (loadable_path !== file_path) closeFd(loadable_path).catch(Logger.error)
+                if (loadable_path !== file_path) closeContentFd(loadable_path)
             })
             let fileSize = 0
             const fileResult = fileInfo(file_path)

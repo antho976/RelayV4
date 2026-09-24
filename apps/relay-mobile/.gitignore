@@ -6,12 +6,13 @@ node_modules*
 # dev items
 public/
 
-# builds
-android
+# builds (anchored: local Expo modules keep their own android/ sources)
+/android
 eas.json
 *.apk
 .gradle
-ios
+/ios
+modules/*/android/build/
 
 # Expo
 .expo/

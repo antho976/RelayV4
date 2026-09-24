@@ -1,7 +1,7 @@
-import { localDownload } from '@vali98/react-native-fs'
 import { getDocumentAsync } from 'expo-document-picker'
 import { Directory, File, FileMode, Paths } from 'expo-file-system'
 
+import { saveToDownloads } from '../../modules/relay-device'
 import { Logger } from '../state/Logger'
 
 export const AppDirectory = {
@@ -25,7 +25,7 @@ export namespace FileUtils {
         encoding: 'base64' | `utf8`
     ) => {
         new File(Paths.cache, filename).write(data, { encoding })
-        await localDownload((Paths.cache.uri + filename).replace('file://', '')).catch((e) =>
+        await saveToDownloads((Paths.cache.uri + filename).replace('file://', '')).catch((e) =>
             Logger.error('Failed to download: ' + e)
         )
     }
@@ -70,7 +70,7 @@ export const saveStringToDownload = async (
     encoding: 'base64' | `utf8`
 ) => {
     new File(Paths.cache, filename).write(data, { encoding })
-    await localDownload((Paths.cache.uri + filename).replace('file://', '')).catch((e) =>
+    await saveToDownloads((Paths.cache.uri + filename).replace('file://', '')).catch((e) =>
         Logger.error('Failed to download: ' + e)
     )
 }

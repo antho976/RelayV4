@@ -80,7 +80,7 @@ module.exports = {
                     'android:largeHeap': true,
                 },
             ],
-            ['@vali98/react-native-process-text', { label: 'Ask in Relay' }],
+            ['./modules/relay-device/app.plugin.js', { label: 'Ask in Relay' }],
             [
                 'expo-camera',
                 {
