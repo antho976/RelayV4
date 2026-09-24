@@ -61,6 +61,9 @@ const BottomSheet = forwardRef<BottomSheetRefFunctions, BottomSheetProps>(
             onClose?.()
         }, [onClose, setVisible, setContentVisible])
 
+        // back and the backdrop both let the owner intercept, e.g. to ask about unsaved changes
+        const requestClose = () => (onRequestClose ? onRequestClose(handleClose) : handleClose())
+
         const open = useCallback(() => {
             setVisible(true)
             setContentVisible(true)
@@ -80,13 +83,7 @@ const BottomSheet = forwardRef<BottomSheetRefFunctions, BottomSheetProps>(
                 transparent
                 statusBarTranslucent
                 navigationBarTranslucent
-                onRequestClose={() => {
-                    if (onRequestClose) {
-                        onRequestClose(handleClose)
-                        return
-                    }
-                    handleClose()
-                }}
+                onRequestClose={requestClose}
                 style={{
                     flex: 1,
                 }}
@@ -97,7 +94,7 @@ const BottomSheet = forwardRef<BottomSheetRefFunctions, BottomSheetProps>(
                         style={[animatedStyle]}
                         entering={SlideInDown}
                         exiting={SlideOutDown}>
-                        <FadeBackrop handleOverlayClick={handleClose} />
+                        <FadeBackrop handleOverlayClick={requestClose} />
                         <View
                             style={[
                                 {

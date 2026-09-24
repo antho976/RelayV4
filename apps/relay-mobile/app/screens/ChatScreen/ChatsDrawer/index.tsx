@@ -1,6 +1,6 @@
 import { FlashList } from '@shopify/flash-list'
 import { authenticateAsync } from 'expo-local-authentication'
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { StyleSheet, Text, View } from 'react-native'
 import { useMMKVBoolean } from 'react-native-mmkv'
@@ -63,24 +63,33 @@ const ChatsDrawer = () => {
     const [showSearchResults, setShowSearchResults] = useState(false)
     const [searchQuery, setSearchQuery] = useState('')
 
-    const handleLoadChat = async (chatId: number) => {
-        await setId(chatId)
+    // a search hit passes its entry so the chat window scrolls to it
+    const handleLoadChat = async (chatId: number, entryId?: number) => {
+        await setId(chatId, entryId)
         setShowDrawer(false)
     }
 
-    const search = useDebounce(async (query: string, charId?: number) => {
-        if (!charId || !query) return
+    // only the newest search may set results, so a slow query cannot overwrite a newer one
+    const searchRequest = useRef(0)
+    const search = useDebounce(async (query: string, charId: number, request: number) => {
         const results = await Chats.db.query.searchChat(query, charId).catch((e) => {
             Logger.error(t('chat.drawer.search.errors.queryFailed', { error: String(e) }))
             return []
         })
+        if (request !== searchRequest.current) return
         setSearchResults(results.sort((a, b) => b.sendDate.getTime() - a.sendDate.getTime()))
         setShowSearchResults(true)
     }, 500)
 
     const setSearch = (query: string) => {
         setSearchQuery(query)
-        search(query, charId)
+        const request = ++searchRequest.current
+        if (!query || charId < 0) {
+            setSearchResults([])
+            setShowSearchResults(false)
+            return
+        }
+        search(query, charId, request)
     }
 
     const handleCreateChat = async (ghost: boolean = false) => {

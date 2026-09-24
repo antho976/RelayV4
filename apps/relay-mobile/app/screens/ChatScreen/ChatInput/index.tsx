@@ -98,7 +98,8 @@ const ChatInput = () => {
 
     const handleSend = async () => {
         Keyboard.dismiss()
-        if (!chatId) return
+        // send-on-enter reaches here even while a reply is streaming
+        if (!chatId || disableSend || useInference.getState().nowGenerating) return
         setDisableSend(true)
         if (newMessage.trim() !== '' || attachments.length > 0)
             Chats.db.mutate.createEntry(
@@ -187,9 +188,9 @@ const ChatInput = () => {
             .map((item) => ({
                 uri: item.uri,
                 type: 'image',
-                name: item.fileName,
+                name: item.fileName ?? item.uri,
             }))
-            .filter((item) => !attachments.some((a) => a.name === item.name)) as Attachment[]
+            .filter((item) => !attachments.some((a) => a.uri === item.uri)) as Attachment[]
 
         return setAttachments([...attachments, ...newAttachments])
     }
@@ -261,6 +262,7 @@ const ChatInput = () => {
                             <ThemedButton
                                 iconName="close"
                                 iconSize={20}
+                                accessibilityLabel={t('chat.input.a11y.removeAttachment')}
                                 buttonStyle={{
                                     borderWidth: 0,
                                     paddingHorizontal: 2,
@@ -375,6 +377,7 @@ const ChatInput = () => {
                                 }}
                                 variant="tertiary"
                                 iconName="right"
+                                accessibilityLabel={t('chat.input.a11y.showOptions')}
                                 onPress={() => setHideOptions(false)}
                             />
                         </Animated.View>
@@ -420,6 +423,9 @@ const ChatInput = () => {
                     <Animated.View layout={XAxisOnlyTransition} entering={FadeIn} exiting={FadeOut}>
                         <TouchableOpacity
                             disabled={!chatId}
+                            accessibilityRole="button"
+                            accessibilityLabel={t('chat.input.a11y.continue')}
+                            accessibilityHint={t('chat.input.a11y.continueHint')}
                             style={{
                                 borderRadius: 999,
                                 backgroundColor: color.neutral._200,
@@ -435,6 +441,10 @@ const ChatInput = () => {
                 <Animated.View layout={XAxisOnlyTransition}>
                     <TouchableOpacity
                         disabled={disableSend || !chatId || !activeProvider}
+                        accessibilityRole="button"
+                        accessibilityLabel={
+                            nowGenerating ? t('chat.input.a11y.stop') : t('chat.input.a11y.send')
+                        }
                         style={{
                             borderRadius: 999,
                             backgroundColor: !activeProvider

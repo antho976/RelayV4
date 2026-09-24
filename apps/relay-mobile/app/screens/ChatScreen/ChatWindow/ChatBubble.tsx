@@ -46,7 +46,7 @@ const ChatBubble: React.FC<ChatTextProps> = ({
         if (!nowGenerating) showEditor(entry.id)
     }
 
-    const swipe = entry.swipes[0]
+    const swipe = entry?.swipes[0]
     if (!entry || !swipe) return
 
     const showSwipe = !entry.is_user && isLastMessage

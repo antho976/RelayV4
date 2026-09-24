@@ -52,16 +52,19 @@ export const useLiveQueryJoined = <
         sync?: boolean
     } = {}
 ) => {
-    const data = useRef<Awaited<T>>(
-        //@ts-expect-error
-        (options?.sync && query.sync
-            ? //@ts-expect-error sync not found
-              query.sync()
-            : //@ts-expect-error
-              is(query, SQLiteRelationalQuery) && query.mode === 'first'
-              ? undefined
-              : []) as Awaited<T>
+    // a lazy initializer: an argument to useRef would run the sync query on every render
+    const [initialData] = useState(
+        () =>
+            //@ts-expect-error
+            (options?.sync && query.sync
+                ? //@ts-expect-error sync not found
+                  query.sync()
+                : //@ts-expect-error
+                  is(query, SQLiteRelationalQuery) && query.mode === 'first'
+                  ? undefined
+                  : []) as Awaited<T>
     )
+    const data = useRef<Awaited<T>>(initialData)
     const [error, setError] = useState<Error>()
     const [updatedAt, setUpdatedAt] = useState<Date>()
 

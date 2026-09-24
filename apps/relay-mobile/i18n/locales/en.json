@@ -268,6 +268,15 @@
             }
         },
         "input": {
+            "a11y": {
+                "continue": "Continue",
+                "continueHint": "Lets the character reply. Long press to extend the last reply.",
+                "jumpToLatest": "Jump to latest message",
+                "removeAttachment": "Remove attachment",
+                "send": "Send message",
+                "showOptions": "Show options",
+                "stop": "Stop generating"
+            },
             "actions": {
                 "addImage": "Add Image",
                 "authorNotes": "Author Notes",
@@ -282,12 +291,19 @@
             },
             "errors": {
                 "abortGeneration": "Aborting Generation",
+                "cameraPermission": "Camera access is required to take a picture",
+                "captureFailed": "Failed to take picture",
                 "failedToSend": "Failed to send message",
                 "permissionDescription": "Media access required for adding attachments"
             },
             "message": "Message...",
             "noConnection": "No Connection Enabled",
             "noModelLoaded": "No Model Loaded"
+        },
+        "markdown": {
+            "blockedImage": "Image not shown: {{url}}",
+            "linkFailed": "Could not open link",
+            "loadImage": "Tap to load image from {{url}}"
         },
         "model": {
             "noModelLoaded": "No Model Loaded"
@@ -365,6 +381,7 @@
     "common": {
         "actions": {
             "cancel": "Cancel",
+            "clear": "Clear",
             "clone": "Clone",
             "close": "Close",
             "create": "Create",
@@ -376,6 +393,7 @@
             "export": "Export",
             "link": "Link",
             "more": "More",
+            "paste": "Paste",
             "rename": "Rename",
             "reset": "Reset",
             "save": "Save",
@@ -481,6 +499,7 @@
             "delete": {
                 "confirm": "Delete Template",
                 "description": "Are you sure you want to delete '{{name}}'?",
+                "inUse": "'{{name}}' is used by: {{connections}}. Delete those connections or change their template first.",
                 "title": "Delete Template"
             },
             "empty": "No Custom Templates Added",
@@ -727,6 +746,7 @@
             "contextlength": "Context Length",
             "file": "File",
             "invalid": "Model is Invalid",
+            "nameEmpty": "Name cannot be empty",
             "noparamsize": "No Param Size",
             "rename": "Rename Model"
         },
@@ -919,8 +939,11 @@
             "rerunMigrationsButton": "Rerun Migrations",
             "title": "Database Management",
             "toast": {
+                "backupFailed": "Could not back up the current database, so nothing was imported",
                 "downloadFailed": "Failed to copy database: {{error}}",
-                "downloadOk": "Download Successful!"
+                "downloadOk": "Download Successful!",
+                "importFailed": "Import failed, the current database is unchanged: {{error}}",
+                "invalidFile": "That file is not a database"
             },
             "warningText": "WARNING: ensure imported database is from the same app version!"
         },

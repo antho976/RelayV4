@@ -32,7 +32,8 @@ const ThemedSlider: React.FC<ThemedSliderProps> = ({
 }) => {
     const styles = useStyles()
     const { color } = Theme.useTheme()
-    const [textValue, setTextValue] = useState(value.toString())
+    // the box shows value unless it is being typed in, so Reset and note switches reach it
+    const [textValue, setTextValue] = useState<string | undefined>(undefined)
 
     const clampSlider = useCallback(
         (value: number) => clamp(value, min, max, precision),
@@ -41,7 +42,6 @@ const ThemedSlider: React.FC<ThemedSliderProps> = ({
 
     const handleSliderChange = (v: number) => {
         if (!isNaN(clampSlider(v))) onValueChange(clampSlider(v))
-        setTextValue(clampSlider(v).toString())
     }
 
     const handleTextInputChange = (t: string) => {
@@ -52,9 +52,10 @@ const ThemedSlider: React.FC<ThemedSliderProps> = ({
     }
 
     const handleEndEdit = () => {
+        if (textValue === undefined) return
         const v = parseFloat(textValue)
-        if (!isNaN(v)) onValueChange(clamp(v, min, max, precision))
-        setTextValue(clampSlider(value).toString())
+        if (!isNaN(v)) onValueChange(clampSlider(v))
+        setTextValue(undefined)
     }
 
     return (
@@ -85,7 +86,8 @@ const ThemedSlider: React.FC<ThemedSliderProps> = ({
                                 borderColor: disabled ? color.neutral._700 : color.neutral._400,
                             },
                         ]}
-                        value={textValue}
+                        value={textValue ?? clampSlider(value).toString()}
+                        onFocus={() => setTextValue(clampSlider(value).toString())}
                         onChangeText={handleTextInputChange}
                         keyboardType="number-pad"
                         submitBehavior="blurAndSubmit"

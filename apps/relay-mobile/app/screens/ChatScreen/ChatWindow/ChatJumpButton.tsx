@@ -1,4 +1,5 @@
 import AntDesign from '@react-native-vector-icons/ant-design/static'
+import { useTranslation } from 'react-i18next'
 import { Pressable } from 'react-native'
 import Animated, { FadeInDown } from 'react-native-reanimated'
 import { useShallow } from 'zustand/react/shallow'
@@ -9,6 +10,7 @@ import { useInputHeightStore } from '../ChatInput'
 
 const ChatJumpButton: React.FC<{ jump: () => void; visible: boolean }> = ({ jump, visible }) => {
     const { color } = Theme.useTheme()
+    const { t } = useTranslation()
 
     const chatInputHeight = useInputHeightStore(useShallow((state) => state.height))
     if (!visible) return
@@ -16,6 +18,8 @@ const ChatJumpButton: React.FC<{ jump: () => void; visible: boolean }> = ({ jump
         <Animated.View entering={FadeInDown}>
             <Pressable
                 style={{ position: 'absolute', bottom: chatInputHeight + 12, right: '50%' }}
+                accessibilityRole="button"
+                accessibilityLabel={t('chat.input.a11y.jumpToLatest')}
                 onPress={jump}>
                 <AntDesign
                     name="caret-down"

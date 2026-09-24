@@ -30,6 +30,7 @@ const ThemedSwitch: React.FC<ThemedSwitchProps> = ({
                     ios_backgroundColor="#3e3e3e"
                     onValueChange={onChangeValue}
                     value={value}
+                    accessibilityLabel={label}
                 />
                 {label && (
                     <Text

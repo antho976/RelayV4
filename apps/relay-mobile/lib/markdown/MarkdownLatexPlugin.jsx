@@ -106,28 +106,22 @@ module.exports = function latexDetectorPlugin(md) {
             }
         }
 
-        // --- Match $...$ (not $$...$$) ---
+        // --- Match $...$ (not $$...$$), with pandoc's rules so prices are left alone:
+        // the opening $ is followed by a non-space, the closing $ follows a non-space
+        // and is not followed by a digit ---
         if (
             src[start] === '$' &&
             src[start + 1] !== '$' &&
-            (start === 0 || src[start - 1] !== '$')
+            (start === 0 || src[start - 1] !== '$') &&
+            start + 1 < max &&
+            !/\s/.test(src[start + 1])
         ) {
-            let end = start + 1
-            while (end < max) {
-                if (src[end] === '$') {
-                    // Ensure not escaped
-                    let backslashes = 0
-                    let k = end - 1
-                    while (k >= 0 && src[k] === '\\') {
-                        backslashes++
-                        k--
-                    }
-                    if (backslashes % 2 === 0) break
-                }
-                end++
-            }
-
-            if (end < max && src[end] === '$') {
+            for (let end = start + 1; end < max; end++) {
+                if (src[end] !== '$') continue
+                let backslashes = 0
+                for (let k = end - 1; k >= 0 && src[k] === '\\'; k--) backslashes++
+                if (backslashes % 2 !== 0) continue
+                if (/\s/.test(src[end - 1]) || /[0-9]/.test(src[end + 1] ?? '')) continue
                 if (silent) return true
                 const token = state.push('latex_inline', 'math', 0)
                 token.content = src.slice(start + 1, end)

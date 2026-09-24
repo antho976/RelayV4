@@ -46,6 +46,9 @@ const ThemedCheckbox: React.FC<ThemedCheckboxProps> = ({
     return (
         <Pressable
             style={{ flexDirection: 'row', alignItems: 'center' }}
+            accessibilityRole="checkbox"
+            accessibilityLabel={label}
+            accessibilityState={{ checked: value }}
             onPress={() => {
                 onChangeValue(!value)
             }}>

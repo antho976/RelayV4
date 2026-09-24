@@ -6,7 +6,7 @@ interface ScaledImageProps extends ImageProps {
     uri: string
 }
 
-const ScaledImage: React.FC<ScaledImageProps> = ({ uri, style }) => {
+const ScaledImage: React.FC<ScaledImageProps> = ({ uri, style, ...rest }) => {
     const [aspectRatio, setAspectRatio] = useState(1)
     useEffect(() => {
         RNImage.getSize(
@@ -19,7 +19,7 @@ const ScaledImage: React.FC<ScaledImageProps> = ({ uri, style }) => {
             }
         )
     }, [uri])
-    return <Image source={{ uri: uri }} style={[style, { aspectRatio: aspectRatio }]} />
+    return <Image {...rest} source={{ uri: uri }} style={[style, { aspectRatio: aspectRatio }]} />
 }
 
 export default ScaledImage

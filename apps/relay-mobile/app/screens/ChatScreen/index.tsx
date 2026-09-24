@@ -75,12 +75,17 @@ const ChatScreen = () => {
         }
         const file = await FileUtils.pickText({ type: 'application/json' })
         if (!file.success) return
-        const result = ChatImportSchema.safeParse(JSON.parse(file.data))
-        if (!result.success) {
-            Logger.errorToast(t('chat.import.errors.failedToImport'))
-            return
+        try {
+            await importChat(file.data)
+        } catch (e) {
+            Logger.errorToast(t('chat.import.errors.failedToImport'), e)
         }
-        const chat = result.data
+    }
+
+    const importChat = async (data: string) => {
+        if (!charId) return
+        // malformed JSON and schema mismatches throw, and the caller reports them
+        const chat = ChatImportSchema.parse(JSON.parse(data))
         chat.character_id = charId
         chat.scroll_offset = 0
         // an imported chat is always meant to be kept
@@ -105,8 +110,7 @@ const ChatScreen = () => {
                 chat.user_id = null
             }
         }
-        chat.last_modified = Date.now()
-        Chats.db.mutate.cloneChat(chat)
+        await Chats.db.mutate.cloneChat(chat)
     }
 
     const renderHeaderButtonRight = () => {
@@ -167,7 +171,7 @@ const ChatScreen = () => {
                     />
                     <View style={{ flex: 1 }}>
                         {typeof chatId === 'number' && (
-                            <ChatWindow chatId={chatId} scrollData={scrollData} />
+                            <ChatWindow key={chatId} chatId={chatId} scrollData={scrollData} />
                         )}
                         <ChatInput />
                         <AvatarViewer />

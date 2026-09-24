@@ -22,7 +22,6 @@ type ChatEditorStateProps = {
 export const useChatEditorStore = create<ChatEditorStateProps>()((set, get) => ({
     entryId: 0,
     ref: createBottomSheetRef(),
-    editMode: false,
     hide: () => {
         get().ref.current?.close()
     },
@@ -61,7 +60,11 @@ const ChatEditor = () => {
     }
 
     return (
-        <BottomSheet sheetStyle={{ rowGap: 12, maxHeight: '95%' }} ref={ref}>
+        <BottomSheet
+            sheetStyle={{ rowGap: 12, maxHeight: '95%' }}
+            ref={ref}
+            // a dismissed edit is discarded, so the next open shows the saved text
+            onClose={() => setPlaceholderText(swipe?.swipe ?? '')}>
             {swipe !== undefined && (
                 <>
                     <View style={styles.topText}>
