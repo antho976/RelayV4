@@ -377,6 +377,103 @@ export namespace DefaultColorSchemes {
         _900: '#0e0e10',
     }
 
+    /**
+     * The default look: the warm, low-contrast dark of a reading app rather than a console —
+     * charcoal with a hint of brown, rounded slabs a step lighter, cream text, and off-white
+     * pill buttons. `error` and `quote` keep Relay's held red and waiting amber.
+     */
+    export const relayWarm: ThemeColor = {
+        version: 1,
+        name: 'Relay',
+        primary: {
+            _100: '#262624',
+            _200: '#30302e',
+            _300: '#3a3a37',
+            _400: '#8c8a82',
+            _500: '#ecebe4',
+            _600: '#f1f0ea',
+            _700: '#f5f4ee',
+            _800: '#faf9f5',
+            _900: '#ffffff',
+        },
+        neutral: {
+            _100: '#1a1a18',
+            _200: '#262624',
+            _300: '#30302e',
+            _400: '#3a3a37',
+            _500: '#474743',
+            _600: '#575752',
+            _700: '#6b6a64',
+            _800: '#807e77',
+            _900: '#96948c',
+        },
+        error: relayError,
+        text: {
+            _100: '#f5f4ee',
+            _200: '#e8e6dc',
+            _300: '#cfcdc3',
+            _400: '#a9a79e',
+            _500: '#8c8a82',
+            _600: '#6f6d66',
+            _700: '#55534e',
+            _800: '#2c2b28',
+            _900: '#1a1a18',
+        },
+        quote: '#e8a33d',
+        shadow: '#000000',
+    }
+
+    export const relayWarmLight: ThemeColor = {
+        version: 1,
+        name: 'Relay Light',
+        primary: {
+            _100: '#e8e6dc',
+            _200: '#dedbd0',
+            _300: '#d1cec2',
+            _400: '#6f6d66',
+            _500: '#1f1e1c',
+            _600: '#2a2926',
+            _700: '#2f2e2b',
+            _800: '#161614',
+            _900: '#000000',
+        },
+        neutral: {
+            _100: '#faf9f5',
+            _200: '#f0eee6',
+            _300: '#e8e6dc',
+            _400: '#dedbd0',
+            _500: '#d1cec2',
+            _600: '#bdb9ac',
+            _700: '#a5a195',
+            _800: '#8c897e',
+            _900: '#757268',
+        },
+        error: {
+            _100: '#f2c9c6',
+            _200: '#ea9a95',
+            _300: '#d9382e',
+            _400: '#c9302a',
+            _500: '#a82722',
+            _600: '#861f1b',
+            _700: '#651714',
+            _800: '#44100d',
+            _900: '#240806',
+        },
+        text: {
+            _100: '#1f1e1c',
+            _200: '#2f2e2b',
+            _300: '#45433f',
+            _400: '#5f5d57',
+            _500: '#78766f',
+            _600: '#918f87',
+            _700: '#aaa89f',
+            _800: '#e8e6dc',
+            _900: '#faf9f5',
+        },
+        quote: '#b8780c',
+        shadow: '#8a8a88',
+    }
+
     export const relayMatte: ThemeColor = {
         version: 1,
         name: 'Relay Matte',
@@ -492,6 +589,8 @@ export namespace DefaultColorSchemes {
     }
 
     export const schemes = [
+        relayWarm,
+        relayWarmLight,
         relayMatte,
         relayDark,
         relayOled,

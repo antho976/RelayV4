@@ -16,7 +16,7 @@ type TemplateItemProps = {
 
 const TemplateItem: React.FC<TemplateItemProps> = ({ item, index }) => {
     const { t } = useTranslation()
-    const { color, spacing, borderWidth, fontSize, borderRadius } = Theme.useTheme()
+    const { color, spacing, borderWidth, fontSize } = Theme.useTheme()
 
     const removeTemplate = APIManager.useConnectionsStore((state) => state.removeTemplate)
 
@@ -51,7 +51,7 @@ const TemplateItem: React.FC<TemplateItemProps> = ({ item, index }) => {
                 flexDirection: 'row',
                 justifyContent: 'space-between',
                 alignItems: 'center',
-                borderRadius: borderRadius.xl,
+                borderRadius: 22,
                 flex: 1,
                 paddingLeft: spacing.l,
                 paddingRight: spacing.xl2,

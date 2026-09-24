@@ -70,7 +70,7 @@ const ChatDrawerItem: React.FC<ChatDrawerItemProps> = ({ item, onLoad }) => {
 export default ChatDrawerItem
 
 const useStyles = () => {
-    const { color, spacing, borderWidth, borderRadius, fontSize } = Theme.useTheme()
+    const { color, spacing, borderWidth, fontSize } = Theme.useTheme()
 
     return StyleSheet.create({
         title: {
@@ -84,9 +84,10 @@ const useStyles = () => {
             paddingHorizontal: spacing.m,
             flex: 1,
             marginBottom: spacing.m,
-            borderRadius: borderRadius.m,
+            borderRadius: 22,
             borderWidth: borderWidth.m,
-            borderColor: color.neutral._100,
+            borderColor: color.neutral._200,
+            backgroundColor: color.neutral._200,
         },
 
         chatItemActive: {
@@ -95,9 +96,10 @@ const useStyles = () => {
             paddingHorizontal: spacing.m,
             flex: 1,
             marginBottom: spacing.m,
-            borderRadius: spacing.m,
+            borderRadius: 22,
             borderWidth: borderWidth.m,
-            borderColor: color.primary._500,
+            borderColor: color.primary._400,
+            backgroundColor: color.neutral._300,
         },
         smallText: { color: color.text._700, marginLeft: spacing.l },
         smallTextChat: { color: color.text._600, marginLeft: spacing.sm },

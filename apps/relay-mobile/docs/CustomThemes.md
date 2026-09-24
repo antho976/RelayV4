@@ -2,7 +2,7 @@
 
 v0.8.5 introduces custom app themes, allowing you to customize the colors used in the app!
 
-To get started, simply add your custom colors to [exampleTheme.json](https://github.com/Vali-98/ChatterUI/blob/master/docs/exampleTheme.json), then import them in the `Settings` > `Change Theme` > `Gear Icon` > `Import`
+To get started, simply add your custom colors to [exampleTheme.json](https://github.com/antho976/RelayV4/blob/main/apps/relay-mobile/docs/exampleTheme.json), then import them in the `Settings` > `Change Theme` > `Gear Icon` > `Import`
 
 This doc will explain each property of the theme object:
 

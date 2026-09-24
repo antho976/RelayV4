@@ -35,9 +35,9 @@ export namespace Theme {
         persist(
             (set, get) => ({
                 useSystemDarkMode: true,
-                color: DefaultColorSchemes.relayMatte,
-                darkColor: DefaultColorSchemes.relayMatte,
-                lightColor: DefaultColorSchemes.relayPaper,
+                color: DefaultColorSchemes.relayWarm,
+                darkColor: DefaultColorSchemes.relayWarm,
+                lightColor: DefaultColorSchemes.relayWarmLight,
                 setColor: (color) => {
                     set({ color: color })
                 },
@@ -87,11 +87,11 @@ export namespace Theme {
                     let lightColor = get().lightColor
                     let darkColor = get().darkColor
                     if (removed) {
-                        if (removed.name === color.name) color = DefaultColorSchemes.relayMatte
+                        if (removed.name === color.name) color = DefaultColorSchemes.relayWarm
                         if (removed.name === lightColor.name)
-                            lightColor = DefaultColorSchemes.relayPaper
+                            lightColor = DefaultColorSchemes.relayWarmLight
                         if (removed.name === darkColor.name)
-                            darkColor = DefaultColorSchemes.relayMatte
+                            darkColor = DefaultColorSchemes.relayWarm
                     }
                     set({
                         customColors: colors,
@@ -104,7 +104,7 @@ export namespace Theme {
             {
                 name: Storage.ColorState,
                 storage: createMMKVStorage(),
-                version: 3,
+                version: 4,
                 partialize: (state) => ({
                     color: state.color,
                     customColors: state.customColors,
@@ -129,6 +129,17 @@ export namespace Theme {
                             persistedState.darkColor = DefaultColorSchemes.relayMatte
                         if (wasDefault(persistedState.lightColor, 'Lavender Light'))
                             persistedState.lightColor = DefaultColorSchemes.relayPaper
+                    }
+                    if (version <= 3) {
+                        // The warm look replaces the console one as the default; again, only
+                        // for someone still on the default.
+                        const swap = (key: string, from: string, to: ThemeColor) => {
+                            const current = persistedState[key] as ThemeColor | undefined
+                            if (!current || current.name === from) persistedState[key] = to
+                        }
+                        swap('color', 'Relay Matte', DefaultColorSchemes.relayWarm)
+                        swap('darkColor', 'Relay Matte', DefaultColorSchemes.relayWarm)
+                        swap('lightColor', 'Relay Paper', DefaultColorSchemes.relayWarmLight)
                     }
                     return persistedState
                 },

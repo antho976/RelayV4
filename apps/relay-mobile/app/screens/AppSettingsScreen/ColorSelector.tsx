@@ -2,7 +2,7 @@ import Octicons from '@react-native-vector-icons/octicons/static'
 import { setBackgroundColorAsync } from 'expo-system-ui'
 import React from 'react'
 import { useTranslation } from 'react-i18next'
-import { FlatList, Linking, Text, TouchableOpacity, useColorScheme, View } from 'react-native'
+import { FlatList, Text, TouchableOpacity, useColorScheme, View } from 'react-native'
 import { SafeAreaView } from 'react-native-safe-area-context'
 import { useShallow } from 'zustand/react/shallow'
 
@@ -245,16 +245,6 @@ const ColorSelector = () => {
                                 onPress: (close) => {
                                     close()
                                     inputRef.current?.open()
-                                },
-                            },
-                            {
-                                label: t('settings.colors.contextMenu.getThemes'),
-                                icon: 'github',
-                                onPress: (close) => {
-                                    close()
-                                    Linking.openURL(
-                                        'https://github.com/Vali-98/ChatterUI/discussions/218'
-                                    )
                                 },
                             },
                         ]}

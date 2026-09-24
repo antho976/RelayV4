@@ -127,7 +127,7 @@ namespace Drawer {
 
     export const Button: React.FC<DrawerButtonProps> = ({
         drawerID: drawerId,
-        openIcon = 'menu-fold',
+        openIcon = 'menu',
         closeIcon = 'close',
         ...rest
     }) => {

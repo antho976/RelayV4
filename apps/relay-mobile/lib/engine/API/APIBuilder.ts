@@ -136,7 +136,7 @@ const hordeResponse = (senderParams: SenderParams) => {
             fetch(`${hordeURL}generate/text/status/${generation_id}`, {
                 method: 'DELETE',
                 headers: {
-                    'Client-Agent': `ChatterUI:${nativeApplicationVersion}:https://github.com/Vali-98/ChatterUI`,
+                    'Client-Agent': `Relay:${nativeApplicationVersion}:https://github.com/antho976/RelayV4`,
                     accept: 'application/json',
                     'Content-Type': 'application/json',
                 },
@@ -153,7 +153,7 @@ const hordeResponse = (senderParams: SenderParams) => {
             body: senderParams.payload,
             headers: {
                 ...senderParams.header,
-                'Client-Agent': `ChatterUI:${nativeApplicationVersion}:https://github.com/Vali-98/ChatterUI`,
+                'Client-Agent': `Relay:${nativeApplicationVersion}:https://github.com/antho976/RelayV4`,
                 accept: 'application/json',
                 'content-type': 'application/json',
             },
@@ -186,7 +186,7 @@ const hordeResponse = (senderParams: SenderParams) => {
             const response = await fetch(`${hordeURL}generate/text/status/${generation_id}`, {
                 method: 'GET',
                 headers: {
-                    'Client-Agent': `ChatterUI:${nativeApplicationVersion}:https://github.com/Vali-98/ChatterUI`,
+                    'Client-Agent': `Relay:${nativeApplicationVersion}:https://github.com/antho976/RelayV4`,
                     accept: 'application/json',
                     'content-type': 'application/json',
                 },

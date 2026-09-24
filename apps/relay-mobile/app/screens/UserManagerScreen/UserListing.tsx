@@ -149,24 +149,26 @@ const useStyles = () => {
         },
 
         longButtonContainer: {
-            borderColor: color.neutral._100,
+            borderColor: color.neutral._200,
+            backgroundColor: color.neutral._200,
             borderWidth: borderWidth.m,
             flexDirection: 'row',
             marginBottom: spacing.m,
             justifyContent: 'space-between',
             alignItems: 'center',
-            borderRadius: spacing.m,
+            borderRadius: 22,
             flex: 1,
         },
 
         longButtonSelectedContainer: {
-            borderColor: color.primary._500,
+            borderColor: color.primary._400,
+            backgroundColor: color.neutral._300,
             borderWidth: borderWidth.m,
             flexDirection: 'row',
             marginBottom: spacing.m,
             justifyContent: 'space-between',
             alignItems: 'center',
-            borderRadius: spacing.m,
+            borderRadius: 22,
             flex: 1,
         },
 

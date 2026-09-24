@@ -25,7 +25,7 @@ const LogsScreen = () => {
     const handleExportLogs = () => {
         if (!logs) return
         // eslint-disable-next-line i18next/no-literal-string, react-hooks/purity
-        const filename = `logs-chatterui-${Date.now()}.txt`
+        const filename = `logs-relay-${Date.now()}.txt`
         const data = logs
             .map((item) => `${Logger.LevelName[item.level]} ${item.timestamp}: ${item.message}`)
             .join('\n')

@@ -33,7 +33,7 @@ const ChatBubble: React.FC<ChatTextProps> = ({
     const { t } = useTranslation()
     const { appMode } = useAppMode()
     const [showTPS] = useMMKVBoolean(AppSettings.ShowTokenPerSecond)
-    const { color, spacing, borderRadius, fontSize } = Theme.useTheme()
+    const { color, spacing, fontSize } = Theme.useTheme()
 
     const { setShowOptions } = useChatActionsState(
         useShallow((state) => ({
@@ -51,7 +51,8 @@ const ChatBubble: React.FC<ChatTextProps> = ({
 
     const showSwipe = !entry.is_user && isLastMessage
     const timings = swipe.timings
-    const bubbleColor = entry.is_user ? color.neutral._200 : color.neutral._200
+    // Your messages sit in a bubble; replies read as plain text on the page.
+    const bubbleColor = entry.is_user ? color.neutral._300 : 'transparent'
     return (
         <View>
             <Pressable
@@ -60,23 +61,11 @@ const ChatBubble: React.FC<ChatTextProps> = ({
                 }}
                 style={{
                     backgroundColor: bubbleColor,
-                    borderColor: color.neutral._200,
-                    borderWidth: 1,
                     marginBottom: showSwipe ? 0 : 4,
-                    paddingVertical: spacing.sm,
-                    paddingHorizontal: spacing.m,
+                    paddingVertical: spacing.m,
+                    paddingHorizontal: spacing.l,
                     minHeight: 40,
-                    borderRadius: borderRadius.m,
-                    shadowColor: color.shadow,
-                    boxShadow: [
-                        {
-                            offsetX: 1,
-                            offsetY: 1,
-                            spreadDistance: 2,
-                            color: color.shadow,
-                            blurRadius: 4,
-                        },
-                    ],
+                    borderRadius: 20,
                 }}
                 onLongPress={handleEnableEdit}>
                 {isLastMessage ? (

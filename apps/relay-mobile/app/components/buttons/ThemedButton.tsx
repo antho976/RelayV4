@@ -45,11 +45,11 @@ const useButtonTheme = (variant: ButtonVariant): ButtonTheme => {
             return {
                 buttonStyle: {
                     backgroundColor: theme.color.primary._500,
-                    borderColor: theme.color.primary._200,
+                    borderColor: theme.color.primary._500,
                     borderWidth: theme.borderWidth.m,
-                    paddingVertical: theme.spacing.m,
-                    paddingHorizontal: theme.spacing.xl,
-                    borderRadius: theme.borderRadius.m,
+                    paddingVertical: theme.spacing.m + 2,
+                    paddingHorizontal: theme.spacing.xl2,
+                    borderRadius: 999,
                 },
                 labelStyle: {
                     textAlign: 'center',
@@ -59,11 +59,11 @@ const useButtonTheme = (variant: ButtonVariant): ButtonTheme => {
         case 'secondary':
             return {
                 buttonStyle: {
-                    borderColor: theme.color.primary._400,
+                    borderColor: theme.color.neutral._600,
                     borderWidth: theme.borderWidth.m,
-                    paddingVertical: theme.spacing.m,
-                    paddingHorizontal: theme.spacing.xl,
-                    borderRadius: theme.borderRadius.m,
+                    paddingVertical: theme.spacing.m + 2,
+                    paddingHorizontal: theme.spacing.xl2,
+                    borderRadius: 999,
                 },
                 labelStyle: {
                     textAlign: 'center',
@@ -86,9 +86,9 @@ const useButtonTheme = (variant: ButtonVariant): ButtonTheme => {
                 buttonStyle: {
                     borderColor: theme.color.error._400,
                     borderWidth: theme.borderWidth.m,
-                    paddingVertical: theme.spacing.m,
-                    paddingHorizontal: theme.spacing.xl,
-                    borderRadius: theme.borderRadius.m,
+                    paddingVertical: theme.spacing.m + 2,
+                    paddingHorizontal: theme.spacing.xl2,
+                    borderRadius: 999,
                 },
                 labelStyle: {
                     textAlign: 'center',
@@ -100,9 +100,9 @@ const useButtonTheme = (variant: ButtonVariant): ButtonTheme => {
                 buttonStyle: {
                     borderColor: theme.color.neutral._500,
                     borderWidth: theme.borderWidth.m,
-                    paddingVertical: theme.spacing.m,
-                    paddingHorizontal: theme.spacing.xl,
-                    borderRadius: theme.borderRadius.m,
+                    paddingVertical: theme.spacing.m + 2,
+                    paddingHorizontal: theme.spacing.xl2,
+                    borderRadius: 999,
                 },
                 labelStyle: {
                     textAlign: 'center',

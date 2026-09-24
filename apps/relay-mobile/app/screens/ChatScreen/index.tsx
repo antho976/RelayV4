@@ -28,10 +28,11 @@ import ChatEditor from './ChatWindow/ChatEditor'
 const ChatScreen = () => {
     const { t } = useTranslation()
     const insets = useSafeAreaInsets()
-    const { unloadCharacter, charId } = Characters.useCharacterStore(
+    const { unloadCharacter, charId, charName } = Characters.useCharacterStore(
         useShallow((state) => ({
             unloadCharacter: state.unloadCard,
             charId: state.id,
+            charName: state.card?.name,
         }))
     )
     const userId = Characters.useUserStore(useShallow((state) => state.id))
@@ -159,7 +160,7 @@ const ChatScreen = () => {
             ]}>
             <View style={{ flex: 1, paddingBottom: insets.bottom + 4 }}>
                 <Animated.View style={animatedStyle}>
-                    <HeaderTitle />
+                    <HeaderTitle title={charName ?? ''} />
                     <HeaderButton
                         headerLeft={renderHeaderButtonLeft}
                         headerRight={renderHeaderButtonRight}

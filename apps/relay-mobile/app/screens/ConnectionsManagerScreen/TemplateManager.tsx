@@ -64,22 +64,12 @@ const TemplateManager = () => {
                                 },
                             },
                             {
-                                label: t('connections.templates.get'),
-                                icon: 'github',
-                                onPress: (close) => {
-                                    close()
-                                    Linking.openURL(
-                                        'https://github.com/Vali-98/ChatterUI/discussions/126'
-                                    )
-                                },
-                            },
-                            {
                                 label: t('connections.templates.learn'),
                                 icon: 'info',
                                 onPress: (close) => {
                                     close()
                                     Linking.openURL(
-                                        'https://github.com/Vali-98/ChatterUI/blob/dev/docs/CustomTemplates.md'
+                                        'https://github.com/antho976/RelayV4/blob/main/apps/relay-mobile/docs/CustomTemplates.md'
                                     )
                                 },
                             },

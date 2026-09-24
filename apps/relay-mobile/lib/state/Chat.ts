@@ -108,7 +108,7 @@ export const sendGenerateCompleteNotification = async () => {
 
     const notificationText = showMessage
         ? Chats.useChatState.getState().buffer?.data?.trim()
-        : 'ChatterUI has finished a response.'
+        : 'Relay has finished a response.'
 
     Notifications.scheduleNotificationAsync({
         content: {

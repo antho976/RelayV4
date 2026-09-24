@@ -82,17 +82,19 @@ const HorizontalSelector = <T,>({
                     flex: style?.flex ?? 1,
                     flexDirection: 'row',
                     justifyContent: 'space-evenly',
-                    borderColor: color.primary._200,
-                    backgroundColor: color.neutral._100,
+                    // The highlight is placed from measured offsets that assume this 2px
+                    // border and no padding; change them together.
+                    borderColor: color.neutral._200,
+                    backgroundColor: color.neutral._200,
                     borderWidth: 2,
-                    borderRadius: 8,
+                    borderRadius: 14,
                 }}>
                 <Animated.View
                     style={[
                         {
                             position: 'absolute',
-                            backgroundColor: color.primary._300,
-                            borderRadius: 8,
+                            backgroundColor: color.neutral._400,
+                            borderRadius: 11,
                         },
                         animatedStyle,
                     ]}

@@ -305,7 +305,7 @@ const ChatPresetsScreen = () => {
 export default ChatPresetsScreen
 
 const useStyles = () => {
-    const { color, spacing, borderRadius, fontSize, borderWidth } = Theme.useTheme()
+    const { color, spacing, fontSize, borderWidth } = Theme.useTheme()
     return StyleSheet.create({
         container: {
             paddingHorizontal: spacing.xl,
@@ -323,8 +323,8 @@ const useStyles = () => {
             paddingVertical: spacing.xl,
         },
         card: {
-            backgroundColor: color.neutral._100,
-            borderRadius: borderRadius.m,
+            backgroundColor: color.neutral._200,
+            borderRadius: 20,
             borderWidth: borderWidth.m,
             borderColor: color.neutral._200,
             padding: spacing.l,
