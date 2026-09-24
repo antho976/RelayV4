@@ -2,7 +2,6 @@ import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 
 import { Storage } from '@lib/enums/Storage'
-import { Logger } from '@lib/state/Logger'
 import { createMMKVStorage } from '@lib/storage/MMKV'
 
 type TextFilterStateProps = {
@@ -30,6 +29,18 @@ export const useTextFilterStore = create<TextFilterStateProps>()(
     )
 )
 
+/**
+ * A filter word is a regular expression; one that does not compile (`c++`, `(`)
+ * is matched as plain text instead.
+ */
+export const filterRegex = (item: string) => {
+    try {
+        return new RegExp(item, 'gi')
+    } catch {
+        return new RegExp(item.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi')
+    }
+}
+
 type RegexResult = {
     result: string
     found: boolean
@@ -39,14 +50,8 @@ export const useTextFilter = (inputString: string): RegexResult => {
     const filters = useTextFilterStore((state) => state.filter)
     if (filters.length === 0) return { result: inputString, found: false }
     let newString = inputString
-    try {
-        filters.forEach((item) => {
-            const regex = new RegExp(item, 'gi')
-            newString = inputString.replace(regex, '')
-        })
-    } catch (e) {
-        Logger.warn('Regex parsing failed: ' + e)
-    } finally {
-        return { result: newString, found: newString.length !== inputString.length }
-    }
+    filters.forEach((item) => {
+        if (item) newString = newString.replace(filterRegex(item), '')
+    })
+    return { result: newString, found: newString.length !== inputString.length }
 }

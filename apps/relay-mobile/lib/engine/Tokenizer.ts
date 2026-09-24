@@ -23,8 +23,9 @@ export namespace Tokenizer {
         getTokenCount: async function getTokenCount(text: string, image_urls: string[] = []) {
             const model = get().model
             if (!model) {
-                Logger.warn('Tokenizer not loaded')
-                return 0
+                // a rough count keeps the context trimmed until the tokenizer is ready
+                Logger.warn('Tokenizer not loaded, estimating')
+                return Math.ceil(text.length / 4) + image_urls.length * 512
             }
             return (await model.tokenize(text)).tokens.length + image_urls.length * 512
         },

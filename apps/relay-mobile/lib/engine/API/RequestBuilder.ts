@@ -1,18 +1,16 @@
 import merge from 'lodash.merge'
 
 import { SamplerConfigData, SamplerID, Samplers } from '@lib/constants/SamplerData'
-import { InstructType } from '@lib/state/Instructs'
 import { SamplersManager } from '@lib/state/SamplerState'
 import { getNestedValue } from '@lib/utils/Parsing'
 
 import { APIConfiguration, APISampler, APIValues } from './APIBuilder.types'
-import { Message } from './ContextBuilder'
+import { enforceAlternation, Message } from './ContextBuilder'
 
 export interface RequestBuilderParams {
     apiConfig: APIConfiguration
     apiValues: APIValues
     samplers: SamplerConfigData
-    instruct: InstructType
     stopSequence: string[]
     prompt: string | Message[]
 }
@@ -25,7 +23,6 @@ export const buildRequest = async ({
     apiConfig,
     apiValues,
     samplers,
-    instruct,
     prompt,
     stopSequence,
 }: RequestBuilderParams) => {
@@ -42,9 +39,9 @@ export const buildRequest = async ({
         case 'horde':
             return hordeRequest(fields)
         case 'claude':
-            return claudeRequest(apiConfig, instruct, fields)
+            return claudeRequest(apiConfig, fields)
         case 'custom':
-            return customRequest(apiConfig, apiValues, fields)
+            return customRequest(apiConfig, apiValues, stopSequence, fields)
     }
 }
 
@@ -60,7 +57,8 @@ const openAIRequest = async ({ payloadFields, model, stop, prompt, custom }: Fie
 
 const ollamaRequest = async ({ payloadFields, model, stop, prompt, custom }: Field) => {
     let keep_alive = 5
-    if (payloadFields.keep_alive) {
+    // 0 unloads the model at once and a negative value keeps it loaded
+    if (typeof payloadFields.keep_alive === 'number') {
         keep_alive = payloadFields.keep_alive as number
         delete payloadFields.keep_alive
     }
@@ -112,24 +110,28 @@ const cohereRequest = async (
 
 const claudeRequest = async (
     config: APIConfiguration,
-    instruct: InstructType,
     { payloadFields, model, stop, prompt, custom }: Field
 ) => {
-    const systemPrompt = instruct.system_prompt
-    const systemRole =
-        config.request.completionType.type === 'chatCompletions'
-            ? config.request.completionType.systemRole
-            : 'system'
+    const completionType = config.request.completionType
     const promptObject = prompt?.[config.request.promptKey]
-    const finalPrompt = Array.isArray(promptObject)
-        ? {
-              [config.request.promptKey]: promptObject.filter(
-                  (item) => item.role !== systemRole && item['content']
-              ),
-          }
-        : prompt
+    let system: string | undefined = undefined
+    let finalPrompt = prompt
+    if (completionType.type === 'chatCompletions' && Array.isArray(promptObject)) {
+        const { systemRole, contentName } = completionType
+        // the leading system message is the fully built system prompt: Claude takes it
+        // as `system`, and any later system message becomes part of a user turn
+        const [head, ...rest] = promptObject
+        const hasSystem = head?.role === systemRole
+        if (hasSystem && typeof head[contentName] === 'string') system = head[contentName]
+        const history = (hasSystem ? rest : promptObject)
+            .filter((item) => item[contentName]?.length > 0)
+            .map((item) => ({ ...item, [contentName]: toClaudeContent(item[contentName]) }))
+        finalPrompt = {
+            [config.request.promptKey]: enforceAlternation(history, completionType),
+        }
+    }
     return {
-        system: systemPrompt,
+        ...(system ? { system: system } : {}),
         ...payloadFields,
         stream: true,
         ...model,
@@ -137,6 +139,20 @@ const claudeRequest = async (
         ...finalPrompt,
         ...custom,
     }
+}
+
+// Claude takes base64 images as its own block and has no audio input
+const toClaudeContent = (content: Message[string]): Message[string] => {
+    if (typeof content === 'string') return content
+    return content
+        .filter((item) => item.type !== 'input_audio')
+        .map((item) => {
+            if (item.type !== 'image_url') return item
+            const [, media_type, data] =
+                item.image_url.url.match(/^data:([^;]+);base64,(.*)$/) ?? []
+            if (!data) return item
+            return { type: 'image', source: { type: 'base64', media_type: media_type, data: data } }
+        })
 }
 
 const hordeRequest = async ({ payloadFields, model, stop, prompt, custom }: Field) => {
@@ -164,37 +180,33 @@ const hordeRequest = async ({ payloadFields, model, stop, prompt, custom }: Fiel
 const customRequest = async (
     config: APIConfiguration,
     values: APIValues,
-    { stop, prompt }: Field
+    stopSequence: string[],
+    { prompt }: Field
 ) => {
     if (config.payload.type !== 'custom') return {}
     const modelName = getModelName(config, values)
 
-    let length = 0
-
     const sampler = SamplersManager.getCurrentSampler()
 
-    if (config.model.useModelContextLength) {
-        length = getModelContextLength(config, values) ?? 0
-    } else {
-        length = sampler[SamplerID.CONTEXT_LENGTH]
+    // values are inserted through a function so a `$` in them is kept as written
+    let responseBody = config.payload.customPayload
+    const insert = (macro: string, value: string) => {
+        responseBody = responseBody.replaceAll(macro, () => value)
     }
 
-    const responseBody = config.payload.customPayload
+    // the reply length, whether or not the template lists it as a sampler;
+    // '{{generted_length}}' is the macro's old misspelling, still found in stored templates
+    const replyLength = `${sampler[SamplerID.GENERATED_LENGTH]}`
+    insert('{{generated_length}}', replyLength)
+    insert('{{generted_length}}', replyLength)
 
-    responseBody.replaceAll('{{generated_length}}', `${length}`)
-
-    config.request.samplerFields.map((item) => {
-        responseBody.replaceAll(
-            Samplers[item.samplerID].macro,
-            sampler?.[item.samplerID]?.toString() ?? ''
-        )
+    config.request.samplerFields.forEach((item) => {
+        insert(Samplers[item.samplerID].macro, sampler?.[item.samplerID]?.toString() ?? '')
     })
-    responseBody.replaceAll('{{stop}}', stop.toString())
-    responseBody.replaceAll(
-        '{{prompt}}',
-        typeof prompt === 'object' ? JSON.stringify(prompt) : prompt
-    )
-    responseBody.replaceAll('{{model}}', modelName.toString())
+    // prompt and stop are inserted as JSON values
+    insert('{{stop}}', JSON.stringify(stopSequence))
+    insert('{{prompt}}', JSON.stringify(prompt[config.request.promptKey]))
+    insert('{{model}}', modelName?.toString() ?? '')
     return responseBody
 }
 
@@ -221,8 +233,14 @@ const buildFields = async (
         (item) => item.samplerID === SamplerID.SEED
     )
 
-    if (seedObject[0] && config.request.removeSeedifNegative) {
-        delete payloadFields?.[seedObject?.[0].externalName]
+    const seedName = seedObject[0]?.externalName
+    if (
+        seedName &&
+        config.request.removeSeedifNegative &&
+        typeof payloadFields[seedName] === 'number' &&
+        payloadFields[seedName] < 0
+    ) {
+        delete payloadFields[seedName]
     }
 
     // Context Length
@@ -230,10 +248,8 @@ const buildFields = async (
         (item) => item.samplerID === SamplerID.CONTEXT_LENGTH
     )
 
-    const instructLengthField = payloadFields?.[contextLengthObject?.[0]?.externalName]
-    if (instructLengthField) {
-        delete payloadFields?.[contextLengthObject?.[0].externalName]
-    }
+    const lengthName = contextLengthObject[0]?.externalName
+    const instructLengthField = lengthName ? payloadFields[lengthName] : undefined
 
     const modelLengthField = getModelContextLength(config, values)
     const instructLength =
@@ -242,6 +258,12 @@ const buildFields = async (
     const length = config.model.useModelContextLength
         ? Math.min(modelLength, instructLength)
         : instructLength
+
+    // the length is used client-side either way; only APIs that take it are sent it
+    if (lengthName && instructLengthField !== undefined) {
+        if (config.request.removeLength) delete payloadFields[lengthName]
+        else payloadFields[lengthName] = length
+    }
 
     const prompt = { [config.request.promptKey]: promptData }
 
@@ -325,9 +347,11 @@ const getSamplerFields = (
             let cleanvalue = value
             if (typeof value === 'number') {
                 const type = samplerItem.values.type
+                // any keep-alive value is meaningful to Ollama, -1 included
                 if (
-                    type === 'float' ||
-                    (type === 'integer' && value === samplerItem.values.ignoreIf)
+                    (type === 'float' || type === 'integer') &&
+                    value === samplerItem.values.ignoreIf &&
+                    item.samplerID !== SamplerID.KEEP_ALIVE_DURATION
                 ) {
                     return {}
                 }

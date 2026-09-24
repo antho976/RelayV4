@@ -129,14 +129,14 @@ async function chatInferenceStream() {
          * This is a naive implementation that expects output tags to be full tokens
          * Most LLMs are trained so that think_start and think_end tokens are not composite
          */
-        if (!reasoningMode && output.type === 'text' && isOpenThinkTag(output.type)) {
+        if (!reasoningMode && output.type === 'text' && isOpenThinkTag(output.content)) {
             reasoningMode = 'structured'
         }
 
         if (
             reasoningMode === 'structured' &&
             output.type === 'text' &&
-            isCloseThinkTag(output.type)
+            isCloseThinkTag(output.content)
         ) {
             reasoningMode = null
         }
@@ -158,11 +158,13 @@ async function chatInferenceStream() {
         Logger.info('Generating Title')
         titleGeneratorStream(chatId)
     }
-    const abort = await buildAndSendRequest(fields)
+    const request = await buildAndSendRequest(fields)
     useInference.getState().setAbort(() => {
         Logger.debug('Running Abort')
-        abort?.()
+        request?.abort()
     })
+    // the background task lives until the reply has finished streaming
+    await request?.done
 }
 
 const titleGeneratorStream = async (chatId: number) => {
@@ -283,9 +285,10 @@ async function obtainFields(): Promise<APIBuilderParams | void> {
         const modelLengthField = getModelContextLength(apiConfig, apiValues)
         const instructLength = samplers.max_length as number
         const modelLength = modelLengthField ?? (instructLength as number)
-        const length = apiConfig.model.useModelContextLength
+        const contextLength = apiConfig.model.useModelContextLength
             ? Math.min(modelLength, instructLength)
-            : instructLength - (samplers.genamt as number)
+            : instructLength
+        const length = Math.max(contextLength - (samplers.genamt as number), 0)
 
         let stopSequence = instructState.getStopSequence()
         const stopSequenceLimit = apiConfig.request.stopSequenceLimit
@@ -318,16 +321,17 @@ async function obtainFields(): Promise<APIBuilderParams | void> {
                 if (entry.id === -1) return 0
                 const [activeSwipe] = entry.swipes.filter((item) => item.active)
                 if (!activeSwipe) return 0
-                const tokenCount = activeSwipe.token_count ?? 0
+                const tokenCount = activeSwipe.token_length ?? 0
                 if (tokenCount === 0 && activeSwipe.swipe.length > 0) {
                     // assume that token length hasnt been calculated
-                    const tokenCount = await tokenizer(
+                    const freshCount = await tokenizer(
                         activeSwipe.swipe,
                         entry.attachments.map((item) => item.uri)
                     )
-                    await Chats.db.mutate.updateSwipeTokenLength(activeSwipe.id, tokenCount)
+                    await Chats.db.mutate.updateSwipeTokenLength(activeSwipe.id, freshCount)
+                    return freshCount
                 }
-                return activeSwipe.token_count ?? 0
+                return tokenCount
             },
             tokenizer: tokenizer,
             maxLength: length,

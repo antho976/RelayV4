@@ -140,7 +140,7 @@ export const Samplers = {
         internalID: SamplerID.GENERATED_LENGTH,
         friendlyName: 'Generated Tokens',
         inputType: 'slider',
-        macro: '{{generted_length}}',
+        macro: '{{generated_length}}',
         values: {
             type: 'integer',
             min: 16,
@@ -175,7 +175,7 @@ export const Samplers = {
             type: 'float',
             min: 0,
             max: 10,
-            default: 1,
+            default: 0,
             step: 0.01,
             precision: 2,
             ignoreIf: 0,

@@ -1,4 +1,9 @@
-import { copyFileSAF, getContentFd, persistContentPermission } from '@vali98/react-native-fs'
+import {
+    closeFd,
+    copyFileSAF,
+    getContentFd,
+    persistContentPermission,
+} from '@vali98/react-native-fs'
 import { loadLlamaModelInfo } from 'cui-llama.rn'
 import { eq, inArray, notInArray } from 'drizzle-orm'
 import { getDocumentAsync } from 'expo-document-picker'
@@ -252,7 +257,9 @@ export namespace Model {
             if (loadable_path.includes('content://'))
                 loadable_path = (await getContentFd(loadable_path)) ?? loadable_path
 
-            const modelInfo: any = await loadLlamaModelInfo(loadable_path)
+            const modelInfo: any = await loadLlamaModelInfo(loadable_path).finally(() => {
+                if (loadable_path !== file_path) closeFd(loadable_path).catch(Logger.error)
+            })
             let fileSize = 0
             const fileResult = fileInfo(file_path)
             if (fileResult.exists) {

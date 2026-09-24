@@ -57,7 +57,7 @@ export const buildAndSendRequest = async (params: APIBuilderParams) => {
         let header: any = {}
         if (apiConfig.features.useKey) {
             const anthropicVersion =
-                apiConfig.name === 'Claude' ? { 'anthropic-version': CLAUDE_VERSION } : {}
+                apiConfig.payload.type === 'claude' ? { 'anthropic-version': CLAUDE_VERSION } : {}
 
             header = {
                 ...anthropicVersion,
@@ -116,6 +116,12 @@ type KeyHeader = {
     [key: string]: string
 }
 
+// done settles once the reply has finished, failed or been aborted
+type SentRequest = {
+    abort: () => void
+    done: Promise<void>
+}
+
 type SenderParams = {
     endpoint: string
     payload: string
@@ -125,7 +131,10 @@ type SenderParams = {
     stopGenerating: () => void
 }
 
-const hordeResponse = (senderParams: SenderParams) => {
+// polled every 5 s, so a job still queued after 20 minutes is given up on
+const HORDE_MAX_POLLS = 240
+
+const hordeResponse = (senderParams: SenderParams): SentRequest => {
     const hordeURL = `https://aihorde.net/api/v2/`
     let generation_id = ''
     let aborted = false
@@ -168,9 +177,9 @@ const hordeResponse = (senderParams: SenderParams) => {
         if (request.status !== 202) {
             Logger.error(`Horde Request failed.`)
             senderParams.stopGenerating()
-            const body = await request.json()
+            const body = await request.json().catch(() => undefined)
             Logger.error(JSON.stringify(body))
-            for (const e of body.errors) Logger.error(e)
+            if (Array.isArray(body?.errors)) for (const e of body.errors) Logger.error(e)
             return
         }
 
@@ -178,9 +187,16 @@ const hordeResponse = (senderParams: SenderParams) => {
         generation_id = body.id
         let result
 
-        do {
+        for (let poll = 0; ; poll++) {
             await new Promise((resolve) => setTimeout(resolve, 5000))
             if (aborted) return
+
+            if (poll >= HORDE_MAX_POLLS) {
+                Logger.errorToast(t('generation.errors.generationFailed'))
+                Logger.error('Horde job did not finish in time')
+                abortFn()
+                return
+            }
 
             Logger.info(`Checking...`)
             const response = await fetch(`${hordeURL}generate/text/status/${generation_id}`, {
@@ -192,26 +208,44 @@ const hordeResponse = (senderParams: SenderParams) => {
                 },
             })
 
-            if (response.status === 400) {
-                Logger.error(`Response failed.`)
+            // rate limited: try again on the next poll
+            if (response.status === 429) continue
+
+            if (!response.ok) {
+                Logger.errorToast(t('generation.errors.generationFailed'))
+                Logger.error(`Response failed with status ${response.status}.`)
+                Logger.error((await response.json().catch(() => undefined))?.message)
                 senderParams.stopGenerating()
-                Logger.error((await response.json())?.message)
                 return
             }
 
             result = await response.json()
-        } while (!result.done)
+            if (result?.faulted || result?.is_possible === false) {
+                Logger.errorToast(t('generation.errors.generationFailed'))
+                Logger.error('Horde job faulted or no worker can run it')
+                abortFn()
+                return
+            }
+            if (result?.done) break
+        }
 
         if (aborted) return
         if (result) senderParams.onEvent(result)
+        // as with a stream, the finished reply can get an automatic title
+        senderParams.onEnd('')
         senderParams.stopGenerating()
     }
-    sendRequest()
 
-    return abortFn
+    const done = sendRequest().catch((e) => {
+        if (aborted) return
+        Logger.errorToast(t('generation.errors.completionFailed'), e)
+        senderParams.stopGenerating()
+    })
+
+    return { abort: abortFn, done: done }
 }
 
-const readableStreamResponse = async (senderParams: SenderParams) => {
+const readableStreamResponse = (senderParams: SenderParams): SentRequest => {
     const sse = new SSEFetch()
 
     const closeStream = () => {
@@ -241,7 +275,7 @@ const readableStreamResponse = async (senderParams: SenderParams) => {
         closeStream()
     })
 
-    sse.start({
+    const done = sse.start({
         endpoint: senderParams.endpoint,
         body: senderParams.payload,
         method: 'POST',
@@ -252,7 +286,7 @@ const readableStreamResponse = async (senderParams: SenderParams) => {
         },
     })
 
-    return () => sse.abort()
+    return { abort: () => sse.abort(), done: done }
 }
 
 const constructReplaceStrings = (stopSequence: string[]) => {
@@ -265,7 +299,7 @@ const constructReplaceStrings = (stopSequence: string[]) => {
 
 const responses: Record<
     APIConfiguration['request']['requestType'],
-    (params: SenderParams) => Promise<() => void> | (() => void)
+    (params: SenderParams) => SentRequest
 > = {
     horde: hordeResponse,
     stream: readableStreamResponse,

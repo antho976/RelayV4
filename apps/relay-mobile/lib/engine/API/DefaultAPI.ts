@@ -342,8 +342,8 @@ export const defaultTemplates: APIConfiguration[] = [
                 { externalName: 'max_context_length', samplerID: SamplerID.CONTEXT_LENGTH },
                 { externalName: 'max_tokens', samplerID: SamplerID.GENERATED_LENGTH },
                 { externalName: 'stream', samplerID: SamplerID.STREAMING },
+                // Claude rejects temperature and top_p sent together
                 { externalName: 'temperature', samplerID: SamplerID.TEMPERATURE },
-                { externalName: 'top_p', samplerID: SamplerID.TOP_P },
                 { externalName: 'top_k', samplerID: SamplerID.TOP_K },
             ],
             completionType: {
@@ -352,7 +352,7 @@ export const defaultTemplates: APIConfiguration[] = [
                 systemRole: 'system',
                 assistantRole: 'assistant',
                 contentName: 'content',
-                supportsAudio: true,
+                supportsAudio: false,
                 supportsImages: true,
             },
             authHeader: 'x-api-key',
@@ -589,7 +589,7 @@ export const defaultTemplates: APIConfiguration[] = [
             useStop: true,
             stopKey: 'stop_sequence',
             promptKey: 'prompt',
-            removeLength: true,
+            removeLength: false,
         },
 
         payload: {
