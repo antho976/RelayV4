@@ -131,13 +131,5 @@ const useStyles = () => {
             color: color.text._400,
             fontSize: fontSize.s,
         },
-
-        messageInput: {
-            color: color.text._100,
-            borderColor: color.neutral._400,
-            borderRadius: 8,
-            borderWidth: 1,
-            padding: 8,
-        },
     })
 }

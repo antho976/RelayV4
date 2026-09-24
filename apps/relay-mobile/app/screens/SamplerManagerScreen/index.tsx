@@ -133,14 +133,6 @@ const SamplerManagerScreen = () => {
                         close()
                     },
                 },
-                /*{
-                    label: 'Import Sampler',
-                    icon: 'upload',
-                    onPress: (close) => {
-                        handleImportSampler()
-                        close()
-                    },
-                },*/
                 {
                     label: t('sampler.delete'),
                     icon: 'delete',

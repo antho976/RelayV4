@@ -88,10 +88,6 @@ export class TerminalText {
         return this.lines.join('\n')
     }
 
-    lineCount(): number {
-        return this.lines.length
-    }
-
     private put(run: string) {
         const line = this.lines[this.lines.length - 1]
         if (this.cursor >= line.length) {

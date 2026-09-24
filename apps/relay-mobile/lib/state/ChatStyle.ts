@@ -31,19 +31,15 @@ export namespace ChatStyle {
         fontSize: FontSize
         setTextWeight: (mode: TextWeight) => void
         setFontSize: (size: FontSize) => void
-        getModifiedFontSize: (size: number) => number
     }
 
     export const useChatStyle = create<ChatTextStyleStateProps>()(
         persist(
-            (set, get) => ({
+            (set) => ({
                 textWeight: 'normal',
                 fontSize: 'm',
                 setTextWeight: (textWeight) => set({ textWeight }),
                 setFontSize: (fontSize) => set({ fontSize }),
-                getModifiedFontSize: (size) => {
-                    return Math.max(MIN_FONT_SIZE, sizeModifierMap?.[get().fontSize] ?? 0 + size)
-                },
             }),
             {
                 name: Storage.ChatStyle,

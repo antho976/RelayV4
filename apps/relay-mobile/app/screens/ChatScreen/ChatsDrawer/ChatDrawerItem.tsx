@@ -103,10 +103,5 @@ const useStyles = () => {
         },
         smallText: { color: color.text._700, marginLeft: spacing.l },
         smallTextChat: { color: color.text._600, marginLeft: spacing.sm },
-
-        editButton: {
-            paddingHorizontal: spacing.m,
-            justifyContent: 'center',
-        },
     })
 }

@@ -106,15 +106,12 @@ export const enum Global {
     // Management
     // AppMode = 'appmode', // moved to zustand state
 
-    CpuFeatures = 'cpufeatures',
     CPUThreads = 'constants-cpu-threads',
     InstallTextIntentDisable = 'install-text-intent-disable',
 }
 
 export enum AppSettings {
     DevMode = 'devmode',
-    DarkMode = 'darkmode',
-    AnimateEditor = 'animateeditor',
     CreateFirstMes = 'createfirstmes',
     ChatOnStartup = 'chatonstartup',
     AutoLoadLocal = 'autoloadlocal',
@@ -130,7 +127,6 @@ export enum AppSettings {
     ShowNotificationText = 'shownotificationtext',
     LocallyAuthenticateUser = 'localauthuser',
     UnlockOrientation = 'unlockorientation',
-    UseLegacyAPI = 'uselegacyapi',
     ShowModelInChat = 'showmodelinchat',
     ShowTags = 'showtags',
     UseModelTemplate = 'useModelTemplate',
@@ -152,12 +148,10 @@ export enum AppSettings {
  * Default settings on first install
  */
 export const AppSettingsDefault: Record<AppSettings, boolean> = {
-    [AppSettings.AnimateEditor]: true,
     [AppSettings.AutoLoadLocal]: false,
     [AppSettings.AutoScroll]: true,
     [AppSettings.ChatOnStartup]: false,
     [AppSettings.CreateFirstMes]: true,
-    [AppSettings.DarkMode]: true,
     [AppSettings.DevMode]: false,
     [AppSettings.SendOnEnter]: false,
     [AppSettings.SaveLocalKV]: false,
@@ -170,7 +164,6 @@ export const AppSettingsDefault: Record<AppSettings, boolean> = {
     [AppSettings.LocallyAuthenticateUser]: false,
     [AppSettings.ShowNotificationText]: false,
     [AppSettings.UnlockOrientation]: false,
-    [AppSettings.UseLegacyAPI]: false,
     [AppSettings.ShowModelInChat]: false,
     [AppSettings.ShowTags]: false,
     [AppSettings.UseModelTemplate]: true,

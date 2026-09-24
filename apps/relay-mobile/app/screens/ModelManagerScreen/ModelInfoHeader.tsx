@@ -109,32 +109,15 @@ const ModelInfoHeader: React.FC<ModelInfoHeaderProps> = ({
 export default ModelInfoHeader
 
 export const useStyles = () => {
-    const { color, spacing, borderRadius, fontSize } = Theme.useTheme()
+    const { color, spacing, borderRadius } = Theme.useTheme()
 
     return StyleSheet.create({
-        mainContainer: {
-            paddingTop: spacing.xl,
-            paddingHorizontal: spacing.xl,
-            paddingBottom: spacing.xl2,
-            flex: 1,
-        },
-
-        list: {
-            marginTop: 16,
-            flex: 1,
-        },
-
         modelContainer: {
             borderRadius: borderRadius.l,
             paddingVertical: spacing.l,
             paddingHorizontal: spacing.xl2,
             backgroundColor: color.neutral._200,
             marginBottom: spacing.l,
-        },
-
-        title: {
-            fontSize: fontSize.l,
-            color: color.text._100,
         },
 
         modelTitle: {

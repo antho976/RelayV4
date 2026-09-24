@@ -13,14 +13,6 @@ export const AppDirectory = {
 }
 
 export namespace FileUtils {
-    export const getDocumentDir = (dir: string) => {
-        return `${Paths.document.uri}${dir}`
-    }
-
-    export const getCacheDir = (dir: string) => {
-        return `${Paths.cache.uri}${dir}`
-    }
-
     /**
      *
      * @param data string data of file
@@ -41,12 +33,6 @@ export namespace FileUtils {
     export const pickText = async (params: { type?: string } = {}): Promise<PickerResult> => {
         return pickFile(async (file) => {
             return await file.text()
-        }, params)
-    }
-
-    export const pickBase64 = async (params: { type?: string } = {}): Promise<PickerResult> => {
-        return pickFile(async (file) => {
-            return await file.base64()
         }, params)
     }
 

@@ -140,7 +140,6 @@ type RelayState = {
     holds: RelayHold[]
     notifications: RelayNotification[]
     inReview: number
-    lastRefresh?: number
 }
 
 const REQUEST_TIMEOUT_MS = 20_000
@@ -325,10 +324,6 @@ class RelayClient {
             if (next !== 'active' || !this.wanted) return
             if (useRelayStore.getState().status === 'offline') this.reconnectNow()
         })
-    }
-
-    get online() {
-        return useRelayStore.getState().status === 'online'
     }
 
     private reconnectNow() {
@@ -721,7 +716,6 @@ class RelayClient {
         ])
         useRelayStore.setState({
             sessions: [...sessions.sessions].sort(bySessionOrder),
-            lastRefresh: Date.now(),
         })
         await this.refreshAttention()
     }

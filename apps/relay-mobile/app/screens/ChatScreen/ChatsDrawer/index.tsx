@@ -244,11 +244,6 @@ const useStyles = () => {
             paddingLeft: spacing.s,
         },
 
-        title: {
-            color: color.text._100,
-            fontSize: fontSize.l,
-        },
-
         emptyText: {
             color: color.text._400,
             fontSize: fontSize.m,

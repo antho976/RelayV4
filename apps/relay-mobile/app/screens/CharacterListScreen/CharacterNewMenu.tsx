@@ -18,7 +18,6 @@ const CharacterNewMenu: React.FC<CharacterNewMenuProps> = ({ nowLoading, setNowL
     const { setCurrentCard } = Characters.useCharacterStore(
         useShallow((state) => ({
             setCurrentCard: state.setCard,
-            id: state.id,
         }))
     )
 

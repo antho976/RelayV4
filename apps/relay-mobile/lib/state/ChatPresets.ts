@@ -107,14 +107,6 @@ export namespace ChatPresets {
                     )
                     .orderBy(desc(chats.last_modified))
             }
-
-            export const linkedChats = async (presetId: number) => {
-                return await database
-                    .select({ id: chats.id, name: chats.name })
-                    .from(chatPresetLinks)
-                    .innerJoin(chats, eq(chatPresetLinks.chat_id, chats.id))
-                    .where(eq(chatPresetLinks.preset_id, presetId))
-            }
         }
 
         export namespace mutate {

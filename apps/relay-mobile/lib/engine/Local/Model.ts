@@ -161,10 +161,6 @@ export namespace Model {
         return setModelDataInternal(filename, newdir, deleteOnFailure)
     }
 
-    export const getModelListQuery = () => {
-        return db.query.model_data.findMany()
-    }
-
     export const getModelListQuery2 = () => {
         return db.query.model_data.findMany({
             where: notInArray(model_data.architecture, mmprojArchs),
@@ -364,14 +360,5 @@ export namespace KV {
 
     export const deleteKV = async () => {
         deleteFile(sessionFile)
-    }
-
-    export const kvInfo = async () => {
-        const data = fileInfo(sessionFile)
-        if (!data.exists) {
-            Logger.warn('No KV Cache found')
-            return
-        }
-        Logger.info(`Size of KV cache: ${Math.floor(data.size ?? 0 * 0.000001)} MB`)
     }
 }

@@ -311,19 +311,6 @@ export namespace Chats {
                 return result
             }
 
-            export const chatList = async (charId: number) => {
-                const result = await database
-                    .select({
-                        ...getTableColumns(chats),
-                        entryCount: count(chatEntries.id),
-                    })
-                    .from(chats)
-                    .leftJoin(chatEntries, eq(chats.id, chatEntries.chat_id))
-                    .groupBy(chats.id)
-                    .where(eq(chats.character_id, charId))
-                return result
-            }
-
             export const chatListQuery = (charId: number, includeHidden: boolean = false) => {
                 return database
                     .select({
@@ -340,10 +327,6 @@ export namespace Chats {
                         )
                     )
                     .orderBy(desc(chats.last_modified))
-            }
-
-            export const chatExists = async (chatId: number) => {
-                return await database.query.chats.findFirst({ where: eq(chats.id, chatId) })
             }
 
             export const searchChat = async (
@@ -824,10 +807,6 @@ export namespace Chats {
                     })
                     .returning()
                 return attachment
-            }
-
-            export const deleteAttachment = async (attachmentId: number) => {
-                await database.delete(chatAttachments).where(eq(chatAttachments.id, attachmentId))
             }
 
             export const updateScrollOffset = async (chatId: number, scrollOffset: number) => {

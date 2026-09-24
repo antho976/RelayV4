@@ -103,29 +103,6 @@ export const localFallbackConnection = (): string | undefined => {
     if (!active) return undefined
     return active.friendlyName || active.configName
 }
-// TODO: Use this
-/*
-const useGenerateResponse = () => {
-    const startGenerating = Chats.useChatState((state) => state.startGenerating)
-    const nowGenerating = useInference((state) => state.nowGenerating)
-    const appMode = useAppModeStore((state) => state.appMode)
-
-    const generateResponse = useCallback(
-        async (swipeId: number) => {
-            if (nowGenerating) {
-                Logger.infoToast(t('generation.errors.generationAlreadyInProgress'))
-                return
-            }
-            startGenerating(swipeId)
-            Logger.info(`Obtaining response.`)
-            const process = appMode === 'local' ? localInference : chatInferenceStream
-            await BackgroundService.start(process, completionTaskOptions)
-        },
-        [nowGenerating, appMode, startGenerating]
-    )
-
-    return generateResponse
-}*/
 
 async function chatInferenceStream() {
     const fields = await obtainFields()

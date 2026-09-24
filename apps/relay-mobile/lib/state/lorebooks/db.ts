@@ -13,10 +13,6 @@ export namespace db {
             })
         }
 
-        export const lorebookInfo = async (id: number) => {
-            return await database.query.lorebooks.findFirst({ where: eq(lorebooks.id, id) })
-        }
-
         export const activeLorebooks = async () => {
             return await database.query.lorebooks.findMany({
                 where: eq(lorebooks.active, true),
@@ -96,18 +92,6 @@ export namespace db {
 
         export const lorebookInfo = (id: number) => {
             return database.query.lorebooks.findFirst({ where: eq(lorebooks.id, id) })
-        }
-
-        export const lorebook = (id: number) => {
-            return database.query.lorebooks.findFirst({
-                where: eq(lorebookEntries.lorebook_id, id),
-            })
-        }
-
-        export const lorebookEntryList = (id: number) => {
-            return database.query.lorebookEntries.findMany({
-                where: eq(lorebookEntries.lorebook_id, id),
-            })
         }
 
         export const lorebookEntryNameList = (id: number, query?: string) => {

@@ -198,13 +198,6 @@ const useStyles = () => {
             marginRight: 8,
         },
 
-        emptyTag: {
-            color: color.text._400,
-            paddingVertical: 4,
-            paddingHorizontal: 12,
-            fontStyle: 'italic',
-        },
-
         input: {
             flex: 1,
             color: color.text._100,

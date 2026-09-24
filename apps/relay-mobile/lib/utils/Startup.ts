@@ -1,4 +1,4 @@
-import { getCpuFeatures, getThreads } from '@vali98/react-native-cpu-info'
+import { getThreads } from '@vali98/react-native-cpu-info'
 import { setTextIntentEnabled, useTextIntentOnForeground } from '@vali98/react-native-process-text'
 import { DeviceType, getDeviceTypeAsync } from 'expo-device'
 import { Paths } from 'expo-file-system'
@@ -68,11 +68,6 @@ const createDefaultCard = async () => {
     const result = await Characters.db.query.cardList('character')
     if (result.length === 0) await Characters.createDefaultCard()
     mmkv.set(AppSettings.CreateDefaultCard, false)
-}
-
-const setCPUFeatures = async () => {
-    const result = await getCpuFeatures()
-    mmkv.set(Global.CpuFeatures, JSON.stringify(result))
 }
 
 const migrateModelData_0_7_10_to_0_8_0 = () => {
@@ -268,14 +263,8 @@ export const startupApp = () => {
     // ghost chats never survive a restart
     purgeGhostChats()
 
-    // get fp16, i8mm and dotprod data
-    setCPUFeatures()
-
     // set cpu thread count
     setCPUThreads()
-
-    // patch Android text for bold Accessibility (still broken upstream; left off)
-    // patchAndroidText()
 
     // set keep awake settings
     setKeepAwake()

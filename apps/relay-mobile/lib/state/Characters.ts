@@ -493,12 +493,6 @@ export namespace Characters {
                 })
             }
 
-            export const cardExists = async (charId: number) => {
-                return await database.query.characters.findFirst({
-                    where: eq(characters.id, charId),
-                })
-            }
-
             export const backgroundImageQuery = (charId: number) => {
                 return database.query.characters.findFirst({
                     where: eq(characters.id, charId),

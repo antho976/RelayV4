@@ -138,38 +138,4 @@ module.exports = function latexDetectorPlugin(md) {
 
         return false
     })
-
-    /*md.core.ruler.after('inline', 'latex_in_code_blocks', function (state) {
-        for (const token of state.tokens) {
-            if (token.type !== 'inline' || !token.children) continue
-
-            const children = token.children
-            const newChildren = []
-
-            for (const child of children) {
-                if (child.type === 'code_inline' || child.type === 'fence') {
-                    const content = child.content
-                    if (looksLikeLaTeX(content)) {
-                        const mathToken = new state.Token('latex_inline', 'math', 0)
-                        mathToken.content = content
-                        newChildren.push(mathToken)
-                    } else {
-                        newChildren.push(child)
-                    }
-                } else {
-                    newChildren.push(child)
-                }
-            }
-
-            token.children = newChildren
-        }
-
-        return true
-    })*/
 }
-
-// function looksLikeLaTeX(content) {
-//    const latexPattern =/\\(frac|vec|Delta|alpha|beta|gamma|theta|mu|cdot|ldots|int|sum|sqrt)\b|[_^]\w+|[_^]{\w+}|[=+\-*/^]/
-//    const codeLikePattern = /(function|var|let|const|if\s*\(|=>|import|return|class|\{\}|\(\))/
-//    return latexPattern.test(content) && !codeLikePattern.test(content)
-// }
