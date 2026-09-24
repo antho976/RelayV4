@@ -20,6 +20,7 @@ import { APIManager } from './API/APIManagerState'
 import { getDataSources } from './DataSources'
 import { Llama } from './Local/LlamaLocal'
 import { localInference } from './LocalInference'
+import { summarizing } from './Relay/Summarize'
 import { Tokenizer } from './Tokenizer'
 
 export async function regenerateResponse(swipe: ChatSwipe, regenCache: boolean = true) {
@@ -68,9 +69,16 @@ export async function generateResponse(swipeId: number) {
         Logger.infoToast(t('generation.errors.generationAlreadyInProgress'))
         return
     }
+    const appMode = useAppModeStore.getState().appMode
+    // a PC-tab summary holds the on-device model until it finishes
+    if (appMode === 'local' && summarizing()) {
+        Logger.infoToast(
+            'The on-device model is summarizing a PC session. Try again when it is done.'
+        )
+        return
+    }
     useInference.getState().startGenerating(swipeId)
     Logger.info(`Obtaining response.`)
-    const appMode = useAppModeStore.getState().appMode
 
     if (appMode === 'local') {
         const fallback = localFallbackConnection()
