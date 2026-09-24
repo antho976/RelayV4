@@ -38,7 +38,8 @@ The live tools (`ue_python`, `ue_call`, `ue_property`, `ue_search_assets`, `ue_l
    Performance → Use Less CPU when in Background*. Otherwise the editor barely ticks while you are
    in another window, and animation previews capture poses late. Set only in the editor it can
    come back on at the next start; `ue_setup_check` with `fix: true` writes it into the
-   project's config so it stays off.
+   EditorSettings config (`Config/DefaultEditorSettings.ini` and your saved `EditorSettings.ini`)
+   so it stays off, and `ue_editor_launch` does the same for editors it starts.
 5. **Optional:** a different port or host goes in **`UE_REMOTE_CONTROL_URL`**, and a passphrase, if
    you configured one, in **`UE_REMOTE_CONTROL_PASSPHRASE`**.
 

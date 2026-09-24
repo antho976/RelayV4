@@ -32,14 +32,15 @@ if action == "start":
     if in_play():
         raise RuntimeError("a play session is already running; stop it first (ue_play with stop_existing=true)")
     # An unfocused editor throttles itself to a few frames per second, which silently ruins
-    # timed play sessions and profiles. Turn that off for the session; `stop` restores it.
+    # timed play sessions and profiles. Turn it off, and leave it off: restoring it after play
+    # was one of the ways it kept coming back.
     throttled = None
     try:
         settings = perf_settings()
         throttled = bool(settings.get_editor_property("throttle_cpu_when_not_foreground"))
         settings.set_editor_property("throttle_cpu_when_not_foreground", False)
         # Keep it off in the user's editor settings when this engine exposes save_config, so
-        # it stays off after a restart; then there is nothing to restore at the end.
+        # it stays off after a restart.
         if ARGS.get("persist", True) and hasattr(settings, "save_config"):
             settings.save_config()
             throttled = False
@@ -63,11 +64,6 @@ elif action == "status":
 elif action == "stop":
     if in_play():
         les.editor_request_end_play()
-    if ARGS.get("restore_throttle") is not None:
-        try:
-            perf_settings().set_editor_property("throttle_cpu_when_not_foreground", bool(ARGS["restore_throttle"]))
-        except Exception:
-            pass
     emit({"stopped": True})
 elif action == "shot":
     world = game_world()

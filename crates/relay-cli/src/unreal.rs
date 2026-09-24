@@ -124,7 +124,7 @@ fn tools() -> Vec<Value> {
             "The Unreal project in this checkout: .uproject fields (engine association, modules, plugins), build targets, C++ modules, project plugins, config files, maps, asset counts, the resolved engine directory and log path. Works without the editor.",
             json!({}), &[], true),
         tool("ue_setup_check",
-            "Whether the editor bridge is ready: the RemoteControl, PythonScriptPlugin and EditorScriptingUtilities plugins in the .uproject, whether the editor's Remote Control server answers, and whether remote Python runs. Also whether Use Less CPU when in Background is on. With fix=true, adds the missing plugins to the .uproject (takes effect after the editor restarts), writes the Remote Control settings, and turns the background throttle off in the running editor and in the project's config, so it stays off across restarts.",
+            "Whether the editor bridge is ready: the RemoteControl, PythonScriptPlugin and EditorScriptingUtilities plugins in the .uproject, whether the editor's Remote Control server answers, and whether remote Python runs. Also whether Use Less CPU when in Background is on. Also asset files under Content that are read-only (the editor cannot save them). With fix=true, adds the missing plugins to the .uproject (takes effect after the editor restarts), writes the Remote Control settings, turns the background throttle off in the running editor and in the EditorSettings config, so it stays off across restarts, and makes read-only assets writable (and stops Git LFS making lockable files read-only in this checkout).",
             json!({"fix":{"type":"boolean","description":"Add missing bridge plugins to the .uproject"}}), &[], false),
         tool("ue_build",
             "Build with UnrealBuildTool through the engine's Build script. Defaults: the project's Editor target, the host platform, Development. Close the editor first (or use Live Coding in the editor instead). Returns success, the error lines and the tail of the output.",
@@ -251,7 +251,7 @@ fn tools() -> Vec<Value> {
                 "screenshots":{"type":"boolean","description":"Default true"},
                 "width":{"type":"integer"},"height":{"type":"integer"},
                 "console":{"type":"array","items":{"type":"string"},"description":"Console commands to run right after play starts, e.g. cheats or 'slomo 0.5'"},
-                "probe":{"type":"string","description":"Python run at each checkpoint with `unreal` and `world` (the game world); print what you want to see"},
+                "probe":{"type":"string","description":"Python run at each checkpoint with `unreal`, `world` (the game world), `checkpoint` (0-based index), `checkpoints` (count), `checkpoint_at` (seconds), `first_checkpoint`, `last_checkpoint` and `play_session` (distinct per ue_play call; key any state you keep by it, since globals survive between calls); print what you want to see"},
                 "log_filter":{"type":"string","description":"Regex over new log lines; default errors, warnings, ensures and Blueprint runtime errors"},
                 "stop":{"type":"boolean","description":"Stop at the end (default true)"},
                 "stop_existing":{"type":"boolean","description":"End a session that is already running first"},
@@ -311,7 +311,7 @@ fn tools() -> Vec<Value> {
             "Start the Unreal editor on this checkout's project with the Remote Control server enabled: waits until the port is free (a closed editor holds it for a while), launches, and waits until Remote Control answers, reporting a failed bind from the new log. Returns when the editor is ready.",
             json!({"timeout_s":{"type":"integer","minimum":30,"maximum":3600,"description":"Default 900; first starts compile shaders"},"extra_args":{"type":"array","items":{"type":"string"}},"keep_background_throttle":{"type":"boolean","description":"Leave 'Use Less CPU when in Background' as configured (default: off for this session)"}}), &[], false),
         tool("ue_editor_quit",
-            "Quit the editor cleanly (saving dirty packages unless save=false), wait for the process to exit and for the Remote Control port to be released. Use before builds; ue_build restart_editor=true does quit, build and relaunch in one call.",
+            "Quit the editor cleanly (saving dirty packages unless save=false), and wait for the process to exit; reports whether the Remote Control port is free yet (ue_editor_launch waits for it). Use before builds; ue_build restart_editor=true does quit, build and relaunch in one call.",
             json!({"save":{"type":"boolean"}}), &[], false),
         tool("ue_editor_lock",
             "Who is driving the editor. Live tools that change the editor take this lock automatically, so two agents never script the one editor at once; it frees itself after 15 idle minutes. action=release gives it up when you are done.",
@@ -339,7 +339,20 @@ fn call(name: &str, args: &Value) -> Result<Value> {
         "ue_editor_status" => editor_status(),
         "ue_python" => {
             let code = args["code"].as_str().ok_or_else(|| anyhow!("code is required"))?;
-            python(code, secs(args, "timeout_s", 120))
+            let project = Project::find().ok();
+            let start = project.as_ref().map(log_len);
+            let result = python(code, secs(args, "timeout_s", 120));
+            let log = match (&project, start) { (Some(p), Some(s)) => log_since(p, s, None), _ => Vec::new() };
+            let output = match &result { Ok(v) => v["output"].as_str().unwrap_or("").to_string(), Err(e) => format!("{e:#}") };
+            let warnings = python_warnings(&output, &log);
+            match result {
+                Ok(mut v) => {
+                    if !warnings.is_empty() { v["warnings"] = json!(warnings); }
+                    Ok(v)
+                }
+                Err(e) if !warnings.is_empty() => Err(e.context(warnings.join("\n"))),
+                Err(e) => Err(e),
+            }
         }
         "ue_call" => {
             let mut body = json!({
@@ -606,15 +619,25 @@ fn quit_editor(project: &Project, save: bool) -> Result<Value> {
         std::thread::sleep(Duration::from_millis(250));
     }
     let exited = started.elapsed();
+    // Done once the process is gone. The port is only reported: waiting for it here cost about
+    // 60 s per restart while the closed connections of an editor started without port reuse
+    // lingered, and ue_editor_launch waits for it anyway when it must.
     let port = crate::unreal_process::port_of(&remote_base());
-    let port_free = crate::unreal_process::wait_port_free(port, Duration::from_secs(90));
+    let port_free = crate::unreal_process::wait_port_free(port, Duration::from_secs(2));
+    let port_state = if port_free {
+        "free"
+    } else if crate::unreal_process::port_listening(port) {
+        "held by another listening process"
+    } else {
+        "lingering connections (TIME_WAIT) from an editor started without port reuse; the next ue_editor_launch waits them out, up to about 60 s, and starts the editor with reuse so later restarts do not"
+    };
     let _ = release_lock(project, &holder_id());
     let round = |d: Duration| (d.as_secs_f64() * 10.0).round() / 10.0;
     Ok(json!({
-        "stopped": before, "saved": save, "port_free": port_free, "notes": notes,
+        "stopped": before, "saved": save, "port_free": port_free, "port": port_state, "notes": notes,
         "seconds": round(started.elapsed()),
         // Where the time went, so a slow quit can be told apart from a slow port.
-        "timing": {"save_and_request_s": round(requested), "terminate_signal_at_s": signalled, "exited_at_s": round(exited), "port_free_at_s": round(started.elapsed())},
+        "timing": {"save_and_request_s": round(requested), "terminate_signal_at_s": signalled, "exited_at_s": round(exited)},
     }))
 }
 
@@ -632,20 +655,15 @@ fn launch_editor(project: &Project, args: &Value) -> Result<Value> {
     let extra: Vec<String> = args["extra_args"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
     let mut extra = extra;
     // "Use Less CPU when in Background" comes back on every start, and a throttled editor runs
-    // agent play sessions at a few frames per second. Write it off in the saved per-project user
-    // settings (the editor is not running, so nothing overwrites it) and override it on the
-    // command line as well.
+    // agent play sessions at a few frames per second. Write it off in the EditorSettings files
+    // (the editor is not running, so nothing overwrites them) and override it on the command
+    // line as well.
     if args["keep_background_throttle"] != true {
-        let platform_dir = if cfg!(target_os = "windows") { "WindowsEditor" } else if cfg!(target_os = "macos") { "MacEditor" } else { "LinuxEditor" };
-        let ini = project.root.join("Saved/Config").join(platform_dir).join("EditorPerProjectUserSettings.ini");
-        let text = std::fs::read_to_string(&ini).unwrap_or_default();
-        let merged = merge_ini(&text, "[/Script/UnrealEd.EditorPerformanceSettings]", &[("bThrottleCPUWhenNotForeground".to_string(), "False".to_string())]);
-        if merged != text {
-            if let Some(parent) = ini.parent() { let _ = std::fs::create_dir_all(parent); }
-            let _ = std::fs::write(&ini, merged);
-        }
-        extra.push("-ini:EditorPerProjectUserSettings:[/Script/UnrealEd.EditorPerformanceSettings]:bThrottleCPUWhenNotForeground=False".to_string());
+        let _ = write_editor_settings_ini(project, Some(&engine));
+        extra.push(PERF_OVERRIDE.to_string());
     }
+    // Port reuse, so the restart after this one does not wait out the old connections.
+    extra.push(HTTP_REUSE_OVERRIDE.to_string());
     let pid = crate::unreal_process::launch(&engine, &project.uproject, port, &extra)?;
     let timeout = Duration::from_secs(args["timeout_s"].as_u64().unwrap_or(900).clamp(30, 3600));
     loop {
@@ -717,23 +735,49 @@ fn write_remote_control_ini(project: &Project) -> Result<Value> {
     }))
 }
 
-/// "Use Less CPU when in Background", off. Changed only in memory (as `ue_play` does), it comes
-/// back on at the next start, so it goes into the project's default per-user settings, and into
-/// any saved per-user file that already holds it, since that file wins over the default.
+/// "Use Less CPU when in Background", off. The setting lives in the EditorSettings config, which
+/// is shared by every project on one engine version: the project's `DefaultEditorSettings.ini`,
+/// then the user's saved `EditorSettings.ini` (the engine's `Saved/Config` for a source build, the
+/// per-user engine folder for an installed one), which wins over the default. Changed only in
+/// memory, or written to the per-project user settings, it came back on at every start.
 const PERF_SECTION: &str = "[/Script/UnrealEd.EditorPerformanceSettings]";
 const PERF_KEY: &str = "bThrottleCPUWhenNotForeground";
+const PERF_OVERRIDE: &str = "-ini:EditorSettings:[/Script/UnrealEd.EditorPerformanceSettings]:bThrottleCPUWhenNotForeground=False";
+/// Unreal's HTTP server binds without address reuse by default, so after a quit the Remote
+/// Control port stays unbindable for the ~60 s its closed connections linger (TIME_WAIT).
+const HTTP_REUSE_OVERRIDE: &str = "-ini:Engine:[HTTPServer.Listeners]:DefaultReuseAddressAndPort=True";
 
-fn write_editor_settings_ini(project: &Project) -> Result<Value> {
-    let keys = [(PERF_KEY.to_string(), "False".to_string())];
-    let mut files = vec![project.root.join("Config/DefaultEditorPerProjectUserSettings.ini")];
-    if let Ok(dirs) = std::fs::read_dir(project.root.join("Saved/Config")) {
-        for dir in dirs.flatten() {
-            let saved = dir.path().join("EditorPerProjectUserSettings.ini");
-            if std::fs::read_to_string(&saved).is_ok_and(|t| t.lines().any(|l| l.split_once('=').is_some_and(|(k, _)| k.trim() == PERF_KEY))) {
-                files.push(saved);
-            }
-        }
+/// Saved `EditorSettings.ini` files that already set the throttle; the editor wrote them, so
+/// only those are touched, never a folder guessed for an engine version that is not installed.
+fn saved_editor_settings(engine: Option<&Path>) -> Vec<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let mut roots: Vec<PathBuf> = vec![home.join(".config/Epic/UnrealEngine"), home.join("Library/Application Support/Epic/UnrealEngine")];
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        roots.push(PathBuf::from(local).join("UnrealEngine"));
     }
+    // <root>/<version>/Saved/Config/<Platform>Editor/EditorSettings.ini
+    let mut saved: Vec<PathBuf> = roots.iter().flat_map(|r| std::fs::read_dir(r).into_iter().flatten().flatten().map(|v| v.path().join("Saved/Config"))).collect();
+    if let Some(engine) = engine {
+        saved.push(engine.join("Engine/Saved/Config"));
+    }
+    settings_files_in(&saved)
+}
+
+fn settings_files_in(saved: &[PathBuf]) -> Vec<PathBuf> {
+    saved.iter()
+        .flat_map(|c| std::fs::read_dir(c).into_iter().flatten().flatten().map(|p| p.path().join("EditorSettings.ini")))
+        .filter(|f| std::fs::read_to_string(f).is_ok_and(|t| t.lines().any(|l| l.split_once('=').is_some_and(|(k, _)| k.trim() == PERF_KEY))))
+        .collect()
+}
+
+fn write_editor_settings_ini(project: &Project, engine: Option<&Path>) -> Result<Value> {
+    write_editor_settings(project, saved_editor_settings(engine))
+}
+
+fn write_editor_settings(project: &Project, saved: Vec<PathBuf>) -> Result<Value> {
+    let keys = [(PERF_KEY.to_string(), "False".to_string())];
+    let mut files = vec![project.root.join("Config/DefaultEditorSettings.ini")];
+    files.extend(saved);
     let mut changed = Vec::new();
     for path in &files {
         let text = std::fs::read_to_string(path).unwrap_or_default();
@@ -745,6 +789,64 @@ fn write_editor_settings_ini(project: &Project) -> Result<Value> {
         }
     }
     Ok(json!({"files": files, "changed": changed, "written": format!("{PERF_KEY}=False")}))
+}
+
+/// `.uasset`/`.umap` files under Content the editor cannot save over.
+fn read_only_assets(project: &Project) -> Vec<PathBuf> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            let Ok(meta) = e.metadata() else { continue };
+            if meta.is_dir() {
+                walk(&p, out);
+            } else if matches!(p.extension().and_then(|x| x.to_str()), Some("uasset" | "umap")) && meta.permissions().readonly() {
+                out.push(p);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&project.root.join("Content"), &mut out);
+    out.sort();
+    out
+}
+
+/// Git LFS makes files marked `lockable` read-only on checkout until they are locked.
+fn lfs_lockable(project: &Project) -> bool {
+    std::fs::read_to_string(project.root.join(".gitattributes")).is_ok_and(|t| t.lines().any(|l| !l.trim_start().starts_with('#') && l.contains("lockable")))
+}
+
+/// Owner-writable, as `chmod u+w` does (not `git lfs lock`, which needs a lock server and
+/// blocks everyone else); then tell LFS to stop making lockable files read-only here.
+fn make_writable(project: &Project, files: &[PathBuf], lockable: bool) -> Value {
+    let mut failed = Vec::new();
+    for f in files {
+        let result = std::fs::metadata(f).and_then(|m| {
+            let mut perms = m.permissions();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                perms.set_mode(perms.mode() | 0o200);
+            }
+            #[cfg(not(unix))]
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            std::fs::set_permissions(f, perms)
+        });
+        if let Err(e) = result {
+            failed.push(format!("{}: {e}", f.display()));
+        }
+    }
+    let lfs = lockable.then(|| {
+        let mut command = std::process::Command::new("git");
+        command.arg("-C").arg(&project.root).args(["config", "lfs.setlockablereadonly", "false"]);
+        match relay_core::proc::output_with_timeout(&mut command, Duration::from_secs(20)) {
+            Ok(Some(o)) if o.status.success() => json!("lfs.setlockablereadonly=false"),
+            Ok(Some(o)) => json!(format!("git config failed: {}", String::from_utf8_lossy(&o.stderr).trim())),
+            Ok(None) => json!("git config timed out"),
+            Err(e) => json!(format!("git config failed: {e}")),
+        }
+    });
+    json!({"made_writable": files.len() - failed.len(), "failed": failed, "lfs": lfs})
 }
 
 /// Set keys inside one ini section, keeping every other line and section as it was.
@@ -859,6 +961,8 @@ fn play(project: &Project, args: &Value) -> Result<Value> {
         None => None,
     };
     let log_start = log_len(project);
+    // Distinct per ue_play call, for probes that keep state between checkpoints.
+    let play_id = format!("{}-{}", std::process::id(), now_secs());
     let started = play_step("start", json!({"mode": args["mode"].as_str().unwrap_or("pie")}))?;
     wait_for_play(true)?;
     let t0 = std::time::Instant::now();
@@ -869,16 +973,21 @@ fn play(project: &Project, args: &Value) -> Result<Value> {
             play_step("console", json!({"commands": commands}))?;
         }
         let mut probes = Vec::new();
-        for at in &checkpoints {
+        for (index, at) in checkpoints.iter().enumerate() {
             std::thread::sleep(Duration::from_secs_f64(*at).saturating_sub(t0.elapsed()));
             // Probe first, then capture, then wait for this capture's file: a screenshot is
             // written a frame or more after the request, and pairing by order let images fall
             // one checkpoint behind the probes.
             if let Some(code) = args["probe"].as_str() {
-                let out = python_tx(&format!("ARGS_JSON = {}\n{PY_COMMON}\nworld = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_game_world()\n{code}", py_str("{}")), Duration::from_secs(60), false);
+                // A counter kept by the probe itself outlived the session it counted and carried
+                // into the next one after a failure. Hand it the checkpoint instead.
+                let here = json!({"checkpoint": index, "checkpoints": checkpoints.len(), "at": at, "session": play_id});
+                let out = python_tx(&format!(
+                    "ARGS_JSON = {}\n{PY_COMMON}\nworld = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_game_world()\ncheckpoint = ARGS['checkpoint']\ncheckpoints = ARGS['checkpoints']\ncheckpoint_at = ARGS['at']\nplay_session = ARGS['session']\nfirst_checkpoint = checkpoint == 0\nlast_checkpoint = checkpoint == checkpoints - 1\n{code}",
+                    py_str(&here.to_string())), Duration::from_secs(60), false);
                 probes.push(match out {
-                    Ok(v) => json!({"at": at, "output": v["output"]}),
-                    Err(e) => json!({"at": at, "error": format!("{e:#}")}),
+                    Ok(v) => json!({"checkpoint": index, "at": at, "output": v["output"]}),
+                    Err(e) => json!({"checkpoint": index, "at": at, "error": format!("{e:#}")}),
                 });
             }
             if screenshots {
@@ -919,7 +1028,7 @@ fn play(project: &Project, args: &Value) -> Result<Value> {
     })();
     let last = play_step("status", json!({})).ok();
     let stopped = if args["stop"].as_bool().unwrap_or(true) {
-        play_step("stop", json!({"restore_throttle": started["was_throttled"]})).and_then(|_| wait_for_play(false)).err().map(|e| format!("{e:#}"))
+        play_step("stop", json!({})).and_then(|_| wait_for_play(false)).err().map(|e| format!("{e:#}"))
     } else {
         None
     };
@@ -1026,9 +1135,8 @@ fn profile(project: &Project, args: &Value) -> Result<Value> {
     let play = args["play"].as_bool().unwrap_or(true);
     let dir = project.root.join("Saved/Profiling/CSV");
     let before: std::collections::HashSet<PathBuf> = std::fs::read_dir(&dir).map(|e| e.flatten().map(|e| e.path()).collect()).unwrap_or_default();
-    let mut throttle = Value::Null;
     if play {
-        throttle = play_step("start", json!({"mode":"pie"}))?["was_throttled"].clone();
+        play_step("start", json!({"mode":"pie"}))?;
         wait_for_play(true)?;
     }
     let run = (|| -> Result<()> {
@@ -1042,7 +1150,7 @@ fn profile(project: &Project, args: &Value) -> Result<Value> {
         Ok(())
     })();
     if play {
-        let _ = play_step("stop", json!({"restore_throttle": throttle})).and_then(|_| wait_for_play(false));
+        let _ = play_step("stop", json!({})).and_then(|_| wait_for_play(false));
     }
     run?;
     let mut file = None;
@@ -1459,7 +1567,7 @@ fn setup_check(project: &Project, fix: bool) -> Result<Value> {
         std::fs::write(&project.uproject, out).with_context(|| format!("writing {}", project.uproject.display()))?;
     }
     let ini = if fix { Some(write_remote_control_ini(project)?) } else { None };
-    let editor_ini = if fix { Some(write_editor_settings_ini(project)?) } else { None };
+    let editor_ini = if fix { Some(write_editor_settings_ini(project, engine_root(project).ok().as_deref())?) } else { None };
     let editor = remote("GET", "/remote/info", None, Duration::from_secs(3));
     let python_ok = match &editor {
         Ok(_) => python("print('relay-python-ok')", Duration::from_secs(20))
@@ -1472,11 +1580,20 @@ fn setup_check(project: &Project, fix: bool) -> Result<Value> {
     let throttled = match &python_ok {
         Ok(true) => python_json(&format!(
             "import json, unreal\ns = unreal.get_default_object(unreal.EditorPerformanceSettings)\nwas = bool(s.get_editor_property('throttle_cpu_when_not_foreground'))\n{}print('RELAY_JSON:' + json.dumps(was))\n",
-            if fix { "s.set_editor_property('throttle_cpu_when_not_foreground', False)\n" } else { "" }
+            if fix { "s.set_editor_property('throttle_cpu_when_not_foreground', False)\nif hasattr(s, 'save_config'):\n    s.save_config()\n" } else { "" }
         ), Duration::from_secs(20)).ok().and_then(|v| v.as_bool()),
         _ => None,
     };
+    let read_only = read_only_assets(project);
+    let lockable = lfs_lockable(project);
+    let writable = if fix && !read_only.is_empty() { Some(make_writable(project, &read_only, lockable)) } else { None };
     let mut advice = Vec::new();
+    if !read_only.is_empty() && writable.is_none() {
+        advice.push(format!("{} asset file(s) under Content are read-only, so the editor cannot save them{}. Run ue_setup_check with fix=true to make them writable{}.",
+            read_only.len(),
+            if lockable { " (.gitattributes marks assets lockable, and Git LFS makes lockable files read-only on checkout)" } else { "" },
+            if lockable { " and set lfs.setlockablereadonly=false in this checkout so LFS stops doing it" } else { "" }));
+    }
     if !missing.is_empty() && fixed.is_empty() {
         advice.push(format!("Enable {} (Edit > Plugins, or run ue_setup_check with fix=true) and restart the editor.", missing.join(", ")));
     }
@@ -1487,7 +1604,7 @@ fn setup_check(project: &Project, fix: bool) -> Result<Value> {
         advice.push("Config/DefaultRemoteControl.ini now enables the web server at start-up, remote Python, console commands and remote function calls; restart the editor (ue_editor_quit, then ue_editor_launch) to apply it.".to_string());
     }
     if throttled == Some(true) && !fix {
-        advice.push("Use Less CPU when in Background is on: the editor barely ticks while another window has focus. Run ue_setup_check with fix=true to turn it off for good (it writes Config/DefaultEditorPerProjectUserSettings.ini).".to_string());
+        advice.push("Use Less CPU when in Background is on: the editor barely ticks while another window has focus. Run ue_setup_check with fix=true to turn it off for good (it writes Config/DefaultEditorSettings.ini and the saved EditorSettings.ini).".to_string());
     }
     if editor.is_err() {
         advice.push("Open the project in the editor and start the Remote Control web server: run `WebControl.StartServer` in the editor console, or turn on auto-start under Project Settings > Plugins > Remote Control. Set UE_REMOTE_CONTROL_URL if it is not on 127.0.0.1:30010.".to_string());
@@ -1500,6 +1617,7 @@ fn setup_check(project: &Project, fix: bool) -> Result<Value> {
         "added_to_uproject": fixed,
         "remote_control_ini": ini,
         "background_throttle": {"was_on": throttled, "ini": editor_ini},
+        "read_only_assets": {"count": read_only.len(), "first": read_only.iter().take(20).map(|p| p.strip_prefix(&project.root).unwrap_or(p).display().to_string()).collect::<Vec<_>>(), "lfs_lockable": lockable, "fixed": writable},
         "remote_control_url": remote_base(),
         "editor_reachable": editor.is_ok(),
         "editor_error": editor.err().map(|e| e.to_string()),
@@ -1711,6 +1829,20 @@ fn python_tx(code: &str, timeout: Duration, transaction: bool) -> Result<Value> 
         bail!("Python failed:\n{}", serde_json::to_string_pretty(&result)?);
     }
     Ok(result)
+}
+
+/// Failures that leave no Python error behind, read from the script's output and the log lines
+/// written during the call. Each has cost a session before.
+fn python_warnings(output: &str, log: &[String]) -> Vec<String> {
+    let lines: Vec<String> = output.lines().map(str::to_string).chain(log.iter().cloned()).map(|l| l.to_lowercase()).collect();
+    let mut warnings = Vec::new();
+    if lines.iter().any(|l| l.contains("navigation") && l.contains("locked")) {
+        warnings.push("The navigation build was refused (\"navigation build is locked\"): it cannot run in the same call that builds or changes the level. A level saved now holds an empty navmesh, and AI will stand still. Rebuild in a separate ue_python call (unreal.SystemLibrary.execute_console_command(world, 'RebuildNavigation')), then save the level in the call after that; or give the map runtime navigation generation.".to_string());
+    }
+    if lines.iter().any(|l| (l.contains("read-only") || l.contains("read only")) && (l.contains("save") || l.contains("package") || l.contains(".uasset") || l.contains(".umap"))) {
+        warnings.push("A package could not be saved because its file is read-only (Git LFS makes lockable files read-only on checkout). ue_setup_check lists read-only assets; with fix=true it makes them writable and stops LFS doing it again in this checkout.".to_string());
+    }
+    warnings
 }
 
 /// Run a script that prints one line `RELAY_JSON:<json>` and return that JSON.
@@ -2095,20 +2227,58 @@ mod tests {
     fn the_background_throttle_stays_off_across_restarts() {
         let root = tempfile::tempdir().unwrap();
         let project = bare_project(root.path());
-        let saved = root.path().join("Saved/Config/LinuxEditor");
+        // A source-built engine keeps the user's EditorSettings.ini under Engine/Saved/Config.
+        let engine_config = root.path().join("Engine/Saved/Config");
+        let saved = engine_config.join("LinuxEditor");
         std::fs::create_dir_all(&saved).unwrap();
-        std::fs::write(saved.join("EditorPerProjectUserSettings.ini"), format!("{PERF_SECTION}\n{PERF_KEY}=True\nbMonitorEditorPerformance=True\n")).unwrap();
-        let other = root.path().join("Saved/Config/WindowsEditor");
+        std::fs::write(saved.join("EditorSettings.ini"), format!("{PERF_SECTION}\n{PERF_KEY}=True\nbMonitorEditorPerformance=True\n")).unwrap();
+        let other = engine_config.join("WindowsEditor");
         std::fs::create_dir_all(&other).unwrap();
-        std::fs::write(other.join("EditorPerProjectUserSettings.ini"), "[Other]\nA=1\n").unwrap();
-        let result = write_editor_settings_ini(&project).unwrap();
+        std::fs::write(other.join("EditorSettings.ini"), "[Other]\nA=1\n").unwrap();
+        let found = settings_files_in(&[engine_config]);
+        assert_eq!(found, vec![saved.join("EditorSettings.ini")], "only a file the editor wrote the key to");
+        let result = write_editor_settings(&project, found.clone()).unwrap();
         assert_eq!(result["changed"].as_array().unwrap().len(), 2, "{result}");
-        let default = std::fs::read_to_string(root.path().join("Config/DefaultEditorPerProjectUserSettings.ini")).unwrap();
+        let default = std::fs::read_to_string(root.path().join("Config/DefaultEditorSettings.ini")).unwrap();
         assert_eq!(default, format!("{PERF_SECTION}\n{PERF_KEY}=False\n"));
-        let user = std::fs::read_to_string(saved.join("EditorPerProjectUserSettings.ini")).unwrap();
+        let user = std::fs::read_to_string(saved.join("EditorSettings.ini")).unwrap();
         assert!(user.contains(&format!("{PERF_KEY}=False\nbMonitorEditorPerformance=True")), "{user}");
-        assert_eq!(std::fs::read_to_string(other.join("EditorPerProjectUserSettings.ini")).unwrap(), "[Other]\nA=1\n", "a file without the key is left to the default");
-        assert_eq!(write_editor_settings_ini(&project).unwrap()["changed"], json!([]), "a second run changes nothing");
+        assert_eq!(std::fs::read_to_string(other.join("EditorSettings.ini")).unwrap(), "[Other]\nA=1\n");
+        assert_eq!(write_editor_settings(&project, found).unwrap()["changed"], json!([]), "a second run changes nothing");
+        assert!(PERF_OVERRIDE.starts_with("-ini:EditorSettings:[/Script/UnrealEd.EditorPerformanceSettings]:"));
+    }
+
+    #[test]
+    fn silent_python_failures_become_warnings() {
+        assert!(python_warnings("built 12 walls\nsaved", &[]).is_empty());
+        let nav = python_warnings("", &["[2026.09.24-10.00.00:000][  0]LogNavigation: Error: Navigation build is locked".to_string()]);
+        assert!(nav.len() == 1 && nav[0].contains("separate ue_python call"), "{nav:?}");
+        let ro = python_warnings("[Error] Failed to save package /Game/L_MovementGym: the file is read-only", &[]);
+        assert!(ro.len() == 1 && ro[0].contains("ue_setup_check"), "{ro:?}");
+    }
+
+    #[test]
+    fn read_only_assets_are_found_and_made_writable() {
+        let root = tempfile::tempdir().unwrap();
+        let project = bare_project(root.path());
+        let dir = root.path().join("Content/Enemies");
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["BP_Enemy_Soldier.uasset", "L_MovementGym.umap", "notes.txt", "DA_Rifle.uasset"] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        for name in ["BP_Enemy_Soldier.uasset", "L_MovementGym.umap", "notes.txt"] {
+            let mut perms = std::fs::metadata(dir.join(name)).unwrap().permissions();
+            perms.set_readonly(true);
+            std::fs::set_permissions(dir.join(name), perms).unwrap();
+        }
+        let found = read_only_assets(&project);
+        assert_eq!(found, vec![dir.join("BP_Enemy_Soldier.uasset"), dir.join("L_MovementGym.umap")]);
+        assert!(!lfs_lockable(&project));
+        std::fs::write(root.path().join(".gitattributes"), "# *.uasset lockable\n*.umap filter=lfs diff=lfs merge=lfs -text lockable\n").unwrap();
+        assert!(lfs_lockable(&project));
+        let fixed = make_writable(&project, &found, false);
+        assert_eq!(fixed["made_writable"], 2, "{fixed}");
+        assert!(read_only_assets(&project).is_empty());
     }
 
     #[test]

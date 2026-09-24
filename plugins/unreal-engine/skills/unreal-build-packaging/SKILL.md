@@ -292,8 +292,9 @@ Plugins/MyTools/
 
 There is no Live Coding on Linux: every C++ change means close, build, relaunch (one to five
 minutes). Do it in one call: `ue_build {"restart_editor": true}` saves and quits the editor,
-waits for it to exit and for the Remote Control port to be released, builds, relaunches, and
-waits until the editor answers. Batch C++ changes to pay that cost less often.
+waits for it to exit, builds, relaunches (waiting for the Remote Control port only if it is still
+held, which with port reuse on it no longer is from the second restart), and waits until the
+editor answers. Batch C++ changes to pay that cost less often.
 
 Two traps `ue_build` now guards against:
 - A leftover **CrashReportClient** makes UnrealBuildTool think an editor is running, so it builds

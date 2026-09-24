@@ -19,11 +19,18 @@ and the log path. **Call it first in every task.**
 With `fix`, also writes `Config/DefaultRemoteControl.ini` (web server at start-up, remote Python,
 console commands, remote function calls), checking each key against the engine's
 `RemoteControlSettings.h` when the engine source is present, and turns *Use Less CPU when in
-Background* off for good: `bThrottleCPUWhenNotForeground=False` in
-`Config/DefaultEditorPerProjectUserSettings.ini`, in any `Saved/Config/*/EditorPerProjectUserSettings.ini`
-that already holds the key (it overrides the default), and in the running editor, so the value it
-writes back on quitting is the same. Without `fix`, `background_throttle.was_on` reports the
-running editor's value and `advice` says when it is on.
+Background* off for good. The setting belongs to the **EditorSettings** config (shared by every
+project on one engine version), not the per-project user settings: `bThrottleCPUWhenNotForeground=False`
+goes into `Config/DefaultEditorSettings.ini`, into any saved `EditorSettings.ini` that already holds
+the key (it overrides the default: `Engine/Saved/Config/<Platform>Editor/` for a source build, the
+per-user engine folder such as `~/.config/Epic/UnrealEngine/<version>/Saved/Config/` for an installed
+one), and into the running editor, so the value it writes back on quitting is the same. Without
+`fix`, `background_throttle.was_on` reports the running editor's value and `advice` says when it is on.
+
+Also lists `.uasset`/`.umap` files under `Content` that are read-only, which the editor cannot save
+(`read_only_assets`). Git LFS makes files marked `lockable` in `.gitattributes` read-only on
+checkout. With `fix`, they are made owner-writable (as `chmod u+w`, not `git lfs lock`) and, when
+assets are lockable, `lfs.setlockablereadonly=false` is set in this checkout so LFS stops doing it.
 
 Whether *RemoteControl*, *PythonScriptPlugin* and *EditorScriptingUtilities* are enabled in the
 `.uproject`, whether the editor answers, whether remote Python runs, and a list of `advice` steps.
@@ -64,7 +71,11 @@ frees itself after 15 idle minutes.
 ### `ue_python` — `{ code, timeout_s? }`
 Runs the code as a file through `PythonScriptLibrary.ExecutePythonCommandEx`. Returns `ok`, the
 printed `output` (warnings and errors are prefixed with their type) and the command `result`.
-A Python exception is a tool error carrying the traceback.
+A Python exception is a tool error carrying the traceback. `warnings` names failures that raise no
+Python error, read from the output and the log lines written during the call: a navigation rebuild
+refused as "navigation build is locked" (it cannot run in the call that builds the level; rebuild
+in a separate call, then save, or the saved level has an empty navmesh), and a save refused
+because the file is read-only.
 
 ### `ue_call` — `{ object_path, function, parameters?, transaction? }`
 `PUT /remote/object/call`. For a static `BlueprintCallable` function, call it on the class default
@@ -86,11 +97,16 @@ Actors of the open level with label, class, object path, outliner folder and loc
 Runs a console command in the editor world. Output lands in the log; read it with `ue_log`.
 
 ### `ue_editor_launch` — `{ timeout_s?, extra_args? }` and `ue_editor_quit` — `{ save? }`
-Launch waits for the Remote Control port to be free, starts the editor with `-RCWebControlEnable`
-(and with "Use Less CPU when in Background" overridden off unless `keep_background_throttle`),
-and waits until Remote Control answers, failing early on a bind error in the new log. Quit saves
-dirty packages (unless `save: false`), asks the editor to quit, sends a terminate signal if it is
-still running 20 s later, waits for the port to be released, and reports the timing of each step.
+Launch waits for the Remote Control port to be free, starts the editor with `-RCWebControlEnable`,
+with "Use Less CPU when in Background" overridden off (`-ini:EditorSettings:...`, and written off
+in the EditorSettings files) unless `keep_background_throttle`, and with address reuse on for
+Unreal's HTTP server (`-ini:Engine:[HTTPServer.Listeners]:DefaultReuseAddressAndPort=True`), then
+waits until Remote Control answers, failing early on a bind error in the new log. Without reuse,
+a quit editor's closed connections keep the port unbindable for about 60 s; with it, the next
+restart binds at once. Quit saves dirty packages (unless `save: false`), asks the editor to quit,
+sends a terminate signal if it is still running 20 s later, and returns once the process has
+exited, with the timing of each step and the state of the `port` (free, held by a listener, or
+lingering connections that the next launch waits out).
 
 When the editor is unreachable, `ue_editor_status` says which case it is: editor running but no
 server, a failed bind (run `WebControl.StopServer` then `WebControl.StartServer`), or the port
@@ -108,7 +124,11 @@ Who holds the editor lock; `release` gives up your own.
 Starts Play In Editor (`mode: "simulate"` for Simulate), waits until it runs, runs `console`
 commands, and at each checkpoint (seconds after start; default the end) takes an in-game
 screenshot (`HighResShot`) and runs `probe` — Python with `unreal` and `world` (the game world) in
-scope, whose printed output is returned. Then it stops the session and returns the screenshots as
+scope, whose printed output is returned. The probe also gets `checkpoint` (0-based index),
+`checkpoints` (count), `checkpoint_at` (seconds), `first_checkpoint`, `last_checkpoint` and
+`play_session` (distinct per `ue_play` call). Use these rather than a counter of your own: state a
+probe keeps can outlive a failed session and shift every later count. Each probe result carries its
+`checkpoint`. Then it stops the session and returns the screenshots as
 images, the probe output, and the log lines written while playing (default filter: errors,
 warnings, ensures, "Accessed None", Blueprint user messages). On engine versions whose Python has
 no play-in-editor request it falls back to Simulate and says so.

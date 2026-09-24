@@ -268,20 +268,31 @@ These cost hours once. Check here before debugging them again.
   remote Python, console commands, remote function calls; keys are checked against the engine's
   own `RemoteControlSettings.h`). Restart the editor afterwards.
 - *Quitting takes a while.* `ue_editor_quit` saves, asks the editor to quit, sends a terminate
-  signal if it is still running 20 s later, and reports a `timing` breakdown (save and request,
-  signal, exit, port free) so a slow step can be named.
+  signal if it is still running 20 s later, and returns once the process has exited, with a
+  `timing` breakdown (save and request, signal, exit) and the state of the `port`.
 - *The port stays held after the editor closes.* A quick relaunch then fails to bind with one log
   line, and `WebControl.StartServer` alone does nothing: run `WebControl.StopServer` first. Use
   `ue_editor_quit` and `ue_editor_launch`, which wait for the port and read the log for a failed
-  bind; `ue_editor_status` explains which of the three unreachable cases you are in.
+  bind; `ue_editor_status` explains which of the three unreachable cases you are in. The ~60 s
+  wait after a quit was the closed connections lingering (TIME_WAIT) because Unreal's HTTP server
+  binds without address reuse; `ue_editor_launch` turns reuse on, so from the second restart on
+  the port is free at once.
 - *The editor throttles itself in the background* (a few fps), and the setting comes back on
   every start. `ue_editor_launch` starts the editor with it overridden off; `ue_play` and
   `ue_profile` also turn it off (and save it where the engine allows) and report `average_fps`;
-  below 20 fps a timed test means nothing. `ue_editor_launch` also writes the setting off into
-  the project's saved per-project user settings before starting the editor, so it survives
-  restarts. For an editor started by hand, `ue_setup_check {"fix": true}` writes it to
-  `Config/DefaultEditorPerProjectUserSettings.ini` (and the saved per-user file) and turns it off
-  in the running editor.
+  below 20 fps a timed test means nothing. The setting is in the **EditorSettings** config, not
+  EditorPerProjectUserSettings (writing it there, and restoring it after play, is why it kept
+  coming back). `ue_editor_launch` writes it off into `Config/DefaultEditorSettings.ini` and the
+  saved `EditorSettings.ini` before starting the editor; for an editor started by hand,
+  `ue_setup_check {"fix": true}` does the same and turns it off in the running editor. Play no
+  longer turns it back on afterwards.
+- *Probes need the checkpoint.* `ue_play` gives each probe `checkpoint`, `checkpoints`,
+  `checkpoint_at`, `first_checkpoint`, `last_checkpoint` and `play_session`. Do not count
+  checkpoints in a global: after a failed run the count carried into the next one and a test
+  never fired.
+- *Read-only assets.* Git LFS makes `lockable` files read-only on checkout, and the editor then
+  cannot save them. `ue_setup_check` lists them; `fix: true` makes them writable (as `chmod u+w`,
+  not `git lfs lock`) and sets `lfs.setlockablereadonly=false` in the checkout.
 - *Seeing the game from outside the player's camera.* Python cannot spawn into a running game;
   `ue_play` with `outside` places a capture in the level before play and moves it around the
   player at each checkpoint, showing first-person arms and guns from the side or front.
@@ -294,6 +305,12 @@ These cost hours once. Check here before debugging them again.
   level, so they rarely need isolation at all.
 
 **Python API gaps**
+- *Navigation does not build in the call that builds the level.* A rebuild there is refused
+  ("navigation build is locked") without a Python error, and a level saved then has an empty
+  navmesh: AI stands still. Place the NavMeshBoundsVolume in one `ue_python` call; run
+  `RebuildNavigation` (`unreal.SystemLibrary.execute_console_command(world, "RebuildNavigation")`)
+  in a separate call; save the level in the call after that. Or set the project's navigation to
+  generate at runtime. `ue_python` returns a `warning` when the refusal appears.
 - *Collision set with `set_collision_enabled` is not saved*: that is a runtime call. For an
   asset, change the mesh's `body_setup` (and save the mesh); for a placed actor, change the
   component's `body_instance` struct and set it back with `set_editor_property`, then save the

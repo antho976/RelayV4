@@ -261,6 +261,11 @@ pub fn port_free(port: u16) -> bool {
     std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
 }
 
+/// Something accepts connections on the port: a live server, not just closed connections.
+pub fn port_listening(port: u16) -> bool {
+    std::net::TcpStream::connect_timeout(&std::net::SocketAddr::from(([127, 0, 0, 1], port)), Duration::from_millis(300)).is_ok()
+}
+
 pub fn wait_port_free(port: u16, timeout: Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     loop {
@@ -337,7 +342,9 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         assert!(!port_free(port));
+        assert!(port_listening(port));
         drop(listener);
+        assert!(!port_listening(port));
         assert!(wait_port_free(port, Duration::from_secs(5)));
         assert_eq!(port_of("http://127.0.0.1:30010"), 30010);
         assert_eq!(port_of("http://localhost:31000/"), 31000);
