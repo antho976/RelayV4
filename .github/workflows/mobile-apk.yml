@@ -37,14 +37,15 @@ on:
 permissions:
     contents: write
 
-# One APK build per branch at a time; a newer push supersedes the one still compiling.
-concurrency:
-    group: mobile-apk-${{ github.ref }}
-    cancel-in-progress: true
-
 jobs:
     build-apk:
         if: ${{ github.event_name != 'push' || github.ref_type == 'tag' || contains(github.event.head_commit.message, '[apk]') }}
+        # One APK build per branch at a time; a newer build supersedes the one still compiling.
+        # This sits on the job, not the workflow: a push without `[apk]` skips the job and so
+        # must not cancel a build that is running.
+        concurrency:
+            group: mobile-apk-${{ github.ref }}
+            cancel-in-progress: true
         runs-on: ubuntu-latest
         timeout-minutes: 120
         env:
@@ -142,10 +143,22 @@ jobs:
                           `${indent}    keyPassword RELEASE_KEY_PASSWORD\n` +
                           `${indent}}\n${indent}debug {`
                   )
-                  gradle = gradle.replace(
-                      /release \{\n([\s\S]*?)signingConfig signingConfigs\.debug/,
-                      (match, body) => `release {\n${body}signingConfig signingConfigs.release`
-                  )
+                  // Only the release *build type* switches keys. Searching the whole file would
+                  // match the signing config inserted above and re-key the debug build type.
+                  const types = gradle.indexOf('buildTypes {')
+                  gradle =
+                      gradle.slice(0, types) +
+                      gradle
+                          .slice(types)
+                          .replace(
+                              /release \{\n([\s\S]*?)signingConfig signingConfigs\.debug/,
+                              (match, body) => `release {\n${body}signingConfig signingConfigs.release`
+                          )
+                  const release = gradle.slice(gradle.indexOf('buildTypes {')).match(/release \{[\s\S]*?\n\s*\}/)
+                  if (types < 0 || !release || !release[0].includes('signingConfigs.release')) {
+                      console.error('Could not point the release build type at the release key')
+                      process.exit(1)
+                  }
                   fs.writeFileSync(file, gradle)
                   console.log('Release signing configured')
                   EOF

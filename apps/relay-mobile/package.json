@@ -62,6 +62,7 @@
     "expo-sqlite": "~57.0.3",
     "expo-system-ui": "~57.0.4",
     "i18next": "^26.0.10",
+    "lodash.merge": "^4.6.2",
     "mime": "^4.0.7",
     "ratex-react-native": "^0.1.13",
     "react": "19.2.3",
