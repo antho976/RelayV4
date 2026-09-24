@@ -361,8 +361,10 @@ class RelayClient {
             transport: 'direct' as const,
         }))
         const via = host.via ? [{ url: host.via, transport: 'via' as const }] : []
-        const groups =
-            host.route === 'direct' ? [direct] : host.route === 'via' ? [via] : [direct, via]
+        // A pin to a route this PC does not have (Server only with no server) would leave
+        // nothing to try; it falls back to Auto instead of failing every connect.
+        const pinned = host.route === 'direct' ? direct : host.route === 'via' ? via : []
+        const groups = pinned.length > 0 ? [pinned] : [direct, via]
         return groups.filter((group) => group.length > 0)
     }
 
@@ -446,12 +448,7 @@ class RelayClient {
             hostName: host.name,
         })
         const groups = this.routeGroups(host)
-        let lastError =
-            host.route === 'direct'
-                ? 'This PC has no WiFi address; set its route to Auto or Server'
-                : host.route === 'via'
-                  ? 'This PC has no server route; set its route to Auto or WiFi'
-                  : 'This PC has no address to connect to'
+        let lastError = 'This PC has no address to connect to; pair it again or add one'
         if (groups.length === 0) this.wanted = undefined
         for (const group of groups) {
             try {

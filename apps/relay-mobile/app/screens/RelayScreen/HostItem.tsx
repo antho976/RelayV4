@@ -116,11 +116,15 @@ const HostItem: React.FC<HostItemProps> = ({ host }) => {
         })
     }
 
+    // A pin is offered only for a route this PC has: "Server only" with no server would
+    // leave nothing to try. A pin whose route has since gone reads, and acts, as Auto.
+    const hasDirect = routes.some((route) => route.kind !== 'server')
     const choices: { label: string; value: RelayRoute }[] = [
         { label: 'Auto', value: 'auto' },
-        { label: 'Direct only', value: 'direct' },
-        { label: 'Server only', value: 'via' },
+        ...(hasDirect && host.via ? [{ label: 'Direct only', value: 'direct' as const }] : []),
+        ...(hasDirect && host.via ? [{ label: 'Server only', value: 'via' as const }] : []),
     ]
+    const route = choices.some((choice) => choice.value === host.route) ? host.route : 'auto'
 
     return (
         <View style={styles.record}>
@@ -215,12 +219,14 @@ const HostItem: React.FC<HostItemProps> = ({ host }) => {
                 </TouchableOpacity>
             </View>
 
-            <HorizontalSelector
-                style={{ flex: 0, marginTop: spacing.s }}
-                values={choices}
-                selected={host.route}
-                onPress={(route) => updateHost(host.id, { route })}
-            />
+            {choices.length > 1 && (
+                <HorizontalSelector
+                    style={{ flex: 0, marginTop: spacing.s }}
+                    values={choices}
+                    selected={route}
+                    onPress={(next) => updateHost(host.id, { route: next })}
+                />
+            )}
             <View style={styles.footer}>
                 <Text style={styles.device} numberOfLines={1}>
                     device {host.deviceId}
