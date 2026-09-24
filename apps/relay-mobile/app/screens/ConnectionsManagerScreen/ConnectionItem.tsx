@@ -16,9 +16,15 @@ type ConnectionItemProps = {
     item: APIManagerValue
     index: number
     pendingOpen?: number
+    onPendingOpened?: () => void
 }
 
-const ConnectionItem: React.FC<ConnectionItemProps> = ({ item, index, pendingOpen }) => {
+const ConnectionItem: React.FC<ConnectionItemProps> = ({
+    item,
+    index,
+    pendingOpen,
+    onPendingOpened,
+}) => {
     const { spacing, color } = Theme.useTheme()
     const styles = useStyles()
     const editorRef = useBottomSheetRef()
@@ -29,8 +35,10 @@ const ConnectionItem: React.FC<ConnectionItemProps> = ({ item, index, pendingOpe
     )
 
     useEffect(() => {
-        if (index === pendingOpen) editorRef.current?.open()
-    }, [editorRef, index, pendingOpen])
+        if (index !== pendingOpen) return
+        editorRef.current?.open()
+        onPendingOpened?.()
+    }, [editorRef, index, pendingOpen, onPendingOpened])
 
     const animatedStyle = useAnimatedActiveColorStyle({
         deactiveColor: color.neutral._200,

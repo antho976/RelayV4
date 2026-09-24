@@ -71,10 +71,10 @@ const CharacterEditPopup: React.FC<CharacterEditPopupProps> = ({
                 return
             }
             await setId(chatId)
-            setNowLoading(false)
             router.push('/screens/ChatScreen')
         } catch (error) {
             Logger.errorToast(t('character.list.errors.load', { error }))
+        } finally {
             setNowLoading(false)
         }
     }
@@ -116,9 +116,13 @@ const CharacterEditPopup: React.FC<CharacterEditPopupProps> = ({
                     label: t('character.editor.dialogs.clone.confirm'),
                     onPress: async () => {
                         setNowLoading(true)
-                        await Characters.db.mutate.duplicateCard(character.id)
-
-                        setNowLoading(false)
+                        try {
+                            await Characters.db.mutate.duplicateCard(character.id)
+                        } catch (error) {
+                            Logger.errorToast(t('character.list.errors.load', { error }))
+                        } finally {
+                            setNowLoading(false)
+                        }
                     },
                 },
             ],
@@ -128,10 +132,15 @@ const CharacterEditPopup: React.FC<CharacterEditPopupProps> = ({
     const editCharacter = async (close: () => void) => {
         if (nowLoading) return
         setNowLoading(true)
-        await setCurrentCard(character.id)
-        setNowLoading(false)
-        close()
-        router.push('/screens/CharacterEditorScreen')
+        try {
+            await setCurrentCard(character.id)
+            close()
+            router.push('/screens/CharacterEditorScreen')
+        } catch (error) {
+            Logger.errorToast(t('character.list.errors.load', { error }))
+        } finally {
+            setNowLoading(false)
+        }
     }
 
     return (

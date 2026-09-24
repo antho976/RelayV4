@@ -67,6 +67,8 @@ const ChracterEditorScreen = () => {
     const setShowViewer = useAvatarViewerStore((state) => state.setShow)
     const [edited, setEdited] = useState(false)
     const [altSwipeIndex, setAltSwipeIndex] = useState(0)
+    // greetings added (negative ids) or removed here are written only on save
+    const [removedGreetings, setRemovedGreetings] = useState<number[]>([])
 
     const setCharacterCardEdited = (card: CharacterCardData) => {
         if (!edited) setEdited(true)
@@ -74,12 +76,22 @@ const ChracterEditorScreen = () => {
     }
 
     const handleSaveCard = async () => {
-        if (characterCard && charId)
-            return Characters.db.mutate.updateCard(characterCard, charId).then(() => {
-                setCurrentCard(charId)
-                setEdited(() => false)
-                Logger.infoToast(t('character.editor.messages.saved'))
-            })
+        if (!characterCard || !charId) return
+        for (const id of removedGreetings) await Characters.db.mutate.deleteAltGreeting(id)
+        const alternate_greetings = []
+        for (const item of characterCard.alternate_greetings)
+            alternate_greetings.push(
+                item.id < 0
+                    ? { ...item, id: await Characters.db.mutate.addAltGreeting(charId) }
+                    : item
+            )
+        const card = { ...characterCard, alternate_greetings }
+        await Characters.db.mutate.updateCard(card, charId)
+        setCharacterCard(card)
+        setRemovedGreetings([])
+        setCurrentCard(charId)
+        setEdited(() => false)
+        Logger.infoToast(t('character.editor.messages.saved'))
     }
 
     usePreventRemove(edited, ({ data }) => {
@@ -179,15 +191,11 @@ const ChracterEditorScreen = () => {
         })
     }
 
-    const handleAddAltMessage = async () => {
+    const handleAddAltMessage = () => {
         if (!charId || !characterCard) return
-        const id = await Characters.db.mutate.addAltGreeting(charId)
-        await setCurrentCard(charId)
-
-        // optimistically update editor state
-
+        const id = -Date.now()
         const greetings = [
-            ...(characterCard?.alternate_greetings ?? []),
+            ...characterCard.alternate_greetings,
             { id: id, greeting: '', character_id: charId },
         ]
         setCharacterCardEdited({ ...characterCard, alternate_greetings: greetings })
@@ -196,16 +204,13 @@ const ChracterEditorScreen = () => {
         }
     }
 
-    const deleteAltMessageRoutine = async () => {
-        const id = characterCard?.alternate_greetings[altSwipeIndex].id
+    const deleteAltMessageRoutine = () => {
+        const id = characterCard?.alternate_greetings[altSwipeIndex]?.id
         if (!id || !charId) {
             return
         }
-        await Characters.db.mutate.deleteAltGreeting(id)
-        await setCurrentCard(charId)
-        const greetings = [...(characterCard?.alternate_greetings ?? [])].filter(
-            (item) => item.id !== id
-        )
+        if (id > 0) setRemovedGreetings([...removedGreetings, id])
+        const greetings = characterCard.alternate_greetings.filter((item) => item.id !== id)
         setAltSwipeIndex(0)
         setCharacterCardEdited({ ...characterCard, alternate_greetings: greetings })
     }
@@ -218,9 +223,7 @@ const ChracterEditorScreen = () => {
                 { label: t('common.actions.cancel') },
                 {
                     label: t('character.editor.dialogs.deleteAlternateMessage.confirm'),
-                    onPress: async () => {
-                        await deleteAltMessageRoutine()
-                    },
+                    onPress: deleteAltMessageRoutine,
                     type: 'warning',
                 },
             ],
@@ -481,8 +484,12 @@ const ChracterEditorScreen = () => {
                                     multiline
                                     numberOfLines={16}
                                     onChangeText={(mes) => {
-                                        const greetings = [...characterCard.alternate_greetings]
-                                        greetings[altSwipeIndex].greeting = mes
+                                        const greetings = characterCard.alternate_greetings.map(
+                                            (item, index) =>
+                                                index === altSwipeIndex
+                                                    ? { ...item, greeting: mes }
+                                                    : item
+                                        )
                                         setCharacterCardEdited({
                                             ...characterCard,
                                             alternate_greetings: greetings,

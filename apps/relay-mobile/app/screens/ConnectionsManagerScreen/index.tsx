@@ -78,7 +78,12 @@ const ConnectionsManagerScreen = () => {
                     data={apiValues}
                     keyExtractor={(item, index) => item.configName + index}
                     renderItem={({ item, index }) => (
-                        <ConnectionItem item={item} index={index} pendingOpen={pendingOpen} />
+                        <ConnectionItem
+                            item={item}
+                            index={index}
+                            pendingOpen={pendingOpen}
+                            onPendingOpened={() => setPendingOpen(undefined)}
+                        />
                     )}
                     removeClippedSubviews={false}
                     showsVerticalScrollIndicator={false}

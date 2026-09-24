@@ -2,7 +2,7 @@ import AntDesign from '@react-native-vector-icons/ant-design/static'
 import * as DocumentPicker from 'expo-document-picker'
 import { useNavigation } from 'expo-router'
 import { usePreventRemove } from 'expo-router/build/react-navigation'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { StyleSheet, View } from 'react-native'
 import { useShallow } from 'zustand/react/shallow'
@@ -37,9 +37,25 @@ const UserCardEditor = () => {
 
     const setShowViewer = useAvatarViewerStore((state) => state.setShow)
 
+    const latest = useRef({ edited, currentCard })
     useEffect(() => {
-        // eslint-disable-next-line react-hooks/set-state-in-effect
+        latest.current = { edited, currentCard }
+    })
+
+    // the store card changes on save, avatar change or switching user: keep unsaved edits
+    useEffect(() => {
+        const { edited, currentCard } = latest.current
+        if (edited && currentCard && userCard && currentCard.id === userCard.id) {
+            setCurrentCard({
+                ...userCard,
+                name: currentCard.name,
+                description: currentCard.description,
+            })
+            return
+        }
+        if (edited && currentCard) Characters.db.mutate.updateCard(currentCard, currentCard.id)
         setCurrentCard(userCard)
+        setEdited(false)
     }, [userCard])
 
     const updateCard = (card: CharacterCardData) => {

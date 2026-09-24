@@ -100,9 +100,10 @@ const ModelItem: React.FC<ModelItemProps> = ({
     const isLoaded = isMMPROJ ? mmprojId === item.id : modelId === item.id
 
     const disable =
-        modelLoading || isInvalid || modelImporting || isMMPROJ
-            ? !modelId || isLoaded
-            : modelId !== undefined
+        modelLoading ||
+        isInvalid ||
+        modelImporting ||
+        (isMMPROJ ? !modelId || isLoaded : modelId !== undefined)
     const disableEdit = isLoaded || modelLoading || isInvalid
     const disableDelete = isLoaded || modelLoading
 
@@ -124,8 +125,9 @@ const ModelItem: React.FC<ModelItemProps> = ({
         <View style={styles.modelContainer}>
             <InputSheet
                 ref={editInputRef}
+                verifyText={(name) => (name.trim() ? '' : t('model.item.nameEmpty'))}
                 onConfirm={async (name) => {
-                    await Model.updateName(name, item.id)
+                    await Model.updateName(name.trim(), item.id)
                 }}
                 title={t('model.item.rename')}
                 defaultValue={item.name}

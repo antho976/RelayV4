@@ -1,5 +1,5 @@
 import { useLiveQuery } from 'drizzle-orm/expo-sqlite'
-import { useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { View } from 'react-native'
 import { FlatList } from 'react-native-gesture-handler'
@@ -16,7 +16,6 @@ import TText from '@components/text/TText'
 import Accordion from '@components/views/Accordion'
 import HeaderTitle from '@components/views/HeaderTitle'
 import { LorebookType } from '@db/schema'
-import { useDebounce } from '@lib/hooks/Debounce'
 import { useLiveQueryJoined } from '@lib/hooks/LiveQueryJoined'
 import { Lorebooks } from '@lib/state/lorebooks'
 
@@ -41,25 +40,32 @@ const LorebookInfoScreen = () => {
     )
     const [placeholderInfo, setPlaceholderInfo] = useState<LorebookType | undefined>(undefined)
     const openEditor = useLorebookEntryEditorState((state) => state.open)
+    // edits not yet written, merged so quick edits to two fields both land
+    const pending = useRef<Partial<LorebookType>>({})
+    const timer = useRef<ReturnType<typeof setTimeout>>(undefined)
+
     useLiveQueryJoined(Lorebooks.db.live.lorebookInfo(id ?? -1), [id], {
         onUpdated: (result) => {
-            if (result) setPlaceholderInfo(result)
+            if (result) setPlaceholderInfo({ ...result, ...pending.current })
         },
     })
 
-    const handleUpdateDebounce = useDebounce(
-        async (lorebookInfo: LorebookType | Partial<LorebookType>) => {
-            if (!id) return
-            await Lorebooks.db.mutate.updateLorebookInfo(id, lorebookInfo)
-        },
-        300
-    )
+    const flush = useCallback(() => {
+        clearTimeout(timer.current)
+        const patch = pending.current
+        pending.current = {}
+        if (id && Object.keys(patch).length > 0) Lorebooks.db.mutate.updateLorebookInfo(id, patch)
+    }, [id])
 
-    const handleUpdate = async (lorebookInfo: LorebookType | Partial<LorebookType>) => {
+    useEffect(() => flush, [flush])
+
+    const handleUpdate = (lorebookInfo: Partial<LorebookType>) => {
         if (placeholderInfo) {
             setPlaceholderInfo({ ...placeholderInfo, ...lorebookInfo })
         }
-        handleUpdateDebounce(lorebookInfo)
+        pending.current = { ...pending.current, ...lorebookInfo }
+        clearTimeout(timer.current)
+        timer.current = setTimeout(flush, 300)
     }
 
     return (
