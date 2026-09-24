@@ -125,6 +125,8 @@ const InputSheet: React.FC<InputSheetProps> = ({
                             if (result) setErrorMessage(result)
                             else {
                                 onConfirm(text)
+                                // The next open starts fresh, not with what was just sent.
+                                setText(defaultValue)
                                 handleClose()
                             }
                         }}

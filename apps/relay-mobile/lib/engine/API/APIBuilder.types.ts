@@ -5,7 +5,7 @@ export type APISampler = {
     externalName: string
 }
 
-// These are for ChatterUI's interface
+// These are for Relay's interface
 // When a user wishes to add new 'X' API, we can control which fields remain default, and which can be edited
 export interface UISettings {
     editableCompletionPath: boolean
@@ -20,7 +20,7 @@ export interface UISettings {
     }
 }
 
-// These are the actual values being stored by ChatterUI
+// These are the actual values being stored by Relay
 export interface APIValues {
     endpoint: string
     modelEndpoint: string

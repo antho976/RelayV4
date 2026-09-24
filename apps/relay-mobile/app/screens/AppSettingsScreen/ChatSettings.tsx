@@ -51,10 +51,10 @@ const ChatSettings = () => {
             />
 
             <ThemedSwitch
-                label={t('settings.chat.askInChatterUI')}
+                label={t('settings.chat.askInRelay')}
                 value={textIntent}
                 onChangeValue={setTextIntent}
-                description={t('settings.chat.askInChatterUIDescription')}
+                description={t('settings.chat.askInRelayDescription')}
             />
 
             <ThemedButton

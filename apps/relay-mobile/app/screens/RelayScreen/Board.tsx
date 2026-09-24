@@ -1,4 +1,4 @@
-import { useFocusEffect, useRouter } from 'expo-router'
+import { useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router'
 import React, { useCallback, useEffect, useState } from 'react'
 import { RefreshControl, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native'
 import { SafeAreaView } from 'react-native-safe-area-context'
@@ -46,28 +46,38 @@ const BoardScreen = () => {
     const router = useRouter()
     const projects = useRelayStore((state) => state.projects)
     const status = useRelayStore((state) => state.status)
-    const [project, setProject] = useState<RelayProject | undefined>(undefined)
-    const [tasks, setTasks] = useState<Task[]>([])
+    const params = useLocalSearchParams<{ project?: string }>()
+    const [project, setProject] = useState<RelayProject | undefined>(() =>
+        useRelayStore.getState().projects.find((item) => String(item.id) === params.project)
+    )
+    // Tagged with the project they came from, so a slow answer for a project the person has
+    // since switched away from never shows under the new one.
+    const [loaded, setLoaded] = useState<{ projectId?: number; tasks: Task[] }>({ tasks: [] })
     const [loading, setLoading] = useState(false)
     const [open, setOpen] = useState<number | undefined>(undefined)
 
-    const current = project ?? projects[0]
+    // The chosen project, or the first one when the choice is stale (removed on the PC) or unmade.
+    const current = (project && projects.find((item) => item.id === project.id)) ?? projects[0]
+    const currentId = current?.id
+    const tasks = loaded.projectId === currentId ? loaded.tasks : []
 
+    // Keyed on the id, not the object: every refresh hands out new project objects, and the
+    // board should not refetch for those.
     const load = useCallback(async () => {
-        if (!current || status !== 'online') return
+        if (currentId === undefined || status !== 'online') return
         setLoading(true)
         try {
             const result = await relay.request<{ tasks: Task[] }>('task.list', {
-                project_id: current.id,
+                project_id: currentId,
                 sort: 'updated',
             })
-            setTasks(result.tasks)
+            setLoaded({ projectId: currentId, tasks: result.tasks })
         } catch (e) {
             Logger.errorToast(`${(e as Error).message}`)
         } finally {
             setLoading(false)
         }
-    }, [current, status])
+    }, [currentId, status])
 
     useFocusEffect(
         useCallback(() => {

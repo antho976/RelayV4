@@ -1,19 +1,9 @@
 {
     "about": {
-        "description": {
-            "primary": "ChatterUI is a free and open-source application developed by Vali-98",
-            "support": "This app is a passion project I develop in my free time. If you're enjoying the app, consider supporting its development!"
-        },
         "devMode": {
             "disableAction": "Disable Dev Mode",
             "disabledMessage": "Dev mode disabled.",
             "enabledMessage": "You have enabled dev mode."
-        },
-        "logsReminder": "Remember to include logs",
-        "reportIssue": "Got an issue? Report it here:",
-        "support": {
-            "button": "Support ChatterUI",
-            "label": "Donate to ChatterUI here:"
         },
         "versionPrefix": "v"
     },
@@ -413,7 +403,7 @@
             }
         },
         "brand": {
-            "name": "ChatterUI"
+            "name": "Relay"
         },
         "emptyStates": {
             "noItems": "No Items"
@@ -680,7 +670,7 @@
             "title": "Hidden Text"
         },
         "localtemplate": {
-            "description": "When in Local Mode, ChatterUI automatically uses the instruct template provided by the loaded model. Disable this if you want messages to be formatted using Instruct instead. System Prompt however is always used.",
+            "description": "When in Local Mode, Relay automatically uses the instruct template provided by the loaded model. Disable this if you want messages to be formatted using Instruct instead. System Prompt however is always used.",
             "label": "Use Built-In Local Model Template",
             "title": "Local Template"
         },
@@ -769,7 +759,7 @@
         "backenddev": "Backend Device",
         "batch": "Batch",
         "contextshift": "Context Shift",
-        "copymodel": "Copy Model Into ChatterUI",
+        "copymodel": "Copy Model Into Relay",
         "empty": "No Models Found. Try Importing Some!",
         "externalmodel": "Use External Model",
         "gpulayers": "GPU Layers",
@@ -889,8 +879,8 @@
             "title": "Character Management"
         },
         "chat": {
-            "askInChatterUI": "Ask in ChatterUI",
-            "askInChatterUIDescription": "Use ChatterUI prompts for text intent instead of the default keyboard behavior.",
+            "askInRelay": "Ask in Relay",
+            "askInRelayDescription": "Use Relay prompts for text intent instead of the default keyboard behavior.",
             "autoGenerateTitles": "Auto-generate chat titles",
             "autoGenerateTitlesDescription": "Create titles for new chats automatically.",
             "autoLoadUser": "Auto-load selected user",

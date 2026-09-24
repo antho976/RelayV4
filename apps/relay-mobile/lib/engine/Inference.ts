@@ -47,15 +47,15 @@ export async function continueResponse(swipe: ChatSwipe) {
 }
 
 const completionTaskOptions = {
-    taskName: 'chatterui_completion_task',
+    taskName: 'relay_completion_task',
     taskTitle: 'Running completion...',
-    taskDesc: 'ChatterUI is running a completion task',
+    taskDesc: 'Relay is running a completion task',
     taskIcon: {
         name: 'ic_launcher',
         type: 'mipmap',
     },
     color: '#403737',
-    linkingURI: 'chatterui://',
+    linkingURI: 'relayapp://',
     progressBar: {
         max: 1,
         value: 0,

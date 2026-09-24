@@ -1,6 +1,6 @@
 # Secure (HTTPS) connections to your own server
 
-ChatterUI already supports `https://` endpoints, including servers that use a certificate
+Relay already supports `https://` endpoints, including servers that use a certificate
 you signed yourself. What it cannot do is add encryption to a server that only speaks
 plain HTTP: that has to happen on the server side. This page shows the two easiest ways.
 
@@ -19,7 +19,7 @@ by anyone on that network.
     tailscale serve --bg 8080
     ```
 
-3. Use the `https://<machine>.<tailnet>.ts.net/...` address in ChatterUI.
+3. Use the `https://<machine>.<tailnet>.ts.net/...` address in Relay.
 
 Traffic is encrypted end to end and the certificate is publicly trusted, so nothing needs
 to be installed on the phone.
@@ -52,13 +52,13 @@ Use this when the server is on your LAN and you do not want a third party involv
 3. Install the CA certificate (`rootCA.pem`, found with `mkcert -CAROOT`) on the phone:
    Settings > Security > Encryption & credentials > Install a certificate > CA certificate.
 
-4. Use the `https://192.168.1.20:8443/...` address in ChatterUI.
+4. Use the `https://192.168.1.20:8443/...` address in Relay.
 
-ChatterUI's Android build trusts user-installed CA certificates, so step 3 is enough for
+Relay's Android build trusts user-installed CA certificates, so step 3 is enough for
 the connection to succeed.
 
 ## Checking that it works
 
-Open the connection in ChatterUI. The heartbeat indicator turns green when the model
+Open the connection in Relay. The heartbeat indicator turns green when the model
 endpoint answers, and the plain-HTTP warning disappears once the address starts with
 `https://`.

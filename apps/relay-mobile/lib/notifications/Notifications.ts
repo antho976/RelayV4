@@ -38,7 +38,7 @@ export async function registerForPushNotificationsAsync() {
     if (finalStatus !== 'granted') {
         Alert.alert({
             title: 'Permission Required',
-            description: 'ChatterUI requires permissions to send you notifications.',
+            description: 'Relay needs permission to send you notifications.',
             buttons: [
                 {
                     label: 'Cancel',

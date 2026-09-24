@@ -385,13 +385,14 @@ const ChatInput = () => {
                     ref={inputRef}
                     style={{
                         color: color.text._100,
-                        backgroundColor: color.neutral._100,
+                        backgroundColor: color.neutral._200,
                         flex: 1,
-                        borderWidth: 2,
-                        borderColor: activeProvider ? color.primary._300 : color.primary._100,
-                        borderRadius: borderRadius.l,
-                        paddingHorizontal: spacing.m,
-                        paddingVertical: spacing.m,
+                        borderWidth: 1,
+                        borderColor: color.neutral._300,
+                        borderRadius: 24,
+                        paddingHorizontal: spacing.xl,
+                        paddingVertical: spacing.l,
+                        fontSize: 16,
                     }}
                     onPress={() => {
                         setHideOptions(!!newMessage)
@@ -420,7 +421,7 @@ const ChatInput = () => {
                         <TouchableOpacity
                             disabled={!chatId}
                             style={{
-                                borderRadius: borderRadius.m,
+                                borderRadius: 999,
                                 backgroundColor: color.neutral._200,
                                 padding: spacing.m,
                             }}
@@ -435,13 +436,13 @@ const ChatInput = () => {
                     <TouchableOpacity
                         disabled={disableSend || !chatId || !activeProvider}
                         style={{
-                            borderRadius: borderRadius.m,
+                            borderRadius: 999,
                             backgroundColor: !activeProvider
                                 ? color.neutral._100
                                 : nowGenerating
                                   ? color.error._500
                                   : color.primary._500,
-                            padding: spacing.s,
+                            padding: spacing.m,
                             borderWidth: 2,
                             borderColor: !activeProvider
                                 ? color.primary._100
@@ -451,7 +452,7 @@ const ChatInput = () => {
                         }}
                         onPress={nowGenerating ? abortResponse : handleSend}>
                         <MaterialIcons
-                            name={nowGenerating ? 'stop' : 'send'}
+                            name={nowGenerating ? 'stop' : 'arrow-upward'}
                             color={activeProvider ? color.neutral._100 : color.text._700}
                             size={24}
                         />

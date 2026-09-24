@@ -23,10 +23,10 @@ const SectionTitle = ({
                 {...props}
                 style={{
                     color: color.text._100,
-                    fontSize: 16,
+                    fontFamily: 'serif',
+                    fontSize: 19,
+                    paddingTop: spacing.m,
                     paddingBottom: spacing.m,
-                    borderBottomWidth: 1,
-                    borderColor: color.neutral._500,
                     ...style,
                 }}>
                 {children}

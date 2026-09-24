@@ -194,7 +194,7 @@ const PairSheet: React.FC<PairSheetProps> = ({ visible, setVisible }) => {
                     <View style={{ rowGap: spacing.m }}>
                         <ThemedTextInput
                             label="PC address"
-                            description="The direct line the PC printed, or its rendezvous join link."
+                            description="The direct line the PC printed, its Tailscale address (100.x.y.z) or its rendezvous join link."
                             value={address}
                             onChangeText={setAddress}
                             placeholder="192.168.1.20  or  wss://server/join/…"

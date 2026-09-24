@@ -79,6 +79,7 @@ namespace Drawer {
         SETTINGS = 'settings',
         CHATLIST = 'chats',
         USERLIST = 'userlist',
+        RELAY = 'relay',
     }
 
     export const Body: React.FC<DrawerBodyProps> = ({
@@ -126,7 +127,7 @@ namespace Drawer {
 
     export const Button: React.FC<DrawerButtonProps> = ({
         drawerID: drawerId,
-        openIcon = 'menu-fold',
+        openIcon = 'menu',
         closeIcon = 'close',
         ...rest
     }) => {

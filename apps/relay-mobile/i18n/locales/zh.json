@@ -1,19 +1,9 @@
 {
     "about": {
-        "description": {
-            "primary": "ChatterUI 是由 Vali-98 开发的免费开源应用",
-            "support": "这个应用是我业余时间的一个热情项目。如果你喜欢这个应用，请考虑支持它的开发！"
-        },
         "devMode": {
             "disableAction": "禁用开发模式",
             "disabledMessage": "开发模式已禁用。",
             "enabledMessage": "你已启用开发模式。"
-        },
-        "logsReminder": "记得附上日志",
-        "reportIssue": "遇到问题？在这里报告：",
-        "support": {
-            "button": "支持 ChatterUI",
-            "label": "在这里捐助 ChatterUI："
         },
         "versionPrefix": "v"
     },
@@ -341,7 +331,7 @@
             }
         },
         "brand": {
-            "name": "ChatterUI"
+            "name": "Relay"
         },
         "emptyStates": {
             "noItems": "没有条目"
@@ -593,7 +583,7 @@
             "title": "隐藏文本"
         },
         "localtemplate": {
-            "description": "在本地模式下，ChatterUI 会自动使用加载模型提供的 instruct 模板。禁用后，如果你希望消息改为使用 Instruct 格式，请关闭此选项。但系统提示仍然始终使用。",
+            "description": "在本地模式下，Relay 会自动使用加载模型提供的 instruct 模板。禁用后，如果你希望消息改为使用 Instruct 格式，请关闭此选项。但系统提示仍然始终使用。",
             "label": "使用内置本地模型模板",
             "title": "本地模板"
         },
@@ -678,7 +668,7 @@
         "backenddev": "后端设备",
         "batch": "批处理",
         "contextshift": "上下文切换",
-        "copymodel": "将模型复制到 ChatterUI",
+        "copymodel": "将模型复制到 Relay",
         "empty": "未找到模型。试着导入一些！",
         "externalmodel": "使用外部模型",
         "gpulayers": "GPU 层",
@@ -793,8 +783,8 @@
             "title": "角色管理"
         },
         "chat": {
-            "askInChatterUI": "在 ChatterUI 中询问",
-            "askInChatterUIDescription": "使用 ChatterUI 提示进行文本意图，而不是默认键盘行为。",
+            "askInRelay": "在 Relay 中询问",
+            "askInRelayDescription": "使用 Relay 提示进行文本意图，而不是默认键盘行为。",
             "autoGenerateTitles": "自动生成聊天标题",
             "autoGenerateTitlesDescription": "自动为新聊天创建标题。",
             "autoLoadUser": "自动加载所选用户",

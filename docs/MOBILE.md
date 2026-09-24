@@ -8,12 +8,13 @@ Two routes, tried in privacy order by the phone:
 
 | route | when | what travels where |
 | --- | --- | --- |
-| **direct** | phone and PC on the same network | LAN only; nothing leaves the building |
+| **direct** | phone and PC on the same network, or the same Tailscale tailnet | LAN only, or Tailscale's end-to-end encrypted tunnel |
 | **via a rendezvous** | phone anywhere | PC dials *out* to a server you host; the phone joins there; the server copies lines and reads none of them |
 
 Both end in `bridge.rs` on the PC, which checks the phone's credential and forwards its
 requests to the socket door as actor `user` — the same door, the same rights, the same
-guardrails and audit rows as the CLI. There is no third route and no third party.
+guardrails and audit rows as the CLI. There is no third route: Tailscale, if you use it, only
+carries the direct link, and sees encrypted packets, not bus lines.
 
 ## 1. Tonight, in three steps
 
@@ -29,7 +30,7 @@ run from the Actions tab, or `npm run android` in `apps/relay-mobile` with the A
 open the drawer, tap **PC**, **Pair a PC**, scan. If the engine was running from before the
 door existed, restart it once (`./target/debug/relay --instance dev cmd app.quit '{}'`, then
 `./run.sh`), or run `./target/debug/relay remote serve --pair` alongside it. For the phone to
-reach the PC when you are out, see §3.
+reach the PC when you are out, see §3 (Tailscale) or §4 (your own server).
 
 ## 2. On the PC
 
@@ -59,7 +60,21 @@ minutes and admits one phone; to pair another later, `relay remote pair` in a se
 State lives in `~/.local/share/relay-v4/<instance>/remote.json`, mode 0600. It holds each
 phone's token, so treat it like a private key.
 
-## 3. From anywhere: your own rendezvous
+## 3. From anywhere without a server: Tailscale
+
+The simplest way to reach the PC away from home needs no server at all. Install
+[Tailscale](https://tailscale.com) on the PC and on the phone and sign both in to the same
+account. The PC then has a `100.x.y.z` address that the phone can reach from any network, and
+the direct door already listens on it: `relay remote pair` prints it on a `Tailscale:` line and
+puts it in the pairing link, so a phone paired after Tailscale was set up just works.
+
+For a phone paired before that, open **Paired PCs**, tap **Add Tailscale or other address** on
+the PC's card, and enter the PC's Tailscale address (`100.x.y.z`, or its MagicDNS name
+`my-pc.tail1234.ts.net`). Added addresses are tried with the WiFi ones, survive re-pairing, and
+the PC tab's card says **Tailscale · private** when that is the link in use. Traffic travels
+over Tailscale's encrypted WireGuard tunnel; nothing on the PC listens to the internet.
+
+## 4. From anywhere: your own rendezvous
 
 The PC never listens to the internet. Instead it keeps one outbound WebSocket open to a small
 server you run, and phones join through it — the shape of a remote-control service, with the
@@ -101,20 +116,30 @@ The rendezvous keeps nothing on disk. A room is named by the digest of its secre
 PC that holds the secret can host it, and a restart forgets nothing worth keeping.
 `GET /health` reports how many hosts and lanes are up.
 
-## 4. On the phone
+## 5. On the phone
 
-The **PC** tab is one screen: a line that says which PC is connected and how, what needs a
-decision, the live sessions, and a bar at the bottom to hand an agent some work. The gear in
-its corner opens **Paired PCs**: every PC this phone knows, its routes, pairing another, and
-the two things the link may do to the phone (notify you, keep the screen on in a terminal).
+The **PC** tab is one screen: a card that says which PC is connected and how (WiFi,
+Tailscale or your server), a banner when an agent is waiting for permission, counts of what
+is running, blocked and in review, the live sessions grouped by project, and a bar at the
+bottom to hand an agent some work. Two buttons sit in the header:
+
+- **The bell** opens the **Inbox**, with a badge for how much is waiting: guardrail holds,
+  tasks in review, and the notification feed. Tap a notification to mark it read on the PC.
+- **The menu** opens the sidebar (or swipe from the left edge): every workspace on the PC
+  and the projects in it, each with how many agents are live there. Tap one to narrow the
+  tab — and the request bar — to it; the board icon next to a project opens its board.
+
+Tapping the PC card opens **Paired PCs**: every PC this phone knows, its routes, adding an
+address, pairing another, and the two things the link may do to the phone (notify you, keep
+the screen on in a terminal).
 
 **Pairing.** Scan the QR that `relay remote pair` prints. Without a camera, paste the
 `relay://pair?…` link, or type the address the PC printed and the eight-character code. The
 code is spent on use.
 
 **Routes.** Each PC card shows where it can be reached and lets you pin a route: **Auto** tries
-WiFi first and the server second; **WiFi only** never leaves the network; **Server only**
-always goes through the rendezvous. The status line says which is in use.
+the direct addresses (WiFi and Tailscale) first and the server second; **Direct only** never
+uses the server; **Server only** always goes through the rendezvous. The route in use is marked.
 
 **What you can do.** Everything is an existing bus op, so the list is the bus's:
 
@@ -131,7 +156,7 @@ always goes through the rendezvous. The status line says which is in use.
   through `session.input`, which the engine answers without touching its store.
 - **Mail**: priority mail to that agent (`mailbox.send`). It reaches an agent that is busy at
   its next step, where a typed line would wait in the terminal until it reads its prompt.
-- **Needs you**: guardrail holds with **Allow once** / **Deny** (`guardrail.confirm` /
+- **Inbox**: guardrail holds with **Allow once** / **Deny** (`guardrail.confirm` /
   `guardrail.reject`), unread notifications, and how many tasks wait for review. With the app
   in the background, a held, blocked or finished agent shows up as a notification; it comes
   from the PC link, not from a push service.
@@ -150,7 +175,7 @@ back to the foreground; **Disconnect** on a PC card stops that until you connect
 
 The phone's own chats and on-device models never touch this link.
 
-## 5. Security model, honestly
+## 6. Security model, honestly
 
 - A phone is the user at the keyboard. The door refuses any envelope whose actor is not
   `user` (or `test` on a dev/test instance) before the engine sees it, so a phone cannot

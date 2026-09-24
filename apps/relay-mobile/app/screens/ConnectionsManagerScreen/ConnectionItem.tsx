@@ -76,10 +76,11 @@ const useStyles = () => {
     return StyleSheet.create({
         longContainer: {
             borderWidth: borderWidth.m,
+            backgroundColor: color.neutral._200,
             flexDirection: 'row',
             justifyContent: 'space-between',
             alignItems: 'center',
-            borderRadius: spacing.xl,
+            borderRadius: 22,
             flex: 1,
             paddingLeft: spacing.xl,
             paddingRight: spacing.xl,

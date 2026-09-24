@@ -107,9 +107,9 @@ const BottomSheet = forwardRef<BottomSheetRefFunctions, BottomSheetProps>(
                                     paddingRight: spacing.xl,
                                     maxHeight: '70%',
                                     width: '100%',
-                                    borderTopLeftRadius: spacing.xl2,
-                                    borderTopRightRadius: spacing.xl2,
-                                    backgroundColor: color.neutral._100,
+                                    borderTopLeftRadius: 28,
+                                    borderTopRightRadius: 28,
+                                    backgroundColor: color.neutral._200,
                                 },
                                 sheetStyle,
                             ]}>

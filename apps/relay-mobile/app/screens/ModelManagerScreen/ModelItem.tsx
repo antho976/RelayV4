@@ -291,7 +291,7 @@ const useStyles = () => {
 
     return StyleSheet.create({
         modelContainer: {
-            borderRadius: spacing.l,
+            borderRadius: 22,
             paddingVertical: spacing.l,
             paddingHorizontal: spacing.xl2,
             backgroundColor: color.neutral._200,

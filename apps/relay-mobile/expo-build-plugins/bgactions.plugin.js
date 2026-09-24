@@ -41,7 +41,7 @@ module.exports = function withCustomIntentFilter(config) {
                             { $: { 'android:name': 'android.intent.category.DEFAULT' } },
                             { $: { 'android:name': 'android.intent.category.BROWSABLE' } },
                         ],
-                        data: [{ $: { 'android:scheme': 'chatterui' } }],
+                        data: [{ $: { 'android:scheme': 'relayapp' } }],
                     })
 
                     hasModified = true

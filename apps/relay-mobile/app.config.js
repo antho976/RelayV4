@@ -4,11 +4,11 @@ module.exports = {
     expo: {
         name: IS_DEV ? 'Relay (DEV)' : 'Relay',
         newArchEnabled: true,
-        slug: 'ChatterUI',
+        slug: 'Relay',
         version: '0.10.0-beta5',
         orientation: 'default',
         icon: './assets/images/icon.png',
-        scheme: 'chatterui',
+        scheme: 'relayapp',
         userInterfaceStyle: 'automatic',
         assetBundlePatterns: ['**/*'],
         ios: {
@@ -81,18 +81,18 @@ module.exports = {
                     'android:largeHeap': true,
                 },
             ],
-            ['@vali98/react-native-process-text', { label: 'Ask In ChatterUi' }],
+            ['@vali98/react-native-process-text', { label: 'Ask in Relay' }],
             [
                 'expo-camera',
                 {
-                    cameraPermission: 'Allow ChatterUI to access your camera',
+                    cameraPermission: 'Allow Relay to access your camera',
                 },
             ],
             ['expo-sqlite', { withSQLiteVecExtension: true }],
             [
                 'expo-image-picker',
                 {
-                    photosPermission: 'ChatterUI requires image permissions for vision models',
+                    photosPermission: 'Relay needs photo access for vision models',
                     colors: {
                         cropToolbarColor: '#000000',
                     },

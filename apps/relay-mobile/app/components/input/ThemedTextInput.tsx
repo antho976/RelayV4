@@ -46,11 +46,12 @@ const ThemedTextInput: React.FC<ThemedTextInputProps> = ({
                 style={[
                     {
                         color: color.text._100,
-                        borderColor: color.neutral._400,
+                        backgroundColor: color.neutral._200,
+                        borderColor: color.neutral._300,
                         borderWidth: 1,
-                        paddingVertical: 8,
-                        paddingHorizontal: 12,
-                        borderRadius: 8,
+                        paddingVertical: 10,
+                        paddingHorizontal: 14,
+                        borderRadius: 14,
                         textAlignVertical: numberOfLines && numberOfLines > 1 ? `top` : `center`,
                     },
                     style,
