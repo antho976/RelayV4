@@ -21,20 +21,21 @@ export namespace CharacterLink {
             }
 
             export const deleteByValue = async (type: LinkType, value: number) => {
-                await database.transaction(async (tx) => {
-                    await tx
-                        .delete(characterLinks)
+                // sync on purpose: expo-sqlite commits an async transaction at its first await
+                database.transaction((tx) => {
+                    tx.delete(characterLinks)
                         .where(and(eq(characterLinks.value, value), eq(characterLinks.type, type)))
+                        .run()
                     // for _index stores, need to shift all values greater than [value] by -1 on removals
                     if (type.endsWith('index')) {
-                        await tx
-                            .update(characterLinks)
+                        tx.update(characterLinks)
                             .set({
                                 value: sql`${characterLinks.value} - 1`,
                             })
                             .where(
                                 and(eq(characterLinks.type, type), gt(characterLinks.value, value))
                             )
+                            .run()
                     }
                 })
             }

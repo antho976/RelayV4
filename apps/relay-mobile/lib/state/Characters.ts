@@ -82,6 +82,9 @@ const CHARACTER_CARD_TEXT_CHUNK_KEYWORDS = [
     'ccv3',
 ]
 
+// hidden and ghost chats never leak into the list's previews
+const previewChats = and(eq(chats.hidden, false), eq(chats.ghost, false))
+
 export namespace Characters {
     export const useUserStore = create<CharacterCardState>()(
         persist(
@@ -304,8 +307,7 @@ export namespace Characters {
                                 id: true,
                             },
                             limit: 1,
-                            // hidden and ghost chats never leak into previews
-                            where: and(eq(chats.hidden, false), eq(chats.ghost, false)),
+                            where: previewChats,
                             orderBy: desc(chats.last_modified),
                             with: {
                                 messages: {
@@ -320,7 +322,7 @@ export namespace Characters {
                                             columns: {
                                                 swipe: true,
                                             },
-                                            orderBy: desc(chatSwipes.id),
+                                            where: eq(chatSwipes.active, true),
                                             limit: 1,
                                         },
                                     },
@@ -367,6 +369,7 @@ export namespace Characters {
                                 id: true,
                             },
                             limit: 1,
+                            where: previewChats,
                             orderBy: desc(chats.last_modified),
                             with: {
                                 messages: {
@@ -381,7 +384,7 @@ export namespace Characters {
                                             columns: {
                                                 swipe: true,
                                             },
-                                            orderBy: desc(chatSwipes.id),
+                                            where: eq(chatSwipes.active, true),
                                             limit: 1,
                                         },
                                     },
@@ -463,6 +466,7 @@ export namespace Characters {
                                 id: true,
                             },
                             limit: 1,
+                            where: previewChats,
                             orderBy: desc(chats.last_modified),
                             with: {
                                 messages: {
@@ -477,7 +481,7 @@ export namespace Characters {
                                             columns: {
                                                 swipe: true,
                                             },
-                                            orderBy: desc(chatSwipes.id),
+                                            where: eq(chatSwipes.active, true),
                                             limit: 1,
                                         },
                                     },
@@ -672,15 +676,18 @@ export namespace Characters {
 
             export const createCharacter = async (card: CharacterCardV2, imageuri: string = '') => {
                 const { data } = card
-                const image_id = await database.transaction(async (tx) => {
-                    try {
-                        const [{ id, image_id }] = await tx
+                let image_id: number | undefined
+                try {
+                    // sync on purpose: expo-sqlite commits an async transaction at its first await
+                    image_id = database.transaction((tx) => {
+                        const { id, image_id } = tx
                             .insert(characters)
                             .values({
                                 type: 'character',
                                 ...data,
                             })
                             .returning({ id: characters.id, image_id: characters.image_id })
+                            .get()
 
                         const greetingdata =
                             typeof data?.alternate_greetings === 'object'
@@ -690,34 +697,29 @@ export namespace Characters {
                                   })) ?? [])
                                 : []
                         if (greetingdata.length > 0)
-                            for (const greeting of greetingdata)
-                                await tx.insert(characterGreetings).values(greeting)
+                            tx.insert(characterGreetings).values(greetingdata).run()
 
                         if (data.tags && data?.tags?.length !== 0) {
                             const tagsdata = data.tags.map((tag) => ({ tag: tag }))
-                            for (const tag of tagsdata)
-                                await tx.insert(tags).values(tag).onConflictDoNothing()
-
-                            const tagids = (
-                                await tx.query.tags.findMany({
-                                    where: inArray(tags.tag, data.tags),
-                                })
-                            ).map((item) => ({
-                                character_id: id,
-                                tag_id: item.id,
-                            }))
-                            await tx.insert(characterTags).values(tagids).onConflictDoNothing()
+                            tx.insert(tags).values(tagsdata).onConflictDoNothing().run()
+                            const tagids = tx
+                                .select({ id: tags.id })
+                                .from(tags)
+                                .where(inArray(tags.tag, data.tags))
+                                .all()
+                                .map((item) => ({
+                                    character_id: id,
+                                    tag_id: item.id,
+                                }))
+                            if (tagids.length > 0)
+                                tx.insert(characterTags).values(tagids).onConflictDoNothing().run()
                         }
                         return image_id
-                    } catch (error) {
-                        Logger.errorToast(
-                            t('common.errors.rollingBackDueToError'),
-                            JSON.stringify(error)
-                        )
-                        tx.rollback()
-                        return undefined
-                    }
-                })
+                    })
+                } catch (error) {
+                    Logger.errorToast(t('common.errors.rollingBackDueToError'), `${error}`)
+                    return
+                }
                 if (image_id && imageuri) await copyImage(imageuri, image_id)
             }
 
@@ -734,7 +736,7 @@ export namespace Characters {
 
                 if (fileExists(imageDir)) {
                     cacheLoc = imageCacheDir
-                    copyFile({
+                    await copyFile({
                         from: imageDir,
                         to: cacheLoc,
                     })
@@ -744,7 +746,8 @@ export namespace Characters {
                 card.last_modified = now
                 card.image_id = now
                 if (card.background_image) {
-                    const backgroundId = Date.now()
+                    // not `now`: that id is the avatar's file
+                    const backgroundId = now + 1
                     await copyFile({
                         from: getImageDir(card.background_image),
                         to: getImageDir(backgroundId),
@@ -829,7 +832,7 @@ export namespace Characters {
     }
 
     export const copyImage = async (uri: string, imageID: number) => {
-        copyFile({
+        await copyFile({
             from: uri,
             to: getImageDir(imageID),
         })
@@ -855,9 +858,14 @@ export namespace Characters {
                 Logger.errorToast(t('character.editor.errors.createFromImage'))
                 return
             }
-            const [result] = extractPngTextChunk(file, {
+            const chunks = extractPngTextChunk(file, {
                 keywords: CHARACTER_CARD_TEXT_CHUNK_KEYWORDS,
             })
+            // a V3 card also carries a V2 copy in `chara`, which every reader understands
+            const result =
+                chunks.find((item) => item.keyword === 'chara') ??
+                chunks.find((item) => item.keyword === 'ccv3') ??
+                chunks[0]
 
             if (!result) {
                 Logger.errorToast(t('character.editor.errors.createFromImage'))
@@ -893,6 +901,14 @@ export namespace Characters {
         // check JSON def
         const result = characterCardV2Schema.safeParse(data)
         if (result.error) {
+            const v3 = characterCardV3Schema.safeParse(data)
+            if (v3.success) {
+                Logger.info(`Creating new character: ${v3.data.data.name}`)
+                return await db.mutate.createCharacter(
+                    { spec: 'chara_card_v2', spec_version: '2.0', data: v3.data.data },
+                    uri
+                )
+            }
             Logger.warnToast(t('character.editor.errors.v2ParsingFailedFallingBack'))
             return await createCharacterFromV1JSON(data, uri)
         }
@@ -964,7 +980,7 @@ export namespace Characters {
                 const [asset] = await Asset.loadAsync(
                     require('./../../assets/models/assistant.raw')
                 )
-                if (asset.localUri) copyFile({ from: asset.localUri, to: cardDefaultDir })
+                if (asset.localUri) await copyFile({ from: asset.localUri, to: cardDefaultDir })
             }
             await createCharacterFromImage(cardDefaultDir)
         } catch (e) {
@@ -1003,6 +1019,12 @@ const characterCardV2DataSchema = z.object({
 const characterCardV2Schema = z.object({
     spec: z.literal('chara_card_v2'),
     spec_version: z.literal('2.0'),
+    data: characterCardV2DataSchema,
+})
+
+// V3 keeps every V2 field under `data`; the fields it adds have no column here
+const characterCardV3Schema = z.object({
+    spec: z.literal('chara_card_v3'),
     data: characterCardV2DataSchema,
 })
 

@@ -1,7 +1,7 @@
 import { getThreads } from '@vali98/react-native-cpu-info'
 import { setTextIntentEnabled, useTextIntentOnForeground } from '@vali98/react-native-process-text'
 import { DeviceType, getDeviceTypeAsync } from 'expo-device'
-import { Paths } from 'expo-file-system'
+import { Directory, File, Paths } from 'expo-file-system'
 import * as KeepAwake from 'expo-keep-awake'
 import { router } from 'expo-router'
 import { setBackgroundColorAsync as setUIBackgroundColor } from 'expo-system-ui'
@@ -17,7 +17,7 @@ import { Instructs } from '@lib/state/Instructs'
 import { SamplersManager } from '@lib/state/SamplerState'
 import { useTTSStore } from '@lib/state/TTS'
 
-import { AppDirectory, deleteFile, listFiles, makeDirectory, readStringAsync } from './File'
+import { AppDirectory, listFiles, makeDirectory } from './File'
 import { lockScreenOrientation } from './Screen'
 import { AppSettings, AppSettingsDefault, Global } from '../constants/GlobalValues'
 import { Llama } from '../engine/Local/LlamaLocal'
@@ -26,6 +26,8 @@ import { Chats } from '../state/Chat'
 import { Logger } from '../state/Logger'
 import { mmkv } from '../storage/MMKV'
 import { Theme } from '../theme/ThemeManager'
+
+const recommendedPresetsAdded = 'recommendedpresetsadded'
 
 const loadNewestChat = async () => {
     Logger.info('Loading latest chat')
@@ -144,13 +146,11 @@ export const generateDefaultDirectories = async () => {
 }
 
 const migratePresets_0_8_3_to_0_8_4 = async () => {
-    const presetPath = `${Paths.document.uri}presets`
-    const files = listFiles(presetPath)
-
-    if (files.length === 0) return
-    files.map(async (item) => {
+    const presets = new Directory(Paths.document, 'presets')
+    if (!presets.exists) return
+    for (const item of listFiles(presets.uri)) {
         try {
-            const data = await readStringAsync(`${presetPath}/${item}`)
+            const data = await new File(presets, item).text()
             SamplersManager.useSamplerStore.getState().addSamplerConfig({
                 data: JSON.parse(data),
                 name: item.replace('.json', ''),
@@ -158,8 +158,12 @@ const migratePresets_0_8_3_to_0_8_4 = async () => {
         } catch (e) {
             Logger.error(`Failed to migrate preset ${item}: ${e}`)
         }
-    })
-    deleteFile(presetPath)
+    }
+    try {
+        presets.delete()
+    } catch (e) {
+        Logger.error(`Failed to delete legacy presets: ${e}`)
+    }
 }
 
 const migrateAppMode_0_8_5_to_0_8_6 = () => {
@@ -275,8 +279,11 @@ export const startupApp = () => {
 
     // Fix any missing samplers
     SamplersManager.useSamplerStore.getState().fixConfigs()
-    // make the anti-repetition presets available without a manual step
-    SamplersManager.useSamplerStore.getState().addRecommendedConfigs()
+    // make the anti-repetition presets available once, so deleting one sticks
+    if (!mmkv.getBoolean(recommendedPresetsAdded)) {
+        SamplersManager.useSamplerStore.getState().addRecommendedConfigs()
+        mmkv.set(recommendedPresetsAdded, true)
+    }
 
     // migrations for old versions
     migrateModelData_0_7_10_to_0_8_0()

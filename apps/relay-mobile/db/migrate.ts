@@ -92,8 +92,9 @@ const sqlDefault = (value: unknown): string | undefined => {
  * migration and still miss a column; every query that names it then fails, and a list that
  * reads it — the character list — comes back empty with no error on screen.
  *
- * Only additions: nothing is dropped, renamed or rewritten. A NOT NULL column with no literal
- * default gets the type's zero, which is what SQLite needs to add it to existing rows.
+ * Only additions: nothing is dropped, renamed or rewritten. A column's default, or the value
+ * its `$defaultFn` makes as stored, fills existing rows; a NOT NULL column with neither gets
+ * the type's zero (`'[]'` for JSON), which is what SQLite needs to add it to existing rows.
  */
 export const reconcileSchema = () => {
     let added = 0
@@ -107,9 +108,18 @@ export const reconcileSchema = () => {
         for (const column of config.columns) {
             if (names.has(column.name) || column.primary) continue
             const type = column.getSQLType()
-            let fallback = sqlDefault(column.default)
+            const initial = column.default ?? column.defaultFn?.()
+            let fallback = sqlDefault(
+                initial === undefined || is(initial, SQL)
+                    ? initial
+                    : column.mapToDriverValue(initial)
+            )
             if (fallback === undefined && column.notNull)
-                fallback = /int|real|num/i.test(type) ? '0' : "''"
+                fallback = /int|real|num/i.test(type)
+                    ? '0'
+                    : column.columnType === 'SQLiteTextJson'
+                      ? "'[]'"
+                      : "''"
             const statement =
                 `ALTER TABLE "${config.name}" ADD "${column.name}" ${type}` +
                 (fallback !== undefined ? ` DEFAULT ${fallback}` : '') +

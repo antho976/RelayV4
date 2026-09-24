@@ -95,8 +95,21 @@ export const useQueuedLiveQuery = <
     const [error, setError] = useState<Error>()
     const [updatedAt, setUpdatedAt] = useState<Date>()
 
+    const enabled = options?.enabled !== false
+    const deepCheck = options?.deepCheck
+    // `query` and `options` are new objects on every render, so they cannot be dependencies:
+    // as with drizzle's useLiveQuery, `deps` (plain values) name what the query depends on
+    const depsKey = JSON.stringify(deps)
+    const targets = options?.targets
+    const targetsKey = JSON.stringify(targets)
+    const latest = useRef({ query, targets })
     useEffect(() => {
-        if (options?.enabled === false) return
+        latest.current = { query, targets }
+    })
+
+    useEffect(() => {
+        if (!enabled) return
+        const { query, targets } = latest.current
 
         const entity = is(query, SQLiteRelationalQuery)
             ? //@ts-expect-error
@@ -105,7 +118,6 @@ export const useQueuedLiveQuery = <
               (query as AnySQLiteSelect).config.table
 
         if (is(entity, Subquery) || is(entity, SQL)) {
-            // eslint-disable-next-line react-hooks/set-state-in-effect
             setError(
                 new Error('Selecting from subqueries and SQL are not supported in useLiveQuery')
             )
@@ -120,7 +132,7 @@ export const useQueuedLiveQuery = <
                 const result = (await dbQueryQueue.add(() => query as any)) as any
 
                 if (cancelled) return
-                if (options?.deepCheck && isDeepEqual(data.current, result)) {
+                if (deepCheck && isDeepEqual(data.current, result)) {
                     return
                 }
                 data.current = result
@@ -140,7 +152,6 @@ export const useQueuedLiveQuery = <
             const relationTableNames = getJoinedTableNames(query)
 
             const listeningTables = [config.name, ...relationTableNames]
-            const targets = options?.targets
             listener = addDatabaseChangeListener(({ tableName, rowId }) => {
                 const isListening = listeningTables.includes(tableName)
                 const isTargetMatch =
@@ -161,7 +172,7 @@ export const useQueuedLiveQuery = <
             cancelled = true
             listener?.remove()
         }
-    }, [options?.enabled, query, deps, options])
+    }, [enabled, deepCheck, depsKey, targetsKey])
 
     return {
         // eslint-disable-next-line react-hooks/refs, react-compiler/react-compiler

@@ -150,7 +150,7 @@ export const fileExists = (path: string) => {
 
 export const copyFile = async ({ from, to }: { from: string; to: string }) => {
     try {
-        new File(from).copy(new File(to))
+        await new File(from).copy(new File(to))
         return true
     } catch (e) {
         Logger.error('Failed to copy: ' + e)
@@ -190,11 +190,18 @@ export const makeDirectory = async (path: string) => {
 }
 
 export const readFileMagic = (path: string) => {
-    const magicBytes = new File(path).open(FileMode.ReadOnly).readBytes(4)
+    const handle = new File(path).open(FileMode.ReadOnly)
+    let magicBytes: Uint8Array
+    try {
+        magicBytes = handle.readBytes(4)
+    } finally {
+        handle.close()
+    }
     const magic = String.fromCharCode(...magicBytes)
-    const hex = Array.from(magic, (b) => `0x${b.toString().padStart(2, '0').toUpperCase()}`).join(
-        ' '
-    )
+    const hex = Array.from(
+        magicBytes,
+        (b) => `0x${b.toString(16).toUpperCase().padStart(2, '0')}`
+    ).join(' ')
 
     return { hex, magic }
 }

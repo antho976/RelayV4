@@ -53,7 +53,7 @@ export namespace Tokenizer {
         Logger.info('Importing Tokenizer')
         const [asset] = await Asset.loadAsync(require('./../../assets/models/llama3tokenizer.gguf'))
         await asset.downloadAsync()
-        if (asset.localUri) copyFile({ from: asset.localUri, to: tokenizerModelDir })
+        if (asset.localUri) await copyFile({ from: asset.localUri, to: tokenizerModelDir })
         else throw new Error('Failed to import asset')
     }
 

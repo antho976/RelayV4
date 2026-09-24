@@ -16,7 +16,7 @@ CREATE TABLE `__new_lorebook_entries` (
 	FOREIGN KEY (`lorebook_id`) REFERENCES `lorebooks`(`id`) ON UPDATE no action ON DELETE cascade
 );
 --> statement-breakpoint
-INSERT INTO `__new_lorebook_entries`("id", "lorebook_id", "keys", "content", "enable", "insertion_order", "case_sensitive", "name", "priority", "selective", "constant", "comment", "secondary_keys") SELECT "id", "lorebook_id", "keys", "content", "enable", "insertion_order", "case_sensitive", "name", "priority", "selective", "constant", "comment", "secondary_keys" FROM `lorebook_entries`;--> statement-breakpoint
+INSERT INTO `__new_lorebook_entries`("id", "lorebook_id", "keys", "content", "enable", "insertion_order", "case_sensitive", "name", "priority", "selective", "constant", "comment", "secondary_keys") SELECT "id", "lorebook_id", "keys", "content", COALESCE("enable", true), COALESCE("insertion_order", 100), COALESCE("case_sensitive", true), "name", COALESCE("priority", 100), false, false, '', '[]' FROM `lorebook_entries`;--> statement-breakpoint
 DROP TABLE `lorebook_entries`;--> statement-breakpoint
 ALTER TABLE `__new_lorebook_entries` RENAME TO `lorebook_entries`;--> statement-breakpoint
 PRAGMA foreign_keys=ON;--> statement-breakpoint

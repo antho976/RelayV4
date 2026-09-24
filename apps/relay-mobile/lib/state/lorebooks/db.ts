@@ -52,14 +52,18 @@ export namespace db {
 
         export const importFromJSON = async (lorebook: LorebookImport) => {
             const { entries, ...lorebookRest } = lorebook
-            const [{ lorebookId }] = await database
-                .insert(lorebooks)
-                .values([{ ...lorebookRest, active: true }])
-                .returning({ lorebookId: lorebooks.id })
-
-            await database
-                .insert(lorebookEntries)
-                .values(entries.map((entry) => ({ ...entry, lorebook_id: lorebookId })))
+            // sync on purpose: expo-sqlite commits an async transaction at its first await
+            database.transaction((tx) => {
+                const { lorebookId } = tx
+                    .insert(lorebooks)
+                    .values({ ...lorebookRest, active: true })
+                    .returning({ lorebookId: lorebooks.id })
+                    .get()
+                if (entries.length === 0) return
+                tx.insert(lorebookEntries)
+                    .values(entries.map((entry) => ({ ...entry, lorebook_id: lorebookId })))
+                    .run()
+            })
         }
 
         export const deleteLorebook = async (id: number) => {

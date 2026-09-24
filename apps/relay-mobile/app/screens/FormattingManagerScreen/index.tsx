@@ -30,7 +30,7 @@ import { useCompletionMode } from '@lib/hooks/CompletionMode'
 import { useTextFilterStore } from '@lib/hooks/TextFilter'
 import { MarkdownStyle } from '@lib/markdown/Markdown'
 import { useAppMode } from '@lib/state/AppMode'
-import { Instructs, InstructType } from '@lib/state/Instructs'
+import { Instructs, InstructType, parseStopSequence } from '@lib/state/Instructs'
 import { Logger } from '@lib/state/Logger'
 import { Theme } from '@lib/theme/ThemeManager'
 import { saveStringToDownload } from '@lib/utils/File'
@@ -73,16 +73,6 @@ const promptKeys: KeysOfType<InstructType, boolean>[] = [
 ]
 
 // older presets store a comma-separated list; a list with a comma inside an entry is stored as JSON
-const parseStopSequence = (stored: string): string[] => {
-    if (stored.startsWith('[')) {
-        try {
-            const list = JSON.parse(stored)
-            if (Array.isArray(list)) return list.filter((item) => typeof item === 'string')
-        } catch {}
-    }
-    return stored.split(',').filter((item) => item !== '')
-}
-
 const serializeStopSequence = (list: string[]) =>
     list.some((item) => item.includes(',')) ? JSON.stringify(list) : list.join(',')
 
