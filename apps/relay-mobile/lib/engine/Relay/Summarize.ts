@@ -11,9 +11,6 @@ import { useInference } from '@lib/state/Chat'
 const MAX_INPUT_CHARS = 6000
 const MAX_OUTPUT_TOKENS = 320
 
-export const canSummarize = () =>
-    !!Llama.useLlamaModelStore.getState().context && !useInference.getState().nowGenerating
-
 export const summarizeReason = (): string | undefined => {
     if (!Llama.useLlamaModelStore.getState().context) return 'Load a local model first (Models).'
     if (useInference.getState().nowGenerating) return 'A chat is generating right now.'

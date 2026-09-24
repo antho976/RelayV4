@@ -162,10 +162,6 @@ export const fileExists = (path: string) => {
     return new File(path).exists
 }
 
-export const directoryExists = (path: string) => {
-    return new Directory(path).exists
-}
-
 export const copyFile = async ({ from, to }: { from: string; to: string }) => {
     try {
         new File(from).copy(new File(to))
@@ -215,10 +211,4 @@ export const readFileMagic = (path: string) => {
     )
 
     return { hex, magic }
-}
-
-export const printFileMagic = (path: string) => {
-    const { hex, magic } = readFileMagic(path)
-    Logger.info(hex)
-    Logger.info(magic)
 }

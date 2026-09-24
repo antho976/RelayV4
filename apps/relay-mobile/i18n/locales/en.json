@@ -1,18 +1,12 @@
 {
     "about": {
-        "devMode": {
-            "disableAction": "Disable Dev Mode",
-            "disabledMessage": "Dev mode disabled.",
-            "enabledMessage": "You have enabled dev mode."
-        },
         "versionPrefix": "v"
     },
     "appMode": {
         "options": {
             "local": "On device",
             "remote": "API"
-        },
-        "title": "App Mode"
+        }
     },
     "auth": {
         "authorizationRequired": "Authorization Required"
@@ -53,7 +47,6 @@
             "actions": {
                 "changeBackground": "Change Background",
                 "changeImage": "Change Image",
-                "export": "Export",
                 "manageLinks": "Manage Links",
                 "removeBackground": "Remove Background",
                 "viewImage": "View Image"
@@ -112,7 +105,6 @@
                 "description": "Linked configurations will automatically load when this character is loaded",
                 "loadConnection": "Loading connection with index: {{value}}",
                 "loadInstruct": "Loading instruct with id: {{value}}",
-                "loadModel": "Loading model with id: {{value}}",
                 "loadSampler": "Loading sampler with index: {{value}}",
                 "loadUser": "Loading user with id: {{value}}",
                 "missingConnection": "No Linked Connection",
@@ -328,8 +320,7 @@
             "failedToLoad": "Failed to load chat {{id}}"
         },
         "tokencount": {
-            "title": "Context Limit",
-            "used": "Used {{used}}, Max {{max}}"
+            "title": "Context Limit"
         }
     },
     "chatPresets": {
@@ -373,14 +364,11 @@
     },
     "common": {
         "actions": {
-            "add": "Add",
-            "back": "Back",
             "cancel": "Cancel",
             "clone": "Clone",
             "close": "Close",
             "create": "Create",
             "delete": "Delete",
-            "disable": "Disable",
             "discard": "Discard",
             "discardChanges": "Discard Changes",
             "edit": "Edit",
@@ -402,9 +390,6 @@
                 "title": "Unsaved Changes"
             }
         },
-        "brand": {
-            "name": "Relay"
-        },
         "emptyStates": {
             "noItems": "No Items"
         },
@@ -423,7 +408,6 @@
             "api": "API",
             "comment": "Comment",
             "content": "Content",
-            "cpu": "CPU",
             "description": "Description",
             "devMode": "DEV MODE",
             "devModeDisabled": "Dev mode disabled",
@@ -438,40 +422,22 @@
             "results": "Results",
             "selected": "Selected",
             "suggestions": "Suggestions",
-            "tokens": "Tokens",
-            "version": "Version"
+            "tokens": "Tokens"
         },
         "messages": {
             "importingFile": "Importing file...",
             "successfullyImported": "Successfully Imported!"
         },
         "navigation": {
-            "about": "About",
             "settings": "Settings"
         }
     },
     "connections": {
         "add": {
-            "apiKey": "API Key",
-            "completionUrl": "Completion URL",
-            "createButton": "Create API",
             "defaultFriendlyName": "New Connection",
             "error": {
-                "200": "Could not retrieve models: {{error}}",
-                "modelparse": "Could not parse models",
-                "modelundef": "Models resulted in an undefined value",
-                "nonarray": "Models resulted in an non-array value. `modelListParser` of template is likely incorrect"
+                "200": "Could not retrieve models: {{error}}"
             },
-            "firstMessage": "First Message",
-            "firstMessageHint": "Default first message sent to Claude",
-            "friendlyName": "Friendly Name",
-            "fullUrlHint": "Note: Use full URL path",
-            "model": "Model",
-            "modelUrl": "Model URL",
-            "prefill": "Prefill",
-            "prefillHint": "Prefill before model response",
-            "selectConnectionType": "Select Connection Type",
-            "selectModel": "Select Model",
             "title": "Add Connection"
         },
         "connected": "Connected",
@@ -489,7 +455,6 @@
             "modelUrl": "Model URL",
             "prefill": "Prefill",
             "prefillHint": "Prefill before model response",
-            "saveButton": "Save Changes",
             "selectModel": "Select Model",
             "title": "Edit Connection"
         },
@@ -520,7 +485,6 @@
             },
             "empty": "No Custom Templates Added",
             "exported": "Template sucessfully exported",
-            "get": "Get Templates",
             "import": "Import Template",
             "importError": "Failed to import: {{error}}",
             "learn": "Learn About Templates",
@@ -574,46 +538,19 @@
         "createConfig": "Create Config",
         "defaultName": "Default",
         "deleteConfig": "Delete Config",
-        "deleteConfigDescription": "Are you sure you want to delete '{{name}}'?",
-        "deleteInstruct": "Delete Instruct",
         "errors": {
             "instructDataError": "Something wrong happened with Instruct data"
         },
         "exportConfig": "Export Config",
         "jsonExtension": ".json",
         "newPreset": "New Instruct Preset",
-        "regenerateDefaultPresets": "Regenerate Default Presets",
         "regenerateDefaults": "Regenerate Default Instructs",
-        "regenerateDefaultsDescription": "Are you sure you want to regenerate default Instructs?",
         "sections": {
             "attachmentDepth": "Attachment Depth",
-            "examples": "Use Examples",
-            "hideThinkTags": "Remove Think Tags",
-            "inputPrefix": "Input Prefix",
-            "inputSuffix": "Input Suffix",
-            "labelSections": "Label Card Sections",
-            "lastImageOnly": "Use Last Image Only",
-            "lastOutputPrefix": "Last Output Prefix",
-            "names": "Include Names",
-            "noteInUserMessage": "Rules In User Message",
-            "outputPrefix": "Output Prefix",
-            "outputSuffix": "Output Suffix",
-            "personality": "Use Personality",
-            "scenario": "Use Scenario",
-            "sendAudio": "Send Audio",
-            "sendDocuments": "Send Documents",
-            "sendImages": "Send Images",
             "stopSequence": "Stop Sequence",
-            "strictAlternation": "Strict Role Alternation",
-            "systemPrefix": "System Prefix",
             "systemPrompt": "System Prompt",
             "systemPromptFormat": "System Prompt Format",
-            "systemSuffix": "System Suffix",
-            "timestamp": "Add Timestamp",
-            "useCardSystemPrompt": "Use Card System Prompt",
-            "useCommonStopSequences": "Use Common Stop Sequences",
-            "usePostHistory": "Use Post-History Rules",
-            "wrap": "Wrap In Newline"
+            "useCommonStopSequences": "Use Common Stop Sequences"
         },
         "selectConfig": "Select Config",
         "title": "Formatting",
@@ -650,10 +587,6 @@
             "entryWithoutValidSwipeFound": "Entry without valid swipe found",
             "noMessagesAddedCheckLogs": "No messages added. Check Logs."
         }
-    },
-    "horizontalSelector": {
-        "description": "Optional helpful description for the selector.",
-        "label": "Selector Label"
     },
     "instruct": {
         "attachmentDepth": {
@@ -820,9 +753,7 @@
         "noItemsSelected": "No items selected"
     },
     "navigation": {
-        "about": "About",
         "api": "API",
-        "dataSources": "Data Sources",
         "dev_colortest": "[DEV] ColorTest",
         "dev_components": "[DEV] Components",
         "dev_markdown": "[DEV] Markdown",
@@ -868,7 +799,7 @@
             "alert": {
                 "regenerateDefaultCard": {
                     "confirm": "Create Default Card",
-                    "description": "This will add the default AI Bot card to your character list.",
+                    "description": "This will add the default Assistant card to your character list.",
                     "title": "Regenerate Default Card"
                 }
             },
@@ -925,7 +856,6 @@
             },
             "builtIn": "Built-in",
             "contextMenu": {
-                "getThemes": "Get Themes",
                 "importTheme": "Import Theme",
                 "pasteTheme": "Paste Theme"
             },
@@ -977,9 +907,6 @@
             "printContext": "Print Context",
             "printContextDescription": "Prints the generation context to logs for debugging",
             "title": "Generation"
-        },
-        "language": {
-            "title": "Set Language"
         },
         "notification": {
             "enableNotifications": "Enable Notifications",
@@ -1059,11 +986,9 @@
             },
             "title": "Edit User"
         },
-        "hint": "Hint: Swipe Left or press <icon/> to open the Users drawer",
         "messages": {
             "loadingUser": "Loading User: {{name}}"
         },
-        "nameplaceholder": "Empty names are discouraged",
         "profilecount": "User Profiles"
     }
 }

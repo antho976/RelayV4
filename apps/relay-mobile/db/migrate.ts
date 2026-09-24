@@ -28,7 +28,7 @@ export const migrationErrorText = (error: Error): string => {
 /**
  * A database whose schema is ahead of its `__drizzle_migrations` record — a migration that
  * landed without its row, a database restored from a backup of a different build, an app
- * data folder shared with an older ChatterUI install — fails forever on the first
+ * data folder shared with an older install — fails forever on the first
  * `CREATE TABLE` of the next migration, because the table is already there.
  *
  * This replays every pending migration one statement at a time inside one transaction,
@@ -88,7 +88,7 @@ const sqlDefault = (value: unknown): string | undefined => {
 
 /**
  * Add any column the app's schema has and the database lacks. A database whose tables came
- * from another build (a restored backup, an older ChatterUI install) can pass every
+ * from another build (a restored backup, an older install) can pass every
  * migration and still miss a column; every query that names it then fails, and a list that
  * reads it — the character list — comes back empty with no error on screen.
  *

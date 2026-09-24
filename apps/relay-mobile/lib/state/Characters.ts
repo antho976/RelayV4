@@ -75,7 +75,7 @@ type CharacterCardState = {
 export type CharacterCardData = Awaited<ReturnType<typeof Characters.db.query.cardQuery>>
 
 const CHARACTER_CARD_TEXT_CHUNK_KEYWORDS = [
-    'Description', // AI bot base description
+    'Description', // default card of earlier builds
     'Comment', // incorrect migration, needs to be retained
     'character_card',
     'chara',
@@ -960,14 +960,16 @@ export namespace Characters {
     }
 
     export const createDefaultCard = async () => {
-        const filename = 'aibot'
+        const filename = 'assistant'
         const pngName = filename + '.png'
         const cardDefaultDir = `${Paths.document.uri}appAssets/${pngName}`
 
         try {
             if (!fileExists(cardDefaultDir)) {
                 Logger.info('Importing default card.')
-                const [asset] = await Asset.loadAsync(require('./../../assets/models/aibot.raw'))
+                const [asset] = await Asset.loadAsync(
+                    require('./../../assets/models/assistant.raw')
+                )
                 if (asset.localUri) copyFile({ from: asset.localUri, to: cardDefaultDir })
             }
             await createCharacterFromImage(cardDefaultDir)

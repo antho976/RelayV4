@@ -836,15 +836,6 @@ export type SamplerConfigData = {
     -readonly [ID in keyof SamplerValueMap]: SamplerValueMap[ID]
 }
 
-export const createMarkdownRows = () => {
-    const items: any = []
-    Object.entries(Samplers).map(([k, v]) => {
-        items.push('|' + v.friendlyName + '|' + v.internalID + '|' + v.macro + '|')
-    })
-    const out = items.join('\n')
-    console.log(out)
-}
-
 export const defaultSamplerConfig = (Object.keys(Samplers) as SamplerID[])
     .map((key) => ({ id: key, value: Samplers[key].values.default }))
     .reduce((a, b) => (a = { ...a, [b.id]: b.value }), {}) as SamplerConfigData

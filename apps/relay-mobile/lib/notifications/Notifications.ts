@@ -24,11 +24,11 @@ export const setupNotifications = () => {
 
 export async function registerForPushNotificationsAsync() {
     if (Platform.OS === 'android') {
-        await Notifications.setNotificationChannelAsync('chatterUI', {
-            name: 'chatterUI',
+        await Notifications.setNotificationChannelAsync('relay', {
+            name: 'Relay',
             importance: Notifications.AndroidImportance.DEFAULT,
             vibrationPattern: [250, 0, 250, 250],
-            lightColor: '#7d6294',
+            lightColor: '#72bb98',
         })
     }
 

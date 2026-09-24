@@ -155,10 +155,6 @@ export class TerminalText {
     }
 }
 
-/** Remove escape sequences from a string without any line handling. */
-export const stripAnsi = (text: string) =>
-    text.replace(/\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]/g, '')
-
 /** UTF-8 to string without relying on `TextDecoder`, which not every JS engine ships. */
 export const utf8Decode = (bytes: Uint8Array): string => {
     if (typeof TextDecoder !== 'undefined') {

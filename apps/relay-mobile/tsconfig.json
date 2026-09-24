@@ -7,13 +7,12 @@
             "@screens/*": ["./app/screens/*"],
             "@lib/*": ["./lib/*"],
             "@assets/*": ["./assets/*"],
-            "@public/*": ["./public/*"],
             "@db/*": ["./db/*"],
             "@appconfig": ["./app.config.js"],
             "@i18n/*": ["./i18n/*"]
         },
         "allowJs": true,
-        "types": ["node", "jest"]
+        "types": ["node"]
     },
     "include": [
         "**/*.ts",
