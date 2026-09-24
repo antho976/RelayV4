@@ -1,7 +1,7 @@
 import { useLiveQuery } from 'drizzle-orm/expo-sqlite'
 import { usePathname } from 'expo-router'
 import { useMemo, useState } from 'react'
-import { View } from 'react-native'
+import { Text, View } from 'react-native'
 import Animated, { LinearTransition } from 'react-native-reanimated'
 import { useShallow } from 'zustand/react/shallow'
 
@@ -33,7 +33,7 @@ const CharacterList: React.FC = () => {
     const hiddenTags = TagHider.useHiddenTags()
     const [pages, setPages] = useState(3)
     const [previousLength, setPreviousLength] = useState(0)
-    const { data, updatedAt } = useLiveQuery(
+    const { data, updatedAt, error } = useLiveQuery(
         Characters.db.query.cardListQueryWindow(
             'character',
             searchType,
@@ -73,6 +73,12 @@ const CharacterList: React.FC = () => {
             />
 
             <CharacterListHeader resultLength={characterList.length} />
+            {/* A failed query otherwise looks like an empty list with nothing to act on. */}
+            {!!error && (
+                <Text selectable style={{ color: '#e5382e', padding: 12 }}>
+                    Could not load characters: {error.message}
+                </Text>
+            )}
             <View style={{ flex: 1 }}>
                 <Animated.FlatList
                     layout={LinearTransition}
