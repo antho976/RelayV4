@@ -20,10 +20,8 @@ type StringArrayEditorProps = {
     label?: string
     value: string[]
     setValue: (newdata: string[]) => void
-    allowDuplicates?: boolean
     placeholder?: string
     replaceNewLine?: string
-    allowBlank?: string
     suggestions?: string[]
     filterOnly?: boolean
     showSuggestionsOnEmpty?: boolean
@@ -35,9 +33,7 @@ const StringArrayEditor: React.FC<StringArrayEditorProps> = ({
     value,
     setValue,
     replaceNewLine,
-    allowDuplicates = false,
     placeholder,
-    allowBlank = false,
     suggestions = [],
     filterOnly = false,
     showSuggestionsOnEmpty = false,
@@ -196,13 +192,6 @@ const useStyles = () => {
         tagText: {
             color: color.text._100,
             marginRight: 8,
-        },
-
-        emptyTag: {
-            color: color.text._400,
-            paddingVertical: 4,
-            paddingHorizontal: 12,
-            fontStyle: 'italic',
         },
 
         input: {

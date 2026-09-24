@@ -19,10 +19,11 @@ const SwipeSchema = z.object({
     send_date: z.coerce.date(),
     gen_started: z.coerce.date(),
     gen_finished: z.coerce.date(),
-    active: z.boolean(),
-    token_length: z.number().nullable(),
-    reset_length: z.number().nullable(),
-    timings: CompletionTimingsSchema.nullable(),
+    // exports from before `active` marked the shown swipe with the message's swipe_id
+    active: z.boolean().optional(),
+    token_length: z.number().nullable().catch(null),
+    reset_length: z.number().nullable().catch(null),
+    timings: CompletionTimingsSchema.nullable().catch(null),
 })
 
 const AttachmentSchema = z.object({
@@ -35,25 +36,37 @@ const AttachmentSchema = z.object({
     size: z.number(),
 })
 
-const MessageSchema = z.object({
-    id: z.number().optional(),
-    name: z.string(),
-    chat_id: z.number(),
-    is_user: z.boolean(),
-    order: z.number(),
-    swipe_id: z.number(),
-    swipes: z.array(SwipeSchema),
-    attachments: z.array(AttachmentSchema),
-})
+const MessageSchema = z
+    .object({
+        id: z.number().optional(),
+        name: z.string(),
+        chat_id: z.number(),
+        is_user: z.boolean(),
+        order: z.number(),
+        swipe_id: z.number().catch(0),
+        swipes: z.array(SwipeSchema),
+        attachments: z.array(AttachmentSchema).catch([]),
+    })
+    .transform((message) => {
+        const marked = message.swipes.some((swipe) => swipe.active !== undefined)
+        return {
+            ...message,
+            swipes: message.swipes.map((swipe, index) => ({
+                ...swipe,
+                active: marked ? (swipe.active ?? false) : index === message.swipe_id,
+            })),
+        }
+    })
 
 export const ChatImportSchema = z.object({
     id: z.number().optional(),
-    name: z.string(),
-    last_modified: z.number().nullable(),
+    // fields added after the first export format default when an older file lacks them
+    name: z.string().catch('New Chat'),
+    last_modified: z.number().nullable().catch(null),
     character_id: z.number(),
     create_date: z.coerce.date(),
-    user_id: z.number().nullable(),
-    scroll_offset: z.number(),
+    user_id: z.number().nullable().catch(null),
+    scroll_offset: z.number().catch(0),
     hidden: z.boolean().catch(false),
     ghost: z.boolean().catch(false),
     memory: z.string().catch(''),

@@ -25,11 +25,6 @@ interface ColorStateProps {
     setDarkColor: (colorScheme: ThemeColor) => void
 }
 
-export const useGlobalStyles = () => {
-    // todo: find common items to add here
-    // const { color, spacing, borderWidth, borderRadius } = Theme.useTheme()
-}
-
 export namespace Theme {
     export const useColorState = create<ColorStateProps>()(
         persist(

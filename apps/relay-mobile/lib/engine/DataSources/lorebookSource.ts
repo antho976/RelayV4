@@ -105,13 +105,13 @@ const matchesEntry = async (entry: LorebookEntryType, text: string): Promise<boo
  * Creates the text that participates in the initial lorebook scan.
  *
  * scan_depth is interpreted as the number of most recent messages
- * participating in matching.
+ * participating in matching. messages is newest-first.
  */
 const getScanText = (messages: ContextMessage[], scanDepth: number): string => {
     if (scanDepth <= 0) return messages.map((item) => item.content).join('\n')
 
     return messages
-        .slice(-scanDepth)
+        .slice(0, scanDepth)
         .map((message) => message.content)
         .join('\n')
 }

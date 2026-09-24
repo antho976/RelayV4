@@ -1,7 +1,7 @@
-import { localDownload } from '@vali98/react-native-fs'
 import { getDocumentAsync } from 'expo-document-picker'
 import { Directory, File, FileMode, Paths } from 'expo-file-system'
 
+import { saveToDownloads } from '../../modules/relay-device'
 import { Logger } from '../state/Logger'
 
 export const AppDirectory = {
@@ -13,14 +13,6 @@ export const AppDirectory = {
 }
 
 export namespace FileUtils {
-    export const getDocumentDir = (dir: string) => {
-        return `${Paths.document.uri}${dir}`
-    }
-
-    export const getCacheDir = (dir: string) => {
-        return `${Paths.cache.uri}${dir}`
-    }
-
     /**
      *
      * @param data string data of file
@@ -33,7 +25,7 @@ export namespace FileUtils {
         encoding: 'base64' | `utf8`
     ) => {
         new File(Paths.cache, filename).write(data, { encoding })
-        await localDownload((Paths.cache.uri + filename).replace('file://', '')).catch((e) =>
+        await saveToDownloads((Paths.cache.uri + filename).replace('file://', '')).catch((e) =>
             Logger.error('Failed to download: ' + e)
         )
     }
@@ -41,12 +33,6 @@ export namespace FileUtils {
     export const pickText = async (params: { type?: string } = {}): Promise<PickerResult> => {
         return pickFile(async (file) => {
             return await file.text()
-        }, params)
-    }
-
-    export const pickBase64 = async (params: { type?: string } = {}): Promise<PickerResult> => {
-        return pickFile(async (file) => {
-            return await file.base64()
         }, params)
     }
 
@@ -84,7 +70,7 @@ export const saveStringToDownload = async (
     encoding: 'base64' | `utf8`
 ) => {
     new File(Paths.cache, filename).write(data, { encoding })
-    await localDownload((Paths.cache.uri + filename).replace('file://', '')).catch((e) =>
+    await saveToDownloads((Paths.cache.uri + filename).replace('file://', '')).catch((e) =>
         Logger.error('Failed to download: ' + e)
     )
 }
@@ -162,13 +148,9 @@ export const fileExists = (path: string) => {
     return new File(path).exists
 }
 
-export const directoryExists = (path: string) => {
-    return new Directory(path).exists
-}
-
 export const copyFile = async ({ from, to }: { from: string; to: string }) => {
     try {
-        new File(from).copy(new File(to))
+        await new File(from).copy(new File(to))
         return true
     } catch (e) {
         Logger.error('Failed to copy: ' + e)
@@ -208,17 +190,18 @@ export const makeDirectory = async (path: string) => {
 }
 
 export const readFileMagic = (path: string) => {
-    const magicBytes = new File(path).open(FileMode.ReadOnly).readBytes(4)
+    const handle = new File(path).open(FileMode.ReadOnly)
+    let magicBytes: Uint8Array
+    try {
+        magicBytes = handle.readBytes(4)
+    } finally {
+        handle.close()
+    }
     const magic = String.fromCharCode(...magicBytes)
-    const hex = Array.from(magic, (b) => `0x${b.toString().padStart(2, '0').toUpperCase()}`).join(
-        ' '
-    )
+    const hex = Array.from(
+        magicBytes,
+        (b) => `0x${b.toString(16).toUpperCase().padStart(2, '0')}`
+    ).join(' ')
 
     return { hex, magic }
-}
-
-export const printFileMagic = (path: string) => {
-    const { hex, magic } = readFileMagic(path)
-    Logger.info(hex)
-    Logger.info(magic)
 }

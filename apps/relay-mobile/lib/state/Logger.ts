@@ -50,9 +50,7 @@ export namespace Logger {
                 partialize: (state) => ({
                     logs: state.logs,
                 }),
-                migrate: async (persistedState: any, version) => {
-                    //no migrations yet
-                },
+                migrate: async (persistedState: any) => persistedState,
             }
         )
     )
@@ -136,27 +134,6 @@ export namespace Logger {
         insertLogs(logItem)
     }
 
-    export const debugToast = (data: string, internal?: string) => {
-        error(data)
-        if (internal) {
-            error(internal)
-        }
-        Toast.show(data, toastTime, {
-            textColor: 'blue',
-        })
-    }
-
-    export const errorFn = (e: unknown) => {
-        if (e instanceof Error) {
-            const firstLine = e.stack
-                ?.split('\n')?.[1]
-                ?.trim()
-                ?.replace(/\s*\(.*\)/, '')
-            if (firstLine) {
-                error('Error occured:' + firstLine)
-            }
-        }
-    }
     export const stackTrace = (e: unknown) => {
         if (e instanceof Error && e.stack) {
             error(e.stack)

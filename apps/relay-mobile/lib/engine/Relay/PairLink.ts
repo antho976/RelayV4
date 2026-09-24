@@ -75,7 +75,3 @@ export const parseManualAddress = (text: string): string | undefined => {
     }
     return undefined
 }
-
-/** The HTTP probe the direct door answers without a handshake. */
-export const infoUrl = (wsUrl: string) =>
-    wsUrl.replace(/^ws/i, 'http').replace(/\/+$/, '') + '/info'

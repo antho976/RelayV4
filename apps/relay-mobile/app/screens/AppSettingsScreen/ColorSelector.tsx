@@ -181,7 +181,7 @@ const ColorThemeItem: React.FC<ColorThemeItemProps> = ({ item, index, showDelete
                         }}
                         onPress={() => {
                             setDarkColor(item)
-                            if (systemTheme === 'light') setBackgroundColorAsync(item.neutral._100)
+                            if (systemTheme === 'dark') setBackgroundColorAsync(item.neutral._100)
                         }}>
                         <Octicons
                             color={

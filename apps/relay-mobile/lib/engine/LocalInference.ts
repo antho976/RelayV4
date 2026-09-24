@@ -70,6 +70,8 @@ const getSamplerFields = (max_length?: number) => {
                     .map((item) => item.replaceAll('\\n', '\n'))
                     .filter((item) => item.length > 0)
             }
+            // 0 means no thinking budget, not a budget of zero tokens
+            if (item.samplerID === SamplerID.REASONING_MAX_TOKENS && !cleanvalue) return {}
             return { [item.externalName as SamplerID]: cleanvalue }
         })
         .reduce((acc, obj) => Object.assign(acc, obj), {})
@@ -93,13 +95,17 @@ const buildLocalPayload = async () => {
 
     const { apiConfig, ...rest } = fields
 
-    const completionType = apiConfig.request.completionType
+    // apiConfig is a shallow copy of localAPIConfig, so nested objects are replaced, not mutated
+    let completionType = apiConfig.request.completionType
     if (context && (await context.isMultimodalEnabled())) {
         const mtmdSupport = await context.getMultimodalSupport()
         if (completionType.type === 'chatCompletions') {
-            completionType.supportsAudio = mtmdSupport?.audio
-            completionType.supportsImages = mtmdSupport?.vision
-            apiConfig.request.completionType = completionType
+            completionType = {
+                ...completionType,
+                supportsAudio: mtmdSupport?.audio,
+                supportsImages: mtmdSupport?.vision,
+            }
+            apiConfig.request = { ...apiConfig.request, completionType: completionType }
         }
     }
     const hasAudio = completionType.type === 'chatCompletions' && completionType.supportsAudio
@@ -125,7 +131,7 @@ const buildLocalPayload = async () => {
                         const jinjaResult = result as JinjaFormattedChatResult
                         const thinking_end_tag = jinjaResult.thinking_end_tag
                         const thinking_start_tag = jinjaResult.thinking_start_tag
-                        const thinking_forced_open = true
+                        const thinking_forced_open = !!jinjaResult.thinking_forced_open
 
                         if (thinking_end_tag && thinking_start_tag)
                             thinkTags = {
@@ -268,27 +274,27 @@ export const localInference = async () => {
                 .tokenize(payload.prompt, payload.media_paths)
             const result = KV.useKVStore.getState().verifyKVCache(prompt?.tokens ?? [])
             if (!result.match) {
-                Alert.alert({
-                    title: 'Cache Mismatch',
-                    description: `KV Cache does not match current prompt:\n\n${result.matchLength} of ${result.cachedLength} tokens are identical.\n\nPress 'Load Anyway' if you don't mind losing the cache.`,
-                    buttons: [
-                        { label: 'Cancel', onPress: stopGenerating },
-                        {
-                            label: 'Load Anyway',
-                            onPress: async () => {
-                                Logger.warn('Overriding KV Cache despite mismatch')
-                                const result = await Llama.useLlamaModelStore.getState().loadKV()
-                                if (result) {
-                                    KV.useKVStore.getState().setKvCacheLoaded(true)
-                                }
-                                runLocalCompletion(payload)
+                // the background task waits for the choice, or it would end before generating
+                const loadAnyway = await new Promise<boolean>((resolve) => {
+                    Alert.alert({
+                        title: 'Cache Mismatch',
+                        description: `KV Cache does not match current prompt:\n\n${result.matchLength} of ${result.cachedLength} tokens are identical.\n\nPress 'Load Anyway' if you don't mind losing the cache.`,
+                        buttons: [
+                            { label: 'Cancel', onPress: () => resolve(false) },
+                            {
+                                label: 'Load Anyway',
+                                onPress: () => resolve(true),
+                                type: 'warning',
                             },
-                            type: 'warning',
-                        },
-                    ],
-                    onDismiss: stopGenerating,
+                        ],
+                        onDismiss: () => resolve(false),
+                    })
                 })
-                return
+                if (!loadAnyway) {
+                    stopGenerating()
+                    return
+                }
+                Logger.warn('Overriding KV Cache despite mismatch')
             }
 
             const kvloadResult = await Llama.useLlamaModelStore.getState().loadKV()
@@ -498,14 +504,15 @@ const obtainFields = async (): Promise<ContextBuilderParams | void> => {
                 if (entry.id === -1) return 0
                 const [activeSwipe] = entry.swipes.filter((item) => item.active)
                 if (!activeSwipe) return 0
-                const tokenCount = activeSwipe.token_count ?? 0
+                const tokenCount = activeSwipe.token_length ?? 0
                 if (tokenCount === 0 && activeSwipe.swipe.length > 0) {
                     // assume that token length hasnt been calculated
-                    const tokenCount = await Llama.useLlamaModelStore.getState().tokenLength(
+                    const freshCount = await Llama.useLlamaModelStore.getState().tokenLength(
                         activeSwipe.swipe,
                         entry.attachments.map((item) => item.uri)
                     )
-                    Chats.db.mutate.updateSwipeTokenLength(activeSwipe.id, tokenCount)
+                    await Chats.db.mutate.updateSwipeTokenLength(activeSwipe.id, freshCount)
+                    return freshCount
                 }
 
                 return tokenCount

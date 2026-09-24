@@ -30,7 +30,7 @@ import { useCompletionMode } from '@lib/hooks/CompletionMode'
 import { useTextFilterStore } from '@lib/hooks/TextFilter'
 import { MarkdownStyle } from '@lib/markdown/Markdown'
 import { useAppMode } from '@lib/state/AppMode'
-import { Instructs, InstructType } from '@lib/state/Instructs'
+import { Instructs, InstructType, parseStopSequence } from '@lib/state/Instructs'
 import { Logger } from '@lib/state/Logger'
 import { Theme } from '@lib/theme/ThemeManager'
 import { saveStringToDownload } from '@lib/utils/File'
@@ -71,6 +71,14 @@ const promptKeys: KeysOfType<InstructType, boolean>[] = [
     'note_in_user_message',
     'strict_alternation',
 ]
+
+// older presets store a comma-separated list; a list with a comma inside an entry is stored as JSON
+const serializeStopSequence = (list: string[]) =>
+    list.some((item) => item.includes(',')) ? JSON.stringify(list) : list.join(',')
+
+const saveInstruct = (instruct: InstructType | undefined) => {
+    if (instruct?.id) Instructs.db.mutate.updateInstruct(instruct.id, instruct)
+}
 
 const FormattingManager = () => {
     const { t } = useTranslation()
@@ -120,11 +128,6 @@ const FormattingManager = () => {
             setTextFilter: state.setFilter,
         }))
     )
-
-    const handleSaveInstruct = (log: boolean) => {
-        if (currentInstruct && instructID)
-            Instructs.db.mutate.updateInstruct(instructID, currentInstruct)
-    }
 
     const handleRegenerateDefaults = () => {
         Alert.alert({
@@ -224,7 +227,7 @@ const FormattingManager = () => {
         />
     )
 
-    useAutosave({ data: currentInstruct, onSave: () => handleSaveInstruct(false), interval: 1000 })
+    useAutosave({ data: currentInstruct, onSave: saveInstruct, interval: 1000 })
 
     if (!currentInstruct) return
 
@@ -320,12 +323,18 @@ const FormattingManager = () => {
                         labelExtractor={(item) => item.name}
                         onChangeValue={(item) => {
                             if (item.id === instructID) return
+                            saveInstruct(currentInstruct)
                             loadInstruct(item.id)
                         }}
                         modalTitle={t('formatting.selectConfig')}
                         search
                     />
-                    <ThemedButton iconName="save" iconSize={28} variant="tertiary" />
+                    <ThemedButton
+                        iconName="save"
+                        iconSize={28}
+                        variant="tertiary"
+                        onPress={() => saveInstruct(currentInstruct)}
+                    />
                 </View>
                 <SectionTitle>{t('instruct.formatting')}</SectionTitle>
                 <ThemedTextInput
@@ -365,15 +374,11 @@ const FormattingManager = () => {
                 <StringArrayEditor
                     containerStyle={{}}
                     label={t('formatting.sections.stopSequence')}
-                    value={
-                        currentInstruct.stop_sequence
-                            ? currentInstruct.stop_sequence.split(',')
-                            : []
-                    }
+                    value={parseStopSequence(currentInstruct.stop_sequence ?? '')}
                     setValue={(data) => {
                         setCurrentInstruct({
                             ...currentInstruct,
-                            stop_sequence: data.join(','),
+                            stop_sequence: serializeStopSequence(data),
                         })
                     }}
                     replaceNewLine={String.fromCharCode(10)}

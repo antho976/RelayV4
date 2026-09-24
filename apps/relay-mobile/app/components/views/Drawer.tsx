@@ -206,13 +206,6 @@ const useStyles = () => {
             width: '100%',
             height: '100%',
         },
-        backdrop: {
-            backgroundColor: 'rgba(0, 0, 0, 0.5)',
-            justifyContent: 'center',
-            position: 'absolute',
-            width: '100%',
-            height: '100%',
-        },
 
         drawer: {
             backgroundColor: color.neutral._100,

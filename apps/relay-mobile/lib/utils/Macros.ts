@@ -1,4 +1,4 @@
-import { useTextFilterStore } from '@lib/hooks/TextFilter'
+import { filterRegex, useTextFilterStore } from '@lib/hooks/TextFilter'
 
 export type Macro = {
     macro: string | RegExp
@@ -23,7 +23,9 @@ const getDefaultMacros = () => {
     if (!filterState.sendFilteredText) {
         rules = [
             ...rules,
-            ...filterState.filter.map((item) => ({ macro: new RegExp(item, 'gi'), value: '' })),
+            ...filterState.filter
+                .filter(Boolean)
+                .map((item) => ({ macro: filterRegex(item), value: '' })),
         ]
     }
     return rules
@@ -35,6 +37,7 @@ export const replaceMacroBase = (
 ) => {
     let newtext: string = text
     const rules = [...getDefaultMacros(), ...(options?.extraMacros ?? [])]
-    for (const rule of rules) newtext = newtext.replaceAll(rule.macro, rule.value)
+    // a function replacer keeps `$&` or `$$` in card text as written
+    for (const rule of rules) newtext = newtext.replaceAll(rule.macro, () => rule.value)
     return newtext
 }

@@ -23,9 +23,13 @@ const SummarySheet: React.FC<SummarySheetProps> = ({ ref, session }) => {
     const [text, setText] = useState('')
     const [running, setRunning] = useState(false)
     const [problem, setProblem] = useState('')
+    // The run this sheet shows. Tokens and endings from an older run, one this sheet
+    // replaced or closed, are dropped.
+    const run = useRef(0)
     const active = useRef(false)
 
     const stop = () => {
+        run.current++
         if (active.current) stopSummary().catch(() => {})
         active.current = false
     }
@@ -33,20 +37,25 @@ const SummarySheet: React.FC<SummarySheetProps> = ({ ref, session }) => {
     useImperativeHandle(ref, () => ({
         open: (input: string) => {
             sheet.current?.open()
+            const id = ++run.current
             const reason = summarizeReason()
             setText('')
             if (reason) {
                 setProblem(reason)
+                setRunning(false)
                 return
             }
             setProblem('')
             setRunning(true)
             active.current = true
             summarizeTerminal(session, input, (piece) => {
-                if (active.current) setText((current) => current + piece)
+                if (run.current === id) setText((current) => current + piece)
             })
-                .catch((e) => setProblem(`${(e as Error).message}`))
+                .catch((e) => {
+                    if (run.current === id) setProblem(`${(e as Error).message}`)
+                })
                 .finally(() => {
+                    if (run.current !== id) return
                     setRunning(false)
                     active.current = false
                 })

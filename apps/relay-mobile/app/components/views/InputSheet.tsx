@@ -1,5 +1,5 @@
 import { getStringAsync } from 'expo-clipboard'
-import React, { useState } from 'react'
+import React, { useImperativeHandle, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Text, View } from 'react-native'
 
@@ -7,7 +7,7 @@ import ThemedButton from '@components/buttons/ThemedButton'
 import ThemedTextInput from '@components/input/ThemedTextInput'
 import { Theme } from '@lib/theme/ThemeManager'
 
-import BottomSheet, { BottomSheetRef } from './BottomSheet'
+import BottomSheet, { BottomSheetRef, useBottomSheetRef } from './BottomSheet'
 
 export type InputSheetProps = {
     ref: BottomSheetRef
@@ -17,7 +17,6 @@ export type InputSheetProps = {
     description?: string
     placeholder?: string
     verifyText?: (text: string) => string
-    errorMessage?: string
     autoFocus?: boolean
     defaultValue?: string
     multiline?: boolean
@@ -43,15 +42,26 @@ const InputSheet: React.FC<InputSheetProps> = ({
     const [text, setText] = useState(defaultValue)
     const [errorMessage, setErrorMessage] = useState('')
     const { color, fontSize, spacing } = Theme.useTheme()
+    const sheetRef = useBottomSheetRef()
+
+    // every open starts from the current defaultValue, not from what was typed last time
+    useImperativeHandle(ref, () => ({
+        open: () => {
+            setText(defaultValue)
+            setErrorMessage('')
+            sheetRef.current?.open()
+        },
+        close: () => sheetRef.current?.close(),
+    }))
 
     const handleClose = () => {
-        ref.current?.close()
+        sheetRef.current?.close()
         onClose()
         setErrorMessage('')
     }
 
     return (
-        <BottomSheet ref={ref} onRequestClose={handleClose}>
+        <BottomSheet ref={sheetRef} onRequestClose={handleClose}>
             <View style={{ rowGap: spacing.xl }}>
                 {title && (
                     <Text
@@ -77,7 +87,6 @@ const InputSheet: React.FC<InputSheetProps> = ({
                         multiline={multiline}
                         autoFocus={autoFocus}
                         placeholder={placeholder}
-                        defaultValue={defaultValue}
                         value={text}
                         onChangeText={setText}
                         containerStyle={{ flex: 1 }}
@@ -106,12 +115,14 @@ const InputSheet: React.FC<InputSheetProps> = ({
                             iconStyle={{ color: color.text._400 }}
                             iconName="close"
                             variant="tertiary"
+                            accessibilityLabel={t('common.actions.clear')}
                             onPress={() => setText('')}
                         />
                         <ThemedButton
                             iconStyle={{ color: color.text._400 }}
                             iconName="copy"
                             variant="tertiary"
+                            accessibilityLabel={t('common.actions.paste')}
                             onPress={async () => {
                                 const paste = await getStringAsync()
                                 if (paste) setText((text) => text + paste)
@@ -125,8 +136,6 @@ const InputSheet: React.FC<InputSheetProps> = ({
                             if (result) setErrorMessage(result)
                             else {
                                 onConfirm(text)
-                                // The next open starts fresh, not with what was just sent.
-                                setText(defaultValue)
                                 handleClose()
                             }
                         }}

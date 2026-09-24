@@ -24,6 +24,7 @@ import m0019 from './0019_youthful_captain_cross.sql';
 import m0020 from './0020_amusing_plazm.sql';
 import m0021 from './0021_productive_nebula.sql';
 import m0022 from './0022_nifty_scalphunter.sql';
+import m0023 from './0023_repair_lorebook_entries.sql';
 
   export default {
     journal,
@@ -50,7 +51,8 @@ m0018,
 m0019,
 m0020,
 m0021,
-m0022
+m0022,
+m0023
     }
   }
   

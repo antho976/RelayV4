@@ -93,7 +93,7 @@ Below is an explanation of what each field does:
 | :------------------------- | :------------------: | :---------------------: |
 | Max Context                |      max_length      | {{max_context_length}}  |
 | Streaming                  |      streaming       |       {{stream}}        |
-| Generated Tokens           |        genamt        |   {{generted_length}}   |
+| Generated Tokens           |        genamt        |   {{generated_length}}   |
 | Temperature                |         temp         |        {{temp}}         |
 | Dynamic Temperature Range  |    dynatemp_range    |   {{dynatemp_range}}    |
 | Min P                      |        min_p         |        {{min_p}}        |

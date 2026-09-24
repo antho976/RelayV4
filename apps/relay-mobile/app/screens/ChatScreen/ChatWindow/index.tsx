@@ -46,15 +46,17 @@ const ChatWindow: React.FC<ChatWindowProps> = ({ chatId, scrollData }) => {
     })
     const chatBackground = chatData?.background_image
 
-    const { data: entryIdList, updatedAt } = useLiveQueryJoined(Chats.db.live.entryIdList(chatId), [
-        chatId,
-        {
-            sync: true,
-        },
-    ])
+    const { data: entryIdList, updatedAt } = useLiveQueryJoined(
+        Chats.db.live.entryIdList(chatId),
+        [chatId],
+        { sync: true }
+    )
 
-    const { cause: scrollCause, index: scrollIndex } = scrollData ?? {}
     const flatlistRef = useRef<FlatList | null>(null)
+    // the parent keys this window by chatId, so every row here belongs to chatId
+    const entryCount = useRef(0)
+    // the scroll request already acted on; offsets are not saved until it is
+    const handledScroll = useRef<ScrollData | undefined>(undefined)
     const { showSettings, showChat } = Drawer.useDrawerStore(
         useShallow((state) => ({
             showSettings: state.values?.[Drawer.ID.SETTINGS],
@@ -71,18 +73,21 @@ const ChatWindow: React.FC<ChatWindowProps> = ({ chatId, scrollData }) => {
     const image = useBackgroundStore((state) => state.image)
 
     useEffect(() => {
-        if (!scrollCause || !scrollIndex) return
-        const isSave = scrollCause === 'saveScroll'
-        if (!saveScroll && isSave) return
-        const offset = Math.max(0, scrollIndex + (isSave ? 1 : 0))
-
-        if (offset > 2)
-            flatlistRef.current?.scrollToIndex({
-                index: offset,
-                animated: scrollCause === 'search',
-                viewOffset: 32,
-            })
-    }, [scrollCause, scrollIndex, saveScroll])
+        entryCount.current = entryIdList.length
+        if (!scrollData || handledScroll.current === scrollData || entryIdList.length === 0) return
+        const index =
+            scrollData.cause === 'search'
+                ? entryIdList.findIndex((item) => item.id === scrollData.entryId)
+                : Math.min(scrollData.index, entryIdList.length - 1)
+        handledScroll.current = scrollData
+        if (index === -1 || (scrollData.cause === 'saveScroll' && (!saveScroll || index <= 2)))
+            return
+        flatlistRef.current?.scrollToIndex({
+            index: index,
+            animated: scrollData.cause === 'search',
+            viewOffset: 32,
+        })
+    }, [scrollData, entryIdList, saveScroll])
 
     return (
         <ImageBackground
@@ -128,15 +133,9 @@ const ChatWindow: React.FC<ChatWindowProps> = ({ chatId, scrollData }) => {
                 scrollEventThrottle={16}
                 onViewableItemsChanged={(item) => {
                     const index = item.viewableItems?.at(0)?.index
-
-                    if (index && chatId)
-                        updateScrollPosition(
-                            index - (item.viewableItems.length === 1 ? 1 : 0),
-                            chatId
-                        )
-                    if (index) {
-                        setShowJump(index > 15)
-                    }
+                    if (typeof index !== 'number') return
+                    if (handledScroll.current === scrollData) updateScrollPosition(index, chatId)
+                    setShowJump(index > 15)
                 }}
                 onScrollToIndexFailed={(error) => {
                     flatlistRef.current?.scrollToOffset({
@@ -144,8 +143,8 @@ const ChatWindow: React.FC<ChatWindowProps> = ({ chatId, scrollData }) => {
                         animated: true,
                     })
                     setTimeout(() => {
-                        if (entryIdList.length !== 0 && flatlistRef.current !== null) {
-                            flatlistRef.current?.scrollToIndex({
+                        if (error.index < entryCount.current && flatlistRef.current !== null) {
+                            flatlistRef.current.scrollToIndex({
                                 index: error.index,
                                 animated: true,
                                 viewOffset: 32,

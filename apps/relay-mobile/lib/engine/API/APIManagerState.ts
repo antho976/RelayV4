@@ -45,8 +45,8 @@ export namespace APIManager {
                 updatePreferences: (preferences) =>
                     set({ preferences: { ...get().preferences, ...preferences } }),
                 addValue: (value) => {
-                    const values = [...get().values]
-                    values.forEach((item) => (item.active = false))
+                    if (!value.active) return set({ values: [...get().values, value] })
+                    const values = get().values.map((item) => ({ ...item, active: false }))
                     values.push(value)
                     set({
                         values: values,
@@ -55,7 +55,7 @@ export namespace APIManager {
                 },
                 setActiveIndex: (activeIndex) => {
                     const values = get().values.map((item) => ({ ...item, active: false }))
-                    if (activeIndex > values.length) return
+                    if (activeIndex < 0 || activeIndex >= values.length) return
                     values[activeIndex].active = true
                     set({ activeIndex, values })
                 },
@@ -76,28 +76,25 @@ export namespace APIManager {
                 },
                 removeValue: (index) => {
                     const values = [...get().values]
+                    if (index < 0 || index >= values.length) return
                     let activeIndex = get().activeIndex
-                    if (index === activeIndex) {
-                        activeIndex = -1
-                    }
+                    if (index === activeIndex) activeIndex = -1
+                    else if (index < activeIndex) activeIndex--
                     values.splice(index, 1)
                     CharacterLink.db.mutate.deleteByValue('connection_index', index)
                     set({ values: values, activeIndex: activeIndex })
                 },
                 removeTemplate: (index) => {
-                    const templates = get().customTemplates
-                    templates.splice(index, 1)
-                    set((state) => ({ customTemplates: [...templates] }))
+                    set({ customTemplates: get().customTemplates.filter((_, i) => i !== index) })
                 },
                 editValue: (newValue, index) => {
-                    const values = [...get().values]
+                    let values = [...get().values]
                     const oldValue = values[index]
+                    if (!oldValue) return
                     values[index] = newValue
                     let active = {}
                     if (newValue.active && !oldValue.active) {
-                        values.forEach((item, newindex) => {
-                            item.active = newindex === index
-                        })
+                        values = values.map((item, i) => ({ ...item, active: i === index }))
                         active = { activeIndex: index }
                     }
                     if (!newValue.active && oldValue.active) {

@@ -85,28 +85,6 @@ export namespace AuthorNotes {
                     .where(eq(authorNotes.id, noteId))
                     .limit(1)
             }
-
-            export const chatNoteIds = (chatId: number) => {
-                return database
-                    .select({
-                        id: authorNotes.id,
-                    })
-                    .from(authorNotes)
-                    .where(eq(authorNotes.chat_id, chatId))
-            }
-
-            export const characterNotes = (charId: number) => {
-                return database
-                    .select({ id: authorNotes.id })
-                    .from(authorNotes)
-                    .where(eq(authorNotes.character_id, charId))
-            }
-            export const globalNotes = () => {
-                return database
-                    .select({ id: authorNotes.id })
-                    .from(authorNotes)
-                    .where(and(isNull(authorNotes.character_id), isNull(authorNotes.chat_id)))
-            }
         }
     }
 }

@@ -19,7 +19,12 @@ const withTrustLocalCerts = (config) => {
 }
 
 async function setCustomConfigAsync(config, androidManifest) {
-    const src_file_pat = path.join('assets', 'xml', 'network_security_config.xml')
+    const src_file_pat = path.join(
+        config.modRequest.projectRoot,
+        'assets',
+        'xml',
+        'network_security_config.xml'
+    )
     const res_file_path = path.join(
         await Paths.getResourceFolderAsync(config.modRequest.projectRoot),
         'xml',
@@ -28,15 +33,8 @@ async function setCustomConfigAsync(config, androidManifest) {
 
     const res_dir = path.resolve(res_file_path, '..')
 
-    if (!fs.existsSync(res_dir)) {
-        await fsPromises.mkdir(res_dir)
-    }
-
-    try {
-        await fsPromises.copyFile(src_file_pat, res_file_path)
-    } catch (e) {
-        throw e
-    }
+    await fsPromises.mkdir(res_dir, { recursive: true })
+    await fsPromises.copyFile(src_file_pat, res_file_path)
 
     const mainApplication = getMainApplicationOrThrow(androidManifest)
     mainApplication.$['android:networkSecurityConfig'] = '@xml/network_security_config'

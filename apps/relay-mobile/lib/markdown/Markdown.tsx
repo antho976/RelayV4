@@ -1,9 +1,19 @@
 import { setStringAsync } from 'expo-clipboard'
+import { Paths } from 'expo-file-system'
 import { Image } from 'expo-image'
 import { t } from 'i18next'
 import { RaTeXView } from 'ratex-react-native'
 import React, { ReactNode, useCallback, useMemo, useState } from 'react'
-import { Platform, StyleSheet, Text, useWindowDimensions, View } from 'react-native'
+import {
+    Linking,
+    Platform,
+    Pressable,
+    StyleSheet,
+    Text,
+    TouchableWithoutFeedback,
+    useWindowDimensions,
+    View,
+} from 'react-native'
 import { MarkdownIt } from 'react-native-markdown-display'
 
 import ThemedButton from '@components/buttons/ThemedButton'
@@ -46,33 +56,54 @@ const getDeepASTDirection = (astNode: any): 'ltr' | 'rtl' | 'neutral' => {
     return 'neutral'
 }
 
-const ImageAdapter = ({
-    node,
-    children,
-    parent,
-    styles,
-    allowedImageHandlers,
-    defaultImageHandler,
-}: {
-    node: any
-    children: any
-    parent: any
-    styles: any
-    allowedImageHandlers: any
-    defaultImageHandler: any
-}) => {
+// model output and cards are untrusted, so a link may only open a web page or a mail app
+const openLink = (href?: string) => {
+    const url = href?.trim()
+    if (!url || !/^(https?|mailto):/i.test(url)) return
+    Linking.openURL(url).catch(() => Logger.errorToast(t('chat.markdown.linkFailed')))
+}
+
+// images load by themselves only from the app's own files or data: URIs;
+// a remote image waits for a tap, and anything else (content://, other files) never loads
+const getImageSource = (src: string): 'auto' | 'remote' | 'blocked' => {
+    if (/^data:image\//i.test(src)) return 'auto'
+    if (/^https?:\/\//i.test(src)) return 'remote'
+    let path = src
+    try {
+        path = decodeURIComponent(src)
+    } catch {
+        return 'blocked'
+    }
+    if (/(^|\/)\.\.(\/|$)/.test(path)) return 'blocked'
+    return [Paths.document.uri, Paths.cache.uri].some((dir) => src.startsWith(dir))
+        ? 'auto'
+        : 'blocked'
+}
+
+const ImageAdapter = ({ node, styles }: { node: any; styles: any }) => {
     const [imageData, setImageData] = useState({ height: 0, aspectRatio: 1 })
-    const { src, alt } = node.attributes
+    const src: string = node.attributes.src ?? ''
+    const alt: string | undefined = node.attributes.alt
+    const source = getImageSource(src)
+    const [load, setLoad] = useState(source === 'auto')
 
     const { width } = useWindowDimensions()
-    // we check that the source starts with at least one of the elements in allowedImageHandlers
-    const show =
-        allowedImageHandlers.filter((value: string) => {
-            return src.toLowerCase().startsWith(value.toLowerCase())
-        }).length > 0
 
-    if (show === false && defaultImageHandler === null) {
-        return null
+    if (!load) {
+        const label =
+            source === 'remote'
+                ? t('chat.markdown.loadImage', { url: src })
+                : t('chat.markdown.blockedImage', { url: src })
+        return (
+            <Pressable
+                disabled={source !== 'remote'}
+                accessibilityRole="button"
+                onPress={() => setLoad(true)}>
+                <Text style={styles.link} numberOfLines={2}>
+                    {alt ? `${alt} — ${label}` : label}
+                </Text>
+            </Pressable>
+        )
     }
 
     const imageProps: any = {
@@ -292,26 +323,27 @@ export namespace MarkdownStyle {
                 </Text>
             )
         },
-        image: (
-            node: any,
-            children: any,
-            parent: any,
-            styles: any,
-            allowedImageHandlers: any,
-            defaultImageHandler: any
-        ) => {
-            return (
-                <ImageAdapter
-                    key={node.key}
-                    node={node}
-                    parent={parent}
-                    styles={styles}
-                    allowedImageHandlers={allowedImageHandlers}
-                    defaultImageHandler={defaultImageHandler}>
-                    {children}
-                </ImageAdapter>
-            )
+        image: (node: any, children: any, parent: any, styles: any) => {
+            return <ImageAdapter key={node.key} node={node} styles={styles} />
         },
+        link: (node: any, children: any, parent: any, styles: any) => (
+            <Text
+                key={node.key}
+                style={styles.link}
+                accessibilityRole="link"
+                onPress={() => openLink(node.attributes.href)}>
+                {children}
+            </Text>
+        ),
+        blocklink: (node: any, children: any, parent: any, styles: any) => (
+            <TouchableWithoutFeedback
+                key={node.key}
+                accessibilityRole="link"
+                onPress={() => openLink(node.attributes.href)}
+                style={styles.blocklink}>
+                <View style={styles.image}>{children}</View>
+            </TouchableWithoutFeedback>
+        ),
     }
 
     export const useCustomFormatting = () => {

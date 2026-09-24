@@ -10,7 +10,6 @@ type SSEValues = {
 
 export class SSEFetch {
     private abortController: AbortController = new AbortController()
-    private decoder = new TextDecoder()
     private onEvent = (data: string) => {}
     private onError = () => {}
     private onClose = () => {}
@@ -29,6 +28,8 @@ export class SSEFetch {
         this.abortController = new AbortController()
         const body = values.method === 'POST' ? { body: values.body } : {}
         this.cancelled = false
+        // onError already ends the request, so onClose must not end it a second time
+        let failed = false
         try {
             const res = await fetch(values.endpoint, {
                 signal: this.abortController.signal,
@@ -39,6 +40,7 @@ export class SSEFetch {
             if (res.status !== 200 || !res.body) {
                 Logger.error('Status ' + res.status)
                 Logger.error(await res.text())
+                failed = true
                 return this.onError()
             }
             const reader = res.body.getReader()
@@ -48,13 +50,18 @@ export class SSEFetch {
                     this.cancelled = true
                 } catch {}
             }
+            // a network chunk can end mid-line or mid-character, so decoding is streamed
+            // and the unfinished last line waits for the next chunk
+            const decoder = new TextDecoder()
+            let pending = ''
             while (true) {
                 const { value, done } = await reader.read()
-                if (done || this.cancelled) break
-
-                const data = this.decoder.decode(value)
-                const output = parseSSE(data)
-                output.forEach((item) => this.onEvent(item))
+                if (this.cancelled) break
+                pending += done ? decoder.decode() : decoder.decode(value, { stream: true })
+                const lines = pending.split(/\r?\n/)
+                pending = done ? '' : (lines.pop() ?? '')
+                parseSSE(lines).forEach((item) => this.onEvent(item))
+                if (done) break
             }
         } catch (e) {
             if (this.abortController.signal.aborted) {
@@ -62,7 +69,7 @@ export class SSEFetch {
             }
             Logger.error('Request Failed: ' + e)
         } finally {
-            this.onClose()
+            if (!failed) this.onClose()
         }
     }
 
@@ -79,9 +86,8 @@ export class SSEFetch {
     }
 }
 
-function parseSSE(message: string) {
+function parseSSE(lines: string[]) {
     const output: string[] = []
-    const lines = message.split(/\n/)
     for (const line of lines) {
         // For some APIs like Ollama, they use a ndjson stream
         if (line.startsWith('{')) {

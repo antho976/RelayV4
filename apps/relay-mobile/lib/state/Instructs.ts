@@ -191,6 +191,18 @@ export const commonStopStrings = [
     '<｜end▁of▁sentence｜>',
 ]
 
+/** Stop strings are stored as a JSON array when one contains a comma, else comma separated. */
+export const parseStopSequence = (value: string): string[] => {
+    if (value.trimStart().startsWith('[')) {
+        try {
+            const parsed: unknown = JSON.parse(value)
+            if (Array.isArray(parsed) && parsed.every((item) => typeof item === 'string'))
+                return parsed.filter((item) => item !== '')
+        } catch {}
+    }
+    return value.split(',').filter((item) => item !== '')
+}
+
 type InstructState = {
     data: InstructType | undefined
     load: (id: number) => Promise<void>
@@ -322,10 +334,11 @@ export namespace Instructs {
                         if (charName) sequence.push(`\n${charName}:`)
                     }
 
-                    if (instruct.stop_sequence !== '')
-                        instruct.stop_sequence
-                            .split(',')
-                            .forEach((item) => item !== '' && sequence.push(item))
+                    // parsed before macros are filled in, so a name with a quote or comma stays whole
+                    parseStopSequence(get().data?.stop_sequence ?? '').forEach((item) => {
+                        const stop = replaceMacros(item)
+                        if (stop !== '') sequence.push(stop)
+                    })
 
                     if (instruct.use_common_stop) {
                         extras = [...extras, ...commonStopStrings]
@@ -340,13 +353,15 @@ export namespace Instructs {
                 partialize: (state) => ({ data: state.data }),
                 version: 12,
                 migrate: async (persistedState: any, version) => {
-                    if (!version) {
+                    // steps are cumulative: a store several versions behind takes every one
+                    if (!persistedState?.data) return persistedState
+                    if (version < 1) {
                         persistedState.data.timestamp = false
                         persistedState.data.examples = true
                         persistedState.data.format_type = 0
                         Logger.info('[INSTRUCT] Migrated to v1')
                     }
-                    if (version === 1) {
+                    if (version < 2) {
                         persistedState.data.last_output_prefix = persistedState.data.output_prefix
                         const entries = await database.query.instructs.findMany({
                             columns: {
@@ -354,57 +369,56 @@ export namespace Instructs {
                                 output_prefix: true,
                             },
                         })
-                        entries.forEach(async (item) => {
+                        for (const item of entries)
                             await database
                                 .update(instructs)
                                 .set({ last_output_prefix: item.output_prefix })
                                 .where(eq(instructs.id, item.id))
-                        })
 
                         Logger.info('[INSTRUCT] Migrated to v2')
                     }
-                    if (version === 2) {
+                    if (version < 3) {
                         persistedState.data.scenario = true
                         persistedState.data.personality = true
                     }
 
-                    if (version === 3) {
+                    if (version < 4) {
                         persistedState.data.hide_think_tags = true
                     }
 
-                    if (version === 4) {
+                    if (version < 5) {
                         persistedState.data.use_common_stop = true
                     }
 
-                    if (version === 5) {
+                    if (version < 6) {
                         persistedState.data.send_images = true
                         persistedState.data.send_audio = true
                         persistedState.data.send_documents = true
                         persistedState.data.last_image_only = true
                     }
 
-                    if (version === 6) {
+                    if (version < 7) {
                         persistedState.data.system_prompt_format = defaultSystemPromptFormat
                     }
 
-                    if (version === 7) {
+                    if (version < 8) {
                         persistedState.data.use_card_system_prompt = true
                         persistedState.data.use_post_history = true
                     }
 
-                    if (version === 8) {
+                    if (version < 9) {
                         persistedState.data.label_sections = true
                     }
 
-                    if (version === 9) {
+                    if (version < 10) {
                         persistedState.data.note_in_user_message = false
                     }
 
-                    if (version === 10) {
+                    if (version < 11) {
                         persistedState.data.attachment_depth = 2
                     }
 
-                    if (version === 11) {
+                    if (version < 12) {
                         persistedState.data.strict_alternation = false
                     }
 

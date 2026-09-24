@@ -1,6 +1,6 @@
 import { CameraView, useCameraPermissions } from 'expo-camera'
 import { getStringAsync } from 'expo-clipboard'
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import { Text, View } from 'react-native'
 
 import ThemedButton from '@components/buttons/ThemedButton'
@@ -31,6 +31,9 @@ const PairSheet: React.FC<PairSheetProps> = ({ visible, setVisible }) => {
     const [code, setCode] = useState('')
     const [error, setError] = useState('')
     const [scanned, setScanned] = useState(false)
+    // State updates land on the next render; the camera can report twice before then.
+    const scanLock = useRef(false)
+    const pairLock = useRef(false)
     const sheet = useBottomSheetRef()
 
     // The sheet is opened and closed through its ref; `visible` is what the parent asked for.
@@ -40,7 +43,8 @@ const PairSheet: React.FC<PairSheetProps> = ({ visible, setVisible }) => {
     }, [visible, sheet])
 
     const finish = async (link: PairLink) => {
-        if (busy) return
+        if (pairLock.current) return
+        pairLock.current = true
         setBusy(true)
         setError('')
         try {
@@ -51,6 +55,7 @@ const PairSheet: React.FC<PairSheetProps> = ({ visible, setVisible }) => {
         } catch (e) {
             setError(`${(e as Error).message}`)
         } finally {
+            pairLock.current = false
             setBusy(false)
         }
     }
@@ -58,7 +63,8 @@ const PairSheet: React.FC<PairSheetProps> = ({ visible, setVisible }) => {
     // The camera reports the same code several times a second; one scan is one attempt,
     // and "Scan again" is the only way to re-arm it after a failure.
     const handleScanned = (data: string) => {
-        if (scanned || busy) return
+        if (scanLock.current || pairLock.current) return
+        scanLock.current = true
         setScanned(true)
         const link = parsePairLink(data)
         if (!link) {
@@ -107,6 +113,7 @@ const PairSheet: React.FC<PairSheetProps> = ({ visible, setVisible }) => {
             onClose={() => {
                 setVisible(false)
                 setError('')
+                scanLock.current = false
                 setScanned(false)
             }}
             sheetStyle={{ maxHeight: '85%' }}>
@@ -176,6 +183,7 @@ const PairSheet: React.FC<PairSheetProps> = ({ visible, setVisible }) => {
                                 iconName="reload"
                                 variant="secondary"
                                 onPress={() => {
+                                    scanLock.current = false
                                     setScanned(false)
                                     setError('')
                                 }}

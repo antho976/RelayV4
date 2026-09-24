@@ -1,3 +1,4 @@
+import * as SecureStore from 'expo-secure-store'
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 
@@ -29,6 +30,32 @@ export type RelayHost = {
     lastTransport?: 'direct' | 'via'
 }
 
+/**
+ * The device token lives in the Android keystore (SecureStore), not beside the rest of the
+ * record in MMKV: MMKV files go into Android's cloud backup, and a restored backup would
+ * otherwise carry a working credential to another phone. A keystore key is never backed up,
+ * so after a restore the token is gone and the PC has to be paired again — on purpose.
+ */
+const tokenKey = (hostId: string) => `relay-token-${hostId.replace(/[^A-Za-z0-9._-]/g, '_')}`
+
+const saveToken = (hostId: string, token: string) => {
+    try {
+        SecureStore.setItem(tokenKey(hostId), token)
+    } catch {}
+}
+
+const loadToken = (hostId: string): string => {
+    try {
+        return SecureStore.getItem(tokenKey(hostId)) ?? ''
+    } catch {
+        return ''
+    }
+}
+
+const dropToken = (hostId: string) => {
+    SecureStore.deleteItemAsync(tokenKey(hostId)).catch(() => {})
+}
+
 type RelayHostsState = {
     hosts: RelayHost[]
     activeHostId?: string
@@ -50,9 +77,11 @@ export const useRelayHostsStore = create<RelayHostsState>()(
                 const merged = previous?.extra?.length
                     ? { ...host, extra: host.extra ?? previous.extra }
                     : host
+                saveToken(host.id, host.token)
                 set({ hosts: [...others, merged], activeHostId: host.id })
             },
             updateHost: (id, patch) => {
+                if (patch.token !== undefined) saveToken(id, patch.token)
                 set({
                     hosts: get().hosts.map((item) =>
                         item.id === id ? { ...item, ...patch } : item
@@ -61,6 +90,7 @@ export const useRelayHostsStore = create<RelayHostsState>()(
             },
             removeHost: (id) => {
                 const hosts = get().hosts.filter((item) => item.id !== id)
+                dropToken(id)
                 set({
                     hosts: hosts,
                     activeHostId: get().activeHostId === id ? hosts[0]?.id : get().activeHostId,
@@ -71,8 +101,27 @@ export const useRelayHostsStore = create<RelayHostsState>()(
         {
             name: Storage.RelayHosts,
             storage: createMMKVStorage(),
-            version: 1,
-            partialize: (state) => ({ hosts: state.hosts, activeHostId: state.activeHostId }),
+            version: 2,
+            // the token is stored apart (see tokenKey) and put back on load
+            partialize: (state) => ({
+                hosts: state.hosts.map((host) => ({ ...host, token: '' })),
+                activeHostId: state.activeHostId,
+            }),
+            migrate: (persisted: any, version) => {
+                // version 1 kept the token in MMKV: move it to the keystore
+                if (version < 2)
+                    for (const host of persisted?.hosts ?? [])
+                        if (host.token) saveToken(host.id, host.token)
+                return persisted
+            },
+            merge: (persisted: any, current) => ({
+                ...current,
+                ...persisted,
+                hosts: (persisted?.hosts ?? []).map((host: RelayHost) => ({
+                    ...host,
+                    token: loadToken(host.id),
+                })),
+            }),
         }
     )
 )

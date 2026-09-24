@@ -84,8 +84,13 @@ export const resolveChatPreset = async (
 type TextData = { type: 'input_text' | 'text'; text: string }
 type ImageData = { type: 'image_url'; image_url: { url: string } }
 type AudioData = { type: 'input_audio'; input_audio: { data: string; format: string } }
+// Claude's shape for an image, converted from ImageData when the request is built
+type Base64ImageData = {
+    type: 'image'
+    source: { type: 'base64'; media_type: string; data: string }
+}
 
-type ContentTypes = TextData | ImageData | AudioData
+type ContentTypes = TextData | ImageData | AudioData | Base64ImageData
 
 export type Message = { role: string; [x: string]: ContentTypes[] | string }
 
@@ -361,6 +366,8 @@ export const collectContext = async (params: ContextBuilderParams & { mode: 'cha
             }
 
             const budget = opportunistic ? remaining : source.tokenBudget
+            // the reservation made up front is replaced by what the source actually inserts
+            if (!opportunistic) totalLength -= source.tokenBudget
 
             const results = await source.retrieve(
                 params,
@@ -383,46 +390,34 @@ export const collectContext = async (params: ContextBuilderParams & { mode: 'cha
 
     await runDataSources(sortedDataSources)
 
-    const insertMessage = (index: number, message: ContextMessage) => {
-        contextMessages.splice(index, 0, message)
-    }
-
+    // contextMessages is newest-first. Each insertion is placed in a gap of the history as
+    // it stands now: gap 0 follows the latest message, gap n precedes the oldest one.
+    // Within a gap, insertions keep their order when read chronologically.
+    const gaps: ContextMessage[][] = contextMessages.map(() => [])
+    gaps.push([])
     for (const insertion of pendingInsertions) {
         const syntheticMessage: ContextMessage = {
             role: 'user',
             content: insertion.content,
         }
 
+        let gap = 0
         if (insertion.position.type === 'relative') {
-            switch (insertion.position.location) {
-                case 'afterLast':
-                    contextMessages.push(syntheticMessage)
-                    break
-
-                case 'beforeLast':
-                    contextMessages.splice(
-                        Math.max(contextMessages.length - 1, 0),
-                        0,
-                        syntheticMessage
-                    )
-                    break
-
-                case 'afterSystem':
-                    systemPrompt += '\n' + insertion.content
-                    break
+            if (insertion.position.location === 'afterSystem') {
+                systemPrompt += '\n' + insertion.content
+                continue
             }
-
-            continue
-        }
-
-        const index = insertion.position.location
-
-        if (index >= contextMessages.length) {
-            contextMessages.unshift(syntheticMessage)
+            gap = insertion.position.location === 'afterLast' ? 0 : 1
         } else {
-            insertMessage(index, syntheticMessage)
+            gap = insertion.position.location
         }
+        gaps[Math.min(Math.max(gap, 0), contextMessages.length)].unshift(syntheticMessage)
     }
+    const history = contextMessages.splice(0, contextMessages.length)
+    gaps.forEach((inserted, index) => {
+        contextMessages.push(...inserted)
+        if (index < history.length) contextMessages.push(history[index])
+    })
 
     Logger.info(`Approximate Context Size: ${totalLength}`)
     Logger.info(`${(performance.now() - delta).toFixed(2)}ms`)
@@ -545,7 +540,7 @@ const thinkRule = buildThinkRules()
  * - consecutive same-role messages are merged into one
  * - a leading assistant message (the character's greeting) gets a placeholder user turn
  */
-const enforceAlternation = (
+export const enforceAlternation = (
     output: Message[],
     roles: { userRole: string; systemRole: string; assistantRole: string; contentName: string }
 ): Message[] => {
@@ -722,7 +717,7 @@ export const getSystemPrompt = ({
     const cardSystemPrompt = character?.system_prompt?.trim() ?? ''
     const useCardPrompt = instruct.use_card_system_prompt && cardSystemPrompt.length > 0
     let finalSystemPrompt = useCardPrompt
-        ? cardSystemPrompt.replaceAll('{{original}}', instructSystemPrompt)
+        ? cardSystemPrompt.replaceAll('{{original}}', () => instructSystemPrompt)
         : instructSystemPrompt
     let finalSystemPromptLength = useCardPrompt
         ? characterCache.system_prompt_length +
@@ -732,7 +727,7 @@ export const getSystemPrompt = ({
     // an active chat preset has the final say on the system prompt and persona
     if (preset.system_prompt) {
         const base = finalSystemPrompt
-        finalSystemPrompt = preset.system_prompt.text.replaceAll('{{original}}', base)
+        finalSystemPrompt = preset.system_prompt.text.replaceAll('{{original}}', () => base)
         finalSystemPromptLength =
             preset.system_prompt.length +
             (preset.system_prompt.text.includes('{{original}}') ? finalSystemPromptLength : 0)
@@ -808,7 +803,7 @@ export const getSystemPrompt = ({
         },
     ]
     macros.forEach((m) => {
-        systemPrompt = systemPrompt.replaceAll(m.macro, m.value)
+        systemPrompt = systemPrompt.replaceAll(m.macro, () => m.value)
         systemPromptLength += m.length
     })
     return { systemPrompt, systemPromptLength }

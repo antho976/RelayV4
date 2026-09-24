@@ -144,6 +144,9 @@ const ThemedButton: React.FC<ThemedButtonProps> = ({
     return (
         <AnimatedPressable
             disabled={variant === 'disabled'}
+            accessibilityRole="button"
+            accessibilityLabel={label}
+            accessibilityState={{ disabled: variant === 'disabled' || !!rest.disabled }}
             onPressIn={(event) => {
                 handlePressIn()
                 if (onPressIn) onPressIn(event)

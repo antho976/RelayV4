@@ -1,4 +1,3 @@
-import { closeFd, getContentFd } from '@vali98/react-native-fs'
 import {
     CompletionParams,
     ContextParams,
@@ -16,6 +15,7 @@ import { AppDirectory, fileExists, readableFileSize, writeBase64File } from '@li
 
 import { checkGGMLDeprecated } from './GGML'
 import { KV, Model } from './Model'
+import * as RelayDevice from '../../../modules/relay-device'
 import { AppSettings } from '../../constants/GlobalValues'
 import { Logger } from '../../state/Logger'
 import { createMMKVStorage, mmkv } from '../../storage/MMKV'
@@ -41,6 +41,9 @@ export type LlamaState = {
     context: LlamaContext | undefined
     model?: ModelDataType
     mmproj?: ModelDataType
+    // descriptors opened for models picked from shared storage, closed on unload
+    modelFd?: string
+    mmprojFd?: string
     loadProgress: number
     chatCount: number
     promptCache?: string
@@ -164,10 +167,7 @@ export namespace Llama {
                 await get().unload()
             }
 
-            let model_path = model.file_path
-            if (model.file_path.includes('content://')) {
-                model_path = (await getContentFd(model_path)) ?? model_path
-            }
+            const model_path = await openContentFd(model.file_path)
 
             const params: ContextParams = {
                 model: model_path,
@@ -191,16 +191,17 @@ export namespace Llama {
 
             const llamaContext = await initLlama(params, progressCallback).catch((error) => {
                 Logger.errorToast(t('model.toast.couldNotLoadModel'), JSON.stringify(error))
-                if (model.file_path.includes('content://')) {
-                    closeFd(model_path)
-                }
             })
 
-            if (!llamaContext) return
+            if (!llamaContext) {
+                closeContentFd(model.file_path, model_path)
+                return
+            }
 
             set({
                 context: llamaContext,
                 model: model,
+                modelFd: model_path !== model.file_path ? model_path : undefined,
                 chatCount: 1,
             })
 
@@ -212,19 +213,22 @@ export namespace Llama {
             const context = get().context
             if (!context) return
 
-            let model_path = model.file_path
-            if (model.file_path.includes('content://')) {
-                model_path = (await getContentFd(model_path)) ?? model_path
-            }
+            const model_path = await openContentFd(model.file_path)
 
             Logger.info('Loading MMPROJ')
-            await context.initMultimodal({ path: model_path, use_gpu: true }).catch((e) => {
-                if (model.file_path.includes('content://')) {
-                    closeFd(model_path)
-                }
-
-                Logger.errorToast(t('model.toast.failedToLoadMMPROJ'), e)
-            })
+            const loaded = await context
+                .initMultimodal({ path: model_path, use_gpu: true })
+                .catch((e) => {
+                    Logger.errorToast(t('model.toast.failedToLoadMMPROJ'), e)
+                    return false
+                })
+            if (!loaded) {
+                closeContentFd(model.file_path, model_path)
+                // a failed projector is not retried on the next auto-load
+                if (useLlamaPreferencesStore.getState().lastMmproj?.id === model.id)
+                    useLlamaPreferencesStore.getState().setLastMmprojLoaded(undefined)
+                return
+            }
             if (await context.isMultimodalEnabled()) {
                 const capabilities = await context.getMultimodalSupport()
                 Logger.info(
@@ -232,8 +236,11 @@ export namespace Llama {
                 )
             }
 
+            const previousFd = get().mmprojFd
+            if (previousFd) RelayDevice.closeContentFd(previousFd)
             set({
                 mmproj: model,
+                mmprojFd: model_path !== model.file_path ? model_path : undefined,
             })
 
             useLlamaPreferencesStore.getState().setLastMmprojLoaded(model)
@@ -247,10 +254,15 @@ export namespace Llama {
             }
 
             await get().context?.release()
+            const { modelFd, mmprojFd } = get()
+            if (modelFd) RelayDevice.closeContentFd(modelFd)
+            if (mmprojFd) RelayDevice.closeContentFd(mmprojFd)
             set({
                 context: undefined,
                 model: undefined,
                 mmproj: undefined,
+                modelFd: undefined,
+                mmprojFd: undefined,
             })
             Logger.info('Model Unloaded')
         },
@@ -261,8 +273,11 @@ export namespace Llama {
                 .catch((e) => {
                     Logger.errorToast(t('model.toast.failedToUnloadMMPROJ'), e)
                 })
+            const mmprojFd = get().mmprojFd
+            if (mmprojFd) RelayDevice.closeContentFd(mmprojFd)
             set({
                 mmproj: undefined,
+                mmprojFd: undefined,
             })
         },
         completion: async (
@@ -361,6 +376,21 @@ export namespace Llama {
             return await get().context?.tokenize(text, params)
         },
     }))
+
+    /**
+     * A model picked from shared storage is opened as a descriptor and passed as its bare number:
+     * cui-llama.rn's model loader (lm_ggml_fopen) and projector loader (clip_model_loader) both
+     * treat a slash-free, all-digit path as a descriptor. Other models load by path.
+     */
+    const openContentFd = async (file_path: string) => {
+        if (!file_path.startsWith('content://')) return file_path
+        return String((await RelayDevice.openContentFd(file_path)).fd)
+    }
+
+    const closeContentFd = (file_path: string, loadable_path: string) => {
+        if (loadable_path === file_path) return
+        RelayDevice.closeContentFd(loadable_path)
+    }
 
     const textTimings = (timings: CompletionTimings) => {
         return (

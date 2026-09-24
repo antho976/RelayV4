@@ -46,15 +46,8 @@ const LorebookEntryEditor = () => {
 
     const { close, entryId, ref } = useLorebookEntryEditorState(useShallow((state) => state))
 
-    const [placeholderEntry, setPlaceholderEntry] = useState<LorebookEntryType | undefined>(
-        undefined
-    )
-    const [edited, setEdited] = useState(false)
-
-    const handleSetPlaceholder = useCallback((entry: LorebookEntryType, isEdited = true) => {
-        setPlaceholderEntry(entry)
-        setEdited(isEdited)
-    }, [])
+    // unsaved edits; undefined means the stored entry is shown as is
+    const [draft, setDraft] = useState<LorebookEntryType | undefined>(undefined)
 
     const { data: entry } = useLiveQueryJoined(
         Lorebooks.db.live.lorebookEntry(entryId ?? -1),
@@ -66,19 +59,14 @@ const LorebookEntryEditor = () => {
                     rowId: entryId ?? -1,
                 },
             ],
-            onUpdated: (result) => {
-                const item = result
-
-                if (item) {
-                    setPlaceholderEntry(item)
-                }
-            },
         }
     )
 
+    const placeholderEntry = draft ?? entry
+
     const backAction = useCallback(
         (closeSheet: () => void) => {
-            if (!entry || !placeholderEntry || !edited) {
+            if (!entry || !draft) {
                 return closeSheet()
             }
 
@@ -98,17 +86,17 @@ const LorebookEntryEditor = () => {
                         label: t('common.actions.save'),
                         onPress: async () => {
                             await Lorebooks.db.mutate.updateLorebookEntry(entry.id, {
-                                name: placeholderEntry.name,
-                                content: placeholderEntry.content,
-                                keys: placeholderEntry.keys,
-                                secondary_keys: placeholderEntry.secondary_keys,
-                                enable: placeholderEntry.enable,
-                                insertion_order: placeholderEntry.insertion_order,
-                                case_sensitive: placeholderEntry.case_sensitive,
-                                priority: placeholderEntry.priority,
-                                selective: placeholderEntry.selective,
-                                constant: placeholderEntry.constant,
-                                comment: placeholderEntry.comment,
+                                name: draft.name,
+                                content: draft.content,
+                                keys: draft.keys,
+                                secondary_keys: draft.secondary_keys,
+                                enable: draft.enable,
+                                insertion_order: draft.insertion_order,
+                                case_sensitive: draft.case_sensitive,
+                                priority: draft.priority,
+                                selective: draft.selective,
+                                constant: draft.constant,
+                                comment: draft.comment,
                             })
 
                             closeSheet()
@@ -119,7 +107,7 @@ const LorebookEntryEditor = () => {
 
             return true
         },
-        [entry, placeholderEntry, edited, t]
+        [entry, draft, t]
     )
 
     const updateEntry = <K extends keyof LorebookEntryType>(
@@ -127,20 +115,23 @@ const LorebookEntryEditor = () => {
         value: LorebookEntryType[K]
     ) => {
         if (!placeholderEntry) return
-        handleSetPlaceholder({
+        setDraft({
             ...placeholderEntry,
             [key]: value,
         })
     }
 
     const save = async () => {
-        if (!entry || !placeholderEntry) return
-        await Lorebooks.db.mutate.updateLorebookEntry(entry.id, placeholderEntry)
+        if (entry && draft) await Lorebooks.db.mutate.updateLorebookEntry(entry.id, draft)
         close()
     }
 
     return (
-        <BottomSheet onRequestClose={backAction} sheetStyle={{ flex: 1 }} ref={ref}>
+        <BottomSheet
+            onRequestClose={backAction}
+            onClose={() => setDraft(undefined)}
+            sheetStyle={{ flex: 1 }}
+            ref={ref}>
             {entry && placeholderEntry && entryId && (
                 <>
                     <ScrollView
@@ -270,7 +261,7 @@ const LorebookEntryEditor = () => {
                             variant="tertiary"
                             iconName="reload"
                             onPress={() => {
-                                handleSetPlaceholder(entry, false)
+                                setDraft(undefined)
                             }}
                         />
 

@@ -3,7 +3,7 @@ import { useRouter } from 'expo-router'
 import React from 'react'
 import { StyleSheet, Text, TouchableOpacity, View } from 'react-native'
 
-import { RelayProject, RelaySession } from '@lib/engine/Relay/RelayClient'
+import { RelaySession } from '@lib/engine/Relay/RelayClient'
 import { Theme } from '@lib/theme/ThemeManager'
 
 import { ago, stateColor } from './console'
@@ -11,18 +11,16 @@ import Lamp from './Lamp'
 
 type SessionItemProps = {
     session: RelaySession
-    /** Shown in the detail line when the list is not already grouped by project. */
-    project?: RelayProject
 }
 
 /** One card of the wall: lamp, name, state, which agent, where it works, when it last spoke. */
-const SessionItem: React.FC<SessionItemProps> = ({ session, project }) => {
+const SessionItem: React.FC<SessionItemProps> = ({ session }) => {
     const styles = useStyles()
     const { color } = Theme.useTheme()
     const router = useRouter()
     const held = session.state === 'blocked'
     const tint = stateColor(session.state, color)
-    const where = [project?.name, session.branch].filter(Boolean).join(' · ')
+    const where = session.branch
     const when = ago(session.last_output_at)
     return (
         <TouchableOpacity

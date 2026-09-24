@@ -10,7 +10,3 @@ export const lockScreenOrientation = async () => {
     if (unlock ?? result === DeviceType.TABLET) return
     lockAsync(OrientationLock.PORTRAIT)
 }
-
-export const unlockScreenOrientation = async () => {
-    await unlockScreenOrientation()
-}

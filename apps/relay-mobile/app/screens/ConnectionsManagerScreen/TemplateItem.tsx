@@ -21,6 +21,20 @@ const TemplateItem: React.FC<TemplateItemProps> = ({ item, index }) => {
     const removeTemplate = APIManager.useConnectionsStore((state) => state.removeTemplate)
 
     const handleDelete = () => {
+        const users = APIManager.useConnectionsStore
+            .getState()
+            .values.filter((value) => value.configName === item.name)
+        if (users.length > 0) {
+            Alert.alert({
+                title: t('connections.templates.delete.title'),
+                description: t('connections.templates.delete.inUse', {
+                    name: item.name,
+                    connections: users.map((value) => value.friendlyName).join(', '),
+                }),
+                buttons: [{ label: t('common.actions.close') }],
+            })
+            return
+        }
         Alert.alert({
             title: t('connections.templates.delete.title'),
             description: t('connections.templates.delete.description', { name: item.name }),

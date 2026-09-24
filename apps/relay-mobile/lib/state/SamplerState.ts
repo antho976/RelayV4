@@ -99,9 +99,7 @@ export namespace SamplersManager {
                     configList: state.configList,
                     currentConfigIndex: state.currentConfigIndex,
                 }),
-                migrate: async (persistedState: any, version) => {
-                    //no migrations yet
-                },
+                migrate: async (persistedState: any) => persistedState,
             }
         )
     )

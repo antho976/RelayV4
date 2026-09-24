@@ -55,14 +55,12 @@ const SamplerManagerScreen = () => {
 
     const getSamplerList = (): APISampler[] => {
         if (appMode === 'local') return localSamplerData
-        if (activeIndex !== -1) {
-            const template = getTemplates().find(
-                (item: APIConfiguration) => item.name === apiValues[activeIndex].configName
-            )
-            if (!template) return []
-            return template.request.samplerFields
-        }
-        return []
+        const activeValue = apiValues[activeIndex]
+        if (!activeValue) return []
+        const template = getTemplates().find(
+            (item: APIConfiguration) => item.name === activeValue.configName
+        )
+        return template?.request.samplerFields ?? []
     }
 
     const handleExportSampler = () => {
@@ -133,14 +131,6 @@ const SamplerManagerScreen = () => {
                         close()
                     },
                 },
-                /*{
-                    label: 'Import Sampler',
-                    icon: 'upload',
-                    onPress: (close) => {
-                        handleImportSampler()
-                        close()
-                    },
-                },*/
                 {
                     label: t('sampler.delete'),
                     icon: 'delete',

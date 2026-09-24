@@ -162,6 +162,13 @@
       "when": 1789718797242,
       "tag": "0022_nifty_scalphunter",
       "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "6",
+      "when": 1790287847921,
+      "tag": "0023_repair_lorebook_entries",
+      "breakpoints": true
     }
   ]
 }

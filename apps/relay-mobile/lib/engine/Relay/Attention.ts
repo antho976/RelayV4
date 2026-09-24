@@ -7,6 +7,7 @@ import * as Notifications from 'expo-notifications'
 import { AppState } from 'react-native'
 
 import { AppSettings } from '@lib/constants/GlobalValues'
+import { notificationChannel } from '@lib/notifications/Channel'
 import { registerForPushNotificationsAsync } from '@lib/notifications/Notifications'
 import { Logger } from '@lib/state/Logger'
 import { mmkv } from '@lib/storage/MMKV'
@@ -20,14 +21,8 @@ export const ensureNotifyPermission = async () => {
     if (permissionAsked || !mmkv.getBoolean(AppSettings.RelayNotify)) return
     permissionAsked = true
     try {
-        // The installed typings do not resolve the base permission shape; the fields are stable.
-        const current = (await Notifications.getPermissionsAsync()) as {
-            granted?: boolean
-            canAskAgain?: boolean
-        }
-        if (!current.granted && current.canAskAgain !== false) {
-            await registerForPushNotificationsAsync()
-        }
+        const current = await Notifications.getPermissionsAsync()
+        if (!current.granted && current.canAskAgain) await registerForPushNotificationsAsync()
     } catch (e) {
         Logger.debug(`Relay: notification permission check failed: ${e}`)
     }
@@ -47,7 +42,7 @@ export const notifyIfAway = async (title: string, body: string) => {
                     : undefined,
                 data: { relay: true },
             },
-            trigger: null,
+            trigger: { channelId: notificationChannel },
         })
     } catch (e) {
         Logger.debug(`Relay: could not show a notification: ${e}`)

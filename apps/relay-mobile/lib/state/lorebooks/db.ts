@@ -13,10 +13,6 @@ export namespace db {
             })
         }
 
-        export const lorebookInfo = async (id: number) => {
-            return await database.query.lorebooks.findFirst({ where: eq(lorebooks.id, id) })
-        }
-
         export const activeLorebooks = async () => {
             return await database.query.lorebooks.findMany({
                 where: eq(lorebooks.active, true),
@@ -56,14 +52,18 @@ export namespace db {
 
         export const importFromJSON = async (lorebook: LorebookImport) => {
             const { entries, ...lorebookRest } = lorebook
-            const [{ lorebookId }] = await database
-                .insert(lorebooks)
-                .values([{ ...lorebookRest, active: true }])
-                .returning({ lorebookId: lorebooks.id })
-
-            await database
-                .insert(lorebookEntries)
-                .values(entries.map((entry) => ({ ...entry, lorebook_id: lorebookId })))
+            // sync on purpose: expo-sqlite commits an async transaction at its first await
+            database.transaction((tx) => {
+                const { lorebookId } = tx
+                    .insert(lorebooks)
+                    .values({ ...lorebookRest, active: true })
+                    .returning({ lorebookId: lorebooks.id })
+                    .get()
+                if (entries.length === 0) return
+                tx.insert(lorebookEntries)
+                    .values(entries.map((entry) => ({ ...entry, lorebook_id: lorebookId })))
+                    .run()
+            })
         }
 
         export const deleteLorebook = async (id: number) => {
@@ -96,18 +96,6 @@ export namespace db {
 
         export const lorebookInfo = (id: number) => {
             return database.query.lorebooks.findFirst({ where: eq(lorebooks.id, id) })
-        }
-
-        export const lorebook = (id: number) => {
-            return database.query.lorebooks.findFirst({
-                where: eq(lorebookEntries.lorebook_id, id),
-            })
-        }
-
-        export const lorebookEntryList = (id: number) => {
-            return database.query.lorebookEntries.findMany({
-                where: eq(lorebookEntries.lorebook_id, id),
-            })
         }
 
         export const lorebookEntryNameList = (id: number, query?: string) => {

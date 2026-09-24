@@ -17,7 +17,7 @@ is in [docs/MOBILE.md](../../docs/MOBILE.md) at the repository root. The desktop
 | `lib/engine/Relay/` | the phone's end of the bus: the WebSocket client, terminal text, attention, on-device summary |
 | `lib/state/RelayHosts.ts` | the PCs this phone paired with |
 | `app/screens/ChatScreen/`, `lib/engine/` | chats, on device and over an API |
-| `i18n/` | translations; the PC screens use literal English for now |
+| `i18n/` | the UI strings (English only); the PC screens use literal strings |
 
 ## Run
 
@@ -51,11 +51,14 @@ Both run in CI. The bus payloads the phone sends are exercised against a real en
 - The pairing credential stays on the phone. Each connection proves it with a one-time
   challenge instead of sending it.
 
-## Lineage
+## Models and backends
 
-The chat side began as [ChatterUI](https://github.com/Vali-98/ChatterUI) by Vali-98, which
-runs GGUF models through [llama.cpp](https://github.com/ggerganov/llama.cpp) via
-[cui-llama.rn](https://github.com/Vali-98/cui-llama.rn), and speaks to koboldcpp, Ollama,
-text-generation-webui, OpenAI, Claude, Cohere, OpenRouter and any text- or chat-completion
-backend through its template system ([docs/CustomTemplates.md](docs/CustomTemplates.md)).
-The licence is unchanged: [AGPL-3.0](LICENSE).
+On device, chats run GGUF models through [llama.cpp](https://github.com/ggml-org/llama.cpp).
+Over an API, the app speaks to koboldcpp, Ollama, text-generation-webui, OpenAI, Claude,
+Cohere, OpenRouter and any text- or chat-completion backend through its template system
+([docs/CustomTemplates.md](docs/CustomTemplates.md)).
+
+## Licence
+
+[AGPL-3.0](LICENSE). This app is a modified version of an AGPL-3.0 program; the licence
+requires this notice and the licence text to stay with the source.

@@ -1,7 +1,5 @@
-import { getCpuFeatures, getThreads } from '@vali98/react-native-cpu-info'
-import { setTextIntentEnabled, useTextIntentOnForeground } from '@vali98/react-native-process-text'
 import { DeviceType, getDeviceTypeAsync } from 'expo-device'
-import { Paths } from 'expo-file-system'
+import { Directory, File, Paths } from 'expo-file-system'
 import * as KeepAwake from 'expo-keep-awake'
 import { router } from 'expo-router'
 import { setBackgroundColorAsync as setUIBackgroundColor } from 'expo-system-ui'
@@ -17,8 +15,13 @@ import { Instructs } from '@lib/state/Instructs'
 import { SamplersManager } from '@lib/state/SamplerState'
 import { useTTSStore } from '@lib/state/TTS'
 
-import { AppDirectory, deleteFile, listFiles, makeDirectory, readStringAsync } from './File'
+import { AppDirectory, listFiles, makeDirectory } from './File'
 import { lockScreenOrientation } from './Screen'
+import {
+    availableThreads,
+    setProcessTextEnabled,
+    useProcessTextOnForeground,
+} from '../../modules/relay-device'
 import { AppSettings, AppSettingsDefault, Global } from '../constants/GlobalValues'
 import { Llama } from '../engine/Local/LlamaLocal'
 import { Characters } from '../state/Characters'
@@ -26,6 +29,8 @@ import { Chats } from '../state/Chat'
 import { Logger } from '../state/Logger'
 import { mmkv } from '../storage/MMKV'
 import { Theme } from '../theme/ThemeManager'
+
+const recommendedPresetsAdded = 'recommendedpresetsadded'
 
 const loadNewestChat = async () => {
     Logger.info('Loading latest chat')
@@ -42,13 +47,12 @@ export const loadChatOnInit = async () => {
 }
 
 export const useTextIntentFocus = () => {
-    return useTextIntentOnForeground(async (text) => {
-        if (!text) return
+    return useProcessTextOnForeground(async (text) => {
         useChatInputTextStore.getState().setText(text)
         if (router.canDismiss()) router.dismissAll()
         router.push('/screens/ChatScreen')
         await loadNewestChat()
-    }, [])
+    })
 }
 
 const setAppDefaultSettings = () => {
@@ -68,11 +72,6 @@ const createDefaultCard = async () => {
     const result = await Characters.db.query.cardList('character')
     if (result.length === 0) await Characters.createDefaultCard()
     mmkv.set(AppSettings.CreateDefaultCard, false)
-}
-
-const setCPUFeatures = async () => {
-    const result = await getCpuFeatures()
-    mmkv.set(Global.CpuFeatures, JSON.stringify(result))
 }
 
 const migrateModelData_0_7_10_to_0_8_0 = () => {
@@ -149,13 +148,11 @@ export const generateDefaultDirectories = async () => {
 }
 
 const migratePresets_0_8_3_to_0_8_4 = async () => {
-    const presetPath = `${Paths.document.uri}presets`
-    const files = listFiles(presetPath)
-
-    if (files.length === 0) return
-    files.map(async (item) => {
+    const presets = new Directory(Paths.document, 'presets')
+    if (!presets.exists) return
+    for (const item of listFiles(presets.uri)) {
         try {
-            const data = await readStringAsync(`${presetPath}/${item}`)
+            const data = await new File(presets, item).text()
             SamplersManager.useSamplerStore.getState().addSamplerConfig({
                 data: JSON.parse(data),
                 name: item.replace('.json', ''),
@@ -163,8 +160,12 @@ const migratePresets_0_8_3_to_0_8_4 = async () => {
         } catch (e) {
             Logger.error(`Failed to migrate preset ${item}: ${e}`)
         }
-    })
-    deleteFile(presetPath)
+    }
+    try {
+        presets.delete()
+    } catch (e) {
+        Logger.error(`Failed to delete legacy presets: ${e}`)
+    }
 }
 
 const migrateAppMode_0_8_5_to_0_8_6 = () => {
@@ -183,7 +184,9 @@ const migrateAppMode_0_8_5_to_0_8_6 = () => {
 const migrateTextIntent_0_8_8_to_0_8_9 = () => {
     if (!mmkv.getBoolean(Global.InstallTextIntentDisable)) {
         mmkv.set(Global.InstallTextIntentDisable, true)
-        setTextIntentEnabled(false)
+        // The relay-device alias already starts disabled, so this only pins that choice. Whether
+        // the old package's menu entry was switched on cannot be known, so it is not carried over.
+        setProcessTextEnabled(false).catch(Logger.warn)
     }
 }
 
@@ -239,7 +242,7 @@ const setCPUThreads = () => {
     if (threads) return
     let newThreads = 8
     try {
-        newThreads = getThreads()
+        newThreads = availableThreads()
     } catch (e) {
         Logger.error('Failed to set CPU Threads: ' + e)
     }
@@ -268,14 +271,8 @@ export const startupApp = () => {
     // ghost chats never survive a restart
     purgeGhostChats()
 
-    // get fp16, i8mm and dotprod data
-    setCPUFeatures()
-
     // set cpu thread count
     setCPUThreads()
-
-    // patch Android text for bold Accessibility (still broken upstream; left off)
-    // patchAndroidText()
 
     // set keep awake settings
     setKeepAwake()
@@ -286,8 +283,11 @@ export const startupApp = () => {
 
     // Fix any missing samplers
     SamplersManager.useSamplerStore.getState().fixConfigs()
-    // make the anti-repetition presets available without a manual step
-    SamplersManager.useSamplerStore.getState().addRecommendedConfigs()
+    // make the anti-repetition presets available once, so deleting one sticks
+    if (!mmkv.getBoolean(recommendedPresetsAdded)) {
+        SamplersManager.useSamplerStore.getState().addRecommendedConfigs()
+        mmkv.set(recommendedPresetsAdded, true)
+    }
 
     // migrations for old versions
     migrateModelData_0_7_10_to_0_8_0()

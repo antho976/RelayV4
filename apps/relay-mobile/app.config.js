@@ -18,17 +18,16 @@ module.exports = {
                 tinted: './assets/images/icon.png',
             },
             supportsTablet: true,
-            package: IS_DEV ? 'com.Vali98.ChatterUIDev' : 'com.Vali98.ChatterUI',
-            bundleIdentifier: IS_DEV ? 'com.Vali98.ChatterUIDev' : 'com.Vali98.ChatterUI',
+            bundleIdentifier: IS_DEV ? 'com.quietsoftware.relay.dev' : 'com.quietsoftware.relay',
         },
         android: {
             adaptiveIcon: {
                 foregroundImage: './assets/images/adaptive-icon-foreground.png',
-                backgroundImage: './assets/images//adaptive-icon-background.png',
+                backgroundImage: './assets/images/adaptive-icon-background.png',
                 monochromeImage: './assets/images/adaptive-icon-foreground.png',
-                backgroundColor: '#000',
+                backgroundColor: '#141416',
             },
-            package: IS_DEV ? 'com.Vali98.ChatterUIDev' : 'com.Vali98.ChatterUI',
+            package: IS_DEV ? 'com.quietsoftware.relay.dev' : 'com.quietsoftware.relay',
             userInterfaceStyle: 'dark',
             permissions: [
                 'android.permission.FOREGROUND_SERVICE',
@@ -45,7 +44,7 @@ module.exports = {
             [
                 'expo-asset',
                 {
-                    assets: ['./assets/models/aibot.raw', './assets/models/llama3tokenizer.gguf'],
+                    assets: ['./assets/models/assistant.raw', './assets/models/llama3tokenizer.gguf'],
                 },
             ],
             [
@@ -64,7 +63,7 @@ module.exports = {
             [
                 'expo-splash-screen',
                 {
-                    backgroundColor: '#000000',
+                    backgroundColor: '#141416',
                     image: './assets/images/adaptive-icon.png',
                     imageWidth: 200,
                 },
@@ -81,7 +80,7 @@ module.exports = {
                     'android:largeHeap': true,
                 },
             ],
-            ['@vali98/react-native-process-text', { label: 'Ask in Relay' }],
+            ['./modules/relay-device/app.plugin.js', { label: 'Ask in Relay' }],
             [
                 'expo-camera',
                 {
@@ -103,7 +102,6 @@ module.exports = {
                     },
                 },
             ],
-            'expo-localization',
             'expo-router',
             'expo-font',
             'expo-image',
@@ -126,9 +124,6 @@ module.exports = {
         extra: {
             router: {
                 origin: false,
-            },
-            eas: {
-                projectId: 'd588a96a-5eb0-457a-85bc-e21acfdc60e9',
             },
         },
     },

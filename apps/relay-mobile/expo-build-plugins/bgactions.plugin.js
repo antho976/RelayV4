@@ -15,12 +15,17 @@ module.exports = function withCustomIntentFilter(config) {
             application.service = []
         }
 
-        application.service.push({
-            $: {
-                'android:name': 'com.asterinet.react.bgactions.RNBackgroundActionsTask',
-                'android:foregroundServiceType': 'dataSync',
-            },
-        })
+        // A prebuild without --clean runs against the manifest it wrote last time, so every
+        // entry is added only when it is not already there.
+        const serviceName = 'com.asterinet.react.bgactions.RNBackgroundActionsTask'
+        if (!application.service.some((service) => service.$?.['android:name'] === serviceName)) {
+            application.service.push({
+                $: {
+                    'android:name': serviceName,
+                    'android:foregroundServiceType': 'dataSync',
+                },
+            })
+        }
 
         // Iterate over the activities to find the main activity
         if (application.activity) {
@@ -34,15 +39,19 @@ module.exports = function withCustomIntentFilter(config) {
                         activity['intent-filter'] = []
                     }
 
-                    activity['intent-filter'].push({
-                        $: { 'android:label': 'filter_react_native' },
-                        action: [{ $: { 'android:name': 'android.intent.action.VIEW' } }],
-                        category: [
-                            { $: { 'android:name': 'android.intent.category.DEFAULT' } },
-                            { $: { 'android:name': 'android.intent.category.BROWSABLE' } },
-                        ],
-                        data: [{ $: { 'android:scheme': 'relayapp' } }],
-                    })
+                    const hasScheme = activity['intent-filter'].some((filter) =>
+                        filter.data?.some((data) => data.$?.['android:scheme'] === 'relayapp')
+                    )
+                    if (!hasScheme)
+                        activity['intent-filter'].push({
+                            $: { 'android:label': 'filter_react_native' },
+                            action: [{ $: { 'android:name': 'android.intent.action.VIEW' } }],
+                            category: [
+                                { $: { 'android:name': 'android.intent.category.DEFAULT' } },
+                                { $: { 'android:name': 'android.intent.category.BROWSABLE' } },
+                            ],
+                            data: [{ $: { 'android:scheme': 'relayapp' } }],
+                        })
 
                     hasModified = true
                     break

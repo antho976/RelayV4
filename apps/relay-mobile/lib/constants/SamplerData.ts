@@ -140,7 +140,7 @@ export const Samplers = {
         internalID: SamplerID.GENERATED_LENGTH,
         friendlyName: 'Generated Tokens',
         inputType: 'slider',
-        macro: '{{generted_length}}',
+        macro: '{{generated_length}}',
         values: {
             type: 'integer',
             min: 16,
@@ -175,7 +175,7 @@ export const Samplers = {
             type: 'float',
             min: 0,
             max: 10,
-            default: 1,
+            default: 0,
             step: 0.01,
             precision: 2,
             ignoreIf: 0,
@@ -834,15 +834,6 @@ type SamplerValueMap = {
 
 export type SamplerConfigData = {
     -readonly [ID in keyof SamplerValueMap]: SamplerValueMap[ID]
-}
-
-export const createMarkdownRows = () => {
-    const items: any = []
-    Object.entries(Samplers).map(([k, v]) => {
-        items.push('|' + v.friendlyName + '|' + v.internalID + '|' + v.macro + '|')
-    })
-    const out = items.join('\n')
-    console.log(out)
 }
 
 export const defaultSamplerConfig = (Object.keys(Samplers) as SamplerID[])

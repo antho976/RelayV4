@@ -1,4 +1,4 @@
-import { and, count, desc, eq, getTableColumns, inArray, like, not, sql, sum } from 'drizzle-orm'
+import { and, count, desc, eq, getTableColumns, inArray, like, not, sum } from 'drizzle-orm'
 import { randomUUID } from 'expo-crypto'
 import { getDocumentAsync } from 'expo-document-picker'
 import * as Notifications from 'expo-notifications'
@@ -20,6 +20,7 @@ import {
     CompletionTimings,
 } from '@db/schema'
 import { Tokenizer } from '@lib/engine/Tokenizer'
+import { notificationChannel } from '@lib/notifications/Channel'
 import { replaceMacros } from '@lib/state/Macros'
 import { AppDirectory, copyFile, deleteFile, fileInfo } from '@lib/utils/File'
 import { convertToFormatInstruct } from '@lib/utils/TextFormat'
@@ -45,20 +46,19 @@ export interface ChatData extends ChatType {
     autoScroll?: { cause: 'search' | 'saveScroll'; index: number }
 }
 
-interface ChatSearchQueryResult {
+interface ChatSearchResult {
     swipeId: number
     chatId: number
     chatEntryId: number
     chatName: string
     swipe: string
-    sendDate: number
-}
-
-interface ChatSearchResult extends Omit<ChatSearchQueryResult, 'sendDate'> {
     sendDate: Date
 }
 
-export type ScrollData = { cause: 'search' | 'saveScroll'; index: number }
+// index counts from the newest message; the window clamps it to the rows it holds
+export type ScrollData =
+    | { cause: 'saveScroll'; index: number }
+    | { cause: 'search'; entryId: number }
 
 type UpdateChatSwipeOptions = {
     updateFinished?: boolean
@@ -74,7 +74,7 @@ export interface ChatState {
     // ghost chats are erased permanently when they are left, so the flag is kept in state
     ghost?: boolean
     // chat data
-    setId: (chatId: number) => Promise<void>
+    setId: (chatId: number, entryId?: number) => Promise<void>
     reset: () => void
     setBuffer: (data: OutputBuffer) => void
     setBufferTimings: (timings: CompletionTimings) => void
@@ -122,7 +122,7 @@ export const sendGenerateCompleteNotification = async () => {
                 characterId: Characters.useCharacterStore.getState().id,
             },
         },
-        trigger: null,
+        trigger: { channelId: notificationChannel },
     })
     Notifications.setBadgeCountAsync(0)
 }
@@ -192,35 +192,25 @@ export const useInference = create<InferenceStateType>((set, get) => ({
 export namespace Chats {
     export const useChatState = create<ChatState>((set, get: () => ChatState) => ({
         buffer: { data: '' },
-        setId: async (chatId) => {
+        setId: async (chatId, entryId) => {
+            const data = await db.query.chatNew(chatId)
+            if (!data) {
+                Logger.errorToast(t('chat.state.failedToLoad', { id: chatId }))
+                return
+            }
             // leaving a ghost chat erases it permanently
             const previousId = get().id
             if (get().ghost && previousId && previousId !== chatId) {
                 await purgeGhostChat(previousId)
             }
-
-            const data = { ...(await db.query.chatNew(chatId)), autoScroll: undefined }
-            let autoScroll: { cause: 'search' | 'saveScroll'; index: number } | undefined =
-                undefined
-            if (!data) {
-                Logger.errorToast(
-                    t('chat.state.failedToLoad', { id: chatId }),
-                    JSON.stringify(data)
-                )
-                return
-            }
             if (data.user_id) await setMismatchedUser(data.user_id)
-            if (data) {
-                const index = data.scroll_offset ?? data.entriesCount
-                autoScroll = {
-                    cause: 'saveScroll',
-                    index: Math.min(index, data.entriesCount - 1),
-                }
-            }
 
             set({
                 id: chatId,
-                scrollData: autoScroll,
+                scrollData:
+                    entryId !== undefined
+                        ? { cause: 'search', entryId: entryId }
+                        : { cause: 'saveScroll', index: data.scroll_offset },
                 ghost: data.ghost ?? false,
             })
         },
@@ -311,19 +301,6 @@ export namespace Chats {
                 return result
             }
 
-            export const chatList = async (charId: number) => {
-                const result = await database
-                    .select({
-                        ...getTableColumns(chats),
-                        entryCount: count(chatEntries.id),
-                    })
-                    .from(chats)
-                    .leftJoin(chatEntries, eq(chats.id, chatEntries.chat_id))
-                    .groupBy(chats.id)
-                    .where(eq(chats.character_id, charId))
-                return result
-            }
-
             export const chatListQuery = (charId: number, includeHidden: boolean = false) => {
                 return database
                     .select({
@@ -342,52 +319,34 @@ export namespace Chats {
                     .orderBy(desc(chats.last_modified))
             }
 
-            export const chatExists = async (chatId: number) => {
-                return await database.query.chats.findFirst({ where: eq(chats.id, chatId) })
-            }
-
             export const searchChat = async (
                 query: string,
                 charId: number
             ): Promise<ChatSearchResult[]> => {
-                const swipesWithIndex = sql`
-                    SELECT
-                        ${chatSwipes.id} AS swipeId,
-                        ${chatSwipes.entry_id} AS entryId,
-                        ${chatSwipes.swipe},
-                        ${chatSwipes.send_date} AS sendDate,
-                        ROW_NUMBER() OVER (PARTITION BY ${chatSwipes.entry_id} ORDER BY ${chatSwipes.id}) AS swipeIndex
-                    FROM ${chatSwipes}
-                    `
-
-                const result = (await database
+                return await database
                     .select({
-                        swipeId: sql`swipeId`,
+                        swipeId: chatSwipes.id,
                         chatId: chatEntries.chat_id,
                         chatEntryId: chatEntries.id,
                         chatName: chats.name,
-                        swipe: sql`swipe`,
-                        sendDate: sql`sendDate`,
+                        swipe: chatSwipes.swipe,
+                        sendDate: chatSwipes.send_date,
                     })
                     .from(chatEntries)
                     .innerJoin(
-                        sql`(${swipesWithIndex}) AS swi`,
-                        sql`swi.entryId = ${chatEntries.id} AND swi.swipeIndex = ${chatEntries.swipe_id} + 1`
+                        chatSwipes,
+                        and(eq(chatSwipes.entry_id, chatEntries.id), eq(chatSwipes.active, true))
                     )
                     .innerJoin(chats, eq(chatEntries.chat_id, chats.id))
                     .where(
                         and(
-                            like(sql`swipe`, `%${query}%`),
+                            like(chatSwipes.swipe, `%${query}%`),
                             eq(chats.character_id, charId),
                             visibleChatFilter
                         )
                     )
-                    .orderBy(sql`sendDate`)
-                    .limit(100)) as ChatSearchQueryResult[]
-
-                return result.map((item) => {
-                    return { ...item, sendDate: new Date(item.sendDate * 1000) }
-                })
+                    .orderBy(chatSwipes.send_date)
+                    .limit(100)
             }
 
             export const chatWithoutId = async (chatId: number, limit?: number) => {
@@ -429,7 +388,10 @@ export namespace Chats {
                     where: eq(chatEntries.chat_id, chatId),
                     orderBy: desc(chatEntries.id),
                     with: {
-                        swipes: true,
+                        swipes: {
+                            where: eq(chatSwipes.active, true),
+                            limit: 1,
+                        },
                     },
                 })
                 if (!result) return null
@@ -453,9 +415,10 @@ export namespace Chats {
                 }
                 const userId = Characters.useUserStore.getState().id
                 const charName = card.name
-                return await database.transaction(async (tx) => {
-                    if (!card || charName === undefined) return
-                    const [{ chatId }] = await tx
+                if (charName === undefined) return
+                // sync on purpose: expo-sqlite commits an async transaction at its first await
+                const chatId = database.transaction((tx) => {
+                    const { chatId } = tx
                         .insert(chats)
                         .values({
                             character_id: charId,
@@ -463,6 +426,7 @@ export namespace Chats {
                             ghost: options.ghost ?? false,
                         })
                         .returning({ chatId: chats.id })
+                        .get()
 
                     // custom setting to not generate first mes
                     if (!mmkv.getBoolean(AppSettings.CreateFirstMes)) return chatId
@@ -472,7 +436,7 @@ export namespace Chats {
                     ].filter((item) => item)
 
                     if (greetings.length > 0) {
-                        const [{ entryId }] = await tx
+                        const { entryId } = tx
                             .insert(chatEntries)
                             .values({
                                 chat_id: chatId,
@@ -481,19 +445,22 @@ export namespace Chats {
                                 order: 0,
                             })
                             .returning({ entryId: chatEntries.id })
+                            .get()
 
-                        await tx.insert(chatSwipes).values(
-                            greetings.map((item, index) => ({
-                                entry_id: entryId,
-                                active: index === 0,
-                                swipe: convertToFormatInstruct(replaceMacros(item)),
-                            }))
-                        )
+                        tx.insert(chatSwipes)
+                            .values(
+                                greetings.map((item, index) => ({
+                                    entry_id: entryId,
+                                    active: index === 0,
+                                    swipe: convertToFormatInstruct(replaceMacros(item)),
+                                }))
+                            )
+                            .run()
                     }
-
-                    await Characters.db.mutate.updateModified(charId)
                     return chatId
                 })
+                await Characters.db.mutate.updateModified(charId)
+                return chatId
             }
 
             export const updateChatModified = async (chatID: number) => {
@@ -742,19 +709,23 @@ export namespace Chats {
             ) => {
                 chat.last_modified = Date.now()
 
-                const newChatId = await database.transaction(async (tx) => {
-                    const [{ newChatId }] = await tx
+                // sync on purpose: expo-sqlite commits an async transaction at its first await
+                return database.transaction((tx) => {
+                    const { newChatId } = tx
                         .insert(chats)
                         .values(chat)
                         .returning({ newChatId: chats.id })
+                        .get()
+                    if (chat.messages.length === 0) return newChatId
 
                     chat.messages.forEach((item) => {
                         item.chat_id = newChatId
                     })
-                    const newEntryIds = await tx
+                    const newEntryIds = tx
                         .insert(chatEntries)
                         .values(chat.messages)
                         .returning({ newEntryId: chatEntries.id })
+                        .all()
 
                     chat.messages.forEach((message, index) => {
                         message.swipes.forEach((swipe) => {
@@ -762,10 +733,9 @@ export namespace Chats {
                         })
                     })
                     const swipes = chat.messages.map((item) => item.swipes).flat()
-                    await tx.insert(chatSwipes).values(swipes)
+                    if (swipes.length > 0) tx.insert(chatSwipes).values(swipes).run()
                     return newChatId
                 })
-                return newChatId
             }
 
             export const cloneChatFromId = async (chatId: number, limit?: number) => {
@@ -809,7 +779,7 @@ export namespace Chats {
                 const type = mimeType?.split('/')?.[0]
                 if (!name || !extension || !mimeType || !type || !validExtensionTypes(type)) return
                 const newURI = AppDirectory.Attachments + attachmentId + '.' + extension
-                copyFile({
+                await copyFile({
                     from: uri,
                     to: newURI,
                 })
@@ -824,10 +794,6 @@ export namespace Chats {
                     })
                     .returning()
                 return attachment
-            }
-
-            export const deleteAttachment = async (attachmentId: number) => {
-                await database.delete(chatAttachments).where(eq(chatAttachments.id, attachmentId))
             }
 
             export const updateScrollOffset = async (chatId: number, scrollOffset: number) => {

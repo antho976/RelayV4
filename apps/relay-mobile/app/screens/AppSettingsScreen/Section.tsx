@@ -12,7 +12,6 @@ import ChatSettings from './ChatSettings'
 import ChatWindowSettings from './ChatWindowSettings'
 import DatabaseSettings from './DatabaseSettings'
 import GeneratingSettings from './GeneratingSettings'
-import LanguageSettings from './LanguageSettings'
 import NotificationSettings from './NotificationSettings'
 import PrivacySettings from './PrivacySettings'
 import ScreenSettings from './ScreenSettings'
@@ -44,12 +43,6 @@ export const SECTIONS = {
         detail: 'Sounds and alerts',
         icon: 'bell',
         parts: [NotificationSettings],
-    },
-    language: {
-        title: 'Language',
-        detail: 'App language',
-        icon: 'global',
-        parts: [LanguageSettings],
     },
     data: {
         title: 'Data',

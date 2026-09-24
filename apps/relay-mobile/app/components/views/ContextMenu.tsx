@@ -135,15 +135,14 @@ const ContextMenu: React.FC<ContextMenuProps> = ({
                 activeOpacity={0.5}
                 style={{ opacity: isOpen ? 0.5 : 1 }}
                 ref={triggerRef}
-                onPressIn={(event) => {
-                    if (longPress) return
-                    handleOpen(event)
+                // a tap menu opens on release, so starting a scroll on the trigger does not open it
+                onPress={(event) => {
+                    onPress?.()
+                    if (!longPress) handleOpen(event)
                 }}
-                onPress={() => onPress?.()}
                 delayLongPress={delayLongPress ?? 300}
                 onLongPress={(event) => {
                     onLongPress?.()
-                    if (!longPress) return
                     handleOpen(event)
                 }}
                 disabled={disabled}>
