@@ -15,6 +15,8 @@ import { Theme } from '@lib/theme/ThemeManager'
 type RequestSheetProps = {
     visible: boolean
     setVisible: (visible: boolean) => void
+    /** The project the PC tab is narrowed to, preselected when the sheet opens. */
+    projectId?: number
 }
 
 type Provider = 'claude' | 'codex'
@@ -27,11 +29,13 @@ type ProviderInfo = { provider: Provider; installed: boolean; signed_in_as?: str
  * project's board and a fresh session is launched for it — the same `task.dispatch` the desktop
  * uses — so the desktop wall, the audit log and the review column all see it as yours.
  */
-const RequestSheet: React.FC<RequestSheetProps> = ({ visible, setVisible }) => {
+const RequestSheet: React.FC<RequestSheetProps> = ({ visible, setVisible, projectId }) => {
     const { color, spacing, fontSize } = Theme.useTheme()
     const router = useRouter()
     const projects = useRelayStore((state) => state.projects)
-    const [project, setProject] = useState<RelayProject | undefined>(undefined)
+    // A pick is remembered with the scope it was made under, so narrowing the PC tab to
+    // another project starts the sheet there instead of on an older choice.
+    const [choice, setChoice] = useState<{ scope?: number; project?: RelayProject }>({})
     const [provider, setProvider] = useState<Provider>('claude')
     const [role, setRole] = useState<Role>('builder')
     const [onBoard, setOnBoard] = useState(true)
@@ -41,9 +45,13 @@ const RequestSheet: React.FC<RequestSheetProps> = ({ visible, setVisible }) => {
     const [providers, setProviders] = useState<ProviderInfo[]>([])
     const sheet = useBottomSheetRef()
 
-    // The chosen project, or the first one on this PC when the choice is stale or unmade.
+    // The person's pick under the current scope, else the scoped project, else the first one;
+    // a pick of a project the PC no longer has falls through.
+    const picked = choice.scope === projectId ? choice.project : undefined
     const current =
-        project && projects.some((item) => item.id === project.id) ? project : projects[0]
+        (picked && projects.find((item) => item.id === picked.id)) ??
+        projects.find((item) => item.id === projectId) ??
+        projects[0]
 
     useEffect(() => {
         if (visible) sheet.current?.open()
@@ -147,7 +155,7 @@ const RequestSheet: React.FC<RequestSheetProps> = ({ visible, setVisible }) => {
                     <DropdownSheet
                         data={projects}
                         selected={current}
-                        onChangeValue={setProject}
+                        onChangeValue={(item) => setChoice({ scope: projectId, project: item })}
                         labelExtractor={(item) => item.name}
                         placeholder={
                             projects.length === 0 ? 'No projects on the PC' : 'Pick a project'

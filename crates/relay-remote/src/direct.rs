@@ -127,6 +127,13 @@ async fn handle(ctx: Arc<Ctx>, mut stream: TcpStream) -> Result<()> {
     result.map_err(|e| anyhow::anyhow!(e))
 }
 
+/// A Tailscale address: tailnets hand out 100.64.0.0/10. A phone on the same tailnet reaches
+/// the direct door there from anywhere, with no rendezvous and nothing listening publicly.
+pub fn is_tailnet(ip: std::net::Ipv4Addr) -> bool {
+    let [a, b, ..] = ip.octets();
+    a == 100 && (b & 0xc0) == 64
+}
+
 /// Every address a phone on the same network could reach this machine at.
 pub fn lan_addresses() -> Vec<std::net::Ipv4Addr> {
     let mut out: Vec<std::net::Ipv4Addr> = if_addrs::get_if_addrs()
@@ -142,4 +149,19 @@ pub fn lan_addresses() -> Vec<std::net::Ipv4Addr> {
     out.sort_by_key(|a| (!a.is_private(), a.octets()));
     out.dedup();
     out
+}
+
+#[cfg(test)]
+mod tailnet_tests {
+    use super::is_tailnet;
+
+    #[test]
+    fn tailnet_is_the_cgnat_block_only() {
+        assert!(is_tailnet("100.64.0.1".parse().unwrap()));
+        assert!(is_tailnet("100.101.102.103".parse().unwrap()));
+        assert!(is_tailnet("100.127.255.254".parse().unwrap()));
+        assert!(!is_tailnet("100.63.0.1".parse().unwrap()));
+        assert!(!is_tailnet("100.128.0.1".parse().unwrap()));
+        assert!(!is_tailnet("192.168.1.20".parse().unwrap()));
+    }
 }

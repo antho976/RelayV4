@@ -79,6 +79,7 @@ namespace Drawer {
         SETTINGS = 'settings',
         CHATLIST = 'chats',
         USERLIST = 'userlist',
+        RELAY = 'relay',
     }
 
     export const Body: React.FC<DrawerBodyProps> = ({

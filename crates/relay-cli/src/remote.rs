@@ -7,7 +7,7 @@
 use anyhow::{anyhow, Context, Result};
 use clap::Subcommand;
 use relay_core::Instance;
-use relay_remote::direct::{lan_addresses, DirectServer};
+use relay_remote::direct::{is_tailnet, lan_addresses, DirectServer};
 use relay_remote::pairlink::PairLink;
 use relay_remote::rendezvous::RendezvousServer;
 use relay_remote::{Ctx, Registry, DEFAULT_PORT, DEFAULT_RENDEZVOUS_PORT};
@@ -64,6 +64,17 @@ fn print_pair_link(link: &PairLink) {
         println!("Direct: no LAN address found; the phone can only reach this engine through a rendezvous");
     } else {
         println!("Direct: {}", link.direct.join("  "));
+    }
+    // A tailnet address is still the direct door, reachable wherever the phone is on the tailnet.
+    let tailnet: Vec<&String> = link
+        .direct
+        .iter()
+        .filter(|url| {
+            url.trim_start_matches("ws://").split(':').next().and_then(|ip| ip.parse().ok()).is_some_and(is_tailnet)
+        })
+        .collect();
+    if !tailnet.is_empty() {
+        println!("Tailscale: {} — reachable from anywhere the phone is on your tailnet", tailnet[0]);
     }
     match &link.via {
         Some(via) => println!("Via:    {via}"),

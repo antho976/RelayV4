@@ -12,7 +12,7 @@ import { AppState } from 'react-native'
 import { create } from 'zustand'
 
 import { Logger } from '@lib/state/Logger'
-import { activeHost, RelayHost, useRelayHostsStore } from '@lib/state/RelayHosts'
+import { activeHost, directRoutes, RelayHost, useRelayHostsStore } from '@lib/state/RelayHosts'
 
 import { attentionFromEvent, ensureNotifyPermission } from './Attention'
 import { PairLink } from './PairLink'
@@ -79,6 +79,13 @@ export type RelayProject = {
     path: string
 }
 
+export type RelayWorkspace = {
+    id: number
+    name: string
+    path: string
+    order: number
+}
+
 export type RelayHold = {
     id: number
     session: string | null
@@ -121,12 +128,15 @@ type RelayState = {
     /** True after the person tapped Disconnect, until they connect again. */
     stopped: boolean
     transport?: RelayTransport
+    /** The address the live connection went through. */
+    routeUrl?: string
     hostId?: string
     hostName?: string
     version?: string
     error?: string
     sessions: RelaySession[]
     projects: RelayProject[]
+    workspaces: RelayWorkspace[]
     holds: RelayHold[]
     notifications: RelayNotification[]
     inReview: number
@@ -145,6 +155,7 @@ export const useRelayStore = create<RelayState>()(() => ({
     stopped: false,
     sessions: [],
     projects: [],
+    workspaces: [],
     holds: [],
     notifications: [],
     inReview: 0,
@@ -241,7 +252,7 @@ const openFirst = (
     candidates: { url: string; transport: RelayTransport }[],
     hello: (challenge: string) => Promise<Record<string, unknown>>,
     onLine: (line: string) => void
-): Promise<{ opened: Opened; transport: RelayTransport }> =>
+): Promise<{ opened: Opened; transport: RelayTransport; url: string }> =>
     new Promise((resolve, reject) => {
         if (candidates.length === 0) {
             reject(new Error('no route'))
@@ -260,7 +271,7 @@ const openFirst = (
                         return
                     }
                     settled = true
-                    resolve({ opened: opened, transport: candidate.transport })
+                    resolve({ opened: opened, transport: candidate.transport, url: candidate.url })
                 })
                 .catch((e: Error) => {
                     lastError = e
@@ -321,8 +332,12 @@ class RelayClient {
     private reconnectNow() {
         if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
         this.reconnectTimer = undefined
-        const host = this.wanted
-        if (!host) return
+        if (!this.wanted) return
+        // The stored record, not the one captured at connect: an address added or a route
+        // pinned since then applies to the next attempt.
+        const host =
+            useRelayHostsStore.getState().hosts.find((item) => item.id === this.wanted?.id) ??
+            this.wanted
         this.connect(host, true).catch(() => this.scheduleReconnect())
     }
 
@@ -341,7 +356,10 @@ class RelayClient {
      * the server. A pinned route is its group alone.
      */
     routeGroups(host: RelayHost): { url: string; transport: RelayTransport }[][] {
-        const direct = host.direct.map((url) => ({ url: url, transport: 'direct' as const }))
+        const direct = directRoutes(host).map((url) => ({
+            url: url,
+            transport: 'direct' as const,
+        }))
         const via = host.via ? [{ url: host.via, transport: 'via' as const }] : []
         const groups =
             host.route === 'direct' ? [direct] : host.route === 'via' ? [via] : [direct, via]
@@ -369,7 +387,7 @@ class RelayClient {
         let lastError = 'no route'
         for (const group of groups) {
             try {
-                const { opened, transport } = await openFirst(
+                const { opened, transport, url } = await openFirst(
                     group,
                     async () => ({ v: 1, pair: link.code, device_name: deviceLabel() }),
                     (line) => this.onLine(line)
@@ -395,7 +413,7 @@ class RelayClient {
                 // A freshly paired PC is one the person wants to stay connected to.
                 this.wanted = host
                 this.reconnectDelay = RECONNECT_MIN_MS
-                this.adopt(opened, host, transport)
+                this.adopt(opened, host, transport, url)
                 return host
             } catch (e) {
                 lastError = denialText(`${(e as Error).message}`)
@@ -437,7 +455,7 @@ class RelayClient {
         if (groups.length === 0) this.wanted = undefined
         for (const group of groups) {
             try {
-                const { opened, transport } = await openFirst(
+                const { opened, transport, url } = await openFirst(
                     group,
                     async (challenge) => ({
                         v: 1,
@@ -456,7 +474,7 @@ class RelayClient {
                     lastConnectedAt: Date.now(),
                     lastTransport: transport,
                 })
-                this.adopt(opened, host, transport)
+                this.adopt(opened, host, transport, url)
                 this.reconnectDelay = RECONNECT_MIN_MS
                 await this.refresh()
                 return
@@ -512,6 +530,7 @@ class RelayClient {
         useRelayStore.setState({
             status: 'offline',
             transport: undefined,
+            routeUrl: undefined,
             sessions: [],
             holds: [],
             notifications: [],
@@ -519,7 +538,7 @@ class RelayClient {
         })
     }
 
-    private adopt(opened: Opened, host: RelayHost, transport: RelayTransport) {
+    private adopt(opened: Opened, host: RelayHost, transport: RelayTransport, url: string) {
         const generation = this.generation
         this.socket = opened.socket
         opened.socket.onclose = () => {
@@ -543,6 +562,7 @@ class RelayClient {
         useRelayStore.setState({
             status: 'online',
             transport: transport,
+            routeUrl: url,
             hostId: host.id,
             hostName: opened.greeting.host || host.name,
             version: opened.greeting.version,
@@ -558,7 +578,7 @@ class RelayClient {
         ensureNotifyPermission()
         // Transitions only: the engine never emits an event per byte of output.
         this.request('bus.subscribe', {
-            events: ['session.*', 'guardrail.*', 'notify.*', 'task.*', 'project.*'],
+            events: ['session.*', 'guardrail.*', 'notify.*', 'task.*', 'project.*', 'workspace.*'],
         }).catch(() => {})
         Logger.info(`Relay: connected to ${host.name} (${transport})`)
     }
@@ -612,6 +632,10 @@ class RelayClient {
             event.ev === 'task.changed'
         ) {
             this.refreshAttention().catch(() => {})
+        } else if (event.ev.startsWith('project.') || event.ev.startsWith('workspace.')) {
+            // A project added or renamed on the desktop shows up in the sidebar and the
+            // request sheet without a pull-to-refresh.
+            this.refreshProjects().catch(() => {})
         }
         attentionFromEvent(event)
     }
@@ -692,16 +716,31 @@ class RelayClient {
 
     /** Sessions, projects and attention items in as few round trips as the bus allows. */
     async refresh() {
-        const [sessions, projects] = await Promise.all([
+        const [sessions] = await Promise.all([
             this.request<{ sessions: RelaySession[] }>('session.list', {}),
-            this.request<{ projects: RelayProject[] }>('project.list', {}),
+            this.refreshProjects(),
         ])
         useRelayStore.setState({
             sessions: [...sessions.sessions].sort(bySessionOrder),
-            projects: projects.projects,
             lastRefresh: Date.now(),
         })
         await this.refreshAttention()
+    }
+
+    /** Projects and the workspaces that hold them, for the sidebar and the request sheet. */
+    async refreshProjects() {
+        const [projects, workspaces] = await Promise.all([
+            this.request<{ projects: RelayProject[] }>('project.list', {}),
+            this.request<{ workspaces: RelayWorkspace[] }>('workspace.list', {}).catch(() => ({
+                workspaces: [] as RelayWorkspace[],
+            })),
+        ])
+        useRelayStore.setState({
+            projects: projects.projects,
+            workspaces: [...workspaces.workspaces].sort(
+                (a, b) => a.order - b.order || a.name.localeCompare(b.name)
+            ),
+        })
     }
 
     async refreshAttention() {

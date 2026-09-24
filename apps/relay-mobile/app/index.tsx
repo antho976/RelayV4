@@ -1,5 +1,4 @@
 import AntDesign from '@react-native-vector-icons/ant-design/static'
-import { useMigrations } from 'drizzle-orm/expo-sqlite/migrator'
 import { SplashScreen } from 'expo-router'
 import { useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -7,7 +6,7 @@ import { Linking, StyleSheet, Text, TouchableOpacity, View } from 'react-native'
 
 import ThemedButton from '@components/buttons/ThemedButton'
 import HeaderTitle from '@components/views/HeaderTitle'
-import { db } from '@db/db'
+import { migrationErrorText, useMigrations } from '@db/migrate'
 import useLocalAuth from '@lib/hooks/LocalAuth'
 import { Theme } from '@lib/theme/ThemeManager'
 import { loadChatOnInit, startupApp, useTextIntentFocus } from '@lib/utils/Startup'
@@ -16,7 +15,7 @@ import CharacterList from '@screens/CharacterListScreen'
 import migrations from '../db/migrations/migrations'
 
 const useStartupRoutine = () => {
-    const { success, error } = useMigrations(db, migrations)
+    const { success, error } = useMigrations(migrations)
     const { authorized, retry } = useLocalAuth()
 
     useTextIntentFocus()
@@ -53,7 +52,9 @@ const Home = () => {
             <View style={styles.centeredContainer}>
                 <HeaderTitle />
                 <Text style={styles.title}>{t('db.migrationerror.title')}</Text>
-                <Text style={styles.errorLog}>{error.message}</Text>
+                <Text selectable style={styles.errorLog}>
+                    {migrationErrorText(error)}
+                </Text>
                 <Text style={styles.subtitle}>{t('db.migrationerror.description')}</Text>
                 <Text style={styles.subtitle} />
                 <ThemedButton
@@ -62,7 +63,7 @@ const Home = () => {
                     iconName="github"
                     iconSize={20}
                     onPress={() => {
-                        Linking.openURL('https://github.com/Vali-98/ChatterUI')
+                        Linking.openURL('https://github.com/antho976/RelayV4/issues')
                     }}
                 />
             </View>
