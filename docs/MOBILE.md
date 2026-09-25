@@ -143,12 +143,13 @@ uses the server; **Server only** always goes through the rendezvous. The route i
 
 **What you can do.** Everything is an existing bus op, so the list is the bus's:
 
-- **Ask an agent**: pick a project, say what you want done, and an agent starts on it in its
-  own worktree — `task.create` + `task.dispatch` by default, so it lands in review when the
-  agent reports done; or a one-off session with your text as its opening prompt
-  (`session.create` + `session.spawn`). The new session's terminal opens.
-- **Sessions**: every live agent session, with Relay's lamps (green running, red held, amber
-  spawning). Tap one for its terminal.
+- **New terminal**: pick a project and an agent (claude or codex), optionally a first message,
+  and a session starts in its own worktree (`session.create` + `session.spawn`); its terminal
+  opens. **More options** opens the full launcher (several agents, a review group, staged
+  tasks). To track work on the board, create the task there and dispatch it.
+- **Sessions**: every live agent session grouped by project, with Relay's lamps (green
+  running, red held, amber spawning). Tap one for its terminal. Agents stopped by a PC restart
+  sit in one folded "stopped agents" row at the end, with Resume per agent or Resume all.
 - **Terminal**: the session's recent output (`session.scrollback`), then live
   (`session.attach`). Type a line and **Send**, or **Enter** on an empty line; the key row has
   Esc, Tab, arrows, Ctrl-C and `y`/`n`. The strip above it carries **Summary**, **Changes**,

@@ -2,10 +2,16 @@ import AntDesign from '@react-native-vector-icons/ant-design/static'
 import { useFocusEffect, useRouter } from 'expo-router'
 import React, { useCallback, useState } from 'react'
 import { RefreshControl, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native'
-import { SafeAreaView } from 'react-native-safe-area-context'
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context'
 
 import ThemedButton from '@components/buttons/ThemedButton'
-import { DashboardTiles, RestorableBanner, UsageCard, usePeers } from '@components/relay/sessions'
+import {
+    isStopped,
+    StatsStrip,
+    StoppedAgents,
+    UsageRow,
+    usePeers,
+} from '@components/relay/sessions'
 import Drawer from '@components/views/Drawer'
 import HeaderButton from '@components/views/HeaderButton'
 import HeaderTitle from '@components/views/HeaderTitle'
@@ -16,22 +22,23 @@ import { useRelayView } from '@lib/state/RelayView'
 import { Theme } from '@lib/theme/ThemeManager'
 
 import { linkColor } from './console'
-import RequestSheet from './RequestSheet'
+import NewTerminalSheet from './NewTerminalSheet'
 import SessionItem from './SessionItem'
 import WorkspaceDrawer, { groupProjects } from './WorkspaceDrawer'
 
 /**
- * The PC tab: the agent wall on the desktop, from a phone. A card says whether the PC is
- * there and how it is reached; a row of counts says what the agents are doing; the sessions
- * follow, grouped by project; and at the bottom, the one thing a person came here to do —
- * hand an agent some work.
+ * The PC tab: the agent wall on the desktop, from a phone. One line says whether the PC is
+ * there; another appears only when something needs the person; a slim card carries the
+ * figures and provider usage. Then the live agents, grouped by project, and at the end every
+ * stopped agent folded into one row. The New terminal button starts another agent.
  *
- * The header carries the rest: the sidebar (every workspace and project on the PC, and the
- * way to narrow this page to one), and the bell (holds, reviews and notifications).
+ * Everything else lives once, elsewhere: the sidebar picks the workspace or project this page
+ * shows and lists the PC's other surfaces, and the bell opens holds, reviews and notifications.
  */
 const RelayScreen = () => {
     const styles = useStyles()
-    const { color } = Theme.useTheme()
+    const { color, spacing } = Theme.useTheme()
+    const insets = useSafeAreaInsets()
     const router = useRouter()
     const paired = useRelayHostsStore((state) => state.hosts.length > 0)
     const status = useRelayStore((state) => state.status)
@@ -46,9 +53,9 @@ const RelayScreen = () => {
     const holds = useRelayStore((state) => state.holds)
     const notifications = useRelayStore((state) => state.notifications)
     const inReview = useRelayStore((state) => state.inReview)
-    const { scope, setScope } = useRelayView()
+    const { scope } = useRelayView()
     const setDrawer = Drawer.useDrawerStore((state) => state.setShow)
-    const [showRequest, setShowRequest] = useState(false)
+    const [showNew, setShowNew] = useState(false)
     const [refreshing, setRefreshing] = useState(false)
 
     useFocusEffect(
@@ -98,7 +105,6 @@ const RelayScreen = () => {
         })
 
     const online = status === 'online'
-    const live = sessions.filter((item) => item.state !== 'closed')
     const badge = holds.length + notifications.length + inReview
 
     // The scope the sidebar picked, if what it points at still exists on this PC.
@@ -106,35 +112,48 @@ const RelayScreen = () => {
         scope.kind === 'project' ? projects.find((p) => p.id === scope.id) : undefined
     const scopeWorkspace =
         scope.kind === 'workspace' ? workspaces.find((w) => w.id === scope.id) : undefined
-    const scopeLabel = scopeProject?.name ?? scopeWorkspace?.name
-    const inScope = (session: RelaySession) => {
-        if (scopeProject) return session.project_id === scopeProject.id
+    const inScope = (projectId: number | undefined) => {
+        if (scopeProject) return projectId === scopeProject.id
         if (scopeWorkspace) {
-            const project = projects.find((p) => p.id === session.project_id)
+            const project = projects.find((p) => p.id === projectId)
             return project?.workspace_id === scopeWorkspace.id
         }
         return true
     }
-    const shown = live.filter(inScope)
+    // Live is everything on the wall that is not stopped; stopped agents have a row of their own.
+    const shown = sessions.filter(
+        (item) => item.state !== 'closed' && !isStopped(item.state) && inScope(item.project_id)
+    )
+    const running = shown.filter((item) => item.state === 'running').length
+    const blocked = shown.filter((item) => item.state === 'blocked').length
 
-    // Sessions under their project, projects in the sidebar's order; one with none is left out.
+    // Sessions under their project, projects in the sidebar's order. A project with none is
+    // left out, except the one the tab is narrowed to: its header is the page's title.
     const sections = groupProjects(workspaces, projects)
         .flatMap((group) => group.projects)
         .map((project) => ({
-            project,
+            project: project,
             sessions: shown.filter((item) => item.project_id === project.id),
         }))
-        .filter((section) => section.sessions.length > 0)
+        .filter((section) => section.sessions.length > 0 || section.project.id === scopeProject?.id)
     const orphans = shown.filter((item) => !projects.some((p) => p.id === item.project_id))
     // What each visible agent says it is doing: one peer table per project on screen.
-    const peers = usePeers(online ? sections.map((section) => section.project.id) : [])
+    const peers = usePeers(
+        online ? sections.filter((s) => s.sessions.length > 0).map((s) => s.project.id) : []
+    )
 
     const routeLabel =
         transport === 'via'
-            ? 'Through your server'
+            ? 'via server'
             : routeUrl && isTailnetUrl(routeUrl)
-              ? 'Tailscale · private'
-              : 'Same network · private'
+              ? 'Tailscale'
+              : 'same network'
+
+    const attention = [
+        holds.length > 0 && `${holds.length} ${holds.length === 1 ? 'hold' : 'holds'}`,
+        blocked > 0 && `${blocked} blocked`,
+        inReview > 0 && `${inReview} to review`,
+    ].filter(Boolean) as string[]
 
     const headerRight = () =>
         paired ? (
@@ -185,21 +204,42 @@ const RelayScreen = () => {
         )
     }
 
+    const projectHead = (project: RelayProject) => (
+        <View style={styles.groupHead}>
+            <TouchableOpacity style={styles.groupOpen} onPress={() => openProject(project)}>
+                <Text numberOfLines={1} style={styles.groupName}>
+                    {project.name}
+                </Text>
+                <AntDesign name="right" size={11} color={color.text._500} />
+            </TouchableOpacity>
+            <TouchableOpacity
+                hitSlop={10}
+                style={styles.iconButton}
+                accessibilityLabel={`${project.name} board`}
+                onPress={() => openBoard(project)}>
+                <AntDesign name="project" size={15} color={color.text._400} />
+            </TouchableOpacity>
+        </View>
+    )
+
     return (
         <Drawer.Gesture
             config={[
                 { drawerID: Drawer.ID.RELAY, openDirection: 'right', closeDirection: 'left' },
             ]}>
-            <SafeAreaView edges={['bottom']} style={styles.fill}>
+            <View style={styles.fill}>
                 <HeaderTitle title="PC" />
                 <HeaderButton headerRight={headerRight} />
-                <RequestSheet
-                    visible={showRequest}
-                    setVisible={setShowRequest}
+                <NewTerminalSheet
+                    visible={showNew}
+                    setVisible={setShowNew}
                     projectId={scopeProject?.id}
                 />
                 <ScrollView
-                    contentContainerStyle={styles.page}
+                    contentContainerStyle={[
+                        styles.page,
+                        { paddingBottom: insets.bottom + (online ? 96 : spacing.xl3) },
+                    ]}
                     refreshControl={
                         <RefreshControl
                             refreshing={refreshing}
@@ -208,176 +248,138 @@ const RelayScreen = () => {
                             colors={[color.text._300]}
                         />
                     }>
-                    <TouchableOpacity style={styles.hostCard} onPress={openHosts}>
-                        <View style={styles.hostIcon}>
-                            <AntDesign name="desktop" size={20} color={color.text._200} />
-                            <View
-                                style={[
-                                    styles.hostLamp,
-                                    {
-                                        backgroundColor: linkColor(status, color),
-                                        borderColor: color.neutral._200,
-                                    },
-                                ]}
-                            />
-                        </View>
-                        <View style={{ flex: 1 }}>
-                            <Text numberOfLines={1} style={styles.hostName}>
-                                {hostName ?? activeHost()?.name ?? 'PC'}
-                            </Text>
-                            <Text
-                                numberOfLines={2}
-                                style={[styles.hostMeta, !online && !!error && styles.error]}>
-                                {online
-                                    ? `${routeLabel}${version ? ` · v${version}` : ''}`
-                                    : status === 'connecting'
-                                      ? 'Connecting…'
-                                      : (error ?? 'Not connected')}
-                            </Text>
-                        </View>
-                        {status === 'offline' ? (
-                            <ThemedButton label="Connect" variant="secondary" onPress={connect} />
-                        ) : (
-                            <AntDesign name="right" size={14} color={color.text._500} />
-                        )}
+                    <TouchableOpacity style={styles.hostRow} onPress={openHosts}>
+                        <View
+                            style={[styles.lamp, { backgroundColor: linkColor(status, color) }]}
+                        />
+                        <Text numberOfLines={1} style={styles.hostName}>
+                            {hostName ?? activeHost()?.name ?? 'PC'}
+                        </Text>
+                        <Text
+                            numberOfLines={1}
+                            style={[styles.hostMeta, !online && !!error && styles.error]}>
+                            {online
+                                ? `${routeLabel}${version ? ` · v${version}` : ''}`
+                                : status === 'connecting'
+                                  ? 'Connecting…'
+                                  : 'Not connected'}
+                        </Text>
+                        <AntDesign name="right" size={11} color={color.text._500} />
                     </TouchableOpacity>
 
-                    {online && holds.length > 0 && (
+                    {!online && (
+                        <View style={styles.none}>
+                            <AntDesign name="disconnect" size={26} color={color.text._500} />
+                            <Text style={styles.noneTitle}>
+                                {status === 'connecting' ? 'Reaching the PC…' : 'Not connected'}
+                            </Text>
+                            {status === 'offline' && (
+                                <>
+                                    <Text style={styles.note}>
+                                        {error ?? 'The PC is paired but not reachable right now.'}
+                                    </Text>
+                                    <ThemedButton
+                                        label="Connect"
+                                        iconName="reload"
+                                        variant="secondary"
+                                        onPress={connect}
+                                    />
+                                </>
+                            )}
+                        </View>
+                    )}
+
+                    {online && attention.length > 0 && (
                         <TouchableOpacity
-                            style={[styles.alert, { borderColor: color.error._400 }]}
+                            style={[
+                                styles.attention,
+                                holds.length > 0 && { borderColor: color.error._400 },
+                            ]}
                             onPress={openInbox}>
-                            <AntDesign name="safety" size={20} color={color.error._300} />
-                            <Text style={styles.alertText}>
-                                {holds.length === 1
-                                    ? `${holds[0].session ?? 'An agent'} is waiting for permission`
-                                    : `${holds.length} agents are waiting for permission`}
+                            <AntDesign
+                                name={holds.length > 0 ? 'safety' : 'bell'}
+                                size={14}
+                                color={holds.length > 0 ? color.error._300 : color.quote}
+                            />
+                            <Text numberOfLines={1} style={styles.attentionText}>
+                                {attention.join(' · ')}
                             </Text>
-                            <Text style={[styles.alertAction, { color: color.error._300 }]}>
-                                Review
-                            </Text>
+                            <AntDesign name="right" size={11} color={color.text._500} />
                         </TouchableOpacity>
                     )}
 
-                    {online && <RestorableBanner />}
-
                     {online && (
-                        <DashboardTiles
-                            onInbox={openInbox}
-                            onBoard={() => openBoard(scopeProject)}
-                        />
+                        <View style={styles.overview}>
+                            <StatsStrip
+                                open={shown.length}
+                                running={running}
+                                onBoard={() => openBoard(scopeProject)}
+                            />
+                            <View style={styles.divider} />
+                            <UsageRow />
+                        </View>
                     )}
 
-                    {online && <UsageCard />}
+                    {online && scopeWorkspace && (
+                        <Text numberOfLines={1} style={styles.scopeTitle}>
+                            {scopeWorkspace.name}
+                        </Text>
+                    )}
 
                     {online && (
-                        <View style={styles.section}>
-                            <View style={styles.headingRow}>
-                                <Text style={styles.heading}>
-                                    {scopeLabel ? scopeLabel : 'All sessions'} · {shown.length}
-                                </Text>
-                                {scopeProject && (
-                                    <TouchableOpacity
-                                        hitSlop={8}
-                                        style={styles.scopeClear}
-                                        onPress={() => openProject(scopeProject)}>
-                                        <Text style={styles.link}>Open project</Text>
-                                    </TouchableOpacity>
-                                )}
-                                {scopeLabel ? (
-                                    <TouchableOpacity
-                                        hitSlop={8}
-                                        style={styles.scopeClear}
-                                        onPress={() => setScope({ kind: 'all' })}>
-                                        <Text style={styles.link}>Show all</Text>
-                                    </TouchableOpacity>
-                                ) : (
-                                    <TouchableOpacity
-                                        hitSlop={8}
-                                        onPress={() => setDrawer(Drawer.ID.RELAY, true)}>
-                                        <Text style={styles.link}>Workspaces</Text>
-                                    </TouchableOpacity>
-                                )}
-                            </View>
-                            {shown.length === 0 ? (
-                                <View style={styles.none}>
-                                    <AntDesign name="code" size={28} color={color.text._600} />
-                                    <Text style={styles.note}>
-                                        {scopeLabel
-                                            ? `Nothing running in ${scopeLabel}.`
-                                            : 'Nothing running.'}{' '}
-                                        Ask for something below, or launch agents from a project;
-                                        they appear here as they start.
-                                    </Text>
-                                </View>
-                            ) : (
-                                <View style={styles.groups}>
-                                    {sections.map(({ project, sessions: items }) => (
-                                        <View key={project.id} style={styles.group}>
-                                            {!scopeProject && (
-                                                <View style={styles.groupHead}>
-                                                    <TouchableOpacity
-                                                        style={styles.groupOpen}
-                                                        onPress={() => openProject(project)}>
-                                                        <AntDesign
-                                                            name="folder"
-                                                            size={14}
-                                                            color={color.text._500}
-                                                        />
-                                                        <Text
-                                                            numberOfLines={1}
-                                                            style={styles.groupName}>
-                                                            {project.name}
-                                                        </Text>
-                                                        <AntDesign
-                                                            name="right"
-                                                            size={12}
-                                                            color={color.text._500}
-                                                        />
-                                                    </TouchableOpacity>
-                                                    <TouchableOpacity
-                                                        hitSlop={8}
-                                                        onPress={() => openBoard(project)}>
-                                                        <Text style={styles.link}>Board</Text>
-                                                    </TouchableOpacity>
-                                                </View>
-                                            )}
-                                            {items.map((session) => (
-                                                <SessionItem
-                                                    key={session.name}
-                                                    session={session}
-                                                    peer={peers[session.name]}
-                                                />
-                                            ))}
-                                        </View>
+                        <View style={styles.groups}>
+                            {sections.map(({ project, sessions: items }) => (
+                                <View key={project.id} style={styles.group}>
+                                    {projectHead(project)}
+                                    {items.map((session) => (
+                                        <SessionItem
+                                            key={session.name}
+                                            session={session}
+                                            peer={peers[session.name]}
+                                        />
                                     ))}
-                                    {orphans.length > 0 && (
-                                        <View style={styles.group}>
-                                            {orphans.map((session) => (
-                                                <SessionItem key={session.name} session={session} />
-                                            ))}
-                                        </View>
-                                    )}
+                                </View>
+                            ))}
+                            {orphans.length > 0 && (
+                                <View style={styles.group}>
+                                    {orphans.map((session: RelaySession) => (
+                                        <SessionItem key={session.name} session={session} />
+                                    ))}
                                 </View>
                             )}
+                            {shown.length === 0 && (
+                                <View style={styles.none}>
+                                    <AntDesign name="code" size={26} color={color.text._500} />
+                                    <Text style={styles.noneTitle}>No agents running</Text>
+                                    <Text style={styles.note}>
+                                        {scopeProject || scopeWorkspace
+                                            ? `Nothing is running in ${(scopeProject ?? scopeWorkspace)!.name}. `
+                                            : ''}
+                                        Start one in a terminal; it shows up here as it runs.
+                                    </Text>
+                                    <ThemedButton
+                                        label="New terminal"
+                                        iconName="plus"
+                                        variant="secondary"
+                                        onPress={() => setShowNew(true)}
+                                    />
+                                </View>
+                            )}
+                            <StoppedAgents sessions={sessions} inScope={inScope} />
                         </View>
                     )}
                 </ScrollView>
 
                 {online && (
-                    <TouchableOpacity style={styles.composer} onPress={() => setShowRequest(true)}>
-                        <AntDesign name="thunderbolt" size={16} color={color.text._500} />
-                        <Text numberOfLines={1} style={styles.composerText}>
-                            {scopeProject
-                                ? `Ask an agent in ${scopeProject.name}…`
-                                : 'Ask an agent on the PC…'}
-                        </Text>
-                        <View style={styles.composerSend}>
-                            <AntDesign name="arrow-up" size={16} color={color.text._900} />
-                        </View>
+                    <TouchableOpacity
+                        style={[styles.fab, { bottom: insets.bottom + spacing.xl }]}
+                        onPress={() => setShowNew(true)}>
+                        <AntDesign name="plus" size={16} color={color.primary._100} />
+                        <Text style={styles.fabText}>New terminal</Text>
                     </TouchableOpacity>
                 )}
                 <WorkspaceDrawer onOpenInbox={openInbox} onOpenHosts={openHosts} />
-            </SafeAreaView>
+            </View>
         </Drawer.Gesture>
     )
 }
@@ -391,9 +393,9 @@ const useStyles = () => {
             flex: 1,
         },
         page: {
-            padding: spacing.xl,
-            rowGap: spacing.xl,
-            paddingBottom: spacing.xl3,
+            paddingHorizontal: spacing.xl,
+            paddingTop: spacing.m,
+            rowGap: spacing.l,
         },
         headerActions: {
             flexDirection: 'row',
@@ -436,8 +438,8 @@ const useStyles = () => {
         },
         emptyTitle: {
             color: color.text._100,
-            fontSize: fontSize.xl,
-            fontWeight: '600',
+            fontFamily: 'serif',
+            fontSize: fontSize.xl2,
         },
         emptyText: {
             color: color.text._400,
@@ -445,90 +447,77 @@ const useStyles = () => {
             lineHeight: 20,
             marginBottom: spacing.m,
         },
-        hostCard: {
+        hostRow: {
             flexDirection: 'row',
             alignItems: 'center',
-            columnGap: spacing.l,
-            padding: spacing.l,
-            borderRadius: 16,
-            backgroundColor: color.neutral._200,
+            columnGap: spacing.m,
+            paddingHorizontal: spacing.s,
+            paddingVertical: spacing.s,
         },
-        hostIcon: {
-            width: 40,
-            height: 40,
-            borderRadius: 12,
-            alignItems: 'center',
-            justifyContent: 'center',
-            backgroundColor: color.neutral._300,
-        },
-        hostLamp: {
-            position: 'absolute',
-            right: -2,
-            bottom: -2,
-            width: 12,
-            height: 12,
-            borderRadius: 6,
-            borderWidth: 2,
+        lamp: {
+            width: 8,
+            height: 8,
+            borderRadius: 4,
         },
         hostName: {
+            flexShrink: 1,
             color: color.text._100,
-            fontSize: fontSize.l,
+            fontSize: fontSize.m,
             fontWeight: '600',
         },
         hostMeta: {
-            color: color.text._400,
+            flex: 1,
+            color: color.text._500,
             fontSize: fontSize.s,
         },
         error: {
             color: color.error._300,
         },
-        alert: {
+        attention: {
             flexDirection: 'row',
             alignItems: 'center',
-            columnGap: spacing.l,
-            padding: spacing.l,
-            borderRadius: 16,
+            columnGap: spacing.m,
+            paddingHorizontal: spacing.l,
+            paddingVertical: spacing.m,
+            borderRadius: 999,
             borderWidth: 1,
+            borderColor: color.neutral._400,
             backgroundColor: color.neutral._200,
         },
-        alertText: {
+        attentionText: {
             flex: 1,
             color: color.text._100,
+            fontSize: fontSize.s,
         },
-        alertAction: {
-            fontWeight: '600',
-        },
-        section: {
+        overview: {
             rowGap: spacing.m,
+            paddingHorizontal: spacing.l,
+            paddingVertical: spacing.m,
+            borderRadius: 14,
+            backgroundColor: color.neutral._200,
         },
-        headingRow: {
-            flexDirection: 'row',
-            alignItems: 'baseline',
-            justifyContent: 'space-between',
+        divider: {
+            height: StyleSheet.hairlineWidth,
+            backgroundColor: color.neutral._400,
         },
-        heading: {
-            flex: 1,
-            color: color.text._400,
-            fontSize: fontSize.s,
-            letterSpacing: 1,
-            textTransform: 'uppercase',
-        },
-        scopeClear: {
-            marginLeft: spacing.m,
-        },
-        link: {
-            color: color.primary._700,
-            fontSize: fontSize.s,
+        scopeTitle: {
+            color: color.text._100,
+            fontFamily: 'serif',
+            fontSize: fontSize.xl,
+            paddingHorizontal: spacing.s,
         },
         none: {
             alignItems: 'center',
             rowGap: spacing.m,
             paddingVertical: spacing.xl2,
             paddingHorizontal: spacing.xl,
-            borderRadius: 16,
-            borderWidth: 1,
-            borderStyle: 'dashed',
-            borderColor: color.neutral._400,
+            borderRadius: 14,
+            backgroundColor: color.neutral._200,
+        },
+        noneTitle: {
+            color: color.text._100,
+            fontFamily: 'serif',
+            fontSize: fontSize.xl,
         },
         note: {
             color: color.text._400,
@@ -536,55 +525,57 @@ const useStyles = () => {
             textAlign: 'center',
         },
         groups: {
-            rowGap: spacing.xl,
+            rowGap: spacing.l,
         },
         group: {
-            rowGap: spacing.s,
+            rowGap: 6,
         },
         groupHead: {
             flexDirection: 'row',
             alignItems: 'center',
             columnGap: spacing.m,
-            paddingHorizontal: spacing.s,
+            paddingLeft: spacing.s,
         },
         groupOpen: {
             flex: 1,
             flexDirection: 'row',
             alignItems: 'center',
-            columnGap: spacing.m,
+            columnGap: spacing.s,
+            paddingVertical: 2,
         },
         groupName: {
             flexShrink: 1,
             color: color.text._200,
-            fontSize: fontSize.m,
-            fontWeight: '600',
+            fontFamily: 'serif',
+            fontSize: fontSize.l,
         },
-        composer: {
+        iconButton: {
+            width: 30,
+            height: 30,
+            borderRadius: 15,
+            alignItems: 'center',
+            justifyContent: 'center',
+        },
+        fab: {
+            position: 'absolute',
+            right: spacing.xl,
             flexDirection: 'row',
             alignItems: 'center',
             columnGap: spacing.m,
-            marginHorizontal: spacing.xl,
-            marginBottom: spacing.l,
-            paddingLeft: spacing.l,
-            paddingRight: spacing.s,
-            paddingVertical: spacing.s,
-            borderRadius: 24,
-            backgroundColor: color.neutral._200,
-            borderColor: color.neutral._400,
-            borderWidth: 1,
-        },
-        composerText: {
-            flex: 1,
-            color: color.text._500,
-            fontSize: fontSize.m,
-        },
-        composerSend: {
-            width: 32,
-            height: 32,
-            borderRadius: 16,
-            alignItems: 'center',
-            justifyContent: 'center',
+            paddingHorizontal: spacing.xl,
+            paddingVertical: spacing.l,
+            borderRadius: 999,
             backgroundColor: color.primary._500,
+            elevation: 4,
+            shadowColor: '#000',
+            shadowOpacity: 0.3,
+            shadowRadius: 8,
+            shadowOffset: { width: 0, height: 3 },
+        },
+        fabText: {
+            color: color.primary._100,
+            fontSize: fontSize.m,
+            fontWeight: '600',
         },
     })
 }
