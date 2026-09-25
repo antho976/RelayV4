@@ -15,6 +15,7 @@ import { Logger } from '@lib/state/Logger'
 import { activeHost, directRoutes, RelayHost, useRelayHostsStore } from '@lib/state/RelayHosts'
 
 import { attentionFromEvent, ensureNotifyPermission } from './Attention'
+import { useHoldPromptStore } from './HoldPrompt'
 import { PairLink } from './PairLink'
 import { base64Decode, Utf8Stream } from './Terminal'
 
@@ -56,6 +57,45 @@ export type PtyFrame = {
     epoch?: number
     seq: number
     data: string
+}
+
+/**
+ * Any data-plane frame. `logcat` frames carry `run_id` and one log line as `data`; `mirror`
+ * frames carry `mirror_id` and base64 video. A broken stream sends `data: {error}` once.
+ */
+export type StreamFrame = {
+    v: number
+    stream: string
+    session?: string
+    run_id?: number
+    mirror_id?: number
+    epoch?: number
+    seq: number
+    data: string | { error: string }
+}
+
+/** The frozen action behind a hold, as `guardrail.hold.get` returns it (auth removed). */
+export type HeldRequest = {
+    v: number
+    id: string
+    actor: string
+    op: string
+    payload: Record<string, any>
+}
+
+/** The full hold row (`types::Hold`); the dashboard's `RelayHold` is a subset of it. */
+export type RelayHoldFull = RelayHold & {
+    project_id: number | null
+    session_id: number | null
+    actor: string
+    payload_hash: string
+    resolved_at: string | null
+    resolved_by: string | null
+}
+
+export type RequestOptions = {
+    /** Overrides the per-op default from `timeoutFor`. */
+    timeoutMs?: number
 }
 
 export type RelaySession = {
@@ -112,6 +152,16 @@ export class RelayRequestError extends Error {
     }
 }
 
+/** The person answered Deny on a held action; nothing ran. Callers usually ignore it quietly. */
+export class RelayCancelledError extends Error {
+    constructor(message = 'Cancelled: the held action was denied') {
+        super(message)
+    }
+}
+
+export const isCancelled = (e: unknown): e is RelayCancelledError =>
+    e instanceof RelayCancelledError
+
 type Pending = {
     resolve: (response: BusResponse) => void
     reject: (error: Error) => void
@@ -119,6 +169,7 @@ type Pending = {
 }
 
 type FrameListener = (frame: PtyFrame, text: string) => void
+type StreamListener = (frame: StreamFrame) => void
 
 /** One listener's own decoder: a character split across two frames is joined for it. */
 type Attachment = { decoder: Utf8Stream; epoch?: number }
@@ -146,6 +197,84 @@ type RelayState = {
 }
 
 const REQUEST_TIMEOUT_MS = 20_000
+
+// Ops that legitimately run long on the PC: a fresh worktree may hydrate LFS assets, a clone
+// or a Gradle build takes minutes. The desktop's table (relay-native client.rs) plus the ops
+// it runs off its own timer.
+const LONG_OPS: Record<string, number> = {
+    'project.clone': 1_800_000,
+    'session.create': 180_000,
+    'session.spawn': 180_000,
+    'task.dispatch': 180_000,
+    'git.worktree.create': 180_000,
+    'git.push': 300_000,
+    'git.fetch': 300_000,
+    'git.pr.open': 300_000,
+    'git.pr.list': 120_000,
+    'integration.request': 300_000,
+    'device.build': 300_000,
+    'device.run': 300_000,
+    'avd.boot': 180_000,
+    'app.backup.now': 300_000,
+    'skill.install': 300_000,
+    'provider.update': 300_000,
+    'provider.refresh': 120_000,
+    'guardrail.confirm': 300_000,
+    'file.search': 60_000,
+}
+
+/** How long the phone waits for `op` before calling it lost (the outcome is then unknown). */
+export const timeoutFor = (op: string) => LONG_OPS[op] ?? REQUEST_TIMEOUT_MS
+
+/**
+ * What the phone subscribes to on connect: every transition a PC screen may want to follow.
+ * `resource.sample` is left out on purpose — it ticks every second; see `watchResources`.
+ */
+export const EVENT_PATTERNS = [
+    'session.*',
+    'guardrail.*',
+    'notify.*',
+    'task.*',
+    'project.*',
+    'workspace.*',
+    'mailbox.*',
+    'notes.*',
+    'module.*',
+    'git.*',
+    'file.*',
+    'worktree.*',
+    'overlap.*',
+    'integration.*',
+    'usage.*',
+    'run.*',
+    'device.*',
+    'avd.*',
+    'skill.*',
+    'plugin.*',
+    'provider.*',
+    'settings.*',
+    'github.*',
+]
+
+/** The engine's own filter (socket.rs `Filter`): exact, `prefix.*`, or `*`. */
+export const matchEvent = (patterns: string[], ev: string) =>
+    patterns.some(
+        (p) =>
+            p === '*' ||
+            p === ev ||
+            (p.endsWith('.*') && ev.startsWith(p.slice(0, -1)) && ev.length > p.length - 1)
+    )
+
+/** Order-insensitive JSON equality, for comparing a frozen payload with the one we sent. */
+const sameJson = (a: unknown, b: unknown): boolean => {
+    if (a === b) return true
+    if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false
+    if (Array.isArray(a) !== Array.isArray(b)) return false
+    const ak = Object.keys(a as object).filter((k) => (a as any)[k] !== undefined)
+    const bk = Object.keys(b as object).filter((k) => (b as any)[k] !== undefined)
+    if (ak.length !== bk.length) return false
+    return ak.every((k) => sameJson((a as any)[k], (b as any)[k]))
+}
 // Generous: the first packet to a Tailscale peer can wait several seconds while the tunnel
 // wakes or is set up through a relay, and a LAN route that cannot answer fails on its own.
 const HANDSHAKE_TIMEOUT_MS = 20_000
@@ -367,6 +496,10 @@ class RelayClient {
     private pending = new Map<string, Pending>()
     private frameListeners = new Map<string, Map<FrameListener, Attachment>>()
     private eventListeners = new Set<EventListener>()
+    /** Stream listeners by `${stream}:${key}`; `*` as the key hears every frame of a stream. */
+    private streamListeners = new Map<string, Set<StreamListener>>()
+    /** Screens that want `resource.sample`; the engine samples only while this is above 0. */
+    private resourceWatchers = 0
     private keepalive?: ReturnType<typeof setInterval>
     private generation = 0
     /** The connection the person asked for; a drop is retried until `disconnect()`. */
@@ -622,6 +755,9 @@ class RelayClient {
         }
         this.pending.clear()
         this.frameListeners.clear()
+        // A held action asked about on the old link cannot be answered on it any more; the
+        // hold stays open on the PC and shows in the Inbox.
+        useHoldPromptStore.getState().clear()
         if (socket) closeQuietly(socket)
         useRelayStore.setState({
             status: 'offline',
@@ -684,10 +820,11 @@ class RelayClient {
             })
         }, KEEPALIVE_MS)
         ensureNotifyPermission()
-        // Transitions only: the engine never emits an event per byte of output.
-        this.request('bus.subscribe', {
-            events: ['session.*', 'guardrail.*', 'notify.*', 'task.*', 'project.*', 'workspace.*'],
-        }).catch(() => {})
+        this.subscribe()
+        // A watch is a lease on the connection; a new connection starts without one.
+        if (this.resourceWatchers > 0) {
+            this.request('app.resources.watch', { on: true }).catch(() => {})
+        }
         Logger.info(`Relay: connected to ${host.name} (${transport})`)
     }
 
@@ -699,6 +836,10 @@ class RelayClient {
             return
         }
         if (typeof parsed?.stream === 'string') {
+            if (parsed.stream !== 'pty') {
+                this.onStreamFrame(parsed as StreamFrame)
+                return
+            }
             const frame = parsed as PtyFrame
             if (frame.stream === 'pty' && frame.session) {
                 const listeners = this.frameListeners.get(frame.session)
@@ -764,8 +905,142 @@ class RelayClient {
         attentionFromEvent(event)
     }
 
+    /**
+     * Transitions only: the engine never emits an event per byte of output. `bus.subscribe`
+     * replaces the connection's filter, so this always sends the whole list.
+     */
+    private subscribe() {
+        const events =
+            this.resourceWatchers > 0 ? [...EVENT_PATTERNS, 'resource.sample'] : EVENT_PATTERNS
+        this.request('bus.subscribe', { events }).catch(() => {})
+    }
+
+    private onStreamFrame(frame: StreamFrame) {
+        const key =
+            frame.run_id ?? frame.mirror_id ?? frame.session ?? (undefined as string | undefined)
+        const exact =
+            key !== undefined ? this.streamListeners.get(`${frame.stream}:${key}`) : undefined
+        const any = this.streamListeners.get(`${frame.stream}:*`)
+        for (const listener of [...(exact ?? []), ...(any ?? [])]) {
+            try {
+                listener(frame)
+            } catch (e) {
+                Logger.warn(`Relay: stream listener failed: ${e}`)
+            }
+        }
+    }
+
+    /**
+     * Hear a data-plane stream other than a session's PTY, e.g. `onStream('logcat', runId, …)`
+     * for the log lines of a `device.run`/`device.build` this phone started (the engine sends
+     * them only to the connection that asked). `key` is the frame's `run_id`, `mirror_id` or
+     * `session`, or `*` for every frame of that stream. Returns the unsubscribe function.
+     */
+    onStream(stream: string, key: string | number, listener: StreamListener): () => void {
+        const id = `${stream}:${key}`
+        let set = this.streamListeners.get(id)
+        if (!set) {
+            set = new Set()
+            this.streamListeners.set(id, set)
+        }
+        set.add(listener)
+        return () => {
+            const current = this.streamListeners.get(id)
+            current?.delete(listener)
+            if (current && current.size === 0) this.streamListeners.delete(id)
+        }
+    }
+
+    /**
+     * Live CPU/memory samples (`resource.sample`, about once a second) while at least one
+     * caller wants them. Refcounted: every `watchResources(true)` needs its own
+     * `watchResources(false)` (the `useResourceSamples` hook does both). Survives reconnects.
+     */
+    watchResources(on: boolean) {
+        const before = this.resourceWatchers
+        this.resourceWatchers = Math.max(0, before + (on ? 1 : -1))
+        const after = this.resourceWatchers
+        if ((before === 0) === (after === 0)) return
+        if (useRelayStore.getState().status !== 'online') return
+        this.subscribe()
+        this.request('app.resources.watch', { on: after > 0 }).catch(() => {})
+    }
+
+    /**
+     * A typed bus request with the op's own timeout. Rejects with `RelayRequestError` on a
+     * typed refusal (including `held`; use `guarded` for mutations), or a plain `Error` when
+     * offline or timed out.
+     */
+    call<T = any>(op: string, payload: object = {}, opts: RequestOptions = {}): Promise<T> {
+        return this.request<T>(op, payload as Record<string, unknown>, opts)
+    }
+
+    /**
+     * A mutation that the guardrail may hold. On `held`, the frozen request is fetched
+     * (`guardrail.hold.get`) and shown in the global hold sheet; Allow confirms it
+     * (`guardrail.confirm`) and returns the original op's result, Deny rejects the hold and
+     * throws `RelayCancelledError` (test with `isCancelled(e)` and stay quiet). A confirmed
+     * action that still fails (a cap, a protected path) throws `RelayRequestError`.
+     * Desktop equivalent: relay-native code_git.rs `guarded()`.
+     */
+    async guarded<T = any>(
+        op: string,
+        payload: object = {},
+        opts: RequestOptions = {}
+    ): Promise<T> {
+        try {
+            return await this.call<T>(op, payload, opts)
+        } catch (e) {
+            if (!(e instanceof RelayRequestError) || e.error.kind !== 'held') throw e
+            const confirm = e.error.confirm
+            if (confirm?.op !== 'guardrail.confirm') throw e
+            const holdId = confirm.payload.hold_id
+            const inspection = await this.call<{ hold: RelayHoldFull; request: HeldRequest }>(
+                'guardrail.hold.get',
+                { hold_id: holdId }
+            )
+            // What would run must be what the person asked for, or they are asked about
+            // something else. The engine never changes a user's payload, so any drift is a bug.
+            if (
+                inspection.request.op !== op ||
+                !sameJson(JSON.parse(JSON.stringify(payload)), inspection.request.payload)
+            ) {
+                throw new Error(
+                    'Held action does not match the requested operation. Inspect it in the Inbox.'
+                )
+            }
+            const allow = await useHoldPromptStore.getState().ask({
+                error: e.error,
+                hold: inspection.hold,
+                request: inspection.request,
+            })
+            if (!allow) {
+                await this.call('guardrail.reject', {
+                    hold_id: holdId,
+                    reason: 'Denied from the phone',
+                }).catch((err) => Logger.warn(`Relay: reject failed: ${err}`))
+                this.refreshAttention().catch(() => {})
+                throw new RelayCancelledError()
+            }
+            const confirmed = await this.call<{ hold: RelayHoldFull; outcome: BusResponse }>(
+                'guardrail.confirm',
+                { hold_id: holdId },
+                { timeoutMs: Math.max(timeoutFor(op), timeoutFor('guardrail.confirm')) }
+            )
+            this.refreshAttention().catch(() => {})
+            if (confirmed.outcome?.ok) return confirmed.outcome.result as T
+            const failure = confirmed.outcome?.error
+            if (failure) throw new RelayRequestError(failure)
+            throw new Error('Held action was not completed')
+        }
+    }
+
     /** One bus request. Rejects with `RelayRequestError` on a typed refusal. */
-    async request<T = any>(op: string, payload: Record<string, unknown> = {}): Promise<T> {
+    async request<T = any>(
+        op: string,
+        payload: Record<string, unknown> = {},
+        opts: RequestOptions = {}
+    ): Promise<T> {
         const socket = this.socket
         if (!socket || socket.readyState !== WebSocket.OPEN) {
             throw new Error('Not connected to a PC')
@@ -773,10 +1048,13 @@ class RelayClient {
         const id = uuid()
         const line = JSON.stringify({ v: 1, id: id, actor: 'user', op: op, payload: payload })
         const response = await new Promise<BusResponse>((resolve, reject) => {
-            const timer = setTimeout(() => {
-                this.pending.delete(id)
-                reject(new Error(`${op} timed out`))
-            }, REQUEST_TIMEOUT_MS)
+            const timer = setTimeout(
+                () => {
+                    this.pending.delete(id)
+                    reject(new Error(`${op} timed out`))
+                },
+                opts.timeoutMs ?? timeoutFor(op)
+            )
             this.pending.set(id, { resolve, reject, timer })
             socket.send(line)
         })

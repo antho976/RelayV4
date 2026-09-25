@@ -4,6 +4,7 @@ import React from 'react'
 import { ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 
+import { relayHref, RelayPage } from '@components/relay'
 import Drawer from '@components/views/Drawer'
 import {
     RelayProject,
@@ -48,6 +49,8 @@ type RowProps = {
     lamp?: string
     indent?: boolean
     onBoard?: () => void
+    onOpen?: () => void
+    onLongPress?: () => void
 }
 
 const Row: React.FC<RowProps> = ({
@@ -59,13 +62,16 @@ const Row: React.FC<RowProps> = ({
     lamp,
     indent,
     onBoard,
+    onOpen,
+    onLongPress,
 }) => {
     const styles = useStyles()
     const { color } = Theme.useTheme()
     return (
         <TouchableOpacity
             style={[styles.row, indent && styles.indent, active && styles.rowActive]}
-            onPress={onPress}>
+            onPress={onPress}
+            onLongPress={onLongPress}>
             {icon ? (
                 <AntDesign
                     name={icon}
@@ -86,6 +92,11 @@ const Row: React.FC<RowProps> = ({
                     <AntDesign name="project" size={16} color={color.text._500} />
                 </TouchableOpacity>
             )}
+            {onOpen && (
+                <TouchableOpacity hitSlop={10} onPress={onOpen}>
+                    <AntDesign name="right" size={16} color={color.text._500} />
+                </TouchableOpacity>
+            )}
         </TouchableOpacity>
     )
 }
@@ -93,7 +104,8 @@ const Row: React.FC<RowProps> = ({
 /**
  * The PC tab's sidebar: every workspace on the PC and the projects in it, each with how many
  * agents are live there. Tapping one narrows the tab to it; the board icon opens that
- * project's board. The rest of the PC's surfaces sit at the bottom.
+ * project's board, the arrow (or a long press) its hub. The rest of the PC's surfaces sit at
+ * the bottom.
  */
 const WorkspaceDrawer: React.FC<{ onOpenInbox: () => void; onOpenHosts: () => void }> = ({
     onOpenInbox,
@@ -122,6 +134,12 @@ const WorkspaceDrawer: React.FC<{ onOpenInbox: () => void; onOpenHosts: () => vo
     const selected = (candidate: RelayScope) =>
         candidate.kind === scope.kind &&
         (candidate.kind === 'all' || (scope.kind !== 'all' && candidate.id === scope.id))
+
+    const go = (page: RelayPage, params: Record<string, string> = {}) => {
+        close()
+        router.push(relayHref(page, params))
+    }
+    const openProject = (project: RelayProject) => go('Project', { project_id: String(project.id) })
 
     const openBoard = (project: RelayProject) => {
         close()
@@ -178,6 +196,8 @@ const WorkspaceDrawer: React.FC<{ onOpenInbox: () => void; onOpenHosts: () => vo
                                         lamp={loudest(here)}
                                         indent
                                         onBoard={() => openBoard(project)}
+                                        onOpen={() => openProject(project)}
+                                        onLongPress={() => openProject(project)}
                                     />
                                 )
                             })}
@@ -188,10 +208,15 @@ const WorkspaceDrawer: React.FC<{ onOpenInbox: () => void; onOpenHosts: () => vo
                     )
                 })}
                 {projects.length === 0 && (
-                    <Text style={styles.empty}>
-                        No projects on this PC yet. Add one from the desktop.
-                    </Text>
+                    <Text style={styles.empty}>No projects on this PC yet.</Text>
                 )}
+                <Row
+                    active={false}
+                    onPress={() => go('AddProject')}
+                    icon="folder-add"
+                    label="Add a project"
+                    count={0}
+                />
             </ScrollView>
             <View style={[styles.footer, { paddingBottom: insets.bottom + 8 }]}>
                 <TouchableOpacity
@@ -218,8 +243,12 @@ const WorkspaceDrawer: React.FC<{ onOpenInbox: () => void; onOpenHosts: () => vo
                         close()
                         onOpenHosts()
                     }}>
-                    <AntDesign name="setting" size={18} color={color.text._300} />
+                    <AntDesign name="desktop" size={18} color={color.text._300} />
                     <Text style={styles.footerText}>Paired PCs</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.footerItem} onPress={() => go('PcSettings')}>
+                    <AntDesign name="setting" size={18} color={color.text._300} />
+                    <Text style={styles.footerText}>Settings</Text>
                 </TouchableOpacity>
             </View>
         </Drawer.Body>

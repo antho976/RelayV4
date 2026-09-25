@@ -89,6 +89,12 @@ const RelayScreen = () => {
             pathname: '/screens/RelayScreen/Board',
             params: project ? { project: String(project.id) } : {},
         })
+    // A project's hub: every surface the desktop has for it.
+    const openProject = (project: RelayProject) =>
+        router.push({
+            pathname: '/screens/RelayScreen/Project',
+            params: { project_id: String(project.id) },
+        })
 
     const online = status === 'online'
     const live = sessions.filter((item) => item.state !== 'closed')
@@ -278,6 +284,14 @@ const RelayScreen = () => {
                                 <Text style={styles.heading}>
                                     {scopeLabel ? scopeLabel : 'All sessions'} · {shown.length}
                                 </Text>
+                                {scopeProject && (
+                                    <TouchableOpacity
+                                        hitSlop={8}
+                                        style={styles.scopeClear}
+                                        onPress={() => openProject(scopeProject)}>
+                                        <Text style={styles.link}>Open project</Text>
+                                    </TouchableOpacity>
+                                )}
                                 {scopeLabel ? (
                                     <TouchableOpacity
                                         hitSlop={8}
@@ -310,16 +324,25 @@ const RelayScreen = () => {
                                         <View key={project.id} style={styles.group}>
                                             {!scopeProject && (
                                                 <View style={styles.groupHead}>
-                                                    <AntDesign
-                                                        name="folder"
-                                                        size={14}
-                                                        color={color.text._500}
-                                                    />
-                                                    <Text
-                                                        numberOfLines={1}
-                                                        style={styles.groupName}>
-                                                        {project.name}
-                                                    </Text>
+                                                    <TouchableOpacity
+                                                        style={styles.groupOpen}
+                                                        onPress={() => openProject(project)}>
+                                                        <AntDesign
+                                                            name="folder"
+                                                            size={14}
+                                                            color={color.text._500}
+                                                        />
+                                                        <Text
+                                                            numberOfLines={1}
+                                                            style={styles.groupName}>
+                                                            {project.name}
+                                                        </Text>
+                                                        <AntDesign
+                                                            name="right"
+                                                            size={12}
+                                                            color={color.text._500}
+                                                        />
+                                                    </TouchableOpacity>
                                                     <TouchableOpacity
                                                         hitSlop={8}
                                                         onPress={() => openBoard(project)}>
@@ -566,8 +589,14 @@ const useStyles = () => {
             columnGap: spacing.m,
             paddingHorizontal: spacing.s,
         },
-        groupName: {
+        groupOpen: {
             flex: 1,
+            flexDirection: 'row',
+            alignItems: 'center',
+            columnGap: spacing.m,
+        },
+        groupName: {
+            flexShrink: 1,
             color: color.text._200,
             fontSize: fontSize.m,
             fontWeight: '600',
