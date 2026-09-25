@@ -1091,6 +1091,15 @@ class RelayClient {
         )
     }
 
+    /**
+     * Keystrokes that something waits on: resolves once the engine has written them to the
+     * PTY. For text that an Enter must follow in a separate write (`TerminalInput`); the
+     * engine still answers `session.input` without touching its store (D148).
+     */
+    async inputWritten(session: string, data: string): Promise<void> {
+        await this.request('session.input', { session, data }, { timeoutMs: 5000 })
+    }
+
     /** Attach a session's PTY stream; returns the detach function. */
     async attach(
         session: string,

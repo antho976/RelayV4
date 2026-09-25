@@ -1,6 +1,8 @@
+import AntDesign, { AntDesignIconName } from '@react-native-vector-icons/ant-design/static'
+import { setStringAsync } from 'expo-clipboard'
 import { useLocalSearchParams, useRouter } from 'expo-router'
 import React, { useState } from 'react'
-import { View } from 'react-native'
+import { ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native'
 
 import ThemedButton from '@components/buttons/ThemedButton'
 import {
@@ -12,7 +14,6 @@ import {
     LoadingState,
     Mono,
     relay,
-    Row,
     Screen,
     Section,
     SwitchRow,
@@ -20,14 +21,11 @@ import {
     useRelayStore,
 } from '@components/relay'
 import MailThread from '@components/relay/mail/MailThread'
-import {
-    effortChoices,
-    lifecycleActions,
-    terminalHref,
-    useSessionLifecycle,
-} from '@components/relay/sessions'
+import { effortChoices, terminalHref, useSessionLifecycle } from '@components/relay/sessions'
 import { Logger } from '@lib/state/Logger'
 import { Theme } from '@lib/theme/ThemeManager'
+
+import { ago, stateColor } from './console'
 
 /** `session.get`: the Session row (relay-bus types.rs). */
 type SessionFull = {
@@ -66,13 +64,15 @@ const when = (iso: string | null | undefined) => {
 
 /**
  * One session's facts and settings: what the desktop's session menu shows (shell.rs
- * `session_menu`). Details from `session.get`, the launch brief from `session.brief`,
+ * `session_menu`). A header card with its state, the actions in one row of pills, then the
+ * details from `session.get`, the launch brief from `session.brief` (folded until asked for),
  * model/effort (before the first spawn only) and permissions through `session.update`, and
- * the same lifecycle actions as the terminal strip.
+ * its mail.
  */
 const SessionScreen = () => {
     const router = useRouter()
-    const { spacing } = Theme.useTheme()
+    const styles = useStyles()
+    const { color, spacing } = Theme.useTheme()
     const params = useLocalSearchParams<{ session: string }>()
     const name = typeof params.session === 'string' ? params.session : ''
     const project = useRelayStore((state) => {
@@ -161,8 +161,7 @@ const SessionScreen = () => {
         }
     }
 
-    const facts: { label: string; value?: string | null; mono?: boolean }[] = [
-        { label: 'Intent', value: session.intent },
+    const facts: Fact[] = [
         { label: 'Branch', value: session.branch, mono: true },
         { label: 'Worktree', value: session.worktree, mono: true },
         { label: 'Task', value: session.task_id ? `#${session.task_id}` : undefined },
@@ -180,6 +179,28 @@ const SessionScreen = () => {
         { label: 'Closed', value: when(session.closed_at) },
     ]
     const choices = effortChoices(session.provider)
+    const tint = stateColor(session.state, color)
+    const quiet = ago(session.last_output_at)
+    const pills: Pill[] = [
+        ...(closed
+            ? []
+            : [
+                  {
+                      key: 'terminal',
+                      label: 'Terminal',
+                      icon: 'code' as const,
+                      primary: true,
+                      onPress: () => router.push(terminalHref(name)),
+                  },
+              ]),
+        ...lifecycle.actions.map((action) => ({
+            key: action.key,
+            label: lifecycle.busy === action.key ? `${action.label}…` : action.label,
+            icon: ICONS[action.key],
+            destructive: action.destructive,
+            onPress: () => lifecycle.run(action.key),
+        })),
+    ]
 
     return (
         <Screen
@@ -198,90 +219,100 @@ const SessionScreen = () => {
                       ]
             }>
             {lifecycle.sheets}
-            <Section card={false}>
-                <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: spacing.s }}>
-                    <Chip
-                        label={session.state}
-                        tone={
-                            session.state === 'running'
-                                ? 'live'
-                                : session.state === 'blocked'
-                                  ? 'danger'
-                                  : 'neutral'
-                        }
-                        selected
-                    />
-                    <Chip label={session.provider} />
-                    <Chip label={session.role} />
-                    {!!project && <Chip label={project.name} icon="folder" />}
+            <View style={styles.head}>
+                <View style={styles.headLine}>
+                    <View style={[styles.state, { borderColor: tint }]}>
+                        <View style={[styles.dot, { backgroundColor: tint }]} />
+                        <Text style={[styles.stateText, { color: tint }]}>{session.state}</Text>
+                    </View>
+                    <Text numberOfLines={1} style={styles.who}>
+                        {session.provider} · {session.role}
+                    </Text>
                 </View>
-            </Section>
+                {!!project && (
+                    <View style={styles.headLine}>
+                        <AntDesign name="folder" size={13} color={color.text._500} />
+                        <Text numberOfLines={1} style={styles.meta}>
+                            {project.name}
+                            {session.pid ? ` · pid ${session.pid}` : ''}
+                            {quiet ? ` · output ${quiet} ago` : ''}
+                        </Text>
+                    </View>
+                )}
+                {!!session.intent && <Text style={styles.intent}>{session.intent}</Text>}
+            </View>
 
-            {lifecycleActions(session.state).length > 0 && (
-                <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: spacing.m }}>
-                    {!closed && (
-                        <ThemedButton
-                            label="Terminal"
-                            iconName="code"
-                            variant="secondary"
-                            onPress={() => router.push(terminalHref(name))}
-                        />
-                    )}
-                    {lifecycle.actions.map((action) => (
-                        <ThemedButton
-                            key={action.key}
-                            label={
-                                lifecycle.busy === action.key ? `${action.label}…` : action.label
-                            }
-                            variant={
-                                lifecycle.busy
-                                    ? 'disabled'
-                                    : action.destructive
-                                      ? 'tertiary'
-                                      : 'secondary'
-                            }
-                            onPress={() => lifecycle.run(action.key)}
-                        />
+            {pills.length > 0 && (
+                <ScrollView
+                    horizontal
+                    showsHorizontalScrollIndicator={false}
+                    contentContainerStyle={styles.pills}>
+                    {pills.map((pill) => (
+                        <TouchableOpacity
+                            key={pill.key}
+                            disabled={!!lifecycle.busy}
+                            style={[
+                                styles.pill,
+                                pill.primary && styles.pillPrimary,
+                                !!lifecycle.busy && styles.dim,
+                            ]}
+                            onPress={pill.onPress}>
+                            <AntDesign
+                                name={pill.icon}
+                                size={14}
+                                color={
+                                    pill.primary
+                                        ? color.primary._100
+                                        : pill.destructive
+                                          ? color.error._300
+                                          : color.text._200
+                                }
+                            />
+                            <Text
+                                style={[
+                                    styles.pillText,
+                                    pill.primary && styles.pillTextPrimary,
+                                    pill.destructive && styles.danger,
+                                ]}>
+                                {pill.label}
+                            </Text>
+                        </TouchableOpacity>
                     ))}
-                </View>
+                </ScrollView>
             )}
 
             <Section title="Details">
-                {facts
-                    .filter((fact) => !!fact.value)
-                    .map((fact) => (
-                        <Row
-                            key={fact.label}
-                            label={fact.label}
-                            detail={fact.value ?? undefined}
-                            mono={fact.mono}
-                            detailLines={4}
-                        />
-                    ))}
+                <View style={styles.facts}>
+                    {facts
+                        .filter((fact) => !!fact.value)
+                        .map((fact) => (
+                            <FactRow key={fact.label} fact={fact} />
+                        ))}
+                </View>
             </Section>
 
-            <Section
-                title="Launch brief"
-                action={{
-                    label: showBrief ? 'Hide' : 'Show',
-                    onPress: () => setShowBrief((on) => !on),
-                }}>
-                {!showBrief ? (
-                    <Row
-                        label="What the agent is told at launch"
-                        detail="State, peers, notes, adjacent work and skills."
-                        onPress={() => setShowBrief(true)}
-                    />
-                ) : brief.data ? (
-                    <View style={{ paddingVertical: spacing.l }}>
-                        <Mono>{brief.data.text || 'The brief is empty.'}</Mono>
+            <View style={styles.fold}>
+                <TouchableOpacity style={styles.foldHead} onPress={() => setShowBrief((on) => !on)}>
+                    <View style={{ flex: 1, rowGap: 2 }}>
+                        <Text style={styles.foldTitle}>Launch brief</Text>
+                        <Text style={styles.meta}>
+                            What the agent is told at launch: state, peers, notes and skills.
+                        </Text>
                     </View>
-                ) : brief.error ? (
-                    <ErrorState error={brief.error} onRetry={brief.reload} />
-                ) : (
-                    <LoadingState />
+                    <AntDesign name={showBrief ? 'up' : 'down'} size={12} color={color.text._500} />
+                </TouchableOpacity>
+                {showBrief && (
+                    <View style={{ paddingTop: spacing.m }}>
+                        {brief.data ? (
+                            <Mono>{brief.data.text || 'The brief is empty.'}</Mono>
+                        ) : brief.error ? (
+                            <ErrorState error={brief.error} onRetry={brief.reload} />
+                        ) : (
+                            <LoadingState />
+                        )}
+                    </View>
                 )}
-            </Section>
+            </View>
 
             {!closed && (
                 <Section title="Settings">
@@ -343,3 +374,168 @@ const SessionScreen = () => {
 }
 
 export default SessionScreen
+
+type Fact = { label: string; value?: string | null; mono?: boolean }
+
+type Pill = {
+    key: string
+    label: string
+    icon: AntDesignIconName
+    primary?: boolean
+    destructive?: boolean
+    onPress: () => void
+}
+
+const ICONS: Record<string, AntDesignIconName> = {
+    start: 'caret-right',
+    wake: 'caret-right',
+    resume: 'caret-right',
+    park: 'pause',
+    clear: 'reload',
+    close: 'close',
+}
+
+/**
+ * One fact: a small label and its value. Paths and branches are monospace, cut in the middle
+ * so both ends stay readable; a long press copies the whole value.
+ */
+const FactRow: React.FC<{ fact: Fact }> = ({ fact }) => {
+    const styles = useStyles()
+    const value = fact.value ?? ''
+    return (
+        <TouchableOpacity
+            style={styles.fact}
+            disabled={!fact.mono}
+            onLongPress={() => {
+                setStringAsync(value)
+                    .then(() => Logger.infoToast(`Copied ${fact.label.toLowerCase()}`))
+                    .catch(() => {})
+            }}>
+            <Text style={styles.factLabel}>{fact.label}</Text>
+            <Text
+                numberOfLines={fact.mono ? 1 : 3}
+                ellipsizeMode={fact.mono ? 'middle' : 'tail'}
+                style={[styles.factValue, fact.mono && styles.mono]}>
+                {value}
+            </Text>
+        </TouchableOpacity>
+    )
+}
+
+const useStyles = () => {
+    const { color, spacing, fontSize } = Theme.useTheme()
+    return StyleSheet.create({
+        head: {
+            rowGap: spacing.m,
+            paddingHorizontal: spacing.l,
+            paddingVertical: spacing.l,
+            borderRadius: 14,
+            backgroundColor: color.neutral._200,
+        },
+        headLine: {
+            flexDirection: 'row',
+            alignItems: 'center',
+            columnGap: spacing.m,
+        },
+        state: {
+            flexDirection: 'row',
+            alignItems: 'center',
+            columnGap: 6,
+            paddingHorizontal: spacing.m,
+            paddingVertical: 2,
+            borderRadius: 999,
+            borderWidth: 1,
+        },
+        dot: {
+            width: 7,
+            height: 7,
+            borderRadius: 4,
+        },
+        stateText: {
+            fontSize: fontSize.s,
+            fontWeight: '600',
+        },
+        who: {
+            flex: 1,
+            color: color.text._300,
+            fontSize: fontSize.s,
+        },
+        meta: {
+            flex: 1,
+            color: color.text._500,
+            fontSize: fontSize.s - 1,
+        },
+        intent: {
+            color: color.text._100,
+            fontSize: fontSize.m,
+            lineHeight: 21,
+        },
+        pills: {
+            columnGap: spacing.s,
+        },
+        pill: {
+            flexDirection: 'row',
+            alignItems: 'center',
+            columnGap: 6,
+            height: 34,
+            paddingHorizontal: spacing.l,
+            borderRadius: 999,
+            backgroundColor: color.neutral._200,
+        },
+        pillPrimary: {
+            backgroundColor: color.primary._500,
+        },
+        pillText: {
+            color: color.text._200,
+            fontSize: fontSize.s,
+            fontWeight: '600',
+        },
+        pillTextPrimary: {
+            color: color.primary._100,
+        },
+        danger: {
+            color: color.error._300,
+        },
+        dim: {
+            opacity: 0.5,
+        },
+        facts: {
+            paddingVertical: spacing.s,
+        },
+        fact: {
+            flexDirection: 'row',
+            alignItems: 'baseline',
+            columnGap: spacing.l,
+            paddingVertical: 7,
+        },
+        factLabel: {
+            width: 88,
+            color: color.text._500,
+            fontSize: fontSize.s - 1,
+        },
+        factValue: {
+            flex: 1,
+            color: color.text._200,
+            fontSize: fontSize.s,
+        },
+        mono: {
+            fontFamily: 'monospace',
+            fontSize: fontSize.s - 1,
+        },
+        fold: {
+            paddingHorizontal: spacing.l,
+            paddingVertical: spacing.m,
+            borderRadius: 14,
+            backgroundColor: color.neutral._200,
+        },
+        foldHead: {
+            flexDirection: 'row',
+            alignItems: 'center',
+            columnGap: spacing.m,
+        },
+        foldTitle: {
+            color: color.text._100,
+            fontSize: fontSize.m,
+        },
+    })
+}

@@ -150,11 +150,16 @@ uses the server; **Server only** always goes through the rendezvous. The route i
 - **Sessions**: every live agent session grouped by project, with Relay's lamps (green
   running, red held, amber spawning). Tap one for its terminal. Agents stopped by a PC restart
   sit in one folded "stopped agents" row at the end, with Resume per agent or Resume all.
-- **Terminal**: the session's recent output (`session.scrollback`), then live
-  (`session.attach`). Type a line and **Send**, or **Enter** on an empty line; the key row has
-  Esc, Tab, arrows, Ctrl-C and `y`/`n`. The strip above it carries **Summary**, **Changes**,
-  **Mail**, and **Park** / **Wake** / **Resume** as the session's state allows. Keystrokes go
-  through `session.input`, which the engine answers without touching its store.
+- **Terminal**: a real terminal emulator (xterm.js, headless) rebuilt from the engine's raw
+  replay (`session.attach` with no position replays up to 256 KiB, then streams live), so
+  Claude Code and Codex redraws look as they do on the PC. It fits the PTY's width to the
+  screen (pinch to zoom) and never resizes the shared PTY. Type in the composer and send;
+  the text and its Enter go as separate writes so a TUI does not take them for a paste
+  (several lines go as one bracketed paste when the program asks for it). The key row has
+  Esc, Tab, arrows, Enter, Ctrl-C, `y`/`n`; the ⋯ menu carries **Summarize**, **Changes**,
+  **Mail**, copy, text size and **Park** / **Wake** / **Resume** as the session's state
+  allows. Keystrokes go through `session.input`, which the engine answers without touching
+  its store.
 - **Mail**: priority mail to that agent (`mailbox.send`). It reaches an agent that is busy at
   its next step, where a typed line would wait in the terminal until it reads its prompt.
 - **Inbox**: guardrail holds with **Allow once** / **Deny** (`guardrail.confirm` /
