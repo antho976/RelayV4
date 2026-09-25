@@ -66,7 +66,9 @@ const HoldItem: React.FC<{ hold: RelayHold }> = ({ hold }) => {
             ) : (
                 <>
                     <View style={styles.head}>
-                        <Text style={styles.session}>{hold.session ?? 'system'}</Text>
+                        <Text style={styles.session}>
+                            {hold.session ?? (hold as Partial<RelayHoldFull>).actor ?? 'system'}
+                        </Text>
                         <Text style={styles.policy}>{hold.policy}</Text>
                     </View>
                     <Text style={styles.op}>{hold.op}</Text>
