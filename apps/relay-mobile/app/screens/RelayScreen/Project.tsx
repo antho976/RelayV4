@@ -50,7 +50,8 @@ const GROUPS: { title: string; links: Link[] }[] = [
     {
         title: 'Code',
         links: [
-            { page: 'Git', label: 'Git', detail: 'Changes, history, branches', icon: 'branches' },
+            { page: 'Changes', label: 'Changes', detail: 'Stage, commit, push', icon: 'diff' },
+            { page: 'Git', label: 'Git', detail: 'History, branches', icon: 'branches' },
             { page: 'Files', label: 'Files', detail: 'Browse, search, edit', icon: 'folder' },
             {
                 page: 'Integration',

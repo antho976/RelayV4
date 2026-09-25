@@ -19,6 +19,7 @@ import {
     useBusQuery,
     useRelayStore,
 } from '@components/relay'
+import MailThread from '@components/relay/mail/MailThread'
 import {
     effortChoices,
     lifecycleActions,
@@ -330,6 +331,11 @@ const SessionScreen = () => {
                             onPress={save}
                         />
                     </View>
+                </Section>
+            )}
+            {session && (
+                <Section title="Mail">
+                    <MailThread project_id={session.project_id} session={name} />
                 </Section>
             )}
         </Screen>

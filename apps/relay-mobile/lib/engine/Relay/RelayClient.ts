@@ -110,6 +110,14 @@ export type RelaySession = {
     task_id: number | null
     last_output_at: string | null
     pid: number | null
+    // carried by session.list and session events; older engines may leave them out
+    intent?: string | null
+    model?: string | null
+    effort?: string | null
+    spawned_at?: string | null
+    pair_with?: string | null
+    bus_writes?: boolean
+    allow_ui?: boolean
 }
 
 export type RelayProject = {
@@ -117,6 +125,7 @@ export type RelayProject = {
     workspace_id: number
     name: string
     path: string
+    pinned?: boolean
 }
 
 export type RelayWorkspace = {
@@ -144,6 +153,8 @@ export type RelayNotification = {
     body: string
     read: boolean
     created_at: string
+    /** Where the notification points: `{op: 'ui.page.switch' | 'task.get' | …, payload}`. */
+    link?: { op: string; payload: Record<string, any> } | null
 }
 
 export class RelayRequestError extends Error {
@@ -221,6 +232,9 @@ const LONG_OPS: Record<string, number> = {
     'provider.refresh': 120_000,
     'guardrail.confirm': 300_000,
     'file.search': 60_000,
+    'workspace.discover': 60_000,
+    'github.repo.list': 60_000,
+    'github.connect': 60_000,
 }
 
 /** How long the phone waits for `op` before calling it lost (the outcome is then unknown). */

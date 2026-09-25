@@ -36,6 +36,17 @@ export type RelayPage =
     | 'AddProject'
     | 'Inbox'
     | 'Hosts'
+    | 'Terminal'
+    | 'Session'
+    | 'Changes'
+    | 'Commit'
+    | 'FileView'
+    | 'Task'
+    | 'Module'
+    | 'Note'
+    | 'Skills'
+    | 'Skill'
+    | 'Plugins'
 
 /**
  * An href for `router.push`: `router.push(relayHref('Notes', { project_id: '3' }))`.
