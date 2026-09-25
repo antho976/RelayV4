@@ -14,6 +14,7 @@ import {
     useProjectParam,
     useRelayStore,
 } from '@components/relay'
+import { usePeers } from '@components/relay/sessions'
 import { Theme } from '@lib/theme/ThemeManager'
 
 import SessionItem from './SessionItem'
@@ -90,6 +91,7 @@ const ProjectScreen = () => {
     const sessions = useRelayStore((state) => state.sessions)
     const live = sessions.filter((item) => item.project_id === projectId && item.state !== 'closed')
     const params = { project_id: String(projectId ?? '') }
+    const peers = usePeers(projectId !== undefined && live.length > 0 ? [projectId] : [])
 
     const open = (page: RelayPage) =>
         router.push(
@@ -120,13 +122,29 @@ const ProjectScreen = () => {
                     <Row label={project.name} detail={project.path} icon="folder" mono />
                 </Section>
             )}
-            {live.length > 0 && (
-                <Section title={`Sessions · ${live.length}`} card={false}>
+            {live.length > 0 ? (
+                <Section
+                    title={`Sessions · ${live.length}`}
+                    action={{ label: 'Launch agents', onPress: () => open('Launch') }}
+                    card={false}>
                     <View style={{ rowGap: spacing.s }}>
                         {live.map((session) => (
-                            <SessionItem key={session.name} session={session} />
+                            <SessionItem
+                                key={session.name}
+                                session={session}
+                                peer={peers[session.name]}
+                            />
                         ))}
                     </View>
+                </Section>
+            ) : (
+                <Section card={false}>
+                    <EmptyState
+                        icon="rocket"
+                        title="No agents running"
+                        text="Launch one or more agents, alone or as a review group."
+                        action={{ label: 'Launch agents', onPress: () => open('Launch') }}
+                    />
                 </Section>
             )}
             {GROUPS.map((group) => (

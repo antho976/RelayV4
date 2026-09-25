@@ -7,8 +7,15 @@ import DropdownSheet from '@components/input/DropdownSheet'
 import HorizontalSelector from '@components/input/HorizontalSelector'
 import ThemedSwitch from '@components/input/ThemedSwitch'
 import ThemedTextInput from '@components/input/ThemedTextInput'
+import { launchHref } from '@components/relay/sessions'
 import BottomSheet, { useBottomSheetRef } from '@components/views/BottomSheet'
-import { relay, RelayProject, RelaySession, useRelayStore } from '@lib/engine/Relay/RelayClient'
+import {
+    isCancelled,
+    relay,
+    RelayProject,
+    RelaySession,
+    useRelayStore,
+} from '@lib/engine/Relay/RelayClient'
 import { Logger } from '@lib/state/Logger'
 import { Theme } from '@lib/theme/ThemeManager'
 
@@ -101,25 +108,25 @@ const RequestSheet: React.FC<RequestSheetProps> = ({ visible, setVisible, projec
             if (onBoard) {
                 const firstLine = body.split('\n')[0].trim()
                 const title = firstLine.length > 80 ? firstLine.slice(0, 77) + '…' : firstLine
-                const task = await relay.request<{ id: number }>('task.create', {
+                const task = await relay.guarded<{ id: number }>('task.create', {
                     project_id: project.id,
                     title: title,
                     body: body,
                 })
-                const dispatched = await relay.request<{ session: RelaySession }>('task.dispatch', {
+                const dispatched = await relay.guarded<{ session: RelaySession }>('task.dispatch', {
                     task_id: task.id,
                     create: { project_id: project.id, provider: provider, role: role },
                     start: true,
                 })
                 session = dispatched.session
             } else {
-                const created = await relay.request<RelaySession>('session.create', {
+                const created = await relay.guarded<RelaySession>('session.create', {
                     project_id: project.id,
                     provider: provider,
                     role: role,
                     prompt: body,
                 })
-                session = await relay.request<RelaySession>('session.spawn', {
+                session = await relay.guarded<RelaySession>('session.spawn', {
                     session: created.name,
                 })
             }
@@ -132,10 +139,17 @@ const RequestSheet: React.FC<RequestSheetProps> = ({ visible, setVisible, projec
                 params: { session: session.name },
             })
         } catch (e) {
-            setError(`${(e as Error).message}`)
+            if (!isCancelled(e)) setError(`${(e as Error).message}`)
         } finally {
             setBusy(false)
         }
+    }
+
+    // The full launcher: several agents, a review group, models, worktrees, staged tasks.
+    // What was typed so far becomes the first agent's instructions there.
+    const moreOptions = () => {
+        setVisible(false)
+        router.push(launchHref(current?.id, { prompt: text.trim() || undefined }))
     }
 
     return (
@@ -205,6 +219,13 @@ const RequestSheet: React.FC<RequestSheetProps> = ({ visible, setVisible, projec
                 />
 
                 {!!error && <Text style={{ color: color.error._300 }}>{error}</Text>}
+
+                <ThemedButton
+                    label="More options: several agents, review group, worktree…"
+                    iconName="rocket"
+                    variant="tertiary"
+                    onPress={moreOptions}
+                />
 
                 <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
                     <ThemedButton

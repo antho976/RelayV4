@@ -3,6 +3,7 @@ import { useRouter } from 'expo-router'
 import React from 'react'
 import { StyleSheet, Text, TouchableOpacity, View } from 'react-native'
 
+import { RelayPeer, sessionHref, terminalHref } from '@components/relay/sessions'
 import { RelaySession } from '@lib/engine/Relay/RelayClient'
 import { Theme } from '@lib/theme/ThemeManager'
 
@@ -11,10 +12,15 @@ import Lamp from './Lamp'
 
 type SessionItemProps = {
     session: RelaySession
+    /** Its row of `session.peers`: the agent's own line on what it is doing. */
+    peer?: RelayPeer
 }
 
-/** One card of the wall: lamp, name, state, which agent, where it works, when it last spoke. */
-const SessionItem: React.FC<SessionItemProps> = ({ session }) => {
+/**
+ * One card of the wall: lamp, name, state, which agent, where it works, when it last spoke,
+ * and what it says it is doing. Tap for the terminal, long-press for the session's details.
+ */
+const SessionItem: React.FC<SessionItemProps> = ({ session, peer }) => {
     const styles = useStyles()
     const { color } = Theme.useTheme()
     const router = useRouter()
@@ -22,15 +28,14 @@ const SessionItem: React.FC<SessionItemProps> = ({ session }) => {
     const tint = stateColor(session.state, color)
     const where = session.branch
     const when = ago(session.last_output_at)
+    // The peer table is the fresher source; a session event carries the intent too.
+    const intent = peer?.intent || (session as RelaySession & { intent?: string | null }).intent
+    const doing = intent || (peer?.task_title ? `Task: ${peer.task_title}` : '')
     return (
         <TouchableOpacity
             style={[styles.card, held && { borderColor: color.error._400 }]}
-            onPress={() =>
-                router.push({
-                    pathname: '/screens/RelayScreen/Terminal',
-                    params: { session: session.name },
-                })
-            }>
+            onPress={() => router.push(terminalHref(session.name))}
+            onLongPress={() => router.push(sessionHref(session.name))}>
             <View style={styles.head}>
                 <Lamp state={session.state} />
                 <Text numberOfLines={1} style={[styles.name, held && styles.nameHeld]}>
@@ -54,6 +59,11 @@ const SessionItem: React.FC<SessionItemProps> = ({ session }) => {
                 )}
                 {!!when && <Text style={styles.when}>{when} ago</Text>}
             </View>
+            {!!doing && (
+                <Text numberOfLines={2} style={[styles.intent, !intent && styles.task]}>
+                    {doing}
+                </Text>
+            )}
         </TouchableOpacity>
     )
 }
@@ -117,6 +127,16 @@ const useStyles = () => {
             flexShrink: 1,
             color: color.text._400,
             fontSize: fontSize.s,
+        },
+        intent: {
+            paddingLeft: 8 + spacing.m,
+            color: color.text._200,
+            fontSize: fontSize.s,
+            fontStyle: 'italic',
+        },
+        task: {
+            color: color.text._400,
+            fontStyle: 'normal',
         },
         when: {
             color: color.text._500,

@@ -1,3 +1,4 @@
+import AntDesign from '@react-native-vector-icons/ant-design/static'
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake'
 import { useLocalSearchParams, useRouter } from 'expo-router'
 import React, { useCallback, useEffect, useRef, useState } from 'react'
@@ -8,11 +9,18 @@ import Animated, { useAnimatedStyle } from 'react-native-reanimated'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 
 import ThemedButton from '@components/buttons/ThemedButton'
+import {
+    LifecycleAction,
+    LifecycleKey,
+    sessionHref,
+    useSessionLifecycle,
+} from '@components/relay/sessions'
 import { useBottomSheetRef } from '@components/views/BottomSheet'
+import HeaderButton from '@components/views/HeaderButton'
 import HeaderTitle from '@components/views/HeaderTitle'
 import InputSheet from '@components/views/InputSheet'
 import { AppSettings } from '@lib/constants/GlobalValues'
-import { relay, RelaySession, useRelayStore } from '@lib/engine/Relay/RelayClient'
+import { isCancelled, relay, RelaySession, useRelayStore } from '@lib/engine/Relay/RelayClient'
 import { TerminalText } from '@lib/engine/Relay/Terminal'
 import { Logger } from '@lib/state/Logger'
 import { Theme } from '@lib/theme/ThemeManager'
@@ -153,7 +161,7 @@ const TerminalScreen = () => {
     const mail = async (body: string) => {
         if (!session) return
         try {
-            await relay.request('mailbox.send', {
+            await relay.guarded('mailbox.send', {
                 project_id: session.project_id,
                 to: session.name,
                 text: body,
@@ -161,22 +169,32 @@ const TerminalScreen = () => {
             })
             Logger.infoToast(`Mailed ${session.name}`)
         } catch (e) {
-            Logger.errorToast(`${(e as Error).message}`)
+            if (!isCancelled(e)) Logger.errorToast(`${(e as Error).message}`)
         }
     }
 
-    const lifecycle = async (op: string) => {
-        try {
-            await relay.request(op, { session: name })
-            await relay.refresh()
-        } catch (e) {
-            Logger.errorToast(`${(e as Error).message}`)
-        }
-    }
+    // Start, Park, Wake, Resume, Clear context and Close, as the desktop's pane header has
+    // them. A closed session has no terminal left to show.
+    const lifecycle = useSessionLifecycle(session, { onClosed: () => router.back() })
+    const openInfo = () => router.push(sessionHref(name))
 
     return (
         <View style={{ flex: 1, paddingBottom: insets.bottom }}>
             <HeaderTitle title={name || 'Terminal'} />
+            <HeaderButton
+                headerRight={() =>
+                    name ? (
+                        <TouchableOpacity
+                            hitSlop={10}
+                            style={{ marginRight: 8 }}
+                            accessibilityLabel="Session details"
+                            onPress={openInfo}>
+                            <AntDesign name="info-circle" size={22} color={color.text._200} />
+                        </TouchableOpacity>
+                    ) : null
+                }
+            />
+            {lifecycle.sheets}
             <InputSheet
                 ref={mailSheet}
                 title="Mail the agent"
@@ -189,7 +207,10 @@ const TerminalScreen = () => {
                 <SummarySheet ref={summarySheet} session={name} />
                 <Strip
                     session={session}
-                    onLifecycle={lifecycle}
+                    lifecycle={lifecycle.actions}
+                    busy={lifecycle.busy}
+                    onLifecycle={lifecycle.run}
+                    onInfo={openInfo}
                     onMail={() => mailSheet.current?.open()}
                     onChanges={() =>
                         router.push({
@@ -263,31 +284,38 @@ export default TerminalScreen
 
 const Strip: React.FC<{
     session?: RelaySession
-    onLifecycle: (op: string) => void
+    lifecycle: LifecycleAction[]
+    busy?: LifecycleKey
+    onLifecycle: (key: LifecycleKey) => void
+    onInfo: () => void
     onMail: () => void
     onChanges: () => void
     onSummarize: () => void
-}> = ({ session, onLifecycle, onMail, onChanges, onSummarize }) => {
+}> = ({ session, lifecycle, busy, onLifecycle, onInfo, onMail, onChanges, onSummarize }) => {
     const styles = useStyles()
+    const { color } = Theme.useTheme()
     if (!session) return null
     const awake =
         session.state === 'running' || session.state === 'idle' || session.state === 'blocked'
-    // The actions that apply right now, in the order a person reaches for them.
-    const actions: { label: string; onPress: () => void }[] = [
+    // The actions that apply right now, in the order a person reaches for them: a session
+    // that was only allocated leads with Start; the destructive Close comes last.
+    const start = lifecycle.filter((action) => action.key === 'start')
+    const rest = lifecycle.filter((action) => action.key !== 'start')
+    const toAction = (action: LifecycleAction) => ({
+        label: busy === action.key ? `${action.label}…` : action.label,
+        destructive: action.destructive,
+        onPress: () => onLifecycle(action.key),
+    })
+    const actions: { label: string; destructive?: boolean; onPress: () => void }[] = [
+        ...start.map(toAction),
         { label: 'Summary', onPress: onSummarize },
         { label: 'Changes', onPress: onChanges },
         ...(awake ? [{ label: 'Mail', onPress: onMail }] : []),
-        ...(awake ? [{ label: 'Park', onPress: () => onLifecycle('session.park') }] : []),
-        ...(session.state === 'parked'
-            ? [{ label: 'Wake', onPress: () => onLifecycle('session.wake') }]
-            : []),
-        ...(session.state === 'restorable'
-            ? [{ label: 'Resume', onPress: () => onLifecycle('session.resume') }]
-            : []),
+        ...rest.map(toAction),
     ]
     return (
         <View style={styles.strip}>
-            <View style={styles.identity}>
+            <TouchableOpacity style={styles.identity} onPress={onInfo}>
                 <Lamp state={session.state} />
                 <Text
                     numberOfLines={1}
@@ -297,7 +325,8 @@ const Strip: React.FC<{
                 <Text numberOfLines={1} style={styles.stripMeta}>
                     {session.provider} · {session.role} · {session.state}
                 </Text>
-            </View>
+                <AntDesign name="right" size={12} color={color.text._500} />
+            </TouchableOpacity>
             <ScrollView
                 horizontal
                 showsHorizontalScrollIndicator={false}
@@ -307,8 +336,16 @@ const Strip: React.FC<{
                         key={action.label}
                         style={styles.action}
                         hitSlop={6}
+                        disabled={!!busy}
                         onPress={action.onPress}>
-                        <Text style={styles.actionText}>{action.label}</Text>
+                        <Text
+                            style={[
+                                styles.actionText,
+                                action.destructive && { color: color.error._300 },
+                                !!busy && { opacity: 0.5 },
+                            ]}>
+                            {action.label}
+                        </Text>
                     </TouchableOpacity>
                 ))}
             </ScrollView>

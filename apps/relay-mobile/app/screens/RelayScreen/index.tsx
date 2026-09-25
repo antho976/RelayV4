@@ -5,6 +5,7 @@ import { RefreshControl, ScrollView, StyleSheet, Text, TouchableOpacity, View } 
 import { SafeAreaView } from 'react-native-safe-area-context'
 
 import ThemedButton from '@components/buttons/ThemedButton'
+import { DashboardTiles, RestorableBanner, UsageCard, usePeers } from '@components/relay/sessions'
 import Drawer from '@components/views/Drawer'
 import HeaderButton from '@components/views/HeaderButton'
 import HeaderTitle from '@components/views/HeaderTitle'
@@ -14,7 +15,7 @@ import { activeHost, isTailnetUrl, useRelayHostsStore } from '@lib/state/RelayHo
 import { useRelayView } from '@lib/state/RelayView'
 import { Theme } from '@lib/theme/ThemeManager'
 
-import { linkColor, palette } from './console'
+import { linkColor } from './console'
 import RequestSheet from './RequestSheet'
 import SessionItem from './SessionItem'
 import WorkspaceDrawer, { groupProjects } from './WorkspaceDrawer'
@@ -115,8 +116,6 @@ const RelayScreen = () => {
         return true
     }
     const shown = live.filter(inScope)
-    const running = shown.filter((item) => item.state === 'running').length
-    const blocked = shown.filter((item) => item.state === 'blocked').length
 
     // Sessions under their project, projects in the sidebar's order; one with none is left out.
     const sections = groupProjects(workspaces, projects)
@@ -127,6 +126,8 @@ const RelayScreen = () => {
         }))
         .filter((section) => section.sessions.length > 0)
     const orphans = shown.filter((item) => !projects.some((p) => p.id === item.project_id))
+    // What each visible agent says it is doing: one peer table per project on screen.
+    const peers = usePeers(online ? sections.map((section) => section.project.id) : [])
 
     const routeLabel =
         transport === 'via'
@@ -257,26 +258,16 @@ const RelayScreen = () => {
                         </TouchableOpacity>
                     )}
 
+                    {online && <RestorableBanner />}
+
                     {online && (
-                        <View style={styles.stats}>
-                            <Stat
-                                value={running}
-                                label="Running"
-                                tint={running > 0 ? palette.live : undefined}
-                            />
-                            <Stat
-                                value={blocked}
-                                label="Blocked"
-                                tint={blocked > 0 ? color.error._300 : undefined}
-                            />
-                            <Stat
-                                value={inReview}
-                                label="In review"
-                                tint={inReview > 0 ? color.primary._700 : undefined}
-                                onPress={() => openBoard(scopeProject)}
-                            />
-                        </View>
+                        <DashboardTiles
+                            onInbox={openInbox}
+                            onBoard={() => openBoard(scopeProject)}
+                        />
                     )}
+
+                    {online && <UsageCard />}
 
                     {online && (
                         <View style={styles.section}>
@@ -314,7 +305,7 @@ const RelayScreen = () => {
                                         {scopeLabel
                                             ? `Nothing running in ${scopeLabel}.`
                                             : 'Nothing running.'}{' '}
-                                        Ask for something below, or launch agents from the desktop;
+                                        Ask for something below, or launch agents from a project;
                                         they appear here as they start.
                                     </Text>
                                 </View>
@@ -351,7 +342,11 @@ const RelayScreen = () => {
                                                 </View>
                                             )}
                                             {items.map((session) => (
-                                                <SessionItem key={session.name} session={session} />
+                                                <SessionItem
+                                                    key={session.name}
+                                                    session={session}
+                                                    peer={peers[session.name]}
+                                                />
                                             ))}
                                         </View>
                                     ))}
@@ -388,22 +383,6 @@ const RelayScreen = () => {
 }
 
 export default RelayScreen
-
-const Stat: React.FC<{ value: number; label: string; tint?: string; onPress?: () => void }> = ({
-    value,
-    label,
-    tint,
-    onPress,
-}) => {
-    const styles = useStyles()
-    const { color } = Theme.useTheme()
-    return (
-        <TouchableOpacity style={styles.stat} disabled={!onPress} onPress={onPress}>
-            <Text style={[styles.statValue, { color: tint ?? color.text._300 }]}>{value}</Text>
-            <Text style={styles.statLabel}>{label}</Text>
-        </TouchableOpacity>
-    )
-}
 
 const useStyles = () => {
     const { color, spacing, fontSize } = Theme.useTheme()
@@ -518,27 +497,6 @@ const useStyles = () => {
         },
         alertAction: {
             fontWeight: '600',
-        },
-        stats: {
-            flexDirection: 'row',
-            columnGap: spacing.m,
-        },
-        stat: {
-            flex: 1,
-            paddingVertical: spacing.l,
-            paddingHorizontal: spacing.l,
-            borderRadius: 16,
-            backgroundColor: color.neutral._200,
-            rowGap: 2,
-        },
-        statValue: {
-            fontSize: fontSize.xl2,
-            fontWeight: '700',
-            fontVariant: ['tabular-nums'],
-        },
-        statLabel: {
-            color: color.text._400,
-            fontSize: fontSize.s,
         },
         section: {
             rowGap: spacing.m,
