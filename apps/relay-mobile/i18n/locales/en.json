@@ -899,15 +899,43 @@
             },
             "builtIn": "Built-in",
             "contextMenu": {
+                "copy": "Copy JSON",
+                "delete": "Delete",
                 "importTheme": "Import Theme",
-                "pasteTheme": "Paste Theme"
+                "pasteTheme": "Paste Theme",
+                "save": "Save to Downloads",
+                "share": "Share"
             },
             "custom": "Custom",
+            "darkTheme": "Dark theme",
+            "editing": "Editing",
             "error": {
                 "colorNameAlreadyUsed": "Color Name Already Used",
                 "failedToImport": "Failed to import: {{error}}"
             },
+            "fixedDescription": "Always uses the theme picked below.",
+            "inUse": "In use",
+            "lightTheme": "Light theme",
+            "longPressHint": "Long-press a theme to share it, copy it or save it as JSON. Paste or import a JSON theme to add your own.",
+            "messages": {
+                "copied": "Theme copied to the clipboard",
+                "saved": "Saved {{name}}.json to Downloads"
+            },
+            "mode": "Mode",
+            "modeDark": "Dark",
+            "modeLight": "Light",
+            "modeSystem": "System",
             "pasteThemeTitle": "Paste Theme Here",
+            "preview": {
+                "action": "Apply",
+                "character": "Aster",
+                "input": "Message",
+                "quote": "\"easy on the eyes after dark.\"",
+                "reply": "Of course. Softer light and warmer tones,",
+                "user": "Could you make it a little warmer?"
+            },
+            "systemFollowingDark": "Following your phone, which is dark right now.",
+            "systemFollowingLight": "Following your phone, which is light right now.",
             "title": "Themes",
             "useSystemDarkMode": "Use System Dark Mode"
         },
@@ -983,14 +1011,29 @@
                     "title": "Delete Background"
                 }
             },
+            "background": "Chat background",
+            "backgroundNone": "No image. Chats use the theme background.",
+            "backgroundSet": "Shown behind every chat.",
             "changeTheme": "Change Theme",
+            "chatText": "Chat text",
+            "chatTextSample": "This is how messages read in a chat.",
+            "chooseImage": "Choose image",
             "deleteBackground": "Delete Chat Background",
+            "fullPreview": "Full preview",
             "importBackground": "Import Chat Background",
             "messages": {
                 "backgroundDeleted": "Background Deleted!"
             },
+            "removeImage": "Remove",
             "replaceBackground": "Replace Chat Background",
-            "title": "Style"
+            "replaceImage": "Replace",
+            "title": "Style",
+            "weights": {
+                "bold": "Bold",
+                "bolder": "Heavy",
+                "normal": "Regular",
+                "thin": "Thin"
+            }
         },
         "tagHider": {
             "description": "Hide characters with the following tags from the character list.",
