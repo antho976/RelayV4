@@ -22,7 +22,7 @@ import StyleSettings from './StyleSettings'
 export const SECTIONS = {
     appearance: {
         title: 'Appearance',
-        detail: 'Theme, background, screen',
+        detail: 'Theme, chat text, background, screen',
         icon: 'skin',
         parts: [StyleSettings, ScreenSettings],
     },

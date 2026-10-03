@@ -26,6 +26,7 @@
     "@react-native-vector-icons/material-icons": "^13.1.2",
     "@react-native-vector-icons/octicons": "^21.1.2",
     "@shopify/flash-list": "2.0.2",
+    "@xterm/headless": "^6.0.0",
     "babel-plugin-inline-import": "^3.0.0",
     "babel-plugin-react-compiler": "^19.0.0-beta-af1b7da-20250417",
     "cui-llama.rn": "^1.12.2",

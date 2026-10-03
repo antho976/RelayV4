@@ -3,6 +3,7 @@ import { useRouter } from 'expo-router'
 import React from 'react'
 import { StyleSheet, Text, TouchableOpacity, View } from 'react-native'
 
+import { RelayPeer, sessionHref, terminalHref } from '@components/relay/sessions'
 import { RelaySession } from '@lib/engine/Relay/RelayClient'
 import { Theme } from '@lib/theme/ThemeManager'
 
@@ -11,10 +12,16 @@ import Lamp from './Lamp'
 
 type SessionItemProps = {
     session: RelaySession
+    /** Its row of `session.peers`: the agent's own line on what it is doing. */
+    peer?: RelayPeer
 }
 
-/** One card of the wall: lamp, name, state, which agent, where it works, when it last spoke. */
-const SessionItem: React.FC<SessionItemProps> = ({ session }) => {
+/**
+ * One compact card of the wall: lamp, name, a state chip unless it is plainly running, when
+ * it last spoke, which agent and branch, and one line of what it says it is doing. Tap for
+ * the terminal, long-press for the session's details.
+ */
+const SessionItem: React.FC<SessionItemProps> = ({ session, peer }) => {
     const styles = useStyles()
     const { color } = Theme.useTheme()
     const router = useRouter()
@@ -22,23 +29,25 @@ const SessionItem: React.FC<SessionItemProps> = ({ session }) => {
     const tint = stateColor(session.state, color)
     const where = session.branch
     const when = ago(session.last_output_at)
+    // The peer table is the fresher source; a session event carries the intent too.
+    const intent = peer?.intent || (session as RelaySession & { intent?: string | null }).intent
+    const doing = intent || (peer?.task_title ? `Task: ${peer.task_title}` : '')
     return (
         <TouchableOpacity
             style={[styles.card, held && { borderColor: color.error._400 }]}
-            onPress={() =>
-                router.push({
-                    pathname: '/screens/RelayScreen/Terminal',
-                    params: { session: session.name },
-                })
-            }>
+            onPress={() => router.push(terminalHref(session.name))}
+            onLongPress={() => router.push(sessionHref(session.name))}>
             <View style={styles.head}>
                 <Lamp state={session.state} />
                 <Text numberOfLines={1} style={[styles.name, held && styles.nameHeld]}>
                     {session.name}
                 </Text>
-                <View style={[styles.pill, { borderColor: tint }]}>
-                    <Text style={[styles.pillText, { color: tint }]}>{session.state}</Text>
-                </View>
+                {session.state !== 'running' && (
+                    <View style={[styles.pill, { borderColor: tint }]}>
+                        <Text style={[styles.pillText, { color: tint }]}>{session.state}</Text>
+                    </View>
+                )}
+                {!!when && <Text style={styles.when}>{when}</Text>}
             </View>
             <View style={styles.meta}>
                 <Text style={styles.agent}>
@@ -46,14 +55,18 @@ const SessionItem: React.FC<SessionItemProps> = ({ session }) => {
                 </Text>
                 {!!where && (
                     <View style={styles.where}>
-                        <AntDesign name="branches" size={12} color={color.text._500} />
+                        <AntDesign name="branches" size={11} color={color.text._500} />
                         <Text numberOfLines={1} style={styles.detail}>
                             {where}
                         </Text>
                     </View>
                 )}
-                {!!when && <Text style={styles.when}>{when} ago</Text>}
             </View>
+            {!!doing && (
+                <Text numberOfLines={1} style={[styles.intent, !intent && styles.task]}>
+                    {doing}
+                </Text>
+            )}
         </TouchableOpacity>
     )
 }
@@ -64,9 +77,9 @@ const useStyles = () => {
     const { color, spacing, fontSize } = Theme.useTheme()
     return StyleSheet.create({
         card: {
-            rowGap: spacing.s,
+            rowGap: 3,
             paddingHorizontal: spacing.l,
-            paddingVertical: spacing.l,
+            paddingVertical: spacing.m,
             backgroundColor: color.neutral._200,
             borderRadius: 14,
             borderWidth: 1,
@@ -90,7 +103,7 @@ const useStyles = () => {
             borderWidth: 1,
             borderRadius: 10,
             paddingHorizontal: 8,
-            paddingVertical: 1,
+            paddingVertical: 0,
         },
         pillText: {
             fontSize: fontSize.s - 2,
@@ -118,7 +131,18 @@ const useStyles = () => {
             color: color.text._400,
             fontSize: fontSize.s,
         },
+        intent: {
+            paddingLeft: 8 + spacing.m,
+            color: color.text._200,
+            fontSize: fontSize.s,
+            fontStyle: 'italic',
+        },
+        task: {
+            color: color.text._400,
+            fontStyle: 'normal',
+        },
         when: {
+            marginLeft: 'auto',
             color: color.text._500,
             fontSize: fontSize.s,
             fontVariant: ['tabular-nums'],
