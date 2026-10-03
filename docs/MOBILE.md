@@ -27,7 +27,7 @@ phone door (`relay serve --remote`), so there is nothing else to keep running. T
 
 On the phone: install the app (the `relay-mobile-apk` artifact of the **Mobile APK** workflow,
 run from the Actions tab, or `npm run android` in `apps/relay-mobile` with the Android SDK),
-open the drawer, tap **PC**, **Pair a PC**, scan. If the engine was running from before the
+open it, tap **Pair a PC**, scan. If the engine was running from before the
 door existed, restart it once (`./target/debug/relay --instance dev cmd app.quit '{}'`, then
 `./run.sh`), or run `./target/debug/relay remote serve --pair` alongside it. For the phone to
 reach the PC when you are out, see §3 (Tailscale) or §4 (your own server).
@@ -71,7 +71,7 @@ puts it in the pairing link, so a phone paired after Tailscale was set up just w
 For a phone paired before that, open **Paired PCs**, tap **Add Tailscale or other address** on
 the PC's card, and enter the PC's Tailscale address (`100.x.y.z`, or its MagicDNS name
 `my-pc.tail1234.ts.net`). Added addresses are tried with the WiFi ones, survive re-pairing, and
-the PC tab's card says **Tailscale · private** when that is the link in use. Traffic travels
+the home screen's card says **Tailscale · private** when that is the link in use. Traffic travels
 over Tailscale's encrypted WireGuard tunnel; nothing on the PC listens to the internet.
 
 ## 4. From anywhere: your own rendezvous
@@ -118,16 +118,20 @@ PC that holds the secret can host it, and a restart forgets nothing worth keepin
 
 ## 5. On the phone
 
-The **PC** tab is one screen: a card that says which PC is connected and how (WiFi,
-Tailscale or your server), a banner when an agent is waiting for permission, counts of what
-is running, blocked and in review, the live sessions grouped by project, and a bar at the
-bottom to hand an agent some work. Two buttons sit in the header:
+The app is Relay first: it opens on the PC. The home screen is a card that says which PC is
+connected and how (WiFi, Tailscale or your server), a banner when an agent is waiting for
+permission, counts of what is running, blocked and in review, the live sessions grouped by
+project, and a bar at the bottom to hand an agent some work. The header has three buttons:
 
+- **The menu** (left, or swipe from the left edge) opens the app's drawer: the PC at the
+  top with its workspaces, inbox and paired PCs, then **Local** — the characters, models
+  and recent chats that run on the phone itself.
 - **The bell** opens the **Inbox**, with a badge for how much is waiting: guardrail holds,
   tasks in review, and the notification feed. Tap a notification to mark it read on the PC.
-- **The menu** opens the sidebar (or swipe from the left edge): every workspace on the PC
-  and the projects in it, each with how many agents are live there. Tap one to narrow the
-  tab — and the request bar — to it; the board icon next to a project opens its board.
+- **The folder** (right, or swipe from the right edge) opens the workspaces sidebar: every
+  workspace on the PC and the projects in it, each with how many agents are live there. Tap
+  one to narrow the home screen — and the request bar — to it; the board icon next to a
+  project opens its board.
 
 Tapping the PC card opens **Paired PCs**: every PC this phone knows, its routes, adding an
 address, pairing another, and the two things the link may do to the phone (notify you, keep
@@ -152,8 +156,9 @@ uses the server; **Server only** always goes through the rendezvous. The route i
 - **Terminal**: the session's recent output (`session.scrollback`), then live
   (`session.attach`). Type a line and **Send**, or **Enter** on an empty line; the key row has
   Esc, Tab, arrows, Ctrl-C and `y`/`n`. The strip above it carries **Summary**, **Changes**,
-  **Mail**, and **Park** / **Wake** / **Resume** as the session's state allows. Keystrokes go
-  through `session.input`, which the engine answers without touching its store.
+  **Mail**, and **Park** / **Wake** / **Resume** as the session's state allows, and
+  **Phone width**. Keystrokes go through `session.input`, which the engine answers without
+  touching its store.
 - **Mail**: priority mail to that agent (`mailbox.send`). It reaches an agent that is busy at
   its next step, where a typed line would wait in the terminal until it reads its prompt.
 - **Inbox**: guardrail holds with **Allow once** / **Deny** (`guardrail.confirm` /
@@ -168,10 +173,17 @@ uses the server; **Server only** always goes through the rendezvous. The route i
 - **Summary**: with a local model loaded, the phone's own model reads the terminal text and
   says what the agent did and what it needs. The text never leaves the phone.
 
-The terminal is a plain-text view — escape sequences are dropped, carriage returns
-overwrite — not a terminal emulator. It is for reading what an agent says and answering it,
-not for `vim`. The link reconnects by itself after a drop, and again the moment the app comes
-back to the foreground; **Disconnect** on a PC card stops that until you connect again.
+The terminal follows the cursor the way the PC's terminal does, so an agent's CLI that
+redraws in place (Claude Code's prompt box, a spinner, a menu) reads as it does on the PC.
+It shows text only: colours are dropped. While it is open, the phone borrows the session's
+terminal at the phone's own width (`session.resize {until_detach}`), so the agent lays itself
+out for the phone instead of being cut off at the PC's width; the desktop shows the narrow
+layout meanwhile. The PC's size comes back by itself when you leave the terminal, put the
+phone away, or the link drops. **Phone width** off keeps the PC's size and scrolls sideways
+instead. A PC whose Relay predates this keeps its width, read sideways.
+
+The link reconnects by itself after a drop, and again the moment the app comes back to the
+foreground; **Disconnect** on a PC card stops that until you connect again.
 
 The phone's own chats and on-device models never touch this link.
 

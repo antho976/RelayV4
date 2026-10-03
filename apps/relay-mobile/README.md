@@ -1,8 +1,10 @@
 # Relay mobile
 
-The phone half of Relay. Chats run on the phone, with a model that lives there or an API you
-choose; the **PC** tab reaches the Relay engine on your desktop, over your own WiFi when you
-are home and through a server you host when you are not. One app, one look, one drawer.
+The phone half of Relay, Relay first. The app opens on the PC: the agents running in the
+Relay engine on your desktop, reached over your own WiFi when you are home and through
+Tailscale or a server you host when you are not. Below the PC in the drawer is what runs on
+the phone itself: chats with a model that lives there or an API you choose. One app, one look,
+one drawer.
 
 Everything about the PC link — pairing, routes, what the tab can do, and the security model —
 is in [docs/MOBILE.md](../../docs/MOBILE.md) at the repository root. The desktop client is
@@ -13,8 +15,9 @@ is in [docs/MOBILE.md](../../docs/MOBILE.md) at the repository root. The desktop
 
 | path | what |
 | --- | --- |
-| `app/screens/RelayScreen/` | the PC tab: sessions, terminal, board, changes, paired PCs, pairing |
-| `lib/engine/Relay/` | the phone's end of the bus: the WebSocket client, terminal text, attention, on-device summary |
+| `app/screens/RelayScreen/` | the home screen (the PC): sessions, terminal, board, changes, paired PCs, pairing |
+| `app/components/views/SettingsDrawer/` | the drawer: the PC first, then Local (characters, models, recent chats) |
+| `lib/engine/Relay/` | the phone's end of the bus: the WebSocket client, the terminal screen, attention, on-device summary |
 | `lib/state/RelayHosts.ts` | the PCs this phone paired with |
 | `app/screens/ChatScreen/`, `lib/engine/` | chats, on device and over an API |
 | `i18n/` | the UI strings (English only); the PC screens use literal strings |
@@ -46,7 +49,7 @@ Both run in CI. The bus payloads the phone sends are exercised against a real en
 - Chats never use the PC link. On device, the model runs on the phone; the fallback to an
   API (Settings → Privacy) only applies when no on-device model can run, tells you each time,
   and can be switched off.
-- The PC link carries only what you do on the PC tab, and every action is logged on the
+- The PC link carries only what you do on the PC screens, and every action is logged on the
   desktop as yours.
 - The pairing credential stays on the phone. Each connection proves it with a one-time
   challenge instead of sending it.
