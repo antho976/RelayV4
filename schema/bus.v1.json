@@ -2049,7 +2049,7 @@
       }
     },
     "session.resize": {
-      "summary": "Resize the PTY",
+      "summary": "Resize the PTY, for good or until this connection detaches",
       "kind": "mutation",
       "audit": "agent_only",
       "undo": "none",
@@ -2068,7 +2068,7 @@
       }
     },
     "session.scrollback": {
-      "summary": "Scrollback text and the (epoch, seq) it ends at",
+      "summary": "Scrollback text, the (epoch, seq) it ends at, and the PTY's size",
       "kind": "query",
       "audit": "never",
       "undo": "none",
@@ -9288,6 +9288,13 @@
           "format": "uint16",
           "minimum": 0,
           "maximum": 65535
+        },
+        "until_detach": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Borrow the size: on a connection door, the PTY goes back to the size it had when this\nconnection detaches from the session or goes away, unless someone resized it since."
         }
       },
       "required": [
@@ -9331,6 +9338,25 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0
+        },
+        "cols": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "The live PTY's size; absent when the text comes from a saved scrollback."
+        },
+        "rows": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "minimum": 0,
+          "maximum": 65535
         }
       },
       "required": [

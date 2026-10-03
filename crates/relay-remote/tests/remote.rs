@@ -328,3 +328,81 @@ async fn a_terminal_streams_to_the_phone() {
     let listed = call(&mut ws, "session.list", json!({})).await;
     assert_eq!(listed["result"]["sessions"].as_array().map(|s| s.len()), Some(2));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_phone_fits_a_terminal_to_itself_and_hands_it_back() {
+    let h = harness().await;
+    let door = DirectServer::bind(h.ctx.clone(), "127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .await
+        .unwrap();
+    let url = format!("ws://{}", door.local_addr);
+    let code = pair_code(&h.ctx);
+    let (device, token, _) = pair(&url, &code).await;
+    let mut ws = admit(&url, &device, &token).await;
+
+    // A live PTY: a provider that is a shell script waiting on its input.
+    let repo = tempfile::tempdir().unwrap();
+    let out = std::process::Command::new("git").args(["-C", repo.path().to_str().unwrap(), "init", "-q"]).output().unwrap();
+    assert!(out.status.success());
+    let provider = repo.path().join("fake-claude.sh");
+    std::fs::write(&provider, "#!/bin/sh\necho hello-from-pty\nwhile IFS= read -r line; do echo \"echo:$line\"; done\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let set = call(&mut ws, "settings.set", json!({"path": "providers.claude.path", "value": provider})).await;
+    assert_eq!(set["ok"], true, "{set}");
+    let created = call(&mut ws, "workspace.create", json!({"path": repo.path().parent().unwrap()})).await;
+    assert_eq!(created["ok"], true, "{created}");
+    let project = call(&mut ws, "project.add", json!({"workspace_id": created["result"]["id"], "path": repo.path()})).await;
+    assert_eq!(project["ok"], true, "{project}");
+    let session = call(&mut ws, "session.create", json!({"project_id": project["result"]["id"], "provider": "claude"})).await;
+    assert_eq!(session["ok"], true, "{session}");
+    let name = session["result"]["name"].as_str().unwrap().to_string();
+    let spawned = call(&mut ws, "session.spawn", json!({"session": name})).await;
+    assert_eq!(spawned["ok"], true, "{spawned}");
+
+    // The terminal screen's opening read: the text, where it ends, and the PC's size.
+    let back = call(&mut ws, "session.scrollback", json!({"session": name, "lines": 400})).await;
+    assert_eq!(back["ok"], true, "{back}");
+    let (cols, rows) = (back["result"]["cols"].clone(), back["result"]["rows"].clone());
+    assert_eq!((cols.as_u64(), rows.as_u64()), (Some(120), Some(40)));
+
+    // Fit to the phone for as long as it looks: turning sideways refits, and leaving (the
+    // screen detaching) hands the PC's size back.
+    let size = |back: &Value| (back["result"]["cols"].as_u64(), back["result"]["rows"].as_u64());
+    let attached = call(&mut ws, "session.attach", json!({"session": name, "epoch": back["result"]["epoch"], "from_seq": back["result"]["seq"]})).await;
+    assert_eq!(attached["ok"], true, "{attached}");
+    for (fit_cols, fit_rows) in [(52, 38), (96, 20)] {
+        let fit = call(&mut ws, "session.resize", json!({"session": name, "cols": fit_cols, "rows": fit_rows, "until_detach": true})).await;
+        assert_eq!(fit["ok"], true, "{fit}");
+        let back = call(&mut ws, "session.scrollback", json!({"session": name, "lines": 400})).await;
+        assert_eq!(size(&back), (Some(fit_cols), Some(fit_rows)));
+    }
+    let detached = call(&mut ws, "session.detach", json!({"session": name})).await;
+    assert_eq!(detached["ok"], true, "{detached}");
+    let back = call(&mut ws, "session.scrollback", json!({"session": name, "lines": 400})).await;
+    assert_eq!(size(&back), (cols.as_u64(), rows.as_u64()));
+
+    // "Fit to phone" off: the PC's size, set for good, which ends the loan.
+    let fit = call(&mut ws, "session.resize", json!({"session": name, "cols": 52, "rows": 38, "until_detach": true})).await;
+    assert_eq!(fit["ok"], true, "{fit}");
+    let wide = call(&mut ws, "session.resize", json!({"session": name, "cols": cols, "rows": rows})).await;
+    assert_eq!(wide["ok"], true, "{wide}");
+
+    // A phone that drops mid-look hands the size back too: the bridge's socket closes with it.
+    let fit = call(&mut ws, "session.resize", json!({"session": name, "cols": 52, "rows": 38, "until_detach": true})).await;
+    assert_eq!(fit["ok"], true, "{fit}");
+    drop(ws);
+    let mut ws = admit(&url, &device, &token).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let back = call(&mut ws, "session.scrollback", json!({"session": name, "lines": 400})).await;
+        if size(&back) == (cols.as_u64(), rows.as_u64()) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "the size never came back: {back}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let closed = call(&mut ws, "session.close", json!({"session": name})).await;
+    assert_eq!(closed["ok"], true, "{closed}");
+}

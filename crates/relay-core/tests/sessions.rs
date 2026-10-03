@@ -405,8 +405,10 @@ async fn session_lifecycle_over_socket() {
         }
     }
     // resize + scrollback
+    assert_eq!(ok(&e, "session.scrollback", json!({"session": name}))["cols"].as_u64(), Some(120));
     ok(&e, "session.resize", json!({"session": name, "cols": 200, "rows": 50}));
     let sb = ok(&e, "session.scrollback", json!({"session": name}));
+    assert_eq!((sb["cols"].as_u64(), sb["rows"].as_u64()), (Some(200), Some(50)), "the size a client hands back");
     assert!(sb["text"].as_str().unwrap().contains("hello-from-pty"));
     assert!(sb["text"].as_str().unwrap().contains("echo:ping"));
     assert_eq!(sb["epoch"], 1);
@@ -510,6 +512,65 @@ fn input_bypasses_the_store_but_still_wakes_an_idle_session() {
     });
     assert_eq!(state(), "running");
     ok(e, "session.close", json!({"session": &name}));
+}
+
+/// A phone fits an agent's terminal to its own screen with `until_detach`. The size goes back
+/// when it detaches or its connection goes, and never over a size someone set since.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_borrowed_terminal_size_goes_back() {
+    let f = fixture();
+    let e = f.engine.clone();
+    let prov = fake_provider(&f.root, false);
+    ok(&e, "settings.set", json!({"path": "providers.claude.path", "value": prov}));
+    let server = SocketServer::start_in(e.clone(), f.root.join("run")).await.unwrap();
+    let s = ok(&e, "session.create", json!({"project_id": 1, "provider": "claude"}));
+    let name = s["name"].as_str().unwrap().to_string();
+    ok(&e, "session.spawn", json!({"session": &name}));
+    let size = || {
+        let sb = ok(&e, "session.scrollback", json!({"session": &name}));
+        (sb["cols"].as_u64().unwrap(), sb["rows"].as_u64().unwrap())
+    };
+    let user = |op: &str, payload: Value| Request::new(Actor::User, op, payload);
+    let fit = |cols: u16, rows: u16| user("session.resize", json!({"session": &name, "cols": cols, "rows": rows, "until_detach": true}));
+    let set = |cols: u16, rows: u16| user("session.resize", json!({"session": &name, "cols": cols, "rows": rows}));
+    let detach = || user("session.detach", json!({"session": &name}));
+    async fn sent(c: &mut Client, req: Request) {
+        let r = c.call(&req, |_| {}).await.unwrap();
+        assert!(r.ok, "{} failed: {:?}", req.op, r.error);
+    }
+    assert_eq!(size(), (120, 40));
+
+    // Detaching hands it back, to the size from before the first fit, not the last.
+    let mut phone = Client::connect(&server.path).await.unwrap();
+    sent(&mut phone, user("session.attach", json!({"session": &name}))).await;
+    sent(&mut phone, fit(52, 38)).await;
+    assert_eq!(size(), (52, 38));
+    sent(&mut phone, fit(96, 20)).await;
+    assert_eq!(size(), (96, 20));
+    sent(&mut phone, detach()).await;
+    assert_eq!(size(), (120, 40));
+
+    // So does the connection going away, however it goes.
+    sent(&mut phone, fit(52, 38)).await;
+    drop(phone);
+    wait_until("a dropped phone hands the size back", || size() == (120, 40));
+
+    // The desktop resizing since is the newer wish: the hand-back leaves it alone.
+    let mut phone = Client::connect(&server.path).await.unwrap();
+    let mut desk = Client::connect(&server.path).await.unwrap();
+    sent(&mut phone, fit(52, 38)).await;
+    sent(&mut desk, set(160, 48)).await;
+    sent(&mut phone, detach()).await;
+    assert_eq!(size(), (160, 48));
+
+    // A size the phone sets for good ends the loan: nothing to hand back.
+    sent(&mut phone, fit(52, 38)).await;
+    sent(&mut phone, set(100, 30)).await;
+    sent(&mut phone, detach()).await;
+    assert_eq!(size(), (100, 30));
+
+    ok(&e, "session.close", json!({"session": &name}));
+    drop(server);
 }
 
 /// SPEC §16: spawn/kill N sessions, assert zero orphans — including the children's children.

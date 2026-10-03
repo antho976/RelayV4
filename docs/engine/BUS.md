@@ -703,8 +703,8 @@ are `user_only` (§9.1). Agents get `done`, `report`, `attach`/`scrollback`, `bo
 | `session.attach` | query · stream | `{ session, from_seq?: number }` → attaches `pty` stream (replays scrollback from `from_seq`) |
 | `session.detach` | query | `{ session }` → `{}` |
 | `session.input` | mutation · agent_only · session | `{ session, data: string }` → `{}` — text to the PTY |
-| `session.resize` | mutation · agent_only · session | `{ session, cols, rows }` → `{}` |
-| `session.scrollback` | query | `{ session, lines?: number }` → `{ text, seq }` |
+| `session.resize` | mutation · agent_only · session | `{ session, cols, rows, until_detach?: bool }` → `{}` — `until_detach` borrows the size: on a connection door the PTY goes back to the size it had when that connection detaches from the session or closes, unless someone resized it since. A size set without it ends a borrow. The phone fits an agent's terminal to its screen this way |
+| `session.scrollback` | query | `{ session, lines?: number }` → `{ text, epoch, seq, cols?, rows? }` — `cols`/`rows` are the live PTY's size, absent for a saved scrollback |
 | `session.restorable` | query | `{}` → `{ sessions: {session: Session, reason: "app_restart"\|"crash", worktree_dirty: bool}[] }` — the individual-resume list at launch |
 | `session.discard_restorable` | mutation · always | `{ session }` → `{}` — declined at launch → cleaned |
 
