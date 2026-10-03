@@ -100,13 +100,14 @@ jobs:
             - name: Set up Gradle cache
               uses: gradle/actions/setup-gradle@v4
 
-            # cui-llama.rn's CMake picks up ccache when it is on PATH, so a rebuild after a
-            # JavaScript-only change compiles almost nothing.
+            # Every native compile goes through ccache (see the build step), so a rebuild that
+            # leaves llama.cpp alone compiles almost none of it. A cache saved on the default
+            # branch is restored by every branch; one saved on a branch, only by that branch.
             - name: Set up compiler cache
               uses: hendrikmuhs/ccache-action@v1.2
               with:
                   key: mobile-apk-${{ env.ARCHS }}
-                  max-size: 1G
+                  max-size: 2G
 
             - name: Install dependencies
               run: npm ci
@@ -165,6 +166,18 @@ jobs:
 
             - name: Build release APK
               working-directory: apps/relay-mobile/android
+              env:
+                  # Gradle installs the NDK afresh on every run, so its compilers always have a
+                  # new timestamp, and ccache's default check (mtime) missed every object of
+                  # every build. Hash the compiler's contents instead. With debug info ccache
+                  # also hashes the build directory; leave it out so a CMake build directory
+                  # that moves (new arguments, new hash) still hits.
+                  CCACHE_COMPILERCHECK: content
+                  CCACHE_NOHASHDIR: 'true'
+                  # cui-llama.rn finds ccache on PATH by itself; these put the app's own native
+                  # code, reanimated and the Expo modules through it too.
+                  CMAKE_C_COMPILER_LAUNCHER: ccache
+                  CMAKE_CXX_COMPILER_LAUNCHER: ccache
               run: |
                   sed -i 's/^org.gradle.jvmargs=.*/org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m/' gradle.properties
                   ./gradlew :app:assembleRelease \
