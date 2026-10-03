@@ -145,7 +145,7 @@ const CharacterEditPopup: React.FC<CharacterEditPopupProps> = ({
 
     return (
         <ContextMenu
-            disabled={nowLoading || path !== '/'}
+            disabled={nowLoading || path !== '/screens/CharacterListScreen'}
             onPress={setCurrentCharacter}
             longPress
             delayLongPress={300}

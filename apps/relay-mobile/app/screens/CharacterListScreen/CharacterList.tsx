@@ -58,9 +58,10 @@ const CharacterList: React.FC = () => {
         }))
     }, [data])
 
-    // do not render when not shown, optimizes some rerenders
+    // do not render when not shown, optimizes some rerenders; the list is the drawer's
+    // Characters, pushed over the PC home screen
     const path = usePathname()
-    if (path !== '/') return
+    if (path !== '/screens/CharacterListScreen') return
 
     return (
         <View style={{ paddingTop: 8, paddingHorizontal: 16, flex: 1 }}>

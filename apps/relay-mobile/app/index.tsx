@@ -10,7 +10,7 @@ import { migrationErrorText, useMigrations } from '@db/migrate'
 import useLocalAuth from '@lib/hooks/LocalAuth'
 import { Theme } from '@lib/theme/ThemeManager'
 import { loadChatOnInit, startupApp, useTextIntentFocus } from '@lib/utils/Startup'
-import CharacterList from '@screens/CharacterListScreen'
+import RelayScreen from '@screens/RelayScreen'
 
 import migrations from '../db/migrations/migrations'
 
@@ -85,7 +85,8 @@ const Home = () => {
                 </TouchableOpacity>
             </View>
         )
-    if (success) return <CharacterList />
+    // Relay first: the app opens on the PC. What runs on the phone is in the drawer.
+    if (success) return <RelayScreen />
     return <HeaderTitle />
 }
 

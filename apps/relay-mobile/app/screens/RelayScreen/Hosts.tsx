@@ -66,7 +66,7 @@ const HostsScreen = () => {
 
                 <Text style={styles.footnote}>
                     Chats and on-device models stay on this phone. The PC link carries only what you
-                    do on the PC tab, and every action is logged on the desktop as yours.
+                    do on the PC screens, and every action is logged on the desktop as yours.
                 </Text>
             </ScrollView>
         </SafeAreaView>

@@ -8,6 +8,7 @@ import ThemedButton from '@components/buttons/ThemedButton'
 import Drawer from '@components/views/Drawer'
 import HeaderButton from '@components/views/HeaderButton'
 import HeaderTitle from '@components/views/HeaderTitle'
+import SettingsDrawer from '@components/views/SettingsDrawer'
 import { relay, RelayProject, RelaySession, useRelayStore } from '@lib/engine/Relay/RelayClient'
 import { Logger } from '@lib/state/Logger'
 import { activeHost, isTailnetUrl, useRelayHostsStore } from '@lib/state/RelayHosts'
@@ -20,13 +21,15 @@ import SessionItem from './SessionItem'
 import WorkspaceDrawer, { groupProjects } from './WorkspaceDrawer'
 
 /**
- * The PC tab: the agent wall on the desktop, from a phone. A card says whether the PC is
+ * The home screen: the agent wall on the desktop, from a phone. A card says whether the PC is
  * there and how it is reached; a row of counts says what the agents are doing; the sessions
  * follow, grouped by project; and at the bottom, the one thing a person came here to do —
  * hand an agent some work.
  *
- * The header carries the rest: the sidebar (every workspace and project on the PC, and the
- * way to narrow this page to one), and the bell (holds, reviews and notifications).
+ * The header carries the rest. On the left, the app's drawer: the PC first, then what runs on
+ * the phone itself (characters, models, recent chats). On the right, the bell (holds, reviews
+ * and notifications) and the workspaces sidebar, which narrows this page to one workspace or
+ * project and slides in from that side.
  */
 const RelayScreen = () => {
     const styles = useStyles()
@@ -129,6 +132,7 @@ const RelayScreen = () => {
               ? 'Tailscale · private'
               : 'Same network · private'
 
+    const headerLeft = () => <Drawer.Button drawerID={Drawer.ID.SETTINGS} />
     const headerRight = () =>
         paired ? (
             <View style={styles.headerActions}>
@@ -152,40 +156,57 @@ const RelayScreen = () => {
                     )}
                 </TouchableOpacity>
                 <TouchableOpacity hitSlop={10} onPress={() => setDrawer(Drawer.ID.RELAY, true)}>
-                    <AntDesign name="menu" size={22} color={color.text._200} />
+                    <AntDesign name="folder" size={22} color={color.text._200} />
                 </TouchableOpacity>
             </View>
         ) : null
 
     if (!paired) {
         return (
-            <SafeAreaView edges={['bottom']} style={styles.fill}>
-                <HeaderTitle title="PC" />
-                <HeaderButton headerRight={headerRight} />
-                <View style={styles.empty}>
-                    <View style={styles.emptyIcon}>
-                        <AntDesign name="desktop" size={40} color={color.text._300} />
+            <Drawer.Gesture
+                config={[
+                    {
+                        drawerID: Drawer.ID.SETTINGS,
+                        openDirection: 'right',
+                        closeDirection: 'left',
+                    },
+                ]}>
+                <SafeAreaView edges={['bottom']} style={styles.fill}>
+                    <HeaderTitle title="Relay" />
+                    <HeaderButton headerLeft={headerLeft} headerRight={headerRight} />
+                    <View style={styles.empty}>
+                        <View style={styles.emptyIcon}>
+                            <AntDesign name="desktop" size={40} color={color.text._300} />
+                        </View>
+                        <Text style={styles.emptyTitle}>Your desktop, from here</Text>
+                        <Text style={styles.emptyText}>
+                            Pair this phone with the PC that runs Relay. On the same WiFi the link
+                            is direct and never leaves your network. Away from home, use Tailscale
+                            on both devices, or a server you host.
+                        </Text>
+                        <ThemedButton label="Pair a PC" iconName="qrcode" onPress={openHosts} />
+                        <TouchableOpacity
+                            hitSlop={8}
+                            style={styles.localLink}
+                            onPress={() => router.push('/screens/CharacterListScreen')}>
+                            <Text style={styles.link}>Or chat with a model on this phone</Text>
+                        </TouchableOpacity>
                     </View>
-                    <Text style={styles.emptyTitle}>Your desktop, from here</Text>
-                    <Text style={styles.emptyText}>
-                        Pair this phone with the PC that runs Relay. On the same WiFi the link is
-                        direct and never leaves your network. Away from home, use Tailscale on both
-                        devices, or a server you host.
-                    </Text>
-                    <ThemedButton label="Pair a PC" iconName="qrcode" onPress={openHosts} />
-                </View>
-            </SafeAreaView>
+                    <SettingsDrawer />
+                </SafeAreaView>
+            </Drawer.Gesture>
         )
     }
 
     return (
         <Drawer.Gesture
             config={[
-                { drawerID: Drawer.ID.RELAY, openDirection: 'right', closeDirection: 'left' },
+                { drawerID: Drawer.ID.SETTINGS, openDirection: 'right', closeDirection: 'left' },
+                { drawerID: Drawer.ID.RELAY, openDirection: 'left', closeDirection: 'right' },
             ]}>
             <SafeAreaView edges={['bottom']} style={styles.fill}>
-                <HeaderTitle title="PC" />
-                <HeaderButton headerRight={headerRight} />
+                <HeaderTitle title="Relay" />
+                <HeaderButton headerLeft={headerLeft} headerRight={headerRight} />
                 <RequestSheet
                     visible={showRequest}
                     setVisible={setShowRequest}
@@ -359,6 +380,7 @@ const RelayScreen = () => {
                     </TouchableOpacity>
                 )}
                 <WorkspaceDrawer onOpenInbox={openInbox} onOpenHosts={openHosts} />
+                <SettingsDrawer />
             </SafeAreaView>
         </Drawer.Gesture>
     )
@@ -442,6 +464,9 @@ const useStyles = () => {
             textAlign: 'center',
             lineHeight: 20,
             marginBottom: spacing.m,
+        },
+        localLink: {
+            marginTop: spacing.m,
         },
         hostCard: {
             flexDirection: 'row',

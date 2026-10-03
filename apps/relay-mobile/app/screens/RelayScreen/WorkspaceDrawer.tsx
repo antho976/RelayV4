@@ -91,9 +91,10 @@ const Row: React.FC<RowProps> = ({
 }
 
 /**
- * The PC tab's sidebar: every workspace on the PC and the projects in it, each with how many
- * agents are live there. Tapping one narrows the tab to it; the board icon opens that
- * project's board. The rest of the PC's surfaces sit at the bottom.
+ * The home screen's workspaces sidebar, on the right (the app's drawer has the left): every
+ * workspace on the PC and the projects in it, each with how many agents are live there.
+ * Tapping one narrows the home screen to it; the board icon opens that project's board. The
+ * rest of the PC's surfaces sit at the bottom.
  */
 const WorkspaceDrawer: React.FC<{ onOpenInbox: () => void; onOpenHosts: () => void }> = ({
     onOpenInbox,
@@ -132,7 +133,7 @@ const WorkspaceDrawer: React.FC<{ onOpenInbox: () => void; onOpenHosts: () => vo
     }
 
     return (
-        <Drawer.Body drawerID={Drawer.ID.RELAY} direction="left" drawerStyle={styles.drawer}>
+        <Drawer.Body drawerID={Drawer.ID.RELAY} direction="right" drawerStyle={styles.drawer}>
             <View style={styles.head}>
                 <Text style={styles.title} numberOfLines={1}>
                     {hostName ?? 'PC'}
@@ -236,8 +237,10 @@ const useStyles = () => {
             width: '82%',
             height: '100%',
             position: 'absolute',
-            left: 0,
+            right: 0,
             elevation: 20,
+            borderTopLeftRadius: 20,
+            borderBottomLeftRadius: 20,
             shadowColor: color.shadow,
             paddingTop: spacing.l,
         },
