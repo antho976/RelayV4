@@ -1,7 +1,16 @@
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake'
 import { useLocalSearchParams, useRouter } from 'expo-router'
 import React, { useCallback, useEffect, useRef, useState } from 'react'
-import { ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native'
+import {
+    AppState,
+    LayoutChangeEvent,
+    ScrollView,
+    StyleSheet,
+    Text,
+    TextInput,
+    TouchableOpacity,
+    View,
+} from 'react-native'
 import { useReanimatedKeyboardAnimation } from 'react-native-keyboard-controller'
 import { useMMKVBoolean } from 'react-native-mmkv'
 import Animated, { useAnimatedStyle } from 'react-native-reanimated'
@@ -13,7 +22,7 @@ import HeaderTitle from '@components/views/HeaderTitle'
 import InputSheet from '@components/views/InputSheet'
 import { AppSettings } from '@lib/constants/GlobalValues'
 import { relay, RelaySession, useRelayStore } from '@lib/engine/Relay/RelayClient'
-import { TerminalText } from '@lib/engine/Relay/Terminal'
+import { VtScreen } from '@lib/engine/Relay/Terminal'
 import { Logger } from '@lib/state/Logger'
 import { Theme } from '@lib/theme/ThemeManager'
 
@@ -37,9 +46,26 @@ const KEYS: { label: string; data: string }[] = [
 /** How often the screen text is rebuilt while output streams. */
 const RENDER_INTERVAL_MS = 60
 
+/** A new size settles this long before the PTY hears of it: one rotation is several layouts. */
+const FIT_SETTLE_MS = 150
+
+/** The screen's padding, which the column and row counts leave out. */
+const PAD = { left: 10, right: 4, top: 8, bottom: 12 }
+
+/** Measured in the terminal's font for the width of one column and the height of one row. */
+const RULER = 'M'.repeat(20)
+
+type Size = { cols: number; rows: number }
+
 /**
- * One session's terminal, as text. Scrollback first, then live frames; keystrokes go straight
- * to the PTY through `session.input`, which the engine answers without touching its store.
+ * One session's terminal. Scrollback first, then live frames, through a screen that follows
+ * the cursor the way the PC's terminal does; keystrokes go straight to the PTY through
+ * `session.input`, which the engine answers without touching its store.
+ *
+ * While it is open the screen borrows the PTY at the phone's own width, so an agent's CLI
+ * lays itself out for the phone instead of being cut off at the PC's. The engine hands the
+ * PC's size back when the screen detaches or the link drops; "Phone width" off keeps the PC's
+ * size and scrolls sideways instead.
  */
 const TerminalScreen = () => {
     const styles = useStyles()
@@ -50,6 +76,8 @@ const TerminalScreen = () => {
     const session = useRelayStore((state) => state.sessions.find((item) => item.name === name))
     const status = useRelayStore((state) => state.status)
     const [keepOn] = useMMKVBoolean(AppSettings.RelayKeepScreenOn)
+    const [fitSetting, setFitSetting] = useMMKVBoolean(AppSettings.RelayFitTerminal)
+    const fit = fitSetting !== false
     const [text, setText] = useState('')
     const [input, setInput] = useState('')
     const [attached, setAttached] = useState(false)
@@ -57,10 +85,17 @@ const TerminalScreen = () => {
     const mailSheet = useBottomSheetRef()
     const summarySheet = useRef<SummarySheetRef>(null)
     const router = useRouter()
-    const screen = useRef(new TerminalText())
+    const screen = useRef(new VtScreen())
     const scroll = useRef<ScrollView>(null)
     const dirty = useRef(false)
     const stick = useRef(true)
+    /** The PTY's size on the PC, as the engine reported it when the screen attached. */
+    const [pcSize, setPcSize] = useState<Size>()
+    const [cell, setCell] = useState<{ width: number; height: number }>()
+    const [area, setArea] = useState<{ width: number; height: number }>()
+    const [foreground, setForeground] = useState(AppState.currentState === 'active')
+    /** This screen holds the PTY at the phone's size. */
+    const borrowed = useRef(false)
 
     const { height } = useReanimatedKeyboardAnimation()
     const animatedStyle = useAnimatedStyle(() => ({
@@ -95,12 +130,20 @@ const TerminalScreen = () => {
         }, RENDER_INTERVAL_MS)
         ;(async () => {
             try {
-                const back = await relay.request<{ text: string; epoch: number; seq: number }>(
-                    'session.scrollback',
-                    { session: name, lines: 400 }
-                )
+                const back = await relay.request<{
+                    text: string
+                    epoch: number
+                    seq: number
+                    cols?: number
+                    rows?: number
+                }>('session.scrollback', { session: name, lines: 400 })
                 if (cancelled) return
-                screen.current.reset(back.text)
+                // An engine too old to report its size cannot lend it either: that PC's
+                // terminals stay at its width, read sideways.
+                const size =
+                    back.cols && back.rows ? { cols: back.cols, rows: back.rows } : undefined
+                screen.current.reset(back.text, size?.cols ?? 120, size?.rows ?? 40)
+                setPcSize(size)
                 dirty.current = true
                 detach = await relay.attach(
                     name,
@@ -123,10 +166,78 @@ const TerminalScreen = () => {
         return () => {
             cancelled = true
             clearInterval(timer)
+            // Detaching is what hands a borrowed size back; a dropped link does it as well.
             detach?.()
+            borrowed.current = false
             setAttached(false)
         }
     }, [name, status, launched, pid])
+
+    // The phone's columns and rows: the screen's size over one character's.
+    const phone: Size | undefined =
+        cell && area
+            ? {
+                  cols: Math.max(
+                      20,
+                      Math.floor((area.width - PAD.left - PAD.right - 1) / cell.width)
+                  ),
+                  rows: Math.max(4, Math.floor((area.height - PAD.top - PAD.bottom) / cell.height)),
+              }
+            : undefined
+    const lend = fit && !!phone && !!pcSize
+    const target = !attached || !pcSize ? undefined : lend && phone ? phone : pcSize
+    const targetCols = target?.cols
+    const targetRows = target?.rows
+
+    // Fit the PTY to what the screen shows. Borrowed, the size goes back to the PC by itself
+    // when this screen detaches; set for good, it ends the loan, which is "Phone width" off.
+    useEffect(() => {
+        if (!targetCols || !targetRows || !foreground) return
+        const timer = setTimeout(() => {
+            screen.current.resize(targetCols, targetRows)
+            dirty.current = true
+            if (!lend && !borrowed.current) return
+            borrowed.current = lend
+            relay
+                .request('session.resize', {
+                    session: name,
+                    cols: targetCols,
+                    rows: targetRows,
+                    ...(lend ? { until_detach: true } : {}),
+                })
+                .catch((e) => Logger.warn(`Could not fit the terminal: ${(e as Error).message}`))
+        }, FIT_SETTLE_MS)
+        return () => clearTimeout(timer)
+    }, [name, targetCols, targetRows, lend, foreground])
+
+    // Put away, the phone hands the terminal back at once, so whoever sits down at the PC
+    // finds it as they left it. Back in front, the effect above borrows it again.
+    useEffect(() => {
+        const subscription = AppState.addEventListener('change', (next) => {
+            setForeground(next === 'active')
+            if (next !== 'background' || !borrowed.current || !pcSize) return
+            borrowed.current = false
+            relay
+                .request('session.resize', { session: name, cols: pcSize.cols, rows: pcSize.rows })
+                .catch(() => {})
+        })
+        return () => subscription.remove()
+    }, [name, pcSize])
+
+    const onScreenLayout = (event: LayoutChangeEvent) => {
+        const { width, height } = event.nativeEvent.layout
+        // Rows follow the screen as it is with the keyboard down. The keyboard coming up only
+        // covers the top of the agent's screen; resizing for it would have the agent redraw
+        // everything each time it does.
+        setArea((prev) =>
+            !prev || Math.abs(prev.width - width) >= 1 || height > prev.height + 1
+                ? { width, height }
+                : prev
+        )
+    }
+
+    // Wide lines scroll sideways instead of wrapping into each other.
+    const wide = !lend
 
     const send = useCallback(
         (data: string) => {
@@ -198,28 +309,50 @@ const TerminalScreen = () => {
                         })
                     }
                     onSummarize={() => summarySheet.current?.open(screen.current.text())}
+                    fit={pcSize ? fit : undefined}
+                    onFit={() => setFitSetting(!fit)}
                 />
-                <ScrollView
-                    ref={scroll}
-                    style={styles.screen}
-                    contentContainerStyle={styles.screenContent}
-                    onContentSizeChange={() => {
-                        if (stick.current) scroll.current?.scrollToEnd({ animated: false })
-                    }}
-                    onScroll={(event) => {
-                        const { contentOffset, contentSize, layoutMeasurement } = event.nativeEvent
-                        stick.current =
-                            contentOffset.y + layoutMeasurement.height >= contentSize.height - 40
-                    }}
-                    scrollEventThrottle={100}>
-                    {!!problem && <Text style={styles.problem}>{problem}</Text>}
-                    {!problem && status !== 'online' && (
-                        <Text style={styles.problem}>Not connected to the PC.</Text>
-                    )}
-                    <Text selectable style={styles.mono}>
-                        {text}
+                <View style={styles.screen} onLayout={onScreenLayout}>
+                    <Text
+                        style={[styles.mono, styles.ruler]}
+                        onLayout={(event) => {
+                            const { width, height } = event.nativeEvent.layout
+                            if (width > 0 && height > 0)
+                                setCell({ width: width / RULER.length, height: height })
+                        }}>
+                        {RULER}
                     </Text>
-                </ScrollView>
+                    <ScrollView
+                        ref={scroll}
+                        contentContainerStyle={styles.screenContent}
+                        onContentSizeChange={() => {
+                            if (stick.current) scroll.current?.scrollToEnd({ animated: false })
+                        }}
+                        onScroll={(event) => {
+                            const { contentOffset, contentSize, layoutMeasurement } =
+                                event.nativeEvent
+                            stick.current =
+                                contentOffset.y + layoutMeasurement.height >=
+                                contentSize.height - 40
+                        }}
+                        scrollEventThrottle={100}>
+                        {!!problem && <Text style={styles.problem}>{problem}</Text>}
+                        {!problem && status !== 'online' && (
+                            <Text style={styles.problem}>Not connected to the PC.</Text>
+                        )}
+                        {wide ? (
+                            <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+                                <Text selectable style={styles.mono}>
+                                    {text}
+                                </Text>
+                            </ScrollView>
+                        ) : (
+                            <Text selectable style={styles.mono}>
+                                {text}
+                            </Text>
+                        )}
+                    </ScrollView>
+                </View>
                 <View style={styles.keys}>
                     {KEYS.map((key) => (
                         <TouchableOpacity
@@ -267,13 +400,16 @@ const Strip: React.FC<{
     onMail: () => void
     onChanges: () => void
     onSummarize: () => void
-}> = ({ session, onLifecycle, onMail, onChanges, onSummarize }) => {
+    /** Whether the PTY is fitted to the phone; absent when the PC cannot lend it. */
+    fit?: boolean
+    onFit: () => void
+}> = ({ session, onLifecycle, onMail, onChanges, onSummarize, fit, onFit }) => {
     const styles = useStyles()
     if (!session) return null
     const awake =
         session.state === 'running' || session.state === 'idle' || session.state === 'blocked'
     // The actions that apply right now, in the order a person reaches for them.
-    const actions: { label: string; onPress: () => void }[] = [
+    const actions: { label: string; onPress: () => void; on?: boolean }[] = [
         { label: 'Summary', onPress: onSummarize },
         { label: 'Changes', onPress: onChanges },
         ...(awake ? [{ label: 'Mail', onPress: onMail }] : []),
@@ -284,6 +420,7 @@ const Strip: React.FC<{
         ...(session.state === 'restorable'
             ? [{ label: 'Resume', onPress: () => onLifecycle('session.resume') }]
             : []),
+        ...(fit !== undefined ? [{ label: 'Phone width', onPress: onFit, on: fit }] : []),
     ]
     return (
         <View style={styles.strip}>
@@ -305,10 +442,12 @@ const Strip: React.FC<{
                 {actions.map((action) => (
                     <TouchableOpacity
                         key={action.label}
-                        style={styles.action}
+                        style={[styles.action, action.on && styles.actionOn]}
                         hitSlop={6}
                         onPress={action.onPress}>
-                        <Text style={styles.actionText}>{action.label}</Text>
+                        <Text style={[styles.actionText, action.on && styles.actionTextOn]}>
+                            {action.label}
+                        </Text>
                     </TouchableOpacity>
                 ))}
             </ScrollView>
@@ -358,15 +497,25 @@ const useStyles = () => {
             color: color.text._200,
             fontSize: fontSize.s,
         },
+        actionOn: {
+            backgroundColor: color.primary._500,
+        },
+        actionTextOn: {
+            color: color.primary._100,
+        },
         screen: {
             flex: 1,
             backgroundColor: palette.ink,
         },
         screenContent: {
-            paddingLeft: 10,
-            paddingRight: 4,
-            paddingTop: 8,
-            paddingBottom: 12,
+            paddingLeft: PAD.left,
+            paddingRight: PAD.right,
+            paddingTop: PAD.top,
+            paddingBottom: PAD.bottom,
+        },
+        ruler: {
+            position: 'absolute',
+            opacity: 0,
         },
         mono: {
             color: palette.paper,
