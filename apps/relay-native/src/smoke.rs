@@ -403,11 +403,18 @@ fn edit_fixture(ui: Rc<Ui>, page: String) {
                             .unwrap()
                             .set_text("Native task edit verified");
                     }
-                    named(&window, "draft-save")
-                        .unwrap()
-                        .downcast::<gtk::Button>()
-                        .unwrap()
-                        .emit_clicked();
+                    if page == "board" {
+                        named(&window, "draft-save")
+                            .unwrap()
+                            .downcast::<gtk::Button>()
+                            .unwrap()
+                            .emit_clicked();
+                    } else {
+                        // The Notes editor saves through its window action, not Draft's key.
+                        window
+                            .activate_action("notes.save", None)
+                            .expect("Notes window has a save action");
+                    }
                     break;
                 }
             }

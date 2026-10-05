@@ -766,7 +766,11 @@ fn build_row(note: &Value) -> Row {
 fn render_rows(ui: &Rc<Ui>, shell: &Shell) {
     let adjustment = shell.list_scroll.vadjustment();
     let keep = adjustment.value();
-    shell.list.remove_all();
+    // Rows only: `remove_all` would also try the row menu parented to the list and, in GTK
+    // 4.22, retry it forever ("Tried to remove non-child").
+    while let Some(row) = shell.list.row_at_index(0) {
+        shell.list.remove(&row);
+    }
     let mut notes = shell.notes.borrow().clone();
     if prefs().sort_title {
         notes.sort_by_cached_key(|n| {
