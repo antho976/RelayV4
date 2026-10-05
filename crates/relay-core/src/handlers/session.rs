@@ -10,7 +10,7 @@ use relay_bus::error::BusError;
 use relay_bus::ops::session::*;
 use relay_bus::types::{Id, Provider, Role, Session, SessionState};
 use relay_bus::Empty;
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -323,25 +323,127 @@ fn write_session_file(
     })
 }
 
-fn uninstall_git_chain(tx: &Transaction, repo: &Path, worktree: &Path) -> Result<(), BusError> {
-    let mut stmt = tx
-        .prepare_cached("SELECT name FROM sessions WHERE worktree=?1 ORDER BY id DESC")
+/// What undoing Relay's wiring in one worktree needs from the store: every session name that
+/// ever owned its hook path, and which provider adapters were ever installed there.
+struct Teardown {
+    names: Vec<String>,
+    any_claude: bool,
+    any_codex: bool,
+}
+
+fn read_teardown(conn: &Connection, worktree: &str) -> Result<Teardown, BusError> {
+    let mut stmt = conn
+        .prepare_cached("SELECT name, provider FROM sessions WHERE worktree=?1 ORDER BY id DESC")
         .bus()?;
-    let names = stmt
-        .query_map([worktree.display().to_string()], |row| {
-            row.get::<_, String>(0)
-        })
+    let rows = stmt
+        .query_map([worktree], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
         .bus()?
         .collect::<rusqlite::Result<Vec<_>>>()
         .bus()?;
-    for name in names {
-        crate::hooks::uninstall_git(repo, worktree, &name).bus()?;
+    Ok(Teardown {
+        any_claude: rows.iter().any(|(_, provider)| provider == "claude"),
+        any_codex: rows.iter().any(|(_, provider)| provider == "codex"),
+        names: rows.into_iter().map(|(name, _)| name).collect(),
+    })
+}
+
+/// The git and file half of a teardown. Subprocesses and file rewrites, so it runs with the
+/// store unlocked; one `git config --get` covers every name in the chain.
+fn run_teardown(repo: &Path, worktree: &Path, teardown: &Teardown) -> Result<(), BusError> {
+    crate::hooks::uninstall_git_any(repo, worktree, &teardown.names).bus()?;
+    if teardown.any_claude {
+        crate::hooks::uninstall_claude(worktree).bus()?;
+    }
+    if teardown.any_codex {
+        crate::hooks::uninstall_codex(worktree).bus()?;
     }
     Ok(())
 }
 
-fn launch(ctx: &mut Ctx, row: &Row_, kind: LaunchKind) -> Result<Session, BusError> {
-    let cmd = crate::providers::executable(ctx.tx(), row.session.provider)?;
+/// Kill a PTY that is already out of the registry without making the caller wait for it.
+/// The SIGTERM grace and the SIGKILL fallback can take seconds; nothing reads the child again.
+fn kill_detached(pty: Arc<Pty>, grace: Duration) {
+    let spawned = std::thread::Builder::new()
+        .name(format!("pty-kill-{}", pty.pid()))
+        .spawn({
+            let pty = pty.clone();
+            move || pty.kill(grace)
+        });
+    if spawned.is_err() {
+        pty.kill(grace);
+    }
+}
+
+/// Everything a launch reads from the store, gathered in one short read. The hooks, skill
+/// folders and brief files it implies are then written with the store unlocked (D149).
+struct LaunchPlan {
+    row: Row_,
+    kind: LaunchKind,
+    cmd: PathBuf,
+    project_path: PathBuf,
+    relay_bin: PathBuf,
+    plugin_servers: Vec<crate::plugins::LaunchServer>,
+    skills: Vec<crate::skills::Plan>,
+    brief_compact: String,
+    brief_skills: String,
+    write_roots: Vec<PathBuf>,
+    initial_scrollback: Vec<u8>,
+}
+
+/// A launch whose external work is done: only the PTY and the row update remain.
+struct PreparedLaunch {
+    session_id: Id,
+    name: String,
+    /// The state and epoch the row had when it was read. A launch whose row moved on meanwhile
+    /// (closed, parked, launched by a concurrent request) is refused rather than doubled.
+    expect: SessionState,
+    epoch: u64,
+    kind: LaunchKind,
+    /// `session.spawn {prompt}`: the launch assignment to record with the spawn.
+    launch_prompt: Option<Option<String>>,
+    /// `session.clear_restorable`: forget the provider conversation and its scrollback.
+    clear: bool,
+    spec: SpawnSpec,
+}
+
+fn plan_launch(conn: &Connection, engine: &Engine, row: Row_, kind: LaunchKind) -> Result<LaunchPlan, BusError> {
+    let cmd = crate::providers::executable(conn, row.session.provider)?;
+    let relay_bin = crate::hooks::relay_bin();
+    let project = crate::handlers::workspace::get_project(conn, row.session.project_id)?;
+    // A plugin that is on brings its MCP servers to every agent of the project (D159).
+    let plugin_servers = crate::plugins::mcp_servers(conn, row.session.project_id, &relay_bin).bus()?;
+    let cwd = PathBuf::from(&row.session.worktree);
+    let mut skills = Vec::new();
+    match crate::skills::plan(conn, &cwd, row.session.project_id) {
+        Ok(plan) => skills.push(plan),
+        Err(error) => tracing::warn!(session = %row.session.name, error = %error, "planning skills"),
+    }
+    match crate::skills::plan_user(conn, engine.instance) {
+        Ok(plan) => skills.push(plan),
+        Err(error) => tracing::warn!(session = %row.session.name, error = %error, "planning user skills"),
+    }
+    // The brief is delivered on *every* spawn, not only with a dispatched task: an agent with
+    // no assignment is exactly the one that most needs to know who its peers are (D101).
+    let brief = crate::awareness::brief(conn, &row.session.name, Some(engine))?;
+    let cfg = crate::guardrail::config(conn, Some(row.session.project_id))?;
+    let write_roots = crate::guardrail::write_roots(&cfg, &cwd).into_iter().filter(|root| root != &cwd).collect();
+    let initial_scrollback = match kind {
+        LaunchKind::Fresh => Vec::new(),
+        LaunchKind::Resume => sessions::load_scrollback(conn, row.session.id)?
+            .map(|saved| saved.0.into_bytes())
+            .unwrap_or_default(),
+    };
+    Ok(LaunchPlan {
+        row, kind, cmd, project_path: PathBuf::from(&project.path), relay_bin, plugin_servers, skills,
+        brief_compact: brief.compact, brief_skills: brief.parts.skills, write_roots, initial_scrollback,
+    })
+}
+
+/// The external half of a launch: git hooks, provider adapters, skill folders, the brief and
+/// role files. All of it is idempotent, so a launch refused afterwards leaves nothing wrong.
+fn prepare_launch(engine: &Engine, plan: LaunchPlan) -> Result<PreparedLaunch, BusError> {
+    let LaunchPlan { row, kind, cmd, project_path, relay_bin, plugin_servers, skills, brief_compact, brief_skills, write_roots, initial_scrollback } = plan;
+    let instance = engine.instance;
     let cwd = PathBuf::from(&row.session.worktree);
     if !cwd.is_dir() {
         return Err(BusError::conflict(
@@ -349,47 +451,25 @@ fn launch(ctx: &mut Ctx, row: &Row_, kind: LaunchKind) -> Result<Session, BusErr
             format!("worktree {} is gone", cwd.display()),
         ));
     }
-    let relay_bin = crate::hooks::relay_bin();
-    let project = crate::handlers::workspace::get_project(ctx.tx(), row.session.project_id)?;
-    crate::hooks::install_git(
-        Path::new(&project.path),
-        &cwd,
-        &row.session.name,
-        ctx.instance(),
-        &relay_bin,
-    )
-    .bus()?;
-    // A plugin that is on brings its MCP servers to every agent of the project (D159).
-    let plugin_servers = crate::plugins::mcp_servers(ctx.tx(), row.session.project_id, &relay_bin).bus()?;
+    crate::hooks::install_git(&project_path, &cwd, &row.session.name, instance, &relay_bin).bus()?;
     if row.session.provider == Provider::Claude {
-        crate::hooks::install_claude(&cwd, ctx.instance(), &relay_bin).bus()?;
+        crate::hooks::install_claude(&cwd, instance, &relay_bin).bus()?;
         crate::hooks::add_claude_mcp_servers(&cwd, &plugin_servers).bus()?;
     } else if row.session.provider == Provider::Codex {
-        crate::hooks::install_codex(&cwd, ctx.instance(), &relay_bin).bus()?;
+        crate::hooks::install_codex(&cwd, instance, &relay_bin).bus()?;
     }
     // Every enabled skill becomes a real provider skill folder in this worktree, whatever
-    // project it belongs to (D147). A skill folder that cannot be written is never worth
-    // failing a launch over, so this reports and continues.
-    if let Err(error) =
-        crate::skills::materialize(ctx.tx(), &ctx.engine().store, &cwd, row.session.project_id)
-    {
-        tracing::warn!(session = %row.session.name, error = %error, "materializing skills");
+    // project it belongs to (D147); Codex reads skills only from its own home, so the machine
+    // folders are refreshed too. A skill folder that cannot be written is never worth failing
+    // a launch over, so this reports and continues.
+    for plan in &skills {
+        if let Err(error) = crate::skills::apply(plan, &engine.store) {
+            tracing::warn!(session = %row.session.name, error = %error, "materializing skills");
+        }
     }
-    // Codex reads skills only from its own home, so the checkout alone would leave a Codex
-    // session with nothing registered (D147).
-    if let Err(error) =
-        crate::skills::materialize_user(ctx.tx(), &ctx.engine().store, ctx.instance())
-    {
-        tracing::warn!(session = %row.session.name, error = %error, "materializing user skills");
-    }
-    // The brief is delivered on *every* spawn, not only with a dispatched task: an agent with
-    // no assignment is exactly the one that most needs to know who its peers are (D101). It
-    // travels inside the role instruction file because that is the channel both providers
-    // already read; the skills half stays on disk, referenced by path.
-    let brief = crate::awareness::brief(ctx.tx(), &row.session.name, Some(ctx.engine()))?;
     // The file lives inside the private worktree, so it may carry the launch assignment. The
     // injected copy may not: for Codex it ends up in argv, which anyone can read with `ps`.
-    let mut on_disk = brief.compact.clone();
+    let mut on_disk = brief_compact.clone();
     if let Some(assignment) = row
         .launch_prompt
         .as_deref()
@@ -403,13 +483,13 @@ fn launch(ctx: &mut Ctx, row: &Row_, kind: LaunchKind) -> Result<Session, BusErr
     write_session_file(
         &cwd,
         SESSION_SKILLS_PATH,
-        &brief.parts.skills,
+        &brief_skills,
         "session.brief_write_failed",
     )?;
     let instructions = format!(
         "{}\n\n{}",
         crate::providers::role_instructions(row.session.role),
-        brief.compact,
+        brief_compact,
     );
     write_session_file(
         &cwd,
@@ -421,14 +501,14 @@ fn launch(ctx: &mut Ctx, row: &Row_, kind: LaunchKind) -> Result<Session, BusErr
         LaunchKind::Fresh => crate::providers::driver(row.session.provider).args(
             &row.session,
             crate::providers::Launch::Fresh,
-            Some(&brief.compact),
+            Some(&brief_compact),
         ),
         LaunchKind::Resume => crate::providers::driver(row.session.provider).args(
             &row.session,
             crate::providers::Launch::Resume {
                 provider_ref: row.session.provider_ref.as_deref(),
             },
-            Some(&brief.compact),
+            Some(&brief_compact),
         ),
     };
     if row.session.provider == Provider::Codex {
@@ -440,49 +520,100 @@ fn launch(ctx: &mut Ctx, row: &Row_, kind: LaunchKind) -> Result<Session, BusErr
             args.extend(crate::providers::codex_mcp_config(name, command, server_args, env));
         }
     }
-    let cfg = crate::guardrail::config(ctx.tx(), Some(row.session.project_id))?;
-    for root in crate::guardrail::write_roots(&cfg, &cwd).into_iter().filter(|root| root != &cwd) {
+    for root in write_roots {
         // Provider directory grants need a real directory. Test engines never
         // create directories in the user's provider homes.
-        if ctx.instance() != crate::Instance::Test && !root.is_dir() {
+        if instance != crate::Instance::Test && !root.is_dir() {
             fs::create_dir_all(&root).map_err(|error| BusError::unavailable(
                 "session.write_root", format!("cannot prepare {}: {error}", root.display()),
             ))?;
         }
         args.extend(["--add-dir".into(), root.display().to_string()]);
     }
-    let initial_scrollback = match kind {
-        LaunchKind::Fresh => Vec::new(),
-        LaunchKind::Resume => sessions::load_scrollback(ctx.tx(), row.session.id)?
-            .map(|saved| saved.0.into_bytes())
-            .unwrap_or_default(),
-    };
-    let epoch = row.epoch + 1;
     let spec = SpawnSpec {
         cmd: cmd.display().to_string(),
         args,
         env: vec![
             ("RELAY_SESSION".into(), row.session.name.clone()),
             ("RELAY_TOKEN".into(), row.token.clone()),
-            ("RELAY_INSTANCE".into(), ctx.instance().as_str().to_string()),
+            ("RELAY_INSTANCE".into(), instance.as_str().to_string()),
             ("RELAY_PROJECT".into(), row.session.project_id.to_string()),
             ("RELAY_WORKTREE".into(), row.session.worktree.clone()),
             ("RELAY_BRIEF".into(), brief_path),
             ("RELAY_BIN".into(), relay_bin.display().to_string()),
             (
                 "RELAY_STORE".into(),
-                ctx.engine().store.path().display().to_string(),
+                engine.store.path().display().to_string(),
             ),
         ],
         cwd,
         cols: 120,
         rows: 40,
-        epoch,
+        epoch: row.epoch + 1,
         initial_scrollback,
     };
+    Ok(PreparedLaunch {
+        session_id: row.session.id,
+        name: row.session.name.clone(),
+        expect: row.session.state,
+        epoch: row.epoch,
+        kind,
+        launch_prompt: None,
+        clear: false,
+        spec,
+    })
+}
+
+/// Read and prepare a launch from the unlocked phase of a staged handler.
+fn stage_launch(
+    ctx: &crate::engine::Unlocked,
+    session: &str,
+    kind: LaunchKind,
+    check: impl FnOnce(&Row_) -> Result<(), BusError>,
+    adjust: impl FnOnce(&mut Row_),
+) -> Result<PreparedLaunch, BusError> {
+    let engine = ctx.engine();
+    let plan = ctx.read(|conn| {
+        let mut row = sessions::by_name(conn, session)?;
+        check(&row)?;
+        adjust(&mut row);
+        plan_launch(conn, engine, row, kind)
+    })?;
+    prepare_launch(engine, plan)
+}
+
+/// The locked half of a launch: recheck the row, start the PTY, record it. Short by design —
+/// everything slow already happened in [`prepare_launch`].
+fn finish_launch(ctx: &mut Ctx, prepared: PreparedLaunch) -> Result<Session, BusError> {
+    let PreparedLaunch { session_id: sid, name, expect, epoch: seen_epoch, kind, launch_prompt, clear, spec } = prepared;
+    let current = sessions::by_id(ctx.tx(), sid)?
+        .ok_or_else(|| BusError::not_found("session.not_found", format!("no session {name}")))?;
+    if current.session.state != expect || current.epoch != seen_epoch {
+        let state = sessions::state_str(current.session.state);
+        return Err(if sessions::is_live(current.session.state) {
+            BusError::conflict("session.already_spawned", format!("session {name} is {state}"))
+        } else {
+            BusError::conflict("session.state", format!("session {name} became {state} while it was launching"))
+        });
+    }
+    if let Some(launch_prompt) = launch_prompt {
+        ctx.tx().execute(
+            "UPDATE sessions SET launch_prompt=?1,updated_at=?2 WHERE id=?3",
+            params![launch_prompt, ctx.now, sid],
+        ).bus()?;
+    }
+    if clear {
+        // Unlike Resume, Clear must not pass the provider's saved conversation. Unlike Discard,
+        // it keeps the durable Relay session and worktree, then launches a new PTY epoch in place.
+        ctx.tx().execute(
+            "UPDATE sessions SET provider_ref=NULL,restore_reason=NULL,exit_code=NULL,updated_at=?1 WHERE id=?2",
+            params![ctx.now, sid],
+        ).bus()?;
+        ctx.tx().execute("DELETE FROM session_scrollback WHERE session_id=?1", [sid]).bus()?;
+    }
+    let epoch = spec.epoch;
     let engine = ctx.engine().arc().map(|engine| Arc::downgrade(&engine));
-    let sid = row.session.id;
-    let project_id = row.session.project_id;
+    let project_id = current.session.project_id;
     let req_id = ctx.req_id;
     let pty = Pty::spawn(spec, move |code| {
         let Some(engine) = engine.and_then(|weak| weak.upgrade()) else { return };
@@ -520,11 +651,13 @@ fn launch(ctx: &mut Ctx, row: &Row_, kind: LaunchKind) -> Result<Session, BusErr
          exit_code=NULL,restore_reason=NULL,done_pending_stop=NULL,updated_at=?3 WHERE id=?4",
         params![pty.pid() as i64, epoch as i64, ctx.now, sid],
     ).bus()?;
-    if let Some(old) = ctx.engine().set_pty(sid, &row.session.name, pty) {
-        old.kill(Duration::from_millis(500));
+    if let Some(old) = ctx.engine().set_pty(sid, &name, pty) {
+        kill_detached(old, Duration::from_millis(500));
     }
+    let updated =
+        sessions::by_id(ctx.tx(), sid)?.ok_or_else(|| BusError::internal("session vanished"))?;
     if matches!(kind, LaunchKind::Fresh) {
-        if let Some(prompt) = launch_nudge(row) {
+        if let Some(prompt) = launch_nudge(&updated) {
             ctx.after_commit(move |engine| {
                 if let Some(pty) = engine.pty(sid) {
                     if let Err(error) = pty.write(format!("{prompt}\r").as_bytes()) {
@@ -534,8 +667,6 @@ fn launch(ctx: &mut Ctx, row: &Row_, kind: LaunchKind) -> Result<Session, BusErr
             });
         }
     }
-    let updated =
-        sessions::by_id(ctx.tx(), sid)?.ok_or_else(|| BusError::internal("session vanished"))?;
     emit_session(ctx, &updated.session);
     Ok(updated.session)
 }
@@ -555,7 +686,10 @@ struct PreparedCreate {
     engine: std::sync::Weak<Engine>,
     name: String,
     project: relay_bus::types::Project,
-    worktree: Option<relay_bus::types::Worktree>,
+    /// The checkout the session will run in, resolved (and for "new", created) unlocked.
+    checkout: Option<(String, String)>,
+    /// Relay's commit hook was installed for `name` in that checkout before the row exists.
+    hooked: bool,
     /// Read once in the prepare phase, so both phases agree even if a plugin is switched
     /// meanwhile (D160).
     default_checkout: &'static str,
@@ -589,6 +723,81 @@ fn validate_create(conn: &Connection, p: &CreateIn) -> Result<relay_bus::types::
     Ok(project)
 }
 
+/// The PAIR partner a create joins, with every refusal that depends on it. Read-only, so the
+/// prepare phase can refuse a bad pairing before it touches the partner's checkout.
+fn validate_pair(conn: &Connection, p: &CreateIn, project_id: Id, name: &str) -> Result<Row_, BusError> {
+    let pair = sessions::by_name(conn, name)?;
+    if pair.session.project_id != project_id { return Err(BusError::invalid("session.pair_project", "PAIR sessions must belong to the same project")); }
+    if pair.session.pair_with.is_some() {
+        let role = p.role.unwrap_or(Role::Builder);
+        let (builders, reviewers): (i64, i64) = conn.query_row(
+            "SELECT COUNT(*) FILTER (WHERE role='builder'), COUNT(*) FILTER (WHERE role='reviewer') FROM sessions WHERE worktree=?1 AND state!='closed'",
+            [&pair.session.worktree], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).bus()?;
+        if role != Role::Builder || pair.session.role != Role::Reviewer || reviewers != 1 {
+            return Err(BusError::conflict("session.pair_exists", format!("session {name} is already paired")));
+        }
+        if builders >= 2 {
+            return Err(BusError::conflict("session.review_group_full", "one reviewer can supervise at most two builders"));
+        }
+    }
+    if p.branch.as_deref().is_some_and(|branch| branch != pair.session.branch) {
+        return Err(BusError::invalid("session.pair_branch", "PAIR sessions share one branch"));
+    }
+    if p.worktree.as_deref().is_some_and(|worktree| worktree != pair.session.worktree) {
+        return Err(BusError::invalid("session.pair_worktree", "omit worktree for a PAIR session; Relay reuses its partner's checkout"));
+    }
+    Ok(pair)
+}
+
+fn finish_create(ctx: &mut Ctx, p: &CreateIn, prepared: &mut PreparedCreate) -> Result<Session, BusError> {
+    // Recheck mutable records after the external work completes.
+    let project = validate_create(ctx.tx(), p)?;
+    if project.path != prepared.project.path || project.base_branch != prepared.project.base_branch {
+        return Err(BusError::conflict("session.project_changed",
+            "Project changed during creation; any created worktree is preserved"));
+    }
+    let pair = match p.pair_with.as_deref() {
+        Some(name) => Some(validate_pair(ctx.tx(), p, project.id, name)?),
+        None => None,
+    };
+    let name = prepared.name.clone();
+    let token = sessions::new_token();
+    let (worktree_path, branch) = prepared.checkout.take().ok_or_else(|| BusError::internal("checkout was not prepared"))?;
+    if let Some(pair) = &pair {
+        if worktree_path != pair.session.worktree {
+            return Err(BusError::invalid("session.pair_worktree", "PAIR sessions must share one worktree"));
+        }
+    }
+    ctx.tx().execute(
+        "INSERT INTO sessions(name, project_id, provider, role, model, effort, branch, worktree, task_id, module_id, pair_with,
+                              bus_writes, allow_ui, state, token, epoch, created_at, updated_at, launch_prompt)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'created', ?14, 0, ?15, ?15, ?16)",
+        params![name, project.id, sessions::provider_str(p.provider), sessions::role_str(p.role.unwrap_or(relay_bus::types::Role::Builder)),
+                p.model, p.effort, branch, worktree_path, p.task_id, p.module_id, p.pair_with,
+                p.bus_writes.unwrap_or(false) as i64, p.allow_ui.unwrap_or(false) as i64, token, ctx.now,
+                p.prompt.as_deref().filter(|prompt| !prompt.trim().is_empty())],
+    ).bus()?;
+    let id = ctx.tx().last_insert_rowid();
+    if let Some(pair) = &pair {
+        if pair.session.pair_with.is_none() {
+        ctx.tx().execute(
+            "UPDATE sessions SET pair_with=?1,updated_at=?2 WHERE id=?3",
+            params![name, ctx.now, pair.session.id],
+        ).bus()?;
+        }
+    }
+    if let Some(task_id) = p.task_id {
+        let ord: i64 = ctx.tx().query_row("SELECT COALESCE(MAX(ord), -1) + 1 FROM task_sessions WHERE task_id = ?1", [task_id], |r| r.get(0)).bus()?;
+        let queue_ord: i64 = ctx.tx().query_row("SELECT COALESCE(MAX(queue_ord), -1) + 1 FROM task_sessions WHERE session_id = ?1", [id], |r| r.get(0)).bus()?;
+        ctx.tx().execute("INSERT OR IGNORE INTO task_sessions(task_id, session_id, ord, queue_ord) VALUES (?1, ?2, ?3, ?4)", params![task_id, id, ord, queue_ord]).bus()?;
+    }
+    let row = sessions::by_id(ctx.tx(), id)?.ok_or_else(|| BusError::internal("session vanished"))?;
+    emit_session(ctx, &row.session);
+    ctx.emit("worktree.changed", json!({ "project_id": project.id }));
+    Ok(row.session)
+}
+
 pub fn register(e: &mut Engine) {
     e.register_staged::<Create, _>(|ctx, p| {
         let mut prepared = ctx.read(|conn| {
@@ -601,74 +810,38 @@ pub fn register(e: &mut Engine) {
                     || !reservations.insert(name.clone()) { continue; }
                 return Ok(PreparedCreate {
                     engine: Arc::downgrade(&ctx.engine().arc().ok_or_else(|| BusError::internal("engine unavailable"))?),
-                    name, project, worktree: None, default_checkout,
+                    name, project, checkout: None, hooked: false, default_checkout,
                 });
             }
             Err(BusError::conflict("session.names_busy", "Could not reserve a free session name"))
         })?;
-        // Fetch AND checkout can invoke slow network/LFS filters. Neither belongs
-        // under the global store mutex: existing sessions must remain responsive.
-        if p.pair_with.is_none() && p.worktree.as_deref().unwrap_or(prepared.default_checkout) == "new" {
-            let repo = Path::new(&prepared.project.path);
-            super::git::refresh_new_worktree(repo, p.branch.as_deref())?;
-            let branch = p.branch.clone().unwrap_or_else(|| worktree::branch_for(&prepared.name));
-            let path = worktree::pooled_path(repo, &prepared.name);
-            let from = if super::git::existing_worktree_branch(repo, Some(&branch))? {
-                None
-            } else {
-                super::git::new_worktree_base(repo, &prepared.project.base_branch)?
-            };
-            prepared.worktree = Some(worktree::create(repo, &path, &branch, from.as_deref())
-                .map_err(|e| BusError::conflict("worktree.create_failed", e.to_string()))?);
-        }
-        Ok(prepared)
-    }, |ctx: &mut Ctx, p, mut prepared| {
-        // Recheck mutable records after the external work completes.
-        let project = validate_create(ctx.tx(), &p)?;
-        if project.path != prepared.project.path || project.base_branch != prepared.project.base_branch {
-            return Err(BusError::conflict("session.project_changed",
-                "Project changed during creation; any created worktree is preserved"));
-        }
-        let pair = match p.pair_with.as_deref() {
-            Some(name) => {
-                let pair = sessions::by_name(ctx.tx(), name)?;
-                if pair.session.project_id != project.id { return Err(BusError::invalid("session.pair_project", "PAIR sessions must belong to the same project")); }
-                if pair.session.pair_with.is_some() {
-                    let role = p.role.unwrap_or(Role::Builder);
-                    let (builders, reviewers): (i64, i64) = ctx.tx().query_row(
-                        "SELECT COUNT(*) FILTER (WHERE role='builder'), COUNT(*) FILTER (WHERE role='reviewer') FROM sessions WHERE worktree=?1 AND state!='closed'",
-                        [&pair.session.worktree], |row| Ok((row.get(0)?, row.get(1)?)),
-                    ).bus()?;
-                    if role != Role::Builder || pair.session.role != Role::Reviewer || reviewers != 1 {
-                        return Err(BusError::conflict("session.pair_exists", format!("session {name} is already paired")));
-                    }
-                    if builders >= 2 {
-                        return Err(BusError::conflict("session.review_group_full", "one reviewer can supervise at most two builders"));
-                    }
-                }
-                if p.branch.as_deref().is_some_and(|branch| branch != pair.session.branch) {
-                    return Err(BusError::invalid("session.pair_branch", "PAIR sessions share one branch"));
-                }
-                if p.worktree.as_deref().is_some_and(|worktree| worktree != pair.session.worktree) {
-                    return Err(BusError::invalid("session.pair_worktree", "omit worktree for a PAIR session; Relay reuses its partner's checkout"));
-                }
-                Some(pair)
-            }
+        // A refused pairing is refused here, before anything touches the partner's checkout.
+        let pair_worktree = match p.pair_with.as_deref() {
+            Some(name) => Some(ctx.read(|conn| validate_pair(conn, p, prepared.project.id, name))?.session.worktree),
             None => None,
         };
-        let name = prepared.name.clone();
-        let token = sessions::new_token();
-        let repo = Path::new(&project.path);
-        let pair_worktree = pair.as_ref().map(|row| row.session.worktree.as_str());
-        let requested_worktree = p.worktree.as_deref().or(pair_worktree).unwrap_or(prepared.default_checkout);
-        let (worktree_path, branch) = match requested_worktree {
+        // Fetch, checkout, `git worktree list` and the hook install all shell out, and fetch and
+        // checkout can invoke slow network/LFS filters. None of it belongs under the global
+        // store mutex: existing sessions must remain responsive.
+        let repo = PathBuf::from(&prepared.project.path);
+        let requested = p.worktree.as_deref().or(pair_worktree.as_deref()).unwrap_or(prepared.default_checkout);
+        let (worktree_path, branch) = match requested {
             "primary" => {
-                let all = worktree::list_with_dirty(repo, false).bus()?;
+                let all = worktree::list_with_dirty(&repo, false).bus()?;
                 let primary = all.first().ok_or_else(|| BusError::internal("no primary worktree"))?;
                 (primary.path.clone(), primary.branch.clone())
             }
             "new" => {
-                let wt = prepared.worktree.take().ok_or_else(|| BusError::internal("checkout was not prepared"))?;
+                super::git::refresh_new_worktree(&repo, p.branch.as_deref())?;
+                let branch = p.branch.clone().unwrap_or_else(|| worktree::branch_for(&prepared.name));
+                let path = worktree::pooled_path(&repo, &prepared.name);
+                let from = if super::git::existing_worktree_branch(&repo, Some(&branch))? {
+                    None
+                } else {
+                    super::git::new_worktree_base(&repo, &prepared.project.base_branch)?
+                };
+                let wt = worktree::create(&repo, &path, &branch, from.as_deref())
+                    .map_err(|e| BusError::conflict("worktree.create_failed", e.to_string()))?;
                 (wt.path, wt.branch)
             }
             other => {
@@ -676,72 +849,38 @@ pub fn register(e: &mut Engine) {
                 if !path.is_absolute() || !path.join(".git").exists() {
                     return Err(BusError::invalid("session.worktree", format!("{other:?} is not an existing worktree path")));
                 }
-                let all = worktree::list_with_dirty(repo, false).bus()?;
+                let all = worktree::list_with_dirty(&repo, false).bus()?;
                 let want = std::fs::canonicalize(path).map(|p| p.display().to_string()).unwrap_or(other.to_string());
                 let wt = all.into_iter().find(|w| w.path == want)
                     .ok_or_else(|| BusError::invalid("session.worktree", format!("{other:?} is not a worktree of this project")))?;
                 (wt.path, wt.branch)
             }
         };
-        if let Some(pair) = &pair {
-            if worktree_path != pair.session.worktree {
-                return Err(BusError::invalid("session.pair_worktree", "PAIR sessions must share one worktree"));
+        crate::hooks::install_git(&repo, Path::new(&worktree_path), &prepared.name, ctx.instance(), &crate::hooks::relay_bin()).bus()?;
+        prepared.checkout = Some((worktree_path, branch));
+        prepared.hooked = true;
+        Ok(prepared)
+    }, |ctx: &mut Ctx, p, mut prepared| {
+        let checkout = prepared.checkout.clone();
+        let created = finish_create(ctx, &p, &mut prepared);
+        if created.is_err() && prepared.hooked && p.pair_with.is_none() {
+            // A create refused after its hook went in leaves the checkout's hook path as it found it.
+            if let Some((path, _)) = checkout {
+                let repo = Path::new(&prepared.project.path);
+                if let Err(error) = crate::hooks::uninstall_git(repo, Path::new(&path), &prepared.name) {
+                    tracing::warn!(session = %prepared.name, %error, "restoring hooks after a refused create");
+                }
+                crate::hooks::remove_hook_dir(repo, &prepared.name);
             }
         }
-        let relay_bin = crate::hooks::relay_bin();
-        crate::hooks::install_git(
-            repo,
-            Path::new(&worktree_path),
-            &name,
-            ctx.instance(),
-            &relay_bin,
-        ).bus()?;
-        ctx.tx().execute(
-            "INSERT INTO sessions(name, project_id, provider, role, model, effort, branch, worktree, task_id, module_id, pair_with,
-                                  bus_writes, allow_ui, state, token, epoch, created_at, updated_at, launch_prompt)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'created', ?14, 0, ?15, ?15, ?16)",
-            params![name, project.id, sessions::provider_str(p.provider), sessions::role_str(p.role.unwrap_or(relay_bus::types::Role::Builder)),
-                    p.model, p.effort, branch, worktree_path, p.task_id, p.module_id, p.pair_with,
-                    p.bus_writes.unwrap_or(false) as i64, p.allow_ui.unwrap_or(false) as i64, token, ctx.now,
-                    p.prompt.filter(|prompt| !prompt.trim().is_empty())],
-        ).bus()?;
-        let id = ctx.tx().last_insert_rowid();
-        if let Some(pair) = &pair {
-            if pair.session.pair_with.is_none() {
-            ctx.tx().execute(
-                "UPDATE sessions SET pair_with=?1,updated_at=?2 WHERE id=?3",
-                params![name, ctx.now, pair.session.id],
-            ).bus()?;
-            }
-        }
-        if let Some(task_id) = p.task_id {
-            let ord: i64 = ctx.tx().query_row("SELECT COALESCE(MAX(ord), -1) + 1 FROM task_sessions WHERE task_id = ?1", [task_id], |r| r.get(0)).bus()?;
-            let queue_ord: i64 = ctx.tx().query_row("SELECT COALESCE(MAX(queue_ord), -1) + 1 FROM task_sessions WHERE session_id = ?1", [id], |r| r.get(0)).bus()?;
-            ctx.tx().execute("INSERT OR IGNORE INTO task_sessions(task_id, session_id, ord, queue_ord) VALUES (?1, ?2, ?3, ?4)", params![task_id, id, ord, queue_ord]).bus()?;
-        }
-        let row = sessions::by_id(ctx.tx(), id)?.ok_or_else(|| BusError::internal("session vanished"))?;
-        emit_session(ctx, &row.session);
-        ctx.emit("worktree.changed", json!({ "project_id": project.id }));
-        Ok(row.session)
+        created
     });
 
-    e.register::<Spawn>(|ctx: &mut Ctx, p| {
-        let row = sessions::by_name(ctx.tx(), &p.session)?;
-        match row.session.state {
-            SessionState::Created => {
-                if let Some(prompt) = p.prompt {
-                    let launch_prompt = (!prompt.trim().is_empty()).then_some(prompt);
-                    ctx.tx()
-                        .execute(
-                            "UPDATE sessions SET launch_prompt=?1,updated_at=?2 WHERE id=?3",
-                            params![launch_prompt, ctx.now, row.session.id],
-                        )
-                        .bus()?;
-                }
-                let updated = sessions::by_id(ctx.tx(), row.session.id)?
-                    .ok_or_else(|| BusError::internal("session vanished"))?;
-                launch(ctx, &updated, LaunchKind::Fresh)
-            }
+    // Launches are staged (D149): the hooks, skill folders and brief files are written with
+    // the store unlocked, and only the PTY start and the row update hold it.
+    e.register_staged::<Spawn, _>(|ctx, p| {
+        let mut prepared = stage_launch(ctx, &p.session, LaunchKind::Fresh, |row| match row.session.state {
+            SessionState::Created => Ok(()),
             s if sessions::is_live(s) => Err(BusError::conflict(
                 "session.already_spawned",
                 format!("session {} is {}", row.session.name, sessions::state_str(s)),
@@ -754,74 +893,88 @@ pub fn register(e: &mut Engine) {
                     sessions::state_str(s)
                 ),
             )),
+        }, |row| {
+            if let Some(prompt) = &p.prompt {
+                row.launch_prompt = (!prompt.trim().is_empty()).then(|| prompt.clone());
+            }
+        })?;
+        if let Some(prompt) = &p.prompt {
+            prepared.launch_prompt = Some((!prompt.trim().is_empty()).then(|| prompt.clone()));
         }
-    });
+        Ok(prepared)
+    }, |ctx: &mut Ctx, _p, prepared| finish_launch(ctx, prepared));
 
-    e.register::<Resume>(|ctx: &mut Ctx, p| {
-        let row = sessions::by_name(ctx.tx(), &p.session)?;
-        if row.session.state != SessionState::Restorable {
-            return Err(BusError::conflict(
-                "session.state",
-                format!(
-                    "session {} is {}; only restorable sessions resume",
-                    row.session.name,
-                    sessions::state_str(row.session.state)
-                ),
-            ));
-        }
-        launch(ctx, &row, LaunchKind::Resume)
-    });
+    e.register_staged::<Resume, _>(|ctx, p| {
+        stage_launch(ctx, &p.session, LaunchKind::Resume, |row| {
+            if row.session.state != SessionState::Restorable {
+                return Err(BusError::conflict(
+                    "session.state",
+                    format!(
+                        "session {} is {}; only restorable sessions resume",
+                        row.session.name,
+                        sessions::state_str(row.session.state)
+                    ),
+                ));
+            }
+            Ok(())
+        }, |_| {})
+    }, |ctx: &mut Ctx, _p, prepared| finish_launch(ctx, prepared));
 
-    e.register::<ClearRestorable>(|ctx: &mut Ctx, p| {
-        let row = sessions::by_name(ctx.tx(), &p.session)?;
-        if row.session.state != SessionState::Restorable {
-            return Err(BusError::conflict("session.state", format!("session {} is not restorable", row.session.name)));
-        }
-        // Unlike Resume, Clear must not pass the provider's saved conversation. Unlike Discard,
-        // it keeps the durable Relay session and worktree, then launches a new PTY epoch in place.
-        ctx.tx().execute(
-            "UPDATE sessions SET provider_ref=NULL,restore_reason=NULL,exit_code=NULL,updated_at=?1 WHERE id=?2",
-            params![ctx.now, row.session.id],
-        ).bus()?;
-        ctx.tx().execute("DELETE FROM session_scrollback WHERE session_id=?1", [row.session.id]).bus()?;
-        let cleared = sessions::by_id(ctx.tx(), row.session.id)?
-            .ok_or_else(|| BusError::internal("session vanished"))?;
-        launch(ctx, &cleared, LaunchKind::Fresh)
-    });
+    e.register_staged::<ClearRestorable, _>(|ctx, p| {
+        let mut prepared = stage_launch(ctx, &p.session, LaunchKind::Fresh, |row| {
+            if row.session.state != SessionState::Restorable {
+                return Err(BusError::conflict("session.state", format!("session {} is not restorable", row.session.name)));
+            }
+            Ok(())
+        }, |row| row.session.provider_ref = None)?;
+        prepared.clear = true;
+        Ok(prepared)
+    }, |ctx: &mut Ctx, _p, prepared| finish_launch(ctx, prepared));
 
-    e.register::<Park>(|ctx: &mut Ctx, p| {
-        let row = sessions::by_name(ctx.tx(), &p.session)?;
+    // The child gets up to three seconds to exit, so it is stopped before the transaction
+    // opens. Its exit callback is silenced first: this request records the outcome, `parked`.
+    e.register_staged::<Park, _>(|ctx, p| {
+        let row = ctx.read(|conn| sessions::by_name(conn, &p.session))?;
         if !sessions::is_live(row.session.state) {
             return Err(BusError::conflict("session.state", format!("session {} is {}; only live sessions park", row.session.name, sessions::state_str(row.session.state))));
         }
         let pty = ctx.engine().take_pty(row.session.id)
             .ok_or_else(|| BusError::conflict("session.not_spawned", format!("session {} has no PTY", row.session.name)))?;
-        let (text, epoch, seq) = pty.scrollback(None);
-        sessions::save_scrollback(ctx.tx(), row.session.id, &text, epoch, seq, &ctx.now)?;
+        pty.silence_exit();
         pty.kill(Duration::from_secs(3));
+        let (text, epoch, seq) = pty.scrollback(None);
+        Ok((row.session.id, text, epoch, seq))
+    }, |ctx: &mut Ctx, p, (id, text, epoch, seq): (Id, String, u64, u64)| {
+        let row = sessions::by_id(ctx.tx(), id)?
+            .ok_or_else(|| BusError::not_found("session.not_found", format!("no session {}", p.session)))?;
+        if !sessions::is_live(row.session.state) {
+            return Err(BusError::conflict("session.state", format!("session {} became {} while it was parking", row.session.name, sessions::state_str(row.session.state))));
+        }
+        sessions::save_scrollback(ctx.tx(), id, &text, epoch, seq, &ctx.now)?;
         ctx.tx().execute(
             "UPDATE sessions SET state='parked',pid=NULL,restore_reason=NULL,updated_at=?1 WHERE id=?2",
-            params![ctx.now, row.session.id],
+            params![ctx.now, id],
         ).bus()?;
-        let updated = sessions::by_id(ctx.tx(), row.session.id)?.ok_or_else(|| BusError::internal("session vanished"))?;
+        let updated = sessions::by_id(ctx.tx(), id)?.ok_or_else(|| BusError::internal("session vanished"))?;
         emit_session(ctx, &updated.session);
         Ok(updated.session)
     });
 
-    e.register::<Wake>(|ctx: &mut Ctx, p| {
-        let row = sessions::by_name(ctx.tx(), &p.session)?;
-        if row.session.state != SessionState::Parked {
-            return Err(BusError::conflict(
-                "session.state",
-                format!(
-                    "session {} is {}; only parked sessions wake",
-                    row.session.name,
-                    sessions::state_str(row.session.state)
-                ),
-            ));
-        }
-        launch(ctx, &row, LaunchKind::Resume)
-    });
+    e.register_staged::<Wake, _>(|ctx, p| {
+        stage_launch(ctx, &p.session, LaunchKind::Resume, |row| {
+            if row.session.state != SessionState::Parked {
+                return Err(BusError::conflict(
+                    "session.state",
+                    format!(
+                        "session {} is {}; only parked sessions wake",
+                        row.session.name,
+                        sessions::state_str(row.session.state)
+                    ),
+                ));
+            }
+            Ok(())
+        }, |_| {})
+    }, |ctx: &mut Ctx, _p, prepared| finish_launch(ctx, prepared));
 
     e.register::<Get>(|ctx, p| {
         let row = sessions::by_name(ctx.tx(), &p.session)?;
@@ -1306,30 +1459,35 @@ pub fn register(e: &mut Engine) {
         Ok(RestorableOut { sessions: out })
     });
 
-    e.register::<DiscardRestorable>(|ctx: &mut Ctx, p| {
-        let row = sessions::by_name(ctx.tx(), &p.session)?;
+    // Both of these undo hooks and may delete a checkout: git subprocesses and a tree walk.
+    // That half runs before the transaction opens; the transaction only records the result.
+    e.register_staged::<DiscardRestorable, _>(|ctx, p| {
+        let (row, repo, teardown) = ctx.read(|conn| {
+            let row = sessions::by_name(conn, &p.session)?;
+            if row.session.state != SessionState::Restorable {
+                return Err(BusError::conflict("session.state", format!("session {} is not restorable", row.session.name)));
+            }
+            let project = crate::handlers::workspace::get_project(conn, row.session.project_id)?;
+            let other_sessions: i64 = conn.prepare_cached(
+                "SELECT COUNT(*) FROM sessions WHERE id!=?1 AND worktree=?2 AND state!='closed'",
+            ).bus()?.query_row(params![row.session.id, row.session.worktree], |r| r.get(0)).bus()?;
+            let teardown = if other_sessions == 0 { Some(read_teardown(conn, &row.session.worktree)?) } else { None };
+            Ok((row, PathBuf::from(project.path), teardown))
+        })?;
+        let wt = Path::new(&row.session.worktree);
+        if let Some(teardown) = &teardown {
+            run_teardown(&repo, wt, teardown)?;
+            if wt.starts_with(worktree::pool_dir(&repo)) {
+                worktree::remove(&repo, wt, true).map_err(|error| BusError::conflict("worktree.remove_failed", error.to_string()))?;
+            }
+        }
+        Ok(row.session.id)
+    }, |ctx: &mut Ctx, p, id: Id| {
+        let row = sessions::by_id(ctx.tx(), id)?
+            .ok_or_else(|| BusError::not_found("session.not_found", format!("no session {}", p.session)))?;
         let s = &row.session;
         if s.state != SessionState::Restorable {
             return Err(BusError::conflict("session.state", format!("session {} is not restorable", s.name)));
-        }
-        let project = crate::handlers::workspace::get_project(ctx.tx(), s.project_id)?;
-        let other_sessions: i64 = ctx.tx().query_row(
-            "SELECT COUNT(*) FROM sessions WHERE id!=?1 AND worktree=?2 AND state!='closed'",
-            params![s.id,s.worktree], |r| r.get(0),
-        ).bus()?;
-        let repo = Path::new(&project.path);
-        let wt = Path::new(&s.worktree);
-        if other_sessions == 0 {
-            uninstall_git_chain(ctx.tx(), repo, wt)?;
-            if ctx.tx().query_row("SELECT EXISTS(SELECT 1 FROM sessions WHERE worktree=?1 AND provider='claude')", [&s.worktree], |r| r.get::<_,bool>(0)).bus()? {
-                crate::hooks::uninstall_claude(wt).bus()?;
-            }
-            if ctx.tx().query_row("SELECT EXISTS(SELECT 1 FROM sessions WHERE worktree=?1 AND provider='codex')", [&s.worktree], |r| r.get::<_,bool>(0)).bus()? {
-                crate::hooks::uninstall_codex(wt).bus()?;
-            }
-            if wt.starts_with(worktree::pool_dir(repo)) {
-                worktree::remove(repo, wt, true).map_err(|error| BusError::conflict("worktree.remove_failed", error.to_string()))?;
-            }
         }
         ctx.tx().execute("UPDATE sessions SET state='closed',pid=NULL,closed_at=?1,updated_at=?1 WHERE id=?2", params![ctx.now,s.id]).bus()?;
         release_claims(ctx, s)?;
@@ -1341,61 +1499,56 @@ pub fn register(e: &mut Engine) {
         Ok(Empty {})
     });
 
-    e.register::<Close>(|ctx: &mut Ctx, p| {
-        let row = sessions::by_name(ctx.tx(), &p.session)?;
-        let s = &row.session;
-        let project = crate::handlers::workspace::get_project(ctx.tx(), s.project_id)?;
-        let pair_live: bool = ctx.tx().query_row(
-            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id!=?1 AND worktree=?2 AND state!='closed')",
-            params![s.id, s.worktree], |row| row.get(0),
-        ).bus()?;
-        if pair_live && p.remove_worktree.unwrap_or(true) {
-            return Err(BusError::conflict("session.pair_live", "close the PAIR partner first or pass remove_worktree:false"));
-        }
-        if let Some(pty) = ctx.engine().take_pty(s.id) {
-            let (text, epoch, seq) = pty.scrollback(None);
-            sessions::save_scrollback(ctx.tx(), s.id, &text, epoch, seq, &ctx.now)?;
-            if p.remove_worktree.unwrap_or(true) {
-                // Stop writers before deleting their checkout, with a bounded grace period.
-                pty.kill(Duration::from_millis(150));
-            } else {
-                // Provider shutdown hooks may need the bus. Let them run after the
-                // transaction unlocks instead of waiting on them while holding it.
-                ctx.after_commit(move |_| pty.kill(Duration::from_millis(150)));
+    // Closing what the shell closes (remove_worktree:false) holds the store for a few row
+    // updates and answers at once: the child is killed on its own thread after the commit.
+    // Removing the checkout stops the child first, with the store unlocked, and the exit
+    // callback silenced so the row goes straight to `closed`.
+    e.register_staged::<Close, _>(|ctx, p| {
+        let remove = p.remove_worktree.unwrap_or(true);
+        let (row, repo, teardown) = ctx.read(|conn| {
+            let row = sessions::by_name(conn, &p.session)?;
+            let s = &row.session;
+            let project = crate::handlers::workspace::get_project(conn, s.project_id)?;
+            let others: i64 = conn.prepare_cached(
+                "SELECT COUNT(*) FROM sessions WHERE id!=?1 AND worktree=?2 AND state!='closed'",
+            ).bus()?.query_row(params![s.id, s.worktree], |row| row.get(0)).bus()?;
+            if others > 0 && remove {
+                return Err(BusError::conflict("session.pair_live", "close the PAIR partner first or pass remove_worktree:false"));
             }
+            let teardown = if others == 0 { Some(read_teardown(conn, &s.worktree)?) } else { None };
+            Ok((row, PathBuf::from(project.path), teardown))
+        })?;
+        let s = &row.session;
+        if remove {
+            // Stop writers before deleting their checkout, with a bounded grace period.
+            if let Some(pty) = ctx.engine().take_pty(s.id) {
+                pty.silence_exit();
+                pty.kill(Duration::from_millis(150));
+            }
+        }
+        let wt = Path::new(&s.worktree);
+        if let Some(teardown) = &teardown {
+            run_teardown(&repo, wt, teardown)?;
         }
         let mut freed = 0u64;
-        let repo = Path::new(&project.path);
-        let wt = Path::new(&s.worktree);
-        let other_sessions: i64 = ctx.tx().query_row(
-            "SELECT COUNT(*) FROM sessions WHERE id!=?1 AND worktree=?2 AND state!='closed'",
-            params![s.id, s.worktree], |row| row.get(0),
-        ).bus()?;
-        if other_sessions == 0 {
-            uninstall_git_chain(ctx.tx(), repo, wt)?;
-            let any_claude: bool = ctx.tx().query_row(
-                "SELECT EXISTS(SELECT 1 FROM sessions WHERE worktree=?1 AND provider='claude')",
-                [&s.worktree], |row| row.get(0),
-            ).bus()?;
-            if any_claude {
-                crate::hooks::uninstall_claude(wt).bus()?;
-            }
-            let any_codex: bool = ctx.tx().query_row(
-                "SELECT EXISTS(SELECT 1 FROM sessions WHERE worktree=?1 AND provider='codex')",
-                [&s.worktree], |row| row.get(0),
-            ).bus()?;
-            if any_codex {
-                crate::hooks::uninstall_codex(wt).bus()?;
-            }
-        }
-        let pooled = wt.starts_with(worktree::pool_dir(repo));
-        if pooled && p.remove_worktree.unwrap_or(true) {
-            freed = worktree::remove(repo, wt, p.purge_build.unwrap_or(true))
+        if remove && wt.starts_with(worktree::pool_dir(&repo)) {
+            freed = worktree::remove(&repo, wt, p.purge_build.unwrap_or(true))
                 .map_err(|e| BusError::conflict("worktree.remove_failed", e.to_string()))?;
         }
         // The generated hook directory outlives nothing: leaving one per dead session behind
         // makes `.relay/hooks` read like a fleet that never shut down.
-        crate::hooks::remove_hook_dir(repo, &s.name);
+        crate::hooks::remove_hook_dir(&repo, &s.name);
+        Ok((s.id, freed))
+    }, |ctx: &mut Ctx, p, (id, freed): (Id, u64)| {
+        let row = sessions::by_id(ctx.tx(), id)?
+            .ok_or_else(|| BusError::not_found("session.not_found", format!("no session {}", p.session)))?;
+        let s = &row.session;
+        if let Some(pty) = ctx.engine().take_pty(s.id) {
+            // Provider shutdown hooks may need the bus, and the grace period is the child's to
+            // spend: neither is worth a request, let alone the store lock. The row is `closed`
+            // by the time the child exits, so its exit callback changes nothing.
+            ctx.after_commit(move |_| kill_detached(pty, Duration::from_millis(150)));
+        }
         ctx.tx().execute("UPDATE sessions SET state = 'closed', pid = NULL, closed_at = ?1, updated_at = ?1 WHERE id = ?2", params![ctx.now, s.id]).bus()?;
         ctx.tx().execute("UPDATE sessions SET pair_with=NULL,updated_at=?1 WHERE pair_with=?2 AND state!='closed'", params![ctx.now, s.name]).bus()?;
         ctx.tx().execute("DELETE FROM session_scrollback WHERE session_id=?1", [s.id]).bus()?;
@@ -1414,7 +1567,7 @@ pub fn register(e: &mut Engine) {
                 "count": expired,
             }));
         }
-        ctx.emit("worktree.changed", json!({ "project_id": project.id }));
+        ctx.emit("worktree.changed", json!({ "project_id": s.project_id }));
         Ok(CloseOut { freed_mb: freed as f64 / (1024.0 * 1024.0) })
     });
 
