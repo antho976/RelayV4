@@ -78,6 +78,59 @@ pub fn image_with_stroke(name: &str, size: i32, stroke: f64) -> gtk::Image {
         "folder-open" => {
             r##"<path d="M2 4h4l1.5 1.5H13V7" /><path d="M2 13l1.5-5.5H15L13.5 13z" />"##
         }
+        // File-type glyphs for the explorer and the Git panel; the tint comes from a CSS class.
+        "file-rust" => {
+            r##"<circle cx="8" cy="8" r="3.75" /><circle cx="8" cy="8" r="1.25" /><path d="M8 1.75v2.5M8 11.75v2.5M1.75 8h2.5M11.75 8h2.5M3.6 3.6l1.75 1.75M10.65 10.65l1.75 1.75M3.6 12.4l1.75-1.75M10.65 5.35l1.75-1.75" />"##
+        }
+        "file-ts" => {
+            r##"<rect x="2.25" y="2.25" width="11.5" height="11.5" rx="1.5" /><path d="M4.75 7h3.5M6.5 7v4.5M12 7.5a1.4 1.4 0 0 0-1.3-.5c-.8 0-1.3.4-1.3 1s.5.9 1.3 1.1 1.3.5 1.3 1.1-.5 1.05-1.3 1.05a1.6 1.6 0 0 1-1.45-.65" />"##
+        }
+        "file-js" => {
+            r##"<rect x="2.25" y="2.25" width="11.5" height="11.5" rx="1.5" /><path d="M7.25 6.75v3.5a1.25 1.25 0 0 1-2.4.5M12 7.5a1.4 1.4 0 0 0-1.3-.5c-.8 0-1.3.4-1.3 1s.5.9 1.3 1.1 1.3.5 1.3 1.1-.5 1.05-1.3 1.05a1.6 1.6 0 0 1-1.45-.65" />"##
+        }
+        "file-react" => {
+            r##"<ellipse cx="8" cy="8" rx="6.25" ry="2.4" /><ellipse cx="8" cy="8" rx="6.25" ry="2.4" transform="rotate(60 8 8)" /><ellipse cx="8" cy="8" rx="6.25" ry="2.4" transform="rotate(120 8 8)" /><circle cx="8" cy="8" r=".9" fill="currentColor" stroke="none" />"##
+        }
+        "file-json" => {
+            r##"<path d="M5.5 2.5c-1.5 0-1.75.9-1.75 2.25S3.5 7.6 2.25 8c1.25.4 1.5 1.9 1.5 3.25S4 13.5 5.5 13.5M10.5 2.5c1.5 0 1.75.9 1.75 2.25S12.5 7.6 13.75 8c-1.25.4-1.5 1.9-1.5 3.25S12 13.5 10.5 13.5" />"##
+        }
+        "file-md" => {
+            r##"<rect x="1.5" y="3.5" width="13" height="9" rx="1.5" /><path d="M4 10.25v-4.5l2 2.25 2-2.25v4.5M11 5.75v4.5M9.5 8.75L11 10.25l1.5-1.5" />"##
+        }
+        "file-config" => {
+            r##"<path d="M2.5 4.5h3M9.5 4.5h4M2.5 8h7M13 8h.5M2.5 11.5h1.5M7.5 11.5h6" /><circle cx="7.5" cy="4.5" r="1.5" /><circle cx="11.25" cy="8" r="1.5" /><circle cx="5.75" cy="11.5" r="1.5" />"##
+        }
+        "file-css" => r##"<path d="M6.5 2.5L5 13.5M11.5 2.5L10 13.5M3 6h10.5M2.5 10H13" />"##,
+        "file-html" => r##"<path d="M5.5 4L2 8l3.5 4M10.5 4L14 8l-3.5 4M9 3l-2 10" />"##,
+        "file-py" => {
+            r##"<path d="M8 2.25H6.75A2 2 0 0 0 4.75 4.25V6h4.5M4.75 6h-.5A2 2 0 0 0 2.25 8v1.25a2 2 0 0 0 2 2H5.5V9.5a1.5 1.5 0 0 1 1.5-1.5h2.25a1.5 1.5 0 0 0 1.5-1.5V4.25a2 2 0 0 0-2-2H8" /><path d="M8 13.75h1.25a2 2 0 0 0 2-2V10h-4.5M11.25 10h.5a2 2 0 0 0 2-2V6.75a2 2 0 0 0-2-2H10.5" /><circle cx="6.75" cy="4" r=".6" fill="currentColor" stroke="none" /><circle cx="9.25" cy="12" r=".6" fill="currentColor" stroke="none" />"##
+        }
+        "file-image" => {
+            r##"<rect x="2" y="2.75" width="12" height="10.5" rx="1.5" /><circle cx="5.75" cy="6.25" r="1.25" /><path d="M2.5 12.25L6.25 8.5l2.5 2.5 2-2 3 3" />"##
+        }
+        "file-lock" => {
+            r##"<rect x="3.25" y="7" width="9.5" height="7" rx="1.25" /><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2M8 9.75v1.5" />"##
+        }
+        "file-shell" => {
+            r##"<rect x="1.75" y="2.75" width="12.5" height="10.5" rx="1.5" /><path d="M4.5 6.25L6.75 8 4.5 9.75M8.5 10.25h3" />"##
+        }
+        "file-git" => {
+            r##"<path d="M8 1.75L14.25 8 8 14.25 1.75 8z" /><circle cx="6.5" cy="6.5" r="1" /><circle cx="9.5" cy="9.5" r="1" /><path d="M7.2 7.2l1.6 1.6M6.5 7.5v3" />"##
+        }
+        "file-text" => {
+            r##"<path d="M4 2h5l3 3v9H4z" /><path d="M9 2v3h3M6 8.25h4M6 10.75h4" />"##
+        }
+        "file-plus" => r##"<path d="M9 2H4v12h5M9 2l3 3v2.5M9 2v3h3" /><path d="M12 10v4M10 12h4" />"##,
+        "folder-plus" => {
+            r##"<path d="M8.5 13H2V4h4l1.5 1.5H14V8.5" /><path d="M12 10v4M10 12h4" />"##
+        }
+        "collapse" => r##"<path d="M5 2.5l3 3 3-3M5 13.5l3-3 3 3M2.5 8h11" />"##,
+        "arrow-up" => r##"<path d="M8 13V3M4 7l4-4 4 4" />"##,
+        "arrow-down" => r##"<path d="M8 3v10M4 9l4 4 4-4" />"##,
+        "cloud" => {
+            r##"<path d="M4.5 12.5a3 3 0 0 1-.4-6A4 4 0 0 1 11.8 5.6 3.5 3.5 0 0 1 11.5 12.5z" />"##
+        }
+        "minus" => r##"<path d="M3 8h10" />"##,
         "chevron-down" => r##"<path d="M4 6l4 4 4-4" />"##,
         "chevron-right" => r##"<path d="M6 4l4 4-4 4" />"##,
         "chevron-left" => r##"<path d="M10 4L6 8l4 4" />"##,

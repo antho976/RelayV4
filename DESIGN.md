@@ -213,7 +213,10 @@ neutral wash for selection. GTK owns window controls and menus.
 `apps/relay-native/src/icons.rs` carries the pinned Relay-2 SVG path geometry.
 Shared shell/action icons use a 16-unit view box, 1.5-unit strokes and rounded
 stroke caps and joins, rendered by GTK's SVG paintable. Preserve that geometry
-when adding native controls. Native widget fallback icons remain GTK-owned;
+when adding native controls. File-type glyphs in the explorer and Git panel are the
+one exception to neutral chrome: like syntax colour, they describe content, so each
+carries a muted per-language tint (`css/git_files.css`), and Git status letters use
+VS Code's status colours. Native widget fallback icons remain GTK-owned;
 matching path geometry alone is not proof of complete rendering fidelity.
 
 ### Records / Containers
