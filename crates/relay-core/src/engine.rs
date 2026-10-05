@@ -893,6 +893,11 @@ impl Engine {
                 return Ok(Response::ok(req.id, result));
             }
         }
+        // A mirror touch-move is the same kind of request: one per pointer event, felt as lag,
+        // and `UserOnly` with `Audit::Never` — so nothing is left to persist here either.
+        if entry.name == "device.mirror.input" && !audited && session_id.is_none() {
+            return self.mirror_fast_path(&req.payload).map(|result| Response::ok(req.id, result));
+        }
         // Slow reads run with nothing locked (D149). Queries are never audited, so there is no
         // row to append and no transaction to keep open across an `adb`, `gh` or `gix` call.
         if let Some(h) = self.unlocked.get(entry.name).cloned() {
@@ -1231,6 +1236,17 @@ impl Engine {
                     return false;
                 }
             }
+            // One control message to the device. Text and clipboard payloads can be large
+            // enough to block on a full socket, so only the pointer/key events stay inline.
+            "device.mirror.input" => {
+                let inline = !req.payload["event"]["type"]
+                    .as_str()
+                    .is_some_and(|kind| matches!(kind, "text" | "setclipboard"));
+                return inline
+                    && req.payload["mirror_id"]
+                        .as_i64()
+                        .is_some_and(|id| self.mirrors.lock().unwrap().contains_key(&id));
+            }
             _ => return false,
         }
         req.payload
@@ -1281,6 +1297,17 @@ impl Engine {
             _ => return Ok(None),
         }
         Ok(Some(json!({})))
+    }
+
+    /// `device.mirror.input` with no store lock and no transaction: a map lookup, an encode and
+    /// one write to the device's control socket. The mirror registry is memory-only, so unlike
+    /// the PTY path there is nothing to fall through to — an unknown id is answered here too.
+    fn mirror_fast_path(&self, payload: &Value) -> Result<Value, BusError> {
+        let p: relay_bus::ops::device::MirrorInputIn = serde_json::from_value(payload.clone())
+            .map_err(|e| BusError::schema("device.mirror.input", e))?;
+        let runtime = crate::handlers::device::mirror_by_id(self, p.mirror_id)?;
+        crate::handlers::device::send_input(&runtime, &p.event)?;
+        Ok(json!({}))
     }
 
     /// The deferred half of the input fast path: move an idle session back to `running` and tell

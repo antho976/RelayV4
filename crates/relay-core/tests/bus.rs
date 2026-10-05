@@ -1085,11 +1085,18 @@ async fn native_mirror_socket_stream_and_disconnect_cleanup() {
     let id = result["mirror_id"].as_i64().unwrap();
     let runtime = relay_core::handlers::device::mirror_by_id(&e, id).unwrap();
     runtime.push(vec![3, 0, 0, 0, 1, 7]);
-    let frame = tokio::time::timeout(Duration::from_secs(2), client.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    // The stream opens with the mirror's status (an object); video packets are strings.
+    let frame = loop {
+        let frame = tokio::time::timeout(Duration::from_secs(2), client.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        match &frame {
+            Line::Frame(f) if f.data.is_object() => assert_eq!(f.data["state"], "starting"),
+            _ => break frame,
+        }
+    };
     match frame {
         Line::Frame(frame) => {
             assert_eq!(frame.stream, "mirror");

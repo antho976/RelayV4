@@ -1,7 +1,7 @@
 //! `device.*` (phase 10): request-driven ADB discovery, H.264 mirrors, Gradle deploys,
 //! and bounded logcat streams. Nothing starts until a bus op asks for it.
 
-use crate::device::{mirror_server_path, DeviceWatchRuntime, MirrorRuntime, MirrorRuntimeConfig, RunRuntime};
+use crate::device::{mirror_server_path, DeviceWatchRuntime, MirrorRuntime, MirrorRuntimeConfig, MirrorState, RunRuntime};
 use crate::engine::{Ctx, Engine, IntoBus};
 use crate::handlers::workspace::get_project;
 use crate::mirror;
@@ -62,16 +62,20 @@ pub fn register(e: &mut Engine) {
         Ok(Empty {})
     });
 
-    e.register::<MirrorStart>(|ctx: &mut Ctx, p| {
-        let adb = adb_path(ctx.tx())?;
+    // `adb devices` and `wm size` are two subprocesses, seconds when the adb server is cold;
+    // both run in the prepare phase with nothing locked, each under a deadline (D149).
+    e.register_staged::<MirrorStart, _>(|ctx, p| {
+        let adb = ctx.read(adb_path)?;
         let device = require_device(&adb, &p.device)?;
         if device.state != "device" {
             return Err(BusError::unavailable("device.not_ready", format!("{} is {}", device.model, device.state)));
         }
+        let (physical_width, physical_height) = device_size(&adb, &p.device)?;
+        Ok((adb, physical_width, physical_height))
+    }, |ctx: &mut Ctx, p, (adb, physical_width, physical_height)| {
         let max_size = mirror::capture_size_for(p.max_size.unwrap_or(mirror::CAPTURE_MIN));
         let bitrate = p.bitrate.unwrap_or_else(|| mirror::capture_bit_rate(max_size)).clamp(500_000, 50_000_000);
-        let (physical_width, physical_height) = device_size(&adb, &p.device)?;
-        let (width, height) = fit_size(physical_width, physical_height, max_size);
+        let (width, height) = mirror::fit_size(physical_width, physical_height, max_size);
         let id = ctx.engine().next_mirror.fetch_add(1, Ordering::SeqCst);
         let scid = new_scid(id);
         if ctx.engine().instance != Instance::Test && mirror_server_path().is_none() {
@@ -111,6 +115,7 @@ pub fn register(e: &mut Engine) {
                 )
             })?;
         runtime.stop();
+        runtime.finish(MirrorState::Stopped, None, None);
         ctx.emit(
             "mirror.changed",
             json!({"mirror_id":p.mirror_id,"device":runtime.device,"state":"stopped"}),
@@ -118,20 +123,11 @@ pub fn register(e: &mut Engine) {
         Ok(Empty {})
     });
 
+    // The engine answers this from memory before it gets here (`Engine::mirror_fast_path`);
+    // this handler is the fallback for the cases that path declines — an audited or
+    // session-bound caller — and it touches nothing in the store either.
     e.register::<MirrorInput>(|ctx, p| {
-        let runtime = ctx
-            .engine()
-            .mirrors
-            .lock()
-            .unwrap()
-            .get(&p.mirror_id)
-            .cloned()
-            .ok_or_else(|| {
-                BusError::not_found(
-                    "device.mirror_not_found",
-                    format!("no mirror {}", p.mirror_id),
-                )
-            })?;
+        let runtime = mirror_by_id(ctx.engine(), p.mirror_id)?;
         send_input(&runtime, &p.event)?;
         Ok(Empty {})
     });
@@ -615,11 +611,20 @@ fn require_device(adb: &Path, serial: &str) -> Result<Device, BusError> {
         })
 }
 
+const ADB_SIZE_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn device_size(adb: &Path, serial: &str) -> Result<(u32, u32), BusError> {
-    let output = Command::new(adb)
-        .args(["-s", serial, "shell", "wm", "size"])
-        .output()
-        .map_err(|e| BusError::unavailable("device.size_failed", e.to_string()))?;
+    let mut command = Command::new(adb);
+    command.args(["-s", serial, "shell", "wm", "size"]);
+    let output = crate::proc::output_with_timeout(&mut command, ADB_SIZE_TIMEOUT)
+        .map_err(|e| BusError::unavailable("device.size_failed", e.to_string()))?
+        .ok_or_else(|| {
+            BusError::unavailable(
+                "device.size_timeout",
+                format!("`adb shell wm size` did not answer within {}s", ADB_SIZE_TIMEOUT.as_secs()),
+            )
+            .with_hint("the device may be locked up or still booting; replug it and try again")
+        })?;
     if !output.status.success() {
         return Err(BusError::unavailable(
             "device.size_failed",
@@ -640,18 +645,6 @@ fn device_size(adb: &Path, serial: &str) -> Result<(u32, u32), BusError> {
         })
 }
 
-fn fit_size(width: u32, height: u32, max_size: u32) -> (u32, u32) {
-    let longest = width.max(height);
-    if longest <= max_size {
-        return (width & !1, height & !1);
-    }
-    let scale = max_size as f64 / longest as f64;
-    (
-        ((width as f64 * scale).round() as u32) & !1,
-        ((height as f64 * scale).round() as u32) & !1,
-    )
-}
-
 fn new_scid(id: Id) -> u32 {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -660,11 +653,14 @@ fn new_scid(id: Id) -> u32 {
     ((nanos ^ std::process::id().rotate_left(16) ^ (id as u32).rotate_left(7)) & 0x7fff_ffff).max(1)
 }
 
-fn mirror_adb(runtime: &MirrorRuntime, args: Vec<String>) -> Result<String, String> {
-    let output = Command::new(&runtime.adb)
-        .args(&args)
-        .output()
-        .map_err(|error| format!("adb: {error}"))?;
+/// One short adb step of a mirror's setup or teardown, under a deadline. The worker is off the
+/// bus, but a push that never returns would still leave the window on "Connecting" forever.
+fn mirror_adb(runtime: &MirrorRuntime, args: Vec<String>, timeout: Duration) -> Result<String, String> {
+    let mut command = Command::new(&runtime.adb);
+    command.args(&args);
+    let output = crate::proc::output_with_timeout(&mut command, timeout)
+        .map_err(|error| format!("adb: {error}"))?
+        .ok_or_else(|| format!("adb {} did not finish within {}s", args.join(" "), timeout.as_secs()))?;
     if !output.status.success() {
         return Err(format!(
             "adb {} failed: {}",
@@ -705,35 +701,65 @@ fn drain_server_lines(pipe: Option<impl Read + Send + 'static>, ring: Arc<Mutex<
     });
 }
 
-fn mirror_failure(engine: &Engine, runtime: &MirrorRuntime, code: &str, message: String) {
+const MIRROR_PUSH_TIMEOUT: Duration = Duration::from_secs(60);
+const MIRROR_FORWARD_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the server gets between the handshake and its first session packet. An encoder
+/// that never starts is a failure to report, not a window to leave on "Connecting".
+const MIRROR_FIRST_UNIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Report a mirror that ended without being asked to: the `mirror.changed` event for every
+/// listener, and the runtime's terminal status, which is what the socket door forwards to
+/// the window that owns it — the window does not have to be subscribed to anything.
+fn mirror_failure(engine: &Engine, runtime: &MirrorRuntime, state: MirrorState, code: &str, message: String) {
+    if !runtime.finish(state, Some(code.to_string()), Some(message.clone())) {
+        return;
+    }
+    let state = if state == MirrorState::Lost { "lost" } else { "failed" };
     engine.emit_system(
         "mirror.changed",
-        json!({"mirror_id":runtime.id,"device":runtime.device,"state":"failed","code":code,"message":message}),
+        json!({"mirror_id":runtime.id,"device":runtime.device,"state":state,"code":code,"message":message}),
     );
 }
 
-fn mirror_worker(engine: Arc<Engine>, runtime: Arc<MirrorRuntime>) {
-    let Some(server_jar) = mirror_server_path() else {
-        mirror_failure(&engine, &runtime, "device.mirror_server_missing", "the bundled scrcpy server is missing".into());
+/// Whether adb still sees the device. Asked once, after the stream broke, to tell "unplugged"
+/// from "the server died" — the two need different words and a different next step.
+fn device_present(runtime: &MirrorRuntime) -> bool {
+    mirror_adb(runtime, vec!["-s".into(), runtime.device.clone(), "get-state".into()], Duration::from_secs(3))
+        .is_ok_and(|state| state.trim() == "device")
+}
+
+/// The transport half of a mirror: push, forward, boot the server, pump the stream, and on the
+/// way out report how it ended. Public so the integration tests can drive it against a fake
+/// adb and a fake server; the engine itself only ever starts it from `device.mirror.start`.
+#[doc(hidden)]
+pub fn mirror_worker(engine: Arc<Engine>, runtime: Arc<MirrorRuntime>) {
+    let fail = |code: &str, message: String| {
+        mirror_failure(&engine, &runtime, MirrorState::Failed, code, message);
         engine.mirrors.lock().unwrap().remove(&runtime.id);
+    };
+    let Some(server_jar) = mirror_server_path() else {
+        fail("device.mirror_server_missing", "the bundled scrcpy server is missing".into());
         return;
     };
 
-    if let Err(error) = mirror_adb(&runtime, mirror::push_args(&runtime.device, &server_jar.to_string_lossy())) {
-        mirror_failure(&engine, &runtime, "device.mirror_push_failed", error);
-        engine.mirrors.lock().unwrap().remove(&runtime.id);
+    if let Err(error) = mirror_adb(&runtime, mirror::push_args(&runtime.device, &server_jar.to_string_lossy()), MIRROR_PUSH_TIMEOUT) {
+        fail("device.mirror_push_failed", error);
         return;
     }
-    let port = match mirror_adb(&runtime, mirror::forward_args(&runtime.device, runtime.scid))
+    let port = match mirror_adb(&runtime, mirror::forward_args(&runtime.device, runtime.scid), MIRROR_FORWARD_TIMEOUT)
         .and_then(|value| value.trim().parse::<u16>().map_err(|_| format!("adb forward returned no port ({value:?})")))
     {
         Ok(port) => port,
         Err(error) => {
-            mirror_failure(&engine, &runtime, "device.mirror_forward_failed", error);
-            engine.mirrors.lock().unwrap().remove(&runtime.id);
+            fail("device.mirror_forward_failed", error);
             return;
         }
     };
+    if runtime.stopped() {
+        let _ = mirror_adb(&runtime, mirror::forward_remove_args(&runtime.device, runtime.scid), MIRROR_FORWARD_TIMEOUT);
+        engine.mirrors.lock().unwrap().remove(&runtime.id);
+        return;
+    }
 
     let mut options = mirror::MirrorOptions::for_capture(runtime.max_size);
     options.video_bit_rate = runtime.bitrate;
@@ -746,9 +772,8 @@ fn mirror_worker(engine: Arc<Engine>, runtime: Arc<MirrorRuntime>) {
     let mut server = match command.spawn() {
         Ok(server) => server,
         Err(error) => {
-            let _ = mirror_adb(&runtime, mirror::forward_remove_args(&runtime.device, runtime.scid));
-            mirror_failure(&engine, &runtime, "device.mirror_spawn_failed", error.to_string());
-            engine.mirrors.lock().unwrap().remove(&runtime.id);
+            let _ = mirror_adb(&runtime, mirror::forward_remove_args(&runtime.device, runtime.scid), MIRROR_FORWARD_TIMEOUT);
+            fail("device.mirror_spawn_failed", error.to_string());
             return;
         }
     };
@@ -769,6 +794,8 @@ fn mirror_worker(engine: Arc<Engine>, runtime: Arc<MirrorRuntime>) {
         if mirror::parse_codec_id(&codec) != mirror::CODEC_ID_H264 {
             return Err("mirror device did not provide H.264 video".into());
         }
+        let _ = video.set_nodelay(true);
+        let _ = control.set_nodelay(true);
         let keepalive = video.try_clone().map_err(|error| error.to_string())?;
         let mut drain = control.try_clone().map_err(|error| error.to_string())?;
         runtime.set_video(keepalive);
@@ -778,22 +805,45 @@ fn mirror_worker(engine: Arc<Engine>, runtime: Arc<MirrorRuntime>) {
             while drain.read(&mut bytes).is_ok_and(|count| count > 0) {}
         });
         let device_name = String::from_utf8_lossy(&name).trim_end_matches('\0').trim().to_string();
-        engine.emit_system(
-            "mirror.changed",
-            json!({"mirror_id":runtime.id,"device":runtime.device,"name":device_name,"state":"running","width":runtime.width,"height":runtime.height}),
-        );
-        video.set_read_timeout(None).map_err(|error| error.to_string())?;
+        // "Running" waits for the first unit — the session packet that carries the real
+        // picture size — so the window and tap/swipe never work from the `wm size` estimate.
+        video.set_read_timeout(Some(MIRROR_FIRST_UNIT_TIMEOUT)).map_err(|error| error.to_string())?;
+        let mut announced = false;
+        let announce = |announced: &mut bool| {
+            if *announced {
+                return;
+            }
+            *announced = true;
+            runtime.set_running(device_name.clone());
+            let (width, height) = runtime.size();
+            engine.emit_system(
+                "mirror.changed",
+                json!({"mirror_id":runtime.id,"device":runtime.device,"name":device_name,"state":"running","width":width,"height":height}),
+            );
+        };
         while !runtime.stopped() {
             let mut header = [0u8; 12];
-            video.read_exact(&mut header).map_err(|error| format!("mirror stream ended: {error}"))?;
+            video.read_exact(&mut header).map_err(|error| {
+                if announced { format!("mirror stream ended: {error}") } else { format!("mirror server sent no video: {error}") }
+            })?;
+            if !announced {
+                // The first-unit deadline covers the handshake only; once frames flow, a
+                // static screen can legitimately send nothing for minutes.
+                video.set_read_timeout(None).map_err(|error| error.to_string())?;
+            }
             match mirror::parse_stream_unit(&header) {
                 mirror::StreamUnit::Session { width, height } => {
-                    engine.emit_system(
-                        "mirror.changed",
-                        json!({"mirror_id":runtime.id,"device":runtime.device,"state":"running","width":width,"height":height}),
-                    );
+                    runtime.set_size(width, height);
+                    if announced {
+                        engine.emit_system(
+                            "mirror.changed",
+                            json!({"mirror_id":runtime.id,"device":runtime.device,"state":"running","width":width,"height":height}),
+                        );
+                    }
+                    announce(&mut announced);
                 }
                 mirror::StreamUnit::Media { config, key, len, .. } => {
+                    announce(&mut announced);
                     if len == 0 || len > 16 * 1024 * 1024 {
                         return Err("mirror stream desynced".into());
                     }
@@ -812,12 +862,25 @@ fn mirror_worker(engine: Arc<Engine>, runtime: Arc<MirrorRuntime>) {
     if let Some(mut child) = runtime.take_child() {
         let _ = child.wait();
     }
-    let _ = mirror_adb(&runtime, mirror::forward_remove_args(&runtime.device, runtime.scid));
-    if let Err(error) = result {
-        if !requested_stop {
-            let tail = logs.lock().unwrap().iter().rev().take(5).cloned().collect::<Vec<_>>();
-            let message = if tail.is_empty() { error } else { format!("{error}\n{}", tail.into_iter().rev().collect::<Vec<_>>().join("\n")) };
-            mirror_failure(&engine, &runtime, "device.mirror_stream_failed", message);
+    let _ = mirror_adb(&runtime, mirror::forward_remove_args(&runtime.device, runtime.scid), MIRROR_FORWARD_TIMEOUT);
+    match result {
+        Err(error) if !requested_stop => {
+            if device_present(&runtime) {
+                let tail = logs.lock().unwrap().iter().rev().take(5).cloned().collect::<Vec<_>>();
+                let message = if tail.is_empty() { error } else { format!("{error}\n{}", tail.into_iter().rev().collect::<Vec<_>>().join("\n")) };
+                mirror_failure(&engine, &runtime, MirrorState::Failed, "device.mirror_stream_failed", message);
+            } else {
+                mirror_failure(
+                    &engine,
+                    &runtime,
+                    MirrorState::Lost,
+                    "device.mirror_device_lost",
+                    format!("{} is no longer connected", runtime.device),
+                );
+            }
+        }
+        _ => {
+            runtime.finish(MirrorState::Stopped, None, None);
         }
     }
     engine.mirrors.lock().unwrap().remove(&runtime.id);
@@ -828,30 +891,35 @@ fn event_coordinate(event: &Value, name: &str, limit: u32) -> Result<i32, BusErr
         BusError::invalid("device.input", format!("event.{name} must be an integer"))
     })?;
     if !(0..limit as i64).contains(&value) {
-        return Err(BusError::invalid("device.input", format!("event.{name} is outside the mirrored display")));
+        return Err(BusError::invalid("device.input", format!("event.{name} is outside the mirrored display ({limit} px)")));
     }
     Ok(value as i32)
 }
 
-fn send_input(runtime: &MirrorRuntime, event: &Value) -> Result<(), BusError> {
+/// Encode and write one `device.mirror.input` event. Pure memory and one socket write — no
+/// store access — which is what lets the engine answer it on the fast path. `tap`/`swipe`
+/// coordinates are in the stream's *current* size, rotation included.
+pub fn send_input(runtime: &MirrorRuntime, event: &Value) -> Result<(), BusError> {
     let kind = event.get("type").and_then(Value::as_str)
         .ok_or_else(|| BusError::invalid("device.input", "event.type is required"))?;
+    let (width, height) = runtime.size();
+    let (w, h) = (width as u16, height as u16);
     let message = match kind {
         "tap" => {
-            let x = event_coordinate(event, "x", runtime.width)?;
-            let y = event_coordinate(event, "y", runtime.height)?;
-            let mut bytes = mirror::touch(mirror::ACTION_DOWN, x, y, runtime.width as u16, runtime.height as u16, 1.0).to_vec();
-            bytes.extend_from_slice(&mirror::touch(mirror::ACTION_UP, x, y, runtime.width as u16, runtime.height as u16, 0.0));
+            let x = event_coordinate(event, "x", width)?;
+            let y = event_coordinate(event, "y", height)?;
+            let mut bytes = mirror::touch(mirror::ACTION_DOWN, x, y, w, h, 1.0).to_vec();
+            bytes.extend_from_slice(&mirror::touch(mirror::ACTION_UP, x, y, w, h, 0.0));
             bytes
         }
         "swipe" => {
-            let x1 = event_coordinate(event, "x1", runtime.width)?;
-            let y1 = event_coordinate(event, "y1", runtime.height)?;
-            let x2 = event_coordinate(event, "x2", runtime.width)?;
-            let y2 = event_coordinate(event, "y2", runtime.height)?;
-            let mut bytes = mirror::touch(mirror::ACTION_DOWN, x1, y1, runtime.width as u16, runtime.height as u16, 1.0).to_vec();
-            bytes.extend_from_slice(&mirror::touch(mirror::ACTION_MOVE, x2, y2, runtime.width as u16, runtime.height as u16, 1.0));
-            bytes.extend_from_slice(&mirror::touch(mirror::ACTION_UP, x2, y2, runtime.width as u16, runtime.height as u16, 0.0));
+            let x1 = event_coordinate(event, "x1", width)?;
+            let y1 = event_coordinate(event, "y1", height)?;
+            let x2 = event_coordinate(event, "x2", width)?;
+            let y2 = event_coordinate(event, "y2", height)?;
+            let mut bytes = mirror::touch(mirror::ACTION_DOWN, x1, y1, w, h, 1.0).to_vec();
+            bytes.extend_from_slice(&mirror::touch(mirror::ACTION_MOVE, x2, y2, w, h, 1.0));
+            bytes.extend_from_slice(&mirror::touch(mirror::ACTION_UP, x2, y2, w, h, 0.0));
             bytes
         }
         _ => {
@@ -2199,9 +2267,10 @@ mod tests {
     }
 
     #[test]
-    fn sizes_preserve_aspect_and_even_dimensions() {
-        assert_eq!(fit_size(1080, 2400, 1080), (486, 1080));
-        assert_eq!(fit_size(800, 600, 1080), (800, 600));
+    fn sizes_preserve_aspect_and_round_like_the_server() {
+        // scrcpy rounds the short side to a multiple of 8, not 2 (486 was never what it sent).
+        assert_eq!(mirror::fit_size(1080, 2400, 1080), (488, 1080));
+        assert_eq!(mirror::fit_size(800, 600, 1080), (800, 600));
     }
 
     #[test]
