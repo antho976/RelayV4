@@ -42,7 +42,7 @@
 .explorer-head { min-height: 35px; padding: 0 4px 0 12px; }
 .explorer-head .section-label { padding: 0; color: @secondary; letter-spacing: 0.1em; }
 .explorer-actions button.explorer-key, .code-bar .explorer-actions button.explorer-key {
-  min-width: 24px; min-height: 24px; padding: 0; border-radius: 3px; color: @faint;
+  min-width: 24px; min-height: 24px; padding: 0; border-radius: 2px; color: @faint;
 }
 .explorer-actions button.explorer-key:hover { background: @wash; color: @ink; }
 .code-search { margin: 6px 8px 4px; min-height: 26px; font-size: 12px; }
@@ -72,7 +72,7 @@ button.tree-row.search-hit { min-height: 38px; padding: 3px 10px; }
 
 /* ---- Image hover card ---- */
 popover.image-hover > contents {
-  padding: 8px; background: @slab; border: 1px solid @strong; border-radius: 4px;
+  padding: 8px; background: @slab; border: 1px solid @strong; border-radius: 2px;
   box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
 }
 .image-hover-card { min-width: 132px; }
@@ -95,7 +95,7 @@ popover.image-hover > contents {
 .code-git { background: @console; }
 .git-head { min-height: 38px; padding: 0 4px 0 6px; }
 .git-branch-picker > button, .code-bar .git-branch-picker > button {
-  min-height: 28px; padding: 0 8px; border: 1px solid transparent; border-radius: 3px;
+  min-height: 28px; padding: 0 8px; border: 1px solid transparent; border-radius: 2px;
   background: transparent; color: @ink; font-size: 12.5px;
 }
 .git-branch-picker > button:hover, .git-branch-picker > button:checked { background: @wash; border-color: @edge; }
@@ -106,7 +106,7 @@ popover.image-hover > contents {
 .code-bar button.git-head-key { min-width: 26px; min-height: 26px; padding: 0; color: @faint; }
 .code-bar button.git-head-key:hover { color: @ink; }
 
-popover.branch-popover > contents { padding: 0; border: 1px solid @strong; border-radius: 4px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5); }
+popover.branch-popover > contents { padding: 0; border: 1px solid @strong; border-radius: 2px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5); }
 .branch-search { margin: 8px; min-height: 30px; font-size: 12.5px; }
 .branch-list { padding: 0 0 6px; }
 .branch-heading {
@@ -125,7 +125,7 @@ button.branch-row.held-elsewhere .branch-name, button.branch-row.held-elsewhere 
 button.branch-row.remote image { color: @faint; }
 .branch-name { font-family: 'Fira Mono', monospace; font-size: 12px; }
 .branch-tag {
-  padding: 1px 6px; border-radius: 9px; background: alpha(@ink, 0.07);
+  padding: 1px 6px; border-radius: 2px; background: alpha(@ink, 0.07);
   color: @secondary; font-size: 10.5px;
 }
 button.branch-create { min-height: 30px; border-bottom: 1px solid @edge; }
@@ -141,14 +141,14 @@ button.branch-delete:hover { color: #f0786f; }
 /* ---- Source Control: commit box ---- */
 .scm-commit { padding: 10px 10px 8px; border-bottom: 1px solid @edge; }
 .code-commit-message {
-  min-height: 46px; padding: 6px 8px; border: 1px solid @strong; border-radius: 3px;
+  min-height: 46px; padding: 6px 8px; border: 1px solid @strong; border-radius: 2px;
   background: @screen; font-size: 12.5px;
 }
 .code-commit-message:focus-within { border-color: @secondary; }
 .code-commit-placeholder { padding: 7px 9px; color: @faint; font-size: 12.5px; }
-.scm-commit-split button.scm-commit-key { min-height: 28px; border-radius: 3px 0 0 3px; font-size: 12.5px; }
+.scm-commit-split button.scm-commit-key { min-height: 28px; border-radius: 2px 0 0 2px; font-size: 12.5px; }
 .scm-commit-more > button {
-  min-height: 28px; min-width: 26px; padding: 0; border-radius: 0 3px 3px 0;
+  min-height: 28px; min-width: 26px; padding: 0; border-radius: 0 2px 2px 0;
   background: @ink; border: 1px solid @ink; border-left: 1px solid alpha(@wall, 0.35); color: @wall;
 }
 .scm-commit-more > button:hover { background: white; }
@@ -174,12 +174,12 @@ button.scm-toggle:hover { background: transparent; color: @ink; }
   font-weight: 600; letter-spacing: 0.08em; color: @secondary;
 }
 .scm-count {
-  min-width: 16px; margin-left: 4px; padding: 0 5px; border-radius: 8px;
+  min-width: 16px; margin-left: 4px; padding: 0 5px; border-radius: 2px;
   background: alpha(@ink, 0.1); color: @ink; font-size: 10.5px; font-weight: 600;
 }
 .scm-head-actions { opacity: 0; }
 .scm-section-head:hover .scm-head-actions, .scm-head-actions:focus-within { opacity: 1; }
-button.scm-head-key, button.scm-action { min-width: 22px; min-height: 22px; padding: 0; border-radius: 3px; color: @secondary; }
+button.scm-head-key, button.scm-action { min-width: 22px; min-height: 22px; padding: 0; border-radius: 2px; color: @secondary; }
 button.scm-head-key:hover, button.scm-action:hover { background: alpha(@ink, 0.1); color: @ink; }
 .scm-section-body { padding-bottom: 4px; }
 .scm-row { min-height: 22px; padding-right: 8px; }
@@ -205,7 +205,7 @@ button.scm-open:focus-visible { outline: 1px solid alpha(@ink, 0.38); outline-of
 .scm-remote-row { min-height: 40px; padding: 4px 10px 4px 22px; color: @secondary; }
 .scm-remote-title { font-size: 12px; color: @ink; }
 .scm-remote-hint { font-size: 11px; color: @faint; }
-.scm-tag { padding: 1px 7px; border-radius: 9px; font-size: 10.5px; font-weight: 600; background: alpha(@ink, 0.08); color: @secondary; }
+.scm-tag { padding: 1px 7px; border-radius: 2px; font-size: 10.5px; font-weight: 600; background: alpha(@ink, 0.08); color: @secondary; }
 .scm-tag.pr-open { background: alpha(@live, 0.16); color: #73c991; }
 .scm-tag.pr-draft { background: alpha(@ink, 0.08); color: @secondary; }
 .scm-tag.pr-merged { background: rgba(165, 108, 214, 0.18); color: #bb8fd9; }
@@ -215,7 +215,7 @@ button.scm-open:focus-visible { outline: 1px solid alpha(@ink, 0.38); outline-of
 .code-git-split > separator { min-height: 1px; background: @edge; }
 .code-history-pane { background: @console; }
 .scm-history { border-bottom: 0; }
-button.code-graph-toggle { min-height: 20px; margin-right: 2px; padding: 0 7px; font-size: 10.5px; border-radius: 3px; }
+button.code-graph-toggle { min-height: 20px; margin-right: 2px; padding: 0 7px; font-size: 10.5px; border-radius: 2px; }
 button.code-commit { min-height: 40px; padding: 0 10px 0 8px; border: 0; border-radius: 0; background: transparent; }
 button.code-commit:hover { background: alpha(@ink, 0.045); }
 .code-commit-subject { font-size: 12.5px; color: @ink; }
@@ -227,8 +227,8 @@ button.code-commit:hover { background: alpha(@ink, 0.045); }
   min-height: 24px; padding: 0 9px; font-size: 11px; border: 1px solid @strong;
   background: transparent; color: @secondary;
 }
-.diff-switch button:first-child { border-radius: 3px 0 0 3px; }
-.diff-switch button:last-child { border-radius: 0 3px 3px 0; border-left: 0; }
+.diff-switch button:first-child { border-radius: 2px 0 0 2px; }
+.diff-switch button:last-child { border-radius: 0 2px 2px 0; border-left: 0; }
 .diff-switch button:checked { background: @wash; color: @ink; }
 
 /* ---- Commit details panel ---- */
@@ -237,7 +237,7 @@ button.code-commit:hover { background: alpha(@ink, 0.045); }
 .commit-author { color: @ink; font-size: 12px; }
 .commit-when { color: @faint; font-size: 12px; }
 .commit-sha { font-family: 'Fira Mono', monospace; font-size: 11px; color: #c9a24c; }
-.commit-body { padding: 10px 12px; background: @screen; border: 1px solid @edge; border-radius: 3px; font-family: 'Fira Mono', monospace; font-size: 12px; color: @secondary; }
+.commit-body { padding: 10px 12px; background: @screen; border: 1px solid @edge; border-radius: 2px; font-family: 'Fira Mono', monospace; font-size: 12px; color: @secondary; }
 .commit-files-head { margin-top: 6px; padding-bottom: 6px; border-bottom: 1px solid @edge; }
 .commit-files { margin-top: 2px; }
 .commit-file { min-height: 26px; padding: 0 4px; }
