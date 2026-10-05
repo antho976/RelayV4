@@ -531,6 +531,7 @@ fn detail(ui: &Rc<Ui>, task: Value, modules: Vec<Value>, tasks: Vec<Value>) {
     let id = task["id"].as_i64().unwrap_or(0);
     let project = task["project_id"].as_i64().unwrap_or(0);
     let form = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    form.append(&super::board_view::identity_strip(&task));
     let title = gtk::Entry::builder().text(text(&task, "title")).build();
     title.set_widget_name("task-title");
     field("Title", &title, &form);
@@ -600,7 +601,10 @@ fn detail(ui: &Rc<Ui>, task: Value, modules: Vec<Value>, tasks: Vec<Value>) {
         &format!("{} · {}", text(&task, "column"), text(&task, "state")),
         "dim",
     ));
-    let column = choose(COLUMNS, text(&task, "column"));
+    // Done is reached by approval (the engine refuses a plain move there), so Move offers
+    // the other columns and Approve stands beside it until the task is done.
+    let done = text(&task, "column") == "done";
+    let column = choose(&COLUMNS[..4], if done { "in_review" } else { text(&task, "column") });
     transitions.append(&column);
     action(
         ui,
@@ -611,7 +615,7 @@ fn detail(ui: &Rc<Ui>, task: Value, modules: Vec<Value>, tasks: Vec<Value>) {
         move || json!({"task_id":id,"column":chosen(&column)}),
         Some(id),
     );
-    if text(&task, "column") == "in_review" {
+    if !done {
         action(
             ui,
             &d,
