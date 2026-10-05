@@ -17,6 +17,13 @@ pub fn defaults() -> &'static Value {
             "appearance": { "mode": "dark", "panel_alpha": 1.0, "wallpaper": null, "wallpaper_preview": null },
             "notifications": { "sound": "chime", "volume": 0.7, "categories": {} },
             "providers": { "claude": { "path": null }, "codex": { "path": null } },
+            // What the status bar's limit meters show, and how often the window re-reads them
+            // (minutes; 0 = only on engine events and the refresh key).
+            "usage": {
+                "refresh_minutes": 0,
+                "claude": { "enabled": true, "five_hour": true, "weekly": true, "fable": true },
+                "codex": { "enabled": true, "five_hour": true, "weekly": true }
+            },
             "device": { "sdk_path": null, "adb_path": null, "emulator_path": null, "avdmanager_path": null },
             "guardrails": {
                 "caps": { "files": 40, "lines": 2000 },
@@ -26,9 +33,9 @@ pub fn defaults() -> &'static Value {
                 "denied_commands": ["rm -rf", "git reset --hard", "git clean -fd", "git push --force"],
                 "allowed_write_roots": [],
                 "roles": {
-                    "builder": ["task.move", "task.link_commit", "task.changelog.write", "task.update", "mailbox.*", "notes.append", "overlap.flag", "overlap.ack", "integration.request", "session.done", "session.report", "session.intent", "session.claim", "session.release", "usage.report", "guardrail.gate"],
-                    "reviewer": ["mailbox.*", "notes.append", "overlap.flag", "task.changelog.write", "session.done", "session.report", "session.intent", "session.claim", "session.release", "usage.report"],
-                    "docs": ["task.move", "task.changelog.write", "task.update", "mailbox.*", "notes.append", "notes.create", "notes.update", "overlap.flag", "overlap.ack", "session.done", "session.report", "session.intent", "session.claim", "session.release", "usage.report", "guardrail.gate"]
+                    "builder": ["task.move", "task.link_commit", "task.changelog.write", "task.update", "mailbox.*", "notes.append", "overlap.flag", "overlap.ack", "integration.request", "session.done", "session.report", "session.intent", "session.claim", "session.release", "device.claim", "device.release", "usage.report", "guardrail.gate"],
+                    "reviewer": ["mailbox.*", "notes.append", "overlap.flag", "task.changelog.write", "session.done", "session.report", "session.intent", "session.claim", "session.release", "device.claim", "device.release", "usage.report"],
+                    "docs": ["task.move", "task.changelog.write", "task.update", "mailbox.*", "notes.append", "notes.create", "notes.update", "overlap.flag", "overlap.ack", "session.done", "session.report", "session.intent", "session.claim", "session.release", "device.claim", "device.release", "usage.report", "guardrail.gate"]
                 },
                 "projects": {},
             },

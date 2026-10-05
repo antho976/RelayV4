@@ -785,23 +785,43 @@ impl Ui {
                 let tasks=if !group||index==0{p.selected_tasks()}else{Vec::new()};profiles_data.push((payload,tasks,p.prompt()));
             }
             key.set_sensitive(false);let key=key.clone();ui.launch_box.set_sensitive(false);let progress=progress.clone();
+            // The sheet steps aside on the click and the new agents appear at once, each pane
+            // saying which step it is on; the worktree fetch and checkout happen behind them.
+            let clicked=std::time::Instant::now();
+            ui.launch.set_reveal_child(false);ui.open_project(project,"agents");
+            let payloads:Vec<Value>=profiles_data.iter().map(|(payload,_,_)|payload.clone()).collect();
+            let placeholders=ui.launch_placeholders(project,&payloads);
+            tracing::debug!(agents=placeholders.len(),elapsed_us=clicked.elapsed().as_micros() as u64,"launch: placeholders visible");
             glib::spawn_future_local(async move{
+                let mut touched:Vec<String>=placeholders.clone();
                 let result=async{
                     // session.create refreshes new-branch refs before allocation.
                     let mut allocated: Vec<(Value, Vec<i64>, String)> = Vec::new();
                     for (index,(mut payload,tasks,prompt)) in profiles_data.into_iter().enumerate(){
                         progress.set_text(&format!("Allocating agent {}",index+1));
+                        ui.launch_progress(&placeholders[index],if group&&index>0{"Joining the shared worktree…"}else{"Preparing worktree…"});
                         if group&&index>0{payload["pair_with"]=json!(text(&allocated[index-1].0,"name"));payload.as_object_mut().unwrap().remove("worktree");}
                         if let Some(task)=tasks.first(){payload["task_id"]=json!(task);}
-                        let session=ui.call("session.create",payload).await?;allocated.push((session,tasks,prompt));ui.refresh();
+                        let session=ui.call("session.create",payload).await?;
+                        ui.launch_adopt(&placeholders[index],&session,"Worktree ready · waiting to start…");touched.push(text(&session,"name").to_string());
+                        tracing::debug!(session=text(&session,"name"),elapsed_ms=clicked.elapsed().as_millis() as u64,"launch: session created");
+                        allocated.push((session,tasks,prompt));
                     }
-                    for(session,tasks,_)in &allocated{for task in tasks{progress.set_text(&format!("Staging task #{task}"));ui.call("task.dispatch",json!({"task_id":task,"session":session["name"],"start":false})).await?;}}
+                    for(session,tasks,_)in &allocated{for task in tasks{progress.set_text(&format!("Staging task #{task}"));ui.launch_progress(text(session,"name"),&format!("Staging task #{task}…"));ui.call("task.dispatch",json!({"task_id":task,"session":session["name"],"start":false})).await?;}}
                     // Start reviewers first so their mailbox is live before builders publish files.
                     allocated.sort_by_key(|(s,_,_)|text(s,"role")!="reviewer");
-                    for(session,_,prompt)in allocated{progress.set_text(&format!("Starting {}",text(&session,"name")));ui.call("session.spawn",json!({"session":session["name"],"prompt":prompt})).await?;}
+                    for(session,_,prompt)in allocated{
+                        let name=text(&session,"name").to_string();
+                        progress.set_text(&format!("Starting {name}"));ui.launch_progress(&name,"Starting the provider…");
+                        let started=ui.call("session.spawn",json!({"session":name,"prompt":prompt})).await;
+                        ui.launch_done(&name);
+                        let started=started?;ui.upsert_session(&started);
+                        tracing::debug!(session=%name,elapsed_ms=clicked.elapsed().as_millis() as u64,"launch: provider started");
+                    }
                     Ok::<(),Error>(())
                 }.await;
-                match result{Ok(())=>{ui.launch.set_reveal_child(false);ui.open_project(project,"agents");},Err(e)=>{ui.launch.set_reveal_child(false);ui.open_project(project,"agents");ui.show_error(&format!("Launch incomplete: {e}. Created sessions and queues are preserved. Start the remaining sessions individually from the wall."));}}
+                ui.launch_abort(&touched);
+                if let Err(e)=result{ui.show_error(&format!("Launch incomplete: {e}. Created sessions and queues are preserved. Start the remaining sessions individually from the wall."));}
                 ui.launch_busy.set(false);ui.launch_box.set_sensitive(true);key.set_sensitive(true);ui.refresh();
             });
         });

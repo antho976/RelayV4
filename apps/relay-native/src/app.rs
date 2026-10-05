@@ -78,6 +78,129 @@ pub fn field(caption: &str, widget: &impl IsA<gtk::Widget>, parent: &gtk::Box) {
     parent.append(widget);
 }
 
+#[path = "notification_center.rs"]
+mod notification_center;
+#[path = "session_context.rs"]
+mod session_context;
+
+thread_local! {
+    /// Bumped by every `Ui::show_error`, so a newer message is never cleared by an older timer.
+    static NOTICE_SERIAL: Cell<u64> = const { Cell::new(0) };
+}
+
+/// How long an armed key waits for its second click before it reverts.
+const CONFIRM_WINDOW: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// A destructive key that confirms in place instead of opening a dialog.
+///
+/// The first click arms it: the key turns red and reads `caption`. A second click runs `run`.
+/// Waiting [`CONFIRM_WINDOW`], moving focus elsewhere or pressing Escape reverts it untouched.
+/// Use a real dialog only where the action needs more input than a yes.
+pub fn confirm_inline(key: &gtk::Button, caption: &str, run: impl Fn(&gtk::Button) + 'static) {
+    confirm_inline_if(key, caption, || true, run);
+}
+
+/// [`confirm_inline`], asking only while `needed` holds (a discard with nothing to lose runs at once).
+pub fn confirm_inline_if(
+    key: &gtk::Button,
+    caption: &str,
+    needed: impl Fn() -> bool + 'static,
+    run: impl Fn(&gtk::Button) + 'static,
+) {
+    struct Armed {
+        label: Option<glib::GString>,
+        child: Option<gtk::Widget>,
+        tooltip: Option<glib::GString>,
+        width: i32,
+    }
+    let armed: Rc<RefCell<Option<Armed>>> = Rc::default();
+    let serial = Rc::new(Cell::new(0_u64));
+    let disarm: Rc<dyn Fn(&gtk::Button)> = Rc::new({
+        let armed = armed.clone();
+        move |key: &gtk::Button| {
+            let Some(previous) = armed.borrow_mut().take() else { return };
+            match &previous.label {
+                Some(text) => key.set_label(text),
+                None => key.set_child(previous.child.as_ref()),
+            }
+            key.set_tooltip_text(previous.tooltip.as_deref());
+            key.set_size_request(previous.width, -1);
+            key.remove_css_class("confirm-armed");
+            key.reset_property(gtk::AccessibleProperty::Label);
+            // An icon key names itself through its caption; a text key through its text.
+            if previous.label.is_none() {
+                if let Some(caption) = previous.tooltip.as_deref() {
+                    key.update_property(&[gtk::accessible::Property::Label(caption)]);
+                }
+            }
+        }
+    });
+    let caption = caption.to_string();
+    let reset = disarm.clone();
+    let state = armed.clone();
+    key.connect_clicked(move |key| {
+        serial.set(serial.get().wrapping_add(1));
+        if state.borrow().is_some() {
+            reset(key);
+            run(key);
+            return;
+        }
+        if !needed() {
+            run(key);
+            return;
+        }
+        let text = key.label();
+        *state.borrow_mut() = Some(Armed {
+            child: if text.is_none() { key.child() } else { None },
+            label: text,
+            tooltip: key.tooltip_text(),
+            width: key.size_request().0,
+        });
+        // Never narrower than the key it replaces, so the row around it does not jump.
+        key.set_size_request(key.width().max(key.size_request().0), -1);
+        if key.label().is_some() {
+            key.set_label(&caption);
+        } else {
+            let text = label(&caption, "confirm-caption");
+            text.set_xalign(0.5);
+            key.set_child(Some(&text));
+        }
+        key.add_css_class("confirm-armed");
+        key.set_tooltip_text(Some("Click again to confirm · Esc cancels"));
+        key.update_property(&[gtk::accessible::Property::Label(&caption)]);
+        let current = serial.get();
+        let serial = serial.clone();
+        let key = key.downgrade();
+        let reset = reset.clone();
+        glib::timeout_add_local_once(CONFIRM_WINDOW, move || {
+            if let Some(key) = key.upgrade().filter(|_| serial.get() == current) {
+                reset(&key);
+            }
+        });
+    });
+    let focus = gtk::EventControllerFocus::new();
+    let reset = disarm.clone();
+    let weak = key.downgrade();
+    focus.connect_leave(move |_| {
+        if let Some(key) = weak.upgrade() {
+            reset(&key);
+        }
+    });
+    key.add_controller(focus);
+    let keys = gtk::EventControllerKey::new();
+    let weak = key.downgrade();
+    keys.connect_key_pressed(move |_, pressed, _, _| {
+        if pressed == gtk::gdk::Key::Escape && armed.borrow().is_some() {
+            if let Some(key) = weak.upgrade() {
+                disarm(&key);
+            }
+            return glib::Propagation::Stop;
+        }
+        glib::Propagation::Proceed
+    });
+    key.add_controller(keys);
+}
+
 fn track_navigation(stack: &gtk::Stack, key: &gtk::Button, name: &'static str) {
     if name == "agents" {
         key.add_css_class("selected");
@@ -120,6 +243,7 @@ pub struct Ui {
     pub notice: gtk::Label,
     status: gtk::Label,
     usage_meters: gtk::Box,
+    usage: status::UsageState,
     device_status: gtk::Label,
     pub(super) resource_status: gtk::Box,
     notification_count: gtk::Label,
@@ -145,7 +269,7 @@ pub struct Ui {
     wallpaper: gtk::Picture,
     wallpaper_dim: gtk::Box,
     font_size: Cell<f64>,
-    palette: RefCell<String>,
+    pub(crate) palette: RefCell<String>,
     pub keybindings: RefCell<Value>,
     pub sound_busy: Cell<bool>,
     projects_box: gtk::Box,
@@ -207,7 +331,18 @@ pub fn run(rt: Handle) -> glib::ExitCode {
         }
         let provider = gtk::CssProvider::new();
         provider.connect_parsing_error(|_, _, e| tracing::error!("stylesheet: {e}"));
-        provider.load_from_string(include_str!("theme.css"));
+        provider.load_from_string(concat!(
+            include_str!("theme.css"),
+            include_str!("css/mirror.css"),
+            include_str!("css/notes.css"),
+            include_str!("css/git_files.css"),
+            include_str!("css/board.css"),
+            include_str!("css/sessions.css"),
+            include_str!("css/workspace.css"),
+            include_str!("css/guardrails.css"),
+            include_str!("css/usage.css"),
+            include_str!("css/tools.css"),
+        ));
         if let Some(display) = gtk::gdk::Display::default() {
             gtk::style_context_add_provider_for_display(
                 &display,
@@ -329,11 +464,38 @@ impl Ui {
         top.append(&window_controls);
         let handle = gtk::WindowHandle::new();
         handle.set_child(Some(&top));
-        window.set_titlebar(Some(&handle));
+        // The bar lives inside the wallpaper backdrop so panel opacity shows the wallpaper
+        // behind it, like the status bar. A hidden titlebar keeps client-side decorations
+        // and their resize edges; the WindowHandle still drags and maximizes the window.
+        let titlebar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        titlebar.set_visible(false);
+        window.set_titlebar(Some(&titlebar));
+        outer.append(&handle);
         let notice = label("Connecting to the Relay engine…", "notice");
         notice.set_wrap(true);
         notice.set_selectable(true);
-        outer.append(&notice);
+        notice.set_hexpand(true);
+        // The label stays the notice's source of truth (`show_error`, smoke checks); the bar
+        // around it follows its visibility and carries the dismiss key.
+        let notice_bar = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        notice_bar.add_css_class("notice-bar");
+        notice_bar.append(&notice);
+        let notice_close = icon_button("close", "Dismiss");
+        notice_close.set_widget_name("notice-dismiss");
+        notice_close.add_css_class("notice-dismiss");
+        notice_close.set_valign(gtk::Align::Start);
+        notice_bar.append(&notice_close);
+        notice
+            .bind_property("visible", &notice_bar, "visible")
+            .sync_create()
+            .build();
+        let weak_notice = notice.downgrade();
+        notice_close.connect_clicked(move |_| {
+            if let Some(notice) = weak_notice.upgrade() {
+                notice.set_visible(false);
+            }
+        });
+        outer.append(&notice_bar);
         let body = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         body.set_vexpand(true);
         let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -437,6 +599,12 @@ impl Ui {
         agents.append(&wall_body);
         let editor = crate::editor::Editor::new();
         editor.mount_agents(&agents);
+        // Panel opacity reaches the terminals only if the stacks between them and the
+        // wallpaper stop repainting @wall on top of each other (see css/usage.css).
+        agents.add_css_class("agents-surface");
+        if let Some(host) = agents.parent() {
+            host.add_css_class("agents-host");
+        }
         content.add_named(&editor.root, Some("agents"));
         let mut pages = BTreeMap::new();
         for name in [
@@ -536,6 +704,8 @@ impl Ui {
         resource_content.append(&resource_status);
         resources_key.set_child(Some(&resource_content));
         bottom.append(&usage_key);
+        let usage = status::UsageState::new();
+        bottom.append(&usage.strip);
         bottom.append(&gtk::Separator::new(gtk::Orientation::Vertical));
         bottom.append(&devices_key);
         bottom.append(&gtk::Separator::new(gtk::Orientation::Vertical));
@@ -576,6 +746,7 @@ impl Ui {
             notice,
             status,
             usage_meters,
+            usage,
             device_status,
             resource_status,
             notification_count,
@@ -640,6 +811,11 @@ impl Ui {
         ] {
             let b = nav_button(caption, icon);
             b.set_widget_name(&format!("nav-{name}"));
+            match name {
+                "skills" => b.set_tooltip_text(Some("Skills: agent instructions, on or off per project")),
+                "plugins" => b.set_tooltip_text(Some("Plugins: skills, rules and MCP tools for a project")),
+                _ => {}
+            }
             track_navigation(&ui.content, &b, name);
             nav.append(&b);
             let weak = Rc::downgrade(&ui);
@@ -649,17 +825,14 @@ impl Ui {
                 }
             });
         }
-        for (key, page) in [
-            (settings_key, "settings"),
-            (notifications_key, "notifications"),
-        ] {
-            let weak = Rc::downgrade(&ui);
-            key.connect_clicked(move |_| {
-                if let Some(ui) = weak.upgrade() {
-                    ui.toggle_page(page);
-                }
-            });
-        }
+        let weak = Rc::downgrade(&ui);
+        settings_key.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                ui.toggle_page("settings");
+            }
+        });
+        // Notifications open in place under the bell, never as a page of their own.
+        notification_center::install(&ui, &notifications_key);
         let weak = Rc::downgrade(&ui);
         skills_key.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
@@ -752,9 +925,10 @@ impl Ui {
         let weak = Rc::downgrade(&ui);
         usage_key.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
-                ui.usage();
+                ui.usage_panel();
             }
         });
+        ui.install_usage();
         ui.install_shortcuts();
         if let Some(display) = gtk::gdk::Display::default() {
             gtk::style_context_add_provider_for_display(
@@ -889,9 +1063,40 @@ impl Ui {
         });
         ui
     }
+    /// Show `message` in the banner under the title bar. It has a dismiss key and clears itself
+    /// once there was time to read it, unless the pointer rests on it. While the engine is not
+    /// connected it describes that state, so it stays until the connection comes back.
     pub fn show_error(&self, message: &str) {
         self.notice.set_text(message);
         self.notice.set_visible(true);
+        let serial = NOTICE_SERIAL.with(|s| {
+            s.set(s.get().wrapping_add(1));
+            s.get()
+        });
+        if !self.connected.get() {
+            return;
+        }
+        let mut remaining = (6 + message.chars().count() / 20).min(20);
+        let notice = self.notice.downgrade();
+        glib::timeout_add_local(std::time::Duration::from_secs(1), move || {
+            let Some(notice) = notice.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            if NOTICE_SERIAL.with(Cell::get) != serial || !notice.is_visible() {
+                return glib::ControlFlow::Break;
+            }
+            let held = notice.parent().is_some_and(|bar| {
+                bar.state_flags().contains(gtk::StateFlags::PRELIGHT)
+            }) || notice.has_focus();
+            if !held {
+                remaining = remaining.saturating_sub(1);
+            }
+            if remaining > 0 {
+                return glib::ControlFlow::Continue;
+            }
+            notice.set_visible(false);
+            glib::ControlFlow::Break
+        });
     }
     pub async fn call(&self, op: &str, payload: Value) -> Result<Value, Error> {
         let client = self.client.borrow().clone().ok_or(Error::Disconnected)?;
@@ -936,12 +1141,13 @@ impl Ui {
                         return;
                     }
                     *ui.client.borrow_mut() = Some(client);
-                    if let Err(e)=ui.call("bus.subscribe",json!({"events":["project.changed","project.deleted","workspace.changed","session.changed","task.changed","task.deleted","mailbox.new","mailbox.changed","guardrail.held","guardrail.resolved","overlap.changed","notes.changed","notes.deleted","file.changed","git.changed","worktree.changed","module.changed","module.deleted","skill.changed","skill.deleted","plugin.changed","settings.changed","provider.update.changed","notify.new","notify.changed","device.changed","run.changed","run.crash","device.signing.changed","avd.changed","layout.changed","ui.changed","ui.toast","usage.changed","integration.changed","integration.result"]})).await { ui.show_error(&e.to_string()); return; }
+                    if let Err(e)=ui.call("bus.subscribe",json!({"events":["project.changed","project.deleted","workspace.changed","session.changed","task.changed","task.deleted","mailbox.new","mailbox.changed","guardrail.held","guardrail.resolved","overlap.changed","notes.changed","notes.deleted","file.changed","git.changed","worktree.changed","module.changed","module.deleted","skill.changed","skill.deleted","plugin.changed","settings.changed","provider.update.changed","notify.new","notify.changed","device.changed","device.lease.acquired","device.lease.released","run.changed","run.crash","device.signing.changed","avd.changed","layout.changed","ui.changed","ui.toast","usage.changed","integration.changed","integration.result"]})).await { ui.show_error(&e.to_string()); return; }
                     ui.connected.set(true);
                     crate::provider_updates::startup(&ui);
                     ui.status.set_text("");
                     ui.refresh_status();
                     ui.refresh_notification_count();
+                    crate::pages::restore_prompts(&ui);
                     ui.notice.set_visible(false);
                     ui.refresh();
                     ui.load_appearance();
@@ -980,6 +1186,10 @@ impl Ui {
                                 }
                                 if e.ev.starts_with("notify.") {
                                     ui.refresh_notification_count();
+                                    notification_center::changed();
+                                }
+                                if e.ev.starts_with("guardrail.") {
+                                    crate::pages::guardrail_event(&ui, &e.ev, &e.payload);
                                 }
                                 if e.ev == "provider.update.changed" {
                                     crate::provider_updates::event(&ui, &e.payload);
@@ -1004,7 +1214,11 @@ impl Ui {
                                     ui.registry_dirty.set(true);
                                     ui.refresh();
                                 } else if e.ev.starts_with("session.") {
-                                    ui.refresh();
+                                    // `session.changed` carries the whole row: apply it in
+                                    // place instead of re-listing every session.
+                                    if !ui.apply_session_event(&e.ev, &e.payload) {
+                                        ui.refresh();
+                                    }
                                 } else if matches!(
                                     e.ev.as_str(),
                                     "file.changed"
@@ -1026,6 +1240,9 @@ impl Ui {
                                     let path = text(&e.payload, "path");
                                     if path.starts_with("keybindings") || path.is_empty() {
                                         ui.load_keybindings();
+                                    }
+                                    if path.starts_with("usage") || path.is_empty() {
+                                        ui.reload_usage_prefs();
                                     }
                                     if path.starts_with("appearance.")
                                         || path == "terminal.font_size"
@@ -1075,6 +1292,13 @@ impl Ui {
     pub fn navigate(self: &Rc<Self>, page: &str) {
         if page == "notes" {
             crate::pages::show_notes(self);
+            return;
+        }
+        if page == "notifications" {
+            // A restored layout or an engine echo must not pop it open by itself.
+            if !self.applying_ui.get() {
+                notification_center::open();
+            }
             return;
         }
         let files = page == "code";
@@ -1212,6 +1436,8 @@ impl Ui {
         });
     }
     fn reconcile(self: &Rc<Self>) {
+        // A pane closed optimistically stays closed while its close is in flight.
+        self.sessions.borrow_mut().retain(|s| !shell::is_closing(text(s, "name")));
         self.render_status_counts();
         let sessions = self.sessions.borrow().clone();
         self.launch_caption.set_text(if sessions.is_empty() {

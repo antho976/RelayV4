@@ -677,3 +677,61 @@ fn task_activity_is_exactly_scoped_paginated_and_read_only_for_agents() {
         "agent cannot read user-wide task conversations"
     );
 }
+
+/// A card dropped between two others lands there: `position` on `task.move` is the index the
+/// task ends at in its column, and undo puts it back exactly where it was, gaps and all.
+#[test]
+fn move_with_position_reorders_a_column_and_undo_restores_it() {
+    let f = Fixture::new();
+    let e = &f.engine;
+    let ready = |f: &Fixture, title: &str| f.task(title, json!({"column":"ready"}))["id"].as_i64().unwrap();
+    let (a, b, c, d) = (ready(&f, "A"), ready(&f, "B"), ready(&f, "C"), ready(&f, "D"));
+    let order = |column: &str| -> Vec<i64> {
+        ok(e, "task.list", json!({"project_id":1}))["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["column"] == column)
+            .map(|t| t["id"].as_i64().unwrap())
+            .collect()
+    };
+    let undo_last = |op: &str| {
+        let row = ok(e, "audit.list", json!({"op_prefix":op,"limit":1}))["rows"][0].clone();
+        ok(e, "audit.undo", json!({"audit_id":row["id"]}));
+    };
+    assert_eq!(order("ready"), vec![a, b, c, d]);
+
+    // Down the column: A ends at index 2, after C.
+    ok(e, "task.move", json!({"task_id":a,"column":"ready","position":2}));
+    assert_eq!(order("ready"), vec![b, c, a, d]);
+    undo_last("task.move");
+    assert_eq!(order("ready"), vec![a, b, c, d]);
+
+    // Up the column: D ends at index 1, and undo returns it to the bottom.
+    ok(e, "task.move", json!({"task_id":d,"column":"ready","position":1}));
+    assert_eq!(order("ready"), vec![a, d, b, c]);
+    undo_last("task.move");
+    assert_eq!(order("ready"), vec![a, b, c, d]);
+
+    // Into another column at a given slot, and back out on undo.
+    let x = f.task("X", json!({"column":"active"}))["id"].as_i64().unwrap();
+    let y = f.task("Y", json!({"column":"active"}))["id"].as_i64().unwrap();
+    ok(e, "task.move", json!({"task_id":b,"column":"active","position":1}));
+    assert_eq!(order("active"), vec![x, b, y]);
+    assert_eq!(order("ready"), vec![a, c, d]);
+    undo_last("task.move");
+    assert_eq!(order("ready"), vec![a, b, c, d]);
+    assert_eq!(order("active"), vec![x, y]);
+
+    // An index past the end clamps to last; without a position a move still appends.
+    ok(e, "task.move", json!({"task_id":a,"column":"ready","position":99}));
+    assert_eq!(order("ready"), vec![b, c, d, a]);
+    ok(e, "task.move", json!({"task_id":x,"column":"ready"}));
+    assert_eq!(order("ready"), vec![b, c, d, a, x]);
+
+    // Approval out of a reordered column is undone to the same slot as well.
+    ok(e, "task.approve", json!({"task_id":c,"sha":"cafe"}));
+    assert_eq!(order("ready"), vec![b, d, a, x]);
+    undo_last("task.approve");
+    assert_eq!(order("ready"), vec![b, c, d, a, x]);
+}

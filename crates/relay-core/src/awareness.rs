@@ -494,6 +494,7 @@ pub fn bootstrap(
         denied_commands: cfg.denied_commands.clone(),
         write_roots,
         dry_run: "guardrail.check".to_string(),
+        exceptions: crate::guardrail::grants::BOOTSTRAP_HINT.to_string(),
     };
 
     Ok(BootstrapOut {

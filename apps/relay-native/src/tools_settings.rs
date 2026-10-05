@@ -55,7 +55,6 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
             data[path] = ui.call("settings.get", json!({"path":path})).await?["value"].clone();
         }
         data["notifications"] = ui.call("notify.settings.get", json!({})).await?;
-        data["guardrails"] = ui.call("guardrail.config.get", json!({})).await?;
         data["detected"] = ui.call("provider.list", json!({})).await?;
         Ok::<_, crate::client::Error>(data)
     }
@@ -140,7 +139,6 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
         }
         let saved_wallpapers = saved_for_save.clone();
         settings.push(("notify.settings.set", json!({"patch":notifications})));
-        settings.push(("guardrail.config.set", json!({"patch":guardrails})));
         let save_caption = save_caption.clone();
         page.set_sensitive(false);
         save_caption.set_text("Saving…");
@@ -456,8 +454,8 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
         );
     }
     let safety = category(&stack, "safety", "Guardrails");
-    safety.append(&paragraph("Hard operating limits enforced by the engine. These values apply globally; project overrides are preserved."));
-    guardrails(ui, &safety, &data["guardrails"]);
+    safety.append(&paragraph("Limits the engine enforces on agents. Set them globally, for a workspace, or for one project; anything a level does not set follows the level above. These save on their own, with the button below."));
+    safety.append(&crate::pages::guardrail_settings(ui));
     let notifications = category(&stack, "notifications", "Notifications");
     notifications.append(&paragraph(
         "Choose which events appear in your notification feed.",
@@ -806,59 +804,6 @@ fn setting_number(
     input.set_value(value);
     input.set_widget_name(&format!("setting:{path}"));
     field(title, &input, parent);
-}
-
-fn guardrails(_ui: &Rc<Ui>, page: &gtk::Box, data: &Value) {
-    for (group, key, title, max) in [
-        ("caps", "files", "Maximum changed files", 1_000_000.),
-        ("caps", "lines", "Maximum changed lines", 100_000_000.),
-        (
-            "destructive_write",
-            "min_removed_lines",
-            "Destructive change: minimum removed lines",
-            1_000_000.,
-        ),
-        (
-            "destructive_write",
-            "min_removed_pct",
-            "Destructive change: minimum removed percent",
-            100.,
-        ),
-    ] {
-        let fractional = key == "min_removed_pct";
-        let input = gtk::SpinButton::with_range(0., max, if fractional { 0.1 } else { 1. });
-        input.set_digits(if fractional { 2 } else { 0 });
-        input.set_widget_name(&format!("guardrail:{group}.{key}"));
-        input.set_value(data[group][key].as_f64().unwrap_or(0.));
-        field(title, &input, page);
-    }
-    for (key, title) in [
-        ("protected_paths", "Protected paths, one per line"),
-        ("denied_commands", "Denied commands, one per line"),
-    ] {
-        let view = gtk::TextView::new();
-        view.set_widget_name(&format!("guardrail:{key}"));
-        view.set_monospace(true);
-        view.set_wrap_mode(gtk::WrapMode::WordChar);
-        view.set_top_margin(8);
-        view.set_bottom_margin(8);
-        view.buffer().set_text(
-            &data[key]
-                .as_array()
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                })
-                .unwrap_or_default(),
-        );
-        let scroll = crate::app::scrolled(&view);
-        scroll.set_min_content_height(110);
-        scroll.set_vexpand(false);
-        field(title, &scroll, page);
-    }
 }
 
 fn wallpaper_library(ui: &Rc<Ui>, parent: &gtk::Box, state: &Rc<RefCell<Value>>) -> gtk::Box {

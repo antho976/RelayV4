@@ -8,13 +8,17 @@ use relay_bus::envelope::{Actor, Request};
 use relay_bus::error::BusError;
 use relay_bus::registry::{Callable, OpEntry, OpKind, Registry};
 use relay_bus::types::{
-    GateKind, GuardrailConfig, Hold, HoldState, Id, Role, Session, ShapeGate,
+    GateKind, GuardrailConfig, GuardrailLayer, Hold, HoldState, Id, Role, Session, ShapeGate,
 };
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
+
+pub mod grants;
+pub use grants::Grants;
 
 /// Result of pure policy evaluation. A hold names the one policy confirmation may skip.
 ///
@@ -42,66 +46,123 @@ pub struct GateRequest<'a> {
     pub command: Option<&'a str>,
     /// Confirmation skips exactly this policy and no other (BUS.md §9.4).
     pub skip_policy: Option<&'a str>,
+    /// Exceptions a person granted this session. Each lifts only the rule it names.
+    pub grants: Option<&'a Grants>,
 }
 
 // ---------------------------------------------------------------- configuration
 
+/// Where a guardrail config is read for. A project's layer sits on its workspace's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigScope {
+    Global,
+    Workspace(Id),
+    Project(Id),
+}
+
 /// Read the effective config: defaults <- global settings <- project override <- the
 /// project's legacy `protected_paths` / `critical_files` fields.
 pub fn config(conn: &Connection, project_id: Option<Id>) -> Result<GuardrailConfig, BusError> {
-    let mut root = crate::handlers::settings::defaults()["guardrails"].clone();
-    // Settings are leaves. Overlay every global guardrail leaf except `projects.*`.
+    config_for(conn, project_id.map_or(ConfigScope::Global, ConfigScope::Project))
+}
+
+/// The effective config at one scope: defaults <- global <- the workspace <- the project <- the
+/// project's legacy `protected_paths` / `critical_files` columns.
+pub fn config_for(conn: &Connection, scope: ConfigScope) -> Result<GuardrailConfig, BusError> {
+    let layers = layers(conn, scope)?;
+    let root = layers.stages.last().map(|(_, value)| value.clone()).unwrap_or_default();
+    typed(root)
+}
+
+/// Every layer that applies at a scope: each one's raw stored overrides, and the effective
+/// value after it was applied. Read with one pass over the stored `guardrails.*` leaves.
+pub struct Layers {
+    pub workspace_id: Option<Id>,
+    /// `(layer, raw overrides)`, defaults excluded, in application order.
+    pub raw: Vec<(GuardrailLayer, Value)>,
+    /// `(layer, effective after it)`, defaults first.
+    pub stages: Vec<(GuardrailLayer, Value)>,
+    /// The project's legacy columns contributed something.
+    pub legacy: bool,
+}
+
+pub fn layers(conn: &Connection, scope: ConfigScope) -> Result<Layers, BusError> {
+    // The project row first: it names the workspace whose layer sits under it.
+    let (workspace_id, project) = match scope {
+        ConfigScope::Global => (None, None),
+        ConfigScope::Workspace(id) => (Some(id), None),
+        ConfigScope::Project(project_id) => {
+            let row: Option<(Id, String, String)> = conn
+                .prepare_cached("SELECT workspace_id, protected_paths, critical_files FROM projects WHERE id = ?1")
+                .bus()?
+                .query_row([project_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .optional()
+                .bus()?;
+            let Some((workspace_id, protected, critical)) = row else {
+                return Err(BusError::not_found("project.not_found", format!("no project {project_id}")));
+            };
+            (Some(workspace_id), Some((project_id, protected, critical)))
+        }
+    };
+    let workspace_prefix = workspace_id.map(|id| format!("workspaces.{id}"));
+    let project_prefix = project.as_ref().map(|(id, _, _)| format!("projects.{id}"));
+    let mut global = json!({});
+    let mut workspace = json!({});
+    let mut own = json!({});
     let mut stmt = conn
         .prepare_cached("SELECT path, value FROM settings WHERE path LIKE 'guardrails.%' ORDER BY path")
         .bus()?;
     let rows = stmt
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-        .bus()?
-        .collect::<rusqlite::Result<Vec<_>>>()
         .bus()?;
-    for (path, raw) in rows {
+    for row in rows {
+        let (path, raw) = row.bus()?;
         let Some(relative) = path.strip_prefix("guardrails.") else { continue };
-        if relative.starts_with("projects.") {
-            continue;
-        }
-        let value: Value = serde_json::from_str(&raw).map_err(crate::engine::internal)?;
-        set_at(&mut root, relative, value);
-    }
-    if let Some(project_id) = project_id {
-        let prefix = format!("guardrails.projects.{project_id}");
-        let mut stmt = conn
-            .prepare_cached("SELECT path, value FROM settings WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\' ORDER BY path")
-            .bus()?;
-        let rows = stmt
-            .query_map(params![prefix, format!("{prefix}.%")], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })
-            .bus()?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .bus()?;
-        for (path, raw) in rows {
-            let relative = path.strip_prefix(&prefix).unwrap_or("").trim_start_matches('.');
-            let value: Value = serde_json::from_str(&raw).map_err(crate::engine::internal)?;
-            if relative.is_empty() {
-                crate::handlers::settings::merge_value(&mut root, &value);
+        let under = |prefix: &str| -> Option<String> {
+            let rest = relative.strip_prefix(prefix)?;
+            if rest.is_empty() {
+                Some(String::new())
             } else {
-                set_at(&mut root, relative, value);
+                rest.strip_prefix('.').map(str::to_owned)
             }
-        }
-        let legacy: Option<(String, String)> = conn
-            .query_row(
-                "SELECT protected_paths, critical_files FROM projects WHERE id = ?1",
-                [project_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()
-            .bus()?;
-        let Some((protected, critical)) = legacy else {
-            return Err(BusError::not_found("project.not_found", format!("no project {project_id}")));
         };
+        let (target, at) = if let Some(at) = workspace_prefix.as_deref().and_then(under) {
+            (&mut workspace, at)
+        } else if let Some(at) = project_prefix.as_deref().and_then(under) {
+            (&mut own, at)
+        } else if under("projects").is_some() || under("workspaces").is_some() {
+            continue;
+        } else {
+            (&mut global, relative.to_string())
+        };
+        let value: Value = serde_json::from_str(&raw).map_err(crate::engine::internal)?;
+        put_raw(target, &at, value);
+    }
+
+    let mut current = crate::handlers::settings::defaults()["guardrails"].clone();
+    if let Some(map) = current.as_object_mut() {
+        map.remove("projects");
+        map.remove("workspaces");
+    }
+    let mut stages = vec![(GuardrailLayer::Default, current.clone())];
+    let mut raws = Vec::new();
+    let mut apply = |layer: GuardrailLayer, raw: Value, current: &mut Value| {
+        crate::handlers::settings::merge_value(current, &raw);
+        stages.push((layer, current.clone()));
+        raws.push((layer, raw));
+    };
+    apply(GuardrailLayer::Global, global, &mut current);
+    if workspace_id.is_some() {
+        apply(GuardrailLayer::Workspace, workspace, &mut current);
+    }
+    let mut legacy = false;
+    if let Some((_, protected, critical)) = project {
+        let mut next = current.clone();
+        crate::handlers::settings::merge_value(&mut next, &own);
         let mut protected_paths: Vec<String> = serde_json::from_str(&protected).unwrap_or_default();
+        legacy |= !protected_paths.is_empty();
         protected_paths.extend(
-            root["protected_paths"]
+            next["protected_paths"]
                 .as_array()
                 .into_iter()
                 .flatten()
@@ -110,10 +171,11 @@ pub fn config(conn: &Connection, project_id: Option<Id>) -> Result<GuardrailConf
         );
         protected_paths.sort();
         protected_paths.dedup();
-        root["protected_paths"] = json!(protected_paths);
+        next["protected_paths"] = json!(protected_paths);
 
         let critical: Vec<String> = serde_json::from_str(&critical).unwrap_or_default();
-        let gates = root["shape_gates"].as_array_mut().ok_or_else(|| {
+        legacy |= !critical.is_empty();
+        let gates = next["shape_gates"].as_array_mut().ok_or_else(|| {
             BusError::invalid("guardrail.config", "shape_gates must be an array")
         })?;
         for path in critical {
@@ -121,12 +183,110 @@ pub fn config(conn: &Connection, project_id: Option<Id>) -> Result<GuardrailConf
                 gates.push(json!({"path": path, "validator": "non_empty"}));
             }
         }
+        stages.push((GuardrailLayer::Project, next));
+        raws.push((GuardrailLayer::Project, own));
     }
-    root.as_object_mut().map(|m| m.remove("projects"));
+    Ok(Layers { workspace_id, raw: raws, stages, legacy })
+}
+
+/// Deserialize and validate one effective tree.
+pub fn typed(root: Value) -> Result<GuardrailConfig, BusError> {
     let cfg: GuardrailConfig = serde_json::from_value(root)
         .map_err(|e| BusError::invalid("guardrail.config", format!("invalid guardrail config: {e}")))?;
     validate_config(&cfg)?;
     Ok(cfg)
+}
+
+/// Settings rows are leaves. Rebuild one layer's overrides from them. A stored `null` means
+/// nothing; a stored object (the `{}` a cleared subtree leaves behind) merges rather than
+/// replacing the subtree, which used to wipe `caps` and fail every read after.
+fn put_raw(root: &mut Value, path: &str, value: Value) {
+    if value.is_null() {
+        return;
+    }
+    if path.is_empty() {
+        crate::handlers::settings::merge_value(root, &value);
+        return;
+    }
+    let mut current = root;
+    for part in path.split('.') {
+        if !current.is_object() {
+            *current = json!({});
+        }
+        current = current
+            .as_object_mut()
+            .unwrap()
+            .entry(part.to_string())
+            .or_insert(Value::Null);
+    }
+    if value.is_object() && current.is_object() {
+        crate::handlers::settings::merge_value(current, &value);
+    } else {
+        *current = value;
+    }
+}
+
+/// Drop every object that a `null` patch emptied, bottom up. An empty object stored as a leaf
+/// carries no meaning, and the root itself stays.
+pub fn prune_empty(value: &mut Value) {
+    if let Value::Object(map) = value {
+        for child in map.values_mut() {
+            prune_empty(child);
+        }
+        map.retain(|_, child| !(child.is_null() || child.as_object().is_some_and(|m| m.is_empty())));
+    }
+}
+
+/// The patch that undoes `before -> after` under [`merge_value`]: keys `after` added become
+/// `null`, everything `before` held comes back.
+pub fn inverse_patch(before: &Value, after: &Value) -> Value {
+    let (Some(before_map), Some(after_map)) = (before.as_object(), after.as_object()) else {
+        return before.clone();
+    };
+    let mut patch = serde_json::Map::new();
+    for (key, value) in before_map {
+        match after_map.get(key) {
+            Some(next) if next == value => {}
+            Some(next) if value.is_object() && next.is_object() => {
+                patch.insert(key.clone(), inverse_patch(value, next));
+            }
+            _ => {
+                patch.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    for key in after_map.keys() {
+        if !before_map.contains_key(key) {
+            patch.insert(key.clone(), Value::Null);
+        }
+    }
+    Value::Object(patch)
+}
+
+/// Leaf paths of an effective tree: objects recurse, arrays and scalars are leaves.
+pub fn leaf_paths(value: &Value, prefix: &str, out: &mut Vec<String>) {
+    match value.as_object() {
+        Some(map) if !map.is_empty() => {
+            for (key, child) in map {
+                let path = if prefix.is_empty() { key.clone() } else { format!("{prefix}.{key}") };
+                leaf_paths(child, &path, out);
+            }
+        }
+        _ => out.push(prefix.to_string()),
+    }
+}
+
+/// Does a raw override tree set `path` (or an ancestor of it, as a non-object)?
+pub fn sets_path(raw: &Value, path: &str) -> bool {
+    let mut current = raw;
+    for part in path.split('.') {
+        match current.get(part) {
+            Some(next) if next.is_object() => current = next,
+            Some(_) => return true,
+            None => return false,
+        }
+    }
+    true
 }
 
 pub fn validate_config(cfg: &GuardrailConfig) -> Result<(), BusError> {
@@ -149,32 +309,6 @@ pub fn validate_config(cfg: &GuardrailConfig) -> Result<(), BusError> {
         }
     }
     Ok(())
-}
-
-fn set_at(root: &mut Value, path: &str, value: Value) {
-    if path.is_empty() {
-        crate::handlers::settings::merge_value(root, &value);
-        return;
-    }
-    let mut current = root;
-    let parts: Vec<&str> = path.split('.').collect();
-    for (index, part) in parts.iter().enumerate() {
-        if index == parts.len() - 1 {
-            if !current.is_object() {
-                *current = json!({});
-            }
-            current.as_object_mut().unwrap().insert((*part).to_string(), value);
-            return;
-        }
-        if !current.is_object() {
-            *current = json!({});
-        }
-        current = current
-            .as_object_mut()
-            .unwrap()
-            .entry((*part).to_string())
-            .or_insert_with(|| json!({}));
-    }
 }
 
 // ---------------------------------------------------------------- authorization
@@ -217,6 +351,10 @@ pub fn authorize(
         return Ok(());
     }
 
+    // Asking a person is always open: a role that may not act may still say it is stuck.
+    if entry.name == grants::OP {
+        return Ok(());
+    }
     let cfg = config(conn, Some(session.project_id))?;
     let allowed = role_allowlist(&cfg, session.role);
     if allowed.iter().any(|pattern| op_matches(pattern, entry.name)) {
@@ -270,6 +408,9 @@ pub fn callability(
     };
     if entry.meta.kind == OpKind::Query {
         return self_only(if scoped { "own session only".into() } else { "query".into() });
+    }
+    if entry.name == grants::OP {
+        return self_only("every agent may ask for an exception".to_string());
     }
     // Layer 3: the role allowlist, then the two deliberate per-session escape hatches.
     let Some(cfg) = cfg else {
@@ -331,6 +472,34 @@ pub fn evaluate(conn: &Connection, request: &GateRequest<'_>) -> Result<Decision
     }
 }
 
+/// [`evaluate`], and when that would not allow an agent's action, once more with the grants
+/// its session holds. The common path pays nothing for grants. Returns the decision and the
+/// grants it leaned on — consume those only if the action then really happens.
+pub fn evaluate_granted(
+    conn: &Connection,
+    request: &GateRequest<'_>,
+    session_id: Option<Id>,
+) -> Result<(Decision, Vec<Id>), BusError> {
+    let first = evaluate(conn, request)?;
+    let (Some(session_id), true) = (session_id, request.actor.is_agent()) else {
+        return Ok((first, Vec::new()));
+    };
+    if matches!(first, Decision::Allow) {
+        return Ok((first, Vec::new()));
+    }
+    let grants = Grants::load(conn, session_id)?;
+    if grants.is_empty() {
+        return Ok((first, Vec::new()));
+    }
+    let second = evaluate(conn, &GateRequest { grants: Some(&grants), ..request.clone() })?;
+    let used = if matches!(second, Decision::Allow) { grants.used() } else { Vec::new() };
+    Ok((second, used))
+}
+
+fn granted_path(request: &GateRequest<'_>, path: &Path) -> bool {
+    request.grants.is_some_and(|grants| grants.covers_path(request.worktree, path))
+}
+
 fn evaluate_write(cfg: &GuardrailConfig, request: &GateRequest<'_>) -> Result<Decision, BusError> {
     let raw_path = request.path.ok_or_else(|| {
         BusError::invalid("guardrail.path", "kind=write requires path")
@@ -341,7 +510,7 @@ fn evaluate_write(cfg: &GuardrailConfig, request: &GateRequest<'_>) -> Result<De
         WriteTarget::Outside(decision) => return Ok(*decision),
     };
     if let Some(pattern) = cfg.protected_paths.iter().find(|p| path_matches(p, &path)) {
-        if request.skip_policy != Some("protected_path") {
+        if request.skip_policy != Some("protected_path") && !granted_path(request, &path) {
             return Ok(refuse_or_user_hold(
                 request.actor,
                 "protected_path",
@@ -476,6 +645,11 @@ fn write_target(
     if roots.iter().skip(1).any(|root| candidate.starts_with(root)) {
         return Ok(WriteTarget::Scratch);
     }
+    // A person let this session write here. It is outside the repository, so nothing below
+    // (protected paths, shape gates, rewrite size) has anything left to judge.
+    if request.grants.is_some_and(|grants| grants.covers_root(candidate)) {
+        return Ok(WriteTarget::Scratch);
+    }
     let listed: Vec<String> = roots.iter().map(|root| root.display().to_string()).collect();
     Ok(WriteTarget::Outside(Box::new(refuse_or_user_hold(
         request.actor,
@@ -494,13 +668,15 @@ fn write_target(
 /// an ignored file is build output or scratch, not repository content. Untracked or modified
 /// files carry work that exists nowhere else — those are the ones worth stopping (D114).
 fn recoverable(worktree: &Path, path: &Path) -> Option<&'static str> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(worktree)
-        .args(["status", "--porcelain", "--ignored=matching", "--untracked-files=all", "--"])
-        .arg(path)
-        .output()
-        .ok()?;
+    let out = crate::proc::output_with_timeout(
+        Command::new("git")
+            .arg("-C")
+            .arg(worktree)
+            .args(["status", "--porcelain", "--ignored=matching", "--untracked-files=all", "--"])
+            .arg(path),
+        GIT_TIMEOUT,
+    )
+    .ok()??;
     if !out.status.success() {
         return None;
     }
@@ -543,7 +719,7 @@ fn destructive_decision(
         .map(|old| removed as f64 * 100.0 / old as f64);
     let over_lines = removed > limits.min_removed_lines;
     let over_pct = removed_pct.is_some_and(|pct| pct > limits.min_removed_pct);
-    if (over_lines || over_pct) && request.skip_policy != Some("destructive_write") {
+    if (over_lines || over_pct) && request.skip_policy != Some("destructive_write") && !granted_path(request, path) {
         // Volume is a proxy; what actually matters is whether the work can come back. Asked
         // only here, on the path that was about to block, so the common write pays nothing.
         if limits.allow_if_recoverable {
@@ -595,10 +771,12 @@ fn evaluate_commit(cfg: &GuardrailConfig, request: &GateRequest<'_>) -> Result<D
         lines = lines.saturating_add(added).saturating_add(removed);
         touched.push(path.to_string());
     }
+    // Every protected path the commit touches needs its own grant.
     if let Some((path, pattern)) = touched.iter().find_map(|path| {
         cfg.protected_paths
             .iter()
             .find(|pattern| path_matches(pattern, Path::new(path)))
+            .filter(|_| !granted_path(request, Path::new(path)))
             .map(|pattern| (path, pattern))
     }) {
         if request.skip_policy != Some("protected_path") {
@@ -611,14 +789,17 @@ fn evaluate_commit(cfg: &GuardrailConfig, request: &GateRequest<'_>) -> Result<D
             ));
         }
     }
-    if (files > cfg.caps.files || lines > cfg.caps.lines) && request.skip_policy != Some("cap") {
+    if (files > cfg.caps.files || lines > cfg.caps.lines)
+        && request.skip_policy != Some("cap")
+        && !request.grants.is_some_and(|grants| grants.covers_caps(files, lines, &cfg.caps))
+    {
         return Ok(refuse_or_user_hold(
             request.actor,
             "cap",
             "guardrail.cap",
             format!(
                 "commit changes {files} files / {lines} lines; caps are {} files / {} lines. \
-                 Commit in smaller pieces, or ask for guardrails.caps to be raised for this project",
+                 Commit in smaller pieces; if the change cannot be split, ask the user to let it through",
                 cfg.caps.files, cfg.caps.lines
             ),
             json!({"files": files, "lines": lines, "cap_files": cfg.caps.files, "cap_lines": cfg.caps.lines, "paths": touched}),
@@ -631,21 +812,72 @@ fn evaluate_exec(cfg: &GuardrailConfig, request: &GateRequest<'_>) -> Result<Dec
     let command = request.command.ok_or_else(|| {
         BusError::invalid("guardrail.command", "kind=exec requires command")
     })?;
-    if let Some((pattern, argv)) = denied_match(&cfg.denied_commands, command) {
-        if request.skip_policy != Some("denied_command") {
-            return Ok(refuse_or_user_hold(
-                request.actor,
-                "denied_command",
-                "guardrail.command",
-                format!(
-                    "{} runs the denied command {pattern:?}; test a command with guardrail.check first, or ask for a hold",
-                    argv.join(" ")
-                ),
-                json!({"command": command, "pattern": pattern, "argv": argv}),
+    if request.actor.is_agent() {
+        if let Some(argv) = self_approval(command) {
+            // No grant lifts this one: an agent approving its own exception is no exception.
+            return Ok(Decision::Refuse(
+                BusError::refused(
+                    "guardrail.self_approval",
+                    format!("{} would answer a guardrail as the user; only the user can do that", argv.join(" ")),
+                )
+                .with_details(json!({"command": command, "argv": argv}))
+                .with_hint("Ask with guardrail.request and wait for guardrail.request_resolved; the user answers it in Relay."),
             ));
         }
     }
+    if request.skip_policy == Some("denied_command") {
+        return Ok(Decision::Allow);
+    }
+    let uncovered = denied_matches(&cfg.denied_commands, command).into_iter().find(|hit| {
+        !request.grants.is_some_and(|grants| grants.covers_command(&hit.bare))
+    });
+    if let Some(DeniedMatch { pattern, argv, .. }) = uncovered {
+        return Ok(refuse_or_user_hold(
+            request.actor,
+            "denied_command",
+            "guardrail.command",
+            format!(
+                "{} runs the denied command {pattern:?}; test a command with guardrail.check first",
+                argv.join(" ")
+            ),
+            json!({"command": command, "pattern": pattern, "argv": argv}),
+        ));
+    }
     Ok(Decision::Allow)
+}
+
+/// The user-only answers to a guardrail, reached through the CLI as the user. Best effort: the
+/// socket does not authenticate `user`, so this closes the obvious door, not every door.
+const USER_ONLY_ANSWERS: &[&str] = &[
+    "guardrail.confirm", "guardrail.reject", "guardrail.config.set", "guardrail.grant.revoke", "settings.set", "settings.reset",
+];
+
+/// Does a command line invoke Relay as the user, or answer a guardrail through it? Returns the
+/// offending argv.
+fn self_approval(line: &str) -> Option<Vec<String>> {
+    for command in shell_commands(line) {
+        let words: Vec<&str> = command.iter().map(|word| word.text.as_str()).collect();
+        let relay = words.iter().any(|word| {
+            let stem = Path::new(word).file_stem().and_then(|stem| stem.to_str()).unwrap_or(word);
+            stem.to_ascii_lowercase().starts_with("relay") || word.contains("RELAY_BIN")
+        });
+        // Clearing the session identity makes the CLI fall back to the user actor.
+        let sheds_identity = words.iter().enumerate().any(|(at, word)| {
+            word.starts_with("RELAY_ACTOR=")
+                || word.starts_with("RELAY_SESSION=")
+                || (*word == "-u" || *word == "--unset") && words.get(at + 1) == Some(&"RELAY_SESSION")
+                || *word == "unset" && words.get(at + 1) == Some(&"RELAY_SESSION")
+        });
+        let as_user = words.iter().enumerate().any(|(at, word)| {
+            matches!(*word, "--actor=user" | "--actor=test")
+                || *word == "--actor" && matches!(words.get(at + 1), Some(&"user") | Some(&"test"))
+        });
+        let answers = words.iter().any(|word| USER_ONLY_ANSWERS.contains(word));
+        if (relay && (as_user || answers)) || sheds_identity {
+            return Some(command.iter().map(|word| word.text.clone()).collect());
+        }
+    }
+    None
 }
 
 /// One shell word plus whether *every* character of it came from inside quotes. A partly
@@ -723,9 +955,19 @@ fn shell_commands(line: &str) -> Vec<Vec<Word>> {
     commands
 }
 
-/// Does any command in `line` actually *run* one of the denied patterns? Returns the pattern
-/// and the offending argv. Quoted data that merely mentions a pattern is not a match.
-fn denied_match(patterns: &[String], line: &str) -> Option<(String, Vec<String>)> {
+/// One place a command line runs a denied pattern.
+struct DeniedMatch {
+    pattern: String,
+    argv: Vec<String>,
+    /// The command's unquoted words, lowercased.
+    bare: Vec<String>,
+}
+
+/// Every command in `line` that actually *runs* one of the denied patterns. Quoted data that
+/// merely mentions a pattern is not a match. All of them, not the first: a grant has to cover
+/// each one for the line to pass.
+fn denied_matches(patterns: &[String], line: &str) -> Vec<DeniedMatch> {
+    let mut hits = Vec::new();
     for command in shell_commands(line) {
         if is_guardrail_dry_run(&command) {
             continue;
@@ -744,12 +986,25 @@ fn denied_match(patterns: &[String], line: &str) -> Option<(String, Vec<String>)
                 continue;
             }
             if bare.windows(wanted.len()).any(|window| window == wanted.as_slice()) {
-                let argv = command.iter().map(|word| word.text.clone()).collect();
-                return Some((pattern.clone(), argv));
+                hits.push(DeniedMatch {
+                    pattern: pattern.clone(),
+                    argv: command.iter().map(|word| word.text.clone()).collect(),
+                    bare: bare.clone(),
+                });
             }
         }
     }
-    None
+    hits
+}
+
+/// The unquoted words of each command in `line`, lowercased — how a command grant is compared.
+pub(crate) fn command_words(line: &str) -> Vec<Vec<String>> {
+    shell_commands(line)
+        .into_iter()
+        .map(|command| {
+            command.iter().filter(|word| !word.quoted).map(|word| word.text.to_ascii_lowercase()).collect()
+        })
+        .collect()
 }
 
 /// `relay q guardrail.check ...` is the sanctioned way to ask "would this be allowed?".
@@ -780,7 +1035,16 @@ fn refuse_or_user_hold(
     } else if matches!(policy, "destructive_write" | "shape_gate") {
         hold(policy, code, message, details)
     } else {
-        Decision::Refuse(BusError::refused(code, message).with_details(details))
+        let mut error = BusError::refused(code, message);
+        let mut details = details;
+        // The agent is told it can ask, and exactly what to ask for.
+        if let Some((kind, value)) = grants::suggestion(policy, &details) {
+            error = error.with_hint(grants::hint(kind, &value));
+            if let Some(map) = details.as_object_mut() {
+                map.insert("exception".into(), json!({"kind": kind, "value": value}));
+            }
+        }
+        Decision::Refuse(error.with_details(details))
     }
 }
 
@@ -852,13 +1116,13 @@ fn changed_line_counts(old: &str, new: &str) -> (u32, u32) {
     (removed, added)
 }
 
+/// Both git probes here run with the store lock held, so they get a deadline (D144).
+const GIT_TIMEOUT: Duration = Duration::from_secs(10);
+
 fn git_output(worktree: &Path, args: &[&str]) -> Result<String, BusError> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(worktree)
-        .args(args)
-        .output()
-        .map_err(|e| BusError::unavailable("git.unavailable", e.to_string()))?;
+    let out = crate::proc::output_with_timeout(Command::new("git").arg("-C").arg(worktree).args(args), GIT_TIMEOUT)
+        .map_err(|e| BusError::unavailable("git.unavailable", e.to_string()))?
+        .ok_or_else(|| BusError::unavailable("git.timeout", format!("git {} took longer than 10s", args.join(" "))))?;
     if !out.status.success() {
         return Err(BusError::conflict(
             "git.failed",

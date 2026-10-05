@@ -81,10 +81,15 @@ pub fn forward_remove_args(serial: &str, scid: u32) -> Vec<String> {
     ]
 }
 
-/// How the server should pin the video orientation. Unlocked (the default) lets the
+/// How the server should pin the captured orientation. Unlocked (the default) lets the
 /// stream follow the device, which is why the reader has to handle a mid-stream
 /// [`StreamUnit::Session`]; pinning one angle keeps a recorded macro's coordinates
 /// meaningful across a rotation the app does on its own.
+///
+/// v4.1 has no `lock_video_orientation` — it became `capture_orientation`, whose value is
+/// `[@]<angle>` with `@` meaning "locked". The old key is unknown to the pinned jar, and an
+/// unknown key makes the server refuse to start, so the old spelling was a hard failure
+/// waiting for the first caller that set it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LockOrientation {
     #[default]
@@ -96,14 +101,16 @@ pub enum LockOrientation {
 }
 
 impl LockOrientation {
-    /// The server parses this key as a string, not an int — "unlocked" is a real value.
+    /// The `capture_orientation` value (`Options.parseCaptureOrientation` in the jar):
+    /// a bare angle captures at that angle and still follows the device, `@angle` locks it.
+    /// "Unlocked" is therefore `0` — the server default spelled out.
     fn as_arg(self) -> &'static str {
         match self {
-            LockOrientation::Unlocked => "unlocked",
-            LockOrientation::Deg0 => "0",
-            LockOrientation::Deg90 => "90",
-            LockOrientation::Deg180 => "180",
-            LockOrientation::Deg270 => "270",
+            LockOrientation::Unlocked => "0",
+            LockOrientation::Deg0 => "@0",
+            LockOrientation::Deg90 => "@90",
+            LockOrientation::Deg180 => "@180",
+            LockOrientation::Deg270 => "@270",
         }
     }
 }
@@ -124,7 +131,7 @@ pub struct MirrorOptions {
     pub video_bit_rate: u32,
     pub max_fps: u32,
     /// `None` leaves the key off the line entirely (server default: unlocked).
-    pub lock_video_orientation: Option<LockOrientation>,
+    pub capture_orientation: Option<LockOrientation>,
     /// Relay decodes video only; the audio socket would just be another thing to drain.
     pub audio: bool,
     /// Keep the device awake while plugged in — a mirror that watches a screen that
@@ -143,7 +150,7 @@ impl Default for MirrorOptions {
             max_size: 1024,
             video_bit_rate: 8_000_000,
             max_fps: 60,
-            lock_video_orientation: None,
+            capture_orientation: None,
             audio: false,
             stay_awake: true,
             power_off_on_close: false,
@@ -194,6 +201,22 @@ pub fn capture_bit_rate(max_size: u32) -> u32 {
     scaled.min(20_000_000) as u32
 }
 
+/// The stream size scrcpy will most likely pick for a `width`×`height` display capped at
+/// `max_size` on the long edge: the short side scaled and rounded to a multiple of 8
+/// (`(minor * max / major + 4) & !7`, the server's own rounding). Only an estimate — v4.1
+/// also honours the encoder's alignment, and `wm size` reports the natural (portrait) size
+/// even in landscape — so the real size always comes from the stream's session packet; this
+/// is what the start response says before that packet exists.
+pub fn fit_size(width: u32, height: u32, max_size: u32) -> (u32, u32) {
+    let (w, h) = (width & !7, height & !7);
+    let (major, minor) = (w.max(h), w.min(h));
+    if major == 0 || max_size == 0 || major <= max_size {
+        return (w, h);
+    }
+    let minor = ((u64::from(minor) * u64::from(max_size) / u64::from(major)) as u32 + 4) & !7;
+    if w >= h { (max_size, minor) } else { (minor, max_size) }
+}
+
 /// The full `adb shell … app_process` invocation that boots the server on-device, with
 /// Relay's standing defaults and one capture rung. Options kept to long-stable names —
 /// the server hard-fails on any unknown key. Meta preludes (dummy byte, device name,
@@ -228,8 +251,8 @@ pub fn server_shell_args_with(serial: &str, scid: u32, opts: &MirrorOptions) -> 
         format!("max_fps={}", opts.max_fps),
         format!("stay_awake={}", opts.stay_awake),
     ];
-    if let Some(lock) = opts.lock_video_orientation {
-        args.push(format!("lock_video_orientation={}", lock.as_arg()));
+    if let Some(lock) = opts.capture_orientation {
+        args.push(format!("capture_orientation={}", lock.as_arg()));
     }
     if opts.power_off_on_close {
         args.push("power_off_on_close=true".into());

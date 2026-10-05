@@ -1,0 +1,110 @@
+/* sessions area styles: loaded after theme.css, so rules here override it. */
+/* sessions-1 */
+/* Inline confirmation: an armed destructive key turns red and asks for a second click. */
+button.confirm-armed, button.quiet.confirm-armed, button.confirm-armed:hover, button.quiet.confirm-armed:hover {
+  background: @held; border-color: @held; color: white; font-weight: 600;
+}
+button.confirm-armed label { color: white; }
+.umd button.confirm-armed, .umd button.icon-key.confirm-armed { padding: 0 8px; font-size: 11px; }
+.confirm-caption { font-weight: 600; }
+
+/* The banner under the title bar: dismissible, clears itself. */
+.notice-bar { background: @slab; border-bottom: 1px solid @held; padding-right: 6px; }
+.notice-bar .notice { background: transparent; border: 0; padding: 8px 12px; }
+.notice-bar button.notice-dismiss { margin-top: 4px; color: @secondary; }
+.notice-bar button.notice-dismiss:hover { color: @ink; }
+
+/* Notification center: the bell's popover. */
+popover.notification-center contents { padding: 0; }
+.notification-center scrolledwindow, .notification-center viewport { background: transparent; }
+.notification-heading { padding: 12px 12px 10px; border-bottom: 1px solid @edge; }
+.notification-title { color: @ink; font-weight: 600; font-size: 13px; }
+.notification-summary { color: @faint; font-size: 11px; }
+.notification-row { border-bottom: 1px solid @edge; }
+.notification-row:last-child { border-bottom: 0; }
+button.notification-open { background: transparent; border: 0; border-radius: 0; padding: 10px 12px; min-height: 0; }
+button.notification-open:hover { background: @wash; }
+.notification-row button.notification-read { margin: 0 8px 0 2px; }
+.notification-row-title { color: @secondary; font-size: 12px; font-weight: 500; }
+.notification-row.unread .notification-row-title { color: @ink; font-weight: 600; }
+.notification-time { color: @faint; font-size: 11px; }
+.notification-body { color: @secondary; font-size: 12px; }
+.notification-meta { color: @faint; font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif; font-size: 10px; font-weight: 600; letter-spacing: 0.08em; }
+.notification-dot { min-width: 6px; min-height: 6px; margin-top: 5px; border-radius: 3px; background: @secondary; }
+.notification-dot.held { background: @held; }
+.notification-dot.live { background: @live; }
+.notification-dot.neutral { background: @secondary; }
+.notification-empty { padding: 28px 16px; }
+.notification-empty-title { color: @ink; font-size: 13px; font-weight: 600; }
+.notification-empty-detail { color: @secondary; font-size: 12px; }
+
+/* "Where it left off" on a stopped session's slate. */
+.session-slate scrolledwindow, .session-slate viewport { background: transparent; }
+.slate-context { background: @console; border: 1px solid @edge; padding: 10px 12px; margin-top: 4px; }
+.slate-context-title { color: @faint; font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif; font-size: 11px; font-weight: 600; letter-spacing: 0.1em; }
+.slate-context-key { color: @faint; font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif; font-size: 10px; font-weight: 600; letter-spacing: 0.08em; margin-top: 1px; }
+.slate-context-value { color: @ink; font-size: 12px; }
+.slate-context-value.slate-context-report { color: @secondary; }
+.slate-context-value.slate-context-dirty { color: @waiting; }
+.slate-context-empty { color: @secondary; font-size: 12px; }
+/* end sessions-1 */
+
+
+/* adb-lease */
+.device-lease {
+  padding: 8px 10px;
+  border-radius: 8px;
+  background-color: alpha(@waiting, 0.08);
+  border: 1px solid alpha(@waiting, 0.28);
+}
+.device-lease-mark {
+  min-width: 3px;
+  min-height: 28px;
+  border-radius: 2px;
+  background-color: @waiting;
+}
+.device-lease-holder { color: @ink; font-weight: 600; font-size: 12px; }
+.device-lease-action { color: @secondary; font-size: 11px; }
+/* /adb-lease */
+
+/* sessions-2 */
+/* Agent settings: a popover anchored to the pane's sliders key, not a side sheet. */
+popover.agent-settings > contents { background: @slab; border: 1px solid @strong; border-radius: 2px; padding: 0; box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45); }
+popover.agent-settings > arrow { background: @slab; border: 1px solid @strong; }
+.agent-menu { padding: 12px 10px 10px 10px; }
+/* The popover lives under the pane header in the widget tree; undo the header's 22px keys. */
+popover.agent-settings button { min-height: 28px; min-width: 0; padding: 0 10px; font-size: 12px; }
+.agent-menu-head { padding: 0 4px; }
+.agent-menu-title { color: @ink; font-size: 15px; font-weight: 600; }
+.agent-menu-state { font-family: 'Fira Sans Condensed'; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; color: @secondary; padding: 1px 6px; border: 1px solid @edge; border-radius: 2px; }
+.agent-menu-state.live { color: @live; border-color: alpha(@live, 0.45); }
+.agent-menu-state.held { color: @held; border-color: alpha(@held, 0.45); }
+.agent-menu-meta { color: @secondary; font-size: 12px; padding: 2px 4px 4px 4px; }
+.agent-menu-path { padding: 1px 4px; color: @faint; }
+.agent-menu-path label { color: @secondary; font-size: 11px; }
+.agent-menu-section { color: @faint; font-family: 'Fira Sans Condensed'; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; padding: 12px 4px 4px 4px; border-top: 1px solid @edge; margin-top: 8px; }
+popover.agent-settings button.agent-menu-row { background: transparent; border-color: transparent; color: @ink; min-height: 30px; padding: 0 6px; border-radius: 2px; }
+popover.agent-settings button.agent-menu-row:hover { background: @wash; }
+button.agent-menu-row:disabled { opacity: 0.45; }
+button.agent-menu-row image { color: @secondary; }
+button.agent-menu-row:hover image { color: @ink; }
+.agent-menu-caption { color: @ink; font-size: 13px; }
+.agent-menu-field { color: @secondary; font-size: 11px; padding: 0 2px; }
+.agent-menu-hint { color: @secondary; font-size: 11px; }
+.agent-menu entry { min-height: 28px; background: @screen; }
+.agent-menu entry:disabled { opacity: 0.55; }
+.agent-menu-switch { padding: 6px 4px; }
+popover.agent-settings button.agent-menu-save { margin-top: 6px; min-height: 30px; }
+.agent-menu-devices { margin: 2px 6px; }
+.agent-menu-phone { padding: 2px 6px 0 6px; }
+.agent-menu-phone label { font-family: 'Fira Mono', monospace; font-size: 11px; }
+popover.agent-settings button.agent-menu-danger:hover { background: alpha(@held, 0.14); }
+button.agent-menu-danger:hover label, button.agent-menu-danger:hover image { color: @held; }
+.agent-menu-confirm { margin: 4px 2px 2px 2px; padding: 10px; background: @console; border: 1px solid @edge; border-radius: 2px; }
+.agent-menu-confirm checkbutton label { color: @secondary; font-size: 12px; }
+popover.agent-settings button.agent-menu-confirm-go { background: @held; border-color: @held; color: white; font-weight: 600; }
+popover.agent-settings button.agent-menu-confirm-go:hover { background: shade(@held, 1.12); border-color: shade(@held, 1.12); }
+/* A pane whose provider is still starting: amber lamp, quiet slate, a spinner under the step. */
+.terminal-plate.starting .umd .lamp, .lamp.starting { background: @waiting; border-color: @waiting; }
+.terminal-plate.starting .session-state, .terminal-plate.starting .slate-state { color: @waiting; }
+.session-slate spinner { min-width: 18px; min-height: 18px; color: @secondary; }

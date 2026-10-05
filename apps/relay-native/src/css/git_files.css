@@ -1,0 +1,251 @@
+/* git_files area styles: loaded after theme.css, so rules here override it. */
+
+/* ---- File-type tints. Muted so a tree of them reads as texture, not confetti. ---- */
+.file-icon { color: @secondary; }
+.ft-rust { color: #de8c5c; }
+.ft-ts { color: #4f9ad6; }
+.ft-react { color: #5cc4dc; }
+.ft-js { color: #dcc157; }
+.ft-json { color: #c9a24c; }
+.ft-md { color: #8eaed0; }
+.ft-config { color: #a597cb; }
+.ft-css { color: #5fb3c9; }
+.ft-html { color: #e07a5a; }
+.ft-py { color: #6fa3dc; }
+.ft-shell { color: #8ec46c; }
+.ft-image { color: #bb8fd9; }
+.ft-lock { color: #8d9097; }
+.ft-git { color: #e2694a; }
+.ft-text { color: #a5a5a3; }
+.ft-archive { color: #b9a06a; }
+.ft-go { color: #62c4dc; }
+.ft-c { color: #7397d6; }
+.ft-java { color: #d77d55; }
+.ft-code { color: #b3a7d9; }
+.ft-data { color: #d48fb4; }
+.ft-shader { color: #9bc36d; }
+.ft-plain { color: #8a8a8d; }
+.ft-folder { color: #c8a96a; }
+
+/* ---- Git status colours: names and letters, explorer and Source Control alike. ---- */
+.git-modified { color: #e2c08d; }
+.git-added, .git-untracked { color: #73c991; }
+.git-deleted { color: #e5675b; }
+.git-renamed { color: #73b2e8; }
+.git-conflict { color: #f0786f; }
+.git-ignored { color: #6c6c70; }
+.tree-name.git-deleted, .scm-name.git-deleted { text-decoration-line: line-through; }
+.tree-name.git-ignored { color: #6c6c70; }
+
+/* ---- Explorer ---- */
+.code-files { background: @console; }
+.explorer-head { min-height: 35px; padding: 0 4px 0 12px; }
+.explorer-head .section-label { padding: 0; color: @secondary; letter-spacing: 0.1em; }
+.explorer-actions button.explorer-key, .code-bar .explorer-actions button.explorer-key {
+  min-width: 24px; min-height: 24px; padding: 0; border-radius: 2px; color: @faint;
+}
+.explorer-actions button.explorer-key:hover { background: @wash; color: @ink; }
+.code-search { margin: 6px 8px 4px; min-height: 26px; font-size: 12px; }
+.file-tree { padding: 2px 0 10px; background: @console; }
+button.tree-row {
+  min-height: 22px; padding: 0 8px 0 4px; border: 0; border-radius: 0;
+  background: transparent; color: @ink; font-size: 12.5px; font-weight: 400;
+}
+button.tree-row:hover { background: alpha(@ink, 0.045); }
+button.tree-row.selected { background: alpha(@ink, 0.095); }
+button.tree-row:focus-visible { outline: 1px solid alpha(@ink, 0.38); outline-offset: -1px; }
+button.tree-row:active { background: alpha(@ink, 0.12); }
+.tree-guides { color: alpha(@ink, 0.075); }
+button.tree-row:hover .tree-guides, .file-tree:hover .tree-guides { color: alpha(@ink, 0.13); }
+.tree-chevron { color: @faint; }
+button.tree-row:hover .tree-chevron { color: @secondary; }
+.tree-glyph { min-width: 16px; margin-right: 6px; }
+.tree-name { font-size: 12.5px; color: @ink; }
+.tree-badge {
+  min-width: 14px; margin-left: 6px; font-family: 'Fira Mono', monospace;
+  font-size: 11px; font-weight: 600;
+}
+.tree-empty { padding: 4px 12px 4px 38px; color: @faint; font-size: 11.5px; font-style: italic; }
+.tree-dir { color: @faint; font-size: 11px; }
+button.tree-row.search-hit { min-height: 38px; padding: 3px 10px; }
+.search-snippet { color: @secondary; font-family: 'Fira Mono', monospace; font-size: 11px; margin-left: 20px; }
+
+/* ---- Image hover card ---- */
+popover.image-hover > contents {
+  padding: 8px; background: @slab; border: 1px solid @strong; border-radius: 2px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+}
+.image-hover-card { min-width: 132px; }
+.image-hover-name { color: @ink; font-size: 12px; font-weight: 500; }
+.image-hover-frame {
+  padding: 6px;
+  border-radius: 2px;
+  background-color: #1d1d21;
+  background-image:
+    linear-gradient(45deg, #26262b 25%, transparent 25%, transparent 75%, #26262b 75%),
+    linear-gradient(45deg, #26262b 25%, transparent 25%, transparent 75%, #26262b 75%);
+  background-size: 12px 12px;
+  background-position: 0 0, 6px 6px;
+}
+.image-hover-card.loading .image-hover-frame { min-width: 120px; min-height: 80px; }
+.image-hover-meta { color: @secondary; font-family: 'Fira Mono', monospace; font-size: 10.5px; }
+.image-hover-meta.error { color: #f0786f; font-family: 'Fira Sans', sans-serif; font-size: 11.5px; }
+
+/* ---- Source Control: header and branch picker ---- */
+.code-git { background: @console; }
+.git-head { min-height: 38px; padding: 0 4px 0 6px; }
+.git-branch-picker > button, .code-bar .git-branch-picker > button {
+  min-height: 28px; padding: 0 8px; border: 1px solid transparent; border-radius: 2px;
+  background: transparent; color: @ink; font-size: 12.5px;
+}
+.git-branch-picker > button:hover, .git-branch-picker > button:checked { background: @wash; border-color: @edge; }
+.git-branch-name { font-family: 'Fira Mono', monospace; font-size: 12px; font-weight: 500; color: @ink; }
+.git-sync-counts { color: @secondary; margin: 0 2px; }
+.git-sync-count { font-family: 'Fira Mono', monospace; font-size: 10.5px; margin-right: 3px; }
+.git-unpublished { color: @faint; }
+.code-bar button.git-head-key { min-width: 26px; min-height: 26px; padding: 0; color: @faint; }
+.code-bar button.git-head-key:hover { color: @ink; }
+
+popover.branch-popover > contents { padding: 0; border: 1px solid @strong; border-radius: 2px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5); }
+.branch-search { margin: 8px; min-height: 30px; font-size: 12.5px; }
+.branch-list { padding: 0 0 6px; }
+.branch-heading {
+  padding: 10px 12px 4px; color: @faint; font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif;
+  font-size: 10.5px; font-weight: 600; letter-spacing: 0.1em;
+}
+.branch-note { padding: 14px 12px; color: @secondary; font-size: 12px; }
+button.branch-row {
+  min-height: 28px; padding: 0 10px 0 12px; border: 0; border-radius: 0;
+  background: transparent; color: @ink;
+}
+button.branch-row:hover, button.branch-row:focus-visible { background: alpha(@ink, 0.07); outline: 0; }
+button.branch-row.current { background: alpha(@live, 0.08); }
+button.branch-row.current image { color: @live; }
+button.branch-row.held-elsewhere .branch-name, button.branch-row.held-elsewhere image { opacity: 0.55; }
+button.branch-row.remote image { color: @faint; }
+.branch-name { font-family: 'Fira Mono', monospace; font-size: 12px; }
+.branch-tag {
+  padding: 1px 6px; border-radius: 2px; background: alpha(@ink, 0.07);
+  color: @secondary; font-size: 10.5px;
+}
+button.branch-create { min-height: 30px; border-bottom: 1px solid @edge; }
+button.branch-create image { color: @secondary; }
+button.branch-create .branch-name { font-family: 'Fira Sans', sans-serif; color: @secondary; }
+button.branch-create:hover .branch-name { color: @ink; }
+.branch-create-form { padding: 8px 12px 10px; border-bottom: 1px solid @edge; background: alpha(@ink, 0.025); }
+.branch-create-form entry { min-height: 28px; font-size: 12px; }
+button.branch-delete { min-width: 26px; min-height: 26px; margin-right: 6px; padding: 0; color: @faint; opacity: 0; }
+.branch-row-wrap:hover button.branch-delete, button.branch-delete:focus-visible { opacity: 1; }
+button.branch-delete:hover { color: #f0786f; }
+
+/* ---- Source Control: commit box ---- */
+.scm-commit { padding: 10px 10px 8px; border-bottom: 1px solid @edge; }
+.code-commit-message {
+  min-height: 46px; padding: 6px 8px; border: 1px solid @strong; border-radius: 2px;
+  background: @screen; font-size: 12.5px;
+}
+.code-commit-message:focus-within { border-color: @secondary; }
+.code-commit-placeholder { padding: 7px 9px; color: @faint; font-size: 12.5px; }
+.scm-commit-split button.scm-commit-key { min-height: 28px; border-radius: 2px 0 0 2px; font-size: 12.5px; }
+.scm-commit-more > button {
+  min-height: 28px; min-width: 26px; padding: 0; border-radius: 0 2px 2px 0;
+  background: @ink; border: 1px solid @ink; border-left: 1px solid alpha(@wall, 0.35); color: @wall;
+}
+.scm-commit-more > button:hover { background: white; }
+.scm-commit-more > button:disabled { opacity: 0.4; }
+button.scm-suggest { min-height: 28px; padding: 0 10px; border: 1px solid @strong; color: @secondary; }
+popover.scm-menu > contents { padding: 4px 0; }
+button.scm-menu-item { min-height: 28px; padding: 0 14px; border-radius: 0; color: @ink; font-weight: 400; }
+.scm-clean { padding: 14px 14px 12px; border-bottom: 1px solid @edge; color: @live; }
+.scm-clean-title { color: @ink; font-size: 12.5px; font-weight: 500; }
+.scm-clean-hint { color: @faint; font-size: 11.5px; }
+
+/* ---- Source Control: groups and rows ---- */
+.scm-section { border-bottom: 1px solid @edge; }
+.scm-section-head { min-height: 26px; padding-right: 4px; }
+.scm-section-head:hover { background: alpha(@ink, 0.03); }
+button.scm-toggle {
+  min-height: 26px; padding: 0 6px 0 4px; border: 0; border-radius: 0; background: transparent; color: @secondary;
+}
+button.scm-toggle:hover { background: transparent; color: @ink; }
+.scm-chevron { color: @faint; min-width: 14px; }
+.scm-title {
+  font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif; font-size: 11px;
+  font-weight: 600; letter-spacing: 0.08em; color: @secondary;
+}
+.scm-count {
+  min-width: 16px; margin-left: 4px; padding: 0 5px; border-radius: 2px;
+  background: alpha(@ink, 0.1); color: @ink; font-size: 10.5px; font-weight: 600;
+}
+.scm-head-actions { opacity: 0; }
+.scm-section-head:hover .scm-head-actions, .scm-head-actions:focus-within { opacity: 1; }
+button.scm-head-key, button.scm-action { min-width: 22px; min-height: 22px; padding: 0; border-radius: 2px; color: @secondary; }
+button.scm-head-key:hover, button.scm-action:hover { background: alpha(@ink, 0.1); color: @ink; }
+.scm-section-body { padding-bottom: 4px; }
+.scm-row { min-height: 22px; padding-right: 8px; }
+.scm-row:hover { background: alpha(@ink, 0.045); }
+button.scm-open {
+  min-height: 22px; padding: 0 4px 0 22px; border: 0; border-radius: 0;
+  background: transparent; color: @ink; font-weight: 400;
+}
+button.scm-open:hover { background: transparent; }
+button.scm-open:focus-visible { outline: 1px solid alpha(@ink, 0.38); outline-offset: -1px; }
+.scm-name { font-size: 12.5px; color: @ink; }
+.scm-dir { color: @faint; font-size: 11.5px; margin-left: 2px; }
+.scm-row button.scm-action { opacity: 0; margin: 0 2px; }
+.scm-row:hover button.scm-action, .scm-row button.scm-action:focus-visible { opacity: 1; }
+.scm-letter {
+  min-width: 14px; margin-left: 4px; font-family: 'Fira Mono', monospace;
+  font-size: 11px; font-weight: 600;
+}
+.code-git-hint { padding: 6px 14px; font-size: 11.5px; color: @faint; }
+.code-merge-pick { padding: 4px 14px; }
+
+/* ---- Remote rows ---- */
+.scm-remote-row { min-height: 40px; padding: 4px 10px 4px 22px; color: @secondary; }
+.scm-remote-title { font-size: 12px; color: @ink; }
+.scm-remote-hint { font-size: 11px; color: @faint; }
+.scm-tag { padding: 1px 7px; border-radius: 2px; font-size: 10.5px; font-weight: 600; background: alpha(@ink, 0.08); color: @secondary; }
+.scm-tag.pr-open { background: alpha(@live, 0.16); color: #73c991; }
+.scm-tag.pr-draft { background: alpha(@ink, 0.08); color: @secondary; }
+.scm-tag.pr-merged { background: rgba(165, 108, 214, 0.18); color: #bb8fd9; }
+.scm-tag.pr-closed { background: alpha(@held, 0.16); color: #f0786f; }
+
+/* ---- History ---- */
+.code-git-split > separator { min-height: 1px; background: @edge; }
+.code-history-pane { background: @console; }
+.scm-history { border-bottom: 0; }
+button.code-graph-toggle { min-height: 20px; margin-right: 2px; padding: 0 7px; font-size: 10.5px; border-radius: 2px; }
+button.code-commit { min-height: 40px; padding: 0 10px 0 8px; border: 0; border-radius: 0; background: transparent; }
+button.code-commit:hover { background: alpha(@ink, 0.045); }
+.code-commit-subject { font-size: 12.5px; color: @ink; }
+.code-commit-sha { font-family: 'Fira Mono', monospace; font-size: 10.5px; color: #c9a24c; }
+.code-commit-author { font-size: 11px; color: @faint; }
+
+/* ---- Diff view ---- */
+.diff-switch button {
+  min-height: 24px; padding: 0 9px; font-size: 11px; border: 1px solid @strong;
+  background: transparent; color: @secondary;
+}
+.diff-switch button:first-child { border-radius: 2px 0 0 2px; }
+.diff-switch button:last-child { border-radius: 0 2px 2px 0; border-left: 0; }
+.diff-switch button:checked { background: @wash; color: @ink; }
+
+/* ---- Commit details panel ---- */
+.commit-title { font-size: 15px; font-weight: 600; color: @ink; }
+.commit-meta { color: @secondary; font-size: 12px; }
+.commit-author { color: @ink; font-size: 12px; }
+.commit-when { color: @faint; font-size: 12px; }
+.commit-sha { font-family: 'Fira Mono', monospace; font-size: 11px; color: #c9a24c; }
+.commit-body { padding: 10px 12px; background: @screen; border: 1px solid @edge; border-radius: 2px; font-family: 'Fira Mono', monospace; font-size: 12px; color: @secondary; }
+.commit-files-head { margin-top: 6px; padding-bottom: 6px; border-bottom: 1px solid @edge; }
+.commit-files { margin-top: 2px; }
+.commit-file { min-height: 26px; padding: 0 4px; }
+.commit-file:hover { background: alpha(@ink, 0.04); }
+.diff-plus { color: #73c991; font-family: 'Fira Mono', monospace; font-size: 11px; }
+.diff-minus { color: #f0786f; font-family: 'Fira Mono', monospace; font-size: 11px; }
+.change-bar { margin-left: 4px; }
+.change-bar > box { border-radius: 1px; }
+.change-bar .bar-added { background: #4fae70; }
+.change-bar .bar-removed { background: #d4574d; }
+.change-bar .bar-empty { background: alpha(@ink, 0.12); }

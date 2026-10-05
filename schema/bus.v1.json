@@ -4,7 +4,7 @@
   "title": "RELAY v4 command bus",
   "description": "Generated from crates/relay-bus by `relay schema`. Do not edit; see docs/BUS.md.",
   "version": 1,
-  "op_count": 212,
+  "op_count": 221,
   "envelope": {
     "request": {
       "$ref": "#/$defs/Request"
@@ -536,7 +536,7 @@
       }
     },
     "workspace.remove": {
-      "summary": "Forget a workspace; conflict if it still has projects",
+      "summary": "Forget a workspace; conflict if it still has projects unless force removes them too",
       "kind": "mutation",
       "audit": "always",
       "undo": "none",
@@ -545,7 +545,9 @@
       "actors": "user_only",
       "doors": "all",
       "emits": [
-        "workspace.deleted"
+        "workspace.deleted",
+        "project.deleted",
+        "session.changed"
       ],
       "since": "1.0",
       "phase": 1,
@@ -553,7 +555,7 @@
         "$ref": "#/$defs/WorkspaceRemoveIn"
       },
       "result": {
-        "$ref": "#/$defs/Empty"
+        "$ref": "#/$defs/WorkspaceRemoveOut"
       }
     },
     "project.add": {
@@ -658,7 +660,7 @@
       }
     },
     "project.remove": {
-      "summary": "Forget a project (never touches disk); conflict if live sessions",
+      "summary": "Forget a project (repository untouched); conflict if live sessions unless force closes them",
       "kind": "mutation",
       "audit": "always",
       "undo": "none",
@@ -667,7 +669,10 @@
       "actors": "user_only",
       "doors": "all",
       "emits": [
-        "project.deleted"
+        "project.deleted",
+        "session.changed",
+        "worktree.changed",
+        "run.changed"
       ],
       "since": "1.0",
       "phase": 1,
@@ -675,7 +680,7 @@
         "$ref": "#/$defs/ProjectRemoveIn"
       },
       "result": {
-        "$ref": "#/$defs/Empty"
+        "$ref": "#/$defs/ProjectRemoveOut"
       }
     },
     "project.stats": {
@@ -2219,6 +2224,9 @@
       "doors": "all",
       "emits": [
         "guardrail.held",
+        "guardrail.refused",
+        "guardrail.grant_used",
+        "guardrail.resolved",
         "notify.new"
       ],
       "since": "1.0",
@@ -2279,6 +2287,7 @@
       "doors": "all",
       "emits": [
         "guardrail.resolved",
+        "guardrail.request_resolved",
         "mailbox.new"
       ],
       "since": "1.0",
@@ -2301,6 +2310,7 @@
       "doors": "all",
       "emits": [
         "guardrail.resolved",
+        "guardrail.request_resolved",
         "mailbox.new"
       ],
       "since": "1.0",
@@ -2313,7 +2323,7 @@
       }
     },
     "guardrail.config.get": {
-      "summary": "Guardrail config: global merged with project overrides",
+      "summary": "Effective guardrail config: defaults, then global, workspace and project overrides",
       "kind": "query",
       "audit": "never",
       "undo": "none",
@@ -2332,7 +2342,7 @@
       }
     },
     "guardrail.config.set": {
-      "summary": "Patch guardrail config (caps, protected paths, thresholds, roles)",
+      "summary": "Patch one layer of guardrail config (caps, protected paths, thresholds, roles)",
       "kind": "mutation",
       "audit": "always",
       "undo": "inverse",
@@ -2350,6 +2360,25 @@
       },
       "result": {
         "$ref": "#/$defs/GuardrailConfig"
+      }
+    },
+    "guardrail.config.layers": {
+      "summary": "One guardrail config layer: effective, inherited, its own overrides, and which layer set each value",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "executor": "core",
+      "actors": "all",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 4,
+      "payload": {
+        "$ref": "#/$defs/GuardrailConfigLayersIn"
+      },
+      "result": {
+        "$ref": "#/$defs/GuardrailConfigLayersOut"
       }
     },
     "guardrail.check": {
@@ -2388,6 +2417,90 @@
       },
       "result": {
         "$ref": "#/$defs/GuardrailExplainOut"
+      }
+    },
+    "guardrail.request": {
+      "summary": "Ask the user for a guardrail exception when you cannot progress without one; every agent may call it",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "session",
+      "executor": "core",
+      "actors": "agent_only",
+      "doors": "all",
+      "emits": [
+        "guardrail.requested",
+        "guardrail.held",
+        "notify.new"
+      ],
+      "since": "1.0",
+      "phase": 4,
+      "payload": {
+        "$ref": "#/$defs/GuardrailRequestIn"
+      },
+      "result": {
+        "$ref": "#/$defs/GuardrailRequestOut"
+      }
+    },
+    "guardrail.request.get": {
+      "summary": "One exception request and its grant: open, approved (and whether still active), denied",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "executor": "core",
+      "actors": "all",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 4,
+      "payload": {
+        "$ref": "#/$defs/GuardrailRequestGetIn"
+      },
+      "result": {
+        "$ref": "#/$defs/GuardrailException"
+      }
+    },
+    "guardrail.requests.list": {
+      "summary": "Exception requests, newest first",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "executor": "core",
+      "actors": "all",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 4,
+      "payload": {
+        "$ref": "#/$defs/GuardrailRequestsListIn"
+      },
+      "result": {
+        "$ref": "#/$defs/GuardrailRequestsListOut"
+      }
+    },
+    "guardrail.grant.revoke": {
+      "summary": "End an approved exception before it would expire",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "executor": "core",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "guardrail.resolved",
+        "guardrail.request_resolved",
+        "mailbox.new"
+      ],
+      "since": "1.0",
+      "phase": 4,
+      "payload": {
+        "$ref": "#/$defs/GuardrailGrantRevokeIn"
+      },
+      "result": {
+        "$ref": "#/$defs/GuardrailException"
       }
     },
     "worktree.list": {
@@ -2606,7 +2719,7 @@
       }
     },
     "git.branch.switch": {
-      "summary": "Switch a clean checkout without a live session to an existing local branch",
+      "summary": "Switch a checkout without a live session to a local or remote branch; uncommitted changes are carried or refused, never discarded",
       "kind": "mutation",
       "audit": "always",
       "undo": "none",
@@ -2623,7 +2736,7 @@
         "$ref": "#/$defs/GitBranchSwitchIn"
       },
       "result": {
-        "$ref": "#/$defs/Empty"
+        "$ref": "#/$defs/GitBranchSwitchOut"
       }
     },
     "git.branch.delete": {
@@ -2805,6 +2918,28 @@
       },
       "result": {
         "$ref": "#/$defs/GitCleanMergedOut"
+      }
+    },
+    "git.branch.cleanup": {
+      "summary": "Remove the worktree and branch of every closed session whose work is merged (into the base branch, or by a merged GitHub PR); unmerged work is kept",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "project",
+      "executor": "core",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "git.changed",
+        "worktree.changed"
+      ],
+      "since": "1.0",
+      "phase": 8,
+      "payload": {
+        "$ref": "#/$defs/GitBranchCleanupIn"
+      },
+      "result": {
+        "$ref": "#/$defs/GitBranchCleanupOut"
       }
     },
     "git.suggest_message": {
@@ -3236,7 +3371,7 @@
       }
     },
     "device.run": {
-      "summary": "gradle installDebug then stream logcat; crashes as run.crash events",
+      "summary": "gradle installDebug then stream logcat; crashes as run.crash events. Holds the device lease while it runs; device.busy names whoever holds it already",
       "kind": "mutation",
       "audit": "always",
       "undo": "none",
@@ -3247,7 +3382,9 @@
       "emits": [
         "run.changed",
         "run.crash",
-        "notify.new"
+        "notify.new",
+        "device.lease.acquired",
+        "device.lease.released"
       ],
       "stream": "logcat",
       "since": "1.0",
@@ -3460,6 +3597,67 @@
       },
       "result": {
         "$ref": "#/$defs/Empty"
+      }
+    },
+    "device.leases": {
+      "summary": "Who is using which Android device right now, without asking adb",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "executor": "core",
+      "actors": "all",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 10,
+      "payload": {
+        "$ref": "#/$defs/Empty"
+      },
+      "result": {
+        "$ref": "#/$defs/DeviceLeasesOut"
+      }
+    },
+    "device.claim": {
+      "summary": "Hold an Android device across several steps (install, test, inspect) so no other session installs over it; device.busy names the holder",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "executor": "core",
+      "actors": "all",
+      "doors": "all",
+      "emits": [
+        "device.lease.acquired"
+      ],
+      "since": "1.0",
+      "phase": 10,
+      "payload": {
+        "$ref": "#/$defs/DeviceClaimIn"
+      },
+      "result": {
+        "$ref": "#/$defs/DeviceLease"
+      }
+    },
+    "device.release": {
+      "summary": "Release a device lease you hold (the user may release any lease but a live run's)",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "executor": "core",
+      "actors": "all",
+      "doors": "all",
+      "emits": [
+        "device.lease.released"
+      ],
+      "since": "1.0",
+      "phase": 10,
+      "payload": {
+        "$ref": "#/$defs/DeviceReleaseIn"
+      },
+      "result": {
+        "$ref": "#/$defs/DeviceReleaseOut"
       }
     },
     "provider.list": {
@@ -4950,6 +5148,9 @@
           "format": "uint64",
           "minimum": 0,
           "description": "How long to block before giving up. Default 60s, clamped to an hour."
+        },
+        "matching": {
+          "description": "Only an event whose payload has every one of these top-level keys equal to the value\ngiven, e.g. `{\"request_id\": 7}`. Omit to take the first event that matches by name."
         }
       }
     },
@@ -5925,10 +6126,41 @@
         "workspace_id": {
           "type": "integer",
           "format": "int64"
+        },
+        "force": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Also remove every project in it, closing their open sessions (`project.remove` with `force`).\nWithout it the op refuses `workspace.has_projects`."
+        },
+        "remove_worktrees": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "With `force`: also delete the Relay-pool worktrees of the sessions it closes. Branches\nare always kept; off by default, so every checkout stays on disk."
         }
       },
       "required": [
         "workspace_id"
+      ]
+    },
+    "WorkspaceRemoveOut": {
+      "type": "object",
+      "properties": {
+        "projects_removed": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "sessions_closed": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "projects_removed",
+        "sessions_closed"
       ]
     },
     "ProjectAddIn": {
@@ -6177,10 +6409,41 @@
         "project_id": {
           "type": "integer",
           "format": "int64"
+        },
+        "force": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Close its open sessions (`session.close`, worktree kept) and stop its device runs first.\nWithout it the op refuses `project.sessions_live` / `project.activity_live`."
+        },
+        "remove_worktrees": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "With `force`: also delete the Relay-pool worktrees of the sessions it closes. Branches\nare always kept; off by default, so every checkout stays on disk."
         }
       },
       "required": [
         "project_id"
+      ]
+    },
+    "ProjectRemoveOut": {
+      "type": "object",
+      "properties": {
+        "sessions_closed": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "runs_stopped": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "sessions_closed",
+        "runs_stopped"
       ]
     },
     "ProjectStatsOut": {
@@ -9121,13 +9384,18 @@
         "dry_run": {
           "type": "string",
           "description": "The op that answers \"would this be allowed?\" without doing it."
+        },
+        "exceptions": {
+          "type": "string",
+          "description": "What to do when a refusal stands between you and the task: how to ask the user for an\nexception and wait for the answer."
         }
       },
       "required": [
         "caps",
         "denied_commands",
         "write_roots",
-        "dry_run"
+        "dry_run",
+        "exceptions"
       ]
     },
     "GuardrailCaps": {
@@ -9744,11 +10012,30 @@
         "hold_id": {
           "type": "integer",
           "format": "int64"
+        },
+        "scope": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GrantScope"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Exception requests only: how long the grant lasts. Defaults to what the agent asked for."
         }
       },
       "required": [
         "hold_id"
       ]
+    },
+    "GrantScope": {
+      "type": "string",
+      "enum": [
+        "once",
+        "session"
+      ],
+      "description": "How long an approved exception lasts: one use, or until the session ends."
     },
     "GuardrailConfirmOut": {
       "type": "object",
@@ -9799,6 +10086,14 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "workspace_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "One of the two, or neither for the global layer."
+        },
         "project_id": {
           "type": [
             "integer",
@@ -9943,6 +10238,14 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "workspace_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "Patch this workspace's layer. At most one of `workspace_id` / `project_id`."
+        },
         "project_id": {
           "type": [
             "integer",
@@ -9950,11 +10253,92 @@
           ],
           "format": "int64"
         },
-        "patch": true
+        "patch": {
+          "description": "Merged into the layer's stored overrides; `null` clears a key back to the inherited value."
+        }
       },
       "required": [
         "patch"
       ]
+    },
+    "GuardrailConfigLayersIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "workspace_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "At most one of the two; neither reads the global layer."
+        },
+        "project_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        }
+      }
+    },
+    "GuardrailConfigLayersOut": {
+      "type": "object",
+      "properties": {
+        "scope": {
+          "$ref": "#/$defs/GuardrailLayer",
+          "description": "The layer asked about."
+        },
+        "workspace_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "project_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "effective": {
+          "$ref": "#/$defs/GuardrailConfig",
+          "description": "What applies at this layer."
+        },
+        "inherited": {
+          "$ref": "#/$defs/GuardrailConfig",
+          "description": "What this layer would get with no overrides of its own: the parent layer's effective config."
+        },
+        "overrides": {
+          "description": "This layer's stored overrides, exactly as stored."
+        },
+        "sources": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/GuardrailLayer"
+          },
+          "description": "Leaf path (`caps.files`, `protected_paths`) to the layer that decided its value."
+        }
+      },
+      "required": [
+        "scope",
+        "effective",
+        "inherited",
+        "overrides",
+        "sources"
+      ]
+    },
+    "GuardrailLayer": {
+      "type": "string",
+      "enum": [
+        "default",
+        "global",
+        "workspace",
+        "project"
+      ],
+      "description": "Which layer of guardrail configuration a value lives in. Each layer overrides the one\nbefore it: defaults, then global, then the project's workspace, then the project."
     },
     "GuardrailCheckIn": {
       "type": "object",
@@ -10141,6 +10525,272 @@
       "required": [
         "subject",
         "verdict"
+      ]
+    },
+    "GuardrailRequestIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "session": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/ExceptionKind",
+          "description": "`command` for a denied command, `path` for a protected path / write root / large rewrite,\n`cap` for the commit caps."
+        },
+        "value": {
+          "type": "string",
+          "description": "The exact command line; the path (worktree-relative or absolute); or `files=N lines=M`."
+        },
+        "reason": {
+          "type": "string",
+          "description": "Why you cannot progress without it. The user reads this before deciding."
+        },
+        "scope": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GrantScope"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What you are asking for; the user may grant less. Default `once`."
+        }
+      },
+      "required": [
+        "session",
+        "kind",
+        "value",
+        "reason"
+      ]
+    },
+    "ExceptionKind": {
+      "type": "string",
+      "enum": [
+        "command",
+        "path",
+        "cap"
+      ],
+      "description": "What an agent asks to be let past. `command` lifts a denied command, `path` a protected\npath, a write root or a destructive-write rule, `cap` the commit caps."
+    },
+    "GuardrailRequestOut": {
+      "type": "object",
+      "properties": {
+        "request": {
+          "$ref": "#/$defs/GuardrailException"
+        },
+        "created": {
+          "type": "boolean",
+          "description": "False when an identical request from this session was already open."
+        },
+        "wait_for": {
+          "type": "string",
+          "description": "The event announcing the answer; wait with `bus.wait {events:[wait_for], matching:{request_id}}`."
+        }
+      },
+      "required": [
+        "request",
+        "created",
+        "wait_for"
+      ]
+    },
+    "GuardrailException": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64",
+          "description": "Also the id of the hold that carries it, so `guardrail.confirm` / `guardrail.reject`\nanswer it with `hold_id` set to this."
+        },
+        "project_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "session": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/$defs/ExceptionKind"
+        },
+        "value": {
+          "type": "string",
+          "description": "The exact command, the path (worktree-relative, a glob, or an absolute root), or the\ncaps wanted (`files=N lines=M`; empty lifts the caps for the grant's life)."
+        },
+        "reason": {
+          "type": "string"
+        },
+        "requested_scope": {
+          "$ref": "#/$defs/GrantScope"
+        },
+        "state": {
+          "$ref": "#/$defs/HoldState"
+        },
+        "scope": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GrantScope"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set once approved."
+        },
+        "active": {
+          "type": "boolean",
+          "description": "Approved, not revoked, and (for `once`) not yet used."
+        },
+        "uses": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "used_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "revoked_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "denial_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "resolved_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "resolved_by": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Actor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "value",
+        "reason",
+        "requested_scope",
+        "state",
+        "active",
+        "uses",
+        "created_at"
+      ],
+      "description": "An agent's request to be let past one guardrail, and — once a person answered — the grant."
+    },
+    "GuardrailRequestGetIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "request_id": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "request_id"
+      ]
+    },
+    "GuardrailRequestsListIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "project_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "session": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GuardrailRequestsFilter"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Default `all`."
+        }
+      }
+    },
+    "GuardrailRequestsFilter": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "all"
+          ]
+        },
+        {
+          "type": "string",
+          "const": "open",
+          "description": "Waiting for an answer."
+        },
+        {
+          "type": "string",
+          "const": "active",
+          "description": "Approved and still usable."
+        }
+      ]
+    },
+    "GuardrailRequestsListOut": {
+      "type": "object",
+      "properties": {
+        "requests": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/GuardrailException"
+          }
+        }
+      },
+      "required": [
+        "requests"
+      ]
+    },
+    "GuardrailGrantRevokeIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "request_id": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "request_id"
       ]
     },
     "WorktreeListIn": {
@@ -10686,6 +11336,14 @@
           "items": {
             "$ref": "#/$defs/Branch"
           }
+        },
+        "remote_branches": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/GitRemoteBranch"
+          },
+          "description": "Remote-tracking branches (`refs/remotes/*`), without the symbolic `origin/HEAD`.",
+          "default": []
         }
       },
       "required": [
@@ -10740,6 +11398,38 @@
         "head",
         "merged",
         "current"
+      ]
+    },
+    "GitRemoteBranch": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "`origin/feature`, as `git branch -r` prints it."
+        },
+        "remote": {
+          "type": "string"
+        },
+        "branch": {
+          "type": "string",
+          "description": "The branch name on the remote, `feature`."
+        },
+        "head": {
+          "type": "string"
+        },
+        "local": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The local branch of the same name, if there is one; switching to the remote selects it."
+        }
+      },
+      "required": [
+        "name",
+        "remote",
+        "branch",
+        "head"
       ]
     },
     "GitBranchCreateIn": {
@@ -10811,12 +11501,37 @@
           ]
         },
         "name": {
-          "type": "string"
+          "type": "string",
+          "description": "A local branch, or a remote-tracking one (`origin/feature`) to check out as a new local\ntracking branch."
+        },
+        "carry_changes": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Bring uncommitted changes to tracked files along, as `git switch` does. Git still refuses\nwhen the target branch would overwrite them; nothing is ever discarded."
         }
       },
       "required": [
         "project_id",
         "name"
+      ]
+    },
+    "GitBranchSwitchOut": {
+      "type": "object",
+      "properties": {
+        "branch": {
+          "type": "string",
+          "description": "The local branch now checked out."
+        },
+        "created": {
+          "type": "boolean",
+          "description": "Whether a local tracking branch was created for a remote branch."
+        }
+      },
+      "required": [
+        "branch",
+        "created"
       ]
     },
     "GitBranchDeleteIn": {
@@ -11074,6 +11789,83 @@
       },
       "required": [
         "deleted"
+      ]
+    },
+    "GitBranchCleanupIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "project_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "dry_run": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "project_id"
+      ]
+    },
+    "GitBranchCleanupOut": {
+      "type": "object",
+      "properties": {
+        "branches": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/GitBranchCleanup"
+          }
+        }
+      },
+      "required": [
+        "branches"
+      ]
+    },
+    "GitBranchCleanup": {
+      "type": "object",
+      "properties": {
+        "branch": {
+          "type": "string"
+        },
+        "session": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The closed session that worked on it."
+        },
+        "outcome": {
+          "type": "string",
+          "description": "`deleted`, `would_delete` (dry run) or `kept`."
+        },
+        "reason": {
+          "type": "string",
+          "description": "Why: how the work was found merged, or what unmerged work kept it."
+        },
+        "pr": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "removed_worktree": {
+          "type": "boolean"
+        },
+        "deleted_remote": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "branch",
+        "outcome",
+        "reason",
+        "removed_worktree",
+        "deleted_remote"
       ]
     },
     "GitSuggestOut": {
@@ -11762,6 +12554,17 @@
         },
         "state": {
           "type": "string"
+        },
+        "lease": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeviceLease"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Who is using this device right now, if anyone. A conflicting run, install or claim\nfrom anyone else is refused with `device.busy` until it is released."
         }
       },
       "required": [
@@ -11777,6 +12580,56 @@
         "usb",
         "avd"
       ]
+    },
+    "DeviceLease": {
+      "type": "object",
+      "properties": {
+        "device": {
+          "type": "string",
+          "description": "The device serial, or `*` when the command named no device (adb's only device, or\nGradle's every device): that lease conflicts with every device."
+        },
+        "session": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The holding session's name; `None` when the user holds it directly."
+        },
+        "kind": {
+          "type": "string",
+          "description": "`run`, `shell` or `claim`."
+        },
+        "action": {
+          "type": "string",
+          "description": "What the holder is doing, in a few words (`device.run debug from relay/brisk-otter`,\n`adb install app-debug.apk`)."
+        },
+        "since": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "expires_in_s": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0,
+          "description": "Seconds until the lease lapses on its own; `None` while it lasts as long as its run."
+        }
+      },
+      "required": [
+        "device",
+        "kind",
+        "action",
+        "since"
+      ],
+      "description": "One holder's exclusive use of an Android device: a `device.run` in flight, an agent's\n`adb install` / `gradlew install*` seen by the guardrail hook, or an explicit `device.claim`.\nReleased with a `device.lease.released` event, so `bus.wait` can wait for it."
     },
     "DeviceWatchIn": {
       "type": "object",
@@ -12252,6 +13105,76 @@
       },
       "required": [
         "name"
+      ]
+    },
+    "DeviceLeasesOut": {
+      "type": "object",
+      "properties": {
+        "leases": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DeviceLease"
+          }
+        }
+      },
+      "required": [
+        "leases"
+      ]
+    },
+    "DeviceClaimIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "device": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Serial from `device.list`; omit to claim every device (what a bare `adb` would touch)."
+        },
+        "action": {
+          "type": "string",
+          "description": "What you will be doing, shown to anyone refused with `device.busy`."
+        },
+        "minutes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "How long to hold it. Default 10, at most 60; released early by `device.release`."
+        }
+      },
+      "required": [
+        "action"
+      ]
+    },
+    "DeviceReleaseIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "device": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Serial to release; omit to release every lease you hold."
+        }
+      }
+    },
+    "DeviceReleaseOut": {
+      "type": "object",
+      "properties": {
+        "released": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DeviceLease"
+          }
+        }
+      },
+      "required": [
+        "released"
       ]
     },
     "ProviderListOut": {

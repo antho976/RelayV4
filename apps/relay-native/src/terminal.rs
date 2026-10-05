@@ -54,6 +54,9 @@ pub struct Pane {
     slate: gtk::Box,
     slate_state: gtk::Label,
     slate_hint: gtk::Label,
+    /// "Where it left off" on a stopped session's slate (`session_context.rs`).
+    slate_context: gtk::Box,
+    context_serial: Cell<u64>,
     status: gtk::Label,
     name: String,
     path: PathBuf,
@@ -159,10 +162,20 @@ impl Pane {
         slate_hint.set_max_width_chars(44);
         slate_hint.set_justify(gtk::Justification::Center);
         slate_content.append(&slate_hint);
+        let slate_context = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        slate_context.add_css_class("slate-context");
+        slate_context.set_visible(false);
+        slate_content.append(&slate_context);
         let slate_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         slate_actions.set_halign(gtk::Align::Center);
         slate_content.append(&slate_actions);
-        slate.append(&slate_content);
+        // A plate is only 280px square; a tall context card scrolls instead of clipping.
+        let slate_scroll = gtk::ScrolledWindow::builder()
+            .child(&slate_content)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vexpand(true)
+            .build();
+        slate.append(&slate_scroll);
         screen.add_overlay(&slate);
         root.append(&screen);
         status.set_wrap(true);
@@ -186,6 +199,8 @@ impl Pane {
             slate,
             slate_state,
             slate_hint,
+            slate_context,
+            context_serial: Cell::new(0),
             status,
             name: name.into(),
             path,
@@ -278,11 +293,17 @@ impl Pane {
             "#5c5c60", "#ff6b5f", "#5fe08c", "#f2cf6b", "#8ab8ff", "#e19bea", "#68dfe8", "#f2f2f0",
         ]
         .map(color);
+        // The plate behind the terminal paints the ground (`@plate`, which follows panel
+        // opacity), so VTE's own default background is clear. Reverse video and explicit
+        // cell colours still use the opaque RGB, and the cursor keeps an opaque glyph.
+        let mut clear = color(background);
+        clear.set_alpha(0.);
         self.terminal.set_colors(
             Some(&color("#dcdcda")),
-            Some(&color(background)),
+            Some(&clear),
             &palette.iter().collect::<Vec<_>>(),
         );
+        self.terminal.set_color_background(&clear);
         self.terminal.set_color_cursor(Some(&color("#ececea")));
         self.terminal
             .set_color_cursor_foreground(Some(&color(background)));
@@ -309,6 +330,18 @@ impl Pane {
     }
     pub fn name(&self) -> &str {
         &self.name
+    }
+    /// Empty and hide the slate's context card; the returned serial is the only one
+    /// [`Pane::context_card`] still answers to, so an older, slower read cannot fill it.
+    pub fn begin_context(&self) -> u64 {
+        let serial = self.context_serial.get().wrapping_add(1);
+        self.context_serial.set(serial);
+        crate::app::clear(&self.slate_context);
+        self.slate_context.set_visible(false);
+        serial
+    }
+    pub fn context_card(&self, serial: u64) -> Option<&gtk::Box> {
+        (self.context_serial.get() == serial).then_some(&self.slate_context)
     }
     pub fn update_session(&self, session: &serde_json::Value) {
         use crate::app::text;
@@ -368,6 +401,8 @@ impl Pane {
         self.state.set_text(&state_label);
         let live = matches!(state, "spawning" | "running" | "idle" | "blocked");
         self.slate.set_visible(!live);
+        // The slate is as see-through as the plate, so it hides the stale screen under it.
+        self.terminal.set_opacity(if live { 1. } else { 0. });
         self.slate_state.set_text(&state_label);
         self.slate_hint.set_text(match state {
             "parked" => "Process released. Scrollback and worktree kept; wake respawns with provider resume.",
@@ -375,7 +410,7 @@ impl Pane {
             "created" => "The launch was interrupted before the provider started.",
             _ => "No signal from this session.",
         });
-        for class in ["live", "held", "waiting", "off"] {
+        for class in ["live", "held", "waiting", "off", "starting"] {
             self.root.remove_css_class(class);
             self.lamp.remove_css_class(class);
         }
@@ -387,6 +422,21 @@ impl Pane {
         };
         self.root.add_css_class(class);
         self.lamp.add_css_class(class);
+    }
+
+    /// A launch in flight: the pane is on the wall before its provider exists, and says which
+    /// step it is on instead of reading as an interrupted launch.
+    pub fn show_progress(&self, step: &str) {
+        self.state.set_text("STARTING");
+        self.slate.set_visible(true);
+        self.slate_state.set_text("STARTING");
+        self.slate_hint.set_text(step);
+        for class in ["live", "held", "waiting", "off", "starting"] {
+            self.root.remove_css_class(class);
+            self.lamp.remove_css_class(class);
+        }
+        self.root.add_css_class("starting");
+        self.lamp.add_css_class("starting");
     }
 
     pub fn set_active(self: &Rc<Self>, active: bool) {

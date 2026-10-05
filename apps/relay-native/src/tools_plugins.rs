@@ -1,7 +1,8 @@
 //! Plugins: bundled bundles of skills, agent rules, docs and MCP servers, switched on per
-//! project (D159). The page lists each plugin with one switch per project; the project row in
-//! the sidebar opens the same switches for that project alone.
-use super::{current, paragraph};
+//! project (D159). The page is a searchable catalog beside a detail pane (`tools_market.rs`);
+//! the project row in the sidebar opens the same switches for that project alone.
+use super::market::{self, Market, Spec};
+use super::paragraph;
 use crate::app::{clear, label, rows, text, Ui};
 use gtk::prelude::*;
 use gtk4 as gtk;
@@ -23,36 +24,69 @@ pub(crate) fn explain(error: &str) -> String {
 }
 
 pub async fn refresh(ui: &Rc<Ui>, project: i64) {
-    let generation = ui.generation.get();
-    let result = ui.call("plugin.list", json!({})).await;
-    if !current(ui, "plugins", project, generation) {
-        return;
+    market::refresh(ui, &SPEC, project).await
+}
+
+static SPEC: Spec = Spec {
+    page: "plugins",
+    title: "Plugins",
+    subtitle: "Whole toolkits for a project's agents: skill folders, standing rules in every brief, and MCP tools. Switch one on per project.",
+    icon: "plugins",
+    noun: ("plugin", "plugins"),
+    placeholder: "Search plugins, skills and tools",
+    filters: &["All", "Enabled", "Available", "Suggested"],
+    list_op: "plugin.list",
+    list_key: "plugins",
+    enable_op: "plugin.enable",
+    id_key: "plugin_id",
+    id: |plugin| text(plugin, "id").to_string(),
+    haystack,
+    passes: |plugin, filter, project| match filter {
+        1 => enabled(plugin, project),
+        2 => !enabled(plugin, project),
+        3 => suggested(plugin, project),
+        _ => true,
+    },
+    group: None,
+    sort: |plugin| text(plugin, "name").to_lowercase(),
+    card,
+    detail,
+    empty,
+    setup: None,
+};
+
+fn haystack(plugin: &Value) -> String {
+    let mut words = vec![
+        text(plugin, "name").to_string(),
+        text(plugin, "id").to_string(),
+        text(plugin, "category").to_string(),
+        text(plugin, "summary").to_string(),
+        text(plugin, "description").to_string(),
+    ];
+    for skill in rows(plugin, "skills") {
+        words.push(text(&skill, "name").to_string());
+        words.push(text(&skill, "description").to_string());
     }
-    let plugins = match result {
-        Ok(value) => rows(&value, "plugins"),
-        Err(error) => {
-            ui.show_error(&explain(&error.to_string()));
-            return;
-        }
-    };
-    let page = &ui.pages["plugins"];
-    clear(page);
-    page.add_css_class("plugins-page");
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 14);
-    content.add_css_class("plugins-content");
-    let head = gtk::Box::new(gtk::Orientation::Vertical, 3);
-    head.append(&label("Plugins", "title"));
-    let copy = paragraph("A plugin gives every agent of a project a whole toolkit at once: skill folders, standing rules in its brief, and MCP tools. Switch one on per project. Skills reach running agents immediately; rules and tools apply when an agent starts or resumes.");
-    copy.set_max_width_chars(96);
-    head.append(&copy);
-    content.append(&head);
-    if plugins.is_empty() {
-        content.append(&paragraph(STALE_ENGINE));
+    for server in rows(plugin, "mcp_servers") {
+        words.push(text(&server, "name").to_string());
+        words.extend(tool_names(&server));
     }
-    for plugin in &plugins {
-        content.append(&card(ui, plugin));
-    }
-    page.append(&crate::app::scrolled(&content));
+    words.join("\n").to_lowercase()
+}
+
+fn tool_names(server: &Value) -> Vec<String> {
+    rows(server, "tools")
+        .iter()
+        .filter_map(|t| t.as_str().map(str::to_string))
+        .collect()
+}
+
+fn tool_count(plugin: &Value) -> usize {
+    rows(plugin, "mcp_servers").iter().map(|s| rows(s, "tools").len()).sum()
+}
+
+fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
 }
 
 fn enabled(plugin: &Value, project: i64) -> bool {
@@ -126,163 +160,308 @@ pub(crate) fn switch(
     toggle
 }
 
-fn card(ui: &Rc<Ui>, plugin: &Value) -> gtk::Box {
-    let card = gtk::Box::new(gtk::Orientation::Vertical, 10);
-    card.add_css_class("record");
-    card.add_css_class("plugin-card");
-    let top = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-    top.append(&crate::icons::image("plugins", 22));
-    let words = gtk::Box::new(gtk::Orientation::Vertical, 2);
+fn card(ui: &Rc<Ui>, market: &Rc<Market>, plugin: &Value) -> gtk::Widget {
+    let scope = market.scope.get();
+    let id = text(plugin, "id");
+    let card = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    card.add_css_class("ext-card");
+    card.append(&market::monogram(text(plugin, "name"), false));
+    let words = gtk::Box::new(gtk::Orientation::Vertical, 4);
     words.set_hexpand(true);
-    words.append(&label(text(plugin, "name"), "title"));
-    let skills = rows(plugin, "skills");
-    let servers = rows(plugin, "mcp_servers");
-    let tools: usize = servers.iter().map(|s| rows(s, "tools").len()).sum();
+    let top = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let name = label(text(plugin, "name"), "ext-name");
+    name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    top.append(&name);
+    let version = label(&format!("v{}", text(plugin, "version")), "ext-version");
+    version.set_valign(gtk::Align::Baseline);
+    top.append(&version);
+    words.append(&top);
+    let category = label(text(plugin, "category"), "ext-meta");
+    category.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    words.append(&category);
+    let summary = label(text(plugin, "summary"), "ext-summary");
+    summary.set_wrap(true);
+    summary.set_lines(2);
+    summary.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    summary.set_max_width_chars(44);
+    words.append(&summary);
+    let mut tags = vec![
+        market::chip(&plural(rows(plugin, "skills").len(), "skill", "skills"), ""),
+        market::chip(&plural(tool_count(plugin), "MCP tool", "MCP tools"), ""),
+        market::chip(&plural(rows(plugin, "docs").len(), "doc", "docs"), ""),
+    ];
+    if suggested(plugin, scope) && !enabled(plugin, scope) {
+        let hint = market::chip("Suggested", "hint");
+        hint.set_tooltip_text(Some("This project's files match what the plugin is for"));
+        tags.push(hint);
+    }
+    let flow = market::chips(&tags);
+    flow.set_margin_top(2);
+    words.append(&flow);
+    card.append(&words);
+    let switch = market::toggle(ui, market, plugin, scope, format!("plugin-{id}-{scope}"));
+    switch.set_valign(gtk::Align::Start);
+    card.append(&switch);
+    card.upcast()
+}
+
+fn detail(ui: &Rc<Ui>, market: &Rc<Market>, plugin: &Value, parent: &gtk::Box) {
+    let id = text(plugin, "id").to_string();
+    let head = gtk::Box::new(gtk::Orientation::Horizontal, 14);
+    head.append(&market::monogram(text(plugin, "name"), true));
+    let words = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    words.set_valign(gtk::Align::Center);
+    words.set_hexpand(true);
+    let title = label(text(plugin, "name"), "ext-detail-title");
+    title.set_wrap(true);
+    words.append(&title);
     words.append(&label(
         &format!(
-            "{} · v{} · {} skills · {} MCP tools",
+            "{} · v{} · bundled with Relay",
             text(plugin, "category"),
-            text(plugin, "version"),
-            skills.len(),
-            tools
+            text(plugin, "version")
         ),
-        "dim",
+        "ext-meta",
     ));
-    top.append(&words);
-    card.append(&top);
-    let summary = paragraph(text(plugin, "description"));
-    summary.set_max_width_chars(110);
-    card.append(&summary);
+    head.append(&words);
+    parent.append(&head);
+    let lede = market::prose(text(plugin, "summary"));
+    lede.add_css_class("ext-lede");
+    parent.append(&lede);
+    parent.append(&market::enable_block(
+        ui,
+        market,
+        plugin,
+        (
+            "Agents launched here get its skills, rules and MCP tools.",
+            "Switch it on to give this project's agents the whole toolkit.",
+        ),
+        format!("plugin-{id}-detail"),
+    ));
 
-    // One switch per project, grouped under its workspace.
-    card.append(&label("PROJECTS", "section-label"));
-    let projects = ui.projects.borrow().clone();
-    let workspaces = ui.workspaces.borrow().clone();
-    if projects.is_empty() {
-        card.append(&label(
-            "Add a project to switch this plugin on for it.",
-            "dim",
-        ));
+    let skills = rows(plugin, "skills");
+    let servers = rows(plugin, "mcp_servers");
+    let tools = tool_count(plugin);
+    let (projects, _) = market::reach(ui, plugin);
+    let switch_name = {
+        let id = id.clone();
+        move |project: i64| format!("plugin-{id}-in-{project}")
+    };
+    parent.append(&market::tabs(
+        market,
+        vec![
+            ("overview", "Overview", None, overview(plugin).upcast()),
+            ("skills", "Skills", Some(skills.len()), skill_list(ui, market, &id, &skills).upcast()),
+            ("tools", "MCP tools", Some(tools), tool_list(&servers).upcast()),
+            ("docs", "Rules & docs", Some(rows(plugin, "docs").len()), documents(ui, market, &id).upcast()),
+            (
+                "projects",
+                "Projects",
+                Some(projects),
+                market::project_switches(ui, market, plugin, &switch_name, Some(suggested)).upcast(),
+            ),
+        ],
+    ));
+}
+
+fn overview(plugin: &Value) -> gtk::Box {
+    let page = gtk::Box::new(gtk::Orientation::Vertical, 20);
+    page.append(&market::prose(text(plugin, "description")));
+    let reach = market::section("How it reaches agents");
+    reach.append(&market::facts(&[
+        (
+            "Skills",
+            "Written into every checkout as real skill folders. Running agents see them at once."
+                .into(),
+            false,
+        ),
+        (
+            "Rules",
+            "Added to each agent's brief when it starts or resumes.".into(),
+            false,
+        ),
+        (
+            "MCP tools",
+            "Registered with the provider when an agent starts or resumes.".into(),
+            false,
+        ),
+    ]));
+    page.append(&reach);
+    let servers: Vec<String> = rows(plugin, "mcp_servers")
+        .iter()
+        .map(|s| text(s, "name").to_string())
+        .collect();
+    let docs: Vec<String> = rows(plugin, "docs")
+        .iter()
+        .filter_map(|d| d.as_str().map(str::to_string))
+        .collect();
+    let about = market::section("Package");
+    about.append(&market::facts(&[
+        ("Identifier", text(plugin, "id").to_string(), true),
+        ("Version", text(plugin, "version").to_string(), true),
+        ("MCP servers", if servers.is_empty() { "None".into() } else { servers.join(", ") }, true),
+        ("Documents", if docs.is_empty() { "None".into() } else { docs.join("\n") }, true),
+    ]));
+    page.append(&about);
+    page
+}
+
+fn skill_list(ui: &Rc<Ui>, market: &Rc<Market>, plugin: &str, skills: &[Value]) -> gtk::Box {
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    list.add_css_class("ext-entries");
+    if skills.is_empty() {
+        list.append(&label("This plugin ships no skills.", "dim"));
     }
-    let grid = gtk::Grid::builder()
-        .column_spacing(12)
-        .row_spacing(6)
-        .build();
-    let mut line = 0;
-    for workspace in &workspaces {
-        let mine: Vec<&Value> = projects
-            .iter()
-            .filter(|p| p["workspace_id"] == workspace["id"])
-            .collect();
-        if mine.is_empty() {
-            continue;
+    for skill in skills {
+        let name = text(skill, "name").to_string();
+        let head = gtk::Box::new(gtk::Orientation::Vertical, 3);
+        let top = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let title = label(&name, "ext-entry-name");
+        title.set_hexpand(true);
+        title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        top.append(&title);
+        let files = skill["files"].as_u64().unwrap_or(0) as usize;
+        if files > 0 {
+            top.append(&label(&plural(files, "file", "files"), "ext-group-count"));
         }
-        let caption = label(text(workspace, "name"), "dim");
-        caption.set_xalign(0.);
-        grid.attach(&caption, 0, line, 3, 1);
-        line += 1;
-        for project in mine {
-            let id = project["id"].as_i64().unwrap_or(0);
-            let name = label(text(project, "name"), "body");
-            name.set_xalign(0.);
-            name.set_hexpand(true);
-            name.set_margin_start(12);
-            name.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            grid.attach(&name, 0, line, 1, 1);
-            if suggested(plugin, id) {
-                let hint = label("Suggested", "task-chip");
-                hint.set_tooltip_text(Some("This project's files match what the plugin is for"));
-                grid.attach(&hint, 1, line, 1, 1);
+        head.append(&top);
+        let about = label(text(skill, "description"), "ext-entry-text");
+        about.set_wrap(true);
+        about.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        about.set_lines(3);
+        about.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        head.append(&about);
+        let body = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        body.add_css_class("ext-entry-body");
+        let expander = gtk::Expander::new(None);
+        expander.add_css_class("ext-entry");
+        expander.set_label_widget(Some(&head));
+        expander.set_child(Some(&body));
+        let weak = Rc::downgrade(ui);
+        let market = Rc::downgrade(market);
+        let plugin = plugin.to_string();
+        expander.connect_expanded_notify(move |expander| {
+            if !expander.is_expanded() || body.first_child().is_some() {
+                return;
             }
-            grid.attach(&switch(ui, plugin, id, None), 2, line, 1, 1);
-            line += 1;
-        }
+            let (Some(ui), Some(market)) = (weak.upgrade(), market.upgrade()) else {
+                return;
+            };
+            let key = format!("{plugin}/skill/{name}");
+            let cached = market.cache.borrow().get(&key).cloned();
+            if let Some(found) = cached {
+                body.append(&market::markdown(&ui, text(&found["skill"], "body")));
+                return;
+            }
+            body.append(&label("Loading SKILL.md…", "dim"));
+            let (body, plugin, name) = (body.clone(), plugin.clone(), name.clone());
+            glib::spawn_future_local(async move {
+                let result = ui
+                    .call("plugin.get", json!({"plugin_id": plugin, "skill": name}))
+                    .await;
+                clear(&body);
+                match result {
+                    Ok(found) => {
+                        body.append(&market::markdown(&ui, text(&found["skill"], "body")));
+                        market.cache.borrow_mut().insert(key, found);
+                    }
+                    Err(error) => body.append(&paragraph(&explain(&error.to_string()))),
+                }
+            });
+        });
+        list.append(&expander);
     }
-    card.append(&grid);
+    list
+}
 
-    let skill_list = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    for skill in &skills {
-        let row = gtk::Box::new(gtk::Orientation::Vertical, 1);
-        row.append(&label(text(skill, "name"), "mono"));
-        let about = paragraph(text(skill, "description"));
-        about.add_css_class("dim");
-        row.append(&about);
-        skill_list.append(&row);
+fn tool_list(servers: &[Value]) -> gtk::Box {
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    if servers.is_empty() {
+        list.append(&label("This plugin adds no MCP servers.", "dim"));
     }
-    card.append(&expander(
-        &format!("Skills ({})", skills.len()),
-        &skill_list,
-    ));
-
-    let tool_list = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    for server in &servers {
-        tool_list.append(&label(
-            &format!("Server `{}`", text(server, "name")),
-            "body",
-        ));
-        tool_list.append(&paragraph(text(server, "description")));
-        let names: Vec<String> = rows(server, "tools")
+    for server in servers {
+        let block = gtk::Box::new(gtk::Orientation::Vertical, 10);
+        block.add_css_class("ext-server");
+        let top = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let name = label(text(server, "name"), "ext-server-name");
+        name.set_hexpand(true);
+        top.append(&name);
+        let tools = tool_names(server);
+        top.append(&label(&plural(tools.len(), "tool", "tools"), "ext-group-count"));
+        block.append(&top);
+        block.append(&market::prose(text(server, "description")));
+        let tags: Vec<gtk::Label> = tools
             .iter()
-            .filter_map(|t| t.as_str().map(str::to_string))
+            .map(|tool| market::chip(tool, "code"))
             .collect();
-        tool_list.append(&label(&names.join("  "), "mono"));
+        block.append(&market::chips(&tags));
+        list.append(&block);
     }
-    card.append(&expander(&format!("MCP tools ({tools})"), &tool_list));
+    let note = label(
+        "Agents get these tools when they start or resume in a project with the plugin on.",
+        "ext-hint",
+    );
+    note.set_wrap(true);
+    list.append(&note);
+    list
+}
 
-    // Rules and documentation are fetched when first opened.
-    let docs = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    let docs_expander = expander("Agent rules and documentation", &docs);
+/// The rules every agent receives and the plugin's documents, fetched when the tab opens.
+fn documents(ui: &Rc<Ui>, market: &Rc<Market>, plugin: &str) -> gtk::Box {
+    let page = gtk::Box::new(gtk::Orientation::Vertical, 20);
     let weak = Rc::downgrade(ui);
-    let id = text(plugin, "id").to_string();
-    docs_expander.connect_expanded_notify(move |expander| {
-        if !expander.is_expanded() || docs.first_child().is_some() {
+    let market = Rc::downgrade(market);
+    let plugin = plugin.to_string();
+    market::lazy(&page, move |page| {
+        let (Some(ui), Some(market)) = (weak.upgrade(), market.upgrade()) else {
+            return;
+        };
+        let cached = market.cache.borrow().get(&plugin).cloned();
+        if let Some(found) = cached {
+            fill_documents(&ui, page, &found);
             return;
         }
-        let Some(ui) = weak.upgrade() else { return };
-        let docs = docs.clone();
-        let id = id.clone();
-        docs.append(&label("Loading…", "dim"));
+        page.append(&label("Loading rules and documents…", "dim"));
+        let (page, plugin) = (page.clone(), plugin.clone());
         glib::spawn_future_local(async move {
-            let result = ui.call("plugin.get", json!({"plugin_id": id})).await;
-            clear(&docs);
+            let result = ui.call("plugin.get", json!({"plugin_id": plugin})).await;
+            clear(&page);
             match result {
-                Ok(detail) => {
-                    docs.append(&label("RULES EVERY AGENT RECEIVES", "section-label"));
-                    docs.append(&source(text(&detail, "instructions")));
-                    for doc in rows(&detail, "docs") {
-                        docs.append(&label(&text(&doc, "path").to_uppercase(), "section-label"));
-                        docs.append(&source(text(&doc, "body")));
-                    }
+                Ok(found) => {
+                    fill_documents(&ui, &page, &found);
+                    market.cache.borrow_mut().insert(plugin, found);
                 }
-                Err(error) => docs.append(&paragraph(&error.to_string())),
+                Err(error) => page.append(&paragraph(&explain(&error.to_string()))),
             }
         });
     });
-    card.append(&docs_expander);
-    card
+    page
 }
 
-fn expander(title: &str, child: &gtk::Box) -> gtk::Expander {
-    let expander = gtk::Expander::new(Some(title));
-    expander.add_css_class("plugin-section");
-    expander.set_expanded(false);
-    child.set_margin_start(12);
-    child.set_margin_top(6);
-    expander.set_child(Some(child));
-    expander
+fn fill_documents(ui: &Ui, page: &gtk::Box, found: &Value) {
+    let rules = market::section("Rules every agent receives");
+    rules.append(&market::markdown(ui, text(found, "instructions")));
+    page.append(&rules);
+    for doc in rows(found, "docs") {
+        let block = market::section(text(&doc, "path"));
+        block.append(&market::markdown(ui, text(&doc, "body")));
+        page.append(&block);
+    }
 }
 
-fn source(body: &str) -> gtk::ScrolledWindow {
-    let view = gtk::TextView::new();
-    view.set_editable(false);
-    view.set_cursor_visible(false);
-    view.set_monospace(true);
-    view.set_wrap_mode(gtk::WrapMode::WordChar);
-    view.add_css_class("skill-source");
-    view.buffer().set_text(body);
-    let scroll = crate::app::scrolled(&view);
-    scroll.set_min_content_height(160);
-    scroll.set_max_content_height(420);
-    scroll.set_propagate_natural_height(true);
-    scroll
+fn empty(ui: &Rc<Ui>, _market: &Rc<Market>) -> gtk::Widget {
+    let retry = crate::app::button("Check again", "");
+    let weak = Rc::downgrade(ui);
+    retry.connect_clicked(move |_| {
+        if let Some(ui) = weak.upgrade() {
+            ui.refresh_page();
+        }
+    });
+    market::state_box(
+        "plugins",
+        "No plugins found",
+        &label(STALE_ENGINE, "dim"),
+        &[retry.upcast()],
+    )
+    .upcast()
 }

@@ -702,6 +702,27 @@ fn idempotent_replay() {
 }
 
 #[test]
+fn usage_display_preferences_default_on_and_override_per_meter() {
+    let e = engine(Instance::Test);
+    let v = call(&e, Actor::User, "settings.get", json!({"path": "usage"})).into_result().unwrap();
+    assert_eq!(v["value"]["refresh_minutes"], 0, "no timer unless the user asks for one");
+    for (provider, meters) in [("claude", &["enabled", "five_hour", "weekly", "fable"][..]), ("codex", &["enabled", "five_hour", "weekly"][..])] {
+        for meter in meters {
+            assert_eq!(v["value"][provider][meter], true, "{provider}.{meter} shows by default");
+        }
+    }
+    call(&e, Actor::User, "settings.set", json!({"path": "usage.codex.enabled", "value": false})).into_result().unwrap();
+    call(&e, Actor::User, "settings.set", json!({"path": "usage.claude.fable", "value": false})).into_result().unwrap();
+    call(&e, Actor::User, "settings.set", json!({"path": "usage.refresh_minutes", "value": 5})).into_result().unwrap();
+    let v = call(&e, Actor::User, "settings.get", json!({"path": "usage"})).into_result().unwrap();
+    assert_eq!(v["value"]["codex"]["enabled"], false);
+    assert_eq!(v["value"]["codex"]["weekly"], true, "hiding a provider keeps its meter choices");
+    assert_eq!(v["value"]["claude"]["fable"], false);
+    assert_eq!(v["value"]["claude"]["five_hour"], true);
+    assert_eq!(v["value"]["refresh_minutes"], 5);
+}
+
+#[test]
 fn settings_tree_and_undo_op() {
     let e = engine(Instance::Test);
     let v = call(&e, Actor::User, "settings.get", json!({})).into_result().unwrap();
@@ -1033,6 +1054,26 @@ async fn socket_door_round_trip_and_events() {
     assert_eq!(result["timed_out"], false);
     assert_eq!(result["event"]["ev"], "settings.changed");
 
+    // `matching` takes this waiter's own event, not the first one of the same name.
+    let mut picky = Client::connect(&server.path).await.unwrap();
+    let wait = tokio::spawn(async move {
+        picky
+            .call(
+                &Request::new(Actor::User, "bus.wait", json!({
+                    "events": ["settings.*"], "matching": {"path": "mine"}, "timeout_ms": 5000,
+                })),
+                |_| {},
+            )
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    c.call(&Request::new(Actor::User, "settings.set", json!({"path": "theirs", "value": 1})), |_| {}).await.unwrap();
+    c.call(&Request::new(Actor::User, "settings.set", json!({"path": "mine", "value": 2})), |_| {}).await.unwrap();
+    let woken = tokio::time::timeout(std::time::Duration::from_secs(5), wait).await.unwrap().unwrap();
+    let result = woken.result.unwrap();
+    assert_eq!(result["event"]["payload"]["path"], "mine", "the waiter took someone else's event");
+
     // …and gives up rather than hanging when nothing matches.
     let mut idle = Client::connect(&server.path).await.unwrap();
     let timed_out = idle
@@ -1085,11 +1126,18 @@ async fn native_mirror_socket_stream_and_disconnect_cleanup() {
     let id = result["mirror_id"].as_i64().unwrap();
     let runtime = relay_core::handlers::device::mirror_by_id(&e, id).unwrap();
     runtime.push(vec![3, 0, 0, 0, 1, 7]);
-    let frame = tokio::time::timeout(Duration::from_secs(2), client.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    // The stream opens with the mirror's status (an object); video packets are strings.
+    let frame = loop {
+        let frame = tokio::time::timeout(Duration::from_secs(2), client.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        match &frame {
+            Line::Frame(f) if f.data.is_object() => assert_eq!(f.data["state"], "starting"),
+            _ => break frame,
+        }
+    };
     match frame {
         Line::Frame(frame) => {
             assert_eq!(frame.stream, "mirror");

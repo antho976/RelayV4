@@ -80,6 +80,10 @@ model or touches the user's project store. Screenshots go under
 `.impeccable/review/`.
 
 See [verification and limits](docs/VERIFICATION.md). The application has no
-refresh timers. Each terminal has a bounded stream connection separate from
+engine refresh timers by default. The one opt-in exception is the usage-limit
+interval (`usage.refresh_minutes`, set from the status bar's limits popup, off by
+default), which re-reads what Claude Code and Codex already saved locally and
+never contacts a provider. A 30-second clock only rewrites the "updated … ago"
+labels. Each terminal has a bounded stream connection separate from
 control requests; project/page changes detach unneeded streams. Engine state
 changes refresh the visible surface, and VTE owns terminal scrolling.

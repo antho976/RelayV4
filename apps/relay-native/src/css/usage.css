@@ -1,0 +1,81 @@
+/* usage area styles: loaded after theme.css, so rules here override it. */
+
+/* Fallbacks until load_appearance defines the runtime colours (a higher-priority provider). */
+@define-color plate @screen;
+@define-color backbox_chrome @console;
+
+/* See-through terminals. Every stack and scrolled window paints @wall (theme.css), and four
+   of them nest between the wallpaper and a terminal, which compounds to opaque. Inside the
+   agents surface only the page stack keeps its @wall; the plate adds @plate on top of it,
+   and VTE's own ground is clear (terminal.rs apply_appearance). Text entries stay opaque. */
+.agents-host,
+.agents-surface stack,
+.agents-surface scrolledwindow,
+.agents-surface viewport { background: transparent; }
+.terminal-plate { background: @plate; }
+.session-slate { background: transparent; }
+/* The workspace strip above the wall is one layer over the page, not a second slab. */
+.code-bar.workspace-strip { background: transparent; }
+
+/* Status bar: compact meters, then when they were last read and a refresh key. */
+.statusbar .usage-group { margin: 0 1px; }
+.statusbar .usage-name { color: @secondary; font-size: 11px; font-weight: 500; margin-right: 2px; }
+.statusbar .usage-caption { color: @faint; font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif; font-size: 10px; font-weight: 600; letter-spacing: 0.04em; margin-left: 3px; }
+.statusbar .usage-value { color: @secondary; font-family: 'Fira Mono', monospace; font-size: 10px; min-width: 26px; }
+.usage-meter trough { min-width: 34px; min-height: 4px; border-radius: 0; background: alpha(@ink, 0.12); border: 0; }
+.usage-meter progress { min-width: 0; min-height: 4px; border-radius: 0; background: @secondary; }
+.usage-meter.warn progress, .usage-bar.warn progress { background: @waiting; }
+.usage-meter.hot progress, .usage-bar.hot progress { background: @held; }
+.usage-meter.stale progress, .usage-bar.stale progress { background: @faint; }
+.statusbar .usage-value.warn { color: @waiting; }
+.statusbar .usage-value.hot { color: @held; }
+.statusbar .usage-value.stale { color: @faint; }
+.usage-strip { margin-left: -4px; }
+.statusbar .usage-age { color: @faint; font-size: 11px; margin-left: 2px; }
+.statusbar .usage-age.failed { color: @waiting; }
+.statusbar button.usage-refresh { min-width: 21px; min-height: 21px; padding: 0; }
+.statusbar button.usage-refresh image { color: @faint; }
+.statusbar button.usage-refresh:hover image { color: @ink; }
+
+/* Popup: readable over any wallpaper, a restrained lift, sections divided by hairlines. */
+.usage-panel { background: @backbox_chrome; box-shadow: 0 10px 28px rgba(0, 0, 0, 0.42); }
+.usage-panel .panel-heading button.icon-key { min-width: 24px; min-height: 24px; }
+.usage-panel .panel-body.usage-body { padding: 0; }
+.usage-checked { padding: 12px 16px 10px; color: @faint; font-size: 11px; }
+.usage-provider { padding: 14px 16px 16px; border-top: 1px solid @edge; }
+.usage-provider-head { min-height: 18px; }
+.usage-provider-head image { color: @secondary; }
+.usage-provider-name { font-size: 13px; font-weight: 600; color: @ink; }
+.usage-reported { color: @faint; font-size: 11px; }
+.usage-row { margin-top: 2px; }
+.usage-row.missing { min-height: 22px; }
+.usage-row-title { color: @secondary; font-size: 12px; }
+.usage-row.missing .usage-row-title { color: @faint; }
+.usage-pct { font-family: 'Fira Mono', monospace; font-size: 20px; font-weight: 500; color: @ink; line-height: 1; }
+.usage-pct.warn { color: @waiting; }
+.usage-pct.hot { color: @held; }
+.usage-pct.stale { color: @faint; }
+.usage-bar trough { min-height: 6px; border-radius: 0; border: 0; background: alpha(@ink, 0.10); }
+.usage-bar progress { min-height: 6px; border-radius: 0; border: 0; background-image: none; box-shadow: none; background: @ink; }
+.usage-reset { color: @faint; font-size: 11px; }
+.usage-reset.stale { color: @secondary; }
+.usage-note { color: @secondary; font-size: 12px; padding: 2px 0; }
+.usage-providers > .usage-note { padding: 14px 16px; border-top: 1px solid @edge; }
+
+.usage-options { padding: 14px 16px 16px; border-top: 1px solid @edge; background: alpha(@wall, 0.45); }
+.usage-options-title { color: @ink; font-size: 12px; font-weight: 600; margin-bottom: 2px; }
+.usage-option-row { min-height: 30px; }
+.usage-option-name { color: @ink; font-size: 12px; }
+.usage-option-row:disabled .usage-option-name { color: @faint; }
+.usage-options switch { min-width: 30px; min-height: 16px; border-radius: 2px; border: 1px solid @strong; background: @slab; background-image: none; box-shadow: none; }
+.usage-options switch:checked { background: @ink; border-color: @ink; }
+.usage-options switch slider { min-width: 14px; min-height: 14px; margin: 1px; border-radius: 2px; border: 0; background: @faint; box-shadow: none; }
+.usage-options switch:checked slider { background: @wall; }
+.usage-chips { border: 1px solid @strong; border-radius: 2px; }
+.usage-chips button.usage-chip { min-height: 24px; padding: 0 8px; border: 0; border-left: 1px solid @strong; border-radius: 0; background: @console; color: @secondary; font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif; font-size: 11px; letter-spacing: 0.04em; }
+.usage-chips button.usage-chip:first-child { border-left: 0; }
+.usage-chips button.usage-chip:hover { background: @wash; color: @ink; }
+.usage-chips button.usage-chip:checked { background: @ink; color: @wall; }
+.usage-chips button.usage-chip:checked label { color: @wall; }
+.usage-chips:disabled { opacity: 0.45; }
+.usage-footnote { padding: 10px 16px 14px; border-top: 1px solid @edge; color: @faint; font-size: 11px; }

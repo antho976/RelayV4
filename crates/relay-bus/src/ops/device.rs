@@ -1,6 +1,6 @@
 //! `device.*` — BUS.md §10.14. `avd.*` is reserved for post-4.0.
 use crate::registry::{Actors, Audit, OpMeta, Scope};
-use crate::types::{Avd, Device, Id, Run};
+use crate::types::{Avd, Device, DeviceLease, Id, Run};
 use crate::{op, Empty};
 use serde_json::Value;
 
@@ -20,7 +20,7 @@ op!(MirrorInput, "device.mirror.input", MirrorInputIn => Empty,
     OpMeta::mutation(Scope::Global, 10, "Touch / key event to the device").audit(Audit::Never).actors(Actors::UserOnly));
 payload!(#[schemars(rename = "DeviceRunIn")] RunIn { pub project_id: Id, pub worktree: Option<String>, pub device: String, pub variant: Option<String>, pub integration_id: Option<Id> });
 op!(RunOp, "device.run", RunIn => Run,
-    OpMeta::mutation(Scope::Project, 10, "gradle installDebug then stream logcat; crashes as run.crash events").actors(Actors::UserOnly).stream("logcat").emits(&["run.changed", "run.crash", "notify.new"]));
+    OpMeta::mutation(Scope::Project, 10, "gradle installDebug then stream logcat; crashes as run.crash events. Holds the device lease while it runs; device.busy names whoever holds it already").actors(Actors::UserOnly).stream("logcat").emits(&["run.changed", "run.crash", "notify.new", "device.lease.acquired", "device.lease.released"]));
 payload!(#[schemars(rename = "DeviceBuildIn")] BuildIn { pub project_id: Id, pub worktree: Option<String>, pub variant: Option<String>, pub format: Option<String>, pub publish: Option<bool>, pub integration_id: Option<Id> });
 op!(Build, "device.build", BuildIn => Run,
     OpMeta::mutation(Scope::Project, 10, "gradle assemble/bundle <Variant> with no device attached; record artifact signing; publish uploads to Google Play").actors(Actors::UserOnly).stream("logcat").emits(&["run.changed"]));
@@ -58,6 +58,27 @@ payload!(#[schemars(rename = "AvdBootIn")] AvdBootIn { pub name: String, pub col
 op!(AvdBoot, "avd.boot", AvdBootIn => Empty,
     OpMeta::mutation(Scope::Global, 12, "Boot an Android Virtual Device").actors(Actors::UserOnly).emits(&["avd.changed"]));
 
+result!(#[schemars(rename = "DeviceLeasesOut")] LeasesOut { pub leases: Vec<DeviceLease> });
+op!(Leases, "device.leases", Empty => LeasesOut,
+    OpMeta::query(Scope::Global, 10, "Who is using which Android device right now, without asking adb"));
+payload!(#[schemars(rename = "DeviceClaimIn")] ClaimIn {
+    /// Serial from `device.list`; omit to claim every device (what a bare `adb` would touch).
+    pub device: Option<String>,
+    /// What you will be doing, shown to anyone refused with `device.busy`.
+    pub action: String,
+    /// How long to hold it. Default 10, at most 60; released early by `device.release`.
+    pub minutes: Option<u32>,
+});
+op!(Claim, "device.claim", ClaimIn => DeviceLease,
+    OpMeta::mutation(Scope::Global, 10, "Hold an Android device across several steps (install, test, inspect) so no other session installs over it; device.busy names the holder").emits(&["device.lease.acquired"]));
+payload!(#[schemars(rename = "DeviceReleaseIn")] ReleaseIn {
+    /// Serial to release; omit to release every lease you hold.
+    pub device: Option<String>,
+});
+result!(#[schemars(rename = "DeviceReleaseOut")] ReleaseOut { pub released: Vec<DeviceLease> });
+op!(Release, "device.release", ReleaseIn => ReleaseOut,
+    OpMeta::mutation(Scope::Global, 10, "Release a device lease you hold (the user may release any lease but a live run's)").emits(&["device.lease.released"]));
+
 entries!(
     List,
     Watch,
@@ -74,5 +95,8 @@ entries!(
     AvdList,
     AvdCatalog,
     AvdCreate,
-    AvdBoot
+    AvdBoot,
+    Leases,
+    Claim,
+    Release
 );

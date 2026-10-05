@@ -84,7 +84,7 @@ impl Editor {
         self.scope_label
             .set_text(&format!("{workspace_name} / {project_name} · {branch}"));
     }
-    fn select_checkout(self: &Rc<Self>, ui: &Rc<Ui>, path: &str) {
+    pub(super) fn select_checkout(self: &Rc<Self>, ui: &Rc<Ui>, path: &str) {
         if self.worktree.borrow().as_str() == path {
             return;
         }
@@ -199,8 +199,16 @@ impl Editor {
                 Ok(value) => {
                     for branch in rows(&value, "branches") {
                         let name = text(&branch, "name").to_owned();
-                        let key = button_row(&name, "branch");
-                        key.set_sensitive(branch["current"] != true && branch["session"].is_null());
+                        let current = branch["current"] == true;
+                        let holder = if current { None } else { ed.branch_holder(&ui, &name) };
+                        let key = button_row(&name, if current { "check" } else { "branch" });
+                        key.set_widget_name(&format!("scope-branch-{name}"));
+                        key.set_sensitive(!current);
+                        key.set_tooltip_text(Some(&match &holder {
+                            Some((path, _)) if path.is_empty() => format!("{name} is checked out in the primary checkout; open it"),
+                            Some((path, _)) => format!("{name} is checked out in {path}; open that checkout"),
+                            None => format!("Switch this checkout to {name}"),
+                        }));
                         let needle = name.to_lowercase();
                         key.set_visible(needle.contains(query.text().to_lowercase().as_str()));
                         let row = key.downgrade();
@@ -219,12 +227,15 @@ impl Editor {
                                 pop.popdown();
                             }
                             if let Some(ui) = weak.upgrade() {
-                                editor.git_action(
-                                    &ui,
-                                    "git.branch.switch",
-                                    json!({"name":name}),
-                                    None,
-                                );
+                                match &holder {
+                                    Some((path, _)) => editor.select_checkout(&ui, path),
+                                    None => editor.git_action(
+                                        &ui,
+                                        "git.branch.switch",
+                                        json!({"name":name}),
+                                        None,
+                                    ),
+                                }
                             }
                         });
                         branch_list.append(&key);
@@ -401,17 +412,217 @@ fn button_row(title: &str, icon: &str) -> gtk::Button {
     row.set_child(Some(&content));
     row
 }
-pub(super) fn file_icon(path: &str) -> &'static str {
-    match std::path::Path::new(path)
+/// The explorer glyph for a path and the CSS class that tints it.
+pub(super) fn file_glyph(path: &str) -> (&'static str, &'static str) {
+    let file = std::path::Path::new(path);
+    let name = file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match name.as_str() {
+        "cargo.lock" | "package-lock.json" | "yarn.lock" | "pnpm-lock.yaml" | "bun.lockb"
+        | "flake.lock" | "poetry.lock" | "composer.lock" | "gemfile.lock" | "uv.lock" => {
+            return ("file-lock", "ft-lock");
+        }
+        ".gitignore" | ".gitattributes" | ".gitmodules" | ".gitkeep" | ".ignore" => {
+            return ("file-git", "ft-git");
+        }
+        "cargo.toml" | "rust-toolchain" | "rust-toolchain.toml" => {
+            return ("file-config", "ft-rust");
+        }
+        "package.json" | "tsconfig.json" => return ("file-json", "ft-js"),
+        "dockerfile" | "makefile" | "justfile" | "containerfile" => {
+            return ("file-shell", "ft-shell");
+        }
+        "license" | "licence" | "copying" | "notice" => return ("file-text", "ft-text"),
+        _ if name.starts_with(".env") || (name.ends_with("rc") && name.starts_with('.')) => {
+            return ("file-config", "ft-config");
+        }
+        _ => {}
+    }
+    let extension = file
         .extension()
         .and_then(|ext| ext.to_str())
         .unwrap_or("")
-    {
-        "rs" | "js" | "ts" | "tsx" | "jsx" | "py" | "kt" | "java" | "svelte" | "html" | "css"
-        | "sh" => "code",
-        "toml" | "json" | "yaml" | "yml" | "xml" | "ini" => "settings",
-        "md" | "txt" | "rst" => "notes",
-        "zip" | "gz" | "tar" => "modules",
-        _ => "file",
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "rs" => ("file-rust", "ft-rust"),
+        "ts" | "mts" | "cts" => ("file-ts", "ft-ts"),
+        "tsx" | "jsx" => ("file-react", "ft-react"),
+        "js" | "mjs" | "cjs" => ("file-js", "ft-js"),
+        "json" | "jsonc" | "json5" | "jsonl" => ("file-json", "ft-json"),
+        "md" | "mdx" | "markdown" => ("file-md", "ft-md"),
+        "toml" | "yaml" | "yml" | "ini" | "cfg" | "conf" | "env" | "properties" | "editorconfig" => {
+            ("file-config", "ft-config")
+        }
+        "css" | "scss" | "sass" | "less" => ("file-css", "ft-css"),
+        "html" | "htm" | "xml" | "svelte" | "vue" | "xhtml" | "ui" => ("file-html", "ft-html"),
+        "py" | "pyi" | "pyw" => ("file-py", "ft-py"),
+        "sh" | "bash" | "zsh" | "fish" | "ps1" | "bat" | "nu" => ("file-shell", "ft-shell"),
+        "lock" => ("file-lock", "ft-lock"),
+        "txt" | "rst" | "log" | "csv" | "tsv" => ("file-text", "ft-text"),
+        "zip" | "gz" | "tar" | "xz" | "7z" | "zst" | "bz2" | "tgz" | "rar" => ("modules", "ft-archive"),
+        "go" => ("code", "ft-go"),
+        "c" | "h" | "cpp" | "hpp" | "cc" | "cxx" | "hh" | "m" | "mm" => ("code", "ft-c"),
+        "java" | "kt" | "kts" | "scala" | "groovy" | "gradle" => ("code", "ft-java"),
+        "cs" | "fs" | "swift" | "rb" | "php" | "lua" | "zig" | "dart" | "ex" | "exs" | "hs"
+        | "ml" | "nim" | "r" | "jl" | "pl" => ("code", "ft-code"),
+        "sql" | "graphql" | "gql" | "proto" | "prisma" => ("file-config", "ft-data"),
+        "glsl" | "wgsl" | "hlsl" | "frag" | "vert" | "shader" => ("code", "ft-shader"),
+        _ if super::image_preview::is_image(path) => ("file-image", "ft-image"),
+        _ => ("file", "ft-plain"),
     }
 }
+
+/// A tinted file-type icon, as the explorer and the Git panel draw it.
+pub(super) fn file_image(path: &str, size: i32) -> gtk::Image {
+    let (glyph, tint) = file_glyph(path);
+    let image = crate::icons::image(glyph, size);
+    image.add_css_class("file-icon");
+    image.add_css_class(tint);
+    image.set_valign(gtk::Align::Center);
+    image
+}
+
+/// One porcelain status code as VS Code letters it, with its colour class.
+pub(super) fn status_letter(code: &str) -> Option<(&'static str, &'static str, &'static str)> {
+    Some(match code.trim() {
+        "M" | "T" => ("M", "git-modified", "Modified"),
+        "A" => ("A", "git-added", "Added"),
+        "?" => ("U", "git-untracked", "Untracked"),
+        "D" => ("D", "git-deleted", "Deleted"),
+        "R" => ("R", "git-renamed", "Renamed"),
+        "C" => ("C", "git-renamed", "Copied"),
+        "U" => ("!", "git-conflict", "Conflict"),
+        "!" => ("I", "git-ignored", "Ignored"),
+        _ => return None,
+    })
+}
+
+thread_local! {
+    /// The explorer row last selected, so a new selection can clear it.
+    static SELECTED_ROW: RefCell<Option<glib::WeakRef<gtk::Widget>>> = const { RefCell::new(None) };
+    /// Changed paths from the last `git.status`, for tinting folders that contain them.
+    static CHANGED: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
+}
+
+pub(super) fn mark_selected(row: &impl IsA<gtk::Widget>) {
+    let row = row.as_ref();
+    SELECTED_ROW.with(|selected| {
+        if let Some(previous) = selected.borrow().as_ref().and_then(|weak| weak.upgrade()) {
+            previous.remove_css_class("selected");
+        }
+        row.add_css_class("selected");
+        *selected.borrow_mut() = Some(row.downgrade());
+    });
+}
+
+/// The strongest status among the changes under a folder, if any.
+pub(super) fn folder_status(path: &str) -> Option<&'static str> {
+    let prefix = format!("{path}/");
+    CHANGED.with(|changed| {
+        let changed = changed.borrow();
+        let codes: Vec<&str> = changed
+            .iter()
+            .filter(|(file, _)| file.starts_with(&prefix))
+            .map(|(_, code)| code.as_str())
+            .collect();
+        if codes.is_empty() {
+            None
+        } else if codes.contains(&"U") {
+            Some("git-conflict")
+        } else if codes.iter().any(|code| *code != "?") {
+            Some("git-modified")
+        } else {
+            Some("git-untracked")
+        }
+    })
+}
+
+const STATUS_CLASSES: [&str; 7] = [
+    "git-modified", "git-added", "git-untracked", "git-deleted", "git-renamed", "git-conflict", "git-ignored",
+];
+
+impl Editor {
+    /// Record the latest status and re-tint the folders already drawn in the explorer.
+    pub(super) fn note_changes(&self, files: &[Value]) {
+        CHANGED.with(|changed| {
+            *changed.borrow_mut() = files
+                .iter()
+                .map(|file| {
+                    let code = if !text(file, "worktree").trim().is_empty() {
+                        text(file, "worktree")
+                    } else {
+                        text(file, "index")
+                    };
+                    let code = if text(file, "index") == "U" { "U" } else { code };
+                    (text(file, "path").to_owned(), code.trim().to_owned())
+                })
+                .filter(|(_, code)| code != "!")
+                .collect();
+        });
+        fn walk(widget: &gtk::Widget) {
+            if widget.has_css_class("code-folder") {
+                if let Some(path) = widget.widget_name().strip_prefix("project-file:") {
+                    let status = folder_status(path);
+                    if let Some(name) = tree_name(widget) {
+                        for class in STATUS_CLASSES {
+                            name.remove_css_class(class);
+                        }
+                        if let Some(class) = status {
+                            name.add_css_class(class);
+                        }
+                    }
+                }
+            }
+            let mut child = widget.first_child();
+            while let Some(next) = child {
+                walk(&next);
+                child = next.next_sibling();
+            }
+        }
+        walk(self.tree.upcast_ref());
+    }
+}
+
+fn tree_name(widget: &gtk::Widget) -> Option<gtk::Label> {
+    let mut child = widget.first_child();
+    while let Some(next) = child {
+        if next.has_css_class("tree-name") {
+            return next.downcast().ok();
+        }
+        if let Some(found) = tree_name(&next) {
+            return Some(found);
+        }
+        child = next.next_sibling();
+    }
+    None
+}
+
+/// Vertical guides at each ancestor's chevron, as VS Code's explorer draws them.
+pub(super) fn indent_guides(depth: usize) -> gtk::DrawingArea {
+    let guides = gtk::DrawingArea::new();
+    guides.set_content_width(depth as i32 * INDENT);
+    guides.set_content_height(1);
+    guides.set_vexpand(true);
+    guides.add_css_class("tree-guides");
+    guides.set_draw_func(move |widget, cr, _, height| {
+        let color = widget.color();
+        cr.set_source_rgba(
+            color.red() as f64,
+            color.green() as f64,
+            color.blue() as f64,
+            color.alpha() as f64,
+        );
+        cr.set_line_width(1.0);
+        for level in 0..depth {
+            let x = (level as i32 * INDENT + INDENT / 2) as f64 + 0.5;
+            cr.move_to(x, 0.0);
+            cr.line_to(x, height as f64);
+        }
+        let _ = cr.stroke();
+    });
+    guides
+}
+pub(super) const INDENT: i32 = 12;

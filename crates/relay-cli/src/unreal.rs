@@ -1147,7 +1147,7 @@ fn crash(project: &Project, index: usize) -> Result<Value> {
         .filter(|e| e.path().is_dir())
         .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
         .collect();
-    crashes.sort_by(|a, b| b.0.cmp(&a.0));
+    crashes.sort_by_key(|c| std::cmp::Reverse(c.0));
     let (_, folder) = crashes.get(index).cloned().ok_or_else(|| anyhow!("there are {} crash reports", crashes.len()))?;
     let context = std::fs::read_to_string(folder.join("CrashContext.runtime-xml")).unwrap_or_default();
     let field = |name: &str| -> Option<String> {

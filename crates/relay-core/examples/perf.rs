@@ -795,6 +795,8 @@ fn cases() -> Vec<Case> {
     });
     per(&mut c, "session.close", "session.close", U, Heavy, |fx| json!({"session": spawned_session(fx)}));
     per(&mut c, "session.close.created", "session.close", U, Mid, |fx| json!({"session": fresh_session(fx)}));
+    // What the shell sends: close the pane, keep the checkout.
+    per(&mut c, "session.close.keep_worktree", "session.close", U, Heavy, |fx| json!({"session": spawned_session(fx), "remove_worktree": false}));
     per_agent(&mut c, "session.done", "session.done", Mid, |fx| {
         fx.user("task.dispatch", json!({"task_id": fresh_task(fx), "session": fx.builder, "start": false}));
         json!({"session": fx.builder, "summary": "done", "status": "completed"})
@@ -1264,6 +1266,26 @@ fn cases() -> Vec<Case> {
     during(&mut c, "session_list.during_task_list", "task.list", json!({"project_id": 1}), "session.list", sessions);
     during(&mut c, "scrollback_tail.during_overlap_scan", "overlap.scan", json!({"project_id": 1}), "session.scrollback", tail);
     during(&mut c, "scrollback_tail.during_device_build", "device.build", json!({"project_id": 1}), "session.scrollback", tail);
+    // Opening or closing one agent must not stall the panes of every other one.
+    let during_session = |c: &mut Vec<Case>, name: &str, other: &'static str, setup: fn(&Fixture) -> Value| {
+        path_case(c, name, Heavy, move |fx| {
+            let fx = fx.clone();
+            let runner = fx.clone();
+            let payload = setup(&fx);
+            let running = std::thread::spawn(move || {
+                runner.call(Actor::User, other, payload);
+            });
+            std::thread::sleep(Duration::from_millis(2));
+            Box::new(move || {
+                let out = Outcome::of(&fx.call(Actor::User, "session.list", json!({"project_id": 1})));
+                fx.join_later(running);
+                out
+            })
+        });
+    };
+    during_session(&mut c, "session_list.during_session_spawn", "session.spawn", |fx| json!({"session": fresh_session(fx)}));
+    during_session(&mut c, "session_list.during_session_close", "session.close", |fx| json!({"session": spawned_session(fx)}));
+    during_session(&mut c, "session_list.during_session_close_keep", "session.close", |fx| json!({"session": spawned_session(fx), "remove_worktree": false}));
     path_case(&mut c, "keystroke.during_busy_thread", Mid, |fx| {
         // The control: a thread that only burns CPU for 30 ms, no engine involved.
         let fx = fx.clone();
@@ -1368,7 +1390,7 @@ fn strace_stop(mut s: Strace) -> Value {
             }
         }
     }
-    top.sort_by(|a, b| b.0.cmp(&a.0));
+    top.sort_by_key(|t| std::cmp::Reverse(t.0));
     json!({"total": total, "top": top.iter().take(8).map(|(n, s)| json!({"syscall": s, "calls": n})).collect::<Vec<_>>()})
 }
 

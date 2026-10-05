@@ -1,5 +1,8 @@
-use super::{action, current, paragraph};
-use crate::app::{button, clear, field, label, rows, text, Ui};
+//! Skills: reusable agent instructions installed from GitHub or written here, switched on or
+//! off per project. The page is a searchable catalog beside a detail pane (`tools_market.rs`).
+use super::market::{self, Market, Spec};
+use super::paragraph;
+use crate::app::{button, field, label, rows, text, Ui};
 use crate::client::Error;
 use gtk::prelude::*;
 use gtk4 as gtk;
@@ -8,394 +11,303 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 pub async fn refresh(ui: &Rc<Ui>, project: i64) {
-    let generation = ui.generation.get();
-    let result = ui.call("skill.list", json!({})).await;
-    if !current(ui, "skills", project, generation) {
-        return;
-    }
-    let data = match result {
-        Ok(v) => rows(&v, "skills"),
-        Err(e) => {
-            ui.show_error(&e.to_string());
-            return;
-        }
-    };
-    let page = &ui.pages["skills"];
-    if ui.page_projects.borrow().get("skills") != Some(&project) {
-        clear(page);
-        page.add_css_class("skills-page");
-        page.set_spacing(0);
-        ui.page_projects
-            .borrow_mut()
-            .insert("skills".into(), project);
-        let head = gtk::Box::new(gtk::Orientation::Vertical, 3);
-        head.add_css_class("skills-head");
-        head.append(&label("Skills", "title"));
-        let copy = paragraph("Install reusable agent instructions from GitHub. Every skill is enabled everywhere and written into every checkout and provider home as a real skill folder; switch one off below for a project that should not see it.");
-        copy.add_css_class("skills-description");
-        head.append(&copy);
-        page.append(&head);
-        install_form(ui, page);
-        let workspace = gtk::Paned::new(gtk::Orientation::Horizontal);
-        workspace.add_css_class("skills-workspace");
-        workspace.set_widget_name("skills-split");
-        workspace.set_vexpand(true);
-        workspace.set_resize_start_child(true);
-        workspace.set_resize_end_child(true);
-        workspace.set_shrink_start_child(false);
-        workspace.set_shrink_end_child(false);
-        workspace.set_position(((ui.window.width() - 240) / 3).clamp(250, 420));
-        let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        list.add_css_class("skills-list");
-        list.set_size_request(220, -1);
-        let scroll = crate::app::scrolled(&list);
-        scroll.set_hexpand(true);
-        scroll.set_min_content_width(220);
-        scroll.set_min_content_height(240);
-        scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
-        workspace.set_start_child(Some(&scroll));
-        let preview = gtk::Box::new(gtk::Orientation::Vertical, 10);
-        preview.add_css_class("skills-preview");
-        preview.set_hexpand(true);
-        preview.set_vexpand(true);
-        preview.set_size_request(300, -1);
-        preview.set_widget_name("skill-0");
-        workspace.set_end_child(Some(&preview));
-        page.append(&workspace);
-    }
-    let workspace = page.last_child().unwrap().downcast::<gtk::Paned>().unwrap();
-    let list = workspace
-        .start_child()
-        .unwrap()
-        .downcast::<gtk::ScrolledWindow>()
-        .unwrap()
-        .child()
-        .unwrap()
-        .downcast::<gtk::Viewport>()
-        .unwrap()
-        .child()
-        .unwrap()
-        .downcast::<gtk::Box>()
-        .unwrap();
-    let preview = workspace
-        .end_child()
-        .unwrap()
-        .downcast::<gtk::Box>()
-        .unwrap();
-    let scope = list
-        .widget_name()
-        .strip_prefix("skills-scope-")
-        .and_then(|id| id.parse().ok())
-        .unwrap_or(project);
-    render_library(ui, &list, &preview, &data, scope);
+    market::refresh(ui, &SPEC, project).await
 }
 
-fn render_library(ui: &Rc<Ui>, list: &gtk::Box, preview: &gtk::Box, data: &[Value], project: i64) {
-    list.set_widget_name(&format!("skills-scope-{project}"));
-    let selected = preview
-        .widget_name()
-        .strip_prefix("skill-")
-        .and_then(|id| id.parse::<i64>().ok());
-    let selected = data
-        .iter()
-        .find(|skill| skill["id"].as_i64() == selected)
-        .or(data.first())
-        .cloned();
-    clear(list);
-    let scope = gtk::Box::new(gtk::Orientation::Vertical, 3);
-    scope.add_css_class("skills-scope");
-    scope.append(&label("PROJECT ENABLEMENT", "section-label"));
-    let name = ui
-        .projects
-        .borrow()
-        .iter()
-        .find(|p| p["id"].as_i64() == Some(project))
-        .map(|p| text(p, "name").to_owned())
-        .unwrap_or_else(|| "No active project".into());
-    let projects = ui.projects.borrow().clone();
-    let picker =
-        gtk::DropDown::from_strings(&projects.iter().map(|p| text(p, "name")).collect::<Vec<_>>());
-    picker.set_widget_name("skills-project");
-    picker.set_enable_search(true);
-    let factory = gtk::SignalListItemFactory::new();
-    factory.connect_setup(|_, item| {
-        let name = label("", "");
-        name.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        name.set_width_chars(1);
-        name.set_max_width_chars(28);
-        item.downcast_ref::<gtk::ListItem>()
-            .unwrap()
-            .set_child(Some(&name));
-    });
-    factory.connect_bind(|_, item| {
-        let item = item.downcast_ref::<gtk::ListItem>().unwrap();
-        let value = item.item().and_downcast::<gtk::StringObject>().unwrap();
-        let name = item.child().and_downcast::<gtk::Label>().unwrap();
-        name.set_text(&value.string());
-        name.set_tooltip_text(Some(&value.string()));
-    });
-    picker.set_factory(Some(&factory));
-    picker.set_list_factory(Some(&factory));
-    picker.set_selected(
-        projects
-            .iter()
-            .position(|p| p["id"].as_i64() == Some(project))
-            .map(|i| i as u32)
-            .unwrap_or(gtk::INVALID_LIST_POSITION),
+static SPEC: Spec = Spec {
+    page: "skills",
+    title: "Skills",
+    subtitle: "Reusable agent instructions, written into every checkout and provider home as real skill folders. A new skill is on everywhere; switch it off where it does not belong.",
+    icon: "skills",
+    noun: ("skill", "skills"),
+    placeholder: "Search skills by name, description or source",
+    filters: &["All", "Enabled", "Disabled"],
+    list_op: "skill.list",
+    list_key: "skills",
+    enable_op: "skill.enable",
+    id_key: "skill_id",
+    id: |skill| skill["id"].to_string(),
+    haystack: |skill| {
+        format!(
+            "{}\n{}\n{}\n{}",
+            text(skill, "name"),
+            description(skill),
+            source(skill),
+            text(skill, "source_path")
+        )
+        .to_lowercase()
+    },
+    passes: |skill, filter, project| match filter {
+        1 => market::enabled(skill, project),
+        2 => !market::enabled(skill, project),
+        _ => true,
+    },
+    group: Some(source),
+    sort: |skill| text(skill, "name").to_lowercase(),
+    card,
+    detail,
+    empty,
+    setup: Some(setup),
+};
+
+/// The `description:` line of the SKILL.md frontmatter, or the first line of prose.
+fn description(skill: &Value) -> String {
+    let body = text(skill, "body");
+    let mut lines = body.lines();
+    if body.trim_start().starts_with("---") {
+        lines.next();
+        for line in lines.by_ref() {
+            let line = line.trim();
+            if line == "---" {
+                break;
+            }
+            if let Some(value) = line.strip_prefix("description:") {
+                return value.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+            }
+        }
+    }
+    lines
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with("---"))
+        .unwrap_or("")
+        .to_string()
+}
+
+/// `owner/repository` for an installed skill, or "Local skills".
+fn source(skill: &Value) -> String {
+    match skill["source_url"].as_str() {
+        Some(url) => {
+            let url = url.trim_end_matches('/').trim_end_matches(".git");
+            let parts: Vec<&str> = url.rsplit('/').take(2).collect();
+            match parts.as_slice() {
+                [repo, owner] => format!("{owner}/{repo}"),
+                _ => url.to_string(),
+            }
+        }
+        None => "Local skills".into(),
+    }
+}
+
+fn web_url(skill: &Value) -> Option<String> {
+    skill["source_url"]
+        .as_str()
+        .map(|url| url.trim_end_matches('/').trim_end_matches(".git").to_string())
+}
+
+fn card(ui: &Rc<Ui>, market: &Rc<Market>, skill: &Value) -> gtk::Widget {
+    let scope = market.scope.get();
+    let card = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    card.add_css_class("ext-card");
+    let words = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    words.set_hexpand(true);
+    let name = label(text(skill, "name"), "ext-name");
+    name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    words.append(&name);
+    let about = description(skill);
+    if !about.is_empty() {
+        let summary = label(&about, "ext-summary");
+        summary.set_wrap(true);
+        summary.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        summary.set_lines(2);
+        summary.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        summary.set_max_width_chars(44);
+        words.append(&summary);
+    }
+    let path = label(
+        skill["source_path"].as_str().unwrap_or("Written in Relay"),
+        "ext-path",
     );
-    picker.set_sensitive(!projects.is_empty());
+    path.set_ellipsize(gtk::pango::EllipsizeMode::Start);
+    path.set_tooltip_text(skill["source_path"].as_str());
+    words.append(&path);
+    card.append(&words);
+    let switch = market::toggle(ui, market, skill, scope, format!("skill-enabled-{}", skill["id"]));
+    switch.set_valign(gtk::Align::Start);
+    card.append(&switch);
+    card.upcast()
+}
+
+fn detail(ui: &Rc<Ui>, market: &Rc<Market>, skill: &Value, parent: &gtk::Box) {
+    let id = skill["id"].clone();
+    let head = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    let title = label(text(skill, "name"), "ext-detail-title");
+    title.set_wrap(true);
+    head.append(&title);
+    head.append(&label(
+        &match skill["source_url"].as_str() {
+            Some(_) => format!("From {} on GitHub", source(skill)),
+            None => "Written in Relay".to_string(),
+        },
+        "ext-meta",
+    ));
+    parent.append(&head);
+    let about = description(skill);
+    if !about.is_empty() {
+        let lede = market::prose(&about);
+        lede.add_css_class("ext-lede");
+        parent.append(&lede);
+    }
+    parent.append(&market::enable_block(
+        ui,
+        market,
+        skill,
+        (
+            "Agents in this project find it in their skills folder.",
+            "Agents in this project do not see it.",
+        ),
+        format!("skill-{id}-scope"),
+    ));
+
+    // Actions.
+    let bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    bar.add_css_class("ext-action-bar");
+    if let Some(url) = web_url(skill) {
+        let open = button("Open on GitHub", "");
+        open.set_tooltip_text(Some(&url));
+        let weak = Rc::downgrade(ui);
+        open.connect_clicked(move |key| {
+            if let Some(ui) = weak.upgrade() {
+                ui.mutate("os.open_url", json!({"url": url}), key);
+            }
+        });
+        bar.append(&open);
+        let update = button("Update from GitHub", "");
+        update.set_tooltip_text(Some("Download the current version of this skill"));
+        let weak = Rc::downgrade(ui);
+        let payload = json!({"url": skill["source_url"], "subdir": skill["source_path"]});
+        update.connect_clicked(move |key| {
+            if let Some(ui) = weak.upgrade() {
+                ui.mutate("skill.install", payload.clone(), key);
+            }
+        });
+        bar.append(&update);
+    } else {
+        let edit_key = button("Edit", "");
+        let weak = Rc::downgrade(ui);
+        let editing = skill.clone();
+        edit_key.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                edit(&ui, Some(editing.clone()));
+            }
+        });
+        bar.append(&edit_key);
+    }
+    let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    spacer.set_hexpand(true);
+    bar.append(&spacer);
+    let remove = button("Remove", "quiet");
+    remove.add_css_class("ext-danger");
+    remove.set_tooltip_text(Some("Remove this skill from every project"));
     let weak = Rc::downgrade(ui);
-    let target_list = list.downgrade();
-    let target_preview = preview.downgrade();
-    let data_copy = data.to_vec();
-    picker.connect_selected_notify(move |picker| {
-        let (Some(ui), Some(list), Some(preview)) = (
-            weak.upgrade(),
-            target_list.upgrade(),
-            target_preview.upgrade(),
-        ) else {
+    let armed = Rc::new(Cell::new(false));
+    remove.connect_clicked(move |key| {
+        if !armed.replace(true) {
+            key.set_label("Click again to remove");
+            key.add_css_class("armed");
+            let (key, armed) = (key.downgrade(), armed.clone());
+            glib::timeout_add_local_once(std::time::Duration::from_secs(4), move || {
+                if let Some(key) = key.upgrade() {
+                    armed.set(false);
+                    key.set_label("Remove");
+                    key.remove_css_class("armed");
+                }
+            });
             return;
-        };
-        if let Some(project) = projects
-            .get(picker.selected() as usize)
-            .and_then(|p| p["id"].as_i64())
-        {
-            render_library(&ui, &list, &preview, &data_copy, project);
+        }
+        if let Some(ui) = weak.upgrade() {
+            ui.mutate("skill.delete", json!({"skill_id": id}), key);
         }
     });
-    scope.append(&picker);
-    list.append(&scope);
-    let mut groups: Vec<(String, Vec<Value>)> = Vec::new();
-    for skill in data {
-        let key = skill["source_url"]
-            .as_str()
-            .map(|s| s.trim_end_matches(".git").to_lowercase())
-            .unwrap_or_else(|| format!("local:{}", skill["id"]));
-        if let Some((_, rows)) = groups.iter_mut().find(|(name, _)| name == &key) {
-            rows.push(skill.clone());
-        } else {
-            groups.push((key, vec![skill.clone()]));
-        }
+    bar.append(&remove);
+    parent.append(&bar);
+
+    let mut facts = Vec::new();
+    if let Some(url) = web_url(skill) {
+        facts.push(("Source", url, true));
     }
-    let keys = Rc::new(RefCell::new(Vec::<gtk::ToggleButton>::new()));
-    for (source, mut skills) in groups {
-        skills.sort_by_key(|s| text(s, "source_path").to_string());
-        let children = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        if skills.len() > 1 {
-            let group = gtk::Expander::new(Some(&format!(
-                "{}   {} skills · {} on",
-                source.rsplit('/').next().unwrap_or(&source),
-                skills.len(),
-                skills.iter().filter(|s| enabled(s, project)).count()
-            )));
-            group.add_css_class("skills-group");
-            group.set_expanded(false);
-            group.set_child(Some(&children));
-            list.append(&group);
-        } else {
-            list.append(&children);
-        }
-        let mut directories = std::collections::BTreeMap::new();
-        for skill in skills {
-            let mut parent = children.clone();
-            let source_path = text(&skill, "source_path");
-            let mut prefix = String::new();
-            let parts: Vec<_> = source_path
-                .trim_end_matches("/SKILL.md")
-                .split('/')
-                .filter(|s| !s.is_empty() && *s != ".")
-                .collect();
-            for component in parts.iter().take(parts.len().saturating_sub(1)) {
-                if !prefix.is_empty() {
-                    prefix.push('/');
-                }
-                prefix.push_str(component);
-                parent = directories
-                    .entry(prefix.clone())
-                    .or_insert_with(|| {
-                        let group = gtk::Expander::new(Some(component));
-                        group.add_css_class("skills-directory");
-                        group.set_expanded(true);
-                        let nested = gtk::Box::new(gtk::Orientation::Vertical, 0);
-                        nested.set_margin_start(12);
-                        group.set_child(Some(&nested));
-                        parent.append(&group);
-                        nested
-                    })
-                    .clone();
-            }
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-            row.add_css_class("skills-row");
-            let key = gtk::ToggleButton::new();
-            key.add_css_class("skill-pick");
-            key.set_hexpand(true);
-            if let Some(first) = keys.borrow().first() {
-                key.set_group(Some(first));
-            }
-            let words = gtk::Box::new(gtk::Orientation::Vertical, 3);
-            let title = label(text(&skill, "name"), "body");
-            title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            words.append(&title);
-            let path = label(
-                skill["source_path"].as_str().unwrap_or("local instruction"),
-                "mono",
-            );
-            path.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            words.append(&path);
-            key.set_child(Some(&words));
-            key.set_active(selected.as_ref().is_some_and(|v| v["id"] == skill["id"]));
-            row.append(&key);
-            keys.borrow_mut().push(key.clone());
-            let switch = gtk::Switch::new();
-            switch.set_widget_name(&format!("skill-enabled-{}", skill["id"]));
-            switch.set_valign(gtk::Align::Center);
-            switch.set_active(enabled(&skill, project));
-            switch.set_sensitive(project > 0);
-            switch.set_tooltip_text(Some(&format!("Enable {} for {name}", text(&skill, "name"))));
-            switch.add_css_class("skill-switch");
-            row.append(&switch);
-            let weak = Rc::downgrade(ui);
-            let id = skill["id"].clone();
-            switch.connect_state_set(move |key, on| {
-                // A rejected write restores the switch while it is disabled.
-                if !key.is_sensitive() {
-                    return glib::Propagation::Proceed;
-                }
-                if let Some(ui) = weak.upgrade() {
-                    let key = key.clone();
-                    let id = id.clone();
-                    key.set_sensitive(false);
-                    glib::spawn_future_local(async move {
-                        if let Err(e) = ui
-                            .call(
-                                "skill.enable",
-                                json!({"skill_id":id,"project_id":project,"enabled":on}),
-                            )
-                            .await
-                        {
-                            ui.show_error(&e.to_string());
-                            key.set_active(!on);
-                        }
-                        key.set_sensitive(true);
-                    });
-                }
-                glib::Propagation::Proceed
-            });
-            let weak = Rc::downgrade(ui);
-            let preview = preview.clone();
-            key.connect_toggled(move |key| {
-                if key.is_active() {
-                    if let Some(ui) = weak.upgrade() {
-                        skill_preview(&ui, &preview, Some(&skill));
-                    }
-                }
-            });
-            parent.append(&row);
-        }
+    if let Some(path) = skill["source_path"].as_str() {
+        facts.push(("Path", path.to_string(), true));
     }
-    if data.is_empty() {
-        list.append(&paragraph("No skills installed. Paste a GitHub skill repository above. Relay finds its SKILL.md files."));
+    if let Some(revision) = skill["revision"].as_str() {
+        facts.push(("Revision", revision.chars().take(8).collect(), true));
     }
-    let create = button("Write a local skill", "quiet");
+    let date = |key: &str| text(skill, key).chars().take(10).collect::<String>();
+    facts.push(("Installed", date("created_at"), false));
+    facts.push(("Updated", date("updated_at"), false));
+    parent.append(&market::facts(&facts));
+
+    let instructions = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    instructions.append(&market::markdown(ui, text(skill, "body")));
+    let skill_id = skill["id"].clone();
+    let switch_name = move |project: i64| format!("skill-{skill_id}-in-{project}");
+    parent.append(&market::tabs(
+        market,
+        vec![
+            ("instructions", "Instructions", None, instructions.upcast()),
+            (
+                "projects",
+                "Projects",
+                Some(market::reach(ui, skill).0),
+                market::project_switches(ui, market, skill, &switch_name, None).upcast(),
+            ),
+        ],
+    ));
+}
+
+fn empty(ui: &Rc<Ui>, market: &Rc<Market>) -> gtk::Widget {
+    let install = button("Install from GitHub", "primary");
+    let weak = Rc::downgrade(market);
+    install.connect_clicked(move |_| {
+        if let Some(market) = weak.upgrade() {
+            market.reveal_banner();
+        }
+    });
+    let create = button("Write a local skill", "");
     let weak = Rc::downgrade(ui);
     create.connect_clicked(move |_| {
         if let Some(ui) = weak.upgrade() {
             edit(&ui, None);
         }
     });
-    if data.is_empty() {
-        list.append(&create);
-    }
-    skill_preview(ui, preview, selected.as_ref());
+    market::state_box(
+        "skills",
+        "No skills installed",
+        &label(
+            "Paste a GitHub repository and Relay finds its SKILL.md files, or write instructions of your own.",
+            "dim",
+        ),
+        &[install.upcast(), create.upcast()],
+    )
+    .upcast()
 }
 
-fn enabled(skill: &Value, project: i64) -> bool {
-    skill["enabled_in"]
-        .as_array()
-        .is_some_and(|ids| ids.iter().any(|id| id.as_i64() == Some(project)))
-}
-
-fn skill_preview(ui: &Rc<Ui>, preview: &gtk::Box, skill: Option<&Value>) {
-    clear(preview);
-    let Some(skill) = skill else {
-        preview.append(&label("Select an installed skill", "title"));
-        preview.append(&paragraph("Its source and instructions will appear here."));
-        return;
-    };
-    preview.set_widget_name(&format!("skill-{}", skill["id"]));
-    let head = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let title = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    title.set_hexpand(true);
-    title.append(&label("INSTALLED SKILL", "section-label"));
-    title.append(&label(text(skill, "name"), "title"));
-    head.append(&title);
-    if let Some(url) = skill["source_url"].as_str() {
-        action(ui, &head, "Open source", "os.open_url", json!({"url":url}));
-        action(
-            ui,
-            &head,
-            "Refresh",
-            "skill.install",
-            json!({"url":url,"subdir":skill["source_path"]}),
-        );
-    }
-    let edit_key = button("Edit", "quiet");
+/// Header actions and the installer banner.
+fn setup(ui: &Rc<Ui>, market: &Rc<Market>) {
+    let create = button("New local skill", "");
     let weak = Rc::downgrade(ui);
-    let editing = skill.clone();
-    edit_key.connect_clicked(move |_| {
+    create.connect_clicked(move |_| {
         if let Some(ui) = weak.upgrade() {
-            edit(&ui, Some(editing.clone()));
+            edit(&ui, None);
         }
     });
-    if !skill["source_url"].is_string() {
-        head.append(&edit_key);
-    }
-    preview.append(&head);
-    let source = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let url = label(
-        skill["source_url"].as_str().unwrap_or("Local skill"),
-        "mono",
+    market.actions.append(&create);
+    let install = gtk::ToggleButton::with_label("Install from GitHub");
+    install.add_css_class("primary");
+    install.add_css_class("ext-install");
+    let banner = market.banner.clone();
+    install.connect_toggled(move |key| banner.set_visible(key.is_active()));
+    market.actions.append(&install);
+    *market.banner_key.borrow_mut() = Some(install);
+    let head = gtk::Box::new(gtk::Orientation::Vertical, 3);
+    head.append(&label("Install from GitHub", "ext-banner-title"));
+    let copy = label(
+        "Relay finds every SKILL.md in the repository. Give a folder to install only the skills under it.",
+        "dim",
     );
-    url.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    url.set_hexpand(true);
-    source.append(&url);
-    source.append(&label(
-        &text(skill, "revision").chars().take(8).collect::<String>(),
-        "mono",
-    ));
-    preview.append(&source);
-    let body = gtk::TextView::new();
-    body.set_editable(false);
-    body.set_cursor_visible(false);
-    body.set_monospace(true);
-    body.set_wrap_mode(gtk::WrapMode::WordChar);
-    body.add_css_class("skill-source");
-    body.buffer().set_text(text(skill, "body"));
-    let scroll = crate::app::scrolled(&body);
-    scroll.set_min_content_height(200);
-    scroll.set_vexpand(true);
-    preview.append(&scroll);
-    let footer = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let remove = button("Remove", "quiet");
-    remove.add_css_class("danger");
-    let weak = Rc::downgrade(ui);
-    let id = skill["id"].clone();
-    let armed = Cell::new(false);
-    remove.connect_clicked(move |key| {
-        if !armed.replace(true) {
-            key.set_label("Remove now");
-            return;
-        }
-        if let Some(ui) = weak.upgrade() {
-            ui.mutate("skill.delete", json!({"skill_id":id}), key);
-        }
-    });
-    footer.append(&remove);
-    let hint = label("Refresh pulls the current GitHub version.", "faint");
-    hint.set_hexpand(true);
-    hint.set_xalign(1.);
-    footer.append(&hint);
-    preview.append(&footer);
+    copy.set_wrap(true);
+    head.append(&copy);
+    market.banner.append(&head);
+    install_form(ui, &market.banner);
 }
 
 fn install_form(ui: &Rc<Ui>, page: &gtk::Box) {

@@ -1,0 +1,71 @@
+/* mirror area styles: loaded after theme.css, so rules here override it. */
+
+/* The mirror reads as one more plate on the wall: a console identity strip over a
+   screen-black stage. The phone is the only rounded thing in it — it is a picture of a
+   device, not chrome — and colour stays on the lamp and on problems, per the Tally Rule. */
+
+.mirror { background: @wall; }
+.dock-panel { background: @wall; border-left: 1px solid @edge; box-shadow: -10px 0 28px alpha(black, 0.38); }
+
+/* -- identity strip ------------------------------------------------------------ */
+.mirror-strip { min-height: 44px; padding: 0 6px 0 4px; background: @console; border-bottom: 1px solid @edge; }
+menubutton.mirror-picker > button { min-height: 36px; padding: 2px 8px; background: transparent; border-color: transparent; border-radius: 2px; }
+menubutton.mirror-picker > button:hover, menubutton.mirror-picker > button:checked { background: @wash; border-color: transparent; }
+menubutton.mirror-picker image { color: @faint; }
+.mirror-title { color: @ink; font-size: 13px; font-weight: 600; }
+.mirror-meta { color: @faint; font-family: 'Fira Mono', monospace; font-size: 10px; }
+.lamp.mirror-lamp { min-width: 7px; min-height: 7px; margin: 0 2px; }
+.lamp.waiting { background: @waiting; border-color: @waiting; }
+
+button.mirror-key { min-width: 30px; min-height: 30px; padding: 0; color: @secondary; }
+button.mirror-key:hover { color: @ink; }
+button.mirror-key:disabled { opacity: 0.32; }
+
+/* -- stage ----------------------------------------------------------------------- */
+.mirror-stage { padding: 20px 16px 12px 20px; }
+.mirror.docked .mirror-stage { padding: 16px 12px 10px 14px; }
+.mirror.fullscreen .mirror-stage { padding: 28px; }
+
+/* The bezel is drawn as spread shadows, outside the screen's allocation, so it never
+   shifts the picture and the touch mapping stays exact. The margin gives it room. */
+.mirror-device { margin: 12px; }
+.mirror-screen {
+  background: @screen;
+  border-radius: 12px;
+  box-shadow: 0 0 0 9px #050506, 0 0 0 10px @strong, 0 22px 48px alpha(black, 0.5);
+}
+picture.mirror-picture { transition: opacity 180ms cubic-bezier(0.16, 1, 0.3, 1); }
+picture.mirror-picture.dimmed { opacity: 0.26; }
+picture.mirror-picture:focus-visible { outline: none; }
+
+/* State card: connecting, lost, failed. A problem carries the notice's red bottom rule. */
+.mirror-card {
+  margin: 0 14px;
+  padding: 18px 16px 14px;
+  background: alpha(@console, 0.95);
+  border: 1px solid @edge;
+  border-radius: 2px;
+}
+.mirror-card.problem { border-bottom: 2px solid @held; }
+.mirror-card-title { color: @ink; font-size: 14px; font-weight: 600; }
+.mirror-card-detail { color: @secondary; font-size: 12px; }
+.mirror-card-code { color: @faint; font-family: 'Fira Mono', monospace; font-size: 10px; }
+.mirror-card-actions { margin-top: 8px; }
+.mirror-card-actions button { min-height: 28px; }
+spinner.mirror-spinner { color: @ink; min-width: 18px; min-height: 18px; margin-bottom: 4px; }
+
+/* Hardware keys beside the phone, grouped as they sit on a device. */
+.mirror-rail-group { margin: 5px 0; padding: 3px; background: @console; border: 1px solid @edge; border-radius: 2px; }
+
+/* Android's navigation bar, under the phone it drives. */
+.mirror-nav { padding: 0 12px; }
+button.mirror-nav-key { min-width: 54px; min-height: 30px; }
+
+.mirror-hint { padding: 5px 12px; background: @console; border-top: 1px solid @edge; color: @faint; font-size: 11px; }
+.mirror-hint.flash { color: @ink; }
+
+/* -- device picker ------------------------------------------------------------------ */
+.mirror-devices { padding: 4px; min-width: 240px; }
+button.mirror-device-row { min-height: 40px; padding: 4px 8px; }
+button.mirror-device-row image { color: @ink; }
+.mirror-device-name { color: @ink; font-size: 13px; }

@@ -1,430 +1,1245 @@
-//! Native device mirror: engine-owned scrcpy transport, FFmpeg decode, GTK textures.
-//! Only the newest two decoded images are retained; no idle refresh or unbounded video queue.
-use crate::app::{button, label, Ui};
-use crate::client::{Client, Notice};
-use base64::Engine;
+//! Native device mirror: an engine-owned scrcpy transport, one FFmpeg decode, GTK textures.
+//!
+//! One [`MirrorView`] per device. It is a self-contained widget tree that lives either in its
+//! own window or docked to the right of the wall, and moves between the two without restarting
+//! the stream. Its anatomy follows the terminal plate: an identity strip (lamp, device, actions)
+//! above a screen-black stage holding the phone, the hardware keys beside it and the Android
+//! navigation bar under it.
+//!
+//! The mirror never waits on silence. The engine reports every state on the stream itself —
+//! starting, running (with the real picture size), and on the way out stopped, failed with its
+//! code and reason, or lost when the device went away — so the stage always says what is
+//! happening and offers the next step. A lost device is watched for, and the mirror resumes on
+//! its own when it comes back.
+mod decode;
+mod glyphs;
+mod input;
+
+use crate::app::{label, Ui};
+use crate::client::{Client, Error, Notice};
+use crate::panel::Dock;
 use gtk::prelude::*;
 use gtk4 as gtk;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::cell::{Cell, RefCell};
-use std::process::Stdio;
-use std::rc::Rc;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use std::path::PathBuf;
+use std::rc::{Rc, Weak};
+use std::time::Duration;
 
-// Overflow ends the mirror instead of losing a key or touch release.
-#[derive(Clone)]
-struct Input {
-    queue: async_channel::Sender<serde_json::Value>,
-    reset: async_channel::Sender<()>,
-}
-impl Input {
-    fn try_send(
-        &self,
-        event: serde_json::Value,
-    ) -> Result<(), async_channel::TrySendError<serde_json::Value>> {
-        let result = self.queue.try_send(event);
-        if result.is_err() {
-            let _ = self.reset.try_send(());
-        }
-        result
-    }
+/// Engine → view messages that must never be dropped (pictures travel separately, lossy).
+pub(crate) enum Control {
+    /// A status object from the engine: `{state, width, height, name?, code?, message?}`.
+    Status(Value),
+    /// The decoder lost its place; ask the device for a fresh config + key frame.
+    Resync,
+    /// The video pipeline or the engine connection broke.
+    Broken(String),
 }
 
-struct Pixels {
-    width: i32,
-    height: i32,
-    rgb: Vec<u8>,
-}
-async fn ppm<R: tokio::io::AsyncRead + Unpin>(read: &mut BufReader<R>) -> Result<Pixels, String> {
-    async fn line<R: tokio::io::AsyncRead + Unpin>(
-        read: &mut BufReader<R>,
-    ) -> Result<String, String> {
-        let mut value = String::new();
-        let count = read
-            .read_line(&mut value)
-            .await
-            .map_err(|e| e.to_string())?;
-        if count == 0 || value.len() > 64 {
-            return Err("Video decoder closed or sent an invalid image header".into());
-        }
-        Ok(value)
-    }
-    if line(read).await?.trim() != "P6" {
-        return Err("Expected an RGB image from decoder".into());
-    }
-    let size = line(read).await?;
-    let mut sizes = size.split_whitespace();
-    let width = sizes
-        .next()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|n| *n > 0 && *n <= 4096)
-        .ok_or("Invalid video width")?;
-    let height = sizes
-        .next()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|n| *n > 0 && *n <= 4096)
-        .ok_or("Invalid video height")?;
-    if line(read).await?.trim() != "255" {
-        return Err("Unsupported video pixel depth".into());
-    }
-    let mut rgb = vec![0; width * height * 3];
-    read.read_exact(&mut rgb).await.map_err(|e| e.to_string())?;
-    Ok(Pixels {
-        width: width as i32,
-        height: height as i32,
-        rgb,
-    })
+/// Video frames can exceed the control channel's 2 MiB line: a key frame at a high capture
+/// rung is a single base64 line.
+const MIRROR_MAX_LINE: usize = 32 * 1024 * 1024;
+/// The largest capture rung the client asks for. Decode is single-threaded on purpose (see
+/// `decode.rs`), and a picture taller than this is more pixels than any dock or window shows.
+const MAX_CAPTURE: i32 = 1280;
+const DOCK_WIDTH: i32 = 440;
+/// What the window spends around the phone: the key rail and stage padding across, the
+/// strip, navigation bar and hint line down.
+const CHROME_W: i32 = 110;
+const CHROME_H: i32 = 150;
+const HINT: &str = "Click to tap · drag to swipe · right-click for Back · type to send keys";
+
+thread_local! {
+    /// Open mirrors, strongly held: a view lives until its window closes or its dock is closed.
+    static VIEWS: RefCell<Vec<Rc<MirrorView>>> = const { RefCell::new(Vec::new()) };
+    /// Whether the last mirror the user placed was docked; new mirrors open the same way.
+    static PREFER_DOCK: Cell<bool> = const { Cell::new(false) };
 }
 
+/// Open (or bring forward) the mirror for `device`.
 pub fn open(ui: &Rc<Ui>, device: String) {
-    let window = gtk::Window::builder()
-        .application(&ui.window.application().unwrap())
-        .transient_for(&ui.window)
-        .title(format!("Device · {device}"))
-        .default_width(480)
-        .default_height(850)
-        .build();
-    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    window.set_child(Some(&root));
-    let toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 2);
-    toolbar.add_css_class("toolbar");
-    root.append(&toolbar);
-    let picture = gtk::Picture::new();
-    picture.set_hexpand(true);
-    picture.set_vexpand(true);
-    picture.set_can_shrink(true);
-    picture.set_content_fit(gtk::ContentFit::Contain);
-    root.append(&picture);
-    let status = label("Starting mirror…", "dim");
-    status.set_wrap(true);
-    root.append(&status);
-    let id = Rc::new(Cell::new(0i64));
-    let dimensions = Rc::new(Cell::new((0i32, 0i32)));
-    let (queue, event_rx) = async_channel::bounded::<serde_json::Value>(64);
-    let (reset, reset_rx) = async_channel::bounded(1);
-    let events = Input { queue, reset };
-    for (caption, kind) in [
-        ("Back", "back"),
-        ("Home", "home"),
-        ("Apps", "appswitch"),
-        ("Rotate", "rotate"),
-        ("Power", "power"),
-        ("−", "volumedown"),
-        ("+", "volumeup"),
-    ] {
-        let b = button(caption, "quiet");
-        toolbar.append(&b);
-        let events = events.clone();
-        b.connect_clicked(move |_| {
-            let _ = events.try_send(json!({"type":kind}));
-        });
+    let existing = VIEWS.with(|views| views.borrow().iter().find(|view| *view.device.borrow() == device).cloned());
+    if let Some(view) = existing {
+        view.present();
+        return;
     }
-    let texture = Rc::new(RefCell::new(None::<gtk::gdk::MemoryTexture>));
-    let save = button("Capture", "quiet");
-    toolbar.append(&save);
-    let parent = window.clone();
-    let tex = texture.clone();
-    let message = status.clone();
-    save.connect_clicked(move |_| {
-        let Some(texture) = tex.borrow().clone() else {
-            return;
+    let view = MirrorView::new(ui, device);
+    VIEWS.with(|views| views.borrow_mut().push(view.clone()));
+    if PREFER_DOCK.with(Cell::get) {
+        view.dock();
+    } else {
+        view.detach();
+    }
+    view.start();
+}
+
+enum Host {
+    None,
+    Window(gtk::Window),
+    Dock(Dock),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Connecting,
+    Live,
+    Ended,
+}
+
+struct MirrorView {
+    ui: Weak<Ui>,
+    device: RefCell<String>,
+    /// The device's own name once known (`device.list` model or the server's handshake).
+    model: RefCell<String>,
+    root: gtk::Box,
+    lamp: gtk::Box,
+    title: gtk::Label,
+    meta: gtk::Label,
+    picker: gtk::MenuButton,
+    picker_list: gtk::Box,
+    dock_key: gtk::Button,
+    fullscreen_key: gtk::Button,
+    close_key: gtk::Button,
+    shot_key: gtk::Button,
+    display_key: gtk::Button,
+    controls: Vec<gtk::Button>,
+    aspect: gtk::AspectFrame,
+    picture: gtk::Picture,
+    card: gtk::Box,
+    card_spinner: gtk::Spinner,
+    card_title: gtk::Label,
+    card_detail: gtk::Label,
+    card_code: gtk::Label,
+    card_retry: gtk::Button,
+    card_other: gtk::Button,
+    hint: gtk::Label,
+    hint_generation: Cell<u64>,
+    phase: Cell<Phase>,
+    /// The picture size in device pixels: the last decoded frame, else the engine's status.
+    dims: Cell<(i32, i32)>,
+    texture: RefCell<Option<gtk::gdk::MemoryTexture>>,
+    display_on: Cell<bool>,
+    /// The last failure, for "Copy details".
+    problem: RefCell<String>,
+    input: RefCell<Option<async_channel::Sender<Value>>>,
+    task: RefCell<Option<glib::JoinHandle<()>>>,
+    generation: Cell<u64>,
+    host: RefCell<Host>,
+    fullscreen: Cell<bool>,
+    pointer: Cell<Option<(f64, f64)>>,
+}
+
+impl MirrorView {
+    fn new(ui: &Rc<Ui>, device: String) -> Rc<Self> {
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        root.add_css_class("mirror");
+        root.set_hexpand(true);
+        root.set_vexpand(true);
+
+        // -- identity strip --------------------------------------------------------------
+        let strip = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        strip.add_css_class("mirror-strip");
+        let lamp = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        lamp.add_css_class("lamp");
+        lamp.add_css_class("mirror-lamp");
+        lamp.set_valign(gtk::Align::Center);
+        let identity = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        identity.append(&lamp);
+        let names = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        names.set_valign(gtk::Align::Center);
+        let title = label(&device, "mirror-title");
+        title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        let meta = label(&device, "mirror-meta");
+        meta.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        names.append(&title);
+        names.append(&meta);
+        identity.append(&names);
+        identity.append(&glyphs::image("chevron-down", 12));
+        let picker = gtk::MenuButton::new();
+        picker.set_child(Some(&identity));
+        picker.add_css_class("mirror-picker");
+        picker.set_hexpand(true);
+        picker.set_tooltip_text(Some("Switch device"));
+        let picker_list = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        picker_list.add_css_class("mirror-devices");
+        let popover = gtk::Popover::new();
+        popover.set_child(Some(&picker_list));
+        popover.set_has_arrow(false);
+        popover.set_halign(gtk::Align::Start);
+        picker.set_popover(Some(&popover));
+        strip.append(&picker);
+        let shot_key = glyphs::key("screenshot", "Save a screenshot");
+        let dock_key = glyphs::key("dock", "Dock beside the wall");
+        let fullscreen_key = glyphs::key("fullscreen", "Full screen (F11)");
+        let close_key = glyphs::key("close", "Close mirror");
+        for key in [&shot_key, &dock_key, &fullscreen_key, &close_key] {
+            key.set_valign(gtk::Align::Center);
+            strip.append(key);
+        }
+        root.append(&strip);
+
+        // -- stage: phone, hardware keys, navigation bar ------------------------------------
+        let stage = gtk::Grid::new();
+        stage.add_css_class("mirror-stage");
+        stage.set_hexpand(true);
+        stage.set_vexpand(true);
+        stage.set_column_spacing(14);
+        stage.set_row_spacing(10);
+        let picture = gtk::Picture::new();
+        picture.set_can_shrink(true);
+        picture.set_content_fit(gtk::ContentFit::Contain);
+        picture.set_hexpand(true);
+        picture.set_vexpand(true);
+        picture.set_focusable(true);
+        picture.add_css_class("mirror-picture");
+        picture.update_property(&[gtk::accessible::Property::Label("Device screen")]);
+        let screen = gtk::Overlay::new();
+        screen.add_css_class("mirror-screen");
+        screen.set_overflow(gtk::Overflow::Hidden);
+        screen.set_child(Some(&picture));
+
+        let card = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        card.add_css_class("mirror-card");
+        card.set_halign(gtk::Align::Fill);
+        card.set_valign(gtk::Align::Center);
+        let card_spinner = gtk::Spinner::new();
+        card_spinner.set_halign(gtk::Align::Center);
+        card_spinner.add_css_class("mirror-spinner");
+        let card_title = label("", "mirror-card-title");
+        card_title.set_wrap(true);
+        card_title.set_justify(gtk::Justification::Center);
+        card_title.set_xalign(0.5);
+        let card_detail = label("", "mirror-card-detail");
+        card_detail.set_wrap(true);
+        card_detail.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        card_detail.set_justify(gtk::Justification::Center);
+        card_detail.set_xalign(0.5);
+        card_detail.set_selectable(true);
+        card_detail.set_lines(8);
+        card_detail.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        let card_code = label("", "mirror-card-code");
+        card_code.set_xalign(0.5);
+        card_code.set_selectable(true);
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        actions.set_halign(gtk::Align::Center);
+        actions.add_css_class("mirror-card-actions");
+        let card_retry = gtk::Button::new();
+        let retry_face = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        retry_face.append(&glyphs::image("retry", 14));
+        retry_face.append(&gtk::Label::new(Some("Retry")));
+        card_retry.set_child(Some(&retry_face));
+        card_retry.add_css_class("primary");
+        let card_other = gtk::Button::with_label("Copy details");
+        card_other.add_css_class("quiet");
+        actions.append(&card_retry);
+        actions.append(&card_other);
+        for widget in [card_spinner.upcast_ref::<gtk::Widget>(), card_title.upcast_ref(), card_detail.upcast_ref(), card_code.upcast_ref(), actions.upcast_ref()] {
+            card.append(widget);
+        }
+        screen.add_overlay(&card);
+
+        let aspect = gtk::AspectFrame::new(0.5, 0.5, 9.0 / 19.5, false);
+        aspect.set_child(Some(&screen));
+        aspect.set_hexpand(true);
+        aspect.set_vexpand(true);
+        aspect.add_css_class("mirror-device");
+        stage.attach(&aspect, 0, 0, 1, 1);
+
+        let rail = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        rail.add_css_class("mirror-rail");
+        rail.set_valign(gtk::Align::Center);
+        let mut controls = Vec::new();
+        let display_key = glyphs::key("screen-off", "Turn the device screen off (mirroring continues)");
+        for group in [
+            &[("power", "Power button", "power"), ("volume-up", "Volume up", "volumeup"), ("volume-down", "Volume down", "volumedown")][..],
+            &[("rotate", "Rotate the device", "rotate"), ("notifications", "Open notifications", "notifications"), ("quick-settings", "Open quick settings", "quicksettings")][..],
+        ] {
+            let block = gtk::Box::new(gtk::Orientation::Vertical, 2);
+            block.add_css_class("mirror-rail-group");
+            for (glyph, caption, kind) in group {
+                let key = glyphs::key(glyph, caption);
+                key.set_widget_name(kind);
+                block.append(&key);
+                controls.push(key);
+            }
+            rail.append(&block);
+        }
+        let block = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        block.add_css_class("mirror-rail-group");
+        block.append(&display_key);
+        rail.append(&block);
+        controls.push(display_key.clone());
+        stage.attach(&rail, 1, 0, 1, 1);
+
+        let nav = gtk::Box::new(gtk::Orientation::Horizontal, 28);
+        nav.add_css_class("mirror-nav");
+        nav.set_halign(gtk::Align::Center);
+        for (glyph, caption, kind) in [("back", "Back (right-click, Esc)", "back"), ("home", "Home (middle-click)", "home"), ("recents", "Recent apps", "appswitch")] {
+            let key = glyphs::key(glyph, caption);
+            key.add_css_class("mirror-nav-key");
+            key.set_widget_name(kind);
+            nav.append(&key);
+            controls.push(key);
+        }
+        stage.attach(&nav, 0, 1, 1, 1);
+        root.append(&stage);
+
+        let hint = label(HINT, "mirror-hint");
+        hint.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        root.append(&hint);
+
+        let view = Rc::new(Self {
+            ui: Rc::downgrade(ui),
+            device: RefCell::new(device),
+            model: RefCell::default(),
+            root,
+            lamp,
+            title,
+            meta,
+            picker,
+            picker_list,
+            dock_key,
+            fullscreen_key,
+            close_key,
+            shot_key,
+            display_key,
+            controls,
+            aspect,
+            picture,
+            card,
+            card_spinner,
+            card_title,
+            card_detail,
+            card_code,
+            card_retry,
+            card_other,
+            hint,
+            hint_generation: Cell::new(0),
+            phase: Cell::new(Phase::Connecting),
+            dims: Cell::new((0, 0)),
+            texture: RefCell::default(),
+            display_on: Cell::new(true),
+            problem: RefCell::default(),
+            input: RefCell::default(),
+            task: RefCell::default(),
+            generation: Cell::new(0),
+            host: RefCell::new(Host::None),
+            fullscreen: Cell::new(false),
+            pointer: Cell::new(None),
+        });
+        view.wire();
+        view
+    }
+
+    /// Connect every control. Closures hold the view weakly; the registry owns it.
+    fn wire(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        let with = move |f: fn(&Rc<MirrorView>)| {
+            let weak = weak.clone();
+            move || {
+                if let Some(view) = weak.upgrade() {
+                    f(&view);
+                }
+            }
         };
-        let chooser = gtk::FileDialog::builder()
-            .title("Save device screenshot")
-            .initial_name("device.png")
-            .build();
-        let parent = parent.clone();
-        let message = message.clone();
-        glib::spawn_future_local(async move {
-            if let Ok(file) = chooser.save_future(Some(&parent)).await {
-                if let Some(path) = file.path() {
-                    if let Err(e) = texture.save_to_png(path) {
-                        message.set_text(&e.to_string());
-                    }
+        let action = with(|view| view.save_screenshot());
+        self.shot_key.connect_clicked(move |_| action());
+        let action = with(|view| if matches!(*view.host.borrow(), Host::Dock(_)) { view.detach() } else { view.dock() });
+        self.dock_key.connect_clicked(move |_| action());
+        let action = with(|view| view.toggle_fullscreen());
+        self.fullscreen_key.connect_clicked(move |_| action());
+        let action = with(|view| view.close());
+        self.close_key.connect_clicked(move |_| action());
+        let action = with(|view| view.start());
+        self.card_retry.connect_clicked(move |_| action());
+        let weak = Rc::downgrade(self);
+        self.card_other.connect_clicked(move |button| {
+            if let Some(view) = weak.upgrade() {
+                if view.card_other.label().as_deref() == Some("Choose device") {
+                    view.picker.popup();
+                } else {
+                    button.clipboard().set_text(&view.problem.borrow());
+                    view.flash("Copied the error details.");
                 }
             }
         });
-    });
-    let gesture = gtk::GestureDrag::new();
-    let p = picture.clone();
-    let dims = dimensions.clone();
-    let ev = events.clone();
-    let origin = Rc::new(Cell::new(None));
-    let start = origin.clone();
-    gesture.connect_drag_begin(move |_, x, y| {
-        if let Some((x, y, w, h)) = point(&p, dims.get(), x, y) {
-            start.set(Some((x, y, w, h)));
-            let _ = ev.try_send(
-                json!({"type":"touch","action":0,"x":x,"y":y,"w":w,"h":h,"pressure":1.0}),
-            );
-        }
-    });
-    let p = picture.clone();
-    let dims = dimensions.clone();
-    let ev = events.clone();
-    gesture.connect_drag_update(move |g, x, y| {
-        if let Some((sx, sy)) = g.start_point() {
-            if let Some((x, y, w, h)) = point(&p, dims.get(), sx + x, sy + y) {
-                let _ = ev.try_send(
-                    json!({"type":"touch","action":2,"x":x,"y":y,"w":w,"h":h,"pressure":1.0}),
-                );
-            }
-        }
-    });
-    let p = picture.clone();
-    let dims = dimensions.clone();
-    let ev = events.clone();
-    gesture.connect_drag_end(move |g, x, y| {
-        if let Some((sx, sy)) = g.start_point() {
-            if let Some((x, y, w, h)) = point(&p, dims.get(), sx + x, sy + y).or(origin.take()) {
-                let _ = ev.try_send(
-                    json!({"type":"touch","action":1,"x":x,"y":y,"w":w,"h":h,"pressure":0.0}),
-                );
-            }
-        }
-    });
-    picture.add_controller(gesture);
-    let keys = gtk::EventControllerKey::new();
-    let ev = events.clone();
-    let p = picture.clone();
-    keys.connect_key_pressed(move |_, key, _, mods| {
-        if mods.contains(gtk::gdk::ModifierType::CONTROL_MASK)
-            && (key == gtk::gdk::Key::v || key == gtk::gdk::Key::V)
-        {
-            let clipboard = p.clipboard();
-            let ev = ev.clone();
-            glib::spawn_future_local(async move {
-                if let Ok(Some(text)) = clipboard.read_text_future().await {
-                    let _ = ev
-                        .try_send(json!({"type":"setclipboard","text":text.as_str(),"paste":true}));
+        let weak = Rc::downgrade(self);
+        if let Some(popover) = self.picker.popover() {
+            popover.connect_show(move |_| {
+                if let Some(view) = weak.upgrade() {
+                    view.fill_picker();
                 }
             });
-            return glib::Propagation::Stop;
         }
-        let code = match key {
-            gtk::gdk::Key::Return => Some(66),
-            gtk::gdk::Key::BackSpace => Some(67),
-            gtk::gdk::Key::Escape => Some(4),
-            gtk::gdk::Key::Tab => Some(61),
-            gtk::gdk::Key::Left => Some(21),
-            gtk::gdk::Key::Right => Some(22),
-            gtk::gdk::Key::Up => Some(19),
-            gtk::gdk::Key::Down => Some(20),
-            _ => None,
-        };
-        if let Some(keycode) = code {
-            let _ = ev.try_send(json!({"type":"keypress","keycode":keycode}));
-            return glib::Propagation::Stop;
+        for key in &self.controls {
+            let weak = Rc::downgrade(self);
+            key.connect_clicked(move |key| {
+                let Some(view) = weak.upgrade() else { return };
+                if key == &view.display_key {
+                    let on = !view.display_on.get();
+                    view.send(json!({"type":"displaypower","on":on}));
+                    view.display_on.set(on);
+                    if on {
+                        glyphs::rekey(key, "screen-off", "Turn the device screen off (mirroring continues)");
+                    } else {
+                        glyphs::rekey(key, "screen-on", "Turn the device screen back on");
+                    }
+                } else {
+                    view.send(json!({"type":key.widget_name().as_str()}));
+                }
+            });
         }
-        if !mods.contains(gtk::gdk::ModifierType::CONTROL_MASK) {
-            if let Some(c) = key.to_unicode().filter(|c| !c.is_control()) {
-                let _ = ev.try_send(json!({"type":"text","text":c.to_string()}));
+        self.wire_pointer();
+        self.wire_keys();
+    }
+
+    fn wire_pointer(self: &Rc<Self>) {
+        // Primary button: a finger. Down, coalesced moves, up — a drag that leaves the picture
+        // keeps tracking along its edge, and a cancelled gesture still lifts the finger.
+        let drag = gtk::GestureDrag::new();
+        drag.set_button(gtk::gdk::BUTTON_PRIMARY);
+        let last = Rc::new(Cell::new(None::<(i32, i32)>));
+        let weak = Rc::downgrade(self);
+        let held = last.clone();
+        drag.connect_drag_begin(move |_, x, y| {
+            let Some(view) = weak.upgrade() else { return };
+            view.picture.grab_focus();
+            if let Some(point) = view.map(x, y, false) {
+                held.set(Some(point));
+                view.send(input::touch(input::DOWN, point, view.dims.get()));
+            }
+        });
+        let weak = Rc::downgrade(self);
+        let held = last.clone();
+        drag.connect_drag_update(move |gesture, dx, dy| {
+            let Some(view) = weak.upgrade() else { return };
+            let (Some((sx, sy)), Some(previous)) = (gesture.start_point(), held.get()) else { return };
+            if let Some(point) = view.map(sx + dx, sy + dy, true) {
+                if point != previous {
+                    held.set(Some(point));
+                    view.send(input::touch(input::MOVE, point, view.dims.get()));
+                }
+            }
+        });
+        let weak = Rc::downgrade(self);
+        let held = last.clone();
+        drag.connect_drag_end(move |gesture, dx, dy| {
+            let Some(view) = weak.upgrade() else { return };
+            let Some(previous) = held.take() else { return };
+            let point = gesture.start_point().and_then(|(sx, sy)| view.map(sx + dx, sy + dy, true)).unwrap_or(previous);
+            view.send(input::touch(input::UP, point, view.dims.get()));
+        });
+        let weak = Rc::downgrade(self);
+        drag.connect_cancel(move |_, _| {
+            if let (Some(view), Some(point)) = (weak.upgrade(), last.take()) {
+                view.send(input::touch(input::UP, point, view.dims.get()));
+            }
+        });
+        self.picture.add_controller(drag);
+
+        // Secondary = Back, middle = Home: the two things a desktop mouse reaches for most.
+        let click = gtk::GestureClick::new();
+        click.set_button(0);
+        let weak = Rc::downgrade(self);
+        click.connect_pressed(move |gesture, _, _, _| {
+            let Some(view) = weak.upgrade() else { return };
+            match gesture.current_button() {
+                gtk::gdk::BUTTON_SECONDARY => view.send(json!({"type":"back"})),
+                gtk::gdk::BUTTON_MIDDLE => view.send(json!({"type":"home"})),
+                _ => {}
+            }
+        });
+        self.picture.add_controller(click);
+
+        let motion = gtk::EventControllerMotion::new();
+        let weak = Rc::downgrade(self);
+        motion.connect_motion(move |_, x, y| {
+            if let Some(view) = weak.upgrade() {
+                view.pointer.set(Some((x, y)));
+            }
+        });
+        self.picture.add_controller(motion);
+
+        let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
+        let weak = Rc::downgrade(self);
+        scroll.connect_scroll(move |controller, dx, dy| {
+            let Some(view) = weak.upgrade() else { return glib::Propagation::Proceed };
+            let (w, h) = view.dims.get();
+            let at = view.pointer.get().and_then(|(x, y)| view.map(x, y, false)).unwrap_or((w / 2, h / 2));
+            let pixels = controller.unit() == gtk::gdk::ScrollUnit::Surface;
+            let (hscroll, vscroll) = input::scroll_amount(dx, dy, pixels);
+            if hscroll != 0.0 || vscroll != 0.0 {
+                view.send(json!({"type":"scroll","x":at.0,"y":at.1,"w":w,"h":h,"hscroll":hscroll,"vscroll":vscroll}));
+            }
+            glib::Propagation::Stop
+        });
+        self.picture.add_controller(scroll);
+    }
+
+    fn wire_keys(self: &Rc<Self>) {
+        let keys = gtk::EventControllerKey::new();
+        let weak = Rc::downgrade(self);
+        keys.connect_key_pressed(move |_, key, _, modifiers| {
+            let Some(view) = weak.upgrade() else { return glib::Propagation::Proceed };
+            if key == gtk::gdk::Key::F11 || (key == gtk::gdk::Key::Escape && view.fullscreen.get()) {
+                view.toggle_fullscreen();
                 return glib::Propagation::Stop;
             }
-        }
-        glib::Propagation::Proceed
-    });
-    window.add_controller(keys);
-    let (rt, path) = (ui.rt.clone(), ui.path.clone());
-    let worker_rt = rt.clone();
-    let (frames, images) = async_channel::bounded::<Result<Pixels, String>>(2);
-    let stale = images.clone();
-    let mirror_id = id.clone();
-    let task = glib::spawn_future_local(async move {
-        let (client, notices) = match Client::connect(&rt, path).await {
-            Ok(v) => v,
-            Err(e) => {
-                let _ = frames.send(Err(e.to_string())).await;
-                return;
+            if view.phase.get() != Phase::Live {
+                return glib::Propagation::Proceed;
             }
-        };
-        match client
-            .request(
-                &rt,
-                "device.mirror.start",
-                json!({"device":device,"max_size":1024}),
-            )
-            .await
-        {
-            Ok(v) => mirror_id.set(v["mirror_id"].as_i64().unwrap_or(0)),
-            Err(e) => {
-                let _ = frames.send(Err(e.to_string())).await;
-                return;
+            let ctrl = modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK);
+            let alt = modifiers.contains(gtk::gdk::ModifierType::ALT_MASK);
+            if ctrl && !alt && matches!(key, gtk::gdk::Key::v | gtk::gdk::Key::V) {
+                // Paste the desktop clipboard into the focused field on the device: one
+                // clipboard message instead of a keystroke per character.
+                let clipboard = view.picture.clipboard();
+                let weak = Rc::downgrade(&view);
+                glib::spawn_future_local(async move {
+                    if let Ok(Some(text)) = clipboard.read_text_future().await {
+                        if let Some(view) = weak.upgrade() {
+                            view.send(json!({"type":"setclipboard","text":text.as_str(),"paste":true}));
+                        }
+                    }
+                });
+                return glib::Propagation::Stop;
             }
-        }
-        let mid = mirror_id.get();
-        let sender = frames.clone();
-        let c = client.clone();
-        let worker = worker_rt.spawn(async move {
-            let mut decoder = tokio::process::Command::new("ffmpeg")
-                .args([
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-probesize",
-                    "32",
-                    "-analyzeduration",
-                    "0",
-                    "-f",
-                    "h264",
-                    "-i",
-                    "pipe:0",
-                    "-an",
-                    "-f",
-                    "image2pipe",
-                    "-vcodec",
-                    "ppm",
-                    "-pix_fmt",
-                    "rgb24",
-                    "pipe:1",
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .kill_on_drop(true)
-                .spawn()
-                .map_err(|e| format!("FFmpeg is required for native mirroring: {e}"))?;
-            let mut input = decoder.stdin.take().unwrap();
-            let mut output = BufReader::new(decoder.stdout.take().unwrap());
-            let read = async {
-                loop {
-                    let frame = ppm(&mut output).await?;
-                    if sender.is_full() {
-                        let _ = stale.try_recv();
-                    }
-                    if sender.try_send(Ok(frame)).is_err() && sender.is_closed() {
-                        return Ok::<(), String>(());
-                    }
+            let meta = input::meta(modifiers);
+            if let Some(code) = input::keycode(key).or_else(|| (ctrl || alt).then(|| input::chord_keycode(key)).flatten()) {
+                view.send(json!({"type":"key","action":0,"keycode":code,"meta":meta}));
+                return glib::Propagation::Stop;
+            }
+            if !ctrl && !alt {
+                if let Some(c) = key.to_unicode().filter(|c| !c.is_control()) {
+                    view.send(json!({"type":"text","text":c.to_string()}));
+                    return glib::Propagation::Stop;
                 }
-            };
-            let write = async {
-                let mut last = None;
-                while let Ok(notice) = notices.recv().await {
-                    match notice {
-                        Notice::Frame(frame) if frame.stream == "mirror" => {
-                            let encoded = frame.data.as_str().ok_or("Mirror stream interrupted")?;
-                            if last.is_some_and(|seq| frame.seq != seq + 1) {
-                                return Err(
-                                    "Mirror lost video packets. Close and reopen it.".into()
-                                );
-                            }
-                            last = Some(frame.seq);
-                            let bytes = base64::engine::general_purpose::STANDARD
-                                .decode(encoded)
-                                .map_err(|e| e.to_string())?;
-                            if bytes.len() > 1 {
-                                input
-                                    .write_all(&bytes[1..])
-                                    .await
-                                    .map_err(|e| e.to_string())?;
+            }
+            glib::Propagation::Proceed
+        });
+        let weak = Rc::downgrade(self);
+        keys.connect_key_released(move |_, key, _, modifiers| {
+            let Some(view) = weak.upgrade() else { return };
+            if view.phase.get() != Phase::Live || key == gtk::gdk::Key::F11 {
+                return;
+            }
+            let ctrl = modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK);
+            let alt = modifiers.contains(gtk::gdk::ModifierType::ALT_MASK);
+            if let Some(code) = input::keycode(key).or_else(|| (ctrl || alt).then(|| input::chord_keycode(key)).flatten()) {
+                view.send(json!({"type":"key","action":1,"keycode":code,"meta":input::meta(modifiers)}));
+            }
+        });
+        self.root.add_controller(keys);
+    }
+
+    fn map(&self, x: f64, y: f64, clamp: bool) -> Option<(i32, i32)> {
+        let area = (self.picture.width() as f64, self.picture.height() as f64);
+        if clamp {
+            input::map_point_clamped(area, self.dims.get(), x, y)
+        } else {
+            input::map_point(area, self.dims.get(), x, y)
+        }
+    }
+
+    /// Queue one input event. Only a live mirror takes input; the queue is unbounded and the
+    /// sender collapses moves, so no burst of motion can end the mirror.
+    fn send(&self, event: Value) {
+        if self.phase.get() != Phase::Live {
+            return;
+        }
+        if let Some(input) = self.input.borrow().as_ref() {
+            let _ = input.try_send(event);
+        }
+    }
+
+    // ------------------------------------------------------------------ hosts
+
+    fn present(&self) {
+        match &*self.host.borrow() {
+            Host::Window(window) => window.present(),
+            Host::Dock(_) => {
+                self.picture.grab_focus();
+            }
+            Host::None => {}
+        }
+    }
+
+    /// Take the view out of its current host without stopping anything.
+    fn release(&self) {
+        match self.host.replace(Host::None) {
+            Host::Window(window) => {
+                window.set_child(None::<&gtk::Widget>);
+                // `destroy`, not `close`: close-request is what ends the mirror.
+                window.destroy();
+            }
+            Host::Dock(dock) => {
+                dock.body.remove(&self.root);
+                dock.close();
+            }
+            Host::None => {}
+        }
+    }
+
+    fn detach(self: &Rc<Self>) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        self.release();
+        let (width, height) = self.window_size(&ui);
+        let window = gtk::Window::builder()
+            .application(&ui.window.application().unwrap())
+            .transient_for(&ui.window)
+            .title(self.window_title())
+            .default_width(width)
+            .default_height(height)
+            .build();
+        window.add_css_class("mirror-window");
+        window.set_child(Some(&self.root));
+        let weak = Rc::downgrade(self);
+        window.connect_close_request(move |_| {
+            if let Some(view) = weak.upgrade() {
+                // The window is closing itself; forget it so `close` does not destroy it again.
+                *view.host.borrow_mut() = Host::None;
+                view.close();
+            }
+            glib::Propagation::Proceed
+        });
+        let weak = Rc::downgrade(self);
+        window.connect_fullscreened_notify(move |window| {
+            if let Some(view) = weak.upgrade() {
+                view.fullscreen.set(window.is_fullscreen());
+                if window.is_fullscreen() {
+                    glyphs::rekey(&view.fullscreen_key, "exit-fullscreen", "Leave full screen (F11)");
+                    view.root.add_css_class("fullscreen");
+                } else {
+                    glyphs::rekey(&view.fullscreen_key, "fullscreen", "Full screen (F11)");
+                    view.root.remove_css_class("fullscreen");
+                }
+            }
+        });
+        glyphs::rekey(&self.dock_key, "dock", "Dock beside the wall");
+        self.close_key.set_visible(false);
+        self.root.remove_css_class("docked");
+        *self.host.borrow_mut() = Host::Window(window.clone());
+        PREFER_DOCK.with(|prefer| prefer.set(false));
+        window.present();
+        self.picture.grab_focus();
+    }
+
+    fn dock(self: &Rc<Self>) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        // The dock takes the right edge; a sheet already there (the Devices panel the mirror
+        // was opened from) would sit on top of or under it, so it steps aside.
+        let _ = ui.dismiss_panels();
+        // One dock: a mirror already docked moves out to its own window.
+        let docked = VIEWS.with(|views| {
+            views.borrow().iter().filter(|view| !Rc::ptr_eq(view, self) && matches!(*view.host.borrow(), Host::Dock(_))).cloned().collect::<Vec<_>>()
+        });
+        for view in docked {
+            view.detach();
+        }
+        if self.fullscreen.get() {
+            self.toggle_fullscreen();
+        }
+        self.release();
+        let dock = Dock::new(&ui, DOCK_WIDTH);
+        dock.body.append(&self.root);
+        glyphs::rekey(&self.dock_key, "undock", "Open in its own window");
+        self.close_key.set_visible(true);
+        self.root.add_css_class("docked");
+        *self.host.borrow_mut() = Host::Dock(dock);
+        PREFER_DOCK.with(|prefer| prefer.set(true));
+        self.picture.grab_focus();
+    }
+
+    fn toggle_fullscreen(self: &Rc<Self>) {
+        if matches!(*self.host.borrow(), Host::Dock(_)) {
+            self.detach();
+        }
+        if let Host::Window(window) = &*self.host.borrow() {
+            if window.is_fullscreen() {
+                window.unfullscreen();
+            } else {
+                window.fullscreen();
+            }
+        }
+    }
+
+    /// End the mirror and drop the view. Dropping the session drops its engine connection,
+    /// and the engine stops a mirror whose connection is gone.
+    fn close(&self) {
+        self.generation.set(self.generation.get() + 1);
+        if let Some(task) = self.task.borrow_mut().take() {
+            task.abort();
+        }
+        self.input.borrow_mut().take();
+        self.release();
+        let device = self.device.borrow().clone();
+        VIEWS.with(|views| views.borrow_mut().retain(|view| *view.device.borrow() != device));
+    }
+
+    fn window_title(&self) -> String {
+        let model = self.model.borrow();
+        if model.is_empty() { format!("Device · {}", self.device.borrow()) } else { format!("{model} · Relay") }
+    }
+
+    /// A phone-shaped window: tall, sized to the monitor, wide enough for the key rail.
+    fn window_size(&self, ui: &Ui) -> (i32, i32) {
+        let monitor = ui.window.surface().and_then(|surface| WidgetExt::display(&ui.window).monitor_at_surface(&surface));
+        let screen = monitor.map(|monitor| monitor.geometry().height()).unwrap_or(1080);
+        let height = (screen * 85 / 100).clamp(560, 960);
+        let (w, h) = match self.dims.get() {
+            (w, h) if w > 0 && h > 0 => (w as f64, h as f64),
+            _ => (9.0, 19.5),
+        };
+        let phone = ((height - CHROME_H) as f64 * w / h) as i32;
+        (phone + CHROME_W, height)
+    }
+
+    /// The capture rung to ask for: the monitor's height in device pixels, capped.
+    fn capture_size(&self, ui: &Ui) -> i32 {
+        let monitor = ui.window.surface().and_then(|surface| WidgetExt::display(&ui.window).monitor_at_surface(&surface));
+        monitor.map(|monitor| monitor.geometry().height() * monitor.scale_factor()).unwrap_or(1024).clamp(1024, MAX_CAPTURE)
+    }
+
+    // ------------------------------------------------------------------ session
+
+    /// (Re)start the mirror on the current device. Any running session is dropped first.
+    fn start(self: &Rc<Self>) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        let generation = self.generation.get() + 1;
+        self.generation.set(generation);
+        if let Some(task) = self.task.borrow_mut().take() {
+            task.abort();
+        }
+        let (input, inputs) = async_channel::unbounded();
+        *self.input.borrow_mut() = Some(input);
+        self.display_on.set(true);
+        glyphs::rekey(&self.display_key, "screen-off", "Turn the device screen off (mirroring continues)");
+        self.connecting("Asking Relay to start the mirror…");
+        let device = self.device.borrow().clone();
+        let max_size = self.capture_size(&ui);
+        let task = glib::spawn_future_local(session(Rc::downgrade(self), generation, device, max_size, ui.rt.clone(), ui.path.clone(), inputs));
+        *self.task.borrow_mut() = Some(task);
+        // The model name, for the strip and the cards, ahead of the handshake.
+        if self.model.borrow().is_empty() {
+            let weak = Rc::downgrade(self);
+            glib::spawn_future_local(async move {
+                let Some(ui) = weak.upgrade().and_then(|view| view.ui.upgrade()) else { return };
+                if let Ok(list) = ui.call("device.list", json!({})).await {
+                    if let Some(view) = weak.upgrade() {
+                        let device = view.device.borrow().clone();
+                        if let Some(model) = list["devices"].as_array().into_iter().flatten().find(|d| d["serial"] == device.as_str()).and_then(|d| d["model"].as_str()) {
+                            if view.model.borrow().is_empty() {
+                                view.set_model(model);
                             }
                         }
-                        Notice::Disconnected(e) => return Err(e.to_string()),
-                        _ => {}
                     }
                 }
-                Ok::<(), String>(())
-            };
-            let result = tokio::select! {result=read=>result,result=write=>result};
-            let _ = decoder.kill().await;
-            let _ = decoder.wait().await;
-            result
-        });
-        let abort = worker.abort_handle();
-        struct Stop(tokio::task::AbortHandle);
-        impl Drop for Stop {
-            fn drop(&mut self) {
-                self.0.abort();
-            }
+            });
         }
-        let _stop = Stop(abort);
-        let input = async {
-            while let Ok(event) = event_rx.recv().await {
-                c.request(
-                    &rt,
-                    "device.mirror.input",
-                    json!({"mirror_id":mid,"event":event}),
-                )
-                .await
-                .map_err(|e| e.to_string())?;
-            }
-            Ok::<(), String>(())
+    }
+
+    fn current(&self, generation: u64) -> bool {
+        self.generation.get() == generation
+    }
+
+    fn switch_device(self: &Rc<Self>, serial: String) {
+        if *self.device.borrow() == serial {
+            return;
+        }
+        let taken = VIEWS.with(|views| views.borrow().iter().find(|view| *view.device.borrow() == serial).cloned());
+        if let Some(other) = taken {
+            other.present();
+            return;
+        }
+        *self.device.borrow_mut() = serial;
+        self.model.borrow_mut().clear();
+        self.texture.borrow_mut().take();
+        self.picture.set_paintable(None::<&gtk::gdk::Paintable>);
+        self.dims.set((0, 0));
+        self.title.set_text(&self.device.borrow());
+        self.update_meta();
+        self.start();
+    }
+
+    fn set_model(&self, model: &str) {
+        let model = model.replace('_', " ");
+        *self.model.borrow_mut() = model.clone();
+        self.title.set_text(&model);
+        if let Host::Window(window) = &*self.host.borrow() {
+            window.set_title(Some(&self.window_title()));
+        }
+        if self.phase.get() == Phase::Connecting {
+            self.card_title.set_text(&format!("Connecting to {model}"));
+        }
+    }
+
+    fn name(&self) -> String {
+        let model = self.model.borrow();
+        if model.is_empty() { self.device.borrow().clone() } else { model.clone() }
+    }
+
+    fn update_meta(&self) {
+        let (w, h) = self.dims.get();
+        let device = self.device.borrow();
+        let text = match self.phase.get() {
+            Phase::Live if w > 0 => format!("{device} · {w}×{h}"),
+            Phase::Connecting => format!("{device} · connecting"),
+            Phase::Ended => format!("{device} · not mirroring"),
+            Phase::Live => device.clone(),
         };
-        let result = tokio::select! {value=worker=>value.map_err(|e|e.to_string()).and_then(|v|v),value=input=>value, _=reset_rx.recv()=>Err("Mirror stopped because input could not keep up. Reopen it to reconnect.".into())};
-        if let Err(e) = result {
-            let _ = frames.send(Err(e)).await;
+        self.meta.set_text(&text);
+    }
+
+    fn set_lamp(&self, state: &str) {
+        for class in ["live", "held", "waiting"] {
+            self.lamp.remove_css_class(class);
         }
-        let _ = client
-            .request(&rt, "device.mirror.stop", json!({"mirror_id":mid}))
-            .await;
-    });
-    let paint = glib::spawn_future_local(async move {
-        while let Ok(frame) = images.recv().await {
-            match frame {
-                Ok(frame) => {
-                    dimensions.set((frame.width, frame.height));
-                    let bytes = glib::Bytes::from_owned(frame.rgb);
-                    let t = gtk::gdk::MemoryTexture::new(
-                        frame.width,
-                        frame.height,
-                        gtk::gdk::MemoryFormat::R8g8b8,
-                        &bytes,
-                        frame.width as usize * 3,
-                    );
-                    picture.set_paintable(Some(&t));
-                    *texture.borrow_mut() = Some(t);
-                    status.set_text("Drag to touch · Ctrl V to paste");
-                }
-                Err(e) => status.set_text(&e),
+        if !state.is_empty() {
+            self.lamp.add_css_class(state);
+        }
+    }
+
+    fn set_controls(&self, live: bool) {
+        for key in &self.controls {
+            key.set_sensitive(live);
+        }
+        self.shot_key.set_sensitive(self.texture.borrow().is_some());
+    }
+
+    fn connecting(&self, stage: &str) {
+        self.phase.set(Phase::Connecting);
+        self.set_lamp("waiting");
+        self.set_controls(false);
+        self.picture.add_css_class("dimmed");
+        self.card.set_visible(true);
+        self.card.remove_css_class("problem");
+        self.card_spinner.set_visible(true);
+        self.card_spinner.start();
+        self.card_title.set_text(&format!("Connecting to {}", self.name()));
+        self.card_detail.set_text(stage);
+        self.card_code.set_visible(false);
+        self.card_retry.set_visible(false);
+        self.card_other.set_visible(false);
+        self.update_meta();
+    }
+
+    fn live(&self) {
+        if self.phase.get() == Phase::Live {
+            return;
+        }
+        self.phase.set(Phase::Live);
+        self.set_lamp("live");
+        self.card_spinner.stop();
+        self.card.set_visible(false);
+        self.picture.remove_css_class("dimmed");
+        self.set_controls(true);
+        self.update_meta();
+    }
+
+    /// A terminal card: what happened, why, and the next step.
+    fn ended(&self, title: &str, detail: &str, code: Option<&str>, other: Option<&str>) {
+        self.phase.set(Phase::Ended);
+        self.input.borrow_mut().take();
+        self.set_lamp("held");
+        self.set_controls(false);
+        self.picture.add_css_class("dimmed");
+        self.card.set_visible(true);
+        self.card.add_css_class("problem");
+        self.card_spinner.stop();
+        self.card_spinner.set_visible(false);
+        self.card_title.set_text(title);
+        self.card_detail.set_text(detail);
+        self.card_code.set_text(code.unwrap_or(""));
+        self.card_code.set_visible(code.is_some());
+        self.card_retry.set_visible(true);
+        self.card_other.set_visible(other.is_some());
+        if let Some(other) = other {
+            self.card_other.set_label(other);
+        }
+        *self.problem.borrow_mut() = match code {
+            Some(code) => format!("{title}\n{detail}\n{code}"),
+            None => format!("{title}\n{detail}"),
+        };
+        self.update_meta();
+    }
+
+    fn apply_status(&self, status: &Value) {
+        if let Some(name) = status["name"].as_str().filter(|name| !name.is_empty()) {
+            if self.model.borrow().is_empty() {
+                self.set_model(name);
             }
         }
-    });
-    window.connect_close_request(move |_| {
-        task.abort();
-        paint.abort();
-        glib::Propagation::Proceed
-    });
-    window.present();
-}
-fn point(p: &gtk::Picture, (w, h): (i32, i32), x: f64, y: f64) -> Option<(i32, i32, u16, u16)> {
-    if w <= 0 || h <= 0 {
-        return None;
+        let size = (status["width"].as_i64().unwrap_or(0) as i32, status["height"].as_i64().unwrap_or(0) as i32);
+        if self.texture.borrow().is_none() && size.0 > 0 && size.1 > 0 {
+            self.set_dims(size);
+        }
+        match status["state"].as_str() {
+            Some("starting") if self.phase.get() == Phase::Connecting => {
+                self.card_detail.set_text("Starting the screen server on the device…");
+            }
+            Some("running") if self.phase.get() == Phase::Connecting => {
+                self.card_detail.set_text("Waiting for the first picture…");
+            }
+            _ => {}
+        }
     }
-    let scale = (p.width() as f64 / w as f64).min(p.height() as f64 / h as f64);
-    if scale <= 0.0 {
-        return None;
+
+    fn set_dims(&self, (w, h): (i32, i32)) {
+        if self.dims.get() == (w, h) {
+            return;
+        }
+        let (ow, oh) = self.dims.replace((w, h));
+        self.aspect.set_ratio(w as f32 / h as f32);
+        self.update_meta();
+        // The device rotated: turn the window with it, so a landscape app is not a thin strip
+        // in a tall window. The phone area swaps axes; the chrome around it stays put.
+        let rotated = ow > 0 && oh > 0 && (ow > oh) != (w > h);
+        if let Host::Window(window) = &*self.host.borrow() {
+            if rotated && !window.is_fullscreen() && !window.is_maximized() {
+                let (cw, ch) = (window.width(), window.height());
+                let (phone_w, phone_h) = ((cw - CHROME_W).max(120), (ch - CHROME_H).max(120));
+                window.set_default_size(phone_h + CHROME_W, phone_w + CHROME_H);
+            }
+        }
     }
-    let x = (x - (p.width() as f64 - w as f64 * scale) / 2.0) / scale;
-    let y = (y - (p.height() as f64 - h as f64 * scale) / 2.0) / scale;
-    Some((
-        x.round().clamp(0.0, (w - 1) as f64) as i32,
-        y.round().clamp(0.0, (h - 1) as f64) as i32,
-        w as u16,
-        h as u16,
-    ))
+
+    fn paint(&self, frame: decode::Pixels) {
+        let bytes = glib::Bytes::from_owned(frame.rgb);
+        let texture = gtk::gdk::MemoryTexture::new(frame.width, frame.height, gtk::gdk::MemoryFormat::R8g8b8, &bytes, frame.width as usize * 3);
+        self.picture.set_paintable(Some(&texture));
+        *self.texture.borrow_mut() = Some(texture);
+        self.set_dims((frame.width, frame.height));
+        if self.phase.get() == Phase::Connecting {
+            self.live();
+        }
+    }
+
+    /// Show `message` in the hint line for a few seconds.
+    fn flash(self: &Rc<Self>, message: &str) {
+        let generation = self.hint_generation.get() + 1;
+        self.hint_generation.set(generation);
+        self.hint.set_text(message);
+        self.hint.add_css_class("flash");
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local_once(Duration::from_secs(4), move || {
+            if let Some(view) = weak.upgrade().filter(|view| view.hint_generation.get() == generation) {
+                view.hint.set_text(HINT);
+                view.hint.remove_css_class("flash");
+            }
+        });
+    }
+
+    fn save_screenshot(self: &Rc<Self>) {
+        let Some(texture) = self.texture.borrow().clone() else { return };
+        let stamp = glib::DateTime::now_local().ok().and_then(|now| now.format("%Y%m%d-%H%M%S").ok()).map(|s| s.to_string()).unwrap_or_default();
+        let name = format!("{}-{stamp}.png", self.name().replace(' ', "-"));
+        let chooser = gtk::FileDialog::builder().title("Save device screenshot").initial_name(name.as_str()).build();
+        let parent = self.root.root().and_downcast::<gtk::Window>();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let Ok(file) = chooser.save_future(parent.as_ref()).await else { return };
+            let Some(path) = file.path() else { return };
+            let Some(view) = weak.upgrade() else { return };
+            match texture.save_to_png(&path) {
+                Ok(()) => view.flash(&format!("Saved {}", path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())),
+                Err(error) => view.flash(&format!("Could not save the screenshot: {error}")),
+            }
+        });
+    }
+
+    /// Fill the device picker from `device.list` each time it opens.
+    fn fill_picker(self: &Rc<Self>) {
+        crate::app::clear(&self.picker_list);
+        self.picker_list.append(&label("Loading devices…", "mirror-meta"));
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let Some(ui) = weak.upgrade().and_then(|view| view.ui.upgrade()) else { return };
+            let listed = ui.call("device.list", json!({})).await;
+            let Some(view) = weak.upgrade() else { return };
+            crate::app::clear(&view.picker_list);
+            let devices = match listed {
+                Ok(value) => value["devices"].as_array().cloned().unwrap_or_default(),
+                Err(error) => {
+                    view.picker_list.append(&label(&error.to_string(), "mirror-meta"));
+                    return;
+                }
+            };
+            if devices.is_empty() {
+                view.picker_list.append(&label("No devices. Connect a phone with USB debugging on.", "mirror-meta"));
+            }
+            for device in devices {
+                let serial = device["serial"].as_str().unwrap_or("").to_string();
+                let state = device["state"].as_str().unwrap_or("");
+                let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+                let current = *view.device.borrow() == serial;
+                let mark = glyphs::image("check", 14);
+                mark.set_opacity(if current { 1.0 } else { 0.0 });
+                row.append(&mark);
+                let names = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                names.append(&label(&device["model"].as_str().unwrap_or(&serial).replace('_', " "), "mirror-device-name"));
+                let detail = if state == "device" { serial.clone() } else { format!("{serial} · {state}") };
+                names.append(&label(&detail, "mirror-meta"));
+                row.append(&names);
+                let button = gtk::Button::new();
+                button.set_child(Some(&row));
+                button.add_css_class("quiet");
+                button.add_css_class("mirror-device-row");
+                button.set_sensitive(state == "device");
+                let weak = Rc::downgrade(&view);
+                button.connect_clicked(move |_| {
+                    if let Some(view) = weak.upgrade() {
+                        view.picker.popdown();
+                        view.switch_device(serial.clone());
+                    }
+                });
+                view.picker_list.append(&button);
+            }
+        });
+    }
 }
+
+/// How a session ended, as the stage explains it.
+enum End {
+    /// A terminal status object from the engine.
+    Status(Value),
+    /// The local pipeline or connection broke.
+    Broken(String),
+    /// The engine refused or could not be reached.
+    Request(Error),
+}
+
+/// One mirror session: connect, start, stream, then explain the end. Runs on the GTK thread;
+/// FFmpeg and the socket reads run on the tokio runtime.
+async fn session(
+    weak: Weak<MirrorView>,
+    generation: u64,
+    device: String,
+    max_size: i32,
+    rt: tokio::runtime::Handle,
+    path: PathBuf,
+    inputs: async_channel::Receiver<Value>,
+) {
+    let alive = || weak.upgrade().filter(|view| view.current(generation));
+    let end = stream(&alive, &device, max_size, &rt, &path, inputs).await;
+    let Some(view) = alive() else { return };
+    let name = view.name();
+    let lost = match end {
+        End::Status(status) => {
+            let code = status["code"].as_str().unwrap_or("");
+            let message = status["message"].as_str().unwrap_or("");
+            match status["state"].as_str() {
+                Some("lost") => {
+                    view.ended(&format!("{name} disconnected"), "The mirror resumes on its own when it reconnects. Check the cable, or that wireless debugging is still on.", None, Some("Choose device"));
+                    true
+                }
+                Some("stopped") => {
+                    view.ended("Mirror stopped", "Something outside this window ended the mirror.", None, None);
+                    false
+                }
+                _ => {
+                    view.ended(failure_title(code), message, Some(code), Some("Copy details"));
+                    false
+                }
+            }
+        }
+        End::Broken(message) => {
+            let title = if message.starts_with("FFmpeg") { "FFmpeg is needed to show the screen" } else { "The mirror stopped" };
+            view.ended(title, &message, None, Some("Copy details"));
+            false
+        }
+        End::Request(Error::Bus(error)) => {
+            let detail = match &error.hint {
+                Some(hint) => format!("{} {}", sentence(&error.message), sentence(hint)),
+                None => sentence(&error.message),
+            };
+            let lost = error.code == "device.none";
+            let title = if lost { format!("{name} isn't connected") } else { failure_title(&error.code).to_string() };
+            view.ended(&title, &detail, Some(&error.code), Some(if lost { "Choose device" } else { "Copy details" }));
+            lost
+        }
+        End::Request(error) => {
+            view.ended("Can't reach Relay's engine", &error.to_string(), None, Some("Copy details"));
+            false
+        }
+    };
+    drop(view);
+    if lost && wait_for_device(&alive, &device, &rt, &path).await {
+        // adb lists a device a moment before it accepts a push.
+        glib::timeout_future(Duration::from_millis(800)).await;
+        if let Some(view) = alive() {
+            view.start();
+        }
+    }
+}
+
+async fn stream(
+    alive: &impl Fn() -> Option<Rc<MirrorView>>,
+    device: &str,
+    max_size: i32,
+    rt: &tokio::runtime::Handle,
+    path: &std::path::Path,
+    inputs: async_channel::Receiver<Value>,
+) -> End {
+    let (client, notices) = match Client::connect_with_limit(rt, path.to_path_buf(), MIRROR_MAX_LINE).await {
+        Ok(connection) => connection,
+        Err(error) => return End::Request(error),
+    };
+    let started = match client.request(rt, "device.mirror.start", json!({"device":device,"max_size":max_size})).await {
+        Ok(started) => started,
+        Err(error) => return End::Request(error),
+    };
+    let mirror_id = started["mirror_id"].as_i64().unwrap_or(0);
+    if let Some(view) = alive() {
+        view.apply_status(&json!({"state":"starting","width":started["width"],"height":started["height"]}));
+    } else {
+        return End::Broken(String::new());
+    }
+
+    let (frames, pictures) = async_channel::bounded::<decode::Pixels>(2);
+    let (control, controls) = async_channel::unbounded::<Control>();
+    let worker = rt.spawn(decode::run(notices, frames, pictures.clone(), control));
+    struct AbortOnDrop(tokio::task::AbortHandle);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let _worker = AbortOnDrop(worker.abort_handle());
+    // Resync requests share the input path, so they queue behind nothing but input.
+    let (resync, resyncs) = async_channel::unbounded::<()>();
+
+    let paint = async {
+        while let Ok(picture) = pictures.recv().await {
+            match alive() {
+                Some(view) => view.paint(picture),
+                None => break,
+            }
+        }
+        std::future::pending::<()>().await;
+    };
+    let watch = async {
+        while let Ok(message) = controls.recv().await {
+            match message {
+                Control::Status(status) => {
+                    if matches!(status["state"].as_str(), Some("stopped" | "failed" | "lost")) {
+                        return End::Status(status);
+                    }
+                    match alive() {
+                        Some(view) => view.apply_status(&status),
+                        None => return End::Broken(String::new()),
+                    }
+                }
+                Control::Resync => {
+                    let _ = resync.try_send(());
+                }
+                Control::Broken(message) => return End::Broken(message),
+            }
+        }
+        End::Broken("The video pipeline stopped.".into())
+    };
+    let send = async {
+        loop {
+            let batch = tokio::select! {
+                event = inputs.recv() => match event {
+                    Ok(event) => {
+                        let mut batch = vec![event];
+                        while let Ok(more) = inputs.try_recv() {
+                            batch.push(more);
+                        }
+                        input::coalesce(batch)
+                    }
+                    Err(_) => break,
+                },
+                Ok(()) = resyncs.recv() => vec![json!({"type":"resetvideo"})],
+            };
+            for event in batch {
+                match client.request(rt, "device.mirror.input", json!({"mirror_id":mirror_id,"event":event})).await {
+                    Err(Error::Disconnected) => return,
+                    Err(error) => tracing::debug!(%error, "mirror input refused"),
+                    Ok(_) => {}
+                }
+            }
+        }
+        std::future::pending::<()>().await;
+    };
+    tokio::select! {
+        end = watch => end,
+        _ = paint => End::Broken(String::new()),
+        _ = send => End::Broken("Relay's engine connection closed.".into()),
+    }
+}
+
+/// Wait, event-driven, for `device` to come back: subscribe to `device.changed` on a connection
+/// of our own, take a device-watch lease, and check `device.list` on each change.
+async fn wait_for_device(
+    alive: &impl Fn() -> Option<Rc<MirrorView>>,
+    device: &str,
+    rt: &tokio::runtime::Handle,
+    path: &std::path::Path,
+) -> bool {
+    let Ok((client, notices)) = Client::connect(rt, path.to_path_buf()).await else { return false };
+    if client.request(rt, "bus.subscribe", json!({"events":["device.changed"]})).await.is_err()
+        || client.request(rt, "device.watch", json!({"on":true})).await.is_err()
+    {
+        return false;
+    }
+    loop {
+        if alive().is_none() {
+            return false;
+        }
+        if let Ok(list) = client.request(rt, "device.list", json!({})).await {
+            let ready = list["devices"].as_array().into_iter().flatten().any(|d| d["serial"] == device && d["state"] == "device");
+            if ready {
+                return true;
+            }
+        }
+        loop {
+            match notices.recv().await {
+                Ok(Notice::Event(event)) if event.ev == "device.changed" => break,
+                Ok(Notice::Disconnected(_)) | Err(_) => return false,
+                Ok(_) => {}
+            }
+        }
+    }
+}
+
+fn sentence(text: &str) -> String {
+    let text = text.trim();
+    let mut out = text.to_string();
+    if let Some(first) = out.get(..1) {
+        out.replace_range(..1, &first.to_uppercase());
+    }
+    if !out.is_empty() && !out.ends_with(['.', '!', '?']) {
+        out.push('.');
+    }
+    out
+}
+
+/// The card title for an engine failure code: what broke, in the user's terms.
+fn failure_title(code: &str) -> &'static str {
+    match code {
+        "device.mirror_push_failed" => "Couldn't copy the screen server to the device",
+        "device.mirror_forward_failed" => "adb couldn't open a tunnel to the device",
+        "device.mirror_spawn_failed" | "device.mirror_ended" => "The screen server didn't start",
+        "device.mirror_stream_failed" => "The screen stream stopped",
+        "device.mirror_server_missing" => "This Relay install is missing its screen server",
+        "device.not_ready" => "The device isn't ready — allow USB debugging on it",
+        "device.size_failed" | "device.size_timeout" => "The device didn't report its screen size",
+        "device.adb_timeout" | "device.adb_failed" | "device.adb_missing" => "adb isn't answering",
+        _ => "The mirror stopped",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[tokio::test]
-    async fn decoder_frames_preserve_rotation_and_reject_bad_dimensions() {
-        let data = b"P6\n2 1\n255\nabcdefP6\n1 2\n255\nghijkl";
-        let mut reader = BufReader::new(&data[..]);
-        let a = ppm(&mut reader).await.unwrap();
-        let b = ppm(&mut reader).await.unwrap();
-        assert_eq!((a.width, a.height, a.rgb), (2, 1, b"abcdef".to_vec()));
-        assert_eq!((b.width, b.height, b.rgb), (1, 2, b"ghijkl".to_vec()));
-        let mut reader = BufReader::new(&b"P6\n9000 9000\n255\n"[..]);
-        assert!(ppm(&mut reader).await.is_err());
-    }
-}
 
-#[test]
-fn input_overflow_requests_device_reset() {
-    let (queue, _events) = async_channel::bounded(1);
-    let (reset, signal) = async_channel::bounded(1);
-    let input = Input { queue, reset };
-    input.try_send(json!({"type":"touch","action":0})).unwrap();
-    assert!(input.try_send(json!({"type":"touch","action":1})).is_err());
-    assert!(signal.try_recv().is_ok());
+    #[test]
+    fn failure_codes_have_specific_titles_and_messages_read_as_sentences() {
+        assert_eq!(failure_title("device.mirror_push_failed"), "Couldn't copy the screen server to the device");
+        assert_eq!(failure_title("device.something_new"), "The mirror stopped");
+        assert_eq!(sentence("device relay-phone is not connected"), "Device relay-phone is not connected.");
+        assert_eq!(sentence("Already fine."), "Already fine.");
+        assert_eq!(sentence(""), "");
+    }
 }

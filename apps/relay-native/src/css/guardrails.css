@@ -1,0 +1,53 @@
+/* guardrails area styles: loaded after theme.css, so rules here override it. */
+
+/* Cards: a held action is red (it stopped something), an exception request amber (it waits on
+   you). State color stays a 2px rule, per the Tally Rule; the slab itself stays neutral. */
+.guardrail-card { padding: 14px 16px; }
+.guardrail-card.record { border-left: 2px solid @held; }
+.guardrail-request.record { border-left-color: @waiting; }
+.guardrail-card .title { font-size: 14px; }
+.guardrail-mark { color: @held; }
+.guardrail-request .guardrail-mark { color: @waiting; }
+.guardrail-eyebrow { padding: 0; color: @secondary; }
+.guardrail-subject { background: @screen; border: 1px solid @edge; padding: 7px 9px; color: @ink; font-size: 12px; }
+.guardrail-reason { color: @ink; font-style: italic; }
+.guardrail-exact { color: @secondary; font-size: 11px; }
+.guardrail-keys { margin-top: 4px; }
+.guardrail-deny entry { min-height: 28px; }
+.guardrail-expander title { color: @secondary; font-size: 12px; }
+.guardrail-details { margin: 6px 0 2px 18px; }
+.guardrail-details .faint { font-size: 11px; }
+.guardrail-details .body { font-size: 12px; }
+
+/* The page. */
+.guardrail-actions { margin: 2px 0 6px; }
+.guardrail-section { margin: 14px 0 2px; }
+.guardrail-section .section-label { padding: 0; }
+.guardrail-grant { border-left: 2px solid @live; padding: 10px 14px; }
+.guardrail-grant .body { font-weight: 600; }
+
+/* The prompt: floats bottom-right over whatever you are doing, never takes focus. */
+.guardrail-tray { background: transparent; }
+.guardrail-prompt { background: @console; border: 1px solid @edge; border-top: 2px solid @waiting; padding: 14px 16px 12px; box-shadow: 0 10px 30px alpha(black, .45); }
+.guardrail-prompt .guardrail-subject { font-size: 11px; }
+.guardrail-prompt button.icon-key { min-width: 26px; padding: 0; }
+button.guardrail-more { background: @console; border: 1px solid @edge; color: @ink; }
+
+/* The layered editor. */
+.guardrail-editor { margin-top: 4px; }
+.guardrail-scope button.guardrail-scope-key { min-width: 92px; min-height: 28px; border-radius: 0; }
+.guardrail-scope .linked > button:first-child { border-radius: 2px 0 0 2px; }
+.guardrail-scope .linked > button:last-child { border-radius: 0 2px 2px 0; }
+.guardrail-scope button.guardrail-scope-key:checked { background: @ink; border-color: @ink; color: @wall; font-weight: 600; }
+.guardrail-scope-note { font-size: 12px; color: @secondary; }
+.guardrail-group { border: 1px solid @edge; background: @slab; padding: 12px 14px 4px; }
+.guardrail-group > .section-label { padding: 0 0 6px; }
+.guardrail-field { padding: 10px 0; border-top: 1px solid @edge; }
+.guardrail-group > .section-label + .guardrail-field { border-top: 0; }
+.guardrail-field .body { font-weight: 500; }
+.guardrail-source { font-size: 11px; margin-top: 2px; }
+.guardrail-source.inherited { color: @faint; }
+.guardrail-source.here { color: @ink; }
+.guardrail-source.pending { color: @waiting; }
+.guardrail-list { border: 1px solid @edge; }
+.guardrail-footer { padding-top: 4px; }

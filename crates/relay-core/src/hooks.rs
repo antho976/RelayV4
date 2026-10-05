@@ -54,6 +54,15 @@ fn is_executable(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
+/// Serializes the hook and adapter writes of launches, creates and closes. They used to be
+/// serialized by the store mutex; now that they run with it released, two of them touching one
+/// repository at once would race on `.git/config`'s lock file and on the adapters' temp files.
+/// Held for milliseconds, never across a network call.
+pub fn writes() -> std::sync::MutexGuard<'static, ()> {
+    static WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    WRITES.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Give one worktree its own hook path, preserving any pre-existing pre-commit hook by
 /// chaining it before Relay's gate.
 pub fn install_git(
@@ -214,39 +223,57 @@ pub fn run_user_pre_commit(repo: &Path, worktree: &Path) -> Result<()> {
 /// Restore the hook path that was active before Relay owned this worktree. If another Relay
 /// session has since taken ownership, leave it alone.
 pub fn uninstall_git(repo: &Path, worktree: &Path, session: &str) -> Result<()> {
+    uninstall_git_any(repo, worktree, &[session.to_string()])
+}
+
+/// [`uninstall_git`] for every session that ever owned `worktree`, reading the active hook
+/// path once instead of once per session. Only the session whose hook directory is active has
+/// anything to undo: [`install_git`] records the pre-Relay path even when it replaces another
+/// Relay hook, so restoring that one leaves every other name a no-op.
+pub fn uninstall_git_any(repo: &Path, worktree: &Path, sessions: &[String]) -> Result<()> {
     if !worktree.exists() {
         return Ok(());
     }
-    let hook_dir = repo.join(".relay").join("hooks").join(session);
-    let Some(current) = git_optional(
-        worktree,
-        &["config", "--worktree", "--get", "core.hooksPath"],
-    ) else {
-        return Ok(());
-    };
-    let current = PathBuf::from(current);
-    let current_absolute = if current.is_absolute() { current } else { worktree.join(current) };
-    if current_absolute != hook_dir {
-        return Ok(());
-    }
-    match fs::read_to_string(hook_dir.join(PREVIOUS_HOOKS_PATH)) {
-        Ok(previous) if !previous.trim().is_empty() => {
-            git(
-                worktree,
-                &["config", "--worktree", "core.hooksPath", previous.trim()],
-            )?;
+    let relay_hooks = repo.join(".relay").join("hooks");
+    // Bounded by the list: a previous path that is itself a listed Relay hook unwinds too.
+    for _ in 0..sessions.len() {
+        let Some(current) = git_optional(
+            worktree,
+            &["config", "--worktree", "--get", "core.hooksPath"],
+        ) else {
+            return Ok(());
+        };
+        let current = PathBuf::from(current);
+        let current_absolute = if current.is_absolute() { current } else { worktree.join(current) };
+        let owned = current_absolute
+            .strip_prefix(&relay_hooks)
+            .ok()
+            .and_then(|rest| rest.to_str())
+            .is_some_and(|name| sessions.iter().any(|session| session == name));
+        if !owned {
+            return Ok(());
         }
-        _ => {
-            let output = Command::new("git")
-                .arg("-C")
-                .arg(worktree)
-                .args(["config", "--worktree", "--unset", "core.hooksPath"])
-                .output()?;
-            if !output.status.success() && output.status.code() != Some(5) {
-                return Err(anyhow!(
-                    "git config --worktree --unset core.hooksPath failed: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ));
+        match fs::read_to_string(current_absolute.join(PREVIOUS_HOOKS_PATH)) {
+            Ok(previous) if !previous.trim().is_empty() => {
+                git(
+                    worktree,
+                    &["config", "--worktree", "core.hooksPath", previous.trim()],
+                )?;
+            }
+            _ => {
+                let mut cmd = Command::new("git");
+                cmd.arg("-C")
+                    .arg(worktree)
+                    .args(["config", "--worktree", "--unset", "core.hooksPath"]);
+                let output = crate::proc::output_with_timeout(&mut cmd, GIT_TIMEOUT)?
+                    .ok_or_else(|| anyhow!("git config --worktree --unset core.hooksPath timed out"))?;
+                if !output.status.success() && output.status.code() != Some(5) {
+                    return Err(anyhow!(
+                        "git config --worktree --unset core.hooksPath failed: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ));
+                }
+                return Ok(());
             }
         }
     }
@@ -550,13 +577,15 @@ fn claude_statusline_script() -> &'static str {
     "#!/bin/sh\ninput=$(cat)\ncase \"$input\" in\n  *'\"rate_limits\"'*) ;;\n  *) exit 0 ;;\nesac\nout=\"${CLAUDE_CONFIG_DIR:-$HOME}/.claude/relay-usage.json\"\nmkdir -p \"${out%/*}\" 2>/dev/null\nprintf '%s\\n' \"$input\" > \"$out\" 2>/dev/null\nexit 0\n"
 }
 
+/// Hook setup is a handful of local `git config` calls; one that outlives this is stuck.
+const GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 fn git(repo: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .with_context(|| format!("running git {}", args.join(" ")))?;
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(repo).args(args);
+    let output = crate::proc::output_with_timeout(&mut cmd, GIT_TIMEOUT)
+        .with_context(|| format!("running git {}", args.join(" ")))?
+        .ok_or_else(|| anyhow!("git {} timed out", args.join(" ")))?;
     if !output.status.success() {
         return Err(anyhow!(
             "git {} failed: {}",

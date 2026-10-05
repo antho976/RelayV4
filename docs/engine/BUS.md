@@ -551,6 +551,48 @@ Holds live in the `holds` table with the frozen envelope. `guardrail.confirm {ho
 through the channel it already reads. Open holds expire (`state: expired`) when their session
 closes.
 
+### 9.5 Exceptions: an agent that cannot progress asks
+
+A refusal an agent cannot work around is not the end of the task. Every agent refusal a grant
+could lift carries `hint` (printed by both hook adapters) and `details.exception {kind, value}`
+naming the request to make:
+
+- **`guardrail.request`** (mutation · agent · session, callable by *every* role regardless of the
+  allowlist) — `{session, kind: "command"|"path"|"cap", value, reason, scope?: "once"|"session"}`
+  → `{request: GuardrailException, created, wait_for: "guardrail.request_resolved"}`. It is
+  stored as an open hold (`op: guardrail.request`, `policy: exception`), so it appears wherever
+  holds do, raises a notification, and expires with its session. An identical open (or still
+  active) request from the same session is returned instead of duplicated.
+- The user answers with **`guardrail.confirm {hold_id, scope?}`** (no replay: it records a grant
+  of `scope`, default the requested one) or **`guardrail.reject {hold_id, reason?}`**. Both emit
+  `guardrail.request_resolved {request_id, session, state, scope?|reason?}` and mail the agent.
+  The agent waits with `bus.wait {events: ["guardrail.request_resolved"], matching:
+  {request_id}}` and, after a timeout, re-reads `guardrail.request.get`.
+- A **grant** lifts exactly one rule for exactly that session, in `guardrail.gate`, every
+  enforcing `file.*` / `git.commit`, and (read-only) `guardrail.check`. `command` covers that
+  exact command (a trailing lone `*` covers anything after the words before it); every denied
+  command in a line needs its own. `path` covers protected paths, write roots (absolute prefix)
+  and large rewrites; never shape gates. `cap` raises the caps it names (`files=N lines=M`) or,
+  naming neither, lifts them. A `once` grant is spent only when the action it let through was
+  allowed, then announced as `guardrail.resolved {state: "used"}`.
+  `guardrail.grant.revoke {request_id}` (user) ends one early; `guardrail.requests.list
+  {project_id?, session?, state?: open|active|all}` lists them.
+- **No self-approval.** The answers are user-only on the bus. An agent's `exec` gate also refuses,
+  with the ungrantable `guardrail.self_approval`, any `relay` invocation that names a user-only
+  guardrail/settings answer or claims `--actor user|test`, and any line that sheds
+  `RELAY_SESSION`/sets `RELAY_ACTOR`. The socket does not authenticate the user actor, so this is
+  best effort against the obvious route, not a security boundary.
+
+### 9.6 Configuration layers
+
+Effective config is `defaults <- global <- workspace <- project <- the project's legacy
+protected_paths / critical_files`. Each layer stores only what it overrides
+(`guardrails.*`, `guardrails.workspaces.{id}.*`, `guardrails.projects.{id}.*`); a `null` in a
+`guardrail.config.set` patch clears a key back to the inherited value, and an object a patch
+empties is dropped rather than stored as `{}` (which used to replace the subtree).
+`guardrail.config.layers` answers one layer with its `effective` and `inherited` configs, its raw
+`overrides`, and `sources`: every leaf path mapped to the layer that decided it.
+
 ---
 
 ## 10. Op catalogue
@@ -567,7 +609,7 @@ optional. Entity shapes are in §11. `Id = number`. Every project-scoped op take
 | `bus.schema` | query · global | `{ op?: string }` → `{ schema: JsonSchema }` (whole `bus.v1.json`, or one op's `{payload, result}`) |
 | `bus.ops` | query · global | `{ actor?: Actor }` → `{ ops: OpInfo[] }` — registry attributes plus the all-layers `call`/`why` verdict for the (given or calling) actor (§9.1) |
 | `bus.whoami` | query · global | `{}` → `{ actor, is_agent, session?, role?, project_id?, project?, worktree?, branch?, can_call: string[], write_roots: string[] }` — identity and capability in one call, for any actor (D119) |
-| `bus.wait` | query · global · socket only | `{ events?: string[], timeout_ms? = 60000 }` → `{ event?: Event, timed_out }` — block until a matching event arrives. The wake-up an agent has instead of a poll loop; events fired before the call are not replayed, so read state first, then wait (D115) |
+| `bus.wait` | query · global · socket only | `{ events?: string[], timeout_ms? = 60000, matching?: object }` → `{ event?: Event, timed_out }` — block until a matching event arrives. The wake-up an agent has instead of a poll loop; events fired before the call are not replayed, so read state first, then wait (D115). `matching` takes only an event whose payload has each given top-level key equal to the value given |
 | `bus.subscribe` | query · global · socket only | `{ events?: string[] }` → `{ subscribed: string[] }` |
 | `bus.unsubscribe` | query · global · socket only | `{}` → `{}` |
 
@@ -610,13 +652,13 @@ unique; nothing else is.
 | `workspace.discover` | query | `{ path? }` → `{ path, repositories: {path,name}[] }`; resolves blank to the current Git checkout's parent (or the current directory outside a checkout) and scans bounded descendants for Git roots |
 | `workspace.list` | query | `{}` → `{ workspaces: Workspace[] }` |
 | `workspace.update` | mutation · always · inverse | `{ workspace_id, name?, order? }` → `Workspace` |
-| `workspace.remove` | mutation · always · global | `{ workspace_id }` → `{}` — `conflict` if it still has projects |
+| `workspace.remove` | mutation · always · global | `{ workspace_id, force?: bool, remove_worktrees?: bool }` → `{ projects_removed, sessions_closed }` — `conflict` (`workspace.has_projects`, `details.projects`) if it still has projects, unless `force`, which runs `project.remove { force }` for each of them first |
 | `project.add` | mutation · always · global | `{ workspace_id, path, name? }` → `Project` — path must be a git repo root **inside** `workspace.path` (`invalid`/`project.outside_workspace`); one project per path (`conflict`/`project.exists`) |
 | `project.clone` | mutation · always · global | `{ workspace_id, url, dest? }` → `{ project: Project }`; clones inside the workspace and registers the result |
 | `project.list` | query | `{ workspace_id? }` → `{ projects: Project[] }` |
 | `project.get` | query | `{ project_id }` → `Project` |
 | `project.update` | mutation · always · inverse | `{ project_id, name?, build_cmd?, run_cmd?, base_branch?, protected_paths?, critical_files?, order?, pinned? }` → `Project` |
-| `project.remove` | mutation · always · project | `{ project_id }` → `{}` — forgets project-owned Relay metadata but never touches repository files; `conflict` if sessions, integrations, or device runs are live |
+| `project.remove` | mutation · always · project | `{ project_id, force?: bool, remove_worktrees?: bool }` → `{ sessions_closed, runs_stopped }` — forgets project-owned Relay metadata but never touches repository files; `conflict` if sessions (`project.sessions_live`, `details.open_sessions`) or device runs are live, unless `force`, which closes every open session through `session.close` and stops the runs first. Closed sessions keep their worktrees and branches unless `remove_worktrees` (Relay-pool checkouts only, deleted once the store unlocks; branches always kept). An integration in progress refuses even with `force` |
 | `project.stats` | query | `{ project_id }` → `{ tasks_by_column, sessions_live, sessions_idle, worktrees, disk_mb }` |
 
 ### 10.5 task (SPEC §6)
@@ -627,7 +669,7 @@ unique; nothing else is.
 | `task.get` | query | `{ task_id }` → `Task` (with attachments, commits) |
 | `task.list` | query | `{ project_id?, column?, state?, module_id?, priority?, include_deleted?, sort?: "column"\|"priority"\|"updated", type?, label?, session?, parent_id?: Id\|null }` → `{ tasks: Task[] }` — `project_id` optional so the Dashboard can ask "in review, everywhere"; `parent_id: null` is roots only, `session` is "every card this agent was ever sent" |
 | `task.update` | mutation · always · inverse | `{ task_id, title?, body?, priority?, size?, module_id?: Id\|null, state?, changelog?, type? }` → `Task` |
-| `task.move` | mutation · always · inverse | `{ task_id, column: Column, position?: number }` → `Task` — transitions table in §11.1; agents may only move their own task and only `active → in_review` |
+| `task.move` | mutation · always · inverse | `{ task_id, column: Column, position?: number }` → `Task` — transitions table in §11.1; `position` is the 0-based index the task ends at in the column (the others shift around it, clamped to the end), omitted means last; agents may only move their own task and only `active → in_review` |
 | `task.delete` | mutation · always · inverse (restore) | `{ task_id }` → `{}` |
 | `task.restore` | mutation · always · inverse (delete) | `{ task_id }` → `Task` |
 | `task.link_commit` | mutation · always | `{ task_id, sha, branch? }` → `Task` |
@@ -750,10 +792,15 @@ Provider-neutral Markdown; the same for both providers.
 |---|---|---|
 | `guardrail.gate` | mutation · always · session · agent | `{ session, kind: "write"\|"commit"\|"exec", path?, new_text?, diff?, command? }` → `{ verdict: "allow"\|"refuse"\|"hold", error?: BusError, hold_id?: Id }` — the enforcement door (§9.3); may create a hold |
 | `guardrail.holds.list` | query | `{ project_id?, session?, open_only? = true }` → `{ holds: Hold[] }` |
-| `guardrail.confirm` | mutation · always · user | `{ hold_id }` → `{ hold: Hold, outcome: Response }` (§9.4) |
+| `guardrail.confirm` | mutation · always · user | `{ hold_id, scope? }` → `{ hold: Hold, outcome: Response }` (§9.4); for an exception request `scope` is `once`\|`session` and nothing is replayed (§9.5) |
 | `guardrail.reject` | mutation · always · user | `{ hold_id, reason? }` → `{ hold: Hold }` |
-| `guardrail.config.get` | query | `{ project_id? }` → `GuardrailConfig` (global merged with project overrides) |
-| `guardrail.config.set` | mutation · always · inverse | `{ project_id?, patch: Partial<GuardrailConfig> }` → `GuardrailConfig` |
+| `guardrail.config.get` | query | `{ workspace_id? \| project_id? }` → `GuardrailConfig` (§9.6) |
+| `guardrail.config.set` | mutation · always · inverse · user | `{ workspace_id? \| project_id?, patch: Partial<GuardrailConfig> }` → `GuardrailConfig` — patches that one layer's overrides |
+| `guardrail.config.layers` | query | `{ workspace_id? \| project_id? }` → `{ scope, workspace_id?, project_id?, effective, inherited, overrides, sources }` (§9.6) |
+| `guardrail.request` | mutation · always · session · agent (every role) | `{ session, kind, value, reason, scope? }` → `{ request: GuardrailException, created, wait_for }` (§9.5) |
+| `guardrail.request.get` | query | `{ request_id }` → `GuardrailException` |
+| `guardrail.requests.list` | query | `{ project_id?, session?, state?: "open"\|"active"\|"all" }` → `{ requests: GuardrailException[] }` |
+| `guardrail.grant.revoke` | mutation · always · user | `{ request_id }` → `GuardrailException` |
 | `guardrail.explain` | query | `{ project_id, paths?, lines?, commands? }` → `{ verdict, paths: Item[], commands: Item[], files, lines, caps, over_caps, write_roots }` where `Item = {subject, verdict, policy?, message?}` — preflight a whole plan before the first action (D117). Pure: holds nothing, writes nothing |
 | `guardrail.check` | query | `{ project_id, kind: "write"\|"commit"\|"exec", path?, new_text?, diff?, command? }` → `{ verdict: "allow"\|"refuse"\|"hold", error?: BusError }` — pure dry run of `gate`: nothing created, nothing audited |
 

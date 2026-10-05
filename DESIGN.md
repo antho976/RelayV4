@@ -181,8 +181,18 @@ shadow; OS file choosers keep their native decoration. Launch reveal duration is
 Optional PNG/JPEG wallpaper fills the window with cover sizing, beneath a black
 dim layer. Settings exposes a wallpaper library, panel opacity, wallpaper dim
 and content contrast. Increasing content contrast raises effective panel
-opacity; terminal and text-entry grounds remain opaque for legibility. The
-Matte default uses fully opaque panels.
+opacity. The top bar sits inside the wallpaper backdrop like the status bar, so
+both chrome strips show it through one console layer. Terminal plates follow
+panel opacity too, as one slightly denser layer (`@plate`, about 5 points above
+the chrome) over the page; VTE's own ground is clear, and a parked session's
+slate hides its stale screen. The workspace strip above the wall adds no layer
+of its own. Text-entry grounds remain opaque for legibility. The Matte default
+uses fully opaque panels, which keeps the screen-black plates.
+
+The status bar's usage meters show, per enabled provider, the 5-hour, weekly
+and Fable windows chosen in the limits popup, with amber at 70% and red at 90%,
+and faint once a window has reset since its report. Beside them sit when the
+limits were last read and a refresh key.
 
 ## Shapes
 
@@ -213,7 +223,10 @@ neutral wash for selection. GTK owns window controls and menus.
 `apps/relay-native/src/icons.rs` carries the pinned Relay-2 SVG path geometry.
 Shared shell/action icons use a 16-unit view box, 1.5-unit strokes and rounded
 stroke caps and joins, rendered by GTK's SVG paintable. Preserve that geometry
-when adding native controls. Native widget fallback icons remain GTK-owned;
+when adding native controls. File-type glyphs in the explorer and Git panel are the
+one exception to neutral chrome: like syntax colour, they describe content, so each
+carries a muted per-language tint (`css/git_files.css`), and Git status letters use
+VS Code's status colours. Native widget fallback icons remain GTK-owned;
 matching path geometry alone is not proof of complete rendering fidelity.
 
 ### Records / Containers
@@ -235,10 +248,20 @@ text editing. Worktree selection scopes the file tree, content search, file
 operations and Git controls. Read-only comparisons sit beside editable source;
 staging, commits, history and branch tools stay in the Git region.
 
-Notes uses native text editing with Markdown tools and find/replace. Open drafts
-remain mounted in tabs or satellite windows, with explicit Save and Discard
-controls and dirty-close protection. Plan uses the same editor with its title
-fixed. Preserve project identity when a tab outlives navigation.
+Notes is a desktop text editor in the KWrite mould, in its own window. Its compact
+titlebar carries a File/Edit/Search/View menu bar (menus show their shortcuts)
+and the open note's name; below it sit a toolbar, a resizable library (search,
+pinned and dated rows, sort, a context menu) and tabbed GtkSourceView documents
+with Markdown highlighting and list continuation. A find/replace bar (match case,
+whole words, regular expressions, "3 of 12"), go-to-line and a status bar (save
+state, line and column, counts, Markdown/plain, encoding, line endings, zoom,
+autosave) complete each document. Open drafts remain mounted in tabs, and each
+project's open tabs are restored. Saving is explicit by default: unsaved tabs show
+a dot and closing one asks Save / Don't Save / Cancel. Autosave is an opt-in
+preference that saves through the same conflict-checked update after a pause and
+when the window hides. A change made elsewhere reloads a clean tab and raises a
+notice on a dirty one. Plan uses the same editor with its title fixed. Preserve
+project identity when a tab outlives navigation.
 
 ### Native adaptations
 Mail composition remains mounted while messages refresh. Message/error text is

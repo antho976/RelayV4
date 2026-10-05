@@ -236,6 +236,63 @@ pub struct GuardrailConfig {
     pub roles: RoleAllowlist,
 }
 
+/// Which layer of guardrail configuration a value lives in. Each layer overrides the one
+/// before it: defaults, then global, then the project's workspace, then the project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardrailLayer {
+    Default,
+    Global,
+    Workspace,
+    Project,
+}
+
+/// What an agent asks to be let past. `command` lifts a denied command, `path` a protected
+/// path, a write root or a destructive-write rule, `cap` the commit caps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ExceptionKind {
+    Command,
+    Path,
+    Cap,
+}
+
+/// How long an approved exception lasts: one use, or until the session ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GrantScope {
+    Once,
+    Session,
+}
+
+/// An agent's request to be let past one guardrail, and — once a person answered — the grant.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct GuardrailException {
+    /// Also the id of the hold that carries it, so `guardrail.confirm` / `guardrail.reject`
+    /// answer it with `hold_id` set to this.
+    pub id: Id,
+    pub project_id: Option<Id>,
+    pub session: Option<String>,
+    pub kind: ExceptionKind,
+    /// The exact command, the path (worktree-relative, a glob, or an absolute root), or the
+    /// caps wanted (`files=N lines=M`; empty lifts the caps for the grant's life).
+    pub value: String,
+    pub reason: String,
+    pub requested_scope: GrantScope,
+    pub state: HoldState,
+    /// Set once approved.
+    pub scope: Option<GrantScope>,
+    /// Approved, not revoked, and (for `once`) not yet used.
+    pub active: bool,
+    pub uses: u32,
+    pub used_at: Option<Ts>,
+    pub revoked_at: Option<Ts>,
+    pub denial_reason: Option<String>,
+    pub created_at: Ts,
+    pub resolved_at: Option<Ts>,
+    pub resolved_by: Option<crate::envelope::Actor>,
+}
+
 // ---------------------------------------------------------------- entities
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -673,6 +730,33 @@ pub struct Device {
     pub model: String,
     pub kind: DeviceKind,
     pub state: String,
+    /// Who is using this device right now, if anyone. A conflicting run, install or claim
+    /// from anyone else is refused with `device.busy` until it is released.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease: Option<DeviceLease>,
+}
+
+/// One holder's exclusive use of an Android device: a `device.run` in flight, an agent's
+/// `adb install` / `gradlew install*` seen by the guardrail hook, or an explicit `device.claim`.
+/// Released with a `device.lease.released` event, so `bus.wait` can wait for it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct DeviceLease {
+    /// The device serial, or `*` when the command named no device (adb's only device, or
+    /// Gradle's every device): that lease conflicts with every device.
+    pub device: String,
+    /// The holding session's name; `None` when the user holds it directly.
+    pub session: Option<String>,
+    /// `run`, `shell` or `claim`.
+    pub kind: String,
+    /// What the holder is doing, in a few words (`device.run debug from relay/brisk-otter`,
+    /// `adb install app-debug.apk`).
+    pub action: String,
+    pub since: Ts,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<Id>,
+    /// Seconds until the lease lapses on its own; `None` while it lasts as long as its run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_in_s: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]

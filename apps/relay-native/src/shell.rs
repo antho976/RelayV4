@@ -1,5 +1,10 @@
 use super::*;
 use vte4::prelude::*;
+#[path = "shell/registry.rs"]
+mod registry;
+#[path = "agent_menu.rs"]
+mod agent_menu;
+pub(super) use agent_menu::is_closing;
 
 impl Ui {
     pub fn open_project(self: &Rc<Self>, project: i64, page: &str) {
@@ -29,235 +34,6 @@ impl Ui {
             self.refresh();
         }
         self.navigate(page);
-    }
-    pub(super) fn render_projects(self: &Rc<Self>) {
-        // Only registry or visible session state changes rebuild the project tree.
-        let signature = format!(
-            "{}:{}:{}:{:?}",
-            self.project.get(),
-            serde_json::to_string(&*self.projects.borrow()).unwrap_or_default(),
-            serde_json::to_string(&*self.workspaces.borrow()).unwrap_or_default(),
-            self.sidebar_sessions
-                .borrow()
-                .iter()
-                .map(|s| (s["project_id"].as_i64(), text(s, "state").to_owned()))
-                .collect::<Vec<_>>()
-        );
-        if self.projects_box.widget_name() == signature {
-            return;
-        }
-        self.projects_box.set_widget_name(&signature);
-        clear(&self.projects_box);
-        let projects = self.projects.borrow().clone();
-        for workspace in self.workspaces.borrow().iter() {
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 5);
-            row.add_css_class("workspace-row");
-            self.registry_drag(&row, workspace, true);
-            let caption = label(text(workspace, "name"), "dim");
-            caption.set_hexpand(true);
-            caption.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            row.append(&crate::icons::image("chevron-down", 12));
-            row.append(&caption);
-            let add = icon_button("plus", "Add project to this workspace");
-            add.add_css_class("small-key");
-            add.add_css_class("add-project");
-            add.set_child(Some(&crate::icons::image("plus", 12)));
-            add.set_widget_name(&format!("workspace-add-{}", workspace["id"]));
-            row.append(&add);
-            let weak = Rc::downgrade(self);
-            let target = workspace.clone();
-            add.connect_clicked(move |_| {
-                if let Some(ui) = weak.upgrade() {
-                    ui.open_repository_in(Some(target.clone()));
-                }
-            });
-            let manage = self.registry_menu(workspace, true);
-            manage.add_css_class("small-key");
-            manage.add_css_class("manage");
-            row.append(&manage);
-            self.projects_box.append(&row);
-            let mut children: Vec<_> = projects
-                .iter()
-                .filter(|p| p["workspace_id"] == workspace["id"])
-                .collect();
-            children.sort_by_key(|p| {
-                (
-                    !p["pinned"].as_bool().unwrap_or(false),
-                    p["order"].as_i64().unwrap_or(0),
-                    p["id"].as_i64().unwrap_or(0),
-                )
-            });
-            for project in children {
-                let row = gtk::Overlay::new();
-                row.add_css_class("project-row");
-                self.registry_drag(&row, project, false);
-                let name = text(project, "name");
-                let id = project["id"].as_i64().unwrap_or(0);
-                let b = button("", "project");
-                b.set_hexpand(true);
-                let content = gtk::Grid::builder()
-                    .column_spacing(6)
-                    .row_spacing(2)
-                    .build();
-                content.add_css_class("project-content");
-                let sessions = self.sidebar_sessions.borrow();
-                let mine: Vec<_> = sessions
-                    .iter()
-                    .filter(|s| s["project_id"].as_i64() == Some(id))
-                    .collect();
-                let live = mine
-                    .iter()
-                    .filter(|s| {
-                        matches!(
-                            text(s, "state"),
-                            "spawning" | "running" | "idle" | "blocked"
-                        )
-                    })
-                    .count();
-                let lamp = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-                lamp.add_css_class("lamp");
-                lamp.add_css_class("small-lamp");
-                lamp.set_valign(gtk::Align::Center);
-                if mine.iter().any(|s| text(s, "state") == "blocked") {
-                    lamp.add_css_class("held");
-                } else if mine
-                    .iter()
-                    .any(|s| matches!(text(s, "state"), "running" | "spawning"))
-                {
-                    lamp.add_css_class("live");
-                }
-                content.attach(&lamp, 0, 0, 1, 1);
-                let title = label(name, "project-name");
-                title.set_hexpand(true);
-                title.set_width_chars(1);
-                title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-                content.attach(&title, 1, 0, 1, 1);
-                if live > 0 {
-                    content.attach(&label(&live.to_string(), "project-count"), 2, 0, 1, 1);
-                }
-                if id == self.project.get() {
-                    b.add_css_class("selected");
-                    row.add_css_class("selected");
-                    let branch = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-                    branch.add_css_class("project-branch");
-                    branch.set_tooltip_text(Some(
-                        "Base for new agent branches. Change it in Project settings.",
-                    ));
-                    branch.append(&crate::icons::image("branch", 11));
-                    let branch_name =
-                        label(&format!("Base: {}", text(project, "base_branch")), "mono");
-                    branch_name.set_ellipsize(gtk::pango::EllipsizeMode::End);
-                    branch_name.set_width_chars(1);
-                    branch_name.set_hexpand(true);
-                    branch.append(&branch_name);
-                    content.attach(&branch, 1, 1, 2, 1);
-                }
-                if project["pinned"] == true {
-                    b.add_css_class("pinned");
-                }
-                b.set_child(Some(&content));
-                let weak = Rc::downgrade(self);
-                b.connect_clicked(move |_| {
-                    if let Some(ui) = weak.upgrade() {
-                        ui.open_project(id, "agents");
-                    }
-                });
-                row.set_child(Some(&b));
-                let controls = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-                controls.add_css_class("project-tools");
-                controls.set_halign(gtk::Align::End);
-                controls.set_valign(gtk::Align::Start);
-                let pin = icon_button(
-                    "pin",
-                    if project["pinned"] == true {
-                        "Unpin project"
-                    } else {
-                        "Pin project"
-                    },
-                );
-                pin.set_child(Some(&crate::icons::image("pin", 12)));
-                pin.add_css_class("small-key");
-                pin.add_css_class("manage");
-                if project["pinned"] == true {
-                    pin.add_css_class("pinned");
-                }
-                controls.append(&pin);
-                let weak = Rc::downgrade(self);
-                let pinned = project["pinned"] != true;
-                pin.connect_clicked(move |key| {
-                    if let Some(ui) = weak.upgrade() {
-                        ui.mutate(
-                            "project.update",
-                            json!({"project_id":id,"pinned":pinned}),
-                            key,
-                        );
-                    }
-                });
-                let menu = self.registry_menu(project, false);
-                menu.add_css_class("small-key");
-                menu.add_css_class("manage");
-                controls.append(&menu);
-                row.add_overlay(&controls);
-                self.projects_box.append(&row);
-            }
-        }
-    }
-    fn registry_menu(self: &Rc<Self>, value: &Value, workspace: bool) -> gtk::MenuButton {
-        let menu = gtk::MenuButton::new();
-        menu.set_child(Some(&crate::icons::image("more", 13)));
-        menu.set_tooltip_text(Some(if workspace {
-            "Workspace menu"
-        } else {
-            "Project menu"
-        }));
-        let popover = gtk::Popover::new();
-        popover.add_css_class("registry-menu");
-        let body = gtk::Box::new(gtk::Orientation::Vertical, 3);
-        body.set_size_request(230, -1);
-        let title = label(text(value, "name"), "title");
-        body.append(&title);
-        let path = label(text(value, "path"), "dim");
-        path.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-        path.set_max_width_chars(32);
-        path.set_tooltip_text(Some(text(value, "path")));
-        body.append(&path);
-        body.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-        let choices = if workspace {
-            vec![
-                ("plus", "Add project", "add"),
-                ("settings", "Workspace settings", "settings"),
-            ]
-        } else {
-            vec![
-                ("terminal", "Open agents", "agents"),
-                ("files", "Files and Git", "code"),
-                ("settings", "Project settings", "settings"),
-            ]
-        };
-        for (icon, caption, action) in choices {
-            let key = button("", "registry-action");
-            let line = gtk::Box::new(gtk::Orientation::Horizontal, 9);
-            line.append(&crate::icons::image(icon, 15));
-            line.append(&label(caption, ""));
-            key.set_child(Some(&line));
-            body.append(&key);
-            let weak = Rc::downgrade(self);
-            let value = value.clone();
-            let pop = popover.clone();
-            key.connect_clicked(move |_| {
-                pop.popdown();
-                if let Some(ui) = weak.upgrade() {
-                    match action {
-                        "add" => ui.open_repository_in(Some(value.clone())),
-                        "settings" => ui.registry_editor(value.clone(), workspace),
-                        page => ui.open_project(value["id"].as_i64().unwrap_or(0), page),
-                    }
-                }
-            });
-        }
-        popover.set_child(Some(&body));
-        menu.set_popover(Some(&popover));
-        menu
     }
     fn registry_drag(
         self: &Rc<Self>,
@@ -356,85 +132,6 @@ impl Ui {
         });
         widget.add_controller(drop);
     }
-    fn registry_editor(self: &Rc<Self>, value: Value, workspace: bool) {
-        let Some((window, body)) =
-            self.sheet(if workspace { "Workspace" } else { "Project" }, 420, 480)
-        else {
-            return;
-        };
-        let name = gtk::Entry::builder().text(text(&value, "name")).build();
-        field("Name", &name, &body);
-        let path = label(text(&value, "path"), "dim");
-        path.set_wrap(true);
-        path.set_selectable(true);
-        body.append(&path);
-        let branch = gtk::Entry::builder()
-            .text(text(&value, "base_branch"))
-            .build();
-        let build = gtk::Entry::builder()
-            .text(text(&value, "build_cmd"))
-            .build();
-        let run = gtk::Entry::builder().text(text(&value, "run_cmd")).build();
-        let pinned = gtk::CheckButton::with_label("Pin project");
-        pinned.set_active(value["pinned"] == true);
-        if !workspace {
-            field("Base branch", &branch, &body);
-            let help = label(
-                "New agents branch from this base. Existing agent branches stay where they are.",
-                "dim",
-            );
-            help.set_wrap(true);
-            body.append(&help);
-            field("Build command", &build, &body);
-            field("Run command", &run, &body);
-            body.append(&pinned);
-        }
-        let save = button("Save", "primary");
-        body.append(&save);
-        let weak = Rc::downgrade(self);
-        let win = window.clone();
-        let v = value.clone();
-        save.connect_clicked(move|key|{let Some(ui)=weak.upgrade()else{return;};let name=name.text().trim().to_string();if name.is_empty(){ui.show_error("Enter a name.");return;}
-            let payload=if workspace{json!({"workspace_id":v["id"],"name":name})}else{json!({"project_id":v["id"],"name":name,"base_branch":branch.text().as_str(),"build_cmd":build.text().as_str(),"run_cmd":run.text().as_str(),"pinned":pinned.is_active()})};
-            let win=win.clone();let key=key.clone();key.set_sensitive(false);
-            glib::spawn_future_local(async move{match ui.call(if workspace{"workspace.update"}else{"project.update"},payload).await{Ok(_)=>{ui.registry_dirty.set(true);ui.refresh();win.close();},Err(e)=>ui.show_error(&e.to_string())}key.set_sensitive(true);});
-        });
-        let forget = button(
-            if workspace {
-                "Remove empty workspace"
-            } else {
-                "Forget project"
-            },
-            "quiet",
-        );
-        body.append(&forget);
-        let weak = Rc::downgrade(self);
-        let win = window.clone();
-        forget.connect_clicked(move |_| {
-            if let Some(ui) = weak.upgrade() {
-                let payload = if workspace {
-                    json!({"workspace_id":value["id"]})
-                } else {
-                    json!({"project_id":value["id"]})
-                };
-                ui.confirm_mutation(
-                    if workspace {
-                        "Remove this workspace from Relay? It must be empty first. Projects, terminals, and files will not be removed automatically."
-                    } else {
-                        "Remove this project from Relay? Close its sessions and stop its active runs first. Files and branches stay on disk; Relay will not close terminals for you."
-                    },
-                    if workspace {
-                        "workspace.remove"
-                    } else {
-                        "project.remove"
-                    },
-                    payload,
-                    Some(win.clone()),
-                );
-            }
-        });
-        window.present();
-    }
     pub(super) fn sheet(
         &self,
         title: &str,
@@ -445,40 +142,8 @@ impl Ui {
         let body = panel.body.clone();
         Some((panel, body))
     }
-    fn confirm_mutation(
-        self: &Rc<Self>,
-        message: &str,
-        op: &'static str,
-        payload: Value,
-        parent: Option<Rc<crate::panel::Panel>>,
-    ) {
-        let dialog = crate::panel::Panel::new(self, "Confirm action", 520);
-        let copy = label(message, "body");
-        copy.set_wrap(true);
-        dialog.body.append(&copy);
-        let ui = self.clone();
-        glib::spawn_future_local(async move {
-            if dialog.response("Confirm").await {
-                match ui.call(op, payload).await {
-                    Ok(_) => {
-                        if let Some(w) = parent {
-                            w.close();
-                        }
-                        ui.registry_dirty.set(true);
-                        ui.refresh();
-                    }
-                    Err(e) => ui.show_error(&e.to_string()),
-                }
-            }
-        });
-    }
     pub(super) fn layout(self: &Rc<Self>) {
-        while let Some(w) = self.wall.first_child() {
-            self.wall.remove(&w);
-        }
-        while let Some(w) = self.wall_right.first_child() {
-            self.wall_right.remove(&w);
-        }
+        let started = std::time::Instant::now();
         let names: Vec<_> = self.ordered.borrow().iter().cloned().collect();
         if self
             .focused
@@ -497,6 +162,7 @@ impl Ui {
         clear(&self.focus_tabs);
         self.focus_tabs
             .set_visible(mode == "focus" && names.len() > 1);
+        let mut targets: Vec<(Rc<Pane>, gtk::Grid, i32, i32)> = Vec::new();
         for (i, name) in names.iter().enumerate() {
             if mode == "focus" {
                 let b = button("", "focus-tab");
@@ -535,46 +201,81 @@ impl Ui {
                 });
                 self.focus_tabs.append(&b);
             }
-            if let Some(p) = self.panes.borrow().get(name) {
-                if mode == "focus" && focus.as_ref() != Some(name) {
-                    continue;
-                }
-                if matches!(mode.as_str(), "review" | "mosaic") && names.len() > 1 {
-                    if focus.as_ref() == Some(name) {
-                        self.wall.attach(&p.root, 0, 0, 1, 1);
-                    } else {
-                        let offset = names[..i]
-                            .iter()
-                            .filter(|n| Some(*n) != focus.as_ref())
-                            .count() as i32;
-                        let columns = if mode == "mosaic" { 2 } else { 1 };
-                        self.wall_right
-                            .attach(&p.root, offset % columns, offset / columns, 1, 1);
-                    }
-                } else if mode == "grid" && self.columns.get() == 2 && names.len() > 1 {
-                    let grid = if i % 2 == 0 {
-                        &self.wall
-                    } else {
-                        &self.wall_right
-                    };
-                    grid.attach(&p.root, 0, (i / 2) as i32, 1, 1);
+            let Some(p) = self.panes.borrow().get(name).cloned() else {
+                continue;
+            };
+            if mode == "focus" && focus.as_ref() != Some(name) {
+                continue;
+            }
+            let (grid, column, row) = if matches!(mode.as_str(), "review" | "mosaic") && names.len() > 1 {
+                if focus.as_ref() == Some(name) {
+                    (&self.wall, 0, 0)
                 } else {
-                    let cols = if mode == "focus" {
-                        1
-                    } else {
-                        self.columns.get()
-                    };
-                    self.wall.attach(
-                        &p.root,
-                        i as i32 % cols,
-                        if mode == "focus" { 0 } else { i as i32 / cols },
-                        1,
-                        1,
-                    );
+                    let offset = names[..i]
+                        .iter()
+                        .filter(|n| Some(*n) != focus.as_ref())
+                        .count() as i32;
+                    let columns = if mode == "mosaic" { 2 } else { 1 };
+                    (&self.wall_right, offset % columns, offset / columns)
                 }
-                p.schedule_resize();
+            } else if mode == "grid" && self.columns.get() == 2 && names.len() > 1 {
+                let grid = if i % 2 == 0 {
+                    &self.wall
+                } else {
+                    &self.wall_right
+                };
+                (grid, 0, (i / 2) as i32)
+            } else {
+                let cols = if mode == "focus" {
+                    1
+                } else {
+                    self.columns.get()
+                };
+                (&self.wall, i as i32 % cols, if mode == "focus" { 0 } else { i as i32 / cols })
+            };
+            targets.push((p, grid.clone(), column, row));
+        }
+        // Incremental: a pane already in its grid moves in place. Re-parenting a VTE unrealizes
+        // and re-realizes it, so detaching the whole wall on every open or close redrew every
+        // terminal. Only panes that change grid, or leave the wall, are removed.
+        for grid in [&self.wall, &self.wall_right] {
+            let mut child = grid.first_child();
+            while let Some(widget) = child {
+                child = widget.next_sibling();
+                if !targets.iter().any(|(p, g, ..)| g == grid && p.root.upcast_ref::<gtk::Widget>() == &widget) {
+                    grid.remove(&widget);
+                }
             }
         }
+        let mut moved = 0;
+        for (p, grid, column, row) in targets {
+            // Sizes can change without a move (a column appears or goes); the resize check
+            // itself is a no-op when the grid did not change.
+            p.schedule_resize();
+            if p.root.parent().as_ref() == Some(grid.upcast_ref::<gtk::Widget>()) {
+                let Some(cell) = grid
+                    .layout_manager()
+                    .and_then(|manager| manager.layout_child(&p.root).downcast::<gtk::GridLayoutChild>().ok())
+                else {
+                    continue;
+                };
+                if cell.column() == column && cell.row() == row {
+                    continue;
+                }
+                cell.set_column(column);
+                cell.set_row(row);
+            } else {
+                if let Some(parent) = p.root.parent() {
+                    match parent.downcast::<gtk::Grid>() {
+                        Ok(other) => other.remove(&p.root),
+                        Err(_) => p.root.unparent(),
+                    }
+                }
+                grid.attach(&p.root, column, row, 1, 1);
+            }
+            moved += 1;
+        }
+        tracing::debug!(panes = names.len(), moved, elapsed_us = started.elapsed().as_micros() as u64, "wall layout");
         self.update_attachments();
     }
     pub(super) fn set_mode(self: &Rc<Self>, mode: &str) {
@@ -970,19 +671,25 @@ impl Ui {
         pane.root.add_controller(drop_target);
     }
     pub(super) fn session_actions(self: &Rc<Self>, pane: &Rc<Pane>, session: &Value) {
-        clear(&pane.actions);
+        self.clear_agent_actions(pane);
         clear(&pane.slate_actions);
+        if self.agent_overrides(pane, session) {
+            if session["placeholder"] != true {
+                self.agent_controls(pane, session);
+            }
+            return;
+        }
         let state = text(session, "state");
         let name = text(session, "name");
-        let (caption, icon, op) = match state {
-            "created" => ("Start", "media-playback-start-symbolic", "session.spawn"),
-            "parked" => ("Wake", "media-playback-start-symbolic", "session.wake"),
+        let (caption, icon, op, tooltip) = match state {
+            "created" => ("Start", "media-playback-start-symbolic", "session.spawn", "Start the agent"),
+            "parked" => ("Wake", "media-playback-start-symbolic", "session.wake", "Wake: start the provider again and resume its conversation"),
             "restorable" | "exited" => {
-                ("Resume", "media-playback-start-symbolic", "session.resume")
+                ("Resume", "media-playback-start-symbolic", "session.resume", "Resume where it left off")
             }
-            _ => ("Park", "media-playback-pause-symbolic", "session.park"),
+            _ => ("Park", "media-playback-pause-symbolic", "session.park", "Park: release the process, keep the worktree and scrollback"),
         };
-        let action = icon_button(icon, caption);
+        let action = icon_button(icon, tooltip);
         action.set_child(Some(&crate::icons::image(icon, 13)));
         if matches!(state, "created" | "parked" | "restorable" | "exited") {
             let slate_action = button(
@@ -997,7 +704,7 @@ impl Ui {
             let n = name.to_string();
             slate_action.connect_clicked(move |key| {
                 if let Some(ui) = weak.upgrade() {
-                    ui.mutate(op, json!({"session":n}), key);
+                    ui.agent_op(op, &n, Some(key));
                 }
             });
             pane.slate_actions.append(&slate_action);
@@ -1006,165 +713,38 @@ impl Ui {
         let n = name.to_string();
         action.connect_clicked(move |b| {
             if let Some(ui) = weak.upgrade() {
-                ui.mutate(op, json!({"session":n}), b);
+                ui.agent_op(op, &n, Some(b));
             }
         });
         pane.actions.append(&action);
         if matches!(state, "restorable" | "exited") {
-            for (caption, icon, op, message) in [
-                ("Clear context", "refresh", "session.clear_restorable", "Start fresh in this session and worktree? Saved provider conversation context will be cleared."),
-                ("Discard session", "close", "session.close", "Discard this session from the wall? Its worktree and branch will be kept."),
+            // Confirmed in place: the key itself turns into "Confirm …" for a second click.
+            for (caption, icon, op, armed, tip) in [
+                ("Clear context", "refresh", "session.clear_restorable", "Confirm clear", "Start fresh in this session and worktree; saved provider conversation context is cleared"),
+                ("Discard session", "close", "session.close", "Confirm discard", "Remove this session from the wall; its worktree and branch are kept"),
             ] {
                 if op == "session.clear_restorable" && state != "restorable" { continue; }
                 for key in [button(caption, "quiet"), icon_button(icon, caption)] {
+                    let slate = key.label().is_some();
+                    key.set_tooltip_text(Some(if slate { tip } else { caption }));
                     let weak = Rc::downgrade(self);
                     let n = name.to_string();
-                    key.connect_clicked(move |_| {
+                    crate::app::confirm_inline(&key, if slate { armed } else { "Confirm" }, move |key| {
                         if let Some(ui) = weak.upgrade() {
                             let payload = if op == "session.close" { json!({"session":n,"remove_worktree":false,"purge_build":false}) } else { json!({"session":n}) };
-                            ui.confirm_mutation(message, op, payload, None);
+                            ui.mutate(op, payload, key);
                         }
                     });
-                    if key.label().is_some() { pane.slate_actions.append(&key); } else { pane.actions.append(&key); }
+                    if slate { pane.slate_actions.append(&key); } else { pane.actions.append(&key); }
                 }
             }
         }
-        let zoom = icon_button("view-fullscreen-symbolic", "Focus terminal");
-        zoom.set_child(Some(&crate::icons::image("maximize", 13)));
-        let weak = Rc::downgrade(self);
-        let n = name.to_string();
-        zoom.connect_clicked(move |_| {
-            if let Some(ui) = weak.upgrade() {
-                let already =
-                    *ui.mode.borrow() == "focus" && ui.focused.borrow().as_ref() == Some(&n);
-                *ui.focused.borrow_mut() = Some(n.clone());
-                ui.set_mode(if already { "grid" } else { "focus" });
-            }
-        });
-        pane.actions.append(&zoom);
-        let menu = icon_button("view-more-symbolic", "Session menu");
-        menu.set_child(Some(&crate::icons::image("more", 13)));
-        let weak = Rc::downgrade(self);
-        let session = session.clone();
-        menu.connect_clicked(move |_| {
-            if let Some(ui) = weak.upgrade() {
-                ui.session_menu(session.clone());
-            }
-        });
-        pane.actions.append(&menu);
-    }
-    fn session_menu(self: &Rc<Self>, session: Value) {
-        let name = text(&session, "name").to_string();
-        let Some((window, body)) = self.sheet(&name, 440, 620) else {
-            return;
-        };
-        body.append(&label(
-            &format!(
-                "{} · {} · {}",
-                text(&session, "provider"),
-                text(&session, "role"),
-                text(&session, "state")
-            ),
-            "dim",
-        ));
-        for key in ["worktree", "branch", "intent", "pair_with"] {
-            let l = label(text(&session, key), "dim");
-            l.set_wrap(true);
-            l.set_selectable(true);
-            body.append(&l);
+        if matches!(state, "created" | "parked" | "restorable" | "exited") {
+            self.describe_stopped_session(pane, session);
+        } else {
+            pane.begin_context();
         }
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        body.append(&row);
-        for (caption, delta) in [("Move earlier", -1), ("Move later", 1)] {
-            let b = button(caption, "quiet");
-            row.append(&b);
-            let weak = Rc::downgrade(self);
-            let n = name.clone();
-            b.connect_clicked(move |_| {
-                if let Some(ui) = weak.upgrade() {
-                    let mut order = ui.ordered.borrow_mut();
-                    if let Some(i) = order.iter().position(|s| *s == n) {
-                        let next = (i as i32 + delta).clamp(0, order.len() as i32 - 1) as usize;
-                        order.swap(i, next);
-                    }
-                    drop(order);
-                    ui.layout();
-                    ui.save_layout();
-                }
-            });
-        }
-        let brief = button("Inspect launch brief", "quiet");
-        body.append(&brief);
-        let weak = Rc::downgrade(self);
-        let n = name.clone();
-        brief.connect_clicked(move |_| {
-            if let Some(ui) = weak.upgrade() {
-                let n = n.clone();
-                glib::spawn_future_local(async move {
-                    match ui.call("session.brief", json!({"session":n})).await {
-                        Ok(v) => {
-                            let Some((w, b)) = ui.sheet("Session brief", 760, 640) else {
-                                return;
-                            };
-                            let t = gtk::TextView::new();
-                            t.set_editable(false);
-                            t.set_monospace(true);
-                            t.buffer().set_text(text(&v, "text"));
-                            b.append(&t);
-                            w.present();
-                        }
-                        Err(e) => ui.show_error(&e.to_string()),
-                    }
-                });
-            }
-        });
-        let model = gtk::Entry::builder().text(text(&session, "model")).build();
-        field("Model", &model, &body);
-        let effort = gtk::Entry::builder().text(text(&session, "effort")).build();
-        field("Effort", &effort, &body);
-        let writes = gtk::CheckButton::with_label("Allow agent bus writes");
-        writes.set_active(session["bus_writes"] == true);
-        body.append(&writes);
-        let ui_access = gtk::CheckButton::with_label("Allow UI control");
-        ui_access.set_active(session["allow_ui"] == true);
-        body.append(&ui_access);
-        let spawned = !session["spawned_at"].is_null();
-        model.set_sensitive(!spawned);
-        effort.set_sensitive(!spawned);
-        let save = button("Save session settings", "primary");
-        body.append(&save);
-        let weak = Rc::downgrade(self);
-        let n = name.clone();
-        save.connect_clicked(move|b|{if let Some(ui)=weak.upgrade(){let mut payload=json!({"session":n,"bus_writes":writes.is_active(),"allow_ui":ui_access.is_active()});if !spawned{payload["model"]=model.text().as_str().into();payload["effort"]=effort.text().as_str().into();}ui.mutate("session.update",payload,b);}});
-        if text(&session, "state") == "restorable" {
-            let fresh = button("Start fresh without saved provider context…", "quiet");
-            body.append(&fresh);
-            let weak = Rc::downgrade(self);
-            let n = name.clone();
-            let w = window.clone();
-            fresh.connect_clicked(move |_|{if let Some(ui)=weak.upgrade(){ui.confirm_mutation("Start fresh in this same session and worktree? Saved provider conversation context will be cleared.","session.clear_restorable",json!({"session":n}),Some(w.clone()));}});
-        }
-        let cleanup = gtk::Expander::new(Some("Worktree cleanup"));
-        body.append(&cleanup);
-        let options = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        cleanup.set_child(Some(&options));
-        let remove = gtk::CheckButton::with_label("Remove worktree after closing");
-        options.append(&remove);
-        let purge = gtk::CheckButton::with_label("Purge build output");
-        options.append(&purge);
-        let key = button("Close with selected cleanup…", "quiet");
-        options.append(&key);
-        let weak = Rc::downgrade(self);
-        let n = name.clone();
-        let w = window.clone();
-        let path = text(&session, "worktree").to_string();
-        key.connect_clicked(move |_|{if let Some(ui)=weak.upgrade(){ui.confirm_mutation(&format!("Close {n} at {path}? Remove worktree: {}. Purge build output: {}. The branch is retained.",remove.is_active(),purge.is_active()),"session.close",json!({"session":n,"remove_worktree":remove.is_active(),"purge_build":purge.is_active()}),Some(w.clone()));}});
-        let close = button("Close session…", "quiet");
-        body.append(&close);
-        let weak = Rc::downgrade(self);
-        let w = window.clone();
-        close.connect_clicked(move |_|{if let Some(ui)=weak.upgrade(){ui.confirm_mutation("Close this session and stop its process? The worktree and branch will be kept.","session.close",json!({"session":name,"remove_worktree":false,"purge_build":false}),Some(w.clone()));}});
-        window.present();
+        self.agent_controls(pane, session);
     }
     pub(super) fn refresh_notification_count(self: &Rc<Self>) {
         let revision = self.notification_revision.get().wrapping_add(1);
@@ -1529,75 +1109,6 @@ impl Ui {
             }
         });
     }
-    pub(super) fn usage(self: &Rc<Self>) {
-        let Some((window, body)) = self.sheet("Provider usage", 400, 420) else {
-            return;
-        };
-        window.bottom(380);
-        let refresh = button("Refresh", "quiet");
-        body.append(&refresh);
-        let list = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        body.append(&list);
-        let pending = Rc::new(RefCell::new(None::<glib::JoinHandle<()>>));
-        let closing = pending.clone();
-        window.on_closed(move || {
-            if let Some(task) = closing.borrow_mut().take() {
-                task.abort();
-            }
-        });
-        let weak = Rc::downgrade(self);
-        refresh.connect_clicked(move |key| {
-            let Some(ui) = weak.upgrade() else {
-                return;
-            };
-            let key = key.clone();
-            let list = list.clone();
-            key.set_sensitive(false);
-            *pending.borrow_mut() = Some(glib::spawn_future_local(async move {
-                clear(&list);
-                match ui.call("usage.get", json!({})).await {
-                    Ok(v) => {
-                        let entries = rows(&v, "usage");
-                        if entries.is_empty() {
-                            list.append(&label("No provider usage has been reported yet.", "dim"));
-                        }
-                        for item in entries {
-                            list.append(&label(text(&item, "provider"), "title"));
-                            if let Some(windows) = item["windows"].as_object() {
-                                for (name, value) in windows {
-                                    if let Some(pct) =
-                                        value["used_pct"].as_f64().or(value["pct"].as_f64())
-                                    {
-                                        list.append(&label(
-                                            &format!(
-                                                "{} · {:.0}% used",
-                                                name.replace('_', " "),
-                                                pct.clamp(0., 100.)
-                                            ),
-                                            "body",
-                                        ));
-                                        let bar = gtk::ProgressBar::new();
-                                        bar.set_fraction(pct.clamp(0., 100.) / 100.);
-                                        list.append(&bar);
-                                        if let Some(reset) = value["resets_in"].as_str() {
-                                            list.append(&label(
-                                                &format!("Resets in {reset}"),
-                                                "dim",
-                                            ));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => ui.show_error(&e.to_string()),
-                }
-                key.set_sensitive(true);
-            }));
-        });
-        refresh.emit_clicked();
-        window.present();
-    }
     pub(super) fn load_appearance(self: &Rc<Self>) {
         crate::wallpaper_rotation::refresh(self);
         let ui = self.clone();
@@ -1678,6 +1189,15 @@ impl Ui {
                     (alpha + offset).min(1.)
                 );
             }
+            // Terminal plates sit on one @wall layer; @plate tops that up to slightly
+            // denser than the chrome. Matte's opaque default keeps the opaque screen.
+            let wall = (alpha + 0.02).min(1.);
+            let plate = if wall >= 1. {
+                1.
+            } else {
+                (((alpha + 0.05).min(1.) - wall) / (1. - wall)).clamp(0., 1.)
+            };
+            css += &format!("\n@define-color plate alpha({},{plate:.3});", colors[4]);
             css += &format!(
                 "\n@define-color backbox alpha({},{});\n@define-color backbox_chrome alpha({},{});",
                 colors[0],
