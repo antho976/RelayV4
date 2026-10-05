@@ -54,6 +54,9 @@ pub struct Pane {
     slate: gtk::Box,
     slate_state: gtk::Label,
     slate_hint: gtk::Label,
+    /// "Where it left off" on a stopped session's slate (`session_context.rs`).
+    slate_context: gtk::Box,
+    context_serial: Cell<u64>,
     status: gtk::Label,
     name: String,
     path: PathBuf,
@@ -159,10 +162,20 @@ impl Pane {
         slate_hint.set_max_width_chars(44);
         slate_hint.set_justify(gtk::Justification::Center);
         slate_content.append(&slate_hint);
+        let slate_context = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        slate_context.add_css_class("slate-context");
+        slate_context.set_visible(false);
+        slate_content.append(&slate_context);
         let slate_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         slate_actions.set_halign(gtk::Align::Center);
         slate_content.append(&slate_actions);
-        slate.append(&slate_content);
+        // A plate is only 280px square; a tall context card scrolls instead of clipping.
+        let slate_scroll = gtk::ScrolledWindow::builder()
+            .child(&slate_content)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vexpand(true)
+            .build();
+        slate.append(&slate_scroll);
         screen.add_overlay(&slate);
         root.append(&screen);
         status.set_wrap(true);
@@ -186,6 +199,8 @@ impl Pane {
             slate,
             slate_state,
             slate_hint,
+            slate_context,
+            context_serial: Cell::new(0),
             status,
             name: name.into(),
             path,
@@ -309,6 +324,18 @@ impl Pane {
     }
     pub fn name(&self) -> &str {
         &self.name
+    }
+    /// Empty and hide the slate's context card; the returned serial is the only one
+    /// [`Pane::context_card`] still answers to, so an older, slower read cannot fill it.
+    pub fn begin_context(&self) -> u64 {
+        let serial = self.context_serial.get().wrapping_add(1);
+        self.context_serial.set(serial);
+        crate::app::clear(&self.slate_context);
+        self.slate_context.set_visible(false);
+        serial
+    }
+    pub fn context_card(&self, serial: u64) -> Option<&gtk::Box> {
+        (self.context_serial.get() == serial).then_some(&self.slate_context)
     }
     pub fn update_session(&self, session: &serde_json::Value) {
         use crate::app::text;

@@ -1011,23 +1011,31 @@ impl Ui {
         });
         pane.actions.append(&action);
         if matches!(state, "restorable" | "exited") {
-            for (caption, icon, op, message) in [
-                ("Clear context", "refresh", "session.clear_restorable", "Start fresh in this session and worktree? Saved provider conversation context will be cleared."),
-                ("Discard session", "close", "session.close", "Discard this session from the wall? Its worktree and branch will be kept."),
+            // Confirmed in place: the key itself turns into "Confirm …" for a second click.
+            for (caption, icon, op, armed, tip) in [
+                ("Clear context", "refresh", "session.clear_restorable", "Confirm clear", "Start fresh in this session and worktree; saved provider conversation context is cleared"),
+                ("Discard session", "close", "session.close", "Confirm discard", "Remove this session from the wall; its worktree and branch are kept"),
             ] {
                 if op == "session.clear_restorable" && state != "restorable" { continue; }
                 for key in [button(caption, "quiet"), icon_button(icon, caption)] {
+                    let slate = key.label().is_some();
+                    key.set_tooltip_text(Some(if slate { tip } else { caption }));
                     let weak = Rc::downgrade(self);
                     let n = name.to_string();
-                    key.connect_clicked(move |_| {
+                    crate::app::confirm_inline(&key, if slate { armed } else { "Confirm" }, move |key| {
                         if let Some(ui) = weak.upgrade() {
                             let payload = if op == "session.close" { json!({"session":n,"remove_worktree":false,"purge_build":false}) } else { json!({"session":n}) };
-                            ui.confirm_mutation(message, op, payload, None);
+                            ui.mutate(op, payload, key);
                         }
                     });
-                    if key.label().is_some() { pane.slate_actions.append(&key); } else { pane.actions.append(&key); }
+                    if slate { pane.slate_actions.append(&key); } else { pane.actions.append(&key); }
                 }
             }
+        }
+        if matches!(state, "created" | "parked" | "restorable" | "exited") {
+            self.describe_stopped_session(pane, session);
+        } else {
+            pane.begin_context();
         }
         let zoom = icon_button("view-fullscreen-symbolic", "Focus terminal");
         zoom.set_child(Some(&crate::icons::image("maximize", 13)));

@@ -1,0 +1,327 @@
+//! The bell's popover. Notifications are read, cleared and followed in place, under the bell,
+//! without replacing the page the person is working on.
+use super::session_context::relative_time;
+use super::{button, clear, icon_button, label, rows, text, Ui};
+use gtk::prelude::*;
+use gtk4 as gtk;
+use serde_json::{json, Value};
+use std::cell::{Cell, RefCell};
+use std::rc::{Rc, Weak};
+
+struct Center {
+    ui: Weak<Ui>,
+    popover: gtk::Popover,
+    list: gtk::Box,
+    summary: gtk::Label,
+    mark_all: gtk::Button,
+    revision: Cell<u64>,
+    /// When the popover last closed. A press on the bell that closes an open popover reaches
+    /// the bell too; without this it would open the popover again at once.
+    closed_at: Cell<i64>,
+}
+
+thread_local! {
+    static CENTER: RefCell<Option<Rc<Center>>> = const { RefCell::new(None) };
+}
+
+fn center() -> Option<Rc<Center>> {
+    CENTER.with(|c| c.borrow().clone())
+}
+
+pub(super) fn install(ui: &Rc<Ui>, key: &gtk::Button) {
+    let popover = gtk::Popover::new();
+    popover.add_css_class("notification-center");
+    popover.set_widget_name("notification-center");
+    popover.set_has_arrow(false);
+    popover.set_position(gtk::PositionType::Bottom);
+    popover.set_parent(key);
+    let frame = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    frame.set_size_request(400, -1);
+    let heading = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    heading.add_css_class("notification-heading");
+    let titles = gtk::Box::new(gtk::Orientation::Vertical, 1);
+    titles.set_hexpand(true);
+    titles.append(&label("Notifications", "notification-title"));
+    let summary = label("", "notification-summary");
+    titles.append(&summary);
+    heading.append(&titles);
+    let mark_all = button("Mark all read", "quiet");
+    mark_all.set_widget_name("notifications-mark-all");
+    mark_all.set_valign(gtk::Align::Center);
+    heading.append(&mark_all);
+    frame.append(&heading);
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    list.add_css_class("notification-list");
+    let scroll = gtk::ScrolledWindow::builder()
+        .child(&list)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_height(true)
+        .max_content_height(480)
+        .build();
+    frame.append(&scroll);
+    popover.set_child(Some(&frame));
+    let center = Rc::new(Center {
+        ui: Rc::downgrade(ui),
+        popover,
+        list,
+        summary,
+        mark_all,
+        revision: Cell::new(0),
+        closed_at: Cell::new(0),
+    });
+    let weak = Rc::downgrade(&center);
+    center.popover.connect_closed(move |_| {
+        if let Some(center) = weak.upgrade() {
+            center.closed_at.set(glib::monotonic_time());
+        }
+    });
+    let weak = Rc::downgrade(&center);
+    center.mark_all.connect_clicked(move |key| {
+        let Some(center) = weak.upgrade() else { return };
+        let Some(ui) = center.ui.upgrade() else { return };
+        key.set_sensitive(false);
+        glib::spawn_future_local(async move {
+            if let Err(e) = ui.call("notify.ack_all", json!({})).await {
+                ui.show_error(&e.to_string());
+            }
+            ui.refresh_notification_count();
+            center.load();
+        });
+    });
+    key.connect_clicked(|_| {
+        let Some(center) = self::center() else { return };
+        if center.popover.is_visible() {
+            center.popover.popdown();
+        } else if glib::monotonic_time() - center.closed_at.get() > 250_000 {
+            center.show();
+        }
+    });
+    CENTER.with(|c| *c.borrow_mut() = Some(center));
+}
+
+/// Open the popover, as the bell does (command palette, `ui.page.switch` to notifications).
+/// It opens on the next idle, so a palette or sheet that asked for it has closed first.
+pub(super) fn open() {
+    glib::idle_add_local_once(|| {
+        if let Some(center) = center().filter(|c| !c.popover.is_visible()) {
+            center.show();
+        }
+    });
+}
+
+/// A `notify.*` event arrived: an open popover reloads; a closed one loads when opened.
+pub(super) fn changed() {
+    if let Some(center) = center().filter(|c| c.popover.is_visible()) {
+        center.load();
+    }
+}
+
+impl Center {
+    fn show(self: &Rc<Self>) {
+        if self.list.first_child().is_none() {
+            self.placeholder("Loading…", "");
+        }
+        self.popover.popup();
+        self.load();
+    }
+
+    fn load(self: &Rc<Self>) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        let revision = self.revision.get().wrapping_add(1);
+        self.revision.set(revision);
+        let center = self.clone();
+        glib::spawn_future_local(async move {
+            let result = ui.call("notify.list", json!({"limit": 100})).await;
+            if center.revision.get() != revision {
+                return;
+            }
+            match result {
+                Ok(data) => center.render(&ui, &rows(&data, "notifications")),
+                Err(e) => center.placeholder("Notifications are unavailable", &e.to_string()),
+            }
+        });
+    }
+
+    fn placeholder(&self, title: &str, detail: &str) {
+        clear(&self.list);
+        let empty = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        empty.add_css_class("notification-empty");
+        let glyph = crate::icons::image_with_stroke("bell", 20, 1.25);
+        glyph.add_css_class("empty-glyph");
+        empty.append(&glyph);
+        let heading = label(title, "notification-empty-title");
+        heading.set_xalign(0.5);
+        empty.append(&heading);
+        if !detail.is_empty() {
+            let copy = label(detail, "notification-empty-detail");
+            copy.set_xalign(0.5);
+            copy.set_wrap(true);
+            copy.set_justify(gtk::Justification::Center);
+            copy.set_max_width_chars(44);
+            empty.append(&copy);
+        }
+        self.list.append(&empty);
+    }
+
+    fn render(self: &Rc<Self>, ui: &Rc<Ui>, entries: &[Value]) {
+        let unread = entries.iter().filter(|n| n["read"] != true).count();
+        self.summary.set_text(&match unread {
+            0 if entries.is_empty() => String::from("Nothing yet"),
+            0 => String::from("All read"),
+            1 => String::from("1 unread"),
+            n => format!("{n} unread"),
+        });
+        self.mark_all.set_sensitive(unread > 0);
+        if entries.is_empty() {
+            self.placeholder(
+                "You're all caught up",
+                "Finished, blocked and held agents report here.",
+            );
+            return;
+        }
+        clear(&self.list);
+        let projects = ui.projects.borrow();
+        for item in entries {
+            let project = item["project_id"].as_i64().and_then(|id| {
+                projects
+                    .iter()
+                    .find(|p| p["id"].as_i64() == Some(id))
+                    .map(|p| text(p, "name").to_string())
+            });
+            self.list.append(&self.row(item, project.as_deref()));
+        }
+    }
+
+    fn row(self: &Rc<Self>, item: &Value, project: Option<&str>) -> gtk::Box {
+        let unread = item["read"] != true;
+        let category = text(item, "category");
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        row.add_css_class("notification-row");
+        if unread {
+            row.add_css_class("unread");
+        }
+        let open = button("", "notification-open");
+        open.set_hexpand(true);
+        open.set_tooltip_text(Some("Open where this happened"));
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        dot.add_css_class("notification-dot");
+        dot.add_css_class(match category {
+            "agent_blocked" | "guardrail" => "held",
+            "agent_done" => "live",
+            _ => "neutral",
+        });
+        dot.set_valign(gtk::Align::Start);
+        dot.set_opacity(if unread { 1.0 } else { 0.0 });
+        content.append(&dot);
+        let copy = gtk::Box::new(gtk::Orientation::Vertical, 3);
+        copy.set_hexpand(true);
+        let top = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let title = label(text(item, "title"), "notification-row-title");
+        title.set_hexpand(true);
+        title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        top.append(&title);
+        top.append(&label(&relative_time(text(item, "created_at")), "notification-time"));
+        copy.append(&top);
+        let body = text(item, "body").trim();
+        if !body.is_empty() {
+            let body_label = label(body, "notification-body");
+            body_label.set_wrap(true);
+            body_label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+            body_label.set_lines(3);
+            body_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            body_label.set_max_width_chars(48);
+            body_label.set_tooltip_text(Some(body));
+            copy.append(&body_label);
+        }
+        let mut meta = vec![category.replace('_', " ")];
+        if let Some(project) = project.filter(|p| !p.is_empty()) {
+            meta.insert(0, project.to_string());
+        }
+        copy.append(&label(&meta.join(" · ").to_uppercase(), "notification-meta"));
+        content.append(&copy);
+        open.set_child(Some(&content));
+        row.append(&open);
+        let weak = Rc::downgrade(self);
+        let target = item.clone();
+        open.connect_clicked(move |_| {
+            if let Some(center) = weak.upgrade() {
+                center.follow(&target);
+            }
+        });
+        if unread {
+            let read = icon_button("check", "Mark read");
+            read.add_css_class("notification-read");
+            read.set_valign(gtk::Align::Center);
+            let weak = Rc::downgrade(self);
+            let id = item["id"].clone();
+            read.connect_clicked(move |key| {
+                let Some(center) = weak.upgrade() else { return };
+                let Some(ui) = center.ui.upgrade() else { return };
+                key.set_sensitive(false);
+                let id = id.clone();
+                glib::spawn_future_local(async move {
+                    if let Err(e) = ui.call("notify.ack", json!({"notification_id": id})).await {
+                        ui.show_error(&e.to_string());
+                    }
+                    ui.refresh_notification_count();
+                    center.load();
+                });
+            });
+            row.append(&read);
+        }
+        row
+    }
+
+    /// Mark `item` read and go where it happened: its task, its page or its project's agents.
+    fn follow(&self, item: &Value) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        self.popover.popdown();
+        if item["read"] != true {
+            let ui = ui.clone();
+            let id = item["id"].clone();
+            glib::spawn_future_local(async move {
+                if ui.call("notify.ack", json!({"notification_id": id})).await.is_ok() {
+                    ui.refresh_notification_count();
+                }
+            });
+        }
+        let project = item["project_id"].as_i64().unwrap_or(ui.project.get());
+        let link = &item["link"];
+        let payload = &link["payload"];
+        let page = match text(link, "op") {
+            "ui.page.switch" => payload["page"]
+                .as_str()
+                .filter(|p| *p != "notifications")
+                .unwrap_or("agents"),
+            "task.get" => "board",
+            "session.get" => "agents",
+            _ => match text(item, "category") {
+                "agent_done" | "integration" => "board",
+                "guardrail" => "guardrails",
+                "provider" => "settings",
+                _ => "agents",
+            },
+        };
+        if project == 0 {
+            ui.navigate(page);
+            return;
+        }
+        ui.open_project(project, page);
+        if ui.project.get() != project {
+            return;
+        }
+        if text(link, "op") == "task.get" {
+            if let Some(id) = payload["task_id"].as_i64() {
+                crate::pages::open_task(&ui, id);
+            }
+        }
+        // A session's own notice focuses its terminal, as the tile's focus key does.
+        if let Some(session) = payload["session"].as_str() {
+            if ui.panes.borrow().contains_key(session) {
+                *ui.focused.borrow_mut() = Some(session.to_string());
+                ui.set_mode("focus");
+            }
+        }
+    }
+}

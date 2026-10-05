@@ -1,1 +1,50 @@
 /* sessions area styles: loaded after theme.css, so rules here override it. */
+/* sessions-1 */
+/* Inline confirmation: an armed destructive key turns red and asks for a second click. */
+button.confirm-armed, button.quiet.confirm-armed, button.confirm-armed:hover, button.quiet.confirm-armed:hover {
+  background: @held; border-color: @held; color: white; font-weight: 600;
+}
+button.confirm-armed label { color: white; }
+.umd button.confirm-armed, .umd button.icon-key.confirm-armed { padding: 0 8px; font-size: 11px; }
+.confirm-caption { font-weight: 600; }
+
+/* The banner under the title bar: dismissible, clears itself. */
+.notice-bar { background: @slab; border-bottom: 1px solid @held; padding-right: 6px; }
+.notice-bar .notice { background: transparent; border: 0; padding: 8px 12px; }
+.notice-bar button.notice-dismiss { margin-top: 4px; color: @secondary; }
+.notice-bar button.notice-dismiss:hover { color: @ink; }
+
+/* Notification center: the bell's popover. */
+popover.notification-center contents { padding: 0; }
+.notification-center scrolledwindow, .notification-center viewport { background: transparent; }
+.notification-heading { padding: 12px 12px 10px; border-bottom: 1px solid @edge; }
+.notification-title { color: @ink; font-weight: 600; font-size: 13px; }
+.notification-summary { color: @faint; font-size: 11px; }
+.notification-row { border-bottom: 1px solid @edge; }
+.notification-row:last-child { border-bottom: 0; }
+button.notification-open { background: transparent; border: 0; border-radius: 0; padding: 10px 12px; min-height: 0; }
+button.notification-open:hover { background: @wash; }
+.notification-row button.notification-read { margin: 0 8px 0 2px; }
+.notification-row-title { color: @secondary; font-size: 12px; font-weight: 500; }
+.notification-row.unread .notification-row-title { color: @ink; font-weight: 600; }
+.notification-time { color: @faint; font-size: 11px; }
+.notification-body { color: @secondary; font-size: 12px; }
+.notification-meta { color: @faint; font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif; font-size: 10px; font-weight: 600; letter-spacing: 0.08em; }
+.notification-dot { min-width: 6px; min-height: 6px; margin-top: 5px; border-radius: 3px; background: @secondary; }
+.notification-dot.held { background: @held; }
+.notification-dot.live { background: @live; }
+.notification-dot.neutral { background: @secondary; }
+.notification-empty { padding: 28px 16px; }
+.notification-empty-title { color: @ink; font-size: 13px; font-weight: 600; }
+.notification-empty-detail { color: @secondary; font-size: 12px; }
+
+/* "Where it left off" on a stopped session's slate. */
+.session-slate scrolledwindow, .session-slate viewport { background: transparent; }
+.slate-context { background: @console; border: 1px solid @edge; padding: 10px 12px; margin-top: 4px; }
+.slate-context-title { color: @faint; font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif; font-size: 11px; font-weight: 600; letter-spacing: 0.1em; }
+.slate-context-key { color: @faint; font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif; font-size: 10px; font-weight: 600; letter-spacing: 0.08em; margin-top: 1px; }
+.slate-context-value { color: @ink; font-size: 12px; }
+.slate-context-value.slate-context-report { color: @secondary; }
+.slate-context-value.slate-context-dirty { color: @waiting; }
+.slate-context-empty { color: @secondary; font-size: 12px; }
+/* end sessions-1 */
