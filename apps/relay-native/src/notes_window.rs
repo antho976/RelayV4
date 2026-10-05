@@ -7,7 +7,14 @@ pub struct NotesWindow {
     pub rendered_project: Cell<i64>,
     pub rail_width: Cell<i32>,
     pub rail_collapsed: Cell<bool>,
+    /// The open note's name, centred in the titlebar.
+    pub heading: gtk::Label,
+    /// Completed library renders; the shell persists, so tests wait on this.
+    pub renders: Cell<u64>,
     loading: Cell<bool>,
+    /// Settings were read; until then a persist would overwrite them with defaults.
+    loaded: Cell<bool>,
+    persist_wanted: Cell<bool>,
     pending: Cell<bool>,
     restored: Cell<bool>,
     persist_timer: RefCell<Option<glib::SourceId>>,
@@ -22,18 +29,32 @@ impl NotesWindow {
             .build();
         window.add_css_class("notes-window");
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        let chrome = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        chrome.add_css_class("notes-window-chrome");
-        let title = label("NOTES", "brand");
-        title.set_hexpand(true);
-        title.set_margin_start(12);
-        chrome.append(&title);
+        // A compact titlebar in the KWrite mould: menu bar, document name, window keys.
+        let chrome = gtk::CenterBox::new();
+        chrome.add_css_class("notes-chrome");
+        let start = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        let mark = crate::icons::image("notes", 14);
+        mark.add_css_class("notes-chrome-mark");
+        mark.set_valign(gtk::Align::Center);
+        start.append(&mark);
+        start.append(&super::note_pages::window_menu(ui, &window));
+        chrome.set_start_widget(Some(&start));
+        let heading = label("Notes", "notes-heading");
+        heading.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        heading.set_max_width_chars(48);
+        chrome.set_center_widget(Some(&heading));
+        let controls = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        controls.add_css_class("notes-chrome-controls");
         for (icon, hint) in [
             ("minimize", "Minimize"),
             ("maximize", "Maximize"),
             ("close", "Close Notes"),
         ] {
             let key = crate::app::icon_button(icon, hint);
+            key.set_focus_on_click(false);
+            if icon == "close" {
+                key.add_css_class("notes-window-close");
+            }
             let target = window.downgrade();
             key.connect_clicked(move |_| {
                 if let Some(window) = target.upgrade() {
@@ -50,8 +71,9 @@ impl NotesWindow {
                     }
                 }
             });
-            chrome.append(&key);
+            controls.append(&key);
         }
+        chrome.set_end_widget(Some(&controls));
         let handle = gtk::WindowHandle::new();
         handle.set_child(Some(&chrome));
         // Keep GTK's resize edges while drawing our own compact titlebar.
@@ -67,7 +89,11 @@ impl NotesWindow {
             rendered_project: Cell::new(0),
             rail_width: Cell::new(270),
             rail_collapsed: Cell::new(false),
+            heading,
+            renders: Cell::new(0),
             loading: Cell::new(false),
+            loaded: Cell::new(false),
+            persist_wanted: Cell::new(false),
             pending: Cell::new(false),
             restored: Cell::new(false),
             persist_timer: RefCell::new(None),
@@ -76,6 +102,7 @@ impl NotesWindow {
         owned.window.connect_close_request(move |window| {
             window.set_visible(false);
             if let Some(ui) = weak.upgrade() {
+                super::note_pages::flush(&ui);
                 if let Some(owner) = ui.notes_window.borrow().as_ref() {
                     owner.persist(&ui);
                 }
@@ -85,6 +112,10 @@ impl NotesWindow {
         owned
     }
     pub fn persist(&self, ui: &Rc<Ui>) {
+        if !self.loaded.get() {
+            self.persist_wanted.set(true);
+            return;
+        }
         if let Some(timer) = self.persist_timer.borrow_mut().take() {
             timer.remove();
         }
@@ -101,7 +132,11 @@ impl NotesWindow {
                         return;
                     };
                     owner.persist_timer.borrow_mut().take();
-                    json!({"rail_width":owner.rail_width.get(),"rail_collapsed":owner.rail_collapsed.get()})
+                    let mut value = json!({"rail_width":owner.rail_width.get(),"rail_collapsed":owner.rail_collapsed.get()});
+                    if let (Some(value), Value::Object(state)) = (value.as_object_mut(), super::note_pages::saved_state()) {
+                        value.extend(state);
+                    }
+                    value
                 };
                 glib::spawn_future_local(async move {
                     let _ = ui
@@ -161,6 +196,11 @@ pub fn refresh_notes(ui: &Rc<Ui>) {
                 window
                     .rail_collapsed
                     .set(value["value"]["rail_collapsed"].as_bool().unwrap_or(false));
+                super::note_pages::restore_state(&ui, &value["value"]);
+            }
+            window.loaded.set(true);
+            if window.persist_wanted.replace(false) {
+                window.persist(&ui);
             }
         }
         while window.pending.replace(false) {

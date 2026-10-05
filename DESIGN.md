@@ -235,10 +235,20 @@ text editing. Worktree selection scopes the file tree, content search, file
 operations and Git controls. Read-only comparisons sit beside editable source;
 staging, commits, history and branch tools stay in the Git region.
 
-Notes uses native text editing with Markdown tools and find/replace. Open drafts
-remain mounted in tabs or satellite windows, with explicit Save and Discard
-controls and dirty-close protection. Plan uses the same editor with its title
-fixed. Preserve project identity when a tab outlives navigation.
+Notes is a desktop text editor in the KWrite mould, in its own window. Its compact
+titlebar carries a File/Edit/Search/View menu bar (menus show their shortcuts)
+and the open note's name; below it sit a toolbar, a resizable library (search,
+pinned and dated rows, sort, a context menu) and tabbed GtkSourceView documents
+with Markdown highlighting and list continuation. A find/replace bar (match case,
+whole words, regular expressions, "3 of 12"), go-to-line and a status bar (save
+state, line and column, counts, Markdown/plain, encoding, line endings, zoom,
+autosave) complete each document. Open drafts remain mounted in tabs, and each
+project's open tabs are restored. Saving is explicit by default: unsaved tabs show
+a dot and closing one asks Save / Don't Save / Cancel. Autosave is an opt-in
+preference that saves through the same conflict-checked update after a pause and
+when the window hides. A change made elsewhere reloads a clean tab and raises a
+notice on a dirty one. Plan uses the same editor with its title fixed. Preserve
+project identity when a tab outlives navigation.
 
 ### Native adaptations
 Mail composition remains mounted while messages refresh. Message/error text is

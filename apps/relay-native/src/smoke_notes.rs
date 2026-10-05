@@ -110,6 +110,53 @@ pub async fn run(ui: &Rc<Ui>) -> Result<(), String> {
         .ok_or("Note body missing")?
         .downcast::<gtk::TextView>()
         .map_err(|_| "Note body type")?;
+    let source = body
+        .clone()
+        .downcast::<sourceview5::View>()
+        .map_err(|_| "Note body must be a GtkSourceView")?;
+    require(
+        source
+            .buffer()
+            .downcast::<sourceview5::Buffer>()
+            .ok()
+            .and_then(|buffer| sourceview5::prelude::BufferExt::language(&buffer))
+            .is_some_and(|language| language.id() == "markdown"),
+        "Note body must use the Markdown language",
+    )?;
+    owner
+        .window
+        .activate_action("notes.find", None)
+        .map_err(|_| "Find action missing")?;
+    let query = named(&draft.layout, "notes-find-entry")
+        .ok_or("Find bar missing")?
+        .downcast::<gtk::Entry>()
+        .map_err(|_| "Find entry type")?;
+    require(query.is_mapped(), "Ctrl+F did not show the find bar")?;
+    query.set_text("plan");
+    let count = named(&draft.layout, "notes-find-count")
+        .ok_or("Find count missing")?
+        .downcast::<gtk::Label>()
+        .map_err(|_| "Find count type")?;
+    wait_for(|| count.text() == "1 of 1", "Find shows a match count").await?;
+    owner
+        .window
+        .activate_action("notes.close-find", None)
+        .map_err(|_| "Close-find action missing")?;
+    require(!query.is_mapped(), "Escape did not close the find bar")?;
+    owner
+        .window
+        .activate_action("notes.goto", None)
+        .map_err(|_| "Go-to-line action missing")?;
+    let goto = named(&draft.layout, "notes-goto-entry")
+        .ok_or("Go-to-line field missing")?
+        .downcast::<gtk::Entry>()
+        .map_err(|_| "Go-to-line field type")?;
+    goto.set_text("1:10");
+    goto.emit_activate();
+    require(
+        body.buffer().cursor_position() == 9,
+        "Go to line 1:10 did not move the cursor",
+    )?;
     body.buffer()
         .set_text("Unsaved text survives the window closing.");
     owner.window.close();
@@ -158,15 +205,14 @@ pub async fn run(ui: &Rc<Ui>) -> Result<(), String> {
         .map_err(|_| "Library toggle type")?;
     toggle.emit_clicked();
     require(owner.rail_collapsed.get(), "Library did not collapse")?;
+    let renders = owner.renders.get();
     crate::pages::refresh_notes(ui);
-    wait_for(
-        || {
-            named(&owner.window, "notes-library-split")
-                .is_some_and(|new| new != split.clone().upcast::<gtk::Widget>())
-        },
-        "Notes refresh completed",
-    )
-    .await?;
+    wait_for(|| owner.renders.get() > renders, "Notes refresh completed").await?;
+    require(
+        named(&owner.window, "notes-library-split")
+            .is_some_and(|same| same == split.clone().upcast::<gtk::Widget>()),
+        "Refresh rebuilt the Notes shell instead of keeping it",
+    )?;
     require(
         owner.rail_collapsed.get(),
         "Refresh reset collapsed library",
@@ -250,6 +296,6 @@ pub async fn run(ui: &Rc<Ui>) -> Result<(), String> {
     ui.call("notes.delete", json!({"note_id":id}))
         .await
         .map_err(|e| e.to_string())?;
-    println!("NOTES_TASK_LIFECYCLE_OK: custom titlebar, resize, retained window, dirty reopen, rail persistence, ordinary Plan, task message guard");
+    println!("NOTES_TASK_LIFECYCLE_OK: custom titlebar, resize, retained window, sourceview markdown, find count, go to line, dirty reopen, persistent shell, rail persistence, ordinary Plan, task message guard");
     Ok(())
 }
