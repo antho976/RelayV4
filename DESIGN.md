@@ -181,8 +181,18 @@ shadow; OS file choosers keep their native decoration. Launch reveal duration is
 Optional PNG/JPEG wallpaper fills the window with cover sizing, beneath a black
 dim layer. Settings exposes a wallpaper library, panel opacity, wallpaper dim
 and content contrast. Increasing content contrast raises effective panel
-opacity; terminal and text-entry grounds remain opaque for legibility. The
-Matte default uses fully opaque panels.
+opacity. The top bar sits inside the wallpaper backdrop like the status bar, so
+both chrome strips show it through one console layer. Terminal plates follow
+panel opacity too, as one slightly denser layer (`@plate`, about 5 points above
+the chrome) over the page; VTE's own ground is clear, and a parked session's
+slate hides its stale screen. The workspace strip above the wall adds no layer
+of its own. Text-entry grounds remain opaque for legibility. The Matte default
+uses fully opaque panels, which keeps the screen-black plates.
+
+The status bar's usage meters show, per enabled provider, the 5-hour, weekly
+and Fable windows chosen in the limits popup, with amber at 70% and red at 90%,
+and faint once a window has reset since its report. Beside them sit when the
+limits were last read and a refresh key.
 
 ## Shapes
 

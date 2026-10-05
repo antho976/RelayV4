@@ -1537,75 +1537,6 @@ impl Ui {
             }
         });
     }
-    pub(super) fn usage(self: &Rc<Self>) {
-        let Some((window, body)) = self.sheet("Provider usage", 400, 420) else {
-            return;
-        };
-        window.bottom(380);
-        let refresh = button("Refresh", "quiet");
-        body.append(&refresh);
-        let list = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        body.append(&list);
-        let pending = Rc::new(RefCell::new(None::<glib::JoinHandle<()>>));
-        let closing = pending.clone();
-        window.on_closed(move || {
-            if let Some(task) = closing.borrow_mut().take() {
-                task.abort();
-            }
-        });
-        let weak = Rc::downgrade(self);
-        refresh.connect_clicked(move |key| {
-            let Some(ui) = weak.upgrade() else {
-                return;
-            };
-            let key = key.clone();
-            let list = list.clone();
-            key.set_sensitive(false);
-            *pending.borrow_mut() = Some(glib::spawn_future_local(async move {
-                clear(&list);
-                match ui.call("usage.get", json!({})).await {
-                    Ok(v) => {
-                        let entries = rows(&v, "usage");
-                        if entries.is_empty() {
-                            list.append(&label("No provider usage has been reported yet.", "dim"));
-                        }
-                        for item in entries {
-                            list.append(&label(text(&item, "provider"), "title"));
-                            if let Some(windows) = item["windows"].as_object() {
-                                for (name, value) in windows {
-                                    if let Some(pct) =
-                                        value["used_pct"].as_f64().or(value["pct"].as_f64())
-                                    {
-                                        list.append(&label(
-                                            &format!(
-                                                "{} · {:.0}% used",
-                                                name.replace('_', " "),
-                                                pct.clamp(0., 100.)
-                                            ),
-                                            "body",
-                                        ));
-                                        let bar = gtk::ProgressBar::new();
-                                        bar.set_fraction(pct.clamp(0., 100.) / 100.);
-                                        list.append(&bar);
-                                        if let Some(reset) = value["resets_in"].as_str() {
-                                            list.append(&label(
-                                                &format!("Resets in {reset}"),
-                                                "dim",
-                                            ));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => ui.show_error(&e.to_string()),
-                }
-                key.set_sensitive(true);
-            }));
-        });
-        refresh.emit_clicked();
-        window.present();
-    }
     pub(super) fn load_appearance(self: &Rc<Self>) {
         crate::wallpaper_rotation::refresh(self);
         let ui = self.clone();
@@ -1686,6 +1617,15 @@ impl Ui {
                     (alpha + offset).min(1.)
                 );
             }
+            // Terminal plates sit on one @wall layer; @plate tops that up to slightly
+            // denser than the chrome. Matte's opaque default keeps the opaque screen.
+            let wall = (alpha + 0.02).min(1.);
+            let plate = if wall >= 1. {
+                1.
+            } else {
+                (((alpha + 0.05).min(1.) - wall) / (1. - wall)).clamp(0., 1.)
+            };
+            css += &format!("\n@define-color plate alpha({},{plate:.3});", colors[4]);
             css += &format!(
                 "\n@define-color backbox alpha({},{});\n@define-color backbox_chrome alpha({},{});",
                 colors[0],

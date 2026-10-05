@@ -293,11 +293,17 @@ impl Pane {
             "#5c5c60", "#ff6b5f", "#5fe08c", "#f2cf6b", "#8ab8ff", "#e19bea", "#68dfe8", "#f2f2f0",
         ]
         .map(color);
+        // The plate behind the terminal paints the ground (`@plate`, which follows panel
+        // opacity), so VTE's own default background is clear. Reverse video and explicit
+        // cell colours still use the opaque RGB, and the cursor keeps an opaque glyph.
+        let mut clear = color(background);
+        clear.set_alpha(0.);
         self.terminal.set_colors(
             Some(&color("#dcdcda")),
-            Some(&color(background)),
+            Some(&clear),
             &palette.iter().collect::<Vec<_>>(),
         );
+        self.terminal.set_color_background(&clear);
         self.terminal.set_color_cursor(Some(&color("#ececea")));
         self.terminal
             .set_color_cursor_foreground(Some(&color(background)));
@@ -395,6 +401,8 @@ impl Pane {
         self.state.set_text(&state_label);
         let live = matches!(state, "spawning" | "running" | "idle" | "blocked");
         self.slate.set_visible(!live);
+        // The slate is as see-through as the plate, so it hides the stale screen under it.
+        self.terminal.set_opacity(if live { 1. } else { 0. });
         self.slate_state.set_text(&state_label);
         self.slate_hint.set_text(match state {
             "parked" => "Process released. Scrollback and worktree kept; wake respawns with provider resume.",

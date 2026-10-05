@@ -109,6 +109,7 @@ impl Editor {
         scope.set_child(Some(&scope_content));
         let project_tools = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         project_tools.add_css_class("code-bar");
+        project_tools.add_css_class("workspace-strip");
         project_tools.append(&scope);
         let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         spacer.set_hexpand(true);

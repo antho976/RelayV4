@@ -33,15 +33,22 @@ fn read_claude() -> Option<Usage> {
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from))?;
-    let path = root.join(".claude").join("relay-usage.json");
-    if fs::metadata(&path).ok()?.len() > MAX_STATE_FILE { return None; }
+    read_claude_file(&root.join(".claude").join("relay-usage.json"))
+}
+
+fn read_claude_file(path: &Path) -> Option<Usage> {
+    let metadata = fs::metadata(path).ok()?;
+    if metadata.len() > MAX_STATE_FILE { return None; }
     let raw = fs::read_to_string(path).ok()?;
     let value: Value = serde_json::from_str(&raw).ok()?;
     let limits = find_named(&value, &["rate_limits", "rateLimits"], 0)?;
     let windows = normalize_group(limits);
     if windows.is_empty() { return None; }
-    let taken_at = value.get("timestamp").and_then(Value::as_str)
-        .map(str::to_string).unwrap_or_else(crate::time::now);
+    // The status-line hook rewrites this file on every report and the payload carries no
+    // timestamp of its own, so the file's mtime is when Claude Code last reported.
+    let taken_at = value.get("timestamp").and_then(Value::as_str).map(str::to_string)
+        .or_else(|| metadata.modified().ok().and_then(|at| jiff::Timestamp::try_from(at).ok()).map(|at| at.to_string()))
+        .unwrap_or_else(crate::time::now);
     Some(Usage { provider: Provider::Claude, windows: Value::Object(windows), taken_at })
 }
 
@@ -143,8 +150,16 @@ fn normalize_window(value: &Value) -> Option<Value> {
     let used = ["used_pct", "used_percent", "used_percentage", "utilization", "percent"]
         .iter().find_map(|key| object.get(*key).and_then(number))?;
     let resets = ["resets_at", "resetsAt", "reset_at", "resetAt"]
-        .iter().find_map(|key| object.get(*key)).and_then(reset_label);
-    Some(json!({"used_pct": used.clamp(0.0, 100.0).round(), "resets_in": resets}))
+        .iter().find_map(|key| object.get(*key));
+    // `resets_in` is relative to this read; `resets_at` (unix seconds) lets the client show the
+    // wall-clock reset and notice a window that has already rolled over since the report.
+    Some(json!({"used_pct": used.clamp(0.0, 100.0).round(),
+        "resets_in": resets.and_then(reset_label), "resets_at": resets.and_then(reset_epoch)}))
+}
+
+fn reset_epoch(value: &Value) -> Option<u64> {
+    let epoch = value.as_f64().or_else(|| value.as_str()?.parse::<f64>().ok())?;
+    Some(if epoch > 100_000_000_000.0 { epoch / 1000.0 } else { epoch } as u64)
 }
 
 fn number(value: &Value) -> Option<f64> {
@@ -152,8 +167,7 @@ fn number(value: &Value) -> Option<f64> {
 }
 
 fn reset_label(value: &Value) -> Option<String> {
-    let epoch = value.as_f64().or_else(|| value.as_str()?.parse::<f64>().ok())?;
-    let seconds = if epoch > 100_000_000_000.0 { epoch / 1000.0 } else { epoch };
+    let seconds = reset_epoch(value)? as f64;
     let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs_f64();
     let remaining = seconds.saturating_sub(now) as u64;
     let days = remaining / 86_400;
@@ -180,11 +194,32 @@ mod tests {
             "seven_day":{"utilization":71}
         }));
         assert_eq!(claude["five_hour"]["used_pct"], 32.0);
+        assert_eq!(claude["five_hour"]["resets_at"], 4102444800_u64);
         assert_eq!(claude["seven_day"]["used_pct"], 71.0);
+        assert!(claude["seven_day"]["resets_at"].is_null());
         let codex = normalize_codex(&json!({
             "primary":{"used_percent":44,"window_minutes":10080,"resets_at":4102444800_u64},
             "secondary":null
         }));
         assert_eq!(codex["weekly"]["used_pct"], 44.0);
+        // Milliseconds are accepted and normalized to seconds.
+        let window = normalize_window(&json!({"used_percent":5,"resets_at":"4102444800000"})).unwrap();
+        assert_eq!(window["resets_at"], 4102444800_u64);
+    }
+
+    #[test]
+    fn claude_report_is_dated_by_the_file_when_it_carries_no_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("relay-usage.json");
+        fs::write(&path, r#"{"rate_limits":{"five_hour":{"used_percentage":7,"resets_at":4102444800}}}"#).unwrap();
+        let old = SystemTime::now() - std::time::Duration::from_secs(600);
+        File::options().write(true).open(&path).unwrap().set_modified(old).unwrap();
+        let usage = read_claude_file(&path).unwrap();
+        assert_eq!(usage.windows["five_hour"]["used_pct"], 7.0);
+        let taken: jiff::Timestamp = usage.taken_at.parse().unwrap();
+        let age = jiff::Timestamp::now().as_second() - taken.as_second();
+        assert!((595..=605).contains(&age), "taken_at follows the file's mtime, got {age}s old");
+        fs::write(&path, r#"{"timestamp":"2026-01-02T03:04:05Z","rate_limits":{"seven_day":{"utilization":9}}}"#).unwrap();
+        assert_eq!(read_claude_file(&path).unwrap().taken_at, "2026-01-02T03:04:05Z");
     }
 }

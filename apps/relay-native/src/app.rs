@@ -243,6 +243,7 @@ pub struct Ui {
     pub notice: gtk::Label,
     status: gtk::Label,
     usage_meters: gtk::Box,
+    usage: status::UsageState,
     device_status: gtk::Label,
     pub(super) resource_status: gtk::Box,
     notification_count: gtk::Label,
@@ -463,7 +464,13 @@ impl Ui {
         top.append(&window_controls);
         let handle = gtk::WindowHandle::new();
         handle.set_child(Some(&top));
-        window.set_titlebar(Some(&handle));
+        // The bar lives inside the wallpaper backdrop so panel opacity shows the wallpaper
+        // behind it, like the status bar. A hidden titlebar keeps client-side decorations
+        // and their resize edges; the WindowHandle still drags and maximizes the window.
+        let titlebar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        titlebar.set_visible(false);
+        window.set_titlebar(Some(&titlebar));
+        outer.append(&handle);
         let notice = label("Connecting to the Relay engine…", "notice");
         notice.set_wrap(true);
         notice.set_selectable(true);
@@ -592,6 +599,12 @@ impl Ui {
         agents.append(&wall_body);
         let editor = crate::editor::Editor::new();
         editor.mount_agents(&agents);
+        // Panel opacity reaches the terminals only if the stacks between them and the
+        // wallpaper stop repainting @wall on top of each other (see css/usage.css).
+        agents.add_css_class("agents-surface");
+        if let Some(host) = agents.parent() {
+            host.add_css_class("agents-host");
+        }
         content.add_named(&editor.root, Some("agents"));
         let mut pages = BTreeMap::new();
         for name in [
@@ -691,6 +704,8 @@ impl Ui {
         resource_content.append(&resource_status);
         resources_key.set_child(Some(&resource_content));
         bottom.append(&usage_key);
+        let usage = status::UsageState::new();
+        bottom.append(&usage.strip);
         bottom.append(&gtk::Separator::new(gtk::Orientation::Vertical));
         bottom.append(&devices_key);
         bottom.append(&gtk::Separator::new(gtk::Orientation::Vertical));
@@ -731,6 +746,7 @@ impl Ui {
             notice,
             status,
             usage_meters,
+            usage,
             device_status,
             resource_status,
             notification_count,
@@ -904,9 +920,10 @@ impl Ui {
         let weak = Rc::downgrade(&ui);
         usage_key.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
-                ui.usage();
+                ui.usage_panel();
             }
         });
+        ui.install_usage();
         ui.install_shortcuts();
         if let Some(display) = gtk::gdk::Display::default() {
             gtk::style_context_add_provider_for_display(
@@ -1210,6 +1227,9 @@ impl Ui {
                                     let path = text(&e.payload, "path");
                                     if path.starts_with("keybindings") || path.is_empty() {
                                         ui.load_keybindings();
+                                    }
+                                    if path.starts_with("usage") || path.is_empty() {
+                                        ui.reload_usage_prefs();
                                     }
                                     if path.starts_with("appearance.")
                                         || path == "terminal.font_size"

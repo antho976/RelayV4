@@ -17,6 +17,13 @@ pub fn defaults() -> &'static Value {
             "appearance": { "mode": "dark", "panel_alpha": 1.0, "wallpaper": null, "wallpaper_preview": null },
             "notifications": { "sound": "chime", "volume": 0.7, "categories": {} },
             "providers": { "claude": { "path": null }, "codex": { "path": null } },
+            // What the status bar's limit meters show, and how often the window re-reads them
+            // (minutes; 0 = only on engine events and the refresh key).
+            "usage": {
+                "refresh_minutes": 0,
+                "claude": { "enabled": true, "five_hour": true, "weekly": true, "fable": true },
+                "codex": { "enabled": true, "five_hour": true, "weekly": true }
+            },
             "device": { "sdk_path": null, "adb_path": null, "emulator_path": null, "avdmanager_path": null },
             "guardrails": {
                 "caps": { "files": 40, "lines": 2000 },
