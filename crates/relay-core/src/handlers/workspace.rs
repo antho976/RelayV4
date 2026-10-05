@@ -4,7 +4,6 @@ use crate::engine::{Ctx, Engine, IntoBus};
 use relay_bus::error::BusError;
 use relay_bus::ops::workspace::*;
 use relay_bus::types::{Id, Project, Workspace};
-use relay_bus::Empty;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde_json::json;
 use std::fs;
@@ -150,14 +149,35 @@ pub fn register(e: &mut Engine) {
     });
     e.register::<WsRemove>(|ctx: &mut Ctx, p| {
         get_workspace(ctx.tx(), p.workspace_id)?;
-        let n: i64 = ctx.tx().query_row("SELECT COUNT(*) FROM projects WHERE workspace_id = ?1", [p.workspace_id], |r| r.get(0)).bus()?;
-        if n > 0 {
+        let projects: Vec<Id> = {
+            let mut stmt = ctx.tx().prepare_cached("SELECT id FROM projects WHERE workspace_id = ?1 ORDER BY id").bus()?;
+            let rows = stmt.query_map([p.workspace_id], |r| r.get(0)).bus()?.collect::<rusqlite::Result<Vec<_>>>();
+            rows.bus()?
+        };
+        let n = projects.len();
+        if n > 0 && !p.force.unwrap_or(false) {
             return Err(BusError::conflict("workspace.has_projects", format!("workspace {} still has {n} project(s)", p.workspace_id))
-                .with_hint("remove its projects first (project.remove)"));
+                .with_details(json!({ "projects": n }))
+                .with_hint("remove its projects first (project.remove), or pass force to remove them with it"));
+        }
+        // Refuse before closing anything: one project mid-integration must not leave the rest
+        // half-removed. Each project.remove below repeats the check for itself.
+        for &id in &projects {
+            if integrations_live(ctx.tx(), id)? > 0 {
+                return Err(BusError::conflict("project.activity_live", format!("project {id} has an integration in progress"))
+                    .with_hint("wait for the integration to finish, then remove the workspace"));
+            }
+        }
+        let mut sessions_closed = 0;
+        for id in &projects {
+            let out = ctx.invoke_registered("project.remove", json!({
+                "project_id": id, "force": true, "remove_worktrees": p.remove_worktrees.unwrap_or(false),
+            }))?;
+            sessions_closed += out["sessions_closed"].as_i64().unwrap_or(0);
         }
         ctx.tx().execute("DELETE FROM workspaces WHERE id = ?1", [p.workspace_id]).bus()?;
         ctx.emit("workspace.deleted", json!({ "id": p.workspace_id }));
-        Ok(Empty {})
+        Ok(WsRemoveOut { projects_removed: n as i64, sessions_closed })
     });
 
     e.register::<ProjectAdd>(|ctx: &mut Ctx, p| {
@@ -267,25 +287,66 @@ pub fn register(e: &mut Engine) {
     });
     e.register::<ProjectRemove>(|ctx: &mut Ctx, p| {
         let pr = get_project(ctx.tx(), p.project_id)?;
-        let live_sessions: i64 = ctx.tx().query_row(
-            "SELECT COUNT(*) FROM sessions WHERE project_id=?1 AND state!='closed'",
-            [pr.id], |row| row.get(0),
-        ).bus()?;
-        if live_sessions > 0 {
-            return Err(BusError::conflict("project.sessions_live", format!("project {} still has {live_sessions} open session(s)", pr.id))
-                .with_hint("close its sessions before removing the project"));
+        let force = p.force.unwrap_or(false);
+        let open: Vec<(String, String)> = {
+            let mut stmt = ctx.tx().prepare_cached(
+                "SELECT name, worktree FROM sessions WHERE project_id=?1 AND state!='closed' ORDER BY id",
+            ).bus()?;
+            let rows = stmt.query_map([pr.id], |r| Ok((r.get(0)?, r.get(1)?))).bus()?.collect::<rusqlite::Result<Vec<_>>>();
+            rows.bus()?
+        };
+        if !open.is_empty() && !force {
+            return Err(BusError::conflict("project.sessions_live", format!("project {} still has {} open session(s)", pr.id, open.len()))
+                .with_details(json!({ "open_sessions": open.len() }))
+                .with_hint("close its sessions before removing the project, or pass force to close them with it"));
         }
-        let live_integrations: i64 = ctx.tx().query_row(
-            "SELECT COUNT(*) FROM integrations WHERE project_id=?1 AND state IN ('queued','merging','building','deploying')",
-            [pr.id], |row| row.get(0),
-        ).bus()?;
-        let live_runs: i64 = ctx.tx().query_row(
-            "SELECT COUNT(*) FROM device_runs WHERE project_id=?1 AND state IN ('building','running')",
-            [pr.id], |row| row.get(0),
-        ).bus()?;
-        if live_integrations + live_runs > 0 {
-            return Err(BusError::conflict("project.activity_live", "project still has an active integration or device run")
-                .with_hint("stop active runs before removing the project"));
+        // An integration may be mid-merge in the primary checkout; never interrupt it, force or not.
+        if integrations_live(ctx.tx(), pr.id)? > 0 {
+            return Err(BusError::conflict("project.activity_live", "project still has an integration in progress")
+                .with_hint("wait for the integration to finish before removing the project"));
+        }
+        let live_runs: Vec<Id> = {
+            let mut stmt = ctx.tx().prepare_cached(
+                "SELECT id FROM device_runs WHERE project_id=?1 AND state IN ('building','running') ORDER BY id",
+            ).bus()?;
+            let rows = stmt.query_map([pr.id], |r| r.get(0)).bus()?.collect::<rusqlite::Result<Vec<_>>>();
+            rows.bus()?
+        };
+        if !live_runs.is_empty() && !force {
+            return Err(BusError::conflict("project.activity_live", "project still has an active device run")
+                .with_details(json!({ "active_runs": live_runs.len() }))
+                .with_hint("stop active runs before removing the project, or pass force to stop them with it"));
+        }
+        // `force` closes through `session.close` itself, so every teardown rule holds: scrollback
+        // saved, claims released, holds expired, hooks uninstalled. Each close keeps its worktree,
+        // which also defers the agent's kill until the store unlocks; deleting checkouts (build
+        // purge, `git worktree remove`) is seconds of disk work per agent, so `remove_worktrees`
+        // queues it for after the commit too, behind those kills, instead of holding the bus
+        // through all of it (BUS.md §5.1). A checkout shared by a PAIR or review group is in
+        // `open` once per session but removed once, after all of them have closed.
+        for (name, _) in &open {
+            ctx.invoke_registered("session.close", json!({ "session": name, "remove_worktree": false }))?;
+        }
+        if p.remove_worktrees.unwrap_or(false) {
+            let repo = PathBuf::from(&pr.path);
+            let pool = crate::worktree::pool_dir(&repo);
+            let mut doomed: Vec<PathBuf> = open.iter().map(|(_, wt)| PathBuf::from(wt)).filter(|wt| wt.starts_with(&pool)).collect();
+            doomed.sort();
+            doomed.dedup();
+            if !doomed.is_empty() {
+                let project_id = pr.id;
+                ctx.after_commit(move |engine| {
+                    for wt in &doomed {
+                        if let Err(error) = crate::worktree::remove(&repo, wt, true) {
+                            tracing::warn!(worktree = %wt.display(), %error, "removing a removed project's worktree");
+                        }
+                    }
+                    engine.emit_system("worktree.changed", json!({ "project_id": project_id }));
+                });
+            }
+        }
+        for run in &live_runs {
+            ctx.invoke_registered("device.run.stop", json!({ "run_id": run }))?;
         }
 
         // `project.remove` forgets Relay metadata only. Audit rows deliberately remain as the
@@ -319,8 +380,14 @@ pub fn register(e: &mut Engine) {
         ctx.tx().execute("DELETE FROM projects WHERE id = ?1", [pr.id]).bus()?;
         ctx.set_project(pr.id);
         ctx.emit("project.deleted", json!({ "id": pr.id }));
-        Ok(Empty {})
+        Ok(ProjectRemoveOut { sessions_closed: open.len() as i64, runs_stopped: live_runs.len() as i64 })
     });
+}
+
+fn integrations_live(tx: &Connection, project_id: Id) -> Result<i64, BusError> {
+    tx.prepare_cached(
+        "SELECT COUNT(*) FROM integrations WHERE project_id=?1 AND state IN ('queued','merging','building','deploying')",
+    ).bus()?.query_row([project_id], |row| row.get(0)).bus()
 }
 
 fn discover_repositories(root: &Path) -> Result<Vec<relay_bus::types::LocalRepo>, BusError> {

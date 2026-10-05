@@ -16,9 +16,18 @@ op!(WsList, "workspace.list", Empty => WsListOut, OpMeta::query(Scope::Global, 1
 payload!(#[schemars(rename = "WorkspaceUpdateIn")] WsUpdateIn { pub workspace_id: Id, pub name: Option<String>, pub order: Option<i64> });
 op!(WsUpdate, "workspace.update", WsUpdateIn => Workspace,
     OpMeta::mutation(Scope::Global, 1, "Rename / reorder a workspace").actors(Actors::UserOnly).undo(Undo::Inverse).emits(&["workspace.changed"]));
-payload!(#[schemars(rename = "WorkspaceRemoveIn")] WsRemoveIn { pub workspace_id: Id });
-op!(WsRemove, "workspace.remove", WsRemoveIn => Empty,
-    OpMeta::mutation(Scope::Global, 1, "Forget a workspace; conflict if it still has projects").actors(Actors::UserOnly).emits(&["workspace.deleted"]));
+payload!(#[schemars(rename = "WorkspaceRemoveIn")] WsRemoveIn {
+    pub workspace_id: Id,
+    /// Also remove every project in it, closing their open sessions (`project.remove` with `force`).
+    /// Without it the op refuses `workspace.has_projects`.
+    pub force: Option<bool>,
+    /// With `force`: also delete the Relay-pool worktrees of the sessions it closes. Branches
+    /// are always kept; off by default, so every checkout stays on disk.
+    pub remove_worktrees: Option<bool>,
+});
+result!(#[schemars(rename = "WorkspaceRemoveOut")] WsRemoveOut { pub projects_removed: i64, pub sessions_closed: i64 });
+op!(WsRemove, "workspace.remove", WsRemoveIn => WsRemoveOut,
+    OpMeta::mutation(Scope::Global, 1, "Forget a workspace; conflict if it still has projects unless force removes them too").actors(Actors::UserOnly).emits(&["workspace.deleted", "project.deleted", "session.changed"]));
 
 payload!(#[schemars(rename = "ProjectAddIn")] ProjectAddIn { pub workspace_id: Id, pub path: String, pub name: Option<String> });
 op!(ProjectAdd, "project.add", ProjectAddIn => Project,
@@ -39,9 +48,18 @@ payload!(#[schemars(rename = "ProjectUpdateIn")] ProjectUpdateIn {
 });
 op!(ProjectUpdate, "project.update", ProjectUpdateIn => Project,
     OpMeta::mutation(Scope::Project, 1, "Patch project settings").actors(Actors::UserOnly).undo(Undo::Inverse).emits(&["project.changed"]));
-payload!(#[schemars(rename = "ProjectRemoveIn")] ProjectRemoveIn { pub project_id: Id });
-op!(ProjectRemove, "project.remove", ProjectRemoveIn => Empty,
-    OpMeta::mutation(Scope::Project, 1, "Forget a project (never touches disk); conflict if live sessions").actors(Actors::UserOnly).emits(&["project.deleted"]));
+payload!(#[schemars(rename = "ProjectRemoveIn")] ProjectRemoveIn {
+    pub project_id: Id,
+    /// Close its open sessions (`session.close`, worktree kept) and stop its device runs first.
+    /// Without it the op refuses `project.sessions_live` / `project.activity_live`.
+    pub force: Option<bool>,
+    /// With `force`: also delete the Relay-pool worktrees of the sessions it closes. Branches
+    /// are always kept; off by default, so every checkout stays on disk.
+    pub remove_worktrees: Option<bool>,
+});
+result!(#[schemars(rename = "ProjectRemoveOut")] ProjectRemoveOut { pub sessions_closed: i64, pub runs_stopped: i64 });
+op!(ProjectRemove, "project.remove", ProjectRemoveIn => ProjectRemoveOut,
+    OpMeta::mutation(Scope::Project, 1, "Forget a project (repository untouched); conflict if live sessions unless force closes them").actors(Actors::UserOnly).emits(&["project.deleted", "session.changed", "worktree.changed", "run.changed"]));
 result!(#[schemars(rename = "ProjectStatsOut")] ProjectStatsOut { pub tasks_by_column: BTreeMap<Column, i64>, pub sessions_live: i64, pub sessions_idle: i64, pub worktrees: i64, pub disk_mb: f64 });
 op!(ProjectStats, "project.stats", ProjectGetIn => ProjectStatsOut, OpMeta::query(Scope::Project, 9, "Sidebar numbers for one project"));
 

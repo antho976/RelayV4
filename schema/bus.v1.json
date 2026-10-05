@@ -536,7 +536,7 @@
       }
     },
     "workspace.remove": {
-      "summary": "Forget a workspace; conflict if it still has projects",
+      "summary": "Forget a workspace; conflict if it still has projects unless force removes them too",
       "kind": "mutation",
       "audit": "always",
       "undo": "none",
@@ -545,7 +545,9 @@
       "actors": "user_only",
       "doors": "all",
       "emits": [
-        "workspace.deleted"
+        "workspace.deleted",
+        "project.deleted",
+        "session.changed"
       ],
       "since": "1.0",
       "phase": 1,
@@ -553,7 +555,7 @@
         "$ref": "#/$defs/WorkspaceRemoveIn"
       },
       "result": {
-        "$ref": "#/$defs/Empty"
+        "$ref": "#/$defs/WorkspaceRemoveOut"
       }
     },
     "project.add": {
@@ -658,7 +660,7 @@
       }
     },
     "project.remove": {
-      "summary": "Forget a project (never touches disk); conflict if live sessions",
+      "summary": "Forget a project (repository untouched); conflict if live sessions unless force closes them",
       "kind": "mutation",
       "audit": "always",
       "undo": "none",
@@ -667,7 +669,10 @@
       "actors": "user_only",
       "doors": "all",
       "emits": [
-        "project.deleted"
+        "project.deleted",
+        "session.changed",
+        "worktree.changed",
+        "run.changed"
       ],
       "since": "1.0",
       "phase": 1,
@@ -675,7 +680,7 @@
         "$ref": "#/$defs/ProjectRemoveIn"
       },
       "result": {
-        "$ref": "#/$defs/Empty"
+        "$ref": "#/$defs/ProjectRemoveOut"
       }
     },
     "project.stats": {
@@ -6010,10 +6015,41 @@
         "workspace_id": {
           "type": "integer",
           "format": "int64"
+        },
+        "force": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Also remove every project in it, closing their open sessions (`project.remove` with `force`).\nWithout it the op refuses `workspace.has_projects`."
+        },
+        "remove_worktrees": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "With `force`: also delete the Relay-pool worktrees of the sessions it closes. Branches\nare always kept; off by default, so every checkout stays on disk."
         }
       },
       "required": [
         "workspace_id"
+      ]
+    },
+    "WorkspaceRemoveOut": {
+      "type": "object",
+      "properties": {
+        "projects_removed": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "sessions_closed": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "projects_removed",
+        "sessions_closed"
       ]
     },
     "ProjectAddIn": {
@@ -6262,10 +6298,41 @@
         "project_id": {
           "type": "integer",
           "format": "int64"
+        },
+        "force": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Close its open sessions (`session.close`, worktree kept) and stop its device runs first.\nWithout it the op refuses `project.sessions_live` / `project.activity_live`."
+        },
+        "remove_worktrees": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "With `force`: also delete the Relay-pool worktrees of the sessions it closes. Branches\nare always kept; off by default, so every checkout stays on disk."
         }
       },
       "required": [
         "project_id"
+      ]
+    },
+    "ProjectRemoveOut": {
+      "type": "object",
+      "properties": {
+        "sessions_closed": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "runs_stopped": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "sessions_closed",
+        "runs_stopped"
       ]
     },
     "ProjectStatsOut": {
