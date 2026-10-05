@@ -702,6 +702,27 @@ fn idempotent_replay() {
 }
 
 #[test]
+fn usage_display_preferences_default_on_and_override_per_meter() {
+    let e = engine(Instance::Test);
+    let v = call(&e, Actor::User, "settings.get", json!({"path": "usage"})).into_result().unwrap();
+    assert_eq!(v["value"]["refresh_minutes"], 0, "no timer unless the user asks for one");
+    for (provider, meters) in [("claude", &["enabled", "five_hour", "weekly", "fable"][..]), ("codex", &["enabled", "five_hour", "weekly"][..])] {
+        for meter in meters {
+            assert_eq!(v["value"][provider][meter], true, "{provider}.{meter} shows by default");
+        }
+    }
+    call(&e, Actor::User, "settings.set", json!({"path": "usage.codex.enabled", "value": false})).into_result().unwrap();
+    call(&e, Actor::User, "settings.set", json!({"path": "usage.claude.fable", "value": false})).into_result().unwrap();
+    call(&e, Actor::User, "settings.set", json!({"path": "usage.refresh_minutes", "value": 5})).into_result().unwrap();
+    let v = call(&e, Actor::User, "settings.get", json!({"path": "usage"})).into_result().unwrap();
+    assert_eq!(v["value"]["codex"]["enabled"], false);
+    assert_eq!(v["value"]["codex"]["weekly"], true, "hiding a provider keeps its meter choices");
+    assert_eq!(v["value"]["claude"]["fable"], false);
+    assert_eq!(v["value"]["claude"]["five_hour"], true);
+    assert_eq!(v["value"]["refresh_minutes"], 5);
+}
+
+#[test]
 fn settings_tree_and_undo_op() {
     let e = engine(Instance::Test);
     let v = call(&e, Actor::User, "settings.get", json!({})).into_result().unwrap();
