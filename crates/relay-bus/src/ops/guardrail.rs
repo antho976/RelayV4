@@ -14,7 +14,7 @@ payload!(#[schemars(rename = "GuardrailGateIn")] GateIn {
 });
 result!(#[schemars(rename = "GuardrailGateOut")] GateOut { pub verdict: Verdict, pub error: Option<BusError>, pub hold_id: Option<Id> });
 op!(Gate, "guardrail.gate", GateIn => GateOut,
-    OpMeta::mutation(Scope::Session, 4, "The enforcement door: hooks call it before a write/commit/exec; may create a hold").actors(Actors::AgentOnly).emits(&["guardrail.held", "guardrail.refused", "guardrail.grant_used", "notify.new"]));
+    OpMeta::mutation(Scope::Session, 4, "The enforcement door: hooks call it before a write/commit/exec; may create a hold").actors(Actors::AgentOnly).emits(&["guardrail.held", "guardrail.refused", "guardrail.grant_used", "guardrail.resolved", "notify.new"]));
 
 payload!(#[schemars(rename = "GuardrailHoldsListIn")] HoldsListIn { pub project_id: Option<Id>, pub session: Option<String>, pub open_only: Option<bool> });
 result!(#[schemars(rename = "GuardrailHoldsListOut")] HoldsListOut { pub holds: Vec<Hold> });

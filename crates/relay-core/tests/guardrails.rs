@@ -655,6 +655,10 @@ fn an_agent_can_ask_but_only_the_user_answers_and_once_means_once() {
 
     ok(engine, agent.clone(), "guardrail.gate",
         json!({"session": name, "kind": "exec", "command": "cd repo && git push --force origin main"}));
+    let seen = events(&mut rx);
+    assert!(seen.iter().any(|event| event.ev == "guardrail.grant_used" && event.payload["request_id"] == id));
+    assert!(seen.iter().any(|event| event.ev == "guardrail.resolved" && event.payload["state"] == "used"),
+        "a spent one-use grant is announced so every surface drops it");
     let used = ok(engine, agent.clone(), "guardrail.request.get", json!({"request_id": id}));
     assert_eq!(used["active"], false);
     assert_eq!(used["uses"], 1);

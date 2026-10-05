@@ -737,9 +737,13 @@ fn use_grants(ctx: &mut Ctx, used: &[Id], session: Option<&str>) -> Result<(), B
     if used.is_empty() {
         return Ok(());
     }
-    grants::consume(ctx.tx(), used, &ctx.now)?;
+    let spent = grants::consume(ctx.tx(), used, &ctx.now)?;
     for id in used {
         ctx.emit("guardrail.grant_used", json!({"request_id": id, "session": session, "op": ctx.op}));
+    }
+    // A one-use grant ends here; say so on the event every guardrail surface already follows.
+    for id in spent {
+        ctx.emit("guardrail.resolved", json!({"hold_id": id, "request_id": id, "state": "used"}));
     }
     Ok(())
 }

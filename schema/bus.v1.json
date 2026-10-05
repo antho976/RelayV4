@@ -2221,6 +2221,7 @@
         "guardrail.held",
         "guardrail.refused",
         "guardrail.grant_used",
+        "guardrail.resolved",
         "notify.new"
       ],
       "since": "1.0",

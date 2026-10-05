@@ -10,7 +10,7 @@ use crate::engine::IntoBus;
 use relay_bus::envelope::Actor;
 use relay_bus::error::BusError;
 use relay_bus::types::{ExceptionKind, GrantScope, GuardrailCaps, GuardrailException, Hold, HoldState, Id};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::cell::RefCell;
 use std::path::{Component, Path};
@@ -166,20 +166,29 @@ pub fn parse_caps(value: &str) -> (Option<u32>, Option<u32>) {
     (files, lines)
 }
 
-/// Count one use against each grant an allowed action leaned on.
-pub fn consume(conn: &Connection, ids: &[Id], now: &str) -> Result<(), BusError> {
+/// Count one use against each grant an allowed action leaned on. Returns the `once` grants
+/// this used up, which are over now.
+pub fn consume(conn: &Connection, ids: &[Id], now: &str) -> Result<Vec<Id>, BusError> {
+    let mut spent = Vec::new();
     for id in ids {
-        conn.prepare_cached(
-            "UPDATE holds SET details = json_set(details,
-                 '$.grant.uses', COALESCE(json_extract(details, '$.grant.uses'), 0) + 1,
-                 '$.grant.used_at', ?1)
-             WHERE id = ?2 AND op = 'guardrail.request'",
-        )
-        .bus()?
-        .execute(params![now, id])
-        .bus()?;
+        let scope: Option<String> = conn
+            .prepare_cached(
+                "UPDATE holds SET details = json_set(details,
+                     '$.grant.uses', COALESCE(json_extract(details, '$.grant.uses'), 0) + 1,
+                     '$.grant.used_at', ?1)
+                 WHERE id = ?2 AND op = 'guardrail.request'
+                 RETURNING json_extract(details, '$.grant.scope')",
+            )
+            .bus()?
+            .query_row(params![now, id], |r| r.get(0))
+            .optional()
+            .bus()?
+            .flatten();
+        if scope.as_deref() == Some("once") {
+            spent.push(*id);
+        }
     }
-    Ok(())
+    Ok(spent)
 }
 
 /// Check a request's shape before it reaches a person.
