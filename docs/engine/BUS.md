@@ -610,13 +610,13 @@ unique; nothing else is.
 | `workspace.discover` | query | `{ path? }` → `{ path, repositories: {path,name}[] }`; resolves blank to the current Git checkout's parent (or the current directory outside a checkout) and scans bounded descendants for Git roots |
 | `workspace.list` | query | `{}` → `{ workspaces: Workspace[] }` |
 | `workspace.update` | mutation · always · inverse | `{ workspace_id, name?, order? }` → `Workspace` |
-| `workspace.remove` | mutation · always · global | `{ workspace_id }` → `{}` — `conflict` if it still has projects |
+| `workspace.remove` | mutation · always · global | `{ workspace_id, force?: bool, remove_worktrees?: bool }` → `{ projects_removed, sessions_closed }` — `conflict` (`workspace.has_projects`, `details.projects`) if it still has projects, unless `force`, which runs `project.remove { force }` for each of them first |
 | `project.add` | mutation · always · global | `{ workspace_id, path, name? }` → `Project` — path must be a git repo root **inside** `workspace.path` (`invalid`/`project.outside_workspace`); one project per path (`conflict`/`project.exists`) |
 | `project.clone` | mutation · always · global | `{ workspace_id, url, dest? }` → `{ project: Project }`; clones inside the workspace and registers the result |
 | `project.list` | query | `{ workspace_id? }` → `{ projects: Project[] }` |
 | `project.get` | query | `{ project_id }` → `Project` |
 | `project.update` | mutation · always · inverse | `{ project_id, name?, build_cmd?, run_cmd?, base_branch?, protected_paths?, critical_files?, order?, pinned? }` → `Project` |
-| `project.remove` | mutation · always · project | `{ project_id }` → `{}` — forgets project-owned Relay metadata but never touches repository files; `conflict` if sessions, integrations, or device runs are live |
+| `project.remove` | mutation · always · project | `{ project_id, force?: bool, remove_worktrees?: bool }` → `{ sessions_closed, runs_stopped }` — forgets project-owned Relay metadata but never touches repository files; `conflict` if sessions (`project.sessions_live`, `details.open_sessions`) or device runs are live, unless `force`, which closes every open session through `session.close` and stops the runs first. Closed sessions keep their worktrees and branches unless `remove_worktrees` (Relay-pool checkouts only; branches always kept). An integration in progress refuses even with `force` |
 | `project.stats` | query | `{ project_id }` → `{ tasks_by_column, sessions_live, sessions_idle, worktrees, disk_mb }` |
 
 ### 10.5 task (SPEC §6)
