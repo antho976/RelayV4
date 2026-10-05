@@ -157,8 +157,6 @@ pub fn image_with_stroke(name: &str, size: i32, stroke: f64) -> gtk::Image {
         "phone-install" => {
             r##"<rect x="4.25" y="1.5" width="7.5" height="13" rx="1" /><path d="M8 4v5.5M5.75 7.5L8 9.75l2.25-2.25M7.25 12.5h1.5" />"##
         }
-        "arrow-up" => r##"<path d="M8 13V3M4 7l4-4 4 4" />"##,
-        "arrow-down" => r##"<path d="M8 3v10M4 9l4 4 4-4" />"##,
         "brief" => r##"<path d="M4 2h5l3 3v9H4z" /><path d="M9 2v3h3M6 8.5h4M6 11h4" />"##,
         "power" => r##"<path d="M8 2v5.5" /><path d="M4.8 4.3a5 5 0 1 0 6.4 0" />"##,
         "claude" => {

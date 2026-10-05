@@ -142,33 +142,6 @@ impl Ui {
         let body = panel.body.clone();
         Some((panel, body))
     }
-    fn confirm_mutation(
-        self: &Rc<Self>,
-        message: &str,
-        op: &'static str,
-        payload: Value,
-        parent: Option<Rc<crate::panel::Panel>>,
-    ) {
-        let dialog = crate::panel::Panel::new(self, "Confirm action", 520);
-        let copy = label(message, "body");
-        copy.set_wrap(true);
-        dialog.body.append(&copy);
-        let ui = self.clone();
-        glib::spawn_future_local(async move {
-            if dialog.response("Confirm").await {
-                match ui.call(op, payload).await {
-                    Ok(_) => {
-                        if let Some(w) = parent {
-                            w.close();
-                        }
-                        ui.registry_dirty.set(true);
-                        ui.refresh();
-                    }
-                    Err(e) => ui.show_error(&e.to_string()),
-                }
-            }
-        });
-    }
     pub(super) fn layout(self: &Rc<Self>) {
         let started = std::time::Instant::now();
         let names: Vec<_> = self.ordered.borrow().iter().cloned().collect();
