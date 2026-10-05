@@ -318,14 +318,32 @@ pub fn register(e: &mut Engine) {
                 .with_hint("stop active runs before removing the project, or pass force to stop them with it"));
         }
         // `force` closes through `session.close` itself, so every teardown rule holds: scrollback
-        // saved, claims released, holds expired, hooks uninstalled. Worktrees stay on disk unless
-        // `remove_worktrees`; with it, sessions sharing one checkout (PAIR, review group) keep it
-        // until the last of them closes, exactly as closing them by hand would.
-        let remove_worktrees = p.remove_worktrees.unwrap_or(false);
-        for (i, (name, worktree)) in open.iter().enumerate() {
-            let last_of_checkout = !open[i + 1..].iter().any(|(_, other)| other == worktree);
-            let remove = remove_worktrees && last_of_checkout;
-            ctx.invoke_registered("session.close", json!({ "session": name, "remove_worktree": remove, "purge_build": remove }))?;
+        // saved, claims released, holds expired, hooks uninstalled. Each close keeps its worktree,
+        // which also defers the agent's kill until the store unlocks; deleting checkouts (build
+        // purge, `git worktree remove`) is seconds of disk work per agent, so `remove_worktrees`
+        // queues it for after the commit too, behind those kills, instead of holding the bus
+        // through all of it (BUS.md §5.1). A checkout shared by a PAIR or review group is in
+        // `open` once per session but removed once, after all of them have closed.
+        for (name, _) in &open {
+            ctx.invoke_registered("session.close", json!({ "session": name, "remove_worktree": false }))?;
+        }
+        if p.remove_worktrees.unwrap_or(false) {
+            let repo = PathBuf::from(&pr.path);
+            let pool = crate::worktree::pool_dir(&repo);
+            let mut doomed: Vec<PathBuf> = open.iter().map(|(_, wt)| PathBuf::from(wt)).filter(|wt| wt.starts_with(&pool)).collect();
+            doomed.sort();
+            doomed.dedup();
+            if !doomed.is_empty() {
+                let project_id = pr.id;
+                ctx.after_commit(move |engine| {
+                    for wt in &doomed {
+                        if let Err(error) = crate::worktree::remove(&repo, wt, true) {
+                            tracing::warn!(worktree = %wt.display(), %error, "removing a removed project's worktree");
+                        }
+                    }
+                    engine.emit_system("worktree.changed", json!({ "project_id": project_id }));
+                });
+            }
         }
         for run in &live_runs {
             ctx.invoke_registered("device.run.stop", json!({ "run_id": run }))?;
