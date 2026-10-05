@@ -352,8 +352,9 @@ impl Ui {
         };
         if key.parent().is_none() {
             pane.actions.append(&key);
-        } else {
-            pane.actions.reorder_child_after(&key, pane.actions.last_child().as_ref());
+        } else if let Some(last) = pane.actions.last_child().filter(|last| last != key.upcast_ref::<gtk::Widget>()) {
+            // Moved within its box, never re-parented: an open popover stays open.
+            pane.actions.reorder_child_after(&key, Some(&last));
         }
     }
 
