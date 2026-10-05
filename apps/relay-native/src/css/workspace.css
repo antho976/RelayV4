@@ -1,1 +1,90 @@
 /* workspace area styles: loaded after theme.css, so rules here override it. */
+
+/* Sidebar tree. Calm by default: names and lamps only; counts, pins and menus surface under the
+   pointer or keyboard focus. Children's names align with their group's name (28px). */
+.workspace-heading { padding: 12px 8px 6px 12px; }
+.registry-filter { margin: 0 8px 6px; min-height: 26px; font-size: 12px; }
+.registry-filter image { color: @faint; }
+
+.workspace-row { min-height: 0; margin-top: 10px; padding: 0 6px 0 0; color: @secondary; font-size: 12px; font-weight: 500; }
+.workspace-row:first-child { margin-top: 2px; }
+button.workspace-toggle { min-height: 26px; min-width: 0; padding: 0 4px 0 10px; border: 0; border-radius: 0; background: transparent; color: @secondary; }
+button.workspace-toggle:hover { background: transparent; color: @ink; }
+.workspace-name { font-size: 12px; font-weight: 600; letter-spacing: 0.01em; }
+.workspace-chevron { color: @faint; }
+button.workspace-toggle:hover .workspace-chevron { color: @secondary; }
+.workspace-row.has-active .workspace-name { color: @ink; }
+.workspace-count { min-width: 8px; min-height: 16px; padding: 0 5px; border-radius: 2px; background: @wall; color: @faint; font-family: 'Fira Mono', monospace; font-size: 10.5px; }
+.workspace-tools button, .project-tools button { min-height: 22px; min-width: 22px; padding: 0; }
+.workspace-tools, .project-tools { opacity: 0; }
+.workspace-row:hover .workspace-tools, .workspace-row:focus-within .workspace-tools,
+.project-row:hover .project-tools, .project-row:focus-within .project-tools { opacity: 1; }
+.workspace-row .add-project, .workspace-row .manage, .project-row .manage { opacity: 1; }
+
+.project-row button.project { min-height: 30px; padding: 0 8px 0 14px; border: 0; border-radius: 0; background: transparent; color: @secondary; font-size: 13px; }
+.project-row:hover button.project { background: @wash; color: @ink; }
+.project-row.selected button.project, .project-row button.project.selected { min-height: 30px; padding: 0 8px 0 12px; border-left: 2px solid @ink; background: mix(@console, @ink, 0.07); color: @ink; }
+.project-row.selected:hover button.project { background: mix(@console, @ink, 0.11); }
+.project-name { font-weight: 500; }
+.project-pin-mark { color: @faint; }
+.project-count { min-width: 8px; min-height: 16px; padding: 0 5px; background: @wall; color: @secondary; border-radius: 2px; font-family: 'Fira Mono', monospace; font-size: 10.5px; }
+/* The tools cover the row's end with the row's own ground, so they never sit on the text. */
+.project-tools { margin: 0 4px 0 0; padding-left: 6px; }
+.project-row:hover .project-tools, .project-row:focus-within .project-tools { background: @wash; }
+.project-row.selected:focus-within .project-tools { background: mix(@console, @ink, 0.07); }
+.project-row.selected:hover .project-tools { background: mix(@console, @ink, 0.11); }
+
+button.registry-more { min-height: 24px; padding: 0 8px 0 28px; border: 0; border-radius: 0; background: transparent; color: @faint; font-size: 12px; font-weight: 500; }
+button.registry-more:hover { background: transparent; color: @ink; }
+.registry-empty { padding: 8px 12px 8px 28px; color: @faint; font-size: 12px; }
+
+/* Row menu. */
+.registry-menu > contents { padding: 6px; border: 1px solid @strong; background: @console; }
+.registry-menu .title { padding: 6px 8px 0; font-size: 13px; }
+.registry-menu-path { padding: 2px 8px 2px; color: @faint; font-family: 'Fira Mono', monospace; font-size: 11px; }
+.registry-menu separator { margin: 6px 0; min-height: 1px; background: @edge; }
+button.registry-action { min-height: 30px; padding: 0 8px; border: 0; border-radius: 2px; background: transparent; color: @ink; }
+button.registry-action image { color: @secondary; }
+button.registry-action:hover { background: @wash; }
+button.registry-action.danger, button.registry-action.danger image { color: @held; }
+button.registry-action.danger:hover { background: alpha(@held, 0.12); }
+
+/* Destructive key: outlined in attention red, filled only under the pointer. */
+.registry-editor button.danger, .registry-confirm button.danger { background: transparent; border-color: alpha(@held, 0.6); color: @held; font-weight: 600; }
+.registry-editor button.danger:hover, .registry-confirm button.danger:hover { background: @held; border-color: @held; color: @wall; }
+.registry-confirm button.danger { min-height: 30px; padding: 0 14px; }
+.registry-confirm button.quiet { min-height: 30px; }
+
+/* Project and workspace editor. */
+.registry-editor-head { padding: 2px 2px 2px; }
+.registry-editor-name { font-size: 15px; font-weight: 600; color: @ink; }
+.registry-path { color: @secondary; font-family: 'Fira Mono', monospace; font-size: 11px; }
+.registry-meta { color: @faint; font-size: 12px; }
+.registry-section { padding: 14px 16px 16px; border: 1px solid @edge; background: @slab; }
+.registry-section .section-label { padding: 0 0 2px; color: @faint; }
+.registry-field { margin-top: 2px; }
+.registry-field-label { color: @ink; font-size: 13px; font-weight: 500; }
+.registry-help { color: @secondary; font-size: 12px; }
+.registry-field-error { color: @held; font-size: 12px; }
+.registry-editor entry.invalid { border-color: @held; }
+.registry-editor entry.registry-mono { font-family: 'Fira Mono', monospace; font-size: 12px; }
+.registry-switch-row { padding-top: 6px; }
+.registry-editor switch { min-width: 34px; min-height: 18px; border: 1px solid @strong; border-radius: 2px; background: @screen; box-shadow: none; }
+.registry-editor switch:checked { border-color: @ink; background: @ink; }
+.registry-editor switch slider { min-width: 14px; min-height: 14px; margin: 1px; border: 0; border-radius: 1px; background: @secondary; box-shadow: none; }
+.registry-editor switch:checked slider { background: @wall; }
+.registry-editor-actions { padding: 0 0 2px; }
+.registry-editor-actions button { min-height: 30px; }
+.registry-status { color: @faint; font-size: 12px; }
+.registry-status.registry-status-warn { color: @waiting; }
+.registry-section.registry-danger { border-color: alpha(@held, 0.35); background: transparent; }
+.registry-danger .section-label { color: alpha(@held, 0.85); }
+
+/* One-step removal confirmation. */
+.registry-confirm .panel-body { padding: 18px 20px; }
+.registry-confirm-title { font-size: 15px; font-weight: 600; color: @ink; }
+.registry-confirm .registry-help { font-size: 13px; }
+.registry-confirm-agents { color: @faint; font-family: 'Fira Mono', monospace; font-size: 11px; }
+.registry-confirm-option { color: @secondary; font-size: 12px; }
+.registry-error { color: @held; font-size: 12px; }
+.registry-confirm-actions { margin-top: 4px; }
