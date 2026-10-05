@@ -360,15 +360,8 @@ fn dashboard(ui: &Rc<Ui>, page: &gtk::Box, data: &Value) {
         let icon = crate::icons::image("shield", 14);
         icon.add_css_class("dashboard-signal");
         row.append(&icon);
-        row.append(&dashboard_copy(
-            "Guardrail decision",
-            &format!(
-                "{} · {} · {}",
-                text(&hold, "policy"),
-                text(&hold, "op"),
-                text(&hold, "session")
-            ),
-        ));
+        let (title, summary) = crate::pages::hold_summary(&hold);
+        row.append(&dashboard_copy(&title, &summary));
         row.append(&crate::icons::image("chevron-right", 13));
         key.set_child(Some(&row));
         let weak = Rc::downgrade(ui);

@@ -5,6 +5,8 @@ use serde_json::{json, Value};
 use std::cell::RefCell;
 use std::rc::Rc;
 
+#[path = "guardrail_pages.rs"]
+mod guardrail_pages;
 #[path = "note_pages.rs"]
 mod note_pages;
 #[path = "notes_window.rs"]
@@ -13,6 +15,9 @@ mod notes_window;
 mod task_pages;
 pub use notes_window::{refresh_notes, show_notes, NotesWindow};
 pub use task_pages::Draft;
+pub use guardrail_pages::{guardrail_event, hold_summary, restore_prompts, settings_editor as guardrail_settings};
+#[allow(unused_imports)] // entry points for the workspace and project menus
+pub use guardrail_pages::{open_project_guardrails, open_workspace_guardrails};
 pub fn verify_note_tools() {
     note_pages::verify_tools();
 }
@@ -103,7 +108,7 @@ pub async fn refresh(ui: &Rc<Ui>, name: &str, project: i64) {
             "notes" => note_composer(ui, page, project),
             "modules" => note_pages::module_composer(ui, page, project),
             _ => page.append(&paragraph(
-                "Decide which held actions may proceed. Refused actions cannot be approved here.",
+                "Answer agents that need an exception, decide which held actions may proceed, and see the exceptions still in force.",
             )),
         }
         let body = gtk::Box::new(gtk::Orientation::Vertical, 8);
@@ -116,7 +121,7 @@ pub async fn refresh(ui: &Rc<Ui>, name: &str, project: i64) {
         body.append(&paragraph(match name {
             "board" => "No tasks yet. Add a task above to assign work.",
             "mailbox" => "No messages in this project.",
-            "guardrails" => "No actions are waiting for approval.",
+            "guardrails" => "Nothing is waiting for you: no exception requests and no held actions.",
             _ => "No project notes yet.",
         }));
     }
@@ -145,8 +150,9 @@ pub async fn refresh(ui: &Rc<Ui>, name: &str, project: i64) {
             }
         }
         "guardrails" => {
-            for hold in data {
-                hold_row(ui, &body, hold);
+            guardrail_pages::page(ui, &body, project, data).await;
+            if ui.project.get() != project || *ui.page.borrow() != name {
+                return;
             }
             if let Ok(overlaps) = ui.call("overlap.list", json!({"project_id":project})).await {
                 if ui.project.get() != project || *ui.page.borrow() != name {
@@ -1266,94 +1272,6 @@ fn mail_composer(ui: &Rc<Ui>, page: &gtk::Box, project: i64) {
             b.set_sensitive(true);
         });
     });
-}
-fn hold_row(ui: &Rc<Ui>, body: &gtk::Box, hold: Value) {
-    let row = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    row.add_css_class("record");
-    row.append(&label(
-        &format!("{} · {}", text(&hold, "session"), text(&hold, "policy")),
-        "title",
-    ));
-    row.append(&paragraph(&format!(
-        "{}\n{}",
-        text(&hold, "op"),
-        hold["details"]
-    )));
-    let inspect = button("Review exact action", "quiet");
-    row.append(&inspect);
-    let exact = paragraph("");
-    row.append(&exact);
-    let keys = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    row.append(&keys);
-    let allow = Rc::new(RefCell::new(None::<gtk::Button>));
-    for (caption, op) in [
-        ("Allow once", "guardrail.confirm"),
-        ("Reject", "guardrail.reject"),
-    ] {
-        let b = button(
-            caption,
-            if op.ends_with("confirm") {
-                "primary"
-            } else {
-                "quiet"
-            },
-        );
-        keys.append(&b);
-        let weak = Rc::downgrade(ui);
-        let id = hold["id"].clone();
-        if op.ends_with("confirm") {
-            b.set_sensitive(false);
-            *allow.borrow_mut() = Some(b.clone());
-        }
-        b.connect_clicked(move |b| {
-            let Some(ui) = weak.upgrade() else {
-                return;
-            };
-            b.set_sensitive(false);
-            let b = b.clone();
-            let id = id.clone();
-            glib::spawn_future_local(async move {
-                match ui.call(op, json!({"hold_id":id})).await {
-                    Ok(v) => {
-                        if v.get("outcome").is_some() && v["outcome"]["ok"] == false {
-                            ui.show_error(&format!("Action failed: {}", v["outcome"]["error"]));
-                        }
-                        ui.refresh_page();
-                    }
-                    Err(e) => ui.show_error(&e.to_string()),
-                }
-                b.set_sensitive(true);
-            });
-        });
-    }
-    let weak = Rc::downgrade(ui);
-    let id = hold["id"].clone();
-    inspect.connect_clicked(move |b| {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        let exact = exact.clone();
-        let id = id.clone();
-        let allow = allow.clone();
-        b.set_sensitive(false);
-        let b = b.clone();
-        glib::spawn_future_local(async move {
-            match ui.call("guardrail.hold.get", json!({"hold_id":id})).await {
-                Ok(v) => {
-                    exact
-                        .set_text(&serde_json::to_string_pretty(&v["request"]).unwrap_or_default());
-                    if let Some(allow) = allow.borrow().as_ref() {
-                        allow.set_sensitive(true);
-                    }
-                }
-                Err(e) => ui.show_error(&format!(
-                    "Cannot inspect this hold: {e}. Use the matching rebuilt engine."
-                )),
-            }
-            b.set_sensitive(true);
-        });
-    });
-    body.append(&row);
 }
 fn note_composer(ui: &Rc<Ui>, page: &gtk::Box, project: i64) {
     let title = gtk::Entry::builder().placeholder_text("Note title").build();

@@ -953,6 +953,7 @@ impl Ui {
                     ui.status.set_text("");
                     ui.refresh_status();
                     ui.refresh_notification_count();
+                    crate::pages::restore_prompts(&ui);
                     ui.notice.set_visible(false);
                     ui.refresh();
                     ui.load_appearance();
@@ -991,6 +992,9 @@ impl Ui {
                                 }
                                 if e.ev.starts_with("notify.") {
                                     ui.refresh_notification_count();
+                                }
+                                if e.ev.starts_with("guardrail.") {
+                                    crate::pages::guardrail_event(&ui, &e.ev, &e.payload);
                                 }
                                 if e.ev == "provider.update.changed" {
                                     crate::provider_updates::event(&ui, &e.payload);
