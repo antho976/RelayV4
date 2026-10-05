@@ -54,6 +54,15 @@ fn is_executable(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
+/// Serializes the hook and adapter writes of launches, creates and closes. They used to be
+/// serialized by the store mutex; now that they run with it released, two of them touching one
+/// repository at once would race on `.git/config`'s lock file and on the adapters' temp files.
+/// Held for milliseconds, never across a network call.
+pub fn writes() -> std::sync::MutexGuard<'static, ()> {
+    static WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    WRITES.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Give one worktree its own hook path, preserving any pre-existing pre-commit hook by
 /// chaining it before Relay's gate.
 pub fn install_git(

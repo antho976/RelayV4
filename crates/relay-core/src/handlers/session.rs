@@ -350,6 +350,7 @@ fn read_teardown(conn: &Connection, worktree: &str) -> Result<Teardown, BusError
 /// The git and file half of a teardown. Subprocesses and file rewrites, so it runs with the
 /// store unlocked; one `git config --get` covers every name in the chain.
 fn run_teardown(repo: &Path, worktree: &Path, teardown: &Teardown) -> Result<(), BusError> {
+    let _writes = crate::hooks::writes();
     crate::hooks::uninstall_git_any(repo, worktree, &teardown.names).bus()?;
     if teardown.any_claude {
         crate::hooks::uninstall_claude(worktree).bus()?;
@@ -372,6 +373,29 @@ fn kill_detached(pty: Arc<Pty>, grace: Duration) {
     if spawned.is_err() {
         pty.kill(grace);
     }
+}
+
+/// Record that a session's child is gone after a request that stopped it failed before it
+/// could write the session's next state. On its own thread: the failing request may still be
+/// running inside a transaction that holds the store (a guardrail replay).
+fn mark_exited_detached(engine: &Engine, sid: Id, project_id: Id) {
+    let Some(engine) = engine.arc() else { return };
+    std::thread::spawn(move || {
+        let _ = engine.system_write("session.stop.failed", None, Some(project_id), Some(sid), json!({}), |tx, now| {
+            let changed = tx.execute(
+                "UPDATE sessions SET state='exited',pid=NULL,updated_at=?1
+                 WHERE id=?2 AND state IN ('spawning','running','idle','blocked')",
+                params![now, sid],
+            ).map_err(crate::engine::internal)?;
+            let mut events = Vec::new();
+            if changed > 0 {
+                if let Some(row) = sessions::by_id(tx, sid)? {
+                    events.push(("session.changed".into(), serde_json::to_value(&row.session).unwrap_or(Value::Null)));
+                }
+            }
+            Ok(((), events))
+        });
+    });
 }
 
 /// Everything a launch reads from the store, gathered in one short read. The hooks, skill
@@ -451,6 +475,9 @@ fn prepare_launch(engine: &Engine, plan: LaunchPlan) -> Result<PreparedLaunch, B
             format!("worktree {} is gone", cwd.display()),
         ));
     }
+    // Concurrent launches (two sessions of one repository, or a double-clicked Start) would
+    // otherwise race on `.git/config` and the provider adapters' temp files.
+    let writes = crate::hooks::writes();
     crate::hooks::install_git(&project_path, &cwd, &row.session.name, instance, &relay_bin).bus()?;
     if row.session.provider == Provider::Claude {
         crate::hooks::install_claude(&cwd, instance, &relay_bin).bus()?;
@@ -530,6 +557,7 @@ fn prepare_launch(engine: &Engine, plan: LaunchPlan) -> Result<PreparedLaunch, B
         }
         args.extend(["--add-dir".into(), root.display().to_string()]);
     }
+    drop(writes);
     let spec = SpawnSpec {
         cmd: cmd.display().to_string(),
         args,
@@ -856,7 +884,10 @@ pub fn register(e: &mut Engine) {
                 (wt.path, wt.branch)
             }
         };
-        crate::hooks::install_git(&repo, Path::new(&worktree_path), &prepared.name, ctx.instance(), &crate::hooks::relay_bin()).bus()?;
+        {
+            let _writes = crate::hooks::writes();
+            crate::hooks::install_git(&repo, Path::new(&worktree_path), &prepared.name, ctx.instance(), &crate::hooks::relay_bin()).bus()?;
+        }
         prepared.checkout = Some((worktree_path, branch));
         prepared.hooked = true;
         Ok(prepared)
@@ -867,6 +898,8 @@ pub fn register(e: &mut Engine) {
             // A create refused after its hook went in leaves the checkout's hook path as it found it.
             if let Some((path, _)) = checkout {
                 let repo = Path::new(&prepared.project.path);
+                // Lock order is store, then hook writes: nothing holding the second takes the first.
+                let _writes = crate::hooks::writes();
                 if let Err(error) = crate::hooks::uninstall_git(repo, Path::new(&path), &prepared.name) {
                     tracing::warn!(session = %prepared.name, %error, "restoring hooks after a refused create");
                 }
@@ -1519,22 +1552,37 @@ pub fn register(e: &mut Engine) {
             Ok((row, PathBuf::from(project.path), teardown))
         })?;
         let s = &row.session;
-        if remove {
-            // Stop writers before deleting their checkout, with a bounded grace period.
-            if let Some(pty) = ctx.engine().take_pty(s.id) {
+        let wt = Path::new(&s.worktree);
+        // Stop writers before undoing their hooks and deleting their checkout, with a bounded
+        // grace period.
+        let stopped = remove
+            .then(|| ctx.engine().take_pty(s.id))
+            .flatten()
+            .map(|pty| {
                 pty.silence_exit();
                 pty.kill(Duration::from_millis(150));
+            });
+        let cleaned = (|| {
+            if let Some(teardown) = &teardown {
+                run_teardown(&repo, wt, teardown)?;
             }
-        }
-        let wt = Path::new(&s.worktree);
-        if let Some(teardown) = &teardown {
-            run_teardown(&repo, wt, teardown)?;
-        }
-        let mut freed = 0u64;
-        if remove && wt.starts_with(worktree::pool_dir(&repo)) {
-            freed = worktree::remove(&repo, wt, p.purge_build.unwrap_or(true))
-                .map_err(|e| BusError::conflict("worktree.remove_failed", e.to_string()))?;
-        }
+            if remove && wt.starts_with(worktree::pool_dir(&repo)) {
+                return worktree::remove(&repo, wt, p.purge_build.unwrap_or(true))
+                    .map_err(|e| BusError::conflict("worktree.remove_failed", e.to_string()));
+            }
+            Ok(0u64)
+        })();
+        let freed = match cleaned {
+            Ok(freed) => freed,
+            Err(error) => {
+                // The child is gone and its exit callback was silenced: say so in the row
+                // rather than leave a live session with no process behind it.
+                if stopped.is_some() {
+                    mark_exited_detached(ctx.engine(), s.id, s.project_id);
+                }
+                return Err(error);
+            }
+        };
         // The generated hook directory outlives nothing: leaving one per dead session behind
         // makes `.relay/hooks` read like a fleet that never shut down.
         crate::hooks::remove_hook_dir(&repo, &s.name);
