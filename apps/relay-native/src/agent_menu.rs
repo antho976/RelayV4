@@ -1,0 +1,841 @@
+//! Agent pane controls: the settings popover, the phone install, and the optimistic open and
+//! close paths that make an agent appear or disappear the moment it is asked to.
+//!
+//! The wall used to wait for the engine and then re-list everything: a close answered only after
+//! the child's TERM grace, and the pane went away after four more round trips and a full wall
+//! rebuild. Now the pane leaves on the click and comes back only if the engine refuses; a launch
+//! shows its panes before the worktree exists; and `session.changed` carries the whole row, so it
+//! is applied in place instead of triggering a `session.list`.
+use super::*;
+use std::collections::HashMap;
+use std::rc::Weak;
+use std::time::Instant;
+
+#[derive(Default)]
+struct Agents {
+    /// Sessions the user closed whose close has not answered yet. Kept off the wall even if a
+    /// stale list or event still carries them.
+    closing: BTreeSet<String>,
+    /// Sessions (or launch placeholders) with a start in flight, and the step they are on.
+    launching: BTreeMap<String, String>,
+    /// One settings key per pane, kept across header rebuilds so an open popover survives the
+    /// state changes an agent produces every few seconds.
+    keys: HashMap<String, (Weak<Pane>, gtk::Button)>,
+    /// The last phone install per session: run id and what it last said.
+    phone: HashMap<String, Phone>,
+    next_placeholder: u32,
+}
+
+#[derive(Clone, Default)]
+struct Phone {
+    run: Option<i64>,
+    status: String,
+    busy: bool,
+    /// The label of the popover currently showing this session, if one is open.
+    view: Option<glib::WeakRef<gtk::Label>>,
+    stop: Option<glib::WeakRef<gtk::Button>>,
+}
+
+thread_local! {
+    static AGENTS: RefCell<Agents> = RefCell::new(Agents::default());
+}
+
+fn with<T>(f: impl FnOnce(&mut Agents) -> T) -> T {
+    AGENTS.with(|agents| f(&mut agents.borrow_mut()))
+}
+
+pub(in crate::app) fn is_closing(name: &str) -> bool {
+    with(|a| a.closing.contains(name))
+}
+
+fn launching(name: &str) -> Option<String> {
+    with(|a| a.launching.get(name).cloned())
+}
+
+/// A popover row: an icon that says what it does, a caption that says it again, a tooltip
+/// that says what happens next.
+fn row_key(icon: &str, caption: &str, tooltip: &str) -> gtk::Button {
+    let key = gtk::Button::new();
+    key.add_css_class("agent-menu-row");
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    row.append(&crate::icons::image(icon, 16));
+    let text = label(caption, "agent-menu-caption");
+    text.set_hexpand(true);
+    row.append(&text);
+    key.set_child(Some(&row));
+    key.set_tooltip_text(Some(tooltip));
+    key.update_property(&[gtk::accessible::Property::Label(caption)]);
+    key
+}
+
+fn section(title: &str) -> gtk::Label {
+    let heading = label(title, "agent-menu-section");
+    heading.set_xalign(0.0);
+    heading
+}
+
+fn bus_code(error: &Error) -> Option<&str> {
+    match error {
+        Error::Bus(error) => Some(error.code.as_str()),
+        _ => None,
+    }
+}
+
+/// `device.run` refusals in words a person can act on.
+fn phone_error(error: &Error) -> String {
+    match bus_code(error) {
+        Some("device.gradle_missing") => "No Android project in this agent's worktree: no gradlew at its root or in forge-android/, and no run command in Project settings.".into(),
+        Some("device.not_ready") | Some("device.none") => "The phone is not connected or has not authorized this computer. Reconnect it and accept the USB debugging prompt.".into(),
+        Some("device.worktree") => "This agent's worktree is missing or does not belong to the project.".into(),
+        Some("device.busy") => error.to_string(),
+        Some("device.sdk_missing") | Some("device.adb_missing") => format!("Android SDK not found: {error}"),
+        _ => error.to_string(),
+    }
+}
+
+impl Ui {
+    /// Apply a `session.changed` row in place. Returns false when the payload is not a row, so
+    /// the caller falls back to a full refresh.
+    pub(in crate::app) fn apply_session_event(self: &Rc<Self>, ev: &str, payload: &Value) -> bool {
+        if ev != "session.changed" || !payload["name"].is_string() || !payload["state"].is_string() {
+            return false;
+        }
+        let name = text(payload, "name").to_string();
+        let closed = text(payload, "state") == "closed";
+        {
+            let mut all = self.sidebar_sessions.borrow_mut();
+            match all.iter().position(|s| text(s, "name") == name) {
+                Some(i) if closed => {
+                    all.remove(i);
+                }
+                Some(i) => all[i] = payload.clone(),
+                None if !closed => all.push(payload.clone()),
+                None => {}
+            }
+        }
+        if payload["project_id"].as_i64() == Some(self.project.get()) && !is_closing(&name) {
+            let mut sessions = self.sessions.borrow_mut();
+            match sessions.iter().position(|s| text(s, "name") == name) {
+                Some(i) if closed => {
+                    sessions.remove(i);
+                }
+                Some(i) => sessions[i] = payload.clone(),
+                // A launch adopts its own new sessions into its placeholders' places; until it
+                // does, a fresh `created` row would read as an interrupted launch.
+                None if !closed && !(self.launch_busy.get() && text(payload, "state") == "created") => {
+                    sessions.push(payload.clone())
+                }
+                None => {}
+            }
+        }
+        self.render_projects();
+        self.reconcile();
+        if matches!(self.page.borrow().as_str(), "board" | "dashboard") {
+            self.refresh_page();
+        }
+        true
+    }
+
+    /// Put one session row on the wall (or update it) without a round trip.
+    pub(in crate::app) fn upsert_session(self: &Rc<Self>, session: &Value) {
+        if !session["name"].is_string() {
+            return;
+        }
+        self.apply_session_event("session.changed", session);
+    }
+
+    /// Close an agent: its pane leaves now, the engine is told after, and the pane comes back
+    /// only if the engine refuses.
+    pub(super) fn close_agent(self: &Rc<Self>, name: String, payload: Value) {
+        let clicked = Instant::now();
+        with(|a| a.closing.insert(name.clone()));
+        self.sessions.borrow_mut().retain(|s| text(s, "name") != name);
+        self.reconcile();
+        tracing::debug!(session = %name, elapsed_us = clicked.elapsed().as_micros() as u64, "close: pane removed");
+        let ui = self.clone();
+        glib::spawn_future_local(async move {
+            let result = ui.call("session.close", payload).await;
+            with(|a| a.closing.remove(&name));
+            tracing::debug!(session = %name, elapsed_ms = clicked.elapsed().as_millis() as u64, ok = result.is_ok(), "close: engine answered");
+            match result {
+                Ok(_) => {
+                    ui.sidebar_sessions.borrow_mut().retain(|s| text(s, "name") != name);
+                    ui.render_projects();
+                    ui.render_status_counts();
+                }
+                Err(error) => {
+                    ui.show_error(&format!("Could not close {name}: {error}"));
+                    ui.refresh();
+                }
+            }
+        });
+    }
+
+    /// Start, park, wake or resume from the pane header. Starts show their progress on the pane
+    /// at once; the returned row is applied in place.
+    pub(super) fn agent_op(self: &Rc<Self>, op: &'static str, name: &str, key: Option<&gtk::Button>) {
+        let name = name.to_string();
+        let starting = matches!(op, "session.spawn" | "session.wake" | "session.resume" | "session.clear_restorable");
+        if starting {
+            self.launch_progress(&name, "Starting the provider…");
+        }
+        if let Some(key) = key {
+            key.set_sensitive(false);
+        }
+        let key = key.cloned();
+        let ui = self.clone();
+        glib::spawn_future_local(async move {
+            let result = ui.call(op, json!({"session": name})).await;
+            if starting {
+                ui.launch_done(&name);
+            }
+            match result {
+                Ok(session) if session["name"].is_string() => ui.upsert_session(&session),
+                Ok(_) => ui.refresh(),
+                Err(error) => {
+                    ui.show_error(&error.to_string());
+                    ui.refresh();
+                }
+            }
+            if let Some(key) = key {
+                key.set_sensitive(true);
+            }
+        });
+    }
+
+    // ------------------------------------------------------------------ launch placeholders
+
+    /// Panes for agents that do not exist yet, so a launch shows up on the click rather than
+    /// after the worktree fetch and checkout.
+    pub(in crate::app) fn launch_placeholders(self: &Rc<Self>, project: i64, payloads: &[Value]) -> Vec<String> {
+        let mut names = Vec::new();
+        for payload in payloads {
+            let n = with(|a| {
+                a.next_placeholder += 1;
+                a.next_placeholder
+            });
+            let name = format!("new agent {n}");
+            with(|a| a.launching.insert(name.clone(), "Preparing worktree…".into()));
+            self.sessions.borrow_mut().push(json!({
+                "name": name, "state": "created", "project_id": project, "placeholder": true,
+                "provider": payload["provider"], "role": payload["role"].as_str().unwrap_or("builder"),
+                "branch": payload["branch"], "worktree": "",
+            }));
+            names.push(name);
+        }
+        self.reconcile();
+        names
+    }
+
+    /// Say which step a launching pane is on.
+    pub(in crate::app) fn launch_progress(self: &Rc<Self>, name: &str, step: &str) {
+        with(|a| a.launching.insert(name.to_string(), step.to_string()));
+        if let Some(pane) = self.panes.borrow().get(name) {
+            pane.show_progress(step);
+            clear(&pane.slate_actions);
+            let spinner = gtk::Spinner::new();
+            spinner.set_spinning(true);
+            pane.slate_actions.append(&spinner);
+        }
+    }
+
+    /// Swap a placeholder for the session the engine created, in the same place on the wall.
+    pub(in crate::app) fn launch_adopt(self: &Rc<Self>, placeholder: &str, session: &Value, step: &str) {
+        let name = text(session, "name").to_string();
+        with(|a| {
+            a.launching.remove(placeholder);
+            a.launching.insert(name.clone(), step.to_string());
+        });
+        {
+            let mut sessions = self.sessions.borrow_mut();
+            sessions.retain(|s| text(s, "name") != placeholder && text(s, "name") != name);
+            sessions.push(session.clone());
+        }
+        {
+            let mut ordered = self.ordered.borrow_mut();
+            ordered.retain(|n| *n != name);
+            if let Some(slot) = ordered.iter_mut().find(|n| n.as_str() == placeholder) {
+                *slot = name.clone();
+            }
+        }
+        if !self.sidebar_sessions.borrow().iter().any(|s| text(s, "name") == name) {
+            self.sidebar_sessions.borrow_mut().push(session.clone());
+        }
+        self.reconcile();
+        self.launch_progress(&name, step);
+    }
+
+    /// The start answered (either way): the pane renders from its row again.
+    pub(in crate::app) fn launch_done(self: &Rc<Self>, name: &str) {
+        with(|a| a.launching.remove(name));
+        self.rendered_sessions.borrow_mut().remove(name);
+    }
+
+    /// A launch is over, finished or stopped short: placeholders leave, and sessions that exist
+    /// keep their panes and render from their rows again.
+    pub(in crate::app) fn launch_abort(self: &Rc<Self>, names: &[String]) {
+        for name in names {
+            with(|a| a.launching.remove(name));
+            self.rendered_sessions.borrow_mut().remove(name);
+        }
+        self.sessions
+            .borrow_mut()
+            .retain(|s| !(s["placeholder"] == true && names.iter().any(|p| p == text(s, "name"))));
+        self.reconcile();
+    }
+
+    // ------------------------------------------------------------------ pane header
+
+    /// Remove the header keys `session_actions` rebuilds, keeping this pane's settings key (and
+    /// any popover open on it) in place.
+    pub(super) fn clear_agent_actions(&self, pane: &Rc<Pane>) {
+        let keep = with(|a| a.keys.get(pane.name()).filter(|(owner, _)| owner.as_ptr() == Rc::as_ptr(pane)).map(|(_, key)| key.clone()));
+        let mut child = pane.actions.first_child();
+        while let Some(widget) = child {
+            child = widget.next_sibling();
+            if keep.as_ref().map(|key| key.upcast_ref::<gtk::Widget>()) != Some(&widget) {
+                pane.actions.remove(&widget);
+            }
+        }
+    }
+
+    /// While a pane is a launch in flight it shows its progress and nothing else. True when
+    /// `session_actions` has nothing more to build.
+    pub(super) fn agent_overrides(self: &Rc<Self>, _pane: &Rc<Pane>, session: &Value) -> bool {
+        let name = text(session, "name");
+        let placeholder = session["placeholder"] == true;
+        if text(session, "state") != "created" && !placeholder {
+            return false;
+        }
+        let Some(step) = launching(name) else {
+            return placeholder;
+        };
+        self.launch_progress(name, &step);
+        true
+    }
+
+    /// Focus and Agent settings, last in the header.
+    pub(super) fn agent_controls(self: &Rc<Self>, pane: &Rc<Pane>, session: &Value) {
+        let name = text(session, "name").to_string();
+        let zoom = icon_button("focus", "Focus this agent (show it alone)");
+        zoom.set_child(Some(&crate::icons::image("focus", 13)));
+        let weak = Rc::downgrade(self);
+        let n = name.clone();
+        zoom.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                let already = *ui.mode.borrow() == "focus" && ui.focused.borrow().as_ref() == Some(&n);
+                *ui.focused.borrow_mut() = Some(n.clone());
+                ui.set_mode(if already { "grid" } else { "focus" });
+            }
+        });
+        pane.actions.append(&zoom);
+        let existing = with(|a| {
+            a.keys.retain(|_, (owner, _)| owner.strong_count() > 0);
+            a.keys.get(&name).filter(|(owner, _)| owner.as_ptr() == Rc::as_ptr(pane)).map(|(_, key)| key.clone())
+        });
+        let key = match existing {
+            Some(key) => key,
+            None => {
+                let key = icon_button("sliders", "Agent settings");
+                key.set_child(Some(&crate::icons::image("sliders", 13)));
+                key.add_css_class("agent-settings-key");
+                let weak = Rc::downgrade(self);
+                let n = name.clone();
+                key.connect_clicked(move |key| {
+                    if let Some(ui) = weak.upgrade() {
+                        ui.agent_settings(key, &n);
+                    }
+                });
+                with(|a| a.keys.insert(name.clone(), (Rc::downgrade(pane), key.clone())));
+                key
+            }
+        };
+        if key.parent().is_none() {
+            pane.actions.append(&key);
+        } else {
+            pane.actions.reorder_child_after(&key, pane.actions.last_child().as_ref());
+        }
+    }
+
+    // ------------------------------------------------------------------ settings popover
+
+    fn agent_settings(self: &Rc<Self>, key: &gtk::Button, name: &str) {
+        let Some(session) = self.sessions.borrow().iter().find(|s| text(s, "name") == name).cloned() else {
+            return;
+        };
+        let popover = gtk::Popover::new();
+        popover.add_css_class("agent-settings");
+        popover.set_position(gtk::PositionType::Bottom);
+        popover.set_parent(key);
+        popover.connect_closed(|popover| {
+            let popover = popover.clone();
+            glib::idle_add_local_once(move || popover.unparent());
+        });
+        let body = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        body.add_css_class("agent-menu");
+        body.set_size_request(340, -1);
+        popover.set_child(Some(&body));
+        self.agent_settings_body(&popover, &body, &session);
+        popover.popup();
+    }
+
+    fn agent_settings_body(self: &Rc<Self>, popover: &gtk::Popover, body: &gtk::Box, session: &Value) {
+        let name = text(session, "name").to_string();
+        let state = text(session, "state").to_string();
+
+        // Identity.
+        let head = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        head.add_css_class("agent-menu-head");
+        let title = label(&name, "agent-menu-title");
+        title.set_hexpand(true);
+        title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        head.append(&title);
+        let chip = label(&state.replace('_', " ").to_uppercase(), "agent-menu-state");
+        chip.add_css_class(match state.as_str() {
+            "running" | "spawning" | "idle" => "live",
+            "blocked" => "held",
+            _ => "off",
+        });
+        head.append(&chip);
+        body.append(&head);
+        body.append(&label(&format!("{} · {}", text(session, "provider"), text(session, "role")), "agent-menu-meta"));
+        for (icon, value, ellipsize) in [
+            ("branch", text(session, "branch"), gtk::pango::EllipsizeMode::Middle),
+            ("folder", text(session, "worktree"), gtk::pango::EllipsizeMode::Start),
+        ] {
+            if value.is_empty() {
+                continue;
+            }
+            let line = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            line.add_css_class("agent-menu-path");
+            line.append(&crate::icons::image(icon, 12));
+            let path = label(value, "mono");
+            path.set_selectable(true);
+            path.set_ellipsize(ellipsize);
+            path.set_hexpand(true);
+            path.set_tooltip_text(Some(value));
+            line.append(&path);
+            body.append(&line);
+        }
+
+        // Arrange.
+        body.append(&section("ARRANGE"));
+        let arrange = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        arrange.set_homogeneous(true);
+        for (icon, caption, tip, delta) in [
+            ("arrow-up", "Move earlier", "Move this agent one place earlier on the wall", -1),
+            ("arrow-down", "Move later", "Move this agent one place later on the wall", 1),
+        ] {
+            let key = row_key(icon, caption, tip);
+            let weak = Rc::downgrade(self);
+            let n = name.clone();
+            key.connect_clicked(move |_| {
+                if let Some(ui) = weak.upgrade() {
+                    let mut order = ui.ordered.borrow_mut();
+                    if let Some(i) = order.iter().position(|s| *s == n) {
+                        let next = (i as i32 + delta).clamp(0, order.len() as i32 - 1) as usize;
+                        order.swap(i, next);
+                    }
+                    drop(order);
+                    ui.layout();
+                    ui.save_layout();
+                }
+            });
+            arrange.append(&key);
+        }
+        body.append(&arrange);
+        let brief = row_key("brief", "Inspect launch brief", "Read the instructions and peer brief this agent was started with");
+        let weak = Rc::downgrade(self);
+        let n = name.clone();
+        let p = popover.clone();
+        brief.connect_clicked(move |_| {
+            let Some(ui) = weak.upgrade() else { return };
+            p.popdown();
+            let n = n.clone();
+            glib::spawn_future_local(async move {
+                match ui.call("session.brief", json!({"session": n})).await {
+                    Ok(v) => {
+                        let Some((window, sheet)) = ui.sheet("Launch brief", 760, 640) else { return };
+                        let view = gtk::TextView::new();
+                        view.set_editable(false);
+                        view.set_monospace(true);
+                        view.set_wrap_mode(gtk::WrapMode::WordChar);
+                        view.buffer().set_text(text(&v, "text"));
+                        sheet.append(&scrolled(&view));
+                        window.present();
+                    }
+                    Err(e) => ui.show_error(&e.to_string()),
+                }
+            });
+        });
+        body.append(&brief);
+
+        // Launch options.
+        body.append(&section("LAUNCH OPTIONS"));
+        let spawned = !session["spawned_at"].is_null();
+        let options = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let model = gtk::Entry::builder().text(text(session, "model")).placeholder_text("Provider default").hexpand(true).build();
+        let effort = gtk::Entry::builder().text(text(session, "effort")).placeholder_text("Default").width_chars(8).build();
+        for (caption, entry) in [("Model", &model), ("Effort", &effort)] {
+            let column = gtk::Box::new(gtk::Orientation::Vertical, 3);
+            column.append(&label(caption, "agent-menu-field"));
+            entry.set_sensitive(!spawned);
+            if spawned {
+                entry.set_tooltip_text(Some("Fixed once the agent has started"));
+            }
+            column.append(entry);
+            column.set_hexpand(caption == "Model");
+            options.append(&column);
+        }
+        body.append(&options);
+        if spawned {
+            body.append(&label("Model and effort are fixed once the agent has started.", "agent-menu-hint"));
+        }
+        let mut switches = Vec::new();
+        for (caption, hint, key) in [
+            ("Agent bus writes", "Let this agent change tasks, notes and settings through Relay", "bus_writes"),
+            ("UI control", "Let this agent drive the Relay window", "allow_ui"),
+        ] {
+            let line = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+            line.add_css_class("agent-menu-switch");
+            let words = gtk::Box::new(gtk::Orientation::Vertical, 1);
+            words.set_hexpand(true);
+            words.append(&label(caption, "agent-menu-caption"));
+            let sub = label(hint, "agent-menu-hint");
+            sub.set_wrap(true);
+            sub.set_max_width_chars(34);
+            words.append(&sub);
+            line.append(&words);
+            let switch = gtk::Switch::new();
+            switch.set_valign(gtk::Align::Center);
+            switch.set_active(session[key] == true);
+            switch.update_property(&[gtk::accessible::Property::Label(caption)]);
+            line.append(&switch);
+            body.append(&line);
+            switches.push(switch);
+        }
+        let save = gtk::Button::with_label("Save changes");
+        save.add_css_class("primary");
+        save.add_css_class("agent-menu-save");
+        save.set_sensitive(false);
+        let original = (text(session, "model").to_string(), text(session, "effort").to_string(), session["bus_writes"] == true, session["allow_ui"] == true);
+        let dirty: Rc<dyn Fn()> = Rc::new({
+            let (model, effort, writes, control, save) = (model.downgrade(), effort.downgrade(), switches[0].downgrade(), switches[1].downgrade(), save.downgrade());
+            move || {
+                let (Some(model), Some(effort), Some(writes), Some(control), Some(save)) = (model.upgrade(), effort.upgrade(), writes.upgrade(), control.upgrade(), save.upgrade()) else { return };
+                save.set_sensitive((model.text().to_string(), effort.text().to_string(), writes.is_active(), control.is_active()) != original);
+            }
+        });
+        for entry in [&model, &effort] {
+            let dirty = dirty.clone();
+            entry.connect_changed(move |_| dirty());
+        }
+        for switch in &switches {
+            let dirty = dirty.clone();
+            switch.connect_active_notify(move |_| dirty());
+        }
+        let weak = Rc::downgrade(self);
+        let n = name.clone();
+        let (writes, control) = (switches[0].clone(), switches[1].clone());
+        let p = popover.clone();
+        save.connect_clicked(move |key| {
+            let Some(ui) = weak.upgrade() else { return };
+            let mut payload = json!({"session": n, "bus_writes": writes.is_active(), "allow_ui": control.is_active()});
+            if !spawned {
+                payload["model"] = model.text().as_str().into();
+                payload["effort"] = effort.text().as_str().into();
+            }
+            key.set_sensitive(false);
+            let key = key.clone();
+            let p = p.clone();
+            glib::spawn_future_local(async move {
+                match ui.call("session.update", payload).await {
+                    Ok(session) => {
+                        ui.upsert_session(&session);
+                        p.popdown();
+                    }
+                    Err(e) => {
+                        ui.show_error(&e.to_string());
+                        key.set_sensitive(true);
+                    }
+                }
+            });
+        });
+        body.append(&save);
+
+        // Phone.
+        body.append(&section("PHONE"));
+        self.phone_section(body, session);
+
+        // Session.
+        body.append(&section("SESSION"));
+        if state == "restorable" {
+            let fresh = row_key("refresh", "Start fresh", "Start a new provider conversation in this same session and worktree; the saved context is cleared");
+            let confirm = gtk::Revealer::new();
+            let weak = Rc::downgrade(self);
+            let n = name.clone();
+            let p = popover.clone();
+            confirm_strip(&confirm, "Clear the saved provider conversation and start fresh here?", "Start fresh", None, move |_| {
+                p.popdown();
+                if let Some(ui) = weak.upgrade() {
+                    ui.agent_op("session.clear_restorable", &n, None);
+                }
+            });
+            let c = confirm.clone();
+            fresh.connect_clicked(move |_| c.set_reveal_child(true));
+            body.append(&fresh);
+            body.append(&confirm);
+        }
+        let close = row_key("power", "Close session…", "Stop the agent and take it off the wall; the worktree and branch are kept unless you choose otherwise");
+        close.add_css_class("agent-menu-danger");
+        let confirm = gtk::Revealer::new();
+        let options = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        let remove = gtk::CheckButton::with_label("Also remove the worktree");
+        let purge = gtk::CheckButton::with_label("Purge build output");
+        purge.set_sensitive(false);
+        let p = purge.clone();
+        remove.connect_toggled(move |remove| {
+            p.set_sensitive(remove.is_active());
+            if !remove.is_active() {
+                p.set_active(false);
+            }
+        });
+        options.append(&remove);
+        options.append(&purge);
+        let weak = Rc::downgrade(self);
+        let n = name.clone();
+        let p = popover.clone();
+        confirm_strip(&confirm, "Stop this agent and close its pane? The branch is kept.", "Close", Some(&options), move |_| {
+            p.popdown();
+            if let Some(ui) = weak.upgrade() {
+                ui.close_agent(n.clone(), json!({"session": n, "remove_worktree": remove.is_active(), "purge_build": purge.is_active()}));
+            }
+        });
+        let c = confirm.clone();
+        close.connect_clicked(move |_| c.set_reveal_child(!c.reveals_child()));
+        body.append(&close);
+        body.append(&confirm);
+    }
+
+    // ------------------------------------------------------------------ build & install on phone
+
+    fn phone_section(self: &Rc<Self>, body: &gtk::Box, session: &Value) {
+        let name = text(session, "name").to_string();
+        let install = row_key("phone-install", "Build & install on phone", "Build this agent's branch with Gradle, install it on the connected phone over ADB and launch it");
+        body.append(&install);
+        let devices = gtk::DropDown::from_strings(&[]);
+        devices.set_visible(false);
+        devices.add_css_class("agent-menu-devices");
+        body.append(&devices);
+        let line = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        line.add_css_class("agent-menu-phone");
+        let status = label("", "agent-menu-hint");
+        status.set_wrap(true);
+        status.set_max_width_chars(36);
+        status.set_hexpand(true);
+        status.set_selectable(true);
+        line.append(&status);
+        let stop = gtk::Button::with_label("Stop");
+        stop.add_css_class("quiet");
+        stop.set_valign(gtk::Align::Start);
+        line.append(&stop);
+        body.append(&line);
+        let phone = with(|a| {
+            let phone = a.phone.entry(name.clone()).or_default();
+            phone.view = Some(status.downgrade());
+            phone.stop = Some(stop.downgrade());
+            phone.clone()
+        });
+        status.set_text(&phone.status);
+        status.set_visible(!phone.status.is_empty());
+        stop.set_visible(phone.busy && phone.run.is_some());
+        install.set_sensitive(!phone.busy);
+        let weak = Rc::downgrade(self);
+        let n = name.clone();
+        stop.connect_clicked(move |key| {
+            let Some(ui) = weak.upgrade() else { return };
+            let Some(run) = with(|a| a.phone.get(&n).and_then(|p| p.run)) else { return };
+            key.set_sensitive(false);
+            let key = key.clone();
+            glib::spawn_future_local(async move {
+                if let Err(e) = ui.call("device.run.stop", json!({"run_id": run})).await {
+                    ui.show_error(&e.to_string());
+                }
+                key.set_sensitive(true);
+            });
+        });
+        let weak = Rc::downgrade(self);
+        let n = name.clone();
+        let serials: Rc<RefCell<Vec<(String, String)>>> = Rc::new(RefCell::new(Vec::new()));
+        let (project, worktree) = (session["project_id"].as_i64().unwrap_or(0), text(session, "worktree").to_string());
+        install.connect_clicked(move |key| {
+            let Some(ui) = weak.upgrade() else { return };
+            key.set_sensitive(false);
+            let (key, devices, serials, n, worktree) = (key.clone(), devices.clone(), serials.clone(), n.clone(), worktree.clone());
+            glib::spawn_future_local(async move {
+                let chosen = if devices.is_visible() {
+                    serials.borrow().get(devices.selected() as usize).cloned()
+                } else {
+                    None
+                };
+                let device = match chosen {
+                    Some(device) => device,
+                    None => {
+                        phone_status(&n, "Looking for a phone…", true, None);
+                        let listed = match ui.call("device.list", json!({})).await {
+                            Ok(v) => rows(&v, "devices"),
+                            Err(e) => {
+                                phone_status(&n, &format!("Could not list devices: {e}"), false, None);
+                                key.set_sensitive(true);
+                                return;
+                            }
+                        };
+                        let ready: Vec<(String, String)> = listed.iter().filter(|d| text(d, "state") == "device")
+                            .map(|d| (text(d, "serial").to_string(), text(d, "model").to_string())).collect();
+                        if ready.is_empty() {
+                            let message = if listed.iter().any(|d| text(d, "state") == "unauthorized") {
+                                "A phone is connected but has not authorized this computer. Accept the USB debugging prompt on the phone, then try again."
+                            } else if !listed.is_empty() {
+                                "The connected phone is not ready (offline). Reconnect the cable, then try again."
+                            } else {
+                                "No phone found. Connect one with USB debugging enabled, then try again."
+                            };
+                            phone_status(&n, message, false, None);
+                            key.set_sensitive(true);
+                            return;
+                        }
+                        if ready.len() > 1 {
+                            let model = gtk::StringList::new(&ready.iter().map(|(serial, model)| format!("{model} · {serial}")).collect::<Vec<_>>().iter().map(String::as_str).collect::<Vec<_>>());
+                            devices.set_model(Some(&model));
+                            devices.set_visible(true);
+                            *serials.borrow_mut() = ready;
+                            phone_status(&n, "Several phones are connected. Choose one, then press Build & install again.", false, None);
+                            key.set_sensitive(true);
+                            return;
+                        }
+                        ready[0].clone()
+                    }
+                };
+                // The key stays off while the run lives: Stop ends it, then it can run again.
+                ui.install_on_phone(n, project, worktree, device).await;
+                key.set_sensitive(true);
+            });
+        });
+    }
+
+    /// `device.run` against this agent's worktree, on a connection of its own so Gradle and
+    /// logcat output never queue behind the shell's control traffic.
+    async fn install_on_phone(self: &Rc<Self>, name: String, project: i64, worktree: String, (serial, model): (String, String)) {
+        phone_status(&name, &format!("Building {name}'s branch for {model}…"), true, None);
+        let (client, notices) = match Client::connect(&self.rt, self.path.clone()).await {
+            Ok(connected) => connected,
+            Err(e) => {
+                phone_status(&name, &e.to_string(), false, None);
+                return;
+            }
+        };
+        if let Err(e) = client.request(&self.rt, "bus.subscribe", json!({"events": ["run.changed"]})).await {
+            phone_status(&name, &e.to_string(), false, None);
+            return;
+        }
+        let run = match client.request(&self.rt, "device.run", json!({"project_id": project, "device": serial, "worktree": worktree})).await {
+            Ok(run) => run["id"].as_i64(),
+            Err(e) => {
+                phone_status(&name, &phone_error(&e), false, None);
+                return;
+            }
+        };
+        phone_status(&name, &format!("Building for {model}…"), true, run);
+        self.refresh_status();
+        let mut last = String::new();
+        let mut installed = false;
+        while let Ok(notice) = notices.recv().await {
+            match notice {
+                Notice::Frame(frame) if frame.stream == "logcat" => {
+                    let line = frame.data.as_str().unwrap_or("").trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    last = line.chars().take(220).collect();
+                    if !installed {
+                        phone_status(&name, &format!("Building for {model} · {last}"), true, run);
+                    }
+                }
+                Notice::Event(event) if event.ev == "run.changed" && event.payload["id"].as_i64() == run && run.is_some() => {
+                    match text(&event.payload, "state") {
+                        "running" => {
+                            installed = true;
+                            phone_status(&name, &format!("Installed and launched on {model}. Logcat is attached; Stop ends it."), true, run);
+                            self.show_error(&format!("{name}: installed and launched on {model}"));
+                        }
+                        "failed" => {
+                            let detail = if last.is_empty() { String::from("see Devices for the full log") } else { last.clone() };
+                            phone_status(&name, &format!("Build or install failed: {detail}"), false, run);
+                            self.show_error(&format!("{name}: phone install failed"));
+                            break;
+                        }
+                        "stopped" | "finished" | "done" => {
+                            phone_status(&name, if installed { "Stopped. The app stays installed." } else { "Stopped before the install finished." }, false, run);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                Notice::Disconnected(e) => {
+                    phone_status(&name, &e.to_string(), false, run);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        drop(client);
+    }
+}
+
+/// Record and show where a phone install is.
+fn phone_status(name: &str, status: &str, busy: bool, run: Option<i64>) {
+    let phone = with(|a| {
+        let phone = a.phone.entry(name.to_string()).or_default();
+        phone.status = status.to_string();
+        phone.busy = busy;
+        if run.is_some() {
+            phone.run = run;
+        }
+        phone.clone()
+    });
+    if let Some(view) = phone.view.as_ref().and_then(|view| view.upgrade()) {
+        view.set_text(status);
+        view.set_visible(!status.is_empty());
+    }
+    if let Some(stop) = phone.stop.as_ref().and_then(|stop| stop.upgrade()) {
+        stop.set_visible(busy && phone.run.is_some());
+    }
+}
+
+/// An inline confirmation: a sentence, optional extra choices, and Cancel / the action.
+fn confirm_strip(revealer: &gtk::Revealer, caption: &str, action: &str, extra: Option<&gtk::Box>, run: impl Fn(&gtk::Button) + 'static) {
+    revealer.set_transition_type(gtk::RevealerTransitionType::SlideDown);
+    revealer.set_transition_duration(120);
+    let strip = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    strip.add_css_class("agent-menu-confirm");
+    let words = label(caption, "agent-menu-caption");
+    words.set_wrap(true);
+    words.set_max_width_chars(36);
+    strip.append(&words);
+    if let Some(extra) = extra {
+        strip.append(extra);
+    }
+    let keys = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    keys.set_halign(gtk::Align::End);
+    let cancel = gtk::Button::with_label("Cancel");
+    cancel.add_css_class("quiet");
+    let go = gtk::Button::with_label(action);
+    go.add_css_class("agent-menu-confirm-go");
+    let r = revealer.clone();
+    cancel.connect_clicked(move |_| r.set_reveal_child(false));
+    go.connect_clicked(move |key| run(key));
+    keys.append(&cancel);
+    keys.append(&go);
+    strip.append(&keys);
+    revealer.set_child(Some(&strip));
+}

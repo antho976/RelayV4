@@ -1015,7 +1015,11 @@ impl Ui {
                                     ui.registry_dirty.set(true);
                                     ui.refresh();
                                 } else if e.ev.starts_with("session.") {
-                                    ui.refresh();
+                                    // `session.changed` carries the whole row: apply it in
+                                    // place instead of re-listing every session.
+                                    if !ui.apply_session_event(&e.ev, &e.payload) {
+                                        ui.refresh();
+                                    }
                                 } else if matches!(
                                     e.ev.as_str(),
                                     "file.changed"
@@ -1223,6 +1227,8 @@ impl Ui {
         });
     }
     fn reconcile(self: &Rc<Self>) {
+        // A pane closed optimistically stays closed while its close is in flight.
+        self.sessions.borrow_mut().retain(|s| !shell::is_closing(text(s, "name")));
         self.render_status_counts();
         let sessions = self.sessions.borrow().clone();
         self.launch_caption.set_text(if sessions.is_empty() {

@@ -1,5 +1,8 @@
 use super::*;
 use vte4::prelude::*;
+#[path = "agent_menu.rs"]
+mod agent_menu;
+pub(super) use agent_menu::is_closing;
 
 impl Ui {
     pub fn open_project(self: &Rc<Self>, project: i64, page: &str) {
@@ -473,12 +476,7 @@ impl Ui {
         });
     }
     pub(super) fn layout(self: &Rc<Self>) {
-        while let Some(w) = self.wall.first_child() {
-            self.wall.remove(&w);
-        }
-        while let Some(w) = self.wall_right.first_child() {
-            self.wall_right.remove(&w);
-        }
+        let started = std::time::Instant::now();
         let names: Vec<_> = self.ordered.borrow().iter().cloned().collect();
         if self
             .focused
@@ -497,6 +495,7 @@ impl Ui {
         clear(&self.focus_tabs);
         self.focus_tabs
             .set_visible(mode == "focus" && names.len() > 1);
+        let mut targets: Vec<(Rc<Pane>, gtk::Grid, i32, i32)> = Vec::new();
         for (i, name) in names.iter().enumerate() {
             if mode == "focus" {
                 let b = button("", "focus-tab");
@@ -535,46 +534,81 @@ impl Ui {
                 });
                 self.focus_tabs.append(&b);
             }
-            if let Some(p) = self.panes.borrow().get(name) {
-                if mode == "focus" && focus.as_ref() != Some(name) {
-                    continue;
-                }
-                if matches!(mode.as_str(), "review" | "mosaic") && names.len() > 1 {
-                    if focus.as_ref() == Some(name) {
-                        self.wall.attach(&p.root, 0, 0, 1, 1);
-                    } else {
-                        let offset = names[..i]
-                            .iter()
-                            .filter(|n| Some(*n) != focus.as_ref())
-                            .count() as i32;
-                        let columns = if mode == "mosaic" { 2 } else { 1 };
-                        self.wall_right
-                            .attach(&p.root, offset % columns, offset / columns, 1, 1);
-                    }
-                } else if mode == "grid" && self.columns.get() == 2 && names.len() > 1 {
-                    let grid = if i % 2 == 0 {
-                        &self.wall
-                    } else {
-                        &self.wall_right
-                    };
-                    grid.attach(&p.root, 0, (i / 2) as i32, 1, 1);
+            let Some(p) = self.panes.borrow().get(name).cloned() else {
+                continue;
+            };
+            if mode == "focus" && focus.as_ref() != Some(name) {
+                continue;
+            }
+            let (grid, column, row) = if matches!(mode.as_str(), "review" | "mosaic") && names.len() > 1 {
+                if focus.as_ref() == Some(name) {
+                    (&self.wall, 0, 0)
                 } else {
-                    let cols = if mode == "focus" {
-                        1
-                    } else {
-                        self.columns.get()
-                    };
-                    self.wall.attach(
-                        &p.root,
-                        i as i32 % cols,
-                        if mode == "focus" { 0 } else { i as i32 / cols },
-                        1,
-                        1,
-                    );
+                    let offset = names[..i]
+                        .iter()
+                        .filter(|n| Some(*n) != focus.as_ref())
+                        .count() as i32;
+                    let columns = if mode == "mosaic" { 2 } else { 1 };
+                    (&self.wall_right, offset % columns, offset / columns)
                 }
-                p.schedule_resize();
+            } else if mode == "grid" && self.columns.get() == 2 && names.len() > 1 {
+                let grid = if i % 2 == 0 {
+                    &self.wall
+                } else {
+                    &self.wall_right
+                };
+                (grid, 0, (i / 2) as i32)
+            } else {
+                let cols = if mode == "focus" {
+                    1
+                } else {
+                    self.columns.get()
+                };
+                (&self.wall, i as i32 % cols, if mode == "focus" { 0 } else { i as i32 / cols })
+            };
+            targets.push((p, grid.clone(), column, row));
+        }
+        // Incremental: a pane already in its grid moves in place. Re-parenting a VTE unrealizes
+        // and re-realizes it, so detaching the whole wall on every open or close redrew every
+        // terminal. Only panes that change grid, or leave the wall, are removed.
+        for grid in [&self.wall, &self.wall_right] {
+            let mut child = grid.first_child();
+            while let Some(widget) = child {
+                child = widget.next_sibling();
+                if !targets.iter().any(|(p, g, ..)| g == grid && p.root.upcast_ref::<gtk::Widget>() == &widget) {
+                    grid.remove(&widget);
+                }
             }
         }
+        let mut moved = 0;
+        for (p, grid, column, row) in targets {
+            // Sizes can change without a move (a column appears or goes); the resize check
+            // itself is a no-op when the grid did not change.
+            p.schedule_resize();
+            if p.root.parent().as_ref() == Some(grid.upcast_ref::<gtk::Widget>()) {
+                let Some(cell) = grid
+                    .layout_manager()
+                    .and_then(|manager| manager.layout_child(&p.root).downcast::<gtk::GridLayoutChild>().ok())
+                else {
+                    continue;
+                };
+                if cell.column() == column && cell.row() == row {
+                    continue;
+                }
+                cell.set_column(column);
+                cell.set_row(row);
+            } else {
+                if let Some(parent) = p.root.parent() {
+                    match parent.downcast::<gtk::Grid>() {
+                        Ok(other) => other.remove(&p.root),
+                        Err(_) => p.root.unparent(),
+                    }
+                }
+                grid.attach(&p.root, column, row, 1, 1);
+            }
+            moved += 1;
+        }
+        tracing::debug!(panes = names.len(), moved, elapsed_us = started.elapsed().as_micros() as u64, "wall layout");
         self.update_attachments();
     }
     pub(super) fn set_mode(self: &Rc<Self>, mode: &str) {
@@ -970,19 +1004,25 @@ impl Ui {
         pane.root.add_controller(drop_target);
     }
     pub(super) fn session_actions(self: &Rc<Self>, pane: &Rc<Pane>, session: &Value) {
-        clear(&pane.actions);
+        self.clear_agent_actions(pane);
         clear(&pane.slate_actions);
+        if self.agent_overrides(pane, session) {
+            if session["placeholder"] != true {
+                self.agent_controls(pane, session);
+            }
+            return;
+        }
         let state = text(session, "state");
         let name = text(session, "name");
-        let (caption, icon, op) = match state {
-            "created" => ("Start", "media-playback-start-symbolic", "session.spawn"),
-            "parked" => ("Wake", "media-playback-start-symbolic", "session.wake"),
+        let (caption, icon, op, tooltip) = match state {
+            "created" => ("Start", "media-playback-start-symbolic", "session.spawn", "Start the agent"),
+            "parked" => ("Wake", "media-playback-start-symbolic", "session.wake", "Wake: start the provider again and resume its conversation"),
             "restorable" | "exited" => {
-                ("Resume", "media-playback-start-symbolic", "session.resume")
+                ("Resume", "media-playback-start-symbolic", "session.resume", "Resume where it left off")
             }
-            _ => ("Park", "media-playback-pause-symbolic", "session.park"),
+            _ => ("Park", "media-playback-pause-symbolic", "session.park", "Park: release the process, keep the worktree and scrollback"),
         };
-        let action = icon_button(icon, caption);
+        let action = icon_button(icon, tooltip);
         action.set_child(Some(&crate::icons::image(icon, 13)));
         if matches!(state, "created" | "parked" | "restorable" | "exited") {
             let slate_action = button(
@@ -997,7 +1037,7 @@ impl Ui {
             let n = name.to_string();
             slate_action.connect_clicked(move |key| {
                 if let Some(ui) = weak.upgrade() {
-                    ui.mutate(op, json!({"session":n}), key);
+                    ui.agent_op(op, &n, Some(key));
                 }
             });
             pane.slate_actions.append(&slate_action);
@@ -1006,7 +1046,7 @@ impl Ui {
         let n = name.to_string();
         action.connect_clicked(move |b| {
             if let Some(ui) = weak.upgrade() {
-                ui.mutate(op, json!({"session":n}), b);
+                ui.agent_op(op, &n, Some(b));
             }
         });
         pane.actions.append(&action);
@@ -1029,142 +1069,7 @@ impl Ui {
                 }
             }
         }
-        let zoom = icon_button("view-fullscreen-symbolic", "Focus terminal");
-        zoom.set_child(Some(&crate::icons::image("maximize", 13)));
-        let weak = Rc::downgrade(self);
-        let n = name.to_string();
-        zoom.connect_clicked(move |_| {
-            if let Some(ui) = weak.upgrade() {
-                let already =
-                    *ui.mode.borrow() == "focus" && ui.focused.borrow().as_ref() == Some(&n);
-                *ui.focused.borrow_mut() = Some(n.clone());
-                ui.set_mode(if already { "grid" } else { "focus" });
-            }
-        });
-        pane.actions.append(&zoom);
-        let menu = icon_button("view-more-symbolic", "Session menu");
-        menu.set_child(Some(&crate::icons::image("more", 13)));
-        let weak = Rc::downgrade(self);
-        let session = session.clone();
-        menu.connect_clicked(move |_| {
-            if let Some(ui) = weak.upgrade() {
-                ui.session_menu(session.clone());
-            }
-        });
-        pane.actions.append(&menu);
-    }
-    fn session_menu(self: &Rc<Self>, session: Value) {
-        let name = text(&session, "name").to_string();
-        let Some((window, body)) = self.sheet(&name, 440, 620) else {
-            return;
-        };
-        body.append(&label(
-            &format!(
-                "{} · {} · {}",
-                text(&session, "provider"),
-                text(&session, "role"),
-                text(&session, "state")
-            ),
-            "dim",
-        ));
-        for key in ["worktree", "branch", "intent", "pair_with"] {
-            let l = label(text(&session, key), "dim");
-            l.set_wrap(true);
-            l.set_selectable(true);
-            body.append(&l);
-        }
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        body.append(&row);
-        for (caption, delta) in [("Move earlier", -1), ("Move later", 1)] {
-            let b = button(caption, "quiet");
-            row.append(&b);
-            let weak = Rc::downgrade(self);
-            let n = name.clone();
-            b.connect_clicked(move |_| {
-                if let Some(ui) = weak.upgrade() {
-                    let mut order = ui.ordered.borrow_mut();
-                    if let Some(i) = order.iter().position(|s| *s == n) {
-                        let next = (i as i32 + delta).clamp(0, order.len() as i32 - 1) as usize;
-                        order.swap(i, next);
-                    }
-                    drop(order);
-                    ui.layout();
-                    ui.save_layout();
-                }
-            });
-        }
-        let brief = button("Inspect launch brief", "quiet");
-        body.append(&brief);
-        let weak = Rc::downgrade(self);
-        let n = name.clone();
-        brief.connect_clicked(move |_| {
-            if let Some(ui) = weak.upgrade() {
-                let n = n.clone();
-                glib::spawn_future_local(async move {
-                    match ui.call("session.brief", json!({"session":n})).await {
-                        Ok(v) => {
-                            let Some((w, b)) = ui.sheet("Session brief", 760, 640) else {
-                                return;
-                            };
-                            let t = gtk::TextView::new();
-                            t.set_editable(false);
-                            t.set_monospace(true);
-                            t.buffer().set_text(text(&v, "text"));
-                            b.append(&t);
-                            w.present();
-                        }
-                        Err(e) => ui.show_error(&e.to_string()),
-                    }
-                });
-            }
-        });
-        let model = gtk::Entry::builder().text(text(&session, "model")).build();
-        field("Model", &model, &body);
-        let effort = gtk::Entry::builder().text(text(&session, "effort")).build();
-        field("Effort", &effort, &body);
-        let writes = gtk::CheckButton::with_label("Allow agent bus writes");
-        writes.set_active(session["bus_writes"] == true);
-        body.append(&writes);
-        let ui_access = gtk::CheckButton::with_label("Allow UI control");
-        ui_access.set_active(session["allow_ui"] == true);
-        body.append(&ui_access);
-        let spawned = !session["spawned_at"].is_null();
-        model.set_sensitive(!spawned);
-        effort.set_sensitive(!spawned);
-        let save = button("Save session settings", "primary");
-        body.append(&save);
-        let weak = Rc::downgrade(self);
-        let n = name.clone();
-        save.connect_clicked(move|b|{if let Some(ui)=weak.upgrade(){let mut payload=json!({"session":n,"bus_writes":writes.is_active(),"allow_ui":ui_access.is_active()});if !spawned{payload["model"]=model.text().as_str().into();payload["effort"]=effort.text().as_str().into();}ui.mutate("session.update",payload,b);}});
-        if text(&session, "state") == "restorable" {
-            let fresh = button("Start fresh without saved provider context…", "quiet");
-            body.append(&fresh);
-            let weak = Rc::downgrade(self);
-            let n = name.clone();
-            let w = window.clone();
-            fresh.connect_clicked(move |_|{if let Some(ui)=weak.upgrade(){ui.confirm_mutation("Start fresh in this same session and worktree? Saved provider conversation context will be cleared.","session.clear_restorable",json!({"session":n}),Some(w.clone()));}});
-        }
-        let cleanup = gtk::Expander::new(Some("Worktree cleanup"));
-        body.append(&cleanup);
-        let options = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        cleanup.set_child(Some(&options));
-        let remove = gtk::CheckButton::with_label("Remove worktree after closing");
-        options.append(&remove);
-        let purge = gtk::CheckButton::with_label("Purge build output");
-        options.append(&purge);
-        let key = button("Close with selected cleanup…", "quiet");
-        options.append(&key);
-        let weak = Rc::downgrade(self);
-        let n = name.clone();
-        let w = window.clone();
-        let path = text(&session, "worktree").to_string();
-        key.connect_clicked(move |_|{if let Some(ui)=weak.upgrade(){ui.confirm_mutation(&format!("Close {n} at {path}? Remove worktree: {}. Purge build output: {}. The branch is retained.",remove.is_active(),purge.is_active()),"session.close",json!({"session":n,"remove_worktree":remove.is_active(),"purge_build":purge.is_active()}),Some(w.clone()));}});
-        let close = button("Close session…", "quiet");
-        body.append(&close);
-        let weak = Rc::downgrade(self);
-        let w = window.clone();
-        close.connect_clicked(move |_|{if let Some(ui)=weak.upgrade(){ui.confirm_mutation("Close this session and stop its process? The worktree and branch will be kept.","session.close",json!({"session":name,"remove_worktree":false,"purge_build":false}),Some(w.clone()));}});
-        window.present();
+        self.agent_controls(pane, session);
     }
     pub(super) fn refresh_notification_count(self: &Rc<Self>) {
         let revision = self.notification_revision.get().wrapping_add(1);

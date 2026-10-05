@@ -1,1 +1,43 @@
 /* sessions area styles: loaded after theme.css, so rules here override it. */
+
+/* sessions-2 */
+/* Agent settings: a popover anchored to the pane's sliders key, not a side sheet. */
+popover.agent-settings > contents { background: @slab; border: 1px solid @strong; border-radius: 2px; padding: 0; box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45); }
+popover.agent-settings > arrow { background: @slab; border: 1px solid @strong; }
+.agent-menu { padding: 12px 10px 10px 10px; }
+/* The popover lives under the pane header in the widget tree; undo the header's 22px keys. */
+popover.agent-settings button { min-height: 28px; min-width: 0; padding: 0 10px; font-size: 12px; }
+.agent-menu-head { padding: 0 4px; }
+.agent-menu-title { color: @ink; font-size: 15px; font-weight: 600; }
+.agent-menu-state { font-family: 'Fira Sans Condensed'; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; color: @secondary; padding: 1px 6px; border: 1px solid @edge; border-radius: 2px; }
+.agent-menu-state.live { color: @live; border-color: alpha(@live, 0.45); }
+.agent-menu-state.held { color: @held; border-color: alpha(@held, 0.45); }
+.agent-menu-meta { color: @secondary; font-size: 12px; padding: 2px 4px 4px 4px; }
+.agent-menu-path { padding: 1px 4px; color: @faint; }
+.agent-menu-path label { color: @secondary; font-size: 11px; }
+.agent-menu-section { color: @faint; font-family: 'Fira Sans Condensed'; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; padding: 12px 4px 4px 4px; border-top: 1px solid @edge; margin-top: 8px; }
+popover.agent-settings button.agent-menu-row { background: transparent; border-color: transparent; color: @ink; min-height: 30px; padding: 0 6px; border-radius: 2px; }
+popover.agent-settings button.agent-menu-row:hover { background: @wash; }
+button.agent-menu-row:disabled { opacity: 0.45; }
+button.agent-menu-row image { color: @secondary; }
+button.agent-menu-row:hover image { color: @ink; }
+.agent-menu-caption { color: @ink; font-size: 13px; }
+.agent-menu-field { color: @secondary; font-size: 11px; padding: 0 2px; }
+.agent-menu-hint { color: @secondary; font-size: 11px; }
+.agent-menu entry { min-height: 28px; background: @screen; }
+.agent-menu entry:disabled { opacity: 0.55; }
+.agent-menu-switch { padding: 6px 4px; }
+popover.agent-settings button.agent-menu-save { margin-top: 6px; min-height: 30px; }
+.agent-menu-devices { margin: 2px 6px; }
+.agent-menu-phone { padding: 2px 6px 0 6px; }
+.agent-menu-phone label { font-family: 'Fira Mono', monospace; font-size: 11px; }
+popover.agent-settings button.agent-menu-danger:hover { background: alpha(@held, 0.14); }
+button.agent-menu-danger:hover label, button.agent-menu-danger:hover image { color: @held; }
+.agent-menu-confirm { margin: 4px 2px 2px 2px; padding: 10px; background: @console; border: 1px solid @edge; border-radius: 2px; }
+.agent-menu-confirm checkbutton label { color: @secondary; font-size: 12px; }
+popover.agent-settings button.agent-menu-confirm-go { background: @held; border-color: @held; color: white; font-weight: 600; }
+popover.agent-settings button.agent-menu-confirm-go:hover { background: shade(@held, 1.12); border-color: shade(@held, 1.12); }
+/* A pane whose provider is still starting: amber lamp, quiet slate, a spinner under the step. */
+.terminal-plate.starting .umd .lamp, .lamp.starting { background: @waiting; border-color: @waiting; }
+.terminal-plate.starting .session-state, .terminal-plate.starting .slate-state { color: @waiting; }
+.session-slate spinner { min-width: 18px; min-height: 18px; color: @secondary; }
