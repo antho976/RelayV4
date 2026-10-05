@@ -293,3 +293,34 @@ impl Panel {
         accepted
     }
 }
+
+/// A non-modal surface docked to the right edge of the main window. It sits outside the panel
+/// stack on purpose: navigation and other panels leave it alone, the wall beside it stays
+/// clickable (only the dock's own strip is covered), and its body is not scrolled — a live view
+/// sizes itself to the height it is given. The device mirror is its one user.
+pub struct Dock {
+    pub body: gtk::Box,
+    host: gtk::Overlay,
+}
+
+impl Dock {
+    pub fn new(ui: &Ui, width: i32) -> Self {
+        let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        body.add_css_class("app-panel");
+        body.add_css_class("dock-panel");
+        body.set_halign(gtk::Align::End);
+        body.set_valign(gtk::Align::Fill);
+        body.set_size_request(width, -1);
+        ui.overlay.add_overlay(&body);
+        Self {
+            body,
+            host: ui.overlay.clone(),
+        }
+    }
+
+    pub fn close(&self) {
+        if self.body.parent().is_some() {
+            self.host.remove_overlay(&self.body);
+        }
+    }
+}

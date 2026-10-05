@@ -149,6 +149,19 @@ impl Client {
             .map_err(|e| Error::Io(e.to_string()))?
     }
 
+    /// A connection whose frames may be larger than the control channel's 2 MiB: the device
+    /// mirror's video stream, where one key frame at a high capture rung arrives as a single
+    /// base64 line. Nothing else should need it.
+    pub async fn connect_with_limit(
+        rt: &Handle,
+        path: PathBuf,
+        max_line: usize,
+    ) -> Result<(Self, async_channel::Receiver<Notice>), Error> {
+        rt.spawn(async move { Self::open_with_limit(path, max_line).await })
+            .await
+            .map_err(|e| Error::Io(e.to_string()))?
+    }
+
     async fn open(path: PathBuf) -> Result<(Self, async_channel::Receiver<Notice>), Error> {
         Self::open_with_limit(path, MAX_LINE).await
     }
