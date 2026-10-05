@@ -1,14 +1,9 @@
 use super::*;
 use std::collections::VecDeque;
 
-fn percent(item: &Value) -> Option<f64> {
-    item["windows"].as_object()?.values().find_map(|v| {
-        v["used_pct"]
-            .as_f64()
-            .or(v["pct"].as_f64())
-            .map(|n| n.clamp(0., 100.))
-    })
-}
+#[path = "status_usage.rs"]
+mod usage;
+pub(super) use usage::UsageState;
 
 impl Ui {
     pub(super) fn render_status_counts(&self) {
@@ -70,58 +65,13 @@ impl Ui {
 
     pub(super) fn refresh_status(self: &Rc<Self>) {
         self.render_status_counts();
+        self.refresh_usage(false);
         let ui = self.clone();
         glib::spawn_future_local(async move {
             let generation = ui.generation.get();
-            let (usage, devices, providers) = tokio::join!(
-                ui.call("usage.get", json!({})),
-                ui.call("device.list", json!({})),
-                ui.call("provider.list", json!({}))
-            );
+            let devices = ui.call("device.list", json!({})).await;
             if generation != ui.generation.get() {
                 return;
-            }
-            if let Ok(v) = usage {
-                clear(&ui.usage_meters);
-                let mut usage = rows(&v, "usage");
-                if let Ok(providers) = providers {
-                    for provider in rows(&providers, "providers") {
-                        if provider["installed"] == true
-                            && !usage.iter().any(|u| u["provider"] == provider["provider"])
-                        {
-                            usage.push(json!({"provider":provider["provider"],"windows":{}}));
-                        }
-                    }
-                }
-                for item in usage {
-                    let provider = text(&item, "provider");
-                    let pct = percent(&item);
-                    let meter = gtk::Box::new(gtk::Orientation::Horizontal, 5);
-                    meter.append(&label(provider, "mono"));
-                    let bar = gtk::ProgressBar::new();
-                    bar.add_css_class("usage-meter");
-                    bar.set_valign(gtk::Align::Center);
-                    bar.set_fraction(pct.unwrap_or(0.) / 100.);
-                    if pct.is_some_and(|pct| pct >= 85.) {
-                        bar.add_css_class("hot");
-                    }
-                    meter.append(&bar);
-                    meter.append(&label(
-                        &pct.map(|n| format!("{n:.0}%"))
-                            .unwrap_or_else(|| "?".into()),
-                        "mono",
-                    ));
-                    meter.set_tooltip_text(Some(
-                        &pct.map(|n| format!("{provider}: {n:.0}% used"))
-                            .unwrap_or_else(|| format!("{provider}: no usage window reported")),
-                    ));
-                    ui.usage_meters.append(&meter);
-                }
-                if ui.usage_meters.first_child().is_none() {
-                    ui.usage_meters.append(&label("Usage", "mono"));
-                }
-                ui.usage_meters
-                    .append(&crate::icons::image("chevron-down", 10));
             }
             if let Ok(v) = devices {
                 let n = rows(&v, "devices").len();
