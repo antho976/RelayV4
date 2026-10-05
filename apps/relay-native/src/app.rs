@@ -78,6 +78,129 @@ pub fn field(caption: &str, widget: &impl IsA<gtk::Widget>, parent: &gtk::Box) {
     parent.append(widget);
 }
 
+#[path = "notification_center.rs"]
+mod notification_center;
+#[path = "session_context.rs"]
+mod session_context;
+
+thread_local! {
+    /// Bumped by every `Ui::show_error`, so a newer message is never cleared by an older timer.
+    static NOTICE_SERIAL: Cell<u64> = const { Cell::new(0) };
+}
+
+/// How long an armed key waits for its second click before it reverts.
+const CONFIRM_WINDOW: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// A destructive key that confirms in place instead of opening a dialog.
+///
+/// The first click arms it: the key turns red and reads `caption`. A second click runs `run`.
+/// Waiting [`CONFIRM_WINDOW`], moving focus elsewhere or pressing Escape reverts it untouched.
+/// Use a real dialog only where the action needs more input than a yes.
+pub fn confirm_inline(key: &gtk::Button, caption: &str, run: impl Fn(&gtk::Button) + 'static) {
+    confirm_inline_if(key, caption, || true, run);
+}
+
+/// [`confirm_inline`], asking only while `needed` holds (a discard with nothing to lose runs at once).
+pub fn confirm_inline_if(
+    key: &gtk::Button,
+    caption: &str,
+    needed: impl Fn() -> bool + 'static,
+    run: impl Fn(&gtk::Button) + 'static,
+) {
+    struct Armed {
+        label: Option<glib::GString>,
+        child: Option<gtk::Widget>,
+        tooltip: Option<glib::GString>,
+        width: i32,
+    }
+    let armed: Rc<RefCell<Option<Armed>>> = Rc::default();
+    let serial = Rc::new(Cell::new(0_u64));
+    let disarm: Rc<dyn Fn(&gtk::Button)> = Rc::new({
+        let armed = armed.clone();
+        move |key: &gtk::Button| {
+            let Some(previous) = armed.borrow_mut().take() else { return };
+            match &previous.label {
+                Some(text) => key.set_label(text),
+                None => key.set_child(previous.child.as_ref()),
+            }
+            key.set_tooltip_text(previous.tooltip.as_deref());
+            key.set_size_request(previous.width, -1);
+            key.remove_css_class("confirm-armed");
+            key.reset_property(gtk::AccessibleProperty::Label);
+            // An icon key names itself through its caption; a text key through its text.
+            if previous.label.is_none() {
+                if let Some(caption) = previous.tooltip.as_deref() {
+                    key.update_property(&[gtk::accessible::Property::Label(caption)]);
+                }
+            }
+        }
+    });
+    let caption = caption.to_string();
+    let reset = disarm.clone();
+    let state = armed.clone();
+    key.connect_clicked(move |key| {
+        serial.set(serial.get().wrapping_add(1));
+        if state.borrow().is_some() {
+            reset(key);
+            run(key);
+            return;
+        }
+        if !needed() {
+            run(key);
+            return;
+        }
+        let text = key.label();
+        *state.borrow_mut() = Some(Armed {
+            child: if text.is_none() { key.child() } else { None },
+            label: text,
+            tooltip: key.tooltip_text(),
+            width: key.size_request().0,
+        });
+        // Never narrower than the key it replaces, so the row around it does not jump.
+        key.set_size_request(key.width().max(key.size_request().0), -1);
+        if key.label().is_some() {
+            key.set_label(&caption);
+        } else {
+            let text = label(&caption, "confirm-caption");
+            text.set_xalign(0.5);
+            key.set_child(Some(&text));
+        }
+        key.add_css_class("confirm-armed");
+        key.set_tooltip_text(Some("Click again to confirm · Esc cancels"));
+        key.update_property(&[gtk::accessible::Property::Label(&caption)]);
+        let current = serial.get();
+        let serial = serial.clone();
+        let key = key.downgrade();
+        let reset = reset.clone();
+        glib::timeout_add_local_once(CONFIRM_WINDOW, move || {
+            if let Some(key) = key.upgrade().filter(|_| serial.get() == current) {
+                reset(&key);
+            }
+        });
+    });
+    let focus = gtk::EventControllerFocus::new();
+    let reset = disarm.clone();
+    let weak = key.downgrade();
+    focus.connect_leave(move |_| {
+        if let Some(key) = weak.upgrade() {
+            reset(&key);
+        }
+    });
+    key.add_controller(focus);
+    let keys = gtk::EventControllerKey::new();
+    let weak = key.downgrade();
+    keys.connect_key_pressed(move |_, pressed, _, _| {
+        if pressed == gtk::gdk::Key::Escape && armed.borrow().is_some() {
+            if let Some(key) = weak.upgrade() {
+                disarm(&key);
+            }
+            return glib::Propagation::Stop;
+        }
+        glib::Propagation::Proceed
+    });
+    key.add_controller(keys);
+}
+
 fn track_navigation(stack: &gtk::Stack, key: &gtk::Button, name: &'static str) {
     if name == "agents" {
         key.add_css_class("selected");
@@ -344,7 +467,28 @@ impl Ui {
         let notice = label("Connecting to the Relay engine…", "notice");
         notice.set_wrap(true);
         notice.set_selectable(true);
-        outer.append(&notice);
+        notice.set_hexpand(true);
+        // The label stays the notice's source of truth (`show_error`, smoke checks); the bar
+        // around it follows its visibility and carries the dismiss key.
+        let notice_bar = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        notice_bar.add_css_class("notice-bar");
+        notice_bar.append(&notice);
+        let notice_close = icon_button("close", "Dismiss");
+        notice_close.set_widget_name("notice-dismiss");
+        notice_close.add_css_class("notice-dismiss");
+        notice_close.set_valign(gtk::Align::Start);
+        notice_bar.append(&notice_close);
+        notice
+            .bind_property("visible", &notice_bar, "visible")
+            .sync_create()
+            .build();
+        let weak_notice = notice.downgrade();
+        notice_close.connect_clicked(move |_| {
+            if let Some(notice) = weak_notice.upgrade() {
+                notice.set_visible(false);
+            }
+        });
+        outer.append(&notice_bar);
         let body = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         body.set_vexpand(true);
         let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -660,17 +804,14 @@ impl Ui {
                 }
             });
         }
-        for (key, page) in [
-            (settings_key, "settings"),
-            (notifications_key, "notifications"),
-        ] {
-            let weak = Rc::downgrade(&ui);
-            key.connect_clicked(move |_| {
-                if let Some(ui) = weak.upgrade() {
-                    ui.toggle_page(page);
-                }
-            });
-        }
+        let weak = Rc::downgrade(&ui);
+        settings_key.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                ui.toggle_page("settings");
+            }
+        });
+        // Notifications open in place under the bell, never as a page of their own.
+        notification_center::install(&ui, &notifications_key);
         let weak = Rc::downgrade(&ui);
         skills_key.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
@@ -900,9 +1041,40 @@ impl Ui {
         });
         ui
     }
+    /// Show `message` in the banner under the title bar. It has a dismiss key and clears itself
+    /// once there was time to read it, unless the pointer rests on it. While the engine is not
+    /// connected it describes that state, so it stays until the connection comes back.
     pub fn show_error(&self, message: &str) {
         self.notice.set_text(message);
         self.notice.set_visible(true);
+        let serial = NOTICE_SERIAL.with(|s| {
+            s.set(s.get().wrapping_add(1));
+            s.get()
+        });
+        if !self.connected.get() {
+            return;
+        }
+        let mut remaining = (6 + message.chars().count() / 20).min(20);
+        let notice = self.notice.downgrade();
+        glib::timeout_add_local(std::time::Duration::from_secs(1), move || {
+            let Some(notice) = notice.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            if NOTICE_SERIAL.with(Cell::get) != serial || !notice.is_visible() {
+                return glib::ControlFlow::Break;
+            }
+            let held = notice.parent().is_some_and(|bar| {
+                bar.state_flags().contains(gtk::StateFlags::PRELIGHT)
+            }) || notice.has_focus();
+            if !held {
+                remaining = remaining.saturating_sub(1);
+            }
+            if remaining > 0 {
+                return glib::ControlFlow::Continue;
+            }
+            notice.set_visible(false);
+            glib::ControlFlow::Break
+        });
     }
     pub async fn call(&self, op: &str, payload: Value) -> Result<Value, Error> {
         let client = self.client.borrow().clone().ok_or(Error::Disconnected)?;
@@ -991,6 +1163,7 @@ impl Ui {
                                 }
                                 if e.ev.starts_with("notify.") {
                                     ui.refresh_notification_count();
+                                    notification_center::changed();
                                 }
                                 if e.ev == "provider.update.changed" {
                                     crate::provider_updates::event(&ui, &e.payload);
@@ -1086,6 +1259,13 @@ impl Ui {
     pub fn navigate(self: &Rc<Self>, page: &str) {
         if page == "notes" {
             crate::pages::show_notes(self);
+            return;
+        }
+        if page == "notifications" {
+            // A restored layout or an engine echo must not pop it open by itself.
+            if !self.applying_ui.get() {
+                notification_center::open();
+            }
             return;
         }
         let files = page == "code";

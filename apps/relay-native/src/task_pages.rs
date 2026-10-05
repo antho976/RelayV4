@@ -195,7 +195,8 @@ impl Draft {
         let d = self.clone();
         close.connect_clicked(move |_| d.close());
         let d = self.clone();
-        discard.connect_clicked(move |_| {
+        let pending = self.clone();
+        crate::app::confirm_inline_if(&discard, "Confirm discard", move || pending.dirty() || pending.unsent_message.get(), move |_| {
             if !d.busy.get() {
                 *d.base.borrow_mut() = (d.snapshot)();
                 d.close();
@@ -1142,7 +1143,9 @@ pub fn action(
     row.append(&key);
     let weak = Rc::downgrade(ui);
     let d = d.clone();
-    key.connect_clicked(move |_| {
+    // A delete confirms on the key itself, and only when it would actually go ahead.
+    let confirm = op.ends_with(".delete").then(|| d.clone());
+    let act = move |_: &gtk::Button| {
         let Some(ui) = weak.upgrade() else { return };
         if d.busy.get() {
             return;
@@ -1175,7 +1178,13 @@ pub fn action(
                 }
             }
         });
-    });
+    };
+    match confirm {
+        Some(d) => crate::app::confirm_inline_if(&key, "Confirm delete", move || !d.busy.get() && !d.dirty() && !d.unsent_message.get(), act),
+        None => {
+            key.connect_clicked(act);
+        }
+    }
 }
 
 fn draft_conflicts(base: &Value, latest: &Value, fields: &[String]) -> bool {
