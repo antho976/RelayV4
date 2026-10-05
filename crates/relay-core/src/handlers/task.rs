@@ -453,6 +453,31 @@ fn next_position(tx: &Transaction, project_id: Id, column: Column) -> Result<i64
     tx.query_row("SELECT COALESCE(MAX(position),-1)+1 FROM tasks WHERE project_id=?1 AND col=?2 AND deleted_at IS NULL", params![project_id, column_str(column)], |r| r.get(0)).bus()
 }
 
+/// Where `task` sits among the other live tasks of its column, counting from 0 in board order
+/// (`position, id`). Undo records this rather than the raw `position`, which can hold gaps
+/// and ties, so moving the task back to that index restores the exact order it left.
+fn column_index(tx: &Transaction, task: &Task) -> Result<i64, BusError> {
+    tx.prepare_cached("SELECT COUNT(*) FROM tasks WHERE project_id=?1 AND col=?2 AND deleted_at IS NULL AND id<>?3 AND (position<?4 OR (position=?4 AND id<?3))")
+        .and_then(|mut stmt| stmt.query_row(params![task.project_id, column_str(task.column), task.id, task.position], |r| r.get(0)))
+        .bus()
+}
+
+/// Opens slot `index` in `column` for `task_id`: the column's other tasks are renumbered
+/// `0..` in board order, skipping `index`, which is returned clamped to the column's length.
+fn open_slot(tx: &Transaction, project_id: Id, column: Column, task_id: Id, index: i64) -> Result<i64, BusError> {
+    let ids: Vec<Id> = tx
+        .prepare_cached("SELECT id FROM tasks WHERE project_id=?1 AND col=?2 AND deleted_at IS NULL AND id<>?3 ORDER BY position,id")
+        .and_then(|mut stmt| stmt.query_map(params![project_id, column_str(column), task_id], |r| r.get(0))?.collect())
+        .bus()?;
+    let index = index.clamp(0, ids.len() as i64);
+    let mut renumber = tx.prepare_cached("UPDATE tasks SET position=?1 WHERE id=?2 AND position<>?1").bus()?;
+    for (at, id) in ids.iter().enumerate() {
+        let at = at as i64;
+        renumber.execute(params![if at < index { at } else { at + 1 }, id]).bus()?;
+    }
+    Ok(index)
+}
+
 fn attachment_root(ctx: &Ctx) -> PathBuf {
     ctx.engine()
         .store
@@ -870,11 +895,14 @@ pub fn register(e: &mut Engine) {
         let before=get_task(ctx.tx(),p.task_id,false)?;
         if ctx.actor.is_agent() && !(before.column==Column::Active && p.column==Column::InReview) { return Err(BusError::conflict("task.column_transition","agents may only move their active task to in_review")) }
         if p.column==Column::Done { return Err(BusError::conflict("task.column_transition","move to done through task.approve")) }
-        let position=p.position.unwrap_or(next_position(ctx.tx(),before.project_id,p.column)?).max(0);
+        // An explicit position is the index the task ends at in its column; the others shift
+        // around it, so a card can be dropped between two others. Without one it goes last.
+        let index=column_index(ctx.tx(),&before)?;
+        let position=match p.position { Some(at) => open_slot(ctx.tx(),before.project_id,p.column,before.id,at)?, None => next_position(ctx.tx(),before.project_id,p.column)? };
         let moved_state = if before.column == Column::Done && p.column == Column::InReview { TaskState::AwaitingReview } else { before.state };
         ctx.tx().execute("UPDATE tasks SET col=?1,position=?2,state=?3,updated_at=?4 WHERE id=?5",params![column_str(p.column),position,state_str(moved_state),ctx.now,before.id]).bus()?;
         let task=get_task(ctx.tx(),before.id,false)?;
-        ctx.set_undo("task.move",json!({"task_id":before.id,"column":column_str(before.column),"position":before.position}),Some(json!({"updated_at":task.updated_at})));
+        ctx.set_undo("task.move",json!({"task_id":before.id,"column":column_str(before.column),"position":index}),Some(json!({"updated_at":task.updated_at})));
         emit_task(ctx,&task)?; Ok(task)
     });
 
@@ -1098,6 +1126,7 @@ pub fn register(e: &mut Engine) {
             }
         };
         link_commit(ctx.tx(), before.id, &sha, branch.as_deref(), &ctx.now)?;
+        let index = column_index(ctx.tx(), &before)?;
         ctx.tx()
             .execute(
                 "UPDATE tasks SET col='done',position=?1,state='none',updated_at=?2 WHERE id=?3",
@@ -1111,7 +1140,7 @@ pub fn register(e: &mut Engine) {
         let task = get_task(ctx.tx(), before.id, false)?;
         ctx.set_undo(
             "task.move",
-            json!({"task_id":before.id,"column":column_str(before.column),"position":before.position}),
+            json!({"task_id":before.id,"column":column_str(before.column),"position":index}),
             Some(json!({"updated_at":task.updated_at})),
         );
         emit_task(ctx, &task)?;

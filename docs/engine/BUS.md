@@ -627,7 +627,7 @@ unique; nothing else is.
 | `task.get` | query | `{ task_id }` → `Task` (with attachments, commits) |
 | `task.list` | query | `{ project_id?, column?, state?, module_id?, priority?, include_deleted?, sort?: "column"\|"priority"\|"updated", type?, label?, session?, parent_id?: Id\|null }` → `{ tasks: Task[] }` — `project_id` optional so the Dashboard can ask "in review, everywhere"; `parent_id: null` is roots only, `session` is "every card this agent was ever sent" |
 | `task.update` | mutation · always · inverse | `{ task_id, title?, body?, priority?, size?, module_id?: Id\|null, state?, changelog?, type? }` → `Task` |
-| `task.move` | mutation · always · inverse | `{ task_id, column: Column, position?: number }` → `Task` — transitions table in §11.1; agents may only move their own task and only `active → in_review` |
+| `task.move` | mutation · always · inverse | `{ task_id, column: Column, position?: number }` → `Task` — transitions table in §11.1; `position` is the 0-based index the task ends at in the column (the others shift around it, clamped to the end), omitted means last; agents may only move their own task and only `active → in_review` |
 | `task.delete` | mutation · always · inverse (restore) | `{ task_id }` → `{}` |
 | `task.restore` | mutation · always · inverse (delete) | `{ task_id }` → `Task` |
 | `task.link_commit` | mutation · always | `{ task_id, sha, branch? }` → `Task` |
