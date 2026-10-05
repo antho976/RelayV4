@@ -1368,7 +1368,7 @@ fn strace_stop(mut s: Strace) -> Value {
             }
         }
     }
-    top.sort_by(|a, b| b.0.cmp(&a.0));
+    top.sort_by_key(|t| std::cmp::Reverse(t.0));
     json!({"total": total, "top": top.iter().take(8).map(|(n, s)| json!({"syscall": s, "calls": n})).collect::<Vec<_>>()})
 }
 
