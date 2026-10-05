@@ -70,6 +70,9 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
             text(&device, "serial"),
             text(&device, "kind")
         )));
+        if let Some(lease) = lease_row(ui, &device) {
+            connected.append(&lease);
+        }
         let mirror = button("Open mirror", "primary");
         connected.append(&mirror);
         let weak = Rc::downgrade(ui);
@@ -540,6 +543,54 @@ fn signing_form(ui: &Rc<Ui>, row: &gtk::Box, project: i64) {
     });
 }
 
+/// "In use by brisk-otter: adb install app-debug.apk · since 14:02" for a leased device, with
+/// a Release button unless a run holds it (a run's lease goes when the run is stopped).
+fn lease_row(ui: &Rc<Ui>, device: &Value) -> Option<gtk::Box> {
+    let lease = &device["lease"];
+    let action = lease["action"].as_str()?;
+    let holder = lease["session"].as_str().unwrap_or("you");
+    let since = lease["since"].as_str()
+        .and_then(|since| glib::DateTime::from_iso8601(since, None).ok())
+        .and_then(|time| time.to_local().ok())
+        .and_then(|time| time.format("%H:%M").ok())
+        .map(|time| format!(" · since {time}"))
+        .unwrap_or_default();
+    let run = lease["run_id"].as_i64().map(|id| format!(" · run {id}")).unwrap_or_default();
+    let every = if text(lease, "device") == "*" { " · every device" } else { "" };
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    row.add_css_class("device-lease");
+    row.set_tooltip_text(Some("Another run or install on this device is refused until this one is released, so sessions cannot overwrite each other's builds."));
+    let mark = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    mark.add_css_class("device-lease-mark");
+    mark.set_valign(gtk::Align::Center);
+    row.append(&mark);
+    let words = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    words.set_hexpand(true);
+    let who = label(&format!("In use by {holder}"), "device-lease-holder");
+    words.append(&who);
+    let what = label(&format!("{action}{run}{since}{every}"), "device-lease-action");
+    what.set_wrap(true);
+    words.append(&what);
+    row.append(&words);
+    if lease["kind"] != "run" {
+        action_quiet(ui, &row, "Release", json!({"device": lease["device"]}));
+    }
+    Some(row)
+}
+
+fn action_quiet(ui: &Rc<Ui>, parent: &gtk::Box, title: &str, payload: Value) {
+    let key = button(title, "quiet");
+    key.set_valign(gtk::Align::Center);
+    key.set_tooltip_text(Some("Free the device for other sessions now"));
+    let weak = Rc::downgrade(ui);
+    key.connect_clicked(move |b| {
+        if let Some(ui) = weak.upgrade() {
+            ui.mutate("device.release", payload.clone(), b);
+        }
+    });
+    parent.append(&key);
+}
+
 /// Footer utility. The full device page retains build history and advanced controls.
 pub fn open(ui: &Rc<Ui>) {
     let Some(panel) = crate::panel::Panel::toggle(ui, "Device control", 430) else {
@@ -643,15 +694,26 @@ pub fn open(ui: &Rc<Ui>) {
             let target = gtk::ComboBoxText::new();
             for device in &devices {
                 if text(device, "state") == "device" {
+                    let busy = device["lease"]["action"].is_string();
                     target.append(
                         Some(text(device, "serial")),
-                        &format!("{} · {}", text(device, "model"), text(device, "serial")),
+                        &format!("{} · {}{}", text(device, "model"), text(device, "serial"), if busy { " · in use" } else { "" }),
                     );
                 }
             }
             target.set_active(Some(0));
             if !is_release && !devices.is_empty() {
                 field("Device", &target, form);
+                // Who else is on the phone right now, so a run does not install over them.
+                let leases = gtk::Box::new(gtk::Orientation::Vertical, 6);
+                for device in devices.iter().filter(|device| text(device, "state") == "device") {
+                    if let Some(lease) = lease_row(&ui, device) {
+                        leases.append(&lease);
+                    }
+                }
+                if leases.first_child().is_some() {
+                    form.append(&leases);
+                }
                 let facts = gtk::Box::new(gtk::Orientation::Horizontal, 8);
                 facts.add_css_class("device-facts");
                 let serial = label(

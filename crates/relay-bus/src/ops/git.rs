@@ -85,6 +85,22 @@ payload!(#[schemars(rename = "GitCleanMergedIn")] CleanMergedIn { pub project_id
 result!(#[schemars(rename = "GitCleanMergedOut")] CleanMergedOut { pub deleted: Vec<String> });
 op!(CleanMerged, "git.branch.clean_merged", CleanMergedIn => CleanMergedOut,
     OpMeta::mutation(Scope::Project, 8, "Delete merged branches without a live/parked session").actors(Actors::UserOnly).emits(&["git.changed"]));
+payload!(#[schemars(rename = "GitBranchCleanupIn")] BranchCleanupIn { pub project_id: Id, pub dry_run: Option<bool> });
+result!(#[schemars(rename = "GitBranchCleanup")] BranchCleanupRow {
+    pub branch: String,
+    /// The closed session that worked on it.
+    pub session: Option<String>,
+    /// `deleted`, `would_delete` (dry run) or `kept`.
+    pub outcome: String,
+    /// Why: how the work was found merged, or what unmerged work kept it.
+    pub reason: String,
+    pub pr: Option<u64>,
+    pub removed_worktree: bool,
+    pub deleted_remote: bool,
+});
+result!(#[schemars(rename = "GitBranchCleanupOut")] BranchCleanupOut { pub branches: Vec<BranchCleanupRow> });
+op!(BranchCleanup, "git.branch.cleanup", BranchCleanupIn => BranchCleanupOut,
+    OpMeta::mutation(Scope::Project, 8, "Remove the worktree and branch of every closed session whose work is merged (into the base branch, or by a merged GitHub PR); unmerged work is kept").actors(Actors::UserOnly).emits(&["git.changed", "worktree.changed"]));
 result!(#[schemars(rename = "GitSuggestOut")] SuggestOut { pub message: String });
 op!(SuggestMessage, "git.suggest_message", WtIn => SuggestOut, OpMeta::query(Scope::Project, 8, "Heuristic commit subject from the diff"));
 
@@ -123,6 +139,7 @@ entries!(
     PrList,
     PrOpen,
     CleanMerged,
+    BranchCleanup,
     SuggestMessage,
     IntegrationRequest,
     IntegrationGet,

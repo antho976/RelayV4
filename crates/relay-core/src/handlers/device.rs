@@ -31,9 +31,14 @@ pub fn register(e: &mut Engine) {
     // nothing locked (D144).
     e.register_unlocked::<List>(|ctx, _| {
         let adb = ctx.read(adb_path)?;
-        Ok(ListOut {
-            devices: list_with_adb(&adb)?,
-        })
+        let mut devices = list_with_adb(&adb)?;
+        // Whoever is using each device, so an agent knows before it tries (device_lease).
+        let released = ctx.read(|conn| Ok(super::device_lease::prune(ctx.engine(), conn)))?;
+        for lease in released { ctx.emit(super::device_lease::RELEASED, lease.event()); }
+        for device in &mut devices {
+            device.lease = ctx.engine().device_leases.holder_of(&device.serial).map(|lease| lease.view());
+        }
+        Ok(ListOut { devices })
     });
 
     e.register::<Watch>(|ctx: &mut Ctx, p| {
@@ -138,6 +143,15 @@ pub fn register(e: &mut Engine) {
 
     e.register::<RunOp>(|ctx: &mut Ctx, p| {
         let project = get_project(ctx.tx(), p.project_id)?;
+        // The device lease (device_lease): refuse before any adb or Gradle work when another
+        // session is installing on this device, and name it.
+        let requested_root = p.worktree.clone().unwrap_or_else(|| project.path.clone());
+        let requested_root = std::fs::canonicalize(&requested_root).map(|path| path.display().to_string()).unwrap_or(requested_root);
+        let holder = match ctx.actor_session_id() {
+            Some(id) => sessions_holder(ctx, id)?,
+            None => super::device_lease::worktree_holder(ctx.tx(), project.id, &requested_root)?,
+        };
+        super::device_lease::check(ctx, &p.device, &holder)?;
         let adb = adb_path(ctx.tx())?;
         let device = require_device(&adb, &p.device)?;
         if device.state != "device" {
@@ -162,7 +176,12 @@ pub fn register(e: &mut Engine) {
         let id = ctx.tx().last_insert_rowid();
         let run = get_run(ctx.tx(), id)?;
         let runtime = RunRuntime::new(id);
+        let action = format!("device.run {} from {}", p.variant.as_deref().unwrap_or("debug"), run_source(&root, &project.path));
         ctx.engine().device_runs.lock().unwrap().insert(id, runtime.clone());
+        if let Err(error) = super::device_lease::acquire(ctx, crate::device_lease::Lease::new(&p.device, holder, crate::device_lease::Kind::Run(id), &action, None)) {
+            ctx.engine().device_runs.lock().unwrap().remove(&id);
+            return Err(error);
+        }
         let parent = ctx.req_id;
         let device_serial = p.device;
         let variant = p.variant.unwrap_or_else(|| "debug".to_string());
@@ -249,6 +268,9 @@ pub fn register(e: &mut Engine) {
         let run = get_run(ctx.tx(), p.run_id)?;
         if let Some(runtime) = ctx.engine().device_runs.lock().unwrap().remove(&p.run_id) {
             runtime.stop();
+        }
+        for lease in ctx.engine().device_leases.release_run(p.run_id) {
+            ctx.emit(super::device_lease::RELEASED, lease.event());
         }
         if matches!(run.state.as_str(), "building" | "running") {
             ctx.tx()
@@ -601,6 +623,7 @@ fn list_with_adb(adb: &Path) -> Result<Vec<Device>, BusError> {
                 DeviceKind::Usb
             },
             state: state.to_string(),
+            lease: None,
         });
     }
     Ok(devices)
@@ -862,6 +885,24 @@ fn send_input(runtime: &MirrorRuntime, event: &Value) -> Result<(), BusError> {
     };
     runtime.send_control(message)
         .map_err(|error| BusError::unavailable("device.input_failed", error.to_string()))
+}
+
+/// The lease holder for a run an agent session asked for itself.
+fn sessions_holder(ctx: &Ctx, id: Id) -> Result<crate::device_lease::Holder, BusError> {
+    let row = crate::sessions::by_id(ctx.tx(), id)?.ok_or_else(|| BusError::internal("bound session vanished"))?;
+    Ok(crate::device_lease::Holder::Session { id, name: row.session.name })
+}
+
+/// `relay/brisk-otter` for a pooled checkout, `the primary checkout` otherwise: what a refused
+/// caller needs to recognize whose build is on the phone.
+fn run_source(root: &Path, project_path: &str) -> String {
+    let primary = std::fs::canonicalize(project_path).ok();
+    if primary.as_deref() == Some(root) {
+        return "the primary checkout".into();
+    }
+    gix::open(root).ok()
+        .and_then(|repo| repo.head_name().ok().flatten().map(|name| name.shorten().to_string()))
+        .unwrap_or_else(|| root.display().to_string())
 }
 
 fn resolve_run_root(
@@ -1681,6 +1722,7 @@ fn run_worker(engine: Arc<Engine>, runtime: Arc<RunRuntime>, parent: uuid::Uuid,
         let _ = advance_run(&engine, runtime.id, parent, "finished", true);
     }
     engine.device_runs.lock().unwrap().remove(&runtime.id);
+    super::device_lease::release_run(&engine, runtime.id);
 }
 
 /// Outcome of one streamed shell command. `Failed` has already failed the run; `Stopped`
@@ -2046,6 +2088,7 @@ fn fail_run(engine: &Engine, runtime: &RunRuntime, parent: uuid::Uuid, code: &st
     runtime.push(format!("{code}: {message}"));
     let _ = advance_run(engine, runtime.id, parent, "failed", true);
     engine.device_runs.lock().unwrap().remove(&runtime.id);
+    super::device_lease::release_run(engine, runtime.id);
 }
 
 /// A finished build records its artifact in the same write that finishes the run, so

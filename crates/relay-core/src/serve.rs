@@ -31,6 +31,8 @@ pub async fn start(instance: Instance, store_path: Option<PathBuf>) -> Result<Se
         .name("skill-materialize".into())
         .spawn(move || crate::skills::refresh_all(&skills))
         .ok();
+    // Branches whose PR merged after their session closed (branch_cleanup).
+    crate::branch_cleanup::spawn_sweeper(&engine);
     let socket = SocketServer::start(engine.clone()).await?;
     Ok(Served { engine, socket })
 }

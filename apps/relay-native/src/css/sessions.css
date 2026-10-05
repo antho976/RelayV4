@@ -1,1 +1,18 @@
 /* sessions area styles: loaded after theme.css, so rules here override it. */
+
+/* adb-lease */
+.device-lease {
+  padding: 8px 10px;
+  border-radius: 8px;
+  background-color: alpha(@waiting, 0.08);
+  border: 1px solid alpha(@waiting, 0.28);
+}
+.device-lease-mark {
+  min-width: 3px;
+  min-height: 28px;
+  border-radius: 2px;
+  background-color: @waiting;
+}
+.device-lease-holder { color: @ink; font-weight: 600; font-size: 12px; }
+.device-lease-action { color: @secondary; font-size: 11px; }
+/* /adb-lease */
