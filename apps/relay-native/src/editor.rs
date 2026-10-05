@@ -41,6 +41,9 @@ pub struct Editor {
     branch_start: gtk::Entry,
     invalidate_pending: Cell<bool>,
     diff: Cell<bool>,
+    diff_switch: gtk::Box,
+    diff_inline: Cell<bool>,
+    diff_data: RefCell<Option<Value>>,
     before: sourceview5::Buffer,
     before_scroll: gtk::ScrolledWindow,
     content_stack: gtk::Stack,
@@ -126,6 +129,22 @@ impl Editor {
         caption.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
         caption.set_hexpand(true);
         tools.append(&caption);
+        // Split / inline, shown only while a diff is open.
+        let diff_switch = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        diff_switch.add_css_class("linked");
+        diff_switch.add_css_class("diff-switch");
+        diff_switch.set_visible(false);
+        let split_key = gtk::ToggleButton::with_label("Split");
+        split_key.set_widget_name("project-diff-split");
+        split_key.set_tooltip_text(Some("HEAD and the working tree side by side"));
+        split_key.set_active(true);
+        let inline_key = gtk::ToggleButton::with_label("Inline");
+        inline_key.set_widget_name("project-diff-inline");
+        inline_key.set_tooltip_text(Some("One column with removed lines above added ones"));
+        inline_key.set_group(Some(&split_key));
+        diff_switch.append(&split_key);
+        diff_switch.append(&inline_key);
+        tools.append(&diff_switch);
         let save = button("Save", "primary");
         save.set_widget_name("project-save");
         let discard = crate::app::icon_button("undo", "Discard changes");
@@ -145,9 +164,12 @@ impl Editor {
         file_sidebar.set_size_request(260, -1);
         file_sidebar.set_spacing(0);
         file_sidebar.add_css_class("code-files");
-        let file_header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let file_header = gtk::Box::new(gtk::Orientation::Horizontal, 2);
         file_header.add_css_class("code-bar");
-        file_header.append(&label("FILES", "section-label"));
+        file_header.add_css_class("explorer-head");
+        let explorer_title = label("EXPLORER", "section-label");
+        explorer_title.set_hexpand(true);
+        file_header.append(&explorer_title);
         file_sidebar.append(&file_header);
         let search = gtk::SearchEntry::new();
         search.set_placeholder_text(Some("Search in worktree"));
@@ -156,8 +178,10 @@ impl Editor {
         ));
         search.add_css_class("code-search");
         file_sidebar.append(&search);
-        let file_actions = gtk::Box::new(gtk::Orientation::Horizontal, 2);
-        file_sidebar.append(&file_actions);
+        let file_actions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        file_actions.add_css_class("explorer-actions");
+        file_actions.set_valign(gtk::Align::Center);
+        file_header.append(&file_actions);
         let file_undo = gtk::Box::new(gtk::Orientation::Vertical, 2);
         file_sidebar.append(&file_undo);
         file_sidebar.append(&scrolled(&tree));
@@ -306,6 +330,9 @@ impl Editor {
             tree_load_pending: Cell::new(false),
             tree_load_next: RefCell::new(None),
             diff: Cell::new(false),
+            diff_switch,
+            diff_inline: Cell::new(false),
+            diff_data: RefCell::new(None),
             before,
             before_scroll,
             content_stack,
@@ -331,6 +358,14 @@ impl Editor {
             handlers: Cell::new(false),
             busy: Cell::new(false),
             tree_revision: Cell::new(0),
+        });
+        let weak = Rc::downgrade(&editor);
+        inline_key.connect_toggled(move |key| {
+            if let Some(e) = weak.upgrade() {
+                if e.diff_inline.replace(key.is_active()) != key.is_active() {
+                    e.rerender_diff();
+                }
+            }
         });
         let weak = Rc::downgrade(&editor);
         editor.buffer.connect_modified_changed(move |b| {
@@ -433,6 +468,7 @@ impl Editor {
         self.save.set_sensitive(!busy && self.buffer.is_modified());
         self.discard
             .set_sensitive(!busy && self.buffer.is_modified());
+        self.diff_switch.set_visible(!busy && self.diff.get());
     }
     pub fn reset(&self) {
         self.scope_revision.set(self.scope_revision.get() + 1);
@@ -615,6 +651,8 @@ impl Editor {
                         return;
                     }
                     e.diff.set(false);
+                    e.diff_data.borrow_mut().take();
+                    e.view.set_show_line_numbers(true);
                     e.image_mode.set(false);
                     e.image.clear();
                     e.before_scroll.set_visible(false);
@@ -703,29 +741,83 @@ impl Editor {
         revision: u64,
     ) {
         if entries.is_empty() {
-            target.append(&label("Empty folder", "dim"));
+            target.append(&label("Empty folder", "tree-empty"));
         }
         for entry in entries {
             let path = text(&entry, "path").to_string();
-            let title = format!("{} {}", text(&entry, "name"), text(&entry, "badge"));
-            if text(&entry, "kind") == "dir" {
+            let directory = text(&entry, "kind") == "dir";
+            let depth = path.matches('/').count();
+            let badge = text(&entry, "badge");
+            let status = project_files::status_letter(badge);
+            // VS Code explorer anatomy: guides, chevron, type icon, name, status letter.
+            let row = button("", "tree-row");
+            row.add_css_class(if directory { "code-folder" } else { "code-file" });
+            row.set_tooltip_text(Some(&match status {
+                Some((_, _, word)) => format!("{path} · {word}"),
+                None => path.clone(),
+            }));
+            let content = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            if depth > 0 {
+                content.append(&project_files::indent_guides(depth));
+            }
+            let chevron = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            chevron.add_css_class("tree-chevron");
+            chevron.set_size_request(project_files::INDENT + 4, -1);
+            content.append(&chevron);
+            let glyph = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            glyph.add_css_class("tree-glyph");
+            content.append(&glyph);
+            let name = label(text(&entry, "name"), "tree-name");
+            name.set_hexpand(true);
+            name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            if let Some((_, class, _)) = status {
+                name.add_css_class(class);
+            } else if let Some(class) = directory.then(|| project_files::folder_status(&path)).flatten() {
+                name.add_css_class(class);
+            }
+            content.append(&name);
+            if let Some((letter, class, _)) = status {
+                let mark = label(letter, "tree-badge");
+                mark.add_css_class(class);
+                content.append(&mark);
+            }
+            row.set_child(Some(&content));
+            if path == *self.path.borrow() || path == *self.selected_path.borrow() {
+                project_files::mark_selected(&row);
+            }
+            self.bind_tree_row(ui, &row, &path, directory);
+            if directory {
                 let children = gtk::Box::new(gtk::Orientation::Vertical, 0);
-                children.set_margin_start(14);
-                let row = gtk::Expander::builder()
-                    .label(&title)
-                    .child(&children)
-                    .build();
-                row.add_css_class("code-folder");
-                let heading = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-                heading.append(&crate::icons::image("folder", 13));
-                heading.append(&label(&title, "code-file-name"));
-                row.set_label_widget(Some(&heading));
+                children.set_visible(false);
+                let node = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                node.append(&row);
+                node.append(&children);
+                target.append(&node);
+                let paint = {
+                    let chevron = chevron.clone();
+                    let glyph = glyph.clone();
+                    move |open: bool| {
+                        clear(&chevron);
+                        clear(&glyph);
+                        let arrow = crate::icons::image(if open { "chevron-down" } else { "chevron-right" }, 12);
+                        arrow.set_halign(gtk::Align::Center);
+                        arrow.set_hexpand(true);
+                        chevron.append(&arrow);
+                        let folder = crate::icons::image(if open { "folder-open" } else { "folder" }, 14);
+                        folder.add_css_class("file-icon");
+                        folder.add_css_class("ft-folder");
+                        glyph.append(&folder);
+                    }
+                };
+                paint(false);
                 let loaded = Rc::new(Cell::new(false));
                 let e = self.clone();
                 let weak = Rc::downgrade(ui);
                 let child_path = path.clone();
-                row.connect_expanded_notify(move |row| {
-                    if !row.is_expanded() {
+                let toggle = Rc::new(move |open: bool| {
+                    children.set_visible(open);
+                    paint(open);
+                    if !open {
                         e.expanded.borrow_mut().remove(&child_path);
                         return;
                     }
@@ -758,28 +850,28 @@ impl Editor {
                         }
                     });
                 });
-                self.bind_tree_row(ui, &row, &path, true);
-                target.append(&row);
-                let expand = self.expanded.borrow().contains(&path);
-                row.set_expanded(expand);
+                let click = toggle.clone();
+                let select = path.clone();
+                let e = self.clone();
+                row.connect_clicked(move |row| {
+                    project_files::mark_selected(row);
+                    *e.selected_path.borrow_mut() = select.clone();
+                    e.selected_directory.set(true);
+                    let open = !e.expanded.borrow().contains(&select);
+                    click(open);
+                });
+                if self.expanded.borrow().contains(&path) {
+                    toggle(true);
+                }
             } else {
-                let row = button("", "file");
-                row.add_css_class("code-file");
-                row.set_tooltip_text(Some(&path));
-                let content = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-                content.append(&crate::icons::image(project_files::file_icon(&path), 13));
-                let name = label(text(&entry, "name"), "code-file-name");
-                name.set_hexpand(true);
-                name.set_ellipsize(gtk::pango::EllipsizeMode::End);
-                content.append(&name);
-                let badge = label(text(&entry, "badge"), "dim");
-                content.append(&badge);
-                row.set_child(Some(&content));
-                self.bind_tree_row(ui, &row, &path, false);
+                glyph.append(&project_files::file_image(&path, 14));
+                let stamp = format!("{}:{}", entry["size"], entry["modified_at"]);
+                self.bind_image_hover(ui, &row, &path, stamp);
                 let e = self.clone();
                 let weak = Rc::downgrade(ui);
-                row.connect_clicked(move |_| {
+                row.connect_clicked(move |row| {
                     if let Some(ui) = weak.upgrade() {
+                        project_files::mark_selected(row);
                         *e.selected_path.borrow_mut() = path.clone();
                         e.selected_directory.set(false);
                         e.open_path(&ui, path.clone(), None);
@@ -867,12 +959,13 @@ impl Editor {
                 e.load_tree(&ui, None);
             }
         });
-        for (title, op) in [
-            ("New", "file.create"),
-            ("Rename", "file.rename"),
-            ("Trash", "file.delete"),
+        for (icon, title, op) in [
+            ("file-plus", "New file or folder", "file.create"),
+            ("edit", "Rename the selected file", "file.rename"),
+            ("trash", "Move the selected file to Relay trash", "file.delete"),
         ] {
-            let action = button(title, "quiet");
+            let action = crate::app::icon_button(icon, title);
+            action.add_css_class("explorer-key");
             action.set_widget_name(&format!("project-{op}"));
             let e = self.clone();
             let weak = Rc::downgrade(ui);
@@ -883,6 +976,30 @@ impl Editor {
             });
             self.file_actions.append(&action);
         }
+        let refresh = crate::app::icon_button("refresh", "Refresh the explorer");
+        refresh.add_css_class("explorer-key");
+        refresh.set_widget_name("project-files-refresh");
+        let e = self.clone();
+        let weak = Rc::downgrade(ui);
+        refresh.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                e.load_tree(&ui, None);
+                e.refresh_git(&ui);
+            }
+        });
+        self.file_actions.append(&refresh);
+        let collapse = crate::app::icon_button("collapse", "Collapse folders");
+        collapse.add_css_class("explorer-key");
+        collapse.set_widget_name("project-files-collapse");
+        let e = self.clone();
+        let weak = Rc::downgrade(ui);
+        collapse.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                e.expanded.borrow_mut().clear();
+                e.load_tree(&ui, None);
+            }
+        });
+        self.file_actions.append(&collapse);
         let keys = gtk::EventControllerKey::new();
         let e = self.clone();
         let weak = Rc::downgrade(ui);
@@ -1001,19 +1118,42 @@ impl Editor {
                     let hits = rows(&v, "hits");
                     e.tree.append(&label(
                         &format!(
-                            "{} matches{}",
+                            "{} match{}{}",
                             hits.len(),
+                            if hits.len() == 1 { "" } else { "es" },
                             if hits.len() == 100 {
                                 " (limit reached)"
                             } else {
                                 ""
                             }
                         ),
-                        "dim",
+                        "tree-empty",
                     ));
                     for hit in hits {
                         let path = text(&hit, "path").to_string();
-                        let b = button(&format!("{}:{}", path, hit["line"]), "file");
+                        let b = button("", "tree-row");
+                        b.add_css_class("search-hit");
+                        let card = gtk::Box::new(gtk::Orientation::Vertical, 1);
+                        let head = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+                        head.append(&project_files::file_image(&path, 14));
+                        let (directory, file) = match path.rsplit_once('/') {
+                            Some((directory, file)) => (directory, file),
+                            None => ("", path.as_str()),
+                        };
+                        head.append(&label(file, "tree-name"));
+                        let place = label(&if directory.is_empty() {
+                            format!("line {}", hit["line"])
+                        } else {
+                            format!("{directory} · line {}", hit["line"])
+                        }, "tree-dir");
+                        place.set_hexpand(true);
+                        place.set_ellipsize(gtk::pango::EllipsizeMode::Start);
+                        head.append(&place);
+                        card.append(&head);
+                        let snippet = label(text(&hit, "text").trim(), "search-snippet");
+                        snippet.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                        card.append(&snippet);
+                        b.set_child(Some(&card));
                         b.set_tooltip_text(Some(text(&hit, "text")));
                         let ed = e.clone();
                         let weak = Rc::downgrade(&ui);

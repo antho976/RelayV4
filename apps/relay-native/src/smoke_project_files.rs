@@ -203,9 +203,10 @@ pub async fn run(ui: &Rc<Ui>) -> Result<(), String> {
     .await?;
     let folder = named(&ui.window, "project-file:project-smoke-folder")
         .ok_or("Refreshed folder missing")?
-        .downcast::<gtk::Expander>()
-        .map_err(|_| "Folder expander type")?;
-    folder.set_expanded(true);
+        .downcast::<gtk::Button>()
+        .map_err(|_| "Folder row type")?;
+    // Explorer folders are rows that toggle their children, as in VS Code.
+    folder.emit_clicked();
     wait_for(
         || {
             named(

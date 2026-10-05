@@ -32,7 +32,23 @@ op!(Log, "git.log", LogIn => LogOut, OpMeta::query(Scope::Project, 8, "History")
 payload!(#[schemars(rename = "GitShowIn")] ShowIn { pub project_id: Id, pub sha: String });
 result!(#[schemars(rename = "GitShowOut")] ShowOut { pub commit: Commit, pub files: Vec<DiffFile> });
 op!(Show, "git.show", ShowIn => ShowOut, OpMeta::query(Scope::Project, 8, "One commit and its files"));
-result!(#[schemars(rename = "GitBranchesOut")] BranchesOut { pub current: String, pub branches: Vec<Branch> });
+result!(#[schemars(rename = "GitRemoteBranch")] RemoteBranch {
+    /// `origin/feature`, as `git branch -r` prints it.
+    pub name: String,
+    pub remote: String,
+    /// The branch name on the remote, `feature`.
+    pub branch: String,
+    pub head: String,
+    /// The local branch of the same name, if there is one; switching to the remote selects it.
+    pub local: Option<String>,
+});
+result!(#[schemars(rename = "GitBranchesOut")] BranchesOut {
+    pub current: String,
+    pub branches: Vec<Branch>,
+    /// Remote-tracking branches (`refs/remotes/*`), without the symbolic `origin/HEAD`.
+    #[serde(default)]
+    pub remote_branches: Vec<RemoteBranch>,
+});
 op!(Branches, "git.branches", WtIn => BranchesOut, OpMeta::query(Scope::Project, 8, "Branches with merged flag and session owner for the selected worktree"));
 payload!(#[schemars(rename = "GitBranchCreateIn")] BranchCreateIn {
     pub project_id: Id,
@@ -49,10 +65,22 @@ result!(#[schemars(rename = "GitBranchCreateOut")] BranchCreateOut {
 op!(BranchCreate, "git.branch.create", BranchCreateIn => BranchCreateOut,
     OpMeta::mutation(Scope::Project, 8, "Create a branch in a project worktree and optionally check it out").actors(Actors::UserOnly).emits(&["git.changed"]));
 payload!(#[schemars(rename = "GitBranchSwitchIn")] BranchSwitchIn {
-    pub project_id: Id, pub worktree: Option<String>, pub name: String,
+    pub project_id: Id, pub worktree: Option<String>,
+    /// A local branch, or a remote-tracking one (`origin/feature`) to check out as a new local
+    /// tracking branch.
+    pub name: String,
+    /// Bring uncommitted changes to tracked files along, as `git switch` does. Git still refuses
+    /// when the target branch would overwrite them; nothing is ever discarded.
+    pub carry_changes: Option<bool>,
 });
-op!(BranchSwitch, "git.branch.switch", BranchSwitchIn => Empty,
-    OpMeta::mutation(Scope::Project, 8, "Switch a clean checkout without a live session to an existing local branch").actors(Actors::UserOnly).emits(&["git.changed"]));
+result!(#[schemars(rename = "GitBranchSwitchOut")] BranchSwitchOut {
+    /// The local branch now checked out.
+    pub branch: String,
+    /// Whether a local tracking branch was created for a remote branch.
+    pub created: bool,
+});
+op!(BranchSwitch, "git.branch.switch", BranchSwitchIn => BranchSwitchOut,
+    OpMeta::mutation(Scope::Project, 8, "Switch a checkout without a live session to a local or remote branch; uncommitted changes are carried or refused, never discarded").actors(Actors::UserOnly).emits(&["git.changed"]));
 payload!(#[schemars(rename = "GitBranchDeleteIn")] BranchDeleteIn { pub project_id: Id, pub name: String });
 op!(BranchDelete, "git.branch.delete", BranchDeleteIn => Empty,
     OpMeta::mutation(Scope::Project, 8, "Delete one merged local branch that is not checked out or owned by a session").actors(Actors::UserOnly).emits(&["git.changed"]));

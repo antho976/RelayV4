@@ -2611,7 +2611,7 @@
       }
     },
     "git.branch.switch": {
-      "summary": "Switch a clean checkout without a live session to an existing local branch",
+      "summary": "Switch a checkout without a live session to a local or remote branch; uncommitted changes are carried or refused, never discarded",
       "kind": "mutation",
       "audit": "always",
       "undo": "none",
@@ -2628,7 +2628,7 @@
         "$ref": "#/$defs/GitBranchSwitchIn"
       },
       "result": {
-        "$ref": "#/$defs/Empty"
+        "$ref": "#/$defs/GitBranchSwitchOut"
       }
     },
     "git.branch.delete": {
@@ -10838,6 +10838,14 @@
           "items": {
             "$ref": "#/$defs/Branch"
           }
+        },
+        "remote_branches": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/GitRemoteBranch"
+          },
+          "description": "Remote-tracking branches (`refs/remotes/*`), without the symbolic `origin/HEAD`.",
+          "default": []
         }
       },
       "required": [
@@ -10892,6 +10900,38 @@
         "head",
         "merged",
         "current"
+      ]
+    },
+    "GitRemoteBranch": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "`origin/feature`, as `git branch -r` prints it."
+        },
+        "remote": {
+          "type": "string"
+        },
+        "branch": {
+          "type": "string",
+          "description": "The branch name on the remote, `feature`."
+        },
+        "head": {
+          "type": "string"
+        },
+        "local": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The local branch of the same name, if there is one; switching to the remote selects it."
+        }
+      },
+      "required": [
+        "name",
+        "remote",
+        "branch",
+        "head"
       ]
     },
     "GitBranchCreateIn": {
@@ -10963,12 +11003,37 @@
           ]
         },
         "name": {
-          "type": "string"
+          "type": "string",
+          "description": "A local branch, or a remote-tracking one (`origin/feature`) to check out as a new local\ntracking branch."
+        },
+        "carry_changes": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Bring uncommitted changes to tracked files along, as `git switch` does. Git still refuses\nwhen the target branch would overwrite them; nothing is ever discarded."
         }
       },
       "required": [
         "project_id",
         "name"
+      ]
+    },
+    "GitBranchSwitchOut": {
+      "type": "object",
+      "properties": {
+        "branch": {
+          "type": "string",
+          "description": "The local branch now checked out."
+        },
+        "created": {
+          "type": "boolean",
+          "description": "Whether a local tracking branch was created for a remote branch."
+        }
+      },
+      "required": [
+        "branch",
+        "created"
       ]
     },
     "GitBranchDeleteIn": {
