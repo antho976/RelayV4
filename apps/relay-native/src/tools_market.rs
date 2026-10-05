@@ -151,7 +151,7 @@ fn build(ui: &Rc<Ui>, spec: &'static Spec) -> Rc<Market> {
     tile.add_css_class("ext-tile");
     tile.set_valign(gtk::Align::Center);
     let glyph = crate::icons::image(spec.icon, 20);
-    glyph.set_vexpand(true);
+    glyph.set_valign(gtk::Align::Center);
     glyph.set_halign(gtk::Align::Center);
     tile.append(&glyph);
     head.append(&tile);
@@ -972,7 +972,7 @@ pub(crate) fn state_box(
     tile.add_css_class("ext-tile");
     tile.set_halign(gtk::Align::Center);
     let glyph = crate::icons::image(icon, 18);
-    glyph.set_vexpand(true);
+    glyph.set_valign(gtk::Align::Center);
     glyph.set_halign(gtk::Align::Center);
     tile.append(&glyph);
     state.append(&tile);

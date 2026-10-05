@@ -584,6 +584,8 @@ impl Doc {
         let name = self.name();
         if self.tab_label.text() != name {
             self.tab_label.set_text(&name);
+            // An ellipsizing label asks for no width at all; a notebook tab then shows only "…".
+            self.tab_label.set_width_chars(name.chars().count().clamp(4, 24) as i32);
             self.tab.set_tooltip_text(Some(&format!("{} · {name}", super::project_name(ui, self.project))));
         }
         if self.last_dirty.replace(dirty) != dirty {
