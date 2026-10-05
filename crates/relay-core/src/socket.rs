@@ -188,6 +188,13 @@ fn pty_frame_line(head: &str, epoch: u64, seq: u64, data: &[u8]) -> String {
     line
 }
 
+/// `bus.wait {matching}`: every top-level key given must be present in the event payload with
+/// an equal value. Lets a waiter take *its* answer and not the first one of the same name.
+fn payload_matches(payload: &serde_json::Value, matching: Option<&serde_json::Value>) -> bool {
+    let Some(wanted) = matching.and_then(serde_json::Value::as_object) else { return true };
+    wanted.iter().all(|(key, value)| payload.get(key) == Some(value))
+}
+
 /// Event filter for `bus.subscribe {events}`: exact, `prefix.*`, or `*`. Empty = everything.
 #[derive(Clone, Default)]
 struct Filter(Vec<String>);
@@ -396,7 +403,7 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) -> Result<()> {
                     let waited = tokio::time::timeout(timeout, async {
                         loop {
                             match rx.recv().await {
-                                Ok(ev) if filter.matches(&ev.ev) => return Some(ev),
+                                Ok(ev) if filter.matches(&ev.ev) && payload_matches(&ev.payload, p.matching.as_ref()) => return Some(ev),
                                 Ok(_) => continue,
                                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                                     tracing::warn!(lagged = n, "waiter lagged; events dropped");

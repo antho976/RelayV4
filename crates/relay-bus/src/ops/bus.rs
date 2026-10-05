@@ -20,6 +20,9 @@ payload!(#[schemars(rename = "BusWaitIn")] WaitIn {
     pub events: Option<Vec<String>>,
     /// How long to block before giving up. Default 60s, clamped to an hour.
     pub timeout_ms: Option<u64>,
+    /// Only an event whose payload has every one of these top-level keys equal to the value
+    /// given, e.g. `{"request_id": 7}`. Omit to take the first event that matches by name.
+    pub matching: Option<Value>,
 });
 result!(#[schemars(rename = "BusWaitOut")] WaitOut {
     pub event: Option<crate::envelope::Event>,

@@ -47,7 +47,10 @@ never poll. Android devices are shared between sessions: an `adb install`, `adb 
 `gradlew install*` takes a lease on the device, and while a peer holds one yours is refused with \
 `device.busy` naming who is using it, for what, and since when — `bus.wait` on \
 `device.lease.released`, then retry, rather than retrying in a loop. `device.list` shows each \
-device's holder; `device.claim` holds a device across several steps and `device.release` frees it. Work on `task` first; `tasks` is the remaining ordered queue. Report each current \
+device's holder; `device.claim` holds a device across several steps and `device.release` frees it. When a guardrail refuses something you cannot progress without, do not work around \
+it: call `guardrail.request` with the `kind` and `value` its hint names and a `reason`, then \
+`bus.wait` for `guardrail.request_resolved` matching your `request_id` and retry once approved; \
+only the user can approve it. Work on `task` first; `tasks` is the remaining ordered queue. Report each current \
 task through `session.done` with `status` `completed`, `blocked` or `partial`. All builders must \
 finish before the task enters review. A shared-worktree group stays on that task until every \
 reviewer finishes; do not begin queued work while peers are still building or reviewing. Relay \

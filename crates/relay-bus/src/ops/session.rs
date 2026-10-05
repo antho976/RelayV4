@@ -113,6 +113,9 @@ result!(#[schemars(rename = "SessionBootstrapGuardrails")] BootstrapGuardrails {
     pub write_roots: Vec<String>,
     /// The op that answers "would this be allowed?" without doing it.
     pub dry_run: String,
+    /// What to do when a refusal stands between you and the task: how to ask the user for an
+    /// exception and wait for the answer.
+    pub exceptions: String,
 });
 result!(#[schemars(rename = "SessionBootstrapOut")] BootstrapOut {
     pub session: String, pub role: Role, pub project_id: Id, pub project: String, pub base_branch: String,
