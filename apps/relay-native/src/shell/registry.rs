@@ -471,6 +471,7 @@ impl Ui {
             vec![
                 ("plus", "Add project…", false, Rc::new(move |ui: &Rc<Ui>| ui.open_repository_in(Some(add.clone())))),
                 ("settings", "Workspace settings…", false, Rc::new(move |ui: &Rc<Ui>| ui.registry_editor(edit.clone(), true))),
+                ("shield", "Guardrails…", false, Rc::new(move |ui: &Rc<Ui>| crate::pages::open_workspace_guardrails(ui, id))),
                 ("trash", "Remove workspace…", true, Rc::new(move |ui: &Rc<Ui>| ui.confirm_registry_remove(&remove, true, None))),
             ]
         } else {
@@ -479,6 +480,7 @@ impl Ui {
                 ("terminal", "Open agents", false, Rc::new(move |ui: &Rc<Ui>| ui.open_project(id, "agents"))),
                 ("files", "Files and Git", false, Rc::new(move |ui: &Rc<Ui>| ui.open_project(id, "code"))),
                 ("settings", "Project settings…", false, Rc::new(move |ui: &Rc<Ui>| ui.registry_editor(edit.clone(), false))),
+                ("shield", "Guardrails…", false, Rc::new(move |ui: &Rc<Ui>| crate::pages::open_project_guardrails(ui, id))),
                 ("trash", "Remove project…", true, Rc::new(move |ui: &Rc<Ui>| ui.confirm_registry_remove(&remove, false, None))),
             ]
         };
