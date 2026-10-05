@@ -339,7 +339,8 @@ pub fn register(e: &mut Engine) {
             });
         }
         branches.sort_by_key(|b| (!b.current, b.name.clone()));
-        Ok(BranchesOut { current, branches })
+        let remote_branches = remote_branches(&repo, &platform, &branches)?;
+        Ok(BranchesOut { current, branches, remote_branches })
     });
     e.register::<BranchCreate>(|ctx: &mut Ctx, p| {
         let (project, root) = resolve_root(ctx, p.project_id, p.worktree.as_deref())?;
@@ -380,24 +381,67 @@ pub fn register(e: &mut Engine) {
             worktree: root.display().to_string(),
         })
     });
-    e.register::<BranchSwitch>(|ctx: &mut Ctx, p| {
-        let (project, root) = resolve_root(ctx, p.project_id, p.worktree.as_deref())?;
-        let name = validate_branch_name(&root, &p.name)?;
-        let owned: bool = ctx.tx().query_row(
-            "SELECT EXISTS(SELECT 1 FROM sessions WHERE project_id=?1 AND worktree=?2 AND state!='closed')",
-            rusqlite::params![project.id, root.to_string_lossy()], |row| row.get(0),
-        ).bus()?;
-        if owned { return Err(BusError::conflict("git.checkout_session_owned", "This checkout belongs to a live session; select another checkout")); }
-        if !status_files(&root)?.is_empty() {
-            return Err(BusError::conflict("git.checkout_dirty", "Commit or discard checkout changes before switching branches"));
-        }
-        let repo = gix::open(&root).map_err(gix_err("git.open_failed"))?;
-        repo.find_reference(format!("refs/heads/{name}").as_str())
-            .map_err(|_| BusError::not_found("git.branch_not_found", format!("no local branch {name}")))?;
-        worktree::git_mutate(&root, &["switch", "--no-overwrite-ignore", "--", &name]).map_err(git_mutation("git.branch_switch_failed"))?;
-        changed(ctx, project.id, &root);
-        Ok(relay_bus::Empty {})
-    });
+    // `git status` and `git switch` both walk the checkout; neither needs the store (D144).
+    e.register_staged::<BranchSwitch, _>(
+        |ctx, p| {
+            let (project, root) = resolve_root_unlocked(ctx, p.project_id, p.worktree.as_deref())?;
+            let checkout = root.to_string_lossy().to_string();
+            let owner = ctx.read(|conn| {
+                let mut st = conn
+                    .prepare_cached("SELECT name FROM sessions WHERE project_id=?1 AND worktree=?2 AND state!='closed' LIMIT 1")
+                    .bus()?;
+                let mut rows = st.query(rusqlite::params![project.id, checkout]).bus()?;
+                rows.next().bus()?.map(|row| row.get::<_, String>(0)).transpose().bus()
+            })?;
+            if let Some(session) = owner {
+                return Err(BusError::conflict(
+                    "git.checkout_session_owned",
+                    format!("This checkout belongs to the live session {session}; its agent decides its branch. Select another checkout, or end the session first."),
+                ));
+            }
+            let target = switch_target(&root, &p.name)?;
+            let current = gix::open(&root)
+                .ok()
+                .and_then(|repo| repo.head_name().ok().flatten().map(|n| n.shorten().to_string()));
+            if current.as_deref() == Some(target.local.as_str()) {
+                return Ok((project, root, target.local, false));
+            }
+            // Untracked files travel with any switch and git refuses one that would overwrite
+            // them, so only tracked changes count as a dirty checkout.
+            let tracked: Vec<_> = status_files(&root)?
+                .into_iter()
+                .filter(|file| !(file.index.is_empty() && file.worktree == "?"))
+                .collect();
+            if tracked.iter().any(|file| file.index == "U" || file.worktree == "U") {
+                return Err(BusError::conflict(
+                    "git.checkout_unmerged",
+                    "This checkout is in the middle of a merge or rebase with unresolved conflicts; resolve them before switching branches",
+                ));
+            }
+            if !tracked.is_empty() && !p.carry_changes.unwrap_or(false) {
+                return Err(BusError::conflict(
+                    "git.checkout_dirty",
+                    format!(
+                        "{} uncommitted change{} ({}). Commit them first, or bring them along to {}.",
+                        tracked.len(),
+                        if tracked.len() == 1 { "" } else { "s" },
+                        sample_paths(tracked.iter().map(|file| file.path.as_str())),
+                        target.local
+                    ),
+                ));
+            }
+            let args: Vec<&str> = match &target.remote {
+                Some(remote) => vec!["switch", "--no-overwrite-ignore", "--track", "-c", &target.local, remote],
+                None => vec!["switch", "--no-overwrite-ignore", "--", &target.local],
+            };
+            run_switch(&root, &args, &target.local)?;
+            Ok((project, root, target.local, target.remote.is_some()))
+        },
+        |ctx: &mut Ctx, _p, (project, root, branch, created)| {
+            changed(ctx, project.id, &root);
+            Ok(BranchSwitchOut { branch, created })
+        },
+    );
     e.register::<BranchDelete>(|ctx: &mut Ctx, p| {
         let project = get_project(ctx.tx(), p.project_id)?;
         let root = Path::new(&project.path);
@@ -1227,6 +1271,137 @@ fn merged_tips(
     merged
 }
 
+/// What `git.branch.switch` checks out: a local branch, or a new local tracking branch for a
+/// remote one.
+struct SwitchTarget {
+    local: String,
+    remote: Option<String>,
+}
+
+/// A local branch of that name wins; otherwise `origin/feature` names a remote-tracking branch,
+/// checked out as `feature` — or as the existing local `feature`, if there is one.
+fn switch_target(root: &Path, requested: &str) -> Result<SwitchTarget, BusError> {
+    let name = requested.trim();
+    let repo = gix::open(root).map_err(gix_err("git.open_failed"))?;
+    if repo.find_reference(format!("refs/heads/{name}").as_str()).is_ok() {
+        return Ok(SwitchTarget { local: validate_branch_name(root, name)?, remote: None });
+    }
+    if repo.find_reference(format!("refs/remotes/{name}").as_str()).is_ok() {
+        let branch = repo
+            .remote_names()
+            .iter()
+            .map(|remote| remote.to_string())
+            .filter_map(|remote| name.strip_prefix(&format!("{remote}/")).map(str::to_owned))
+            .min_by_key(String::len)
+            .or_else(|| name.split_once('/').map(|(_, rest)| rest.to_owned()))
+            .filter(|branch| !branch.is_empty() && branch != "HEAD")
+            .ok_or_else(|| BusError::invalid("git.branch_name", format!("{name} is not a remote branch")))?;
+        let local = validate_branch_name(root, &branch)?;
+        if repo.find_reference(format!("refs/heads/{local}").as_str()).is_ok() {
+            return Ok(SwitchTarget { local, remote: None });
+        }
+        return Ok(SwitchTarget { local, remote: Some(name.to_owned()) });
+    }
+    validate_branch_name(root, name)?;
+    Err(BusError::not_found("git.branch_not_found", format!("no local or remote branch {name}")))
+}
+
+/// `git switch`, bounded, with its refusals turned into errors a person can act on. Git never
+/// discards anything on these paths: every refusal leaves the checkout as it was.
+fn run_switch(root: &Path, args: &[&str], branch: &str) -> Result<(), BusError> {
+    let mut command = std::process::Command::new("git");
+    command.arg("-C").arg(root).args(args).env("GIT_TERMINAL_PROMPT", "0");
+    let output = crate::proc::output_with_timeout(&mut command, std::time::Duration::from_secs(120))
+        .map_err(|error| BusError::unavailable("git.branch_switch_failed", error.to_string()))?
+        .ok_or_else(|| BusError::unavailable("git.branch_switch_failed", "git switch did not finish within 2 minutes"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let listed = || {
+        sample_paths(
+            stderr
+                .lines()
+                .filter(|line| line.starts_with('\t'))
+                .map(str::trim),
+        )
+    };
+    if let Some(at) = stderr
+        .split("is already checked out at ")
+        .nth(1)
+        .or_else(|| stderr.split("is already used by worktree at ").nth(1))
+    {
+        let path = at.lines().next().unwrap_or("").trim().trim_matches(['\'', '"']);
+        return Err(BusError::conflict(
+            "git.branch_checked_out",
+            format!("{branch} is already checked out in {path}. Select that checkout to work on it."),
+        ));
+    }
+    if stderr.contains("local changes to the following files would be overwritten") {
+        return Err(BusError::conflict(
+            "git.checkout_conflict",
+            format!("Your uncommitted changes to {} would be overwritten by {branch}. Commit them first; nothing was changed.", listed()),
+        ));
+    }
+    if stderr.contains("untracked working tree files would be overwritten") {
+        return Err(BusError::conflict(
+            "git.branch_switch_failed",
+            format!("{branch} has its own copy of {}, which is untracked or ignored here. Move it aside first; nothing was changed.", listed()),
+        ));
+    }
+    Err(BusError::conflict("git.branch_switch_failed", format!("git {} failed: {stderr}", args.join(" "))))
+}
+
+/// Up to three paths, then a count, for one-line messages.
+fn sample_paths<'a>(paths: impl Iterator<Item = &'a str>) -> String {
+    let paths: Vec<&str> = paths.collect();
+    let shown = paths.iter().take(3).copied().collect::<Vec<_>>().join(", ");
+    match paths.len() {
+        0 => String::from("some files"),
+        n if n > 3 => format!("{shown} and {} more", n - 3),
+        _ => shown,
+    }
+}
+
+/// `refs/remotes/*` as remote branches, each linked to the local branch of the same name.
+fn remote_branches(
+    repo: &gix::Repository,
+    platform: &gix::reference::iter::Platform<'_>,
+    local: &[Branch],
+) -> Result<Vec<RemoteBranch>, BusError> {
+    let remotes: Vec<String> = repo.remote_names().iter().map(|r| r.to_string()).collect();
+    let mut out = Vec::new();
+    for reference in platform.remote_branches().map_err(gix_err("git.branches_failed"))? {
+        let reference = reference.map_err(gix_err("git.branches_failed"))?;
+        // Symbolic refs — `origin/HEAD` — point at a branch already listed.
+        let Some(id) = reference.try_id() else {
+            continue;
+        };
+        let name = reference.name().as_bstr().to_string();
+        let Some(name) = name.strip_prefix("refs/remotes/").map(str::to_owned) else {
+            continue;
+        };
+        let (remote, branch) = remotes
+            .iter()
+            .filter_map(|remote| name.strip_prefix(&format!("{remote}/")).map(|b| (remote.clone(), b.to_owned())))
+            .min_by_key(|(_, branch)| branch.len())
+            .or_else(|| name.split_once('/').map(|(r, b)| (r.to_owned(), b.to_owned())))
+            .unwrap_or_else(|| (String::new(), name.clone()));
+        if branch == "HEAD" {
+            continue;
+        }
+        out.push(RemoteBranch {
+            local: local.iter().find(|b| b.name == branch).map(|b| b.name.clone()),
+            head: id.to_string(),
+            name,
+            remote,
+            branch,
+        });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
 fn gix_err<E: std::fmt::Display>(code: &'static str) -> impl Fn(E) -> BusError {
     move |e| BusError::unavailable(code, e.to_string())
 }
@@ -1298,7 +1473,7 @@ fn branches_for(
             current: name == current,
         });
     }
-    Ok(BranchesOut { current, branches })
+    Ok(BranchesOut { current, branches, remote_branches: Vec::new() })
 }
 
 #[cfg(test)]
