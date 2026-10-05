@@ -4,7 +4,7 @@
   "title": "RELAY v4 command bus",
   "description": "Generated from crates/relay-bus by `relay schema`. Do not edit; see docs/BUS.md.",
   "version": 1,
-  "op_count": 212,
+  "op_count": 217,
   "envelope": {
     "request": {
       "$ref": "#/$defs/Request"
@@ -2219,6 +2219,8 @@
       "doors": "all",
       "emits": [
         "guardrail.held",
+        "guardrail.refused",
+        "guardrail.grant_used",
         "notify.new"
       ],
       "since": "1.0",
@@ -2279,6 +2281,7 @@
       "doors": "all",
       "emits": [
         "guardrail.resolved",
+        "guardrail.request_resolved",
         "mailbox.new"
       ],
       "since": "1.0",
@@ -2301,6 +2304,7 @@
       "doors": "all",
       "emits": [
         "guardrail.resolved",
+        "guardrail.request_resolved",
         "mailbox.new"
       ],
       "since": "1.0",
@@ -2313,7 +2317,7 @@
       }
     },
     "guardrail.config.get": {
-      "summary": "Guardrail config: global merged with project overrides",
+      "summary": "Effective guardrail config: defaults, then global, workspace and project overrides",
       "kind": "query",
       "audit": "never",
       "undo": "none",
@@ -2332,7 +2336,7 @@
       }
     },
     "guardrail.config.set": {
-      "summary": "Patch guardrail config (caps, protected paths, thresholds, roles)",
+      "summary": "Patch one layer of guardrail config (caps, protected paths, thresholds, roles)",
       "kind": "mutation",
       "audit": "always",
       "undo": "inverse",
@@ -2350,6 +2354,25 @@
       },
       "result": {
         "$ref": "#/$defs/GuardrailConfig"
+      }
+    },
+    "guardrail.config.layers": {
+      "summary": "One guardrail config layer: effective, inherited, its own overrides, and which layer set each value",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "executor": "core",
+      "actors": "all",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 4,
+      "payload": {
+        "$ref": "#/$defs/GuardrailConfigLayersIn"
+      },
+      "result": {
+        "$ref": "#/$defs/GuardrailConfigLayersOut"
       }
     },
     "guardrail.check": {
@@ -2388,6 +2411,90 @@
       },
       "result": {
         "$ref": "#/$defs/GuardrailExplainOut"
+      }
+    },
+    "guardrail.request": {
+      "summary": "Ask the user for a guardrail exception when you cannot progress without one; every agent may call it",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "session",
+      "executor": "core",
+      "actors": "agent_only",
+      "doors": "all",
+      "emits": [
+        "guardrail.requested",
+        "guardrail.held",
+        "notify.new"
+      ],
+      "since": "1.0",
+      "phase": 4,
+      "payload": {
+        "$ref": "#/$defs/GuardrailRequestIn"
+      },
+      "result": {
+        "$ref": "#/$defs/GuardrailRequestOut"
+      }
+    },
+    "guardrail.request.get": {
+      "summary": "One exception request and its grant: open, approved (and whether still active), denied",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "executor": "core",
+      "actors": "all",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 4,
+      "payload": {
+        "$ref": "#/$defs/GuardrailRequestGetIn"
+      },
+      "result": {
+        "$ref": "#/$defs/GuardrailException"
+      }
+    },
+    "guardrail.requests.list": {
+      "summary": "Exception requests, newest first",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "executor": "core",
+      "actors": "all",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 4,
+      "payload": {
+        "$ref": "#/$defs/GuardrailRequestsListIn"
+      },
+      "result": {
+        "$ref": "#/$defs/GuardrailRequestsListOut"
+      }
+    },
+    "guardrail.grant.revoke": {
+      "summary": "End an approved exception before it would expire",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "executor": "core",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "guardrail.resolved",
+        "guardrail.request_resolved",
+        "mailbox.new"
+      ],
+      "since": "1.0",
+      "phase": 4,
+      "payload": {
+        "$ref": "#/$defs/GuardrailGrantRevokeIn"
+      },
+      "result": {
+        "$ref": "#/$defs/GuardrailException"
       }
     },
     "worktree.list": {
@@ -4950,6 +5057,9 @@
           "format": "uint64",
           "minimum": 0,
           "description": "How long to block before giving up. Default 60s, clamped to an hour."
+        },
+        "matching": {
+          "description": "Only an event whose payload has every one of these top-level keys equal to the value\ngiven, e.g. `{\"request_id\": 7}`. Omit to take the first event that matches by name."
         }
       }
     },
@@ -9121,13 +9231,18 @@
         "dry_run": {
           "type": "string",
           "description": "The op that answers \"would this be allowed?\" without doing it."
+        },
+        "exceptions": {
+          "type": "string",
+          "description": "What to do when a refusal stands between you and the task: how to ask the user for an\nexception and wait for the answer."
         }
       },
       "required": [
         "caps",
         "denied_commands",
         "write_roots",
-        "dry_run"
+        "dry_run",
+        "exceptions"
       ]
     },
     "GuardrailCaps": {
@@ -9744,11 +9859,30 @@
         "hold_id": {
           "type": "integer",
           "format": "int64"
+        },
+        "scope": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GrantScope"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Exception requests only: how long the grant lasts. Defaults to what the agent asked for."
         }
       },
       "required": [
         "hold_id"
       ]
+    },
+    "GrantScope": {
+      "type": "string",
+      "enum": [
+        "once",
+        "session"
+      ],
+      "description": "How long an approved exception lasts: one use, or until the session ends."
     },
     "GuardrailConfirmOut": {
       "type": "object",
@@ -9799,6 +9933,14 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "workspace_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "One of the two, or neither for the global layer."
+        },
         "project_id": {
           "type": [
             "integer",
@@ -9943,6 +10085,14 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "workspace_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "Patch this workspace's layer. At most one of `workspace_id` / `project_id`."
+        },
         "project_id": {
           "type": [
             "integer",
@@ -9950,11 +10100,92 @@
           ],
           "format": "int64"
         },
-        "patch": true
+        "patch": {
+          "description": "Merged into the layer's stored overrides; `null` clears a key back to the inherited value."
+        }
       },
       "required": [
         "patch"
       ]
+    },
+    "GuardrailConfigLayersIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "workspace_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "At most one of the two; neither reads the global layer."
+        },
+        "project_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        }
+      }
+    },
+    "GuardrailConfigLayersOut": {
+      "type": "object",
+      "properties": {
+        "scope": {
+          "$ref": "#/$defs/GuardrailLayer",
+          "description": "The layer asked about."
+        },
+        "workspace_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "project_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "effective": {
+          "$ref": "#/$defs/GuardrailConfig",
+          "description": "What applies at this layer."
+        },
+        "inherited": {
+          "$ref": "#/$defs/GuardrailConfig",
+          "description": "What this layer would get with no overrides of its own: the parent layer's effective config."
+        },
+        "overrides": {
+          "description": "This layer's stored overrides, exactly as stored."
+        },
+        "sources": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/GuardrailLayer"
+          },
+          "description": "Leaf path (`caps.files`, `protected_paths`) to the layer that decided its value."
+        }
+      },
+      "required": [
+        "scope",
+        "effective",
+        "inherited",
+        "overrides",
+        "sources"
+      ]
+    },
+    "GuardrailLayer": {
+      "type": "string",
+      "enum": [
+        "default",
+        "global",
+        "workspace",
+        "project"
+      ],
+      "description": "Which layer of guardrail configuration a value lives in. Each layer overrides the one\nbefore it: defaults, then global, then the project's workspace, then the project."
     },
     "GuardrailCheckIn": {
       "type": "object",
@@ -10141,6 +10372,272 @@
       "required": [
         "subject",
         "verdict"
+      ]
+    },
+    "GuardrailRequestIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "session": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/ExceptionKind",
+          "description": "`command` for a denied command, `path` for a protected path / write root / large rewrite,\n`cap` for the commit caps."
+        },
+        "value": {
+          "type": "string",
+          "description": "The exact command line; the path (worktree-relative or absolute); or `files=N lines=M`."
+        },
+        "reason": {
+          "type": "string",
+          "description": "Why you cannot progress without it. The user reads this before deciding."
+        },
+        "scope": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GrantScope"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What you are asking for; the user may grant less. Default `once`."
+        }
+      },
+      "required": [
+        "session",
+        "kind",
+        "value",
+        "reason"
+      ]
+    },
+    "ExceptionKind": {
+      "type": "string",
+      "enum": [
+        "command",
+        "path",
+        "cap"
+      ],
+      "description": "What an agent asks to be let past. `command` lifts a denied command, `path` a protected\npath, a write root or a destructive-write rule, `cap` the commit caps."
+    },
+    "GuardrailRequestOut": {
+      "type": "object",
+      "properties": {
+        "request": {
+          "$ref": "#/$defs/GuardrailException"
+        },
+        "created": {
+          "type": "boolean",
+          "description": "False when an identical request from this session was already open."
+        },
+        "wait_for": {
+          "type": "string",
+          "description": "The event announcing the answer; wait with `bus.wait {events:[wait_for], matching:{request_id}}`."
+        }
+      },
+      "required": [
+        "request",
+        "created",
+        "wait_for"
+      ]
+    },
+    "GuardrailException": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64",
+          "description": "Also the id of the hold that carries it, so `guardrail.confirm` / `guardrail.reject`\nanswer it with `hold_id` set to this."
+        },
+        "project_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "session": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/$defs/ExceptionKind"
+        },
+        "value": {
+          "type": "string",
+          "description": "The exact command, the path (worktree-relative, a glob, or an absolute root), or the\ncaps wanted (`files=N lines=M`; empty lifts the caps for the grant's life)."
+        },
+        "reason": {
+          "type": "string"
+        },
+        "requested_scope": {
+          "$ref": "#/$defs/GrantScope"
+        },
+        "state": {
+          "$ref": "#/$defs/HoldState"
+        },
+        "scope": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GrantScope"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set once approved."
+        },
+        "active": {
+          "type": "boolean",
+          "description": "Approved, not revoked, and (for `once`) not yet used."
+        },
+        "uses": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "used_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "revoked_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "denial_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "resolved_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "resolved_by": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Actor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "value",
+        "reason",
+        "requested_scope",
+        "state",
+        "active",
+        "uses",
+        "created_at"
+      ],
+      "description": "An agent's request to be let past one guardrail, and — once a person answered — the grant."
+    },
+    "GuardrailRequestGetIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "request_id": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "request_id"
+      ]
+    },
+    "GuardrailRequestsListIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "project_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "session": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GuardrailRequestsFilter"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Default `all`."
+        }
+      }
+    },
+    "GuardrailRequestsFilter": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "all"
+          ]
+        },
+        {
+          "type": "string",
+          "const": "open",
+          "description": "Waiting for an answer."
+        },
+        {
+          "type": "string",
+          "const": "active",
+          "description": "Approved and still usable."
+        }
+      ]
+    },
+    "GuardrailRequestsListOut": {
+      "type": "object",
+      "properties": {
+        "requests": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/GuardrailException"
+          }
+        }
+      },
+      "required": [
+        "requests"
+      ]
+    },
+    "GuardrailGrantRevokeIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "request_id": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "request_id"
       ]
     },
     "WorktreeListIn": {

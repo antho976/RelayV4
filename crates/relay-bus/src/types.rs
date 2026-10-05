@@ -236,6 +236,63 @@ pub struct GuardrailConfig {
     pub roles: RoleAllowlist,
 }
 
+/// Which layer of guardrail configuration a value lives in. Each layer overrides the one
+/// before it: defaults, then global, then the project's workspace, then the project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardrailLayer {
+    Default,
+    Global,
+    Workspace,
+    Project,
+}
+
+/// What an agent asks to be let past. `command` lifts a denied command, `path` a protected
+/// path, a write root or a destructive-write rule, `cap` the commit caps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ExceptionKind {
+    Command,
+    Path,
+    Cap,
+}
+
+/// How long an approved exception lasts: one use, or until the session ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GrantScope {
+    Once,
+    Session,
+}
+
+/// An agent's request to be let past one guardrail, and — once a person answered — the grant.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct GuardrailException {
+    /// Also the id of the hold that carries it, so `guardrail.confirm` / `guardrail.reject`
+    /// answer it with `hold_id` set to this.
+    pub id: Id,
+    pub project_id: Option<Id>,
+    pub session: Option<String>,
+    pub kind: ExceptionKind,
+    /// The exact command, the path (worktree-relative, a glob, or an absolute root), or the
+    /// caps wanted (`files=N lines=M`; empty lifts the caps for the grant's life).
+    pub value: String,
+    pub reason: String,
+    pub requested_scope: GrantScope,
+    pub state: HoldState,
+    /// Set once approved.
+    pub scope: Option<GrantScope>,
+    /// Approved, not revoked, and (for `once`) not yet used.
+    pub active: bool,
+    pub uses: u32,
+    pub used_at: Option<Ts>,
+    pub revoked_at: Option<Ts>,
+    pub denial_reason: Option<String>,
+    pub created_at: Ts,
+    pub resolved_at: Option<Ts>,
+    pub resolved_by: Option<crate::envelope::Actor>,
+}
+
 // ---------------------------------------------------------------- entities
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

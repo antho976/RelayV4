@@ -474,6 +474,9 @@ async fn claude_pre_tool(instance: Instance, actor_override: Option<&str>) -> Re
     }
     if let Some(error) = response.error {
         eprintln!("RELAY blocked {tool}: {} ({})", error.message, error.code);
+        if let Some(hint) = error.hint.as_deref() {
+            eprintln!("RELAY hint: {hint}");
+        }
     } else {
         eprintln!("RELAY blocked {tool}: guardrail returned no result");
     }
@@ -518,6 +521,9 @@ async fn codex_pre_tool(instance: Instance, actor_override: Option<&str>) -> Res
     if response.ok { return Ok(0); }
     if let Some(error) = response.error {
         eprintln!("RELAY blocked {tool}: {} ({})", error.message, error.code);
+        if let Some(hint) = error.hint.as_deref() {
+            eprintln!("RELAY hint: {hint}");
+        }
     } else {
         eprintln!("RELAY blocked {tool}: guardrail returned no result");
     }

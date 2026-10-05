@@ -517,3 +517,283 @@ fn codex_hooks_add_guardrails_and_lifecycle_without_clobbering_project_hooks() {
         assert!(removed["hooks"][event].as_array().unwrap().is_empty());
     }
 }
+
+fn events(rx: &mut tokio::sync::broadcast::Receiver<relay_bus::Event>) -> Vec<relay_bus::Event> {
+    let mut out = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        out.push(event);
+    }
+    out
+}
+
+#[test]
+fn workspace_layer_sits_between_global_and_project_and_null_clears_back() {
+    let fixture = Fixture::new();
+    let engine = &fixture.engine;
+    let set = |payload: Value| ok(engine, Actor::User, "guardrail.config.set", payload);
+    let get = |payload: Value| ok(engine, Actor::User, "guardrail.config.get", payload);
+    set(json!({"patch": {"caps": {"files": 30}}}));
+    set(json!({"workspace_id": 1, "patch": {"caps": {"files": 20}, "denied_commands": ["make deploy"]}}));
+    set(json!({"project_id": 1, "patch": {"caps": {"files": 10}}}));
+
+    assert_eq!(get(json!({}))["caps"], json!({"files": 30, "lines": 2000}));
+    assert_eq!(get(json!({"workspace_id": 1}))["caps"]["files"], 20);
+    let project = get(json!({"project_id": 1}));
+    assert_eq!(project["caps"], json!({"files": 10, "lines": 2000}));
+    assert_eq!(project["denied_commands"], json!(["make deploy"]), "the workspace layer reaches its projects");
+
+    let layers = ok(engine, Actor::User, "guardrail.config.layers", json!({"project_id": 1}));
+    assert_eq!(layers["scope"], "project");
+    assert_eq!(layers["workspace_id"], 1);
+    assert_eq!(layers["inherited"]["caps"]["files"], 20);
+    assert_eq!(layers["overrides"], json!({"caps": {"files": 10}}));
+    assert_eq!(layers["sources"]["caps.files"], "project");
+    assert_eq!(layers["sources"]["caps.lines"], "default");
+    assert_eq!(layers["sources"]["denied_commands"], "workspace");
+    let global = ok(engine, Actor::User, "guardrail.config.layers", json!({}));
+    assert_eq!(global["scope"], "global");
+    assert_eq!(global["sources"]["caps.files"], "global");
+    assert_eq!(global["inherited"]["caps"]["files"], 40, "global inherits the defaults");
+
+    // Clearing the project's only override leaves an empty `caps` object behind. That used to
+    // replace the whole `caps` subtree and make every later read fail to deserialize.
+    let cleared = set(json!({"project_id": 1, "patch": {"caps": {"files": null}}}));
+    assert_eq!(cleared["caps"], json!({"files": 20, "lines": 2000}));
+    let layers = ok(engine, Actor::User, "guardrail.config.layers", json!({"project_id": 1}));
+    assert_eq!(layers["overrides"], json!({}));
+    assert_eq!(layers["sources"]["caps.files"], "workspace");
+    set(json!({"workspace_id": 1, "patch": {"caps": null}}));
+    assert_eq!(get(json!({"project_id": 1}))["caps"]["files"], 30);
+    set(json!({"patch": {"caps": {"files": null}}}));
+    assert_eq!(get(json!({"project_id": 1}))["caps"]["files"], 40, "every layer cleared: the default");
+
+    // A stray empty object written straight into settings merges instead of wiping defaults.
+    ok(engine, Actor::User, "settings.set", json!({"path": "guardrails.projects.1.caps", "value": {}}));
+    assert_eq!(get(json!({"project_id": 1}))["caps"], json!({"files": 40, "lines": 2000}));
+
+    let both = call(engine, Actor::User, "guardrail.config.get", json!({"workspace_id": 1, "project_id": 1}));
+    assert_eq!(error(&both).code, "guardrail.scope");
+    let missing = call(engine, Actor::User, "guardrail.config.set", json!({"workspace_id": 9, "patch": {}}));
+    assert_eq!(error(&missing).code, "workspace.not_found");
+    let nested = call(engine, Actor::User, "guardrail.config.set", json!({"patch": {"workspaces": {"1": {}}}}));
+    assert_eq!(error(&nested).code, "guardrail.config");
+}
+
+#[test]
+fn an_agent_can_ask_but_only_the_user_answers_and_once_means_once() {
+    let fixture = Fixture::new();
+    let engine = &fixture.engine;
+    let session = fixture.session("builder", "claude");
+    let name = session["name"].as_str().unwrap();
+    let agent = Actor::agent(name);
+    let mut rx = engine.subscribe();
+    let push = json!({"session": name, "kind": "exec", "command": "git push --force origin main"});
+
+    let refused = call(engine, agent.clone(), "guardrail.gate", push.clone());
+    let refusal = error(&refused);
+    assert_eq!(refusal.code, "guardrail.command");
+    assert!(refusal.hint.as_deref().unwrap().contains("guardrail.request"), "the agent is told it can ask");
+    assert_eq!(refusal.details.as_ref().unwrap()["exception"],
+        json!({"kind": "command", "value": "git push --force origin main"}));
+
+    let asked = ok(engine, agent.clone(), "guardrail.request", json!({
+        "kind": "command", "value": "git push --force origin main",
+        "reason": "the remote branch was rebased by the user and must be replaced",
+    }));
+    assert_eq!(asked["created"], true);
+    assert_eq!(asked["wait_for"], "guardrail.request_resolved");
+    assert_eq!(asked["request"]["state"], "open");
+    assert_eq!(asked["request"]["session"], name, "the engine fills the bound session");
+    let id = asked["request"]["id"].as_i64().unwrap();
+    let again = ok(engine, agent.clone(), "guardrail.request", json!({
+        "kind": "command", "value": "git push --force origin main", "reason": "still need it",
+    }));
+    assert_eq!(again["created"], false);
+    assert_eq!(again["request"]["id"], id, "asking twice is one question");
+
+    let holds = ok(engine, Actor::User, "guardrail.holds.list", json!({}));
+    let hold = holds["holds"].as_array().unwrap().iter().find(|hold| hold["id"] == id).unwrap();
+    assert_eq!(hold["op"], "guardrail.request");
+    assert_eq!(hold["policy"], "exception");
+    let notices = ok(engine, Actor::User, "notify.list", json!({}));
+    assert!(notices.to_string().contains("Agent requests a guardrail exception"), "{notices}");
+    let seen = events(&mut rx);
+    assert!(seen.iter().any(|event| event.ev == "guardrail.requested" && event.payload["request_id"] == id));
+    assert!(seen.iter().any(|event| event.ev == "guardrail.held" && event.payload["policy"] == "exception"));
+
+    // No self-approval: the answer is user-only, on the bus and through a shell.
+    let own = call(engine, agent.clone(), "guardrail.confirm", json!({"hold_id": id}));
+    assert_eq!(error(&own).code, "actor.allowlist");
+    let shell = call(engine, agent.clone(), "guardrail.gate", json!({
+        "session": name, "kind": "exec",
+        "command": format!("$RELAY_BIN --actor user q guardrail.confirm '{{\"hold_id\":{id}}}'"),
+    }));
+    assert_eq!(error(&shell).code, "guardrail.self_approval");
+
+    let approved = ok(engine, Actor::User, "guardrail.confirm", json!({"hold_id": id, "scope": "once"}));
+    assert_eq!(approved["hold"]["state"], "confirmed");
+    assert_eq!(approved["outcome"]["result"]["active"], true);
+    let seen = events(&mut rx);
+    let resolved = seen.iter().find(|event| event.ev == "guardrail.request_resolved").unwrap();
+    assert_eq!(resolved.payload["request_id"], id);
+    assert_eq!(resolved.payload["state"], "confirmed");
+    assert_eq!(resolved.payload["scope"], "once");
+    let inbox = ok(engine, agent.clone(), "mailbox.list", json!({"unread_only": true}));
+    assert!(inbox.to_string().contains("approved for one use"), "{inbox}");
+
+    // A grant is for the exact command: a longer one is not covered.
+    let wider = call(engine, agent.clone(), "guardrail.gate",
+        json!({"session": name, "kind": "exec", "command": "git push --force origin main other"}));
+    assert_eq!(error(&wider).code, "guardrail.command");
+    // Every denied command in a line needs its own grant.
+    let chained = call(engine, agent.clone(), "guardrail.gate",
+        json!({"session": name, "kind": "exec", "command": "git reset --hard && git push --force origin main"}));
+    assert_eq!(error(&chained).code, "guardrail.command");
+    assert!(error(&chained).message.contains("git reset --hard"), "{}", error(&chained).message);
+    assert!(ok(engine, agent.clone(), "guardrail.request.get", json!({"request_id": id}))["active"] == true,
+        "a refused action does not use the grant up");
+
+    ok(engine, agent.clone(), "guardrail.gate",
+        json!({"session": name, "kind": "exec", "command": "cd repo && git push --force origin main"}));
+    let used = ok(engine, agent.clone(), "guardrail.request.get", json!({"request_id": id}));
+    assert_eq!(used["active"], false);
+    assert_eq!(used["uses"], 1);
+    assert!(used["used_at"].is_string());
+    let second = call(engine, agent.clone(), "guardrail.gate", push);
+    assert_eq!(error(&second).code, "guardrail.command", "once means once");
+    let active = ok(engine, Actor::User, "guardrail.requests.list", json!({"state": "active"}));
+    assert_eq!(active["requests"], json!([]));
+}
+
+#[test]
+fn session_grants_cover_paths_roots_and_caps_until_revoked_and_denials_say_why() {
+    let fixture = Fixture::new();
+    let engine = &fixture.engine;
+    ok(engine, Actor::User, "guardrail.config.set", json!({"project_id": 1, "patch": {
+        "protected_paths": ["secret/**"], "caps": {"files": 1, "lines": 2},
+    }}));
+    let session = fixture.session("builder", "codex");
+    let name = session["name"].as_str().unwrap();
+    let agent = Actor::agent(name);
+    let write = |path: &str| call(engine, agent.clone(), "guardrail.gate",
+        json!({"session": name, "kind": "write", "path": path, "new_text": "x\n"}));
+    let ask = |kind: &str, value: &str, scope: &str| {
+        ok(engine, agent.clone(), "guardrail.request", json!({
+            "kind": kind, "value": value, "reason": "needed for the task", "scope": scope,
+        }))["request"]["id"].as_i64().unwrap()
+    };
+
+    assert_eq!(error(&write("secret/key")).code, "guardrail.protected_path");
+    let path_grant = ask("path", "secret/key", "session");
+    let pending = ok(engine, Actor::User, "guardrail.requests.list", json!({"state": "open"}));
+    assert_eq!(pending["requests"][0]["requested_scope"], "session");
+    // Approved with no scope: what the agent asked for.
+    ok(engine, Actor::User, "guardrail.confirm", json!({"hold_id": path_grant}));
+    assert!(write("secret/key").ok);
+    assert!(write("secret/key").ok, "a session grant lasts");
+    assert_eq!(error(&write("secret/other")).code, "guardrail.protected_path", "only the granted path");
+    let listed = ok(engine, Actor::User, "guardrail.requests.list", json!({"state": "active", "session": name}));
+    assert_eq!(listed["requests"][0]["uses"], 2);
+    ok(engine, Actor::User, "guardrail.grant.revoke", json!({"request_id": path_grant}));
+    assert_eq!(error(&write("secret/key")).code, "guardrail.protected_path", "revoked");
+    let twice = call(engine, Actor::User, "guardrail.grant.revoke", json!({"request_id": path_grant}));
+    assert_eq!(error(&twice).code, "guardrail.grant_inactive");
+    let agent_revoke = call(engine, agent.clone(), "guardrail.grant.revoke", json!({"request_id": path_grant}));
+    assert_eq!(error(&agent_revoke).code, "actor.allowlist");
+
+    // An absolute root outside every write root.
+    let outside = "/opt/relay-grant-test/out.txt";
+    let refused = write(outside);
+    assert_eq!(error(&refused).code, "guardrail.write_root");
+    assert_eq!(error(&refused).details.as_ref().unwrap()["exception"]["kind"], "path");
+    let root = ask("path", "/opt/relay-grant-test", "once");
+    ok(engine, Actor::User, "guardrail.confirm", json!({"hold_id": root}));
+    assert!(write(outside).ok);
+    assert_eq!(error(&write(outside)).code, "guardrail.write_root");
+
+    // Commit caps.
+    let worktree = PathBuf::from(session["worktree"].as_str().unwrap());
+    std::fs::write(worktree.join("one.txt"), "one\ntwo\n").unwrap();
+    std::fs::write(worktree.join("two.txt"), "three\nfour\n").unwrap();
+    git(&worktree, &["add", "one.txt", "two.txt"]);
+    let commit = || call(engine, agent.clone(), "guardrail.gate", json!({"session": name, "kind": "commit"}));
+    let capped = commit();
+    assert_eq!(error(&capped).code, "guardrail.cap");
+    let suggested = error(&capped).details.as_ref().unwrap()["exception"]["value"].as_str().unwrap().to_string();
+    assert_eq!(suggested, "files=2 lines=4");
+    let small = ask("cap", "files=2 lines=3", "once");
+    ok(engine, Actor::User, "guardrail.confirm", json!({"hold_id": small}));
+    assert_eq!(error(&commit()).code, "guardrail.cap", "a grant below the commit's size does not cover it");
+    let enough = ask("cap", &suggested, "once");
+    ok(engine, Actor::User, "guardrail.confirm", json!({"hold_id": enough}));
+    assert!(commit().ok);
+
+    // A denial reaches the agent with its reason.
+    let mut rx = engine.subscribe();
+    let denied = ask("command", "rm -rf build", "once");
+    let rejected = ok(engine, Actor::User, "guardrail.reject", json!({"hold_id": denied, "reason": "use cargo clean"}));
+    assert_eq!(rejected["hold"]["state"], "rejected");
+    let read = ok(engine, agent.clone(), "guardrail.request.get", json!({"request_id": denied}));
+    assert_eq!(read["state"], "rejected");
+    assert_eq!(read["denial_reason"], "use cargo clean");
+    assert!(events(&mut rx).iter().any(|event| event.ev == "guardrail.request_resolved"
+        && event.payload["state"] == "rejected" && event.payload["reason"] == "use cargo clean"));
+
+    let bad = call(engine, agent.clone(), "guardrail.request", json!({"kind": "path", "value": "../up", "reason": "x"}));
+    assert_eq!(error(&bad).code, "guardrail.request");
+    let no_reason = call(engine, agent, "guardrail.request", json!({"kind": "command", "value": "x", "reason": " "}));
+    assert_eq!(error(&no_reason).code, "guardrail.request");
+}
+
+#[test]
+fn agents_cannot_answer_guardrails_as_the_user_from_a_shell() {
+    let fixture = Fixture::new();
+    let engine = &fixture.engine;
+    let session = fixture.session("builder", "codex");
+    let name = session["name"].as_str().unwrap();
+    let agent = Actor::agent(name);
+    let exec = |command: &str| call(engine, agent.clone(), "guardrail.gate",
+        json!({"session": name, "kind": "exec", "command": command}));
+    for command in [
+        "relay q guardrail.confirm '{\"hold_id\":1}'",
+        "/usr/local/bin/relay --actor user q task.list",
+        "$RELAY_BIN --actor=user q settings.get",
+        "env -u RELAY_SESSION relay q guardrail.reject '{\"hold_id\":1}'",
+        "RELAY_SESSION= relay q task.list",
+        "cargo test && relay q guardrail.config.set '{\"patch\":{}}'",
+    ] {
+        let response = exec(command);
+        assert_eq!(error(&response).code, "guardrail.self_approval", "{command}");
+    }
+    for command in ["relay q task.list", "grep guardrail.confirm docs/engine/BUS.md", "relay q guardrail.check '{}'"] {
+        assert!(exec(command).ok, "{command} is not self-approval");
+    }
+
+    // A command grant does not lift it.
+    let sneaky = "relay q guardrail.confirm '{\"hold_id\":1}'";
+    let id = ok(engine, agent.clone(), "guardrail.request", json!({"kind": "command", "value": sneaky, "reason": "x"}))
+        ["request"]["id"].as_i64().unwrap();
+    ok(engine, Actor::User, "guardrail.confirm", json!({"hold_id": id, "scope": "session"}));
+    assert_eq!(error(&exec(sneaky)).code, "guardrail.self_approval");
+}
+
+#[test]
+fn every_role_may_ask_for_an_exception_but_only_for_itself() {
+    let fixture = Fixture::new();
+    let engine = &fixture.engine;
+    let reviewer = fixture.session("reviewer", "codex");
+    let builder = fixture.session("builder", "codex");
+    let reviewer_name = reviewer["name"].as_str().unwrap();
+    let asked = call(engine, Actor::agent(reviewer_name), "guardrail.request",
+        json!({"kind": "command", "value": "cargo publish --dry-run", "reason": "verify packaging"}));
+    assert!(asked.ok, "{:?}", asked.error);
+    let ops = ok(engine, Actor::agent(reviewer_name), "bus.ops", json!({}));
+    let row = ops["ops"].as_array().unwrap().iter().find(|op| op["name"] == "guardrail.request").unwrap();
+    assert_ne!(row["call"], "no", "{}", row["why"]);
+    let foreign = call(engine, Actor::agent(reviewer_name), "guardrail.request", json!({
+        "session": builder["name"], "kind": "command", "value": "x", "reason": "x",
+    }));
+    assert_eq!(error(&foreign).code, "actor.scope");
+    let bootstrap = ok(engine, Actor::agent(reviewer_name), "session.bootstrap", json!({}));
+    assert!(bootstrap["guardrails"]["exceptions"].as_str().unwrap().contains("guardrail.request"));
+}

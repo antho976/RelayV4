@@ -1033,6 +1033,26 @@ async fn socket_door_round_trip_and_events() {
     assert_eq!(result["timed_out"], false);
     assert_eq!(result["event"]["ev"], "settings.changed");
 
+    // `matching` takes this waiter's own event, not the first one of the same name.
+    let mut picky = Client::connect(&server.path).await.unwrap();
+    let wait = tokio::spawn(async move {
+        picky
+            .call(
+                &Request::new(Actor::User, "bus.wait", json!({
+                    "events": ["settings.*"], "matching": {"path": "mine"}, "timeout_ms": 5000,
+                })),
+                |_| {},
+            )
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    c.call(&Request::new(Actor::User, "settings.set", json!({"path": "theirs", "value": 1})), |_| {}).await.unwrap();
+    c.call(&Request::new(Actor::User, "settings.set", json!({"path": "mine", "value": 2})), |_| {}).await.unwrap();
+    let woken = tokio::time::timeout(std::time::Duration::from_secs(5), wait).await.unwrap().unwrap();
+    let result = woken.result.unwrap();
+    assert_eq!(result["event"]["payload"]["path"], "mine", "the waiter took someone else's event");
+
     // …and gives up rather than hanging when nothing matches.
     let mut idle = Client::connect(&server.path).await.unwrap();
     let timed_out = idle

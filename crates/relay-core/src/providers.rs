@@ -43,7 +43,10 @@ provider including Codex, which your own cross-agent messaging tool does not; se
 peer already holding them — and one line of what you are doing with `session.intent`. Before \
 starting sizeable work, call `guardrail.explain` with structured paths, lines, and commands; \
 `guardrail.check` tests one command or write. `bus.wait` blocks until something happens, so \
-never poll. Work on `task` first; `tasks` is the remaining ordered queue. Report each current \
+never poll. When a guardrail refuses something you cannot progress without, do not work around \
+it: call `guardrail.request` with the `kind` and `value` its hint names and a `reason`, then \
+`bus.wait` for `guardrail.request_resolved` matching your `request_id` and retry once approved; \
+only the user can approve it. Work on `task` first; `tasks` is the remaining ordered queue. Report each current \
 task through `session.done` with `status` `completed`, `blocked` or `partial`. All builders must \
 finish before the task enters review. A shared-worktree group stays on that task until every \
 reviewer finishes; do not begin queued work while peers are still building or reviewing. Relay \

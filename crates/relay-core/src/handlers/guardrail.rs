@@ -2,61 +2,150 @@
 //! confirmation/rejection and effective configuration.
 
 use crate::engine::{Ctx, Engine, IntoBus};
-use crate::guardrail::{self, Decision, GateRequest};
-use crate::handlers::workspace::get_project;
+use crate::guardrail::{self, grants, ConfigScope, Decision, GateRequest};
+use crate::handlers::workspace::{get_project, get_workspace};
 use crate::sessions;
 use relay_bus::envelope::{Request, Response};
 use relay_bus::error::BusError;
 use relay_bus::ops::guardrail::*;
-use relay_bus::types::{GateKind, HoldState, Id, Verdict};
-use rusqlite::params;
-use serde_json::json;
+use relay_bus::types::{GateKind, GrantScope, GuardrailLayer, HoldState, Id, Verdict};
+use rusqlite::{params, Connection};
+use serde_json::{json, Value};
 use std::path::Path;
+
+/// Which layer a `workspace_id` / `project_id` pair names. Both at once is ambiguous: a project
+/// already sits on its workspace.
+fn scope_of(conn: &Connection, workspace_id: Option<Id>, project_id: Option<Id>) -> Result<ConfigScope, BusError> {
+    match (workspace_id, project_id) {
+        (Some(_), Some(_)) => Err(BusError::invalid(
+            "guardrail.scope",
+            "give workspace_id or project_id, not both: a project already inherits its workspace",
+        )),
+        (Some(id), None) => get_workspace(conn, id).map(|_| ConfigScope::Workspace(id)),
+        (None, Some(id)) => get_project(conn, id).map(|_| ConfigScope::Project(id)),
+        (None, None) => Ok(ConfigScope::Global),
+    }
+}
+
+fn delete_settings_under(conn: &Connection, path: &str) -> Result<(), BusError> {
+    let like = format!("{}.%", path.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
+    conn.execute("DELETE FROM settings WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'", params![path, like]).bus()?;
+    Ok(())
+}
 
 pub fn register(engine: &mut Engine) {
     engine.register::<ConfigGet>(|ctx, payload| {
-        guardrail::config(ctx.tx(), payload.project_id)
+        let scope = scope_of(ctx.tx(), payload.workspace_id, payload.project_id)?;
+        guardrail::config_for(ctx.tx(), scope)
     });
 
     engine.register::<ConfigSet>(|ctx: &mut Ctx, payload| {
-        if !payload.patch.is_object() {
+        let Some(patch) = payload.patch.as_object() else {
             return Err(BusError::invalid("guardrail.config", "patch must be an object"));
-        }
-        if let Some(project_id) = payload.project_id {
-            get_project(ctx.tx(), project_id)?;
-            ctx.set_project(project_id);
-        }
-        let path = payload.project_id.map(|id| format!("guardrails.projects.{id}"));
-        let before = if let Some(path) = &path {
-            crate::handlers::settings::get(ctx.tx(), Some(path))?
-        } else {
-            serde_json::to_value(guardrail::config(ctx.tx(), None)?)
-                .map_err(crate::engine::internal)?
         };
-        let mut merged = if before.is_object() { before.clone() } else { json!({}) };
+        if patch.contains_key("projects") || patch.contains_key("workspaces") {
+            return Err(BusError::invalid(
+                "guardrail.config",
+                "patch a project or workspace layer with project_id / workspace_id, not a nested key",
+            ));
+        }
+        let scope = scope_of(ctx.tx(), payload.workspace_id, payload.project_id)?;
+        if let ConfigScope::Project(id) = scope {
+            ctx.set_project(id);
+        }
+        // Each layer stores only what it overrides, so clearing a key (`null`) brings the
+        // inherited value back instead of freezing a copy of it.
+        let before = guardrail::layers(ctx.tx(), scope)?
+            .raw
+            .pop()
+            .map(|(_, raw)| raw)
+            .unwrap_or_else(|| json!({}));
+        let mut merged = before.clone();
         crate::handlers::settings::merge_value(&mut merged, &payload.patch);
-        if let Some(path) = &path {
-            crate::handlers::settings::set(ctx.tx(), path, &merged, &ctx.now.clone())?;
-        } else {
-            // Write global keys independently: replacing `guardrails` as a whole would
-            // delete the separately stored `guardrails.projects.*` overrides.
-            let object = merged.as_object().ok_or_else(|| {
-                BusError::invalid("guardrail.config", "merged config must be an object")
-            })?;
-            for (key, value) in object {
-                crate::handlers::settings::set(
-                    ctx.tx(),
-                    &format!("guardrails.{key}"),
-                    value,
-                    &ctx.now.clone(),
-                )?;
+        guardrail::prune_empty(&mut merged);
+        let now = ctx.now.clone();
+        let layer_path = match scope {
+            ConfigScope::Global => None,
+            ConfigScope::Workspace(id) => Some(format!("guardrails.workspaces.{id}")),
+            ConfigScope::Project(id) => Some(format!("guardrails.projects.{id}")),
+        };
+        match &layer_path {
+            Some(path) => {
+                delete_settings_under(ctx.tx(), path)?;
+                if merged.as_object().is_some_and(|map| !map.is_empty()) {
+                    crate::handlers::settings::set(ctx.tx(), path, &merged, &now)?;
+                }
+            }
+            None => {
+                // Write global keys independently: replacing `guardrails` as a whole would
+                // delete the separately stored project and workspace layers.
+                let keys: std::collections::BTreeSet<String> = before
+                    .as_object()
+                    .into_iter()
+                    .chain(merged.as_object())
+                    .flat_map(|map| map.keys().cloned())
+                    .collect();
+                for key in keys {
+                    let path = format!("guardrails.{key}");
+                    delete_settings_under(ctx.tx(), &path)?;
+                    if let Some(value) = merged.get(&key) {
+                        crate::handlers::settings::set(ctx.tx(), &path, value, &now)?;
+                    }
+                }
             }
         }
         // Typed read validates the merged result. An error rolls the handler transaction back.
-        let effective = guardrail::config(ctx.tx(), payload.project_id)?;
-        ctx.set_undo("guardrail.config.set", json!({"project_id": payload.project_id, "patch": before}), None);
-        ctx.emit("guardrail.config_changed", json!({"project_id": payload.project_id}));
+        let effective = guardrail::config_for(ctx.tx(), scope)?;
+        ctx.set_undo(
+            "guardrail.config.set",
+            json!({
+                "workspace_id": payload.workspace_id, "project_id": payload.project_id,
+                "patch": guardrail::inverse_patch(&before, &merged),
+            }),
+            None,
+        );
+        ctx.emit(
+            "guardrail.config_changed",
+            json!({"project_id": payload.project_id, "workspace_id": payload.workspace_id}),
+        );
         Ok(effective)
+    });
+
+    engine.register::<ConfigLayers>(|ctx, payload| {
+        let scope = scope_of(ctx.tx(), payload.workspace_id, payload.project_id)?;
+        let mut layers = guardrail::layers(ctx.tx(), scope)?;
+        let (layer, effective) = layers.stages.pop().ok_or_else(|| BusError::internal("no guardrail layers"))?;
+        let (_, inherited) = layers.stages.pop().ok_or_else(|| BusError::internal("no inherited layer"))?;
+        let overrides = layers.raw.last().map(|(_, raw)| raw.clone()).unwrap_or_else(|| json!({}));
+        let effective = guardrail::typed(effective)?;
+        let inherited = guardrail::typed(inherited)?;
+        let effective_value = serde_json::to_value(&effective).map_err(crate::engine::internal)?;
+        let inherited_value = serde_json::to_value(&inherited).map_err(crate::engine::internal)?;
+        let mut leaves = Vec::new();
+        guardrail::leaf_paths(&effective_value, "", &mut leaves);
+        let at = |value: &Value, path: &str| path.split('.').try_fold(value, |v, part| v.get(part)).cloned();
+        let sources = leaves
+            .into_iter()
+            .map(|path| {
+                let set_by = layers.raw.iter().rev().find(|(_, raw)| guardrail::sets_path(raw, &path)).map(|(l, _)| *l);
+                // The project's legacy columns add to protected paths and shape gates without
+                // a stored override.
+                let legacy = layer == GuardrailLayer::Project
+                    && layers.legacy
+                    && at(&effective_value, &path) != at(&inherited_value, &path);
+                let source = set_by.or(legacy.then_some(GuardrailLayer::Project)).unwrap_or(GuardrailLayer::Default);
+                (path, source)
+            })
+            .collect();
+        Ok(ConfigLayersOut {
+            scope: layer,
+            workspace_id: layers.workspace_id,
+            project_id: payload.project_id,
+            effective,
+            inherited,
+            overrides,
+            sources,
+        })
     });
 
     engine.register::<Check>(|ctx, payload| {
@@ -64,7 +153,9 @@ pub fn register(engine: &mut Engine) {
         // A dry run has to judge the tree the write would land in. Judging the project root
         // would answer a question the caller did not ask (D111).
         let worktree = crate::handlers::file::default_worktree(ctx, &project, None)?;
-        let decision = guardrail::evaluate(
+        // A dry run honours this session's grants, so an agent can see an approval land; it
+        // never uses one up.
+        let (decision, _) = guardrail::evaluate_granted(
             ctx.tx(),
             &GateRequest {
                 actor: &ctx.actor,
@@ -76,7 +167,9 @@ pub fn register(engine: &mut Engine) {
                 diff: payload.diff.as_deref(),
                 command: payload.command.as_deref(),
                 skip_policy: None,
+                grants: None,
             },
+            ctx.actor_session_id(),
         )?;
         Ok(check_out(decision))
     });
@@ -115,6 +208,7 @@ pub fn register(engine: &mut Engine) {
                     diff: Some(""),
                     command: None,
                     skip_policy: None,
+                    grants: None,
                 },
             );
             let item = match decision {
@@ -152,6 +246,7 @@ pub fn register(engine: &mut Engine) {
                     diff: None,
                     command: Some(&command),
                     skip_policy: None,
+                    grants: None,
                 },
             )?;
             let item = match decision {
@@ -227,6 +322,164 @@ pub fn register(engine: &mut Engine) {
     });
     engine.register::<Confirm>(confirm);
     engine.register::<Reject>(reject);
+    engine.register::<ExceptionRequest>(request);
+    engine.register::<ExceptionGet>(|ctx, payload| grants::by_id(ctx.tx(), payload.request_id));
+    engine.register::<ExceptionsList>(|ctx, payload| {
+        let mut sql = String::from("SELECT * FROM holds WHERE op = 'guardrail.request'");
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(project_id) = payload.project_id {
+            sql.push_str(" AND project_id = ?");
+            args.push(Box::new(project_id));
+        }
+        if let Some(session) = payload.session {
+            sql.push_str(" AND session = ?");
+            args.push(Box::new(session));
+        }
+        let filter = payload.state.unwrap_or(ExceptionFilter::All);
+        match filter {
+            ExceptionFilter::Open => sql.push_str(" AND state = 'open'"),
+            ExceptionFilter::Active => sql.push_str(" AND state = 'confirmed'"),
+            ExceptionFilter::All => {}
+        }
+        sql.push_str(" ORDER BY id DESC LIMIT 500");
+        let mut stmt = ctx.tx().prepare(&sql).bus()?;
+        let holds = stmt
+            .query_map(rusqlite::params_from_iter(args.iter().map(|arg| arg.as_ref())), guardrail::hold_row)
+            .bus()?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .bus()?;
+        let requests = holds
+            .iter()
+            .map(grants::exception)
+            .filter(|request| filter != ExceptionFilter::Active || request.active)
+            .collect();
+        Ok(ExceptionsListOut { requests })
+    });
+    engine.register::<GrantRevoke>(revoke);
+}
+
+/// `guardrail.request`: an agent that cannot progress asks a person to let it past one rule.
+fn request(ctx: &mut Ctx, payload: ExceptionRequestIn) -> Result<ExceptionRequestOut, BusError> {
+    let session = sessions::by_name(ctx.tx(), &payload.session)?;
+    if let Some(actor_session_id) = ctx.actor_session_id() {
+        if actor_session_id != session.session.id {
+            return Err(BusError::not_own("session"));
+        }
+    }
+    grants::validate(payload.kind, &payload.value, &payload.reason)?;
+    let project_id = session.session.project_id;
+    let session_id = session.session.id;
+    let name = session.session.name.clone();
+    ctx.set_project(project_id);
+    ctx.set_session(session_id);
+    let wait_for = grants::RESOLVED_EVENT.to_string();
+    // Asking twice is one question. An approval that is still live is the answer already.
+    if let Some(request) = grants::existing(ctx.tx(), session_id, payload.kind, &payload.value)? {
+        return Ok(ExceptionRequestOut { request, created: false, wait_for });
+    }
+    let scope = payload.scope.unwrap_or(GrantScope::Once);
+    let details = grants::details(payload.kind, &payload.value, &payload.reason, scope);
+    let frozen = Request::new(
+        ctx.actor.clone(),
+        grants::OP,
+        serde_json::to_value(&payload).map_err(crate::engine::internal)?,
+    )
+    .with_id(ctx.req_id);
+    let hold_id = grants::insert(
+        ctx.tx(), &frozen, project_id, session_id, &name, &details,
+        payload.kind, payload.value.trim(), &payload.reason, &ctx.now,
+    )?;
+    let request = grants::by_id(ctx.tx(), hold_id)?;
+    ctx.emit("guardrail.requested", json!({
+        "request_id": hold_id, "hold_id": hold_id, "session": name,
+        "kind": payload.kind, "value": request.value, "reason": request.reason, "scope": scope,
+    }));
+    ctx.emit("guardrail.held", json!({
+        "hold_id": hold_id, "request_id": hold_id, "session": name, "policy": grants::POLICY,
+    }));
+    ctx.emit("notify.new", json!({"category": "guardrail", "project_id": project_id, "hold_id": hold_id}));
+    Ok(ExceptionRequestOut { request, created: true, wait_for })
+}
+
+/// Approve an exception request: no replay, just a grant the session's next gates can use.
+fn approve(ctx: &mut Ctx, hold: relay_bus::types::Hold, scope: Option<GrantScope>) -> Result<ConfirmOut, BusError> {
+    let requested = grants::exception(&hold);
+    let scope = scope.unwrap_or(requested.requested_scope);
+    ctx.tx().execute(
+        "UPDATE holds SET state = 'confirmed', resolved_at = ?1, resolved_by = ?2,
+             details = json_set(details, '$.grant', json(?3))
+         WHERE id = ?4 AND state = 'open'",
+        params![
+            ctx.now, ctx.actor.to_string(),
+            json!({"scope": scope, "uses": 0, "used_at": null, "revoked_at": null}).to_string(),
+            hold.id,
+        ],
+    ).bus()?;
+    let resolved = guardrail::hold_by_id(ctx.tx(), hold.id)?;
+    let exception = grants::exception(&resolved);
+    if let Some(project_id) = hold.project_id { ctx.set_project(project_id); }
+    if let Some(session_id) = hold.session_id { ctx.set_session(session_id); }
+    let by = ctx.actor.to_string();
+    ctx.emit("guardrail.resolved", json!({
+        "hold_id": hold.id, "request_id": hold.id, "state": "confirmed", "scope": scope, "by": by,
+    }));
+    ctx.emit(grants::RESOLVED_EVENT, json!({
+        "request_id": hold.id, "session": hold.session, "state": "confirmed", "scope": scope,
+    }));
+    if let (Some(project_id), Some(session)) = (hold.project_id, hold.session.as_deref()) {
+        let lasting = match scope {
+            GrantScope::Once => "for one use",
+            GrantScope::Session => "for the rest of this session",
+        };
+        if let Some(message) = super::notes::send_system_priority(
+            ctx.tx(), project_id, session,
+            &format!(
+                "Guardrail exception {} approved {lasting} by {}: you may now {}. Retry the action.",
+                hold.id, grants::by_line(&ctx.actor), grants::describe(exception.kind, &exception.value),
+            ),
+            None, &ctx.now,
+        )? {
+            ctx.emit("mailbox.new", serde_json::to_value(message).bus()?);
+        }
+    }
+    let outcome = Response::ok(ctx.req_id, serde_json::to_value(&exception).map_err(crate::engine::internal)?);
+    Ok(ConfirmOut { hold: resolved, outcome })
+}
+
+/// `guardrail.grant.revoke`: end an approved exception early.
+fn revoke(ctx: &mut Ctx, payload: GrantRevokeIn) -> Result<relay_bus::types::GuardrailException, BusError> {
+    let exception = grants::by_id(ctx.tx(), payload.request_id)?;
+    if !exception.active {
+        return Err(BusError::conflict(
+            "guardrail.grant_inactive",
+            format!("exception {} is not an active grant", exception.id),
+        ));
+    }
+    ctx.tx().execute(
+        "UPDATE holds SET details = json_set(details, '$.grant.revoked_at', ?1) WHERE id = ?2",
+        params![ctx.now, exception.id],
+    ).bus()?;
+    let revoked = grants::by_id(ctx.tx(), exception.id)?;
+    if let Some(project_id) = exception.project_id { ctx.set_project(project_id); }
+    ctx.emit("guardrail.resolved", json!({
+        "hold_id": exception.id, "request_id": exception.id, "state": "revoked", "by": ctx.actor.to_string(),
+    }));
+    ctx.emit(grants::RESOLVED_EVENT, json!({
+        "request_id": exception.id, "session": exception.session, "state": "revoked",
+    }));
+    if let (Some(project_id), Some(session)) = (exception.project_id, exception.session.as_deref()) {
+        if let Some(message) = super::notes::send_system_priority(
+            ctx.tx(), project_id, session,
+            &format!(
+                "Guardrail exception {} was revoked by {}: you may no longer {}.",
+                exception.id, grants::by_line(&ctx.actor), grants::describe(exception.kind, &exception.value),
+            ),
+            None, &ctx.now,
+        )? {
+            ctx.emit("mailbox.new", serde_json::to_value(message).bus()?);
+        }
+    }
+    Ok(revoked)
 }
 
 fn gate(ctx: &mut Ctx, payload: GateIn, skip_policy: Option<&str>) -> Result<GateOut, BusError> {
@@ -239,7 +492,7 @@ fn gate(ctx: &mut Ctx, payload: GateIn, skip_policy: Option<&str>) -> Result<Gat
     let project_id = session.session.project_id;
     ctx.set_project(project_id);
     ctx.set_session(session.session.id);
-    let decision = guardrail::evaluate(
+    let (decision, used) = guardrail::evaluate_granted(
         ctx.tx(),
         &GateRequest {
             actor: &ctx.actor,
@@ -251,10 +504,15 @@ fn gate(ctx: &mut Ctx, payload: GateIn, skip_policy: Option<&str>) -> Result<Gat
             diff: payload.diff.as_deref(),
             command: payload.command.as_deref(),
             skip_policy,
+            grants: None,
         },
+        Some(session.session.id),
     )?;
     match decision {
-        Decision::Allow => Ok(GateOut { verdict: Verdict::Allow, error: None, hold_id: None }),
+        Decision::Allow => {
+            use_grants(ctx, &used, Some(&payload.session))?;
+            Ok(GateOut { verdict: Verdict::Allow, error: None, hold_id: None })
+        }
         Decision::Refuse(error) => {
             guardrail::insert_refusal_notification(ctx.tx(), project_id, &ctx.actor, &error, &ctx.now)?;
             ctx.commit_error(None);
@@ -297,6 +555,9 @@ fn confirm(ctx: &mut Ctx, payload: ConfirmIn) -> Result<ConfirmOut, BusError> {
         ));
     }
     let frozen = guardrail::frozen_request(ctx.tx(), hold.id)?;
+    if frozen.op == grants::OP {
+        return approve(ctx, hold, payload.scope);
+    }
     if frozen.op != "guardrail.gate" {
         let outcome = match ctx.replay_registered(&frozen.op, frozen.payload.clone(), hold.actor.clone(), hold.policy.clone()) {
             Ok(value) => Response::ok(ctx.req_id, value),
@@ -330,6 +591,7 @@ fn confirm(ctx: &mut Ctx, payload: ConfirmIn) -> Result<ConfirmOut, BusError> {
             diff: gate_payload.diff.as_deref(),
             command: gate_payload.command.as_deref(),
             skip_policy: Some(&hold.policy),
+            grants: None,
         },
     )?;
 
@@ -390,12 +652,13 @@ pub(crate) fn enforce(
     ctx: &mut Ctx, project_id: Id, worktree: &Path, kind: GateKind, path: Option<&str>,
     new_text: Option<&str>, diff: Option<&str>, command: Option<&str>,
 ) -> Result<(), BusError> {
-    let decision = guardrail::evaluate(ctx.tx(), &GateRequest {
+    let session_id = ctx.actor_session_id();
+    let (decision, used) = guardrail::evaluate_granted(ctx.tx(), &GateRequest {
         actor: &ctx.actor, project_id, worktree, kind, path, new_text, diff, command,
-        skip_policy: ctx.skip_policy(),
-    })?;
+        skip_policy: ctx.skip_policy(), grants: None,
+    }, session_id)?;
     match decision {
-        Decision::Allow => Ok(()),
+        Decision::Allow => use_grants(ctx, &used, None),
         Decision::Refuse(error) => {
             guardrail::insert_refusal_notification(ctx.tx(), project_id, &ctx.actor, &error, &ctx.now)?;
             ctx.commit_error(None);
@@ -444,17 +707,41 @@ fn reject(ctx: &mut Ctx, payload: RejectIn) -> Result<RejectOut, BusError> {
     if let Some(session_id) = hold.session_id {
         ctx.set_session(session_id);
     }
+    let is_request = hold.op == grants::OP;
+    let reason = payload.reason.as_deref().unwrap_or("no reason provided");
     if let (Some(project_id), Some(session)) = (hold.project_id, hold.session.as_deref()) {
-        if let Some(message) = super::notes::send_system_priority(
-            ctx.tx(), project_id, session,
-            &format!("Guardrail hold {} was rejected: {}", hold.id, payload.reason.as_deref().unwrap_or("no reason provided")),
-            None, &ctx.now,
-        )? {
+        let text = if is_request {
+            let asked = grants::exception(&hold);
+            format!(
+                "Guardrail exception {} was denied: {reason}. You may not {}; find another way, or report the task blocked.",
+                hold.id, grants::describe(asked.kind, &asked.value),
+            )
+        } else {
+            format!("Guardrail hold {} was rejected: {reason}", hold.id)
+        };
+        if let Some(message) = super::notes::send_system_priority(ctx.tx(), project_id, session, &text, None, &ctx.now)? {
             ctx.emit("mailbox.new", serde_json::to_value(message).bus()?);
         }
     }
     ctx.emit("guardrail.resolved", json!({"hold_id": hold.id, "state": "rejected", "by": ctx.actor.to_string(), "reason": payload.reason}));
+    if is_request {
+        ctx.emit(grants::RESOLVED_EVENT, json!({
+            "request_id": hold.id, "session": hold.session, "state": "rejected", "reason": payload.reason,
+        }));
+    }
     Ok(RejectOut { hold: resolved })
+}
+
+/// Count a use against each grant an allowed action leaned on, and say so.
+fn use_grants(ctx: &mut Ctx, used: &[Id], session: Option<&str>) -> Result<(), BusError> {
+    if used.is_empty() {
+        return Ok(());
+    }
+    grants::consume(ctx.tx(), used, &ctx.now)?;
+    for id in used {
+        ctx.emit("guardrail.grant_used", json!({"request_id": id, "session": session, "op": ctx.op}));
+    }
+    Ok(())
 }
 
 fn check_out(decision: Decision) -> CheckOut {
