@@ -5,6 +5,7 @@ pub mod app;
 pub mod audit;
 pub mod bus;
 pub mod device;
+pub mod device_lease;
 pub mod file;
 pub mod git;
 pub mod guardrail;
@@ -26,6 +27,7 @@ use crate::engine::Engine;
 pub fn register_all(e: &mut Engine) {
     bus::register(e);
     device::register(e);
+    device_lease::register(e);
     app::register(e);
     audit::register(e);
     settings::register(e);

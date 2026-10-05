@@ -254,7 +254,14 @@ fn gate(ctx: &mut Ctx, payload: GateIn, skip_policy: Option<&str>) -> Result<Gat
         },
     )?;
     match decision {
-        Decision::Allow => Ok(GateOut { verdict: Verdict::Allow, error: None, hold_id: None }),
+        Decision::Allow => {
+            // A command that writes to an Android device takes this session's device lease, or
+            // is refused naming the session already using the device (device_lease).
+            if let (GateKind::Exec, Some(command)) = (payload.kind, payload.command.as_deref()) {
+                super::device_lease::gate_command(ctx, session.session.id, &session.session.name, command)?;
+            }
+            Ok(GateOut { verdict: Verdict::Allow, error: None, hold_id: None })
+        }
         Decision::Refuse(error) => {
             guardrail::insert_refusal_notification(ctx.tx(), project_id, &ctx.actor, &error, &ctx.now)?;
             ctx.commit_error(None);

@@ -581,8 +581,44 @@ pub fn register(e: &mut Engine) {
     e.register_unlocked::<PrList>(|ctx, p| {
         let project = ctx.read(|conn| get_project(conn, p.project_id))?;
         let gh = crate::github::gh_path()?;
-        list_pull_requests(&gh, Path::new(&project.path))
+        let listed = list_pull_requests(&gh, Path::new(&project.path))?;
+        // A PR merged for a branch a closed session left behind: clean that branch up now
+        // rather than at the next sweep (branch_cleanup).
+        let merged: Vec<String> = listed.pull_requests.iter()
+            .filter(|pr| pr.state == "merged" && pr.same_repository).map(|pr| pr.branch.clone()).collect();
+        if !merged.is_empty() {
+            let leftover: Vec<String> = ctx.read(|conn| {
+                let (candidates, _) = crate::branch_cleanup::candidates(conn, Some(project.id), Some(&merged))?;
+                Ok(candidates.into_iter().map(|candidate| candidate.branch).collect())
+            })?;
+            if !leftover.is_empty() && ctx.engine().instance != crate::Instance::Test {
+                let project_id = project.id;
+                ctx.after_commit(move |engine| crate::branch_cleanup::after_merged_prs(engine, project_id, leftover));
+            }
+        }
+        Ok(listed)
     });
+    // Every git and gh call is a subprocess; the transaction only attributes the result (D149).
+    e.register_staged::<BranchCleanup, _>(
+        |ctx, p| {
+            let project = ctx.read(|conn| get_project(conn, p.project_id))?;
+            let options = crate::branch_cleanup::Options {
+                dry_run: p.dry_run.unwrap_or(false),
+                gh: crate::branch_cleanup::gh(),
+                audit_kept: false,
+                use_gh_cache: false,
+            };
+            let rows = crate::branch_cleanup::run(ctx.engine(), Some(project.id), None, &options)?;
+            Ok((project, rows))
+        },
+        |ctx: &mut Ctx, _p, (project, rows)| {
+            changed(ctx, project.id, Path::new(&project.path));
+            if rows.iter().any(|row| row.removed_worktree) {
+                ctx.emit("worktree.changed", json!({ "project_id": project.id }));
+            }
+            Ok(BranchCleanupOut { branches: rows })
+        },
+    );
     e.register::<PrOpen>(|ctx: &mut Ctx, p| {
         let (project, root) = resolve_root(ctx, p.project_id, p.worktree.as_deref())?;
         let gh = crate::github::gh_path()?;

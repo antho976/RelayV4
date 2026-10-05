@@ -428,6 +428,8 @@ pub struct Engine {
     pub(crate) resource_cpu: std::sync::Mutex<HashMap<i64, (u64, Instant)>>,
     pub(crate) resource_disk: std::sync::Mutex<HashMap<String, (f64, Option<f64>)>>,
     pub(crate) resource_disk_refresh: std::sync::Mutex<(bool, Option<Instant>)>,
+    /// Who holds which Android device (`device_lease`). Its own lock; never the store's.
+    pub(crate) device_leases: crate::device_lease::Leases,
 }
 
 impl Engine {
@@ -463,6 +465,7 @@ impl Engine {
             resource_cpu: std::sync::Mutex::new(HashMap::new()),
             resource_disk: std::sync::Mutex::new(HashMap::new()),
             resource_disk_refresh: std::sync::Mutex::new((false, None)),
+            device_leases: Default::default(),
         };
         crate::handlers::register_all(&mut engine);
         let arc = Arc::new(engine);

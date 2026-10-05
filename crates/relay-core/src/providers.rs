@@ -43,7 +43,11 @@ provider including Codex, which your own cross-agent messaging tool does not; se
 peer already holding them — and one line of what you are doing with `session.intent`. Before \
 starting sizeable work, call `guardrail.explain` with structured paths, lines, and commands; \
 `guardrail.check` tests one command or write. `bus.wait` blocks until something happens, so \
-never poll. Work on `task` first; `tasks` is the remaining ordered queue. Report each current \
+never poll. Android devices are shared between sessions: an `adb install`, `adb shell am …` or \
+`gradlew install*` takes a lease on the device, and while a peer holds one yours is refused with \
+`device.busy` naming who is using it, for what, and since when — `bus.wait` on \
+`device.lease.released`, then retry, rather than retrying in a loop. `device.list` shows each \
+device's holder; `device.claim` holds a device across several steps and `device.release` frees it. Work on `task` first; `tasks` is the remaining ordered queue. Report each current \
 task through `session.done` with `status` `completed`, `blocked` or `partial`. All builders must \
 finish before the task enters review. A shared-worktree group stays on that task until every \
 reviewer finishes; do not begin queued work while peers are still building or reviewing. Relay \

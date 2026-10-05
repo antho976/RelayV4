@@ -673,6 +673,33 @@ pub struct Device {
     pub model: String,
     pub kind: DeviceKind,
     pub state: String,
+    /// Who is using this device right now, if anyone. A conflicting run, install or claim
+    /// from anyone else is refused with `device.busy` until it is released.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease: Option<DeviceLease>,
+}
+
+/// One holder's exclusive use of an Android device: a `device.run` in flight, an agent's
+/// `adb install` / `gradlew install*` seen by the guardrail hook, or an explicit `device.claim`.
+/// Released with a `device.lease.released` event, so `bus.wait` can wait for it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct DeviceLease {
+    /// The device serial, or `*` when the command named no device (adb's only device, or
+    /// Gradle's every device): that lease conflicts with every device.
+    pub device: String,
+    /// The holding session's name; `None` when the user holds it directly.
+    pub session: Option<String>,
+    /// `run`, `shell` or `claim`.
+    pub kind: String,
+    /// What the holder is doing, in a few words (`device.run debug from relay/brisk-otter`,
+    /// `adb install app-debug.apk`).
+    pub action: String,
+    pub since: Ts,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<Id>,
+    /// Seconds until the lease lapses on its own; `None` while it lasts as long as its run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_in_s: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]

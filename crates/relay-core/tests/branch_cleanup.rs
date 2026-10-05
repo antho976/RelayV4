@@ -1,0 +1,207 @@
+//! Branch cleanup: a closed session's branch (and worktree, and merged PR's remote branch) goes
+//! once its work is merged, and never before.
+
+use relay_bus::{Actor, Request, Response};
+use relay_core::branch_cleanup::{self, Options};
+use relay_core::engine::{Door, Engine};
+use relay_core::{Instance, Store};
+use serde_json::{json, Value};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
+
+fn git(repo: &Path, args: &[&str]) -> String {
+    let out = Command::new("git").arg("-C").arg(repo).args(args).output().unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn has_ref(repo: &Path, reference: &str) -> bool {
+    Command::new("git").arg("-C").arg(repo).args(["show-ref", "--verify", "--quiet", reference]).status().unwrap().success()
+}
+
+fn call(engine: &Engine, op: &str, payload: Value) -> Response {
+    engine.dispatch(Request::new(Actor::User, op, payload), Door::InProcess)
+}
+
+fn ok(engine: &Engine, op: &str, payload: Value) -> Value {
+    call(engine, op, payload).into_result().unwrap_or_else(|error| panic!("{op} failed: {} {}", error.code, error.message))
+}
+
+struct Fixture {
+    _root: tempfile::TempDir,
+    base: PathBuf,
+    repo: PathBuf,
+    origin: PathBuf,
+    engine: Arc<Engine>,
+}
+
+fn fixture() -> Fixture {
+    let root = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(root.path()).unwrap();
+    let ws = base.join("ws");
+    let repo = ws.join("app");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.email", "t@t"]);
+    git(&repo, &["config", "user.name", "t"]);
+    std::fs::write(repo.join("README.md"), "hi\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "--no-verify", "-q", "-m", "init"]);
+    let origin = base.join("origin.git");
+    git(&base, &["init", "-q", "--bare", "-b", "main", origin.to_str().unwrap()]);
+    git(&repo, &["remote", "add", "origin", origin.to_str().unwrap()]);
+    git(&repo, &["push", "-q", "-u", "origin", "main"]);
+    let store = Store::open(&base.join("store/store.db"), false).unwrap();
+    let engine = Engine::new(Instance::Test, store);
+    ok(&engine, "workspace.create", json!({"path": ws}));
+    ok(&engine, "project.add", json!({"workspace_id": 1, "path": repo}));
+    Fixture { _root: root, base, repo, origin, engine }
+}
+
+struct Work { name: String, branch: String, worktree: PathBuf }
+
+/// A session with one commit of its own on its branch.
+fn session_with_commit(f: &Fixture, file: &str) -> Work {
+    let created = ok(&f.engine, "session.create", json!({"project_id": 1, "provider": "codex"}));
+    let worktree = PathBuf::from(created["worktree"].as_str().unwrap());
+    git(&worktree, &["config", "user.email", "t@t"]);
+    git(&worktree, &["config", "user.name", "t"]);
+    std::fs::write(worktree.join(file), format!("{file}\n")).unwrap();
+    git(&worktree, &["add", file]);
+    git(&worktree, &["commit", "--no-verify", "-q", "-m", &format!("add {file}")]);
+    Work {
+        name: created["name"].as_str().unwrap().to_string(),
+        branch: created["branch"].as_str().unwrap().to_string(),
+        worktree,
+    }
+}
+
+/// A stand-in `gh` that reports one merged PR with the given head.
+fn fake_gh(f: &Fixture, number: u64, head: &str) -> PathBuf {
+    let path = f.base.join(format!("gh-{number}"));
+    std::fs::write(&path, format!("#!/bin/sh\n[ \"$1 $2\" = \"pr list\" ] || exit 9\nprintf '[{{\"number\":{number},\"headRefOid\":\"{head}\"}}]'\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+fn cleanup(f: &Fixture, branch: &str, gh: Option<PathBuf>) -> relay_bus::ops::git::BranchCleanupRow {
+    let options = Options { gh, audit_kept: true, ..Options::default() };
+    let mut rows = branch_cleanup::run(&f.engine, Some(1), Some(&[branch.to_string()]), &options).unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    rows.remove(0)
+}
+
+fn audited(f: &Fixture, branch: &str) -> Vec<Value> {
+    let audit = ok(&f.engine, "audit.list", json!({"op_prefix": "git.branch.cleanup"}));
+    audit["rows"].as_array().cloned().unwrap_or_default().into_iter()
+        .filter(|row| row.to_string().contains(branch)).collect()
+}
+
+#[test]
+fn a_merged_branch_goes_and_an_unmerged_one_stays_with_its_reason() {
+    let f = fixture();
+    let merged = session_with_commit(&f, "merged.txt");
+    let open = session_with_commit(&f, "open.txt");
+    git(&f.repo, &["merge", "--no-verify", "-q", "--no-ff", "-m", "merge", &merged.branch]);
+    ok(&f.engine, "session.close", json!({"session": merged.name}));
+    ok(&f.engine, "session.close", json!({"session": open.name}));
+    assert!(has_ref(&f.repo, &format!("refs/heads/{}", merged.branch)), "close alone keeps the branch for cleanup to judge");
+
+    let row = cleanup(&f, &merged.branch, None);
+    assert_eq!(row.outcome, "deleted", "{row:?}");
+    assert!(row.reason.contains("merged into main"), "{row:?}");
+    assert_eq!(row.session.as_deref(), Some(merged.name.as_str()));
+    assert!(!has_ref(&f.repo, &format!("refs/heads/{}", merged.branch)));
+    assert!(!audited(&f, &merged.branch).is_empty(), "the deletion is on the audit record");
+
+    let row = cleanup(&f, &open.branch, None);
+    assert_eq!(row.outcome, "kept", "{row:?}");
+    assert!(row.reason.contains("1 commit(s) not in main"), "{row:?}");
+    assert!(row.reason.contains("never pushed"), "{row:?}");
+    assert!(has_ref(&f.repo, &format!("refs/heads/{}", open.branch)), "unmerged work is never deleted");
+    assert!(!audited(&f, &open.branch).is_empty(), "keeping it after a close is on the record, with why");
+}
+
+#[test]
+fn a_squash_merged_pr_removes_worktree_branch_and_remote_branch() {
+    let f = fixture();
+    let work = session_with_commit(&f, "feature.txt");
+    // Two commits: squashed into one, no patch id matches, so only GitHub can prove the merge.
+    std::fs::write(work.worktree.join("feature.txt"), "feature, revised\n").unwrap();
+    git(&work.worktree, &["commit", "--no-verify", "-q", "-am", "revise feature"]);
+    git(&work.worktree, &["push", "-q", "-u", "origin", &work.branch]);
+    let tip = git(&work.worktree, &["rev-parse", "HEAD"]);
+    // GitHub squash-merges: main gets one new commit, not the branch's.
+    git(&f.repo, &["merge", "-q", "--squash", &work.branch]);
+    git(&f.repo, &["commit", "--no-verify", "-q", "-m", "feature (#42)"]);
+    // Closed with its checkout kept, the PR merged later.
+    ok(&f.engine, "session.close", json!({"session": work.name, "remove_worktree": false}));
+    assert!(work.worktree.exists());
+
+    // Without GitHub, nothing proves a squash merge: kept.
+    let row = cleanup(&f, &work.branch, None);
+    assert_eq!(row.outcome, "kept", "{row:?}");
+    assert!(work.worktree.exists());
+
+    let row = cleanup(&f, &work.branch, Some(fake_gh(&f, 42, &tip)));
+    assert_eq!(row.outcome, "deleted", "{row:?}");
+    assert_eq!(row.pr, Some(42));
+    assert!(row.removed_worktree && !work.worktree.exists(), "{row:?}");
+    assert!(row.deleted_remote, "{row:?}");
+    assert!(!has_ref(&f.repo, &format!("refs/heads/{}", work.branch)));
+    assert!(!has_ref(&f.origin, &format!("refs/heads/{}", work.branch)), "the merged PR's branch is gone from the remote");
+}
+
+#[test]
+fn work_after_the_pr_or_uncommitted_changes_keep_the_branch() {
+    let f = fixture();
+    // Commits after the PR head was merged.
+    let late = session_with_commit(&f, "late.txt");
+    git(&late.worktree, &["push", "-q", "-u", "origin", &late.branch]);
+    let pr_head = git(&late.worktree, &["rev-parse", "HEAD"]);
+    std::fs::write(late.worktree.join("after.txt"), "more\n").unwrap();
+    git(&late.worktree, &["add", "after.txt"]);
+    git(&late.worktree, &["commit", "--no-verify", "-q", "-m", "after the PR"]);
+    ok(&f.engine, "session.close", json!({"session": late.name}));
+    let row = cleanup(&f, &late.branch, Some(fake_gh(&f, 7, &pr_head)));
+    assert_eq!(row.outcome, "kept", "{row:?}");
+    assert!(row.reason.contains("no merged PR contains its tip"), "{row:?}");
+    assert!(has_ref(&f.repo, &format!("refs/heads/{}", late.branch)));
+    assert!(has_ref(&f.origin, &format!("refs/heads/{}", late.branch)));
+
+    // Merged, but its kept checkout has uncommitted changes.
+    let dirty = session_with_commit(&f, "dirty.txt");
+    git(&f.repo, &["merge", "--no-verify", "-q", "--no-ff", "-m", "merge", &dirty.branch]);
+    ok(&f.engine, "session.close", json!({"session": dirty.name, "remove_worktree": false}));
+    std::fs::write(dirty.worktree.join("scratch.txt"), "not committed\n").unwrap();
+    let row = cleanup(&f, &dirty.branch, None);
+    assert_eq!(row.outcome, "kept", "{row:?}");
+    assert!(row.reason.contains("uncommitted"), "{row:?}");
+    assert!(dirty.worktree.join("scratch.txt").exists());
+    assert!(has_ref(&f.repo, &format!("refs/heads/{}", dirty.branch)));
+}
+
+#[test]
+fn open_sessions_are_never_candidates_and_the_op_dry_runs() {
+    let f = fixture();
+    let live = session_with_commit(&f, "live.txt");
+    let done = session_with_commit(&f, "done.txt");
+    git(&f.repo, &["merge", "--no-verify", "-q", "--no-ff", "-m", "merge live", &live.branch]);
+    git(&f.repo, &["merge", "--no-verify", "-q", "--no-ff", "-m", "merge done", &done.branch]);
+    ok(&f.engine, "session.close", json!({"session": done.name}));
+
+    let dry = ok(&f.engine, "git.branch.cleanup", json!({"project_id": 1, "dry_run": true}));
+    let rows = dry["branches"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "only the closed session's branch is considered: {dry}");
+    assert_eq!(rows[0]["branch"], done.branch.as_str());
+    assert_eq!(rows[0]["outcome"], "would_delete");
+    assert!(has_ref(&f.repo, &format!("refs/heads/{}", done.branch)), "a dry run deletes nothing");
+
+    let real = ok(&f.engine, "git.branch.cleanup", json!({"project_id": 1}));
+    assert_eq!(real["branches"][0]["outcome"], "deleted");
+    assert!(!has_ref(&f.repo, &format!("refs/heads/{}", done.branch)));
+    assert!(has_ref(&f.repo, &format!("refs/heads/{}", live.branch)), "a live session's branch is untouched");
+    assert!(live.worktree.exists());
+}

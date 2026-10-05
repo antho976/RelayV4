@@ -486,7 +486,7 @@ fn launch(ctx: &mut Ctx, row: &Row_, kind: LaunchKind) -> Result<Session, BusErr
     let req_id = ctx.req_id;
     let pty = Pty::spawn(spec, move |code| {
         let Some(engine) = engine.and_then(|weak| weak.upgrade()) else { return };
-        let _ = engine.system_write(
+        let exited = engine.system_write(
             "session.spawn.completed", Some(req_id), Some(project_id), Some(sid), json!({ "exit_code": code }),
             |tx, now| {
                 let mut events = Vec::new();
@@ -511,9 +511,12 @@ fn launch(ctx: &mut Ctx, row: &Row_, kind: LaunchKind) -> Result<Session, BusErr
                         events.push(("session.changed".into(), serde_json::to_value(&row.session).unwrap_or(Value::Null)));
                     }
                 }
-                Ok(((), events))
+                Ok((changed > 0, events))
             },
         );
+        if exited.unwrap_or(false) {
+            crate::handlers::device_lease::release_session(&engine, sid);
+        }
     }).map_err(|error| BusError::unavailable("session.spawn_failed", error.to_string()))?;
     ctx.tx().execute(
         "UPDATE sessions SET state='running',pid=?1,epoch=?2,spawned_at=COALESCE(spawned_at,?3),
@@ -1187,6 +1190,11 @@ pub fn register(e: &mut Engine) {
             ctx.tx().execute("UPDATE sessions SET done_pending_stop=NULL WHERE id=?1", [s.id]).bus()?;
         }
         note_pty_state(ctx, s.id, state);
+        if matches!(p.kind.as_str(), "tool_use" | "stop") {
+            // The command behind a device lease has finished; keep the lease only briefly.
+            let command = data.pointer("/tool_input/command").and_then(Value::as_str);
+            crate::handlers::device_lease::command_finished(ctx.engine(), s.id, command, p.kind == "stop");
+        }
         if p.kind == "stop" {
             if let (Some(completed), Some(current)) = (pending_stop, s.task_id) {
                 if completed != current { deliver_assignment(ctx, s, current, false)?; }
@@ -1415,6 +1423,16 @@ pub fn register(e: &mut Engine) {
             }));
         }
         ctx.emit("worktree.changed", json!({ "project_id": project.id }));
+        // Off the request: the session's device leases go, and its branch is deleted if its
+        // work is already merged (or kept, with the reason audited) — `branch_cleanup`.
+        let (session_id, project_id, branch) = (s.id, project.id, s.branch.clone());
+        ctx.after_commit(move |engine| {
+            crate::handlers::device_lease::release_session(&engine, session_id);
+            // Tests drive the cleanup synchronously instead (`branch_cleanup::run`).
+            if engine.instance != crate::Instance::Test {
+                crate::branch_cleanup::after_close(engine, project_id, branch);
+            }
+        });
         Ok(CloseOut { freed_mb: freed as f64 / (1024.0 * 1024.0) })
     });
 

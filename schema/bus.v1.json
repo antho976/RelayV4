@@ -4,7 +4,7 @@
   "title": "RELAY v4 command bus",
   "description": "Generated from crates/relay-bus by `relay schema`. Do not edit; see docs/BUS.md.",
   "version": 1,
-  "op_count": 212,
+  "op_count": 216,
   "envelope": {
     "request": {
       "$ref": "#/$defs/Request"
@@ -2807,6 +2807,28 @@
         "$ref": "#/$defs/GitCleanMergedOut"
       }
     },
+    "git.branch.cleanup": {
+      "summary": "Remove the worktree and branch of every closed session whose work is merged (into the base branch, or by a merged GitHub PR); unmerged work is kept",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "project",
+      "executor": "core",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "git.changed",
+        "worktree.changed"
+      ],
+      "since": "1.0",
+      "phase": 8,
+      "payload": {
+        "$ref": "#/$defs/GitBranchCleanupIn"
+      },
+      "result": {
+        "$ref": "#/$defs/GitBranchCleanupOut"
+      }
+    },
     "git.suggest_message": {
       "summary": "Heuristic commit subject from the diff",
       "kind": "query",
@@ -3236,7 +3258,7 @@
       }
     },
     "device.run": {
-      "summary": "gradle installDebug then stream logcat; crashes as run.crash events",
+      "summary": "gradle installDebug then stream logcat; crashes as run.crash events. Holds the device lease while it runs; device.busy names whoever holds it already",
       "kind": "mutation",
       "audit": "always",
       "undo": "none",
@@ -3247,7 +3269,9 @@
       "emits": [
         "run.changed",
         "run.crash",
-        "notify.new"
+        "notify.new",
+        "device.lease.acquired",
+        "device.lease.released"
       ],
       "stream": "logcat",
       "since": "1.0",
@@ -3460,6 +3484,67 @@
       },
       "result": {
         "$ref": "#/$defs/Empty"
+      }
+    },
+    "device.leases": {
+      "summary": "Who is using which Android device right now, without asking adb",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "executor": "core",
+      "actors": "all",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 10,
+      "payload": {
+        "$ref": "#/$defs/Empty"
+      },
+      "result": {
+        "$ref": "#/$defs/DeviceLeasesOut"
+      }
+    },
+    "device.claim": {
+      "summary": "Hold an Android device across several steps (install, test, inspect) so no other session installs over it; device.busy names the holder",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "executor": "core",
+      "actors": "all",
+      "doors": "all",
+      "emits": [
+        "device.lease.acquired"
+      ],
+      "since": "1.0",
+      "phase": 10,
+      "payload": {
+        "$ref": "#/$defs/DeviceClaimIn"
+      },
+      "result": {
+        "$ref": "#/$defs/DeviceLease"
+      }
+    },
+    "device.release": {
+      "summary": "Release a device lease you hold (the user may release any lease but a live run's)",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "executor": "core",
+      "actors": "all",
+      "doors": "all",
+      "emits": [
+        "device.lease.released"
+      ],
+      "since": "1.0",
+      "phase": 10,
+      "payload": {
+        "$ref": "#/$defs/DeviceReleaseIn"
+      },
+      "result": {
+        "$ref": "#/$defs/DeviceReleaseOut"
       }
     },
     "provider.list": {
@@ -11076,6 +11161,83 @@
         "deleted"
       ]
     },
+    "GitBranchCleanupIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "project_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "dry_run": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "project_id"
+      ]
+    },
+    "GitBranchCleanupOut": {
+      "type": "object",
+      "properties": {
+        "branches": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/GitBranchCleanup"
+          }
+        }
+      },
+      "required": [
+        "branches"
+      ]
+    },
+    "GitBranchCleanup": {
+      "type": "object",
+      "properties": {
+        "branch": {
+          "type": "string"
+        },
+        "session": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The closed session that worked on it."
+        },
+        "outcome": {
+          "type": "string",
+          "description": "`deleted`, `would_delete` (dry run) or `kept`."
+        },
+        "reason": {
+          "type": "string",
+          "description": "Why: how the work was found merged, or what unmerged work kept it."
+        },
+        "pr": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "removed_worktree": {
+          "type": "boolean"
+        },
+        "deleted_remote": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "branch",
+        "outcome",
+        "reason",
+        "removed_worktree",
+        "deleted_remote"
+      ]
+    },
     "GitSuggestOut": {
       "type": "object",
       "properties": {
@@ -11762,6 +11924,17 @@
         },
         "state": {
           "type": "string"
+        },
+        "lease": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeviceLease"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Who is using this device right now, if anyone. A conflicting run, install or claim\nfrom anyone else is refused with `device.busy` until it is released."
         }
       },
       "required": [
@@ -11777,6 +11950,56 @@
         "usb",
         "avd"
       ]
+    },
+    "DeviceLease": {
+      "type": "object",
+      "properties": {
+        "device": {
+          "type": "string",
+          "description": "The device serial, or `*` when the command named no device (adb's only device, or\nGradle's every device): that lease conflicts with every device."
+        },
+        "session": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The holding session's name; `None` when the user holds it directly."
+        },
+        "kind": {
+          "type": "string",
+          "description": "`run`, `shell` or `claim`."
+        },
+        "action": {
+          "type": "string",
+          "description": "What the holder is doing, in a few words (`device.run debug from relay/brisk-otter`,\n`adb install app-debug.apk`)."
+        },
+        "since": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "expires_in_s": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0,
+          "description": "Seconds until the lease lapses on its own; `None` while it lasts as long as its run."
+        }
+      },
+      "required": [
+        "device",
+        "kind",
+        "action",
+        "since"
+      ],
+      "description": "One holder's exclusive use of an Android device: a `device.run` in flight, an agent's\n`adb install` / `gradlew install*` seen by the guardrail hook, or an explicit `device.claim`.\nReleased with a `device.lease.released` event, so `bus.wait` can wait for it."
     },
     "DeviceWatchIn": {
       "type": "object",
@@ -12252,6 +12475,76 @@
       },
       "required": [
         "name"
+      ]
+    },
+    "DeviceLeasesOut": {
+      "type": "object",
+      "properties": {
+        "leases": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DeviceLease"
+          }
+        }
+      },
+      "required": [
+        "leases"
+      ]
+    },
+    "DeviceClaimIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "device": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Serial from `device.list`; omit to claim every device (what a bare `adb` would touch)."
+        },
+        "action": {
+          "type": "string",
+          "description": "What you will be doing, shown to anyone refused with `device.busy`."
+        },
+        "minutes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "How long to hold it. Default 10, at most 60; released early by `device.release`."
+        }
+      },
+      "required": [
+        "action"
+      ]
+    },
+    "DeviceReleaseIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "device": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Serial to release; omit to release every lease you hold."
+        }
+      }
+    },
+    "DeviceReleaseOut": {
+      "type": "object",
+      "properties": {
+        "released": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DeviceLease"
+          }
+        }
+      },
+      "required": [
+        "released"
       ]
     },
     "ProviderListOut": {
