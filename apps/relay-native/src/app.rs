@@ -145,7 +145,7 @@ pub struct Ui {
     wallpaper: gtk::Picture,
     wallpaper_dim: gtk::Box,
     font_size: Cell<f64>,
-    palette: RefCell<String>,
+    pub(crate) palette: RefCell<String>,
     pub keybindings: RefCell<Value>,
     pub sound_busy: Cell<bool>,
     projects_box: gtk::Box,
@@ -651,6 +651,11 @@ impl Ui {
         ] {
             let b = nav_button(caption, icon);
             b.set_widget_name(&format!("nav-{name}"));
+            match name {
+                "skills" => b.set_tooltip_text(Some("Skills: agent instructions, on or off per project")),
+                "plugins" => b.set_tooltip_text(Some("Plugins: skills, rules and MCP tools for a project")),
+                _ => {}
+            }
             track_navigation(&ui.content, &b, name);
             nav.append(&b);
             let weak = Rc::downgrade(&ui);

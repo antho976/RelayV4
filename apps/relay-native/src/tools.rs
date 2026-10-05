@@ -7,6 +7,8 @@ use std::rc::Rc;
 
 #[path = "tools_devices.rs"]
 pub(crate) mod devices;
+#[path = "tools_market.rs"]
+mod market;
 #[path = "tools_plugins.rs"]
 pub(crate) mod plugins;
 #[path = "tools_settings.rs"]
