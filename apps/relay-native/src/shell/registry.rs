@@ -799,9 +799,9 @@ impl Ui {
         copy.append(&label(if workspace { "Remove workspace" } else { "Remove project" }, "registry-field-label"));
         let what = if workspace { "the workspace and its projects" } else { "the project" };
         copy.append(&paragraph(&if agents == 0 {
-            format!("Forgets {what}. Files, worktrees and branches stay on disk.")
+            format!("Forgets {what}. Repository files and branches stay on disk.")
         } else {
-            format!("Stops and closes {}, then forgets {what}. Files, worktrees and branches stay on disk.", plural(agents, "agent", "agents"))
+            format!("Stops and closes {}, then forgets {what}. Repository files and branches stay on disk.", plural(agents, "agent", "agents"))
         }));
         row.append(&copy);
         let remove = button("Remove…", "danger");
