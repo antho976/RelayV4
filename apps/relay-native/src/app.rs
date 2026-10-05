@@ -207,7 +207,18 @@ pub fn run(rt: Handle) -> glib::ExitCode {
         }
         let provider = gtk::CssProvider::new();
         provider.connect_parsing_error(|_, _, e| tracing::error!("stylesheet: {e}"));
-        provider.load_from_string(include_str!("theme.css"));
+        provider.load_from_string(concat!(
+            include_str!("theme.css"),
+            include_str!("css/mirror.css"),
+            include_str!("css/notes.css"),
+            include_str!("css/git_files.css"),
+            include_str!("css/board.css"),
+            include_str!("css/sessions.css"),
+            include_str!("css/workspace.css"),
+            include_str!("css/guardrails.css"),
+            include_str!("css/usage.css"),
+            include_str!("css/tools.css"),
+        ));
         if let Some(display) = gtk::gdk::Display::default() {
             gtk::style_context_add_provider_for_display(
                 &display,
