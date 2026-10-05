@@ -282,8 +282,12 @@ fn closing_a_provider_that_ignores_term_is_bounded_and_preserves_its_worktree() 
     wait_until("ignoring TERM", || ok(&f.engine,"session.scrollback",json!({"session":session["name"]}))["text"].as_str().unwrap().contains("ready"));
     let start = Instant::now();
     ok(&f.engine, "session.close", json!({"session":session["name"],"remove_worktree":false}));
-    assert!(start.elapsed() < Duration::from_secs(1), "close took {:?}", start.elapsed());
-    assert!(!alive(spawned["pid"].as_i64().unwrap()));
+    // The close answers without waiting out the TERM grace; the kill finishes on its own thread.
+    assert!(start.elapsed() < Duration::from_millis(100), "close took {:?}", start.elapsed());
+    let pid = spawned["pid"].as_i64().unwrap();
+    wait_until("the TERM-ignoring child to be killed", || !alive(pid));
+    assert!(start.elapsed() < Duration::from_secs(3), "kill took {:?}", start.elapsed());
+    assert_eq!(ok(&f.engine, "session.list", json!({"include_closed":true}))["sessions"][0]["state"], "closed");
     assert!(Path::new(session["worktree"].as_str().unwrap()).join("README.md").is_file());
 }
 
@@ -1292,4 +1296,101 @@ fn slow_checkout_does_not_hold_the_store_lock() {
     assert_eq!(session["state"], "created");
     assert_eq!(std::fs::read_to_string(Path::new(session["worktree"].as_str().unwrap()).join("README.md")).unwrap(), "hi\n");
     assert!(elapsed < Duration::from_millis(500), "app.status blocked behind checkout for {elapsed:?}");
+}
+
+/// Opening and closing one agent must never stall every other pane: a park or a close that
+/// removes the checkout waits out the child's TERM grace with the store unlocked, and the
+/// silenced exit callback leaves the row at the state the request wrote — never `exited`,
+/// and never a builder's task marked failed on the way.
+#[test]
+fn park_and_close_stop_the_child_without_holding_the_store() {
+    let f = fixture();
+    let provider = fake_provider(&f.root, false);
+    std::fs::write(&provider, "#!/bin/sh\ntrap '' TERM\necho ready\nwhile IFS= read -r line; do :; done\n").unwrap();
+    ok(&f.engine, "settings.set", json!({"path":"providers.claude.path","value":provider}));
+    let task = ok(&f.engine, "task.create", json!({"project_id":1,"title":"Survives a close"}));
+    for op in ["session.park", "session.close"] {
+        let session = ok(&f.engine, "session.create", json!({"project_id":1,"provider":"claude"}));
+        let name = session["name"].as_str().unwrap().to_string();
+        ok(&f.engine, "task.dispatch", json!({"task_id":task["id"],"session":name,"start":false}));
+        let spawned = ok(&f.engine, "session.spawn", json!({"session":name}));
+        wait_until("ignoring TERM", || ok(&f.engine,"session.scrollback",json!({"session":name}))["text"].as_str().unwrap().contains("ready"));
+        let engine = f.engine.clone();
+        let payload = if op == "session.close" { json!({"session":name,"remove_worktree":true}) } else { json!({"session":name}) };
+        let stopping = std::thread::spawn(move || ok(&engine, op, payload));
+        std::thread::sleep(Duration::from_millis(60));
+        let started = Instant::now();
+        ok(&f.engine, "session.list", json!({}));
+        let waited = started.elapsed();
+        stopping.join().unwrap();
+        assert!(waited < Duration::from_millis(60), "session.list waited {waited:?} behind {op}");
+        assert!(!alive(spawned["pid"].as_i64().unwrap()), "{op} returned before its child died");
+        let row = ok(&f.engine, "session.list", json!({"include_closed":true}))["sessions"]
+            .as_array().unwrap().iter().find(|s| s["name"] == name.as_str()).cloned().unwrap();
+        let want = if op == "session.park" { "parked" } else { "closed" };
+        assert_eq!(row["state"], want, "{op}");
+        // Nothing lands after the response either.
+        std::thread::sleep(Duration::from_millis(100));
+        let row = ok(&f.engine, "session.list", json!({"include_closed":true}))["sessions"]
+            .as_array().unwrap().iter().find(|s| s["name"] == name.as_str()).cloned().unwrap();
+        assert_eq!(row["state"], want, "{op} was overwritten by the exit callback");
+        assert_ne!(ok(&f.engine, "task.get", json!({"task_id":task["id"]}))["state"], "failed", "{op}");
+        if op == "session.park" {
+            assert!(ok(&f.engine, "session.scrollback", json!({"session":name}))["text"].as_str().unwrap().contains("ready"));
+            ok(&f.engine, "session.close", json!({"session":name,"remove_worktree":true}));
+        } else {
+            assert!(!Path::new(session["worktree"].as_str().unwrap()).exists());
+        }
+    }
+}
+
+/// Every session that ever ran in one checkout is torn down with one read of its hook path,
+/// and the path that was there before Relay comes back, not a dead session's hook directory.
+#[test]
+fn closing_the_last_of_several_sessions_restores_the_original_hook_path() {
+    let f = fixture();
+    let hooks = |repo: &Path| {
+        let out = Command::new("git").arg("-C").arg(repo).args(["config", "--worktree", "--get", "core.hooksPath"]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    git(&f.repo, &["config", "extensions.worktreeConfig", "true"]);
+    git(&f.repo, &["config", "--worktree", "core.hooksPath", "user-hooks"]);
+    let mut names = Vec::new();
+    for _ in 0..3 {
+        let s = ok(&f.engine, "session.create", json!({"project_id":1,"provider":"claude","worktree":"primary"}));
+        names.push(s["name"].as_str().unwrap().to_string());
+        assert!(hooks(&f.repo).ends_with(&format!(".relay/hooks/{}", names.last().unwrap())));
+    }
+    // Closed oldest first, so the newest session's hook stays active until the very last close.
+    for name in &names {
+        ok(&f.engine, "session.close", json!({"session":name,"remove_worktree":false}));
+    }
+    assert_eq!(hooks(&f.repo), "user-hooks");
+    for name in &names {
+        assert!(!f.repo.join(".relay/hooks").join(name).exists(), "{name}'s hook directory survived");
+    }
+}
+
+/// A launch that finds its row moved on while it was writing hooks and briefs is refused
+/// instead of starting a second child: two concurrent spawns start exactly one.
+#[test]
+fn concurrent_spawns_start_exactly_one_child() {
+    let f = fixture();
+    let provider = fake_provider(&f.root, false);
+    ok(&f.engine, "settings.set", json!({"path":"providers.claude.path","value":provider}));
+    let session = ok(&f.engine, "session.create", json!({"project_id":1,"provider":"claude"}));
+    let name = session["name"].as_str().unwrap().to_string();
+    let spawns: Vec<_> = (0..4).map(|_| {
+        let engine = f.engine.clone();
+        let name = name.clone();
+        std::thread::spawn(move || call(&engine, "session.spawn", json!({"session":name})))
+    }).collect();
+    let results: Vec<Response> = spawns.into_iter().map(|h| h.join().unwrap()).collect();
+    let started = results.iter().filter(|r| r.error.is_none()).count();
+    assert_eq!(started, 1, "{:?}", results.iter().map(|r| r.error.as_ref().map(|e| e.code.clone())).collect::<Vec<_>>());
+    for r in results.iter().filter(|r| r.error.is_some()) {
+        assert_eq!(r.error.as_ref().unwrap().code, "session.already_spawned");
+    }
+    assert_eq!(f.engine.live_pty_count(), 1);
+    ok(&f.engine, "session.close", json!({"session":name,"remove_worktree":true}));
 }

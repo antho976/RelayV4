@@ -410,7 +410,7 @@ impl Pane {
             "created" => "The launch was interrupted before the provider started.",
             _ => "No signal from this session.",
         });
-        for class in ["live", "held", "waiting", "off"] {
+        for class in ["live", "held", "waiting", "off", "starting"] {
             self.root.remove_css_class(class);
             self.lamp.remove_css_class(class);
         }
@@ -422,6 +422,21 @@ impl Pane {
         };
         self.root.add_css_class(class);
         self.lamp.add_css_class(class);
+    }
+
+    /// A launch in flight: the pane is on the wall before its provider exists, and says which
+    /// step it is on instead of reading as an interrupted launch.
+    pub fn show_progress(&self, step: &str) {
+        self.state.set_text("STARTING");
+        self.slate.set_visible(true);
+        self.slate_state.set_text("STARTING");
+        self.slate_hint.set_text(step);
+        for class in ["live", "held", "waiting", "off", "starting"] {
+            self.root.remove_css_class(class);
+            self.lamp.remove_css_class(class);
+        }
+        self.root.add_css_class("starting");
+        self.lamp.add_css_class("starting");
     }
 
     pub fn set_active(self: &Rc<Self>, active: bool) {

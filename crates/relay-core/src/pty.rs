@@ -139,6 +139,9 @@ struct Shared {
     /// keystroke needs a database write without reading the database (D148). Only the
     /// idle→running edge does; every other keystroke is pure memory.
     idle: AtomicBool,
+    /// Set by [`Pty::silence_exit`]: the request that stops this child records the outcome
+    /// itself, so the exit callback must not race it to the row.
+    silent: AtomicBool,
 }
 
 /// A live PTY. Cheap to clone the handle (`Arc`).
@@ -195,6 +198,7 @@ impl Pty {
             ring: Mutex::new(ring),
             tx,
             idle: AtomicBool::new(false),
+            silent: AtomicBool::new(false),
             exited: AtomicBool::new(false),
             exit_code: Mutex::new(None),
         });
@@ -223,7 +227,9 @@ impl Pty {
             let code = child.wait().ok().map(|s| s.exit_code() as i32);
             *sh.exit_code.lock().unwrap() = code;
             sh.exited.store(true, Ordering::SeqCst);
-            on_exit(code);
+            if !sh.silent.load(Ordering::SeqCst) {
+                on_exit(code);
+            }
         })?;
 
         Ok(Arc::new(Pty {
@@ -266,6 +272,13 @@ impl Pty {
     /// false for every keystroke after it. Exactly one deferred write per idle period.
     pub fn claim_idle_edge(&self) -> bool {
         self.shared.idle.swap(false, Ordering::SeqCst)
+    }
+    /// Skip the `on_exit` callback when the child is reaped. For a caller that kills the child
+    /// with the store unlocked and then writes the session's next state itself (park, close
+    /// with checkout removal): without this the callback would mark the row `exited` — and a
+    /// builder's task `failed` — in the gap between the kill and that write.
+    pub fn silence_exit(&self) {
+        self.shared.silent.store(true, Ordering::SeqCst);
     }
     pub fn exit_code(&self) -> Option<i32> {
         *self.shared.exit_code.lock().unwrap()
