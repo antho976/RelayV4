@@ -1,670 +1,1201 @@
+//! The Notes window: a persistent shell (toolbar, library sidebar, tabbed editors) that
+//! survives refreshes, built around one `doc::Doc` per open note.
+#[path = "note_pages/doc.rs"]
+mod doc;
+#[path = "note_pages/glyphs.rs"]
+mod glyphs;
+#[path = "note_pages/menu.rs"]
+mod menu;
+#[path = "note_pages/text.rs"]
+mod text;
+
 use super::task_pages::{buffer_text, choose, chosen, multiline, Draft};
 use super::*;
+use doc::Doc;
+use glyphs::glyph;
+use std::cell::{Cell, OnceCell};
+use std::collections::{BTreeMap, BTreeSet};
 
-fn find_note(view: &gtk::TextView, needle: &str, backward: bool) {
-    if needle.is_empty() {
-        return;
+/// View and editing preferences, persisted with the window in `native.notes.window`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Prefs {
+    pub autosave: bool,
+    pub wrap: bool,
+    pub line_numbers: bool,
+    pub current_line: bool,
+    pub toolbar: bool,
+    pub monospace: bool,
+    pub markdown: bool,
+    pub zoom: u16,
+    pub sort_title: bool,
+}
+impl Default for Prefs {
+    fn default() -> Self {
+        // Autosave is opt-in: D72 notes save explicitly unless the person turns it on.
+        Self {
+            autosave: false,
+            wrap: true,
+            line_numbers: true,
+            current_line: true,
+            toolbar: true,
+            monospace: true,
+            markdown: true,
+            zoom: 100,
+            sort_title: false,
+        }
     }
-    let buffer = view.buffer();
-    let cursor = buffer
-        .selection_bounds()
-        .map(|(start, end)| if backward { start } else { end })
-        .unwrap_or_else(|| buffer.iter_at_offset(buffer.cursor_position()));
-    let flags = gtk::TextSearchFlags::CASE_INSENSITIVE;
-    let found = if backward {
-        cursor
-            .backward_search(needle, flags, None)
-            .or_else(|| buffer.end_iter().backward_search(needle, flags, None))
-    } else {
-        cursor
-            .forward_search(needle, flags, None)
-            .or_else(|| buffer.start_iter().forward_search(needle, flags, None))
-    };
-    if let Some((mut start, end)) = found {
-        buffer.select_range(&end, &start);
-        view.scroll_to_iter(&mut start, 0., false, 0., 0.);
+}
+impl Prefs {
+    fn to_json(self) -> Value {
+        json!({"autosave":self.autosave,"wrap":self.wrap,"line_numbers":self.line_numbers,
+            "current_line":self.current_line,"toolbar":self.toolbar,"monospace":self.monospace,
+            "markdown":self.markdown,"zoom":self.zoom,"sort":if self.sort_title {"title"} else {"modified"}})
+    }
+    fn from_json(value: &Value) -> Self {
+        let d = Self::default();
+        let flag = |key: &str, fallback: bool| value[key].as_bool().unwrap_or(fallback);
+        Self {
+            autosave: flag("autosave", d.autosave),
+            wrap: flag("wrap", d.wrap),
+            line_numbers: flag("line_numbers", d.line_numbers),
+            current_line: flag("current_line", d.current_line),
+            toolbar: flag("toolbar", d.toolbar),
+            monospace: flag("monospace", d.monospace),
+            markdown: flag("markdown", d.markdown),
+            zoom: value["zoom"].as_u64().map_or(d.zoom, |z| z.clamp(50, 300) as u16),
+            sort_title: value["sort"] == "title",
+        }
     }
 }
 
-fn replace_note(view: &gtk::TextView, needle: &str, replacement: &str, all: bool) {
-    if needle.is_empty() {
-        return;
-    }
-    let buffer = view.buffer();
-    buffer.begin_user_action();
-    if all {
-        let mut cursor = buffer.start_iter();
-        while let Some((mut start, mut end)) =
-            cursor.forward_search(needle, gtk::TextSearchFlags::CASE_INSENSITIVE, None)
-        {
-            buffer.delete(&mut start, &mut end);
-            buffer.insert(&mut start, replacement);
-            cursor = start;
-        }
-    } else if let Some((mut start, mut end)) = buffer.selection_bounds() {
-        if buffer.text(&start, &end, false).to_lowercase() == needle.to_lowercase() {
-            buffer.delete(&mut start, &mut end);
-            buffer.insert(&mut start, replacement);
-        }
-    }
-    buffer.end_user_action();
-    if !all {
-        find_note(view, needle, false);
-    }
+struct Row {
+    row: gtk::ListBoxRow,
+    note: Value,
+    haystack: String,
+    dot: gtk::Box,
 }
 
-pub fn verify_tools() {
-    let view = gtk::TextView::new();
-    view.buffer().set_text("one ONE one");
-    find_note(&view, "one", true);
-    assert_eq!(
-        view.buffer()
-            .selection_bounds()
-            .map(|(a, b)| (a.offset(), b.offset())),
-        Some((8, 11))
-    );
-    replace_note(&view, "one", "two", false);
-    assert_eq!(buffer_text(&view.buffer()), "one ONE two");
-    replace_note(&view, "one", "one+", true);
-    assert_eq!(buffer_text(&view.buffer()), "one+ one+ two");
+struct Shell {
+    root: gtk::Box,
+    toolbar: gtk::Box,
+    picker: gtk::Box,
+    split: gtk::Paned,
+    library: gtk::Box,
+    count: gtk::Label,
+    search: gtk::SearchEntry,
+    list: gtk::ListBox,
+    list_scroll: gtk::ScrolledWindow,
+    placeholder: gtk::Label,
+    row_menu: gtk::PopoverMenu,
+    banner: gtk::Box,
+    banner_text: gtk::Label,
+    welcome: gtk::Box,
+    rows: RefCell<Vec<Row>>,
+    notes: RefCell<Vec<Value>>,
+    project: Cell<i64>,
+    rail_applied: Cell<bool>,
 }
 
-fn editor(ui: &Rc<Ui>, note: Value) -> Rc<Draft> {
-    let id = note["id"].as_i64().unwrap_or(0);
-    let form = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    form.set_vexpand(true);
-    form.add_css_class("document-editor");
-    let document_head = gtk::Box::new(gtk::Orientation::Horizontal, 5);
-    document_head.add_css_class("document-head");
-    let title = gtk::Entry::builder().text(text(&note, "title")).build();
-    title.set_widget_name("note-title");
-    title.add_css_class("document-title");
-    title.set_hexpand(true);
-    title.set_valign(gtk::Align::Center);
-    document_head.append(&title);
-    let pin = gtk::CheckButton::with_label("Pin");
-    pin.set_active(note["pinned"].as_bool().unwrap_or(false));
-    pin.set_valign(gtk::Align::Center);
-    document_head.append(&pin);
-    form.append(&document_head);
+thread_local! {
+    static SHELL: RefCell<Option<Rc<Shell>>> = const { RefCell::new(None) };
+    static DOCS: RefCell<BTreeMap<i64, Rc<Doc>>> = const { RefCell::new(BTreeMap::new()) };
+    static PREFS: Cell<Prefs> = Cell::new(Prefs::default());
+    static SESSION: RefCell<serde_json::Map<String, Value>> = RefCell::new(serde_json::Map::new());
+    static RESTORED: RefCell<BTreeSet<i64>> = const { RefCell::new(BTreeSet::new()) };
+    static LAST_QUERY: RefCell<String> = const { RefCell::new(String::new()) };
+    static FONT: RefCell<Option<gtk::CssProvider>> = const { RefCell::new(None) };
+    static SCHEME: OnceCell<Option<sourceview5::StyleScheme>> = const { OnceCell::new() };
+}
 
-    let body = multiline(text(&note, "body"), 100);
-    body.set_vexpand(true);
-    body.add_css_class("document-text");
-    body.set_monospace(true);
-    body.set_widget_name("note-body");
-    let inset = move |width: i32| (width as f64 * 0.04).round().max(22.) as i32;
-    let window = ui
-        .notes_window
-        .borrow()
-        .as_ref()
-        .map(|owner| owner.window.clone())
-        .unwrap_or_else(|| ui.window.clone().upcast());
-    body.set_left_margin(inset(window.width()));
-    body.set_right_margin(inset(window.width()));
-    if let Some(surface) = window.surface() {
-        let target = body.downgrade();
-        let handler = surface.connect_layout(move |_, width, _| {
-            if let Some(view) = target.upgrade() {
-                view.set_left_margin(inset(width));
-                view.set_right_margin(inset(width));
-            }
-        });
-        let handler = RefCell::new(Some(handler));
-        body.connect_destroy(move |_| {
-            if let Some(handler) = handler.borrow_mut().take() {
-                surface.disconnect(handler);
-            }
-        });
-    }
-    let toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 2);
-    toolbar.add_css_class("document-toolbar");
+const NOTES_SCHEME: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<!-- Relay Notes: the Code editor's matte palette, with quieter Markdown. -->
+<style-scheme id="relay-notes" name="Relay Notes" version="1.0" parent-scheme="Adwaita-dark">
+  <style name="text" foreground="#dcdcda" background="#0c0c0e"/>
+  <style name="selection" background="#3a3a3f"/>
+  <style name="cursor" foreground="#ececea"/>
+  <style name="current-line" background="#131316"/>
+  <style name="line-numbers" foreground="#47474c" background="#0c0c0e"/>
+  <style name="current-line-number" foreground="#a5a5a3" background="#0c0c0e"/>
+  <style name="search-match" foreground="#0c0c0e" background="#e0b04a"/>
+  <style name="def:heading" foreground="#f4f4f2" bold="true"/>
+  <style name="def:emphasis" italic="true"/>
+  <style name="def:strong-emphasis" bold="true"/>
+  <style name="def:list-marker" foreground="#e0b04a" bold="true"/>
+  <style name="def:inline-code" foreground="#d9b46a" background="#17171a"/>
+  <style name="def:preformatted-section" foreground="#c9c4b4"/>
+  <style name="def:link-text" foreground="#7aa7f0" underline="single"/>
+  <style name="def:link-destination" foreground="#6e6e72"/>
+  <style name="def:link-symbol" foreground="#6e6e72"/>
+  <style name="def:shebang" foreground="#a5a5a3" italic="true"/>
+  <style name="def:thematic-break" foreground="#5a5a60"/>
+  <style name="def:special-char" foreground="#77777a"/>
+  <style name="def:comment" foreground="#6e6e70"/>
+  <style name="def:string" foreground="#e0b04a"/>
+  <style name="def:keyword" foreground="#c979d6"/>
+</style-scheme>
+"##;
 
-    for (caption, hint, before, after) in [
-        ("B", "Bold", "**", "**"),
-        ("I", "Italic", "_", "_"),
-        ("H2", "Heading", "\n## ", ""),
-        ("•≡", "Bulleted list", "\n- ", ""),
-        ("1≡", "Numbered list", "\n1. ", ""),
-        ("☐", "Checklist", "\n- [ ] ", ""),
-        ("❯", "Quote", "\n> ", ""),
-        ("<>", "Inline code", "`", "`"),
-        ("▣", "Code block", "\n```\n", "\n```\n"),
-        ("↗", "Link", "[", "](url)"),
-    ] {
-        if hint == "Checklist" {
-            continue;
-        }
-        let key = button(caption, "quiet");
-        key.set_valign(gtk::Align::Center);
-        key.set_tooltip_text(Some(hint));
-        if hint == "Bulleted list" {
-            let separator = gtk::Separator::new(gtk::Orientation::Vertical);
-            separator.add_css_class("document-tool-separator");
-            toolbar.append(&separator);
-        }
-        if hint == "Bold" {
-            key.add_css_class("document-tool-bold");
-        }
-        if hint == "Italic" {
-            key.add_css_class("document-tool-italic");
-        }
-        toolbar.append(&key);
-        let buffer = body.buffer();
-        key.connect_clicked(move |_| {
-            let (mut start, mut end) = buffer.selection_bounds().unwrap_or_else(|| {
-                let cursor = buffer.iter_at_offset(buffer.cursor_position());
-                (cursor, cursor)
+pub(super) fn scheme() -> Option<sourceview5::StyleScheme> {
+    SCHEME.with(|cell| {
+        cell.get_or_init(|| {
+            let manager = sourceview5::StyleSchemeManager::default();
+            let directory = glib::user_cache_dir().join("relay-v4/notes-styles");
+            let path = directory.join("relay-notes.xml");
+            let written = std::fs::create_dir_all(&directory).and_then(|_| {
+                if std::fs::read_to_string(&path).ok().as_deref() == Some(NOTES_SCHEME) {
+                    Ok(())
+                } else {
+                    std::fs::write(&path, NOTES_SCHEME)
+                }
             });
-            let selected = buffer.text(&start, &end, false);
-            let replacement = format!("{before}{selected}{after}");
-            buffer.begin_user_action();
-            buffer.delete(&mut start, &mut end);
-            buffer.insert(&mut start, &replacement);
-            buffer.end_user_action();
-        });
-    }
-    form.append(&toolbar);
-    let find_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    let query = gtk::Entry::builder()
-        .placeholder_text("Find")
-        .hexpand(true)
-        .build();
-    let replacement = gtk::Entry::builder()
-        .placeholder_text("Replace with")
-        .hexpand(true)
-        .build();
-    let matches = label("0 matches", "dim");
-    find_row.append(&query);
-    find_row.append(&matches);
-    for (caption, backward) in [("Previous", true), ("Next", false)] {
-        let key = button(caption, "quiet");
-        find_row.append(&key);
-        let view = body.clone();
-        let query = query.clone();
-        key.connect_clicked(move |_| find_note(&view, &query.text(), backward));
-    }
-    find_row.append(&replacement);
-    for (caption, all) in [("Replace", false), ("All", true)] {
-        let key = button(caption, "quiet");
-        find_row.append(&key);
-        let view = body.clone();
-        let query = query.clone();
-        let replacement = replacement.clone();
-        key.connect_clicked(move |_| replace_note(&view, &query.text(), &replacement.text(), all));
-    }
-    let close = crate::app::icon_button("close", "Close find");
-    find_row.append(&close);
-    let target = find_row.downgrade();
-    close.connect_clicked(move |_| {
-        if let Some(row) = target.upgrade() {
-            row.set_visible(false);
-        }
-    });
-    find_row.add_css_class("document-find");
-    find_row.set_visible(false);
-    let find_toggle = crate::app::icon_button("search", "Find and replace");
-
-    let separator = gtk::Separator::new(gtk::Orientation::Vertical);
-    separator.add_css_class("document-tool-separator");
-    toolbar.append(&separator);
-    toolbar.append(&find_toggle);
-
-    let find_box = find_row.clone();
-    find_toggle.connect_clicked(move |_| {
-        find_box.set_visible(!find_box.is_visible());
-    });
-    form.append(&find_row);
-    let buffer = body.buffer();
-    let q = query.clone();
-    let count = matches.clone();
-    let update: Rc<dyn Fn()> = Rc::new(move || {
-        let needle = q.text().to_lowercase();
-        let count_value = if needle.is_empty() {
-            0
-        } else {
-            buffer_text(&buffer).to_lowercase().matches(&needle).count()
-        };
-        count.set_text(&format!("{count_value} matches"));
-    });
-    let changed = update.clone();
-    query.connect_changed(move |_| changed());
-    body.buffer().connect_changed(move |_| update());
-    let view = body.clone();
-    let q = query.clone();
-    query.connect_activate(move |_| find_note(&view, &q.text(), false));
-    let keyboard = gtk::EventControllerKey::new();
-    let row = find_row.clone();
-    let q = query.clone();
-    keyboard.connect_key_pressed(move |_, key, _, mods| {
-        if key == gtk::gdk::Key::f && mods.contains(gtk::gdk::ModifierType::CONTROL_MASK) {
-            row.set_visible(true);
-            q.grab_focus();
-            glib::Propagation::Stop
-        } else if key == gtk::gdk::Key::Escape && row.is_visible() {
-            row.set_visible(false);
-            glib::Propagation::Stop
-        } else {
-            glib::Propagation::Proceed
-        }
-    });
-    form.add_controller(keyboard);
-    let wrap = gtk::ToggleButton::with_label("↩");
-    wrap.add_css_class("quiet");
-    wrap.set_valign(gtk::Align::Center);
-    wrap.set_active(true);
-    let view = body.clone();
-    wrap.connect_toggled(move |key| {
-        view.set_wrap_mode(if key.is_active() {
-            gtk::WrapMode::WordChar
-        } else {
-            gtk::WrapMode::None
+            match written {
+                Ok(()) => manager.append_search_path(&directory.to_string_lossy()),
+                Err(error) => tracing::warn!(%error, "Could not install the Notes colour scheme"),
+            }
+            manager
+                .scheme("relay-notes")
+                .or_else(|| manager.scheme("relay-matte"))
+                .or_else(|| manager.scheme("Adwaita-dark"))
         })
-    });
-    wrap.set_tooltip_text(Some("Toggle line wrap"));
-
-    let stamp = crate::app::icon_button("history", "Insert timestamp");
-    let buffer = body.buffer();
-    stamp.connect_clicked(move |_| {
-        if let Ok(now) = glib::DateTime::now_local() {
-            if let Ok(stamp) = now.format("%x %X") {
-                buffer.insert_at_cursor(&stamp);
-            }
-        }
-    });
-    toolbar.append(&stamp);
-    toolbar.append(&wrap);
-    let size = Rc::new(std::cell::Cell::new(13_i32));
-    let provider = gtk::CssProvider::new();
-    body.style_context()
-        .add_provider(&provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1);
-    for (caption, delta) in [("A−", -1), ("A+", 1)] {
-        let key = button(caption, "quiet");
-        key.set_tooltip_text(Some(if delta < 0 {
-            "Decrease text size"
-        } else {
-            "Increase text size"
-        }));
-        let size = size.clone();
-        let provider = provider.clone();
-        key.connect_clicked(move |_| {
-            size.set((size.get() + delta).clamp(11, 17));
-            provider.load_from_string(&format!(
-                "textview.document-text {{ font-size: {}px; }}",
-                size.get()
-            ));
-        });
-        toolbar.append(&key);
-    }
-
-    let editor_scroll = crate::app::scrolled(&body);
-
-    form.append(&editor_scroll);
-
-    let count = label("", "dim");
-    let buffer = body.buffer();
-    let status_bar = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    status_bar.add_css_class("document-status");
-    count.remove_css_class("dim");
-    status_bar.append(&count);
-
-    form.append(&status_bar);
-    let update = move |b: &gtk::TextBuffer| {
-        let value = buffer_text(b);
-        count.set_text(&format!(
-            "{} lines · {} words · {} characters",
-            value.lines().count().max(1),
-            value.split_whitespace().count(),
-            value.chars().count()
-        ));
-    };
-    update(&buffer);
-    buffer.connect_changed(update);
-    let dirty_title = title.clone();
-    let dirty_pin = pin.clone();
-    let snapshot: Rc<dyn Fn() -> Value> = Rc::new(
-        move || json!({"title":if title.text().trim().is_empty(){Value::Null}else{json!(title.text().trim())},"body":buffer_text(&body.buffer()),"pinned":pin.is_active()}),
-    );
-    let draft = Draft::new_note(ui, "Note", note, snapshot, form);
-    draft.controls(ui, "notes.get", "notes.update", "note_id", id);
-    draft.layout.add_css_class("note-draft");
-    for child in super::widgets(&draft.footer) {
-        if let Ok(key) = child.downcast::<gtk::Button>() {
-            match key.label().as_deref() {
-                Some("Close") => key.set_visible(false),
-                Some("Discard and close") => {
-                    key.set_label("Discard");
-                    key.set_tooltip_text(Some("Discard changes and close this note"));
-                }
-                _ => {}
-            }
-        }
-    }
-    draft.layout.remove(&draft.footer);
-    draft.footer.set_valign(gtk::Align::Center);
-
-    document_head.append(&draft.footer);
-
-    draft.layout.remove(&draft.status);
-    draft.status.add_css_class("document-save-status");
-    draft.status.set_text("Saved");
-
-    status_bar.prepend(&draft.status);
-
-    draft.layout.set_spacing(0);
-    draft.layout.set_margin_top(0);
-    draft.layout.set_margin_bottom(0);
-    draft.layout.set_margin_start(0);
-    draft.layout.set_margin_end(0);
-    draft.form.set_valign(gtk::Align::Fill);
-    if let Some(scroll) = draft
-        .layout
-        .first_child()
-        .and_downcast::<gtk::ScrolledWindow>()
-    {
-        scroll.set_child(gtk::Widget::NONE);
-        draft.layout.remove(&scroll);
-        draft.layout.prepend(&draft.form);
-    }
-
-    super::task_pages::action(
-        ui,
-        &draft,
-        &draft.footer,
-        "Delete",
-        "notes.delete",
-        move || json!({"note_id":id}),
-        None,
-    );
-
-    let sync: Rc<dyn Fn()> = Rc::new({
-        let weak = Rc::downgrade(&draft);
-        move || {
-            if let Some(draft) = weak.upgrade() {
-                if draft.busy.get() {
-                    return;
-                }
-                let dirty = draft.dirty();
-                draft
-                    .status
-                    .set_text(if dirty { "Modified" } else { "Saved" });
-                for child in super::widgets(&draft.footer) {
-                    if let Ok(key) = child.downcast::<gtk::Button>() {
-                        if key.widget_name() == "draft-save" {
-                            key.set_sensitive(dirty);
-                        }
-                        if key.label().as_deref() == Some("Discard") {
-                            key.set_visible(dirty);
-                        }
-                    }
-                }
-            }
-        }
-    });
-    let changed = sync.clone();
-    dirty_title.connect_changed(move |_| changed());
-    let changed = sync.clone();
-    dirty_pin.connect_toggled(move |_| changed());
-    let changed = sync.clone();
-    buffer.connect_changed(move |_| changed());
-    sync();
-
-    draft
+        .clone()
+    })
 }
-pub fn edit(ui: &Rc<Ui>, note: Value) {
-    ui.note_tabs.set_visible(true);
-    if let Some(host) = ui.note_tabs.parent() {
-        for child in super::widgets(&host) {
-            if child.has_css_class("notes-welcome") {
-                child.set_visible(false);
-            }
-        }
+
+pub(super) fn prefs() -> Prefs {
+    PREFS.with(Cell::get)
+}
+
+fn docs() -> Vec<Rc<Doc>> {
+    DOCS.with(|docs| docs.borrow().values().cloned().collect())
+}
+
+fn doc_by_id(id: i64) -> Option<Rc<Doc>> {
+    DOCS.with(|docs| docs.borrow().get(&id).cloned())
+}
+
+fn owner(ui: &Rc<Ui>) -> Option<Rc<NotesWindow>> {
+    ui.notes_window.borrow().clone()
+}
+
+pub(super) fn window_of(ui: &Rc<Ui>) -> Option<gtk::Window> {
+    owner(ui).map(|owner| owner.window.clone())
+}
+
+fn persist(ui: &Rc<Ui>) {
+    if let Some(owner) = owner(ui) {
+        owner.persist(ui);
     }
-    let id = note["id"].as_i64().unwrap_or(0);
-    if let Some(d) = ui.note_drafts.borrow().get(&id) {
-        d.layout.set_visible(true);
-        if let Some(page) = ui.note_tabs.page_num(&d.layout) {
-            ui.note_tabs.set_current_page(Some(page));
-        }
-        return;
-    }
-    let d = editor(ui, note.clone());
-    let title = if text(&note, "title").is_empty() {
-        "Untitled"
-    } else {
-        text(&note, "title")
-    };
-    let tab = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-    let project = note["project_id"].as_i64().unwrap_or(ui.project.get());
-    let project_name = ui
-        .projects
+}
+
+pub(super) fn last_query() -> String {
+    LAST_QUERY.with(|q| q.borrow().clone())
+}
+
+pub(super) fn remember_query(value: &str) {
+    LAST_QUERY.with(|q| value.clone_into(&mut q.borrow_mut()));
+}
+
+pub(super) fn project_name(ui: &Rc<Ui>, project: i64) -> String {
+    ui.projects
         .borrow()
         .iter()
         .find(|p| p["id"].as_i64() == Some(project))
         .map(|p| text(p, "name").to_string())
-        .unwrap_or_else(|| format!("Project {project}"));
-    tab.add_css_class("document-tab");
-    tab.set_tooltip_text(Some(&format!("{project_name} · {title}")));
-    tab.append(&label(title, "dim"));
-    let close = crate::app::icon_button("window-close-symbolic", "Close note");
-    tab.append(&close);
-    let page = ui.note_tabs.append_page(&d.layout, Some(&tab));
-    ui.note_tabs.set_tab_reorderable(&d.layout, true);
-    ui.note_tabs.set_current_page(Some(page));
-    ui.note_tabs.set_scrollable(true);
-    let weak = Rc::downgrade(ui);
-    let draft = Rc::downgrade(&d);
-    *d.on_close.borrow_mut() = Some(Box::new(move || {
-        if let (Some(ui), Some(d)) = (weak.upgrade(), draft.upgrade()) {
-            if let Some(page) = ui.note_tabs.page_num(&d.layout) {
-                ui.note_tabs.remove_page(Some(page));
-            }
-            ui.note_drafts.borrow_mut().remove(&id);
-            super::refresh_notes(&ui);
-        }
-    }));
-    let draft = d.clone();
-    close.connect_clicked(move |_| draft.close());
-    ui.note_drafts.borrow_mut().insert(id, d);
+        .unwrap_or_else(|| format!("Project {project}"))
 }
 
-pub fn workspace(ui: &Rc<Ui>, name: &str, project: i64, notes: &[Value]) {
-    let page = &ui.pages[name];
-    page.add_css_class("notes-page");
-    page.set_spacing(0);
-    ui.note_tabs.set_show_tabs(true);
-    ui.note_tabs.set_visible(true);
-    // Retain editors while the project library refreshes.
-    if let Some(parent) = ui.note_tabs.parent() {
-        if let Ok(paned) = parent.clone().downcast::<gtk::Paned>() {
-            paned.set_end_child(gtk::Widget::NONE);
-        } else if let Ok(container) = parent.downcast::<gtk::Box>() {
-            container.remove(&ui.note_tabs);
+/// "14:02" today, "Oct 5" this year, "Oct 5, 2025" before.
+pub(super) fn fmt_date(iso: &str) -> String {
+    let Some(date) = glib::DateTime::from_iso8601(iso, None).ok().and_then(|d| d.to_local().ok()) else {
+        return String::new();
+    };
+    let now = glib::DateTime::now_local().ok();
+    let format = match &now {
+        Some(now) if now.year() == date.year() && now.day_of_year() == date.day_of_year() => "%H:%M",
+        Some(now) if now.year() == date.year() => "%b %-d",
+        _ => "%b %-d, %Y",
+    };
+    date.format(format).map(|s| s.to_string()).unwrap_or_default()
+}
+
+fn apply_font(prefs: &Prefs) {
+    let css = format!(
+        "textview.notes-source {{ font-family: {}; font-size: {:.1}px; }}",
+        if prefs.monospace { "'Fira Mono', monospace" } else { "'Fira Sans', sans-serif" },
+        13.0 * f64::from(prefs.zoom) / 100.0
+    );
+    FONT.with(|font| {
+        let mut font = font.borrow_mut();
+        if font.is_none() {
+            if let Some(display) = gtk::gdk::Display::default() {
+                let provider = gtk::CssProvider::new();
+                gtk::style_context_add_provider_for_display(
+                    &display,
+                    &provider,
+                    gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+                );
+                *font = Some(provider);
+            }
+        }
+        if let Some(provider) = font.as_ref() {
+            provider.load_from_string(&css);
+        }
+    });
+}
+
+fn apply_prefs(ui: &Rc<Ui>, prefs: &Prefs, rows: bool) {
+    apply_font(prefs);
+    for doc in docs() {
+        doc.apply_prefs(prefs);
+    }
+    if let Some(shell) = shell_if_built() {
+        shell.toolbar.set_visible(prefs.toolbar);
+        if rows {
+            render_rows(ui, &shell);
         }
     }
-    clear(page);
-    let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    header.add_css_class("notes-app-head");
-    let icon = crate::icons::image("notes", 19);
-    icon.add_css_class("notes-app-icon");
-    icon.set_valign(gtk::Align::Center);
-    header.append(&icon);
-    let heading = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    heading.append(&label("Notes", "title"));
-    heading.append(&label("Plain-text project context agents can read.", "dim"));
-    heading.set_hexpand(true);
-    heading.set_valign(gtk::Align::Center);
-    header.append(&heading);
-    header.append(&super::workspace_picker(ui, project, name));
+}
 
-    let add = button("New document", "primary");
-    add.set_valign(gtk::Align::Center);
-    header.append(&add);
-    let weak = Rc::downgrade(ui);
-    add.connect_clicked(move |key| {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        let key = key.clone();
-        key.set_sensitive(false);
-        glib::spawn_future_local(async move {
-            match ui
-                .call(
-                    "notes.create",
-                    json!({"project_id":project,"title":"Untitled","body":"","pinned":false}),
-                )
-                .await
-            {
-                Ok(note) => {
-                    edit(&ui, note);
-                    super::refresh_notes(&ui);
-                }
-                Err(e) => ui.show_error(&e.to_string()),
-            }
-            key.set_sensitive(true);
-        });
-    });
-    page.append(&header);
+pub(super) fn set_prefs(ui: &Rc<Ui>, next: Prefs) {
+    let before = prefs();
+    if before == next {
+        return;
+    }
+    PREFS.with(|p| p.set(next));
+    apply_prefs(ui, &next, before.sort_title != next.sort_title);
+    if next.autosave && !before.autosave {
+        for doc in docs() {
+            doc.schedule_autosave(ui);
+        }
+    }
+    persist(ui);
+}
+
+pub(super) fn zoom(ui: &Rc<Ui>, direction: i32) {
+    let mut next = prefs();
+    next.zoom = if direction == 0 { 100 } else { text::zoom_step(next.zoom, direction) };
+    set_prefs(ui, next);
+}
+
+/// What the window persists besides its rail: preferences and open tabs per project.
+pub(super) fn saved_state() -> Value {
+    json!({"prefs": prefs().to_json(), "session": SESSION.with(|s| Value::Object(s.borrow().clone()))})
+}
+
+/// Settings arrived: adopt preferences and the remembered tabs, before the first render.
+pub(super) fn restore_state(ui: &Rc<Ui>, value: &Value) {
+    let restored = Prefs::from_json(&value["prefs"]);
+    PREFS.with(|p| p.set(restored));
+    if let Some(session) = value["session"].as_object() {
+        SESSION.with(|s| *s.borrow_mut() = session.clone());
+    }
+    let sidebar = owner(ui).is_none_or(|o| !o.rail_collapsed.get());
+    menu::sync_prefs(&restored, sidebar);
+    apply_prefs(ui, &restored, true);
+}
+
+/// The window is hiding: with autosave on, nothing waits for the timer.
+pub(super) fn flush(ui: &Rc<Ui>) {
+    if !prefs().autosave {
+        return;
+    }
+    for doc in docs() {
+        if doc.dirty() && !doc.deleted.get() && !doc.conflict.get() {
+            doc::save(ui, &doc, None);
+        }
+    }
+}
+
+/// Install the actions, shortcuts and menu bar on the Notes window.
+pub(super) fn window_menu(ui: &Rc<Ui>, window: &gtk::Window) -> gtk::Widget {
+    menu::install(ui, window).upcast()
+}
+
+fn shell_if_built() -> Option<Rc<Shell>> {
+    SHELL.with(|s| s.borrow().clone())
+}
+
+fn current_project(ui: &Rc<Ui>) -> i64 {
+    let shown = shell_if_built().map_or(0, |s| s.project.get());
+    if shown != 0 {
+        shown
+    } else {
+        owner(ui).map_or(ui.project.get(), |o| o.project.get())
+    }
+}
+
+fn tool(icon: &str, tip: &str, action: &str) -> gtk::Button {
+    let key = gtk::Button::new();
+    key.set_child(Some(&glyph(icon, 16)));
+    key.add_css_class("notes-tool");
+    key.set_focus_on_click(false);
+    key.set_tooltip_text(Some(tip));
+    key.update_property(&[gtk::accessible::Property::Label(tip)]);
+    key.set_action_name(Some(&format!("notes.{action}")));
+    key
+}
+
+fn text_tool(caption: &str, class: &str, tip: &str, action: &str) -> gtk::Button {
+    let key = gtk::Button::with_label(caption);
+    key.add_css_class("notes-tool");
+    key.add_css_class("notes-tool-text");
+    key.add_css_class(class);
+    key.set_focus_on_click(false);
+    key.set_tooltip_text(Some(tip));
+    key.set_action_name(Some(&format!("notes.{action}")));
+    key
+}
+
+fn tool_separator() -> gtk::Separator {
+    let line = gtk::Separator::new(gtk::Orientation::Vertical);
+    line.add_css_class("notes-tool-sep");
+    line
+}
+
+fn shell(ui: &Rc<Ui>) -> Rc<Shell> {
+    if let Some(shell) = shell_if_built() {
+        return shell;
+    }
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    root.add_css_class("notes-shell");
+    root.set_vexpand(true);
+
+    let toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 1);
+    toolbar.add_css_class("notes-toolbar");
+    let collapse = gtk::Button::new();
+    collapse.set_child(Some(&glyph("sidebar", 16)));
+    collapse.add_css_class("notes-tool");
+    collapse.set_focus_on_click(false);
+    collapse.set_widget_name("notes-library-toggle");
+    collapse.set_tooltip_text(Some("Show or hide the library (F9)"));
+    collapse.update_property(&[gtk::accessible::Property::Label("Toggle library")]);
+    toolbar.append(&collapse);
+    toolbar.append(&tool_separator());
+    toolbar.append(&tool("note-new", "New note (Ctrl+N)", "new"));
+    toolbar.append(&tool("save", "Save (Ctrl+S)", "save"));
+    toolbar.append(&tool_separator());
+    toolbar.append(&tool("undo", "Undo (Ctrl+Z)", "undo"));
+    toolbar.append(&tool("redo", "Redo (Ctrl+Shift+Z)", "redo"));
+    toolbar.append(&tool_separator());
+    toolbar.append(&tool("cut", "Cut (Ctrl+X)", "cut"));
+    toolbar.append(&tool("copy", "Copy (Ctrl+C)", "copy"));
+    toolbar.append(&tool("paste", "Paste (Ctrl+V)", "paste"));
+    toolbar.append(&tool_separator());
+    toolbar.append(&tool("search", "Find (Ctrl+F)", "find"));
+    toolbar.append(&tool("replace", "Replace (Ctrl+H)", "replace"));
+    toolbar.append(&tool_separator());
+    toolbar.append(&text_tool("B", "notes-tool-bold", "Bold (Ctrl+B)", "bold"));
+    toolbar.append(&text_tool("I", "notes-tool-italic", "Italic (Ctrl+I)", "italic"));
+    let headings = gtk::MenuButton::new();
+    headings.set_label("H");
+    headings.set_always_show_arrow(false);
+    headings.add_css_class("notes-tool-menu");
+    headings.set_tooltip_text(Some("Heading"));
+    headings.set_menu_model(Some(&menu::headings_menu()));
+    toolbar.append(&headings);
+    toolbar.append(&tool("list", "Bulleted list", "bullets"));
+    toolbar.append(&tool("list-numbered", "Numbered list", "numbers"));
+    toolbar.append(&tool("checklist", "Checklist", "checklist"));
+    toolbar.append(&tool("quote", "Quote", "quote"));
+    toolbar.append(&tool("code-inline", "Inline code", "code"));
+    toolbar.append(&tool("code-block", "Code block", "code-block"));
+    toolbar.append(&tool("link", "Link (Ctrl+K)", "link"));
+    let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    spacer.set_hexpand(true);
+    toolbar.append(&spacer);
+    let picker = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    picker.add_css_class("notes-picker");
+    toolbar.append(&picker);
+    root.append(&toolbar);
+
     let split = gtk::Paned::new(gtk::Orientation::Horizontal);
     split.set_widget_name("notes-library-split");
-    let owner = ui.notes_window.borrow().clone();
-    split.set_position(owner.as_ref().map_or(270, |window| window.rail_width.get()));
-    split.add_css_class("notes-workspace");
+    split.add_css_class("notes-split");
     split.set_vexpand(true);
-    let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    sidebar.set_size_request(180, -1);
-    sidebar.add_css_class("document-library");
-    sidebar.set_visible(
-        owner
-            .as_ref()
-            .is_none_or(|window| !window.rail_collapsed.get()),
-    );
-    let collapse = crate::app::icon_button("sidebar", "Toggle document library");
-    collapse.set_widget_name("notes-library-toggle");
-    collapse.set_valign(gtk::Align::Center);
-    header.prepend(&collapse);
-    let library = sidebar.clone();
-    let weak = Rc::downgrade(ui);
-    collapse.connect_clicked(move |_| {
-        library.set_visible(!library.is_visible());
-        if let Some(ui) = weak.upgrade() {
-            if let Some(window) = ui.notes_window.borrow().as_ref() {
-                window.rail_collapsed.set(!library.is_visible());
-                window.persist(&ui);
-            }
-        }
-    });
-    let weak = Rc::downgrade(ui);
-    split.connect_position_notify(move |split| {
-        if let Some(ui) = weak.upgrade() {
-            if let Some(window) = ui.notes_window.borrow().as_ref() {
-                if !window.rail_collapsed.get() {
-                    window.rail_width.set(split.position().max(180));
-                }
-                window.persist(&ui);
-            }
-        }
-    });
-    let library_head = gtk::Box::new(gtk::Orientation::Horizontal, 7);
-    library_head.add_css_class("document-library-head");
-    let documents = label("Documents", "dim");
-    documents.set_hexpand(true);
-    library_head.append(&documents);
-    library_head.append(&label(&notes.len().to_string(), "dim"));
-    sidebar.append(&library_head);
+    split.set_resize_start_child(false);
+    split.set_shrink_start_child(false);
+    split.set_shrink_end_child(false);
+    split.set_position(owner(ui).map_or(270, |o| o.rail_width.get()));
+
+    let library = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    library.add_css_class("notes-library");
+    library.set_size_request(180, -1);
+    let head = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    head.add_css_class("notes-library-head");
+    let heading = label("NOTES", "notes-library-title");
+    head.append(&heading);
+    let count = label("", "notes-library-count");
+    count.set_hexpand(true);
+    head.append(&count);
+    let sort = gtk::MenuButton::new();
+    sort.set_child(Some(&glyph("sort", 14)));
+    sort.add_css_class("notes-library-key");
+    sort.set_tooltip_text(Some("Sort notes"));
+    sort.set_menu_model(Some(&menu::sort_menu()));
+    head.append(&sort);
+    let add = tool("plus", "New note (Ctrl+N)", "new");
+    add.add_css_class("notes-library-key");
+    head.append(&add);
+    library.append(&head);
     let search = gtk::SearchEntry::new();
     search.set_placeholder_text(Some("Search notes"));
-    sidebar.append(&search);
-    let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    sidebar.append(&crate::app::scrolled(&list));
-    let mut filters = Vec::new();
-    for note in notes {
-        let title = text(note, "title");
-        let b = button("", "document-row");
-        let row = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        row.append(&label(
-            if title.is_empty() { "Untitled" } else { title },
-            "document-row-title",
-        ));
-        let preview = text(note, "body")
-            .lines()
-            .next()
-            .unwrap_or("Empty document");
-        let preview = label(preview, "document-preview");
-        preview.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        preview.set_max_width_chars(32);
-        row.append(&preview);
-        let date = glib::DateTime::from_iso8601(text(note, "updated_at"), None)
-            .and_then(|date| date.to_local())
-            .and_then(|date| date.format("%b %-d"))
-            .map(|date| date.to_string())
-            .unwrap_or_else(|_| text(note, "updated_at").to_string());
-        row.append(&label(&date, "document-date"));
-        if note["pinned"] == true {
-            b.add_css_class("pinned");
-        }
-        b.set_child(Some(&row));
-        list.append(&b);
-        filters.push((
-            format!("{} {}", title, text(note, "body")).to_lowercase(),
-            b.clone(),
-        ));
-        let weak = Rc::downgrade(ui);
-        let note = note.clone();
-        b.connect_clicked(move |_| {
-            if let Some(ui) = weak.upgrade() {
-                edit(&ui, note.clone());
-            }
-        });
-    }
-    search.connect_search_changed(move |s| {
-        let query = s.text().to_lowercase();
-        for (text, b) in &filters {
-            b.set_visible(text.contains(&query));
+    search.add_css_class("notes-library-search");
+    library.append(&search);
+    let list = gtk::ListBox::new();
+    list.add_css_class("notes-list");
+    list.set_selection_mode(gtk::SelectionMode::Single);
+    let placeholder = label("", "notes-list-empty");
+    placeholder.set_wrap(true);
+    placeholder.set_justify(gtk::Justification::Center);
+    placeholder.set_xalign(0.5);
+    list.set_placeholder(Some(&placeholder));
+    let list_scroll = crate::app::scrolled(&list);
+    list_scroll.set_hscrollbar_policy(gtk::PolicyType::Never);
+    library.append(&list_scroll);
+    split.set_start_child(Some(&library));
+
+    let host = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    host.add_css_class("notes-host");
+    host.set_vexpand(true);
+    host.set_hexpand(true);
+    let banner = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    banner.add_css_class("notes-notice");
+    banner.set_visible(false);
+    let banner_text = label("", "notes-notice-text");
+    banner_text.set_wrap(true);
+    banner_text.set_hexpand(true);
+    banner.append(&banner_text);
+    let dismiss = gtk::Button::new();
+    dismiss.set_child(Some(&glyph("close", 12)));
+    dismiss.add_css_class("notes-notice-close");
+    let hide = banner.downgrade();
+    dismiss.connect_clicked(move |_| {
+        if let Some(banner) = hide.upgrade() {
+            banner.set_visible(false)
         }
     });
-    split.set_start_child(Some(&sidebar));
-    let editor_host = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    editor_host.set_vexpand(true);
-    editor_host.append(&ui.note_tabs);
-    let welcome = gtk::Box::new(gtk::Orientation::Vertical, 9);
+    banner.append(&dismiss);
+    host.append(&banner);
+    let tabs = &ui.note_tabs;
+    if let Some(parent) = tabs.parent() {
+        if let Ok(parent) = parent.downcast::<gtk::Box>() {
+            parent.remove(tabs);
+        }
+    }
+    tabs.add_css_class("notes-tabs");
+    tabs.set_scrollable(true);
+    tabs.set_show_border(false);
+    tabs.set_show_tabs(true);
+    tabs.set_vexpand(true);
+    tabs.set_visible(false);
+    host.append(tabs);
+    let welcome = gtk::Box::new(gtk::Orientation::Vertical, 10);
     welcome.add_css_class("notes-welcome");
     welcome.set_valign(gtk::Align::Center);
     welcome.set_halign(gtk::Align::Center);
     welcome.set_vexpand(true);
-    welcome.append(&label("Open a document", "title"));
-    welcome.append(&label(
-        "Choose a note from the library or create a new document.",
-        "dim",
-    ));
-    editor_host.append(&welcome);
-    split.set_end_child(Some(&editor_host));
-    page.append(&split);
-    let changed_project = owner
-        .as_ref()
-        .is_some_and(|w| w.rendered_project.replace(project) != project);
-    let mut selected = None;
-    for draft in ui.note_drafts.borrow().values() {
-        let belongs = draft.base.borrow()["project_id"].as_i64() == Some(project);
-        draft.layout.set_visible(belongs);
-        if belongs && selected.is_none() {
-            selected = ui.note_tabs.page_num(&draft.layout);
+    let mark = glyph("notes", 36);
+    mark.add_css_class("notes-welcome-mark");
+    welcome.append(&mark);
+    let title = label("No note open", "notes-welcome-title");
+    title.set_xalign(0.5);
+    welcome.append(&title);
+    let hint = label("Pick a note from the library, or start a new one.", "notes-welcome-text");
+    hint.set_xalign(0.5);
+    welcome.append(&hint);
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    actions.set_halign(gtk::Align::Center);
+    let create = button("New note", "primary");
+    create.set_action_name(Some("notes.new"));
+    let find = button("Search the library", "");
+    find.set_action_name(Some("notes.open"));
+    actions.append(&create);
+    actions.append(&find);
+    welcome.append(&actions);
+    let keys = label("Ctrl+N new note  ·  Ctrl+O search  ·  F9 library", "notes-welcome-keys");
+    keys.set_xalign(0.5);
+    welcome.append(&keys);
+    host.append(&welcome);
+    split.set_end_child(Some(&host));
+    root.append(&split);
+
+    let row_menu = gtk::PopoverMenu::from_model(None::<&gtk::gio::MenuModel>);
+    row_menu.set_parent(&list);
+    row_menu.set_has_arrow(false);
+    row_menu.set_halign(gtk::Align::Start);
+    let menu_owner = row_menu.downgrade();
+    list.connect_destroy(move |_| {
+        if let Some(menu) = menu_owner.upgrade() {
+            menu.unparent();
         }
-    }
-    if changed_project {
-        if let Some(page) = selected {
-            ui.note_tabs.set_current_page(Some(page));
-        } else if let Some(note) = notes.first() {
-            edit(ui, note.clone());
+    });
+
+    let shell = Rc::new(Shell {
+        root,
+        toolbar,
+        picker,
+        split,
+        library,
+        count,
+        search,
+        list,
+        list_scroll,
+        placeholder,
+        row_menu,
+        banner,
+        banner_text,
+        welcome,
+        rows: RefCell::new(Vec::new()),
+        notes: RefCell::new(Vec::new()),
+        project: Cell::new(0),
+        rail_applied: Cell::new(false),
+    });
+    SHELL.with(|s| *s.borrow_mut() = Some(shell.clone()));
+    let weak_ui = Rc::downgrade(ui);
+    let weak = Rc::downgrade(&shell);
+
+    let target = weak_ui.clone();
+    collapse.connect_clicked(move |_| {
+        if let Some(ui) = target.upgrade() {
+            let visible = shell_if_built().is_some_and(|s| s.library.is_visible());
+            set_sidebar(&ui, !visible);
         }
-    }
-    let has_document = ui
-        .note_drafts
+    });
+    let target = weak_ui.clone();
+    shell.split.connect_position_notify(move |split| {
+        if let Some(ui) = target.upgrade() {
+            if let Some(owner) = owner(&ui) {
+                if !owner.rail_collapsed.get() {
+                    owner.rail_width.set(split.position().max(180));
+                }
+                owner.persist(&ui);
+            }
+        }
+    });
+    let filter = weak.clone();
+    shell.list.set_filter_func(move |row| {
+        let Some(shell) = filter.upgrade() else { return true };
+        let query = shell.search.text().trim().to_lowercase();
+        query.is_empty()
+            || shell
+                .rows
+                .borrow()
+                .get(row.index() as usize)
+                .is_some_and(|r| r.haystack.contains(&query))
+    });
+    let headers = weak.clone();
+    shell.list.set_header_func(move |row, before| {
+        let Some(shell) = headers.upgrade() else { return };
+        let rows = shell.rows.borrow();
+        let pinned = |row: &gtk::ListBoxRow| {
+            rows.get(row.index() as usize).is_some_and(|r| r.note["pinned"] == true)
+        };
+        let this = pinned(row);
+        let show = rows.iter().any(|r| r.note["pinned"] == true)
+            && before.is_none_or(|before| pinned(before) != this);
+        if show {
+            row.set_header(Some(&label(if this { "PINNED" } else { "NOTES" }, "notes-list-header")));
+        } else {
+            row.set_header(gtk::Widget::NONE);
+        }
+    });
+    let target = weak_ui.clone();
+    let rows = weak.clone();
+    shell.list.connect_row_activated(move |_, row| {
+        let (Some(ui), Some(shell)) = (target.upgrade(), rows.upgrade()) else { return };
+        let note = shell.rows.borrow().get(row.index() as usize).map(|r| r.note.clone());
+        if let Some(note) = note {
+            edit(&ui, note);
+            if let Some(doc) = current_doc(&ui) {
+                doc.view.grab_focus();
+            }
+        }
+    });
+    let context = gtk::GestureClick::new();
+    context.set_button(3);
+    let menu_shell = weak.clone();
+    context.connect_pressed(move |gesture, _, x, y| {
+        let Some(shell) = menu_shell.upgrade() else { return };
+        let Some(row) = shell.list.row_at_y(y as i32) else { return };
+        let target = shell
+            .rows
+            .borrow()
+            .get(row.index() as usize)
+            .map(|r| (r.note["id"].as_i64().unwrap_or(0), r.note["pinned"] == true));
+        if let Some((id, pinned)) = target {
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            shell.row_menu.set_menu_model(Some(&menu::row_menu(id, pinned)));
+            shell
+                .row_menu
+                .set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            shell.row_menu.popup();
+        }
+    });
+    shell.list.add_controller(context);
+    let searching = weak.clone();
+    shell.search.connect_search_changed(move |_| {
+        if let Some(shell) = searching.upgrade() {
+            shell.list.invalidate_filter();
+            shell.list.invalidate_headers();
+            update_placeholder(&shell);
+        }
+    });
+    let target = weak_ui.clone();
+    let first = weak.clone();
+    shell.search.connect_activate(move |_| {
+        let (Some(ui), Some(shell)) = (target.upgrade(), first.upgrade()) else { return };
+        if let Some(row) = first_visible(&shell) {
+            shell.list.select_row(Some(&row));
+            row.activate();
+        }
+        if let Some(doc) = current_doc(&ui) {
+            doc.view.grab_focus();
+        }
+    });
+    let target = weak_ui.clone();
+    shell.search.connect_stop_search(move |search| {
+        search.set_text("");
+        if let Some(doc) = target.upgrade().and_then(|ui| current_doc(&ui)) {
+            doc.view.grab_focus();
+        }
+    });
+    let down = gtk::EventControllerKey::new();
+    let first = weak.clone();
+    down.connect_key_pressed(move |_, key, _, _| {
+        if key == gtk::gdk::Key::Down {
+            if let Some(row) = first.upgrade().and_then(|shell| first_visible(&shell)) {
+                row.grab_focus();
+                return glib::Propagation::Stop;
+            }
+        }
+        glib::Propagation::Proceed
+    });
+    shell.search.add_controller(down);
+    let target = weak_ui.clone();
+    ui.note_tabs.connect_page_notify(move |_| {
+        if let Some(ui) = target.upgrade() {
+            tabs_changed(&ui);
+        }
+    });
+    let target = weak_ui.clone();
+    ui.note_tabs.connect_page_reordered(move |_, _, _| {
+        if let Some(ui) = target.upgrade() {
+            record_session(&ui);
+        }
+    });
+    let prefs = prefs();
+    apply_font(&prefs);
+    shell.toolbar.set_visible(prefs.toolbar);
+    update_placeholder(&shell);
+    shell
+}
+
+fn first_visible(shell: &Shell) -> Option<gtk::ListBoxRow> {
+    let query = shell.search.text().trim().to_lowercase();
+    shell
+        .rows
         .borrow()
-        .values()
-        .any(|draft| draft.base.borrow()["project_id"].as_i64() == Some(project));
-    ui.note_tabs.set_visible(has_document);
-    welcome.set_visible(!has_document);
+        .iter()
+        .find(|r| query.is_empty() || r.haystack.contains(&query))
+        .map(|r| r.row.clone())
+}
+
+fn update_placeholder(shell: &Shell) {
+    shell.placeholder.set_text(if shell.rows.borrow().is_empty() {
+        "No notes in this project yet.\nPress Ctrl+N to start one."
+    } else {
+        "No notes match your search."
+    });
+}
+
+fn mount(ui: &Rc<Ui>, shell: &Shell) {
+    let page = &ui.pages["notes"];
+    page.add_css_class("notes-page");
+    page.set_spacing(0);
+    if shell.root.parent().as_ref() != Some(page.upcast_ref::<gtk::Widget>()) {
+        clear(page);
+        page.append(&shell.root);
+    }
+}
+
+fn shell_error(ui: &Rc<Ui>, message: &str) {
+    let shell = shell(ui);
+    shell.banner_text.set_text(message);
+    shell.banner.set_visible(true);
+}
+
+fn build_row(note: &Value) -> Row {
+    let title = text(note, "title");
+    let body = text(note, "body");
+    let id = note["id"].as_i64().unwrap_or(0);
+    let row = gtk::ListBoxRow::new();
+    row.add_css_class("notes-row");
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 3);
+    let top = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    dot.add_css_class("notes-dirty-dot");
+    dot.set_valign(gtk::Align::Center);
+    dot.set_visible(doc_by_id(id).is_some_and(|d| d.dirty()));
+    dot.set_tooltip_text(Some("Unsaved changes"));
+    top.append(&dot);
+    let name = text::display_title(title, body);
+    let heading = label(&name, "notes-row-title");
+    heading.set_hexpand(true);
+    heading.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    top.append(&heading);
+    if note["pinned"] == true {
+        let pin = glyph("pin", 12);
+        pin.add_css_class("notes-row-pin");
+        pin.set_tooltip_text(Some("Pinned: shared with agents"));
+        top.append(&pin);
+    }
+    content.append(&top);
+    let bottom = gtk::Box::new(gtk::Orientation::Horizontal, 7);
+    bottom.append(&label(&fmt_date(text(note, "updated_at")), "notes-row-date"));
+    let preview = text::preview(title, body);
+    let preview = label(if preview.is_empty() { "No additional text" } else { &preview }, "notes-row-preview");
+    preview.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    preview.set_hexpand(true);
+    bottom.append(&preview);
+    content.append(&bottom);
+    row.set_child(Some(&content));
+    row.update_property(&[gtk::accessible::Property::Label(&name)]);
+    Row { row, note: note.clone(), haystack: format!("{title}\n{body}").to_lowercase(), dot }
+}
+
+fn render_rows(ui: &Rc<Ui>, shell: &Shell) {
+    let adjustment = shell.list_scroll.vadjustment();
+    let keep = adjustment.value();
+    shell.list.remove_all();
+    let mut notes = shell.notes.borrow().clone();
+    if prefs().sort_title {
+        notes.sort_by_cached_key(|n| {
+            (n["pinned"] != true, text::display_title(text(n, "title"), text(n, "body")).to_lowercase())
+        });
+    }
+    let rows: Vec<Row> = notes.iter().map(build_row).collect();
+    let widgets: Vec<gtk::ListBoxRow> = rows.iter().map(|r| r.row.clone()).collect();
+    *shell.rows.borrow_mut() = rows;
+    for row in &widgets {
+        shell.list.append(row);
+    }
+    shell.count.set_text(&notes.len().to_string());
+    update_placeholder(shell);
+    shell.list.invalidate_filter();
+    shell.list.invalidate_headers();
+    select_active_row(ui, shell);
+    glib::idle_add_local_once(move || adjustment.set_value(keep));
+}
+
+fn select_active_row(ui: &Rc<Ui>, shell: &Shell) {
+    let active = current_doc(ui).map(|d| d.id);
+    let row = shell
+        .rows
+        .borrow()
+        .iter()
+        .find(|r| active.is_some() && r.note["id"].as_i64() == active)
+        .map(|r| r.row.clone());
+    match row {
+        Some(row) => shell.list.select_row(Some(&row)),
+        None => shell.list.unselect_all(),
+    }
+}
+
+/// The note in the visible tab, if any.
+pub(super) fn current_doc(ui: &Rc<Ui>) -> Option<Rc<Doc>> {
+    let tabs = &ui.note_tabs;
+    let widget = tabs.nth_page(tabs.current_page())?;
+    if !widget.is_visible() {
+        return None;
+    }
+    docs().into_iter().find(|d| d.draft.layout.upcast_ref::<gtk::Widget>() == &widget)
+}
+
+pub(super) fn update_chrome(ui: &Rc<Ui>) {
+    let Some(owner) = owner(ui) else { return };
+    let (heading, title) = match current_doc(ui) {
+        Some(doc) => {
+            let name = doc.name();
+            if doc.dirty() {
+                (format!("{name}  •"), format!("{name} • — Notes · Relay"))
+            } else {
+                (name.clone(), format!("{name} — Notes · Relay"))
+            }
+        }
+        None => ("Notes".to_string(), "Notes · Relay".to_string()),
+    };
+    if owner.heading.text() != heading {
+        owner.heading.set_text(&heading);
+    }
+    if owner.window.title().as_deref() != Some(title.as_str()) {
+        owner.window.set_title(Some(&title));
+    }
+}
+
+pub(super) fn dirty_changed(ui: &Rc<Ui>, id: i64, dirty: bool) {
+    if let Some(shell) = shell_if_built() {
+        for row in shell.rows.borrow().iter() {
+            if row.note["id"].as_i64() == Some(id) {
+                row.dot.set_visible(dirty);
+            }
+        }
+    }
+    menu::sync(current_doc(ui).as_ref());
+}
+
+fn update_welcome(ui: &Rc<Ui>) {
+    let Some(shell) = shell_if_built() else { return };
+    let project = current_project(ui);
+    let open = docs().iter().any(|d| {
+        (project == 0 || d.project == project) && ui.note_tabs.page_num(&d.draft.layout).is_some()
+    });
+    ui.note_tabs.set_visible(open);
+    shell.welcome.set_visible(!open);
+}
+
+fn tabs_changed(ui: &Rc<Ui>) {
+    update_welcome(ui);
+    if let Some(shell) = shell_if_built() {
+        select_active_row(ui, &shell);
+    }
+    let current = current_doc(ui);
+    menu::sync(current.as_ref());
+    update_chrome(ui);
+    record_session(ui);
+}
+
+/// Remember the open tabs and the active one for the project on screen.
+fn record_session(ui: &Rc<Ui>) {
+    let project = shell_if_built().map_or(0, |s| s.project.get());
+    if project == 0 || !RESTORED.with(|r| r.borrow().contains(&project)) {
+        return;
+    }
+    let all = docs();
+    let tabs = &ui.note_tabs;
+    let open: Vec<i64> = (0..tabs.n_pages())
+        .filter_map(|i| tabs.nth_page(Some(i)))
+        .filter_map(|w| {
+            all.iter()
+                .find(|d| d.project == project && d.draft.layout.upcast_ref::<gtk::Widget>() == &w)
+                .map(|d| d.id)
+        })
+        .collect();
+    let active = current_doc(ui).filter(|d| d.project == project).map(|d| d.id);
+    let entry = json!({"open":open,"active":active});
+    let changed = SESSION.with(|s| {
+        let mut s = s.borrow_mut();
+        let changed = s.get(&project.to_string()) != Some(&entry);
+        s.insert(project.to_string(), entry);
+        changed
+    });
+    if changed {
+        persist(ui);
+    }
+}
+
+/// Build a tab for `note` (at `position`, else last) and show it.
+pub(super) fn open_doc(ui: &Rc<Ui>, note: Value, position: Option<u32>) -> Rc<Doc> {
+    let shell = shell(ui);
+    mount(ui, &shell);
+    let doc = doc::build(ui, &note);
+    let id = doc.id;
+    let tabs = &ui.note_tabs;
+    let page = match position {
+        Some(position) => tabs.insert_page(&doc.draft.layout, Some(&doc.tab), Some(position)),
+        None => tabs.append_page(&doc.draft.layout, Some(&doc.tab)),
+    };
+    tabs.set_tab_reorderable(&doc.draft.layout, true);
+    let (weak_ui, weak) = (Rc::downgrade(ui), Rc::downgrade(&doc));
+    *doc.draft.on_close.borrow_mut() = Some(Box::new(move || {
+        let Some(ui) = weak_ui.upgrade() else { return };
+        if let Some(doc) = weak.upgrade() {
+            doc.stop_timers();
+            if let Some(page) = ui.note_tabs.page_num(&doc.draft.layout) {
+                ui.note_tabs.remove_page(Some(page));
+            }
+        }
+        DOCS.with(|docs| docs.borrow_mut().remove(&id));
+        ui.note_drafts.borrow_mut().remove(&id);
+        if let Some(shell) = shell_if_built() {
+            for row in shell.rows.borrow().iter() {
+                if row.note["id"].as_i64() == Some(id) {
+                    row.dot.set_visible(false);
+                }
+            }
+        }
+        tabs_changed(&ui);
+    }));
+    DOCS.with(|docs| docs.borrow_mut().insert(id, doc.clone()));
+    ui.note_drafts.borrow_mut().insert(id, doc.draft.clone());
+    tabs.set_current_page(Some(page));
+    tabs_changed(ui);
+    doc
+}
+
+pub fn edit(ui: &Rc<Ui>, note: Value) {
+    let shell = shell(ui);
+    mount(ui, &shell);
+    let id = note["id"].as_i64().unwrap_or(0);
+    if let Some(doc) = doc_by_id(id) {
+        doc.draft.layout.set_visible(true);
+        if let Some(page) = ui.note_tabs.page_num(&doc.draft.layout) {
+            ui.note_tabs.set_current_page(Some(page));
+        }
+        tabs_changed(ui);
+        return;
+    }
+    open_doc(ui, note, None);
+}
+
+pub(super) fn new_note(ui: &Rc<Ui>, title: Option<String>, body: String) {
+    let project = current_project(ui);
+    if project == 0 {
+        return;
+    }
+    let mut payload = json!({"project_id":project,"body":body,"pinned":false});
+    if let Some(title) = title {
+        payload["title"] = json!(title);
+    }
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        match ui.call("notes.create", payload).await {
+            Ok(note) => {
+                open_doc(&ui, note, None).view.grab_focus();
+                refresh_notes(&ui);
+            }
+            Err(error) => shell_error(&ui, &format!("Could not create a note: {error}")),
+        }
+    });
+}
+
+pub(super) fn set_sidebar(ui: &Rc<Ui>, visible: bool) {
+    let shell = shell(ui);
+    if let Some(owner) = owner(ui) {
+        owner.rail_collapsed.set(!visible);
+        owner.persist(ui);
+    }
+    shell.library.set_visible(visible);
+    if let Some(action) = menu::lookup("sidebar") {
+        action.set_state(&visible.to_variant());
+    }
+}
+
+pub(super) fn focus_library(ui: &Rc<Ui>) {
+    let shell = shell(ui);
+    if !shell.library.is_visible() {
+        set_sidebar(ui, true);
+    }
+    shell.search.grab_focus();
+    shell.search.select_region(0, -1);
+}
+
+pub(super) fn toggle_pin(doc: &Rc<Doc>) {
+    doc.pin.set_active(!doc.pin.is_active());
+}
+
+pub(super) fn cycle_tab(ui: &Rc<Ui>, direction: i32) {
+    let tabs = &ui.note_tabs;
+    let visible: Vec<u32> = (0..tabs.n_pages())
+        .filter(|i| tabs.nth_page(Some(*i)).is_some_and(|w| w.is_visible()))
+        .collect();
+    if visible.len() < 2 {
+        return;
+    }
+    let at = visible.iter().position(|i| Some(*i) == tabs.current_page()).unwrap_or(0) as i32;
+    let next = (at + direction).rem_euclid(visible.len() as i32) as usize;
+    tabs.set_current_page(Some(visible[next]));
+}
+
+fn listed(id: i64) -> Option<Value> {
+    shell_if_built()?
+        .notes
+        .borrow()
+        .iter()
+        .find(|n| n["id"].as_i64() == Some(id))
+        .cloned()
+}
+
+pub(super) fn open_id(ui: &Rc<Ui>, id: i64, rename: bool) {
+    let Some(note) = doc_by_id(id).map(|d| d.draft.base.borrow().clone()).or_else(|| listed(id)) else {
+        return;
+    };
+    edit(ui, note);
+    if let Some(doc) = doc_by_id(id) {
+        if rename {
+            doc.title.grab_focus();
+            doc.title.select_region(0, -1);
+        } else {
+            doc.view.grab_focus();
+        }
+    }
+}
+
+pub(super) fn pin_id(ui: &Rc<Ui>, id: i64) {
+    if let Some(doc) = doc_by_id(id) {
+        toggle_pin(&doc);
+        return;
+    }
+    let Some(note) = listed(id) else { return };
+    let pinned = note["pinned"] != true;
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        match ui.call("notes.pin", json!({"note_id":id,"pinned":pinned})).await {
+            Ok(_) => refresh_notes(&ui),
+            Err(error) => shell_error(&ui, &error.to_string()),
+        }
+    });
+}
+
+pub(super) fn duplicate_id(ui: &Rc<Ui>, id: i64) {
+    let (title, body) = match doc_by_id(id) {
+        Some(doc) => (doc.name(), doc.body()),
+        None => match listed(id) {
+            Some(note) => (text::display_title(text(&note, "title"), text(&note, "body")), text(&note, "body").to_string()),
+            None => return,
+        },
+    };
+    new_note(ui, Some(format!("{title} copy")), body);
+}
+
+pub(super) fn delete_id(ui: &Rc<Ui>, id: i64) {
+    let name = match doc_by_id(id) {
+        Some(doc) => doc.name(),
+        None => listed(id).map_or_else(|| "this note".into(), |n| text::display_title(text(&n, "title"), text(&n, "body"))),
+    };
+    confirm_delete(ui, id, name);
+}
+
+pub(super) fn confirm_delete(ui: &Rc<Ui>, id: i64, name: String) {
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let dialog = gtk::AlertDialog::builder()
+            .message(format!("Delete “{name}”?"))
+            .detail("It leaves this project's library, and agents stop reading it.")
+            .buttons(["Cancel", "Delete"])
+            .cancel_button(0)
+            .default_button(0)
+            .modal(true)
+            .build();
+        if dialog.choose_future(window_of(&ui).as_ref()).await.ok() != Some(1) {
+            return;
+        }
+        match ui.call("notes.delete", json!({"note_id":id})).await {
+            Ok(_) => {
+                if let Some(doc) = doc_by_id(id) {
+                    doc::discard_close(&ui, &doc);
+                }
+                refresh_notes(&ui);
+            }
+            Err(error) => match doc_by_id(id) {
+                Some(doc) => doc.show_notice(&ui, &format!("Not deleted: {error}"), Vec::new()),
+                None => shell_error(&ui, &format!("Not deleted: {error}")),
+            },
+        }
+    });
+}
+
+/// Render the library for `project`, reconcile open notes with the stored copies, and
+/// restore the project's remembered tabs the first time it is shown. The shell itself is
+/// built once, so the search text, scroll position and editors survive every refresh.
+pub fn workspace(ui: &Rc<Ui>, _name: &str, project: i64, notes: &[Value]) {
+    let shell = shell(ui);
+    mount(ui, &shell);
+    // Read the remembered tabs before hiding other projects' tabs records anything.
+    let saved = SESSION.with(|s| s.borrow().get(&project.to_string()).cloned());
+    let changed = shell.project.replace(project) != project;
+    let owner = owner(ui);
+    if let Some(owner) = &owner {
+        owner.rendered_project.set(project);
+        if !shell.rail_applied.replace(true) {
+            shell.split.set_position(owner.rail_width.get());
+            shell.library.set_visible(!owner.rail_collapsed.get());
+            if let Some(action) = menu::lookup("sidebar") {
+                action.set_state(&(!owner.rail_collapsed.get()).to_variant());
+            }
+        }
+    }
+    clear(&shell.picker);
+    shell.picker.append(&super::workspace_picker(ui, project, "notes"));
+    *shell.notes.borrow_mut() = notes.to_vec();
+    for doc in docs() {
+        let mine = doc.project == project;
+        doc.draft.layout.set_visible(mine);
+        if mine {
+            doc::reconcile(ui, &doc, notes.iter().find(|n| n["id"].as_i64() == Some(doc.id)));
+        }
+    }
+    render_rows(ui, &shell);
+    let first_time = RESTORED.with(|r| r.borrow_mut().insert(project));
+    if first_time {
+        match &saved {
+            Some(entry) => {
+                for id in rows(entry, "open").iter().filter_map(Value::as_i64) {
+                    if doc_by_id(id).is_none() {
+                        if let Some(note) = notes.iter().find(|n| n["id"].as_i64() == Some(id)) {
+                            open_doc(ui, note.clone(), None);
+                        }
+                    }
+                }
+            }
+            None => {
+                if !docs().iter().any(|d| d.project == project) {
+                    if let Some(note) = notes.first() {
+                        open_doc(ui, note.clone(), None);
+                    }
+                }
+            }
+        }
+    }
+    if first_time || changed {
+        let wanted = saved
+            .as_ref()
+            .and_then(|s| s["active"].as_i64())
+            .and_then(doc_by_id)
+            .filter(|d| d.project == project)
+            .or_else(|| {
+                (0..ui.note_tabs.n_pages())
+                    .filter_map(|i| ui.note_tabs.nth_page(Some(i)))
+                    .find(|w| w.is_visible())
+                    .and_then(|w| docs().into_iter().find(|d| d.draft.layout.upcast_ref::<gtk::Widget>() == &w))
+            });
+        if let Some(doc) = wanted {
+            if let Some(page) = ui.note_tabs.page_num(&doc.draft.layout) {
+                ui.note_tabs.set_current_page(Some(page));
+            }
+        }
+    }
+    tabs_changed(ui);
+    if let Some(owner) = owner {
+        owner.renders.set(owner.renders.get() + 1);
+    }
+}
+
+/// Fixture checks for the editor's pure helpers and GtkSourceView search, run by smoke.
+pub fn verify_tools() {
+    use sourceview5::prelude::*;
+    assert_eq!(text::list_enter("- milk", ""), Some(text::Enter::Continue("- ".into())));
+    assert_eq!(text::list_enter("3. three", ""), Some(text::Enter::Continue("4. ".into())));
+    assert_eq!(text::list_enter("- [ ] ", ""), Some(text::Enter::End));
+    assert_eq!(text::toggle_lines(&["a", "b"], text::Prefix::Bullet), ["- a", "- b"]);
+    assert_eq!(text::toggle_lines(&["## a"], text::Prefix::Heading(2)), ["a"]);
+    assert_eq!(text::parse_goto("12:4"), Some((12, Some(4))));
+    assert!(sourceview5::LanguageManager::default().language("markdown").is_some());
+    assert!(scheme().is_some(), "Notes colour scheme");
+    let buffer = sourceview5::Buffer::new(None);
+    buffer.set_text("one ONE one");
+    let settings = sourceview5::SearchSettings::new();
+    settings.set_wrap_around(true);
+    settings.set_search_text(Some("one"));
+    let search = sourceview5::SearchContext::new(&buffer, Some(&settings));
+    let (start, end, _) = search.forward(&buffer.start_iter()).expect("first match");
+    assert_eq!((start.offset(), end.offset()), (0, 3));
+    let (mut start, mut end, _) = search.backward(&buffer.end_iter()).expect("last match");
+    assert_eq!((start.offset(), end.offset()), (8, 11));
+    search.replace(&mut start, &mut end, "two").expect("replace one");
+    assert_eq!(buffer_text(buffer.upcast_ref()), "one ONE two");
+    settings.set_case_sensitive(true);
+    search.replace_all("one+").expect("replace all");
+    assert_eq!(buffer_text(buffer.upcast_ref()), "one+ ONE two");
 }
 
 pub fn note_row(ui: &Rc<Ui>, body: &gtk::Box, note: Value) {

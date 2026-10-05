@@ -1,1 +1,146 @@
 /* notes area styles: loaded after theme.css, so rules here override it. */
+/* Notes is a desktop text editor in the KWrite mould: menu bar, toolbar, library,
+   tabbed documents on one paper surface, a find bar and a status bar. */
+@define-color notes_paper #0c0c0e;
+
+/* ---- titlebar: menu bar · document name · window keys ---- */
+.notes-chrome { min-height: 30px; background: @console; border-bottom: 1px solid @edge; }
+.notes-chrome-mark { margin: 0 4px 0 11px; color: @faint; }
+.notes-chrome popovermenubar { background: transparent; padding: 0; }
+.notes-chrome popovermenubar > item { min-height: 30px; padding: 0 9px; border-radius: 0; color: @secondary; font-size: 12px; font-weight: 500; }
+.notes-chrome popovermenubar > item:hover,
+.notes-chrome popovermenubar > item:selected { background: @wash; color: @ink; }
+.notes-heading { color: @secondary; font-size: 12px; font-weight: 500; }
+.notes-chrome-controls button { min-height: 30px; min-width: 40px; padding: 0; border: 0; border-radius: 0; background: transparent; color: @secondary; }
+.notes-chrome-controls button:hover { background: @wash; color: @ink; }
+.notes-chrome-controls button.notes-window-close:hover { background: #c42b1c; color: white; }
+
+/* ---- menus ---- */
+.notes-window popover.menu > contents { padding: 4px; min-width: 232px; background: @slab; border: 1px solid @strong; border-radius: 3px; }
+.notes-window popover.menu modelbutton { min-height: 27px; padding: 0 10px; border-radius: 2px; color: @ink; font-size: 12px; }
+.notes-window popover.menu modelbutton:hover,
+.notes-window popover.menu modelbutton:selected { background: @wash; }
+.notes-window popover.menu modelbutton:disabled { color: @faint; }
+.notes-window popover.menu modelbutton accelerator { margin-left: 28px; color: @faint; font-size: 11px; }
+.notes-window popover.menu modelbutton check,
+.notes-window popover.menu modelbutton radio { min-width: 14px; min-height: 14px; margin-right: 8px; }
+.notes-window popover.menu separator { min-height: 1px; margin: 4px 2px; background: @edge; }
+.notes-window popover.menu .title { padding: 6px 10px 3px; color: @faint; font-size: 11px; font-weight: 600; }
+
+/* ---- toolbar ---- */
+.notes-toolbar { min-height: 36px; padding: 0 6px; background: @console; border-bottom: 1px solid @edge; }
+button.notes-tool,
+.notes-tool-menu > button { min-width: 30px; min-height: 28px; margin: 4px 0; padding: 0; border: 0; border-radius: 3px; background: transparent; color: @secondary; box-shadow: none; }
+button.notes-tool:hover,
+.notes-tool-menu > button:hover,
+.notes-tool-menu > button:checked { background: @wash; color: @ink; }
+button.notes-tool:active { background: alpha(@ink, 0.12); }
+button.notes-tool:disabled { opacity: 0.32; }
+button.notes-tool-text,
+.notes-tool-menu > button { font-family: 'Fira Sans', sans-serif; font-size: 14px; }
+button.notes-tool-bold { font-weight: 700; }
+button.notes-tool-italic { font-style: italic; font-family: serif; font-size: 15px; }
+.notes-tool-menu > button { font-weight: 600; }
+.notes-tool-sep { min-width: 1px; margin: 9px 5px; background: @edge; }
+.notes-picker .workspace-picker > button { min-height: 26px; }
+
+/* ---- library ---- */
+.notes-split > separator { min-width: 1px; background: @edge; }
+.notes-library { background: @console; }
+.notes-library scrolledwindow, .notes-library viewport { background: @console; }
+.notes-library-head { min-height: 36px; padding: 0 6px 0 13px; }
+.notes-library-title { color: @faint; font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; }
+.notes-library-count { color: @faint; font-size: 11px; }
+button.notes-library-key,
+.notes-library-key > button { min-width: 26px; min-height: 26px; margin: 0; padding: 0; border: 0; border-radius: 3px; background: transparent; color: @secondary; }
+button.notes-library-key:hover,
+.notes-library-key > button:hover,
+.notes-library-key > button:checked { background: @wash; color: @ink; }
+entry.notes-library-search { margin: 0 8px 8px; min-height: 28px; background: @wall; border-color: @edge; font-size: 12px; }
+list.notes-list { background: @console; padding-bottom: 8px; }
+list.notes-list > row.notes-row { padding: 8px 12px 9px 11px; border-left: 2px solid transparent; border-radius: 0; background: transparent; }
+list.notes-list > row.notes-row:hover { background: alpha(@ink, 0.035); }
+list.notes-list > row.notes-row:selected { background: alpha(@ink, 0.075); border-left-color: @ink; }
+list.notes-list > row.notes-row:focus-visible { outline: 1px solid alpha(@ink, 0.35); outline-offset: -1px; }
+.notes-row-title { color: @ink; font-size: 13px; font-weight: 500; }
+.notes-row-date { color: @secondary; font-size: 11px; font-feature-settings: "tnum"; }
+.notes-row-preview { color: @faint; font-size: 11px; }
+.notes-row-pin { color: @faint; }
+.notes-list-header { padding: 12px 13px 4px; color: @faint; font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif; font-size: 10px; font-weight: 600; letter-spacing: 0.08em; }
+.notes-list-empty { padding: 28px 18px; color: @faint; font-size: 12px; }
+
+/* ---- tabs ---- */
+notebook.notes-tabs > header { min-height: 0; padding: 0; background: @console; border-bottom: 1px solid @edge; box-shadow: none; }
+notebook.notes-tabs > header > tabs > tab { min-height: 32px; padding: 0 4px 0 12px; margin: 0; border: 0; border-right: 1px solid @edge; border-radius: 0; background: transparent; color: @secondary; box-shadow: none; }
+notebook.notes-tabs > header > tabs > tab:hover { background: alpha(@ink, 0.03); color: @ink; }
+notebook.notes-tabs > header > tabs > tab:checked { background: @notes_paper; color: @ink; box-shadow: inset 0 2px @ink; }
+notebook.notes-tabs > header > arrow { min-width: 24px; color: @secondary; }
+notebook.notes-tabs > stack { background: @notes_paper; }
+.notes-tab-label { font-size: 12px; }
+tab:checked .notes-tab-label { font-weight: 500; }
+button.notes-tab-close { min-width: 20px; min-height: 20px; padding: 0; border: 0; border-radius: 3px; background: transparent; color: @faint; opacity: 0.65; }
+tab:hover button.notes-tab-close, tab:checked button.notes-tab-close { opacity: 1; }
+button.notes-tab-close:hover { background: @wash; color: @ink; }
+.notes-dirty-dot { min-width: 7px; min-height: 7px; border-radius: 99px; background: @waiting; }
+
+/* ---- document ---- */
+.notes-page-body, .notes-doc { background: @notes_paper; }
+.notes-doc-head { min-height: 52px; padding: 6px 12px 2px 16px; background: @notes_paper; }
+entry.notes-title { min-height: 36px; padding: 0 2px; border: 0; border-radius: 0; background: transparent; box-shadow: none; color: @ink; font-size: 19px; font-weight: 600; }
+entry.notes-title:focus-within { box-shadow: inset 0 -1px alpha(@ink, 0.25); }
+.notes-meta { color: @faint; font-size: 11px; }
+button.notes-pin { min-width: 28px; min-height: 28px; padding: 0; border: 0; border-radius: 3px; background: transparent; color: @faint; }
+button.notes-pin:hover { background: @wash; color: @ink; }
+button.notes-pin:checked { color: @waiting; background: alpha(@waiting, 0.10); }
+.notes-scroll, .notes-scroll > viewport { background: @notes_paper; }
+textview.notes-source { padding: 0; background: @notes_paper; }
+textview.notes-source > text { background: @notes_paper; }
+textview.notes-source > border.left gutter { background: @notes_paper; }
+
+/* ---- notices (conflicts, deletions, errors) ---- */
+.notes-notice { min-height: 34px; padding: 4px 8px 4px 16px; background: alpha(@waiting, 0.09); border-top: 1px solid alpha(@waiting, 0.28); border-bottom: 1px solid alpha(@waiting, 0.28); }
+.notes-notice-text { color: @ink; font-size: 12px; }
+button.notes-notice-button { min-height: 24px; padding: 0 9px; font-size: 11px; background: @slab; }
+button.notes-notice-close { min-width: 22px; min-height: 22px; padding: 0; border: 0; background: transparent; color: @secondary; }
+button.notes-notice-close:hover { background: @wash; color: @ink; }
+
+/* ---- find / replace bar ---- */
+.notes-find { padding: 6px 8px 6px 12px; background: @console; border-top: 1px solid @edge; }
+entry.notes-find-entry { min-height: 28px; background: @wall; font-size: 12px; }
+entry.notes-find-entry.error { border-color: alpha(@held, 0.7); }
+.notes-find-count { margin: 0 6px; color: @secondary; font-size: 11px; font-feature-settings: "tnum"; }
+button.notes-find-key { min-width: 28px; min-height: 28px; padding: 0; border: 0; border-radius: 3px; background: transparent; color: @secondary; }
+button.notes-find-key:hover { background: @wash; color: @ink; }
+button.notes-find-option { min-width: 30px; min-height: 28px; padding: 0 6px; border: 1px solid transparent; border-radius: 3px; background: transparent; color: @secondary; font-family: 'Fira Mono', monospace; font-size: 11px; }
+button.notes-find-option:hover { background: @wash; color: @ink; }
+button.notes-find-option:checked { background: alpha(@ink, 0.10); border-color: @strong; color: @ink; }
+button.notes-find-word { text-decoration: underline; }
+button.notes-find-button { min-height: 28px; padding: 0 12px; font-size: 12px; }
+
+/* ---- status bar ---- */
+.notes-status { min-height: 24px; padding: 0 4px 0 12px; background: @console; border-top: 1px solid @edge; color: @secondary; font-size: 11px; }
+.notes-state { color: @secondary; font-size: 11px; }
+.notes-state.modified { color: @waiting; }
+.notes-state.warning { color: @held; }
+.notes-state.saving { color: @ink; }
+.notes-status-text { padding: 0 8px; color: @secondary; font-size: 11px; font-feature-settings: "tnum"; }
+button.notes-status-item,
+.notes-status-menu > button { min-height: 22px; margin: 1px 0; padding: 0 8px; border: 0; border-radius: 2px; background: transparent; color: @secondary; font-size: 11px; font-weight: 400; box-shadow: none; }
+button.notes-status-item:hover,
+.notes-status-menu > button:hover,
+.notes-status-menu > button:checked { background: @wash; color: @ink; }
+.notes-status-menu > button label { font-feature-settings: "tnum"; }
+button.notes-status-item.on { color: @live; }
+.notes-status-sep { min-width: 1px; margin: 6px 2px; background: @edge; }
+.notes-goto > contents { padding: 10px; }
+.notes-goto-title { color: @ink; font-size: 12px; font-weight: 600; }
+.notes-goto-hint { color: @faint; font-size: 11px; }
+.notes-goto entry.error { border-color: alpha(@held, 0.7); }
+
+/* ---- empty state ---- */
+.notes-host { background: @notes_paper; }
+.notes-welcome { padding: 32px; }
+.notes-welcome-mark { color: @faint; margin-bottom: 4px; }
+.notes-welcome-title { color: @ink; font-size: 16px; font-weight: 600; }
+.notes-welcome-text { color: @secondary; font-size: 12px; margin-bottom: 6px; }
+.notes-welcome-keys { margin-top: 8px; color: @faint; font-size: 11px; }
