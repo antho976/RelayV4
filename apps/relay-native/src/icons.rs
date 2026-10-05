@@ -60,8 +60,10 @@ pub fn image_with_stroke(name: &str, size: i32, stroke: f64) -> gtk::Image {
         "dashboard" => {
             r##"<rect x="2" y="2" width="5" height="5" /><rect x="9" y="2" width="5" height="5" /><rect x="2" y="9" width="5" height="5" /><rect x="9" y="9" width="5" height="5" />"##
         }
-        "skills" => r##"<path d="M8 2v12M2 8h12M4 4l8 8M12 4l-8 8" />"##,
-        "plugins" => r##"<path d="M6 2v3M10 2v3M4 5h8v3a4 4 0 0 1-8 0V5zM8 12v2" />"##,
+        "skills" => r##"<path d="M9 1.5L3.5 9h4L7 14.5 12.5 7h-4z" />"##,
+        "plugins" => {
+            r##"<rect x="2" y="8" width="6" height="6" /><rect x="8" y="8" width="6" height="6" /><rect x="2" y="2" width="6" height="6" /><rect x="10" y="2" width="4" height="4" />"##
+        }
         "bell" => {
             r##"<path d="M4 11V7.5A4 4 0 0 1 12 7.5V11l1.5 2h-11L4 11z" /><path d="M6.5 13.5a1.5 1.5 0 0 0 3 0" />"##
         }
