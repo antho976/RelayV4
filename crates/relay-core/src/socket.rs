@@ -215,8 +215,11 @@ struct MirrorAttachment {
 impl Drop for MirrorAttachment {
     fn drop(&mut self) {
         self.task.abort();
-        self.runtime.stop();
+        // Out of the registry before the stop flag flips: anything that sees the mirror
+        // stopped must also no longer find it.
         self.engine.mirrors.lock().unwrap().remove(&self.runtime.id);
+        self.runtime.finish(crate::device::MirrorState::Stopped, None, None);
+        self.runtime.stop();
         self.engine.emit_system(
             "mirror.changed",
             serde_json::json!({"mirror_id":self.runtime.id,"state":"stopped"}),
@@ -494,58 +497,118 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) -> Result<()> {
                     .as_ref()
                     .and_then(|v| v["mirror_id"].as_i64())
                 {
-                    if let Ok(runtime) = crate::handlers::device::mirror_by_id(&engine, id) {
-                        let (cursor, history, mut rx) = runtime.attach();
-                        let tx = out_tx.clone();
-                        let task = tokio::spawn(async move {
-                            use base64::Engine as _;
-                            let frame = |item: crate::device::MirrorChunk| {
-                                serde_json::to_string(&Frame {
-                                    v: 1,
-                                    stream: "mirror".into(),
-                                    session: None,
-                                    run_id: None,
-                                    mirror_id: Some(id),
-                                    epoch: None,
-                                    seq: item.seq,
-                                    data: serde_json::Value::String(
-                                        base64::engine::general_purpose::STANDARD
-                                            .encode(&*item.data),
-                                    ),
-                                })
-                            };
-                            for item in history {
-                                if let Ok(line) = frame(item) {
-                                    if tx.send(line).await.is_err() {
-                                        return;
+                    // Frames on this connection are of two kinds, told apart by `data`: a base64
+                    // string is one video packet; an object is the mirror's status (state, picture
+                    // size, device name, and on the way out the typed code and message). The
+                    // status goes first, then on every change, and a terminal one ends the
+                    // stream — the window learns that the device went away from the stream it is
+                    // already reading, without subscribing to anything (it used to wait forever).
+                    let status_frame = move |status: &crate::device::MirrorStatus| {
+                        serde_json::to_string(&Frame {
+                            v: 1,
+                            stream: "mirror".into(),
+                            session: None,
+                            run_id: None,
+                            mirror_id: Some(id),
+                            epoch: None,
+                            seq: 0,
+                            data: serde_json::to_value(status).unwrap_or_default(),
+                        })
+                    };
+                    match crate::handlers::device::mirror_by_id(&engine, id) {
+                        Ok(runtime) => {
+                            let (cursor, history, mut rx) = runtime.attach();
+                            let mut status = runtime.watch_status();
+                            let tx = out_tx.clone();
+                            let task = tokio::spawn(async move {
+                                use base64::Engine as _;
+                                let frame = |item: crate::device::MirrorChunk| {
+                                    serde_json::to_string(&Frame {
+                                        v: 1,
+                                        stream: "mirror".into(),
+                                        session: None,
+                                        run_id: None,
+                                        mirror_id: Some(id),
+                                        epoch: None,
+                                        seq: item.seq,
+                                        data: serde_json::Value::String(
+                                            base64::engine::general_purpose::STANDARD
+                                                .encode(&*item.data),
+                                        ),
+                                    })
+                                };
+                                let first = status.borrow_and_update().clone();
+                                let Ok(line) = status_frame(&first) else { return };
+                                if tx.send(line).await.is_err() {
+                                    return;
+                                }
+                                if first.state.is_terminal() {
+                                    return;
+                                }
+                                for item in history {
+                                    if let Ok(line) = frame(item) {
+                                        if tx.send(line).await.is_err() {
+                                            return;
+                                        }
                                     }
                                 }
-                            }
-                            loop {
-                                match rx.recv().await {
-                                    Ok(item) if item.seq > cursor => {
-                                        if let Ok(line) = frame(item) {
-                                            if tx.send(line).await.is_err() {
+                                loop {
+                                    tokio::select! {
+                                        biased;
+                                        changed = status.changed() => {
+                                            if changed.is_err() {
+                                                break;
+                                            }
+                                            let now = status.borrow_and_update().clone();
+                                            let Ok(line) = status_frame(&now) else { break };
+                                            if tx.send(line).await.is_err() || now.state.is_terminal() {
                                                 break;
                                             }
                                         }
-                                    }
-                                    Ok(_) => {}
-                                    Err(_) => {
-                                        let _=tx.send(serde_json::to_string(&Frame{v:1,stream:"mirror".into(),session:None,run_id:None,mirror_id:Some(id),epoch:None,seq:0,data:serde_json::json!({"error":"Mirror stream interrupted; close and reopen it."})}).unwrap()).await;
-                                        break;
+                                        item = rx.recv() => match item {
+                                            Ok(item) if item.seq > cursor => {
+                                                if let Ok(line) = frame(item) {
+                                                    if tx.send(line).await.is_err() {
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            Ok(_) => {}
+                                            // A slow window skipped packets. The seq gap tells it so;
+                                            // it asks the device for a fresh key frame and resumes —
+                                            // no reason to end a mirror over one hiccup.
+                                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                                tracing::warn!(lagged = n, mirror_id = id, "mirror subscriber lagged; packets dropped");
+                                            }
+                                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                        },
                                     }
                                 }
+                            });
+                            attached_mirrors.insert(
+                                id,
+                                MirrorAttachment {
+                                    engine: engine.clone(),
+                                    runtime,
+                                    task,
+                                },
+                            );
+                        }
+                        // The worker already ended (a failure faster than this attach). Say so
+                        // rather than leave the window on "Connecting".
+                        Err(_) => {
+                            let ended = crate::device::MirrorStatus {
+                                state: crate::device::MirrorState::Failed,
+                                code: Some("device.mirror_ended".into()),
+                                message: Some("The mirror ended before it could start. Retry to see why.".into()),
+                                ..Default::default()
+                            };
+                            let _ = out_tx.send(serde_json::to_string(&response)?).await;
+                            if let Ok(line) = status_frame(&ended) {
+                                let _ = out_tx.send(line).await;
                             }
-                        });
-                        attached_mirrors.insert(
-                            id,
-                            MirrorAttachment {
-                                engine: engine.clone(),
-                                runtime,
-                                task,
-                            },
-                        );
+                            continue;
+                        }
                     }
                 }
             }

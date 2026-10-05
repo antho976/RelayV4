@@ -38,8 +38,11 @@ drafts block dismissal and application closure until saved or discarded.
   writers cannot be made atomic by this API.
 - Session allocation persists assignments before spawning, so partially launched
   groups can recover from the wall without losing their prompt.
-- Native mirror connections own their capture lifetime. Input queue overflow
-  stops capture rather than silently losing a touch release.
+- Native mirror connections own their capture lifetime. The engine reports the
+  mirror's state on that same stream (starting, running with the real picture size,
+  then stopped, failed with its code, or lost), so a window never waits on silence.
+  Input is answered from memory, queued moves collapse into the newest, and downs
+  and ups are never dropped; overflow no longer stops capture.
 - Device watchers are leased per socket. Duplicate requests retain all schema and
   actor validation; disconnect releases only that connection's watcher.
 - Closing Notes hides its retained window and preserves drafts. The main

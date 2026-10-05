@@ -7,9 +7,9 @@ use std::io::{self, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::Child;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 static MIRROR_SERVER: OnceLock<PathBuf> = OnceLock::new();
 const RUN_LOG_LINES: usize = 512;
@@ -86,12 +86,53 @@ struct MirrorControl {
     pending: VecDeque<Vec<u8>>,
 }
 
+/// Where a mirror is in its life. `Stopped`, `Failed` and `Lost` are terminal: the
+/// runtime never leaves them, and the socket door ends the window's stream on them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MirrorState {
+    #[default]
+    Starting,
+    Running,
+    /// Someone asked for it to end (`device.mirror.stop`, or the window went away).
+    Stopped,
+    /// The transport or the server failed while the device was still there.
+    Failed,
+    /// The device itself went away — unplugged, rebooted, adb lost it.
+    Lost,
+}
+
+impl MirrorState {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, MirrorState::Stopped | MirrorState::Failed | MirrorState::Lost)
+    }
+}
+
+/// What a window needs to draw the mirror's state: the live picture size, the device's
+/// own name once the handshake gave it, and on a terminal state the typed code and the
+/// message to show next to Retry. Forwarded verbatim as a `mirror` frame whose `data` is
+/// this object (video frames carry a base64 string instead).
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
+pub struct MirrorStatus {
+    pub state: MirrorState,
+    pub width: u32,
+    pub height: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+fn pack_size(width: u32, height: u32) -> u64 {
+    (u64::from(width) << 32) | u64::from(height)
+}
+
 #[derive(Debug)]
 pub struct MirrorRuntime {
     pub id: Id,
     pub device: String,
-    pub width: u32,
-    pub height: u32,
     pub input_width: u32,
     pub input_height: u32,
     pub max_size: u32,
@@ -104,6 +145,12 @@ pub struct MirrorRuntime {
     control: Mutex<MirrorControl>,
     buffer: Mutex<MirrorBuffer>,
     tx: broadcast::Sender<MirrorChunk>,
+    /// The stream's current picture size, `width << 32 | height`. Starts at the estimate
+    /// from `wm size` and follows every session packet, so tap/swipe coordinates are
+    /// checked and scaled against what the device is actually sending — after a rotation
+    /// too, which is exactly when the estimate is wrong.
+    size: AtomicU64,
+    status: watch::Sender<MirrorStatus>,
 }
 
 pub struct MirrorRuntimeConfig {
@@ -134,11 +181,10 @@ impl MirrorRuntime {
             adb,
         } = config;
         let (tx, _) = broadcast::channel(256);
+        let (status, _) = watch::channel(MirrorStatus { width, height, ..MirrorStatus::default() });
         Arc::new(Self {
             id,
             device,
-            width,
-            height,
             input_width,
             input_height,
             max_size,
@@ -155,6 +201,59 @@ impl MirrorRuntime {
                 chunks: VecDeque::new(),
             }),
             tx,
+            size: AtomicU64::new(pack_size(width, height)),
+            status,
+        })
+    }
+    /// The picture size the device is sending right now.
+    pub fn size(&self) -> (u32, u32) {
+        let packed = self.size.load(Ordering::Relaxed);
+        ((packed >> 32) as u32, packed as u32)
+    }
+    /// A session packet: the stream changed size (start, rotation, resize). Updates the
+    /// size inputs are checked against and, while running, the status windows draw from.
+    pub fn set_size(&self, width: u32, height: u32) {
+        self.size.store(pack_size(width, height), Ordering::Relaxed);
+        self.status.send_if_modified(|status| {
+            if status.state.is_terminal() || (status.width, status.height) == (width, height) {
+                return false;
+            }
+            status.width = width;
+            status.height = height;
+            true
+        });
+    }
+    pub fn status(&self) -> MirrorStatus {
+        self.status.borrow().clone()
+    }
+    /// A receiver that already holds the current status, so an attach that arrives after a
+    /// fast failure still sees it rather than waiting for a change that already happened.
+    pub fn watch_status(&self) -> watch::Receiver<MirrorStatus> {
+        self.status.subscribe()
+    }
+    /// The handshake finished: the device's name is known and frames are about to flow.
+    pub fn set_running(&self, name: String) {
+        let (width, height) = self.size();
+        self.status.send_if_modified(|status| {
+            if status.state.is_terminal() {
+                return false;
+            }
+            *status = MirrorStatus { state: MirrorState::Running, width, height, name: Some(name), code: None, message: None };
+            true
+        });
+    }
+    /// Enter a terminal state. The first one wins — a stop that races a failure must not
+    /// relabel a device loss as a clean stop, or the reverse.
+    pub fn finish(&self, state: MirrorState, code: Option<String>, message: Option<String>) -> bool {
+        debug_assert!(state.is_terminal());
+        self.status.send_if_modified(|status| {
+            if status.state.is_terminal() {
+                return false;
+            }
+            status.state = state;
+            status.code = code;
+            status.message = message;
+            true
         })
     }
     pub fn stopped(&self) -> bool {

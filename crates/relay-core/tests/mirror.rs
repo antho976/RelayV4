@@ -590,7 +590,7 @@ fn options_emit_in_a_fixed_order_and_omit_server_defaults() {
         max_size: 720,
         video_bit_rate: 2_000_000,
         max_fps: 30,
-        lock_video_orientation: Some(LockOrientation::Deg90),
+        capture_orientation: Some(LockOrientation::Deg90),
         audio: true,
         stay_awake: false,
         power_off_on_close: true,
@@ -609,7 +609,7 @@ fn options_emit_in_a_fixed_order_and_omit_server_defaults() {
             "video_bit_rate=2000000",
             "max_fps=30",
             "stay_awake=false",
-            "lock_video_orientation=90",
+            "capture_orientation=@90",
             "power_off_on_close=true",
             "tunnel_forward=true",
         ]
@@ -619,17 +619,329 @@ fn options_emit_in_a_fixed_order_and_omit_server_defaults() {
 
     // Off-by-default keys never appear unless asked for.
     let plain = mirror::server_shell_args_with("S", 1, &MirrorOptions::default());
-    assert!(!plain.iter().any(|a| a.starts_with("lock_video_orientation")));
+    assert!(!plain.iter().any(|a| a.starts_with("capture_orientation")));
+    // v4.1 does not know the pre-3.0 key; sending it makes the server refuse to start.
+    assert!(!args.iter().any(|a| a.starts_with("lock_video_orientation")));
     assert!(!plain.iter().any(|a| a.starts_with("power_off_on_close")));
 
     for (lock, want) in [
-        (LockOrientation::Unlocked, "unlocked"),
-        (LockOrientation::Deg0, "0"),
-        (LockOrientation::Deg180, "180"),
-        (LockOrientation::Deg270, "270"),
+        (LockOrientation::Unlocked, "0"),
+        (LockOrientation::Deg0, "@0"),
+        (LockOrientation::Deg180, "@180"),
+        (LockOrientation::Deg270, "@270"),
     ] {
-        let o = MirrorOptions { lock_video_orientation: Some(lock), ..MirrorOptions::default() };
+        let o = MirrorOptions { capture_orientation: Some(lock), ..MirrorOptions::default() };
         let args = mirror::server_shell_args_with("S", 1, &o);
-        assert!(args.contains(&format!("lock_video_orientation={want}")), "{lock:?}");
+        assert!(args.contains(&format!("capture_orientation={want}")), "{lock:?}");
+    }
+}
+
+// -- runtime: picture size, status, input fast path, worker end -------------
+//
+// The handoff that motivated these: a window sat on "Starting mirror…" or a frozen frame
+// forever because no failure ever reached it; tap/swipe were checked against a width the
+// stream did not have; and every touch-move took the store mutex.
+
+mod runtime {
+    use relay_bus::{Actor, Request};
+    use relay_core::device::{MirrorRuntime, MirrorRuntimeConfig, MirrorState};
+    use relay_core::mirror;
+    use relay_core::{Door, Engine, Instance, Store};
+    use serde_json::{json, Value};
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    fn engine() -> Arc<Engine> {
+        Engine::new(Instance::Test, Store::open_memory().unwrap())
+    }
+
+    #[allow(clippy::result_large_err)] // the bus's own error type, as `into_result` returns it
+    fn call(e: &Engine, op: &str, payload: Value) -> Result<Value, relay_bus::error::BusError> {
+        e.dispatch(Request::new(Actor::User, op, payload), Door::InProcess).into_result()
+    }
+
+    /// A fake adb: one device, `wm size` 1080x2400, and enough of push/forward/shell for the
+    /// worker. `forward` prints `$port`; the server "process" just sleeps, because the test
+    /// itself plays the server on that port. `get-state` answers from `state`.
+    fn fake_adb(dir: &std::path::Path, port: u16, state: &str) -> String {
+        let path = dir.join("adb");
+        std::fs::write(&path, format!(r#"#!/bin/sh
+[ "$1" = "-s" ] && shift 2
+case "$1" in
+  devices) printf 'List of devices attached\nrelay-phone device product:relay model:Pixel_9_Pro device:relay transport_id:1\n' ;;
+  push) exit 0 ;;
+  get-state) [ "{state}" = device ] && echo device && exit 0; echo "error: device not found" >&2; exit 1 ;;
+  forward) [ "$2" = "--remove" ] && exit 0; echo {port} ;;
+  shell) [ "$2" = wm ] && echo 'Physical size: 1080x2400' && exit 0; exec sleep 30 ;;
+  *) exit 1 ;;
+esac
+"#)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.display().to_string()
+    }
+
+    fn runtime(width: u32, height: u32) -> Arc<MirrorRuntime> {
+        MirrorRuntime::new(MirrorRuntimeConfig {
+            id: 1,
+            device: "relay-phone".into(),
+            width,
+            height,
+            input_width: 1080,
+            input_height: 2400,
+            max_size: 1024,
+            bitrate: 8_000_000,
+            scid: 1,
+            adb: "adb".into(),
+        })
+    }
+
+    /// A control socket the test can read back: what the device would receive.
+    fn control_pair(runtime: &MirrorRuntime) -> TcpStream {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (device, _) = listener.accept().unwrap();
+        runtime.install_control(client).unwrap();
+        device.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        device
+    }
+
+    #[test]
+    fn fit_size_rounds_the_short_side_to_eight_like_the_server() {
+        // The old handler rounded to 2 and said 460; the server sends 464 for this phone.
+        assert_eq!(mirror::fit_size(1080, 2400, 1024), (464, 1024));
+        assert_eq!(mirror::fit_size(2400, 1080, 1024), (1024, 464));
+        assert_eq!(mirror::fit_size(1080, 2400, 1280), (576, 1280));
+        // Under the cap nothing scales, but both sides still land on a multiple of 8.
+        assert_eq!(mirror::fit_size(1001, 803, 1024), (1000, 800));
+        assert_eq!(mirror::fit_size(0, 0, 1024), (0, 0));
+        for (w, h, max) in [(1440, 3120, 1600), (720, 1600, 1024), (1200, 1920, 1920)] {
+            let (a, b) = mirror::fit_size(w, h, max);
+            assert_eq!((a % 8, b % 8), (0, 0), "{w}x{h}@{max}");
+            assert!(a.max(b) <= max);
+        }
+    }
+
+    #[test]
+    fn session_packets_move_the_size_tap_and_swipe_are_checked_against() {
+        // Started from the `wm size` estimate; the device then rotates to landscape.
+        let r = runtime(464, 1024);
+        let mut device = control_pair(&r);
+        r.set_size(1024, 464);
+        assert_eq!(r.size(), (1024, 464));
+        // x=900 is outside the portrait estimate, and valid in landscape.
+        relay_core::handlers::device::send_input(&r, &json!({"type":"tap","x":900,"y":400})).unwrap();
+        let mut bytes = [0u8; 64];
+        device.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes[..32], &mirror::touch(mirror::ACTION_DOWN, 900, 400, 1024, 464, 1.0));
+        assert_eq!(&bytes[32..], &mirror::touch(mirror::ACTION_UP, 900, 400, 1024, 464, 0.0));
+        // y=600 was fine in portrait and is now off the picture: refused, not sent to be
+        // dropped silently by the server.
+        let err = relay_core::handlers::device::send_input(&r, &json!({"type":"tap","x":10,"y":600})).unwrap_err();
+        assert_eq!(err.code, "device.input");
+        // Status carries the new size while live, so the window can re-letterbox.
+        r.set_running("Pixel".into());
+        r.set_size(464, 1024);
+        let status = r.status();
+        assert_eq!((status.state, status.width, status.height), (MirrorState::Running, 464, 1024));
+    }
+
+    #[test]
+    fn the_first_terminal_state_wins() {
+        let r = runtime(464, 1024);
+        assert_eq!(r.status().state, MirrorState::Starting);
+        r.set_running("Pixel".into());
+        assert!(r.finish(MirrorState::Lost, Some("device.mirror_device_lost".into()), Some("gone".into())));
+        // A stop racing the loss must not relabel it — the window would say "Stopped" for an
+        // unplugged phone.
+        assert!(!r.finish(MirrorState::Stopped, None, None));
+        r.set_running("again".into());
+        r.set_size(1, 1);
+        let status = r.status();
+        assert_eq!(status.state, MirrorState::Lost);
+        assert_eq!(status.code.as_deref(), Some("device.mirror_device_lost"));
+        assert_eq!((status.width, status.height), (464, 1024));
+        let wire = serde_json::to_value(&status).unwrap();
+        assert_eq!(wire["state"], "lost");
+        assert_eq!(wire["message"], "gone");
+    }
+
+    #[test]
+    fn mirror_input_is_answered_without_the_store() {
+        let e = engine();
+        let dir = tempfile::tempdir().unwrap();
+        let adb = fake_adb(dir.path(), 1, "device");
+        call(&e, "settings.set", json!({"path":"device.adb_path","value":adb})).unwrap();
+        let started = call(&e, "device.mirror.start", json!({"device":"relay-phone","max_size":1024})).unwrap();
+        assert_eq!((started["width"].as_u64(), started["height"].as_u64()), (Some(464), Some(1024)));
+        let id = started["mirror_id"].as_i64().unwrap();
+
+        let touch = |id: i64| Request::new(
+            Actor::User,
+            "device.mirror.input",
+            json!({"mirror_id":id,"event":{"type":"touch","action":2,"x":10,"y":10,"w":464,"h":1024,"pressure":1.0}}),
+        );
+        assert!(e.answers_from_memory(&touch(id)));
+        assert!(!e.answers_from_memory(&touch(id + 99)));
+        // Text can be big enough to block on the socket, so it keeps to the blocking pool.
+        assert!(!e.answers_from_memory(&Request::new(
+            Actor::User,
+            "device.mirror.input",
+            json!({"mirror_id":id,"event":{"type":"text","text":"hello"}}),
+        )));
+
+        // Hold the store for the whole exchange. A request that needs it would block here
+        // until the guard drops; the fast path answers anyway.
+        let guard = e.store.lock();
+        let (done, result) = std::sync::mpsc::channel();
+        let engine = e.clone();
+        std::thread::spawn(move || {
+            let ok = engine.dispatch(touch(id), Door::Socket).into_result();
+            let missing = engine.dispatch(touch(id + 99), Door::Socket).into_result();
+            let _ = done.send((ok, missing));
+        });
+        let (ok, missing) = result.recv_timeout(Duration::from_secs(5)).expect("mirror input waited for the store");
+        drop(guard);
+        ok.unwrap();
+        assert_eq!(missing.unwrap_err().code, "device.mirror_not_found");
+        call(&e, "device.mirror.stop", json!({"mirror_id":id})).unwrap();
+    }
+
+    /// Play the scrcpy server on `listener`: handshake, one session packet, a config and a key
+    /// frame, then drop both sockets the way an unplugged phone does.
+    fn serve_then_vanish(listener: TcpListener) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let (mut video, _) = listener.accept().unwrap();
+            video.write_all(&[0]).unwrap();
+            let (control, _) = listener.accept().unwrap();
+            let mut name = [0u8; 64];
+            name[..5].copy_from_slice(b"Pixel");
+            video.write_all(&name).unwrap();
+            video.write_all(b"h264").unwrap();
+            let mut session = [0u8; 12];
+            session[0] = 0x80;
+            session[4..8].copy_from_slice(&1024u32.to_be_bytes());
+            session[8..12].copy_from_slice(&464u32.to_be_bytes());
+            video.write_all(&session).unwrap();
+            for (flags, payload) in [(1u64 << 62, &[0, 0, 0, 1, 0x67][..]), (1u64 << 61, &[0, 0, 0, 1, 0x65][..])] {
+                video.write_all(&flags.to_be_bytes()).unwrap();
+                video.write_all(&(payload.len() as u32).to_be_bytes()).unwrap();
+                video.write_all(payload).unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(200));
+            drop(control);
+            drop(video);
+        })
+    }
+
+    fn run_worker_until_it_ends(get_state: &str) -> (Arc<Engine>, i64, relay_core::device::MirrorStatus, Vec<Value>) {
+        let e = engine();
+        let dir = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // The source-tree jar is the server path in tests; the fake adb "pushes" it anywhere.
+        assert!(relay_core::device::mirror_server_path().is_some());
+        let adb = fake_adb(dir.path(), port, get_state);
+        call(&e, "settings.set", json!({"path":"device.adb_path","value":adb})).unwrap();
+        let mut events = e.subscribe();
+        let started = call(&e, "device.mirror.start", json!({"device":"relay-phone","max_size":1024})).unwrap();
+        let id = started["mirror_id"].as_i64().unwrap();
+        let runtime = relay_core::handlers::device::mirror_by_id(&e, id).unwrap();
+        let mut status = runtime.watch_status();
+        let server = serve_then_vanish(listener);
+        let worker = {
+            let (e, r) = (e.clone(), runtime.clone());
+            std::thread::spawn(move || relay_core::handlers::device::mirror_worker(e, r))
+        };
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !status.borrow_and_update().state.is_terminal() {
+            assert!(Instant::now() < deadline, "worker never reported an end: {:?}", runtime.status());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        worker.join().unwrap();
+        server.join().unwrap();
+        // The session packet set the size before "running" was announced.
+        assert_eq!(runtime.size(), (1024, 464));
+        let mut seen = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if event.ev == "mirror.changed" {
+                seen.push(event.payload);
+            }
+        }
+        (e, id, runtime.status(), seen)
+    }
+
+    #[test]
+    fn a_vanished_device_ends_the_mirror_as_lost_and_says_so() {
+        let (e, id, status, events) = run_worker_until_it_ends("gone");
+        assert_eq!(status.state, MirrorState::Lost);
+        assert_eq!(status.code.as_deref(), Some("device.mirror_device_lost"));
+        assert!(status.message.unwrap().contains("relay-phone"));
+        assert_eq!(status.name.as_deref(), Some("Pixel"));
+        let running = events.iter().find(|ev| ev["state"] == "running").expect("running event");
+        assert_eq!((running["width"].as_u64(), running["height"].as_u64()), (Some(1024), Some(464)));
+        assert_eq!(running["name"], "Pixel");
+        assert!(events.iter().any(|ev| ev["state"] == "lost" && ev["code"] == "device.mirror_device_lost"));
+        assert!(relay_core::handlers::device::mirror_by_id(&e, id).is_err(), "an ended mirror leaves the registry");
+    }
+
+    #[test]
+    fn a_dead_server_on_a_present_device_is_a_failure_with_the_reason() {
+        let (_, _, status, events) = run_worker_until_it_ends("device");
+        assert_eq!(status.state, MirrorState::Failed);
+        assert_eq!(status.code.as_deref(), Some("device.mirror_stream_failed"));
+        assert!(status.message.unwrap().contains("mirror stream ended"));
+        assert!(events.iter().any(|ev| ev["state"] == "failed"));
+    }
+
+    async fn next_frame(client: &mut relay_core::socket::Client, id: i64) -> relay_bus::envelope::Frame {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(2), client.next()).await.unwrap().unwrap().unwrap() {
+                relay_core::socket::Line::Frame(frame) => {
+                    assert_eq!(frame.stream, "mirror");
+                    assert_eq!(frame.mirror_id, Some(id));
+                    return frame;
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_window_stream_carries_status_and_ends_on_a_terminal_state() {
+        use relay_core::socket::{Client, SocketServer};
+        let e = engine();
+        let dir = tempfile::tempdir().unwrap();
+        let adb = fake_adb(dir.path(), 1, "device");
+        call(&e, "settings.set", json!({"path":"device.adb_path","value":adb})).unwrap();
+        let server = SocketServer::start_in(e.clone(), dir.path().join("socket")).await.unwrap();
+        let mut client = Client::connect(&server.path).await.unwrap();
+        let started = client
+            .call(&Request::new(Actor::User, "device.mirror.start", json!({"device":"relay-phone"})), |_| {})
+            .await
+            .unwrap()
+            .into_result()
+            .unwrap();
+        let id = started["mirror_id"].as_i64().unwrap();
+        let runtime = relay_core::handlers::device::mirror_by_id(&e, id).unwrap();
+        let first = next_frame(&mut client, id).await;
+        assert_eq!(first.data["state"], "starting");
+        assert_eq!(first.data["width"], 464);
+        runtime.set_running("Pixel".into());
+        let running = next_frame(&mut client, id).await;
+        assert_eq!(running.data["state"], "running");
+        assert_eq!(running.data["name"], "Pixel");
+        runtime.push(vec![1, 0, 0, 0, 1, 0x67]);
+        assert!(next_frame(&mut client, id).await.data.is_string(), "video packets are base64 strings");
+        runtime.finish(MirrorState::Lost, Some("device.mirror_device_lost".into()), Some("relay-phone is no longer connected".into()));
+        let lost = next_frame(&mut client, id).await;
+        assert_eq!(lost.data["state"], "lost");
+        assert_eq!(lost.data["code"], "device.mirror_device_lost");
+        // Nothing follows a terminal state on this mirror's stream.
+        runtime.push(vec![2, 0, 0, 0, 1, 0x65]);
+        assert!(tokio::time::timeout(Duration::from_millis(300), client.next()).await.is_err());
+        drop(client);
     }
 }
