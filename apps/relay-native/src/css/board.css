@@ -1,1 +1,180 @@
 /* board area styles: loaded after theme.css, so rules here override it. */
+
+/* ── Header ─────────────────────────────────────────────────────────────── */
+.board-head { min-height: 52px; padding: 0 16px; border-bottom: 1px solid @edge; background: @console; }
+.board-count { margin-left: 4px; color: @secondary; font-size: 12px; }
+entry.board-search, .board-search { min-height: 28px; }
+.board-head > button, .board-head > menubutton > button, .board-view-toggle button {
+  min-height: 28px; padding: 0 10px; border: 1px solid @edge; border-radius: 2px; background: @slab; color: @secondary; font-size: 12px;
+}
+.board-head > button:hover, .board-head > menubutton > button:hover, .board-view-toggle button:hover { background: @wash; color: @ink; }
+.board-head > button.primary { background: @ink; border-color: @ink; color: @wall; font-weight: 600; }
+.board-head > button.primary:hover { background: white; border-color: white; }
+.board-head > button.icon-key { min-width: 28px; padding: 0; }
+.board-head > menubutton.active > button { border-color: @secondary; color: @ink; background: @wash; }
+.board-view-toggle { padding: 2px; border: 1px solid @edge; background: @screen; border-radius: 2px; }
+.board-view-toggle button { min-height: 24px; border: 0; background: transparent; }
+.board-view-toggle button:checked { background: @wash; color: @ink; }
+
+/* ── Columns strip and active filters ──────────────────────────────────── */
+.board-strip { min-height: 38px; padding: 0 16px; border-bottom: 1px solid @edge; background: @wall; }
+.board-strip-caption { margin-right: 4px; color: @faint; font-family: 'Fira Sans Condensed'; font-size: 10.5px; font-weight: 600; letter-spacing: 0.08em; }
+button.column-chip { min-height: 24px; padding: 0 9px; border: 1px solid @edge; border-radius: 2px; background: transparent; color: @faint; }
+button.column-chip:checked { background: @slab; color: @ink; border-color: @strong; }
+button.column-chip:hover { background: @wash; }
+.column-chip-name { font-size: 11.5px; }
+.column-chip-count { font-family: 'Fira Mono'; font-size: 10.5px; color: @secondary; }
+button.column-chip:not(:checked) .column-chip-name { text-decoration-line: line-through; }
+.board-strip-rule { margin: 10px 4px; background: @edge; min-width: 1px; }
+button.filter-chip { min-height: 22px; padding: 0 6px 0 8px; border: 1px solid @strong; border-radius: 2px; background: @slab; color: @ink; font-size: 11px; }
+button.filter-chip:hover { border-color: @secondary; background: @wash; }
+
+/* ── Quick create and drop rail ────────────────────────────────────────── */
+.board-quick { margin: 10px 16px 0; padding: 6px; border: 1px solid @strong; background: @console; }
+.board-quick entry { min-height: 30px; font-size: 13px; }
+.board-quick dropdown > button { min-height: 30px; }
+.board-quick-note { color: @secondary; font-size: 11px; margin: 0 4px; }
+.board-drag-rail { margin: 10px 16px 0; padding: 5px 8px; background: @console; border: 1px dashed @strong; }
+.board-drag-rail button { min-height: 22px; padding: 0 8px; font-size: 11px; border: 1px solid transparent; }
+.board-drag-rail button:drop(active) { border-color: @ink; background: @wash; color: @ink; }
+.board-rail-caption { margin-right: 6px; color: @faint; font-family: 'Fira Sans Condensed'; font-size: 10.5px; font-weight: 600; letter-spacing: 0.08em; }
+
+/* ── Lanes ──────────────────────────────────────────────────────────────── */
+.board-grid { padding: 12px 16px 10px; }
+.board-lane { background: @console; border: 1px solid @edge; }
+.board-lane.drop-lane, .list-section.drop-lane { border-color: @secondary; }
+.lane-head, .list-head { min-height: 38px; padding: 0 6px 0 11px; border-bottom: 1px solid @edge; }
+.lane-title { color: @ink; font-family: 'Fira Sans Condensed'; font-size: 11.5px; font-weight: 600; letter-spacing: 0.08em; }
+.lane-count { color: @faint; font-family: 'Fira Mono'; font-size: 11px; }
+button.lane-key { min-height: 22px; min-width: 22px; padding: 0; opacity: 0.55; }
+button.lane-key:hover { opacity: 1; }
+.board-cards { padding: 8px; background: @console; }
+.board-lane scrolledwindow, .board-lane viewport { background: @console; }
+.board-empty { min-height: 96px; padding: 18px 10px; border: 1px dashed @edge; }
+.board-empty-title { color: @secondary; font-size: 12px; font-weight: 500; }
+.board-empty-hint { color: @faint; font-size: 11px; }
+.board-group-heading { margin: 6px 2px 0; color: @faint; font-family: 'Fira Sans Condensed'; font-size: 10.5px; font-weight: 600; letter-spacing: 0.06em; }
+
+/* ── Cards ──────────────────────────────────────────────────────────────── */
+.task-card { margin: 0; padding: 9px 10px 8px; background: @slab; border: 1px solid @edge; border-radius: 2px; }
+.task-card:hover { border-color: @strong; background: shade(@slab, 1.08); }
+.task-card:focus, .list-row:focus { outline: 0; box-shadow: inset 0 0 0 1px @ink; border-color: @ink; }
+.task-card:focus-visible, .list-row:focus-visible { outline: 0; }
+.task-card.task-child { margin-left: 0; border-left: 2px solid @strong; }
+.task-card.dragging, .list-row.dragging { opacity: 0.4; }
+.task-card.drop-before, .list-row.drop-before { box-shadow: inset 0 2px 0 @ink; }
+.task-card.drop-after, .list-row.drop-after { box-shadow: inset 0 -2px 0 @ink; }
+.task-card.drop-into, .list-row.drop-into { border-color: @ink; background: @wash; }
+.card-id { color: @faint; font-family: 'Fira Mono'; font-size: 10.5px; }
+.card-title { color: @ink; font-size: 13px; font-weight: 500; }
+.task-card.done .card-title, .list-row.done .list-title { color: @secondary; text-decoration-line: line-through; }
+.task-card.done { background: alpha(@slab, 0.6); }
+.card-tools { opacity: 0; }
+.task-card:hover .card-tools, .task-card:focus-within .card-tools { opacity: 1; }
+button.card-key { min-height: 20px; min-width: 20px; padding: 0; }
+.card-lineage { color: @secondary; }
+.task-lineage { color: @secondary; font-size: 11px; }
+.task-rollup progressbar trough, .task-rollup progressbar progress { min-height: 3px; border-radius: 0; border: 0; }
+.task-rollup progressbar trough { background: @wall; }
+.task-rollup progressbar progress { background: @live; }
+.card-blocked-caption { color: @held; font-size: 11px; }
+.blocked-lamp { color: @held; }
+.card-foot { min-height: 16px; }
+.card-module { color: @secondary; font-size: 11px; }
+.task-chip { font-family: 'Fira Mono'; font-size: 10px; padding: 0 4px; border: 1px solid @edge; color: @secondary; }
+.card-sha { font-family: 'Fira Mono'; font-size: 10px; color: @faint; }
+.card-ago { color: @faint; font-family: 'Fira Mono'; font-size: 10.5px; }
+.task-agent { min-height: 22px; margin: 2px -10px -8px; padding: 0 10px; background: @console; border-top: 1px solid @edge; color: @secondary; font-size: 10.5px; }
+.board-lamp { color: @faint; }
+.board-lamp.live-lamp { color: @live; }
+
+/* Labels: an edge-outlined chip with a muted swatch, so tags read without shouting. */
+.label-chip { padding: 1px 6px 1px 5px; border: 1px solid @edge; border-radius: 2px; }
+.label-chip-name { color: @secondary; font-size: 10.5px; }
+.label-more { color: @faint; font-size: 10.5px; }
+.label-hue-0 { color: #8fa3bf; }
+.label-hue-1 { color: #a597c4; }
+.label-hue-2 { color: #c4949f; }
+.label-hue-3 { color: #c4aa8b; }
+.label-hue-4 { color: #8fb89c; }
+.label-hue-5 { color: #8db6bd; }
+.label-hue-6 { color: #b3b78b; }
+.label-hue-7 { color: #c09a8d; }
+
+/* Status glyphs, priority bars and execution-state badges carry the state colours. */
+.status-backlog { color: @faint; }
+.status-ready { color: @secondary; }
+.status-active { color: @live; }
+.status-in_review { color: @waiting; }
+.status-done { color: @secondary; }
+.priority-icon { color: @secondary; }
+.priority-high { color: @waiting; }
+.priority-urgent { color: @held; }
+.state-badge { padding: 0 5px; border: 1px solid @edge; border-radius: 2px; min-height: 16px; }
+.state-caption { font-family: 'Fira Sans Condensed'; font-size: 9.5px; font-weight: 600; letter-spacing: 0.06em; color: @secondary; }
+.state-badge .board-lamp { color: @secondary; }
+.state-running .board-lamp { color: @live; }
+.state-running .state-caption { color: @live; }
+.state-awaiting_review .board-lamp, .state-dispatched .board-lamp { color: @waiting; }
+.state-blocked .board-lamp, .state-failed .board-lamp { color: @held; }
+.state-blocked .state-caption, .state-failed .state-caption { color: @held; }
+
+/* ── List view ──────────────────────────────────────────────────────────── */
+.board-list { padding: 12px 16px 10px; }
+.list-section { margin-bottom: 10px; background: @console; border: 1px solid @edge; }
+.list-row { min-height: 36px; padding: 0 12px; border-bottom: 1px solid @edge; background: @slab; }
+.list-row:hover { background: @wash; }
+.list-row:last-child { border-bottom: 0; }
+.list-title { color: @ink; font-size: 13px; }
+.list-lineage { color: @faint; font-size: 11px; }
+.list-meta, .list-agent { color: @secondary; font-size: 11px; }
+.list-empty { padding: 10px 12px; color: @faint; font-size: 11.5px; }
+.list-group-heading { padding: 6px 12px 3px; color: @faint; font-family: 'Fira Sans Condensed'; font-size: 10.5px; font-weight: 600; letter-spacing: 0.06em; border-bottom: 1px solid @edge; }
+
+/* ── Peek panel ─────────────────────────────────────────────────────────── */
+.board-peek { background: @console; border-left: 1px solid @edge; }
+.peek-head { min-height: 40px; padding: 0 8px 0 14px; border-bottom: 1px solid @edge; }
+.peek-body { padding: 14px 16px 18px; }
+.peek-title { color: @ink; font-size: 16px; font-weight: 600; }
+.peek-props { padding: 6px 0; border-top: 1px solid @edge; border-bottom: 1px solid @edge; }
+.peek-key { min-width: 70px; color: @faint; font-size: 11.5px; }
+.peek-value > button { min-height: 26px; padding: 0 8px; border: 1px solid transparent; background: transparent; color: @ink; font-size: 12px; }
+.peek-value > button:hover { border-color: @edge; background: @slab; }
+.peek-text { min-height: 26px; padding-left: 9px; color: @ink; font-size: 12px; }
+.peek-description { color: @ink; font-size: 12.5px; }
+.peek-muted { color: @faint; font-size: 12px; }
+.peek-commit { font-family: 'Fira Mono'; font-size: 11px; color: @secondary; }
+button.peek-link { min-height: 28px; padding: 0 8px; border: 1px solid @edge; border-radius: 2px; background: @slab; color: @ink; font-size: 12px; font-weight: 400; }
+button.peek-link:hover { background: @wash; border-color: @strong; }
+button.peek-link.done label { color: @secondary; }
+button.peek-edit { border: 1px solid @edge; }
+
+/* ── Menus (context, filter, pickers) ──────────────────────────────────── */
+popover.board-menu contents { padding: 6px; background: @slab; border: 1px solid @strong; }
+.board-menu-title { padding: 4px 6px 6px; color: @ink; font-size: 12px; font-weight: 600; }
+.board-menu-caption { margin-top: 6px; padding: 0 6px; color: @faint; font-family: 'Fira Sans Condensed'; font-size: 10px; font-weight: 600; letter-spacing: 0.08em; }
+button.board-menu-item { min-height: 28px; padding: 0 8px; border: 0; border-radius: 2px; background: transparent; color: @ink; font-weight: 400; }
+button.board-menu-item:hover { background: @wash; }
+button.board-menu-item.selected { background: @wash; }
+button.board-menu-item.destructive label { color: @held; }
+button.board-menu-choice { min-height: 28px; padding: 0; border: 1px solid @edge; border-radius: 2px; background: @console; }
+button.board-menu-choice:hover { background: @wash; border-color: @strong; }
+button.board-menu-choice.selected { border-color: @ink; background: @wash; opacity: 1; }
+.board-filter { padding: 4px; }
+button.filter-option { min-height: 24px; padding: 0 8px; border: 1px solid @edge; border-radius: 2px; background: @console; color: @secondary; font-size: 11.5px; font-weight: 400; }
+button.filter-option:hover { background: @wash; color: @ink; }
+button.filter-option:checked { border-color: @ink; background: @wash; color: @ink; }
+.board-filter flowboxchild { padding: 0; }
+
+/* ── Empty board and shortcuts ─────────────────────────────────────────── */
+.board-blank { padding: 40px; }
+.board-blank-title { color: @ink; font-size: 15px; font-weight: 600; }
+.board-blank-hint { color: @secondary; font-size: 12px; margin-bottom: 6px; }
+.board-shortcuts { min-height: 28px; padding: 0 16px; border-top: 1px solid @edge; background: @console; }
+.board-kbd { padding: 0 4px; border: 1px solid @edge; border-radius: 2px; font-family: 'Fira Mono'; font-size: 10px; color: @secondary; }
+.board-hint { margin-right: 8px; color: @faint; font-size: 11px; }
+
+/* ── Task editor identity line ─────────────────────────────────────────── */
+.task-identity { min-height: 34px; padding: 0 10px; margin-bottom: 4px; border: 1px solid @edge; background: @slab; }
+.identity-part { padding-right: 8px; border-right: 1px solid @edge; }
+.identity-caption { color: @ink; font-size: 12px; }
