@@ -4,7 +4,7 @@
   "title": "RELAY v4 command bus",
   "description": "Generated from crates/relay-bus by `relay schema`. Do not edit; see docs/BUS.md.",
   "version": 1,
-  "op_count": 221,
+  "op_count": 222,
   "envelope": {
     "request": {
       "$ref": "#/$defs/Request"
@@ -3594,6 +3594,27 @@
       "phase": 12,
       "payload": {
         "$ref": "#/$defs/AvdBootIn"
+      },
+      "result": {
+        "$ref": "#/$defs/Empty"
+      }
+    },
+    "avd.stop": {
+      "summary": "Shut down a running Android Virtual Device",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "executor": "core",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "avd.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/AvdStopIn"
       },
       "result": {
         "$ref": "#/$defs/Empty"
@@ -13101,6 +13122,18 @@
             "boolean",
             "null"
           ]
+        }
+      },
+      "required": [
+        "name"
+      ]
+    },
+    "AvdStopIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
         }
       },
       "required": [

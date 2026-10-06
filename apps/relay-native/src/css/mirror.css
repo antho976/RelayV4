@@ -1,20 +1,18 @@
 /* mirror area styles: loaded after theme.css, so rules here override it. */
 
-/* The mirror reads as one more plate on the wall: a console identity strip over a
-   screen-black stage. The phone is the only rounded thing in it — it is a picture of a
-   device, not chrome — and colour stays on the lamp and on problems, per the Tally Rule. */
+/* The mirror is the phone and one rail beside it: no strip, no footer. The phone is the only
+   rounded thing in it — it is a picture of a device, not chrome — and colour stays on the
+   lamp and on problems, per the Tally Rule. */
 
 .mirror { background: @wall; }
 .dock-panel { background: @wall; border-left: 1px solid @edge; box-shadow: -10px 0 28px alpha(black, 0.38); }
 
-/* -- identity strip ------------------------------------------------------------ */
-.mirror-strip { min-height: 44px; padding: 0 6px 0 4px; background: @console; border-bottom: 1px solid @edge; }
-menubutton.mirror-picker > button { min-height: 36px; padding: 2px 8px; background: transparent; border-color: transparent; border-radius: 2px; }
-menubutton.mirror-picker > button:hover, menubutton.mirror-picker > button:checked { background: @wash; border-color: transparent; }
-menubutton.mirror-picker image { color: @faint; }
+/* -- device switcher: the rail's head, its lamp on the glyph's shoulder ----------- */
+menubutton.mirror-picker > button { min-width: 30px; min-height: 30px; padding: 0; background: transparent; border-color: transparent; border-radius: 2px; color: @secondary; }
+menubutton.mirror-picker > button:hover, menubutton.mirror-picker > button:checked { background: @wash; border-color: transparent; color: @ink; }
 .mirror-title { color: @ink; font-size: 13px; font-weight: 600; }
 .mirror-meta { color: @faint; font-family: 'Fira Mono', monospace; font-size: 10px; }
-.lamp.mirror-lamp { min-width: 7px; min-height: 7px; margin: 0 2px; }
+.lamp.mirror-lamp { min-width: 6px; min-height: 6px; margin: 4px 3px 0 0; }
 .lamp.waiting { background: @waiting; border-color: @waiting; }
 
 button.mirror-key { min-width: 30px; min-height: 30px; padding: 0; color: @secondary; }
@@ -22,8 +20,8 @@ button.mirror-key:hover { color: @ink; }
 button.mirror-key:disabled { opacity: 0.32; }
 
 /* -- stage ----------------------------------------------------------------------- */
-.mirror-stage { padding: 20px 16px 12px 20px; }
-.mirror.docked .mirror-stage { padding: 16px 12px 10px 14px; }
+.mirror-stage { padding: 16px 12px 16px 16px; }
+.mirror.docked .mirror-stage { padding: 12px 10px 12px 12px; }
 .mirror.fullscreen .mirror-stage { padding: 28px; }
 
 /* The bezel is drawn as spread shadows, outside the screen's allocation, so it never
@@ -54,18 +52,21 @@ picture.mirror-picture:focus-visible { outline: none; }
 .mirror-card-actions button { min-height: 28px; }
 spinner.mirror-spinner { color: @ink; min-width: 18px; min-height: 18px; margin-bottom: 4px; }
 
-/* Hardware keys beside the phone, grouped as they sit on a device. */
-.mirror-rail-group { margin: 5px 0; padding: 3px; background: @console; border: 1px solid @edge; border-radius: 2px; }
+/* The rail: one console bar the height of the phone, its keys grouped as they sit on a
+   device and divided by hairlines. The margin matches the phone's, so the two line up. */
+.mirror-rail { margin: 12px 0; padding: 3px; background: @console; border: 1px solid @edge; border-radius: 2px; }
+.mirror-rail-group { padding: 4px 0; }
+.mirror-rail-group + .mirror-rail-group { border-top: 1px solid @edge; }
+.mirror-rail-foot { border-top: 1px solid @edge; }
 
-/* Android's navigation bar, under the phone it drives. */
-.mirror-nav { padding: 0 12px; }
-button.mirror-nav-key { min-width: 54px; min-height: 30px; }
+/* Confirmations float over the foot of the screen instead of a status line. */
+.mirror-toast { margin-bottom: 14px; padding: 5px 10px; background: alpha(@console, 0.94); border: 1px solid @edge; border-radius: 2px; color: @ink; font-size: 11px; }
 
-.mirror-hint { padding: 5px 12px; background: @console; border-top: 1px solid @edge; color: @faint; font-size: 11px; }
-.mirror-hint.flash { color: @ink; }
-
-/* -- device picker ------------------------------------------------------------------ */
-.mirror-devices { padding: 4px; min-width: 240px; }
+/* -- device picker: opens beside the rail ----------------------------------------- */
+.mirror-sheet { padding: 4px; min-width: 250px; }
+.mirror-sheet-head { padding: 6px 8px 8px; border-bottom: 1px solid @edge; }
+.mirror-sheet-foot { padding: 8px 8px 4px; border-top: 1px solid @edge; }
+.mirror-devices { padding: 2px 0; }
 button.mirror-device-row { min-height: 40px; padding: 4px 8px; }
 button.mirror-device-row image { color: @ink; }
 .mirror-device-name { color: @ink; font-size: 13px; }

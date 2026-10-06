@@ -25,7 +25,7 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
         clear(page);
         page.append(&label("Device control", "title"));
         page.append(&paragraph("Run Android builds from the selected checkout. A release build needs no connected device."));
-        let reload = button("Refresh devices and worktrees", "quiet");
+        let reload = button("Refresh devices and checkouts", "quiet");
         page.append(&reload);
         let weak = Rc::downgrade(ui);
         reload.connect_clicked(move |_| {
@@ -41,10 +41,11 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
             Ok(v) => rows(&v, "worktrees"),
             Err(_) => Vec::new(),
         };
+        let last = last_worktree(ui, project).await;
         if !current(ui, "devices", project, generation) {
             return;
         }
-        build_form(ui, page, project, &devices, &worktrees);
+        build_form(ui, page, project, &devices, &worktrees, last.as_deref());
         avd_form(ui, page);
         page.append(&gtk::Box::new(gtk::Orientation::Vertical, 8));
         // Navigation can cancel the await above. Mark only a fully built form reusable.
@@ -54,77 +55,19 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
     }
     let list = page.last_child().unwrap().downcast::<gtk::Box>().unwrap();
     clear(&list);
-    let connected = section(&list, "Connected devices");
-    if devices.is_empty() {
-        connected.append(&paragraph(
-            "No Android device. Connect a phone with USB debugging enabled or boot an AVD below.",
-        ));
+    let avds = ui.call("avd.list", json!({})).await;
+    if !current(ui, "devices", project, generation) {
+        return;
     }
-    for device in devices {
-        connected.append(&label(
-            &format!("{} · {}", text(&device, "model"), text(&device, "state")),
-            "title",
-        ));
-        connected.append(&paragraph(&format!(
-            "{} · {}",
-            text(&device, "serial"),
-            text(&device, "kind")
-        )));
-        if let Some(lease) = lease_row(ui, &device) {
-            connected.append(&lease);
-        }
-        let mirror = button("Open mirror", "primary");
-        connected.append(&mirror);
-        let weak = Rc::downgrade(ui);
-        let target = text(&device, "serial").to_string();
-        mirror.connect_clicked(move |_| {
-            if let Some(ui) = weak.upgrade() {
-                crate::mirror::open(&ui, target.clone());
-            }
-        });
-        let copy = button("Copy device ID", "quiet");
-        connected.append(&copy);
-        let serial = text(&device, "serial").to_string();
-        copy.connect_clicked(move |b| {
-            b.clipboard().set_text(&serial);
-        });
-    }
-    match ui.call("avd.list", json!({})).await {
-        Ok(value) => {
-            if !current(ui, "devices", project, generation) {
-                return;
-            }
-            let avds = section(&list, "Virtual devices");
-            for avd in rows(&value, "avds") {
-                let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-                let name = label(text(&avd, "name"), "title");
-                name.set_hexpand(true);
-                row.append(&name);
-                if let Some(serial) = avd["running_serial"].as_str() {
-                    row.append(&label(serial, "dim"));
-                } else {
-                    action(
-                        ui,
-                        &row,
-                        "Boot",
-                        "avd.boot",
-                        json!({"name":avd["name"],"cold":false}),
-                    );
-                    action(
-                        ui,
-                        &row,
-                        "Cold boot",
-                        "avd.boot",
-                        json!({"name":avd["name"],"cold":true}),
-                    );
-                }
-                avds.append(&row);
-            }
-        }
+    let all = section(&list, "Devices");
+    let avds = match avds {
+        Ok(value) => rows(&value, "avds"),
         Err(error) => {
-            list.append(&paragraph(&format!("Virtual devices unavailable: {error}")));
+            all.append(&paragraph(&format!("Virtual devices unavailable: {error}")));
+            Vec::new()
         }
-    }
+    };
+    device_list(ui, &all, &devices, &avds);
     if project <= 0 {
         return;
     }
@@ -221,60 +164,299 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
     }
 }
 
+/// One checkout the picker offers.
+struct Checkout {
+    branch: String,
+    path: String,
+    /// The project's own checkout: built with no `worktree` in the payload.
+    primary: bool,
+    session: Option<String>,
+    dirty: bool,
+}
+
+/// "Build from": a searchable list of the project's checkouts, branch first. The checkout of
+/// the last build or run is preselected and tagged, else the project's own checkout, so a
+/// rebuild is one click.
 #[derive(Clone)]
 struct WorktreePicker {
-    widget: gtk::DropDown,
-    paths: Rc<Vec<String>>,
+    widget: gtk::MenuButton,
+    inner: Rc<Picker>,
+}
+
+/// The picker's state. Its own signal handlers hold it weakly, so it goes with its widgets.
+struct Picker {
+    widget: gtk::MenuButton,
+    checkouts: Rc<Vec<Checkout>>,
+    selected: std::cell::Cell<usize>,
+    /// Index of the checkout the last build or run used, when it is still there.
+    last: Option<usize>,
+    face_branch: gtk::Label,
+    face_path: gtk::Label,
+    face_tag: gtk::Label,
+    search: gtk::SearchEntry,
+    rows: gtk::ListBox,
 }
 
 impl WorktreePicker {
-    fn new(worktrees: &[Value]) -> Self {
-        let mut names = vec!["Primary · project branch".to_string()];
-        let mut paths = vec![String::new()];
-        for tree in worktrees {
-            names.push(format!("{} · {}", text(tree, "branch"), text(tree, "path")));
-            paths.push(text(tree, "path").to_string());
-        }
-        let widget =
-            gtk::DropDown::from_strings(&names.iter().map(String::as_str).collect::<Vec<_>>());
-        widget.set_widget_name("device-worktree");
-        widget.set_enable_search(true);
-        widget.set_hexpand(true);
-        let factory = gtk::SignalListItemFactory::new();
-        factory.connect_setup(|_, item| {
-            let item = item.downcast_ref::<gtk::ListItem>().unwrap();
-            let name = label("", "");
-            name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-            name.set_max_width_chars(38);
-            item.set_child(Some(&name));
-        });
-        factory.connect_bind(|_, item| {
-            let item = item.downcast_ref::<gtk::ListItem>().unwrap();
-            let Some(value) = item.item().and_downcast::<gtk::StringObject>() else {
-                return;
-            };
-            let name = item.child().and_downcast::<gtk::Label>().unwrap();
-            name.set_text(&value.string());
-            name.set_tooltip_text(Some(&value.string()));
-        });
-        widget.set_factory(Some(&factory));
-        widget.set_list_factory(Some(&factory));
-        Self {
-            widget,
-            paths: Rc::new(paths),
-        }
+    fn new(worktrees: &[Value], last: Option<&str>) -> Self {
+        Picker::build(worktrees, last)
     }
 
     fn active_id(&self) -> Option<String> {
-        self.paths.get(self.widget.selected() as usize).cloned()
+        self.inner.active_id()
     }
+
+    fn choose(&self, index: i32) {
+        self.inner.choose(index);
+    }
+}
+
+impl Picker {
+    /// `worktrees` as `worktree.list` returns them (the project's own checkout first);
+    /// `last` is the worktree path of the most recent build or run.
+    fn build(worktrees: &[Value], last: Option<&str>) -> WorktreePicker {
+        let mut checkouts: Vec<Checkout> = worktrees
+            .iter()
+            .enumerate()
+            .map(|(index, tree)| Checkout {
+                branch: text(tree, "branch").to_string(),
+                path: text(tree, "path").to_string(),
+                primary: index == 0,
+                session: tree["session"].as_str().map(str::to_string),
+                dirty: tree["dirty"].as_bool() == Some(true),
+            })
+            .collect();
+        if checkouts.is_empty() {
+            checkouts.push(Checkout { branch: "Project checkout".into(), path: String::new(), primary: true, session: None, dirty: false });
+        }
+        let last = last
+            .filter(|path| !path.is_empty())
+            .and_then(|path| checkouts.iter().position(|checkout| checkout.path.trim_end_matches('/') == path.trim_end_matches('/')));
+
+        let face = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        face.append(&crate::icons::image("branch", 14));
+        let names = gtk::Box::new(gtk::Orientation::Vertical, 1);
+        names.set_hexpand(true);
+        let face_branch = label("", "build-from-branch");
+        face_branch.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        face_branch.set_max_width_chars(30);
+        let face_path = label("", "build-from-path");
+        face_path.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        face_path.set_max_width_chars(30);
+        names.append(&face_branch);
+        names.append(&face_path);
+        face.append(&names);
+        let face_tag = label("", "build-from-tag");
+        face_tag.set_valign(gtk::Align::Center);
+        face.append(&face_tag);
+        face.append(&crate::icons::image("chevron-down", 12));
+        let widget = gtk::MenuButton::new();
+        widget.set_widget_name("device-worktree");
+        widget.add_css_class("build-from");
+        widget.set_child(Some(&face));
+        widget.set_hexpand(true);
+
+        let sheet = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        sheet.add_css_class("build-from-sheet");
+        let search = gtk::SearchEntry::new();
+        search.set_placeholder_text(Some("Search branches, paths or sessions"));
+        sheet.append(&search);
+        let rows = gtk::ListBox::new();
+        rows.add_css_class("build-from-list");
+        rows.set_selection_mode(gtk::SelectionMode::None);
+        let empty = label("No branch matches.", "dim");
+        empty.set_margin_top(10);
+        empty.set_margin_bottom(10);
+        rows.set_placeholder(Some(&empty));
+        let scroll = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .propagate_natural_height(true)
+            .max_content_height(340)
+            .child(&rows)
+            .build();
+        sheet.append(&scroll);
+        let popover = gtk::Popover::new();
+        popover.set_child(Some(&sheet));
+        popover.set_has_arrow(false);
+        widget.set_popover(Some(&popover));
+
+        let picker = Rc::new(Self {
+            widget: widget.clone(),
+            checkouts: Rc::new(checkouts),
+            selected: std::cell::Cell::new(last.unwrap_or(0)),
+            last,
+            face_branch,
+            face_path,
+            face_tag,
+            search: search.clone(),
+            rows,
+        });
+        for index in 0..picker.checkouts.len() {
+            picker.rows.append(&picker.row(index));
+        }
+        picker.show_selected();
+
+        let checkouts = picker.checkouts.clone();
+        let query = search.downgrade();
+        picker.rows.set_filter_func(move |row| {
+            let needle = query.upgrade().map(|query| query.text().trim().to_lowercase()).unwrap_or_default();
+            let Some(checkout) = usize::try_from(row.index()).ok().and_then(|index| checkouts.get(index)) else { return true };
+            needle.is_empty()
+                || checkout.branch.to_lowercase().contains(&needle)
+                || checkout.path.to_lowercase().contains(&needle)
+                || checkout.session.as_deref().is_some_and(|session| session.to_lowercase().contains(&needle))
+        });
+        let rows = picker.rows.downgrade();
+        search.connect_search_changed(move |_| {
+            if let Some(rows) = rows.upgrade() {
+                rows.invalidate_filter();
+            }
+        });
+        let weak = Rc::downgrade(&picker);
+        picker.rows.connect_row_activated(move |_, row| {
+            if let Some(picker) = weak.upgrade() {
+                picker.choose(row.index());
+            }
+        });
+        // Enter in the search box takes the first match.
+        let weak = Rc::downgrade(&picker);
+        search.connect_activate(move |_| {
+            let Some(picker) = weak.upgrade() else { return };
+            let mut index = 0;
+            while let Some(row) = picker.rows.row_at_index(index) {
+                if row.is_child_visible() {
+                    picker.choose(index);
+                    return;
+                }
+                index += 1;
+            }
+        });
+        let close = popover.downgrade();
+        search.connect_stop_search(move |_| {
+            if let Some(popover) = close.upgrade() {
+                popover.popdown();
+            }
+        });
+        let focus = search.downgrade();
+        popover.connect_show(move |_| {
+            if let Some(search) = focus.upgrade() {
+                search.set_text("");
+                search.grab_focus();
+            }
+        });
+        WorktreePicker { widget, inner: picker }
+    }
+
+    fn tag(&self, index: usize) -> Option<&'static str> {
+        match self.last {
+            Some(last) if last == index => Some("last build"),
+            None if self.checkouts[index].primary => Some("checked out"),
+            _ => None,
+        }
+    }
+
+    fn row(&self, index: usize) -> gtk::ListBoxRow {
+        let checkout = &self.checkouts[index];
+        let body = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let mark = crate::icons::image("check", 14);
+        mark.add_css_class("build-from-mark");
+        mark.set_valign(gtk::Align::Center);
+        body.append(&mark);
+        let names = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        names.set_hexpand(true);
+        let top = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let branch = label(&checkout.branch, "build-from-branch");
+        branch.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        branch.set_max_width_chars(34);
+        branch.set_hexpand(true);
+        top.append(&branch);
+        if let Some(tag) = self.tag(index) {
+            top.append(&label(tag, "build-from-tag"));
+        }
+        names.append(&top);
+        let mut facts = vec![short_path(&checkout.path)];
+        if let Some(session) = &checkout.session {
+            facts.push(session.clone());
+        }
+        if checkout.dirty {
+            facts.push("uncommitted changes".into());
+        }
+        let path = label(&facts.join(" · "), "build-from-path");
+        path.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        path.set_max_width_chars(40);
+        names.append(&path);
+        body.append(&names);
+        let row = gtk::ListBoxRow::new();
+        row.set_child(Some(&body));
+        row.set_tooltip_text(Some(&checkout.path));
+        row
+    }
+
+    fn choose(&self, index: i32) {
+        let Ok(index) = usize::try_from(index) else { return };
+        if index >= self.checkouts.len() {
+            return;
+        }
+        self.selected.set(index);
+        self.show_selected();
+        self.widget.popdown();
+    }
+
+    fn show_selected(&self) {
+        let index = self.selected.get();
+        let checkout = &self.checkouts[index];
+        self.face_branch.set_text(&checkout.branch);
+        self.face_path.set_text(&short_path(&checkout.path));
+        self.widget.set_tooltip_text(Some(&checkout.path));
+        let tag = self.tag(index);
+        self.face_tag.set_text(tag.unwrap_or(""));
+        self.face_tag.set_visible(tag.is_some());
+        let mut position = 0;
+        while let Some(row) = self.rows.row_at_index(position) {
+            if position as usize == index {
+                row.add_css_class("chosen");
+            } else {
+                row.remove_css_class("chosen");
+            }
+            position += 1;
+        }
+    }
+
+    /// The `worktree` to send: none for the project's own checkout.
+    fn active_id(&self) -> Option<String> {
+        let checkout = &self.checkouts[self.selected.get()];
+        (!checkout.primary).then(|| checkout.path.clone())
+    }
+}
+
+/// The tail of a checkout path: what tells two worktrees apart.
+fn short_path(path: &str) -> String {
+    let parts: Vec<&str> = path.trim_end_matches('/').rsplit('/').take(3).collect();
+    if parts.len() < 3 {
+        return path.to_string();
+    }
+    format!("…/{}", parts.into_iter().rev().collect::<Vec<_>>().join("/"))
+}
+
+/// The worktree of the project's most recent build or run, for the picker's default.
+async fn last_worktree(ui: &Rc<Ui>, project: i64) -> Option<String> {
+    if project <= 0 {
+        return None;
+    }
+    let runs = ui.call("device.run.list", json!({"project_id":project})).await.ok()?;
+    rows(&runs, "runs").first().map(|run| text(run, "worktree").to_string())
 }
 
 pub(crate) async fn verify_worktree_picker(ui: &Rc<Ui>) {
     assert_eq!(std::env::var("RELAY_INSTANCE").as_deref(), Ok("test"));
     let path = format!("/tmp/{}", "long-checkout-name/".repeat(30));
-    let picker =
-        WorktreePicker::new(&[json!({"branch":"very-long-branch-name/".repeat(30),"path":path})]);
+    let picker = WorktreePicker::new(
+        &[
+            json!({"branch":"main","path":"/tmp/project"}),
+            json!({"branch":"very-long-branch-name/".repeat(30),"path":path}),
+        ],
+        Some(&path),
+    );
     let window = gtk::Window::builder()
         .transient_for(&ui.window)
         .default_width(400)
@@ -282,10 +464,18 @@ pub(crate) async fn verify_worktree_picker(ui: &Rc<Ui>) {
         .build();
     window.set_child(Some(&picker.widget));
     window.present();
-    picker.widget.set_selected(1);
     glib::timeout_future(std::time::Duration::from_millis(100)).await;
+    // The last build's checkout is preselected; the primary checkout builds with no worktree.
     assert_eq!(picker.active_id().as_deref(), Some(path.as_str()));
-    assert!(picker.widget.enables_search());
+    picker.choose(0);
+    assert_eq!(picker.active_id(), None);
+    // Search filters by branch; Enter takes the first match.
+    picker.inner.search.set_text("very-long");
+    glib::timeout_future(std::time::Duration::from_millis(400)).await;
+    let visible = |index| picker.inner.rows.row_at_index(index).unwrap().is_child_visible();
+    assert!(!visible(0) && visible(1), "Search must hide branches that do not match");
+    picker.inner.search.emit_activate();
+    assert_eq!(picker.active_id().as_deref(), Some(path.as_str()));
     assert!(
         window.width() <= 430,
         "Long branch and path must not expand the device surface: {}px",
@@ -294,9 +484,9 @@ pub(crate) async fn verify_worktree_picker(ui: &Rc<Ui>) {
     window.close();
 }
 
-fn build_form(ui: &Rc<Ui>, page: &gtk::Box, project: i64, devices: &[Value], worktrees: &[Value]) {
+fn build_form(ui: &Rc<Ui>, page: &gtk::Box, project: i64, devices: &[Value], worktrees: &[Value], last: Option<&str>) {
     let form = section(page, "Build & run");
-    let tree = WorktreePicker::new(worktrees);
+    let tree = WorktreePicker::new(worktrees, last);
     field("Build from", &tree.widget, &form);
     let target = gtk::ComboBoxText::new();
     for device in devices {
@@ -422,6 +612,114 @@ fn avd_form(ui: &Rc<Ui>, page: &gtk::Box) {
             );
         }
     });
+}
+
+/// Phones and virtual devices in one list. A connected device opens in the mirror; an AVD that
+/// is off boots headless straight into it, so both end up in the same window.
+fn device_list(ui: &Rc<Ui>, parent: &gtk::Box, devices: &[Value], avds: &[Value]) {
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    list.add_css_class("device-list");
+    parent.append(&list);
+    let stopped: Vec<&Value> = avds.iter().filter(|avd| !avd["running_serial"].is_string()).collect();
+    if devices.is_empty() && stopped.is_empty() {
+        let copy = paragraph("No Android device. Connect a phone with USB debugging enabled, or create a virtual device below.");
+        list.append(&copy);
+        return;
+    }
+    for device in devices {
+        let serial = text(device, "serial").to_string();
+        let state = text(device, "state");
+        let avd = avds.iter().find(|avd| avd["running_serial"] == serial.as_str()).map(|avd| text(avd, "name"));
+        let virtual_device = avd.is_some() || text(device, "kind") == "avd";
+        let name = avd.unwrap_or(text(device, "model")).replace('_', " ");
+        let mut facts = vec![serial.clone(), if virtual_device { "virtual".into() } else { "USB".into() }];
+        if state != "device" {
+            facts.push(state.to_string());
+        }
+        let row = device_row(&name, &facts.join(" · "), if state == "device" { "live" } else { "held" });
+        if state == "device" {
+            let mirror = button("Mirror", "primary");
+            mirror.set_valign(gtk::Align::Center);
+            mirror.set_tooltip_text(Some("Show and control this device's screen"));
+            let weak = Rc::downgrade(ui);
+            let target = serial.clone();
+            mirror.connect_clicked(move |_| {
+                if let Some(ui) = weak.upgrade() {
+                    crate::mirror::open(&ui, target.clone());
+                }
+            });
+            row.append(&mirror);
+        }
+        // A virtual device runs headless; this is its off switch.
+        if let Some(avd) = avd {
+            let stop = button("Stop", "quiet");
+            stop.set_valign(gtk::Align::Center);
+            stop.set_tooltip_text(Some("Shut this virtual device down"));
+            let weak = Rc::downgrade(ui);
+            let payload = json!({"name":avd});
+            stop.connect_clicked(move |key| {
+                if let Some(ui) = weak.upgrade() {
+                    ui.mutate("avd.stop", payload.clone(), key);
+                }
+            });
+            row.append(&stop);
+        }
+        let copy = crate::app::icon_button("copy", "Copy device ID");
+        copy.set_valign(gtk::Align::Center);
+        copy.connect_clicked(move |key| {
+            key.clipboard().set_text(&serial);
+            key.set_tooltip_text(Some("Copied"));
+        });
+        row.append(&copy);
+        list.append(&row);
+        if let Some(lease) = lease_row(ui, device) {
+            list.append(&lease);
+        }
+    }
+    for avd in stopped {
+        let name = text(avd, "name").to_string();
+        let row = device_row(&name.replace('_', " "), "virtual · off", "");
+        for (title, cold, style, tip) in [
+            ("Start", false, "primary", "Boot this virtual device and open it in the mirror"),
+            ("Cold", true, "quiet", "Cold boot: ignore the saved snapshot"),
+        ] {
+            let key = button(title, style);
+            key.set_valign(gtk::Align::Center);
+            key.set_tooltip_text(Some(tip));
+            let weak = Rc::downgrade(ui);
+            let name = name.clone();
+            key.connect_clicked(move |_| {
+                if let Some(ui) = weak.upgrade() {
+                    crate::mirror::open_avd(&ui, name.clone(), cold);
+                }
+            });
+            row.append(&key);
+        }
+        list.append(&row);
+    }
+}
+
+/// A device row's frame: status lamp, name over facts; the caller appends the actions.
+fn device_row(name: &str, facts: &str, lamp: &str) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    row.add_css_class("device-row");
+    let mark = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    mark.add_css_class("lamp");
+    if !lamp.is_empty() {
+        mark.add_css_class(lamp);
+    }
+    mark.set_valign(gtk::Align::Center);
+    row.append(&mark);
+    let words = gtk::Box::new(gtk::Orientation::Vertical, 1);
+    words.set_hexpand(true);
+    let title = label(name, "device-row-name");
+    title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    words.append(&title);
+    let detail = label(facts, "device-row-facts");
+    detail.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    words.append(&detail);
+    row.append(&words);
+    row
 }
 
 // A separate socket keeps noisy Gradle/logcat output away from the UI control plane.
@@ -639,118 +937,37 @@ pub fn open(ui: &Rc<Ui>) {
             }
         };
         let trees = trees.map(|v| rows(&v, "worktrees")).unwrap_or_default();
+        let (avds, last) = tokio::join!(ui.call("avd.list", json!({})), last_worktree(&ui, project));
+        let avds = avds.map(|v| rows(&v, "avds")).unwrap_or_default();
+        run.append(&label("Devices", "title"));
+        device_list(&ui, &run, &devices, &avds);
         avd_form(&ui, &run);
-        if let Ok(v) = ui.call("avd.list", json!({})).await {
-            for avd in rows(&v, "avds") {
-                let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-                let name = label(text(&avd, "name"), "body");
-                name.set_hexpand(true);
-                row.append(&name);
-                if avd["running_serial"].is_string() {
-                    row.append(&label("Running", "dim"));
-                } else {
-                    action(
-                        &ui,
-                        &row,
-                        "Boot",
-                        "avd.boot",
-                        json!({"name":avd["name"],"cold":false}),
-                    );
-                    action(
-                        &ui,
-                        &row,
-                        "Cold",
-                        "avd.boot",
-                        json!({"name":avd["name"],"cold":true}),
-                    );
-                }
-                run.append(&row);
-            }
-        }
-        if devices.is_empty() {
-            let empty = gtk::Box::new(gtk::Orientation::Vertical, 8);
-            empty.set_margin_top(20);
-            empty.set_margin_bottom(20);
-            empty.append(&crate::icons::image("device", 24));
-            let title = label("No Android device", "title");
-            title.set_xalign(0.5);
-            empty.append(&title);
-            let copy = paragraph("Connect a phone with USB debugging enabled, or boot an AVD above. A release build needs no device.");
-            copy.set_justify(gtk::Justification::Center);
-            empty.append(&copy);
-            run.append(&empty);
-        }
         release.append(&label("Release artifact", "title"));
         release.append(&paragraph(
-            "Build the selected worktree with its Gradle release configuration.",
+            "Build the selected checkout with its Gradle release configuration.",
         ));
         for (form, is_release) in [(&run, false), (&release, true)] {
             if project <= 0 {
                 form.append(&paragraph("Select a project to build."));
                 continue;
             }
-            let tree = WorktreePicker::new(&trees);
+            let tree = WorktreePicker::new(&trees, last.as_deref());
             field("Build from", &tree.widget, form);
             let target = gtk::ComboBoxText::new();
             for device in &devices {
                 if text(device, "state") == "device" {
                     let busy = device["lease"]["action"].is_string();
+                    let serial = text(device, "serial");
+                    let name = avds.iter().find(|avd| avd["running_serial"] == serial).map_or(text(device, "model"), |avd| text(avd, "name"));
                     target.append(
-                        Some(text(device, "serial")),
-                        &format!("{} · {}{}", text(device, "model"), text(device, "serial"), if busy { " · in use" } else { "" }),
+                        Some(serial),
+                        &format!("{} · {}{}", name.replace('_', " "), serial, if busy { " · in use" } else { "" }),
                     );
                 }
             }
             target.set_active(Some(0));
-            if !is_release && !devices.is_empty() {
-                field("Device", &target, form);
-                // Who else is on the phone right now, so a run does not install over them.
-                let leases = gtk::Box::new(gtk::Orientation::Vertical, 6);
-                for device in devices.iter().filter(|device| text(device, "state") == "device") {
-                    if let Some(lease) = lease_row(&ui, device) {
-                        leases.append(&lease);
-                    }
-                }
-                if leases.first_child().is_some() {
-                    form.append(&leases);
-                }
-                let facts = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-                facts.add_css_class("device-facts");
-                let serial = label(
-                    target.active_id().as_deref().unwrap_or("unavailable"),
-                    "mono",
-                );
-                serial.set_hexpand(true);
-                serial.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-                facts.append(&serial);
-                let copy = button("Copy ID", "quiet");
-                facts.append(&copy);
-                let selected = target.downgrade();
-                copy.connect_clicked(move |key| {
-                    if let Some(target) = selected.upgrade() {
-                        if let Some(id) = target.active_id() {
-                            key.clipboard().set_text(&id);
-                            key.set_label("Copied");
-                        }
-                    }
-                });
-                let selected_copy = copy.downgrade();
-                target.connect_changed(move |target| {
-                    serial.set_text(target.active_id().as_deref().unwrap_or("unavailable"));
-                    if let Some(copy) = selected_copy.upgrade() {
-                        copy.set_label("Copy ID");
-                    }
-                });
-                form.append(&facts);
-                let mirror = button("Open mirror", "quiet");
-                form.append(&mirror);
-                let weak = Rc::downgrade(&ui);
-                let target = target.clone();
-                mirror.connect_clicked(move |_| {
-                    if let (Some(ui), Some(serial)) = (weak.upgrade(), target.active_id()) {
-                        crate::mirror::open(&ui, serial.to_string());
-                    }
-                });
+            if !is_release && target.active_id().is_some() {
+                field("Run on", &target, form);
             }
             let format = gtk::ComboBoxText::new();
             format.append(Some("aab"), "Android App Bundle (.aab) · Google Play");

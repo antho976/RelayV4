@@ -352,11 +352,32 @@ pub fn register(e: &mut Engine) {
         ctx.emit("avd.changed", json!({"name":name,"state":"booting"}));
         ctx.after_commit(move |engine| {
             let mut command = Command::new(emulator);
-            command.arg(format!("@{event_name}"));
+            // Headless: Relay's mirror is the emulator's only screen, the same window a phone
+            // gets, rather than a second emulator UI beside it.
+            command.arg(format!("@{event_name}")).arg("-no-window");
             if cold { command.arg("-no-snapshot-load"); }
             command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
             let state = if command.spawn().is_ok() { "started" } else { "failed" };
             engine.emit_system("avd.changed", json!({"name":event_name,"state":state}));
+        });
+        Ok(Empty {})
+    });
+    // AVDs boot headless, so there is no emulator window to close: this is how one stops.
+    e.register_staged::<AvdStop, _>(|ctx, p| {
+        let name = valid_avd_name(&p.name)?;
+        let adb = ctx.read(adb_path)?;
+        let serial = running_avds_with(&adb)?.remove(&name)
+            .ok_or_else(|| BusError::not_found("avd.not_running", format!("{name} is not running")))?;
+        Ok((adb, name, serial))
+    }, |ctx: &mut Ctx, _, (adb, name, serial)| {
+        ctx.emit("avd.changed", json!({"name":name,"state":"stopping"}));
+        ctx.after_commit(move |engine| {
+            std::thread::spawn(move || {
+                let mut command = Command::new(adb);
+                command.args(["-s", &serial, "emu", "kill"]).stdin(Stdio::null());
+                let stopped = matches!(crate::proc::output_with_timeout(&mut command, Duration::from_secs(10)), Ok(Some(output)) if output.status.success());
+                engine.emit_system("avd.changed", json!({"name":name,"state":if stopped { "stopped" } else { "failed" }}));
+            });
         });
         Ok(Empty {})
     });

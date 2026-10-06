@@ -2,9 +2,10 @@
 //!
 //! One [`MirrorView`] per device. It is a self-contained widget tree that lives either in its
 //! own window or docked to the right of the wall, and moves between the two without restarting
-//! the stream. Its anatomy follows the terminal plate: an identity strip (lamp, device, actions)
-//! above a screen-black stage holding the phone, the hardware keys beside it and the Android
-//! navigation bar under it.
+//! the stream. It is the phone and one rail beside it, nothing else: the rail carries the device
+//! switcher (with the status lamp), the hardware keys, Android's navigation triad and the
+//! window's own actions. A phone and a virtual device get the same view — AVDs boot headless and
+//! this is their screen (see [`open_avd`]).
 //!
 //! The mirror never waits on silence. The engine reports every state on the stream itself —
 //! starting, running (with the real picture size), and on the way out stopped, failed with its
@@ -43,11 +44,14 @@ const MIRROR_MAX_LINE: usize = 32 * 1024 * 1024;
 /// `decode.rs`), and a picture taller than this is more pixels than any dock or window shows.
 const MAX_CAPTURE: i32 = 1280;
 const DOCK_WIDTH: i32 = 440;
-/// What the window spends around the phone: the key rail and stage padding across, the
-/// strip, navigation bar and hint line down.
-const CHROME_W: i32 = 110;
-const CHROME_H: i32 = 150;
+/// What the window spends around the phone: the rail and stage padding across, padding down.
+const CHROME_W: i32 = 116;
+const CHROME_H: i32 = 60;
 const HINT: &str = "Click to tap · drag to swipe · right-click for Back · type to send keys";
+/// How long a booting AVD may take before the mirror stops waiting for it.
+const BOOT_WAIT: Duration = Duration::from_secs(180);
+/// Mirror attempts while a fresh AVD finishes booting (adb lists it before the system is up).
+const BOOT_TRIES: u32 = 40;
 
 thread_local! {
     /// Open mirrors, strongly held: a view lives until its window closes or its dock is closed.
@@ -73,6 +77,32 @@ pub fn open(ui: &Rc<Ui>, device: String) {
     view.start();
 }
 
+/// Open the next mirror docked beside the wall (the smoke harness screenshots the main window,
+/// which a detached mirror is not part of).
+pub(crate) fn prefer_dock() {
+    PREFER_DOCK.with(|prefer| prefer.set(true));
+}
+
+/// Boot the AVD `name` headless and open its mirror: the same view a phone gets. The stage
+/// says what is happening while the emulator comes up, then the mirror starts on its serial.
+pub fn open_avd(ui: &Rc<Ui>, name: String, cold: bool) {
+    let existing = VIEWS.with(|views| views.borrow().iter().find(|view| view.avd.borrow().as_deref() == Some(name.as_str())).cloned());
+    if let Some(view) = existing {
+        view.present();
+        return;
+    }
+    let view = MirrorView::new(ui, String::new());
+    *view.avd.borrow_mut() = Some(name.clone());
+    view.set_model(&name);
+    VIEWS.with(|views| views.borrow_mut().push(view.clone()));
+    if PREFER_DOCK.with(Cell::get) {
+        view.dock();
+    } else {
+        view.detach();
+    }
+    view.boot(cold);
+}
+
 enum Host {
     None,
     Window(gtk::Window),
@@ -91,6 +121,10 @@ struct MirrorView {
     device: RefCell<String>,
     /// The device's own name once known (`device.list` model or the server's handshake).
     model: RefCell<String>,
+    /// The AVD this view booted, while it has not yet been seen live.
+    avd: RefCell<Option<String>>,
+    booting: Cell<bool>,
+    boot_tries: Cell<u32>,
     root: gtk::Box,
     lamp: gtk::Box,
     title: gtk::Label,
@@ -136,55 +170,51 @@ impl MirrorView {
         root.set_hexpand(true);
         root.set_vexpand(true);
 
-        // -- identity strip --------------------------------------------------------------
-        let strip = gtk::Box::new(gtk::Orientation::Horizontal, 2);
-        strip.add_css_class("mirror-strip");
+        // -- device switcher: the rail's head, with the status lamp on it -----------------
         let lamp = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         lamp.add_css_class("lamp");
         lamp.add_css_class("mirror-lamp");
-        lamp.set_valign(gtk::Align::Center);
-        let identity = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        identity.append(&lamp);
-        let names = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        names.set_valign(gtk::Align::Center);
+        lamp.set_halign(gtk::Align::End);
+        lamp.set_valign(gtk::Align::Start);
+        lamp.set_can_target(false);
+        let face = gtk::Overlay::new();
+        face.set_child(Some(&glyphs::image("device", 16)));
+        face.add_overlay(&lamp);
+        let picker = gtk::MenuButton::new();
+        picker.set_child(Some(&face));
+        picker.add_css_class("mirror-picker");
+        picker.set_tooltip_text(Some(&device));
         let title = label(&device, "mirror-title");
         title.set_ellipsize(gtk::pango::EllipsizeMode::End);
         let meta = label(&device, "mirror-meta");
         meta.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-        names.append(&title);
-        names.append(&meta);
-        identity.append(&names);
-        identity.append(&glyphs::image("chevron-down", 12));
-        let picker = gtk::MenuButton::new();
-        picker.set_child(Some(&identity));
-        picker.add_css_class("mirror-picker");
-        picker.set_hexpand(true);
-        picker.set_tooltip_text(Some("Switch device"));
+        let sheet = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        sheet.add_css_class("mirror-sheet");
+        let heading = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        heading.add_css_class("mirror-sheet-head");
+        heading.append(&title);
+        heading.append(&meta);
+        sheet.append(&heading);
         let picker_list = gtk::Box::new(gtk::Orientation::Vertical, 2);
         picker_list.add_css_class("mirror-devices");
+        sheet.append(&picker_list);
+        let tips = label(HINT, "mirror-meta");
+        tips.set_wrap(true);
+        tips.set_max_width_chars(34);
+        tips.add_css_class("mirror-sheet-foot");
+        sheet.append(&tips);
         let popover = gtk::Popover::new();
-        popover.set_child(Some(&picker_list));
+        popover.set_child(Some(&sheet));
         popover.set_has_arrow(false);
-        popover.set_halign(gtk::Align::Start);
+        popover.set_position(gtk::PositionType::Left);
         picker.set_popover(Some(&popover));
-        strip.append(&picker);
-        let shot_key = glyphs::key("screenshot", "Save a screenshot");
-        let dock_key = glyphs::key("dock", "Dock beside the wall");
-        let fullscreen_key = glyphs::key("fullscreen", "Full screen (F11)");
-        let close_key = glyphs::key("close", "Close mirror");
-        for key in [&shot_key, &dock_key, &fullscreen_key, &close_key] {
-            key.set_valign(gtk::Align::Center);
-            strip.append(key);
-        }
-        root.append(&strip);
 
-        // -- stage: phone, hardware keys, navigation bar ------------------------------------
+        // -- stage: the phone and its rail ---------------------------------------------------
         let stage = gtk::Grid::new();
         stage.add_css_class("mirror-stage");
         stage.set_hexpand(true);
         stage.set_vexpand(true);
         stage.set_column_spacing(14);
-        stage.set_row_spacing(10);
         let picture = gtk::Picture::new();
         picture.set_can_shrink(true);
         picture.set_content_fit(gtk::ContentFit::Contain);
@@ -192,12 +222,11 @@ impl MirrorView {
         picture.set_vexpand(true);
         picture.set_focusable(true);
         picture.add_css_class("mirror-picture");
-        picture.update_property(&[gtk::accessible::Property::Label("Device screen")]);
+        picture.update_property(&[gtk::accessible::Property::Label("Device screen"), gtk::accessible::Property::Description(HINT)]);
         let screen = gtk::Overlay::new();
         screen.add_css_class("mirror-screen");
         screen.set_overflow(gtk::Overflow::Hidden);
         screen.set_child(Some(&picture));
-
         let card = gtk::Box::new(gtk::Orientation::Vertical, 6);
         card.add_css_class("mirror-card");
         card.set_halign(gtk::Align::Fill);
@@ -237,6 +266,13 @@ impl MirrorView {
             card.append(widget);
         }
         screen.add_overlay(&card);
+        // Short confirmations ("Saved …", "Copied …") float over the foot of the screen.
+        let hint = label("", "mirror-toast");
+        hint.set_halign(gtk::Align::Center);
+        hint.set_valign(gtk::Align::End);
+        hint.set_can_target(false);
+        hint.set_visible(false);
+        screen.add_overlay(&hint);
 
         let aspect = gtk::AspectFrame::new(0.5, 0.5, 9.0 / 19.5, false);
         aspect.set_child(Some(&screen));
@@ -245,13 +281,19 @@ impl MirrorView {
         aspect.add_css_class("mirror-device");
         stage.attach(&aspect, 0, 0, 1, 1);
 
-        let rail = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        // The rail: switcher, hardware keys, navigation, device panels; window actions at the foot.
+        let rail = gtk::Box::new(gtk::Orientation::Vertical, 0);
         rail.add_css_class("mirror-rail");
-        rail.set_valign(gtk::Align::Center);
+        rail.set_vexpand(true);
         let mut controls = Vec::new();
         let display_key = glyphs::key("screen-off", "Turn the device screen off (mirroring continues)");
+        let head = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        head.add_css_class("mirror-rail-group");
+        head.append(&picker);
+        rail.append(&head);
         for group in [
             &[("power", "Power button", "power"), ("volume-up", "Volume up", "volumeup"), ("volume-down", "Volume down", "volumedown")][..],
+            &[("back", "Back (right-click, Esc)", "back"), ("home", "Home (middle-click)", "home"), ("recents", "Recent apps", "appswitch")][..],
             &[("rotate", "Rotate the device", "rotate"), ("notifications", "Open notifications", "notifications"), ("quick-settings", "Open quick settings", "quicksettings")][..],
         ] {
             let block = gtk::Box::new(gtk::Orientation::Vertical, 2);
@@ -269,29 +311,30 @@ impl MirrorView {
         block.append(&display_key);
         rail.append(&block);
         controls.push(display_key.clone());
-        stage.attach(&rail, 1, 0, 1, 1);
-
-        let nav = gtk::Box::new(gtk::Orientation::Horizontal, 28);
-        nav.add_css_class("mirror-nav");
-        nav.set_halign(gtk::Align::Center);
-        for (glyph, caption, kind) in [("back", "Back (right-click, Esc)", "back"), ("home", "Home (middle-click)", "home"), ("recents", "Recent apps", "appswitch")] {
-            let key = glyphs::key(glyph, caption);
-            key.add_css_class("mirror-nav-key");
-            key.set_widget_name(kind);
-            nav.append(&key);
-            controls.push(key);
+        let spacer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        spacer.set_vexpand(true);
+        rail.append(&spacer);
+        let shot_key = glyphs::key("screenshot", "Save a screenshot");
+        let dock_key = glyphs::key("dock", "Dock beside the wall");
+        let fullscreen_key = glyphs::key("fullscreen", "Full screen (F11)");
+        let close_key = glyphs::key("close", "Close mirror");
+        let foot = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        foot.add_css_class("mirror-rail-group");
+        foot.add_css_class("mirror-rail-foot");
+        for key in [&shot_key, &dock_key, &fullscreen_key, &close_key] {
+            foot.append(key);
         }
-        stage.attach(&nav, 0, 1, 1, 1);
+        rail.append(&foot);
+        stage.attach(&rail, 1, 0, 1, 1);
         root.append(&stage);
-
-        let hint = label(HINT, "mirror-hint");
-        hint.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        root.append(&hint);
 
         let view = Rc::new(Self {
             ui: Rc::downgrade(ui),
             device: RefCell::new(device),
             model: RefCell::default(),
+            avd: RefCell::default(),
+            booting: Cell::new(false),
+            boot_tries: Cell::new(0),
             root,
             lamp,
             title,
@@ -350,7 +393,7 @@ impl MirrorView {
         self.fullscreen_key.connect_clicked(move |_| action());
         let action = with(|view| view.close());
         self.close_key.connect_clicked(move |_| action());
-        let action = with(|view| view.start());
+        let action = with(|view| view.retry());
         self.card_retry.connect_clicked(move |_| action());
         let weak = Rc::downgrade(self);
         self.card_other.connect_clicked(move |button| {
@@ -672,8 +715,8 @@ impl MirrorView {
         }
         self.input.borrow_mut().take();
         self.release();
-        let device = self.device.borrow().clone();
-        VIEWS.with(|views| views.borrow_mut().retain(|view| *view.device.borrow() != device));
+        // By identity: a view still booting its AVD has no serial yet.
+        VIEWS.with(|views| views.borrow_mut().retain(|view| !std::ptr::eq(Rc::as_ptr(view), self)));
     }
 
     fn window_title(&self) -> String {
@@ -714,12 +757,16 @@ impl MirrorView {
         *self.input.borrow_mut() = Some(input);
         self.display_on.set(true);
         glyphs::rekey(&self.display_key, "screen-off", "Turn the device screen off (mirroring continues)");
-        self.connecting("Asking Relay to start the mirror…");
+        if self.booting.get() {
+            self.connecting("Waiting for Android to finish starting…");
+        } else {
+            self.connecting("Asking Relay to start the mirror…");
+        }
         let device = self.device.borrow().clone();
         let max_size = self.capture_size(&ui);
         let task = glib::spawn_future_local(session(Rc::downgrade(self), generation, device, max_size, ui.rt.clone(), ui.path.clone(), inputs));
         *self.task.borrow_mut() = Some(task);
-        // The model name, for the strip and the cards, ahead of the handshake.
+        // The model name, for the switcher and the cards, ahead of the handshake.
         if self.model.borrow().is_empty() {
             let weak = Rc::downgrade(self);
             glib::spawn_future_local(async move {
@@ -738,6 +785,62 @@ impl MirrorView {
         }
     }
 
+    /// Boot this view's AVD headless, wait for adb to list it, then start the mirror on it.
+    fn boot(self: &Rc<Self>, cold: bool) {
+        let (Some(ui), Some(name)) = (self.ui.upgrade(), self.avd.borrow().clone()) else { return };
+        let generation = self.generation.get() + 1;
+        self.generation.set(generation);
+        if let Some(task) = self.task.borrow_mut().take() {
+            task.abort();
+        }
+        self.booting.set(true);
+        self.boot_tries.set(0);
+        self.connecting(if cold { "Cold-booting the virtual device…" } else { "Booting the virtual device…" });
+        self.card_title.set_text(&format!("Starting {}", self.name()));
+        let weak = Rc::downgrade(self);
+        let task = glib::spawn_future_local(async move {
+            let alive = || weak.upgrade().filter(|view| view.current(generation));
+            if let Err(error) = ui.call("avd.boot", json!({"name":name,"cold":cold})).await {
+                if let Some(view) = alive() {
+                    view.booting.set(false);
+                    view.ended(&format!("{} didn't boot", view.name()), &error.to_string(), None, Some("Copy details"));
+                }
+                return;
+            }
+            let found = glib::future_with_timeout(BOOT_WAIT, wait_for_avd(&alive, &name, &ui.rt, &ui.path)).await;
+            let Some(view) = alive() else { return };
+            match found {
+                Ok(Ok(serial)) => {
+                    *view.device.borrow_mut() = serial;
+                    drop(view);
+                    // adb lists an emulator a moment before it accepts a push.
+                    glib::timeout_future(Duration::from_millis(800)).await;
+                    if let Some(view) = alive() {
+                        view.start();
+                    }
+                }
+                Ok(Err(reason)) => {
+                    view.booting.set(false);
+                    view.ended(&format!("{} didn't boot", view.name()), &reason, None, Some("Copy details"));
+                }
+                Err(_) => {
+                    view.booting.set(false);
+                    view.ended(&format!("{} is taking too long to boot", view.name()), "adb never listed the emulator. Check the AVD in Android Studio's Device Manager, or retry with a cold boot.", None, Some("Copy details"));
+                }
+            }
+        });
+        *self.task.borrow_mut() = Some(task);
+    }
+
+    /// Retry: a view that never reached its AVD boots it again; anything else restarts the mirror.
+    fn retry(self: &Rc<Self>) {
+        if self.device.borrow().is_empty() && self.avd.borrow().is_some() {
+            self.boot(false);
+        } else {
+            self.start();
+        }
+    }
+
     fn current(&self, generation: u64) -> bool {
         self.generation.get() == generation
     }
@@ -752,6 +855,8 @@ impl MirrorView {
             return;
         }
         *self.device.borrow_mut() = serial;
+        self.avd.borrow_mut().take();
+        self.booting.set(false);
         self.model.borrow_mut().clear();
         self.texture.borrow_mut().take();
         self.picture.set_paintable(None::<&gtk::gdk::Paintable>);
@@ -781,13 +886,16 @@ impl MirrorView {
     fn update_meta(&self) {
         let (w, h) = self.dims.get();
         let device = self.device.borrow();
+        let device = if device.is_empty() { "virtual device".to_string() } else { device.clone() };
         let text = match self.phase.get() {
             Phase::Live if w > 0 => format!("{device} · {w}×{h}"),
+            Phase::Connecting if self.booting.get() => format!("{device} · booting"),
             Phase::Connecting => format!("{device} · connecting"),
             Phase::Ended => format!("{device} · not mirroring"),
             Phase::Live => device.clone(),
         };
         self.meta.set_text(&text);
+        self.picker.set_tooltip_text(Some(&format!("{}\n{text}\nSwitch device", self.name())));
     }
 
     fn set_lamp(&self, state: &str) {
@@ -828,6 +936,7 @@ impl MirrorView {
             return;
         }
         self.phase.set(Phase::Live);
+        self.booting.set(false);
         self.set_lamp("live");
         self.card_spinner.stop();
         self.card.set_visible(false);
@@ -914,17 +1023,16 @@ impl MirrorView {
         }
     }
 
-    /// Show `message` in the hint line for a few seconds.
+    /// Show `message` over the foot of the screen for a few seconds.
     fn flash(self: &Rc<Self>, message: &str) {
         let generation = self.hint_generation.get() + 1;
         self.hint_generation.set(generation);
         self.hint.set_text(message);
-        self.hint.add_css_class("flash");
+        self.hint.set_visible(true);
         let weak = Rc::downgrade(self);
         glib::timeout_add_local_once(Duration::from_secs(4), move || {
             if let Some(view) = weak.upgrade().filter(|view| view.hint_generation.get() == generation) {
-                view.hint.set_text(HINT);
-                view.hint.remove_css_class("flash");
+                view.hint.set_visible(false);
             }
         });
     }
@@ -1022,6 +1130,20 @@ async fn session(
     let alive = || weak.upgrade().filter(|view| view.current(generation));
     let end = stream(&alive, &device, max_size, &rt, &path, inputs).await;
     let Some(view) = alive() else { return };
+    // A fresh emulator is listed before Android is up, so its first attempts fail; keep the
+    // booting card and try again rather than showing each of those as an error.
+    if view.booting.get() && !matches!(end, End::Request(Error::Disconnected)) && view.boot_tries.get() < BOOT_TRIES {
+        view.boot_tries.set(view.boot_tries.get() + 1);
+        drop(view);
+        glib::timeout_future(Duration::from_secs(3)).await;
+        if let Some(view) = alive() {
+            view.start();
+        }
+        return;
+    }
+    if let Some(view) = alive() {
+        view.booting.set(false);
+    }
     let name = view.name();
     let lost = match end {
         End::Status(status) => {
@@ -1197,6 +1319,42 @@ async fn wait_for_device(
             match notices.recv().await {
                 Ok(Notice::Event(event)) if event.ev == "device.changed" => break,
                 Ok(Notice::Disconnected(_)) | Err(_) => return false,
+                Ok(_) => {}
+            }
+        }
+    }
+}
+
+/// Wait, event-driven, for the AVD `name` to show up in adb, and return its serial. `avd.boot`
+/// reports a failed launch on `avd.changed`; the caller bounds the wait.
+async fn wait_for_avd(
+    alive: &impl Fn() -> Option<Rc<MirrorView>>,
+    name: &str,
+    rt: &tokio::runtime::Handle,
+    path: &std::path::Path,
+) -> Result<String, String> {
+    let gone = || "The mirror was closed.".to_string();
+    let (client, notices) = Client::connect(rt, path.to_path_buf()).await.map_err(|error| error.to_string())?;
+    client.request(rt, "bus.subscribe", json!({"events":["device.changed","avd.changed"]})).await.map_err(|error| error.to_string())?;
+    client.request(rt, "device.watch", json!({"on":true})).await.map_err(|error| error.to_string())?;
+    loop {
+        if alive().is_none() {
+            return Err(gone());
+        }
+        if let Ok(list) = client.request(rt, "avd.list", json!({})).await {
+            let serial = list["avds"].as_array().into_iter().flatten().find(|avd| avd["name"] == name).and_then(|avd| avd["running_serial"].as_str());
+            if let Some(serial) = serial {
+                return Ok(serial.to_string());
+            }
+        }
+        loop {
+            match notices.recv().await {
+                Ok(Notice::Event(event)) if event.ev == "avd.changed" && event.payload["name"] == name && event.payload["state"] == "failed" => {
+                    return Err("The Android emulator could not be launched. Check the SDK path in Settings.".into());
+                }
+                Ok(Notice::Event(event)) if event.ev == "device.changed" => break,
+                Ok(Notice::Disconnected(error)) => return Err(error.to_string()),
+                Err(_) => return Err(gone()),
                 Ok(_) => {}
             }
         }

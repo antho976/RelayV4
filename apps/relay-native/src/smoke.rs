@@ -591,6 +591,18 @@ pub fn install(ui: &Rc<Ui>) {
                 return;
             }
 
+            if page == "mirror" {
+                // No adb in the fixture: the docked mirror shows its rail and a problem card.
+                crate::mirror::prefer_dock();
+                if let Ok(avd) = std::env::var("RELAY_NATIVE_MIRROR_AVD") {
+                    crate::mirror::open_avd(&navigate, avd, false);
+                } else {
+                    let device = std::env::var("RELAY_NATIVE_MIRROR_DEVICE").unwrap_or_else(|_| "fixture-serial".into());
+                    crate::mirror::open(&navigate, device);
+                }
+                return;
+            }
+
             if matches!(page.as_str(), "device-run" | "device-release" | "resources") {
                 if page == "resources" {
                     navigate.resources();
