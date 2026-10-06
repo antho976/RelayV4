@@ -175,6 +175,27 @@ impl Panel {
             .set_min_content_height(height.min((self.host.height() - 16).max(200)));
     }
 
+    /// Grow to the content once it has arrived. A scrolled window asks its child for a height
+    /// at no particular width, so wrapped text counts as one line and the last rows are clipped.
+    pub fn fit(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        glib::idle_add_local_once(move || {
+            let Some(panel) = weak.upgrade() else {
+                return;
+            };
+            let width = match panel.scroll.width() {
+                0 => panel.frame.width_request() - 2,
+                width => width,
+            };
+            if width <= 0 {
+                return;
+            }
+            let (_, natural, _, _) = panel.body.measure(gtk::Orientation::Vertical, width);
+            let ceiling = panel.scroll.max_content_height();
+            panel.scroll.set_min_content_height(if ceiling > 0 { natural.min(ceiling) } else { natural });
+        });
+    }
+
     pub fn bottom(&self, height: i32) {
         self.modal.set(false);
         self.layer.add_css_class("utility-layer");

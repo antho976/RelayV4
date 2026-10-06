@@ -40,9 +40,9 @@ button.notification-open:hover { background: @wash; }
 
 /* "Where it left off" on a stopped session's slate. */
 .session-slate scrolledwindow, .session-slate viewport { background: transparent; }
-.slate-context { background: @console; border: 1px solid @edge; padding: 10px 12px; margin-top: 4px; }
-.slate-context-title { color: @faint; font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif; font-size: 11px; font-weight: 600; letter-spacing: 0.1em; }
-.slate-context-key { color: @faint; font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif; font-size: 10px; font-weight: 600; letter-spacing: 0.08em; margin-top: 1px; }
+.slate-context { background: @console; border: 1px solid @edge; padding: 12px 14px 13px; margin-top: 6px; }
+.slate-context-title { color: @faint; font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif; font-size: 11px; font-weight: 600; letter-spacing: 0.1em; margin-bottom: 2px; }
+.slate-context-key { color: @faint; font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif; font-size: 10px; font-weight: 600; letter-spacing: 0.08em; }
 .slate-context-value { color: @ink; font-size: 12px; }
 .slate-context-value.slate-context-report { color: @secondary; }
 .slate-context-value.slate-context-dirty { color: @waiting; }

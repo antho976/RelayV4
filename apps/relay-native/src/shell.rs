@@ -827,6 +827,7 @@ impl Ui {
         });
         panel.present();
         let ui = self.clone();
+        let panel = Rc::downgrade(&panel);
         glib::spawn_future_local(async move {
             match ui.call("skill.list", json!({"project_id":project})).await {
                 Ok(result) => {
@@ -892,6 +893,9 @@ impl Ui {
                     feedback.set_text(&error.to_string());
                     feedback.set_visible(true);
                 }
+            }
+            if let Some(panel) = panel.upgrade() {
+                panel.fit();
             }
         });
     }

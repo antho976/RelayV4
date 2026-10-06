@@ -25,8 +25,8 @@
 /* Status bar: compact meters, then when they were last read and a refresh key. */
 .statusbar .usage-group { margin: 0 1px; }
 .statusbar .usage-name { color: @secondary; font-size: 11px; font-weight: 500; margin-right: 2px; }
-.statusbar .usage-caption { color: @faint; font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif; font-size: 10px; font-weight: 600; letter-spacing: 0.04em; margin-left: 3px; }
-.statusbar .usage-value { color: @secondary; font-family: 'Fira Mono', monospace; font-size: 10px; min-width: 26px; }
+.statusbar .usage-caption { color: @faint; font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif; font-size: 11px; font-weight: 600; letter-spacing: 0.04em; margin-left: 4px; }
+.statusbar .usage-value { color: @secondary; font-family: 'Fira Mono', monospace; font-size: 11px; min-width: 28px; }
 .usage-meter trough { min-width: 34px; min-height: 4px; border-radius: 0; background: alpha(@ink, 0.12); border: 0; }
 .usage-meter progress { min-width: 0; min-height: 4px; border-radius: 0; background: @secondary; }
 .usage-meter.warn progress, .usage-bar.warn progress { background: @waiting; }
