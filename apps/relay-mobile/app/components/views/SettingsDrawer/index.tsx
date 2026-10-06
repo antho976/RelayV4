@@ -14,7 +14,9 @@ import { useAppMode } from '@lib/state/AppMode'
 import { Characters } from '@lib/state/Characters'
 import { Chats } from '@lib/state/Chat'
 import { Logger } from '@lib/state/Logger'
+import { activeHost, useRelayHostsStore } from '@lib/state/RelayHosts'
 import { Theme } from '@lib/theme/ThemeManager'
+import { linkColor } from '@screens/RelayScreen/console'
 
 /** Recent conversations across every character, newest first: the sidebar's history. */
 const recentChatsQuery = () =>
@@ -33,12 +35,20 @@ const recentChatsQuery = () =>
         .orderBy(desc(chats.last_modified))
         .limit(40)
 
-type NavItem = { label: string; icon: AntDesignIconName; path: string; lamp?: string }
+type NavItem = {
+    label: string
+    icon: AntDesignIconName
+    onPress: () => void
+    active?: boolean
+    count?: number
+    disabled?: boolean
+}
 
 /**
- * The app's sidebar: where you go (the PC, your characters, models) above your recent
- * conversations with local agents, and at the bottom the profile bubble that opens Settings
- * and a button to start a new chat.
+ * The app's drawer, Relay first. At the top the PC, which is the home screen, with how it is
+ * reached and what waits there: its workspaces, the inbox, the paired PCs. Below it what runs
+ * on the phone itself: characters, models, and the recent conversations with them. At the
+ * bottom, the profile bubble that opens Settings and a button to start a new chat.
  */
 const SettingsDrawer = () => {
     const styles = useStyles()
@@ -48,6 +58,11 @@ const SettingsDrawer = () => {
     const path = usePathname()
     const { appMode } = useAppMode()
     const relayStatus = useRelayStore((state) => state.status)
+    const hostName = useRelayStore((state) => state.hostName)
+    const waiting = useRelayStore(
+        (state) => state.holds.length + state.notifications.length + state.inReview
+    )
+    const paired = useRelayHostsStore((state) => state.hosts.length > 0)
     const setShow = Drawer.useDrawerStore((state) => state.setShow)
     const { charId, setCard } = Characters.useCharacterStore(
         useShallow((state) => ({ charId: state.id, setCard: state.setCard }))
@@ -63,7 +78,7 @@ const SettingsDrawer = () => {
             if (router.canDismiss()) router.dismissAll()
             return
         }
-        router.push(target)
+        if (path !== target) router.push(target)
     }
 
     const openChat = async (characterId: number, id: number) => {
@@ -80,30 +95,76 @@ const SettingsDrawer = () => {
     const newChat = async () => {
         // A new chat is with the character on screen; with none chosen yet, pick one first.
         if (!charId) {
-            go('/')
+            go('/screens/CharacterListScreen')
             return
         }
         const id = await Chats.db.mutate.createChat(charId)
         if (id) await openChat(charId, id)
     }
 
-    const pcLamp =
-        relayStatus === 'online'
-            ? '#2ec469'
-            : relayStatus === 'connecting'
-              ? color.quote
-              : undefined
-    const nav: NavItem[] = [
-        { label: 'PC', icon: 'desktop', path: '/screens/RelayScreen', lamp: pcLamp },
-        { label: 'Characters', icon: 'team', path: '/' },
-        appMode === 'remote'
-            ? { label: t('navigation.api'), icon: 'api', path: '/screens/ConnectionsManagerScreen' }
-            : {
-                  label: t('navigation.models'),
-                  icon: 'branches',
-                  path: '/screens/ModelManagerScreen',
+    const online = relayStatus === 'online'
+    const pcName = (paired && (hostName ?? activeHost()?.name)) || 'PC'
+    const pcMeta = !paired
+        ? 'Not paired yet'
+        : online
+          ? 'Connected'
+          : relayStatus === 'connecting'
+            ? 'Connecting…'
+            : 'Not connected'
+    const link = (label: string, icon: AntDesignIconName, target: string): NavItem => ({
+        label: label,
+        icon: icon,
+        onPress: () => go(target),
+        active: path.startsWith(target),
+    })
+
+    // What reaches the PC: the workspaces sidebar sits on the home screen, so it opens there.
+    const relayNav: NavItem[] = paired
+        ? [
+              {
+                  label: 'Workspaces',
+                  icon: 'folder',
+                  onPress: () => {
+                      go('/')
+                      setShow(Drawer.ID.RELAY, true)
+                  },
+                  disabled: !online,
               },
+              {
+                  ...link('Inbox', 'bell', '/screens/RelayScreen/Inbox'),
+                  count: online ? waiting : 0,
+                  disabled: !online,
+              },
+              link('Paired PCs', 'link', '/screens/RelayScreen/Hosts'),
+          ]
+        : [link('Pair a PC', 'qrcode', '/screens/RelayScreen/Hosts')]
+    const localNav: NavItem[] = [
+        link('Characters', 'team', '/screens/CharacterListScreen'),
+        appMode === 'remote'
+            ? link(t('navigation.api'), 'api', '/screens/ConnectionsManagerScreen')
+            : link(t('navigation.models'), 'branches', '/screens/ModelManagerScreen'),
     ]
+
+    const renderNav = (items: NavItem[]) =>
+        items.map((entry) => (
+            <TouchableOpacity
+                key={entry.label}
+                style={[styles.navRow, entry.active && styles.navRowActive]}
+                disabled={entry.disabled}
+                onPress={entry.onPress}>
+                <AntDesign
+                    name={entry.icon}
+                    size={20}
+                    color={entry.disabled ? color.text._600 : color.text._200}
+                />
+                <Text style={[styles.navLabel, entry.disabled && styles.navLabelOff]}>
+                    {entry.label}
+                </Text>
+                {!!entry.count && (
+                    <Text style={styles.count}>{entry.count > 99 ? '99+' : entry.count}</Text>
+                )}
+            </TouchableOpacity>
+        ))
 
     const initial = userName.trim().charAt(0).toUpperCase() || 'Y'
 
@@ -113,31 +174,45 @@ const SettingsDrawer = () => {
                 <Text style={styles.wordmark}>Relay</Text>
             </View>
 
-            <View style={styles.nav}>
-                {nav.map((item) => {
-                    const active = item.path === '/' ? path === '/' : path.startsWith(item.path)
-                    return (
-                        <TouchableOpacity
-                            key={item.label}
-                            style={[styles.navRow, active && styles.navRowActive]}
-                            onPress={() => go(item.path)}>
-                            <AntDesign name={item.icon} size={22} color={color.text._200} />
-                            <Text style={styles.navLabel}>{item.label}</Text>
-                            {!!item.lamp && (
-                                <View style={[styles.lamp, { backgroundColor: item.lamp }]} />
-                            )}
-                        </TouchableOpacity>
-                    )
-                })}
-            </View>
-
-            <View style={styles.divider} />
-
             <FlatList
                 style={{ flex: 1 }}
                 data={recents}
                 keyExtractor={(item) => String(item.id)}
-                ListHeaderComponent={<Text style={styles.sectionTitle}>Recents</Text>}
+                ListHeaderComponent={
+                    <View>
+                        <View style={styles.nav}>
+                            <TouchableOpacity
+                                style={[styles.pcRow, path === '/' && styles.navRowActive]}
+                                onPress={() => go('/')}>
+                                <View style={styles.pcIcon}>
+                                    <AntDesign name="desktop" size={20} color={color.text._200} />
+                                    <View
+                                        style={[
+                                            styles.pcLamp,
+                                            {
+                                                backgroundColor: linkColor(relayStatus, color),
+                                                borderColor: color.neutral._300,
+                                            },
+                                        ]}
+                                    />
+                                </View>
+                                <View style={{ flex: 1 }}>
+                                    <Text numberOfLines={1} style={styles.pcName}>
+                                        {pcName}
+                                    </Text>
+                                    <Text numberOfLines={1} style={styles.pcMeta}>
+                                        {pcMeta}
+                                    </Text>
+                                </View>
+                            </TouchableOpacity>
+                            {renderNav(relayNav)}
+                        </View>
+                        <View style={styles.divider} />
+                        <Text style={styles.sectionTitle}>Local</Text>
+                        <View style={styles.nav}>{renderNav(localNav)}</View>
+                        <Text style={[styles.sectionTitle, styles.recentsTitle]}>Recent chats</Text>
+                    </View>
+                }
                 ListEmptyComponent={
                     <Text style={styles.empty}>
                         Conversations with your characters show up here.
@@ -220,12 +295,56 @@ const useStyles = () => {
         navLabel: {
             flex: 1,
             color: color.text._200,
-            fontSize: fontSize.xl,
+            fontSize: fontSize.l,
         },
-        lamp: {
-            width: 8,
-            height: 8,
-            borderRadius: 4,
+        navLabelOff: {
+            color: color.text._600,
+        },
+        count: {
+            minWidth: 22,
+            textAlign: 'center',
+            color: color.text._100,
+            fontSize: fontSize.s,
+            fontVariant: ['tabular-nums'],
+            paddingHorizontal: 6,
+            paddingVertical: 1,
+            borderRadius: 10,
+            overflow: 'hidden',
+            backgroundColor: color.primary._500,
+        },
+        pcRow: {
+            flexDirection: 'row',
+            alignItems: 'center',
+            columnGap: spacing.l,
+            paddingHorizontal: spacing.l,
+            paddingVertical: spacing.m,
+            borderRadius: 20,
+        },
+        pcIcon: {
+            width: 40,
+            height: 40,
+            borderRadius: 12,
+            alignItems: 'center',
+            justifyContent: 'center',
+            backgroundColor: color.neutral._300,
+        },
+        pcLamp: {
+            position: 'absolute',
+            right: -2,
+            bottom: -2,
+            width: 12,
+            height: 12,
+            borderRadius: 6,
+            borderWidth: 2,
+        },
+        pcName: {
+            color: color.text._100,
+            fontSize: fontSize.xl,
+            fontWeight: '600',
+        },
+        pcMeta: {
+            color: color.text._400,
+            fontSize: fontSize.s,
         },
         divider: {
             height: 1,
@@ -235,10 +354,15 @@ const useStyles = () => {
         },
         sectionTitle: {
             color: color.text._400,
-            fontSize: fontSize.l,
+            fontSize: fontSize.s,
+            letterSpacing: 1,
+            textTransform: 'uppercase',
             paddingHorizontal: spacing.xl2,
             paddingTop: spacing.s,
-            paddingBottom: spacing.m,
+            paddingBottom: spacing.s,
+        },
+        recentsTitle: {
+            paddingTop: spacing.xl,
         },
         empty: {
             color: color.text._500,

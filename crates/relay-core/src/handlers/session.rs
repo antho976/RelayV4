@@ -1701,7 +1701,9 @@ pub fn register(e: &mut Engine) {
     e.register::<Scrollback>(|ctx, p| {
         let row = sessions::by_name(ctx.tx(), &p.session)?;
         assert_own(ctx, &row, true)?;
-        let (text, epoch, seq) = match ctx.engine().pty(row.session.id) {
+        let pty = ctx.engine().pty(row.session.id);
+        let size = pty.as_ref().map(|pty| pty.size());
+        let (text, epoch, seq) = match pty {
             Some(pty) => pty.scrollback(p.lines.map(|n| n as usize)),
             None => {
                 let (text, epoch, seq) = sessions::load_scrollback(ctx.tx(), row.session.id)?
@@ -1724,7 +1726,7 @@ pub fn register(e: &mut Engine) {
                 (text, epoch, seq)
             }
         };
-        Ok(ScrollbackOut { text, epoch, seq })
+        Ok(ScrollbackOut { text, epoch, seq, cols: size.map(|s| s.0), rows: size.map(|s| s.1) })
     });
 }
 

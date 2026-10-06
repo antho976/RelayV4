@@ -278,6 +278,56 @@ impl Drop for WatchLease {
     }
 }
 
+/// PTY sizes this connection borrowed with `session.resize {until_detach}`: a phone fits an
+/// agent's terminal to its own screen while it looks at it. Each is handed back when the
+/// connection detaches from the session or goes away, however it goes, unless someone resized
+/// the PTY since: their size is the newer wish.
+#[derive(Default)]
+struct Borrowed(std::collections::HashMap<String, BorrowedSize>);
+struct BorrowedSize {
+    pty: Arc<crate::pty::Pty>,
+    before: (u16, u16),
+    set: (u16, u16),
+}
+impl Borrowed {
+    /// After a successful resize: `prior` is the PTY and its size before it.
+    fn resized(&mut self, p: &relay_bus::ops::session::ResizeIn, prior: Option<(Arc<crate::pty::Pty>, (u16, u16))>) {
+        let Some((pty, before)) = prior else { return };
+        if p.until_detach != Some(true) {
+            // A size set for good ends the loan; there is nothing left to hand back.
+            self.0.remove(&p.session);
+            return;
+        }
+        let set = (p.cols.max(2), p.rows.max(2));
+        match self.0.get_mut(&p.session) {
+            // Still the same process: keep the size from before the first borrow.
+            Some(held) if Arc::ptr_eq(&held.pty, &pty) => held.set = set,
+            _ => {
+                self.0.insert(p.session.clone(), BorrowedSize { pty, before, set });
+            }
+        }
+    }
+    fn release(&mut self, session: &str) {
+        if let Some(held) = self.0.remove(session) {
+            held.hand_back();
+        }
+    }
+}
+impl BorrowedSize {
+    fn hand_back(self) {
+        if !self.pty.exited() && self.pty.size() == self.set {
+            let _ = self.pty.resize(self.before.0, self.before.1);
+        }
+    }
+}
+impl Drop for Borrowed {
+    fn drop(&mut self) {
+        for (_, held) in self.0.drain() {
+            held.hand_back();
+        }
+    }
+}
+
 async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) -> Result<()> {
     // The blocking dispatch keeps this Arc until its ownership update completes,
     // even if the socket task is cancelled while that dispatch is in flight.
@@ -331,6 +381,8 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) -> Result<()> {
 
     let mut attached_mirrors: std::collections::HashMap<relay_bus::types::Id, MirrorAttachment> =
         std::collections::HashMap::new();
+    // Dropped with the connection, which is when a borrowed size goes back.
+    let mut borrowed = Borrowed::default();
 
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
@@ -514,7 +566,24 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) -> Result<()> {
                     if let Some(h) = attached.remove(name) {
                         h.abort();
                     }
+                    borrowed.release(name);
                 }
+            }
+            resp
+        } else if req.op == relay_bus::ops::session::Resize::NAME {
+            let parsed = serde_json::from_value::<relay_bus::ops::session::ResizeIn>(req.payload.clone()).ok();
+            let prior = parsed.as_ref().and_then(|p| engine.pty_named(&p.session)).map(|(_, pty)| {
+                let size = pty.size();
+                (pty, size)
+            });
+            let resp = if engine.answers_from_memory(&req) {
+                engine.dispatch(req, Door::Socket)
+            } else {
+                let e = engine.clone();
+                tokio::task::spawn_blocking(move || e.dispatch(req, Door::Socket)).await?
+            };
+            if let (true, Some(p)) = (resp.ok, parsed) {
+                borrowed.resized(&p, prior);
             }
             resp
         } else if req.op == relay_bus::ops::device::MirrorStart::NAME {

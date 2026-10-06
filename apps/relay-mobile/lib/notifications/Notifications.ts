@@ -94,8 +94,8 @@ export function useAppStateNotificationObserver() {
             const data = response.notification.request.content.data
             if (useAuth) return
             if (data?.relay) {
-                // An agent on the PC needs a decision: land on the PC tab.
-                router.navigate('/screens/RelayScreen')
+                // An agent on the PC needs a decision: land on the home screen, the PC's.
+                if (router.canDismiss()) router.dismissAll()
                 return
             }
             if (chatActive ?? autoLoad) return

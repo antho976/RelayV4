@@ -52,4 +52,11 @@ module.exports = defineConfig([
             'i18next/no-literal-string': ['warn', i18nRules],
         },
     },
+    {
+        // The PC tab is written in literal English by design; the rule only buries real warnings.
+        files: ['app/screens/RelayScreen/**/*.{tsx,ts}', 'app/components/relay/**/*.{tsx,ts}'],
+        rules: {
+            'i18next/no-literal-string': 'off',
+        },
+    },
 ])

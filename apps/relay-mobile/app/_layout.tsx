@@ -3,6 +3,7 @@ import { setOptions } from 'expo-splash-screen'
 import { GestureHandlerRootView } from 'react-native-gesture-handler'
 import { KeyboardProvider } from 'react-native-keyboard-controller'
 
+import { ConfirmHost, HoldSheet } from '@components/relay'
 import { AlertProvider } from '@components/views/Alert'
 import { PortalHost } from '@components/views/Portal'
 import { useAppStateNotificationObserver } from '@lib/notifications/Notifications'
@@ -40,6 +41,8 @@ const Layout = () => {
                     <Stack.Screen name="index" options={{ animation: 'fade' }} />
                 </Stack>
                 <PortalHost />
+                <HoldSheet />
+                <ConfirmHost />
             </KeyboardProvider>
         </GestureHandlerRootView>
     )

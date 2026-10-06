@@ -1,3 +1,4 @@
+import { useRouter } from 'expo-router'
 import React, { useState } from 'react'
 import { ScrollView, StyleSheet, Text, View } from 'react-native'
 import { useMMKVBoolean } from 'react-native-mmkv'
@@ -5,6 +6,7 @@ import { SafeAreaView } from 'react-native-safe-area-context'
 
 import ThemedButton from '@components/buttons/ThemedButton'
 import ThemedSwitch from '@components/input/ThemedSwitch'
+import { relayHref } from '@components/relay'
 import HeaderTitle from '@components/views/HeaderTitle'
 import { AppSettings } from '@lib/constants/GlobalValues'
 import { useRelayHostsStore } from '@lib/state/RelayHosts'
@@ -20,6 +22,7 @@ import PairSheet from './PairSheet'
 const HostsScreen = () => {
     const styles = useStyles()
     const { spacing } = Theme.useTheme()
+    const router = useRouter()
     const hosts = useRelayHostsStore((state) => state.hosts)
     const [keepOn, setKeepOn] = useMMKVBoolean(AppSettings.RelayKeepScreenOn)
     const [notify, setNotify] = useMMKVBoolean(AppSettings.RelayNotify)
@@ -48,6 +51,13 @@ const HostsScreen = () => {
                     onPress={() => setShowPair(true)}
                 />
 
+                <ThemedButton
+                    label="PC settings"
+                    iconName="setting"
+                    variant="secondary"
+                    onPress={() => router.push(relayHref('PcSettings'))}
+                />
+
                 <View style={styles.section}>
                     <Text style={styles.heading}>On this phone</Text>
                     <ThemedSwitch
@@ -66,7 +76,7 @@ const HostsScreen = () => {
 
                 <Text style={styles.footnote}>
                     Chats and on-device models stay on this phone. The PC link carries only what you
-                    do on the PC tab, and every action is logged on the desktop as yours.
+                    do on the PC screens, and every action is logged on the desktop as yours.
                 </Text>
             </ScrollView>
         </SafeAreaView>

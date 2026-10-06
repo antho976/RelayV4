@@ -142,6 +142,7 @@ export enum AppSettings {
     LocalFirstFallback = 'settings-local-first-fallback',
     RelayKeepScreenOn = 'settings-relay-keep-screen-on',
     RelayNotify = 'settings-relay-notify',
+    RelayFitTerminal = 'settings-relay-fit-terminal',
 }
 
 /**
@@ -179,6 +180,7 @@ export const AppSettingsDefault: Record<AppSettings, boolean> = {
     [AppSettings.LocalFirstFallback]: true,
     [AppSettings.RelayKeepScreenOn]: true,
     [AppSettings.RelayNotify]: true,
+    [AppSettings.RelayFitTerminal]: true,
 }
 
 export const CLAUDE_VERSION = '2023-06-01'

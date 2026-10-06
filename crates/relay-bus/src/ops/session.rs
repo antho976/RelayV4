@@ -155,12 +155,22 @@ op!(Detach, "session.detach", NameIn => Empty, OpMeta::query(Scope::Session, 3, 
 payload!(#[schemars(rename = "SessionInputIn")] InputIn { pub session: String, pub data: String });
 op!(Input, "session.input", InputIn => Empty,
     OpMeta::mutation(Scope::Session, 3, "Text to the PTY").audit(Audit::AgentOnly).actors(Actors::UserOnly).emits(&["session.changed"]));
-payload!(#[schemars(rename = "SessionResizeIn")] ResizeIn { pub session: String, pub cols: u16, pub rows: u16 });
+payload!(#[schemars(rename = "SessionResizeIn")] ResizeIn {
+    pub session: String, pub cols: u16, pub rows: u16,
+    /// Borrow the size: on a connection door, the PTY goes back to the size it had when this
+    /// connection detaches from the session or goes away, unless someone resized it since.
+    pub until_detach: Option<bool>,
+});
 op!(Resize, "session.resize", ResizeIn => Empty,
-    OpMeta::mutation(Scope::Session, 3, "Resize the PTY").audit(Audit::AgentOnly).actors(Actors::UserOnly));
+    OpMeta::mutation(Scope::Session, 3, "Resize the PTY, for good or until this connection detaches").audit(Audit::AgentOnly).actors(Actors::UserOnly));
 payload!(#[schemars(rename = "SessionScrollbackIn")] ScrollbackIn { pub session: String, pub lines: Option<u32> });
-result!(#[schemars(rename = "SessionScrollbackOut")] ScrollbackOut { pub text: String, pub epoch: u64, pub seq: u64 });
-op!(Scrollback, "session.scrollback", ScrollbackIn => ScrollbackOut, OpMeta::query(Scope::Session, 3, "Scrollback text and the (epoch, seq) it ends at"));
+result!(#[schemars(rename = "SessionScrollbackOut")] ScrollbackOut {
+    pub text: String, pub epoch: u64, pub seq: u64,
+    /// The live PTY's size; absent when the text comes from a saved scrollback.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub cols: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub rows: Option<u16>,
+});
+op!(Scrollback, "session.scrollback", ScrollbackIn => ScrollbackOut, OpMeta::query(Scope::Session, 3, "Scrollback text, the (epoch, seq) it ends at, and the PTY's size"));
 result!(#[schemars(rename = "SessionRestorable")] Restorable { pub session: Session, pub reason: String, pub worktree_dirty: bool });
 result!(#[schemars(rename = "SessionRestorableOut")] RestorableOut { pub sessions: Vec<Restorable> });
 op!(RestorableList, "session.restorable", Empty => RestorableOut, OpMeta::query(Scope::Global, 6, "Sessions offering resume at launch"));

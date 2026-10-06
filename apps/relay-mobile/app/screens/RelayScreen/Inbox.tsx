@@ -4,6 +4,7 @@ import React, { useCallback, useEffect, useState } from 'react'
 import { RefreshControl, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native'
 import { SafeAreaView } from 'react-native-safe-area-context'
 
+import { relayHref } from '@components/relay'
 import HeaderButton from '@components/views/HeaderButton'
 import HeaderTitle from '@components/views/HeaderTitle'
 import { relay, RelayNotification, useRelayStore } from '@lib/engine/Relay/RelayClient'
@@ -17,6 +18,97 @@ const ICONS: Record<string, AntDesignIconName> = {
     agent_done: 'check-circle',
     agent_blocked: 'exclamation-circle',
     guardrail: 'safety',
+    integration: 'experiment',
+    provider: 'api',
+    disk: 'hdd',
+}
+
+/** A notification as notify.list returns it: the store's row plus its deep link. */
+type Notification = RelayNotification & {
+    link?: { op: string; payload?: Record<string, any> } | null
+}
+
+type Href = { pathname: string; params: Record<string, string> }
+
+const screen = (page: string, params: Record<string, string> = {}): Href => ({
+    pathname: `/screens/RelayScreen/${page}`,
+    params: params,
+})
+
+/**
+ * The desktop's pages (`ui.page.switch` → types::Page, plus the page names the desktop uses
+ * for itself) as the phone's per-project screens; tools.rs `notifications()`.
+ */
+const PAGES: Record<string, string> = {
+    agents: 'Project',
+    dashboard: 'Project',
+    code: 'Git',
+    git: 'Git',
+    files: 'Files',
+    board: 'Board',
+    plan: 'Board',
+    modules: 'Modules',
+    notes: 'Notes',
+    mailbox: 'Mailbox',
+    guardrails: 'Guardrails',
+    integration: 'Integration',
+    devices: 'Devices',
+    skills: 'Skills',
+    plugins: 'Plugins',
+    settings: 'ProjectSettings',
+}
+
+/**
+ * Where a notification leads on the phone, as the desktop's "Open" does: its link first
+ * (a page, a task, a session, a hold), else a page for its category. Pages without a phone
+ * screen fall back to the project hub; undefined when there is nowhere to go.
+ */
+const notificationHref = (item: Notification): Href | undefined => {
+    const link = item.link
+    const payload = link?.payload ?? {}
+    const projectId = payload.project_id ?? item.project_id
+    const project = projectId === null || projectId === undefined ? undefined : String(projectId)
+    const inProject = (page: string) =>
+        project ? screen(page, { project_id: project }) : undefined
+    switch (link?.op) {
+        case 'ui.page.switch': {
+            const page = String(payload.page ?? '')
+            if (!project) {
+                if (page === 'settings') return screen('PcSettings')
+                if (page === 'skills') return screen('Skills')
+                if (page === 'plugins') return screen('Plugins')
+                return undefined
+            }
+            return inProject(PAGES[page] ?? 'Project')
+        }
+        case 'task.get':
+            if (payload.task_id !== undefined)
+                return screen('Task', {
+                    task_id: String(payload.task_id),
+                    ...(project ? { project_id: project } : {}),
+                })
+            break
+        case 'session.get':
+        case 'session.brief':
+            if (payload.session) return screen('Terminal', { session: String(payload.session) })
+            break
+        case 'guardrail.confirm':
+        case 'guardrail.hold.get':
+            return inProject('Guardrails')
+    }
+    switch (item.category) {
+        case 'agent_done':
+        case 'agent_blocked':
+            return inProject('Board')
+        case 'integration':
+            return inProject('Integration')
+        case 'guardrail':
+            return inProject('Guardrails')
+        case 'provider':
+            return relayHref('PcSettings')
+        default:
+            return inProject('Project')
+    }
 }
 
 /**
@@ -31,17 +123,16 @@ const InboxScreen = () => {
     const status = useRelayStore((state) => state.status)
     const holds = useRelayStore((state) => state.holds)
     const inReview = useRelayStore((state) => state.inReview)
-    const [items, setItems] = useState<RelayNotification[]>([])
+    const [items, setItems] = useState<Notification[]>([])
     const [loading, setLoading] = useState(false)
 
     const load = useCallback(async () => {
         if (status !== 'online') return
         setLoading(true)
         try {
-            const result = await relay.request<{ notifications: RelayNotification[] }>(
-                'notify.list',
-                { limit: 50 }
-            )
+            const result = await relay.request<{ notifications: Notification[] }>('notify.list', {
+                limit: 50,
+            })
             setItems(result.notifications)
             await relay.refreshAttention()
         } catch (e) {
@@ -67,7 +158,13 @@ const InboxScreen = () => {
 
     const unread = items.filter((item) => !item.read).length
 
-    const ack = async (item: RelayNotification) => {
+    const open = (item: Notification) => {
+        ack(item)
+        const href = notificationHref(item)
+        if (href) router.push(href)
+    }
+
+    const ack = async (item: Notification) => {
         if (item.read) return
         // Read at once on the phone; the PC catches up.
         setItems((list) => list.map((n) => (n.id === item.id ? { ...n, read: true } : n)))
@@ -147,44 +244,57 @@ const InboxScreen = () => {
                             Notifications{unread > 0 ? ` · ${unread} new` : ''}
                         </Text>
                         <View style={styles.list}>
-                            {items.map((item, index) => (
-                                <TouchableOpacity
-                                    key={item.id}
-                                    activeOpacity={item.read ? 1 : 0.6}
-                                    style={[
-                                        styles.item,
-                                        index > 0 && styles.itemDivider,
-                                        item.read && { opacity: 0.55 },
-                                    ]}
-                                    onPress={() => ack(item)}>
-                                    <AntDesign
-                                        name={ICONS[item.category] ?? 'bell'}
-                                        size={18}
-                                        color={item.read ? color.text._500 : color.text._200}
-                                    />
-                                    <View style={{ flex: 1, rowGap: 2 }}>
-                                        <View style={styles.itemHead}>
-                                            <Text numberOfLines={1} style={styles.title}>
-                                                {item.title}
-                                            </Text>
-                                            <Text style={styles.when}>{ago(item.created_at)}</Text>
-                                        </View>
-                                        {!!item.body && (
-                                            <Text numberOfLines={4} style={styles.body}>
-                                                {item.body}
-                                            </Text>
-                                        )}
-                                    </View>
-                                    {!item.read && (
-                                        <View
-                                            style={[
-                                                styles.dot,
-                                                { backgroundColor: color.primary._500 },
-                                            ]}
+                            {items.map((item, index) => {
+                                const href = notificationHref(item)
+                                return (
+                                    <TouchableOpacity
+                                        key={item.id}
+                                        activeOpacity={item.read && !href ? 1 : 0.6}
+                                        style={[
+                                            styles.item,
+                                            index > 0 && styles.itemDivider,
+                                            item.read && { opacity: 0.55 },
+                                        ]}
+                                        onPress={() => open(item)}>
+                                        <AntDesign
+                                            name={ICONS[item.category] ?? 'bell'}
+                                            size={18}
+                                            color={item.read ? color.text._500 : color.text._200}
                                         />
-                                    )}
-                                </TouchableOpacity>
-                            ))}
+                                        <View style={{ flex: 1, rowGap: 2 }}>
+                                            <View style={styles.itemHead}>
+                                                <Text numberOfLines={1} style={styles.title}>
+                                                    {item.title}
+                                                </Text>
+                                                <Text style={styles.when}>
+                                                    {ago(item.created_at)}
+                                                </Text>
+                                            </View>
+                                            {!!item.body && (
+                                                <Text numberOfLines={4} style={styles.body}>
+                                                    {item.body}
+                                                </Text>
+                                            )}
+                                        </View>
+                                        {!item.read && (
+                                            <View
+                                                style={[
+                                                    styles.dot,
+                                                    { backgroundColor: color.primary._500 },
+                                                ]}
+                                            />
+                                        )}
+                                        {href && (
+                                            <AntDesign
+                                                name="right"
+                                                size={14}
+                                                color={color.text._500}
+                                                style={{ marginTop: 3 }}
+                                            />
+                                        )}
+                                    </TouchableOpacity>
+                                )
+                            })}
                         </View>
                     </View>
                 )}

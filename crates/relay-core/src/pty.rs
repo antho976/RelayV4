@@ -7,7 +7,7 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -151,6 +151,13 @@ pub struct Pty {
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
     writer: Mutex<Option<Box<dyn Write + Send>>>,
     started: Instant,
+    /// The size last set, `cols << 16 | rows`: a client that resizes for itself (a phone)
+    /// reads it first so it can hand the terminal back as it found it.
+    size: AtomicU32,
+}
+
+fn pack_size(cols: u16, rows: u16) -> u32 {
+    (cols as u32) << 16 | rows as u32
 }
 
 /// What `attach` hands a subscriber: catch-up bytes, where they end, and the live feed.
@@ -166,8 +173,9 @@ impl Pty {
     /// reaped (with its exit code, `None` if killed by signal).
     pub fn spawn(spec: SpawnSpec, on_exit: impl FnOnce(Option<i32>) + Send + 'static) -> Result<Arc<Pty>> {
         let sys = native_pty_system();
+        let (cols, rows) = (spec.cols.max(2), spec.rows.max(2));
         let pair = sys
-            .openpty(PtySize { rows: spec.rows.max(2), cols: spec.cols.max(2), pixel_width: 0, pixel_height: 0 })
+            .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
             .map_err(|e| anyhow!("openpty: {e}"))?;
         let mut cmd = CommandBuilder::new(&spec.cmd);
         cmd.args(&spec.args);
@@ -238,6 +246,7 @@ impl Pty {
             master: Mutex::new(Some(pair.master)),
             writer: Mutex::new(Some(writer)),
             started: Instant::now(),
+            size: AtomicU32::new(pack_size(cols, rows)),
         }))
     }
 
@@ -296,10 +305,20 @@ impl Pty {
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+        let (cols, rows) = (cols.max(2), rows.max(2));
         let m = self.master.lock().unwrap();
         let m = m.as_ref().ok_or_else(|| anyhow!("pty is closed"))?;
-        m.resize(PtySize { rows: rows.max(2), cols: cols.max(2), pixel_width: 0, pixel_height: 0 })
-            .map_err(|e| anyhow!("resize: {e}"))
+        m.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+            .map_err(|e| anyhow!("resize: {e}"))?;
+        // Under the master lock, so two resizes cannot record each other's size.
+        self.size.store(pack_size(cols, rows), Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// `(cols, rows)` as last set by spawn or [`Pty::resize`].
+    pub fn size(&self) -> (u16, u16) {
+        let packed = self.size.load(Ordering::SeqCst);
+        ((packed >> 16) as u16, packed as u16)
     }
 
     /// Subscribe with bounded catch-up since (`from_epoch`, `from_seq`) plus the live feed.
