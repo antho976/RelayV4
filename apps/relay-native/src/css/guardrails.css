@@ -26,12 +26,18 @@
 .guardrail-grant { border-left: 2px solid @live; padding: 10px 14px; }
 .guardrail-grant .body { font-weight: 600; }
 
-/* The prompt: floats bottom-right over whatever you are doing, never takes focus. */
+/* The prompt: floats bottom-right over whatever you are doing, never takes focus. It is the one
+   floating surface here, so it is softened: rounded, a diffuse shadow, and it slides and fades
+   in and out (guardrail_pages::prompt_slot) rather than popping. Each card carries its own gap,
+   so the gap closes with it. */
 .guardrail-tray { background: transparent; }
-.guardrail-prompt { background: @console; border: 1px solid @edge; border-top: 2px solid @waiting; padding: 14px 16px 12px; box-shadow: 0 10px 30px alpha(black, .45); }
-.guardrail-prompt .guardrail-subject { font-size: 11px; }
-.guardrail-prompt button.icon-key { min-width: 26px; padding: 0; }
-button.guardrail-more { background: @console; border: 1px solid @edge; color: @ink; }
+.guardrail-prompt { margin-top: 8px; background: @console; border: 1px solid @strong; border-top: 2px solid alpha(@waiting, .8); border-radius: 10px; padding: 14px 16px 12px; box-shadow: 0 14px 36px alpha(black, .28), 0 2px 8px alpha(black, .18); opacity: 1; transition: opacity 260ms cubic-bezier(0.16, 1, 0.3, 1); }
+.guardrail-prompt.leaving { opacity: 0; transition: opacity 180ms cubic-bezier(0.4, 0, 1, 1); }
+.guardrail-prompt .guardrail-subject { font-size: 11px; border-radius: 6px; }
+.guardrail-prompt button { border-radius: 6px; }
+.guardrail-prompt button.icon-key { min-width: 26px; padding: 0; border-radius: 99px; }
+.guardrail-prompt .guardrail-deny entry { border-radius: 6px; }
+button.guardrail-more { margin-top: 8px; background: @console; border: 1px solid @strong; border-radius: 99px; color: @ink; box-shadow: 0 6px 18px alpha(black, .22); }
 
 /* The layered editor. */
 .guardrail-editor { margin-top: 4px; }

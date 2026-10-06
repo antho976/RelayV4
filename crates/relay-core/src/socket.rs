@@ -195,6 +195,15 @@ fn payload_matches(payload: &serde_json::Value, matching: Option<&serde_json::Va
     wanted.iter().all(|(key, value)| payload.get(key) == Some(value))
 }
 
+/// The exception request a `bus.wait` is waiting on: `guardrail.request_resolved` with a
+/// `request_id` to match. That answer is stored, so a wait begun after it can still see it.
+fn exception_waited(filter: &Filter, matching: Option<&serde_json::Value>) -> Option<relay_bus::types::Id> {
+    if filter.0.is_empty() || !filter.matches(crate::guardrail::grants::RESOLVED_EVENT) {
+        return None;
+    }
+    matching?.get("request_id")?.as_i64()
+}
+
 /// Event filter for `bus.subscribe {events}`: exact, `prefix.*`, or `*`. Empty = everything.
 #[derive(Clone, Default)]
 struct Filter(Vec<String>);
@@ -400,7 +409,22 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) -> Result<()> {
                         p.timeout_ms.unwrap_or(60_000).clamp(1_000, 3_600_000),
                     );
                     let mut rx = engine.subscribe();
+                    // Subscribed first, so an answer is either already stored or still to come.
+                    let answered = match exception_waited(&filter, p.matching.as_ref()) {
+                        Some(id) => {
+                            let e = engine.clone();
+                            tokio::task::spawn_blocking(move || {
+                                crate::guardrail::grants::resolved_event(&e.store.lock(), id)
+                            })
+                            .await?
+                            .filter(|ev| payload_matches(&ev.payload, p.matching.as_ref()))
+                        }
+                        None => None,
+                    };
                     let waited = tokio::time::timeout(timeout, async {
+                        if answered.is_some() {
+                            return answered;
+                        }
                         loop {
                             match rx.recv().await {
                                 Ok(ev) if filter.matches(&ev.ev) && payload_matches(&ev.payload, p.matching.as_ref()) => return Some(ev),

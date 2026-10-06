@@ -309,6 +309,34 @@ pub fn by_id(conn: &Connection, id: Id) -> Result<GuardrailException, BusError> 
     Ok(exception(&hold))
 }
 
+/// The `guardrail.request_resolved` event a waiter would have seen had it been listening when
+/// the person answered. `None` while the request is still open, or when `id` is no request.
+/// `bus.wait` asks this first: a person who approves within a second of the ask answers
+/// before the agent's wait subscribes, and that wait would otherwise sleep to its timeout.
+pub fn resolved_event(conn: &Connection, id: Id) -> Option<relay_bus::envelope::Event> {
+    let hold = super::hold_by_id(conn, id).ok().filter(|hold| hold.op == OP)?;
+    let answered = exception(&hold);
+    let payload = match hold.state {
+        HoldState::Open => return None,
+        HoldState::Confirmed if answered.revoked_at.is_some() => {
+            json!({"request_id": id, "session": hold.session, "state": "revoked"})
+        }
+        HoldState::Confirmed => {
+            json!({"request_id": id, "session": hold.session, "state": "confirmed", "scope": answered.scope})
+        }
+        HoldState::Rejected => json!({
+            "request_id": id, "session": hold.session, "state": "rejected", "reason": answered.denial_reason,
+        }),
+        HoldState::Expired => json!({"request_id": id, "session": hold.session, "state": "expired"}),
+    };
+    let ts = answered.revoked_at.or(hold.resolved_at).unwrap_or(hold.created_at);
+    let mut event = relay_bus::envelope::Event::new(
+        RESOLVED_EVENT, ts, hold.resolved_by.unwrap_or(Actor::System), payload,
+    );
+    event.project_id = hold.project_id;
+    Some(event)
+}
+
 /// The suggestion an agent gets with a refusal it could ask past: which `kind` and `value` a
 /// `guardrail.request` should carry. `None` for a policy no grant lifts.
 pub fn suggestion(policy: &str, details: &Value) -> Option<(ExceptionKind, String)> {
