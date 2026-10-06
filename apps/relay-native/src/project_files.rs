@@ -605,7 +605,6 @@ pub(super) fn indent_guides(depth: usize) -> gtk::DrawingArea {
     let guides = gtk::DrawingArea::new();
     guides.set_content_width(depth as i32 * INDENT);
     guides.set_content_height(1);
-    guides.set_vexpand(true);
     guides.add_css_class("tree-guides");
     guides.set_draw_func(move |widget, cr, _, height| {
         let color = widget.color();

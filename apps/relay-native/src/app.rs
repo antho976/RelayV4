@@ -328,6 +328,16 @@ pub fn run(rt: Handle) -> glib::ExitCode {
         }
         if let Some(settings) = gtk::Settings::default() {
             settings.set_gtk_icon_theme_name(Some("Adwaita"));
+            // The bundled Fira files carry no hinting instructions, and GTK's automatic mode
+            // places glyphs unhinted at fractional positions: on a 1x screen the small
+            // captions and figures lose their tops. Slight autohinting on whole pixels keeps
+            // them crisp, and is indistinguishable at 2x.
+            settings.set_gtk_font_rendering(gtk::FontRendering::Manual);
+            settings.set_gtk_hint_font_metrics(true);
+            settings.set_gtk_xft_antialias(1);
+            settings.set_gtk_xft_hinting(1);
+            settings.set_gtk_xft_hintstyle(Some("hintslight"));
+            settings.set_gtk_xft_rgba(Some("none"));
         }
         let provider = gtk::CssProvider::new();
         provider.connect_parsing_error(|_, _, e| tracing::error!("stylesheet: {e}"));

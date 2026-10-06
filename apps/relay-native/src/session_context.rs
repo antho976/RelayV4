@@ -137,17 +137,19 @@ impl Ui {
 fn render(card: &gtk::Box, session: &Value, task: Option<&Value>, report: Option<&Value>, restore: Option<&Value>) {
     card.append(&label("WHERE IT LEFT OFF", "slate-context-title"));
     let grid = gtk::Grid::new();
-    grid.set_column_spacing(12);
-    grid.set_row_spacing(6);
+    grid.set_column_spacing(14);
+    grid.set_row_spacing(7);
     let mut row = 0;
     let mut add = |key: &str, value: &str, class: &str, lines: i32| {
+        // Caption and first line of the value share a baseline, whatever their sizes.
         let caption = label(key, "slate-context-key");
-        caption.set_valign(gtk::Align::Start);
+        caption.set_valign(gtk::Align::BaselineFill);
         grid.attach(&caption, 0, row, 1, 1);
         let shown = label(value, "slate-context-value");
         if !class.is_empty() {
             shown.add_css_class(class);
         }
+        shown.set_valign(gtk::Align::BaselineFill);
         shown.set_hexpand(true);
         shown.set_wrap(true);
         shown.set_wrap_mode(gtk::pango::WrapMode::WordChar);
@@ -205,8 +207,9 @@ fn render(card: &gtk::Box, session: &Value, task: Option<&Value>, report: Option
         .find(|ts| !ts.is_empty());
     if let Some(ts) = active {
         let mut value = relative_time(ts);
+        // "Sep 27 · Sep 27, 15:48" says the date twice; the stamp alone is enough.
         if let Some(stamp) = local_stamp(ts).filter(|s| *s != value) {
-            value = format!("{value} · {stamp}");
+            value = if stamp.starts_with(&value) { stamp } else { format!("{value} · {stamp}") };
         }
         add("LAST ACTIVE", &value, "", 1);
     }

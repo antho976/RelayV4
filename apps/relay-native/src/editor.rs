@@ -763,6 +763,9 @@ impl Editor {
             let chevron = gtk::Box::new(gtk::Orientation::Horizontal, 0);
             chevron.add_css_class("tree-chevron");
             chevron.set_size_request(project_files::INDENT + 4, -1);
+            // The arrow inside expands to centre itself; stop that reaching the row, or the
+            // chevron shares the spare width with the name and the folder drifts right.
+            chevron.set_hexpand(false);
             content.append(&chevron);
             let glyph = gtk::Box::new(gtk::Orientation::Horizontal, 0);
             glyph.add_css_class("tree-glyph");

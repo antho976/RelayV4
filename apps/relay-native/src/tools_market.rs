@@ -149,6 +149,8 @@ fn build(ui: &Rc<Ui>, spec: &'static Spec) -> Rc<Market> {
     head.add_css_class("ext-head");
     let tile = gtk::Box::new(gtk::Orientation::Vertical, 0);
     tile.add_css_class("ext-tile");
+    // A box packs its child at the top of the min-height; a bin layout centres it both ways.
+    tile.set_layout_manager(Some(gtk::BinLayout::new()));
     tile.set_valign(gtk::Align::Center);
     let glyph = crate::icons::image(spec.icon, 20);
     glyph.set_valign(gtk::Align::Center);
@@ -970,6 +972,7 @@ pub(crate) fn state_box(
     state.set_halign(gtk::Align::Center);
     let tile = gtk::Box::new(gtk::Orientation::Vertical, 0);
     tile.add_css_class("ext-tile");
+    tile.set_layout_manager(Some(gtk::BinLayout::new()));
     tile.set_halign(gtk::Align::Center);
     let glyph = crate::icons::image(icon, 18);
     glyph.set_valign(gtk::Align::Center);
