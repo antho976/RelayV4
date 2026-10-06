@@ -62,7 +62,8 @@ fn avd_catalog_create_list_and_boot_use_configured_sdk_tools() {
     let emulator = root.path().join("emulator");
     let avdmanager = root.path().join("avdmanager");
     executable(&adb, "if [ \"$1\" = \"devices\" ]; then echo 'List of devices attached'; fi");
-    executable(&emulator, "if [ \"$1\" = \"-list-avds\" ]; then echo 'Pixel_9_API_35'; fi");
+    let boot_log = root.path().join("emulator-boot.log");
+    executable(&emulator, &format!("if [ \"$1\" = \"-list-avds\" ]; then echo 'Pixel_9_API_35'; else echo \"$@\" > '{}'; fi", boot_log.display()));
     executable(&avdmanager, "if [ \"$1\" = \"list\" ]; then echo 'pixel_9'; fi\nexit 0");
     for (path, value) in [
         ("device.sdk_path", sdk.display().to_string()),
@@ -78,6 +79,24 @@ fn avd_catalog_create_list_and_boot_use_configured_sdk_tools() {
     let created = ok(&engine, "avd.create", json!({"name":"New_API_35","package":"system-images;android-35;google_apis;x86_64","device":"pixel_9"}));
     assert_eq!(created["name"], "New_API_35");
     ok(&engine, "avd.boot", json!({"name":"Pixel_9_API_35","cold":true}));
+    // Booted headless, so the mirror is the only window the emulator gets.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while fs::read_to_string(&boot_log).map_or(true, |text| !text.ends_with('\n')) && std::time::Instant::now() < deadline { std::thread::sleep(std::time::Duration::from_millis(20)); }
+    assert_eq!(fs::read_to_string(&boot_log).unwrap().trim(), "@Pixel_9_API_35 -no-window -no-snapshot-load");
+
+    // With no emulator window, avd.stop is how a running AVD shuts down.
+    let err = call(&engine, "avd.stop", json!({"name":"Pixel_9_API_35"})).into_result().unwrap_err();
+    assert_eq!(err.code, "avd.not_running");
+    let kill_log = root.path().join("adb-kill.log");
+    executable(&adb, &format!(
+        "case \"$*\" in\n  'devices -l') printf 'List of devices attached\\nemulator-5554 device product:sdk model:sdk_gphone64\\n' ;;\n  '-s emulator-5554 emu avd name') printf 'Pixel_9_API_35\\nOK\\n' ;;\n  '-s emulator-5554 emu kill') echo \"$*\" > '{}' ;;\nesac",
+        kill_log.display()
+    ));
+    assert_eq!(ok(&engine, "avd.list", json!({}))["avds"][0]["running_serial"], "emulator-5554");
+    ok(&engine, "avd.stop", json!({"name":"Pixel_9_API_35"}));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while fs::read_to_string(&kill_log).map_or(true, |text| !text.ends_with('\n')) && std::time::Instant::now() < deadline { std::thread::sleep(std::time::Duration::from_millis(20)); }
+    assert_eq!(fs::read_to_string(&kill_log).unwrap().trim(), "-s emulator-5554 emu kill");
 }
 
 #[test]

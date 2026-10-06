@@ -165,3 +165,26 @@
 .ext-page switch > slider { min-width: 14px; min-height: 14px; margin: 1px; border: 0; border-radius: 0; background: @faint; background-image: none; box-shadow: none; }
 .ext-page switch:hover > slider { background: @secondary; }
 .ext-page switch:checked > slider { background: @wall; }
+
+/* ── Devices (tools_devices.rs) ───────────────────────────────────────────────
+   Phones and virtual devices share one list: lamp, name over facts, actions. */
+.device-list { margin-top: 2px; }
+.device-row { min-height: 40px; padding: 6px 8px 6px 10px; background: @console; border: 1px solid @edge; border-radius: 2px; }
+.device-row button { min-height: 28px; }
+.device-row-name { color: @ink; font-size: 13px; font-weight: 600; }
+.device-row-facts { color: @faint; font-family: 'Fira Mono', monospace; font-size: 10px; }
+
+/* Build from: the chosen branch over its checkout, a tag for the last build. */
+menubutton.build-from > button { min-height: 40px; padding: 4px 10px; background: @console; border: 1px solid @edge; border-radius: 2px; }
+menubutton.build-from > button:hover, menubutton.build-from > button:checked { background: @wash; border-color: @strong; }
+menubutton.build-from image { color: @secondary; }
+.build-from-branch { color: @ink; font-size: 13px; font-weight: 600; }
+.build-from-path { color: @faint; font-family: 'Fira Mono', monospace; font-size: 10px; }
+.build-from-tag { padding: 1px 6px; border: 1px solid @strong; border-radius: 2px; color: @secondary; font-size: 10px; }
+.build-from-sheet { padding: 6px; min-width: 340px; }
+list.build-from-list { background: transparent; }
+list.build-from-list > row { padding: 6px 8px; border-radius: 2px; }
+list.build-from-list > row:hover, list.build-from-list > row:focus-visible { background: @wash; }
+list.build-from-list > row.chosen { background: @slab; box-shadow: inset 2px 0 @ink; }
+.build-from-mark { opacity: 0; color: @ink; }
+row.chosen .build-from-mark { opacity: 1; }

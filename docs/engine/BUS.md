@@ -871,7 +871,8 @@ All paths are relative to the worktree root; `..` and absolute paths are `invali
 | `avd.list` | query | `{}` → `{ avds: Avd[] }`; includes a running emulator serial when available |
 | `avd.catalog` | query | `{}` → `{ system_images, devices }`; installed SDK choices only |
 | `avd.create` | mutation · always | `{ name, package, device? }` → `Avd` |
-| `avd.boot` | mutation · always | `{ name, cold? }` → `{}`; the emulator then appears through `device.list` and uses the normal deploy pipeline |
+| `avd.boot` | mutation · always | `{ name, cold? }` → `{}`; boots headless (`-no-window`) — Relay's mirror is its screen. The emulator then appears through `device.list` and uses the normal deploy pipeline |
+| `avd.stop` | mutation · always | `{ name }` → `{}`; `adb emu kill` on the running AVD (`avd.not_running` otherwise), since a headless emulator has no window to close |
 
 ### 10.15 provider / usage / skill / plugin
 

@@ -57,6 +57,9 @@ op!(AvdCreate, "avd.create", AvdCreateIn => Avd,
 payload!(#[schemars(rename = "AvdBootIn")] AvdBootIn { pub name: String, pub cold: Option<bool> });
 op!(AvdBoot, "avd.boot", AvdBootIn => Empty,
     OpMeta::mutation(Scope::Global, 12, "Boot an Android Virtual Device").actors(Actors::UserOnly).emits(&["avd.changed"]));
+payload!(#[schemars(rename = "AvdStopIn")] AvdStopIn { pub name: String });
+op!(AvdStop, "avd.stop", AvdStopIn => Empty,
+    OpMeta::mutation(Scope::Global, 12, "Shut down a running Android Virtual Device").actors(Actors::UserOnly).emits(&["avd.changed"]));
 
 result!(#[schemars(rename = "DeviceLeasesOut")] LeasesOut { pub leases: Vec<DeviceLease> });
 op!(Leases, "device.leases", Empty => LeasesOut,
@@ -96,6 +99,7 @@ entries!(
     AvdCatalog,
     AvdCreate,
     AvdBoot,
+    AvdStop,
     Leases,
     Claim,
     Release

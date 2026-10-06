@@ -1004,6 +1004,7 @@ fn cases() -> Vec<Case> {
     fixed(&mut c, "avd.catalog", U, Mid, json!({}));
     fixed(&mut c, "avd.create", U, Mid, json!({"name": "perf", "package": "system-images;android-34;google_apis;x86_64"}));
     fixed(&mut c, "avd.boot", U, Mid, json!({"name": "perf"}));
+    fixed(&mut c, "avd.stop", U, Mid, json!({"name": "perf"}));
 
     // ---- provider / usage / skill / github / plugin
     fixed(&mut c, "provider.list", U, Cheap, json!({}));
