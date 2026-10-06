@@ -15,6 +15,11 @@ pub use settings::{editor as settings_editor, open_project_guardrails, open_work
 const TRAY: &str = "guardrail-requests";
 /// More than this many prompts at once is a queue, and the Guardrails page is the queue.
 const TRAY_LIMIT: usize = 3;
+/// How long a prompt takes to slide in, and to slide away once it is answered.
+const PROMPT_IN_MS: u32 = 260;
+const PROMPT_OUT_MS: u32 = 180;
+/// The name a prompt takes while it slides away, so it no longer counts as showing.
+const LEAVING: &str = "guardrail-leaving";
 
 fn paragraph(value: &str, class: &str) -> gtk::Label {
     let l = label(value, class);
@@ -499,7 +504,8 @@ fn tray(ui: &Rc<Ui>) -> gtk::Box {
         }
         child = widget.next_sibling();
     }
-    let tray = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    // No spacing: each card carries its own gap, so the gap closes with it as it slides away.
+    let tray = gtk::Box::new(gtk::Orientation::Vertical, 0);
     tray.set_widget_name(TRAY);
     tray.add_css_class("guardrail-tray");
     tray.set_halign(gtk::Align::End);
@@ -573,10 +579,73 @@ fn show_prompt(ui: &Rc<Ui>, request: &Value) {
         });
     } else {
         // The overflow line is re-added below, so it always ends the tray.
-        tray.append(&exception_card(ui, request, true));
+        tray.append(&prompt_slot(&exception_card(ui, request, true), id));
     }
     let hidden = WAITING.with(|w| w.borrow().len());
     update_overflow(ui, &tray, hidden);
+}
+
+/// A prompt card inside a revealer: it slides up and fades in on the next frame, rather than
+/// appearing all at once over whatever you are doing.
+fn prompt_slot(card: &gtk::Box, id: i64) -> gtk::Revealer {
+    let slot = gtk::Revealer::new();
+    slot.set_widget_name(&format!("guardrail-request-{id}"));
+    slot.set_transition_type(gtk::RevealerTransitionType::SlideUp);
+    slot.set_transition_duration(PROMPT_IN_MS);
+    card.add_css_class("leaving");
+    slot.set_child(Some(card));
+    // A revealer clips its child, shadow included. Clip only while sliding.
+    slot.connect_child_revealed_notify(|slot| {
+        if slot.is_child_revealed() {
+            slot.set_overflow(gtk::Overflow::Visible);
+        }
+    });
+    // Started from a frame callback so the hidden state is drawn once and the fade has
+    // something to fade from.
+    slot.add_tick_callback(|slot, _| {
+        if slot.widget_name() == LEAVING {
+            return glib::ControlFlow::Break;
+        }
+        slot.set_reveal_child(true);
+        if let Some(card) = slot.child() {
+            card.remove_css_class("leaving");
+        }
+        glib::ControlFlow::Break
+    });
+    slot
+}
+
+/// Slide a prompt away, then remove it. Without animations (or off screen) the revealer
+/// reports itself hidden at once, and it is removed at once.
+fn retire(tray: &gtk::Box, slot: &gtk::Widget) {
+    let Some(revealer) = slot.downcast_ref::<gtk::Revealer>() else {
+        tray.remove(slot);
+        return;
+    };
+    revealer.set_widget_name(LEAVING);
+    if !revealer.reveals_child() && !revealer.is_child_revealed() {
+        // Answered before its first frame: there is nothing to slide away.
+        tray.remove(revealer);
+        return;
+    }
+    revealer.set_can_target(false);
+    revealer.set_overflow(gtk::Overflow::Hidden);
+    if let Some(card) = revealer.child() {
+        card.add_css_class("leaving");
+    }
+    let weak = tray.downgrade();
+    revealer.connect_child_revealed_notify(move |revealer| {
+        if revealer.is_child_revealed() {
+            return;
+        }
+        if let Some(tray) = weak.upgrade() {
+            if revealer.parent().as_ref() == Some(tray.upcast_ref::<gtk::Widget>()) {
+                tray.remove(revealer);
+            }
+        }
+    });
+    revealer.set_transition_duration(PROMPT_OUT_MS);
+    revealer.set_reveal_child(false);
 }
 
 /// Take a request's prompt down (answered, expired, or put off), and let a waiting one in.
@@ -588,7 +657,7 @@ fn close_prompt(ui: &Rc<Ui>, id: i64) {
     while let Some(widget) = child {
         child = widget.next_sibling();
         if widget.widget_name() == format!("guardrail-request-{id}") {
-            tray.remove(&widget);
+            retire(&tray, &widget);
             removed = true;
         }
     }
