@@ -1479,9 +1479,11 @@ impl Ui {
                 }
             }
         }
+        let mut created = false;
         for s in &sessions {
             let name = text(s, "name");
             let new_pane = !self.panes.borrow().contains_key(name);
+            created |= new_pane;
             if new_pane {
                 let pane = Pane::new(name, self.path.clone(), self.rt.clone());
                 self.install_pane_controls(&pane, name);
@@ -1500,7 +1502,10 @@ impl Ui {
                     .insert(name.into(), signature);
             }
         }
-        if *self.ordered.borrow() != names {
+        // Only layout() puts a pane in a grid. A new pane whose name is already in `ordered` (a
+        // launch adopting its placeholder's slot, a restored layout) needs it as much as a new
+        // order does, or it stays off the wall until something else lays out.
+        if *self.ordered.borrow() != names || created {
             *self.ordered.borrow_mut() = names;
             self.layout();
         } else {
