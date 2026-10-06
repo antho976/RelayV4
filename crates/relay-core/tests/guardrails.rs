@@ -801,3 +801,55 @@ fn every_role_may_ask_for_an_exception_but_only_for_itself() {
     let bootstrap = ok(engine, Actor::agent(reviewer_name), "session.bootstrap", json!({}));
     assert!(bootstrap["guardrails"]["exceptions"].as_str().unwrap().contains("guardrail.request"));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_approval_that_lands_before_the_wait_still_wakes_it_and_explain_sees_it() {
+    use relay_core::socket::{Client, SocketServer};
+    let fixture = Fixture::new();
+    let engine = &fixture.engine;
+    let session = fixture.session("builder", "claude");
+    let name = session["name"].as_str().unwrap();
+    let agent = Actor::agent(name);
+    let sdk = "/opt/relay-grant-test/Sdk";
+    let plan = json!({"project_id": 1, "paths": [format!("{sdk}/cmdline-tools/latest/bin/sdkmanager")]});
+
+    let before = ok(engine, agent.clone(), "guardrail.explain", plan.clone());
+    assert_eq!(before["verdict"], "refuse");
+    assert_eq!(before["paths"][0]["policy"], "guardrail.write_root");
+    let id = ok(engine, agent.clone(), "guardrail.request", json!({
+        "kind": "path", "value": sdk, "reason": "install the emulator tools", "scope": "session",
+    }))["request"]["id"].as_i64().unwrap();
+    // The person answers within a second, before the agent's bus.wait subscribes.
+    ok(engine, Actor::User, "guardrail.confirm", json!({"hold_id": id}));
+
+    let dir = tempfile::tempdir().unwrap();
+    let server = SocketServer::start_in(engine.clone(), dir.path().to_path_buf()).await.unwrap();
+    let mut waiter = Client::connect(&server.path).await.unwrap();
+    let wait = Request::new(Actor::User, "bus.wait", json!({
+        "events": ["guardrail.request_resolved"], "matching": {"request_id": id}, "timeout_ms": 5000,
+    }));
+    let wait = waiter.call(&wait, |_| {});
+    let woken = tokio::time::timeout(std::time::Duration::from_secs(2), wait).await
+        .expect("a wait begun after the answer returns at once").unwrap();
+    let result = woken.result.unwrap();
+    assert_eq!(result["timed_out"], false);
+    assert_eq!(result["event"]["ev"], "guardrail.request_resolved");
+    assert_eq!(result["event"]["payload"]["state"], "confirmed");
+    assert_eq!(result["event"]["payload"]["scope"], "session");
+    // A matching key the stored answer does not have still waits for a live event.
+    let other = waiter.call(&Request::new(Actor::User, "bus.wait", json!({
+        "events": ["guardrail.request_resolved"], "matching": {"request_id": id, "state": "rejected"},
+        "timeout_ms": 1000,
+    })), |_| {}).await.unwrap();
+    assert_eq!(other.result.unwrap()["timed_out"], true);
+
+    // The plan the agent checks before acting now agrees with the gate it will meet.
+    let after = ok(engine, agent.clone(), "guardrail.explain", plan);
+    assert_eq!(after["verdict"], "allow", "{after}");
+    assert!(after["write_roots"].as_array().unwrap().iter().any(|root| root == sdk), "{after}");
+    let granted = ok(engine, agent.clone(), "guardrail.request.get", json!({"request_id": id}));
+    assert_eq!(granted["uses"], 0, "explaining a plan never uses a grant");
+    assert!(call(engine, agent.clone(), "guardrail.gate", json!({
+        "session": name, "kind": "write", "path": format!("{sdk}/licenses/x"), "new_text": "x\n",
+    })).ok);
+}

@@ -196,7 +196,8 @@ pub fn register(engine: &mut Engine) {
         for path in &requested {
             // No text yet, so this reports the policies that can be judged from a path alone:
             // protected paths, write roots, and whether a shape gate will demand full text.
-            let decision = guardrail::evaluate(
+            // An approved exception counts, as it does in guardrail.check; neither uses it up.
+            let decision = guardrail::evaluate_granted(
                 ctx.tx(),
                 &GateRequest {
                     actor: &ctx.actor,
@@ -210,7 +211,8 @@ pub fn register(engine: &mut Engine) {
                     skip_policy: None,
                     grants: None,
                 },
-            );
+                ctx.actor_session_id(),
+            ).map(|(decision, _)| decision);
             let item = match decision {
                 Ok(guardrail::Decision::Allow) => ExplainItem {
                     subject: path.clone(), verdict: Verdict::Allow, policy: None, message: None,
@@ -234,7 +236,7 @@ pub fn register(engine: &mut Engine) {
 
         let mut commands = Vec::new();
         for command in payload.commands.unwrap_or_default() {
-            let decision = guardrail::evaluate(
+            let (decision, _) = guardrail::evaluate_granted(
                 ctx.tx(),
                 &GateRequest {
                     actor: &ctx.actor,
@@ -248,6 +250,7 @@ pub fn register(engine: &mut Engine) {
                     skip_policy: None,
                     grants: None,
                 },
+                ctx.actor_session_id(),
             )?;
             let item = match decision {
                 guardrail::Decision::Allow => ExplainItem {
@@ -268,9 +271,23 @@ pub fn register(engine: &mut Engine) {
 
         let files = requested.len() as u32;
         let lines = payload.lines.unwrap_or(0);
-        let over_caps = files > cfg.caps.files || lines > cfg.caps.lines;
+        let granted = match ctx.actor_session_id().filter(|_| ctx.actor.is_agent()) {
+            Some(session_id) => guardrail::Grants::load(ctx.tx(), session_id)?,
+            None => guardrail::Grants::default(),
+        };
+        let over_caps = (files > cfg.caps.files || lines > cfg.caps.lines)
+            && !granted.covers_caps(files, lines, &cfg.caps);
         if over_caps {
             note(Verdict::Refuse);
+        }
+        // Absolute path grants are roots this session may write to now, too.
+        let mut write_roots: Vec<String> = guardrail::write_roots(&cfg, &worktree)
+            .iter().map(|root| root.display().to_string()).collect();
+        for grant in granted.list.iter().filter(|grant| grant.kind == relay_bus::types::ExceptionKind::Path) {
+            let value = grant.value.trim();
+            if Path::new(value).is_absolute() && !write_roots.iter().any(|root| root == value) {
+                write_roots.push(value.to_string());
+            }
         }
         Ok(ExplainOut {
             verdict: worst,
@@ -280,8 +297,7 @@ pub fn register(engine: &mut Engine) {
             lines,
             caps: cfg.caps.clone(),
             over_caps,
-            write_roots: guardrail::write_roots(&cfg, &worktree)
-                .iter().map(|root| root.display().to_string()).collect(),
+            write_roots,
         })
     });
 
