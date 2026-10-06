@@ -1,0 +1,2555 @@
+{
+ "groups": [
+  {
+   "keep": "lens-concurrency#3",
+   "dupes": [
+    "cli-main#4",
+    "lens-errors-panics#1",
+    "sec-supply-chain#4"
+   ],
+   "note": "The claude_pre_tool and codex_pre_tool adapters (main.rs:466-520) call guardrail.gate with no deadline of their own. When the store lock stalls past the provider's 30 s hook timeout (hooks.rs:351), the provider kills the hook and runs the tool unchecked. All four cite the same adapters and the same timeout, and one fix covers them: a client-side deadline that fails closed.",
+   "severity_notes": [
+    "high is right (both skeptic-verified): the safety check is silently bypassed whenever the engine is busy. cli-main#4 and sec-supply-chain#4 rated it medium.",
+    "sec-supply-chain#4 and cli-main#4 say medium and lens-concurrency#3 and lens-errors-panics#1 high. High is right: it silently bypasses the guardrail, and store-lock stalls happen (see the invoke_registered group)."
+   ],
+   "shards": [
+    "bus-cli-remote-misc-1",
+    "engine-core-1"
+   ]
+  },
+  {
+   "keep": "core-guardrail#7",
+   "dupes": [
+    "cli-main#3",
+    "core-engine#6",
+    "core-socket-store#1",
+    "sec-local-ipc#1",
+    "tests-bus-guardrails#4"
+   ],
+   "note": "resolve_actor admits `(Actor::User, _) | (Actor::Test, _) => Ok(None)` without a credential (engine.rs:1355), and the socket accept loop never reads peer credentials. So any agent process can claim `user`: via `--actor user` (main.rs:118-121), via a `relay cmd` envelope whose actor do_cmd keeps (main.rs:586-593, cli-main#3), or with a raw socket client. Each of these findings recommends the same door-level fix (SO_PEERCRED plus a session-ancestry check); the CLI-side checks are partial mitigations.",
+   "severity_notes": [
+    "All are rated medium. Per the rubric this is at least high (a safety check that agents can silently bypass), and arguably critical (an agent escaping its guardrails). The severity should rise.",
+    "All say medium. Per the rubric ('an agent escaping its guardrails') this is at least high: one discoverable CLI call lets an agent approve its own guardrail holds or rewrite guardrail config. BUS.md \u00a70.6 scopes hostile same-uid processes out, but agents are exactly the actor the guardrails constrain."
+   ],
+   "shards": [
+    "bus-cli-remote-misc-1",
+    "engine-core-1",
+    "engine-core-2"
+   ]
+  },
+  {
+   "keep": "cli-python#4",
+   "dupes": [
+    "cli-unreal#3",
+    "core-hooks-skills#1",
+    "lens-docs#5",
+    "plugins-unreal#10",
+    "sec-supply-chain#3"
+   ],
+   "note": "The PreToolUse matchers list exact tool names, `Edit|Write|MultiEdit|Bash` (hooks.rs:350) and `Bash|apply_patch|Edit|Write` (hooks.rs:517). Plugin MCP tools (mcp__blender__*, mcp__unreal__*) therefore never reach guardrail.gate, and the plugin servers never call it themselves. That covers blender_python exec, ue_python, ue_data_table writes and setup_check ini rewrites. lens-docs#5's reviewer angle and sec-supply-chain#3's NotebookEdit angle are fixed by the same matcher/gating change, plus a role filter that lens-docs#5 adds.",
+   "severity_notes": [
+    "medium is right: guardrails are bypassed, but only in projects with a plugin enabled, and the provider's own MCP permission prompt still applies. cli-unreal#3 and plugins-unreal#10 rated it low because they looked at one tool.",
+    "plugins-unreal#10 and cli-unreal#3 say low and the rest medium. Medium is right at least: arbitrary code and file writes are reachable by agents outside the gate."
+   ],
+   "shards": [
+    "bus-cli-remote-misc-1",
+    "engine-core-1"
+   ]
+  },
+  {
+   "keep": "cli-main#5",
+   "dupes": [
+    "lens-concurrency#12",
+    "lens-resources#13",
+    "plugins-blender#24"
+   ],
+   "note": "All three stdio MCP servers (mcp.rs:20-24, unreal.rs:57-60, blender.rs:37) read and handle one JSON-RPC message at a time and never read notifications/cancelled. One long bus.wait, render or build therefore blocks every later call from that agent. cli-main#5 already cites all three servers; the others are its relay-mcp and blender instances.",
+   "severity_notes": [
+    "medium is right; plugins-blender#24's low covers only the blender instance."
+   ],
+   "shards": [
+    "bus-cli-remote-misc-1"
+   ]
+  },
+  {
+   "keep": "lens-overengineering#12",
+   "dupes": [
+    "cli-main#22",
+    "cli-unreal#16",
+    "lens-dead-dup#20"
+   ],
+   "note": "The stdio JSON-RPC loop, initialize negotiation, rpc_error and protocol constants are copied across mcp.rs:13, unreal.rs:22/57 and blender.rs:10/34. lens-overengineering#12 also names the three op-pattern matchers; one shared module resolves them all.",
+   "severity_notes": [],
+   "shards": [
+    "bus-cli-remote-misc-1"
+   ]
+  },
+  {
+   "keep": "cli-python#21",
+   "dupes": [
+    "cli-main#6",
+    "lens-errors-panics#15",
+    "plugins-blender#16"
+   ],
+   "note": "blender.rs:372 does `value[\"output\"] = ...` on the parsed RELAY_JSON value. serde_json IndexMut panics when the value is not an object or null, so emit(\"done\") or emit([..]) kills relay blender-mcp. cli-python#21 also carries a separate main-guard (__name__) defect, which is why it is kept as the most complete member.",
+   "severity_notes": [],
+   "shards": [
+    "bus-cli-remote-misc-1"
+   ]
+  },
+  {
+   "keep": "plugins-blender#17",
+   "dupes": [
+    "cli-main#18",
+    "cli-python#22"
+   ],
+   "note": "plugins-blender#17 reports both diagnostics losses in blender_python. failure_text (blender.rs:379-384) starts at the first Traceback line, which is in stderr, and so drops the stdout prints (= cli-main#18). The addon_utils.enable failure is printed outside the RELAY_OUT markers and never raised (run.py:3-4 with blender.rs:358-361; = cli-python#22). Its fix contains both members' fixes.",
+   "severity_notes": [],
+   "shards": [
+    "bus-cli-remote-misc-1"
+   ]
+  },
+  {
+   "keep": "lens-errors-panics#16",
+   "dupes": [
+    "cli-main#17"
+   ],
+   "note": "claude_pre_tool reconstructs Edit/MultiEdit by reading the file and bailing when old_string is missing or the read fails (main.rs:422-426, 438-448). run() turns that into `RELAY guardrail unavailable` with exit 2. cli-main#17 adds the empty-old_string and non-UTF-8 triggers of the same bail. The one fix is to gate path-only, or report a content error, instead of an infrastructure failure.",
+   "severity_notes": [],
+   "shards": [
+    "bus-cli-remote-misc-1"
+   ]
+  },
+  {
+   "keep": "cli-main#2",
+   "dupes": [
+    "cli-python#1",
+    "plugins-blender#1"
+   ],
+   "note": "info.py:45-46 and export.py:48 iterate Action.fcurves, which Blender 5.x removed. blender_info and skeletal/animation exports therefore crash on any animated file. All three cite the same lines (all skeptic-verified); cli-main#2 also ties it to blender_to_unreal and the failing test.",
+   "severity_notes": [],
+   "shards": [
+    "bus-cli-remote-misc-1"
+   ]
+  },
+  {
+   "keep": "cli-python#2",
+   "dupes": [
+    "plugins-blender#2"
+   ],
+   "note": "set_action (blender_py/common.py:126) assigns animation_data.action without an action slot. On Blender 4.4+ anim_inspect, render and export then silently evaluate the rest pose. Both cite the same function and callers.",
+   "severity_notes": [],
+   "shards": [
+    "bus-cli-remote-misc-1"
+   ]
+  },
+  {
+   "keep": "cli-python#3",
+   "dupes": [
+    "plugins-blender#20"
+   ],
+   "note": "export.py:60 selects objects without regard to view-layer visibility. Objects in excluded collections make select_set raise, and eye-hidden ones are silently dropped from the FBX. plugins-blender#20 is the excluded-collection crash for children (UCX_, SOCKET_, LOD) at the same selection code.",
+   "severity_notes": [
+    "high (skeptic) is right for the group: besides the crash, hidden collections are silently left out of the exported FBX in a normal flow. plugins-blender#20 rated only the crash case, at low."
+   ],
+   "shards": [
+    "bus-cli-remote-misc-1"
+   ]
+  },
+  {
+   "keep": "plugins-blender#13",
+   "dupes": [
+    "cli-main#21",
+    "cli-python#30"
+   ],
+   "note": "export.py:85 takes size_cm from world_bbox of the posed meshes at the current frame, while compare (blender.rs:442-450) checks it against Unreal's bind-pose bounds from import_fbx. A posed character therefore gets a false height-ratio problem. All three cite the same pair of lines.",
+   "severity_notes": [
+    "low is more accurate than plugins-blender#13's medium: it only misfires when the current pose's height differs from the bind pose by more than 10%, and the result is a spurious entry in the problems list, not a failed export."
+   ],
+   "shards": [
+    "bus-cli-remote-misc-1"
+   ]
+  },
+  {
+   "keep": "cli-python#7",
+   "dupes": [
+    "plugins-blender#6"
+   ],
+   "note": "The anim_inspect ground check measures the ankle/foot bone head against the lowest rest point (blender_py/anim_inspect.py:157-159), so a foot can sink by about its ankle height before 'ground' fires. Same lines, same fix.",
+   "severity_notes": [],
+   "shards": [
+    "bus-cli-remote-misc-1"
+   ]
+  },
+  {
+   "keep": "plugins-blender#22",
+   "dupes": [
+    "cli-python#34"
+   ],
+   "note": "The collision prefix list in info.py:29 and export.py:39/84/107 omits UCP_, so documented capsule collision is treated as render geometry. Same lines.",
+   "severity_notes": [],
+   "shards": [
+    "bus-cli-remote-misc-1"
+   ]
+  },
+  {
+   "keep": "plugins-blender#14",
+   "dupes": [
+    "cli-python#24"
+   ],
+   "note": "render.py:35 maps 'eevee' to BLENDER_EEVEE, an identifier that Blender 4.2-4.5 reject (they use BLENDER_EEVEE_NEXT). Same engine map.",
+   "severity_notes": [
+    "medium is right: blender_render engine=eevee fails outright on both current LTS lines, which is a common setup, not a rare edge."
+   ],
+   "shards": [
+    "bus-cli-remote-misc-1"
+   ]
+  },
+  {
+   "keep": "cli-python#16",
+   "dupes": [
+    "cli-main#9"
+   ],
+   "note": "rig_check.py:106-108 re-implements the mesh and skinning checks instead of using common.mesh_report, and the copies already disagree on severity. As a result rig_check and export accept and refuse different rigs. cli-main#9 is the rig_check-vs-export instance of cli-python#16's duplication.",
+   "severity_notes": [],
+   "shards": [
+    "bus-cli-remote-misc-1"
+   ]
+  },
+  {
+   "keep": "plugins-blender#15",
+   "dupes": [
+    "cli-python#23"
+   ],
+   "note": "blender_python save and save_as call save_mainfile/save_as_mainfile with backups left on (run.py:15-20), which leaves full-size .blend1 files in the checkout. Same lines.",
+   "severity_notes": [
+    "medium is right: save is a normal flow, and the backups are neither ignored nor LFS-tracked, so they can be committed as large binaries."
+   ],
+   "shards": [
+    "bus-cli-remote-misc-1"
+   ]
+  },
+  {
+   "keep": "cli-python#9",
+   "dupes": [
+    "plugins-blender#12"
+   ],
+   "note": "blender_to_unreal sends materials=null in import_args (blender.rs:406), and import_fbx.py:30-31 reads that as false, so materials and textures are never imported by default. This is the same defect described from the Rust side and from the script side.",
+   "severity_notes": [],
+   "shards": [
+    "bus-cli-remote-misc-1",
+    "bus-cli-remote-misc-2"
+   ]
+  },
+  {
+   "keep": "cli-python#25",
+   "dupes": [
+    "plugins-blender#18"
+   ],
+   "note": "The blender_to_unreal tool description and docs still promise a hand-side check, but import_fbx.py:99 returns tautological hand_sides and nothing compares them. Same stale promise.",
+   "severity_notes": [],
+   "shards": [
+    "bus-cli-remote-misc-1",
+    "bus-cli-remote-misc-2"
+   ]
+  },
+  {
+   "keep": "cli-main#15",
+   "dupes": [
+    "lens-docs#20"
+   ],
+   "note": "relay-cli main.rs:113 maps every client-side error to exit 5 ('engine unreachable'), including bad JSON, bus.project_required and typed refusals. Same line, same fix.",
+   "severity_notes": [],
+   "shards": [
+    "bus-cli-remote-misc-1"
+   ]
+  },
+  {
+   "keep": "remote#9",
+   "dupes": [
+    "lens-errors-panics#13"
+   ],
+   "note": "serve_with_door (relay-cli remote.rs:114-118) propagates a failure to read or write remote.json with `?`, so `relay serve --remote` never starts the engine. Same lines.",
+   "severity_notes": [
+    "medium is right: run.sh and the service launch with --remote, so a corrupt or unwritable remote.json stops the whole engine from starting, not just the phone door."
+   ],
+   "shards": [
+    "bus-cli-remote-misc-1"
+   ]
+  },
+  {
+   "keep": "remote#18",
+   "dupes": [
+    "sec-remote-door#15"
+   ],
+   "note": "The phone-supplied device_name is stored with its control characters (registry.rs:217-220) and printed raw by `relay remote devices` (remote.rs:245), so escape sequences reach the terminal. Same data flow.",
+   "severity_notes": [],
+   "shards": [
+    "bus-cli-remote-misc-1",
+    "bus-cli-remote-misc-2"
+   ]
+  },
+  {
+   "keep": "cli-unreal#4",
+   "dupes": [
+    "plugins-unreal#9"
+   ],
+   "note": "ue_editor_lock is in the LIVE list (unreal.rs:34). call() therefore requires a reachable editor with this project open before it will run 'status' or 'release' on the file-based lock. Same line.",
+   "severity_notes": [],
+   "shards": [
+    "bus-cli-remote-misc-1"
+   ]
+  },
+  {
+   "keep": "cli-unreal#6",
+   "dupes": [
+    "plugins-unreal#13"
+   ],
+   "note": "acquire_lock (unreal.rs:535-536) does a non-atomic read-check-write on a plain file, so two agents can both believe they hold the editor lock. Same function.",
+   "severity_notes": [],
+   "shards": [
+    "bus-cli-remote-misc-1"
+   ]
+  },
+  {
+   "keep": "cli-unreal#5",
+   "dupes": [
+    "plugins-unreal#14"
+   ],
+   "note": "The editor lock's idle timestamp (LOCK_IDLE, unreal.rs:40/550) is refreshed only when a call starts, and quit_editor releases it during a ue_build restart. The lock therefore lapses mid-operation during long ue_python, in-editor tests or builds. Same mechanism and lines.",
+   "severity_notes": [
+    "medium is right: a lapsed lock lets a second agent drive the same editor during a long run, which is a normal multi-agent flow."
+   ],
+   "shards": [
+    "bus-cli-remote-misc-1"
+   ]
+  },
+  {
+   "keep": "cli-unreal#2",
+   "dupes": [
+    "plugins-unreal#2"
+   ],
+   "note": "quit_editor (unreal.rs:589-600) sends SIGTERM without saving when Remote Control misses a 3 s probe, even with save=true. Both are skeptic-verified at the same line; cli-unreal#2 additionally notes the argv-matching blast radius, which is tracked separately in cli-main#1.",
+   "severity_notes": [],
+   "shards": [
+    "bus-cli-remote-misc-1"
+   ]
+  },
+  {
+   "keep": "cli-unreal#8",
+   "dupes": [
+    "plugins-unreal#8"
+   ],
+   "note": "launch_editor (unreal.rs:656) scans for bind failures in whatever Saved/Logs/<Project>.log is on disk right after spawning. That is often the previous session's log, so it reports stale bind failures and misses real ones. Same lines.",
+   "severity_notes": [],
+   "shards": [
+    "bus-cli-remote-misc-1"
+   ]
+  },
+  {
+   "keep": "cli-unreal#10",
+   "dupes": [
+    "plugins-unreal#11",
+    "sec-supply-chain#9"
+   ],
+   "note": "ue_setup_check fix writes RC_KEYS (remote Python, console commands, any-function calls, unauthenticated) into the tracked Config/DefaultRemoteControl.ini (unreal.rs:675-718). All three cite RC_KEYS and write_remote_control_ini.",
+   "severity_notes": [],
+   "shards": [
+    "bus-cli-remote-misc-1"
+   ]
+  },
+  {
+   "keep": "cli-unreal#9",
+   "dupes": [
+    "plugins-unreal#15"
+   ],
+   "note": "The early `?` returns in play and profile (unreal.rs:848-863, 919-929, 1029-1047) skip the stop/cleanup step, leaving the RelayPlayCapture SceneCapture2D in the user's level and PIE running. Same code paths.",
+   "severity_notes": [
+    "medium is right: the leftover actor dirties the user's level and can be saved into the .umap by a later quit or restart; low understates that."
+   ],
+   "shards": [
+    "bus-cli-remote-misc-1"
+   ]
+  },
+  {
+   "keep": "plugins-unreal#16",
+   "dupes": [
+    "cli-unreal#13"
+   ],
+   "note": "build (unreal.rs:1519) reads `save` and `launch_timeout_s`, but the ue_build schema (additionalProperties:false, unreal.rs:116-139) does not declare them. Same mismatch; plugins-unreal#16 adds the consequence that a restart always saves.",
+   "severity_notes": [],
+   "shards": [
+    "bus-cli-remote-misc-1"
+   ]
+  },
+  {
+   "keep": "cli-unreal#15",
+   "dupes": [
+    "lens-perf#21"
+   ],
+   "note": "ue_log and log_since read the whole Unreal log from byte 0 on every call, then filter and re-join it to return a tail (unreal.rs:787, 1611-1623). lens-perf#21 is the ue_log part of cli-unreal#15.",
+   "severity_notes": [],
+   "shards": [
+    "bus-cli-remote-misc-1"
+   ]
+  },
+  {
+   "keep": "cli-unreal#1",
+   "dupes": [
+    "plugins-unreal#5"
+   ],
+   "note": "python_tx cuts editor output to its last 60 KB (tail, unreal.rs:1590/1707) before python_json_tx looks for the RELAY_JSON line, so any result over about 60 KB fails with 'printed no result'. Same lines; cli-unreal#1 is skeptic-verified.",
+   "severity_notes": [],
+   "shards": [
+    "bus-cli-remote-misc-1"
+   ]
+  },
+  {
+   "keep": "lens-docs#7",
+   "dupes": [
+    "bus#6",
+    "core-device-handler#20"
+   ],
+   "note": "device.signing.create (ops/device.rs:37-39) has no door restriction, although D157 and BUS.md \u00a710.14 say it is TauriOnly and that the socket door never receives the keystore password. All three cite the same op.",
+   "severity_notes": [],
+   "shards": [
+    "bus-cli-remote-misc-1"
+   ]
+  },
+  {
+   "keep": "bus#13",
+   "dupes": [
+    "lens-contract#13",
+    "lens-dead-dup#13"
+   ],
+   "note": "The registry advertises ops that do nothing. project.stats has no handler, app.log.tail only emits app.log.attached and attaches no stream (handlers/app.rs:133-136), and git.log `graph` is never read. lens-contract#13's app.reconcile part also matches core-misc-handlers#10, which is kept separate (its root is the missing purge).",
+   "severity_notes": [],
+   "shards": [
+    "bus-cli-remote-misc-1",
+    "handlers-other-1"
+   ]
+  },
+  {
+   "keep": "bus#16",
+   "dupes": [
+    "core-engine#14",
+    "lens-sqlite#19"
+   ],
+   "note": "bus.schema calls relay_bus::schema::render(), which regenerates the roughly 315 KB schema on every call (schema.rs:11-52). It is registered with plain e.register (handlers/bus.rs:22), so this runs under the store mutex. Same fix: OnceLock plus register_unlocked.",
+   "severity_notes": [],
+   "shards": [
+    "bus-cli-remote-misc-1",
+    "handlers-core"
+   ]
+  },
+  {
+   "keep": "bus#1",
+   "dupes": [
+    "lens-contract#10"
+   ],
+   "note": "settings.set and settings.reset write guardrails.* (handlers/settings.rs:217-229) without guardrail.config.set's typed validation. A bad key then makes the deny_unknown_fields GuardrailConfig parse in every config read fail, which blocks every agent mutation and gate. Same root and same fix.",
+   "severity_notes": [
+    "medium is right: one mistyped settings.set breaks every agent's mutations and hooks until it is repaired by hand. lens-contract#10's low understates that."
+   ],
+   "shards": [
+    "bus-cli-remote-misc-1"
+   ]
+  },
+  {
+   "keep": "sec-supply-chain#13",
+   "dupes": [
+    "scripts-infra#10"
+   ],
+   "note": "The workflows reference actions by mutable tag or branch (dtolnay/rust-toolchain@master, @v4, @v2), have no least-privilege permissions block, and keep checkout's persist-credentials. sec-supply-chain#13 covers both ci.yml and mobile-apk.yml; scripts-infra#10 is the ci.yml part. Same fix: pin by SHA, set permissions to read, turn off persisted credentials.",
+   "severity_notes": [],
+   "shards": [
+    "bus-cli-remote-misc-1"
+   ]
+  },
+  {
+   "keep": "cli-main#1",
+   "dupes": [
+    "plugins-unreal#4"
+   ],
+   "note": "unreal_process::editors_for (unreal_process.rs:57) matches any editor whose argv merely ends with the same .uproject file name. Fixing it by comparing canonical full paths resolves both reports. Both cite the same function and the same callers (unreal.rs:575/624/1521).",
+   "severity_notes": [
+    "high (cli-main#1, verified by a skeptic) is right. The mismatch causes quit and build to SIGTERM another checkout's editor, which can lose unsaved work. medium understates that."
+   ],
+   "shards": [
+    "bus-cli-remote-misc-2"
+   ]
+  },
+  {
+   "keep": "plugins-unreal#1",
+   "dupes": [
+    "cli-main#11",
+    "core-socket-store#5",
+    "lens-resources#2",
+    "tests-sessions#2"
+   ],
+   "note": "unreal_process::launch (unreal_process.rs:291-307, confirmed in the current code) spawns the editor in its own process group and never calls env_remove, so the editor inherits RELAY_SESSION, RELAY_TOKEN, RELAY_STORE and RELAY_INSTANCE. One fix, stripping RELAY_* from the child, closes both the token leak (cli-main#11) and the editor being killed by the startup reaper (plugins-unreal#1).",
+   "severity_notes": [
+    "high is right. The concrete consequence is that the startup reaper SIGKILLs the user's editor, losing unsaved work. cli-main#11 rated only the token-exposure side, as low.",
+    "core-socket-store#5 says medium; the others say high. High is right: a normal engine restart kills the user's editor and loses unsaved work, in an ordinary Unreal workflow."
+   ],
+   "shards": [
+    "bus-cli-remote-misc-2",
+    "engine-core-2"
+   ]
+  },
+  {
+   "keep": "cli-python#33",
+   "dupes": [
+    "plugins-unreal#20"
+   ],
+   "note": "asset_audit.py:63 uses `str(mips).endswith(\"NO_MIPMAPS\")`. The fix for both is to compare by enum value. Both reports cite the same line, the same fix and the same uncertainty about Unreal's str() format.",
+   "severity_notes": [],
+   "shards": [
+    "bus-cli-remote-misc-2"
+   ]
+  },
+  {
+   "keep": "remote#4",
+   "dupes": [
+    "lens-concurrency#5",
+    "lens-data-loss#14",
+    "lens-resources#9",
+    "sec-remote-door#4"
+   ],
+   "note": "remote.json is read-modify-written without a lock, and Registry::save (registry.rs:165) writes through one fixed temp path. This happens in bridge::admit (bridge.rs:72/94) and in the relay remote CLI subcommands (remote.rs:226/253). A file lock plus a unique temp file fixes every report.",
+   "severity_notes": [
+    "medium (remote#4, verified by a skeptic) is right. The race can silently undo a revocation, which is a safety check bypassed in a less common path. low understates the security impact."
+   ],
+   "shards": [
+    "bus-cli-remote-misc-2"
+   ]
+  },
+  {
+   "keep": "remote#3",
+   "dupes": [
+    "sec-remote-door#1"
+   ],
+   "note": "The phone protocol has no end-to-end channel security. Welcome::paired sends the bearer token in clear (bridge.rs:79), the direct door is a plain accept_async over ws:// (direct.rs:89), frames after the proof are unauthenticated (bridge.rs:172-181), and the PC never authenticates itself. Both reports propose the same fix: a pinned key in the QR code plus an authenticated key exchange and a MAC on every frame.",
+   "severity_notes": [],
+   "shards": [
+    "bus-cli-remote-misc-2"
+   ]
+  },
+  {
+   "keep": "sec-remote-door#3",
+   "dupes": [
+    "lens-docs#8",
+    "remote#7"
+   ],
+   "note": "bridge::run (bridge.rs:173-197) checks remote.json only once, in admit, so `relay remote revoke` does not end a live bridge. The fix is to re-check admission or signal live bridges on revoke. All three reports cite the same loop and MOBILE.md:193.",
+   "severity_notes": [],
+   "shards": [
+    "bus-cli-remote-misc-2"
+   ]
+  },
+  {
+   "keep": "remote#1",
+   "dupes": [
+    "lens-concurrency#7",
+    "lens-resources#3",
+    "sec-remote-door#2"
+   ],
+   "note": "The in-engine direct door (direct.rs:37-46, 76, 89) has no timeout on peek or on the WebSocket handshake, no cap on connections, and tungstenite's default 64 MiB limit applies before authentication. Idle LAN peers can therefore exhaust the engine's file descriptors. The same fix (a timeout around peek, handshake and hello, a semaphore, and a small WebSocketConfig) resolves all four. Some of them also mention the rendezvous server, which has the same shape and is tracked in sec-remote-door#8.",
+   "severity_notes": [],
+   "shards": [
+    "bus-cli-remote-misc-2"
+   ]
+  },
+  {
+   "keep": "remote#14",
+   "dupes": [
+    "sec-remote-door#12"
+   ],
+   "note": "direct.rs:80 sends `Access-Control-Allow-Origin: *` on the unauthenticated /info, and the upgrade at direct.rs:89 never checks Origin. The fix for both is to drop the CORS header and refuse upgrades that carry a browser Origin.",
+   "severity_notes": [],
+   "shards": [
+    "bus-cli-remote-misc-2"
+   ]
+  },
+  {
+   "keep": "sec-remote-door#8",
+   "dupes": [
+    "remote#10"
+   ],
+   "note": "The rendezvous server has no size, count or idle limits: default tungstenite limits at accept_hdr_async (rendezvous.rs:159), no timeout on peek (127), an uncapped accept loop, rooms anyone can host via classify (103-107), and queues bounded by message count rather than bytes (173, 233). One set of limits fixes both reports.",
+   "severity_notes": [],
+   "shards": [
+    "bus-cli-remote-misc-2"
+   ]
+  },
+  {
+   "keep": "remote#5",
+   "dupes": [
+    "lens-concurrency#18",
+    "sec-remote-door#9"
+   ],
+   "note": "Inside loops shared by every lane, the code awaits a send into one lane's bounded queue: `target.send(l).await` in rendezvous host (rendezvous.rs:207), `tx.send(l).await` and a 5 s close wait in tunnel::connect_once (tunnel.rs:139-152). One slow lane therefore stalls all of them. Using try_send, dropping the full lane and aborting the close wait fixes all three.",
+   "severity_notes": [
+    "high (remote#5, verified by a skeptic) is right. Phones routinely drop without a FIN on mobile links, and every phone, plus the PC's tunnel keepalive, then stalls for about 15 minutes."
+   ],
+   "shards": [
+    "bus-cli-remote-misc-2"
+   ]
+  },
+  {
+   "keep": "lens-errors-panics#4",
+   "dupes": [
+    "lens-concurrency#6",
+    "remote#6",
+    "sec-remote-door#10"
+   ],
+   "note": "When a replaced host connection ends, its cleanup in rendezvous host (rendezvous.rs:218-223, confirmed: `r.host = None; r.lanes.clear();`) runs without checking that it is still the current host, so it evicts the new host and its lanes. The fix for all four is a generation or identity check before clearing.",
+   "severity_notes": [
+    "medium is closer than low. A PC reconnecting after a network blip, while the old socket is still alive server-side, is a normal flow, and phones then see host.offline until the PC's next redial. It is a real bug in a less common path, not a rare edge case."
+   ],
+   "shards": [
+    "bus-cli-remote-misc-2"
+   ]
+  },
+  {
+   "keep": "remote#13",
+   "dupes": [
+    "sec-remote-door#13"
+   ],
+   "note": "tunnel.rs:19 builds `/host/<room>?secret=<s>`, so the room secret travels in the query string and ends up in proxy logs. The fix for both is to send it in a header or a first frame. sec-remote-door#13 also covers the 0.0.0.0 default bind of `relay remote rendezvous`, as a secondary point.",
+   "severity_notes": [],
+   "shards": [
+    "bus-cli-remote-misc-2"
+   ]
+  },
+  {
+   "keep": "remote#15",
+   "dupes": [
+    "sec-remote-door#14"
+   ],
+   "note": "tunnel.rs:57 awaits connect_async with no timeout, so a stalled dial never reaches the backoff loop. The fix for both is wrapping it in tokio::time::timeout. remote#15 also notes that the backoff never resets.",
+   "severity_notes": [],
+   "shards": [
+    "bus-cli-remote-misc-2"
+   ]
+  },
+  {
+   "keep": "remote#12",
+   "dupes": [
+    "lens-docs#16",
+    "sec-remote-door#11"
+   ],
+   "note": "wire::gate (wire.rs:96-98, confirmed) parses the whole frame as one JSON value and forwards it on any parse failure. A frame of two newline-separated objects therefore passes ungated, and the engine's lines() reader (socket.rs:335) splits it into separate requests. The fix for all three is to split frames on newlines, or refuse frames that contain one.",
+   "severity_notes": [],
+   "shards": [
+    "bus-cli-remote-misc-2"
+   ]
+  },
+  {
+   "keep": "lens-docs#13",
+   "dupes": [
+    "scripts-infra#5"
+   ],
+   "note": "run.sh:5 defaults RELAY_INSTANCE to dev, while the CLI (main.rs:24) and deploy/relay-remote.service:9 default to stable. Enabling the unit therefore starts a second engine that holds port 7420, contrary to the unit's comment on line 4. The fix for both is one shared default instance, or Environment=RELAY_INSTANCE in the unit.",
+   "severity_notes": [
+    "medium (lens-docs#13) fits better. The phone silently pairs with and controls a different store than the desktop shows. That is wrong behaviour, but only on the less common path of enabling the login service."
+   ],
+   "shards": [
+    "bus-cli-remote-misc-2"
+   ]
+  },
+  {
+   "keep": "lens-store-mutex#17",
+   "dupes": [
+    "lens-docs#14"
+   ],
+   "note": "The first bullet of BUS.md \u00a75.1 (lines 225-229) describes a tokio Mutex with concurrent WAL reads, but the store is one rusqlite Connection behind a std Mutex (store.rs:474-476). Rewriting \u00a75.1 to the one-connection model fixes both. Each report adds a secondary drift: lens-store-mutex#17 the nested prepares in D149, lens-docs#14 the `<op>.completed` names.",
+   "severity_notes": [],
+   "shards": [
+    "bus-cli-remote-misc-2"
+   ]
+  },
+  {
+   "keep": "lens-docs#11",
+   "dupes": [
+    "core-device-mirror#20",
+    "perf-harness#18"
+   ],
+   "note": "BUS.md \u00a76-\u00a77 were never updated after the move from Tauri to V4. They still say \u00a76.5 ui.* ops are forwarded to the UI or refused with ui.absent (ui.rs answers them in core), and the \u00a77 mirror row says Tauri Channel only (socket.rs:520 streams it). One rewrite of \u00a76-\u00a77 fixes the shared claims. perf-harness#18 shares the \u00a76.5 claim, and core-device-mirror#20 shares the mirror row and adds the undocumented lease ops.",
+   "severity_notes": [
+    "low or medium. lens-docs#11's medium is justified by its wrong socket path, which can point a client at the Relay-2/V3 engine. The other members only claim low-impact drift."
+   ],
+   "shards": [
+    "bus-cli-remote-misc-2"
+   ]
+  },
+  {
+   "keep": "core-misc-handlers#10",
+   "dupes": [
+    "bus#5",
+    "core-workspace-files#8",
+    "lens-data-loss#12",
+    "lens-dead-dup#8",
+    "lens-docs#9",
+    "lens-resources#12",
+    "lens-sqlite#13"
+   ],
+   "note": "The reconcile/purge pass promised in BUS.md \u00a75.4 does not exist: app.reconcile is a stub (handlers/app.rs:137-141) and undo.grace_days (settings.rs:42) is read by nothing. As a result .relay/trash payloads and soft-deleted rows are never removed. Implementing the pass, or changing the doc and removing the setting, resolves all of them. core-misc-handlers#10 also covers notification pruning and the app.log.tail stub.",
+   "severity_notes": [
+    "medium (most members) is right, not the docs-drift low. It is real unbounded disk retention, but it grows only by what the user deletes through Relay, not by runaway growth.",
+    "Medium is right: the growth is slow and needs explicit deletes. The two low docs-drift members (lens-sqlite#13, lens-data-loss#12) describe the same missing pass from the doc side."
+   ],
+   "shards": [
+    "bus-cli-remote-misc-2",
+    "handlers-other-1"
+   ]
+  },
+  {
+   "keep": "sec-supply-chain#7",
+   "dupes": [
+    "sec-remote-door#6"
+   ],
+   "note": "run.sh:32 always runs `serve --remote`, and --remote-bind defaults to 0.0.0.0:7420 (main.rs:68), so every desktop launch opens the phone door on every interface whether or not a phone is paired. The fix for both is an opt-in door bound to chosen interfaces. sec-supply-chain#7 also restates the plain-ws, no-channel-security issue, which belongs to remote#3.",
+   "severity_notes": [
+    "medium (sec-remote-door#6) fits the always-open-door exposure on its own. sec-supply-chain#7's high comes from the channel-security part, which is already counted as high in remote#3."
+   ],
+   "shards": [
+    "bus-cli-remote-misc-2"
+   ]
+  },
+  {
+   "keep": "core-engine#4",
+   "dupes": [
+    "core-workspace-files#26",
+    "lens-perf#12",
+    "lens-sqlite#7"
+   ],
+   "note": "audit::store_limit caps only session.report/usage.report, so always-audited guardrail.gate rows keep the Claude adapter's whole post-edit new_text (up to 64 KB) per Edit/Write. lens-perf#12 also mentions an uncapped undo_op, a small addition on the same storage-size policy. Checked the shared store_limit/append evidence at audit.rs:22-27,88-93 and relay-cli main.rs:415-432.",
+   "severity_notes": [
+    "Medium (lens-sqlite#7, core-engine#4) is right over low. The store grows by edits times file size for 180 days in normal agent use, and keeps copies of secrets."
+   ],
+   "shards": [
+    "engine-core-1",
+    "handlers-other-1"
+   ]
+  },
+  {
+   "keep": "core-session#12",
+   "dupes": [
+    "core-workspace-files#17",
+    "lens-sqlite#12",
+    "lens-store-mutex#7"
+   ],
+   "note": "awareness::brief \u2192 git::briefing_state opens gix and runs unbounded rev-walks while session.brief and the launch read phase (session.rs:451/604/1128) still hold the store connection. All four cite the same call chain.",
+   "severity_notes": [
+    "core-session#12 and lens-store-mutex#7 rate it medium and lens-sqlite#12 low. Medium is right: the walk is bounded by history size, not by a hang, but it runs on every launch and brief.",
+    "core-session#12, core-workspace-files#17 and lens-store-mutex#7 say medium; lens-sqlite#12 says low. Medium is right: this is a CLAUDE.md invariant break on every launch and brief, but the stall depends on how far the branches have diverged and was not measured."
+   ],
+   "shards": [
+    "engine-core-1",
+    "handlers-core"
+   ]
+  },
+  {
+   "keep": "core-pty-providers#6",
+   "dupes": [
+    "core-session#18",
+    "core-workspace-files#24",
+    "lens-resources#17"
+   ],
+   "note": "The compact brief has no size cap (task bodies, changelogs, standing note) and is packed into a single Codex `developer_instructions=` argv element at providers.rs:81-94/220. Past MAX_ARG_STRLEN every Codex launch fails. One fix covers all three: pass a pointer to the brief file, or cap it.",
+   "severity_notes": [
+    "lens-resources#17 says low and the others medium. Medium is right: once a note grows, every Codex launch in the project fails hard.",
+    "core-pty-providers#6 and core-workspace-files#24 say medium; lens-resources#17 and core-session#18 say low. Medium is right: once a note or task body grows, every Codex launch in the project fails hard.",
+    "core-session#18 and lens-resources#17 say low; core-pty-providers#6 and core-workspace-files#24 say medium. Medium is right: once a project's notes or task text grow past 128 KiB, every Codex launch in that project fails hard, and the content is also exposed through ps."
+   ],
+   "shards": [
+    "engine-core-1",
+    "engine-core-2",
+    "handlers-core"
+   ]
+  },
+  {
+   "keep": "core-hooks-skills#4",
+   "dupes": [
+    "tests-misc#6"
+   ],
+   "note": "branch_cleanup::candidates (76-79) selects every closed session's branch rather than only Relay-created relay/<name> branches. A session run in the primary checkout or on an existing branch therefore gets its user branch deleted locally and on GitHub. Both cite candidates/evaluate with the same trigger.",
+   "severity_notes": [],
+   "shards": [
+    "engine-core-1"
+   ]
+  },
+  {
+   "keep": "core-hooks-skills#16",
+   "dupes": [
+    "lens-data-loss#7"
+   ],
+   "note": "after_close branch cleanup (evaluate, branch_cleanup.rs:307) force-removes the worktree that a close with keep-worktree preserved, destroying git-ignored files. Both cite the same evaluate/after_close path and session.rs:1634.",
+   "severity_notes": [],
+   "shards": [
+    "engine-core-1"
+   ]
+  },
+  {
+   "keep": "core-hooks-skills#15",
+   "dupes": [
+    "lens-data-loss#16"
+   ],
+   "note": "checkouts() at branch_cleanup.rs:140 returns an empty Vec when `git worktree list` fails, and ran.ok is never checked, so the check fails open. update-ref -d (314) then deletes a branch that is checked out. Both quote the same `let Ok(ran) = ... else { return Vec::new() }`.",
+   "severity_notes": [],
+   "shards": [
+    "engine-core-1"
+   ]
+  },
+  {
+   "keep": "lens-resources#10",
+   "dupes": [
+    "core-hooks-skills#21",
+    "lens-perf#19"
+   ],
+   "note": "The 20-minute sweep re-evaluates every leftover closed-session branch from scratch with about 10 git subprocesses each. No verdict or tip is remembered, so the cost grows with history. lens-perf#19 adds the 1 s polling loop of the same sweeper. One fix covers all three: cache the verdict by tip and base, and wait on a condvar.",
+   "severity_notes": [
+    "core-hooks-skills#21 and lens-perf#19 rate it low and lens-resources#10 medium. Medium is right: the work and log volume grow without bound over normal use, but it runs in the background with output_with_timeout."
+   ],
+   "shards": [
+    "engine-core-1"
+   ]
+  },
+  {
+   "keep": "core-device-mirror#7",
+   "dupes": [
+    "lens-concurrency#10"
+   ],
+   "note": "MirrorRuntime::send_control does a blocking socket write while holding the control mutex, and stop() needs the same mutex. A stalled socket therefore wedges device.mirror.stop under the store lock. Same code (device.rs:279-326).",
+   "severity_notes": [],
+   "shards": [
+    "engine-core-1"
+   ]
+  },
+  {
+   "keep": "core-device-handler#3",
+   "dupes": [
+    "core-device-mirror#1",
+    "lens-resources#8",
+    "lens-subprocess#4",
+    "tests-bus-guardrails#5",
+    "tests-misc#3"
+   ],
+   "note": "RunRuntime::stop kills only the `fish -lc` wrapper pid, not its process group. Gradle keeps building and installing after device.run.stop releases the lease. All five cite device.rs:403-406 / handlers/device.rs:1822.",
+   "severity_notes": [
+    "lens-subprocess#4 and tests-bus-guardrails#5 say medium and the rest high. High is right: Stop is a normal flow, and the build keeps touching a device that has been handed to another session.",
+    "High is right: after Stop, another session can install onto the device while the old build is still installing."
+   ],
+   "shards": [
+    "engine-core-1",
+    "handlers-other-1"
+   ]
+  },
+  {
+   "keep": "core-device-mirror#4",
+   "dupes": [
+    "lens-concurrency#13"
+   ],
+   "note": "Lease expiry is lazy (expire() runs only in acquire/release_where) and emits no device.lease.released, yet the device.busy hint tells agents to bus.wait for that event. lens-concurrency#13 adds the subscribe-after-release race; the same fix (emit on expiry or answer at subscribe time) covers both.",
+   "severity_notes": [],
+   "shards": [
+    "engine-core-1"
+   ]
+  },
+  {
+   "keep": "core-device-mirror#12",
+   "dupes": [
+    "tests-mirror-board#12"
+   ],
+   "note": "The control drain thread (handlers/device.rs:826-829) discards device-to-host bytes. DeviceMsg/DeviceEvent/parse_* and GetClipboard/ack sequencing are dead, and their docs are false. Both name the same drain loop and parsers.",
+   "severity_notes": [],
+   "shards": [
+    "engine-core-1",
+    "handlers-other-1"
+   ]
+  },
+  {
+   "keep": "core-tasks-notes#2",
+   "dupes": [
+    "core-engine#2",
+    "core-git#9",
+    "core-session#13",
+    "lens-concurrency#1",
+    "lens-contract#3",
+    "lens-overengineering#1",
+    "lens-store-mutex#2",
+    "tests-mirror-board#1"
+   ],
+   "note": "Ctx::invoke_registered (engine.rs:325-351) runs a staged op's prepare with held: Some(self.tx), inside the caller's transaction. task.dispatch (task.rs:683/712, plain register) therefore runs session.create/spawn prepare (git fetch, worktree add, hook installs) under the store mutex. lens-overengineering#1 and core-engine#2 also cite guardrail.confirm's replay through the same function. All cite this one mechanism. This is the task's own example.",
+   "severity_notes": [
+    "core-engine#2 and core-session#13 say medium and the others high. High is right: git fetch (20 s) plus worktree add (120 s), repeated per child on fanout, freezes the whole bus in a normal dispatch flow.",
+    "Members are rated high, except core-session#13 and core-engine#2 (medium). High is right: a normal-flow dispatch freezes the whole bus for the length of a git fetch and checkout, which the rubric counts as a freeze of the bus."
+   ],
+   "shards": [
+    "engine-core-1",
+    "handlers-core"
+   ]
+  },
+  {
+   "keep": "core-engine#1",
+   "dupes": [
+    "core-guardrail#1",
+    "sec-local-ipc#2"
+   ],
+   "note": "guardrail.confirm calls replay_registered before set_session (guardrail.rs:583 vs 593), and replay_registered swaps only actor and skip_policy. A replayed agent file.write therefore resolves root(ctx, ..) with session None, and file.rs:401-408 returns the project's primary checkout. All three quote the same lines.",
+   "severity_notes": [
+    "core-engine#1 says critical and the other two high. Critical is defensible because a confirmed write silently overwrites files in the user's main checkout (data loss). Skeptic-verified as critical.",
+    "core-guardrail#1 and sec-local-ipc#2 say high; core-engine#1 says critical, and both of its verifiers agreed. Critical fits the rubric: the confirmed destructive write goes to the user's main checkout with the destructive-write check skipped. It silently overwrites uncommitted user edits there (data loss), and this happens in the normal hold-and-confirm flow."
+   ],
+   "shards": [
+    "engine-core-1",
+    "handlers-core"
+   ]
+  },
+  {
+   "keep": "sec-local-ipc#5",
+   "dupes": [
+    "core-guardrail#8"
+   ],
+   "note": "self_approval (guardrail.rs:857-881) treats any word whose stem starts with 'relay', plus any word equal to a user-only op or starting with RELAY_SESSION=, as a self-approval attempt, instead of parsing argv[0] and relay's op argument. One rewrite (judge only the executed relay invocation) fixes both the false refusals of ordinary rg/grep that core-guardrail#8 reports and the missed spellings in sec-local-ipc#5.",
+   "severity_notes": [],
+   "shards": [
+    "engine-core-1"
+   ]
+  },
+  {
+   "keep": "core-guardrail#2",
+   "dupes": [
+    "lens-overengineering#3",
+    "sec-guardrail-bypass#2",
+    "sec-local-ipc#6",
+    "tests-bus-guardrails#2",
+    "tests-mirror-board#2"
+   ],
+   "note": "denied_matches (guardrail.rs:975-988) keeps only unquoted words and requires the pattern as one exact, contiguous, lower-cased window (`bare.windows(..).any(|w| w == wanted)`). `git push -f`, `rm -fr`, `/bin/rm -rf`, `git clean -fdx` and reordered flags all pass the default denials. All six quote that line and propose argv/flag-set normalization.",
+   "severity_notes": [
+    "sec-local-ipc#6 says medium and the rest high. High is right: a guardrail that is bypassed silently by everyday spellings."
+   ],
+   "shards": [
+    "engine-core-1"
+   ]
+  },
+  {
+   "keep": "lens-dead-dup#2",
+   "dupes": [
+    "core-device-mirror#11"
+   ],
+   "note": "guardrail::shell_commands splits only on `; \\n | &` (guardrail.rs:939), while device_lease::split_commands (device_lease.rs:365-394) is a second, diverged tokenizer that does split on ( ) backtick $(. Both findings' fix is the same: make one shared tokenizer with subshell and substitution splitting and use it in guardrail and device_lease. That fixes the denied-command miss for `(cmd)` and `$(cmd)` and removes the duplication.",
+   "severity_notes": [
+    "core-device-mirror#11 is rated low duplication and lens-dead-dup#2 high security. The security impact governs: high."
+   ],
+   "shards": [
+    "engine-core-1"
+   ]
+  },
+  {
+   "keep": "core-guardrail#17",
+   "dupes": [
+    "tests-bus-guardrails#3"
+   ],
+   "note": "shell_commands treats heredoc bodies (and `#` comments) as commands, so writing text that mentions a denied command is refused. Both cite guardrail.rs:939 and the same heredoc trigger.",
+   "severity_notes": [
+    "core-guardrail#17 says low and tests-bus-guardrails#3 medium. Medium is right: it refuses ordinary agent work (writing docs or scripts) in a normal flow, with no grant workaround noted."
+   ],
+   "shards": [
+    "engine-core-1"
+   ]
+  },
+  {
+   "keep": "core-guardrail#21",
+   "dupes": [
+    "bus#18",
+    "lens-dead-dup#22"
+   ],
+   "note": "The layer-3 bus_writes/allow_ui predicate (the `starts_with(\"file.\") || git.stage|unstage|commit` and ui./os. checks) is written twice, in authorize (363-383) and callability (422-436). core-guardrail#21 also notes a delete_under copy in the guardrail config handler; kept as the most complete.",
+   "severity_notes": [],
+   "shards": [
+    "engine-core-1"
+   ]
+  },
+  {
+   "keep": "core-guardrail#12",
+   "dupes": [
+    "lens-errors-panics#3"
+   ],
+   "note": "evaluate_write (guardrail.rs:572) reads the old file with read_to_string and falls back to empty on a non-UTF-8 file or a read error, so a rewrite never counts as destructive. Same line, same trigger.",
+   "severity_notes": [
+    "core-guardrail#12 says data-loss and lens-errors-panics#3 bug; both are medium. Medium stands."
+   ],
+   "shards": [
+    "engine-core-1"
+   ]
+  },
+  {
+   "keep": "core-guardrail#9",
+   "dupes": [
+    "tests-mirror-board#4"
+   ],
+   "note": "recoverable() (guardrail.rs:687) counts a git-ignored file as recoverable, so destructive rewrites of .env and local configs are allowed although git cannot restore them. Same function, same trigger.",
+   "severity_notes": [],
+   "shards": [
+    "engine-core-1"
+   ]
+  },
+  {
+   "keep": "core-guardrail#11",
+   "dupes": [
+    "core-workspace-files#2",
+    "lens-dead-dup#5",
+    "sec-local-ipc#3"
+   ],
+   "note": "relative_path/path_matches (guardrail.rs:1135-1168) and handlers/file.rs:470-486 compare raw path strings, so `./.env`, `a//b` and `a/./b` slip past protected_paths and shape gates. One normalization of paths before matching fixes all four.",
+   "severity_notes": [
+    "Both members rate this medium. The rubric's 'a safety check that can be silently bypassed' suggests high."
+   ],
+   "shards": [
+    "engine-core-1",
+    "handlers-other-1"
+   ]
+  },
+  {
+   "keep": "core-guardrail#5",
+   "dupes": [
+    "lens-overengineering#2"
+   ],
+   "note": "glob_match (guardrail.rs:1171-1185) keeps a single backtrack point, so a later `*` drops the `**` restart. `**/*.pem` and `dir/**/*.ext` then miss files more than one directory deep. Same matcher, same fix.",
+   "severity_notes": [],
+   "shards": [
+    "engine-core-1"
+   ]
+  },
+  {
+   "keep": "core-guardrail#13",
+   "dupes": [
+    "lens-store-mutex#6",
+    "tests-mirror-board#5"
+   ],
+   "note": "guardrail.gate and guardrail.check are plain Engine::register handlers (handlers/guardrail.rs:151,304). Inside the transaction, evaluate_commit runs `git diff --cached --numstat` (760) and recoverable runs `git status` (671-679). lens-store-mutex#6 bundles this with device.run's adb probe and provider.refresh; those parts are covered by their own findings core-device-handler#4 and core-pty-providers#5.",
+   "severity_notes": [],
+   "shards": [
+    "engine-core-1",
+    "handlers-core"
+   ]
+  },
+  {
+   "keep": "sec-local-ipc#4",
+   "dupes": [
+    "sec-guardrail-bypass#4"
+   ],
+   "note": "Commit-time guardrails (caps, protected paths at commit) live only in the pre-commit hook installed by hooks::install_git, and an agent can skip it with `git commit --no-verify`. Nothing re-checks the branch afterwards.",
+   "severity_notes": [
+    "sec-guardrail-bypass#4 says medium and sec-local-ipc#4 high. High is right: a safety check that is silently bypassed. Skeptic-verified as high."
+   ],
+   "shards": [
+    "engine-core-1"
+   ]
+  },
+  {
+   "keep": "core-git#8",
+   "dupes": [
+    "sec-supply-chain#10"
+   ],
+   "note": "install_git's per-worktree core.hooksPath override (hooks.rs:153) points at a dir with only pre-commit, so every other hook (git-lfs pre-push and others) stops running, in primary checkouts too. Same line, same fix.",
+   "severity_notes": [],
+   "shards": [
+    "engine-core-1"
+   ]
+  },
+  {
+   "keep": "core-hooks-skills#9",
+   "dupes": [
+    "tests-features#5"
+   ],
+   "note": "run_user_pre_commit (hooks.rs:210-213) runs the user's hook with Command::output() and no proc::output_with_timeout. tests-features#5 adds that through guardrail.confirm's replay it also runs under the store lock; that part is the invoke_registered group.",
+   "severity_notes": [],
+   "shards": [
+    "engine-core-1"
+   ]
+  },
+  {
+   "keep": "core-hooks-skills#3",
+   "dupes": [
+    "lens-errors-panics#14"
+   ],
+   "note": "install_claude/install_codex skip installing whenever any handler contains the CLAUDE_PRE_TOOL marker (hooks.rs:333-341, 512-515), so a stale relay path or instance is never refreshed. A missing binary exits 127, which Claude treats as non-blocking. Same check, same fix (rewrite Relay-owned handlers).",
+   "severity_notes": [],
+   "shards": [
+    "engine-core-1"
+   ]
+  },
+  {
+   "keep": "sec-supply-chain#5",
+   "dupes": [
+    "sec-local-ipc#7"
+   ],
+   "note": "Relay puts enforcement config the provider trusts (.claude/settings.local.json hooks, plus the statusline script) inside the agent-writable worktree, with no default protected path. The re-install only checks a marker substring, so an agent can disable or alter its own hook. Both propose moving the config out of the worktree, or protecting it and rewriting it exactly.",
+   "severity_notes": [],
+   "shards": [
+    "engine-core-1"
+   ]
+  },
+  {
+   "keep": "sec-supply-chain#18",
+   "dupes": [
+    "lens-data-loss#15"
+   ],
+   "note": "install_codex rewrites a repository-tracked .codex/hooks.json with machine-specific Relay commands (hooks.rs:494-553), so agents can commit them. Same function, same fix.",
+   "severity_notes": [],
+   "shards": [
+    "engine-core-1"
+   ]
+  },
+  {
+   "keep": "core-hooks-skills#5",
+   "dupes": [
+    "core-git#13",
+    "core-workspace-files#31"
+   ],
+   "note": "ensure_excluded for `.relay/` (and Relay's provider files) runs only when Relay creates a pooled worktree (worktree.rs:199). Primary-checkout sessions and early file ops write .relay/ into the project root unexcluded, and a commit then picks it up. One fix covers all: exclude at the repository level whenever Relay writes there.",
+   "severity_notes": [
+    "core-workspace-files#31 says low and the others medium. Medium is right: hook scripts, MCP config and briefs get committed in a normal primary-checkout flow.",
+    "core-workspace-files#31 says low; the others say medium. Medium is right: with the Unreal plugin's primary-checkout default this happens in normal use and pushes hook scripts and briefs to the team."
+   ],
+   "shards": [
+    "engine-core-1",
+    "engine-core-2"
+   ]
+  },
+  {
+   "keep": "core-engine#5",
+   "dupes": [
+    "core-socket-store#4",
+    "lens-docs#22",
+    "sec-fs-injection#2",
+    "sec-local-ipc#11",
+    "sec-supply-chain#8"
+   ],
+   "note": "Instance::runtime_dir falls back to a predictable /tmp/relay-v4-<uid> without checking owner or mode, and SocketServer::start_in opens and truncates the lock file through symlinks. Another local user can pre-create the dir, hijack the socket or truncate victim files. All six cite paths.rs:72 and socket.rs:55-60/96-100.",
+   "severity_notes": [
+    "Ratings range from low to high. High is right: another local user can exploit it, but only when XDG_RUNTIME_DIR is unset, which is uncommon in a desktop session. Skeptic-verified as high.",
+    "core-socket-store#4 says medium and lens-docs#22 says low. Medium is right: it is reachable by another local user, but only when XDG_RUNTIME_DIR is unset."
+   ],
+   "shards": [
+    "engine-core-1",
+    "engine-core-2"
+   ]
+  },
+  {
+   "keep": "core-engine#12",
+   "dupes": [
+    "lens-concurrency#16"
+   ],
+   "note": "dispatch_inner publishes events after releasing the store lock (engine.rs:1027), so two commits to the same entity can reach subscribers in reverse order, and the UI keeps the stale session row. Same line, same fix.",
+   "severity_notes": [],
+   "shards": [
+    "engine-core-1"
+   ]
+  },
+  {
+   "keep": "core-git#3",
+   "dupes": [
+    "core-git#18",
+    "lens-contract#5",
+    "lens-dead-dup#4",
+    "lens-docs#4",
+    "lens-overengineering#4",
+    "lens-perf#5",
+    "lens-sqlite#2",
+    "lens-store-mutex#3",
+    "lens-subprocess#2",
+    "sec-local-ipc#10",
+    "tests-features#2",
+    "tests-sessions#3"
+   ],
+   "note": "Shared root: worktree::git (worktree.rs:26-33, `Command::new(\"git\")...output()`), which git_mutate/remove/rename_branch all go through, has no proc::output_with_timeout and no prompt suppression, and locked handlers call it. Re-read worktree.rs:26-36 in the current tree: unchanged. lens-sqlite#2 lists the locked callers most completely. Extras that should go into the kept finding: core-git#18 adds the github.rs runners, sec-local-ipc#10 adds the pre-commit hook replayed under guardrail.confirm, and lens-overengineering#4 adds the 'seven runners' consolidation and a clippy disallowed-methods guard.",
+   "severity_notes": [
+    "core-git#18 and lens-docs#4 say medium; the rest say high. High is right: a hung or slow git (LFS filter, gpg pinentry, credential prompt) under the store mutex freezes the whole bus, with no deadline, in normal flows such as stage, commit and branch create.",
+    "High is right: a freeze of the bus in normal git-panel flows, such as gpg pinentry or the LFS clean filter. lens-perf#5's medium undercounts it."
+   ],
+   "shards": [
+    "engine-core-2",
+    "handlers-other-1"
+   ]
+  },
+  {
+   "keep": "core-pty-providers#1",
+   "dupes": [
+    "core-socket-store#2",
+    "lens-data-loss#11",
+    "lens-errors-panics#2",
+    "lens-resources#7",
+    "lens-sqlite#3",
+    "perf-harness#12",
+    "tests-sessions#5"
+   ],
+   "note": "recovery::run_with step 2 (recovery.rs:86-88) calls kill_wait on the stored sessions.pid after only a pid_alive check, with no start-time or identity check. A reused pid gets SIGTERM and then SIGKILL, along with its process group. All eight cite the same lines and propose the same fix: record the start time and verify it.",
+   "severity_notes": [],
+   "shards": [
+    "engine-core-2"
+   ]
+  },
+  {
+   "keep": "core-socket-store#12",
+   "dupes": [
+    "lens-perf#11",
+    "lens-resources#11",
+    "lens-sqlite#8"
+   ],
+   "note": "Recovery step 7 (recovery.rs:218) runs VACUUM whenever any audit row was pruned. Once the store is older than the retention window, rows age out on nearly every start, so the whole store is rewritten (in RAM with temp_store=MEMORY) before the socket opens. All four cite the same line and give the same fix.",
+   "severity_notes": [],
+   "shards": [
+    "engine-core-2"
+   ]
+  },
+  {
+   "keep": "core-socket-store#3",
+   "dupes": [
+    "core-engine#10",
+    "lens-errors-panics#12"
+   ],
+   "note": "time::days_ago (time.rs:15-16) builds a SignedDuration from hours and subtracts it from Timestamp::now(), which panics when audit.retention_days is very large. Recovery calls it on every launch, so the engine can never start again. Checked time.rs and recovery.rs:186: the value is not clamped.",
+   "severity_notes": [
+    "core-socket-store#3 says medium; the other two say low. Medium is right: the trigger is a rare user setting, but the result is an engine that cannot start until the store is hand-edited."
+   ],
+   "shards": [
+    "engine-core-2"
+   ]
+  },
+  {
+   "keep": "core-misc-handlers#4",
+   "dupes": [
+    "core-socket-store#7",
+    "lens-errors-panics#6",
+    "lens-sqlite#11"
+   ],
+   "note": "Recovery has no reconciliation step for integrations. A restart in the middle of merging, building or deploying leaves the row non-terminal forever, and workspace.rs then refuses project.remove and workspace.remove. One fix covers all four: mark interrupted integrations failed in recovery. lens-errors-panics#6 also mentions hung builds, which is the separate core-misc-handlers#8 issue (untimed children).",
+   "severity_notes": [],
+   "shards": [
+    "engine-core-2",
+    "handlers-other-2"
+   ]
+  },
+  {
+   "keep": "lens-resources#1",
+   "dupes": [
+    "core-hooks-skills#6",
+    "core-workspace-files#25",
+    "lens-concurrency#4",
+    "lens-perf#10"
+   ],
+   "note": "Engine::watchers and watch::ensure / ensure_after_commit (watch.rs:53, 133-138) insert one recursive notify watcher per root and never remove it. Each leaks a thread and an inotify instance per worktree, and a recreated or pooled path keeps a dead watcher. The one fix is a release path keyed to worktree or session lifetime.",
+   "severity_notes": [],
+   "shards": [
+    "engine-core-2",
+    "handlers-other-1"
+   ]
+  },
+  {
+   "keep": "core-hooks-skills#17",
+   "dupes": [
+    "lens-perf#14"
+   ],
+   "note": "watch::ensure registers RecursiveMode::Recursive on the project root (watch.rs:133). That covers every pooled session worktree under .relay and all build output, and only afterwards filters events with is_generated_path. Both findings ask to scope the watch registration. lens-perf#14 adds the IN_OPEN flood and queue-overflow consequences.",
+   "severity_notes": [
+    "core-hooks-skills#17 says medium and lens-perf#14 says low. Medium is reasonable: the inotify watch budget and CPU cost grow with every worktree in normal use."
+   ],
+   "shards": [
+    "engine-core-2"
+   ]
+  },
+  {
+   "keep": "core-pty-providers#3",
+   "dupes": [
+    "core-socket-store#9",
+    "lens-concurrency#8"
+   ],
+   "note": "The PTY reader thread does `seq.fetch_add` before `ring.lock().push(seq, ..)` (pty.rs:223-225 in the current tree). Pty::attach reads self.seq() and then the ring, so an attach in that window can drop a frame or replay a large catch-up. All three cite the same ordering and give the same fix: publish seq under the ring lock.",
+   "severity_notes": [
+    "core-socket-store#9 says low; the others say medium. Medium is right: terminal output is silently lost or duplicated on reattach, which happens often in normal use."
+   ],
+   "shards": [
+    "engine-core-2"
+   ]
+  },
+  {
+   "keep": "core-pty-providers#19",
+   "dupes": [
+    "lens-perf#20"
+   ],
+   "note": "Ring::push (pty.rs:57-65) extends the VecDeque and trims afterwards, so the buffer grows to about twice its 8 MiB budget per PTY. Same line, same fix.",
+   "severity_notes": [],
+   "shards": [
+    "engine-core-2"
+   ]
+  },
+  {
+   "keep": "core-hooks-skills#7",
+   "dupes": [
+    "core-pty-providers#24"
+   ],
+   "note": "skills::fill copies library_dir(id), including the upstream SKILL.md, and writes row.body only `if !instructions.is_file()` (skills.rs:340-344). skill.update edits therefore never reach the materialized SKILL.md. Same lines, same fix: always write row.body after the copy.",
+   "severity_notes": [
+    "core-hooks-skills#7 says medium and core-pty-providers#24 says low. Medium is right: editing an installed skill in the skill editor is a normal flow, and agents silently keep the old instructions.",
+    "core-pty-providers#24 low vs core-hooks-skills#7 medium; medium is right: editing an installed skill in the Skills editor is a normal flow and the edit silently never reaches agents."
+   ],
+   "shards": [
+    "engine-core-2",
+    "handlers-other-2"
+   ]
+  },
+  {
+   "keep": "core-hooks-skills#11",
+   "dupes": [
+    "core-pty-providers#8"
+   ],
+   "note": "skills::adopt (remove_dir_all, then rename into <store>/skills/<id>) runs inside skill.install's finish transaction (provider.rs:504-508). A rollback leaves the folder in place, and the next skill that reuses the rolled-back AUTOINCREMENT id picks it up. Same mechanism, same fix: adopt after commit.",
+   "severity_notes": [],
+   "shards": [
+    "engine-core-2",
+    "handlers-other-2"
+   ]
+  },
+  {
+   "keep": "core-pty-providers#9",
+   "dupes": [
+    "core-hooks-skills#19",
+    "lens-concurrency#19"
+   ],
+   "note": "Every skill or plugin mutation spawns its own refresh_all thread (provider.rs:532-538). Each plans under the store lock, then applies without a lock and without taking hooks::writes(). Concurrent materializers race, a stale plan can win, and fill's error path deletes another writer's folder. All three propose one serialized, coalescing worker.",
+   "severity_notes": [
+    "core-pty-providers#9 says medium; the other two say low. Medium is right: a real race in an ordinary flow (two quick toggles) that leaves the wrong skills materialized until the next refresh.",
+    "core-pty-providers#9 says medium, the others low; medium is right: a stale plan can leave the wrong skill set (or a deleted folder via fill's error path) in agents' checkouts after ordinary toggles."
+   ],
+   "shards": [
+    "engine-core-2",
+    "handlers-other-2"
+   ]
+  },
+  {
+   "keep": "core-hooks-skills#13",
+   "dupes": [
+    "plugins-unreal#7"
+   ],
+   "note": "enabled_anywhere/plan_user (skills.rs:172-220) materialize a plugin's skills into the machine-wide ~/.claude/skills and $CODEX_HOME/skills when the plugin is enabled in any project, so every project and every Claude Code session gets them. Same code, same fix.",
+   "severity_notes": [],
+   "shards": [
+    "engine-core-2"
+   ]
+  },
+  {
+   "keep": "core-hooks-skills#14",
+   "dupes": [
+    "lens-data-loss#6",
+    "sec-supply-chain#16"
+   ],
+   "note": "Dev and stable instances share namespaces that live outside the instance directory: the user-scope skill folders (user_bases ignores the instance) and the per-repo .relay/hooks and trash slots. Each instance's cleanup (skills::prune, hooks::sweep_hook_dirs from recovery.rs:124-139) deletes the other instance's live state. The single fix all three propose is to namespace by instance or record ownership in a marker. lens-data-loss#6 also covers trash-slot collisions, which the same namespacing fixes.",
+   "severity_notes": [
+    "sec-supply-chain#16 says low; the others say medium. Medium is right: the dev and stable split is the author's normal setup (run.sh defaults to dev), and the sweep can leave core.hooksPath dangling, so commits go ungated."
+   ],
+   "shards": [
+    "engine-core-2"
+   ]
+  },
+  {
+   "keep": "core-git#1",
+   "dupes": [
+    "lens-data-loss#1",
+    "tests-sessions#4"
+   ],
+   "note": "The WorktreeRemove handler (git.rs:129-144) passes an unvalidated path, which can be relative to the engine's cwd, to worktree::remove. That function falls back to remove_dir_all whenever `git worktree remove` refuses (worktree.rs:360-365). Same code path, same fix: validate that the path is a worktree of the project, and drop the blind fallback.",
+   "severity_notes": [],
+   "shards": [
+    "engine-core-2",
+    "handlers-other-1"
+   ]
+  },
+  {
+   "keep": "lens-perf#2",
+   "dupes": [
+    "lens-overengineering#6",
+    "native-app#3",
+    "native-codegit#4",
+    "native-launch#6"
+   ],
+   "note": "handle_conn (socket.rs:335-744) awaits each dispatch before it reads the next line, while the native client multiplexes all UI traffic on one control connection. Any slow op (clone, gh api --paginate, file.search, bus.wait) blocks every later UI request on that connection. One fix covers all four: concurrent per-connection dispatch, or a client connection pool. native-launch#6 is the onboarding instance of the same head-of-line blocking.",
+   "severity_notes": [
+    "lens-overengineering#6 and native-launch#6 say medium; lens-perf#2 and native-app#3 say high. High is right: the whole UI freezes in normal use.",
+    "native-launch#6 rated medium; high is right, because this is a UI/bus freeze in normal flows (push, commit, clone) per the rubric.",
+    "launch#6 says medium; native-app#3 and lens-perf#2 say high. High is right for the shared root cause: any slow op freezes the whole UI's bus traffic, and the rubric rates a UI freeze as high."
+   ],
+   "shards": [
+    "engine-core-2",
+    "native-main",
+    "native-other-2"
+   ]
+  },
+  {
+   "keep": "core-socket-store#6",
+   "dupes": [
+    "lens-concurrency#15",
+    "lens-errors-panics#10",
+    "lens-resources#14"
+   ],
+   "note": "Every `?` inside handle_conn's loop (read error, ECONNRESET, a spawn_blocking JoinError from a handler panic) returns before the cleanup block at socket.rs:746-759. The subscription and attach tasks are never aborted, which leaves a half-open connection that keeps streaming. One fix: run the cleanup on every exit, with a guard or a labelled loop.",
+   "severity_notes": [
+    "core-socket-store#6 and lens-errors-panics#10 say medium; the others say low. Medium is right: a handler panic turns the UI's connection into a zombie until the app reconnects."
+   ],
+   "shards": [
+    "engine-core-2"
+   ]
+  },
+  {
+   "keep": "core-engine#13",
+   "dupes": [
+    "core-socket-store#15"
+   ],
+   "note": "The bus.subscribe forwarder (socket.rs:385, 432) handles broadcast RecvError::Lagged by continuing silently, so the client never gets a resync signal. Same code, same fix: emit a resync notice.",
+   "severity_notes": [],
+   "shards": [
+    "engine-core-2"
+   ]
+  },
+  {
+   "keep": "lens-concurrency#11",
+   "dupes": [
+    "core-socket-store#10",
+    "lens-perf#13",
+    "lens-store-mutex#11"
+   ],
+   "note": "After session.attach, the async task calls handlers::session::pty_by_name, which does engine.store.lock() (session.rs:1733) on a tokio worker thread (socket.rs:469). A long locked handler then parks runtime workers. Same line, same fix: resolve the PTY from the in-memory index or inside spawn_blocking. lens-concurrency#11 is kept because it is the superset: it also covers the app.resources.watch tick and the inline keystroke write.",
+   "severity_notes": [],
+   "shards": [
+    "engine-core-2"
+   ]
+  },
+  {
+   "keep": "core-socket-store#23",
+   "dupes": [
+    "sec-fs-injection#1",
+    "sec-local-ipc#12",
+    "sec-supply-chain#19"
+   ],
+   "note": "Store::open and backup_to (store.rs:386-388, 556) create store.db, its WAL and the backups with the umask default, typically 0644, unlike the deliberately 0600 remote.json. All four cite the same code and the same fix.",
+   "severity_notes": [],
+   "shards": [
+    "engine-core-2"
+   ]
+  },
+  {
+   "keep": "core-socket-store#11",
+   "dupes": [
+    "lens-sqlite#10"
+   ],
+   "note": "app.backup.now (handlers/app.rs:47-51) is a plain register handler that calls backup_to, which copies the whole database while the store mutex is held. core-socket-store#11 also notes that backup_with can spin after a write. Same handler, same fix: move it to an unlocked path.",
+   "severity_notes": [
+    "core-socket-store#11 says medium and lens-sqlite#10 says low. Medium is right: a manual backup of a large store freezes the bus for the whole copy.",
+    "Medium (core-socket-store#11) is right over low. The bus freezes for seconds on a normal Settings action, but only when the user clicks the button."
+   ],
+   "shards": [
+    "engine-core-2",
+    "handlers-other-1"
+   ]
+  },
+  {
+   "keep": "core-pty-providers#25",
+   "dupes": [
+    "lens-errors-panics#8"
+   ],
+   "note": "usage::read_tail reads the last 1 MiB of a Codex log as a String (usage.rs:61, 90-96). When the tail starts inside a multi-byte character the UTF-8 error aborts the whole read_codex scan. Same code, same fix: lossy decode or skip to the next newline.",
+   "severity_notes": [],
+   "shards": [
+    "engine-core-2"
+   ]
+  },
+  {
+   "keep": "lens-overengineering#13",
+   "dupes": [
+    "core-pty-providers#18"
+   ],
+   "note": "Driver::profile() (providers.rs:193-198, 236-241) is a hand-written JSON copy of args() that has already drifted (it omits the resume --model/--effort flags). It is persisted in provider_cache and served stale by provider.list. Both propose deriving it from args() or deleting it. lens-overengineering#13 is kept because it also covers the rest of the thin Driver abstraction.",
+   "severity_notes": [],
+   "shards": [
+    "engine-core-2"
+   ]
+  },
+  {
+   "keep": "core-session#3",
+   "dupes": [
+    "core-tasks-notes#1"
+   ],
+   "note": "Group membership is decided by worktree equality instead of an explicit PAIR link. complete_group_assignment counts builders and reviewers with `s.worktree=?2` (session.rs:100-118), and assign_session queues the task for every live session with `worktree=?1` (task.rs:572). Both findings name both sites, and both fixes say the same thing: store the group explicitly (pair_with or a group id) and use that one predicate everywhere. Independent agents on the shared primary checkout (D160) then fan out and deadlock through the same predicate.",
+   "severity_notes": [],
+   "shards": [
+    "handlers-core"
+   ]
+  },
+  {
+   "keep": "core-guardrail#6",
+   "dupes": [
+    "lens-contract#1",
+    "native-misc#4",
+    "tests-bus-guardrails#1"
+   ],
+   "note": "For a frozen guardrail.gate, confirm (guardrail.rs:598-651) only re-evaluates and marks the hold confirmed. It persists nothing that a later gate reads: Grants::load reads only guardrail.request holds (grants.rs:51-53). The hook has already exited non-zero (relay-cli main.rs:471-483, hooks.rs:130-132), so the retry is held again. All three propose the same fix: a one-use pass consumed by gate, or have the hook wait on guardrail.resolved.",
+   "severity_notes": [],
+   "shards": [
+    "handlers-core",
+    "native-other-1"
+   ]
+  },
+  {
+   "keep": "lens-resources#5",
+   "dupes": [
+    "core-tasks-notes#12",
+    "lens-sqlite#9"
+   ],
+   "note": "MailboxList (notes.rs:660-689) has no LIMIT or cursor over a messages table that is never pruned, and the native mailbox page re-runs it on every event. The fix is the same in all three: paginate mailbox.list and prune or archive old messages. core-tasks-notes#12 also mentions task.list having no limit, and lens-resources#5's fix covers that as well. lens-sqlite#17 is the separate N+1 hydration issue in task.list.",
+   "severity_notes": [
+    "lens-resources#5 says high; the other two say medium. High is right: growth is unbounded in normal use, and once the reply passes 2 MiB the GUI drops its whole control connection (client.rs:200), which counts as a user-visible failure."
+   ],
+   "shards": [
+    "handlers-core"
+   ]
+  },
+  {
+   "keep": "core-tasks-notes#6",
+   "dupes": [
+    "lens-sqlite#6"
+   ],
+   "note": "Mailbox list, outbox and priority lookups key on the session name (notes.rs:640, 672, 293), but names are recycled after close (sessions.rs:73-89, unique only WHERE state!='closed'), while ack matches session_id (694). One fix covers both findings: resolve to the live session_id and join on mr.session_id. lens-sqlite#6 also notes the overlap fingerprint uses names.",
+   "severity_notes": [],
+   "shards": [
+    "handlers-core"
+   ]
+  },
+  {
+   "keep": "lens-sqlite#4",
+   "dupes": [
+    "core-session#6"
+   ],
+   "note": "session.create's 'new' checkout path (session.rs:866-869) reuses an existing relay/<name> branch. Names are recycled after close (sessions.rs:74), so a new session silently starts on a closed namesake's old branch instead of branching from base. Both findings cite the same lines and the same fix.",
+   "severity_notes": [],
+   "shards": [
+    "handlers-core"
+   ]
+  },
+  {
+   "keep": "core-workspace-files#23",
+   "dupes": [
+    "lens-sqlite#18"
+   ],
+   "note": "`UPDATE overlaps SET active=0 WHERE project_id=?1` (overlap.rs:424-428) has no `AND active=1`, and overlap rows are only deactivated, never deleted (except by project.remove). Both findings give the same fix: add the guard and prune inactive rows.",
+   "severity_notes": [],
+   "shards": [
+    "handlers-core"
+   ]
+  },
+  {
+   "keep": "core-workspace-files#22",
+   "dupes": [
+    "core-session#17"
+   ],
+   "note": "session.claim's claim_path (session.rs:223-237) stores trimmed but unnormalized `path.display()`, while overlap.flag's relative_path (overlap.rs:82-96) requires Normal components. Overlap matching compares exact strings, so equivalent claims never collide. The fix in both is one shared normalizer. core-workspace-files#22 is broader and also lists the file/git/guardrail validators.",
+   "severity_notes": [],
+   "shards": [
+    "handlers-core"
+   ]
+  },
+  {
+   "keep": "tests-features#3",
+   "dupes": [
+    "core-session#20"
+   ],
+   "note": "BUS.md \u00a79.2 (line 497) lists session.done as a per-task caps enforcement point, but the Done handler (session.rs:1140-1226) evaluates no caps. Both findings ask for either implementing the check or correcting the doc. core-session#20 also notes the \u00a710.8 reviewer wording; tests-features#3 adds that --no-verify bypasses the hook.",
+   "severity_notes": [
+    "tests-features#3 says medium; core-session#20 says low. Medium is right: the docs promise a safety cap that does not run, so over-cap work reaches review unchecked."
+   ],
+   "shards": [
+    "handlers-core"
+   ]
+  },
+  {
+   "keep": "core-session#31",
+   "dupes": [
+    "lens-sqlite#16"
+   ],
+   "note": "session.report (session.rs:1354-1396), the op that runs on every agent tool use, re-reads done_pending_stop with an uncached query_row and runs its UPDATEs through Connection::execute. Both findings give the same fix: carry done_pending_stop in Row_ and use prepare_cached. lens-sqlite#16 also mentions get_task being uncached, which overlaps core-tasks-notes#17.",
+   "severity_notes": [],
+   "shards": [
+    "handlers-core"
+   ]
+  },
+  {
+   "keep": "sec-supply-chain#1",
+   "dupes": [
+    "core-session#1"
+   ],
+   "note": "session.report stores the agent-supplied data.session_id/provider_ref without validation (session.rs:1358, 1371-1374). On resume or wake it becomes a provider argv element (providers.rs:185 `--resume <ref>`, 229 positional) with no `--` or leading-dash check, so an agent can inject CLI flags. Both findings cite the same code and the same fix.",
+   "severity_notes": [
+    "sec-supply-chain#1 says high (skeptic-verified twice); core-session#1 says medium. High is right. Flag injection can disable the guardrail hook or the Codex sandbox on the next resume. The case for critical is that this is an agent escaping its guardrails, but it requires a prompt-injected agent and a later resume, wake or dispatch."
+   ],
+   "shards": [
+    "handlers-core"
+   ]
+  },
+  {
+   "keep": "core-session#8",
+   "dupes": [
+    "tests-mirror-board#7"
+   ],
+   "note": "The Report handler writes the new state from the hook kind unconditionally (`UPDATE sessions SET state=?1 ... WHERE id=?4`, session.rs:1361-1374). There is no `state IN ('spawning','running','idle','blocked')` guard like the one on the PTY-exit path, so the update can overwrite blocked, parked, exited or created rows. Both findings give the same fix.",
+   "severity_notes": [
+    "core-session#8 says medium; tests-mirror-board#7 says low. Medium is right: the Stop hook routinely demotes 'blocked' set by session.done(blocked) in the same turn, so the user sees the wrong state."
+   ],
+   "shards": [
+    "handlers-core"
+   ]
+  },
+  {
+   "keep": "core-session#15",
+   "dupes": [
+    "lens-sqlite#14"
+   ],
+   "note": "session.discard_restorable's finish (session.rs:1526-1533) copies session.close's cleanup but skips the step that expires the session's open guardrail holds (close does this around 1612). Both findings give the same fix: share the close teardown.",
+   "severity_notes": [
+    "core-session#15 says medium; lens-sqlite#14 says low. Medium is right: duplicated logic has already diverged and leaves holds pending forever, which the rubric places at medium."
+   ],
+   "shards": [
+    "handlers-core"
+   ]
+  },
+  {
+   "keep": "lens-data-loss#8",
+   "dupes": [
+    "core-session#14"
+   ],
+   "note": "session.close (remove_worktree defaults to true, session.rs:1548, 1577-1579) and discard_restorable (1521-1523) call worktree::remove with `git worktree remove --force` and never run a dirty check. The fix is the same in both: refuse with worktree.dirty unless forced. lens-data-loss#8 also covers project.remove.",
+   "severity_notes": [],
+   "shards": [
+    "handlers-core"
+   ]
+  },
+  {
+   "keep": "core-session#2",
+   "dupes": [
+    "core-hooks-skills#2",
+    "plugins-unreal#3",
+    "tests-sessions#1"
+   ],
+   "note": "Close prepare calls hooks::remove_hook_dir (session.rs:1596, hooks.rs:283-287) on a hook dir that the shared checkout's core.hooksPath still points at for the remaining sessions, which silently disables the commit gate. All four findings cite the same call and the same fix (refcount, or re-point the hooks path before deleting).",
+   "severity_notes": [],
+   "shards": [
+    "handlers-core"
+   ]
+  },
+  {
+   "keep": "core-session#24",
+   "dupes": [
+    "lens-perf#15"
+   ],
+   "note": "The session.scrollback handler (session.rs:1705) defaults to the whole 8 MiB ring and copies and serializes it inside the locked transaction. The fix is the same in both: cap the default and register it unlocked.",
+   "severity_notes": [],
+   "shards": [
+    "handlers-core"
+   ]
+  },
+  {
+   "keep": "core-tasks-notes#8",
+   "dupes": [
+    "lens-sqlite#5",
+    "lens-store-mutex#13",
+    "tests-mirror-board#6"
+   ],
+   "note": "task.activity (task.rs:763-766) scans the project's whole audit history with json_extract under the store lock every time a task page opens. All four findings cite the same query and the same fix (an indexed task_id column, or a bounded scan). lens-sqlite#5 also mentions audit.list.",
+   "severity_notes": [
+    "Three say medium; lens-store-mutex#13 says low. Medium is right: the cost grows with audit history, under the lock, on a common UI action."
+   ],
+   "shards": [
+    "handlers-core"
+   ]
+  },
+  {
+   "keep": "lens-store-mutex#10",
+   "dupes": [
+    "core-tasks-notes#9"
+   ],
+   "note": "task.attach is a plain register handler that does `std::fs::read(&src)` and attach_bytes writes the file (task.rs:993, 505-538), with no size cap, inside the transaction. Both findings give the same fix: cap the size and copy in an unlocked or staged phase. lens-store-mutex#10 is kept because it also covers file.import (overlaps core-workspace-files#13 in another shard) and guard_path_mutation's full read.",
+   "severity_notes": [],
+   "shards": [
+    "handlers-core"
+   ]
+  },
+  {
+   "keep": "core-tasks-notes#15",
+   "dupes": [
+    "tests-mirror-board#8"
+   ],
+   "note": "task.relate discards the INSERT OR IGNORE change count (task.rs:1261-1266) and always records the task.unrelate undo (1269-1276), so undoing a repeated relate deletes the original edge. Both findings give the same fix: use the change count, as LabelAdd does. core-tasks-notes#15 also covers duplicate_of edges that point to deleted tasks.",
+   "severity_notes": [],
+   "shards": [
+    "handlers-core"
+   ]
+  },
+  {
+   "keep": "core-tasks-notes#3",
+   "dupes": [
+    "lens-data-loss#3",
+    "tests-features#1"
+   ],
+   "note": "task.approve resolves refs/heads/<branch> of the assigned session with no fallback (task.rs:1112-1113). branch_cleanup deletes a closed session's merged branch (branch_cleanup.rs:314), so approval fails hard afterwards. All three findings cite the same lines and trigger.",
+   "severity_notes": [],
+   "shards": [
+    "handlers-core"
+   ]
+  },
+  {
+   "keep": "core-engine#11",
+   "dupes": [
+    "lens-contract#9",
+    "lens-sqlite#15"
+   ],
+   "note": "audit.rs target_updated_at (10-27) maps only task./module./notes./project.update/skill. ops and returns Ok(None) for everything else. workspace.update (workspace.rs:144) and session.update (session.rs:1474) record expect.updated_at, so `actual != Some(expected)` always fails as audit.stale. lens-contract#9 leads with this root cause but also bundles three separate bugs that need their own fixes: the session.update inverse carrying branch (core-session#28), undo of a move out of done (core-tasks-notes#4), and the notify.settings.set merge-patch inverse (core-misc-handlers#9).",
+   "severity_notes": [
+    "core-engine#11 and lens-contract#9 say medium; lens-sqlite#15 says low. Medium is right: undo always fails for two common update ops, and core-engine#11 adds that undo silently clobbers later edits for ops recorded without expect."
+   ],
+   "shards": [
+    "handlers-core"
+   ]
+  },
+  {
+   "keep": "core-misc-handlers#21",
+   "dupes": [
+    "lens-dead-dup#12"
+   ],
+   "note": "app.rs dir_usage (line 249) re-implements worktree::dir_size/build_size with its own list of build directories, which has diverged from worktree::BUILD_DIRS (worktree.rs:12). Both findings point at the same pair of definitions.",
+   "severity_notes": [],
+   "shards": [
+    "handlers-other-1"
+   ]
+  },
+  {
+   "keep": "core-device-handler#1",
+   "dupes": [
+    "lens-store-mutex#8",
+    "lens-subprocess#6",
+    "native-mirror#1",
+    "perf-harness#2",
+    "tests-misc#4"
+   ],
+   "note": "AvdCreate and AvdBoot are plain e.register handlers (device.rs:321-358). Inside the transaction they spawn and wait on avdmanager (spawn plus wait_with_output, no deadline), call list_avds_with (emulator -list-avds, device.rs:478) and running_avds_with (adb emu, 505). Every member names these two handlers and these calls. perf-harness#2 also names git.pr.open (core-git#4), which needs its own fix.",
+   "severity_notes": [
+    "High (native-mirror#1, perf-harness#2) is right. The Devices AVD form reaches this in normal use, and with no deadline the whole bus can freeze."
+   ],
+   "shards": [
+    "handlers-other-1"
+   ]
+  },
+  {
+   "keep": "core-device-handler#5",
+   "dupes": [
+    "core-device-mirror#9"
+   ],
+   "note": "device_watch_worker reads `adb track-devices` with read_line (device.rs:375), but the stream is %04x length-prefixed. An empty device list arrives as '0000' with no newline, so unplugging the last device emits no device.changed.",
+   "severity_notes": [],
+   "shards": [
+    "handlers-other-1"
+   ]
+  },
+  {
+   "keep": "core-device-handler#6",
+   "dupes": [
+    "core-device-mirror#10"
+   ],
+   "note": "When track-devices exits, the worker calls runtime.finish and clear_device_watch (device.rs:380-386). That drops the runtime but leaves watch.clients above zero. engine.rs:882 turns a repeated watch-on into a no-op, so the watcher is never respawned. Both findings give the same trigger (adb kill-server) and the same fix (respawn unless stopped).",
+   "severity_notes": [],
+   "shards": [
+    "handlers-other-1"
+   ]
+  },
+  {
+   "keep": "core-device-handler#7",
+   "dupes": [
+    "lens-errors-panics#7"
+   ],
+   "note": "run_worker's logcat loop (device.rs:1779) and stream_command (around 1842-1850) read lines with BufRead::lines/read_line into String. The first non-UTF-8 byte returns Err and ends the loop, which ends the logcat stream (the run is marked finished or the worker blocks in child.wait) and truncates build logs.",
+   "severity_notes": [
+    "Medium is right over low: a binary logcat line ends a run's log in normal use."
+   ],
+   "shards": [
+    "handlers-other-1"
+   ]
+  },
+  {
+   "keep": "core-device-handler#2",
+   "dupes": [
+    "lens-concurrency#14"
+   ],
+   "note": "run_worker never checks runtime.stopped() between phases, and RunRuntime::set_child stores a child without checking stopped(). advance_run, fail_run and finish_build update device_runs with no state guard (device.rs:2194). A device.run.stop during sync, build start or launch is therefore lost and the 'stopped' row is rewritten to 'running'. lens-concurrency#14 reports the same race plus the orphaned logcat that results; both need the same fix (stopped checks and state-guarded updates).",
+   "severity_notes": [
+    "High (core-device-handler#2) is right: Stop does not stop the run in a normal flow, and the device lease is already released."
+   ],
+   "shards": [
+    "handlers-other-1"
+   ]
+  },
+  {
+   "keep": "core-device-mirror#3",
+   "dupes": [
+    "tests-misc#5"
+   ],
+   "note": "command_finished calls Leases::shell_finished on any PostToolUse or Stop (device_lease.rs:137-138, device_lease.rs:253), which cuts every shell lease to the 90 s grace even while a background or parallel device command is still running.",
+   "severity_notes": [],
+   "shards": [
+    "handlers-other-1"
+   ]
+  },
+  {
+   "keep": "lens-perf#6",
+   "dupes": [
+    "core-workspace-files#4",
+    "lens-store-mutex#9"
+   ],
+   "note": "The locked file.write handler reads the old file with no size cap (file.rs:76) and calls line_counts (file.rs:103, 599-610), which is similar's TextDiff::from_lines: Myers with no deadline. The linear changed_line_counts that guardrail::enforce has just computed for the same pair (guardrail.rs:1096-1099) goes unused. All three give the same fix: reuse the guardrail counts or add a timeout. lens-perf#6 also covers the git.rs counts paths, which core-git#7 reports separately.",
+   "severity_notes": [
+    "High (lens-perf#6, skeptic-verified) is right: an agent rewriting a large generated file freezes the bus with the mutex held."
+   ],
+   "shards": [
+    "handlers-other-1"
+   ]
+  },
+  {
+   "keep": "lens-data-loss#9",
+   "dupes": [
+    "core-workspace-files#10"
+   ],
+   "note": "safe_join validates the canonical path but returns the unresolved root.join(rel) (file.rs:489-506), and for a dangling link only the parent is canonicalized. file.create's fs::write (file.rs:154) and import's fs::copy (file.rs:624) then follow a dangling final-component symlink out of the worktree. Both findings describe this escape; checking the final component with symlink_metadata in safe_join or creating with create_new/O_NOFOLLOW fixes it.",
+   "severity_notes": [],
+   "shards": [
+    "handlers-other-1"
+   ]
+  },
+  {
+   "keep": "core-workspace-files#11",
+   "dupes": [
+    "lens-errors-panics#9"
+   ],
+   "note": "safe_join canonicalizes the parent directory and fails when it does not exist (file.rs:494). Creating or writing a nested path whose parent is missing therefore errors with 'missing', and the create_dir_all calls after it are dead.",
+   "severity_notes": [],
+   "shards": [
+    "handlers-other-1"
+   ]
+  },
+  {
+   "keep": "core-workspace-files#5",
+   "dupes": [
+    "lens-overengineering#9",
+    "lens-perf#8"
+   ],
+   "note": "The file.search walk (file.rs:318-343) skips only .git, .relay, node_modules and target (skip_dir, file.rs:629-636), unlike watch::is_generated_path. It then reads each entry whole with read_to_end, with no size cap and before any binary check. Searching Unreal or Gradle projects therefore reads gigabytes of caches and build output. lens-overengineering#9 frames this as diverged skip lists, but its impact and fix (a shared predicate, a size cap and a NUL sniff on file.search) are the same.",
+   "severity_notes": [
+    "High (core-workspace-files#5 and lens-perf#8, both skeptic-verified) is right over medium. A search left in the editor's search box re-runs on every file event."
+   ],
+   "shards": [
+    "handlers-other-1"
+   ]
+  },
+  {
+   "keep": "core-workspace-files#1",
+   "dupes": [
+    "lens-contract#6"
+   ],
+   "note": "root_choice and default_worktree_in (file.rs:399-447) accept any project_id and worktree from an agent. authorize does not compare the target project or worktree with the caller's own checkout, so a bus_writes agent can aim file.* and git.* mutations at any project or worktree. lens-contract#6 also lists integration.request, which sec-local-ipc#9 reports separately.",
+   "severity_notes": [
+    "Both members rate this medium. By the rubric it could be argued higher (an agent acting outside its checkout), but the two agree, so medium is kept."
+   ],
+   "shards": [
+    "handlers-other-1"
+   ]
+  },
+  {
+   "keep": "core-misc-handlers#2",
+   "dupes": [
+    "lens-dead-dup#6",
+    "lens-store-mutex#5",
+    "tests-features#4"
+   ],
+   "note": "worktree.remove (git.rs:129-144) and integration.discard (integration.rs:58-64) are plain register handlers that call worktree::remove inside the transaction: purge_build, a dir_size walk and an untimed `git worktree remove`. session.close and project.remove already moved this work off the lock. Three members cover both handlers together, and core-misc-handlers#2 (discard only) says worktree.remove needs the same change. The fix is one pattern: move the worktree::remove call out of the transaction.",
+   "severity_notes": [],
+   "shards": [
+    "handlers-other-1",
+    "handlers-other-2"
+   ]
+  },
+  {
+   "keep": "core-git#20",
+   "dupes": [
+    "lens-store-mutex#4"
+   ],
+   "note": "CommitOp's prepare computes staged_numstat and the gate judges it before the lock. finish then runs `git commit` (git.rs:557-571) on whatever the index holds at that later moment, which can differ from what was judged.",
+   "severity_notes": [
+    "Medium (core-git#20) is right over low: an agent can race extra staged changes past the commit gate."
+   ],
+   "shards": [
+    "handlers-other-1"
+   ]
+  },
+  {
+   "keep": "core-git#15",
+   "dupes": [
+    "lens-perf#9"
+   ],
+   "note": "The git.branches handler (git.rs:326) still runs a merge-base walk per branch with no object cache. The PERF \u00a71.3 single-walk fix that FIXES-2026-09-20 credits went only into the duplicate branches_for (git.rs:1445).",
+   "severity_notes": [],
+   "shards": [
+    "handlers-other-1"
+   ]
+  },
+  {
+   "keep": "lens-perf#7",
+   "dupes": [
+    "core-git#14",
+    "lens-overengineering#5",
+    "native-codegit#3"
+   ],
+   "note": "list_pull_requests (git.rs:1089) runs `gh api --paginate --slurp .../pulls?state=all&per_page=100` with no cache. The desktop's refresh_git calls it on every git or file event (code_git.rs:578-583), so every refresh pages the repository's whole PR history. native-codegit#3 is the same defect seen from the client; querying only the current branch with a TTL cache fixes all three.",
+   "severity_notes": [
+    "High (lens-perf#7, native-codegit#3) is right over medium. In normal use with active agents it exhausts the user's GitHub API quota.",
+    "core-git#14 rated medium; high is right, because it can exhaust the shared 5000/h gh quota (which breaks the agents' gh use) during normal agent work."
+   ],
+   "shards": [
+    "handlers-other-1",
+    "native-main"
+   ]
+  },
+  {
+   "keep": "lens-dead-dup#14",
+   "dupes": [
+    "core-git#27"
+   ],
+   "note": "list_with_owners (git.rs:72-81) has no callers. It takes &Transaction and runs per-worktree git status, the shape D144 forbids. core-git#27 reports only this helper; lens-dead-dup#14 reports it among other unused helpers, and deleting the dead helpers resolves both.",
+   "severity_notes": [],
+   "shards": [
+    "handlers-other-1"
+   ]
+  },
+  {
+   "keep": "core-device-handler#11",
+   "dupes": [
+    "lens-dead-dup#23"
+   ],
+   "note": "adb_path (device.rs:550-572) checks only the setting and PATH, while sdk_tool and android_sdk_root search the SDK and skip empty configured values. #11 covers both the missing platform-tools lookup and the empty-value drift. lens-dead-dup#23 is the empty-value half, and routing adb through sdk_tool fixes both.",
+   "severity_notes": [
+    "Medium (core-device-handler#11) is right: with Android Studio's default SDK not on PATH, every device op fails."
+   ],
+   "shards": [
+    "handlers-other-1"
+   ]
+  },
+  {
+   "keep": "core-workspace-files#3",
+   "dupes": [
+    "core-engine#3",
+    "lens-concurrency#2",
+    "lens-contract#4",
+    "lens-dead-dup#3",
+    "lens-docs#3",
+    "lens-errors-panics#5",
+    "lens-perf#3",
+    "lens-resources#4",
+    "lens-store-mutex#1",
+    "lens-subprocess#1",
+    "native-app#1",
+    "native-launch#1",
+    "sec-supply-chain#6",
+    "tests-misc#2"
+   ],
+   "note": "project.clone is a plain e.register handler that runs `Command::new(\"git\")...arg(\"clone\")...output()` (workspace.rs:234) with no deadline while the store mutex/transaction is held; confirmed in code. The umbrella members (lens-concurrency#2, lens-errors-panics#5, lens-resources#4, lens-docs#3, core-engine#3, sec-supply-chain#6, lens-store-mutex#1, lens-perf#3) also list git.pr.open, avd.*, worktree.remove, workspace.discover etc.; those other handlers have their own findings (e.g. core-git#4, perf-harness#2, core-workspace-files#16) and are not merged here, only the project.clone part is.",
+   "severity_notes": [],
+   "shards": [
+    "handlers-other-2"
+   ]
+  },
+  {
+   "keep": "lens-sqlite#1",
+   "dupes": [
+    "core-workspace-files#7",
+    "lens-dead-dup#1",
+    "tests-misc#1"
+   ],
+   "note": "project.remove's dependency-ordered DELETE list (workspace.rs:354-380) never deletes from `labels`/task label rows, so the FK on labels.project_id fails the final `DELETE FROM projects` for any project with a label (and workspace.remove cascades into it), after sessions were already force-closed; checked the DELETE list in code.",
+   "severity_notes": [],
+   "shards": [
+    "handlers-other-2"
+   ]
+  },
+  {
+   "keep": "core-misc-handlers#3",
+   "dupes": [
+    "lens-data-loss#4",
+    "lens-resources#6"
+   ],
+   "note": "integration::run creates .relay/integrations/<id> worktree + relay/integration-<id> branch + build output and nothing (no auto-discard, no GUI discard) ever removes them; all three cite the same run()/discard code and the same code_git.rs:738 GUI gap.",
+   "severity_notes": [],
+   "shards": [
+    "handlers-other-2"
+   ]
+  },
+  {
+   "keep": "core-misc-handlers#5",
+   "dupes": [
+    "core-device-mirror#8",
+    "lens-contract#17"
+   ],
+   "note": "Integration deploy runs `shell(&path, run_cmd, Some(&device))` (integration.rs:207, 228-234) without device_lease::check/acquire that device.run uses (device.rs:150,177); reusing the device.run path (core-misc-handlers#5's fix) resolves the lease gap and ANDROID_SERIAL in both others.",
+   "severity_notes": [
+    "lens-contract#17 says low; medium is right: a deploy can install onto a device another session or the user holds a run lease on, a real bug in a less common flow."
+   ],
+   "shards": [
+    "handlers-other-2"
+   ]
+  },
+  {
+   "keep": "core-misc-handlers#6",
+   "dupes": [
+    "sec-local-ipc#9"
+   ],
+   "note": "integration.request does `get_project(ctx.tx(), p.project_id)` and never compares it to the agent caller's project (authorize only scopes session/task_id). sec-local-ipc#9 also mentions the missing deploy lease, which is tracked in the core-misc-handlers#5 group.",
+   "severity_notes": [],
+   "shards": [
+    "handlers-other-2"
+   ]
+  },
+  {
+   "keep": "core-misc-handlers#12",
+   "dupes": [
+    "lens-concurrency#17",
+    "lens-sqlite#21"
+   ],
+   "note": "integration::set_state checks for 'discarded' under one store-lock acquisition and writes the new state under another (integration.rs:266-284), so a discard in between is overwritten; same function and race in all three.",
+   "severity_notes": [],
+   "shards": [
+    "handlers-other-2"
+   ]
+  },
+  {
+   "keep": "core-pty-providers#5",
+   "dupes": [
+    "tests-sessions#10"
+   ],
+   "note": "provider.refresh is a plain register handler (provider.rs:18-19) that runs the claude/codex --version and auth status probes inside the transaction; same handler, same fix (probe in a staged prepare). lens-store-mutex#6 also mentions it but is an umbrella whose primary is the guardrail commit gate.",
+   "severity_notes": [],
+   "shards": [
+    "handlers-other-2"
+   ]
+  },
+  {
+   "keep": "core-pty-providers#23",
+   "dupes": [
+    "lens-subprocess#5"
+   ],
+   "note": "github.rs runs `gh api user` (45), `gh api --paginate` (68) and `git clone --depth 1` (109) with plain .output() and no deadline, reached from github.status/repo.list/skill.install prepare registered in provider.rs; both findings cite the same github.rs calls and the same fix (proc::output_with_timeout).",
+   "severity_notes": [],
+   "shards": [
+    "handlers-other-2"
+   ]
+  },
+  {
+   "keep": "core-misc-handlers#16",
+   "dupes": [
+    "lens-dead-dup#11",
+    "native-shell#9"
+   ],
+   "note": "The native client saves/restores `native.layout.current.{id}` (shell.rs:308,334) while the engine's fallback_state reads and project.remove deletes `layout.current.{id}` (ui.rs:34, workspace.rs:378-379); one fix (use one key) resolves all three.",
+   "severity_notes": [],
+   "shards": [
+    "handlers-other-2",
+    "native-main"
+   ]
+  },
+  {
+   "keep": "core-misc-handlers#18",
+   "dupes": [
+    "lens-resources#15"
+   ],
+   "note": "os.reveal/os.open_url spawn xdg-open in after_commit and drop the Child without wait (ui.rs:343-360), leaving zombies; same sites and same reaper fix. lens-resources#15 also lists avd.boot and run children, which have their own findings (core-device-handler#18, lens-resources#8).",
+   "severity_notes": [],
+   "shards": [
+    "handlers-other-2"
+   ]
+  },
+  {
+   "keep": "core-workspace-files#16",
+   "dupes": [
+    "bus#2",
+    "lens-store-mutex#15",
+    "native-launch#7",
+    "tests-misc#7"
+   ],
+   "note": "WsDiscover is a plain e.register handler (workspace.rs:114) that calls discover_repositories (a multi-level directory walk) inside the locked transaction though it never touches the store; confirmed in code. Fix: register_unlocked.",
+   "severity_notes": [
+    "lens-store-mutex#15 rates low; medium is right: it breaks the CLAUDE.md lock invariant and a walk of a large home tree stalls every request, though only from onboarding/discovery."
+   ],
+   "shards": [
+    "handlers-other-2"
+   ]
+  },
+  {
+   "keep": "core-workspace-files#33",
+   "dupes": [
+    "tests-misc#8"
+   ],
+   "note": "discover_repositories::walk propagates the first read_dir error with `?` (workspace.rs:400-410), so one unreadable subdirectory aborts the whole discovery; native-launch#7 mentions this secondarily but is grouped with the lock finding.",
+   "severity_notes": [],
+   "shards": [
+    "handlers-other-2"
+   ]
+  },
+  {
+   "keep": "core-workspace-files#18",
+   "dupes": [
+    "lens-contract#11",
+    "lens-dead-dup#10"
+   ],
+   "note": "workspace.remove only runs `DELETE FROM workspaces WHERE id=?1` (workspace.rs:178), leaving settings under guardrails.workspaces.{id}, and workspaces.id is INTEGER PRIMARY KEY without AUTOINCREMENT, so the next workspace reusing the id inherits the guardrail layer; same handler and fix.",
+   "severity_notes": [],
+   "shards": [
+    "handlers-other-2"
+   ]
+  },
+  {
+   "keep": "core-misc-handlers#1",
+   "dupes": [
+    "lens-data-loss#10",
+    "tests-sessions#11"
+   ],
+   "note": "The v3 importer copies each attachment to dest_dir.join(original_name) with the untrusted v3 name (import_v3.rs:262), allowing traversal outside the store and silent overwrite of same-named attachments; generating a safe unique destination name fixes both. lens-data-loss#10's secondary 'note tags dropped' point overlaps core-misc-handlers#15, which stays separate (its main defect is positions/ord numbering).",
+   "severity_notes": [
+    "lens-data-loss#10 frames it as data-loss and the other two as security, all medium; medium is right: the import is user-initiated from a local v3 directory."
+   ],
+   "shards": [
+    "handlers-other-2"
+   ]
+  },
+  {
+   "keep": "lens-dead-dup#9",
+   "dupes": [
+    "lens-overengineering#8"
+   ],
+   "note": "settings defaults expose parking.idle_minutes ('Park idle sessions after') and other dead keys (roles/theme/wallpaper_preview) that nothing reads; both findings cite settings.rs:44 and tools_settings.rs:428-436 with the same implement-or-remove fix. The undo.grace_days/purge half of lens-overengineering#8 overlaps the separate purge group (lens-dead-dup#8, lens-docs#9, core-misc-handlers#10), not merged here to avoid joining two root causes.",
+   "severity_notes": [],
+   "shards": [
+    "handlers-other-2",
+    "native-other-2"
+   ]
+  },
+  {
+   "keep": "native-app#2",
+   "dupes": [
+    "lens-gtk-mainthread#4",
+    "lens-perf#4",
+    "native-codegit#5"
+   ],
+   "note": "One root cause: the client reader (client.rs:200-205) returns Error::Protocol when a line exceeds MAX_LINE (2 MiB), which ends the reader and drops the whole control connection, and git.diff.file returns old, new and the full diff with no cap or binary check (git.rs:235-255). The Git panel's 1 MiB check at code_git.rs:1350 runs only after the reply has arrived. All four cite this reader path and git.diff.file as the trigger, and all propose the same fix: fail only that request on an oversized line, and cap or flag binaries in git.diff.file. native-codegit#5 is the same defect seen from open_diff (code_git.rs:1338).",
+   "severity_notes": [],
+   "shards": [
+    "native-main"
+   ]
+  },
+  {
+   "keep": "lens-gtk-mainthread#3",
+   "dupes": [
+    "lens-perf#1",
+    "native-editor-files#3"
+   ],
+   "note": "Editor::invalidate (editor.rs:508-526) checks only that the page is code/agents. It never checks file_sidebar/git visibility, and both panels start hidden (editor.rs:299-300). So every file/git/worktree event reloads the tree (2+N file.tree calls with git_badges, each a full git status), refresh_git and refresh_scopes for panels nobody can see. All three propose gating on visibility and marking stale until the panel is shown; editor-files#3 adds badge reuse, as lens-perf#1 does.",
+   "severity_notes": [
+    "lens-perf#1 and native-editor-files#3 rated medium; high (lens-gtk-mainthread#3, skeptic-verified) is right, because on the default page this saturates the single UI connection about once a second while agents work."
+   ],
+   "shards": [
+    "native-main"
+   ]
+  },
+  {
+   "keep": "lens-gtk-mainthread#2",
+   "dupes": [
+    "native-codegit#1"
+   ],
+   "note": "Both identify the same strong reference cycles in render_branch_picker (search <-> create_key, code_git.rs:997-999 and 1194-1196) and in the merge-test section (picks <-> test, 700-723). refresh_git's clear() only unparents them, so each Git refresh leaks them. The fix is the same: capture these widgets weakly. lens-gtk-mainthread#2 also lists other sites (registry_menu, agent_menu, task_pages), which are kept as separate findings.",
+   "severity_notes": [],
+   "shards": [
+    "native-main"
+   ]
+  },
+  {
+   "keep": "native-launch#10",
+   "dupes": [
+    "native-misc#7",
+    "native-shell#7"
+   ],
+   "note": "The window key controller is installed with PropagationPhase::Capture (shell.rs:1066-1067) and returns Stop for any DEFAULTS chord (shortcuts.rs:3-11), so Ctrl+K/N/1/2/3 never reach a focused VTE terminal. The same fix covers all three: run in bubble phase, or skip when focus is in a terminal or editable. native-misc#7 adds chord validation and launch#10 adds show_launch wiping the form, both extensions of the same defect.",
+   "severity_notes": [],
+   "shards": [
+    "native-main",
+    "native-other-2"
+   ]
+  },
+  {
+   "keep": "native-codegit#8",
+   "dupes": [
+    "native-editor-files#12"
+   ],
+   "note": "Conflict detection recognizes only 'U': is_conflict at code_git.rs:118-120 is `index==\"U\" || worktree==\"U\"`, and note_changes at project_files.rs:559 is `if index==\"U\"`. AA, DD and UA/UD are therefore not shown as conflicts. Both findings propose one shared unmerged-code helper used in is_conflict, change_summary and note_changes. I checked both functions in the code.",
+   "severity_notes": [],
+   "shards": [
+    "native-main"
+   ]
+  },
+  {
+   "keep": "native-mirror#6",
+   "dupes": [
+    "native-app#17"
+   ],
+   "note": "Mirror windows are created as application windows with no destroy_with_parent (mirror.rs:587-593), and the main window's close handler (app.rs:1032-1072) destroys only the Notes window. GtkApplication therefore keeps the process, and a docked mirror's stream, alive. The fix is the same: close every mirror view on main-window close.",
+   "severity_notes": [
+    "native-app#17 says low, native-mirror#6 says medium. Medium is right: the process never exits and a docked device stream keeps running. That is a real bug in a less common path, because it needs a detached or docked mirror.",
+    "medium (native-mirror#6) is right. It also notes that a docked mirror's stream keeps running via VIEWS, and the leftover process holds a live device stream."
+   ],
+   "shards": [
+    "native-main",
+    "native-other-1"
+   ]
+  },
+  {
+   "keep": "native-market-status#4",
+   "dupes": [
+    "native-shell#3",
+    "native-tools#12"
+   ],
+   "note": "The project_skills switch in shell.rs:873-888 calls key.set_active(!on) on error without the `if !key.is_sensitive() { return Proceed }` guard that tools_market.rs:717 and tools_plugins.rs:123 have. The revert re-fires state-set and loops skill.enable. market-status#4 frames this as the triplicated switch losing its guard; both fixes reuse the guarded helper.",
+   "severity_notes": [
+    "tools#12 says low; the other two say medium. Medium is right, because the unguarded copy loops forever writing audited skill.enable mutations whenever the failure persists, for example while the engine is down."
+   ],
+   "shards": [
+    "native-main",
+    "native-other-2"
+   ]
+  },
+  {
+   "keep": "native-misc#16",
+   "dupes": [
+    "native-shell#8"
+   ],
+   "note": "load_appearance (shell.rs:1116-1245) runs uncoalesced on every appearance.* or terminal.font_size settings.changed (app.rs:1257-1262). Each run calls wallpaper_rotation::refresh, which re-fetches and re-hashes the whole 1.5 MB library (wallpaper_rotation.rs:59-64, 92-104), and then decodes the wallpaper on the GTK thread. native-misc#16 is the rotation-refresh part of the same unconditional reload, and native-shell#8's evidence already includes it. One fix covers both: coalesce, and refresh or decode only when the relevant key changed.",
+   "severity_notes": [],
+   "shards": [
+    "native-main",
+    "native-other-2"
+   ]
+  },
+  {
+   "keep": "native-misc#1",
+   "dupes": [
+    "lens-gtk-mainthread#1"
+   ],
+   "note": "Both report the same RefCell double borrow in guardrail_pages.rs close_prompt (line 666). Promoting a waiting prompt re-enters a borrow_mut that is still held, so the client panics as soon as a 4th open request is queued. Both cite the same lines (459, 479, 691, 711) and propose the same fix.",
+   "severity_notes": [],
+   "shards": [
+    "native-other-1"
+   ]
+  },
+  {
+   "keep": "native-tasks#5",
+   "dupes": [
+    "lens-contract#12"
+   ],
+   "note": "Same line (agent_menu.rs:546). The agent-settings Save sends model:\"\"/effort:\"\" for an unspawned session, and session.update rejects them (providers.rs:253). Both findings give the same trigger and the same fix.",
+   "severity_notes": [],
+   "shards": [
+    "native-other-1"
+   ]
+  },
+  {
+   "keep": "scripts-infra#12",
+   "dupes": [
+    "native-app#18"
+   ],
+   "note": "Both report the unused serde and anyhow dependencies in apps/relay-native/Cargo.toml:11. scripts-infra#12 also covers the workspace tracing-subscriber json feature, so it is the superset.",
+   "severity_notes": [],
+   "shards": [
+    "native-other-1"
+   ]
+  },
+  {
+   "keep": "native-board#1",
+   "dupes": [
+    "lens-perf#17"
+   ],
+   "note": "Same root cause. Board::render clears and rebuilds every card on each refresh (board_view.rs:1188), and each card does a linear scan of all tasks for duplicate_of and blocked_by (1796, 1937), so a refresh is O(n^2). Both propose one id->task HashMap per render and skipping or diffing unchanged cards.",
+   "severity_notes": [
+    "medium (native-board#1) is right over low. It happens in a normal flow on every task or unclassified event, Done tasks are uncapped, and the work runs on the GTK main thread. That is a concrete ongoing cost, but not a hard freeze."
+   ],
+   "shards": [
+    "native-other-1"
+   ]
+  },
+  {
+   "keep": "lens-dead-dup#19",
+   "dupes": [
+    "native-misc#18"
+   ],
+   "note": "Both report the relative-time formatter duplicated across guardrail_pages.rs:39, session_context.rs:27, board_view.rs:143, status_usage.rs:110 and others, with output that differs between them. The fix for both is one helper in app.rs. native-misc#18 also notes the byte-identical paragraph() in pages.rs and tools.rs, a small extra on the same cleanup.",
+   "severity_notes": [],
+   "shards": [
+    "native-other-1"
+   ]
+  },
+  {
+   "keep": "native-notes-b#3",
+   "dupes": [
+    "native-notes-a#6"
+   ],
+   "note": "The note buffer's 'changed' handler re-snapshots the whole text several times per edit: refresh_state calls dirty(), then update_chrome calls dirty() and name() again, and autosave calls dirty() once more (doc.rs:563/594/601, note_pages.rs:823). native-notes-a#6 is the update_chrome part of the same handler chain. Its fix (pass the already-computed dirty flag and name into update_chrome) is part of native-notes-b#3's fix (coalesce into one idle pass and pass dirty and name along).",
+   "severity_notes": [
+    "medium (native-notes-b#3) is right. Replace all or undo on a large note emits two signals per match, each copying the full text, which can freeze the UI. low undersells that."
+   ],
+   "shards": [
+    "native-other-1"
+   ]
+  },
+  {
+   "keep": "native-tasks#7",
+   "dupes": [
+    "native-app#4"
+   ],
+   "note": "Shared cause: session.close falls into the client's default 30 s timeout (client.rs:65-71), while its handler runs teardown and worktree::remove (purge_build, dir_size, git worktree remove --force) before replying (session.rs:1566-1586). native-app#4's fix (long timeout for session.close, git.commit and git.push) resolves native-tasks#7. native-app#4 additionally covers git.commit and git.push.",
+   "severity_notes": [
+    "Both medium. That fits: a real failure in a less common path (close with worktree removal on a large tree)."
+   ],
+   "shards": [
+    "native-other-1"
+   ]
+  },
+  {
+   "keep": "native-misc#15",
+   "dupes": [
+    "native-notes-a#11"
+   ],
+   "note": "Same dead code. pages::refresh never runs for 'notes', because navigate('notes') returns early (app.rs:1303-1306) and the notes branch at pages.rs:82-85 returns first. So the notes loop at pages.rs:178-182 that calls note_row, and note_composer, are unreachable. Deleting the notes arms of pages::refresh resolves both. native-misc#15 also notes the Modules empty-state fallthrough at pages.rs:130, which is fixed by the same cleanup.",
+   "severity_notes": [],
+   "shards": [
+    "native-other-1",
+    "native-other-2"
+   ]
+  },
+  {
+   "keep": "native-notes-b#14",
+   "dupes": [
+    "native-tasks#13"
+   ],
+   "note": "Root cause: Draft::build (task_pages.rs:85-87) bakes a ScrolledWindow, status label and footer into its layout, which Doc (note_pages/doc.rs:302-318) and task detail tear back out. native-tasks#13 cites doc.rs:302-318 explicitly, and its fix (Draft owns only state, callers place status and footer) also fixes Doc's off-screen refusal label.",
+   "severity_notes": [],
+   "shards": [
+    "native-other-1",
+    "native-other-2"
+   ]
+  },
+  {
+   "keep": "native-css#10",
+   "dupes": [
+    "native-tools#13"
+   ],
+   "note": "Both report the Skills 'Remove' button (tools_skills.rs:198-220) hand-rolling a two-click confirm with its own armed Cell, a 4 s timer and .ext-danger.armed CSS, instead of using app::confirm_inline. The fix for both is to call confirm_inline and delete the Cell, the timer and the .armed rules.",
+   "severity_notes": [],
+   "shards": [
+    "native-other-1",
+    "native-other-2"
+   ]
+  },
+  {
+   "keep": "native-tools#2",
+   "dupes": [
+    "native-market-status#1"
+   ],
+   "note": "Same root cause: skill.list (and the skill.install reply) returns every skill's full SKILL.md body (provider.rs:551 body, up to 256 KiB each), and the Skills market page calls it on every refresh (tools_market.rs:96 with tools_skills.rs:25 list_op). Past the 2 MiB MAX_LINE (client.rs:48, 200-204), that tears down the only control connection. Both findings cite the same call, engine row, cap and fix: return summaries without body, fetch one body through skill.get, and make an oversized line fail only that one request.",
+   "severity_notes": [
+    "tools#2 says high and market-status#1 says medium. Medium is right. The plugins in this repo carry 26 SKILL.md files totalling about 480 KB, so roughly four times that much has to be installed before the reply passes 2 MiB. That is an edge case, and the user can recover with Reconnect, so it is not a likely failure in a normal flow."
+   ],
+   "shards": [
+    "native-other-2"
+   ]
+  },
+  {
+   "keep": "native-tools#6",
+   "dupes": [
+    "lens-gtk-mainthread#5"
+   ],
+   "note": "Same root cause: render_wallpapers base64-decodes each card's `preview` and calls gdk::Texture::from_bytes on the GTK thread (tools_settings.rs:838-853). `preview` is the full image (1011: \"preview\":image), so every gallery render decodes N+1 full-size images. Both findings propose the same fix: store a small thumbnail and decode off-thread or cache the textures. gtk#5's remark about load_appearance decoding again belongs with native-shell#8.",
+   "severity_notes": [
+    "tools#6 says medium and gtk#5 says low. Medium is right: the redraw also runs from sync_wallpaper on every rotation tick, even while Settings is hidden, so the UI thread stutters periodically in normal use."
+   ],
+   "shards": [
+    "native-other-2"
+   ]
+  },
+  {
+   "keep": "native-notes-b#18",
+   "dupes": [
+    "native-tools#10"
+   ],
+   "note": "Same dead code. navigate(\"notifications\") opens the bell popover and returns before ui.page is assigned (app.rs:1307-1311, 1348), so tools::notifications (tools.rs:596-650) and its refresh arms (66, 84) never run, and they have drifted from Center::follow. Both findings give the same fix: delete it.",
+   "severity_notes": [],
+   "shards": [
+    "native-other-2"
+   ]
+  },
+  {
+   "keep": "native-css#4",
+   "dupes": [
+    "lens-dead-dup#17"
+   ],
+   "note": "Both report the same theme.css classes that no widget sets (the document-*, skills-*, code-step-*, plan-* and task-preview families and others), found by cross-referencing selectors against the class strings in relay-native/src. css#4 counts 63 classes, dead-dup#17 counts 55, and both fix it by deleting the rules. css#4 also notes the files-rail row in smoke.rs.",
+   "severity_notes": [],
+   "shards": [
+    "native-other-2"
+   ]
+  },
+  {
+   "keep": "native-smoke#10",
+   "dupes": [
+    "lens-dead-dup#25"
+   ],
+   "note": "Same duplication: the same recursive named() appears in smoke.rs:11, smoke_notes.rs:8, smoke_registry.rs:7, smoke_project_files.rs:8 and roadmap_smoke.rs:9, and wait_for/require appear twice. Both fix it with one shared smoke support module. smoke#10 is the more complete of the two and also documents how the copies have drifted (wait strategies, error contracts).",
+   "severity_notes": [],
+   "shards": [
+    "native-other-2"
+   ]
+  },
+  {
+   "keep": "native-tools#19",
+   "dupes": [
+    "native-market-status#8"
+   ],
+   "note": "Shared defect: Market.cache, filled by tools_plugins.rs:366 and 432 and stored in the thread-local MARKETS (tools_market.rs:79, 85-87), is never cleared on reconnect or when ui.generation changes. Both findings propose the same fix: tag or clear the cache by generation. Each also carries one extra item that the kept finding should absorb: tools#19 says a failed lazy load is never retried, and market-status#8 says the error notice is not hidden on a successful reload.",
+   "severity_notes": [],
+   "shards": [
+    "native-other-2"
+   ]
+  },
+  {
+   "keep": "tests-features#7",
+   "dupes": [
+    "tests-bus-guardrails#14",
+    "tests-mirror-board#15",
+    "tests-misc#14"
+   ],
+   "note": "One root cause: crates/relay-core/tests has no shared tests/common module, so every integration test file defines its own git/call/ok/wait_until/Fixture helpers, and the copies have drifted (stderr reporting, ok() panic format, --no-verify, .status() vs .output()). Adding one tests/common/mod.rs fixes all four. Checked: `ls crates/relay-core/tests` shows 18 files and no common/ directory, and `fn call(` is defined in all 18. Each member cites a different file (phase7.rs, board.rs, bus.rs, registry_remove.rs) for the same missing module. Side points bundled in some members are kept in the note but are not separate groups here: board.rs Fixture field drop order (tests-mirror-board#15) and the `sh -lc` test shell (tests-misc#14).",
+   "severity_notes": [],
+   "shards": [
+    "tests-perf"
+   ]
+  },
+  {
+   "keep": "tests-sessions#8",
+   "dupes": [
+    "core-socket-store#22"
+   ],
+   "note": "Both name the same defect in crates/relay-core/tests/store.rs:24-26, every_prior_version_migrates_forward. It builds each 'prior version' store by running today's `MIGRATIONS[..k]` text, so an in-place edit to a shipped migration changes the simulated old store and the upgrade path together, and the test cannot detect it. One fix covers both: pin per-migration checksums or golden fixtures. I checked the code: lines 23-29 execute_batch the current strings and insert only a meta row. tests-sessions#8 also covers the empty-table problem, so I kept it.",
+   "severity_notes": [
+    "tests-sessions#8 rates it medium and core-socket-store#22 rates it low. Low is right per the rubric. This is a test gap with no current defect behind it: no shipped migration is known to have been edited, and no data-dependent upgrade failure has been shown. It matters only if someone breaks the append-only rule later."
+   ],
+   "shards": [
+    "tests-perf"
+   ]
+  },
+  {
+   "keep": "lens-docs#1",
+   "dupes": [
+    "cli-main#10",
+    "sec-guardrail-bypass#6"
+   ],
+   "note": "codex_pre_tool maps apply_patch/Edit/Write to kind exec, so evaluate_write never runs for Codex edits while Codex::guarded() is true.",
+   "severity_notes": [],
+   "shards": [
+    "manual"
+   ]
+  },
+  {
+   "keep": "sec-guardrail-bypass#1",
+   "dupes": [
+    "core-guardrail#16"
+   ],
+   "note": "evaluate_exec checks only self_approval and denied_commands; redirections, sed -i, tee and cp writes never meet the write policy.",
+   "severity_notes": [],
+   "shards": [
+    "manual"
+   ]
+  },
+  {
+   "keep": "lens-docs#10",
+   "dupes": [
+    "sec-supply-chain#17",
+    "lens-contract#18"
+   ],
+   "note": "BUS.md 9.3/10.8/14 say Codex is unguarded and covered by a post-hoc guardrail.violation watcher; the code installs Codex hooks, reports guarded=true, and has no watcher.",
+   "severity_notes": [],
+   "shards": [
+    "manual"
+   ]
+  },
+  {
+   "keep": "bus#4",
+   "dupes": [
+    "lens-dead-dup#7",
+    "lens-contract#8",
+    "lens-overengineering#7"
+   ],
+   "note": "ui.* ops answer from an engine-side UiRuntime the GTK client never reads or renders.",
+   "severity_notes": [],
+   "shards": [
+    "manual"
+   ]
+  },
+  {
+   "keep": "lens-overengineering#11",
+   "dupes": [
+    "tests-bus-guardrails#13",
+    "lens-dead-dup#16"
+   ],
+   "note": "Door::Tauri, Doors::TauriOnly and related scaffolding survive the removed Tauri client.",
+   "severity_notes": [],
+   "shards": [
+    "manual"
+   ]
+  },
+  {
+   "keep": "lens-dead-dup#18",
+   "dupes": [
+    "lens-contract#16",
+    "native-tasks#15"
+   ],
+   "note": "The native client hard-codes engine names that drifted (device.sdk_missing vs avd.sdk_missing, git.worktree.create).",
+   "severity_notes": [],
+   "shards": [
+    "manual"
+   ]
+  },
+  {
+   "keep": "native-app#11",
+   "dupes": [
+    "lens-contract#19"
+   ],
+   "note": "The desktop event subscription is a hand-kept allow-list that omits workspace.deleted.",
+   "severity_notes": [],
+   "shards": [
+    "manual"
+   ]
+  }
+ ],
+ "left_single": []
+}

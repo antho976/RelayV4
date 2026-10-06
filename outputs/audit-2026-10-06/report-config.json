@@ -1,0 +1,7 @@
+{
+  "rounds": ["round2-merged.json"],
+  "dedup": "round2-dedup.json",
+  "header": "report-header.md",
+  "out_md": "report.md",
+  "out_json": "report-data.json"
+}

@@ -4,10 +4,11 @@ Usage: python3 -I build_report.py <config.json>
 
 config.json:
   {
-    "rounds": ["round1.json", "round2.json"],   # workflow return values: {"summary":..., "results":[...]}
+    "rounds": ["round2-merged.json"],           # workflow return values: {"summary":..., "results":[...]}
+                                                 # a finding may carry v3 (blind re-check), recheck, dispute;
+                                                 # status may be confirmed, plausible, disputed, fixed, refuted
     "dedup": "dedup.json",                       # optional: {"groups":[{"keep":id,"dupes":[ids],"note":str}]}
     "header": "header.md",                       # hand-written front matter (summary, themes, tooling)
-    "pr30_files": [...],                         # files touched by PR #30 after the audited commit
     "out_md": ".../outputs/code-audit-2026-10-06.md",
     "out_json": ".../report-data.json"
   }
@@ -56,6 +57,7 @@ AREAS = [
     ("schema/", "Bus types"),
     ("CLAUDE.md", "Docs"),
     ("README.md", "Docs"),
+    ("DESIGN.md", "Docs"),
 ]
 
 
@@ -92,13 +94,17 @@ def coverage_notes(paths):
     return notes
 
 
+NOTE_LABEL = {"v1": "Verifier", "v2": "Skeptic", "v3": "Blind re-check", "v_recheck": "Recheck after PR #30/#31"}
+
+
 def corrections(f):
+    """Each verifier's correction, labelled with the pass that made it, oldest first."""
     parts = []
-    for key in ("v1", "v2"):
+    for key in ("v1", "v2", "v3", "v_recheck"):
         v = f.get(key) or {}
         c = (v.get("correction") or "").strip()
         if c and c.lower() not in ("none", "n/a", "-", "none."):
-            parts.append(c)
+            parts.append(f"{NOTE_LABEL[key]}: {c}")
     return parts
 
 
@@ -109,17 +115,20 @@ def md_escape_title(t):
 def render_finding(f, rid):
     loc = f"{f['file']}:{f['line']}" if f.get("line") else f["file"]
     status = f["status"]
-    head = f"#### {rid} · {md_escape_title(f['title'])}\n"
+    head = f"<a id=\"{rid.lower()}\"></a>\n\n#### {rid} · {md_escape_title(f['title'])}\n"
     meta = (f"`{loc}` · **{f['final_severity']}** · {CAT_LABEL.get(f['final_category'], f['final_category'])}"
             f" · {status} · effort {f.get('effort', '?')}")
-    if f.get("pr30"):
-        meta += " · file changed by PR #30, recheck after rebase"
+    if f.get("recheck"):
+        meta += f" · {f['recheck']}"
     lines = [head, meta + "\n"]
     lines.append(f"**Problem.** {f['evidence'].strip()}\n")
     lines.append(f"**Impact.** {f['impact'].strip()}\n")
     lines.append(f"**Fix.** {f['fix'].strip()}\n")
     for c in corrections(f):
-        lines.append(f"**Verifier note.** {c}\n")
+        label, _, text = c.partition(": ")
+        lines.append(f"**{label} note.** {text}\n")
+    if f.get("dispute"):
+        lines.append(f"**Disputed.** {f['dispute'].strip()}\n")
     if status == "plausible":
         v = f.get("v2") or f.get("v1") or {}
         if v.get("reason"):
@@ -151,24 +160,24 @@ def main():
                 dup = byid[d]
                 dropped.add(d)
                 keep.setdefault("merged_from", []).append(d)
-                # A duplicate never lowers severity; take the more severe verified rating.
-                if (dup["status"] in ("confirmed", "plausible") and
+                # A duplicate never lowers severity; take the more severe verified rating,
+                # unless a blind round-2 re-check (v3) already calibrated the kept finding.
+                if (not keep.get("v3") and dup["status"] in ("confirmed", "plausible") and
                         SEV_ORDER[dup["final_severity"]] < SEV_ORDER[keep["final_severity"]]):
                     keep["final_severity"] = dup["final_severity"]
                 for r in [f"{dup['file']}:{dup.get('line')}"] + (dup.get("related") or []):
                     if r not in (keep.get("related") or []) and r != f"{keep['file']}:{keep.get('line')}":
                         keep.setdefault("related", []).append(r)
 
-    pr30 = set(cfg.get("pr30_files", []))
     live = []
     disputed = []
     unverified = []
+    fixed = []
     refuted = 0
     for f in allf:
         if f["id"] in dropped:
             continue
         f["area"] = area_of(f["file"])
-        f["pr30"] = f["file"] in pr30
         s = f["status"]
         if s in ("confirmed", "plausible"):
             live.append(f)
@@ -176,6 +185,8 @@ def main():
             disputed.append(f)
         elif s == "unverified":
             unverified.append(f)
+        elif s == "fixed":
+            fixed.append(f)
         else:
             refuted += 1
 
@@ -233,19 +244,28 @@ def main():
             for f in group:
                 out.append(render_finding(f, f["rid"]))
 
+    for i, f in enumerate(sorted(disputed, key=lambda f: (f["file"], f.get("line") or 0)), start=1):
+        f["rid"] = f"RD-{i:02d}"
     out.append("## Appendix A: Disputed high-severity claims\n")
-    out.append("A first verifier confirmed each of these and a second skeptic refuted it. They are listed so nothing is silently dropped; treat them as leads, not findings.\n")
-    for f in sorted(disputed, key=lambda f: (f["file"], f.get("line") or 0)):
-        v1 = f.get("v1") or {}
-        v2 = f.get("v2") or {}
-        out.append(f"- **{md_escape_title(f['title'])}** (`{f['file']}:{f.get('line')}`, claimed {v1.get('severity')})  \n"
-                   f"  For: {(v1.get('reason') or '').strip()}  \n  Against: {(v2.get('reason') or '').strip()}\n")
+    if disputed:
+        out.append("Earlier verifiers confirmed each of these and the blind round-2 re-check refuted it. They are listed with both arguments so nothing is silently dropped; read them as leads to settle, not as findings.\n")
+    else:
+        out.append("None. The blind round-2 re-check refuted no finding that earlier verifiers had confirmed.\n")
+    for f in sorted(disputed, key=lambda f: f["rid"]):
+        out.append(render_finding(f, f["rid"]))
+    if fixed:
+        out.append("## Appendix B: Fixed since the audited commit\n")
+        out.append("PR #30 and PR #31 changed these lines after commit 361c6f9; a recheck found the problem gone.\n")
+        for f in sorted(fixed, key=lambda f: (f["file"], f.get("line") or 0)):
+            out.append(f"- {md_escape_title(f['title'])} (`{f['file']}:{f.get('line')}`, was {f['final_severity']}): {(f.get('recheck_reason') or '').strip()}\n")
+    letter = "C"
     if unverified:
-        out.append("## Appendix B: Unverified findings\n")
+        out.append("## Appendix C: Unverified findings\n")
+        letter = "D"
         out.append("Their verification agents failed; they have not been checked.\n")
         for f in unverified:
             out.append(f"- {md_escape_title(f['title'])} (`{f['file']}:{f.get('line')}`, {f['severity']}, {f['category']})\n")
-    out.append("## Appendix C: Coverage notes from the auditors\n")
+    out.append(f"## Appendix {letter}: Coverage notes from the auditors\n")
     for unit, note in coverage_notes(cfg["rounds"]):
         note = " ".join(note.split())
         out.append(f"- **{unit}**: {note}\n")
@@ -255,10 +275,10 @@ def main():
     data = {
         "findings": [
             {k: f.get(k) for k in ("rid", "title", "file", "line", "symbol", "area", "final_severity", "final_category",
-                                    "status", "confidence", "effort", "evidence", "impact", "fix", "related", "pr30",
-                                    "merged_from", "unit", "round")}
+                                    "status", "confidence", "effort", "evidence", "impact", "fix", "related",
+                                    "merged_from", "unit", "round", "recheck", "dispute")}
             | {"notes": corrections(f)}
-            for f in defects + quality
+            for f in defects + quality + sorted(disputed, key=lambda f: f["rid"])
         ],
         "disputed": [
             {"title": f["title"], "file": f["file"], "line": f.get("line"),
@@ -267,7 +287,7 @@ def main():
             for f in disputed
         ],
         "counts": {"live": len(live), "defects": len(defects), "quality": len(quality), "disputed": len(disputed),
-                   "refuted": refuted, "unverified": len(unverified), "candidates": len(allf), "merged": len(dropped)},
+                   "refuted": refuted, "unverified": len(unverified), "fixed": len(fixed), "candidates": len(allf), "merged": len(dropped)},
     }
     json.dump(data, open(cfg["out_json"], "w"), indent=1)
     print(json.dumps(data["counts"]))

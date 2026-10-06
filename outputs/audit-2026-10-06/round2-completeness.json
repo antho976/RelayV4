@@ -1,0 +1,1060 @@
+{
+ "mined": [
+  {
+   "miner": 1,
+   "candidates": [
+    {
+     "key": "cov1-4-module-editor-icon-null-vs-empty",
+     "source_unit": "native-tasks",
+     "file": "apps/relay-native/src/note_pages.rs",
+     "line": 1361,
+     "claim": "module_detail's Draft snapshot maps an empty or whitespace icon to JSON null, but base holds the engine's stored value. module.create/module.update accept icon \"\" (Option<Option<String>>, module.rs:122/158), so a module whose icon is \"\" (or has surrounding spaces) differs from base on open. Draft::dirty (task_pages.rs:174-179) compares per key, so the module editor opens as unsaved and close/navigation are guarded. This is the same mechanism as native-tasks#2 and native-notes-b#9, but in a different editor that no finding names.",
+     "searched": "regex for 'opens as unsaved', 'icon ... null/empty/unsaved', 'snapshot ... null/dirty'; matched native-tasks#2 (task module), native-notes-b#9 (note title trim), native-shell#16 (project settings), none for the module editor"
+    },
+    {
+     "key": "cov1-6-board-refresh-sequential-roundtrips",
+     "source_unit": "native-board",
+     "file": "apps/relay-native/src/pages.rs",
+     "line": 66,
+     "claim": "Every board refresh awaits task.list and then, sequentially, module.list on the shared serialized control connection, and joins them with a tasks x modules linear find (pages.rs:55-80). Every board re-render therefore pays two round trips behind any slow op. native-board cited this only in `related`. Low.",
+     "searched": "regex for 'board refresh', 'round trip ... board', 'two sequential'; matches (lens-sqlite#17, native-tasks#8, core-tasks-notes#12) cover task.list cost and refresh frequency, not the extra serial module.list"
+    },
+    {
+     "key": "cov1-1-idempotency-replay-ignores-op-actor",
+     "source_unit": "bus",
+     "file": "crates/relay-core/src/engine.rs",
+     "line": 840,
+     "claim": "The idempotency check matches a request only on req_id plus payload hash. audit::lookup (audit.rs:136-156) selects payload_hash/kind/result_summary by req_id and never compares op or actor. It also runs before validation and before the layer-1/session authorization (engine.rs:840-850 vs 853+). So a request that reuses an id with the same payload (e.g. `{}`) but a different op, or a different actor, gets back the recorded response of someone else's request, with no authorization check. core-engine#19 covers only the lookup/append race and the fact that clients never reuse ids. This is a different root cause. Low: req ids are UUIDs, though agents can read them through audit.list.",
+     "searched": "grep -i idempoten / payload hash in index.tsv and round1.json via regex script; only core-engine#19 (race and unreachable replay) and bus#8 (doc) matched"
+    },
+    {
+     "key": "cov1-2-commit-add-all-before-gate",
+     "source_unit": "native-codegit",
+     "file": "crates/relay-core/src/handlers/git.rs",
+     "line": 545,
+     "claim": "CommitOp's unlocked prepare phase runs `git add -A` (when all=true), refresh_git and the user's pre-commit hook before guardrail::enforce runs in the locked phase (git.rs:545-569). A commit the gate refuses or holds has therefore already changed the index (everything staged, including files a protected-path rule was meant to stop), and the pre-commit hook has already run and may have rewritten files. The refusal leaves that state behind with no rollback.",
+     "searched": "regex over round1.json for 'add -A', 'git add -A', 'index ... held/refused', 'stages everything before'; hits (core-git#3, core-git#18, native-codegit#7, sec-local-ipc#10) cover timeouts/locking/conflict markers, not gate ordering"
+    },
+    {
+     "key": "cov1-3-integration-merge-no-end-of-options",
+     "source_unit": "core-misc-handlers",
+     "file": "crates/relay-core/src/handlers/integration.rs",
+     "line": 124,
+     "claim": "integration.request (open to builder agents) takes caller-supplied `branches`, checks each only with gix rev_parse_single (line 29), and then passes them straight to `git merge --no-ff --no-edit <branches>` with no `--` separator (lines 124-127). A ref that resolves but whose name starts with '-' (e.g. one created with update-ref) would be parsed by git merge as an option such as -X/-s. The auditor marked it unconfirmed and low impact, since agents already run git.",
+     "searched": "regex for rev_parse_single, option injection, leading dash/hyphen, 'starts with -'; only core-session#1 (provider_ref argv) and unrelated integration findings matched"
+    },
+    {
+     "key": "cov1-5-codex-relay-token-env-policy",
+     "source_unit": "core-pty-providers",
+     "file": "crates/relay-core/src/handlers/session.rs",
+     "line": 566,
+     "claim": "RELAY_TOKEN reaches agent sessions only as an environment variable (session.rs:566). Relay passes no shell_environment_policy override to Codex (grep finds none). If Codex's default shell_environment_policy still drops variables whose names contain TOKEN, Codex's shell tool never sees RELAY_TOKEN. Then both `$RELAY_BIN q` and the commit hook (hooks.rs:124-127: 'session identity has no token', exit 2) refuse for Codex sessions. Unverified: it depends on the Codex version's default, and the author reports Codex sessions working.",
+     "searched": "regex for shell_environment_policy, 'RELAY_TOKEN ... codex' in round1.json: no matches"
+    }
+   ],
+   "covered": [
+    {
+     "claim": "socket.rs reads request lines with unbounded BufReader::lines() (raised by core-engine, native-codegit and native-mirror). Despite the harness list it is already reported: core-socket-store#8 at socket.rs:323 'Request lines have no size limit', status confirmed",
+     "by": [
+      "core-socket-store#8"
+     ]
+    },
+    {
+     "claim": "MirrorRuntime::send_control does a blocking write_all with no write timeout (device.rs:279-283), answered inline on the connection task. Already reported",
+     "by": [
+      "core-device-mirror#7",
+      "lens-concurrency#10",
+      "lens-concurrency#11"
+     ]
+    },
+    {
+     "claim": "socket.rs dispatches each connection's requests sequentially (head-of-line blocking), including responses queued behind PTY output on the shared channel",
+     "by": [
+      "lens-perf#2",
+      "lens-overengineering#6",
+      "native-app#3",
+      "lens-perf#18"
+     ]
+    },
+    {
+     "claim": "workspace.discover walks the tree to depth 4 under the store lock (native-launch, bus)",
+     "by": [
+      "core-workspace-files#16",
+      "bus#2",
+      "native-launch#7",
+      "tests-misc#7",
+      "lens-store-mutex#15"
+     ]
+    },
+    {
+     "claim": "Inline keystroke write / Pty::write under the writer mutex blocking a tokio worker (dropped by core-engine and core-pty-providers as contrived)",
+     "by": [
+      "lens-concurrency#11"
+     ]
+    },
+    {
+     "claim": "Agents may pass any project worktree (a peer's) as `worktree` to file.* and git.* ops; only membership is checked",
+     "by": [
+      "core-workspace-files#1",
+      "lens-contract#6"
+     ]
+    },
+    {
+     "claim": "client.rs timeout table names the non-existent op git.worktree.create",
+     "by": [
+      "lens-dead-dup#18"
+     ]
+    },
+    {
+     "claim": "device.run/device.build run the worktree's agent-writable gradlew/build scripts on the host outside every guardrail (threat-model observation)",
+     "by": [
+      "sec-supply-chain#2"
+     ]
+    },
+    {
+     "claim": "AvdCreate runs avdmanager with wait_with_output and no timeout under the store lock; AvdCreate/AvdBoot call list_avds (emulator -list-avds, adb emu avd name) under the lock with no deadline",
+     "by": [
+      "core-device-handler#1",
+      "native-mirror#1",
+      "tests-misc#4",
+      "lens-store-mutex#8",
+      "lens-subprocess#6",
+      "perf-harness#2"
+     ]
+    },
+    {
+     "claim": "RunOp runs `adb devices` (2 s) and gix::open under the store lock",
+     "by": [
+      "core-device-handler#4",
+      "lens-store-mutex#6"
+     ]
+    },
+    {
+     "claim": "run_worker's adb logcat -c, am start -W and pidof use .output() with no deadline",
+     "by": [
+      "core-device-handler#8"
+     ]
+    },
+    {
+     "claim": "Desktop status bar calls device.list (adb devices -l) on every usage/device/run event",
+     "by": [
+      "native-market-status#6"
+     ]
+    },
+    {
+     "claim": "worktree.remove (git.rs:129) removes the checkout inside a locked handler",
+     "by": [
+      "lens-store-mutex#5",
+      "lens-dead-dup#6",
+      "tests-features#4"
+     ]
+    },
+    {
+     "claim": "app.resources.watch is Actors::All although app.* mutations are documented user_only",
+     "by": [
+      "bus#17"
+     ]
+    },
+    {
+     "claim": "Socket door answers bus.subscribe/bus.wait without checking actor, token or v",
+     "by": [
+      "core-socket-store#19",
+      "sec-local-ipc#8"
+     ]
+    },
+    {
+     "claim": "Phone gate forwards a frame containing newlines, which reaches the engine as several lines",
+     "by": [
+      "sec-remote-door#11",
+      "lens-docs#16"
+     ]
+    },
+    {
+     "claim": "Claude PreToolUse matcher (hooks.rs:350) leaves NotebookEdit ungated",
+     "by": [
+      "sec-supply-chain#3"
+     ]
+    },
+    {
+     "claim": "guardrail.gate is registered with Engine::register and runs git status/diff under the store mutex",
+     "by": [
+      "core-guardrail#13",
+      "tests-mirror-board#5",
+      "lens-store-mutex#6"
+     ]
+    },
+    {
+     "claim": "launch_editor reads the whole log from offset 0 right after spawning, so the previous session's bind failure is misreported (unreal.rs:656)",
+     "by": [
+      "plugins-unreal#8"
+     ]
+    },
+    {
+     "claim": "quit_editor SIGTERMs the editor after a 3 s Remote Control timeout, losing unsaved work",
+     "by": [
+      "cli-unreal#2",
+      "plugins-unreal#2"
+     ]
+    },
+    {
+     "claim": "git.pr.open runs `gh pr create` via Command::output() inside Engine::register",
+     "by": [
+      "perf-harness#2",
+      "lens-store-mutex#1",
+      "lens-perf#3",
+      "core-engine#3"
+     ]
+    },
+    {
+     "claim": "BranchCreate, Stage, Unstage, BranchDelete, CleanMerged run worktree::git (no timeout) inside Engine::register; worktree.rs git() has no timeout and is reached from session.close teardown",
+     "by": [
+      "core-git#3",
+      "lens-sqlite#2",
+      "lens-contract#5",
+      "tests-sessions#3",
+      "lens-dead-dup#4"
+     ]
+    },
+    {
+     "claim": "hooks.rs:210-213 runs the user's pre-commit hook with no timeout",
+     "by": [
+      "core-hooks-skills#9",
+      "tests-features#5"
+     ]
+    },
+    {
+     "claim": "git push has no timeout and no GIT_TERMINAL_PROMPT=0",
+     "by": [
+      "core-git#18",
+      "lens-store-mutex#16"
+     ]
+    },
+    {
+     "claim": "git.diff.file has no size/binary limit or diff deadline (and does not apply git filters)",
+     "by": [
+      "core-git#2",
+      "core-git#7",
+      "native-codegit#5",
+      "lens-perf#4"
+     ]
+    },
+    {
+     "claim": "project_files.rs never resets a selected worktree that disappeared",
+     "by": [
+      "native-editor-files#11"
+     ]
+    },
+    {
+     "claim": "Engine-side search returns unbounded hit text and reads binaries whole; watcher events carry no envelope project_id",
+     "by": [
+      "native-editor-files#6",
+      "core-workspace-files#5",
+      "lens-perf#8",
+      "native-editor-files#1"
+     ]
+    },
+    {
+     "claim": "app.rs:1263-1265 refreshes the current page on nearly every event",
+     "by": [
+      "native-app#12"
+     ]
+    },
+    {
+     "claim": "doc::request_close with autosave: Draft::close silently refuses because its status label was removed from the layout (Ctrl+W appears to do nothing)",
+     "by": [
+      "native-notes-b#14"
+     ]
+    },
+    {
+     "claim": "Notifications are never pruned",
+     "by": [
+      "core-misc-handlers#10",
+      "core-guardrail#15",
+      "bus#5"
+     ]
+    },
+    {
+     "claim": "Notes library rebuilds every row on every notes.changed event",
+     "by": [
+      "native-notes-a#4"
+     ]
+    },
+    {
+     "claim": "task.activity scans project audit rows with json_extract under the store mutex",
+     "by": [
+      "core-tasks-notes#8",
+      "tests-mirror-board#6",
+      "lens-sqlite#5",
+      "lens-store-mutex#13"
+     ]
+    },
+    {
+     "claim": "provider.refresh is registered with Engine::register and runs provider probes under the mutex",
+     "by": [
+      "core-pty-providers#5",
+      "tests-sessions#10"
+     ]
+    },
+    {
+     "claim": "skill.install's staged read phase runs git clone / rev-parse with Command::output (no timeout, prompts possible)",
+     "by": [
+      "core-pty-providers#23",
+      "lens-subprocess#5",
+      "lens-store-mutex#16",
+      "core-git#18"
+     ]
+    },
+    {
+     "claim": "app.backup.now copies the store inside the request transaction",
+     "by": [
+      "core-socket-store#11",
+      "lens-sqlite#10"
+     ]
+    },
+    {
+     "claim": "audit undo_op is stored uncapped for every op",
+     "by": [
+      "lens-perf#12"
+     ]
+    },
+    {
+     "claim": "Phone door forwards any op as the user, including settings.set",
+     "by": [
+      "sec-remote-door#5"
+     ]
+    },
+    {
+     "claim": "shell.rs:882 copy of the per-project enable switch loops forever (lost re-entrancy guard)",
+     "by": [
+      "native-market-status#4"
+     ]
+    }
+   ],
+   "discarded": [
+    "Post-exit process-group kill reaching non-setsid daemons: dropped by core-engine as contrived; core-device-handler showed the adb server setsid()s first",
+    "user_version i64->usize cast for a negative user_version in a foreign DB: not a realistic input",
+    "jiff variable-precision timestamps compared as text (core-misc-handlers, native-notes-b, core-tasks-notes, core-socket-store): misorders only stamps within ~10 ns or with trimmed trailing zeros, which three auditors judged negligible",
+    "Reviewer role cannot call guardrail.gate: intended, asserted by tests/guardrails.rs:298-304",
+    "query_row vs prepare_cached on cold guardrail/app paths: trivia, and core-device-handler#23 already covers the pattern where it is hot",
+    "Request derives Debug including its token (envelope.rs:96-111): latent only, since nothing logs requests",
+    "app.rs:1062-1064 notes_window.borrow_mut() held across destroy: safe today, since no callback re-borrows",
+    "doc::reconcile never compares updated_at: per-connection request ordering plus the busy guard (doc.rs:1315) prevent an older listing from reverting a saved buffer, so not concrete",
+    "Dead `_ctx` fn at app.rs:287 and hand-written enum/string maps: trivia",
+    "relay-native tests never run in CI: documented in ci.yml, deliberately not reported (native-board#20 covers the effect)",
+    "native-shell trivia (order.dedup, no-op sort_by_key, unreachable Escape branch, 100 px drop threshold): harmless",
+    "Codex resume --last scoping and --approve-for-me semantics: unverified, with no concrete defect named",
+    "Gradle client behaviour after a stdout pipe break, and adb SIGPIPE: unverified side questions"
+   ],
+   "findings": [
+    {
+     "title": "Module editor opens as unsaved when the stored icon is \"\" or has surrounding spaces, because the snapshot normalizes the icon and base does not",
+     "category": "bug",
+     "severity": "low",
+     "confidence": "high",
+     "file": "apps/relay-native/src/note_pages.rs",
+     "line": 1361,
+     "symbol": "module_detail snapshot / Draft::dirty",
+     "evidence": "The snapshot normalizes the icon: `\"icon\":if icon.text().trim().is_empty(){Value::Null}else{json!(icon.text().trim())}` (note_pages.rs:1361). `Draft::new(ui, \"Module\", module.clone(), ...)` keeps the engine's raw value as base. The engine stores whatever it is given: module.create binds `p.icon` unchanged (handlers/module.rs:122), and module.update does `let icon=p.icon.unwrap_or(before.icon.clone())` with no trim or empty-to-NULL step (module.rs:158). `UpdateIn.icon` is `Option<Option<String>>` (relay-bus ops/module.rs:21), so `\"icon\":\"\"` and `\"icon\":\" bug \"` are both accepted. `Draft::dirty` compares each key: `m.iter().any(|(k, v)| self.base.borrow()[k] != *v)` (task_pages.rs:174-179), and `can_close` refuses while dirty (task_pages.rs:137-140). The two first-party clients normalize before sending (native create sends no icon, note_pages.rs:1317; mobile sends `icon.trim() || null`, Module.tsx:142). So the raw value comes from an agent, the CLI or MCP calling module.create/module.update.",
+     "impact": "An agent sets a module's icon to \"\" or \" x \". The user opens that module: the editor shows the unsaved-changes state immediately, close and navigation are refused with \"Save your changes or choose Discard and close\", and \"Add task\" is gated the same way. Saving the untouched form clears it, but it also rewrites the icon the agent set. This is the same mechanism as native-tasks#2 and native-notes-b#9, in an editor neither of them covers.",
+     "fix": "Normalize in the engine: in module.create and module.update, trim the icon and store NULL when it is empty, as the name is already trimmed. That fixes every client at once. Alternatively, build the Draft base by running the stored module through the same normalization the snapshot uses.",
+     "effort": "S",
+     "related": [
+      "crates/relay-core/src/handlers/module.rs:122",
+      "crates/relay-core/src/handlers/module.rs:158",
+      "apps/relay-native/src/task_pages.rs:174",
+      "apps/relay-native/src/task_pages.rs:137",
+      "apps/relay-mobile/app/screens/RelayScreen/Module.tsx:142"
+     ],
+     "id": "r2-cov1-1#1",
+     "cand": "cov1-4-module-editor-icon-null-vs-empty",
+     "source": "r2-completeness",
+     "v1": {
+      "id": "r2-cov1-1#1",
+      "verdict": "confirmed",
+      "severity": "low",
+      "category": "bug",
+      "reason": "note_pages.rs:1360-1361: the snapshot sends `\"icon\": null` when the trimmed icon text is empty, and the trimmed text otherwise. `Draft::new(ui, \"Module\", module.clone(), ...)` (1363) keeps the raw module.get value as the base. `Draft::dirty` (task_pages.rs:175-179) compares each snapshot key against `base[k]`. `can_close` (task_pages.rs:131-143) refuses while dirty, and so does the panel guard. `action` also checks `d.dirty()` (task_pages.rs ~1157). On the engine side, module.create binds `p.icon` unchanged (module.rs:122). module.update does `let icon=p.icon.unwrap_or(before.icon.clone())` with no trim (module.rs:158), while `name` is trimmed. So a stored icon of \"\" gives base \"\" against snapshot null, and \" x \" gives \" x \" against \"x\". Either way the editor opens dirty. Name and priority cannot diverge this way, because the engine trims the name and priority is an enum string.",
+      "correction": "The trigger is narrower than \"an agent\". None of the default role allowlists (handlers/settings.rs:36-38: builder, reviewer, docs) includes module.create or module.update. The raw value has to come from a user-run `relay` CLI call with an arbitrary payload, or from a custom role that has been granted module ops. Saving the form also has a side effect: it sends the normalized icon with `expected` set to the raw base, and that passes. The main fix (trim, and store NULL when empty, in module.create/update) is right."
+     }
+    },
+    {
+     "title": "Board refresh makes a second, serial module.list call only to label cards. It omits archived modules, so cards in completed modules show as \"No module\"",
+     "category": "bug",
+     "severity": "low",
+     "confidence": "high",
+     "file": "apps/relay-native/src/pages.rs",
+     "line": 67,
+     "symbol": "pages::refresh (board branch)",
+     "evidence": "After awaiting task.list, the board branch awaits a second call, `if let Ok(modules) = ui.call(\"module.list\", json!({\"project_id\":project})).await {` (pages.rs:67). It then joins with `modules.iter().find(|module| module[\"id\"] == task[\"module_id\"])` per task, and keeps only `module[\"name\"]` (pages.rs:68-76). module.list is a locked `register` handler that runs `summary()` (a per-module counts query) for every module, plus `header()`, which runs three aggregate queries (handlers/module.rs:75-104, 145). Without `include_archived` it uses `... AND completed_at IS NULL` (module.rs:145). So a task whose module is completed never gets `_module_name`. board_view then falls back to `unwrap_or(\"No module\")` when grouping (board_view.rs:119), excludes it from the module-name search text (board_view.rs:111), and labels the filter `Module #{id}` (board_view.rs:1411).",
+     "impact": "Every board refresh pays a second round trip on the serialized control connection, which runs N+3 SQL queries under the store mutex just to look up names. Refreshes fire on every task event and every session.changed event (native-tasks#8). In normal use, completing a module that still has tasks makes those cards lose their module chip and show up under \"No module\" when grouped by module. Searching for the module name no longer finds them.",
+     "fix": "Have task.list return `module_name` through a LEFT JOIN on modules, regardless of completed_at. Then drop the module.list call and the per-task linear find. Short of that, pass `include_archived: true`.",
+     "effort": "S",
+     "related": [
+      "apps/relay-native/src/board_view.rs:111",
+      "apps/relay-native/src/board_view.rs:119",
+      "apps/relay-native/src/board_view.rs:1411",
+      "crates/relay-core/src/handlers/module.rs:145",
+      "crates/relay-core/src/handlers/module.rs:75"
+     ],
+     "id": "r2-cov1-1#2",
+     "cand": "cov1-6-board-refresh-sequential-roundtrips",
+     "source": "r2-completeness",
+     "v1": {
+      "id": "r2-cov1-1#2",
+      "verdict": "confirmed",
+      "severity": "low",
+      "category": "bug",
+      "reason": "pages.rs:66-77: after task.list, the board branch awaits `ui.call(\"module.list\", json!({\"project_id\":project}))` without include_archived. Only the \"modules\" page passes `include_archived:true` (pages.rs:49-50). module.list without the flag runs `... AND completed_at IS NULL` (module.rs:145), then `summary()` per module and `header()` (three aggregate queries). module.complete (module.rs:159-181) has no guard against open tasks. task.list does not filter by module completion. So tasks in a completed module (at least the Done cards, which stay on the board) get no `_module_name`. The effects: the card-foot module caption is missing (board_view.rs:1807/1951/2389), grouping by module puts them under \"No module\" (119), the search text omits the module name (111), and the filter label falls back to `Module #{id}` (1411).",
+      "correction": "The main impact is mislabeling, not cost. The extra serialized round trip is real but small. Completing a module is a normal action, but what goes wrong is cosmetic and filtering behavior, so this stays low. The fix is fine: a LEFT JOIN that returns module_name from task.list. The minimal alternative is `include_archived:true`."
+     }
+    },
+    {
+     "title": "integration.request passes caller-supplied branch names to `git merge` with no `--`, so a ref named like an option changes how the merge runs",
+     "category": "security",
+     "severity": "low",
+     "confidence": "medium",
+     "file": "crates/relay-core/src/handlers/integration.rs",
+     "line": 124,
+     "symbol": "run (merge_args)",
+     "evidence": "Caller-supplied branches are only checked to resolve: `repo.rev_parse_single(branch.as_str())` (integration.rs:29). They are then sorted and passed as-is: `std::iter::once(\"merge\").chain([\"--no-ff\", \"--no-edit\"]).chain(integration.branches.iter().map(String::as_str))` (integration.rs:124-127). A ref with a leading dash can be created. In a scratch repo, `git update-ref refs/heads/-Xtheirs HEAD` succeeded, and `git merge --no-ff --no-edit -Xtheirs main` parsed `-Xtheirs` as a strategy option rather than a commit. `git merge ... -- main` works as a separator. integration.request is in the builder role's default allowlist (handlers/settings.rs:36). Because '-' sorts before letters, such a ref always lands first in the argument list. Not verified: that gix rev_parse_single resolves the short name `-Xtheirs`.",
+     "impact": "A builder agent creates `refs/heads/-Xours` in the shared repo and requests an integration with it plus two real branches. The merge then silently resolves every conflict in favour of the integration base, and the run reports success. With `-s<name>` git instead looks for a `git-merge-<name>` program. Other branch names can inject further merge options. Agents already control the branch contents, so the added power is small, but the integration result no longer means what it says.",
+     "fix": "Reject branch names that start with '-' in integration.request (or validate them with `git check-ref-format --branch`), and add `\"--\"` before the branch list in merge_args.",
+     "effort": "S",
+     "related": [
+      "crates/relay-core/src/handlers/integration.rs:29",
+      "crates/relay-core/src/handlers/settings.rs:36"
+     ],
+     "id": "r2-cov1-1#3",
+     "cand": "cov1-3-integration-merge-no-end-of-options",
+     "source": "r2-completeness",
+     "v1": {
+      "id": "r2-cov1-1#3",
+      "verdict": "confirmed",
+      "severity": "low",
+      "category": "security",
+      "reason": "integration.rs:26-29: branches are trimmed only for the emptiness check, then sorted and deduped, and validated only by `repo.rev_parse_single(branch)`. gix accepts a leading-dash ref. gix-validate's ref and tag name checks have no leading-'-' rule, only leading '.' and '/'. gix-revision's `revision()` treats only `~^:.@` as separators, so `-Xours` is looked up as a ref name and resolves to refs/heads/-Xours. merge_args (integration.rs:124-127) is `merge --no-ff --no-edit <branches...>` with no `--` separator. '-' (0x2D) sorts before alphanumerics, so the crafted ref comes first and git parses it as an option. integration.request is in the default builder allowlist (settings.rs:36). Agents have a shell in the shared repo and can run `git update-ref refs/heads/-Xours HEAD`, which bypasses `git branch`'s check-ref-format.",
+      "correction": "`-sours` is a stronger variant than `-Xours`. The merge then keeps the base tree entirely and still reports success, so the integration/build tests none of the branches' changes. With an unknown `-s<name>`, git looks for a `git-merge-<name>` program. That gives no extra power, because the agent already runs code as the same user. The impact is limited to a misleading integration result, so low severity is right. Fix: reject names starting with '-' (or run check-ref-format --branch) and insert \"--\" before the branch list. Note that git merge's `--` handling is recent: older git versions treated `--` as the end of options only in some forms, so the name validation is the more robust half."
+     }
+    }
+   ],
+   "dropped": [
+    {
+     "cand": "cov1-1-idempotency-replay-ignores-op-actor",
+     "why": "No consequence. A replay executes nothing: the handler never runs, so the missing authorization check gives no power. The only data it can return is the recorded result_summary of another request, and agents can already read that directly through audit.list and audit.get (Global-scope queries; audit.rs:173-190 exposes result_summary). Reusing an id is the caller's own choice, and first-party clients always mint fresh UUIDs. The race and reachability side is already core-engine#19."
+    },
+    {
+     "cand": "cov1-2-commit-add-all-before-gate",
+     "why": "Not worth reporting. With all=true, staging everything is the requested effect, it is reversible, and an agent can do the same with git.stage or a shell `git add`. A refused commit cannot leak a protected path later, because evaluate_commit re-reads the full `--cached` numstat on every later git.commit (guardrail.rs:757-790). Running the pre-commit hook before the lock is deliberate (D144) so it stays outside the store mutex. The real gate-ordering defect, judging a stale numstat and then committing whatever the index holds, is already core-git#20 and lens-store-mutex#4."
+    },
+    {
+     "cand": "cov1-5-codex-relay-token-env-policy",
+     "why": "Not real for the Codex version in use. The premise is that Codex's default shell_environment_policy strips variables whose names contain TOKEN, so the shell tool never sees RELAY_TOKEN, which session.rs:566 passes only through the environment. The local install is codex-cli 0.154.0, and ~/.codex/config.toml sets only [shell_environment_policy.set], so the policy is at its default. Codex rollouts whose cwd is a .relay/worktrees/<name> show `$RELAY_BIN q session.bootstrap` finishing with status \"completed\" and returning the agent's bootstrap (sessions amber-hare, bold-quail, gentle-zebra, proud-newt, sly-quail and others). An agent actor on the socket door must carry a token, or the engine refuses with \"agent:{name} requires a token on the socket door\" (engine.rs:1366-1368). The CLI takes the token only from env RELAY_TOKEN (relay-cli/src/main.rs:120-123), so RELAY_TOKEN does reach Codex's shell tool. The rollouts contain the \"requires a token\" and hooks.rs \"session identity has no token\" strings only where agents were reading source code, never as a runtime failure. The bus.actor refusals seen in Codex sessions are \"unknown session\" (a store/instance mismatch, unrelated to the token). The remaining risk is that Relay does not pin shell_environment_policy, so a user config that sets inherit=\"core\" or turns the KEY/SECRET/TOKEN excludes back on would break agent identity. That depends on user configuration, and nothing shows it happening, so it is not worth reporting."
+    }
+   ]
+  },
+  {
+   "miner": 2,
+   "candidates": [
+    {
+     "key": "cov2-13-perf-prefix-filter-dup-runs",
+     "source_unit": "perf-harness",
+     "file": "crates/relay-core/examples/perf.rs",
+     "line": 1561,
+     "claim": "The callgrind and scale passes pass exact case names back in as filters, but the filter matches `c.name == f || c.name.starts_with(f)`. About 20 cases whose name prefixes another case (e.g. session.close vs session.close.created) therefore run twice. This wastes time; the data stays valid.",
+     "searched": "index.tsv perf-harness rows; round1.json: 'prefix filter|twice|run twice'. No perf-harness hit"
+    },
+    {
+     "key": "cov2-8-ts-since-until-lexicographic",
+     "source_unit": "lens-sqlite",
+     "file": "crates/relay-core/src/audit.rs",
+     "line": 216,
+     "claim": "audit.list and mailbox.list take free-form since/until strings (Ts = String, unvalidated) and compare them lexicographically against stored RFC3339 timestamps (`ts >= ?`, `ts <= ?`; notes.rs:645/686 for mailbox). A differently formatted value (offset, no 'Z', date only, epoch) silently returns wrong rows.",
+     "searched": "index.tsv: since|until|lexicograph; round1.json: 'Ts = String|since:', 'since.*until|lexicograph'. No relevant hits"
+    },
+    {
+     "key": "cov2-12-double-payload-deserialize",
+     "source_unit": "lens-perf",
+     "file": "crates/relay-core/src/engine.rs",
+     "line": 0,
+     "claim": "Each request payload is deserialized twice, once in the pipeline's validate step and again in the handler. The auditor noted it on hot agent paths and judged it too small to report. Not located precisely.",
+     "searched": "index.tsv and round1.json: 'deseriali', 'validate.{0,40}(twice|again|handler)'. core-engine#18 covers only the keystroke fast path's deep clone"
+    },
+    {
+     "key": "cov2-9-session-token-nonconstant-compare",
+     "source_unit": "lens-sqlite",
+     "file": "crates/relay-core/src/engine.rs",
+     "line": 1381,
+     "claim": "check_session_token compares the session token with plain `row.token != token`, which is not constant-time. relay-remote's pairing uses digest_eq instead. The auditor judged it low risk because the socket is local.",
+     "searched": "index.tsv: constant.time, token compare; round1.json: 'constant.time', 'token.{0,30}(compare|==|eq)', 'check_session_token' (only core-engine#8 and sec-local-ipc#1, both about something else)"
+    },
+    {
+     "key": "cov2-1-write-roots-grants-tmp",
+     "source_unit": "tests-sessions",
+     "file": "crates/relay-core/src/guardrail.rs",
+     "line": 617,
+     "claim": "guardrail::write_roots always pushes std::env::temp_dir() as an allowed write root for every agent, unconditionally. That covers all of /tmp, including the /tmp/relay-v4-<uid> runtime-dir fallback (socket, lock file) when XDG_RUNTIME_DIR is unset, so an agent's gated writes into the engine's own runtime directory pass the write-root check.",
+     "searched": "index.tsv: temp_dir, write_roots, 'write root', tmp|temp; round1.json full text: 'temp_dir\\(\\)'. Only core-guardrail#24 (relative/~ roots ignored), tests-sessions#7 (test) and the paths.rs fallback findings come up; none is about write_roots granting temp_dir"
+    },
+    {
+     "key": "cov2-5-swipe-duration-ignored",
+     "source_unit": "tests-mirror-board",
+     "file": "crates/relay-core/src/handlers/device.rs",
+     "line": 959,
+     "claim": "device.mirror.input's 'swipe' event sends DOWN, one MOVE and UP back to back with no timing (send_input, handlers/device.rs ~959-966). A duration_ms field is silently ignored, and tests/bus.rs:225 sends duration_ms:300 as if it were honoured. Apps that need a timed or long swipe (scrolling vs fling) get an instant fling.",
+     "searched": "index.tsv: swipe, duration; round1.json: 'duration_ms', 'swipe'. No relevant hits"
+    },
+    {
+     "key": "cov2-7-project-remove-worktree-race",
+     "source_unit": "tests-misc",
+     "file": "crates/relay-core/src/handlers/workspace.rs",
+     "line": 338,
+     "claim": "project.remove with remove_worktrees queues worktree::remove(..., force) in after_commit while the force-closed sessions' agent kills are deferred (~150 ms grace). Removal can therefore start while the agents are still alive and writing into the checkout. The auditor rated it minor.",
+     "searched": "index.tsv: project.remove, remove_worktrees, after_commit; round1.json: 'remove_worktrees', '150 ?ms'. lens-data-loss#8 and core-workspace-files#15 cover no dirty check and the teardown under lock, not this ordering race"
+    },
+    {
+     "key": "cov2-10-mirror-adb-forward-local-port",
+     "source_unit": "sec-remote-door",
+     "file": "crates/relay-core/src/mirror.rs",
+     "line": 64,
+     "claim": "Mirroring sets up `adb forward tcp:0 localabstract:scrcpy_<scid>` (forward_args, mirror.rs:64-69), which opens a 127.0.0.1 TCP port that any local user can connect to. Another account on the machine can reach the scrcpy video and control sockets (screen capture and input injection) while a mirror is up. The auditor did not verify this.",
+     "searched": "index.tsv: forward, tcp:0, 'other local user'; round1.json: 'forward', 'local port|127.0.0.1'. core-device-mirror#2 is only the leaked forward on teardown, not who can reach the port"
+    },
+    {
+     "key": "cov2-3-skills-test-set-var",
+     "source_unit": "tests-mirror-board",
+     "file": "crates/relay-core/src/skills.rs",
+     "line": 382,
+     "claim": "The skills.rs unit test user_scope_covers_both_providers... does unsafe set_var(\"RELAY_SKILLS_HOME\") process-wide (removed at 419) while other unit tests in the crate run in parallel threads. Concurrent env reads race with it (UB in 2024 semantics), and any test that resolves user skill bases during that window is redirected.",
+     "searched": "index.tsv: set_var, RELAY_SKILLS_HOME; round1.json: 'RELAY_SKILLS_HOME' (only tests-misc#11, which is about Instance::Test branches, not this)"
+    },
+    {
+     "key": "cov2-6-open-memory-stray-paths",
+     "source_unit": "tests-misc",
+     "file": "crates/relay-core/src/store.rs",
+     "line": 507,
+     "claim": "For a store with no parent dir (Store::open_memory), skills_dir falls back to a per-process /tmp/relay-skills-<pid> that is never cleaned up, and backup_dir/upgrade backups fall back to a relative PathBuf::from(\"backups\") (store.rs:440, 498), which resolves against the process cwd.",
+     "searched": "index.tsv: open_memory, backups; round1.json: 'open_memory|relay-skills-'. Only the store-permissions and size_mb/backup-dir duplication findings (core-socket-store#25) come up; neither covers the tmp or relative fallbacks"
+    },
+    {
+     "key": "cov2-4-socket-test-eof-spin",
+     "source_unit": "tests-sessions",
+     "file": "crates/relay-core/tests/sessions.rs",
+     "line": 389,
+     "claim": "In session_lifecycle_over_socket, the frame loops (389-399 and 404-410) treat only Ok(Ok(Some(Frame))) as progress. If the stream hits EOF, term.next() returns Ok(None) at once, so the loop busy-spins for the full 10 s deadline and then fails with a misleading 'no greeting/no echo' message.",
+     "searched": "index.tsv: tests/sessions.rs (4 findings, none about this), EOF|spin; round1.json: 'session_lifecycle_over_socket'. No hits"
+    },
+    {
+     "key": "cov2-2-store-test-env-var-leak",
+     "source_unit": "tests-sessions",
+     "file": "crates/relay-core/tests/store.rs",
+     "line": 129,
+     "claim": "The store.rs integration test calls std::env::set_var(\"RELAY_V3_SESSIONS_JSON\", ...) for the whole process and never restores it. handlers/import_v3.rs:341 reads that variable, so any other test in the binary that runs app.import.v3 in parallel picks up the fixture path.",
+     "searched": "index.tsv: RELAY_V3_SESSIONS, set_var, process-wide, tests/store.rs; round1.json: 'RELAY_V3_SESSIONS'. No hits"
+    },
+    {
+     "key": "cov2-11-doc-events-no-producer",
+     "source_unit": "lens-docs",
+     "file": "docs/engine/BUS.md",
+     "line": 1074,
+     "claim": "BUS.md promises a `bus.deprecated` warning event, logged once per client per op by a translation shim (1074), and a `session.output` domain event (183). Nothing in the code emits either. The same check found guardrail.violation, ui.absent and bus.project_required; those are covered elsewhere, these two are not.",
+     "searched": "index.tsv: producer, bus.deprecated, session.output; round1.json: 'deprecat' (bus#15 is dead relay-bus API, not the doc promise), 'session\\.output'. guardrail.violation is covered by lens-docs#10/sec-supply-chain#17 and ui.absent by lens-contract#8"
+    },
+    {
+     "key": "cov2-14-baseline-py-log-handle-leak",
+     "source_unit": "perf-harness",
+     "file": "scripts/perf/baseline.py",
+     "line": 328,
+     "claim": "baseline.py opens engine.log with `open(..., 'a')` for each engine fixture (self.log) and never closes it, leaking one file handle per engine started.",
+     "searched": "index.tsv/round1.json: baseline.py, 'log handle|file handle'. perf-harness#8/#16 are other baseline.py issues"
+    },
+    {
+     "key": "cov2-15-report-py-hardcoded-burst",
+     "source_unit": "perf-harness",
+     "file": "scripts/perf/report.py",
+     "line": 222,
+     "claim": "report.py hard-codes the burst description '50 000 lines (4.9 MB)' instead of reading the run's burst size, so the report is wrong for any run with a different burst size.",
+     "searched": "index.tsv/round1.json: report.py, 'hard-?codes|50 000'. No report.py finding"
+    }
+   ],
+   "covered": [
+    {
+     "claim": "tools_settings.rs:121-126/668-684 still collect dead `guardrail:` widgets into an unsent `guardrails` value",
+     "by": [
+      "native-tools#9"
+     ]
+    },
+    {
+     "claim": "Socket door accepts actor 'user' with no token, so an agent can approve its own holds over a raw socket line",
+     "by": [
+      "sec-local-ipc#1",
+      "core-socket-store#1",
+      "core-guardrail#7"
+     ]
+    },
+    {
+     "claim": "session.close defaults to remove_worktree=true and force-removes with no dirty check",
+     "by": [
+      "core-session#14",
+      "lens-data-loss#8"
+     ]
+    },
+    {
+     "claim": "git::briefing_state walks commit graphs under the store lock during spawn/brief/bootstrap",
+     "by": [
+      "core-session#12",
+      "lens-store-mutex#7",
+      "core-workspace-files#17",
+      "lens-sqlite#12"
+     ]
+    },
+    {
+     "claim": "hooks::writes() is documented as held for milliseconds but is held across skill-folder copies",
+     "by": [
+      "core-hooks-skills#25"
+     ]
+    },
+    {
+     "claim": "hooks.rs:210 run_user_pre_commit runs without a timeout, and under the store lock on a guardrail.confirm replay",
+     "by": [
+      "core-hooks-skills#9",
+      "tests-features#5",
+      "sec-local-ipc#10"
+     ]
+    },
+    {
+     "claim": "audit.undo (handlers/audit.rs:68) runs staged inverses' prepare under the lock via invoke_registered. Same root cause as invoke_registered running prepare inside the caller's transaction",
+     "by": [
+      "core-engine#2",
+      "lens-overengineering#1"
+     ]
+    },
+    {
+     "claim": "integration.request deploy runs run_cmd through untimed fish -lc without a device lease",
+     "by": [
+      "sec-local-ipc#9",
+      "core-device-mirror#8",
+      "lens-contract#17",
+      "core-misc-handlers#5",
+      "core-misc-handlers#8"
+     ]
+    },
+    {
+     "claim": "workspace.discover walks a tree to depth 4 inside a locked handler, and one unreadable dir fails the whole scan (workspace.rs:115-133, 393-413). Listed as known-uncovered, but round 1 already has it",
+     "by": [
+      "native-launch#7",
+      "core-workspace-files#16",
+      "bus#2",
+      "tests-misc#7",
+      "lens-store-mutex#15",
+      "core-workspace-files#33",
+      "tests-misc#8"
+     ]
+    },
+    {
+     "claim": "attach_bytes writes files before the transaction commits, leaving orphans when task.create fails (task.rs:505-530). Listed as known-uncovered, but core-tasks-notes#14 cites task.rs:524 and the failed second-attachment create",
+     "by": [
+      "core-tasks-notes#14"
+     ]
+    },
+    {
+     "claim": "github.rs runs gh via Command::output()/status() with no timeout (gh auth login --web blocks)",
+     "by": [
+      "lens-subprocess#5",
+      "core-pty-providers#23"
+     ]
+    },
+    {
+     "claim": "store.db, WAL and backups are created 0644 under the default umask",
+     "by": [
+      "sec-local-ipc#12",
+      "core-socket-store#23",
+      "sec-fs-injection#1",
+      "sec-supply-chain#19"
+     ]
+    },
+    {
+     "claim": "target/engine-<instance>.log is appended to forever (and carries ANSI codes)",
+     "by": [
+      "lens-resources#16"
+     ]
+    },
+    {
+     "claim": "BUS.md \u00a714 'No RPC over the network' is contradicted by the phone door",
+     "by": [
+      "lens-docs#11"
+     ]
+    },
+    {
+     "claim": "The same request id sent twice concurrently gets an internal error instead of a replay",
+     "by": [
+      "core-engine#19"
+     ]
+    },
+    {
+     "claim": "In-memory device-lease/run state is not rolled back with the transaction",
+     "by": [
+      "lens-concurrency#20",
+      "core-device-mirror#18"
+     ]
+    },
+    {
+     "claim": "LFS smudge/clean reaches the network under the store lock through untimed git",
+     "by": [
+      "lens-subprocess#2"
+     ]
+    },
+    {
+     "claim": "The integration build shell hard-codes fish -lc with no timeout",
+     "by": [
+      "core-misc-handlers#8"
+     ]
+    },
+    {
+     "claim": "os.reveal/os.open_url spawn xdg-open without reaping (zombies)",
+     "by": [
+      "core-misc-handlers#18",
+      "lens-resources#15"
+     ]
+    },
+    {
+     "claim": "The dev store.db is ~180 MB (retention/growth)",
+     "by": [
+      "lens-perf#12",
+      "lens-perf#11"
+     ]
+    },
+    {
+     "claim": "paths.rs:66-75 falls back to a predictable /tmp/relay-v4-<uid> runtime dir that another local user can pre-create",
+     "by": [
+      "core-engine#5",
+      "sec-local-ipc#11",
+      "sec-fs-injection#2",
+      "sec-supply-chain#8",
+      "core-socket-store#4",
+      "lens-docs#22"
+     ]
+    },
+    {
+     "claim": "unreal.rs:675-680 writes remote-exec switches into the committed DefaultRemoteControl.ini",
+     "by": [
+      "cli-unreal#10",
+      "plugins-unreal#11",
+      "sec-supply-chain#9"
+     ]
+    },
+    {
+     "claim": "With dev and stable both on --remote, the second door fails to bind and pair still points at 7420",
+     "by": [
+      "remote#17"
+     ]
+    },
+    {
+     "claim": "file.import, app.backup.now and app.import.v3 do slow filesystem work under Engine::register",
+     "by": [
+      "core-workspace-files#13",
+      "lens-sqlite#10",
+      "core-socket-store#11",
+      "core-misc-handlers#14",
+      "lens-store-mutex#10"
+     ]
+    },
+    {
+     "claim": "worktree.remove and integration.discard do tree walks and rm -rf under the lock",
+     "by": [
+      "lens-store-mutex#5",
+      "lens-dead-dup#6",
+      "core-misc-handlers#2",
+      "tests-features#4"
+     ]
+    },
+    {
+     "claim": "worktree::git (git_mutate) runs without output_with_timeout",
+     "by": [
+      "tests-sessions#3",
+      "tests-features#2",
+      "lens-overengineering#4",
+      "lens-store-mutex#3"
+     ]
+    },
+    {
+     "claim": "device.run (Engine::register) calls require_device -> `adb devices -l` under the store mutex",
+     "by": [
+      "core-device-handler#4",
+      "lens-store-mutex#6"
+     ]
+    },
+    {
+     "claim": "The notify.settings.set undo merge does not revert added keys",
+     "by": [
+      "core-misc-handlers#9",
+      "lens-contract#9"
+     ]
+    },
+    {
+     "claim": "The denied-command matcher treats quoted first words as data",
+     "by": [
+      "lens-overengineering#3"
+     ]
+    },
+    {
+     "claim": "Responses over 2 MiB on native's main socket (wallpaper-library reads included) tear down the connection",
+     "by": [
+      "native-app#2",
+      "lens-gtk-mainthread#4",
+      "lens-perf#4"
+     ]
+    },
+    {
+     "claim": "session.report recompiles uncached SQL on every agent tool use",
+     "by": [
+      "core-session#31",
+      "lens-sqlite#16"
+     ]
+    },
+    {
+     "claim": "The inline session.input PTY write on a tokio worker can block when the child stops reading",
+     "by": [
+      "lens-concurrency#11"
+     ]
+    },
+    {
+     "claim": "A failed skill install may leave skill folders orphaned",
+     "by": [
+      "core-pty-providers#8",
+      "core-hooks-skills#11"
+     ]
+    },
+    {
+     "claim": "The smoke harness ships in the native binary behind env vars",
+     "by": [
+      "native-smoke#1"
+     ]
+    },
+    {
+     "claim": "Five or six native relative-time formatters print differently",
+     "by": [
+      "lens-dead-dup#19"
+     ]
+    },
+    {
+     "claim": "socket bind returns the same AlreadyRunning error from both probe branches",
+     "by": [
+      "core-socket-store#21"
+     ]
+    }
+   ],
+   "discarded": [
+    "fonts.rs non-atomic cache writes shared by instances: auditor dropped as near-zero impact (race only at simultaneous start)",
+    "native-misc: DISMISSED set grows 8 bytes per prompt; Panel::close RefMut across callbacks with no re-entrant callback; wallpaper SourceId double-remove impossible; all ruled out",
+    "native-css: whether notes-window box-shadow/margin removes Wayland resize edges was not checked (needs a mapped window); speculative",
+    "lens-store-mutex: git.branch.cleanup prepare calls store.lock() directly and would self-deadlock if nested, but nothing nests it; auditor found no reachable deadlock",
+    "sec-guardrail-bypass: session-scoped grants not expired on session.close, ruled out as no cross-session leak since closed ids are never reactivated",
+    "sec-guardrail-bypass: whether device_lease::gate_command does slow work under the lock was not evaluated; vague",
+    "lens-dead-dup: four icon geometries never requested by a literal name, not checked against dynamic names; unverified",
+    "lens-resources: Claude/Codex subprocess grouping vs kill(-pid) unknown; external behaviour, not a concrete code issue",
+    "lens-overengineering 'not reported as too minor or not diverged': watch::Defer two impls, SaturatingSubF64 one-call trait, duplicate hex(), serve.rs/remote.rs shared run-until-quit block, overlap.rs gix status vs git CLI, native socket-path logic duplicating paths.rs; judged not diverged or too minor",
+    "plugins-blender: plugin MCP tools bypassing guardrail.gate, deliberately folded into the path-containment finding (D5/D132 make the pre-commit gate the boundary)",
+    "tests-sessions: fixture lacks git-config isolation, but the developer's global config sets none of the risky keys; ruled out",
+    "tests-bus-guardrails/tests-features/tests-misc: Door::InProcess and Instance::Test are reachable only from tests/examples; ruled out",
+    "Unverified external behaviours (PreToolUse hook timeout semantics, Codex apply_patch payload shape, Gradle after wrapper kill, RLIMIT_NOFILE): not code issues in this repo",
+    "socket.rs unbounded BufReader::lines and MirrorRuntime::send_control blocking write_all are not mentioned in this half; for reference, round 1 already has core-socket-store#8 (request lines have no size limit, socket.rs:323) and core-device-mirror#7/lens-concurrency#10 (mirror control writes block holding the control mutex, device.rs:279-282)"
+   ],
+   "findings": [
+    {
+     "title": "perf `run` treats every filter as a prefix, so baseline.py's exact-name shards run 19 cases twice under callgrind and add unlisted cases to the scale pass",
+     "category": "test-quality",
+     "severity": "low",
+     "confidence": "high",
+     "file": "crates/relay-core/examples/perf.rs",
+     "line": 1561,
+     "symbol": "main (\"run\" filter)",
+     "evidence": "perf.rs:1561: `.filter(|c| filters.is_empty() || filters.iter().any(|f| c.name == *f || c.name.starts_with(f.trim_end_matches('*'))))`. A plain name with no `*` still matches as a prefix. scripts/perf/baseline.py:266 splits exact names round-robin across jobs (`groups = [names[i::jobs] for i in range(jobs)]`) and passes each group as filters (line 273), and the scale pass passes the exact SCALE_OPS names (line 632). 21 case names prefix another case (op.session.list/op.session.list.all, op.task.list/.filtered, op.git.diff/.file/.staged, op.guardrail.gate/.hold/.refused, op.session.close/.created, op.settings.get/.path, ...). The checked-in run shows the effect. `cat docs/perf/runs/2026-09-19/callgrind/rows-*.jsonl | jq -r .name | sort | uniq -d` lists 19 names that ran in two shards. rows-extra-0.jsonl has 9 rows for 8 names passed. scale10.jsonl contains op.session.list.all@x10 and op.settings.get.path@x10, which are not in SCALE_OPS.",
+     "impact": "Each baseline run repeats about 19 scenarios under valgrind, the slowest pass at roughly 50x. The repeat happens in a different shard with different fixture state (see perf-harness#6). parse_callgrind keys profiles by name and keeps whichever dump sorts last (baseline.py:212-258), so the profile reported for those cases depends on which shard's pid sorts last. The scale pass also measures cases nobody chose. The numbers stay usable, but time is wasted and the selection does not match what was asked for.",
+     "fix": "Match exactly unless the filter ends in `*`: `c.name == *f || (f.ends_with('*') && c.name.starts_with(f.trim_end_matches('*')))`. Apply the same rule to baseline.py's `matches()` (line 110) so `--only` keeps working as a prefix only when given `op.git.*`. If bare-prefix behaviour should stay for interactive use, have baseline.py pass names with an `=` marker that means exact.",
+     "effort": "S",
+     "related": [
+      "scripts/perf/baseline.py:266",
+      "scripts/perf/baseline.py:632",
+      "scripts/perf/baseline.py:110",
+      "scripts/perf/baseline.py:211"
+     ],
+     "id": "r2-cov2-1#1",
+     "cand": "cov2-13-perf-prefix-filter-dup-runs",
+     "source": "r2-completeness",
+     "v1": {
+      "id": "r2-cov2-1#1",
+      "verdict": "confirmed",
+      "severity": "low",
+      "category": "test-quality",
+      "reason": "perf.rs:1561 has exactly `c.name == *f || c.name.starts_with(f.trim_end_matches('*'))`, so a filter without `*` still matches as a prefix. baseline.py:266 splits exact names round-robin into shards (`groups = [names[i::jobs] ...]`) and passes each group as filters to `perf run` (line 273). When `op.session.list` and `op.session.list.all` land in different shards, the second case runs in both. I ran `cat docs/perf/runs/2026-09-19/callgrind/rows-*.jsonl | jq -r .name | sort | uniq -d | wc -l` and got 19. The scale pass (baseline.py:629-632) passes only SCALE_OPS names (lines 40-46), and the checked-in scale10.jsonl has op.session.list.all@x10 and op.settings.get.path@x10, neither of which is in SCALE_OPS. parse_callgrind (baseline.py:211) loops over sorted callgrind.out.* files and sets `profiles[name] = ...`, so whichever dump sorts last wins. baseline.py:110 `matches()` has the same prefix rule. The cost is wasted valgrind time and a scale-pass selection that does not match what was asked for. The numbers stay usable, so low is right.",
+      "correction": "Line numbers match: perf.rs:1561, baseline.py:110, 211, 266, 273, 629-632. Only the callgrind shards run cases twice. Each single native or strace run filters cases once, so a case does not repeat within one run."
+     }
+    },
+    {
+     "title": "audit.list, mailbox.list and mailbox.outbox compare unvalidated `since`/`until` strings lexicographically against stored UTC timestamps, so offset, space-separated or epoch values silently return wrong rows",
+     "category": "bug",
+     "severity": "medium",
+     "confidence": "high",
+     "file": "crates/relay-core/src/audit.rs",
+     "line": 216,
+     "symbol": "audit::list / MailboxList / MailboxOutbox",
+     "evidence": "relay-bus types.rs:12-13: `/// RFC 3339 UTC.\\npub type Ts = String;`. This is documentation only: the payload validate step (registry.rs:221) only checks that serde accepts a String. audit.rs:216-217: `if let Some(s) = f.since { sql.push_str(\" AND ts >= ?\"); args.push(Box::new(s.to_string())); }` / `... \" AND ts <= ?\"`. handlers/notes.rs:640 (outbox) `(?3 IS NULL OR m.sent_at >= ?3)` and notes.rs:683 (mailbox.list) use the same comparison. Stored values come from jiff `Timestamp::to_string()` (time.rs:5), e.g. `2026-10-06T12:00:00.123Z`. Each of these ops is exposed to agents as an MCP tool (audit_list, mailbox_list, mailbox_outbox).",
+     "impact": "An agent polling its mailbox with a local-offset time such as `date -Iseconds` -> `2026-10-06T14:00:00+02:00` (12:00Z) compares as later than `2026-10-06T12:30:00Z`, so every message sent between 12:00Z and 14:00Z is silently skipped. An epoch value (`1759752000`) sorts below every year-2xxx string: `since` matches everything and `until` matches nothing. A date-only `until: \"2026-10-06\"` excludes that whole day. A space-separated `2026-10-06 12:00` makes `since` include the whole day. None of these return an error. Separately, jiff prints the fraction at minimal width, so `...:49Z` sorts after `...:49.5Z` and the order within one second is not chronological.",
+     "fix": "Parse `since`/`until` in the handlers with `jiff::Timestamp::from_str` (it accepts any RFC 3339 offset) and reject anything else with `BusError::invalid`. Re-render the parsed value with a fixed precision (`format!(\"{ts:.9}\")`) and write stored timestamps with the same fixed precision in time::now()/days_ago, so string comparison really is chronological. Alternatively, compare with `julianday()` / `unixepoch()` in SQL.",
+     "effort": "S",
+     "related": [
+      "crates/relay-core/src/handlers/notes.rs:640",
+      "crates/relay-core/src/handlers/notes.rs:683",
+      "crates/relay-core/src/handlers/audit.rs:37",
+      "crates/relay-bus/src/types.rs:13",
+      "crates/relay-core/src/time.rs:5",
+      "crates/relay-bus/src/ops/notes.rs:55"
+     ],
+     "id": "r2-cov2-1#2",
+     "cand": "cov2-8-ts-since-until-lexicographic",
+     "source": "r2-completeness",
+     "v1": {
+      "id": "r2-cov2-1#2",
+      "verdict": "confirmed",
+      "severity": "medium",
+      "category": "bug",
+      "reason": "audit.rs:216-217 appends `AND ts >= ?` / `AND ts <= ?` and binds the raw `since`/`until` strings. notes.rs MailboxOutbox has `(?3 IS NULL OR m.sent_at >= ?3)` and MailboxList pushes the same clause, both binding `p.since` unchanged. The payload fields are `Option<Ts>`, where `Ts = String` (relay-bus types.rs:13). The 'RFC 3339 UTC' note is a doc comment on a type alias, so it does not reach the JSON schema. The op descriptions ('Messages, optionally for one session', 'Audit rows, filtered; limit \u2264 1000') give no format either. Nothing parses the value before it reaches SQL. Stored values are jiff `Timestamp::to_string()` in UTC 'Z' form (time.rs:5), so text comparison is chronological only for input in that exact form. An offset value (`...T14:00:00+02:00`), an epoch number, a date-only value or a space-separated value is accepted and silently returns the wrong rows. No internal client (native, CLI, remote) passes `since` or `until`; the reachable path is agents through the MCP tools audit_list, mailbox_list and mailbox_outbox. An agent that reuses a previous `sent_at` as its cursor gets correct results, so the trigger is uncommon. When it does happen, mail is skipped with no error, which fits medium.",
+      "correction": "MailboxList builds its SQL with `ctx.tx().prepare(&sql)` around notes.rs:670-683; MailboxOutbox is at about notes.rs:633-640. The sub-second ordering point is real (jiff prints the fraction at minimal width, and '.' and digits sort below 'Z'). In practice it only matters within the same sub-microsecond window, because stored values carry nanosecond precision, so it is negligible. The fix should rest on parsing and rejecting bad input with `BusError::invalid` and re-rendering the value as UTC. Changing the stored precision is optional."
+     }
+    },
+    {
+     "title": "project.remove with remove_worktrees starts deleting checkouts as soon as the agents are signalled, not after they are dead",
+     "category": "concurrency",
+     "severity": "low",
+     "confidence": "high",
+     "file": "crates/relay-core/src/handlers/workspace.rs",
+     "line": 338,
+     "symbol": "ProjectRemove handler / after_commit worktree removal",
+     "evidence": "The comment at workspace.rs:321-325 says the removal is queued \"for after the commit too, behind those kills\". It is queued behind the start of those kills, not their end. Each forced `session.close` (invoked with remove_worktree:false) defers its kill as `ctx.after_commit(move |_| kill_detached(pty, Duration::from_millis(150)))` (session.rs:1606). `kill_detached` (session.rs:366-376) only spawns a `pty-kill-<pid>` thread and returns. Inside that thread, `Pty::kill` (pty.rs:363-384) sends SIGTERM, waits up to 150 ms, then sends SIGKILL and waits up to 2 s more. Engine::dispatch runs the after_commit closures one after another on the request thread (engine.rs:1030-1035). So project.remove's closure `for wt in &doomed { crate::worktree::remove(&repo, wt, true) ... }` (workspace.rs:338-344) runs right after those threads are spawned, possibly before SIGTERM has even been delivered. `worktree::remove` (worktree.rs:352-369) runs purge_build, dir_size and then `git worktree remove --force` with a remove_dir_all fallback. session.close's own remove path does the opposite, killing synchronously first: \"Stop writers before undoing their hooks and deleting their checkout\" with `pty.kill(Duration::from_millis(150))` (session.rs:1567-1571).",
+     "impact": "Trigger: project.remove {force:true, remove_worktrees:true} on a project whose agents are busy, for example in a build or a file-writing tool call. The agent and its process group keep running for up to 150 ms (2+ s if they ignore SIGTERM) while purge_build and `git worktree remove --force` delete the tree under them. A writer that creates files mid-delete makes remove_dir_all fail with ENOTEMPTY. worktree::remove then returns an error that is only logged as a warning, so a half-deleted pool directory and stale worktree metadata stay on disk after the project has been forgotten. Nothing is left in Relay to clean them up. Agents also see their checkout disappear while they are still running, which leads to spurious tool errors and partial writes. The path is uncommon and the window is short, so the severity is low.",
+     "fix": "Make the removal wait for the kills. Before invoking session.close for each open session, have project.remove take the PTYs itself with `ctx.engine().take_pty(id)`, so session.close finds none to defer. Move them into the existing after_commit closure, and there call `pty.silence_exit(); pty.kill(Duration::from_millis(150))` synchronously for every PTY before the `worktree::remove` loop. That matches session.close's own remove path. Fix the comment at workspace.rs:321-325 to match.",
+     "effort": "S",
+     "related": [
+      "crates/relay-core/src/handlers/session.rs:1606",
+      "crates/relay-core/src/handlers/session.rs:366",
+      "crates/relay-core/src/handlers/session.rs:1567",
+      "crates/relay-core/src/pty.rs:363",
+      "crates/relay-core/src/worktree.rs:352",
+      "crates/relay-core/src/engine.rs:1030"
+     ],
+     "id": "r2-cov2-2#1",
+     "cand": "cov2-7-project-remove-worktree-race",
+     "source": "r2-completeness",
+     "v1": {
+      "id": "r2-cov2-2#1",
+      "verdict": "confirmed",
+      "severity": "low",
+      "category": "concurrency",
+      "reason": "In workspace.rs (around 288-345), project.remove calls `ctx.invoke_registered(\"session.close\", {remove_worktree:false})` for each open session. With remove_worktree false, session.close's staged prepare phase (session.rs ~1565) does not take the PTY. Its commit phase (session.rs ~1601-1606) queues `ctx.after_commit(move |_| kill_detached(pty, 150ms))`, and the deferred closures are merged into the parent's after_commit list (engine.rs ~347). project.remove then pushes its own closure, which loops over `crate::worktree::remove(&repo, wt, true)`. Engine::dispatch runs these closures in order on the request thread after the commit (engine.rs 1030-1035). kill_detached (session.rs 366-376) only spawns a thread that runs Pty::kill (SIGTERM, up to 150 ms grace, then SIGKILL and up to 2 s), so the worktree removal starts as soon as the kill threads exist, not once the children are dead. worktree::remove (worktree.rs 352-369) runs purge_build, dir_size, `git worktree remove --force`, and remove_dir_all as a fallback. Any error is only logged with tracing::warn, after the project rows have been deleted. session.close's own remove path does it the other way round: it takes the PTY and calls `pty.kill(150ms)` synchronously before deleting. The comment's phrase \"behind those kills\" is therefore inaccurate.",
+      "correction": "Severity stays low. SIGTERM goes to the whole process group within microseconds of the thread being spawned, and most agents exit quickly, so the race window is short. It matters only when force and remove_worktrees are both set and an agent or its build is actively writing. A leftover directory is an unlikely outcome, not a typical one. The proposed fix is sound: take each PTY before session.close runs, then kill them synchronously with exit silenced inside the after_commit closure, before the remove loop."
+     }
+    },
+    {
+     "title": "device.mirror.input 'swipe' is an instant three-packet fling; duration_ms is silently ignored while the test sends it as if it were honoured",
+     "category": "test-quality",
+     "severity": "low",
+     "confidence": "high",
+     "file": "crates/relay-core/src/handlers/device.rs",
+     "line": 959,
+     "symbol": "send_input (\"swipe\" arm)",
+     "evidence": "`\"swipe\" => { ... let mut bytes = mirror::touch(mirror::ACTION_DOWN, x1, y1, w, h, 1.0).to_vec(); bytes.extend_from_slice(&mirror::touch(mirror::ACTION_MOVE, x2, y2, w, h, 1.0)); bytes.extend_from_slice(&mirror::touch(mirror::ACTION_UP, x2, y2, w, h, 0.0)); bytes }`. The three events are written in one control-socket write. No field other than x1/y1/x2/y2 is read. MirrorInputIn's `event` is an untyped `Value` (relay-bus ops/device.rs:18), so an extra `duration_ms` is accepted without complaint. The only in-repo sender of a swipe is tests/bus.rs:225: `{\"type\":\"swipe\",\"x1\":0,\"y1\":0,\"x2\":575,\"y2\":1279,\"duration_ms\":300}`. It asserts only that the call succeeded. BUS.md:863 documents `event: TouchEvent | KeyEvent` and says nothing about swipe semantics. The native client does not use `swipe` and sends its own DOWN/MOVE/UP stream (apps/relay-native/src/mirror/input.rs).",
+     "impact": "Trigger: a bus client (the CLI, a script, or a future phone or macro feature) sends `swipe` with a duration to scroll a list by a controlled amount. Android sees DOWN, one MOVE and UP within microseconds, which is a very high velocity, so the gesture lands as a fling (or is ignored by gesture detectors that need intermediate moves) rather than a slow drag or long-press drag. The caller gets `{}` and no hint that the duration was dropped. The test makes `duration_ms` look supported, which hides the gap. No in-repo caller relies on it today, so the impact is limited.",
+     "fix": "Pick one behaviour. The simplest is to drop `duration_ms` from tests/bus.rs:225, document `swipe` in BUS.md as an instant gesture, and reject unknown swipe fields with BusError::invalid. If a timed swipe is wanted, interpolate N MOVE events over duration_ms on a short-lived thread that writes through runtime.send_control. It must not sleep on the request thread, because device.mirror.input is answered on the no-lock fast path (engine.rs:1305). Add a test that checks the encoded packet count and timing.",
+     "effort": "S",
+     "related": [
+      "crates/relay-core/tests/bus.rs:225",
+      "crates/relay-bus/src/ops/device.rs:18",
+      "docs/engine/BUS.md:863",
+      "crates/relay-core/src/engine.rs:1305"
+     ],
+     "id": "r2-cov2-2#2",
+     "cand": "cov2-5-swipe-duration-ignored",
+     "source": "r2-completeness",
+     "v1": {
+      "id": "r2-cov2-2#2",
+      "verdict": "confirmed",
+      "severity": "low",
+      "category": "test-quality",
+      "reason": "In device.rs 959-968, the \"swipe\" arm reads only x1/y1/x2/y2 and encodes DOWN, a single MOVE and UP back to back, with no timing. Nothing reads duration_ms. The only swipe sender in the repo is tests/bus.rs:225, which passes `\"duration_ms\":300` and asserts nothing beyond success. A search turns up no production sender of swipe: the native client sends its own touch events (mirror.rs:1278, mirror/input.rs), and neither the phone app nor any MCP tool exposes device.mirror.input with swipe. BUS.md:863 does not document swipe fields. DECISIONS.md D89 shows swipes used to go through `adb shell cmd input`, which honours a duration, and D90 replaced that with the scrcpy control socket. The duration_ms in the test is probably left over from the earlier API and was silently dropped.",
+      "correction": "The impact is limited to hypothetical external bus clients, because no shipped client sends swipe. Calling the gesture a guaranteed fling is an overstatement, since how Android treats a three-packet gesture depends on the receiving view. The cheap fix is enough: remove duration_ms from the test and document swipe as instant in BUS.md, possibly with a note under docs-drift. Building timed interpolation is not justified without a caller that needs it."
+     }
+    },
+    {
+     "title": "session_lifecycle_over_socket frame loops spin for 10 s on EOF or a decode error, then fail with a misleading 'no greeting'/'no echo' message",
+     "category": "test-quality",
+     "severity": "low",
+     "confidence": "high",
+     "file": "crates/relay-core/tests/sessions.rs",
+     "line": 391,
+     "symbol": "session_lifecycle_over_socket",
+     "evidence": "Both loops only act on one arm: `while !String::from_utf8_lossy(&seen).contains(\"hello-from-pty\") { assert!(Instant::now() < deadline, \"no greeting; got {:?}\", ...); if let Ok(Ok(Some(Line::Frame(fr)))) = tokio::time::timeout(Duration::from_secs(2), term.next()).await { ... } }` (389-399), and the same pattern for \"echo:ping\" (404-410). `Client::next` (crates/relay-core/src/socket.rs:855-858) returns `Ok(None)` as soon as `next_line()` hits EOF, and returns `Err` for an I/O or JSON/serde decode error. Both are dropped silently by the `if let`, while `Client::call` in the same file treats `None` as `bail!(\"connection closed\")` (878).",
+     "impact": "If a regression makes the engine close the attach stream (a server task panics, the door disconnects a lagging client) or send a frame that fails to decode, every `term.next()` after that returns at once. The loop busy-spins at full CPU until the 10 s deadline, then fails with \"no greeting; got \\\"\\\"\" or \"no echo\", which points the reader at the PTY child or session.input rather than at the closed or corrupt stream. That costs debugging time on the one integration test that covers attach over the real socket.",
+     "fix": "Match all arms: `match tokio::time::timeout(..., term.next()).await { Ok(Ok(Some(Line::Frame(fr)))) => {...}, Ok(Ok(None)) => panic!(\"attach stream closed; got {:?}\", ...), Ok(Err(e)) => panic!(\"attach stream error: {e}\"), _ => {} }` in both loops, or factor the two loops into one `read_until(&mut term, needle, &mut seen)` helper that does this.",
+     "effort": "S",
+     "related": [
+      "crates/relay-core/tests/sessions.rs:404",
+      "crates/relay-core/src/socket.rs:855"
+     ],
+     "id": "r2-cov2-3#1",
+     "cand": "cov2-4-socket-test-eof-spin",
+     "source": "r2-completeness",
+     "v1": {
+      "id": "r2-cov2-3#1",
+      "verdict": "confirmed",
+      "severity": "low",
+      "category": "test-quality",
+      "reason": "crates/relay-core/tests/sessions.rs:388-398 (greeting loop) and 402-408 (echo loop) both use `if let Ok(Ok(Some(Line::Frame(fr)))) = tokio::time::timeout(Duration::from_secs(2), term.next()).await { ... }` and ignore every other arm. Client::next (crates/relay-core/src/socket.rs:854-857) returns `Ok(None)` right away once `next_line()` reaches EOF, and every later call does the same. If the attach stream closes, the loop therefore spins at full CPU until the 10 s deadline. It then fails with \"no greeting; got ...\" or \"no echo; got ...\", which does not say the stream closed. Client::call in the same file handles the same case with `None => anyhow::bail!(\"connection closed\")`, so the test is less strict than the client it exercises. The cost is test-only (one CI job's CPU for 10 s and a misleading failure message), so low severity is right.",
+      "correction": "Line numbers: the loops are at 388-398 and 402-408. The busy-spin only happens on EOF. A JSON or serde decode error uses up just that one line, so the next call blocks normally. In that case the frame is silently dropped (its bytes never reach `seen`), which can still end in the same misleading timeout, but without a spin. An I/O error from next_line may or may not repeat. The suggested fix (match the Ok(Ok(None)) and Ok(Err) arms and panic with a stream-specific message, ideally in one shared read_until helper used by both loops) is sound."
+     }
+    }
+   ],
+   "dropped": [
+    {
+     "cand": "cov2-12-double-payload-deserialize",
+     "why": "Real but not worth reporting. engine.rs:853 runs `(entry.validate)(&req.payload)`, which deserializes O::Payload from the &Value and drops it (registry.rs:221). The handler wrapper deserializes again (engine.rs:489/515), and staged ops do it a third time (engine.rs:542/548). The validate step has to run before authorization for every op, implemented or not. The callgrind report (docs/perf/runs/2026-09-19/report.md) puts `deserialize` at about 1-1.3% of instructions per op. The one hot case is device.mirror.input at 8.9% (report.md:1476), and core-engine#18 already covers the keystroke/mirror fast path's clone-then-deserialize. Removing the second pass would need validate to hand a typed Box<dyn Any> through the pipeline, which costs more than the roughly 1% it saves."
+    },
+    {
+     "cand": "cov2-9-session-token-nonconstant-compare",
+     "why": "Not worth reporting. check_session_token's `!=` is reachable only over the Unix socket in the user's runtime dir, which is the same-uid trust boundary. A timing side channel there gains nothing, because core-guardrail#7 already shows the socket accepts actor:user without any token. The phone door, the only network-facing path, uses digest_eq in relay-remote. The /tmp fallback exposure by another local user is covered by core-engine#5 / sec-local-ipc#11."
+    },
+    {
+     "cand": "cov2-1-write-roots-grants-tmp",
+     "why": "By design and already covered where it matters. guardrail.rs:593-594 documents that the temp dir is always a write root because every provider harness puts its scratchpad there. write_target's comment (D102, guardrail.rs:585-586) says scratch outside the worktree is deliberately allowed because the write gate is a repo-integrity check, not a sandbox. Agents with shell access can write /tmp regardless. The runtime-dir overlap only exists in the XDG_RUNTIME_DIR-unset fallback, whose real problems (predictable name, unchecked owner, symlinked lock file) are already reported as core-engine#5, sec-local-ipc#11, sec-supply-chain#8 and core-socket-store#4. The symlink escape through write roots is covered by sec-guardrail-bypass#5 / core-guardrail#11."
+    },
+    {
+     "cand": "cov2-10-mirror-adb-forward-local-port",
+     "why": "Not a hole that Relay adds. The adb server that Relay drives already listens on 127.0.0.1:5037 with no per-user authentication, so any local account can run `adb -s <serial> shell input ...` or `screencap` against the same device without the scrcpy port. In tunnel_forward mode the scrcpy server accepts only its first sockets (video, then control) and then closes its LocalServerSocket. Relay connects both right after the forward is set up (connect_mirror_video polls every 100 ms; the control connect follows at device.rs:831). The port is therefore not reachable 'while a mirror is up'. The remaining exposure is a short startup race, and a lost race makes Relay's mirror fail visibly. The adb server exposes far more than that, and stock scrcpy has the same exposure."
+    },
+    {
+     "cand": "cov2-3-skills-test-set-var",
+     "why": "No real race. RELAY_SKILLS_HOME is read only by skills::user_bases, which unit tests reach only through materialize_user/plan_user. No other unit test in the relay-core lib reaches those paths: no lib test spawns a session or calls refresh_all, and the provider.rs tests call install_downloaded_skill on a bare store. Integration tests in tests/ run as separate processes. The workspace is on edition 2021, and std::env reads are serialized by std's internal env lock. Only a concurrent libc getenv from C code could race, which is theoretical. Not worth reporting."
+    },
+    {
+     "cand": "cov2-6-open-memory-stray-paths",
+     "why": "The fallbacks only apply to tests. Store::open_memory is used only by unit and integration tests and examples/perf.rs; production always opens a file-backed store with a parent dir. No test drives a backup on an in-memory store: tests/store.rs backups_via_bus_keep_last_five uses a tempdir-backed Store::open, and migrate's upgrade backup is skipped because ':memory:' is not a file. skills_dir is written only by downloaded-skill install (provider.rs:215/505), which no test runs against an in-memory engine. No /tmp/relay-skills-* directories exist on this machine. No real-world impact."
+    },
+    {
+     "cand": "cov2-2-store-test-env-var-leak",
+     "why": "Not reachable. Each integration-test file builds its own binary, and in crates/relay-core/tests/store.rs only one test (v3_import_dry_run_then_real, line 142) calls project_with_v3 or app.import.v3. The other two tests (every_prior_version_migrates_forward and backups_via_bus_keep_last_five) never read RELAY_V3_SESSIONS_JSON, and no other test binary sets or reads it. Nothing can race on the variable today."
+    },
+    {
+     "cand": "cov2-11-doc-events-no-producer",
+     "why": "Not real drift. `session.output` is listed as \"on the data plane\" (BUS.md:183). \u00a72 (lines 17-18) defines the data plane as byte streams attached to the bus, which are the `stream: \"pty\"` frames that session.attach already delivers. `bus.deprecated` in \u00a712 (1074) is policy for when a breaking change bumps the envelope `v`. Only v1 exists, so there is no translation shim yet and nothing that should emit it."
+    },
+    {
+     "cand": "cov2-14-baseline-py-log-handle-leak",
+     "why": "Not worth reporting. The perf script builds Engine(base) only a few times per run (lines 464, 571, 579). Each handle is an append-mode log that is also the child's stdout and stderr, and the OS closes it when this short-lived script exits. Nothing grows and nothing goes wrong."
+    },
+    {
+     "cand": "cov2-15-report-py-hardcoded-burst",
+     "why": "Not reachable. The burst size is not configurable. baseline.py always sends `burst 50000` (line 526), records `payload_bytes: 50000 * 98` (4.9 MB, line 555) and writes the phase under the fixed key `burst_50k_lines_attached`, which report.py:219 reads. No run can have a different burst size, so the hard-coded text is always correct."
+    }
+   ]
+  }
+ ]
+}
