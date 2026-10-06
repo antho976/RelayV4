@@ -13,6 +13,11 @@
 .agents-surface scrolledwindow,
 .agents-surface viewport { background: transparent; }
 .terminal-plate { background: @plate; }
+/* VTE's widget node carries an opaque ground from the GTK theme, under its own clear one. */
+.terminal-plate vte-terminal { background: transparent; }
+/* The sidebar paints @console once; its project list's scroller and viewport would stack two
+   more layers of it, which reads as opaque under the nav that shows the wallpaper. */
+.sidebar scrolledwindow, .sidebar viewport { background: transparent; }
 .session-slate { background: transparent; }
 /* The workspace strip above the wall is one layer over the page, not a second slab. */
 .code-bar.workspace-strip { background: transparent; }
