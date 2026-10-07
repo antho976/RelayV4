@@ -23,9 +23,16 @@ pub fn branch_for(name: &str) -> String {
     format!("relay/{name}")
 }
 
+/// The longest any one git subprocess here may run. Generous — a checkout through LFS
+/// filters, a signing prompt — but never unbounded (D144).
+const GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 fn git(repo: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git").arg("-C").arg(repo).args(args).output()
-        .with_context(|| format!("running git {}", args.join(" ")))?;
+    let mut command = Command::new("git");
+    command.arg("-C").arg(repo).args(args);
+    let out = crate::proc::output_with_timeout(&mut command, GIT_TIMEOUT)
+        .with_context(|| format!("running git {}", args.join(" ")))?
+        .ok_or_else(|| anyhow!("git {} did not finish within {} s", args.join(" "), GIT_TIMEOUT.as_secs()))?;
     if !out.status.success() {
         return Err(anyhow!("git {} failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim()));
     }

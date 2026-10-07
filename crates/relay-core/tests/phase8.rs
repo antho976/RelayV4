@@ -772,3 +772,53 @@ fn integrations_run_one_at_a_time_and_only_the_newest_keep_their_checkouts() {
         }
     }
 }
+
+/// `git.commit` makes the commit object (and any signature) before the store is locked, then
+/// gates and publishes exactly that object. It still behaves like `git commit -m`.
+#[test]
+fn commit_publishes_the_gated_object_signs_when_asked_and_concludes_merges() {
+    let e = engine();
+    let (ws, repo) = real_repo();
+    add_project(&e, &ws, &repo);
+    let path = std::path::Path::new(&repo);
+    let head = |rev: &str| String::from_utf8(Command::new("git").arg("-C").arg(path).args(["rev-parse", rev]).output().unwrap().stdout).unwrap().trim().to_string();
+
+    // Nothing staged is refused, as `git commit` refuses it.
+    let empty = call(&e, "git.commit", json!({"project_id":1,"message":"nothing"}));
+    assert_eq!(err(&empty).code, "git.commit_failed");
+
+    std::fs::write(path.join("a.txt"), "a\n").unwrap();
+    let before = head("HEAD");
+    let out = call(&e, "git.commit", json!({"project_id":1,"message":"\nAdd a  \n\n\nbody\n","all":true})).into_result().unwrap();
+    assert_eq!(out["sha"].as_str().unwrap(), head("main"), "the branch moved to the new commit");
+    assert_eq!(head("HEAD~1"), before);
+    let message = String::from_utf8(Command::new("git").arg("-C").arg(path).args(["log", "-1", "--format=%B"]).output().unwrap().stdout).unwrap();
+    assert_eq!(message.trim_end(), "Add a\n\nbody");
+    let reflog = String::from_utf8(Command::new("git").arg("-C").arg(path).args(["reflog", "-1", "--format=%gs", "main"]).output().unwrap().stdout).unwrap();
+    assert_eq!(reflog.trim(), "commit: Add a");
+
+    // commit.gpgSign is honoured: with a signer that always fails, the commit fails and the
+    // branch stays where it was.
+    git(path, &["config", "commit.gpgsign", "true"]);
+    git(path, &["config", "gpg.program", "false"]);
+    std::fs::write(path.join("b.txt"), "b\n").unwrap();
+    let unsigned = call(&e, "git.commit", json!({"project_id":1,"message":"Add b","all":true}));
+    assert_eq!(err(&unsigned).code, "git.commit_failed");
+    assert_eq!(head("main"), out["sha"].as_str().unwrap());
+    git(path, &["config", "--unset", "commit.gpgsign"]);
+    git(path, &["config", "--unset", "gpg.program"]);
+    git(path, &["reset", "-q"]);
+    std::fs::remove_file(path.join("b.txt")).unwrap();
+
+    // A merge stopped on a conflict is concluded as a merge, with both parents.
+    git(path, &["checkout", "-q", "-b", "side"]);
+    std::fs::write(path.join("a.txt"), "side\n").unwrap();
+    git(path, &["commit", "-qam", "side"]);
+    git(path, &["checkout", "-q", "main"]);
+    std::fs::write(path.join("a.txt"), "main\n").unwrap();
+    git(path, &["commit", "-qam", "main"]);
+    assert!(!Command::new("git").arg("-C").arg(path).args(["merge", "side"]).output().unwrap().status.success());
+    std::fs::write(path.join("a.txt"), "both\n").unwrap();
+    call(&e, "git.commit", json!({"project_id":1,"message":"Merge side","all":true})).into_result().unwrap();
+    assert_eq!(head("HEAD^2"), head("side"), "the merge kept its second parent");
+}
