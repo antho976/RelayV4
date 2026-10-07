@@ -1621,7 +1621,7 @@ impl Ui {
             while ui.refresh_dirty.replace(false) {
                 let generation = ui.generation.get();
                 let layout_revision = ui.layout_revision.get();
-                let layout_project = ui.project.get();
+                let mut layout_project = ui.project.get();
                 // The sidebar order before this read, to find a removed project's neighbour.
                 let mut order = None;
                 if ui.registry_dirty.replace(false) {
@@ -1662,6 +1662,9 @@ impl Ui {
                         let first = ui.projects.borrow().first().and_then(|p| p["id"].as_i64());
                         if let Some(first) = first {
                             ui.project.set(first);
+                            // Chosen by this iteration, not switched under it: restore (and so
+                            // allow saves to) this project's layout now, not on a later refresh.
+                            layout_project = first;
                             ui.editor.reset();
                             ui.editor.prepare_project(&ui);
                         }
@@ -1889,10 +1892,17 @@ impl Ui {
                 .paste_text(&format!("native-paste-check-{name}\n"));
         }
     }
+    /// Every live pane is on screen and shows `marker`. A parked, exited or interrupted
+    /// session's pane shows its slate over a detached terminal, so it is not read.
     pub fn terminal_contents_contain(&self, marker: &str) -> bool {
         use vte4::prelude::TerminalExt;
         let panes = self.panes.borrow();
-        !panes.is_empty() && panes.values().all(|pane| {
+        let live: Vec<_> = self.sessions.borrow().iter()
+            .filter(|s| matches!(text(s, "state"), "spawning" | "running" | "idle" | "blocked"))
+            .map(|s| panes.get(text(s, "name")).cloned())
+            .collect();
+        !live.is_empty() && live.iter().all(|pane| {
+            let Some(pane) = pane else { return false };
             let (_, row) = pane.terminal.cursor_position();
             let (text, _) = pane.terminal.text_range_format(vte4::Format::Text, 0, 0, row, 500);
             pane.terminal.is_mapped() && text.is_some_and(|text| text.contains(marker))
