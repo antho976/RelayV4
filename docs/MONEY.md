@@ -48,3 +48,51 @@ Decided with Antho on 2026-10-07:
   from the bill and the date, so the two copies are the same row and merge.
 - **Bank imports.** An imported line's id is derived from the statement line, so importing the
   same CSV on both devices adds it once.
+
+## The ledger on the PC
+
+The engine keeps the ledger in its own SQLite file, `money.db` beside `store.db`, owned by
+`relay_money::ledger`. It is apart from the dev store on purpose: money has its own schema
+versions, its own backups, and is what the phone will sync with. Every row has a local integer
+`id`, a permanent `uid` (UUID text) that sync will use, `updated_at` (ms) and `deleted` (0/1).
+
+Amounts are minor units (`i64`). Dates are `YYYY-MM-DD`. Enum values are Tally's names
+(`EXPENSE`, `CHEQUING`, `OVER_PACE`). Every mutation emits `money.changed`.
+
+### Ops (phase 12, scope global)
+
+`money.summary {today?}` → the Home reading:
+
+```
+{ currency, fraction_digits, month_start_day, empty,
+  period: { start, end_exclusive, days, days_left },
+  pace: { budget, spent, expected, remaining, pace_delta, days_left, daily_allowance,
+          spent_fraction, pace_fraction, status },
+  income, spent,                       // this period, transfers excluded
+  lines: { margin, pace, versus_last },  // Tally's sentences, from relay_money::copy
+  budgets: [ { category_id, name, icon, color, budget, spent, status } ],   // per category
+  accounts: [ { id, name, type, balance } ], net_worth,
+  bills: [ { id, name, amount, type, next_date, days_until, due_line, auto_post } ], // next 30 days
+  goals: [ { id, name, kind, target, saved, line } ],
+  recent: [ Tx ] }                      // last 8
+```
+
+`Tx` = `{ id, uid, type, amount, date, account_id, account, to_account_id, to_account,
+category_id, category, icon, color, note }`.
+
+| op | payload | result |
+|---|---|---|
+| `money.summary` | `{ today? }` | above |
+| `money.lists` | `{}` | `{ currency, fraction_digits, accounts: [{id,name,type,balance,archived}], categories: [{id,name,kind,icon,color,archived}] }` |
+| `money.tx.list` | `{ period_offset?, query?, account_id?, category_id?, limit? }` | `{ period, transactions: [Tx], income, spent }` |
+| `money.tx.add` | `{ type, amount, date, account_id, to_account_id?, category_id?, note? }` | `Tx` |
+| `money.tx.update` | `{ id, type?, amount?, date?, account_id?, to_account_id?, category_id?, note? }` | `Tx` |
+| `money.tx.delete` | `{ id }` | `{}` |
+| `money.budget.set` | `{ category_id?, amount }` (no category: the overall budget; 0 removes) | `{}` |
+| `money.import` | `{ path }`: a Tally backup (`.json`) replaces the ledger, as a restore does on the phone | `{ kind, transactions, accounts }` |
+| `money.export` | `{ path }` | `{ path, transactions }` |
+| `money.sample` | `{}`: Tally's sample household, only into an empty ledger | `{ transactions }` |
+| `money.reset` | `{}`: erase everything | `{}` |
+
+Clients format amounts themselves with `relay_money::money::MoneyFormatter`
+(`currency` from the result, `Locale::from_env()`).

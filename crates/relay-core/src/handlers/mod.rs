@@ -12,6 +12,7 @@ pub mod guardrail;
 pub mod import_v3;
 pub mod integration;
 pub mod module;
+pub mod money;
 pub mod notes;
 pub mod notify;
 pub mod overlap;
@@ -43,6 +44,7 @@ pub fn register_all(e: &mut Engine) {
     integration::register(e);
     notify::register(e);
     ui::register(e);
+    money::register(e);
     guardrail::register(e);
 }
 

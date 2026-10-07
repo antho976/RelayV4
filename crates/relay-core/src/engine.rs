@@ -518,6 +518,8 @@ pub struct Engine {
     pub(crate) device_leases: crate::device_lease::Leases,
     /// Serializes skill-folder refreshes (`skills::refresh_all`).
     pub(crate) skill_refresh: crate::skills::Refresher,
+    /// The Money space's ledger (`money.db` beside the store), opened on first use.
+    pub(crate) money: std::sync::Mutex<Option<relay_money::ledger::Ledger>>,
 }
 
 impl Engine {
@@ -557,6 +559,7 @@ impl Engine {
                 resource_disk_refresh: std::sync::Mutex::new((false, None)),
                 device_leases: Default::default(),
                 skill_refresh: Default::default(),
+                money: Default::default(),
             };
             crate::handlers::register_all(&mut engine);
             engine

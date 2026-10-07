@@ -22,7 +22,7 @@ relay-core = { path = "crates/relay-core" }
 relay-remote = { path = "crates/relay-remote" }
 relay-board = { path = "crates/relay-board" }
 relay-client = { path = "crates/relay-client" }
-relay-money = { path = "crates/relay-money" }
+relay-money = { path = "crates/relay-money", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 schemars = { version = "1", features = ["uuid1", "preserve_order"] }

@@ -13,3 +13,11 @@ serde_json.workspace = true
 jiff.workspace = true
 regex.workspace = true
 unicode-normalization = "0.1"
+rusqlite = { workspace = true, optional = true }
+schemars.workspace = true
+uuid = { workspace = true, optional = true }
+
+[features]
+default = ["ledger"]
+# The SQLite ledger. Off for crates that only need the money.* contract (relay-bus).
+ledger = ["dep:rusqlite", "dep:uuid"]

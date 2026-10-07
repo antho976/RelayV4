@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TxType {
     Expense,
@@ -15,7 +15,7 @@ pub enum TxType {
 
 /// `Investment` holds money put to work (a TFSA, an RRSP, a brokerage account); its value can be
 /// updated by hand.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AccountType {
     Cash,
@@ -25,7 +25,7 @@ pub enum AccountType {
     Investment,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CategoryKind {
     Expense,
@@ -38,7 +38,7 @@ pub enum CategoryKind {
 /// - `Balance`: an account (or everything you own, net of what you owe) reaching an amount by a date.
 /// - `Invest`: each month, money moved into investment accounts: a share of what came in, or a set amount.
 /// - `Save`: each month, what is kept of what came in: a share of it, or a set amount.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum GoalKind {
     Savings,

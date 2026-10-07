@@ -13,6 +13,8 @@ pub mod bank_statements;
 pub mod copy;
 pub mod csv;
 pub mod icon_hints;
+#[cfg(feature = "ledger")]
+pub mod ledger;
 pub mod model;
 pub mod money;
 pub mod pace;
@@ -21,5 +23,6 @@ pub mod period;
 pub mod recurrence;
 pub mod sample_data;
 pub mod text_match;
+pub mod views;
 
 pub use jiff::civil::Date;

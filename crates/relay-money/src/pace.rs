@@ -6,7 +6,7 @@
 
 use serde::Serialize;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum PaceStatus {
     NoBudget,
@@ -16,7 +16,7 @@ pub enum PaceStatus {
     OverBudget,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct PaceReading {
     pub budget: i64,
     pub spent: i64,
