@@ -52,8 +52,23 @@ result!(#[schemars(rename = "MailboxSendOut")] SendOut {
 });
 op!(MailboxSend, "mailbox.send", SendIn => SendOut,
     OpMeta::mutation(Scope::Project, 5, "Send normal or priority mail to a session name, or normal mail to * (broadcast); reaches every provider").emits(&["mailbox.new"]));
-payload!(#[schemars(rename = "MailboxListIn")] MailboxListIn { pub project_id: Id, pub session: Option<String>, pub unread_only: Option<bool>, pub since: Option<Ts> });
-result!(#[schemars(rename = "MailboxListOut")] MailboxListOut { pub messages: Vec<Message> });
+payload!(#[schemars(rename = "MailboxListIn")] MailboxListIn {
+    pub project_id: Id, pub session: Option<String>, pub unread_only: Option<bool>, pub since: Option<Ts>,
+    /// Page size, default 200, at most 1000.
+    pub limit: Option<u32>,
+    /// Only messages older than this message id: the previous page's `next_before`.
+    pub before: Option<Id>,
+});
+result!(#[schemars(rename = "MailboxListOut")] MailboxListOut {
+    /// Oldest first. Without `unread_only` this is the newest page; with it, the oldest unread.
+    pub messages: Vec<Message>,
+    /// Set when older messages remain: pass it as `before` for the page before this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_before: Option<Id>,
+    /// More unread messages remain past this page (`unread_only`): ack these, then ask again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub more_unread: bool,
+});
 op!(MailboxList, "mailbox.list", MailboxListIn => MailboxListOut, OpMeta::query(Scope::Project, 5, "Messages, optionally for one session"));
 payload!(#[schemars(rename = "MailboxOutboxIn")] OutboxIn { pub project_id: Id, pub since: Option<Ts>, pub limit: Option<u32> });
 result!(#[schemars(rename = "MailboxOutboxEntry")] OutboxEntry { pub message: Message, pub recipients: Vec<Recipient> });

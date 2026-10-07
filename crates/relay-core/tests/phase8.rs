@@ -133,6 +133,17 @@ fn file_lifecycle_search_and_confirmation_replay() {
     .into_result()
     .unwrap();
     assert_eq!(hits["hits"][0]["line"], 1);
+    // Binaries and non-regular files are skipped, not read: a FIFO would block the walk.
+    let src = std::path::Path::new(&repo).join("src");
+    std::fs::write(src.join("asset.bin"), b"println\0").unwrap();
+    let fifo = src.join("pipe");
+    assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    let hits = call(&e, "file.search", json!({"project_id":1,"query":"println","glob":"src/**"}))
+        .into_result()
+        .unwrap();
+    assert_eq!(hits["hits"].as_array().unwrap().len(), 1, "{hits}");
+    std::fs::remove_file(src.join("asset.bin")).unwrap();
+    std::fs::remove_file(fifo).unwrap();
     let deleted = call(
         &e,
         "file.delete",
@@ -225,6 +236,14 @@ fn git_status_diff_commit_log_show_and_branches() {
     .unwrap();
     assert_eq!(diff["old"], "");
     assert!(diff["new"].as_str().unwrap().contains("two"));
+    // A binary or oversized file is refused before its reply outgrows a client's line.
+    let root = std::path::Path::new(&repo);
+    std::fs::write(root.join("blob.bin"), b"head\0tail").unwrap();
+    std::fs::write(root.join("huge.txt"), "line\n".repeat(300_000)).unwrap();
+    assert_eq!(err(&call(&e, "git.diff.file", json!({"project_id":1,"path":"blob.bin"}))).code, "git.diff_binary");
+    assert_eq!(err(&call(&e, "git.diff.file", json!({"project_id":1,"path":"huge.txt"}))).code, "git.diff_too_large");
+    std::fs::remove_file(root.join("blob.bin")).unwrap();
+    std::fs::remove_file(root.join("huge.txt")).unwrap();
     call(
         &e,
         "git.stage",
@@ -548,9 +567,20 @@ fn a_held_commit_still_commits_when_confirmed() {
         .as_i64()
         .unwrap();
 
-    let confirmed = call(&e, "guardrail.confirm", json!({"hold_id": hold_id}))
-        .into_result()
-        .unwrap();
+    // The replay's slow half — here a pre-commit hook that takes a second — runs before the
+    // confirm takes the store, so the rest of the bus keeps moving meanwhile.
+    let hook = root.join(".git/hooks/pre-commit");
+    std::fs::write(&hook, "#!/bin/sh\nsleep 1\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let confirming = {
+        let e = e.clone();
+        std::thread::spawn(move || call(&e, "guardrail.confirm", json!({"hold_id": hold_id})))
+    };
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let started = std::time::Instant::now();
+    call(&e, "settings.set", json!({"path":"appearance.panel_alpha","value":0.9})).into_result().unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_millis(500), "a write waited {:?} behind the confirm", started.elapsed());
+    let confirmed = confirming.join().unwrap().into_result().unwrap();
     assert_eq!(confirmed["hold"]["state"], "confirmed");
     assert_eq!(confirmed["outcome"]["ok"], true);
     let sha = confirmed["outcome"]["result"]["sha"].as_str().unwrap();
@@ -659,4 +689,166 @@ fn filesystem_reads_do_not_retrigger_refresh_but_writes_do() {
         assert!(Instant::now() < deadline, "staging did not invalidate Git");
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn search_reads_only_bounded_regular_text_and_path_ops_never_read_content() {
+    let e = engine();
+    let (ws, repo) = real_repo();
+    add_project(&e, &ws, &repo);
+    let root = std::path::Path::new(&repo);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "// needle in source\n").unwrap();
+    // A FIFO would block open() forever; a symlink out of the worktree must not be followed.
+    assert!(Command::new("mkfifo").arg(root.join("src/pipe.rs")).status().unwrap().success());
+    let outside = ws.path().join("outside.txt");
+    std::fs::write(&outside, "needle outside\n").unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("src/escape.txt")).unwrap();
+    std::os::unix::fs::symlink(root.join("src/lib.rs"), root.join("src/alias.rs")).unwrap();
+    // Generated trees, binaries and oversized files are not searched.
+    for dir in ["build", "Intermediate", "dist"] {
+        std::fs::create_dir_all(root.join(dir)).unwrap();
+        std::fs::write(root.join(dir).join("gen.txt"), "needle generated\n").unwrap();
+    }
+    let mut binary = b"needle".to_vec();
+    binary.extend([0u8; 16]);
+    std::fs::write(root.join("src/blob.bin"), binary).unwrap();
+    let big = std::fs::File::create(root.join("src/huge.txt")).unwrap();
+    big.set_len(65 * 1024 * 1024).unwrap();
+    drop(big);
+
+    let started = std::time::Instant::now();
+    let hits = call(&e, "file.search", json!({"project_id":1,"query":"needle"})).into_result().unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(5), "the search waited on something");
+    let mut paths: Vec<&str> = hits["hits"].as_array().unwrap().iter().map(|h| h["path"].as_str().unwrap()).collect();
+    paths.sort();
+    assert_eq!(paths, ["src/alias.rs", "src/lib.rs"]);
+
+    // Renaming, moving and deleting a file past the 64 MiB comparison cap is a path operation:
+    // it is not held as a destructive write and its content is never read.
+    let renamed = call(&e, "file.rename", json!({"project_id":1,"path":"src/huge.txt","new_name":"huge2.txt"}));
+    assert!(renamed.error.is_none(), "rename held: {:?}", renamed.error);
+    call(&e, "file.move", json!({"project_id":1,"path":"src/huge2.txt","into":""})).into_result().unwrap();
+    call(&e, "file.delete", json!({"project_id":1,"path":"huge2.txt"})).into_result().unwrap();
+    std::fs::remove_file(root.join("src/pipe.rs")).unwrap();
+
+    // Protected paths still hold a rename, on either end.
+    call(&e, "project.update", json!({"project_id":1,"protected_paths":["keep.txt"]})).into_result().unwrap();
+    std::fs::write(root.join("keep.txt"), "x\n").unwrap();
+    let held = call(&e, "file.rename", json!({"project_id":1,"path":"keep.txt","new_name":"moved.txt"}));
+    assert_eq!(err(&held).kind, ErrorKind::Held);
+    let held = call(&e, "file.rename", json!({"project_id":1,"path":"README.md","new_name":"keep.txt"}));
+    assert_eq!(err(&held).kind, ErrorKind::Held);
+}
+
+#[test]
+fn a_confirmed_write_over_the_comparison_cap_goes_through() {
+    let e = engine();
+    let (ws, repo) = real_repo();
+    add_project(&e, &ws, &repo);
+    let big = std::fs::File::create(std::path::Path::new(&repo).join("big.dat")).unwrap();
+    big.set_len(65 * 1024 * 1024).unwrap();
+    drop(big);
+    let held = call(&e, "file.write", json!({"project_id":1,"path":"big.dat","text":"small now\n"}));
+    assert_eq!(err(&held).kind, ErrorKind::Held);
+    let hold_id = err(&held).confirm.as_ref().unwrap().payload["hold_id"].as_i64().unwrap();
+    let confirmed = call(&e, "guardrail.confirm", json!({"hold_id":hold_id})).into_result().unwrap();
+    assert_eq!(confirmed["outcome"]["ok"], true, "{confirmed}");
+    assert_eq!(std::fs::read_to_string(std::path::Path::new(&repo).join("big.dat")).unwrap(), "small now\n");
+}
+
+#[test]
+fn integrations_run_one_at_a_time_and_only_the_newest_keep_their_checkouts() {
+    let e = engine();
+    let (ws, repo) = real_repo();
+    add_project(&e, &ws, &repo);
+    let path = std::path::Path::new(&repo);
+    for branch in ["feature-a", "feature-b"] {
+        git(path, &["checkout", "-b", branch]);
+        std::fs::write(path.join(format!("{branch}.txt")), "x\n").unwrap();
+        git(path, &["add", "."]);
+        git(path, &["commit", "-m", branch]);
+        git(path, &["checkout", "main"]);
+    }
+    // Five clicks in a row: they queue behind each other instead of five concurrent checkouts.
+    let ids: Vec<i64> = (0..5).map(|_| {
+        call(&e, "integration.request", json!({"project_id":1,"branches":["feature-a","feature-b"],"build":false}))
+            .into_result().unwrap()["id"].as_i64().unwrap()
+    }).collect();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let list = call(&e, "integration.list", json!({"project_id":1})).into_result().unwrap();
+        let states: Vec<String> = list["integrations"].as_array().unwrap().iter().map(|i| i["state"].as_str().unwrap().to_string()).collect();
+        let live = states.iter().filter(|s| matches!(s.as_str(), "merging" | "building" | "deploying")).count();
+        assert!(live <= 1, "integrations ran concurrently: {states:?}");
+        // Pruning follows each finish, so wait for it as well as for the last result.
+        if states.iter().all(|s| matches!(s.as_str(), "passed" | "discarded"))
+            && states.iter().filter(|s| *s == "discarded").count() == 2 { break; }
+        assert!(std::time::Instant::now() < deadline, "integrations never finished: {states:?}");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // Retention: the newest three keep their checkout; the older two are discarded, branch and all.
+    for (n, id) in ids.iter().enumerate() {
+        let value = call(&e, "integration.get", json!({"integration_id":id})).into_result().unwrap();
+        let wt = std::path::Path::new(value["worktree"].as_str().unwrap());
+        let branch = format!("refs/heads/relay/integration-{id}");
+        let has_branch = Command::new("git").arg("-C").arg(path).args(["rev-parse", "--verify", "--quiet", &branch]).status().unwrap().success();
+        if n < 2 {
+            assert_eq!(value["state"], "discarded", "integration {id}");
+            assert!(!wt.exists() && !has_branch, "integration {id} kept its checkout");
+        } else {
+            assert_eq!(value["state"], "passed", "integration {id}");
+            assert!(wt.exists() && has_branch, "integration {id} lost its checkout");
+        }
+    }
+}
+
+/// `git.commit` makes the commit object (and any signature) before the store is locked, then
+/// gates and publishes exactly that object. It still behaves like `git commit -m`.
+#[test]
+fn commit_publishes_the_gated_object_signs_when_asked_and_concludes_merges() {
+    let e = engine();
+    let (ws, repo) = real_repo();
+    add_project(&e, &ws, &repo);
+    let path = std::path::Path::new(&repo);
+    let head = |rev: &str| String::from_utf8(Command::new("git").arg("-C").arg(path).args(["rev-parse", rev]).output().unwrap().stdout).unwrap().trim().to_string();
+
+    // Nothing staged is refused, as `git commit` refuses it.
+    let empty = call(&e, "git.commit", json!({"project_id":1,"message":"nothing"}));
+    assert_eq!(err(&empty).code, "git.commit_failed");
+
+    std::fs::write(path.join("a.txt"), "a\n").unwrap();
+    let before = head("HEAD");
+    let out = call(&e, "git.commit", json!({"project_id":1,"message":"\nAdd a  \n\n\nbody\n","all":true})).into_result().unwrap();
+    assert_eq!(out["sha"].as_str().unwrap(), head("main"), "the branch moved to the new commit");
+    assert_eq!(head("HEAD~1"), before);
+    let message = String::from_utf8(Command::new("git").arg("-C").arg(path).args(["log", "-1", "--format=%B"]).output().unwrap().stdout).unwrap();
+    assert_eq!(message.trim_end(), "Add a\n\nbody");
+    let reflog = String::from_utf8(Command::new("git").arg("-C").arg(path).args(["reflog", "-1", "--format=%gs", "main"]).output().unwrap().stdout).unwrap();
+    assert_eq!(reflog.trim(), "commit: Add a");
+
+    // commit.gpgSign is honoured: with a signer that always fails, the commit fails and the
+    // branch stays where it was.
+    git(path, &["config", "commit.gpgsign", "true"]);
+    git(path, &["config", "gpg.program", "false"]);
+    std::fs::write(path.join("b.txt"), "b\n").unwrap();
+    let unsigned = call(&e, "git.commit", json!({"project_id":1,"message":"Add b","all":true}));
+    assert_eq!(err(&unsigned).code, "git.commit_failed");
+    assert_eq!(head("main"), out["sha"].as_str().unwrap());
+    git(path, &["config", "--unset", "commit.gpgsign"]);
+    git(path, &["config", "--unset", "gpg.program"]);
+    git(path, &["reset", "-q"]);
+    std::fs::remove_file(path.join("b.txt")).unwrap();
+
+    // A merge stopped on a conflict is concluded as a merge, with both parents.
+    git(path, &["checkout", "-q", "-b", "side"]);
+    std::fs::write(path.join("a.txt"), "side\n").unwrap();
+    git(path, &["commit", "-qam", "side"]);
+    git(path, &["checkout", "-q", "main"]);
+    std::fs::write(path.join("a.txt"), "main\n").unwrap();
+    git(path, &["commit", "-qam", "main"]);
+    assert!(!Command::new("git").arg("-C").arg(path).args(["merge", "side"]).output().unwrap().status.success());
+    std::fs::write(path.join("a.txt"), "both\n").unwrap();
+    call(&e, "git.commit", json!({"project_id":1,"message":"Merge side","all":true})).into_result().unwrap();
+    assert_eq!(head("HEAD^2"), head("side"), "the merge kept its second parent");
 }

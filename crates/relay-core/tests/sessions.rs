@@ -504,6 +504,11 @@ async fn session_lifecycle_over_socket() {
     assert_eq!(code(call(&e, "session.input", json!({"session": name, "data": "x"}))), "session.exited");
     // scrollback survives exit; close tears it all down
     assert!(ok(&e, "session.scrollback", json!({"session": name}))["text"].as_str().unwrap().contains("echo:again"));
+    // An exited session relaunches in place, carrying the dead PTY's history into the new one.
+    let resumed = ok(&e, "session.resume", json!({"session": name}));
+    assert_eq!(resumed["state"], "running");
+    assert_ne!(resumed["pid"], pid);
+    assert!(ok(&e, "session.scrollback", json!({"session": name}))["text"].as_str().unwrap().contains("echo:again"));
     let wt = PathBuf::from(s["worktree"].as_str().unwrap());
     ok(&e, "session.close", json!({"session": name}));
     assert!(!wt.exists());
@@ -1478,6 +1483,36 @@ fn closing_the_last_of_several_sessions_restores_the_original_hook_path() {
     for name in &names {
         assert!(!f.repo.join(".relay/hooks").join(name).exists(), "{name}'s hook directory survived");
     }
+}
+
+/// Closing the session whose hook directory is the checkout's active hook path, while others
+/// still work there, hands the path to a survivor instead of deleting it out from under them:
+/// the commit gate stays on, and the user's own hook stays in the chain to the very end.
+#[test]
+fn closing_the_newest_of_several_sessions_keeps_the_commit_gate_wired() {
+    let f = fixture();
+    let hooks = |repo: &Path| {
+        let out = Command::new("git").arg("-C").arg(repo).args(["config", "--worktree", "--get", "core.hooksPath"]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    git(&f.repo, &["config", "extensions.worktreeConfig", "true"]);
+    git(&f.repo, &["config", "--worktree", "core.hooksPath", "user-hooks"]);
+    let mut names = Vec::new();
+    for _ in 0..3 {
+        let s = ok(&f.engine, "session.create", json!({"project_id":1,"provider":"claude","worktree":"primary"}));
+        names.push(s["name"].as_str().unwrap().to_string());
+    }
+    // Newest first: every close but the last removes the active directory.
+    for (closed, name) in names.iter().enumerate().rev() {
+        ok(&f.engine, "session.close", json!({"session":name,"remove_worktree":false}));
+        assert!(!f.repo.join(".relay/hooks").join(name).exists(), "{name}'s hook directory survived");
+        if closed > 0 {
+            let active = hooks(&f.repo);
+            assert!(Path::new(&active).join("pre-commit").is_file(), "the hook path {active} points at nothing");
+            assert!(names[..closed].iter().any(|live| active.ends_with(&format!(".relay/hooks/{live}"))), "{active}");
+        }
+    }
+    assert_eq!(hooks(&f.repo), "user-hooks");
 }
 
 /// A launch that finds its row moved on while it was writing hooks and briefs is refused

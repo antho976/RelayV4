@@ -97,14 +97,19 @@ fn complete_group_assignment(ctx: &mut Ctx, session: &Session, task_id: Id, sha:
     if let Some(sha) = sha.filter(|sha| !sha.trim().is_empty()) {
         ctx.tx().execute("INSERT OR IGNORE INTO task_commits(task_id,sha,branch,linked_at) VALUES (?1,?2,?3,?4)",params![task_id,sha,session.branch,ctx.now]).bus()?;
     }
-    let builders_left: i64 = ctx.tx().query_row(
-        "SELECT COUNT(*) FROM task_sessions ts JOIN sessions s ON s.id=ts.session_id WHERE ts.task_id=?1 AND s.worktree=?2 AND s.role='builder' AND s.state!='closed' AND ts.completed_at IS NULL",
-        params![task_id,session.worktree],|row|row.get(0)).bus()?;
-    if builders_left != 0 { return Ok(()); }
-    let changed = ctx.tx().execute("UPDATE tasks SET col='in_review',state='awaiting_review',updated_at=?1 WHERE id=?2 AND col='active' AND deleted_at IS NULL",params![ctx.now,task_id]).bus()?;
-    let mut stmt = ctx.tx().prepare_cached("SELECT s.id FROM sessions s JOIN task_sessions ts ON ts.session_id=s.id WHERE ts.task_id=?1 AND s.worktree=?2 AND s.state!='closed' ORDER BY s.id").bus()?;
-    let ids = stmt.query_map(params![task_id,session.worktree],|row|row.get::<_,Id>(0)).bus()?.collect::<rusqlite::Result<Vec<_>>>().bus()?;
+    // Only this session's review group waits on itself: an unrelated agent that shares the
+    // checkout (the primary, D160) and happens to hold a queue row for the task is not in it.
+    let group = sessions::review_group(ctx.tx(), session)?;
+    let mut stmt = ctx.tx().prepare_cached("SELECT session_id, completed_at IS NULL FROM task_sessions WHERE task_id=?1").bus()?;
+    let assigned = stmt.query_map([task_id],|row|Ok((row.get::<_,Id>(0)?,row.get::<_,bool>(1)?))).bus()?.collect::<rusqlite::Result<Vec<_>>>().bus()?;
     drop(stmt);
+    let members: Vec<(Id, Role, bool)> = group.iter()
+        .filter_map(|(id, role)| assigned.iter().find(|(sid, _)| sid == id).map(|(_, open)| (*id, *role, *open)))
+        .collect();
+    let left = |want: Role| members.iter().filter(|(_, role, open)| *role == want && *open).count();
+    if left(Role::Builder) != 0 { return Ok(()); }
+    let changed = ctx.tx().execute("UPDATE tasks SET col='in_review',state='awaiting_review',updated_at=?1 WHERE id=?2 AND col='active' AND deleted_at IS NULL",params![ctx.now,task_id]).bus()?;
+    let ids: Vec<Id> = members.iter().map(|(id, _, _)| *id).collect();
     if changed > 0 {
         ctx.emit("task.changed",json!({"task_id":task_id,"col":"in_review","state":"awaiting_review"}));
         for id in &ids {
@@ -113,10 +118,7 @@ fn complete_group_assignment(ctx: &mut Ctx, session: &Session, task_id: Id, sha:
             }
         }
     }
-    let reviewers_left: i64 = ctx.tx().query_row(
-        "SELECT COUNT(*) FROM task_sessions ts JOIN sessions s ON s.id=ts.session_id WHERE ts.task_id=?1 AND s.worktree=?2 AND s.role='reviewer' AND s.state!='closed' AND ts.completed_at IS NULL",
-        params![task_id,session.worktree],|row|row.get(0)).bus()?;
-    if reviewers_left != 0 { return Ok(()); }
+    if left(Role::Reviewer) != 0 { return Ok(()); }
     let next = next_queued_task(ctx.tx(),session.id,task_id)?;
     for id in ids {
         let changed = ctx.tx().execute("UPDATE sessions SET task_id=?1,module_id=?2,updated_at=?3 WHERE id=?4 AND task_id=?5",params![next.map(|v|v.0),next.and_then(|v|v.1),ctx.now,id,task_id]).bus()?;
@@ -347,6 +349,33 @@ fn read_teardown(conn: &Connection, worktree: &str) -> Result<Teardown, BusError
     })
 }
 
+/// What closing a session does to its checkout's hooks: the full teardown when it is the last
+/// session there, else a hand-over of the hook path to `survivor`.
+struct Hooks {
+    teardown: Option<Teardown>,
+    survivor: Option<String>,
+}
+
+/// Another open session on the same checkout, newest first.
+fn survivor_on(conn: &Connection, session_id: Id, worktree: &str) -> Result<Option<String>, BusError> {
+    conn.prepare_cached(
+        "SELECT name FROM sessions WHERE id!=?1 AND worktree=?2 AND state!='closed' ORDER BY id DESC LIMIT 1",
+    ).bus()?.query_row(params![session_id, worktree], |row| row.get(0)).optional().bus()
+}
+
+/// Delete a departing session's hook directory, first handing the checkout's hook path to
+/// `survivor` when the directory is the active one ([`crate::hooks::hand_over`]).
+fn retire_hook_dir(instance: crate::Instance, repo: &Path, worktree: &Path, closing: &str, survivor: Option<&str>) {
+    let _writes = crate::hooks::writes();
+    let Some(survivor) = survivor else {
+        crate::hooks::remove_hook_dir(repo, closing);
+        return;
+    };
+    if let Err(error) = crate::hooks::hand_over(repo, worktree, closing, survivor, instance, &crate::hooks::relay_bin()) {
+        tracing::warn!(session = closing, %survivor, %error, "handing the commit hook to a surviving session");
+    }
+}
+
 /// The git and file half of a teardown. Subprocesses and file rewrites, so it runs with the
 /// store unlocked; one `git config --get` covers every name in the chain.
 fn run_teardown(repo: &Path, worktree: &Path, teardown: &Teardown) -> Result<(), BusError> {
@@ -453,9 +482,14 @@ fn plan_launch(conn: &Connection, engine: &Engine, row: Row_, kind: LaunchKind) 
     let write_roots = crate::guardrail::write_roots(&cfg, &cwd).into_iter().filter(|root| root != &cwd).collect();
     let initial_scrollback = match kind {
         LaunchKind::Fresh => Vec::new(),
-        LaunchKind::Resume => sessions::load_scrollback(conn, row.session.id)?
-            .map(|saved| saved.0.into_bytes())
-            .unwrap_or_default(),
+        // An exited session's history is still in its dead PTY: nothing saves it at exit, so
+        // the stored copy is stale or missing until the engine shuts down.
+        LaunchKind::Resume => match engine.pty(row.session.id).filter(|_| row.session.state == SessionState::Exited) {
+            Some(dead) => dead.scrollback(None).0.into_bytes(),
+            None => sessions::load_scrollback(conn, row.session.id)?
+                .map(|saved| saved.0.into_bytes())
+                .unwrap_or_default(),
+        },
     };
     Ok(LaunchPlan {
         row, kind, cmd, project_path: PathBuf::from(&project.path), relay_bin, plugin_servers, skills,
@@ -533,7 +567,7 @@ fn prepare_launch(engine: &Engine, plan: LaunchPlan) -> Result<PreparedLaunch, B
         LaunchKind::Resume => crate::providers::driver(row.session.provider).args(
             &row.session,
             crate::providers::Launch::Resume {
-                provider_ref: row.session.provider_ref.as_deref(),
+                provider_ref: row.session.provider_ref.as_deref().filter(|value| crate::providers::is_provider_ref(value)),
             },
             Some(&brief_compact),
         ),
@@ -685,6 +719,18 @@ fn finish_launch(ctx: &mut Ctx, prepared: PreparedLaunch) -> Result<Session, Bus
     if let Some(old) = ctx.engine().set_pty(sid, &name, pty) {
         kill_detached(old, Duration::from_millis(500));
     }
+    if expect == SessionState::Exited && current.session.role == Role::Builder {
+        // The exit marked the builder's task failed; relaunched, it is being worked on again.
+        if let Some(task_id) = current.session.task_id {
+            let revived = ctx.tx().execute(
+                "UPDATE tasks SET state='running',updated_at=?1 WHERE id=?2 AND col='active' AND state='failed' AND deleted_at IS NULL",
+                params![ctx.now, task_id],
+            ).bus()?;
+            if revived > 0 {
+                ctx.emit("task.changed", json!({"task_id": task_id, "state": "running"}));
+            }
+        }
+    }
     let updated =
         sessions::by_id(ctx.tx(), sid)?.ok_or_else(|| BusError::internal("session vanished"))?;
     if matches!(kind, LaunchKind::Fresh) {
@@ -761,10 +807,9 @@ fn validate_pair(conn: &Connection, p: &CreateIn, project_id: Id, name: &str) ->
     if pair.session.project_id != project_id { return Err(BusError::invalid("session.pair_project", "PAIR sessions must belong to the same project")); }
     if pair.session.pair_with.is_some() {
         let role = p.role.unwrap_or(Role::Builder);
-        let (builders, reviewers): (i64, i64) = conn.query_row(
-            "SELECT COUNT(*) FILTER (WHERE role='builder'), COUNT(*) FILTER (WHERE role='reviewer') FROM sessions WHERE worktree=?1 AND state!='closed'",
-            [&pair.session.worktree], |row| Ok((row.get(0)?, row.get(1)?)),
-        ).bus()?;
+        let group = sessions::review_group(conn, &pair.session)?;
+        let builders = group.iter().filter(|(_, role)| *role == Role::Builder).count();
+        let reviewers = group.iter().filter(|(_, role)| *role == Role::Reviewer).count();
         if role != Role::Builder || pair.session.role != Role::Reviewer || reviewers != 1 {
             return Err(BusError::conflict("session.pair_exists", format!("session {name} is already paired")));
         }
@@ -897,16 +942,27 @@ pub fn register(e: &mut Engine) {
     }, |ctx: &mut Ctx, p, mut prepared| {
         let checkout = prepared.checkout.clone();
         let created = finish_create(ctx, &p, &mut prepared);
-        if created.is_err() && prepared.hooked && p.pair_with.is_none() {
-            // A create refused after its hook went in leaves the checkout's hook path as it found it.
+        if created.is_err() && prepared.hooked {
+            // A create refused after its hook went in leaves the checkout's hook path as it found
+            // it: wired to a session still on that checkout (a PAIR partner, or anyone sharing the
+            // primary), or restored to the pre-Relay path when there is none.
             if let Some((path, _)) = checkout {
                 let repo = Path::new(&prepared.project.path);
-                // Lock order is store, then hook writes: nothing holding the second takes the first.
-                let _writes = crate::hooks::writes();
-                if let Err(error) = crate::hooks::uninstall_git(repo, Path::new(&path), &prepared.name) {
-                    tracing::warn!(session = %prepared.name, %error, "restoring hooks after a refused create");
+                let survivor: Option<String> = ctx.tx().query_row(
+                    "SELECT name FROM sessions WHERE worktree=?1 AND name!=?2 AND state!='closed' ORDER BY id DESC LIMIT 1",
+                    params![path, prepared.name], |row| row.get(0),
+                ).optional().unwrap_or(None);
+                match survivor {
+                    Some(survivor) => retire_hook_dir(ctx.instance(), repo, Path::new(&path), &prepared.name, Some(&survivor)),
+                    None => {
+                        // Lock order is store, then hook writes: nothing holding the second takes the first.
+                        let _writes = crate::hooks::writes();
+                        if let Err(error) = crate::hooks::uninstall_git(repo, Path::new(&path), &prepared.name) {
+                            tracing::warn!(session = %prepared.name, %error, "restoring hooks after a refused create");
+                        }
+                        crate::hooks::remove_hook_dir(repo, &prepared.name);
+                    }
                 }
-                crate::hooks::remove_hook_dir(repo, &prepared.name);
             }
         }
         created
@@ -924,9 +980,14 @@ pub fn register(e: &mut Engine) {
             s => Err(BusError::conflict(
                 "session.state",
                 format!(
-                    "session {} is {}; use session.resume or session.wake",
+                    "session {} is {}; {}",
                     row.session.name,
-                    sessions::state_str(s)
+                    sessions::state_str(s),
+                    match s {
+                        SessionState::Parked => "use session.wake",
+                        SessionState::Closed => "a closed session cannot be relaunched",
+                        _ => "use session.resume, or session.clear_restorable for a fresh conversation",
+                    },
                 ),
             )),
         }, |row| {
@@ -941,12 +1002,14 @@ pub fn register(e: &mut Engine) {
     }, |ctx: &mut Ctx, _p, prepared| finish_launch(ctx, prepared));
 
     e.register_staged::<Resume, _>(|ctx, p| {
+        // An exited session — the provider quit, crashed or lost its login — relaunches in
+        // place exactly like one Relay itself stopped, keeping its conversation and its group.
         stage_launch(ctx, &p.session, LaunchKind::Resume, |row| {
-            if row.session.state != SessionState::Restorable {
+            if !matches!(row.session.state, SessionState::Restorable | SessionState::Exited) {
                 return Err(BusError::conflict(
                     "session.state",
                     format!(
-                        "session {} is {}; only restorable sessions resume",
+                        "session {} is {}; only restorable or exited sessions resume",
                         row.session.name,
                         sessions::state_str(row.session.state)
                     ),
@@ -958,8 +1021,8 @@ pub fn register(e: &mut Engine) {
 
     e.register_staged::<ClearRestorable, _>(|ctx, p| {
         let mut prepared = stage_launch(ctx, &p.session, LaunchKind::Fresh, |row| {
-            if row.session.state != SessionState::Restorable {
-                return Err(BusError::conflict("session.state", format!("session {} is not restorable", row.session.name)));
+            if !matches!(row.session.state, SessionState::Restorable | SessionState::Exited) {
+                return Err(BusError::conflict("session.state", format!("session {} is not restorable or exited", row.session.name)));
             }
             Ok(())
         }, |row| row.session.provider_ref = None)?;
@@ -1356,6 +1419,12 @@ pub fn register(e: &mut Engine) {
         ).bus()?;
         let completed_without_done = p.kind == "stop" && pending_stop.is_none() && s.state == SessionState::Running;
         let provider_ref = data.get("session_id").or_else(|| data.get("provider_ref")).and_then(Value::as_str);
+        // It is replayed into the provider's argv on resume (`--resume <id>`), so a value a CLI
+        // could parse as an option must never be stored.
+        if let Some(value) = provider_ref.filter(|value| !crate::providers::is_provider_ref(value)) {
+            return Err(BusError::invalid("session.provider_ref", format!("{value:?} is not a provider session id"))
+                .with_hint("provider_ref is the provider's own conversation id: letters, digits, '-' and '_', starting with a letter or digit"));
+        }
         let state = match p.kind.as_str() {
             "session_start" | "tool_use" => "running",
             "stop" | "idle" => "idle",
@@ -1505,16 +1574,15 @@ pub fn register(e: &mut Engine) {
     e.register_staged::<DiscardRestorable, _>(|ctx, p| {
         let (row, repo, teardown) = ctx.read(|conn| {
             let row = sessions::by_name(conn, &p.session)?;
-            if row.session.state != SessionState::Restorable {
-                return Err(BusError::conflict("session.state", format!("session {} is not restorable", row.session.name)));
+            if !matches!(row.session.state, SessionState::Restorable | SessionState::Exited) {
+                return Err(BusError::conflict("session.state", format!("session {} is not restorable or exited", row.session.name)));
             }
             let project = crate::handlers::workspace::get_project(conn, row.session.project_id)?;
-            let other_sessions: i64 = conn.prepare_cached(
-                "SELECT COUNT(*) FROM sessions WHERE id!=?1 AND worktree=?2 AND state!='closed'",
-            ).bus()?.query_row(params![row.session.id, row.session.worktree], |r| r.get(0)).bus()?;
-            let teardown = if other_sessions == 0 { Some(read_teardown(conn, &row.session.worktree)?) } else { None };
-            Ok((row, PathBuf::from(project.path), teardown))
+            let survivor = survivor_on(conn, row.session.id, &row.session.worktree)?;
+            let teardown = if survivor.is_none() { Some(read_teardown(conn, &row.session.worktree)?) } else { None };
+            Ok((row, PathBuf::from(project.path), Hooks { teardown, survivor }))
         })?;
+        let Hooks { teardown, survivor } = teardown;
         let wt = Path::new(&row.session.worktree);
         if let Some(teardown) = &teardown {
             run_teardown(&repo, wt, teardown)?;
@@ -1522,13 +1590,14 @@ pub fn register(e: &mut Engine) {
                 worktree::remove(&repo, wt, true).map_err(|error| BusError::conflict("worktree.remove_failed", error.to_string()))?;
             }
         }
+        retire_hook_dir(ctx.instance(), &repo, wt, &row.session.name, survivor.as_deref());
         Ok(row.session.id)
     }, |ctx: &mut Ctx, p, id: Id| {
         let row = sessions::by_id(ctx.tx(), id)?
             .ok_or_else(|| BusError::not_found("session.not_found", format!("no session {}", p.session)))?;
         let s = &row.session;
-        if s.state != SessionState::Restorable {
-            return Err(BusError::conflict("session.state", format!("session {} is not restorable", s.name)));
+        if !matches!(s.state, SessionState::Restorable | SessionState::Exited) {
+            return Err(BusError::conflict("session.state", format!("session {} is not restorable or exited", s.name)));
         }
         ctx.tx().execute("UPDATE sessions SET state='closed',pid=NULL,closed_at=?1,updated_at=?1 WHERE id=?2", params![ctx.now,s.id]).bus()?;
         release_claims(ctx, s)?;
@@ -1550,15 +1619,17 @@ pub fn register(e: &mut Engine) {
             let row = sessions::by_name(conn, &p.session)?;
             let s = &row.session;
             let project = crate::handlers::workspace::get_project(conn, s.project_id)?;
-            let others: i64 = conn.prepare_cached(
-                "SELECT COUNT(*) FROM sessions WHERE id!=?1 AND worktree=?2 AND state!='closed'",
-            ).bus()?.query_row(params![s.id, s.worktree], |row| row.get(0)).bus()?;
-            if others > 0 && remove {
+            let survivor = survivor_on(conn, s.id, &s.worktree)?;
+            // Only a pooled checkout is ever removed, so only there does a partner still on it
+            // stand in the way; an independent agent sharing the primary does not.
+            let pooled = Path::new(&s.worktree).starts_with(worktree::pool_dir(Path::new(&project.path)));
+            if survivor.is_some() && remove && pooled {
                 return Err(BusError::conflict("session.pair_live", "close the PAIR partner first or pass remove_worktree:false"));
             }
-            let teardown = if others == 0 { Some(read_teardown(conn, &s.worktree)?) } else { None };
-            Ok((row, PathBuf::from(project.path), teardown))
+            let teardown = if survivor.is_none() { Some(read_teardown(conn, &s.worktree)?) } else { None };
+            Ok((row, PathBuf::from(project.path), Hooks { teardown, survivor }))
         })?;
+        let Hooks { teardown, survivor } = teardown;
         let s = &row.session;
         let wt = Path::new(&s.worktree);
         // Stop writers before undoing their hooks and deleting their checkout, with a bounded
@@ -1592,8 +1663,9 @@ pub fn register(e: &mut Engine) {
             }
         };
         // The generated hook directory outlives nothing: leaving one per dead session behind
-        // makes `.relay/hooks` read like a fleet that never shut down.
-        crate::hooks::remove_hook_dir(&repo, &s.name);
+        // makes `.relay/hooks` read like a fleet that never shut down. On a shared checkout it
+        // may be the one the checkout's hooksPath points at, so it is handed over first.
+        retire_hook_dir(ctx.instance(), &repo, wt, &s.name, survivor.as_deref());
         Ok((s.id, freed))
     }, |ctx: &mut Ctx, p, (id, freed): (Id, u64)| {
         let row = sessions::by_id(ctx.tx(), id)?

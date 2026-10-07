@@ -513,8 +513,12 @@ callers of it wherever the provider lets us:
 - **`guardrail.gate`** (mutation · agent · session) — `{session, kind: "write" | "commit" |
   "exec", path?, new_text?, diff?, command?}` → `{verdict: "allow" | "refuse" | "hold",
   error?: BusError}`. Unlike `guardrail.check` (a pure dry run) it may **create a hold** and it
-  is audited. It is what a hook calls; the hook blocks the tool while the verdict is `hold`
-  and fails it while `refuse`.
+  is audited. It is what a hook calls; the hook fails the tool on `hold` as on `refuse`. A
+  person who confirms the hold (`guardrail.confirm`) leaves a single-use pass for that exact
+  action — same policy, kind, path, text, diff and command — so the agent's identical retry,
+  or the person's own re-run commit, goes through once; anything different is gated afresh.
+  An agent held on `destructive_write` is also told it may ask for the path
+  (`guardrail.request`).
 - **Claude Code**: at `session.spawn` Relay merges a per-worktree
   `.claude/settings.local.json` (or the equivalent the CLI version accepts — `provider.list`
   reports the spawn profile). Phase 4 installs `PreToolUse` on
@@ -680,7 +684,7 @@ unique; nothing else is.
 |---|---|---|
 | `task.create` | mutation · always · inverse (delete) · project | `{ project_id, title, body?, column?: Column = "backlog", state?: TaskState, priority?: Priority = "medium", size?: Size, module_id?, changelog?, attachments?: AttachmentIn[], type?: TaskType = "task", parent_id?, labels?: string[] }` → `Task` |
 | `task.get` | query | `{ task_id }` → `Task` (with attachments, commits) |
-| `task.list` | query | `{ project_id?, column?, state?, module_id?, priority?, include_deleted?, sort?: "column"\|"priority"\|"updated", type?, label?, session?, parent_id?: Id\|null }` → `{ tasks: Task[] }` — `project_id` optional so the Dashboard can ask "in review, everywhere"; `parent_id: null` is roots only, `session` is "every card this agent was ever sent" |
+| `task.list` | query | `{ project_id?, column?, state?, module_id?, priority?, include_deleted?, sort?: "column"\|"priority"\|"updated", type?, label?, session?, parent_id?: Id\|null, limit? (1000, ≤2000), offset?, summary? }` → `{ tasks: Task[], next_offset? }` — a page; `summary` leaves `body` and `changelog` empty. `project_id` optional so the Dashboard can ask "in review, everywhere"; `parent_id: null` is roots only, `session` is "every card this agent was ever sent" |
 | `task.update` | mutation · always · inverse | `{ task_id, title?, body?, priority?, size?, module_id?: Id\|null, state?, changelog?, type? }` → `Task` |
 | `task.move` | mutation · always · inverse | `{ task_id, column: Column, position?: number }` → `Task` — transitions table in §11.1; `position` is the 0-based index the task ends at in the column (the others shift around it, clamped to the end), omitted means last; agents may only move their own task and only `active → in_review` |
 | `task.delete` | mutation · always · inverse (restore) | `{ task_id }` → `{}` |
@@ -726,7 +730,7 @@ unique; nothing else is.
 | `notes.standing` | query | `{ project_id }` → `{ text }` — exactly what gets injected at dispatch |
 | `mailbox.send` | mutation · always · project | `{ project_id, to: string \| "*", text, re_task?: Id, priority?: bool }` → `{ message, recipients, delivery }` — priority mail produces the response `mail` hint until acknowledged. Agents may prioritize only direct task-linked mail and may have only one unread priority message outstanding per recipient; user/system sends are unrestricted. |
 | `mailbox.outbox` | query | `{ project_id, since?, limit? = 100 }` → `{ sent: {message: Message, recipients: {session, state, acked_at?}[]}[] }` — what this actor sent, and where each addressee stands (D109) |
-| `mailbox.list` | query | `{ project_id, session?: string, unread_only?, since? }` → `{ messages: Message[] }` |
+| `mailbox.list` | query | `{ project_id, session?: string, unread_only?, since?, limit? (200, ≤1000), before?: message id }` → `{ messages: Message[], next_before?, more_unread? }` — a page, oldest first: the newest page (older ones through `before: next_before`), or with `unread_only` the oldest unread, `more_unread` when more wait. Message text is at most 64 KiB; system notices are clipped to 2,000 bytes |
 | `mailbox.ack` | mutation · agent_only | `{ message_id }` → `{}` |
 
 ### 10.8 session (SPEC §10)
@@ -743,7 +747,7 @@ are `user_only` (§9.1). Agents get `done`, `report`, `attach`/`scrollback`, `bo
 | `session.clear_restorable` | mutation · always | `{ session }` → `Session` — drop saved provider context and fresh-spawn the same restorable session/worktree |
 | `session.park` | mutation · always | `{ session }` → `Session` — kill CLI, keep pane/scrollback/worktree/token |
 | `session.wake` | mutation · always | `{ session }` → `Session` — respawn with provider resume |
-| `session.close` | mutation · always | `{ session, remove_worktree?: bool = true, purge_build?: bool = true }` → `{ freed_mb }` — see SPEC §8 lifecycle; branch is kept. A shared review worktree is removed only when every other session on it is closed (`conflict`/`session.pair_live` otherwise, unless `remove_worktree: false`) |
+| `session.close` | mutation · always | `{ session, remove_worktree?: bool = true, purge_build?: bool = true }` → `{ freed_mb }` — see SPEC §8 lifecycle. The branch stays unless branch cleanup finds its work already merged, after the close. A shared pooled review worktree is removed only when every other session on it is closed (`conflict`/`session.pair_live` otherwise, unless `remove_worktree: false`); a non-pooled checkout such as the primary is never removed, so others on it do not refuse the close |
 | `session.done` | mutation · always · agent | `{ session, summary?, sha?, status?: "completed"\|"blocked"\|"partial", blockers?: string[] }` → `Session` — self-report for `sessions.task_id`, the current task only. `completed` (default) moves that task `active → in_review`, promotes and prompts the next queued task, and notifies. `blocked`/`partial` leave only the current task in place, set it `blocked`, notify `agent_blocked`, and require `blockers` (D118). Reviewer: notifies only |
 | `session.intent` | mutation · always · agent | `{ session, text }` → `Session` — one line, ≤200 chars, of what this session is doing; empty clears it. Surfaces in `session.peers` and the dashboard, where coordination happens |
 | `session.claim` | mutation · always · agent | `{ paths: string[], symbol?, note?, exclusive? }` → `{ claimed, collisions: {path, symbol, session, since}[] }` — declare the files this session is taking on. Collisions are reported, not refused, so they can be negotiated over `mailbox.send`; `exclusive: true` refuses instead and records nothing. Advisory, not enforced (D116) |
@@ -828,7 +832,7 @@ Provider-neutral Markdown; the same for both providers.
 | `git.status` | query | `{ project_id, worktree? }` → `{ branch, upstream?, ahead, behind, files: FileStatus[] }` |
 |  |  | **`worktree` throughout `git.*` and `file.*`:** omitted, it is the caller's own session worktree for an agent and the project root for the user. `"@project"` asks for the project root explicitly. Defaulting an agent to the project root returned confident, well-formed, wrong answers with no error either way (D111) |
 | `git.diff` | query | `{ project_id, worktree?, base?, staged? }` → `{ files: DiffFile[] }` |
-| `git.diff.file` | query | `{ project_id, worktree?, path, base? }` → `{ old, new, hunks }` (for `@codemirror/merge`) |
+| `git.diff.file` | query | `{ project_id, worktree?, path, base? }` → `{ old, new, hunks }` (for `@codemirror/merge`); refuses a binary file (`git.diff_binary`) or one whose old + new text passes 1 MiB (`git.diff_too_large`) before building the reply |
 | `git.log` | query | `{ project_id, worktree?, branch?, limit? = 200, graph? }` → `{ commits: Commit[] }` |
 | `git.show` | query | `{ project_id, sha }` → `{ commit: Commit, files: DiffFile[] }` |
 | `git.branches` | query | `{ project_id, worktree? }` → `{ current, branches: Branch[] }` (with merged flag and session owner; `current` follows the selected worktree) |
@@ -838,8 +842,8 @@ Provider-neutral Markdown; the same for both providers.
 | `git.commit` | mutation · always | `{ project_id, worktree?, message, all?: bool }` → `{ sha }` — caps and protected paths apply |
 | `git.fetch` | mutation · agent_only | `{ project_id }` → `{ ahead, behind }` |
 | `git.push` | mutation · always | `{ project_id, worktree?, set_upstream? = auto }` → `{}` — a branch without an upstream is first-pushed as `git push -u origin <branch>`; explicit `false` keeps plain-push behavior |
-| `git.pr.list` | query | `{ project_id }` → `{ pull_requests: { number, branch, draft, url, title }[] }` — open GitHub PRs reported by the authenticated `gh` CLI |
-| `git.pr.open` | mutation · always | `{ project_id, worktree?, title?, body? }` → `{ url }` |
+| `git.pr.list` | query | `{ project_id, refresh? }` → `{ pull_requests: { number, branch, draft, url, title }[] }` — GitHub PRs reported by the authenticated `gh` CLI. One listing answers for a minute per repository (D130: redraws must not repeat the network request); `refresh` asks GitHub now, and `git.push` / `git.pr.open` drop the cached one |
+| `git.pr.open` | mutation · always | `{ project_id, worktree?, title?, body? }` → `{ url }` — `gh pr create` runs before the store lock, with a 25 s deadline; `git.pr_timeout` means the outcome is unknown |
 | `git.branch.clean_merged` | mutation · always | `{ project_id, dry_run? }` → `{ deleted: string[] }` — never touches branches with a live/parked session |
 | `git.suggest_message` | query | `{ project_id, worktree? }` → `{ message }` — heuristic subject from the diff |
 | `integration.request` | mutation · always | `{ project_id, sessions: string[] \| branches: string[], build?: bool = true, deploy?: DeviceRef }` → `Integration` (state `queued`; results via `integration.result` events) |
@@ -862,8 +866,8 @@ All paths are relative to the worktree root; `..` and absolute paths are `invali
 | `file.delete` | mutation · always · inverse (restore) | `{ project_id, worktree?, path }` → `{ trash_id }` |
 | `file.restore` | mutation · always | `{ project_id, trash_id }` → `Entry` |
 | `file.import` | mutation · always | `{ project_id, worktree?, into, sources: path[] }` → `{ entries: Entry[] }` — OS drag-in |
-| `file.restore_head` | mutation · always · user | `{ project_id, worktree?, path }` → `Entry` — `git checkout -- <path>` |
-| `file.search` | query | `{ project_id, worktree?, query, glob?, regex?, limit? }` → `{ hits: {path, line, col, text}[] }` |
+| `file.restore_head` | mutation · always · user | `{ project_id, worktree?, path }` → `Entry` — `git checkout -- <path>`; the one-click answer to a post-hoc `guardrail.violation` (§9.3) |
+| `file.search` | query | `{ project_id, worktree?, query, glob?, regex?, limit? }` → `{ hits: {path, line, col, text}[] }`; searches regular text files only (a symlink only when it stays inside the worktree), skipping generated trees, files over 8 MiB and any with a NUL in the first 8 KiB |
 
 ### 10.14 device (SPEC §9)
 
@@ -895,10 +899,11 @@ All paths are relative to the worktree root; `..` and absolute paths are `invali
 | `provider.refresh` | mutation · never | `{}` → `{ providers: ProviderInfo[] }` — re-detect now |
 | `usage.get` | query | `{ provider?: Provider }` → `{ usage: Usage[] }` — per provider, in its own units and windows; combines stored agent reports with bounded read-only CLI state inspection and never calls a provider endpoint |
 | `usage.report` | mutation · never · session · agent | `{ session, provider, payload: object }` → `{}` — the provider's own metering pushed by its statusLine/hook (v3's `statusline.rs`); core stores the latest per session and derives `usage.get` |
-| `skill.list` | query | `{ project_id?, enabled? }` → `{ skills: Skill[] }` |
+| `skill.list` | query | `{ project_id?, enabled?, summary? }` → `{ skills: Skill[] }`; with `summary: true` each `body` is cut to its first 4 KiB (the frontmatter and opening), so a large library fits one reply |
+| `skill.get` | query | `{ skill_id }` → `Skill` with its whole body; `skill.not_found` |
 | `skill.create` / `skill.update` / `skill.delete` | mutation · always · inverse | `{ name, body }` / `{ skill_id, name?, body? }` / `{ skill_id }`; a skill nobody has enabled anywhere is enabled in every project on create/install (D147) |
 | `skill.enable` | mutation · always · inverse | `{ skill_id, project_id, enabled: bool }` → `Skill`; the per-project override on top of that app-wide default |
-| `skill.install` | mutation · always | `{ url, subdir?, replace_skill_id? }` → `{ skills: Skill[] }`; clones a GitHub source, finds bounded `SKILL.md` files, prefers canonical `skills/` then Relay-native `.agents/skills/` entries over provider adapters, collapses byte-identical copies with the same name, and installs or refreshes them with source revision metadata. The whole skill folder is kept (`<store dir>/skills/<id>/`), not only the `SKILL.md` body, and is materialized into every project root and session worktree as `.claude/skills/<name>/` and `.agents/skills/<name>/`, and into the provider homes `~/.claude/skills/` and `$CODEX_HOME/skills/` — Codex reads skills from nowhere else. A folder the repository or the user wrote themselves is never overwritten (D147). Same-rank different bodies return `skill.duplicate_name`. A hidden deleted name is reclaimed automatically; a visible different-source collision returns `skill.name_exists` with both identities and requires the exact conflicting id for atomic replacement |
+| `skill.install` | mutation · always | `{ url, subdir?, replace_skill_id? }` → `{ skills: Skill[] }` (bodies cut as in `skill.list {summary: true}`); clones a GitHub source, finds bounded `SKILL.md` files, prefers canonical `skills/` then Relay-native `.agents/skills/` entries over provider adapters, collapses byte-identical copies with the same name, and installs or refreshes them with source revision metadata. The whole skill folder is kept (`<store dir>/skills/<id>/`), not only the `SKILL.md` body, and is materialized into every project root and session worktree as `.claude/skills/<name>/` and `.agents/skills/<name>/`, and into the provider homes `~/.claude/skills/` and `$CODEX_HOME/skills/` — Codex reads skills from nowhere else. A folder the repository or the user wrote themselves is never overwritten (D147). Same-rank different bodies return `skill.duplicate_name`. A hidden deleted name is reclaimed automatically; a visible different-source collision returns `skill.name_exists` with both identities and requires the exact conflicting id for atomic replacement |
 | `github.status` | query | `{}` → `{ installed, connected, login? }` |
 | `github.connect` | mutation · never | `{}` → `{ started }`; launches GitHub CLI browser auth and emits `github.changed` when it finishes; Relay stores no token |
 | `github.repo.list` | query | `{}` → `{ repositories: GitHubRepo[] }`; all repositories the connected account can access |

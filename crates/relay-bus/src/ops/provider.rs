@@ -19,7 +19,13 @@ payload!(#[schemars(rename = "UsageReportIn")] UsageReportIn { pub session: Stri
 op!(UsageReport, "usage.report", UsageReportIn => Empty,
     OpMeta::mutation(Scope::Session, 9, "Provider metering pushed by its statusLine/hook").audit(Audit::Never).actors(Actors::AgentOnly).emits(&["usage.changed"]));
 
-payload!(#[schemars(rename = "SkillListIn")] SkillListIn { pub project_id: Option<Id>, pub enabled: Option<bool> });
+payload!(#[schemars(rename = "SkillListIn")] SkillListIn {
+    pub project_id: Option<Id>,
+    pub enabled: Option<bool>,
+    /// Cut each body to its opening, frontmatter included, instead of the whole SKILL.md;
+    /// `skill.get` returns one whole body.
+    pub summary: Option<bool>
+});
 result!(#[schemars(rename = "SkillListOut")] SkillListOut { pub skills: Vec<Skill> });
 op!(SkillList, "skill.list", SkillListIn => SkillListOut, OpMeta::query(Scope::Global, 11, "Skills (markdown instruction files)"));
 payload!(#[schemars(rename = "SkillCreateIn")] SkillCreateIn { pub name: String, pub body: String });
@@ -29,6 +35,7 @@ payload!(#[schemars(rename = "SkillUpdateIn")] SkillUpdateIn { pub skill_id: Id,
 op!(SkillUpdate, "skill.update", SkillUpdateIn => Skill,
     OpMeta::mutation(Scope::Global, 11, "Patch a skill").actors(Actors::UserOnly).undo(Undo::Inverse).emits(&["skill.changed"]));
 payload!(#[schemars(rename = "SkillIdIn")] SkillIdIn { pub skill_id: Id });
+op!(SkillGet, "skill.get", SkillIdIn => Skill, OpMeta::query(Scope::Global, 11, "One skill with its whole body"));
 op!(SkillDelete, "skill.delete", SkillIdIn => Empty,
     OpMeta::mutation(Scope::Global, 11, "Delete a skill").actors(Actors::UserOnly).undo(Undo::Inverse).emits(&["skill.deleted"]));
 payload!(#[schemars(rename = "SkillEnableIn")] SkillEnableIn { pub skill_id: Id, pub project_id: Id, pub enabled: bool });
@@ -75,4 +82,4 @@ payload!(#[schemars(rename = "PluginEnableIn")] PluginEnableIn { pub plugin_id: 
 op!(PluginEnable, "plugin.enable", PluginEnableIn => Plugin,
     OpMeta::mutation(Scope::Project, 12, "Switch a plugin on or off for a project").actors(Actors::UserOnly).undo(Undo::Inverse).emits(&["plugin.changed"]));
 
-entries!(List, Refresh, Update, UsageGet, UsageReport, SkillList, SkillCreate, SkillUpdate, SkillDelete, SkillEnable, SkillInstall, GitHubStatusOp, GitHubConnect, GitHubRepoList, PluginList, PluginGet, PluginEnable);
+entries!(List, Refresh, Update, UsageGet, UsageReport, SkillList, SkillGet, SkillCreate, SkillUpdate, SkillDelete, SkillEnable, SkillInstall, GitHubStatusOp, GitHubConnect, GitHubRepoList, PluginList, PluginGet, PluginEnable);

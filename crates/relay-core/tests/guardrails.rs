@@ -260,6 +260,26 @@ fn refusals_holds_confirmation_replay_and_expiry_are_durable() {
     assert_eq!(confirmed["on_behalf_of"], format!("agent:{name}"));
     assert_eq!(confirmed["kind"], "ok");
 
+    // The hook that asked has already failed the write, so the agent retries it. The person's
+    // confirmation lets exactly that retry through, once.
+    let retried = call(
+        engine,
+        actor.clone(),
+        "guardrail.gate",
+        json!({"session": name, "kind": "write", "path": "large.txt", "new_text": next}),
+    );
+    assert!(retried.ok, "the confirmed write was held again: {:?}", retried.error);
+    assert_eq!(retried.result.as_ref().unwrap()["verdict"], "allow");
+    let once_more = call(
+        engine,
+        actor.clone(),
+        "guardrail.gate",
+        json!({"session": name, "kind": "write", "path": "large.txt", "new_text": next}),
+    );
+    assert_eq!(error(&once_more).kind, ErrorKind::Held, "a confirmation covers one retry, not every one");
+    // The held agent is told it may ask for the path instead of waiting.
+    assert!(error(&once_more).hint.as_deref().is_some_and(|hint| hint.contains("guardrail.request")));
+
     let held_again = call(
         engine,
         actor,

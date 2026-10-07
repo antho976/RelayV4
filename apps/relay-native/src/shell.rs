@@ -7,7 +7,16 @@ mod agent_menu;
 pub(super) use agent_menu::is_closing;
 
 impl Ui {
+    /// Open `project` on `page`: an explicit destination, which the project's saved layout
+    /// does not override.
     pub fn open_project(self: &Rc<Self>, project: i64, page: &str) {
+        self.enter_project(project, Some(page));
+    }
+    /// Switch to `project` on the page it was last left on.
+    pub fn switch_project(self: &Rc<Self>, project: i64) {
+        self.enter_project(project, None);
+    }
+    fn enter_project(self: &Rc<Self>, project: i64, page: Option<&str>) {
         if project != self.project.get() {
             if !self.dismiss_panels() {
                 return;
@@ -31,9 +40,10 @@ impl Ui {
             self.reconcile();
             self.editor.reset();
             self.restored_project.set(0);
+            self.explicit_page.set(if page.is_some() { project } else { 0 });
             self.refresh();
         }
-        self.navigate(page);
+        self.navigate(page.unwrap_or("agents"));
     }
     fn registry_drag(
         self: &Rc<Self>,
@@ -316,7 +326,12 @@ impl Ui {
         });
     }
     fn layout_state(&self) -> Value {
-        json!({"page":*self.page.borrow(),"agent_layout":*self.mode.borrow(),"columns":self.columns.get(),"focused":*self.focused.borrow(),"order":*self.ordered.borrow(),"sidebar":if self.page.borrow().as_str() == "settings" { self.settings_sidebar.get() } else { self.sidebar.is_visible() },"split":self.wall_split.position(),"width":self.window.width(),"height":self.window.height(),"project_tools":self.editor.layout_state()})
+        // "agents" is both the agent wall and Files and Git; keep which one was showing.
+        let page = match self.page.borrow().as_str() {
+            "agents" if !self.editor.agents_visible() => String::from("code"),
+            page => page.to_owned(),
+        };
+        json!({"page":page,"agent_layout":*self.mode.borrow(),"columns":self.columns.get(),"focused":*self.focused.borrow(),"order":*self.ordered.borrow(),"sidebar":if self.page.borrow().as_str() == "settings" { self.settings_sidebar.get() } else { self.sidebar.is_visible() },"split":self.wall_split.position(),"width":self.window.width(),"height":self.window.height(),"project_tools":self.editor.layout_state()})
     }
     pub(super) async fn restore_layout(self: &Rc<Self>, revision: u64) {
         let project = self.project.get();
@@ -324,7 +339,10 @@ impl Ui {
             return;
         }
         self.restored_project.set(project);
-        if self.layout_revision.get() != revision {
+        // Opened on an explicit page: restore the rest of the project's layout, never its
+        // saved page, and never save the previous project's layout over it.
+        let explicit = self.explicit_page.replace(0) == project;
+        if self.layout_revision.get() != revision && !explicit {
             self.save_layout();
             return;
         }
@@ -335,20 +353,29 @@ impl Ui {
             )
             .await;
         // A pending startup read must not undo navigation or a layout edit.
-        if self.project.get() != project || self.layout_revision.get() != revision {
+        if self.project.get() != project || (self.layout_revision.get() != revision && !explicit) {
             return;
         }
         if let Ok(v) = result {
             if !v["value"].is_null() {
                 let applying = self.applying_ui.replace(true);
-                self.apply_layout(&v["value"]);
+                self.apply_layout_keeping(&v["value"], explicit);
                 self.applying_ui.set(applying);
             }
         }
         self.refresh_page();
     }
     pub(super) fn apply_layout(self: &Rc<Self>, state: &Value) {
+        self.apply_layout_keeping(state, false);
+    }
+    /// Apply a saved layout; with `keep_page`, everything but its page.
+    fn apply_layout_keeping(self: &Rc<Self>, state: &Value, keep_page: bool) {
+        let files_shown = *self.page.borrow() == "agents" && !self.editor.agents_visible();
         self.editor.apply_layout(&state["project_tools"]);
+        if keep_page && files_shown {
+            // Files and Git was asked for: the saved panes must not hide its tree.
+            self.editor.show_files();
+        }
         if let Some(mode) = state["agent_layout"]
             .as_str()
             .filter(|s| matches!(*s, "grid" | "focus" | "review" | "mosaic"))
@@ -397,6 +424,7 @@ impl Ui {
         }
         if let Some(page) = state["page"]
             .as_str()
+            .filter(|_| !keep_page)
             .filter(|p| *p == "agents" || *p == "code" || self.pages.contains_key(*p))
         {
             self.navigate(page);
@@ -721,9 +749,8 @@ impl Ui {
             // Confirmed in place: the key itself turns into "Confirm …" for a second click.
             for (caption, icon, op, armed, tip) in [
                 ("Clear context", "refresh", "session.clear_restorable", "Confirm clear", "Start fresh in this session and worktree; saved provider conversation context is cleared"),
-                ("Discard session", "close", "session.close", "Confirm discard", "Remove this session from the wall; its worktree and branch are kept"),
+                ("Discard session", "close", "session.close", "Confirm discard", "Remove this session from the wall; its worktree is kept, and so is its branch unless its work is already merged"),
             ] {
-                if op == "session.clear_restorable" && state != "restorable" { continue; }
                 for key in [button(caption, "quiet"), icon_button(icon, caption)] {
                     let slate = key.label().is_some();
                     key.set_tooltip_text(Some(if slate { tip } else { caption }));
@@ -829,7 +856,7 @@ impl Ui {
         let ui = self.clone();
         let panel = Rc::downgrade(&panel);
         glib::spawn_future_local(async move {
-            match ui.call("skill.list", json!({"project_id":project})).await {
+            match ui.call("skill.list", json!({"project_id":project,"summary":true})).await {
                 Ok(result) => {
                     clear(&list);
                     let skills = rows(&result, "skills");
@@ -1113,7 +1140,7 @@ impl Ui {
             }
         });
     }
-    pub(super) fn load_appearance(self: &Rc<Self>) {
+    pub(crate) fn load_appearance(self: &Rc<Self>) {
         crate::wallpaper_rotation::refresh(self);
         let ui = self.clone();
         glib::spawn_future_local(async move {
@@ -1217,9 +1244,11 @@ impl Ui {
                     .clamp(0., 0.85),
             );
             if let Ok(v) = image {
+                // Settings keeps showing the saved choice; a rotation only paints this window.
                 crate::tools::settings::sync_wallpaper(&ui, &v["value"]);
+                let image = crate::wallpaper_rotation::shown(&ui, &v["value"]);
                 use base64::Engine;
-                if let Some(data) = v["value"].as_str().and_then(|s| {
+                if let Some(data) = image.as_str().and_then(|s| {
                     s.strip_prefix("data:image/jpeg;base64,")
                         .or_else(|| s.strip_prefix("data:image/png;base64,"))
                 }) {

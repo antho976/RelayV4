@@ -167,7 +167,7 @@ pub fn register(engine: &mut Engine) {
                 diff: payload.diff.as_deref(),
                 command: payload.command.as_deref(),
                 skip_policy: None,
-                grants: None,
+                grants: None, path_only: false,
             },
             ctx.actor_session_id(),
         )?;
@@ -209,7 +209,7 @@ pub fn register(engine: &mut Engine) {
                     diff: Some(""),
                     command: None,
                     skip_policy: None,
-                    grants: None,
+                    grants: None, path_only: false,
                 },
                 ctx.actor_session_id(),
             ).map(|(decision, _)| decision);
@@ -248,7 +248,7 @@ pub fn register(engine: &mut Engine) {
                     diff: None,
                     command: Some(&command),
                     skip_policy: None,
-                    grants: None,
+                    grants: None, path_only: false,
                 },
                 ctx.actor_session_id(),
             )?;
@@ -336,7 +336,23 @@ pub fn register(engine: &mut Engine) {
         request.token = None;
         Ok(HoldGetOut { hold, request })
     });
-    engine.register::<Confirm>(confirm);
+    // Confirming replays the held op. Its read/external phase — for a held `git.commit`, the
+    // staging, the user's pre-commit hook and the signature — runs here, before the
+    // transaction, as the op's original caller; the transaction rechecks the hold and replays.
+    engine.register_staged::<Confirm, Option<Result<crate::engine::Prepared, BusError>>>(
+        |ctx, payload| {
+            let (hold, frozen) = ctx.read(|conn| {
+                let hold = guardrail::hold_by_id(conn, payload.hold_id)?;
+                let frozen = guardrail::frozen_request(conn, hold.id)?;
+                Ok((hold, frozen))
+            })?;
+            if hold.state != HoldState::Open || frozen.op == grants::OP || frozen.op == "guardrail.gate" {
+                return Ok(None);
+            }
+            Ok(ctx.prepare_registered(&frozen.op, &frozen.payload, hold.actor.clone(), hold.session_id).transpose())
+        },
+        |ctx: &mut Ctx, payload, prepared| confirm(ctx, payload, prepared),
+    );
     engine.register::<Reject>(reject);
     engine.register::<ExceptionRequest>(request);
     engine.register::<ExceptionGet>(|ctx, payload| grants::by_id(ctx.tx(), payload.request_id));
@@ -520,10 +536,25 @@ fn gate(ctx: &mut Ctx, payload: GateIn, skip_policy: Option<&str>) -> Result<Gat
             diff: payload.diff.as_deref(),
             command: payload.command.as_deref(),
             skip_policy,
-            grants: None,
+            grants: None, path_only: false,
         },
         Some(session.session.id),
     )?;
+    // A person already confirmed exactly this action: judge it again without the policy they
+    // waived, and spend their pass only if it then goes through.
+    if let (None, Decision::Hold { policy, details, .. }) = (skip_policy, &decision) {
+        if let Some(pass) = find_pass(ctx, session.session.id, policy, &payload, details)? {
+            let policy = policy.clone();
+            let out = gate(ctx, payload, Some(&policy));
+            if out.is_ok() {
+                ctx.tx().execute(
+                    "UPDATE holds SET details = json_set(details, '$.pass.used_at', ?1) WHERE id = ?2",
+                    params![ctx.now, pass],
+                ).bus()?;
+            }
+            return out;
+        }
+    }
     match decision {
         Decision::Allow => {
             // A command that writes to an Android device takes this session's device lease, or
@@ -567,7 +598,7 @@ fn gate(ctx: &mut Ctx, payload: GateIn, skip_policy: Option<&str>) -> Result<Gat
     }
 }
 
-fn confirm(ctx: &mut Ctx, payload: ConfirmIn) -> Result<ConfirmOut, BusError> {
+fn confirm(ctx: &mut Ctx, payload: ConfirmIn, prepared: Option<Result<crate::engine::Prepared, BusError>>) -> Result<ConfirmOut, BusError> {
     let hold = guardrail::hold_by_id(ctx.tx(), payload.hold_id)?;
     if hold.state != HoldState::Open {
         return Err(BusError::conflict(
@@ -580,7 +611,14 @@ fn confirm(ctx: &mut Ctx, payload: ConfirmIn) -> Result<ConfirmOut, BusError> {
         return approve(ctx, hold, payload.scope);
     }
     if frozen.op != "guardrail.gate" {
-        let outcome = match ctx.replay_registered(&frozen.op, frozen.payload.clone(), hold.actor.clone(), hold.session_id, hold.policy.clone()) {
+        let replayed = match prepared {
+            Some(Err(error)) => Err(error),
+            prepared => ctx.replay_prepared(
+                &frozen.op, frozen.payload.clone(), hold.actor.clone(), hold.session_id, hold.policy.clone(),
+                prepared.and_then(Result::ok),
+            ),
+        };
+        let outcome = match replayed {
             Ok(value) => Response::ok(ctx.req_id, value),
             Err(error) => Response::err(ctx.req_id, error),
         };
@@ -612,10 +650,14 @@ fn confirm(ctx: &mut Ctx, payload: ConfirmIn) -> Result<ConfirmOut, BusError> {
             diff: gate_payload.diff.as_deref(),
             command: gate_payload.command.as_deref(),
             skip_policy: Some(&hold.policy),
-            grants: None,
+            grants: None, path_only: false,
         },
     )?;
 
+    // The hook that asked has already failed the action; the agent (or the person's own
+    // commit) retries it. A confirmed hold therefore leaves a pass for exactly that action,
+    // used once by the next identical gate from the same session (`spend_pass`).
+    let allowed = matches!(decision, Decision::Allow);
     let outcome = match decision {
         Decision::Allow => Response::ok(
             ctx.req_id,
@@ -649,21 +691,51 @@ fn confirm(ctx: &mut Ctx, payload: ConfirmIn) -> Result<ConfirmOut, BusError> {
             params![ctx.now, ctx.actor.to_string(), hold.id],
         )
         .bus()?;
+    if allowed {
+        ctx.tx().execute(
+            "UPDATE holds SET details = json_set(details, '$.pass', json(?1)) WHERE id = ?2",
+            params![json!({"key": pass_key(&hold.policy, &gate_payload, &hold.details), "used_at": null}).to_string(), hold.id],
+        ).bus()?;
+    }
     let resolved = guardrail::hold_by_id(ctx.tx(), hold.id)?;
     ctx.set_project(session.session.project_id);
     ctx.set_session(session.session.id);
     ctx.audit_as(frozen.op, hold.actor.clone());
     ctx.emit("guardrail.resolved", json!({"hold_id": hold.id, "state": "confirmed", "by": ctx.actor.to_string()}));
     if let (Some(project_id), Some(session)) = (hold.project_id, hold.session.as_deref()) {
+        let text = if allowed {
+            format!("Guardrail hold {} was confirmed by {}. Retry the identical action once and it will go through; anything different is checked afresh.", hold.id, ctx.actor)
+        } else {
+            format!("Guardrail hold {} was confirmed by {}.", hold.id, ctx.actor)
+        };
         if let Some(message) = super::notes::send_system_priority(
             ctx.tx(), project_id, session,
-            &format!("Guardrail hold {} was confirmed by {}.", hold.id, ctx.actor),
+            &text,
             None, &ctx.now,
         )? {
             ctx.emit("mailbox.new", serde_json::to_value(message).bus()?);
         }
     }
     Ok(ConfirmOut { hold: resolved, outcome })
+}
+
+/// What a confirmed gate hold lets through: the same policy held for the same action — same
+/// kind, path, text, diff and command, and the same findings (for a commit, which carries none
+/// of those, the files and counts the hold named).
+fn pass_key(policy: &str, payload: &GateIn, details: &Value) -> String {
+    let material = json!([policy, payload.kind, payload.path, payload.new_text, payload.diff, payload.command, details]);
+    use sha2::Digest;
+    crate::hex(&sha2::Sha256::digest(material.to_string().as_bytes()))
+}
+
+/// The unused pass a person's confirmation left for exactly this held action, if any.
+fn find_pass(ctx: &Ctx, session_id: Id, policy: &str, payload: &GateIn, details: &Value) -> Result<Option<Id>, BusError> {
+    use rusqlite::OptionalExtension;
+    ctx.tx().prepare_cached(
+        "SELECT id FROM holds WHERE session_id = ?1 AND op = 'guardrail.gate' AND state = 'confirmed'
+         AND json_extract(details, '$.pass.key') = ?2 AND json_extract(details, '$.pass.used_at') IS NULL
+         ORDER BY id LIMIT 1",
+    ).bus()?.query_row(params![session_id, pass_key(policy, payload, details)], |r| r.get(0)).optional().bus()
 }
 
 /// Apply the phase-4 policy engine to a mutation that is itself a bus op. A hold freezes
@@ -673,10 +745,26 @@ pub(crate) fn enforce(
     ctx: &mut Ctx, project_id: Id, worktree: &Path, kind: GateKind, path: Option<&str>,
     new_text: Option<&str>, diff: Option<&str>, command: Option<&str>,
 ) -> Result<(), BusError> {
+    enforce_request(ctx, project_id, worktree, kind, path, new_text, diff, command, false)
+}
+
+/// [`enforce`] for a rename, move or delete: the path rules only, never the file's content
+/// (BUS.md §9.2). `new_text` is only for a shape gate on the destination.
+pub(crate) fn enforce_path_mutation(
+    ctx: &mut Ctx, project_id: Id, worktree: &Path, path: &str, new_text: Option<&str>,
+) -> Result<(), BusError> {
+    enforce_request(ctx, project_id, worktree, GateKind::Write, Some(path), new_text, None, None, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enforce_request(
+    ctx: &mut Ctx, project_id: Id, worktree: &Path, kind: GateKind, path: Option<&str>,
+    new_text: Option<&str>, diff: Option<&str>, command: Option<&str>, path_only: bool,
+) -> Result<(), BusError> {
     let session_id = ctx.actor_session_id();
     let (decision, used) = guardrail::evaluate_granted(ctx.tx(), &GateRequest {
         actor: &ctx.actor, project_id, worktree, kind, path, new_text, diff, command,
-        skip_policy: ctx.skip_policy(), grants: None,
+        skip_policy: ctx.skip_policy(), grants: None, path_only,
     }, session_id)?;
     match decision {
         Decision::Allow => use_grants(ctx, &used, None),

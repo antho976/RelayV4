@@ -104,10 +104,18 @@ pub fn download_skills(
     let subdir = requested_subdir.filter(|value| !value.trim().is_empty()).map(str::trim).or(url_subdir.as_deref());
     let temp = std::env::temp_dir().join(format!("relay-skill-{}", uuid::Uuid::new_v4()));
     let mut command = Command::new("git");
+    crate::proc::quiet_network_git(&mut command);
     command.args(["clone", "--depth", "1"]);
     if let Some(branch) = branch.as_deref() { command.args(["--branch", branch]); }
-    let output = command.arg(&source_url).arg(&temp).output()
-        .map_err(|error| BusError::unavailable("skill.git_missing", format!("cannot start git: {error}")))?;
+    command.arg("--").arg(&source_url).arg(&temp);
+    let output = match crate::proc::output_with_timeout(&mut command, std::time::Duration::from_secs(300)) {
+        Ok(Some(output)) => output,
+        Ok(None) => {
+            let _ = fs::remove_dir_all(&temp);
+            return Err(BusError::unavailable("skill.clone_timeout", "git clone did not finish within 5 minutes"));
+        }
+        Err(error) => return Err(BusError::unavailable("skill.git_missing", format!("cannot start git: {error}"))),
+    };
     if !output.status.success() {
         let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let _ = fs::remove_dir_all(&temp);

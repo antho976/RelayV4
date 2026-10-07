@@ -81,6 +81,35 @@ pub fn list_with_owners(
 
 /// How long the paginated GitHub lookup may take before Relay stops waiting on the network.
 const PR_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long one listing answers `git.pr.list` for a repository. The Source Control panel asks
+/// on every refresh, which while agents work is about once a second; every page of every PR
+/// the repository ever had, each time, spends the user's GitHub REST quota (D130).
+const PR_LIST_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+/// `gh pr create` makes several GitHub round trips. Under the desktop client's 30 s request
+/// timeout, so the engine reports a timeout before the client gives up on its own.
+const PR_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
+
+type PrCache = std::collections::HashMap<PathBuf, (std::time::Instant, PrListOut)>;
+static PR_LISTS: std::sync::Mutex<Option<PrCache>> = std::sync::Mutex::new(None);
+
+fn cached_prs(repo: &Path) -> Option<PrListOut> {
+    let cache = PR_LISTS.lock().unwrap_or_else(|p| p.into_inner());
+    cache.as_ref()?.get(repo).filter(|(at, _)| at.elapsed() < PR_LIST_TTL).map(|(_, listed)| listed.clone())
+}
+
+fn remember_prs(repo: &Path, listed: &PrListOut) {
+    let mut cache = PR_LISTS.lock().unwrap_or_else(|p| p.into_inner());
+    let cache = cache.get_or_insert_with(Default::default);
+    cache.retain(|_, (at, _)| at.elapsed() < PR_LIST_TTL);
+    cache.insert(repo.to_path_buf(), (std::time::Instant::now(), listed.clone()));
+}
+
+/// A push or a new PR changes what GitHub would say; the next listing asks again.
+fn forget_prs(repo: &Path) {
+    if let Some(cache) = PR_LISTS.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+        cache.remove(repo);
+    }
+}
 
 pub fn register(e: &mut Engine) {
     e.register_unlocked::<WorktreeList>(|ctx, p| {
@@ -126,26 +155,35 @@ pub fn register(e: &mut Engine) {
             Ok(wt)
         },
     );
-    e.register::<WorktreeRemove>(|ctx: &mut Ctx, p| {
-        let project = get_project(ctx.tx(), p.project_id)?;
-        let repo = Path::new(&project.path);
-        // A relative path would resolve against the engine's cwd ($HOME under `relay serve`).
-        if !Path::new(&p.path).is_absolute() {
-            return Err(BusError::invalid("worktree.path", format!("{:?} must be an absolute path", p.path)));
-        }
-        let want = std::fs::canonicalize(&p.path).map(|c| c.display().to_string()).unwrap_or(p.path.clone());
-        let owner: Option<String> = ctx.tx().query_row(
-            "SELECT name FROM sessions WHERE project_id = ?1 AND worktree = ?2 AND state != 'closed'",
-            rusqlite::params![project.id, want], |r| r.get(0)).ok();
-        if let Some(name) = owner {
-            return Err(BusError::conflict("worktree.owned", format!("session {name} owns {want}")).with_hint("session.close it first"));
-        }
-        let freed = worktree::remove(repo, Path::new(&want), p.purge_build.unwrap_or(true))
-            .map_err(|e| BusError::conflict("worktree.remove_failed", e.to_string()))?;
-        ctx.set_project(project.id);
-        ctx.emit("worktree.changed", json!({ "project_id": project.id }));
-        Ok(FreedOut { freed_mb: freed as f64 / (1024.0 * 1024.0) })
-    });
+    // The build purge, the size walk and `git worktree remove` are seconds of disk work for a
+    // checkout with real build output: done before the transaction, which only announces it.
+    e.register_staged::<WorktreeRemove, _>(
+        |ctx, p| {
+            // A relative path would resolve against the engine's cwd ($HOME under `relay serve`).
+            if !Path::new(&p.path).is_absolute() {
+                return Err(BusError::invalid("worktree.path", format!("{:?} must be an absolute path", p.path)));
+            }
+            let want = std::fs::canonicalize(&p.path).map(|c| c.display().to_string()).unwrap_or(p.path.clone());
+            let (project, owner) = ctx.read(|conn| {
+                let project = get_project(conn, p.project_id)?;
+                let owner: Option<String> = conn.query_row(
+                    "SELECT name FROM sessions WHERE project_id = ?1 AND worktree = ?2 AND state != 'closed'",
+                    rusqlite::params![project.id, want], |r| r.get(0)).ok();
+                Ok((project, owner))
+            })?;
+            if let Some(name) = owner {
+                return Err(BusError::conflict("worktree.owned", format!("session {name} owns {want}")).with_hint("session.close it first"));
+            }
+            let freed = worktree::remove(Path::new(&project.path), Path::new(&want), p.purge_build.unwrap_or(true))
+                .map_err(|e| BusError::conflict("worktree.remove_failed", e.to_string()))?;
+            Ok((project.id, freed))
+        },
+        |ctx: &mut Ctx, _p, (project_id, freed): (relay_bus::types::Id, u64)| {
+            ctx.set_project(project_id);
+            ctx.emit("worktree.changed", json!({ "project_id": project_id }));
+            Ok(FreedOut { freed_mb: freed as f64 / (1024.0 * 1024.0) })
+        },
+    );
     e.register_unlocked::<WorktreeDisk>(|ctx, p| {
         let project = ctx.read(|conn| get_project(conn, p.project_id))?;
         let wts = worktree::list_with_dirty(Path::new(&project.path), false)
@@ -239,8 +277,21 @@ pub fn register(e: &mut Engine) {
     e.register_unlocked::<DiffFileOp>(|ctx, p| {
         let (_project, root) = resolve_root_unlocked(ctx, p.project_id, p.worktree.as_deref())?;
         validate_path(&p.path)?;
+        // The reply carries both sides and the diff on one line; stop at the editor's limit
+        // before reading, rather than build a reply larger than a client can read.
+        let size = std::fs::metadata(root.join(&p.path)).map_or(0, |m| m.len());
+        if size > DIFF_FILE_MAX as u64 {
+            return Err(diff_too_large());
+        }
         let old = revision_text(&root, p.base.as_deref().unwrap_or("HEAD"), &p.path)?;
         let new = working_text(&root, &p.path)?;
+        if old.len() + new.len() > DIFF_FILE_MAX {
+            return Err(diff_too_large());
+        }
+        // Same test git.diff uses for its `binary` flag.
+        if old.contains('\0') || new.contains('\0') {
+            return Err(BusError::refused("git.diff_binary", "This file is binary; there is no text diff to show."));
+        }
         let hunks = if old == new {
             Vec::new()
         } else {
@@ -346,8 +397,10 @@ pub fn register(e: &mut Engine) {
         let remote_branches = remote_branches(&repo, &platform, &branches)?;
         Ok(BranchesOut { current, branches, remote_branches })
     });
-    e.register::<BranchCreate>(|ctx: &mut Ctx, p| {
-        let (project, root) = resolve_root(ctx, p.project_id, p.worktree.as_deref())?;
+    // `git switch -c <name> <start>` checks out whatever differs from the start point, through
+    // any LFS or clean/smudge filters: never under the store lock (D149).
+    e.register_staged::<BranchCreate, _>(|ctx, p| {
+        let (project, root) = resolve_root_unlocked(ctx, p.project_id, p.worktree.as_deref())?;
         let name = validate_branch_name(&root, &p.name)?;
         let repo = gix::open(&root).map_err(gix_err("git.open_failed"))?;
         let full_name = format!("refs/heads/{name}");
@@ -378,6 +431,8 @@ pub fn register(e: &mut Engine) {
         worktree::git_mutate(&root, &args).map_err(git_mutation("git.branch_create_failed"))?;
         let repo = gix::open(&root).map_err(gix_err("git.open_failed"))?;
         let head = repo.head_id().map_err(gix_err("git.head"))?.to_string();
+        Ok((project, root, name, head))
+    }, |ctx: &mut Ctx, _p, (project, root, name, head)| {
         changed(ctx, project.id, &root);
         Ok(BranchCreateOut {
             name,
@@ -446,8 +501,14 @@ pub fn register(e: &mut Engine) {
             Ok(BranchSwitchOut { branch, created })
         },
     );
-    e.register::<BranchDelete>(|ctx: &mut Ctx, p| {
-        let project = get_project(ctx.tx(), p.project_id)?;
+    // Deciding "merged" walks the base branch's history, and listing worktrees opens each:
+    // with the store unlocked, as `git.branches` already does (D149).
+    e.register_staged::<BranchDelete, _>(|ctx, p| {
+        let (project, owners) = ctx.read(|conn| {
+            let project = get_project(conn, p.project_id)?;
+            let owners = branch_owners(conn, project.id)?;
+            Ok((project, owners))
+        })?;
         let root = Path::new(&project.path);
         let name = validate_branch_name(root, &p.name)?;
         if name == project.base_branch {
@@ -456,7 +517,7 @@ pub fn register(e: &mut Engine) {
                 format!("cannot delete the base branch {name}"),
             ));
         }
-        let branches = branches_for(ctx.tx(), &project)?;
+        let branches = branches_with(&project, &owners)?;
         let branch = branches
             .branches
             .iter()
@@ -488,11 +549,15 @@ pub fn register(e: &mut Engine) {
         }
         worktree::git_mutate(root, &["branch", "-d", &name])
             .map_err(git_mutation("git.branch_delete_failed"))?;
-        changed(ctx, project.id, root);
+        Ok(project)
+    }, |ctx: &mut Ctx, _p, project| {
+        changed(ctx, project.id, Path::new(&project.path));
         Ok(relay_bus::Empty {})
     });
-    e.register::<Stage>(|ctx: &mut Ctx, p| {
-        let (project, root) = resolve_root(ctx, p.project_id, p.worktree.as_deref())?;
+    // `git add` runs clean filters and hashes every file it stages (a multi-GB asset, through
+    // LFS); `git reset` rewrites the index. Neither needs the store (D149).
+    e.register_staged::<Stage, _>(|ctx, p| {
+        let (project, root) = resolve_root_unlocked(ctx, p.project_id, p.worktree.as_deref())?;
         if p.paths.is_empty() {
             return Err(BusError::invalid(
                 "git.paths",
@@ -505,11 +570,13 @@ pub fn register(e: &mut Engine) {
         let mut args = vec!["add", "--"];
         args.extend(p.paths.iter().map(String::as_str));
         worktree::git_mutate(&root, &args).map_err(git_mutation("git.stage_failed"))?;
+        Ok((project, root))
+    }, |ctx: &mut Ctx, _p, (project, root)| {
         changed(ctx, project.id, &root);
         Ok(relay_bus::Empty {})
     });
-    e.register::<Unstage>(|ctx: &mut Ctx, p| {
-        let (project, root) = resolve_root(ctx, p.project_id, p.worktree.as_deref())?;
+    e.register_staged::<Unstage, _>(|ctx, p| {
+        let (project, root) = resolve_root_unlocked(ctx, p.project_id, p.worktree.as_deref())?;
         if p.paths.is_empty() {
             return Err(BusError::invalid(
                 "git.paths",
@@ -529,6 +596,8 @@ pub fn register(e: &mut Engine) {
         };
         args.extend(p.paths.iter().map(String::as_str));
         worktree::git_mutate(&root, &args).map_err(git_mutation("git.unstage_failed"))?;
+        Ok((project, root))
+    }, |ctx: &mut Ctx, _p, (project, root)| {
         changed(ctx, project.id, &root);
         Ok(relay_bus::Empty {})
     });
@@ -559,9 +628,12 @@ pub fn register(e: &mut Engine) {
             crate::hooks::run_user_pre_commit(Path::new(&project.path), &root)
                 .map_err(|error| BusError::conflict("git.pre_commit_failed", error.to_string()))?;
             let numstat = staged_numstat(&root)?;
-            Ok((project, root, numstat))
+            // The commit object itself — and a signing prompt, if commit.gpgSign asks for one —
+            // is made here too. The transaction gates exactly that object and publishes it.
+            let staged = stage_commit(&root, &p.message)?;
+            Ok((project, root, numstat, staged))
         },
-        |ctx: &mut Ctx, p, (project, root, numstat)| {
+        |ctx: &mut Ctx, p, (project, root, numstat, staged)| {
             super::guardrail::enforce(
                 ctx,
                 project.id,
@@ -572,8 +644,29 @@ pub fn register(e: &mut Engine) {
                 Some(&numstat),
                 None,
             )?;
-            worktree::git_mutate(&root, &["commit", "--no-verify", "-m", &p.message])
-                .map_err(git_mutation("git.commit_failed"))?;
+            match staged {
+                // A merge, cherry-pick, revert or rebase in progress has state only `git commit`
+                // knows how to finish; those stay the slow path they always were.
+                StagedCommit::InProgress => {
+                    worktree::git_mutate(&root, &["commit", "--no-verify", "-m", &p.message])
+                        .map_err(git_mutation("git.commit_failed"))?;
+                }
+                StagedCommit::Object { sha, parent, subject } => {
+                    // Compare-and-swap: the gate and its grants judged this object against this
+                    // parent, so it lands only if the branch has not moved since.
+                    let reflog = match parent {
+                        Some(_) => format!("commit: {subject}"),
+                        None => format!("commit (initial): {subject}"),
+                    };
+                    worktree::git_mutate(&root, &["update-ref", "-m", &reflog, "HEAD", &sha, parent.as_deref().unwrap_or("")])
+                        .map_err(|error| BusError::conflict(
+                            "git.commit_raced",
+                            format!("the branch moved while this commit was being made; nothing was committed ({error})"),
+                        ))?;
+                    let hook_root = root.clone();
+                    ctx.after_commit(move |_| run_post_commit(hook_root));
+                }
+            }
             let repo = gix::open(&root).map_err(gix_err("git.open_failed"))?;
             let sha = repo.head_id().map_err(gix_err("git.head"))?.to_string();
             changed(ctx, project.id, &root);
@@ -619,6 +712,7 @@ pub fn register(e: &mut Engine) {
                 vec!["push"]
             };
             worktree::git_mutate(&root, &args).map_err(git_mutation("git.push_failed"))?;
+            forget_prs(Path::new(&project.path));
             Ok((project, root))
         },
         |ctx: &mut Ctx, _p, (project, root)| {
@@ -628,8 +722,15 @@ pub fn register(e: &mut Engine) {
     );
     e.register_unlocked::<PrList>(|ctx, p| {
         let project = ctx.read(|conn| get_project(conn, p.project_id))?;
+        let repo = Path::new(&project.path);
+        if !p.refresh.unwrap_or(false) {
+            if let Some(listed) = cached_prs(repo) {
+                return Ok(listed);
+            }
+        }
         let gh = crate::github::gh_path()?;
-        let listed = list_pull_requests(&gh, Path::new(&project.path))?;
+        let listed = list_pull_requests(&gh, repo)?;
+        remember_prs(repo, &listed);
         // A PR merged for a branch a closed session left behind: clean that branch up now
         // rather than at the next sweep (branch_cleanup).
         let merged: Vec<String> = listed.pull_requests.iter()
@@ -639,6 +740,12 @@ pub fn register(e: &mut Engine) {
                 let (candidates, _) = crate::branch_cleanup::candidates(conn, Some(project.id), Some(&merged))?;
                 Ok(candidates.into_iter().map(|candidate| candidate.branch).collect())
             })?;
+            // Closed rows keep their branch name forever; only a branch that still exists is
+            // anything to clean up, or every listing would start another cleanup for it.
+            let local = gix::open(repo).ok();
+            let leftover: Vec<String> = leftover.into_iter()
+                .filter(|branch| local.as_ref().is_some_and(|repo| repo.find_reference(format!("refs/heads/{branch}").as_str()).is_ok()))
+                .collect();
             if !leftover.is_empty() && ctx.engine().instance != crate::Instance::Test {
                 let project_id = project.id;
                 ctx.after_commit(move |engine| crate::branch_cleanup::after_merged_prs(engine, project_id, leftover));
@@ -667,36 +774,48 @@ pub fn register(e: &mut Engine) {
             Ok(BranchCleanupOut { branches: rows })
         },
     );
-    e.register::<PrOpen>(|ctx: &mut Ctx, p| {
-        let (project, root) = resolve_root(ctx, p.project_id, p.worktree.as_deref())?;
-        let gh = crate::github::gh_path()?;
-        let mut cmd = std::process::Command::new(gh);
-        cmd.current_dir(&root).args(["pr", "create"]);
-        if let Some(title) = &p.title {
-            cmd.args(["--title", title]);
-        }
-        if let Some(body) = &p.body {
-            cmd.args(["--body", body]);
-        } else {
-            cmd.arg("--fill");
-        }
-        let out = cmd
-            .output()
-            .map_err(|e| BusError::unavailable("git.gh_unavailable", e.to_string()))?;
-        if !out.status.success() {
-            return Err(BusError::conflict(
-                "git.pr_failed",
-                String::from_utf8_lossy(&out.stderr).trim().to_string(),
-            ));
-        }
-        changed(ctx, project.id, &root);
-        Ok(PrOpenOut {
-            url: String::from_utf8_lossy(&out.stdout).trim().to_string(),
-        })
-    });
-    e.register::<CleanMerged>(|ctx: &mut Ctx, p| {
-        let project = get_project(ctx.tx(), p.project_id)?;
-        let branches = branches_for(ctx.tx(), &project)?;
+    // `gh pr create` is GitHub round trips: never under the store lock, never unbounded.
+    e.register_staged::<PrOpen, _>(
+        |ctx, p| {
+            let (project, root) = resolve_root_unlocked(ctx, p.project_id, p.worktree.as_deref())?;
+            let gh = crate::github::gh_path()?;
+            let mut cmd = std::process::Command::new(gh);
+            cmd.current_dir(&root).env("GH_PROMPT_DISABLED", "1").args(["pr", "create"]);
+            if let Some(title) = &p.title {
+                cmd.args(["--title", title]);
+            }
+            if let Some(body) = &p.body {
+                cmd.args(["--body", body]);
+            } else {
+                cmd.arg("--fill");
+            }
+            let out = crate::proc::output_with_timeout(&mut cmd, PR_OPEN_TIMEOUT)
+                .map_err(|e| BusError::unavailable("git.gh_unavailable", e.to_string()))?
+                .ok_or_else(|| BusError::unavailable(
+                    "git.pr_timeout",
+                    format!("gh did not finish within {}s; the pull request may or may not have been opened", PR_OPEN_TIMEOUT.as_secs()),
+                ).with_hint("check GitHub, or retry: gh refuses a second pull request for the same branch"))?;
+            forget_prs(Path::new(&project.path));
+            if !out.status.success() {
+                return Err(BusError::conflict(
+                    "git.pr_failed",
+                    String::from_utf8_lossy(&out.stderr).trim().to_string(),
+                ));
+            }
+            Ok((project, root, String::from_utf8_lossy(&out.stdout).trim().to_string()))
+        },
+        |ctx: &mut Ctx, _p, (project, root, url)| {
+            changed(ctx, project.id, &root);
+            Ok(PrOpenOut { url })
+        },
+    );
+    e.register_staged::<CleanMerged, _>(|ctx, p| {
+        let (project, owners) = ctx.read(|conn| {
+            let project = get_project(conn, p.project_id)?;
+            let owners = branch_owners(conn, project.id)?;
+            Ok((project, owners))
+        })?;
+        let branches = branches_with(&project, &owners)?;
         let checked_out = worktree::list_with_dirty(Path::new(&project.path), false)
             .map_err(|error| BusError::unavailable("worktree.list_failed", error.to_string()))?;
         let candidates: Vec<String> = branches
@@ -717,6 +836,8 @@ pub fn register(e: &mut Engine) {
                     .map_err(git_mutation("git.branch_delete_failed"))?;
             }
         }
+        Ok((project, candidates))
+    }, |ctx: &mut Ctx, _p, (project, candidates)| {
         changed(ctx, project.id, Path::new(&project.path));
         Ok(CleanMergedOut {
             deleted: candidates,
@@ -748,26 +869,87 @@ pub fn status_badges(root: &Path) -> Result<HashMap<String, String>, BusError> {
         .collect())
 }
 
+/// What `git.commit`'s unlocked phase prepared.
+enum StagedCommit {
+    /// A commit object for the staged tree, not yet on any branch.
+    Object { sha: String, parent: Option<String>, subject: String },
+    /// A merge, cherry-pick, revert or rebase is in progress: `git commit` must conclude it.
+    InProgress,
+}
+
+/// Build the commit `git commit -m message` would make, without moving any ref.
+fn stage_commit(root: &Path, message: &str) -> Result<StagedCommit, BusError> {
+    let repo = gix::open(root).map_err(gix_err("git.open_failed"))?;
+    // Per-worktree state: a linked checkout's own git dir, not the shared one.
+    let git_dir = repo.path().to_path_buf();
+    if ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "sequencer", "rebase-merge", "rebase-apply"]
+        .iter()
+        .any(|name| git_dir.join(name).exists())
+    {
+        return Ok(StagedCommit::InProgress);
+    }
+    let message = clean_message(message);
+    if message.is_empty() {
+        return Err(BusError::invalid("git.message", "commit message cannot be empty"));
+    }
+    let tree = worktree::git_mutate(root, &["write-tree"]).map_err(git_mutation("git.commit_failed"))?.trim().to_string();
+    let parent = repo.head_id().ok().map(|id| id.to_string());
+    if let Some(parent) = &parent {
+        let parent_tree = worktree::git_mutate(root, &["rev-parse", &format!("{parent}^{{tree}}")])
+            .map_err(git_mutation("git.commit_failed"))?;
+        if parent_tree.trim() == tree {
+            return Err(BusError::conflict("git.commit_failed", "nothing to commit: no staged changes"));
+        }
+    }
+    // `commit-tree` ignores commit.gpgSign, so honour it here the way `git commit` would.
+    let sign = worktree::git_mutate(root, &["config", "--bool", "--get", "commit.gpgsign"])
+        .is_ok_and(|value| value.trim() == "true");
+    let mut args = vec!["commit-tree", tree.as_str()];
+    if let Some(parent) = &parent {
+        args.extend(["-p", parent.as_str()]);
+    }
+    if sign {
+        args.push("-S");
+    }
+    args.extend(["-m", message.as_str()]);
+    let sha = worktree::git_mutate(root, &args).map_err(git_mutation("git.commit_failed"))?.trim().to_string();
+    let subject = message.lines().next().unwrap_or_default().to_string();
+    Ok(StagedCommit::Object { sha, parent, subject })
+}
+
+/// `git commit -m`'s default cleanup: trailing whitespace off every line, runs of blank lines
+/// collapsed to one, and none at either end.
+fn clean_message(message: &str) -> String {
+    let mut lines: Vec<&str> = Vec::new();
+    for line in message.lines().map(str::trim_end) {
+        if line.is_empty() && lines.last().is_none_or(|last| last.is_empty()) {
+            continue;
+        }
+        lines.push(line);
+    }
+    while lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
+/// `git commit` runs post-commit itself; a commit published with `update-ref` runs it here,
+/// after the store is unlocked and on its own thread.
+fn run_post_commit(root: PathBuf) {
+    let _ = std::thread::Builder::new().name("post-commit".into()).spawn(move || {
+        let mut command = std::process::Command::new("git");
+        command.arg("-C").arg(&root).args(["hook", "run", "--ignore-missing", "post-commit"]);
+        if let Err(error) = crate::proc::output_with_timeout(&mut command, std::time::Duration::from_secs(120)) {
+            tracing::warn!(root = %root.display(), %error, "running the post-commit hook");
+        }
+    });
+}
+
 fn status_files(root: &Path) -> Result<Vec<FileStatus>, BusError> {
     worktree::status_files(root).map_err(git_mutation("git.status_failed"))
 }
 
-fn resolve_root(
-    ctx: &Ctx,
-    project_id: relay_bus::types::Id,
-    requested: Option<&str>,
-) -> Result<(relay_bus::types::Project, PathBuf), BusError> {
-    let (project, chosen) = crate::handlers::file::root_choice(
-        ctx.tx(),
-        ctx.actor_session_id(),
-        project_id,
-        requested,
-    )?;
-    let chosen = crate::handlers::file::root_verify(&project, chosen, "git.worktree")?;
-    Ok((project, chosen))
-}
-
-/// [`resolve_root`] for the unlocked query context: one short read for the project row and the
+/// The project and the checkout a git op means: one short read for the project row and the
 /// session's worktree, then `git worktree list` with the store lock released (D144).
 fn resolve_root_unlocked(
     ctx: &Unlocked,
@@ -801,6 +983,14 @@ fn validate_path(path: &str) -> Result<(), BusError> {
     } else {
         Ok(())
     }
+}
+
+/// The largest combined old + new text git.diff.file returns: the desktop editor's limit,
+/// and well inside every client's 2 MiB line.
+const DIFF_FILE_MAX: usize = 1024 * 1024;
+
+fn diff_too_large() -> BusError {
+    BusError::refused("git.diff_too_large", "This diff is larger than the 1 MiB editor limit.")
 }
 
 fn revision_text(root: &Path, revision: &str, path: &str) -> Result<String, BusError> {
@@ -1446,9 +1636,28 @@ fn gix_err<E: std::fmt::Display>(code: &'static str) -> impl Fn(E) -> BusError {
     move |e| BusError::unavailable(code, e.to_string())
 }
 
-fn branches_for(
-    tx: &Transaction,
+/// Which open session owns each branch of a project: the one store read behind a listing.
+fn branch_owners(conn: &rusqlite::Connection, project_id: relay_bus::types::Id) -> Result<HashMap<String, String>, BusError> {
+    let mut owners = HashMap::new();
+    let mut st = conn
+        .prepare_cached("SELECT branch,name FROM sessions WHERE project_id=?1 AND state!='closed'")
+        .bus()?;
+    for row in st
+        .query_map([project_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })
+        .bus()?
+    {
+        let (b, n) = row.bus()?;
+        owners.insert(b, n);
+    }
+    Ok(owners)
+}
+
+/// The branch listing, merged state included: history walks, so never under the store lock.
+fn branches_with(
     project: &relay_bus::types::Project,
+    owners: &HashMap<String, String>,
 ) -> Result<BranchesOut, BusError> {
     let mut repo = gix::open(&project.path).map_err(gix_err("git.open_failed"))?;
     // Every walk below decompresses commits; without a cache each branch paid for its own.
@@ -1463,19 +1672,6 @@ fn branches_for(
         .rev_parse_single(project.base_branch.as_str())
         .ok()
         .map(|id| id.detach());
-    let mut owners = HashMap::new();
-    let mut st = tx
-        .prepare_cached("SELECT branch,name FROM sessions WHERE project_id=?1 AND state!='closed'")
-        .bus()?;
-    for row in st
-        .query_map([project.id], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })
-        .bus()?
-    {
-        let (b, n) = row.bus()?;
-        owners.insert(b, n);
-    }
     let mut tips = Vec::new();
     let platform = repo.references().map_err(gix_err("git.branches_failed"))?;
     let refs = platform
@@ -1563,6 +1759,26 @@ mod tests {
         )
         .unwrap();
         assert!(list_pull_requests(&gh, dir.path()).is_err());
+    }
+
+    #[test]
+    fn commit_messages_are_cleaned_like_git_commit_m() {
+        assert_eq!(clean_message("\n\nSubject  \n\n\n\nBody line \t\n\n"), "Subject\n\nBody line");
+        assert_eq!(clean_message("one"), "one");
+        assert_eq!(clean_message(" \n \n"), "");
+    }
+
+    #[test]
+    fn pull_request_listings_are_reused_until_a_push_or_new_pr() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        assert!(cached_prs(repo).is_none());
+        let listed = PrListOut { pull_requests: Vec::new(), complete: true };
+        remember_prs(repo, &listed);
+        assert_eq!(cached_prs(repo), Some(listed));
+        assert!(cached_prs(&repo.join("other")).is_none(), "a listing answers only its own repository");
+        forget_prs(repo);
+        assert!(cached_prs(repo).is_none());
     }
 
     fn git(root: &Path, args: &[&str]) -> String {

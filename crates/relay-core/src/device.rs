@@ -344,11 +344,17 @@ struct LogBuffer {
     lines: VecDeque<LogLine>,
 }
 
+/// How long a stopped run's process group has to exit on SIGTERM before it is SIGKILLed.
+const RUN_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
 #[derive(Debug)]
 pub struct RunRuntime {
     pub id: Id,
     stop: AtomicBool,
-    child: Mutex<Option<Child>>,
+    /// The running child, and whether it leads its own process group. A run command is a
+    /// shell (`fish -lc`) whose real work — the Gradle client, `adb install` — runs in its
+    /// children, so stopping it has to reach the whole group, not just the shell.
+    child: Mutex<Option<(Child, bool)>>,
     buffer: Mutex<LogBuffer>,
     tx: broadcast::Sender<LogLine>,
 }
@@ -370,11 +376,26 @@ impl RunRuntime {
     pub fn stopped(&self) -> bool {
         self.stop.load(Ordering::Relaxed)
     }
+    /// Track a child that is a single process (`adb logcat`).
     pub fn set_child(&self, child: Child) {
-        *self.child.lock().unwrap() = Some(child);
+        self.track(child, false);
+    }
+    /// Track a child spawned with `process_group(0)`: stopping signals its whole group.
+    pub fn set_group_child(&self, child: Child) {
+        self.track(child, true);
+    }
+    fn track(&self, child: Child, group: bool) {
+        let mut slot = self.child.lock().unwrap();
+        *slot = Some((child, group));
+        // A stop that landed before the child existed found nothing to signal.
+        if self.stopped() {
+            if let Some((child, group)) = slot.as_mut() {
+                terminate(child, *group);
+            }
+        }
     }
     pub fn take_child(&self) -> Option<Child> {
-        self.child.lock().unwrap().take()
+        self.child.lock().unwrap().take().map(|(child, _)| child)
     }
     pub fn push(&self, line: impl Into<String>) {
         if self.stopped() {
@@ -400,17 +421,75 @@ impl RunRuntime {
         let state = self.buffer.lock().unwrap();
         (state.seq, state.lines.iter().cloned().collect(), rx)
     }
+    /// Stop the run. Never waits: `device.run.stop` calls this with the store locked, so the
+    /// group's SIGTERM grace runs out on its own thread. The worker reaps the child.
     pub fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
-        if let Some(child) = self.child.lock().unwrap().as_mut() {
-            let _ = child.kill();
+        if let Some((child, group)) = self.child.lock().unwrap().as_mut() {
+            terminate(child, *group);
         }
     }
+}
+
+fn terminate(child: &mut Child, group: bool) {
+    if !group {
+        let _ = child.kill();
+        return;
+    }
+    let pgid = child.id() as i32;
+    unsafe { libc::kill(-pgid, libc::SIGTERM); }
+    let _ = std::thread::Builder::new().name("run-stop".into()).spawn(move || {
+        std::thread::sleep(RUN_STOP_GRACE);
+        unsafe { libc::kill(-pgid, libc::SIGKILL); }
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stopping_a_group_child_ends_its_grandchildren_too() {
+        use std::os::unix::process::CommandExt;
+        let runtime = RunRuntime::new(1);
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("grandchild");
+        // The shell forks `sleep` and waits on it, as fish does with `./gradlew`.
+        let child = std::process::Command::new("sh")
+            .args(["-c", &format!("sleep 30 & echo $! > {}; wait", pidfile.display())])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        runtime.set_group_child(child);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let grandchild = loop {
+            if let Some(pid) = std::fs::read_to_string(&pidfile).ok().and_then(|text| text.trim().parse::<i32>().ok()) {
+                break pid;
+            }
+            assert!(std::time::Instant::now() < deadline, "the shell never started its child");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        runtime.stop();
+        let _ = runtime.take_child().unwrap().wait();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while unsafe { libc::kill(grandchild, 0) } == 0 {
+            // Reaped by init once orphaned; until then a zombie still answers kill(0).
+            let zombie = std::fs::read_to_string(format!("/proc/{grandchild}/stat")).map(|s| s.contains(") Z ")).unwrap_or(true);
+            if zombie { break; }
+            assert!(std::time::Instant::now() < deadline, "the grandchild outlived the stop");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_child_set_after_stop_is_stopped_at_once() {
+        let runtime = RunRuntime::new(1);
+        runtime.stop();
+        let child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        runtime.set_child(child);
+        let status = runtime.take_child().unwrap().wait().unwrap();
+        assert!(!status.success());
+    }
 
     #[test]
     fn run_history_keeps_only_the_recent_tail() {

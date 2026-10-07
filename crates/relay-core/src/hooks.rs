@@ -79,23 +79,26 @@ pub fn install_git(
         &["config", "--worktree", "--get", "core.hooksPath"],
     );
     let relay_hooks = repo.join(".relay").join("hooks");
-    let previous_dir = configured
-        .map(PathBuf::from)
-        .and_then(|configured| {
+    let previous_dir = match configured.map(PathBuf::from) {
+        Some(configured) => {
             let absolute = if configured.is_absolute() {
                 configured.clone()
             } else {
                 worktree.join(&configured)
             };
             if absolute.starts_with(&relay_hooks) {
+                // A Relay dir with no record of what it replaced (deleted under a live
+                // hooksPath) chains to nothing: `rev-parse --git-path hooks` would answer with
+                // that same dead dir, and the user's own hook would drop out of the chain.
                 fs::read_to_string(absolute.join(PREVIOUS_HOOKS_PATH))
                     .ok()
                     .map(|path| PathBuf::from(path.trim()))
             } else {
                 Some(configured)
             }
-        })
-        .or_else(|| git_optional(worktree, &["rev-parse", "--git-path", "hooks"]).map(PathBuf::from));
+        }
+        None => git_optional(worktree, &["rev-parse", "--git-path", "hooks"]).map(PathBuf::from),
+    };
 
     let hook_dir = relay_hooks.join(session);
     fs::create_dir_all(&hook_dir)
@@ -187,6 +190,9 @@ pub fn refresh_git(repo: &Path, worktree: &Path, instance: Instance, relay: &Pat
 /// Run the user-owned pre-commit hook without re-entering Relay's generated guardrail hook.
 /// `git.commit` already executes the guardrail in-process while its transaction is open; letting
 /// the generated hook call the socket door here would wait on that same transaction forever.
+/// A person's own pre-commit hook (lint, tests) may be slow, but not unbounded.
+const USER_HOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 pub fn run_user_pre_commit(repo: &Path, worktree: &Path) -> Result<()> {
     let configured = git_optional(
         worktree,
@@ -207,10 +213,11 @@ pub fn run_user_pre_commit(repo: &Path, worktree: &Path) -> Result<()> {
     };
     let hook = user_dir.join("pre-commit");
     if !is_executable(&hook) { return Ok(()) }
-    let output = Command::new(&hook)
-        .current_dir(worktree)
-        .output()
-        .with_context(|| format!("running {}", hook.display()))?;
+    let mut command = Command::new(&hook);
+    command.current_dir(worktree);
+    let output = crate::proc::output_with_timeout(&mut command, USER_HOOK_TIMEOUT)
+        .with_context(|| format!("running {}", hook.display()))?
+        .ok_or_else(|| anyhow!("{} did not finish within {} s", hook.display(), USER_HOOK_TIMEOUT.as_secs()))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -280,8 +287,29 @@ pub fn uninstall_git_any(repo: &Path, worktree: &Path, sessions: &[String]) -> R
     Ok(())
 }
 
-/// Drop one session's generated hook directory. Best-effort: a hook directory that is still
-/// wired into a live worktree is left alone by [`uninstall_git`] before this runs.
+/// Retire `closing`'s hook directory on a checkout other sessions still use. When the
+/// checkout's `core.hooksPath` points at that directory, it is first re-pointed at a fresh one
+/// for `survivor` — [`install_git`] reads the closing directory's record of the pre-Relay hook
+/// path, so the user's own hook stays in the chain — and only then deleted. Deleting it in
+/// place silently turns the commit gate off for everyone left on the checkout.
+///
+/// Call with [`writes`] held. If the hand-over fails the directory is kept, still working.
+pub fn hand_over(repo: &Path, worktree: &Path, closing: &str, survivor: &str, instance: Instance, relay: &Path) -> Result<()> {
+    let closing_dir = repo.join(".relay").join("hooks").join(closing);
+    if worktree.exists() {
+        let active = git_optional(worktree, &["config", "--worktree", "--get", "core.hooksPath"])
+            .map(PathBuf::from)
+            .map(|path| if path.is_absolute() { path } else { worktree.join(path) });
+        if active.as_deref() == Some(closing_dir.as_path()) {
+            install_git(repo, worktree, survivor, instance, relay)?;
+        }
+    }
+    remove_hook_dir(repo, closing);
+    Ok(())
+}
+
+/// Drop one session's generated hook directory. Best-effort, and only for a directory no
+/// checkout points at: [`uninstall_git`] or [`hand_over`] re-points the checkout first.
 pub fn remove_hook_dir(repo: &Path, session: &str) {
     let _ = fs::remove_dir_all(repo.join(".relay").join("hooks").join(session));
 }

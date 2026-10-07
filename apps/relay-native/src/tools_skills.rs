@@ -23,6 +23,9 @@ static SPEC: Spec = Spec {
     placeholder: "Search skills by name, description or source",
     filters: &["All", "Enabled", "Disabled"],
     list_op: "skill.list",
+    // Bodies are cut to their opening, which holds the description; the detail and the
+    // editor fetch the whole body with skill.get.
+    list_payload: || json!({"summary": true}),
     list_key: "skills",
     enable_op: "skill.enable",
     id_key: "skill_id",
@@ -49,6 +52,23 @@ static SPEC: Spec = Spec {
     empty,
     setup: Some(setup),
 };
+
+/// How much of a body `skill.list {summary: true}` keeps (the engine's SKILL_SUMMARY_BYTES).
+const SUMMARY_BYTES: usize = 4096;
+
+/// Whether a listed body may have been cut: a char boundary can land up to 3 bytes short.
+fn maybe_cut(skill: &Value) -> bool {
+    text(skill, "body").len() + 4 > SUMMARY_BYTES
+}
+
+/// The skill with its whole body: the listed row when it cannot have been cut, else skill.get.
+async fn whole(ui: &Rc<Ui>, skill: &Value) -> Result<Value, Error> {
+    if maybe_cut(skill) {
+        ui.call("skill.get", json!({"skill_id": skill["id"]})).await
+    } else {
+        Ok(skill.clone())
+    }
+}
 
 /// The `description:` line of the SKILL.md frontmatter, or the first line of prose.
 fn description(skill: &Value) -> String {
@@ -185,10 +205,19 @@ fn detail(ui: &Rc<Ui>, market: &Rc<Market>, skill: &Value, parent: &gtk::Box) {
         let edit_key = button("Edit", "");
         let weak = Rc::downgrade(ui);
         let editing = skill.clone();
-        edit_key.connect_clicked(move |_| {
-            if let Some(ui) = weak.upgrade() {
-                edit(&ui, Some(editing.clone()));
-            }
+        edit_key.connect_clicked(move |key| {
+            let Some(ui) = weak.upgrade() else { return };
+            // The editor saves what it shows, so it opens only on the whole body.
+            let (editing, key) = (editing.clone(), key.clone());
+            key.set_sensitive(false);
+            glib::spawn_future_local(async move {
+                let result = whole(&ui, &editing).await;
+                key.set_sensitive(true);
+                match result {
+                    Ok(skill) => edit(&ui, Some(skill)),
+                    Err(error) => ui.show_error(&error.to_string()),
+                }
+            });
         });
         bar.append(&edit_key);
     }
@@ -238,6 +267,18 @@ fn detail(ui: &Rc<Ui>, market: &Rc<Market>, skill: &Value, parent: &gtk::Box) {
 
     let instructions = gtk::Box::new(gtk::Orientation::Vertical, 0);
     instructions.append(&market::markdown(ui, text(skill, "body")));
+    if maybe_cut(skill) {
+        // Show the opening at once, then the whole body when it arrives.
+        let (ui, skill, instructions) = (ui.clone(), skill.clone(), instructions.downgrade());
+        glib::spawn_future_local(async move {
+            let Ok(full) = whole(&ui, &skill).await else { return };
+            let Some(instructions) = instructions.upgrade() else { return };
+            while let Some(child) = instructions.first_child() {
+                instructions.remove(&child);
+            }
+            instructions.append(&market::markdown(&ui, text(&full, "body")));
+        });
+    }
     let skill_id = skill["id"].clone();
     let switch_name = move |project: i64| format!("skill-{skill_id}-in-{project}");
     parent.append(&market::tabs(

@@ -86,6 +86,12 @@ fn suggested_workspace_from(cwd: &Path) -> PathBuf {
     cwd.to_path_buf()
 }
 
+/// A clone in progress lives in `<workspace>/.relay-clone-<uuid>` until it is complete.
+const CLONE_SCRATCH: &str = ".relay-clone-";
+/// Just under the desktop client's 30-minute allowance for this op, so the engine reports the
+/// timeout rather than the client giving up on a clone that is still running.
+const CLONE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(29 * 60);
+
 fn name_of(path: &Path) -> String {
     path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| path.display().to_string())
 }
@@ -225,27 +231,65 @@ pub fn register(e: &mut Engine) {
         ctx.emit("project.changed", serde_json::to_value(&pr).bus()?);
         Ok(pr)
     });
-    e.register::<ProjectClone>(|ctx: &mut Ctx, p| {
-        let workspace = get_workspace(ctx.tx(), p.workspace_id)?;
-        let destination = clone_destination(&workspace.path, &p.url, p.dest.as_deref())?;
-        if destination.exists() {
-            return Err(BusError::conflict("project.clone_destination", format!("{} already exists", destination.display())));
-        }
-        let output = Command::new("git").current_dir(&workspace.path).arg("clone").arg("--").arg(&p.url).arg(&destination).output()
-            .map_err(|error| BusError::unavailable("project.git_missing", format!("cannot start git: {error}")))?;
-        if !output.status.success() {
-            return Err(BusError::unavailable("project.clone_failed", String::from_utf8_lossy(&output.stderr).trim().to_string()));
-        }
-        let added = ctx.invoke_registered("project.add", json!({"workspace_id":workspace.id,"path":destination}))
-            .and_then(|value| serde_json::from_value::<Project>(value).map_err(|error| BusError::internal(error.to_string())));
-        match added {
-            Ok(project) => Ok(ProjectCloneOut { project }),
-            Err(error) => {
-                let _ = fs::remove_dir_all(&destination);
-                Err(error)
+    // The clone is network work of unbounded length, so it runs before the transaction opens
+    // (D149) and under a deadline (D144). It lands in a scratch directory beside the
+    // destination and is renamed into place in `finish`, so a concurrent clone to the same name
+    // can never be deleted by this one's cleanup.
+    e.register_staged::<ProjectClone, PathBuf>(
+        |ctx, p| {
+            let workspace = ctx.read(|conn| get_workspace(conn, p.workspace_id))?;
+            let destination = clone_destination(&workspace.path, &p.url, p.dest.as_deref())?;
+            if destination.exists() {
+                return Err(BusError::conflict("project.clone_destination", format!("{} already exists", destination.display())));
             }
-        }
-    });
+            let scratch = Path::new(&workspace.path).join(format!("{CLONE_SCRATCH}{}", uuid::Uuid::new_v4().simple()));
+            let mut command = Command::new("git");
+            command.current_dir(&workspace.path);
+            crate::proc::quiet_network_git(&mut command);
+            command.arg("clone").arg("--").arg(&p.url).arg(&scratch);
+            let output = crate::proc::output_with_timeout(&mut command, CLONE_TIMEOUT);
+            let failed = |error: BusError| {
+                let _ = fs::remove_dir_all(&scratch);
+                Err(error)
+            };
+            match output {
+                Err(error) => failed(BusError::unavailable("project.git_missing", format!("cannot start git: {error}"))),
+                Ok(None) => failed(BusError::unavailable("project.clone_timeout",
+                    format!("git clone did not finish within {} minutes", CLONE_TIMEOUT.as_secs() / 60))),
+                Ok(Some(output)) if !output.status.success() => failed(BusError::unavailable(
+                    "project.clone_failed", String::from_utf8_lossy(&output.stderr).trim().to_string())),
+                Ok(Some(_)) => Ok(scratch),
+            }
+        },
+        |ctx: &mut Ctx, p, scratch| {
+            let discard = |error: BusError| {
+                let _ = fs::remove_dir_all(&scratch);
+                Err(error)
+            };
+            let found = get_workspace(ctx.tx(), p.workspace_id)
+                .and_then(|workspace| Ok((clone_destination(&workspace.path, &p.url, p.dest.as_deref())?, workspace)));
+            let (destination, workspace) = match found {
+                Ok(found) => found,
+                Err(error) => return discard(error),
+            };
+            if destination.exists() {
+                return discard(BusError::conflict("project.clone_destination", format!("{} already exists", destination.display())));
+            }
+            if let Err(error) = fs::rename(&scratch, &destination) {
+                return discard(BusError::unavailable("project.clone_failed", format!("moving the clone into place: {error}")));
+            }
+            let added = ctx.invoke_registered("project.add", json!({"workspace_id":workspace.id,"path":destination}))
+                .and_then(|value| serde_json::from_value::<Project>(value).map_err(|error| BusError::internal(error.to_string())));
+            match added {
+                Ok(project) => Ok(ProjectCloneOut { project }),
+                Err(error) => {
+                    // This request put it there a moment ago; nothing else can own it yet.
+                    let _ = fs::remove_dir_all(&destination);
+                    Err(error)
+                }
+            }
+        },
+    );
     e.register::<ProjectList>(|ctx, p| {
         let projects = match p.workspace_id {
             Some(w) => {
@@ -333,12 +377,26 @@ pub fn register(e: &mut Engine) {
             let mut doomed: Vec<PathBuf> = open.iter().map(|(_, wt)| PathBuf::from(wt)).filter(|wt| wt.starts_with(&pool)).collect();
             doomed.sort();
             doomed.dedup();
-            if !doomed.is_empty() {
+            // Integration checkouts and their branches go too: once the rows below are deleted,
+            // nothing else could ever find them again.
+            let integrations: Vec<(Id, String)> = {
+                let mut stmt = ctx.tx().prepare_cached(
+                    "SELECT id, worktree FROM integrations WHERE project_id=?1 AND worktree IS NOT NULL AND state!='discarded'",
+                ).bus()?;
+                let rows = stmt.query_map([pr.id], |r| Ok((r.get(0)?, r.get(1)?))).bus()?.collect::<rusqlite::Result<Vec<_>>>();
+                rows.bus()?
+            };
+            if !doomed.is_empty() || !integrations.is_empty() {
                 let project_id = pr.id;
                 ctx.after_commit(move |engine| {
                     for wt in &doomed {
                         if let Err(error) = crate::worktree::remove(&repo, wt, true) {
                             tracing::warn!(worktree = %wt.display(), %error, "removing a removed project's worktree");
+                        }
+                    }
+                    for (id, wt) in &integrations {
+                        if let Err(error) = super::integration::remove_checkout(&repo, Path::new(wt), *id) {
+                            tracing::warn!(worktree = %wt, %error, "removing a removed project's integration");
                         }
                     }
                     engine.emit_system("worktree.changed", json!({ "project_id": project_id }));
@@ -362,6 +420,8 @@ pub fn register(e: &mut Engine) {
             "DELETE FROM attachments WHERE task_id IN (SELECT id FROM tasks WHERE project_id=?1)",
             "DELETE FROM module_unlinked_tasks WHERE module_id IN (SELECT id FROM modules WHERE project_id=?1) OR task_id IN (SELECT id FROM tasks WHERE project_id=?1)",
             "DELETE FROM tasks WHERE project_id=?1",
+            // `task_labels` cascades with the tasks; the vocabulary itself is project-owned.
+            "DELETE FROM labels WHERE project_id=?1",
             "DELETE FROM modules WHERE project_id=?1",
             "DELETE FROM notes WHERE project_id=?1",
             "DELETE FROM notifications WHERE project_id=?1",
@@ -402,6 +462,7 @@ fn discover_repositories(root: &Path) -> Result<Vec<relay_bus::types::LocalRepo>
             if !entry.file_type()?.is_dir() || entry.file_type()?.is_symlink() { continue; }
             let name = entry.file_name();
             if matches!(name.to_str(), Some(".git" | ".relay" | "node_modules" | "target" | "build" | ".gradle")) { continue; }
+            if name.to_str().is_some_and(|name| name.starts_with(CLONE_SCRATCH)) { continue; }
             walk(&entry.path(), depth + 1, out)?;
         }
         Ok(())

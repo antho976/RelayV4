@@ -834,10 +834,17 @@ The *why* behind anything surprising. Append; never rewrite history. Reference a
   door now runs up to eight unlocked queries per connection at once and answers each by id; any
   other request waits for the queries sent before it on that connection, so a read followed by a
   write is still answered in that order. RA-015.)
-  Two constraints bind. A staged op can still be replayed from inside another transaction —
-  `guardrail.confirm` replaying a held `git.commit` — so `invoke_registered` runs the missing
-  prepare against the connection it already holds; that path costs what it cost before the split,
-  and only that path. And every store lock is now accounted for: the pipeline records queue-wait
+  Two constraints bind. A staged op can still be reached from inside another transaction —
+  `project.remove {force}` closing its sessions — so `invoke_registered` runs the missing prepare
+  against the connection it already holds; that path costs what it cost before the split.
+  `guardrail.confirm` is itself staged and runs the held op's prepare before its transaction
+  (`Unlocked::prepare_registered`), as the op's original caller; `task.dispatch` creates and
+  launches sessions as requests of their own. The audit fixes (RA-018..RA-035) staged
+  `avd.create`, `avd.boot`, `git.branch.create`, `git.branch.delete`,
+  `git.branch.clean_merged`, `git.stage`, `git.unstage`, `git.pr.open`, `worktree.remove`,
+  `integration.discard`, `project.clone`, `task.dispatch` and `guardrail.confirm`; `git.commit`
+  now also builds its commit object before the lock and publishes it with a compare-and-swap
+  `update-ref` inside it. And every store lock is now accounted for: the pipeline records queue-wait
   and hold time per op and warns past one frame's worth (16 ms), so the next op that parks on the
   lock names itself instead of being felt as "the app froze".
 - **D150 A settings read reads its own subtree.** Settings are leaf rows overlaid on defaults, and

@@ -120,6 +120,32 @@ pub fn run_with(engine: &Engine, dirty_scan: DirtyScan) -> Result<RecoveryReport
                 .push(format!("closed {changed} interrupted device run(s)"));
         }
     }
+    //    An integration the engine was merging, building or deploying, or had queued in
+    //    memory, has nothing left to drive it; a live row would also block project.remove.
+    {
+        let changed = tx.execute(
+            "UPDATE integrations SET state='failed',finished_at=COALESCE(finished_at,?1),
+             log_tail=COALESCE(log_tail,'')||'\nInterrupted: Relay stopped before this integration finished.'
+             WHERE state IN ('queued','merging','building','deploying')",
+            [&now],
+        )?;
+        if changed > 0 {
+            report
+                .fsck_fixes
+                .push(format!("closed {changed} interrupted integration(s)"));
+        }
+    }
+    //    Before review groups were keyed on group membership (RA-028), dispatching to one
+    //    agent on a shared checkout queued the task for every session there. Those rows still
+    //    hold reviews open; drop the ones whose task another group on the checkout is working.
+    {
+        let removed = drop_cross_queued(&tx)?;
+        if removed > 0 {
+            report
+                .fsck_fixes
+                .push(format!("dropped {removed} task queue row(s) left by the shared-checkout rule"));
+        }
+    }
     // 5. generated hook directories with no session behind them. Stale ones accumulate one
     //    per closed session and make `.relay/hooks` misreport the live fleet.
     {
@@ -279,4 +305,31 @@ pub fn last(conn: &rusqlite::Connection) -> Result<Option<RecoveryReport>> {
     Ok(raw
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
         .and_then(|v| serde_json::from_value(v).ok()))
+}
+
+/// Delete open `task_sessions` rows that queue a task for a session outside the review group
+/// working it on the same checkout. A row is kept unless that is certain: some other group
+/// there has the task current, and nobody in this session's group does.
+fn drop_cross_queued(tx: &rusqlite::Transaction) -> anyhow::Result<usize> {
+    let rows: Vec<(Id, Id)> = tx.prepare(
+        "SELECT ts.task_id, ts.session_id FROM task_sessions ts
+         JOIN sessions s ON s.id = ts.session_id JOIN tasks t ON t.id = ts.task_id
+         WHERE ts.completed_at IS NULL AND s.state != 'closed' AND t.deleted_at IS NULL AND t.col != 'done'
+           AND (s.task_id IS NULL OR s.task_id != ts.task_id)",
+    )?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+    let mut removed = 0;
+    for (task_id, session_id) in rows {
+        let Some(row) = crate::sessions::by_id(tx, session_id).map_err(|e| anyhow::anyhow!(e.message))? else { continue };
+        let group = crate::sessions::review_group(tx, &row.session).map_err(|e| anyhow::anyhow!(e.message))?;
+        let members: Vec<Id> = group.iter().map(|(id, _)| *id).collect();
+        let holders: Vec<Id> = tx.prepare_cached(
+            "SELECT id FROM sessions WHERE worktree = ?1 AND state != 'closed' AND task_id = ?2",
+        )?.query_map(params![row.session.worktree, task_id], |r| r.get(0))?.collect::<Result<_, _>>()?;
+        let ours = holders.iter().any(|id| members.contains(id));
+        let theirs = holders.iter().any(|id| !members.contains(id));
+        if theirs && !ours {
+            removed += tx.execute("DELETE FROM task_sessions WHERE task_id = ?1 AND session_id = ?2", params![task_id, session_id])?;
+        }
+    }
+    Ok(removed)
 }

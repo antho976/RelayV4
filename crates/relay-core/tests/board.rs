@@ -735,3 +735,107 @@ fn move_with_position_reorders_a_column_and_undo_restores_it() {
     undo_last("task.approve");
     assert_eq!(order("ready"), vec![b, c, d, a, x]);
 }
+
+/// Independent agents that share the primary checkout (every session of an Unreal-plugin
+/// project, D160) are not one review group: each one's task reaches review on its own done,
+/// and dispatching to one never queues the task for the others.
+#[test]
+fn independent_builders_on_the_primary_checkout_do_not_wait_on_each_other() {
+    let f = Fixture::new();
+    let e = &f.engine;
+    let a = ok(e, "session.create", json!({"project_id":1,"provider":"claude","worktree":"primary"}));
+    let b = ok(e, "session.create", json!({"project_id":1,"provider":"claude","worktree":"primary"}));
+    let (a, b) = (a["name"].as_str().unwrap().to_string(), b["name"].as_str().unwrap().to_string());
+    let first = f.task("A's task", json!({}));
+    let second = f.task("B's task", json!({}));
+    ok(e, "task.dispatch", json!({"task_id":first["id"],"session":a,"start":false}));
+    ok(e, "task.dispatch", json!({"task_id":second["id"],"session":b,"start":false}));
+    let mine = |name: &str| ids(&ok(e, "task.list", json!({"project_id":1,"session":name}))["tasks"].as_array().unwrap()
+        .iter().map(|t| t["id"].clone()).collect::<Value>());
+    assert_eq!(mine(&a), [first["id"].as_i64().unwrap()]);
+    assert_eq!(mine(&b), [second["id"].as_i64().unwrap()]);
+
+    let done = |name: &str| call(e, Actor::agent(name), "session.done", json!({"session":name,"summary":"done"}))
+        .into_result().unwrap_or_else(|err| panic!("session.done: {} {}", err.code, err.message));
+    done(&a);
+    assert_eq!(ok(e, "task.get", json!({"task_id":first["id"]}))["column"], "in_review");
+    assert_eq!(ok(e, "task.get", json!({"task_id":second["id"]}))["column"], "active");
+    done(&b);
+    assert_eq!(ok(e, "task.get", json!({"task_id":second["id"]}))["column"], "in_review");
+
+    // Closing either keeps the shared checkout, and is not refused for the other being there.
+    ok(e, "session.close", json!({"session":a}));
+}
+
+/// `task.dispatch {create}` fetches and checks out a new worktree: that happens in a request of
+/// its own, before the dispatch takes the store, and the launch happens after the assignment is
+/// committed — yet before the reply, so the session is already running when the caller looks.
+#[test]
+fn dispatch_with_create_starts_the_session_and_a_refused_one_leaves_nothing_behind() {
+    let f = Fixture::new();
+    let e = &f.engine;
+    let task = f.task("Ship it", json!({}));
+    let out = ok(e, "task.dispatch", json!({"task_id":task["id"],"create":{"project_id":1,"provider":"claude","role":"builder"}}));
+    let name = out["session"]["name"].as_str().unwrap();
+    let session = ok(e, "session.get", json!({"session":name}));
+    assert_eq!(session["state"], "running");
+    assert_eq!(session["task_id"], task["id"]);
+    let brief = std::fs::read_to_string(std::path::Path::new(session["worktree"].as_str().unwrap()).join(".relay/sessions").join(name).join("session-brief.md")).unwrap();
+    assert!(brief.contains("Ship it"), "the brief was written before the assignment: {brief}");
+
+    // A missing provider is refused before any session or checkout is made.
+    ok(e, "settings.set", json!({"path":"providers.codex.path","value":"/nonexistent/codex"}));
+    let before = ok(e, "session.list", json!({"project_id":1}))["sessions"].as_array().unwrap().len();
+    let other = f.task("Not today", json!({}));
+    assert_eq!(code(call(e, Actor::User, "task.dispatch",
+        json!({"task_id":other["id"],"create":{"project_id":1,"provider":"codex","role":"builder"}}))), "provider.not_installed");
+    assert_eq!(ok(e, "session.list", json!({"project_id":1}))["sessions"].as_array().unwrap().len(), before);
+    assert_eq!(ok(e, "task.get", json!({"task_id":other["id"]}))["column"], "backlog");
+    ok(e, "session.close", json!({"session":name}));
+}
+
+#[test]
+fn task_list_is_paged_and_a_summary_leaves_out_the_long_fields() {
+    let f = Fixture::new();
+    let e = &f.engine;
+    for n in 0..5 {
+        f.task(&format!("Task {n}"), json!({"body": "a long body", "changelog": "notes"}));
+    }
+    let first = ok(e, "task.list", json!({"project_id":1,"limit":2}));
+    assert_eq!(first["tasks"].as_array().unwrap().len(), 2);
+    assert_eq!(first["next_offset"], 2);
+    let last = ok(e, "task.list", json!({"project_id":1,"limit":2,"offset":4}));
+    assert_eq!(last["tasks"].as_array().unwrap().len(), 1);
+    assert!(last.get("next_offset").is_none());
+    let all = ok(e, "task.list", json!({"project_id":1}));
+    assert_eq!(all["tasks"].as_array().unwrap().len(), 5, "the default page holds a normal board");
+    let summary = ok(e, "task.list", json!({"project_id":1,"summary":true}));
+    assert!(summary["tasks"].as_array().unwrap().iter().all(|t| t["body"] == "" && t["changelog"] == "" && t["title"] != ""));
+}
+
+/// Stores written under the old rule still hold the cross-queued rows; the startup check
+/// drops the ones that are certainly another group's, and the deadlock lifts.
+#[test]
+fn startup_drops_task_rows_the_old_shared_checkout_rule_cross_queued() {
+    let f = Fixture::new();
+    let e = &f.engine;
+    let a = ok(e, "session.create", json!({"project_id":1,"provider":"claude","worktree":"primary"}));
+    let b = ok(e, "session.create", json!({"project_id":1,"provider":"claude","worktree":"primary"}));
+    let (a, b) = (a["name"].as_str().unwrap().to_string(), b["name"].as_str().unwrap().to_string());
+    let first = f.task("A's task", json!({}));
+    let second = f.task("B's task", json!({}));
+    ok(e, "task.dispatch", json!({"task_id":first["id"],"session":a,"start":false}));
+    ok(e, "task.dispatch", json!({"task_id":second["id"],"session":b,"start":false}));
+    // What the old rule left behind: each task queued for the other agent too.
+    e.store.lock().execute_batch(&format!(
+        "INSERT INTO task_sessions(task_id, session_id, ord, queue_ord)
+           SELECT {first}, id, 9, 9 FROM sessions WHERE name='{b}';
+         INSERT INTO task_sessions(task_id, session_id, ord, queue_ord)
+           SELECT {second}, id, 9, 9 FROM sessions WHERE name='{a}';",
+        first = first["id"], second = second["id"],
+    )).unwrap();
+    let report = relay_core::recovery::run(e).unwrap();
+    assert!(report.fsck_fixes.iter().any(|fix| fix.contains("dropped 2 task queue row")), "{:?}", report.fsck_fixes);
+    call(e, Actor::agent(&a), "session.done", json!({"session":a,"summary":"done"})).into_result().unwrap();
+    assert_eq!(ok(e, "task.get", json!({"task_id":first["id"]}))["column"], "in_review");
+}

@@ -49,6 +49,10 @@ pub struct GateRequest<'a> {
     pub skip_policy: Option<&'a str>,
     /// Exceptions a person granted this session. Each lifts only the rule it names.
     pub grants: Option<&'a Grants>,
+    /// A rename, move or delete rather than a write of new content (BUS.md §9.2): only the
+    /// path rules apply — where it lands, protected paths, and a shape gate on a destination
+    /// (validated against `new_text` when the caller supplies it). Never reads the file.
+    pub path_only: bool,
 }
 
 // ---------------------------------------------------------------- configuration
@@ -531,6 +535,30 @@ fn evaluate_write(cfg: &GuardrailConfig, request: &GateRequest<'_>) -> Result<De
             ));
         }
     }
+    if request.path_only {
+        if let Some(gate) = cfg.shape_gates.iter().find(|g| path_matches(&g.path, &path)) {
+            if request.skip_policy != Some("shape_gate") {
+                let Some(new_text) = request.new_text else {
+                    return Ok(hold(
+                        "shape_gate",
+                        "guardrail.shape_gate",
+                        format!("{} needs complete text for validator {}", path.display(), gate.validator),
+                        json!({"path": path, "validator": gate.validator, "reason": "new_text missing"}),
+                    ));
+                };
+                if let Err(reason) = validate_shape(gate, new_text) {
+                    return Ok(refuse_or_user_hold(
+                        request.actor,
+                        "shape_gate",
+                        "guardrail.shape_gate",
+                        format!("{} failed {}: {reason}", path.display(), gate.validator),
+                        json!({"path": path, "validator": gate.validator, "reason": reason}),
+                    ));
+                }
+            }
+        }
+        return Ok(Decision::Allow);
+    }
     let Some(new_text) = request.new_text else {
         // Edit hooks may only provide a diff. Destructive counts still work from it; shape
         // gates need complete text, so a critical path without text is held conservatively.
@@ -572,7 +600,12 @@ fn evaluate_write(cfg: &GuardrailConfig, request: &GateRequest<'_>) -> Result<De
 
     let absolute = request.worktree.join(&path);
     let old = match std::fs::metadata(&absolute) {
+        // A confirmed hold or a path grant lifts this exactly as it lifts the line counts;
+        // without that, a confirm replayed straight back into the same hold.
         Ok(meta) if meta.len() > 64 * 1024 * 1024 => {
+            if request.skip_policy == Some("destructive_write") || granted_path(request, &path) {
+                return Ok(Decision::Allow);
+            }
             return Ok(hold(
                 "destructive_write",
                 "guardrail.destructive_write",
@@ -1152,7 +1185,12 @@ fn refuse_or_user_hold(
             json!({"policy": policy, "original_code": code, "original": details}),
         )
     } else if matches!(policy, "destructive_write" | "shape_gate") {
-        hold(policy, code, message, details)
+        // Held for a person; for a destructive write the agent may also ask for the path.
+        let mut error = BusError::held(code, message).with_details(details.clone());
+        if let Some((kind, value)) = grants::suggestion(policy, &details) {
+            error = error.with_hint(grants::hint(kind, &value));
+        }
+        Decision::Hold { policy: policy.to_string(), error, details }
     } else {
         let mut error = BusError::refused(code, message);
         let mut details = details;

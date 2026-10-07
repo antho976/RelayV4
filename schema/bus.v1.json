@@ -4,7 +4,7 @@
   "title": "RELAY v4 command bus",
   "description": "Generated from crates/relay-bus by `relay schema`. Do not edit; see docs/BUS.md.",
   "version": 1,
-  "op_count": 222,
+  "op_count": 223,
   "envelope": {
     "request": {
       "$ref": "#/$defs/Request"
@@ -2862,7 +2862,7 @@
       }
     },
     "git.pr.list": {
-      "summary": "All pull request states for the project, across every page",
+      "summary": "All pull request states for the project, across every page; cached for a minute unless refresh",
       "kind": "query",
       "audit": "never",
       "undo": "none",
@@ -2874,7 +2874,7 @@
       "since": "1.0",
       "phase": 8,
       "payload": {
-        "$ref": "#/$defs/GitProjectIn"
+        "$ref": "#/$defs/GitPrListIn"
       },
       "result": {
         "$ref": "#/$defs/GitPrListOut"
@@ -3799,6 +3799,25 @@
       },
       "result": {
         "$ref": "#/$defs/SkillListOut"
+      }
+    },
+    "skill.get": {
+      "summary": "One skill with its whole body",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "executor": "core",
+      "actors": "all",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 11,
+      "payload": {
+        "$ref": "#/$defs/SkillIdIn"
+      },
+      "result": {
+        "$ref": "#/$defs/Skill"
       }
     },
     "skill.create": {
@@ -7175,6 +7194,31 @@
           "format": "int64",
           "description": "`Some(Some(id))` = children of that task, `Some(None)` = roots only, absent = every task.",
           "default": null
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "Page size, default 1000, at most 2000. Done cards sort last, so a page cut short drops\nthe oldest finished work first."
+        },
+        "offset": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "Skip this many tasks of the ordered result: the previous page's `next_offset`."
+        },
+        "summary": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Leave each task's `body` and `changelog` empty: a board needs titles, not essays."
         }
       }
     },
@@ -7186,6 +7230,15 @@
           "items": {
             "$ref": "#/$defs/Task"
           }
+        },
+        "next_offset": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "Set when more tasks match than this page holds: pass it as `offset`."
         }
       },
       "required": [
@@ -8705,6 +8758,23 @@
             "string",
             "null"
           ]
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "Page size, default 200, at most 1000."
+        },
+        "before": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "Only messages older than this message id: the previous page's `next_before`."
         }
       },
       "required": [
@@ -8718,7 +8788,20 @@
           "type": "array",
           "items": {
             "$ref": "#/$defs/Message"
-          }
+          },
+          "description": "Oldest first. Without `unread_only` this is the newest page; with it, the oldest unread."
+        },
+        "next_before": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "Set when older messages remain: pass it as `before` for the page before this one."
+        },
+        "more_unread": {
+          "type": "boolean",
+          "description": "More unread messages remain past this page (`unread_only`): ack these, then ask again."
         }
       },
       "required": [
@@ -11708,6 +11791,26 @@
         "project_id"
       ]
     },
+    "GitPrListIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "project_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "refresh": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Ask GitHub now instead of answering from the last listing (kept up to a minute, and\ndropped by `git.push` and `git.pr.open`). For an explicit refresh, not for every redraw."
+        }
+      },
+      "required": [
+        "project_id"
+      ]
+    },
     "GitPrListOut": {
       "type": "object",
       "properties": {
@@ -13370,6 +13473,13 @@
             "boolean",
             "null"
           ]
+        },
+        "summary": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Cut each body to its opening, frontmatter included, instead of the whole SKILL.md;\n`skill.get` returns one whole body."
         }
       }
     },
@@ -13441,6 +13551,19 @@
         "updated_at"
       ]
     },
+    "SkillIdIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "skill_id": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "skill_id"
+      ]
+    },
     "SkillCreateIn": {
       "type": "object",
       "additionalProperties": false,
@@ -13476,19 +13599,6 @@
             "string",
             "null"
           ]
-        }
-      },
-      "required": [
-        "skill_id"
-      ]
-    },
-    "SkillIdIn": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "skill_id": {
-          "type": "integer",
-          "format": "int64"
         }
       },
       "required": [

@@ -151,7 +151,7 @@ pub async fn run(ui: &Rc<Ui>) -> Result<(), String> {
     glib::timeout_future(Duration::from_millis(1250)).await;
     let revision = ui.editor.tree_revision.get();
     for _ in 0..20 {
-        ui.editor.invalidate(ui);
+        ui.editor.invalidate(ui, None);
     }
     glib::timeout_future(Duration::from_millis(250)).await;
     require(

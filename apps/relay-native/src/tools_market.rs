@@ -29,6 +29,7 @@ pub(crate) struct Spec {
     pub placeholder: &'static str,
     pub filters: &'static [&'static str],
     pub list_op: &'static str,
+    pub list_payload: fn() -> Value,
     pub list_key: &'static str,
     pub enable_op: &'static str,
     pub id_key: &'static str,
@@ -93,7 +94,7 @@ pub(crate) async fn refresh(ui: &Rc<Ui>, spec: &'static Spec, project: i64) {
     if !market.loaded.get() {
         market.body.set_visible_child_name("loading");
     }
-    let result = ui.call(spec.list_op, json!({})).await;
+    let result = ui.call(spec.list_op, (spec.list_payload)()).await;
     if !super::current(ui, spec.page, project, generation) {
         return;
     }

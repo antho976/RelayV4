@@ -143,7 +143,7 @@ fn label_id(tx: &Transaction, project_id: Id, name: &str, now: &str) -> Result<I
 
 /// Distance from the root, walking parents. Bounded by `TASK_DEPTH_MAX` so a cycle that
 /// somehow reached the store cannot spin here.
-fn depth_of(tx: &Transaction, task_id: Id) -> rusqlite::Result<i64> {
+fn depth_of(tx: &rusqlite::Connection, task_id: Id) -> rusqlite::Result<i64> {
     let mut depth = 0;
     let mut cursor = task_id;
     while let Some(parent) = tx
@@ -161,7 +161,7 @@ fn depth_of(tx: &Transaction, task_id: Id) -> rusqlite::Result<i64> {
     Ok(depth)
 }
 
-fn child_ids(tx: &Transaction, task_id: Id) -> Result<Vec<Id>, BusError> {
+fn child_ids(tx: &rusqlite::Connection, task_id: Id) -> Result<Vec<Id>, BusError> {
     let mut stmt = tx
         .prepare_cached(
             "SELECT id FROM tasks WHERE parent_id=?1 AND deleted_at IS NULL ORDER BY position,id",
@@ -197,7 +197,7 @@ fn subtree_height(tx: &Transaction, task_id: Id) -> Result<i64, BusError> {
 }
 
 /// Every descendant id, parents before their own children. Used for roll-up and fan-out.
-fn descendants(tx: &Transaction, task_id: Id) -> Result<Vec<Id>, BusError> {
+fn descendants(tx: &rusqlite::Connection, task_id: Id) -> Result<Vec<Id>, BusError> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::from([task_id]);
     let mut frontier = std::collections::VecDeque::from([task_id]);
@@ -226,7 +226,7 @@ fn attachment_row(row: &Row) -> rusqlite::Result<Attachment> {
 
 /// Every statement here is `prepare_cached`: a task list hydrates each row with seven of them,
 /// and compiling five of those per row was 61 % of `task.list` (PERF §1.2).
-pub(crate) fn row_task(tx: &Transaction, row: &Row) -> Result<Task, rusqlite::Error> {
+pub(crate) fn row_task(tx: &rusqlite::Connection, row: &Row) -> Result<Task, rusqlite::Error> {
     let id: Id = row.get("id")?;
     let sessions = {
         let mut stmt = tx.prepare_cached("SELECT s.name FROM task_sessions ts JOIN sessions s ON s.id=ts.session_id WHERE ts.task_id=?1 ORDER BY ts.ord,ts.session_id")?;
@@ -341,7 +341,7 @@ pub(crate) fn row_task(tx: &Transaction, row: &Row) -> Result<Task, rusqlite::Er
     })
 }
 
-pub(crate) fn get_task(tx: &Transaction, id: Id, include_deleted: bool) -> Result<Task, BusError> {
+pub(crate) fn get_task(tx: &rusqlite::Connection, id: Id, include_deleted: bool) -> Result<Task, BusError> {
     let sql = if include_deleted {
         "SELECT * FROM tasks WHERE id=?1"
     } else {
@@ -567,15 +567,12 @@ fn assign_session(ctx: &mut Ctx, name: &str, task: &Task) -> Result<Vec<Id>, Bus
             "task and session belong to different projects",
         ));
     }
-    let mut stmt = ctx
-        .tx()
-        .prepare_cached("SELECT id FROM sessions WHERE worktree=?1 AND state!='closed' ORDER BY id")
-        .bus()?;
-    let ids = stmt
-        .query_map([&row.session.worktree], |record| record.get::<_, Id>(0))
-        .bus()?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .bus()?;
+    // The task is queued for the session's review group, not for everyone who happens to
+    // share its checkout: independent agents on the primary each work their own tasks.
+    let ids: Vec<Id> = sessions::review_group(ctx.tx(), &row.session)?
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
     let mut newly_current = Vec::new();
     for id in ids {
         let ord: i64 = ctx
@@ -644,16 +641,17 @@ fn assert_relatable(tx: &Transaction, task: &Task, other_id: Id) -> Result<Id, B
     Ok(other.id)
 }
 
-/// One task → one session (BUS.md §10.5). `task.dispatch` calls this once for the task it was
-/// given and once more per not-done descendant when `fanout` is set.
+/// One task → one existing session (BUS.md §10.5). `task.dispatch` calls this once for the task
+/// it was given and once more per not-done descendant when `fanout` is set. Returns the launch
+/// the session still needs (`session.spawn`, `wake` or `resume`), which the caller starts after
+/// the commit: a launch shells out and writes files, and the brief it writes must already see
+/// this assignment.
 fn dispatch_task(
     ctx: &mut Ctx,
     task_id: Id,
-    session: Option<String>,
-    create: Option<relay_bus::ops::session::CreateIn>,
+    name: &str,
     start: bool,
-) -> Result<(Task, relay_bus::types::Session), BusError> {
-    let (mut session, mut create) = (session, create);
+) -> Result<(Task, relay_bus::types::Session, Option<&'static str>), BusError> {
     let before = get_task(ctx.tx(), task_id, false)?;
     if before.column == Column::Done {
         return Err(BusError::conflict(
@@ -666,51 +664,10 @@ fn dispatch_task(
     }
     ctx.tx().execute("UPDATE tasks SET col='active',position=?1,state='dispatched',updated_at=?2 WHERE id=?3",params![next_position(ctx.tx(),before.project_id,Column::Active)?,ctx.now,before.id]).bus()?;
     let active = get_task(ctx.tx(), before.id, false)?;
-    let mut newly_current = Vec::new();
-    let name = if let Some(name) = session.take() {
-        newly_current = assign_session(ctx, &name, &active)?;
-        name
-    } else {
-        let mut create = create.take().expect("validated");
-        if create.project_id != active.project_id {
-            return Err(BusError::invalid(
-                "task.dispatch_project",
-                "created session must use the task project",
-            ));
-        }
-        create.task_id = Some(active.id);
-        create.module_id = active.module_id;
-        let value = ctx.invoke_registered("session.create", serde_json::to_value(create).bus()?)?;
-        let name = serde_json::from_value::<relay_bus::types::Session>(value)
-            .bus()?
-            .name;
-        // A create payload may add the second half of a PAIR. Assign both identities to
-        // the task so own-task authorization and injected peer context agree.
-        newly_current.extend(assign_session(ctx, &name, &active)?);
-        name
-    };
-    let row = sessions::by_name(ctx.tx(), &name)?;
-    let launch_op = match row.session.state {
-        relay_bus::types::SessionState::Created => Some("session.spawn"),
-        relay_bus::types::SessionState::Parked => Some("session.wake"),
-        relay_bus::types::SessionState::Restorable => Some("session.resume"),
-        relay_bus::types::SessionState::Running
-        | relay_bus::types::SessionState::Idle
-        | relay_bus::types::SessionState::Blocked => None,
-        _ => {
-            return Err(BusError::conflict(
-                "task.session_state",
-                format!(
-                    "session {name} cannot be dispatched while {}",
-                    sessions::state_str(row.session.state)
-                ),
-            ))
-        }
-    };
+    let newly_current = assign_session(ctx, name, &active)?;
+    let row = sessions::by_name(ctx.tx(), name)?;
+    let launch_op = launch_op(name, row.session.state)?;
     if start {
-        if let Some(op) = launch_op {
-            ctx.invoke_registered(op, json!({"session":name}))?;
-        }
         for id in newly_current {
             if let Some(assigned) = sessions::by_id(ctx.tx(), id)? {
                 if matches!(assigned.session.state, relay_bus::types::SessionState::Idle | relay_bus::types::SessionState::Running | relay_bus::types::SessionState::Blocked) {
@@ -720,12 +677,52 @@ fn dispatch_task(
         }
     }
     let task = get_task(ctx.tx(), active.id, false)?;
-    let launched = sessions::by_name(ctx.tx(), &name)?.session;
+    let session = sessions::by_name(ctx.tx(), name)?.session;
     ctx.set_project(task.project_id);
-    ctx.emit("session.changed", serde_json::to_value(&launched).bus()?);
+    ctx.emit("session.changed", serde_json::to_value(&session).bus()?);
     emit_task(ctx, &task)?;
-    Ok((task, launched))
+    Ok((task, session, if start { launch_op } else { None }))
 }
+
+/// The launch a session in `state` needs to start working, or a refusal when it cannot.
+fn launch_op(name: &str, state: relay_bus::types::SessionState) -> Result<Option<&'static str>, BusError> {
+    use relay_bus::types::SessionState as S;
+    match state {
+        S::Created => Ok(Some("session.spawn")),
+        S::Parked => Ok(Some("session.wake")),
+        S::Restorable | S::Exited => Ok(Some("session.resume")),
+        S::Running | S::Idle | S::Blocked => Ok(None),
+        _ => Err(BusError::conflict(
+            "task.session_state",
+            format!("session {name} cannot be dispatched while {}", sessions::state_str(state)),
+        )),
+    }
+}
+
+/// What `task.dispatch` settles before the transaction opens: the not-done descendants it will
+/// fan out to, and the sessions it created for them (each by its own `session.create` request,
+/// so the fetch and checkout never run under the store lock).
+struct PreparedDispatch {
+    children: Vec<Id>,
+    created: Vec<String>,
+}
+
+/// Close sessions this dispatch created when it cannot go on; their checkouts go with them.
+fn discard_created(engine: &Engine, created: &[String]) {
+    for name in created {
+        let closed = engine.dispatch(
+            relay_bus::Request::new(relay_bus::Actor::User, "session.close", json!({"session": name, "remove_worktree": true})),
+            crate::engine::Door::InProcess,
+        );
+        if let Some(error) = closed.error {
+            tracing::warn!(session = %name, code = %error.code, "closing a session an abandoned dispatch created");
+        }
+    }
+}
+
+/// `task.list` page size when the caller names none, and the most it may ask for.
+const TASK_PAGE: u32 = 1000;
+const TASK_PAGE_MAX: u32 = 2000;
 
 pub fn register(e: &mut Engine) {
     e.register::<Create>(|ctx: &mut Ctx, p| {
@@ -854,13 +851,28 @@ pub fn register(e: &mut Engine) {
             "updated" => sql.push_str(" ORDER BY updated_at DESC,id DESC"),
             _ => sql.push_str(" ORDER BY CASE col WHEN 'backlog' THEN 0 WHEN 'in_review' THEN 1 WHEN 'ready' THEN 2 WHEN 'active' THEN 3 ELSE 4 END,position,id"),
         }
+        // The reply is bounded: every task ever made, done ones included, each with its body,
+        // changelog and roll-up, grew past what a client accepts on one line (RA-027).
+        let limit = p.limit.unwrap_or(TASK_PAGE).clamp(1, TASK_PAGE_MAX);
+        let offset = p.offset.unwrap_or(0);
+        sql.push_str(" LIMIT ? OFFSET ?");
+        args.push(Box::new(limit as i64 + 1));
+        args.push(Box::new(offset as i64));
         // A dozen filter shapes at most, and the store's statement cache holds 128: the built
         // statement is compiled once per shape, not once per call.
         let mut stmt=ctx.tx().prepare_cached(&sql).bus()?;
         let mut rows=stmt.query(rusqlite::params_from_iter(args.iter().map(|v| v.as_ref()))).bus()?;
         let mut tasks=Vec::new();
         while let Some(row)=rows.next().bus()? { tasks.push(row_task(ctx.tx(), row).bus()?); }
-        Ok(ListOut { tasks })
+        let next_offset = (tasks.len() > limit as usize).then_some(offset + limit);
+        tasks.truncate(limit as usize);
+        if p.summary.unwrap_or(false) {
+            for task in &mut tasks {
+                task.body.clear();
+                task.changelog.clear();
+            }
+        }
+        Ok(ListOut { tasks, next_offset })
     });
 
     e.register::<Update>(|ctx: &mut Ctx, p| {
@@ -1046,7 +1058,11 @@ pub fn register(e: &mut Engine) {
         emit_task(ctx, &get_task(ctx.tx(), task.id, false)?)?;
         Ok(Empty {})
     });
-    e.register::<Dispatch>(|ctx: &mut Ctx, p| {
+    // Staged (D149): creating a session fetches and checks out, and launching one installs
+    // hooks and writes files. Both run as their own requests with the store unlocked — the
+    // creates before the transaction, the launches after it, once the assignment they brief
+    // the agent about is committed. Only the task and assignment writes hold the lock.
+    e.register_staged::<Dispatch, PreparedDispatch>(|ctx, p| {
         if p.session.is_some() == p.create.is_some() {
             return Err(BusError::invalid(
                 "task.dispatch_target",
@@ -1061,19 +1077,96 @@ pub fn register(e: &mut Engine) {
                 "fanout needs create: one session cannot hold several tasks",
             ));
         }
-        let template = p.create.clone();
-        let (task, session) = dispatch_task(ctx, p.task_id, p.session, p.create, start)?;
-        let mut fanned = Vec::new();
-        if fanout {
-            for id in descendants(ctx.tx(), task.id)? {
-                let child = get_task(ctx.tx(), id, false)?;
-                if child.column == Column::Done {
-                    continue;
+        let children = ctx.read(|conn| {
+            let task = get_task(conn, p.task_id, false)?;
+            if task.column == Column::Done {
+                return Err(BusError::conflict("task.column_transition", "done tasks cannot be dispatched"));
+            }
+            if let Some(create) = &p.create {
+                if create.project_id != task.project_id {
+                    return Err(BusError::invalid("task.dispatch_project", "created session must use the task project"));
                 }
-                let (task, session) = dispatch_task(ctx, id, None, template.clone(), start)?;
-                fanned.push(Dispatched { task, session });
+                // A launch that fails after the commit cannot answer this request; the one
+                // refusal people actually hit is a missing provider, so it is checked here.
+                if start { crate::providers::executable(conn, create.provider)?; }
+            }
+            if let (Some(name), true) = (&p.session, start) {
+                let row = sessions::by_name(conn, name)?;
+                if launch_op(name, row.session.state)?.is_some() {
+                    crate::providers::executable(conn, row.session.provider)?;
+                }
+            }
+            if !fanout { return Ok(Vec::new()); }
+            let mut children = Vec::new();
+            for id in descendants(conn, p.task_id)? {
+                if get_task(conn, id, false)?.column != Column::Done { children.push(id); }
+            }
+            Ok(children)
+        })?;
+        let mut created = Vec::new();
+        if let Some(template) = &p.create {
+            for _ in 0..=children.len() {
+                let mut create = template.clone();
+                create.task_id = None;
+                let out = ctx.engine().dispatch(
+                    relay_bus::Request::new(ctx.actor.clone(), "session.create", serde_json::to_value(&create).bus()?),
+                    crate::engine::Door::InProcess,
+                );
+                match out.into_result() {
+                    Ok(session) => created.push(session["name"].as_str().unwrap_or_default().to_string()),
+                    Err(error) => {
+                        discard_created(ctx.engine(), &created);
+                        return Err(error);
+                    }
+                }
             }
         }
+        Ok(PreparedDispatch { children, created })
+    }, |ctx: &mut Ctx, p, prepared| {
+        let start = p.start.unwrap_or(true);
+        let PreparedDispatch { children, created } = prepared;
+        let mut names = created.iter().cloned();
+        let main = match p.session.clone() {
+            Some(name) => name,
+            None => names.next().ok_or_else(|| BusError::internal("dispatch created no session"))?,
+        };
+        let mut launches = Vec::new();
+        let (task, session, launch) = dispatch_task(ctx, p.task_id, &main, start)?;
+        launches.extend(launch.map(|op| (op, main.clone())));
+        let mut fanned = Vec::new();
+        for id in children {
+            if get_task(ctx.tx(), id, false)?.column == Column::Done {
+                continue;
+            }
+            let name = names.next().ok_or_else(|| BusError::conflict(
+                "task.changed", "sub-tasks were added while the dispatch was preparing; dispatch again",
+            ))?;
+            let (task, session, launch) = dispatch_task(ctx, id, &name, start)?;
+            launches.extend(launch.map(|op| (op, name.clone())));
+            fanned.push(Dispatched { task, session });
+        }
+        // Each launch is its own request, after the commit and before the reply, so a client
+        // that attaches as soon as the dispatch answers finds the PTY. A launch that fails then
+        // has nobody to answer: it is audited, and said in a notification.
+        let project_id = task.project_id;
+        ctx.after_commit(move |engine| {
+            for (op, name) in launches {
+                let launched = engine.dispatch(
+                    relay_bus::Request::new(relay_bus::Actor::User, op, json!({"session": name})),
+                    crate::engine::Door::InProcess,
+                );
+                if let Some(error) = launched.error {
+                    tracing::warn!(session = %name, op, code = %error.code, "starting a dispatched session");
+                    let _ = engine.system_write("task.dispatch.launch_failed", None, Some(project_id), None, json!({"session": name, "code": error.code}), |tx, now| {
+                        tx.execute(
+                            "INSERT INTO notifications(project_id,category,title,body,link,read,created_at) VALUES (?1,'session',?2,?3,NULL,0,?4)",
+                            params![project_id, format!("{name} did not start"), format!("{op}: {}", error.message), now],
+                        ).bus()?;
+                        Ok(((), vec![("notify.new".into(), json!({"category": "session", "project_id": project_id}))]))
+                    });
+                }
+            }
+        });
         // Re-read: fanning out to a child does not change the parent row, but its roll-up and
         // its children's states did move, and the caller reads them off this Task.
         let task = get_task(ctx.tx(), task.id, false)?;
@@ -1102,27 +1195,45 @@ pub fn register(e: &mut Engine) {
             let project = crate::handlers::workspace::get_project(ctx.tx(), before.project_id)?;
             let repo = gix::open(&project.path)
                 .map_err(|e| BusError::unavailable("git.head", e.to_string()))?;
-            // Approval is a historical task operation. The assigned session may already be
-            // closed and its worktree removed, but session.close deliberately keeps its branch.
-            // Resolve that recorded branch from the project repository instead of requiring a
-            // currently live session (or accidentally finding a newer session with the same name).
-            if let Some(session_id) = session_id {
-                let session = sessions::by_id(ctx.tx(), session_id)?
-                    .ok_or_else(|| BusError::internal("task session vanished"))?;
-                let sha = repo
-                    .rev_parse_single(format!("refs/heads/{}", session.session.branch).as_str())
-                    .map_err(|e| BusError::unavailable("git.head", e.to_string()))?
-                    .detach()
-                    .to_string();
-                (sha, Some(session.session.branch))
-            } else {
-                // Work completed directly in the project checkout still gets the same Done
-                // invariant: link the checkout HEAD even though Relay never dispatched it.
-                let branch = repo.head_name().ok().flatten().map(|name| name.shorten().to_string());
-                let sha = repo.head_id()
-                    .map_err(|e| BusError::unavailable("git.head", e.to_string()))?
-                    .to_string();
-                (sha, branch)
+            // Approval is a historical task operation. The assigned session may be closed, its
+            // worktree removed, and — once its work merged — its branch deleted by branch
+            // cleanup; a session in a detached primary checkout records the branch `HEAD`,
+            // which never resolves as a ref. So take the first of: the recorded branch's tip,
+            // the commit `session.done` already linked, the base branch tip (which holds the
+            // merged work), and the checkout HEAD. Fail only when the repository says nothing.
+            let recorded = match session_id {
+                Some(session_id) => Some(sessions::by_id(ctx.tx(), session_id)?
+                    .ok_or_else(|| BusError::internal("task session vanished"))?.session.branch),
+                None => None,
+            };
+            let tip = |reference: &str| repo.rev_parse_single(reference).ok().map(|id| id.detach().to_string());
+            let on_branch = recorded.as_deref().filter(|branch| *branch != "HEAD")
+                .and_then(|branch| Some((tip(&format!("refs/heads/{branch}"))?, Some(branch.to_string()))));
+            let linked = || -> Result<Option<(String, Option<String>)>, BusError> {
+                ctx.tx().query_row(
+                    "SELECT sha, branch FROM task_commits WHERE task_id=?1 ORDER BY id DESC LIMIT 1",
+                    [before.id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                ).optional().bus()
+            };
+            let found = match on_branch {
+                Some(found) => Some(found),
+                None if recorded.is_some() => linked()?.or_else(|| {
+                    tip(&format!("refs/heads/{}", project.base_branch)).map(|sha| (sha, Some(project.base_branch.clone())))
+                }),
+                None => None,
+            };
+            match found {
+                Some(found) => found,
+                None => {
+                    // Work completed directly in the project checkout still gets the same Done
+                    // invariant: link the checkout HEAD even though Relay never dispatched it.
+                    let branch = repo.head_name().ok().flatten().map(|name| name.shorten().to_string());
+                    let sha = repo.head_id()
+                        .map_err(|e| BusError::unavailable("git.head", e.to_string()))?
+                        .to_string();
+                    (sha, branch)
+                }
             }
         };
         link_commit(ctx.tx(), before.id, &sha, branch.as_deref(), &ctx.now)?;
@@ -1185,7 +1296,7 @@ pub fn register(e: &mut Engine) {
         for id in ids {
             tasks.push(get_task(ctx.tx(), id, false)?);
         }
-        Ok(ListOut { tasks })
+        Ok(ListOut { tasks, next_offset: None })
     });
 
     e.register::<LabelAdd>(|ctx: &mut Ctx, p| {

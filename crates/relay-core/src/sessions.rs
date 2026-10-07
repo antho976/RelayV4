@@ -161,6 +161,50 @@ pub fn by_name(conn: &Connection, name: &str) -> Result<Row_, BusError> {
         .ok_or_else(|| BusError::not_found("session.not_found", format!("no live session named {name:?}")))
 }
 
+/// The open sessions that review and advance through tasks together with `session`, itself
+/// included, as (id, role), oldest first.
+///
+/// A pooled checkout (`.relay/worktrees/<name>`) is made for one session and shared only by
+/// its PAIR or review group, so everyone on it is in the group. Any other checkout — the
+/// primary above all, where every session of an Unreal-plugin project lands (D160) — is shared
+/// by independent agents: there the group is only the sessions joined by `pair_with`.
+pub fn review_group(conn: &Connection, session: &Session) -> Result<Vec<(Id, Role)>, BusError> {
+    let project: String = conn
+        .prepare_cached("SELECT path FROM projects WHERE id=?1").map_err(crate::engine::internal)?
+        .query_row([session.project_id], |row| row.get(0)).map_err(crate::engine::internal)?;
+    let mut stmt = conn
+        .prepare_cached("SELECT id, name, role, pair_with FROM sessions WHERE worktree=?1 AND state!='closed' ORDER BY id")
+        .map_err(crate::engine::internal)?;
+    let open = stmt
+        .query_map([&session.worktree], |row| Ok((
+            row.get::<_, Id>(0)?, row.get::<_, String>(1)?, parse_role(&row.get::<_, String>(2)?), row.get::<_, Option<String>>(3)?,
+        )))
+        .map_err(crate::engine::internal)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(crate::engine::internal)?;
+    let pooled = std::path::Path::new(&session.worktree).starts_with(crate::worktree::pool_dir(std::path::Path::new(&project)));
+    let mut members: Vec<String> = vec![session.name.clone()];
+    if pooled {
+        members = open.iter().map(|(_, name, _, _)| name.clone()).collect();
+    } else {
+        // `pair_with` links, either direction, until nothing new joins.
+        loop {
+            let before = members.len();
+            for (_, name, _, pair) in &open {
+                if members.contains(name) {
+                    if let Some(pair) = pair.as_ref().filter(|pair| !members.contains(pair)) {
+                        if open.iter().any(|(_, other, _, _)| other == pair) { members.push(pair.clone()); }
+                    }
+                } else if pair.as_ref().is_some_and(|pair| members.contains(pair)) {
+                    members.push(name.clone());
+                }
+            }
+            if members.len() == before { break; }
+        }
+    }
+    Ok(open.into_iter().filter(|(_, name, _, _)| members.contains(name)).map(|(id, _, role, _)| (id, role)).collect())
+}
+
 pub fn set_state(conn: &Connection, id: Id, state: SessionState, now: &str) -> Result<(), BusError> {
     conn.prepare_cached("UPDATE sessions SET state = ?1, updated_at = ?2 WHERE id = ?3")
         .map_err(crate::engine::internal)?

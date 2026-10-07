@@ -256,9 +256,10 @@ impl Profile {
         let advanced = gtk::Expander::new(Some("Worktree and permissions"));
         let options = gtk::Box::new(gtk::Orientation::Vertical, 8);
         field("Additional instructions", &prompt, &options);
+        // Blank means the project default: a new worktree, or the primary checkout when an
+        // enabled plugin asks for it (D160). Only a typed value is sent.
         let worktree = gtk::Entry::builder()
-            .text("new")
-            .placeholder_text("new, primary, or absolute worktree path")
+            .placeholder_text("Project default — or new, primary, or an absolute path")
             .build();
         field("Worktree", &worktree, &options);
         let writes = gtk::CheckButton::with_label("Allow agent bus writes");
@@ -331,6 +332,9 @@ impl Profile {
             .collect()
     }
     fn payload(&self, project: i64, role: Option<&str>) -> Value {
+        // A review group keeps its own fresh worktree unless the user typed one: groups in the
+        // primary checkout collide with solo agents already there.
+        let group = role.is_some();
         let role = role.unwrap_or(match self.role.selected() {
             1 => "reviewer",
             2 => "docs",
@@ -343,7 +347,14 @@ impl Profile {
             .and_downcast::<gtk::StringObject>()
             .map(|s| s.string().to_string())
             .filter(|s| s != "Default");
-        json!({"project_id":project,"provider":if self.provider.selected()==0{"claude"}else{"codex"},"role":role,"model":if model.is_empty(){None}else{Some(model)},"effort":effort,"worktree":self.worktree.text().trim(),"bus_writes":self.writes.is_active(),"allow_ui":self.ui_access.is_active(),"prompt":self.prompt()})
+        let mut payload = json!({"project_id":project,"provider":if self.provider.selected()==0{"claude"}else{"codex"},"role":role,"model":if model.is_empty(){None}else{Some(model)},"effort":effort,"bus_writes":self.writes.is_active(),"allow_ui":self.ui_access.is_active(),"prompt":self.prompt()});
+        let worktree = self.worktree.text().trim().to_string();
+        if !worktree.is_empty() {
+            payload["worktree"] = json!(worktree);
+        } else if group {
+            payload["worktree"] = json!("new");
+        }
+        payload
     }
     fn prompt(&self) -> String {
         let b = self.prompt.buffer();
@@ -587,7 +598,7 @@ impl Ui {
         let u = update.clone();
         count.connect_value_changed(move |_| u());
         update();
-        let hint=label("Each solo agent has its own worktree. A review group shares one branch, with a separate reviewer and one or two builders. Choose the group's task queue on agent 1.","dim");
+        let hint=label("Each solo agent gets the project's default checkout: its own worktree, or the primary checkout when a plugin asks for it. A review group shares one branch, with a separate reviewer and one or two builders. Choose the group's task queue on agent 1.","dim");
         hint.set_wrap(true);
         body.append(&hint);
         let footer = gtk::Box::new(gtk::Orientation::Horizontal, 12);
@@ -781,7 +792,6 @@ impl Ui {
             let mut profiles_data=Vec::new();
             for index in indexes{
                 let p=&profiles[index];if !p.provider_cards[p.provider.selected() as usize].0.is_sensitive(){ui.launch_busy.set(false);ui.show_error("Choose an installed provider for every agent.");return;}let payload=p.payload(project,if group{Some(if index==2{"reviewer"}else{"builder"})}else{None});
-                if text(&payload,"worktree").is_empty(){ui.launch_busy.set(false);ui.show_error("Set a worktree for every agent.");return;}
                 let tasks=if !group||index==0{p.selected_tasks()}else{Vec::new()};profiles_data.push((payload,tasks,p.prompt()));
             }
             key.set_sensitive(false);let key=key.clone();ui.launch_box.set_sensitive(false);let progress=progress.clone();

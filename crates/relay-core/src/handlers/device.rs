@@ -311,42 +311,59 @@ pub fn register(e: &mut Engine) {
         let mut system_images = installed_system_images(&sdk)?;
         system_images.sort();
         system_images.reverse();
+        // avdmanager is a JVM: slow to start, and nothing here may wait on it forever (D144).
         let devices = avdmanager
-            .and_then(|avdmanager| Command::new(avdmanager).args(["list", "device", "-c"]).output().ok())
+            .and_then(|avdmanager| crate::proc::output_with_timeout(
+                Command::new(avdmanager).args(["list", "device", "-c"]), AVDMANAGER_LIST_TIMEOUT).ok().flatten())
             .filter(|output| output.status.success())
             .map(|output| String::from_utf8_lossy(&output.stdout).lines().map(str::trim).filter(|line| !line.is_empty()).map(str::to_string).collect())
             .unwrap_or_default();
         Ok(AvdCatalogOut { system_images, devices })
     });
-    e.register::<AvdCreate>(|ctx: &mut Ctx, p| {
+    // Creating runs avdmanager (a JVM) and then lists AVDs through the emulator binary, so
+    // both happen before the transaction opens (D149); the transaction only announces it.
+    e.register_staged::<AvdCreate, Avd>(|ctx, p| {
         let name = valid_avd_name(&p.name)?;
         if !p.package.starts_with("system-images;") {
             return Err(BusError::invalid("avd.package", "AVD package must be an installed system image"));
         }
-        let avdmanager = sdk_tool(ctx.tx(), "device.avdmanager_path", "avdmanager")?;
+        let (avdmanager, emulator) = ctx.read(|conn| Ok((
+            sdk_tool(conn, "device.avdmanager_path", "avdmanager")?,
+            sdk_tool(conn, "device.emulator_path", "emulator").ok(),
+        )))?;
         let mut command = Command::new(avdmanager);
         command.args(["create", "avd", "--name", &name, "--package", &p.package]);
         if let Some(device) = p.device.as_deref().filter(|value| !value.trim().is_empty()) {
             command.args(["--device", device]);
         }
-        let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
-            .map_err(|error| BusError::unavailable("avd.create_failed", error.to_string()))?;
-        if let Some(stdin) = child.stdin.as_mut() { let _ = stdin.write_all(b"no\n"); }
-        let output = child.wait_with_output().map_err(|error| BusError::unavailable("avd.create_failed", error.to_string()))?;
+        // "no" answers "Do you wish to create a custom hardware profile?", which avdmanager
+        // asks whenever no --device is given; an empty stdin makes it throw instead.
+        let output = crate::proc::output_with_input(&mut command, b"no\n", AVD_CREATE_TIMEOUT)
+            .map_err(|error| BusError::unavailable("avd.create_failed", error.to_string()))?
+            .ok_or_else(|| BusError::unavailable("avd.create_timeout",
+                format!("avdmanager did not finish within {} s", AVD_CREATE_TIMEOUT.as_secs())))?;
         if !output.status.success() {
             return Err(BusError::unavailable("avd.create_failed", String::from_utf8_lossy(&output.stderr).trim().to_string()));
         }
-        let avd = list_avds(ctx.tx())?.into_iter().find(|avd| avd.name == name)
-            .unwrap_or(Avd { name, device: p.device, package: Some(p.package), path: None, running_serial: None });
+        // The AVD exists now whatever the listing says, so a listing that fails only costs the
+        // details it would have filled in. Nothing just created is running: no adb probe.
+        let listed = emulator.and_then(|emulator| list_avds_with(&emulator, None).ok())
+            .and_then(|avds| avds.into_iter().find(|avd| avd.name == name));
+        Ok(listed.unwrap_or(Avd { name, device: p.device.clone(), package: Some(p.package.clone()), path: None, running_serial: None }))
+    }, |ctx: &mut Ctx, _p, avd| {
         ctx.emit("avd.changed", serde_json::to_value(&avd).bus()?);
         Ok(avd)
     });
-    e.register::<AvdBoot>(|ctx: &mut Ctx, p| {
+    e.register_staged::<AvdBoot, PathBuf>(|ctx, p| {
         let name = valid_avd_name(&p.name)?;
-        if !list_avds(ctx.tx())?.iter().any(|avd| avd.name == name) {
+        let emulator = ctx.read(|conn| sdk_tool(conn, "device.emulator_path", "emulator"))?;
+        // Only the names matter here; whether it is already running is the emulator's business.
+        if !list_avds_with(&emulator, None)?.iter().any(|avd| avd.name == name) {
             return Err(BusError::not_found("avd.not_found", format!("no AVD named {name}")));
         }
-        let emulator = sdk_tool(ctx.tx(), "device.emulator_path", "emulator")?;
+        Ok(emulator)
+    }, |ctx: &mut Ctx, p, emulator| {
+        let name = valid_avd_name(&p.name)?;
         let cold = p.cold.unwrap_or(false);
         let event_name = name.clone();
         ctx.emit("avd.changed", json!({"name":name,"state":"booting"}));
@@ -487,17 +504,12 @@ fn installed_system_images(sdk: &Path) -> Result<Vec<String>, BusError> {
     Ok(images)
 }
 
-fn list_avds(conn: &rusqlite::Connection) -> Result<Vec<Avd>, BusError> {
-    let emulator = sdk_tool(conn, "device.emulator_path", "emulator")?;
-    let adb = adb_path(conn).ok();
-    list_avds_with(&emulator, adb.as_deref())
-}
-
 /// The subprocess half of [`list_avds`], with both tool paths already read out of the store so
 /// the emulator and adb calls happen with nothing locked (D144).
 fn list_avds_with(emulator: &Path, adb: Option<&Path>) -> Result<Vec<Avd>, BusError> {
-    let output = Command::new(emulator).arg("-list-avds").output()
-        .map_err(|error| BusError::unavailable("avd.list_failed", error.to_string()))?;
+    let output = crate::proc::output_with_timeout(Command::new(emulator).arg("-list-avds"), AVD_LIST_TIMEOUT)
+        .map_err(|error| BusError::unavailable("avd.list_failed", error.to_string()))?
+        .ok_or_else(|| BusError::unavailable("avd.list_failed", "emulator -list-avds did not answer"))?;
     if !output.status.success() {
         return Err(BusError::unavailable("avd.list_failed", String::from_utf8_lossy(&output.stderr).trim().to_string()));
     }
@@ -523,7 +535,9 @@ fn list_avds_with(emulator: &Path, adb: Option<&Path>) -> Result<Vec<Avd>, BusEr
 fn running_avds_with(adb: &Path) -> Result<std::collections::HashMap<String, String>, BusError> {
     let mut running = std::collections::HashMap::new();
     for device in list_with_adb(adb)?.into_iter().filter(|device| device.kind == DeviceKind::Avd && device.state == "device") {
-        if let Ok(output) = Command::new(adb).args(["-s", &device.serial, "emu", "avd", "name"]).output() {
+        // A wedged emulator console never answers this; give each one a few seconds.
+        if let Ok(Some(output)) = crate::proc::output_with_timeout(
+            Command::new(adb).args(["-s", &device.serial, "emu", "avd", "name"]), AVD_NAME_TIMEOUT) {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let name = stdout.lines().map(str::trim).find(|line| !line.is_empty() && *line != "OK");
             if let Some(name) = name { running.insert(name.to_string(), device.serial); }
@@ -596,6 +610,14 @@ fn adb_path(conn: &rusqlite::Connection) -> Result<PathBuf, BusError> {
 /// runs inside the request transaction, so an unbounded wait would freeze every other bus op —
 /// keystrokes included (D144). Bound it and refuse instead.
 const ADB_LIST_TIMEOUT: Duration = Duration::from_secs(2);
+/// `emulator -list-avds` reads a directory; it answers in milliseconds when it answers at all.
+const AVD_LIST_TIMEOUT: Duration = Duration::from_secs(10);
+/// `adb emu avd name` talks to the emulator's console, which a frozen emulator never answers.
+const AVD_NAME_TIMEOUT: Duration = Duration::from_secs(3);
+/// avdmanager is a JVM; listing device profiles is quick once it has started.
+const AVDMANAGER_LIST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Creating an AVD copies a system image's userdata; generous, but never unbounded.
+const AVD_CREATE_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn list_with_adb(adb: &Path) -> Result<Vec<Device>, BusError> {
     let mut command = Command::new(adb);
@@ -1795,6 +1817,9 @@ fn run_worker(engine: Arc<Engine>, runtime: Arc<RunRuntime>, parent: uuid::Uuid,
     let mut crash_reported = false;
     for line in BufReader::new(stdout).lines() {
         if runtime.stopped() {
+            if let Some(mut child) = runtime.take_child() {
+                let _ = child.wait();
+            }
             return;
         }
         let Ok(line) = line else { break };
@@ -1840,7 +1865,13 @@ fn stream_command(
     // run commands still use Fish, while the test instance only executes portable
     // fixture commands and must also work on bare CI runners.
     let shell = if engine.instance == Instance::Test { "sh" } else { "fish" };
+    if runtime.stopped() {
+        return Streamed::Stopped;
+    }
     let mut spawn = Command::new(shell);
+    // Its own process group, so a stop reaches the Gradle client the shell forked, not
+    // only the shell (which would leave the build installing onto a released device).
+    std::os::unix::process::CommandExt::process_group(&mut spawn, 0);
     spawn
         .current_dir(root)
         .args(["-lc", &format!("{command} 2>&1")])
@@ -1859,9 +1890,12 @@ fn stream_command(
         fail_run(engine, runtime, parent, "device.run_spawn_failed", "run command had no output stream");
         return Streamed::Failed;
     };
-    runtime.set_child(child);
+    runtime.set_group_child(child);
     for line in BufReader::new(stdout).lines() {
         if runtime.stopped() {
+            if let Some(mut child) = runtime.take_child() {
+                let _ = child.wait();
+            }
             return Streamed::Stopped;
         }
         match line {

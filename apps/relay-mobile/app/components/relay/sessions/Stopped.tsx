@@ -21,7 +21,7 @@ type Stopped = {
     provider: string
     role: string
     projectId?: number
-    /** Offered by `session.restorable`: Discard declines it, Clear context starts it fresh. */
+    /** Offered by `session.restorable`: Discard declines it rather than closing it. */
     restorable: boolean
     dirty: boolean
 }
@@ -142,7 +142,7 @@ export const StoppedAgents: React.FC<{
             title: `Discard ${item.name}?`,
             message:
                 (item.dirty ? 'Its worktree has uncommitted changes. ' : '') +
-                'The session is cleaned up and taken off the PC; its branch is kept.',
+                'The session is cleaned up and taken off the PC; its branch is kept unless its work is already merged.',
             confirmLabel: 'Discard',
             destructive: true,
         })
@@ -188,9 +188,8 @@ export const StoppedAgents: React.FC<{
             icon: 'info-circle',
             onPress: () => router.push(sessionHref(item.name)),
         },
-        ...(item.restorable
-            ? [{ label: 'Start fresh', icon: 'reload' as const, onPress: () => clear(item) }]
-            : []),
+        // session.clear_restorable takes exited sessions as well as restorable ones.
+        { label: 'Start fresh', icon: 'reload' as const, onPress: () => clear(item) },
         { label: 'Discard…', icon: 'delete', destructive: true, onPress: () => discard(item) },
     ]
 

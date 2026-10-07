@@ -212,12 +212,22 @@ pub fn set(tx: &Transaction, path: &str, value: &Value, now: &str) -> Result<(),
     Ok(())
 }
 
+/// Record the inverse of a settings write, unless the old value is past the audit's store
+/// limit: the uncapped undo column would keep it for the whole retention window, and the only
+/// settings that large are wallpaper libraries. Such a row is not undoable.
+fn set_bounded_undo(ctx: &mut Ctx, path: &str, before: Value) {
+    let size = serde_json::to_string(&before).map_or(usize::MAX, |s| s.len());
+    if size <= crate::audit::STORE_LIMIT {
+        ctx.set_undo("settings.set", json!({ "path": path, "value": before }), None);
+    }
+}
+
 pub fn register(e: &mut Engine) {
     e.register::<SettingsGet>(|ctx, p| Ok(ValueOut { value: get(ctx.tx(), p.path.as_deref())? }));
     e.register::<SettingsSet>(|ctx: &mut Ctx, p| {
         let before = get(ctx.tx(), Some(&p.path))?;
         set(ctx.tx(), &p.path, &p.value, &ctx.now.clone())?;
-        ctx.set_undo("settings.set", json!({ "path": p.path, "value": before }), None);
+        set_bounded_undo(ctx, &p.path, before);
         let value = get(ctx.tx(), Some(&p.path))?;
         ctx.emit("settings.changed", json!({ "path": p.path, "value": value }));
         Ok(ValueOut { value })
@@ -227,7 +237,7 @@ pub fn register(e: &mut Engine) {
         valid_path(&path)?;
         let before = get(ctx.tx(), Some(&path))?;
         delete_under(ctx.tx(), &path)?;
-        ctx.set_undo("settings.set", json!({ "path": path, "value": before }), None);
+        set_bounded_undo(ctx, &path, before);
         let value = get(ctx.tx(), Some(&path))?;
         ctx.emit("settings.changed", json!({ "path": path, "value": value }));
         Ok(ValueOut { value })

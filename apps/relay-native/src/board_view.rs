@@ -471,14 +471,21 @@ struct Board {
     layout: RefCell<Lanes>,
     /// The horizontal board scroller first, then each lane's, to keep places across renders.
     scrolls: RefCell<Vec<gtk::Adjustment>>,
+    /// What the peek last drew (`peek_key`): an unchanged peek keeps its scroll and focus.
+    peek_key: RefCell<Option<String>>,
+    peek_shown: Cell<Option<i64>>,
+    /// A render is waiting for an open card menu or picker to close.
+    deferred: Cell<bool>,
 }
 
 /// Mounts the board on `page` for `project` the first time, then re-renders it with `tasks`.
 pub fn show(ui: &Rc<Ui>, page: &gtk::Box, project: i64, tasks: Vec<Value>) {
     let owner = ui.page_projects.borrow().get("board").copied();
+    let mut fresh = false;
     let board = match current() {
         Some(board) if owner == Some(project) && board.project == project => board,
         old => {
+            fresh = true;
             if let Some(old) = old {
                 page.remove_controller(&old.keys);
             }
@@ -499,8 +506,13 @@ pub fn show(ui: &Rc<Ui>, page: &gtk::Box, project: i64, tasks: Vec<Value>) {
             task["_parent_title"] = title.clone();
         }
     }
+    // Most events that refresh the page change no task: leave the board, and any open menu,
+    // scroll position and selection on it, alone.
+    if !fresh && *board.tasks.borrow() == tasks {
+        return;
+    }
     *board.tasks.borrow_mut() = tasks;
-    board.render();
+    board.render_when_closed();
 }
 
 impl Board {
@@ -676,6 +688,9 @@ impl Board {
             dragged: Cell::new(None),
             layout: RefCell::new(Vec::new()),
             scrolls: RefCell::new(Vec::new()),
+            peek_key: RefCell::new(None),
+            peek_shown: Cell::new(None),
+            deferred: Cell::new(false),
         });
 
         for (field, values) in [
@@ -1176,6 +1191,26 @@ impl Board {
         self.peeked.set(if self.peeked.get() == Some(id) { None } else { Some(id) });
         self.focused.set(Some(id));
         self.render_peek();
+    }
+
+    /// Render now, or once an open card menu or peek picker closes: a render destroys the
+    /// widgets those popovers hang from.
+    fn render_when_closed(self: &Rc<Self>) {
+        let Some(popover) = crate::app::open_popover(self.page.upcast_ref()) else {
+            self.deferred.set(false);
+            self.render();
+            return;
+        };
+        if !self.deferred.replace(true) {
+            let weak = Rc::downgrade(self);
+            popover.connect_closed(move |_| {
+                let Some(board) = weak.upgrade() else { return };
+                if board.deferred.get() {
+                    // The popover is still mapped while `closed` runs.
+                    glib::idle_add_local_once(move || board.render_when_closed());
+                }
+            });
+        }
     }
 
     fn render(self: &Rc<Self>) {
@@ -2285,7 +2320,31 @@ impl Board {
         menu
     }
 
+    /// The peeked task and the tasks it links to, which is everything the peek draws.
+    fn peek_key(&self) -> Option<String> {
+        let id = self.peeked.get()?;
+        let tasks = self.tasks.borrow();
+        let task = tasks.iter().find(|t| t["id"].as_i64() == Some(id))?;
+        let listed = |key: &str, other: &Value| task[key].as_array().is_some_and(|ids| ids.contains(&other["id"]));
+        let linked: Vec<&Value> = tasks
+            .iter()
+            .filter(|t| t["id"] == task["parent_id"] || t["parent_id"] == task["id"] || listed("blocked_by", t) || listed("blocks", t))
+            .collect();
+        Some(json!([task, linked]).to_string())
+    }
+
     fn render_peek(self: &Rc<Self>) {
+        let key = self.peek_key();
+        if key.is_some() && *self.peek_key.borrow() == key && self.peek.first_child().is_some() {
+            return;
+        }
+        // The same task redrawn keeps its place in a long description.
+        let same = key.is_some() && self.peek_shown.replace(self.peeked.get()) == self.peeked.get();
+        let kept = same
+            .then(|| self.peek.last_child().and_downcast::<gtk::ScrolledWindow>())
+            .flatten()
+            .map(|scroll| scroll.vadjustment().value());
+        *self.peek_key.borrow_mut() = key;
         clear(&self.peek);
         let Some(id) = self.peeked.get() else {
             self.peek.set_visible(false);
@@ -2319,6 +2378,8 @@ impl Board {
             if let Some(board) = weak.upgrade() {
                 board.peeked.set(None);
                 board.render_peek();
+                // The focused key went with the peek.
+                board.focus_board();
             }
         });
         head.append(&close);
@@ -2456,6 +2517,15 @@ impl Board {
         body.append(&edit);
         let scroll = crate::app::scrolled(&body);
         scroll.set_hscrollbar_policy(gtk::PolicyType::Never);
+        if let Some(value) = kept.filter(|v| *v > 0.) {
+            let done = Cell::new(false);
+            scroll.vadjustment().connect_changed(move |a| {
+                if !done.get() && a.upper() - a.page_size() >= value {
+                    done.set(true);
+                    a.set_value(value);
+                }
+            });
+        }
         self.peek.append(&scroll);
     }
 
@@ -2479,6 +2549,7 @@ impl Board {
                 board.peeked.set(Some(id));
                 board.focused.set(Some(id));
                 board.render_peek();
+                board.focus_board();
             }
         });
         key
