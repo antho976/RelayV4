@@ -220,7 +220,7 @@ fn apply(tx: &Transaction, c: &Change) -> Result<bool> {
     // Budgets are one per category, whatever uid each device gave theirs.
     // A budget tombstone that does not say its category is matched by uid, never read as the
     // overall budget.
-    let by_category = table == "budgets" && !(c.deleted && !c.row.contains_key("category"));
+    let by_category = table == "budgets" && (!c.deleted || c.row.contains_key("category"));
     let existing: Option<(i64, i64)> = if by_category {
         let category = match c.row.get("category").filter(|v| !v.is_null()) {
             None => Some(0),
