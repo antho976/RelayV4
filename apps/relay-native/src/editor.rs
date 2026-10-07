@@ -1835,7 +1835,7 @@ impl Editor {
     }
     /// Dropping a tree item on `widget` moves it into the folder `into`. A drop on the item's
     /// own folder is no move at all, and a drop into itself is refused.
-    fn bind_folder_drop(self: &Rc<Self>, ui: &Rc<Ui>, widget: &impl IsA<gtk::Widget>, into: &str) {
+    pub(super) fn bind_folder_drop(self: &Rc<Self>, ui: &Rc<Ui>, widget: &impl IsA<gtk::Widget>, into: &str) {
         let drop = gtk::DropTarget::new(String::static_type(), gtk::gdk::DragAction::MOVE);
         let ed = self.clone();
         let weak = Rc::downgrade(ui);
