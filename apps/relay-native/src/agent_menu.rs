@@ -579,7 +579,8 @@ impl Ui {
 
         // Session.
         body.append(&section("SESSION"));
-        if state == "restorable" {
+        // An exited agent (it quit, crashed or lost its login) starts fresh the same way.
+        if matches!(state.as_str(), "restorable" | "exited") {
             let fresh = row_key("refresh", "Start fresh", "Start a new provider conversation in this same session and worktree; the saved context is cleared");
             let confirm = gtk::Revealer::new();
             let weak = Rc::downgrade(self);
@@ -598,7 +599,7 @@ impl Ui {
             body.append(&fresh);
             body.append(&confirm);
         }
-        let close = row_key("power", "Close session…", "Stop the agent and take it off the wall; the worktree and branch are kept unless you choose otherwise");
+        let close = row_key("power", "Close session…", "Stop the agent and take it off the wall; the worktree is kept unless you choose otherwise, and the branch unless its work is already merged");
         close.add_css_class("agent-menu-danger");
         let confirm = gtk::Revealer::new();
         let options = gtk::Box::new(gtk::Orientation::Vertical, 4);
@@ -617,7 +618,7 @@ impl Ui {
         let weak = Rc::downgrade(self);
         let n = name.clone();
         let p = popover.downgrade();
-        confirm_strip(&confirm, "Stop this agent and close its pane? The branch is kept.", "Close", Some(&options), move |_| {
+        confirm_strip(&confirm, "Stop this agent and close its pane? Its branch is kept unless its work is already merged.", "Close", Some(&options), move |_| {
             if let Some(p) = p.upgrade() {
                 p.popdown();
             }

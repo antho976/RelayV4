@@ -227,6 +227,7 @@ impl Editor {
         let project = ui.project.get();
         let worktree = self.worktree.borrow().clone();
         let payload = self.payload(ui, json!({}));
+        let prs = json!({"project_id":project,"refresh":self.pr_refresh.replace(false)});
         let e = self.clone();
         let ui = ui.clone();
         glib::spawn_future_local(async move {
@@ -254,7 +255,7 @@ impl Editor {
                 ui.call("git.branches", payload.clone()),
                 ui.call("git.log", e.payload(&ui, json!({"limit":30}))),
                 ui.call("integration.list", json!({"project_id":project})),
-                ui.call("git.pr.list", json!({"project_id":project}))
+                ui.call("git.pr.list", prs)
             );
             if !e.matches(&ui, project, &worktree) || revision != e.git_revision.get() {
                 return;
@@ -338,6 +339,7 @@ impl Editor {
             let weak = Rc::downgrade(&ui);
             refresh.connect_clicked(move |_| {
                 if let Some(ui) = weak.upgrade() {
+                    ed.pr_refresh.set(true);
                     ed.refresh_git(&ui);
                     ed.refresh_scopes(&ui);
                 }
@@ -892,7 +894,8 @@ impl Editor {
             });
             match results.2 {
                 Ok(v) => {
-                    for run in rows(&v, "integrations").iter().take(3) {
+                    for run in rows(&v, "integrations").iter().filter(|run| run["state"] != "discarded").take(3) {
+                        let line = gtk::Box::new(gtk::Orientation::Horizontal, 4);
                         let l = label(
                             &format!(
                                 "#{} · {}{}",
@@ -912,7 +915,34 @@ impl Editor {
                             "code-git-hint",
                         );
                         l.set_wrap(true);
-                        merge.append(&l);
+                        l.set_hexpand(true);
+                        line.append(&l);
+                        // A finished integration keeps its checkout and build output until it
+                        // is discarded (D38); this is where a person does that.
+                        if matches!(text(run, "state"), "passed" | "failed" | "conflict") && !run["worktree"].is_null() {
+                            let id = run["id"].as_i64().unwrap_or(0);
+                            let discard = crate::app::icon_button("trash", &format!("Discard integration #{id}: its checkout, build output and branch"));
+                            discard.set_valign(gtk::Align::Center);
+                            let weak = Rc::downgrade(&ui);
+                            let ed = e.clone();
+                            discard.connect_clicked(move |key| {
+                                let Some(ui) = weak.upgrade() else { return };
+                                key.set_sensitive(false);
+                                let key = key.clone();
+                                let ed = ed.clone();
+                                glib::spawn_future_local(async move {
+                                    if let Err(err) = ui.call("integration.discard", json!({"integration_id":id})).await {
+                                        ui.show_error(&err.to_string());
+                                        key.set_sensitive(true);
+                                    }
+                                    if ui.project.get() == project {
+                                        ed.refresh_git(&ui);
+                                    }
+                                });
+                            });
+                            line.append(&discard);
+                        }
+                        merge.append(&line);
                     }
                 }
                 Err(err) => merge.append(&label(&err.to_string(), "code-git-hint")),

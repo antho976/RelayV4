@@ -38,6 +38,14 @@ fn paragraph(value: &str) -> gtk::Label {
     l
 }
 
+/// How many mailbox messages the page asks for at first, and the most "Show older" reaches
+/// (the engine's own ceiling for one page).
+const MAILBOX_PAGE: u32 = 200;
+const MAILBOX_PAGE_MAX: u32 = 1000;
+thread_local! {
+    static MAILBOX_LIMIT: std::cell::Cell<u32> = const { std::cell::Cell::new(MAILBOX_PAGE) };
+}
+
 pub async fn refresh(ui: &Rc<Ui>, name: &str, project: i64) {
     let (op, key) = match name {
         "board" => ("task.list", "tasks"),
@@ -47,17 +55,22 @@ pub async fn refresh(ui: &Rc<Ui>, name: &str, project: i64) {
         "modules" => ("module.list", "modules"),
         _ => return,
     };
-    let payload = if name == "modules" {
-        json!({"project_id":project,"include_archived":true})
-    } else {
-        json!({"project_id":project})
+    // A page shown for another project starts again from the newest mailbox page.
+    if name == "mailbox" && ui.page_projects.borrow().get(name).copied() != Some(project) {
+        MAILBOX_LIMIT.with(|limit| limit.set(MAILBOX_PAGE));
+    }
+    let payload = match name {
+        "modules" => json!({"project_id":project,"include_archived":true}),
+        // mailbox.list answers a page, newest messages last; "Show older" widens it.
+        "mailbox" => json!({"project_id":project,"limit":MAILBOX_LIMIT.with(|limit| limit.get())}),
+        _ => json!({"project_id":project}),
     };
     let result = ui.call(op, payload).await;
     if ui.project.get() != project || *ui.page.borrow() != name {
         return;
     }
-    let mut data = match result {
-        Ok(v) => rows(&v, key),
+    let (mut data, older) = match result {
+        Ok(v) => (rows(&v, key), v.get("next_before").is_some_and(|before| !before.is_null())),
         Err(e) => {
             ui.show_error(&e.to_string());
             return;
@@ -137,6 +150,20 @@ pub async fn refresh(ui: &Rc<Ui>, name: &str, project: i64) {
     }
     match name {
         "mailbox" => {
+            let widest = MAILBOX_LIMIT.with(|limit| limit.get()) >= MAILBOX_PAGE_MAX;
+            if older && !widest {
+                let more = button("Show older messages", "secondary");
+                let weak = Rc::downgrade(ui);
+                more.connect_clicked(move |_| {
+                    MAILBOX_LIMIT.with(|limit| limit.set((limit.get() + MAILBOX_PAGE).min(MAILBOX_PAGE_MAX)));
+                    if let Some(ui) = weak.upgrade() {
+                        ui.refresh_page();
+                    }
+                });
+                body.append(&more);
+            } else if older {
+                body.append(&label(&format!("Showing the newest {MAILBOX_PAGE_MAX} messages."), "dim"));
+            }
             for message in data {
                 let row = gtk::Box::new(gtk::Orientation::Vertical, 6);
                 row.add_css_class("record");

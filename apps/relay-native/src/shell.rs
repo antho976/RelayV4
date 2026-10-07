@@ -749,9 +749,8 @@ impl Ui {
             // Confirmed in place: the key itself turns into "Confirm …" for a second click.
             for (caption, icon, op, armed, tip) in [
                 ("Clear context", "refresh", "session.clear_restorable", "Confirm clear", "Start fresh in this session and worktree; saved provider conversation context is cleared"),
-                ("Discard session", "close", "session.close", "Confirm discard", "Remove this session from the wall; its worktree and branch are kept"),
+                ("Discard session", "close", "session.close", "Confirm discard", "Remove this session from the wall; its worktree is kept, and so is its branch unless its work is already merged"),
             ] {
-                if op == "session.clear_restorable" && state != "restorable" { continue; }
                 for key in [button(caption, "quiet"), icon_button(icon, caption)] {
                     let slate = key.label().is_some();
                     key.set_tooltip_text(Some(if slate { tip } else { caption }));

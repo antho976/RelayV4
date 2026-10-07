@@ -33,6 +33,9 @@ pub struct Editor {
     git_revision: Cell<u64>,
     git_refresh_pending: Cell<bool>,
     git_refresh_dirty: Cell<bool>,
+    /// The next refresh asks GitHub for pull requests again instead of taking the engine's
+    /// minute-old listing: set by the Refresh button, never by a file event (D130).
+    pr_refresh: Cell<bool>,
     /// Set when an event arrived while the panel was hidden; consumed when it is shown.
     git_stale: Cell<bool>,
     tree_stale: Cell<bool>,
@@ -336,6 +339,7 @@ impl Editor {
             invalidate_pending: Cell::new(false),
             git_refresh_pending: Cell::new(false),
             git_refresh_dirty: Cell::new(false),
+            pr_refresh: Cell::new(false),
             git_stale: Cell::new(false),
             tree_stale: Cell::new(false),
             git_signature: Cell::new(0),

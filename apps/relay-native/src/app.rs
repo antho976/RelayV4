@@ -1286,6 +1286,11 @@ impl Ui {
                                     {
                                         ui.load_appearance();
                                     }
+                                } else if *ui.page.borrow() == "mailbox"
+                                    && !e.ev.starts_with("mailbox.")
+                                {
+                                    // Only mail changes the Mailbox page; a task, overlap or
+                                    // notification event re-read the whole page for nothing.
                                 } else {
                                     ui.refresh_page();
                                 }
