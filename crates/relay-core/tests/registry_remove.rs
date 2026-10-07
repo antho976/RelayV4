@@ -213,11 +213,18 @@ fn a_project_with_labelled_tasks_removes_and_so_does_its_workspace() {
     ok(e, "task.label.add", json!({"task_id": untagged["id"], "label": "stale"}));
     ok(e, "task.label.remove", json!({"task_id": untagged["id"], "label": "stale"}));
     let (_, _, _, pid) = spawn(e, 1);
+    // RA-419: both clients' saved layouts go with the project, whole subtrees included; a
+    // project 10's key only shares the prefix.
+    for path in ["layout.current.1", "layout.current.1.grid", "native.layout.current.1", "native.layout.current.1.panes", "native.layout.current.10"] {
+        e.store.lock().execute("INSERT INTO settings (path, value, updated_at) VALUES (?1, '{}', '')", [path]).unwrap();
+    }
 
     let out = ok(e, "project.remove", json!({"project_id": 1, "force": true}));
     assert_eq!(out["sessions_closed"], 1);
     wait_until("closed agent gone", || !alive(pid));
     assert_eq!(count(e, "SELECT COUNT(*) FROM labels"), 0);
+    assert_eq!(count(e, "SELECT COUNT(*) FROM settings WHERE path LIKE '%layout.current.1%' AND path != 'native.layout.current.10'"), 0);
+    assert_eq!(count(e, "SELECT COUNT(*) FROM settings WHERE path = 'native.layout.current.10'"), 1);
     assert_eq!(count(e, "SELECT COUNT(*) FROM projects"), 0);
 
     let again = ok(e, "project.add", json!({"workspace_id": 1, "path": f.repo}))["id"].clone();
