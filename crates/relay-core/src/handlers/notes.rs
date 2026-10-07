@@ -60,9 +60,33 @@ fn assert_actor_project(ctx: &Ctx, project_id: Id) -> Result<(), BusError> {
     Ok(())
 }
 
+/// `notes.changed` names the note and its new state, not its body: every subscribed client
+/// receives the event, and one large note pushed whole to each of them on every keystroke-sized
+/// append dropped the desktop's connection (RA-227). `notes.get` has the body.
 fn emit_note(ctx: &mut Ctx, note: &Note) -> Result<(), BusError> {
     ctx.set_project(note.project_id);
-    ctx.emit("notes.changed", serde_json::to_value(note).bus()?);
+    let mut payload = serde_json::to_value(note).bus()?;
+    if let Some(map) = payload.as_object_mut() {
+        map.remove("body");
+        map.insert("body_bytes".into(), json!(note.body.len()));
+    }
+    ctx.emit("notes.changed", payload);
+    Ok(())
+}
+
+/// The largest note body, in bytes. A body is returned whole by `notes.get` and the mutations,
+/// and the clients' sockets cap a line at 2 MiB (RA-227).
+const BODY_MAX: usize = 1024 * 1024;
+/// `notes.list {summary}` cuts each body to this many characters.
+const PREVIEW_CHARS: usize = 240;
+
+fn check_body(len: usize) -> Result<(), BusError> {
+    if len > BODY_MAX {
+        return Err(BusError::invalid(
+            "notes.body",
+            format!("the note body would be {len} bytes; the limit is {BODY_MAX}"),
+        ).with_hint("split it across notes, or put long material in a file and link it"));
+    }
     Ok(())
 }
 
@@ -372,12 +396,20 @@ fn send(
 pub fn register(e: &mut Engine) {
     e.register::<List>(|ctx, p| {
         assert_actor_project(ctx, p.project_id)?;
-        let sql = if p.pinned_only.unwrap_or(false) {
-            "SELECT * FROM notes WHERE project_id = ?1 AND deleted_at IS NULL AND pinned = 1 ORDER BY standing DESC, updated_at DESC, id DESC"
+        // `summary` cuts the body in SQL (substr counts characters), so a large note is never
+        // read whole for a list that shows a line of it.
+        let body = if p.summary.unwrap_or(false) { format!("substr(body, 1, {PREVIEW_CHARS}) AS body") } else { "body".into() };
+        let deleted = if p.include_deleted.unwrap_or(false) { "" } else { " AND deleted_at IS NULL" };
+        let (pinned, order) = if p.pinned_only.unwrap_or(false) {
+            (" AND pinned = 1", "standing DESC, updated_at DESC, id DESC")
         } else {
-            "SELECT * FROM notes WHERE project_id = ?1 AND deleted_at IS NULL ORDER BY standing DESC, pinned DESC, updated_at DESC, id DESC"
+            ("", "standing DESC, pinned DESC, updated_at DESC, id DESC")
         };
-        let mut stmt = ctx.tx().prepare(sql).bus()?;
+        let sql = format!(
+            "SELECT id, project_id, title, {body}, pinned, created_at, updated_at, deleted_at FROM notes
+             WHERE project_id = ?1{deleted}{pinned} ORDER BY {order}"
+        );
+        let mut stmt = ctx.tx().prepare_cached(&sql).bus()?;
         let notes = stmt.query_map([p.project_id], note_row).bus()?
             .collect::<rusqlite::Result<Vec<_>>>().bus()?;
         Ok(ListOut { notes })
@@ -389,6 +421,7 @@ pub fn register(e: &mut Engine) {
     });
     e.register::<Create>(|ctx: &mut Ctx, p| {
         assert_actor_project(ctx, p.project_id)?;
+        check_body(p.body.len())?;
         ctx.tx()
             .execute(
                 "INSERT INTO notes(project_id, title, body, pinned, created_at, updated_at)
@@ -426,6 +459,9 @@ pub fn register(e: &mut Engine) {
         } else {
             p.title.clone().unwrap_or_else(|| before.title.clone())
         };
+        if let Some(body) = &p.body {
+            check_body(body.len())?;
+        }
         let body = p.body.clone().unwrap_or_else(|| before.body.clone());
         let pinned = if standing {
             true
@@ -508,6 +544,8 @@ pub fn register(e: &mut Engine) {
         } else {
             "\n"
         };
+        // The whole note counts, not the text added: appends are how a note grows past the cap.
+        check_body(before.body.len() + separator.len() + text.len())?;
         let body = format!("{}{separator}{text}", before.body);
         ctx.tx()
             .execute(

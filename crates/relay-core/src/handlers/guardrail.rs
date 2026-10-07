@@ -327,9 +327,11 @@ pub fn register(engine: &mut Engine) {
         if payload.open_only.unwrap_or(true) {
             sql.push_str(" AND state = 'open'");
         }
-        sql.push_str(" ORDER BY id DESC LIMIT 1000");
-        let mut stmt = ctx.tx().prepare(&sql).bus()?;
-        let holds = stmt
+        // A page, newest first: every client fetches this whole, on a socket that caps a line.
+        sql.push_str(" ORDER BY id DESC LIMIT ?");
+        args.push(Box::new(payload.limit.unwrap_or(HOLDS_PAGE).clamp(1, HOLDS_PAGE_MAX)));
+        let mut stmt = ctx.tx().prepare_cached(&sql).bus()?;
+        let mut holds = stmt
             .query_map(
                 rusqlite::params_from_iter(args.iter().map(|arg| arg.as_ref())),
                 guardrail::hold_row,
@@ -337,14 +339,23 @@ pub fn register(engine: &mut Engine) {
             .bus()?
             .collect::<rusqlite::Result<Vec<_>>>()
             .bus()?;
+        for hold in &mut holds {
+            elide_hold(hold, &mut Vec::new());
+        }
         Ok(HoldsListOut { holds })
     });
 
     engine.register::<HoldGet>(|ctx, payload| {
-        let hold = guardrail::hold_by_id(ctx.tx(), payload.hold_id)?;
+        let mut hold = guardrail::hold_by_id(ctx.tx(), payload.hold_id)?;
         let mut request = guardrail::frozen_request(ctx.tx(), payload.hold_id)?;
         request.token = None;
-        Ok(HoldGetOut { hold, request })
+        // Only the copy shown is cut: the stored envelope, which confirm replays, stays whole.
+        let mut elided = Vec::new();
+        if !payload.full.unwrap_or(false) {
+            elide_hold(&mut hold, &mut elided);
+            elide_strings(&mut request.payload, "/request/payload", &mut elided);
+        }
+        Ok(HoldGetOut { hold, request, elided })
     });
     // Confirming replays the held op. Its read/external phase — for a held `git.commit`, the
     // staging, the user's pre-commit hook and the signature — runs here, before the
@@ -925,6 +936,50 @@ fn use_grants(ctx: &mut Ctx, used: &[Id], session: Option<&str>) -> Result<(), B
         ctx.emit("guardrail.resolved", json!({"hold_id": id, "request_id": id, "state": "used"}));
     }
     Ok(())
+}
+
+/// `guardrail.holds.list` page size when the caller names none, and the most it may ask for.
+const HOLDS_PAGE: u32 = 200;
+const HOLDS_PAGE_MAX: u32 = 1000;
+/// A string in a hold shown to a person is cut past this size: a held rewrite of a large file
+/// carries the whole file, and a reply over the client's line cap tore its connection down
+/// (RA-217).
+const SHOWN_STRING_MAX: usize = 64 * 1024;
+/// How much of a cut string is kept.
+const SHOWN_STRING_KEEP: usize = 4 * 1024;
+
+/// Cut the large strings in a hold's details, for a list or an inspection.
+pub(crate) fn elide_hold(hold: &mut relay_bus::types::Hold, elided: &mut Vec<String>) {
+    elide_strings(&mut hold.details, "/hold/details", elided);
+}
+
+/// Replace every string in `value` over [`SHOWN_STRING_MAX`] bytes by its first
+/// [`SHOWN_STRING_KEEP`] and a note of what was dropped, recording each one's JSON pointer.
+fn elide_strings(value: &mut Value, pointer: &str, elided: &mut Vec<String>) {
+    match value {
+        Value::String(text) if text.len() > SHOWN_STRING_MAX => {
+            let mut end = SHOWN_STRING_KEEP;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            let dropped = text.len() - end;
+            text.truncate(end);
+            text.push_str(&format!("… [{dropped} more bytes elided]"));
+            elided.push(pointer.to_string());
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter_mut().enumerate() {
+                elide_strings(item, &format!("{pointer}/{index}"), elided);
+            }
+        }
+        Value::Object(map) => {
+            for (key, item) in map.iter_mut() {
+                let key = key.replace('~', "~0").replace('/', "~1");
+                elide_strings(item, &format!("{pointer}/{key}"), elided);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn check_out(decision: Decision) -> CheckOut {

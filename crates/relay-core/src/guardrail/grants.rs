@@ -197,12 +197,30 @@ pub fn consume(conn: &Connection, ids: &[Id], now: &str) -> Result<Vec<Id>, BusE
     Ok(spent)
 }
 
+/// The longest `reason` a request may carry. A person reads it in a prompt that pops up by
+/// itself, and every open request is fetched whole on each client connect (RA-217).
+pub const REASON_MAX: usize = 4 * 1024;
+/// The longest `value`: a command line, a path or a pair of caps.
+pub const VALUE_MAX: usize = 8 * 1024;
+
 /// Check a request's shape before it reaches a person.
 pub fn validate(kind: ExceptionKind, value: &str, reason: &str) -> Result<(), BusError> {
     if reason.trim().is_empty() {
         return Err(BusError::invalid("guardrail.request", "reason must say why you cannot progress without this"));
     }
+    if reason.trim().len() > REASON_MAX {
+        return Err(BusError::invalid(
+            "guardrail.request",
+            format!("reason is {} bytes; the limit is {REASON_MAX}", reason.trim().len()),
+        ).with_hint("say in a few sentences why you need it; put logs in a file and name it"));
+    }
     let value = value.trim();
+    if value.len() > VALUE_MAX {
+        return Err(BusError::invalid(
+            "guardrail.request",
+            format!("value is {} bytes; the limit is {VALUE_MAX}", value.len()),
+        ));
+    }
     match kind {
         ExceptionKind::Command if value.is_empty() => {
             Err(BusError::invalid("guardrail.request", "value must be the exact command you need to run"))
@@ -491,5 +509,17 @@ mod tests {
         assert!(!covered("rm -rf \"$TMPDIR/x\"", "rm -rf \"/\""));
         assert!(!covered("rm -rf \"$TMPDIR/x\"", "rm -rf \"$TMPDIR/x\" \"/\""));
         assert!(!covered("rm -rf build", "rm -rf Build"), "arguments keep their case");
+    }
+
+    /// RA-217: a pasted build log as the reason, or a megabyte as the value, is refused before
+    /// it reaches a prompt.
+    #[test]
+    fn reason_and_value_are_bounded() {
+        let ok = super::validate(ExceptionKind::Command, "cargo publish", &"r".repeat(super::REASON_MAX));
+        assert!(ok.is_ok(), "{ok:?}");
+        let long = super::validate(ExceptionKind::Command, "cargo publish", &"r".repeat(super::REASON_MAX + 1));
+        assert_eq!(long.unwrap_err().kind, relay_bus::ErrorKind::Invalid);
+        let long = super::validate(ExceptionKind::Path, &"a/".repeat(super::VALUE_MAX), "need it");
+        assert_eq!(long.unwrap_err().kind, relay_bus::ErrorKind::Invalid);
     }
 }

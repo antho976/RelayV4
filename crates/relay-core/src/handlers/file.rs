@@ -11,7 +11,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use similar::{ChangeTag, TextDiff};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -32,9 +32,10 @@ pub fn register(e: &mut Engine) {
         } else {
             HashMap::new()
         };
-        Ok(TreeOut {
-            entries: list_dir(&root, &dir, p.depth.unwrap_or(1).min(20), &badges)?,
-        })
+        let limit = p.limit.unwrap_or(TREE_LIMIT).clamp(1, TREE_LIMIT_MAX) as usize;
+        let mut truncated = BTreeMap::new();
+        let entries = list_dir(&root, &dir, p.depth.unwrap_or(1).min(20), &badges, limit, &mut truncated)?;
+        Ok(TreeOut { entries, truncated })
     });
     e.register_unlocked::<Read>(|ctx, p| {
         let (project, root) = root_unlocked(ctx, p.project_id, p.worktree.as_deref())?;
@@ -170,7 +171,7 @@ pub fn register(e: &mut Engine) {
             _ => return Err(BusError::invalid("file.kind", "kind must be file or dir")),
         }
         changed(ctx, project.id, &root, &p.path);
-        entry(&root, &path, &HashMap::new(), 0)
+        entry(&root, &path, &HashMap::new())
     });
     // Rename, move and delete are staged (D149): a directory source is walked for the gated
     // paths inside it (RA-147) before the transaction opens, and only the gates and the rename
@@ -232,9 +233,15 @@ pub fn register(e: &mut Engine) {
             params![project_id, root.display().to_string(), p.path, ctx.now],
         ).bus()?;
         let id = ctx.tx().last_insert_rowid();
-        let trash = root.join(".relay").join("trash").join(id.to_string()).join("payload");
-        fs::create_dir_all(trash.parent().unwrap()).map_err(|e| io_err("file.delete_failed", &rel, e))?;
-        fs::rename(&path, &trash).map_err(|e| io_err("file.delete_failed", &rel, e))?;
+        // The primary checkout keeps the trash: a session's worktree is removed when the
+        // session ends, and its `.relay/trash` went with it while the row still offered a
+        // restore (RA-214). A worktree a rename cannot leave (another filesystem) keeps its own.
+        let primary = fs::canonicalize(get_project(ctx.tx(), project_id)?.path).ok();
+        let mut bases: Vec<&Path> = primary.iter().map(PathBuf::as_path).collect();
+        if !bases.contains(&root.as_path()) {
+            bases.push(&root);
+        }
+        let trash = trash_into(&bases, id, &path).map_err(|e| io_err("file.delete_failed", &rel, e))?;
         ctx.tx().execute("UPDATE file_trash SET trash_path=?1 WHERE id=?2", params![trash.display().to_string(), id]).bus()?;
         ctx.set_undo("file.restore", json!({"project_id": project_id, "trash_id": id}), None);
         changed(ctx, project_id, &root, &p.path);
@@ -255,7 +262,30 @@ pub fn register(e: &mut Engine) {
         fs::rename(&trash_s, &path).map_err(|e| io_err("file.restore_failed", &rel, e))?;
         ctx.tx().execute("UPDATE file_trash SET restored_at=?1 WHERE id=?2", params![ctx.now, p.trash_id]).bus()?;
         changed(ctx, project.id, &root, &rel_s);
-        entry(&root, &path, &HashMap::new(), 0)
+        entry(&root, &path, &HashMap::new())
+    });
+    e.register_unlocked::<TrashList>(|ctx, p| {
+        let limit = p.limit.unwrap_or(200).clamp(1, 1000);
+        let rows = ctx.read(|conn| {
+            get_project(conn, p.project_id)?;
+            conn.prepare_cached(
+                "SELECT id, original_path, worktree, trash_path, created_at FROM file_trash
+                 WHERE project_id = ?1 AND restored_at IS NULL ORDER BY id DESC LIMIT ?2",
+            ).bus()?
+            .query_map(params![p.project_id, limit], |r| {
+                Ok((r.get::<_, Id>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?))
+            }).bus()?
+            .collect::<rusqlite::Result<Vec<_>>>().bus()
+        })?;
+        // Whether the bytes are still there is a stat per row, so it is asked with nothing held.
+        let entries = rows
+            .into_iter()
+            .map(|(id, original_path, worktree, trash_path, created_at)| TrashEntry {
+                id, original_path, worktree, created_at,
+                available: !trash_path.is_empty() && occupied(Path::new(&trash_path)),
+            })
+            .collect();
+        Ok(TrashListOut { entries })
     });
     // Staged (D149): the checkout is a subprocess, so it runs before the transaction opens;
     // the transaction only announces the change. `--literal-pathspecs`: a path is a name, never
@@ -266,7 +296,7 @@ pub fn register(e: &mut Engine) {
         crate::worktree::git_mutate(&root, &["--literal-pathspecs", "checkout", "--", &p.path])
             .map_err(|e| BusError::conflict("file.restore_head_failed", e.to_string()))?;
         let path = safe_join(&root, &rel, false)?;
-        Ok((project.id, root.clone(), entry(&root, &path, &HashMap::new(), 0)?))
+        Ok((project.id, root.clone(), entry(&root, &path, &HashMap::new())?))
     }, |ctx: &mut Ctx, p, (project_id, root, restored)| {
         changed(ctx, project_id, &root, &p.path);
         Ok(restored)
@@ -338,7 +368,7 @@ pub fn register(e: &mut Engine) {
         for item in &items {
             let dest = root.join(&item.dest_rel);
             fs::rename(&item.staged, &dest).map_err(|e| io_err("file.import_failed", &item.dest_rel, e))?;
-            entries.push(entry(&root, &dest, &HashMap::new(), 0)?);
+            entries.push(entry(&root, &dest, &HashMap::new())?);
         }
         changed(ctx, project_id, &root, &p.into);
         Ok(ImportOut { entries })
@@ -406,11 +436,13 @@ pub fn register(e: &mut Engine) {
                     counted_to = at;
                     let start = text[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
                     let end = text[at..].find('\n').map(|i| at + i).unwrap_or(text.len());
+                    let (shown, text_offset) = hit_window(&text[start..end], at - start);
                     hits.push(Hit {
                         path: relp.to_string_lossy().to_string(),
                         line,
                         col: (at - start) as u32 + 1,
-                        text: text[start..end].trim_end_matches('\r').to_string(),
+                        text: shown.trim_end_matches('\r').to_string(),
+                        text_offset: (text_offset > 0).then_some(text_offset as u32),
                     });
                     if hits.len() >= limit {
                         return Ok(SearchOut { hits });
@@ -583,6 +615,25 @@ fn confine(own: Option<PathBuf>, root: &Path) -> Result<(), BusError> {
     }
 }
 
+/// Move `path` to `<base>/.relay/trash/<id>/payload` under the first base a rename reaches,
+/// the shape purge's expiry accepts. A base that fails is left as it was found.
+fn trash_into(bases: &[&Path], id: Id, path: &Path) -> std::io::Result<PathBuf> {
+    let mut failed = None;
+    for base in bases {
+        let dir = base.join(".relay").join("trash").join(id.to_string());
+        let payload = dir.join("payload");
+        let moved = fs::create_dir_all(&dir).and_then(|_| fs::rename(path, &payload));
+        match moved {
+            Ok(()) => return Ok(payload),
+            Err(e) => {
+                let _ = fs::remove_dir(&dir);
+                failed = Some(e);
+            }
+        }
+    }
+    Err(failed.unwrap_or_else(|| std::io::Error::other("no trash directory")))
+}
+
 /// Whether anything — a dangling symlink included — already sits at `path`. `Path::exists`
 /// follows links, so a dangling one read as free and was then written through (RA-146).
 fn occupied(path: &Path) -> bool {
@@ -615,22 +666,49 @@ fn safe_join(root: &Path, rel: &Path, may_not_exist: bool) -> Result<PathBuf, Bu
     Ok(path)
 }
 
+/// `file.tree` entries per directory when the caller names no `limit`, and the most it may ask
+/// for. A folder of ten thousand icons was one reply over the client's 2 MiB line cap (RA-210).
+const TREE_LIMIT: u32 = 2000;
+const TREE_LIMIT_MAX: u32 = 5000;
+
+/// The first `limit` entries of `dir` in display order (folders first, then by name), each
+/// directory among them listed `depth - 1` levels further. A directory cut short is recorded
+/// in `truncated` with its full count. Only the entries kept are stat'ed.
 fn list_dir(
     root: &Path,
     dir: &Path,
     depth: u32,
     badges: &HashMap<String, String>,
+    limit: usize,
+    truncated: &mut BTreeMap<String, u32>,
 ) -> Result<Vec<Entry>, BusError> {
-    let mut out = fs::read_dir(dir)
+    let mut found: Vec<(bool, String, PathBuf)> = fs::read_dir(dir)
         .map_err(|e| io_err("file.tree_failed", dir, e))?
         .flatten()
         .filter(|e| {
             !matches!(e.file_name().to_string_lossy().as_ref(), ".git" | ".relay")
                 && !crate::watch::is_generated_path(root, &e.path())
         })
-        .map(|e| entry(root, &e.path(), badges, depth.saturating_sub(1)))
-        .collect::<Result<Vec<_>, _>>()?;
-    out.sort_by_key(|e| (e.kind != EntryKind::Dir, e.name.to_lowercase()));
+        // `DirEntry::file_type` does not follow links, the same as `entry`'s `symlink_metadata`.
+        .map(|e| {
+            let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
+            (!is_dir, e.file_name().to_string_lossy().to_lowercase(), e.path())
+        })
+        .collect();
+    found.sort();
+    if found.len() > limit {
+        let rel = dir.strip_prefix(root).unwrap_or(dir).to_string_lossy().replace('\\', "/");
+        truncated.insert(rel, found.len() as u32);
+        found.truncate(limit);
+    }
+    let mut out = Vec::with_capacity(found.len());
+    for (_, _, path) in found {
+        let mut item = entry(root, &path, badges)?;
+        if item.kind == EntryKind::Dir && depth > 1 {
+            item.children = Some(list_dir(root, &path, depth - 1, badges, limit, truncated)?);
+        }
+        out.push(item);
+    }
     Ok(out)
 }
 
@@ -638,7 +716,6 @@ fn entry(
     root: &Path,
     path: &Path,
     badges: &HashMap<String, String>,
-    child_depth: u32,
 ) -> Result<Entry, BusError> {
     let md = fs::symlink_metadata(path).map_err(|e| io_err("file.stat_failed", path, e))?;
     let rel = path
@@ -652,11 +729,6 @@ fn entry(
         EntryKind::Dir
     } else {
         EntryKind::File
-    };
-    let children = if kind == EntryKind::Dir && child_depth > 0 {
-        Some(list_dir(root, path, child_depth, badges)?)
-    } else {
-        None
     };
     let modified_at = md
         .modified()
@@ -674,7 +746,7 @@ fn entry(
         size: (kind == EntryKind::File).then_some(md.len() as i64),
         modified_at,
         badge: badges.get(&rel).cloned(),
-        children,
+        children: None,
     })
 }
 
@@ -800,7 +872,7 @@ fn relocate(ctx: &mut Ctx, prepared: PreparedPath, code: &str) -> Result<Entry, 
     }
     fs::rename(&from, &into).map_err(|e| io_err(code, &from_rel, e))?;
     changed(ctx, project_id, &root, &into_rel.to_string_lossy());
-    entry(&root, &into, &HashMap::new(), 0)
+    entry(&root, &into, &HashMap::new())
 }
 
 /// One source of a staged `file.import`, already copied into the staging directory.
@@ -916,6 +988,29 @@ fn read_searchable(root: &Path, path: &Path, buffer: &mut Vec<u8>) -> bool {
     file.read_to_end(buffer).is_ok()
 }
 
+/// The longest hit `text` file.search returns, in bytes. Hits were whole lines, and one match
+/// in a minified bundle or source map made a reply the client could not read (RA-212).
+const HIT_TEXT_MAX: usize = 240;
+/// How much of the line before the match a cut hit keeps.
+const HIT_TEXT_BEFORE: usize = 80;
+
+/// `line` whole when it is short, or a window of at most [`HIT_TEXT_MAX`] bytes around the match
+/// at byte `at`, cut on character boundaries. Returns the text and its byte offset in `line`.
+fn hit_window(line: &str, at: usize) -> (&str, usize) {
+    if line.len() <= HIT_TEXT_MAX {
+        return (line, 0);
+    }
+    let mut start = at.saturating_sub(HIT_TEXT_BEFORE);
+    while !line.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = (start + HIT_TEXT_MAX).min(line.len());
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&line[start..end], start)
+}
+
 fn mime(path: &Path) -> String {
     match path
         .extension()
@@ -954,5 +1049,23 @@ mod tests {
         assert_eq!(line_counts(&old, &new), (20_000, 20_000));
         assert!(started.elapsed() < std::time::Duration::from_secs(5), "took {:?}", started.elapsed());
         assert_eq!(line_counts("a\nb\nc\n", "a\nc\nd\n"), (1, 1));
+    }
+
+    /// RA-212: a long line is cut to a window that starts before the match and still holds it,
+    /// on character boundaries, and says where in the line it starts.
+    #[test]
+    fn a_long_hit_line_is_cut_to_a_window_around_the_match() {
+        assert_eq!(hit_window("short line", 6), ("short line", 0));
+        let line = format!("{}needle{}", "é".repeat(5000), "x".repeat(5000));
+        let at = line.find("needle").unwrap();
+        let (text, offset) = hit_window(&line, at);
+        assert!(text.len() <= HIT_TEXT_MAX && text.len() > HIT_TEXT_MAX - 4, "{}", text.len());
+        assert!(offset <= at && at - offset <= HIT_TEXT_BEFORE);
+        assert_eq!(&text[at - offset..at - offset + 6], "needle");
+        assert_eq!(&line[offset..offset + text.len()], text);
+        // At the very start or end of a line the window runs to that edge.
+        assert_eq!(hit_window(&line, 0).1, 0);
+        let (tail, offset) = hit_window(&line, line.len() - 1);
+        assert_eq!(offset + tail.len(), line.len());
     }
 }
