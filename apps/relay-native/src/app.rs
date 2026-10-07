@@ -397,6 +397,456 @@ pub fn run(rt: Handle) -> glib::ExitCode {
     app.run_with_args::<&str>(&[])
 }
 
+/// The title bar, and the keys on it that the rest of the window wires up.
+struct TopBar {
+    handle: gtk::WindowHandle,
+    sidebar_key: gtk::Button,
+    brand: gtk::Label,
+    actions: gtk::Box,
+    palette_key: gtk::Button,
+    layouts_key: gtk::Button,
+    skills_key: gtk::Button,
+    plugins_key: gtk::Button,
+    notifications_key: gtk::Button,
+    notification_count: gtk::Label,
+    reconnect: gtk::Button,
+    launch_key: gtk::Button,
+    launch_caption: gtk::Label,
+}
+
+fn top_bar(window: &gtk::ApplicationWindow) -> TopBar {
+    let top = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+    top.add_css_class("topbar");
+    let sidebar_key = icon_button("sidebar-show-symbolic", "Toggle sidebar");
+    sidebar_key.set_widget_name("sidebar-toggle");
+    let top_left = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    top_left.add_css_class("topbar-left");
+    top_left.set_size_request(194, -1);
+    sidebar_key.set_child(Some(&crate::icons::image("sidebar", 14)));
+    top_left.append(&sidebar_key);
+    let mark = label("R", "brand-mark");
+    mark.set_valign(gtk::Align::Center);
+    mark.set_xalign(0.5);
+    top_left.append(&mark);
+    let brand = label("RELAY", "brand");
+    top_left.append(&brand);
+    top.append(&top_left);
+    let top_space = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    top_space.set_hexpand(true);
+    top.append(&top_space);
+    let top_actions = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+    top_actions.add_css_class("topbar-actions");
+    top.append(&top_actions);
+    let palette_key = icon_button("system-search-symbolic", "Command palette · Ctrl K");
+    palette_key.set_widget_name("command-palette");
+    let layouts_key = icon_button("view-grid-symbolic", "Window presets");
+    layouts_key.set_widget_name("window-presets");
+    let skills_key = icon_button("skills", "Skills for this project");
+    let plugins_key = icon_button("plugins", "Plugins for this project");
+    plugins_key.set_widget_name("project-plugins");
+    let notifications_key = icon_button("alarm-symbolic", "Notifications");
+    let bell = gtk::Overlay::new();
+    bell.set_child(Some(&crate::icons::image("bell", 16)));
+    let notification_count = label("", "notification-count");
+    notification_count.set_halign(gtk::Align::End);
+    notification_count.set_valign(gtk::Align::Start);
+    notification_count.set_visible(false);
+    notification_count.set_can_target(false);
+    bell.add_overlay(&notification_count);
+    notifications_key.set_child(Some(&bell));
+    for key in [
+        &palette_key,
+        &skills_key,
+        &plugins_key,
+        &layouts_key,
+        &notifications_key,
+    ] {
+        top_actions.append(key);
+    }
+    let reconnect = icon_button("view-refresh-symbolic", "Reconnect to engine");
+    top_actions.append(&reconnect);
+    reconnect.set_visible(false);
+    let launch_key = button("New session", "primary");
+    launch_key.set_widget_name("new-session");
+    let launch_label = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    launch_label.append(&crate::icons::image_with_stroke("plus", 14, 2.0));
+    let launch_caption = label("New session", "");
+    launch_label.append(&launch_caption);
+    launch_key.set_child(Some(&launch_label));
+    launch_key.set_valign(gtk::Align::Center);
+    launch_key.add_css_class("launch-key");
+    top_actions.append(&launch_key);
+    let window_controls = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    window_controls.add_css_class("window-controls");
+    for (icon, caption, size) in [
+        ("minimize", "Minimize", 14),
+        ("maximize", "Maximize", 12),
+        ("close", "Close", 14),
+    ] {
+        let key = icon_button(icon, caption);
+        key.remove_css_class("icon-key");
+        key.add_css_class("window-control");
+        key.set_margin_top(0);
+        key.set_margin_bottom(0);
+        key.set_child(Some(&crate::icons::image(icon, size)));
+        if icon == "close" {
+            key.add_css_class("window-close");
+        }
+        let window = window.downgrade();
+        key.connect_clicked(move |_| {
+            if let Some(window) = window.upgrade() {
+                match icon {
+                    "minimize" => window.minimize(),
+                    "maximize" if window.is_maximized() => window.unmaximize(),
+                    "maximize" => window.maximize(),
+                    _ => window.close(),
+                }
+            }
+        });
+        window_controls.append(&key);
+    }
+    top.append(&window_controls);
+    let handle = gtk::WindowHandle::new();
+    handle.set_child(Some(&top));
+    // The bar lives inside the wallpaper backdrop so panel opacity shows the wallpaper
+    // behind it, like the status bar. A hidden titlebar keeps client-side decorations
+    // and their resize edges; the WindowHandle still drags and maximizes the window.
+    let titlebar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    titlebar.set_visible(false);
+    window.set_titlebar(Some(&titlebar));
+    TopBar {
+        handle,
+        sidebar_key,
+        brand,
+        actions: top_actions,
+        palette_key,
+        layouts_key,
+        skills_key,
+        plugins_key,
+        notifications_key,
+        notification_count,
+        reconnect,
+        launch_key,
+        launch_caption,
+    }
+}
+
+/// The notice under the title bar: the label, which stays the notice's source of truth
+/// (`show_error`, smoke checks), and the bar around it, which follows its visibility and
+/// carries the dismiss key.
+fn notice_bar() -> (gtk::Label, gtk::Box) {
+    let notice = label("Connecting to the Relay engine…", "notice");
+    notice.set_wrap(true);
+    notice.set_selectable(true);
+    notice.set_hexpand(true);
+    // The label stays the notice's source of truth (`show_error`, smoke checks); the bar
+    // around it follows its visibility and carries the dismiss key.
+    let notice_bar = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    notice_bar.add_css_class("notice-bar");
+    notice_bar.append(&notice);
+    let notice_close = icon_button("close", "Dismiss");
+    notice_close.set_widget_name("notice-dismiss");
+    notice_close.add_css_class("notice-dismiss");
+    notice_close.set_valign(gtk::Align::Start);
+    notice_bar.append(&notice_close);
+    notice
+        .bind_property("visible", &notice_bar, "visible")
+        .sync_create()
+        .build();
+    let weak_notice = notice.downgrade();
+    notice_close.connect_clicked(move |_| {
+        if let Some(notice) = weak_notice.upgrade() {
+            notice.set_visible(false);
+        }
+    });
+    (notice, notice_bar)
+}
+
+/// The sidebar: page keys, the workspaces and their projects, and Settings at the foot.
+struct Sidebar {
+    root: gtk::Box,
+    nav: gtk::Box,
+    add_project: gtk::Button,
+    projects_box: gtk::Box,
+    settings_key: gtk::Button,
+}
+
+fn sidebar() -> Sidebar {
+    let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    sidebar.set_size_request(200, -1);
+    sidebar.set_hexpand(false);
+    sidebar.add_css_class("sidebar");
+    let nav = gtk::Box::new(gtk::Orientation::Vertical, 1);
+    nav.add_css_class("navigation");
+    sidebar.append(&nav);
+    let section = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    section.add_css_class("workspace-heading");
+    let heading = label("WORKSPACES", "section-label");
+    heading.set_hexpand(true);
+    section.append(&heading);
+    let add_project = icon_button("plus", "Open repository");
+    section.append(&add_project);
+    sidebar.append(&section);
+    let projects_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let project_scroll = scrolled(&projects_box);
+    project_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    sidebar.append(&project_scroll);
+    let settings_key = nav_button("Settings", "settings");
+    settings_key.add_css_class("settings-key");
+    let sidebar_footer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    sidebar_footer.add_css_class("sidebar-footer");
+    sidebar_footer.append(&settings_key);
+    sidebar.append(&sidebar_footer);
+    Sidebar { root: sidebar, nav, add_project, projects_box, settings_key }
+}
+
+/// The agent wall: the panes' grid and its right column, the empty state, and the focus tabs.
+struct Wall {
+    agents: gtk::Box,
+    focus_tabs: gtk::Box,
+    wall: gtk::Grid,
+    wall_right: gtk::Grid,
+    wall_split: gtk::Paned,
+    wall_stack: gtk::Stack,
+    empty_title: gtk::Label,
+    empty_launch: gtk::Button,
+}
+
+fn wall() -> Wall {
+    let wall = gtk::Grid::builder()
+        .hexpand(true)
+        .vexpand(true)
+        .column_homogeneous(true)
+        .row_homogeneous(true)
+        .column_spacing(2)
+        .row_spacing(2)
+        .build();
+    let wall_stack = gtk::Stack::new();
+    wall_stack.set_vexpand(true);
+    let wall_right = gtk::Grid::builder()
+        .hexpand(true)
+        .vexpand(true)
+        .row_homogeneous(true)
+        .row_spacing(2)
+        .build();
+    let wall_split = gtk::Paned::new(gtk::Orientation::Horizontal);
+    wall_split.add_css_class("wall-split");
+    wall_split.set_start_child(Some(&wall));
+    wall_split.set_end_child(Some(&wall_right));
+    wall_split.set_position(600);
+    wall_split.set_shrink_start_child(false);
+    wall_split.set_shrink_end_child(false);
+    wall.set_size_request(280, -1);
+    wall_right.set_size_request(280, -1);
+    let wall_scroll = scrolled(&wall_split);
+    // Files and Git can leave less room than the terminal panes' minimum.
+    // Keep their content reachable instead of allocating below that minimum.
+    wall_scroll.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Automatic);
+    wall_scroll.set_overlay_scrolling(false);
+    wall_stack.add_named(&wall_scroll, Some("wall"));
+    let empty = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    empty.add_css_class("wall-empty");
+    empty.set_valign(gtk::Align::Center);
+    empty.set_halign(gtk::Align::Center);
+    let empty_glyph = crate::icons::image_with_stroke("grid", 28, 1.0);
+    empty_glyph.add_css_class("empty-glyph");
+    empty.append(&empty_glyph);
+    let empty_title = label("No sessions", "title");
+    empty_title.set_halign(gtk::Align::Center);
+    empty.append(&empty_title);
+    let empty_description = label(
+        "Launch a solo agent in its own worktree, or a builder–reviewer pair on one branch. Each session lands here as a tile.",
+        "empty-description",
+    );
+    empty_description.set_wrap(true);
+    empty_description.set_max_width_chars(52);
+    empty_description.set_justify(gtk::Justification::Center);
+    empty.append(&empty_description);
+    let empty_launch = button("", "primary");
+    let empty_action = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    empty_action.append(&crate::icons::image_with_stroke("plus", 14, 2.0));
+    empty_action.append(&label("Session", ""));
+    empty_launch.set_child(Some(&empty_action));
+    empty_launch.set_halign(gtk::Align::Center);
+    empty.append(&empty_launch);
+    wall_stack.add_named(&empty, Some("empty"));
+    wall_stack.set_visible_child_name("empty");
+    let agents = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let focus_tabs = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+    focus_tabs.add_css_class("focus-tabs");
+    agents.append(&focus_tabs);
+    let wall_body = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    wall_body.append(&wall_stack);
+    agents.append(&wall_body);
+    Wall { agents, focus_tabs, wall, wall_right, wall_split, wall_stack, empty_title, empty_launch }
+}
+
+/// Every page but the agent wall, added to `content`. Notes has a box but no place in it.
+fn pages(content: &gtk::Stack) -> BTreeMap<String, gtk::Box> {
+    let mut pages = BTreeMap::new();
+    for name in [
+        "board",
+        "modules",
+        "mailbox",
+        "guardrails",
+        "notes",
+        "dashboard",
+        "settings",
+        "skills",
+        "plugins",
+        "devices",
+    ] {
+        let page = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        page.add_css_class("page");
+        page.set_vexpand(true);
+        if name == "notes" {
+            // The Notes workspace lives in its own retained native window.
+        } else if name == "board" {
+            content.add_named(&page, Some(name));
+        } else {
+            content.add_named(&scrolled(&page), Some(name));
+        }
+        pages.insert(name.into(), page);
+    }
+    pages
+}
+
+/// The New session sheet over `body`, and the scrim that closes it.
+struct LaunchSheet {
+    overlay: gtk::Overlay,
+    launch: gtk::Revealer,
+    launch_box: gtk::Box,
+    scrim: gtk::Button,
+}
+
+fn launch_sheet(body: &gtk::Box) -> LaunchSheet {
+    let launch_box = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    launch_box.add_css_class("launch");
+    launch_box.set_size_request(780, -1);
+    let launch = gtk::Revealer::new();
+    // Its fixed-width allocation remains above the page when collapsed.
+    launch.set_can_target(false);
+    launch.set_transition_duration(0);
+    launch.set_hexpand(false);
+    launch.set_child(Some(&launch_box));
+    launch.set_halign(gtk::Align::End);
+    launch.set_size_request(780, -1);
+    let overlay = gtk::Overlay::new();
+    overlay.set_child(Some(body));
+    let scrim = gtk::Button::new();
+    scrim.add_css_class("launch-scrim");
+    scrim.set_visible(false);
+    scrim.update_property(&[gtk::accessible::Property::Label("Close new session")]);
+    overlay.add_overlay(&scrim);
+    overlay.add_overlay(&launch);
+    let weak_body = body.downgrade();
+    let weak_scrim = scrim.downgrade();
+    launch.connect_child_revealed_notify(move |launch| {
+        launch.set_can_target(launch.reveals_child());
+        if let Some(scrim) = weak_scrim.upgrade() {
+            scrim.set_visible(launch.reveals_child());
+        }
+        if let Some(body) = weak_body.upgrade() {
+            body.set_sensitive(!launch.reveals_child());
+        }
+    });
+    LaunchSheet { overlay, launch, launch_box, scrim }
+}
+
+/// The status bar along the bottom.
+struct StatusBar {
+    root: gtk::Box,
+    status_project: gtk::Label,
+    status_branch: gtk::Label,
+    status: gtk::Label,
+    usage_key: gtk::Button,
+    usage_meters: gtk::Box,
+    devices_key: gtk::Button,
+    device_status: gtk::Label,
+    resources_key: gtk::Button,
+    resource_status: gtk::Box,
+}
+
+/// The bar, and the usage strip it shows.
+fn status_bar() -> (StatusBar, status::UsageState) {
+    let bottom = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    bottom.add_css_class("statusbar");
+    let status_project = label("No project", "status-project");
+    status_project.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    status_project.set_max_width_chars(24);
+    let status_branch = label("", "mono");
+    status_branch.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    status_branch.set_max_width_chars(18);
+    bottom.append(&status_project);
+    bottom.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+    bottom.append(&crate::icons::image("branch", 11));
+    bottom.append(&status_branch);
+    bottom.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+    bottom.append(&label("linux · local", "status-platform"));
+    let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    spacer.set_hexpand(true);
+    bottom.append(&spacer);
+    let status = label("Engine disconnected", "");
+    bottom.append(&status);
+    let usage_key = button("", "quiet");
+    usage_key.set_tooltip_text(Some("Provider usage"));
+    usage_key.set_widget_name("status-usage");
+    let usage_meters = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    usage_key.set_child(Some(&usage_meters));
+    let devices_key = button("", "quiet");
+    devices_key.set_widget_name("status-devices");
+    let device_status = label("No device", "mono");
+    let device_content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    device_content.append(&crate::icons::image("device", 12));
+    device_content.append(&device_status);
+    devices_key.set_child(Some(&device_content));
+    let resources_key = icon_button("cpu", "Resources");
+    resources_key.set_widget_name("status-resources");
+    let resource_content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    resource_content.append(&crate::icons::image("cpu", 12));
+    let resource_status = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    resource_content.append(&resource_status);
+    resources_key.set_child(Some(&resource_content));
+    bottom.append(&usage_key);
+    let usage = status::UsageState::new();
+    bottom.append(&usage.strip);
+    bottom.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+    bottom.append(&devices_key);
+    bottom.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+    bottom.append(&resources_key);
+    let bar = StatusBar {
+        root: bottom,
+        status_project,
+        status_branch,
+        status,
+        usage_key,
+        usage_meters,
+        devices_key,
+        device_status,
+        resources_key,
+        resource_status,
+    };
+    (bar, usage)
+}
+
+/// Puts `outer` over the wallpaper and its dim layer, as the window's content.
+fn backdrop(window: &gtk::ApplicationWindow, outer: &gtk::Box) -> (gtk::Picture, gtk::Box) {
+    let wallpaper = gtk::Picture::new();
+    wallpaper.set_can_shrink(true);
+    wallpaper.set_content_fit(gtk::ContentFit::Cover);
+    let backdrop = gtk::Overlay::new();
+    backdrop.set_child(Some(&wallpaper));
+    let wallpaper_dim = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    wallpaper_dim.add_css_class("wallpaper-dim");
+    wallpaper_dim.set_can_target(false);
+    backdrop.add_overlay(&wallpaper_dim);
+    backdrop.add_overlay(outer);
+    outer.set_hexpand(true);
+    outer.set_vexpand(true);
+    window.set_child(Some(&backdrop));
+    (wallpaper, wallpaper_dim)
+}
+
 impl Ui {
     fn build(app: &gtk::Application, rt: Handle, path: PathBuf) -> Rc<Self> {
         let window = gtk::ApplicationWindow::builder()
@@ -408,159 +858,14 @@ impl Ui {
         crate::fonts::install(&window);
         crate::icons::install_app_icon(&window);
         let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        let top = gtk::Box::new(gtk::Orientation::Horizontal, 2);
-        top.add_css_class("topbar");
-        let sidebar_key = icon_button("sidebar-show-symbolic", "Toggle sidebar");
-        sidebar_key.set_widget_name("sidebar-toggle");
-        let top_left = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        top_left.add_css_class("topbar-left");
-        top_left.set_size_request(194, -1);
-        sidebar_key.set_child(Some(&crate::icons::image("sidebar", 14)));
-        top_left.append(&sidebar_key);
-        let mark = label("R", "brand-mark");
-        mark.set_valign(gtk::Align::Center);
-        mark.set_xalign(0.5);
-        top_left.append(&mark);
-        let brand = label("RELAY", "brand");
-        top_left.append(&brand);
-        top.append(&top_left);
-        let top_space = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        top_space.set_hexpand(true);
-        top.append(&top_space);
-        let top_actions = gtk::Box::new(gtk::Orientation::Horizontal, 2);
-        top_actions.add_css_class("topbar-actions");
-        top.append(&top_actions);
-        let palette_key = icon_button("system-search-symbolic", "Command palette · Ctrl K");
-        palette_key.set_widget_name("command-palette");
-        let layouts_key = icon_button("view-grid-symbolic", "Window presets");
-        layouts_key.set_widget_name("window-presets");
-        let skills_key = icon_button("skills", "Skills for this project");
-        let plugins_key = icon_button("plugins", "Plugins for this project");
-        plugins_key.set_widget_name("project-plugins");
-        let notifications_key = icon_button("alarm-symbolic", "Notifications");
-        let bell = gtk::Overlay::new();
-        bell.set_child(Some(&crate::icons::image("bell", 16)));
-        let notification_count = label("", "notification-count");
-        notification_count.set_halign(gtk::Align::End);
-        notification_count.set_valign(gtk::Align::Start);
-        notification_count.set_visible(false);
-        notification_count.set_can_target(false);
-        bell.add_overlay(&notification_count);
-        notifications_key.set_child(Some(&bell));
-        for key in [
-            &palette_key,
-            &skills_key,
-            &plugins_key,
-            &layouts_key,
-            &notifications_key,
-        ] {
-            top_actions.append(key);
-        }
-        let reconnect = icon_button("view-refresh-symbolic", "Reconnect to engine");
-        top_actions.append(&reconnect);
-        reconnect.set_visible(false);
-        let launch_key = button("New session", "primary");
-        launch_key.set_widget_name("new-session");
-        let launch_label = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        launch_label.append(&crate::icons::image_with_stroke("plus", 14, 2.0));
-        let launch_caption = label("New session", "");
-        launch_label.append(&launch_caption);
-        launch_key.set_child(Some(&launch_label));
-        launch_key.set_valign(gtk::Align::Center);
-        launch_key.add_css_class("launch-key");
-        top_actions.append(&launch_key);
-        let window_controls = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        window_controls.add_css_class("window-controls");
-        for (icon, caption, size) in [
-            ("minimize", "Minimize", 14),
-            ("maximize", "Maximize", 12),
-            ("close", "Close", 14),
-        ] {
-            let key = icon_button(icon, caption);
-            key.remove_css_class("icon-key");
-            key.add_css_class("window-control");
-            key.set_margin_top(0);
-            key.set_margin_bottom(0);
-            key.set_child(Some(&crate::icons::image(icon, size)));
-            if icon == "close" {
-                key.add_css_class("window-close");
-            }
-            let window = window.downgrade();
-            key.connect_clicked(move |_| {
-                if let Some(window) = window.upgrade() {
-                    match icon {
-                        "minimize" => window.minimize(),
-                        "maximize" if window.is_maximized() => window.unmaximize(),
-                        "maximize" => window.maximize(),
-                        _ => window.close(),
-                    }
-                }
-            });
-            window_controls.append(&key);
-        }
-        top.append(&window_controls);
-        let handle = gtk::WindowHandle::new();
-        handle.set_child(Some(&top));
-        // The bar lives inside the wallpaper backdrop so panel opacity shows the wallpaper
-        // behind it, like the status bar. A hidden titlebar keeps client-side decorations
-        // and their resize edges; the WindowHandle still drags and maximizes the window.
-        let titlebar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        titlebar.set_visible(false);
-        window.set_titlebar(Some(&titlebar));
-        outer.append(&handle);
-        let notice = label("Connecting to the Relay engine…", "notice");
-        notice.set_wrap(true);
-        notice.set_selectable(true);
-        notice.set_hexpand(true);
-        // The label stays the notice's source of truth (`show_error`, smoke checks); the bar
-        // around it follows its visibility and carries the dismiss key.
-        let notice_bar = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        notice_bar.add_css_class("notice-bar");
-        notice_bar.append(&notice);
-        let notice_close = icon_button("close", "Dismiss");
-        notice_close.set_widget_name("notice-dismiss");
-        notice_close.add_css_class("notice-dismiss");
-        notice_close.set_valign(gtk::Align::Start);
-        notice_bar.append(&notice_close);
-        notice
-            .bind_property("visible", &notice_bar, "visible")
-            .sync_create()
-            .build();
-        let weak_notice = notice.downgrade();
-        notice_close.connect_clicked(move |_| {
-            if let Some(notice) = weak_notice.upgrade() {
-                notice.set_visible(false);
-            }
-        });
+        let top = top_bar(&window);
+        outer.append(&top.handle);
+        let (notice, notice_bar) = notice_bar();
         outer.append(&notice_bar);
         let body = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         body.set_vexpand(true);
-        let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        sidebar.set_size_request(200, -1);
-        sidebar.set_hexpand(false);
-        sidebar.add_css_class("sidebar");
-        let nav = gtk::Box::new(gtk::Orientation::Vertical, 1);
-        nav.add_css_class("navigation");
-        sidebar.append(&nav);
-        let section = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        section.add_css_class("workspace-heading");
-        let heading = label("WORKSPACES", "section-label");
-        heading.set_hexpand(true);
-        section.append(&heading);
-        let add_project = icon_button("plus", "Open repository");
-        section.append(&add_project);
-        sidebar.append(&section);
-        let projects_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        let project_scroll = scrolled(&projects_box);
-        project_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
-        sidebar.append(&project_scroll);
-        let settings_key = nav_button("Settings", "settings");
-        settings_key.add_css_class("settings-key");
-        let sidebar_footer = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        sidebar_footer.add_css_class("sidebar-footer");
-        sidebar_footer.append(&settings_key);
-        sidebar.append(&sidebar_footer);
-        body.append(&sidebar);
+        let side = sidebar();
+        body.append(&side.root);
         let content = gtk::Stack::new();
         content.set_hhomogeneous(false);
         content.set_vhomogeneous(false);
@@ -569,197 +874,24 @@ impl Ui {
         let page_overlay = gtk::Overlay::new();
         page_overlay.set_child(Some(&content));
         body.append(&page_overlay);
-        let wall = gtk::Grid::builder()
-            .hexpand(true)
-            .vexpand(true)
-            .column_homogeneous(true)
-            .row_homogeneous(true)
-            .column_spacing(2)
-            .row_spacing(2)
-            .build();
-        let wall_stack = gtk::Stack::new();
-        wall_stack.set_vexpand(true);
-        let wall_right = gtk::Grid::builder()
-            .hexpand(true)
-            .vexpand(true)
-            .row_homogeneous(true)
-            .row_spacing(2)
-            .build();
-        let wall_split = gtk::Paned::new(gtk::Orientation::Horizontal);
-        wall_split.add_css_class("wall-split");
-        wall_split.set_start_child(Some(&wall));
-        wall_split.set_end_child(Some(&wall_right));
-        wall_split.set_position(600);
-        wall_split.set_shrink_start_child(false);
-        wall_split.set_shrink_end_child(false);
-        wall.set_size_request(280, -1);
-        wall_right.set_size_request(280, -1);
-        let wall_scroll = scrolled(&wall_split);
-        // Files and Git can leave less room than the terminal panes' minimum.
-        // Keep their content reachable instead of allocating below that minimum.
-        wall_scroll.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Automatic);
-        wall_scroll.set_overlay_scrolling(false);
-        wall_stack.add_named(&wall_scroll, Some("wall"));
-        let empty = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        empty.add_css_class("wall-empty");
-        empty.set_valign(gtk::Align::Center);
-        empty.set_halign(gtk::Align::Center);
-        let empty_glyph = crate::icons::image_with_stroke("grid", 28, 1.0);
-        empty_glyph.add_css_class("empty-glyph");
-        empty.append(&empty_glyph);
-        let empty_title = label("No sessions", "title");
-        empty_title.set_halign(gtk::Align::Center);
-        empty.append(&empty_title);
-        let empty_description = label(
-            "Launch a solo agent in its own worktree, or a builder–reviewer pair on one branch. Each session lands here as a tile.",
-            "empty-description",
-        );
-        empty_description.set_wrap(true);
-        empty_description.set_max_width_chars(52);
-        empty_description.set_justify(gtk::Justification::Center);
-        empty.append(&empty_description);
-        let empty_launch = button("", "primary");
-        let empty_action = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        empty_action.append(&crate::icons::image_with_stroke("plus", 14, 2.0));
-        empty_action.append(&label("Session", ""));
-        empty_launch.set_child(Some(&empty_action));
-        empty_launch.set_halign(gtk::Align::Center);
-        empty.append(&empty_launch);
-        wall_stack.add_named(&empty, Some("empty"));
-        wall_stack.set_visible_child_name("empty");
-        let agents = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        let focus_tabs = gtk::Box::new(gtk::Orientation::Horizontal, 2);
-        focus_tabs.add_css_class("focus-tabs");
-        agents.append(&focus_tabs);
-        let wall_body = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        wall_body.append(&wall_stack);
-        agents.append(&wall_body);
+        let wall = wall();
         let editor = crate::editor::Editor::new();
-        editor.mount_agents(&agents);
+        editor.mount_agents(&wall.agents);
         // Panel opacity reaches the terminals only if the stacks between them and the
         // wallpaper stop repainting @wall on top of each other (see css/usage.css).
-        agents.add_css_class("agents-surface");
-        if let Some(host) = agents.parent() {
+        wall.agents.add_css_class("agents-surface");
+        if let Some(host) = wall.agents.parent() {
             host.add_css_class("agents-host");
         }
         content.add_named(&editor.root, Some("agents"));
-        let mut pages = BTreeMap::new();
-        for name in [
-            "board",
-            "modules",
-            "mailbox",
-            "guardrails",
-            "notes",
-            "dashboard",
-            "settings",
-            "skills",
-            "plugins",
-            "devices",
-        ] {
-            let page = gtk::Box::new(gtk::Orientation::Vertical, 12);
-            page.add_css_class("page");
-            page.set_vexpand(true);
-            if name == "notes" {
-                // The Notes workspace lives in its own retained native window.
-            } else if name == "board" {
-                content.add_named(&page, Some(name));
-            } else {
-                content.add_named(&scrolled(&page), Some(name));
-            }
-            pages.insert(name.into(), page);
-        }
-        let launch_box = gtk::Box::new(gtk::Orientation::Vertical, 12);
-        launch_box.add_css_class("launch");
-        launch_box.set_size_request(780, -1);
-        let launch = gtk::Revealer::new();
-        // Its fixed-width allocation remains above the page when collapsed.
-        launch.set_can_target(false);
-        launch.set_transition_duration(0);
-        launch.set_hexpand(false);
-        launch.set_child(Some(&launch_box));
-        launch.set_halign(gtk::Align::End);
-        launch.set_size_request(780, -1);
-        let overlay = gtk::Overlay::new();
-        overlay.set_child(Some(&body));
-        let scrim = gtk::Button::new();
-        scrim.add_css_class("launch-scrim");
-        scrim.set_visible(false);
-        scrim.update_property(&[gtk::accessible::Property::Label("Close new session")]);
-        overlay.add_overlay(&scrim);
-        overlay.add_overlay(&launch);
-        let weak_body = body.downgrade();
-        let weak_scrim = scrim.downgrade();
-        launch.connect_child_revealed_notify(move |launch| {
-            launch.set_can_target(launch.reveals_child());
-            if let Some(scrim) = weak_scrim.upgrade() {
-                scrim.set_visible(launch.reveals_child());
-            }
-            if let Some(body) = weak_body.upgrade() {
-                body.set_sensitive(!launch.reveals_child());
-            }
-        });
+        let pages = pages(&content);
+        let sheet = launch_sheet(&body);
         let panel_host = gtk::Overlay::new();
-        panel_host.set_child(Some(&overlay));
+        panel_host.set_child(Some(&sheet.overlay));
         outer.append(&panel_host);
-        let bottom = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        bottom.add_css_class("statusbar");
-        let status_project = label("No project", "status-project");
-        status_project.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        status_project.set_max_width_chars(24);
-        let status_branch = label("", "mono");
-        status_branch.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        status_branch.set_max_width_chars(18);
-        bottom.append(&status_project);
-        bottom.append(&gtk::Separator::new(gtk::Orientation::Vertical));
-        bottom.append(&crate::icons::image("branch", 11));
-        bottom.append(&status_branch);
-        bottom.append(&gtk::Separator::new(gtk::Orientation::Vertical));
-        bottom.append(&label("linux · local", "status-platform"));
-        let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        spacer.set_hexpand(true);
-        bottom.append(&spacer);
-        let status = label("Engine disconnected", "");
-        bottom.append(&status);
-        let usage_key = button("", "quiet");
-        usage_key.set_tooltip_text(Some("Provider usage"));
-        usage_key.set_widget_name("status-usage");
-        let usage_meters = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        usage_key.set_child(Some(&usage_meters));
-        let devices_key = button("", "quiet");
-        devices_key.set_widget_name("status-devices");
-        let device_status = label("No device", "mono");
-        let device_content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        device_content.append(&crate::icons::image("device", 12));
-        device_content.append(&device_status);
-        devices_key.set_child(Some(&device_content));
-        let resources_key = icon_button("cpu", "Resources");
-        resources_key.set_widget_name("status-resources");
-        let resource_content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        resource_content.append(&crate::icons::image("cpu", 12));
-        let resource_status = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        resource_content.append(&resource_status);
-        resources_key.set_child(Some(&resource_content));
-        bottom.append(&usage_key);
-        let usage = status::UsageState::new();
-        bottom.append(&usage.strip);
-        bottom.append(&gtk::Separator::new(gtk::Orientation::Vertical));
-        bottom.append(&devices_key);
-        bottom.append(&gtk::Separator::new(gtk::Orientation::Vertical));
-        bottom.append(&resources_key);
-        outer.append(&bottom);
-        let wallpaper = gtk::Picture::new();
-        wallpaper.set_can_shrink(true);
-        wallpaper.set_content_fit(gtk::ContentFit::Cover);
-        let backdrop = gtk::Overlay::new();
-        backdrop.set_child(Some(&wallpaper));
-        let wallpaper_dim = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        wallpaper_dim.add_css_class("wallpaper-dim");
-        wallpaper_dim.set_can_target(false);
-        backdrop.add_overlay(&wallpaper_dim);
-        backdrop.add_overlay(&outer);
-        outer.set_hexpand(true);
-        outer.set_vexpand(true);
-        window.set_child(Some(&backdrop));
+        let (bar, usage) = status_bar();
+        outer.append(&bar.root);
+        let (wallpaper, wallpaper_dim) = backdrop(&window, &outer);
         let ui = Rc::new(Self {
             window,
             rt,
@@ -780,19 +912,19 @@ impl Ui {
             pages,
             page_projects: RefCell::default(),
             notice,
-            status,
-            usage_meters,
+            status: bar.status.clone(),
+            usage_meters: bar.usage_meters.clone(),
             usage,
-            device_status,
-            resource_status,
-            notification_count,
+            device_status: bar.device_status.clone(),
+            resource_status: bar.resource_status.clone(),
+            notification_count: top.notification_count.clone(),
             notification_revision: Cell::new(0),
             setup_checked: Cell::new(false),
-            status_project,
-            status_branch,
-            sidebar,
+            status_project: bar.status_project.clone(),
+            status_branch: bar.status_branch.clone(),
+            sidebar: side.root.clone(),
             settings_sidebar: Cell::new(true),
-            focus_tabs,
+            focus_tabs: wall.focus_tabs,
             mode: RefCell::new("grid".into()),
             overlay: panel_host,
             page_overlay,
@@ -812,12 +944,12 @@ impl Ui {
             palette: RefCell::new("matte".into()),
             keybindings: RefCell::new(json!({})),
             sound_busy: Cell::new(false),
-            projects_box,
-            wall,
-            wall_right,
-            wall_split,
-            wall_stack,
-            empty_title,
+            projects_box: side.projects_box.clone(),
+            wall: wall.wall,
+            wall_right: wall.wall_right,
+            wall_split: wall.wall_split,
+            wall_stack: wall.wall_stack,
+            empty_title: wall.empty_title,
             panes: RefCell::default(),
             ordered: RefCell::default(),
             columns: Cell::new(2),
@@ -827,12 +959,12 @@ impl Ui {
             page_pending: Cell::new(false),
             page_dirty: Cell::new(false),
             connected: Cell::new(false),
-            reconnect: reconnect.clone(),
+            reconnect: top.reconnect.clone(),
             appearance_pending: Cell::new(false),
-            launch,
-            launch_caption,
+            launch: sheet.launch.clone(),
+            launch_caption: top.launch_caption.clone(),
             launch_busy: Cell::new(false),
-            launch_box,
+            launch_box: sheet.launch_box.clone(),
             editor,
             note_tabs: gtk::Notebook::new(),
             notes_window: RefCell::default(),
@@ -840,6 +972,18 @@ impl Ui {
             wallpaper_draft: RefCell::default(),
             provider_updates_checked: Cell::new(false),
         });
+        ui.wire_navigation(&side, &top);
+        ui.wire_settings_return(&top, &bar.root);
+        ui.wire_keys(&top, &bar, &wall.empty_launch, &side.add_project, &sheet.scrim);
+        ui.wire_window();
+        ui
+    }
+
+    /// The sidebar's page keys and Settings, and the title bar's notifications, Skills and
+    /// Plugins keys.
+    fn wire_navigation(self: &Rc<Self>, side: &Sidebar, top: &TopBar) {
+        let ui = self;
+        let nav = &side.nav;
         for (name, caption, icon) in [
             ("dashboard", "Dashboard", "view-app-grid-symbolic"),
             ("skills", "Skills", "applications-science-symbolic"),
@@ -856,38 +1000,45 @@ impl Ui {
             }
             track_navigation(&ui.content, &b, name);
             nav.append(&b);
-            let weak = Rc::downgrade(&ui);
+            let weak = Rc::downgrade(ui);
             b.connect_clicked(move |_| {
                 if let Some(ui) = weak.upgrade() {
                     ui.toggle_page(name);
                 }
             });
         }
-        let weak = Rc::downgrade(&ui);
-        settings_key.connect_clicked(move |_| {
+        let weak = Rc::downgrade(ui);
+        side.settings_key.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
                 ui.toggle_page("settings");
             }
         });
         // Notifications open in place under the bell, never as a page of their own.
-        notification_center::install(&ui, &notifications_key);
-        let weak = Rc::downgrade(&ui);
-        skills_key.connect_clicked(move |_| {
+        notification_center::install(ui, &top.notifications_key);
+        let weak = Rc::downgrade(ui);
+        top.skills_key.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
                 ui.project_skills();
             }
         });
-        let weak = Rc::downgrade(&ui);
-        plugins_key.connect_clicked(move |_| {
+        let weak = Rc::downgrade(ui);
+        top.plugins_key.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
                 ui.project_plugins();
             }
         });
+    }
+
+    /// Settings takes the whole window: it hides the sidebar, the title bar's actions and the
+    /// status bar, and turns the sidebar key into a back key to the page it was opened from.
+    fn wire_settings_return(self: &Rc<Self>, top: &TopBar, bottom: &gtk::Box) {
+        let ui = self;
+        let (brand, back_key, top_actions) = (top.brand.clone(), top.sidebar_key.clone(), top.actions.clone());
+        let (skills_key, plugins_key, bottom) = (top.skills_key.clone(), top.plugins_key.clone(), bottom.clone());
         // The page Settings was opened from, which its back key returns to.
         let settings_return = Rc::new(RefCell::new(String::from("agents")));
         let return_state = settings_return.clone();
-        let weak = Rc::downgrade(&ui);
-        let back_key = sidebar_key.clone();
+        let weak = Rc::downgrade(ui);
         let mut_previous = Rc::new(RefCell::new(String::from("agents")));
         ui.content.connect_visible_child_name_notify(move |stack| {
             let Some(ui) = weak.upgrade() else {
@@ -918,8 +1069,8 @@ impl Ui {
             plugins_key.set_visible(page == "agents");
             *mut_previous.borrow_mut() = page.into();
         });
-        let weak = Rc::downgrade(&ui);
-        sidebar_key.connect_clicked(move |_| {
+        let weak = Rc::downgrade(ui);
+        top.sidebar_key.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
                 if ui.page.borrow().as_str() == "settings" {
                     let page = settings_return.borrow().clone();
@@ -930,40 +1081,96 @@ impl Ui {
                 }
             }
         });
-        let weak = Rc::downgrade(&ui);
-        palette_key.connect_clicked(move |_| {
+    }
+
+    /// The title bar's and status bar's remaining keys, the empty wall's launch key, Open
+    /// repository and the launch scrim.
+    fn wire_keys(
+        self: &Rc<Self>,
+        top: &TopBar,
+        bar: &StatusBar,
+        empty_launch: &gtk::Button,
+        add_project: &gtk::Button,
+        scrim: &gtk::Button,
+    ) {
+        let ui = self;
+        let weak = Rc::downgrade(ui);
+        top.palette_key.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
                 ui.command_palette();
             }
         });
-        let weak = Rc::downgrade(&ui);
-        layouts_key.connect_clicked(move |_| {
+        let weak = Rc::downgrade(ui);
+        top.layouts_key.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
                 ui.layout_menu();
             }
         });
-        let weak = Rc::downgrade(&ui);
-        devices_key.connect_clicked(move |_| {
+        let weak = Rc::downgrade(ui);
+        bar.devices_key.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
                 crate::tools::devices::open(&ui);
             }
         });
-        let weak = Rc::downgrade(&ui);
-        resources_key.connect_clicked(move |_| {
+        let weak = Rc::downgrade(ui);
+        bar.resources_key.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
                 ui.resources();
             }
         });
-        let weak = Rc::downgrade(&ui);
+        let weak = Rc::downgrade(ui);
+        bar.usage_key.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                ui.usage_panel();
+            }
+        });
+        for b in [&top.launch_key, empty_launch] {
+            let weak = Rc::downgrade(ui);
+            b.connect_clicked(move |_| {
+                if let Some(ui) = weak.upgrade() {
+                    if ui.launch.reveals_child() && !ui.launch_busy.get() {
+                        ui.launch.set_reveal_child(false);
+                    } else {
+                        ui.show_launch(None);
+                    }
+                }
+            });
+        }
+        let weak = Rc::downgrade(ui);
+        top.reconnect.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                // Reconnecting recreates every pane, the launch's placeholders included.
+                if ui.launch_busy.get() {
+                    ui.show_error("Wait for agent launch to finish before reconnecting.");
+                    return;
+                }
+                ui.connect();
+            }
+        });
+        let weak = Rc::downgrade(ui);
+        add_project.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                ui.open_repository();
+            }
+        });
+        let weak = Rc::downgrade(ui);
+        scrim.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                if !ui.launch_busy.get() {
+                    ui.launch.set_reveal_child(false);
+                }
+            }
+        });
+    }
+
+    /// Window-wide wiring: the Code view, usage polling, shortcuts, the appearance sheet,
+    /// Escape, pane sizes on every layout, and the close policy.
+    fn wire_window(self: &Rc<Self>) {
+        let ui = self;
+        let weak = Rc::downgrade(ui);
         ui.editor.connect_view_changed(move || {
             if let Some(ui) = weak.upgrade() {
                 ui.update_attachments();
-            }
-        });
-        let weak = Rc::downgrade(&ui);
-        usage_key.connect_clicked(move |_| {
-            if let Some(ui) = weak.upgrade() {
-                ui.usage_panel();
             }
         });
         ui.install_usage();
@@ -975,45 +1182,8 @@ impl Ui {
                 gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
             );
         }
-        for b in [launch_key, empty_launch] {
-            let weak = Rc::downgrade(&ui);
-            b.connect_clicked(move |_| {
-                if let Some(ui) = weak.upgrade() {
-                    if ui.launch.reveals_child() && !ui.launch_busy.get() {
-                        ui.launch.set_reveal_child(false);
-                    } else {
-                        ui.show_launch(None);
-                    }
-                }
-            });
-        }
-        let weak = Rc::downgrade(&ui);
-        reconnect.connect_clicked(move |_| {
-            if let Some(ui) = weak.upgrade() {
-                // Reconnecting recreates every pane, the launch's placeholders included.
-                if ui.launch_busy.get() {
-                    ui.show_error("Wait for agent launch to finish before reconnecting.");
-                    return;
-                }
-                ui.connect();
-            }
-        });
-        let weak = Rc::downgrade(&ui);
-        add_project.connect_clicked(move |_| {
-            if let Some(ui) = weak.upgrade() {
-                ui.open_repository();
-            }
-        });
-        let weak = Rc::downgrade(&ui);
-        scrim.connect_clicked(move |_| {
-            if let Some(ui) = weak.upgrade() {
-                if !ui.launch_busy.get() {
-                    ui.launch.set_reveal_child(false);
-                }
-            }
-        });
         let keys = gtk::EventControllerKey::new();
-        let weak = Rc::downgrade(&ui);
+        let weak = Rc::downgrade(ui);
         keys.connect_key_pressed(move |_, key, _, _| {
             if let Some(ui) = weak.upgrade() {
                 if key == gtk::gdk::Key::Escape {
@@ -1034,7 +1204,7 @@ impl Ui {
             glib::Propagation::Proceed
         });
         ui.window.add_controller(keys);
-        let weak = Rc::downgrade(&ui);
+        let weak = Rc::downgrade(ui);
         ui.window.connect_realize(move |w| {
             if let Some(surface) = w.surface() {
                 let weak = weak.clone();
@@ -1056,7 +1226,6 @@ impl Ui {
         });
         let owned = ui.clone();
         ui.window.connect_close_request(move |_| owned.close_request());
-        ui
     }
     /// The main window's close: refused while a launch runs or any work is unsaved, otherwise
     /// every panel, note, mirror and pane is closed before the window goes.
@@ -1452,7 +1621,7 @@ impl Ui {
             while ui.refresh_dirty.replace(false) {
                 let generation = ui.generation.get();
                 let layout_revision = ui.layout_revision.get();
-                let layout_project = ui.project.get();
+                let mut layout_project = ui.project.get();
                 // The sidebar order before this read, to find a removed project's neighbour.
                 let mut order = None;
                 if ui.registry_dirty.replace(false) {
@@ -1493,6 +1662,9 @@ impl Ui {
                         let first = ui.projects.borrow().first().and_then(|p| p["id"].as_i64());
                         if let Some(first) = first {
                             ui.project.set(first);
+                            // Chosen by this iteration, not switched under it: restore (and so
+                            // allow saves to) this project's layout now, not on a later refresh.
+                            layout_project = first;
                             ui.editor.reset();
                             ui.editor.prepare_project(&ui);
                         }
@@ -1720,10 +1892,17 @@ impl Ui {
                 .paste_text(&format!("native-paste-check-{name}\n"));
         }
     }
+    /// Every live pane is on screen and shows `marker`. A parked, exited or interrupted
+    /// session's pane shows its slate over a detached terminal, so it is not read.
     pub fn terminal_contents_contain(&self, marker: &str) -> bool {
         use vte4::prelude::TerminalExt;
         let panes = self.panes.borrow();
-        !panes.is_empty() && panes.values().all(|pane| {
+        let live: Vec<_> = self.sessions.borrow().iter()
+            .filter(|s| matches!(text(s, "state"), "spawning" | "running" | "idle" | "blocked"))
+            .map(|s| panes.get(text(s, "name")).cloned())
+            .collect();
+        !live.is_empty() && live.iter().all(|pane| {
+            let Some(pane) = pane else { return false };
             let (_, row) = pane.terminal.cursor_position();
             let (text, _) = pane.terminal.text_range_format(vte4::Format::Text, 0, 0, row, 500);
             pane.terminal.is_mapped() && text.is_some_and(|text| text.contains(marker))

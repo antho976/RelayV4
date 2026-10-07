@@ -17,7 +17,7 @@ result!(#[schemars(rename = "UsageGetOut")] UsageGetOut { pub usage: Vec<Usage> 
 op!(UsageGet, "usage.get", UsageGetIn => UsageGetOut, OpMeta::query(Scope::Global, 9, "Per-provider usage in its own units"));
 payload!(#[schemars(rename = "UsageReportIn")] UsageReportIn { pub session: String, pub provider: Provider, pub payload: Value });
 op!(UsageReport, "usage.report", UsageReportIn => Empty,
-    OpMeta::mutation(Scope::Session, 9, "Provider metering pushed by its statusLine/hook").audit(Audit::Never).actors(Actors::AgentOnly).emits(&["usage.changed"]));
+    OpMeta::mutation(Scope::Session, 9, "Provider metering an agent reports for its own session").audit(Audit::Never).actors(Actors::AgentOnly).emits(&["usage.changed"]));
 
 payload!(#[schemars(rename = "SkillListIn")] SkillListIn {
     pub project_id: Option<Id>,

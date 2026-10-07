@@ -34,3 +34,8 @@ notify.workspace = true
 regex.workspace = true
 similar.workspace = true
 tempfile = "3"
+
+# The native client's headless half: tests/native_input.rs sends its mirror payload builders.
+[dev-dependencies]
+ctor = "1"
+relay-client.workspace = true

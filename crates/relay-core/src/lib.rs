@@ -73,6 +73,20 @@ pub fn hex(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
+/// Before `main`, while this test process has one thread: its git (fixtures and the engine's own
+/// calls alike) reads no global or system config (RA-672), so a developer's `core.hooksPath`,
+/// signing or templates never reach a test. The real engine keeps reading the user's config;
+/// only test binaries carry this.
+#[ctor::ctor(unsafe)]
+fn hermetic_git() {
+    // SAFETY: runs before main, so no other thread can be reading the environment.
+    unsafe {
+        libc::setenv(c"GIT_CONFIG_GLOBAL".as_ptr(), c"/dev/null".as_ptr(), 1);
+        libc::setenv(c"GIT_CONFIG_NOSYSTEM".as_ptr(), c"1".as_ptr(), 1);
+    }
+}
+
+#[cfg(test)]
 mod hex_tests {
     #[test]
     fn hex_matches_the_per_byte_formatter() {

@@ -305,11 +305,7 @@ impl MirrorView {
         head.add_css_class("mirror-rail-group");
         head.append(&picker);
         rail.append(&head);
-        for group in [
-            &[("power", "Power button", "power"), ("volume-up", "Volume up", "volumeup"), ("volume-down", "Volume down", "volumedown")][..],
-            &[("back", "Back (right-click, Esc)", "back"), ("home", "Home (middle-click)", "home"), ("recents", "Recent apps", "appswitch")][..],
-            &[("rotate", "Rotate the device", "rotate"), ("notifications", "Open notifications", "notifications"), ("quick-settings", "Open quick settings", "quicksettings")][..],
-        ] {
+        for group in input::RAIL {
             let block = gtk::Box::new(gtk::Orientation::Vertical, 2);
             block.add_css_class("mirror-rail-group");
             for (glyph, caption, kind) in group {
@@ -435,7 +431,7 @@ impl MirrorView {
                 let Some(view) = weak.upgrade() else { return };
                 if key == &view.display_key {
                     let on = !view.display_on.get();
-                    view.send(json!({"type":"displaypower","on":on}));
+                    view.send(input::display_power(on));
                     view.display_on.set(on);
                     if on {
                         glyphs::rekey(key, "screen-off", "Turn the device screen off (mirroring continues)");
@@ -443,7 +439,7 @@ impl MirrorView {
                         glyphs::rekey(key, "screen-on", "Turn the device screen back on");
                     }
                 } else {
-                    view.send(json!({"type":key.widget_name().as_str()}));
+                    view.send(input::button(key.widget_name().as_str()));
                 }
             });
         }
@@ -502,8 +498,8 @@ impl MirrorView {
         click.connect_pressed(move |gesture, _, _, _| {
             let Some(view) = weak.upgrade() else { return };
             match gesture.current_button() {
-                gtk::gdk::BUTTON_SECONDARY => view.send(json!({"type":"back"})),
-                gtk::gdk::BUTTON_MIDDLE => view.send(json!({"type":"home"})),
+                gtk::gdk::BUTTON_SECONDARY => view.send(input::button("back")),
+                gtk::gdk::BUTTON_MIDDLE => view.send(input::button("home")),
                 _ => {}
             }
         });
@@ -527,7 +523,7 @@ impl MirrorView {
             let pixels = controller.unit() == gtk::gdk::ScrollUnit::Surface;
             let (hscroll, vscroll) = input::scroll_amount(dx, dy, pixels);
             if hscroll != 0.0 || vscroll != 0.0 {
-                view.send(json!({"type":"scroll","x":at.0,"y":at.1,"w":w,"h":h,"hscroll":hscroll,"vscroll":vscroll}));
+                view.send(input::scroll(at, (w, h), hscroll, vscroll));
             }
             glib::Propagation::Stop
         });
@@ -556,7 +552,7 @@ impl MirrorView {
                 glib::spawn_future_local(async move {
                     if let Ok(Some(text)) = clipboard.read_text_future().await {
                         if let Some(view) = weak.upgrade() {
-                            view.send(json!({"type":"setclipboard","text":text.as_str(),"paste":true}));
+                            view.send(input::paste(text.as_str()));
                         }
                     }
                 });
@@ -564,13 +560,13 @@ impl MirrorView {
             }
             let meta = input::meta(modifiers);
             if let Some(code) = input::keycode(key).or_else(|| (ctrl || alt).then(|| input::chord_keycode(key)).flatten()) {
-                view.send(json!({"type":"key","action":0,"keycode":code,"meta":meta}));
+                view.send(input::key(input::DOWN, code, meta));
                 view.held.borrow_mut().insert(hardware, code);
                 return glib::Propagation::Stop;
             }
             if !ctrl && !alt {
                 if let Some(c) = key.to_unicode().filter(|c| !c.is_control()) {
-                    view.send(json!({"type":"text","text":c.to_string()}));
+                    view.send(input::text(c));
                     return glib::Propagation::Stop;
                 }
             }
@@ -580,7 +576,7 @@ impl MirrorView {
         keys.connect_key_released(move |_, _, hardware, modifiers| {
             let Some(view) = weak.upgrade() else { return };
             let Some(code) = view.held.borrow_mut().remove(&hardware) else { return };
-            view.send(json!({"type":"key","action":1,"keycode":code,"meta":input::meta(modifiers)}));
+            view.send(input::key(input::UP, code, input::meta(modifiers)));
         });
         self.root.add_controller(keys);
     }
@@ -1313,7 +1309,7 @@ async fn stream(
                     }
                     Err(_) => break,
                 },
-                Ok(()) = resyncs.recv() => vec![json!({"type":"resetvideo"})],
+                Ok(()) = resyncs.recv() => vec![input::reset_video()],
             };
             for event in batch {
                 match client.request(rt, "device.mirror.input", json!({"mirror_id":mirror_id,"event":event})).await {

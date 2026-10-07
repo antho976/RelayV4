@@ -2,6 +2,8 @@
 //! hold's envelope; it is read back whole to confirm and to show in full, and removed once no
 //! hold names it. A hold's payload hash is taken when it is frozen.
 
+mod common;
+
 use relay_bus::{Actor, ErrorKind, Request, Response};
 use relay_core::engine::{Door, Engine};
 use relay_core::store::MIGRATIONS;

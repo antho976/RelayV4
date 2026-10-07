@@ -600,9 +600,11 @@ callers of it wherever the provider lets us:
   like, inside `sh -c` too — with an overwrite or delete carrying the line count it removes.
   Targets built from variables or globs, and files a program opens by itself, are not seen
   (D163). Phase 5 extends the
-  same local file with `SessionStart`/`PostToolUse`/`Stop`/`Notification` hooks and a
-  `statusLine` command that call `session.report` / `usage.report` (§10.8). This is v3's
-  `agenthooks.rs`, now a bus client instead of bespoke files.
+  same local file with `SessionStart`/`PostToolUse`/`Stop`/`Notification` hooks that call
+  `session.report` (§10.8), and a `statusLine` command that writes Claude's rate-limit payload
+  to `${CLAUDE_CONFIG_DIR:-$HOME}/.claude/relay-usage.json` for `usage.get` to read (D64); it
+  calls nothing on the bus. This is v3's `agenthooks.rs`, now a bus client instead of bespoke
+  files.
 - **git**: every Relay-created worktree gets a `pre-commit` hook calling `relay cmd
   guardrail.gate '{"kind":"commit"}'`; the hook exits non-zero on `refuse`/`hold`. This binds
   both providers' commits, and yours.
@@ -982,9 +984,9 @@ All paths are relative to the worktree root; `..` and absolute paths are `invali
 |---|---|---|
 | `provider.list` | query | `{}` → `{ providers: ProviderInfo[] }` — installed, path, version, auth (`signed_in_as?`), spawn profile |
 | `provider.refresh` | mutation · never | `{}` → `{ providers: ProviderInfo[] }` — re-detect now |
-| `usage.get` | query | `{ provider?: Provider }` → `{ usage: Usage[] }` — per provider, in its own units and windows; combines stored agent reports with bounded read-only CLI state inspection and never calls a provider endpoint |
-| `usage.report` | mutation · never · session · agent | `{ session, provider, payload: object }` → `{}` — the provider's own metering pushed by its statusLine/hook (v3's `statusline.rs`); core stores the latest per session and derives `usage.get` |
-| `skill.list` | query | `{ project_id?, enabled?, summary? }` → `{ skills: Skill[] }`; with `summary: true` each `body` is cut to its first 4 KiB (the frontmatter and opening), so a large library fits one reply |
+| `usage.get` | query | `{ provider?: Provider }` → `{ usage: Usage[] }` — per provider, in its own units and windows; combines stored agent reports with bounded read-only CLI state inspection and never calls a provider endpoint. Where a provider left state to read (the Claude status-line file, Codex's newest rollout), it wins over a stored report whatever their ages |
+| `usage.report` | mutation · never · session · agent | `{ session, provider, payload: object }` → `{}` — metering an agent reports for its own session; core stores the latest per session as `usage.get`'s fallback. No hook sends it: the Claude status line writes a file instead (D64) |
+| `skill.list` | query | `{ project_id?, enabled?, summary? }` → `{ skills: Skill[] }`; with `summary: true` each `body` is cut to its first 4 KiB (the frontmatter and opening), so a large library fits one reply; `description` is read before the cut |
 | `skill.get` | query | `{ skill_id }` → `Skill` with its whole body; `skill.not_found` |
 | `skill.create` / `skill.update` / `skill.delete` | mutation · always · inverse | `{ name, body }` / `{ skill_id, name?, body? }` / `{ skill_id }`; a skill nobody has enabled anywhere is enabled in every project on create/install (D147) |
 | `skill.enable` | mutation · always · inverse | `{ skill_id, project_id, enabled: bool }` → `Skill`; the per-project override on top of that app-wide default |
@@ -1169,7 +1171,9 @@ interface ProviderInfo { provider; installed: bool; path: string | null; version
   signed_in_as: string | null; last_seen_version: string | null; spawn_profile: object;
   guarded: bool /* true for both providers: Claude Code's hooks in .claude/settings.local.json,
                     Codex's in .codex/hooks.json once trusted in /hooks (§9.3, D132) */ }
-interface Skill { id; name; body; enabled_in: Id[] }
+interface Skill { id; name; description: string /* the SKILL.md front matter's `description`, else
+  its first prose line, else ""; read from the whole body, so a summary's cut body keeps it */;
+  body; enabled_in: Id[] }
 interface Device { serial; model; kind: "usb" | "avd"; state }
 ```
 

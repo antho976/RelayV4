@@ -70,7 +70,7 @@
 .ext-page .ext-summary { font-size: 12px; color: @secondary; }
 .ext-page .ext-path { font-family: 'Fira Mono', monospace; font-size: 10.5px; color: @faint; }
 .ext-page list.ext-list > row:selected .ext-name { color: @ink; }
-.ext-page list.ext-list > row:selected .ext-summary { color: #c4c4c2; }
+.ext-page list.ext-list > row:selected .ext-summary { color: @secondary; }
 .ext-page list.ext-list > row:selected .ext-meta { color: @secondary; }
 .ext-page .ext-mark { min-width: 34px; min-height: 34px; background: @slab; border: 1px solid @strong; border-radius: 2px; color: @ink; font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif; font-size: 13px; font-weight: 700; letter-spacing: 0.04em; }
 .ext-page .ext-mark.large { min-width: 52px; min-height: 52px; font-size: 18px; }

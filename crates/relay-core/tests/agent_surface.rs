@@ -2,29 +2,16 @@
 //! through the bus, with nothing read out of the source. Each test pins one finding from the
 //! 2026-08-19 agent surface audit (docs/DECISIONS.md D101 … D111).
 
-use relay_bus::{Actor, Request, Response};
-use relay_core::engine::{Door, Engine};
-use relay_core::{Instance, Store};
+mod common;
+
+use common::{call_as as call, committed_repo, engine_with_project, git, ok_as as ok};
+use relay_bus::Actor;
+use relay_core::engine::Engine;
 use serde_json::{json, Value};
 use std::path::Path;
-use std::process::Command;
 use std::sync::Arc;
 
-fn git(repo: &Path, args: &[&str]) {
-    let out = Command::new("git").arg("-C").arg(repo).args(args).output().unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-}
-
-fn call(engine: &Engine, actor: Actor, op: &str, payload: Value) -> Response {
-    engine.dispatch(Request::new(actor, op, payload), Door::InProcess)
-}
-
-fn ok(engine: &Engine, actor: Actor, op: &str, payload: Value) -> Value {
-    call(engine, actor, op, payload)
-        .into_result()
-        .unwrap_or_else(|error| panic!("{op} failed: {} {}", error.code, error.message))
-}
-
+/// Unlike `common::refused`, takes the request and names the op that should have refused.
 fn refusal(engine: &Engine, actor: Actor, op: &str, payload: Value) -> relay_bus::error::BusError {
     call(engine, actor, op, payload)
         .into_result()
@@ -40,29 +27,16 @@ struct Fixture {
     outsider: Value,
 }
 
-fn init_repo(path: &Path) {
-    std::fs::create_dir_all(path.join("src")).unwrap();
-    git(path, &["init", "-q", "-b", "main"]);
-    git(path, &["config", "user.email", "surface@relay.test"]);
-    git(path, &["config", "user.name", "Surface"]);
-    std::fs::write(path.join("src/lib.rs"), "pub fn one() -> i32 { 1 }\n").unwrap();
-    git(path, &["add", "."]);
-    git(path, &["commit", "-q", "-m", "init"]);
-}
-
 impl Fixture {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
         let ws = root.path().join("ws");
         let first = ws.join("first");
         let second = ws.join("second");
-        init_repo(&first);
-        init_repo(&second);
+        committed_repo(&first, &[("src/lib.rs", "pub fn one() -> i32 { 1 }\n")]);
+        committed_repo(&second, &[("src/lib.rs", "pub fn one() -> i32 { 1 }\n")]);
 
-        let store = Store::open(&root.path().join("store/store.db"), false).unwrap();
-        let engine = Engine::new(Instance::Test, store);
-        ok(&engine, Actor::User, "workspace.create", json!({"path": ws}));
-        ok(&engine, Actor::User, "project.add", json!({"workspace_id": 1, "path": first}));
+        let engine = engine_with_project(root.path(), &ws, &first);
         ok(&engine, Actor::User, "project.add", json!({"workspace_id": 1, "path": second}));
 
         let builder = ok(&engine, Actor::User, "session.create",

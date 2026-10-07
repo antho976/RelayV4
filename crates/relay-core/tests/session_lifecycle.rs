@@ -1,31 +1,14 @@
 //! Session lifecycle edges: repeated and blocked `session.done`, late hooks, deleted tasks,
 //! per-task caps at done, reused session names, and discard sharing close's cleanup.
 
-use relay_bus::{Actor, Request, Response};
-use relay_core::engine::{Door, Engine};
-use relay_core::{Instance, Store};
+mod common;
+
+use common::{call_as, committed_repo, engine_with_project, git, ok, ok_as};
+use relay_bus::Actor;
+use relay_core::engine::Engine;
 use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 use std::sync::Arc;
-
-fn call_as(e: &Engine, actor: Actor, op: &str, payload: Value) -> Response {
-    e.dispatch(Request::new(actor, op, payload), Door::InProcess)
-}
-fn ok_as(e: &Engine, actor: Actor, op: &str, payload: Value) -> Value {
-    match call_as(e, actor, op, payload).into_result() {
-        Ok(v) => v,
-        Err(err) => panic!("{op} failed: {} {}", err.code, err.message),
-    }
-}
-fn ok(e: &Engine, op: &str, payload: Value) -> Value {
-    ok_as(e, Actor::User, op, payload)
-}
-
-fn git(repo: &Path, args: &[&str]) {
-    let st = Command::new("git").arg("-C").arg(repo).args(args).status().unwrap();
-    assert!(st.success(), "git {args:?}");
-}
 
 struct Fixture {
     _root: tempfile::TempDir,
@@ -37,17 +20,8 @@ fn fixture() -> Fixture {
     let root = std::fs::canonicalize(tmp.path()).unwrap();
     let ws = root.join("ws");
     let repo = ws.join("app");
-    std::fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "-q", "-b", "main"]);
-    git(&repo, &["config", "user.email", "t@t"]);
-    git(&repo, &["config", "user.name", "t"]);
-    std::fs::write(repo.join("README.md"), "hi\n").unwrap();
-    git(&repo, &["add", "."]);
-    git(&repo, &["commit", "-q", "-m", "init"]);
-    let store = Store::open(&root.join("store").join("store.db"), false).unwrap();
-    let engine = Engine::new(Instance::Test, store);
-    ok(&engine, "workspace.create", json!({"path": ws}));
-    ok(&engine, "project.add", json!({"workspace_id": 1, "path": repo}));
+    committed_repo(&repo, &[("README.md", "hi\n")]);
+    let engine = engine_with_project(&root, &ws, &repo);
     Fixture { _root: tmp, engine }
 }
 

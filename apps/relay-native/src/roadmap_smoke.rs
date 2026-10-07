@@ -1,6 +1,6 @@
 //! Opt-in checks against the isolated native smoke engine, never installed providers.
 use crate::app::Ui;
-use crate::smoke::util::{click, named, press, wait_for};
+use crate::smoke::util::{choose, chosen, click, clickable, named, press, wait_for};
 use gtk::prelude::*;
 use gtk4 as gtk;
 use serde_json::{json, Value};
@@ -105,26 +105,15 @@ pub(crate) async fn run(ui: &Rc<Ui>) -> Result<(), String> {
             usize::from(index == 0),
             "Only agent1 gets an initial assignment"
         );
-        let provider = named(&ui.window, &format!("launch-provider-{index}"))
-            .unwrap()
-            .downcast::<gtk::DropDown>()
-            .unwrap();
-        assert_eq!(provider.selected(), 0, "Every agent defaults to Claude");
+        assert_eq!(chosen(&profile, &format!("launch-provider-{index}"))?, 0, "Every agent defaults to Claude");
     }
-    let provider = named(&ui.window, "launch-provider-0")
-        .unwrap()
-        .downcast::<gtk::DropDown>()
-        .unwrap();
-    let effort = named(&ui.window, "launch-effort-0")
-        .unwrap()
-        .downcast::<gtk::DropDown>()
-        .unwrap();
-    effort.set_selected(5);
-    provider.set_selected(1);
-    assert_eq!(effort.selected(), 3, "Codex cannot inherit max effort");
-    effort.set_selected(0);
-    provider.set_selected(0);
-    assert_eq!(effort.selected(), 3, "Claude cannot inherit minimal effort");
+    // Pressed as a person would: max is offered for Claude only and minimal for Codex only.
+    choose(&ui.window, "launch-effort-0", 5)?;
+    choose(&ui.window, "launch-provider-0", 1)?;
+    assert_eq!(chosen(&ui.window, "launch-effort-0")?, 3, "Codex cannot inherit max effort");
+    choose(&ui.window, "launch-effort-0", 0)?;
+    choose(&ui.window, "launch-provider-0", 0)?;
+    assert_eq!(chosen(&ui.window, "launch-effort-0")?, 3, "Claude cannot inherit minimal effort");
     let model = named(&ui.window, "launch-model-0")
         .unwrap()
         .downcast::<gtk::Entry>()
@@ -165,21 +154,11 @@ pub(crate) async fn run(ui: &Rc<Ui>) -> Result<(), String> {
     );
     ui.open_project(project, "agents");
 
-    // Exercise the visible count keys after show_launch has returned. An unowned
-    // backing DropDown used to be destroyed, silently leaving the count at one.
+    // Exercise the visible count keys after show_launch has returned: the count must reach
+    // the launch, not just the keys (checked by the session count below).
     ui.show_launch(None);
     wait_for(|| named(&ui.window, "launch-start").is_some_and(|w| w.is_sensitive()), "multi-agent form").await?;
-    let control = named(&ui.window, "launch-count-control").unwrap();
-    let mut sibling = control.next_sibling();
-    let mut count_keys = None;
-    while let Some(widget) = sibling {
-        if widget.has_css_class("launch-count") { count_keys = Some(widget); break; }
-        sibling = widget.next_sibling();
-    }
-    let second = count_keys.unwrap().first_child().unwrap().next_sibling().unwrap()
-        .downcast::<gtk::ToggleButton>().unwrap();
-    second.set_active(true);
-    assert_eq!(control.downcast::<gtk::DropDown>().unwrap().selected(), 1);
+    choose(&ui.window, "launch-count", 1)?;
     let submit = named(&ui.window, "launch-start").unwrap().downcast::<gtk::Button>().unwrap();
     let started = std::time::Instant::now();
     press(&submit, "launch-start")?;
@@ -213,7 +192,13 @@ pub(crate) async fn run(ui: &Rc<Ui>) -> Result<(), String> {
     if git_hidden {
         ui.editor.toggle_git();
     }
-    wait_for(|| named(&ui.window, "branch-switch-switch-fixture").is_some(), "branch switch control").await?;
+    // The switch keys live in the branch picker's popover: open it, as a person would.
+    wait_for(|| named(&ui.window, "git-branch-picker").is_some_and(|w| w.is_mapped()), "branch picker").await?;
+    named(&ui.window, "git-branch-picker")
+        .and_then(|w| w.downcast::<gtk::MenuButton>().ok())
+        .ok_or("Branch picker type")?
+        .popup();
+    wait_for(|| clickable(&ui.window, "branch-switch-switch-fixture"), "branch switch control").await?;
     assert!(!ui.editor.agents_visible(), "Files and Git must stay open after the layout restore");
     click(&ui.window, "branch-switch-switch-fixture")?;
     let mut switched = false;

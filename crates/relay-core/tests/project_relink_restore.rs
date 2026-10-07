@@ -1,6 +1,8 @@
 //! A project whose repository moved is relinked rather than removed and re-added, and a removed
 //! project comes back from the backup its removal took, with its original ids (RA-195).
 
+mod common;
+
 use relay_bus::{Actor, BusError, Request, Response};
 use relay_core::engine::{Door, Engine};
 use relay_core::{Instance, Store};
