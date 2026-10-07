@@ -347,6 +347,33 @@ fn read_teardown(conn: &Connection, worktree: &str) -> Result<Teardown, BusError
     })
 }
 
+/// What closing a session does to its checkout's hooks: the full teardown when it is the last
+/// session there, else a hand-over of the hook path to `survivor`.
+struct Hooks {
+    teardown: Option<Teardown>,
+    survivor: Option<String>,
+}
+
+/// Another open session on the same checkout, newest first.
+fn survivor_on(conn: &Connection, session_id: Id, worktree: &str) -> Result<Option<String>, BusError> {
+    conn.prepare_cached(
+        "SELECT name FROM sessions WHERE id!=?1 AND worktree=?2 AND state!='closed' ORDER BY id DESC LIMIT 1",
+    ).bus()?.query_row(params![session_id, worktree], |row| row.get(0)).optional().bus()
+}
+
+/// Delete a departing session's hook directory, first handing the checkout's hook path to
+/// `survivor` when the directory is the active one ([`crate::hooks::hand_over`]).
+fn retire_hook_dir(instance: crate::Instance, repo: &Path, worktree: &Path, closing: &str, survivor: Option<&str>) {
+    let _writes = crate::hooks::writes();
+    let Some(survivor) = survivor else {
+        crate::hooks::remove_hook_dir(repo, closing);
+        return;
+    };
+    if let Err(error) = crate::hooks::hand_over(repo, worktree, closing, survivor, instance, &crate::hooks::relay_bin()) {
+        tracing::warn!(session = closing, %survivor, %error, "handing the commit hook to a surviving session");
+    }
+}
+
 /// The git and file half of a teardown. Subprocesses and file rewrites, so it runs with the
 /// store unlocked; one `git config --get` covers every name in the chain.
 fn run_teardown(repo: &Path, worktree: &Path, teardown: &Teardown) -> Result<(), BusError> {
@@ -914,16 +941,27 @@ pub fn register(e: &mut Engine) {
     }, |ctx: &mut Ctx, p, mut prepared| {
         let checkout = prepared.checkout.clone();
         let created = finish_create(ctx, &p, &mut prepared);
-        if created.is_err() && prepared.hooked && p.pair_with.is_none() {
-            // A create refused after its hook went in leaves the checkout's hook path as it found it.
+        if created.is_err() && prepared.hooked {
+            // A create refused after its hook went in leaves the checkout's hook path as it found
+            // it: wired to a session still on that checkout (a PAIR partner, or anyone sharing the
+            // primary), or restored to the pre-Relay path when there is none.
             if let Some((path, _)) = checkout {
                 let repo = Path::new(&prepared.project.path);
-                // Lock order is store, then hook writes: nothing holding the second takes the first.
-                let _writes = crate::hooks::writes();
-                if let Err(error) = crate::hooks::uninstall_git(repo, Path::new(&path), &prepared.name) {
-                    tracing::warn!(session = %prepared.name, %error, "restoring hooks after a refused create");
+                let survivor: Option<String> = ctx.tx().query_row(
+                    "SELECT name FROM sessions WHERE worktree=?1 AND name!=?2 AND state!='closed' ORDER BY id DESC LIMIT 1",
+                    params![path, prepared.name], |row| row.get(0),
+                ).optional().unwrap_or(None);
+                match survivor {
+                    Some(survivor) => retire_hook_dir(ctx.instance(), repo, Path::new(&path), &prepared.name, Some(&survivor)),
+                    None => {
+                        // Lock order is store, then hook writes: nothing holding the second takes the first.
+                        let _writes = crate::hooks::writes();
+                        if let Err(error) = crate::hooks::uninstall_git(repo, Path::new(&path), &prepared.name) {
+                            tracing::warn!(session = %prepared.name, %error, "restoring hooks after a refused create");
+                        }
+                        crate::hooks::remove_hook_dir(repo, &prepared.name);
+                    }
                 }
-                crate::hooks::remove_hook_dir(repo, &prepared.name);
             }
         }
         created
@@ -1539,12 +1577,11 @@ pub fn register(e: &mut Engine) {
                 return Err(BusError::conflict("session.state", format!("session {} is not restorable or exited", row.session.name)));
             }
             let project = crate::handlers::workspace::get_project(conn, row.session.project_id)?;
-            let other_sessions: i64 = conn.prepare_cached(
-                "SELECT COUNT(*) FROM sessions WHERE id!=?1 AND worktree=?2 AND state!='closed'",
-            ).bus()?.query_row(params![row.session.id, row.session.worktree], |r| r.get(0)).bus()?;
-            let teardown = if other_sessions == 0 { Some(read_teardown(conn, &row.session.worktree)?) } else { None };
-            Ok((row, PathBuf::from(project.path), teardown))
+            let survivor = survivor_on(conn, row.session.id, &row.session.worktree)?;
+            let teardown = if survivor.is_none() { Some(read_teardown(conn, &row.session.worktree)?) } else { None };
+            Ok((row, PathBuf::from(project.path), Hooks { teardown, survivor }))
         })?;
+        let Hooks { teardown, survivor } = teardown;
         let wt = Path::new(&row.session.worktree);
         if let Some(teardown) = &teardown {
             run_teardown(&repo, wt, teardown)?;
@@ -1552,13 +1589,14 @@ pub fn register(e: &mut Engine) {
                 worktree::remove(&repo, wt, true).map_err(|error| BusError::conflict("worktree.remove_failed", error.to_string()))?;
             }
         }
+        retire_hook_dir(ctx.instance(), &repo, wt, &row.session.name, survivor.as_deref());
         Ok(row.session.id)
     }, |ctx: &mut Ctx, p, id: Id| {
         let row = sessions::by_id(ctx.tx(), id)?
             .ok_or_else(|| BusError::not_found("session.not_found", format!("no session {}", p.session)))?;
         let s = &row.session;
-        if s.state != SessionState::Restorable {
-            return Err(BusError::conflict("session.state", format!("session {} is not restorable", s.name)));
+        if !matches!(s.state, SessionState::Restorable | SessionState::Exited) {
+            return Err(BusError::conflict("session.state", format!("session {} is not restorable or exited", s.name)));
         }
         ctx.tx().execute("UPDATE sessions SET state='closed',pid=NULL,closed_at=?1,updated_at=?1 WHERE id=?2", params![ctx.now,s.id]).bus()?;
         release_claims(ctx, s)?;
@@ -1580,15 +1618,14 @@ pub fn register(e: &mut Engine) {
             let row = sessions::by_name(conn, &p.session)?;
             let s = &row.session;
             let project = crate::handlers::workspace::get_project(conn, s.project_id)?;
-            let others: i64 = conn.prepare_cached(
-                "SELECT COUNT(*) FROM sessions WHERE id!=?1 AND worktree=?2 AND state!='closed'",
-            ).bus()?.query_row(params![s.id, s.worktree], |row| row.get(0)).bus()?;
-            if others > 0 && remove {
+            let survivor = survivor_on(conn, s.id, &s.worktree)?;
+            if survivor.is_some() && remove {
                 return Err(BusError::conflict("session.pair_live", "close the PAIR partner first or pass remove_worktree:false"));
             }
-            let teardown = if others == 0 { Some(read_teardown(conn, &s.worktree)?) } else { None };
-            Ok((row, PathBuf::from(project.path), teardown))
+            let teardown = if survivor.is_none() { Some(read_teardown(conn, &s.worktree)?) } else { None };
+            Ok((row, PathBuf::from(project.path), Hooks { teardown, survivor }))
         })?;
+        let Hooks { teardown, survivor } = teardown;
         let s = &row.session;
         let wt = Path::new(&s.worktree);
         // Stop writers before undoing their hooks and deleting their checkout, with a bounded
@@ -1622,8 +1659,9 @@ pub fn register(e: &mut Engine) {
             }
         };
         // The generated hook directory outlives nothing: leaving one per dead session behind
-        // makes `.relay/hooks` read like a fleet that never shut down.
-        crate::hooks::remove_hook_dir(&repo, &s.name);
+        // makes `.relay/hooks` read like a fleet that never shut down. On a shared checkout it
+        // may be the one the checkout's hooksPath points at, so it is handed over first.
+        retire_hook_dir(ctx.instance(), &repo, wt, &s.name, survivor.as_deref());
         Ok((s.id, freed))
     }, |ctx: &mut Ctx, p, (id, freed): (Id, u64)| {
         let row = sessions::by_id(ctx.tx(), id)?
