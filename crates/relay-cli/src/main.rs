@@ -8,14 +8,16 @@ use relay_core::socket::Client;
 use relay_core::Instance;
 use serde_json::{json, Value};
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 mod mcp;
 mod unreal;
 mod unreal_process;
 mod blender;
 mod remote;
+mod write_targets;
 
 #[derive(Parser)]
 #[command(name = "relay", version, about = "RELAY v4 command bus CLI", long_about = None)]
@@ -402,18 +404,23 @@ async fn claude_pre_tool(instance: Instance, actor_override: Option<&str>) -> Re
         .ok_or_else(|| anyhow!("Claude hook input has no tool_input object"))?;
     let session = std::env::var("RELAY_SESSION").context("RELAY_SESSION is missing")?;
 
-    let payload = match tool {
-        "Bash" => json!({
-            "session": session,
-            "kind": "exec",
-            "command": required_string(tool_input, "command")?,
-        }),
-        "Write" => json!({
+    let payloads = match tool {
+        "Bash" => {
+            let command = required_string(tool_input, "command")?;
+            let mut payloads = vec![json!({
+                "session": session,
+                "kind": "exec",
+                "command": command,
+            })];
+            payloads.extend(shell_write_gates(&input, &session, command)?);
+            payloads
+        }
+        "Write" => vec![json!({
             "session": session,
             "kind": "write",
             "path": hook_relative_path(&input, required_string(tool_input, "file_path")?)?,
             "new_text": required_string(tool_input, "content")?,
-        }),
+        })],
         "Edit" => {
             let file_path = required_string(tool_input, "file_path")?;
             let old = required_string(tool_input, "old_string")?;
@@ -425,12 +432,12 @@ async fn claude_pre_tool(instance: Instance, actor_override: Option<&str>) -> Re
                 anyhow::bail!("Edit old_string does not occur in {file_path}");
             }
             let next = if replace_all { current.replace(old, new) } else { current.replacen(old, new, 1) };
-            json!({
+            vec![json!({
                 "session": session,
                 "kind": "write",
                 "path": hook_relative_path(&input, file_path)?,
                 "new_text": next,
-            })
+            })]
         }
         // Kept for Claude versions that still expose the former batched edit tool.
         "MultiEdit" => {
@@ -452,35 +459,97 @@ async fn claude_pre_tool(instance: Instance, actor_override: Option<&str>) -> Re
                     next.replacen(old, new, 1)
                 };
             }
-            json!({
+            vec![json!({
                 "session": session,
                 "kind": "write",
                 "path": hook_relative_path(&input, file_path)?,
                 "new_text": next,
-            })
+            })]
         }
         other => anyhow::bail!("unsupported Claude PreToolUse tool {other:?}"),
     };
+    gate(instance, actor_override, tool, payloads).await
+}
 
+/// How long a PreToolUse hook waits for the guardrail. Claude Code and Codex kill a hook after
+/// 30 s and then run the tool unchecked, so the hook gives up first and blocks (D23).
+const GATE_DEADLINE: Duration = Duration::from_secs(20);
+
+/// Run every gate a tool call needs, in order, blocking (exit 2) at the first that refuses or
+/// holds, or when the guardrail does not answer in time.
+async fn gate(instance: Instance, actor_override: Option<&str>, tool: &str, payloads: Vec<Value>) -> Result<u8> {
     let (actor, token) = actor_from_env(actor_override)?;
-    let mut client = connect(instance).await?;
-    let mut request = Request::new(actor, "guardrail.gate", payload);
-    if let Some(token) = token {
-        request = request.with_token(token);
-    }
-    let response = client.call(&request, |_| {}).await?;
-    if response.ok {
-        return Ok(0);
-    }
-    if let Some(error) = response.error {
-        eprintln!("RELAY blocked {tool}: {} ({})", error.message, error.code);
-        if let Some(hint) = error.hint.as_deref() {
-            eprintln!("RELAY hint: {hint}");
+    run_gates(connect(instance), actor, token, tool, payloads, GATE_DEADLINE).await
+}
+
+async fn run_gates(
+    client: impl std::future::Future<Output = Result<Client>>,
+    actor: Actor,
+    token: Option<String>,
+    tool: &str,
+    payloads: Vec<Value>,
+    deadline: Duration,
+) -> Result<u8> {
+    let checks = async {
+        let mut client = client.await?;
+        for payload in payloads {
+            let mut request = Request::new(actor.clone(), "guardrail.gate", payload);
+            if let Some(token) = &token {
+                request = request.with_token(token.clone());
+            }
+            let response = client.call(&request, |_| {}).await?;
+            if response.ok {
+                continue;
+            }
+            if let Some(error) = response.error {
+                eprintln!("RELAY blocked {tool}: {} ({})", error.message, error.code);
+                if let Some(hint) = error.hint.as_deref() {
+                    eprintln!("RELAY hint: {hint}");
+                }
+            } else {
+                eprintln!("RELAY blocked {tool}: guardrail returned no result");
+            }
+            return Ok(2);
         }
-    } else {
-        eprintln!("RELAY blocked {tool}: guardrail returned no result");
-    }
-    Ok(2)
+        Ok(0)
+    };
+    tokio::time::timeout(deadline, checks)
+        .await
+        .map_err(|_| anyhow!("the guardrail did not answer within {} s", deadline.as_secs_f32()))?
+}
+
+/// Write gates for the files a shell command visibly writes (write_targets). Overwrites and
+/// deletions say how many lines go, so the destructive-write rule can weigh them; edits in
+/// place and appends carry an empty diff, which still meets protected paths, write roots and
+/// shape gates.
+fn shell_write_gates(input: &Value, session: &str, command: &str) -> Result<Vec<Value>> {
+    let Some(cwd) = input["cwd"].as_str().map(PathBuf::from).or_else(|| std::env::current_dir().ok()) else {
+        return Ok(Vec::new());
+    };
+    write_targets::shell_writes(command, &cwd)
+        .into_iter()
+        .map(|write| {
+            let diff = match write.effect {
+                write_targets::Effect::Overwrite | write_targets::Effect::Delete => removed_lines(&write.path),
+                write_targets::Effect::Append | write_targets::Effect::Modify => String::new(),
+            };
+            write_gate(input, session, &write.path, "diff", json!(diff))
+        })
+        .collect()
+}
+
+/// A diff that removes every line of `path`, for a write whose new content is unknown. Only the
+/// '-' markers count, so the lines themselves are not copied; past 200 000 the count is capped,
+/// which is already over any destructive-write limit.
+fn removed_lines(path: &Path) -> String {
+    let lines = match std::fs::metadata(path) {
+        // Counted the way str::lines counts: a last line without a newline still counts.
+        Ok(meta) if meta.is_file() && meta.len() <= 64 * 1024 * 1024 => std::fs::read(path)
+            .map(|bytes| bytes.iter().filter(|b| **b == b'\n').count() + usize::from(bytes.last().is_some_and(|b| *b != b'\n')))
+            .unwrap_or(0),
+        _ => 0,
+    };
+    "-\n".repeat(lines.min(200_000))
 }
 
 async fn claude_report(instance: Instance, actor_override: Option<&str>, kind: &str) -> Result<()> {
@@ -504,30 +573,69 @@ async fn codex_pre_tool(instance: Instance, actor_override: Option<&str>) -> Res
     let tool_input = input["tool_input"].as_object().ok_or_else(|| anyhow!("Codex hook input has no tool_input object"))?;
     let session = std::env::var("RELAY_SESSION").context("RELAY_SESSION is missing")?;
     let command = required_string(tool_input, "command")?;
-    let payload = match tool {
-        "Bash" | "apply_patch" | "Edit" | "Write" => json!({
-            "session": session,
-            "kind": "exec",
-            "command": command,
-        }),
+    let payloads = match tool {
+        "Bash" => {
+            let mut payloads = vec![json!({
+                "session": session,
+                "kind": "exec",
+                "command": command,
+            })];
+            payloads.extend(shell_write_gates(&input, &session, command)?);
+            payloads
+        }
+        // Codex edits files through apply_patch, whose `command` is the patch (Edit and Write
+        // are matcher aliases for it). Each file meets the write gate, as Claude's Write and
+        // Edit do; the patch text is not a command line to run exec rules on.
+        "apply_patch" | "Edit" | "Write" => patch_write_gates(&input, &session, command)?,
         other => anyhow::bail!("unsupported Codex PreToolUse tool {other:?}"),
     };
+    gate(instance, actor_override, tool, payloads).await
+}
 
-    let (actor, token) = actor_from_env(actor_override)?;
-    let mut client = connect(instance).await?;
-    let mut request = Request::new(actor, "guardrail.gate", payload);
-    if let Some(token) = token { request = request.with_token(token); }
-    let response = client.call(&request, |_| {}).await?;
-    if response.ok { return Ok(0); }
-    if let Some(error) = response.error {
-        eprintln!("RELAY blocked {tool}: {} ({})", error.message, error.code);
-        if let Some(hint) = error.hint.as_deref() {
-            eprintln!("RELAY hint: {hint}");
+/// One write gate per file an apply_patch touches. An added file carries its text and an
+/// updated one its text after the hunks, so shape gates can validate it; a deleted file says
+/// how many lines go. A moved file's source loses nothing, so only the path rules meet it.
+fn patch_write_gates(input: &Value, session: &str, patch: &str) -> Result<Vec<Value>> {
+    use write_targets::PatchOp;
+    let cwd = input["cwd"].as_str().map(PathBuf::from).or_else(|| std::env::current_dir().ok())
+        .ok_or_else(|| anyhow!("cannot tell which directory the patch is relative to"))?;
+    let mut payloads = Vec::new();
+    for op in write_targets::parse_patch(patch)? {
+        match op {
+            PatchOp::Add { path, text } => payloads.push(write_gate(input, session, &cwd.join(path), "new_text", json!(text))?),
+            PatchOp::Delete { path } => {
+                let path = cwd.join(path);
+                payloads.push(write_gate(input, session, &path, "diff", json!(removed_lines(&path)))?);
+            }
+            PatchOp::Update { path, move_to, chunks } => {
+                let source = cwd.join(path);
+                let (field, value) = match std::fs::read_to_string(&source).ok().and_then(|old| write_targets::apply_chunks(&old, &chunks)) {
+                    Some(next) => ("new_text", json!(next)),
+                    // apply_patch would refuse this hunk as well. The diff still gives the
+                    // destructive rule its counts; a shape-gated file is held for want of text.
+                    None => ("diff", json!(write_targets::chunk_diff(&chunks))),
+                };
+                match move_to {
+                    Some(to) => {
+                        payloads.push(write_gate(input, session, &source, "diff", json!(""))?);
+                        payloads.push(write_gate(input, session, &cwd.join(to), field, value)?);
+                    }
+                    None => payloads.push(write_gate(input, session, &source, field, value)?),
+                }
+            }
         }
-    } else {
-        eprintln!("RELAY blocked {tool}: guardrail returned no result");
     }
-    Ok(2)
+    Ok(payloads)
+}
+
+fn write_gate(input: &Value, session: &str, path: &Path, field: &str, value: Value) -> Result<Value> {
+    let mut payload = json!({
+        "session": session,
+        "kind": "write",
+        "path": hook_relative_path(input, &path.to_string_lossy())?,
+    });
+    payload[field] = value;
+    Ok(payload)
 }
 
 async fn codex_notify(instance: Instance, actor_override: Option<&str>, raw: &str) -> Result<()> {
@@ -619,4 +727,54 @@ async fn do_cmd(instance: Instance, actor_override: Option<&str>, op: String, pa
         }
     }
     Ok(exit_for(&resp))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_guardrail_that_never_answers_blocks_before_the_provider_gives_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("engine.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        // Accepts and then says nothing, like an engine whose gate waits behind the store lock.
+        let stalled = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            drop(stream);
+        });
+        let started = std::time::Instant::now();
+        let payloads = vec![json!({"session": "calm-otter", "kind": "exec", "command": "true"})];
+        let error = run_gates(Client::connect(&path), Actor::Agent("calm-otter".into()), None, "Bash", payloads, Duration::from_millis(300))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("did not answer"), "{error:#}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        stalled.abort();
+    }
+
+    #[test]
+    fn shell_and_patch_writes_become_write_gates() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("data.ts"), "a\nb\nc").unwrap();
+        std::fs::write(root.path().join("lib.rs"), "fn a() {}\nfn b() {}\n").unwrap();
+        let input = json!({"cwd": root.path()});
+        let worktree_env = std::env::var_os("RELAY_WORKTREE");
+        let rel = |p: &str| if worktree_env.is_some() { root.path().join(p).display().to_string() } else { p.to_string() };
+
+        let gates = shell_write_gates(&input, "calm-otter", ": > data.ts && echo x >> notes.md").unwrap();
+        assert_eq!(gates, [
+            json!({"session": "calm-otter", "kind": "write", "path": rel("data.ts"), "diff": "-\n-\n-\n"}),
+            json!({"session": "calm-otter", "kind": "write", "path": rel("notes.md"), "diff": ""}),
+        ]);
+
+        let patch = "*** Begin Patch\n*** Update File: lib.rs\n@@\n-fn b() {}\n+fn c() {}\n*** Add File: new.rs\n+x\n*** Delete File: data.ts\n*** End Patch";
+        let gates = patch_write_gates(&input, "calm-otter", patch).unwrap();
+        assert_eq!(gates[0]["new_text"], "fn a() {}\nfn c() {}\n");
+        assert_eq!(gates[1], json!({"session": "calm-otter", "kind": "write", "path": rel("new.rs"), "new_text": "x\n"}));
+        assert_eq!(gates[2]["diff"], "-\n-\n-\n");
+        assert!(gates.iter().all(|g| g["kind"] == "write"));
+        assert!(patch_write_gates(&input, "calm-otter", "not a patch").is_err(), "an unreadable patch blocks");
+    }
 }

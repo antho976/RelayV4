@@ -238,8 +238,9 @@ the relevant checks. State what you looked at and what the checks returned.
 - 4.1: Auto Smooth removed (`use_auto_smooth`, `auto_smooth_angle` and
   `calc_normals_split()` are gone; sharp edges are always respected; Smooth by Angle is a
   modifier). Code that must run on 4.0 and 4.1+ branches on `bpy.app.version`.
-- 4.2 LTS: EEVEE Next - the engine id is `BLENDER_EEVEE_NEXT` in 4.2 (it was `BLENDER_EEVEE`);
-  list valid ids with `bpy.context.scene.render.bl_rna.properties['engine'].enum_items.keys()`.
+- 4.2 LTS: EEVEE Next - the engine id is `BLENDER_EEVEE_NEXT` from 4.2 to 4.5 (it was
+  `BLENDER_EEVEE`, and is again from 5.0). `enum_items` does not list the real ids; branch on
+  `bpy.app.version`, or assign and read them from the `TypeError`.
   Many bundled add-ons (Rigify among them) moved to the online extensions platform, so
   `addons: ["rigify"]` can fail there; check with `addon_utils.modules()`. FBX stays built in.
 

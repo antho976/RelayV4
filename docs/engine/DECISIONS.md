@@ -652,7 +652,8 @@ The *why* behind anything surprising. Append; never rewrite history. Reference a
   preserves project handlers, and removes only Relay-owned commands on teardown. Codex requires a one-time
   review of the exact non-managed hook through `/hooks`; Relay surfaces that requirement and never passes
   `--dangerously-bypass-hook-trust`. Shell and patch invocations reach the same `guardrail.gate` bus path as
-  Claude, while the Git pre-commit gate remains the final write-set enforcement boundary.
+  Claude — patches as one write gate per file (D163) — while the Git pre-commit gate remains the final
+  write-set enforcement boundary.
 - **D133 Fresh sessions receive a private start turn after their queue is complete.** Provider-native
   role instructions still replace positional CLI prompts (D82), but starting an interactive CLI without
   a user turn leaves it waiting forever. Relay now stages every selected task with
@@ -972,3 +973,18 @@ The *why* behind anything surprising. Append; never rewrite history. Reference a
   broken result, and renders every imported mesh once to measure its coverage. Registry lookups
   replace path-function checks. On the Blender side, export refuses meshes the check finds broken
   on the evaluated mesh and rigs not at scale 1.
+- **D163 Write rules meet every edit a hook can read, and a slow gate blocks.** The audit found
+  write guardrails bound only Claude's Write/Edit tools: a Bash command, and every Codex edit
+  (sent as `kind: exec`), skipped protected paths, destructive writes, shape gates and write
+  roots. The PreToolUse adapter now reads what a call will write before it runs. Codex's
+  `apply_patch` is structured, so each file becomes a `write` gate with its new text (hunks
+  applied in memory the way apply_patch matches them; a diff of counts when they do not apply).
+  A shell command line is tokenised — quotes, here-documents, `$(…)`, `sh -c` — and the obvious
+  writers yield targets: an overwrite or delete sends a diff of the lines it removes, an append
+  or in-place edit an empty diff that still meets the path rules. This is best effort by
+  construction: variables, globs and programs that open files themselves are not seen, which
+  the docs say plainly. A post-hoc watcher was rejected for now: `file.restore_head` cannot bring
+  back the untracked or modified content that destructive writes guard (D114) without a snapshot
+  taken first, and diffing a tree inside a gate would hold the store lock. Separately, the
+  adapter gives up after 20 s and exits 2: a provider kills a hook at 30 s and then runs the tool
+  unchecked, so a store-lock stall used to wave every tool through (D23).

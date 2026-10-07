@@ -269,7 +269,9 @@ These cost hours once. Check here before debugging them again.
   own `RemoteControlSettings.h`). Restart the editor afterwards.
 - *Quitting takes a while.* `ue_editor_quit` saves, asks the editor to quit, sends a terminate
   signal if it is still running 20 s later, and reports a `timing` breakdown (save and request,
-  signal, exit, port free) so a slow step can be named.
+  signal, exit, port free) so a slow step can be named. When the editor does not answer Remote
+  Control, or a package cannot be saved, it refuses and leaves the editor running: ask the human.
+  `force: true` terminates without saving; pass it only when they have said so.
 - *The port stays held after the editor closes.* A quick relaunch then fails to bind with one log
   line, and `WebControl.StartServer` alone does nothing: run `WebControl.StopServer` first. Use
   `ue_editor_quit` and `ue_editor_launch`, which wait for the port and read the log for a failed

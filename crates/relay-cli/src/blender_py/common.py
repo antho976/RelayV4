@@ -124,7 +124,30 @@ def set_action(arm, action_name):
     if arm.animation_data is None:
         arm.animation_data_create()
     arm.animation_data.action = action
+    # Blender 4.4+ animates through a slot. Assignment picks one when it can; an action whose
+    # slots were all made for other objects leaves it empty and plays nothing.
+    ad = arm.animation_data
+    if getattr(ad, "action_slot", False) is None:
+        slot = next((s for s in getattr(action, "slots", ()) if s.target_id_type == "OBJECT"), None)
+        if slot is not None:
+            ad.action_slot = slot
     return action
+
+
+def action_fcurves(action, slot=None):
+    """An action's F-curves, on any Blender. 4.4 made actions layered (one channelbag per slot)
+    and 5.0 removed Action.fcurves; on 4.4/4.5 that legacy view shows only the first slot.
+    With `slot`, only the curves animating that slot, so one action shared by several objects
+    does not lend one object the bones of another."""
+    if getattr(action, "layers", None):
+        curves = []
+        for layer in action.layers:
+            for strip in layer.strips:
+                for bag in getattr(strip, "channelbags", ()):
+                    if slot is None or getattr(bag, "slot", slot) == slot:
+                        curves.extend(bag.fcurves)
+        return curves
+    return list(getattr(action, "fcurves", ()))
 
 
 def action_range(arm):

@@ -41,21 +41,53 @@ pub fn processes() -> Vec<Proc> {
 
 fn is_editor(p: &Proc) -> bool {
     let name = p.name();
-    (name == "UnrealEditor" || name == "UnrealEditor.exe" || name == "UE4Editor") && !p.cmdline.iter().any(|a| a.contains("-run=") || a == "-nullrhi")
+    (name == "UnrealEditor" || name == "UnrealEditor.exe" || name == "UE4Editor")
+        && !p.cmdline.iter().any(|a| a.to_ascii_lowercase().contains("-run=") || a.eq_ignore_ascii_case("-nullrhi"))
 }
 
 fn is_crash_reporter(p: &Proc) -> bool {
     p.name().starts_with("CrashReportClient")
 }
 
-/// Editors that have this project open.
+/// Editors that have this project open: this exact file, not another checkout's copy of it or
+/// a project whose name merely ends the same way. Signals go to these PIDs.
 pub fn editors_for(uproject: &Path) -> Vec<Proc> {
     let want = uproject.canonicalize().unwrap_or_else(|_| uproject.to_path_buf());
     processes()
         .into_iter()
         .filter(is_editor)
-        .filter(|p| p.cmdline.iter().any(|a| Path::new(a).canonicalize().map(|c| c == want).unwrap_or(false) || a.ends_with(&*uproject.file_name().unwrap_or_default().to_string_lossy())))
+        .filter(|p| opens(p, &want))
         .collect()
+}
+
+/// Whether an editor process opened the canonical `want`. A relative argument is resolved
+/// against the PWD the editor was started with, not its cwd: UnrealEditor changes into
+/// Engine/Binaries at start-up. An argument that cannot be resolved does not match.
+fn opens(p: &Proc, want: &Path) -> bool {
+    let pwd = std::fs::read(format!("/proc/{}/environ", p.pid)).ok().and_then(|raw| {
+        raw.split(|b| *b == 0).find_map(|var| var.strip_prefix(b"PWD=")).map(|v| PathBuf::from(String::from_utf8_lossy(v).into_owned()))
+    });
+    project_args(&p.cmdline, pwd.as_deref()).iter().any(|path| path == want)
+}
+
+/// The canonical .uproject paths named on a command line.
+fn project_args(cmdline: &[String], pwd: Option<&Path>) -> Vec<PathBuf> {
+    cmdline
+        .iter()
+        .skip(1)
+        .filter(|a| a.to_ascii_lowercase().ends_with(".uproject"))
+        .filter_map(|a| {
+            let path = Path::new(a);
+            let path = if path.is_absolute() { path.to_path_buf() } else { pwd?.join(path) };
+            path.canonicalize().ok()
+        })
+        .collect()
+}
+
+/// Whether `pid` is still an editor with this project open, checked right before a signal so a
+/// PID reused since the list was taken is never hit.
+pub fn still_editor_for(pid: u32, uproject: &Path) -> bool {
+    editors_for(uproject).iter().any(|p| p.pid == pid)
 }
 
 pub fn crash_reporters() -> Vec<Proc> {
@@ -288,28 +320,80 @@ pub fn launch(engine: &Path, uproject: &Path, port: u16, extra: &[String]) -> Re
     if !wait_port_free(port, Duration::from_secs(90)) {
         bail!("port {port} is still held (a previous editor, or another program). Wait, or free it, before launching: the new editor could not start its Remote Control server");
     }
-    let mut command = std::process::Command::new(&binary);
+    let mut command = launch_command(&binary, uproject, extra);
+    let child = command.spawn().with_context(|| format!("starting {}", binary.display()))?;
+    Ok(child.id())
+}
+
+fn launch_command(binary: &Path, uproject: &Path, extra: &[String]) -> std::process::Command {
+    let mut command = std::process::Command::new(binary);
     command
-        .arg(uproject)
+        // Canonical, so editors_for recognises this editor by path whatever the cwd was.
+        .arg(uproject.canonicalize().unwrap_or_else(|_| uproject.to_path_buf()))
         // Starts the Remote Control web server even when auto-start is off in the project.
         .arg("-RCWebControlEnable")
         .args(extra)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    // The editor belongs to the person, not to the agent that started it. Carrying the agent's
+    // RELAY_SESSION/INSTANCE/STORE would make Relay's crash recovery reap it as that agent's
+    // orphan on the next engine start, and its git commits would run as the agent.
+    strip_relay_identity(&mut command, std::env::vars_os().map(|(key, _)| key));
     #[cfg(unix)]
     {
         // Its own process group: the editor outlives this MCP server and the agent.
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    let child = command.spawn().with_context(|| format!("starting {}", binary.display()))?;
-    Ok(child.id())
+    command
+}
+
+fn strip_relay_identity(command: &mut std::process::Command, keys: impl IntoIterator<Item = std::ffi::OsString>) {
+    for key in keys {
+        if key.to_string_lossy().starts_with("RELAY_") {
+            command.env_remove(key);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_this_exact_project_file_matches() {
+        let root = tempfile::tempdir().unwrap();
+        let main = root.path().join("Game");
+        let worktree = main.join(".relay/worktrees/w1");
+        std::fs::create_dir_all(&worktree).unwrap();
+        for file in [main.join("Game.uproject"), main.join("TopDownGame.uproject"), worktree.join("Game.uproject")] {
+            std::fs::write(file, "{}").unwrap();
+        }
+        let want = main.join("Game.uproject").canonicalize().unwrap();
+        let line = |args: &[&str]| -> Vec<String> { std::iter::once("UnrealEditor").chain(args.iter().copied()).map(str::to_string).collect() };
+        let hits = |args: &[&str], pwd: Option<&Path>| project_args(&line(args), pwd).contains(&want);
+        assert!(hits(&[main.join("Game.uproject").to_str().unwrap(), "-RCWebControlEnable"], None));
+        assert!(hits(&["Game.uproject"], Some(&main)), "a relative path resolves against the launch PWD");
+        assert!(!hits(&["Game.uproject"], None), "an unresolvable relative path matches nothing");
+        assert!(!hits(&[worktree.join("Game.uproject").to_str().unwrap()], None), "another checkout's copy");
+        assert!(!hits(&[main.join("TopDownGame.uproject").to_str().unwrap()], None), "a name that ends the same way");
+        assert!(!hits(&["Game.uproject"], Some(&worktree)));
+    }
+
+    #[test]
+    fn the_editor_does_not_inherit_the_agents_identity() {
+        let mut command = std::process::Command::new("UnrealEditor");
+        let keys = ["RELAY_SESSION", "RELAY_TOKEN", "RELAY_INSTANCE", "RELAY_STORE", "PATH", "HOME"];
+        strip_relay_identity(&mut command, keys.iter().map(std::ffi::OsString::from));
+        let mut removed: Vec<String> = command.get_envs().filter(|(_, v)| v.is_none()).map(|(k, _)| k.to_string_lossy().into_owned()).collect();
+        removed.sort();
+        assert_eq!(removed, ["RELAY_INSTANCE", "RELAY_SESSION", "RELAY_STORE", "RELAY_TOKEN"]);
+        // And launch really applies it to whatever this process carries.
+        let launch = launch_command(Path::new("/opt/UE/UnrealEditor"), Path::new("/no/such/Game.uproject"), &[]);
+        let inherited = std::env::vars_os().filter(|(k, _)| k.to_string_lossy().starts_with("RELAY_")).count();
+        assert_eq!(launch.get_envs().filter(|(_, v)| v.is_none()).count(), inherited);
+    }
 
     #[test]
     fn hot_reload_modules_are_flagged() {

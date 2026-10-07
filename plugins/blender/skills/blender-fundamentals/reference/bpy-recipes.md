@@ -196,6 +196,7 @@ lc.exclude = False                           # excluded collections take their o
 ob.hide_set(False)                           # eye icon (per view layer)
 ob.hide_viewport = False                     # monitor icon (global)
 ob.hide_render = False                       # camera icon; blender_export skips hide_render roots
+                                             # (it exports eye/monitor-hidden ones, and reports excluded ones)
 bpy.context.view_layer.update()
 print(ob.name in bpy.context.view_layer.objects, [c.name for c in ob.users_collection])
 ```

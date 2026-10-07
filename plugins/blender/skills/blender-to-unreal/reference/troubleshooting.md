@@ -84,7 +84,8 @@ call, and compare the numbers. Fix one cause at a time. Python for the fixes:
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `nothing to export` | no visible root mesh/armature, or all `hide_render` | pass `objects` |
+| `nothing to export` | no root mesh/armature that renders, or all in excluded collections | pass `objects` |
+| a mesh is missing and listed in `excluded` | its collection is excluded from the view layer (unticked in the outliner) | tick the collection, or name the mesh in `objects` |
 | `skeletal export needs an armature among the objects` | `objects` lists only meshes | list the armature (its skinned meshes come along) |
 | `nothing was imported` | FBX rejected; read `import_log` | common: animation without `skeleton`, bone mismatch, empty mesh |
 | Import settings seem ignored; `Interchange` in the log | UE 5.5+ Interchange pipeline | set the options in the Interchange pipeline; import one asset and inspect; record settings in the project docs |
