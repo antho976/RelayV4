@@ -3058,7 +3058,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [],
