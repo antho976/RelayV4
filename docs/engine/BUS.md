@@ -212,7 +212,7 @@ mutation emits at least one event**, and every event's payload is reproducible b
   `session.spawn` and exported to the child as `RELAY_SESSION=<name>` and
   `RELAY_TOKEN=<token>`. Wrong or missing token → `invalid` / `bus.actor`. `user` needs no
   token (same uid, same trust — §0.6), but it must come from **outside the engine's process
-  tree** (D164). On accept the engine reads the peer's pid (`SO_PEERCRED`, and `SO_PEERPIDFD`
+  tree** (D165). On accept the engine reads the peer's pid (`SO_PEERCRED`, and `SO_PEERPIDFD`
   where the kernel has it, so a recycled pid is not mistaken for the peer) and follows its
   `/proc/<pid>/stat` parent links to the top. A peer below a live session's PTY child, or below
   the engine anywhere else (a session's orphan, a build, a hook), or one that cannot be
@@ -437,7 +437,7 @@ no client either.
 
 Relay-2 planned a UI executor door (`bus:ui-op` / `bus:ui-result`) that answered `ui.*` from the
 main window and returned `unavailable` / `ui.absent` headless. V4 never had it, and the
-`executor` registry attribute that described it was removed on 2026-10-06 (D165).
+`executor` registry attribute that described it was removed on 2026-10-06 (D164).
 
 ---
 
@@ -1231,7 +1231,8 @@ test that opens a DB at each prior version.
 
 - **No pagination cursors.** One user; `limit ≤ 1000`; if a list is bigger, the filter is
   wrong.
-- **No per-request auth beyond tokens.** Same uid = same trust (§0.6). Tokens prevent
+- **No per-request auth beyond tokens.** Same uid = same trust (§0.6) on the socket; over the
+  phone door, `user` is whoever holds a paired device's token (§4.2). Tokens prevent
   misattribution, and the peer check on `user` (§4.2) stops an agent's own process tree from
   claiming the user; neither stops determined impersonation by a same-uid process that gets
   itself started outside that tree.

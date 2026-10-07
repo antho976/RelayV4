@@ -20,7 +20,7 @@ pub struct Served {
 /// Open the store (exclusive), build the engine, bind the socket. Does not block.
 pub async fn start(instance: Instance, store_path: Option<PathBuf>) -> Result<Served, BindError> {
     // Before any child exists: a session descendant that double-forks must land under the
-    // engine, not init, or the socket door would take it for the user (RA-096, D164).
+    // engine, not init, or the socket door would take it for the user (RA-096, D165).
     let subreaper = crate::peer::become_subreaper();
     if !subreaper {
         tracing::warn!(error = %std::io::Error::last_os_error(), "could not become a child subreaper; a session's orphans can claim the user actor");

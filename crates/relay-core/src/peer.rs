@@ -1,4 +1,4 @@
-//! Who is at the other end of a socket connection (RA-096, D164).
+//! Who is at the other end of a socket connection (RA-096, D165).
 //!
 //! The socket door carries the user as well as the agents, and `user` has no token: same uid,
 //! same trust (BUS.md §4.2). So until now an agent refused by a guardrail could answer its own
