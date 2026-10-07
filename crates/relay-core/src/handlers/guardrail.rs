@@ -856,22 +856,29 @@ fn enforce_request(
             ctx.emit("notify.new", json!({"category": "guardrail", "project_id": project_id}));
             Err(error)
         }
-        Decision::Hold { policy, mut error, details } => {
-            let frozen = Request::new(ctx.actor.clone(), ctx.op, ctx.payload().clone()).with_id(ctx.req_id);
-            let session_id = ctx.actor_session_id();
-            let session = session_id.and_then(|id| ctx.tx().query_row(
-                "SELECT name FROM sessions WHERE id = ?1", [id], |r| r.get::<_, String>(0),
-            ).ok());
-            let hold_id = guardrail::insert_hold(
-                ctx.tx(), &frozen, project_id, session_id, session.as_deref(), &policy, &details, &ctx.now,
-            )?;
-            error = error.with_confirm("guardrail.confirm", json!({"hold_id": hold_id}));
-            ctx.commit_error(Some(hold_id));
-            ctx.emit("guardrail.held", json!({"hold_id": hold_id, "op": ctx.op, "policy": policy}));
-            ctx.emit("notify.new", json!({"category": "guardrail", "project_id": project_id, "hold_id": hold_id}));
-            Err(error)
-        }
+        Decision::Hold { policy, error, details } => Err(hold_op(ctx, project_id, &policy, error, &details)?),
     }
+}
+
+/// Freeze the running bus op as a hold under `policy` and return the `held` error to answer it
+/// with. `guardrail.confirm` replays the frozen op with `policy` waived (`Ctx::skip_policy`), so
+/// a handler that holds itself must let the request through when that is the policy skipped.
+pub(crate) fn hold_op(
+    ctx: &mut Ctx, project_id: Id, policy: &str, error: BusError, details: &Value,
+) -> Result<BusError, BusError> {
+    let frozen = Request::new(ctx.actor.clone(), ctx.op, ctx.payload().clone()).with_id(ctx.req_id);
+    let session_id = ctx.actor_session_id();
+    let session = session_id.and_then(|id| ctx.tx().query_row(
+        "SELECT name FROM sessions WHERE id = ?1", [id], |r| r.get::<_, String>(0),
+    ).ok());
+    let hold_id = guardrail::insert_hold(
+        ctx.tx(), &frozen, project_id, session_id, session.as_deref(), policy, details, &ctx.now,
+    )?;
+    let error = error.with_confirm("guardrail.confirm", json!({"hold_id": hold_id}));
+    ctx.commit_error(Some(hold_id));
+    ctx.emit("guardrail.held", json!({"hold_id": hold_id, "op": ctx.op, "policy": policy}));
+    ctx.emit("notify.new", json!({"category": "guardrail", "project_id": project_id, "hold_id": hold_id}));
+    Ok(error)
 }
 
 fn reject(ctx: &mut Ctx, payload: RejectIn) -> Result<RejectOut, BusError> {

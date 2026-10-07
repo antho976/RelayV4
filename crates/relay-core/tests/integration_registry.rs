@@ -107,6 +107,40 @@ fn an_agent_reaches_only_its_own_projects_integrations_and_cannot_deploy() {
 }
 
 #[test]
+fn an_agents_build_waits_for_a_person_unless_the_project_trusts_agent_builds() {
+    let f = fixture();
+    let e = &f.engine;
+    branch(&f.repo, "a", "a.txt", "a\n");
+    branch(&f.repo, "b", "b.txt", "b\n");
+    let session = ok(e, "session.create", json!({"project_id": 1, "provider": "codex", "role": "builder"}));
+    let agent = Actor::agent(session["name"].as_str().unwrap());
+    let request = json!({"project_id": 1, "branches": ["a", "b"]});
+    let count = || e.store.lock().query_row("SELECT COUNT(*) FROM integrations", [], |r| r.get::<_, i64>(0)).unwrap();
+
+    // Build defaults to on: held, and nothing is queued until someone says yes.
+    let held = refused(call_as(e, agent.clone(), "integration.request", request.clone()));
+    assert_eq!((held.code.as_str(), held.kind), ("integration.agent_build", relay_bus::ErrorKind::Held), "{held:?}");
+    assert_eq!(count(), 0);
+    let hold_id = held.confirm.as_ref().expect("a hold to confirm").payload["hold_id"].as_i64().unwrap();
+    let confirmed = ok(e, "guardrail.confirm", json!({"hold_id": hold_id}));
+    let queued = &confirmed["outcome"]["result"];
+    assert_eq!(settle(e, queued["id"].as_i64().unwrap())["state"], "passed", "{confirmed}");
+
+    // A merge-only request needs nobody.
+    ok_as(e, agent.clone(), "integration.request", json!({"project_id": 1, "branches": ["a", "b"], "build": false}));
+    // The user is never held.
+    ok(e, "integration.request", request.clone());
+    // A project that trusts agent builds lets them straight through.
+    ok(e, "guardrail.config.set", json!({"project_id": 1, "patch": {"agent_builds": true}}));
+    ok_as(e, agent, "integration.request", request);
+    assert_eq!(count(), 4);
+}
+
+fn ok_as(e: &Engine, actor: Actor, op: &str, payload: Value) -> Value {
+    call_as(e, actor, op, payload).into_result().unwrap_or_else(|err| panic!("{op}: {err:?}"))
+}
+
+#[test]
 fn a_failed_merge_names_the_branches_that_really_conflict() {
     let f = fixture();
     let e = &f.engine;

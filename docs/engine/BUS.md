@@ -857,7 +857,7 @@ Provider-neutral Markdown; the same for both providers.
 | `git.pr.open` | mutation · always | `{ project_id, worktree?, title?, body? }` → `{ url }` — `gh pr create` runs before the store lock, with a 25 s deadline; `git.pr_timeout` means the outcome is unknown |
 | `git.branch.clean_merged` | mutation · always | `{ project_id, dry_run? }` → `{ deleted: string[] }` — never touches branches with a live/parked session |
 | `git.suggest_message` | query | `{ project_id, worktree? }` → `{ message }` — heuristic subject from the diff |
-| `integration.request` | mutation · always | `{ project_id, sessions: string[] \| branches: string[], build?: bool = true, deploy?: DeviceRef }` → `Integration` (state `queued`; results via `integration.result` events) |
+| `integration.request` | mutation · always | `{ project_id, sessions: string[] \| branches: string[], build?: bool = true, deploy?: DeviceRef }` → `Integration` (state `queued`; results via `integration.result` events). An agent is held to its own project and refused `deploy`; an agent's request that builds (the project's `build_cmd`, run outside any sandbox) is `held` / `integration.agent_build` for a person to confirm unless the project's `guardrails.agent_builds` is on, while a merge-only request (`build: false`) goes straight through |
 | `integration.get` / `integration.list` | query | `{ integration_id }` / `{ project_id }` |
 | `integration.discard` | mutation · always | `{ integration_id }` → `{}` — removes the throwaway worktree |
 
@@ -1073,6 +1073,7 @@ interface GuardrailConfig {
   shape_gates: { path: string; validator: "non_empty" | "json" | "json_non_empty_array" | "json_non_empty_object" }[];
   denied_commands: string[];   /* matched against parsed argv, never a raw substring */
   allowed_write_roots: string[]; /* absolute; the process temp dir is always allowed too */
+  agent_builds: boolean;  /* default false: an agent's integration build waits for a person */
   roles: { builder: string[]; reviewer: string[]; docs: string[] };
 }
 interface AuditRow { id; ts; req_id; parent_req: string | null; actor; on_behalf_of: Actor | null;

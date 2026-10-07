@@ -14,6 +14,9 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// The hold policy for an agent asking the engine to run a build (RA-167).
+const AGENT_BUILD_POLICY: &str = "agent_build";
+
 /// An agent reaches only its own project's integrations, like every other project-scoped op
 /// that names a `project_id` (`not_own("project")`).
 fn assert_own_project(ctx: &Ctx, project_id: Id) -> Result<(), BusError> {
@@ -55,9 +58,27 @@ pub fn register(e: &mut Engine) {
             if branch.starts_with('-') { return Err(BusError::invalid("integration.branch", format!("{branch}: a branch name cannot start with '-'"))); }
             repo.rev_parse_single(branch.as_str()).map_err(|e| BusError::invalid("integration.branch", format!("{branch}: {e}")))?;
         }
+        // The build is the project's own command, run by the engine outside any sandbox with the
+        // user's rights. An agent may ask for one only with a person's say-so, unless the project
+        // trusts agent builds (`guardrails.agent_builds`); a merge-only request needs neither.
+        let build = p.build.unwrap_or(true);
+        if build && ctx.actor.is_agent() && ctx.skip_policy() != Some(AGENT_BUILD_POLICY) {
+            let trusted = crate::guardrail::config_for(ctx.tx(), crate::guardrail::ConfigScope::Project(project.id))?.agent_builds;
+            if !trusted {
+                let command = project.build_cmd.clone().unwrap_or_default();
+                let details = json!({"policy": AGENT_BUILD_POLICY, "branches": branches, "build_cmd": command});
+                let error = BusError::held("integration.agent_build", format!(
+                    "running the build command ({}) for an agent needs a person to confirm it",
+                    if command.is_empty() { "none configured" } else { command.as_str() },
+                ))
+                .with_details(details.clone())
+                .with_hint("wait for the user to confirm, or request a merge-only integration with build: false");
+                return Err(super::guardrail::hold_op(ctx, project.id, AGENT_BUILD_POLICY, error, &details)?);
+            }
+        }
         ctx.tx().execute(
             "INSERT INTO integrations(project_id,branches,state,build,deploy,created_at) VALUES (?1,?2,'queued',?3,?4,?5)",
-            params![project.id, serde_json::to_string(&branches).bus()?, p.build.unwrap_or(true) as i64, p.deploy, ctx.now],
+            params![project.id, serde_json::to_string(&branches).bus()?, build as i64, p.deploy, ctx.now],
         ).bus()?;
         let id = ctx.tx().last_insert_rowid();
         let integration = get(ctx.tx(), id)?;

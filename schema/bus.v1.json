@@ -10351,6 +10351,11 @@
         },
         "roles": {
           "$ref": "#/$defs/RoleAllowlist"
+        },
+        "agent_builds": {
+          "type": "boolean",
+          "description": "Whether an agent's `integration.request` may run the project's build command without a\nperson confirming it. Off by default: the build runs outside any sandbox (RA-167), so an\nagent's request that builds is held for confirmation; a merge-only request is not.",
+          "default": false
         }
       },
       "required": [

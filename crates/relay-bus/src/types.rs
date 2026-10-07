@@ -234,6 +234,11 @@ pub struct GuardrailConfig {
     #[serde(default)]
     pub allowed_write_roots: Vec<String>,
     pub roles: RoleAllowlist,
+    /// Whether an agent's `integration.request` may run the project's build command without a
+    /// person confirming it. Off by default: the build runs outside any sandbox (RA-167), so an
+    /// agent's request that builds is held for confirmation; a merge-only request is not.
+    #[serde(default)]
+    pub agent_builds: bool,
 }
 
 /// Which layer of guardrail configuration a value lives in. Each layer overrides the one
