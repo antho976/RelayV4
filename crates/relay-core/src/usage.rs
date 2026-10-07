@@ -186,11 +186,7 @@ fn number(value: &Value) -> Option<f64> {
 fn reset_label(value: &Value) -> Option<String> {
     let seconds = reset_epoch(value)? as f64;
     let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs_f64();
-    let remaining = seconds.saturating_sub(now) as u64;
-    let days = remaining / 86_400;
-    let hours = (remaining % 86_400) / 3600;
-    let minutes = (remaining % 3600) / 60;
-    Some(if days > 0 { format!("{days}d {hours}h") } else if hours > 0 { format!("{hours}h {minutes}m") } else { format!("{minutes}m") })
+    Some(crate::time::span(seconds.saturating_sub(now) as u64, crate::time::Unit::Minute))
 }
 
 fn clean_name(value: &str) -> String {

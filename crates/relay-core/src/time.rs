@@ -42,6 +42,24 @@ pub fn bound(field: &str, raw: &str) -> Result<String, relay_bus::error::BusErro
     ))
 }
 
+/// The smallest unit a [`span`] shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unit { Second, Minute }
+
+/// A length of time as its largest whole unit and the next one down, each truncated: "2d 5h",
+/// "4h 30m", "3m 12s", "45s". Below `finest` it reads as none of it ("0m"). The one wording the
+/// engine uses for how long something has run and how long until something happens (RA-689).
+pub fn span(seconds: u64, finest: Unit) -> String {
+    const UNITS: [(u64, &str); 4] = [(86_400, "d"), (3600, "h"), (60, "m"), (1, "s")];
+    let units = match finest { Unit::Second => &UNITS[..], Unit::Minute => &UNITS[..3] };
+    let first = units.iter().position(|(size, _)| seconds >= *size).unwrap_or(units.len() - 1);
+    let (size, name) = units[first];
+    match units.get(first + 1) {
+        Some((next, next_name)) => format!("{}{name} {}{next_name}", seconds / size, seconds % size / next),
+        None => format!("{}{name}", seconds / size),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -55,6 +73,20 @@ mod tests {
         }
         assert!(days_ago(i64::MIN).as_str() > now.as_str());
         assert!(days_ago(180).as_str() < now.as_str());
+    }
+
+    #[test]
+    fn spans_show_the_largest_unit_and_the_next_down() {
+        assert_eq!(span(0, Unit::Second), "0s");
+        assert_eq!(span(45, Unit::Second), "45s");
+        assert_eq!(span(3 * 60 + 12, Unit::Second), "3m 12s");
+        assert_eq!(span(2 * 3600 + 5 * 60 + 59, Unit::Second), "2h 5m");
+        assert_eq!(span(26 * 3600 + 3 * 60, Unit::Second), "1d 2h");
+        assert_eq!(span(0, Unit::Minute), "0m", "the client reads 0m as a window that has reset");
+        assert_eq!(span(59, Unit::Minute), "0m");
+        assert_eq!(span(5 * 60 + 59, Unit::Minute), "5m");
+        assert_eq!(span(4 * 3600 + 30 * 60, Unit::Minute), "4h 30m");
+        assert_eq!(span(2 * 86_400 + 5 * 3600 + 9 * 60, Unit::Minute), "2d 5h");
     }
 
     #[test]
