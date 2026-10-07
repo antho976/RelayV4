@@ -178,6 +178,14 @@ fn actor_name(ctx: &Ctx) -> Result<String, BusError> {
     }
 }
 
+/// `mailbox.list` page size when the caller names none, and the most it may ask for.
+const MAILBOX_PAGE: u32 = 200;
+const MAILBOX_PAGE_MAX: u32 = 1000;
+/// The longest message text anyone may send.
+const MAILBOX_TEXT_MAX: usize = 64 * 1024;
+/// System notices are clipped here; the full text lives in the matching notification.
+const SYSTEM_TEXT_MAX: usize = 2000;
+
 /// Persist one system-originated message. Used by lifecycle and guardrail handlers inside
 /// their existing request transaction, preserving a single audit boundary.
 pub(crate) fn send_system(
@@ -223,6 +231,24 @@ fn send(
             "mailbox.text",
             "message text cannot be empty",
         ));
+    }
+    // Every message is pushed whole to every connected client in `mailbox.new`, and kept
+    // forever. A system notice (often an agent's last reply) is cut short — the notification
+    // carries the full text — and a person's or agent's message has a ceiling.
+    let clipped;
+    let text = if from == "system" && text.len() > SYSTEM_TEXT_MAX {
+        let mut end = SYSTEM_TEXT_MAX;
+        while !text.is_char_boundary(end) { end -= 1; }
+        clipped = format!("{}…", text[..end].trim_end());
+        clipped.as_str()
+    } else {
+        text
+    };
+    if text.len() > MAILBOX_TEXT_MAX {
+        return Err(BusError::invalid(
+            "mailbox.text",
+            format!("message text is {} bytes; the limit is {MAILBOX_TEXT_MAX}", text.len()),
+        ).with_hint("put long material in a note or a file and send its name"));
     }
     if let Some(task_id) = re_task {
         let project: Option<Id> = tx
@@ -680,12 +706,24 @@ pub fn register(e: &mut Engine) {
                 sql.push_str(" AND EXISTS (SELECT 1 FROM message_recipients pending WHERE pending.message_id=m.id AND pending.acked_at IS NULL)");
             }
         }
-        sql.push_str(" AND (?3 IS NULL OR m.sent_at >= ?3)");
-        sql.push_str(" ORDER BY m.sent_at, m.id");
-        let mut stmt = ctx.tx().prepare(&sql).bus()?;
-        let messages = stmt.query_map(params![p.project_id, session, p.since], message_row).bus()?
+        sql.push_str(" AND (?3 IS NULL OR m.sent_at >= ?3) AND (?4 IS NULL OR m.id < ?4)");
+        // History is never pruned (D26), so the reply is a page. A reader working through its
+        // unread mail takes the oldest first and acks as it goes; every other view wants the
+        // newest. Either way one row past the page says whether there is more.
+        let unread = p.unread_only.unwrap_or(false);
+        sql.push_str(if unread { " ORDER BY m.id ASC LIMIT ?5" } else { " ORDER BY m.id DESC LIMIT ?5" });
+        let limit = p.limit.unwrap_or(MAILBOX_PAGE).clamp(1, MAILBOX_PAGE_MAX) as usize;
+        let mut stmt = ctx.tx().prepare_cached(&sql).bus()?;
+        let mut messages = stmt.query_map(params![p.project_id, session, p.since, p.before, limit as i64 + 1], message_row).bus()?
             .collect::<rusqlite::Result<Vec<_>>>().bus()?;
-        Ok(MailboxListOut { messages })
+        let more = messages.len() > limit;
+        messages.truncate(limit);
+        if unread {
+            return Ok(MailboxListOut { messages, next_before: None, more_unread: more });
+        }
+        messages.reverse();
+        let next_before = more.then(|| messages.first().map(|m| m.id)).flatten();
+        Ok(MailboxListOut { messages, next_before, more_unread: false })
     });
     e.register::<MailboxAck>(|ctx: &mut Ctx, p| {
         let session_id = ctx.actor_session_id().ok_or_else(|| BusError::actor("mailbox.ack requires a bound agent session"))?;

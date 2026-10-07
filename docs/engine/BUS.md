@@ -713,7 +713,7 @@ unique; nothing else is.
 | `notes.standing` | query | `{ project_id }` → `{ text }` — exactly what gets injected at dispatch |
 | `mailbox.send` | mutation · always · project | `{ project_id, to: string \| "*", text, re_task?: Id, priority?: bool }` → `{ message, recipients, delivery }` — priority mail produces the response `mail` hint until acknowledged. Agents may prioritize only direct task-linked mail and may have only one unread priority message outstanding per recipient; user/system sends are unrestricted. |
 | `mailbox.outbox` | query | `{ project_id, since?, limit? = 100 }` → `{ sent: {message: Message, recipients: {session, state, acked_at?}[]}[] }` — what this actor sent, and where each addressee stands (D109) |
-| `mailbox.list` | query | `{ project_id, session?: string, unread_only?, since? }` → `{ messages: Message[] }` |
+| `mailbox.list` | query | `{ project_id, session?: string, unread_only?, since?, limit? (200, ≤1000), before?: message id }` → `{ messages: Message[], next_before?, more_unread? }` — a page, oldest first: the newest page (older ones through `before: next_before`), or with `unread_only` the oldest unread, `more_unread` when more wait. Message text is at most 64 KiB; system notices are clipped to 2,000 bytes |
 | `mailbox.ack` | mutation · agent_only | `{ message_id }` → `{}` |
 
 ### 10.8 session (SPEC §10)

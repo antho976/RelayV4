@@ -8705,6 +8705,23 @@
             "string",
             "null"
           ]
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "Page size, default 200, at most 1000."
+        },
+        "before": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "Only messages older than this message id: the previous page's `next_before`."
         }
       },
       "required": [
@@ -8718,7 +8735,20 @@
           "type": "array",
           "items": {
             "$ref": "#/$defs/Message"
-          }
+          },
+          "description": "Oldest first. Without `unread_only` this is the newest page; with it, the oldest unread."
+        },
+        "next_before": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "Set when older messages remain: pass it as `before` for the page before this one."
+        },
+        "more_unread": {
+          "type": "boolean",
+          "description": "More unread messages remain past this page (`unread_only`): ack these, then ask again."
         }
       },
       "required": [

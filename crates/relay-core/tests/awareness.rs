@@ -624,3 +624,34 @@ fn repeated_reports_coalesce_unread_cards_and_do_not_replay_alerts() {
     assert_eq!(unread["notifications"].as_array().unwrap().len(), 1);
     assert_eq!(unread["notifications"][0]["body"], "New work finished");
 }
+
+#[test]
+fn mailbox_list_is_paged_newest_first_for_people_and_oldest_unread_for_agents() {
+    let f = Fixture::new();
+    let e = &f.engine;
+    for n in 0..250 {
+        ok(e, Actor::User, "mailbox.send", json!({"project_id":1,"to":f.a_name(),"text":format!("m{n}")}));
+    }
+    let texts = |page: &Value| -> Vec<String> {
+        page["messages"].as_array().unwrap().iter().map(|m| m["text"].as_str().unwrap().to_string()).collect()
+    };
+    // The person's view: the newest page, in reading order, with a cursor to the older ones.
+    let newest = ok(e, Actor::User, "mailbox.list", json!({"project_id":1}));
+    let page = texts(&newest);
+    assert_eq!(page.len(), 200);
+    assert_eq!((page[0].as_str(), page[199].as_str()), ("m50", "m249"));
+    let older = ok(e, Actor::User, "mailbox.list", json!({"project_id":1,"before":newest["next_before"]}));
+    let page = texts(&older);
+    assert_eq!((page.len(), page[0].as_str(), page[49].as_str()), (50, "m0", "m49"));
+    assert!(older.get("next_before").is_none());
+
+    // An agent working through its inbox gets the oldest unread first, and is told more wait.
+    let inbox = ok(e, Actor::agent(f.a_name()), "mailbox.list", json!({"project_id":1,"unread_only":true,"limit":100}));
+    assert_eq!(texts(&inbox)[0], "m0");
+    assert_eq!(inbox["more_unread"], true);
+
+    // Text is bounded: a person's message has a ceiling.
+    let long = "x".repeat(70 * 1024);
+    let refused = call(e, Actor::User, "mailbox.send", json!({"project_id":1,"to":f.a_name(),"text":long}));
+    assert_eq!(refused.error.unwrap().code, "mailbox.text");
+}
