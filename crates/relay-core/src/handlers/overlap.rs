@@ -243,7 +243,14 @@ fn changed_symbols(
         if language(path).is_none() {
             continue;
         }
-        let current = std::fs::read(worktree.join(path)).unwrap_or_default();
+        // Only a regular file small enough to parse is read: a planted symlink to a device or
+        // a huge file must not be pulled into memory just to be refused by `symbols`.
+        let file = worktree.join(path);
+        let current = std::fs::metadata(&file)
+            .ok()
+            .filter(|md| md.is_file() && md.len() <= 2 * 1024 * 1024)
+            .and_then(|_| std::fs::read(&file).ok())
+            .unwrap_or_default();
         let before = baseline(&repo, path);
         let current_symbols = symbols(path, &current);
         let before_symbols = symbols(path, &before);

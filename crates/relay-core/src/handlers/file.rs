@@ -177,8 +177,8 @@ pub fn register(e: &mut Engine) {
         let from = safe_join(&root, &from_rel, false)?;
         let into_rel = from_rel.parent().unwrap_or(Path::new("")).join(&p.new_name);
         let into = safe_join(&root, &into_rel, true)?;
-        guard_path_mutation(ctx, project.id, &root, &from_rel, &from)?;
-        guard_path_mutation(ctx, project.id, &root, &into_rel, &from)?;
+        guard_path_mutation(ctx, project.id, &root, &from_rel, None)?;
+        guard_path_mutation(ctx, project.id, &root, &into_rel, Some(&from))?;
         if into.exists() {
             return Err(BusError::conflict(
                 "file.exists",
@@ -206,8 +206,8 @@ pub fn register(e: &mut Engine) {
             .ok_or_else(|| BusError::invalid("file.path", "path has no name"))?;
         let into_rel = dir_rel.join(name);
         let into = safe_join(&root, &into_rel, true)?;
-        guard_path_mutation(ctx, project.id, &root, &from_rel, &from)?;
-        guard_path_mutation(ctx, project.id, &root, &into_rel, &from)?;
+        guard_path_mutation(ctx, project.id, &root, &from_rel, None)?;
+        guard_path_mutation(ctx, project.id, &root, &into_rel, Some(&from))?;
         if into.exists() {
             return Err(BusError::conflict(
                 "file.exists",
@@ -221,7 +221,7 @@ pub fn register(e: &mut Engine) {
     e.register::<Delete>(|ctx: &mut Ctx, p| {
         let (project, root) = root(ctx, p.project_id, p.worktree.as_deref())?;
         let rel = rel(&p.path, false)?; let path = safe_join(&root, &rel, false)?;
-        guard_path_mutation(ctx, project.id, &root, &rel, &path)?;
+        guard_path_mutation(ctx, project.id, &root, &rel, None)?;
         ctx.tx().execute(
             "INSERT INTO file_trash(project_id, worktree, original_path, trash_path, created_at) VALUES (?1,?2,?3,'',?4)",
             params![project.id, root.display().to_string(), p.path, ctx.now],
@@ -283,7 +283,7 @@ pub fn register(e: &mut Engine) {
                 .ok_or_else(|| BusError::invalid("file.source", "source has no name"))?;
             let dest = into.join(name);
             let dest_rel = into_rel.join(name);
-            guard_path_mutation(ctx, project.id, &root, &dest_rel, source)?;
+            guard_path_mutation(ctx, project.id, &root, &dest_rel, Some(source))?;
             if dest.exists() {
                 return Err(BusError::conflict(
                     "file.exists",
@@ -314,14 +314,19 @@ pub fn register(e: &mut Engine) {
         // `String` for every file in the tree, most of which contribute no hits at all.
         let mut buffer: Vec<u8> = Vec::new();
         while let Some(dir) = stack.pop() {
-            for e in fs::read_dir(&dir)
-                .map_err(|e| io_err("file.search_failed", &dir, e))?
-                .flatten()
-            {
+            // One unreadable subdirectory costs its own hits, not the whole search.
+            let entries = match fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(e) if dir == root => return Err(io_err("file.search_failed", &dir, e)),
+                Err(_) => continue,
+            };
+            for e in entries.flatten() {
                 let path = e.path();
                 let relp = path.strip_prefix(&root).unwrap_or(&path);
+                // `DirEntry::file_type` does not follow symlinks, so a linked directory is
+                // never walked into. Generated trees are skipped by the same rule file.tree uses.
                 if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    if !skip_dir(relp) {
+                    if !crate::watch::is_generated_path(&root, &path) {
                         stack.push(path);
                     }
                     continue;
@@ -331,10 +336,7 @@ pub fn register(e: &mut Engine) {
                         continue;
                     }
                 }
-                buffer.clear();
-                let read = fs::File::open(&path)
-                    .and_then(|mut file| std::io::Read::read_to_end(&mut file, &mut buffer));
-                if read.is_err() {
+                if !read_searchable(&root, &path, &mut buffer) {
                     continue;
                 }
                 // Same rule as `read_to_string`: what is not text is not searched.
@@ -568,25 +570,30 @@ fn entry(
     })
 }
 
+/// Gate a rename, move, delete or import by path alone (BUS.md §9.2). `content` is the file
+/// that would land at `rel`; it is read only when a shape gate covers `rel` and needs the text,
+/// so moving a multi-GB asset never reads it, under the lock or otherwise.
 fn guard_path_mutation(
     ctx: &mut Ctx,
     project_id: Id,
     root: &Path,
     rel: &Path,
-    content: &Path,
+    content: Option<&Path>,
 ) -> Result<(), BusError> {
-    let text = fs::read_to_string(content).unwrap_or_default();
-    guardrail::enforce(
-        ctx,
-        project_id,
-        root,
-        GateKind::Write,
-        Some(&rel.to_string_lossy()),
-        Some(&text),
-        None,
-        None,
-    )
+    let shaped = content.is_some()
+        && crate::guardrail::config(ctx.tx(), Some(project_id))?
+            .shape_gates
+            .iter()
+            .any(|gate| crate::guardrail::path_matches(&gate.path, rel));
+    let text = content
+        .filter(|_| shaped)
+        .filter(|path| fs::metadata(path).is_ok_and(|md| md.is_file() && md.len() <= SHAPE_TEXT_MAX))
+        .and_then(|path| fs::read_to_string(path).ok());
+    guardrail::enforce_path_mutation(ctx, project_id, root, &rel.to_string_lossy(), text.as_deref())
 }
+
+/// Shape gates validate configuration files; anything larger is not one, and is held unread.
+const SHAPE_TEXT_MAX: u64 = 4 * 1024 * 1024;
 
 fn changed(ctx: &mut Ctx, project_id: Id, root: &Path, path: &str) {
     ctx.set_project(project_id);
@@ -626,13 +633,55 @@ fn copy(from: &Path, to: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn skip_dir(path: &Path) -> bool {
-    path.components().any(|c| {
-        matches!(
-            c.as_os_str().to_string_lossy().as_ref(),
-            ".git" | ".relay" | "node_modules" | "target"
-        )
-    })
+/// Files larger than this are not searched: at that size they are assets or generated output,
+/// and reading them whole on every search is the cost the editor's re-search pays repeatedly.
+const SEARCH_MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// How much of a file is read first to decide whether it is text at all.
+const SEARCH_SNIFF_BYTES: usize = 8 * 1024;
+
+/// Read `path` into `buffer` if it is a searchable text file: a regular file (a symlink only
+/// when its target stays inside `root`, the same rule as file.read), no larger than
+/// [`SEARCH_MAX_BYTES`], whose first few KB hold no NUL and valid UTF-8. A FIFO, socket or
+/// device is never opened, and a binary asset costs one small read rather than its full size.
+fn read_searchable(root: &Path, path: &Path, buffer: &mut Vec<u8>) -> bool {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let Ok(link) = fs::symlink_metadata(path) else { return false };
+    if link.file_type().is_symlink()
+        && !fs::canonicalize(path).is_ok_and(|target| target.starts_with(root))
+    {
+        return false;
+    }
+    let Ok(md) = fs::metadata(path) else { return false };
+    if !md.is_file() || md.len() > SEARCH_MAX_BYTES {
+        return false;
+    }
+    // O_NONBLOCK: a file swapped for a FIFO after the check above cannot hang the open.
+    let Ok(file) = fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(path) else {
+        return false;
+    };
+    if !file.metadata().is_ok_and(|md| md.is_file()) {
+        return false;
+    }
+    buffer.clear();
+    let mut file = file.take(SEARCH_MAX_BYTES);
+    if (&mut file).take(SEARCH_SNIFF_BYTES as u64).read_to_end(buffer).is_err() {
+        return false;
+    }
+    let sniff = &buffer[..];
+    if sniff.contains(&0) {
+        return false;
+    }
+    if let Err(error) = std::str::from_utf8(sniff) {
+        // A multi-byte character cut by the sniff boundary is not evidence of binary.
+        if error.error_len().is_some() {
+            return false;
+        }
+    }
+    if buffer.len() < SEARCH_SNIFF_BYTES {
+        return true;
+    }
+    file.read_to_end(buffer).is_ok()
 }
 
 fn mime(path: &Path) -> String {

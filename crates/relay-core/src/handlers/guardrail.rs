@@ -167,7 +167,7 @@ pub fn register(engine: &mut Engine) {
                 diff: payload.diff.as_deref(),
                 command: payload.command.as_deref(),
                 skip_policy: None,
-                grants: None,
+                grants: None, path_only: false,
             },
             ctx.actor_session_id(),
         )?;
@@ -209,7 +209,7 @@ pub fn register(engine: &mut Engine) {
                     diff: Some(""),
                     command: None,
                     skip_policy: None,
-                    grants: None,
+                    grants: None, path_only: false,
                 },
                 ctx.actor_session_id(),
             ).map(|(decision, _)| decision);
@@ -248,7 +248,7 @@ pub fn register(engine: &mut Engine) {
                     diff: None,
                     command: Some(&command),
                     skip_policy: None,
-                    grants: None,
+                    grants: None, path_only: false,
                 },
                 ctx.actor_session_id(),
             )?;
@@ -520,7 +520,7 @@ fn gate(ctx: &mut Ctx, payload: GateIn, skip_policy: Option<&str>) -> Result<Gat
             diff: payload.diff.as_deref(),
             command: payload.command.as_deref(),
             skip_policy,
-            grants: None,
+            grants: None, path_only: false,
         },
         Some(session.session.id),
     )?;
@@ -612,7 +612,7 @@ fn confirm(ctx: &mut Ctx, payload: ConfirmIn) -> Result<ConfirmOut, BusError> {
             diff: gate_payload.diff.as_deref(),
             command: gate_payload.command.as_deref(),
             skip_policy: Some(&hold.policy),
-            grants: None,
+            grants: None, path_only: false,
         },
     )?;
 
@@ -673,10 +673,26 @@ pub(crate) fn enforce(
     ctx: &mut Ctx, project_id: Id, worktree: &Path, kind: GateKind, path: Option<&str>,
     new_text: Option<&str>, diff: Option<&str>, command: Option<&str>,
 ) -> Result<(), BusError> {
+    enforce_request(ctx, project_id, worktree, kind, path, new_text, diff, command, false)
+}
+
+/// [`enforce`] for a rename, move or delete: the path rules only, never the file's content
+/// (BUS.md §9.2). `new_text` is only for a shape gate on the destination.
+pub(crate) fn enforce_path_mutation(
+    ctx: &mut Ctx, project_id: Id, worktree: &Path, path: &str, new_text: Option<&str>,
+) -> Result<(), BusError> {
+    enforce_request(ctx, project_id, worktree, GateKind::Write, Some(path), new_text, None, None, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enforce_request(
+    ctx: &mut Ctx, project_id: Id, worktree: &Path, kind: GateKind, path: Option<&str>,
+    new_text: Option<&str>, diff: Option<&str>, command: Option<&str>, path_only: bool,
+) -> Result<(), BusError> {
     let session_id = ctx.actor_session_id();
     let (decision, used) = guardrail::evaluate_granted(ctx.tx(), &GateRequest {
         actor: &ctx.actor, project_id, worktree, kind, path, new_text, diff, command,
-        skip_policy: ctx.skip_policy(), grants: None,
+        skip_policy: ctx.skip_policy(), grants: None, path_only,
     }, session_id)?;
     match decision {
         Decision::Allow => use_grants(ctx, &used, None),

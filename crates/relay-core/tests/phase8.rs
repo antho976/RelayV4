@@ -660,3 +660,69 @@ fn filesystem_reads_do_not_retrigger_refresh_but_writes_do() {
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+
+#[test]
+fn search_reads_only_bounded_regular_text_and_path_ops_never_read_content() {
+    let e = engine();
+    let (ws, repo) = real_repo();
+    add_project(&e, &ws, &repo);
+    let root = std::path::Path::new(&repo);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "// needle in source\n").unwrap();
+    // A FIFO would block open() forever; a symlink out of the worktree must not be followed.
+    assert!(Command::new("mkfifo").arg(root.join("src/pipe.rs")).status().unwrap().success());
+    let outside = ws.path().join("outside.txt");
+    std::fs::write(&outside, "needle outside\n").unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("src/escape.txt")).unwrap();
+    std::os::unix::fs::symlink(root.join("src/lib.rs"), root.join("src/alias.rs")).unwrap();
+    // Generated trees, binaries and oversized files are not searched.
+    for dir in ["build", "Intermediate", "dist"] {
+        std::fs::create_dir_all(root.join(dir)).unwrap();
+        std::fs::write(root.join(dir).join("gen.txt"), "needle generated\n").unwrap();
+    }
+    let mut binary = b"needle".to_vec();
+    binary.extend([0u8; 16]);
+    std::fs::write(root.join("src/blob.bin"), binary).unwrap();
+    let big = std::fs::File::create(root.join("src/huge.txt")).unwrap();
+    big.set_len(65 * 1024 * 1024).unwrap();
+    drop(big);
+
+    let started = std::time::Instant::now();
+    let hits = call(&e, "file.search", json!({"project_id":1,"query":"needle"})).into_result().unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(5), "the search waited on something");
+    let mut paths: Vec<&str> = hits["hits"].as_array().unwrap().iter().map(|h| h["path"].as_str().unwrap()).collect();
+    paths.sort();
+    assert_eq!(paths, ["src/alias.rs", "src/lib.rs"]);
+
+    // Renaming, moving and deleting a file past the 64 MiB comparison cap is a path operation:
+    // it is not held as a destructive write and its content is never read.
+    let renamed = call(&e, "file.rename", json!({"project_id":1,"path":"src/huge.txt","new_name":"huge2.txt"}));
+    assert!(renamed.error.is_none(), "rename held: {:?}", renamed.error);
+    call(&e, "file.move", json!({"project_id":1,"path":"src/huge2.txt","into":""})).into_result().unwrap();
+    call(&e, "file.delete", json!({"project_id":1,"path":"huge2.txt"})).into_result().unwrap();
+    std::fs::remove_file(root.join("src/pipe.rs")).unwrap();
+
+    // Protected paths still hold a rename, on either end.
+    call(&e, "project.update", json!({"project_id":1,"protected_paths":["keep.txt"]})).into_result().unwrap();
+    std::fs::write(root.join("keep.txt"), "x\n").unwrap();
+    let held = call(&e, "file.rename", json!({"project_id":1,"path":"keep.txt","new_name":"moved.txt"}));
+    assert_eq!(err(&held).kind, ErrorKind::Held);
+    let held = call(&e, "file.rename", json!({"project_id":1,"path":"README.md","new_name":"keep.txt"}));
+    assert_eq!(err(&held).kind, ErrorKind::Held);
+}
+
+#[test]
+fn a_confirmed_write_over_the_comparison_cap_goes_through() {
+    let e = engine();
+    let (ws, repo) = real_repo();
+    add_project(&e, &ws, &repo);
+    let big = std::fs::File::create(std::path::Path::new(&repo).join("big.dat")).unwrap();
+    big.set_len(65 * 1024 * 1024).unwrap();
+    drop(big);
+    let held = call(&e, "file.write", json!({"project_id":1,"path":"big.dat","text":"small now\n"}));
+    assert_eq!(err(&held).kind, ErrorKind::Held);
+    let hold_id = err(&held).confirm.as_ref().unwrap().payload["hold_id"].as_i64().unwrap();
+    let confirmed = call(&e, "guardrail.confirm", json!({"hold_id":hold_id})).into_result().unwrap();
+    assert_eq!(confirmed["outcome"]["ok"], true, "{confirmed}");
+    assert_eq!(std::fs::read_to_string(std::path::Path::new(&repo).join("big.dat")).unwrap(), "small now\n");
+}
