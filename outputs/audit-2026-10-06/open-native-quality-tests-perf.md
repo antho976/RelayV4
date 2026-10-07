@@ -15,7 +15,8 @@ What is still open, in full or in part, is under "Still open"; the rest is fixed
   region before it is sized, `ok` comes from the call, "during" rows report their overlap
   (`device.build`/`task.list` variants dropped), startup/recovery scans are drained between
   iterations, strace attaches under Yama scope 1 and counts only between markers, and filters
-  match exactly unless they end in `*` (`baseline.py` follows). RA-651 needed no change:
+  match exactly unless they end in `*` (`baseline.py` follows). strace was checked live (7.2,
+  Yama scope 1): every case recorded exactly one marked region per iteration. RA-651 needed no change:
   `isolate_host` already points git at the fixture's own config.
 - RA-675..678, RA-742 (sessions.rs, store.rs), RA-671 (every listed file uses `tests/common`),
   RA-665 (the signing test opens a file store in a TempDir).
@@ -49,9 +50,6 @@ session's own pane, the tools check skips parked panes, and registry returns to 
 
 ## Still open
 
-- **RA-655, RA-656, live.** strace is not installed on the machine this was done on, so the
-  attach under scope 1 and the marker counting ran only against a synthetic trace (unit test
-  `cargo test -p relay-core --example perf`).
 - **RA-663, production half.** `usage.get`'s test-instance branch stays: the test instance
   must not read the developer's real provider files, and the real path is now tested on a dev
   instance. After-close cleanup and `after_merged_prs` stay off in tests: turning them on
