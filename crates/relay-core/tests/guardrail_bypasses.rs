@@ -1,18 +1,14 @@
 //! Guardrail bypasses from the RA-093..RA-105 audit, each driven through the bus: what used to
 //! slip past a gate, and the ordinary work that must still pass it.
 
-use relay_bus::{Actor, ErrorKind, Request, Response};
-use relay_core::engine::{Door, Engine};
-use relay_core::{Instance, Store};
-use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::Arc;
+mod common;
 
-fn git(repo: &Path, args: &[&str]) {
-    let status = Command::new("git").arg("-C").arg(repo).args(args).status().unwrap();
-    assert!(status.success(), "git {args:?}");
-}
+use common::{call_as as call, committed_repo, engine_with_project, git, ok_as as ok};
+use relay_bus::{Actor, ErrorKind, Response};
+use relay_core::engine::Engine;
+use serde_json::json;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 struct Fixture {
     _root: tempfile::TempDir,
@@ -24,17 +20,8 @@ impl Fixture {
         let root = tempfile::tempdir().unwrap();
         let ws = root.path().join("ws");
         let repo = ws.join("app");
-        std::fs::create_dir_all(&repo).unwrap();
-        git(&repo, &["init", "-q", "-b", "main"]);
-        git(&repo, &["config", "user.email", "bypass@relay.test"]);
-        git(&repo, &["config", "user.name", "Bypass"]);
-        std::fs::write(repo.join("README.md"), "relay\n").unwrap();
-        git(&repo, &["add", "."]);
-        git(&repo, &["commit", "-q", "-m", "init"]);
-        let store = Store::open(&root.path().join("store/store.db"), false).unwrap();
-        let engine = Engine::new(Instance::Test, store);
-        ok(&engine, Actor::User, "workspace.create", json!({"path": ws}));
-        ok(&engine, Actor::User, "project.add", json!({"workspace_id": 1, "path": repo}));
+        committed_repo(&repo, &[("README.md", "relay\n")]);
+        let engine = engine_with_project(root.path(), &ws, &repo);
         Self { _root: root, engine }
     }
 
@@ -50,16 +37,6 @@ impl Fixture {
     fn protect(&self, paths: &[&str]) {
         ok(&self.engine, Actor::User, "guardrail.config.set", json!({"project_id": 1, "patch": {"protected_paths": paths}}));
     }
-}
-
-fn call(engine: &Engine, actor: Actor, op: &str, payload: Value) -> Response {
-    engine.dispatch(Request::new(actor, op, payload), Door::InProcess)
-}
-
-fn ok(engine: &Engine, actor: Actor, op: &str, payload: Value) -> Value {
-    call(engine, actor, op, payload)
-        .into_result()
-        .unwrap_or_else(|error| panic!("{op} failed: {} {}", error.code, error.message))
 }
 
 fn code(response: &Response) -> String {

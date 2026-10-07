@@ -1,37 +1,13 @@
 //! `git.*` over the bus where a repository is less tidy than a fixture: merges in history,
 //! bracketed file names, submodules, symlinks, renames out of protected paths.
 
-use relay_bus::{Actor, BusError, ErrorKind, Request, Response};
-use relay_core::engine::{Door, Engine};
-use relay_core::{Instance, Store};
+mod common;
+
+use common::{call, engine, err, git, git_command, init_repo as init, ok};
+use relay_bus::ErrorKind;
+use relay_core::engine::Engine;
 use serde_json::{json, Value};
 use std::path::Path;
-use std::process::Command;
-use std::sync::Arc;
-
-fn engine() -> Arc<Engine> {
-    Engine::new(Instance::Test, Store::open_memory().unwrap())
-}
-fn call(e: &Engine, op: &str, payload: Value) -> Response {
-    e.dispatch(Request::new(Actor::User, op, payload), Door::InProcess)
-}
-fn ok(e: &Engine, op: &str, payload: Value) -> Value {
-    call(e, op, payload).into_result().unwrap_or_else(|error| panic!("{op}: {error:?}"))
-}
-fn err(r: &Response) -> &BusError {
-    r.error.as_ref().expect("expected an error response")
-}
-fn git(repo: &Path, args: &[&str]) -> String {
-    let out = Command::new("git").arg("-C").arg(repo).args(args).output().unwrap();
-    assert!(out.status.success(), "git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr));
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
-fn init(repo: &Path) {
-    std::fs::create_dir_all(repo).unwrap();
-    git(repo, &["init", "-q", "-b", "main"]);
-    git(repo, &["config", "user.name", "Relay Test"]);
-    git(repo, &["config", "user.email", "relay@example.test"]);
-}
 /// A repository with one commit on `main`, registered as project 1.
 fn project(e: &Engine) -> (tempfile::TempDir, String) {
     let ws = tempfile::tempdir().unwrap();
@@ -299,7 +275,7 @@ fn commit_is_refused_while_the_index_is_unmerged() {
     git(root, &["switch", "-q", "main"]);
     std::fs::write(root.join("README.md"), "# Main\n").unwrap();
     git(root, &["commit", "-q", "-am", "Main"]);
-    let merge = Command::new("git").arg("-C").arg(root).args(["merge", "-q", "side"]).output().unwrap();
+    let merge = git_command(root).args(["merge", "-q", "side"]).output().unwrap();
     assert!(!merge.status.success(), "the fixture must conflict");
     let head = git(root, &["rev-parse", "HEAD"]);
 
