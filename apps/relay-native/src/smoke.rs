@@ -756,14 +756,18 @@ pub fn install(ui: &Rc<Ui>) {
                     }
                     click_control(&ui, "setup-scan");
                     if page.starts_with("setup-github") {
-                        // Nothing below depends on the scan's result, which only fills
-                        // the Local tab; give it a moment so the GitHub tab is what shows.
-                        glib::timeout_future(Duration::from_millis(500)).await;
+                        // Nothing below depends on the scan's result, which only fills the
+                        // Local tab and never switches tabs, so the switch need not wait for it.
                         named(&ui.window, "setup-source")
                             .ok_or("Setup source tabs missing")?
                             .downcast::<gtk::Stack>()
                             .map_err(|_| "Setup source type")?
                             .set_visible_child_name("github");
+                        wait_for(
+                            || named(&ui.window, "setup-github-repos").is_some_and(|w| w.is_mapped()),
+                            "GitHub tab shown",
+                        )
+                        .await?;
                     }
                     if page.contains("connect") {
                         wait_for(|| clickable(&ui.window, "setup-connect"), "GitHub connect shown")
