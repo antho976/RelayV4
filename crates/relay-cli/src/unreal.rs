@@ -2088,7 +2088,13 @@ mod tests {
         // A stand-in editor: any long-running binary named UnrealEditor with this project open.
         let binary = root.path().join("UnrealEditor");
         std::fs::copy("/usr/bin/tail", &binary).unwrap();
-        let mut editor = Command::new(&binary).arg("-f").arg(&project.uproject).stdout(Stdio::null()).spawn().unwrap();
+        // A test forking at the same moment can hold the fresh copy open for writing a moment.
+        let mut editor = (0..50)
+            .find_map(|_| match Command::new(&binary).arg("-f").arg(&project.uproject).stdout(Stdio::null()).spawn() {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => { std::thread::sleep(Duration::from_millis(20)); None }
+                other => Some(other.unwrap()),
+            })
+            .expect("the stand-in editor stayed busy");
         // SAFETY: see setup_fix_adds_only_the_missing_bridge_plugins.
         unsafe { std::env::set_var("UE_REMOTE_CONTROL_URL", CLOSED_REMOTE) };
         let deadline = std::time::Instant::now() + Duration::from_secs(5);

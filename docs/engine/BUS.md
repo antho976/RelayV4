@@ -514,23 +514,31 @@ callers of it wherever the provider lets us:
   `.claude/settings.local.json` (or the equivalent the CLI version accepts — `provider.list`
   reports the spawn profile). Phase 4 installs `PreToolUse` on
   `Write`/`Edit`/`MultiEdit`/`Bash`; its thin CLI adapter translates the hook's stdin into
-  `guardrail.gate` and exits 2 on hold/refusal or infrastructure failure. Phase 5 extends the
+  `guardrail.gate` and exits 2 on hold/refusal or infrastructure failure, including a gate that
+  has not answered within 20 s: the provider kills a hook at 30 s and then runs the tool
+  unchecked (D163). A `Bash` call meets the `exec` gate and then one `write` gate per file the
+  command visibly writes — redirections, `tee`, `sed -i`, `truncate`, `rm`, `cp`/`mv` and the
+  like, inside `sh -c` too — with an overwrite or delete carrying the line count it removes.
+  Targets built from variables or globs, and files a program opens by itself, are not seen
+  (D163). Phase 5 extends the
   same local file with `SessionStart`/`PostToolUse`/`Stop`/`Notification` hooks and a
   `statusLine` command that call `session.report` / `usage.report` (§10.8). This is v3's
   `agenthooks.rs`, now a bus client instead of bespoke files.
 - **git**: every Relay-created worktree gets a `pre-commit` hook calling `relay cmd
   guardrail.gate '{"kind":"commit"}'`; the hook exits non-zero on `refuse`/`hold`. This binds
   both providers' commits, and yours.
-- **Codex** (no tool hooks): `ProviderInfo.guarded` is `false` and the settings surface labels
-  its sessions **unguarded**, so the gap is a known state rather than an assumption (D107). Its
-  only channel is `--config developer_instructions`, which therefore carries the role
-  instruction, the compact brief, and the `$RELAY_BIN q <op>` shell path to the bus. Relay still
-  observes it: the PTY reader stamps `last_output_at` for every provider, hooked or not (D108).
-  The git hook covers commits; writes are detected **post-hoc**
-  by the `notify` watcher — a destructive write that already landed raises a
-  `guardrail.violation` notification with a one-click `git checkout -- <path>` restore
-  (`file.restore_head`), not a hold. Documented as weaker; the pair preset with a Claude
-  reviewer is the mitigation SPEC §4 intends.
+- **Codex**: Relay merges `PreToolUse` and lifecycle hooks into `.codex/hooks.json` (D132);
+  they run only after the person trusts them once in Codex's `/hooks`, which Relay surfaces and
+  never bypasses. `Bash` is gated as for Claude: `exec`, then a `write` gate per visible target.
+  `apply_patch`, Codex's edit tool, is parsed into one `write` gate per file — an added file
+  with its text, an updated one with its text after the hunks are applied in memory, a deleted
+  one with the lines it removes, a move's source by path alone — so protected paths, destructive
+  writes, shape gates and write roots bind Codex's edits as they bind Claude's Write and Edit
+  (D163). Developer instructions still carry the role instruction, the compact brief and the
+  `$RELAY_BIN q <op>` shell path to the bus, and the PTY reader stamps `last_output_at` for
+  every provider (D108). No post-hoc write watcher exists: a write the hooks cannot see — a
+  script opening files itself — is caught only by the commit gate, which checks protected paths
+  and caps, not destructive writes or shape gates.
 
 ### 9.4 Holds and confirmation
 
@@ -849,7 +857,7 @@ All paths are relative to the worktree root; `..` and absolute paths are `invali
 | `file.delete` | mutation · always · inverse (restore) | `{ project_id, worktree?, path }` → `{ trash_id }` |
 | `file.restore` | mutation · always | `{ project_id, trash_id }` → `Entry` |
 | `file.import` | mutation · always | `{ project_id, worktree?, into, sources: path[] }` → `{ entries: Entry[] }` — OS drag-in |
-| `file.restore_head` | mutation · always · user | `{ project_id, worktree?, path }` → `Entry` — `git checkout -- <path>`; the one-click answer to a post-hoc `guardrail.violation` (§9.3) |
+| `file.restore_head` | mutation · always · user | `{ project_id, worktree?, path }` → `Entry` — `git checkout -- <path>` |
 | `file.search` | query | `{ project_id, worktree?, query, glob?, regex?, limit? }` → `{ hits: {path, line, col, text}[] }` |
 
 ### 10.14 device (SPEC §9)
@@ -1128,8 +1136,9 @@ test that opens a DB at each prior version.
   v3 importer folds comments into the body under a `--- comments ---` marker.
 - **`merge.integration.request` (SPEC §3) is `integration.request` here.** Same op; the
   namespace is the noun. Skills written from SPEC's wording should be updated, not aliased.
-- **Guardrails bind agents through hooks, not through the bus's file ops** (§9.3). Codex is
-  weaker there (post-hoc), by the provider's limits, and the spec says so rather than pretends.
+- **Guardrails bind agents through hooks, not through the bus's file ops** (§9.3). Shell writes
+  are gated only where the command line shows them, for every provider, and the spec says so
+  rather than pretends (D163).
 
 ---
 
