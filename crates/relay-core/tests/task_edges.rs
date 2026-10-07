@@ -324,3 +324,49 @@ fn changelog_and_append_take_an_optional_expected_updated_at() {
     assert_eq!(code(stale), "notes.edit_conflict");
     ok(e, "notes.append", json!({"project_id":1,"text":"rule two","expected_updated_at":standing["updated_at"]}));
 }
+
+/// RA-416: undoing task.approve is task.unapprove. The task returns to its column, slot and
+/// state, and the commit link the approval added goes; a link that was there before stays.
+#[test]
+fn undoing_approve_restores_the_task_and_drops_only_its_own_link() {
+    let f = Fixture::new();
+    let e = &f.engine;
+    let ids = |e: &Engine| -> Vec<i64> {
+        ok(e, "task.list", json!({"project_id":1,"column":"in_review"}))["tasks"].as_array().unwrap()
+            .iter().map(|t| t["id"].as_i64().unwrap()).collect()
+    };
+    let a = f.task("A", json!({"column":"in_review"}));
+    let b = f.task("B", json!({"column":"in_review"}));
+    let c = f.task("C", json!({"column":"in_review"}));
+    ok(e, "task.update", json!({"task_id":b["id"],"state":"awaiting_review"}));
+    let before = ids(e);
+    let done = ok(e, "task.approve", json!({"task_id":b["id"],"sha":"cafe"}));
+    assert_eq!(done["column"], "done");
+    assert_eq!(done["state"], "none");
+    let row = f.last_audit("task.approve");
+    assert_eq!(row["undo_op"]["op"], "task.unapprove");
+    ok(e, "audit.undo", json!({"audit_id":row["id"]}));
+    let back = ok(e, "task.get", json!({"task_id":b["id"]}));
+    assert_eq!(back["column"], "in_review");
+    assert_eq!(back["state"], "awaiting_review");
+    assert_eq!(back["commits"], json!([]));
+    assert_eq!(ids(e), before);
+    assert_eq!(before, [a["id"].as_i64().unwrap(), b["id"].as_i64().unwrap(), c["id"].as_i64().unwrap()]);
+    // Undoing the undo is a redo: back to done with the same commit.
+    ok(e, "audit.undo", json!({"audit_id":f.last_audit("audit.undo")["id"]}));
+    let again = ok(e, "task.get", json!({"task_id":b["id"]}));
+    assert_eq!(again["column"], "done");
+    assert_eq!(again["commits"][0]["sha"], "cafe");
+
+    // A commit linked before the approval is not the approval's to remove.
+    ok(e, "task.link_commit", json!({"task_id":a["id"],"sha":"beef","branch":"relay/a"}));
+    ok(e, "task.approve", json!({"task_id":a["id"],"sha":"beef"}));
+    ok(e, "audit.undo", json!({"audit_id":f.last_audit("task.approve")["id"]}));
+    let kept = ok(e, "task.get", json!({"task_id":a["id"]}));
+    assert_eq!(kept["column"], "in_review");
+    assert_eq!(kept["commits"].as_array().unwrap().len(), 1);
+    assert_eq!(kept["commits"][0]["sha"], "beef");
+
+    // Called directly it refuses a task that is not done.
+    assert_eq!(code(call(e, Actor::User, "task.unapprove", json!({"task_id":c["id"],"column":"ready","position":0,"state":"none"}))), "task.column_transition");
+}

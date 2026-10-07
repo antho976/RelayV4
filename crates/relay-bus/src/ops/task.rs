@@ -118,6 +118,21 @@ payload!(#[schemars(rename = "TaskApproveIn")] ApproveIn { pub task_id: Id, pub 
 op!(Approve, "task.approve", ApproveIn => Task,
     OpMeta::mutation(Scope::Project, 7, "open task → done, linking the commit").actors(Actors::UserOnly).undo(Undo::Inverse).emits(&["task.changed"]));
 
+payload!(#[schemars(rename = "TaskUnapproveIn")] UnapproveIn {
+    pub task_id: Id,
+    /// The column the task goes back to; not `done`.
+    pub column: Column,
+    /// Its 0-based index in that column, as in `task.move`.
+    pub position: i64,
+    /// The run state it had before the approval.
+    pub state: TaskState,
+    /// The commit link the approval created, removed again. Absent when the approval linked a
+    /// commit that was already there, which then stays.
+    pub sha: Option<String>,
+});
+op!(Unapprove, "task.unapprove", UnapproveIn => Task,
+    OpMeta::mutation(Scope::Project, 7, "Undo task.approve: done task → its old column, slot and state, dropping the commit link the approval added").actors(Actors::UserOnly).undo(Undo::Inverse).emits(&["task.changed"]));
+
 payload!(#[schemars(rename = "TaskParentSetIn")] ParentSetIn {
     pub task_id: Id,
     /// Absent or null detaches the task back to a root.
@@ -173,5 +188,6 @@ entries!(
     Unrelate,
     Dispatch,
     Approve,
+    Unapprove,
     CopyText
 );

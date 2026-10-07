@@ -586,13 +586,15 @@ fn attach_staged(ctx: &mut Ctx, task: &Task, prepared: PreparedAttach) -> Result
         .bus()
 }
 
+/// Link `sha` (trimmed) to the task. Returns it when this call added the link, `None` when it
+/// was already there: `task.approve` undoes only a link it made itself.
 fn link_commit(
     tx: &Transaction,
     task_id: Id,
     sha: &str,
     branch: Option<&str>,
     now: &str,
-) -> Result<(), BusError> {
+) -> Result<Option<String>, BusError> {
     let sha = sha.trim();
     if sha.is_empty() {
         return Err(BusError::invalid(
@@ -600,12 +602,12 @@ fn link_commit(
             "commit sha cannot be empty",
         ));
     }
-    tx.execute(
+    let added = tx.execute(
         "INSERT OR IGNORE INTO task_commits(task_id,sha,branch,linked_at) VALUES (?1,?2,?3,?4)",
         params![task_id, sha, branch, now],
     )
     .bus()?;
-    Ok(())
+    Ok((added > 0).then(|| sha.to_string()))
 }
 
 fn assign_session(ctx: &mut Ctx, name: &str, task: &Task) -> Result<Vec<Id>, BusError> {
@@ -1404,7 +1406,7 @@ pub fn register(e: &mut Engine) {
                 }
             }
         };
-        link_commit(ctx.tx(), before.id, &sha, branch.as_deref(), &ctx.now)?;
+        let added = link_commit(ctx.tx(), before.id, &sha, branch.as_deref(), &ctx.now)?;
         let index = column_index(ctx.tx(), &before)?;
         ctx.tx()
             .execute(
@@ -1417,11 +1419,49 @@ pub fn register(e: &mut Engine) {
             )
             .bus()?;
         let task = get_task(ctx.tx(), before.id, false)?;
+        // Undone by its own inverse, not a plain move: that left the commit link behind
+        // (RA-416). `sha` is set only when this approval made the link.
         ctx.set_undo(
-            "task.move",
-            json!({"task_id":before.id,"column":column_str(before.column),"position":index}),
+            "task.unapprove",
+            json!({"task_id":before.id,"column":column_str(before.column),"position":index,"state":state_str(before.state),"sha":added}),
             Some(json!({"updated_at":task.updated_at})),
         );
+        emit_task(ctx, &task)?;
+        Ok(task)
+    });
+    e.register::<Unapprove>(|ctx: &mut Ctx, p| {
+        let before = get_task(ctx.tx(), p.task_id, false)?;
+        if before.column != Column::Done {
+            return Err(BusError::conflict("task.column_transition", "task is not done"));
+        }
+        if p.column == Column::Done {
+            return Err(BusError::invalid("task.column", "unapprove moves a task out of done"));
+        }
+        // The commit goes back to the approval that would link it again: the one removed, or
+        // the newest still linked when the approval found its link already there.
+        let mut sha = None;
+        if let Some(removed) = p.sha.as_deref().map(str::trim) {
+            let unlinked = ctx.tx().execute("DELETE FROM task_commits WHERE task_id=?1 AND sha=?2", params![before.id, removed]).bus()?;
+            if unlinked > 0 { sha = Some(removed.to_string()); }
+        }
+        if sha.is_none() {
+            sha = before.commits.last().map(|c| c.sha.clone());
+        }
+        let position = open_slot(ctx.tx(), before.project_id, p.column, before.id, p.position)?;
+        ctx.tx()
+            .execute(
+                "UPDATE tasks SET col=?1,position=?2,state=?3,updated_at=?4 WHERE id=?5",
+                params![column_str(p.column), position, state_str(p.state), ctx.now, before.id],
+            )
+            .bus()?;
+        let task = get_task(ctx.tx(), before.id, false)?;
+        if sha.is_some() {
+            ctx.set_undo(
+                "task.approve",
+                json!({"task_id":before.id,"sha":sha}),
+                Some(json!({"updated_at":task.updated_at})),
+            );
+        }
         emit_task(ctx, &task)?;
         Ok(task)
     });
