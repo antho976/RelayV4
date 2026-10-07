@@ -248,6 +248,14 @@ impl Editor {
         if ui.project.get() == 0 {
             return;
         }
+        // Another checkout's rows must not stay clickable while its status loads: their keys
+        // act on whatever checkout is selected when they are pressed (RA-452).
+        let scope = (ui.project.get(), self.worktree.borrow().clone());
+        if *self.git_scope.borrow() != scope {
+            clear(&self.git);
+            self.git_revision.set(self.git_revision.get() + 1);
+            *self.git_scope.borrow_mut() = scope;
+        }
         if self.git_refresh_pending.replace(true) {
             self.git_refresh_dirty.set(true);
             return;
@@ -314,7 +322,9 @@ impl Editor {
             let typing = e.commit_message.has_focus();
             let scrolls = scroll_positions(e.git.upcast_ref());
             clear(&e.git);
-            let branch_name = text(&status, "branch").to_string();
+            // git.status names a detached head "HEAD"; it has no branch to publish or open a PR for.
+            let branch_name = Some(text(&status, "branch")).filter(|b| *b != "HEAD").unwrap_or("").to_string();
+            let detached = branch_name.is_empty();
             let ahead = status["ahead"].as_i64();
             let behind = status["behind"].as_i64();
             let upstream = status["upstream"].as_str().map(str::to_owned);
@@ -671,8 +681,9 @@ impl Editor {
 
             // Remote: push and the pull request, one compact row each.
             let remote = section("remote", "REMOTE", None);
-            let can_push = upstream.is_none() || (ahead.is_some_and(|n| n > 0) && behind == Some(0));
+            let can_push = !detached && (upstream.is_none() || (ahead.is_some_and(|n| n > 0) && behind == Some(0)));
             let push_state = match (&upstream, ahead, behind) {
+                _ if detached => String::from("Check out a branch to push or open a pull request"),
                 (None, _, _) => String::from("This branch is not on a remote yet"),
                 (Some(up), Some(0), Some(0)) => format!("Up to date with {up}"),
                 (Some(up), Some(a), Some(b)) => format!(
@@ -683,11 +694,13 @@ impl Editor {
             let push_row = remote_row(
                 &remote.body,
                 "cloud",
-                upstream.as_deref().unwrap_or("Not published"),
+                upstream.as_deref().unwrap_or(if detached { "Detached HEAD" } else { "Not published" }),
                 &push_state,
             );
             let push = button(
-                &if can_push {
+                &if detached {
+                    String::from("No branch")
+                } else if can_push {
                     if let Some(ahead) = ahead.filter(|n| *n > 0) {
                         format!("Push {ahead}")
                     } else {
@@ -719,6 +732,7 @@ impl Editor {
             pr.set_valign(gtk::Align::Center);
             pr.set_sensitive(false);
             pr_row.0.append(&pr);
+            pr_row.0.set_visible(!detached);
             upper.append(&remote.root);
 
             // History sits in its own pane below, resizable and foldable.
@@ -1135,7 +1149,7 @@ impl Editor {
         open.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
                 // open_diff refuses a dirty buffer and shows an image instead; keep its message.
-                let text_diff = !ed.is_dirty() && !super::image_preview::is_image(&diff_path);
+                let text_diff = !ed.is_occupied() && !super::image_preview::is_image(&diff_path);
                 ed.open_diff(&ui, diff_path.clone());
                 if let Some(caveat) = caveat.as_deref().filter(|_| text_diff) {
                     ui.show_error(caveat);
@@ -1467,7 +1481,7 @@ impl Editor {
         if self.git_busy.get() {
             return;
         }
-        if self.is_dirty() {
+        if self.is_occupied() {
             ui.show_error("Save or discard your editor changes before changing Git state.");
             return;
         }
@@ -1496,10 +1510,15 @@ impl Editor {
             }.await;
             e.git_busy.set(false);
             e.git.set_sensitive(true);
-            if !e.matches(&ui, project, &worktree) || revision != e.revision.get() {
+            if !e.matches(&ui, project, &worktree) {
                 return;
             }
-            e.set_busy(false);
+            // A file opened meanwhile owns the document: leave it alone, but still report the
+            // outcome (RA-453).
+            let document = revision == e.revision.get();
+            if document {
+                e.set_busy(false);
+            }
             match result {
                 Ok(Some(v)) => {
                     if commit_snapshot
@@ -1525,7 +1544,9 @@ impl Editor {
                         ));
                     }
                     if matches!(op, "git.branch.create" | "git.branch.switch") {
-                        e.clear_document();
+                        if document {
+                            e.clear_document();
+                        }
                         e.load_tree(&ui, None);
                     }
                     e.refresh_git(&ui);
@@ -1608,7 +1629,7 @@ impl Editor {
         });
     }
     fn open_diff(self: &Rc<Self>, ui: &Rc<Ui>, path: String) {
-        if self.is_dirty() {
+        if self.is_occupied() {
             ui.show_error("Save or discard your edits before opening a diff.");
             return;
         }
@@ -1927,11 +1948,31 @@ fn hunk_header(line: &str) -> Option<(usize, usize, usize, usize)> {
     Some((old_start, old_length, new_start, new_length))
 }
 
+/// Lines as the engine's diff (similar's `from_lines`) and GtkTextBuffer count them: ended by
+/// LF, CRLF or a lone CR, which `str::lines` would leave inside a line (RA-454).
+fn diff_lines(text: &str) -> Vec<&str> {
+    let (bytes, mut lines, mut start, mut at) = (text.as_bytes(), Vec::new(), 0, 0);
+    while at < bytes.len() {
+        if matches!(bytes[at], b'\n' | b'\r') {
+            lines.push(&text[start..at]);
+            if bytes[at] == b'\r' && bytes.get(at + 1) == Some(&b'\n') {
+                at += 1;
+            }
+            start = at + 1;
+        }
+        at += 1;
+    }
+    if start < text.len() {
+        lines.push(&text[start..]);
+    }
+    lines
+}
+
 /// Zero-based lines removed from the old text and added to the new one.
 fn diff_marks(unified: &str) -> (Vec<usize>, Vec<usize>) {
     let (mut removed, mut added) = (Vec::new(), Vec::new());
     let (mut old, mut new, mut inside) = (0, 0, false);
-    for line in unified.lines() {
+    for line in diff_lines(unified) {
         if let Some((old_start, _, new_start, _)) = hunk_header(line) {
             (old, new, inside) = (old_start, new_start, true);
             continue;
@@ -1967,10 +2008,10 @@ enum Mark {
 
 /// The whole new file with each hunk's removed lines shown above their replacements.
 fn inline_diff<'a>(unified: &'a str, new: &'a str) -> Vec<(Mark, &'a str)> {
-    let lines: Vec<&str> = new.lines().collect();
+    let lines = diff_lines(new);
     let mut out = Vec::new();
     let (mut cursor, mut inside) = (0, false);
-    for line in unified.lines() {
+    for line in diff_lines(unified) {
         if let Some((_, _, new_start, _)) = hunk_header(line) {
             let start = new_start.min(lines.len());
             if start > cursor {
@@ -2013,7 +2054,7 @@ async fn confirm(ui: &Ui, title: &str, copy: &str) -> bool {
     dialog.response("Continue").await
 }
 
-async fn guarded(ui: &Ui, op: &str, payload: Value) -> Result<Option<Value>, Error> {
+pub(super) async fn guarded(ui: &Ui, op: &str, payload: Value) -> Result<Option<Value>, Error> {
     match ui.call(op, payload.clone()).await {
         Ok(v) => Ok(Some(v)),
         Err(Error::Bus(err)) if err.kind == relay_bus::ErrorKind::Held => {
@@ -2032,11 +2073,14 @@ async fn guarded(ui: &Ui, op: &str, payload: Value) -> Result<Option<Value>, Err
                         .into(),
                 ));
             }
-            let copy = format!(
-                "{}\n\n{}",
-                err.message,
-                serde_json::to_string_pretty(&inspection["request"]).unwrap_or_default()
-            );
+            // A held save carries the whole file; the dialog shows its head, not all of it.
+            let mut request = serde_json::to_string_pretty(&inspection["request"]).unwrap_or_default();
+            if request.len() > 2000 {
+                let end = (0..=2000).rev().find(|&i| request.is_char_boundary(i)).unwrap_or(0);
+                request.truncate(end);
+                request.push('…');
+            }
+            let copy = format!("{}\n\n{}", err.message, request);
             if !confirm(ui, "Allow this held action once?", &copy).await {
                 return Ok(None);
             }
@@ -2293,6 +2337,13 @@ mod graph_tests {
         assert_eq!(
             inline_diff("@@ -0,0 +1,2 @@\n+x\n+y\n\\ No newline at end of file\n", "x\ny"),
             vec![(Mark::Added, "x"), (Mark::Added, "y")]
+        );
+        // A lone CR ends a line for the engine's diff and the buffer alike (RA-454).
+        assert_eq!(diff_lines("a\r\nb\rc\n\nd"), vec!["a", "b", "c", "", "d"]);
+        assert_eq!(diff_marks("@@ -1,3 +1,2 @@\n a\r-b\r c\n"), (vec![1], vec![]));
+        assert_eq!(
+            inline_diff("@@ -1,2 +1,2 @@\n a\r-b\r+B\r", "a\rB\r"),
+            vec![(Mark::Same, "a"), (Mark::Removed, "b"), (Mark::Added, "B")]
         );
     }
     #[test]
