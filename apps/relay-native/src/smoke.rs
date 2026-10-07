@@ -365,13 +365,9 @@ async fn edit_fixture(ui: Rc<Ui>, page: String) -> Result<(), String> {
         ui.show_launch(task["id"].as_i64());
         // The form enables Start only once it has loaded; a person cannot submit it sooner.
         wait_for(|| clickable(&ui.window, "launch-start"), "Launch form loaded").await?;
-        for name in ["launch-mode", "launch-builders"] {
-            named(&ui.window, name)
-                .ok_or_else(|| format!("{name} missing"))?
-                .downcast::<gtk::DropDown>()
-                .map_err(|_| format!("{name} type"))?
-                .set_selected(1);
-        }
+        // A review group with two builders, chosen with the keys a person would press.
+        util::choose(&ui.window, "launch-mode", 1)?;
+        util::choose(&ui.window, "launch-builders", 1)?;
         return click(&ui.window, "launch-start");
     }
     let field = if page == "board" { "task-title" } else { "note-body" };

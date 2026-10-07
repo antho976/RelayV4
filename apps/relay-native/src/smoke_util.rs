@@ -90,6 +90,38 @@ pub(crate) fn press(key: &gtk::Button, name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The grouped toggle keys of a choice row (launch.rs `Choice`), in order.
+fn choice_keys(root: &impl IsA<gtk::Widget>, row: &str) -> Result<Vec<gtk::ToggleButton>, String> {
+    let row = named(root, row).ok_or_else(|| format!("Missing choice row: {row}"))?;
+    let mut keys = Vec::new();
+    let mut child = row.first_child();
+    while let Some(widget) = child {
+        child = widget.next_sibling();
+        if let Ok(key) = widget.downcast::<gtk::ToggleButton>() {
+            keys.push(key);
+        }
+    }
+    Ok(keys)
+}
+
+/// Presses key `index` of the choice row `row`, refusing one a person could not press.
+pub(crate) fn choose(root: &impl IsA<gtk::Widget>, row: &str, index: usize) -> Result<(), String> {
+    let keys = choice_keys(root, row)?;
+    let key = keys.get(index).ok_or_else(|| format!("{row} has no key {index}"))?;
+    press(key.upcast_ref(), &format!("{row} key {index}"))?;
+    require(key.is_active(), &format!("{row} key {index} did not take the choice"))
+}
+
+/// Which key of the choice row `row` is chosen.
+pub(crate) fn chosen(root: &impl IsA<gtk::Widget>, row: &str) -> Result<usize, String> {
+    let keys = choice_keys(root, row)?;
+    let mut active = keys.iter().enumerate().filter(|(_, key)| key.is_active()).map(|(i, _)| i);
+    match (active.next(), active.next()) {
+        (Some(index), None) => Ok(index),
+        _ => Err(format!("{row} must have exactly one key chosen")),
+    }
+}
+
 /// What the production `DragSource` on `row` hands a drop target: its `prepare` handler
 /// runs, so a change to the payload format reaches the drop under test (RA-722).
 pub(crate) fn drag_payload(row: &gtk::Widget) -> Result<glib::Value, String> {
