@@ -2,6 +2,8 @@
 export type Skill = {
     id: number
     name: string
+    /** Read by the engine from the SKILL.md front matter, else the first prose line. */
+    description: string
     body: string
     source_url: string | null
     source_path: string | null
@@ -71,15 +73,4 @@ export type DeviceRun = {
     signing: string | null
     started_at: string
     finished_at: string | null
-}
-
-/** The first line of a skill's description in its front matter, or of its body. */
-export const skillSummary = (body: string) => {
-    const described = body.match(/^description:\s*(.+)$/m)
-    if (described) return described[1].trim().replace(/^["']|["']$/g, '')
-    const line = body
-        .split('\n')
-        .map((item) => item.trim())
-        .find((item) => item && item !== '---' && !item.includes(':') && !item.startsWith('#'))
-    return line ?? ''
 }
