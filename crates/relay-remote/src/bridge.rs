@@ -40,9 +40,12 @@ impl Ctx {
 const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long a phone presenting a code that needs the PC's approval waits for it. The phone
-/// gives up on its welcome after 20 s (RelayClient.ts `HANDSHAKE_TIMEOUT_MS`), so this stays
-/// under that; a person who is slower runs `relay remote pair` again.
-const PAIR_CONFIRM_WAIT: Duration = Duration::from_secs(18);
+/// waits 90 s for the welcome to a pairing (RelayClient.ts `PAIR_WELCOME_TIMEOUT_MS`), so this
+/// stays under that and the phone hears `pair.unconfirmed` rather than its own timeout; a person
+/// who is slower runs `relay remote pair` again. Both doors ping during the wait, so neither
+/// drops the quiet phone first. A phone that leaves sooner (an older app gives up after 20 s)
+/// withdraws its request: see `Withdraw`.
+const PAIR_CONFIRM_WAIT: Duration = Duration::from_secs(75);
 const PAIR_POLL: Duration = Duration::from_millis(200);
 
 /// How often an admitted connection checks that its device is still paired. A revoke from
@@ -106,17 +109,20 @@ pub async fn admit(ctx: &Ctx, challenge: &str, hello: &Hello, origin: &str) -> s
             Presented::Waiting => {
                 tracing::warn!(device_name = %name, origin = %origin, instance = %ctx.instance,
                     "a phone presented the pairing code; waiting for `relay remote pair` to approve it");
+                let mut withdraw = Withdraw { path, code: Some(code) };
                 let deadline = tokio::time::Instant::now() + PAIR_CONFIRM_WAIT;
                 loop {
                     match Registry::update(path, |r| Ok::<_, BridgeEnd>(r.outcome(code)))? {
-                        Outcome::Approved(device) => break device,
-                        Outcome::Declined => return Err(BridgeEnd::Denied("pair.declined")),
+                        Outcome::Approved(device) => {
+                            withdraw.code = None;
+                            break device;
+                        }
+                        Outcome::Declined => {
+                            withdraw.code = None;
+                            return Err(BridgeEnd::Denied("pair.declined"));
+                        }
+                        // Unanswered is not yes: `withdraw` spends the code, and the person pairs again.
                         Outcome::Waiting if tokio::time::Instant::now() >= deadline => {
-                            // Unanswered is not yes: the code is spent, and the person pairs again.
-                            Registry::update(path, |r| {
-                                r.abandon(code);
-                                Ok::<_, BridgeEnd>(())
-                            })?;
                             return Err(BridgeEnd::Denied("pair.unconfirmed"));
                         }
                         Outcome::Waiting => tokio::time::sleep(PAIR_POLL).await,
@@ -124,9 +130,11 @@ pub async fn admit(ctx: &Ctx, challenge: &str, hello: &Hello, origin: &str) -> s
                 }
             }
         };
-        // Every pairing is announced where the PC's owner looks: the engine log, at warn.
+        // Every pairing is announced where the PC's owner looks: the engine log, at warn, and
+        // the desktop app, if one is open.
         tracing::warn!(device = %device.id, device_name = %device.name, origin = %origin, instance = %ctx.instance,
             "a new phone paired with this PC; `relay remote devices` lists it, `relay remote revoke {}` removes it", device.id);
+        tokio::spawn(announce_pairing(ctx.socket_path.clone(), device.name.clone(), device.id.clone(), origin.to_string()));
         return Ok(Admitted {
             device_id: device.id.clone(),
             welcome: Welcome::paired(&device.id, &device.token),
@@ -145,6 +153,64 @@ pub async fn admit(ctx: &Ctx, challenge: &str, hello: &Hello, origin: &str) -> s
         registry.touch(id);
         Ok(Admitted { device_id: id.to_string(), welcome: Welcome::admitted(id), token })
     })
+}
+
+/// How long announcing a pairing to the desktop may take before it is given up.
+const ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Tell whoever is at the desktop that a phone just paired: `ui.toast`, which the native client
+/// shows in every window it has open. Best effort — with no desktop open, or no engine, the warn
+/// line in the log is the record. A lasting entry in the notification centre needs an op that
+/// can write one (none exists for a client today; see docs/MOBILE.md §6).
+async fn announce_pairing(socket_path: PathBuf, name: String, id: String, origin: String) {
+    use relay_bus::envelope::{Actor, Request};
+    let text = format!("A phone paired with this PC: \"{name}\" ({origin}). Not yours? Run `relay remote revoke {id}`.");
+    let request = Request::new(Actor::User, "ui.toast", serde_json::json!({"text": text, "level": "warn", "ttl_ms": 20_000}));
+    let attempt = async {
+        let stream = UnixStream::connect(&socket_path).await?;
+        relay_core::socket::same_user(&stream)?;
+        let (reader, mut writer) = stream.into_split();
+        writer.write_all(serde_json::to_string(&request)?.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        // Wait for the answer, so closing the socket cannot cut the request off.
+        let id = request.id.to_string();
+        let mut lines = BufReader::new(reader).lines();
+        while let Some(line) = lines.next_line().await? {
+            if line.contains(&id) {
+                break;
+            }
+        }
+        anyhow::Ok(())
+    };
+    match tokio::time::timeout(ANNOUNCE_TIMEOUT, attempt).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::debug!(error = %format!("{e:#}"), "pairing not announced to the desktop"),
+        Err(_) => tracing::debug!("pairing not announced to the desktop: the engine did not answer"),
+    }
+}
+
+/// Closes the window of a pairing that stopped waiting for its answer — timed out, or dropped
+/// because the phone left — so a late "yes" at the PC mints no credential nobody holds.
+struct Withdraw<'a> {
+    path: &'a std::path::Path,
+    code: Option<&'a str>,
+}
+
+impl Drop for Withdraw<'_> {
+    fn drop(&mut self) {
+        if let Some(code) = self.code {
+            let _ = Registry::update(self.path, |r| {
+                r.abandon(code);
+                Ok::<_, anyhow::Error>(())
+            });
+        }
+    }
+}
+
+/// Resolves once the phone has gone: its inbound channel closed. Before the welcome a phone
+/// has nothing to say, so whatever it sends while it waits is dropped.
+async fn gone(inbound: &mut mpsc::Receiver<String>) {
+    while inbound.recv().await.is_some() {}
 }
 
 /// What `still_admitted` compares to notice that `remote.json` changed without reading it.
@@ -203,7 +269,12 @@ pub async fn run(
             return Err(BridgeEnd::BadHello(e.to_string()));
         }
     };
-    let admitted = match admit(&ctx, &challenge, &hello, &origin).await {
+    // A pairing can wait on a person at the PC; a phone that leaves meanwhile ends it.
+    let admission = tokio::select! {
+        admission = admit(&ctx, &challenge, &hello, &origin) => admission,
+        _ = gone(&mut inbound) => return Err(BridgeEnd::ClosedEarly),
+    };
+    let admitted = match admission {
         Ok(a) => a,
         Err(end) => {
             let code = match &end {
@@ -383,5 +454,22 @@ mod tests {
         let reg = Registry::load(&ctx.registry_path).unwrap();
         assert_eq!(reg.devices.len(), 1);
         assert!(reg.pending.is_empty());
+
+        // A phone that leaves while it waits withdraws its request: a late "yes" mints nothing.
+        let code = Registry::update(&ctx.registry_path, |r| Ok::<_, anyhow::Error>(r.begin_pair(true).code)).unwrap();
+        let hello = Hello { v: 1, pair: Some(code.clone()), device_name: Some("Impatient".into()), ..Default::default() };
+        let waiting = {
+            let ctx = ctx.clone();
+            tokio::spawn(async move { admit(&ctx, "c", &hello, "direct 192.0.2.8").await })
+        };
+        while Registry::load(&ctx.registry_path).unwrap().pending.first().and_then(|p| p.request.as_ref()).is_none() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        waiting.abort();
+        assert!(waiting.await.is_err_and(|e| e.is_cancelled()));
+        assert!(!Registry::update(&ctx.registry_path, |r| Ok::<_, anyhow::Error>(r.decide(&code, true))).unwrap());
+        let reg = Registry::load(&ctx.registry_path).unwrap();
+        assert!(reg.pending.is_empty());
+        assert_eq!(reg.devices.len(), 1);
     }
 }

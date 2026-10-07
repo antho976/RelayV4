@@ -26,7 +26,10 @@ phone door (`relay serve --remote`), so there is nothing else to keep running. T
 ```
 
 Leave it running: when the phone presents the code, it asks `Pair "<phone>" (…) with this PC?
-[y/N]`, and only a yes pairs it. The phone waits about twenty seconds for that answer.
+[y/N]`, and only a yes pairs it. The phone waits up to 90 seconds for that answer; the PC gives
+up after 75, and the phone then says nobody approved it (`pair.unconfirmed`). A no tells the
+phone the PC declined (`pair.declined`). Either way the code is spent: run `relay remote pair`
+again. A phone that gives up sooner withdraws its request, so a late yes pairs nothing.
 
 On the phone: install the app (the `relay-mobile-apk` artifact of the **Mobile APK** workflow,
 run from the Actions tab, or `npm run android` in `apps/relay-mobile` with the Android SDK),
@@ -58,8 +61,10 @@ A pairing window lasts ten minutes and admits one phone; to pair another later,
 `relay remote pair` in a second terminal. Opening a window replaces any older code still open,
 and a code answers one phone at a time. Each pairing is confirmed at the terminal that opened
 the window (`--no-confirm` on `pair` or `serve --pair` lets the first phone with the code pair
-without asking; without a terminal, `pair` refuses unless it is given) and logged at warn in
-the engine log, naming the phone.
+without asking; without a terminal, `pair` refuses unless it is given). Every new pairing is
+logged at warn in the engine log, naming the phone, and shown as a toast in the desktop app if
+it is open (`ui.toast`). Nothing lasting lands in the notification centre yet: no bus op lets a
+client create a notification, so that needs one in the engine.
 
 Every connection has ten seconds to finish its WebSocket upgrade and thirty more to say hello.
 The door holds at most 64 connections, of which at most 16 may be unproven and at most 4 from
@@ -163,8 +168,9 @@ address, pairing another, and the two things the link may do to the phone (notif
 the screen on in a terminal).
 
 **Pairing.** Scan the QR that `relay remote pair` prints. Without a camera, paste the
-`relay://pair?…` link, or type the address the PC printed and the eight-character code. The
-code is spent on use.
+`relay://pair?…` link, or type the address the PC printed and the eight-character code, then
+approve the phone in the terminal on the PC when it asks. The code is spent on use, whether
+the PC said yes or no.
 
 **Routes.** Each PC card shows where it can be reached and lets you pin a route: **Auto** tries
 the direct addresses (WiFi and Tailscale) first and the server second; **Direct only** never
@@ -222,7 +228,10 @@ The phone's own chats and on-device models never touch this link.
 - A phone is the user at the keyboard. The door refuses any envelope whose actor is not
   `user` (or `test` on a dev/test instance) before the engine sees it, so a phone cannot
   borrow an agent's identity even with a guessed token.
-- Pairing codes live ten minutes and are single use. A device token is 256 bits, stored on
+- Pairing codes live ten minutes and are single use, a new code replaces any older one, and the
+  PC approves each phone that presents one before it gets a token (unless `--no-confirm`), so
+  a code seen by someone else — a screen share, scrollback — pairs nothing on its own. Every
+  pairing is logged and toasted on the desktop. A device token is 256 bits, stored on
   the PC in `remote.json` and on the phone in its private storage.
 - After pairing, the token is never sent again: each connection gets a random challenge and
   the phone answers with `sha256(challenge:token)`. Listening on the LAN yields proofs that

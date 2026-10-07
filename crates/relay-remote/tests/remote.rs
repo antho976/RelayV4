@@ -655,3 +655,27 @@ async fn silent_hosts_and_phones_are_dropped_and_live_ones_kept() {
     assert_eq!(close["c"], open["c"]);
     reader.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_pairing_is_announced_to_the_desktop() {
+    let h = harness().await;
+    let door = DirectServer::bind(h.ctx.clone(), "127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .await
+        .unwrap();
+    let url = format!("ws://{}", door.local_addr);
+    let (device, token, _) = pair(&url, &pair_code(&h.ctx)).await;
+    // A client listening as the desktop does.
+    let mut desktop = admit(&url, &device, &token).await;
+    let sub = call(&mut desktop, "bus.subscribe", json!({"events":["ui.toast"]})).await;
+    assert_eq!(sub["ok"], true, "{sub}");
+
+    let (second, _, _) = pair(&url, &pair_code(&h.ctx)).await;
+    loop {
+        let line = recv_json(&mut desktop).await;
+        if line["ev"] == "ui.toast" {
+            let text = line["payload"]["text"].as_str().unwrap();
+            assert!(text.contains("Test Phone") && text.contains(&second) && text.contains("direct 127.0.0.1"), "{text}");
+            break;
+        }
+    }
+}
