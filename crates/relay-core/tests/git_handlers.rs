@@ -81,7 +81,7 @@ fn log_lists_every_commit_before_its_parents() {
     }
 }
 
-/// RA-151: `git.branches` decides "merged" with the same single walk as clean_merged.
+/// RA-151: `git.branches` decides "merged" with the same single walk as branch.delete.
 #[test]
 fn branches_mark_merged_and_unmerged_tips() {
     let e = engine();

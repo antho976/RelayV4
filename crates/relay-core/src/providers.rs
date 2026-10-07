@@ -196,15 +196,15 @@ fn codex_mcp_config_with(
 }
 
 pub trait Driver: Sync {
-    fn provider(&self) -> Provider;
     fn binary(&self) -> &'static str;
     /// `brief` is the compact session brief. Providers that read a prompt file ignore it;
     /// providers with no such channel inline it.
     fn args(&self, session: &Session, launch: Launch<'_>, brief: Option<&str>) -> Vec<String>;
-    fn profile(&self) -> Value;
     /// Whether Relay's `PreToolUse` guardrail and lifecycle reports actually bind here.
     fn guarded(&self) -> bool;
-    fn auth(&self, path: &Path) -> Option<String>;
+    /// Who the CLI is signed in as: `Some(None)` when it answered and nobody is, `None` when
+    /// it gave no answer at all (it timed out or would not start), which says nothing.
+    fn auth(&self, path: &Path) -> Option<Option<String>>;
 }
 
 struct Claude;
@@ -218,6 +218,33 @@ pub fn driver(provider: Provider) -> &'static dyn Driver {
         Provider::Claude => &CLAUDE,
         Provider::Codex => &CODEX,
     }
+}
+
+/// `provider.list`'s `spawn_profile`: the command lines [`Driver::args`] builds, for a
+/// placeholder session that sets every option, so it cannot drift from what is run (RA-617).
+/// An argument too long to read (inline settings, role instructions) is shown by its name.
+fn spawn_profile(drv: &dyn Driver) -> Value {
+    let session = Session {
+        id: 0, name: "<session>".into(), intent: None, project_id: 0, provider: Provider::Claude, role: Role::Builder,
+        model: Some("<model>".into()), effort: Some("<effort>".into()), branch: String::new(), worktree: String::new(),
+        task_id: None, module_id: None, pair_with: None, bus_writes: false, allow_ui: false, state: relay_bus::types::SessionState::Created,
+        pid: None, exit_code: None, provider_ref: None, spawned_at: None, last_output_at: None, usage: None,
+        created_at: String::new(), updated_at: String::new(), closed_at: None,
+    };
+    let shape = |launch| -> Vec<String> {
+        drv.args(&session, launch, None).into_iter().map(|arg| {
+            if arg.len() <= 120 { return arg; }
+            match arg.split_once('=') {
+                Some((key, _)) if key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.') => format!("{key}=<{key}>"),
+                _ => "<inline JSON>".into(),
+            }
+        }).collect()
+    };
+    json!({
+        "binary": drv.binary(), "fresh": shape(Launch::Fresh),
+        "resume": shape(Launch::Resume { provider_ref: Some("<provider_ref>") }),
+        "fallback_resume": shape(Launch::Resume { provider_ref: None }), "guarded": drv.guarded(),
+    })
 }
 
 fn model_effort_args(session: &Session, claude: bool) -> Vec<String> {
@@ -236,7 +263,6 @@ fn model_effort_args(session: &Session, claude: bool) -> Vec<String> {
 }
 
 impl Driver for Claude {
-    fn provider(&self) -> Provider { Provider::Claude }
     fn binary(&self) -> &'static str { "claude" }
     fn guarded(&self) -> bool { true }
     fn args(&self, session: &Session, launch: Launch<'_>, _brief: Option<&str>) -> Vec<String> {
@@ -260,24 +286,16 @@ impl Driver for Claude {
         }
         args
     }
-    fn profile(&self) -> Value {
-        json!({
-            "binary": "claude", "fresh": ["--mcp-config", ".relay/relay.mcp.json", "--settings", "<inline statusLine settings JSON>", "--append-system-prompt-file", ".relay/sessions/<session>/role-instructions.md", "--name", "<session>", "[--model]", "[--effort]"],
-            "resume": ["--mcp-config", ".relay/relay.mcp.json", "--settings", "<inline statusLine settings JSON>", "--append-system-prompt-file", ".relay/sessions/<session>/role-instructions.md", "--resume", "<provider_ref>"], "fallback_resume": ["--mcp-config", ".relay/relay.mcp.json", "--settings", "<inline statusLine settings JSON>", "--append-system-prompt-file", ".relay/sessions/<session>/role-instructions.md", "--continue"],
-            "auth": ["auth", "status"], "lifecycle_hooks": true, "guarded": true,
-        })
-    }
-    fn auth(&self, path: &Path) -> Option<String> {
+    fn auth(&self, path: &Path) -> Option<Option<String>> {
         let output = command_output(path, &["auth", "status"])?;
-        if !output.success { return None; }
-        let value: Value = serde_json::from_str(&output.stdout).ok()?;
-        if value["loggedIn"].as_bool() != Some(true) { return None; }
-        value["email"].as_str().or_else(|| value["orgName"].as_str()).map(str::to_string)
+        if !output.success { return Some(None); }
+        let Ok(value) = serde_json::from_str::<Value>(&output.stdout) else { return Some(None) };
+        if value["loggedIn"].as_bool() != Some(true) { return Some(None); }
+        Some(value["email"].as_str().or_else(|| value["orgName"].as_str()).map(str::to_string))
     }
 }
 
 impl Driver for Codex {
-    fn provider(&self) -> Provider { Provider::Codex }
     fn binary(&self) -> &'static str { "codex" }
     fn guarded(&self) -> bool { true }
     fn args(&self, session: &Session, launch: Launch<'_>, brief: Option<&str>) -> Vec<String> {
@@ -303,19 +321,11 @@ impl Driver for Codex {
         }
         args
     }
-    fn profile(&self) -> Value {
-        json!({
-            "binary": "codex", "fresh": ["--no-alt-screen", "--approve-for-me", "[--model]", "[--config model_reasoning_effort]", "--config", "<role developer_instructions>"],
-            "resume": ["resume", "--no-alt-screen", "--approve-for-me", "--config", "<role developer_instructions>", "<provider_ref>"],
-            "fallback_resume": ["resume", "--no-alt-screen", "--approve-for-me", "--config", "<role developer_instructions>", "--last"], "auth": ["login", "status"],
-            "lifecycle_hooks": true, "guarded": true,
-        })
-    }
-    fn auth(&self, path: &Path) -> Option<String> {
+    fn auth(&self, path: &Path) -> Option<Option<String>> {
         let output = command_output(path, &["login", "status"])?;
-        if !output.success { return None; }
-        let line = output.stdout.lines().find(|line| !line.trim().is_empty())?.trim();
-        line.strip_prefix("Logged in using ").unwrap_or(line).trim().to_string().into()
+        if !output.success { return Some(None); }
+        let line = output.stdout.lines().find(|line| !line.trim().is_empty()).map(str::trim);
+        Some(line.map(|line| line.strip_prefix("Logged in using ").unwrap_or(line).trim().to_string()))
     }
 }
 
@@ -359,11 +369,10 @@ pub fn executable(conn: &Connection, provider: Provider) -> Result<PathBuf, BusE
     })
 }
 
-type CacheRow = (Option<String>, Option<String>, Option<String>, Option<String>, Value);
+type CacheRow = (Option<String>, Option<String>, Option<String>, Option<String>);
 
 fn cache_row(row: &Row) -> rusqlite::Result<CacheRow> {
-    let profile: String = row.get("spawn_profile")?;
-    Ok((row.get("path")?, row.get("version")?, row.get("signed_in_as")?, row.get("last_seen_version")?, serde_json::from_str(&profile).unwrap_or(Value::Null)))
+    Ok((row.get("path")?, row.get("version")?, row.get("signed_in_as")?, row.get("last_seen_version")?))
 }
 
 pub fn list(conn: &Connection) -> Result<Vec<ProviderInfo>, BusError> {
@@ -371,9 +380,10 @@ pub fn list(conn: &Connection) -> Result<Vec<ProviderInfo>, BusError> {
         let drv = driver(provider);
         let resolved = executable(conn, provider).ok();
         let cached = conn.query_row("SELECT * FROM provider_cache WHERE provider=?1", [drv.binary()], cache_row).optional().bus()?;
-        let (path, version, signed_in_as, last_seen_version, profile) = cached.unwrap_or((None, None, None, None, drv.profile()));
+        let (path, version, signed_in_as, last_seen_version) = cached.unwrap_or_default();
         let path = resolved.as_ref().map(|p| p.display().to_string()).or(path);
-        Ok(ProviderInfo { provider, installed: resolved.is_some(), path, version, signed_in_as, last_seen_version, spawn_profile: profile, guarded: drv.guarded() })
+        // Derived, not the cached copy: what this build runs, not what the last refresh's did.
+        Ok(ProviderInfo { provider, installed: resolved.is_some(), path, version, signed_in_as, last_seen_version, spawn_profile: spawn_profile(drv), guarded: drv.guarded() })
     }).collect()
 }
 
@@ -387,12 +397,14 @@ pub fn paths(conn: &Connection) -> Vec<(Provider, Option<PathBuf>)> {
     [Provider::Claude, Provider::Codex].into_iter().map(|provider| (provider, executable(conn, provider).ok())).collect()
 }
 
-/// What one provider's binary said about itself, gathered with no lock held.
+/// What one provider's binary said about itself, gathered with no lock held. With a `path`,
+/// a `None` version or sign-in is no answer (the probe timed out or failed), not an absence:
+/// [`record`] keeps what it knew rather than report the provider gone (RA-328).
 pub struct Probe {
     provider: Provider,
     path: Option<PathBuf>,
     version: Option<String>,
-    signed_in_as: Option<String>,
+    signed_in_as: Option<Option<String>>,
 }
 
 /// Run every provider's `--version` and auth probe, in parallel. These are subprocesses, so
@@ -405,7 +417,7 @@ pub fn probe(paths: Vec<(Provider, Option<PathBuf>)>) -> Vec<Probe> {
             let (version, signed_in_as) = thread::scope(|scope| {
                 let version = scope.spawn(|| path.as_deref().and_then(|path| command_output(path, &["--version"]))
                     .filter(|output| output.success).map(|output| first_line(&output.stdout)));
-                let auth = scope.spawn(|| path.as_deref().and_then(|path| drv.auth(path)));
+                let auth = scope.spawn(|| match path.as_deref() { Some(path) => drv.auth(path), None => Some(None) });
                 (version.join().expect("provider version probe panicked"), auth.join().expect("provider auth probe panicked"))
             });
             Probe { provider, path, version, signed_in_as }
@@ -418,14 +430,23 @@ pub fn record(tx: &Transaction, now: &str, probes: Vec<Probe>) -> Result<Vec<Dis
     let mut out = Vec::new();
     for Probe { provider, path, version, signed_in_as } in probes {
         let drv = driver(provider);
-        let old: Option<(Option<String>, Option<String>)> = tx.query_row(
-            "SELECT version, last_seen_version FROM provider_cache WHERE provider=?1",
-            [drv.binary()], |row| Ok((row.get(0)?, row.get(1)?)),
+        let old: Option<CacheRow> = tx.query_row(
+            "SELECT * FROM provider_cache WHERE provider=?1", [drv.binary()], cache_row,
         ).optional().bus()?;
-        let previous_version = old.as_ref().and_then(|old| old.0.clone());
+        let (old_path, previous_version, old_signed_in, old_last_seen) = old.unwrap_or_default();
+        // A binary that did not answer is still the binary it was: a slow cold start must not
+        // read as "not installed", nor sign the account out (RA-328). Only a vanished
+        // executable, or a different one, clears what was known.
+        let same_binary = path.is_some() && old_path == path.as_ref().map(|p| p.display().to_string());
+        let version = if version.is_none() && same_binary { previous_version.clone() } else { version };
+        let signed_in_as = match signed_in_as {
+            Some(answer) => answer,
+            None if same_binary => old_signed_in,
+            None => None,
+        };
         let version_changed = previous_version.is_some() && previous_version != version;
-        let last_seen_version = if version_changed { previous_version.clone() } else { old.and_then(|old| old.1) };
-        let profile = drv.profile();
+        let last_seen_version = if version_changed { previous_version.clone() } else { old_last_seen };
+        let profile = spawn_profile(drv);
         tx.execute(
             "INSERT INTO provider_cache(provider,path,version,signed_in_as,last_seen_version,spawn_profile,detected_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7)
@@ -452,11 +473,9 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 fn command_output(path: &Path, args: &[&str]) -> Option<Output> {
     let mut command = Command::new(path);
     command.args(args);
-    // A killed probe reports "not installed" rather than failing detection outright, which is the
-    // same answer the old busy-wait produced on timeout.
-    let Some(output) = crate::proc::output_with_timeout(&mut command, PROBE_TIMEOUT).ok()? else {
-        return Some(Output { success: false, stdout: String::new() });
-    };
+    // `None` for a probe that would not start or was killed at the deadline: no answer, which
+    // the caller must not read as "not installed" or "signed out".
+    let output = crate::proc::output_with_timeout(&mut command, PROBE_TIMEOUT).ok()??;
     let stdout = if output.stdout.is_empty() {
         String::from_utf8_lossy(&output.stderr).to_string()
     } else {
@@ -509,6 +528,42 @@ mod tests {
         assert_eq!(args[7], "--config");
         assert!(args[8].starts_with("developer_instructions=\"You are this Relay session's reviewer."));
         assert_eq!(args[9], "cx-id");
+    }
+
+    #[test]
+    fn the_spawn_profile_is_the_command_line_args_builds() {
+        let claude = spawn_profile(driver(Provider::Claude));
+        let resume: Vec<&str> = claude["resume"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(resume[..4], ["--mcp-config", ".relay/relay.mcp.json", "--settings", "<inline JSON>"]);
+        assert!(resume.ends_with(&["--resume", "<provider_ref>", "--model", "<model>", "--effort", "<effort>"]), "{resume:?}");
+        let codex = spawn_profile(driver(Provider::Codex));
+        let fallback: Vec<&str> = codex["fallback_resume"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(fallback.contains(&"model_reasoning_effort=\"<effort>\"") && fallback.ends_with(&["--last"]), "{fallback:?}");
+        assert!(fallback.contains(&"developer_instructions=<developer_instructions>"), "{fallback:?}");
+    }
+
+    #[test]
+    fn a_probe_that_gives_no_answer_keeps_what_was_known() {
+        let store = crate::Store::open_memory().unwrap();
+        let mut conn = store.lock();
+        let tx = conn.transaction().unwrap();
+        let path = Some(PathBuf::from("/opt/claude"));
+        let probe = |path: Option<PathBuf>, version: Option<&str>, signed_in_as: Option<Option<&str>>| Probe {
+            provider: Provider::Claude, path, version: version.map(str::to_string),
+            signed_in_as: signed_in_as.map(|answer| answer.map(str::to_string)),
+        };
+        record(&tx, "t0", vec![probe(path.clone(), Some("claude 1.0"), Some(Some("me@example.test")))]).unwrap();
+        // Timed out: the version and the account stand, and nothing changed.
+        let slow = record(&tx, "t1", vec![probe(path.clone(), None, None)]).unwrap().remove(0);
+        assert!(!slow.version_changed);
+        assert_eq!(slow.info.version.as_deref(), Some("claude 1.0"));
+        assert_eq!(slow.info.signed_in_as.as_deref(), Some("me@example.test"));
+        // An answer that nobody is signed in is believed.
+        let out = record(&tx, "t2", vec![probe(path.clone(), Some("claude 1.0"), Some(None))]).unwrap().remove(0);
+        assert_eq!(out.info.signed_in_as, None);
+        // The executable vanished: that is a change.
+        let gone = record(&tx, "t3", vec![probe(None, None, Some(None))]).unwrap().remove(0);
+        assert!(gone.version_changed && gone.info.version.is_none());
     }
 
     #[test]

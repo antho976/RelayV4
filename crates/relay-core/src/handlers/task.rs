@@ -622,33 +622,10 @@ fn assign_session(ctx: &mut Ctx, name: &str, task: &Task) -> Result<Vec<Id>, Bus
         .into_iter()
         .map(|(id, _)| id)
         .collect();
+    crate::handlers::session::enqueue(ctx.tx(), task.id, &ids)?;
     let mut newly_current = Vec::new();
     for id in ids {
-        let ord: i64 = ctx
-            .tx()
-            .query_row(
-                "SELECT COALESCE(MAX(ord),-1)+1 FROM task_sessions WHERE task_id=?1",
-                [task.id],
-                |r| r.get(0),
-            )
-            .bus()?;
-        let queue_ord: i64 = ctx
-            .tx()
-            .query_row(
-                "SELECT COALESCE(MAX(queue_ord),-1)+1 FROM task_sessions WHERE session_id=?1",
-                [id],
-                |r| r.get(0),
-            )
-            .bus()?;
-        ctx.tx()
-            .execute(
-                "INSERT OR IGNORE INTO task_sessions(task_id,session_id,ord,queue_ord) VALUES (?1,?2,?3,?4)",
-                params![task.id, id, ord, queue_ord],
-            )
-            .bus()?;
-        let next: Option<(Id,Option<Id>)> = ctx.tx().query_row(
-            "SELECT t.id,t.module_id FROM task_sessions ts JOIN tasks t ON t.id=ts.task_id WHERE ts.session_id=?1 AND ts.completed_at IS NULL AND t.deleted_at IS NULL AND t.col='active' ORDER BY ts.queue_ord,t.id LIMIT 1",
-            [id],|row|Ok((row.get(0)?,row.get(1)?))).optional().bus()?;
+        let next = crate::handlers::session::next_queued_task(ctx.tx(), id, None)?;
         if let Some((task_id,module_id)) = next {
             let changed = ctx.tx().execute(
                 "UPDATE sessions SET task_id=?1,module_id=?2,updated_at=?3 WHERE id=?4

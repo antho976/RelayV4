@@ -235,6 +235,32 @@ fn backups_via_bus_keep_last_five() {
     assert_eq!(r.error.unwrap().code, "actor.allowlist");
 }
 
+/// RA-342: the store, its WAL and its backups hold audit payloads and session tokens. A new data
+/// dir and `backups/` are 0700, the files 0600 — and an existing 0644 store is tightened on open.
+#[test]
+fn the_store_and_its_backups_are_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("relay-v4/test");
+    let path = data.join("store.db");
+    let store = Store::open(&path, false).unwrap();
+    assert_eq!(mode(&data), 0o700);
+    assert_eq!(mode(&path), 0o600);
+    store.with_tx(|tx| { tx.execute("INSERT INTO meta(key, value) VALUES ('probe', 'x')", [])?; Ok(()) }).unwrap();
+    for side in ["store.db-wal", "store.db-shm"] {
+        let side = data.join(side);
+        if side.exists() { assert_eq!(mode(&side), 0o600, "{}", side.display()); }
+    }
+    let backup = store.backup("manual").unwrap();
+    assert_eq!(mode(backup.parent().unwrap()), 0o700);
+    assert_eq!(mode(&backup), 0o600);
+    drop(store);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    drop(Store::open(&path, false).unwrap());
+    assert_eq!(mode(&path), 0o600, "an existing install's store is tightened");
+}
+
 /// A v3 `.relay/` dir the way v3 wrote it (schema copied from a real relay.db).
 fn make_v3(dir: &std::path::Path) {
     std::fs::create_dir_all(dir.join("attachments")).unwrap();

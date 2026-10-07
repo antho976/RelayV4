@@ -1,11 +1,11 @@
 //! `relay serve` (and `relay serve --remote`, which adds the phone door in the same process) does
-//! this: become the subreaper for everything below it, open the store exclusively, build the
-//! engine, open the socket door, run until quit. The desktop app is a client of this socket; it
-//! does not host an engine.
+//! this: take the instance lock, become the subreaper for everything below it, open the store
+//! exclusively, build the engine, open the socket door, run until quit. The desktop app is a
+//! client of this socket; it does not host an engine.
 
 use crate::engine::Engine;
 use crate::paths::Instance;
-use crate::socket::{BindError, SocketServer};
+use crate::socket::{BindError, InstanceLock, SocketServer};
 use crate::store::Store;
 use anyhow::Result;
 use std::path::PathBuf;
@@ -17,8 +17,24 @@ pub struct Served {
     pub socket: SocketServer,
 }
 
-/// Open the store (exclusive), build the engine, bind the socket. Does not block.
+impl Served {
+    /// Stop: no new requests, the socket door closed and its connections ended, then every
+    /// child killed and marked restorable. The door goes first, so nothing a client sends can
+    /// land after [`Engine::shutdown`] has drained the PTYs (RA-333).
+    pub fn stop(self) {
+        let Served { engine, socket } = self;
+        engine.request_quit();
+        drop(socket);
+        engine.shutdown();
+    }
+}
+
+/// Take the instance lock, open the store (exclusive), build the engine, bind the socket. Does
+/// not block.
 pub async fn start(instance: Instance, store_path: Option<PathBuf>) -> Result<Served, BindError> {
+    // The lock first: a second engine for this instance is told so, before it opens a store
+    // or runs recovery on one (RA-624).
+    let lock = InstanceLock::take(instance)?;
     // Before any child exists: a session descendant that double-forks must land under the
     // engine, not init, or the socket door would take it for the user (RA-096, D165).
     let subreaper = crate::peer::become_subreaper();
@@ -46,7 +62,7 @@ pub async fn start(instance: Instance, store_path: Option<PathBuf>) -> Result<Se
     crate::branch_cleanup::spawn_sweeper(&engine);
     // Retention: soft-deleted rows past the undo window, old notifications and mail (purge).
     crate::purge::spawn_timer(&engine);
-    let socket = SocketServer::start(engine.clone()).await?;
+    let socket = lock.bind(engine.clone()).await?;
     Ok(Served { engine, socket })
 }
 
@@ -60,8 +76,7 @@ pub async fn serve(instance: Instance, store_path: Option<PathBuf>) -> Result<()
         _ = tokio::signal::ctrl_c() => tracing::info!("SIGINT"),
         _ = sigterm() => tracing::info!("SIGTERM"),
     }
-    served.engine.shutdown();
-    drop(served);
+    served.stop();
     Ok(())
 }
 

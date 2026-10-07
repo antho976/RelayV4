@@ -8,10 +8,9 @@ use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, watch};
 
-static MIRROR_SERVER: OnceLock<PathBuf> = OnceLock::new();
 const RUN_LOG_LINES: usize = 512;
 
 #[derive(Debug, Default)]
@@ -57,32 +56,61 @@ impl DeviceWatchRuntime {
     }
 }
 
-/// Point the engine at a bundled scrcpy server. Native development also has a source-tree fallback.
-pub fn configure_mirror_server(path: PathBuf) {
-    if path.is_file() {
-        let _ = MIRROR_SERVER.set(path);
+/// The vendored jar's file name, wherever it is installed.
+const MIRROR_SERVER_FILE: &str = "scrcpy-server-v4.1";
+
+/// Where the scrcpy server jar is looked for, first existing file wins: `$RELAY_SCRCPY_SERVER`,
+/// then `~/.local/share/relay-v4/scrcpy-server-v4.1` (where an installed engine — `cargo
+/// install`, the relay-remote service — finds it once copied there), then the checkout this
+/// binary was built from, which is all a development build needs.
+fn mirror_server_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = std::env::var_os("RELAY_SCRCPY_SERVER").filter(|path| !path.is_empty()) {
+        candidates.push(PathBuf::from(path));
     }
+    if let Some(base) = directories::BaseDirs::new() {
+        candidates.push(base.data_local_dir().join("relay-v4").join(MIRROR_SERVER_FILE));
+    }
+    candidates.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../apps/relay-native/resources").join(MIRROR_SERVER_FILE));
+    candidates
 }
 
-pub fn mirror_server_path() -> Option<PathBuf> {
-    MIRROR_SERVER.get().cloned().or_else(|| {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../apps/relay-native/resources/scrcpy-server-v4.1");
-        path.is_file().then_some(path)
-    })
+/// Why there is no server jar to push: a typed code for `device.mirror.*` and the words.
+pub type MirrorServerError = (&'static str, String);
+
+/// The scrcpy server jar to push, read and checked against [`crate::mirror::SCRCPY_SERVER_SHA256`]
+/// on every call. It runs on the device with shell privileges, so a jar that differs from the
+/// pinned one — changed in the checkout by a branch switch or a merge nobody could review —
+/// refuses the mirror instead of being pushed. Hashing ~720 KB takes a few milliseconds, so
+/// callers keep it off the store lock.
+pub fn mirror_server() -> Result<PathBuf, MirrorServerError> {
+    let Some(path) = mirror_server_candidates().into_iter().find(|path| path.is_file()) else {
+        return Err(("device.mirror_server_missing", format!(
+            "the bundled scrcpy server is missing; set RELAY_SCRCPY_SERVER or copy {MIRROR_SERVER_FILE} into ~/.local/share/relay-v4/"
+        )));
+    };
+    verify_mirror_server(&path)?;
+    Ok(path)
+}
+
+fn verify_mirror_server(path: &Path) -> Result<(), MirrorServerError> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path)
+        .map_err(|error| ("device.mirror_server_missing", format!("cannot read the scrcpy server {}: {error}", path.display())))?;
+    let digest: String = Sha256::digest(&bytes).iter().map(|byte| format!("{byte:02x}")).collect();
+    if digest != crate::mirror::SCRCPY_SERVER_SHA256 {
+        return Err(("device.mirror_server_mismatch", format!(
+            "{} is not the pinned scrcpy {} server (sha256 {digest}); Relay will not push it to a device",
+            path.display(), crate::mirror::SCRCPY_VERSION,
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
 pub struct MirrorChunk {
     pub seq: u64,
     pub data: Arc<Vec<u8>>,
-}
-
-#[derive(Debug)]
-struct MirrorBuffer {
-    seq: u64,
-    bytes: usize,
-    chunks: VecDeque<MirrorChunk>,
 }
 
 #[derive(Debug, Default)]
@@ -142,8 +170,6 @@ fn pack_size(width: u32, height: u32) -> u64 {
 pub struct MirrorRuntime {
     pub id: Id,
     pub device: String,
-    pub input_width: u32,
-    pub input_height: u32,
     pub max_size: u32,
     pub bitrate: u32,
     pub scid: u32,
@@ -155,7 +181,10 @@ pub struct MirrorRuntime {
     /// A clone of the control socket, under its own lock, so `stop()` can shut it down — and
     /// so fail a writer blocked inside `send_control` — without waiting for the control lock.
     control_shutdown: Mutex<Option<TcpStream>>,
-    buffer: Mutex<MirrorBuffer>,
+    /// The last packet's number. Windows detect a lagged subscription by a gap in it. There is
+    /// no catch-up ring: the one attach comes before the worker's first packet, and a late
+    /// joiner recovers with RESET_VIDEO (fresh config + key frame), not a replay.
+    seq: AtomicU64,
     tx: broadcast::Sender<MirrorChunk>,
     /// The stream's current picture size, `width << 32 | height`. Starts at the estimate
     /// from `wm size` and follows every session packet, so tap/swipe coordinates are
@@ -170,8 +199,6 @@ pub struct MirrorRuntimeConfig {
     pub device: String,
     pub width: u32,
     pub height: u32,
-    pub input_width: u32,
-    pub input_height: u32,
     pub max_size: u32,
     pub bitrate: u32,
     pub scid: u32,
@@ -185,8 +212,6 @@ impl MirrorRuntime {
             device,
             width,
             height,
-            input_width,
-            input_height,
             max_size,
             bitrate,
             scid,
@@ -197,8 +222,6 @@ impl MirrorRuntime {
         Arc::new(Self {
             id,
             device,
-            input_width,
-            input_height,
             max_size,
             bitrate,
             scid,
@@ -208,11 +231,7 @@ impl MirrorRuntime {
             video: Mutex::new(None),
             control: Mutex::new(MirrorControl::default()),
             control_shutdown: Mutex::new(None),
-            buffer: Mutex::new(MirrorBuffer {
-                seq: 0,
-                bytes: 0,
-                chunks: VecDeque::new(),
-            }),
+            seq: AtomicU64::new(0),
             tx,
             size: AtomicU64::new(pack_size(width, height)),
             status,
@@ -321,31 +340,14 @@ impl MirrorRuntime {
         if data.is_empty() || self.stopped() {
             return;
         }
-        let chunk = {
-            let mut state = self.buffer.lock().unwrap();
-            state.seq += 1;
-            let data = Arc::new(data);
-            let chunk = MirrorChunk {
-                seq: state.seq,
-                data: data.clone(),
-            };
-            state.bytes += data.len();
-            state.chunks.push_back(chunk.clone());
-            while state.bytes > 2 * 1024 * 1024 {
-                if let Some(old) = state.chunks.pop_front() {
-                    state.bytes = state.bytes.saturating_sub(old.data.len());
-                } else {
-                    break;
-                }
-            }
-            chunk
-        };
-        let _ = self.tx.send(chunk);
+        // One writer (the worker), so the counter needs no lock to stay in send order.
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = self.tx.send(MirrorChunk { seq, data: Arc::new(data) });
     }
-    pub fn attach(&self) -> (u64, Vec<MirrorChunk>, broadcast::Receiver<MirrorChunk>) {
-        let rx = self.tx.subscribe();
-        let state = self.buffer.lock().unwrap();
-        (state.seq, state.chunks.iter().cloned().collect(), rx)
+    /// Subscribe to the stream from the next packet on. Nothing is replayed (see `seq`), so
+    /// every packet the receiver yields is new.
+    pub fn attach(&self) -> broadcast::Receiver<MirrorChunk> {
+        self.tx.subscribe()
     }
     pub fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
@@ -545,7 +547,7 @@ mod tests {
         // Accepted and never read: the "device" has stopped reading its control socket.
         let (_server, _) = listener.accept().unwrap();
         let runtime = MirrorRuntime::new(MirrorRuntimeConfig {
-            id: 1, device: "S".into(), width: 1080, height: 2400, input_width: 1080, input_height: 2400,
+            id: 1, device: "S".into(), width: 1080, height: 2400,
             max_size: 1600, bitrate: 8_000_000, scid: 1, adb: "adb".into(),
         });
         runtime.install_control(client).unwrap();
@@ -557,6 +559,35 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(1), "stop waited {:?} for the writer", started.elapsed());
         assert!(sending.join().unwrap().is_err());
         assert!(runtime.send_control(vec![1]).is_err(), "a stopped mirror takes no more input");
+    }
+
+    #[test]
+    fn only_the_pinned_scrcpy_server_is_pushed() {
+        let vendored = mirror_server_candidates().pop().unwrap();
+        assert!(verify_mirror_server(&vendored).is_ok(), "the vendored jar no longer matches SCRCPY_SERVER_SHA256");
+        let dir = tempfile::tempdir().unwrap();
+        let tampered = dir.path().join(MIRROR_SERVER_FILE);
+        let mut bytes = std::fs::read(&vendored).unwrap();
+        bytes[0] ^= 1;
+        std::fs::write(&tampered, bytes).unwrap();
+        let (code, message) = verify_mirror_server(&tampered).unwrap_err();
+        assert_eq!(code, "device.mirror_server_mismatch");
+        assert!(message.contains(&tampered.display().to_string()), "{message}");
+    }
+
+    #[test]
+    fn mirror_packets_are_numbered_for_gap_detection_and_never_replayed() {
+        let runtime = MirrorRuntime::new(MirrorRuntimeConfig {
+            id: 1, device: "S".into(), width: 1080, height: 2400,
+            max_size: 1600, bitrate: 8_000_000, scid: 1, adb: "adb".into(),
+        });
+        runtime.push(vec![1]);
+        let mut rx = runtime.attach();
+        assert!(rx.try_recv().is_err(), "nothing pushed before the attach is replayed");
+        runtime.push(vec![2]);
+        runtime.push(vec![3]);
+        assert_eq!(rx.try_recv().unwrap().seq, 2);
+        assert_eq!(rx.try_recv().unwrap().seq, 3);
     }
 
     #[test]

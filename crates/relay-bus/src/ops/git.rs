@@ -135,7 +135,7 @@ op!(PrOpen, "git.pr.open", PrOpenIn => PrOpenOut, OpMeta::mutation(Scope::Projec
 payload!(#[schemars(rename = "GitCleanMergedIn")] CleanMergedIn { pub project_id: Id, pub dry_run: Option<bool> });
 result!(#[schemars(rename = "GitCleanMergedOut")] CleanMergedOut { pub deleted: Vec<String> });
 op!(CleanMerged, "git.branch.clean_merged", CleanMergedIn => CleanMergedOut,
-    OpMeta::mutation(Scope::Project, 8, "Delete merged branches without a live/parked session").actors(Actors::UserOnly).emits(&["git.changed"]));
+    OpMeta::mutation(Scope::Project, 8, "Alias of git.branch.cleanup that answers with the names of the branches deleted (or, on a dry run, that would be)").actors(Actors::UserOnly).emits(&["git.changed", "worktree.changed"]));
 payload!(#[schemars(rename = "GitBranchCleanupIn")] BranchCleanupIn { pub project_id: Id, pub dry_run: Option<bool> });
 result!(#[schemars(rename = "GitBranchCleanup")] BranchCleanupRow {
     pub branch: String,

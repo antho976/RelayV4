@@ -215,8 +215,8 @@ pub async fn serve_with_door(
         t.abort();
     }
     drop(door);
-    served.engine.shutdown();
-    drop(served);
+    // Quitting first and the socket door closed before the sessions go (RA-333).
+    served.stop();
     Ok(())
 }
 

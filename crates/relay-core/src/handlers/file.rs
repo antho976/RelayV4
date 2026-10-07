@@ -34,7 +34,8 @@ pub fn register(e: &mut Engine) {
         };
         let limit = p.limit.unwrap_or(TREE_LIMIT).clamp(1, TREE_LIMIT_MAX) as usize;
         let mut truncated = BTreeMap::new();
-        let entries = list_dir(&root, &dir, p.depth.unwrap_or(1).min(20), &badges, limit, &mut truncated)?;
+        let shown = Shown::new(&root);
+        let entries = list_dir(&root, &dir, p.depth.unwrap_or(1).min(20), &badges, &shown, limit, &mut truncated)?;
         Ok(TreeOut { entries, truncated })
     });
     e.register_unlocked::<Read>(|ctx, p| {
@@ -449,6 +450,7 @@ pub fn register(e: &mut Engine) {
         let limit = p.limit.unwrap_or(200).min(2000) as usize;
         let mut hits = Vec::new();
         let mut stack = vec![root.clone()];
+        let shown = Shown::new(&root);
         // One buffer for the whole walk: `read_to_string` allocated, grew and freed a fresh
         // `String` for every file in the tree, most of which contribute no hits at all.
         let mut buffer: Vec<u8> = Vec::new();
@@ -465,7 +467,7 @@ pub fn register(e: &mut Engine) {
                 // `DirEntry::file_type` does not follow symlinks, so a linked directory is
                 // never walked into. Generated trees are skipped by the same rule file.tree uses.
                 if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    if !crate::watch::is_generated_path(&root, &path) {
+                    if !shown.hidden(&path) {
                         stack.push(path);
                     }
                     continue;
@@ -523,7 +525,7 @@ pub fn register(e: &mut Engine) {
 /// error either way (D111). `@project` asks for the root explicitly and loudly.
 ///
 /// The store half of worktree resolution, split out so the unlocked query context can do it in
-/// one short read and leave the `git worktree list` that validates the answer off the lock (D144).
+/// one short read and check the answer against the repository with nothing held (D144).
 pub(crate) fn default_worktree_in(
     conn: &Connection,
     session_id: Option<Id>,
@@ -560,7 +562,8 @@ pub(crate) fn root_choice(
 }
 
 /// The external half: canonicalize and confirm the path really is a worktree of this repository.
-/// `git worktree list` is a subprocess, so this must run with the store lock released.
+/// Filesystem reads only — [`crate::worktree::contains`] reads the checkout's `.git` pointer and
+/// its slot, no subprocess — so the locked mutation path ([`root_mut`]) calls it too.
 pub(crate) fn root_verify(
     project: &relay_bus::types::Project,
     chosen: PathBuf,
@@ -581,8 +584,9 @@ pub(crate) fn root_verify(
 /// The one spelling that means "the project root, deliberately".
 pub(crate) const PROJECT_ROOT: &str = "@project";
 
-/// The tree a query reads: one short read, then the subprocess with nothing held. Mutations
-/// resolve theirs through [`root_mut`], which also confines an agent to its own checkout.
+/// The tree a query reads: one short read, then the check against the repository with nothing
+/// held. Mutations resolve theirs through [`root_mut`], which also confines an agent to its own
+/// checkout.
 pub(crate) fn root_unlocked(
     ctx: &Unlocked,
     project_id: Id,
@@ -760,11 +764,46 @@ const TREE_LIMIT_MAX: u32 = 5000;
 /// The first `limit` entries of `dir` in display order (folders first, then by name), each
 /// directory among them listed `depth - 1` levels further. A directory cut short is recorded
 /// in `truncated` with its full count. Only the entries kept are stat'ed.
+/// Which paths `file.tree` and `file.search` leave out: VCS metadata, and build output or caches
+/// named by [`crate::watch::generated_name`] — unless git tracks something there. The name list
+/// alone hid a committed `dist/` or `scripts/build/` from the tree (RA-345, RA-638). The index is
+/// read only when a generated name actually turns up.
+struct Shown<'a> {
+    root: &'a Path,
+    index: std::cell::OnceCell<Option<gix::worktree::Index>>,
+}
+
+impl<'a> Shown<'a> {
+    fn new(root: &'a Path) -> Self {
+        Shown { root, index: std::cell::OnceCell::new() }
+    }
+
+    fn hidden(&self, path: &Path) -> bool {
+        let Ok(relative) = path.strip_prefix(self.root) else { return true };
+        if !crate::watch::is_generated_path(self.root, path) { return false; }
+        if relative.starts_with(".git") { return true; }
+        let index = self.index.get_or_init(|| gix::open(self.root).ok().and_then(|repo| repo.index_or_empty().ok()));
+        let Some(index) = index else { return true };
+        let mut prefix = String::new();
+        for component in relative.components() {
+            let name = component.as_os_str().to_string_lossy();
+            if !prefix.is_empty() { prefix.push('/'); }
+            prefix.push_str(&name);
+            if crate::watch::generated_name(&name) {
+                let at = gix::bstr::BStr::new(prefix.as_bytes());
+                if index.entry_by_path(at).is_none() && !index.path_is_directory(at) { return true; }
+            }
+        }
+        false
+    }
+}
+
 fn list_dir(
     root: &Path,
     dir: &Path,
     depth: u32,
     badges: &HashMap<String, String>,
+    shown: &Shown,
     limit: usize,
     truncated: &mut BTreeMap<String, u32>,
 ) -> Result<Vec<Entry>, BusError> {
@@ -773,7 +812,7 @@ fn list_dir(
         .flatten()
         .filter(|e| {
             !matches!(e.file_name().to_string_lossy().as_ref(), ".git" | ".relay")
-                && !crate::watch::is_generated_path(root, &e.path())
+                && !shown.hidden(&e.path())
         })
         // `DirEntry::file_type` does not follow links, the same as `entry`'s `symlink_metadata`.
         .map(|e| {
@@ -793,7 +832,7 @@ fn list_dir(
         // cannot be read is listed without children; either used to fail the whole tree (RA-368).
         let Ok(mut item) = entry(root, &path, badges) else { continue };
         if item.kind == EntryKind::Dir && depth > 1 {
-            item.children = list_dir(root, &path, depth - 1, badges, limit, truncated).ok();
+            item.children = list_dir(root, &path, depth - 1, badges, shown, limit, truncated).ok();
         }
         out.push(item);
     }
@@ -1261,5 +1300,27 @@ mod tests {
         assert_eq!(highest_trash_slot(&[base.path()]), 1);
         let payload = trash_into(&[base.path()], 2, &doomed).unwrap();
         assert_eq!(fs::read_to_string(payload).unwrap(), "newer");
+    }
+
+    /// RA-345: a tracked `dist/` or `scripts/build/` is source, shown and searched; an untracked
+    /// `dist/` or `target/` is build output, left out.
+    #[test]
+    fn generated_names_are_hidden_only_where_git_tracks_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = &std::fs::canonicalize(directory.path()).unwrap();
+        let git = |args: &[&str]| assert!(std::process::Command::new("git").arg("-C").arg(root).args(args).status().unwrap().success());
+        git(&["init", "-q", "-b", "main"]);
+        for file in ["action/dist/index.js", "scripts/build/run.sh", "src/main.rs", "web/dist/out.js", "target/debug/app"] {
+            std::fs::create_dir_all(root.join(file).parent().unwrap()).unwrap();
+            std::fs::write(root.join(file), "x").unwrap();
+        }
+        git(&["add", "action", "scripts", "src"]);
+        let shown = Shown::new(root);
+        for visible in ["action/dist", "action/dist/index.js", "action/dist/new.js", "scripts/build", "src"] {
+            assert!(!shown.hidden(&root.join(visible)), "{visible} is hidden");
+        }
+        for hidden in ["web/dist", "target", "target/debug", ".git", "action/dist/node_modules"] {
+            assert!(shown.hidden(&root.join(hidden)), "{hidden} is shown");
+        }
     }
 }

@@ -3,9 +3,7 @@
 //! protocol moved and mirror.rs must be re-transcribed against the new version.
 
 use relay_core::mirror::{
-    self, parse_codec_id, parse_device_event, parse_device_msg, parse_stream_unit, CopyKey,
-    DeviceEvent, DeviceMsg, InputMsg, LockOrientation, MirrorOptions, StreamUnit, ACTION_DOWN,
-    ACTION_MOVE, ACTION_UP, CODEC_ID_H264, INJECT_TEXT_MAX_LENGTH, KEYCODE_APP_SWITCH,
+    self, parse_codec_id, parse_stream_unit, InputMsg, StreamUnit, ACTION_DOWN, ACTION_MOVE, ACTION_UP, CODEC_ID_H264, INJECT_TEXT_MAX_LENGTH, KEYCODE_APP_SWITCH,
     KEYCODE_HOME, KEYCODE_POWER, KEYCODE_VOLUME_DOWN, KEYCODE_VOLUME_UP, KEYCODE_WAKEUP,
     META_CTRL_ON, POINTER_ID_GENERIC_FINGER,
 };
@@ -14,7 +12,7 @@ use relay_core::mirror::{
 
 #[test]
 fn server_args_pin_version_and_required_options() {
-    let args = mirror::server_shell_args("SERIAL1", 0xabcd_1234, mirror::CAPTURE_MIN);
+    let args = mirror::server_shell_args("SERIAL1", 0xabcd_1234, mirror::CAPTURE_MIN, 8_000_000);
     assert_eq!(args[0], "-s");
     assert_eq!(args[1], "SERIAL1");
     assert!(args.contains(&"4.1".to_string()));
@@ -56,11 +54,11 @@ fn bit_rate_scales_with_capture_size_and_is_capped() {
 
 #[test]
 fn server_args_carry_the_requested_capture_size() {
-    let args = mirror::server_shell_args("S", 1, 1600);
+    let args = mirror::server_shell_args("S", 1, 1600, mirror::capture_bit_rate(1600));
     assert!(args.contains(&"max_size=1600".to_string()));
     assert!(args.contains(&"video_bit_rate=12500000".to_string()));
     // An off-ladder request can never reach the server: the builder snaps it.
-    let odd = mirror::server_shell_args("S", 1, 1300);
+    let odd = mirror::server_shell_args("S", 1, 1300, 8_000_000);
     assert!(odd.contains(&"max_size=1600".to_string()));
 }
 
@@ -350,30 +348,22 @@ fn panel_rotate_power_and_reset_are_byte_exact() {
 // -- clipboard --------------------------------------------------------------
 
 #[test]
-fn get_clipboard_is_byte_exact() {
-    assert_eq!(mirror::get_clipboard(CopyKey::None), [8, 0]);
-    assert_eq!(mirror::get_clipboard(CopyKey::Copy), [8, 1]);
-    assert_eq!(mirror::get_clipboard(CopyKey::Cut), [8, 2]);
-    assert_eq!(mirror::encode_input(&InputMsg::GetClipboard { copy: CopyKey::Copy }), vec![8, 1]);
-}
-
-#[test]
 fn set_clipboard_is_byte_exact() {
-    let m = mirror::set_clipboard(0x0102_0304_0506_0708, true, "hi");
+    let m = mirror::set_clipboard(true, "hi");
     #[rustfmt::skip]
     let expect: Vec<u8> = vec![
         9,                                              // TYPE_SET_CLIPBOARD
-        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // sequence
+        0, 0, 0, 0, 0, 0, 0, 0,                         // sequence: 0, no ack wanted
         1,                                              // paste
         0x00, 0x00, 0x00, 0x02,                         // length
         b'h', b'i',
     ];
     assert_eq!(m, expect);
-    // sequence 0 = no ack wanted, paste off
-    assert_eq!(mirror::set_clipboard(0, false, ""), vec![9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    // paste off
+    assert_eq!(mirror::set_clipboard(false, ""), vec![9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
 
-    let msg = InputMsg::SetClipboard { text: "hi".into(), paste: true, sequence: 7 };
-    assert_eq!(mirror::encode_input(&msg), mirror::set_clipboard(7, true, "hi"));
+    let msg = InputMsg::SetClipboard { text: "hi".into(), paste: true };
+    assert_eq!(mirror::encode_input(&msg), mirror::set_clipboard(true, "hi"));
 }
 
 #[test]
@@ -385,7 +375,7 @@ fn set_clipboard_caps_on_a_char_boundary() {
     // "€" is 3 bytes and does not divide the cap: 87376 * 3 = 262128, and the char that
     // would end at 262131 has to be dropped whole or the device decodes garbage.
     let s = "€".repeat(max); // three times the cap in bytes
-    let m = mirror::set_clipboard(1, false, &s);
+    let m = mirror::set_clipboard(false, &s);
     let len = u32::from_be_bytes(m[10..14].try_into().unwrap()) as usize;
     assert_eq!(len, 262_128);
     assert_eq!(m.len(), 14 + len);
@@ -419,11 +409,9 @@ fn input_msg_deserializes_from_ui_json() {
     assert_eq!(m, InputMsg::DisplayPower { on: false });
     // clipboard flags default off
     let m: InputMsg = serde_json::from_str(r#"{"type":"setclipboard","text":"x"}"#).unwrap();
-    assert_eq!(m, InputMsg::SetClipboard { text: "x".into(), paste: false, sequence: 0 });
-    let m: InputMsg = serde_json::from_str(r#"{"type":"getclipboard"}"#).unwrap();
-    assert_eq!(m, InputMsg::GetClipboard { copy: CopyKey::None });
-    let m: InputMsg = serde_json::from_str(r#"{"type":"getclipboard","copy":"cut"}"#).unwrap();
-    assert_eq!(m, InputMsg::GetClipboard { copy: CopyKey::Cut });
+    assert_eq!(m, InputMsg::SetClipboard { text: "x".into(), paste: false });
+    // Reading the clipboard back is not implemented; asking is an error, not a silent `{}`.
+    assert!(serde_json::from_str::<InputMsg>(r#"{"type":"getclipboard"}"#).is_err());
 }
 
 #[test]
@@ -451,8 +439,7 @@ fn input_msg_round_trips_for_the_macro_recorder() {
         InputMsg::QuickSettings,
         InputMsg::Collapse,
         InputMsg::DisplayPower { on: true },
-        InputMsg::SetClipboard { text: "long".into(), paste: true, sequence: 9 },
-        InputMsg::GetClipboard { copy: CopyKey::Copy },
+        InputMsg::SetClipboard { text: "long".into(), paste: true },
         InputMsg::ResetVideo,
     ];
     let json = serde_json::to_string(&recording.clone()).unwrap();
@@ -464,109 +451,13 @@ fn input_msg_round_trips_for_the_macro_recorder() {
     }
 }
 
-// -- device message drain ---------------------------------------------------
+// -- launch line --------------------------------------------------------------
 
 #[test]
-fn device_msg_framing() {
-    // clipboard: type 0 + u32 len + text
-    let mut msg = vec![0u8, 0, 0, 0, 3];
-    msg.extend_from_slice(b"abc");
-    assert_eq!(parse_device_msg(&msg), DeviceMsg::Skip(8));
-    assert_eq!(parse_device_msg(&msg[..6]), DeviceMsg::NeedMore);
-    assert_eq!(parse_device_msg(&msg[..3]), DeviceMsg::NeedMore);
-    assert_eq!(parse_device_msg(&[]), DeviceMsg::NeedMore);
-
-    // ack clipboard: fixed 9 bytes
-    let ack = [1u8, 0, 0, 0, 0, 0, 0, 0, 7];
-    assert_eq!(parse_device_msg(&ack), DeviceMsg::Skip(9));
-    assert_eq!(parse_device_msg(&ack[..8]), DeviceMsg::NeedMore);
-
-    // uhid output: type 2 + u16 id + u16 size + data
-    let uhid = [2u8, 0, 1, 0, 2, 0xaa, 0xbb];
-    assert_eq!(parse_device_msg(&uhid), DeviceMsg::Skip(7));
-    assert_eq!(parse_device_msg(&uhid[..5]), DeviceMsg::NeedMore);
-
-    assert_eq!(parse_device_msg(&[9u8, 1, 2]), DeviceMsg::Unknown(9));
-}
-
-#[test]
-fn device_events_decode_content_and_agree_with_the_framing_parser() {
-    let mut clip = vec![0u8, 0, 0, 0, 3];
-    clip.extend_from_slice("héllo".as_bytes()); // longer than 3 — trailing bytes are the next message
+fn the_launch_line_is_pinned() {
+    // Byte for byte what the vendored jar is asked to do — it hard-fails on an unknown key.
     assert_eq!(
-        parse_device_event(&clip[..8]),
-        DeviceEvent::Clipboard { consumed: 8, text: "hé".into() }
-    );
-
-    let mut clip = vec![0u8, 0, 0, 0, 6];
-    clip.extend_from_slice("héllo".as_bytes());
-    assert_eq!(
-        parse_device_event(&clip),
-        DeviceEvent::Clipboard { consumed: 11, text: "héllo".into() }
-    );
-    assert_eq!(parse_device_event(&clip[..7]), DeviceEvent::NeedMore);
-    assert_eq!(parse_device_event(&clip[..2]), DeviceEvent::NeedMore);
-    assert_eq!(parse_device_event(&[]), DeviceEvent::NeedMore);
-
-    // invalid utf-8 must not stall the socket — lossy, framed, consumed
-    let bad = [0u8, 0, 0, 0, 2, 0xff, 0xfe];
-    assert_eq!(
-        parse_device_event(&bad),
-        DeviceEvent::Clipboard { consumed: 7, text: "\u{fffd}\u{fffd}".into() }
-    );
-
-    let ack = [1u8, 0, 0, 0, 0, 0, 0, 0, 7];
-    assert_eq!(parse_device_event(&ack), DeviceEvent::ClipboardAck { consumed: 9, sequence: 7 });
-    assert_eq!(parse_device_event(&ack[..8]), DeviceEvent::NeedMore);
-
-    let uhid = [2u8, 0, 1, 0, 2, 0xaa, 0xbb];
-    assert_eq!(
-        parse_device_event(&uhid),
-        DeviceEvent::UhidOutput { consumed: 7, id: 1, data: vec![0xaa, 0xbb] }
-    );
-    assert_eq!(parse_device_event(&[9u8, 1, 2]), DeviceEvent::Unknown(9));
-
-    // Both parsers frame identically — that is the whole reason they share a length fn.
-    for buf in [&clip[..], &ack[..], &uhid[..], &bad[..], &[9u8, 1][..], &[][..]] {
-        let framed = match parse_device_msg(buf) {
-            DeviceMsg::Skip(n) => Some(n),
-            _ => None,
-        };
-        let evented = match parse_device_event(buf) {
-            DeviceEvent::Clipboard { consumed, .. }
-            | DeviceEvent::ClipboardAck { consumed, .. }
-            | DeviceEvent::UhidOutput { consumed, .. } => Some(consumed),
-            _ => None,
-        };
-        assert_eq!(framed, evented, "{buf:?}");
-    }
-}
-
-#[test]
-fn clipboard_set_then_ack_round_trips_the_sequence() {
-    let sent = mirror::set_clipboard(0xdead_beef, true, "paste me");
-    let seq = u64::from_be_bytes(sent[1..9].try_into().unwrap());
-    let mut ack = vec![1u8];
-    ack.extend_from_slice(&seq.to_be_bytes());
-    assert_eq!(parse_device_event(&ack), DeviceEvent::ClipboardAck { consumed: 9, sequence: seq });
-}
-
-// -- server option builder --------------------------------------------------
-
-#[test]
-fn default_options_reproduce_the_pinned_launch_line() {
-    // Switching a call site to the builder must not change one byte of what the vendored
-    // jar is asked to do — it hard-fails on an unknown key.
-    // At the bottom capture rung the two agree by construction: `for_capture(CAPTURE_MIN)`
-    // is `default()`, which is what keeps the historical line pinned through the ladder.
-    let opts = MirrorOptions::default();
-    assert_eq!(opts, MirrorOptions::for_capture(mirror::CAPTURE_MIN));
-    assert_eq!(
-        mirror::server_shell_args_with("S", 0xabcd_1234, &opts),
-        mirror::server_shell_args("S", 0xabcd_1234, mirror::CAPTURE_MIN)
-    );
-    assert_eq!(
-        mirror::server_shell_args("S", 0xabcd_1234, mirror::CAPTURE_MIN),
+        mirror::server_shell_args("S", 0xabcd_1234, mirror::CAPTURE_MIN, mirror::capture_bit_rate(mirror::CAPTURE_MIN)),
         vec![
             "-s",
             "S",
@@ -587,58 +478,6 @@ fn default_options_reproduce_the_pinned_launch_line() {
             "tunnel_forward=true",
         ]
     );
-}
-
-#[test]
-fn options_emit_in_a_fixed_order_and_omit_server_defaults() {
-    let opts = MirrorOptions {
-        max_size: 720,
-        video_bit_rate: 2_000_000,
-        max_fps: 30,
-        capture_orientation: Some(LockOrientation::Deg90),
-        audio: true,
-        stay_awake: false,
-        power_off_on_close: true,
-        log_level: "debug".into(),
-    };
-    let args = mirror::server_shell_args_with("S", 1, &opts);
-    assert_eq!(
-        &args[7..],
-        &[
-            "4.1",
-            "scid=00000001",
-            "log_level=debug",
-            "audio=true",
-            "video_codec=h264",
-            "max_size=720",
-            "video_bit_rate=2000000",
-            "max_fps=30",
-            "stay_awake=false",
-            "capture_orientation=@90",
-            "power_off_on_close=true",
-            "tunnel_forward=true",
-        ]
-    );
-    // tunnel mode is always last; the shell's connect sequence assumes it.
-    assert_eq!(args.last().unwrap(), "tunnel_forward=true");
-
-    // Off-by-default keys never appear unless asked for.
-    let plain = mirror::server_shell_args_with("S", 1, &MirrorOptions::default());
-    assert!(!plain.iter().any(|a| a.starts_with("capture_orientation")));
-    // v4.1 does not know the pre-3.0 key; sending it makes the server refuse to start.
-    assert!(!args.iter().any(|a| a.starts_with("lock_video_orientation")));
-    assert!(!plain.iter().any(|a| a.starts_with("power_off_on_close")));
-
-    for (lock, want) in [
-        (LockOrientation::Unlocked, "0"),
-        (LockOrientation::Deg0, "@0"),
-        (LockOrientation::Deg180, "@180"),
-        (LockOrientation::Deg270, "@270"),
-    ] {
-        let o = MirrorOptions { capture_orientation: Some(lock), ..MirrorOptions::default() };
-        let args = mirror::server_shell_args_with("S", 1, &o);
-        assert!(args.contains(&format!("capture_orientation={want}")), "{lock:?}");
-    }
 }
 
 // -- runtime: picture size, status, input fast path, worker end -------------
@@ -695,8 +534,6 @@ esac
             device: "relay-phone".into(),
             width,
             height,
-            input_width: 1080,
-            input_height: 2400,
             max_size: 1024,
             bitrate: 8_000_000,
             scid: 1,
@@ -872,7 +709,7 @@ esac
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         // The source-tree jar is the server path in tests; the fake adb "pushes" it anywhere.
-        assert!(relay_core::device::mirror_server_path().is_some());
+        assert!(relay_core::device::mirror_server().is_ok());
         let adb = fake_adb(dir.path(), port, get_state);
         call(&e, "settings.set", json!({"path":"device.adb_path","value":adb})).unwrap();
         let mut events = e.subscribe();

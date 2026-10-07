@@ -1,13 +1,15 @@
-//! `bus.*` (BUS.md §10.1). `bus.subscribe`/`unsubscribe` are answered by the socket door;
-//! if they reach the engine (in-process) they say so.
+//! `bus.*` (BUS.md §10.1). `bus.wait`/`subscribe`/`unsubscribe` are answered by the socket
+//! door; if they reach the engine (in-process) they say so. The door dispatches them first all
+//! the same, for the pipeline's envelope, actor and authorization checks: [`DOOR_ONLY`] coming
+//! back means every one of them passed.
 
-use crate::engine::{Ctx, Engine, IntoBus};
+use crate::engine::{Engine, IntoBus};
 use crate::sessions;
 use relay_bus::error::BusError;
 use relay_bus::ops::bus::*;
 use relay_bus::registry::{Callable, OpInfo, Registry};
 use relay_bus::types::Session;
-use relay_bus::{Empty, Op};
+use relay_bus::Op;
 use rusqlite::OptionalExtension;
 
 pub fn register(e: &mut Engine) {
@@ -110,12 +112,9 @@ pub fn register(e: &mut Engine) {
     e.register::<Unsubscribe>(|_, _| Err(door_only(Unsubscribe::NAME)));
 }
 
+/// The code of the refusal a socket-door op's handler gives.
+pub(crate) const DOOR_ONLY: &str = "bus.door";
+
 fn door_only(op: &str) -> BusError {
-    BusError::invalid("bus.door", format!("{op} is answered by the socket door, not the engine"))
+    BusError::invalid(DOOR_ONLY, format!("{op} is answered by the socket door, not the engine"))
 }
-
-#[allow(dead_code)]
-fn _ctx_used(_: &Ctx, _: Empty) {}
-
-#[allow(dead_code)]
-const _CALLABLE_USED: Callable = Callable::Yes;

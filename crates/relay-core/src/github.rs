@@ -117,7 +117,9 @@ pub fn download_skills(
     let temp = std::env::temp_dir().join(format!("relay-skill-{}", uuid::Uuid::new_v4()));
     let mut command = Command::new("git");
     crate::proc::quiet_network_git(&mut command);
-    command.args(["clone", "--depth", "1"]);
+    // A committed symlink is checked out as a plain file, so nothing in the clone can point
+    // the skill walk at the rest of the disk (RA-317).
+    command.args(["-c", "core.symlinks=false", "clone", "--depth", "1"]);
     if let Some(branch) = branch.as_deref() { command.args(["--branch", branch]); }
     command.arg("--").arg(&source_url).arg(&temp);
     let output = match crate::proc::output_with_timeout(&mut command, std::time::Duration::from_secs(300)) {
@@ -185,15 +187,25 @@ fn collect_skills(
     if !start.exists() {
         return Err(BusError::not_found("skill.path_not_found", format!("{} does not exist in the repository", start.strip_prefix(root).unwrap_or(&start).display())));
     }
+    // `safe_relative` checks only the syntax; a symlinked component would still lead out of
+    // the clone, so the resolved folder must stay under the resolved root (RA-317).
+    let read_failed = |error: std::io::Error| BusError::unavailable("skill.read_failed", error.to_string());
+    let root = &root.canonicalize().map_err(read_failed)?;
+    let start = start.canonicalize().map_err(read_failed)?;
+    if !start.starts_with(root) {
+        return Err(BusError::invalid("skill.subdir", "skill subdirectory leads outside the repository through a symlink"));
+    }
     let mut files = Vec::new();
-    find_skill_files(&start, 0, &mut files).map_err(|error| BusError::unavailable("skill.read_failed", error.to_string()))?;
+    find_skill_files(&start, 0, &mut files).map_err(read_failed)?;
     if files.is_empty() {
         return Err(BusError::not_found("skill.none_found", "no SKILL.md files were found at that GitHub source"));
     }
     files.sort();
     files.into_iter().enumerate().map(|(index, path)| {
-        let body = fs::read_to_string(&path).map_err(|error| BusError::unavailable("skill.read_failed", error.to_string()))?;
-        if body.len() > 256 * 1024 { return Err(BusError::invalid("skill.body", format!("{} exceeds 256 KiB", path.display()))); }
+        // Checked before reading, so an oversized file is never pulled into memory whole.
+        let len = fs::metadata(&path).map_err(read_failed)?.len();
+        if len > 256 * 1024 { return Err(BusError::invalid("skill.body", format!("{} exceeds 256 KiB", path.display()))); }
+        let body = fs::read_to_string(&path).map_err(read_failed)?;
         let source_path = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().replace('\\', "/");
         let fallback = path.parent().and_then(Path::file_name).map(|value| value.to_string_lossy().to_string()).unwrap_or_else(|| "skill".into());
         let name = frontmatter_name(&body).unwrap_or(fallback);
@@ -278,5 +290,18 @@ mod tests {
         let assets = skills[0].assets.as_deref().expect("skill folder staged");
         assert_eq!(fs::read_to_string(assets.join("reference/audit.md")).unwrap(), "audit");
         assert!(assets.join("SKILL.md").is_file());
+    }
+
+    #[test]
+    fn a_symlinked_subdir_cannot_lead_out_of_the_clone() {
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir_all(outside.path().join("private")).unwrap();
+        fs::write(outside.path().join("private/SKILL.md"), "---\nname: Local\n---\nmine\n").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("pack")).unwrap();
+        for subdir in ["pack", "pack/private"] {
+            let error = collect_skills(root.path(), "https://github.com/example/skills.git", None, Some(subdir), None).unwrap_err();
+            assert_eq!(error.code, "skill.subdir", "{subdir}");
+        }
     }
 }

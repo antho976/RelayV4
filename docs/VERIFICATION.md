@@ -200,8 +200,10 @@ Relay is meant to sit beside a game, a build or a call, so a second pass went
 after what it spends in the background rather than what it spends per call.
 
 It already has no idle cost worth naming: the only recurring timers in the
-application are the opt-in wallpaper rotation and one-shot debounces, and the
-resource sampler runs only while its panel is open. What remained was work that
+application are the opt-in wallpaper rotation, one-shot debounces and the
+engine's merged-branch sweep (`git.branch.cleanup`, every 20 minutes, a few git
+commands per changed branch), and the resource sampler runs only while its
+panel is open. What remained was work that
 runs whether or not anyone is looking at it.
 
 - **Terminals detach when the window is not on screen.** Panes tracked the

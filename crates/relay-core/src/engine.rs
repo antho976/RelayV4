@@ -5,7 +5,9 @@
 //! ```
 //!
 //! Handlers are synchronous and run inside one SQLite transaction with the store mutex held —
-//! writes are serial by design (§5.1). Doors call [`Engine::dispatch`] from `spawn_blocking`.
+//! writes are serial by design (§5.1). Doors call [`Engine::dispatch`] from `spawn_blocking`,
+//! except for the requests [`Engine::answers_from_memory`] admits, which run inline on the
+//! door's own thread.
 
 use crate::audit::{self, AuditEntry};
 use crate::device::{DeviceWatchState, MirrorRuntime, RunRuntime};
@@ -484,7 +486,14 @@ pub struct Engine {
     quit: Notify,
     quitting: AtomicBool,
     pub socket_path: std::sync::Mutex<Option<String>>,
-    self_ref: std::sync::Mutex<Option<std::sync::Weak<Engine>>>,
+    /// The engine's own `Arc`, for work that outlives a borrow of it (after-commit closures,
+    /// the idle-edge worker). Set once, by [`Arc::new_cyclic`], before anything can read it.
+    self_ref: std::sync::Weak<Engine>,
+    /// Ids of audited requests between their idempotency lookup and their audit row (BUS.md
+    /// §5.3). A duplicate that arrives in that window waits on `in_flight_done` and then replays
+    /// the recorded response, instead of running the op a second time.
+    in_flight: std::sync::Mutex<HashSet<Uuid>>,
+    in_flight_done: std::sync::Condvar,
     /// Live PTYs by session id (phase 3). Not persisted: a restart makes sessions restorable.
     ptys: std::sync::Mutex<HashMap<Id, Arc<Pty>>>,
     /// Session name → id for the live PTYs above, so `session.input` can resolve a keystroke's
@@ -514,42 +523,44 @@ pub struct Engine {
 impl Engine {
     pub fn new(instance: Instance, store: Store) -> Arc<Engine> {
         let (events_tx, _) = broadcast::channel(4096);
-        let mut engine = Engine {
-            instance,
-            store,
-            handlers: HashMap::new(),
-            unlocked: HashMap::new(),
-            prepares: HashMap::new(),
-            events_tx,
-            started: Instant::now(),
-            quit: Notify::new(),
-            quitting: AtomicBool::new(false),
-            socket_path: std::sync::Mutex::new(None),
-            self_ref: std::sync::Mutex::new(None),
-            ptys: std::sync::Mutex::new(HashMap::new()),
-            pty_ids: std::sync::Mutex::new(HashMap::new()),
-            mirrors: std::sync::Mutex::new(HashMap::new()),
-            device_runs: std::sync::Mutex::new(HashMap::new()),
-            device_watch: std::sync::Mutex::new(DeviceWatchState::default()),
-            next_mirror: AtomicI64::new(1),
-            watchers: std::sync::Mutex::new(HashMap::new()),
-            provider_updates: std::sync::Mutex::new(HashSet::new()),
-            creating_sessions: std::sync::Mutex::new(HashSet::new()),
-            watcher_registrations: std::sync::Mutex::new(HashSet::new()),
-            ui: std::sync::Mutex::new(UiRuntime::default()),
-            resource_watch: AtomicBool::new(false),
-            resource_watch_clients: std::sync::Mutex::new(0),
-            resource_watch_epoch: AtomicI64::new(0),
-            resource_cpu: std::sync::Mutex::new(HashMap::new()),
-            resource_disk: std::sync::Mutex::new(HashMap::new()),
-            resource_disk_refresh: std::sync::Mutex::new((false, None)),
-            device_leases: Default::default(),
-            skill_refresh: Default::default(),
-        };
-        crate::handlers::register_all(&mut engine);
-        let arc = Arc::new(engine);
-        *arc.self_ref.lock().unwrap() = Some(Arc::downgrade(&arc));
-        arc
+        Arc::new_cyclic(|self_ref| {
+            let mut engine = Engine {
+                instance,
+                store,
+                handlers: HashMap::new(),
+                unlocked: HashMap::new(),
+                prepares: HashMap::new(),
+                events_tx,
+                started: Instant::now(),
+                quit: Notify::new(),
+                quitting: AtomicBool::new(false),
+                socket_path: std::sync::Mutex::new(None),
+                self_ref: self_ref.clone(),
+                in_flight: std::sync::Mutex::new(HashSet::new()),
+                in_flight_done: std::sync::Condvar::new(),
+                ptys: std::sync::Mutex::new(HashMap::new()),
+                pty_ids: std::sync::Mutex::new(HashMap::new()),
+                mirrors: std::sync::Mutex::new(HashMap::new()),
+                device_runs: std::sync::Mutex::new(HashMap::new()),
+                device_watch: std::sync::Mutex::new(DeviceWatchState::default()),
+                next_mirror: AtomicI64::new(1),
+                watchers: std::sync::Mutex::new(HashMap::new()),
+                provider_updates: std::sync::Mutex::new(HashSet::new()),
+                creating_sessions: std::sync::Mutex::new(HashSet::new()),
+                watcher_registrations: std::sync::Mutex::new(HashSet::new()),
+                ui: std::sync::Mutex::new(UiRuntime::default()),
+                resource_watch: AtomicBool::new(false),
+                resource_watch_clients: std::sync::Mutex::new(0),
+                resource_watch_epoch: AtomicI64::new(0),
+                resource_cpu: std::sync::Mutex::new(HashMap::new()),
+                resource_disk: std::sync::Mutex::new(HashMap::new()),
+                resource_disk_refresh: std::sync::Mutex::new((false, None)),
+                device_leases: Default::default(),
+                skill_refresh: Default::default(),
+            };
+            crate::handlers::register_all(&mut engine);
+            engine
+        })
     }
 
     /// Register a typed handler for `O`. Payload validation (BUS.md §5.2) is the typed
@@ -667,11 +678,7 @@ impl Engine {
         self.quitting.load(Ordering::SeqCst)
     }
     pub fn arc(&self) -> Option<Arc<Engine>> {
-        self.self_ref
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|w| w.upgrade())
+        self.self_ref.upgrade()
     }
 
     // ------------------------------------------------------------------ PTY registry
@@ -749,9 +756,11 @@ impl Engine {
         }
         // mark first, then kill: the exit callback only touches live states, so it stays a no-op
         self.mark_restorable(&ptys);
-        for (_, p) in &ptys {
-            p.kill(std::time::Duration::from_secs(2));
-        }
+        // All at once, not in turn: each kill waits up to its grace for the child to leave, and
+        // ten slow CLIs one after another outlasted a logout's stop timeout. One TERM to every
+        // group and one shared wait cost about one grace however many sessions are open.
+        let all: Vec<&Pty> = ptys.iter().map(|(_, p)| &**p).collect();
+        crate::pty::kill_all(&all, std::time::Duration::from_secs(2));
     }
 
     fn mark_restorable(&self, ptys: &[(Id, Arc<Pty>)]) {
@@ -811,12 +820,13 @@ impl Engine {
         };
         audit::append(&tx, &e).map_err(internal)?;
         tx.commit().map_err(internal)?;
-        drop(conn);
+        // Published before the lock goes, like a request's events: see `publish`.
         for (ev, payload) in events {
             let mut e = Event::new(ev, now.clone(), Actor::System, payload);
             e.project_id = project_id;
             let _ = self.events_tx.send(e);
         }
+        drop(conn);
         Ok(out)
     }
 
@@ -910,28 +920,39 @@ impl Engine {
         let entry = Registry::global()
             .get(&req.op)
             .ok_or_else(|| BusError::unknown_op(&req.op))?;
-        // actor
-        let session_id = self.resolve_actor(req, door)?;
-        // An agent already *is* a project and a session. Making it restate both on every call
-        // turned each op into guess-and-retry, so the engine fills the two identity fields
-        // when an op requires them and the caller left them out (D110). Only required fields
-        // are filled: an optional `project_id` is usually one half of an either/or.
-        let filled = self.fill_identity(req, entry, session_id)?;
-        let req = filled.as_ref().unwrap_or(req);
         let audited = should_audit(entry, &req.actor);
-        // idempotency
-        if audited {
-            let conn = self.store.lock();
-            if let Some(rec) = audit::lookup(&conn, req.id).map_err(internal)? {
-                if rec.payload_hash != audit::payload_hash(&req.payload) {
-                    return Err(BusError::conflict(
-                        "bus.id_reused",
-                        "this request id was already used with a different payload",
-                    ));
+        // An audited request holds its id from the lookup below until its audit row is written,
+        // so a duplicate sent meanwhile — a retry after a timeout, during a staged op's slow
+        // prepare — waits and replays that row instead of running the op twice (§5.3). Taken
+        // before the store: the request it may wait for needs the store to finish.
+        let _reserved = audited.then(|| self.reserve_id(req.id));
+        // Actor, identity and idempotency share one acquisition of the store and one read of
+        // the session row. A user's unaudited request — every keystroke — takes no lock (D148).
+        let (session_id, filled) = {
+            let conn = (audited || req.actor.is_agent()).then(|| self.store.lock());
+            // actor
+            let row = self.resolve_actor(conn.as_deref(), req, door)?;
+            // An agent already *is* a project and a session. Making it restate both on every
+            // call turned each op into guess-and-retry, so the engine fills the two identity
+            // fields when an op requires them and the caller left them out (D110). Only required
+            // fields are filled: an optional `project_id` is usually one half of an either/or.
+            let filled = Self::fill_identity(req, entry, row.as_ref());
+            let req = filled.as_ref().unwrap_or(req);
+            // idempotency
+            if let (true, Some(conn)) = (audited, conn.as_deref()) {
+                if let Some(rec) = audit::lookup(conn, req.id).map_err(internal)? {
+                    if rec.payload_hash != audit::payload_hash(&req.payload) {
+                        return Err(BusError::conflict(
+                            "bus.id_reused",
+                            "this request id was already used with a different payload",
+                        ));
+                    }
+                    return Ok(rec.response.replayed());
                 }
-                return Ok(rec.response.replayed());
             }
-        }
+            (row.map(|row| row.session.id), filled)
+        };
+        let req = filled.as_ref().unwrap_or(req);
         // validate (before authorization — BUS.md §5; for every op, implemented or not)
         (entry.validate)(&req.payload).map_err(|e| BusError::schema(entry.name, e))?;
         // authorize — fixed op-level allowlist, then the session role/options/scope.
@@ -1080,20 +1101,13 @@ impl Engine {
         match outcome {
             Ok(result) => {
                 if audited {
+                    let outcome = Ok(result.clone());
                     let e = AuditEntry {
-                        ts: &now,
-                        req_id: req.id,
-                        parent_req: None,
-                        actor: &req.actor,
                         on_behalf_of: on_behalf_of.as_ref(),
-                        session_id,
-                        op: audit_op,
-                        project_id,
-                        payload: &req.payload,
-                        outcome: &Ok(result.clone()),
                         hold_id,
                         undo_op: undo.as_ref(),
                         undo_of,
+                        ..request_audit(req, &now, audit_op, session_id, project_id, &outcome)
                     };
                     let audit_id = audit::append(&tx, &e).map_err(internal)?;
                     if let Some(original) = mark_undone {
@@ -1105,79 +1119,86 @@ impl Engine {
                     }
                 }
                 tx.commit().map_err(internal)?;
-                drop(conn);
-                span.finish();
-                for ev in events {
-                    let _ = self.events_tx.send(ev);
-                }
-                if !after_commit.is_empty() {
-                    if let Some(arc) = self.arc() {
-                        for f in after_commit {
-                            f(arc.clone());
-                        }
-                    }
-                }
+                self.publish(conn, span, events, after_commit);
                 Ok(Response::ok(req.id, result))
             }
             Err(err) => {
+                let outcome = Err(err.clone());
                 if commit_error {
                     if audited {
+                        let project_id = project_id.or_else(|| session_project(&tx, session_id));
                         let e = AuditEntry {
-                            ts: &now,
-                            req_id: req.id,
-                            parent_req: None,
-                            actor: &req.actor,
                             on_behalf_of: on_behalf_of.as_ref(),
-                            session_id,
-                            op: audit_op,
-                            project_id,
-                            payload: &req.payload,
-                            outcome: &Err(err.clone()),
                             hold_id,
-                            undo_op: None,
-                            undo_of: None,
+                            ..request_audit(req, &now, audit_op, session_id, project_id, &outcome)
                         };
                         audit::append(&tx, &e).map_err(internal)?;
                     }
                     tx.commit().map_err(internal)?;
-                    drop(conn);
-                    for ev in events {
-                        let _ = self.events_tx.send(ev);
-                    }
-                    if !after_commit.is_empty() {
-                        if let Some(arc) = self.arc() {
-                            for f in after_commit {
-                                f(arc.clone());
-                            }
-                        }
-                    }
+                    self.publish(conn, span, events, after_commit);
                     return Err(err);
                 }
                 // ordinary failure: roll back handler work; audit in its own transaction
                 tx.rollback().map_err(internal)?;
                 if audited && err.kind != relay_bus::ErrorKind::Invalid {
+                    // A handler usually names its project last, so a failure falls back to the
+                    // session's — the same project `audit_only` records for a refusal.
+                    let project_id = project_id.or_else(|| session_project(&conn, session_id));
                     let tx = conn.transaction().map_err(internal)?;
                     let e = AuditEntry {
-                        ts: &now,
-                        req_id: req.id,
-                        parent_req: None,
-                        actor: &req.actor,
                         on_behalf_of: on_behalf_of.as_ref(),
-                        session_id,
-                        op: audit_op,
-                        project_id,
-                        payload: &req.payload,
-                        outcome: &Err(err.clone()),
                         hold_id,
-                        undo_op: None,
-                        undo_of: None,
+                        ..request_audit(req, &now, audit_op, session_id, project_id, &outcome)
                     };
                     audit::append(&tx, &e).map_err(internal)?;
                     tx.commit().map_err(internal)?;
                 }
+                drop(conn);
+                span.finish();
                 Err(err)
             }
         }
+    }
+
+    /// After a commit: publish the request's events, release the store, then run its
+    /// after-commit work. The events go out while the lock is still held, so two commits that
+    /// touch the same row reach subscribers in commit order — the native client applies a
+    /// `session.changed` in place, and one sent late would overwrite the newer state (or bring
+    /// back a closed session). A broadcast send never blocks.
+    fn publish(
+        &self,
+        conn: std::sync::MutexGuard<'_, rusqlite::Connection>,
+        span: LockSpan,
+        events: Vec<Event>,
+        after_commit: Vec<Box<dyn FnOnce(Arc<Engine>) + Send + 'static>>,
+    ) {
+        for ev in events {
+            let _ = self.events_tx.send(ev);
+        }
+        drop(conn);
+        span.finish();
+        self.run_deferred(after_commit);
+    }
+
+    /// Run a request's after-commit work, with nothing locked.
+    fn run_deferred(&self, deferred: Vec<Box<dyn FnOnce(Arc<Engine>) + Send + 'static>>) {
+        if deferred.is_empty() {
+            return;
+        }
+        if let Some(arc) = self.arc() {
+            for f in deferred {
+                f(arc.clone());
+            }
+        }
+    }
+
+    /// Hold `id` for one audited request (BUS.md §5.3), first waiting out any request that
+    /// already holds it. Released when the guard drops, after the audit row is written.
+    fn reserve_id(&self, id: Uuid) -> ReservedId<'_> {
+        let held = self.in_flight.lock().unwrap();
+        let mut held = self.in_flight_done.wait_while(held, |held| held.contains(&id)).unwrap();
+        held.insert(id);
+        ReservedId { engine: self, id }
     }
 
     /// Write an audit row for a request that never reached a handler (refused / unavailable).
@@ -1190,44 +1211,22 @@ impl Engine {
     ) -> Result<(), BusError> {
         let now = crate::time::now();
         let mut conn = self.store.lock();
-        let project_id = session_id.and_then(|session_id| {
-            conn.prepare_cached("SELECT project_id FROM sessions WHERE id = ?1")
-                .ok()?
-                .query_row([session_id], |row| row.get(0))
-                .ok()
-        });
+        let project_id = session_project(&conn, session_id);
         let tx = conn.transaction().map_err(internal)?;
-        let e = AuditEntry {
-            ts: &now,
-            req_id: req.id,
-            parent_req: None,
-            actor: &req.actor,
-            on_behalf_of: None,
-            session_id,
-            op: entry.name,
-            project_id,
-            payload: &req.payload,
-            outcome,
-            hold_id: None,
-            undo_op: None,
-            undo_of: None,
-        };
+        let e = request_audit(req, &now, entry.name, session_id, project_id, outcome);
         audit::append(&tx, &e).map_err(internal)?;
         tx.commit().map_err(internal)
     }
 
-    /// Fill `project_id` / `session` from the authenticated agent when the op requires them
-    /// and the payload omits them. Returns `None` when nothing needed filling, so the common
-    /// path never clones the request.
+    /// Fill `project_id` / `session` from the authenticated agent's session row when the op
+    /// requires them and the payload omits them. Returns `None` when nothing needed filling, so
+    /// the common path never clones the request.
     fn fill_identity(
-        &self,
         req: &Request,
-        entry: &relay_bus::registry::OpEntry,
-        session_id: Option<Id>,
-    ) -> Result<Option<Request>, BusError> {
-        let Some(session_id) = session_id else {
-            return Ok(None);
-        };
+        entry: &OpEntry,
+        row: Option<&crate::sessions::Row_>,
+    ) -> Option<Request> {
+        let row = row?;
         let object = req.payload.as_object().expect("payload is an object");
         let registry = Registry::global();
         let wants = |field: &str| {
@@ -1235,12 +1234,8 @@ impl Engine {
         };
         let (needs_project, needs_session) = (wants("project_id"), wants("session"));
         if !needs_project && !needs_session {
-            return Ok(None);
+            return None;
         }
-        let conn = self.store.lock();
-        let row = crate::sessions::by_id(&conn, session_id)?
-            .ok_or_else(|| BusError::actor("bound session vanished"))?;
-        drop(conn);
         let mut next = req.clone();
         let object = next.payload.as_object_mut().expect("payload is an object");
         if needs_project {
@@ -1249,10 +1244,9 @@ impl Engine {
         if needs_session {
             object.insert("session".into(), Value::from(row.session.name.clone()));
         }
-        Ok(Some(next))
+        Some(next)
     }
 
-    /// BUS.md §4.2. Returns the agent's session id when the actor is a bound agent.
     /// Run a query registered with [`Engine::register_unlocked`]: no store lock held for the
     /// handler's duration, events emitted and deferred work run once it returns.
     fn dispatch_unlocked(
@@ -1283,13 +1277,7 @@ impl Engine {
         for ev in events {
             let _ = self.events_tx.send(ev);
         }
-        if !deferred.is_empty() {
-            if let Some(arc) = self.arc() {
-                for f in deferred {
-                    f(arc.clone());
-                }
-            }
-        }
+        self.run_deferred(deferred);
         Ok(Response::ok(req.id, result))
     }
 
@@ -1297,11 +1285,12 @@ impl Engine {
     /// on the thread it arrived on instead of handing it to the blocking pool.
     ///
     /// True only for the two ops [`Engine::pty_fast_path`] serves, from an actor that is not a
-    /// session, against a PTY that is in the map right now — every one of those a lock-free
-    /// check. The hop costs about 25 µs and a thread wake-up, which is most of what a keystroke
-    /// spends before reaching the terminal. Being wrong is not a correctness problem: the
-    /// request simply takes the ordinary pipeline, inline, and the two ops it admits never do
-    /// more than one write to a file descriptor.
+    /// session, against a PTY that is in the map right now — every one of those an in-memory
+    /// check under a short-lived map lock, never the store. The hop costs about 25 µs and a
+    /// thread wake-up, which is most of what a keystroke spends before reaching the terminal.
+    /// Being wrong is not a correctness problem: the request simply takes the ordinary
+    /// pipeline, inline, and the two ops it admits never do more than one write to a file
+    /// descriptor.
     pub fn answers_from_memory(&self, req: &Request) -> bool {
         if req.actor.is_agent() {
             return false;
@@ -1321,6 +1310,9 @@ impl Engine {
                 if !small {
                     return false;
                 }
+                // Behind a paste that is still draining, even a small write waits (RA-341).
+                let name = req.payload.get("session").and_then(Value::as_str).unwrap_or_default();
+                return self.pty_named(name).is_some_and(|(_, pty)| pty.writer_idle());
             }
             // One control message to the device. Text and clipboard payloads can be large
             // enough to block on a full socket, so only the pointer/key events stay inline.
@@ -1347,6 +1339,7 @@ impl Engine {
     /// typed error for that case.
     fn pty_fast_path(&self, op: &str, payload: &Value) -> Result<Option<Value>, BusError> {
         use relay_bus::ops::session::{InputIn, ResizeIn};
+        use serde::Deserialize;
         let name = payload
             .get("session")
             .and_then(Value::as_str)
@@ -1356,7 +1349,7 @@ impl Engine {
         };
         match op {
             "session.input" => {
-                let p: InputIn = serde_json::from_value(payload.clone())
+                let p = InputIn::deserialize(payload)
                     .map_err(|e| BusError::schema("session.input", e))?;
                 if pty.exited() {
                     return Err(BusError::conflict(
@@ -1364,18 +1357,16 @@ impl Engine {
                         format!("session {} has exited", p.session),
                     ));
                 }
-                pty.write(p.data.as_bytes())
-                    .map_err(|e| BusError::conflict("session.io", e.to_string()))?;
                 // The one keystroke per idle period that owes the store a row: hand it to a
                 // worker so the character itself is already in the PTY either way.
-                if !p.data.is_empty() && pty.claim_idle_edge() {
+                if write_input(&pty, &p.data)? {
                     if let Some(engine) = self.arc() {
                         std::thread::spawn(move || engine.mark_session_running(session_id));
                     }
                 }
             }
             "session.resize" => {
-                let p: ResizeIn = serde_json::from_value(payload.clone())
+                let p = ResizeIn::deserialize(payload)
                     .map_err(|e| BusError::schema("session.resize", e))?;
                 pty.resize(p.cols, p.rows)
                     .map_err(|e| BusError::conflict("session.io", e.to_string()))?;
@@ -1389,7 +1380,9 @@ impl Engine {
     /// one write to the device's control socket. The mirror registry is memory-only, so unlike
     /// the PTY path there is nothing to fall through to — an unknown id is answered here too.
     fn mirror_fast_path(&self, payload: &Value) -> Result<Value, BusError> {
-        let p: relay_bus::ops::device::MirrorInputIn = serde_json::from_value(payload.clone())
+        use serde::Deserialize;
+        // Read through the payload, not out of a clone of it: this runs once per pointer event.
+        let p = relay_bus::ops::device::MirrorInputIn::deserialize(payload)
             .map_err(|e| BusError::schema("device.mirror.input", e))?;
         let runtime = crate::handlers::device::mirror_by_id(self, p.mirror_id)?;
         crate::handlers::device::send_input(&runtime, &p.event)?;
@@ -1427,41 +1420,42 @@ impl Engine {
         );
     }
 
-    fn resolve_actor(&self, req: &Request, door: Door) -> Result<Option<Id>, BusError> {
-        match (&req.actor, door) {
-            (Actor::System, _) => Err(BusError::actor(
-                "\"system\" is internal and cannot be claimed",
-            )),
-            (Actor::Test, _) if !self.instance.accepts_test_actor() => Err(BusError::actor(
-                "\"test\" actor is only accepted by dev/test instances",
-            )),
-            (Actor::User, _) | (Actor::Test, _) => Ok(None),
-            (Actor::Agent(name), Door::InProcess) => {
-                let conn = self.store.lock();
-                Ok(crate::sessions::by_name(&conn, name)
-                    .ok()
-                    .map(|r| r.session.id))
+    /// BUS.md §4.2. The bound session's row when the actor is an agent, read from `conn` —
+    /// which the caller holds whenever the actor is an agent. On the socket door, `agent:<name>`
+    /// and its token must match a non-closed session.
+    fn resolve_actor(
+        &self,
+        conn: Option<&rusqlite::Connection>,
+        req: &Request,
+        door: Door,
+    ) -> Result<Option<crate::sessions::Row_>, BusError> {
+        let name = match &req.actor {
+            Actor::System => {
+                return Err(BusError::actor("\"system\" is internal and cannot be claimed"))
             }
-            (Actor::Agent(name), Door::Socket) => {
+            Actor::Test if !self.instance.accepts_test_actor() => {
+                return Err(BusError::actor("\"test\" actor is only accepted by dev/test instances"))
+            }
+            Actor::User | Actor::Test => return Ok(None),
+            Actor::Agent(name) => name,
+        };
+        let conn = conn.expect("an agent's request resolves under the store lock");
+        match door {
+            Door::InProcess => Ok(crate::sessions::by_name(conn, name).ok()),
+            Door::Socket => {
                 let Some(token) = req.token.as_deref() else {
                     return Err(BusError::actor(format!(
                         "agent:{name} requires a token on the socket door"
                     )));
                 };
-                self.check_session_token(name, token)
+                let row = crate::sessions::by_name(conn, name)
+                    .map_err(|_| BusError::actor(format!("unknown session {name:?}")))?;
+                if row.token.is_empty() || row.token != token {
+                    return Err(BusError::actor(format!("bad token for session {name:?}")));
+                }
+                Ok(Some(row))
             }
         }
-    }
-
-    /// BUS.md §4.2: `agent:<name>` + token must match a non-closed session.
-    fn check_session_token(&self, name: &str, token: &str) -> Result<Option<Id>, BusError> {
-        let conn = self.store.lock();
-        let row = crate::sessions::by_name(&conn, name)
-            .map_err(|_| BusError::actor(format!("unknown session {name:?}")))?;
-        if row.token.is_empty() || row.token != token {
-            return Err(BusError::actor(format!("bad token for session {name:?}")));
-        }
-        Ok(Some(row.session.id))
     }
 
 }
@@ -1480,6 +1474,54 @@ pub fn should_audit(entry: &OpEntry, actor: &Actor) -> bool {
     }
 }
 
+/// An audited request's id, held from its idempotency lookup to its audit row.
+struct ReservedId<'a> {
+    engine: &'a Engine,
+    id: Uuid,
+}
+
+impl Drop for ReservedId<'_> {
+    fn drop(&mut self) {
+        self.engine.in_flight.lock().unwrap().remove(&self.id);
+        self.engine.in_flight_done.notify_all();
+    }
+}
+
+/// The audit row for a request, with the fields only a handler sets left empty.
+fn request_audit<'a>(
+    req: &'a Request,
+    now: &'a str,
+    op: &'a str,
+    session_id: Option<Id>,
+    project_id: Option<Id>,
+    outcome: &'a Result<Value, BusError>,
+) -> AuditEntry<'a> {
+    AuditEntry {
+        ts: now,
+        req_id: req.id,
+        parent_req: None,
+        actor: &req.actor,
+        on_behalf_of: None,
+        session_id,
+        op,
+        project_id,
+        payload: &req.payload,
+        outcome,
+        hold_id: None,
+        undo_op: None,
+        undo_of: None,
+    }
+}
+
+/// The project an agent's session belongs to.
+fn session_project(conn: &rusqlite::Connection, session_id: Option<Id>) -> Option<Id> {
+    let session_id = session_id?;
+    conn.prepare_cached("SELECT project_id FROM sessions WHERE id = ?1")
+        .ok()?
+        .query_row([session_id], |row| row.get(0))
+        .ok()
+}
+
 /// Map an infrastructure error to `internal`, logging it.
 pub fn internal(e: impl std::fmt::Display) -> BusError {
     tracing::error!(error = %e, "internal error");
@@ -1494,6 +1536,15 @@ impl<T, E: std::fmt::Display> IntoBus<T> for Result<T, E> {
     fn bus(self) -> Result<T, BusError> {
         self.map_err(internal)
     }
+}
+
+/// Write a keystroke batch to a live PTY, shared by the in-memory fast path and the staged
+/// `session.input` fallback. `true` when this write ends an idle period, which owes the store
+/// a `running` row (RA-646).
+pub(crate) fn write_input(pty: &crate::pty::Pty, data: &str) -> Result<bool, BusError> {
+    pty.write(data.as_bytes())
+        .map_err(|e| BusError::conflict("session.io", e.to_string()))?;
+    Ok(!data.is_empty() && pty.claim_idle_edge())
 }
 
 #[cfg(test)]
@@ -1570,5 +1621,34 @@ mod inline_path_tests {
         )));
 
         e.shutdown();
+    }
+
+    /// The same audited request sent from several threads at once runs once; every other copy
+    /// replays it. Without the in-flight reservation a copy could pass the lookup while the
+    /// first was still running and then fail the `audit.req_id` constraint as `internal`.
+    #[test]
+    fn concurrent_duplicates_of_one_request_run_once_and_replay() {
+        let e = engine();
+        for round in 0..100 {
+            let req = Request::new(Actor::User, "settings.set", json!({"path": "a.b", "value": round}));
+            let start = std::sync::Barrier::new(6);
+            let responses: Vec<Response> = std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..6)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            let req = req.clone();
+                            start.wait();
+                            e.dispatch(req, Door::InProcess)
+                        })
+                    })
+                    .collect();
+                workers.into_iter().map(|w| w.join().unwrap()).collect()
+            });
+            for r in &responses {
+                assert!(r.ok, "every copy succeeds: {:?}", r.error);
+            }
+            let ran = responses.iter().filter(|r| r.replayed.is_none()).count();
+            assert_eq!(ran, 1, "exactly one copy executes in round {round}");
+        }
     }
 }

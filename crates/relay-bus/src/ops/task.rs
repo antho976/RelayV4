@@ -143,7 +143,7 @@ op!(Unrelate, "task.unrelate", RelateIn => Task,
     OpMeta::mutation(Scope::Project, 7, "Drop a blocked_by or duplicate_of edge").undo(Undo::Inverse).emits(&["task.changed"]));
 
 result!(#[schemars(rename = "TaskCopyTextOut")] CopyTextOut { pub text: String });
-op!(CopyText, "task.copy_text", IdIn => CopyTextOut, OpMeta::query(Scope::Project, 7, "The copy-button text: title + body + id"));
+op!(CopyText, "task.copy_text", IdIn => CopyTextOut, OpMeta::query(Scope::Project, 7, "A task as plain text: `#id title`, then the body"));
 
 entries!(
     Create,
