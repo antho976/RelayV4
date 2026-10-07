@@ -425,9 +425,13 @@ impl Pane {
         font.set_absolute_size(points.clamp(8.0, 24.0) * 96.0 / 72.0 * gtk::pango::SCALE as f64);
         self.terminal.set_font(Some(&font));
     }
+    /// Shown and attached to its session, so input reaches the agent.
+    pub fn is_ready(&self) -> bool {
+        self.active.get() && self.client.borrow().is_some()
+    }
     pub fn verify_ready(&self) {
         assert!(
-            self.active.get() && self.client.borrow().is_some(),
+            self.is_ready(),
             "{} has no ready terminal attachment (active={})",
             self.name,
             self.active.get()

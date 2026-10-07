@@ -804,8 +804,10 @@ pub fn install(ui: &Rc<Ui>) {
                 let ui = navigate.clone();
                 // Layout checks reconnect hidden panes. Wait for their fixture sockets
                 // before feeding input, just as a user waits for a ready terminal.
-                glib::timeout_add_local_once(Duration::from_millis(500), move || {
-                    ui.verify_burst(false)
+                track("burst input", async move {
+                    wait_for(|| ui.burst_ready(), "Every burst pane attached").await?;
+                    ui.verify_burst(false);
+                    Ok(())
                 });
             }
             if page == "code" && fixture {

@@ -20,7 +20,7 @@ pub async fn run(ui: &Rc<Ui>) -> Result<(), String> {
         .clone();
     wait_for(
         || {
-            owner.rendered_project.get() == project
+            crate::pages::shown_project() == project
                 && named(&owner.window, "notes-library-split").is_some()
         },
         "Notes library loaded",
@@ -58,12 +58,7 @@ pub async fn run(ui: &Rc<Ui>) -> Result<(), String> {
         "Notes window grew back",
     )
     .await?;
-    let draft = ui
-        .note_drafts
-        .borrow()
-        .get(&id)
-        .ok_or("Fixture draft missing")?
-        .clone();
+    let draft = crate::pages::open_draft(id).ok_or("Fixture draft missing")?;
     let title = named(&draft.layout, "note-title")
         .ok_or("Plan must have a title editor")?
         .downcast::<gtk::Entry>()
@@ -131,7 +126,7 @@ pub async fn run(ui: &Rc<Ui>) -> Result<(), String> {
         "Close must hide Notes even with a dirty draft",
     )?;
     require(
-        ui.note_drafts.borrow().contains_key(&id),
+        crate::pages::open_draft(id).is_some(),
         "Window close discarded a draft",
     )?;
     // Prove a negative: wait past the autosave debounce (1.5 s, note_pages/doc.rs), so a
@@ -204,14 +199,14 @@ pub async fn run(ui: &Rc<Ui>) -> Result<(), String> {
     body.buffer().set_text("Ordinary Plan fixture");
     draft.close();
     require(
-        !ui.note_drafts.borrow().contains_key(&id),
+        crate::pages::open_draft(id).is_none(),
         "Clean tab close retained stale draft",
     )?;
     let renders = owner.renders.get();
     crate::pages::refresh_notes(ui);
     wait_for(|| owner.renders.get() > renders, "Notes refresh after tab close").await?;
     require(
-        !ui.note_drafts.borrow().contains_key(&id),
+        crate::pages::open_draft(id).is_none(),
         "Refresh reopened a deliberately closed tab",
     )?;
     let task = ui

@@ -192,6 +192,16 @@ pub fn unsaved_notes() -> bool {
     docs().iter().any(|doc| doc.draft.busy.get() || doc.dirty())
 }
 
+/// The editor of note `id` while its tab is open.
+pub fn open_draft(id: i64) -> Option<Rc<Draft>> {
+    doc_by_id(id).map(|doc| doc.draft.clone())
+}
+
+/// The project whose library Notes shows; 0 before the first render or once it is removed.
+pub fn shown_project() -> i64 {
+    shell_if_built().map_or(0, |shell| shell.project.get())
+}
+
 /// Close every open note, as the main window closes.
 pub fn close_all_notes() {
     for doc in docs() {
@@ -985,11 +995,6 @@ pub(super) fn project_gone(ui: &Rc<Ui>, dead: i64) {
     if SESSION.with(|s| s.borrow_mut().remove(&dead.to_string())).is_some() {
         persist(ui);
     }
-    if let Some(owner) = owner(ui) {
-        if owner.rendered_project.get() == dead {
-            owner.rendered_project.set(0);
-        }
-    }
     if let Some(shell) = shell_if_built() {
         if shell.project.get() == dead {
             shell.project.set(0);
@@ -1085,7 +1090,6 @@ pub(super) fn open_doc(ui: &Rc<Ui>, note: Value, position: Option<u32>) -> Rc<Do
             }
         }
         DOCS.with(|docs| docs.borrow_mut().remove(&id));
-        ui.note_drafts.borrow_mut().remove(&id);
         if let Some(shell) = shell_if_built() {
             for row in shell.rows.borrow().iter() {
                 if row.note["id"].as_i64() == Some(id) {
@@ -1096,7 +1100,6 @@ pub(super) fn open_doc(ui: &Rc<Ui>, note: Value, position: Option<u32>) -> Rc<Do
         tabs_changed(&ui);
     }));
     DOCS.with(|docs| docs.borrow_mut().insert(id, doc.clone()));
-    ui.note_drafts.borrow_mut().insert(id, doc.draft.clone());
     tabs.set_current_page(Some(page));
     tabs_changed(ui);
     doc
@@ -1281,7 +1284,6 @@ pub fn workspace(ui: &Rc<Ui>, _name: &str, project: i64, notes: &[Value]) {
     let changed = shell.project.replace(project) != project;
     let owner = owner(ui);
     if let Some(owner) = &owner {
-        owner.rendered_project.set(project);
         if !shell.rail_applied.replace(true) {
             shell.split.set_position(owner.rail_width.get());
             shell.library.set_visible(!owner.rail_collapsed.get());

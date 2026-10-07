@@ -157,36 +157,12 @@ fn group_title(group: &str) -> String {
 }
 
 /// `5m`, `3h`, `2d`: how long ago an RFC 3339 timestamp was, at a glance.
-fn ago_between(ts: &str, now: &glib::DateTime) -> String {
-    let Some(then) = ts
-        .get(..19)
-        .and_then(|base| glib::DateTime::from_iso8601(&format!("{base}Z"), None).ok())
-    else {
-        return String::new();
-    };
-    let seconds = now.difference(&then).as_seconds().max(0);
-    match seconds {
-        0..60 => "now".into(),
-        60..3_600 => format!("{}m", seconds / 60),
-        3_600..86_400 => format!("{}h", seconds / 3_600),
-        86_400..604_800 => format!("{}d", seconds / 86_400),
-        604_800..3_024_000 => format!("{}w", seconds / 604_800),
-        _ => then.format("%b %-d").map(|s| s.to_string()).unwrap_or_default(),
-    }
-}
 fn ago(ts: &str) -> String {
-    glib::DateTime::now_utc()
-        .map(|now| ago_between(ts, &now))
-        .unwrap_or_default()
+    crate::relative::ago(ts, crate::relative::Form::Compact).unwrap_or_default()
 }
 /// The peek's longer reading of an [`ago`]: `just now`, `5m ago`, `on Mar 1`, or a dash.
-fn since(age: &str) -> String {
-    match age {
-        "" => "—".into(),
-        "now" => "just now".into(),
-        date if date.contains(' ') => format!("on {date}"),
-        age => format!("{age} ago"),
-    }
+fn since(ts: &str) -> String {
+    crate::relative::ago(ts, crate::relative::Form::CompactAgo).unwrap_or_else(|| "—".into())
 }
 
 fn hue(name: &str) -> usize {
@@ -2574,8 +2550,8 @@ impl Board {
         if let Some(parent) = task["parent_id"].as_i64().and_then(|p| tasks.iter().find(|t| t["id"].as_i64() == Some(p))) {
             prop("Parent", self.task_link(parent).upcast_ref());
         }
-        prop("Updated", &value(&since(&ago(text(&task, "updated_at")))));
-        prop("Created", &value(&since(&ago(text(&task, "created_at")))));
+        prop("Updated", &value(&since(text(&task, "updated_at"))));
+        prop("Created", &value(&since(text(&task, "created_at"))));
         body.append(&grid);
 
         if let Some(tags) = labels_row(&task, 12) {
@@ -2718,17 +2694,12 @@ mod tests {
     }
     #[test]
     fn ages_read_at_a_glance() {
-        let now = glib::DateTime::from_iso8601("2026-10-05T12:00:00Z", None).unwrap();
-        assert_eq!(ago_between("2026-10-05T11:59:30.123456789Z", &now), "now");
-        assert_eq!(ago_between("2026-10-05T11:15:00Z", &now), "45m");
-        assert_eq!(ago_between("2026-10-05T02:00:00Z", &now), "10h");
-        assert_eq!(ago_between("2026-10-02T12:00:00Z", &now), "3d");
-        assert_eq!(ago_between("2026-09-14T12:00:00Z", &now), "3w");
-        assert_eq!(ago_between("2026-03-01T12:00:00Z", &now), "Mar 1");
-        assert_eq!(ago_between("", &now), "");
-        assert_eq!(since("now"), "just now");
-        assert_eq!(since("45m"), "45m ago");
-        assert_eq!(since("Mar 1"), "on Mar 1");
+        // The wording itself is relative.rs's; the board owns what an unreadable time shows.
+        let minutes = |m: i32| glib::DateTime::now_utc().unwrap().add_minutes(-m).unwrap().format_iso8601().unwrap().to_string();
+        assert_eq!(ago(&minutes(45)), "45m");
+        assert_eq!(ago(""), "");
+        assert_eq!(since(&minutes(0)), "just now");
+        assert_eq!(since(&minutes(45)), "45m ago");
         assert_eq!(since(""), "—");
     }
     #[test]

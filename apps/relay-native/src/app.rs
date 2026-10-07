@@ -311,9 +311,6 @@ pub struct Ui {
     launch_box: gtk::Box,
     pub editor: Rc<crate::editor::Editor>,
     pub note_tabs: gtk::Notebook,
-    /// The open notes' drafts, kept in step with note_pages' own list for smoke_notes.rs,
-    /// which is its only reader; the close guard asks note_pages.
-    pub note_drafts: RefCell<BTreeMap<i64, Rc<crate::pages::Draft>>>,
     pub notes_window: RefCell<Option<Rc<crate::pages::NotesWindow>>>,
     pub(crate) wallpaper_rotation: RefCell<crate::wallpaper_rotation::Rotation>,
     pub(crate) wallpaper_draft: RefCell<Option<crate::tools::settings::WallpaperDraft>>,
@@ -828,7 +825,6 @@ impl Ui {
             launch_box,
             editor,
             note_tabs: gtk::Notebook::new(),
-            note_drafts: RefCell::default(),
             notes_window: RefCell::default(),
             wallpaper_rotation: RefCell::default(),
             wallpaper_draft: RefCell::default(),
@@ -1718,6 +1714,12 @@ impl Ui {
             let (text, _) = pane.terminal.text_range_format(vte4::Format::Text, 0, 0, row, 500);
             pane.terminal.is_mapped() && text.is_some_and(|text| text.contains(marker))
         })
+    }
+    /// Every session has a pane and every pane is attached: what [`Ui::verify_burst`] asserts
+    /// before it feeds input.
+    pub(crate) fn burst_ready(&self) -> bool {
+        let panes = self.panes.borrow();
+        !panes.is_empty() && panes.len() == self.sessions.borrow().len() && panes.values().all(|pane| pane.is_ready())
     }
     pub fn verify_burst(&self, check: bool) {
         use vte4::prelude::TerminalExt;

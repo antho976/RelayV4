@@ -4,7 +4,6 @@ use std::cell::Cell;
 pub struct NotesWindow {
     pub window: gtk::Window,
     pub project: Cell<i64>,
-    pub rendered_project: Cell<i64>,
     pub rail_width: Cell<i32>,
     pub rail_collapsed: Cell<bool>,
     /// The open note's name, centred in the titlebar.
@@ -86,7 +85,6 @@ impl NotesWindow {
         let owned = Rc::new(Self {
             window,
             project: Cell::new(0),
-            rendered_project: Cell::new(0),
             rail_width: Cell::new(270),
             rail_collapsed: Cell::new(false),
             heading,
