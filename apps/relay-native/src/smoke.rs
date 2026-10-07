@@ -384,6 +384,8 @@ async fn edit_fixture(ui: Rc<Ui>, page: String) -> Result<(), String> {
     .await?;
     let (window, widget) = found.unwrap();
     if page == "board" {
+        // The title edits in place behind its pencil, as on a GitHub issue.
+        click(&window, "task-title-edit")?;
         widget
             .downcast::<gtk::Entry>()
             .map_err(|_| "Task title type")?
@@ -890,6 +892,36 @@ pub fn install(ui: &Rc<Ui>) {
             }
             if page == "launch-preview" {
                 navigate.show_launch(None);
+                return;
+            }
+            // A task's page (`task:<id>`) or the New task page, over the board.
+            if let Some(task) = page.strip_prefix("task:").and_then(|id| id.parse::<i64>().ok()) {
+                navigate.navigate("board");
+                crate::pages::open_task(&navigate, task);
+                return;
+            }
+            if let Some(module) = page.strip_prefix("module:").and_then(|id| id.parse::<i64>().ok()) {
+                crate::pages::open_module_board(&navigate, module);
+                return;
+            }
+            if page == "board-view" {
+                navigate.navigate("board");
+                let window = navigate.window.clone();
+                glib::timeout_add_local_once(Duration::from_millis(1500), move || {
+                    if let Some(menu) = named(&window, "board-view").and_downcast::<gtk::MenuButton>() {
+                        menu.popup();
+                    }
+                });
+                return;
+            }
+            if page == "module-new" {
+                navigate.navigate("modules");
+                crate::pages::new_module(&navigate, navigate.project.get());
+                return;
+            }
+            if page == "task-new" {
+                navigate.navigate("board");
+                crate::pages::new_task(&navigate, navigate.project.get(), "backlog");
                 return;
             }
             navigate.navigate(if page == "launch" { "agents" } else { &page });

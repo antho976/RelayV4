@@ -967,7 +967,7 @@ fn remove_project(ctx: &mut Ctx, project_id: Id, force: bool, remove_worktrees: 
         "DELETE FROM attachments WHERE task_id IN (SELECT id FROM tasks WHERE project_id=?1)",
         "DELETE FROM module_unlinked_tasks WHERE module_id IN (SELECT id FROM modules WHERE project_id=?1) OR task_id IN (SELECT id FROM tasks WHERE project_id=?1)",
         "DELETE FROM tasks WHERE project_id=?1",
-        // `task_labels` cascades with the tasks; the vocabulary itself is project-owned.
+        // `task_labels` and `task_comments` cascade with the tasks; the vocabulary itself is project-owned.
         "DELETE FROM labels WHERE project_id=?1",
         "DELETE FROM modules WHERE project_id=?1",
         "DELETE FROM notes WHERE project_id=?1",

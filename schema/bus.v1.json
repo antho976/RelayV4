@@ -4,7 +4,7 @@
   "title": "RELAY v4 command bus",
   "description": "Generated from crates/relay-bus by `relay schema`. Do not edit; see docs/engine/BUS.md.",
   "version": 1,
-  "op_count": 232,
+  "op_count": 233,
   "envelope": {
     "request": {
       "$ref": "#/$defs/Request"
@@ -843,6 +843,24 @@
       },
       "result": {
         "$ref": "#/$defs/TaskActivityOut"
+      }
+    },
+    "task.comment": {
+      "summary": "Comment on a task, GitHub-issue style; task.activity lists every comment oldest first",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "project",
+      "actors": "all",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 7,
+      "payload": {
+        "$ref": "#/$defs/TaskCommentIn"
+      },
+      "result": {
+        "$ref": "#/$defs/TaskComment"
       }
     },
     "task.list": {
@@ -7261,6 +7279,14 @@
             "null"
           ],
           "format": "int64"
+        },
+        "comments": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TaskComment"
+          },
+          "description": "Every comment on the task, oldest first; not paged. `task.comment` rows stay out of\n`history`, so a comment is reported once.",
+          "default": []
         }
       },
       "required": [
@@ -7317,6 +7343,53 @@
         "to",
         "text",
         "sent_at"
+      ]
+    },
+    "TaskComment": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "task_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "author": {
+          "type": "string"
+        },
+        "body": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "task_id",
+        "author",
+        "body",
+        "created_at"
+      ],
+      "description": "One entry in a task's discussion, GitHub-issue style. `author` is the session name for an\nagent and `user` for a person, as `mailbox.send` renders `from`."
+    },
+    "TaskCommentIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "task_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "body": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "task_id",
+        "body"
       ]
     },
     "TaskListIn": {

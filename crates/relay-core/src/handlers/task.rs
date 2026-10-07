@@ -6,8 +6,8 @@ use base64::Engine as _;
 use relay_bus::error::BusError;
 use relay_bus::ops::task::*;
 use relay_bus::types::{
-    Attachment, Column, Id, Label, Priority, Size, Task, TaskCommit, TaskRelation, TaskRollup,
-    TaskState, TaskType, TASK_CHILDREN_MAX, TASK_DEPTH_MAX,
+    Attachment, Column, Id, Label, Priority, Size, Task, TaskComment, TaskCommit, TaskRelation,
+    TaskRollup, TaskState, TaskType, TASK_CHILDREN_MAX, TASK_DEPTH_MAX,
 };
 use relay_bus::Empty;
 use rusqlite::{params, OptionalExtension, Row, Transaction};
@@ -827,7 +827,9 @@ fn activity_sql() -> &'static str {
         let ops = relay_bus::registry::Registry::global()
             .entries()
             .iter()
-            .filter(|op| op.name.starts_with("task.") && matches!(op.meta.kind, relay_bus::registry::OpKind::Mutation))
+            // `task.comment` is read back whole as `comments`; listing it here too reported
+            // every comment twice.
+            .filter(|op| op.name.starts_with("task.") && op.name != "task.comment" && matches!(op.meta.kind, relay_bus::registry::OpKind::Mutation))
             .map(|op| format!("'{}'", op.name))
             .collect::<Vec<_>>()
             .join(",");
@@ -838,6 +840,19 @@ fn activity_sql() -> &'static str {
                OR (op = 'task.dispatch' AND json_extract(result_summary, '$.task.id') = ?2))
              ORDER BY id DESC LIMIT ?4"
         )
+    })
+}
+
+/// The longest comment anyone may post, as for a mailbox message.
+const COMMENT_MAX: usize = 64 * 1024;
+
+fn comment_row(row: &Row) -> rusqlite::Result<TaskComment> {
+    Ok(TaskComment {
+        id: row.get("id")?,
+        task_id: row.get("task_id")?,
+        author: row.get("author")?,
+        body: row.get("body")?,
+        created_at: row.get("created_at")?,
     })
 }
 
@@ -950,12 +965,34 @@ pub fn register(e: &mut Engine) {
             .bus()?;
         let next_message = (messages.len() > limit).then(|| messages[limit - 1].id);
         messages.truncate(limit);
+        let comments = ctx
+            .tx()
+            .prepare_cached("SELECT * FROM task_comments WHERE task_id = ?1 ORDER BY id")
+            .and_then(|mut stmt| stmt.query_map([task.id], comment_row)?.collect::<rusqlite::Result<Vec<_>>>())
+            .bus()?;
         Ok(ActivityOut {
             history,
             messages,
             next_audit,
             next_message,
+            comments,
         })
+    });
+    // Append-only: a comment is not edited or undone, and the task's `updated_at` stays put so
+    // a comment never trips another writer's `expected_updated_at`.
+    e.register::<Comment>(|ctx: &mut Ctx, p| {
+        let task = get_task(ctx.tx(), p.task_id, false)?;
+        if p.body.trim().is_empty() { return Err(BusError::invalid("task.comment_empty", "comment cannot be empty")) }
+        if p.body.len() > COMMENT_MAX {
+            return Err(BusError::invalid("task.comment_size", format!("comment is {} bytes; the limit is {COMMENT_MAX}", p.body.len()))
+                .with_hint("put long material in a note or an attachment and link it"));
+        }
+        let author = crate::handlers::notes::actor_name(ctx)?;
+        ctx.set_project(task.project_id);
+        ctx.tx()
+            .prepare_cached("INSERT INTO task_comments(task_id,author,body,created_at) VALUES (?1,?2,?3,?4) RETURNING *")
+            .and_then(|mut stmt| stmt.query_row(params![task.id, author, p.body, ctx.now], comment_row))
+            .bus()
     });
     e.register::<Get>(|ctx, p| get_task(ctx.tx(), p.task_id, false));
 

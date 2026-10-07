@@ -82,6 +82,48 @@ pub fn task_matches(task: &Value, filters: &Filters, query: &str) -> bool {
             })
     }) && (query.is_empty() || haystack(task).contains(query))
 }
+/// The search box's own language, as GitHub's "filter by keyword or by field": `key:value`
+/// terms narrow by a field (several values comma-separated, any one matching), every other
+/// word must appear in the task's [`haystack`]. Keys: `status`/`is`, `priority`, `size`,
+/// `type`, `label`, `module`, `agent`; `is:blocked` and `no:size`/`no:module`/`no:label`
+/// test for absence. Matching ignores case; an unknown key reads as a plain word.
+pub fn query_matches(task: &Value, query: &str) -> bool {
+    let hay = haystack(task);
+    query.split_whitespace().all(|term| {
+        let term = term.to_lowercase();
+        let Some((key, values)) = term.split_once(':').filter(|(k, v)| !k.is_empty() && !v.is_empty()) else {
+            return hay.contains(&term);
+        };
+        let values: Vec<&str> = values.split(',').filter(|v| !v.is_empty()).collect();
+        let field = |name: &str| text(task, name).to_lowercase();
+        let listed = |name: &str, value: &str| {
+            task[name].as_array().is_some_and(|list| list.iter().filter_map(Value::as_str).any(|v| v.to_lowercase() == value))
+        };
+        values.iter().any(|value| match key {
+            "status" | "column" | "is" if *value == "blocked" => !text(task, "state").is_empty() && text(task, "state") == "blocked",
+            "status" | "column" | "is" => {
+                let column = field("column");
+                column == *value || column_title(&column).to_lowercase().replace(' ', "") == value.replace(['_', '-'], "")
+                    || (*value == "open" && column != "done") || (*value == "closed" && column == "done")
+            }
+            "priority" | "p" => field("priority") == *value,
+            "size" => field("size") == *value,
+            "type" => field("type") == *value,
+            "label" => listed("labels", value),
+            "agent" | "session" => listed("sessions", value),
+            "module" => text(task, "module_name").to_lowercase().contains(value),
+            "no" => match *value {
+                "size" => text(task, "size").is_empty(),
+                "module" => task["module_id"].is_null(),
+                "label" | "labels" => task["labels"].as_array().is_none_or(|l| l.is_empty()),
+                "agent" => task["sessions"].as_array().is_none_or(|l| l.is_empty()),
+                _ => false,
+            },
+            _ => hay.contains(&term),
+        })
+    })
+}
+
 /// What the search box matches against, lowercased: the id, title, body, labels, agents and
 /// module name. A query is expected lowercased too.
 pub fn haystack(task: &Value) -> String {
@@ -170,6 +212,212 @@ pub fn nudge(lane: &[&Value], order: &[i64], id: i64, delta: i64, grouping: &str
     }
     let Some(onto) = neighbour["id"].as_i64() else { return Nudge::Edge };
     Nudge::To(drop_index(order, id, onto, delta > 0))
+}
+
+/// The bus's columns in board order with their headings, written once for the board, the task
+/// pages and the timeline's sentences.
+pub const COLUMN_TITLES: [(&str, &str); 5] = [
+    ("backlog", "Backlog"),
+    ("ready", "Ready"),
+    ("active", "Active"),
+    ("in_review", "In review"),
+    ("done", "Done"),
+];
+/// A column's heading; an unknown name reads as itself.
+pub fn column_title(column: &str) -> &str {
+    COLUMN_TITLES.iter().find(|(name, _)| *name == column).map(|(_, title)| *title).unwrap_or(column)
+}
+
+/// How much work a size is, in points: what a lane's estimate sums. S, M and L step like a
+/// short Fibonacci run, so one large task outweighs a few small ones.
+pub fn points(size: &str) -> u32 {
+    match size {
+        "S" => 1,
+        "M" => 3,
+        "L" => 5,
+        _ => 0,
+    }
+}
+/// The summed [`points`] of `tasks`: a lane head's `Estimate`.
+pub fn estimate<'a>(tasks: impl IntoIterator<Item = &'a Value>) -> u32 {
+    tasks.into_iter().map(|t| points(text(t, "size"))).sum()
+}
+
+/// Who an audit row or comment names, as the timeline shows them: an agent by its session name,
+/// a person as `you`.
+pub fn actor_name(actor: &str) -> String {
+    match actor {
+        "user" | "" => "you".into(),
+        other => other.strip_prefix("agent:").unwrap_or(other).to_string(),
+    }
+}
+
+fn titled(value: &str) -> String {
+    let mut chars = value.chars();
+    chars.next().map(|c| c.to_uppercase().chain(chars).collect()).unwrap_or_default()
+}
+
+/// One `task.activity` history row as the timeline's sentence, its actor left off: `moved this
+/// from Backlog to Ready`. `None` for a row the timeline does not show (a refused or failed
+/// attempt, or a comment, which the timeline draws from its own list).
+pub fn activity_sentence(row: &Value) -> Option<String> {
+    if row["kind"].as_str().is_some_and(|kind| kind != "ok") {
+        return None;
+    }
+    let payload = &row["payload"];
+    let before = &row["undo_op"]["payload"];
+    let other = |key: &str| payload[key].as_i64().map(|id| format!("#{id}")).unwrap_or_else(|| "a task".into());
+    let op = row["op"].as_str().unwrap_or("");
+    Some(match op {
+        "task.comment" => return None,
+        "task.create" => match payload["column"].as_str().filter(|c| *c != "backlog") {
+            Some(column) => format!("created this in {}", column_title(column)),
+            None => "created this".into(),
+        },
+        "task.move" => match (before["column"].as_str(), payload["column"].as_str()) {
+            (Some(from), Some(to)) if from != to => format!("moved this from {} to {}", column_title(from), column_title(to)),
+            (_, Some(to)) => format!("reordered this in {}", column_title(to)),
+            _ => "moved this".into(),
+        },
+        "task.approve" => "closed this as completed by moving it to Done".into(),
+        "task.unapprove" => match payload["column"].as_str() {
+            Some(column) => format!("reopened this into {}", column_title(column)),
+            None => "reopened this".into(),
+        },
+        "task.update" => {
+            let mut changes = Vec::new();
+            for (key, value) in payload.as_object().into_iter().flatten() {
+                let was = before[key.as_str()].as_str().filter(|was| !was.is_empty());
+                let now = value.as_str().filter(|now| !now.is_empty());
+                changes.push(match key.as_str() {
+                    "task_id" | "expected" => continue,
+                    "title" => format!("renamed this to “{}”", now.unwrap_or("")),
+                    "body" => "edited the description".into(),
+                    "changelog" => "edited the changelog".into(),
+                    "module_id" if value.is_null() => "removed the module".into(),
+                    "module_id" => "changed the module".into(),
+                    field @ ("priority" | "size" | "type" | "state") => {
+                        let name = if field == "type" { "type" } else { field };
+                        let show = |v: &str| if field == "state" { v.replace('_', " ") } else { titled(v) };
+                        match (was, now) {
+                            (_, None) => format!("cleared the {name}"),
+                            (Some(was), Some(now)) if was != now => format!("changed the {name} from {} to {}", show(was), show(now)),
+                            (_, Some(now)) => format!("set the {name} to {}", show(now)),
+                        }
+                    }
+                    other => format!("changed {}", other.replace('_', " ")),
+                });
+            }
+            if changes.is_empty() {
+                return None;
+            }
+            changes.join(", ")
+        }
+        "task.label.add" => format!("added the label {}", payload["label"].as_str().unwrap_or("")),
+        "task.label.remove" => format!("removed the label {}", payload["label"].as_str().unwrap_or("")),
+        "task.dispatch" => match payload["session"].as_str().filter(|s| !s.is_empty()) {
+            Some(session) => format!("dispatched this to {session}"),
+            None => "dispatched this to a new agent".into(),
+        },
+        "task.parent.set" if payload["parent_id"].is_null() => "removed the parent".into(),
+        "task.parent.set" => format!("set the parent to {}", other("parent_id")),
+        "task.relate" | "task.unrelate" => {
+            let relation = match payload["relation"].as_str() {
+                Some("duplicate_of") => "a duplicate of",
+                _ => "blocked by",
+            };
+            let verb = if op == "task.relate" { "marked this as" } else { "unmarked this as" };
+            format!("{verb} {relation} {}", other("other_id"))
+        }
+        "task.link_commit" => format!(
+            "linked commit {}",
+            payload["sha"].as_str().unwrap_or("").chars().take(7).collect::<String>()
+        ),
+        "task.attach" => match payload["name"].as_str() {
+            Some(name) => format!("attached {name}"),
+            None => "attached an image".into(),
+        },
+        "task.detach" => "removed an attachment".into(),
+        "task.attachment.restore" => "restored an attachment".into(),
+        "task.delete" => "deleted this".into(),
+        "task.restore" => "restored this".into(),
+        "task.changelog.write" => "wrote the changelog".into(),
+        other => format!("ran {}", other.strip_prefix("task.").unwrap_or(other).replace(['.', '_'], " ")),
+    })
+}
+
+fn escape(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+/// `**bold**`, `*italic*` and `` `code` `` within one line, escaped for Pango. Underscores are
+/// left alone: they sit inside identifiers far more often than they mean emphasis.
+fn inline(line: &str) -> String {
+    let mut out = String::new();
+    let ticks = line.matches('`').count();
+    for (index, part) in line.split('`').enumerate() {
+        // Odd parts sat between backticks; an unclosed backtick leaves the last part as text.
+        if index % 2 == 1 && index < ticks {
+            out.push_str(&format!("<tt>{}</tt>", escape(part)));
+            continue;
+        }
+        if index % 2 == 1 {
+            out.push('`');
+        }
+        let mut text = escape(part);
+        for (mark, tag) in [("**", "b"), ("*", "i")] {
+            let pieces: Vec<&str> = text.split(mark).collect();
+            if pieces.len() < 3 {
+                continue;
+            }
+            let mut joined = String::new();
+            let pairs = (pieces.len() - 1) / 2 * 2;
+            for (i, piece) in pieces.iter().enumerate() {
+                if i > 0 {
+                    joined.push_str(&if i > pairs { mark.to_string() } else if i % 2 == 1 { format!("<{tag}>") } else { format!("</{tag}>") });
+                }
+                joined.push_str(piece);
+            }
+            text = joined;
+        }
+        out.push_str(&text);
+    }
+    out
+}
+/// A task's Markdown as Pango markup, for a label: headings, lists, task boxes, quotes, fenced
+/// code and the inline marks. Anything else reads as its plain text, escaped.
+pub fn markdown_markup(source: &str) -> String {
+    let mut lines = Vec::new();
+    let mut fenced = false;
+    for line in source.trim_end().lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            lines.push(format!("<tt>{}</tt>", escape(line)));
+            continue;
+        }
+        let indent = " ".repeat((line.len() - trimmed.len()).min(8));
+        let heading = trimmed.chars().take_while(|c| *c == '#').count();
+        lines.push(if (1..=6).contains(&heading) && trimmed[heading..].starts_with(' ') {
+            let size = match heading { 1 => "x-large", 2 => "large", _ => "medium" };
+            format!("<span size=\"{size}\" weight=\"bold\">{}</span>", inline(trimmed[heading..].trim()))
+        } else if let Some(rest) = ["- [ ] ", "* [ ] "].iter().find_map(|p| trimmed.strip_prefix(p)) {
+            format!("{indent}☐  {}", inline(rest))
+        } else if let Some(rest) = ["- [x] ", "- [X] ", "* [x] "].iter().find_map(|p| trimmed.strip_prefix(p)) {
+            format!("{indent}☑  {}", inline(rest))
+        } else if let Some(rest) = ["- ", "* ", "+ "].iter().find_map(|p| trimmed.strip_prefix(p)) {
+            format!("{indent}•  {}", inline(rest))
+        } else if let Some(rest) = trimmed.strip_prefix("> ").or_else(|| (trimmed == ">").then_some("")) {
+            format!("<i>│  {}</i>", inline(rest))
+        } else if trimmed.chars().all(|c| c == '-' || c == '*') && trimmed.len() >= 3 {
+            "──────────".into()
+        } else {
+            format!("{indent}{}", inline(trimmed))
+        });
+    }
+    lines.join("\n")
 }
 
 #[cfg(test)]
@@ -378,5 +626,52 @@ mod tests {
         // From another column (7, in backlog) onto 5's lower part.
         let at = drop_index(&order, 7, 5, true);
         assert_eq!(moved(&order, 7, at), [1, 2, 3, 4, 5, 7, 6]);
+    }
+
+    #[test]
+    fn estimates_sum_size_points() {
+        let tasks = [json!({"size":"S"}), json!({"size":"L"}), json!({"size":null}), json!({"size":"M"})];
+        assert_eq!(estimate(&tasks), 9);
+        assert_eq!(estimate(&[] as &[Value]), 0);
+        assert_eq!(points(""), 0);
+    }
+    #[test]
+    fn activity_reads_as_sentences() {
+        let moved = json!({"op":"task.move","kind":"ok","payload":{"task_id":1,"column":"ready"},"undo_op":{"op":"task.move","payload":{"task_id":1,"column":"backlog"}}});
+        assert_eq!(activity_sentence(&moved).unwrap(), "moved this from Backlog to Ready");
+        let reordered = json!({"op":"task.move","kind":"ok","payload":{"task_id":1,"column":"ready","position":0},"undo_op":{"op":"task.move","payload":{"column":"ready"}}});
+        assert_eq!(activity_sentence(&reordered).unwrap(), "reordered this in Ready");
+        let update = json!({"op":"task.update","kind":"ok","payload":{"task_id":1,"priority":"high","size":null,"expected":{}},"undo_op":{"payload":{"priority":"medium","size":"S"}}});
+        assert_eq!(activity_sentence(&update).unwrap(), "changed the priority from Medium to High, cleared the size");
+        let refused = json!({"op":"task.move","kind":"refused","payload":{}});
+        assert_eq!(activity_sentence(&refused), None);
+        assert_eq!(activity_sentence(&json!({"op":"task.comment","kind":"ok","payload":{}})), None);
+        assert_eq!(activity_sentence(&json!({"op":"task.approve","kind":"ok","payload":{"task_id":1}})).unwrap(), "closed this as completed by moving it to Done");
+        assert_eq!(actor_name("agent:quick-newt"), "quick-newt");
+        assert_eq!(actor_name("user"), "you");
+    }
+    #[test]
+    fn markdown_becomes_escaped_markup() {
+        assert_eq!(markdown_markup("# Title"), "<span size=\"x-large\" weight=\"bold\">Title</span>");
+        assert_eq!(markdown_markup("a **b** *c* `d<e>` f_g_h"), "a <b>b</b> <i>c</i> <tt>d&lt;e&gt;</tt> f_g_h");
+        assert_eq!(markdown_markup("- [ ] todo\n- [x] done\n- item"), "☐  todo\n☑  done\n•  item");
+        assert_eq!(markdown_markup("```\nlet a = 1 < 2;\n```"), "<tt>let a = 1 &lt; 2;</tt>");
+        // An unpaired mark stays as typed.
+        assert_eq!(markdown_markup("2 * 3 and `open"), "2 * 3 and `open");
+    }
+
+    #[test]
+    fn search_filters_by_field_and_keyword() {
+        let task = json!({"id":4,"title":"Gallery thumbnails","column":"in_review","priority":"high","size":"M","type":"bug",
+            "labels":["UI","perf"],"sessions":["quick-newt"],"module_name":"Gallery","module_id":2,"state":"none"});
+        for query in ["", "gallery", "priority:high", "p:urgent,high", "size:m", "label:ui", "status:inreview", "is:open",
+            "module:gal thumb", "agent:quick-newt type:bug", "#4"] {
+            assert!(query_matches(&task, query), "{query} should match");
+        }
+        for query in ["priority:low", "size:s", "label:docs", "is:closed", "no:module", "gallery missing", "module:profile"] {
+            assert!(!query_matches(&task, query), "{query} should not match");
+        }
+        // A stray colon is a word, not a field.
+        assert!(!query_matches(&task, "nothing:"));
     }
 }
