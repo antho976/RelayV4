@@ -1298,7 +1298,7 @@ impl Editor {
             } else {
                 glyph.append(&project_files::file_image(&path, 14));
                 let stamp = format!("{}:{}", entry["size"], entry["modified_at"]);
-                self.bind_image_hover(ui, &row, &path, stamp);
+                self.bind_image_hover(ui, &row, &path, stamp, entry["size"].as_u64());
                 let e = self.clone();
                 let weak = Rc::downgrade(ui);
                 row.connect_clicked(move |row| {

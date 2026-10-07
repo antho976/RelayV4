@@ -1156,7 +1156,7 @@ impl Editor {
                 }
             }
         });
-        self.bind_image_hover(ui, &open, &path, format!("{code}:{}", self.git_revision.get()));
+        self.bind_image_hover(ui, &open, &path, format!("{code}:{}", self.git_revision.get()), None);
         row.append(&open);
         let (icon, caption, op) = if staged {
             ("minus", "Unstage changes", "git.unstage")

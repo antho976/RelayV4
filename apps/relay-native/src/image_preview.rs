@@ -394,6 +394,7 @@ impl Editor {
         row: &impl IsA<gtk::Widget>,
         path: &str,
         stamp: String,
+        size: Option<u64>,
     ) {
         if !is_image(path) {
             return;
@@ -487,6 +488,14 @@ impl Editor {
                 let worktree = editor.worktree.borrow().clone();
                 let key = format!("{project}\0{worktree}\0{path}\0{stamp}");
                 if let Some(thumb) = cached(&key) {
+                    show_thumb(&card, &picture, &note, &thumb);
+                    return;
+                }
+                // The tree already knows the size: a file the engine would only truncate is not
+                // worth 16 MiB on the wire to learn that.
+                if size.is_some_and(|size| size > MAX_BYTES) {
+                    let thumb = Thumb { texture: None, caption: "No preview · Image exceeds the 16 MiB preview limit.".into() };
+                    remember(key, thumb.clone());
                     show_thumb(&card, &picture, &note, &thumb);
                     return;
                 }
