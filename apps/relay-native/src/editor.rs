@@ -85,7 +85,22 @@ pub struct Editor {
     handlers: Cell<bool>,
     busy: Cell<bool>,
     pub(crate) tree_revision: Cell<u64>,
+    /// What the explorer last drew (`load_tree`); an identical listing is not rebuilt.
+    tree_signature: Cell<u64>,
+    /// Entries drawn per folder beyond the first `TREE_PAGE`, raised by "Show more".
+    tree_limits: RefCell<std::collections::BTreeMap<String, usize>>,
+    /// Where the next `read_file` puts the caret: 1-based line, 1-based byte column, and the
+    /// length in characters to select (a search hit).
+    goto: Cell<Option<(u32, u32, usize)>>,
+    /// Shown when the open document changed on disk while it has unsaved edits.
+    conflict_bar: gtk::Box,
+    conflict_label: gtk::Label,
+    /// The on-disk text the conflict bar was raised for.
+    disk_text: RefCell<Option<String>>,
+    disk_check_pending: Cell<bool>,
 }
+/// Entries of one folder the explorer draws before a "Show more" row.
+const TREE_PAGE: usize = 500;
 struct TreeLoadGuard(Rc<Editor>, Rc<Ui>);
 impl Drop for TreeLoadGuard {
     fn drop(&mut self) {
@@ -229,6 +244,22 @@ impl Editor {
         find_bar.append(&replacement);
         content.append(&find_bar);
         find_bar.set_visible(false);
+        let conflict_bar = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        conflict_bar.add_css_class("toolbar");
+        conflict_bar.set_widget_name("project-disk-conflict");
+        let conflict_label = label("", "body");
+        conflict_label.set_hexpand(true);
+        conflict_label.set_wrap(true);
+        conflict_label.set_xalign(0.0);
+        conflict_bar.append(&conflict_label);
+        let reload_key = button("Reload from disk", "quiet");
+        reload_key.set_tooltip_text(Some("Drop your edits and show the file as it is on disk"));
+        let keep_key = button("Keep my edits", "quiet");
+        keep_key.set_tooltip_text(Some("Saving will replace the version on disk"));
+        conflict_bar.append(&reload_key);
+        conflict_bar.append(&keep_key);
+        conflict_bar.set_visible(false);
+        content.append(&conflict_bar);
         let search_settings = sourceview5::SearchSettings::new();
         search_settings.set_wrap_around(true);
         let search_context = sourceview5::SearchContext::new(&buffer, Some(&search_settings));
@@ -384,6 +415,30 @@ impl Editor {
             handlers: Cell::new(false),
             busy: Cell::new(false),
             tree_revision: Cell::new(0),
+            tree_signature: Cell::new(0),
+            tree_limits: RefCell::default(),
+            goto: Cell::new(None),
+            conflict_bar,
+            conflict_label,
+            disk_text: RefCell::new(None),
+            disk_check_pending: Cell::new(false),
+        });
+        let weak = Rc::downgrade(&editor);
+        keep_key.connect_clicked(move |_| {
+            if let Some(e) = weak.upgrade() {
+                // The disk version becomes the base the save is checked against, so the next
+                // Save writes the draft over it instead of failing as a conflict.
+                if let Some(disk) = e.disk_text.borrow_mut().take() {
+                    *e.original.borrow_mut() = disk;
+                }
+                e.conflict_bar.set_visible(false);
+            }
+        });
+        let weak = Rc::downgrade(&editor);
+        reload_key.connect_clicked(move |_| {
+            if let Some(e) = weak.upgrade() {
+                e.discard.emit_clicked();
+            }
         });
         let weak = Rc::downgrade(&editor);
         inline_key.connect_toggled(move |key| {
@@ -478,7 +533,6 @@ impl Editor {
         self.buffer.is_modified() || self.busy.get() || self.git_busy.get()
     }
     fn set_busy(&self, busy: bool) {
-        self.busy.set(busy);
         if busy || !self.agents_visible() {
             self.content_stack
                 .set_visible_child_name(if self.image_mode.get() {
@@ -489,6 +543,12 @@ impl Editor {
                     "empty"
                 });
         }
+        self.set_locked(busy);
+    }
+    /// Busy without changing what the main area shows: an explorer operation must not pull
+    /// the agents view away (RA-215).
+    fn set_locked(&self, busy: bool) {
+        self.busy.set(busy);
         self.view
             .set_editable(!busy && !self.diff.get() && !self.image_mode.get() && !self.path.borrow().is_empty());
         self.save.set_sensitive(!busy && self.buffer.is_modified());
@@ -503,6 +563,7 @@ impl Editor {
         self.scope_project.set(0);
         self.selected_path.borrow_mut().clear();
         self.expanded.borrow_mut().clear();
+        self.tree_limits.borrow_mut().clear();
         self.show_agents();
         self.commit_message.buffer().set_text("");
         self.branch_name.set_text("");
@@ -528,7 +589,10 @@ impl Editor {
         self.directory.borrow_mut().clear();
         self.view.set_editable(false);
         self.set_busy(false);
+        self.disk_text.borrow_mut().take();
+        self.conflict_bar.set_visible(false);
         clear(&self.tree);
+        self.tree_signature.set(0);
         self.caption.set_text("Open a file");
     }
     /// A file, git, worktree or integration event: `event` is its name and payload, and
@@ -537,9 +601,10 @@ impl Editor {
         if event.is_some_and(|(ev, payload)| !self.concerns(ui, ev, payload)) {
             return;
         }
-        if matches!(ui.page.borrow().as_str(), "code" | "agents")
-            && !self.invalidate_pending.replace(true)
-        {
+        // An open document is compared with the disk on any page; the panels refresh only
+        // where they are seen.
+        let shown = matches!(ui.page.borrow().as_str(), "code" | "agents");
+        if (shown || !self.path.borrow().is_empty()) && !self.invalidate_pending.replace(true) {
             let weak = Rc::downgrade(ui);
             let e = self.clone();
             glib::timeout_add_local_once(std::time::Duration::from_millis(1000), move || {
@@ -548,11 +613,90 @@ impl Editor {
                     if matches!(ui.page.borrow().as_str(), "code" | "agents") {
                         e.refresh_shown(&ui);
                     }
+                    e.check_disk(&ui);
                 }
             });
         }
-        if !self.path.borrow().is_empty() && !self.busy.get() && self.buffer.is_modified() {
-            ui.show_error("Files changed on disk. Save checks for conflicting edits; discard reloads the file.");
+    }
+    /// Compare the open document with its file on disk. Events carry no paths, and git or an
+    /// agent can rewrite the file under any of them, so one read here is what tells a real
+    /// change from the echo of our own save or a neighbour's edit. A clean document takes the
+    /// new text in place; an edited one raises the conflict bar once per disk version.
+    fn check_disk(self: &Rc<Self>, ui: &Rc<Ui>) {
+        let path = self.path.borrow().clone();
+        if path.is_empty()
+            || self.diff.get()
+            || self.image_mode.get()
+            || self.busy.get()
+            || self.disk_check_pending.replace(true)
+        {
+            return;
+        }
+        let project = ui.project.get();
+        let worktree = self.worktree.borrow().clone();
+        let revision = self.revision.get();
+        let e = self.clone();
+        let ui = ui.clone();
+        glib::spawn_future_local(async move {
+            let result = ui
+                .call(
+                    "file.read",
+                    json!({"project_id":project,"worktree":optional_scope(&worktree),"path":path,"max_bytes":1048576}),
+                )
+                .await;
+            e.disk_check_pending.set(false);
+            if e.revision.get() != revision
+                || e.busy.get()
+                || !e.matches(&ui, project, &worktree)
+                || *e.path.borrow() != path
+            {
+                return;
+            }
+            // A removed, binary or oversized file is left to Save, whose check reports it.
+            let Some(disk) = result
+                .ok()
+                .filter(|v| v["truncated"] != true)
+                .and_then(|v| v["text"].as_str().map(str::to_owned))
+            else {
+                return;
+            };
+            if disk == *e.original.borrow() {
+                e.disk_text.borrow_mut().take();
+                e.conflict_bar.set_visible(false);
+                return;
+            }
+            if !e.buffer.is_modified() {
+                e.reload_in_place(&disk);
+                return;
+            }
+            if e.disk_text.borrow().as_deref() == Some(disk.as_str()) {
+                return;
+            }
+            *e.disk_text.borrow_mut() = Some(disk);
+            e.conflict_label.set_text(&format!(
+                "{path} changed on disk while you were editing it. Reload it, or keep your edits and save over it."
+            ));
+            e.conflict_bar.set_visible(true);
+        });
+    }
+    /// Replace a clean document's text with the disk's, keeping the caret line and scroll.
+    fn reload_in_place(&self, disk: &str) {
+        let cursor = self.buffer.iter_at_mark(&self.buffer.get_insert());
+        let (line, offset) = (cursor.line(), cursor.line_offset());
+        let scroll = self.view.vadjustment().map(|a| (a.value(), a));
+        self.buffer.set_text(disk);
+        self.buffer.set_modified(false);
+        *self.original.borrow_mut() = disk.into();
+        self.disk_text.borrow_mut().take();
+        self.conflict_bar.set_visible(false);
+        let at = self
+            .buffer
+            .iter_at_line_offset(line, offset)
+            .or_else(|| self.buffer.iter_at_line(line))
+            .unwrap_or_else(|| self.buffer.end_iter());
+        self.buffer.place_cursor(&at);
+        if let Some((value, adjustment)) = scroll {
+            glib::idle_add_local_once(move || adjustment.set_value(value));
         }
     }
     /// Whether an event can change what this editor shows. Watcher events carry no envelope
@@ -655,15 +799,87 @@ impl Editor {
             if !e.matches(&ui, project, &worktree) || e.tree_revision.get() != revision {
                 return;
             }
-            match result {
-                Ok(v) => {
-                    *e.directory.borrow_mut() = directory.clone();
-                    clear(&e.tree);
-                    e.render_tree(&ui, &e.tree, rows(&v, "entries"), revision);
+            let v = match result {
+                Ok(v) => v,
+                Err(err) => return ui.show_error(&err.to_string()),
+            };
+            // Every open folder is listed before a widget is touched, so the tree is rebuilt
+            // in one go: rebuilding a level per round trip let the content collapse and the
+            // view snap to the top on every refresh (RA-209).
+            let mut prefetched = std::collections::BTreeMap::new();
+            for folder in e.open_folders(&directory) {
+                let listing = ui
+                    .call(
+                        "file.tree",
+                        json!({"project_id":project,"worktree":optional_scope(&worktree),"path":folder,"depth":1,"git_badges":true}),
+                    )
+                    .await;
+                if !e.matches(&ui, project, &worktree) || e.tree_revision.get() != revision {
+                    return;
                 }
-                Err(err) => ui.show_error(&err.to_string()),
+                // A folder that cannot be listed now is fetched when it is drawn, as before.
+                if let Ok(listing) = listing {
+                    prefetched.insert(folder, rows(&listing, "entries"));
+                }
+            }
+            let signature = {
+                use std::hash::{Hash, Hasher};
+                let mut hash = std::collections::hash_map::DefaultHasher::new();
+                directory.hash(&mut hash);
+                v["entries"].to_string().hash(&mut hash);
+                for (folder, entries) in &prefetched {
+                    folder.hash(&mut hash);
+                    for entry in entries {
+                        entry.to_string().hash(&mut hash);
+                    }
+                }
+                e.tree_limits.borrow().hash(&mut hash);
+                e.path.borrow().hash(&mut hash);
+                e.selected_path.borrow().hash(&mut hash);
+                hash.finish()
+            };
+            // Nothing the explorer draws changed: the rows on screen stay, with their focus
+            // and any open menu.
+            if signature == e.tree_signature.get() && *e.directory.borrow() == directory {
+                return;
+            }
+            *e.directory.borrow_mut() = directory.clone();
+            let scroll = e
+                .tree
+                .ancestor(gtk::ScrolledWindow::static_type())
+                .and_downcast::<gtk::ScrolledWindow>()
+                .map(|s| s.vadjustment())
+                .map(|a| (a.value(), a));
+            clear(&e.tree);
+            e.render_tree(&ui, &e.tree, &directory, rows(&v, "entries"), revision, &mut prefetched);
+            e.tree_signature.set(signature);
+            if let Some((value, adjustment)) = scroll {
+                adjustment.set_value(value);
+                glib::idle_add_local_once(move || adjustment.set_value(value));
             }
         });
+    }
+    /// Expanded folders under `directory` whose every ancestor is expanded too: the ones a
+    /// rebuild draws open.
+    fn open_folders(&self, directory: &str) -> Vec<String> {
+        let expanded = self.expanded.borrow();
+        expanded
+            .iter()
+            .filter(|path| {
+                let rest = if directory.is_empty() {
+                    Some(path.as_str())
+                } else {
+                    path.strip_prefix(directory).and_then(|rest| rest.strip_prefix('/'))
+                };
+                let Some(rest) = rest else {
+                    return false;
+                };
+                let base = path.len() - rest.len();
+                rest.match_indices('/')
+                    .all(|(at, _)| expanded.contains(&path[..base + at]))
+            })
+            .cloned()
+            .collect()
     }
     fn open(self: &Rc<Self>, ui: &Rc<Ui>, path: String) {
         self.read_file(ui, path, false);
@@ -687,6 +903,7 @@ impl Editor {
         );
     }
     fn read_file(self: &Rc<Self>, ui: &Rc<Ui>, path: String, discard: bool) {
+        let goto = self.goto.take();
         if self.busy.get() || (self.buffer.is_modified() && !discard) {
             ui.show_error("Save or discard this file's changes before opening another file.");
             return;
@@ -736,11 +953,16 @@ impl Editor {
                     *e.selected_path.borrow_mut() = path.clone();
                     e.selected_directory.set(false);
                     *e.original.borrow_mut() = content.into();
+                    e.disk_text.borrow_mut().take();
+                    e.conflict_bar.set_visible(false);
                     e.set_busy(false);
                     let manager = sourceview5::LanguageManager::default();
                     e.buffer
                         .set_language(manager.guess_language(Some(&path), None).as_ref());
                     e.caption.set_text(&path);
+                    if let Some((line, col, length)) = goto {
+                        e.reveal(line, col, length);
+                    }
                 }
                 Err(err) => ui.show_error(&err.to_string()),
             }
@@ -785,15 +1007,82 @@ impl Editor {
                 Ok(_) => {
                     *e.original.borrow_mut() = content;
                     e.buffer.set_modified(false);
+                    e.disk_text.borrow_mut().take();
+                    e.conflict_bar.set_visible(false);
                     e.refresh_git(&ui);
                 }
                 Err(err) => {
                     ui.show_error(&err.to_string());
                     e.save.set_sensitive(true);
+                    // The file changed under the draft: offer reload or keep-and-overwrite
+                    // instead of a Save that fails the same way again (RA-208).
+                    if matches!(&err, crate::client::Error::Bus(bus) if bus.code == "file.edit_conflict")
+                    {
+                        e.check_disk(&ui);
+                    }
                 }
             }
         });
     }
+}
+
+impl Editor {
+    /// Put the caret on a 1-based line and byte column, select `length` characters and scroll
+    /// there. The column is a byte offset, cut back to a character boundary.
+    fn reveal(&self, line: u32, col: u32, length: usize) {
+        let Some(mut start) = self.buffer.iter_at_line(line.saturating_sub(1) as i32) else {
+            return;
+        };
+        let mut line_end = start;
+        if !line_end.ends_line() {
+            line_end.forward_to_line_end();
+        }
+        let text = self.buffer.text(&start, &line_end, true);
+        let mut byte = (col.saturating_sub(1) as usize).min(text.len());
+        while !text.is_char_boundary(byte) {
+            byte -= 1;
+        }
+        start.forward_chars(text[..byte].chars().count() as i32);
+        let mut end = start;
+        end.forward_chars(length as i32);
+        if end > line_end {
+            end = line_end;
+        }
+        self.buffer.select_range(&start, &end);
+        self.view.grab_focus();
+        // The view may not have its size yet right after the text was set.
+        let view = self.view.clone();
+        let mark = self.buffer.get_insert();
+        glib::idle_add_local_once(move || view.scroll_to_mark(&mark, 0.1, true, 0.0, 0.3));
+    }
+}
+
+/// At most this many characters of a search hit's line are drawn, around the match.
+const SNIPPET_CHARS: usize = 240;
+
+/// The part of `line` around the 1-based byte column `col` that a search row shows: a hit in a
+/// minified bundle or source map is one line of megabytes, which no label should shape.
+fn snippet(line: &str, col: u32) -> String {
+    let mut at = (col.saturating_sub(1) as usize).min(line.len());
+    while !line.is_char_boundary(at) {
+        at -= 1;
+    }
+    // A quarter of the room is context before the match.
+    let start = line[..at]
+        .char_indices()
+        .rev()
+        .nth(SNIPPET_CHARS / 4 - 1)
+        .map_or(0, |(i, _)| i);
+    let end = line[start..]
+        .char_indices()
+        .nth(SNIPPET_CHARS)
+        .map_or(line.len(), |(i, _)| start + i);
+    format!(
+        "{}{}{}",
+        if start > 0 { "…" } else { "" },
+        line[start..end].trim(),
+        if end < line.len() { "…" } else { "" }
+    )
 }
 
 fn optional_scope(worktree: &str) -> Option<&str> {
@@ -809,13 +1098,19 @@ impl Editor {
         self: &Rc<Self>,
         ui: &Rc<Ui>,
         target: &gtk::Box,
+        directory: &str,
         entries: Vec<Value>,
         revision: u64,
+        prefetched: &mut std::collections::BTreeMap<String, Vec<Value>>,
     ) {
         if entries.is_empty() {
             target.append(&label("Empty folder", "tree-empty"));
         }
-        for entry in entries {
+        // Each row is a dozen widgets and controllers: a folder of thousands is drawn a page
+        // at a time (RA-210).
+        let limit = self.tree_limits.borrow().get(directory).copied().unwrap_or(TREE_PAGE);
+        let hidden = entries.len().saturating_sub(limit);
+        for entry in entries.into_iter().take(limit) {
             let path = text(&entry, "path").to_string();
             let directory = text(&entry, "kind") == "dir";
             let depth = path.matches('/').count();
@@ -864,6 +1159,8 @@ impl Editor {
             if directory {
                 let children = gtk::Box::new(gtk::Orientation::Vertical, 0);
                 children.set_visible(false);
+                // A drop on any row inside this folder lands in this folder, not the root.
+                self.bind_folder_drop(ui, &children, &path);
                 let node = gtk::Box::new(gtk::Orientation::Vertical, 0);
                 node.append(&row);
                 node.append(&children);
@@ -886,6 +1183,7 @@ impl Editor {
                 };
                 paint(false);
                 let loaded = Rc::new(Cell::new(false));
+                let drawn = (children.clone(), loaded.clone());
                 let e = self.clone();
                 let weak = Rc::downgrade(ui);
                 let child_path = path.clone();
@@ -894,6 +1192,10 @@ impl Editor {
                     paint(open);
                     if !open {
                         e.expanded.borrow_mut().remove(&child_path);
+                        // Listed afresh when reopened: a refresh with the same listing
+                        // keeps these rows, so what they held could be stale by then.
+                        loaded.set(false);
+                        clear(&children);
                         return;
                     }
                     e.expanded.borrow_mut().insert(child_path.clone());
@@ -910,14 +1212,26 @@ impl Editor {
                     let e = e.clone();
                     let target = children.clone();
                     let loaded = loaded.clone();
+                    let folder = child_path.clone();
                     glib::spawn_future_local(async move {
                         let result = ui.call("file.tree", payload).await;
-                        if !e.matches(&ui, project, &worktree) || e.tree_revision.get() != revision
+                        if !e.matches(&ui, project, &worktree)
+                            || e.tree_revision.get() != revision
+                            || !loaded.get()
                         {
                             return;
                         }
+                        // A close and reopen while this ran asked again; the last answer wins.
+                        clear(&target);
                         match result {
-                            Ok(v) => e.render_tree(&ui, &target, rows(&v, "entries"), revision),
+                            Ok(v) => e.render_tree(
+                                &ui,
+                                &target,
+                                &folder,
+                                rows(&v, "entries"),
+                                revision,
+                                &mut Default::default(),
+                            ),
                             Err(err) => {
                                 loaded.set(false);
                                 ui.show_error(&err.to_string());
@@ -936,6 +1250,11 @@ impl Editor {
                     click(open);
                 });
                 if self.expanded.borrow().contains(&path) {
+                    if let Some(entries) = prefetched.remove(&path) {
+                        let (children, loaded) = drawn;
+                        loaded.set(true);
+                        self.render_tree(ui, &children, &path, entries, revision, prefetched);
+                    }
                     toggle(true);
                 }
             } else {
@@ -954,6 +1273,33 @@ impl Editor {
                 });
                 target.append(&row);
             }
+        }
+        if hidden > 0 {
+            let more = button("", "tree-row");
+            more.set_widget_name("project-files-more");
+            let content = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            let depth = if directory.is_empty() { 0 } else { directory.matches('/').count() + 1 };
+            if depth > 0 {
+                content.append(&project_files::indent_guides(depth));
+            }
+            let caption = label(
+                &format!("Show {} more ({hidden} hidden)", hidden.min(TREE_PAGE)),
+                "tree-empty",
+            );
+            caption.set_margin_start(project_files::INDENT + 4);
+            content.append(&caption);
+            more.set_child(Some(&content));
+            let e = self.clone();
+            let weak = Rc::downgrade(ui);
+            let folder = directory.to_owned();
+            more.connect_clicked(move |_| {
+                if let Some(ui) = weak.upgrade() {
+                    e.tree_limits.borrow_mut().insert(folder.clone(), limit + TREE_PAGE);
+                    let directory = e.directory.borrow().clone();
+                    e.load_tree(&ui, Some(directory));
+                }
+            });
+            target.append(&more);
         }
     }
     fn matches(&self, ui: &Ui, project: i64, worktree: &str) -> bool {
@@ -1037,7 +1383,7 @@ impl Editor {
                 e.scope_picker(&ui, button);
             }
         });
-        self.bind_tree_drop(ui, &self.tree, "");
+        self.bind_folder_drop(ui, &self.tree, "");
         let e = self.clone();
         let weak = Rc::downgrade(ui);
         self.search.connect_activate(move |_| {
@@ -1082,6 +1428,17 @@ impl Editor {
             }
         });
         self.file_actions.append(&refresh);
+        let trash = crate::app::icon_button("history", "Recently trashed files");
+        trash.add_css_class("explorer-key");
+        trash.set_widget_name("project-files-trash");
+        let e = self.clone();
+        let weak = Rc::downgrade(ui);
+        trash.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                e.show_trash(&ui);
+            }
+        });
+        self.file_actions.append(&trash);
         let collapse = crate::app::icon_button("collapse", "Collapse folders");
         collapse.add_css_class("explorer-key");
         collapse.set_widget_name("project-files-collapse");
@@ -1218,6 +1575,7 @@ impl Editor {
             match result {
                 Ok(v) => {
                     clear(&e.tree);
+                    e.tree_signature.set(0);
                     let hits = rows(&v, "hits");
                     e.tree.append(&label(
                         &format!(
@@ -1253,15 +1611,31 @@ impl Editor {
                         place.set_ellipsize(gtk::pango::EllipsizeMode::Start);
                         head.append(&place);
                         card.append(&head);
-                        let snippet = label(text(&hit, "text").trim(), "search-snippet");
+                        let line = hit["line"].as_u64().unwrap_or(1) as u32;
+                        let col = hit["col"].as_u64().unwrap_or(1) as u32;
+                        let shown = snippet(text(&hit, "text"), col);
+                        let snippet = label(&shown, "search-snippet");
                         snippet.set_ellipsize(gtk::pango::EllipsizeMode::End);
                         card.append(&snippet);
                         b.set_child(Some(&card));
-                        b.set_tooltip_text(Some(text(&hit, "text")));
+                        b.set_tooltip_text(Some(&shown));
                         let ed = e.clone();
                         let weak = Rc::downgrade(&ui);
+                        let length = query.chars().count();
                         b.connect_clicked(move |_| {
                             if let Some(ui) = weak.upgrade() {
+                                // The open document is only moved within: re-reading it
+                                // would be refused while it has edits.
+                                if *ed.path.borrow() == path
+                                    && !ed.diff.get()
+                                    && !ed.image_mode.get()
+                                    && !ed.busy.get()
+                                {
+                                    ed.show_files();
+                                    ed.reveal(line, col, length);
+                                    return;
+                                }
+                                ed.goto.set(Some((line, col, length)));
                                 ed.open(&ui, path.clone());
                             }
                         });
@@ -1322,7 +1696,9 @@ impl Editor {
         folder.set_widget_name("project-file-folder");
         if op == "file.delete" {
             let copy = label(
-                &format!("{path}\nThe file can be restored from Relay trash."),
+                &format!(
+                    "{path}\nRelay keeps a copy inside this checkout. Restore it from Recently trashed in the explorer; removing the checkout removes the copy."
+                ),
                 "body",
             );
             copy.set_wrap(true);
@@ -1362,38 +1738,28 @@ impl Editor {
                 "file.rename" => json!({"path":path,"new_name":value}),
                 _ => json!({"path":path}),
             };
-            e.set_busy(true);
+            e.set_locked(true);
             let result = ui.call(op, e.payload(&ui, extra)).await;
-            e.set_busy(false);
+            e.set_locked(false);
             if !e.matches(&ui, project, &worktree) {
                 return;
             }
             match result {
                 Ok(v) => {
-                    if op == "file.rename" && text(&v, "kind") == "dir" {
-                        let new_path = text(&v, "path");
-                        let expanded = e
-                            .expanded
-                            .borrow()
-                            .iter()
-                            .map(|item| {
-                                item.strip_prefix(&path)
-                                    .filter(|suffix| suffix.is_empty() || suffix.starts_with('/'))
-                                    .map(|suffix| format!("{new_path}{suffix}"))
-                                    .unwrap_or_else(|| item.clone())
-                            })
-                            .collect();
-                        *e.expanded.borrow_mut() = expanded;
-                    }
                     *e.selected_path.borrow_mut() = if op == "file.delete" {
                         String::new()
                     } else {
                         text(&v, "path").to_owned()
                     };
                     e.selected_directory.set(text(&v, "kind") == "dir");
-                    e.clear_document();
-                    e.load_tree(&ui, None);
-                    e.refresh_git(&ui);
+                    match op {
+                        "file.create" => {
+                            e.load_tree(&ui, None);
+                            e.refresh_git(&ui);
+                        }
+                        "file.rename" => e.follow_change(&ui, &path, Some(text(&v, "path"))),
+                        _ => e.follow_change(&ui, &path, None),
+                    }
                     if op == "file.delete" {
                         // The ID is also kept by the engine; no permanent deletion is offered here.
                         let id = v["trash_id"].as_i64().unwrap_or(0);
@@ -1412,13 +1778,7 @@ impl Editor {
                             let button = button.clone();
                             let ed = ed.clone();
                             glib::spawn_future_local(async move {
-                                match ui
-                                    .call(
-                                        "file.restore",
-                                        json!({"project_id":project,"trash_id":id}),
-                                    )
-                                    .await
-                                {
+                                match restore_trash(&ui, project, id).await {
                                     Ok(_) => {
                                         button.set_visible(false);
                                         ed.load_tree(&ui, None);
@@ -1432,13 +1792,209 @@ impl Editor {
                             });
                         });
                         e.file_undo.append(&restore);
-                    } else if text(&v, "kind") != "dir" {
+                    } else if op == "file.create" && text(&v, "kind") != "dir" {
                         e.open(&ui, text(&v, "path").to_string());
                     }
                 }
                 Err(err) => ui.show_error(&err.to_string()),
             }
         });
+    }
+    /// After `old` was renamed or moved to `new`, or trashed (`None`): the open document
+    /// follows it, closes only when it was itself removed, and is left alone when the change
+    /// was elsewhere. Open folders follow too, and the agents view stays up (RA-215).
+    fn follow_change(self: &Rc<Self>, ui: &Rc<Ui>, old: &str, new: Option<&str>) {
+        let agents = self.agents_visible();
+        // None: not under `old`. Some(None): removed. Some(Some(path)): now at `path`.
+        let remap = |item: &str| {
+            item.strip_prefix(old)
+                .filter(|suffix| suffix.is_empty() || suffix.starts_with('/'))
+                .map(|suffix| new.map(|new| format!("{new}{suffix}")))
+        };
+        let expanded = self
+            .expanded
+            .borrow()
+            .iter()
+            .filter_map(|item| remap(item).unwrap_or_else(|| Some(item.clone())))
+            .collect();
+        *self.expanded.borrow_mut() = expanded;
+        let document = self.path.borrow().clone();
+        match remap(&document).filter(|_| !document.is_empty()) {
+            Some(Some(moved)) => {
+                self.clear_document();
+                self.open(ui, moved);
+            }
+            Some(None) => self.clear_document(),
+            None => {}
+        }
+        self.load_tree(ui, None);
+        self.refresh_git(ui);
+        if agents {
+            self.show_agents();
+        }
+    }
+    /// Dropping a tree item on `widget` moves it into the folder `into`. A drop on the item's
+    /// own folder is no move at all, and a drop into itself is refused.
+    fn bind_folder_drop(self: &Rc<Self>, ui: &Rc<Ui>, widget: &impl IsA<gtk::Widget>, into: &str) {
+        let drop = gtk::DropTarget::new(String::static_type(), gtk::gdk::DragAction::MOVE);
+        let ed = self.clone();
+        let weak = Rc::downgrade(ui);
+        let into = into.to_owned();
+        drop.connect_drop(move |_, value, _, _| {
+            let Some(ui) = weak.upgrade() else {
+                return false;
+            };
+            let Some(data) = value
+                .get::<String>()
+                .ok()
+                .and_then(|data| serde_json::from_str::<Value>(&data).ok())
+            else {
+                return false;
+            };
+            if data["project"] != ui.project.get()
+                || data["worktree"] != *ed.worktree.borrow()
+                || ed.is_dirty()
+            {
+                return false;
+            }
+            let Some(path) = data["path"].as_str().filter(|path| !path.is_empty()) else {
+                return false;
+            };
+            let parent = path.rsplit_once('/').map_or("", |(parent, _)| parent);
+            if into == path || into == parent || into.starts_with(&format!("{path}/")) {
+                return false;
+            }
+            let payload = ed.payload(&ui, json!({"path":path,"into":into}));
+            let moved = path.to_owned();
+            let ed = ed.clone();
+            ed.busy.set(true);
+            glib::spawn_future_local(async move {
+                let result = ui.call("file.move", payload).await;
+                ed.busy.set(false);
+                match result {
+                    Ok(value) => ed.follow_change(&ui, &moved, Some(text(&value, "path"))),
+                    Err(error) => ui.show_error(&error.to_string()),
+                }
+            });
+            true
+        });
+        widget.add_controller(drop);
+    }
+    /// Files trashed in this project that are still in Relay trash, each with Restore. The
+    /// audit log is the listing: no op lists `file_trash`, and `audit.undo` marks a restored
+    /// row so it leaves this list.
+    fn show_trash(self: &Rc<Self>, ui: &Rc<Ui>) {
+        let Some(panel) = crate::panel::Panel::toggle(ui, "Recently trashed", 480) else {
+            return;
+        };
+        let note = label(
+            "Files moved to Relay trash in this project, newest first. Each copy is kept in the checkout it was deleted from.",
+            "dim",
+        );
+        note.set_wrap(true);
+        note.set_xalign(0.0);
+        panel.body.append(&note);
+        let list = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        panel.body.append(&list);
+        panel.present();
+        let project = ui.project.get();
+        let e = self.clone();
+        let ui = ui.clone();
+        glib::spawn_future_local(async move {
+            let result = ui.call("audit.list", trash_query(project)).await;
+            if ui.project.get() != project {
+                return;
+            }
+            let items = match result {
+                Ok(v) => trashed(&v),
+                Err(err) => return list.append(&label(&err.to_string(), "dim")),
+            };
+            if items.is_empty() {
+                list.append(&label("Nothing from this project is in Relay trash.", "dim"));
+            }
+            for row in items {
+                let item = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+                let words = gtk::Box::new(gtk::Orientation::Vertical, 2);
+                words.set_hexpand(true);
+                let name = label(text(&row["payload"], "path"), "body");
+                name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+                name.set_xalign(0.0);
+                words.append(&name);
+                let checkout = row["payload"]["worktree"]
+                    .as_str()
+                    .filter(|w| !w.is_empty())
+                    .unwrap_or("Primary checkout");
+                let when = glib::DateTime::from_iso8601(text(&row, "ts"), None)
+                    .and_then(|t| t.to_local())
+                    .and_then(|t| t.format("%Y-%m-%d %H:%M"))
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|_| text(&row, "ts").to_owned());
+                let place = label(&format!("{checkout} · {when}"), "dim");
+                place.set_ellipsize(gtk::pango::EllipsizeMode::Start);
+                place.set_xalign(0.0);
+                words.append(&place);
+                item.append(&words);
+                let restore = button("Restore", "quiet");
+                restore.set_valign(gtk::Align::Center);
+                restore.set_widget_name(&format!("project-trash-restore:{}", row["id"]));
+                item.append(&restore);
+                list.append(&item);
+                let audit = row["id"].clone();
+                let weak = Rc::downgrade(&ui);
+                let ed = e.clone();
+                restore.connect_clicked(move |button| {
+                    let Some(ui) = weak.upgrade() else {
+                        return;
+                    };
+                    button.set_sensitive(false);
+                    let (button, item, audit, ed) =
+                        (button.clone(), item.clone(), audit.clone(), ed.clone());
+                    glib::spawn_future_local(async move {
+                        match ui.call("audit.undo", json!({"audit_id":audit})).await {
+                            Ok(_) => {
+                                item.set_visible(false);
+                                if ui.project.get() == project {
+                                    ed.load_tree(&ui, None);
+                                    ed.refresh_git(&ui);
+                                }
+                            }
+                            Err(err) => {
+                                button.set_sensitive(true);
+                                ui.show_error(&err.to_string());
+                            }
+                        }
+                    });
+                });
+            }
+        });
+    }
+}
+
+fn trash_query(project: i64) -> Value {
+    json!({"project_id":project,"op_prefix":"file.delete","limit":200})
+}
+
+/// The `file.delete` audit rows whose file is still in Relay trash.
+fn trashed(history: &Value) -> Vec<Value> {
+    rows(history, "rows")
+        .into_iter()
+        .filter(|row| row["kind"] == "ok" && !row["undo_op"].is_null() && row["undone_by"].is_null())
+        .collect()
+}
+
+/// Restore one trashed file through its audit row when it is found, so the row is marked
+/// undone and leaves Recently trashed; `file.restore` directly otherwise.
+async fn restore_trash(ui: &Ui, project: i64, trash_id: i64) -> Result<Value, crate::client::Error> {
+    let history = ui.call("audit.list", trash_query(project)).await?;
+    match trashed(&history)
+        .into_iter()
+        .find(|row| row["undo_op"]["payload"]["trash_id"] == trash_id)
+    {
+        Some(row) => ui.call("audit.undo", json!({"audit_id":row["id"]})).await,
+        None => {
+            ui.call("file.restore", json!({"project_id":project,"trash_id":trash_id}))
+                .await
+        }
     }
 }
 
@@ -1464,5 +2020,27 @@ pub fn replace_all(search: &sourceview5::SearchContext, replace: &str) -> Result
             &mut error,
         );
         if error.is_null() { Ok(count) } else { Err(from_glib_full(error)) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{snippet, SNIPPET_CHARS};
+
+    #[test]
+    fn a_short_line_is_shown_whole() {
+        assert_eq!(snippet("  let x = needle;  ", 11), "let x = needle;");
+    }
+
+    #[test]
+    fn a_long_line_is_cut_around_the_match_on_character_boundaries() {
+        let line = format!("{}needle{}", "é".repeat(100_000), "ü".repeat(100_000));
+        let col = "é".repeat(100_000).len() as u32 + 1;
+        let shown = snippet(&line, col);
+        assert!(shown.starts_with('…') && shown.ends_with('…'));
+        assert!(shown.contains("needle"));
+        assert!(shown.chars().count() <= SNIPPET_CHARS + 2);
+        // A column inside a multi-byte character does not panic.
+        assert!(!snippet("éé", 2).is_empty());
     }
 }
