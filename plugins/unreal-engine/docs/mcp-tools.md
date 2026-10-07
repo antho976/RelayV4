@@ -67,6 +67,11 @@ Runs the code as a file through `PythonScriptLibrary.ExecutePythonCommandEx`. Re
 printed `output` (warnings and errors are prefixed with their type) and the command `result`.
 A Python exception is a tool error carrying the traceback.
 
+Inside a Relay session, `ue_python`, `ue_console`, `ue_call`, `ue_play` and `ue_profile` first pass
+Relay's guardrail (`guardrail.gate`), so deny rules and holds apply and every call is audited.
+The code itself is not sandboxed: it runs inside your open editor with all of the editor's access.
+Cancelling a call only drops its answer; Unreal cannot interrupt Python that is already running.
+
 ### `ue_call` — `{ object_path, function, parameters?, transaction? }`
 `PUT /remote/object/call`. For a static `BlueprintCallable` function, call it on the class default
 object: `/Script/<Module>.Default__<Class>`, e.g.
@@ -126,7 +131,9 @@ views ("only owner see") shown for the capture. Named `views` (front, right, bac
 three_quarter) sit `distance` cm from the `look_at` point ([forward, right, up] from the target,
 default [30, 0, 50], where first-person hands and guns sit); `offset` places the camera exactly.
 It works by placing a tagged SceneCapture2D in the level before play (the game world is a copy of
-the level) and removing it afterwards, so the level is left marked modified.
+the level) and removing it afterwards. Unreal gives no way to clear a level's modified flag, so
+the level is left marked modified; if it had no unsaved changes before, `ue_editor_quit` (which
+saves dirty packages) names it in its result so the rewrite can be reverted.
 
 ### `ue_run_tests` — `{ filter, in_editor?, timeout_s? }`
 Headless by default: runs `UnrealEditor-Cmd` on the project with
@@ -193,6 +200,6 @@ asset, not the Animation Blueprint, so runtime IK is not included.
 ### `ue_anim_preview` — `{ mesh, animation?, times?, samples?, attachments?, partner?, views?, location?, isolate?, settle_ms?, width?, height? }`
 Spawns temporary `RelayPreview` actors (character, attached items, partner), poses them at each
 time (up to 8), confirms the editor applied the pose, and returns images from the chosen views
-(default `front` and `right`, isolated). The actors are removed afterwards; the level stays marked
-modified, so do not save it for this. If poses lag, the editor is throttled in the background:
+(default `front` and `right`, isolated). The actors are transient and removed afterwards, so the
+level is not marked modified by them. If poses lag, the editor is throttled in the background:
 see [setup](setup.md).

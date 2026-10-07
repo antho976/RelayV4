@@ -292,6 +292,10 @@ const sameJson = (a: unknown, b: unknown): boolean => {
 // Generous: the first packet to a Tailscale peer can wait several seconds while the tunnel
 // wakes or is set up through a relay, and a LAN route that cannot answer fails on its own.
 const HANDSHAKE_TIMEOUT_MS = 20_000
+// A pairing hello waits for a person at the PC to approve it (`relay remote pair` asks), so its
+// welcome may take as long as that person does. The PC gives up a little sooner
+// (bridge.rs `PAIR_CONFIRM_WAIT`), so the phone hears its verdict rather than its own timeout.
+const PAIR_WELCOME_TIMEOUT_MS = 90_000
 const KEEPALIVE_MS = 25_000
 const RECONNECT_MIN_MS = 1_000
 const RECONNECT_MAX_MS = 30_000
@@ -437,7 +441,8 @@ const greetFirst = (routes: Route[], opening: Opening): Promise<Greeted> =>
 const answer = (
     greeted: Greeted,
     hello: (challenge: string) => Promise<Record<string, unknown>>,
-    opening: Opening
+    opening: Opening,
+    timeoutMs: number = HANDSHAKE_TIMEOUT_MS
 ): Promise<Opened> =>
     new Promise((resolve, reject) => {
         const { socket, route } = greeted
@@ -450,7 +455,7 @@ const answer = (
             closeQuietly(socket)
             reject(new Error(reason))
         }
-        const timer = setTimeout(() => fail(`no answer from ${route.url}`), HANDSHAKE_TIMEOUT_MS)
+        const timer = setTimeout(() => fail(`no answer from ${route.url}`), timeoutMs)
         opening.set(socket, () => fail('cancelled'))
         socket.onerror = () => fail(`cannot reach ${route.url}`)
         socket.onclose = () => fail(`closed by ${route.url}`)
@@ -492,6 +497,10 @@ const denialText = (code: string) => {
     switch (code) {
         case 'pair.invalid':
             return 'The pairing code was wrong or has expired. Run `relay remote pair` again.'
+        case 'pair.declined':
+            return 'The PC declined this pairing. Run `relay remote pair` again to retry.'
+        case 'pair.unconfirmed':
+            return 'Nobody approved the pairing on the PC in time. Run `relay remote pair` again and answer its prompt.'
         case 'auth.unknown_device':
             return 'This phone is no longer paired with that PC. Pair it again.'
         case 'auth.bad_proof':
@@ -625,7 +634,8 @@ class RelayClient {
                 opened = await answer(
                     greeted,
                     async () => ({ v: 1, pair: link.code, device_name: deviceLabel() }),
-                    this.opening
+                    this.opening,
+                    PAIR_WELCOME_TIMEOUT_MS
                 )
             } catch (e) {
                 if (generation !== this.generation) throw new Error('cancelled')

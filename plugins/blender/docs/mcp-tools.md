@@ -5,6 +5,14 @@ runs a script and exits, so calls are independent and nothing is left running. P
 to the agent's checkout, and files outside it are refused. Lengths are reported in centimetres,
 like Unreal.
 
+**Guardrails and sandbox.** Inside a Relay session, `blender_python`, `blender_export` and
+`blender_to_unreal` first pass Relay's guardrail (`guardrail.gate`), like a shell command: deny
+rules, holds and protected paths apply, and every call is audited. On Linux with `bwrap`, every
+Blender child then runs sandboxed: it can write only to the session's write roots, its own job
+folder and a private config/cache folder, and it has no network. Reading is not restricted. Every
+result carries a `sandbox` field saying whether the sandbox was on, and why not. Without a session
+(a standalone plugin), or without `bwrap` (macOS, Windows), Blender runs unconfined.
+
 ### `blender_info` — `{ file? }`
 No file: the art files in the checkout (`.blend`, `.fbx`, `.obj`, `.glb`, `.gltf`, `.abc`, `.usd`)
 and which Blender was found. With a file: units, frame rate and range; every object with type,

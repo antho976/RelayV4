@@ -6,8 +6,9 @@ def transform_flags(o):
     flags = []
     if any(abs(s - 1.0) > 1e-4 for s in o.scale):
         flags.append("scale not applied (%s)" % rnd(o.scale, 3))
-    if o.type in ("MESH", "ARMATURE") and any(abs(r) > 1e-4 for r in o.rotation_euler):
-        flags.append("rotation not applied (%s deg)" % rnd([math.degrees(r) for r in o.rotation_euler]))
+    rotation = unapplied_rotation(o) if o.type in ("MESH", "ARMATURE") else None
+    if rotation:
+        flags.append("rotation not applied (%s deg)" % rotation)
     return flags
 
 

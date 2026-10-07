@@ -28,9 +28,15 @@ V4 uses `$XDG_RUNTIME_DIR/relay-v4/` for engine sockets and
 This keeps it independent of a running Relay-2/V3 engine. Existing Relay-2/V3
 projects and sessions stay in their original store; V4 starts with its own registry.
 
-A running engine is reused without replacement; after engine code changes,
-it needs a deliberate restart to pick them up. Closing the window keeps the
-engine, sessions and worktrees alive.
+A running engine is reused when it is the build `run.sh` just made. One that
+predates the build (or comes from another checkout) is restarted if it holds no
+live sessions; otherwise `run.sh` warns and leaves it running its old code until
+you restart it deliberately. `app.version` reports the running image's
+`built_at`. Closing the window keeps the engine, sessions and worktrees alive.
+
+`run.sh` keeps the desktop launcher pointing at the primary checkout's `dev`
+instance; runs of another instance or from a linked worktree leave it alone.
+`RELAY_INSTALL_DESKTOP=1 ./run.sh <instance>` repoints it deliberately.
 
 The engine `run.sh` starts also carries the phone door, so a phone can reach it
 on the LAN directly (`relay remote pair` prints the QR code), or from anywhere
@@ -64,6 +70,10 @@ cargo fmt -p relay-native --check
 cargo clippy -p relay-native --all-targets -- -D warnings -A deprecated
 python3 scripts/native-smoke.py
 ```
+
+`native-smoke.py` captures every page, then runs the in-app roadmap regressions
+(`notes`, `files`, `lifecycle`, `tools`, `registry`) against the same fixture
+engine; `RELAY_SMOKE_ROADMAP_ONLY=notes,files` runs only the named parts.
 
 CI runs the engine, bus and CLI half of that list — `cargo test --locked` and
 `cargo clippy --locked --all-targets -- -D warnings` — on every push and pull
