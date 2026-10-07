@@ -147,6 +147,16 @@ pub struct Lists {
     pub fraction_digits: u32,
     pub accounts: Vec<AccountView>,
     pub categories: Vec<CategoryView>,
+    /// Phones that sync with this ledger, the latest first.
+    pub devices: Vec<DeviceView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[schemars(rename = "MoneyDevice")]
+pub struct DeviceView {
+    pub name: String,
+    /// When it last synced (RFC 3339).
+    pub last_sync: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -194,4 +204,32 @@ pub struct TxPatch {
     pub to_account_id: Option<i64>,
     pub category_id: Option<i64>,
     pub note: Option<String>,
+}
+
+/// One row's change on the sync wire (docs/MONEY.md, "Sync"). `row` holds the table's fields in
+/// camelCase, references as uids; empty for a tombstone.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[schemars(rename = "MoneyChange")]
+pub struct Change {
+    pub table: String,
+    pub uid: String,
+    pub updated_at: i64,
+    #[serde(default)]
+    pub deleted: bool,
+    #[serde(default)]
+    pub row: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[schemars(rename = "MoneySyncOut")]
+pub struct SyncOut {
+    /// Store it and send it back as `since` next time.
+    pub cursor: i64,
+    /// This ledger's changes the device has not seen.
+    pub changes: Vec<Change>,
+    /// This ledger was replaced by the device's.
+    pub replaced: bool,
+    /// The device's changes taken, and those older than what is here or not placeable.
+    pub applied: usize,
+    pub skipped: usize,
 }

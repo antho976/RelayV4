@@ -155,6 +155,17 @@ pub fn register(e: &mut Engine) {
         ctx.emit("money.changed", json!({}));
         Ok(SampleOut { transactions })
     });
+    e.register::<Sync>(|ctx, p| {
+        let device = p.device.trim();
+        if device.is_empty() || device.chars().count() > 64 || device.contains(char::is_control) {
+            return Err(BusError::invalid("money.invalid", "A device name is 1 to 64 printable characters"));
+        }
+        let out = ledger(ctx.engine(), |l| l.sync(device, p.replace.unwrap_or(false), p.since, &p.changes, &crate::time::now()))?;
+        if out.applied > 0 || out.replaced {
+            ctx.emit("money.changed", json!({"synced": device, "applied": out.applied}));
+        }
+        Ok(out)
+    });
     e.register::<Reset>(|ctx, _: Empty| {
         ledger(ctx.engine(), |l| l.reset())?;
         ctx.emit("money.changed", json!({}));

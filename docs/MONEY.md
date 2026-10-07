@@ -96,3 +96,45 @@ category_id, category, icon, color, note }`.
 
 Clients format amounts themselves with `relay_money::money::MoneyFormatter`
 (`currency` from the result, `Locale::from_env()`).
+
+## Sync
+
+Tally talks to the PC through the same door `relay-mobile` uses (`crates/relay-remote`, wire v1:
+greeting, pairing code once, then a proof per connection; docs/MOBILE.md §2, §6). It sends one
+bus request, `money.sync`, which is in `PHONE_OPS`.
+
+```
+money.sync { device, replace?, since, changes: [Change] }  →  { cursor, changes: [Change], replaced }
+Change = { table, uid, updated_at, deleted, row }
+```
+
+- `since` is the PC's `cursor` from the phone's last sync with this PC (0 the first time). The PC
+  answers with every row it changed after `since`, and the new `cursor`.
+- `changes` are the phone's rows changed since it last synced (by the phone's `updatedAt`), and
+  its tombstones.
+- **First sync: `replace: true`.** The PC's ledger becomes the phone's: everything on the PC is
+  erased and the phone's rows are applied. The phone is where the ledger lives; the PC is a
+  second view of it. After that, both sides merge.
+- **Newest edit wins, per row**, by `updated_at` (ms since the epoch). An equal or older change
+  is ignored. A tombstone (`deleted: true`) wins like any edit.
+- References travel as uids, never local ids: a transaction's `row.account` is the account's
+  uid. Budgets are matched by their category (`row.category`, null for the overall budget), not
+  by uid, because each category has one budget.
+- A posted bill's uid is `bill:<recurring uid>:<date>` on both devices, so the same rent posted
+  on each merges into one row.
+- `table` is one of `settings`, `accounts`, `categories`, `recurring`, `goals`, `transactions`,
+  `budgets`, `contributions`, `account_values`, applied in that order. `settings` rows have
+  the setting's name as uid (`currency`, `month_start_day`) and `row: { value }`.
+
+Row fields, camelCase as Tally's backup writes them:
+
+| table | row |
+|---|---|
+| accounts | `name, type, openingBalance, archived, sortOrder` |
+| categories | `name, kind, color, icon, archived, sortOrder` |
+| recurring | `name, type, amount, account, toAccount, category, frequency, interval, anchorDate, nextDate, endDate, autoPost, active` |
+| goals | `name, target, targetDate, color, archived, kind, account, percent, startDate, startAmount` |
+| transactions | `type, amount, date, account, toAccount, category, note, recurring, createdAt` |
+| budgets | `category, amount` |
+| contributions | `goal, amount, date, note` |
+| account_values | `account, date, value` |

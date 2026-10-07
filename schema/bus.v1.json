@@ -4,7 +4,7 @@
   "title": "RELAY v4 command bus",
   "description": "Generated from crates/relay-bus by `relay schema`. Do not edit; see docs/engine/BUS.md.",
   "version": 1,
-  "op_count": 246,
+  "op_count": 247,
   "envelope": {
     "request": {
       "$ref": "#/$defs/Request"
@@ -4776,6 +4776,26 @@
       },
       "result": {
         "$ref": "#/$defs/Empty"
+      }
+    },
+    "money.sync": {
+      "summary": "Tally's two-way sync (docs/MONEY.md): apply the phone's changes, newest edit winning per row, and answer with the PC's changes since the phone's cursor",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "money.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/MoneySyncIn"
+      },
+      "result": {
+        "$ref": "#/$defs/MoneySyncOut"
       }
     }
   },
@@ -16073,13 +16093,21 @@
           "items": {
             "$ref": "#/$defs/MoneyCategory"
           }
+        },
+        "devices": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MoneyDevice"
+          },
+          "description": "Phones that sync with this ledger, the latest first."
         }
       },
       "required": [
         "currency",
         "fraction_digits",
         "accounts",
-        "categories"
+        "categories",
+        "devices"
       ]
     },
     "MoneyCategory": {
@@ -16120,6 +16148,22 @@
       "enum": [
         "EXPENSE",
         "INCOME"
+      ]
+    },
+    "MoneyDevice": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "last_sync": {
+          "type": "string",
+          "description": "When it last synced (RFC 3339)."
+        }
+      },
+      "required": [
+        "name",
+        "last_sync"
       ]
     },
     "MoneyTxListIn": {
@@ -16475,6 +16519,109 @@
       },
       "required": [
         "transactions"
+      ]
+    },
+    "MoneySyncIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "device": {
+          "type": "string",
+          "description": "The phone's name, shown on the PC."
+        },
+        "replace": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "The phone's first sync with this PC: erase the PC's ledger and take the phone's."
+        },
+        "since": {
+          "type": "integer",
+          "format": "int64",
+          "description": "The cursor this PC returned last time; 0 the first time."
+        },
+        "changes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MoneyChange"
+          },
+          "description": "The phone's rows changed since its last sync, and its tombstones."
+        }
+      },
+      "required": [
+        "device",
+        "since",
+        "changes"
+      ]
+    },
+    "MoneyChange": {
+      "type": "object",
+      "properties": {
+        "table": {
+          "type": "string"
+        },
+        "uid": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "deleted": {
+          "type": "boolean",
+          "default": false
+        },
+        "row": {
+          "type": "object",
+          "additionalProperties": true,
+          "default": {}
+        }
+      },
+      "required": [
+        "table",
+        "uid",
+        "updated_at"
+      ],
+      "description": "One row's change on the sync wire (docs/MONEY.md, \"Sync\"). `row` holds the table's fields in\ncamelCase, references as uids; empty for a tombstone."
+    },
+    "MoneySyncOut": {
+      "type": "object",
+      "properties": {
+        "cursor": {
+          "type": "integer",
+          "format": "int64",
+          "description": "Store it and send it back as `since` next time."
+        },
+        "changes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MoneyChange"
+          },
+          "description": "This ledger's changes the device has not seen."
+        },
+        "replaced": {
+          "type": "boolean",
+          "description": "This ledger was replaced by the device's."
+        },
+        "applied": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "description": "The device's changes taken, and those older than what is here or not placeable."
+        },
+        "skipped": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "cursor",
+        "changes",
+        "replaced",
+        "applied",
+        "skipped"
       ]
     }
   }

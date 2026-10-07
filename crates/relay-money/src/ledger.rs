@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// Bumped with every entry appended to [`MIGRATIONS`]; every earlier version must stay openable.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 const MIGRATIONS: &[&str] = &[r"
 CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -66,6 +66,81 @@ CREATE TABLE contributions (
 CREATE TABLE account_values (
     id INTEGER PRIMARY KEY, uid TEXT NOT NULL UNIQUE, account_id INTEGER NOT NULL, date TEXT NOT NULL,
     value INTEGER NOT NULL, updated_at INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0);
+", r"
+-- Sync (docs/MONEY.md): every change takes the next number from one counter, so a device that
+-- last synced at cursor N asks for everything numbered above N. Rows erased outright (a restore,
+-- an erase) leave a tombstone, which takes a number too.
+CREATE TABLE sync_counter (n INTEGER NOT NULL);
+INSERT INTO sync_counter (n) VALUES (0);
+CREATE TABLE tombstones (tbl TEXT NOT NULL, uid TEXT NOT NULL, updated_at INTEGER NOT NULL, seq INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (tbl, uid));
+ALTER TABLE settings ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE settings ADD COLUMN seq INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE accounts ADD COLUMN seq INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX accounts_seq ON accounts (seq);
+CREATE TRIGGER accounts_seq_insert AFTER INSERT ON accounts BEGIN
+    UPDATE sync_counter SET n = n + 1; UPDATE accounts SET seq = (SELECT n FROM sync_counter) WHERE id = NEW.id; END;
+CREATE TRIGGER accounts_seq_update AFTER UPDATE ON accounts WHEN NEW.seq = OLD.seq BEGIN
+    UPDATE sync_counter SET n = n + 1; UPDATE accounts SET seq = (SELECT n FROM sync_counter) WHERE id = NEW.id; END;
+ALTER TABLE categories ADD COLUMN seq INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX categories_seq ON categories (seq);
+CREATE TRIGGER categories_seq_insert AFTER INSERT ON categories BEGIN
+    UPDATE sync_counter SET n = n + 1; UPDATE categories SET seq = (SELECT n FROM sync_counter) WHERE id = NEW.id; END;
+CREATE TRIGGER categories_seq_update AFTER UPDATE ON categories WHEN NEW.seq = OLD.seq BEGIN
+    UPDATE sync_counter SET n = n + 1; UPDATE categories SET seq = (SELECT n FROM sync_counter) WHERE id = NEW.id; END;
+ALTER TABLE transactions ADD COLUMN seq INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX transactions_seq ON transactions (seq);
+CREATE TRIGGER transactions_seq_insert AFTER INSERT ON transactions BEGIN
+    UPDATE sync_counter SET n = n + 1; UPDATE transactions SET seq = (SELECT n FROM sync_counter) WHERE id = NEW.id; END;
+CREATE TRIGGER transactions_seq_update AFTER UPDATE ON transactions WHEN NEW.seq = OLD.seq BEGIN
+    UPDATE sync_counter SET n = n + 1; UPDATE transactions SET seq = (SELECT n FROM sync_counter) WHERE id = NEW.id; END;
+ALTER TABLE budgets ADD COLUMN seq INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX budgets_seq ON budgets (seq);
+CREATE TRIGGER budgets_seq_insert AFTER INSERT ON budgets BEGIN
+    UPDATE sync_counter SET n = n + 1; UPDATE budgets SET seq = (SELECT n FROM sync_counter) WHERE id = NEW.id; END;
+CREATE TRIGGER budgets_seq_update AFTER UPDATE ON budgets WHEN NEW.seq = OLD.seq BEGIN
+    UPDATE sync_counter SET n = n + 1; UPDATE budgets SET seq = (SELECT n FROM sync_counter) WHERE id = NEW.id; END;
+ALTER TABLE recurring ADD COLUMN seq INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX recurring_seq ON recurring (seq);
+CREATE TRIGGER recurring_seq_insert AFTER INSERT ON recurring BEGIN
+    UPDATE sync_counter SET n = n + 1; UPDATE recurring SET seq = (SELECT n FROM sync_counter) WHERE id = NEW.id; END;
+CREATE TRIGGER recurring_seq_update AFTER UPDATE ON recurring WHEN NEW.seq = OLD.seq BEGIN
+    UPDATE sync_counter SET n = n + 1; UPDATE recurring SET seq = (SELECT n FROM sync_counter) WHERE id = NEW.id; END;
+ALTER TABLE goals ADD COLUMN seq INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX goals_seq ON goals (seq);
+CREATE TRIGGER goals_seq_insert AFTER INSERT ON goals BEGIN
+    UPDATE sync_counter SET n = n + 1; UPDATE goals SET seq = (SELECT n FROM sync_counter) WHERE id = NEW.id; END;
+CREATE TRIGGER goals_seq_update AFTER UPDATE ON goals WHEN NEW.seq = OLD.seq BEGIN
+    UPDATE sync_counter SET n = n + 1; UPDATE goals SET seq = (SELECT n FROM sync_counter) WHERE id = NEW.id; END;
+ALTER TABLE contributions ADD COLUMN seq INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX contributions_seq ON contributions (seq);
+CREATE TRIGGER contributions_seq_insert AFTER INSERT ON contributions BEGIN
+    UPDATE sync_counter SET n = n + 1; UPDATE contributions SET seq = (SELECT n FROM sync_counter) WHERE id = NEW.id; END;
+CREATE TRIGGER contributions_seq_update AFTER UPDATE ON contributions WHEN NEW.seq = OLD.seq BEGIN
+    UPDATE sync_counter SET n = n + 1; UPDATE contributions SET seq = (SELECT n FROM sync_counter) WHERE id = NEW.id; END;
+ALTER TABLE account_values ADD COLUMN seq INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX account_values_seq ON account_values (seq);
+CREATE TRIGGER account_values_seq_insert AFTER INSERT ON account_values BEGIN
+    UPDATE sync_counter SET n = n + 1; UPDATE account_values SET seq = (SELECT n FROM sync_counter) WHERE id = NEW.id; END;
+CREATE TRIGGER account_values_seq_update AFTER UPDATE ON account_values WHEN NEW.seq = OLD.seq BEGIN
+    UPDATE sync_counter SET n = n + 1; UPDATE account_values SET seq = (SELECT n FROM sync_counter) WHERE id = NEW.id; END;
+CREATE TRIGGER settings_seq_insert AFTER INSERT ON settings BEGIN
+    UPDATE sync_counter SET n = n + 1; UPDATE settings SET seq = (SELECT n FROM sync_counter) WHERE key = NEW.key; END;
+CREATE TRIGGER settings_seq_update AFTER UPDATE ON settings WHEN NEW.seq = OLD.seq BEGIN
+    UPDATE sync_counter SET n = n + 1; UPDATE settings SET seq = (SELECT n FROM sync_counter) WHERE key = NEW.key; END;
+CREATE TRIGGER tombstones_seq_insert AFTER INSERT ON tombstones BEGIN
+    UPDATE sync_counter SET n = n + 1; UPDATE tombstones SET seq = (SELECT n FROM sync_counter) WHERE tbl = NEW.tbl AND uid = NEW.uid; END;
+CREATE TRIGGER tombstones_seq_update AFTER UPDATE ON tombstones WHEN NEW.seq = OLD.seq BEGIN
+    UPDATE sync_counter SET n = n + 1; UPDATE tombstones SET seq = (SELECT n FROM sync_counter) WHERE tbl = NEW.tbl AND uid = NEW.uid; END;
+-- Rows that existed before sync count as changed once, so a first sync carries them.
+UPDATE accounts SET seq = 0;
+UPDATE categories SET seq = 0;
+UPDATE transactions SET seq = 0;
+UPDATE budgets SET seq = 0;
+UPDATE recurring SET seq = 0;
+UPDATE goals SET seq = 0;
+UPDATE contributions SET seq = 0;
+UPDATE account_values SET seq = 0;
+UPDATE settings SET seq = 0;
 "];
 
 const TABLES: [&str; 8] =
@@ -127,7 +202,7 @@ pub fn parse_date(s: &str) -> Option<Date> {
 type DueRow = (i64, String, String, i64, i64, Option<i64>, Option<i64>, String, i64, String, String, Option<String>);
 
 pub struct Ledger {
-    conn: Connection,
+    pub(crate) conn: Connection,
 }
 
 impl Ledger {
@@ -167,8 +242,10 @@ impl Ledger {
     }
 
     fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
-        conn.prepare_cached("INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value")?
-            .execute([key, value])?;
+        conn.prepare_cached(
+            "INSERT INTO settings (key, value, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        )?.execute(params![key, value, now_ms()])?;
         Ok(())
     }
 
@@ -256,6 +333,7 @@ impl Ledger {
             currency: s.currency,
             accounts: self.accounts()?,
             categories: self.categories()?,
+            devices: self.synced_devices()?.into_iter().map(|(name, last_sync)| DeviceView { name, last_sync }).collect(),
         })
     }
 
@@ -624,11 +702,23 @@ impl Ledger {
         Ok(out)
     }
 
-    fn clear(tx: &rusqlite::Transaction) -> Result<()> {
+    /// Erases every row. Each live one leaves a tombstone, so the next sync erases it on the
+    /// other device too, unless `quietly` (the phone replacing this ledger has none of them).
+    pub(crate) fn clear(tx: &rusqlite::Transaction, quietly: bool) -> Result<()> {
+        let now = now_ms();
         for t in TABLES {
+            if !quietly {
+                tx.execute(
+                    &format!("INSERT OR REPLACE INTO tombstones (tbl, uid, updated_at) SELECT '{t}', uid, ?1 FROM {t} WHERE deleted = 0"),
+                    [now],
+                )?;
+            }
             tx.execute(&format!("DELETE FROM {t}"), [])?;
         }
         tx.execute("DELETE FROM settings", [])?;
+        if quietly {
+            tx.execute("DELETE FROM tombstones", [])?;
+        }
         Ok(())
     }
 
@@ -640,7 +730,7 @@ impl Ledger {
         }
         let now = now_ms();
         let tx = self.conn.transaction()?;
-        Ledger::clear(&tx)?;
+        Ledger::clear(&tx, false)?;
         Ledger::set_setting(&tx, "currency", &file.currency)?;
         if let Some(d) = file.month_start_day {
             Ledger::set_setting(&tx, "month_start_day", &d.to_string())?;
@@ -798,7 +888,7 @@ impl Ledger {
     /// Erases everything, settings included.
     pub fn reset(&mut self) -> Result<()> {
         let tx = self.conn.transaction()?;
-        Ledger::clear(&tx)?;
+        Ledger::clear(&tx, false)?;
         tx.commit()?;
         Ok(())
     }

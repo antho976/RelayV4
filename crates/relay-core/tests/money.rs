@@ -81,3 +81,26 @@ fn an_agent_may_add_entries_but_never_wipe_the_ledger() {
     }
     assert!(call_as(&engine, agent, "money.import", json!({"path": "/tmp/x.json"})).error.is_some());
 }
+
+#[test]
+fn a_phone_syncs_its_ledger_across_the_bus() {
+    let engine = engine();
+    let changes = json!([
+        {"table": "accounts", "uid": "a1", "updated_at": 100, "row": {"name": "Chequing", "type": "CHEQUING", "openingBalance": 50_000, "archived": false, "sortOrder": 0}},
+        {"table": "transactions", "uid": "t1", "updated_at": 100, "row": {"type": "INCOME", "amount": 210_000, "date": "2026-10-01", "account": "a1",
+            "toAccount": null, "category": null, "note": "Pay", "recurring": null, "createdAt": 100}}
+    ]);
+    let first = ok(&engine, "money.sync", json!({"device": "Pixel 9", "replace": true, "since": 0, "changes": changes}));
+    assert_eq!(first["applied"], 2);
+    let home = ok(&engine, "money.summary", json!({"today": "2026-10-07"}));
+    assert_eq!(home["income"], 210_000);
+    assert_eq!(ok(&engine, "money.lists", json!({}))["devices"][0]["name"], "Pixel 9");
+    ok(&engine, "money.tx.add", json!({"type": "EXPENSE", "amount": 1_500, "date": "2026-10-06", "account_id": home["accounts"][0]["id"]}));
+    let next = ok(&engine, "money.sync", json!({"device": "Pixel 9", "since": first["cursor"], "changes": []}));
+    let back = next["changes"].as_array().unwrap();
+    assert_eq!(back.len(), 1);
+    assert_eq!(back[0]["row"]["account"], "a1");
+    // A phone's credential is the person's; an agent cannot sync a ledger over it.
+    let agent = call_as(&engine, Actor::agent("brisk-otter"), "money.sync", json!({"device": "x", "since": 0, "changes": []}));
+    assert!(agent.error.is_some());
+}

@@ -8,7 +8,7 @@
 use crate::registry::{Actors, OpMeta, Scope};
 use crate::{op, Empty};
 use relay_money::model::{AccountType, TxType};
-use relay_money::views::{AccountView, Lists, Settings, Summary, Tx, TxPage};
+use relay_money::views::{AccountView, Change, Lists, Settings, Summary, SyncOut, Tx, TxPage};
 
 payload!(#[schemars(rename = "MoneySummaryIn")] SummaryIn {
     /// The day to read the month from; today in the engine's time zone when absent.
@@ -79,4 +79,17 @@ op!(Sample, "money.sample", Empty => SampleOut,
     OpMeta::mutation(Scope::Global, 12, "Load Tally's sample household, only into an empty ledger; its accounts are named Sample").actors(Actors::UserOnly).emits(&["money.changed"]));
 op!(Reset, "money.reset", Empty => Empty, OpMeta::mutation(Scope::Global, 12, "Erase the whole ledger").actors(Actors::UserOnly).emits(&["money.changed"]));
 
-entries!(SummaryOp, ListsOp, TxList, TxAdd, TxUpdate, TxDelete, TxRestore, BudgetSet, AccountAdd, SettingsSet, Import, Export, Sample, Reset);
+payload!(#[schemars(rename = "MoneySyncIn")] SyncIn {
+    /// The phone's name, shown on the PC.
+    pub device: String,
+    /// The phone's first sync with this PC: erase the PC's ledger and take the phone's.
+    pub replace: Option<bool>,
+    /// The cursor this PC returned last time; 0 the first time.
+    pub since: i64,
+    /// The phone's rows changed since its last sync, and its tombstones.
+    pub changes: Vec<Change>,
+});
+op!(Sync, "money.sync", SyncIn => SyncOut,
+    OpMeta::mutation(Scope::Global, 12, "Tally's two-way sync (docs/MONEY.md): apply the phone's changes, newest edit winning per row, and answer with the PC's changes since the phone's cursor").actors(Actors::UserOnly).emits(&["money.changed"]));
+
+entries!(SummaryOp, ListsOp, TxList, TxAdd, TxUpdate, TxDelete, TxRestore, BudgetSet, AccountAdd, SettingsSet, Import, Export, Sample, Reset, Sync);

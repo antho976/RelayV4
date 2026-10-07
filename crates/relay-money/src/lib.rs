@@ -22,6 +22,8 @@ pub mod payees;
 pub mod period;
 pub mod recurrence;
 pub mod sample_data;
+#[cfg(feature = "ledger")]
+pub mod sync;
 pub mod text_match;
 pub mod views;
 
