@@ -284,7 +284,8 @@ pub async fn profile_lifecycle(ui: &Rc<Ui>) -> Result<(), String> {
         .await?;
         let rendered = start.elapsed().as_secs_f64() * 1000.0;
         let close = std::time::Instant::now();
-        ui.call("session.close", json!({"session":name}))
+        // A throwaway smoke session: whatever its provider left in the checkout goes too.
+        ui.call("session.close", json!({"session":name,"discard_changes":true}))
             .await
             .map_err(|e| e.to_string())?;
         let closed = close.elapsed().as_secs_f64() * 1000.0;

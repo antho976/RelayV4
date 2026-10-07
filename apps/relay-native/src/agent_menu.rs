@@ -172,7 +172,7 @@ impl Ui {
         tracing::debug!(session = %name, elapsed_us = clicked.elapsed().as_micros() as u64, "close: pane removed");
         let ui = self.clone();
         glib::spawn_future_local(async move {
-            let result = ui.call("session.close", payload).await;
+            let result = ui.call("session.close", payload.clone()).await;
             tracing::debug!(session = %name, elapsed_ms = clicked.elapsed().as_millis() as u64, ok = result.is_ok(), "close: engine answered");
             if matches!(result, Err(crate::client::Error::Timeout)) {
                 // Removing a large worktree can outlast the request: the close is still running,
@@ -196,6 +196,28 @@ impl Ui {
                     ui.sidebar_sessions.borrow_mut().retain(|s| text(s, "name") != name);
                     ui.render_projects();
                     ui.render_status_counts();
+                }
+                // Removing the worktree would delete uncommitted work. The popover is gone by
+                // now, so the question is asked here; only a yes deletes it (RA-405).
+                Err(Error::Bus(error)) if error.code == "worktree.dirty" => {
+                    let dialog = gtk::AlertDialog::builder()
+                        .message(format!("Discard {name}'s uncommitted changes?"))
+                        .detail(format!(
+                            "{}. Closing with its worktree removed deletes them for good. To keep them, commit or stash them, or close it keeping the worktree.",
+                            error.message
+                        ))
+                        .buttons(["Keep the agent", "Discard changes and close"])
+                        .cancel_button(0)
+                        .default_button(0)
+                        .modal(true)
+                        .build();
+                    if dialog.choose_future(Some(&ui.window)).await.ok() == Some(1) {
+                        let mut payload = payload;
+                        payload["discard_changes"] = json!(true);
+                        ui.close_agent(name, payload);
+                    } else {
+                        ui.refresh();
+                    }
                 }
                 Err(error) => {
                     ui.show_error(&format!("Could not close {name}: {error}"));
