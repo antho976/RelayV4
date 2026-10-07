@@ -2,7 +2,7 @@
 use crate::registry::{Actors, OpMeta, Scope, Undo};
 use crate::types::{
     Attachment, AuditRow, Column, Id, Label, Message, Priority, Session, Size, Task, TaskRelation,
-    TaskState, TaskType,
+    TaskState, TaskType, Ts,
 };
 use crate::{op, Empty};
 
@@ -84,9 +84,15 @@ payload!(#[schemars(rename = "TaskLinkCommitIn")] LinkCommitIn { pub task_id: Id
 op!(LinkCommit, "task.link_commit", LinkCommitIn => Task,
     OpMeta::mutation(Scope::Project, 7, "Link a commit sha to a task").emits(&["task.changed"]));
 
-payload!(#[schemars(rename = "TaskChangelogWriteIn")] ChangelogWriteIn { pub task_id: Id, pub text: String });
+payload!(#[schemars(rename = "TaskChangelogWriteIn")] ChangelogWriteIn {
+    pub task_id: Id, pub text: String,
+    /// The task's `updated_at` as you last read it. When given and the task has changed since,
+    /// the write is refused (`task.edit_conflict`) instead of overwriting someone else's edit;
+    /// omitted, the write goes through as before.
+    pub expected_updated_at: Option<Ts>,
+});
 op!(ChangelogWrite, "task.changelog.write", ChangelogWriteIn => Task,
-    OpMeta::mutation(Scope::Project, 7, "Write the sentence that ships in patch notes").undo(Undo::Inverse).emits(&["task.changed"]));
+    OpMeta::mutation(Scope::Project, 7, "Write the sentence that ships in patch notes; pass expected_updated_at (from your last read) to refuse the write if the task changed since").undo(Undo::Inverse).emits(&["task.changed"]));
 
 payload!(#[schemars(rename = "TaskAttachIn")] AttachIn { pub task_id: Id, pub name: Option<String>, pub mime: Option<String>, pub bytes_b64: Option<String>, pub path: Option<String> });
 op!(Attach, "task.attach", AttachIn => Attachment,

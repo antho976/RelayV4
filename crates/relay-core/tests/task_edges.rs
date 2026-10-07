@@ -294,3 +294,33 @@ fn v3_import_appends_and_cleans_up_after_failure() {
     let ord: i64 = e.store.lock().query_row("SELECT ord FROM modules WHERE id=?1", [out["id_map"]["modules"]["7"].as_i64().unwrap()], |r| r.get(0)).unwrap();
     assert!(ord > module["order"].as_i64().unwrap());
 }
+
+/// RA-413: `expected_updated_at` on the agent-reachable writes with no other optimistic check.
+/// Given and current, the write lands; given and stale, it is refused with the code
+/// task.update / notes.update use; omitted, nothing changes from before.
+#[test]
+fn changelog_and_append_take_an_optional_expected_updated_at() {
+    let f = Fixture::new();
+    let e = &f.engine;
+    let task = f.task("Changelog", json!({}));
+    let read = ok(e, "task.get", json!({"task_id":task["id"]}));
+    let written = ok(e, "task.changelog.write", json!({"task_id":task["id"],"text":"first","expected_updated_at":read["updated_at"]}));
+    assert_eq!(written["changelog"], "first");
+    let stale = call(e, Actor::User, "task.changelog.write", json!({"task_id":task["id"],"text":"second","expected_updated_at":"2000-01-01T00:00:00Z"}));
+    assert_eq!(code(stale), "task.edit_conflict");
+    assert_eq!(ok(e, "task.get", json!({"task_id":task["id"]}))["changelog"], "first");
+    assert_eq!(ok(e, "task.changelog.write", json!({"task_id":task["id"],"text":"third"}))["changelog"], "third");
+
+    let note = ok(e, "notes.create", json!({"project_id":1,"title":"Log","body":"a"}));
+    let appended = ok(e, "notes.append", json!({"note_id":note["id"],"text":"b","expected_updated_at":note["updated_at"]}));
+    assert_eq!(appended["body"], "a\nb");
+    let stale = call(e, Actor::User, "notes.append", json!({"note_id":note["id"],"text":"c","expected_updated_at":"2000-01-01T00:00:00Z"}));
+    assert_eq!(code(stale), "notes.edit_conflict");
+    assert_eq!(ok(e, "notes.get", json!({"note_id":note["id"]}))["body"], "a\nb");
+    assert_eq!(ok(e, "notes.append", json!({"note_id":note["id"],"text":"d"}))["body"], "a\nb\nd");
+    // The standing note, found from the project, is checked the same way.
+    let standing = ok(e, "notes.append", json!({"project_id":1,"text":"rule"}));
+    let stale = call(e, Actor::User, "notes.append", json!({"project_id":1,"text":"x","expected_updated_at":"2000-01-01T00:00:00Z"}));
+    assert_eq!(code(stale), "notes.edit_conflict");
+    ok(e, "notes.append", json!({"project_id":1,"text":"rule two","expected_updated_at":standing["updated_at"]}));
+}

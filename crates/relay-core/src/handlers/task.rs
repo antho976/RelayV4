@@ -1109,6 +1109,12 @@ pub fn register(e: &mut Engine) {
     });
     e.register::<ChangelogWrite>(|ctx: &mut Ctx, p| {
         let before = get_task(ctx.tx(), p.task_id, false)?;
+        // Optional, for an agent that read the task and wants its write refused rather than
+        // landing over an edit made since (RA-413). Nothing tracks what it read; it says.
+        if p.expected_updated_at.as_ref().is_some_and(|at| *at != before.updated_at) {
+            return Err(BusError::conflict("task.edit_conflict", "Task changed elsewhere since you read it; your changelog was not saved")
+                .with_details(json!({"expected": p.expected_updated_at, "actual": before.updated_at})));
+        }
         ctx.tx()
             .execute(
                 "UPDATE tasks SET changelog=?1,updated_at=?2 WHERE id=?3",

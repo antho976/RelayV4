@@ -550,6 +550,12 @@ pub fn register(e: &mut Engine) {
         };
         let (before, _, _) = get_note(ctx.tx(), id, false)?;
         assert_actor_project(ctx, before.project_id)?;
+        // Optional, as in task.changelog.write: refused rather than appended to a note that
+        // changed since the caller read it (RA-413).
+        if p.expected_updated_at.as_ref().is_some_and(|at| *at != before.updated_at) {
+            return Err(BusError::conflict("notes.edit_conflict", "Note changed elsewhere since you read it; your text was not appended")
+                .with_details(json!({"expected": p.expected_updated_at, "actual": before.updated_at})));
+        }
         if text.is_empty() {
             return Err(BusError::invalid(
                 "notes.text",
