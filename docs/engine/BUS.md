@@ -616,7 +616,10 @@ callers of it wherever the provider lets us:
   both providers' commits, and yours.
 - **Codex**: Relay merges `PreToolUse` and lifecycle hooks into `.codex/hooks.json` (D132);
   they run only after the person trusts them once in Codex's `/hooks`, which Relay surfaces and
-  never bypasses. `Bash` is gated as for Claude: `exec`, then a `write` gate per visible target.
+  never bypasses. A launch is refused (`conflict` / `session.codex_hooks_tracked`) when the
+  repository tracks that file, since Relay's handlers name this machine's binary and a commit
+  would share them; an untracked one is added to `info/exclude` once Relay's handlers are in
+  it, never before. `Bash` is gated as for Claude: `exec`, then a `write` gate per visible target.
   `apply_patch`, Codex's edit tool, is parsed into one `write` gate per file — an added file
   with its text, an updated one with its text after the hunks are applied in memory, a deleted
   one with the lines it removes, a move's source by path alone — so protected paths, destructive
@@ -937,7 +940,7 @@ Provider-neutral Markdown; the same for both providers.
 | `git.push` | mutation · always | `{ project_id, worktree?, set_upstream? = auto }` → `{}` — a branch without an upstream is first-pushed as `git push -u origin <branch>`; explicit `false` keeps plain-push behavior |
 | `git.pr.list` | query | `{ project_id, refresh? }` → `{ pull_requests: { number, branch, draft, url, title }[] }` — GitHub PRs reported by the authenticated `gh` CLI. One listing answers for a minute per repository (D130: redraws must not repeat the network request); `refresh` asks GitHub now, and `git.push` / `git.pr.open` drop the cached one |
 | `git.pr.open` | mutation · always | `{ project_id, worktree?, title?, body? }` → `{ url }` — `gh pr create` runs before the store lock, with a 25 s deadline; `git.pr_timeout` means the outcome is unknown |
-| `git.branch.clean_merged` | mutation · always | `{ project_id, dry_run? }` → `{ deleted: string[] }` — never touches branches with a live/parked session |
+| `git.branch.clean_merged` | mutation · always · user | `{ project_id, dry_run? }` → `{ deleted: string[] }` — an alias of `git.branch.cleanup` (same rules, same staged pass), answering with the branches deleted, or on a dry run that would be. It used to delete any merged local branch by rules of its own, which had drifted from cleanup's |
 | `git.branch.cleanup` | mutation · always · user | `{ project_id, dry_run? }` → `{ branches: {branch, session?, outcome, reason, pr?, removed_worktree, deleted_remote}[] }` — closed sessions' `relay/*` branches whose work is merged (an ancestor of the base, every commit already upstream by patch id, or a merged GitHub PR containing the tip) are deleted; anything else is `kept` with the reason. A branch checked out in the primary, by an open session or outside the pool, or being rebased or bisected, stays; a clean, unowned pooled checkout holding it is removed first. The remote branch is deleted only for a merged PR, leased on the sha just seen. The same pass runs after `session.close`, when `git.pr.list` sees a closed session's PR merged, and as a background sweep 90 s after start and every 20 min (a kept, unchanged branch is looked at again ever less often, up to weekly). Each deletion writes a `system` audit row and emits `git.changed` |
 | `git.suggest_message` | query | `{ project_id, worktree? }` → `{ message }` — heuristic subject from the diff |
 | `integration.request` | mutation · always | `{ project_id, sessions: string[] \| branches: string[], build?: bool = true, deploy?: DeviceRef }` → `Integration` (state `queued`; results via `integration.result` events). An agent is held to its own project and refused `deploy`; an agent's request that builds (the project's `build_cmd`, run outside any sandbox) is `held` / `integration.agent_build` for a person to confirm unless the project's `guardrails.agent_builds` is on, while a merge-only request (`build: false`) goes straight through |

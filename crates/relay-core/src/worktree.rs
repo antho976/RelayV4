@@ -43,12 +43,19 @@ fn git(repo: &Path, args: &[&str]) -> Result<String> {
 pub fn git_mutate(repo: &Path, args: &[&str]) -> Result<String> { git(repo, args) }
 
 /// Make sure `.relay/` is excluded in this repo without touching its tracked `.gitignore`.
+/// `.codex/hooks.json` is not: a project may commit its own, so `hooks::install_codex` excludes
+/// it only once Relay's handlers are in an untracked one.
 pub fn ensure_excluded(repo: &Path) -> Result<()> {
-    exclude_paths(repo, &[".relay/", ".claude/settings.local.json", ".codex/hooks.json"])
+    exclude_paths(repo, &[".relay/", ".claude/settings.local.json"])
 }
 
 /// Same, for paths Relay writes into a checkout on demand (materialized skill folders).
 pub fn exclude_paths(repo: &Path, entries: &[&str]) -> Result<()> {
+    // One read-modify-write at a time: skills call this under their own lock, the hook
+    // adapters under `hooks::writes()`, and both edit the one `info/exclude` a repository's
+    // worktrees share.
+    static EXCLUDE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = EXCLUDE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let git_dir = git_dir_of(repo)?;
     let info = git_dir.join("info");
     std::fs::create_dir_all(&info)?;
@@ -281,21 +288,37 @@ fn canon(p: &Path) -> String {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()).display().to_string()
 }
 
+/// Where a new worktree's branch comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Start {
+    /// The branch exists already: check it out as it is.
+    Existing,
+    /// Create the branch, at this commit or ref (`None`: HEAD, or an unborn base).
+    New(Option<String>),
+}
+
 /// `git worktree add -b <branch> <path> [<from>]`; if the branch exists already, check it out
-/// instead of creating it.
+/// instead of creating it. A caller that already knows which calls [`create_at`].
 pub fn create(repo: &Path, path: &Path, branch: &str, from: Option<&str>) -> Result<Worktree> {
+    let exists = gix::open(repo)?.find_reference(format!("refs/heads/{branch}").as_str()).is_ok();
+    let start = if exists { Start::Existing } else { Start::New(from.map(str::to_string)) };
+    create_at(repo, path, branch, &start)
+}
+
+/// `git worktree add` for a branch whose [`Start`] the caller has settled (RA-640).
+pub fn create_at(repo: &Path, path: &Path, branch: &str, start: &Start) -> Result<Worktree> {
     ensure_excluded(repo)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let path_s = path.display().to_string();
-    let exists = git(repo, &["show-ref", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok();
-    let args = if exists {
-        vec!["worktree", "add", &path_s, branch]
-    } else {
-        let mut args = vec!["worktree", "add", "-b", branch, &path_s];
-        if let Some(f) = from { args.push(f); }
-        args
+    let args = match start {
+        Start::Existing => vec!["worktree", "add", &path_s, branch],
+        Start::New(from) => {
+            let mut args = vec!["worktree", "add", "-b", branch, &path_s];
+            if let Some(f) = from { args.push(f); }
+            args
+        }
     };
     let mut command = Command::new("git");
     command.arg("-C").arg(repo).args(args).env("GIT_TERMINAL_PROMPT", "0");

@@ -376,6 +376,14 @@ enum LaunchKind {
     Resume,
 }
 
+/// A repository that tracks `.codex/hooks.json` is the person's to fix, not an engine fault.
+fn codex_hooks_error(error: anyhow::Error) -> BusError {
+    match error.downcast_ref::<crate::hooks::CodexHooksTracked>() {
+        Some(tracked) => BusError::conflict("session.codex_hooks_tracked", tracked.to_string()),
+        None => crate::engine::internal(error),
+    }
+}
+
 /// Write one of Relay's launch files into a worktree the agent can write to. A symlink the
 /// agent planted on the way — a directory of the path, or the file itself — would otherwise
 /// carry Relay's write outside the sandbox: such links are replaced by real directories, and
@@ -672,8 +680,11 @@ fn prepare_launch(engine: &Engine, plan: LaunchPlan) -> Result<PreparedLaunch, B
         crate::hooks::install_claude(&cwd, instance, &relay_bin).bus()?;
         crate::hooks::add_claude_mcp_servers(&cwd, &plugin_servers).bus()?;
     } else if row.session.provider == Provider::Codex {
-        crate::hooks::install_codex(&cwd, instance, &relay_bin).bus()?;
+        crate::hooks::install_codex(&cwd, instance, &relay_bin).map_err(codex_hooks_error)?;
     }
+    // Skill folders have their own lock (`skills::apply`); copying them under this one held up
+    // every other launch, create, close and bus commit for as long as the copy took (RA-322).
+    drop(writes);
     // Every enabled skill becomes a real provider skill folder in this worktree, whatever
     // project it belongs to (D147); Codex reads skills only from its own home, so the machine
     // folders are refreshed too. A skill folder that cannot be written is never worth failing
@@ -746,7 +757,6 @@ fn prepare_launch(engine: &Engine, plan: LaunchPlan) -> Result<PreparedLaunch, B
         }
         args.extend(["--add-dir".into(), root.display().to_string()]);
     }
-    drop(writes);
     let spec = SpawnSpec {
         cmd: cmd.display().to_string(),
         args,
@@ -1079,18 +1089,13 @@ pub fn register(e: &mut Engine) {
                 (primary.path.clone(), primary.branch.clone())
             }
             "new" => {
-                super::git::refresh_new_worktree(&repo, p.branch.as_deref())?;
                 let branch = match p.branch.clone() {
                     Some(branch) => branch,
                     None => own_branch(&repo, &prepared.name)?,
                 };
                 let path = worktree::pooled_path(&repo, &prepared.name);
-                let from = if super::git::existing_worktree_branch(&repo, Some(&branch))? {
-                    None
-                } else {
-                    super::git::new_worktree_base(&repo, &prepared.project.base_branch)?
-                };
-                let wt = worktree::create(&repo, &path, &branch, from.as_deref())
+                let start = super::git::new_worktree_start(&repo, &branch, &prepared.project.base_branch, None)?;
+                let wt = worktree::create_at(&repo, &path, &branch, &start)
                     .map_err(|e| BusError::conflict("worktree.create_failed", e.to_string()))?;
                 (wt.path, wt.branch)
             }

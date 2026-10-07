@@ -491,6 +491,29 @@ fn branch_listing_follows_the_selected_worktree_and_delete_keeps_unsafe_branches
     assert_eq!(err(&owned).code, "git.branch_session_owned");
 }
 
+/// RA-740: `git.branch.clean_merged` is `git.branch.cleanup` under its older name. A closed
+/// session's merged branch goes; a merged branch Relay did not name is not its to delete.
+#[test]
+fn clean_merged_is_branch_cleanup_by_its_older_name() {
+    let e = engine();
+    let (ws, repo) = real_repo();
+    add_project(&e, &ws, &repo);
+    let repo_path = std::path::Path::new(&repo);
+    git(repo_path, &["branch", "feature/landed"]);
+    let created = call(&e, "session.create", json!({"project_id":1,"provider":"codex"})).into_result().unwrap();
+    let branch = created["branch"].as_str().unwrap().to_string();
+    call(&e, "session.close", json!({"session":created["name"]})).into_result().unwrap();
+    for dry_run in [true, false] {
+        let cleaned = call(&e, "git.branch.clean_merged", json!({"project_id":1,"dry_run":dry_run}))
+            .into_result().unwrap();
+        assert_eq!(cleaned["deleted"], json!([branch]), "dry_run {dry_run}");
+    }
+    let branches = call(&e, "git.branches", json!({"project_id":1})).into_result().unwrap();
+    let names: Vec<&str> = branches["branches"].as_array().unwrap().iter().map(|b| b["name"].as_str().unwrap()).collect();
+    assert!(!names.contains(&branch.as_str()), "{names:?}");
+    assert!(names.contains(&"feature/landed"), "{names:?}");
+}
+
 #[test]
 fn integration_merges_two_branches_and_reports_result() {
     let e = engine();

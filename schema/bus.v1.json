@@ -2840,7 +2840,7 @@
       }
     },
     "git.branch.clean_merged": {
-      "summary": "Delete merged branches without a live/parked session",
+      "summary": "Alias of git.branch.cleanup that answers with the names of the branches deleted (or, on a dry run, that would be)",
       "kind": "mutation",
       "audit": "always",
       "undo": "none",
@@ -2848,7 +2848,8 @@
       "actors": "user_only",
       "doors": "all",
       "emits": [
-        "git.changed"
+        "git.changed",
+        "worktree.changed"
       ],
       "since": "1.0",
       "phase": 8,

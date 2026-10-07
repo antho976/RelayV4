@@ -262,7 +262,14 @@ pub fn plan_user(conn: &Connection, instance: crate::Instance) -> Result<Plan> {
 /// that are no longer enabled are removed, and results inside a checkout stay out of
 /// `git status`. Best-effort per skill — one unwritable folder never costs the caller its
 /// session.
+///
+/// One apply at a time, process-wide. A launch, a [`refresh_all`] pass and a new project's
+/// first fill can run at once, and they rewrite the same machine-wide folders (remove, then
+/// copy) and read-modify-write one repository's `info/exclude`; interleaved, one's removal lands
+/// in the middle of the other's copy. The lock is a leaf: nothing is taken under it.
 pub fn apply(plan: &Plan, store: &crate::Store) -> Result<()> {
+    static APPLYING: Mutex<()> = Mutex::new(());
+    let _applying = APPLYING.lock().unwrap_or_else(PoisonError::into_inner);
     let owner = owner_line(store);
     let mut written: Vec<String> = Vec::new();
     for (base, plugins) in &plan.bases {
