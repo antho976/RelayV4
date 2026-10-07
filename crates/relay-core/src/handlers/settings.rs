@@ -276,7 +276,7 @@ pub fn set(tx: &Transaction, path: &str, value: &Value, now: &str) -> Result<(),
     valid_path(path)?;
     // The root is a tree of keys, never a value of its own: a row at "" is applied by a whole-tree
     // read but by no leaf read, so the two disagreed (RA-407).
-    if path.is_empty() && !value.as_object().is_some_and(|m| !m.is_empty()) {
+    if path.is_empty() && value.as_object().is_none_or(|m| m.is_empty()) {
         return Err(BusError::invalid("settings.path", "the settings root can only be set to a non-empty object; settings.reset clears it"));
     }
     check_guardrail_keys(path, value)?;
