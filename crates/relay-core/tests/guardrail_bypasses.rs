@@ -256,7 +256,7 @@ fn prune_holds_keeps_open_holds_and_live_grants() {
     let pruned = {
         let mut conn = f.engine.store.lock();
         let tx = conn.transaction().unwrap();
-        let pruned = relay_core::guardrail::prune_holds(&tx, "9999-01-01T00:00:00Z").unwrap();
+        let (pruned, _) = relay_core::guardrail::prune_holds(&tx, "9999-01-01T00:00:00Z").unwrap();
         tx.commit().unwrap();
         pruned
     };
