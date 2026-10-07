@@ -1,11 +1,11 @@
 //! Guardrail surfaces: held actions in words rather than raw JSON, the exception requests a
 //! refused agent sends (with the prompt that puts one in front of the user wherever they are),
 //! the grants still in force, and the layered settings editor.
-use crate::app::{button, label, rows, text, Ui};
+use crate::app::{button, clear, label, rows, text, Ui};
 use gtk::prelude::*;
 use gtk4 as gtk;
 use serde_json::{json, Value};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 #[path = "guardrail_settings.rs"]
@@ -239,7 +239,7 @@ fn head(eyebrow: &str, when: &str) -> gtk::Box {
 }
 
 /// A held action, in words: what it was, why it stopped, and what you can do.
-pub fn hold_row(ui: &Rc<Ui>, body: &gtk::Box, hold: Value) {
+pub fn hold_row(ui: &Rc<Ui>, hold: Value) -> gtk::Box {
     let (policy, details) = effective(&hold);
     let card = gtk::Box::new(gtk::Orientation::Vertical, 8);
     card.add_css_class("record");
@@ -344,7 +344,7 @@ pub fn hold_row(ui: &Rc<Ui>, body: &gtk::Box, hold: Value) {
             key.set_sensitive(true);
         });
     });
-    body.append(&card);
+    card
 }
 
 /// An inline "why not" form under `keys`, sending `guardrail.reject`. Returns the opener.
@@ -578,6 +578,8 @@ fn show_prompt(ui: &Rc<Ui>, request: &Value) {
             }
         });
     } else {
+        // A request shown in the tray is no longer waiting, whichever path brought it here.
+        WAITING.with(|w| w.borrow_mut().retain(|r| r["id"] != request["id"]));
         // The overflow line is re-added below, so it always ends the tray.
         tray.append(&prompt_slot(&exception_card(ui, request, true), id));
     }
@@ -663,7 +665,13 @@ fn close_prompt(ui: &Rc<Ui>, id: i64) {
     }
     if removed {
         DISMISSED.with(|d| d.borrow_mut().push(id));
-        if let Some(next) = WAITING.with(|w| (!w.borrow().is_empty()).then(|| w.borrow_mut().remove(0))) {
+        // One mutable borrow, bound before show_prompt borrows WAITING again: a shared borrow
+        // held across `then` makes the borrow_mut panic.
+        let next = WAITING.with(|w| {
+            let mut waiting = w.borrow_mut();
+            (!waiting.is_empty()).then(|| waiting.remove(0))
+        });
+        if let Some(next) = next {
             show_prompt(ui, &next);
         }
     }
@@ -731,8 +739,51 @@ fn section(body: &gtk::Box, title: &str, hint: &str) {
     body.append(&head);
 }
 
+thread_local! {
+    /// The page's cards by request or hold, kept across refreshes: a half-typed denial reason,
+    /// a reviewed exact action or an open expander survives every event that does not resolve
+    /// that card.
+    static CARDS: RefCell<(i64, Vec<(String, gtk::Box)>)> = const { RefCell::new((0, Vec::new())) };
+    /// What the page last drew; an event that changes none of it leaves the page alone.
+    static DRAWN: Cell<u64> = const { Cell::new(0) };
+}
+
+/// How long the page ignores the pointer after cards move under it, so a click aimed at one
+/// card cannot land on the Approve key of the card that slid into its place.
+const SETTLE_MS: u64 = 500;
+
 /// The Guardrails page body: requests first, then held actions, then the grants in force.
 pub async fn page(ui: &Rc<Ui>, body: &gtk::Box, project: i64, holds: Vec<Value>) {
+    // Everything is fetched before the page is touched, so it is never drawn half-way.
+    let (active, overlaps) = tokio::join!(
+        ui.call("guardrail.requests.list", json!({"project_id": project, "state": "active"})),
+        ui.call("overlap.list", json!({"project_id": project}))
+    );
+    if ui.project.get() != project || *ui.page.borrow() != "guardrails" {
+        return;
+    }
+    let drawn = {
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        project.hash(&mut hash);
+        Value::Array(holds.clone()).to_string().hash(&mut hash);
+        for result in [&active, &overlaps] {
+            match result {
+                Ok(value) => value.to_string().hash(&mut hash),
+                Err(error) => error.to_string().hash(&mut hash),
+            }
+        }
+        hash.finish()
+    };
+    if body.first_child().is_some() && DRAWN.get() == drawn {
+        return;
+    }
+    DRAWN.set(drawn);
+    let focus = body.root().and_then(|root| root.focus()).filter(|focus| focus.is_ancestor(body));
+    let (old_project, old) = CARDS.take();
+    let old = if old_project == project { old } else { Vec::new() };
+    clear(body);
+
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     actions.add_css_class("guardrail-actions");
     let edit = button("Guardrail settings for this project", "");
@@ -756,24 +807,33 @@ pub async fn page(ui: &Rc<Ui>, body: &gtk::Box, project: i64, holds: Vec<Value>)
         });
         actions.append(&edit);
     }
-    body.prepend(&actions);
+    body.append(&actions);
+    if holds.is_empty() {
+        body.append(&paragraph("Nothing is waiting for you: no exception requests and no held actions.", "body"));
+    }
 
-    let (requests, held): (Vec<Value>, Vec<Value>) = holds.into_iter().partition(is_request);
+    // Oldest first, so a new arrival lands at the bottom instead of pushing every card down.
+    let (mut requests, mut held): (Vec<Value>, Vec<Value>) = holds.into_iter().partition(is_request);
+    requests.sort_by_key(|r| as_request(r)["id"].as_i64());
+    held.sort_by_key(|h| h["id"].as_i64());
+    let mut cards: Vec<(String, gtk::Box)> = Vec::new();
+    let mut place = |key: String, build: &dyn Fn() -> gtk::Box| {
+        let card = old.iter().find(|(k, _)| *k == key).map(|(_, card)| card.clone()).unwrap_or_else(build);
+        body.append(&card);
+        cards.push((key, card));
+    };
     if !requests.is_empty() {
         section(body, "EXCEPTION REQUESTS", "Agents that cannot progress without passing a guardrail. Approving lifts only the named rule, for that session.");
         for request in &requests {
-            body.append(&exception_card(ui, request, false));
+            let key = format!("request-{}", as_request(request)["id"]);
+            place(key, &|| exception_card(ui, request, false));
         }
     }
     if !held.is_empty() {
         section(body, "HELD ACTIONS", "Paused until you decide. Review the exact action before allowing it.");
-        for hold in held {
-            hold_row(ui, body, hold);
+        for hold in &held {
+            place(format!("hold-{}", hold["id"]), &|| hold_row(ui, hold.clone()));
         }
-    }
-    let active = ui.call("guardrail.requests.list", json!({"project_id": project, "state": "active"})).await;
-    if ui.project.get() != project || *ui.page.borrow() != "guardrails" {
-        return;
     }
     match active {
         Ok(active) => {
@@ -786,6 +846,38 @@ pub async fn page(ui: &Rc<Ui>, body: &gtk::Box, project: i64, holds: Vec<Value>)
             }
         }
         Err(e) => ui.show_error(&format!("Exceptions: {e}")),
+    }
+    if let Ok(overlaps) = overlaps {
+        let overlaps = rows(&overlaps, "overlaps");
+        if !overlaps.is_empty() {
+            body.append(&label("Shared file activity", "title"));
+        }
+        for overlap in overlaps {
+            body.append(&paragraph(&format!("{}\n{}", text(&overlap, "path"), text(&overlap, "note")), "body"));
+        }
+    }
+
+    // A card that kept its place but moved (one above it resolved or arrived): hold the
+    // pointer off for a moment.
+    let kept: Vec<&String> = old.iter().map(|(k, _)| k).filter(|k| cards.iter().any(|(c, _)| c == *k)).collect();
+    let moved = kept.iter().any(|k| {
+        old.iter().position(|(o, _)| o == *k) != cards.iter().position(|(c, _)| c == *k)
+    });
+    CARDS.set((project, cards));
+    if let Some(focus) = focus.filter(|focus| focus.root().is_some()) {
+        match focus.downcast_ref::<gtk::Text>() {
+            Some(text) => text.grab_focus_without_selecting(),
+            None => focus.grab_focus(),
+        };
+    }
+    if moved {
+        body.set_can_target(false);
+        let body = body.downgrade();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(SETTLE_MS), move || {
+            if let Some(body) = body.upgrade() {
+                body.set_can_target(true);
+            }
+        });
     }
 }
 

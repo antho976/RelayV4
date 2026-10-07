@@ -1198,7 +1198,11 @@ pub fn verify_tools() {
     search.replace(&mut start, &mut end, "two").expect("replace one");
     assert_eq!(buffer_text(buffer.upcast_ref()), "one ONE two");
     settings.set_case_sensitive(true);
-    search.replace_all("one+").expect("replace all");
+    assert_eq!(crate::editor::replace_all(&search, "one+").expect("replace all"), 1);
+    assert_eq!(buffer_text(buffer.upcast_ref()), "one+ ONE two");
+    // No match left: the binding's own replace_all aborts here; the helper reports 0.
+    settings.set_search_text(Some("absent"));
+    assert_eq!(crate::editor::replace_all(&search, "x").expect("replace none"), 0);
     assert_eq!(buffer_text(buffer.upcast_ref()), "one+ ONE two");
 }
 

@@ -33,6 +33,15 @@ pub struct Editor {
     git_revision: Cell<u64>,
     git_refresh_pending: Cell<bool>,
     git_refresh_dirty: Cell<bool>,
+    /// Set when an event arrived while the panel was hidden; consumed when it is shown.
+    git_stale: Cell<bool>,
+    tree_stale: Cell<bool>,
+    /// What the Git panel last drew (`git_signature`), and the view state a rebuild keeps.
+    git_signature: Cell<u64>,
+    git_deferred: Cell<bool>,
+    git_split_position: Cell<i32>,
+    git_graph: Cell<bool>,
+    git_merge_picks: RefCell<std::collections::HashSet<String>>,
     tree_load_pending: Cell<bool>,
     tree_load_next: RefCell<Option<String>>,
     git_busy: Cell<bool>,
@@ -327,6 +336,13 @@ impl Editor {
             invalidate_pending: Cell::new(false),
             git_refresh_pending: Cell::new(false),
             git_refresh_dirty: Cell::new(false),
+            git_stale: Cell::new(false),
+            tree_stale: Cell::new(false),
+            git_signature: Cell::new(0),
+            git_deferred: Cell::new(false),
+            git_split_position: Cell::new(0),
+            git_graph: Cell::new(true),
+            git_merge_picks: RefCell::default(),
             tree_load_pending: Cell::new(false),
             tree_load_next: RefCell::new(None),
             diff: Cell::new(false),
@@ -505,7 +521,12 @@ impl Editor {
         clear(&self.tree);
         self.caption.set_text("Open a file");
     }
-    pub fn invalidate(self: &Rc<Self>, ui: &Rc<Ui>) {
+    /// A file, git, worktree or integration event: `event` is its name and payload, and
+    /// `None` refreshes unconditionally.
+    pub fn invalidate(self: &Rc<Self>, ui: &Rc<Ui>, event: Option<(&str, &Value)>) {
+        if event.is_some_and(|(ev, payload)| !self.concerns(ui, ev, payload)) {
+            return;
+        }
         if matches!(ui.page.borrow().as_str(), "code" | "agents")
             && !self.invalidate_pending.replace(true)
         {
@@ -515,14 +536,7 @@ impl Editor {
                 e.invalidate_pending.set(false);
                 if let Some(ui) = weak.upgrade() {
                     if matches!(ui.page.borrow().as_str(), "code" | "agents") {
-                        let directory = e.directory.borrow().clone();
-                        if e.search.text().trim().is_empty() {
-                            e.load_tree(&ui, Some(directory));
-                        } else {
-                            e.run_search(&ui);
-                        }
-                        e.refresh_git(&ui);
-                        e.refresh_scopes(&ui);
+                        e.refresh_shown(&ui);
                     }
                 }
             });
@@ -531,6 +545,54 @@ impl Editor {
             ui.show_error("Files changed on disk. Save checks for conflicting edits; discard reloads the file.");
         }
     }
+    /// Whether an event can change what this editor shows. Watcher events carry no envelope
+    /// project, so their payload's project is checked here; a file event from another
+    /// checkout is ignored, except the primary root's, which holds the shared `.git`.
+    fn concerns(&self, ui: &Ui, ev: &str, payload: &Value) -> bool {
+        if payload["project_id"].as_i64().is_some_and(|id| id != ui.project.get()) {
+            return false;
+        }
+        let Some(changed) = payload["worktree"].as_str().filter(|_| ev == "file.changed") else {
+            return true;
+        };
+        let canonical = |path: &str| std::fs::canonicalize(path).unwrap_or_else(|_| path.into());
+        let changed = canonical(changed);
+        let primary = ui
+            .projects
+            .borrow()
+            .iter()
+            .find(|p| p["id"] == ui.project.get())
+            .map(|p| canonical(text(p, "path")));
+        if primary.as_ref() == Some(&changed) {
+            return true;
+        }
+        let shown = self.worktree.borrow();
+        !shown.is_empty() && canonical(&shown) == changed
+    }
+
+    /// Refresh what is on screen. A hidden tree or Git panel is marked stale instead and
+    /// refreshed when it is shown (`bind_controls`).
+    fn refresh_shown(self: &Rc<Self>, ui: &Rc<Ui>) {
+        if self.file_sidebar.is_mapped() {
+            // A search's results stay until it is run again: re-reading the whole worktree
+            // on every file event is a cost the explorer must not pay.
+            if self.search.text().trim().is_empty() {
+                let directory = self.directory.borrow().clone();
+                self.load_tree(ui, Some(directory));
+            }
+        } else {
+            self.tree_stale.set(true);
+        }
+        // The explorer's change tints need the status even while the Git panel is hidden;
+        // refresh_git fetches only that when the panel is not on screen.
+        if self.git.is_mapped() || self.file_sidebar.is_mapped() {
+            self.refresh_git(ui);
+        } else {
+            self.git_stale.set(true);
+        }
+        self.refresh_scopes(ui);
+    }
+
     pub fn load_tree(self: &Rc<Self>, ui: &Rc<Ui>, directory: Option<String>) {
         if ui.project.get() == 0 {
             return;
@@ -939,6 +1001,25 @@ impl Editor {
         });
     }
     fn bind_controls(self: &Rc<Self>, ui: &Rc<Ui>) {
+        // Whatever shows a panel (its key, a layout restore, a page switch), a refresh that
+        // was skipped while it was hidden runs now.
+        let e = self.clone();
+        let weak = Rc::downgrade(ui);
+        self.file_sidebar.connect_map(move |_| {
+            if let Some(ui) = weak.upgrade().filter(|_| e.tree_stale.replace(false)) {
+                if e.search.text().trim().is_empty() {
+                    let directory = e.directory.borrow().clone();
+                    e.load_tree(&ui, Some(directory));
+                }
+            }
+        });
+        let e = self.clone();
+        let weak = Rc::downgrade(ui);
+        self.git.connect_map(move |_| {
+            if let Some(ui) = weak.upgrade().filter(|_| e.git_stale.replace(false)) {
+                e.refresh_git(&ui);
+            }
+        });
         let e = self.clone();
         let weak = Rc::downgrade(ui);
         self.scope.set_create_popup_func(move |button| {
@@ -1072,9 +1153,8 @@ impl Editor {
                 return;
             }
             // Native search retains undo grouping and UTF-8 text positions.
-            let result = e.search_context.replace_all(&e.replacement.text());
-            match result {
-                Ok(()) => e.position.set_text("Replaced all matches"),
+            match replace_all(&e.search_context, &e.replacement.text()) {
+                Ok(count) => e.position.set_text(&format!("Replaced {count}")),
                 Err(err) => e.position.set_text(&err.to_string()),
             }
         });
@@ -1339,5 +1419,30 @@ impl Editor {
                 Err(err) => ui.show_error(&err.to_string()),
             }
         });
+    }
+}
+
+/// Replace every match and return how many were replaced.
+///
+/// `SearchContext::replace_all` in sourceview5 0.11 asserts that a zero return means an
+/// error, but the C function returns the replacement count: no match, an empty query or an
+/// invalid pattern all return 0 with no error, and the assert aborts the client from inside
+/// a click handler. Only a set GError is a failure here.
+pub fn replace_all(search: &sourceview5::SearchContext, replace: &str) -> Result<u32, glib::Error> {
+    use glib::translate::{from_glib_full, ToGlibPtr};
+    let Ok(length) = i32::try_from(replace.len()) else {
+        return Err(glib::Error::new(glib::FileError::Inval, "Replacement text is too long"));
+    };
+    // SAFETY: `search` and `replace` outlive the call; GtkSourceView copies the replacement
+    // and either leaves `error` null or sets it to a GError we take ownership of.
+    unsafe {
+        let mut error = std::ptr::null_mut();
+        let count = sourceview5::ffi::gtk_source_search_context_replace_all(
+            search.to_glib_none().0,
+            replace.to_glib_none().0,
+            length,
+            &mut error,
+        );
+        if error.is_null() { Ok(count) } else { Err(from_glib_full(error)) }
     }
 }

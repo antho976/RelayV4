@@ -4,7 +4,7 @@
   "title": "RELAY v4 command bus",
   "description": "Generated from crates/relay-bus by `relay schema`. Do not edit; see docs/BUS.md.",
   "version": 1,
-  "op_count": 222,
+  "op_count": 223,
   "envelope": {
     "request": {
       "$ref": "#/$defs/Request"
@@ -3799,6 +3799,25 @@
       },
       "result": {
         "$ref": "#/$defs/SkillListOut"
+      }
+    },
+    "skill.get": {
+      "summary": "One skill with its whole body",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "executor": "core",
+      "actors": "all",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 11,
+      "payload": {
+        "$ref": "#/$defs/SkillIdIn"
+      },
+      "result": {
+        "$ref": "#/$defs/Skill"
       }
     },
     "skill.create": {
@@ -13420,6 +13439,13 @@
             "boolean",
             "null"
           ]
+        },
+        "summary": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Cut each body to its opening, frontmatter included, instead of the whole SKILL.md;\n`skill.get` returns one whole body."
         }
       }
     },
@@ -13491,6 +13517,19 @@
         "updated_at"
       ]
     },
+    "SkillIdIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "skill_id": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "skill_id"
+      ]
+    },
     "SkillCreateIn": {
       "type": "object",
       "additionalProperties": false,
@@ -13526,19 +13565,6 @@
             "string",
             "null"
           ]
-        }
-      },
-      "required": [
-        "skill_id"
-      ]
-    },
-    "SkillIdIn": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "skill_id": {
-          "type": "integer",
-          "format": "int64"
         }
       },
       "required": [

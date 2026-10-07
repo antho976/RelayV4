@@ -280,7 +280,7 @@ impl Ui {
             let Some(ui) = weak.upgrade() else { return };
             if let Some(id) = sidebar(|s| s.first_match) {
                 entry.set_text("");
-                ui.open_project(id, "agents");
+                ui.switch_project(id);
             }
         });
         entry.connect_stop_search(|entry| entry.set_text(""));
@@ -413,7 +413,7 @@ impl Ui {
         let weak = Rc::downgrade(self);
         b.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
-                ui.open_project(id, "agents");
+                ui.switch_project(id);
             }
         });
         row.set_child(Some(&b));
@@ -503,9 +503,13 @@ impl Ui {
             key.set_child(Some(&line));
             body.append(&key);
             let weak = Rc::downgrade(self);
-            let pop = popover.clone();
+            // Weak: the key lives inside the popover, so a strong capture is a cycle that keeps
+            // every rebuilt row's menu alive.
+            let pop = popover.downgrade();
             key.connect_clicked(move |_| {
-                pop.popdown();
+                if let Some(pop) = pop.upgrade() {
+                    pop.popdown();
+                }
                 if let Some(ui) = weak.upgrade() {
                     action(&ui);
                 }
@@ -823,9 +827,10 @@ impl Ui {
         let discard = Rc::new(Cell::new(false));
         // Validate on every edit: errors sit under their field, Save waits for a valid change.
         let check: Rc<dyn Fn() -> bool> = {
-            // Weak: the inputs' own handlers hold this closure.
+            // Weak: the inputs' own handlers hold this closure, and Save's handler holds the
+            // inputs, so a strong Save here would keep the whole form alive after close.
             let (name, branch, build, run, pinned) = (name.downgrade(), branch.downgrade(), build.downgrade(), run.downgrade(), pinned.downgrade());
-            let (name_error, branch_error, status, save, original) = (name_error.clone(), branch_error.clone(), status.clone(), save.clone(), original.clone());
+            let (name_error, branch_error, status, save, original) = (name_error.clone(), branch_error.clone(), status.clone(), save.downgrade(), original.clone());
             Rc::new(move || {
                 let (Some(name), Some(branch), Some(build), Some(run), Some(pinned)) =
                     (name.upgrade(), branch.upgrade(), build.upgrade(), run.upgrade(), pinned.upgrade())
@@ -864,7 +869,9 @@ impl Ui {
                 }
                 status.remove_css_class("registry-status-warn");
                 status.set_text(if !valid { "Fix the highlighted field to save." } else if dirty { "Unsaved changes" } else { "" });
-                save.set_sensitive(valid && dirty);
+                if let Some(save) = save.upgrade() {
+                    save.set_sensitive(valid && dirty);
+                }
                 dirty
             })
         };

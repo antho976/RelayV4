@@ -66,6 +66,21 @@ pub fn clear(container: &gtk::Box) {
         container.remove(&w);
     }
 }
+/// A popover open somewhere under `root`. A page rebuilt under an open popover closes it
+/// under the pointer, so rebuilds wait for this to close.
+pub fn open_popover(root: &gtk::Widget) -> Option<gtk::Popover> {
+    let mut child = root.first_child();
+    while let Some(widget) = child {
+        if let Some(popover) = widget.downcast_ref::<gtk::Popover>().filter(|p| p.is_visible()) {
+            return Some(popover.clone());
+        }
+        if let Some(found) = open_popover(&widget) {
+            return Some(found);
+        }
+        child = widget.next_sibling();
+    }
+    None
+}
 pub fn scrolled(child: &impl IsA<gtk::Widget>) -> gtk::ScrolledWindow {
     gtk::ScrolledWindow::builder()
         .child(child)
@@ -262,6 +277,9 @@ pub struct Ui {
     pub(crate) workspaces: RefCell<Vec<Value>>,
     rendered_sessions: RefCell<BTreeMap<String, Value>>,
     restored_project: Cell<i64>,
+    /// The project an explicit destination was opened for: its layout restore applies
+    /// everything but the saved page.
+    explicit_page: Cell<i64>,
     layout_revision: Cell<u64>,
     layout_saves: RefCell<BTreeMap<i64, Value>>,
     layout_saving: Cell<bool>,
@@ -775,6 +793,7 @@ impl Ui {
             workspaces: RefCell::default(),
             rendered_sessions: RefCell::default(),
             restored_project: Cell::new(0),
+            explicit_page: Cell::new(0),
             layout_revision: Cell::new(0),
             layout_saves: RefCell::default(),
             layout_saving: Cell::new(false),
@@ -1151,7 +1170,7 @@ impl Ui {
                         return;
                     }
                     *ui.client.borrow_mut() = Some(client);
-                    if let Err(e)=ui.call("bus.subscribe",json!({"events":["project.changed","project.deleted","workspace.changed","session.changed","task.changed","task.deleted","mailbox.new","mailbox.changed","guardrail.held","guardrail.resolved","overlap.changed","notes.changed","notes.deleted","file.changed","git.changed","worktree.changed","module.changed","module.deleted","skill.changed","skill.deleted","plugin.changed","settings.changed","provider.update.changed","notify.new","notify.changed","device.changed","device.lease.acquired","device.lease.released","run.changed","run.crash","device.signing.changed","avd.changed","layout.changed","ui.changed","ui.toast","usage.changed","integration.changed","integration.result"]})).await { ui.show_error(&e.to_string()); return; }
+                    if let Err(e)=ui.call("bus.subscribe",json!({"events":["project.changed","project.deleted","workspace.changed","session.changed","task.changed","task.deleted","mailbox.new","mailbox.changed","guardrail.held","guardrail.resolved","guardrail.grant_used","overlap.changed","notes.changed","notes.deleted","file.changed","git.changed","worktree.changed","module.changed","module.deleted","skill.changed","skill.deleted","plugin.changed","settings.changed","provider.update.changed","notify.new","notify.changed","device.changed","device.lease.acquired","device.lease.released","run.changed","run.crash","device.signing.changed","avd.changed","layout.changed","ui.changed","ui.toast","usage.changed","integration.changed","integration.result"]})).await { ui.show_error(&e.to_string()); return; }
                     ui.connected.set(true);
                     crate::provider_updates::startup(&ui);
                     ui.status.set_text("");
@@ -1183,6 +1202,13 @@ impl Ui {
                                         ui.navigation_echoes.borrow_mut().remove(&id)
                                     })
                                 {
+                                    continue;
+                                }
+                                // An event too large to read: whatever it changed, re-read it.
+                                if e.ev == crate::client::DROPPED_EVENT {
+                                    tracing::warn!(ev = text(&e.payload, "ev"), "dropped an oversized engine event");
+                                    crate::pages::refresh_notes(&ui);
+                                    ui.refresh();
                                     continue;
                                 }
                                 if matches!(
@@ -1237,7 +1263,7 @@ impl Ui {
                                         | "integration.changed"
                                         | "integration.result"
                                 ) {
-                                    ui.editor.invalidate(&ui);
+                                    ui.editor.invalidate(&ui, Some((&e.ev, &e.payload)));
                                 } else if e.ev == "layout.changed"
                                     && e.payload["action"] == "applied"
                                 {

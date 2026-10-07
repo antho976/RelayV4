@@ -36,6 +36,7 @@ static SPEC: Spec = Spec {
     placeholder: "Search plugins, skills and tools",
     filters: &["All", "Enabled", "Available", "Suggested"],
     list_op: "plugin.list",
+    list_payload: || json!({}),
     list_key: "plugins",
     enable_op: "plugin.enable",
     id_key: "plugin_id",

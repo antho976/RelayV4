@@ -138,6 +138,81 @@ fn split_path(path: &str) -> (&str, &str) {
     }
 }
 
+/// What the Git panel draws, hashed: a refresh that fetched the same thing leaves it alone.
+fn git_signature(ui: &Ui, e: &Editor, status: &Value, results: &GitResults) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    status.to_string().hash(&mut hash);
+    for result in [&results.0, &results.1, &results.2, &results.3] {
+        match result {
+            Ok(value) => value.to_string().hash(&mut hash),
+            Err(error) => error.to_string().hash(&mut hash),
+        }
+    }
+    for session in ui.sessions.borrow().iter().filter(|s| text(s, "state") != "closed") {
+        (text(session, "name"), text(session, "branch")).hash(&mut hash);
+    }
+    for worktree in e.worktrees.borrow().iter() {
+        (text(worktree, "path"), text(worktree, "branch")).hash(&mut hash);
+    }
+    hash.finish()
+}
+
+type GitResults = (
+    Result<Value, Error>,
+    Result<Value, Error>,
+    Result<Value, Error>,
+    Result<Value, Error>,
+);
+
+/// Every scroller's position under `root`, in tree order.
+fn scroll_positions(root: &gtk::Widget) -> Vec<f64> {
+    let mut positions = Vec::new();
+    fn walk(widget: &gtk::Widget, positions: &mut Vec<f64>) {
+        if let Some(scroller) = widget.downcast_ref::<gtk::ScrolledWindow>() {
+            positions.push(scroller.vadjustment().value());
+        }
+        let mut child = widget.first_child();
+        while let Some(next) = child {
+            walk(&next, positions);
+            child = next.next_sibling();
+        }
+    }
+    walk(root, &mut positions);
+    positions
+}
+
+/// Put the scrollers a rebuild replaced back where they were, once each has its new size.
+fn restore_scrolls(root: &gtk::Widget, saved: Vec<f64>) {
+    let mut scrollers = Vec::new();
+    fn walk(widget: &gtk::Widget, scrollers: &mut Vec<gtk::Adjustment>) {
+        if let Some(scroller) = widget.downcast_ref::<gtk::ScrolledWindow>() {
+            scrollers.push(scroller.vadjustment());
+        }
+        let mut child = widget.first_child();
+        while let Some(next) = child {
+            walk(&next, scrollers);
+            child = next.next_sibling();
+        }
+    }
+    walk(root, &mut scrollers);
+    if scrollers.len() != saved.len() {
+        return;
+    }
+    for (adjustment, value) in scrollers.into_iter().zip(saved) {
+        if value <= 0. {
+            continue;
+        }
+        let done = Cell::new(false);
+        adjustment.connect_changed(move |a| {
+            if !done.get() && a.upper() - a.page_size() >= value {
+                done.set(true);
+                a.set_value(value);
+            }
+        });
+    }
+}
+
 impl Editor {
     pub(super) fn refresh_git(self: &Rc<Self>, ui: &Rc<Ui>) {
         if ui.project.get() == 0 {
@@ -167,9 +242,47 @@ impl Editor {
                     return;
                 }
             };
-            clear(&e.git);
             let files = rows(&status, "files");
             e.note_changes(&files);
+            // Hidden, the panel needs only the status that tints the explorer; it is rebuilt
+            // when it is next shown.
+            if !e.git.is_mapped() {
+                e.git_stale.set(true);
+                return;
+            }
+            let results = tokio::join!(
+                ui.call("git.branches", payload.clone()),
+                ui.call("git.log", e.payload(&ui, json!({"limit":30}))),
+                ui.call("integration.list", json!({"project_id":project})),
+                ui.call("git.pr.list", json!({"project_id":project}))
+            );
+            if !e.matches(&ui, project, &worktree) || revision != e.git_revision.get() {
+                return;
+            }
+            // Nothing the panel draws has changed: keep it, with its focus, popovers and scroll.
+            let signature = git_signature(&ui, &e, &status, &results);
+            if e.git.first_child().is_some() && e.git_signature.get() == signature {
+                return;
+            }
+            // A rebuild would close an open branch picker or commit menu under the pointer:
+            // wait for it to close.
+            if let Some(popover) = crate::app::open_popover(e.git.upcast_ref()) {
+                if !e.git_deferred.replace(true) {
+                    let (ed, weak) = (Rc::downgrade(&e), Rc::downgrade(&ui));
+                    popover.connect_closed(move |_| {
+                        if let (Some(ed), Some(ui)) = (ed.upgrade(), weak.upgrade()) {
+                            if ed.git_deferred.replace(false) {
+                                ed.refresh_git(&ui);
+                            }
+                        }
+                    });
+                }
+                return;
+            }
+            e.git_signature.set(signature);
+            let typing = e.commit_message.has_focus();
+            let scrolls = scroll_positions(e.git.upcast_ref());
+            clear(&e.git);
             let branch_name = text(&status, "branch").to_string();
             let ahead = status["ahead"].as_i64();
             let behind = status["behind"].as_i64();
@@ -247,7 +360,20 @@ impl Editor {
             panes.set_resize_end_child(false);
             panes.set_shrink_end_child(false);
             let free = ui.window.height().max(ui.window.default_height()) - 42 - 24 - 36;
-            panes.set_position(if folded("history") { free - 34 } else { (free - 280).max(120) });
+            let kept = e.git_split_position.get();
+            panes.set_position(if kept > 0 {
+                kept
+            } else if folded("history") {
+                free - 34
+            } else {
+                (free - 280).max(120)
+            });
+            let split_position = Rc::downgrade(&e);
+            panes.connect_position_notify(move |panes| {
+                if let Some(ed) = split_position.upgrade() {
+                    ed.git_split_position.set(panes.position());
+                }
+            });
             let upper = gtk::Box::new(gtk::Orientation::Vertical, 0);
             upper.add_css_class("code-git-upper");
             panes.set_start_child(Some(&scrolled(&upper)));
@@ -549,7 +675,13 @@ impl Editor {
             history_section.root.add_css_class("scm-history");
             let graph_key = gtk::ToggleButton::with_label("Graph");
             graph_key.add_css_class("code-graph-toggle");
-            graph_key.set_active(true);
+            graph_key.set_active(e.git_graph.get());
+            let graph_state = Rc::downgrade(&e);
+            graph_key.connect_toggled(move |key| {
+                if let Some(ed) = graph_state.upgrade() {
+                    ed.git_graph.set(key.is_active());
+                }
+            });
             history_section.actions.append(&graph_key);
             let history_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
             history_box.add_css_class("code-history");
@@ -575,15 +707,6 @@ impl Editor {
                 }
             });
 
-            let results = tokio::join!(
-                ui.call("git.branches", payload.clone()),
-                ui.call("git.log", e.payload(&ui, json!({"limit":30}))),
-                ui.call("integration.list", json!({"project_id":project})),
-                ui.call("git.pr.list", json!({"project_id":project}))
-            );
-            if !e.matches(&ui, project, &worktree) || revision != e.git_revision.get() {
-                return;
-            }
             let branch_record = results.0.as_ref().ok().and_then(|value| {
                 rows(value, "branches")
                     .into_iter()
@@ -695,10 +818,21 @@ impl Editor {
             test.add_css_class("code-merge-action");
             test.set_sensitive(false);
             let selected_count = Rc::new(Cell::new(0_usize));
-            for (_, pick) in &picks {
+            for (pick_name, pick) in &picks {
                 let count = selected_count.clone();
-                let test = test.clone();
+                // Weak: Test's own handler owns every pick, so a strong Test here is a cycle.
+                let test = test.downgrade();
+                let (remember, name) = (Rc::downgrade(&e), pick_name.clone());
                 pick.connect_toggled(move |pick| {
+                    if let Some(ed) = remember.upgrade() {
+                        let mut picked = ed.git_merge_picks.borrow_mut();
+                        if pick.is_active() {
+                            picked.insert(name.clone());
+                        } else {
+                            picked.remove(&name);
+                        }
+                    }
+                    let Some(test) = test.upgrade() else { return };
                     let total = if pick.is_active() {
                         count.get() + 1
                     } else {
@@ -714,6 +848,14 @@ impl Editor {
                 });
             }
             merge.append(&test);
+            // Ticks survive a refresh; a session that has gone drops out of the set.
+            let picked = e.git_merge_picks.borrow().clone();
+            e.git_merge_picks.borrow_mut().retain(|name| picks.iter().any(|(n, _)| n == name));
+            for (name, pick) in &picks {
+                if picked.contains(name) {
+                    pick.set_active(true);
+                }
+            }
             let weak = Rc::downgrade(&ui);
             let ed = e.clone();
             test.connect_clicked(move |key| {
@@ -840,6 +982,9 @@ impl Editor {
                         });
                         history_box.append(&b);
                     }
+                    for graph in &graphs {
+                        graph.set_visible(graph_key.is_active());
+                    }
                     graph_key.connect_toggled(move |key| {
                         for graph in &graphs {
                             graph.set_visible(key.is_active());
@@ -847,6 +992,10 @@ impl Editor {
                     });
                 }
                 Err(err) => history_box.append(&label(&err.to_string(), "code-git-hint")),
+            }
+            restore_scrolls(e.git.upcast_ref(), scrolls);
+            if typing {
+                e.commit_message.grab_focus();
             }
         });
     }
@@ -994,13 +1143,15 @@ impl Editor {
         form.append(&create);
         list.append(&form);
         let reveal = form.clone();
-        let query = search.clone();
+        // Weak: search's Enter handler holds this key, so a strong search here is a cycle that
+        // keeps every rebuilt picker, and through `entries` every branch row, alive.
+        let query = search.downgrade();
         let focus = name.clone();
         create_key.connect_clicked(move |_| {
             let open = !reveal.is_visible();
             reveal.set_visible(open);
             if open {
-                if focus.text().is_empty() {
+                if let Some(query) = query.upgrade().filter(|_| focus.text().is_empty()) {
                     focus.set_text(query.text().trim());
                 }
                 focus.grab_focus();

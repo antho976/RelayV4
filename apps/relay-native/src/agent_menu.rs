@@ -130,8 +130,13 @@ impl Ui {
         }
         self.render_projects();
         self.reconcile();
-        if matches!(self.page.borrow().as_str(), "board" | "dashboard") {
-            self.refresh_page();
+        // The board shows this project's sessions only; the dashboard shows every project.
+        let here = payload["project_id"].as_i64() == Some(self.project.get());
+        let page = self.page.borrow().clone();
+        match page.as_str() {
+            "dashboard" => self.refresh_page(),
+            "board" if here => self.refresh_page(),
+            _ => {}
         }
         true
     }
@@ -448,10 +453,12 @@ impl Ui {
         let brief = row_key("brief", "Inspect launch brief", "Read the instructions and peer brief this agent was started with");
         let weak = Rc::downgrade(self);
         let n = name.clone();
-        let p = popover.clone();
+        let p = popover.downgrade();
         brief.connect_clicked(move |_| {
             let Some(ui) = weak.upgrade() else { return };
-            p.popdown();
+            if let Some(p) = p.upgrade() {
+                p.popdown();
+            }
             let n = n.clone();
             glib::spawn_future_local(async move {
                 match ui.call("session.brief", json!({"session": n})).await {
@@ -538,7 +545,7 @@ impl Ui {
         let weak = Rc::downgrade(self);
         let n = name.clone();
         let (writes, control) = (switches[0].clone(), switches[1].clone());
-        let p = popover.clone();
+        let p = popover.downgrade();
         save.connect_clicked(move |key| {
             let Some(ui) = weak.upgrade() else { return };
             let mut payload = json!({"session": n, "bus_writes": writes.is_active(), "allow_ui": control.is_active()});
@@ -553,7 +560,9 @@ impl Ui {
                 match ui.call("session.update", payload).await {
                     Ok(session) => {
                         ui.upsert_session(&session);
-                        p.popdown();
+                        if let Some(p) = p.upgrade() {
+                            p.popdown();
+                        }
                     }
                     Err(e) => {
                         ui.show_error(&e.to_string());
@@ -575,9 +584,11 @@ impl Ui {
             let confirm = gtk::Revealer::new();
             let weak = Rc::downgrade(self);
             let n = name.clone();
-            let p = popover.clone();
+            let p = popover.downgrade();
             confirm_strip(&confirm, "Clear the saved provider conversation and start fresh here?", "Start fresh", None, move |_| {
-                p.popdown();
+                if let Some(p) = p.upgrade() {
+                    p.popdown();
+                }
                 if let Some(ui) = weak.upgrade() {
                     ui.agent_op("session.clear_restorable", &n, None);
                 }
@@ -605,9 +616,11 @@ impl Ui {
         options.append(&purge);
         let weak = Rc::downgrade(self);
         let n = name.clone();
-        let p = popover.clone();
+        let p = popover.downgrade();
         confirm_strip(&confirm, "Stop this agent and close its pane? The branch is kept.", "Close", Some(&options), move |_| {
-            p.popdown();
+            if let Some(p) = p.upgrade() {
+                p.popdown();
+            }
             if let Some(ui) = weak.upgrade() {
                 ui.close_agent(n.clone(), json!({"session": n, "remove_worktree": remove.is_active(), "purge_build": purge.is_active()}));
             }
@@ -832,8 +845,13 @@ fn confirm_strip(revealer: &gtk::Revealer, caption: &str, action: &str, extra: O
     cancel.add_css_class("quiet");
     let go = gtk::Button::with_label(action);
     go.add_css_class("agent-menu-confirm-go");
-    let r = revealer.clone();
-    cancel.connect_clicked(move |_| r.set_reveal_child(false));
+    // Weak: Cancel sits inside the revealer.
+    let r = revealer.downgrade();
+    cancel.connect_clicked(move |_| {
+        if let Some(r) = r.upgrade() {
+            r.set_reveal_child(false);
+        }
+    });
     go.connect_clicked(move |key| run(key));
     keys.append(&cancel);
     keys.append(&go);

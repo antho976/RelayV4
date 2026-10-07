@@ -476,31 +476,37 @@ pub fn compose(ui: &Rc<Ui>, project: i64) {
         false
     });
     cancel.set_label("Discard draft");
-    let p = panel.clone();
+    // Weak captures: both keys sit inside the form the panel owns, so strong ones would keep
+    // the form and the panel alive after it closes.
+    let p = Rc::downgrade(&panel);
     let permit = permit_close.clone();
     let working = busy.clone();
     cancel.connect_clicked(move |_| {
         if !working.get() {
             permit.set(true);
-            p.close();
+            if let Some(p) = p.upgrade() {
+                p.close();
+            }
         }
     });
     let weak = Rc::downgrade(ui);
-    let p = panel.clone();
+    let p = Rc::downgrade(&panel);
+    let form = form.downgrade();
     create.connect_clicked(move |_| {
         let Some(ui) = weak.upgrade() else { return; };
         let name = title.text().trim().to_string();
         if name.is_empty() { title.grab_focus(); return; }
         if busy.replace(true) { return; }
         let payload = json!({"project_id": project, "title": name, "body": buffer_text(&description.buffer()), "type": chosen(&kind), "priority": chosen(&priority), "size": if chosen(&size).is_empty() {Value::Null} else {json!(chosen(&size))}, "column":chosen(&column),"state":chosen(&state),"parent_id":chosen(&parent).parse::<i64>().ok(),"module_id":chosen(&module).parse::<i64>().ok(),"changelog":changelog.text().to_string(),"labels":labels.text().split(',').map(str::trim).filter(|s|!s.is_empty()).collect::<Vec<_>>()});
+        let Some(form) = form.upgrade() else { return; };
         form.set_sensitive(false);
-        let form = form.clone(); let status = status.clone(); let p = p.clone();
+        let status = status.clone(); let p = p.clone();
         let busy = busy.clone(); let permit = permit_close.clone();
         glib::spawn_future_local(async move {
             let result = ui.call("task.create", payload).await;
             busy.set(false);
             match result {
-                Ok(_) => { permit.set(true); p.close(); ui.refresh_page(); },
+                Ok(_) => { permit.set(true); if let Some(p) = p.upgrade() { p.close(); } ui.refresh_page(); },
                 Err(e) => { status.set_text(&e.to_string()); form.set_sensitive(true); }
             }
         });
@@ -514,10 +520,15 @@ pub fn open(ui: &Rc<Ui>, id: i64) {
         match ui.call("task.get", json!({"task_id":id})).await {
             Ok(task) => {
                 let project = task["project_id"].as_i64().unwrap_or(0);
-                let modules = ui
-                    .call("module.list", json!({"project_id":project}))
+                // Completed modules too: a task keeps its module after the module is completed,
+                // and a combo that cannot show it reads as an edit and Save would unassign it.
+                let modules = match ui
+                    .call("module.list", json!({"project_id":project,"include_archived":true}))
                     .await
-                    .unwrap_or(Value::Null);
+                {
+                    Ok(modules) => modules,
+                    Err(e) => return ui.show_error(&format!("Could not load modules: {e}")),
+                };
                 let tasks = ui
                     .call("task.list", json!({"project_id":project}))
                     .await
@@ -565,8 +576,17 @@ fn detail(ui: &Rc<Ui>, task: Value, modules: Vec<Value>, tasks: Vec<Value>) {
     );
     let module = gtk::ComboBoxText::new();
     module.append(Some(""), "No module");
+    let current_module = task["module_id"].as_i64();
     for m in &modules {
-        module.append(Some(&m["id"].to_string()), text(m, "name"));
+        let completed = !m["completed_at"].is_null();
+        if completed && m["id"].as_i64() != current_module {
+            continue;
+        }
+        let name = if completed { format!("{} (completed)", text(m, "name")) } else { text(m, "name").to_string() };
+        module.append(Some(&m["id"].to_string()), &name);
+    }
+    if let Some(id) = current_module.filter(|id| !modules.iter().any(|m| m["id"].as_i64() == Some(*id))) {
+        module.append(Some(&id.to_string()), &format!("Module #{id}"));
     }
     module.set_active_id(Some(
         &task["module_id"]

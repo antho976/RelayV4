@@ -832,7 +832,7 @@ Provider-neutral Markdown; the same for both providers.
 | `git.status` | query | `{ project_id, worktree? }` → `{ branch, upstream?, ahead, behind, files: FileStatus[] }` |
 |  |  | **`worktree` throughout `git.*` and `file.*`:** omitted, it is the caller's own session worktree for an agent and the project root for the user. `"@project"` asks for the project root explicitly. Defaulting an agent to the project root returned confident, well-formed, wrong answers with no error either way (D111) |
 | `git.diff` | query | `{ project_id, worktree?, base?, staged? }` → `{ files: DiffFile[] }` |
-| `git.diff.file` | query | `{ project_id, worktree?, path, base? }` → `{ old, new, hunks }` (for `@codemirror/merge`) |
+| `git.diff.file` | query | `{ project_id, worktree?, path, base? }` → `{ old, new, hunks }` (for `@codemirror/merge`); refuses a binary file (`git.diff_binary`) or one whose old + new text passes 1 MiB (`git.diff_too_large`) before building the reply |
 | `git.log` | query | `{ project_id, worktree?, branch?, limit? = 200, graph? }` → `{ commits: Commit[] }` |
 | `git.show` | query | `{ project_id, sha }` → `{ commit: Commit, files: DiffFile[] }` |
 | `git.branches` | query | `{ project_id, worktree? }` → `{ current, branches: Branch[] }` (with merged flag and session owner; `current` follows the selected worktree) |
@@ -866,8 +866,8 @@ All paths are relative to the worktree root; `..` and absolute paths are `invali
 | `file.delete` | mutation · always · inverse (restore) | `{ project_id, worktree?, path }` → `{ trash_id }` |
 | `file.restore` | mutation · always | `{ project_id, trash_id }` → `Entry` |
 | `file.import` | mutation · always | `{ project_id, worktree?, into, sources: path[] }` → `{ entries: Entry[] }` — OS drag-in |
-| `file.restore_head` | mutation · always · user | `{ project_id, worktree?, path }` → `Entry` — `git checkout -- <path>` |
-| `file.search` | query | `{ project_id, worktree?, query, glob?, regex?, limit? }` → `{ hits: {path, line, col, text}[] }` |
+| `file.restore_head` | mutation · always · user | `{ project_id, worktree?, path }` → `Entry` — `git checkout -- <path>`; the one-click answer to a post-hoc `guardrail.violation` (§9.3) |
+| `file.search` | query | `{ project_id, worktree?, query, glob?, regex?, limit? }` → `{ hits: {path, line, col, text}[] }`; searches regular text files only (a symlink only when it stays inside the worktree), skipping generated trees, files over 8 MiB and any with a NUL in the first 8 KiB |
 
 ### 10.14 device (SPEC §9)
 
@@ -899,10 +899,11 @@ All paths are relative to the worktree root; `..` and absolute paths are `invali
 | `provider.refresh` | mutation · never | `{}` → `{ providers: ProviderInfo[] }` — re-detect now |
 | `usage.get` | query | `{ provider?: Provider }` → `{ usage: Usage[] }` — per provider, in its own units and windows; combines stored agent reports with bounded read-only CLI state inspection and never calls a provider endpoint |
 | `usage.report` | mutation · never · session · agent | `{ session, provider, payload: object }` → `{}` — the provider's own metering pushed by its statusLine/hook (v3's `statusline.rs`); core stores the latest per session and derives `usage.get` |
-| `skill.list` | query | `{ project_id?, enabled? }` → `{ skills: Skill[] }` |
+| `skill.list` | query | `{ project_id?, enabled?, summary? }` → `{ skills: Skill[] }`; with `summary: true` each `body` is cut to its first 4 KiB (the frontmatter and opening), so a large library fits one reply |
+| `skill.get` | query | `{ skill_id }` → `Skill` with its whole body; `skill.not_found` |
 | `skill.create` / `skill.update` / `skill.delete` | mutation · always · inverse | `{ name, body }` / `{ skill_id, name?, body? }` / `{ skill_id }`; a skill nobody has enabled anywhere is enabled in every project on create/install (D147) |
 | `skill.enable` | mutation · always · inverse | `{ skill_id, project_id, enabled: bool }` → `Skill`; the per-project override on top of that app-wide default |
-| `skill.install` | mutation · always | `{ url, subdir?, replace_skill_id? }` → `{ skills: Skill[] }`; clones a GitHub source, finds bounded `SKILL.md` files, prefers canonical `skills/` then Relay-native `.agents/skills/` entries over provider adapters, collapses byte-identical copies with the same name, and installs or refreshes them with source revision metadata. The whole skill folder is kept (`<store dir>/skills/<id>/`), not only the `SKILL.md` body, and is materialized into every project root and session worktree as `.claude/skills/<name>/` and `.agents/skills/<name>/`, and into the provider homes `~/.claude/skills/` and `$CODEX_HOME/skills/` — Codex reads skills from nowhere else. A folder the repository or the user wrote themselves is never overwritten (D147). Same-rank different bodies return `skill.duplicate_name`. A hidden deleted name is reclaimed automatically; a visible different-source collision returns `skill.name_exists` with both identities and requires the exact conflicting id for atomic replacement |
+| `skill.install` | mutation · always | `{ url, subdir?, replace_skill_id? }` → `{ skills: Skill[] }` (bodies cut as in `skill.list {summary: true}`); clones a GitHub source, finds bounded `SKILL.md` files, prefers canonical `skills/` then Relay-native `.agents/skills/` entries over provider adapters, collapses byte-identical copies with the same name, and installs or refreshes them with source revision metadata. The whole skill folder is kept (`<store dir>/skills/<id>/`), not only the `SKILL.md` body, and is materialized into every project root and session worktree as `.claude/skills/<name>/` and `.agents/skills/<name>/`, and into the provider homes `~/.claude/skills/` and `$CODEX_HOME/skills/` — Codex reads skills from nowhere else. A folder the repository or the user wrote themselves is never overwritten (D147). Same-rank different bodies return `skill.duplicate_name`. A hidden deleted name is reclaimed automatically; a visible different-source collision returns `skill.name_exists` with both identities and requires the exact conflicting id for atomic replacement |
 | `github.status` | query | `{}` → `{ installed, connected, login? }` |
 | `github.connect` | mutation · never | `{}` → `{ started }`; launches GitHub CLI browser auth and emits `github.changed` when it finishes; Relay stores no token |
 | `github.repo.list` | query | `{}` → `{ repositories: GitHubRepo[] }`; all repositories the connected account can access |

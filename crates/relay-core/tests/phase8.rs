@@ -133,6 +133,17 @@ fn file_lifecycle_search_and_confirmation_replay() {
     .into_result()
     .unwrap();
     assert_eq!(hits["hits"][0]["line"], 1);
+    // Binaries and non-regular files are skipped, not read: a FIFO would block the walk.
+    let src = std::path::Path::new(&repo).join("src");
+    std::fs::write(src.join("asset.bin"), b"println\0").unwrap();
+    let fifo = src.join("pipe");
+    assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    let hits = call(&e, "file.search", json!({"project_id":1,"query":"println","glob":"src/**"}))
+        .into_result()
+        .unwrap();
+    assert_eq!(hits["hits"].as_array().unwrap().len(), 1, "{hits}");
+    std::fs::remove_file(src.join("asset.bin")).unwrap();
+    std::fs::remove_file(fifo).unwrap();
     let deleted = call(
         &e,
         "file.delete",
@@ -225,6 +236,14 @@ fn git_status_diff_commit_log_show_and_branches() {
     .unwrap();
     assert_eq!(diff["old"], "");
     assert!(diff["new"].as_str().unwrap().contains("two"));
+    // A binary or oversized file is refused before its reply outgrows a client's line.
+    let root = std::path::Path::new(&repo);
+    std::fs::write(root.join("blob.bin"), b"head\0tail").unwrap();
+    std::fs::write(root.join("huge.txt"), "line\n".repeat(300_000)).unwrap();
+    assert_eq!(err(&call(&e, "git.diff.file", json!({"project_id":1,"path":"blob.bin"}))).code, "git.diff_binary");
+    assert_eq!(err(&call(&e, "git.diff.file", json!({"project_id":1,"path":"huge.txt"}))).code, "git.diff_too_large");
+    std::fs::remove_file(root.join("blob.bin")).unwrap();
+    std::fs::remove_file(root.join("huge.txt")).unwrap();
     call(
         &e,
         "git.stage",

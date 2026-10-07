@@ -54,6 +54,14 @@ fn skills_crud_filter_enable_delete_and_undo() {
 
     let updated = ok(&engine, "skill.update", json!({"skill_id":id,"body":"Run cargo test --all-targets."}));
     assert!(updated["body"].as_str().unwrap().contains("all-targets"));
+    // A summary list cuts long bodies; skill.get returns the whole one.
+    let long = format!("---\nname: Verify\n---\n{}", "é".repeat(5000));
+    ok(&engine, "skill.update", json!({"skill_id":id,"body":long}));
+    let summary = ok(&engine, "skill.list", json!({"summary":true}));
+    let cut = summary["skills"][0]["body"].as_str().unwrap();
+    assert!(cut.len() <= 4096 && long.starts_with(cut), "summary keeps the opening");
+    assert_eq!(ok(&engine, "skill.get", json!({"skill_id":id}))["body"], long.as_str());
+    assert_eq!(ok(&engine, "skill.list", json!({}))["skills"][0]["body"], long.as_str());
     ok(&engine, "skill.delete", json!({"skill_id":id}));
     assert!(ok(&engine, "skill.list", json!({}))["skills"].as_array().unwrap().is_empty());
 
