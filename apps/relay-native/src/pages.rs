@@ -16,6 +16,7 @@ mod task_pages;
 #[path = "board_view.rs"]
 mod board_view;
 pub use notes_window::{refresh_notes, show_notes, NotesWindow};
+pub use note_pages::{close_all_notes, unsaved_notes};
 pub use task_pages::Draft;
 pub use guardrail_pages::{guardrail_event, hold_summary, restore_prompts, settings_editor as guardrail_settings};
 #[allow(unused_imports)] // entry points for the workspace and project menus
@@ -176,12 +177,6 @@ pub async fn refresh(ui: &Rc<Ui>, name: &str, project: i64) {
                 row.append(&paragraph(text(&message, "text")));
                 row.append(&label(text(&message, "sent_at"), "dim"));
                 body.append(&row);
-            }
-        }
-        // Unreachable (Notes has its own window); goes with note_pages::note_row.
-        "notes" => {
-            for note in data {
-                note_pages::note_row(ui, &body, note);
             }
         }
         "modules" => note_pages::modules(ui, &body, &data),

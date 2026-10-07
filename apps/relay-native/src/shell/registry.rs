@@ -670,13 +670,33 @@ impl Ui {
         cancel.grab_focus();
     }
 
-    /// Forget removed rows at once and move the wall off a removed project, to its nearest
-    /// remaining neighbour in sidebar order.
+    /// Every project's id in sidebar order.
+    pub(crate) fn project_order(&self) -> Vec<i64> {
+        let all = self.projects.borrow();
+        self.workspaces.borrow().iter().flat_map(|w| sorted_children(&all, w)).map(id_of).collect()
+    }
+
+    /// Move the wall off the active project, which `self.projects` no longer lists: to its
+    /// nearest remaining neighbour in `order` (the sidebar order from before it went), else
+    /// the first project left, else none. A removal made here and one a refresh finds both
+    /// come through here. False when unsaved work keeps the wall where it is.
+    pub(crate) fn leave_removed_project(self: &Rc<Self>, order: &[i64]) -> bool {
+        let active = self.project.get();
+        if self.editor.is_dirty() {
+            self.show_error("The selected project was removed. Save or copy your editor changes before selecting another project.");
+            return false;
+        }
+        let live: Vec<i64> = self.projects.borrow().iter().map(id_of).collect();
+        let at = order.iter().position(|&id| id == active).unwrap_or(0);
+        let next = order[at..].iter().chain(order[..at].iter().rev()).copied().find(|id| live.contains(id));
+        let page = self.page.borrow().clone();
+        self.open_project(next.or_else(|| live.first().copied()).unwrap_or(0), &page);
+        self.project.get() != active
+    }
+
+    /// Forget removed rows at once and move the wall off a removed project.
     fn registry_removed(self: &Rc<Self>, projects: &[i64], workspace: Option<i64>) {
-        let order: Vec<i64> = {
-            let all = self.projects.borrow();
-            self.workspaces.borrow().iter().flat_map(|w| sorted_children(&all, w)).map(id_of).collect()
-        };
+        let order = self.project_order();
         self.projects.borrow_mut().retain(|p| !projects.contains(&id_of(p)));
         if let Some(ws) = workspace {
             self.workspaces.borrow_mut().retain(|w| id_of(w) != ws);
@@ -687,21 +707,8 @@ impl Ui {
             self.save_collapsed();
         }
         self.registry_dirty.set(true);
-        let active = self.project.get();
-        if projects.contains(&active) {
-            let at = order.iter().position(|&id| id == active).unwrap_or(0);
-            let next = order[at..].iter().chain(order[..at].iter().rev()).copied().find(|id| !projects.contains(id));
-            match next {
-                Some(next) => {
-                    let page = self.page.borrow().clone();
-                    self.open_project(next, &page);
-                }
-                None => {
-                    self.project.set(0);
-                    self.sessions.borrow_mut().clear();
-                    self.reconcile();
-                }
-            }
+        if projects.contains(&self.project.get()) {
+            self.leave_removed_project(&order);
         }
         sidebar(|s| s.rendered = None);
         self.refresh();
@@ -711,7 +718,7 @@ impl Ui {
     /// when something changed and everything is valid.
     pub(crate) fn registry_editor(self: &Rc<Self>, value: Value, workspace: bool) {
         let title = if workspace { "Workspace settings" } else { "Project settings" };
-        let Some((panel, body)) = self.sheet(title, 460, 0) else {
+        let Some((panel, body)) = self.sheet(title, 460) else {
             return;
         };
         panel.add_css_class("registry-editor");

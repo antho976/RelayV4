@@ -492,7 +492,7 @@ impl Ui {
             glib::spawn_future_local(async move {
                 match ui.call("session.brief", json!({"session": n})).await {
                     Ok(v) => {
-                        let Some((window, sheet)) = ui.sheet("Launch brief", 760, 640) else { return };
+                        let Some((window, sheet)) = ui.sheet("Launch brief", 760) else { return };
                         let view = gtk::TextView::new();
                         view.set_editable(false);
                         view.set_monospace(true);

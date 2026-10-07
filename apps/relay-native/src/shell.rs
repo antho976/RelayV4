@@ -156,7 +156,6 @@ impl Ui {
         &self,
         title: &str,
         width: i32,
-        _height: i32,
     ) -> Option<(Rc<crate::panel::Panel>, gtk::Box)> {
         let panel = crate::panel::Panel::toggle(self, title, width)?;
         let body = panel.body.clone();
@@ -502,7 +501,7 @@ impl Ui {
         self.applying_ui.set(false);
     }
     pub(super) fn layout_menu(self: &Rc<Self>) {
-        let Some((window, body)) = self.sheet("Window presets", 390, 420) else {
+        let Some((window, body)) = self.sheet("Window presets", 390) else {
             return;
         };
         window.compact(false, 620);
@@ -921,7 +920,7 @@ impl Ui {
     }
     pub(super) fn project_skills(self: &Rc<Self>) {
         let project = self.project.get();
-        let Some((panel, body)) = self.sheet("Agent skills", 390, 560) else {
+        let Some((panel, body)) = self.sheet("Agent skills", 390) else {
             return;
         };
         panel.top(560);
@@ -995,9 +994,10 @@ impl Ui {
             }
         });
     }
-    /// The plugin switches of `project` (the agents toolbar's Plugins key passes the one in view).
-    pub(super) fn project_plugins(self: &Rc<Self>, project: i64) {
-        let Some((panel, body)) = self.sheet("Plugins", 440, 640) else {
+    /// The plugin switches of the project in view, from the agents toolbar's Plugins key.
+    pub(super) fn project_plugins(self: &Rc<Self>) {
+        let project = self.project.get();
+        let Some((panel, body)) = self.sheet("Plugins", 440) else {
             return;
         };
         panel.top(640);
@@ -1063,7 +1063,7 @@ impl Ui {
         });
     }
     pub(super) fn command_palette(self: &Rc<Self>) {
-        let Some((window, body)) = self.sheet("Command palette", 560, 480) else {
+        let Some((window, body)) = self.sheet("Command palette", 560) else {
             return;
         };
         window.compact(true, 400);
@@ -1185,7 +1185,6 @@ impl Ui {
         });
     }
     pub(crate) fn load_appearance(self: &Rc<Self>) {
-        crate::wallpaper_rotation::refresh(self);
         let ui = self.clone();
         glib::spawn_future_local(async move {
             let generation = ui.generation.get();
