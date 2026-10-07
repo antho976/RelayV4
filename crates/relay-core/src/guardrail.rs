@@ -1182,10 +1182,253 @@ fn evaluate_commit(cfg: &GuardrailConfig, request: &GateRequest<'_>) -> Result<D
     Ok(Decision::Allow)
 }
 
+// ---------------------------------------------------------------- the branch, after the fact
+
+/// How many of a branch's commits `session.done` judges one by one. Past this, the newest are
+/// judged on their own and the older ones only as part of the branch's net change.
+pub const RECHECK_MAX_COMMITS: usize = 200;
+/// How many shape-gated files a done reads back from git.
+const RECHECK_MAX_SHAPED: usize = 50;
+
+/// What a task's branch did since the project base, read by [`measure_branch`] with the store
+/// lock released, for [`recheck_branch`] to judge inside the transaction (RA-109, RA-567).
+#[derive(Debug, Default)]
+pub struct BranchWork {
+    /// `git diff --numstat <base>...HEAD`: the net change the task brings to review.
+    range: String,
+    /// Each non-merge commit since the base, newest first, with its own numstat, renames found.
+    commits: Vec<(String, String)>,
+    /// More commits than [`RECHECK_MAX_COMMITS`]; or git could not list them, and only the
+    /// net change is judged.
+    partial: bool,
+    /// Each shape-gated file the branch changes, as it is at `HEAD`, or why it cannot be read.
+    shaped: Vec<(String, Result<String, &'static str>)>,
+}
+
+/// Read what [`recheck_branch`] judges: the branch's net numstat against `base`, each commit's
+/// numstat, and the shape-gated files it changes. `None` when git cannot measure the branch
+/// at all (no base, no history); a measurement Relay cannot take never blocks a done. Every
+/// call goes through [`crate::proc`] with a deadline, so it belongs before the store lock.
+pub fn measure_branch(cfg: &GuardrailConfig, worktree: &Path, base: &str) -> Option<BranchWork> {
+    let note = |what: &str, error: &BusError| tracing::warn!(worktree = %worktree.display(), %what, error = %error.message, "measuring task work");
+    let range = git_output(worktree, &["diff", "--numstat", "-z", "--no-renames", "--no-ext-diff", &format!("{base}...HEAD"), "--"])
+        .map_err(|error| note("diff", &error))
+        .ok()?;
+    let mut work = BranchWork { range, ..BranchWork::default() };
+    let limit = format!("--max-count={}", RECHECK_MAX_COMMITS + 1);
+    let listed = git_output(worktree, &["rev-list", "--no-merges", &limit, &format!("{base}..HEAD"), "--"]);
+    match listed {
+        Ok(listed) => {
+            let mut shas: Vec<&str> = listed.lines().filter(|line| !line.is_empty()).collect();
+            if shas.len() > RECHECK_MAX_COMMITS {
+                shas.truncate(RECHECK_MAX_COMMITS);
+                work.partial = true;
+                tracing::info!(worktree = %worktree.display(), "more than {RECHECK_MAX_COMMITS} commits since {base}; older ones are judged only in the net diff");
+            }
+            if !shas.is_empty() {
+                let input = shas.iter().map(|sha| format!("{sha}\n")).collect::<String>();
+                match git_with_input(worktree, &["diff-tree", "--stdin", "-r", "-z", "-M", "--numstat", "--root"], input.as_bytes()) {
+                    Ok(out) => work.commits = split_commits(&String::from_utf8_lossy(&out)),
+                    Err(error) => {
+                        note("diff-tree", &error);
+                        work.partial = true;
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            note("rev-list", &error);
+            work.partial = true;
+        }
+    }
+    let shaped: Vec<String> = parse_numstat(&work.range)
+        .into_iter()
+        .flat_map(|entry| entry.paths)
+        .filter(|path| !path.contains('\n') && cfg.shape_gates.iter().any(|gate| path_matches(&gate.path, Path::new(path))))
+        .take(RECHECK_MAX_SHAPED)
+        .collect();
+    if !shaped.is_empty() {
+        match read_at_head(worktree, &shaped) {
+            Some(texts) => work.shaped = shaped.into_iter().zip(texts).collect(),
+            None => tracing::warn!(worktree = %worktree.display(), "could not read shape-gated files at HEAD"),
+        }
+    }
+    Some(work)
+}
+
+/// `git diff-tree --stdin -z` output split per commit: each `<sha>\0` header, then its numstat
+/// records, kept in the `-z` form [`parse_numstat`] reads (a rename is its counts and an empty
+/// path, then both sides).
+fn split_commits(out: &str) -> Vec<(String, String)> {
+    let mut commits: Vec<(String, String)> = Vec::new();
+    let mut records = out.split('\0');
+    while let Some(record) = records.next() {
+        if record.is_empty() {
+            continue;
+        }
+        if !record.contains('\t') {
+            commits.push((record.trim().to_string(), String::new()));
+            continue;
+        }
+        let Some((_, numstat)) = commits.last_mut() else { continue };
+        numstat.push_str(record);
+        numstat.push('\0');
+        if record.splitn(3, '\t').nth(2) == Some("") {
+            for path in records.by_ref().take(2) {
+                numstat.push_str(path);
+                numstat.push('\0');
+            }
+        }
+    }
+    commits
+}
+
+/// Each of `paths` as it is at `HEAD`, in one `git cat-file --batch`. `None` when git fails.
+fn read_at_head(worktree: &Path, paths: &[String]) -> Option<Vec<Result<String, &'static str>>> {
+    let input: String = paths.iter().map(|path| format!("HEAD:{path}\n")).collect();
+    let out = git_with_input(worktree, &["cat-file", "--batch"], input.as_bytes()).ok()?;
+    let mut at = 0;
+    let mut texts = Vec::with_capacity(paths.len());
+    for _ in paths {
+        let end = at + out.get(at..)?.iter().position(|&b| b == b'\n')?;
+        let header = std::str::from_utf8(&out[at..end]).ok()?;
+        at = end + 1;
+        if header.ends_with(" missing") || header.ends_with(" ambiguous") {
+            texts.push(Err("deleted on this branch"));
+            continue;
+        }
+        let mut fields = header.rsplitn(3, ' ');
+        let size: usize = fields.next()?.parse().ok()?;
+        let kind = fields.next()?;
+        let body = out.get(at..at + size)?;
+        at += size + 1;
+        texts.push(match kind {
+            "blob" => String::from_utf8(body.to_vec()).map_err(|_| "not UTF-8 text"),
+            _ => Err("not a file"),
+        });
+    }
+    Some(texts)
+}
+
+/// Judge a finished task's branch as commits (RA-109): each commit since the base against the
+/// protected paths, the net change against the caps and protected paths, and each shape-gated
+/// file it changes against its validator. An agent's own `git commit` meets these at the
+/// pre-commit hook, which `--no-verify`, `core.hooksPath` and commits made without pre-commit
+/// (`cherry-pick`, `commit-tree`) all skip; this is the check they cannot.
+///
+/// The session's grants count and are not spent again — a `once` grant included after its one
+/// use, since that use may have been this very commit — and so does a person's confirmation
+/// of a shape-gate hold for the same file. Returns the refusal, if any.
+pub fn recheck_branch(
+    conn: &Connection,
+    actor: &Actor,
+    project_id: Id,
+    worktree: &Path,
+    session_id: Id,
+    work: &BranchWork,
+) -> Result<(), BusError> {
+    let cfg = config(conn, Some(project_id))?;
+    let grants = grants_given(conn, session_id)?;
+    let judge = |diff: &str, skip_policy: Option<&str>| -> Result<Option<BusError>, BusError> {
+        let request = GateRequest {
+            actor, project_id, worktree, kind: GateKind::Commit, path: None, new_text: None, diff: Some(diff),
+            command: None, skip_policy, grants: None, path_only: false, probes: None,
+        };
+        let first = evaluate_with(&cfg, &request)?;
+        Ok(match granted_retry(&cfg, &request, first, &grants)?.0 {
+            Decision::Allow => None,
+            Decision::Refuse(error) | Decision::Hold { error, .. } => Some(error),
+        })
+    };
+    // Caps are the task's (BUS.md §9.2), so they apply to the net change below, not per commit.
+    for (sha, numstat) in &work.commits {
+        if let Some(mut error) = judge(numstat, Some("cap"))? {
+            let short = &sha[..sha.len().min(12)];
+            error.message = format!("commit {short} on this branch: {}", error.message);
+            if let Some(Value::Object(details)) = error.details.as_mut() {
+                details.insert("commit".into(), json!(sha));
+            }
+            return Err(error);
+        }
+    }
+    if let Some(mut error) = judge(&work.range, None)? {
+        if let Some(Value::Object(details)) = error.details.as_mut() {
+            details.insert("commits_checked".into(), json!(work.commits.len()));
+            details.insert("commits_partial".into(), json!(work.partial));
+        }
+        return Err(error);
+    }
+    for (path, text) in &work.shaped {
+        let Some(gate) = cfg.shape_gates.iter().find(|gate| path_matches(&gate.path, Path::new(path))) else { continue };
+        let failure = match text {
+            Ok(text) => validate_shape(gate, text).err(),
+            Err(why) => Some(why.to_string()),
+        };
+        let Some(reason) = failure else { continue };
+        if shape_confirmed(conn, session_id, path)? {
+            continue;
+        }
+        return Err(BusError::refused(
+            "guardrail.shape_gate",
+            format!("{path} on this branch fails {}: {reason}", gate.validator),
+        )
+        .with_details(json!({"path": path, "validator": gate.validator, "reason": reason}))
+        .with_hint("Fix the file and commit the fix, then call session.done again; if it must stay this way, report the task blocked and say why."));
+    }
+    Ok(())
+}
+
+/// Every grant a person gave this session that has not been revoked, a used-up `once` grant
+/// included: for judging work already done, never for letting something new through.
+fn grants_given(conn: &Connection, session_id: Id) -> Result<Grants, BusError> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT id, json_extract(details, '$.kind'), json_extract(details, '$.value'), json_extract(details, '$.grant.scope')
+             FROM holds
+             WHERE session_id = ?1 AND op = 'guardrail.request' AND state = 'confirmed'
+               AND json_extract(details, '$.grant.revoked_at') IS NULL
+             ORDER BY id",
+        )
+        .bus()?;
+    let rows = stmt
+        .query_map([session_id], |r| {
+            Ok((r.get::<_, Id>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, Option<String>>(3)?))
+        })
+        .bus()?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .bus()?;
+    let mut grants = Grants::default();
+    grants.list = rows
+        .into_iter()
+        .filter_map(|(id, kind, value, scope)| {
+            Some(grants::Grant {
+                id,
+                kind: serde_json::from_value(Value::String(kind?)).ok()?,
+                value: value.unwrap_or_default(),
+                scope: serde_json::from_value(Value::String(scope?)).ok()?,
+            })
+        })
+        .collect();
+    Ok(grants)
+}
+
+/// Did a person confirm a shape-gate hold on `path` for this session — their own write, or an
+/// agent's held one?
+fn shape_confirmed(conn: &Connection, session_id: Id, path: &str) -> Result<bool, BusError> {
+    conn.prepare_cached(
+        "SELECT EXISTS(SELECT 1 FROM holds WHERE session_id = ?1 AND policy = 'shape_gate' AND state = 'confirmed'
+           AND ?2 IN (json_extract(details, '$.path'), json_extract(details, '$.original.path')))",
+    )
+    .bus()?
+    .query_row(params![session_id, path], |r| r.get(0))
+    .bus()
+}
+
 fn evaluate_exec(cfg: &GuardrailConfig, request: &GateRequest<'_>) -> Result<Decision, BusError> {
     let command = request.command.ok_or_else(|| {
         BusError::invalid("guardrail.command", "kind=exec requires command")
     })?;
+    let commands = shell_commands(command);
     if request.actor.is_agent() {
         if let Some(argv) = self_approval(command) {
             // No grant lifts this one: an agent approving its own exception is no exception.
@@ -1198,11 +1441,29 @@ fn evaluate_exec(cfg: &GuardrailConfig, request: &GateRequest<'_>) -> Result<Dec
                 .with_hint("Ask with guardrail.request and wait for guardrail.request_resolved; the user answers it in Relay."),
             ));
         }
+        // Nor this one: it would switch off the check a grant is an exception to.
+        if let Some((argv, what)) = hook_bypass(&commands) {
+            return Ok(Decision::Refuse(
+                BusError::refused(
+                    "guardrail.hook_bypass",
+                    format!(
+                        "{} {what}, and Relay's pre-commit hook is where your commits meet the caps and \
+                         protected paths",
+                        argv.join(" ")
+                    ),
+                )
+                .with_details(json!({"command": command, "argv": argv}))
+                .with_hint(
+                    "Commit with the hooks on (plain `git commit`, or git.commit). If the hook refuses, change what it \
+                     names, or ask for that cap or path with guardrail.request. session.done checks every commit on \
+                     the branch either way.",
+                ),
+            ));
+        }
     }
     if request.skip_policy == Some("denied_command") {
         return Ok(Decision::Allow);
     }
-    let commands = shell_commands(command);
     let uncovered = denied_matches_in(&cfg.denied_commands, &commands).into_iter().find(|hit| {
         !request.grants.is_some_and(|grants| grants.covers_command(&hit.words, &commands))
     });
@@ -1338,6 +1599,142 @@ fn sheds_identity(words: &[&str], runs_relay: bool) -> bool {
                 *flag == "-" || *flag == "--ignore-environment" || !flag.starts_with("--") && flag.contains('i')
             })
     })
+}
+
+/// Does a command line switch off Relay's pre-commit hook, the one place an agent's own `git
+/// commit` meets the caps and protected paths (RA-109)? `git commit -n` / `--no-verify` (also
+/// in a short-flag cluster, `-anm`), a `core.hooksPath` override for one command (`git -c`,
+/// `--config-env`, `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_PARAMETERS`), or a `git config` that sets,
+/// unsets or removes it. Returns the command and what it does. Shell indirection or a commit
+/// that never runs pre-commit (`cherry-pick`, `commit-tree`) still gets past this, which is why
+/// `session.done` re-checks the branch's commits ([`recheck_commits`]).
+fn hook_bypass(commands: &[Vec<Word>]) -> Option<(Vec<String>, &'static str)> {
+    let hooks_path = |assignment: &str| assignment.split('=').next().is_some_and(|key| key.trim().eq_ignore_ascii_case("core.hookspath"));
+    for command in commands {
+        if data_only(command) || is_guardrail_dry_run(command) {
+            continue;
+        }
+        let words: Vec<&str> = command.iter().map(|word| word.text.as_str()).collect();
+        let argv = || words.iter().map(|word| word.to_string()).collect::<Vec<_>>();
+        let by_environment = words.iter().any(|word| {
+            let Some((name, value)) = word.split_once('=') else { return false };
+            let key = name.strip_prefix("GIT_CONFIG_KEY_").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+            key && hooks_path(value) || name == "GIT_CONFIG_PARAMETERS" && value.to_ascii_lowercase().contains("core.hookspath")
+        });
+        if by_environment {
+            return Some((argv(), "overrides core.hooksPath"));
+        }
+        for at in (0..words.len()).filter(|&at| (at == 0 || !command[at].quoted) && shell::program(words[at]) == "git") {
+            let mut i = at + 1;
+            while let Some(&word) = words.get(i) {
+                let value = match word {
+                    "-c" | "--config-env" => words.get(i + 1).copied(),
+                    _ => word.strip_prefix("--config-env="),
+                };
+                if value.is_some_and(hooks_path) {
+                    return Some((argv(), "overrides core.hooksPath"));
+                }
+                if !word.starts_with('-') {
+                    break;
+                }
+                i += if matches!(word, "-c" | "--config-env") || takes_value("git", word) { 2 } else { 1 };
+            }
+            let rest = words.get(i + 1..).unwrap_or_default();
+            match words.get(i) {
+                Some(&"commit") if commit_skips_hooks(rest) => return Some((argv(), "skips the commit hooks")),
+                Some(&"config") if config_writes_hooks_path(rest) => return Some((argv(), "rewrites core.hooksPath")),
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// `git commit` options that take the next word as their value, so a `-n` there is a value.
+const COMMIT_VALUE_OPTIONS: &[&str] = &[
+    "message", "file", "author", "date", "reuse-message", "reedit-message", "fixup", "squash", "template",
+    "cleanup", "trailer", "pathspec-from-file",
+];
+
+/// `-n` or `--no-verify` among `git commit`'s arguments, as git's option parser reads them: a
+/// unique abbreviation (`--no-veri`) counts, a short cluster is read up to the option that
+/// takes the rest as its value (`-anm` skips, `-m -n` is a message), and `--` ends the options.
+fn commit_skips_hooks(args: &[&str]) -> bool {
+    let mut i = 0;
+    while let Some(&word) = args.get(i) {
+        i += 1;
+        if word == "--" {
+            return false;
+        }
+        if let Some(long) = word.strip_prefix("--") {
+            let (name, attached) = match long.split_once('=') {
+                Some((name, _)) => (name, true),
+                None => (long, false),
+            };
+            if name.len() >= "no-veri".len() && "no-verify".starts_with(name) {
+                return true;
+            }
+            if !attached && COMMIT_VALUE_OPTIONS.contains(&name) {
+                i += 1;
+            }
+            continue;
+        }
+        let Some(cluster) = word.strip_prefix('-').filter(|cluster| !cluster.is_empty()) else { continue };
+        for (at, flag) in cluster.char_indices() {
+            match flag {
+                'n' => return true,
+                // The rest of the word is the value; with nothing left, the next word is.
+                'm' | 'F' | 'c' | 'C' | 't' => {
+                    if at + 1 == cluster.len() {
+                        i += 1;
+                    }
+                    break;
+                }
+                // An optional value, attached only.
+                'S' | 'u' => break,
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
+/// A `git config` that sets, unsets or removes `core.hooksPath`, in the classic form
+/// (`git config --worktree core.hooksPath /dev/null`, `--unset`, `--remove-section core`) or the
+/// subcommand form (`git config set|unset core.hooksPath`). Reading it is fine.
+fn config_writes_hooks_path(args: &[&str]) -> bool {
+    let mut positional = Vec::new();
+    let mut flags = Vec::new();
+    let mut i = 0;
+    while let Some(&word) = args.get(i) {
+        i += 1;
+        if word == "--" {
+            positional.extend(args.get(i..).unwrap_or_default());
+            break;
+        }
+        if word.starts_with('-') && word.len() > 1 {
+            if matches!(word, "-f" | "--file" | "--blob" | "--type" | "--default" | "--comment" | "--value") {
+                i += 1;
+            }
+            flags.push(word);
+        } else {
+            positional.push(word);
+        }
+    }
+    let key = |word: &&str| word.eq_ignore_ascii_case("core.hookspath");
+    let flagged = |names: &[&str]| flags.iter().any(|flag| names.contains(flag));
+    let first = positional.first().copied();
+    if flagged(&["--get", "--get-all", "--get-regexp", "--get-urlmatch", "-l", "--list"]) || matches!(first, Some("get" | "list")) {
+        return false;
+    }
+    if flagged(&["--remove-section", "--rename-section"]) || matches!(first, Some("remove-section" | "rename-section")) {
+        return positional.iter().any(|word| word.eq_ignore_ascii_case("core"));
+    }
+    if matches!(first, Some("set" | "unset")) {
+        return positional.get(1).is_some_and(key);
+    }
+    let Some(at) = positional.iter().position(key) else { return false };
+    flagged(&["--unset", "--unset-all", "--add", "--replace-all"]) || positional.len() > at + 1
 }
 
 /// A command whose program reads its arguments as data — text to print, a pattern to search
@@ -2095,7 +2492,7 @@ fn changed_line_counts(old: &str, new: &str) -> (u32, u32) {
     (removed, added)
 }
 
-/// Both git probes here run with the store lock held, so they get a deadline (D144).
+/// Every git call here gets a deadline (D144): some still run with the store lock held.
 const GIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn git_output(worktree: &Path, args: &[&str]) -> Result<String, BusError> {
@@ -2109,6 +2506,17 @@ fn git_output(worktree: &Path, args: &[&str]) -> Result<String, BusError> {
         ));
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// [`git_output`] for a git command that reads its list from stdin; the bytes as they came.
+fn git_with_input(worktree: &Path, args: &[&str], input: &[u8]) -> Result<Vec<u8>, BusError> {
+    let out = crate::proc::output_with_input(Command::new("git").arg("-C").arg(worktree).args(args), input, GIT_TIMEOUT)
+        .map_err(|e| BusError::unavailable("git.unavailable", e.to_string()))?
+        .ok_or_else(|| BusError::unavailable("git.timeout", format!("git {} took longer than 10s", args.join(" "))))?;
+    if !out.status.success() {
+        return Err(BusError::conflict("git.failed", String::from_utf8_lossy(&out.stderr).trim().to_string()));
+    }
+    Ok(out.stdout)
 }
 
 fn relative_path(path: &str) -> Result<PathBuf, BusError> {
@@ -2219,23 +2627,44 @@ pub fn insert_hold(
 ) -> Result<Id, BusError> {
     let mut frozen = request.clone();
     frozen.token = None; // never persist session secrets
-    tx.execute(
-        "INSERT INTO holds(project_id, session_id, session, actor, op, envelope, policy, details, state, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'open', ?9)",
-        params![
-            project_id,
-            session_id,
-            session,
-            request.actor.to_string(),
-            request.op,
-            serde_json::to_string(&frozen).bus()?,
-            policy,
-            serde_json::to_string(details).bus()?,
-            now,
-        ],
+    let payload_hash = crate::audit::payload_hash(&frozen.payload);
+    // A held write carries the whole new file. Past the size a hold is shown cut at anyway, the
+    // text goes to a file named by its hash, and the envelope keeps the cut copy (RA-102).
+    let mut kept_aside = Vec::new();
+    if let (Some(dir), Value::Object(fields)) = (blob_dir(tx), &mut frozen.payload) {
+        for (key, value) in fields.iter_mut() {
+            let Value::String(text) = value else { continue };
+            if text.len() > SHOWN_STRING_MAX {
+                kept_aside.push((format!("/{}", key.replace('~', "~0").replace('/', "~1")), store_blob(&dir, text)?));
+                elide_text(text);
+            }
+        }
+    }
+    tx.prepare_cached(
+        "INSERT INTO holds(project_id, session_id, session, actor, op, envelope, policy, details, state, created_at, payload_hash)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'open', ?9, ?10)",
     )
+    .bus()?
+    .execute(params![
+        project_id,
+        session_id,
+        session,
+        request.actor.to_string(),
+        request.op,
+        serde_json::to_string(&frozen).bus()?,
+        policy,
+        serde_json::to_string(details).bus()?,
+        now,
+        payload_hash,
+    ])
     .bus()?;
     let hold_id = tx.last_insert_rowid();
+    for (pointer, hash) in kept_aside {
+        tx.prepare_cached("INSERT INTO hold_blobs(hold_id, pointer, hash) VALUES (?1, ?2, ?3)")
+            .bus()?
+            .execute(params![hold_id, pointer, hash])
+            .bus()?;
+    }
     tx.execute(
         "INSERT INTO notifications(project_id, category, title, body, link, read, created_at)
          VALUES (?1, 'guardrail', 'Guardrail hold', ?2, ?3, 0, ?4)",
@@ -2268,39 +2697,191 @@ pub fn insert_refusal_notification(
     Ok(())
 }
 
+/// The holds [`prune_holds`] forgets: answered before `?1`. Open holds stay, and so does
+/// anything confirmed for a session still alive: its exception grant or its one-time pass may
+/// yet be used.
+macro_rules! answered_before {
+    () => {
+        "state != 'open' AND COALESCE(resolved_at, created_at) < ?1
+           AND NOT (state = 'confirmed' AND session_id IN (SELECT id FROM sessions WHERE state != 'closed'))"
+    };
+}
+
 /// Forget answered holds resolved before `cutoff` (RA-102). Each frozen envelope carries the
-/// whole action — for a held write, the whole new file — so they are not kept forever. Open
-/// holds stay, and so does anything confirmed for a session still alive: its exception grant
-/// or its one-time pass may yet be used.
-pub fn prune_holds(tx: &Transaction, cutoff: &str) -> rusqlite::Result<usize> {
-    tx.prepare_cached(
-        "DELETE FROM holds WHERE state != 'open' AND COALESCE(resolved_at, created_at) < ?1
-           AND NOT (state = 'confirmed' AND session_id IN (SELECT id FROM sessions WHERE state != 'closed'))",
-    )?
-    .execute([cutoff])
+/// whole action, so they are not kept forever. Returns how many went, and the held-text files
+/// no remaining hold names, for the caller to remove once the transaction has committed.
+///
+/// A new hold freezing the same text between that commit and the removal would lose its file;
+/// confirming it then fails as `guardrail.hold_text_missing` rather than replay anything else.
+pub fn prune_holds(tx: &Transaction, cutoff: &str) -> rusqlite::Result<(usize, Vec<PathBuf>)> {
+    let hashes: Vec<String> = tx
+        .prepare_cached(concat!("SELECT DISTINCT hash FROM hold_blobs WHERE hold_id IN (SELECT id FROM holds WHERE ", answered_before!(), ")"))?
+        .query_map([cutoff], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    tx.prepare_cached(concat!("DELETE FROM hold_blobs WHERE hold_id IN (SELECT id FROM holds WHERE ", answered_before!(), ")"))?
+        .execute([cutoff])?;
+    let pruned = tx.prepare_cached(concat!("DELETE FROM holds WHERE ", answered_before!()))?.execute([cutoff])?;
+    let mut unused = Vec::new();
+    if let Some(dir) = blob_dir(tx) {
+        let mut named = tx.prepare_cached("SELECT EXISTS(SELECT 1 FROM hold_blobs WHERE hash = ?1)")?;
+        for hash in hashes.into_iter().filter(|hash| blob_name(hash)) {
+            if !named.query_row([&hash], |r| r.get::<_, bool>(0))? {
+                unused.push(dir.join(hash));
+            }
+        }
+    }
+    Ok((pruned, unused))
+}
+
+/// A string in a hold past this size is cut wherever a hold is shown: a held rewrite of a
+/// large file carries the whole file, and a reply over the client's line cap tore its
+/// connection down (RA-217). It is also where a frozen payload's text moves out of the
+/// envelope into a file of its own (RA-102).
+pub(crate) const SHOWN_STRING_MAX: usize = 64 * 1024;
+/// How much of a cut string is kept.
+const SHOWN_STRING_KEEP: usize = 4 * 1024;
+
+/// Cut `text` past [`SHOWN_STRING_MAX`] to its first [`SHOWN_STRING_KEEP`] bytes and a note of
+/// what was dropped. Returns whether it cut.
+pub(crate) fn elide_text(text: &mut String) -> bool {
+    if text.len() <= SHOWN_STRING_MAX {
+        return false;
+    }
+    let mut end = SHOWN_STRING_KEEP;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let dropped = text.len() - end;
+    text.truncate(end);
+    text.push_str(&format!("… [{dropped} more bytes elided]"));
+    true
+}
+
+/// `<store dir>/hold-blobs`, where a frozen payload's large strings live, one file per
+/// SHA-256. `None` for an in-memory store, which keeps them in the envelope.
+fn blob_dir(conn: &Connection) -> Option<PathBuf> {
+    let db = conn.path().filter(|path| !path.is_empty())?;
+    Some(Path::new(db).parent()?.join("hold-blobs"))
+}
+
+/// A stored name is a lowercase SHA-256 and nothing else: a corrupt row never names a path.
+fn blob_name(hash: &str) -> bool {
+    hash.len() == 64 && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Write `text` to its content-addressed file, unless an intact copy is already there.
+fn store_blob(dir: &Path, text: &str) -> Result<String, BusError> {
+    use sha2::Digest;
+    let hash = crate::hex(&sha2::Sha256::digest(text.as_bytes()));
+    let path = dir.join(&hash);
+    if std::fs::metadata(&path).is_ok_and(|meta| meta.len() == text.len() as u64) {
+        return Ok(hash);
+    }
+    let failed = |e: std::io::Error| BusError::unavailable("guardrail.hold_text", format!("keeping a held action's text: {e}"));
+    std::fs::create_dir_all(dir).map_err(failed)?;
+    let temp = dir.join(format!(".{hash}.{}.tmp", uuid::Uuid::new_v4()));
+    std::fs::write(&temp, text.as_bytes()).map_err(failed)?;
+    std::fs::rename(&temp, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&temp);
+        failed(e)
+    })?;
+    Ok(hash)
+}
+
+/// The text a hold kept beside the store, checked against its name: a confirm replays exactly
+/// what was held or nothing.
+fn load_blob(dir: &Path, hold_id: Id, hash: &str) -> Result<String, BusError> {
+    use sha2::Digest;
+    let missing = || {
+        BusError::conflict(
+            "guardrail.hold_text_missing",
+            format!("the text hold {hold_id} froze is no longer stored intact; reject it and retry the action"),
+        )
+    };
+    if !blob_name(hash) {
+        return Err(missing());
+    }
+    let bytes = std::fs::read(dir.join(hash)).map_err(|_| missing())?;
+    if crate::hex(&sha2::Sha256::digest(&bytes)) != hash {
+        return Err(missing());
+    }
+    String::from_utf8(bytes).map_err(|_| missing())
 }
 
 pub fn hold_by_id(conn: &Connection, id: Id) -> Result<Hold, BusError> {
-    conn.query_row("SELECT * FROM holds WHERE id = ?1", [id], hold_row)
+    conn.prepare_cached("SELECT * FROM holds WHERE id = ?1")
+        .bus()?
+        .query_row([id], hold_row)
         .optional()
         .bus()?
         .ok_or_else(|| BusError::not_found("guardrail.hold_not_found", format!("no hold {id}")))
 }
 
+/// The request hold `id` froze, whole: what a confirm replays.
 pub fn frozen_request(conn: &Connection, id: Id) -> Result<Request, BusError> {
+    frozen_envelope(conn, id, true).map(|(request, _)| request)
+}
+
+/// The request hold `id` froze, and the JSON pointers into its payload of the strings kept
+/// beside the store. `inflate` reads them back whole; without it they stay as stored — cut,
+/// exactly as a hold is shown.
+pub fn frozen_envelope(conn: &Connection, id: Id, inflate: bool) -> Result<(Request, Vec<String>), BusError> {
     let raw: String = conn
-        .query_row("SELECT envelope FROM holds WHERE id = ?1", [id], |r| r.get(0))
+        .prepare_cached("SELECT envelope FROM holds WHERE id = ?1")
+        .bus()?
+        .query_row([id], |r| r.get(0))
         .optional()
         .bus()?
         .ok_or_else(|| BusError::not_found("guardrail.hold_not_found", format!("no hold {id}")))?;
-    serde_json::from_str(&raw).map_err(crate::engine::internal)
+    let mut request: Request = serde_json::from_str(&raw).map_err(crate::engine::internal)?;
+    let kept: Vec<(String, String)> = conn
+        .prepare_cached("SELECT pointer, hash FROM hold_blobs WHERE hold_id = ?1 ORDER BY pointer")
+        .bus()?
+        .query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .bus()?
+        .collect::<rusqlite::Result<_>>()
+        .bus()?;
+    if inflate && !kept.is_empty() {
+        let dir = blob_dir(conn).ok_or_else(|| BusError::internal("a held text outside an on-disk store"))?;
+        for (pointer, hash) in &kept {
+            let text = load_blob(&dir, id, hash)?;
+            let slot = request.payload.pointer_mut(pointer).ok_or_else(|| BusError::internal(format!("hold {id} has no {pointer}")))?;
+            *slot = Value::String(text);
+        }
+    }
+    Ok((request, kept.into_iter().map(|(pointer, _)| pointer).collect()))
+}
+
+/// Store the payload hash of holds frozen before it was taken at insert (v23), a page at a
+/// time: SQLite cannot hash, so each is hashed once, the first time a list or a look reads it.
+pub fn fill_payload_hashes(conn: &Connection) -> Result<(), BusError> {
+    let unhashed: Vec<(Id, String)> = conn
+        .prepare_cached("SELECT id, envelope FROM holds WHERE payload_hash IS NULL ORDER BY id LIMIT 200")
+        .bus()?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .bus()?
+        .collect::<rusqlite::Result<_>>()
+        .bus()?;
+    let mut store = conn.prepare_cached("UPDATE holds SET payload_hash = ?1 WHERE id = ?2").bus()?;
+    for (id, envelope) in unhashed {
+        store.execute(params![envelope_hash(envelope), id]).bus()?;
+    }
+    Ok(())
+}
+
+/// The payload hash of an envelope stored whole (every hold from before v23).
+fn envelope_hash(envelope: String) -> String {
+    serde_json::from_str::<Request>(&envelope)
+        .map(|request| crate::audit::payload_hash(&request.payload))
+        .unwrap_or_else(|_| crate::audit::payload_hash(&Value::String(envelope)))
 }
 
 pub fn hold_row(row: &Row) -> rusqlite::Result<Hold> {
-    let envelope: String = row.get("envelope")?;
-    let payload_hash = serde_json::from_str::<Request>(&envelope)
-        .map(|request| crate::audit::payload_hash(&request.payload))
-        .unwrap_or_else(|_| crate::audit::payload_hash(&Value::String(envelope)));
+    // Taken at insert; a hold from before that is hashed here until `fill_payload_hashes` stores it.
+    let payload_hash = match row.get::<_, Option<String>>("payload_hash") {
+        Ok(Some(hash)) => hash,
+        _ => envelope_hash(row.get("envelope")?),
+    };
     let actor = Actor::parse(&row.get::<_, String>("actor")?).unwrap_or(Actor::System);
     let resolved_by = row
         .get::<_, Option<String>>("resolved_by")?
@@ -2388,7 +2969,7 @@ mod glob_tests {
 
 #[cfg(test)]
 mod denied_tests {
-    use super::{denied_matches, self_approval};
+    use super::{denied_matches, hook_bypass, self_approval, shell_commands};
 
     fn denied(line: &str) -> bool {
         let defaults = ["rm -rf", "git reset --hard", "git clean -fd", "git push --force"].map(String::from);
@@ -2527,11 +3108,44 @@ mod denied_tests {
         assert!(denied("relay q guardrail.confirm guardrail.check && rm -rf x"));
         assert!(!denied("relay q guardrail.check '{\"command\":\"rm -rf /\"}'"));
     }
+
+    /// RA-109: every way of switching off the pre-commit hook for an agent's own commit, and
+    /// the look-alikes that do not.
+    #[test]
+    fn hook_bypasses_are_seen_and_look_alikes_are_not() {
+        let bypass = |line: &str| hook_bypass(&shell_commands(line)).is_some();
+        for line in [
+            "git commit --no-verify -m wip", "git commit -n -m wip", "git commit -anm wip", "git commit -am wip -n",
+            "git commit --no-verif -m x", "git commit --no-verify=1", "git commit \"-n\" -m x", "git -C app commit -n",
+            "/usr/bin/git commit -n", "env FOO=1 git commit -n -m x", "bash -c 'git commit --no-verify'",
+            "cd app && git add . && git commit -nm x", "timeout 60 git commit -n",
+            "git -c core.hooksPath=/dev/null commit -m x", "git -c core.hookspath= commit -m x", "git -c CORE.HOOKSPATH=x merge main",
+            "git --config-env=core.hooksPath=EMPTY commit", "git --config-env core.hooksPath=EMPTY commit",
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null git commit -m x",
+            "export GIT_CONFIG_PARAMETERS=\"'core.hooksPath'='/dev/null'\"",
+            "git config core.hooksPath /dev/null", "git config --worktree core.hooksPath .",
+            "git config --worktree --unset core.hooksPath", "git config --unset-all core.hookspath",
+            "git config unset core.hooksPath", "git config set core.hooksPath x", "git config --remove-section core",
+            "git config -f .git/config.worktree core.hooksPath x",
+        ] {
+            assert!(bypass(line), "{line:?} switches the hook off");
+        }
+        for line in [
+            "git commit -m wip", "git commit -am 'fix -n handling'", "git commit -m -n", "git commit -m 'no -n here'",
+            "git commit --amend --no-edit", "git commit -F notes.txt", "git commit -- -n", "git commit --verbose",
+            "git log -n 3", "git merge -n main", "git diff --no-index a b", "git -c user.name=x commit -m y",
+            "git config core.hooksPath", "git config --get core.hooksPath", "git config get core.hooksPath", "git config --list",
+            "git config user.name x", "echo git commit -n", "rg 'commit --no-verify' docs", "grep -rn core.hooksPath crates",
+            "relay q guardrail.check '{\"command\":\"git commit -n\"}'",
+        ] {
+            assert!(!bypass(line), "{line:?} leaves the hook on");
+        }
+    }
 }
 
 #[cfg(test)]
 mod path_tests {
-    use super::{diff_counts, parse_numstat, resolve, NumstatEntry};
+    use super::{diff_counts, parse_numstat, resolve, split_commits, NumstatEntry};
     use std::path::Path;
 
     fn paths(text: &str) -> Vec<Vec<String>> {
@@ -2563,6 +3177,19 @@ mod path_tests {
         assert_eq!(diff_counts(diff), (4, 2));
         // No hunk headers at all: the old reading, headers skipped and every marked line counted.
         assert_eq!(diff_counts("--- a\n+++ b\n-x\n+y\n+z\n"), (1, 2));
+    }
+
+    /// RA-109: `diff-tree --stdin -z` output, one commit after another, renames and all.
+    #[test]
+    fn diff_tree_output_splits_per_commit() {
+        let out = "aaaa\x001\t0\ta\x000\t0\t\x00s/key\x00s/key2\x00bbbb\x001\t0\tb\x00";
+        let commits = split_commits(out);
+        assert_eq!(commits.iter().map(|(sha, _)| sha.as_str()).collect::<Vec<_>>(), ["aaaa", "bbbb"]);
+        assert_eq!(
+            parse_numstat(&commits[0].1).into_iter().map(|entry| entry.paths).collect::<Vec<_>>(),
+            vec![vec!["a".to_string()], vec!["s/key".to_string(), "s/key2".into()]]
+        );
+        assert_eq!(parse_numstat(&commits[1].1)[0].paths, vec!["b".to_string()]);
     }
 
     /// RA-101: a symlink, dangling or not, and `..` after one, lead where the OS would go.

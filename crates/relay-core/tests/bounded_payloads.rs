@@ -193,3 +193,60 @@ fn a_large_held_action_is_shown_elided_and_replayed_whole() {
     assert_eq!(confirmed["outcome"]["ok"], true, "{confirmed}");
     assert_eq!(std::fs::read_to_string(repo.join("protected-0.txt")).unwrap(), text);
 }
+
+/// RA-214: a file trashed in a worktree that has since been removed goes back into the primary
+/// checkout, and the reply says so; a named checkout is honoured and confined for an agent, and
+/// a restore never overwrites an existing path.
+#[test]
+fn restore_outlives_the_worktree_it_was_deleted_from() {
+    let (e, _ws, repo) = project();
+    let pooled = repo.join(".relay/worktrees/w2");
+    git(&repo, &["worktree", "add", "-b", "w2", pooled.to_str().unwrap()]);
+    let wt = pooled.to_str().unwrap();
+    let mut trashed = Vec::new();
+    for name in ["a.txt", "b.txt", "c.txt", "d.txt"] {
+        std::fs::write(pooled.join(name), format!("{name}\n")).unwrap();
+        trashed.push(ok(&e, "file.delete", json!({"project_id": 1, "worktree": wt, "path": name}))["trash_id"].clone());
+    }
+    let [a, b, c, d] = <[Value; 4]>::try_from(trashed).unwrap();
+    let restore = |payload: Value| call(&e, "file.restore", payload);
+
+    // While the worktree is there, that is where it goes back.
+    let back = ok(&e, "file.restore", json!({"project_id": 1, "trash_id": a}));
+    assert_eq!((back["path"].as_str(), back["worktree"].as_str(), back["fallback"].as_bool()), (Some("a.txt"), Some(wt), Some(false)));
+    assert_eq!(std::fs::read_to_string(pooled.join("a.txt")).unwrap(), "a.txt\n");
+
+    git(&repo, &["worktree", "remove", "--force", wt]);
+    assert!(!pooled.exists());
+    let primary = repo.display().to_string();
+    // Never over an existing path.
+    std::fs::write(repo.join("b.txt"), "mine\n").unwrap();
+    let refused = restore(json!({"project_id": 1, "trash_id": b}));
+    assert_eq!(refused.error.as_ref().map(|e| e.code.as_str()), Some("file.restore_conflict"), "{:?}", refused.error);
+    assert_eq!(std::fs::read_to_string(repo.join("b.txt")).unwrap(), "mine\n");
+    std::fs::remove_file(repo.join("b.txt")).unwrap();
+    // Its worktree gone, it goes to the primary checkout.
+    let back = ok(&e, "file.restore", json!({"project_id": 1, "trash_id": b}));
+    assert_eq!((back["worktree"].as_str(), back["fallback"].as_bool()), (Some(primary.as_str()), Some(true)));
+    assert_eq!(std::fs::read_to_string(repo.join("b.txt")).unwrap(), "b.txt\n");
+
+    // A named checkout is where it goes.
+    let other = repo.join(".relay/worktrees/w3");
+    git(&repo, &["worktree", "add", "-b", "w3", other.to_str().unwrap()]);
+    let back = ok(&e, "file.restore", json!({"project_id": 1, "trash_id": c, "worktree": other}));
+    assert_eq!((back["worktree"].as_str(), back["fallback"].as_bool()), (other.to_str(), Some(false)));
+    assert_eq!(std::fs::read_to_string(other.join("c.txt")).unwrap(), "c.txt\n");
+
+    // An agent reaches only its own checkout, the fallback included.
+    let builder = ok(&e, "session.create", json!({"project_id": 1, "provider": "claude", "role": "builder", "bus_writes": true}));
+    let agent = |payload: Value| e.dispatch(
+        Request::new(Actor::agent(builder["name"].as_str().unwrap()), "file.restore", payload), Door::InProcess);
+    for payload in [json!({"project_id": 1, "trash_id": d}), json!({"project_id": 1, "trash_id": d, "worktree": "@project"})] {
+        let refused = agent(payload);
+        assert_eq!(refused.error.as_ref().map(|e| (e.kind, e.code.as_str())), Some((ErrorKind::Refused, "actor.scope")), "{:?}", refused.error);
+    }
+    let own = std::fs::canonicalize(builder["worktree"].as_str().unwrap()).unwrap();
+    let back = agent(json!({"project_id": 1, "trash_id": d, "worktree": own})).into_result().unwrap();
+    assert_eq!(back["fallback"], false);
+    assert_eq!(std::fs::read_to_string(own.join("d.txt")).unwrap(), "d.txt\n");
+}

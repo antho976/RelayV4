@@ -39,6 +39,7 @@ const SHIPPED_MIGRATIONS: &[&str] = &[
     "8a0cb54342844cf8d525cf58e77f562853bdaa7bd311dc67e570a7118feb3c28", // v20
     "62681b138e192280c0e12cbb2a9abf5c7c4fde9506337682d16d091e3f46b39e", // v21
     "91c29598127eea523390db607475e48c670a6cfc4cbfd3eb3cf5e8ebb95a0e49", // v22
+    "f59a2bedad6eca0af4f82d20b22ffc35a5befc24a1348f0bca8e63ce87448bbb", // v23
 ];
 
 #[test]
@@ -180,6 +181,11 @@ fn every_prior_version_migrates_forward() {
                 // v22: what was cloned then was the default branch, which a NULL ref still means.
                 let sourced: i64 = conn.query_row("SELECT COUNT(*) FROM skills WHERE source_url IS NOT NULL AND source_ref IS NULL", [], |r| r.get(0)).unwrap();
                 assert_eq!(sourced, 2, "v{k}: installed skills lost their GitHub source");
+            }
+            if k < 23 {
+                // v23: SQLite cannot hash, so a hold from before is hashed when first read.
+                let unhashed: i64 = conn.query_row("SELECT COUNT(*) FROM holds WHERE payload_hash IS NULL", [], |r| r.get(0)).unwrap();
+                assert_eq!(unhashed, 2, "v{k}: a hold from before v23 must read as not yet hashed");
             }
         }
         // every table has its FK indexes: no FK column without an index (SPEC §1)

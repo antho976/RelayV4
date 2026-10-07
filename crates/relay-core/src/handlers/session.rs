@@ -1045,32 +1045,6 @@ fn own_branch(repo: &Path, name: &str) -> Result<String, BusError> {
     Err(BusError::conflict("session.branch", format!("every {first}-<n> branch is taken")))
 }
 
-/// What the session's branch changes against the project base, as `git diff --numstat`:
-/// the work a finished task hands to review. `None` when git cannot say (no base, no
-/// history); a measurement Relay cannot take never blocks a done.
-fn task_numstat(worktree: &Path, base: &str) -> Option<String> {
-    let out = crate::proc::output_with_timeout(
-        std::process::Command::new("git").arg("-C").arg(worktree)
-            .args(["diff", "--numstat", "--no-renames", &format!("{base}...HEAD"), "--"]),
-        Duration::from_secs(10),
-    );
-    match out {
-        Ok(Some(out)) if out.status.success() => Some(String::from_utf8_lossy(&out.stdout).into_owned()),
-        Ok(Some(out)) => {
-            tracing::debug!(worktree = %worktree.display(), stderr = %String::from_utf8_lossy(&out.stderr).trim(), "measuring task work");
-            None
-        }
-        Ok(None) => {
-            tracing::warn!(worktree = %worktree.display(), "measuring task work timed out");
-            None
-        }
-        Err(error) => {
-            tracing::warn!(worktree = %worktree.display(), %error, "measuring task work");
-            None
-        }
-    }
-}
-
 pub fn register(e: &mut Engine) {
     e.register_staged::<Create, _>(|ctx, p| {
         let mut prepared = ctx.read(|conn| {
@@ -1401,8 +1375,8 @@ pub fn register(e: &mut Engine) {
         crate::awareness::bootstrap(ctx.tx(), &row.session.name, ctx.engine())
     });
 
-    // Staged (D149) for the per-task caps (BUS.md §9.2): measuring the task's work is a git
-    // subprocess, so it runs before the transaction opens.
+    // Staged (D149) for the per-task caps and the branch re-check (BUS.md §9.2, RA-109):
+    // measuring the task's work is git subprocesses, so it runs before the transaction opens.
     e.register_staged::<Done, _>(|ctx, p| {
         if !ctx.actor.is_agent() || !matches!(p.status.as_deref(), None | Some("completed")) {
             return Ok(None);
@@ -1414,10 +1388,11 @@ pub fn register(e: &mut Engine) {
                 return Ok(None);
             }
             let project = crate::handlers::workspace::get_project(conn, s.project_id)?;
-            Ok(Some((PathBuf::from(&s.worktree), project.base_branch)))
+            let cfg = crate::guardrail::config(conn, Some(s.project_id))?;
+            Ok(Some((PathBuf::from(&s.worktree), project.base_branch, cfg)))
         })?;
-        Ok(measure.and_then(|(worktree, base)| task_numstat(&worktree, &base)))
-    }, |ctx: &mut Ctx, p, numstat: Option<String>| {
+        Ok(measure.and_then(|(worktree, base, cfg)| crate::guardrail::measure_branch(&cfg, &worktree, &base)))
+    }, |ctx: &mut Ctx, p, work: Option<crate::guardrail::BranchWork>| {
         let row = sessions::by_name(ctx.tx(), &p.session)?;
         assert_own(ctx, &row, false)?;
         let s = &row.session;
@@ -1446,20 +1421,11 @@ pub fn register(e: &mut Engine) {
         if pending.is_some_and(|done| current_task_id.is_some_and(|current| current != done)) {
             return Ok(row.session);
         }
-        // Agents may commit with --no-verify, past the commit gate: the work the task brings
-        // to review is measured here too, against the same caps (BUS.md §9.2).
-        if let (Some(numstat), "completed") = (numstat.as_deref(), status) {
-            let request = crate::guardrail::GateRequest {
-                actor: &ctx.actor, project_id: s.project_id, worktree: Path::new(&s.worktree),
-                kind: relay_bus::types::GateKind::Commit, path: None, new_text: None,
-                diff: Some(numstat), command: None,
-                // Protected paths answer at the commit gate; done applies only the caps.
-                skip_policy: Some("protected_path"), grants: None, path_only: false, probes: None,
-            };
-            match crate::guardrail::evaluate_granted(ctx.tx(), &request, ctx.actor_session_id())?.0 {
-                crate::guardrail::Decision::Allow => {}
-                crate::guardrail::Decision::Refuse(error) | crate::guardrail::Decision::Hold { error, .. } => return Err(error),
-            }
+        // Agents may commit past the commit gate (--no-verify, core.hooksPath, cherry-pick): the
+        // branch the task brings to review is judged here as commits, against the same caps,
+        // protected paths and shape gates (BUS.md §9.2, RA-109). Never a blocked or partial done.
+        if let (Some(work), "completed") = (work.as_ref(), status) {
+            crate::guardrail::recheck_branch(ctx.tx(), &ctx.actor, s.project_id, Path::new(&s.worktree), s.id, work)?;
         }
         // Every outcome holds until the turn's Stop: a `blocked` done must survive the tool
         // and Stop reports that trail it in the same turn.

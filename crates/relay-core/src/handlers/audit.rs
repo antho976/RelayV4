@@ -14,7 +14,7 @@ fn target_updated_at(ctx: &Ctx, op: &str, payload: &Value) -> Result<Option<Stri
         ("modules", "module_id")
     } else if op.starts_with("notes.") {
         ("notes", "note_id")
-    } else if op == "project.update" {
+    } else if op == "project.update" || op == "project.relink" {
         ("projects", "project_id")
     } else if op.starts_with("workspace.") {
         ("workspaces", "workspace_id")

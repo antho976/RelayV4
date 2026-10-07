@@ -339,8 +339,21 @@ pub fn run_user_pre_commit(repo: &Path, worktree: &Path) -> Result<()> {
 /// after [`run_user_pre_commit`] and commits what comes back. With no such hook the message is
 /// returned unchanged.
 pub fn run_user_commit_msg(repo: &Path, worktree: &Path, message: &str) -> Result<String> {
+    run_user_message_hook(repo, worktree, "commit-msg", message, &[])
+}
+
+/// Run the user's own prepare-commit-msg hook on `message`, with the arguments `git commit -m`
+/// gives it (the message file, then `message` as its source, also when concluding a merge), and
+/// return the message as the hook left it. Only for a commit made with `commit-tree`: `git
+/// commit --no-verify` runs prepare-commit-msg itself, since `--no-verify` skips only pre-commit
+/// and commit-msg. Runs before [`run_user_commit_msg`], as in git.
+pub fn run_user_prepare_commit_msg(repo: &Path, worktree: &Path, message: &str) -> Result<String> {
+    run_user_message_hook(repo, worktree, "prepare-commit-msg", message, &["message".as_ref()])
+}
+
+fn run_user_message_hook(repo: &Path, worktree: &Path, name: &str, message: &str, args: &[&std::ffi::OsStr]) -> Result<String> {
     let Some(dir) = previous_hooks(repo, worktree).chain else { return Ok(message.to_string()) };
-    let hook = dir.join("commit-msg");
+    let hook = dir.join(name);
     if !is_executable(&hook) {
         return Ok(message.to_string());
     }
@@ -352,7 +365,9 @@ pub fn run_user_commit_msg(repo: &Path, worktree: &Path, message: &str) -> Resul
         text.push('\n');
     }
     write_replacing(&file, &text, 0o644)?;
-    run_user_hook(&hook, worktree, &[file.as_os_str()])?;
+    let mut all = vec![file.as_os_str()];
+    all.extend_from_slice(args);
+    run_user_hook(&hook, worktree, &all)?;
     fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))
 }
 

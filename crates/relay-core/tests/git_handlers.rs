@@ -335,3 +335,43 @@ fn status_lists_an_untracked_directory_once() {
     let listed = ok(&e, "worktree.list", json!({"project_id":1}));
     assert_eq!(listed["worktrees"][0]["dirty"], true, "{listed}");
 }
+
+/// RA-110: a bus commit runs the user's prepare-commit-msg hook with git's arguments, before
+/// commit-msg, and keeps what it adds. Concluding a merge, `git commit --no-verify` runs it
+/// itself, so it runs exactly once there too, and so does commit-msg.
+#[test]
+fn prepare_commit_msg_hook_runs_once_on_every_bus_commit() {
+    use std::os::unix::fs::PermissionsExt;
+    let e = engine();
+    let (ws, repo) = project(&e);
+    let root = Path::new(&repo);
+    git(root, &["switch", "-q", "-c", "side"]);
+    std::fs::write(root.join("side.txt"), "side\n").unwrap();
+    git(root, &["add", "side.txt"]);
+    git(root, &["commit", "-q", "-m", "Side"]);
+    git(root, &["switch", "-q", "main"]);
+    let log = ws.path().join("hooks.log");
+    let hook = |name: &str, body: String| {
+        let path = root.join(".git/hooks").join(name);
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    hook("prepare-commit-msg", format!(
+        "#!/bin/sh\necho \"prepare-commit-msg $2 $3\" >> '{}'\nprintf '\\nPrepared-by: hook\\n' >> \"$1\"\n", log.display()));
+    hook("commit-msg", format!("#!/bin/sh\necho commit-msg >> '{}'\n", log.display()));
+    let ran = || std::fs::read_to_string(&log).unwrap_or_default();
+
+    std::fs::write(root.join("notes.txt"), "notes\n").unwrap();
+    ok(&e, "git.commit", json!({"project_id":1,"message":"Add notes","all":true}));
+    assert_eq!(ran(), "prepare-commit-msg message \ncommit-msg\n");
+    assert_eq!(git(root, &["log", "-1", "--format=%B"]), "Add notes\n\nPrepared-by: hook");
+
+    std::fs::remove_file(&log).unwrap();
+    git(root, &["merge", "-q", "--no-commit", "--no-ff", "side"]);
+    ok(&e, "git.commit", json!({"project_id":1,"message":"Merge side"}));
+    assert_eq!(git(root, &["log", "-1", "--format=%p"]).split(' ').count(), 2, "the merge was concluded");
+    let ran = ran();
+    assert_eq!(ran.lines().filter(|line| line.starts_with("prepare-commit-msg message")).count(), 1, "{ran}");
+    assert_eq!(ran.lines().filter(|line| *line == "commit-msg").count(), 1, "{ran}");
+    assert_eq!(git(root, &["log", "-1", "--format=%B"]).matches("Prepared-by: hook").count(), 1);
+}

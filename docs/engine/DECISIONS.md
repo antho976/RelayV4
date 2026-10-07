@@ -1035,3 +1035,31 @@ The *why* behind anything surprising. Append; never rewrite history. Reference a
   that opens nothing on screen still answers success, because it did update the model, and the op
   summaries now say which ops reach the screen, since a summary is all an agent reading `bus.ops`
   or an MCP tool list sees.
+- **D165 Only a process outside the engine's tree may claim `user` on the socket.** `user` and
+  `test` carry no token, so an agent refused by a guardrail could answer its own hold by writing
+  `{"actor":"user","op":"guardrail.confirm",…}` to the socket; the command-line check (§9.5)
+  sees only command lines. The socket now identifies the process behind each connection once, on
+  accept: `SO_PEERCRED` for its pid (and `SO_PEERPIDFD`, where the kernel has it, to prove the
+  pid was not recycled during the walk), then `/proc/<pid>/stat` parent links to the top. A peer
+  below a live session's PTY child (the engine's in-memory PTY registry, not `sessions.pid`,
+  which outlives restarts), below the engine in any other way, or not identifiable at all is
+  refused `user`/`test` with `refused` / `actor.peer`; `bus.ping` claims nothing and is let
+  through so liveness probes work from anywhere. The rule is the person's decision: every PTY
+  Relay spawns is an agent session, so a `!relay …` typed into an agent's pane is refused too.
+  The engine calls `prctl(PR_SET_CHILD_SUBREAPER)` before anything else in `serve::start`, so a
+  descendant that double-forks or calls `setsid` lands under the engine instead of init. A
+  subreaper inherits zombies nobody waits for, so a worker reaps them every 30 s — only those
+  in a different session than the engine's (session trees and `setsid` daemons) and only on a
+  second look, because the engine's own children share its session and have owners that wait
+  for them. Checked flows that act as the user from below the engine and would break: none. The
+  app's `git.commit` commits with `--no-verify` and runs the user's own hooks itself, so the
+  installed pre-commit hook's `--actor user` branch runs only for a commit from a terminal
+  outside Relay (allowed) or one that shed `RELAY_SESSION` inside a session (refused, as
+  intended); integration merges run in a worktree without Relay's hooks; provider updates,
+  builds and device runs never call the bus; the phone bridge connects from the engine's own
+  process, or from `relay remote serve` started outside it; the desktop app is not an engine
+  host. `relay events` now subscribes as whoever runs it, as `relay attach` already did. Known
+  cost: a program the engine launches for the person (`xdg-open` starting a file manager that
+  then opens a terminal) is below the engine, so `relay` typed there is refused as the user.
+  This is a seatbelt against an agent's own tree, not a boundary against a same-uid process that
+  gets itself started elsewhere (`systemd-run --user`, cron, editing the store).

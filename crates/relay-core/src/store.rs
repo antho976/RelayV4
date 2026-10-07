@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 /// The schema version this build knows. Bump when appending to [`MIGRATIONS`].
-pub const SCHEMA_VERSION: i64 = 22;
+pub const SCHEMA_VERSION: i64 = 23;
 
 /// Numbered migrations; index 0 brings a fresh DB to `user_version = 1`.
 pub const MIGRATIONS: &[&str] = &[
@@ -385,6 +385,20 @@ pub const MIGRATIONS: &[&str] = &[
     DROP INDEX skills_source;
     CREATE UNIQUE INDEX skills_source ON skills(source_url, source_path, IFNULL(source_ref, ''))
       WHERE source_url IS NOT NULL;
+    "#,
+    // v23 - a hold's payload hash is taken once, when it is frozen, instead of by re-parsing
+    // and re-hashing every envelope a list reads (NULL for older holds: SQLite has no SHA-256,
+    // so each is filled the first time it is read). A held write's large text is kept in a
+    // content-addressed file beside the store, named here, instead of in the envelope (RA-102).
+    r#"
+    ALTER TABLE holds ADD COLUMN payload_hash TEXT;
+    CREATE INDEX holds_unhashed ON holds(id) WHERE payload_hash IS NULL;
+    CREATE TABLE hold_blobs (
+      hold_id INTEGER NOT NULL REFERENCES holds(id) ON DELETE CASCADE,
+      pointer TEXT NOT NULL, hash TEXT NOT NULL,
+      PRIMARY KEY (hold_id, pointer)
+    );
+    CREATE INDEX hold_blobs_hash ON hold_blobs(hash);
     "#,
 ];
 
