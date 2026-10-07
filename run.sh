@@ -8,8 +8,9 @@ if [[ $# -gt 1 || ! "$RELAY_INSTANCE" =~ ^(dev|stable|test)$ ]]; then
     exit 2
 fi
 
-# Never inherit a stale screenshot/test socket when launching the actual app.
-unset RELAY_NATIVE_SOCKET
+# Never inherit a stale screenshot/test socket, or a smoke-test mode (fixture data, a forced
+# page, a roadmap regression, a burst), when launching the actual app.
+unset RELAY_NATIVE_SOCKET RELAY_NATIVE_FIXTURE RELAY_NATIVE_PAGE RELAY_NATIVE_ROADMAP RELAY_NATIVE_BURST
 
 # Keep the build and executable paths together, including with Cargo overrides.
 mkdir -p target
