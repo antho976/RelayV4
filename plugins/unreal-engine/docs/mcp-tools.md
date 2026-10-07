@@ -54,10 +54,13 @@ All need the editor running with the Remote Control web server (see [setup](setu
 refuses if it is not the one in the agent's checkout (for example, the agent is in a git worktree
 while the editor is on the main checkout). `UE_ALLOW_PROJECT_MISMATCH=1` overrides this.
 
-**One driver.** Live tools that change the editor (`ue_python`, `ue_call`, `ue_property` writes,
-`ue_console`, `ue_screenshot`, `ue_anim_preview`) take a lock in `Saved/Relay/editor-lock.json`,
-held by the agent's session name. Another agent gets a clear refusal naming the holder. The lock
-frees itself after 15 idle minutes.
+**One driver.** Tools that change the editor take a lock in `Saved/Relay/editor-lock.json`,
+held by the agent's session name: `ue_python`, `ue_call`, `ue_console`, `ue_screenshot`,
+`ue_anim_preview`, `ue_play`, `ue_profile`, `ue_property` with a `value`, `ue_data_table` with
+`action: "import"`, `ue_blueprint_info` with `compile: true`, `ue_editor_launch`,
+`ue_editor_quit`, `ue_build` with `restart_editor`, `ue_run_tests` with `in_editor: true`, and
+the Blender plugin's `blender_to_unreal`. Another agent gets a clear refusal naming the holder.
+The lock frees itself after 15 idle minutes.
 
 ### `ue_editor_status` — `{}`
 `reachable`, the endpoint and the server's route list.
@@ -175,12 +178,16 @@ returned with the log lines).
 
 ## Seeing and measuring
 
-### `ue_screenshot` — `{ actors?, views?, camera?, forward?, isolate?, width?, height?, fov? }`
+### `ue_screenshot` — `{ actors?, views?, camera?, forward?, isolate?, coverage?, width?, height?, fov? }`
 Renders PNGs with a temporary scene capture and returns them as images the agent can see.
 Frame actors from named views (`front`, `back`, `left`, `right`, `top`, `three_quarter`,
 `three_quarter_left`, relative to the first actor's facing), or give an explicit `camera`
 (`location`, `rotation` as `[pitch, yaw, roll]`), or omit both for the editor viewport.
-`isolate` renders only the framed actors on black.
+`isolate` hides the level actors near the framed ones (within about six times the framing
+radius, up to 2000 actors); the background is not cleared, so farther actors, sky and fog
+can still show. `coverage`
+also reports, per view, the share of the image the framed actors cover (0 means they did not
+render), measured against a second capture without them.
 
 ### `ue_anim_inspect` — `{ mesh, animation?, times?, samples?, track?, attachments?, partner?, contacts?, body_radius?, touch_distance? }`
 Poses the skeleton at sample times directly from the animation data (no level, no ticking) and
@@ -197,9 +204,12 @@ skeleton's `_l`/`_r`-style bone pairs, so any skeleton and mesh orientation work
 Returns `problems`, `passed`, `closest_approach` and per-sample details. It reads the animation
 asset, not the Animation Blueprint, so runtime IK is not included.
 
-### `ue_anim_preview` — `{ mesh, animation?, times?, samples?, attachments?, partner?, views?, location?, isolate?, settle_ms?, width?, height? }`
+### `ue_anim_preview` — `{ mesh, animation?, times?, samples?, attachments?, partner?, views?, location?, isolate?, altitude?, settle_ms?, width?, height? }`
 Spawns temporary `RelayPreview` actors (character, attached items, partner), poses them at each
 time (up to 8), confirms the editor applied the pose, and returns images from the chosen views
-(default `front` and `right`, isolated). The actors are transient and removed afterwards, so the
+(default `front` and `right`). Without `location` the preview spawns `altitude` cm (default
+50000) above the editor camera, clear of the level, so `isolate` defaults to false; set it to hide
+level actors near the preview, as in `ue_screenshot`. The actors are transient and removed
+afterwards, so the
 level is not marked modified by them. If poses lag, the editor is throttled in the background:
 see [setup](setup.md).

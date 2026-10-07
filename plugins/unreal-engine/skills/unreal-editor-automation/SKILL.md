@@ -60,7 +60,7 @@ Live (editor open, web server running):
 
 | Tool | Use it for | Example |
 |---|---|---|
-| `ue_editor_status` | Reachability, engine version | `{}` |
+| `ue_editor_status` | Reachability, which project the editor has open, who holds the editor lock | `{}` |
 | `ue_python` | The workhorse: any asset/level/Blueprint/material edit or complex query | `{"code": "import unreal\nprint(unreal.SystemLibrary.get_engine_version())"}` |
 | `ue_search_assets` | Find assets fast without writing Python | `{"query": "Chair", "class_names": ["StaticMesh"], "package_paths": ["/Game/Props"], "limit": 50}` |
 | `ue_level_actors` | List actors in the open level (label, class, path, location) | `{"class_filter": "PointLight", "limit": 100}` |

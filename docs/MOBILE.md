@@ -35,7 +35,9 @@ On the phone: install the app (the `relay-mobile-apk` artifact of the **Mobile A
 run from the Actions tab, or `npm run android` in `apps/relay-mobile` with the Android SDK),
 open it, tap **Pair a PC**, scan. If the engine was running from before the
 door existed, restart it once (`./target/debug/relay --instance dev cmd app.quit '{}'`, then
-`./run.sh`), or run `./target/debug/relay remote serve --pair` alongside it. For the phone to
+`./run.sh`), or run `./target/debug/relay remote serve --pair` alongside it. The quit is refused
+while agents are live (`app.sessions_live`); `app.quit '{"force":true}'` stops them, and their
+sessions come back as restorable. For the phone to
 reach the PC when you are out, see §3 (Tailscale) or §4 (your own server).
 
 ## 2. On the PC
@@ -129,12 +131,18 @@ Then on the PC:
 
 ```fish
 relay remote via wss://relay.example.org
-relay remote serve --pair
+relay --instance dev cmd app.quit '{"force":true}'    # then ./run.sh
+relay remote pair
 ```
 
-`via` mints a room secret and stores it; `serve` dials the server, and every pairing link from
-then on carries the join address as well as the LAN ones. The phone tries the LAN first and the
-server second; a PC card in the app can pin either. `relay remote via off` clears it.
+`via` mints a room secret and stores it. The process that carries the phone door dials the
+server only when it starts, so restart it: for the `./run.sh` engine (`relay serve --remote`),
+quit it and run `./run.sh` again. `force` stops live agents, whose sessions come back as
+restorable; without it the quit is refused while any is live. (`via` says to restart `relay
+remote serve`; that applies only when a separate `relay remote serve` carries the door. It
+cannot run beside a `serve --remote` engine, which already holds the port.) Every pairing link
+from then on carries the join address as well as the LAN ones. The phone tries the LAN first
+and the server second; a PC card in the app can pin either. `relay remote via off` clears it.
 
 The rendezvous keeps nothing on disk. A room is named by the digest of its secret, so only the
 PC that holds the secret can host it, and a restart forgets nothing worth keeping.

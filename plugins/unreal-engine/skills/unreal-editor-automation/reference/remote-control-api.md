@@ -1,7 +1,8 @@
 # Remote Control HTTP API
 
-The `unreal` MCP server's live tools (`ue_call`, `ue_property`, `ue_search_assets`,
-`ue_python`, `ue_console`) sit on the Remote Control API plugin's HTTP server. You normally
+The `unreal` MCP server's live tools (`ue_call`, `ue_property`, `ue_python`, and the tools
+built on editor Python such as `ue_search_assets` and `ue_console`) sit on the Remote Control
+API plugin's HTTP server. You normally
 use the tools, not raw HTTP; this file explains what they send, which object paths are
 valid, and how to read errors.
 
@@ -112,7 +113,12 @@ Asset Registry search.
 ```
 Returns asset name, class and object path for each hit. Depending on engine version,
 `ClassNames` may need full class paths (`/Script/Engine.StaticMesh`); if a short name returns
-nothing, retry with the full path. `ue_search_assets` maps its arguments to this body.
+nothing, retry with the full path.
+
+`ue_search_assets` does not use this route. It runs an Asset Registry query as editor Python
+(through `ExecutePythonCommandEx`, so remote Python must be enabled) and compares short class
+names: pass `StaticMesh`, `Blueprint`, `Material`; a full path such as `/Script/Engine.StaticMesh`
+matches nothing.
 
 ### `PUT /remote/batch`
 Several requests in one round trip, executed in order.
