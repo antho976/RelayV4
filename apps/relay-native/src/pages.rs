@@ -16,7 +16,7 @@ mod task_pages;
 #[path = "board_view.rs"]
 mod board_view;
 pub use notes_window::{refresh_notes, show_notes, NotesWindow};
-pub use note_pages::{close_all_notes, open_draft, shown_project, unsaved_notes};
+pub use note_pages::{close_all_notes, discard_note, notes_prefs, open_draft, set_notes_prefs, shown_project, unsaved_notes, Prefs as NotesPrefs};
 pub use guardrail_pages::{guardrail_event, hold_summary, restore_prompts, settings_editor as guardrail_settings};
 #[allow(unused_imports)] // entry points for the workspace and project menus
 pub use guardrail_pages::{open_project_guardrails, open_workspace_guardrails};

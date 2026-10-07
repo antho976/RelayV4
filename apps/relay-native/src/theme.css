@@ -8,6 +8,11 @@
 @define-color faint #77777a;
 @define-color strong #37373c;
 @define-color edge #252529;
+/* Opaque twins of the four surfaces panel opacity makes translucent (shell.rs redefines both). */
+@define-color wall_solid #0e0e10;
+@define-color console_solid #141416;
+@define-color slab_solid #1b1b1e;
+@define-color wash_solid #232327;
 /* live, held and waiting are the same in every mode; fonts::STATUS gives them to the editor. */
 @define-color live #2ec469;
 @define-color held #e5382e;
@@ -49,9 +54,22 @@ entry, textview, textview text { background: @screen; color: @ink; caret-color: 
 entry { border: 1px solid @edge; border-radius: 2px; min-height: 28px; padding: 0 9px; background-image: none; box-shadow: none; }
 textview { padding: 8px; }
 entry:focus-within { border-color: @secondary; }
+/* Search fields, everywhere: a rounded well with the glass and clear keys quiet inside it. */
+entry.search { min-height: 30px; padding: 0 6px 0 9px; border: 1px solid @edge; border-radius: 7px; background: @screen; color: @ink; transition: border-color 120ms ease-out, box-shadow 120ms ease-out; }
+entry.search:hover { border-color: @strong; }
+entry.search:focus-within { border-color: alpha(@ink, 0.42); box-shadow: 0 0 0 3px alpha(@ink, 0.07); }
+entry.search > image { color: @faint; -gtk-icon-size: 14px; min-width: 16px; }
+entry.search > image:first-child { margin-right: 7px; }
+entry.search:focus-within > image:first-child { color: @secondary; }
+entry.search > image:last-child { margin-left: 4px; padding: 3px; border-radius: 99px; }
+entry.search > image:last-child:hover { color: @ink; background: alpha(@ink, 0.1); }
+entry.search > text { font-size: 12px; }
+entry.search > text > placeholder { color: @faint; }
 selection { background: alpha(@ink, 0.22); color: @ink; }
 dropdown > button { background: @slab; }
 popover contents { background: @slab; color: @ink; border: 1px solid @edge; }
+/* Menus hold a stack (and long ones a scrolled window): let the menu's own surface show. */
+popover stack, popover scrolledwindow, popover viewport { background: transparent; }
 scrollbar { background: transparent; }
 scrollbar slider { min-width: 4px; min-height: 4px; margin: 2px; background: #2c2c30; border: 0; border-radius: 0; }
 scrollbar slider:hover { background: #3f3f45; }
@@ -342,7 +360,8 @@ button.settings-small-key { min-height: 22px; padding: 0 8px; font-size: 11px; }
 .settings-wallpaper-caption { padding: 4px 7px; background: @console; font-size: 12px; }
 
 /* Separate Notes workspace and compact task detail. */
-window.notes-window, window.notes-window > box { padding: 0; margin: 0; border: 0; box-shadow: none; background: @wall; }
+/* Notes has no wallpaper behind it: panel opacity must not show the desktop through it. */
+window.notes-window, window.notes-window > box { padding: 0; margin: 0; border: 0; box-shadow: none; background: @wall_solid; }
 .notes-window-loading { padding: 24px; color: @secondary; }
 .notes-window .notes-page { padding: 0; }
 .task-detail-tabs { margin-bottom: 8px; }
