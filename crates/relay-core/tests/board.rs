@@ -766,3 +766,30 @@ fn independent_builders_on_the_primary_checkout_do_not_wait_on_each_other() {
     // Closing either keeps the shared checkout, and is not refused for the other being there.
     ok(e, "session.close", json!({"session":a}));
 }
+
+/// `task.dispatch {create}` fetches and checks out a new worktree: that happens in a request of
+/// its own, before the dispatch takes the store, and the launch happens after the assignment is
+/// committed — yet before the reply, so the session is already running when the caller looks.
+#[test]
+fn dispatch_with_create_starts_the_session_and_a_refused_one_leaves_nothing_behind() {
+    let f = Fixture::new();
+    let e = &f.engine;
+    let task = f.task("Ship it", json!({}));
+    let out = ok(e, "task.dispatch", json!({"task_id":task["id"],"create":{"project_id":1,"provider":"claude","role":"builder"}}));
+    let name = out["session"]["name"].as_str().unwrap();
+    let session = ok(e, "session.get", json!({"session":name}));
+    assert_eq!(session["state"], "running");
+    assert_eq!(session["task_id"], task["id"]);
+    let brief = std::fs::read_to_string(std::path::Path::new(session["worktree"].as_str().unwrap()).join(".relay/sessions").join(name).join("session-brief.md")).unwrap();
+    assert!(brief.contains("Ship it"), "the brief was written before the assignment: {brief}");
+
+    // A missing provider is refused before any session or checkout is made.
+    ok(e, "settings.set", json!({"path":"providers.codex.path","value":"/nonexistent/codex"}));
+    let before = ok(e, "session.list", json!({"project_id":1}))["sessions"].as_array().unwrap().len();
+    let other = f.task("Not today", json!({}));
+    assert_eq!(code(call(e, Actor::User, "task.dispatch",
+        json!({"task_id":other["id"],"create":{"project_id":1,"provider":"codex","role":"builder"}}))), "provider.not_installed");
+    assert_eq!(ok(e, "session.list", json!({"project_id":1}))["sessions"].as_array().unwrap().len(), before);
+    assert_eq!(ok(e, "task.get", json!({"task_id":other["id"]}))["column"], "backlog");
+    ok(e, "session.close", json!({"session":name}));
+}

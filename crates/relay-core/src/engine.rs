@@ -322,9 +322,11 @@ impl<'a> Ctx<'a> {
             .ok_or_else(|| BusError::not_implemented(entry.name, entry.meta.phase))?
             .call
             .clone();
-        // A staged op reached this way — `guardrail.confirm` replaying a held `git.commit` — has
-        // no read/external phase behind it, so run it here, against the transaction already open.
-        // It costs what the op cost before the split, and only on this path.
+        // A staged op reached this way — `guardrail.confirm` replaying a held `git.commit`, or
+        // `project.remove {force}` closing its sessions — has no read/external phase behind it,
+        // so run it here, against the transaction already open: everything its prepare does
+        // then holds the store. Keep slow staged ops off this path; `task.dispatch` creates and
+        // launches its sessions as requests of their own for exactly that reason.
         let staged = match self.engine.prepares.get(entry.name).cloned() {
             Some(prepare) => {
                 let mut stage = Unlocked {
