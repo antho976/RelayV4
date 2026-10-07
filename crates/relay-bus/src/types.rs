@@ -241,6 +241,48 @@ pub struct GuardrailConfig {
     pub agent_builds: bool,
 }
 
+impl GuardrailConfig {
+    /// Remove every key `deny_unknown_fields` would reject — an object whose schema says
+    /// `additionalProperties: false` keeps only its named properties — and return them as
+    /// dotted paths. Works on a partial tree too: absent keys are not this function's concern.
+    pub fn strip_unknown(value: &mut Value) -> Vec<String> {
+        static SCHEMA: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+        let schema = SCHEMA.get_or_init(|| schemars::schema_for!(GuardrailConfig).to_value());
+        let mut unknown = Vec::new();
+        strip_unknown_at(value, schema, schema, "", &mut unknown);
+        unknown
+    }
+}
+
+fn strip_unknown_at(value: &mut Value, schema: &Value, root: &Value, at: &str, unknown: &mut Vec<String>) {
+    let schema = match schema.get("$ref").and_then(Value::as_str).and_then(|r| r.strip_prefix("#/$defs/")) {
+        Some(name) => &root["$defs"][name],
+        None => schema,
+    };
+    let join = |key: &str| if at.is_empty() { key.to_string() } else { format!("{at}.{key}") };
+    match value {
+        Value::Object(map) => {
+            let Some(props) = schema.get("properties").and_then(Value::as_object) else { return };
+            if schema.get("additionalProperties") == Some(&Value::Bool(false)) {
+                map.retain(|key, _| props.contains_key(key) || { unknown.push(join(key)); false });
+            }
+            for (key, child) in map.iter_mut() {
+                if let Some(sub) = props.get(key) {
+                    strip_unknown_at(child, sub, root, &join(key), unknown);
+                }
+            }
+        }
+        Value::Array(items) => {
+            if let Some(sub) = schema.get("items") {
+                for (i, item) in items.iter_mut().enumerate() {
+                    strip_unknown_at(item, sub, root, &join(&i.to_string()), unknown);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Which layer of guardrail configuration a value lives in. Each layer overrides the one
 /// before it: defaults, then global, then the project's workspace, then the project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]

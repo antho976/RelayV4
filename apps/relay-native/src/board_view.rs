@@ -70,6 +70,11 @@ fn drop_index(order: &[i64], moving: i64, onto: i64, after: bool) -> usize {
         .unwrap_or(others.len())
 }
 
+/// Every task by id, built once per render: a card's links are looked up, not scanned for.
+fn by_id(tasks: &[Value]) -> BTreeMap<i64, &Value> {
+    tasks.iter().filter_map(|t| Some((t["id"].as_i64()?, t))).collect()
+}
+
 fn caption(column: &str) -> &'static str {
     COLUMNS
         .iter()
@@ -476,6 +481,8 @@ struct Board {
     peek_shown: Cell<Option<i64>>,
     /// A render is waiting for an open card menu or picker to close.
     deferred: Cell<bool>,
+    /// Audit rows Ctrl+Z found stale or not undoable: the next press reaches past them.
+    skipped: RefCell<BTreeSet<i64>>,
 }
 
 /// Mounts the board on `page` for `project` the first time, then re-renders it with `tasks`.
@@ -691,6 +698,7 @@ impl Board {
             peek_key: RefCell::new(None),
             peek_shown: Cell::new(None),
             deferred: Cell::new(false),
+            skipped: RefCell::new(BTreeSet::new()),
         });
 
         for (field, values) in [
@@ -857,11 +865,46 @@ impl Board {
             }
             return;
         }
+        // Picking the column a task is already in would append it to the bottom.
+        if column == from && position.is_none() {
+            return;
+        }
+        // Moved here at once, so a key pressed again before the engine's refresh lands builds
+        // on this move; that refresh confirms or corrects it.
+        let id = task["id"].as_i64();
+        let mut order = self.column_order(column);
+        order.retain(|other| Some(*other) != id);
+        if let Some(id) = id {
+            order.insert(position.unwrap_or(order.len()).min(order.len()), id);
+        }
+        for t in self.tasks.borrow_mut().iter_mut() {
+            if t["id"].as_i64() == id {
+                t["column"] = column.into();
+            }
+            if let Some(at) = t["id"].as_i64().and_then(|i| order.iter().position(|o| *o == i)) {
+                t["position"] = json!(at);
+            }
+        }
+        self.render_when_closed();
         let mut payload = json!({"task_id":task["id"],"column":column});
         if let Some(at) = position {
             payload["position"] = json!(at);
         }
         self.act("task.move", payload);
+    }
+    /// Sets one field, applied locally and redrawn at once like [`Self::move_to`]. Picking the
+    /// value a task already has writes nothing: a no-op update would only stale its undo rows.
+    fn set_field(self: &Rc<Self>, id: i64, field: &'static str, value: Value) {
+        {
+            let mut tasks = self.tasks.borrow_mut();
+            let Some(task) = tasks.iter_mut().find(|t| t["id"].as_i64() == Some(id)) else { return };
+            if task[field] == value {
+                return;
+            }
+            task[field] = value.clone();
+        }
+        self.render_when_closed();
+        self.act("task.update", json!({"task_id":id, field:value}));
     }
     fn drop_on(self: &Rc<Self>, moving: i64, onto: i64, zone: Zone) -> bool {
         let (Some(task), Some(target)) = (self.task(moving), self.task(onto)) else {
@@ -889,6 +932,7 @@ impl Board {
         let project = self.project;
         key.set_sensitive(false);
         let key = key.clone();
+        let board = self.clone();
         glib::spawn_future_local(async move {
             let result = async {
                 let history = ui
@@ -897,12 +941,30 @@ impl Board {
                         json!({"project_id":project,"actor":"user","op_prefix":"task.","limit":50}),
                     )
                     .await?;
-                match rows(&history, "rows")
-                    .iter()
-                    .find(|r| !r["undo_op"].is_null() && r["undone_by"].is_null())
-                {
+                let skipped = board.skipped.borrow().clone();
+                match rows(&history, "rows").iter().find(|r| {
+                    !r["undo_op"].is_null()
+                        && r["undone_by"].is_null()
+                        && !r["id"].as_i64().is_some_and(|id| skipped.contains(&id))
+                }) {
                     Some(row) => {
-                        ui.call("audit.undo", json!({"audit_id":row["id"]})).await?;
+                        let what = format!("{} on #{}", text(row, "op"), row["payload"]["task_id"]);
+                        match ui.call("audit.undo", json!({"audit_id":row["id"]})).await {
+                            Ok(_) => ui.show_error(&format!("Undid {what}")),
+                            // A row that cannot be undone must not block every older one.
+                            Err(crate::client::Error::Bus(error))
+                                if matches!(error.code.as_str(), "audit.stale" | "audit.not_undoable") =>
+                            {
+                                if let Some(id) = row["id"].as_i64() {
+                                    board.skipped.borrow_mut().insert(id);
+                                }
+                                ui.show_error(&format!(
+                                    "Cannot undo {what}: {}. Press Ctrl+Z again for the change before it.",
+                                    error.message
+                                ));
+                            }
+                            Err(error) => return Err(error),
+                        }
                     }
                     None => ui.show_error("Nothing on the board to undo."),
                 }
@@ -1150,10 +1212,10 @@ impl Board {
                 if let Some(task) = task {
                     let order = ["low", "medium", "high", "urgent"];
                     let at = order.iter().position(|p| *p == text(&task, "priority")).unwrap_or(1);
-                    self.act(
-                        "task.update",
-                        json!({"task_id":task["id"],"priority":order[(at + 1) % 4]}),
-                    );
+                    if let Some(id) = task["id"].as_i64() {
+                        self.focused.set(Some(id));
+                        self.set_field(id, "priority", json!(order[(at + 1) % 4]));
+                    }
                 }
             }
             Key::period | Key::Menu => {
@@ -1168,23 +1230,30 @@ impl Board {
         }
         glib::Propagation::Stop
     }
-    /// Shift+J/K: the focused card swaps places with its neighbour in the column.
+    /// Shift+J/K: the focused card swaps places with its neighbour in the lane as shown, which
+    /// leaves out filtered tasks and orders by group first.
     fn nudge(self: &Rc<Self>, task: Option<&Value>, delta: i64) {
         let Some(task) = task else { return };
+        let Some(id) = task["id"].as_i64() else { return };
         let column = text(task, "column").to_string();
         if column == "done" {
             return;
         }
-        let order = self.column_order(&column);
-        let Some(at) = order.iter().position(|id| Some(*id) == task["id"].as_i64()) else {
-            return;
-        };
-        let next = at as i64 + delta;
-        if next < 0 || next >= order.len() as i64 {
+        let neighbour = self.layout.borrow().iter().find(|(lane, _)| *lane == column).and_then(|(_, cards)| {
+            let at = cards.iter().position(|(card, _)| *card == id)? as i64 + delta;
+            usize::try_from(at).ok().and_then(|at| cards.get(at)).map(|(card, _)| *card)
+        });
+        let Some(neighbour) = neighbour.and_then(|other| self.task(other)) else { return };
+        let grouping = self.group.borrow().clone();
+        if group_of(task, &grouping) != group_of(&neighbour, &grouping) {
+            if let Some(ui) = self.ui() {
+                ui.show_error("Cards keep to their group: change the task or the grouping to move it past one.");
+            }
             return;
         }
-        self.focused.set(task["id"].as_i64());
-        self.move_to(task, &column, Some(next as usize));
+        let Some(onto) = neighbour["id"].as_i64() else { return };
+        self.focused.set(Some(id));
+        self.move_to(task, &column, Some(drop_index(&self.column_order(&column), id, onto, delta > 0)));
     }
 
     fn toggle_peek(self: &Rc<Self>, id: i64) {
@@ -1646,6 +1715,7 @@ impl Board {
         self.content.append(&scroller);
         let grouping = self.group.borrow().clone();
         let hidden = self.hidden.borrow().clone();
+        let all = by_id(tasks);
         if hidden.len() == COLUMNS.len() {
             let all = label("Every column is hidden. Turn one back on in the COLUMNS strip.", "board-empty");
             all.set_halign(gtk::Align::Center);
@@ -1682,7 +1752,7 @@ impl Board {
                         previous = Some(group);
                     }
                 }
-                let card = self.card(task, tasks);
+                let card = self.card(task, &all);
                 cards.append(&card);
                 placed.push((task["id"].as_i64().unwrap_or(0), card.upcast()));
             }
@@ -1716,7 +1786,7 @@ impl Board {
         empty
     }
 
-    fn card(self: &Rc<Self>, task: &Value, all: &[Value]) -> gtk::Box {
+    fn card(self: &Rc<Self>, task: &Value, all: &BTreeMap<i64, &Value>) -> gtk::Box {
         let id = task["id"].as_i64().unwrap_or(0);
         let done = text(task, "column") == "done";
         let card = gtk::Box::new(gtk::Orientation::Vertical, 6);
@@ -1808,8 +1878,7 @@ impl Board {
         let blockers: Vec<&Value> = rows(task, "blocked_by")
             .into_iter()
             .filter_map(|other| {
-                all.iter()
-                    .find(|t| t["id"] == other && text(t, "column") != "done")
+                other.as_i64().and_then(|other| all.get(&other)).copied().filter(|t| text(t, "column") != "done")
             })
             .collect();
         if !blockers.is_empty() && !done {
@@ -1828,7 +1897,7 @@ impl Board {
             line.append(&caption);
             card.append(&line);
         }
-        if let Some(duplicate) = all.iter().find(|t| t["id"] == task["duplicate_of"]) {
+        if let Some(duplicate) = task["duplicate_of"].as_i64().and_then(|other| all.get(&other)) {
             let caption = label(&format!("Duplicate of #{} {}", duplicate["id"], text(duplicate, "title")), "task-lineage");
             caption.set_ellipsize(gtk::pango::EllipsizeMode::End);
             card.append(&caption);
@@ -1891,6 +1960,7 @@ impl Board {
         self.content.append(&scroll);
         let hidden = self.hidden.borrow().clone();
         let grouping = self.group.borrow().clone();
+        let all = by_id(tasks);
         for (column, _) in COLUMNS {
             if hidden.contains(column) {
                 continue;
@@ -1918,7 +1988,7 @@ impl Board {
                         previous = Some(group);
                     }
                 }
-                let row = self.row(task, tasks);
+                let row = self.row(task, &all);
                 section.append(&row);
                 placed.push((task["id"].as_i64().unwrap_or(0), row.upcast()));
             }
@@ -1927,7 +1997,7 @@ impl Board {
         }
     }
 
-    fn row(self: &Rc<Self>, task: &Value, all: &[Value]) -> gtk::Box {
+    fn row(self: &Rc<Self>, task: &Value, all: &BTreeMap<i64, &Value>) -> gtk::Box {
         let id = task["id"].as_i64().unwrap_or(0);
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 9);
         row.add_css_class("list-row");
@@ -1971,7 +2041,7 @@ impl Board {
         }
         let blocked = rows(task, "blocked_by")
             .iter()
-            .any(|other| all.iter().any(|t| t["id"] == *other && text(t, "column") != "done"));
+            .any(|other| other.as_i64().and_then(|other| all.get(&other)).is_some_and(|t| text(t, "column") != "done"));
         if blocked && text(task, "column") != "done" {
             let lamp = lamp("blocked-lamp");
             lamp.set_tooltip_text(Some("Blocked by an open task"));
@@ -2212,7 +2282,7 @@ impl Board {
                 key.add_css_class("selected");
             }
             key.connect_clicked(run(Box::new(move |board| {
-                board.act("task.update", json!({"task_id":id,"priority":priority}));
+                board.set_field(id, "priority", json!(priority));
             })));
             priorities.append(&key);
         }
@@ -2228,7 +2298,7 @@ impl Board {
                 key.add_css_class("selected");
             }
             key.connect_clicked(run(Box::new(move |board| {
-                board.act("task.update", json!({"task_id":id,"type":kind}));
+                board.set_field(id, "type", json!(kind));
             })));
             kinds.append(&key);
         }
@@ -2253,7 +2323,7 @@ impl Board {
         let delete = item("trash", "Delete task", "");
         delete.add_css_class("destructive");
         delete.set_tooltip_text(Some("Ctrl+Z on the board restores it"));
-        delete.connect_clicked(run(Box::new(move |board| {
+        crate::app::confirm_inline(&delete, "Delete this task?", run(Box::new(move |board| {
             if board.peeked.get() == Some(id) {
                 board.peeked.set(None);
             }
@@ -2421,14 +2491,14 @@ impl Board {
         prop(
             "Priority",
             self.picker(&PRIORITIES, text(&task, "priority"), |p| Some(priority_icon(p).upcast()), move |board, p| {
-                board.act("task.update", json!({"task_id":id,"priority":p}));
+                board.set_field(id, "priority", json!(p));
             })
             .upcast_ref(),
         );
         prop(
             "Type",
             self.picker(&TYPES, text(&task, "type"), |t| Some(task_mark(t, 9).upcast()), move |board, t| {
-                board.act("task.update", json!({"task_id":id,"type":t}));
+                board.set_field(id, "type", json!(t));
             })
             .upcast_ref(),
         );
@@ -2436,7 +2506,7 @@ impl Board {
             "Size",
             self.picker(&SIZES, text(&task, "size"), |_| None, move |board, s| {
                 let size = if s.is_empty() { Value::Null } else { json!(s) };
-                board.act("task.update", json!({"task_id":id,"size":size}));
+                board.set_field(id, "size", size);
             })
             .upcast_ref(),
         );

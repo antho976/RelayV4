@@ -104,14 +104,11 @@ fn actors_and_doors() {
     // ...but not on stable
     let stable = engine(Instance::Stable);
     assert_eq!(err(&call(&stable, Actor::Test, "bus.ping", json!({}))).code, "bus.actor");
-    // Tauri door carries only the user actor
-    let r = e.dispatch(Request::new(Actor::agent("x"), "bus.ping", json!({})), Door::Tauri);
-    assert_eq!(err(&r).code, "bus.actor");
     // socket door needs a token for agents
     let r = e.dispatch(Request::new(Actor::agent("x"), "bus.ping", json!({})), Door::Socket);
     assert_eq!(err(&r).code, "bus.actor");
-    // socket-only op on the Tauri door
-    let r = e.dispatch(Request::new(Actor::User, "bus.subscribe", json!({})), Door::Tauri);
+    // a socket-only op that reaches the engine itself is refused: only a connection can subscribe
+    let r = e.dispatch(Request::new(Actor::User, "bus.subscribe", json!({})), Door::InProcess);
     assert_eq!(err(&r).code, "bus.door");
     // layer-1 allowlist: an agent may not create workspaces; the refusal is audited
     let r = call(&e, Actor::agent("brisk-otter"), "workspace.create", json!({"path": "/tmp"}));
@@ -218,7 +215,7 @@ fn device_discovery_mirror_input_and_run_lifecycle() {
     });
     call(&e, Actor::User, "device.watch", json!({"on":false})).into_result().unwrap();
 
-    let mirror = e.dispatch(Request::new(Actor::User, "device.mirror.start", json!({"device":"relay-phone","max_size":1080,"bitrate":4_000_000})), Door::Tauri).into_result().unwrap();
+    let mirror = e.dispatch(Request::new(Actor::User, "device.mirror.start", json!({"device":"relay-phone","max_size":1080,"bitrate":4_000_000})), Door::InProcess).into_result().unwrap();
     assert_eq!(mirror["width"], 576);
     assert_eq!(mirror["height"], 1280);
     let mirror_id = mirror["mirror_id"].as_i64().unwrap();

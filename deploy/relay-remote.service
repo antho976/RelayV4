@@ -1,12 +1,21 @@
 # systemd --user unit for the PC: engine and phone door together, from login.
+#
+# It runs the `dev` instance, because that is what ./run.sh and the desktop app use by default
+# (run.sh's RELAY_INSTANCE, relay-native's fallback); `relay` alone defaults to stable, which
+# would be a second engine with its own store that the desktop never shows.
+#
+# ./run.sh (and the desktop launcher, which runs it) reuses a running dev engine only when it is
+# the binary run.sh just built, so ExecStart points at the checkout's build, not a copy:
+# edit the path to your checkout, then
 #   mkdir -p ~/.config/systemd/user && cp deploy/relay-remote.service ~/.config/systemd/user/
 #   systemctl --user enable --now relay-remote
-# The desktop app reuses a running engine, so it keeps working as before.
+# After a rebuild, run.sh restarts an engine that holds no live sessions with the new binary
+# (outside this unit); one that holds sessions keeps running and run.sh says so.
 [Unit]
-Description=Relay engine with the phone door
+Description=Relay engine (dev instance) with the phone door
 
 [Service]
-ExecStart=%h/.cargo/bin/relay serve --remote
+ExecStart=%h/RelayV4/target/debug/relay --instance dev serve --remote
 Restart=on-failure
 RestartSec=2
 Environment=RELAY_LOG=info

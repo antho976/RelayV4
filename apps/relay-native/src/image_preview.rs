@@ -106,6 +106,12 @@ fn decode_to(value: Value, max_edge: i32) -> Result<Decoded, String> {
     } else {
         return Err("The file did not contain image data.".into());
     };
+    // gdk-pixbuf 2.44 (glycin) reports the size only once the whole image is decoded, so the
+    // limit is checked against the header first, then again against what the decoder saw.
+    let declared = header_size(&bytes)?;
+    if declared.is_some_and(|(width, height)| width.saturating_mul(height) > MAX_PIXELS) {
+        return Err(TOO_LARGE.into());
+    }
     let loader = gtk::gdk_pixbuf::PixbufLoader::new();
     let dimensions = Rc::new(Cell::new((0, 0)));
     let prepared = dimensions.clone();
@@ -120,14 +126,19 @@ fn decode_to(value: Value, max_edge: i32) -> Result<Decoded, String> {
     let read: Result<(), String> = bytes.chunks(8192).try_for_each(|chunk| {
         loader.write(chunk).map_err(|e| e.to_string())?;
         let (width, height) = dimensions.get();
-        if i64::from(width) * i64::from(height) > 100_000_000 {
-            return Err("Image dimensions exceed the 100 megapixel preview limit.".into());
+        if i64::from(width) * i64::from(height) > MAX_PIXELS as i64 {
+            return Err(TOO_LARGE.into());
         }
         Ok(())
     });
     let closed = loader.close().map_err(|e| e.to_string());
     read?;
     closed?;
+    // An SVG is drawn at the preview size whatever canvas it declares.
+    let (width, height) = dimensions.get();
+    if declared.is_some() && i64::from(width) * i64::from(height) > MAX_PIXELS as i64 {
+        return Err(TOO_LARGE.into());
+    }
     let pixbuf = loader
         .pixbuf()
         .ok_or("The image format could not be decoded.")?;
@@ -140,6 +151,152 @@ fn decode_to(value: Value, max_edge: i32) -> Result<Decoded, String> {
         alpha: pixbuf.has_alpha(),
         original: dimensions.get(),
     })
+}
+
+const MAX_PIXELS: u64 = 100_000_000;
+const TOO_LARGE: &str = "Image dimensions exceed the 100 megapixel preview limit.";
+const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+/// An image's declared width and height, read from its header before any decoder runs.
+/// `None` is an SVG. Content that is none of the previewed formats is refused, so it cannot
+/// reach whatever other decoder is installed.
+fn header_size(bytes: &[u8]) -> Result<Option<(u64, u64)>, String> {
+    let size = if bytes.starts_with(PNG) {
+        png_size(bytes)
+    } else if bytes.starts_with(&[0xff, 0xd8]) {
+        jpeg_size(bytes)
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        int(bytes, 6, 2, false).zip(int(bytes, 8, 2, false))
+    } else if bytes.starts_with(b"BM") {
+        bmp_size(bytes)
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        webp_size(bytes)
+    } else if bytes.starts_with(b"II*\0") || bytes.starts_with(b"MM\0*") {
+        tiff_size(bytes)
+    } else if bytes.starts_with(&[0, 0, 1, 0]) || bytes.starts_with(&[0, 0, 2, 0]) {
+        ico_size(bytes)
+    } else if bytes
+        .strip_prefix(b"\xef\xbb\xbf")
+        .unwrap_or(bytes)
+        .trim_ascii_start()
+        .starts_with(b"<")
+    {
+        return Ok(None);
+    } else {
+        return Err("This is not a PNG, JPEG, GIF, BMP, WebP, TIFF, ICO or SVG image.".into());
+    };
+    size.map(Some).ok_or_else(|| "The image header could not be read.".into())
+}
+
+/// An unsigned integer of `len` bytes at `at`.
+fn int(bytes: &[u8], at: usize, len: usize, big_endian: bool) -> Option<u64> {
+    let field = bytes.get(at..at.checked_add(len)?)?;
+    let fold = |n: u64, byte: &u8| n << 8 | u64::from(*byte);
+    Some(if big_endian {
+        field.iter().fold(0, fold)
+    } else {
+        field.iter().rev().fold(0, fold)
+    })
+}
+
+fn png_size(bytes: &[u8]) -> Option<(u64, u64)> {
+    if bytes.get(12..16)? != b"IHDR" {
+        return None;
+    }
+    int(bytes, 16, 4, true).zip(int(bytes, 20, 4, true))
+}
+
+/// The first frame header (SOFn) after any number of other segments.
+fn jpeg_size(bytes: &[u8]) -> Option<(u64, u64)> {
+    let mut at = 2;
+    loop {
+        if *bytes.get(at)? != 0xff {
+            return None;
+        }
+        while *bytes.get(at)? == 0xff {
+            at += 1;
+        }
+        let marker = *bytes.get(at)?;
+        at += 1;
+        match marker {
+            0x01 | 0xd0..=0xd7 => {}
+            0xd9 | 0xda => return None,
+            0xc0..=0xcf if !matches!(marker, 0xc4 | 0xc8 | 0xcc) => {
+                return int(bytes, at + 5, 2, true).zip(int(bytes, at + 3, 2, true));
+            }
+            _ => at += int(bytes, at, 2, true)? as usize,
+        }
+    }
+}
+
+/// A DIB header's width and height at `at`; a negative height means top-down rows.
+fn dib_size(bytes: &[u8], at: usize) -> Option<(u64, u64)> {
+    if int(bytes, at, 4, false)? == 12 {
+        return int(bytes, at + 4, 2, false).zip(int(bytes, at + 6, 2, false));
+    }
+    let signed = |at| int(bytes, at, 4, false).map(|n| u64::from((n as u32 as i32).unsigned_abs()));
+    signed(at + 4).zip(signed(at + 8))
+}
+
+fn bmp_size(bytes: &[u8]) -> Option<(u64, u64)> {
+    dib_size(bytes, 14)
+}
+
+fn webp_size(bytes: &[u8]) -> Option<(u64, u64)> {
+    match bytes.get(12..16)? {
+        b"VP8 " => Some((int(bytes, 26, 2, false)? & 0x3fff, int(bytes, 28, 2, false)? & 0x3fff)),
+        b"VP8L" => {
+            let bits = int(bytes, 21, 4, false)?;
+            Some(((bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1))
+        }
+        b"VP8X" => Some((int(bytes, 24, 3, false)? + 1, int(bytes, 27, 3, false)? + 1)),
+        _ => None,
+    }
+}
+
+/// ImageWidth and ImageLength from the first IFD, the page gdk-pixbuf shows.
+fn tiff_size(bytes: &[u8]) -> Option<(u64, u64)> {
+    let big = bytes[0] == b'M';
+    let ifd = int(bytes, 4, 4, big)? as usize;
+    let (mut width, mut height) = (None, None);
+    for entry in 0..int(bytes, ifd, 2, big)? as usize {
+        let at = ifd + 2 + entry * 12;
+        let value = match int(bytes, at + 2, 2, big)? {
+            3 => int(bytes, at + 8, 2, big)?,
+            4 => int(bytes, at + 8, 4, big)?,
+            _ => continue,
+        };
+        match int(bytes, at, 2, big)? {
+            256 => width = Some(value),
+            257 => height = Some(value),
+            _ => {}
+        }
+    }
+    width.zip(height)
+}
+
+/// The largest entry; each holds a PNG or a DIB, whose header can claim more than the
+/// directory's byte-sized edges.
+fn ico_size(bytes: &[u8]) -> Option<(u64, u64)> {
+    let mut largest: Option<(u64, u64)> = None;
+    for entry in 0..int(bytes, 4, 2, false)? as usize {
+        let at = 6 + entry * 16;
+        let edge = |n: u64| if n == 0 { 256 } else { n };
+        let listed = (edge(int(bytes, at, 1, false)?), edge(int(bytes, at + 1, 1, false)?));
+        let offset = int(bytes, at + 12, 4, false)? as usize;
+        let image = bytes.get(offset..)?;
+        let (width, height) = if image.starts_with(PNG) {
+            png_size(image)?
+        } else {
+            // A DIB in an icon stacks the AND mask under the image, doubling its height.
+            dib_size(image, 0).map(|(width, height)| (width, height / 2))?
+        };
+        let size = (width.max(listed.0), height.max(listed.1));
+        if largest.is_none_or(|(w, h)| size.0.saturating_mul(size.1) > w.saturating_mul(h)) {
+            largest = Some(size);
+        }
+    }
+    largest
 }
 
 impl Decoded {
@@ -455,6 +612,7 @@ mod tests {
         pixbuf.fill(0x3377aaff);
         for format in ["png", "jpeg", "bmp", "tiff"] {
             let bytes = pixbuf.save_to_bufferv(format, &[]).unwrap();
+            assert_eq!(header_size(&bytes), Ok(Some((5000, 8))), "{format}");
             let image = decode(
                 json!({"bytes_b64":base64::engine::general_purpose::STANDARD.encode(bytes)}),
             )
@@ -497,6 +655,23 @@ mod tests {
             .unwrap()
             .contains("16 MiB"));
         assert!(is_image("ART/Preview.PNG") && is_image("photo.JPEG") && is_image("asset.webp"));
+        // The header alone refuses a huge image: only IHDR, no pixel data, is needed.
+        let mut huge = PNG.to_vec();
+        huge.extend_from_slice(&[0, 0, 0, 13]);
+        huge.extend_from_slice(b"IHDR");
+        huge.extend_from_slice(&11000u32.to_be_bytes());
+        huge.extend_from_slice(&10000u32.to_be_bytes());
+        huge.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&huge);
+        assert_eq!(decode(json!({"bytes_b64":encoded})).err().as_deref(), Some(TOO_LARGE));
+        let mut gif = b"GIF89a".to_vec();
+        gif.extend_from_slice(&[0x10, 0x27, 0x10, 0x27]);
+        assert_eq!(header_size(&gif), Ok(Some((10000, 10000))));
+        let mut webp = b"RIFF\0\0\0\0WEBPVP8X\0\0\0\0\0\0\0\0".to_vec();
+        webp.extend_from_slice(&[0x0f, 0x27, 0, 0x0f, 0x27, 0]);
+        assert_eq!(header_size(&webp), Ok(Some((10000, 10000))));
+        assert_eq!(header_size(b"\xef\xbb\xbf\n<svg/>"), Ok(None));
+        assert!(header_size(b"\0\0\0\x0cjP  \r\n\x87\n").is_err());
         assert!(!is_image("image.png.rs"));
     }
 }

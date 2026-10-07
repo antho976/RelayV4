@@ -1,8 +1,9 @@
 //! `relay remote …` — the phone door (crates/relay-remote), driven from the CLI.
 //!
 //! `serve` fronts a running engine on the LAN and, when a rendezvous is configured, dials out
-//! to it. `pair` opens a ten-minute window and prints the code as a QR for the phone's camera.
-//! Everything else edits `remote.json`.
+//! to it. `pair` opens a ten-minute window, prints the code as a QR for the phone's camera, and
+//! stays to ask before the phone that presents it is paired. Everything else edits
+//! `remote.json`, always through `Registry::update` so concurrent writers never undo each other.
 
 use anyhow::{anyhow, Context, Result};
 use clap::Subcommand;
@@ -10,9 +11,12 @@ use relay_core::Instance;
 use relay_remote::direct::{is_tailnet, lan_addresses, DirectServer};
 use relay_remote::pairlink::PairLink;
 use relay_remote::rendezvous::RendezvousServer;
+use relay_remote::registry::normalize_code;
 use relay_remote::{Ctx, Registry, DEFAULT_PORT, DEFAULT_RENDEZVOUS_PORT};
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Subcommand)]
 pub enum RemoteCommand {
@@ -24,12 +28,19 @@ pub enum RemoteCommand {
         /// Also open a pairing window and print its QR code at start
         #[arg(long)]
         pair: bool,
+        /// With --pair: let the first phone with the code pair without asking here
+        #[arg(long)]
+        no_confirm: bool,
         /// Do not dial the configured rendezvous this time
         #[arg(long)]
         no_rendezvous: bool,
     },
-    /// Open a ten-minute pairing window and print the code and QR for the phone
-    Pair,
+    /// Open a ten-minute pairing window, print the code and QR for the phone, and ask before it pairs
+    Pair {
+        /// Let the first phone with the code pair without asking (for a terminal you cannot answer in)
+        #[arg(long)]
+        no_confirm: bool,
+    },
     /// List paired phones
     Devices,
     /// Forget a paired phone by id
@@ -53,12 +64,17 @@ fn init_logging() {
         .init();
 }
 
-fn print_pair_link(link: &PairLink) {
+fn print_pair_link(link: &PairLink, confirm: bool) {
     println!();
     if let Some(qr) = link.qr() {
         println!("{qr}");
     }
-    println!("Pairing code: {}   (valid for 10 minutes, one phone)", link.code);
+    println!("Pairing code: {}   (valid for 10 minutes, one phone; any earlier code no longer works)", link.code);
+    if confirm {
+        println!("This terminal asks before the phone that presents it is paired.");
+    } else {
+        println!("Not confirmed here: the first phone that presents this code is paired.");
+    }
     println!("Host: {} ({})", link.host, link.instance);
     if link.direct.is_empty() {
         println!("Direct: no LAN address found; the phone can only reach this engine through a rendezvous");
@@ -83,6 +99,59 @@ fn print_pair_link(link: &PairLink) {
     println!("\nScan the code from the Relay app's PC tab, or type the link:\n{}\n", link.to_url());
 }
 
+/// Whether pairing can be confirmed here: it needs a person at this terminal.
+fn confirm_wanted(no_confirm: bool) -> Result<bool> {
+    use std::io::IsTerminal as _;
+    if no_confirm {
+        return Ok(false);
+    }
+    if !std::io::stdin().is_terminal() {
+        return Err(anyhow!("no terminal to confirm the pairing in; pass --no-confirm to let the first phone with the code pair"));
+    }
+    Ok(true)
+}
+
+/// Stay with the open window and ask about the phone that presents its code. Returns once the
+/// window is answered, expires, or is replaced by a newer one.
+async fn confirm_pairing(path: PathBuf, code: String) -> Result<()> {
+    let wanted = normalize_code(&code);
+    println!("Waiting for a phone… (Ctrl+C closes the window)");
+    loop {
+        let registry = Registry::load(&path)?;
+        let Some(pending) = registry.pending.iter().find(|p| normalize_code(&p.code) == wanted) else {
+            println!("The pairing window closed (it expired, or a newer `relay remote pair` replaced it).");
+            return Ok(());
+        };
+        if let Some(request) = pending.request.as_ref().filter(|r| r.approved.is_none()) {
+            let question = format!("Pair \"{}\" ({}) with this PC? It gets full control as you. [y/N] ", request.device_name, request.origin);
+            let yes = tokio::task::spawn_blocking(move || {
+                use std::io::Write as _;
+                print!("{question}");
+                let _ = std::io::stdout().flush();
+                let mut answer = String::new();
+                std::io::stdin().read_line(&mut answer).map(|_| matches!(answer.trim(), "y" | "Y" | "yes" | "YES" | "Yes"))
+            })
+            .await??;
+            let decided = Registry::update(&path, |r| Ok::<_, anyhow::Error>(r.decide(&code, yes)))?;
+            match (decided, yes) {
+                (false, _) => println!("Too late: the phone stopped waiting. Run `relay remote pair` again."),
+                (true, true) => println!("Approved. `relay remote devices` lists it; `relay remote revoke <id>` removes it."),
+                (true, false) => println!("Declined. The code is spent; nothing was paired."),
+            }
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Close a pairing window nobody is going to answer.
+fn abandon_pairing(path: &Path, code: &str) {
+    let _ = Registry::update(path, |r| {
+        r.abandon(code);
+        Ok::<_, anyhow::Error>(())
+    });
+}
+
 /// `relay serve --remote`: the engine and its phone door in one process, so a machine that
 /// starts Relay at login is reachable from the phone without a second command.
 pub async fn serve_with_door(
@@ -103,7 +172,9 @@ pub async fn serve_with_door(
         version: env!("CARGO_PKG_VERSION").to_string(),
     });
     // The door is a convenience on top of the engine, never a reason for the engine not to
-    // start: a port already taken by another instance's door is logged and skipped.
+    // start: a port already taken by another instance's door is logged and skipped, and so is a
+    // `remote.json` that cannot be read or written — it is never reset, since it holds every
+    // phone's credential, so the door stays shut until a person fixes it.
     let door = match DirectServer::bind(ctx.clone(), addr).await {
         Ok(door) => Some(door),
         Err(e) => {
@@ -111,18 +182,28 @@ pub async fn serve_with_door(
             None
         }
     };
-    let mut registry = Registry::load(&ctx.registry_path).map_err(relay_core::socket::BindError::Other)?;
-    if let Some(door) = &door {
-        registry.direct_port = Some(door.local_addr.port());
-    }
-    registry.save(&ctx.registry_path).map_err(relay_core::socket::BindError::Other)?;
-    let tunnel = registry
-        .rendezvous
+    let port = door.as_ref().map(|d| d.local_addr.port());
+    let registry = Registry::update(&ctx.registry_path, |r| {
+        if port.is_some() {
+            r.direct_port = port;
+        }
+        Ok::<_, anyhow::Error>(r.clone())
+    });
+    let (door, registry) = match registry {
+        Ok(registry) => (door, Some(registry)),
+        Err(e) => {
+            eprintln!("relay serve: {} is unusable ({e:#}); the engine runs without the phone door or rendezvous — fix or move the file, then restart", ctx.registry_path.display());
+            tracing::warn!(error = %format!("{e:#}"), path = %ctx.registry_path.display(), "remote.json unusable; phone door disabled");
+            (None, None)
+        }
+    };
+    let rendezvous = registry.as_ref().and_then(|r| r.rendezvous.clone());
+    let tunnel = rendezvous
         .as_ref()
         .map(|r| relay_remote::tunnel::spawn(ctx.clone(), r.clone()));
     if let Some(door) = &door {
         println!("relay serve: phone door on {} ({}); `relay remote pair` adds a phone", door.local_addr,
-            match &registry.rendezvous { Some(r) => format!("dialing {}", r.url), None => "no rendezvous".to_string() });
+            match &rendezvous { Some(r) => format!("dialing {}", r.url), None => "no rendezvous".to_string() });
     }
     let quit = served.engine.clone();
     tokio::select! {
@@ -178,7 +259,7 @@ pub async fn run(requested: Instance, cmd: RemoteCommand) -> Result<u8> {
     };
     let ctx = Arc::new(Ctx::for_instance(instance));
     match cmd {
-        RemoteCommand::Serve { bind, pair, no_rendezvous } => {
+        RemoteCommand::Serve { bind, pair, no_confirm, no_rendezvous } => {
             init_logging();
             let addr: SocketAddr = bind.parse().with_context(|| format!("bad --bind {bind:?}"))?;
             if !relay_core::socket::probe(&ctx.socket_path).await {
@@ -188,11 +269,14 @@ pub async fn run(requested: Instance, cmd: RemoteCommand) -> Result<u8> {
                 );
                 return Ok(5);
             }
+            let confirm = pair && confirm_wanted(no_confirm)?;
             let door = DirectServer::bind(ctx.clone(), addr).await?;
-            let mut registry = Registry::load(&ctx.registry_path)?;
-            registry.direct_port = Some(door.local_addr.port());
-            let link_code = pair.then(|| registry.begin_pair().code);
-            registry.save(&ctx.registry_path)?;
+            let port = door.local_addr.port();
+            let (registry, link_code) = Registry::update(&ctx.registry_path, |r| {
+                r.direct_port = Some(port);
+                let code = pair.then(|| r.begin_pair(confirm).code);
+                Ok::<_, anyhow::Error>((r.clone(), code))
+            })?;
 
             let tunnel = match (&registry.rendezvous, no_rendezvous) {
                 (Some(r), false) => Some(relay_remote::tunnel::spawn(ctx.clone(), r.clone())),
@@ -211,7 +295,15 @@ pub async fn run(requested: Instance, cmd: RemoteCommand) -> Result<u8> {
                     _ => lan_addresses(),
                 };
                 let link = PairLink::build(&registry, instance.as_str(), &code, door.local_addr.port(), &addresses);
-                print_pair_link(&link);
+                print_pair_link(&link, confirm);
+                if confirm {
+                    let path = ctx.registry_path.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = confirm_pairing(path, code).await {
+                            eprintln!("relay remote: pairing confirmation ended: {e:#}");
+                        }
+                    });
+                }
             } else {
                 println!("relay remote: run `relay remote pair` in another terminal to add a phone");
             }
@@ -222,16 +314,27 @@ pub async fn run(requested: Instance, cmd: RemoteCommand) -> Result<u8> {
             drop(door);
             Ok(0)
         }
-        RemoteCommand::Pair => {
-            let mut registry = Registry::load(&ctx.registry_path)?;
+        RemoteCommand::Pair { no_confirm } => {
+            let confirm = confirm_wanted(no_confirm)?;
+            let (registry, code) = Registry::update(&ctx.registry_path, |r| {
+                let code = r.begin_pair(confirm).code;
+                Ok::<_, anyhow::Error>((r.clone(), code))
+            })?;
             let port = registry.direct_port.unwrap_or(DEFAULT_PORT);
-            let code = registry.begin_pair().code;
-            registry.save(&ctx.registry_path)?;
             let link = PairLink::build(&registry, instance.as_str(), &code, port, &lan_addresses());
             if registry.direct_port.is_none() {
                 println!("note: `relay remote serve` has not run yet on this instance; the link assumes port {DEFAULT_PORT}");
             }
-            print_pair_link(&link);
+            print_pair_link(&link, confirm);
+            if confirm {
+                tokio::select! {
+                    done = confirm_pairing(ctx.registry_path.clone(), code.clone()) => done?,
+                    _ = tokio::signal::ctrl_c() => {
+                        abandon_pairing(&ctx.registry_path, &code);
+                        println!("\nPairing window closed.");
+                    }
+                }
+            }
             Ok(0)
         }
         RemoteCommand::Devices => {
@@ -250,30 +353,31 @@ pub async fn run(requested: Instance, cmd: RemoteCommand) -> Result<u8> {
             Ok(0)
         }
         RemoteCommand::Revoke { id } => {
-            let mut registry = Registry::load(&ctx.registry_path)?;
-            if !registry.revoke(&id) {
+            if !Registry::update(&ctx.registry_path, |r| Ok::<_, anyhow::Error>(r.revoke(&id)))? {
                 return Err(anyhow!("no paired phone with id {id:?}"));
             }
-            registry.save(&ctx.registry_path)?;
-            println!("revoked {id}; its next connection will be refused");
+            println!("revoked {id}; a connection it has open is closed within a few seconds, and the next is refused");
             Ok(0)
         }
         RemoteCommand::Name { name } => {
-            let mut registry = Registry::load(&ctx.registry_path)?;
             let name = name.trim();
             if name.is_empty() {
                 return Err(anyhow!("a name cannot be empty"));
             }
-            registry.host_name = name.chars().take(64).collect();
-            registry.save(&ctx.registry_path)?;
-            println!("phones will see this machine as {:?}", registry.host_name);
+            let host_name: String = name.chars().take(64).collect();
+            Registry::update(&ctx.registry_path, |r| {
+                r.host_name = host_name.clone();
+                Ok::<_, anyhow::Error>(())
+            })?;
+            println!("phones will see this machine as {host_name:?}");
             Ok(0)
         }
         RemoteCommand::Via { url } => {
-            let mut registry = Registry::load(&ctx.registry_path)?;
             if url.eq_ignore_ascii_case("off") {
-                registry.rendezvous = None;
-                registry.save(&ctx.registry_path)?;
+                Registry::update(&ctx.registry_path, |r| {
+                    r.rendezvous = None;
+                    Ok::<_, anyhow::Error>(())
+                })?;
                 println!("rendezvous cleared; phones must be on this network");
                 return Ok(0);
             }
@@ -283,8 +387,7 @@ pub async fn run(requested: Instance, cmd: RemoteCommand) -> Result<u8> {
             if url.starts_with("ws://") {
                 eprintln!("warning: ws:// is unencrypted; a pairing through it exposes the phone's token to the network in between. Put TLS in front (see docs/MOBILE.md).");
             }
-            let r = registry.set_rendezvous(&url).clone();
-            registry.save(&ctx.registry_path)?;
+            let r = Registry::update(&ctx.registry_path, |r| Ok::<_, anyhow::Error>(r.set_rendezvous(&url).clone()))?;
             println!("rendezvous: {}\nroom:       {}\nphones join at {}", r.url, r.room, relay_remote::tunnel::join_url(&r));
             println!("restart `relay remote serve` to dial it");
             Ok(0)

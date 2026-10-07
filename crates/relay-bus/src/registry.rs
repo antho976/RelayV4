@@ -37,13 +37,6 @@ pub enum Scope {
     Session,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum Executor {
-    Core,
-    Ui,
-}
-
 /// Default allow-set before per-session allowlists (BUS.md §9.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -77,12 +70,13 @@ pub enum Callable {
     SelfOnly,
 }
 
+/// Which doors carry an op. A `socket_only` op acts on the connection that sends it (a
+/// subscriber, a wait), so the socket door answers it; the engine refuses it with `bus.door`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Doors {
     All,
     SocketOnly,
-    TauriOnly,
 }
 
 /// Static attributes of an op (BUS.md §3.2).
@@ -92,7 +86,6 @@ pub struct OpMeta {
     pub audit: Audit,
     pub undo: Undo,
     pub scope: Scope,
-    pub executor: Executor,
     pub actors: Actors,
     pub doors: Doors,
     /// Event names this op can emit.
@@ -110,14 +103,13 @@ pub struct OpMeta {
 }
 
 impl OpMeta {
-    /// A mutation with the common defaults: audited always, no undo, core, all actors, all doors.
+    /// A mutation with the common defaults: audited always, no undo, all actors, all doors.
     pub const fn mutation(scope: Scope, phase: u8, summary: &'static str) -> Self {
         OpMeta {
             kind: OpKind::Mutation,
             audit: Audit::Always,
             undo: Undo::None,
             scope,
-            executor: Executor::Core,
             actors: Actors::All,
             doors: Doors::All,
             emits: &[],
@@ -128,14 +120,13 @@ impl OpMeta {
             deprecated: None,
         }
     }
-    /// A query with the common defaults: never audited, core, all actors, all doors.
+    /// A query with the common defaults: never audited, all actors, all doors.
     pub const fn query(scope: Scope, phase: u8, summary: &'static str) -> Self {
         OpMeta {
             kind: OpKind::Query,
             audit: Audit::Never,
             undo: Undo::None,
             scope,
-            executor: Executor::Core,
             actors: Actors::All,
             doors: Doors::All,
             emits: &[],
@@ -152,10 +143,6 @@ impl OpMeta {
     }
     pub const fn undo(mut self, u: Undo) -> Self {
         self.undo = u;
-        self
-    }
-    pub const fn ui(mut self) -> Self {
-        self.executor = Executor::Ui;
         self
     }
     pub const fn actors(mut self, a: Actors) -> Self {
@@ -240,7 +227,6 @@ pub struct OpInfo {
     pub audit: Audit,
     pub undo: Undo,
     pub scope: Scope,
-    pub executor: Executor,
     pub actors: Actors,
     pub doors: Doors,
     pub emits: Vec<String>,
@@ -270,7 +256,6 @@ impl OpInfo {
             audit: e.meta.audit,
             undo: e.meta.undo,
             scope: e.meta.scope,
-            executor: e.meta.executor,
             actors: e.meta.actors,
             doors: e.meta.doors,
             emits: e.meta.emits.iter().map(|s| s.to_string()).collect(),

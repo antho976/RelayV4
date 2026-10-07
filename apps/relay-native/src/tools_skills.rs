@@ -192,7 +192,9 @@ fn detail(ui: &Rc<Ui>, market: &Rc<Market>, skill: &Value, parent: &gtk::Box) {
         });
         bar.append(&open);
         let update = button("Update from GitHub", "");
-        update.set_tooltip_text(Some("Download the current version of this skill"));
+        // The engine keeps the repository but not the branch a skill came from (RA-256), so
+        // an update can only read the default branch. Say so before it replaces anything.
+        update.set_tooltip_text(Some("Download the current version of this skill from the repository's default branch. A skill installed from another branch is replaced by the default branch's copy; reinstall it from its branch URL instead."));
         let weak = Rc::downgrade(ui);
         let payload = json!({"url": skill["source_url"], "subdir": skill["source_path"]});
         update.connect_clicked(move |key| {

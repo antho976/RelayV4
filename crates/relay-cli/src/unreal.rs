@@ -13,7 +13,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Map, Value};
-use std::io::{BufRead, Read, Write};
+use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -30,21 +30,29 @@ const SKIP_DIRS: [&str; 7] = ["Binaries", "Intermediate", "Saved", "DerivedDataC
 const MAX_OUTPUT: usize = 60_000;
 /// Tools that act on the running editor. Each first checks the editor has this checkout's
 /// project open: an agent in a worktree would otherwise edit assets in a different copy.
-const LIVE: [&str; 16] = ["ue_python", "ue_call", "ue_property", "ue_search_assets", "ue_level_actors", "ue_console",
-    "ue_screenshot", "ue_anim_inspect", "ue_anim_preview", "ue_editor_lock", "ue_play", "ue_blueprint_info",
+/// `ue_editor_lock` is not one: the lock is a file, and releasing it must work when the editor
+/// has crashed or been closed.
+const LIVE: [&str; 15] = ["ue_python", "ue_call", "ue_property", "ue_search_assets", "ue_level_actors", "ue_console",
+    "ue_screenshot", "ue_anim_inspect", "ue_anim_preview", "ue_play", "ue_blueprint_info",
     "ue_asset_audit", "ue_asset_refs", "ue_data_table", "ue_profile"];
 /// Live tools that change editor state, and so need the editor lock.
 const MUTATING: [&str; 10] = ["ue_python", "ue_call", "ue_console", "ue_screenshot", "ue_anim_preview", "ue_property",
     "ue_play", "ue_profile", "ue_data_table", "ue_blueprint_info"];
 /// A lock nobody has used for this long is free to take.
 const LOCK_IDLE: Duration = Duration::from_secs(15 * 60);
+/// How often a call in flight refreshes the lock's idle clock, well inside `LOCK_IDLE`.
+const LOCK_HEARTBEAT: Duration = Duration::from_secs(60);
+/// Log lines a tool returns: the first half and the last half of what matched.
+const MAX_LOG_LINES: usize = 300;
 /// Images one call may return; each is a full PNG in the agent's context.
 const MAX_IMAGES: usize = 16;
 
-const PY_COMMON: &str = include_str!("unreal_py/common.py");
+// Every script gets the character frame and bone naming shared with the Blender tools.
+const PY_COMMON: &str = concat!(include_str!("unreal_py/common.py"), "\n", include_str!("rig_frame.py"));
 const PY_PROJECT_CHECK: &str = include_str!("unreal_py/project_check.py");
 const PY_CAPTURE: &str = include_str!("unreal_py/capture.py");
-const PY_ANIM_INSPECT: &str = include_str!("unreal_py/anim_inspect.py");
+// The checks are shared with blender_anim_inspect (`anim_rules.py`); the script only poses the skeleton.
+const PY_ANIM_INSPECT: &str = concat!(include_str!("anim_rules.py"), "\n", include_str!("unreal_py/anim_inspect.py"));
 const PY_ANIM_PREVIEW: &str = include_str!("unreal_py/anim_preview.py");
 const PY_PLAY: &str = include_str!("unreal_py/play.py");
 const PY_BLUEPRINT_INFO: &str = include_str!("unreal_py/blueprint_info.py");
@@ -55,24 +63,16 @@ const PY_IMPORT_FBX: &str = include_str!("unreal_py/import_fbx.py");
 const PY_PREVIEW_ASSET: &str = include_str!("unreal_py/preview_asset.py");
 
 pub fn serve() -> Result<u8> {
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::BufWriter::new(std::io::stdout());
-    for line in stdin.lock().lines() {
-        let line = line.context("reading MCP stdin")?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let response = match serde_json::from_str::<Value>(&line) {
-            Ok(message) => handle(&message),
-            Err(error) => Some(rpc_error(Value::Null, -32700, "Parse error", Some(json!({"message":error.to_string()})))),
-        };
-        if let Some(response) = response {
-            serde_json::to_writer(&mut stdout, &response)?;
-            stdout.write_all(b"\n")?;
-            stdout.flush()?;
-        }
-    }
-    Ok(0)
+    crate::mcp::serve_sync(handle, lane)
+}
+
+/// Everything that drives the editor, builds or launches it shares one editor and waits its
+/// turn (the editor lock names this server's holder, so it cannot keep two of its own calls
+/// apart); reading the project, the log and crash reports runs beside a long build (RA-061).
+fn lane(name: &str, args: &Value) -> crate::mcp::Lane {
+    let reads = matches!(name, "ue_project_info" | "ue_log" | "ue_editor_status" | "ue_crash")
+        || name == "ue_setup_check" && args["fix"] != true;
+    if reads { crate::mcp::Lane::Parallel } else { crate::mcp::Lane::Serial }
 }
 
 fn handle(message: &Value) -> Option<Value> {
@@ -230,7 +230,7 @@ fn tools() -> Vec<Value> {
                 "touch_distance":{"type":"number","description":"Default 5 cm"}
             }), &["mesh"], true),
         tool("ue_anim_preview",
-            "See an animation: spawns a temporary copy of the character (with attached items and an optional partner, same arguments as ue_anim_inspect) in the open level, poses it at each sample time and returns images from the chosen views. Removes the preview actors afterwards; the level is left marked modified, so do not save the map because of it.",
+            "See an animation: spawns a temporary copy of the character (with attached items and an optional partner, same arguments as ue_anim_inspect) in the open level, poses it at each sample time and returns images from the chosen views. The preview actors are transient (never saved, and on engines that support it they leave the level unmodified) and are removed afterwards.",
             json!({
                 "mesh":{"type":"string"},"animation":{"type":"string"},
                 "times":{"type":"array","items":{"type":"number"}},
@@ -322,6 +322,13 @@ fn tools() -> Vec<Value> {
 }
 
 fn call(name: &str, args: &Value) -> Result<Value> {
+    // Tools that run agent-supplied code or commands meet the guardrail first (RA-077; see
+    // mcp::plugin_gate for what that can and cannot cover).
+    if matches!(name, "ue_python" | "ue_console" | "ue_call" | "ue_play" | "ue_profile") {
+        crate::mcp::plugin_gate(name, None, &[])?;
+    }
+    // Held, and kept fresh, until the call returns.
+    let mut _hold = None;
     if LIVE.contains(&name) {
         let project = Project::find()?;
         guard_project(&project)?;
@@ -330,7 +337,7 @@ fn call(name: &str, args: &Value) -> Result<Value> {
             && (name != "ue_data_table" || args["action"] == "import")
             && (name != "ue_blueprint_info" || args["compile"] == true);
         if writes {
-            acquire_lock(&project, &holder_id())?;
+            _hold = Some(LockHold::take(&project, &holder_id())?);
         }
     }
     match name {
@@ -395,7 +402,7 @@ fn call(name: &str, args: &Value) -> Result<Value> {
             let start = log_len(&project);
             let mut value = python_json(&script(PY_BLUEPRINT_INFO, args), Duration::from_secs(600))?;
             if args["compile"] == true {
-                value["compiler_log"] = json!(log_since(&project, start, Some(r"LogBlueprint|Error|Warning")));
+                value["compiler_log"] = json!(cap_lines(log_since(&project, start, Some(r"LogBlueprint|Error|Warning")), MAX_LOG_LINES));
             }
             Ok(value)
         }
@@ -421,10 +428,10 @@ fn call(name: &str, args: &Value) -> Result<Value> {
 pub(crate) fn import_fbx(fbx: &Path, mut args: Value) -> Result<Value> {
     let project = Project::find()?;
     guard_project(&project)?;
-    acquire_lock(&project, &holder_id())?;
+    let _hold = LockHold::take(&project, &holder_id())?;
     args["fbx"] = json!(fbx);
     let start = log_len(&project);
-    let import_log = |project: &Project| log_since(project, start, Some(r"LogFbx|Interchange|Error|Warning"));
+    let import_log = |project: &Project| cap_lines(log_since(project, start, Some(r"LogFbx|Interchange|Error|Warning")), MAX_LOG_LINES);
     let mut value = match python_json(&script(PY_IMPORT_FBX, &args), Duration::from_secs(900)) {
         Ok(value) => value,
         Err(error) => bail!("{error:#}\n{}", import_log(&project).join("\n")),
@@ -449,9 +456,14 @@ pub(crate) fn import_fbx(fbx: &Path, mut args: Value) -> Result<Value> {
         let _ = python_json(&script(PY_PREVIEW_ASSET, &json!({"action": "cleanup"})), Duration::from_secs(60));
         match shot {
             Ok(shot) => {
-                let coverage: Vec<f64> = shot["files"].as_array().map(|f| f.iter().filter_map(|x| x["coverage"].as_f64()).collect()).unwrap_or_default();
-                let visible = coverage.is_empty() || coverage.iter().any(|c| *c > 0.002);
-                renders.push(json!({"path": asset["path"], "coverage": coverage, "renders": visible, "files": shot["files"]}));
+                let files = shot["files"].as_array().cloned().unwrap_or_default();
+                let coverage: Vec<Value> = files.iter().map(|x| x["coverage"].clone()).collect();
+                let mut check = json!({"path": asset["path"], "coverage": coverage, "renders": renders_from_coverage(&coverage), "files": shot["files"]});
+                if check["renders"].is_null() {
+                    let why: Vec<Value> = files.iter().filter_map(|x| x.get("coverage_error").cloned()).collect();
+                    check["not_verified"] = json!(format!("the render check could not read the captures back, so whether the mesh draws is unknown: {why:?}"));
+                }
+                renders.push(check);
             }
             Err(error) => renders.push(json!({"path": asset["path"], "error": format!("{error:#}")})),
         }
@@ -467,6 +479,20 @@ pub(crate) fn import_fbx(fbx: &Path, mut args: Value) -> Result<Value> {
 /// `ARGS_JSON` first, then the shared helpers, then the tool's own script.
 fn script(body: &str, args: &Value) -> String {
     format!("ARGS_JSON = {}\n{PY_COMMON}\n{body}", py_str(&args.to_string()))
+}
+
+/// Whether a mesh draws, from the coverage of its views: true when any view shows it, false when
+/// every view was measured and none does, null when no view could be measured. A failed read
+/// is not evidence that it draws.
+fn renders_from_coverage(coverage: &[Value]) -> Value {
+    let known: Vec<f64> = coverage.iter().filter_map(Value::as_f64).collect();
+    if known.iter().any(|c| *c > 0.002) {
+        json!(true)
+    } else if !known.is_empty() && known.len() == coverage.len() {
+        json!(false)
+    } else {
+        Value::Null
+    }
 }
 
 // ---------------------------------------------------------------- which editor, and who drives it
@@ -522,7 +548,11 @@ fn now_secs() -> u64 {
 }
 
 fn read_lock(project: &Project) -> Value {
-    let Ok(raw) = std::fs::read_to_string(lock_path(project)) else { return Value::Null };
+    read_lock_at(&lock_path(project))
+}
+
+fn read_lock_at(path: &Path) -> Value {
+    let Ok(raw) = std::fs::read_to_string(path) else { return Value::Null };
     let mut lock: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
     if let Some(last) = lock["last_used"].as_u64() {
         let idle = now_secs().saturating_sub(last);
@@ -553,6 +583,55 @@ fn acquire_lock(project: &Project, me: &str) -> Result<()> {
     Ok(())
 }
 
+/// Move the idle clock to now, if `me` still holds the lock. A lock released or taken over in
+/// the meantime is left alone.
+fn touch_lock(path: &Path, me: &str) {
+    let lock = read_lock_at(path);
+    if lock["holder"].as_str() == Some(me) {
+        let since = lock["since"].as_u64().unwrap_or(now_secs());
+        let _ = std::fs::write(path, json!({"holder": me, "since": since, "last_used": now_secs()}).to_string());
+    }
+}
+
+/// The editor lock, held for the length of one call. The idle clock otherwise moves only when a
+/// call starts, so an in-editor test run or a restart build longer than `LOCK_IDLE` would look
+/// abandoned while it is still running. A thread refreshes it until the hold is dropped, and
+/// the drop refreshes it once more, so idleness counts from the end of the call.
+struct LockHold {
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    beat: Option<std::thread::JoinHandle<()>>,
+    path: PathBuf,
+    me: String,
+}
+
+impl LockHold {
+    fn take(project: &Project, me: &str) -> Result<LockHold> {
+        LockHold::take_every(project, me, LOCK_HEARTBEAT)
+    }
+
+    fn take_every(project: &Project, me: &str, every: Duration) -> Result<LockHold> {
+        acquire_lock(project, me)?;
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let (path, holder) = (lock_path(project), me.to_string());
+        let beat = std::thread::spawn(move || {
+            while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(every) {
+                touch_lock(&path, &holder);
+            }
+        });
+        Ok(LockHold { stop: Some(stop), beat: Some(beat), path: lock_path(project), me: me.to_string() })
+    }
+}
+
+impl Drop for LockHold {
+    fn drop(&mut self) {
+        drop(self.stop.take());
+        if let Some(beat) = self.beat.take() {
+            let _ = beat.join();
+        }
+        touch_lock(&self.path, &self.me);
+    }
+}
+
 fn release_lock(project: &Project, me: &str) -> Result<()> {
     let lock = read_lock(project);
     match lock["holder"].as_str() {
@@ -573,8 +652,9 @@ fn release_lock(project: &Project, me: &str) -> Result<()> {
 /// Remote Control port is free again, so the next launch can bind it. An editor that cannot be
 /// asked is never signalled without `force`: whatever it has not saved would go with it.
 fn quit_editor(project: &Project, save: bool, force: bool) -> Result<Value> {
-    acquire_lock(project, &holder_id())?;
+    let hold = LockHold::take(project, &holder_id())?;
     let result = quit_editor_locked(project, save, force);
+    drop(hold);
     let _ = release_lock(project, &holder_id());
     result
 }
@@ -605,11 +685,15 @@ fn quit_editor_locked(project: &Project, save: bool, force: bool) -> Result<Valu
         let code = if save {
             // save_dirty_packages runs without a dialog and silently skips what it cannot save
             // (an untitled map, a read-only file), so ask again what is still dirty.
-            "import unreal\n\
+            // Maps ue_play's capture camera dirtied (play.py notes the ones that were clean
+            // before) are named, so a rewrite of an unchanged map can be reverted.
+            "import unreal, sys\n\
              L = unreal.EditorLoadingAndSavingUtils\n\
+             maps = [p.get_name() for p in list(getattr(L, 'get_dirty_map_packages', list)())]\n\
+             helper = sorted(set(maps) & set(getattr(sys.modules.get('_relay_state'), 'maps_clean_before_relay', ())))\n\
              ok = L.save_dirty_packages(True, True)\n\
              dirty = [p.get_name() for p in list(getattr(L, 'get_dirty_map_packages', list)()) + list(getattr(L, 'get_dirty_content_packages', list)())]\n\
-             if ok and not dirty:\n    unreal.SystemLibrary.quit_editor()\n    print('quitting')\n\
+             if ok and not dirty:\n    if helper:\n        print('RELAY_HELPER_MAPS:' + ', '.join(helper))\n    unreal.SystemLibrary.quit_editor()\n    print('quitting')\n\
              else:\n    print('RELAY_UNSAVED:' + (', '.join(dirty) or 'packages the editor would not save'))\n"
         } else {
             "import unreal\nunreal.SystemLibrary.quit_editor()\nprint('quitting')\n"
@@ -619,6 +703,9 @@ fn quit_editor_locked(project: &Project, save: bool, force: bool) -> Result<Valu
                 let output = result["output"].as_str().unwrap_or("");
                 if let Some(dirty) = output.lines().find_map(|l| l.trim().strip_prefix("RELAY_UNSAVED:")) {
                     bail!("the editor could not save {dirty}, so it was not asked to quit and is still running. Ask the human to save or discard those in the editor, or quit with save=false to lose them.");
+                }
+                if let Some(maps) = output.lines().find_map(|l| l.trim().strip_prefix("RELAY_HELPER_MAPS:")) {
+                    notes.push(format!("saved {maps}, which had no unsaved changes before ue_play placed its outside-capture camera there. If nobody edited them since, the save only rewrote them: check git status and restore them if the diff is unintended."));
                 }
                 saved = json!(save);
                 may_signal = true;
@@ -686,7 +773,7 @@ fn launch_editor(project: &Project, args: &Value) -> Result<Value> {
     if !running.is_empty() {
         return Ok(json!({"already_running": running.iter().map(|p| p.pid).collect::<Vec<_>>(), "status": editor_status()?}));
     }
-    acquire_lock(project, &holder_id())?;
+    let _hold = LockHold::take(project, &holder_id())?;
     let engine = engine_root(project)?;
     let port = crate::unreal_process::port_of(&remote_base());
     let started = std::time::Instant::now();
@@ -707,6 +794,9 @@ fn launch_editor(project: &Project, args: &Value) -> Result<Value> {
         }
         extra.push("-ini:EditorPerProjectUserSettings:[/Script/UnrealEd.EditorPerformanceSettings]:bThrottleCPUWhenNotForeground=False".to_string());
     }
+    // The log as it stood before the launch: until the new editor starts its own file, what is
+    // on disk is the previous session's, and its bind failures are not this one's.
+    let mark = log_mark(project);
     let pid = crate::unreal_process::launch(&engine, &project.uproject, port, &extra)?;
     let timeout = Duration::from_secs(args["timeout_s"].as_u64().unwrap_or(900).clamp(30, 3600));
     loop {
@@ -714,7 +804,9 @@ fn launch_editor(project: &Project, args: &Value) -> Result<Value> {
             // The editor now owns the project; tell the next status call to ask again.
             return Ok(json!({"pid": pid, "reachable": true, "seconds": started.elapsed().as_secs(), "engine": engine, "args": extra}));
         }
-        let lines = log_since(project, 0, None);
+        // Every line since the launch that could be one, not a tail: the failure is logged
+        // once, early, and later start-up logging would push it out of any window.
+        let lines = log_since(project, new_session_start(project, mark), Some(BIND_PREFILTER));
         let bind = crate::unreal_process::bind_failures(&lines);
         if !bind.is_empty() {
             bail!("the editor started (pid {pid}) but its web server could not bind port {port}: {bind:?}. In the editor console run `WebControl.StopServer` then `WebControl.StartServer`.");
@@ -843,20 +935,69 @@ fn log_len(project: &Project) -> u64 {
     std::fs::metadata(project.log_path()).map(|m| m.len()).unwrap_or(0)
 }
 
-/// Log lines written since byte offset `start`, optionally filtered, last 300 kept.
+/// Lines that may report a failed bind; `unreal_process::bind_failures` decides.
+const BIND_PREFILTER: &str = r"(?i)bind|address already in use";
+
+/// The log file's identity and length, or None when there is none yet.
+fn log_mark(project: &Project) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(project.log_path()).ok().map(|m| (m.ino(), m.len()))
+}
+
+/// Where a session started after `mark` begins in the log on disk: past the old end while the
+/// file is still the one marked, and at 0 once the editor has moved it aside for a new one.
+fn new_session_start(project: &Project, mark: Option<(u64, u64)>) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(project.log_path()), mark) {
+        (Ok(now), Some((ino, len))) if now.ino() == ino && now.len() >= len => len,
+        _ => 0,
+    }
+}
+
+/// Every log line written since byte offset `start` that `filter` matches (all lines without
+/// one). Callers that parse the lines get all of them; what goes back to the agent is capped
+/// with `cap_lines`.
 fn log_since(project: &Project, start: u64, filter: Option<&str>) -> Vec<String> {
     let Ok(bytes) = std::fs::read(project.log_path()) else { return Vec::new() };
     let start = (start as usize).min(bytes.len());
     let text = String::from_utf8_lossy(&bytes[start..]);
     let re = filter.and_then(|f| regex::Regex::new(f).ok());
-    let lines: Vec<String> = text.lines().filter(|l| re.as_ref().is_none_or(|re| re.is_match(l))).map(str::to_string).collect();
-    lines[lines.len().saturating_sub(300)..].to_vec()
+    text.lines().filter(|l| re.as_ref().is_none_or(|re| re.is_match(l))).map(str::to_string).collect()
+}
+
+/// At most `max` lines: the first half (the first errors are usually the cause) and the last
+/// half, with a line in between saying how many were left out.
+fn cap_lines(mut lines: Vec<String>, max: usize) -> Vec<String> {
+    if lines.len() <= max {
+        return lines;
+    }
+    let head = max / 2;
+    let tail = max - head;
+    let omitted = lines.len() - head - tail;
+    let rest = lines.split_off(lines.len() - tail);
+    lines.truncate(head);
+    lines.push(format!("[relay: {omitted} matching lines omitted here; narrow the filter, or read them with ue_log]"));
+    lines.extend(rest);
+    lines
 }
 
 fn play_step(action: &str, extra: Value) -> Result<Value> {
     let mut args = extra;
     args["action"] = json!(action);
     python_json_tx(&script(PY_PLAY, &args), Duration::from_secs(60), false)
+}
+
+/// Ask the editor to start playing. Afterwards `requested` says whether a session may be running
+/// because of this call, so cleanup can stop it on every path: true once the request may have
+/// reached the editor (a reply lost to a timeout included), false when play.py refused before
+/// asking, which it does when a session that is not this call's is already running.
+fn request_play(mode: &str, requested: &mut bool) -> Result<Value> {
+    let result = play_step("start", json!({"mode": mode}));
+    *requested = match &result {
+        Ok(_) => true,
+        Err(error) => !format!("{error:#}").starts_with("Python failed"),
+    };
+    result
 }
 
 fn wait_for_play(on: bool) -> Result<()> {
@@ -906,30 +1047,39 @@ fn play(project: &Project, args: &Value) -> Result<Value> {
     let screenshots = args["screenshots"].as_bool().unwrap_or(true);
     let shots_dir = project.root.join("Saved/Screenshots");
     let mut seen: std::collections::HashSet<PathBuf> = pngs_under(&shots_dir).into_iter().collect();
-    if args["stop_existing"] == true {
-        play_step("stop", json!({}))?;
-        wait_for_play(false)?;
-    }
     let outside = args.get("outside").filter(|o| o.is_object()).cloned();
-    let outside_dir = match &outside {
-        Some(_) => {
-            // Placed in the level now so the game world, a copy of the level, contains it.
-            play_step("prepare_outside", json!({}))?;
-            Some(capture_dir(project)?)
-        }
-        None => None,
-    };
-    let log_start = log_len(project);
-    let started = play_step("start", json!({"mode": args["mode"].as_str().unwrap_or("pie")}))?;
-    wait_for_play(true)?;
-    let t0 = std::time::Instant::now();
-    let first = play_step("status", json!({})).ok();
+    // Every step that can fail runs in the closure below, and what it may leave behind (a
+    // capture camera in the level, a running session, a scratch folder) is undone after it on
+    // every path. These say what there is to undo.
+    let mut prepared = false;
+    let mut requested = false;
+    let mut outside_dir: Option<PathBuf> = None;
+    let mut started = Value::Null;
+    let mut log_start = log_len(project);
+    let mut t0 = std::time::Instant::now();
+    let mut first = None;
     let mut shots: Vec<Value> = Vec::new();
-    let outcome = (|| -> Result<Vec<Value>> {
+    let mut probes: Vec<Value> = Vec::new();
+    let outcome = (|| -> Result<()> {
+        if args["stop_existing"] == true {
+            play_step("stop", json!({}))?;
+            wait_for_play(false)?;
+        }
+        if outside.is_some() {
+            // Placed in the level now so the game world, a copy of the level, contains it.
+            // Marked first: a step that fails half way may still have placed it.
+            prepared = true;
+            play_step("prepare_outside", json!({}))?;
+            outside_dir = Some(capture_dir(project)?);
+        }
+        log_start = log_len(project);
+        started = request_play(args["mode"].as_str().unwrap_or("pie"), &mut requested)?;
+        wait_for_play(true)?;
+        t0 = std::time::Instant::now();
+        first = play_step("status", json!({})).ok();
         if let Some(commands) = args["console"].as_array() {
             play_step("console", json!({"commands": commands}))?;
         }
-        let mut probes = Vec::new();
         for at in &checkpoints {
             std::thread::sleep(Duration::from_secs_f64(*at).saturating_sub(t0.elapsed()));
             // Probe first, then capture, then wait for this capture's file: a screenshot is
@@ -976,28 +1126,37 @@ fn play(project: &Project, args: &Value) -> Result<Value> {
             }
         }
         std::thread::sleep(Duration::from_secs_f64(seconds).saturating_sub(t0.elapsed()));
-        Ok(probes)
+        Ok(())
     })();
-    let last = play_step("status", json!({})).ok();
-    let stopped = if args["stop"].as_bool().unwrap_or(true) {
+    let last = if requested { play_step("status", json!({})).ok() } else { None };
+    let stopped = if requested && args["stop"].as_bool().unwrap_or(true) {
         play_step("stop", json!({"restore_throttle": started["was_throttled"]})).and_then(|_| wait_for_play(false)).err().map(|e| format!("{e:#}"))
     } else {
         None
     };
-    if outside.is_some() {
-        let _ = play_step("cleanup_outside", json!({}));
+    let cleanup_error = if prepared { play_step("cleanup_outside", json!({})).err().map(|e| format!("{e:#}")) } else { None };
+    let filter = args["log_filter"].as_str().unwrap_or(DEFAULT_PLAY_LOG);
+    // Harmless: Remote Control wraps calls in a transaction that play start cancels.
+    let log: Vec<String> = log_since(project, log_start, Some(filter)).into_iter().filter(|l| !l.contains("Remote Call Transaction Wrap")).collect();
+    let errors = log.iter().filter(|l| l.contains("Error") || l.contains("Accessed None") || l.to_lowercase().contains("ensure")).count();
+    let log = cap_lines(log, MAX_LOG_LINES);
+    if let Err(error) = outcome {
+        // What the session produced is often what explains the failure (a Blueprint error
+        // that ended play, say), so it goes back with the error.
+        if let Some(dir) = &outside_dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        let kept: Vec<&Value> = shots.iter().filter(|s| !outside_dir.as_ref().is_some_and(|d| s["file"].as_str().is_some_and(|f| Path::new(f).starts_with(d)))).collect();
+        bail!("{error:#}\n\nThe session so far: {}", serde_json::to_string_pretty(&json!({
+            "probes": probes, "screenshots": kept, "log": log, "error_lines": errors, "stop_error": stopped, "cleanup_error": cleanup_error,
+        }))?);
     }
-    let probes = outcome?;
     // Frames per wall-clock second over the session: a throttled or overloaded editor shows
     // here before it shows as a flaky test.
     let fps = match (first.as_ref().and_then(|v| v["frame"].as_u64()), last.as_ref().and_then(|v| v["frame"].as_u64())) {
         (Some(a), Some(b)) if b > a => Some(((b - a) as f64 / t0.elapsed().as_secs_f64() * 10.0).round() / 10.0),
         _ => None,
     };
-    let filter = args["log_filter"].as_str().unwrap_or(DEFAULT_PLAY_LOG);
-    // Harmless: Remote Control wraps calls in a transaction that play start cancels.
-    let log: Vec<String> = log_since(project, log_start, Some(filter)).into_iter().filter(|l| !l.contains("Remote Call Transaction Wrap")).collect();
-    let errors = log.iter().filter(|l| l.contains("Error") || l.contains("Accessed None") || l.to_lowercase().contains("ensure")).count();
     let images: Vec<Value> = shots.iter().filter(|s| s["file"].is_string()).map(|s| json!({"label": s["view"], "path": s["file"]})).collect();
     Ok(json!({
         "mode": started["requested"],
@@ -1010,6 +1169,7 @@ fn play(project: &Project, args: &Value) -> Result<Value> {
         "log": log,
         "error_lines": errors,
         "stop_error": stopped,
+        "cleanup_error": cleanup_error,
         // Screenshots live in the project's own folder; show them but leave them in place.
         // Outside captures live in a scratch folder that goes once they are read.
         "_images": images,
@@ -1040,7 +1200,7 @@ fn data_table(project: &Project, args: &Value) -> Result<Value> {
             let result = python_json(&script(PY_DATA_TABLE, &json!({"action":"import","path":args["path"],"format":format,"text":text})), Duration::from_secs(120));
             match result {
                 Ok(v) => Ok(v),
-                Err(e) => bail!("{e:#}\n{}", log_since(project, start, Some("LogDataTable|Error|Warning")).join("\n")),
+                Err(e) => bail!("{e:#}\n{}", cap_lines(log_since(project, start, Some("LogDataTable|Error|Warning")), MAX_LOG_LINES).join("\n")),
             }
         }
         _ => bail!("action must be export or import"),
@@ -1087,25 +1247,38 @@ fn profile(project: &Project, args: &Value) -> Result<Value> {
     let play = args["play"].as_bool().unwrap_or(true);
     let dir = project.root.join("Saved/Profiling/CSV");
     let before: std::collections::HashSet<PathBuf> = std::fs::read_dir(&dir).map(|e| e.flatten().map(|e| e.path()).collect()).unwrap_or_default();
+    // As in ue_play: the steps run in one closure, and the session and the profiler are
+    // stopped after it on every path.
     let mut throttle = Value::Null;
-    if play {
-        throttle = play_step("start", json!({"mode":"pie"}))?["was_throttled"].clone();
-        wait_for_play(true)?;
-    }
+    let mut requested = false;
+    let mut recording = false;
     let run = (|| -> Result<()> {
+        if play {
+            throttle = request_play("pie", &mut requested)?["was_throttled"].clone();
+            wait_for_play(true)?;
+        }
         if let Some(commands) = args["console"].as_array() {
             play_step("console", json!({"commands": commands}))?;
         }
         std::thread::sleep(Duration::from_secs_f64(warmup));
+        recording = true;
         play_step("console", json!({"commands": ["csvprofile start"]}))?;
         std::thread::sleep(Duration::from_secs_f64(seconds));
         play_step("console", json!({"commands": ["csvprofile stop"]}))?;
+        recording = false;
         Ok(())
     })();
-    if play {
-        let _ = play_step("stop", json!({"restore_throttle": throttle})).and_then(|_| wait_for_play(false));
+    if recording {
+        let _ = play_step("console", json!({"commands": ["csvprofile stop"]}));
     }
-    run?;
+    let stop_error = if requested {
+        play_step("stop", json!({"restore_throttle": throttle})).and_then(|_| wait_for_play(false)).err().map(|e| format!("{e:#}"))
+    } else {
+        None
+    };
+    if let Err(error) = run {
+        bail!("{error:#}{}", stop_error.map(|s| format!("\nStopping the play session also failed: {s}")).unwrap_or_default());
+    }
     let mut file = None;
     for _ in 0..40 {
         file = std::fs::read_dir(&dir).ok().and_then(|e| e.flatten().map(|e| e.path())
@@ -1120,6 +1293,7 @@ fn profile(project: &Project, args: &Value) -> Result<Value> {
     let mut summary = summarize_csv(&text);
     summary["file"] = json!(file);
     summary["recorded_s"] = json!(seconds);
+    summary["stop_error"] = json!(stop_error);
     summary["budget_hint"] = json!("60 fps is 16.7 ms per frame, 30 fps is 33.3 ms. The largest of game thread, render thread and GPU is what limits the frame.");
     Ok(summary)
 }
@@ -1140,17 +1314,19 @@ fn run_tests(project: &Project, args: &Value) -> Result<Value> {
     anyhow::ensure!(!filter.contains(';') && !filter.contains('"'), "filter must be a test path prefix");
     if args["in_editor"] == true {
         guard_project(project)?;
-        acquire_lock(project, &holder_id())?;
+        // Refreshed while the tests run: a long suite must not look abandoned.
+        let _hold = LockHold::take(project, &holder_id())?;
         let start = log_len(project);
         play_step("console", json!({"commands": [format!("Automation RunTests {filter}")]}))?;
         let deadline = std::time::Instant::now() + secs(args, "timeout_s", 1800);
         loop {
+            // Every result line, however many tests ran.
             let lines = log_since(project, start, Some("LogAutomation"));
             if lines.iter().any(|l| l.contains("Automation Test Queue Empty") || l.contains("No automation tests matched")) {
                 return Ok(test_lines(&lines));
             }
             if std::time::Instant::now() > deadline {
-                bail!("tests did not finish before the timeout; partial results:\n{}", lines.join("\n"));
+                bail!("tests did not finish before the timeout; partial results:\n{}", cap_lines(lines, MAX_LOG_LINES).join("\n"));
             }
             std::thread::sleep(Duration::from_secs(1));
         }
@@ -1575,9 +1751,12 @@ fn build(project: &Project, args: &Value) -> Result<Value> {
     // A running editor (or a crash reporter left from one) makes UnrealBuildTool build a
     // numbered hot-reload module that the editor never loads: old code keeps running.
     let restart = args["restart_editor"] == true;
+    // A restart keeps the lock from the quit through the build to the relaunch: released in
+    // between, another agent could launch the editor while the build tool writes its binaries.
+    let _hold = if restart { Some(LockHold::take(project, &holder_id())?) } else { None };
     let mut quit = Value::Null;
     if restart && !crate::unreal_process::editors_for(&project.uproject).is_empty() {
-        quit = quit_editor(project, args["save"].as_bool().unwrap_or(true), args["force"] == true)?;
+        quit = quit_editor_locked(project, args["save"].as_bool().unwrap_or(true), args["force"] == true)?;
     }
     let pre = crate::unreal_process::prebuild(&project.uproject, args["keep_crash_reporters"] != true);
     if pre["editor_running"].as_array().is_some_and(|a| !a.is_empty()) && args["allow_editor_open"] != true {
@@ -1712,8 +1891,13 @@ fn editor_status() -> Result<Value> {
             let editors: Vec<u32> = project.as_ref().map(|p| crate::unreal_process::editors_for(&p.uproject).iter().map(|e| e.pid).collect()).unwrap_or_default();
             let port = crate::unreal_process::port_of(&remote_base());
             let port_free = crate::unreal_process::port_free(port);
-            let recent: Vec<String> = project.as_ref().map(|p| log_since(p, log_len(p).saturating_sub(400_000), None)).unwrap_or_default();
-            let bind = crate::unreal_process::bind_failures(&recent);
+            // The log on disk is the running editor's own; with no editor running it is an
+            // old session's, whose bind failures say nothing about now.
+            let candidates: Vec<String> = match &project {
+                Some(p) if !editors.is_empty() => log_since(p, 0, Some(BIND_PREFILTER)),
+                _ => Vec::new(),
+            };
+            let bind = crate::unreal_process::bind_failures(&candidates);
             let advice = if !bind.is_empty() {
                 format!("The editor is running but its web server could not bind port {port} (a previous editor still held it). In the editor console run `WebControl.StopServer` and then `WebControl.StartServer` (StartServer alone does nothing), or ask the human to save and restart the editor. ue_editor_quit cannot save through a server it cannot reach, so it refuses rather than terminate the editor.")
             } else if !editors.is_empty() && port_free {
@@ -1747,6 +1931,12 @@ fn python(code: &str, timeout: Duration) -> Result<Value> {
 /// `transaction: false` for calls around play sessions: starting Play In Editor inside a
 /// Remote Control transaction logs "Cancelling Open Transaction" on every start.
 fn python_tx(code: &str, timeout: Duration, transaction: bool) -> Result<Value> {
+    python_run(code, timeout, transaction).map(|(result, _)| result)
+}
+
+/// The result `python_tx` returns, with its output cut to a readable tail, and the whole output
+/// beside it: a tool's `RELAY_JSON:` line is often longer than that tail.
+fn python_run(code: &str, timeout: Duration, transaction: bool) -> Result<(Value, String)> {
     let body = json!({
         "objectPath": PYTHON_LIBRARY,
         "functionName": "ExecutePythonCommandEx",
@@ -1754,7 +1944,22 @@ fn python_tx(code: &str, timeout: Duration, transaction: bool) -> Result<Value> 
         "generateTransaction": transaction,
     });
     let response = remote("PUT", "/remote/object/call", Some(&body), timeout)?;
-    let output: Vec<String> = response["LogOutput"]
+    let output = python_output(&response);
+    let ok = response["ReturnValue"].as_bool().unwrap_or(false);
+    let result = json!({
+        "ok": ok,
+        "output": tail(&output, 2000),
+        "result": response["CommandResult"],
+    });
+    if !ok {
+        bail!("Python failed:\n{}", serde_json::to_string_pretty(&result)?);
+    }
+    Ok((result, output))
+}
+
+/// Everything an `ExecutePythonCommandEx` reply printed, in order and uncut.
+fn python_output(response: &Value) -> String {
+    let lines: Vec<String> = response["LogOutput"]
         .as_array()
         .map(|entries| entries.iter().map(|e| {
             let kind = e["Type"].as_str().unwrap_or("Info");
@@ -1762,16 +1967,13 @@ fn python_tx(code: &str, timeout: Duration, transaction: bool) -> Result<Value> 
             if kind == "Info" { text.to_string() } else { format!("[{kind}] {text}") }
         }).collect())
         .unwrap_or_default();
-    let ok = response["ReturnValue"].as_bool().unwrap_or(false);
-    let result = json!({
-        "ok": ok,
-        "output": tail(&output.join("\n"), 2000),
-        "result": response["CommandResult"],
-    });
-    if !ok {
-        bail!("Python failed:\n{}", serde_json::to_string_pretty(&result)?);
-    }
-    Ok(result)
+    lines.join("\n")
+}
+
+/// The JSON of the last `RELAY_JSON:` line in a script's output. Searched line by line, since
+/// one log entry can hold several lines.
+fn relay_json(output: &str) -> Option<&str> {
+    output.lines().rev().find_map(|line| line.trim().strip_prefix("RELAY_JSON:"))
 }
 
 /// Run a script that prints one line `RELAY_JSON:<json>` and return that JSON.
@@ -1780,13 +1982,10 @@ fn python_json(code: &str, timeout: Duration) -> Result<Value> {
 }
 
 fn python_json_tx(code: &str, timeout: Duration, transaction: bool) -> Result<Value> {
-    let result = python_tx(code, timeout, transaction)?;
-    let output = result["output"].as_str().unwrap_or("");
-    let line = output
-        .lines()
-        .rev()
-        .find_map(|line| line.trim().strip_prefix("RELAY_JSON:"))
-        .ok_or_else(|| anyhow!("the editor script printed no result:\n{output}"))?;
+    // Found in the whole output: cutting it first lost every result over the tail's size.
+    let (result, output) = python_run(code, timeout, transaction)?;
+    let line = relay_json(&output)
+        .ok_or_else(|| anyhow!("the editor script printed no result:\n{}", result["output"].as_str().unwrap_or("")))?;
     Ok(serde_json::from_str(line)?)
 }
 
@@ -2268,5 +2467,143 @@ mod tests {
         let search = search_assets_script(&json!({"class_names":["StaticMesh"]}));
         assert!(search.contains(r#"for root in ["/Game"]:"#));
         assert!(search.contains(r#"set(c.lower() for c in ["StaticMesh"])"#));
+    }
+
+    #[test]
+    fn the_editor_lock_works_without_an_editor() {
+        // Releasing a lock must work after the editor has crashed, so the lock tool needs none.
+        assert!(!LIVE.contains(&"ue_editor_lock"));
+        let served: Vec<Value> = tools();
+        let served: Vec<&str> = served.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        for name in LIVE.iter().chain(MUTATING.iter()) {
+            assert!(served.contains(name), "{name} is not a tool");
+        }
+        assert!(MUTATING.iter().all(|m| LIVE.contains(m)), "a mutating tool skips the project guard");
+    }
+
+    #[test]
+    fn a_held_lock_stays_fresh_until_the_call_ends() {
+        let root = tempfile::tempdir().unwrap();
+        let project = bare_project(root.path());
+        let stale = |holder: &str| std::fs::write(lock_path(&project), json!({"holder":holder,"since":1,"last_used":1}).to_string()).unwrap();
+        let hold = LockHold::take_every(&project, "calm-otter", Duration::from_millis(20)).unwrap();
+        // As if the call had been running for longer than LOCK_IDLE.
+        stale("calm-otter");
+        std::thread::sleep(Duration::from_millis(200));
+        let lock = read_lock(&project);
+        assert_eq!(lock["expired"], false, "{lock}");
+        assert_eq!(lock["since"], 1, "the hold keeps when it was taken");
+        assert!(acquire_lock(&project, "brisk-fox").is_err(), "taken over mid-call");
+        drop(hold);
+        assert!(read_lock(&project)["idle_s"].as_u64().unwrap() < 5, "idleness counts from the end of the call");
+        // Once dropped, nothing refreshes it.
+        stale("calm-otter");
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(read_lock(&project)["expired"], true);
+
+        // A lock that changed hands is not written back.
+        let hold = LockHold::take_every(&project, "calm-otter", Duration::from_millis(20)).unwrap();
+        stale("brisk-fox");
+        std::thread::sleep(Duration::from_millis(100));
+        drop(hold);
+        assert_eq!(read_lock(&project)["holder"], "brisk-fox");
+        assert_eq!(read_lock(&project)["last_used"], 1);
+    }
+
+    fn write_log(project: &Project, text: &str) {
+        std::fs::create_dir_all(project.log_path().parent().unwrap()).unwrap();
+        std::fs::write(project.log_path(), text).unwrap();
+    }
+
+    #[test]
+    fn log_lines_are_filtered_before_they_are_capped() {
+        let root = tempfile::tempdir().unwrap();
+        let project = bare_project(root.path());
+        let mut text = String::from("LogTemp: old session\n");
+        let start = text.len() as u64;
+        text.push_str("LogBlueprint: Error: the first error, the cause\n");
+        for n in 0..2000 {
+            text.push_str(&format!("LogTemp: Display: noise {n}\nLogScript: Warning: repeated {n}\n"));
+        }
+        write_log(&project, &text);
+        let all = log_since(&project, start, Some("Error|Warning"));
+        assert_eq!(all.len(), 2001, "every match, not a tail");
+        assert!(all[0].contains("the first error"));
+        let capped = cap_lines(all, MAX_LOG_LINES);
+        assert_eq!(capped.len(), MAX_LOG_LINES + 1);
+        assert!(capped[0].contains("the first error"), "the first errors are kept");
+        assert!(capped[MAX_LOG_LINES / 2].contains("1701 matching lines omitted"), "{}", capped[MAX_LOG_LINES / 2]);
+        assert!(capped.last().unwrap().contains("repeated 1999"));
+        assert_eq!(cap_lines(vec!["a".into()], MAX_LOG_LINES), vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn in_editor_results_count_every_test() {
+        let root = tempfile::tempdir().unwrap();
+        let project = bare_project(root.path());
+        let mut text = String::new();
+        for n in 0..400 {
+            let result = if n == 0 { "Fail" } else { "Success" };
+            text.push_str(&format!("LogAutomationController: Display: Test Started. Name={{T{n}}}\n"));
+            text.push_str(&format!("LogAutomationController: Display: Test Completed. Result={{{result}}} Name={{T{n}}} Path={{Project.T{n}}}\n"));
+        }
+        text.push_str("LogAutomationController: Display: ...Automation Test Queue Empty 400 tests performed.\n");
+        write_log(&project, &text);
+        let report = test_lines(&log_since(&project, 0, Some("LogAutomation")));
+        assert_eq!(report["failed"], 1, "the first test's failure is not dropped");
+        assert_eq!(report["succeeded"], 399);
+    }
+
+    #[test]
+    fn a_launch_reads_only_the_new_sessions_log() {
+        let root = tempfile::tempdir().unwrap();
+        let project = bare_project(root.path());
+        let bind = "LogHttpListener: Error: HttpListener unable to bind to 127.0.0.1:30010\n";
+        // The previous session failed to bind; a fresh launch must not report that.
+        write_log(&project, &format!("LogInit: start\n{bind}LogExit: Exiting.\n"));
+        let mark = log_mark(&project);
+        let old = new_session_start(&project, mark);
+        assert!(crate::unreal_process::bind_failures(&log_since(&project, old, Some(BIND_PREFILTER))).is_empty());
+        // The new editor moves the old log aside and starts its own; its failure comes early
+        // and is followed by far more than 300 lines of start-up.
+        std::fs::rename(project.log_path(), root.path().join("Saved/Logs/Game-backup.log")).unwrap();
+        let mut text = format!("LogInit: start\n{bind}");
+        for n in 0..1000 {
+            text.push_str(&format!("LogShaderCompilers: Display: compiling {n}\n"));
+        }
+        write_log(&project, &text);
+        let start = new_session_start(&project, mark);
+        assert_eq!(start, 0);
+        assert_eq!(crate::unreal_process::bind_failures(&log_since(&project, start, Some(BIND_PREFILTER))).len(), 1);
+        // A file that only grew is the same session: read past the mark.
+        let grown = log_mark(&project);
+        std::fs::write(project.log_path(), format!("{text}LogTemp: more\n")).unwrap();
+        assert_eq!(new_session_start(&project, grown), text.len() as u64);
+    }
+
+    #[test]
+    fn a_large_result_is_found_before_the_output_is_cut() {
+        let rows: Vec<Value> = (0..2000).map(|n| json!({"label": format!("Actor_{n}"), "path": format!("/Game/Maps/Main.Main:PersistentLevel.StaticMeshActor_UAID_{n:040}")})).collect();
+        let payload = json!({"count": rows.len(), "actors": rows}).to_string();
+        assert!(payload.len() > 2 * MAX_OUTPUT);
+        let response = json!({"ReturnValue": true, "LogOutput": [
+            {"Type": "Info", "Output": "LogPython: starting\nsecond line\n"},
+            {"Type": "Info", "Output": format!("RELAY_JSON:{payload}\n")},
+            {"Type": "Warning", "Output": "a warning printed after the result"},
+        ]});
+        let output = python_output(&response);
+        assert!(relay_json(&tail(&output, 2000)).is_none(), "the cut output has lost the result");
+        let parsed: Value = serde_json::from_str(relay_json(&output).unwrap()).unwrap();
+        assert_eq!(parsed["count"], 2000);
+        assert_eq!(relay_json("a\nRELAY_JSON:1\nRELAY_JSON:2\n[Warning] w"), Some("2"), "the last result wins");
+    }
+
+    #[test]
+    fn a_render_check_that_could_not_read_pixels_is_not_a_pass() {
+        assert_eq!(renders_from_coverage(&[json!(0.0), json!(0.05)]), json!(true));
+        assert_eq!(renders_from_coverage(&[json!(0.0), json!(0.001)]), json!(false));
+        assert!(renders_from_coverage(&[Value::Null, Value::Null]).is_null(), "unknown, not visible");
+        assert!(renders_from_coverage(&[]).is_null());
+        assert!(renders_from_coverage(&[json!(0.0), Value::Null]).is_null(), "one view unmeasured");
     }
 }

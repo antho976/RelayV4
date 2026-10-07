@@ -1,4 +1,8 @@
-# Rigify to a clean game skeleton (verified in Blender 4.0 background mode)
+# Rigify to a clean game skeleton (verified in background mode on Blender 4.0.2 and 5.2.1)
+
+Sections 1-3 were re-run in order on 5.2.1 (bundled Rigify) after section 3 moved to the
+`action_fcurves` helper, because 5.0 removed `Action.fcurves`. The helper's 4.x branch has not
+been re-run on a 4.x build since.
 
 Read this when a character is rigged, or should be rigged, with Rigify and has to ship to
 Unreal. The generated rig has ~700 bones and several top-level bones, and its `DEF-` bones are
@@ -112,6 +116,26 @@ export skeleton with visual keying. The Copy Transforms constraints stay (`clear
 so the next action bakes the same way:
 
 ```python
+def action_fcurves(act, obj=None, ensure=False):
+    """F-curves of `act` on any Blender. Since 4.4 they live in a channelbag per action slot;
+    5.0 removed Action.fcurves. Uses obj's assigned slot when obj plays `act`, else the first
+    slot. ensure=True creates the slot (assigned to obj), layer, strip and channelbag."""
+    if not hasattr(act, "slots"):                                   # 4.3 and older
+        return act.fcurves
+    ad = obj.animation_data if obj is not None else None
+    mine = ad is not None and ad.action == act
+    slot = (ad.action_slot if mine else None) or (act.slots[0] if len(act.slots) else None)
+    if not ensure:
+        bags = [st.channelbag(slot) for ly in act.layers for st in ly.strips] if slot else []
+        return next((cb.fcurves for cb in bags if cb), [])
+    if slot is None:
+        slot = act.slots.new(id_type="OBJECT", name=obj.name if obj is not None else act.name)
+    if mine and ad.action_slot != slot:
+        ad.action_slot = slot
+    layer = act.layers[0] if len(act.layers) else act.layers.new("Layer")
+    strip = layer.strips[0] if len(layer.strips) else layer.strips.new(type="KEYFRAME")
+    return strip.channelbag(slot, ensure=True).fcurves
+
 rig, exp = bpy.data.objects["rig"], bpy.data.objects["Armature"]
 src = bpy.data.actions["A_Hero_Wave_ctrl"]          # the action authored on the Rigify rig
 rig.animation_data.action = src
@@ -128,7 +152,7 @@ bpy.ops.nla.bake(frame_start=f0, frame_end=f1, only_selected=True, visual_keying
 bpy.ops.object.mode_set(mode="OBJECT")
 baked = exp.animation_data.action                  # created as "Action": name it
 baked.name, baked.use_fake_user = "A_Hero_Wave", True
-print(baked.name, tuple(baked.frame_range), len(baked.fcurves))
+print(baked.name, tuple(baked.frame_range), len(action_fcurves(baked, exp)))
 ```
 
 Name the control-rig actions differently from the baked ones (here `_ctrl`) so nobody exports

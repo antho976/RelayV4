@@ -37,7 +37,7 @@ pub(crate) fn library_or_defaults(library: &Value) -> Value {
                 "data:image/png;base64,{}",
                 base64::engine::general_purpose::STANDARD.encode(bytes)
             );
-            json!({"id":format!("builtin-{id}"),"name":name,"image":image,"preview":image})
+            json!({"id":format!("builtin-{id}"),"name":name,"image":image})
         })
         .collect()
 }

@@ -117,6 +117,8 @@ scene.frame_start, scene.frame_end = 1, 20
 
 partner = rig("Partner", (0, -0.9, 0))
 partner.rotation_euler = (0, 0, math.pi)
+# Euler like Hero's, so Swing (made on Hero, keying rotation_euler) can play on Partner too.
+partner.pose.bones["upper_arm.R"].rotation_mode = "XYZ"
 body("PartnerBody", partner)
 
 bpy.ops.wm.save_as_mainfile(filepath=out)

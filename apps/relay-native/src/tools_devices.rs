@@ -47,18 +47,36 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
         }
         build_form(ui, page, project, &devices, &worktrees, last.as_deref());
         avd_form(ui, page);
-        page.append(&gtk::Box::new(gtk::Orientation::Vertical, 8));
+        // Devices, release signing and history. Signing holds a form being typed into, so
+        // it is rebuilt only when what it shows changes, not on every engine event.
+        for _ in 0..3 {
+            page.append(&gtk::Box::new(gtk::Orientation::Vertical, 8));
+        }
         // Navigation can cancel the await above. Mark only a fully built form reusable.
         ui.page_projects
             .borrow_mut()
             .insert("devices".into(), project);
+    } else {
+        sync_targets(&devices);
     }
-    let list = page.last_child().unwrap().downcast::<gtk::Box>().unwrap();
-    clear(&list);
+    // Read everything first, then redraw in one go: a list rebuilt across awaits shrinks
+    // under someone scrolled down to the history.
     let avds = ui.call("avd.list", json!({})).await;
+    let (signing, runs) = if project > 0 {
+        (
+            Some(ui.call("device.signing.get", json!({"project_id":project})).await),
+            Some(ui.call("device.run.list", json!({"project_id":project})).await),
+        )
+    } else {
+        (None, None)
+    };
     if !current(ui, "devices", project, generation) {
         return;
     }
+    let history = page.last_child().unwrap().downcast::<gtk::Box>().unwrap();
+    let signing_box = history.prev_sibling().unwrap().downcast::<gtk::Box>().unwrap();
+    let list = signing_box.prev_sibling().unwrap().downcast::<gtk::Box>().unwrap();
+    clear(&list);
     let all = section(&list, "Devices");
     let avds = match avds {
         Ok(value) => rows(&value, "avds"),
@@ -68,18 +86,11 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
         }
     };
     device_list(ui, &all, &devices, &avds);
-    if project <= 0 {
-        return;
-    }
-    if let Ok(signing) = ui
-        .call("device.signing.get", json!({"project_id":project}))
-        .await
-    {
-        if !current(ui, "devices", project, generation) {
-            return;
-        }
-        let row = section(&list, "Release signing");
-        if signing["configured"].as_bool() == Some(true) {
+    match signing {
+        None => clear(&signing_box),
+        Some(Ok(signing)) if signing["configured"].as_bool() == Some(true) => {
+            clear(&signing_box);
+            let row = section(&signing_box, "Release signing");
             let enabled = signing["enabled"].as_bool() == Some(true);
             row.append(&paragraph(&format!(
                 "Alias: {}\nKeystore: {}",
@@ -97,22 +108,25 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
                 "device.signing.set_enabled",
                 json!({"project_id":project,"enabled":!enabled}),
             );
-        } else {
+        }
+        // Keep the form already shown, and whatever is typed into it.
+        Some(Ok(_)) if signing_box.first_child().is_some_and(|row| row.widget_name() == "signing-form") => {}
+        Some(Ok(_)) => {
+            clear(&signing_box);
+            let row = section(&signing_box, "Release signing");
+            row.set_widget_name("signing-form");
             row.append(&paragraph(
                 "Using the project's Gradle signing configuration.",
             ));
             signing_form(ui, &row, project);
         }
+        Some(Err(_)) => {}
     }
-    match ui
-        .call("device.run.list", json!({"project_id":project}))
-        .await
-    {
-        Ok(value) => {
-            if !current(ui, "devices", project, generation) {
-                return;
-            }
-            let history = section(&list, "Build and run history");
+    clear(&history);
+    match runs {
+        None => {}
+        Some(Ok(value)) => {
+            let history = section(&history, "Build and run history");
             let runs = rows(&value, "runs");
             if runs.is_empty() {
                 history.append(&paragraph("No builds or runs yet."));
@@ -158,9 +172,54 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
                 }
             }
         }
-        Err(error) => {
-            list.append(&paragraph(&error.to_string()));
+        Some(Err(error)) => {
+            history.append(&paragraph(&error.to_string()));
         }
+    }
+}
+
+/// "Target device" and the Run button. The form outlives refreshes, so the device list
+/// below and this picker are kept in step: a phone plugged in later can be chosen.
+struct Targets {
+    combo: glib::WeakRef<gtk::ComboBoxText>,
+    shown: Vec<(String, String)>,
+}
+
+thread_local! {
+    static TARGETS: std::cell::RefCell<Option<Targets>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Connected devices a run can target, as (serial, title).
+fn device_targets(devices: &[Value]) -> Vec<(String, String)> {
+    devices
+        .iter()
+        .filter(|device| text(device, "state") == "device")
+        .map(|device| (text(device, "serial").to_string(), format!("{} · {}", text(device, "model"), text(device, "serial"))))
+        .collect()
+}
+
+/// Refill "Target device" when the connected devices change, keeping the chosen one if it
+/// is still there. Its `changed` handler recomputes the Run button.
+fn sync_targets(devices: &[Value]) {
+    let next = device_targets(devices);
+    let Some(combo) = TARGETS.with(|targets| {
+        let mut targets = targets.borrow_mut();
+        let targets = targets.as_mut()?;
+        if targets.shown == next {
+            return None;
+        }
+        targets.shown = next.clone();
+        targets.combo.upgrade()
+    }) else {
+        return;
+    };
+    let selected = combo.active_id();
+    combo.remove_all();
+    for (serial, title) in &next {
+        combo.append(Some(serial), title);
+    }
+    if !selected.is_some_and(|id| combo.set_active_id(Some(&id))) {
+        combo.set_active(Some(0));
     }
 }
 
@@ -489,15 +548,12 @@ fn build_form(ui: &Rc<Ui>, page: &gtk::Box, project: i64, devices: &[Value], wor
     let tree = WorktreePicker::new(worktrees, last);
     field("Build from", &tree.widget, &form);
     let target = gtk::ComboBoxText::new();
-    for device in devices {
-        if text(device, "state") == "device" {
-            target.append(
-                Some(text(device, "serial")),
-                &format!("{} · {}", text(device, "model"), text(device, "serial")),
-            );
-        }
+    let shown = device_targets(devices);
+    for (serial, title) in &shown {
+        target.append(Some(serial), title);
     }
     target.set_active(Some(0));
+    TARGETS.with(|targets| *targets.borrow_mut() = Some(Targets { combo: target.downgrade(), shown }));
     field("Target device", &target, &form);
     let variant = gtk::Entry::builder().text("debug").build();
     field("Gradle variant", &variant, &form);
@@ -517,6 +573,14 @@ fn build_form(ui: &Rc<Ui>, page: &gtk::Box, project: i64, devices: &[Value], wor
     ] {
         let key = button(title, "primary");
         key.set_sensitive(project > 0 && (op != "device.run" || target.active_id().is_some()));
+        if op == "device.run" {
+            let run = key.downgrade();
+            target.connect_changed(move |target| {
+                if let Some(run) = run.upgrade() {
+                    run.set_sensitive(project > 0 && target.active_id().is_some());
+                }
+            });
+        }
         controls.append(&key);
         let weak = Rc::downgrade(ui);
         let tree = tree.clone();

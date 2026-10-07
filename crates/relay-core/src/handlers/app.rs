@@ -19,7 +19,14 @@ pub fn register(e: &mut Engine) {
             build: BuildInfo {
                 profile: if cfg!(debug_assertions) { "debug" } else { "release" }.to_string(),
                 git_sha: option_env!("RELAY_GIT_SHA").map(str::to_string),
-                built_at: option_env!("RELAY_BUILT_AT").map(str::to_string),
+                // Nothing sets RELAY_BUILT_AT in a plain `cargo build`, so fall back to the
+                // running image's own mtime: /proc/self/exe resolves to the inode this process
+                // was started from, even after cargo has replaced the file, so a stale engine
+                // reports an older time than the binary on disk (RA-271).
+                built_at: option_env!("RELAY_BUILT_AT").map(str::to_string).or_else(|| {
+                    let modified = std::fs::metadata("/proc/self/exe").or_else(|_| std::env::current_exe().and_then(std::fs::metadata)).ok()?.modified().ok()?;
+                    Some(jiff::Timestamp::try_from(modified).ok()?.to_string())
+                }),
             },
         })
     });
@@ -30,7 +37,6 @@ pub fn register(e: &mut Engine) {
             uptime_s: eng.uptime_s(),
             store_path: eng.store.path().display().to_string(),
             socket_path: eng.socket_path.lock().unwrap().clone().unwrap_or_default(),
-            ui_connected: eng.ui_connected.load(Ordering::Relaxed),
             sessions_live: eng.live_pty_count() as i64,
             providers: crate::providers::list(ctx.tx())?,
         })

@@ -61,7 +61,7 @@ result!(#[schemars(rename = "FileTrashListOut")] TrashListOut {
 op!(TrashList, "file.trash.list", TrashListIn => TrashListOut,
     OpMeta::query(Scope::Project, 8, "Trashed files not yet restored or expired").actors(Actors::UserOnly));
 op!(RestoreHead, "file.restore_head", PathIn => Entry,
-    OpMeta::mutation(Scope::Project, 8, "git checkout -- <path>: the one-click answer to a post-hoc violation").actors(Actors::UserOnly).emits(&["file.changed"]));
+    OpMeta::mutation(Scope::Project, 8, "git checkout -- <path>: put a tracked file back as HEAD has it").actors(Actors::UserOnly).emits(&["file.changed"]));
 payload!(#[schemars(rename = "ImportIn")] ImportIn { pub project_id: Id, pub worktree: Option<String>, pub into: String, pub sources: Vec<String> });
 result!(#[schemars(rename = "ImportOut")] ImportOut { pub entries: Vec<Entry> });
 op!(Import, "file.import", ImportIn => ImportOut,

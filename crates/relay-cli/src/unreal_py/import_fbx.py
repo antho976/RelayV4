@@ -23,13 +23,20 @@ def set_cvar(name, value):
     unreal.SystemLibrary.execute_console_command(editor_world(), "%s %s" % (name, value))
 
 
+def materials_wanted():
+    """Import materials and textures? Default yes for meshes, no for animations. The Rust side
+    passes materials=null when the caller did not say, which means the default, not False."""
+    wanted = ARGS.get("materials")
+    return (kind != "animation") if wanted is None else bool(wanted)
+
+
 def options():
     ui = unreal.FbxImportUI()
     ui.set_editor_property("import_mesh", kind != "animation")
     ui.set_editor_property("import_as_skeletal", kind in ("skeletal", "animation"))
     ui.set_editor_property("import_animations", kind == "animation" or bool(ARGS.get("animations")))
-    ui.set_editor_property("import_materials", bool(ARGS.get("materials", kind != "animation")))
-    ui.set_editor_property("import_textures", bool(ARGS.get("materials", kind != "animation")))
+    ui.set_editor_property("import_materials", materials_wanted())
+    ui.set_editor_property("import_textures", materials_wanted())
     ui.set_editor_property("mesh_type_to_import", {
         "static": unreal.FBXImportType.FBXIT_STATIC_MESH,
         "skeletal": unreal.FBXImportType.FBXIT_SKELETAL_MESH,
@@ -94,8 +101,8 @@ def measure(path):
         entry["right_axis_in_mesh_space"] = rnd(f["right"], 3)
         entry["left_right_pairs"] = f["found_pairs"]
         pose = skel.component_pose(skel.ref_local)
-        lefts = [n for n in skel.names if "hand" in n.lower() and mirror_name(n) in skel.index]
-        hands = [lefts[0], mirror_name(lefts[0])] if lefts else []
+        lefts = [n for n in skel.names if "hand" in n.lower() and twin(n) in skel.index]
+        hands = [lefts[0], twin(lefts[0])] if lefts else []
         entry["hand_sides"] = dict((n, side(f, pose[n][0])) for n in hands)
     if isinstance(a, unreal.AnimSequence):
         entry["length_s"] = anim_length(a)

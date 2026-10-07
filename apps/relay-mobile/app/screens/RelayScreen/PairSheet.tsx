@@ -121,7 +121,7 @@ const PairSheet: React.FC<PairSheetProps> = ({ visible, setVisible }) => {
                 <Text style={{ color: color.text._100, fontSize: fontSize.l }}>Pair a PC</Text>
                 <Text style={{ color: color.text._400 }}>
                     On the PC, run `relay remote pair`. Scan the code it prints, or type what it
-                    shows.
+                    shows, then approve this phone in that terminal when it asks.
                 </Text>
                 <View style={{ flexDirection: 'row', columnGap: spacing.m }}>
                     <ThemedButton
@@ -227,7 +227,9 @@ const PairSheet: React.FC<PairSheetProps> = ({ visible, setVisible }) => {
                 )}
 
                 {busy && mode === 'scan' && (
-                    <Text style={{ color: color.text._300 }}>Pairing…</Text>
+                    <Text style={{ color: color.text._300 }}>
+                        Pairing… approve it in the terminal on the PC when asked.
+                    </Text>
                 )}
                 {!!error && <Text style={{ color: color.error._300 }}>{error}</Text>}
             </View>

@@ -52,9 +52,8 @@ for o in chosen:
         for c in o.children_recursive:
             take(c)
     if o.type == "ARMATURE":
-        for m in scene.objects:
-            if m.type == "MESH" and any(md.type == "ARMATURE" and md.object == o for md in m.modifiers):
-                take(m)
+        for m in skinned_meshes(o):
+            take(m)
 
 kind = ARGS.get("kind", "auto")
 if kind == "auto":
@@ -134,7 +133,9 @@ result = bpy.ops.export_scene.fbx(**options)
 if "FINISHED" not in result:
     raise RuntimeError("the FBX exporter returned %s" % result)
 meshes = [o for o in selected if o.type == "MESH" and not o.name.startswith(("UCX_", "UBX_", "USP_"))]
-lo, hi = world_bbox(meshes) if meshes else (None, None)
+# In bind pose: the FBX holds skinned meshes at rest, and that is what Unreal measures.
+with rest_pose([o for o in selected if o.type == "ARMATURE"]):
+    lo, hi = world_bbox(meshes) if meshes else (None, None)
 # How each socket empty is turned relative to its mesh. Unreal receives sockets from empties
 # with a -90 degree roll from the axis conversion, so the import puts back what was meant: an
 # empty with no rotation of its own becomes a socket with no rotation.
@@ -158,6 +159,6 @@ emit({"path": path, "bytes": os.path.getsize(path), "kind": kind, "forward_world
       "sockets": sorted(o.name for o in selected if o.type == "EMPTY" and o.name.startswith("SOCKET_")),
       "socket_details": socket_details,
       "collision": sorted(o.name for o in selected if o.name.startswith(("UCX_", "UBX_", "USP_"))),
-      "action": arm.animation_data.action.name if arm is not None and arm.animation_data and arm.animation_data.action else None,
+      "action": action_used(arm)["action"], "action_slot": action_used(arm)["slot"],
       "size_cm": cm(hi - lo) if lo is not None else None,
       "options": dict((k, sorted(v) if isinstance(v, set) else v) for k, v in options.items() if k != "filepath")})

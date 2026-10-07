@@ -77,6 +77,16 @@ pub fn open(ui: &Rc<Ui>, device: String) {
     view.start();
 }
 
+/// End every mirror, docked or in its own window. The main window calls this as it closes:
+/// a mirror window is an application window too and would otherwise keep the process, its
+/// engine connection and the device's stream alive with nothing behind it.
+pub fn close_all() {
+    let views = VIEWS.with(|views| views.borrow().clone());
+    for view in views {
+        view.close();
+    }
+}
+
 /// Open the next mirror docked beside the wall (the smoke harness screenshots the main window,
 /// which a detached mirror is not part of).
 pub(crate) fn prefer_dock() {

@@ -14,7 +14,7 @@ use crate::pty::Pty;
 use crate::store::Store;
 use relay_bus::envelope::{Actor, Event, MailHint, Request, Response, ENVELOPE_V};
 use relay_bus::error::BusError;
-use relay_bus::registry::{Audit, Doors, Op, OpEntry, OpKind, Registry};
+use relay_bus::registry::{Audit, Op, OpEntry, OpKind, Registry};
 use relay_bus::types::{Id, Page, PaneInfo, PaneRef, UndoOp, WindowInfo};
 use rusqlite::Transaction;
 use serde_json::{json, Value};
@@ -26,10 +26,10 @@ use std::time::Instant;
 use tokio::sync::{broadcast, Notify};
 use uuid::Uuid;
 
-/// Which door a request came through (BUS.md §6). Rules differ per door (§4.2).
+/// Which door a request came through (BUS.md §6). Rules differ per door (§4.2). The phone door
+/// (`relay-remote`) is not a door here: it forwards its lines to the socket as `user`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Door {
-    Tauri,
     Socket,
     /// The in-process test harness: trusted, no token checks.
     InProcess,
@@ -481,7 +481,6 @@ pub struct Engine {
     prepares: HashMap<&'static str, PrepareFn>,
     events_tx: broadcast::Sender<Event>,
     started: Instant,
-    pub ui_connected: AtomicBool,
     quit: Notify,
     quitting: AtomicBool,
     pub socket_path: std::sync::Mutex<Option<String>>,
@@ -523,7 +522,6 @@ impl Engine {
             prepares: HashMap::new(),
             events_tx,
             started: Instant::now(),
-            ui_connected: AtomicBool::new(false),
             quit: Notify::new(),
             quitting: AtomicBool::new(false),
             socket_path: std::sync::Mutex::new(None),
@@ -869,9 +867,6 @@ impl Engine {
     /// cannot be attributed to a live, authenticated session gets no hint, exactly as before.
     fn mail_hint(&self, req: &Request, door: Door) -> Option<MailHint> {
         let name = req.actor.session_name()?;
-        if matches!(door, Door::Tauri) {
-            return None;
-        }
         let conn = self.store.lock();
         let row = crate::sessions::by_name(&conn, name).ok()?;
         if matches!(door, Door::Socket) {
@@ -904,16 +899,6 @@ impl Engine {
         let entry = Registry::global()
             .get(&req.op)
             .ok_or_else(|| BusError::unknown_op(&req.op))?;
-        // door
-        match (entry.meta.doors, door) {
-            (Doors::SocketOnly, Door::Tauri) | (Doors::TauriOnly, Door::Socket) => {
-                return Err(BusError::invalid(
-                    "bus.door",
-                    format!("{} is not available on this door", entry.name),
-                ));
-            }
-            _ => {}
-        }
         // actor
         let session_id = self.resolve_actor(req, door)?;
         // An agent already *is* a project and a session. Making it restate both on every call
@@ -1440,9 +1425,6 @@ impl Engine {
                 "\"test\" actor is only accepted by dev/test instances",
             )),
             (Actor::User, _) | (Actor::Test, _) => Ok(None),
-            (Actor::Agent(_), Door::Tauri) => {
-                Err(BusError::actor("the UI door only carries the user actor"))
-            }
             (Actor::Agent(name), Door::InProcess) => {
                 let conn = self.store.lock();
                 Ok(crate::sessions::by_name(&conn, name)

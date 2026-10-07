@@ -4,6 +4,7 @@
 //! only in the notification it raised, and a restorable session's dirty worktree and stop reason
 //! come from `session.restorable`. Panes reconciled together share one round of reads.
 use super::{label, rows, text, Ui};
+use crate::client::Client;
 use crate::terminal::Pane;
 use gtk::prelude::*;
 use gtk4 as gtk;
@@ -94,16 +95,15 @@ impl Ui {
 
     async fn describe_batch(&self, requests: Vec<Request>) {
         let sessions: Vec<&Value> = requests.iter().map(|r| &r.session).collect();
-        let mut restorable = BTreeMap::new();
-        if sessions.iter().any(|s| text(s, "state") == "restorable") {
-            if let Ok(data) = self.call("session.restorable", json!({})).await {
-                for item in rows(&data, "sessions") {
-                    if let Some(id) = item["session"]["id"].as_i64() {
-                        restorable.insert(id, item);
-                    }
-                }
-            }
-        }
+        // `session.restorable` takes no filter and checks every restorable worktree for
+        // changes, one `git status` each. It gets a connection of its own, started first, so
+        // the reads below and every other UI request do not wait in line behind that walk.
+        let lookup = sessions.iter().any(|s| text(s, "state") == "restorable").then(|| {
+            let (rt, path) = (self.rt.clone(), self.path.clone());
+            glib::spawn_future_local(async move {
+                Client::lifecycle_request(&rt, path, "session.restorable", json!({})).await
+            })
+        });
         let projects: BTreeSet<i64> = sessions.iter().filter_map(|s| s["project_id"].as_i64()).collect();
         let mut reports = BTreeMap::new();
         for project in projects {
@@ -118,6 +118,20 @@ impl Ui {
                 tasks.insert(id, task);
             }
         }
+        let mut restorable = BTreeMap::new();
+        let mut restore_failed = false;
+        if let Some(lookup) = lookup {
+            match lookup.await {
+                Ok(Ok(data)) => {
+                    for item in rows(&data, "sessions") {
+                        if let Some(id) = item["session"]["id"].as_i64() {
+                            restorable.insert(id, item);
+                        }
+                    }
+                }
+                _ => restore_failed = true,
+            }
+        }
         for request in requests {
             let Some(pane) = request.pane.upgrade() else { continue };
             let Some(card) = pane.context_card(request.serial) else { continue };
@@ -129,12 +143,12 @@ impl Ui {
                 .unwrap_or_default();
             let restore = session["id"].as_i64().and_then(|id| restorable.get(&id));
             let task = session["task_id"].as_i64().and_then(|id| tasks.get(&id));
-            render(card, session, task, last_report(session, notifications), restore);
+            render(card, session, task, last_report(session, notifications), restore, restore_failed);
         }
     }
 }
 
-fn render(card: &gtk::Box, session: &Value, task: Option<&Value>, report: Option<&Value>, restore: Option<&Value>) {
+fn render(card: &gtk::Box, session: &Value, task: Option<&Value>, report: Option<&Value>, restore: Option<&Value>, restore_failed: bool) {
     card.append(&label("WHERE IT LEFT OFF", "slate-context-title"));
     let grid = gtk::Grid::new();
     grid.set_column_spacing(14);
@@ -190,6 +204,8 @@ fn render(card: &gtk::Box, session: &Value, task: Option<&Value>, report: Option
     let stopped = match text(session, "state") {
         "restorable" => Some(match restore.map(|r| text(r, "reason")) {
             Some("crash") => String::from("Relay stopped unexpectedly"),
+            // Not "Relay was closed": the lookup failing says nothing about why it stopped.
+            None if restore_failed => String::from("The previous process ended"),
             Some("app_restart") | None => String::from("Relay was closed"),
             Some(other) => other.replace('_', " "),
         }),

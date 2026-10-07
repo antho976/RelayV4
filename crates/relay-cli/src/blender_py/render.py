@@ -12,10 +12,24 @@ framed = []
 for o in targets:
     framed.append(o)
     if o.type == "ARMATURE":
-        framed += [c for c in scene.objects if c.type == "MESH" and (c.parent == o or any(m.type == "ARMATURE" and m.object == o for m in c.modifiers))]
+        # Its skin, and the props it holds (bone-parented), which a render should show.
+        for c in skinned_meshes(o) + [c for c in o.children_recursive if c.type == "MESH"]:
+            if c not in framed:
+                framed.append(c)
 meshes = [o for o in framed if o.type == "MESH"] or framed
 
-arm = next((o for o in targets if o.type == "ARMATURE"), None)
+# The armature that poses what is rendered: a listed one, else the one the listed meshes are
+# skinned or parented to. An action with no armature to play it on is an error, not a rest pose.
+arms = [o for o in targets if o.type == "ARMATURE"]
+if not arms:
+    for o in targets:
+        for a in [m.object for m in o.modifiers if m.type == "ARMATURE" and m.object] + [p for p in [o.parent] if p and p.type == "ARMATURE"]:
+            if a not in arms:
+                arms.append(a)
+if ARGS.get("action") and len(arms) != 1:
+    raise RuntimeError("action %r needs one armature to play on, found %s; list the armature in objects" % (
+        ARGS["action"], ", ".join(a.name for a in arms) if arms else "none for %s" % ", ".join(names)))
+arm = arms[0] if arms else None
 if arm is not None:
     set_action(arm, ARGS.get("action"))
     frame = body_frame(arm)
@@ -32,10 +46,16 @@ if ARGS.get("isolate", True):
         if o.type in ("MESH", "CURVE", "SURFACE", "META", "FONT") and o.name not in keep:
             o.hide_render = True
 
-# 4.2 to 4.5 call EEVEE Next "BLENDER_EEVEE_NEXT"; 5.0 took the plain name back.
-eevee = "BLENDER_EEVEE_NEXT" if (4, 2, 0) <= bpy.app.version < (5, 0, 0) else "BLENDER_EEVEE"
-engine = {"workbench": "BLENDER_WORKBENCH", "eevee": eevee, "cycles": "CYCLES"}[ARGS.get("engine", "workbench")]
-scene.render.engine = engine
+# 4.2 to 4.5 call EEVEE Next "BLENDER_EEVEE_NEXT" and reject the plain name; 5.0 took it back.
+# The engine enum is filled at run time, so try the names in turn rather than test the version.
+for engine in {"workbench": ["BLENDER_WORKBENCH"], "eevee": ["BLENDER_EEVEE", "BLENDER_EEVEE_NEXT"], "cycles": ["CYCLES"]}[ARGS.get("engine", "workbench")]:
+    try:
+        scene.render.engine = engine
+        break
+    except TypeError:
+        if engine == "BLENDER_EEVEE":
+            continue
+        raise
 if engine == "CYCLES":
     scene.cycles.samples = int(ARGS.get("samples", 16))
     scene.cycles.device = "CPU"
@@ -73,7 +93,10 @@ for f in frames[:12]:
     lo, hi = world_bbox(meshes)
     center = (lo + hi) / 2
     radius = max((hi - lo).length / 2, 0.05)
-    dist = radius / math.tan(fov / 2) * 1.15
+    # The camera angle spans the wider side of the image; fit the bounding sphere in the narrower
+    # one, or a standing character in a landscape image loses its head and feet.
+    half = math.atan(math.tan(fov / 2) * min(width, height) / max(width, height))
+    dist = radius / math.sin(half) * 1.05
     for view in ARGS.get("views") or ["front", "right", "three_quarter"]:
         if view not in DIRS:
             raise RuntimeError("unknown view %r; use %s" % (view, ", ".join(sorted(DIRS))))
@@ -88,4 +111,5 @@ for f in frames[:12]:
         files.append({"view": "frame %d %s" % (f, view), "file": path})
 
 emit({"files": files, "engine": engine, "objects": [o.name for o in framed],
+      "armature": arm.name if arm is not None else None, "action": action_used(arm)["action"], "action_slot": action_used(arm)["slot"],
       "facing": {"forward": rnd(forward, 3), "right": rnd(right, 3)}})

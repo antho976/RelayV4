@@ -3,12 +3,15 @@ use crate::app::{button, clear, label, rows, text, Ui};
 use gtk::prelude::*;
 use gtk4 as gtk;
 use serde_json::{json, Value};
+use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 #[path = "tools_devices.rs"]
 pub(crate) mod devices;
 #[path = "tools_market.rs"]
 mod market;
+pub(crate) use market::enable_switch;
 #[path = "tools_plugins.rs"]
 pub(crate) mod plugins;
 #[path = "tools_settings.rs"]
@@ -48,6 +51,16 @@ pub(super) fn action(
     parent.append(&key);
 }
 
+thread_local! {
+    /// When the dashboard last asked the engine, and the data it drew. While agents work,
+    /// events from every project reach it back to back; each rebuild resets hover and focus
+    /// and drops a click whose press and release straddle it.
+    static DASHBOARD: RefCell<(Option<Instant>, Value)> = const { RefCell::new((None, Value::Null)) };
+}
+
+/// The dashboard re-reads at most this often; events in between fold into one trailing read.
+const DASHBOARD_INTERVAL: Duration = Duration::from_secs(1);
+
 pub(super) fn current(ui: &Ui, name: &str, project: i64, generation: u64) -> bool {
     ui.generation.get() == generation && ui.project.get() == project && *ui.page.borrow() == name
 }
@@ -61,6 +74,16 @@ pub async fn refresh(ui: &Rc<Ui>, name: &str, project: i64) {
         _ => {}
     }
     let generation = ui.generation.get();
+    if name == "dashboard" {
+        let wait = DASHBOARD.with(|d| d.borrow().0.map(|at| DASHBOARD_INTERVAL.saturating_sub(at.elapsed())));
+        if let Some(wait) = wait.filter(|wait| !wait.is_zero()) {
+            glib::timeout_future(wait).await;
+            if !current(ui, name, project, generation) {
+                return;
+            }
+        }
+        DASHBOARD.with(|d| d.borrow_mut().0 = Some(Instant::now()));
+    }
     let (op, payload) = match name {
         "dashboard" => ("dashboard.get", json!({})),
         "notifications" => ("notify.list", json!({"limit": 200})),
@@ -78,6 +101,12 @@ pub async fn refresh(ui: &Rc<Ui>, name: &str, project: i64) {
         }
     };
     let page = &ui.pages[name];
+    if name == "dashboard" {
+        if page.first_child().is_some() && DASHBOARD.with(|d| d.borrow().1 == data) {
+            return;
+        }
+        DASHBOARD.with(|d| d.borrow_mut().1 = data.clone());
+    }
     clear(page);
     match name {
         "dashboard" => dashboard(ui, page, &data),

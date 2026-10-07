@@ -89,14 +89,24 @@ struct Shell {
     row_menu: gtk::PopoverMenu,
     banner: gtk::Box,
     banner_text: gtk::Label,
+    /// Names unsaved notes of projects not on screen; its Show key opens `elsewhere_target`.
+    elsewhere: gtk::Box,
+    elsewhere_text: gtk::Label,
+    elsewhere_target: Cell<i64>,
     welcome: gtk::Box,
     rows: RefCell<Vec<Row>>,
     notes: RefCell<Vec<Value>>,
+    /// Some row is pinned, so the list shows PINNED / NOTES headers.
+    any_pinned: Cell<bool>,
+    /// What the project picker was last built from; it is rebuilt only when that changes.
+    picker_key: RefCell<String>,
     project: Cell<i64>,
     rail_applied: Cell<bool>,
 }
 
 thread_local! {
+    /// A note to bring forward once its project's library is shown.
+    static FOCUS: Cell<i64> = const { Cell::new(0) };
     static SHELL: RefCell<Option<Rc<Shell>>> = const { RefCell::new(None) };
     static DOCS: RefCell<BTreeMap<i64, Rc<Doc>>> = const { RefCell::new(BTreeMap::new()) };
     static PREFS: Cell<Prefs> = Cell::new(Prefs::default());
@@ -200,7 +210,7 @@ pub(super) fn project_name(ui: &Rc<Ui>, project: i64) -> String {
         .borrow()
         .iter()
         .find(|p| p["id"].as_i64() == Some(project))
-        .map(|p| text(p, "name").to_string())
+        .map(|p| text::clean(text(p, "name")).into_owned())
         .unwrap_or_else(|| format!("Project {project}"))
 }
 
@@ -476,6 +486,18 @@ fn shell(ui: &Rc<Ui>) -> Rc<Shell> {
     });
     banner.append(&dismiss);
     host.append(&banner);
+    let elsewhere = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    elsewhere.add_css_class("notes-notice");
+    elsewhere.set_visible(false);
+    let elsewhere_text = label("", "notes-notice-text");
+    elsewhere_text.set_wrap(true);
+    elsewhere_text.set_hexpand(true);
+    elsewhere.append(&elsewhere_text);
+    let reveal_key = button("Show", "notes-notice-button");
+    reveal_key.set_focus_on_click(false);
+    reveal_key.set_valign(gtk::Align::Center);
+    elsewhere.append(&reveal_key);
+    host.append(&elsewhere);
     let tabs = &ui.note_tabs;
     if let Some(parent) = tabs.parent() {
         if let Ok(parent) = parent.downcast::<gtk::Box>() {
@@ -544,15 +566,28 @@ fn shell(ui: &Rc<Ui>) -> Rc<Shell> {
         row_menu,
         banner,
         banner_text,
+        elsewhere,
+        elsewhere_text,
+        elsewhere_target: Cell::new(0),
         welcome,
         rows: RefCell::new(Vec::new()),
         notes: RefCell::new(Vec::new()),
+        any_pinned: Cell::new(false),
+        picker_key: RefCell::new(String::new()),
         project: Cell::new(0),
         rail_applied: Cell::new(false),
     });
     SHELL.with(|s| *s.borrow_mut() = Some(shell.clone()));
     let weak_ui = Rc::downgrade(ui);
     let weak = Rc::downgrade(&shell);
+
+    let target = weak_ui.clone();
+    let source = weak.clone();
+    reveal_key.connect_clicked(move |_| {
+        if let (Some(ui), Some(shell)) = (target.upgrade(), source.upgrade()) {
+            reveal(&ui, shell.elsewhere_target.get());
+        }
+    });
 
     let target = weak_ui.clone();
     collapse.connect_clicked(move |_| {
@@ -591,7 +626,7 @@ fn shell(ui: &Rc<Ui>) -> Rc<Shell> {
             rows.get(row.index() as usize).is_some_and(|r| r.note["pinned"] == true)
         };
         let this = pinned(row);
-        let show = rows.iter().any(|r| r.note["pinned"] == true)
+        let show = shell.any_pinned.get()
             && before.is_none_or(|before| pinned(before) != this);
         if show {
             row.set_header(Some(&label(if this { "PINNED" } else { "NOTES" }, "notes-list-header")));
@@ -724,9 +759,24 @@ fn shell_error(ui: &Rc<Ui>, message: &str) {
     shell.banner.set_visible(true);
 }
 
+/// A library refresh failed: say so in the Notes banner once the shell is on screen (it may
+/// hold open notes), else in place of the "Opening Notes…" placeholder.
+pub(super) fn load_error(ui: &Rc<Ui>, message: &str) {
+    let page = &ui.pages["notes"];
+    match shell_if_built() {
+        Some(shell) if shell.root.parent().as_ref() == Some(page.upcast_ref::<gtk::Widget>()) => {
+            shell_error(ui, message)
+        }
+        _ => {
+            clear(page);
+            page.append(&label(message, "error"));
+        }
+    }
+}
+
 fn build_row(note: &Value) -> Row {
-    let title = text(note, "title");
-    let body = text(note, "body");
+    let (title, body) = (text::clean(text(note, "title")), text::clean(text(note, "body")));
+    let (title, body) = (title.as_ref(), body.as_ref());
     let id = note["id"].as_i64().unwrap_or(0);
     let row = gtk::ListBoxRow::new();
     row.add_css_class("notes-row");
@@ -735,7 +785,7 @@ fn build_row(note: &Value) -> Row {
     let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     dot.add_css_class("notes-dirty-dot");
     dot.set_valign(gtk::Align::Center);
-    dot.set_visible(doc_by_id(id).is_some_and(|d| d.dirty()));
+    dot.set_visible(doc_by_id(id).is_some_and(|d| d.shown_dirty()));
     dot.set_tooltip_text(Some("Unsaved changes"));
     top.append(&dot);
     let name = text::display_title(title, body);
@@ -784,6 +834,7 @@ fn render_rows(ui: &Rc<Ui>, shell: &Shell) {
         shell.list.append(row);
     }
     shell.count.set_text(&notes.len().to_string());
+    shell.any_pinned.set(notes.iter().any(|n| n["pinned"] == true));
     update_placeholder(shell);
     shell.list.invalidate_filter();
     shell.list.invalidate_headers();
@@ -820,7 +871,7 @@ pub(super) fn update_chrome(ui: &Rc<Ui>) {
     let (heading, title) = match current_doc(ui) {
         Some(doc) => {
             let name = doc.name();
-            if doc.dirty() {
+            if doc.shown_dirty() {
                 (format!("{name}  •"), format!("{name} • — Notes · Relay"))
             } else {
                 (name.clone(), format!("{name} — Notes · Relay"))
@@ -845,20 +896,118 @@ pub(super) fn dirty_changed(ui: &Rc<Ui>, id: i64, dirty: bool) {
         }
     }
     menu::sync(current_doc(ui).as_ref());
+    update_elsewhere(ui);
 }
 
 fn update_welcome(ui: &Rc<Ui>) {
     let Some(shell) = shell_if_built() else { return };
     let project = current_project(ui);
     let open = docs().iter().any(|d| {
-        (project == 0 || d.project == project) && ui.note_tabs.page_num(&d.draft.layout).is_some()
+        (project == 0 || d.project == project || d.orphan.get())
+            && ui.note_tabs.page_num(&d.draft.layout).is_some()
     });
     ui.note_tabs.set_visible(open);
     shell.welcome.set_visible(!open);
 }
 
+/// Tabs of other projects are hidden, so unsaved ones among them are named in a bar above
+/// the editor, whose Show key switches to the project and brings the note forward.
+fn update_elsewhere(ui: &Rc<Ui>) {
+    let Some(shell) = shell_if_built() else { return };
+    let shown = shell.project.get();
+    let hidden: Vec<Rc<Doc>> = docs()
+        .into_iter()
+        .filter(|d| d.project != shown && !d.orphan.get() && d.shown_dirty())
+        .collect();
+    shell.elsewhere.set_visible(!hidden.is_empty());
+    let Some(first) = hidden.first() else { return };
+    shell.elsewhere_target.set(first.id);
+    let named: Vec<String> = hidden
+        .iter()
+        .take(3)
+        .map(|d| format!("“{}” in {}", d.name(), project_name(ui, d.project)))
+        .collect();
+    let more = match hidden.len() {
+        n if n > 3 => format!(" and {} more", n - 3),
+        _ => String::new(),
+    };
+    shell
+        .elsewhere_text
+        .set_text(&format!("Unsaved changes in another project: {}{more}.", named.join(", ")));
+}
+
+/// Switch Notes to note `id`'s project and bring the note forward.
+fn reveal(ui: &Rc<Ui>, id: i64) {
+    let Some(doc) = doc_by_id(id) else { return };
+    FOCUS.with(|f| f.set(id));
+    super::notes_window::show_project(ui, doc.project);
+}
+
+/// `dead` was removed, its notes with it. Clean tabs of it close; tabs with unsaved text stay
+/// on screen whatever project is shown, so the text can be saved under another project or
+/// dropped, and the library empties when it was showing `dead`.
+pub(super) fn project_gone(ui: &Rc<Ui>, dead: i64) {
+    for doc in docs().into_iter().filter(|d| d.project == dead && !d.orphan.get()) {
+        if doc.draft.busy.get() || doc.dirty() {
+            doc.orphan.set(true);
+            doc.deleted.set(true);
+            doc::deleted_notice(ui, &doc);
+            doc.draft.layout.set_visible(true);
+            doc.refresh_state(ui);
+        } else {
+            doc.draft.close();
+        }
+    }
+    if let Some(doc) = doc_by_id(FOCUS.with(Cell::get)).filter(|d| d.orphan.get()) {
+        FOCUS.with(|f| f.set(0));
+        if let Some(page) = ui.note_tabs.page_num(&doc.draft.layout) {
+            ui.note_tabs.set_current_page(Some(page));
+        }
+    }
+    RESTORED.with(|r| r.borrow_mut().remove(&dead));
+    if SESSION.with(|s| s.borrow_mut().remove(&dead.to_string())).is_some() {
+        persist(ui);
+    }
+    if let Some(owner) = owner(ui) {
+        if owner.rendered_project.get() == dead {
+            owner.rendered_project.set(0);
+        }
+    }
+    if let Some(shell) = shell_if_built() {
+        if shell.project.get() == dead {
+            shell.project.set(0);
+            shell.notes.borrow_mut().clear();
+            render_rows(ui, &shell);
+        }
+        refresh_picker(ui, &shell, shell.project.get());
+    }
+    tabs_changed(ui);
+}
+
+/// The project picker, rebuilt only when it would show something new: a rebuild closes an
+/// open picker under the pointer.
+fn refresh_picker(ui: &Rc<Ui>, shell: &Shell, project: i64) {
+    let key = {
+        let mut key = project.to_string();
+        for p in ui.projects.borrow().iter() {
+            key.push_str(&format!("|{}:{}:{}", p["id"], p["workspace_id"], text(p, "name")));
+        }
+        for w in ui.workspaces.borrow().iter() {
+            key.push_str(&format!("|w{}:{}", w["id"], text(w, "name")));
+        }
+        key
+    };
+    if *shell.picker_key.borrow() == key {
+        return;
+    }
+    *shell.picker_key.borrow_mut() = key;
+    clear(&shell.picker);
+    shell.picker.append(&super::workspace_picker(ui, project, "notes"));
+}
+
 fn tabs_changed(ui: &Rc<Ui>) {
     update_welcome(ui);
+    update_elsewhere(ui);
     if let Some(shell) = shell_if_built() {
         select_active_row(ui, &shell);
     }
@@ -954,6 +1103,10 @@ pub fn edit(ui: &Rc<Ui>, note: Value) {
 pub(super) fn new_note(ui: &Rc<Ui>, title: Option<String>, body: String) {
     let project = current_project(ui);
     if project == 0 {
+        return;
+    }
+    if let Some(message) = doc::oversize(&body) {
+        shell_error(ui, &format!("Could not create a note: {message}"));
         return;
     }
     let mut payload = json!({"project_id":project,"body":body,"pinned":false});
@@ -1064,7 +1217,9 @@ pub(super) fn duplicate_id(ui: &Rc<Ui>, id: i64) {
 pub(super) fn delete_id(ui: &Rc<Ui>, id: i64) {
     let name = match doc_by_id(id) {
         Some(doc) => doc.name(),
-        None => listed(id).map_or_else(|| "this note".into(), |n| text::display_title(text(&n, "title"), text(&n, "body"))),
+        None => listed(id).map_or_else(|| "this note".into(), |n| {
+            text::display_title(&text::clean(text(&n, "title")), &text::clean(text(&n, "body")))
+        }),
     };
     confirm_delete(ui, id, name);
 }
@@ -1118,17 +1273,23 @@ pub fn workspace(ui: &Rc<Ui>, _name: &str, project: i64, notes: &[Value]) {
             }
         }
     }
-    clear(&shell.picker);
-    shell.picker.append(&super::workspace_picker(ui, project, "notes"));
-    *shell.notes.borrow_mut() = notes.to_vec();
+    refresh_picker(ui, &shell, project);
+    // Rebuilding every row loses keyboard focus and costs work in all note text: only when
+    // the library shows something new.
+    let fresh = changed || shell.notes.borrow().as_slice() != notes;
+    if fresh {
+        *shell.notes.borrow_mut() = notes.to_vec();
+    }
     for doc in docs() {
         let mine = doc.project == project;
-        doc.draft.layout.set_visible(mine);
+        doc.draft.layout.set_visible(mine || doc.orphan.get());
         if mine {
             doc::reconcile(ui, &doc, notes.iter().find(|n| n["id"].as_i64() == Some(doc.id)));
         }
     }
-    render_rows(ui, &shell);
+    if fresh {
+        render_rows(ui, &shell);
+    }
     let first_time = RESTORED.with(|r| r.borrow_mut().insert(project));
     if first_time {
         match &saved {
@@ -1167,6 +1328,14 @@ pub fn workspace(ui: &Rc<Ui>, _name: &str, project: i64, notes: &[Value]) {
                 ui.note_tabs.set_current_page(Some(page));
             }
         }
+    }
+    // The unsaved-elsewhere bar's Show key asked for this note.
+    if let Some(doc) = doc_by_id(FOCUS.with(Cell::get)).filter(|d| d.project == project) {
+        FOCUS.with(|f| f.set(0));
+        if let Some(page) = ui.note_tabs.page_num(&doc.draft.layout) {
+            ui.note_tabs.set_current_page(Some(page));
+        }
+        doc.view.grab_focus();
     }
     tabs_changed(ui);
     if let Some(owner) = owner {
@@ -1210,11 +1379,12 @@ pub fn note_row(ui: &Rc<Ui>, body: &gtk::Box, note: Value) {
     let row = gtk::Box::new(gtk::Orientation::Vertical, 6);
     row.add_css_class("record");
     let heading = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let name = text::clean(text(&note, "title"));
     let title = label(
-        if text(&note, "title").is_empty() {
+        if name.is_empty() {
             "Untitled"
         } else {
-            text(&note, "title")
+            &name
         },
         "title",
     );
@@ -1247,7 +1417,7 @@ pub fn note_row(ui: &Rc<Ui>, body: &gtk::Box, note: Value) {
     });
     heading.append(&pin);
     row.append(&heading);
-    let preview: String = text(&note, "body").chars().take(500).collect();
+    let preview: String = text::clean(text(&note, "body")).chars().take(500).collect();
     row.append(&paragraph(&preview));
     row.append(&label(
         if note["pinned"] == true {
@@ -1365,7 +1535,7 @@ fn module_detail(ui: &Rc<Ui>, module: Value) {
         move || json!({"name":name.text().trim(),"priority":chosen(&priority),"icon":if icon.text().trim().is_empty(){Value::Null}else{json!(icon.text().trim())}}),
     );
     let d = Draft::new(ui, "Module", module.clone(), snapshot, form);
-    d.controls(ui, "module.get", "module.update", "module_id", id);
+    d.controls(ui, "module.update", "module_id", id);
     for column in super::task_pages::COLUMNS {
         d.form.append(&label(
             &column.replace('_', " ").to_uppercase(),

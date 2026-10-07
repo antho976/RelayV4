@@ -264,7 +264,10 @@ pub fn layers(conn: &Connection, scope: ConfigScope) -> Result<Layers, BusError>
 }
 
 /// Deserialize and validate one effective tree.
-pub fn typed(root: Value) -> Result<GuardrailConfig, BusError> {
+pub fn typed(mut root: Value) -> Result<GuardrailConfig, BusError> {
+    // A stored key this build does not know — a newer build's, or one written before writes
+    // were checked — is ignored with a warning instead of failing every guardrail read.
+    crate::handlers::settings::ignore_unknown_guardrail_keys(&mut root);
     let cfg: GuardrailConfig = serde_json::from_value(root)
         .map_err(|e| BusError::invalid("guardrail.config", format!("invalid guardrail config: {e}")))?;
     validate_config(&cfg)?;

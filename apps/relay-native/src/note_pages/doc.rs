@@ -43,6 +43,9 @@ pub struct Doc {
     null_title: Rc<Cell<bool>>,
     pub deleted: Cell<bool>,
     pub conflict: Cell<bool>,
+    /// Its project was removed: the tab stays on screen whatever project is shown, and Save
+    /// as new note files the text under the project shown.
+    pub orphan: Cell<bool>,
     seen_remote: RefCell<String>,
     /// A result ("Replaced 3") the find count shows until the next search.
     find_note: RefCell<Option<String>>,
@@ -50,6 +53,23 @@ pub struct Doc {
     last_dirty: Cell<bool>,
     autosave_timer: RefCell<Option<glib::SourceId>>,
     count_timer: RefCell<Option<glib::SourceId>>,
+    state_idle: RefCell<Option<glib::SourceId>>,
+}
+
+/// The largest body this client sends. Replies and `notes.changed` events carry the whole
+/// body back over a socket that drops lines over 2 MiB, so a larger note could be stored but
+/// never read back here.
+pub const MAX_BODY: usize = 512 * 1024;
+
+/// Why `body` is refused, when it is over `MAX_BODY`.
+pub fn oversize(body: &str) -> Option<String> {
+    (body.len() > MAX_BODY).then(|| {
+        format!(
+            "This text is {} KB; a note holds at most {} KB. Move part of it into another note.",
+            body.len() / 1024,
+            MAX_BODY / 1024
+        )
+    })
 }
 
 type Action = (&'static str, fn(&Rc<Ui>, &Rc<Doc>));
@@ -99,7 +119,7 @@ pub fn build(ui: &Rc<Ui>, note: &Value) -> Rc<Doc> {
     let head = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     head.add_css_class("notes-doc-head");
     let title = gtk::Entry::builder()
-        .text(text(note, "title"))
+        .text(&*tx::clean(text(note, "title")))
         .placeholder_text("Untitled")
         .hexpand(true)
         .build();
@@ -142,7 +162,7 @@ pub fn build(ui: &Rc<Ui>, note: &Value) -> Rc<Doc> {
     }
     buffer.set_highlight_matching_brackets(false);
     buffer.begin_irreversible_action();
-    buffer.set_text(text(note, "body"));
+    buffer.set_text(&tx::clean(text(note, "body")));
     buffer.end_irreversible_action();
     buffer.place_cursor(&buffer.start_iter());
     let view = sourceview5::View::with_buffer(&buffer);
@@ -347,12 +367,14 @@ pub fn build(ui: &Rc<Ui>, note: &Value) -> Rc<Doc> {
         null_title,
         deleted: Cell::new(false),
         conflict: Cell::new(false),
+        orphan: Cell::new(false),
         seen_remote: RefCell::new(String::new()),
         find_note: RefCell::new(None),
         syncing: Cell::new(false),
         last_dirty: Cell::new(false),
         autosave_timer: RefCell::new(None),
         count_timer: RefCell::new(None),
+        state_idle: RefCell::new(None),
     });
     let weak_ui = Rc::downgrade(ui);
     let weak = Rc::downgrade(&doc);
@@ -500,6 +522,11 @@ impl Doc {
         self.draft.dirty()
     }
 
+    /// The dirty state the last `refresh_state` found, without copying the text again.
+    pub fn shown_dirty(&self) -> bool {
+        self.last_dirty.get()
+    }
+
     /// The tab and window name: the title, else the first line of text.
     pub fn name(&self) -> String {
         let title = self.title.text();
@@ -520,9 +547,9 @@ impl Doc {
     /// Replace the text with `note`, without an undo step, keeping the cursor nearby.
     pub fn load(&self, note: Value) {
         let offset = self.buffer.cursor_position();
-        self.title.set_text(text(&note, "title"));
+        self.title.set_text(&tx::clean(text(&note, "title")));
         self.buffer.begin_irreversible_action();
-        self.buffer.set_text(text(&note, "body"));
+        self.buffer.set_text(&tx::clean(text(&note, "body")));
         self.buffer.end_irreversible_action();
         let at = self.buffer.iter_at_offset(offset.min(self.buffer.char_count()));
         self.buffer.place_cursor(&at);
@@ -553,16 +580,29 @@ impl Doc {
         )));
     }
 
+    /// Typing, Replace all and undo emit 'changed' once per edit, and working out the state
+    /// copies the whole note, so that happens once per main-loop pass instead.
     fn changed(self: &Rc<Self>, ui: &Rc<Ui>) {
-        self.refresh_state(ui);
         self.schedule_counts();
-        self.schedule_autosave(ui);
+        if self.state_idle.borrow().is_some() {
+            return;
+        }
+        let (weak_ui, weak) = (Rc::downgrade(ui), Rc::downgrade(self));
+        *self.state_idle.borrow_mut() = Some(glib::idle_add_local_once(move || {
+            let (Some(ui), Some(doc)) = (weak_ui.upgrade(), weak.upgrade()) else { return };
+            doc.state_idle.borrow_mut().take();
+            let dirty = doc.refresh_state(&ui);
+            doc.arm_autosave(&ui, dirty);
+        }));
     }
 
-    pub fn refresh_state(&self, ui: &Rc<Ui>) {
+    /// Show the save state everywhere it appears; returns whether the note is dirty.
+    pub fn refresh_state(&self, ui: &Rc<Ui>) -> bool {
         let dirty = self.dirty();
         let (caption, class) = if self.draft.busy.get() {
             ("Saving…", "saving")
+        } else if self.orphan.get() {
+            ("Project removed", "warning")
         } else if self.deleted.get() {
             ("Deleted elsewhere", "warning")
         } else if self.conflict.get() {
@@ -592,13 +632,18 @@ impl Doc {
             super::dirty_changed(ui, self.id, dirty);
         }
         super::update_chrome(ui);
+        dirty
     }
 
     pub fn schedule_autosave(self: &Rc<Self>, ui: &Rc<Ui>) {
+        self.arm_autosave(ui, self.dirty());
+    }
+
+    fn arm_autosave(self: &Rc<Self>, ui: &Rc<Ui>, dirty: bool) {
         if let Some(timer) = self.autosave_timer.borrow_mut().take() {
             timer.remove();
         }
-        if !super::prefs().autosave || self.deleted.get() || self.conflict.get() || !self.dirty() {
+        if !super::prefs().autosave || self.deleted.get() || self.conflict.get() || !dirty {
             return;
         }
         let (weak_ui, weak) = (Rc::downgrade(ui), Rc::downgrade(self));
@@ -617,7 +662,7 @@ impl Doc {
     }
 
     pub fn stop_timers(&self) {
-        for timer in [&self.autosave_timer, &self.count_timer] {
+        for timer in [&self.autosave_timer, &self.count_timer, &self.state_idle] {
             if let Some(timer) = timer.borrow_mut().take() {
                 timer.remove();
             }
@@ -1122,9 +1167,13 @@ pub fn save(ui: &Rc<Ui>, doc: &Rc<Doc>, then: AfterSave) {
         }
         return;
     }
+    let next = (doc.draft.snapshot)();
+    if let Some(message) = oversize(text(&next, "body")) {
+        doc.show_notice(ui, &format!("Not saved: {message}"), Vec::new());
+        return;
+    }
     doc.draft.busy.set(true);
     doc.refresh_state(ui);
-    let next = (doc.draft.snapshot)();
     let base = doc.draft.base.borrow().clone();
     let mut payload = json!({
         "note_id": doc.id,
@@ -1142,7 +1191,7 @@ pub fn save(ui: &Rc<Ui>, doc: &Rc<Doc>, then: AfterSave) {
             Ok(note) => {
                 let forced = !next["title"].is_null() && note["title"] != next["title"];
                 if forced {
-                    doc.title.set_text(text(&note, "title"));
+                    doc.title.set_text(&tx::clean(text(&note, "title")));
                 }
                 doc.conflict.set(false);
                 doc.seen_remote.borrow_mut().clear();
@@ -1181,10 +1230,14 @@ pub fn save(ui: &Rc<Ui>, doc: &Rc<Doc>, then: AfterSave) {
     });
 }
 
-fn deleted_notice(ui: &Rc<Ui>, doc: &Rc<Doc>) {
+pub fn deleted_notice(ui: &Rc<Ui>, doc: &Rc<Doc>) {
     doc.show_notice(
         ui,
-        "This note was deleted somewhere else. Your text is still here; saving keeps it as a new note.",
+        if doc.orphan.get() {
+            "This note's project was removed. Your text is still here; saving keeps it as a new note in the project shown."
+        } else {
+            "This note was deleted somewhere else. Your text is still here; saving keeps it as a new note."
+        },
         vec![
             ("Save as new note", |ui, doc| save_as(ui, doc)),
             ("Close", |ui, doc| discard_close(ui, doc)),
@@ -1194,16 +1247,27 @@ fn deleted_notice(ui: &Rc<Ui>, doc: &Rc<Doc>) {
 
 /// Create a new note from the current text and put it in this tab's place.
 pub fn save_as(ui: &Rc<Ui>, doc: &Rc<Doc>) {
-    if doc.draft.busy.replace(true) {
+    if doc.draft.busy.get() {
         return;
     }
-    doc.refresh_state(ui);
     let snapshot = (doc.draft.snapshot)();
+    if let Some(message) = oversize(text(&snapshot, "body")) {
+        doc.show_notice(ui, &format!("Not saved: {message}"), Vec::new());
+        return;
+    }
+    // A removed project takes no notes: file the text under the project on screen.
+    let project = if doc.orphan.get() { super::current_project(ui) } else { doc.project };
+    if project == 0 {
+        doc.show_notice(ui, "Pick a project in the toolbar to save this text into.", Vec::new());
+        return;
+    }
+    doc.draft.busy.set(true);
+    doc.refresh_state(ui);
     let mut title = doc.name();
     if !doc.deleted.get() && snapshot["title"] == doc.draft.base.borrow()["title"] {
         title = format!("{title} (copy)");
     }
-    let payload = json!({"project_id":doc.project,"title":title,"body":snapshot["body"],"pinned":false});
+    let payload = json!({"project_id":project,"title":title,"body":snapshot["body"],"pinned":false});
     let (ui, doc) = (ui.clone(), doc.clone());
     glib::spawn_future_local(async move {
         let result = ui.call("notes.create", payload).await;
@@ -1211,8 +1275,22 @@ pub fn save_as(ui: &Rc<Ui>, doc: &Rc<Doc>) {
         match result {
             Ok(note) => {
                 let position = ui.note_tabs.page_num(&doc.draft.layout);
+                // The editor stayed open during the round trip: keep what was typed meanwhile
+                // (over the stored copy, so it shows as modified) and the cursor with it.
+                let current = (doc.draft.snapshot)();
+                let cursor = doc.buffer.cursor_position();
                 discard_close(&ui, &doc);
-                super::open_doc(&ui, note, position).view.grab_focus();
+                let fresh = super::open_doc(&ui, note, position);
+                if current["title"] != snapshot["title"] {
+                    fresh.title.set_text(text(&current, "title"));
+                }
+                if current["body"] != snapshot["body"] {
+                    fresh.buffer.begin_irreversible_action();
+                    fresh.buffer.set_text(text(&current, "body"));
+                    fresh.buffer.end_irreversible_action();
+                }
+                fresh.buffer.place_cursor(&fresh.buffer.iter_at_offset(cursor.min(fresh.buffer.char_count())));
+                fresh.view.grab_focus();
                 super::refresh_notes(&ui);
             }
             Err(error) => {

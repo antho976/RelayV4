@@ -12,9 +12,9 @@ call, and compare the numbers. Fix one cause at a time. Python for the fixes:
 | Asset 100x too big (height ratio ~100) | mesh modelled in cm-sized BU (180 BU human) at `scale_length` 1.0, or an object scale of 100 left unapplied | scale the data to metres (apply scale), keep `scale_length` 1.0; check sizes in `blender_info` |
 | Asset 100x too small (ratio ~0.01) | object scale 0.01 left from an FBX import; `apply_unit_scale` overridden off; `scale_length` 0.01 with metre-sized geometry | apply the object scale; restore default export options; set `scale_length` 1.0 only after the geometry is truly metre-sized |
 | Ratio neither ~1 nor x100 | unapplied object scale; Import Uniform Scale set in Unreal; bounds include a stray far-away vertex or empty | apply scale; reset the import scale; delete loose geometry; export with `objects` |
-| `root_bone_scale` not 1 | armature object scale not applied (0.01 or 100 after a round-trip) | apply the armature scale with its animation (rig recipes: scales location keys too), export with the default `FBX_SCALE_ALL` |
+| `root_bone_scale` not 1 | armature object scale not applied (0.01 or 100 after a round-trip) | apply the armature scale with its animation (`rig-recipes.md`, "Apply an armature's scale, with its animation": it scales the location keys too), export with the default `FBX_SCALE_ALL` |
 | Animations grow or shrink the character | scale keys on bones, or a root bone scale | remove bone scale fcurves unless intended; fix the root scale as above |
-| Character correct, animations move it 100x too far | location keys not rescaled after applying the armature scale | scale the `pose.bones[...].location` keys by the same factor (rig recipes) |
+| Character correct, animations move it 100x too far | location keys not rescaled after applying the armature scale | scale the `pose.bones[...].location` keys by the same factor (the same `rig-recipes.md` section) |
 
 ## Facing, axes, mirroring
 
