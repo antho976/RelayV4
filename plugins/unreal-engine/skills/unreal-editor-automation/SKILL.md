@@ -265,8 +265,10 @@ These cost hours once. Check here before debugging them again.
 **Editor process and Remote Control**
 - *Remote Control needs project settings.* `ue_setup_check {"fix": true}` adds the bridge
   plugins to the `.uproject` and writes `Config/DefaultRemoteControl.ini` (web server at start-up,
-  remote Python, console commands, remote function calls; keys are checked against the engine's
-  own `RemoteControlSettings.h`). Restart the editor afterwards.
+  remote Python, remote function calls; keys are checked against the engine's own
+  `RemoteControlSettings.h`). Restart the editor afterwards. That file is shared project
+  config: committed, it makes every teammate's editor serve unauthenticated remote Python on
+  localhost, so commit it only with the team's agreement.
 - *Quitting takes a while.* `ue_editor_quit` saves, asks the editor to quit, sends a terminate
   signal if it is still running 20 s later, and reports a `timing` breakdown (save and request,
   signal, exit, port free) so a slow step can be named. When the editor does not answer Remote

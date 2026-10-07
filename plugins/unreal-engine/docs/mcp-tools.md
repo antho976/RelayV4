@@ -6,6 +6,11 @@ up to three folders deep, skipping `Binaries`, `Intermediate`, `Saved`, `Derived
 
 Every tool returns JSON. A failure comes back as a tool error with a message that says what to do.
 
+Replies are bounded. An editor reply over 64 MB is not read; the tool fails and asks for less
+output (a summary, or data written to a file in the project). `ue_call` and `ue_property` results,
+and `ue_python`'s `result`, longer than 60,000 bytes of JSON come back as `truncated: true` with
+the first 60,000 bytes in `json_head`.
+
 ## Offline tools
 
 ### `ue_project_info` — `{}`
@@ -17,7 +22,8 @@ and the log path. **Call it first in every task.**
 
 ### `ue_setup_check` — `{ fix?: bool }`
 With `fix`, also writes `Config/DefaultRemoteControl.ini` (web server at start-up, remote Python,
-console commands, remote function calls), checking each key against the engine's
+remote function calls; not remote console commands, since `ue_console` runs through Python),
+checking each key against the engine's
 `RemoteControlSettings.h` when the engine source is present, and turns *Use Less CPU when in
 Background* off for good: `bThrottleCPUWhenNotForeground=False` in
 `Config/DefaultEditorPerProjectUserSettings.ini`, in any `Saved/Config/*/EditorPerProjectUserSettings.ini`
@@ -25,22 +31,31 @@ that already holds the key (it overrides the default), and in the running editor
 writes back on quitting is the same. Without `fix`, `background_throttle.was_on` reports the
 running editor's value and `advice` says when it is on.
 
+`DefaultRemoteControl.ini` is shared project config, and `advice` says so when `fix` changed it:
+once committed, every teammate's editor serves unauthenticated remote Python on localhost.
+Commit it only with the team's agreement, or set a passphrase (and `UE_REMOTE_CONTROL_PASSPHRASE`).
+
 Whether *RemoteControl*, *PythonScriptPlugin* and *EditorScriptingUtilities* are enabled in the
 `.uproject`, whether the editor answers, whether remote Python runs, and a list of `advice` steps.
 `fix: true` adds the missing plugins to the `.uproject` (tab-indented, other fields untouched).
 
-### `ue_build` — `{ target?, platform?, configuration?, timeout_s?, restart_editor?, save?, force?, allow_editor_open?, keep_crash_reporters? }`
+### `ue_build` — `{ target?, platform?, configuration?, timeout_s?, restart_editor?, save?, force?, launch_timeout_s?, allow_editor_open?, keep_crash_reporters? }`
 `restart_editor` saves and quits the editor, builds, relaunches it and waits until it answers
 (the C++ loop on Linux, which has no Live Coding). The quit is `ue_editor_quit`'s, `save` and
-`force` included, so it refuses rather than lose unsaved work. Before building it stops leftover
-CrashReportClient processes and refuses while the editor runs; afterwards it warns when
-`UnrealEditor.modules` names a numbered hot-reload module. The engine is found without `UE_ROOT`
+`force` included, so it refuses rather than lose unsaved work. `launch_timeout_s` (default 900)
+is how long it waits for the relaunched editor to answer. A relaunch that fails is reported as
+`relaunch_error` beside the build's own result, which still stands; a successful one is in
+`relaunched_editor`. Before building it stops this project's leftover CrashReportClient processes
+(those whose command line names a path in the project; `keep_crash_reporters` leaves them) and
+refuses while the editor runs. Other projects' crash reporters are never stopped: they may be a
+crash dialog still waiting on someone, so a warning lists them (`other_crash_reporters`).
+Afterwards it warns when `UnrealEditor.modules` names a numbered hot-reload module. The engine is found without `UE_ROOT`
 from a running editor, the project log, a surrounding source tree, `Install.ini` or common folders.
 
 Runs `Engine/Build/BatchFiles/<Linux|Mac>/Build.sh` (or `Build.bat`) with
 `<target> <platform> <configuration> -Project=<uproject> -WaitMutex -FromMsBuild`.
 Defaults: the `*Editor` target, the host platform, `Development`, one hour. Returns `success`,
-`exit_code`, extracted `errors`, the last 150 lines and the exact command.
+`exit_code`, extracted `errors`, `warnings`, the last 150 lines and the exact command.
 
 ### `ue_log` — `{ lines?, filter?, file? }`
 The tail of `Saved/Logs/<Project>.log` (or another file in `Saved/Logs`), optionally filtered by a
@@ -94,7 +109,7 @@ Actors of the open level with label, class, object path, outliner folder and loc
 ### `ue_console` — `{ command }`
 Runs a console command in the editor world. Output lands in the log; read it with `ue_log`.
 
-### `ue_editor_launch` — `{ timeout_s?, extra_args? }` and `ue_editor_quit` — `{ save?, force? }`
+### `ue_editor_launch` — `{ timeout_s?, extra_args?, keep_background_throttle? }` and `ue_editor_quit` — `{ save?, force? }`
 Launch waits for the Remote Control port to be free, starts the editor with `-RCWebControlEnable`
 (and with "Use Less CPU when in Background" overridden off unless `keep_background_throttle`),
 and waits until Remote Control answers, failing early on a bind error in the new log. The editor
@@ -142,7 +157,8 @@ saves dirty packages) names it in its result so the rewrite can be reverted.
 Headless by default: runs `UnrealEditor-Cmd` on the project with
 `-ExecCmds="Automation RunTests <filter>;Quit" -nullrhi -unattended` and a report folder, and
 returns each test's state and error/warning messages. `in_editor: true` runs the tests in the open
-editor and reads the results from the log.
+editor and reads the results from the log. `filter` is a test path prefix; `;`, `"` and `,` are
+refused, so join several prefixes with `+` (`MyGame.A+MyGame.B`).
 
 ### `ue_profile` — `{ seconds?, warmup?, play?, console? }`
 Starts Play In Editor (unless `play: false`), waits `warmup` seconds, records `csvprofile` for
@@ -160,7 +176,8 @@ engine version, build configuration and the tail of its log. Works without the e
 Parent class and Asset Registry tags, variables (with default values) and functions/events that
 the Blueprint adds over its native parent, components, and event-graph nodes where the engine
 exposes them to Python (the `notes` say what could not be read). `compile: true` compiles and adds
-the compiler's log lines.
+the compiler's log lines. Because of `compile`, the tool is not marked read-only, and a compiling
+call takes the editor lock.
 
 ### `ue_asset_audit` — `{ path?, checks?, limit? }`
 Textures (non-power-of-two, over 4096, normal maps without Normalmap compression, masks in sRGB,

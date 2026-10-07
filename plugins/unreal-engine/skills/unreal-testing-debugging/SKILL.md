@@ -281,7 +281,8 @@ client; forward to the server with a Server RPC (`unreal-multiplayer`).
 
 - `ue_run_tests {filter}` runs automation tests headless (a separate editor process, safe while the
   human's editor is open) and returns pass/fail per test with messages; `in_editor: true` runs them
-  in the open editor instead.
+  in the open editor instead. `filter` is a test path prefix; join several with `+`
+  (`MyGame.A+MyGame.B`), since `,` is refused.
 - `ue_play` plays the game in the editor for N seconds, takes screenshots, runs a Python probe
   against the game world at checkpoints, and returns the log lines produced while playing
   (errors, warnings, ensures, "Accessed None"). Use it to reproduce runtime bugs and to prove fixes.
