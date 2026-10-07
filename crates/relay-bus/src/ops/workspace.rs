@@ -1,6 +1,6 @@
 //! `workspace.*` / `project.*` — BUS.md §10.4. All mutations user-only.
 use crate::registry::{Actors, OpMeta, Scope, Undo};
-use crate::types::{Column, Id, LocalRepo, Project, Workspace};
+use crate::types::{Column, Id, LocalRepo, Project, Ts, Workspace};
 use crate::{op, Empty};
 use std::collections::BTreeMap;
 
@@ -60,7 +60,37 @@ payload!(#[schemars(rename = "ProjectRemoveIn")] ProjectRemoveIn {
 result!(#[schemars(rename = "ProjectRemoveOut")] ProjectRemoveOut { pub sessions_closed: i64, pub runs_stopped: i64 });
 op!(ProjectRemove, "project.remove", ProjectRemoveIn => ProjectRemoveOut,
     OpMeta::mutation(Scope::Project, 1, "Forget a project (repository untouched); conflict if live sessions unless force closes them").actors(Actors::UserOnly).emits(&["project.deleted", "session.changed", "worktree.changed", "run.changed"]));
+payload!(#[schemars(rename = "ProjectRelinkIn")] ProjectRelinkIn {
+    pub project_id: Id,
+    /// The repository's new root: absolute, a git repository, no other project's path, and inside
+    /// a workspace (the project moves to the innermost one that contains it).
+    pub path: String,
+});
+op!(ProjectRelink, "project.relink", ProjectRelinkIn => Project,
+    OpMeta::mutation(Scope::Project, 1, "Point a project at its repository's new location; conflict while it has open sessions").actors(Actors::UserOnly).undo(Undo::Inverse).emits(&["project.changed"]));
+payload!(#[schemars(rename = "ProjectRemovePreviewIn")] ProjectRemovePreviewIn { pub project_id: Option<Id>, pub workspace_id: Option<Id> });
+result!(#[schemars(rename = "ProjectRemovePreviewOut")] ProjectRemovePreviewOut { pub projects: i64, pub tasks: i64, pub notes: i64, pub modules: i64 });
+op!(ProjectRemovePreview, "project.remove.preview", ProjectRemovePreviewIn => ProjectRemovePreviewOut,
+    OpMeta::query(Scope::Global, 1, "What removing a project (or a workspace's projects) would delete: task, note and module counts").actors(Actors::UserOnly));
+result!(#[schemars(rename = "RemovedProject")] RemovedProject {
+    /// The backup to pass to `project.restore`: the newest one that still holds the project.
+    pub backup_path: String, pub created_at: Ts, pub reason: String,
+    pub project_id: Id, pub workspace_id: Id, pub name: String, pub path: String,
+});
+result!(#[schemars(rename = "ProjectRemovedListOut")] ProjectRemovedListOut { pub removed: Vec<RemovedProject> });
+op!(ProjectRemovedList, "project.removed.list", Empty => ProjectRemovedListOut,
+    OpMeta::query(Scope::Global, 1, "Removed projects that a removal backup can still restore").actors(Actors::UserOnly));
+payload!(#[schemars(rename = "ProjectRestoreIn")] ProjectRestoreIn {
+    /// A file in the store's `backups/` directory, as `project.removed.list` or the removal's
+    /// `project.deleted` event names it.
+    pub backup_path: String,
+    pub project_id: Id,
+});
+result!(#[schemars(rename = "ProjectRestoreOut")] ProjectRestoreOut { pub project: Project, pub tasks: i64, pub notes: i64, pub modules: i64, pub workspace_restored: bool });
+op!(ProjectRestore, "project.restore", ProjectRestoreIn => ProjectRestoreOut,
+    OpMeta::mutation(Scope::Global, 1, "Bring a removed project's board, notes and modules back from its removal backup").actors(Actors::UserOnly).emits(&["project.changed", "workspace.changed"]));
 result!(#[schemars(rename = "ProjectStatsOut")] ProjectStatsOut { pub tasks_by_column: BTreeMap<Column, i64>, pub sessions_live: i64, pub sessions_idle: i64, pub worktrees: i64, pub disk_mb: f64 });
 op!(ProjectStats, "project.stats", ProjectGetIn => ProjectStatsOut, OpMeta::query(Scope::Project, 9, "Sidebar numbers for one project"));
 
-entries!(WsCreate, WsDiscover, WsList, WsUpdate, WsRemove, ProjectAdd, ProjectClone, ProjectList, ProjectGet, ProjectUpdate, ProjectRemove, ProjectStats);
+entries!(WsCreate, WsDiscover, WsList, WsUpdate, WsRemove, ProjectAdd, ProjectClone, ProjectList, ProjectGet, ProjectUpdate, ProjectRemove, ProjectStats,
+    ProjectRelink, ProjectRemovePreview, ProjectRemovedList, ProjectRestore);

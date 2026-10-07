@@ -484,6 +484,10 @@ impl Ui {
                 ("trash", "Remove project…", true, Rc::new(move |ui: &Rc<Ui>| ui.confirm_registry_remove(&remove, false, None))),
             ]
         };
+        // A repository that moved: point the project at its new place instead of removing it.
+        if !workspace && !std::path::Path::new(text(value, "path")).exists() {
+            entries.push(("folder", "Relink…", false, Rc::new(move |ui: &Rc<Ui>| ui.relink_project(id))));
+        }
         entries.sort_by_key(|entry| entry.2);
         let mut separated = false;
         for (icon, caption, danger, action) in entries {
@@ -572,6 +576,28 @@ impl Ui {
         } else {
             "Their worktrees and branches stay on disk. Repository files are never touched."
         };
+        // What goes for good, counted by the engine once the dialog is up.
+        if !projects.is_empty() {
+            let content = paragraph(if workspace { "Their tasks, notes and modules are deleted from Relay." } else { "Its tasks, notes and modules are deleted from Relay." });
+            facts.append(&content);
+            let weak = Rc::downgrade(self);
+            let payload = if workspace { json!({"workspace_id": id}) } else { json!({"project_id": id}) };
+            let content = content.downgrade();
+            glib::spawn_future_local(async move {
+                let Some(ui) = weak.upgrade() else { return };
+                let Ok(counts) = ui.call("project.remove.preview", payload).await else { return };
+                let Some(content) = content.upgrade() else { return };
+                let n = |key: &str| counts[key].as_u64().unwrap_or(0) as usize;
+                let (tasks, notes, modules) = (n("tasks"), n("notes"), n("modules"));
+                content.set_text(&if tasks + notes + modules == 0 {
+                    format!("{} no tasks, notes or modules.", if workspace { "They have" } else { "It has" })
+                } else {
+                    format!("{} {}, {} and {} are deleted from Relay.", if workspace { "Their" } else { "Its" },
+                        plural(tasks, "task", "tasks"), plural(notes, "note", "notes"), plural(modules, "module", "modules"))
+                });
+            });
+            facts.append(&paragraph("Relay backs up its store first, so they can be restored from that backup."));
+        }
         let disk = paragraph(keep);
         facts.append(&disk);
         body.append(&facts);
@@ -660,6 +686,24 @@ impl Ui {
         dialog.centered(420);
         dialog.present();
         cancel.grab_focus();
+    }
+
+    /// Ask where the project's repository is now and relink it there (`project.relink`).
+    fn relink_project(self: &Rc<Self>, id: i64) {
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let Some(ui) = weak.upgrade() else { return };
+            let dialog = gtk::FileDialog::builder().title("Where is this repository now?").build();
+            let Ok(file) = dialog.select_folder_future(Some(&ui.window)).await else { return };
+            let Some(path) = file.path() else { return };
+            match ui.call("project.relink", json!({"project_id": id, "path": path})).await {
+                Ok(_) => {
+                    ui.registry_dirty.set(true);
+                    ui.refresh();
+                }
+                Err(e) => ui.show_error(&e.to_string()),
+            }
+        });
     }
 
     /// Forget removed rows at once and move the wall off a removed project, to its nearest
