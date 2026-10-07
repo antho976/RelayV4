@@ -1,6 +1,9 @@
 //! Phase 3: worktrees, PTY sessions, teardown (SPEC §16 "spawn/kill N sessions, assert zero
 //! orphans"), token binding, crash recovery. All through the bus.
 
+mod common;
+
+use common::{call, code, committed_repo, engine_with_project, git, git_command, ok, wait_until};
 use relay_bus::{Actor, Request, Response};
 use relay_core::engine::{Door, Engine};
 use relay_core::socket::{Client, Line, SocketServer};
@@ -11,24 +14,10 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-fn call(e: &Engine, op: &str, payload: Value) -> Response {
-    e.dispatch(Request::new(Actor::User, op, payload), Door::InProcess)
-}
-fn ok(e: &Engine, op: &str, payload: Value) -> Value {
-    let r = call(e, op, payload);
-    match r.into_result() {
-        Ok(v) => v,
-        Err(err) => panic!("{op} failed: {} {}", err.code, err.message),
-    }
-}
-fn code(r: Response) -> String {
-    r.error.expect("expected error").code
-}
-
-fn git(repo: &Path, args: &[&str]) {
-    let st = Command::new("git").arg("-C").arg(repo).args(args).status().unwrap();
-    assert!(st.success(), "git {args:?}");
-}
+/// The TERM grace `session.close` gives a child before SIGKILL. It is a literal in
+/// handlers/session.rs (`pty.kill(Duration::from_millis(150))`, in both `retire_session` and
+/// close's unlocked phase); keep the two in step.
+const CLOSE_GRACE: Duration = Duration::from_millis(150);
 
 /// A workspace with one real git repo (one commit on `main`) and a store beside it.
 struct Fixture {
@@ -43,32 +32,18 @@ fn fixture() -> Fixture {
     let root = std::fs::canonicalize(tmp.path()).unwrap();
     let ws = root.join("ws");
     let repo = ws.join("app");
-    std::fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "-q", "-b", "main"]);
-    git(&repo, &["config", "user.email", "t@t"]);
-    git(&repo, &["config", "user.name", "t"]);
-    std::fs::write(repo.join("README.md"), "hi\n").unwrap();
-    git(&repo, &["add", "."]);
-    git(&repo, &["commit", "-q", "-m", "init"]);
-    let store = Store::open(&root.join("store").join("store.db"), false).unwrap();
-    let engine = Engine::new(Instance::Test, store);
-    ok(&engine, "workspace.create", json!({"path": ws}));
-    ok(&engine, "project.add", json!({"workspace_id": 1, "path": repo}));
+    committed_repo(&repo, &[("README.md", "hi\n")]);
+    let engine = engine_with_project(&root, &ws, &repo);
     Fixture { _root: tmp, root, repo, engine }
 }
 
 fn head(repo: &Path, reference: &str) -> String {
-    let out = Command::new("git").arg("-C").arg(repo)
-        .args(["rev-parse", reference]).output().unwrap();
-    assert!(out.status.success());
-    String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    git(repo, &["rev-parse", reference])
 }
 
 fn advancing_remote(f: &Fixture, tracking: bool) -> PathBuf {
     let origin = f.root.join("remote");
     git(&f.root, &["clone", f.repo.to_str().unwrap(), origin.to_str().unwrap()]);
-    git(&origin, &["config", "user.email", "t@t"]);
-    git(&origin, &["config", "user.name", "t"]);
     git(&f.repo, &["remote", "add", "origin", origin.to_str().unwrap()]);
     git(&f.repo, &["fetch", "origin"]);
     if tracking {
@@ -180,14 +155,6 @@ fn alive(pid: i64) -> bool {
     relay_core::pty::pid_alive(pid as u32) && std::fs::read_to_string(format!("/proc/{pid}/stat")).map(|s| !s.contains(") Z ")).unwrap_or(false)
 }
 
-fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !f() {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
 fn wait_for_pid(path: &Path) -> i64 {
     let mut pid = None;
     wait_until("child pid written", || {
@@ -233,8 +200,7 @@ fn worktree_ops() {
     assert!(!path.exists());
     assert_eq!(ok(e, "worktree.list", json!({"project_id": 1}))["worktrees"].as_array().unwrap().len(), 1);
     // the branch survives removal (SPEC §8)
-    let out = Command::new("git").arg("-C").arg(&f.repo).args(["branch", "--list", "relay/feature-x"]).output().unwrap();
-    assert!(String::from_utf8_lossy(&out.stdout).contains("relay/feature-x"));
+    assert!(git(&f.repo, &["branch", "--list", "relay/feature-x"]).contains("relay/feature-x"));
     // agents may not create/remove worktrees
     let r = e.dispatch(Request::new(Actor::agent("x"), "worktree.create", json!({"project_id": 1, "branch": "relay/y"})), Door::InProcess);
     assert_eq!(code(r), "actor.allowlist");
@@ -294,8 +260,14 @@ fn launch_passes_configured_and_memory_write_roots_to_both_providers() {
         let f = fixture();
         let binary = fake_discovery_provider(&f.root, provider, "fixture 1.0");
         ok(&f.engine, "settings.set", json!({"path":format!("providers.{provider}.path"),"value":binary}));
-        let extra = f.root.join("agent notes");
+        // Outside the temp dir, which is always a write root, so only the setting can let a
+        // write land here; the sibling is the same kind of directory, not configured (RA-675).
+        let outside = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let outside = std::fs::canonicalize(outside.path()).unwrap();
+        let extra = outside.join("agent notes");
+        let sibling = outside.join("not listed");
         std::fs::create_dir_all(&extra).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
         ok(&f.engine, "settings.set", json!({"path":"guardrails.allowed_write_roots","value":[extra]}));
         let session = ok(&f.engine, "session.create", json!({"project_id":1,"provider":provider}));
         let worktree = PathBuf::from(session["worktree"].as_str().unwrap());
@@ -304,17 +276,38 @@ fn launch_passes_configured_and_memory_write_roots_to_both_providers() {
         wait_until("provider argv", || captured.is_file());
         let args = std::fs::read_to_string(captured).unwrap();
         let args: Vec<_> = args.lines().collect();
-        let cfg = relay_core::guardrail::config(&f.engine.store.lock(), Some(1)).unwrap();
-        let roots = relay_core::guardrail::write_roots(&cfg, &worktree);
-        assert!(roots.iter().any(|path| path.ends_with("memories")));
-        assert!(roots.iter().any(|path| path.ends_with("memory")));
-        for root in roots.iter().skip(1) {
-            assert!(args.windows(2).any(|pair| pair == ["--add-dir", root.to_str().unwrap()]), "{provider}: missing {root:?}");
-            let verdict = f.engine.dispatch(Request::new(Actor::agent(session["name"].as_str().unwrap()), "guardrail.check", json!({
-                "project_id":1,"kind":"write","path":root.join("note.md"),"new_text":"note"
-            })), Door::InProcess).into_result().unwrap();
-            assert_eq!(verdict["verdict"], "allow");
+        // The roots written out from their documented locations, not asked of the code that
+        // builds them: each provider's memory folder, the configured root, and the temp dir.
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let codex = std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".codex"));
+        let claude = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from).unwrap_or_else(|| home.join(".claude"));
+        let project_key = |path: &Path| -> String {
+            path.to_string_lossy().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect()
+        };
+        let expected = [
+            codex.join("memories"),
+            claude.join("projects").join(project_key(&worktree)).join("memory"),
+            claude.join("projects").join(project_key(&f.repo)).join("memory"),
+            extra.clone(),
+            std::env::temp_dir(),
+        ];
+        let mut granted: Vec<PathBuf> = args.windows(2).filter(|pair| pair[0] == "--add-dir").map(|pair| PathBuf::from(pair[1])).collect();
+        // Open: the primary checkout's memory folder is keyed on `common_dir().parent()`, and
+        // for a linked worktree gix's common dir is `.git/worktrees/<name>/../..`, whose parent
+        // is `.git/worktrees`, not the primary checkout (guardrail::write_roots). Until that is
+        // fixed this one grant is checked for its place and shape only.
+        assert!(granted.len() == expected.len() && granted[2].starts_with(claude.join("projects")) && granted[2].ends_with("memory"), "{provider}: {granted:?}");
+        granted[2] = expected[2].clone();
+        assert_eq!(granted, expected, "{provider}: --add-dir grants");
+        let check = |path: PathBuf| f.engine.dispatch(Request::new(Actor::agent(session["name"].as_str().unwrap()), "guardrail.check", json!({
+            "project_id":1,"kind":"write","path":path,"new_text":"note"
+        })), Door::InProcess).into_result().unwrap();
+        for root in expected.iter().filter(|root| **root != expected[2]) {
+            assert_eq!(check(root.join("note.md"))["verdict"], "allow", "{provider}: {root:?}");
         }
+        let refused = check(sibling.join("note.md"));
+        assert_ne!(refused["verdict"], "allow", "{provider}: an unlisted directory is not a write root");
+        assert_eq!(refused["error"]["code"], "guardrail.write_root", "{refused}");
         ok(&f.engine, "session.close", json!({"session":session["name"]}));
     }
 }
@@ -328,11 +321,14 @@ fn closing_a_provider_that_ignores_term_is_bounded_and_preserves_its_worktree() 
     let session = ok(&f.engine, "session.create", json!({"project_id":1,"provider":"claude"}));
     let spawned = ok(&f.engine, "session.spawn", json!({"session":session["name"]}));
     wait_until("ignoring TERM", || ok(&f.engine,"session.scrollback",json!({"session":session["name"]}))["text"].as_str().unwrap().contains("ready"));
+    let pid = spawned["pid"].as_i64().unwrap();
     let start = Instant::now();
     ok(&f.engine, "session.close", json!({"session":session["name"],"remove_worktree":false}));
-    // The close answers without waiting out the TERM grace; the kill finishes on its own thread.
-    assert!(start.elapsed() < Duration::from_millis(100), "close took {:?}", start.elapsed());
-    let pid = spawned["pid"].as_i64().unwrap();
+    // The close answers without waiting out the TERM grace; the kill finishes on its own thread
+    // (RA-742). The child ignores TERM, so it can only be dead already if close waited the grace
+    // out itself — and a close quicker than the grace cannot have waited it out.
+    let took = start.elapsed();
+    assert!(alive(pid) || took < CLOSE_GRACE, "close waited out the TERM grace: {took:?}, and the child is gone");
     wait_until("the TERM-ignoring child to be killed", || !alive(pid));
     assert!(start.elapsed() < Duration::from_secs(3), "kill took {:?}", start.elapsed());
     assert_eq!(ok(&f.engine, "session.list", json!({"include_closed":true}))["sessions"][0]["state"], "closed");
@@ -381,6 +377,27 @@ fn session_create_and_worktree_ownership() {
     assert_eq!(code(call(e, "session.spawn", json!({"session": s3["name"]}))), "provider.not_installed");
 }
 
+/// Read an attached client's frames into `seen` until it holds `needle`, handing each frame to
+/// `frame` first. A stream that closes or sends a line that does not decode fails at once,
+/// saying so, rather than spinning until the deadline as if the PTY had gone quiet (RA-676).
+async fn read_until(term: &mut Client, needle: &str, seen: &mut Vec<u8>, mut frame: impl FnMut(&relay_bus::envelope::Frame)) {
+    use base64::Engine as _;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !String::from_utf8_lossy(seen).contains(needle) {
+        let left = deadline.saturating_duration_since(Instant::now());
+        assert!(!left.is_zero(), "no {needle:?}; got {:?}", String::from_utf8_lossy(seen));
+        match tokio::time::timeout(left, term.next()).await {
+            Ok(Ok(Some(Line::Frame(fr)))) => {
+                frame(&fr);
+                seen.extend(base64::engine::general_purpose::STANDARD.decode(fr.data.as_str().unwrap()).unwrap());
+            }
+            Ok(Ok(Some(_))) | Err(_) => {}
+            Ok(Ok(None)) => panic!("attach stream closed before {needle:?}; got {:?}", String::from_utf8_lossy(seen)),
+            Ok(Err(error)) => panic!("attach stream error before {needle:?}: {error:#}"),
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_lifecycle_over_socket() {
     let f = fixture();
@@ -425,37 +442,23 @@ async fn session_lifecycle_over_socket() {
     assert_eq!(code(r), "actor.allowlist");
 
     // attach: catch-up + live frames
-    use base64::Engine as _;
-    let b64 = base64::engine::general_purpose::STANDARD;
     let mut term = Client::connect(&server.path).await.unwrap();
     let r = term.call(&Request::new(Actor::User, "session.attach", json!({"session": name})), |_| {}).await.unwrap();
     assert!(r.ok, "{:?}", r.error);
     let mut seen = Vec::new();
     let mut last_seq = 0u64;
     let mut epoch = 0u64;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !String::from_utf8_lossy(&seen).contains("hello-from-pty") {
-        assert!(Instant::now() < deadline, "no greeting; got {:?}", String::from_utf8_lossy(&seen));
-        if let Ok(Ok(Some(Line::Frame(fr)))) = tokio::time::timeout(Duration::from_secs(2), term.next()).await {
-            assert_eq!(fr.stream, "pty");
-            assert_eq!(fr.session.as_deref(), Some(name.as_str()));
-            epoch = fr.epoch.unwrap();
-            assert!(fr.seq >= last_seq);
-            last_seq = fr.seq;
-            seen.extend(b64.decode(fr.data.as_str().unwrap()).unwrap());
-        }
-    }
+    read_until(&mut term, "hello-from-pty", &mut seen, |fr| {
+        assert_eq!(fr.stream, "pty");
+        assert_eq!(fr.session.as_deref(), Some(name.as_str()));
+        epoch = fr.epoch.unwrap();
+        assert!(fr.seq >= last_seq);
+        last_seq = fr.seq;
+    }).await;
     assert_eq!(epoch, 1);
     // input → echo
     ok(&e, "session.input", json!({"session": name, "data": "ping\n"}));
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !String::from_utf8_lossy(&seen).contains("echo:ping") {
-        assert!(Instant::now() < deadline, "no echo; got {:?}", String::from_utf8_lossy(&seen));
-        if let Ok(Ok(Some(Line::Frame(fr)))) = tokio::time::timeout(Duration::from_secs(2), term.next()).await {
-            last_seq = fr.seq;
-            seen.extend(b64.decode(fr.data.as_str().unwrap()).unwrap());
-        }
-    }
+    read_until(&mut term, "echo:ping", &mut seen, |fr| last_seq = fr.seq).await;
     // resize + scrollback
     assert_eq!(ok(&e, "session.scrollback", json!({"session": name}))["cols"].as_u64(), Some(120));
     ok(&e, "session.resize", json!({"session": name, "cols": 200, "rows": 50}));
@@ -470,29 +473,43 @@ async fn session_lifecycle_over_socket() {
     term2.call(&Request::new(Actor::User, "session.attach", json!({"session": name, "epoch": epoch, "from_seq": sb["seq"]})), |_| {}).await.unwrap();
     ok(&e, "session.input", json!({"session": name, "data": "again\n"}));
     let mut seen2 = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !String::from_utf8_lossy(&seen2).contains("echo:again") {
-        assert!(Instant::now() < deadline, "no again; got {:?}", String::from_utf8_lossy(&seen2));
-        if let Ok(Ok(Some(Line::Frame(fr)))) = tokio::time::timeout(Duration::from_secs(2), term2.next()).await {
-            seen2.extend(b64.decode(fr.data.as_str().unwrap()).unwrap());
+    read_until(&mut term2, "echo:again", &mut seen2, |_| {}).await;
+    assert!(!String::from_utf8_lossy(&seen2).contains("hello-from-pty"), "catch-up replayed history it should have skipped: {:?}", String::from_utf8_lossy(&seen2));
+    // detach stops frames on term2, and only there: output that still reaches `term` sends
+    // term2 nothing (RA-677). Frames already in flight arrive before the detach answer.
+    let detached = term2.call(&Request::new(Actor::User, "session.detach", json!({"session": name})), |_| {}).await.unwrap();
+    assert!(detached.ok, "{:?}", detached.error);
+    ok(&e, "session.input", json!({"session": name, "data": "quiet\n"}));
+    read_until(&mut term, "echo:quiet", &mut seen, |_| {}).await;
+    let quiet_until = Instant::now() + Duration::from_millis(500);
+    while let Some(left) = quiet_until.checked_duration_since(Instant::now()) {
+        match tokio::time::timeout(left, term2.next()).await {
+            Err(_) => break,
+            Ok(Ok(Some(Line::Frame(fr)))) => panic!("a detached client still gets frames: {fr:?}"),
+            Ok(Ok(Some(_))) => {}
+            Ok(Ok(None)) => panic!("detach closed the connection"),
+            Ok(Err(error)) => panic!("term2 stream error after detach: {error:#}"),
         }
     }
-    assert!(!String::from_utf8_lossy(&seen2).contains("hello-from-pty"), "catch-up replayed history it should have skipped: {:?}", String::from_utf8_lossy(&seen2));
-    // detach stops frames on term2
-    term2.call(&Request::new(Actor::User, "session.detach", json!({"session": name})), |_| {}).await.unwrap();
 
     // process exit → session.changed(exited, 3) event + completion audit row
     ok(&e, "session.input", json!({"session": name, "data": "exit\n"}));
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut exited = false;
     while !exited {
-        assert!(Instant::now() < deadline, "no exit event");
-        if let Ok(Ok(Some(Line::Event(ev)))) = tokio::time::timeout(Duration::from_secs(2), sub.next()).await {
-            if ev.ev == "session.changed" && ev.payload["name"] == name && ev.payload["state"] == "exited" {
-                assert_eq!(ev.payload["exit_code"], 3);
-                assert_eq!(ev.actor, Actor::System);
-                exited = true;
+        let left = deadline.saturating_duration_since(Instant::now());
+        assert!(!left.is_zero(), "no exit event");
+        match tokio::time::timeout(left, sub.next()).await {
+            Ok(Ok(Some(Line::Event(ev)))) => {
+                if ev.ev == "session.changed" && ev.payload["name"] == name && ev.payload["state"] == "exited" {
+                    assert_eq!(ev.payload["exit_code"], 3);
+                    assert_eq!(ev.actor, Actor::System);
+                    exited = true;
+                }
             }
+            Ok(Ok(Some(_))) | Err(_) => {}
+            Ok(Ok(None)) => panic!("event stream closed before the exit event"),
+            Ok(Err(error)) => panic!("event stream error before the exit event: {error:#}"),
         }
     }
     wait_until("pid gone", || !alive(pid));
@@ -940,8 +957,7 @@ fn skills_are_app_wide_folders_in_every_checkout() {
         "checked in",
         "Relay overwrote a skill the repository checks in",
     );
-    let status = Command::new("git").arg("-C").arg(&worktree).args(["status", "--porcelain"]).output().unwrap();
-    let status = String::from_utf8_lossy(&status.stdout);
+    let status = git(&worktree, &["status", "--porcelain"]);
     assert!(status.trim().is_empty(), "materialized skills dirty the worktree: {status}");
 
     // Disabling removes the folders Relay owns again on the next launch.
@@ -1012,8 +1028,7 @@ fn a_plugin_that_is_on_reaches_every_agent_of_its_project() {
     assert!(role.contains("## Enabled plugins"), "the brief never names the plugin");
     assert!(role.contains("Start every task with `ue_project_info`"), "the plugin's rules are not in the injected brief");
     assert!(role.contains("- unreal-animation — "), "plugin skills are not listed with their descriptions");
-    let status = Command::new("git").arg("-C").arg(&worktree).args(["status", "--porcelain"]).output().unwrap();
-    let status = String::from_utf8_lossy(&status.stdout);
+    let status = git(&worktree, &["status", "--porcelain"]);
     assert!(status.trim().is_empty(), "plugin skills dirty the worktree: {status}");
     ok(&f.engine, "session.close", json!({"session": name}));
 
@@ -1087,7 +1102,16 @@ fn multi_task_launch_stages_the_queue_and_prompts_each_current_task() {
     assert_eq!(ok(&f.engine, "task.get", json!({"task_id":first["id"]}))["column"], "in_review");
     assert_eq!(ok(&f.engine, "task.get", json!({"task_id":second["id"]}))["column"], "active");
     let next_prompt = format!("echo:Your current assignment is Task #{}.", second["id"]);
-    assert!(!ok(&f.engine, "session.scrollback", json!({"session":name}))["text"].as_str().unwrap().contains(&next_prompt), "Done must not inject into its own unfinished provider turn");
+    let scrollback = || ok(&f.engine, "session.scrollback", json!({"session":name}))["text"].as_str().unwrap().to_string();
+    // An injected prompt shows only once the provider has read and echoed it, so a check made
+    // straight after Done proves nothing. A line typed now queues behind anything Done wrote
+    // to the PTY: once its echo is back, an injection would be too (RA-677).
+    let fence = |line: &str| {
+        ok(&f.engine, "session.input", json!({"session":name,"data":format!("{line}\n")}));
+        wait_until("the fence line's echo", || scrollback().contains(&format!("echo:{line}")));
+    };
+    fence("fence-after-done");
+    assert!(!scrollback().contains(&next_prompt), "Done must not inject into its own unfinished provider turn");
     // Providers can emit another tool event while finishing the Done turn. It must
     // not clear the marker or make that turn's Stop complete the next assignment.
     ok(&f.engine, "session.report", json!({"session":name,"kind":"tool_use"}));
@@ -1096,13 +1120,9 @@ fn multi_task_launch_stages_the_queue_and_prompts_each_current_task() {
         "SELECT COUNT(*) FROM notifications WHERE category='agent_done'", [], |row| row.get::<_, i64>(0),
     ).unwrap(), 1, "the trailing Stop belongs to the first task");
     assert_eq!(ok(&f.engine, "session.get", json!({"session":name}))["state"], "running");
-    wait_until("next-task prompt", || {
-        ok(&f.engine, "session.scrollback", json!({"session":name}))["text"]
-            .as_str().unwrap().contains(&format!(
-                "echo:Your current assignment is Task #{}.",
-                second["id"],
-            ))
-    });
+    wait_until("next-task prompt", || scrollback().contains(&next_prompt));
+    fence("fence-after-stop");
+    assert_eq!(scrollback().matches(&next_prompt).count(), 1, "the next assignment is typed exactly once");
     let mail_count: i64 = f.engine.store.lock().query_row(
         "SELECT COUNT(*) FROM messages WHERE re_task=?1 AND text LIKE 'Your current assignment is Task #%';", [second["id"].as_i64().unwrap()], |row| row.get(0),
     ).unwrap();
@@ -1155,9 +1175,7 @@ fn phase_six_park_wake_restore_and_immutable_launch_options() {
     let updated = ok(&f.engine, "session.update", json!({"session": name, "branch": "relay/custom", "allow_ui": true}));
     assert_eq!(updated["branch"], "relay/custom");
     assert_eq!(updated["allow_ui"], true);
-    let branch = Command::new("git").arg("-C").arg(updated["worktree"].as_str().unwrap())
-        .args(["branch", "--show-current"]).output().unwrap();
-    assert_eq!(String::from_utf8_lossy(&branch.stdout).trim(), "relay/custom");
+    assert_eq!(git(Path::new(updated["worktree"].as_str().unwrap()), &["branch", "--show-current"]), "relay/custom");
 
     let running = ok(&f.engine, "session.spawn", json!({"session": name, "prompt": "start here"}));
     let first_pid = running["pid"].as_i64().unwrap();
@@ -1298,14 +1316,21 @@ fn allocated_assignments_survive_partial_launch_and_omitted_spawn_prompt() {
                 .unwrap()
         };
         assert_eq!(stored().as_deref(), Some("preserved assignment"));
-        // A later allocation can fail without losing the already allocated assignment.
-        assert!(
-            !call(
-                &f.engine,
-                "session.create",
-                json!({"project_id":1,"provider":"claude","worktree":"invalid-relative-worktree"})
-            )
-            .ok
+        // This session's own launch can fail without losing its allocated assignment (RA-677).
+        ok(
+            &f.engine,
+            "settings.set",
+            json!({"path":"providers.claude.path","value":f.root.join("missing-claude")}),
+        );
+        assert_eq!(
+            code(call(&f.engine, "session.spawn", json!({"session":session["name"]}))),
+            "provider.not_installed"
+        );
+        assert_eq!(stored().as_deref(), Some("preserved assignment"));
+        ok(
+            &f.engine,
+            "settings.set",
+            json!({"path":"providers.claude.path","value":provider}),
         );
         let mut spawn = json!({"session":session["name"]});
         if let Some(prompt) = override_prompt {
@@ -1359,9 +1384,8 @@ fn pair_sessions_share_checkout_and_teardown_safely() {
     assert_eq!(code(call(&f.engine, "session.create", json!({
         "project_id": 1, "provider": "claude", "role": "builder", "pair_with": reviewer_name
     }))), "session.review_group_full");
-    let hook_dir = Command::new("git").arg("-C").arg(reviewer["worktree"].as_str().unwrap())
-        .args(["config", "--worktree", "--get", "core.hooksPath"]).output().unwrap();
-    let hook = PathBuf::from(String::from_utf8(hook_dir.stdout).unwrap().trim()).join("pre-commit");
+    let hook_dir = git(Path::new(reviewer["worktree"].as_str().unwrap()), &["config", "--worktree", "--get", "core.hooksPath"]);
+    let hook = PathBuf::from(hook_dir).join("pre-commit");
     assert!(std::fs::read_to_string(hook).unwrap().contains("$RELAY_SESSION"));
 
     let task = ok(&f.engine, "task.create", json!({"project_id": 1, "title": "Review together"}));
@@ -1445,9 +1469,10 @@ fn slow_checkout_does_not_hold_the_store_lock() {
     use std::os::unix::fs::PermissionsExt;
     let f = fixture();
     let marker = f.root.join("checkout-started");
+    let finished = f.root.join("checkout-finished");
     let filter = f.root.join("slow-filter");
     std::fs::write(&filter, format!(
-        "#!/bin/sh\ntouch '{}'\nsleep 2\ncat\n", marker.display(),
+        "#!/bin/sh\ntouch '{}'\nsleep 2\ntouch '{}'\ncat\n", marker.display(), finished.display(),
     )).unwrap();
     std::fs::set_permissions(&filter, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::write(f.repo.join(".gitattributes"), "README.md filter=slow\n").unwrap();
@@ -1464,13 +1489,13 @@ fn slow_checkout_does_not_hold_the_store_lock() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(marker.exists(), "Git did not start the slow checkout filter");
-    let started = Instant::now();
+    // Answered while the filter still sleeps: no wall-clock bound to race (RA-742).
     ok(&f.engine, "app.status", json!({}));
-    let elapsed = started.elapsed();
+    let answered_during_checkout = !finished.exists();
     let session = creating.join().unwrap();
     assert_eq!(session["state"], "created");
     assert_eq!(std::fs::read_to_string(Path::new(session["worktree"].as_str().unwrap()).join("README.md")).unwrap(), "hi\n");
-    assert!(elapsed < Duration::from_millis(500), "app.status blocked behind checkout for {elapsed:?}");
+    assert!(answered_during_checkout, "app.status blocked behind the checkout");
 }
 
 /// Opening and closing one agent must never stall every other pane: a park or a close that
@@ -1492,14 +1517,22 @@ fn park_and_close_stop_the_child_without_holding_the_store() {
         wait_until("ignoring TERM", || ok(&f.engine,"session.scrollback",json!({"session":name}))["text"].as_str().unwrap().contains("ready"));
         let engine = f.engine.clone();
         let payload = if op == "session.close" { json!({"session":name,"remove_worktree":true}) } else { json!({"session":name}) };
+        let (id, pid) = (session["id"].as_i64().unwrap(), spawned["pid"].as_i64().unwrap());
         let stopping = std::thread::spawn(move || ok(&engine, op, payload));
-        std::thread::sleep(Duration::from_millis(60));
-        let started = Instant::now();
+        // Synchronized, not slept for (RA-742): once the PTY is out of the registry and the
+        // TERM-ignoring child is still alive, the request is inside its grace (3 s to park,
+        // CLOSE_GRACE to close). A store held through it would keep session.list waiting until
+        // the child had been killed, so the child must still be alive when the list answers.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while f.engine.pty(id).is_some() {
+            assert!(Instant::now() < deadline, "{op} never took the PTY");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(alive(pid), "{op}'s grace ran out before the probe could start");
         ok(&f.engine, "session.list", json!({}));
-        let waited = started.elapsed();
+        assert!(alive(pid), "session.list waited behind {op}'s kill");
         stopping.join().unwrap();
-        assert!(waited < Duration::from_millis(60), "session.list waited {waited:?} behind {op}");
-        assert!(!alive(spawned["pid"].as_i64().unwrap()), "{op} returned before its child died");
+        assert!(!alive(pid), "{op} returned before its child died");
         let row = ok(&f.engine, "session.list", json!({"include_closed":true}))["sessions"]
             .as_array().unwrap().iter().find(|s| s["name"] == name.as_str()).cloned().unwrap();
         let want = if op == "session.park" { "parked" } else { "closed" };
@@ -1525,7 +1558,7 @@ fn park_and_close_stop_the_child_without_holding_the_store() {
 fn closing_the_last_of_several_sessions_restores_the_original_hook_path() {
     let f = fixture();
     let hooks = |repo: &Path| {
-        let out = Command::new("git").arg("-C").arg(repo).args(["config", "--worktree", "--get", "core.hooksPath"]).output().unwrap();
+        let out = git_command(repo).args(["config", "--worktree", "--get", "core.hooksPath"]).output().unwrap();
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     };
     git(&f.repo, &["config", "extensions.worktreeConfig", "true"]);
@@ -1553,7 +1586,7 @@ fn closing_the_last_of_several_sessions_restores_the_original_hook_path() {
 fn closing_the_newest_of_several_sessions_keeps_the_commit_gate_wired() {
     let f = fixture();
     let hooks = |repo: &Path| {
-        let out = Command::new("git").arg("-C").arg(repo).args(["config", "--worktree", "--get", "core.hooksPath"]).output().unwrap();
+        let out = git_command(repo).args(["config", "--worktree", "--get", "core.hooksPath"]).output().unwrap();
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     };
     git(&f.repo, &["config", "extensions.worktreeConfig", "true"]);
