@@ -57,7 +57,7 @@ op!(FirstRunState, "app.first_run.state", Empty => FirstRunOut, OpMeta::query(Sc
 
 result!(#[schemars(rename = "AppReconcileOut")] ReconcileOut { pub actions: Vec<String> });
 op!(Reconcile, "app.reconcile", Empty => ReconcileOut,
-    OpMeta::mutation(Scope::Global, 1, "Run the 60s trust-but-verify pass now").actors(Actors::UserOnly));
+    OpMeta::mutation(Scope::Global, 1, "Run the trust-but-verify pass now: retention of soft-deleted rows, notifications and mail").actors(Actors::UserOnly).emits(&["notify.changed"]));
 
 #[allow(dead_code)]
 fn _touch(_: Value) {}

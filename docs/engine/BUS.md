@@ -293,8 +293,12 @@ never pruned. `session.report` and `usage.report` keep 2 KB of readable payload 
 `task`, `module`, `note`, `file` (files go to `.relay/trash/<id>/`, not the OS trash) and
 `session` (closed) are soft-deleted: `deleted_at` set, excluded from `list` unless
 `include_deleted: true`, restorable by `*.restore` for the grace window (`settings:
-undo.grace_days`, default 7), then hard-deleted by the reconcile pass. Hard delete is never an
-op an agent can call.
+undo.grace_days`, default 7; `0` keeps them), then hard-deleted by the reconcile pass. Hard
+delete is never an op an agent can call. A closed session's row stays, because audit, mailbox
+and task history name it; only its scrollback is dropped. The same pass keeps the notification
+table to read rows under 30 days, any row under 180 and at most 5,000, and the mailbox to
+messages under 30 days unless one is still unacked (180 at most). The engine runs it hourly on
+its own (not through the bus, so it lands no audit row); `app.reconcile` runs it now.
 
 ### 5.5 Undo
 
@@ -642,18 +646,18 @@ All `app.*` mutations are `user_only` (§9.1 layer 1).
 | `app.resources.get` | query | `{}` → `{ relay: {pid, rss_mb, cpu_pct}, panes: {session, pid, rss_mb, cpu_pct}[], worktrees: {path, disk_mb}[], store_mb, total_rss_mb }` |
 | `app.resources.watch` | mutation · never · global | `{ on: bool }` → `{}` — while any client watches, `resource.sample` events flow (§1.3); otherwise none |
 | `app.recovery.last` | query | `{}` → `{ at, reaped_pids: number[], fsck_fixes: string[], dirty_worktrees: string[], tasks_reset_offered: Id[] } \| null` — what crash recovery did at the last launch (SPEC §14) |
-| `app.log.tail` | query · stream | `{ level?: "trace"\|"debug"\|"info"\|"warn"\|"error", filter?: string }` → attaches `log` stream |
+| `app.log.tail` | query · stream | `{ level?: "trace"\|"debug"\|"info"\|"warn"\|"error", filter?: string }` → attaches `log` stream. **Not built yet:** answers `unavailable`/`bus.not_implemented`; the engine logs to stderr only |
 | `app.backup.now` | mutation · always · global | `{}` → `{ path, bytes }` |
 | `app.backup.list` | query | `{}` → `{ backups: {path, bytes, created_at, reason: "manual"\|"upgrade"}[] }` |
 | `app.import.v3` | mutation · always · global | `{ source: path, project_id: Id, dry_run?: bool }` — `source` is a v3 `.relay/` dir, its `relay.db`, or the repo containing it; one-time per source (`conflict`/`import.already_done`); mapping in DECISIONS D14 → `{ counts: {tasks, modules, notes, sessions}, id_map: {tasks: Record<old, new>, modules: Record<old, new>, notes: Record<old, new>}, warnings: string[] }` — the id map is also the audit row's `result_summary` |
 | `app.first_run.state` | query | `{}` → `{ needed: bool, steps: {workspace, providers, project, import}: "todo"\|"done"\|"skipped" }` |
-| `app.reconcile` | mutation · always · global | `{}` → `{ actions: string[] }` — the 60 s pass, on demand (tests); same action vocabulary as `app.recovery.last` |
+| `app.reconcile` | mutation · always · global | `{}` → `{ actions: string[] }` — the retention pass of §5.4, on demand; same action vocabulary as `app.recovery.last` |
 
 ### 10.3 audit
 
 | op | attrs | payload → result |
 |---|---|---|
-| `audit.list` | query | `{ project_id?, actor?, session_id?, op_prefix?, parent_req?, since?, until?, limit?: ≤1000 }` → `{ rows: AuditRow[] }` |
+| `audit.list` | query | `{ project_id?, actor?, session_id?, op_prefix?, parent_req?, since?, until?, limit?: ≤1000 }` → `{ rows: AuditRow[] }` — `since`/`until` take RFC 3339 with any offset, a bare date (UTC midnight) or epoch seconds/ms; anything else is `invalid`/`time.invalid` |
 | `audit.get` | query | `{ audit_id }` → `AuditRow` (with stored payload if kept) |
 | `audit.undo` | mutation · always · undo none · global · user | `{ audit_id, force?: bool }` → `{ undone: Id, by: Id }` — `conflict`/`audit.not_undoable` if the row has no inverse or was already undone; `conflict`/`audit.stale` if the entity changed since (§5.5) |
 

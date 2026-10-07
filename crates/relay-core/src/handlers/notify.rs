@@ -147,7 +147,9 @@ pub fn register(engine: &mut Engine) {
         let mut next = before.clone();
         crate::handlers::settings::merge_value(&mut next, &payload.patch);
         crate::handlers::settings::set(ctx.tx(), "notifications", &next, &ctx.now)?;
-        ctx.set_undo("notify.settings.set", json!({"patch":before}), None);
+        // The inverse is a patch too, so it must null the keys this one added: replaying the old
+        // tree as a merge patch would leave them in place.
+        ctx.set_undo("notify.settings.set", json!({"patch":crate::guardrail::inverse_patch(&before, &next)}), None);
         ctx.emit(
             "settings.changed",
             json!({"path":"notifications","value":next}),

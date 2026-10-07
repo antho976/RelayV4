@@ -714,6 +714,25 @@ fn recovery_reaps_orphans_and_fscks() {
 }
 
 #[test]
+fn recovery_leaves_alone_a_process_that_inherited_a_stale_pid() {
+    let f = fixture();
+    // An unrelated process that now holds the pid a crashed session recorded.
+    let mut bystander = Command::new("sleep").arg("30").spawn().unwrap();
+    let pid = bystander.id() as i64;
+    f.engine.store.lock().execute(
+        "INSERT INTO sessions(name, project_id, provider, role, branch, worktree, state, pid, token, epoch, created_at, updated_at)
+         VALUES ('stale-heron', 1, 'claude', 'builder', 'x', '/tmp', 'running', ?1, 't', 1, 'now', 'now')",
+        [pid],
+    ).unwrap();
+    let report = relay_core::recovery::run(&f.engine).unwrap();
+    assert!(alive(pid), "recovery killed a process that was not Relay's: {report:?}");
+    assert!(!report.reaped_pids.contains(&pid), "{report:?}");
+    assert!(report.fsck_fixes.iter().any(|x| x.contains("stale-heron") && x.contains("another process")), "{report:?}");
+    let _ = bystander.kill();
+    let _ = bystander.wait();
+}
+
+#[test]
 fn recovery_releases_legacy_claims_but_preserves_new_work() {
     let f = fixture();
     let create = || ok(&f.engine, "session.create", json!({"project_id":1,"provider":"codex"}));

@@ -22,6 +22,7 @@ pub mod proc;
 pub mod providers;
 mod provider_updates;
 pub mod pty;
+pub mod purge;
 pub mod recovery;
 pub mod serve;
 pub mod sessions;

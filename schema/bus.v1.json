@@ -380,7 +380,7 @@
       }
     },
     "app.reconcile": {
-      "summary": "Run the 60s trust-but-verify pass now",
+      "summary": "Run the trust-but-verify pass now: retention of soft-deleted rows, notifications and mail",
       "kind": "mutation",
       "audit": "always",
       "undo": "none",
@@ -388,7 +388,9 @@
       "executor": "core",
       "actors": "user_only",
       "doors": "all",
-      "emits": [],
+      "emits": [
+        "notify.changed"
+      ],
       "since": "1.0",
       "phase": 1,
       "payload": {

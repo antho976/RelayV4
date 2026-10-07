@@ -44,11 +44,16 @@ pub fn register(e: &mut Engine) {
         Ok(relay_bus::Empty {})
     });
     e.register::<RecoveryLast>(|ctx, _| crate::recovery::last(ctx.tx()).map_err(crate::engine::internal));
-    e.register::<BackupNow>(|ctx, _| {
-        let path = ctx.engine().store.backup_with(ctx.tx(), "manual").map_err(crate::engine::internal)?;
-        let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        Ok(BackupOut { path: path.display().to_string(), bytes })
-    });
+    // The copy is the whole database: it runs before the transaction, taking the store lock one
+    // step at a time (`Store::backup`), so requests keep flowing while it runs.
+    e.register_staged::<BackupNow, BackupOut>(
+        |ctx, _| {
+            let path = ctx.engine().store.backup("manual").map_err(crate::engine::internal)?;
+            let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            Ok(BackupOut { path: path.display().to_string(), bytes })
+        },
+        |_ctx, _, out| Ok(out),
+    );
     e.register::<BackupList>(|ctx, _| {
         let backups = ctx.engine().store.list_backups().map_err(crate::engine::internal)?
             .into_iter()
@@ -130,14 +135,32 @@ pub fn register(e: &mut Engine) {
         }
         Ok(relay_bus::Empty {})
     });
-    e.register::<LogTail>(|ctx, p| {
-        ctx.engine().emit_system("app.log.attached", json!({"level":p.level,"filter":p.filter}));
-        Ok(relay_bus::Empty {})
+    e.register::<LogTail>(|_ctx, _p| {
+        // No `log` stream exists yet: the engine's tracing output goes to stderr only. Saying so
+        // beats a success that attaches nothing and leaves the caller waiting for records.
+        Err(BusError::not_implemented("app.log.tail", 9))
     });
-    e.register::<Reconcile>(|_ctx, _| {
-        // The 60 s trust-but-verify pass. Phase 1 has nothing to verify yet; each later phase
-        // appends its checks here and names what it did (BUS.md §10.2).
-        Ok(ReconcileOut { actions: Vec::new() })
+    e.register::<Reconcile>(|ctx, _| {
+        // The trust-but-verify pass, on demand. Retention is what it does today; the same pass
+        // also runs on the engine's own timer (`purge::spawn_timer`).
+        let store_dir = ctx.engine().store.path().parent().map(Path::to_path_buf).unwrap_or_default();
+        let purged = crate::purge::run(ctx.tx(), &store_dir).map_err(crate::engine::internal)?;
+        if !purged.actions.is_empty() {
+            ctx.emit("notify.changed", json!({"purged": true}));
+        }
+        if !purged.paths.is_empty() {
+            let paths = purged.paths;
+            ctx.after_commit(move |_| {
+                std::thread::Builder::new()
+                    .name("purge-files".into())
+                    .spawn(move || {
+                        crate::background_priority();
+                        crate::purge::remove_paths(&paths)
+                    })
+                    .ok();
+            });
+        }
+        Ok(ReconcileOut { actions: purged.actions })
     });
 }
 
