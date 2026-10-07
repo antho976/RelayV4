@@ -570,7 +570,6 @@ pub(crate) async fn verify_worktree_picker(ui: &Rc<Ui>) {
         .build();
     window.set_child(Some(&picker.widget));
     window.present();
-    glib::timeout_future(std::time::Duration::from_millis(100)).await;
     // The last build's checkout is preselected; the primary checkout builds with no worktree.
     assert_eq!(picker.active_id().as_deref(), Some(path.as_str()));
     picker.choose(0);
@@ -582,11 +581,9 @@ pub(crate) async fn verify_worktree_picker(ui: &Rc<Ui>) {
     assert!(!visible(0) && visible(1), "Search must hide branches that do not match");
     picker.inner.search.emit_activate();
     assert_eq!(picker.active_id().as_deref(), Some(path.as_str()));
-    assert!(
-        window.width() <= 430,
-        "Long branch and path must not expand the device surface: {}px",
-        window.width()
-    );
+    // Measure what the picker asks for: an unallocated window reports a width of 0 (RA-721).
+    let minimum = picker.widget.measure(gtk::Orientation::Horizontal, -1).0;
+    assert!(minimum <= 430, "Long branch and path must not expand the device surface: {minimum}px");
     window.close();
 }
 

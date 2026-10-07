@@ -1547,7 +1547,7 @@ impl Editor {
                         if document {
                             e.clear_document();
                         }
-                        e.load_tree(&ui, None);
+                        e.load_tree(&ui);
                     }
                     e.refresh_git(&ui);
                     e.refresh_scopes(&ui);

@@ -112,7 +112,9 @@ pub async fn run(ui: &Rc<Ui>) -> Result<(), String> {
         "Project save reaches engine",
     )?;
     // Let the save's own file events settle: the tree must hold still for well over the
-    // 1 s client debounce, so a late event's refresh lands before the burst starts (RA-717).
+    // 1 s client debounce, so a late event's refresh lands before the burst starts, and no
+    // invalidation may be armed, or the burst would join its timer and fire early (RA-717).
+    // The burst follows in the same main-loop turn, so nothing can arm one in between.
     let mut revision = ui.editor.tree_revision.get();
     let mut still = std::time::Instant::now();
     util::wait_within(
@@ -122,7 +124,7 @@ pub async fn run(ui: &Rc<Ui>) -> Result<(), String> {
             if now != revision {
                 (revision, still) = (now, std::time::Instant::now());
             }
-            still.elapsed() > Duration::from_millis(2500)
+            still.elapsed() > Duration::from_millis(2500) && !ui.editor.invalidate_pending.get()
         },
         "File tree settles after the save",
     )
@@ -333,7 +335,7 @@ async fn image_preview(ui: &Rc<Ui>) -> Result<(), String> {
     std::fs::write(root.join("preview.PNG"), &png).map_err(|e|e.to_string())?;
     std::fs::write(root.join("broken.png"), b"not an image").map_err(|e|e.to_string())?;
     ui.editor.show_files();
-    ui.editor.load_tree(ui, None);
+    ui.editor.load_tree(ui);
     wait_for(|| named(&ui.window, "project-file:preview.PNG").is_some(), "Image file in tree").await?;
     click(ui, "project-file:preview.PNG")?;
     let picture = named(&ui.window, "project-image").ok_or("Preview widget")?.downcast::<gtk::Picture>().map_err(|_| "Picture type")?;

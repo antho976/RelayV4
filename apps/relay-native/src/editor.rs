@@ -58,7 +58,8 @@ pub struct Editor {
     commit_message: gtk::TextView,
     branch_name: gtk::Entry,
     branch_start: gtk::Entry,
-    invalidate_pending: Cell<bool>,
+    /// An `invalidate` timer is armed; the smoke waits for none before timing a burst.
+    pub(crate) invalidate_pending: Cell<bool>,
     diff: Cell<bool>,
     diff_switch: gtk::Box,
     diff_inline: Cell<bool>,
@@ -111,7 +112,7 @@ impl Drop for TreeLoadGuard {
     fn drop(&mut self) {
         self.0.tree_load_pending.set(false);
         if self.0.tree_load_again.replace(false) {
-            self.0.load_tree(&self.1, None);
+            self.0.load_tree(&self.1);
         }
     }
 }
@@ -741,7 +742,7 @@ impl Editor {
             // A search's results stay until it is run again: re-reading the whole worktree
             // on every file event is a cost the explorer must not pay.
             if self.search.text().trim().is_empty() {
-                self.load_tree(ui, None);
+                self.load_tree(ui);
             }
         } else {
             self.tree_stale.set(true);
@@ -757,9 +758,8 @@ impl Editor {
     }
 
     /// List the explorer from the checkout's root, with every expanded folder open. The
-    /// explorer has no directory scope (RA-687): `_root` is always `None`, and goes once the
-    /// callers in project_files.rs, code_git.rs and smoke_project_files.rs stop passing it.
-    pub fn load_tree(self: &Rc<Self>, ui: &Rc<Ui>, _root: Option<String>) {
+    /// explorer has no directory scope (RA-687).
+    pub fn load_tree(self: &Rc<Self>, ui: &Rc<Ui>) {
         if ui.project.get() == 0 {
             return;
         }
@@ -1319,7 +1319,7 @@ impl Editor {
             more.connect_clicked(move |_| {
                 if let Some(ui) = weak.upgrade() {
                     e.tree_limits.borrow_mut().insert(folder.clone(), limit + TREE_PAGE);
-                    e.load_tree(&ui, None);
+                    e.load_tree(&ui);
                 }
             });
             target.append(&more);
@@ -1390,7 +1390,7 @@ impl Editor {
         self.file_sidebar.connect_map(move |_| {
             if let Some(ui) = weak.upgrade().filter(|_| e.tree_stale.replace(false)) {
                 if e.search.text().trim().is_empty() {
-                    e.load_tree(&ui, None);
+                    e.load_tree(&ui);
                 }
             }
         });
@@ -1421,7 +1421,7 @@ impl Editor {
         self.search.connect_stop_search(move |search| {
             search.set_text("");
             if let Some(ui) = weak.upgrade() {
-                e.load_tree(&ui, None);
+                e.load_tree(&ui);
             }
         });
         for (icon, title, op) in [
@@ -1448,7 +1448,7 @@ impl Editor {
         let weak = Rc::downgrade(ui);
         refresh.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
-                e.load_tree(&ui, None);
+                e.load_tree(&ui);
                 e.refresh_git(&ui);
             }
         });
@@ -1472,7 +1472,7 @@ impl Editor {
         collapse.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
                 e.expanded.borrow_mut().clear();
-                e.load_tree(&ui, None);
+                e.load_tree(&ui);
             }
         });
         self.file_actions.append(&collapse);
@@ -1572,7 +1572,7 @@ impl Editor {
     fn run_search(self: &Rc<Self>, ui: &Rc<Ui>) {
         let query = self.search.text().to_string();
         if query.trim().is_empty() {
-            self.load_tree(ui, None);
+            self.load_tree(ui);
             return;
         }
         if self.search_pending.replace(true) {
@@ -1782,7 +1782,7 @@ impl Editor {
                     e.selected_directory.set(text(&v, "kind") == "dir");
                     match op {
                         "file.create" => {
-                            e.load_tree(&ui, None);
+                            e.load_tree(&ui);
                             e.refresh_git(&ui);
                         }
                         "file.rename" => e.follow_change(&ui, &path, Some(text(&v, "path"))),
@@ -1817,7 +1817,7 @@ impl Editor {
                                         if button.parent().as_ref() == Some(ed.file_undo.upcast_ref()) {
                                             ed.file_undo.remove(&button);
                                         }
-                                        ed.load_tree(&ui, None);
+                                        ed.load_tree(&ui);
                                         ed.refresh_git(&ui);
                                     }
                                     Err(err) => {
@@ -1863,7 +1863,7 @@ impl Editor {
             Some(None) => self.clear_document(),
             None => {}
         }
-        self.load_tree(ui, None);
+        self.load_tree(ui);
         self.refresh_git(ui);
         if agents {
             self.show_agents();
@@ -1993,7 +1993,7 @@ impl Editor {
                             Ok(_) => {
                                 item.set_visible(false);
                                 if ui.project.get() == project {
-                                    ed.load_tree(&ui, None);
+                                    ed.load_tree(&ui);
                                     ed.refresh_git(&ui);
                                 }
                             }
