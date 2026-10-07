@@ -1,9 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["crates/relay-bus", "crates/relay-core", "crates/relay-cli", "crates/relay-remote", "crates/relay-board", "apps/relay-native"]
-# Engine checks stay headless; build the GTK client with `-p relay-native`. relay-board is the
-# client's GTK-free board logic, here so plain `cargo test` (and CI) runs its tests.
-default-members = ["crates/relay-bus", "crates/relay-core", "crates/relay-cli", "crates/relay-remote", "crates/relay-board"]
+members = ["crates/relay-bus", "crates/relay-core", "crates/relay-cli", "crates/relay-remote", "crates/relay-board", "crates/relay-client", "apps/relay-native"]
+# Engine checks stay headless; build the GTK client with `-p relay-native`. relay-board and
+# relay-client are the client's GTK-free logic (the board; the Git panel and the device mirror),
+# here so plain `cargo test` (and CI) runs their tests.
+default-members = ["crates/relay-bus", "crates/relay-core", "crates/relay-cli", "crates/relay-remote", "crates/relay-board", "crates/relay-client"]
 
 [workspace.package]
 version = "4.0.0-dev"
@@ -20,6 +21,7 @@ relay-bus = { path = "crates/relay-bus" }
 relay-core = { path = "crates/relay-core" }
 relay-remote = { path = "crates/relay-remote" }
 relay-board = { path = "crates/relay-board" }
+relay-client = { path = "crates/relay-client" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 schemars = { version = "1", features = ["uuid1", "preserve_order"] }
