@@ -812,14 +812,14 @@ unique; nothing else is.
 | op | attrs | payload → result |
 |---|---|---|
 | `module.create` | mutation · always · inverse | `{ project_id, name, icon?, priority? }` → `Module` |
-| `module.get` | query | `{ module_id }` → `Module & { tasks_by_state }` |
-| `module.list` | query | `{ project_id, include_archived? }` → `{ modules: ModuleSummary[], header: {count, in_flight, issues, completed, completion_pct} }` |
+| `module.get` | query | `{ module_id }` → `Module & { tasks_by_state }` — an agent is refused another project's module, `refused`/`actor.scope` (D106) |
+| `module.list` | query | `{ project_id?, include_archived? }` → `{ modules: ModuleSummary[], header: {count, in_flight, issues, completed, completion_pct} }` — an agent sees its own project only (`project_id` may be left out; another is `refused`/`actor.scope`, D106); the person must name one (`invalid`/`module.project`) |
 | `module.update` | mutation · always · inverse | `{ module_id, name?, icon?, priority?, order? }` → `Module` |
 | `module.complete` | mutation · always · inverse (reopen) | `{ module_id }` → `Module` (archived, `completed_at` set) |
 | `module.reopen` | mutation · always · inverse | `{ module_id }` → `Module` |
 | `module.delete` / `module.restore` | mutation · always · inverse | `{ module_id }` → `{}` / `Module` — delete unlinks tasks (they keep existing, `module_id: null`) |
-| `module.stats` | query | `{ project_id }` → same as `module.list.header` |
-| `module.changelog.draft` | query | `{ module_id, group_by?: "priority" }` (the only grouping built; any other value is `invalid` / `module.changelog_group`) → `{ markdown, tasks: Id[] }` |
+| `module.stats` | query | `{ project_id }` → same as `module.list.header` — an agent's own project only (D106) |
+| `module.changelog.draft` | query | `{ module_id, group_by?: "priority" }` (the only grouping built; any other value is `invalid` / `module.changelog_group`) → `{ markdown, tasks: Id[] }` — an agent's own project's modules only (D106) |
 
 ### 10.7 notes / mailbox (SPEC §3, §12)
 

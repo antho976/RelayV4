@@ -1,6 +1,7 @@
 //! `module.*` — Phase 7 release tracking over the board's single task source of truth.
 
 use crate::engine::{Ctx, Engine, IntoBus};
+use crate::handlers::notes::{actor_project, assert_actor_project};
 use crate::handlers::task::{get_task, parse_column, parse_priority, priority_str};
 use relay_bus::error::BusError;
 use relay_bus::ops::module::*;
@@ -129,6 +130,7 @@ pub fn register(e: &mut Engine) {
     });
     e.register::<Get>(|ctx, p| {
         let module = get_module(ctx.tx(), p.module_id, false)?;
+        assert_actor_project(ctx, module.project_id)?;
         let mut grouped: BTreeMap<Column, Vec<Task>> = BTreeMap::new();
         for col in [
             Column::Backlog,
@@ -147,7 +149,15 @@ pub fn register(e: &mut Engine) {
             tasks_by_state: grouped,
         })
     });
-    e.register::<List>(|ctx,p|{crate::handlers::workspace::get_project(ctx.tx(),p.project_id)?;let sql=if p.include_archived.unwrap_or(false){"SELECT * FROM modules WHERE project_id=?1 AND deleted_at IS NULL ORDER BY completed_at IS NOT NULL,ord,id"}else{"SELECT * FROM modules WHERE project_id=?1 AND deleted_at IS NULL AND completed_at IS NULL ORDER BY ord,id"};let mut stmt=ctx.tx().prepare(sql).bus()?;let modules=stmt.query_map([p.project_id],module_row).bus()?.collect::<rusqlite::Result<Vec<_>>>().bus()?.into_iter().map(|m|summary(ctx.tx(),m)).collect::<Result<Vec<_>,_>>()?;Ok(ListOut{modules,header:header(ctx.tx(),p.project_id)?})});
+    e.register::<List>(|ctx,p|{
+        // An agent reads its own project's modules, as it does its board (D106, RA-411).
+        let project_id=match (actor_project(ctx)?,p.project_id){
+            (Some(own),Some(asked)) if asked!=own=>return Err(BusError::not_own("project")),
+            (Some(own),_)=>own,
+            (None,Some(asked))=>asked,
+            (None,None)=>return Err(BusError::invalid("module.project","project_id is required")),
+        };
+        crate::handlers::workspace::get_project(ctx.tx(),project_id)?;let sql=if p.include_archived.unwrap_or(false){"SELECT * FROM modules WHERE project_id=?1 AND deleted_at IS NULL ORDER BY completed_at IS NOT NULL,ord,id"}else{"SELECT * FROM modules WHERE project_id=?1 AND deleted_at IS NULL AND completed_at IS NULL ORDER BY ord,id"};let mut stmt=ctx.tx().prepare(sql).bus()?;let modules=stmt.query_map([project_id],module_row).bus()?.collect::<rusqlite::Result<Vec<_>>>().bus()?.into_iter().map(|m|summary(ctx.tx(),m)).collect::<Result<Vec<_>,_>>()?;Ok(ListOut{modules,header:header(ctx.tx(),project_id)?})});
     e.register::<Update>(|ctx:&mut Ctx,p|{let before=get_module(ctx.tx(),p.module_id,false)?;
         if let Some(expected) = &p.expected {
             let current = serde_json::to_value(&before).bus()?;
@@ -209,7 +219,10 @@ pub fn register(e: &mut Engine) {
     });
     e.register::<Delete>(|ctx:&mut Ctx,p|{let module=get_module(ctx.tx(),p.module_id,false)?;let task_ids=ids(ctx.tx(),"SELECT id FROM tasks WHERE module_id=?1 ORDER BY id",module.id)?;ctx.tx().execute("INSERT OR IGNORE INTO module_unlinked_tasks(module_id,task_id) SELECT ?1,id FROM tasks WHERE module_id=?1",[module.id]).bus()?;ctx.tx().execute("UPDATE tasks SET module_id=NULL,updated_at=?1 WHERE module_id=?2",params![ctx.now,module.id]).bus()?;ctx.tx().execute("UPDATE modules SET deleted_at=?1,updated_at=?1 WHERE id=?2",params![ctx.now,module.id]).bus()?;ctx.set_project(module.project_id);ctx.set_undo("module.restore",json!({"module_id":module.id}),Some(json!({"updated_at":ctx.now})));ctx.emit("module.deleted",json!({"id":module.id,"project_id":module.project_id}));ctx.emit("task.changed",json!({"module_id":module.id,"unlinked":true,"task_ids":task_ids}));Ok(Empty{})});
     e.register::<Restore>(|ctx:&mut Ctx,p|{let before=get_module(ctx.tx(),p.module_id,true)?;if before.deleted_at.is_none(){return Err(BusError::conflict("module.not_deleted",format!("module {} is not deleted",before.id)))}ctx.tx().execute("UPDATE modules SET deleted_at=NULL,updated_at=?1 WHERE id=?2",params![ctx.now,before.id]).bus()?;let task_ids=ids(ctx.tx(),"SELECT id FROM tasks WHERE module_id IS NULL AND id IN (SELECT task_id FROM module_unlinked_tasks WHERE module_id=?1) ORDER BY id",before.id)?;ctx.tx().execute("UPDATE tasks SET module_id=?1,updated_at=?2 WHERE module_id IS NULL AND id IN (SELECT task_id FROM module_unlinked_tasks WHERE module_id=?1)",params![before.id,ctx.now]).bus()?;ctx.tx().execute("DELETE FROM module_unlinked_tasks WHERE module_id=?1",[before.id]).bus()?;let module=get_module(ctx.tx(),before.id,false)?;ctx.set_undo("module.delete",json!({"module_id":module.id}),Some(json!({"updated_at":module.updated_at})));emit_module(ctx,&module)?;ctx.emit("task.changed",json!({"module_id":module.id,"restored":true,"task_ids":task_ids}));Ok(module)});
-    e.register::<Stats>(|ctx, p| header(ctx.tx(), p.project_id));
+    e.register::<Stats>(|ctx, p| {
+        assert_actor_project(ctx, p.project_id)?;
+        header(ctx.tx(), p.project_id)
+    });
     e.register::<ChangelogDraft>(|ctx, p| {
         if p.group_by.as_deref().is_some_and(|v| v != "priority") {
             return Err(BusError::invalid(
@@ -218,6 +231,7 @@ pub fn register(e: &mut Engine) {
             ));
         }
         let module = get_module(ctx.tx(), p.module_id, false)?;
+        assert_actor_project(ctx, module.project_id)?;
         let mut done = tasks_for(ctx.tx(), module.id)?
             .into_iter()
             .filter(|t| t.column == Column::Done && !t.changelog.trim().is_empty())

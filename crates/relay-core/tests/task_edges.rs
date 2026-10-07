@@ -209,6 +209,41 @@ fn agent_task_create_and_reads_stay_in_bounds() {
     ok(e, "task.create", json!({"project_id":1,"title":"Escape hatch","column":"done"}));
 }
 
+/// RA-386 / RA-411: an agent's module reads stop at its own project (D106); module.list
+/// without a project is its own.
+#[test]
+fn agent_module_reads_stay_in_its_project() {
+    let f = Fixture::new();
+    let e = &f.engine;
+    repo(&f.root.path().join("ws/other"));
+    ok(e, "project.add", json!({"workspace_id":1,"path":f.root.path().join("ws/other")}));
+    let here = ok(e, "module.create", json!({"project_id":1,"name":"Here"}));
+    let there = ok(e, "module.create", json!({"project_id":2,"name":"Elsewhere"}));
+    let session = ok(e, "session.create", json!({"project_id":1,"provider":"claude","role":"builder"}));
+    let agent = Actor::agent(session["name"].as_str().unwrap());
+
+    let listed = ok_as(e, agent.clone(), "module.list", json!({}));
+    let names: Vec<&str> = listed["modules"].as_array().unwrap().iter().map(|m| m["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["Here"]);
+    ok_as(e, agent.clone(), "module.list", json!({"project_id":1}));
+    ok_as(e, agent.clone(), "module.get", json!({"module_id":here["id"]}));
+    ok_as(e, agent.clone(), "module.stats", json!({"project_id":1}));
+    ok_as(e, agent.clone(), "module.changelog.draft", json!({"module_id":here["id"]}));
+    for (op, payload) in [
+        ("module.list", json!({"project_id":2})),
+        ("module.stats", json!({"project_id":2})),
+        ("module.get", json!({"module_id":there["id"]})),
+        ("module.changelog.draft", json!({"module_id":there["id"]})),
+    ] {
+        assert_eq!(code(call(e, agent.clone(), op, payload)), "actor.scope", "{op}");
+    }
+    // The person reaches every project, and names the one they mean.
+    ok(e, "module.get", json!({"module_id":there["id"]}));
+    ok(e, "module.stats", json!({"project_id":2}));
+    assert_eq!(ok(e, "module.list", json!({"project_id":2}))["modules"][0]["name"], "Elsewhere");
+    assert_eq!(code(call(e, Actor::User, "module.list", json!({}))), "module.project");
+}
+
 /// RA-415: a fanned sub-task does not inherit the parent's branch or prompt.
 #[test]
 fn fanout_children_get_their_own_branch_and_prompt() {
