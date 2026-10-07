@@ -895,9 +895,8 @@ impl Doc {
 
     fn replace_all(&self) {
         self.sync_query();
-        let total = self.search.occurrences_count().max(0);
-        let note = match self.search.replace_all(&self.find.replacement.text()) {
-            Ok(()) => format!("Replaced {total}"),
+        let note = match crate::editor::replace_all(&self.search, &self.find.replacement.text()) {
+            Ok(count) => format!("Replaced {count}"),
             Err(error) => error.to_string(),
         };
         *self.find_note.borrow_mut() = Some(note);

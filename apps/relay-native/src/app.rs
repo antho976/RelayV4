@@ -1185,6 +1185,13 @@ impl Ui {
                                 {
                                     continue;
                                 }
+                                // An event too large to read: whatever it changed, re-read it.
+                                if e.ev == crate::client::DROPPED_EVENT {
+                                    tracing::warn!(ev = text(&e.payload, "ev"), "dropped an oversized engine event");
+                                    crate::pages::refresh_notes(&ui);
+                                    ui.refresh();
+                                    continue;
+                                }
                                 if matches!(
                                     e.ev.as_str(),
                                     "usage.changed" | "device.changed" | "run.changed"

@@ -578,6 +578,8 @@ fn show_prompt(ui: &Rc<Ui>, request: &Value) {
             }
         });
     } else {
+        // A request shown in the tray is no longer waiting, whichever path brought it here.
+        WAITING.with(|w| w.borrow_mut().retain(|r| r["id"] != request["id"]));
         // The overflow line is re-added below, so it always ends the tray.
         tray.append(&prompt_slot(&exception_card(ui, request, true), id));
     }
@@ -663,7 +665,13 @@ fn close_prompt(ui: &Rc<Ui>, id: i64) {
     }
     if removed {
         DISMISSED.with(|d| d.borrow_mut().push(id));
-        if let Some(next) = WAITING.with(|w| (!w.borrow().is_empty()).then(|| w.borrow_mut().remove(0))) {
+        // One mutable borrow, bound before show_prompt borrows WAITING again: a shared borrow
+        // held across `then` makes the borrow_mut panic.
+        let next = WAITING.with(|w| {
+            let mut waiting = w.borrow_mut();
+            (!waiting.is_empty()).then(|| waiting.remove(0))
+        });
+        if let Some(next) = next {
             show_prompt(ui, &next);
         }
     }

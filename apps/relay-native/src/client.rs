@@ -46,6 +46,17 @@ fn shape(line: &[u8]) -> Option<Shape> {
 
 const QUEUE: usize = 64;
 const MAX_LINE: usize = 2 * 1024 * 1024;
+/// How much of an oversized line is kept: enough for the envelope's first key and its value.
+const OVERSIZED_HEAD: usize = 256;
+/// Synthesized in place of an event too large to read: the listener refreshes instead.
+pub const DROPPED_EVENT: &str = "client.event_dropped";
+
+/// The string value that directly follows `prefix` at the start of `head`.
+fn head_string(head: &[u8], prefix: &[u8]) -> Option<String> {
+    let rest = head.strip_prefix(prefix)?;
+    let end = rest.iter().position(|b| *b == b'"')?;
+    String::from_utf8(rest[..end].to_vec()).ok()
+}
 
 pub fn is_lifecycle_request(op: &str) -> bool {
     matches!(
@@ -81,6 +92,8 @@ pub enum Error {
     Timeout,
     #[error("Invalid engine response: {0}")]
     Protocol(String),
+    #[error("The engine's reply was larger than {} MiB and was dropped; the connection is still open.", .0 / 1024 / 1024)]
+    TooLarge(usize),
     #[error("{0}")]
     Io(String),
 }
@@ -185,6 +198,7 @@ impl Client {
                 loop {
                     // read_until alone has no size limit. Bound the frame before allocation.
                     let mut line = Vec::new();
+                    let mut oversized = false;
                     loop {
                         let available = reader
                             .fill_buf()
@@ -197,18 +211,56 @@ impl Client {
                             .iter()
                             .position(|b| *b == b'\n')
                             .map_or(available.len(), |n| n + 1);
-                        if line.len() + n > max_line {
-                            return Err(Error::Protocol(format!(
-                                "frame exceeds {} MiB",
-                                max_line / 1024 / 1024
-                            )));
-                        }
                         let complete = available[n - 1] == b'\n';
-                        line.extend_from_slice(&available[..n]);
+                        if !oversized && line.len() + n > max_line {
+                            // Keep only the head, which says what the line was and whose reply
+                            // it is, and skip the rest without buffering it.
+                            oversized = true;
+                            let keep = OVERSIZED_HEAD.saturating_sub(line.len()).min(n);
+                            line.extend_from_slice(&available[..keep]);
+                            line.truncate(OVERSIZED_HEAD);
+                        } else if !oversized {
+                            line.extend_from_slice(&available[..n]);
+                        }
                         reader.consume(n);
                         if complete {
                             break;
                         }
+                    }
+                    if oversized {
+                        // One reply or event too large for this connection fails on its own;
+                        // the connection, its subscriptions and every other request stay up.
+                        match shape(&line) {
+                            Some(Shape::Response) => {
+                                if let Some(id) = head_string(&line, br#"{"v":1,"id":""#)
+                                    .and_then(|id| Uuid::parse_str(&id).ok())
+                                {
+                                    if let Some(reply) = waiting.lock().unwrap().remove(&id) {
+                                        let _ = reply.send(Err(Error::TooLarge(max_line)));
+                                    }
+                                    continue;
+                                }
+                            }
+                            Some(Shape::Event) => {
+                                let ev = head_string(&line, br#"{"v":1,"ev":""#).unwrap_or_default();
+                                let dropped = Event::new(
+                                    DROPPED_EVENT,
+                                    String::new(),
+                                    Actor::System,
+                                    serde_json::json!({ "ev": ev }),
+                                );
+                                reader_notices
+                                    .send(Notice::Event(dropped))
+                                    .await
+                                    .map_err(|_| Error::Disconnected)?;
+                                continue;
+                            }
+                            _ => {}
+                        }
+                        return Err(Error::Protocol(format!(
+                            "frame exceeds {} MiB",
+                            max_line / 1024 / 1024
+                        )));
                     }
                     let shape = match shape(&line) {
                         Some(shape) => shape,
@@ -340,6 +392,44 @@ impl Client {
 mod tests {
     use super::*;
     use tokio::net::UnixListener;
+
+    #[tokio::test]
+    async fn an_oversized_reply_fails_only_its_own_request() {
+        let path = std::env::temp_dir().join(format!("relay-oversized-{}.sock", Uuid::new_v4()));
+        let server = UnixListener::bind(&path).unwrap();
+        let rt = Handle::current();
+        let (client, notices) = Client::connect(&rt, path.clone()).await.unwrap();
+        let fixture = tokio::spawn(async move {
+            let (socket, _) = server.accept().await.unwrap();
+            let (read, mut write) = socket.into_split();
+            let mut lines = BufReader::new(read).lines();
+            let big: Request = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            let body = "x".repeat(MAX_LINE + 1024);
+            let reply = Response::ok(big.id, serde_json::json!({ "body": body }));
+            write.write_all(format!("{}\n", serde_json::to_string(&reply).unwrap()).as_bytes()).await.unwrap();
+            let event = Event::new("notes.changed", String::new(), Actor::User, serde_json::json!({ "body": body }));
+            write.write_all(format!("{}\n", serde_json::to_string(&event).unwrap()).as_bytes()).await.unwrap();
+            let small: Request = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            let reply = Response::ok(small.id, serde_json::json!({ "ok": true }));
+            write.write_all(format!("{}\n", serde_json::to_string(&reply).unwrap()).as_bytes()).await.unwrap();
+            // Hold the socket open until the client is done with it.
+            let _ = lines.next_line().await;
+        });
+        let big = client.request(&rt, "git.diff.file", serde_json::json!({})).await;
+        assert!(matches!(big, Err(Error::TooLarge(_))), "{big:?}");
+        match notices.recv().await.unwrap() {
+            Notice::Event(event) => {
+                assert_eq!(event.ev, DROPPED_EVENT);
+                assert_eq!(event.payload["ev"], "notes.changed");
+            }
+            other => panic!("expected the dropped-event notice, got {other:?}"),
+        }
+        let small = client.request(&rt, "git.status", serde_json::json!({})).await.unwrap();
+        assert_eq!(small["ok"], true);
+        drop(client);
+        fixture.await.unwrap();
+        let _ = std::fs::remove_file(path);
+    }
 
     #[tokio::test]
     async fn lifecycle_actions_bypass_a_stalled_status_request() {

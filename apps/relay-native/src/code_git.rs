@@ -697,8 +697,10 @@ impl Editor {
             let selected_count = Rc::new(Cell::new(0_usize));
             for (_, pick) in &picks {
                 let count = selected_count.clone();
-                let test = test.clone();
+                // Weak: Test's own handler owns every pick, so a strong Test here is a cycle.
+                let test = test.downgrade();
                 pick.connect_toggled(move |pick| {
+                    let Some(test) = test.upgrade() else { return };
                     let total = if pick.is_active() {
                         count.get() + 1
                     } else {
@@ -994,13 +996,15 @@ impl Editor {
         form.append(&create);
         list.append(&form);
         let reveal = form.clone();
-        let query = search.clone();
+        // Weak: search's Enter handler holds this key, so a strong search here is a cycle that
+        // keeps every rebuilt picker, and through `entries` every branch row, alive.
+        let query = search.downgrade();
         let focus = name.clone();
         create_key.connect_clicked(move |_| {
             let open = !reveal.is_visible();
             reveal.set_visible(open);
             if open {
-                if focus.text().is_empty() {
+                if let Some(query) = query.upgrade().filter(|_| focus.text().is_empty()) {
                     focus.set_text(query.text().trim());
                 }
                 focus.grab_focus();

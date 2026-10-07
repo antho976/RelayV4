@@ -1072,9 +1072,8 @@ impl Editor {
                 return;
             }
             // Native search retains undo grouping and UTF-8 text positions.
-            let result = e.search_context.replace_all(&e.replacement.text());
-            match result {
-                Ok(()) => e.position.set_text("Replaced all matches"),
+            match replace_all(&e.search_context, &e.replacement.text()) {
+                Ok(count) => e.position.set_text(&format!("Replaced {count}")),
                 Err(err) => e.position.set_text(&err.to_string()),
             }
         });
@@ -1339,5 +1338,30 @@ impl Editor {
                 Err(err) => ui.show_error(&err.to_string()),
             }
         });
+    }
+}
+
+/// Replace every match and return how many were replaced.
+///
+/// `SearchContext::replace_all` in sourceview5 0.11 asserts that a zero return means an
+/// error, but the C function returns the replacement count: no match, an empty query or an
+/// invalid pattern all return 0 with no error, and the assert aborts the client from inside
+/// a click handler. Only a set GError is a failure here.
+pub fn replace_all(search: &sourceview5::SearchContext, replace: &str) -> Result<u32, glib::Error> {
+    use glib::translate::{from_glib_full, ToGlibPtr};
+    let Ok(length) = i32::try_from(replace.len()) else {
+        return Err(glib::Error::new(glib::FileError::Inval, "Replacement text is too long"));
+    };
+    // SAFETY: `search` and `replace` outlive the call; GtkSourceView copies the replacement
+    // and either leaves `error` null or sets it to a GError we take ownership of.
+    unsafe {
+        let mut error = std::ptr::null_mut();
+        let count = sourceview5::ffi::gtk_source_search_context_replace_all(
+            search.to_glib_none().0,
+            replace.to_glib_none().0,
+            length,
+            &mut error,
+        );
+        if error.is_null() { Ok(count) } else { Err(from_glib_full(error)) }
     }
 }
