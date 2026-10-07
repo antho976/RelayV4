@@ -72,6 +72,17 @@ pub fn run(tx: &Transaction, store_dir: &Path) -> rusqlite::Result<Purged> {
         }
         note(tasks.len(), "deleted task(s) past the undo window");
 
+        // Attachments `task.detach` soft-deleted, row and file, once their undo is past (RA-409).
+        let detached: Vec<(i64, String)> = tx.prepare_cached(
+            "SELECT id, path FROM attachments WHERE deleted_at IS NOT NULL AND deleted_at < ?1",
+        )?.query_map([&cutoff], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        for (id, path) in &detached {
+            let path = PathBuf::from(path);
+            if path.starts_with(&attachment_root) { paths.push(path); }
+            tx.execute("DELETE FROM attachments WHERE id=?1", [id])?;
+        }
+        note(detached.len(), "detached attachment(s) past the undo window");
+
         let modules = ids(tx, "SELECT id FROM modules WHERE deleted_at IS NOT NULL AND deleted_at < ?1", &cutoff)?;
         for &id in &modules {
             tx.execute("UPDATE tasks SET module_id=NULL WHERE module_id=?1", [id])?;

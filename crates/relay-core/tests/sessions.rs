@@ -704,9 +704,10 @@ fn teardown_leaves_no_orphans() {
         names.push(name);
     }
     assert_eq!(e.live_pty_count(), 5);
-    // close three through the bus, then shut the engine down for the rest
+    // close three through the bus, then shut the engine down for the rest; the fake provider
+    // leaves its child.pid in each checkout, an untracked file (RA-405)
     for name in &names[..3] {
-        ok(e, "session.close", json!({"session": name}));
+        ok(e, "session.close", json!({"session": name, "discard_changes": true}));
     }
     for (pid, child) in &pids[..3] {
         wait_until("closed session's processes gone", || !alive(*pid) && !alive(*child));
@@ -1243,6 +1244,11 @@ fn clear_restorable_fresh_starts_the_same_terminal_without_saved_context() {
     let branch = created["branch"].clone();
 
     ok(&f.engine, "session.spawn", json!({"session": name, "prompt": "keep this assignment"}));
+    let bootstrap = |name: &str| f.engine.dispatch(
+        Request::new(Actor::agent(name), "session.bootstrap", json!({})),
+        Door::InProcess,
+    ).into_result().unwrap();
+    assert_eq!(bootstrap(&name)["assignment"], "keep this assignment", "the first launch's work to begin");
     ok(&f.engine, "session.input", json!({"session": name, "data": "old-context-marker\n"}));
     wait_until("old context in scrollback", || {
         ok(&f.engine, "session.scrollback", json!({"session": name}))["text"]
@@ -1268,6 +1274,11 @@ fn clear_restorable_fresh_starts_the_same_terminal_without_saved_context() {
     assert!(!args.contains("saved-provider-context"), "Clear passed the old provider handle: {args}");
     let scrollback = ok(&f.engine, "session.scrollback", json!({"session": name}));
     assert!(!scrollback["text"].as_str().unwrap().contains("old-context-marker"));
+    // RA-397: a fresh start long after the first launch is not handed that launch's work again;
+    // the brief keeps it, named for what it now is.
+    assert!(bootstrap(&name)["assignment"].is_null(), "a relaunch was handed the first launch's assignment");
+    let brief = ok(&f.engine, "session.brief", json!({"session": name}));
+    assert!(brief["text"].as_str().unwrap().contains("Original launch assignment (from the first launch; may already be done):\nkeep this assignment"), "{brief}");
     assert_eq!(
         code(call(&f.engine, "session.clear_restorable", json!({"session": name}))),
         "session.state",

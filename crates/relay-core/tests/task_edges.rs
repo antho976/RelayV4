@@ -160,11 +160,23 @@ fn attachment_undo_and_refused_create() {
     let e = &f.engine;
     let task = f.task("Shot", json!({}));
     let attached = ok(e, "task.attach", json!({"task_id":task["id"],"name":"shot.png","mime":"image/png","bytes_b64":b64(b"png")}));
+    let files = files_under(&f.attachments()).len();
     ok(e, "task.detach", json!({"task_id":task["id"],"attachment_id":attached["id"]}));
-    ok(e, "audit.undo", json!({"audit_id":f.last_audit("task.detach")["id"]}));
+    let detached = f.last_audit("task.detach");
+    assert_eq!(ok(e, "task.get", json!({"task_id":task["id"]}))["attachments"], json!([]));
+    assert!(ok(e, "task.list", json!({"project_id":1}))["tasks"][0]["attachments"].as_array().unwrap().is_empty());
+    assert_eq!(code(call(e, Actor::User, "task.detach", json!({"task_id":task["id"],"attachment_id":attached["id"]}))), "task.attachment_not_found");
+    assert!(Path::new(attached["path"].as_str().unwrap()).is_file(), "a detach keeps the file for its undo");
+    ok(e, "audit.undo", json!({"audit_id":detached["id"]}));
+    // RA-414: the same row comes back — id, path and all — and no second copy of the file.
     let back = &ok(e, "task.get", json!({"task_id":task["id"]}))["attachments"][0];
-    assert_eq!(back["name"], "shot.png");
-    assert_eq!(back["mime"], "image/png");
+    assert_eq!(back, &attached);
+    assert_eq!(files_under(&f.attachments()).len(), files);
+    assert_eq!(code(call(e, Actor::User, "task.attachment.restore", json!({"task_id":task["id"],"attachment_id":attached["id"]}))), "task.attachment_not_found");
+    // Redo detaches it again; restore called directly brings it back too.
+    ok(e, "audit.undo", json!({"audit_id":f.last_audit("audit.undo")["id"]}));
+    assert_eq!(ok(e, "task.get", json!({"task_id":task["id"]}))["attachments"], json!([]));
+    assert_eq!(ok(e, "task.attachment.restore", json!({"task_id":task["id"],"attachment_id":attached["id"]})), attached);
 
     let stored = files_under(&f.attachments()).len();
     let refused = call(e, Actor::User, "task.create", json!({"project_id":1,"title":"Two","attachments":[
@@ -207,6 +219,41 @@ fn agent_task_create_and_reads_stay_in_bounds() {
     }
     ok_as(e, agent, "task.create", json!({"project_id":1,"title":"Filed","column":"ready"}));
     ok(e, "task.create", json!({"project_id":1,"title":"Escape hatch","column":"done"}));
+}
+
+/// RA-386 / RA-411: an agent's module reads stop at its own project (D106); module.list
+/// without a project is its own.
+#[test]
+fn agent_module_reads_stay_in_its_project() {
+    let f = Fixture::new();
+    let e = &f.engine;
+    repo(&f.root.path().join("ws/other"));
+    ok(e, "project.add", json!({"workspace_id":1,"path":f.root.path().join("ws/other")}));
+    let here = ok(e, "module.create", json!({"project_id":1,"name":"Here"}));
+    let there = ok(e, "module.create", json!({"project_id":2,"name":"Elsewhere"}));
+    let session = ok(e, "session.create", json!({"project_id":1,"provider":"claude","role":"builder"}));
+    let agent = Actor::agent(session["name"].as_str().unwrap());
+
+    let listed = ok_as(e, agent.clone(), "module.list", json!({}));
+    let names: Vec<&str> = listed["modules"].as_array().unwrap().iter().map(|m| m["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["Here"]);
+    ok_as(e, agent.clone(), "module.list", json!({"project_id":1}));
+    ok_as(e, agent.clone(), "module.get", json!({"module_id":here["id"]}));
+    ok_as(e, agent.clone(), "module.stats", json!({"project_id":1}));
+    ok_as(e, agent.clone(), "module.changelog.draft", json!({"module_id":here["id"]}));
+    for (op, payload) in [
+        ("module.list", json!({"project_id":2})),
+        ("module.stats", json!({"project_id":2})),
+        ("module.get", json!({"module_id":there["id"]})),
+        ("module.changelog.draft", json!({"module_id":there["id"]})),
+    ] {
+        assert_eq!(code(call(e, agent.clone(), op, payload)), "actor.scope", "{op}");
+    }
+    // The person reaches every project, and names the one they mean.
+    ok(e, "module.get", json!({"module_id":there["id"]}));
+    ok(e, "module.stats", json!({"project_id":2}));
+    assert_eq!(ok(e, "module.list", json!({"project_id":2}))["modules"][0]["name"], "Elsewhere");
+    assert_eq!(code(call(e, Actor::User, "module.list", json!({}))), "module.project");
 }
 
 /// RA-415: a fanned sub-task does not inherit the parent's branch or prompt.
@@ -293,4 +340,208 @@ fn v3_import_appends_and_cleans_up_after_failure() {
     assert!(imported["position"].as_i64().unwrap() > existing["position"].as_i64().unwrap());
     let ord: i64 = e.store.lock().query_row("SELECT ord FROM modules WHERE id=?1", [out["id_map"]["modules"]["7"].as_i64().unwrap()], |r| r.get(0)).unwrap();
     assert!(ord > module["order"].as_i64().unwrap());
+}
+
+/// RA-413: `expected_updated_at` on the agent-reachable writes with no other optimistic check.
+/// Given and current, the write lands; given and stale, it is refused with the code
+/// task.update / notes.update use; omitted, nothing changes from before.
+#[test]
+fn changelog_and_append_take_an_optional_expected_updated_at() {
+    let f = Fixture::new();
+    let e = &f.engine;
+    let task = f.task("Changelog", json!({}));
+    let read = ok(e, "task.get", json!({"task_id":task["id"]}));
+    let written = ok(e, "task.changelog.write", json!({"task_id":task["id"],"text":"first","expected_updated_at":read["updated_at"]}));
+    assert_eq!(written["changelog"], "first");
+    let stale = call(e, Actor::User, "task.changelog.write", json!({"task_id":task["id"],"text":"second","expected_updated_at":"2000-01-01T00:00:00Z"}));
+    assert_eq!(code(stale), "task.edit_conflict");
+    assert_eq!(ok(e, "task.get", json!({"task_id":task["id"]}))["changelog"], "first");
+    assert_eq!(ok(e, "task.changelog.write", json!({"task_id":task["id"],"text":"third"}))["changelog"], "third");
+
+    let note = ok(e, "notes.create", json!({"project_id":1,"title":"Log","body":"a"}));
+    let appended = ok(e, "notes.append", json!({"note_id":note["id"],"text":"b","expected_updated_at":note["updated_at"]}));
+    assert_eq!(appended["body"], "a\nb");
+    let stale = call(e, Actor::User, "notes.append", json!({"note_id":note["id"],"text":"c","expected_updated_at":"2000-01-01T00:00:00Z"}));
+    assert_eq!(code(stale), "notes.edit_conflict");
+    assert_eq!(ok(e, "notes.get", json!({"note_id":note["id"]}))["body"], "a\nb");
+    assert_eq!(ok(e, "notes.append", json!({"note_id":note["id"],"text":"d"}))["body"], "a\nb\nd");
+    // The standing note, found from the project, is checked the same way.
+    let standing = ok(e, "notes.append", json!({"project_id":1,"text":"rule"}));
+    let stale = call(e, Actor::User, "notes.append", json!({"project_id":1,"text":"x","expected_updated_at":"2000-01-01T00:00:00Z"}));
+    assert_eq!(code(stale), "notes.edit_conflict");
+    ok(e, "notes.append", json!({"project_id":1,"text":"rule two","expected_updated_at":standing["updated_at"]}));
+}
+
+/// RA-409: the retention pass removes a detached attachment's row and file once its undo
+/// window is past, and not before.
+#[test]
+fn retention_reclaims_detached_attachments_past_the_window() {
+    let f = Fixture::new();
+    let e = &f.engine;
+    let task = f.task("Shots", json!({}));
+    let old = ok(e, "task.attach", json!({"task_id":task["id"],"name":"old.png","mime":"image/png","bytes_b64":b64(b"old")}));
+    let recent = ok(e, "task.attach", json!({"task_id":task["id"],"name":"new.png","mime":"image/png","bytes_b64":b64(b"new")}));
+    let live = ok(e, "task.attach", json!({"task_id":task["id"],"name":"live.png","mime":"image/png","bytes_b64":b64(b"live")}));
+    for a in [&old, &recent] {
+        ok(e, "task.detach", json!({"task_id":task["id"],"attachment_id":a["id"]}));
+    }
+    e.store.lock().execute("UPDATE attachments SET deleted_at='2000-01-01T00:00:00Z' WHERE id=?1", [old["id"].as_i64().unwrap()]).unwrap();
+    let out = ok(e, "app.reconcile", json!({}));
+    assert!(out["actions"].to_string().contains("detached attachment"), "{out}");
+    let path = |a: &Value| PathBuf::from(a["path"].as_str().unwrap());
+    // The files go on a worker after the commit.
+    for _ in 0..200 {
+        if !path(&old).exists() { break }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(!path(&old).exists());
+    assert!(path(&recent).is_file() && path(&live).is_file());
+    let rows: i64 = e.store.lock().query_row("SELECT COUNT(*) FROM attachments", [], |r| r.get(0)).unwrap();
+    assert_eq!(rows, 2);
+    ok(e, "task.attachment.restore", json!({"task_id":task["id"],"attachment_id":recent["id"]}));
+    assert_eq!(code(call(e, Actor::User, "task.attachment.restore", json!({"task_id":task["id"],"attachment_id":old["id"]}))), "task.attachment_not_found");
+}
+
+/// RA-409: recovery removes attachment files nothing references — but not one a row (live or
+/// detached) names, one an undoable pre-v24 detach would bring back, or one a removed project's
+/// backup still holds for project.restore.
+#[test]
+fn recovery_sweeps_orphaned_attachment_files() {
+    let f = Fixture::new();
+    let e = &f.engine;
+    let task = f.task("Shots", json!({}));
+    let live = ok(e, "task.attach", json!({"task_id":task["id"],"name":"live.png","mime":"image/png","bytes_b64":b64(b"live")}));
+    let detached = ok(e, "task.attach", json!({"task_id":task["id"],"name":"gone.png","mime":"image/png","bytes_b64":b64(b"gone")}));
+    ok(e, "task.detach", json!({"task_id":task["id"],"attachment_id":detached["id"]}));
+    let dir = f.attachments().join(task["id"].to_string());
+    let orphan = dir.join("99-orphan.png");
+    std::fs::write(&orphan, b"orphan").unwrap();
+    let stray = f.attachments().join("424242");
+    std::fs::create_dir_all(&stray).unwrap();
+    std::fs::write(stray.join("1-stray.png"), b"stray").unwrap();
+    let legacy = dir.join("98-legacy.png");
+    std::fs::write(&legacy, b"legacy").unwrap();
+    e.store.lock().execute(
+        "INSERT INTO audit(ts, req_id, actor, op, project_id, kind, payload_hash, undo_op) VALUES (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), 'legacy-detach', 'user', 'task.detach', 1, 'ok', 'x', ?1)",
+        [json!({"op":"task.attach","payload":{"task_id":task["id"],"path":legacy,"name":"legacy.png","mime":"image/png"}}).to_string()],
+    ).unwrap();
+    // A fresh staged copy may belong to an attach in flight.
+    let staged = f.attachments().join(".staging/in-flight");
+    std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+    std::fs::write(&staged, b"x").unwrap();
+
+    let report = relay_core::recovery::run(e).unwrap();
+    assert!(report.fsck_fixes.iter().any(|x| x == "removed 2 orphaned attachment file(s)"), "{:?}", report.fsck_fixes);
+    assert!(!orphan.exists() && !stray.exists(), "orphans and their empty directory go");
+    for kept in [PathBuf::from(live["path"].as_str().unwrap()), PathBuf::from(detached["path"].as_str().unwrap()), legacy.clone(), staged.clone()] {
+        assert!(kept.is_file(), "{kept:?} was removed");
+    }
+
+    // A removed project's files wait for its backup: project.restore needs them.
+    ok(e, "project.remove", json!({"project_id":1}));
+    let report = relay_core::recovery::run(e).unwrap();
+    assert!(!report.fsck_fixes.iter().any(|x| x.contains("attachment")), "{:?}", report.fsck_fixes);
+    assert!(PathBuf::from(live["path"].as_str().unwrap()).is_file());
+    for backup in e.store.list_backups().unwrap() {
+        std::fs::remove_file(backup.path).unwrap();
+    }
+    relay_core::recovery::run(e).unwrap();
+    assert!(!PathBuf::from(live["path"].as_str().unwrap()).exists());
+    assert!(!PathBuf::from(detached["path"].as_str().unwrap()).exists());
+    assert!(legacy.is_file(), "the undoable audit row still names it");
+}
+
+/// RA-412: task.list hydrates its page in one statement per side table. Every task it returns
+/// must read exactly as task.get returns it: sessions, commits, attachments (not detached
+/// ones), labels, relations, children and roll-up.
+#[test]
+fn task_list_hydrates_each_task_as_task_get_does() {
+    let f = Fixture::new();
+    let e = &f.engine;
+    let a = f.task("A", json!({"labels":["ux","Backend"],"column":"ready"}));
+    let b = f.task("B", json!({"labels":["ux"],"parent_id":a["id"]}));
+    let c = f.task("C", json!({"parent_id":b["id"]}));
+    let d = f.task("D", json!({"column":"in_review"}));
+    let plain = f.task("Plain", json!({}));
+    let session = ok(e, "session.create", json!({"project_id":1,"provider":"claude","worktree":"primary","task_id":a["id"]}));
+    ok(e, "task.dispatch", json!({"task_id":d["id"],"session":session["name"],"start":false}));
+    ok(e, "task.link_commit", json!({"task_id":a["id"],"sha":"aaa","branch":"main"}));
+    ok(e, "task.link_commit", json!({"task_id":a["id"],"sha":"bbb"}));
+    ok(e, "task.approve", json!({"task_id":c["id"],"sha":"ccc"}));
+    for (task, name) in [(&a, "one.png"), (&a, "two.png"), (&b, "three.png")] {
+        ok(e, "task.attach", json!({"task_id":task["id"],"name":name,"mime":"image/png","bytes_b64":b64(name.as_bytes())}));
+    }
+    let gone = ok(e, "task.attach", json!({"task_id":d["id"],"name":"gone.png","mime":"image/png","bytes_b64":b64(b"gone")}));
+    ok(e, "task.detach", json!({"task_id":d["id"],"attachment_id":gone["id"]}));
+    ok(e, "task.relate", json!({"task_id":a["id"],"relation":"blocked_by","other_id":d["id"]}));
+    ok(e, "task.relate", json!({"task_id":plain["id"],"relation":"blocked_by","other_id":d["id"]}));
+    ok(e, "task.relate", json!({"task_id":b["id"],"relation":"duplicate_of","other_id":plain["id"]}));
+
+    let listed = ok(e, "task.list", json!({"project_id":1}))["tasks"].as_array().unwrap().clone();
+    assert_eq!(listed.len(), 5);
+    for task in &listed {
+        assert_eq!(task, &ok(e, "task.get", json!({"task_id":task["id"]})));
+    }
+    let get = |t: &Value| ok(e, "task.get", json!({"task_id":t["id"]}));
+    let a = get(&a);
+    assert!(!a["sessions"].as_array().unwrap().is_empty(), "{a}");
+    assert_eq!(a["commits"].as_array().unwrap().len(), 2);
+    assert_eq!(a["attachments"].as_array().unwrap().len(), 2);
+    assert_eq!(a["labels"], json!(["Backend", "ux"]));
+    assert_eq!(a["children"], json!([b["id"]]));
+    assert_eq!(a["rollup"], json!({"total":2,"done":1}));
+    assert_eq!(get(&d)["blocks"], json!([a["id"], plain["id"]]));
+    assert_eq!(get(&d)["attachments"], json!([]));
+    assert!(!get(&d)["sessions"].as_array().unwrap().is_empty());
+    assert_eq!(get(&b)["duplicate_of"], plain["id"]);
+    assert_eq!(get(&c)["depth"], 2);
+    // A page is hydrated as a whole too.
+    let page = ok(e, "task.list", json!({"project_id":1,"limit":2,"offset":1}))["tasks"].as_array().unwrap().clone();
+    assert_eq!(page, listed[1..3]);
+}
+
+/// RA-416: undoing task.approve is task.unapprove. The task returns to its column, slot and
+/// state, and the commit link the approval added goes; a link that was there before stays.
+#[test]
+fn undoing_approve_restores_the_task_and_drops_only_its_own_link() {
+    let f = Fixture::new();
+    let e = &f.engine;
+    let ids = |e: &Engine| -> Vec<i64> {
+        ok(e, "task.list", json!({"project_id":1,"column":"in_review"}))["tasks"].as_array().unwrap()
+            .iter().map(|t| t["id"].as_i64().unwrap()).collect()
+    };
+    let a = f.task("A", json!({"column":"in_review"}));
+    let b = f.task("B", json!({"column":"in_review"}));
+    let c = f.task("C", json!({"column":"in_review"}));
+    ok(e, "task.update", json!({"task_id":b["id"],"state":"awaiting_review"}));
+    let before = ids(e);
+    let done = ok(e, "task.approve", json!({"task_id":b["id"],"sha":"cafe"}));
+    assert_eq!(done["column"], "done");
+    assert_eq!(done["state"], "none");
+    let row = f.last_audit("task.approve");
+    assert_eq!(row["undo_op"]["op"], "task.unapprove");
+    ok(e, "audit.undo", json!({"audit_id":row["id"]}));
+    let back = ok(e, "task.get", json!({"task_id":b["id"]}));
+    assert_eq!(back["column"], "in_review");
+    assert_eq!(back["state"], "awaiting_review");
+    assert_eq!(back["commits"], json!([]));
+    assert_eq!(ids(e), before);
+    assert_eq!(before, [a["id"].as_i64().unwrap(), b["id"].as_i64().unwrap(), c["id"].as_i64().unwrap()]);
+    // Undoing the undo is a redo: back to done with the same commit.
+    ok(e, "audit.undo", json!({"audit_id":f.last_audit("audit.undo")["id"]}));
+    let again = ok(e, "task.get", json!({"task_id":b["id"]}));
+    assert_eq!(again["column"], "done");
+    assert_eq!(again["commits"][0]["sha"], "cafe");
+
+    // A commit linked before the approval is not the approval's to remove.
+    ok(e, "task.link_commit", json!({"task_id":a["id"],"sha":"beef","branch":"relay/a"}));
+    ok(e, "task.approve", json!({"task_id":a["id"],"sha":"beef"}));
+    ok(e, "audit.undo", json!({"audit_id":f.last_audit("task.approve")["id"]}));
+    let kept = ok(e, "task.get", json!({"task_id":a["id"]}));
+    assert_eq!(kept["column"], "in_review");
+    assert_eq!(kept["commits"].as_array().unwrap().len(), 1);
+    assert_eq!(kept["commits"][0]["sha"], "beef");
+
+    // Called directly it refuses a task that is not done.
+    assert_eq!(code(call(e, Actor::User, "task.unapprove", json!({"task_id":c["id"],"column":"ready","position":0,"state":"none"}))), "task.column_transition");
 }

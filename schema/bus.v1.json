@@ -4,7 +4,7 @@
   "title": "RELAY v4 command bus",
   "description": "Generated from crates/relay-bus by `relay schema`. Do not edit; see docs/engine/BUS.md.",
   "version": 1,
-  "op_count": 230,
+  "op_count": 232,
   "envelope": {
     "request": {
       "$ref": "#/$defs/Request"
@@ -964,7 +964,7 @@
       }
     },
     "task.changelog.write": {
-      "summary": "Write the sentence that ships in patch notes",
+      "summary": "Write the sentence that ships in patch notes; pass expected_updated_at (from your last read) to refuse the write if the task changed since",
       "kind": "mutation",
       "audit": "always",
       "undo": "inverse",
@@ -1004,7 +1004,7 @@
       }
     },
     "task.detach": {
-      "summary": "Remove an attachment",
+      "summary": "Remove an attachment (soft: task.attachment.restore brings it back)",
       "kind": "mutation",
       "audit": "always",
       "undo": "inverse",
@@ -1021,6 +1021,26 @@
       },
       "result": {
         "$ref": "#/$defs/Empty"
+      }
+    },
+    "task.attachment.restore": {
+      "summary": "Restore a detached attachment with its id and file",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "inverse",
+      "scope": "project",
+      "actors": "all",
+      "doors": "all",
+      "emits": [
+        "task.changed"
+      ],
+      "since": "1.0",
+      "phase": 7,
+      "payload": {
+        "$ref": "#/$defs/TaskDetachIn"
+      },
+      "result": {
+        "$ref": "#/$defs/Attachment"
       }
     },
     "task.parent.set": {
@@ -1200,6 +1220,26 @@
         "$ref": "#/$defs/Task"
       }
     },
+    "task.unapprove": {
+      "summary": "Undo task.approve: done task → its old column, slot and state, dropping the commit link the approval added",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "inverse",
+      "scope": "project",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "task.changed"
+      ],
+      "since": "1.0",
+      "phase": 7,
+      "payload": {
+        "$ref": "#/$defs/TaskUnapproveIn"
+      },
+      "result": {
+        "$ref": "#/$defs/Task"
+      }
+    },
     "task.copy_text": {
       "summary": "A task as plain text: `#id title`, then the body",
       "kind": "query",
@@ -1257,7 +1297,7 @@
       }
     },
     "module.list": {
-      "summary": "Modules index: list + header stats",
+      "summary": "Modules index: list + header stats; an agent sees its own project's",
       "kind": "query",
       "audit": "never",
       "undo": "none",
@@ -1489,7 +1529,7 @@
       }
     },
     "notes.append": {
-      "summary": "Append text to a note, the project's standing note, or its agent suggestions note",
+      "summary": "Append text to a note, the project's standing note, or its agent suggestions note; pass expected_updated_at (from your last read) to refuse if the note changed since",
       "kind": "mutation",
       "audit": "always",
       "undo": "none",
@@ -1783,7 +1823,7 @@
       }
     },
     "session.close": {
-      "summary": "Kill, purge build output, remove worktree; branch kept",
+      "summary": "Kill, purge build output, remove worktree (refused if dirty unless discard_changes); branch kept",
       "kind": "mutation",
       "audit": "always",
       "undo": "none",
@@ -2143,7 +2183,7 @@
       "since": "1.0",
       "phase": 6,
       "payload": {
-        "$ref": "#/$defs/SessionNameIn"
+        "$ref": "#/$defs/SessionDiscardRestorableIn"
       },
       "result": {
         "$ref": "#/$defs/Empty"
@@ -6136,6 +6176,13 @@
             "null"
           ],
           "description": "With `force`: also delete the Relay-pool worktrees of the sessions it closes. Branches\nare always kept; off by default, so every checkout stays on disk."
+        },
+        "discard_changes": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "With `remove_worktrees`: delete them even with uncommitted changes. Without it, a dirty\none is refused `worktree.dirty` before anything is closed or removed (RA-405)."
         }
       },
       "required": [
@@ -6453,6 +6500,13 @@
             "null"
           ],
           "description": "With `force`: also delete the Relay-pool worktrees of the sessions it closes. Branches\nare always kept; off by default, so every checkout stays on disk."
+        },
+        "discard_changes": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "With `remove_worktrees`: delete them even with uncommitted changes. Without it, a dirty\none is refused `worktree.dirty` before anything is closed or removed (RA-405)."
         }
       },
       "required": [
@@ -7566,6 +7620,13 @@
         },
         "text": {
           "type": "string"
+        },
+        "expected_updated_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The task's `updated_at` as you last read it. When given and the task has changed since,\nthe write is refused (`task.edit_conflict`) instead of overwriting someone else's edit;\nomitted, the write goes through as before."
         }
       },
       "required": [
@@ -8118,6 +8179,42 @@
         "task_id"
       ]
     },
+    "TaskUnapproveIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "task_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "column": {
+          "$ref": "#/$defs/Column",
+          "description": "The column the task goes back to; not `done`."
+        },
+        "position": {
+          "type": "integer",
+          "format": "int64",
+          "description": "Its 0-based index in that column, as in `task.move`."
+        },
+        "state": {
+          "$ref": "#/$defs/TaskState",
+          "description": "The run state it had before the approval."
+        },
+        "sha": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The commit link the approval created, removed again. Absent when the approval linked a\ncommit that was already there, which then stays."
+        }
+      },
+      "required": [
+        "task_id",
+        "column",
+        "position",
+        "state"
+      ]
+    },
     "TaskCopyTextOut": {
       "type": "object",
       "properties": {
@@ -8329,8 +8426,12 @@
       "additionalProperties": false,
       "properties": {
         "project_id": {
-          "type": "integer",
-          "format": "int64"
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "Required from the person; an agent may leave it out for its own project, the only one\nit may name (D106)."
         },
         "include_archived": {
           "type": [
@@ -8338,10 +8439,7 @@
             "null"
           ]
         }
-      },
-      "required": [
-        "project_id"
-      ]
+      }
     },
     "ModuleListOut": {
       "type": "object",
@@ -8785,6 +8883,13 @@
         },
         "text": {
           "type": "string"
+        },
+        "expected_updated_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The target note's `updated_at` as you last read it. When given and the note has changed\nsince, nothing is appended (`notes.edit_conflict`); omitted, the text is appended as before."
         }
       },
       "required": [
@@ -9107,6 +9212,13 @@
             "boolean",
             "null"
           ]
+        },
+        "discard_changes": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Delete the worktree even with uncommitted changes (tracked edits or untracked files).\nWithout it, removing a dirty Relay-pool worktree is refused `worktree.dirty` (RA-405)."
         }
       },
       "required": [
@@ -9536,7 +9648,8 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "description": "The launch prompt, on the session's first launch only: a relaunch may come long after\nthat work was done (RA-397). The brief keeps it as the original launch assignment."
         },
         "brief_path": {
           "type": "string",
@@ -9967,6 +10080,25 @@
         "session",
         "reason",
         "worktree_dirty"
+      ]
+    },
+    "SessionDiscardRestorableIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "session": {
+          "type": "string"
+        },
+        "discard_changes": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Delete the worktree even with uncommitted changes. Without it, a dirty Relay-pool\nworktree that the discard would delete is refused `worktree.dirty` (RA-405)."
+        }
+      },
+      "required": [
+        "session"
       ]
     },
     "OverlapProjectIn": {

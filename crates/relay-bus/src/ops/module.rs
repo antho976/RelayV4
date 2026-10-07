@@ -12,9 +12,14 @@ payload!(#[schemars(rename = "ModuleIdIn")] IdIn { pub module_id: Id });
 result!(#[schemars(rename = "ModuleGetOut")] GetOut { #[serde(flatten)] pub module: Module, pub tasks_by_state: BTreeMap<Column, Vec<Task>> });
 op!(Get, "module.get", IdIn => GetOut, OpMeta::query(Scope::Project, 7, "Module detail with its tasks grouped by column"));
 
-payload!(#[schemars(rename = "ModuleListIn")] ListIn { pub project_id: Id, pub include_archived: Option<bool> });
+payload!(#[schemars(rename = "ModuleListIn")] ListIn {
+    /// Required from the person; an agent may leave it out for its own project, the only one
+    /// it may name (D106).
+    pub project_id: Option<Id>,
+    pub include_archived: Option<bool>,
+});
 result!(#[schemars(rename = "ModuleListOut")] ListOut { pub modules: Vec<ModuleSummary>, pub header: ModuleHeader });
-op!(List, "module.list", ListIn => ListOut, OpMeta::query(Scope::Project, 7, "Modules index: list + header stats"));
+op!(List, "module.list", ListIn => ListOut, OpMeta::query(Scope::Project, 7, "Modules index: list + header stats; an agent sees its own project's"));
 
 payload!(#[schemars(rename = "ModuleUpdateIn")] UpdateIn {
     pub module_id: Id, pub name: Option<String>,

@@ -1,5 +1,42 @@
 # Audit findings left open: engine handler Lows
 
+**Update 2026-10-07 (branch `relay/sunny-puffin`, which also carries PR #42):** every item below
+is now closed except the two notes in "Still open". Each fix names its RA id in its commit.
+
+- RA-405: `session.close`, `session.discard_restorable`, `project.remove` and `workspace.remove`
+  refuse `worktree.dirty` unless `discard_changes: true`; the native client and the phone confirm
+  and retry.
+- RA-413: optional `expected_updated_at` on `task.changelog.write` and `notes.append`.
+- RA-416: `task.unapprove`, task.approve's inverse; it removes the commit link only if approve made it.
+- RA-414: attachments are soft-deleted (migration v24); `task.attachment.restore` keeps id and file.
+- RA-373: `git.branch.clean_merged` answers `failed: {branch, reason}[]`; cleanup rows carry `merged`.
+- RA-370: one disk walk (PR #42).
+- RA-372: `GH_PROMPT_DISABLED=1` on every gh call; user hooks never prompt.
+- RA-378: guardrail.explain skips the old file when a diff removes nothing.
+- RA-394: skill stamps are built from content and the asset folder, not `updated_at`.
+- RA-386 / RA-411: `module.*` reads are scoped to an agent's own project.
+- RA-397: bootstrap returns `assignment` on the first launch only.
+- RA-401: the CLI drops `tool_response` before `session.report`.
+- RA-403: session.update's undo checks the fields it wrote, and drops the queue rows it added.
+- RA-382: v3 import copies attachments off the store lock (`register_staged`).
+- RA-385: every brief section has a budget and points at the op with the full list.
+- RA-409: detached attachments are reclaimed after `undo.grace_days`; recovery sweeps orphans.
+- RA-412: `task.list` hydrates a page with one statement per side table.
+- RA-358: a lease taken by a request that rolls back is taken back, so no event is owed.
+- Docs: every BUS.md item listed at the end, and the agent_menu.rs gradlew message.
+
+## Still open
+
+- RA-412, client half: the native board shows done tasks and reads `body`, so loading done
+  tasks lazily or using `summary` would change what is on screen. Needs a design decision.
+- RA-405: no test for a session opened between the check and the removal (its checkout is kept
+  by construction); `docs/MOBILE.md` does not mention the new confirm.
+
+---
+
+The original list follows, as written before these fixes.
+
+
 Scope: RA-348..424 (Low defects in `crates/relay-core/src/handlers/*`), fixed on branch
 `relay/jade-yak` (2026-10-07). Everything in that range is fixed or was already fixed, except the
 parts below. Each says why it is open and what closing it would take. Most need a file another

@@ -39,6 +39,7 @@ const SHIPPED_MIGRATIONS: &[&str] = &[
     "62681b138e192280c0e12cbb2a9abf5c7c4fde9506337682d16d091e3f46b39e", // v21
     "91c29598127eea523390db607475e48c670a6cfc4cbfd3eb3cf5e8ebb95a0e49", // v22
     "f59a2bedad6eca0af4f82d20b22ffc35a5befc24a1348f0bca8e63ce87448bbb", // v23
+    "9686cbabdf0e0ed0d5a321c149cf8477480d03f05584f58daa07d85c89760c69", // v24
 ];
 
 #[test]
@@ -185,6 +186,11 @@ fn every_prior_version_migrates_forward() {
                 // v23: SQLite cannot hash, so a hold from before is hashed when first read.
                 let unhashed: i64 = conn.query_row("SELECT COUNT(*) FROM holds WHERE payload_hash IS NULL", [], |r| r.get(0)).unwrap();
                 assert_eq!(unhashed, 2, "v{k}: a hold from before v23 must read as not yet hashed");
+            }
+            if k < 24 {
+                // v24: every attachment from before soft-delete existed is live.
+                let gone: i64 = conn.query_row("SELECT COUNT(*) FROM attachments WHERE deleted_at IS NOT NULL", [], |r| r.get(0)).unwrap();
+                assert_eq!(gone, 0, "v{k}: an attachment from before v24 must read as live");
             }
         }
         // every table has its FK indexes: no FK column without an index (SPEC §1)

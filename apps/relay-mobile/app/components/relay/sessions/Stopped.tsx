@@ -10,6 +10,7 @@ import { isCancelled, relay, RelaySession, useRelayStore } from '@lib/engine/Rel
 import { Logger } from '@lib/state/Logger'
 import { Theme } from '@lib/theme/ThemeManager'
 
+import { confirmingDiscard } from './lifecycle'
 import { sessionHref, terminalHref } from './links'
 import { Restorable } from './Overview'
 
@@ -149,9 +150,13 @@ export const StoppedAgents: React.FC<{
         if (!yes) return
         setBusy(item.name)
         try {
-            if (item.restorable)
-                await relay.guarded('session.discard_restorable', { session: item.name })
-            else await relay.guarded('session.close', { session: item.name })
+            const op = item.restorable ? 'session.discard_restorable' : 'session.close'
+            await confirmingDiscard(item.name, (discard) =>
+                relay.guarded(op, {
+                    session: item.name,
+                    ...(discard ? { discard_changes: true } : {}),
+                })
+            )
         } catch (e) {
             report(e)
         } finally {

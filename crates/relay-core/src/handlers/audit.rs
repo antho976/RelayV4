@@ -42,6 +42,17 @@ fn target_updated_at(ctx: &Ctx, op: &str, payload: &Value) -> Result<Option<Stri
     ctx.tx().query_row(&sql, [id], |row| row.get(0)).optional().bus()
 }
 
+/// The open session `session.update`'s inverse names, as JSON: names pass to later sessions.
+fn open_session(ctx: &Ctx, payload: &Value) -> Result<Option<Value>, BusError> {
+    let Some(name) = payload.get("session").and_then(Value::as_str) else { return Ok(None) };
+    let id: Option<i64> = ctx.tx().prepare_cached(
+        "SELECT id FROM sessions WHERE name=?1 AND state!='closed' ORDER BY id DESC LIMIT 1",
+    ).bus()?.query_row([name], |row| row.get(0)).optional().bus()?;
+    let Some(id) = id else { return Ok(None) };
+    let Some(row) = crate::sessions::by_id(ctx.tx(), id)? else { return Ok(None) };
+    serde_json::to_value(&row.session).map(Some).bus()
+}
+
 /// A reorder stamps every row it writes with one `updated_at`. That stamp while all of them
 /// still carry it; `None` (stale) once any one was edited since, removed, or not named.
 fn reordered_at(ctx: &Ctx, table: &str, key: &str, payload: &Value) -> Result<Option<String>, BusError> {
@@ -131,8 +142,23 @@ pub fn register(e: &mut Engine) {
             return Err(BusError::conflict("audit.not_undoable", format!("audit row {} was already undone", row.id)));
         }
         let inverse = row.undo_op.clone().expect("checked above");
+        let expect = inverse.expect.clone().unwrap_or(Value::Null);
+        // `session.update` records the fields it wrote: a running session's every report moves
+        // its `updated_at`, so only one of those fields changing again makes the undo stale.
+        // Rows recorded before that carry `updated_at` and take the general path (RA-403).
+        let fields = (inverse.op == "session.update").then(|| expect.get("fields").and_then(Value::as_object)).flatten();
         if !p.force.unwrap_or(false) {
-            if let Some(expected) = inverse.expect.as_ref().and_then(|v| v.get("updated_at")).and_then(Value::as_str) {
+            if let Some(fields) = fields {
+                let session = open_session(ctx, &inverse.payload)?
+                    .ok_or_else(|| BusError::conflict("audit.stale", "the session was closed after the audited operation"))?;
+                let moved: Vec<&String> = fields.iter()
+                    .filter(|(name, wrote)| session.get(name.as_str()).unwrap_or(&Value::Null) != *wrote)
+                    .map(|(name, _)| name).collect();
+                if !moved.is_empty() {
+                    return Err(BusError::conflict("audit.stale", "the session's fields changed after the audited operation")
+                        .with_details(serde_json::json!({"fields": moved})));
+                }
+            } else if let Some(expected) = expect.get("updated_at").and_then(Value::as_str) {
                 let actual = target_updated_at(ctx, &inverse.op, &inverse.payload)?;
                 if actual.as_deref() != Some(expected) {
                     return Err(BusError::conflict("audit.stale", "the entity changed after the audited operation")
@@ -144,6 +170,14 @@ pub fn register(e: &mut Engine) {
         }
         let by: i64 = ctx.tx().query_row("SELECT COALESCE(MAX(id),0)+1 FROM audit", [], |r| r.get(0)).bus()?;
         ctx.invoke_registered(&inverse.op, inverse.payload)?;
+        // The queue rows the update added, as (task, session) pairs, unless already worked.
+        if inverse.op == "session.update" {
+            for pair in expect.get("queued").and_then(Value::as_array).into_iter().flatten() {
+                let (Some(task_id), Some(session_id)) = (pair.get(0).and_then(Value::as_i64), pair.get(1).and_then(Value::as_i64)) else { continue };
+                ctx.tx().prepare_cached("DELETE FROM task_sessions WHERE task_id=?1 AND session_id=?2 AND completed_at IS NULL").bus()?
+                    .execute([task_id, session_id]).bus()?;
+            }
+        }
         ctx.set_undo_of(row.id);
         Ok(UndoOut { undone: row.id, by })
     });

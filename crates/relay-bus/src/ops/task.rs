@@ -2,7 +2,7 @@
 use crate::registry::{Actors, OpMeta, Scope, Undo};
 use crate::types::{
     Attachment, AuditRow, Column, Id, Label, Message, Priority, Session, Size, Task, TaskRelation,
-    TaskState, TaskType,
+    TaskState, TaskType, Ts,
 };
 use crate::{op, Empty};
 
@@ -84,16 +84,24 @@ payload!(#[schemars(rename = "TaskLinkCommitIn")] LinkCommitIn { pub task_id: Id
 op!(LinkCommit, "task.link_commit", LinkCommitIn => Task,
     OpMeta::mutation(Scope::Project, 7, "Link a commit sha to a task").emits(&["task.changed"]));
 
-payload!(#[schemars(rename = "TaskChangelogWriteIn")] ChangelogWriteIn { pub task_id: Id, pub text: String });
+payload!(#[schemars(rename = "TaskChangelogWriteIn")] ChangelogWriteIn {
+    pub task_id: Id, pub text: String,
+    /// The task's `updated_at` as you last read it. When given and the task has changed since,
+    /// the write is refused (`task.edit_conflict`) instead of overwriting someone else's edit;
+    /// omitted, the write goes through as before.
+    pub expected_updated_at: Option<Ts>,
+});
 op!(ChangelogWrite, "task.changelog.write", ChangelogWriteIn => Task,
-    OpMeta::mutation(Scope::Project, 7, "Write the sentence that ships in patch notes").undo(Undo::Inverse).emits(&["task.changed"]));
+    OpMeta::mutation(Scope::Project, 7, "Write the sentence that ships in patch notes; pass expected_updated_at (from your last read) to refuse the write if the task changed since").undo(Undo::Inverse).emits(&["task.changed"]));
 
 payload!(#[schemars(rename = "TaskAttachIn")] AttachIn { pub task_id: Id, pub name: Option<String>, pub mime: Option<String>, pub bytes_b64: Option<String>, pub path: Option<String> });
 op!(Attach, "task.attach", AttachIn => Attachment,
     OpMeta::mutation(Scope::Project, 7, "Attach an image by bytes or by path").emits(&["task.changed"]));
 payload!(#[schemars(rename = "TaskDetachIn")] DetachIn { pub task_id: Id, pub attachment_id: Id });
 op!(Detach, "task.detach", DetachIn => Empty,
-    OpMeta::mutation(Scope::Project, 7, "Remove an attachment").undo(Undo::Inverse).emits(&["task.changed"]));
+    OpMeta::mutation(Scope::Project, 7, "Remove an attachment (soft: task.attachment.restore brings it back)").undo(Undo::Inverse).emits(&["task.changed"]));
+op!(AttachmentRestore, "task.attachment.restore", DetachIn => Attachment,
+    OpMeta::mutation(Scope::Project, 7, "Restore a detached attachment with its id and file").undo(Undo::Inverse).emits(&["task.changed"]));
 
 payload!(#[schemars(rename = "TaskDispatchIn")] DispatchIn {
     pub task_id: Id, pub session: Option<String>, pub create: Option<crate::ops::session::CreateIn>,
@@ -111,6 +119,21 @@ op!(Dispatch, "task.dispatch", DispatchIn => DispatchOut,
 payload!(#[schemars(rename = "TaskApproveIn")] ApproveIn { pub task_id: Id, pub sha: Option<String> });
 op!(Approve, "task.approve", ApproveIn => Task,
     OpMeta::mutation(Scope::Project, 7, "open task → done, linking the commit").actors(Actors::UserOnly).undo(Undo::Inverse).emits(&["task.changed"]));
+
+payload!(#[schemars(rename = "TaskUnapproveIn")] UnapproveIn {
+    pub task_id: Id,
+    /// The column the task goes back to; not `done`.
+    pub column: Column,
+    /// Its 0-based index in that column, as in `task.move`.
+    pub position: i64,
+    /// The run state it had before the approval.
+    pub state: TaskState,
+    /// The commit link the approval created, removed again. Absent when the approval linked a
+    /// commit that was already there, which then stays.
+    pub sha: Option<String>,
+});
+op!(Unapprove, "task.unapprove", UnapproveIn => Task,
+    OpMeta::mutation(Scope::Project, 7, "Undo task.approve: done task → its old column, slot and state, dropping the commit link the approval added").actors(Actors::UserOnly).undo(Undo::Inverse).emits(&["task.changed"]));
 
 payload!(#[schemars(rename = "TaskParentSetIn")] ParentSetIn {
     pub task_id: Id,
@@ -158,6 +181,7 @@ entries!(
     ChangelogWrite,
     Attach,
     Detach,
+    AttachmentRestore,
     ParentSet,
     Children,
     LabelAdd,
@@ -167,5 +191,6 @@ entries!(
     Unrelate,
     Dispatch,
     Approve,
+    Unapprove,
     CopyText
 );

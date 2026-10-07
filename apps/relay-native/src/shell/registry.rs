@@ -650,6 +650,20 @@ impl Ui {
             let busy = busy.clone();
             dialog.set_guard(move || !busy.get());
         }
+        // A worktree it would delete holds uncommitted work: the engine refuses `worktree.dirty`
+        // and says which, and the next click deletes them anyway (RA-405). Keeping the
+        // worktrees after all takes the question back.
+        const DISCARD: &str = "Discard changes and remove";
+        let discard = Rc::new(Cell::new(false));
+        {
+            let (discard, accept, caption, error) = (discard.clone(), accept.clone(), caption.clone(), error.clone());
+            worktrees.connect_toggled(move |check| {
+                if !check.is_active() && discard.replace(false) {
+                    accept.set_label(&caption);
+                    error.set_visible(false);
+                }
+            });
+        }
         let weak = Rc::downgrade(self);
         let panel = Rc::downgrade(&dialog);
         let cancel_key = cancel.clone();
@@ -663,13 +677,14 @@ impl Ui {
             };
             payload["force"] = json!(true);
             payload["remove_worktrees"] = json!(worktrees.is_active());
+            payload["discard_changes"] = json!(discard.get() && worktrees.is_active());
             busy.set(true);
             key.set_sensitive(false);
             cancel.set_sensitive(false);
             key.set_label("Removing…");
             error.set_visible(false);
             let (key, cancel, error, caption) = (key.clone(), cancel.clone(), error.clone(), caption.clone());
-            let (projects, removed, busy) = (projects.clone(), removed.clone(), busy.clone());
+            let (projects, removed, busy, discard) = (projects.clone(), removed.clone(), busy.clone(), discard.clone());
             glib::spawn_future_local(async move {
                 let result = ui.call(op, payload).await;
                 busy.set(false);
@@ -681,10 +696,21 @@ impl Ui {
                         }
                         ui.registry_removed(&projects, workspace.then_some(id));
                     }
+                    Err(crate::client::Error::Bus(e)) if e.code == "worktree.dirty" => {
+                        discard.set(true);
+                        error.set_text(&format!(
+                            "{}. Nothing was removed. Commit or stash those changes to keep them, or remove anyway to delete them for good.",
+                            e.message
+                        ));
+                        error.set_visible(true);
+                        key.set_label(DISCARD);
+                        key.set_sensitive(true);
+                        cancel.set_sensitive(true);
+                    }
                     Err(e) => {
                         error.set_text(&e.to_string());
                         error.set_visible(true);
-                        key.set_label(&caption);
+                        key.set_label(if discard.get() { DISCARD } else { &caption });
                         key.set_sensitive(true);
                         cancel.set_sensitive(true);
                     }

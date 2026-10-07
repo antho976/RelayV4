@@ -72,6 +72,11 @@ pub fn run_with(engine: &Engine, dirty_scan: DirtyScan) -> Result<RecoveryReport
             .push(format!("reaped orphan pid {pid} (session {name})"));
     }
 
+    // 8, its unlocked half: the attachment files on disk, and what removal backups still name.
+    // Listed before the lock is taken, so a file attached since is not among them, and one
+    // attached before has its row committed by the time step 8 reads the rows.
+    let attachment_scan = scan_attachments(engine);
+
     let mut conn = engine.store.lock();
     let tx = conn.transaction()?;
     // 2. sessions that claim to be live: their pid is dead (or was just reaped) → restorable
@@ -239,6 +244,18 @@ pub fn run_with(engine: &Engine, dirty_scan: DirtyScan) -> Result<RecoveryReport
             .fsck_fixes
             .push(format!("pruned {pruned} audit row(s) past the retention window"));
     }
+    // 8. attachment files nothing references (RA-409): left by a task or project removal, a
+    //    detach from before soft-delete, or a crash mid-attach. Only the rows are read here;
+    //    the files go once the store is unlocked.
+    let orphans = match &attachment_scan {
+        Some(scan) => orphaned_attachments(&tx, scan)?,
+        None => Vec::new(),
+    };
+    if !orphans.is_empty() {
+        report
+            .fsck_fixes
+            .push(format!("removed {} orphaned attachment file(s)", orphans.len()));
+    }
     let json = serde_json::to_string(&report)?;
     tx.execute("INSERT INTO meta(key, value) VALUES ('recovery.last', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [json])?;
     tx.commit()?;
@@ -251,6 +268,9 @@ pub fn run_with(engine: &Engine, dirty_scan: DirtyScan) -> Result<RecoveryReport
         }
     }
     drop(conn);
+    if let Some(scan) = &attachment_scan {
+        remove_orphans(&scan.root, &orphans);
+    }
     if dirty_scan == DirtyScan::Deferred {
         match engine.arc() {
             Some(engine) => {
@@ -284,6 +304,110 @@ pub fn run_with(engine: &Engine, dirty_scan: DirtyScan) -> Result<RecoveryReport
         );
     }
     Ok(report)
+}
+
+/// A staged copy this old belongs to no attach still in flight: one crashed mid-request.
+const STAGED_STALE: Duration = Duration::from_secs(60 * 60);
+
+/// What step 8 reads off the disk before the store is locked.
+struct AttachmentScan {
+    /// `<store dir>/attachments`.
+    root: std::path::PathBuf,
+    /// Every file under `root/<task id>/`, plus staged copies older than [`STAGED_STALE`].
+    files: Vec<std::path::PathBuf>,
+    /// Paths an `attachments` row in a project- or workspace-removal backup names:
+    /// `project.restore` brings those rows back and needs their files.
+    in_backups: std::collections::HashSet<String>,
+}
+
+/// `None` when there is nothing to sweep, or when a removal backup cannot be read — then
+/// nothing is known to be unreferenced, and nothing is removed.
+fn scan_attachments(engine: &Engine) -> Option<AttachmentScan> {
+    if !engine.store.path().is_file() {
+        return None;
+    }
+    let root = engine.store.path().parent()?.join("attachments");
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(&root).ok()?.flatten() {
+        let Ok(kind) = entry.file_type() else { continue };
+        if !kind.is_dir() {
+            continue;
+        }
+        let staging = entry.file_name() == ".staging";
+        for file in std::fs::read_dir(entry.path()).into_iter().flatten().flatten() {
+            let Ok(meta) = file.path().symlink_metadata() else { continue };
+            if meta.is_dir() {
+                continue;
+            }
+            let stale = meta.modified().ok().and_then(|at| at.elapsed().ok()).is_some_and(|age| age > STAGED_STALE);
+            if !staging || stale {
+                files.push(file.path());
+            }
+        }
+    }
+    if files.is_empty() {
+        return None;
+    }
+    let mut in_backups = std::collections::HashSet::new();
+    for backup in engine.store.list_backups().ok()? {
+        if !matches!(backup.reason.as_str(), "project-remove" | "workspace-remove") {
+            continue;
+        }
+        let paths = rusqlite::Connection::open_with_flags(
+            &backup.path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .and_then(|conn| {
+            let mut stmt = conn.prepare("SELECT path FROM attachments")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>();
+            rows
+        });
+        match paths {
+            Ok(paths) => in_backups.extend(paths),
+            Err(error) => {
+                tracing::warn!(backup = %backup.path.display(), %error, "unreadable removal backup; keeping every attachment file");
+                return None;
+            }
+        }
+    }
+    Some(AttachmentScan { root, files, in_backups })
+}
+
+/// The scanned files no `attachments` row names, live or detached, and no undoable audit row
+/// names either: a `task.detach` from before v24 recorded its undo as `task.attach {path}`.
+fn orphaned_attachments(tx: &rusqlite::Transaction, scan: &AttachmentScan) -> Result<Vec<std::path::PathBuf>> {
+    let mut referenced: std::collections::HashSet<String> = tx
+        .prepare_cached("SELECT path FROM attachments")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let undoable = tx
+        .prepare_cached(
+            "SELECT json_extract(undo_op, '$.payload.path') FROM audit
+             WHERE op = 'task.detach' AND kind = 'ok' AND undone_by IS NULL
+               AND json_extract(undo_op, '$.op') = 'task.attach'",
+        )?
+        .query_map([], |r| r.get::<_, Option<String>>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    referenced.extend(undoable.into_iter().flatten());
+    Ok(scan
+        .files
+        .iter()
+        .filter(|path| {
+            let key = path.display().to_string();
+            !referenced.contains(&key) && !scan.in_backups.contains(&key)
+        })
+        .cloned()
+        .collect())
+}
+
+/// Remove the orphans, then any task directory they leave empty. Never under the store lock.
+fn remove_orphans(root: &Path, orphans: &[std::path::PathBuf]) {
+    crate::purge::remove_paths(orphans);
+    let dirs: std::collections::BTreeSet<&Path> = orphans.iter().filter_map(|p| p.parent()).filter(|d| *d != root).collect();
+    for dir in dirs {
+        // Fails, harmlessly, while the directory still holds a live attachment.
+        let _ = std::fs::remove_dir(dir);
+    }
 }
 
 /// At least a quarter of the file, and at least 4 MiB of it, is free pages.

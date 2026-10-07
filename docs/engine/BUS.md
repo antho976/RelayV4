@@ -357,7 +357,10 @@ Ops marked `undo: inverse` write `audit.undo_op = {op, payload, expect: {updated
 their audit row — the inverse envelope plus the entity's `updated_at` *after* the op.
 `audit.undo {audit_id}` executes that inverse as the calling actor; if the entity's
 `updated_at` no longer matches `expect` (someone edited it since) it is `conflict` /
-`audit.stale` unless `force: true` — an undo never silently clobbers a later edit. The undo's
+`audit.stale` unless `force: true` — an undo never silently clobbers a later edit.
+`session.update` is the exception: a running session's reports move its `updated_at`, so it
+records the fields it wrote (`expect.fields`) and the undo is stale only if one of them changed
+again (RA-403); an older row carrying `updated_at` is still checked against it. The undo's
 own audit row carries `undo_of: <audit_id>` and its own `undo_op` (the original envelope), so
 undoing an undo is a redo, and the original row gets `undone_by`. A batch op
 (`project.reorder`, `workspace.reorder`) records one inverse for all its rows; it stamps them
@@ -439,8 +442,9 @@ allowlisted — agents need `session.allow_ui` — and audited when `agent_only`
 an agent), against an in-memory shell model: page, project, panes, focus and windows. The model
 starts at the dashboard with one `main` window, is not persisted, and is the same whether or not
 a client is connected, so a headless engine answers `ui.*` with success too; there is no
-`ui.absent`. Every change emits `ui.changed` with the whole model, except `ui.pane.move`, which
-emits `{move: {pane, to, edge}}` (D40).
+`ui.absent`. Every change emits `ui.changed` with the whole model (D40); `ui.pane.move` adds
+`move: {pane, to, edge}` beside it (RA-420), so a client follows a move as it follows any other
+change.
 
 What reaches the screen is what the native client does with those events:
 
@@ -448,7 +452,7 @@ What reaches the screen is what the native client does with those events:
 |---|---|
 | `ui.page.switch` | follows: opens that project and page. It also sends `ui.page.switch` itself when you navigate, so `ui.state.page` tracks the window, and drops the echo of its own request |
 | `ui.pane.open` / `ui.pane.focus` | follows only a focused pane whose `target.session` is set: it focuses that session's terminal (on Agents). Any other target — a diff, a note, a file, a run, a mirror — opens nothing |
-| `ui.pane.close`, `ui.pane.move` | nothing |
+| `ui.pane.close`, `ui.pane.move` | nothing of their own; their `ui.changed` carries the whole model, so the client re-applies its page and focused session as for any other change (a no-op when they already match) |
 | `ui.window.popout` / `.close` | nothing: no OS window opens or closes |
 | `ui.toast` | shows the text in its notice bar; `level` and `ttl_ms` are carried but ignored |
 | `ui.layout.apply` | applies the stored state from `layout.changed` |
@@ -533,7 +537,7 @@ write surface roughly tenfold and turns a clean upfront refusal into a mid-task 
 so no door computes this for itself.
 
 **Layer 1 — op-level `actors` (registry, fixed).** Lifecycle and configuration ops are
-`user_only`: `task.dispatch`, `task.approve`, `session.create/spawn/resume/park/wake/close`,
+`user_only`: `task.dispatch`, `task.approve/unapprove`, `session.create/spawn/resume/park/wake/close`,
 `session.input/resize/discard_restorable`, `audit.undo`, `guardrail.confirm/reject`,
 `guardrail.config.set`, `settings.*` mutations, `app.*` mutations, `workspace.*` and
 `project.*` mutations, `provider.refresh`, `worktree.*` mutations, `git.branch.clean_merged`,
@@ -777,14 +781,14 @@ unique; nothing else is.
 | `workspace.list` | query | `{}` → `{ workspaces: Workspace[] }` |
 | `workspace.update` | mutation · always · inverse | `{ workspace_id, name?, order? }` → `Workspace` |
 | `workspace.reorder` | mutation · always · inverse · global | `{ orders: { workspace_id, order }[] }` → `{ workspaces: Workspace[] }` — a sidebar drag in one call: every named workspace takes its `order` in one transaction, unnamed ones keep theirs; one audit row whose inverse is a `workspace.reorder` back to the previous orders, and one `workspace.changed {workspaces}` carrying the rows it wrote. `not_found`/`workspace.not_found` for an unknown id (nothing written); `invalid`/`workspace.orders` for an empty list or an id named twice |
-| `workspace.remove` | mutation · always · global | `{ workspace_id, force?: bool, remove_worktrees?: bool }` → `{ projects_removed, sessions_closed }` — `conflict` (`workspace.has_projects`, `details.projects`) if it still has projects, unless `force`, which runs `project.remove { force }` for each of them first |
+| `workspace.remove` | mutation · always · global | `{ workspace_id, force?: bool, remove_worktrees?: bool, discard_changes?: bool }` → `{ projects_removed, sessions_closed }` — `conflict` (`workspace.has_projects`, `details.projects`) if it still has projects, unless `force`, which runs `project.remove { force }` for each of them first. With `remove_worktrees`, refused `conflict`/`worktree.dirty` as `project.remove` is, across all its projects, before anything is backed up or closed |
 | `project.add` | mutation · always · global | `{ workspace_id, path, name? }` → `Project` — path must be a git repo root **inside** `workspace.path` (`invalid`/`project.outside_workspace`); one project per path (`conflict`/`project.exists`) |
 | `project.clone` | mutation · always · global | `{ workspace_id, url, dest? }` → `{ project: Project }`; clones inside the workspace and registers the result |
 | `project.list` | query | `{ workspace_id? }` → `{ projects: Project[] }` |
 | `project.get` | query | `{ project_id }` → `Project` |
 | `project.update` | mutation · always · inverse | `{ project_id, name?, build_cmd?, run_cmd?, base_branch?, protected_paths?, critical_files?, order?, pinned? }` → `Project` |
 | `project.reorder` | mutation · always · inverse · global | `{ orders: { project_id, order }[] }` → `{ projects: Project[] }` — as `workspace.reorder`, for projects (`project.not_found`, `project.orders`); emits one `project.changed {projects}`. `pinned` still sorts first in `project.list` |
-| `project.remove` | mutation · always · project | `{ project_id, force?: bool, remove_worktrees?: bool }` → `{ sessions_closed, runs_stopped }` — forgets project-owned Relay metadata but never touches repository files; `conflict` if sessions (`project.sessions_live`, `details.open_sessions`) or device runs are live, unless `force`, which closes every open session through `session.close` and stops the runs first. Closed sessions keep their worktrees and branches unless `remove_worktrees` (Relay-pool checkouts only, deleted once the store unlocks; branches always kept). An integration in progress refuses even with `force` |
+| `project.remove` | mutation · always · project | `{ project_id, force?: bool, remove_worktrees?: bool, discard_changes?: bool }` → `{ sessions_closed, runs_stopped }` — forgets project-owned Relay metadata but never touches repository files; `conflict` if sessions (`project.sessions_live`, `details.open_sessions`) or device runs are live, unless `force`, which closes every open session through `session.close` and stops the runs first. Closed sessions keep their worktrees and branches unless `remove_worktrees` (Relay-pool checkouts only, deleted once the store unlocks; branches always kept). A checkout `remove_worktrees` would delete that holds uncommitted work (tracked edits or untracked files) refuses the whole removal `conflict`/`worktree.dirty` (`details.worktrees: [{ worktree, sessions, changed }]`, `changed` null when git status failed) before anything is backed up or closed, unless `discard_changes: true` (RA-405); a session opened after that check is closed but its checkout kept. An integration in progress refuses even with `force` |
 | `project.remove.preview` | query · user | `{ project_id? } \| { workspace_id? }` (exactly one) → `{ projects, tasks, notes, modules }` — what a removal would delete (live, untrashed rows), for the confirmation dialog |
 | `project.relink` | mutation · always · inverse | `{ project_id, path }` → `Project` — the repository moved: `path` must be a git repo root (`invalid`/`project.path`), no other project's path (`conflict`/`project.exists`) and inside a workspace (`invalid`/`project.outside_workspace`); the project stays in its workspace if that still contains it, else joins the innermost one that does. Stored worktree and trash paths under the old root are rewritten and the moved checkouts get `git worktree repair` after the commit. `conflict` (`project.sessions_live` / `project.activity_live`) while sessions are open or an integration or device run is live. Undo relinks to the old path |
 | `project.removed.list` | query · user | `{}` → `{ removed: [{ backup_path, created_at, reason, project_id, workspace_id, name, path }] }` — projects absent from the store that a `project-remove` / `workspace-remove` backup still holds, each from the newest such backup |
@@ -797,22 +801,24 @@ unique; nothing else is.
 |---|---|---|
 | `task.create` | mutation · always · inverse (delete) · project | `{ project_id, title, body?, column?: Column = "backlog", state?: TaskState, priority?: Priority = "medium", size?: Size, module_id?, changelog?, attachments?: AttachmentIn[], type?: TaskType = "task", parent_id?, labels?: string[] }` → `Task` |
 | `task.get` | query | `{ task_id }` → `Task` (with attachments, commits) |
-| `task.list` | query | `{ project_id?, column?, state?, module_id?, priority?, include_deleted?, sort?: "column"\|"priority"\|"updated", type?, label?, session?, parent_id?: Id\|null, limit? (1000, ≤2000), offset?, summary? }` → `{ tasks: Task[], next_offset? }` — a page; `summary` leaves `body` and `changelog` empty. `project_id` optional so the Dashboard can ask "in review, everywhere"; `parent_id: null` is roots only, `session` is "every card this agent was ever sent". Every task names its module (`module_name`, completed modules included), so a board labels cards without `module.list` |
+| `task.list` | query | `{ project_id?, column?, state?, module_id?, priority?, include_deleted?, sort?: "column"\|"priority"\|"updated", type?, label?, session?, parent_id?: Id\|null, limit? (1000, ≤2000), offset?, summary? }` → `{ tasks: Task[], next_offset? }` — a page; `summary` leaves `body` and `changelog` empty. `project_id` optional so the Dashboard can ask "in review, everywhere"; `parent_id: null` is roots only, `session` is "every card this agent was ever sent". Each page reads its sessions, commits, attachments, labels, relations and children in one statement per table, and every task in it equals its `task.get` (RA-412) Every task names its module (`module_name`, completed modules included), so a board labels cards without `module.list` |
 | `task.update` | mutation · always · inverse | `{ task_id, title?, body?, priority?, size?, module_id?: Id\|null, state?, changelog?, type? }` → `Task` |
 | `task.move` | mutation · always · inverse | `{ task_id, column: Column, position?: number }` → `Task` — transitions table in §11.1; `position` is the 0-based index the task ends at in the column (the others shift around it, clamped to the end), omitted means last; agents may only move their own task and only `active → in_review` |
 | `task.delete` | mutation · always · inverse (restore) | `{ task_id }` → `{}` |
 | `task.restore` | mutation · always · inverse (delete) | `{ task_id }` → `Task` |
 | `task.link_commit` | mutation · always | `{ task_id, sha, branch? }` → `Task` |
-| `task.changelog.write` | mutation · always · inverse | `{ task_id, text }` → `Task` |
-| `task.attach` | mutation · always | `{ task_id, name, mime, bytes_b64 }` or `{ task_id, path }` → `Attachment` |
-| `task.detach` | mutation · always · inverse | `{ task_id, attachment_id }` → `{}` |
+| `task.changelog.write` | mutation · always · inverse | `{ task_id, text, expected_updated_at? }` → `Task` — `expected_updated_at` is the task's `updated_at` as the caller last read it: given and no longer current, the write is refused (`conflict` / `task.edit_conflict`, the code `task.update`'s `expected` uses); omitted, it writes as before. Nothing tracks reads (RA-413) |
+| `task.attach` | mutation · always | `{ task_id, name, mime, bytes_b64 }` or `{ task_id, path, name?, mime? }` → `Attachment` — by path, `name` and `mime` set what the copy is stored as (default: the file's own name, `application/octet-stream`) (RA-414) |
+| `task.detach` | mutation · always · inverse (attachment.restore) | `{ task_id, attachment_id }` → `{}` — soft: the row gets `deleted_at` and leaves `Task.attachments`, the file stays. The retention pass removes row and file after `undo.grace_days` (RA-414, RA-409) |
+| `task.attachment.restore` | mutation · always · inverse (detach) | `{ task_id, attachment_id }` → `Attachment` — brings a detached attachment back with its id and file; `task.attachment_not_found` when it is not detached (or was purged) |
 | `task.parent.set` | mutation · always · inverse · project | `{ task_id, parent_id?: Id\|null, position? }` → `Task` — promote a task into a sub-task, re-parent it, or (no `parent_id`) detach it back to a root. Refuses `task.parent_cycle`, `task.depth`, `task.children_full`, `task.parent_project` |
 | `task.children` | query | `{ task_id, recursive? }` → `{ tasks: Task[] }` — direct children in board order, or the whole subtree |
 | `task.label.add` / `task.label.remove` | mutation · always · inverse | `{ task_id, label }` → `Task` — `add` creates the project label if the name is new; names are matched case-insensitively and the stored spelling wins |
 | `task.label.list` | query | `{ project_id }` → `{ labels: Label[] }` |
 | `task.relate` / `task.unrelate` | mutation · always · inverse | `{ task_id, relation: "blocked_by"\|"duplicate_of", other_id }` → `Task` — stored and rendered, never enforced; `duplicate_of` is single-valued, so a second `relate` replaces the first |
 | `task.dispatch` | mutation · always · project · user | `{ task_id, session?: string, create?: SessionCreateIn, fanout?, start?: bool }` → `{ task: Task, session: Session, fanned: { task, session }[] }` — one of `session`/`create`; moves the task to `active`, sets `state: dispatched`, and appends it to the session queue. `start` defaults true; false stages assignments before the provider starts. `fanout` also dispatches every not-done descendant, one fresh session each, and therefore requires `create` (`task.fanout_target`) |
-| `task.approve` | mutation · always · inverse (move back) · project · user | `{ task_id, sha? }` → `Task` — any open column → `done`, links sha (defaults to the recorded session branch head, or the project checkout HEAD without a session) |
+| `task.approve` | mutation · always · inverse (unapprove) · project · user | `{ task_id, sha? }` → `Task` — any open column → `done`, links sha (defaults to the recorded session branch head, or the project checkout HEAD without a session) |
+| `task.unapprove` | mutation · always · inverse (approve) · project · user | `{ task_id, column: Column, position: number, state: TaskState, sha? }` → `Task` — `task.approve`'s inverse: a `done` task goes back to `column` (not `done`) at index `position`, as `task.move` places it, with run state `state`, and the commit link `sha` is removed. The approval records `sha` only when it created that link, so a commit linked before it stays (RA-416). Refuses `task.column_transition` when the task is not done |
 | `task.copy_text` | query | `{ task_id }` → `{ text }` — a task as plain text: `#id title`, then the body when it has one. Agents' copy; the desktop board's copy button still builds its own string (title, body, `#id`) and does not call it |
 
 ### 10.6 module (SPEC §7)
@@ -820,14 +826,14 @@ unique; nothing else is.
 | op | attrs | payload → result |
 |---|---|---|
 | `module.create` | mutation · always · inverse | `{ project_id, name, icon?, priority? }` → `Module` |
-| `module.get` | query | `{ module_id }` → `Module & { tasks_by_state }` |
-| `module.list` | query | `{ project_id, include_archived? }` → `{ modules: ModuleSummary[], header: {count, in_flight, issues, completed, completion_pct} }` |
+| `module.get` | query | `{ module_id }` → `Module & { tasks_by_state }` — an agent is refused another project's module, `refused`/`actor.scope` (D106) |
+| `module.list` | query | `{ project_id?, include_archived? }` → `{ modules: ModuleSummary[], header: {count, in_flight, issues, completed, completion_pct} }` — an agent sees its own project only (`project_id` may be left out; another is `refused`/`actor.scope`, D106); the person must name one (`invalid`/`module.project`) |
 | `module.update` | mutation · always · inverse | `{ module_id, name?, icon?, priority?, order? }` → `Module` |
 | `module.complete` | mutation · always · inverse (reopen) | `{ module_id }` → `Module` (archived, `completed_at` set) |
 | `module.reopen` | mutation · always · inverse | `{ module_id }` → `Module` |
 | `module.delete` / `module.restore` | mutation · always · inverse | `{ module_id }` → `{}` / `Module` — delete unlinks tasks (they keep existing, `module_id: null`) |
-| `module.stats` | query | `{ project_id }` → same as `module.list.header` |
-| `module.changelog.draft` | query | `{ module_id, group_by?: "priority" }` (the only grouping built; any other value is `invalid` / `module.changelog_group`) → `{ markdown, tasks: Id[] }` |
+| `module.stats` | query | `{ project_id }` → same as `module.list.header` — an agent's own project only (D106) |
+| `module.changelog.draft` | query | `{ module_id, group_by?: "priority" }` (the only grouping built; any other value is `invalid` / `module.changelog_group`) → `{ markdown, tasks: Id[] }` — an agent's own project's modules only (D106) |
 
 ### 10.7 notes / mailbox (SPEC §3, §12)
 
@@ -836,8 +842,8 @@ unique; nothing else is.
 | `notes.list` | query | `{ project_id, pinned_only?, include_deleted?, summary? }` → `{ notes: Note[] }` — `summary` cuts each `body` to its first 240 characters (`notes.get` has it whole) |
 | `notes.get` | query | `{ note_id }` → `Note` |
 | `notes.create` | mutation · always · inverse | `{ project_id, title?, body, pinned? }` → `Note` — a body is at most 1 MiB here, in `notes.update` and after `notes.append` (`invalid` / `notes.body`). `notes.changed` carries the note without its body, plus `body_bytes` |
-| `notes.update` | mutation · always · inverse | `{ note_id, title?, body?, pinned? }` → `Note` |
-| `notes.append` | mutation · always | `{ note_id?, project_id?, target?: "standing" \| "suggestions", text }` → `Note` — appends to an explicit note, the standing note by default, or the unpinned per-project Agent suggestions note. Suggestions require a bound agent with a current task; Relay adds timestamp, session, and task identity and never injects this note into a brief. |
+| `notes.update` | mutation · always · inverse | `{ note_id, title?, body?, pinned?, expected? }` → `Note` — `expected` holds the original values of the fields being edited; one that no longer matches refuses the write (`conflict` / `notes.edit_conflict`) |
+| `notes.append` | mutation · always | `{ note_id?, project_id?, target?: "standing" \| "suggestions", text, expected_updated_at? }` → `Note` — appends to an explicit note, the standing note by default, or the unpinned per-project Agent suggestions note. Suggestions require a bound agent with a current task; Relay adds timestamp, session, and task identity and never injects this note into a brief. `expected_updated_at` is the target note's `updated_at` as the caller last read it: given and no longer current, nothing is appended (`conflict` / `notes.edit_conflict`); omitted, it appends as before (RA-413). Of the other note writes an agent role can reach, `notes.create` makes a new note and `notes.update` takes `expected`; `notes.pin/delete/restore` are in no agent role |
 | `notes.pin` | mutation · always · inverse | `{ note_id, pinned: bool }` → `Note` |
 | `notes.delete` / `notes.restore` | mutation · always · inverse | `{ note_id }` |
 | `notes.standing` | query | `{ project_id }` → `{ text }` — exactly what gets injected at dispatch |
@@ -860,7 +866,7 @@ are `user_only` (§9.1). Agents get `done`, `report`, `attach`/`scrollback`, `bo
 | `session.clear_restorable` | mutation · always | `{ session }` → `Session` — drop saved provider context and fresh-spawn the same restorable session/worktree |
 | `session.park` | mutation · always | `{ session }` → `Session` — kill CLI, keep pane/scrollback/worktree/token |
 | `session.wake` | mutation · always | `{ session }` → `Session` — respawn with provider resume |
-| `session.close` | mutation · always | `{ session, remove_worktree?: bool = true, purge_build?: bool = true }` → `{ freed_mb }` — see SPEC §8 lifecycle. The branch stays unless branch cleanup finds its work already merged, after the close. A shared pooled review worktree is removed only when every other session on it is closed (`conflict`/`session.pair_live` otherwise, unless `remove_worktree: false`); a non-pooled checkout such as the primary is never removed, so others on it do not refuse the close |
+| `session.close` | mutation · always | `{ session, remove_worktree?: bool = true, purge_build?: bool = true, discard_changes?: bool }` → `{ freed_mb }` — see SPEC §8 lifecycle. The branch stays unless branch cleanup finds its work already merged, after the close. A shared pooled review worktree is removed only when every other session on it is closed (`conflict`/`session.pair_live` otherwise, unless `remove_worktree: false`); a non-pooled checkout such as the primary is never removed, so others on it do not refuse the close. Removing a pooled worktree with uncommitted work (tracked edits or untracked files, or one git status cannot read) is refused `conflict`/`worktree.dirty` (`details.worktrees: [{ worktree, sessions, changed }]`) before the agent is stopped, unless `discard_changes: true` (RA-405) |
 | `session.done` | mutation · always · agent | `{ session, summary?, sha?, status?: "completed"\|"blocked"\|"partial", blockers?: string[] }` → `Session` — self-report for `sessions.task_id`, the current task only. `completed` (default) moves that task `active → in_review`, promotes and prompts the next queued task, and notifies. `blocked`/`partial` leave only the current task in place, set it `blocked`, notify `agent_blocked`, and require `blockers` (D118). Reviewer: notifies only |
 | `session.intent` | mutation · always · agent | `{ session, text }` → `Session` — one line, ≤200 chars, of what this session is doing; empty clears it. Surfaces in `session.peers` and the dashboard, where coordination happens |
 | `session.claim` | mutation · always · agent | `{ paths: string[], symbol?, note?, exclusive? }` → `{ claimed, collisions: {path, symbol, session, since}[] }` — declare the files this session is taking on. Collisions are reported, not refused, so they can be negotiated over `mailbox.send`; `exclusive: true` refuses instead and records nothing. Advisory, not enforced (D116) |
@@ -869,8 +875,8 @@ are `user_only` (§9.1). Agents get `done`, `report`, `attach`/`scrollback`, `bo
 | `session.list` | query | `{ project_id?, state?: SessionState[], include_closed? }` → `{ sessions: Session[] }` — an agent sees its own project only; another `project_id` is `refused`/`actor.scope` (D106) |
 | `session.peers` | query | `{ session }` or `{ project_id }` or `{}` → `{ peers: Peer[] }` — the live peer table (name, provider, branch, claimed files, task title, state). For an agent, neither target means "my project, minus me" |
 | `session.brief` | query | `{ session }` → `{ text, compact, parts: {state, peers, notes, adjacent, skills}: string }` — the knowledge injection, inspectable. `compact` is the half injected on every spawn: state, peers, notes and adjacent work, naming the enabled skills and the folders they are registered in (bodies stay on disk) and the launch assignment omitted (D101, D147). Own session or PAIR partner only |
-| `session.bootstrap` | query · agent | `{}` → `{ session, role, project_id, project, base_branch, worktree, branch, module?, task?, tasks: Task[], pair?, assignment?, brief_path, peers: Peer[], can_call: string[], discovery, comms, guardrails: {caps, denied_commands, write_roots, dry_run} }` — the one call every agent makes first, so it answers "who else is here and what may I do?" as well as "who am I" (D105). `discovery` points to `bus.ops`/`bus.schema` and their shell equivalents; `can_call` is the §9.1 verdict. User/unbound calls are `invalid`/`bus.actor` |
-| `session.update` | mutation · always · inverse · user | `{ session, branch?, model?, effort?, task_id?: Id\|null, module_id?: Id\|null, bus_writes?, allow_ui? }` → `Session` — `branch`/`model`/`effort` are `conflict`/`session.already_spawned` after first spawn; the rest any time |
+| `session.bootstrap` | query · agent | `{}` → `{ session, role, project_id, project, base_branch, worktree, branch, module?, task?, tasks: Task[], pair?, assignment?, brief_path, peers: Peer[], can_call: string[], discovery, comms, guardrails: {caps, denied_commands, write_roots, dry_run} }` — the one call every agent makes first, so it answers "who else is here and what may I do?" as well as "who am I" (D105). `discovery` points to `bus.ops`/`bus.schema` and their shell equivalents; `can_call` is the §9.1 verdict. `assignment` is the launch prompt on the session's first launch only: after a relaunch (fresh or resumed) it is absent, and the brief keeps the text labelled as the original launch assignment (RA-397). User/unbound calls are `invalid`/`bus.actor` |
+| `session.update` | mutation · always · inverse · user | `{ session, branch?, model?, effort?, task_id?: Id\|null, module_id?: Id\|null, bus_writes?, allow_ui? }` → `Session` — `branch`/`model`/`effort` are `conflict`/`session.already_spawned` after first spawn; the rest any time. A branch rename is refused `conflict`/`session.branch_primary` on the project's primary checkout and `conflict`/`session.branch_shared` on a checkout another session shares (RA-402). Its undo records `expect: { fields, queued }` instead of `updated_at`, which every `session.report` moves: `audit.undo` is `audit.stale` only if one of the fields it wrote now holds something else, and it deletes the `(task, session)` queue rows the update added that are not yet completed (RA-403) |
 | `session.report` | mutation · agent_only · session · agent | `{ session, kind: "session_start"\|"tool_use"\|"stop"\|"notification"\|"idle"\|"blocked", data?: object }` → `{}` — the provider's hooks calling home (§9.3); this is where `state: blocked`, `provider_ref` and "agent asking" notifications come from. Codex, having no hooks, degrades to PTY-derived idle/busy |
 | `session.attach` | query · stream | `{ session, from_seq?: number }` → attaches `pty` stream (replays scrollback from `from_seq`) |
 | `session.detach` | query | `{ session }` → `{}` |
@@ -878,7 +884,7 @@ are `user_only` (§9.1). Agents get `done`, `report`, `attach`/`scrollback`, `bo
 | `session.resize` | mutation · agent_only · session | `{ session, cols, rows, until_detach?: bool }` → `{}` — `until_detach` borrows the size: on a connection door the PTY goes back to the size it had when that connection detaches from the session or closes, unless someone resized it since. A size set without it ends a borrow. The phone fits an agent's terminal to its screen this way |
 | `session.scrollback` | query | `{ session, lines?: number }` → `{ text, epoch, seq, cols?, rows? }` — `cols`/`rows` are the live PTY's size, absent for a saved scrollback |
 | `session.restorable` | query | `{}` → `{ sessions: {session: Session, reason: "app_restart"\|"crash", worktree_dirty: bool}[] }` — the individual-resume list at launch |
-| `session.discard_restorable` | mutation · always | `{ session }` → `{}` — declined at launch → cleaned |
+| `session.discard_restorable` | mutation · always | `{ session, discard_changes?: bool }` → `{}` — declined at launch → cleaned. The last session on a pooled checkout deletes it, refused `conflict`/`worktree.dirty` as `session.close` is when it holds uncommitted work, unless `discard_changes: true` (RA-405) |
 
 ### 10.9 knowledge injection
 
@@ -892,7 +898,11 @@ before each provider launch. It comes in two halves, because delivering it whole
   spawn, appended to the provider-native role instruction — Claude's appended-system-prompt file
   or Codex `developer_instructions` — because a session spawned with no assignment is exactly the
   one that most needs to know who its peers are. It never carries the launch assignment: for
-  Codex it lands in argv, and `session.bootstrap` already returns it privately.
+  Codex it lands in argv, and `session.bootstrap` already returns it privately. Each section has
+  a budget (RA-385): peers, adjacent tasks and the skill list at most 40 lines / 8 KiB, the
+  standing note 16 KiB, each task body and changelog 4 KiB. A section that is cut ends with a
+  line naming the op that returns the whole (`session.peers`, `task.list {module_id}`,
+  `skill.list`, `notes.standing {project_id}`, `task.get {task_id}`).
 - **skills** — `skill.list {enabled: true}` bodies, written to `.relay/session-skills.md`. The
   compact half names each enabled skill and the folder it is materialized in
   (`.claude/skills/<name>/`, `.agents/skills/<name>/`, and the provider's own home, D147), so an
@@ -904,7 +914,7 @@ The full document, compact half plus the launch assignment, is written to the un
 file `.relay/sessions/<session>/session-brief.md` (`$RELAY_BRIEF`); `session.brief` returns `text`, `compact` and the
 parts separately, for inspection. Relay still sends no positional prompt, and every role
 instruction directs the first real turn to actor-bound `session.bootstrap` (§10.8), which returns
-the assignment along with the peer table, the callable op list and the session's guardrails.
+the assignment (first launch only) along with the peer table, the callable op list and the session's guardrails.
 Provider-neutral Markdown; the same for both providers.
 
 ### 10.10 overlap
@@ -1007,7 +1017,7 @@ at it; one moved by hand without `git worktree move` is refused until `git workt
 | `avd.list` | query | `{}` → `{ avds: Avd[] }`; includes a running emulator serial when available |
 | `avd.catalog` | query | `{}` → `{ system_images, devices }`; installed SDK choices only |
 | `avd.create` | mutation · always | `{ name, package, device? }` → `Avd` |
-| `avd.boot` | mutation · always | `{ name, cold? }` → `{}`; boots headless (`-no-window`) — Relay's mirror is its screen. The emulator then appears through `device.list` and uses the normal deploy pipeline |
+| `avd.boot` | mutation · always | `{ name, cold? }` → `{}`; boots headless (`-no-window`) — Relay's mirror is its screen. The emulator then appears through `device.list` and uses the normal deploy pipeline. An AVD adb already lists as running is refused `conflict`/`avd.already_running`. `avd.changed {name, state, message?}` follows it: `booting`, then `started`, or `failed` / `stopped` with the emulator's `message` when it exits early (RA-349) |
 | `avd.stop` | mutation · always | `{ name }` → `{}`; `adb emu kill` on the running AVD (`avd.not_running` otherwise), since a headless emulator has no window to close |
 
 ### 10.15 provider / usage / skill / plugin
@@ -1061,7 +1071,7 @@ warning rather than failing every guardrail read.
 | `ui.pane.open` | mutation · agent_only | `{ kind: PaneKind, target?: PaneTarget }` → `{ pane: PaneRef }` — records the pane; the native client acts only on `target.session` (focuses that terminal), so e.g. `{kind:"diff", target:{sha}}` opens nothing on screen |
 | `ui.pane.close` / `ui.pane.focus` | mutation · agent_only | `{ pane: PaneRef }` → `{}` |
 | `ui.pane.move` | mutation · agent_only | `{ pane: PaneRef, to: PaneRef, edge: "top"\|"bottom"\|"left"\|"right"\|"center" }` → `{}` |
-| `ui.layout.list` / `ui.layout.save` / `ui.layout.apply` / `ui.layout.delete` | mutation · always · inverse (save/delete) | `{ project_id }` / `{ project_id, name, state? }` / `{ project_id, name }` / `{ project_id, name }` — opaque shell state is stored in core and an apply emits `layout.changed` for the UI |
+| `ui.layout.list` / `ui.layout.save` / `ui.layout.apply` / `ui.layout.delete` | mutation · always · inverse (save/delete) | `{ project_id }` / `{ project_id, name, state? }` / `{ project_id, name }` / `{ project_id, name }` — opaque shell state is stored in core and an apply emits `layout.changed` for the UI. A save without `state` stores the arrangement the native client last saved (`native.layout.current.<id>`), then the older `layout.current.<id>`, then a plain grid (RA-419, D150) |
 | `ui.window.popout` / `ui.window.close` | mutation · agent_only | `{ pane: PaneRef }` → `{ window_id }` / `{ window_id }` → `{}` — model only: no OS window opens or closes |
 | `ui.window.list` | query | `{}` → `{ windows: WindowInfo[] }` — the model's windows |
 | `ui.toast` | mutation · agent_only | `{ text, level?: "info"\|"warn"\|"error", ttl_ms? }` → `{}` — emits `ui.toast`; the native client shows the text in its notice bar |

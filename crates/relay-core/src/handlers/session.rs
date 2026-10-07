@@ -46,17 +46,20 @@ pub(crate) fn next_queued_task(
 
 /// Queue `task_id` at the end of each session's queue, after the task's existing assignees.
 /// Already queued is a no-op. Every attach path — create, update, task dispatch — goes through
-/// here for the whole review group, so members' queues cannot diverge (RA-645).
-pub(crate) fn enqueue(conn: &Connection, task_id: Id, session_ids: &[Id]) -> Result<(), BusError> {
+/// here for the whole review group, so members' queues cannot diverge (RA-645). Returns the
+/// sessions it queued the task for, those that were not already: what an undo takes back.
+pub(crate) fn enqueue(conn: &Connection, task_id: Id, session_ids: &[Id]) -> Result<Vec<Id>, BusError> {
+    let mut added = Vec::new();
     for &session_id in session_ids {
-        conn.prepare_cached(
+        let inserted = conn.prepare_cached(
             "INSERT OR IGNORE INTO task_sessions(task_id,session_id,ord,queue_ord) VALUES (?1,?2,
                (SELECT COALESCE(MAX(ord),-1)+1 FROM task_sessions WHERE task_id=?1),
                (SELECT COALESCE(MAX(queue_ord),-1)+1 FROM task_sessions WHERE session_id=?2))",
         ).bus()?
         .execute(params![task_id, session_id]).bus()?;
+        if inserted > 0 { added.push(session_id); }
     }
-    Ok(())
+    Ok(added)
 }
 
 /// The running PTY of a session, or the typed refusal the input fallbacks give for one that
@@ -527,6 +530,50 @@ fn run_teardown(repo: &Path, worktree: &Path, teardown: &Teardown) -> Result<(),
         crate::hooks::uninstall_codex(worktree).bus()?;
     }
     Ok(())
+}
+
+/// A checkout a removal would delete, and the sessions on it.
+pub(crate) type Checkout = (PathBuf, Vec<String>);
+
+/// Refuse `worktree.dirty` when a checkout a removal is about to delete holds uncommitted
+/// work: tracked edits, staged changes or untracked files (RA-405). Each entry is a checkout
+/// and the sessions on it. One `git status` per checkout, each bounded by its 10 s timeout and
+/// run a few at a time as `session.restorable` does, so this runs with the store unlocked. A
+/// checkout already gone is skipped; one whose status fails counts as dirty, size unknown.
+pub(crate) fn refuse_dirty(checkouts: &[Checkout]) -> Result<(), BusError> {
+    let live: Vec<&Checkout> = checkouts.iter().filter(|(wt, _)| wt.exists()).collect();
+    if live.is_empty() { return Ok(()); }
+    let changed = |wt: &Path| worktree::status_files_with(wt, worktree::Untracked::Directories).ok().map(|files| files.len());
+    let per_worker = live.len().div_ceil(4).max(1);
+    let counts: Vec<Option<usize>> = std::thread::scope(|scope| {
+        let workers: Vec<_> = live.chunks(per_worker)
+            .map(|chunk| scope.spawn(move || chunk.iter().map(|(wt, _)| changed(wt)).collect::<Vec<_>>()))
+            .collect();
+        workers.into_iter().zip(live.chunks(per_worker))
+            .flat_map(|(worker, chunk)| worker.join().unwrap_or_else(|_| vec![None; chunk.len()]))
+            .collect()
+    });
+    let dirty: Vec<(&Checkout, Option<usize>)> = live.into_iter().zip(counts).filter(|(_, n)| *n != Some(0)).collect();
+    if dirty.is_empty() { return Ok(()); }
+    let describe = |((wt, sessions), n): &(&Checkout, Option<usize>)| {
+        let changes = match n {
+            Some(n) => format!("{n} uncommitted change{}", if *n == 1 { "" } else { "s" }),
+            None => "changes that could not be checked".to_string(),
+        };
+        let whose = if sessions.is_empty() { String::new() } else { format!(" (session {})", sessions.join(", ")) };
+        format!("{}{whose} has {changes}", wt.display())
+    };
+    let message = match dirty.as_slice() {
+        [one] => format!("worktree {}; removing it would delete them", describe(one)),
+        many => format!("{} worktrees hold uncommitted work that removing them would delete: {}",
+            many.len(), many.iter().map(describe).collect::<Vec<_>>().join("; ")),
+    };
+    let details: Vec<Value> = dirty.iter()
+        .map(|((wt, sessions), n)| json!({"worktree": wt.display().to_string(), "sessions": sessions, "changed": n}))
+        .collect();
+    Err(BusError::conflict("worktree.dirty", message)
+        .with_details(json!({"worktrees": details}))
+        .with_hint("commit or stash the changes first, or pass discard_changes: true to delete them with the worktree"))
 }
 
 /// Kill a PTY that is already out of the registry without making the caller wait for it.
@@ -1828,25 +1875,35 @@ pub fn register(e: &mut Engine) {
         ).bus()?;
         // A task attached here is queued for the whole group, as dispatch does; an update that
         // leaves the task alone only re-asserts this session's own row.
+        let mut queued = Vec::new();
         if let Some(task_id) = task_id {
             let ids = if p.task_id.is_some() { group_ids(ctx.tx(), s)? } else { vec![s.id] };
-            enqueue(ctx.tx(), task_id, &ids)?;
+            queued = enqueue(ctx.tx(), task_id, &ids)?.into_iter().map(|sid| json!([task_id, sid])).collect();
         }
         let updated = sessions::by_id(ctx.tx(), s.id)?.ok_or_else(|| BusError::internal("session vanished"))?;
         // The inverse names only what this update changed. Branch, model and effort change only
         // before the first spawn, so an inverse that always carried them was refused as soon as
         // the session had started, whatever the update was about (RA-403).
+        // Its precondition is those fields still holding what this update wrote, not the row's
+        // `updated_at`, which every `session.report` of a running session moves on. And the
+        // queue rows it added go with it: `expect.queued` names the (task, session) pairs that
+        // were not queued before, as UpdateIn has no field for them.
         let mut inverse = serde_json::Map::new();
+        let mut fields = serde_json::Map::new();
         inverse.insert("session".into(), json!(s.name));
         let u = &updated.session;
-        if u.branch != s.branch { inverse.insert("branch".into(), json!(s.branch)); }
-        if u.model != s.model { inverse.insert("model".into(), json!(s.model)); }
-        if u.effort != s.effort { inverse.insert("effort".into(), json!(s.effort)); }
-        if u.task_id != s.task_id { inverse.insert("task_id".into(), json!(s.task_id)); }
-        if u.module_id != s.module_id { inverse.insert("module_id".into(), json!(s.module_id)); }
-        if u.bus_writes != s.bus_writes { inverse.insert("bus_writes".into(), json!(s.bus_writes)); }
-        if u.allow_ui != s.allow_ui { inverse.insert("allow_ui".into(), json!(s.allow_ui)); }
-        ctx.set_undo("session.update", Value::Object(inverse), Some(json!({"updated_at":u.updated_at})));
+        let mut changed = |name: &str, before: Value, after: Value| if before != after {
+            inverse.insert(name.into(), before);
+            fields.insert(name.into(), after);
+        };
+        changed("branch", json!(s.branch), json!(u.branch));
+        changed("model", json!(s.model), json!(u.model));
+        changed("effort", json!(s.effort), json!(u.effort));
+        changed("task_id", json!(s.task_id), json!(u.task_id));
+        changed("module_id", json!(s.module_id), json!(u.module_id));
+        changed("bus_writes", json!(s.bus_writes), json!(u.bus_writes));
+        changed("allow_ui", json!(s.allow_ui), json!(u.allow_ui));
+        ctx.set_undo("session.update", Value::Object(inverse), Some(json!({"fields": fields, "queued": queued})));
         emit_session(ctx, &updated.session);
         Ok(updated.session)
     });
@@ -1906,6 +1963,10 @@ pub fn register(e: &mut Engine) {
         })?;
         let Hooks { teardown, survivor } = teardown;
         let wt = Path::new(&row.session.worktree);
+        // Only the last session on a pooled checkout deletes it, so only then can it lose work.
+        if teardown.is_some() && wt.starts_with(worktree::pool_dir(&repo)) && !p.discard_changes.unwrap_or(false) {
+            refuse_dirty(&[(wt.to_path_buf(), vec![row.session.name.clone()])])?;
+        }
         if let Some(teardown) = &teardown {
             run_teardown(&repo, wt, teardown)?;
             if wt.starts_with(worktree::pool_dir(&repo)) {
@@ -1948,6 +2009,10 @@ pub fn register(e: &mut Engine) {
         let Hooks { teardown, survivor } = teardown;
         let s = &row.session;
         let wt = Path::new(&s.worktree);
+        // Before anything is stopped or undone: a refused close leaves the agent running.
+        if remove && wt.starts_with(worktree::pool_dir(&repo)) && !p.discard_changes.unwrap_or(false) {
+            refuse_dirty(&[(wt.to_path_buf(), vec![s.name.clone()])])?;
+        }
         // Stop writers before undoing their hooks and deleting their checkout, with a bounded
         // grace period.
         let stopped = remove

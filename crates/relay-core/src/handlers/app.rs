@@ -68,7 +68,9 @@ pub fn register(e: &mut Engine) {
             .collect();
         Ok(BackupListOut { backups })
     });
-    e.register::<ImportV3>(super::import_v3::import);
+    // Reading the v3 store and copying its attachments is file work of any size: staged, with
+    // the store unlocked; the transaction only writes the rows and links the copies (RA-382).
+    e.register_staged::<ImportV3, _>(super::import_v3::prepare, super::import_v3::import);
     e.register::<FirstRunState>(|ctx, _| {
         let workspaces: i64 = ctx.tx().query_row("SELECT COUNT(*) FROM workspaces", [], |row| row.get(0)).map_err(crate::engine::internal)?;
         let providers: i64 = ctx.tx().query_row("SELECT COUNT(*) FROM provider_cache", [], |row| row.get(0)).map_err(crate::engine::internal)?;

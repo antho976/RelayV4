@@ -4,7 +4,7 @@ import { Text, View } from 'react-native'
 import ThemedButton from '@components/buttons/ThemedButton'
 import { Field, SwitchRow } from '@components/relay/Kit'
 import { confirm, Sheet, useSheetStyles } from '@components/relay/Sheet'
-import { isCancelled, relay } from '@lib/engine/Relay/RelayClient'
+import { isCancelled, relay, RelayRequestError } from '@lib/engine/Relay/RelayClient'
 import { Logger } from '@lib/state/Logger'
 
 import { megabytes } from './links'
@@ -48,6 +48,29 @@ const OPS: Record<Exclude<LifecycleKey, 'start' | 'close' | 'clear'>, string> = 
 const report = (e: unknown) => {
     if (isCancelled(e)) return
     Logger.errorToast(`${(e as Error).message}`)
+}
+
+/**
+ * Send a request that may delete a session's worktree. The PC refuses `worktree.dirty` when the
+ * worktree holds uncommitted work; the person is then asked, and only a yes sends it again with
+ * `discard_changes`. Resolves `undefined` when they keep the work.
+ */
+export const confirmingDiscard = async <T,>(
+    name: string,
+    send: (discardChanges: boolean) => Promise<T>
+): Promise<T | undefined> => {
+    try {
+        return await send(false)
+    } catch (e) {
+        if (!(e instanceof RelayRequestError) || e.error.code !== 'worktree.dirty') throw e
+        const yes = await confirm({
+            title: `Discard ${name}'s changes?`,
+            message: `${e.error.message}. Removing the worktree deletes them for good; commit or stash them first to keep them.`,
+            confirmLabel: 'Discard changes',
+            destructive: true,
+        })
+        return yes ? await send(true) : undefined
+    }
 }
 
 /**
@@ -133,11 +156,15 @@ export const useSessionLifecycle = (
     const close = async () => {
         setClosing(false)
         try {
-            const result = await perform('close', 'session.close', {
-                session: name,
-                remove_worktree: removeWorktree,
-                purge_build: purgeBuild,
-            })
+            const result = await confirmingDiscard(name, (discard) =>
+                perform('close', 'session.close', {
+                    session: name,
+                    remove_worktree: removeWorktree,
+                    purge_build: purgeBuild,
+                    ...(discard ? { discard_changes: true } : {}),
+                })
+            )
+            if (result === undefined) return
             const freed = Number(result?.freed_mb ?? 0)
             Logger.infoToast(
                 freed > 0 ? `Closed ${name} · freed ${megabytes(freed)}` : `Closed ${name}`

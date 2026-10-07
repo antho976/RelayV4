@@ -26,9 +26,14 @@ payload!(#[schemars(rename = "NotesUpdateIn")] UpdateIn {
 });
 op!(Update, "notes.update", UpdateIn => Note,
     OpMeta::mutation(Scope::Project, 5, "Patch a note").undo(Undo::Inverse).emits(&["notes.changed"]));
-payload!(#[schemars(rename = "NotesAppendIn")] AppendIn { pub note_id: Option<Id>, pub project_id: Option<Id>, pub target: Option<String>, pub text: String });
+payload!(#[schemars(rename = "NotesAppendIn")] AppendIn {
+    pub note_id: Option<Id>, pub project_id: Option<Id>, pub target: Option<String>, pub text: String,
+    /// The target note's `updated_at` as you last read it. When given and the note has changed
+    /// since, nothing is appended (`notes.edit_conflict`); omitted, the text is appended as before.
+    pub expected_updated_at: Option<Ts>,
+});
 op!(Append, "notes.append", AppendIn => Note,
-    OpMeta::mutation(Scope::Project, 5, "Append text to a note, the project's standing note, or its agent suggestions note").emits(&["notes.changed"]));
+    OpMeta::mutation(Scope::Project, 5, "Append text to a note, the project's standing note, or its agent suggestions note; pass expected_updated_at (from your last read) to refuse if the note changed since").emits(&["notes.changed"]));
 payload!(#[schemars(rename = "NotesPinIn")] PinIn { pub note_id: Id, pub pinned: bool });
 op!(Pin, "notes.pin", PinIn => Note,
     OpMeta::mutation(Scope::Project, 5, "Pin / unpin").undo(Undo::Inverse).emits(&["notes.changed"]));

@@ -735,9 +735,14 @@ fn evaluate_write(cfg: &GuardrailConfig, request: &GateRequest<'_>) -> Result<De
             // The file itself is right there. Measuring it is strictly better than inferring
             // a size from the diff, which is what made every diff-only write read as 100%.
             let (removed, added) = diff_counts(diff);
-            let old_lines = match &*request.old_file(path) {
-                OldFile::Text(text) => Some(text.lines().count() as u32),
-                _ => None,
+            // A diff that removes nothing is under every limit whatever the file's size, so
+            // the file is not read just to be discarded (RA-378).
+            let old_lines = match removed {
+                0 => None,
+                _ => match &*request.old_file(path) {
+                    OldFile::Text(text) => Some(text.lines().count() as u32),
+                    _ => None,
+                },
             };
             return destructive_decision(cfg, request, path, removed, added, old_lines);
         }
@@ -3144,6 +3149,35 @@ mod denied_tests {
         ] {
             assert!(!bypass(line), "{line:?} leaves the hook on");
         }
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::{config, evaluate_with, Decision, GateKind, GateRequest, Probes};
+    use relay_bus::Actor;
+
+    /// RA-378: a diff-only write that removes nothing never reads the file it lands on; one that
+    /// removes lines measures it.
+    #[test]
+    fn a_diff_that_removes_nothing_does_not_read_the_old_file() {
+        let store = crate::Store::open_memory().unwrap();
+        let cfg = config(&store.lock(), None).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").unwrap();
+        let judge = |diff: &str| {
+            let probes = Probes::default();
+            let request = GateRequest {
+                actor: &Actor::User, project_id: 1, worktree: dir.path(), kind: GateKind::Write, path: Some("a.txt"),
+                new_text: None, diff: Some(diff), command: None, skip_policy: None, grants: None, path_only: false,
+                probes: Some(&probes),
+            };
+            assert!(matches!(evaluate_with(&cfg, &request).unwrap(), Decision::Allow));
+            let read = probes.old.borrow().len();
+            read
+        };
+        assert_eq!(judge("--- a/a.txt\n+++ b/a.txt\n@@ -2,0 +3 @@\n+three\n"), 0);
+        assert_eq!(judge("--- a/a.txt\n+++ b/a.txt\n@@ -2 +2 @@\n-two\n+2\n"), 1);
     }
 }
 

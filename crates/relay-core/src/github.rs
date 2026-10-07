@@ -49,11 +49,20 @@ pub fn gh_path() -> Result<PathBuf, BusError> {
         .with_hint("install GitHub CLI, then reopen GitHub setup"))
 }
 
+/// `gh`, told never to wait on a prompt: a question nobody can see would hold the call until its
+/// timeout (RA-372). `output_with_timeout` closes its stdin too, but gh decides whether it may
+/// prompt from the terminal Relay was started under.
+fn gh_command(gh: PathBuf) -> Command {
+    let mut command = Command::new(gh);
+    command.env("GH_PROMPT_DISABLED", "1");
+    command
+}
+
 pub fn status() -> GitHubStatus {
     let Ok(gh) = which::which("gh") else {
         return GitHubStatus { installed: false, connected: false, login: None };
     };
-    let output = crate::proc::output_with_timeout(Command::new(gh).args(["api", "user", "--jq", ".login"]), API_TIMEOUT);
+    let output = crate::proc::output_with_timeout(gh_command(gh).args(["api", "user", "--jq", ".login"]), API_TIMEOUT);
     match output {
         Ok(Some(output)) if output.status.success() => GitHubStatus {
             installed: true,
@@ -66,14 +75,15 @@ pub fn status() -> GitHubStatus {
 
 /// A login abandoned in the browser counts as not connected once [`LOGIN_TIMEOUT`] passes.
 pub fn connect(gh: PathBuf) -> std::io::Result<bool> {
-    let mut command = Command::new(gh);
+    // The web flow asks nothing: it prints a code, copies it and opens the browser.
+    let mut command = gh_command(gh);
     command.args(["auth", "login", "--hostname", "github.com", "--web", "--clipboard", "--git-protocol", "https"]);
     Ok(crate::proc::output_with_timeout(&mut command, LOGIN_TIMEOUT)?.is_some_and(|output| output.status.success()))
 }
 
 pub fn repositories() -> Result<Vec<GitHubRepo>, BusError> {
     let gh = gh_path()?;
-    let mut command = Command::new(gh);
+    let mut command = gh_command(gh);
     command.args(["api", "--paginate", "user/repos?per_page=100&sort=updated&direction=desc"]);
     let output = crate::proc::output_with_timeout(&mut command, LIST_TIMEOUT)
         .map_err(|error| BusError::unavailable("github.list_failed", error.to_string()))?

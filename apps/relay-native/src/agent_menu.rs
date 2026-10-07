@@ -85,7 +85,9 @@ fn bus_code(error: &Error) -> Option<&str> {
 /// `device.run` refusals in words a person can act on.
 fn phone_error(error: &Error) -> String {
     match bus_code(error) {
-        Some("device.gradle_missing") => "No Android project in this agent's worktree: no gradlew at its root or in forge-android/, and no run command in Project settings.".into(),
+        // The engine looks for gradlew at the root, then in the one top-level folder that has
+        // one; two such folders are as good as none (`gradle_wrapper` in handlers/device.rs).
+        Some("device.gradle_missing") => "No Android project in this agent's worktree: no gradlew at its root or in a single top-level folder, and no run command in Project settings.".into(),
         Some("device.not_ready") | Some("device.none") => "The phone is not connected or has not authorized this computer. Reconnect it and accept the USB debugging prompt.".into(),
         Some("device.worktree") => "This agent's worktree is missing or does not belong to the project.".into(),
         Some("device.busy") => error.to_string(),
@@ -172,7 +174,7 @@ impl Ui {
         tracing::debug!(session = %name, elapsed_us = clicked.elapsed().as_micros() as u64, "close: pane removed");
         let ui = self.clone();
         glib::spawn_future_local(async move {
-            let result = ui.call("session.close", payload).await;
+            let result = ui.call("session.close", payload.clone()).await;
             tracing::debug!(session = %name, elapsed_ms = clicked.elapsed().as_millis() as u64, ok = result.is_ok(), "close: engine answered");
             if matches!(result, Err(crate::client::Error::Timeout)) {
                 // Removing a large worktree can outlast the request: the close is still running,
@@ -196,6 +198,28 @@ impl Ui {
                     ui.sidebar_sessions.borrow_mut().retain(|s| text(s, "name") != name);
                     ui.render_projects();
                     ui.render_status_counts();
+                }
+                // Removing the worktree would delete uncommitted work. The popover is gone by
+                // now, so the question is asked here; only a yes deletes it (RA-405).
+                Err(Error::Bus(error)) if error.code == "worktree.dirty" => {
+                    let dialog = gtk::AlertDialog::builder()
+                        .message(format!("Discard {name}'s uncommitted changes?"))
+                        .detail(format!(
+                            "{}. Closing with its worktree removed deletes them for good. To keep them, commit or stash them, or close it keeping the worktree.",
+                            error.message
+                        ))
+                        .buttons(["Keep the agent", "Discard changes and close"])
+                        .cancel_button(0)
+                        .default_button(0)
+                        .modal(true)
+                        .build();
+                    if dialog.choose_future(Some(&ui.window)).await.ok() == Some(1) {
+                        let mut payload = payload;
+                        payload["discard_changes"] = json!(true);
+                        ui.close_agent(name, payload);
+                    } else {
+                        ui.refresh();
+                    }
                 }
                 Err(error) => {
                     ui.show_error(&format!("Could not close {name}: {error}"));

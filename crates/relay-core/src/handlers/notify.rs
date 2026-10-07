@@ -208,7 +208,9 @@ pub fn register(engine: &mut Engine) {
         let mut stmt = ctx.tx().prepare_cached("SELECT * FROM tasks WHERE col='in_review' AND deleted_at IS NULL AND (?1 IS NULL OR project_id=?1) ORDER BY updated_at DESC,id DESC").bus()?;
         let mut rows = stmt.query([only]).bus()?;
         let mut in_review = Vec::new();
-        while let Some(row) = rows.next().bus()? { in_review.push(crate::handlers::task::row_task(ctx.tx(), row).bus()?); }
+        while let Some(row) = rows.next().bus()? { in_review.push(crate::handlers::task::task_columns(row).bus()?); }
+        drop(rows);
+        crate::handlers::task::hydrate(ctx.tx(), &mut in_review).bus()?;
         // The newest open holds, cut like guardrail.holds.list cuts them: the dashboard is one
         // reply, and a client drops any line over its cap (RA-217).
         let mut holds_open = ctx.tx().prepare_cached("SELECT * FROM holds WHERE state='open' AND (?1 IS NULL OR project_id=?1) ORDER BY created_at DESC,id DESC LIMIT 100").bus()?

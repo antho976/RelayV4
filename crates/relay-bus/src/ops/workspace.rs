@@ -31,6 +31,9 @@ payload!(#[schemars(rename = "WorkspaceRemoveIn")] WsRemoveIn {
     /// With `force`: also delete the Relay-pool worktrees of the sessions it closes. Branches
     /// are always kept; off by default, so every checkout stays on disk.
     pub remove_worktrees: Option<bool>,
+    /// With `remove_worktrees`: delete them even with uncommitted changes. Without it, a dirty
+    /// one is refused `worktree.dirty` before anything is closed or removed (RA-405).
+    pub discard_changes: Option<bool>,
 });
 result!(#[schemars(rename = "WorkspaceRemoveOut")] WsRemoveOut { pub projects_removed: i64, pub sessions_closed: i64 });
 op!(WsRemove, "workspace.remove", WsRemoveIn => WsRemoveOut,
@@ -70,6 +73,9 @@ payload!(#[schemars(rename = "ProjectRemoveIn")] ProjectRemoveIn {
     /// With `force`: also delete the Relay-pool worktrees of the sessions it closes. Branches
     /// are always kept; off by default, so every checkout stays on disk.
     pub remove_worktrees: Option<bool>,
+    /// With `remove_worktrees`: delete them even with uncommitted changes. Without it, a dirty
+    /// one is refused `worktree.dirty` before anything is closed or removed (RA-405).
+    pub discard_changes: Option<bool>,
 });
 result!(#[schemars(rename = "ProjectRemoveOut")] ProjectRemoveOut { pub sessions_closed: i64, pub runs_stopped: i64 });
 op!(ProjectRemove, "project.remove", ProjectRemoveIn => ProjectRemoveOut,
