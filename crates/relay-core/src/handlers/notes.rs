@@ -250,6 +250,7 @@ fn send(
             format!("message text is {} bytes; the limit is {MAILBOX_TEXT_MAX}", text.len()),
         ).with_hint("put long material in a note or a file and send its name"));
     }
+    let mut re_task = re_task;
     if let Some(task_id) = re_task {
         let project: Option<Id> = tx
             .query_row(
@@ -259,7 +260,11 @@ fn send(
             )
             .optional()
             .bus()?;
-        if project != Some(project_id) {
+        // A lifecycle notice about a task deleted while an agent held it still goes out, just
+        // without the link: refusing it would fail the agent's `session.done` or Stop report.
+        if project != Some(project_id) && from == "system" {
+            re_task = None;
+        } else if project != Some(project_id) {
             return Err(BusError::not_found(
                 "task.not_found",
                 format!("no task {task_id} in project {project_id}"),
@@ -317,6 +322,9 @@ fn send(
                        JOIN messages m ON m.id = r.message_id
                        WHERE r.session_id = ?1 AND r.acked_at IS NULL
                          AND m.priority = 1 AND m.from_session = ?2
+                         AND julianday(m.sent_at) >= julianday(COALESCE((
+                           SELECT created_at FROM sessions WHERE project_id = m.project_id
+                             AND name = ?2 AND state != 'closed' ORDER BY id DESC LIMIT 1), m.sent_at))
                      )",
                     params![session_id, from],
                     |row| row.get(0),
@@ -658,17 +666,25 @@ pub fn register(e: &mut Engine) {
     e.register::<MailboxOutbox>(|ctx, p| {
         assert_actor_project(ctx, p.project_id)?;
         let from = actor_name(ctx)?;
+        // Messages carry the sender's name, and a name is reused once its session closes:
+        // what an earlier namesake sent predates this session and is not its outbox.
+        let born = match ctx.actor_session_id() {
+            Some(id) => sessions::by_id(ctx.tx(), id)?.map(|row| row.session.created_at),
+            None => None,
+        };
+        let since = p.since.as_deref().map(|raw| crate::time::bound("since", raw)).transpose()?;
         let limit = p.limit.unwrap_or(100).min(1000);
         let mut stmt = ctx
             .tx()
             .prepare_cached(
                 "SELECT m.*, NULL AS acked_at FROM messages m
              WHERE m.project_id = ?1 AND m.from_session = ?2 AND (?3 IS NULL OR m.sent_at >= ?3)
+               AND (?5 IS NULL OR julianday(m.sent_at) >= julianday(?5))
              ORDER BY m.sent_at DESC, m.id DESC LIMIT ?4",
             )
             .bus()?;
         let messages = stmt
-            .query_map(params![p.project_id, from, p.since, limit], message_row)
+            .query_map(params![p.project_id, from, since, limit, born], message_row)
             .bus()?
             .collect::<rusqlite::Result<Vec<_>>>()
             .bus()?;
@@ -685,17 +701,30 @@ pub fn register(e: &mut Engine) {
     });
     e.register::<MailboxList>(|ctx, p| {
         assert_actor_project(ctx, p.project_id)?;
-        let session = match (&p.session, ctx.actor.session_name()) {
+        // A recipient is a session, not a name: names are reused once a session closes, and
+        // a new session must not inherit an earlier namesake's inbox.
+        let session: Option<Id> = match (&p.session, ctx.actor.session_name()) {
             (Some(requested), Some(actor)) if requested != actor => return Err(BusError::not_own("mailbox")),
-            (Some(requested), _) => Some(requested.clone()),
-            (None, Some(actor)) => Some(actor.to_string()),
+            (_, Some(_)) => Some(ctx.actor_session_id()
+                .ok_or_else(|| BusError::actor("agent actor is not bound to a live session"))?),
+            // The person may read any session's inbox, a closed one's included: the newest of
+            // that name, which is the live one when there is one.
+            (Some(requested), None) => {
+                let id: Option<Id> = ctx.tx().prepare_cached(
+                    "SELECT id FROM sessions WHERE project_id=?1 AND name=?2 ORDER BY id DESC LIMIT 1",
+                ).bus()?.query_row(params![p.project_id, requested], |row| row.get(0)).optional().bus()?;
+                match id {
+                    Some(id) => Some(id),
+                    None => return Ok(MailboxListOut { messages: Vec::new(), next_before: None, more_unread: false }),
+                }
+            }
             (None, None) => None,
         };
         let mut sql = String::from(
             "SELECT m.*, CASE WHEN ?2 IS NOT NULL THEN mr.acked_at
               WHEN NOT EXISTS (SELECT 1 FROM message_recipients pending WHERE pending.message_id=m.id AND pending.acked_at IS NULL)
               THEN (SELECT MAX(done.acked_at) FROM message_recipients done WHERE done.message_id=m.id) ELSE NULL END AS acked_at
-             FROM messages m LEFT JOIN message_recipients mr ON mr.message_id=m.id AND mr.session=?2
+             FROM messages m LEFT JOIN message_recipients mr ON mr.message_id=m.id AND mr.session_id=?2
              WHERE m.project_id=?1",
         );
         if session.is_some() { sql.push_str(" AND mr.session IS NOT NULL"); }
@@ -713,8 +742,9 @@ pub fn register(e: &mut Engine) {
         let unread = p.unread_only.unwrap_or(false);
         sql.push_str(if unread { " ORDER BY m.id ASC LIMIT ?5" } else { " ORDER BY m.id DESC LIMIT ?5" });
         let limit = p.limit.unwrap_or(MAILBOX_PAGE).clamp(1, MAILBOX_PAGE_MAX) as usize;
+        let since = p.since.as_deref().map(|raw| crate::time::bound("since", raw)).transpose()?;
         let mut stmt = ctx.tx().prepare_cached(&sql).bus()?;
-        let mut messages = stmt.query_map(params![p.project_id, session, p.since, p.before, limit as i64 + 1], message_row).bus()?
+        let mut messages = stmt.query_map(params![p.project_id, session, since, p.before, limit as i64 + 1], message_row).bus()?
             .collect::<rusqlite::Result<Vec<_>>>().bus()?;
         let more = messages.len() > limit;
         messages.truncate(limit);
