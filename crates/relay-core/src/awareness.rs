@@ -152,6 +152,13 @@ pub fn peers(
     Ok(out)
 }
 
+/// Whether the session is on its first launch, or not launched yet. Every spawn, fresh or
+/// resumed, moves `epoch` on by one from 0, so a relaunch is past 1 — the same line the launch
+/// nudge draws with `spawned_at` before it spawns (RA-397).
+fn first_launch(row: &sessions::Row_) -> bool {
+    row.epoch <= 1
+}
+
 /// `git` is [`crate::handlers::git::briefing_state`] for the session, taken by the caller with
 /// the store unlocked: it walks commit history, and this runs under the store lock.
 pub fn brief(
@@ -261,7 +268,9 @@ pub fn brief(
         .as_deref()
         .filter(|text| !text.trim().is_empty())
     {
-        state.push_str(&format!("\n\nLaunch assignment:\n{assignment}"));
+        // Relaunched, the session may be long past it: name it for what it now is (RA-397).
+        let label = if first_launch(&row) { "Launch assignment" } else { "Original launch assignment (from the first launch; may already be done)" };
+        state.push_str(&format!("\n\n{label}:\n{assignment}"));
     }
 
     let peer_rows = peers(conn, session.project_id, Some(&session.name), engine)?;
@@ -484,7 +493,10 @@ pub fn bootstrap(
     };
     let task = task_row.map(bootstrap_task);
     let tasks = assigned.iter().map(bootstrap_task).collect();
-    let assignment = row.launch_prompt.filter(|text| !text.trim().is_empty());
+    // The work to begin only on the first launch, as the launch nudge hands it over: a later
+    // fresh start may come long after it was done, and is nudged toward its current task
+    // instead (RA-397). The text stays in the brief, labelled as the original instructions.
+    let assignment = row.launch_prompt.clone().filter(|text| first_launch(&row) && !text.trim().is_empty());
 
     let cfg = crate::guardrail::config(conn, Some(session.project_id))?;
     let actor = Actor::Agent(session.name.clone());
