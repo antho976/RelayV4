@@ -1175,6 +1175,8 @@ impl Ui {
         // The first refresh after connecting re-applies the saved pane order and focus, and no
         // save writes the cleared wall over them before it has.
         self.restored_project.set(0);
+        // A launch form built for the old connection would no longer submit (RA-470).
+        self.launch.set_reveal_child(false);
         self.layout();
         self.show_error("Connecting to the Relay engine…");
         let ui = self.clone();
