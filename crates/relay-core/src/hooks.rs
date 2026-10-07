@@ -394,7 +394,9 @@ fn run_user_message_hook(repo: &Path, worktree: &Path, name: &str, message: &str
 fn run_user_hook(hook: &Path, worktree: &Path, args: &[&std::ffi::OsStr]) -> Result<()> {
     if !is_executable(hook) { return Ok(()) }
     let mut command = Command::new(hook);
-    command.args(args).current_dir(worktree);
+    // A hook that fetches or asks GitHub fails instead of waiting on a prompt nobody sees: git
+    // asks on /dev/tty even with stdin closed (RA-372).
+    command.args(args).current_dir(worktree).env("GIT_TERMINAL_PROMPT", "0").env("GH_PROMPT_DISABLED", "1");
     let output = crate::proc::output_with_timeout(&mut command, USER_HOOK_TIMEOUT)
         .with_context(|| format!("running {}", hook.display()))?
         .ok_or_else(|| anyhow!("{} did not finish within {} s", hook.display(), USER_HOOK_TIMEOUT.as_secs()))?;

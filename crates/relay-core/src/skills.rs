@@ -10,8 +10,10 @@
 use anyhow::{Context, Result};
 use relay_bus::types::Id;
 use rusqlite::Connection;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
@@ -147,7 +149,7 @@ pub fn folder_names(conn: &Connection) -> Result<HashMap<Id, String>> {
 fn enabled(conn: &Connection, project_id: Id) -> Result<Vec<Row>> {
     let dirs = folder_names(conn)?;
     let mut stmt = conn.prepare_cached(
-        "SELECT s.id,s.name,s.body,s.updated_at,COALESCE(s.revision,'') FROM skills s
+        "SELECT s.id,s.name,s.body,COALESCE(s.revision,'') FROM skills s
          JOIN skill_projects sp ON sp.skill_id=s.id
          WHERE sp.project_id=?1 AND s.deleted_at IS NULL
          ORDER BY s.name COLLATE NOCASE,s.id",
@@ -178,14 +180,35 @@ fn with_plugins(mut rows: Vec<Row>, plugins: &[&'static crate::plugins::Loaded])
 fn row_of(row: &rusqlite::Row, dirs: &HashMap<Id, String>) -> rusqlite::Result<Row> {
     let id: Id = row.get(0)?;
     let name: String = row.get(1)?;
-    let updated_at: String = row.get(3)?;
-    let revision: String = row.get(4)?;
+    let body: String = row.get(2)?;
+    let revision: String = row.get(3)?;
+    // From the content, not `updated_at`: undo, `skill.enable` and every `skill.changed` move
+    // that without changing a byte, and each move recopied the folder into every checkout
+    // (RA-394). The library folder's version is added when it is written ([`write_skill`]).
+    let mut hash = Sha256::new();
+    hash.update(name.as_bytes());
+    hash.update([0]);
+    hash.update(body.as_bytes());
+    let content = crate::hex(&hash.finalize());
     Ok(Row {
         dir: dirs.get(&id).cloned().unwrap_or_else(|| folder_name(&name)),
-        body: row.get(2)?,
-        stamp: format!("{id} {updated_at} {revision}\n"),
+        body,
+        stamp: format!("{id} {revision} {content}\n"),
         source: Source::Library(id),
     })
+}
+
+/// What a skill's library folder holds, without reading it: [`adopt`] puts a new directory in
+/// place every time, by a rename or a fresh copy, so its inode and mtime move exactly when the
+/// files do. A plugin skill's files are its bundle's, whose digest is in the stamp already.
+fn assets_version(store: &crate::Store, source: &Source) -> String {
+    match source {
+        Source::Library(id) => match fs::metadata(library_dir(store, *id)) {
+            Ok(meta) if meta.is_dir() => format!("{}.{}.{}", meta.ino(), meta.mtime(), meta.mtime_nsec()),
+            _ => "none".into(),
+        },
+        Source::Plugin(_) => "bundled".into(),
+    }
 }
 
 /// Every skill enabled in at least one project. The user-scope folders are one per machine,
@@ -194,7 +217,7 @@ fn row_of(row: &rusqlite::Row, dirs: &HashMap<Id, String>) -> rusqlite::Result<R
 fn enabled_anywhere(conn: &Connection) -> Result<Vec<Row>> {
     let dirs = folder_names(conn)?;
     let mut stmt = conn.prepare_cached(
-        "SELECT s.id,s.name,s.body,s.updated_at,COALESCE(s.revision,'') FROM skills s
+        "SELECT s.id,s.name,s.body,COALESCE(s.revision,'') FROM skills s
          WHERE s.deleted_at IS NULL AND EXISTS(SELECT 1 FROM skill_projects sp WHERE sp.skill_id=s.id)
          ORDER BY s.name COLLATE NOCASE,s.id",
     )?;
@@ -378,7 +401,7 @@ fn write_skill(store: &crate::Store, row: &Row, dest: &Path, owner: &str) -> Res
     if dest.exists() && !marker.is_file() {
         return Ok(false);
     }
-    let stamp = format!("{owner}{}", row.stamp);
+    let stamp = format!("{owner}{}assets {}\n", row.stamp, assets_version(store, &row.source));
     if fs::read_to_string(&marker).is_ok_and(|current| current == stamp) {
         return Ok(true);
     }
@@ -539,6 +562,34 @@ mod tests {
         let folder = root.path().join("checkout/.agents/skills/polish");
         assert_eq!(fs::read_to_string(folder.join("SKILL.md")).unwrap(), "as edited");
         assert_eq!(fs::read_to_string(folder.join("reference/notes.md")).unwrap(), "notes");
+    }
+
+    /// RA-394: `updated_at` moving (undo, `skill.enable`, `skill.changed`) does not recopy a
+    /// folder; a new body or a new library folder does.
+    #[test]
+    fn a_folder_is_recopied_only_when_its_content_changes() {
+        let (store, root) = store_with(&["Polish"]);
+        let folder = root.path().join("checkout/.claude/skills/polish");
+        apply_project(&store, root.path());
+        // Left by the last copy; a recopy removes the folder first.
+        fs::write(folder.join("left.md"), "x").unwrap();
+        store.with_tx(|tx| { tx.execute("UPDATE skills SET updated_at='t2'", [])?; Ok(()) }).unwrap();
+        apply_project(&store, root.path());
+        assert!(folder.join("left.md").is_file(), "an unchanged skill was recopied");
+
+        store.with_tx(|tx| { tx.execute("UPDATE skills SET body='new body',updated_at='t3'", [])?; Ok(()) }).unwrap();
+        apply_project(&store, root.path());
+        assert!(!folder.join("left.md").exists(), "a changed body was not recopied");
+        assert_eq!(fs::read_to_string(folder.join("SKILL.md")).unwrap(), "new body");
+
+        fs::write(folder.join("left.md"), "x").unwrap();
+        let staged = root.path().join("staged");
+        fs::create_dir_all(&staged).unwrap();
+        fs::write(staged.join("reference.md"), "ref").unwrap();
+        adopt(&staged, &library_dir(&store, 1)).unwrap();
+        apply_project(&store, root.path());
+        assert!(!folder.join("left.md").exists(), "a new library folder was not recopied");
+        assert_eq!(fs::read_to_string(folder.join("reference.md")).unwrap(), "ref");
     }
 
     #[test]

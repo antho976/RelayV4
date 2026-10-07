@@ -271,6 +271,7 @@ fn evaluate_as(candidate: &Candidate, live_worktrees: &[String], options: &Optio
         pr: None,
         removed_worktree: false,
         deleted_remote: false,
+        merged: false,
     };
     let kept = |mut row: BranchCleanupRow, reason: String| { row.reason = reason; row };
     if !branch.starts_with(RELAY_BRANCHES) {
@@ -361,6 +362,7 @@ fn evaluate_as(candidate: &Candidate, live_worktrees: &[String], options: &Optio
     };
     row.pr = merged.pr.as_ref().map(|pr| pr.number);
     row.reason = merged.reason;
+    row.merged = true;
 
     if let Some(path) = &removable {
         if keep_worktree {
@@ -522,7 +524,7 @@ fn run_as(engine: &Engine, project_id: Option<Id>, only: Option<&[String]>, opti
 fn record(engine: &Engine, candidate: &Candidate, row: &BranchCleanupRow, options: &Options) {
     let summary = json!({
         "branch": row.branch, "session": row.session, "outcome": row.outcome, "reason": row.reason,
-        "pr": row.pr, "removed_worktree": row.removed_worktree, "deleted_remote": row.deleted_remote,
+        "pr": row.pr, "removed_worktree": row.removed_worktree, "deleted_remote": row.deleted_remote, "merged": row.merged,
     });
     match row.outcome.as_str() {
         "deleted" => tracing::info!(branch = %row.branch, reason = %row.reason, remote = row.deleted_remote, "deleted merged session branch"),

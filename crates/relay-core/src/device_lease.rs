@@ -168,6 +168,39 @@ pub fn busy(lease: &Lease) -> BusError {
         .with_details(json!({ "lease": lease.event() }))
 }
 
+/// A lease acquisition made by a request that has not committed yet. The lease map lives
+/// outside the store, so a request that rolled back — a later step refused, or the commit
+/// itself failed — used to leave the lease held while its `device.lease.acquired` event went
+/// with the rest of the request's events: the device was busy for up to [`SHELL_RUNNING`] under
+/// a lease nobody had been told of (RA-358). Dropped without [`Pending::keep`], it takes the
+/// acquisition back, silently, since nothing was announced: the lease map and the event stream
+/// both stay as if the request had never run.
+pub struct Pending {
+    /// `None` once kept.
+    leases: Option<Leases>,
+    device: String,
+    holder: Holder,
+    kind: Kind,
+    commands: u32,
+    /// For a renewal, the action and expiry the lease had before it.
+    prior: Option<(String, Option<Instant>)>,
+}
+
+impl Pending {
+    /// The request committed: the acquisition stands.
+    pub fn keep(mut self) {
+        self.leases = None;
+    }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        if let Some(leases) = self.leases.take() {
+            leases.revert(self);
+        }
+    }
+}
+
 /// Every holder's leases on one device key, in the order they were taken. All share a holder:
 /// another holder is refused before it can add one.
 type Stack = Vec<Lease>;
@@ -207,6 +240,15 @@ impl Leases {
     /// Returns whether the lease is new and now the one others see (the caller emits
     /// `device.lease.acquired`).
     pub fn acquire(&self, lease: Lease, pruned: &mut Vec<Lease>) -> Result<bool, BusError> {
+        self.acquire_pending(lease, pruned).map(|(taken, pending)| {
+            pending.keep();
+            taken
+        })
+    }
+
+    /// [`Leases::acquire`] for a request that has yet to commit: the [`Pending`] it returns
+    /// gives the acquisition back when dropped, unless it is kept.
+    pub fn acquire_pending(&self, lease: Lease, pruned: &mut Vec<Lease>) -> Result<(bool, Pending), BusError> {
         let mut map = self.map();
         pruned.extend(expire(&mut map));
         if let Some(other) = map.values().flatten().filter(|held| held.overlaps(&lease.device) && held.holder != lease.holder)
@@ -214,9 +256,18 @@ impl Leases {
         {
             return Err(busy(other));
         }
+        let mut pending = Pending {
+            leases: Some(self.clone()),
+            device: lease.device.clone(),
+            holder: lease.holder.clone(),
+            kind: lease.kind,
+            commands: lease.commands,
+            prior: None,
+        };
         let stack = map.entry(lease.device.clone()).or_default();
         let taken = if let Some(held) = stack.iter_mut().find(|held| held.kind == lease.kind) {
             // A renewal: keep when it started, move what it is doing and when it lapses.
+            pending.prior = Some((held.action.clone(), held.expires));
             held.action = lease.action;
             held.expires = match (held.expires, lease.expires) {
                 (Some(a), Some(b)) => Some(a.max(b)),
@@ -230,7 +281,28 @@ impl Leases {
             !outranked
         };
         self.shared.changed.notify_all();
-        Ok(taken)
+        Ok((taken, pending))
+    }
+
+    /// Undo one acquisition (see [`Pending`]): a lease it added goes, a renewal gets back the
+    /// action and expiry it had and gives back the command it counted.
+    fn revert(&self, pending: &Pending) {
+        let mut map = self.map();
+        if let Some(stack) = map.get_mut(&pending.device) {
+            if let Some(at) = stack.iter().position(|held| held.kind == pending.kind && held.holder == pending.holder) {
+                match &pending.prior {
+                    None => { stack.remove(at); }
+                    Some((action, expires)) => {
+                        let held = &mut stack[at];
+                        held.action = action.clone();
+                        held.expires = *expires;
+                        held.commands = held.commands.saturating_sub(pending.commands);
+                    }
+                }
+            }
+        }
+        map.retain(|_, stack| !stack.is_empty());
+        self.shared.changed.notify_all();
     }
 
     /// Would `holder` be refused on `device`? Never takes anything.
@@ -576,6 +648,36 @@ mod tests {
 
     fn device(line: &str) -> Option<(String, String)> {
         device_command(line).map(|found| (found.device, found.action))
+    }
+
+    /// RA-358: an acquisition whose request rolled back is taken back, and a renewal gets back
+    /// what it had; one whose request committed stands.
+    #[test]
+    fn an_acquisition_that_does_not_commit_is_taken_back() {
+        let leases = Leases::default();
+        let me = Holder::Session { id: 1, name: "me".into() };
+        let shell = |action: &str| Lease::new("phone", me.clone(), Kind::Shell, action, Some(SHELL_RUNNING));
+
+        let (taken, pending) = leases.acquire_pending(shell("adb install"), &mut Vec::new()).unwrap();
+        assert!(taken);
+        drop(pending);
+        assert!(leases.list().is_empty(), "a rolled-back request left its lease held");
+
+        let (_, pending) = leases.acquire_pending(shell("adb install"), &mut Vec::new()).unwrap();
+        pending.keep();
+        leases.shell_command_finished(1, "phone", false);
+        let before = leases.holder_of("phone").unwrap();
+        assert_eq!(before.commands, 0);
+        let (taken, pending) = leases.acquire_pending(shell("adb shell input tap 1 1"), &mut Vec::new()).unwrap();
+        assert!(!taken, "a renewal");
+        assert_eq!(leases.holder_of("phone").unwrap().commands, 1);
+        drop(pending);
+        let after = leases.holder_of("phone").unwrap();
+        assert_eq!((after.commands, after.action.as_str(), after.expires), (0, "adb install", before.expires));
+
+        // Someone else is refused while the kept lease stands.
+        let other = Lease::new("phone", Holder::User, Kind::Claim, "testing", None);
+        assert!(leases.acquire_pending(other, &mut Vec::new()).is_err());
     }
 
     #[test]

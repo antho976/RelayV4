@@ -813,14 +813,14 @@ unique; nothing else is.
 | op | attrs | payload → result |
 |---|---|---|
 | `module.create` | mutation · always · inverse | `{ project_id, name, icon?, priority? }` → `Module` |
-| `module.get` | query | `{ module_id }` → `Module & { tasks_by_state }` |
-| `module.list` | query | `{ project_id, include_archived? }` → `{ modules: ModuleSummary[], header: {count, in_flight, issues, completed, completion_pct} }` |
+| `module.get` | query | `{ module_id }` → `Module & { tasks_by_state }` — an agent is refused another project's module, `refused`/`actor.scope` (D106) |
+| `module.list` | query | `{ project_id?, include_archived? }` → `{ modules: ModuleSummary[], header: {count, in_flight, issues, completed, completion_pct} }` — an agent sees its own project only (`project_id` may be left out; another is `refused`/`actor.scope`, D106); the person must name one (`invalid`/`module.project`) |
 | `module.update` | mutation · always · inverse | `{ module_id, name?, icon?, priority?, order? }` → `Module` |
 | `module.complete` | mutation · always · inverse (reopen) | `{ module_id }` → `Module` (archived, `completed_at` set) |
 | `module.reopen` | mutation · always · inverse | `{ module_id }` → `Module` |
 | `module.delete` / `module.restore` | mutation · always · inverse | `{ module_id }` → `{}` / `Module` — delete unlinks tasks (they keep existing, `module_id: null`) |
-| `module.stats` | query | `{ project_id }` → same as `module.list.header` |
-| `module.changelog.draft` | query | `{ module_id, group_by?: "priority" }` (the only grouping built; any other value is `invalid` / `module.changelog_group`) → `{ markdown, tasks: Id[] }` |
+| `module.stats` | query | `{ project_id }` → same as `module.list.header` — an agent's own project only (D106) |
+| `module.changelog.draft` | query | `{ module_id, group_by?: "priority" }` (the only grouping built; any other value is `invalid` / `module.changelog_group`) → `{ markdown, tasks: Id[] }` — an agent's own project's modules only (D106) |
 
 ### 10.7 notes / mailbox (SPEC §3, §12)
 
@@ -862,7 +862,7 @@ are `user_only` (§9.1). Agents get `done`, `report`, `attach`/`scrollback`, `bo
 | `session.list` | query | `{ project_id?, state?: SessionState[], include_closed? }` → `{ sessions: Session[] }` — an agent sees its own project only; another `project_id` is `refused`/`actor.scope` (D106) |
 | `session.peers` | query | `{ session }` or `{ project_id }` or `{}` → `{ peers: Peer[] }` — the live peer table (name, provider, branch, claimed files, task title, state). For an agent, neither target means "my project, minus me" |
 | `session.brief` | query | `{ session }` → `{ text, compact, parts: {state, peers, notes, adjacent, skills}: string }` — the knowledge injection, inspectable. `compact` is the half injected on every spawn: state, peers, notes and adjacent work, naming the enabled skills and the folders they are registered in (bodies stay on disk) and the launch assignment omitted (D101, D147). Own session or PAIR partner only |
-| `session.bootstrap` | query · agent | `{}` → `{ session, role, project_id, project, base_branch, worktree, branch, module?, task?, tasks: Task[], pair?, assignment?, brief_path, peers: Peer[], can_call: string[], discovery, comms, guardrails: {caps, denied_commands, write_roots, dry_run} }` — the one call every agent makes first, so it answers "who else is here and what may I do?" as well as "who am I" (D105). `discovery` points to `bus.ops`/`bus.schema` and their shell equivalents; `can_call` is the §9.1 verdict. User/unbound calls are `invalid`/`bus.actor` |
+| `session.bootstrap` | query · agent | `{}` → `{ session, role, project_id, project, base_branch, worktree, branch, module?, task?, tasks: Task[], pair?, assignment?, brief_path, peers: Peer[], can_call: string[], discovery, comms, guardrails: {caps, denied_commands, write_roots, dry_run} }` — the one call every agent makes first, so it answers "who else is here and what may I do?" as well as "who am I" (D105). `discovery` points to `bus.ops`/`bus.schema` and their shell equivalents; `can_call` is the §9.1 verdict. `assignment` is the launch prompt on the session's first launch only: after a relaunch (fresh or resumed) it is absent, and the brief keeps the text labelled as the original launch assignment (RA-397). User/unbound calls are `invalid`/`bus.actor` |
 | `session.update` | mutation · always · inverse · user | `{ session, branch?, model?, effort?, task_id?: Id\|null, module_id?: Id\|null, bus_writes?, allow_ui? }` → `Session` — `branch`/`model`/`effort` are `conflict`/`session.already_spawned` after first spawn; the rest any time. A branch rename is refused `conflict`/`session.branch_primary` on the project's primary checkout and `conflict`/`session.branch_shared` on a checkout another session shares (RA-402) |
 | `session.report` | mutation · agent_only · session · agent | `{ session, kind: "session_start"\|"tool_use"\|"stop"\|"notification"\|"idle"\|"blocked", data?: object }` → `{}` — the provider's hooks calling home (§9.3); this is where `state: blocked`, `provider_ref` and "agent asking" notifications come from. Codex, having no hooks, degrades to PTY-derived idle/busy |
 | `session.attach` | query · stream | `{ session, from_seq?: number }` → attaches `pty` stream (replays scrollback from `from_seq`) |
@@ -885,7 +885,11 @@ before each provider launch. It comes in two halves, because delivering it whole
   spawn, appended to the provider-native role instruction — Claude's appended-system-prompt file
   or Codex `developer_instructions` — because a session spawned with no assignment is exactly the
   one that most needs to know who its peers are. It never carries the launch assignment: for
-  Codex it lands in argv, and `session.bootstrap` already returns it privately.
+  Codex it lands in argv, and `session.bootstrap` already returns it privately. Each section has
+  a budget (RA-385): peers, adjacent tasks and the skill list at most 40 lines / 8 KiB, the
+  standing note 16 KiB, each task body and changelog 4 KiB. A section that is cut ends with a
+  line naming the op that returns the whole (`session.peers`, `task.list {module_id}`,
+  `skill.list`, `notes.standing {project_id}`, `task.get {task_id}`).
 - **skills** — `skill.list {enabled: true}` bodies, written to `.relay/session-skills.md`. The
   compact half names each enabled skill and the folder it is materialized in
   (`.claude/skills/<name>/`, `.agents/skills/<name>/`, and the provider's own home, D147), so an
@@ -897,7 +901,7 @@ The full document, compact half plus the launch assignment, is written to the un
 file `.relay/sessions/<session>/session-brief.md` (`$RELAY_BRIEF`); `session.brief` returns `text`, `compact` and the
 parts separately, for inspection. Relay still sends no positional prompt, and every role
 instruction directs the first real turn to actor-bound `session.bootstrap` (§10.8), which returns
-the assignment along with the peer table, the callable op list and the session's guardrails.
+the assignment (first launch only) along with the peer table, the callable op list and the session's guardrails.
 Provider-neutral Markdown; the same for both providers.
 
 ### 10.10 overlap
@@ -951,8 +955,8 @@ Provider-neutral Markdown; the same for both providers.
 | `git.push` | mutation · always | `{ project_id, worktree?, set_upstream? = auto }` → `{}` — a branch without an upstream is first-pushed as `git push -u origin <branch>`; explicit `false` keeps plain-push behavior |
 | `git.pr.list` | query | `{ project_id, refresh? }` → `{ pull_requests: { number, branch, draft, url, title }[] }` — GitHub PRs reported by the authenticated `gh` CLI. One listing answers for a minute per repository (D130: redraws must not repeat the network request); `refresh` asks GitHub now, and `git.push` / `git.pr.open` drop the cached one |
 | `git.pr.open` | mutation · always | `{ project_id, worktree?, title?, body? }` → `{ url }` — `gh pr create` runs before the store lock, with a 25 s deadline; `git.pr_timeout` means the outcome is unknown |
-| `git.branch.clean_merged` | mutation · always · user | `{ project_id, dry_run? }` → `{ deleted: string[] }` — an alias of `git.branch.cleanup` (same rules, same staged pass), answering with the branches deleted, or on a dry run that would be. It used to delete any merged local branch by rules of its own, which had drifted from cleanup's |
-| `git.branch.cleanup` | mutation · always · user | `{ project_id, dry_run? }` → `{ branches: {branch, session?, outcome, reason, pr?, removed_worktree, deleted_remote}[] }` — closed sessions' `relay/*` branches whose work is merged (an ancestor of the base, every commit already upstream by patch id, or a merged GitHub PR containing the tip) are deleted; anything else is `kept` with the reason. A branch checked out in the primary, by an open session or outside the pool, or being rebased or bisected, stays; a clean, unowned pooled checkout holding it is removed first. The remote branch is deleted only for a merged PR, leased on the sha just seen. The same pass runs after `session.close`, when `git.pr.list` sees a closed session's PR merged, and as a background sweep 90 s after start and every 20 min (a kept, unchanged branch is looked at again ever less often, up to weekly). Each deletion writes a `system` audit row and emits `git.changed` |
+| `git.branch.clean_merged` | mutation · always · user | `{ project_id, dry_run? }` → `{ deleted: string[], failed: {branch, reason}[] }` — an alias of `git.branch.cleanup` (same rules, same staged pass), answering with the branches deleted, or on a dry run that would be, and in `failed` the merged ones it could not delete (a dirty or held checkout, a rebase in progress, a failed delete) with why; unmerged work is in neither. It used to delete any merged local branch by rules of its own, which had drifted from cleanup's |
+| `git.branch.cleanup` | mutation · always · user | `{ project_id, dry_run? }` → `{ branches: {branch, session?, outcome, reason, pr?, removed_worktree, deleted_remote, merged}[] }` — closed sessions' `relay/*` branches whose work is merged (an ancestor of the base, every commit already upstream by patch id, or a merged GitHub PR containing the tip) are deleted; anything else is `kept` with the reason (`merged` tells a merged branch that could not go from unmerged work). A branch checked out in the primary, by an open session or outside the pool, or being rebased or bisected, stays; a clean, unowned pooled checkout holding it is removed first. The remote branch is deleted only for a merged PR, leased on the sha just seen. The same pass runs after `session.close`, when `git.pr.list` sees a closed session's PR merged, and as a background sweep 90 s after start and every 20 min (a kept, unchanged branch is looked at again ever less often, up to weekly). Each deletion writes a `system` audit row and emits `git.changed` |
 | `git.suggest_message` | query | `{ project_id, worktree? }` → `{ message }` — heuristic subject from the diff |
 | `integration.request` | mutation · always | `{ project_id, sessions: string[] \| branches: string[], build?: bool = true, deploy?: DeviceRef }` → `Integration` (state `queued`; results via `integration.result` events). An agent is held to its own project and refused `deploy`; an agent's request that builds (the project's `build_cmd`, run outside any sandbox) is `held` / `integration.agent_build` for a person to confirm unless the project's `guardrails.agent_builds` is on, while a merge-only request (`build: false`) goes straight through |
 | `integration.get` / `integration.list` | query | `{ integration_id }` / `{ project_id }` |

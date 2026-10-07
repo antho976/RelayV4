@@ -85,7 +85,9 @@ fn bus_code(error: &Error) -> Option<&str> {
 /// `device.run` refusals in words a person can act on.
 fn phone_error(error: &Error) -> String {
     match bus_code(error) {
-        Some("device.gradle_missing") => "No Android project in this agent's worktree: no gradlew at its root or in forge-android/, and no run command in Project settings.".into(),
+        // The engine looks for gradlew at the root, then in the one top-level folder that has
+        // one; two such folders are as good as none (`gradle_wrapper` in handlers/device.rs).
+        Some("device.gradle_missing") => "No Android project in this agent's worktree: no gradlew at its root or in a single top-level folder, and no run command in Project settings.".into(),
         Some("device.not_ready") | Some("device.none") => "The phone is not connected or has not authorized this computer. Reconnect it and accept the USB debugging prompt.".into(),
         Some("device.worktree") => "This agent's worktree is missing or does not belong to the project.".into(),
         Some("device.busy") => error.to_string(),

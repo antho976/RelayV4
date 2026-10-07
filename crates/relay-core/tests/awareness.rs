@@ -618,3 +618,37 @@ fn mailbox_list_is_paged_newest_first_for_people_and_oldest_unread_for_agents() 
     let refused = call(e, Actor::User, "mailbox.send", json!({"project_id":1,"to":f.a_name(),"text":long}));
     assert_eq!(refused.error.unwrap().code, "mailbox.text");
 }
+
+/// RA-385: an oversized brief section is cut, and says where the whole of it is.
+#[test]
+fn an_oversized_brief_section_is_cut_with_a_pointer_to_the_full_list() {
+    let f = Fixture::new();
+    let e = &f.engine;
+    let long_note: String = (0..2000).map(|i| format!("standing rule number {i}\n")).collect();
+    e.store.with_tx(|tx| {
+        for i in 0..100 {
+            tx.execute(
+                "INSERT INTO tasks(project_id,module_id,title,body,col,state,position,created_at,updated_at)
+                 VALUES (1,1,?1,'','backlog','none',?2,'t','t')",
+                rusqlite::params![format!("Neighbour {i}"), 10 + i],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO notes(project_id,title,body,standing,created_at,updated_at) VALUES (1,'Standing notes',?1,1,'t','t')",
+            [&long_note],
+        )?;
+        Ok(())
+    }).unwrap();
+    let brief = ok(e, Actor::agent(f.a_name()), "session.brief", json!({"session":f.a_name()}));
+    let adjacent = brief["parts"]["adjacent"].as_str().unwrap();
+    assert!(adjacent.lines().count() <= 41, "{adjacent}");
+    assert!(adjacent.ends_with("not shown here; the full list: `task.list {\"module_id\": 1}`"), "{adjacent}");
+    let notes = brief["parts"]["notes"].as_str().unwrap();
+    assert!(notes.len() < 17 * 1024, "{}", notes.len());
+    assert!(notes.starts_with("standing rule number 0\n"));
+    assert!(notes.ends_with("the whole text: `notes.standing {\"project_id\": 1}`]"), "{}", &notes[notes.len() - 200..]);
+    // The compact half carries the same cut sections.
+    assert!(brief["compact"].as_str().unwrap().contains("the full list: `task.list"));
+    // A section within its budget is whole and says nothing more.
+    assert!(!brief["parts"]["peers"].as_str().unwrap().contains("full list"));
+}

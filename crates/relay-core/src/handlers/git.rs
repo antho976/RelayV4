@@ -797,12 +797,20 @@ pub fn register(e: &mut Engine) {
     );
     // The older name for git.branch.cleanup, kept for the clients that call it. It had rules of
     // its own that had drifted from cleanup's (any merged branch, by any name); now it is the
-    // same cleanup, answering with the branches deleted, or on a dry run that would be (RA-740).
+    // same cleanup, answering with the branches deleted, or on a dry run that would be (RA-740),
+    // and the merged ones it found but could not delete, with why (RA-373).
     e.register_staged::<CleanMerged, _>(
         |ctx, p| branch_cleanup(ctx, p.project_id, p.dry_run),
         |ctx: &mut Ctx, _p, (project, rows)| {
-            let rows = branch_cleaned(ctx, &project, rows);
-            Ok(CleanMergedOut { deleted: rows.into_iter().filter(|row| row.outcome != "kept").map(|row| row.branch).collect() })
+            let (mut deleted, mut failed) = (Vec::new(), Vec::new());
+            for row in branch_cleaned(ctx, &project, rows) {
+                match row.outcome.as_str() {
+                    "kept" if row.merged => failed.push(CleanMergedFailed { branch: row.branch, reason: row.reason }),
+                    "kept" => {}
+                    _ => deleted.push(row.branch),
+                }
+            }
+            Ok(CleanMergedOut { deleted, failed })
         },
     );
     e.register_unlocked::<SuggestMessage>(|ctx, p| {
@@ -1537,7 +1545,7 @@ struct GhRepo {
 
 fn list_pull_requests(gh: &Path, root: &Path) -> Result<PrListOut, BusError> {
     let mut command = std::process::Command::new(gh);
-    command.current_dir(root).args([
+    command.current_dir(root).env("GH_PROMPT_DISABLED", "1").args([
         "api",
         "--paginate",
         "--slurp",

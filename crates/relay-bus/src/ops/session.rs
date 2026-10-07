@@ -125,6 +125,8 @@ result!(#[schemars(rename = "SessionBootstrapOut")] BootstrapOut {
     /// Current task followed by every queued or in-review task attached to this session.
     pub tasks: Vec<BootstrapTask>,
     pub pair: Option<BootstrapPair>,
+    /// The launch prompt, on the session's first launch only: a relaunch may come long after
+    /// that work was done (RA-397). The brief keeps it as the original launch assignment.
     pub assignment: Option<String>,
     /// Worktree-relative path of the full brief.
     pub brief_path: String,
