@@ -133,9 +133,16 @@ payload!(#[schemars(rename = "GitPrOpenIn")] PrOpenIn { pub project_id: Id, pub 
 result!(#[schemars(rename = "GitPrOpenOut")] PrOpenOut { pub url: String });
 op!(PrOpen, "git.pr.open", PrOpenIn => PrOpenOut, OpMeta::mutation(Scope::Project, 8, "Open a PR for the branch"));
 payload!(#[schemars(rename = "GitCleanMergedIn")] CleanMergedIn { pub project_id: Id, pub dry_run: Option<bool> });
-result!(#[schemars(rename = "GitCleanMergedOut")] CleanMergedOut { pub deleted: Vec<String> });
+result!(#[schemars(rename = "GitCleanMergedFailed")] CleanMergedFailed { pub branch: String, pub reason: String });
+result!(#[schemars(rename = "GitCleanMergedOut")] CleanMergedOut {
+    pub deleted: Vec<String>,
+    /// Branches found merged that were not deleted (or, on a dry run, would not be), with why:
+    /// a dirty or still-held checkout, a rebase in progress, a failed delete (RA-373).
+    #[serde(default)]
+    pub failed: Vec<CleanMergedFailed>,
+});
 op!(CleanMerged, "git.branch.clean_merged", CleanMergedIn => CleanMergedOut,
-    OpMeta::mutation(Scope::Project, 8, "Alias of git.branch.cleanup that answers with the names of the branches deleted (or, on a dry run, that would be)").actors(Actors::UserOnly).emits(&["git.changed", "worktree.changed"]));
+    OpMeta::mutation(Scope::Project, 8, "Alias of git.branch.cleanup that answers with the names of the branches deleted (or, on a dry run, that would be), and the merged ones it could not delete").actors(Actors::UserOnly).emits(&["git.changed", "worktree.changed"]));
 payload!(#[schemars(rename = "GitBranchCleanupIn")] BranchCleanupIn { pub project_id: Id, pub dry_run: Option<bool> });
 result!(#[schemars(rename = "GitBranchCleanup")] BranchCleanupRow {
     pub branch: String,
@@ -148,6 +155,9 @@ result!(#[schemars(rename = "GitBranchCleanup")] BranchCleanupRow {
     pub pr: Option<u64>,
     pub removed_worktree: bool,
     pub deleted_remote: bool,
+    /// Its work was found merged; a `kept` row with this set is one cleanup could not delete.
+    #[serde(default)]
+    pub merged: bool,
 });
 result!(#[schemars(rename = "GitBranchCleanupOut")] BranchCleanupOut { pub branches: Vec<BranchCleanupRow> });
 op!(BranchCleanup, "git.branch.cleanup", BranchCleanupIn => BranchCleanupOut,

@@ -350,26 +350,51 @@ fn log_and_show_survive_an_out_of_range_author_date() {
     ok(&e, "git.show", json!({"project_id":1,"sha":sha}));
 }
 
-/// RA-373: one branch git refuses to delete does not stop the others, nor hide that they went.
+/// RA-373: `git.branch.clean_merged` (an alias of `git.branch.cleanup`) deletes every closed
+/// session's merged `relay/*` branch it can, and names the merged ones it could not delete with
+/// why, apart from the unmerged work it keeps on purpose.
 #[test]
 fn clean_merged_deletes_every_branch_it_can() {
     let e = engine();
     let (_ws, repo) = project(&e);
     let root = Path::new(&repo);
-    git(root, &["branch", "old"]);
-    git(root, &["branch", "at-old"]);
-    commit(root, "advance");
-    git(root, &["branch", "at-main"]);
-    // `git branch -d` asks whether a branch is merged into HEAD: `at-main` is merged into the
-    // base but not into `old`, so git refuses that one.
-    git(root, &["checkout", "-q", "old"]);
+    let session = |file: &str| {
+        let created = ok(&e, "session.create", json!({"project_id":1,"provider":"codex"}));
+        let worktree = Path::new(created["worktree"].as_str().unwrap()).to_path_buf();
+        std::fs::write(worktree.join(file), "work\n").unwrap();
+        git(&worktree, &["add", file]);
+        git(&worktree, &["commit", "--no-verify", "-q", "-m", file]);
+        (created["name"].as_str().unwrap().to_string(), created["branch"].as_str().unwrap().to_string())
+    };
+    let (done, done_branch) = session("done.txt");
+    let (held, held_branch) = session("held.txt");
+    let (open, open_branch) = session("open.txt");
+    for branch in [&done_branch, &held_branch] {
+        git(root, &["merge", "--no-verify", "-q", "--no-ff", "-m", "merge", branch]);
+    }
+    for name in [&done, &held, &open] {
+        ok(&e, "session.close", json!({"session": name}));
+    }
+    // A rebase in progress on a merged branch: deleting it would pull it out from under that.
+    let rebase = root.join(".git/rebase-merge");
+    std::fs::create_dir_all(&rebase).unwrap();
+    std::fs::write(rebase.join("head-name"), format!("refs/heads/{held_branch}\n")).unwrap();
+
     let out = ok(&e, "git.branch.clean_merged", json!({"project_id":1}));
-    assert_eq!(out["deleted"], json!(["at-old"]));
-    assert!(git(root, &["branch", "--list", "at-old"]).is_empty());
-    assert!(!git(root, &["branch", "--list", "at-main"]).is_empty());
-    // Nothing deletable left: the refusal is the answer.
-    let refused = call(&e, "git.branch.clean_merged", json!({"project_id":1}));
-    assert_eq!(err(&refused).code, "git.branch_delete_failed");
+    assert_eq!(out["deleted"], json!([done_branch]), "{out}");
+    let failed = out["failed"].as_array().unwrap();
+    assert_eq!(failed.len(), 1, "unmerged work is kept, not failed: {out}");
+    assert_eq!(failed[0]["branch"], held_branch.as_str());
+    assert!(failed[0]["reason"].as_str().unwrap().contains("rebase or bisect"), "{out}");
+    assert!(git(root, &["branch", "--list", &done_branch]).is_empty());
+    assert!(!git(root, &["branch", "--list", &held_branch]).is_empty());
+    assert!(!git(root, &["branch", "--list", &open_branch]).is_empty(), "unmerged work stays");
+
+    // The rebase over, the held branch goes too.
+    std::fs::remove_dir_all(&rebase).unwrap();
+    let out = ok(&e, "git.branch.clean_merged", json!({"project_id":1}));
+    assert_eq!(out["deleted"], json!([held_branch]), "{out}");
+    assert_eq!(out["failed"], json!([]), "{out}");
 }
 
 /// RA-422: project.update's legacy guardrail columns are checked like guardrail.config.set's.
