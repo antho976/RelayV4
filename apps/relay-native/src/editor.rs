@@ -1902,15 +1902,25 @@ impl Editor {
             }
             let payload = ed.payload(&ui, json!({"path":path,"into":into}));
             let moved = path.to_owned();
+            let (project, worktree) = (ui.project.get(), ed.worktree.borrow().clone());
             let ed = ed.clone();
-            ed.busy.set(true);
+            // Locked, not just busy: the view is read-only while the move is queued (RA-499).
+            ed.set_locked(true);
             ed.writing.set(true);
             glib::spawn_future_local(async move {
                 let result = code_git::guarded(&ui, "file.move", payload).await;
-                ed.busy.set(false);
                 ed.writing.set(false);
+                ed.set_locked(false);
+                if !ed.matches(&ui, project, &worktree) {
+                    return;
+                }
                 match result {
                     Ok(None) => {}
+                    // Edits made meanwhile are not thrown away by reopening the document.
+                    Ok(Some(_)) if ed.buffer.is_modified() => {
+                        ed.load_tree(&ui);
+                        ed.refresh_git(&ui);
+                    }
                     Ok(Some(value)) => ed.follow_change(&ui, &moved, Some(text(&value, "path"))),
                     Err(error) => ui.show_error(&error.to_string()),
                 }

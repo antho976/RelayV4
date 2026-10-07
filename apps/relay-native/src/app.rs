@@ -229,6 +229,16 @@ fn track_navigation(stack: &gtk::Stack, key: &gtk::Button, name: &'static str) {
     });
 }
 
+/// Whether a `settings.changed` path can change wallpaper rotation: its own keys, anything
+/// under them, or a parent that holds them. `appearance.wallpaper`, which each rotation tick
+/// writes, is not one (RA-529).
+fn rotation_setting(path: &str) -> bool {
+    matches!(path, "" | "appearance")
+        || ["appearance.wallpaper_rotation", "appearance.wallpapers"]
+            .iter()
+            .any(|key| path.strip_prefix(key).is_some_and(|rest| rest.is_empty() || rest.starts_with('.')))
+}
+
 pub struct Ui {
     pub window: gtk::ApplicationWindow,
     pub rt: Handle,
@@ -1198,10 +1208,13 @@ impl Ui {
                     crate::wallpaper_rotation::refresh(&ui);
                     ui.load_keybindings();
                     if *ui.page.borrow() == "devices" {
-                        let _ = ui.call("device.watch", json!({"on":true})).await;
-                        if generation != ui.generation.get() {
-                            return;
-                        }
+                        // Its own future, as navigate() does: awaited here, more than 64 events
+                        // ahead of its reply would fill the notice channel before anything
+                        // drains it, and the reply would never be read (RA-554).
+                        let ui = ui.clone();
+                        glib::spawn_future_local(async move {
+                            let _ = ui.call("device.watch", json!({"on":true})).await;
+                        });
                     }
                     let weak = Rc::downgrade(&ui);
                     drop(ui);
@@ -1230,11 +1243,12 @@ impl Ui {
                                     ui.refresh();
                                     continue;
                                 }
-                                if matches!(
-                                    e.ev.as_str(),
-                                    "usage.changed" | "device.changed" | "run.changed"
-                                ) {
-                                    ui.refresh_status();
+                                // Each refreshes only what it changed: a usage event spends
+                                // no adb call (RA-511).
+                                match e.ev.as_str() {
+                                    "usage.changed" => ui.refresh_usage(false),
+                                    "device.changed" | "run.changed" => ui.refresh_devices(),
+                                    _ => {}
                                 }
                                 if e.ev == "notify.new" {
                                     crate::sounds::notify(&ui, &e.payload);
@@ -1304,7 +1318,7 @@ impl Ui {
                                     }
                                     // Only these read the wallpaper library, which can be
                                     // megabytes: not every appearance field (RA-529).
-                                    if matches!(path, "appearance.wallpaper_rotation" | "appearance.wallpapers" | "") {
+                                    if rotation_setting(path) {
                                         crate::wallpaper_rotation::refresh(&ui);
                                     }
                                     if path.starts_with("appearance.")
@@ -1786,5 +1800,20 @@ impl Ui {
             return;
         }
         onboarding::open(self, workspace);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rotation_setting;
+
+    #[test]
+    fn only_rotation_keys_refresh_rotation() {
+        for path in ["", "appearance", "appearance.wallpaper_rotation", "appearance.wallpaper_rotation.minutes", "appearance.wallpapers"] {
+            assert!(rotation_setting(path), "{path}");
+        }
+        for path in ["appearance.wallpaper", "appearance.wallpaper_opacity", "appearance.wallpapers_x", "appearance.accent", "terminal.font_size"] {
+            assert!(!rotation_setting(path), "{path}");
+        }
     }
 }
