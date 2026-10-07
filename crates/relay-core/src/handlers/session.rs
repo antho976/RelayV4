@@ -286,10 +286,13 @@ fn record_agent_notification(ctx: &mut Ctx, s: &Session, category: &str, title: 
         params![s.project_id, category, title, link], |row| row.get::<_, i64>(0),
     ).optional().bus()?;
     if let Some(id) = existing {
-        if body != "Agent turn completed" {
-            ctx.tx().execute("UPDATE notifications SET body=?1 WHERE id=?2", params![body, id]).bus()?;
-            ctx.emit("notify.changed", json!({"notification_id":id,"project_id":s.project_id}));
-        }
+        // The card now stands for this report, so it takes this report's time: notify.list and
+        // the client's LAST REPORT order by created_at, and a stale one buried it (RA-234). The
+        // generic hook body never replaces a real summary. Still unread: only unread rows match.
+        let keep_body = body == "Agent turn completed";
+        ctx.tx().prepare_cached("UPDATE notifications SET body=CASE WHEN ?1 THEN body ELSE ?2 END,created_at=?3 WHERE id=?4").bus()?
+            .execute(params![keep_body, body, ctx.now, id]).bus()?;
+        ctx.emit("notify.changed", json!({"notification_id":id,"project_id":s.project_id}));
         return Ok(false);
     }
     ctx.tx().execute(
@@ -1773,24 +1776,33 @@ pub fn register(e: &mut Engine) {
         Ok(updated.session)
     });
 
-    e.register_unlocked::<RestorableList>(|ctx, _| {
+    e.register_unlocked::<RestorableList>(|ctx, p| {
         let rows = ctx.read(|conn| {
-            let mut stmt = conn.prepare_cached("SELECT * FROM sessions WHERE state='restorable' ORDER BY id").bus()?;
-            let rows = stmt.query_map([], |row| Ok((sessions::row(row)?, row.get::<_, Option<String>>("restore_reason")?)))
+            let mut stmt = conn.prepare_cached(
+                "SELECT * FROM sessions WHERE state='restorable' AND (?1 IS NULL OR project_id=?1) AND (?2 IS NULL OR name=?2) ORDER BY id",
+            ).bus()?;
+            let rows = stmt.query_map(params![p.project_id, p.session], |row| Ok((sessions::row(row)?, row.get::<_, Option<String>>("restore_reason")?)))
                 .bus()?.collect::<rusqlite::Result<Vec<_>>>().bus()?;
             Ok(rows)
         })?;
-        let mut out = Vec::new();
-        for (row, reason) in rows {
-            let dirty = gix::open(&row.session.worktree)
-                .ok()
-                .is_some_and(|repo| worktree::is_dirty(&repo));
-            out.push(Restorable {
-                session: row.session,
-                reason: reason.unwrap_or_else(|| "app_restart".into()),
-                worktree_dirty: dirty,
-            });
-        }
+        // One `git status` per worktree, each up to its 10 s timeout. Run side by side, a few at
+        // a time, so the answer costs the slowest checkout rather than the sum of them (RA-235).
+        let dirty = |checkout: &str| gix::open(checkout).ok().is_some_and(|repo| worktree::is_dirty(&repo));
+        let per_worker = rows.len().div_ceil(4).max(1);
+        let flags: Vec<bool> = std::thread::scope(|scope| {
+            let workers: Vec<_> = rows.chunks(per_worker)
+                .map(|chunk| scope.spawn(move || chunk.iter().map(|(row, _)| dirty(&row.session.worktree)).collect::<Vec<_>>()))
+                .collect();
+            // A worker that panicked reports its checkouts dirty, as a failed scan does.
+            workers.into_iter().zip(rows.chunks(per_worker))
+                .flat_map(|(worker, chunk)| worker.join().unwrap_or_else(|_| vec![true; chunk.len()]))
+                .collect()
+        });
+        let out = rows.into_iter().zip(flags).map(|((row, reason), dirty)| Restorable {
+            session: row.session,
+            reason: reason.unwrap_or_else(|| "app_restart".into()),
+            worktree_dirty: dirty,
+        }).collect();
         Ok(RestorableOut { sessions: out })
     });
 

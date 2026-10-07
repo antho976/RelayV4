@@ -227,3 +227,59 @@ fn an_assignment_to_a_busy_session_waits_for_its_next_stop() {
         "SELECT COUNT(*) FROM notifications WHERE category='agent_done'", [], |row| row.get(0)).unwrap();
     assert_eq!(completions, 1, "the turn that ended still reports its completion");
 }
+
+#[test]
+fn a_repeated_report_moves_its_unread_card_to_the_time_of_the_latest_one() {
+    // RA-234: the dedup rewrote the body and kept the first report's time, so notify.list
+    // (newest first) buried the card under older ones and showed a stale time.
+    let f = fixture();
+    let s = ok(&f.engine, "session.create", json!({"project_id": 1, "provider": "claude"}));
+    let name = s["name"].as_str().unwrap().to_string();
+    let stop = |message: Option<&str>| {
+        report(&f, &name, "session_start");
+        let data = message.map_or(json!({}), |m| json!({"message": m}));
+        ok_as(&f.engine, Actor::agent(&name), "session.report", json!({"session": name, "kind": "stop", "data": data}));
+    };
+    let card = || -> (i64, String, String) {
+        f.engine.store.lock().query_row(
+            "SELECT COUNT(*),MAX(body),MAX(created_at) FROM notifications WHERE category='agent_done'", [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap()
+    };
+    stop(Some("first summary"));
+    let age = || f.engine.store.lock().execute("UPDATE notifications SET created_at='2000-01-01T00:00:00Z'", []).unwrap();
+    age();
+    stop(Some("second summary"));
+    let (count, body, at) = card();
+    assert_eq!((count, body.as_str()), (1, "second summary"));
+    assert!(at.as_str() > "2000-01-01T00:00:00Z", "kept the first report's time: {at}");
+    // A bare hook keeps the real summary but is still the latest report.
+    age();
+    stop(None);
+    let (count, body, at) = card();
+    assert_eq!((count, body.as_str()), (1, "second summary"));
+    assert!(at.as_str() > "2000-01-01T00:00:00Z");
+    let listed = ok(&f.engine, "notify.list", json!({}));
+    assert_eq!(listed["notifications"][0]["body"], "second summary");
+}
+
+#[test]
+fn restorable_sessions_can_be_asked_for_by_project_or_session() {
+    // RA-235: each row costs a git status of its checkout; a client describing one pane asks
+    // for that pane's.
+    let f = fixture();
+    let names: Vec<String> = (0..2).map(|_| {
+        let s = ok(&f.engine, "session.create", json!({"project_id": 1, "provider": "claude"}));
+        f.engine.store.lock().execute("UPDATE sessions SET state='restorable' WHERE id=?1", [s["id"].as_i64().unwrap()]).unwrap();
+        s["name"].as_str().unwrap().to_string()
+    }).collect();
+    let listed = |payload: Value| -> Vec<String> {
+        ok(&f.engine, "session.restorable", payload)["sessions"].as_array().unwrap().iter()
+            .map(|r| r["session"]["name"].as_str().unwrap().to_string()).collect()
+    };
+    assert_eq!(listed(json!({})), names);
+    assert_eq!(listed(json!({"project_id": 1})), names);
+    assert!(listed(json!({"project_id": 2})).is_empty());
+    assert_eq!(listed(json!({"session": names[1]})), vec![names[1].clone()]);
+    assert!(listed(json!({"project_id": 2, "session": names[1]})).is_empty());
+}

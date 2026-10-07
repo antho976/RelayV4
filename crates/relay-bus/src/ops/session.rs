@@ -173,7 +173,14 @@ result!(#[schemars(rename = "SessionScrollbackOut")] ScrollbackOut {
 op!(Scrollback, "session.scrollback", ScrollbackIn => ScrollbackOut, OpMeta::query(Scope::Session, 3, "Scrollback text, the (epoch, seq) it ends at, and the PTY's size"));
 result!(#[schemars(rename = "SessionRestorable")] Restorable { pub session: Session, pub reason: String, pub worktree_dirty: bool });
 result!(#[schemars(rename = "SessionRestorableOut")] RestorableOut { pub sessions: Vec<Restorable> });
-op!(RestorableList, "session.restorable", Empty => RestorableOut, OpMeta::query(Scope::Global, 6, "Sessions offering resume at launch"));
+payload!(#[schemars(rename = "SessionRestorableIn")] RestorableIn {
+    /// Only this project's sessions. Each one costs a `git status` of its worktree, so a
+    /// client describing one project's panes should not pay for every project's (RA-235).
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub project_id: Option<Id>,
+    /// Only this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub session: Option<String>,
+});
+op!(RestorableList, "session.restorable", RestorableIn => RestorableOut, OpMeta::query(Scope::Global, 6, "Sessions offering resume at launch, optionally one project's or one session's"));
 op!(DiscardRestorable, "session.discard_restorable", NameIn => Empty,
     OpMeta::mutation(Scope::Session, 6, "Decline resume: clean the session").actors(Actors::UserOnly).emits(&["session.changed"]));
 
