@@ -191,7 +191,7 @@ def main():
             p("")
 
     if soak:
-        p("## Memory over 20 000 mixed operations")
+        p(f"## Memory over {soak.get('ops', 20000):,} mixed operations".replace(",", " "))
         p("")
         p("Ten ops per round (session.list, task.list, a keystroke, a scrollback tail, task.update, notes.list, settings.set, mailbox.list, app.status, git.status). Live heap is what the allocator wrapper has handed out and not been given back; RSS is the process; store is the SQLite file.")
         p("")
@@ -219,7 +219,7 @@ def main():
         b = process["phases"].get("burst_50k_lines_attached")
         if b:
             p("")
-            p(f"- burst of 50 000 lines (4.9 MB) to an attached client: stream quiet after **{b['seconds_until_stream_quiet']} s** (includes a 1 s silence wait), {b['engine_cpu_ms']} ms engine CPU, {b['frames']} frames, {kb(b['wire_bytes_received'])} on the wire carrying {kb(b['payload_bytes_received'])} of the {kb(b['payload_bytes'])} payload")
+            p(f"- burst of 50 000 lines (4.9 MB) to an attached client: stream quiet after **{b['seconds_until_stream_quiet']} s** (includes a 1 s silence wait), {b['engine_cpu_ms']} ms engine CPU, {b['frames']} frames{', ' + str(b['frames_dropped']) + ' dropped by the engine' if 'frames_dropped' in b else ''}, {kb(b['wire_bytes_received'])} on the wire carrying {kb(b['payload_bytes_received'])} of the {kb(b['payload_bytes'])} payload")
         if process.get("cli"):
             p("")
             p("| CLI call | min | p50 | max |")

@@ -27,11 +27,11 @@ so rapid Grid/Focus/Review changes persist the latest selection.
 | --- | --- |
 | `cargo build -p relay-native -p relay-cli --offline` | Passed |
 | `cargo test --workspace --offline` | 173 passed, 1 ignored |
-| `cargo fmt -p relay-native --check` | Passed |
+| `cargo fmt -p relay-native --check` | Not a check to rely on: the workspace is deliberately not rustfmt-clean (CLAUDE.md), so this is neither run in CI nor kept passing |
 | `cargo clippy -p relay-native --all-targets --offline -- -D warnings -A deprecated` | Passed |
 | Generated bus schema drift test | Passed |
 | `python3 scripts/native-smoke.py` | Passed |
-| `python3 scripts/test-launcher.py` | Passed |
+| `python3 scripts/test-launcher.py` | Passed. It broke when run.sh began registering the desktop entry and passed again once that step stopped blocking launch; it now stubs the installer, and CI runs it in the engine job |
 | `python3 scripts/test-launcher-real.py` | Passed |
 
 The launcher regression test opens the actual GTK window twice with an isolated

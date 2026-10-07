@@ -29,7 +29,8 @@ Run this for every change, and first on the existing state when you are asked to
    Skeleton / Skeletal Mesh with `ue_python` (see reference/inspect-recipes.md).
 2. **Measure: `ue_anim_inspect`.** Describe the setup (attachments with grips, partner, the
    contacts you expect) and read `problems`, `attachments[*].side`, `closest_approach`.
-3. **Look: `ue_anim_preview`.** Front and right views at 4-8 times, isolated on black. Check each
+3. **Look: `ue_anim_preview`.** Front and right views at 4-8 times. The preview spawns 500 m
+   above the editor camera, clear of the level (`isolate` is off by default). Check each
    image for: which hand holds the item, which way the item points, whether hands wrap the grip,
    whether anything passes through a body, whether feet are on the ground, and the silhouette of
    the key pose.

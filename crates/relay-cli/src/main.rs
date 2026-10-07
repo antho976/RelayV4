@@ -106,28 +106,54 @@ enum HookCommand {
 
 const EXIT_UNREACHABLE: u8 = 5;
 
+/// An error with its own exit code (BUS.md §8.2). Any other error from `run` exits 5, "engine
+/// unreachable"; a malformed payload or a missing project used to say the same, which sent
+/// callers to restart an engine that was fine (RA-283).
+#[derive(Debug)]
+struct Exit(u8, String);
+
+impl std::fmt::Display for Exit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.1)
+    }
+}
+
+impl std::error::Error for Exit {}
+
+/// A mistake in the call itself, found before the engine is asked: exit 1, as `invalid` is.
+fn invalid(message: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::Error::new(Exit(1, message.to_string()))
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+    // A provider runs the tool when its PreToolUse hook exits with anything but 2, so a hook
+    // that fails before it can ask (a bad --instance) blocks too.
+    let gate = matches!(&cli.cmd, Command::Hook { hook: HookCommand::ClaudePreTool | HookCommand::CodexPreTool });
     match run(cli).await {
         Ok(code) => ExitCode::from(code),
+        Err(e) if gate => {
+            eprintln!("RELAY guardrail unavailable: {e:#}");
+            ExitCode::from(2)
+        }
         Err(e) => {
             eprintln!("relay: {e:#}");
-            ExitCode::from(EXIT_UNREACHABLE)
+            ExitCode::from(e.downcast_ref::<Exit>().map_or(EXIT_UNREACHABLE, |exit| exit.0))
         }
     }
 }
 
 fn actor_from_env(override_: Option<&str>) -> Result<(Actor, Option<String>)> {
     if let Some(a) = override_ {
-        return Ok((Actor::parse(a).map_err(|e| anyhow!(e))?, std::env::var("RELAY_TOKEN").ok()));
+        return Ok((Actor::parse(a).map_err(invalid)?, std::env::var("RELAY_TOKEN").ok()));
     }
     if let Ok(name) = std::env::var("RELAY_SESSION") {
         let token = std::env::var("RELAY_TOKEN").ok();
         return Ok((Actor::Agent(name), token));
     }
     if let Ok(a) = std::env::var("RELAY_ACTOR") {
-        return Ok((Actor::parse(&a).map_err(|e| anyhow!(e))?, None));
+        return Ok((Actor::parse(&a).map_err(invalid)?, None));
     }
     Ok((Actor::User, None))
 }
@@ -138,9 +164,9 @@ fn read_payload(arg: Option<String>) -> Result<Value> {
         Some("-") => {
             let mut s = String::new();
             std::io::stdin().read_to_string(&mut s)?;
-            Ok(serde_json::from_str(&s).context("payload on stdin is not JSON")?)
+            serde_json::from_str(&s).map_err(|e| invalid(format!("payload on stdin is not JSON: {e}")))
         }
-        Some(s) => Ok(serde_json::from_str(s).context("payload is not JSON")?),
+        Some(s) => serde_json::from_str(s).map_err(|e| invalid(format!("payload is not JSON: {e}"))),
     }
 }
 
@@ -169,7 +195,7 @@ async fn fill_project(client: &mut Client, actor: &Actor, token: &Option<String>
         return Ok(());
     }
     if let Ok(p) = std::env::var("RELAY_PROJECT") {
-        let id: i64 = p.parse().context("RELAY_PROJECT must be a project id")?;
+        let id: i64 = p.parse().map_err(|e| invalid(format!("RELAY_PROJECT must be a project id: {e}")))?;
         payload["project_id"] = json!(id);
         return Ok(());
     }
@@ -185,7 +211,7 @@ async fn fill_project(client: &mut Client, actor: &Actor, token: &Option<String>
             }
         }
     }
-    anyhow::bail!("{op} needs project_id: pass it in the payload, set RELAY_PROJECT, or run from inside a registered project (bus.project_required)");
+    Err(invalid(format!("{op} needs project_id: pass it in the payload, set RELAY_PROJECT, or run from inside a registered project (bus.project_required)")))
 }
 
 fn exit_for(resp: &Response) -> u8 {
@@ -201,7 +227,7 @@ async fn connect(instance: Instance) -> Result<Client> {
 }
 
 async fn run(cli: Cli) -> Result<u8> {
-    let instance = Instance::parse(&cli.instance).ok_or_else(|| anyhow!("bad --instance {:?}", cli.instance))?;
+    let instance = Instance::parse(&cli.instance).ok_or_else(|| invalid(format!("bad --instance {:?}", cli.instance)))?;
     match cli.cmd {
         Command::Serve { store, remote, remote_bind } => {
             // The engine outlives launcher worktrees. Git libraries and remote helpers
@@ -243,7 +269,7 @@ async fn run(cli: Cli) -> Result<u8> {
             match op {
                 None => print!("{}", relay_bus::schema::render_pretty()),
                 Some(op) => {
-                    let s = relay_bus::schema::render_op(&op).ok_or_else(|| anyhow!("unknown op {op:?}"))?;
+                    let s = relay_bus::schema::render_op(&op).ok_or_else(|| invalid(format!("unknown op {op:?}")))?;
                     println!("{}", serde_json::to_string_pretty(&s)?);
                 }
             }
@@ -291,7 +317,7 @@ async fn run(cli: Cli) -> Result<u8> {
                     let resp = c.call(&req, |_| {}).await?;
                     match resp.into_result() {
                         Ok(v) => v["ops"].as_array().cloned().unwrap_or_default(),
-                        Err(e) => anyhow::bail!("bus.ops failed: {} {}", e.code, e.message),
+                        Err(e) => return Err(anyhow::Error::new(Exit(e.kind.exit_code() as u8, format!("bus.ops failed: {} {}", e.code, e.message)))),
                     }
                 }
                 Err(_) => {
@@ -407,7 +433,7 @@ async fn claude_pre_tool(instance: Instance, actor_override: Option<&str>) -> Re
         Ok(input) => input,
         Err(error) => return Ok(cannot_check(&anyhow!(error).context("Claude hook input is not JSON"))),
     };
-    match claude_payloads(&input, &session, hook_root(&input).as_deref()) {
+    match claude_payloads(&input, &session) {
         Ok(payloads) => gate(instance, actor_override, input["tool_name"].as_str().unwrap_or("?"), payloads).await,
         Err(error) => Ok(cannot_check(&error)),
     }
@@ -423,16 +449,14 @@ fn cannot_check(error: &anyhow::Error) -> u8 {
 
 /// The gates a Claude Code PreToolUse call must pass, in order. Pure apart from reading the
 /// file an Edit changes, so that the gate judges the text the edit will leave.
-fn claude_payloads(input: &Value, session: &str, root: Option<&Path>) -> Result<Vec<Value>> {
+fn claude_payloads(input: &Value, session: &str) -> Result<Vec<Value>> {
     let tool = input["tool_name"]
         .as_str()
         .ok_or_else(|| anyhow!("Claude hook input has no tool_name"))?;
     let tool_input = input["tool_input"]
         .as_object()
         .ok_or_else(|| anyhow!("Claude hook input has no tool_input object"))?;
-    let write = |path: &str, text: String| -> Result<Value> {
-        write_gate(root, session, Path::new(path), "new_text", json!(text))
-    };
+    let write = |path: &str, text: String| write_gate(session, Path::new(path), "new_text", json!(text));
     Ok(match tool {
         "Bash" => {
             let command = required_string(tool_input, "command")?;
@@ -441,15 +465,15 @@ fn claude_payloads(input: &Value, session: &str, root: Option<&Path>) -> Result<
                 "kind": "exec",
                 "command": command,
             })];
-            payloads.extend(shell_write_gates(input, root, session, command)?);
+            payloads.extend(shell_write_gates(input, session, command));
             payloads
         }
-        "Write" => vec![write(required_string(tool_input, "file_path")?, required_string(tool_input, "content")?.to_string())?],
+        "Write" => vec![write(required_string(tool_input, "file_path")?, required_string(tool_input, "content")?.to_string())],
         "Edit" => {
             let file_path = required_string(tool_input, "file_path")?;
             let edit = (required_string(tool_input, "old_string")?, required_string(tool_input, "new_string")?,
                 tool_input.get("replace_all").and_then(Value::as_bool).unwrap_or(false));
-            vec![write(file_path, edited_text(file_path, &[edit])?)?]
+            vec![write(file_path, edited_text(file_path, &[edit])?)]
         }
         // Kept for Claude versions that still expose the former batched edit tool.
         "MultiEdit" => {
@@ -463,11 +487,11 @@ fn claude_payloads(input: &Value, session: &str, root: Option<&Path>) -> Result<
                         object.get("replace_all").and_then(Value::as_bool).unwrap_or(false)))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            vec![write(file_path, edited_text(file_path, &edits)?)?]
+            vec![write(file_path, edited_text(file_path, &edits)?)]
         }
         // A notebook is JSON whose cells Claude rewrites by id; rebuilding it here would be a
         // second notebook editor. The path rules (protected paths, write roots) still meet it.
-        "NotebookEdit" => vec![write_gate(root, session, Path::new(required_string(tool_input, "notebook_path")?), "diff", json!(""))?],
+        "NotebookEdit" => vec![write_gate(session, Path::new(required_string(tool_input, "notebook_path")?), "diff", json!(""))],
         other => anyhow::bail!("unsupported Claude PreToolUse tool {other:?}"),
     })
 }
@@ -568,9 +592,9 @@ fn refusal_text(error: Option<&relay_bus::BusError>) -> String {
 /// deletions say how many lines go, so the destructive-write rule can weigh them; edits in
 /// place and appends carry an empty diff, which still meets protected paths, write roots and
 /// shape gates.
-fn shell_write_gates(input: &Value, root: Option<&Path>, session: &str, command: &str) -> Result<Vec<Value>> {
+fn shell_write_gates(input: &Value, session: &str, command: &str) -> Vec<Value> {
     let Some(cwd) = input["cwd"].as_str().map(PathBuf::from).or_else(|| std::env::current_dir().ok()) else {
-        return Ok(Vec::new());
+        return Vec::new();
     };
     write_targets::shell_writes(command, &cwd)
         .into_iter()
@@ -579,7 +603,7 @@ fn shell_write_gates(input: &Value, root: Option<&Path>, session: &str, command:
                 write_targets::Effect::Overwrite | write_targets::Effect::Delete => removed_lines(&write.path),
                 write_targets::Effect::Append | write_targets::Effect::Modify => String::new(),
             };
-            write_gate(root, session, &write.path, "diff", json!(diff))
+            write_gate(session, &write.path, "diff", json!(diff))
         })
         .collect()
 }
@@ -619,14 +643,14 @@ async fn codex_pre_tool(instance: Instance, actor_override: Option<&str>) -> Res
         Ok(input) => input,
         Err(error) => return Ok(cannot_check(&anyhow!(error).context("Codex hook input is not JSON"))),
     };
-    match codex_payloads(&input, &session, hook_root(&input).as_deref()) {
+    match codex_payloads(&input, &session) {
         Ok(payloads) => gate(instance, actor_override, input["tool_name"].as_str().unwrap_or("?"), payloads).await,
         Err(error) => Ok(cannot_check(&error)),
     }
 }
 
 /// The gates a Codex PreToolUse call must pass, in order.
-fn codex_payloads(input: &Value, session: &str, root: Option<&Path>) -> Result<Vec<Value>> {
+fn codex_payloads(input: &Value, session: &str) -> Result<Vec<Value>> {
     let tool = input["tool_name"].as_str().ok_or_else(|| anyhow!("Codex hook input has no tool_name"))?;
     let tool_input = input["tool_input"].as_object().ok_or_else(|| anyhow!("Codex hook input has no tool_input object"))?;
     let command = required_string(tool_input, "command")?;
@@ -637,13 +661,13 @@ fn codex_payloads(input: &Value, session: &str, root: Option<&Path>) -> Result<V
                 "kind": "exec",
                 "command": command,
             })];
-            payloads.extend(shell_write_gates(input, root, session, command)?);
+            payloads.extend(shell_write_gates(input, session, command));
             payloads
         }
         // Codex edits files through apply_patch, whose `command` is the patch (Edit and Write
         // are matcher aliases for it). Each file meets the write gate, as Claude's Write and
         // Edit do; the patch text is not a command line to run exec rules on.
-        "apply_patch" | "Edit" | "Write" => patch_write_gates(input, root, session, command)?,
+        "apply_patch" | "Edit" | "Write" => patch_write_gates(input, session, command)?,
         other => anyhow::bail!("unsupported Codex PreToolUse tool {other:?}"),
     })
 }
@@ -651,17 +675,17 @@ fn codex_payloads(input: &Value, session: &str, root: Option<&Path>) -> Result<V
 /// One write gate per file an apply_patch touches. An added file carries its text and an
 /// updated one its text after the hunks, so shape gates can validate it; a deleted file says
 /// how many lines go. A moved file's source loses nothing, so only the path rules meet it.
-fn patch_write_gates(input: &Value, root: Option<&Path>, session: &str, patch: &str) -> Result<Vec<Value>> {
+fn patch_write_gates(input: &Value, session: &str, patch: &str) -> Result<Vec<Value>> {
     use write_targets::PatchOp;
     let cwd = input["cwd"].as_str().map(PathBuf::from).or_else(|| std::env::current_dir().ok())
         .ok_or_else(|| anyhow!("cannot tell which directory the patch is relative to"))?;
     let mut payloads = Vec::new();
     for op in write_targets::parse_patch(patch)? {
         match op {
-            PatchOp::Add { path, text } => payloads.push(write_gate(root, session, &cwd.join(path), "new_text", json!(text))?),
+            PatchOp::Add { path, text } => payloads.push(write_gate(session, &cwd.join(path), "new_text", json!(text))),
             PatchOp::Delete { path } => {
                 let path = cwd.join(path);
-                payloads.push(write_gate(root, session, &path, "diff", json!(removed_lines(&path)))?);
+                payloads.push(write_gate(session, &path, "diff", json!(removed_lines(&path))));
             }
             PatchOp::Update { path, move_to, chunks } => {
                 let source = cwd.join(path);
@@ -673,10 +697,10 @@ fn patch_write_gates(input: &Value, root: Option<&Path>, session: &str, patch: &
                 };
                 match move_to {
                     Some(to) => {
-                        payloads.push(write_gate(root, session, &source, "diff", json!(""))?);
-                        payloads.push(write_gate(root, session, &cwd.join(to), field, value)?);
+                        payloads.push(write_gate(session, &source, "diff", json!("")));
+                        payloads.push(write_gate(session, &cwd.join(to), field, value));
                     }
-                    None => payloads.push(write_gate(root, session, &source, field, value)?),
+                    None => payloads.push(write_gate(session, &source, field, value)),
                 }
             }
         }
@@ -684,14 +708,14 @@ fn patch_write_gates(input: &Value, root: Option<&Path>, session: &str, patch: &
     Ok(payloads)
 }
 
-fn write_gate(root: Option<&Path>, session: &str, path: &Path, field: &str, value: Value) -> Result<Value> {
+fn write_gate(session: &str, path: &Path, field: &str, value: Value) -> Value {
     let mut payload = json!({
         "session": session,
         "kind": "write",
-        "path": hook_relative_path(root, &path.to_string_lossy())?,
+        "path": gate_path(path),
     });
     payload[field] = value;
-    Ok(payload)
+    payload
 }
 
 async fn codex_notify(instance: Instance, actor_override: Option<&str>, raw: &str) -> Result<()> {
@@ -723,41 +747,14 @@ fn required_string<'a>(object: &'a serde_json::Map<String, Value>, key: &str) ->
         .ok_or_else(|| anyhow!("hook input field {key:?} is missing or not a string"))
 }
 
-/// The worktree a hook judges paths against: Relay's own record of it, else the directory the
-/// provider ran the tool in, else the repository around this process.
-fn hook_root(input: &Value) -> Option<PathBuf> {
-    std::env::var_os("RELAY_WORKTREE")
-        .map(PathBuf::from)
-        .or_else(|| input["cwd"].as_str().map(PathBuf::from))
-        .or_else(cwd_repo_root)
-}
-
-/// The path `guardrail.gate` should judge. Inside the worktree it is worktree-relative, as
-/// the gate expects. Outside, the absolute path goes through unchanged: whether a write to
-/// scratch space is allowed is a policy question, and policy lives on the bus, not in this
-/// adapter (BUS.md §9.3). Refusing here produced "guardrail unavailable" for what was really
-/// a deliberate decision, and left the agent with nowhere legal to put a temporary file.
-///
-/// Symlinks are judged where they lead, since that is where the write lands: `link/key` with
-/// `link -> secrets` is `secrets/key` to the protected-path rules, a link out of the worktree
-/// is the absolute path it reaches, and a worktree reached through an aliased directory is
-/// still the worktree. A `..` the file system cannot resolve yet is left for the gate, which
-/// refuses it.
-fn hook_relative_path(root: Option<&Path>, raw_path: &str) -> Result<String> {
-    let root = root.ok_or_else(|| anyhow!("cannot determine the Relay worktree"))?;
-    let path = Path::new(raw_path);
-    let real_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let real = path.is_absolute().then(|| resolve_existing(path));
-    let relative = match (path.strip_prefix(root), real.as_deref().map(|real| real.strip_prefix(&real_root))) {
-        (_, Some(Ok(relative))) => relative,
-        (Ok(_), Some(Err(_))) => return Ok(real.unwrap_or_default().display().to_string()),
-        (Ok(relative), None) => relative,
-        (Err(_), _) => return Ok(path.display().to_string()),
-    };
-    if relative.as_os_str().is_empty() {
-        anyhow::bail!("write target is the worktree directory");
-    }
-    Ok(relative.display().to_string())
+/// The path `guardrail.gate` should judge: the one the tool names. The gate relativizes it
+/// against the session's own worktree and judges it where it lands, through symlinks, so this
+/// side keeps no second idea of the worktree (RA-589). Only a `..` is resolved here, through the
+/// file system, since the gate refuses one in an absolute path; one the file system cannot
+/// resolve yet is left for the gate to refuse.
+fn gate_path(path: &Path) -> String {
+    let dotted = path.is_absolute() && path.components().any(|part| part == std::path::Component::ParentDir);
+    if dotted { resolve_existing(path) } else { path.to_path_buf() }.display().to_string()
 }
 
 /// `path` with its longest existing prefix resolved through the file system (symlinks and
@@ -781,23 +778,28 @@ fn resolve_existing(path: &Path) -> PathBuf {
 
 async fn do_cmd(instance: Instance, actor_override: Option<&str>, op: String, payload: Option<String>, pretty: bool) -> Result<u8> {
     let (actor, token) = actor_from_env(actor_override)?;
-    let mut c = connect(instance).await?;
-    let req = if op.trim_start().starts_with('{') {
+    // The call is checked before the engine is looked for, so a malformed one exits 1 whether
+    // or not an engine is running.
+    let envelope = op.trim_start().starts_with('{');
+    let mut req = if envelope {
         // full envelope
-        let mut v: Value = serde_json::from_str(&op).context("envelope is not JSON")?;
+        let mut v: Value = serde_json::from_str(&op).map_err(|e| invalid(format!("envelope is not JSON: {e}")))?;
         if v.get("v").is_none() { v["v"] = json!(relay_bus::ENVELOPE_V); }
         if v.get("id").is_none() { v["id"] = json!(uuid::Uuid::new_v4()); }
         if v.get("actor").is_none() { v["actor"] = json!(actor.to_string()); }
         if v.get("token").is_none() { if let Some(t) = &token { v["token"] = json!(t); } }
-        serde_json::from_value::<Request>(v).context("bad envelope")?
+        serde_json::from_value::<Request>(v).map_err(|e| invalid(format!("bad envelope: {e}")))?
     } else {
-        let mut p = read_payload(payload)?;
-        if !p.is_object() { anyhow::bail!("payload must be a JSON object"); }
-        fill_project(&mut c, &actor, &token, &op, &mut p).await?;
-        let mut r = Request::new(actor, op, p);
-        if let Some(t) = token { r = r.with_token(t); }
+        let p = read_payload(payload)?;
+        if !p.is_object() { return Err(invalid("payload must be a JSON object")); }
+        let mut r = Request::new(actor.clone(), op, p);
+        if let Some(t) = &token { r = r.with_token(t.clone()); }
         r
     };
+    let mut c = connect(instance).await?;
+    if !envelope {
+        fill_project(&mut c, &actor, &token, &req.op, &mut req.payload).await?;
+    }
     let resp = c.call(&req, |_| {}).await?;
     if pretty {
         match &resp.error {
@@ -852,21 +854,20 @@ mod tests {
         std::fs::write(root.join("data.ts"), "a\nb\nc").unwrap();
         std::fs::write(root.join("lib.rs"), "fn a() {}\nfn b() {}\n").unwrap();
         let input = json!({"cwd": root});
-        let root = Some(root.as_path());
 
-        let gates = shell_write_gates(&input, root, "calm-otter", ": > data.ts && echo x >> notes.md").unwrap();
+        let gates = shell_write_gates(&input, "calm-otter", ": > data.ts && echo x >> notes.md");
         assert_eq!(gates, [
-            json!({"session": "calm-otter", "kind": "write", "path": "data.ts", "diff": "-\n-\n-\n"}),
-            json!({"session": "calm-otter", "kind": "write", "path": "notes.md", "diff": ""}),
+            json!({"session": "calm-otter", "kind": "write", "path": root.join("data.ts"), "diff": "-\n-\n-\n"}),
+            json!({"session": "calm-otter", "kind": "write", "path": root.join("notes.md"), "diff": ""}),
         ]);
 
         let patch = "*** Begin Patch\n*** Update File: lib.rs\n@@\n-fn b() {}\n+fn c() {}\n*** Add File: new.rs\n+x\n*** Delete File: data.ts\n*** End Patch";
-        let gates = patch_write_gates(&input, root, "calm-otter", patch).unwrap();
+        let gates = patch_write_gates(&input, "calm-otter", patch).unwrap();
         assert_eq!(gates[0]["new_text"], "fn a() {}\nfn c() {}\n");
-        assert_eq!(gates[1], json!({"session": "calm-otter", "kind": "write", "path": "new.rs", "new_text": "x\n"}));
+        assert_eq!(gates[1], json!({"session": "calm-otter", "kind": "write", "path": root.join("new.rs"), "new_text": "x\n"}));
         assert_eq!(gates[2]["diff"], "-\n-\n-\n");
         assert!(gates.iter().all(|g| g["kind"] == "write"));
-        assert!(patch_write_gates(&input, root, "calm-otter", "not a patch").is_err(), "an unreadable patch blocks");
+        assert!(patch_write_gates(&input, "calm-otter", "not a patch").is_err(), "an unreadable patch blocks");
     }
 
     /// A checkout with `src/lib.rs` holding "a b a\n", and a hook input builder for it.
@@ -886,18 +887,20 @@ mod tests {
     fn claude_tool_calls_become_the_gates_they_must_pass() {
         let (_dir, root) = checkout();
         let lib = root.join("src/lib.rs").display().to_string();
-        let gates = |tool: &str, tool_input: Value| claude_payloads(&hook_input(&root, tool, tool_input), "calm-otter", Some(&root));
+        let gates = |tool: &str, tool_input: Value| claude_payloads(&hook_input(&root, tool, tool_input), "calm-otter");
 
         let bash = gates("Bash", json!({"command": "cargo test && echo done > out.txt", "description": "test"})).unwrap();
         assert_eq!(bash[0], json!({"session": "calm-otter", "kind": "exec", "command": "cargo test && echo done > out.txt"}));
-        assert_eq!(bash[1], json!({"session": "calm-otter", "kind": "write", "path": "out.txt", "diff": ""}));
+        assert_eq!(bash[1], json!({"session": "calm-otter", "kind": "write", "path": root.join("out.txt"), "diff": ""}));
         assert_eq!(bash.len(), 2);
 
+        // Paths go to the gate as the tool names them; it relativizes them against the session's
+        // worktree (RA-589).
         let write = gates("Write", json!({"file_path": root.join("docs/new.md"), "content": "hello\n"})).unwrap();
-        assert_eq!(write, [json!({"session": "calm-otter", "kind": "write", "path": "docs/new.md", "new_text": "hello\n"})]);
+        assert_eq!(write, [json!({"session": "calm-otter", "kind": "write", "path": root.join("docs/new.md"), "new_text": "hello\n"})]);
 
         let edit = gates("Edit", json!({"file_path": lib, "old_string": "a", "new_string": "x"})).unwrap();
-        assert_eq!(edit, [json!({"session": "calm-otter", "kind": "write", "path": "src/lib.rs", "new_text": "x b a\n"})]);
+        assert_eq!(edit, [json!({"session": "calm-otter", "kind": "write", "path": lib, "new_text": "x b a\n"})]);
         let all = gates("Edit", json!({"file_path": lib, "old_string": "a", "new_string": "x", "replace_all": true})).unwrap();
         assert_eq!(all[0]["new_text"], "x b x\n");
 
@@ -906,10 +909,10 @@ mod tests {
             {"old_string": "a", "new_string": "c", "replace_all": true},
             {"old_string": "c b", "new_string": "d"},
         ]})).unwrap();
-        assert_eq!(multi, [json!({"session": "calm-otter", "kind": "write", "path": "src/lib.rs", "new_text": "d c\n"})]);
+        assert_eq!(multi, [json!({"session": "calm-otter", "kind": "write", "path": lib, "new_text": "d c\n"})]);
 
         let notebook = gates("NotebookEdit", json!({"notebook_path": root.join("nb/a.ipynb"), "new_source": "print(1)", "edit_mode": "replace"})).unwrap();
-        assert_eq!(notebook, [json!({"session": "calm-otter", "kind": "write", "path": "nb/a.ipynb", "diff": ""})]);
+        assert_eq!(notebook, [json!({"session": "calm-otter", "kind": "write", "path": root.join("nb/a.ipynb"), "diff": ""})]);
 
         // The file was never changed: these are previews only.
         assert_eq!(std::fs::read_to_string(&lib).unwrap(), "a b a\n");
@@ -919,7 +922,7 @@ mod tests {
     fn edits_that_cannot_be_previewed_fail_closed() {
         let (_dir, root) = checkout();
         let lib = root.join("src/lib.rs").display().to_string();
-        let gates = |tool: &str, tool_input: Value| claude_payloads(&hook_input(&root, tool, tool_input), "calm-otter", Some(&root));
+        let gates = |tool: &str, tool_input: Value| claude_payloads(&hook_input(&root, tool, tool_input), "calm-otter");
         let error = |tool: &str, tool_input: Value| format!("{:#}", gates(tool, tool_input).unwrap_err());
 
         assert!(error("Edit", json!({"file_path": lib, "old_string": "zzz", "new_string": "x"})).contains("does not occur"));
@@ -940,8 +943,6 @@ mod tests {
 
     #[test]
     fn malformed_hook_input_fails_closed() {
-        let (_dir, root) = checkout();
-        let root = Some(root.as_path());
         for input in [
             json!({}),
             json!({"tool_name": "Bash"}),
@@ -951,62 +952,46 @@ mod tests {
             json!({"tool_name": "Write", "tool_input": {"file_path": "/x"}}),
             json!({"tool_name": "Read", "tool_input": {"file_path": "/x"}}),
         ] {
-            assert!(claude_payloads(&input, "calm-otter", root).is_err(), "Claude {input}");
-            assert!(codex_payloads(&input, "calm-otter", root).is_err(), "Codex {input}");
+            assert!(claude_payloads(&input, "calm-otter").is_err(), "Claude {input}");
+            assert!(codex_payloads(&input, "calm-otter").is_err(), "Codex {input}");
         }
-        // A Write needs a worktree to judge its path against.
-        let write = json!({"tool_name": "Write", "tool_input": {"file_path": "/x/y", "content": ""}});
-        assert!(claude_payloads(&write, "calm-otter", None).is_err());
         assert_eq!(cannot_check(&anyhow!("no tool_name")), 2, "a hook that cannot check blocks");
     }
 
     #[test]
     fn codex_tool_calls_become_the_gates_they_must_pass() {
         let (_dir, root) = checkout();
-        let gates = |tool: &str, tool_input: Value| codex_payloads(&hook_input(&root, tool, tool_input), "calm-otter", Some(&root));
+        let gates = |tool: &str, tool_input: Value| codex_payloads(&hook_input(&root, tool, tool_input), "calm-otter");
+        let lib = root.join("src/lib.rs");
 
         let bash = gates("Bash", json!({"command": "rm -f src/lib.rs"})).unwrap();
         assert_eq!(bash[0], json!({"session": "calm-otter", "kind": "exec", "command": "rm -f src/lib.rs"}));
-        assert_eq!(bash[1], json!({"session": "calm-otter", "kind": "write", "path": "src/lib.rs", "diff": "-\n"}));
+        assert_eq!(bash[1], json!({"session": "calm-otter", "kind": "write", "path": lib, "diff": "-\n"}));
 
         // apply_patch (and its Edit/Write aliases) are writes, never exec gates on the patch text.
         let patch = "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-a b a\n+a b c\n*** End Patch";
         for tool in ["apply_patch", "Edit", "Write"] {
             let gates = gates(tool, json!({"command": patch})).unwrap();
-            assert_eq!(gates, [json!({"session": "calm-otter", "kind": "write", "path": "src/lib.rs", "new_text": "a b c\n"})], "{tool}");
+            assert_eq!(gates, [json!({"session": "calm-otter", "kind": "write", "path": lib, "new_text": "a b c\n"})], "{tool}");
         }
         assert!(gates("Read", json!({"command": "x"})).is_err());
     }
 
+    /// Where a path lands (symlinks, the worktree under another name) is the gate's to judge;
+    /// only a `..` is settled here, because the gate refuses one in an absolute path.
     #[test]
-    fn hook_paths_are_judged_where_the_write_lands() {
+    fn hook_paths_go_to_the_gate_as_named_with_dot_dot_resolved() {
         let (_dir, root) = checkout();
-        let elsewhere = tempfile::tempdir().unwrap();
-        let elsewhere = elsewhere.path().canonicalize().unwrap();
-        let rel = |path: &Path| hook_relative_path(Some(&root), &path.display().to_string());
-
-        assert_eq!(rel(&root.join("src/lib.rs")).unwrap(), "src/lib.rs");
-        assert_eq!(rel(&root.join("src/new/deep.rs")).unwrap(), "src/new/deep.rs", "paths that do not exist yet");
-        assert_eq!(rel(&elsewhere.join("scratch.txt")).unwrap(), elsewhere.join("scratch.txt").display().to_string(), "outside goes through");
-        assert!(rel(&root).is_err(), "the worktree itself is no write target");
-        assert!(hook_relative_path(None, "/x").is_err());
-        assert_eq!(hook_relative_path(Some(&root), "src/lib.rs").unwrap(), "src/lib.rs", "a relative path is already worktree-relative");
+        let path = |p: &Path| gate_path(p);
+        assert_eq!(path(&root.join("src/lib.rs")), root.join("src/lib.rs").display().to_string());
+        assert_eq!(path(Path::new("src/lib.rs")), "src/lib.rs", "a relative path is already worktree-relative");
+        std::os::unix::fs::symlink(root.join("src"), root.join("alias")).unwrap();
+        assert_eq!(path(&root.join("alias/lib.rs")), root.join("alias/lib.rs").display().to_string(), "the gate follows links itself");
 
         // `..` the file system can resolve is resolved, out of the worktree as well as within it.
-        assert_eq!(rel(&root.join("src/../top.rs")).unwrap(), "top.rs");
-        assert_eq!(rel(&root.join("../escape.txt")).unwrap(), root.parent().unwrap().join("escape.txt").display().to_string());
-        // One it cannot is left for the gate, which refuses any `..`.
-        assert_eq!(rel(&root.join("missing/../x.rs")).unwrap(), "missing/../x.rs");
-
-        // Symlinks: judged by where they lead.
-        std::os::unix::fs::symlink(&elsewhere, root.join("out")).unwrap();
-        std::os::unix::fs::symlink(root.join("src"), root.join("alias")).unwrap();
-        assert_eq!(rel(&root.join("out/f.txt")).unwrap(), elsewhere.join("f.txt").display().to_string(), "a link out of the worktree");
-        assert_eq!(rel(&root.join("alias/lib.rs")).unwrap(), "src/lib.rs", "protected-path rules see the real path");
-        // A worktree reached through another name is still the worktree.
-        let door = elsewhere.join("door");
-        std::os::unix::fs::symlink(&root, &door).unwrap();
-        assert_eq!(rel(&door.join("src/lib.rs")).unwrap(), "src/lib.rs");
-        assert_eq!(hook_relative_path(Some(&door), &root.join("src/lib.rs").display().to_string()).unwrap(), "src/lib.rs");
+        assert_eq!(path(&root.join("src/../top.rs")), root.join("top.rs").display().to_string());
+        assert_eq!(path(&root.join("../escape.txt")), root.parent().unwrap().join("escape.txt").display().to_string());
+        // One it cannot is left for the gate, which refuses it.
+        assert_eq!(path(&root.join("missing/../x.rs")), root.join("missing/../x.rs").display().to_string());
     }
 }

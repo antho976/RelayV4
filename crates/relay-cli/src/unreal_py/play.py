@@ -1,4 +1,5 @@
-# ue_play and ue_profile: drive a play session. Actions: start, status, stop, shot, run, console.
+# ue_play and ue_profile: drive a play session. Actions: start, status, stop, shot, console,
+# prepare_outside, cleanup_outside, outside_capture.
 
 les = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
 TAG = "RelayPlayCapture"
@@ -78,11 +79,6 @@ elif action == "console":
     for command in ARGS.get("commands", []):
         unreal.SystemLibrary.execute_console_command(world, command)
     emit({"ran": ARGS.get("commands", [])})
-elif action == "run":
-    # The agent's own probe, with the game world at hand: read positions, health, state.
-    scope = {"unreal": unreal, "world": game_world(), "emit_value": None}
-    exec(compile(ARGS["code"], "probe", "exec"), scope)
-    emit({"ok": True})
 elif action == "prepare_outside":
     # Python cannot spawn into a running game, but the game world is a copy of the level: a
     # capture placed in the level before play exists in the game, found by its tag. It cannot be

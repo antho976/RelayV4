@@ -18,8 +18,16 @@ if not data.is_absolute():
 argument = str(launcher).replace("%", "%%")
 for character in ("\\", '"', "`", "$"):
     argument = argument.replace(character, "\\" + character)
-desktop = (root / "apps/relay-native/resources/com.quietsoftware.Relay4.desktop").read_text()
-desktop = desktop.replace("Exec=relay-native", f'Exec="{argument}" {instance}')
+# The key file's string escapes are undone before the quoting above is read, so every
+# backslash written so far has to survive that first pass as itself.
+argument = argument.replace("\\", "\\\\")
+template = root / "apps/relay-native/resources/com.quietsoftware.Relay4.desktop"
+lines = template.read_text().splitlines(keepends=True)
+execs = [at for at, line in enumerate(lines) if line.rstrip("\n") == "Exec=relay-native"]
+if len(execs) != 1:
+    raise SystemExit(f"{template}: expected exactly one 'Exec=relay-native' line, found {len(execs)}")
+lines[execs[0]] = f'Exec="{argument}" {instance}\n'
+desktop = "".join(lines)
 assets = {
     data / "applications/com.quietsoftware.Relay4.desktop": desktop.encode(),
     data / "icons/hicolor/scalable/apps/com.quietsoftware.Relay4.svg":

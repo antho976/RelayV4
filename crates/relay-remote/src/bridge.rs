@@ -301,7 +301,7 @@ pub async fn run(
     let (reader, mut writer) = stream.into_split();
 
     let to_phone = outbound.clone();
-    let pump = tokio::spawn(async move {
+    let mut pump = tokio::spawn(async move {
         let mut lines = BufReader::with_capacity(256 * 1024, reader).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             if to_phone.send(line).await.is_err() {
@@ -324,6 +324,12 @@ pub async fn run(
                     Some(line) => line,
                     None => break,
                 },
+                // The engine went away (restarted, crashed): end the conversation, so the
+                // transport closes and the phone reconnects instead of talking to nothing.
+                _ = &mut pump => {
+                    tracing::info!(device = %admitted.device_id, "the engine closed its side; closing the phone's");
+                    break;
+                }
                 _ = recheck.tick() => {
                     let now = stamp(&ctx.registry_path);
                     if now != seen {
@@ -336,17 +342,21 @@ pub async fn run(
                     continue;
                 }
             };
-            if line.trim().is_empty() {
-                continue;
-            }
-            match wire::gate(&line, instance) {
-                Gate::Forward => {
-                    writer.write_all(line.as_bytes()).await?;
-                    writer.write_all(b"\n").await?;
+            // The engine reads its door line by line, so a frame holding several lines is
+            // several requests, and each one is gated on its own.
+            for line in line.lines() {
+                if line.trim().is_empty() {
+                    continue;
                 }
-                Gate::Reject(resp) => {
-                    if outbound.send(serde_json::to_string(&resp)?).await.is_err() {
-                        break;
+                match wire::gate(line, instance) {
+                    Gate::Forward => {
+                        writer.write_all(line.as_bytes()).await?;
+                        writer.write_all(b"\n").await?;
+                    }
+                    Gate::Reject(resp) => {
+                        if outbound.send(serde_json::to_string(&resp)?).await.is_err() {
+                            return Ok(());
+                        }
                     }
                 }
             }

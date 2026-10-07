@@ -6,7 +6,13 @@ from pathlib import Path
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
+
+# Every check here is an assert statement, and some perform the action they check;
+# under -O they would vanish and the run would report success without doing anything.
+if sys.flags.optimize:
+    raise SystemExit("Run without python -O or PYTHONOPTIMIZE: this script checks with assert.")
 
 root = Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix="relay-launcher-") as temporary:

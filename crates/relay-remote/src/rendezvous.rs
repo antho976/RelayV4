@@ -18,8 +18,9 @@
 //! Rooms are not configured: a host proves a room by presenting the secret whose digest names
 //! it (`registry::room_for`). The server keeps nothing on disk and forgets everything on exit.
 //!
-//! Paths: `GET /host/<room>?secret=<secret>` for the PC, `GET /join/<room>` for a phone,
-//! `GET /health` for whoever runs it.
+//! Paths: `GET /host/<room>` with `Authorization: Bearer <secret>` for the PC, `GET /join/<room>`
+//! for a phone, `GET /health` for whoever runs it. The secret goes in a header, not the URL, so
+//! a proxy's access log never records it; `?secret=` is still read from a PC that predates that.
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -262,12 +263,12 @@ enum Role {
     Join { room: String },
 }
 
-/// Parse the request path into a role, refusing what is not for us before the upgrade.
-fn classify(path: &str) -> std::result::Result<Role, (u16, &'static str)> {
+/// Parse the request path into a role, refusing what is not for us before the upgrade. `bearer`
+/// is the secret from the `Authorization` header; without one, a `secret=` query is read.
+fn classify(path: &str, bearer: Option<&str>) -> std::result::Result<Role, (u16, &'static str)> {
     let (path, query) = path.split_once('?').unwrap_or((path, ""));
-    let secret = query
-        .split('&')
-        .find_map(|kv| kv.strip_prefix("secret="))
+    let secret = bearer
+        .or_else(|| query.split('&').find_map(|kv| kv.strip_prefix("secret=")))
         .unwrap_or("");
     if let Some(room) = path.strip_prefix("/host/") {
         if room.is_empty() || crate::registry::room_for(secret) != room {
@@ -281,7 +282,7 @@ fn classify(path: &str) -> std::result::Result<Role, (u16, &'static str)> {
         }
         return Ok(Role::Join { room: room.to_string() });
     }
-    Err((404, "relay rendezvous: /host/<room>?secret=… or /join/<room>"))
+    Err((404, "relay rendezvous: /host/<room> or /join/<room>"))
 }
 
 fn refuse((status, body): (u16, &str)) -> ErrorResponse {
@@ -345,7 +346,12 @@ async fn upgrade(rooms: &Rooms, mut stream: TcpStream) -> Result<Option<(Role, W
     #[allow(clippy::result_large_err)]
     let on_request = |req: &Request, resp: Response| {
         let path = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/");
-        match classify(path) {
+        let bearer = req
+            .headers()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
+        match classify(path, bearer) {
             Ok(r) => {
                 role = Some(r);
                 Ok(resp)
@@ -356,6 +362,8 @@ async fn upgrade(rooms: &Rooms, mut stream: TcpStream) -> Result<Option<(Role, W
     // A host carries every lane's lines; a phone only its own requests. Which one this is
     // decides the limit before tungstenite reads a byte of a message.
     let max = if head.starts_with(b"GET /host/") { HOST_MESSAGE } else { rooms.limits.phone_message };
+    // Lines are flushed one message at a time; Nagle would hold the second of two behind an ACK.
+    let _ = stream.set_nodelay(true);
     let config = WebSocketConfig::default().max_message_size(Some(max)).max_frame_size(Some(max));
     let ws = tokio_tungstenite::accept_hdr_async_with_config(stream, on_request, Some(config))
         .await
@@ -552,6 +560,8 @@ async fn join(shared: Rooms, room: String, ws: Ws) -> Result<()> {
             };
             let text = match msg {
                 Ok(Message::Text(t)) => t.to_string(),
+                // As the direct door takes it: the bus is text, and a binary frame is read as text.
+                Ok(Message::Binary(b)) => String::from_utf8_lossy(&b).into_owned(),
                 // A message over `phone_message` is an error here: this phone goes, the host stays.
                 Ok(Message::Close(_)) | Err(_) => break,
                 Ok(_) => continue,
@@ -583,12 +593,15 @@ mod tests {
     fn paths_open_the_right_role_and_nothing_else() {
         let secret = "s3cret";
         let room = crate::registry::room_for(secret);
-        assert!(matches!(classify(&format!("/host/{room}?secret={secret}")), Ok(Role::Host { .. })));
-        assert!(classify(&format!("/host/{room}?secret=wrong")).is_err());
-        assert!(classify(&format!("/host/{room}")).is_err());
-        assert!(matches!(classify(&format!("/join/{room}")), Ok(Role::Join { .. })));
-        assert!(classify("/join/").is_err());
-        assert!(classify("/").is_err());
+        assert!(matches!(classify(&format!("/host/{room}"), Some(secret)), Ok(Role::Host { .. })));
+        assert!(classify(&format!("/host/{room}"), Some("wrong")).is_err());
+        assert!(classify(&format!("/host/{room}"), None).is_err());
+        // A PC from before the header still opens its room.
+        assert!(matches!(classify(&format!("/host/{room}?secret={secret}"), None), Ok(Role::Host { .. })));
+        assert!(classify(&format!("/host/{room}?secret={secret}"), Some("wrong")).is_err());
+        assert!(matches!(classify(&format!("/join/{room}"), None), Ok(Role::Join { .. })));
+        assert!(classify("/join/", None).is_err());
+        assert!(classify("/", None).is_err());
     }
 
     #[tokio::test]

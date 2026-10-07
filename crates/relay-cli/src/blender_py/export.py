@@ -1,4 +1,4 @@
-# blender_export: FBX for Unreal. Static meshes bring their UCX_/UBX_/USP_ collision and SOCKET_
+# blender_export: FBX for Unreal. Static meshes bring their UCX_/UBX_/USP_/UCP_ collision and SOCKET_
 # empties (children of the mesh); skeletal exports carry only deform bones and no leaf bones.
 import os
 
@@ -80,7 +80,7 @@ bpy.context.view_layer.update()
 
 # Check what will be written before writing it: a broken mesh exports "fine" and then imports
 # empty, invisible or shaded wrong.
-mesh_checks = [mesh_report(o) for o in selected if o.type == "MESH" and not o.name.startswith(("UCX_", "UBX_", "USP_"))]
+mesh_checks = [mesh_report(o) for o in selected if o.type == "MESH" and not o.name.startswith(COLLISION_PREFIXES)]
 export_problems = [dict(object=r["object"], problem=p) for r in mesh_checks for p in r["problems"]]
 export_warnings = [dict(object=r["object"], problem=p) for r in mesh_checks for p in r["warnings"]]
 if excluded:
@@ -126,13 +126,18 @@ options = dict(
     bake_anim_use_all_actions=bool(ARGS.get("all_actions", False)),
     bake_anim_use_nla_strips=False, bake_anim_force_startend_keying=True, bake_anim_simplify_factor=0.0,
 )
+# Where the FBX goes and what is in it are path and objects: an override here would write
+# outside the checkout, or something other than what was checked and is reported.
+fixed = sorted(set(ARGS.get("fbx_options") or {}) & {"filepath", "use_selection", "check_existing"})
+if fixed:
+    raise RuntimeError("fbx_options cannot set %s: use path for the file and objects for what goes in it" % ", ".join(fixed))
 for key, value in (ARGS.get("fbx_options") or {}).items():
     options[key] = set(value) if key == "object_types" else value
 os.makedirs(os.path.dirname(path), exist_ok=True)
 result = bpy.ops.export_scene.fbx(**options)
 if "FINISHED" not in result:
     raise RuntimeError("the FBX exporter returned %s" % result)
-meshes = [o for o in selected if o.type == "MESH" and not o.name.startswith(("UCX_", "UBX_", "USP_"))]
+meshes = [o for o in selected if o.type == "MESH" and not o.name.startswith(COLLISION_PREFIXES)]
 # In bind pose: the FBX holds skinned meshes at rest, and that is what Unreal measures.
 with rest_pose([o for o in selected if o.type == "ARMATURE"]):
     lo, hi = world_bbox(meshes) if meshes else (None, None)
@@ -158,7 +163,7 @@ emit({"path": path, "bytes": os.path.getsize(path), "kind": kind, "forward_world
       "excluded": sorted(excluded),
       "sockets": sorted(o.name for o in selected if o.type == "EMPTY" and o.name.startswith("SOCKET_")),
       "socket_details": socket_details,
-      "collision": sorted(o.name for o in selected if o.name.startswith(("UCX_", "UBX_", "USP_"))),
+      "collision": sorted(o.name for o in selected if o.name.startswith(COLLISION_PREFIXES)),
       "action": action_used(arm)["action"], "action_slot": action_used(arm)["slot"],
       "size_cm": cm(hi - lo) if lo is not None else None,
       "options": dict((k, sorted(v) if isinstance(v, set) else v) for k, v in options.items() if k != "filepath")})

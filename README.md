@@ -66,7 +66,6 @@ measure, export and hand art to a running Unreal editor. New plugins are folders
 
 ```fish
 cargo test --workspace
-cargo fmt -p relay-native --check
 cargo clippy -p relay-native --all-targets -- -D warnings -A deprecated
 python3 scripts/native-smoke.py
 ```
@@ -74,6 +73,10 @@ python3 scripts/native-smoke.py
 `native-smoke.py` captures every page, then runs the in-app roadmap regressions
 (`notes`, `files`, `lifecycle`, `tools`, `registry`) against the same fixture
 engine; `RELAY_SMOKE_ROADMAP_ONLY=notes,files` runs only the named parts.
+
+There is no `cargo fmt --check` step: the workspace, `relay-native` included, is
+deliberately not rustfmt-clean. Do not run `cargo fmt` across a crate; match the
+formatting of the code around a change.
 
 CI runs the engine, bus and CLI half of that list — `cargo test --locked` and
 `cargo clippy --locked --all-targets -- -D warnings` — on every push and pull

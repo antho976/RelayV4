@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "relay://bus/v1",
   "title": "RELAY v4 command bus",
-  "description": "Generated from crates/relay-bus by `relay schema`. Do not edit; see docs/BUS.md.",
+  "description": "Generated from crates/relay-bus by `relay schema`. Do not edit; see docs/engine/BUS.md.",
   "version": 1,
   "op_count": 224,
   "envelope": {
@@ -267,7 +267,7 @@
       }
     },
     "app.log.tail": {
-      "summary": "Reserved: emits app.log.attached and sends no log frames yet; the engine logs to relay serve's output (RELAY_LOG filters it)",
+      "summary": "Not built: answers bus.not_implemented and attaches no stream; the engine logs to relay serve's output (RELAY_LOG filters it)",
       "kind": "query",
       "audit": "never",
       "undo": "none",
@@ -2120,7 +2120,9 @@
         "guardrail.refused",
         "guardrail.grant_used",
         "guardrail.resolved",
-        "notify.new"
+        "notify.new",
+        "device.lease.acquired",
+        "device.lease.released"
       ],
       "since": "1.0",
       "phase": 4,
@@ -4059,7 +4061,9 @@
       "scope": "global",
       "actors": "all",
       "doors": "all",
-      "emits": [],
+      "emits": [
+        "ui.changed"
+      ],
       "since": "1.0",
       "phase": 9,
       "payload": {
@@ -4077,7 +4081,9 @@
       "scope": "global",
       "actors": "all",
       "doors": "all",
-      "emits": [],
+      "emits": [
+        "ui.changed"
+      ],
       "since": "1.0",
       "phase": 9,
       "payload": {
@@ -4095,7 +4101,9 @@
       "scope": "global",
       "actors": "all",
       "doors": "all",
-      "emits": [],
+      "emits": [
+        "ui.changed"
+      ],
       "since": "1.0",
       "phase": 9,
       "payload": {
@@ -4113,7 +4121,9 @@
       "scope": "global",
       "actors": "all",
       "doors": "all",
-      "emits": [],
+      "emits": [
+        "ui.changed"
+      ],
       "since": "1.0",
       "phase": 9,
       "payload": {
@@ -4131,7 +4141,9 @@
       "scope": "global",
       "actors": "all",
       "doors": "all",
-      "emits": [],
+      "emits": [
+        "ui.changed"
+      ],
       "since": "1.0",
       "phase": 9,
       "payload": {
@@ -4227,7 +4239,9 @@
       "scope": "global",
       "actors": "all",
       "doors": "all",
-      "emits": [],
+      "emits": [
+        "ui.changed"
+      ],
       "since": "1.0",
       "phase": 9,
       "payload": {
@@ -4245,7 +4259,9 @@
       "scope": "global",
       "actors": "all",
       "doors": "all",
-      "emits": [],
+      "emits": [
+        "ui.changed"
+      ],
       "since": "1.0",
       "phase": 9,
       "payload": {
@@ -4281,7 +4297,9 @@
       "scope": "global",
       "actors": "all",
       "doors": "all",
-      "emits": [],
+      "emits": [
+        "ui.toast"
+      ],
       "since": "1.0",
       "phase": 9,
       "payload": {
@@ -4342,7 +4360,7 @@
         "id": {
           "type": "string",
           "format": "uuid",
-          "description": "UUID v4 minted by the caller; idempotency key for 24h."
+          "description": "UUID v4 minted by the caller; the idempotency key. An audited request's id stays\ndeduplicated for as long as its audit row is kept (`audit.retention_days`, BUS.md §5.3)."
         },
         "actor": {
           "$ref": "#/$defs/Actor"
@@ -4373,12 +4391,11 @@
     },
     "Actor": {
       "type": "string",
-      "description": "\"user\" | \"agent:<session-name>\" | \"test\" (\"system\" is internal and rejected at every door)",
-      "pattern": "^(user|test|agent:[A-Za-z0-9_-]{1,64})$"
+      "description": "\"user\" | \"agent:<session-name>\" | \"test\" | \"system\". \"system\" is the engine itself: it appears on events, audit rows and holds, and every door rejects a request that claims it",
+      "pattern": "^(user|test|system|agent:[A-Za-z0-9_-]{1,64})$"
     },
     "Response": {
       "type": "object",
-      "additionalProperties": false,
       "properties": {
         "v": {
           "type": "integer",
@@ -4429,11 +4446,11 @@
       "required": [
         "v",
         "ok"
-      ]
+      ],
+      "description": "A response envelope (BUS.md §1.2). Exactly one of `result` / `error` is present."
     },
     "BusError": {
       "type": "object",
-      "additionalProperties": false,
       "properties": {
         "kind": {
           "$ref": "#/$defs/ErrorKind"
@@ -4484,7 +4501,6 @@
     },
     "Confirm": {
       "type": "object",
-      "additionalProperties": false,
       "properties": {
         "op": {
           "type": "string"
@@ -4499,7 +4515,6 @@
     },
     "MailHint": {
       "type": "object",
-      "additionalProperties": false,
       "properties": {
         "priority": {
           "type": "integer",
@@ -4511,11 +4526,10 @@
       "required": [
         "priority"
       ],
-      "description": "A response envelope (BUS.md §1.2). Exactly one of `result` / `error` is present."
+      "description": "The `mail` sideband on a response (BUS.md §1.2)."
     },
     "Event": {
       "type": "object",
-      "additionalProperties": false,
       "properties": {
         "v": {
           "type": "integer",
@@ -4561,7 +4575,6 @@
     },
     "Frame": {
       "type": "object",
-      "additionalProperties": false,
       "properties": {
         "v": {
           "type": "integer",
@@ -4570,7 +4583,7 @@
         },
         "stream": {
           "type": "string",
-          "description": "`pty` | `logcat` | `mirror`, all on the socket door (BUS.md §7). `app.log.tail` declares\na `log` stream but sends no frames yet."
+          "description": "`pty` | `logcat` | `mirror`, all on the socket door (BUS.md §7). `app.log.tail` declares\na `log` stream but is not built: it sends no frames."
         },
         "session": {
           "type": [
@@ -4976,7 +4989,13 @@
           "description": "How long to block before giving up. Default 60s, clamped to an hour."
         },
         "matching": {
-          "description": "Only an event whose payload has every one of these top-level keys equal to the value\ngiven, e.g. `{\"request_id\": 7}`. Omit to take the first event that matches by name."
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true,
+          "description": "Only an event whose payload has every one of these top-level keys equal to the value\ngiven, e.g. `{\"request_id\": 7}`. Omit to take the first event that matches by name.\nAnything but an object is `bus.schema`: read as \"no filter\", it woke on any event.",
+          "default": null
         }
       }
     },
@@ -8177,7 +8196,8 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "description": "Only `\"priority\"`, the default; anything else is refused."
         }
       },
       "required": [
@@ -9769,7 +9789,8 @@
       "type": "object",
       "properties": {
         "verdict": {
-          "$ref": "#/$defs/Verdict"
+          "$ref": "#/$defs/Verdict",
+          "description": "Always `allow`. A refusal arrives as a typed `refused` error and a hold as a typed `held`\nerror whose `confirm` names the hold, never as a verdict here (BUS.md §9.3)."
         },
         "error": {
           "anyOf": [
@@ -9779,14 +9800,16 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Never set; a refusal is the response's `error`."
         },
         "hold_id": {
           "type": [
             "integer",
             "null"
           ],
-          "format": "int64"
+          "format": "int64",
+          "description": "Never set; a hold's id is in the `held` error's `confirm.payload`."
         }
       },
       "required": [
@@ -11221,12 +11244,6 @@
           ],
           "format": "uint32",
           "minimum": 0
-        },
-        "graph": {
-          "type": [
-            "boolean",
-            "null"
-          ]
         }
       },
       "required": [
@@ -14467,12 +14484,6 @@
             {
               "type": "null"
             }
-          ]
-        },
-        "at": {
-          "type": [
-            "string",
-            "null"
           ]
         }
       },

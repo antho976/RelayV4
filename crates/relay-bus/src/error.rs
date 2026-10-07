@@ -38,14 +38,13 @@ impl ErrorKind {
 
 /// The op that lifts a hold (present iff `kind == held`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct Confirm {
     pub op: String,
     pub payload: Value,
 }
 
+// No `deny_unknown_fields` here or on `Confirm`: clients ignore unknown fields (BUS.md §12).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, thiserror::Error)]
-#[serde(deny_unknown_fields)]
 #[error("{kind:?} {code}: {message}")]
 pub struct BusError {
     pub kind: ErrorKind,

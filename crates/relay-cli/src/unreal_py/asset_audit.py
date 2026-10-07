@@ -1,5 +1,6 @@
 # ue_asset_audit: facts about textures, meshes, references and redirectors, with the problems
-# they show. Loads assets, so it is bounded by `limit` and shows progress in the editor.
+# they show. Loads assets, so it is bounded by `limit` and shows progress in the editor, where
+# Cancel stops it and returns what was found so far.
 
 registry = unreal.AssetRegistryHelpers.get_asset_registry()
 root = ARGS.get("path", "/Game")
@@ -7,6 +8,7 @@ checks = set(ARGS.get("checks") or ["textures", "meshes", "references", "redirec
 limit = int(ARGS.get("limit", 400))
 findings = []
 counts = {}
+cancelled = False
 
 
 def finding(kind, asset, problem, fix):
@@ -37,7 +39,11 @@ if "textures" in checks:
     textures = by_class.get("Texture2D", [])[:limit]
     counts["textures_checked"] = len(textures)
     with unreal.ScopedSlowTask(len(textures), "Auditing textures") as task:
+        task.make_dialog(True)
         for d in textures:
+            if task.should_cancel():
+                cancelled = True
+                break
             task.enter_progress_frame(1)
             path = str(d.package_name)
             t = unreal.load_asset(path)
@@ -60,10 +66,11 @@ if "textures" in checks:
                 finding("texture", path, "named like a mask/packed texture but sRGB is on", "turn sRGB off for linear data")
             if never_stream and max(w, h) >= 1024:
                 finding("texture", path, "Never Stream is on for a %dx%d texture" % (w, h), "turn it off unless this is UI or must stay resident")
-            if str(mips).endswith("NO_MIPMAPS") and "ui" not in path.lower():
+            ui = "ui" in path.lower().split("/") or name.startswith(("t_ui_", "ui_"))
+            if mips == unreal.TextureMipGenSettings.TMGS_NO_MIPMAPS and not ui:
                 finding("texture", path, "no mipmaps on what looks like a world texture", "use FromTextureGroup mips (keep NoMipmaps for UI)")
 
-if "meshes" in checks:
+if "meshes" in checks and not cancelled:
     meshes = by_class.get("StaticMesh", [])[:limit]
     counts["meshes_checked"] = len(meshes)
     sm = None
@@ -72,7 +79,11 @@ if "meshes" in checks:
     except Exception:
         sm = unreal.EditorStaticMeshLibrary
     with unreal.ScopedSlowTask(len(meshes), "Auditing static meshes") as task:
+        task.make_dialog(True)
         for d in meshes:
+            if task.should_cancel():
+                cancelled = True
+                break
             task.enter_progress_frame(1)
             path = str(d.package_name)
             m = unreal.load_asset(path)
@@ -108,7 +119,7 @@ if "redirectors" in checks:
         finding("redirector", root, "%d redirectors under %s" % (len(redirectors), root),
                 "right-click the folder > Fix Up Redirectors, then commit the removed files together with the fixed referencers")
 
-if "references" in checks:
+if "references" in checks and not cancelled:
     options = unreal.AssetRegistryDependencyOptions(include_soft_package_references=True, include_hard_package_references=True,
                                                    include_searchable_names=False, include_soft_management_references=False,
                                                    include_hard_management_references=False)
@@ -128,4 +139,4 @@ if "references" in checks:
     counts["missing_references"] = missing
 
 emit({"path": root, "assets_by_class": summary, "counts": counts, "findings": findings,
-      "passed": not findings, "limit": limit})
+      "passed": not findings and not cancelled, "cancelled": cancelled, "limit": limit})

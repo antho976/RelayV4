@@ -165,9 +165,6 @@ impl OpMeta {
         self.deprecated = Some(why);
         self
     }
-    pub fn is_mutation(&self) -> bool {
-        matches!(self.kind, OpKind::Mutation)
-    }
 }
 
 /// An op is a type: name + meta + payload + result. Handlers in `relay-core` are keyed by
@@ -184,8 +181,6 @@ pub trait Op: 'static {
 pub struct OpEntry {
     pub name: &'static str,
     pub meta: OpMeta,
-    pub payload_type: &'static str,
-    pub result_type: &'static str,
     pub payload_schema: fn(&mut SchemaGenerator) -> Schema,
     pub result_schema: fn(&mut SchemaGenerator) -> Schema,
     /// Typed validation of a payload (BUS.md §5.2) — available for every op, implemented or
@@ -198,8 +193,6 @@ impl OpEntry {
         OpEntry {
             name: O::NAME,
             meta: O::META,
-            payload_type: std::any::type_name::<O::Payload>(),
-            result_type: std::any::type_name::<O::Result>(),
             payload_schema: |g| g.subschema_for::<O::Payload>(),
             result_schema: |g| g.subschema_for::<O::Result>(),
             // Deserialized *through* the value, not out of a clone of it: validation runs on
@@ -207,9 +200,6 @@ impl OpEntry {
             // away doubled what a large `file.write` or `session.report` cost to check.
             validate: |v| serde::Deserialize::deserialize(v).map(|_: O::Payload| ()).map_err(|e: serde_json::Error| e.to_string()),
         }
-    }
-    pub fn namespace(&self) -> &'static str {
-        self.name.split('.').next().unwrap_or(self.name)
     }
 }
 
@@ -316,14 +306,11 @@ impl Registry {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
-    pub fn names(&self) -> impl Iterator<Item = &'static str> + '_ {
-        self.entries.iter().map(|e| e.name)
-    }
 
     /// Every payload field name and every required one, per op. Built once, lazily: doors
     /// read it to fill in what an agent already carries in its environment rather than making
-    /// it guess-and-retry (BUS.md §8.2).
-    fn payload_shapes(&self) -> &'static PayloadShapes {
+    /// it guess-and-retry (BUS.md §8.2). Only the global registry exists, so it is the one read.
+    fn payload_shapes() -> &'static PayloadShapes {
         static SHAPES: OnceLock<PayloadShapes> = OnceLock::new();
         SHAPES.get_or_init(|| {
             let settings = schemars::generate::SchemaSettings::draft2020_12()
@@ -352,7 +339,7 @@ impl Registry {
 
     /// Does this op's payload have a field named `field`?
     pub fn payload_has(&self, op: &str, field: &str) -> bool {
-        self.payload_shapes()
+        Self::payload_shapes()
             .get(op)
             .is_some_and(|(fields, _)| fields.iter().any(|name| name == field))
     }
@@ -360,7 +347,7 @@ impl Registry {
     /// Is `field` required by this op's payload? Only a required field is safe to fill in
     /// from the caller's identity: an optional one is often half of an either/or.
     pub fn payload_requires(&self, op: &str, field: &str) -> bool {
-        self.payload_shapes()
+        Self::payload_shapes()
             .get(op)
             .is_some_and(|(_, required)| required.iter().any(|name| name == field))
     }

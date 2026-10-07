@@ -8,9 +8,16 @@ on:
     branches: [main]
   pull_request:
 
+# A newer push to a pull request supersedes its running check; a push to main does not, so
+# every merge keeps its own result.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Nothing here writes to the repository. Actions are pinned to commits, with the tag they
+# were resolved from beside them, so a moved tag or branch cannot change what runs.
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -19,18 +26,22 @@ jobs:
   engine:
     name: engine, bus and CLI
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       # Pinned rather than `stable`: a toolchain bump can introduce new lints, and a build
       # that goes red because Rust shipped on a Tuesday teaches people to ignore the build.
-      # Bumping this line is how a new toolchain gets adopted — deliberately, in its own PR.
-      - uses: dtolnay/rust-toolchain@master
+      # Bumping this line is how a new toolchain gets adopted — deliberately, in its own PR,
+      # together with `rust-version` in the root Cargo.toml.
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: "1.94"
           components: clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       # `--locked` fails if Cargo.lock would have to change, so a dependency cannot drift in
       # through a build that happened to resolve differently.
@@ -40,16 +51,23 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 
+      # run.sh against a fake cargo, engine and client: no GTK, no display, nothing installed.
+      - name: Launcher
+        run: python3 scripts/test-launcher.py
+
   mobile:
     name: mobile app (typecheck and lint)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: apps/relay-mobile
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
           cache: npm
@@ -78,10 +96,9 @@ jobs:
 # Covering it needs a runner image that actually carries those versions — a container with a
 # current GNOME stack, or a self-hosted runner. Whoever adds that job should confirm the
 # image's `pkg-config --modversion gtk4 pango vte-2.91-gtk4 gtksourceview-5` before wiring it
-# up, and can then add `cargo clippy -p relay-native --all-targets -- -D warnings -A deprecated`
-# and `cargo fmt -p relay-native --check` from the README's verification list.
+# up, and can then add `cargo clippy -p relay-native --all-targets -- -D warnings -A deprecated`.
 #
-# `cargo fmt --check` is absent for a different reason: the workspace is not rustfmt-clean and
-# deliberately so in places (~900 hunks differ from rustfmt's default). Enforcing it would be a
-# reformat of the repository, which is a decision to take on purpose and not a side effect of
-# turning CI on.
+# `cargo fmt --check` is absent, for relay-native as for every other crate, for a different
+# reason: the workspace is not rustfmt-clean and deliberately so in places (~900 hunks differ
+# from rustfmt's default). Enforcing it would be a reformat of the repository, which is a
+# decision to take on purpose and not a side effect of turning CI on.

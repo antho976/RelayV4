@@ -19,16 +19,16 @@ result!(#[schemars(rename = "UiStateOut")] StateOut { pub project_id: Option<Id>
 op!(State, "ui.state", Empty => StateOut, OpMeta::query(Scope::Global, 9, "The engine's shell model: the last page switched to, plus panes and windows recorded by ui.* ops. Not the native window's own panes"));
 payload!(#[schemars(rename = "UiPageSwitchIn")] PageSwitchIn { pub page: Page, pub project_id: Option<Id> });
 op!(PageSwitch, "ui.page.switch", PageSwitchIn => Empty,
-    OpMeta::mutation(Scope::Global, 9, "Switch the page (and project); the native client follows").audit(Audit::AgentOnly).undo(Undo::Inverse));
-payload!(#[schemars(rename = "PaneOpenIn")] PaneOpenIn { pub kind: PaneKind, pub target: Option<PaneTarget>, pub at: Option<String> });
+    OpMeta::mutation(Scope::Global, 9, "Switch the page (and project); the native client follows").audit(Audit::AgentOnly).undo(Undo::Inverse).emits(&["ui.changed"]));
+payload!(#[schemars(rename = "PaneOpenIn")] PaneOpenIn { pub kind: PaneKind, pub target: Option<PaneTarget> });
 result!(#[schemars(rename = "PaneOpenOut")] PaneOpenOut { pub pane: PaneRef });
 op!(PaneOpen, "ui.pane.open", PaneOpenIn => PaneOpenOut,
-    OpMeta::mutation(Scope::Global, 9, "Record a pane in the shell model. The native client acts only on target.session (it focuses that terminal); other targets open nothing").audit(Audit::AgentOnly));
+    OpMeta::mutation(Scope::Global, 9, "Record a pane in the shell model. The native client acts only on target.session (it focuses that terminal); other targets open nothing").audit(Audit::AgentOnly).emits(&["ui.changed"]));
 payload!(#[schemars(rename = "PaneIn")] PaneIn { pub pane: PaneRef });
-op!(PaneClose, "ui.pane.close", PaneIn => Empty, OpMeta::mutation(Scope::Global, 9, "Remove a pane from the shell model; the native client closes nothing").audit(Audit::AgentOnly));
-op!(PaneFocus, "ui.pane.focus", PaneIn => Empty, OpMeta::mutation(Scope::Global, 9, "Focus a pane in the shell model; the native client follows only when the pane has target.session").audit(Audit::AgentOnly));
+op!(PaneClose, "ui.pane.close", PaneIn => Empty, OpMeta::mutation(Scope::Global, 9, "Remove a pane from the shell model; the native client closes nothing").audit(Audit::AgentOnly).emits(&["ui.changed"]));
+op!(PaneFocus, "ui.pane.focus", PaneIn => Empty, OpMeta::mutation(Scope::Global, 9, "Focus a pane in the shell model; the native client follows only when the pane has target.session").audit(Audit::AgentOnly).emits(&["ui.changed"]));
 payload!(#[schemars(rename = "PaneMoveIn")] PaneMoveIn { pub pane: PaneRef, pub to: PaneRef, pub edge: String });
-op!(PaneMove, "ui.pane.move", PaneMoveIn => Empty, OpMeta::mutation(Scope::Global, 9, "Reorder panes in the shell model; the native client does not move anything").audit(Audit::AgentOnly));
+op!(PaneMove, "ui.pane.move", PaneMoveIn => Empty, OpMeta::mutation(Scope::Global, 9, "Reorder panes in the shell model; the native client does not move anything").audit(Audit::AgentOnly).emits(&["ui.changed"]));
 payload!(#[schemars(rename = "LayoutListIn")] LayoutListIn { pub project_id: Id });
 result!(#[schemars(rename = "LayoutListOut")] LayoutListOut { pub layouts: Vec<String> });
 op!(LayoutList, "ui.layout.list", LayoutListIn => LayoutListOut, OpMeta::query(Scope::Project, 9, "Saved layout presets"));
@@ -40,13 +40,13 @@ op!(LayoutApply, "ui.layout.apply", LayoutNameIn => Empty, OpMeta::mutation(Scop
 op!(LayoutDelete, "ui.layout.delete", LayoutNameIn => Empty,
     OpMeta::mutation(Scope::Project, 9, "Delete a preset").undo(Undo::Inverse).emits(&["layout.changed"]));
 result!(#[schemars(rename = "UiPopoutOut")] PopoutOut { pub window_id: String });
-op!(WindowPopout, "ui.window.popout", PaneIn => PopoutOut, OpMeta::mutation(Scope::Global, 9, "Record a pop-out window in the shell model; no OS window opens").audit(Audit::AgentOnly));
+op!(WindowPopout, "ui.window.popout", PaneIn => PopoutOut, OpMeta::mutation(Scope::Global, 9, "Record a pop-out window in the shell model; no OS window opens").audit(Audit::AgentOnly).emits(&["ui.changed"]));
 payload!(#[schemars(rename = "WindowIn")] WindowIn { pub window_id: String });
-op!(WindowClose, "ui.window.close", WindowIn => Empty, OpMeta::mutation(Scope::Global, 9, "Remove a pop-out window from the shell model").audit(Audit::AgentOnly));
+op!(WindowClose, "ui.window.close", WindowIn => Empty, OpMeta::mutation(Scope::Global, 9, "Remove a pop-out window from the shell model").audit(Audit::AgentOnly).emits(&["ui.changed"]));
 result!(#[schemars(rename = "WindowListOut")] WindowListOut { pub windows: Vec<WindowInfo> });
 op!(WindowList, "ui.window.list", Empty => WindowListOut, OpMeta::query(Scope::Global, 9, "Windows in the shell model (main plus recorded pop-outs), not real OS windows"));
 payload!(#[schemars(rename = "UiToastIn")] ToastIn { pub text: String, pub level: Option<String>, pub ttl_ms: Option<u32> });
-op!(Toast, "ui.toast", ToastIn => Empty, OpMeta::mutation(Scope::Global, 9, "Show text in the native client's notice bar (emits ui.toast; level and ttl_ms are carried but ignored)").audit(Audit::AgentOnly));
+op!(Toast, "ui.toast", ToastIn => Empty, OpMeta::mutation(Scope::Global, 9, "Show text in the native client's notice bar (emits ui.toast; level and ttl_ms are carried but ignored)").audit(Audit::AgentOnly).emits(&["ui.toast"]));
 payload!(#[schemars(rename = "UiRevealIn")] RevealIn { pub path: String });
 op!(OsReveal, "os.reveal", RevealIn => Empty, OpMeta::mutation(Scope::Global, 9, "Reveal in the file manager").audit(Audit::Never));
 payload!(#[schemars(rename = "UiOpenUrlIn")] OpenUrlIn { pub url: String });
