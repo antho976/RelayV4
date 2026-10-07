@@ -312,6 +312,67 @@ pub fn zoom_notches(acc: f64, dy: f64, pixels: bool) -> (i32, f64) {
     (-(notches as i32), travel - notches)
 }
 
+/// A checklist item on `line`: the character column of its `[`, and whether it is ticked.
+pub fn check_item(line: &str) -> Option<(usize, bool)> {
+    let found = marker(line).filter(|m| m.kind == Kind::Check)?;
+    let ticked = matches!(found.marker.as_bytes()[3], b'x' | b'X');
+    Some((found.indent.chars().count() + 2, ticked))
+}
+
+/// The first Markdown image on `line`: its alt text, its path, and the character columns the
+/// reference spans. A path with spaces or parentheses is written `<like this>`.
+pub fn image_ref(line: &str) -> Option<(String, String, usize, usize)> {
+    let start = line.find("![")?;
+    let close = start + 2 + line[start + 2..].find("](")?;
+    let alt = &line[start + 2..close];
+    if alt.contains(']') {
+        return None;
+    }
+    let rest = &line[close + 2..];
+    let (path, length) = match rest.strip_prefix('<') {
+        Some(inner) => {
+            let end = inner.find('>')?;
+            inner[end + 1..].starts_with(')').then_some(())?;
+            (&inner[..end], end + 3)
+        }
+        None => {
+            let end = rest.find(')')?;
+            (&rest[..end], end + 1)
+        }
+    };
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    let from = line[..start].chars().count();
+    let to = line[..close + 2 + length].chars().count();
+    Some((alt.to_string(), path.to_string(), from, to))
+}
+
+/// A Markdown image reference to `path`, bracketed when the path would end it early.
+pub fn image_markdown(alt: &str, path: &str) -> String {
+    if path.contains([' ', '(', ')', '<', '>']) {
+        format!("![{alt}](<{path}>)")
+    } else {
+        format!("![{alt}]({path})")
+    }
+}
+
+/// The number the next pasted image takes: one past the highest "Image N" already in `body`.
+pub fn next_image_number(body: &str) -> usize {
+    body.lines()
+        .filter_map(image_ref)
+        .filter_map(|(alt, ..)| alt.strip_prefix("Image ").and_then(|n| n.trim().parse::<usize>().ok()))
+        .max()
+        .unwrap_or(0)
+        + 1
+}
+
+/// A task title from `text`: its first line with any heading, list or checkbox marker taken off.
+pub fn task_title(text: &str) -> Option<String> {
+    text.lines().map(plain).find(|line| !line.is_empty()).map(|line| clip(line, 120))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,5 +474,31 @@ mod tests {
         assert_eq!(zoom_notches(0.5, 12.0, true), (-1, 0.0));
         assert_eq!(clean("plain"), "plain");
         assert_eq!(clean("a\0b"), "a\u{FFFD}b");
+    }
+
+    #[test]
+    fn checklist_images_and_task_titles() {
+        assert_eq!(check_item("- [ ] milk"), Some((2, false)));
+        assert_eq!(check_item("  * [x] eggs"), Some((4, true)));
+        assert_eq!(check_item("- milk"), None);
+        assert_eq!(
+            image_ref("see ![Image 2](/tmp/a.png) here"),
+            Some(("Image 2".into(), "/tmp/a.png".into(), 4, 26))
+        );
+        assert_eq!(
+            image_ref("![shot](</tmp/my shot (1).png>)"),
+            Some(("shot".into(), "/tmp/my shot (1).png".into(), 0, 31))
+        );
+        assert_eq!(image_ref("![x]()"), None);
+        assert_eq!(image_ref("[link](url)"), None);
+        assert_eq!(image_markdown("Image 1", "/a b.png"), "![Image 1](</a b.png>)");
+        assert_eq!(image_markdown("Image 1", "/a.png"), "![Image 1](/a.png)");
+        let markdown = image_markdown("Image 3", "/a (b).png");
+        assert_eq!(image_ref(&markdown).map(|r| r.1), Some("/a (b).png".into()));
+        assert_eq!(next_image_number("![Image 1](/a.png)\n![Image 4](/b.png)\n![logo](/c.png)"), 5);
+        assert_eq!(next_image_number("no images"), 1);
+        assert_eq!(task_title("\n## Ship it\nmore").as_deref(), Some("Ship it"));
+        assert_eq!(task_title("- [ ] call Sam").as_deref(), Some("call Sam"));
+        assert_eq!(task_title("  \n "), None);
     }
 }
