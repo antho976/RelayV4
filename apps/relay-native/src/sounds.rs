@@ -147,8 +147,8 @@ fn sound_samples_are_short_finite_and_volume_scaled() {
     for kind in ["chime", "glass", "pulse", "signal"] {
         let bytes = samples(kind, 1.);
         assert_eq!(bytes.len(), 22052);
-        assert!(bytes.chunks_exact(4).all(|b| {
-            let v = f32::from_le_bytes(b.try_into().unwrap());
+        assert!(bytes.as_chunks::<4>().0.iter().all(|b| {
+            let v = f32::from_le_bytes(*b);
             v.is_finite() && v.abs() <= 0.68
         }));
         assert!(samples(kind, 0.).iter().all(|b| *b == 0 || *b == 128));
