@@ -456,6 +456,11 @@ async fn session_lifecycle_over_socket() {
     assert_eq!(code(call(&e, "session.input", json!({"session": name, "data": "x"}))), "session.exited");
     // scrollback survives exit; close tears it all down
     assert!(ok(&e, "session.scrollback", json!({"session": name}))["text"].as_str().unwrap().contains("echo:again"));
+    // An exited session relaunches in place, carrying the dead PTY's history into the new one.
+    let resumed = ok(&e, "session.resume", json!({"session": name}));
+    assert_eq!(resumed["state"], "running");
+    assert_ne!(resumed["pid"], pid);
+    assert!(ok(&e, "session.scrollback", json!({"session": name}))["text"].as_str().unwrap().contains("echo:again"));
     let wt = PathBuf::from(s["worktree"].as_str().unwrap());
     ok(&e, "session.close", json!({"session": name}));
     assert!(!wt.exists());

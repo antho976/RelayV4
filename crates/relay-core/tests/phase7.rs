@@ -379,6 +379,43 @@ fn approve_uses_the_recorded_branch_after_the_assigned_session_is_closed() {
 }
 
 #[test]
+fn approve_survives_branch_cleanup_deleting_the_recorded_branch() {
+    let f = Fixture::new();
+    let e = &f.engine;
+    let repo = f._root.path().join("ws/app");
+    let closed = |title: &str| {
+        let task = ok(e, Actor::User, "task.create", json!({"project_id":1,"title":title,"column":"ready"}));
+        let session = ok(
+            e,
+            Actor::User,
+            "session.create",
+            json!({"project_id":1,"provider":"codex","role":"builder","task_id":task["id"]}),
+        );
+        let name = session["name"].as_str().unwrap().to_string();
+        let branch = session["branch"].as_str().unwrap().to_string();
+        ok(e, Actor::User, "session.close", json!({"session":name,"remove_worktree":false}));
+        git_output(&repo, &["worktree", "remove", "--force", session["worktree"].as_str().unwrap()]);
+        git_output(&repo, &["branch", "-D", &branch]);
+        task
+    };
+
+    // Nothing linked: the base branch tip, which holds the merged work.
+    let task = closed("Merged and cleaned up");
+    let done = ok(e, Actor::User, "task.approve", json!({"task_id":task["id"]}));
+    assert_eq!(done["column"], "done");
+    assert_eq!(done["commits"][0]["branch"], "main");
+    assert_eq!(done["commits"][0]["sha"], git_output(&repo, &["rev-parse", "main"]));
+
+    // A commit `session.done` (or anyone) already linked wins over the base tip.
+    let task = closed("Linked before cleanup");
+    ok(e, Actor::User, "task.link_commit", json!({"task_id":task["id"],"sha":"feedface","branch":"relay/gone"}));
+    let done = ok(e, Actor::User, "task.approve", json!({"task_id":task["id"]}));
+    assert_eq!(done["column"], "done");
+    let shas: Vec<&str> = done["commits"].as_array().unwrap().iter().map(|c| c["sha"].as_str().unwrap()).collect();
+    assert_eq!(shas, ["feedface"]);
+}
+
+#[test]
 fn approve_without_a_session_links_the_project_head() {
     let f = Fixture::new();
     let e = &f.engine;

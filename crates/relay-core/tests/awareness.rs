@@ -407,6 +407,19 @@ fn lifecycle_report_and_done_update_session_task_notifications_and_mailbox() {
     );
     assert_eq!(running["state"], "running");
     assert_eq!(running["provider_ref"], "provider-42");
+    // The ref is replayed into the provider's argv on resume, so an option-shaped one is refused
+    // and the stored ref is left as it was.
+    let refused = call(
+        e,
+        Actor::agent(f.a_name()),
+        "session.report",
+        json!({"session":f.a_name(), "kind":"tool_use", "data":{"provider_ref":"--dangerously-skip-permissions"}}),
+    );
+    assert_eq!(refused.error.expect("an option-shaped provider_ref is refused").code, "session.provider_ref");
+    assert_eq!(
+        ok(e, Actor::agent(f.a_name()), "session.get", json!({"session":f.a_name()}))["provider_ref"],
+        "provider-42"
+    );
     ok(
         e,
         Actor::agent(f.a_name()),

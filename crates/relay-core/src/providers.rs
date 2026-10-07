@@ -21,6 +21,16 @@ pub enum Launch<'a> {
     Resume { provider_ref: Option<&'a str> },
 }
 
+/// Whether `value` can be a provider's own conversation id. It becomes an argv element on
+/// resume, and an agent can report it (`session.report`), so anything that a CLI could read
+/// as an option — or that is not shaped like the UUID-style ids Claude and Codex issue — is
+/// refused when written and ignored when read back (an older row may predate the check).
+pub fn is_provider_ref(value: &str) -> bool {
+    value.len() <= 128
+        && value.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && value.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+}
+
 pub fn role_instructions_relative(session: &str) -> String {
     format!(".relay/sessions/{session}/role-instructions.md")
 }
@@ -390,6 +400,16 @@ mod tests {
             task_id: None, module_id: None, pair_with: None, bus_writes: false, allow_ui: false, state: SessionState::Created,
             pid: None, exit_code: None, provider_ref: None, spawned_at: None, last_output_at: None, usage: None,
             created_at: "now".into(), updated_at: "now".into(), closed_at: None }
+    }
+
+    #[test]
+    fn provider_refs_cannot_carry_options() {
+        assert!(is_provider_ref("0f6e1c2a-4b1d-4c55-9a51-3b8f8c1d2e3f"));
+        assert!(is_provider_ref("cx_id-2"));
+        for bad in ["", "--dangerously-skip-permissions", "-x", "--config=sandbox_mode=\"danger-full-access\"",
+            "id with space", "id/../x", "id=1", &"a".repeat(129)] {
+            assert!(!is_provider_ref(bad), "{bad:?} must be refused");
+        }
     }
 
     #[test]

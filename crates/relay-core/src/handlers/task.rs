@@ -693,7 +693,8 @@ fn dispatch_task(
     let launch_op = match row.session.state {
         relay_bus::types::SessionState::Created => Some("session.spawn"),
         relay_bus::types::SessionState::Parked => Some("session.wake"),
-        relay_bus::types::SessionState::Restorable => Some("session.resume"),
+        relay_bus::types::SessionState::Restorable
+        | relay_bus::types::SessionState::Exited => Some("session.resume"),
         relay_bus::types::SessionState::Running
         | relay_bus::types::SessionState::Idle
         | relay_bus::types::SessionState::Blocked => None,
@@ -1102,27 +1103,45 @@ pub fn register(e: &mut Engine) {
             let project = crate::handlers::workspace::get_project(ctx.tx(), before.project_id)?;
             let repo = gix::open(&project.path)
                 .map_err(|e| BusError::unavailable("git.head", e.to_string()))?;
-            // Approval is a historical task operation. The assigned session may already be
-            // closed and its worktree removed, but session.close deliberately keeps its branch.
-            // Resolve that recorded branch from the project repository instead of requiring a
-            // currently live session (or accidentally finding a newer session with the same name).
-            if let Some(session_id) = session_id {
-                let session = sessions::by_id(ctx.tx(), session_id)?
-                    .ok_or_else(|| BusError::internal("task session vanished"))?;
-                let sha = repo
-                    .rev_parse_single(format!("refs/heads/{}", session.session.branch).as_str())
-                    .map_err(|e| BusError::unavailable("git.head", e.to_string()))?
-                    .detach()
-                    .to_string();
-                (sha, Some(session.session.branch))
-            } else {
-                // Work completed directly in the project checkout still gets the same Done
-                // invariant: link the checkout HEAD even though Relay never dispatched it.
-                let branch = repo.head_name().ok().flatten().map(|name| name.shorten().to_string());
-                let sha = repo.head_id()
-                    .map_err(|e| BusError::unavailable("git.head", e.to_string()))?
-                    .to_string();
-                (sha, branch)
+            // Approval is a historical task operation. The assigned session may be closed, its
+            // worktree removed, and — once its work merged — its branch deleted by branch
+            // cleanup; a session in a detached primary checkout records the branch `HEAD`,
+            // which never resolves as a ref. So take the first of: the recorded branch's tip,
+            // the commit `session.done` already linked, the base branch tip (which holds the
+            // merged work), and the checkout HEAD. Fail only when the repository says nothing.
+            let recorded = match session_id {
+                Some(session_id) => Some(sessions::by_id(ctx.tx(), session_id)?
+                    .ok_or_else(|| BusError::internal("task session vanished"))?.session.branch),
+                None => None,
+            };
+            let tip = |reference: &str| repo.rev_parse_single(reference).ok().map(|id| id.detach().to_string());
+            let on_branch = recorded.as_deref().filter(|branch| *branch != "HEAD")
+                .and_then(|branch| Some((tip(&format!("refs/heads/{branch}"))?, Some(branch.to_string()))));
+            let linked = || -> Result<Option<(String, Option<String>)>, BusError> {
+                ctx.tx().query_row(
+                    "SELECT sha, branch FROM task_commits WHERE task_id=?1 ORDER BY id DESC LIMIT 1",
+                    [before.id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                ).optional().bus()
+            };
+            let found = match on_branch {
+                Some(found) => Some(found),
+                None if recorded.is_some() => linked()?.or_else(|| {
+                    tip(&format!("refs/heads/{}", project.base_branch)).map(|sha| (sha, Some(project.base_branch.clone())))
+                }),
+                None => None,
+            };
+            match found {
+                Some(found) => found,
+                None => {
+                    // Work completed directly in the project checkout still gets the same Done
+                    // invariant: link the checkout HEAD even though Relay never dispatched it.
+                    let branch = repo.head_name().ok().flatten().map(|name| name.shorten().to_string());
+                    let sha = repo.head_id()
+                        .map_err(|e| BusError::unavailable("git.head", e.to_string()))?
+                        .to_string();
+                    (sha, branch)
+                }
             }
         };
         link_commit(ctx.tx(), before.id, &sha, branch.as_deref(), &ctx.now)?;

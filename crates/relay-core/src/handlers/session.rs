@@ -453,9 +453,14 @@ fn plan_launch(conn: &Connection, engine: &Engine, row: Row_, kind: LaunchKind) 
     let write_roots = crate::guardrail::write_roots(&cfg, &cwd).into_iter().filter(|root| root != &cwd).collect();
     let initial_scrollback = match kind {
         LaunchKind::Fresh => Vec::new(),
-        LaunchKind::Resume => sessions::load_scrollback(conn, row.session.id)?
-            .map(|saved| saved.0.into_bytes())
-            .unwrap_or_default(),
+        // An exited session's history is still in its dead PTY: nothing saves it at exit, so
+        // the stored copy is stale or missing until the engine shuts down.
+        LaunchKind::Resume => match engine.pty(row.session.id).filter(|_| row.session.state == SessionState::Exited) {
+            Some(dead) => dead.scrollback(None).0.into_bytes(),
+            None => sessions::load_scrollback(conn, row.session.id)?
+                .map(|saved| saved.0.into_bytes())
+                .unwrap_or_default(),
+        },
     };
     Ok(LaunchPlan {
         row, kind, cmd, project_path: PathBuf::from(&project.path), relay_bin, plugin_servers, skills,
@@ -533,7 +538,7 @@ fn prepare_launch(engine: &Engine, plan: LaunchPlan) -> Result<PreparedLaunch, B
         LaunchKind::Resume => crate::providers::driver(row.session.provider).args(
             &row.session,
             crate::providers::Launch::Resume {
-                provider_ref: row.session.provider_ref.as_deref(),
+                provider_ref: row.session.provider_ref.as_deref().filter(|value| crate::providers::is_provider_ref(value)),
             },
             Some(&brief_compact),
         ),
@@ -684,6 +689,18 @@ fn finish_launch(ctx: &mut Ctx, prepared: PreparedLaunch) -> Result<Session, Bus
     ).bus()?;
     if let Some(old) = ctx.engine().set_pty(sid, &name, pty) {
         kill_detached(old, Duration::from_millis(500));
+    }
+    if expect == SessionState::Exited && current.session.role == Role::Builder {
+        // The exit marked the builder's task failed; relaunched, it is being worked on again.
+        if let Some(task_id) = current.session.task_id {
+            let revived = ctx.tx().execute(
+                "UPDATE tasks SET state='running',updated_at=?1 WHERE id=?2 AND col='active' AND state='failed' AND deleted_at IS NULL",
+                params![ctx.now, task_id],
+            ).bus()?;
+            if revived > 0 {
+                ctx.emit("task.changed", json!({"task_id": task_id, "state": "running"}));
+            }
+        }
     }
     let updated =
         sessions::by_id(ctx.tx(), sid)?.ok_or_else(|| BusError::internal("session vanished"))?;
@@ -924,9 +941,14 @@ pub fn register(e: &mut Engine) {
             s => Err(BusError::conflict(
                 "session.state",
                 format!(
-                    "session {} is {}; use session.resume or session.wake",
+                    "session {} is {}; {}",
                     row.session.name,
-                    sessions::state_str(s)
+                    sessions::state_str(s),
+                    match s {
+                        SessionState::Parked => "use session.wake",
+                        SessionState::Closed => "a closed session cannot be relaunched",
+                        _ => "use session.resume, or session.clear_restorable for a fresh conversation",
+                    },
                 ),
             )),
         }, |row| {
@@ -941,12 +963,14 @@ pub fn register(e: &mut Engine) {
     }, |ctx: &mut Ctx, _p, prepared| finish_launch(ctx, prepared));
 
     e.register_staged::<Resume, _>(|ctx, p| {
+        // An exited session — the provider quit, crashed or lost its login — relaunches in
+        // place exactly like one Relay itself stopped, keeping its conversation and its group.
         stage_launch(ctx, &p.session, LaunchKind::Resume, |row| {
-            if row.session.state != SessionState::Restorable {
+            if !matches!(row.session.state, SessionState::Restorable | SessionState::Exited) {
                 return Err(BusError::conflict(
                     "session.state",
                     format!(
-                        "session {} is {}; only restorable sessions resume",
+                        "session {} is {}; only restorable or exited sessions resume",
                         row.session.name,
                         sessions::state_str(row.session.state)
                     ),
@@ -958,8 +982,8 @@ pub fn register(e: &mut Engine) {
 
     e.register_staged::<ClearRestorable, _>(|ctx, p| {
         let mut prepared = stage_launch(ctx, &p.session, LaunchKind::Fresh, |row| {
-            if row.session.state != SessionState::Restorable {
-                return Err(BusError::conflict("session.state", format!("session {} is not restorable", row.session.name)));
+            if !matches!(row.session.state, SessionState::Restorable | SessionState::Exited) {
+                return Err(BusError::conflict("session.state", format!("session {} is not restorable or exited", row.session.name)));
             }
             Ok(())
         }, |row| row.session.provider_ref = None)?;
@@ -1356,6 +1380,12 @@ pub fn register(e: &mut Engine) {
         ).bus()?;
         let completed_without_done = p.kind == "stop" && pending_stop.is_none() && s.state == SessionState::Running;
         let provider_ref = data.get("session_id").or_else(|| data.get("provider_ref")).and_then(Value::as_str);
+        // It is replayed into the provider's argv on resume (`--resume <id>`), so a value a CLI
+        // could parse as an option must never be stored.
+        if let Some(value) = provider_ref.filter(|value| !crate::providers::is_provider_ref(value)) {
+            return Err(BusError::invalid("session.provider_ref", format!("{value:?} is not a provider session id"))
+                .with_hint("provider_ref is the provider's own conversation id: letters, digits, '-' and '_', starting with a letter or digit"));
+        }
         let state = match p.kind.as_str() {
             "session_start" | "tool_use" => "running",
             "stop" | "idle" => "idle",
@@ -1505,8 +1535,8 @@ pub fn register(e: &mut Engine) {
     e.register_staged::<DiscardRestorable, _>(|ctx, p| {
         let (row, repo, teardown) = ctx.read(|conn| {
             let row = sessions::by_name(conn, &p.session)?;
-            if row.session.state != SessionState::Restorable {
-                return Err(BusError::conflict("session.state", format!("session {} is not restorable", row.session.name)));
+            if !matches!(row.session.state, SessionState::Restorable | SessionState::Exited) {
+                return Err(BusError::conflict("session.state", format!("session {} is not restorable or exited", row.session.name)));
             }
             let project = crate::handlers::workspace::get_project(conn, row.session.project_id)?;
             let other_sessions: i64 = conn.prepare_cached(

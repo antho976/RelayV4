@@ -75,6 +75,17 @@ pub fn output_with_timeout(cmd: &mut Command, timeout: Duration) -> io::Result<O
     }))
 }
 
+/// Make a network `git` command fail instead of waiting for a person: no terminal prompt, no
+/// GUI askpass (an empty `GIT_ASKPASS` skips `core.askPass` and `SSH_ASKPASS` too), and a
+/// transfer that stalls below 1 KB/s for a minute is abandoned. Credential helpers still run.
+/// Call before adding the subcommand: the `-c` options belong to `git` itself.
+pub fn quiet_network_git(cmd: &mut Command) {
+    cmd.env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "")
+        .env("GCM_INTERACTIVE", "never")
+        .args(["-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=60"]);
+}
+
 fn drain<R: io::Read + Send + 'static>(mut reader: R) -> std::thread::JoinHandle<Vec<u8>> {
     std::thread::spawn(move || {
         let mut buf = Vec::new();
