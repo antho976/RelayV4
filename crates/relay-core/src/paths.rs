@@ -13,13 +13,6 @@ pub enum Instance {
 }
 
 impl Instance {
-    pub fn from_env() -> Self {
-        match std::env::var("RELAY_INSTANCE").as_deref() {
-            Ok("dev") => Instance::Dev,
-            Ok("test") => Instance::Test,
-            _ => Instance::Stable,
-        }
-    }
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "stable" => Some(Instance::Stable),
@@ -50,12 +43,6 @@ impl Instance {
     pub fn store_path(self) -> PathBuf {
         self.data_dir().join("store.db")
     }
-    pub fn backup_dir(self) -> PathBuf {
-        self.data_dir().join("backups")
-    }
-    pub fn log_dir(self) -> PathBuf {
-        self.data_dir().join("logs")
-    }
     /// `$XDG_RUNTIME_DIR/relay-v4/`. Without that variable (cron, `su`, ssh without
     /// pam_systemd): `/run/user/<uid>/relay-v4/` when that directory is ours and private, else
     /// `~/.cache/relay-v4-runtime/relay-v4/`. Never a predictable name in a shared `/tmp`: any
@@ -77,10 +64,15 @@ impl Instance {
         base.join("relay-v4")
     }
     pub fn socket_path(self) -> PathBuf {
-        self.runtime_dir().join(format!("{}.sock", self.as_str()))
+        self.runtime_dir().join(self.socket_file())
     }
-    pub fn lock_path(self) -> PathBuf {
-        self.runtime_dir().join(format!("{}.lock", self.as_str()))
+    /// The socket's file name in the runtime dir — one spelling for the door and its clients.
+    pub fn socket_file(self) -> String {
+        format!("{}.sock", self.as_str())
+    }
+    /// The instance lock's file name, beside the socket (BUS.md §6.2).
+    pub fn lock_file(self) -> String {
+        format!("{}.lock", self.as_str())
     }
 }
 

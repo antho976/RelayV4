@@ -397,8 +397,8 @@ impl Store {
     /// Open (creating if needed) and migrate. `exclusive` takes SQLite's EXCLUSIVE locking
     /// mode — the engine does (BUS.md §6.2); tests and tools do not.
     pub fn open(path: &Path, exclusive: bool) -> Result<Store> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+            private_dir(dir)?;
         }
         let conn = Connection::open_with_flags(
             path,
@@ -407,7 +407,14 @@ impl Store {
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .with_context(|| format!("opening {}", path.display()))?;
+        // Before WAL mode: SQLite gives the -wal and -shm files the database file's mode.
+        private_file(path);
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        for side in ["-wal", "-shm"] {
+            let mut name = path.as_os_str().to_owned();
+            name.push(side);
+            if Path::new(&name).exists() { private_file(Path::new(&name)); }
+        }
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
@@ -449,12 +456,7 @@ impl Store {
         );
         if v > 0 && (v as usize) < MIGRATIONS.len() && self.path.is_file() {
             // SPEC §14: store.db copied on every version upgrade.
-            let dir = self
-                .path
-                .parent()
-                .map(|d| d.join("backups"))
-                .unwrap_or_else(|| PathBuf::from("backups"));
-            match backup_to(&conn, &dir, "upgrade") {
+            match backup_to(&conn, &self.backup_dir(), "upgrade") {
                 Ok(p) => {
                     tracing::info!(backup = %p.display(), from = v, to = SCHEMA_VERSION, "store backed up before upgrade")
                 }
@@ -499,13 +501,6 @@ impl Store {
         Ok(out)
     }
 
-    /// Size on disk in MiB (0 for memory).
-    pub fn size_mb(&self) -> f64 {
-        std::fs::metadata(&self.path)
-            .map(|m| m.len() as f64 / (1024.0 * 1024.0))
-            .unwrap_or(0.0)
-    }
-
     /// The backups directory beside the store.
     pub fn backup_dir(&self) -> PathBuf {
         self.path
@@ -531,6 +526,7 @@ impl Store {
         let dir = self.backup_dir();
         let dest = backup_dest(&dir, reason)?;
         let mut out = Connection::open(&dest)?;
+        private_file(&dest);
         let copied = {
             let guard = self.lock();
             // SAFETY: the connection lives inside `self.conn` for as long as `self`, which this
@@ -613,8 +609,33 @@ const BACKUP_STEP_PAGES: std::os::raw::c_int = 1024;
 /// Busy steps in a row before a backup gives up, 10 ms apart.
 const BACKUP_BUSY_RETRIES: u32 = 200;
 
+/// The store holds the audit log (request payloads, file contents, commands), notes and session
+/// tokens: other local accounts must not read it where home directories are traversable
+/// (RA-342). New directories are created 0700. An existing one is left as it is — the store's
+/// directory may be one the caller chose — except `backups/`, which is always Relay's own.
+fn private_dir(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)
+        .with_context(|| format!("creating {}", dir.display()))
+}
+
+/// 0600 on a file the store wrote. A failure (a store file someone else owns) is logged, not
+/// fatal: an existing install must keep opening.
+fn private_file(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        tracing::warn!(path = %path.display(), %error, "could not make the store file private");
+    }
+}
+
 fn backup_dest(dir: &Path, reason: &str) -> Result<PathBuf> {
-    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    private_dir(dir)?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(error) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
+            tracing::warn!(dir = %dir.display(), %error, "could not make the backups directory private");
+        }
+    }
     let stamp = crate::time::now().replace(':', "-");
     Ok(dir.join(format!("store-{stamp}-{reason}.db")))
 }
@@ -636,6 +657,7 @@ fn prune_backups(dir: &Path) -> Result<()> {
 fn backup_to(conn: &Connection, dir: &Path, reason: &str) -> Result<PathBuf> {
     let dest = backup_dest(dir, reason)?;
     let mut out = Connection::open(&dest)?;
+    private_file(&dest);
     let copied = (|| -> Result<()> {
         let bk = rusqlite::backup::Backup::new(conn, &mut out)?;
         let mut busy = 0;

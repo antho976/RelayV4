@@ -38,7 +38,10 @@ is explicit. Closing the GUI releases subscriptions without closing sessions.
 Paired launch creates both identities, stages the task assignment, then starts
 the reviewer and builder. The engine enforces roles and shared-worktree rules.
 Partial launch failures preserve allocated sessions for inspection. No cleanup
-path silently deletes a worktree, branch or repository.
+path silently deletes a worktree, branch or repository: the one that deletes
+unprompted, the merged-branch sweep (`git.branch.cleanup`, after a close and
+every 20 minutes), takes only closed sessions' `relay/*` branches whose work is
+provably merged, and writes an audit row for each.
 
 The native hold screen uses the new user-only `guardrail.hold.get` to inspect
 the exact frozen request with its authentication token removed. Only after

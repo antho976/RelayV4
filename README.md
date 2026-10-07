@@ -90,7 +90,10 @@ model or touches the user's project store. Screenshots go under
 `.impeccable/review/`.
 
 See [verification and limits](docs/VERIFICATION.md). The application has no
-engine refresh timers by default. The one opt-in exception is the usage-limit
+engine refresh timers by default, and one housekeeping sweep: every 20 minutes
+the engine deletes closed sessions' `relay/*` branches whose work is merged, and
+the GitHub branch too when a merged PR proves it (`git.branch.cleanup`, BUS.md
+§10.12; each deletion is audited). The one opt-in exception is the usage-limit
 interval (`usage.refresh_minutes`, set from the status bar's limits popup, off by
 default), which re-reads what Claude Code and Codex already saved locally and
 never contacts a provider. A 30-second clock only rewrites the "updated … ago"

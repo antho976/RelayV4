@@ -129,11 +129,13 @@ pub fn register(e: &mut Engine) {
                                 .ok();
                             continue;
                         }
-                        let rows = {
-                            let conn = engine.store.lock();
-                            resource_rows(&conn).ok()
-                        };
-                        let value = rows.and_then(|rows| resource_snapshot(rows, &engine, false).ok()).and_then(|value| serde_json::to_value(value).ok());
+                        // The store mutex and the /proc reads on a blocking worker: waiting on the
+                        // lock here would park a runtime thread the socket door needs (RA-341).
+                        let sampler = engine.clone();
+                        let value = tokio::task::spawn_blocking(move || {
+                            let rows = resource_rows(&sampler.store.lock()).ok()?;
+                            resource_snapshot(rows, &sampler, false).ok().and_then(|value| serde_json::to_value(value).ok())
+                        }).await.ok().flatten();
                         if let Some(value) = value { engine.emit_system("resource.sample", value); }
                     }
                 });
@@ -235,7 +237,7 @@ fn resource_snapshot(rows: Vec<ResourceRow>, engine: &Engine, refresh_disk: bool
     let missing = if refresh_disk { worktree_paths.iter().cloned().collect::<Vec<_>>() } else { Vec::new() };
     if !missing.is_empty() {
         let measured = missing.into_iter().map(|path| {
-            let (disk, build) = dir_usage(Path::new(&path));
+            let (disk, build) = crate::worktree::disk_usage(Path::new(&path));
             (path, (bytes_mb(disk), (build > 0).then(|| bytes_mb(build))))
         }).collect::<Vec<_>>();
         let mut cache = engine.resource_disk.lock().unwrap();
@@ -258,34 +260,6 @@ fn resource_snapshot(rows: Vec<ResourceRow>, engine: &Engine, refresh_disk: bool
 }
 
 fn bytes_mb(bytes: u64) -> f64 { bytes as f64 / (1024.0 * 1024.0) }
-
-/// Walks a worktree. Only directories are queued — files are measured inline — so the stack holds
-/// one `PathBuf` per pending directory rather than one per file in the tree.
-fn dir_usage(root: &Path) -> (u64, u64) {
-    let mut total = 0u64;
-    let mut build = 0u64;
-    let mut stack = vec![(root.to_path_buf(), false)];
-    while let Some((dir, in_build)) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-        for entry in entries.flatten() {
-            // On Linux the kind comes from the dirent, so this costs no extra stat, and it does
-            // not follow symlinks — a link into a large tree is never counted twice.
-            let Ok(kind) = entry.file_type() else { continue };
-            if kind.is_symlink() {
-                continue;
-            }
-            if kind.is_dir() {
-                let child_build = in_build || matches!(entry.file_name().to_string_lossy().as_ref(), "target" | "build" | ".gradle");
-                stack.push((entry.path(), child_build));
-            } else if kind.is_file() {
-                let Ok(meta) = entry.metadata() else { continue };
-                total = total.saturating_add(meta.len());
-                if in_build { build = build.saturating_add(meta.len()); }
-            }
-        }
-    }
-    (total, build)
-}
 
 fn proc_rss_mb(pid: i64) -> Option<f64> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
@@ -311,10 +285,6 @@ fn cpu_pct(engine: &Engine, pid: i64, ticks: u64) -> f64 {
     result
 }
 
-
-
-#[allow(dead_code)]
-fn _ctx(_: &Ctx) {}
 
 #[cfg(test)]
 mod tests {
@@ -351,11 +321,14 @@ mod tests {
 
     #[test]
     fn disk_usage_counts_total_and_build_bytes_in_one_walk() {
+        // The same build dirs a purge deletes (RA-629): top-level `target/`, not `src/build/`.
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join("src")).unwrap();
         std::fs::create_dir_all(root.path().join("target/debug")).unwrap();
         std::fs::write(root.path().join("src/main.rs"), b"source").unwrap();
         std::fs::write(root.path().join("target/debug/app"), b"build-output").unwrap();
-        assert_eq!(dir_usage(root.path()), (18, 12));
+        std::fs::create_dir_all(root.path().join("src/build")).unwrap();
+        std::fs::write(root.path().join("src/build/gen.rs"), b"tracked").unwrap();
+        assert_eq!(crate::worktree::disk_usage(root.path()), (25, 12));
     }
 }
