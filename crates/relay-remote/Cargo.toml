@@ -28,3 +28,5 @@ if-addrs = "0.15"
 
 [dev-dependencies]
 tempfile = "3"
+# Decodes the base64 `pty` frames a phone receives.
+base64.workspace = true

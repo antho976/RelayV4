@@ -1,6 +1,7 @@
 //! A phone's view of the remote door, end to end: a real engine behind a real socket, a
-//! WebSocket client that pairs, proves itself, calls the bus and streams a terminal — once
-//! directly and once through a rendezvous server and the host tunnel.
+//! WebSocket client that pairs, proves itself, calls the bus and streams a live terminal —
+//! directly and through a rendezvous server and the host tunnel. The `wss://` dial is covered
+//! only as far as `tls.rs` goes: no test here runs a TLS server.
 
 use futures_util::{SinkExt, StreamExt};
 use relay_core::engine::Engine;
@@ -22,7 +23,7 @@ type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 struct Harness {
     _dir: tempfile::TempDir,
-    _engine: Arc<Engine>,
+    engine: Arc<Engine>,
     _socket: SocketServer,
     ctx: Arc<Ctx>,
 }
@@ -40,7 +41,15 @@ async fn harness() -> Harness {
         socket_path: socket.path.clone(),
         version: "test".into(),
     });
-    Harness { _dir: dir, _engine: engine, _socket: socket, ctx }
+    Harness { _dir: dir, engine, _socket: socket, ctx }
+}
+
+/// Set up what a phone may not do itself, as the person at the PC would.
+fn at_the_pc(h: &Harness, op: &str, payload: Value) -> Value {
+    use relay_bus::envelope::{Actor, Request};
+    let resp = h.engine.dispatch(Request::new(Actor::User, op, payload), relay_core::engine::Door::Socket);
+    assert!(resp.ok, "{op}: {resp:?}");
+    resp.result.unwrap_or(Value::Null)
 }
 
 /// A first-come window, as `relay remote pair --no-confirm` opens; confirmation has its own
@@ -124,6 +133,23 @@ async fn exercise_bus(ws: &mut Ws) {
     assert_eq!(refused["id"], id);
     assert_eq!(refused["ok"], false);
     assert_eq!(refused["error"]["code"], "bus.actor");
+
+    // Two lines in one frame are two requests to the engine, and the gate sees both.
+    let (first, second) = (uuid_v4(), uuid_v4());
+    send(ws, format!("{}\n{}",
+        json!({"v":1,"id":first,"actor":"user","op":"bus.ping","payload":{}}),
+        json!({"v":1,"id":second,"actor":"agent:brisk-otter","op":"bus.ping","payload":{},"token":"nope"}))).await;
+    let (mut pong, mut refused) = (None, None);
+    while pong.is_none() || refused.is_none() {
+        let line = recv_json(ws).await;
+        if line["id"] == first {
+            pong = Some(line);
+        } else if line["id"] == second {
+            refused = Some(line);
+        }
+    }
+    assert_eq!(pong.unwrap()["ok"], true);
+    assert_eq!(refused.unwrap()["error"]["code"], "bus.actor", "the second line of a frame went ungated");
 
     // Events interleave with responses exactly as on the socket door.
     let sub = call(ws, "bus.subscribe", json!({"events":["workspace.*"]})).await;
@@ -315,25 +341,20 @@ async fn the_same_phone_reaches_the_engine_through_a_rendezvous() {
         assert_eq!(first["error"], "host.offline");
     }
 
-    // The wrong secret cannot host the room.
+    // The wrong secret cannot host the room, in the header or (from an older PC) the URL.
     {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut bad = relay_remote::tunnel::host_url(&rendezvous).into_client_request().unwrap();
+        bad.headers_mut().insert("authorization", "Bearer wrong".parse().unwrap());
+        assert!(tokio_tungstenite::connect_async(bad).await.is_err());
         let bad = format!("ws://{}/host/{}?secret=wrong", server.local_addr, rendezvous.room);
         assert!(tokio_tungstenite::connect_async(bad.as_str()).await.is_err());
     }
+    // The secret never rides in the URL a proxy logs.
+    assert!(!relay_remote::tunnel::host_url(&rendezvous).contains(&rendezvous.secret));
 
     let tunnel = relay_remote::tunnel::spawn(h.ctx.clone(), rendezvous.clone());
-    // Wait for the host to be in the room.
-    for _ in 0..50 {
-        let mut tcp = TcpStream::connect(server.local_addr).await.unwrap();
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        tcp.write_all(b"GET /health HTTP/1.1\r\n\r\n").await.unwrap();
-        let mut buf = String::new();
-        tcp.read_to_string(&mut buf).await.unwrap();
-        if buf.contains("\"hosts\":1") {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    await_hosts(server.local_addr, 1).await;
 
     let (device, token, _) = pair(&join, &code).await;
     let mut a = admit(&join, &device, &token).await;
@@ -350,7 +371,7 @@ async fn the_same_phone_reaches_the_engine_through_a_rendezvous() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_terminal_streams_to_the_phone() {
+async fn the_apps_new_request_payloads_reach_the_engine() {
     let h = harness().await;
     let door = DirectServer::bind(h.ctx.clone(), "127.0.0.1:0".parse::<SocketAddr>().unwrap())
         .await
@@ -424,8 +445,10 @@ async fn a_phone_fits_a_terminal_to_itself_and_hands_it_back() {
     std::fs::write(&provider, "#!/bin/sh\necho hello-from-pty\nwhile IFS= read -r line; do echo \"echo:$line\"; done\n").unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Where the engine finds an executable is the PC's to set, never a phone's.
     let set = call(&mut ws, "settings.set", json!({"path": "providers.claude.path", "value": provider})).await;
-    assert_eq!(set["ok"], true, "{set}");
+    assert_eq!(set["error"]["code"], "remote.op", "{set}");
+    at_the_pc(&h, "settings.set", json!({"path": "providers.claude.path", "value": provider}));
     let created = call(&mut ws, "workspace.create", json!({"path": repo.path().parent().unwrap()})).await;
     assert_eq!(created["ok"], true, "{created}");
     let project = call(&mut ws, "project.add", json!({"workspace_id": created["result"]["id"], "path": repo.path()})).await;
@@ -672,10 +695,114 @@ async fn a_new_pairing_is_announced_to_the_desktop() {
     let (second, _, _) = pair(&url, &pair_code(&h.ctx)).await;
     loop {
         let line = recv_json(&mut desktop).await;
-        if line["ev"] == "ui.toast" {
+        // The first pairing's own announcement is sent in the background and may land here.
+        if line["ev"] == "ui.toast" && line["payload"]["text"].as_str().is_some_and(|t| t.contains(&second)) {
             let text = line["payload"]["text"].as_str().unwrap();
-            assert!(text.contains("Test Phone") && text.contains(&second) && text.contains("direct 127.0.0.1"), "{text}");
+            assert!(text.contains("Test Phone") && text.contains("direct 127.0.0.1"), "{text}");
             break;
         }
     }
+}
+
+/// A session whose provider is a shell script that prints a line, then echoes what it is sent.
+async fn live_session(h: &Harness, ws: &mut Ws) -> (String, tempfile::TempDir) {
+    let repo = tempfile::tempdir().unwrap();
+    let out = std::process::Command::new("git").args(["-C", repo.path().to_str().unwrap(), "init", "-q"]).output().unwrap();
+    assert!(out.status.success());
+    let provider = repo.path().join("fake-claude.sh");
+    std::fs::write(&provider, "#!/bin/sh\necho hello-from-pty\nwhile IFS= read -r line; do echo \"echo:$line\"; done\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o755)).unwrap();
+    at_the_pc(h, "settings.set", json!({"path": "providers.claude.path", "value": provider}));
+    let created = call(ws, "workspace.create", json!({"path": repo.path().parent().unwrap()})).await;
+    assert_eq!(created["ok"], true, "{created}");
+    let project = call(ws, "project.add", json!({"workspace_id": created["result"]["id"], "path": repo.path()})).await;
+    assert_eq!(project["ok"], true, "{project}");
+    let session = call(ws, "session.create", json!({"project_id": project["result"]["id"], "provider": "claude"})).await;
+    assert_eq!(session["ok"], true, "{session}");
+    let name = session["result"]["name"].as_str().unwrap().to_string();
+    let spawned = call(ws, "session.spawn", json!({"session": name})).await;
+    assert_eq!(spawned["ok"], true, "{spawned}");
+    (name, repo)
+}
+
+/// Read until the `pty` frames for `session` seen so far, decoded, contain `want`.
+async fn pty_until(ws: &mut Ws, session: &str, want: &str) {
+    use base64::Engine as _;
+    let mut seen = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !String::from_utf8_lossy(&seen).contains(want) {
+            let line = recv_json(ws).await;
+            if line["stream"] == "pty" && line["session"] == session {
+                seen.extend(base64::engine::general_purpose::STANDARD.decode(line["data"].as_str().unwrap()).unwrap());
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no {want:?} in the terminal: {:?}", String::from_utf8_lossy(&seen)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_live_terminal_streams_to_the_phone_directly_and_through_a_rendezvous() {
+    let h = harness().await;
+    let door = DirectServer::bind(h.ctx.clone(), "127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .await
+        .unwrap();
+    let server = RendezvousServer::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .await
+        .unwrap();
+    let (rendezvous, code) = Registry::update(&h.ctx.registry_path, |r| {
+        let rendezvous = r.set_rendezvous(&format!("ws://{}", server.local_addr)).clone();
+        Ok::<_, anyhow::Error>((rendezvous, r.begin_pair(false).code))
+    })
+    .unwrap();
+    let tunnel = relay_remote::tunnel::spawn(h.ctx.clone(), rendezvous.clone());
+    await_hosts(server.local_addr, 1).await;
+    let url = format!("ws://{}", door.local_addr);
+    let join = relay_remote::tunnel::join_url(&rendezvous);
+    let (device, token, _) = pair(&url, &code).await;
+    let mut direct = admit(&url, &device, &token).await;
+    let (name, _repo) = live_session(&h, &mut direct).await;
+    let mut joined = admit(&join, &device, &token).await;
+
+    // What the terminal screen does: attach, read what is there, type, read the answer. The
+    // frames are read straight off the socket, so none is consumed waiting for a response.
+    for (ws, typed) in [(&mut direct, "via-lan"), (&mut joined, "via-rendezvous")] {
+        send(ws, json!({"v":1,"id":uuid_v4(),"actor":"user","op":"session.attach","payload":{"session": name}}).to_string()).await;
+        pty_until(ws, &name, "hello-from-pty").await;
+        send(ws, json!({"v":1,"id":uuid_v4(),"actor":"user","op":"session.input","payload":{"session": name, "data": format!("{typed}\n")}}).to_string()).await;
+        pty_until(ws, &name, &format!("echo:{typed}")).await;
+    }
+    let closed = call(&mut direct, "session.close", json!({"session": name})).await;
+    assert_eq!(closed["ok"], true, "{closed}");
+    tunnel.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_phone_is_let_go_when_the_engine_goes() {
+    // An engine that takes the bridge's connection and then goes away, as one that restarts does.
+    let dir = tempfile::tempdir().unwrap();
+    let socket_path = dir.path().join("engine.sock");
+    let engine = tokio::net::UnixListener::bind(&socket_path).unwrap();
+    let ctx = Arc::new(Ctx {
+        instance: Instance::Test,
+        registry_path: dir.path().join("remote.json"),
+        socket_path,
+        version: "test".into(),
+    });
+    let door = DirectServer::bind(ctx.clone(), "127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .await
+        .unwrap();
+    let url = format!("ws://{}", door.local_addr);
+    let (device, token, _) = pair(&url, &pair_code(&ctx)).await;
+    // Every connection is closed as soon as it is taken: the pairing's desktop announcement,
+    // and the bridge's own once the phone is admitted.
+    let engine = tokio::spawn(async move {
+        while let Ok((conn, _)) = engine.accept().await {
+            drop(conn);
+        }
+    });
+    let mut ws = admit(&url, &device, &token).await;
+    assert!(closes_within(&mut ws, Duration::from_secs(5)).await, "the phone stayed connected to no engine");
+    engine.abort();
 }

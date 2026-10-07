@@ -299,8 +299,9 @@ Two traps `ue_build` now guards against:
 - A leftover **CrashReportClient** makes UnrealBuildTool think an editor is running, so it builds
   a numbered hot-reload module (`libUnrealEditor-MyGame-0003.so`) while
   `Binaries/Linux/UnrealEditor.modules` keeps pointing at the old one, and the editor runs old
-  code. `ue_build` stops leftover crash reporters first and warns when the manifest names a
-  numbered module. If it does: quit the editor, delete the numbered files, build again.
+  code. `ue_build` stops this project's leftover crash reporters first (another project's may
+  be a dialog still open, so those are listed in a warning and left running) and warns when
+  the manifest names a numbered module. If it does: quit the editor, delete the numbered files, build again.
 - Building while the editor is open is refused unless `allow_editor_open` is set.
 
 `ue_build` finds the engine without `UE_ROOT`: from a running editor, the project's last log

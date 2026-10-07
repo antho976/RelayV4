@@ -63,3 +63,71 @@ fn committed_schema_is_current() {
     assert!(committed == generated,
         "schema/bus.v1.json is stale — regenerate: cargo run -p relay-bus --example dump_schema > schema/bus.v1.json");
 }
+
+/// Every `$ref` in `subtree` that points at `#/$defs/<name>` names a definition in `defs`.
+fn refs_resolve(subtree: &serde_json::Value, defs: &serde_json::Value, at: &str) {
+    match subtree {
+        serde_json::Value::Object(map) => {
+            if let Some(target) = map.get("$ref").and_then(|r| r.as_str()) {
+                let name = target.strip_prefix("#/$defs/").unwrap_or_else(|| panic!("{at}: unexpected $ref {target}"));
+                assert!(defs.get(name).is_some(), "{at}: $ref {target} has no definition");
+            }
+            for value in map.values() {
+                refs_resolve(value, defs, at);
+            }
+        }
+        serde_json::Value::Array(items) => items.iter().for_each(|item| refs_resolve(item, defs, at)),
+        _ => {}
+    }
+}
+
+/// `bus.schema {op}` and MCP's `inputSchema` lift `payload` and `result` out on their own, so
+/// each must resolve every reference it makes (recursive `Entry` once left one dangling).
+#[test]
+fn every_rendered_schema_resolves_its_refs() {
+    for e in Registry::global().entries() {
+        let doc = relay_bus::schema::render_op(e.name).unwrap();
+        for half in ["payload", "result"] {
+            refs_resolve(&doc[half], &doc[half]["$defs"], &format!("{} {half}", e.name));
+        }
+    }
+    let whole = relay_bus::schema::render();
+    refs_resolve(&whole, &whole["$defs"], "bus.v1.json");
+}
+
+/// The Actor schema describes every actor the engine writes into results, and the parser
+/// accepts exactly the names its pattern does.
+#[test]
+fn actor_schema_and_parser_agree() {
+    for actor in [Actor::User, Actor::Test, Actor::System, Actor::agent("brisk-otter_2")] {
+        assert_eq!(Actor::parse(&actor.to_string()).unwrap(), actor);
+    }
+    let whole = relay_bus::schema::render();
+    let pattern = whole["$defs"]["Actor"]["pattern"].as_str().unwrap();
+    assert!(pattern.contains("system"), "events, audit rows and holds carry system: {pattern}");
+    for bad in ["agent:two words", "agent:a/b", "agent:a:b", "agent:é", &format!("agent:{}", "a".repeat(65))] {
+        assert!(Actor::parse(bad).is_err(), "{bad} is outside the published pattern");
+    }
+}
+
+/// Server-to-client envelopes ignore unknown fields (BUS.md §12); requests do not.
+#[test]
+fn only_requests_reject_unknown_envelope_fields() {
+    let response = r#"{"v":1,"id":null,"ok":false,"error":{"kind":"internal","code":"internal","message":"x","later":1},"later":true}"#;
+    assert!(serde_json::from_str::<Response>(response).is_ok());
+    let event = r#"{"v":1,"ev":"task.changed","ts":"2026-01-01T00:00:00Z","actor":"system","payload":{},"later":1}"#;
+    assert!(serde_json::from_str::<relay_bus::Event>(event).is_ok());
+    let request = r#"{"v":1,"id":"00000000-0000-0000-0000-000000000000","actor":"user","op":"bus.ping","payload":{},"later":1}"#;
+    assert!(serde_json::from_str::<Request>(request).is_err());
+}
+
+/// `bus.wait {matching}` is an object or absent; anything else used to mean "no filter".
+#[test]
+fn bus_wait_matching_must_be_an_object() {
+    let validate = Registry::global().get("bus.wait").unwrap().validate;
+    assert!(validate(&serde_json::json!({"matching": {"request_id": 7}})).is_ok());
+    assert!(validate(&serde_json::json!({"matching": null})).is_ok());
+    assert!(validate(&serde_json::json!({})).is_ok());
+    assert!(validate(&serde_json::json!({"matching": "request_id=7"})).is_err());
+    assert!(validate(&serde_json::json!({"matching": [{"request_id": 7}]})).is_err());
+}

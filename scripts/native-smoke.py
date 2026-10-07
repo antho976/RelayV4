@@ -6,9 +6,15 @@ from pathlib import Path
 import socket
 import subprocess
 import struct
+import sys
 import tempfile
 import time
 import uuid
+
+# Every check here is an assert statement, and some perform the action they check;
+# under -O they would vanish and the run would report success without doing anything.
+if sys.flags.optimize:
+    raise SystemExit("Run without python -O or PYTHONOPTIMIZE: this script checks with assert.")
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / ".impeccable/review"

@@ -9,10 +9,14 @@ use relay_bus::error::BusError;
 use relay_bus::ops::device::{Claim, Leases, LeasesOut, Release, ReleaseOut};
 use relay_bus::types::{Id, SessionState};
 use rusqlite::{Connection, OptionalExtension};
+use serde_json::Value;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub const ACQUIRED: &str = "device.lease.acquired";
 pub const RELEASED: &str = "device.lease.released";
+/// The longest the expiry sweeper sleeps before it looks again (and checks the engine is alive).
+const SWEEP_CAP: Duration = Duration::from_secs(30);
 
 pub fn register(e: &mut Engine) {
     e.register_unlocked::<Leases>(|ctx, _| {
@@ -115,7 +119,27 @@ pub(crate) fn acquire(ctx: &mut Ctx, lease: Lease) -> Result<(), BusError> {
     let taken = ctx.engine().device_leases.acquire(lease, &mut released);
     for gone in released { ctx.emit(RELEASED, gone.event()); }
     if taken? { ctx.emit(ACQUIRED, event); }
+    ensure_sweeper(ctx.engine());
     Ok(())
+}
+
+/// A lease that simply runs out is released by nobody, yet `device.busy` tells the waiting
+/// agent to `bus.wait` for `device.lease.released`. One thread per engine, alive only while a
+/// lease is held, sleeps on the lease map until the next expiry and announces it. It holds the
+/// engine weakly, so a dropped engine's sweeper ends at its next wake.
+fn ensure_sweeper(engine: &Engine) {
+    let Some(arc) = engine.arc() else { return };
+    if !engine.device_leases.start_sweeper() { return; }
+    let weak = Arc::downgrade(&arc);
+    drop(arc);
+    let leases = engine.device_leases.clone();
+    let _ = std::thread::Builder::new().name("lease-expiry".into()).spawn(move || {
+        while let Some(gone) = leases.wait_expired(SWEEP_CAP) {
+            let Some(engine) = weak.upgrade() else { return };
+            if engine.is_quitting() { return; }
+            for lease in gone { engine.emit_system(RELEASED, lease.event()); }
+        }
+    });
 }
 
 /// Refuse early, before any slow work, when `holder` could not take `device`.
@@ -132,12 +156,21 @@ pub(crate) fn gate_command(ctx: &mut Ctx, session_id: Id, session: &str, command
     acquire(ctx, Lease::new(&found.device, holder, Kind::Shell, &found.action, Some(device_lease::SHELL_RUNNING)))
 }
 
-/// A tool call finished (PostToolUse) or the turn stopped: a shell lease it took now only
-/// lasts for the grace period.
-pub(crate) fn command_finished(engine: &Engine, session_id: Id, command: Option<&str>, turn_ended: bool) {
-    if turn_ended || command.is_some_and(|command| device_lease::device_command(command).is_some()) {
-        engine.device_leases.shell_finished(session_id);
+/// A tool call finished (PostToolUse) or the turn stopped. `tool_input` is the hook's, when it
+/// has one. A shell lease lasts only the grace period once every device command under it has
+/// finished; a command sent to the background (`run_in_background`, or a trailing `&`) has
+/// not, though its PostToolUse arrives at once, so its lease keeps the full term.
+pub(crate) fn command_finished(engine: &Engine, session_id: Id, tool_input: Option<&Value>, turn_ended: bool) {
+    if turn_ended {
+        engine.device_leases.shell_turn_ended(session_id);
+        return;
     }
+    let Some(command) = tool_input.and_then(|input| input.get("command")).and_then(Value::as_str) else { return };
+    let Some(found) = device_lease::device_command(command) else { return };
+    let line = command.trim_end();
+    let background = tool_input.and_then(|input| input.get("run_in_background")).and_then(Value::as_bool).unwrap_or(false)
+        || (line.ends_with('&') && !line.ends_with("&&"));
+    engine.device_leases.shell_command_finished(session_id, &found.device, background);
 }
 
 /// Release a finished run's lease, from its worker (no request open).

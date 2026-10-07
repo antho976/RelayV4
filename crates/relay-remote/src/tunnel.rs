@@ -8,15 +8,19 @@ use crate::rendezvous::{Lane, MAX_LANE_LINE};
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-/// The host URL for a rendezvous config.
+/// The host URL for a rendezvous config. The room secret is not in it: `dial` sends it in a
+/// header, so a proxy in front of the server never writes it to its access log.
 pub fn host_url(r: &Rendezvous) -> String {
-    format!("{}/host/{}?secret={}", r.url, r.room, r.secret)
+    format!("{}/host/{}", r.url, r.room)
 }
 
 /// The URL a phone uses to reach this room.
@@ -33,15 +37,21 @@ pub fn spawn(ctx: Arc<Ctx>, rendezvous: Rendezvous) -> JoinHandle<()> {
         loop {
             // Each attempt is its own task, so a panic inside a dial is a logged, retried failure
             // rather than the silent end of the tunnel; the guard takes it down with this one.
+            let connected = Arc::new(AtomicBool::new(false));
             let attempt = {
-                let (ctx, rendezvous) = (ctx.clone(), rendezvous.clone());
-                tokio::spawn(async move { connect_once(ctx, &rendezvous).await })
+                let (ctx, rendezvous, connected) = (ctx.clone(), rendezvous.clone(), connected.clone());
+                tokio::spawn(async move { connect_once(ctx, &rendezvous, &connected).await })
             };
             let _guard = AbortOnDrop(attempt.abort_handle());
-            match attempt.await {
+            let outcome = attempt.await;
+            // A connection that came up was a success however it ended (most end in an error:
+            // a dropped socket, the silence limit); the next dial starts from the shortest wait.
+            if connected.load(Ordering::Acquire) {
+                backoff = Duration::from_secs(1);
+            }
+            match outcome {
                 Ok(Ok(())) => {
                     tracing::info!(url = %rendezvous.url, "rendezvous closed; reconnecting");
-                    backoff = Duration::from_secs(1);
                 }
                 Ok(Err(e)) => {
                     tracing::warn!(url = %rendezvous.url, error = %e, retry_s = backoff.as_secs(), "rendezvous unreachable");
@@ -72,16 +82,58 @@ pub fn ensure_crypto_provider() {
 const PING_EVERY: Duration = Duration::from_secs(30);
 const SILENCE_LIMIT: Duration = Duration::from_secs(90);
 
+/// How long a dial may take, TCP, TLS and the upgrade together. A peer that accepts and never
+/// answers would otherwise hold the tunnel down, unlogged, until TCP gives up.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
+
+type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// Open the host socket, with the room secret in an `Authorization` header. A server from
+/// before the header refuses that; it is dialed again the old way, secret in the query.
+async fn dial(r: &Rendezvous) -> Result<Ws> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+    use tokio_tungstenite::tungstenite::{http, Error};
+    // Nagle off: every line is its own message, flushed at once.
+    let connect = |request| tokio_tungstenite::connect_async_with_config(request, None, true);
+    let mut request = host_url(r).into_client_request()?;
+    request
+        .headers_mut()
+        .insert(http::header::AUTHORIZATION, http::HeaderValue::from_str(&format!("Bearer {}", r.secret))?);
+    match connect(request).await {
+        Ok((ws, _)) => Ok(ws),
+        Err(Error::Http(resp)) if resp.status() == http::StatusCode::FORBIDDEN => {
+            tracing::warn!(url = %r.url, "the rendezvous only reads the room secret from the URL, where its proxy logs record it; update `relay remote rendezvous` there");
+            let legacy = format!("{}?secret={}", host_url(r), r.secret).into_client_request()?;
+            Ok(connect(legacy).await?.0)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Every lane's task, aborted however `connect_once` ends.
+#[derive(Default)]
+struct Lanes(HashMap<String, (mpsc::Sender<String>, JoinHandle<()>)>);
+
+impl Drop for Lanes {
+    fn drop(&mut self) {
+        for (_, (_, task)) in self.0.drain() {
+            task.abort();
+        }
+    }
+}
+
 /// Requests from one phone waiting for its bridge. The shared loop never waits on a lane: a lane
 /// that lets this fill is closed, and the phone reconnects.
 const LANE_INBOUND: usize = 256;
 
-/// One connection's lifetime. `Ok` means the server closed cleanly.
-pub async fn connect_once(ctx: Arc<Ctx>, rendezvous: &Rendezvous) -> Result<()> {
-    let url = host_url(rendezvous);
-    let (ws, _) = tokio_tungstenite::connect_async(url.as_str())
-        .await
-        .with_context(|| format!("dialing {}", rendezvous.url))?;
+/// One connection's lifetime. `Ok` means the server closed cleanly; `connected` is set once the
+/// dial succeeded, whatever happens after.
+pub async fn connect_once(ctx: Arc<Ctx>, rendezvous: &Rendezvous, connected: &AtomicBool) -> Result<()> {
+    let ws = match tokio::time::timeout(DIAL_TIMEOUT, dial(rendezvous)).await {
+        Ok(ws) => ws.with_context(|| format!("dialing {}", rendezvous.url))?,
+        Err(_) => anyhow::bail!("dialing {}: no answer within {}s", rendezvous.url, DIAL_TIMEOUT.as_secs()),
+    };
+    connected.store(true, Ordering::Release);
     tracing::info!(url = %rendezvous.url, room = %rendezvous.room, "rendezvous connected");
     let (mut sink, mut source) = ws.split();
 
@@ -94,8 +146,9 @@ pub async fn connect_once(ctx: Arc<Ctx>, rendezvous: &Rendezvous) -> Result<()> 
             }
         }
     });
-
-    let mut lanes: HashMap<String, (mpsc::Sender<String>, JoinHandle<()>)> = HashMap::new();
+    // However this ends — an error, the silence limit, a close — the writer and every lane go.
+    let _writer = AbortOnDrop(writer.abort_handle());
+    let mut lanes = Lanes::default();
     let mut ping = tokio::time::interval(PING_EVERY);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_heard = tokio::time::Instant::now();
@@ -104,10 +157,6 @@ pub async fn connect_once(ctx: Arc<Ctx>, rendezvous: &Rendezvous) -> Result<()> 
             next = source.next() => next,
             _ = ping.tick() => {
                 if last_heard.elapsed() > SILENCE_LIMIT {
-                    for (_, (_, task)) in lanes.drain() {
-                        task.abort();
-                    }
-                    writer.abort();
                     anyhow::bail!("no traffic from the rendezvous for {}s", SILENCE_LIMIT.as_secs());
                 }
                 // Never wait here: with the writer backed up, the silence check above is the
@@ -123,13 +172,7 @@ pub async fn connect_once(ctx: Arc<Ctx>, rendezvous: &Rendezvous) -> Result<()> 
         let text = match msg {
             Ok(Message::Text(t)) => t.to_string(),
             Ok(Message::Close(_)) => break,
-            Err(e) => {
-                for (_, (_, task)) in lanes.drain() {
-                    task.abort();
-                }
-                writer.abort();
-                return Err(e).context("rendezvous socket");
-            }
+            Err(e) => return Err(e).context("rendezvous socket"),
             Ok(_) => continue,
         };
         let Ok(lane) = serde_json::from_str::<Lane>(&text) else {
@@ -170,37 +213,33 @@ pub async fn connect_once(ctx: Arc<Ctx>, rendezvous: &Rendezvous) -> Result<()> 
                     let _ = forward.await;
                     let _ = to_server.send(Message::text(Lane::Close { c: id }.to_line())).await;
                 });
-                lanes.insert(c, (in_tx, task));
+                lanes.0.insert(c, (in_tx, task));
             }
             Lane::Data { c, l } => {
-                let Some((tx, _)) = lanes.get(&c) else { continue };
+                let Some((tx, _)) = lanes.0.get(&c) else { continue };
                 match tx.try_send(l) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         // A lane whose bridge cannot keep up is closed rather than waited on:
                         // every other phone's lines go through this loop.
                         tracing::warn!(lane = %c, "lane fell behind; closing it");
-                        if let Some((_, task)) = lanes.remove(&c) {
+                        if let Some((_, task)) = lanes.0.remove(&c) {
                             task.abort();
                         }
                         let _ = to_server.try_send(Message::text(Lane::Close { c }.to_line()));
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
-                        lanes.remove(&c);
+                        lanes.0.remove(&c);
                     }
                 }
             }
             Lane::Close { c } => {
                 // The phone is gone; nothing it sent is still worth delivering.
-                if let Some((_, task)) = lanes.remove(&c) {
+                if let Some((_, task)) = lanes.0.remove(&c) {
                     task.abort();
                 }
             }
         }
     }
-    for (_, (_, task)) in lanes.drain() {
-        task.abort();
-    }
-    writer.abort();
     Ok(())
 }

@@ -268,6 +268,9 @@ async fn open(ctx: &Ctx, mut stream: TcpStream) -> Result<Option<tokio_tungsteni
         stream.shutdown().await?;
         return Ok(None);
     }
+    // Every bus line is its own message, flushed at once; with Nagle on, a line that follows
+    // another waits for the phone's delayed ACK.
+    let _ = stream.set_nodelay(true);
     let config = WebSocketConfig::default()
         .max_message_size(Some(MAX_MESSAGE))
         .max_frame_size(Some(MAX_MESSAGE));

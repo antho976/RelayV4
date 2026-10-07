@@ -352,6 +352,16 @@ impl<'a> Ctx<'a> {
     ) -> Result<Value, BusError> {
         self.invoke_with(op, payload, None)
     }
+    /// [`Ctx::invoke_registered`] with `op`'s prepare phase already run, unlocked, by
+    /// [`Unlocked::prepare_registered`] — `project.remove {force}` closing its sessions.
+    pub(crate) fn invoke_prepared(
+        &mut self,
+        op: &str,
+        payload: Value,
+        prepared: Option<Prepared>,
+    ) -> Result<Value, BusError> {
+        self.invoke_with(op, payload, prepared)
+    }
 
     fn invoke_with(
         &mut self,
@@ -484,7 +494,7 @@ pub struct Engine {
     pub(crate) device_runs: std::sync::Mutex<HashMap<Id, Arc<RunRuntime>>>,
     pub(crate) device_watch: std::sync::Mutex<DeviceWatchState>,
     pub(crate) next_mirror: AtomicI64,
-    pub(crate) watchers: std::sync::Mutex<HashMap<String, notify::RecommendedWatcher>>,
+    pub(crate) watchers: std::sync::Mutex<HashMap<String, crate::watch::Root>>,
     pub(crate) provider_updates: std::sync::Mutex<HashSet<String>>,
     pub(crate) creating_sessions: std::sync::Mutex<HashSet<String>>,
     pub(crate) watcher_registrations: std::sync::Mutex<HashSet<String>>,
@@ -497,6 +507,8 @@ pub struct Engine {
     pub(crate) resource_disk_refresh: std::sync::Mutex<(bool, Option<Instant>)>,
     /// Who holds which Android device (`device_lease`). Its own lock; never the store's.
     pub(crate) device_leases: crate::device_lease::Leases,
+    /// Serializes skill-folder refreshes (`skills::refresh_all`).
+    pub(crate) skill_refresh: crate::skills::Refresher,
 }
 
 impl Engine {
@@ -532,6 +544,7 @@ impl Engine {
             resource_disk: std::sync::Mutex::new(HashMap::new()),
             resource_disk_refresh: std::sync::Mutex::new((false, None)),
             device_leases: Default::default(),
+            skill_refresh: Default::default(),
         };
         crate::handlers::register_all(&mut engine);
         let arc = Arc::new(engine);
@@ -702,6 +715,7 @@ impl Engine {
     /// Kill every child (SPEC §14 persistence model: after a restart PTYs are dead and the
     /// resume flow takes over) and mark their sessions restorable. Idempotent.
     pub fn shutdown(&self) {
+        crate::handlers::integration::shutdown(self);
         for (_, mirror) in self.mirrors.lock().unwrap().drain() {
             mirror.stop();
         }

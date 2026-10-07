@@ -68,8 +68,9 @@ fn server_args_carry_the_requested_capture_size() {
 fn forward_args_use_ephemeral_port_and_scid_socket() {
     let args = mirror::forward_args("S", 0x00ff_0001);
     assert_eq!(args, vec!["-s", "S", "forward", "tcp:0", "localabstract:scrcpy_00ff0001"]);
-    let rm = mirror::forward_remove_args("S", 0x00ff_0001);
-    assert_eq!(rm, vec!["-s", "S", "forward", "--remove", "localabstract:scrcpy_00ff0001"]);
+    // `--remove` names the local end adb printed; a remote socket name is refused.
+    let rm = mirror::forward_remove_args("S", 40123);
+    assert_eq!(rm, vec!["-s", "S", "forward", "--remove", "tcp:40123"]);
 }
 
 #[test]

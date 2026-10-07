@@ -27,9 +27,10 @@ cd apps/relay-mobile && npm ci && npx tsc --noEmit -p tsconfig.json && npm run l
 Both run in CI. The Android build (`mobile-apk.yml`) runs on demand from the Actions tab or
 on a `mobile-v*` tag; an agent session has no Android SDK, so a change there is typechecked
 and linted, not run, and the summary must say so. Its PC-facing code is `lib/engine/Relay/`;
-the door it talks to is `crates/relay-remote`, whose integration tests exercise every bus
-payload the phone sends. The new screens use literal English strings; the rest of the app
-is localized (`i18n/`), so `i18next/no-literal-string` warns on them.
+the door it talks to is `crates/relay-remote`, whose integration tests send a selection of
+the bus payloads the phone sends, not all of them. Before changing an op the phone calls
+(`docs/MOBILE.md` names them per screen), check whether a remote test covers it. The new
+screens use literal English strings; the rest of the app is localized (`i18n/`), so `i18next/no-literal-string` warns on them.
 
 ## The native client cannot be built everywhere
 

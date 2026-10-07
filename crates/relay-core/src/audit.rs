@@ -17,11 +17,13 @@ pub const STORE_LIMIT: usize = 64 * 1024;
 /// window refresh. Their payloads are high-volume and near-identical, and 64 KB of each is what
 /// grew the audit table past the rest of the store put together. The hash still identifies the
 /// request and the result summary still replays it; only the readable copy is bounded.
+/// `guardrail.gate` is the hottest of all — the write hook sends it before every agent edit, with
+/// the edit's full new text — and its hold, when there is one, keeps its own frozen envelope.
 pub const CHATTY_STORE_LIMIT: usize = 2 * 1024;
 
 fn store_limit(op: &str) -> usize {
     match op {
-        "session.report" | "usage.report" => CHATTY_STORE_LIMIT,
+        "session.report" | "usage.report" | "guardrail.gate" => CHATTY_STORE_LIMIT,
         _ => STORE_LIMIT,
     }
 }

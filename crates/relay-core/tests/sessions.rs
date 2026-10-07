@@ -517,6 +517,36 @@ async fn session_lifecycle_over_socket() {
     drop(server);
 }
 
+/// Run `held` while another thread holds the store's one connection, as a slow handler would.
+/// The lock is let go when `held` returns or panics.
+fn with_store_held<T>(e: &Arc<Engine>, held: impl FnOnce() -> T) -> T {
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let engine = e.clone();
+    let holder = std::thread::spawn(move || {
+        let _conn = engine.store.lock();
+        locked_tx.send(()).unwrap();
+        let _ = release_rx.recv();
+    });
+    locked_rx.recv().unwrap();
+    let out = held();
+    drop(release_tx);
+    holder.join().unwrap();
+    out
+}
+
+/// Dispatch on a thread of its own; `None` when no answer came within `within`. The thread is
+/// left behind, to finish once whatever it waits on is let go.
+fn answer_within(e: &Arc<Engine>, op: &str, payload: Value, within: Duration) -> Option<Response> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let engine = e.clone();
+    let req = Request::new(Actor::User, op, payload);
+    std::thread::spawn(move || {
+        let _ = tx.send(engine.dispatch(req, Door::InProcess));
+    });
+    rx.recv_timeout(within).ok()
+}
+
 /// D148: input reaches the PTY without a transaction, and still carries the one state change
 /// that a keystroke owes the store — the idle→running edge — on a worker.
 #[test]
@@ -555,7 +585,19 @@ fn input_bypasses_the_store_but_still_wakes_an_idle_session() {
         .unwrap();
     e.pty(session_id).expect("spawned session has a PTY").set_idle(true);
 
-    ok(e, "session.input", json!({"session": &name, "data": "wake\n"}));
+    // The store is held, as a git scan or `adb devices` would hold it, while the keystroke
+    // arrives: it must still be answered, and only the idle edge waits for the lock.
+    with_store_held(e, || {
+        // The control: an op that does read the store queues behind the holder. If it did
+        // not, this test could not tell a keystroke that skips the store from one that waits.
+        assert!(
+            answer_within(e, "session.get", json!({"session": &name}), Duration::from_millis(300)).is_none(),
+            "session.get answered with the store held, so the hold below proves nothing",
+        );
+        let answer = answer_within(e, "session.input", json!({"session": &name, "data": "wake\n"}), Duration::from_secs(5))
+            .expect("session.input waited on the store lock (D148)");
+        assert!(answer.ok, "{:?}", answer.error);
+    });
     wait_until("idle session back to running", || state() == "running");
 
     // Every keystroke after the edge is pure memory: no further writes, and the echo still lands.
@@ -711,6 +753,25 @@ fn recovery_reaps_orphans_and_fscks() {
     assert_eq!(last["reaped_pids"], json!(report.reaped_pids));
     // dirty pooled worktree gets flagged (child.pid is untracked)
     assert!(report.dirty_worktrees.iter().any(|d| d == &wt.display().to_string()), "{report:?}");
+}
+
+#[test]
+fn recovery_leaves_alone_a_process_that_inherited_a_stale_pid() {
+    let f = fixture();
+    // An unrelated process that now holds the pid a crashed session recorded.
+    let mut bystander = Command::new("sleep").arg("30").spawn().unwrap();
+    let pid = bystander.id() as i64;
+    f.engine.store.lock().execute(
+        "INSERT INTO sessions(name, project_id, provider, role, branch, worktree, state, pid, token, epoch, created_at, updated_at)
+         VALUES ('stale-heron', 1, 'claude', 'builder', 'x', '/tmp', 'running', ?1, 't', 1, 'now', 'now')",
+        [pid],
+    ).unwrap();
+    let report = relay_core::recovery::run(&f.engine).unwrap();
+    assert!(alive(pid), "recovery killed a process that was not Relay's: {report:?}");
+    assert!(!report.reaped_pids.contains(&pid), "{report:?}");
+    assert!(report.fsck_fixes.iter().any(|x| x.contains("stale-heron") && x.contains("another process")), "{report:?}");
+    let _ = bystander.kill();
+    let _ = bystander.wait();
 }
 
 #[test]

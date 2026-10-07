@@ -4,7 +4,7 @@
 # checks are anim_rules.py's, shared with blender_anim_inspect; this script only poses.
 
 mesh = load(ARGS["mesh"], "skeletal mesh")
-anim = load(ARGS["animation"], "animation") if ARGS.get("animation") else None
+anim = load_animation(ARGS["animation"]) if ARGS.get("animation") else None
 skel = Skeleton(mesh)
 frame = body_frame(skel)
 times = sample_times(anim)
@@ -53,7 +53,7 @@ if ARGS.get("partner"):
     p_mesh = load(spec["mesh"], "partner skeletal mesh")
     partner = {
         "skel": Skeleton(p_mesh),
-        "anim": load(spec["animation"], "partner animation") if spec.get("animation") else None,
+        "anim": load_animation(spec["animation"], "partner animation") if spec.get("animation") else None,
         "place": (tuple(float(c) for c in spec.get("location", [0, 150, 0])), yaw_quat(float(spec.get("yaw", 180))), (1.0, 1.0, 1.0)),
         "time_offset": float(spec.get("time_offset", 0.0)),
     }
@@ -147,14 +147,20 @@ class Rig(object):
 
 
 result = inspect_animation(Rig(), times, ARGS, key="time", row_key="t")
+# A bone the animation could not pose was measured at the reference pose: say so, or the report
+# passes for an animation that never played.
+for who, sk in [("", skel)] + ([("partner ", partner["skel"])] if partner else []):
+    if sk.fallbacks:
+        result["problems"].append({"time": None, "kind": "sampling", "detail": "%d %sbones could not be posed from the animation and were measured at the reference pose: %s" % (
+            len(sk.fallbacks), who, ", ".join(sorted(sk.fallbacks)[:8]))})
 
 # Sides at the reference pose: the quickest way to catch an item on the wrong hand.
 attach_sides = {}
+first = skel.component_pose(skel.local_pose(anim, times[0])) if items else None
 for item in items.values():
     p = item.transform(ref_pose)[0]
     attach_sides[item.name] = {"attach": item.attach, "side": side(frame, p), "fwd_right_up": rnd(to_body(frame, p)),
                                "long_axis": item.long_axis, "length_cm": round(item.length, 1)}
-    first = skel.component_pose(skel.local_pose(anim, times[0]))
     a, b = item.point(first, "end_a"), item.point(first, "end_b")
     attach_sides[item.name]["end_a_at_start"] = rnd(to_body(frame, a))
     attach_sides[item.name]["end_b_at_start"] = rnd(to_body(frame, b))
@@ -164,7 +170,8 @@ emit({
     "animation": anim.get_path_name() if anim else None,
     "length_s": anim_length(anim) if anim else 0.0,
     "frame": {
-        "note": "Positions are [forward, right, up] in cm from the character's centre at ground level, derived from the skeleton's left/right bone pairs. right > 0 is the character's right hand side.",
+        "note": "Positions are [forward, right, up] in cm from the character's centre at ground level, derived from the skeleton's left/right bone pairs. right > 0 is the character's right hand side."
+                + ("" if frame["found_pairs"] else " No left/right pairs were found, so the axes are assumed: forward +Y, right -X in mesh space."),
         "right_axis_in_mesh_space": rnd(frame["right"], 3), "forward_axis_in_mesh_space": rnd(frame["forward"], 3),
         "left_right_pairs_found": frame["found_pairs"], "sample_pairs": frame["pairs"][:6],
     },

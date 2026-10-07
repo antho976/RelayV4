@@ -184,7 +184,8 @@ Every op is registered with, and the schema publishes:
 
 `noun.changed` (entity upserted; payload is the full entity), `noun.deleted` (payload `{id}`),
 plus domain events (`session.state`, `session.output` on the data plane, `guardrail.held`,
-`notify.new`, `integration.result`, `provider.version`, `resource.sample`). Rule: **every
+`notify.new`, `integration.result`, `provider.version`, `resource.sample`, `ui.changed` and
+`ui.toast` from the shell model of §6.5). Rule: **every
 mutation emits at least one event**, and every event's payload is reproducible by a query op.
 
 ---
@@ -238,11 +239,15 @@ fields; a payload that fails schema never reaches policy.
 
 ### 5.1 Ordering guarantees
 
-- Steps up to and including the handler run **serially per store** — one request at a time
-  mutates state (a single `tokio::sync::Mutex` around the engine's write side; queries may
-  read concurrently through the WAL). Latency budget: p99 < 5 ms for store-only ops. Anything
-  that takes longer (git, spawn, build) is a handler that returns quickly with a handle and
-  finishes via events (`integration.request` → `integration.result`).
+- Steps up to and including the handler run **serially per store**. The store is one SQLite
+  connection behind one `std::sync::Mutex`, and an ordinary handler runs inside a transaction
+  with it held, so one request at a time touches the store — reads included: a query waits for
+  the lock exactly as a mutation does, and WAL gives no concurrent readers here. Latency budget:
+  p99 < 5 ms for store-only ops; a request that holds or waits for the lock 16 ms or more is
+  logged at `warn` (`store lock over budget`). Slow work therefore belongs in one of the other
+  two handler shapes below, or behind a handle that finishes via events (`integration.request`
+  → `integration.result`). A plain handler that runs a subprocess blocks every other request,
+  keystrokes included, for as long as it runs.
 - Audit append is in the **same SQLite transaction** as the mutation. If the audit row can't
   be written, the mutation didn't happen.
 - Events are emitted after the transaction commits.
@@ -281,8 +286,10 @@ fields; a payload that fails schema never reaches policy.
 
 Payloads are validated against the generated schema **before** policy runs, so a guardrail
 never sees a malformed request and an agent never receives a policy answer for a request that
-would have failed on shape anyway. Unknown fields are an error (`bus.schema`,
-`details.path`), not ignored — silently dropped fields are how v3 shipped no-ops.
+would have failed on shape anyway. Unknown fields are an error (`bus.schema`), not ignored —
+silently dropped fields are how v3 shipped no-ops. A `bus.schema` error carries no `details`:
+its `message` is serde's, which names the field for an unknown, missing or mistyped top-level
+field ("unknown field `x`, expected one of …") but gives no path into a nested value.
 
 ### 5.3 Idempotency
 
@@ -301,11 +308,17 @@ never pruned. `session.report` and `usage.report` keep 2 KB of readable payload 
 
 ### 5.4 Soft delete
 
-`task`, `module`, `note`, `file` (files go to `.relay/trash/<id>/`, not the OS trash) and
+`task`, `module`, `note`, `file` (files go to the primary checkout's `.relay/trash/<id>/`, not
+the OS trash, so removing a session's worktree does not take them along) and
 `session` (closed) are soft-deleted: `deleted_at` set, excluded from `list` unless
 `include_deleted: true`, restorable by `*.restore` for the grace window (`settings:
-undo.grace_days`, default 7), then hard-deleted by the reconcile pass. Hard delete is never an
-op an agent can call.
+undo.grace_days`, default 7; `0` keeps them), then hard-deleted by the reconcile pass. Hard
+delete is never an op an agent can call. A closed session's row stays, because audit, mailbox
+and task history name it; only its scrollback is dropped. The same pass keeps the notification
+table to read rows under 30 days, any row under 180 and at most 5,000, and the mailbox to
+messages under 30 days unless one is still unacked (180 at most), and drops guardrail holds
+answered more than 30 days ago (a confirmed one only once its session has closed). The engine runs it hourly on
+its own (not through the bus, so it lands no audit row); `app.reconcile` runs it now.
 
 ### 5.5 Undo
 
@@ -412,7 +425,7 @@ main window and returned `unavailable` / `ui.absent` headless. V4 never had it, 
 | `pty` | `session.attach {session, from_seq?, epoch?}` | `{v:1, stream:"pty", session, epoch, seq, data: base64}`, one frame per PTY read (up to 64 KiB) | socket lines, after a catch-up from the scrollback ring. A subscriber more than 1024 frames behind loses frames (the engine logs it) and should re-attach from its last `(epoch, seq)`. `epoch` increments on every spawn/wake and `seq` restarts within it; `session.scrollback` returns `{text, epoch, seq}` so a client can resume exactly |
 | `mirror` | `device.mirror.start` | `{v:1, stream:"mirror", mirror_id, seq, data}`: a base64 string is one H.264 packet; an object is the mirror's status (first, on every change, and a terminal one that ends the stream) | on the socket connection that started it; the mirror stops when that connection closes |
 | `logcat` | `device.run`, `device.build` | `{v:1, stream:"logcat", run_id, seq, data: line}` | a build streams Gradle output only, then ends; a subscriber that falls behind loses lines (logged) |
-| `log` | `app.log.tail` | none yet | declared, not implemented: the op emits `app.log.attached` and no frames follow. The engine logs to `relay serve`'s output, filtered by `RELAY_LOG` |
+| `log` | `app.log.tail` | none yet | declared, not implemented: the op answers `unavailable` / `bus.not_implemented` and attaches nothing. The engine logs to `relay serve`'s output, filtered by `RELAY_LOG` |
 
 Input to a PTY is a bus op (`session.input`, `audit: agent_only`), not a stream — it is
 low-volume in bytes and it matters who typed into whose terminal.
@@ -479,7 +492,9 @@ so no door computes this for itself.
 `session.input/resize/discard_restorable`, `audit.undo`, `guardrail.confirm/reject`,
 `guardrail.config.set`, `settings.*` mutations, `app.*` mutations, `workspace.*` and
 `project.*` mutations, `provider.refresh`, `worktree.*` mutations, `git.branch.clean_merged`,
-`integration.discard`, `device.*` mutations, `skill.*` mutations, `notify.settings.set`.
+`integration.discard`, `device.*` and `avd.*` mutations except `device.claim` / `device.release`,
+`skill.*` mutations, `notify.settings.set`. `app.resources.watch` is the one `app.*` mutation
+every actor may call; it only turns resource sampling on and off.
 SPEC §10 says no swarm: an agent never spawns, closes, or types into a session, full stop.
 
 **Layer 2 — row scope (runtime).** See *Own task / self* below: an op naming a `session` or a
@@ -493,8 +508,8 @@ allow-sets, straight from SPEC §3's agent action list plus reads:
 
 | role | may call |
 |---|---|
-| `builder` | all queries · `task.move` (own, `active → in_review`) · `task.link_commit` · `task.changelog.write` (own) · `task.update` (own; body/changelog only) · `mailbox.*` · `notes.append` · `overlap.flag/ack` · `integration.request` · `session.done/report/intent/claim/release` (self) · `usage.report` · `guardrail.gate/check` |
-| `reviewer` | all queries · `mailbox.*` · `notes.append` · `overlap.flag` · `task.changelog.write` on the reviewed task · `session.done/report/intent/claim/release` (self) · `usage.report` · `guardrail.check` — **nothing** that writes files, commits, or moves the task |
+| `builder` | all queries · `task.move` (own, `active → in_review`) · `task.link_commit` · `task.changelog.write` (own) · `task.update` (own; body/changelog only) · `mailbox.*` · `notes.append` · `overlap.flag/ack` · `integration.request` · `session.done/report/intent/claim/release` (self) · `device.claim/release` · `usage.report` · `guardrail.gate/check` |
+| `reviewer` | all queries · `mailbox.*` · `notes.append` · `overlap.flag` · `task.changelog.write` on the reviewed task · `session.done/report/intent/claim/release` (self) · `device.claim/release` · `usage.report` · `guardrail.check` — **nothing** that writes files, commits, or moves the task |
 | `docs` | builder's set minus `task.link_commit`/`integration.request`, plus `notes.create/update` |
 
 Session options widen a role deliberately, per session, never by default:
@@ -538,8 +553,11 @@ Claude Code and Codex write files with their **own** tools and commit with their
 callers of it wherever the provider lets us:
 
 - **`guardrail.gate`** (mutation · agent · session) — `{session, kind: "write" | "commit" |
-  "exec", path?, new_text?, diff?, command?}` → `{verdict: "allow" | "refuse" | "hold",
-  error?: BusError}`. Unlike `guardrail.check` (a pure dry run) it may **create a hold** and it
+  "exec", path?, new_text?, diff?, command?}` → `{verdict: "allow"}`. A refusal is not a
+  verdict: it arrives as `ok: false` with a typed `refused` error, and a hold as a typed `held`
+  error whose `confirm` carries `{hold_id}`, so a caller checks `ok` before `result`. (The result
+  type still declares `refuse`/`hold`, `error` and `hold_id`; the gate never sets them.
+  `guardrail.check`, the dry run, does return its verdict in the result.) Unlike `guardrail.check` (a pure dry run) it may **create a hold** and it
   is audited. It is what a hook calls; the hook fails the tool on `hold` as on `refuse`. A
   person who confirms the hold (`guardrail.confirm`) leaves a single-use pass for that exact
   action — same policy, kind, path, text, diff and command — so the agent's identical retry,
@@ -614,17 +632,21 @@ naming the request to make:
   {request_id}}` and, after a timeout, re-reads `guardrail.request.get`.
 - A **grant** lifts exactly one rule for exactly that session, in `guardrail.gate`, every
   enforcing `file.*` / `git.commit`, and (read-only) `guardrail.check`. `command` covers that
-  exact command (a trailing lone `*` covers anything after the words before it); every denied
-  command in a line needs its own. `path` covers protected paths, write roots (absolute prefix)
+  exact command, every word as written, quoted ones included (a `*` is the shell's glob, not a
+  wildcard), and a grant of several commands (`cd dist && rm -rf *`) covers only that whole
+  line; every denied command in a line needs its own. A grant ends with its session. `path` covers protected paths, write roots (absolute prefix)
   and large rewrites; never shape gates. `cap` raises the caps it names (`files=N lines=M`) or,
   naming neither, lifts them. A `once` grant is spent only when the action it let through was
   allowed, then announced as `guardrail.resolved {state: "used"}`.
   `guardrail.grant.revoke {request_id}` (user) ends one early; `guardrail.requests.list
   {project_id?, session?, state?: open|active|all}` lists them.
 - **No self-approval.** The answers are user-only on the bus. An agent's `exec` gate also refuses,
-  with the ungrantable `guardrail.self_approval`, any `relay` invocation that names a user-only
-  guardrail/settings answer or claims `--actor user|test`, and any line that sheds
-  `RELAY_SESSION`/sets `RELAY_ACTOR`. The socket does not authenticate the user actor, so this is
+  with the ungrantable `guardrail.self_approval`, any `relay q|cmd` invocation whose op (or
+  `cmd` envelope) is a user-only guardrail/settings answer, any call claiming `--actor
+  user|test`, any envelope claiming `"actor":"user"`, and any line that sheds `RELAY_SESSION`
+  (`unset`, `env -u`, `env -i`, `sudo`, …) or sets `RELAY_ACTOR`. Commands inside `sh -c`,
+  heredocs fed to a shell, scripts piped into one and interpreter `-c`/`-e` code are read too;
+  searching for the names (`rg guardrail.confirm`) is not an invocation. The socket does not authenticate the user actor, so this is
   best effort against the obvious route, not a security boundary.
 
 ### 9.6 Configuration layers
@@ -653,13 +675,13 @@ optional. Entity shapes are in §11. `Id = number`. Every project-scoped op take
 | `bus.schema` | query · global | `{ op?: string }` → `{ schema: JsonSchema }` (whole `bus.v1.json`, or one op's `{payload, result}`) |
 | `bus.ops` | query · global | `{ actor?: Actor }` → `{ ops: OpInfo[] }` — registry attributes plus the all-layers `call`/`why` verdict for the (given or calling) actor (§9.1) |
 | `bus.whoami` | query · global | `{}` → `{ actor, is_agent, session?, role?, project_id?, project?, worktree?, branch?, can_call: string[], write_roots: string[] }` — identity and capability in one call, for any actor (D119) |
-| `bus.wait` | query · global · socket only | `{ events?: string[], timeout_ms? = 60000, matching?: object }` → `{ event?: Event, timed_out }` — block until a matching event arrives. The wake-up an agent has instead of a poll loop; events fired before the call are not replayed, so read state first, then wait (D115). `matching` takes only an event whose payload has each given top-level key equal to the value given |
+| `bus.wait` | query · global · socket only | `{ events?: string[], timeout_ms? = 60000, matching?: object }` → `{ event?: Event, timed_out }` — block until a matching event arrives. The wake-up an agent has instead of a poll loop; events fired before the call are not replayed, so read state first, then wait (D115). `matching` takes only an event whose payload has each given top-level key equal to the value given; anything but an object is `bus.schema` |
 | `bus.subscribe` | query · global · socket only | `{ events?: string[] }` → `{ subscribed: string[] }` |
 | `bus.unsubscribe` | query · global · socket only | `{}` → `{}` |
 
 ### 10.2 app
 
-All `app.*` mutations are `user_only` (§9.1 layer 1).
+All `app.*` mutations except `app.resources.watch` are `user_only` (§9.1 layer 1).
 
 | op | attrs | payload → result |
 |---|---|---|
@@ -669,18 +691,18 @@ All `app.*` mutations are `user_only` (§9.1 layer 1).
 | `app.resources.get` | query | `{}` → `{ relay: {pid, rss_mb, cpu_pct}, panes: {session, pid, rss_mb, cpu_pct}[], worktrees: {path, disk_mb}[], store_mb, total_rss_mb }` |
 | `app.resources.watch` | mutation · never · global | `{ on: bool }` → `{}` — while any client watches, `resource.sample` events flow (§1.3); otherwise none |
 | `app.recovery.last` | query | `{}` → `{ at, reaped_pids: number[], fsck_fixes: string[], dirty_worktrees: string[], tasks_reset_offered: Id[] } \| null` — what crash recovery did at the last launch (SPEC §14) |
-| `app.log.tail` | query · stream | `{ level?: "trace"\|"debug"\|"info"\|"warn"\|"error", filter?: string }` → `{}` — emits `app.log.attached`; the `log` stream it declares sends no frames yet (§7) |
+| `app.log.tail` | query · stream | `{ level?: "trace"\|"debug"\|"info"\|"warn"\|"error", filter?: string }` → attaches `log` stream. **Not built yet:** answers `unavailable`/`bus.not_implemented`; the engine logs to stderr only |
 | `app.backup.now` | mutation · always · global | `{}` → `{ path, bytes }` |
 | `app.backup.list` | query | `{}` → `{ backups: {path, bytes, created_at, reason: "manual"\|"upgrade"}[] }` |
 | `app.import.v3` | mutation · always · global | `{ source: path, project_id: Id, dry_run?: bool }` — `source` is a v3 `.relay/` dir, its `relay.db`, or the repo containing it; one-time per source (`conflict`/`import.already_done`); mapping in DECISIONS D14 → `{ counts: {tasks, modules, notes, sessions}, id_map: {tasks: Record<old, new>, modules: Record<old, new>, notes: Record<old, new>}, warnings: string[] }` — the id map is also the audit row's `result_summary` |
 | `app.first_run.state` | query | `{}` → `{ needed: bool, steps: {workspace, providers, project, import}: "todo"\|"done"\|"skipped" }` |
-| `app.reconcile` | mutation · always · global | `{}` → `{ actions: string[] }` — the 60 s pass, on demand (tests); same action vocabulary as `app.recovery.last` |
+| `app.reconcile` | mutation · always · global | `{}` → `{ actions: string[] }` — the retention pass of §5.4, on demand; same action vocabulary as `app.recovery.last` |
 
 ### 10.3 audit
 
 | op | attrs | payload → result |
 |---|---|---|
-| `audit.list` | query · user | `{ project_id?, actor?, session_id?, op_prefix?, parent_req?, since?, until?, limit?: ≤1000 }` → `{ rows: AuditRow[] }` |
+| `audit.list` | query · user | `{ project_id?, actor?, session_id?, op_prefix?, parent_req?, since?, until?, limit?: ≤1000 }` → `{ rows: AuditRow[] }` — `since`/`until` take RFC 3339 with any offset, a bare date (UTC midnight) or epoch seconds/ms; anything else is `invalid`/`time.invalid` |
 | `audit.get` | query · user | `{ audit_id }` → `AuditRow` (with stored payload if kept) — both reads are `user_only`: stored payloads hold frozen actions, launch prompts and private mail |
 | `audit.undo` | mutation · always · undo none · global · user | `{ audit_id, force?: bool }` → `{ undone: Id, by: Id }` — `conflict`/`audit.not_undoable` if the row has no inverse or was already undone; `conflict`/`audit.stale` if the entity changed since (§5.5) |
 
@@ -741,15 +763,15 @@ unique; nothing else is.
 | `module.reopen` | mutation · always · inverse | `{ module_id }` → `Module` |
 | `module.delete` / `module.restore` | mutation · always · inverse | `{ module_id }` → `{}` / `Module` — delete unlinks tasks (they keep existing, `module_id: null`) |
 | `module.stats` | query | `{ project_id }` → same as `module.list.header` |
-| `module.changelog.draft` | query | `{ module_id, group_by?: "priority"\|"size" }` → `{ markdown, tasks: Id[] }` |
+| `module.changelog.draft` | query | `{ module_id, group_by?: "priority" }` (the only grouping built; any other value is `invalid` / `module.changelog_group`) → `{ markdown, tasks: Id[] }` |
 
 ### 10.7 notes / mailbox (SPEC §3, §12)
 
 | op | attrs | payload → result |
 |---|---|---|
-| `notes.list` | query | `{ project_id, pinned_only? }` → `{ notes: Note[] }` |
+| `notes.list` | query | `{ project_id, pinned_only?, include_deleted?, summary? }` → `{ notes: Note[] }` — `summary` cuts each `body` to its first 240 characters (`notes.get` has it whole) |
 | `notes.get` | query | `{ note_id }` → `Note` |
-| `notes.create` | mutation · always · inverse | `{ project_id, title?, body, pinned? }` → `Note` |
+| `notes.create` | mutation · always · inverse | `{ project_id, title?, body, pinned? }` → `Note` — a body is at most 1 MiB here, in `notes.update` and after `notes.append` (`invalid` / `notes.body`). `notes.changed` carries the note without its body, plus `body_bytes` |
 | `notes.update` | mutation · always · inverse | `{ note_id, title?, body?, pinned? }` → `Note` |
 | `notes.append` | mutation · always | `{ note_id?, project_id?, target?: "standing" \| "suggestions", text }` → `Note` — appends to an explicit note, the standing note by default, or the unpinned per-project Agent suggestions note. Suggestions require a bound agent with a current task; Relay adds timestamp, session, and task identity and never injects this note into a brief. |
 | `notes.pin` | mutation · always · inverse | `{ note_id, pinned: bool }` → `Note` |
@@ -834,14 +856,15 @@ Provider-neutral Markdown; the same for both providers.
 
 | op | attrs | payload → result |
 |---|---|---|
-| `guardrail.gate` | mutation · always · session · agent | `{ session, kind: "write"\|"commit"\|"exec", path?, new_text?, diff?, command? }` → `{ verdict: "allow"\|"refuse"\|"hold", error?: BusError, hold_id?: Id }` — the enforcement door (§9.3); may create a hold |
-| `guardrail.holds.list` | query | `{ project_id?, session?, open_only? = true }` → `{ holds: Hold[] }` |
+| `guardrail.gate` | mutation · always · session · agent | `{ session, kind: "write"\|"commit"\|"exec", path?, new_text?, diff?, command? }` → `{ verdict: "allow" }` — the enforcement door (§9.3); may create a hold. Refuse and hold arrive as typed `refused` / `held` errors, never as a verdict |
+| `guardrail.holds.list` | query | `{ project_id?, session?, open_only? = true, limit? (200, ≤1000) }` → `{ holds: Hold[] }` — newest first; a string over 64 KiB in `details` is cut to its first 4 KiB |
+| `guardrail.hold.get` | query · user | `{ hold_id, full? }` → `{ hold, request, elided? }` — the frozen action without its auth; unless `full`, each string over 64 KiB in `request.payload` or `hold.details` is cut to its first 4 KiB and its JSON pointer listed in `elided`. `guardrail.confirm` replays the stored action whole |
 | `guardrail.confirm` | mutation · always · user | `{ hold_id, scope? }` → `{ hold: Hold, outcome: Response }` (§9.4); for an exception request `scope` is `once`\|`session` and nothing is replayed (§9.5) |
 | `guardrail.reject` | mutation · always · user | `{ hold_id, reason? }` → `{ hold: Hold }` |
 | `guardrail.config.get` | query | `{ workspace_id? \| project_id? }` → `GuardrailConfig` (§9.6) |
 | `guardrail.config.set` | mutation · always · inverse · user | `{ workspace_id? \| project_id?, patch: Partial<GuardrailConfig> }` → `GuardrailConfig` — patches that one layer's overrides |
 | `guardrail.config.layers` | query | `{ workspace_id? \| project_id? }` → `{ scope, workspace_id?, project_id?, effective, inherited, overrides, sources }` (§9.6) |
-| `guardrail.request` | mutation · always · session · agent (every role) | `{ session, kind, value, reason, scope? }` → `{ request: GuardrailException, created, wait_for }` (§9.5) |
+| `guardrail.request` | mutation · always · session · agent (every role) | `{ session, kind, value, reason, scope? }` → `{ request: GuardrailException, created, wait_for }` (§9.5); `reason` at most 4 KiB, `value` at most 8 KiB |
 | `guardrail.request.get` | query | `{ request_id }` → `GuardrailException` |
 | `guardrail.requests.list` | query | `{ project_id?, session?, state?: "open"\|"active"\|"all" }` → `{ requests: GuardrailException[] }` |
 | `guardrail.grant.revoke` | mutation · always · user | `{ request_id }` → `GuardrailException` |
@@ -860,7 +883,7 @@ Provider-neutral Markdown; the same for both providers.
 |  |  | **`worktree` throughout `git.*` and `file.*`:** omitted, it is the caller's own session worktree for an agent and the project root for the user. `"@project"` asks for the project root explicitly. Defaulting an agent to the project root returned confident, well-formed, wrong answers with no error either way (D111) |
 | `git.diff` | query | `{ project_id, worktree?, base?, staged? }` → `{ files: DiffFile[] }` |
 | `git.diff.file` | query | `{ project_id, worktree?, path, base? }` → `{ old, new, hunks }` (for `@codemirror/merge`); refuses a binary file (`git.diff_binary`) or one whose old + new text passes 1 MiB (`git.diff_too_large`) before building the reply |
-| `git.log` | query | `{ project_id, worktree?, branch?, limit? = 200, graph? }` → `{ commits: Commit[] }` |
+| `git.log` | query | `{ project_id, worktree?, branch?, limit? = 200 }` → `{ commits: Commit[] }` |
 | `git.show` | query | `{ project_id, sha }` → `{ commit: Commit, files: DiffFile[] }` |
 | `git.branches` | query | `{ project_id, worktree? }` → `{ current, branches: Branch[] }` (with merged flag and session owner; `current` follows the selected worktree) |
 | `git.branch.create` | mutation · always · user | `{ project_id, worktree?, name, start_point?, checkout? = true }` → `{ name, head, worktree }` — validates with Git, conflicts on an existing branch, and creates only through the selected worktree |
@@ -873,7 +896,7 @@ Provider-neutral Markdown; the same for both providers.
 | `git.pr.open` | mutation · always | `{ project_id, worktree?, title?, body? }` → `{ url }` — `gh pr create` runs before the store lock, with a 25 s deadline; `git.pr_timeout` means the outcome is unknown |
 | `git.branch.clean_merged` | mutation · always | `{ project_id, dry_run? }` → `{ deleted: string[] }` — never touches branches with a live/parked session |
 | `git.suggest_message` | query | `{ project_id, worktree? }` → `{ message }` — heuristic subject from the diff |
-| `integration.request` | mutation · always | `{ project_id, sessions: string[] \| branches: string[], build?: bool = true, deploy?: DeviceRef }` → `Integration` (state `queued`; results via `integration.result` events) |
+| `integration.request` | mutation · always | `{ project_id, sessions: string[] \| branches: string[], build?: bool = true, deploy?: DeviceRef }` → `Integration` (state `queued`; results via `integration.result` events). An agent is held to its own project and refused `deploy`; an agent's request that builds (the project's `build_cmd`, run outside any sandbox) is `held` / `integration.agent_build` for a person to confirm unless the project's `guardrails.agent_builds` is on, while a merge-only request (`build: false`) goes straight through |
 | `integration.get` / `integration.list` | query | `{ integration_id }` / `{ project_id }` |
 | `integration.discard` | mutation · always | `{ integration_id }` → `{}` — removes the throwaway worktree |
 
@@ -884,7 +907,7 @@ All paths are relative to the worktree root; `..` and absolute paths are `invali
 
 | op | attrs | payload → result |
 |---|---|---|
-| `file.tree` | query | `{ project_id, worktree?, path? = "", depth? = 1, git_badges? = true }` → `{ entries: Entry[] }` (optional git badges; omits VCS metadata and high-churn build/cache directories) |
+| `file.tree` | query | `{ project_id, worktree?, path? = "", depth? = 1, git_badges? = true, limit? (2000, ≤5000) }` → `{ entries: Entry[], truncated?: {path: total} }` (optional git badges; omits VCS metadata and high-churn build/cache directories). Each directory lists at most `limit` entries, folders first; one cut short is named in `truncated` with its full count |
 | `file.read` | query | `{ project_id, worktree?, path, max_bytes? }` → `{ text?, bytes_b64?, mime, size, truncated }` |
 | `file.write` | mutation · always · project | `{ project_id, worktree?, path, text }` → `{ bytes, removed_lines, added_lines }` — guardrails §9.2 |
 | `file.create` | mutation · always | `{ project_id, worktree?, path, kind: "file"\|"dir", text? }` → `Entry` |
@@ -892,9 +915,10 @@ All paths are relative to the worktree root; `..` and absolute paths are `invali
 | `file.move` | mutation · always | `{ project_id, worktree?, path, into: string }` → `Entry` |
 | `file.delete` | mutation · always · inverse (restore) | `{ project_id, worktree?, path }` → `{ trash_id }` |
 | `file.restore` | mutation · always | `{ project_id, trash_id }` → `Entry` |
+| `file.trash.list` | query · user | `{ project_id, limit? (200, ≤1000) }` → `{ entries: {id, original_path, worktree, created_at, available}[] }` — the project's trashed files not yet restored or expired, newest first; `id` is the `trash_id` for `file.restore`, `available` whether the bytes are still on disk |
 | `file.import` | mutation · always | `{ project_id, worktree?, into, sources: path[] }` → `{ entries: Entry[] }` — OS drag-in |
 | `file.restore_head` | mutation · always · user | `{ project_id, worktree?, path }` → `Entry` — `git checkout -- <path>`: puts a tracked file back as `HEAD` has it. Nothing calls it for you: there is no post-hoc write watcher (§9.3, D163) |
-| `file.search` | query | `{ project_id, worktree?, query, glob?, regex?, limit? }` → `{ hits: {path, line, col, text}[] }`; searches regular text files only (a symlink only when it stays inside the worktree), skipping generated trees, files over 8 MiB and any with a NUL in the first 8 KiB |
+| `file.search` | query | `{ project_id, worktree?, query, glob?, regex?, limit? }` → `{ hits: {path, line, col, text, text_offset?}[] }`; `col` is the match's 1-based byte offset in the line, and `text` the line, or for one over 240 bytes a window of it around the match starting at byte `text_offset`; searches regular text files only (a symlink only when it stays inside the worktree), skipping generated trees, files over 8 MiB and any with a NUL in the first 8 KiB |
 
 ### 10.14 device (SPEC §9)
 
@@ -943,7 +967,7 @@ All paths are relative to the worktree root; `..` and absolute paths are `invali
 | op | attrs | payload → result |
 |---|---|---|
 | `notify.list` | query | `{ project_id?, unread_only?, category?, limit? }` → `{ notifications: Notification[] }` |
-| `dashboard.get` | query · global | `{}` → `{ projects: DashboardProject[], sessions_live: Peer[], in_review: Task[], holds_open: Hold[], notifications: Notification[], resources: {…as app.resources.get} }` — project workload counts, decisions, activity, and resource pulse in one round trip |
+| `dashboard.get` | query · global | `{}` → `{ projects: DashboardProject[], sessions_live: Peer[], in_review: Task[], holds_open: Hold[] (newest 100), notifications: Notification[], resources: {…as app.resources.get} }` — project workload counts, decisions, activity, and resource pulse in one round trip |
 | `notify.ack` / `notify.ack_all` | mutation · never | `{ notification_id }` / `{ category? }` → `{}` |
 | `notify.settings.get` / `notify.settings.set` | query / mutation · always · inverse | `{}` → `NotifySettings` / `{ patch }` → `NotifySettings` |
 | `settings.get` | query | `{ path?: string }` → `{ value }` — dotted path into the settings tree, whole tree if absent |
@@ -951,8 +975,10 @@ All paths are relative to the worktree root; `..` and absolute paths are `invali
 | `settings.reset` | mutation · always · inverse | `{ path? }` → `{ value }` |
 
 Settings tree top-level keys (each documented where its feature lands): `appearance`,
-`notifications`, `providers`, `guardrails`, `undo`, `parking`, `layout`, `theme`,
-`keybindings` (shortcut → op envelope, SPEC §2), `roles` (the §9.1 allow-sets).
+`notifications`, `providers`, `guardrails` (its `roles` are the §9.1 allow-sets), `undo`,
+`audit`, `usage`, `device`, `layout` (`layout.current.<project>`), `keybindings` (shortcut → op
+envelope, SPEC §2). Unread defaults were dropped (RA-253): `parking`, `theme` and a top-level
+`roles` are no longer part of the tree, though an arbitrary path can still be written.
 `guardrails` is the one subtree with a fixed shape: `settings.set` under it refuses a key the
 guardrail config does not know and reads the touched layers back the way `guardrail.config.set`
 does (`invalid`/`guardrail.config`); a stored key this build does not know is ignored with a
@@ -964,7 +990,7 @@ warning rather than failing every guardrail read.
 |---|---|---|
 | `ui.state` | query | `{}` → `{ project_id, page, panes: PaneInfo[], focused: PaneRef, windows: WindowInfo[] }` — the engine's model, not the native window's panes |
 | `ui.page.switch` | mutation · agent_only · inverse | `{ page: "agents"\|"code"\|"board"\|"modules"\|"dashboard"\|"skills"\|"plugins"\|"settings", project_id? }` → `{}` |
-| `ui.pane.open` | mutation · agent_only | `{ kind: PaneKind, target?: PaneTarget, at?: PaneRef \| "split_h" \| "split_v" \| "tab" }` → `{ pane: PaneRef }` — records the pane; the native client acts only on `target.session` (focuses that terminal), so e.g. `{kind:"diff", target:{sha}}` opens nothing on screen |
+| `ui.pane.open` | mutation · agent_only | `{ kind: PaneKind, target?: PaneTarget }` → `{ pane: PaneRef }` — records the pane; the native client acts only on `target.session` (focuses that terminal), so e.g. `{kind:"diff", target:{sha}}` opens nothing on screen |
 | `ui.pane.close` / `ui.pane.focus` | mutation · agent_only | `{ pane: PaneRef }` → `{}` |
 | `ui.pane.move` | mutation · agent_only | `{ pane: PaneRef, to: PaneRef, edge: "top"\|"bottom"\|"left"\|"right"\|"center" }` → `{}` |
 | `ui.layout.list` / `ui.layout.save` / `ui.layout.apply` / `ui.layout.delete` | mutation · always · inverse (save/delete) | `{ project_id }` / `{ project_id, name, state? }` / `{ project_id, name }` / `{ project_id, name }` — opaque shell state is stored in core and an apply emits `layout.changed` for the UI |
@@ -1091,6 +1117,7 @@ interface GuardrailConfig {
   shape_gates: { path: string; validator: "non_empty" | "json" | "json_non_empty_array" | "json_non_empty_object" }[];
   denied_commands: string[];   /* matched against parsed argv, never a raw substring */
   allowed_write_roots: string[]; /* absolute; the process temp dir is always allowed too */
+  agent_builds: boolean;  /* default false: an agent's integration build waits for a person */
   roles: { builder: string[]; reviewer: string[]; docs: string[] };
 }
 interface AuditRow { id; ts; req_id; parent_req: string | null; actor; on_behalf_of: Actor | null;
@@ -1117,7 +1144,8 @@ interface Device { serial; model; kind: "usb" | "avd"; state }
 
 - The envelope `v` is the schema major. v1 is this document.
 - **Additive changes** (new op, new optional payload field, new result field, new event, new
-  error code) do not bump `v`. Clients ignore unknown result fields; core rejects unknown
+  error code, new optional envelope field) do not bump `v`. Clients ignore unknown result and
+  envelope fields (`Response`, `Event`, frames and `BusError` are lenient); core rejects unknown
   payload fields (§5.2) — so a *new required* payload field is breaking, and a new optional one
   is not.
 - **Breaking changes** (removed op, renamed op, changed field type, new required field,

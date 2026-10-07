@@ -10,6 +10,7 @@
 
 use std::io;
 use std::process::{Command, ExitStatus, Output, Stdio};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// The longest the wait loop sleeps between checks on a child that has not exited yet.
@@ -19,12 +20,23 @@ const POLL_MAX: Duration = Duration::from_millis(5);
 /// every one of them cost a 5 ms sleep it had already outlived. The interval doubles from here,
 /// so a long-running child still settles onto the cheap `POLL_MAX` cadence.
 const POLL_MIN: Duration = Duration::from_micros(150);
+/// The most of each stream a caller gets back. The rest is still read, so the child never
+/// blocks on a full pipe, but dropped: a runaway child cannot grow the handler's memory.
+const MAX_OUTPUT: usize = 64 * 1024 * 1024;
+/// How long past the deadline the pipes may take to close. Killing the process group closes
+/// them at once; only a descendant that left the group (`setsid`, a daemonizing server) can
+/// hold them open, and the call does not wait for it.
+const DRAIN_GRACE: Duration = Duration::from_millis(250);
+/// How long a child past its deadline has to exit on SIGTERM before it is SIGKILLed.
+const TERM_GRACE: Duration = Duration::from_secs(1);
 
 /// Run `cmd` to completion, or kill it once `timeout` elapses.
 ///
 /// Returns `Ok(None)` when the child outlived the deadline. `stdin` is closed and both output
 /// pipes are drained on their own threads, so a child that writes more than a pipe buffer can
-/// never deadlock the wait.
+/// never deadlock the wait. Each stream keeps at most [`MAX_OUTPUT`] bytes, and the drains are
+/// waited on only until the deadline (plus [`DRAIN_GRACE`]): a pipe still held open by an escaped
+/// descendant yields what it has delivered so far.
 pub fn output_with_timeout(cmd: &mut Command, timeout: Duration) -> io::Result<Option<Output>> {
     run(cmd, None, timeout)
 }
@@ -66,8 +78,18 @@ fn run(cmd: &mut Command, input: Option<Vec<u8>>, timeout: Duration) -> io::Resu
                 interval = (interval * 2).min(POLL_MAX);
             }
             None => {
+                // SIGTERM first: git removes its `index.lock` and ref locks on SIGTERM, while a
+                // SIGKILLed git leaves them behind to block every later git command in that
+                // checkout (RA-160). Whatever still runs after the grace is killed outright.
                 #[cfg(unix)]
-                unsafe { libc::kill(-(pid as i32), libc::SIGKILL); }
+                {
+                    unsafe { libc::kill(-(pid as i32), libc::SIGTERM); }
+                    let grace = Instant::now() + TERM_GRACE;
+                    while Instant::now() < grace && matches!(child.try_wait(), Ok(None)) {
+                        std::thread::sleep(POLL_MAX);
+                    }
+                    unsafe { libc::kill(-(pid as i32), libc::SIGKILL); }
+                }
                 let _ = child.kill();
                 let _ = child.wait();
                 break None;
@@ -78,11 +100,9 @@ fn run(cmd: &mut Command, input: Option<Vec<u8>>, timeout: Duration) -> io::Resu
     // A short-lived probe must not leave descendants holding its pipes open.
     #[cfg(unix)]
     unsafe { libc::kill(-(pid as i32), libc::SIGKILL); }
-    let collect = |handle: Option<std::thread::JoinHandle<Vec<u8>>>| {
-        handle.and_then(|h| h.join().ok()).unwrap_or_default()
-    };
-    let stdout = collect(stdout);
-    let stderr = collect(stderr);
+    let until = deadline.max(Instant::now()) + DRAIN_GRACE;
+    let stdout = stdout.map(|drain| drain.collect(until)).unwrap_or_default();
+    let stderr = stderr.map(|drain| drain.collect(until)).unwrap_or_default();
     Ok(status.map(|status| Output {
         status,
         stdout,
@@ -101,12 +121,43 @@ pub fn quiet_network_git(cmd: &mut Command) {
         .args(["-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=60"]);
 }
 
-fn drain<R: io::Read + Send + 'static>(mut reader: R) -> std::thread::JoinHandle<Vec<u8>> {
+/// A pipe being read on its own thread into a buffer the caller can take at any time.
+struct Drain {
+    buf: Arc<Mutex<Vec<u8>>>,
+    /// Disconnects when the thread ends, which is the pipe reaching EOF (or failing).
+    done: mpsc::Receiver<()>,
+}
+
+impl Drain {
+    /// Wait for EOF until `until`, then take whatever has been read. A thread still blocked on
+    /// the pipe is left behind; it ends on its own when the last writer goes.
+    fn collect(self, until: Instant) -> Vec<u8> {
+        let _ = self.done.recv_timeout(until.saturating_duration_since(Instant::now()));
+        std::mem::take(&mut *self.buf.lock().unwrap_or_else(|poison| poison.into_inner()))
+    }
+}
+
+fn drain<R: io::Read + Send + 'static>(mut reader: R) -> Drain {
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let (done_tx, done) = mpsc::channel::<()>();
+    let shared = buf.clone();
     std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = io::Read::read_to_end(&mut reader, &mut buf);
-        buf
-    })
+        let _done = done_tx;
+        let mut chunk = vec![0u8; 64 * 1024];
+        loop {
+            match io::Read::read(&mut reader, &mut chunk) {
+                Ok(0) => break,
+                Ok(count) => {
+                    let mut buf = shared.lock().unwrap_or_else(|poison| poison.into_inner());
+                    let room = MAX_OUTPUT.saturating_sub(buf.len());
+                    buf.extend_from_slice(&chunk[..count.min(room)]);
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+    });
+    Drain { buf, done }
 }
 
 #[cfg(test)]
@@ -153,6 +204,28 @@ mod tests {
             .unwrap()
             .expect("draining the pipes keeps the child from blocking on write");
         assert_eq!(out.stdout.len(), 1_048_576);
+    }
+
+    #[test]
+    fn a_descendant_outside_the_group_cannot_hold_the_call_past_its_deadline() {
+        // `setsid` leaves the process group, so the group kill misses it and it keeps stdout open.
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "setsid sleep 4 & echo done"]);
+        let started = Instant::now();
+        let out = output_with_timeout(&mut cmd, Duration::from_millis(300)).unwrap().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2), "the drains outlived the deadline: {:?}", started.elapsed());
+        assert!(String::from_utf8_lossy(&out.stdout).contains("done"));
+    }
+
+    #[test]
+    fn output_past_the_cap_is_read_but_not_kept() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", &format!("head -c {} /dev/zero", MAX_OUTPUT + 1024 * 1024)]);
+        let out = output_with_timeout(&mut cmd, Duration::from_secs(20))
+            .unwrap()
+            .expect("the child is never blocked on a full pipe");
+        assert!(out.status.success());
+        assert_eq!(out.stdout.len(), MAX_OUTPUT);
     }
 
     #[test]

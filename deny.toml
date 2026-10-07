@@ -1,0 +1,24 @@
+# cargo-deny (https://embarkstudios.github.io/cargo-deny/), run by .github/workflows/deps.yml.
+# Locally: cargo deny check advisories bans sources
+#
+# Licenses are not checked: the workspace is UNLICENSED and published nowhere.
+
+[advisories]
+version = 2
+# Every advisory fails the check unless it is listed here, with the reason it does not apply.
+ignore = []
+# bisync 0.3.0 is yanked. gix-protocol 0.64 (gix 0.86) asks for exactly that version, so there
+# is nothing to move to until gix does; a warning keeps it visible without failing the check.
+yanked = "warn"
+
+[bans]
+# Duplicate versions are a build-time cost, not a hazard (rand 0.9 beside tungstenite's 0.10 is
+# one, RA-545); report them without failing.
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+# crates.io only: no git dependencies and no other registries.
+unknown-registry = "deny"
+unknown-git = "deny"

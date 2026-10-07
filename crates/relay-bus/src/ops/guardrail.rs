@@ -12,19 +12,40 @@ payload!(#[schemars(rename = "GuardrailGateIn")] GateIn {
     pub session: String, pub kind: GateKind, pub path: Option<String>, pub new_text: Option<String>,
     pub diff: Option<String>, pub command: Option<String>,
 });
-result!(#[schemars(rename = "GuardrailGateOut")] GateOut { pub verdict: Verdict, pub error: Option<BusError>, pub hold_id: Option<Id> });
+result!(#[schemars(rename = "GuardrailGateOut")] GateOut {
+    /// Always `allow`. A refusal arrives as a typed `refused` error and a hold as a typed `held`
+    /// error whose `confirm` names the hold, never as a verdict here (BUS.md §9.3).
+    pub verdict: Verdict,
+    /// Never set; a refusal is the response's `error`.
+    pub error: Option<BusError>,
+    /// Never set; a hold's id is in the `held` error's `confirm.payload`.
+    pub hold_id: Option<Id>,
+});
 op!(Gate, "guardrail.gate", GateIn => GateOut,
-    OpMeta::mutation(Scope::Session, 4, "The enforcement door: hooks call it before a write/commit/exec; may create a hold").actors(Actors::AgentOnly).emits(&["guardrail.held", "guardrail.refused", "guardrail.grant_used", "guardrail.resolved", "notify.new"]));
+    OpMeta::mutation(Scope::Session, 4, "The enforcement door: hooks call it before a write/commit/exec; may create a hold").actors(Actors::AgentOnly).emits(&["guardrail.held", "guardrail.refused", "guardrail.grant_used", "guardrail.resolved", "notify.new", "device.lease.acquired", "device.lease.released"]));
 
-payload!(#[schemars(rename = "GuardrailHoldsListIn")] HoldsListIn { pub project_id: Option<Id>, pub session: Option<String>, pub open_only: Option<bool> });
+payload!(#[schemars(rename = "GuardrailHoldsListIn")] HoldsListIn {
+    pub project_id: Option<Id>, pub session: Option<String>, pub open_only: Option<bool>,
+    /// Newest first; default 200, at most 1000.
+    pub limit: Option<u32>,
+});
 result!(#[schemars(rename = "GuardrailHoldsListOut")] HoldsListOut { pub holds: Vec<Hold> });
 op!(HoldsList, "guardrail.holds.list", HoldsListIn => HoldsListOut, OpMeta::query(Scope::Global, 4, "Holds, open by default"));
 
-payload!(#[schemars(rename = "GuardrailHoldGetIn")] HoldGetIn { pub hold_id: Id });
+payload!(#[schemars(rename = "GuardrailHoldGetIn")] HoldGetIn {
+    pub hold_id: Id,
+    /// Return every string whole, however large. By default a string over 64 KiB in the
+    /// payload or details is cut to its first 4 KiB and named in `elided`.
+    pub full: Option<bool>,
+});
 result!(#[schemars(rename = "GuardrailHoldGetOut")] HoldGetOut {
     pub hold: Hold,
-    /// The exact frozen action, with authentication material removed.
+    /// The exact frozen action, with authentication material removed. `guardrail.confirm`
+    /// replays the stored action whole, whatever was elided here.
     pub request: crate::envelope::Request,
+    /// JSON pointers (`/request/payload/new_text`, `/hold/details/reason`) of the strings cut short.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub elided: Vec<String>,
 });
 op!(HoldGet, "guardrail.hold.get", HoldGetIn => HoldGetOut,
     OpMeta::query(Scope::Global, 4, "Inspect the frozen action before deciding a hold").actors(Actors::UserOnly));

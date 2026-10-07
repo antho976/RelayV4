@@ -37,7 +37,11 @@ op!(Restore, "module.restore", IdIn => Module,
 payload!(#[schemars(rename = "ModuleStatsIn")] StatsIn { pub project_id: Id });
 op!(Stats, "module.stats", StatsIn => ModuleHeader, OpMeta::query(Scope::Project, 7, "Header stats only"));
 
-payload!(#[schemars(rename = "ModuleChangelogDraftIn")] ChangelogDraftIn { pub module_id: Id, pub group_by: Option<String> });
+payload!(#[schemars(rename = "ModuleChangelogDraftIn")] ChangelogDraftIn {
+    pub module_id: Id,
+    /// Only `"priority"`, the default; anything else is refused.
+    pub group_by: Option<String>,
+});
 result!(#[schemars(rename = "ModuleChangelogDraftOut")] ChangelogDraftOut { pub markdown: String, pub tasks: Vec<Id> });
 op!(ChangelogDraft, "module.changelog.draft", ChangelogDraftIn => ChangelogDraftOut, OpMeta::query(Scope::Project, 7, "Draft patch notes from done tasks' changelog fields"));
 
