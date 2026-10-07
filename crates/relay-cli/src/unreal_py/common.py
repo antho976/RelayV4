@@ -48,10 +48,60 @@ def save_asset(asset):
 
 
 def find_actor(key):
-    for actor in actor_subsystem().get_all_level_actors():
-        if actor.get_actor_label() == key or actor.get_path_name() == key or actor.get_name() == key:
-            return actor
+    for actors in (actor_subsystem().get_all_level_actors, transient_actors):
+        for actor in actors():
+            if actor.get_actor_label() == key or actor.get_path_name() == key or actor.get_name() == key:
+                return actor
     raise RuntimeError("no actor labelled or named %r in the open level - list them with ue_level_actors" % key)
+
+
+# ---- helper actors: Relay's own cameras and previews in the user's level
+
+def spawn_helper(cls, location, rotation=None):
+    """Spawn a temporary actor that is never saved: transient objects do not dirty their
+    package (MarkPackageDirty stops at RF_Transient), so a preview or capture leaves the level
+    unmodified and a later save-and-quit does not rewrite the .umap. Transient actors are not
+    copied into a play session; ue_play's capture camera uses a plain spawn for that reason.
+    Engines whose spawn_actor_from_class has no `transient` argument get a plain spawn."""
+    rotation = rotation if rotation is not None else unreal.Rotator()
+    try:
+        return actor_subsystem().spawn_actor_from_class(cls, location, rotation, transient=True)
+    except TypeError:
+        return actor_subsystem().spawn_actor_from_class(cls, location, rotation)
+
+
+def transient_actors():
+    """Actors in the editor level that get_all_level_actors leaves out: the transient ones, such
+    as Relay's helpers (and the world settings and builder brush, which match no helper)."""
+    try:
+        listed = set(a.get_path_name() for a in actor_subsystem().get_all_level_actors())
+        return [a for a in unreal.GameplayStatics.get_all_actors_of_class(editor_world(), unreal.Actor)
+                if a.get_path_name() not in listed]
+    except Exception:
+        return []
+
+
+def relay_state():
+    """State that outlives one tool call (each runs in a fresh scope) for the editor's life."""
+    import sys, types
+    state = sys.modules.get("_relay_state")
+    if state is None:
+        state = types.ModuleType("_relay_state")
+        state.maps_clean_before_relay = set()
+        sys.modules["_relay_state"] = state
+    return state
+
+
+def editor_map_package():
+    world = editor_world()
+    return world.get_outermost().get_name() if world else None
+
+
+def dirty_map_packages():
+    try:
+        return set(p.get_name() for p in unreal.EditorLoadingAndSavingUtils.get_dirty_map_packages())
+    except Exception:
+        return set()
 
 
 # ---- vector and quaternion math on plain tuples; quaternions are (x, y, z, w) like FQuat.
@@ -276,24 +326,3 @@ def side(frame, p, tolerance=3.0):
     r = to_body(frame, p)[1]
     return "right" if r > tolerance else ("left" if r < -tolerance else "center")
 
-
-SKIP_SEGMENT = ("finger", "thumb", "index", "middle", "ring", "pinky", "metacarpal", "twist", "ik_", "weapon",
-                "prop", "attach", "socket", "root", "camera", "correct", "_end", "tip", "eye", "jaw", "tongue")
-
-
-def body_segments(skel):
-    segs = []
-    for n in skel.names:
-        p = skel.parent[n]
-        low = n.lower()
-        if p is None or skel.parent.get(p) is None or any(k in low for k in SKIP_SEGMENT):
-            continue
-        segs.append((p, n))
-    return segs
-
-
-def segment_distance(p, a, b):
-    ab = sub(b, a)
-    denom = dot(ab, ab)
-    t = 0.0 if denom < 1e-9 else max(0.0, min(1.0, dot(sub(p, a), ab) / denom))
-    return length(sub(p, add(a, mul(ab, t))))

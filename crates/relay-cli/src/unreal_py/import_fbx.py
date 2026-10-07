@@ -23,13 +23,20 @@ def set_cvar(name, value):
     unreal.SystemLibrary.execute_console_command(editor_world(), "%s %s" % (name, value))
 
 
+def materials_wanted():
+    """Import materials and textures? Default yes for meshes, no for animations. The Rust side
+    passes materials=null when the caller did not say, which means the default, not False."""
+    wanted = ARGS.get("materials")
+    return (kind != "animation") if wanted is None else bool(wanted)
+
+
 def options():
     ui = unreal.FbxImportUI()
     ui.set_editor_property("import_mesh", kind != "animation")
     ui.set_editor_property("import_as_skeletal", kind in ("skeletal", "animation"))
     ui.set_editor_property("import_animations", kind == "animation" or bool(ARGS.get("animations")))
-    ui.set_editor_property("import_materials", bool(ARGS.get("materials", kind != "animation")))
-    ui.set_editor_property("import_textures", bool(ARGS.get("materials", kind != "animation")))
+    ui.set_editor_property("import_materials", materials_wanted())
+    ui.set_editor_property("import_textures", materials_wanted())
     ui.set_editor_property("mesh_type_to_import", {
         "static": unreal.FBXImportType.FBXIT_STATIC_MESH,
         "skeletal": unreal.FBXImportType.FBXIT_SKELETAL_MESH,

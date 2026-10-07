@@ -11,7 +11,7 @@
 use crate::unreal::{rpc_error, tool, tool_result};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -21,35 +21,28 @@ const SUPPORTED_PROTOCOLS: &[&str] = &["2026-07-28", "2025-11-25", FALLBACK_PROT
 /// Folders a file listing never enters.
 const SKIP_DIRS: [&str; 9] = [".git", "node_modules", ".relay", "Binaries", "Intermediate", "Saved", "DerivedDataCache", "target", ".venv"];
 const ASSET_EXTENSIONS: [&str; 7] = ["blend", "fbx", "obj", "glb", "gltf", "abc", "usd"];
+/// The most of a run's printed output (or failure text) a reply carries, like the Unreal server.
+/// run.py keeps no more than this of what the agent's script prints, so the pipe stays small too.
+const MAX_OUTPUT: usize = 60_000;
 
 const PY_COMMON: &str = include_str!("blender_py/common.py");
 const PY_INFO: &str = include_str!("blender_py/info.py");
 const PY_RUN: &str = include_str!("blender_py/run.py");
 const PY_RENDER: &str = include_str!("blender_py/render.py");
 const PY_RIG_CHECK: &str = include_str!("blender_py/rig_check.py");
-const PY_ANIM_INSPECT: &str = include_str!("blender_py/anim_inspect.py");
+// The checks are shared with ue_anim_inspect (`anim_rules.py`); the script only poses the rig.
+const PY_ANIM_INSPECT: &str = concat!(include_str!("anim_rules.py"), "\n", include_str!("blender_py/anim_inspect.py"));
 const PY_EXPORT: &str = include_str!("blender_py/export.py");
 const PY_MESH_CHECK: &str = include_str!("blender_py/mesh_check.py");
 
 pub fn serve() -> Result<u8> {
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::BufWriter::new(std::io::stdout());
-    for line in stdin.lock().lines() {
-        let line = line.context("reading MCP stdin")?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let response = match serde_json::from_str::<Value>(&line) {
-            Ok(message) => handle(&message),
-            Err(error) => Some(rpc_error(Value::Null, -32700, "Parse error", Some(json!({"message":error.to_string()})))),
-        };
-        if let Some(response) = response {
-            serde_json::to_writer(&mut stdout, &response)?;
-            stdout.write_all(b"\n")?;
-            stdout.flush()?;
-        }
-    }
-    Ok(0)
+    crate::mcp::serve_sync(handle, lane)
+}
+
+/// Each call is its own Blender process, so calls run side by side (RA-061); saves to one file
+/// are kept apart by the save lock. Sending to Unreal drives the one editor, so that waits its turn.
+fn lane(name: &str, _args: &Value) -> crate::mcp::Lane {
+    if name == "blender_to_unreal" { crate::mcp::Lane::Serial } else { crate::mcp::Lane::Parallel }
 }
 
 fn handle(message: &Value) -> Option<Value> {
@@ -204,6 +197,16 @@ fn call(name: &str, args: &Value) -> Result<Value> {
                 a["save_as"] = json!(target);
             }
             let file = args["file"].as_str().filter(|f| !f.is_empty()).map(|f| resolve(&root, f)).transpose()?;
+            // Two calls saving one .blend in a shared checkout: the second is refused up front by
+            // the lock, and a save over a file someone changed since it was opened (run.py checks
+            // this stamp, taken before Blender reads the file) is refused instead of losing work.
+            let target = a["save_as"].as_str().map(PathBuf::from).or_else(|| file.clone().filter(|_| args["save"] == true));
+            // Agent code meets the guardrail before it runs (RA-077; mcp::plugin_gate says what that can and cannot cover).
+            crate::mcp::plugin_gate("blender_python", file.as_deref(), &target.as_deref().into_iter().collect::<Vec<_>>())?;
+            let _lock = target.as_deref().map(|t| SaveLock::take(t, secs(args, 300))).transpose()?;
+            if let Some(file) = &file {
+                a["_opened"] = opened_stamp(file)?;
+            }
             run(PY_RUN, &a, file.as_deref(), secs(args, 300))
         }
         "blender_render" => {
@@ -383,9 +386,66 @@ fn failure_text(stdout: &str, stderr: &str) -> String {
     tail(&lines.join("\n"), 60)
 }
 
+/// The last `lines` lines, and at most `MAX_OUTPUT` bytes of them (cut on a char boundary).
 fn tail(text: &str, lines: usize) -> String {
     let all: Vec<&str> = text.lines().collect();
-    all[all.len().saturating_sub(lines)..].join("\n")
+    let out = all[all.len().saturating_sub(lines)..].join("\n");
+    let mut cut = out.len().saturating_sub(MAX_OUTPUT);
+    while !out.is_char_boundary(cut) {
+        cut += 1;
+    }
+    out[cut..].to_string()
+}
+
+/// The file as this run found it, before Blender reads it: run.py refuses to save over it once
+/// its mtime or size differ.
+fn opened_stamp(file: &Path) -> Result<Value> {
+    let meta = std::fs::metadata(file).with_context(|| format!("reading {}", file.display()))?;
+    let mtime_ns = meta.modified()?.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
+    Ok(json!({"path": file, "mtime_ns": mtime_ns, "size": meta.len()}))
+}
+
+/// `<file>.relay-lock` beside a .blend while a `blender_python` call that saves it runs; removed
+/// on drop. It names the time it expires, so one left by a killed server does not block forever.
+struct SaveLock(PathBuf);
+
+impl SaveLock {
+    fn take(target: &Path, timeout: Duration) -> Result<SaveLock> {
+        let mut path = target.as_os_str().to_owned();
+        path.push(".relay-lock");
+        let path = PathBuf::from(path);
+        let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        for _ in 0..2 {
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut lock) => {
+                    let until = now() + timeout.as_secs() + 60;
+                    let _ = write!(lock, "{}", json!({"pid": std::process::id(), "until": until}));
+                    return Ok(SaveLock(path));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Unreadable (or still being written): held for the longest a call can run.
+                    let until = std::fs::read_to_string(&path).ok()
+                        .and_then(|t| serde_json::from_str::<Value>(&t).ok()).and_then(|v| v["until"].as_u64())
+                        .or_else(|| {
+                            let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok()?;
+                            Some(modified.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() + 3660)
+                        });
+                    if until.is_some_and(|until| until > now()) {
+                        bail!("{} is being changed by another blender_python call that saves it (lock {}); wait for it to finish and run again on the saved file", target.display(), path.display());
+                    }
+                    let _ = std::fs::remove_file(&path);
+                }
+                Err(error) => return Err(error).with_context(|| format!("creating {}", path.display())),
+            }
+        }
+        bail!("could not lock {}", target.display())
+    }
+}
+
+impl Drop for SaveLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 fn to_unreal(root: &Path, args: &Value) -> Result<Value> {
@@ -520,6 +580,25 @@ mod tests {
         assert!(compare(&exported, &turned)[0].contains("rotated"));
     }
 
+    #[test]
+    fn output_is_capped_in_bytes_and_a_save_lock_excludes_a_second_saver() {
+        let long = format!("{}\n{}", "x".repeat(10), "é".repeat(MAX_OUTPUT));
+        let cut = tail(&long, 300);
+        assert!(cut.len() <= MAX_OUTPUT && cut.chars().all(|c| c == 'é'), "{}", cut.len());
+        assert_eq!(tail("a\nb\nc", 2), "b\nc");
+
+        let dir = tempfile::tempdir().unwrap();
+        let blend = dir.path().join("hero.blend");
+        let held = SaveLock::take(&blend, Duration::from_secs(60)).unwrap();
+        let refused = SaveLock::take(&blend, Duration::from_secs(60)).err().unwrap();
+        assert!(format!("{refused:#}").contains("another blender_python call"), "{refused:#}");
+        drop(held);
+        assert!(!dir.path().join("hero.blend.relay-lock").exists());
+        // One left by a killed server expires.
+        std::fs::write(dir.path().join("hero.blend.relay-lock"), r#"{"pid":1,"until":1}"#).unwrap();
+        assert!(SaveLock::take(&blend, Duration::from_secs(60)).is_ok());
+    }
+
     /// Runs every Blender script against a fixture built by `blender_py/tests/make_fixture.py`,
     /// with real Blender. Skipped where Blender is not installed (CI runners do not carry it).
     #[test]
@@ -633,7 +712,105 @@ mod tests {
             Err(error) => assert!(format!("{error:#}").contains("numpy"), "{error:#}"),
         }
 
+        // Another rig's action plays: Swing was made on Hero, so its slot does not auto-assign to
+        // Partner, and the pose stayed at rest. The slot is picked by the curves that resolve.
+        let partner = run(PY_RUN, &json!({"code": "a = bpy.data.objects['Partner']\nemit.__globals__['set_action'](a, 'Swing')\nbpy.context.scene.frame_set(20)\nprint(a.animation_data.action_slot.identifier, round(a.pose.bones['upper_arm.R'].rotation_euler.x, 2))"}), Some(&fixture), t).unwrap();
+        assert_eq!(partner["output"].as_str().unwrap().lines().last(), Some("OBHero 1.57"), "{partner}");
+        let foreign = run(PY_RUN, &json!({"code": "e = bpy.data.objects.new('Tmp', None)\nbpy.context.scene.collection.objects.link(e)\ne['foo'] = 1.0\ne.keyframe_insert('[\"foo\"]', frame=1)\nemit.__globals__['set_action'](bpy.data.objects['Partner'], e.animation_data.action.name)"}), Some(&fixture), t).unwrap_err();
+        assert!(format!("{foreign:#}").contains("animates nothing on Partner"), "{foreign:#}");
+
+        // A posed, unkeyed rig still measures its bind pose, which is what Unreal measures.
+        let posed = dir.path().join("posed.blend");
+        run(PY_RUN, &json!({"code": "h = bpy.data.objects['Hero']\nh.animation_data.action = None\nh.pose.bones['root'].scale = (0.5, 0.5, 0.5)", "save_as": posed}), Some(&fixture), t).unwrap();
+        assert_eq!(run(PY_RIG_CHECK, &json!({"armature": "Hero"}), Some(&posed), t).unwrap()["height_cm"], 178.0);
+        match run(PY_EXPORT, &json!({"path": dir.path().join("posed.fbx"), "objects": ["Hero"]}), Some(&posed), t) {
+            Ok(exported) => assert_eq!(exported["size_cm"][2], 178.0, "{exported}"),
+            Err(error) => assert!(format!("{error:#}").contains("numpy"), "{error:#}"),
+        }
+
+        // A rotation in quaternion (glTF imports) or axis-angle mode is a rotation too.
+        let turned = dir.path().join("turned.blend");
+        run(PY_RUN, &json!({"code": "import bmesh\nbpy.ops.wm.read_factory_settings(use_empty=True)\nfor name, mode in (('Quat', 'QUATERNION'), ('AxisAngle', 'AXIS_ANGLE'), ('Straight', 'QUATERNION')):\n    me = bpy.data.meshes.new(name)\n    bm = bmesh.new()\n    bmesh.ops.create_cube(bm, size=1.0)\n    bm.to_mesh(me)\n    bm.free()\n    o = bpy.data.objects.new(name, me)\n    bpy.context.scene.collection.objects.link(o)\n    o.rotation_mode = mode\n    if name != 'Straight':\n        o.rotation_euler = (0, 0, 0)\n        o.rotation_mode = 'XYZ'\n        o.rotation_euler = (0, 0, 1.5708)\n        o.rotation_mode = mode", "save_as": turned}), None, t).unwrap();
+        let info = run(PY_INFO, &json!({}), Some(&turned), t).unwrap();
+        let flags = |name: &str| info["objects"].as_array().unwrap().iter().find(|o| o["name"] == name).unwrap()["flags"].to_string();
+        assert!(flags("Quat").contains("rotation not applied") && flags("AxisAngle").contains("rotation not applied"), "{info}");
+        assert_eq!(flags("Straight"), "[]");
+
+        // An action reaches the rig through its mesh, and a tall subject fits a landscape image.
+        let shots = run(PY_RENDER, &json!({"out_dir": rendered, "objects": ["HeroBody"], "action": "Swing", "frames": [20], "views": ["front"], "width": 64, "height": 48}), Some(&fixture), t).unwrap();
+        assert_eq!((shots["armature"].as_str(), shots["action_slot"].as_str()), (Some("Hero"), Some("OBHero")), "{shots}");
+        let pillar = dir.path().join("pillar.blend");
+        run(PY_RUN, &json!({"code": "import bmesh\nbpy.ops.wm.read_factory_settings(use_empty=True)\nme = bpy.data.meshes.new('Pillar')\nbm = bmesh.new()\nbmesh.ops.create_cube(bm, size=1.0)\nfor v in bm.verts:\n    v.co.x *= 0.3\n    v.co.y *= 0.25\n    v.co.z *= 1.8\nbm.to_mesh(me)\nbm.free()\nbpy.context.scene.collection.objects.link(bpy.data.objects.new('Pillar', me))", "save_as": pillar}), None, t).unwrap();
+        let shots = run(PY_RENDER, &json!({"out_dir": rendered, "views": ["front"], "width": 64, "height": 48}), Some(&pillar), t).unwrap();
+        let png = shots["files"][0]["file"].as_str().unwrap();
+        let rows = run(PY_RUN, &json!({"code": format!("im = bpy.data.images.load({png:?})\nw, h = im.size\npx = list(im.pixels)\nrow = lambda y: [tuple(round(c, 3) for c in px[(y * w + x) * 4:(y * w + x) * 4 + 3]) for x in range(w)]\nprint(max(max(p) for p in row(0) + row(h - 1)) < 0.05, max(max(p) for p in row(h // 2)) > 0.3)")}), None, t).unwrap();
+        // The background is black (with dither); the pillar is grey.
+        assert_eq!(rows["output"].as_str().unwrap().lines().last(), Some("True True"), "the pillar is cut off at the top or bottom: {rows}");
+        let action_without_rig = run(PY_RENDER, &json!({"out_dir": rendered, "action": "Swing", "views": ["front"], "width": 64, "height": 48}), Some(&pillar), t).unwrap_err();
+        assert!(format!("{action_without_rig:#}").contains("needs one armature"), "{action_without_rig:#}");
+        let eevee = run(PY_RENDER, &json!({"out_dir": rendered, "views": ["front"], "width": 64, "height": 48, "engine": "eevee"}), Some(&pillar), t).unwrap();
+        assert!(eevee["engine"].as_str().unwrap().starts_with("BLENDER_EEVEE"), "{eevee}");
+
+        // Saving leaves no .blend1, and a save over a file that changed after it was opened is
+        // refused rather than undoing the other change.
+        let copy = dir.path().join("copy.blend");
+        std::fs::copy(&pillar, &copy).unwrap();
+        let saved = run(PY_RUN, &json!({"code": "bpy.data.objects['Pillar'].location.x = 1", "save": true, "_opened": opened_stamp(&copy).unwrap()}), Some(&copy), t).unwrap();
+        assert_eq!(saved["saved"], json!(copy.display().to_string()), "{saved}");
+        assert!(!dir.path().join("copy.blend1").exists(), "save left a .blend1 backup");
+        let lost = run(PY_RUN, &json!({"code": "import os\nos.utime(bpy.data.filepath, ns=(1, 1))", "save": true, "_opened": opened_stamp(&copy).unwrap()}), Some(&copy), t).unwrap_err();
+        assert!(format!("{lost:#}").contains("changed on disk after this run opened it"), "{lost:#}");
+
+        // A print loop is kept to its tail, in bytes as well as lines.
+        let chatty = run(PY_RUN, &json!({"code": "for i in range(200000):\n    print(i)\nprint('y' * 1000000)"}), None, t).unwrap();
+        let output = chatty["output"].as_str().unwrap();
+        assert!(output.len() <= MAX_OUTPUT && output.ends_with("yyy"), "{}", output.len());
+
         let broken = run(PY_RUN, &json!({"code": "raise ValueError('nope')"}), None, t).unwrap_err();
         assert!(format!("{broken:#}").contains("ValueError: nope"), "{broken:#}");
+    }
+
+    /// The anim_rules fixes (shared with ue_anim_inspect), on a variant of the fixture: a bar at
+    /// the left hand held by hand.R, the partner 55 cm ahead, a forward "Reach" with the right
+    /// arm and a "Sink" that drops the whole rig 1 cm by frame 10 and 5 cm by frame 20.
+    #[test]
+    fn anim_inspect_rules_hold_on_a_real_rig() {
+        let Ok(blender) = find_blender() else {
+            eprintln!("Blender not installed; skipping");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = dir.path().join("fixture.blend");
+        let maker = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/blender_py/tests/make_fixture.py");
+        Command::new(&blender).args(["-b", "--factory-startup", "--python"]).arg(&maker).arg("--").arg(&fixture).output().unwrap();
+        let t = Duration::from_secs(300);
+        let variant = dir.path().join("variant.blend");
+        run(PY_RUN, &json!({"code": "import bmesh\nfrom mathutils import Vector, Matrix\nhero = bpy.data.objects['Hero']\nbpy.data.objects['Partner'].location.y = -0.55\nme = bpy.data.meshes.new('Bar')\nbm = bmesh.new()\nbmesh.ops.create_cube(bm, size=1.0)\nfor v in bm.verts:\n    v.co = Vector((v.co.x * 0.1, v.co.y * 0.04, v.co.z * 0.04))\nbm.to_mesh(me)\nbm.free()\nbar = bpy.data.objects.new('Bar', me)\nbpy.context.scene.collection.objects.link(bar)\nbar.parent, bar.parent_type, bar.parent_bone = hero, 'BONE', 'hand.R'\nbar.matrix_world = Matrix.Translation((0.8, 0, 1.35))\nfor name, bone, path, keys in (('Sink', 'root', 'location', ((1, (0, 0, 0)), (10, (0, 0, -0.01)), (20, (0, 0, -0.05)))), ('Reach', 'upper_arm.R', 'rotation_euler', ((1, (0, 0, 0)), (20, (0, 0, 1.5708))))):\n    act = bpy.data.actions.new(name)\n    act.use_fake_user = True\n    hero.animation_data.action = act\n    pb = hero.pose.bones[bone]\n    pb.rotation_mode = 'XYZ'\n    for f, v in keys:\n        setattr(pb, path, v)\n        pb.keyframe_insert(path, frame=f)\n    setattr(pb, path, (0, 0, 0))",
+            "save_as": variant}), Some(&fixture), t).unwrap();
+        let kinds = |r: &Value, kind: &str| -> Vec<Value> { r["problems"].as_array().unwrap().iter().filter(|p| p["kind"] == kind).cloned().collect() };
+
+        // A grip written `bone:tail` exempts that hand's chain from the item's clearance.
+        let bar = |grips: Value| run(PY_ANIM_INSPECT, &json!({"armature": "Hero", "frames": [1], "attachments": [{"object": "Bar", "grips": grips}]}), Some(&variant), t).unwrap();
+        let gripped = bar(json!([{"point": "item:Bar:center", "bone": "hand.L:tail"}]));
+        assert_eq!(gripped["passed"], true, "{gripped}");
+        assert!(!kinds(&bar(json!([])), "clipping").is_empty(), "without the grip the bar clips the left hand");
+
+        // A touch excuses partner clipping only inside its window and only against its bone.
+        let reach = |bone: &str, window: [u32; 2]| run(PY_ANIM_INSPECT, &json!({"armature": "Hero", "action": "Reach", "frames": [1, 20],
+            "partner": {"armature": "Partner"},
+            "contacts": [{"a": "hand.R:tail", "b": format!("partner:{bone}"), "expect": "touch", "distance": 100, "window": window}]}), Some(&variant), t).unwrap();
+        let inside = reach("upper_arm.L", [20, 20]);
+        assert_eq!(inside["passed"], true, "{inside}");
+        let outside = kinds(&reach("upper_arm.L", [1, 1]), "partner_clipping");
+        assert!(outside.len() == 1 && outside[0]["frame"] == 20, "{outside:?}");
+        let elsewhere = kinds(&reach("head", [20, 20]), "partner_clipping");
+        assert!(elsewhere.len() == 1 && elsewhere[0]["detail"].as_str().unwrap().contains("upper_arm.L"), "{elsewhere:?}");
+
+        // Ground: the lowest point of each foot against the rest-pose floor, not the ankle.
+        let sink = run(PY_ANIM_INSPECT, &json!({"armature": "Hero", "action": "Sink", "frames": [1, 10, 20]}), Some(&variant), t).unwrap();
+        let ground = kinds(&sink, "ground");
+        assert!(!ground.is_empty() && ground.iter().all(|p| p["frame"] == 20), "{sink}");
+        assert_eq!(sink["samples"][0]["feet_height"]["foot.L"], 0.0, "{sink}");
+        assert_eq!(sink["samples"][1]["feet_height"]["foot.L"], -1.0);
     }
 }

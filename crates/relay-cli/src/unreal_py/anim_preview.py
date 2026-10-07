@@ -4,13 +4,15 @@
 #   pose    - move every preview animation to ARGS["time"]; returns where a probe bone should be
 #   check   - where that probe bone actually is (the editor applies a pose on its next tick)
 #   cleanup - destroy every "RelayPreview" actor
+# The actors are transient (spawn_helper), so the level is not left modified.
 
 PREFIX = "RelayPreview"
 subsystem = actor_subsystem()
 
 
 def previews():
-    return [a for a in subsystem.get_all_level_actors() if a.get_actor_label().startswith(PREFIX)]
+    # Transient actors are not in get_all_level_actors; older engines spawn plain ones.
+    return [a for a in subsystem.get_all_level_actors() + transient_actors() if a.get_actor_label().startswith(PREFIX)]
 
 
 def call_first(obj, names, *args):
@@ -22,7 +24,7 @@ def call_first(obj, names, *args):
 
 
 def skeletal_actor(label, mesh, anim, location, yaw):
-    actor = subsystem.spawn_actor_from_class(unreal.SkeletalMeshActor, unreal.Vector(*location), unreal.Rotator(roll=0.0, pitch=0.0, yaw=yaw))
+    actor = spawn_helper(unreal.SkeletalMeshActor, unreal.Vector(*location), unreal.Rotator(roll=0.0, pitch=0.0, yaw=yaw))
     actor.set_actor_label(label)
     actor.set_folder_path(PREFIX)
     comp = actor.get_editor_property("skeletal_mesh_component")
@@ -66,7 +68,7 @@ elif action == "setup":
         if isinstance(asset, unreal.SkeletalMesh):
             item = skeletal_actor(PREFIX + " " + spec["name"], asset, None, base, 0.0)
         else:
-            item = subsystem.spawn_actor_from_class(unreal.StaticMeshActor, unreal.Vector(*base), unreal.Rotator())
+            item = spawn_helper(unreal.StaticMeshActor, unreal.Vector(*base), unreal.Rotator())
             item.set_actor_label(PREFIX + " " + spec["name"])
             item.set_folder_path(PREFIX)
             item.get_editor_property("static_mesh_component").set_static_mesh(asset)

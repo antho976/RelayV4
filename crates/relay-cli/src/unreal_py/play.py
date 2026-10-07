@@ -85,7 +85,13 @@ elif action == "run":
     emit({"ok": True})
 elif action == "prepare_outside":
     # Python cannot spawn into a running game, but the game world is a copy of the level: a
-    # capture placed in the level before play exists in the game, found by its tag.
+    # capture placed in the level before play exists in the game, found by its tag. It cannot be
+    # transient (transient actors are not copied into play), so it does mark the level modified;
+    # a level that had no unsaved changes before is noted, and ue_editor_quit names it if its
+    # save then rewrites it.
+    level = editor_map_package()
+    if level and level not in dirty_map_packages():
+        relay_state().maps_clean_before_relay.add(level)
     for old in actor_subsystem().get_all_level_actors():
         if TAG in [str(t) for t in old.get_editor_property("tags")]:
             actor_subsystem().destroy_actor(old)

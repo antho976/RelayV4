@@ -395,16 +395,38 @@ async fn run(cli: Cli) -> Result<u8> {
 async fn claude_pre_tool(instance: Instance, actor_override: Option<&str>) -> Result<u8> {
     let mut raw = String::new();
     std::io::stdin().read_to_string(&mut raw)?;
-    let input: Value = serde_json::from_str(&raw).context("Claude hook input is not JSON")?;
+    let session = std::env::var("RELAY_SESSION").context("RELAY_SESSION is missing")?;
+    let input: Value = match serde_json::from_str(&raw) {
+        Ok(input) => input,
+        Err(error) => return Ok(cannot_check(&anyhow!(error).context("Claude hook input is not JSON"))),
+    };
+    match claude_payloads(&input, &session, hook_root(&input).as_deref()) {
+        Ok(payloads) => gate(instance, actor_override, input["tool_name"].as_str().unwrap_or("?"), payloads).await,
+        Err(error) => Ok(cannot_check(&error)),
+    }
+}
+
+/// The tool call itself could not be turned into gates — malformed input, or an edit whose
+/// result cannot be previewed. Blocked, like an outage, but said in its own words (RA-284):
+/// "guardrail unavailable" sent agents looking for an engine fault that was not there.
+fn cannot_check(error: &anyhow::Error) -> u8 {
+    eprintln!("RELAY cannot check this tool call, so it is blocked: {error:#}");
+    2
+}
+
+/// The gates a Claude Code PreToolUse call must pass, in order. Pure apart from reading the
+/// file an Edit changes, so that the gate judges the text the edit will leave.
+fn claude_payloads(input: &Value, session: &str, root: Option<&Path>) -> Result<Vec<Value>> {
     let tool = input["tool_name"]
         .as_str()
         .ok_or_else(|| anyhow!("Claude hook input has no tool_name"))?;
     let tool_input = input["tool_input"]
         .as_object()
         .ok_or_else(|| anyhow!("Claude hook input has no tool_input object"))?;
-    let session = std::env::var("RELAY_SESSION").context("RELAY_SESSION is missing")?;
-
-    let payloads = match tool {
+    let write = |path: &str, text: String| -> Result<Value> {
+        write_gate(root, session, Path::new(path), "new_text", json!(text))
+    };
+    Ok(match tool {
         "Bash" => {
             let command = required_string(tool_input, "command")?;
             let mut payloads = vec![json!({
@@ -412,63 +434,60 @@ async fn claude_pre_tool(instance: Instance, actor_override: Option<&str>) -> Re
                 "kind": "exec",
                 "command": command,
             })];
-            payloads.extend(shell_write_gates(&input, &session, command)?);
+            payloads.extend(shell_write_gates(input, root, session, command)?);
             payloads
         }
-        "Write" => vec![json!({
-            "session": session,
-            "kind": "write",
-            "path": hook_relative_path(&input, required_string(tool_input, "file_path")?)?,
-            "new_text": required_string(tool_input, "content")?,
-        })],
+        "Write" => vec![write(required_string(tool_input, "file_path")?, required_string(tool_input, "content")?.to_string())?],
         "Edit" => {
             let file_path = required_string(tool_input, "file_path")?;
-            let old = required_string(tool_input, "old_string")?;
-            let new = required_string(tool_input, "new_string")?;
-            let replace_all = tool_input.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
-            let current = std::fs::read_to_string(file_path)
-                .with_context(|| format!("reading edit target {file_path}"))?;
-            if !current.contains(old) {
-                anyhow::bail!("Edit old_string does not occur in {file_path}");
-            }
-            let next = if replace_all { current.replace(old, new) } else { current.replacen(old, new, 1) };
-            vec![json!({
-                "session": session,
-                "kind": "write",
-                "path": hook_relative_path(&input, file_path)?,
-                "new_text": next,
-            })]
+            let edit = (required_string(tool_input, "old_string")?, required_string(tool_input, "new_string")?,
+                tool_input.get("replace_all").and_then(Value::as_bool).unwrap_or(false));
+            vec![write(file_path, edited_text(file_path, &[edit])?)?]
         }
         // Kept for Claude versions that still expose the former batched edit tool.
         "MultiEdit" => {
             let file_path = required_string(tool_input, "file_path")?;
-            let mut next = std::fs::read_to_string(file_path)
-                .with_context(|| format!("reading multi-edit target {file_path}"))?;
             let edits = tool_input.get("edits").and_then(Value::as_array)
-                .ok_or_else(|| anyhow!("MultiEdit input has no edits array"))?;
-            for edit in edits {
-                let object = edit.as_object().ok_or_else(|| anyhow!("MultiEdit edit is not an object"))?;
-                let old = required_string(object, "old_string")?;
-                let new = required_string(object, "new_string")?;
-                if !next.contains(old) {
-                    anyhow::bail!("MultiEdit old_string does not occur in {file_path}");
-                }
-                next = if object.get("replace_all").and_then(Value::as_bool).unwrap_or(false) {
-                    next.replace(old, new)
-                } else {
-                    next.replacen(old, new, 1)
-                };
-            }
-            vec![json!({
-                "session": session,
-                "kind": "write",
-                "path": hook_relative_path(&input, file_path)?,
-                "new_text": next,
-            })]
+                .ok_or_else(|| anyhow!("MultiEdit input has no edits array"))?
+                .iter()
+                .map(|edit| {
+                    let object = edit.as_object().ok_or_else(|| anyhow!("MultiEdit edit is not an object"))?;
+                    Ok((required_string(object, "old_string")?, required_string(object, "new_string")?,
+                        object.get("replace_all").and_then(Value::as_bool).unwrap_or(false)))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            vec![write(file_path, edited_text(file_path, &edits)?)?]
         }
+        // A notebook is JSON whose cells Claude rewrites by id; rebuilding it here would be a
+        // second notebook editor. The path rules (protected paths, write roots) still meet it.
+        "NotebookEdit" => vec![write_gate(root, session, Path::new(required_string(tool_input, "notebook_path")?), "diff", json!(""))?],
         other => anyhow::bail!("unsupported Claude PreToolUse tool {other:?}"),
+    })
+}
+
+/// The text `file_path` holds after Claude's Edit/MultiEdit `edits` (old, new, replace_all),
+/// applied in order the way Claude applies them. An empty `old_string` on a file that does not
+/// exist yet (or is empty) creates it. Anything the edit tool itself would refuse fails here
+/// too, rather than letting the gate judge text the edit will never produce.
+fn edited_text(file_path: &str, edits: &[(&str, &str, bool)]) -> Result<String> {
+    anyhow::ensure!(!edits.is_empty(), "edit of {file_path} has no edits");
+    let mut next = match std::fs::read_to_string(file_path) {
+        Ok(text) => Some(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).with_context(|| format!("reading edit target {file_path}")),
     };
-    gate(instance, actor_override, tool, payloads).await
+    for (old, new, replace_all) in edits {
+        let creates = old.is_empty() && next.as_deref().is_none_or(str::is_empty);
+        next = Some(match next {
+            _ if creates => new.to_string(),
+            None => anyhow::bail!("edit target {file_path} does not exist"),
+            Some(_) if old.is_empty() => anyhow::bail!("an empty old_string only creates a new file; {file_path} already has content"),
+            Some(text) if !text.contains(old) => anyhow::bail!("old_string does not occur in {file_path}; re-read the file"),
+            Some(text) if *replace_all => text.replace(old, new),
+            Some(text) => text.replacen(old, new, 1),
+        });
+    }
+    next.ok_or_else(|| anyhow!("edit target {file_path} does not exist"))
 }
 
 /// How long a PreToolUse hook waits for the guardrail. Claude Code and Codex kill a hook after
@@ -490,6 +509,25 @@ async fn run_gates(
     payloads: Vec<Value>,
     deadline: Duration,
 ) -> Result<u8> {
+    match first_refusal(client, actor, token, payloads, deadline).await? {
+        None => Ok(0),
+        Some(error) => {
+            eprintln!("RELAY blocked {tool}: {}", refusal_text(error.as_ref()));
+            Ok(2)
+        }
+    }
+}
+
+/// Send each gate in order and stop at the first that does not allow: `Some(error)` names it
+/// (`Some(None)` when the guardrail failed without saying why). An unreachable or silent engine
+/// is an `Err`, which every caller treats as a block.
+async fn first_refusal(
+    client: impl std::future::Future<Output = Result<Client>>,
+    actor: Actor,
+    token: Option<String>,
+    payloads: Vec<Value>,
+    deadline: Duration,
+) -> Result<Option<Option<relay_bus::BusError>>> {
     let checks = async {
         let mut client = client.await?;
         for payload in payloads {
@@ -498,31 +536,32 @@ async fn run_gates(
                 request = request.with_token(token.clone());
             }
             let response = client.call(&request, |_| {}).await?;
-            if response.ok {
-                continue;
+            if !response.ok {
+                return Ok(Some(response.error));
             }
-            if let Some(error) = response.error {
-                eprintln!("RELAY blocked {tool}: {} ({})", error.message, error.code);
-                if let Some(hint) = error.hint.as_deref() {
-                    eprintln!("RELAY hint: {hint}");
-                }
-            } else {
-                eprintln!("RELAY blocked {tool}: guardrail returned no result");
-            }
-            return Ok(2);
         }
-        Ok(0)
+        Ok(None)
     };
     tokio::time::timeout(deadline, checks)
         .await
         .map_err(|_| anyhow!("the guardrail did not answer within {} s", deadline.as_secs_f32()))?
 }
 
+fn refusal_text(error: Option<&relay_bus::BusError>) -> String {
+    match error {
+        Some(error) => match error.hint.as_deref() {
+            Some(hint) => format!("{} ({})\nRELAY hint: {hint}", error.message, error.code),
+            None => format!("{} ({})", error.message, error.code),
+        },
+        None => "guardrail returned no result".to_string(),
+    }
+}
+
 /// Write gates for the files a shell command visibly writes (write_targets). Overwrites and
 /// deletions say how many lines go, so the destructive-write rule can weigh them; edits in
 /// place and appends carry an empty diff, which still meets protected paths, write roots and
 /// shape gates.
-fn shell_write_gates(input: &Value, session: &str, command: &str) -> Result<Vec<Value>> {
+fn shell_write_gates(input: &Value, root: Option<&Path>, session: &str, command: &str) -> Result<Vec<Value>> {
     let Some(cwd) = input["cwd"].as_str().map(PathBuf::from).or_else(|| std::env::current_dir().ok()) else {
         return Ok(Vec::new());
     };
@@ -533,7 +572,7 @@ fn shell_write_gates(input: &Value, session: &str, command: &str) -> Result<Vec<
                 write_targets::Effect::Overwrite | write_targets::Effect::Delete => removed_lines(&write.path),
                 write_targets::Effect::Append | write_targets::Effect::Modify => String::new(),
             };
-            write_gate(input, session, &write.path, "diff", json!(diff))
+            write_gate(root, session, &write.path, "diff", json!(diff))
         })
         .collect()
 }
@@ -568,44 +607,54 @@ async fn lifecycle_hook_report(instance: Instance, actor_override: Option<&str>,
 async fn codex_pre_tool(instance: Instance, actor_override: Option<&str>) -> Result<u8> {
     let mut raw = String::new();
     std::io::stdin().read_to_string(&mut raw)?;
-    let input: Value = serde_json::from_str(&raw).context("Codex hook input is not JSON")?;
+    let session = std::env::var("RELAY_SESSION").context("RELAY_SESSION is missing")?;
+    let input: Value = match serde_json::from_str(&raw) {
+        Ok(input) => input,
+        Err(error) => return Ok(cannot_check(&anyhow!(error).context("Codex hook input is not JSON"))),
+    };
+    match codex_payloads(&input, &session, hook_root(&input).as_deref()) {
+        Ok(payloads) => gate(instance, actor_override, input["tool_name"].as_str().unwrap_or("?"), payloads).await,
+        Err(error) => Ok(cannot_check(&error)),
+    }
+}
+
+/// The gates a Codex PreToolUse call must pass, in order.
+fn codex_payloads(input: &Value, session: &str, root: Option<&Path>) -> Result<Vec<Value>> {
     let tool = input["tool_name"].as_str().ok_or_else(|| anyhow!("Codex hook input has no tool_name"))?;
     let tool_input = input["tool_input"].as_object().ok_or_else(|| anyhow!("Codex hook input has no tool_input object"))?;
-    let session = std::env::var("RELAY_SESSION").context("RELAY_SESSION is missing")?;
     let command = required_string(tool_input, "command")?;
-    let payloads = match tool {
+    Ok(match tool {
         "Bash" => {
             let mut payloads = vec![json!({
                 "session": session,
                 "kind": "exec",
                 "command": command,
             })];
-            payloads.extend(shell_write_gates(&input, &session, command)?);
+            payloads.extend(shell_write_gates(input, root, session, command)?);
             payloads
         }
         // Codex edits files through apply_patch, whose `command` is the patch (Edit and Write
         // are matcher aliases for it). Each file meets the write gate, as Claude's Write and
         // Edit do; the patch text is not a command line to run exec rules on.
-        "apply_patch" | "Edit" | "Write" => patch_write_gates(&input, &session, command)?,
+        "apply_patch" | "Edit" | "Write" => patch_write_gates(input, root, session, command)?,
         other => anyhow::bail!("unsupported Codex PreToolUse tool {other:?}"),
-    };
-    gate(instance, actor_override, tool, payloads).await
+    })
 }
 
 /// One write gate per file an apply_patch touches. An added file carries its text and an
 /// updated one its text after the hunks, so shape gates can validate it; a deleted file says
 /// how many lines go. A moved file's source loses nothing, so only the path rules meet it.
-fn patch_write_gates(input: &Value, session: &str, patch: &str) -> Result<Vec<Value>> {
+fn patch_write_gates(input: &Value, root: Option<&Path>, session: &str, patch: &str) -> Result<Vec<Value>> {
     use write_targets::PatchOp;
     let cwd = input["cwd"].as_str().map(PathBuf::from).or_else(|| std::env::current_dir().ok())
         .ok_or_else(|| anyhow!("cannot tell which directory the patch is relative to"))?;
     let mut payloads = Vec::new();
     for op in write_targets::parse_patch(patch)? {
         match op {
-            PatchOp::Add { path, text } => payloads.push(write_gate(input, session, &cwd.join(path), "new_text", json!(text))?),
+            PatchOp::Add { path, text } => payloads.push(write_gate(root, session, &cwd.join(path), "new_text", json!(text))?),
             PatchOp::Delete { path } => {
                 let path = cwd.join(path);
-                payloads.push(write_gate(input, session, &path, "diff", json!(removed_lines(&path)))?);
+                payloads.push(write_gate(root, session, &path, "diff", json!(removed_lines(&path)))?);
             }
             PatchOp::Update { path, move_to, chunks } => {
                 let source = cwd.join(path);
@@ -617,10 +666,10 @@ fn patch_write_gates(input: &Value, session: &str, patch: &str) -> Result<Vec<Va
                 };
                 match move_to {
                     Some(to) => {
-                        payloads.push(write_gate(input, session, &source, "diff", json!(""))?);
-                        payloads.push(write_gate(input, session, &cwd.join(to), field, value)?);
+                        payloads.push(write_gate(root, session, &source, "diff", json!(""))?);
+                        payloads.push(write_gate(root, session, &cwd.join(to), field, value)?);
                     }
-                    None => payloads.push(write_gate(input, session, &source, field, value)?),
+                    None => payloads.push(write_gate(root, session, &source, field, value)?),
                 }
             }
         }
@@ -628,11 +677,11 @@ fn patch_write_gates(input: &Value, session: &str, patch: &str) -> Result<Vec<Va
     Ok(payloads)
 }
 
-fn write_gate(input: &Value, session: &str, path: &Path, field: &str, value: Value) -> Result<Value> {
+fn write_gate(root: Option<&Path>, session: &str, path: &Path, field: &str, value: Value) -> Result<Value> {
     let mut payload = json!({
         "session": session,
         "kind": "write",
-        "path": hook_relative_path(input, &path.to_string_lossy())?,
+        "path": hook_relative_path(root, &path.to_string_lossy())?,
     });
     payload[field] = value;
     Ok(payload)
@@ -667,24 +716,59 @@ fn required_string<'a>(object: &'a serde_json::Map<String, Value>, key: &str) ->
         .ok_or_else(|| anyhow!("hook input field {key:?} is missing or not a string"))
 }
 
+/// The worktree a hook judges paths against: Relay's own record of it, else the directory the
+/// provider ran the tool in, else the repository around this process.
+fn hook_root(input: &Value) -> Option<PathBuf> {
+    std::env::var_os("RELAY_WORKTREE")
+        .map(PathBuf::from)
+        .or_else(|| input["cwd"].as_str().map(PathBuf::from))
+        .or_else(cwd_repo_root)
+}
+
 /// The path `guardrail.gate` should judge. Inside the worktree it is worktree-relative, as
 /// the gate expects. Outside, the absolute path goes through unchanged: whether a write to
 /// scratch space is allowed is a policy question, and policy lives on the bus, not in this
 /// adapter (BUS.md §9.3). Refusing here produced "guardrail unavailable" for what was really
 /// a deliberate decision, and left the agent with nowhere legal to put a temporary file.
-fn hook_relative_path(input: &Value, raw_path: &str) -> Result<String> {
-    let path = PathBuf::from(raw_path);
-    let root = std::env::var_os("RELAY_WORKTREE")
-        .map(PathBuf::from)
-        .or_else(|| input["cwd"].as_str().map(PathBuf::from))
-        .or_else(cwd_repo_root)
-        .ok_or_else(|| anyhow!("cannot determine the Relay worktree"))?;
-    match path.strip_prefix(&root) {
-        Ok(relative) if relative.as_os_str().is_empty() => {
-            anyhow::bail!("write target is the worktree directory")
+///
+/// Symlinks are judged where they lead, since that is where the write lands: `link/key` with
+/// `link -> secrets` is `secrets/key` to the protected-path rules, a link out of the worktree
+/// is the absolute path it reaches, and a worktree reached through an aliased directory is
+/// still the worktree. A `..` the file system cannot resolve yet is left for the gate, which
+/// refuses it.
+fn hook_relative_path(root: Option<&Path>, raw_path: &str) -> Result<String> {
+    let root = root.ok_or_else(|| anyhow!("cannot determine the Relay worktree"))?;
+    let path = Path::new(raw_path);
+    let real_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let real = path.is_absolute().then(|| resolve_existing(path));
+    let relative = match (path.strip_prefix(root), real.as_deref().map(|real| real.strip_prefix(&real_root))) {
+        (_, Some(Ok(relative))) => relative,
+        (Ok(_), Some(Err(_))) => return Ok(real.unwrap_or_default().display().to_string()),
+        (Ok(relative), None) => relative,
+        (Err(_), _) => return Ok(path.display().to_string()),
+    };
+    if relative.as_os_str().is_empty() {
+        anyhow::bail!("write target is the worktree directory");
+    }
+    Ok(relative.display().to_string())
+}
+
+/// `path` with its longest existing prefix resolved through the file system (symlinks and
+/// `..` included) and the part that does not exist yet appended as written.
+fn resolve_existing(path: &Path) -> PathBuf {
+    let mut existing = path;
+    let mut rest = Vec::new();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(existing) {
+            return rest.iter().rev().fold(real, |acc: PathBuf, part: &&std::ffi::OsStr| acc.join(part));
         }
-        Ok(relative) => Ok(relative.display().to_string()),
-        Err(_) => Ok(path.display().to_string()),
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name);
+                existing = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
     }
 }
 
@@ -756,25 +840,166 @@ mod tests {
 
     #[test]
     fn shell_and_patch_writes_become_write_gates() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("data.ts"), "a\nb\nc").unwrap();
-        std::fs::write(root.path().join("lib.rs"), "fn a() {}\nfn b() {}\n").unwrap();
-        let input = json!({"cwd": root.path()});
-        let worktree_env = std::env::var_os("RELAY_WORKTREE");
-        let rel = |p: &str| if worktree_env.is_some() { root.path().join(p).display().to_string() } else { p.to_string() };
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("data.ts"), "a\nb\nc").unwrap();
+        std::fs::write(root.join("lib.rs"), "fn a() {}\nfn b() {}\n").unwrap();
+        let input = json!({"cwd": root});
+        let root = Some(root.as_path());
 
-        let gates = shell_write_gates(&input, "calm-otter", ": > data.ts && echo x >> notes.md").unwrap();
+        let gates = shell_write_gates(&input, root, "calm-otter", ": > data.ts && echo x >> notes.md").unwrap();
         assert_eq!(gates, [
-            json!({"session": "calm-otter", "kind": "write", "path": rel("data.ts"), "diff": "-\n-\n-\n"}),
-            json!({"session": "calm-otter", "kind": "write", "path": rel("notes.md"), "diff": ""}),
+            json!({"session": "calm-otter", "kind": "write", "path": "data.ts", "diff": "-\n-\n-\n"}),
+            json!({"session": "calm-otter", "kind": "write", "path": "notes.md", "diff": ""}),
         ]);
 
         let patch = "*** Begin Patch\n*** Update File: lib.rs\n@@\n-fn b() {}\n+fn c() {}\n*** Add File: new.rs\n+x\n*** Delete File: data.ts\n*** End Patch";
-        let gates = patch_write_gates(&input, "calm-otter", patch).unwrap();
+        let gates = patch_write_gates(&input, root, "calm-otter", patch).unwrap();
         assert_eq!(gates[0]["new_text"], "fn a() {}\nfn c() {}\n");
-        assert_eq!(gates[1], json!({"session": "calm-otter", "kind": "write", "path": rel("new.rs"), "new_text": "x\n"}));
+        assert_eq!(gates[1], json!({"session": "calm-otter", "kind": "write", "path": "new.rs", "new_text": "x\n"}));
         assert_eq!(gates[2]["diff"], "-\n-\n-\n");
         assert!(gates.iter().all(|g| g["kind"] == "write"));
-        assert!(patch_write_gates(&input, "calm-otter", "not a patch").is_err(), "an unreadable patch blocks");
+        assert!(patch_write_gates(&input, root, "calm-otter", "not a patch").is_err(), "an unreadable patch blocks");
+    }
+
+    /// A checkout with `src/lib.rs` holding "a b a\n", and a hook input builder for it.
+    fn checkout() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "a b a\n").unwrap();
+        (dir, root)
+    }
+
+    fn hook_input(root: &Path, tool: &str, tool_input: Value) -> Value {
+        json!({"hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": tool_input, "cwd": root})
+    }
+
+    #[test]
+    fn claude_tool_calls_become_the_gates_they_must_pass() {
+        let (_dir, root) = checkout();
+        let lib = root.join("src/lib.rs").display().to_string();
+        let gates = |tool: &str, tool_input: Value| claude_payloads(&hook_input(&root, tool, tool_input), "calm-otter", Some(&root));
+
+        let bash = gates("Bash", json!({"command": "cargo test && echo done > out.txt", "description": "test"})).unwrap();
+        assert_eq!(bash[0], json!({"session": "calm-otter", "kind": "exec", "command": "cargo test && echo done > out.txt"}));
+        assert_eq!(bash[1], json!({"session": "calm-otter", "kind": "write", "path": "out.txt", "diff": ""}));
+        assert_eq!(bash.len(), 2);
+
+        let write = gates("Write", json!({"file_path": root.join("docs/new.md"), "content": "hello\n"})).unwrap();
+        assert_eq!(write, [json!({"session": "calm-otter", "kind": "write", "path": "docs/new.md", "new_text": "hello\n"})]);
+
+        let edit = gates("Edit", json!({"file_path": lib, "old_string": "a", "new_string": "x"})).unwrap();
+        assert_eq!(edit, [json!({"session": "calm-otter", "kind": "write", "path": "src/lib.rs", "new_text": "x b a\n"})]);
+        let all = gates("Edit", json!({"file_path": lib, "old_string": "a", "new_string": "x", "replace_all": true})).unwrap();
+        assert_eq!(all[0]["new_text"], "x b x\n");
+
+        // Applied in order: the second edit only matches what the first one wrote.
+        let multi = gates("MultiEdit", json!({"file_path": lib, "edits": [
+            {"old_string": "a", "new_string": "c", "replace_all": true},
+            {"old_string": "c b", "new_string": "d"},
+        ]})).unwrap();
+        assert_eq!(multi, [json!({"session": "calm-otter", "kind": "write", "path": "src/lib.rs", "new_text": "d c\n"})]);
+
+        let notebook = gates("NotebookEdit", json!({"notebook_path": root.join("nb/a.ipynb"), "new_source": "print(1)", "edit_mode": "replace"})).unwrap();
+        assert_eq!(notebook, [json!({"session": "calm-otter", "kind": "write", "path": "nb/a.ipynb", "diff": ""})]);
+
+        // The file was never changed: these are previews only.
+        assert_eq!(std::fs::read_to_string(&lib).unwrap(), "a b a\n");
+    }
+
+    #[test]
+    fn edits_that_cannot_be_previewed_fail_closed() {
+        let (_dir, root) = checkout();
+        let lib = root.join("src/lib.rs").display().to_string();
+        let gates = |tool: &str, tool_input: Value| claude_payloads(&hook_input(&root, tool, tool_input), "calm-otter", Some(&root));
+        let error = |tool: &str, tool_input: Value| format!("{:#}", gates(tool, tool_input).unwrap_err());
+
+        assert!(error("Edit", json!({"file_path": lib, "old_string": "zzz", "new_string": "x"})).contains("does not occur"));
+        assert!(error("MultiEdit", json!({"file_path": lib, "edits": [
+            {"old_string": "a", "new_string": "c"}, {"old_string": "missing", "new_string": "d"},
+        ]})).contains("does not occur"));
+        assert!(error("Edit", json!({"file_path": root.join("gone.rs"), "old_string": "a", "new_string": "x"})).contains("does not exist"));
+        assert!(error("Edit", json!({"file_path": lib, "old_string": "", "new_string": "x"})).contains("already has content"));
+        assert!(error("MultiEdit", json!({"file_path": lib})).contains("edits array"));
+        assert!(error("MultiEdit", json!({"file_path": lib, "edits": []})).contains("no edits"));
+        assert!(error("MultiEdit", json!({"file_path": lib, "edits": ["a"]})).contains("not an object"));
+        assert!(error("Edit", json!({"file_path": lib, "old_string": "a"})).contains("new_string"));
+
+        // An empty old_string on a file that is not there yet is how Edit creates one.
+        let created = gates("Edit", json!({"file_path": root.join("src/new.rs"), "old_string": "", "new_string": "fn n() {}\n"})).unwrap();
+        assert_eq!(created[0]["new_text"], "fn n() {}\n");
+    }
+
+    #[test]
+    fn malformed_hook_input_fails_closed() {
+        let (_dir, root) = checkout();
+        let root = Some(root.as_path());
+        for input in [
+            json!({}),
+            json!({"tool_name": "Bash"}),
+            json!({"tool_name": "Bash", "tool_input": "ls"}),
+            json!({"tool_name": "Bash", "tool_input": {"command": ["ls"]}}),
+            json!({"tool_name": 7, "tool_input": {"command": "ls"}}),
+            json!({"tool_name": "Write", "tool_input": {"file_path": "/x"}}),
+            json!({"tool_name": "Read", "tool_input": {"file_path": "/x"}}),
+        ] {
+            assert!(claude_payloads(&input, "calm-otter", root).is_err(), "Claude {input}");
+            assert!(codex_payloads(&input, "calm-otter", root).is_err(), "Codex {input}");
+        }
+        // A Write needs a worktree to judge its path against.
+        let write = json!({"tool_name": "Write", "tool_input": {"file_path": "/x/y", "content": ""}});
+        assert!(claude_payloads(&write, "calm-otter", None).is_err());
+        assert_eq!(cannot_check(&anyhow!("no tool_name")), 2, "a hook that cannot check blocks");
+    }
+
+    #[test]
+    fn codex_tool_calls_become_the_gates_they_must_pass() {
+        let (_dir, root) = checkout();
+        let gates = |tool: &str, tool_input: Value| codex_payloads(&hook_input(&root, tool, tool_input), "calm-otter", Some(&root));
+
+        let bash = gates("Bash", json!({"command": "rm -f src/lib.rs"})).unwrap();
+        assert_eq!(bash[0], json!({"session": "calm-otter", "kind": "exec", "command": "rm -f src/lib.rs"}));
+        assert_eq!(bash[1], json!({"session": "calm-otter", "kind": "write", "path": "src/lib.rs", "diff": "-\n"}));
+
+        // apply_patch (and its Edit/Write aliases) are writes, never exec gates on the patch text.
+        let patch = "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-a b a\n+a b c\n*** End Patch";
+        for tool in ["apply_patch", "Edit", "Write"] {
+            let gates = gates(tool, json!({"command": patch})).unwrap();
+            assert_eq!(gates, [json!({"session": "calm-otter", "kind": "write", "path": "src/lib.rs", "new_text": "a b c\n"})], "{tool}");
+        }
+        assert!(gates("Read", json!({"command": "x"})).is_err());
+    }
+
+    #[test]
+    fn hook_paths_are_judged_where_the_write_lands() {
+        let (_dir, root) = checkout();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let elsewhere = elsewhere.path().canonicalize().unwrap();
+        let rel = |path: &Path| hook_relative_path(Some(&root), &path.display().to_string());
+
+        assert_eq!(rel(&root.join("src/lib.rs")).unwrap(), "src/lib.rs");
+        assert_eq!(rel(&root.join("src/new/deep.rs")).unwrap(), "src/new/deep.rs", "paths that do not exist yet");
+        assert_eq!(rel(&elsewhere.join("scratch.txt")).unwrap(), elsewhere.join("scratch.txt").display().to_string(), "outside goes through");
+        assert!(rel(&root).is_err(), "the worktree itself is no write target");
+        assert!(hook_relative_path(None, "/x").is_err());
+        assert_eq!(hook_relative_path(Some(&root), "src/lib.rs").unwrap(), "src/lib.rs", "a relative path is already worktree-relative");
+
+        // `..` the file system can resolve is resolved, out of the worktree as well as within it.
+        assert_eq!(rel(&root.join("src/../top.rs")).unwrap(), "top.rs");
+        assert_eq!(rel(&root.join("../escape.txt")).unwrap(), root.parent().unwrap().join("escape.txt").display().to_string());
+        // One it cannot is left for the gate, which refuses any `..`.
+        assert_eq!(rel(&root.join("missing/../x.rs")).unwrap(), "missing/../x.rs");
+
+        // Symlinks: judged by where they lead.
+        std::os::unix::fs::symlink(&elsewhere, root.join("out")).unwrap();
+        std::os::unix::fs::symlink(root.join("src"), root.join("alias")).unwrap();
+        assert_eq!(rel(&root.join("out/f.txt")).unwrap(), elsewhere.join("f.txt").display().to_string(), "a link out of the worktree");
+        assert_eq!(rel(&root.join("alias/lib.rs")).unwrap(), "src/lib.rs", "protected-path rules see the real path");
+        // A worktree reached through another name is still the worktree.
+        let door = elsewhere.join("door");
+        std::os::unix::fs::symlink(&root, &door).unwrap();
+        assert_eq!(rel(&door.join("src/lib.rs")).unwrap(), "src/lib.rs");
+        assert_eq!(hook_relative_path(Some(&door), &root.join("src/lib.rs").display().to_string()).unwrap(), "src/lib.rs");
     }
 }
