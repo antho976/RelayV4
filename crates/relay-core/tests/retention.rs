@@ -121,13 +121,17 @@ fn reconcile_purges_rows_past_their_window_and_keeps_recent_ones() {
             "INSERT INTO notifications(project_id,category,title,body,read,created_at) VALUES
                (NULL,'system','read long ago','',1,'2000-01-01T00:00:00Z'),
                (NULL,'system','unread long ago','',0,'2000-01-01T00:00:00Z'),
-               (NULL,'system','read today','',1,'2999-01-01T00:00:00Z');",
+               (NULL,'system','read today','',1,'2999-01-01T00:00:00Z');
+             INSERT INTO holds(actor,op,envelope,policy,details,state,created_at,resolved_at) VALUES
+               ('agent:x','file.write','{}','destructive_write','{}','rejected','2000-01-01T00:00:00Z','2000-01-01T00:00:00Z'),
+               ('agent:x','file.write','{}','destructive_write','{}','open','2000-01-01T00:00:00Z',NULL);",
         ).unwrap();
     }
     let out = ok(&f.engine, "app.reconcile", json!({}));
     let actions = out["actions"].as_array().unwrap();
     assert!(actions.iter().any(|a| a == "purged 1 deleted task(s) past the undo window"), "{out}");
     assert!(actions.iter().any(|a| a == "purged 2 old notification(s)"), "{out}");
+    assert!(actions.iter().any(|a| a == "purged 1 answered guardrail hold(s)"), "an open hold is never pruned: {out}");
     let conn = f.engine.store.lock();
     let tasks: Vec<i64> = conn.prepare("SELECT id FROM tasks ORDER BY id").unwrap()
         .query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();

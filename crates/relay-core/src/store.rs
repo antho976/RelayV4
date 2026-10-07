@@ -588,7 +588,7 @@ fn tune(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// How many backups `backups/` keeps (SPEC §14).
+/// How many backups of each reason `backups/` keeps (SPEC §14).
 pub const KEEP_BACKUPS: usize = 5;
 
 #[derive(Debug, Clone)]
@@ -610,11 +610,15 @@ fn backup_dest(dir: &Path, reason: &str) -> Result<PathBuf> {
     Ok(dir.join(format!("store-{stamp}-{reason}.db")))
 }
 
+/// Keep the newest [`KEEP_BACKUPS`] of each reason, so a run of removals or manual backups never
+/// pushes out the one taken before a schema upgrade.
 fn prune_backups(dir: &Path) -> Result<()> {
-    let mut all = list_backups(dir)?;
-    while all.len() > KEEP_BACKUPS {
-        if let Some(old) = all.pop() {
-            let _ = std::fs::remove_file(&old.path);
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for backup in list_backups(dir)? {
+        let count = seen.entry(backup.reason.clone()).or_default();
+        *count += 1;
+        if *count > KEEP_BACKUPS {
+            let _ = std::fs::remove_file(&backup.path);
         }
     }
     Ok(())

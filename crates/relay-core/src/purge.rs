@@ -14,6 +14,8 @@ const DEFAULT_GRACE_DAYS: i64 = 7;
 const READ_NOTIFICATION_DAYS: i64 = 30;
 /// One nobody read is stale after this long; the hold or run it pointed at has long moved on.
 const NOTIFICATION_DAYS: i64 = 180;
+/// An answered guardrail hold — whose envelope can carry a whole file — is history after this long.
+const ANSWERED_HOLD_DAYS: i64 = 30;
 /// The table never holds more than this many, newest kept.
 const MAX_NOTIFICATIONS: i64 = 5000;
 /// A message every recipient has acked is history after this long.
@@ -108,6 +110,8 @@ pub fn run(tx: &Transaction, store_dir: &Path) -> rusqlite::Result<Purged> {
             [MAX_NOTIFICATIONS],
         )?;
     note(n, "old notification(s)");
+
+    note(crate::guardrail::prune_holds(tx, &crate::time::days_ago(ANSWERED_HOLD_DAYS))?, "answered guardrail hold(s)");
 
     // Mailbox: fully acked messages after a month, any after half a year. Recipients cascade.
     let n = tx.execute(

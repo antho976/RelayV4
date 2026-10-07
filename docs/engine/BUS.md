@@ -297,7 +297,8 @@ undo.grace_days`, default 7; `0` keeps them), then hard-deleted by the reconcile
 delete is never an op an agent can call. A closed session's row stays, because audit, mailbox
 and task history name it; only its scrollback is dropped. The same pass keeps the notification
 table to read rows under 30 days, any row under 180 and at most 5,000, and the mailbox to
-messages under 30 days unless one is still unacked (180 at most). The engine runs it hourly on
+messages under 30 days unless one is still unacked (180 at most), and drops guardrail holds
+answered more than 30 days ago (a confirmed one only once its session has closed). The engine runs it hourly on
 its own (not through the bus, so it lands no audit row); `app.reconcile` runs it now.
 
 ### 5.5 Undo
@@ -591,17 +592,21 @@ naming the request to make:
   {request_id}}` and, after a timeout, re-reads `guardrail.request.get`.
 - A **grant** lifts exactly one rule for exactly that session, in `guardrail.gate`, every
   enforcing `file.*` / `git.commit`, and (read-only) `guardrail.check`. `command` covers that
-  exact command (a trailing lone `*` covers anything after the words before it); every denied
-  command in a line needs its own. `path` covers protected paths, write roots (absolute prefix)
+  exact command, every word as written, quoted ones included (a `*` is the shell's glob, not a
+  wildcard), and a grant of several commands (`cd dist && rm -rf *`) covers only that whole
+  line; every denied command in a line needs its own. A grant ends with its session. `path` covers protected paths, write roots (absolute prefix)
   and large rewrites; never shape gates. `cap` raises the caps it names (`files=N lines=M`) or,
   naming neither, lifts them. A `once` grant is spent only when the action it let through was
   allowed, then announced as `guardrail.resolved {state: "used"}`.
   `guardrail.grant.revoke {request_id}` (user) ends one early; `guardrail.requests.list
   {project_id?, session?, state?: open|active|all}` lists them.
 - **No self-approval.** The answers are user-only on the bus. An agent's `exec` gate also refuses,
-  with the ungrantable `guardrail.self_approval`, any `relay` invocation that names a user-only
-  guardrail/settings answer or claims `--actor user|test`, and any line that sheds
-  `RELAY_SESSION`/sets `RELAY_ACTOR`. The socket does not authenticate the user actor, so this is
+  with the ungrantable `guardrail.self_approval`, any `relay q|cmd` invocation whose op (or
+  `cmd` envelope) is a user-only guardrail/settings answer, any call claiming `--actor
+  user|test`, any envelope claiming `"actor":"user"`, and any line that sheds `RELAY_SESSION`
+  (`unset`, `env -u`, `env -i`, `sudo`, …) or sets `RELAY_ACTOR`. Commands inside `sh -c`,
+  heredocs fed to a shell, scripts piped into one and interpreter `-c`/`-e` code are read too;
+  searching for the names (`rg guardrail.confirm`) is not an invocation. The socket does not authenticate the user actor, so this is
   best effort against the obvious route, not a security boundary.
 
 ### 9.6 Configuration layers
