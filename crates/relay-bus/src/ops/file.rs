@@ -36,8 +36,22 @@ payload!(#[schemars(rename = "FilePathIn")] PathIn { pub project_id: Id, pub wor
 result!(#[schemars(rename = "FileDeleteOut")] DeleteOut { pub trash_id: Id });
 op!(Delete, "file.delete", PathIn => DeleteOut,
     OpMeta::mutation(Scope::Project, 8, "Soft-delete to .relay/trash").undo(Undo::Inverse).emits(&["file.changed"]));
-payload!(#[schemars(rename = "FileRestoreIn")] RestoreIn { pub project_id: Id, pub trash_id: Id });
-op!(Restore, "file.restore", RestoreIn => Entry,
+payload!(#[schemars(rename = "FileRestoreIn")] RestoreIn {
+    pub project_id: Id, pub trash_id: Id,
+    /// The checkout to put it back into (`@project` or a worktree path). Default: the one it was
+    /// deleted from, or the project's primary checkout once that one is gone.
+    pub worktree: Option<String>,
+});
+result!(#[schemars(rename = "FileRestoreOut")] RestoreOut {
+    #[serde(flatten)]
+    pub entry: Entry,
+    /// The checkout it was put back into.
+    pub worktree: String,
+    /// Set when no `worktree` was named and the one it was deleted from is gone, so it went to
+    /// the project's primary checkout instead.
+    pub fallback: bool,
+});
+op!(Restore, "file.restore", RestoreIn => RestoreOut,
     OpMeta::mutation(Scope::Project, 8, "Restore from trash").emits(&["file.changed"]));
 payload!(#[schemars(rename = "FileTrashListIn")] TrashListIn {
     pub project_id: Id,
@@ -48,7 +62,7 @@ result!(#[schemars(rename = "FileTrashEntry")] TrashEntry {
     /// The `trash_id` that `file.restore` takes.
     pub id: Id,
     pub original_path: String,
-    /// The checkout it was deleted from, and where `file.restore` puts it back.
+    /// The checkout it was deleted from, and where `file.restore` puts it back by default.
     pub worktree: String,
     pub created_at: Ts,
     /// Whether the trashed bytes are still on disk.
