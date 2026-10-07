@@ -13,10 +13,10 @@ caught before it is merged rather than in use.
 **Do not run `cargo test --workspace` in a headless environment.** The workspace
 includes `relay-native`, and building it stops at `pango-sys` long before any
 test runs. Plain `cargo test` uses the default members, which are exactly the
-six headless crates (`relay-bus`, `relay-core`, `relay-cli`, `relay-remote`, and
-the native client's GTK-free logic: `relay-board` for the board, `relay-client`
-for the Git panel's diff/graph/status helpers and the device mirror's decoder
-gate and input payloads).
+seven headless crates (`relay-bus`, `relay-core`, `relay-cli`, `relay-remote`,
+`relay-money` for Tally's money rules, and the native client's GTK-free logic:
+`relay-board` for the board, `relay-client` for the Git panel's diff/graph/status
+helpers and the device mirror's decoder gate and input payloads).
 The full list in `README.md` is for a developer machine with GTK.
 
 ## The mobile app: `apps/relay-mobile`
@@ -34,6 +34,16 @@ the door it talks to is `crates/relay-remote`, whose integration tests send a se
 the bus payloads the phone sends, not all of them. Before changing an op the phone calls
 (`docs/MOBILE.md` names them per screen), check whether a remote test covers it. The new
 screens use literal English strings; the rest of the app is localized (`i18n/`), so `i18next/no-literal-string` warns on them.
+
+## Tally: `apps/tally` and `crates/relay-money`
+
+Tally is the budget tracker for Android (Kotlin, Compose, Room, Gradle), its own app with its own
+CI (`.github/workflows/tally-*.yml`, run only for changes under `apps/tally`). An agent session has
+no Android SDK, so a change there is written, not built, and the summary must say so.
+
+`crates/relay-money` is a port of `apps/tally/core` with the same tests. The phone and the PC each
+hold the whole ledger (`docs/MONEY.md`), so **a money rule changed on one side is changed on the
+other in the same commit**, tests included. Stored enum names are the Kotlin constant names.
 
 ## The native client cannot be built everywhere
 
