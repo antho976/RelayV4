@@ -148,29 +148,7 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
         }
         return;
     }
-    // Read narrow subtrees: wallpaper libraries can be megabytes and are not needed here.
-    let result = async {
-        let mut data = json!({});
-        for path in [
-            "providers",
-            "device",
-            "keybindings",
-            "appearance.mode",
-            "appearance.panel_alpha",
-            "appearance.wallpaper_dim",
-            "appearance.content_contrast",
-            "appearance.wallpapers",
-            "appearance.wallpaper",
-            "appearance.wallpaper_rotation",
-            "terminal.font_size",
-        ] {
-            data[path] = ui.call("settings.get", json!({"path":path})).await?["value"].clone();
-        }
-        data["notifications"] = ui.call("notify.settings.get", json!({})).await?;
-        data["detected"] = ui.call("provider.list", json!({})).await?;
-        Ok::<_, crate::client::Error>(data)
-    }
-    .await;
+    let result = load(ui).await;
     if !current(ui, "settings", project, generation) {
         return;
     }
@@ -198,6 +176,86 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
         .insert("settings".into(), generation as i64);
     let baseline = Rc::new(RefCell::new(None::<Snapshot>));
     let fields = Rc::new(RefCell::new(Fields::default()));
+    let (search, save, save_caption) = header(page);
+    wire_save(ui, page, &save, &save_caption, &fields, &baseline, &wallpapers, &saved_wallpapers);
+    let (shell, nav, stack) = body(page);
+    let detected = gtk::Box::new(gtk::Orientation::Vertical, 13);
+    let mounted = Rc::new(Mounted {
+        page: page.downgrade(),
+        fields: fields.clone(),
+        baseline: baseline.clone(),
+        providers: detected.downgrade(),
+        detected: RefCell::new(data["detected"].clone()),
+    });
+    MOUNTED.with(|m| *m.borrow_mut() = Some(mounted.clone()));
+    {
+        let fields = &mut fields.borrow_mut();
+        appearance(ui, &stack, fields, &data, &wallpapers, &saved_wallpapers);
+        agents(ui, &stack, fields, &data, &detected, &mounted);
+        android(&stack, fields, &data);
+        safety(ui, &stack);
+        notifications(ui, &stack, fields, &data);
+        maintenance(ui, &stack);
+        keyboard(&stack, fields, &data);
+    }
+    wire_search(&search, &shell, &nav, &stack);
+    // Taken from the built controls, so a value a range clamped counts as unchanged.
+    *baseline.borrow_mut() = fields.borrow().snapshot().ok();
+}
+
+/// The settings the page shows, read narrowly: wallpaper libraries can be megabytes and only
+/// the two the gallery needs are read. All of them are asked for at once.
+async fn load(ui: &Ui) -> Result<Value, crate::client::Error> {
+    const PATHS: [&str; 11] = [
+        "providers",
+        "device",
+        "keybindings",
+        "appearance.mode",
+        "appearance.panel_alpha",
+        "appearance.wallpaper_dim",
+        "appearance.content_contrast",
+        "appearance.wallpapers",
+        "appearance.wallpaper",
+        "appearance.wallpaper_rotation",
+        "terminal.font_size",
+    ];
+    let settings = join_all(PATHS.map(|path| ui.call("settings.get", json!({"path":path}))).into());
+    let (settings, notifications, detected) = tokio::join!(
+        settings,
+        ui.call("notify.settings.get", json!({})),
+        ui.call("provider.list", json!({}))
+    );
+    let mut data = json!({});
+    for (path, value) in PATHS.iter().zip(settings) {
+        data[*path] = value?["value"].clone();
+    }
+    data["notifications"] = notifications?;
+    data["detected"] = detected?;
+    Ok(data)
+}
+
+/// Awaits every future together and returns their outputs in order.
+async fn join_all<F: std::future::Future>(futures: Vec<F>) -> Vec<F::Output> {
+    let mut futures: Vec<_> = futures.into_iter().map(Box::pin).collect();
+    let mut outputs: Vec<Option<F::Output>> = futures.iter().map(|_| None).collect();
+    std::future::poll_fn(|cx| {
+        let mut waiting = false;
+        for (future, output) in futures.iter_mut().zip(outputs.iter_mut()) {
+            if output.is_none() {
+                match future.as_mut().poll(cx) {
+                    std::task::Poll::Ready(value) => *output = Some(value),
+                    std::task::Poll::Pending => waiting = true,
+                }
+            }
+        }
+        if waiting { std::task::Poll::Pending } else { std::task::Poll::Ready(()) }
+    })
+    .await;
+    outputs.into_iter().map(|output| output.expect("every future finished")).collect()
+}
+
+/// The title row: search, and Save with its caption.
+fn header(page: &gtk::Box) -> (gtk::SearchEntry, gtk::Button, gtk::Label) {
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     header.add_css_class("settings-head");
     let title = gtk::Box::new(gtk::Orientation::Vertical, 2);
@@ -211,24 +269,40 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
     search.set_size_request(230, -1);
     search.set_valign(gtk::Align::Center);
     header.append(&search);
-    let reload = button("Save changes", "primary");
-    reload.add_css_class("settings-small-key");
+    let save = button("Save changes", "primary");
+    save.add_css_class("settings-small-key");
     let save_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     save_row.append(&crate::icons::image("save", 13));
     let save_caption = label("Save changes", "");
     save_row.append(&save_caption);
-    reload.set_child(Some(&save_row));
-    reload.set_widget_name("settings-save");
-    reload.set_valign(gtk::Align::Center);
-    header.append(&reload);
+    save.set_child(Some(&save_row));
+    save.set_widget_name("settings-save");
+    save.set_valign(gtk::Align::Center);
+    header.append(&save);
     page.append(&header);
+    (search, save, save_caption)
+}
+
+/// Save sends only what differs from `baseline`, then makes what it sent the new baseline.
+#[allow(clippy::too_many_arguments)]
+fn wire_save(
+    ui: &Rc<Ui>,
+    page: &gtk::Box,
+    save: &gtk::Button,
+    save_caption: &gtk::Label,
+    fields: &Rc<RefCell<Fields>>,
+    baseline: &Rc<RefCell<Option<Snapshot>>>,
+    wallpapers: &Rc<RefCell<Value>>,
+    saved_wallpapers: &Rc<RefCell<Value>>,
+) {
+    let save_caption = save_caption.clone();
     let target = page.downgrade();
     let weak = Rc::downgrade(ui);
     let wallpaper_state = wallpapers.clone();
     let saved_for_save = saved_wallpapers.clone();
     let loaded = baseline.clone();
     let saved_fields = fields.clone();
-    reload.connect_clicked(move |_| {
+    save.connect_clicked(move |_| {
         let (Some(ui), Some(page)) = (weak.upgrade(), target.upgrade()) else {
             return;
         };
@@ -292,6 +366,10 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
             }
         });
     });
+}
+
+/// The category list beside the stack of category pages, under the header.
+fn body(page: &gtk::Box) -> (gtk::Box, gtk::Box, gtk::Stack) {
     let shell = gtk::Box::new(gtk::Orientation::Horizontal, 18);
     shell.add_css_class("settings-body");
     shell.set_hexpand(true);
@@ -305,7 +383,7 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
     nav.set_size_request(230, -1);
     nav.set_valign(gtk::Align::Start);
     let mut first = None::<gtk::ToggleButton>;
-    for (name, title, icon, eyebrow, _, _) in CATEGORIES {
+    for Category { name, title, icon, nav: hint, .. } in CATEGORIES {
         let key = gtk::ToggleButton::new();
         key.add_css_class("settings-category");
         if let Some(first) = &first {
@@ -317,15 +395,6 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
         row.append(&crate::icons::image(icon, 16));
         let copy = gtk::Box::new(gtk::Orientation::Vertical, 1);
         copy.append(&label(title, "body"));
-        let hint = match name {
-            "appearance" => "Theme, opacity, wallpaper",
-            "notifications" => "Sounds and categories",
-            "agents" => "Providers and updates",
-            "safety" => "Caps and protected paths",
-            "android" => "SDK and device tools",
-            "keyboard" => "Global shortcuts",
-            _ => eyebrow,
-        };
         copy.append(&label(hint, "faint"));
         row.append(&copy);
         key.set_child(Some(&row));
@@ -345,8 +414,18 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
     shell.append(&nav);
     shell.append(&stack);
     page.append(&shell);
+    (shell, nav, stack)
+}
 
-    let appearance = category(&stack, "appearance", "Appearance");
+fn appearance(
+    ui: &Rc<Ui>,
+    stack: &gtk::Stack,
+    fields: &mut Fields,
+    data: &Value,
+    wallpapers: &Rc<RefCell<Value>>,
+    saved_wallpapers: &Rc<RefCell<Value>>,
+) {
+    let appearance = category(stack, "appearance");
     appearance.append(&paragraph(
         "Choose a theme and adjust how much wallpaper shows behind your editor and terminals.",
     ));
@@ -418,7 +497,7 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
         modes.append(&key);
         cards.push((key.downgrade(), id));
     }
-    fields.borrow_mut().setting(
+    fields.setting(
         "appearance.mode",
         Box::new(move || Ok(cards.iter().find(|(key, _)| key.upgrade().is_some_and(|key| key.is_active())).map(|(_, id)| json!(id)))),
     );
@@ -443,7 +522,7 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
         let input = gtk::Scale::with_range(gtk::Orientation::Horizontal, min, max, 0.01);
         input.set_widget_name(&format!("setting:{path}"));
         input.set_value(data[path].as_f64().unwrap_or(default));
-        fields.borrow_mut().setting(path, reader(&input, |input| Ok(json!(input.value()))));
+        fields.setting(path, reader(&input, |input| Ok(json!(input.value()))));
         input.set_hexpand(true);
         input.set_draw_value(false);
         let caption = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -467,10 +546,10 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
     let legibility_group = gtk::Box::new(gtk::Orientation::Vertical, 7);
     legibility_group.append(&legibility);
     legibility_group.append(&label("Dim controls the image itself. Content protection strengthens panels independently so text stays readable over bright wallpaper areas.","settings-legibility-copy"));
-    let gallery = wallpaper_library(ui, &appearance, &wallpapers);
+    let gallery = wallpaper_library(ui, &appearance, wallpapers);
     *ui.wallpaper_draft.borrow_mut() = Some(WallpaperDraft {
         state: wallpapers.clone(),
-        saved: saved_wallpapers,
+        saved: saved_wallpapers.clone(),
         gallery: gallery.downgrade(),
         stale: std::cell::Cell::new(false),
     });
@@ -479,7 +558,7 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
     let enabled = gtk::CheckButton::with_label("Rotate wallpapers randomly");
     enabled.set_widget_name("setting:appearance.wallpaper_rotation.enabled");
     enabled.set_active(data["appearance.wallpaper_rotation"]["enabled"] == true);
-    fields.borrow_mut().setting("appearance.wallpaper_rotation.enabled", reader(&enabled, |input| Ok(json!(input.is_active()))));
+    fields.setting("appearance.wallpaper_rotation.enabled", reader(&enabled, |input| Ok(json!(input.is_active()))));
     enabled.set_hexpand(true);
     rotation.append(&enabled);
     rotation.append(&label("Every", "dim"));
@@ -491,7 +570,7 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
             .unwrap_or(15.)
             .clamp(1., 1440.),
     );
-    fields.borrow_mut().setting(
+    fields.setting(
         "appearance.wallpaper_rotation.interval_minutes",
         reader(&minutes, |input| Ok(json!(input.value_as_int()))),
     );
@@ -500,10 +579,13 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
     appearance.append(&rotation);
     appearance.append(&paragraph("Uses your saved library and skips the current image. Add at least two wallpapers to rotate."));
     appearance.append(&legibility_group);
+}
 
-    let agents = category(&stack, "agents", "Agents");
+/// The provider cards go in `detected`, which `mounted` redraws when the providers change.
+fn agents(ui: &Rc<Ui>, stack: &gtk::Stack, fields: &mut Fields, data: &Value, detected: &gtk::Box, mounted: &Rc<Mounted>) {
+    let agents = category(stack, "agents");
     setting_number(
-        &mut fields.borrow_mut(),
+        fields,
         &agents,
         "Terminal font size (points)",
         "terminal.font_size",
@@ -515,22 +597,13 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
     agents.append(&paragraph(
         "Provider discovery, updates and executable overrides.",
     ));
-    let detected = gtk::Box::new(gtk::Orientation::Vertical, 13);
-    agents.append(&detected);
-    providers(&detected, &data["detected"]);
-    let mounted = Rc::new(Mounted {
-        page: page.downgrade(),
-        fields: fields.clone(),
-        baseline: baseline.clone(),
-        providers: detected.downgrade(),
-        detected: RefCell::new(data["detected"].clone()),
-    });
-    MOUNTED.with(|m| *m.borrow_mut() = Some(mounted.clone()));
+    agents.append(detected);
+    providers(detected, &data["detected"]);
     // Called directly, not through Ui::mutate: its answer is the providers to show.
     let rediscover = button("Refresh providers", "quiet");
     agents.append(&rediscover);
     let weak = Rc::downgrade(ui);
-    let shown = Rc::downgrade(&mounted);
+    let shown = Rc::downgrade(mounted);
     rediscover.connect_clicked(move |key| {
         let Some(ui) = weak.upgrade() else {
             return;
@@ -555,7 +628,7 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
         let automatic = gtk::CheckButton::with_label(&format!("Update {provider} at startup"));
         automatic.set_widget_name(&format!("setting:providers.{provider}.auto_update"));
         automatic.set_active(data["providers"][provider]["auto_update"] == true);
-        fields.borrow_mut().setting(format!("providers.{provider}.auto_update"), reader(&automatic, |input| Ok(json!(input.is_active()))));
+        fields.setting(format!("providers.{provider}.auto_update"), reader(&automatic, |input| Ok(json!(input.is_active()))));
         automatic.set_hexpand(true);
         updates.append(&automatic);
         let update = button("Update now", "quiet");
@@ -569,15 +642,17 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
         updates.append(&update);
         agents.append(&updates);
         setting_entry(
-            &mut fields.borrow_mut(),
+            fields,
             &agents,
             &format!("{provider} executable"),
             &format!("providers.{provider}.path"),
             data["providers"][provider]["path"].as_str().unwrap_or(""),
         );
     }
+}
 
-    let android = category(&stack, "android", "Android");
+fn android(stack: &gtk::Stack, fields: &mut Fields, data: &Value) {
+    let android = category(stack, "android");
     android.append(&paragraph(
         "Standard SDK paths are discovered automatically. Leave overrides empty to use discovery.",
     ));
@@ -588,17 +663,23 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
         ("avdmanager_path", "AVD manager executable"),
     ] {
         setting_entry(
-            &mut fields.borrow_mut(),
+            fields,
             &android,
             title,
             &format!("device.{key}"),
             text(&data["device"], key),
         );
     }
-    let safety = category(&stack, "safety", "Guardrails");
+}
+
+fn safety(ui: &Rc<Ui>, stack: &gtk::Stack) {
+    let safety = category(stack, "safety");
     safety.append(&paragraph("Limits the engine enforces on agents. Set them globally, for a workspace, or for one project; anything a level does not set follows the level above. These save on their own, with the button below."));
     safety.append(&crate::pages::guardrail_settings(ui));
-    let notifications = category(&stack, "notifications", "Notifications");
+}
+
+fn notifications(ui: &Rc<Ui>, stack: &gtk::Stack, fields: &mut Fields, data: &Value) {
+    let notifications = category(stack, "notifications");
     notifications.append(&paragraph(
         "Choose which events appear in your notification feed.",
     ));
@@ -613,11 +694,11 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
     sound.set_widget_name("notify:sound");
     field("Sound", &sound, &notifications);
     let picked = reader(&sound, move |input| Ok(json!(sounds.get(input.selected() as usize).copied().unwrap_or("off"))));
-    fields.borrow_mut().notifications.push(("sound".into(), picked));
+    fields.notifications.push(("sound".into(), picked));
     let volume = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0., 1., 0.01);
     volume.set_widget_name("notify:volume");
     volume.set_value(data["notifications"]["volume"].as_f64().unwrap_or(0.7));
-    fields.borrow_mut().notifications.push(("volume".into(), reader(&volume, |input| Ok(json!(input.value())))));
+    fields.notifications.push(("volume".into(), reader(&volume, |input| Ok(json!(input.value())))));
     field("Volume", &volume, &notifications);
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     notifications.append(&row);
@@ -647,9 +728,12 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
         check.set_active(enabled);
         check.set_widget_name(&format!("notify:category:{category}"));
         notifications.append(&check);
-        fields.borrow_mut().notifications.push((format!("categories.{category}"), reader(&check, |input| Ok(json!(input.is_active())))));
+        fields.notifications.push((format!("categories.{category}"), reader(&check, |input| Ok(json!(input.is_active())))));
     }
-    let maintenance = category(&stack, "maintenance", "Storage");
+}
+
+fn maintenance(ui: &Rc<Ui>, stack: &gtk::Stack) {
+    let maintenance = category(stack, "maintenance");
     maintenance.append(&paragraph(
         "Create a database backup before major workflow changes.",
     ));
@@ -677,13 +761,16 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
             key.set_sensitive(true);
         });
     });
-    let keyboard = category(&stack, "keyboard", "Keyboard");
+}
+
+fn keyboard(stack: &gtk::Stack, fields: &mut Fields, data: &Value) {
+    let keyboard = category(stack, "keyboard");
     for (name, title, fallback) in crate::shortcuts::DEFAULTS {
         let input = gtk::Entry::new();
         input.set_text(data["keybindings"][name].as_str().unwrap_or(fallback));
         input.set_widget_name(&format!("setting:keybindings.{name}"));
         // A shortcut is saved as typed, empty included: empty turns it off.
-        fields.borrow_mut().setting(
+        fields.setting(
             format!("keybindings.{name}"),
             reader(&input, move |input| {
                 let value = input.text();
@@ -699,6 +786,10 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
         field(title, &row, &keyboard);
     }
     keyboard.append(&paragraph("Escape closes the session sheet. Ctrl+Shift+C / Ctrl+Shift+V copies and pastes in terminals."));
+}
+
+/// Search hides the categories with no match and shows the first that has one.
+fn wire_search(search: &gtk::SearchEntry, shell: &gtk::Box, nav: &gtk::Box, stack: &gtk::Stack) {
     let no_results = paragraph("No settings match your search.");
     no_results.set_visible(false);
     no_results.set_hexpand(true);
@@ -706,7 +797,7 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
     shell.append(&no_results);
     let mut keys = Vec::new();
     let mut child = nav.first_child();
-    for (name, ..) in CATEGORIES {
+    for Category { name, .. } in CATEGORIES {
         let Some(key) = child.take().and_downcast::<gtk::ToggleButton>() else {
             break;
         };
@@ -742,9 +833,8 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
             }
         }
     });
-    // Taken from the built controls, so a value a range clamped counts as unchanged.
-    *baseline.borrow_mut() = fields.borrow().snapshot().ok();
 }
+
 
 /// One card per provider from a `provider.list` / `provider.refresh` answer.
 fn providers(parent: &gtk::Box, detected: &Value) {
@@ -791,63 +881,82 @@ fn settings_search_text(widget: &gtk::Widget) -> String {
     result.to_lowercase()
 }
 
-const CATEGORIES: [(&str, &str, &str, &str, &str, &str); 7] = [
-    (
-        "appearance",
-        "Appearance",
-        "layout",
-        "Visual system",
-        "Make the workspace yours",
-        "Theme, wallpaper, panel density, and safeguards for text over bright images.",
-    ),
-    (
-        "notifications",
-        "Notifications",
-        "bell",
-        "Attention",
-        "Choose what can interrupt you",
-        "Keep high-signal agent events audible and let routine activity stay quiet.",
-    ),
-    (
-        "agents",
-        "Agents",
-        "terminal",
-        "Runtime",
-        "Provider and session behavior",
-        "Local CLI discovery, authentication state, updates, and executable overrides.",
-    ),
-    (
-        "safety",
-        "Guardrails",
-        "sliders",
-        "Enforcement",
-        "Set hard operating boundaries",
-        "These are typed core limits, not prompt suggestions that an agent can ignore.",
-    ),
-    (
-        "android",
-        "Android",
-        "device",
-        "Android",
-        "Connect the local toolchain",
-        "Relay resolves standard SDK locations first; overrides are for unusual installations.",
-    ),
-    (
-        "keyboard",
-        "Keyboard",
-        "code",
-        "Workflow",
-        "Keep navigation under your hands",
-        "Shortcuts are global, durable, and use familiar Ctrl+Key notation.",
-    ),
-    (
-        "maintenance",
-        "Storage",
-        "folder",
-        "Backups",
-        "Keep a recovery copy",
-        "Create a database backup before major workflow changes.",
-    ),
+/// One settings category: its key in the list and the hero at the top of its page.
+struct Category {
+    name: &'static str,
+    title: &'static str,
+    icon: &'static str,
+    /// The line under the title in the category list.
+    nav: &'static str,
+    eyebrow: &'static str,
+    heading: &'static str,
+    hint: &'static str,
+}
+
+const CATEGORIES: [Category; 7] = [
+    Category {
+        name: "appearance",
+        title: "Appearance",
+        icon: "layout",
+        nav: "Theme, opacity, wallpaper",
+        eyebrow: "Visual system",
+        heading: "Make the workspace yours",
+        hint: "Theme, wallpaper, panel density, and safeguards for text over bright images.",
+    },
+    Category {
+        name: "notifications",
+        title: "Notifications",
+        icon: "bell",
+        nav: "Sounds and categories",
+        eyebrow: "Attention",
+        heading: "Choose what can interrupt you",
+        hint: "Keep high-signal agent events audible and let routine activity stay quiet.",
+    },
+    Category {
+        name: "agents",
+        title: "Agents",
+        icon: "terminal",
+        nav: "Providers and updates",
+        eyebrow: "Runtime",
+        heading: "Provider and session behavior",
+        hint: "Local CLI discovery, authentication state, updates, and executable overrides.",
+    },
+    Category {
+        name: "safety",
+        title: "Guardrails",
+        icon: "sliders",
+        nav: "Caps and protected paths",
+        eyebrow: "Enforcement",
+        heading: "Set hard operating boundaries",
+        hint: "These are typed core limits, not prompt suggestions that an agent can ignore.",
+    },
+    Category {
+        name: "android",
+        title: "Android",
+        icon: "device",
+        nav: "SDK and device tools",
+        eyebrow: "Android",
+        heading: "Connect the local toolchain",
+        hint: "Relay resolves standard SDK locations first; overrides are for unusual installations.",
+    },
+    Category {
+        name: "keyboard",
+        title: "Keyboard",
+        icon: "code",
+        nav: "Global shortcuts",
+        eyebrow: "Workflow",
+        heading: "Keep navigation under your hands",
+        hint: "Shortcuts are global, durable, and use familiar Ctrl+Key notation.",
+    },
+    Category {
+        name: "maintenance",
+        title: "Storage",
+        icon: "folder",
+        nav: "Backups",
+        eyebrow: "Backups",
+        heading: "Keep a recovery copy",
+        hint: "Create a database backup before major workflow changes.",
+    },
 ];
 
 /// Lets `widget` fill the scrolled `page` up to `max` px. GTK has no max-width, so a right
@@ -876,25 +985,26 @@ fn cap_width(widget: &gtk::Box, page: &gtk::Box, max: i32) {
     });
 }
 
-fn category(stack: &gtk::Stack, name: &str, title: &str) -> gtk::Box {
+/// The page of category `name`, which must be one of [`CATEGORIES`], added to `stack`.
+fn category(stack: &gtk::Stack, name: &str) -> gtk::Box {
     let outer = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    if let Some((_, _, icon, eyebrow, heading, hint)) = CATEGORIES.iter().find(|c| c.0 == name) {
-        let hero = gtk::Box::new(gtk::Orientation::Horizontal, 16);
-        hero.add_css_class("settings-hero");
-        let mark = crate::icons::image(icon, 22);
-        mark.add_css_class("settings-hero-icon");
-        mark.set_valign(gtk::Align::Center);
-        mark.set_halign(gtk::Align::Center);
-        hero.append(&mark);
-        let copy = gtk::Box::new(gtk::Orientation::Vertical, 3);
-        copy.append(&label(eyebrow, "section-label"));
-        copy.append(&label(heading, "settings-hero-title"));
-        let hint = paragraph(hint);
-        hint.set_max_width_chars(75);
-        copy.append(&hint);
-        hero.append(&copy);
-        outer.append(&hero);
-    }
+    let Category { title, icon, eyebrow, heading, hint, .. } =
+        CATEGORIES.iter().find(|c| c.name == name).expect("a listed settings category");
+    let hero = gtk::Box::new(gtk::Orientation::Horizontal, 16);
+    hero.add_css_class("settings-hero");
+    let mark = crate::icons::image(icon, 22);
+    mark.add_css_class("settings-hero-icon");
+    mark.set_valign(gtk::Align::Center);
+    mark.set_halign(gtk::Align::Center);
+    hero.append(&mark);
+    let copy = gtk::Box::new(gtk::Orientation::Vertical, 3);
+    copy.append(&label(eyebrow, "section-label"));
+    copy.append(&label(heading, "settings-hero-title"));
+    let hint = paragraph(hint);
+    hint.set_max_width_chars(75);
+    copy.append(&hint);
+    hero.append(&copy);
+    outer.append(&hero);
     let page = gtk::Box::new(gtk::Orientation::Vertical, 13);
     page.add_css_class("settings-panel");
     page.append(&label(title, "title"));
