@@ -1,6 +1,6 @@
 //! Opt-in checks against the isolated native smoke engine, never installed providers.
 use crate::app::Ui;
-use crate::smoke::util::{choose, chosen, click, named, press, wait_for};
+use crate::smoke::util::{choose, chosen, click, clickable, named, press, wait_for};
 use gtk::prelude::*;
 use gtk4 as gtk;
 use serde_json::{json, Value};
@@ -192,7 +192,13 @@ pub(crate) async fn run(ui: &Rc<Ui>) -> Result<(), String> {
     if git_hidden {
         ui.editor.toggle_git();
     }
-    wait_for(|| named(&ui.window, "branch-switch-switch-fixture").is_some(), "branch switch control").await?;
+    // The switch keys live in the branch picker's popover: open it, as a person would.
+    wait_for(|| named(&ui.window, "git-branch-picker").is_some_and(|w| w.is_mapped()), "branch picker").await?;
+    named(&ui.window, "git-branch-picker")
+        .and_then(|w| w.downcast::<gtk::MenuButton>().ok())
+        .ok_or("Branch picker type")?
+        .popup();
+    wait_for(|| clickable(&ui.window, "branch-switch-switch-fixture"), "branch switch control").await?;
     assert!(!ui.editor.agents_visible(), "Files and Git must stay open after the layout restore");
     click(&ui.window, "branch-switch-switch-fixture")?;
     let mut switched = false;
