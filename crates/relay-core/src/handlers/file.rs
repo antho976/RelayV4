@@ -70,9 +70,19 @@ pub fn register(e: &mut Engine) {
         })
     });
     e.register::<Write>(|ctx: &mut Ctx, p| {
-        let (project, root) = root(ctx, p.project_id, p.worktree.as_deref())?;
+        let (project, root) = root_mut(ctx, p.project_id, p.worktree.as_deref())?;
         let rel = rel(&p.path, false)?;
         let path = safe_join(&root, &rel, true)?;
+        // A symlink is written through, not replaced: renaming the new text over the link
+        // turned it into a regular file and left its target as it was (RA-146). safe_join has
+        // confirmed the target is inside the worktree, and it is the target that is gated.
+        let (path, target_rel) = if fs::symlink_metadata(&path).is_ok_and(|md| md.file_type().is_symlink()) {
+            let target = fs::canonicalize(&path).map_err(|e| io_err("file.write_failed", &rel, e))?;
+            let target_rel = target.strip_prefix(&root).unwrap_or(&target).to_path_buf();
+            (target, Some(target_rel))
+        } else {
+            (path, None)
+        };
         let old = fs::read_to_string(&path);
         if let Some(expected) = &p.expected_sha256 {
             let matches = old.as_ref().is_ok_and(|text| {
@@ -90,12 +100,13 @@ pub fn register(e: &mut Engine) {
             }
         }
         let old = old.unwrap_or_default();
+        let gated = target_rel.as_ref().map(|t| t.to_string_lossy().to_string());
         guardrail::enforce(
             ctx,
             project.id,
             &root,
             GateKind::Write,
-            Some(&p.path),
+            Some(gated.as_deref().unwrap_or(&p.path)),
             Some(&p.text),
             None,
             None,
@@ -125,10 +136,10 @@ pub fn register(e: &mut Engine) {
         })
     });
     e.register::<Create>(|ctx: &mut Ctx, p| {
-        let (project, root) = root(ctx, p.project_id, p.worktree.as_deref())?;
+        let (project, root) = root_mut(ctx, p.project_id, p.worktree.as_deref())?;
         let rel = rel(&p.path, false)?;
         let path = safe_join(&root, &rel, true)?;
-        if path.exists() {
+        if occupied(&path) {
             return Err(BusError::conflict(
                 "file.exists",
                 format!("{} already exists", p.path),
@@ -161,7 +172,10 @@ pub fn register(e: &mut Engine) {
         changed(ctx, project.id, &root, &p.path);
         entry(&root, &path, &HashMap::new(), 0)
     });
-    e.register::<Rename>(|ctx: &mut Ctx, p| {
+    // Rename, move and delete are staged (D149): a directory source is walked for the gated
+    // paths inside it (RA-147) before the transaction opens, and only the gates and the rename
+    // itself hold the store.
+    e.register_staged::<Rename, PreparedPath>(|ctx, p| {
         if p.new_name.is_empty()
             || Path::new(&p.new_name).components().count() != 1
             || p.new_name == "."
@@ -172,25 +186,16 @@ pub fn register(e: &mut Engine) {
                 "new_name must be one path component",
             ));
         }
-        let (project, root) = root(ctx, p.project_id, p.worktree.as_deref())?;
+        let (project, root) = root_mut_unlocked(ctx, p.project_id, p.worktree.as_deref())?;
         let from_rel = rel(&p.path, false)?;
         let from = safe_join(&root, &from_rel, false)?;
         let into_rel = from_rel.parent().unwrap_or(Path::new("")).join(&p.new_name);
-        let into = safe_join(&root, &into_rel, true)?;
-        guard_path_mutation(ctx, project.id, &root, &from_rel, None)?;
-        guard_path_mutation(ctx, project.id, &root, &into_rel, Some(&from))?;
-        if into.exists() {
-            return Err(BusError::conflict(
-                "file.exists",
-                format!("{} already exists", into_rel.display()),
-            ));
-        }
-        fs::rename(&from, &into).map_err(|e| io_err("file.rename_failed", &from_rel, e))?;
-        changed(ctx, project.id, &root, &into_rel.to_string_lossy());
-        entry(&root, &into, &HashMap::new(), 0)
-    });
-    e.register::<Move>(|ctx: &mut Ctx, p| {
-        let (project, root) = root(ctx, p.project_id, p.worktree.as_deref())?;
+        safe_join(&root, &into_rel, true)?;
+        let inner = covered_inside(ctx, project.id, &from, &[&from_rel, &into_rel])?;
+        Ok(PreparedPath { project_id: project.id, root, from_rel, into_rel: Some(into_rel), inner })
+    }, |ctx: &mut Ctx, _p, prepared| relocate(ctx, prepared, "file.rename_failed"));
+    e.register_staged::<Move, PreparedPath>(|ctx, p| {
+        let (project, root) = root_mut_unlocked(ctx, p.project_id, p.worktree.as_deref())?;
         let from_rel = rel(&p.path, false)?;
         let from = safe_join(&root, &from_rel, false)?;
         let dir_rel = rel(&p.into, true)?;
@@ -205,62 +210,71 @@ pub fn register(e: &mut Engine) {
             .file_name()
             .ok_or_else(|| BusError::invalid("file.path", "path has no name"))?;
         let into_rel = dir_rel.join(name);
-        let into = safe_join(&root, &into_rel, true)?;
-        guard_path_mutation(ctx, project.id, &root, &from_rel, None)?;
-        guard_path_mutation(ctx, project.id, &root, &into_rel, Some(&from))?;
-        if into.exists() {
-            return Err(BusError::conflict(
-                "file.exists",
-                format!("{} already exists", into_rel.display()),
-            ));
+        safe_join(&root, &into_rel, true)?;
+        let inner = covered_inside(ctx, project.id, &from, &[&from_rel, &into_rel])?;
+        Ok(PreparedPath { project_id: project.id, root, from_rel, into_rel: Some(into_rel), inner })
+    }, |ctx: &mut Ctx, _p, prepared| relocate(ctx, prepared, "file.move_failed"));
+    e.register_staged::<Delete, PreparedPath>(|ctx, p| {
+        let (project, root) = root_mut_unlocked(ctx, p.project_id, p.worktree.as_deref())?;
+        let rel = rel(&p.path, false)?;
+        let path = safe_join(&root, &rel, false)?;
+        let inner = covered_inside(ctx, project.id, &path, &[&rel])?;
+        Ok(PreparedPath { project_id: project.id, root, from_rel: rel, into_rel: None, inner })
+    }, |ctx: &mut Ctx, p, prepared| {
+        let PreparedPath { project_id, root, from_rel: rel, inner, .. } = prepared;
+        let path = root.join(&rel);
+        guard_path_mutation(ctx, project_id, &root, &rel, None)?;
+        for inside in &inner {
+            guard_path_mutation(ctx, project_id, &root, &rel.join(inside), None)?;
         }
-        fs::rename(&from, &into).map_err(|e| io_err("file.move_failed", &from_rel, e))?;
-        changed(ctx, project.id, &root, &into_rel.to_string_lossy());
-        entry(&root, &into, &HashMap::new(), 0)
-    });
-    e.register::<Delete>(|ctx: &mut Ctx, p| {
-        let (project, root) = root(ctx, p.project_id, p.worktree.as_deref())?;
-        let rel = rel(&p.path, false)?; let path = safe_join(&root, &rel, false)?;
-        guard_path_mutation(ctx, project.id, &root, &rel, None)?;
         ctx.tx().execute(
             "INSERT INTO file_trash(project_id, worktree, original_path, trash_path, created_at) VALUES (?1,?2,?3,'',?4)",
-            params![project.id, root.display().to_string(), p.path, ctx.now],
+            params![project_id, root.display().to_string(), p.path, ctx.now],
         ).bus()?;
         let id = ctx.tx().last_insert_rowid();
         let trash = root.join(".relay").join("trash").join(id.to_string()).join("payload");
         fs::create_dir_all(trash.parent().unwrap()).map_err(|e| io_err("file.delete_failed", &rel, e))?;
         fs::rename(&path, &trash).map_err(|e| io_err("file.delete_failed", &rel, e))?;
         ctx.tx().execute("UPDATE file_trash SET trash_path=?1 WHERE id=?2", params![trash.display().to_string(), id]).bus()?;
-        ctx.set_undo("file.restore", json!({"project_id": project.id, "trash_id": id}), None);
-        changed(ctx, project.id, &root, &p.path);
+        ctx.set_undo("file.restore", json!({"project_id": project_id, "trash_id": id}), None);
+        changed(ctx, project_id, &root, &p.path);
         Ok(DeleteOut { trash_id: id })
     });
     e.register::<Restore>(|ctx: &mut Ctx, p| {
         let project = get_project(ctx.tx(), p.project_id)?;
+        let own = own_checkout(ctx.tx(), &ctx.actor, ctx.actor_session_id(), project.id)?;
         let row: Option<(String,String,String)> = ctx.tx().query_row(
             "SELECT worktree, original_path, trash_path FROM file_trash WHERE id=?1 AND project_id=?2 AND restored_at IS NULL",
             params![p.trash_id, project.id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
         ).optional().bus()?;
         let (root_s, rel_s, trash_s) = row.ok_or_else(|| BusError::not_found("file.trash_not_found", format!("no open trash {}", p.trash_id)))?;
-        let root = PathBuf::from(root_s); let rel = rel(&rel_s, false)?; let path = safe_join(&root, &rel, true)?;
-        if path.exists() { return Err(BusError::conflict("file.restore_conflict", format!("{} already exists", rel.display()))); }
+        let root = PathBuf::from(root_s); confine(own, &root)?;
+        let rel = rel(&rel_s, false)?; let path = safe_join(&root, &rel, true)?;
+        if occupied(&path) { return Err(BusError::conflict("file.restore_conflict", format!("{} already exists", rel.display()))); }
         if let Some(parent) = path.parent() { fs::create_dir_all(parent).map_err(|e| io_err("file.restore_failed", &rel, e))?; }
         fs::rename(&trash_s, &path).map_err(|e| io_err("file.restore_failed", &rel, e))?;
         ctx.tx().execute("UPDATE file_trash SET restored_at=?1 WHERE id=?2", params![ctx.now, p.trash_id]).bus()?;
         changed(ctx, project.id, &root, &rel_s);
         entry(&root, &path, &HashMap::new(), 0)
     });
-    e.register::<RestoreHead>(|ctx: &mut Ctx, p| {
-        let (project, root) = root(ctx, p.project_id, p.worktree.as_deref())?;
+    // Staged (D149): the checkout is a subprocess, so it runs before the transaction opens;
+    // the transaction only announces the change. `--literal-pathspecs`: a path is a name, never
+    // a glob, so restoring `[id].tsx` cannot also discard edits to `i.tsx` and `d.tsx` (RA-153).
+    e.register_staged::<RestoreHead, (Id, PathBuf, Entry)>(|ctx, p| {
+        let (project, root) = root_mut_unlocked(ctx, p.project_id, p.worktree.as_deref())?;
         let rel = rel(&p.path, false)?;
-        crate::worktree::git_mutate(&root, &["checkout", "--", &p.path])
+        crate::worktree::git_mutate(&root, &["--literal-pathspecs", "checkout", "--", &p.path])
             .map_err(|e| BusError::conflict("file.restore_head_failed", e.to_string()))?;
         let path = safe_join(&root, &rel, false)?;
-        changed(ctx, project.id, &root, &p.path);
-        entry(&root, &path, &HashMap::new(), 0)
+        Ok((project.id, root.clone(), entry(&root, &path, &HashMap::new(), 0)?))
+    }, |ctx: &mut Ctx, p, (project_id, root, restored)| {
+        changed(ctx, project_id, &root, &p.path);
+        Ok(restored)
     });
-    e.register::<Import>(|ctx: &mut Ctx, p| {
-        let (project, root) = root(ctx, p.project_id, p.worktree.as_deref())?;
+    // Staged (D149, RA-190): the sources are copied into the worktree's `.relay/tmp` with
+    // nothing locked; the transaction gates each destination and renames the copies into place.
+    e.register_staged::<Import, PreparedImport>(|ctx, p| {
+        let (project, root) = root_mut_unlocked(ctx, p.project_id, p.worktree.as_deref())?;
         let into_rel = rel(&p.into, true)?;
         let into = safe_join(&root, &into_rel, false)?;
         if !into.is_dir() {
@@ -269,8 +283,9 @@ pub fn register(e: &mut Engine) {
                 "destination is not a directory",
             ));
         }
-        let mut entries = Vec::new();
-        for source in &p.sources {
+        let staging = Staging::new(&root)?;
+        let mut items = Vec::new();
+        for (index, source) in p.sources.iter().enumerate() {
             let source = Path::new(source);
             if !source.is_absolute() || !source.exists() {
                 return Err(BusError::invalid(
@@ -281,19 +296,51 @@ pub fn register(e: &mut Engine) {
             let name = source
                 .file_name()
                 .ok_or_else(|| BusError::invalid("file.source", "source has no name"))?;
-            let dest = into.join(name);
+            // The copy would walk into its own staging directory and never finish.
+            if fs::symlink_metadata(source).is_ok_and(|md| md.is_dir())
+                && fs::canonicalize(source).is_ok_and(|source| root.starts_with(source))
+            {
+                return Err(BusError::invalid(
+                    "file.source",
+                    format!("{} contains the worktree it would be imported into", source.display()),
+                ));
+            }
             let dest_rel = into_rel.join(name);
-            guard_path_mutation(ctx, project.id, &root, &dest_rel, Some(source))?;
-            if dest.exists() {
+            // Checked again under the lock; here it saves copying what cannot land.
+            if occupied(&into.join(name)) {
                 return Err(BusError::conflict(
                     "file.exists",
                     format!("{} already exists", dest_rel.display()),
                 ));
             }
-            copy(source, &dest).map_err(|e| io_err("file.import_failed", &dest_rel, e))?;
+            let inner = covered_inside(ctx, project.id, source, &[&dest_rel])?;
+            let staged = staging.0.join(index.to_string());
+            copy(source, &staged).map_err(|e| io_err("file.import_failed", &dest_rel, e))?;
+            items.push(StagedImport { staged, dest_rel, inner });
+        }
+        Ok(PreparedImport { project_id: project.id, root, items, _staging: staging })
+    }, |ctx: &mut Ctx, p, prepared| {
+        let PreparedImport { project_id, root, items, _staging } = prepared;
+        // Every gate and conflict first, so a refusal part-way leaves nothing half-imported.
+        for item in &items {
+            guard_path_mutation(ctx, project_id, &root, &item.dest_rel, Some(&item.staged))?;
+            for inside in &item.inner {
+                guard_path_mutation(ctx, project_id, &root, &item.dest_rel.join(inside), Some(&item.staged.join(inside)))?;
+            }
+            if occupied(&root.join(&item.dest_rel)) {
+                return Err(BusError::conflict(
+                    "file.exists",
+                    format!("{} already exists", item.dest_rel.display()),
+                ));
+            }
+        }
+        let mut entries = Vec::new();
+        for item in &items {
+            let dest = root.join(&item.dest_rel);
+            fs::rename(&item.staged, &dest).map_err(|e| io_err("file.import_failed", &item.dest_rel, e))?;
             entries.push(entry(&root, &dest, &HashMap::new(), 0)?);
         }
-        changed(ctx, project.id, &root, &p.into);
+        changed(ctx, project_id, &root, &p.into);
         Ok(ImportOut { entries })
     });
     e.register_unlocked::<Search>(|ctx, p| {
@@ -380,14 +427,7 @@ pub fn register(e: &mut Engine) {
 /// never the project root: defaulting to the root answered a confident, well-formed, wrong
 /// question — "your" diff, read from a tree the agent has never touched — and returned no
 /// error either way (D111). `@project` asks for the root explicitly and loudly.
-pub(crate) fn default_worktree(
-    ctx: &Ctx,
-    project: &relay_bus::types::Project,
-    requested: Option<&str>,
-) -> Result<PathBuf, BusError> {
-    default_worktree_in(ctx.tx(), ctx.actor_session_id(), project, requested)
-}
-
+///
 /// The store half of worktree resolution, split out so the unlocked query context can do it in
 /// one short read and leave the `git worktree list` that validates the answer off the lock (D144).
 pub(crate) fn default_worktree_in(
@@ -411,8 +451,9 @@ pub(crate) fn default_worktree_in(
     }
 }
 
-/// The store half of [`root`]: project row plus the worktree the caller means, before any of it
-/// is checked against the repository. Cheap, and the only part that needs the connection.
+/// The store half of [`root_unlocked`] and [`root_mut`]: project row plus the worktree the
+/// caller means, before any of it is checked against the repository. Cheap, and the only part
+/// that needs the connection.
 pub(crate) fn root_choice(
     conn: &Connection,
     session_id: Option<Id>,
@@ -446,17 +487,8 @@ pub(crate) fn root_verify(
 /// The one spelling that means "the project root, deliberately".
 pub(crate) const PROJECT_ROOT: &str = "@project";
 
-fn root(
-    ctx: &Ctx,
-    project_id: Id,
-    requested: Option<&str>,
-) -> Result<(relay_bus::types::Project, PathBuf), BusError> {
-    let (project, chosen) = root_choice(ctx.tx(), ctx.actor_session_id(), project_id, requested)?;
-    let chosen = root_verify(&project, chosen, "file.worktree")?;
-    Ok((project, chosen))
-}
-
-/// [`root`] for the unlocked query context: one short read, then the subprocess with nothing held.
+/// The tree a query reads: one short read, then the subprocess with nothing held. Mutations
+/// resolve theirs through [`root_mut`], which also confines an agent to its own checkout.
 pub(crate) fn root_unlocked(
     ctx: &Unlocked,
     project_id: Id,
@@ -488,16 +520,92 @@ fn rel(value: &str, allow_empty: bool) -> Result<PathBuf, BusError> {
     Ok(path.to_path_buf())
 }
 
+/// The tree a mutation changes: an agent may change files only in its own project and its own
+/// checkout (RA-148). Naming another project, or another worktree of its own, used to be
+/// enough to write there.
+fn root_mut(
+    ctx: &Ctx,
+    project_id: Id,
+    requested: Option<&str>,
+) -> Result<(relay_bus::types::Project, PathBuf), BusError> {
+    let session_id = ctx.actor_session_id();
+    let (project, chosen) = root_choice(ctx.tx(), session_id, project_id, requested)?;
+    let own = own_checkout(ctx.tx(), &ctx.actor, session_id, project.id)?;
+    let chosen = root_verify(&project, chosen, "file.worktree")?;
+    confine(own, &chosen)?;
+    Ok((project, chosen))
+}
+
+/// [`root_mut`] for the read phase of a staged mutation.
+fn root_mut_unlocked(
+    ctx: &Unlocked,
+    project_id: Id,
+    requested: Option<&str>,
+) -> Result<(relay_bus::types::Project, PathBuf), BusError> {
+    let session_id = ctx.actor_session_id();
+    let (project, chosen, own) = ctx.read(|conn| {
+        let (project, chosen) = root_choice(conn, session_id, project_id, requested)?;
+        let own = own_checkout(conn, &ctx.actor, session_id, project.id)?;
+        Ok((project, chosen, own))
+    })?;
+    let chosen = root_verify(&project, chosen, "file.worktree")?;
+    confine(own, &chosen)?;
+    Ok((project, chosen))
+}
+
+/// The checkout an agent is confined to, or `None` for the user. Refuses another project
+/// outright, the way every other project-scoped agent op does.
+fn own_checkout(
+    conn: &Connection,
+    actor: &relay_bus::Actor,
+    session_id: Option<Id>,
+    project_id: Id,
+) -> Result<Option<PathBuf>, BusError> {
+    let Some(id) = session_id else {
+        if actor.is_agent() {
+            return Err(BusError::actor("agent actor is not bound to a live session"));
+        }
+        return Ok(None);
+    };
+    let row = crate::sessions::by_id(conn, id)?
+        .ok_or_else(|| BusError::actor("bound session vanished"))?;
+    if row.session.project_id != project_id {
+        return Err(BusError::not_own("project"));
+    }
+    Ok(Some(PathBuf::from(row.session.worktree)))
+}
+
+/// `root` (already canonical) must be the agent's own checkout.
+fn confine(own: Option<PathBuf>, root: &Path) -> Result<(), BusError> {
+    match own.map(|own| fs::canonicalize(&own).unwrap_or(own)) {
+        Some(own) if own != root => Err(BusError::not_own("worktree")),
+        _ => Ok(()),
+    }
+}
+
+/// Whether anything — a dangling symlink included — already sits at `path`. `Path::exists`
+/// follows links, so a dangling one read as free and was then written through (RA-146).
+fn occupied(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
+/// `root/rel`, refused when it resolves outside `root` through a symlink. A path that does not
+/// exist yet is judged by its nearest existing ancestor, so a nested create, write or restore
+/// can make its parents (RA-149). A symlink at the path itself must resolve: writing through
+/// a dangling one creates its target wherever it points (RA-146).
 fn safe_join(root: &Path, rel: &Path, may_not_exist: bool) -> Result<PathBuf, BusError> {
     let path = root.join(rel);
-    let check = if path.exists() {
-        fs::canonicalize(&path)
-    } else if may_not_exist {
-        fs::canonicalize(path.parent().unwrap_or(root))
-    } else {
-        fs::canonicalize(&path)
+    let check = match fs::symlink_metadata(&path) {
+        Ok(md) if md.file_type().is_symlink() => fs::canonicalize(&path).map_err(|_| {
+            BusError::invalid("file.path", format!("{} is a dangling symlink", rel.display()))
+        })?,
+        Ok(_) => fs::canonicalize(&path).map_err(|e| io_err("file.not_found", rel, e))?,
+        Err(e) if !may_not_exist => return Err(io_err("file.not_found", rel, e)),
+        Err(_) => {
+            let existing = path.ancestors().skip(1).find(|a| occupied(a)).unwrap_or(root);
+            fs::canonicalize(existing).map_err(|e| io_err("file.not_found", rel, e))?
+        }
     };
-    let check = check.map_err(|e| io_err("file.not_found", rel, e))?;
     if !check.starts_with(root) {
         return Err(BusError::invalid(
             "file.path",
@@ -595,6 +703,120 @@ fn guard_path_mutation(
 /// Shape gates validate configuration files; anything larger is not one, and is held unread.
 const SHAPE_TEXT_MAX: u64 = 4 * 1024 * 1024;
 
+/// Every path inside the directory `dir` that a protected path or shape gate would cover once
+/// it sits under one of `bases` (where it is now, where it is going), relative to `dir`.
+/// Gating a directory by its own path alone let `config/` be deleted or moved with the
+/// protected `config/prod.env` inside it (RA-147). A tree walk, so it runs in the read phase
+/// of the staged op, with nothing locked; symlinked directories are not followed, the same
+/// as the rename or copy they precede. Empty for anything that is not a directory.
+fn covered_inside(
+    ctx: &Unlocked,
+    project_id: Id,
+    dir: &Path,
+    bases: &[&Path],
+) -> Result<Vec<PathBuf>, BusError> {
+    if !fs::symlink_metadata(dir).is_ok_and(|md| md.is_dir()) {
+        return Ok(Vec::new());
+    }
+    let cfg = ctx.read(|conn| crate::guardrail::config(conn, Some(project_id)))?;
+    let patterns: Vec<&str> = cfg
+        .protected_paths
+        .iter()
+        .map(String::as_str)
+        .chain(cfg.shape_gates.iter().map(|gate| gate.path.as_str()))
+        .collect();
+    let mut covered = Vec::new();
+    if patterns.is_empty() {
+        return Ok(covered);
+    }
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let entries = fs::read_dir(&current).map_err(|e| io_err("file.walk_failed", &current, e))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| io_err("file.walk_failed", &current, e))?;
+            let path = entry.path();
+            let inner = path.strip_prefix(dir).unwrap_or(&path).to_path_buf();
+            if bases.iter().any(|base| {
+                let at = base.join(&inner);
+                patterns.iter().any(|pattern| crate::guardrail::path_matches(pattern, &at))
+            }) {
+                covered.push(inner);
+            }
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                stack.push(path);
+            }
+        }
+    }
+    Ok(covered)
+}
+
+/// A scratch path under the worktree's `.relay/tmp`, removed when dropped unless its contents
+/// were moved into place. A staged op that never reaches its transaction — a refused hold, a
+/// failed confirm — leaves nothing behind.
+struct Staging(PathBuf);
+
+impl Staging {
+    fn new(root: &Path) -> Result<Self, BusError> {
+        let path = root.join(".relay").join("tmp").join(format!("import-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&path).map_err(|e| io_err("file.import_failed", &path, e))?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// What a staged rename, move or delete settled before its transaction.
+struct PreparedPath {
+    project_id: Id,
+    root: PathBuf,
+    from_rel: PathBuf,
+    /// Where a rename or move lands; `None` for a delete.
+    into_rel: Option<PathBuf>,
+    /// Paths inside a directory source that a gate covers, relative to it ([`covered_inside`]).
+    inner: Vec<PathBuf>,
+}
+
+/// The transaction half of `file.rename` and `file.move`: gate the source and destination,
+/// and every gated path inside a directory at both ends, then rename.
+fn relocate(ctx: &mut Ctx, prepared: PreparedPath, code: &str) -> Result<Entry, BusError> {
+    let PreparedPath { project_id, root, from_rel, into_rel, inner } = prepared;
+    let into_rel = into_rel.ok_or_else(|| BusError::internal("relocate without a destination"))?;
+    let (from, into) = (root.join(&from_rel), root.join(&into_rel));
+    guard_path_mutation(ctx, project_id, &root, &from_rel, None)?;
+    guard_path_mutation(ctx, project_id, &root, &into_rel, Some(&from))?;
+    for inside in &inner {
+        guard_path_mutation(ctx, project_id, &root, &from_rel.join(inside), None)?;
+        guard_path_mutation(ctx, project_id, &root, &into_rel.join(inside), Some(&from.join(inside)))?;
+    }
+    if occupied(&into) {
+        return Err(BusError::conflict(
+            "file.exists",
+            format!("{} already exists", into_rel.display()),
+        ));
+    }
+    fs::rename(&from, &into).map_err(|e| io_err(code, &from_rel, e))?;
+    changed(ctx, project_id, &root, &into_rel.to_string_lossy());
+    entry(&root, &into, &HashMap::new(), 0)
+}
+
+/// One source of a staged `file.import`, already copied into the staging directory.
+struct StagedImport {
+    staged: PathBuf,
+    dest_rel: PathBuf,
+    inner: Vec<PathBuf>,
+}
+
+struct PreparedImport {
+    project_id: Id,
+    root: PathBuf,
+    items: Vec<StagedImport>,
+    _staging: Staging,
+}
+
 fn changed(ctx: &mut Ctx, project_id: Id, root: &Path, path: &str) {
     ctx.set_project(project_id);
     ctx.emit(
@@ -603,10 +825,20 @@ fn changed(ctx: &mut Ctx, project_id: Id, root: &Path, path: &str) {
     );
 }
 
+/// How long `file.write` may spend diffing for its line counts. It runs under the store lock,
+/// and Myers is quadratic in the worst case: a rewrite of a large generated file took seconds
+/// with every other request queued behind it (RA-145). Past the deadline `similar` finishes
+/// with a coarser diff, so the counts stay a true (if not minimal) account of the change.
+const LINE_COUNT_DEADLINE: std::time::Duration = std::time::Duration::from_millis(50);
+
 fn line_counts(old: &str, new: &str) -> (i64, i64) {
     let mut removed = 0;
     let mut added = 0;
-    for change in TextDiff::from_lines(old, new).iter_all_changes() {
+    let diff = TextDiff::configure()
+        .algorithm(similar::Algorithm::Myers)
+        .timeout(LINE_COUNT_DEADLINE)
+        .diff_lines(old, new);
+    for change in diff.iter_all_changes() {
         match change.tag() {
             ChangeTag::Delete => removed += 1,
             ChangeTag::Insert => added += 1,
@@ -706,4 +938,21 @@ fn mime(path: &Path) -> String {
 
 fn io_err(code: &str, path: impl AsRef<Path>, e: std::io::Error) -> BusError {
     BusError::unavailable(code, format!("{}: {e}", path.as_ref().display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RA-145: every line different is Myers' worst case, quadratic in the line count. The
+    /// deadline bounds it, and the counts it settles on are still the whole change.
+    #[test]
+    fn line_counts_for_a_total_rewrite_return_within_the_deadline() {
+        let old: String = (0..20_000).map(|i| format!("old {i}\n")).collect();
+        let new: String = (0..20_000).map(|i| format!("new {i}\n")).collect();
+        let started = std::time::Instant::now();
+        assert_eq!(line_counts(&old, &new), (20_000, 20_000));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "took {:?}", started.elapsed());
+        assert_eq!(line_counts("a\nb\nc\n", "a\nc\nd\n"), (1, 1));
+    }
 }
