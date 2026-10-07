@@ -69,10 +69,6 @@ button.registry-action.danger:hover { background: alpha(@held, 0.12); }
 .registry-editor entry.invalid { border-color: @held; }
 .registry-editor entry.registry-mono { font-family: 'Fira Mono', monospace; font-size: 12px; }
 .registry-switch-row { padding-top: 6px; }
-.registry-editor switch { min-width: 34px; min-height: 18px; border: 1px solid @strong; border-radius: 2px; background: @screen; box-shadow: none; }
-.registry-editor switch:checked { border-color: @ink; background: @ink; }
-.registry-editor switch slider { min-width: 14px; min-height: 14px; margin: 1px; border: 0; border-radius: 1px; background: @secondary; box-shadow: none; }
-.registry-editor switch:checked slider { background: @wall; }
 .registry-editor-actions { padding: 0 0 2px; }
 .registry-editor-actions button { min-height: 30px; }
 .registry-status { color: @faint; font-size: 12px; }
