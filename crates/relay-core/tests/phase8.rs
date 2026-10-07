@@ -1,46 +1,19 @@
 //! Phase 8 bus-driven coverage: files, git, guardrail replay, and integrations.
 
-use relay_bus::{Actor, BusError, ErrorKind, Request, Response};
-use relay_core::engine::{Door, Engine};
-use relay_core::{Instance, Store};
-use serde_json::{json, Value};
+mod common;
+
+use common::{call, committed_repo, engine, err, git, git_command};
+use relay_bus::ErrorKind;
+use relay_core::engine::Engine;
+use relay_core::Instance;
+use serde_json::json;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
-use std::sync::Arc;
 
-fn engine() -> Arc<Engine> {
-    Engine::new(Instance::Test, Store::open_memory().unwrap())
-}
-fn call(e: &Engine, op: &str, payload: Value) -> Response {
-    e.dispatch(Request::new(Actor::User, op, payload), Door::InProcess)
-}
-fn err(r: &Response) -> &BusError {
-    r.error.as_ref().expect("expected an error response")
-}
-fn git(repo: &std::path::Path, args: &[&str]) {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "git {}: {}",
-        args.join(" "),
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
 fn real_repo() -> (tempfile::TempDir, String) {
     let ws = tempfile::tempdir().unwrap();
     let repo = ws.path().join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "-b", "main"]);
-    git(&repo, &["config", "user.name", "Relay Test"]);
-    git(&repo, &["config", "user.email", "relay@example.test"]);
-    std::fs::write(repo.join("README.md"), "# Relay\n").unwrap();
-    git(&repo, &["add", "README.md"]);
-    git(&repo, &["commit", "-m", "Initial"]);
+    committed_repo(&repo, &[("README.md", "# Relay\n")]);
     let path = std::fs::canonicalize(&repo).unwrap().display().to_string();
     (ws, path)
 }
@@ -515,17 +488,21 @@ fn integration_merges_two_branches_and_reports_result() {
     .into_result()
     .unwrap();
     let id = queued["id"].as_i64().unwrap();
-    let mut state = String::new();
-    for _ in 0..100 {
+    // A worktree add and an octopus merge on a background thread, while the other tests run git
+    // too: allow it the time a loaded machine needs, and stop as soon as it settles.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let state = loop {
         let value = call(&e, "integration.get", json!({"integration_id":id}))
             .into_result()
             .unwrap();
-        state = value["state"].as_str().unwrap().to_string();
-        if matches!(state.as_str(), "passed" | "failed" | "conflict") {
-            break;
+        let state = value["state"].as_str().unwrap().to_string();
+        if matches!(state.as_str(), "passed" | "failed" | "conflict")
+            || std::time::Instant::now() >= deadline
+        {
+            break state;
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+    };
     assert_eq!(state, "passed");
     let value = call(&e, "integration.get", json!({"integration_id":id}))
         .into_result()
@@ -633,6 +610,10 @@ fn file_save_expectation_rejects_stale_content_and_deleted_files() {
 #[test]
 fn filesystem_reads_do_not_retrigger_refresh_but_writes_do() {
     use std::time::{Duration, Instant};
+    // The watcher emits from a thread that sleeps 125 ms after the first event of a burst
+    // (watch.rs). A "nothing arrived" check only means something if its window is well past
+    // that, or a delayed thread lets it pass without testing anything.
+    const QUIET: Duration = Duration::from_millis(8 * 125);
     let e = engine();
     let (ws, repo) = real_repo();
     add_project(&e, &ws, &repo);
@@ -648,7 +629,7 @@ fn filesystem_reads_do_not_retrigger_refresh_but_writes_do() {
         assert!(Instant::now() < deadline, "watcher did not register");
         std::thread::sleep(Duration::from_millis(10));
     }
-    std::thread::sleep(Duration::from_millis(250));
+    std::thread::sleep(QUIET);
     while events.try_recv().is_ok() {}
     for _ in 0..3 {
         call(&e, "file.tree", json!({"project_id":1,"depth":1}))
@@ -658,7 +639,7 @@ fn filesystem_reads_do_not_retrigger_refresh_but_writes_do() {
         call(&e, "git.status", json!({"project_id":1}))
             .into_result().unwrap();
     }
-    std::thread::sleep(Duration::from_millis(350));
+    std::thread::sleep(QUIET);
     while let Ok(event) = events.try_recv() {
         assert_ne!(event.ev, "file.changed", "read-only refresh retriggered watcher");
     }
@@ -667,7 +648,7 @@ fn filesystem_reads_do_not_retrigger_refresh_but_writes_do() {
         std::fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
         std::fs::write(root.join(path), "generated output").unwrap();
     }
-    std::thread::sleep(Duration::from_millis(350));
+    std::thread::sleep(QUIET);
     while let Ok(event) = events.try_recv() {
         assert_ne!(event.ev, "file.changed", "LFS or Unreal output retriggered watcher");
     }
@@ -681,7 +662,7 @@ fn filesystem_reads_do_not_retrigger_refresh_but_writes_do() {
         std::thread::sleep(Duration::from_millis(10));
     }
     // Index metadata refreshes are ignored, but actual staging still refreshes Git.
-    assert!(std::process::Command::new("git").arg("-C").arg(&repo)
+    assert!(git_command(&repo)
         .args(["add", "README.md"]).status().unwrap().success());
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
@@ -792,7 +773,7 @@ fn integrations_run_one_at_a_time_and_only_the_newest_keep_their_checkouts() {
         let value = call(&e, "integration.get", json!({"integration_id":id})).into_result().unwrap();
         let wt = std::path::Path::new(value["worktree"].as_str().unwrap());
         let branch = format!("refs/heads/relay/integration-{id}");
-        let has_branch = Command::new("git").arg("-C").arg(path).args(["rev-parse", "--verify", "--quiet", &branch]).status().unwrap().success();
+        let has_branch = git_command(path).args(["rev-parse", "--verify", "--quiet", &branch]).status().unwrap().success();
         if n < 2 {
             assert_eq!(value["state"], "discarded", "integration {id}");
             assert!(!wt.exists() && !has_branch, "integration {id} kept its checkout");
@@ -811,7 +792,7 @@ fn commit_publishes_the_gated_object_signs_when_asked_and_concludes_merges() {
     let (ws, repo) = real_repo();
     add_project(&e, &ws, &repo);
     let path = std::path::Path::new(&repo);
-    let head = |rev: &str| String::from_utf8(Command::new("git").arg("-C").arg(path).args(["rev-parse", rev]).output().unwrap().stdout).unwrap().trim().to_string();
+    let head = |rev: &str| String::from_utf8(git_command(path).args(["rev-parse", rev]).output().unwrap().stdout).unwrap().trim().to_string();
 
     // Nothing staged is refused, as `git commit` refuses it.
     let empty = call(&e, "git.commit", json!({"project_id":1,"message":"nothing"}));
@@ -822,9 +803,9 @@ fn commit_publishes_the_gated_object_signs_when_asked_and_concludes_merges() {
     let out = call(&e, "git.commit", json!({"project_id":1,"message":"\nAdd a  \n\n\nbody\n","all":true})).into_result().unwrap();
     assert_eq!(out["sha"].as_str().unwrap(), head("main"), "the branch moved to the new commit");
     assert_eq!(head("HEAD~1"), before);
-    let message = String::from_utf8(Command::new("git").arg("-C").arg(path).args(["log", "-1", "--format=%B"]).output().unwrap().stdout).unwrap();
+    let message = String::from_utf8(git_command(path).args(["log", "-1", "--format=%B"]).output().unwrap().stdout).unwrap();
     assert_eq!(message.trim_end(), "Add a\n\nbody");
-    let reflog = String::from_utf8(Command::new("git").arg("-C").arg(path).args(["reflog", "-1", "--format=%gs", "main"]).output().unwrap().stdout).unwrap();
+    let reflog = String::from_utf8(git_command(path).args(["reflog", "-1", "--format=%gs", "main"]).output().unwrap().stdout).unwrap();
     assert_eq!(reflog.trim(), "commit: Add a");
 
     // commit.gpgSign is honoured: with a signer that always fails, the commit fails and the
@@ -835,7 +816,7 @@ fn commit_publishes_the_gated_object_signs_when_asked_and_concludes_merges() {
     let unsigned = call(&e, "git.commit", json!({"project_id":1,"message":"Add b","all":true}));
     assert_eq!(err(&unsigned).code, "git.commit_failed");
     assert_eq!(head("main"), out["sha"].as_str().unwrap());
-    git(path, &["config", "--unset", "commit.gpgsign"]);
+    git(path, &["config", "commit.gpgsign", "false"]);
     git(path, &["config", "--unset", "gpg.program"]);
     git(path, &["reset", "-q"]);
     std::fs::remove_file(path.join("b.txt")).unwrap();
@@ -847,7 +828,7 @@ fn commit_publishes_the_gated_object_signs_when_asked_and_concludes_merges() {
     git(path, &["checkout", "-q", "main"]);
     std::fs::write(path.join("a.txt"), "main\n").unwrap();
     git(path, &["commit", "-qam", "main"]);
-    assert!(!Command::new("git").arg("-C").arg(path).args(["merge", "side"]).output().unwrap().status.success());
+    assert!(!git_command(path).args(["merge", "side"]).output().unwrap().status.success());
     std::fs::write(path.join("a.txt"), "both\n").unwrap();
     // Not until the resolution is staged: `all` would stage markers just the same (RA-204).
     assert_eq!(err(&call(&e, "git.commit", json!({"project_id":1,"message":"Merge side","all":true}))).code, "git.unmerged");

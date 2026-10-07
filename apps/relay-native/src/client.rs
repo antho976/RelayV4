@@ -14,7 +14,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
 use uuid::Uuid;
 
-type Pending = Arc<Mutex<HashMap<Uuid, oneshot::Sender<Result<Value, Error>>>>>;
+/// Replies awaited on one connection. `None` once the connection is gone: taking the map and
+/// refusing new requests happen under the same lock, so no request slips in after the drain.
+type Pending = Arc<Mutex<Option<HashMap<Uuid, oneshot::Sender<Result<Value, Error>>>>>>;
 
 /// Which of the three line shapes a socket line carries.
 enum Shape {
@@ -80,7 +82,7 @@ fn request_timeout(op: &str) -> Duration {
     match op {
         "project.clone" => Duration::from_secs(1800),
         // A new checkout may hydrate large LFS assets after the bounded fetch.
-        "session.create" | "git.worktree.create" | "task.dispatch" => Duration::from_secs(180),
+        "session.create" | "worktree.create" | "task.dispatch" => Duration::from_secs(180),
         _ => Duration::from_secs(30),
     }
 }
@@ -126,7 +128,7 @@ impl Drop for Connection {
         for task in &self.tasks {
             task.abort();
         }
-        self.pending.lock().unwrap().clear();
+        self.pending.lock().unwrap().take();
         self.notices.close();
     }
 }
@@ -190,7 +192,7 @@ impl Client {
             .await
             .map_err(|e| Error::Io(format!("Cannot connect to {}: {e}", path.display())))?;
         let (read, mut write) = socket.into_split();
-        let pending: Pending = Arc::default();
+        let pending: Pending = Arc::new(Mutex::new(Some(HashMap::new())));
         let (tx, mut rx) = mpsc::channel::<Request>(QUEUE);
         let (notices, receiver) = async_channel::bounded(QUEUE);
         let waiting = pending.clone();
@@ -238,7 +240,8 @@ impl Client {
                                 if let Some(id) = head_string(&line, br#"{"v":1,"id":""#)
                                     .and_then(|id| Uuid::parse_str(&id).ok())
                                 {
-                                    if let Some(reply) = waiting.lock().unwrap().remove(&id) {
+                                    let reply = waiting.lock().unwrap().as_mut().and_then(|w| w.remove(&id));
+                                    if let Some(reply) = reply {
                                         let _ = reply.send(Err(Error::TooLarge(max_line)));
                                     }
                                     continue;
@@ -304,7 +307,8 @@ impl Client {
                         let id = response
                             .id
                             .ok_or_else(|| Error::Protocol("response has no request id".into()))?;
-                        if let Some(reply) = waiting.lock().unwrap().remove(&id) {
+                        let reply = waiting.lock().unwrap().as_mut().and_then(|w| w.remove(&id));
+                        if let Some(reply) = reply {
                             let _ = reply.send(response.into_result().map_err(Error::from));
                         }
                     }
@@ -312,10 +316,12 @@ impl Client {
             }
             .await;
             let error = outcome.unwrap_err();
-            for (_, reply) in waiting.lock().unwrap().drain() {
+            // Taking the map refuses new requests in the same step, so none is written after the
+            // drain only to wait out its timeout. Notify, then close so drains cannot wait forever.
+            let waiting = waiting.lock().unwrap().take();
+            for (_, reply) in waiting.into_iter().flatten() {
                 let _ = reply.send(Err(error.clone()));
             }
-            // Close before notifying so request callers and drains cannot wait forever.
             let _ = reader_notices.send(Notice::Disconnected(error)).await;
             reader_notices.close();
         });
@@ -328,7 +334,8 @@ impl Client {
                 bytes.push(b'\n');
                 if let Err(e) = write.write_all(&bytes).await {
                     reader_abort.abort();
-                    for (_, reply) in waiting.lock().unwrap().drain() {
+                    let waiting = waiting.lock().unwrap().take();
+                    for (_, reply) in waiting.into_iter().flatten() {
                         let _ = reply.send(Err(Error::Disconnected));
                     }
                     let _ = writer_notices
@@ -361,18 +368,20 @@ impl Client {
         payload: Value,
         id: Uuid,
     ) -> Result<Value, Error> {
-        if self.0.notices.is_closed() {
-            return Err(Error::Disconnected);
-        }
         let mut request = Request::new(Actor::User, op, payload);
         request.id = id;
         let (send, reply) = oneshot::channel();
-        self.0.pending.lock().unwrap().insert(id, send);
+        match self.0.pending.lock().unwrap().as_mut() {
+            Some(pending) => pending.insert(id, send),
+            None => return Err(Error::Disconnected),
+        };
         // Clean up even if the GTK future is cancelled while awaiting an answer.
         struct Remove(Pending, Uuid);
         impl Drop for Remove {
             fn drop(&mut self) {
-                self.0.lock().unwrap().remove(&self.1);
+                if let Some(pending) = self.0.lock().unwrap().as_mut() {
+                    pending.remove(&self.1);
+                }
             }
         }
         let _remove = Remove(self.0.pending.clone(), id);
@@ -564,7 +573,7 @@ mod tests {
         assert!(matches!(notices.recv().await.unwrap(), Notice::Event(_)));
         assert!(client.request(&rt, "c", Value::Null).await.is_err());
         fixture.await.unwrap();
-        assert!(client.0.pending.lock().unwrap().is_empty());
+        assert!(client.0.pending.lock().unwrap().is_none());
         std::fs::remove_file(path).unwrap();
     }
 }

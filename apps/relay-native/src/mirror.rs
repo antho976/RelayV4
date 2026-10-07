@@ -23,6 +23,7 @@ use gtk::prelude::*;
 use gtk4 as gtk;
 use serde_json::{json, Value};
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::{Rc, Weak};
 use std::time::Duration;
@@ -171,6 +172,9 @@ struct MirrorView {
     host: RefCell<Host>,
     fullscreen: Cell<bool>,
     pointer: Cell<Option<(f64, f64)>>,
+    /// The Android key sent down for each hardware key still held, so its release sends the
+    /// same key up whatever the modifiers are by then, and a key never sent down sends nothing.
+    held: RefCell<HashMap<u32, u32>>,
 }
 
 impl MirrorView {
@@ -379,6 +383,7 @@ impl MirrorView {
             host: RefCell::new(Host::None),
             fullscreen: Cell::new(false),
             pointer: Cell::new(None),
+            held: RefCell::default(),
         });
         view.wire();
         view
@@ -532,7 +537,7 @@ impl MirrorView {
     fn wire_keys(self: &Rc<Self>) {
         let keys = gtk::EventControllerKey::new();
         let weak = Rc::downgrade(self);
-        keys.connect_key_pressed(move |_, key, _, modifiers| {
+        keys.connect_key_pressed(move |_, key, hardware, modifiers| {
             let Some(view) = weak.upgrade() else { return glib::Propagation::Proceed };
             if key == gtk::gdk::Key::F11 || (key == gtk::gdk::Key::Escape && view.fullscreen.get()) {
                 view.toggle_fullscreen();
@@ -560,6 +565,7 @@ impl MirrorView {
             let meta = input::meta(modifiers);
             if let Some(code) = input::keycode(key).or_else(|| (ctrl || alt).then(|| input::chord_keycode(key)).flatten()) {
                 view.send(json!({"type":"key","action":0,"keycode":code,"meta":meta}));
+                view.held.borrow_mut().insert(hardware, code);
                 return glib::Propagation::Stop;
             }
             if !ctrl && !alt {
@@ -571,16 +577,10 @@ impl MirrorView {
             glib::Propagation::Proceed
         });
         let weak = Rc::downgrade(self);
-        keys.connect_key_released(move |_, key, _, modifiers| {
+        keys.connect_key_released(move |_, _, hardware, modifiers| {
             let Some(view) = weak.upgrade() else { return };
-            if view.phase.get() != Phase::Live || key == gtk::gdk::Key::F11 {
-                return;
-            }
-            let ctrl = modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK);
-            let alt = modifiers.contains(gtk::gdk::ModifierType::ALT_MASK);
-            if let Some(code) = input::keycode(key).or_else(|| (ctrl || alt).then(|| input::chord_keycode(key)).flatten()) {
-                view.send(json!({"type":"key","action":1,"keycode":code,"meta":input::meta(modifiers)}));
-            }
+            let Some(code) = view.held.borrow_mut().remove(&hardware) else { return };
+            view.send(json!({"type":"key","action":1,"keycode":code,"meta":input::meta(modifiers)}));
         });
         self.root.add_controller(keys);
     }
@@ -624,6 +624,10 @@ impl MirrorView {
                 window.set_child(None::<&gtk::Widget>);
                 // `destroy`, not `close`: close-request is what ends the mirror.
                 window.destroy();
+                // A destroyed window never reports leaving full screen; the view leaves it here.
+                self.fullscreen.set(false);
+                self.root.remove_css_class("fullscreen");
+                glyphs::rekey(&self.fullscreen_key, "fullscreen", "Full screen (F11)");
             }
             Host::Dock(dock) => {
                 dock.body.remove(&self.root);
@@ -679,9 +683,13 @@ impl MirrorView {
 
     fn dock(self: &Rc<Self>) {
         let Some(ui) = self.ui.upgrade() else { return };
-        // The dock takes the right edge; a sheet already there (the Devices panel the mirror
-        // was opened from) would sit on top of or under it, so it steps aside.
-        let _ = ui.dismiss_panels();
+        // The dock takes the right edge; the Devices panel the mirror was opened from would sit
+        // on top of or under it, so it steps aside. Only that one: a run's log panel closed
+        // here could not be reopened, and a panel with unsaved changes stays.
+        let panels = ui.panels.borrow().clone();
+        for panel in panels.iter().filter(|panel| std::iter::successors(panel.body.parent(), |widget| widget.parent()).any(|widget| widget.has_css_class("device-panel"))) {
+            panel.close();
+        }
         // One dock: a mirror already docked moves out to its own window.
         let docked = VIEWS.with(|views| {
             views.borrow().iter().filter(|view| !Rc::ptr_eq(view, self) && matches!(*view.host.borrow(), Host::Dock(_))).cloned().collect::<Vec<_>>()
@@ -724,6 +732,7 @@ impl MirrorView {
             task.abort();
         }
         self.input.borrow_mut().take();
+        self.held.borrow_mut().clear();
         self.release();
         // By identity: a view still booting its AVD has no serial yet.
         VIEWS.with(|views| views.borrow_mut().retain(|view| !std::ptr::eq(Rc::as_ptr(view), self)));
@@ -734,11 +743,20 @@ impl MirrorView {
         if model.is_empty() { format!("Device · {}", self.device.borrow()) } else { format!("{model} · Relay") }
     }
 
+    /// The main window's monitor, in logical pixels.
+    fn screen(ui: &Ui) -> (i32, i32) {
+        let monitor = ui.window.surface().and_then(|surface| WidgetExt::display(&ui.window).monitor_at_surface(&surface));
+        monitor.map(|monitor| (monitor.geometry().width(), monitor.geometry().height())).unwrap_or((1920, 1080))
+    }
+
+    /// The tallest a mirror window asks to be.
+    fn max_height(ui: &Ui) -> i32 {
+        (Self::screen(ui).1 * 85 / 100).clamp(560, 960)
+    }
+
     /// A phone-shaped window: tall, sized to the monitor, wide enough for the key rail.
     fn window_size(&self, ui: &Ui) -> (i32, i32) {
-        let monitor = ui.window.surface().and_then(|surface| WidgetExt::display(&ui.window).monitor_at_surface(&surface));
-        let screen = monitor.map(|monitor| monitor.geometry().height()).unwrap_or(1080);
-        let height = (screen * 85 / 100).clamp(560, 960);
+        let height = Self::max_height(ui);
         let (w, h) = match self.dims.get() {
             (w, h) if w > 0 && h > 0 => (w as f64, h as f64),
             _ => (9.0, 19.5),
@@ -765,6 +783,7 @@ impl MirrorView {
         }
         let (input, inputs) = async_channel::unbounded();
         *self.input.borrow_mut() = Some(input);
+        self.held.borrow_mut().clear();
         self.display_on.set(true);
         glyphs::rekey(&self.display_key, "screen-off", "Turn the device screen off (mirroring continues)");
         if self.booting.get() {
@@ -1011,13 +1030,19 @@ impl MirrorView {
         self.aspect.set_ratio(w as f32 / h as f32);
         self.update_meta();
         // The device rotated: turn the window with it, so a landscape app is not a thin strip
-        // in a tall window. The phone area swaps axes; the chrome around it stays put.
+        // in a tall window. The phone's width becomes its height, within what a new window may
+        // take, and the width follows the picture; the chrome around it stays put.
         let rotated = ow > 0 && oh > 0 && (ow > oh) != (w > h);
-        if let Host::Window(window) = &*self.host.borrow() {
+        if let (Host::Window(window), Some(ui)) = (&*self.host.borrow(), self.ui.upgrade()) {
             if rotated && !window.is_fullscreen() && !window.is_maximized() {
-                let (cw, ch) = (window.width(), window.height());
-                let (phone_w, phone_h) = ((cw - CHROME_W).max(120), (ch - CHROME_H).max(120));
-                window.set_default_size(phone_h + CHROME_W, phone_w + CHROME_H);
+                let ratio = w as f64 / h as f64;
+                let widest = Self::screen(&ui).0 * 9 / 10 - CHROME_W;
+                let mut phone_h = (window.width() - CHROME_W).clamp(120, Self::max_height(&ui) - CHROME_H);
+                if (phone_h as f64 * ratio) as i32 > widest {
+                    phone_h = (widest as f64 / ratio) as i32;
+                }
+                let phone_w = (phone_h as f64 * ratio) as i32;
+                window.set_default_size(phone_w + CHROME_W, phone_h + CHROME_H);
             }
         }
     }
@@ -1053,13 +1078,19 @@ impl MirrorView {
         let name = format!("{}-{stamp}.png", self.name().replace(' ', "-"));
         let chooser = gtk::FileDialog::builder().title("Save device screenshot").initial_name(name.as_str()).build();
         let parent = self.root.root().and_downcast::<gtk::Window>();
+        let Some(rt) = self.ui.upgrade().map(|ui| ui.rt.clone()) else { return };
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
             let Ok(file) = chooser.save_future(parent.as_ref()).await else { return };
-            let Some(path) = file.path() else { return };
+            // Encode on the blocking pool and write through GIO, so a slow disk never stalls
+            // the main loop and a location with no local path still saves.
+            let saved = match rt.spawn_blocking(move || texture.save_to_png_bytes()).await {
+                Ok(bytes) => file.replace_contents_future(bytes, None, false, gtk::gio::FileCreateFlags::REPLACE_DESTINATION).await.map(|_| ()).map_err(|(_, error)| error.to_string()),
+                Err(error) => Err(error.to_string()),
+            };
             let Some(view) = weak.upgrade() else { return };
-            match texture.save_to_png(&path) {
-                Ok(()) => view.flash(&format!("Saved {}", path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())),
+            match saved {
+                Ok(()) => view.flash(&format!("Saved {}", file.basename().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())),
                 Err(error) => view.flash(&format!("Could not save the screenshot: {error}")),
             }
         });

@@ -492,6 +492,10 @@ impl Ui {
                 ("trash", "Remove project…", true, Rc::new(move |ui: &Rc<Ui>| ui.confirm_registry_remove(&remove, false, None))),
             ]
         };
+        // A repository that moved: point the project at its new place instead of removing it.
+        if !workspace && !std::path::Path::new(text(value, "path")).exists() {
+            entries.push(("folder", "Relink…", false, Rc::new(move |ui: &Rc<Ui>| ui.relink_project(id))));
+        }
         entries.sort_by_key(|entry| entry.2);
         let mut separated = false;
         for (icon, caption, danger, action) in entries {
@@ -580,6 +584,28 @@ impl Ui {
         } else {
             "Their worktrees and branches stay on disk. Repository files are never touched."
         };
+        // What goes for good, counted by the engine once the dialog is up.
+        if !projects.is_empty() {
+            let content = paragraph(if workspace { "Their tasks, notes and modules are deleted from Relay." } else { "Its tasks, notes and modules are deleted from Relay." });
+            facts.append(&content);
+            let weak = Rc::downgrade(self);
+            let payload = if workspace { json!({"workspace_id": id}) } else { json!({"project_id": id}) };
+            let content = content.downgrade();
+            glib::spawn_future_local(async move {
+                let Some(ui) = weak.upgrade() else { return };
+                let Ok(counts) = ui.call("project.remove.preview", payload).await else { return };
+                let Some(content) = content.upgrade() else { return };
+                let n = |key: &str| counts[key].as_u64().unwrap_or(0) as usize;
+                let (tasks, notes, modules) = (n("tasks"), n("notes"), n("modules"));
+                content.set_text(&if tasks + notes + modules == 0 {
+                    format!("{} no tasks, notes or modules.", if workspace { "They have" } else { "It has" })
+                } else {
+                    format!("{} {}, {} and {} are deleted from Relay.", if workspace { "Their" } else { "Its" },
+                        plural(tasks, "task", "tasks"), plural(notes, "note", "notes"), plural(modules, "module", "modules"))
+                });
+            });
+            facts.append(&paragraph("Relay backs up its store first, so they can be restored from that backup."));
+        }
         let disk = paragraph(keep);
         facts.append(&disk);
         body.append(&facts);
@@ -670,13 +696,52 @@ impl Ui {
         cancel.grab_focus();
     }
 
+    /// Every project's id in sidebar order.
+    pub(crate) fn project_order(&self) -> Vec<i64> {
+        let all = self.projects.borrow();
+        self.workspaces.borrow().iter().flat_map(|w| sorted_children(&all, w)).map(id_of).collect()
+    }
+
+    /// Move the wall off the active project, which `self.projects` no longer lists: to its
+    /// nearest remaining neighbour in `order` (the sidebar order from before it went), else
+    /// the first project left, else none. A removal made here and one a refresh finds both
+    /// come through here. False when unsaved work keeps the wall where it is.
+    pub(crate) fn leave_removed_project(self: &Rc<Self>, order: &[i64]) -> bool {
+        let active = self.project.get();
+        if self.editor.is_dirty() {
+            self.show_error("The selected project was removed. Save or copy your editor changes before selecting another project.");
+            return false;
+        }
+        let live: Vec<i64> = self.projects.borrow().iter().map(id_of).collect();
+        let at = order.iter().position(|&id| id == active).unwrap_or(0);
+        let next = order[at..].iter().chain(order[..at].iter().rev()).copied().find(|id| live.contains(id));
+        let page = self.page.borrow().clone();
+        self.open_project(next.or_else(|| live.first().copied()).unwrap_or(0), &page);
+        self.project.get() != active
+    }
+
+    /// Ask where the project's repository is now and relink it there (`project.relink`).
+    fn relink_project(self: &Rc<Self>, id: i64) {
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let Some(ui) = weak.upgrade() else { return };
+            let dialog = gtk::FileDialog::builder().title("Where is this repository now?").build();
+            let Ok(file) = dialog.select_folder_future(Some(&ui.window)).await else { return };
+            let Some(path) = file.path() else { return };
+            match ui.call("project.relink", json!({"project_id": id, "path": path})).await {
+                Ok(_) => {
+                    ui.registry_dirty.set(true);
+                    ui.refresh();
+                }
+                Err(e) => ui.show_error(&e.to_string()),
+            }
+        });
+    }
+
     /// Forget removed rows at once and move the wall off a removed project, to its nearest
     /// remaining neighbour in sidebar order.
     fn registry_removed(self: &Rc<Self>, projects: &[i64], workspace: Option<i64>) {
-        let order: Vec<i64> = {
-            let all = self.projects.borrow();
-            self.workspaces.borrow().iter().flat_map(|w| sorted_children(&all, w)).map(id_of).collect()
-        };
+        let order = self.project_order();
         self.projects.borrow_mut().retain(|p| !projects.contains(&id_of(p)));
         if let Some(ws) = workspace {
             self.workspaces.borrow_mut().retain(|w| id_of(w) != ws);
@@ -687,21 +752,8 @@ impl Ui {
             self.save_collapsed();
         }
         self.registry_dirty.set(true);
-        let active = self.project.get();
-        if projects.contains(&active) {
-            let at = order.iter().position(|&id| id == active).unwrap_or(0);
-            let next = order[at..].iter().chain(order[..at].iter().rev()).copied().find(|id| !projects.contains(id));
-            match next {
-                Some(next) => {
-                    let page = self.page.borrow().clone();
-                    self.open_project(next, &page);
-                }
-                None => {
-                    self.project.set(0);
-                    self.sessions.borrow_mut().clear();
-                    self.reconcile();
-                }
-            }
+        if projects.contains(&self.project.get()) {
+            self.leave_removed_project(&order);
         }
         sidebar(|s| s.rendered = None);
         self.refresh();
@@ -711,7 +763,7 @@ impl Ui {
     /// when something changed and everything is valid.
     pub(crate) fn registry_editor(self: &Rc<Self>, value: Value, workspace: bool) {
         let title = if workspace { "Workspace settings" } else { "Project settings" };
-        let Some((panel, body)) = self.sheet(title, 460, 0) else {
+        let Some((panel, body)) = self.sheet(title, 460) else {
             return;
         };
         panel.add_css_class("registry-editor");

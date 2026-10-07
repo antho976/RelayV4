@@ -295,7 +295,9 @@ impl Editor {
         self.target.set_visible(scope != Scope::Global);
     }
 
-    fn load(self: &Rc<Self>) {
+    /// Read the layers again; `done` is the status once they are in (a save's confirmation
+    /// would otherwise be cleared by the reload it starts).
+    fn load(self: &Rc<Self>, done: &'static str) {
         let Some(ui) = self.ui.upgrade() else { return };
         self.generation.set(self.generation.get() + 1);
         let generation = self.generation.get();
@@ -318,7 +320,7 @@ impl Editor {
                         row.input_widget_sensitive(true);
                     }
                     editor.fill();
-                    editor.status.set_text("");
+                    editor.status.set_text(done);
                 }
                 Err(e) => editor.status.set_text(&format!(
                     "Cannot read guardrail layers: {e}. A Relay engine older than this window does not know them; restart it after rebuilding."
@@ -367,14 +369,16 @@ impl Editor {
         glib::spawn_future_local(async move {
             match ui.call("guardrail.config.set", payload).await {
                 Ok(_) => {
-                    if editor.scope.get() == scope {
-                        editor.load();
-                    }
-                    editor.status.set_text(match scope {
+                    let saved = match scope {
                         Scope::Global => "Saved. Applies everywhere it is not overridden.",
                         Scope::Workspace(_) => "Saved for this workspace.",
                         Scope::Project(_) => "Saved for this project.",
-                    });
+                    };
+                    if editor.scope.get() == scope {
+                        editor.load(saved);
+                    } else {
+                        editor.status.set_text(saved);
+                    }
                 }
                 Err(e) => {
                     editor.status.set_text(&format!("Not saved: {e}"));
@@ -392,7 +396,7 @@ impl Editor {
         if let Some(ui) = self.ui.upgrade() {
             self.fill_targets(&ui);
         }
-        self.load();
+        self.load("");
     }
 }
 
@@ -622,7 +626,7 @@ fn build(ui: &Rc<Ui>, scope: Scope) -> (gtk::Box, Weak<Editor>) {
             Scope::Project(_) => Scope::Project(id),
         };
         editor.scope.set(next);
-        editor.load();
+        editor.load("");
     });
     let weak = Rc::downgrade(&editor);
     editor.save.connect_clicked(move |_| {
@@ -642,7 +646,7 @@ fn build(ui: &Rc<Ui>, scope: Scope) -> (gtk::Box, Weak<Editor>) {
     editor.toggles[scope.index()].set_active(true);
     editor.filling.set(false);
     editor.fill_targets(ui);
-    editor.load();
+    editor.load("");
     // The root owns the editor through this handler; its children only hold weak references,
     // so dropping the widget drops everything.
     let weak = Rc::downgrade(&editor);

@@ -39,7 +39,7 @@ PAGE = os.sysconf("SC_PAGE_SIZE")
 # never overlaps its scheduled capture and exit (perf record returns a little late).
 EXIT_MARGIN = 5
 
-PAGES = ["agents", "board", "code", "notes", "modules", "plan", "settings", "skills", "dashboard", "notifications", "devices", "launch-preview", "palette", "layouts"]
+PAGES = ["agents", "board", "code", "notes", "modules", "settings", "skills", "dashboard", "notifications", "devices", "launch-preview", "palette", "layouts"]
 
 PROVIDER = '''#!/usr/bin/env python3
 import os, sys, time
@@ -188,8 +188,11 @@ def main():
             workspace = base / "workspace"
             repo = workspace / "Native baseline project"
             repo.mkdir(parents=True)
+            # Only the repository's own config: a global commit.gpgsign or hooksPath would otherwise
+            # sign (or prompt for) the fixture commit and run the developer's hooks on it.
+            git_env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
             def git(*a):
-                subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True, env=git_env)
             git("init", "-q", "-b", "main")
             git("config", "user.name", "fixture")
             git("config", "user.email", "fixture@relay.test")

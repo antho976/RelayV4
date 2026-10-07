@@ -25,32 +25,9 @@ thread_local! {
 }
 
 /// `ts` (RFC 3339) as a person says it: "just now", "5 min ago", "3 h ago", "yesterday", "Oct 4".
+/// The text itself when it does not parse.
 pub(super) fn relative_time(ts: &str) -> String {
-    let Ok(then) = glib::DateTime::from_iso8601(ts, None) else {
-        return ts.to_string();
-    };
-    let Ok(now) = glib::DateTime::now_utc() else {
-        return ts.to_string();
-    };
-    let minutes = now.difference(&then).as_minutes();
-    if minutes < 1 {
-        return String::from("just now");
-    }
-    if minutes < 60 {
-        return format!("{minutes} min ago");
-    }
-    if minutes < 24 * 60 {
-        return format!("{} h ago", minutes / 60);
-    }
-    let local = |d: &glib::DateTime| d.to_local().ok();
-    let (Some(now), Some(then)) = (local(&now), local(&then)) else {
-        return ts.to_string();
-    };
-    if minutes < 48 * 60 && now.add_days(-1).is_ok_and(|y| y.ymd() == then.ymd()) {
-        return String::from("yesterday");
-    }
-    let pattern = if now.year() == then.year() { "%b %-d" } else { "%b %-d, %Y" };
-    then.format(pattern).map(|s| s.to_string()).unwrap_or_else(|_| ts.to_string())
+    crate::relative::ago(ts, crate::relative::Form::Long).unwrap_or_else(|| ts.to_string())
 }
 
 /// `ts` as a local clock reading, "Oct 4, 14:02".

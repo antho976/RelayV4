@@ -606,9 +606,16 @@ pub fn register(e: &mut Engine) {
             .map_err(|error| BusError::unavailable("git.hook_refresh_failed", error.to_string()))?;
             crate::hooks::run_user_pre_commit(Path::new(&project.path), &root)
                 .map_err(|error| BusError::conflict("git.pre_commit_failed", error.to_string()))?;
-            // The commit is made without git's own hooks, so the user's commit-msg hook runs here
-            // and may refuse or rewrite the message (RA-110).
-            let message = crate::hooks::run_user_commit_msg(Path::new(&project.path), &root, &p.message)
+            // The commit is made without git's own hooks, so the user's prepare-commit-msg and
+            // commit-msg hooks run here and may refuse or rewrite the message (RA-110). Concluding
+            // a merge or the like, `git commit --no-verify` runs prepare-commit-msg itself.
+            let message = if commit_in_progress(&root)? {
+                p.message.clone()
+            } else {
+                crate::hooks::run_user_prepare_commit_msg(Path::new(&project.path), &root, &p.message)
+                    .map_err(|error| BusError::conflict("git.prepare_commit_msg_failed", error.to_string()))?
+            };
+            let message = crate::hooks::run_user_commit_msg(Path::new(&project.path), &root, &message)
                 .map_err(|error| BusError::conflict("git.commit_msg_failed", error.to_string()))?;
             // The commit object itself — and a signing prompt, if commit.gpgSign asks for one —
             // is made here too. The transaction gates exactly that object's tree and publishes
@@ -937,15 +944,25 @@ fn refuse_unmerged(root: &Path) -> Result<(), BusError> {
     ))
 }
 
+/// Whether a merge, cherry-pick, revert or rebase is in progress in `root`, so only `git commit`
+/// can conclude it.
+fn commit_in_progress(root: &Path) -> Result<bool, BusError> {
+    Ok(in_progress_in(&gix::open(root).map_err(gix_err("git.open_failed"))?))
+}
+
+fn in_progress_in(repo: &gix::Repository) -> bool {
+    // Per-worktree state: a linked checkout's own git dir, not the shared one.
+    let git_dir = repo.path();
+    ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "sequencer", "rebase-merge", "rebase-apply"]
+        .iter()
+        .any(|name| git_dir.join(name).exists())
+}
+
 /// Build the commit `git commit -m message` would make, without moving any ref, and the
 /// numstat of exactly its tree for the commit gate.
 fn stage_commit(root: &Path, message: &str) -> Result<(StagedCommit, String), BusError> {
     let repo = gix::open(root).map_err(gix_err("git.open_failed"))?;
-    // Per-worktree state: a linked checkout's own git dir, not the shared one.
-    let git_dir = repo.path().to_path_buf();
-    let in_progress = ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "sequencer", "rebase-merge", "rebase-apply"]
-        .iter()
-        .any(|name| git_dir.join(name).exists());
+    let in_progress = in_progress_in(&repo);
     let message = clean_message(message);
     if !in_progress && message.is_empty() {
         return Err(BusError::invalid("git.message", "commit message cannot be empty"));

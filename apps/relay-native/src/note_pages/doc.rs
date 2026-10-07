@@ -1290,11 +1290,17 @@ pub fn save_as(ui: &Rc<Ui>, doc: &Rc<Doc>) {
     }
     doc.draft.busy.set(true);
     doc.refresh_state(ui);
-    let mut title = doc.name();
-    if !doc.deleted.get() && snapshot["title"] == doc.draft.base.borrow()["title"] {
-        title = format!("{title} (copy)");
+    // An unchanged title is marked as the copy's; a deleted note's text keeps its own.
+    let typed = text(&snapshot, "title");
+    let title = if !doc.deleted.get() && snapshot["title"] == doc.draft.base.borrow()["title"] {
+        tx::copy_title(typed)
+    } else {
+        Some(typed.trim().to_string()).filter(|t| !t.is_empty())
+    };
+    let mut payload = json!({"project_id":project,"body":snapshot["body"],"pinned":false});
+    if let Some(title) = title {
+        payload["title"] = json!(title);
     }
-    let payload = json!({"project_id":project,"title":title,"body":snapshot["body"],"pinned":false});
     let (ui, doc) = (ui.clone(), doc.clone());
     glib::spawn_future_local(async move {
         let result = ui.call("notes.create", payload).await;
@@ -1377,6 +1383,23 @@ pub fn discard_close(_ui: &Rc<Ui>, doc: &Rc<Doc>) {
     doc.draft.close();
 }
 
+/// Close after a save, unless text was typed while it was in flight. Draft's own refusal
+/// goes to a status label this page took off screen, so the notice bar says it instead.
+fn close_saved(ui: &Rc<Ui>, doc: &Rc<Doc>) {
+    if doc.draft.busy.get() || doc.dirty() {
+        doc.show_notice(
+            ui,
+            "Not closed: this note changed while it was being saved.",
+            vec![
+                ("Save and close", |ui, doc| save(ui, doc, Some(Box::new(close_saved)))),
+                ("Discard and close", discard_close),
+            ],
+        );
+        return;
+    }
+    doc.draft.close();
+}
+
 /// Ctrl+W, the tab's close button and middle-click.
 pub fn request_close(ui: &Rc<Ui>, doc: &Rc<Doc>) {
     if doc.draft.busy.get() {
@@ -1387,7 +1410,7 @@ pub fn request_close(ui: &Rc<Ui>, doc: &Rc<Doc>) {
         return;
     }
     if super::prefs().autosave && !doc.deleted.get() && !doc.conflict.get() {
-        save(ui, doc, Some(Box::new(|_, doc| doc.draft.close())));
+        save(ui, doc, Some(Box::new(close_saved)));
         return;
     }
     let (ui, doc) = (ui.clone(), doc.clone());
@@ -1406,7 +1429,7 @@ pub fn request_close(ui: &Rc<Ui>, doc: &Rc<Doc>) {
                 if doc.deleted.get() {
                     save_as(&ui, &doc);
                 } else {
-                    save(&ui, &doc, Some(Box::new(|_, doc| doc.draft.close())));
+                    save(&ui, &doc, Some(Box::new(close_saved)));
                 }
             }
             _ => {}

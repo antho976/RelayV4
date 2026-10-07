@@ -196,6 +196,7 @@ mutation emits at least one event**, and every event's payload is reproducible b
 
 - `user` — you, at the UI or the CLI. Full default rights; guardrails still apply to your
   writes with a `held` + `guardrail.user_bypass` confirm instead of a hard refusal (SPEC §8).
+  On the socket only a process outside Relay's own process tree may claim it (§4.2).
 - `agent:<name>` — a running session's CLI process (Claude Code / Codex) or anything it
   spawns. Rights = the session's allowlist (§9.1). Its ops appear in the peer table and audit
   under its name.
@@ -208,7 +209,23 @@ mutation emits at least one event**, and every event's payload is reproducible b
   door are all its clients): `agent:<name>` requires `token` equal to the session's token, minted at
   `session.spawn` and exported to the child as `RELAY_SESSION=<name>` and
   `RELAY_TOKEN=<token>`. Wrong or missing token → `invalid` / `bus.actor`. `user` needs no
-  token (same uid, same trust — §0.6). `test` needs `RELAY_INSTANCE` ∈ {dev, test}.
+  token (same uid, same trust — §0.6), but it must come from **outside the engine's process
+  tree** (D165). On accept the engine reads the peer's pid (`SO_PEERCRED`, and `SO_PEERPIDFD`
+  where the kernel has it, so a recycled pid is not mistaken for the peer) and follows its
+  `/proc/<pid>/stat` parent links to the top. A peer below a live session's PTY child, or below
+  the engine anywhere else (a session's orphan, a build, a hook), or one that cannot be
+  identified (pid 0 from another pid namespace, an unreadable `/proc`, a process already gone)
+  may not claim `user` or `test`: every such request except `bus.ping` is `refused` /
+  `actor.peer`, with `details.peer` (`session` + `details.session`, `engine_child`, `unknown`).
+  That includes the person's own `!relay …` typed into an agent's pane — every PTY Relay
+  spawns is an agent session; user actions come from the app, the phone, or a terminal outside
+  Relay's sessions. The peer is identified once per connection, so `session.input` and every
+  other request pays one comparison. The engine's own process passes (the phone bridge of
+  `relay serve --remote` connects from it), as does `relay remote serve` started outside Relay.
+  The engine is a child subreaper (`PR_SET_CHILD_SUBREAPER`), so a session descendant that
+  double-forks or calls `setsid` is reparented to the engine rather than to init and stays
+  below it; the engine reaps those orphans itself. `agent:<name>` requests are unaffected.
+  `test` needs `RELAY_INSTANCE` ∈ {dev, test}.
   "Same uid" is checked, not assumed: the engine refuses a runtime directory that is a symlink,
   not its own or open to group/other, and a lock file that is not a regular file of its own;
   clients refuse a socket whose `SO_PEERCRED` uid is not theirs. Without `XDG_RUNTIME_DIR` the
@@ -356,8 +373,10 @@ connection into a subscriber: `Event` lines are interleaved with responses (dist
 the `ev` key). Data-plane frames on this door are `{v, stream, session | run_id | mirror_id,
 epoch?, seq, data}` lines (§7).
 
-The socket is served by `relay serve`, the one process that owns the engine, with or without a
-display. `relay serve --remote` also runs the phone door (§4.2) in that process.
+The socket is served by whichever process owns the engine: `relay serve` (headless engine —
+what the test suite and CI drive; also how you run Relay's core on a machine with no display),
+or `relay serve --remote` with the phone door in the same process. The desktop app is a client
+of this socket. Who may claim `user` on it is decided by the connecting process (§4.2).
 
 **One engine per instance.** The engine takes a non-blocking `flock` on
 `$XDG_RUNTIME_DIR/relay-v4/<instance>.lock` before binding. Lock free → anything at the socket
@@ -542,6 +561,8 @@ instead: `session.peers` with neither means "my project, minus me".
 | destructive write (> N lines removed, or > P% of a file of at least `min_file_lines`) | `gate {kind: write}`, `file.write` | `held` / `guardrail.destructive_write`; `confirm: guardrail.confirm {hold_id}`; notification. The old size is read from the file on disk, for a `new_text` and a `diff` alike; the percentage is skipped for short files, where a share measures nothing (D112) |
 | shape gates (registered validators for critical files) | `gate {kind: write}`, `file.write` | `held` / `guardrail.shape_gate` with `details.validator`, `details.reason` |
 | per-task caps (files, lines) | `gate {kind: commit}`, `git.commit`, `session.done` | `refused` / `guardrail.cap` with the numbers |
+| branch re-check | `session.done {status: completed}` from an agent on a task | every commit since base (newest 200) against protected paths, the net diff against caps and protected paths, and each shape-gated file the branch changes as it is at `HEAD`; uses the session's grants without spending them; `refused` with the policy's code (a per-commit refusal names `details.commit`). A hook can be skipped, so this is the check a skipped hook cannot dodge (RA-109). If git cannot measure, the done is allowed and logged |
+| hook bypass | `gate {kind: exec}` from an agent | `git commit -n`/`--no-verify` (also in flag clusters and abbreviations), any `core.hooksPath` override (`-c`, `--config-env`, `GIT_CONFIG_*`) and `git config` writes to it: `refused` / `guardrail.hook_bypass`, not grantable |
 | write roots | `gate {kind: write}` with a path outside the worktree | allowed inside `guardrails.allowed_write_roots` or the process temp directory (scratch space is not a repo-integrity concern); otherwise `refused` / `guardrail.write_root`, naming the roots that would have worked (D102) |
 | denied commands | `gate {kind: exec}` | matched against the **parsed argv** of each command in the line, never a raw substring, so quoted data naming a pattern is not a match; a `relay … guardrail.check` command is exempt so the dry run is always askable (D103) |
 | user bypass | any of the above when actor is `user` | `held` / `guardrail.user_bypass` — you confirm, it proceeds, audit says you did |
@@ -646,8 +667,11 @@ naming the request to make:
   user|test`, any envelope claiming `"actor":"user"`, and any line that sheds `RELAY_SESSION`
   (`unset`, `env -u`, `env -i`, `sudo`, …) or sets `RELAY_ACTOR`. Commands inside `sh -c`,
   heredocs fed to a shell, scripts piped into one and interpreter `-c`/`-e` code are read too;
-  searching for the names (`rg guardrail.confirm`) is not an invocation. The socket does not authenticate the user actor, so this is
-  best effort against the obvious route, not a security boundary.
+  searching for the names (`rg guardrail.confirm`) is not an invocation. Behind that, the socket
+  refuses a `user`/`test` claim from any process in an agent session's tree or elsewhere below
+  the engine (`actor.peer`, §4.2), so a raw envelope written with `socat` or a script fails too.
+  An agent shares the user's uid and can still reach outside the engine's tree (`systemd-run
+  --user`, a cron job, the store file itself), so this is a seatbelt, not a security boundary.
 
 ### 9.6 Configuration layers
 
@@ -725,6 +749,10 @@ unique; nothing else is.
 | `project.get` | query | `{ project_id }` → `Project` |
 | `project.update` | mutation · always · inverse | `{ project_id, name?, build_cmd?, run_cmd?, base_branch?, protected_paths?, critical_files?, order?, pinned? }` → `Project` |
 | `project.remove` | mutation · always · project | `{ project_id, force?: bool, remove_worktrees?: bool }` → `{ sessions_closed, runs_stopped }` — forgets project-owned Relay metadata but never touches repository files; `conflict` if sessions (`project.sessions_live`, `details.open_sessions`) or device runs are live, unless `force`, which closes every open session through `session.close` and stops the runs first. Closed sessions keep their worktrees and branches unless `remove_worktrees` (Relay-pool checkouts only, deleted once the store unlocks; branches always kept). An integration in progress refuses even with `force` |
+| `project.remove.preview` | query · user | `{ project_id? } \| { workspace_id? }` (exactly one) → `{ projects, tasks, notes, modules }` — what a removal would delete (live, untrashed rows), for the confirmation dialog |
+| `project.relink` | mutation · always · inverse | `{ project_id, path }` → `Project` — the repository moved: `path` must be a git repo root (`invalid`/`project.path`), no other project's path (`conflict`/`project.exists`) and inside a workspace (`invalid`/`project.outside_workspace`); the project stays in its workspace if that still contains it, else joins the innermost one that does. Stored worktree and trash paths under the old root are rewritten and the moved checkouts get `git worktree repair` after the commit. `conflict` (`project.sessions_live` / `project.activity_live`) while sessions are open or an integration or device run is live. Undo relinks to the old path |
+| `project.removed.list` | query · user | `{}` → `{ removed: [{ backup_path, created_at, reason, project_id, workspace_id, name, path }] }` — projects absent from the store that a `project-remove` / `workspace-remove` backup still holds, each from the newest such backup |
+| `project.restore` | mutation · always · global | `{ backup_path, project_id }` → `{ project, tasks, notes, modules, workspace_restored }` — copies a removed project back from its removal backup (read-only, before the transaction), with its original ids, in one transaction: the project, labels, modules, tasks with their labels, relations, commits and attachments, module unlinks, notes, notifications, file-trash records, layouts, skill/plugin enablement and its `guardrails.projects.<id>` / `layout.current.<id>` settings. Sessions (and their mailbox, claims, overlaps), integrations and device runs stay gone. A removed workspace comes back with it unless its directory is a workspace again, which then takes the project. `backup_path` must be a `store-*.db` directly in the store's `backups/` (`invalid`/`project.backup_path`); `conflict`/`project.exists` if the id is live or the path is another project's; `not_found`/`project.not_in_backup` |
 | `project.stats` | query | `{ project_id }` → `{ tasks_by_column, sessions_live, sessions_idle, worktrees, disk_mb }` |
 
 ### 10.5 task (SPEC §6)
@@ -914,7 +942,7 @@ All paths are relative to the worktree root; `..` and absolute paths are `invali
 | `file.rename` | mutation · always | `{ project_id, worktree?, path, new_name }` → `Entry` |
 | `file.move` | mutation · always | `{ project_id, worktree?, path, into: string }` → `Entry` |
 | `file.delete` | mutation · always · inverse (restore) | `{ project_id, worktree?, path }` → `{ trash_id }` |
-| `file.restore` | mutation · always | `{ project_id, trash_id }` → `Entry` |
+| `file.restore` | mutation · always | `{ project_id, trash_id, worktree? }` → `Entry & { worktree, fallback }` — puts it back into `worktree` (`@project` or a worktree path, an agent confined to its own checkout), by default the checkout it was deleted from; once that checkout is gone, the project's primary checkout, with `fallback: true`. Never overwrites an existing path (`file.restore_conflict`); bytes no longer on disk are `file.trash_unavailable` |
 | `file.trash.list` | query · user | `{ project_id, limit? (200, ≤1000) }` → `{ entries: {id, original_path, worktree, created_at, available}[] }` — the project's trashed files not yet restored or expired, newest first; `id` is the `trash_id` for `file.restore`, `available` whether the bytes are still on disk |
 | `file.import` | mutation · always | `{ project_id, worktree?, into, sources: path[] }` → `{ entries: Entry[] }` — OS drag-in |
 | `file.restore_head` | mutation · always · user | `{ project_id, worktree?, path }` → `Entry` — `git checkout -- <path>`: puts a tracked file back as `HEAD` has it. Nothing calls it for you: there is no post-hoc write watcher (§9.3, D163) |
@@ -1196,9 +1224,10 @@ test that opens a DB at each prior version.
 
 - **No pagination cursors.** One user; `limit ≤ 1000`; if a list is bigger, the filter is
   wrong.
-- **No per-request auth beyond tokens.** Same uid = same trust (§0.6) on the socket; over the
-  phone door, `user` is whoever holds a paired device's token (§4.2). Tokens prevent
-  misattribution, not determined impersonation.
+- **No per-request auth beyond tokens.** Same uid = same trust (§0.6). Tokens prevent
+  misattribution, and the peer check on `user` (§4.2) stops an agent's own process tree from
+  claiming the user; neither stops determined impersonation by a same-uid process that gets
+  itself started outside that tree.
 - **No RPC over the network, with one exception.** The engine's own door is the Unix socket
   only. The exception is the paired-phone door (`crates/relay-remote`, `docs/MOBILE.md`): it
   forwards bus lines from a WebSocket to this socket as actor `user`, after a per-connection

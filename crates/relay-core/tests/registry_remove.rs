@@ -2,42 +2,17 @@
 //! removes the children, without touching the repository and, unless asked, without deleting
 //! any worktree.
 
-use relay_bus::{Actor, Request, Response};
-use relay_core::engine::{Door, Engine};
-use relay_core::{Instance, Store};
-use serde_json::{json, Value};
+mod common;
+
+use common::{call, committed_repo, engine_with_project, git_command, ok, refused, wait_until};
+use relay_core::engine::Engine;
+use serde_json::json;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-fn call(e: &Engine, op: &str, payload: Value) -> Response {
-    e.dispatch(Request::new(Actor::User, op, payload), Door::InProcess)
-}
-fn ok(e: &Engine, op: &str, payload: Value) -> Value {
-    match call(e, op, payload).into_result() {
-        Ok(v) => v,
-        Err(err) => panic!("{op} failed: {} {}", err.code, err.message),
-    }
-}
-fn refused(r: Response) -> relay_bus::BusError {
-    r.error.expect("expected an error")
-}
-
-fn git(repo: &Path, args: &[&str]) {
-    let st = Command::new("git").arg("-C").arg(repo).args(args).status().unwrap();
-    assert!(st.success(), "git {args:?}");
-}
 
 fn repo_in(ws: &Path, name: &str) -> PathBuf {
     let repo = ws.join(name);
-    std::fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "-q", "-b", "main"]);
-    git(&repo, &["config", "user.email", "t@t"]);
-    git(&repo, &["config", "user.name", "t"]);
-    std::fs::write(repo.join("README.md"), "hi\n").unwrap();
-    git(&repo, &["add", "."]);
-    git(&repo, &["commit", "-q", "-m", "init"]);
+    committed_repo(&repo, &[("README.md", "hi\n")]);
     repo
 }
 
@@ -54,10 +29,7 @@ fn fixture() -> Fixture {
     let root = std::fs::canonicalize(tmp.path()).unwrap();
     let ws = root.join("ws");
     let repo = repo_in(&ws, "app");
-    let store = Store::open(&root.join("store").join("store.db"), false).unwrap();
-    let engine = Engine::new(Instance::Test, store);
-    ok(&engine, "workspace.create", json!({"path": ws}));
-    ok(&engine, "project.add", json!({"workspace_id": 1, "path": repo}));
+    let engine = engine_with_project(&root, &ws, &repo);
     let provider = root.join("fake-claude.sh");
     std::fs::write(&provider, "#!/bin/sh\necho ready\nwhile IFS= read -r line; do :; done\n").unwrap();
     use std::os::unix::fs::PermissionsExt;
@@ -71,14 +43,6 @@ fn alive(pid: i64) -> bool {
         && std::fs::read_to_string(format!("/proc/{pid}/stat")).map(|s| !s.contains(") Z ")).unwrap_or(false)
 }
 
-fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !f() {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
 /// A spawned agent: (name, worktree, branch, pid).
 fn spawn(e: &Engine, project_id: i64) -> (String, PathBuf, String, i64) {
     let s = ok(e, "session.create", json!({"project_id": project_id, "provider": "claude"}));
@@ -88,7 +52,7 @@ fn spawn(e: &Engine, project_id: i64) -> (String, PathBuf, String, i64) {
 }
 
 fn branch_exists(repo: &Path, branch: &str) -> bool {
-    Command::new("git").arg("-C").arg(repo).args(["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")])
+    git_command(repo).args(["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")])
         .output().unwrap().status.success()
 }
 

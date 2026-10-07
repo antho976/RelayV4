@@ -107,13 +107,9 @@ fn parse_time(value: &str) -> Option<u64> {
     glib::DateTime::from_iso8601(value, None).ok().map(|at| at.to_unix().max(0) as u64)
 }
 
-fn ago(seconds: u64) -> String {
-    match seconds {
-        0..60 => "just now".into(),
-        60..3600 => format!("{}m ago", seconds / 60),
-        3600..172_800 => format!("{}h ago", seconds / 3600),
-        _ => format!("{}d ago", seconds / 86_400),
-    }
+/// "3m ago" for a Unix time.
+fn ago(at: u64) -> String {
+    crate::relative::ago_unix(at, crate::relative::Form::CompactAgo)
 }
 
 fn span(seconds: u64) -> String {
@@ -443,7 +439,7 @@ impl Ui {
         *self.usage.timer.borrow_mut() = Some(source);
     }
 
-    fn set_usage_pref(self: &Rc<Self>, path: &'static str, value: Value) {
+    fn set_usage_pref(self: &Rc<Self>, path: &str, value: Value) {
         if pref_matches(&self.usage.prefs.borrow(), path, &value) {
             return;
         }
@@ -453,8 +449,8 @@ impl Ui {
             self.schedule_usage();
         }
         let ui = self.clone();
+        let payload = json!({"path": format!("usage.{path}"), "value": value});
         glib::spawn_future_local(async move {
-            let payload = json!({"path": format!("usage.{path}"), "value": value});
             if let Err(e) = ui.call("settings.set", payload).await {
                 ui.show_error(&e.to_string());
                 ui.reload_usage_prefs();
@@ -556,7 +552,7 @@ impl Ui {
         let (text, tip) = match (state.checked.get(), state.failed.borrow().as_ref()) {
             (_, Some(error)) => ("update failed".to_string(), format!("The last refresh failed: {error}")),
             (Some(at), None) => (
-                format!("updated {}", ago(now().saturating_sub(at))),
+                format!("updated {}", ago(at)),
                 format!(
                     "Limits checked at {} · {}",
                     glib::DateTime::from_unix_local(at as i64)
@@ -595,7 +591,7 @@ impl Ui {
         self.sync_usage_options(&prefs);
         checked.set_text(&match (state.checked.get(), state.failed.borrow().as_ref()) {
             (_, Some(error)) => format!("The last refresh failed: {error}"),
-            (Some(at), None) => format!("Checked {} · {}", ago(now.saturating_sub(at)), interval_text(interval(&prefs))),
+            (Some(at), None) => format!("Checked {} · {}", ago(at), interval_text(interval(&prefs))),
             (None, None) => "Checking…".into(),
         });
         clear(&list);
@@ -625,7 +621,7 @@ impl Ui {
             let reported = label(
                 &match (&item, reported) {
                     (None, _) => "nothing reported".into(),
-                    (Some(_), Some(at)) => format!("reported {}", ago(now.saturating_sub(at))),
+                    (Some(_), Some(at)) => format!("reported {}", ago(at)),
                     (Some(_), None) => String::new(),
                 },
                 "usage-reported",
@@ -784,27 +780,22 @@ impl Ui {
                 chip.set_tooltip_text(Some(&format!("Show {name}'s {} limit", meter.title().to_lowercase())));
                 controls.chips.push((chip.downgrade(), provider, meter.key()));
                 let weak = Rc::downgrade(self);
-                let path: &'static str = match (provider, meter) {
-                    ("claude", Meter::FiveHour) => "claude.five_hour",
-                    ("claude", Meter::Weekly) => "claude.weekly",
-                    ("claude", Meter::Fable) => "claude.fable",
-                    (_, Meter::FiveHour) => "codex.five_hour",
-                    _ => "codex.weekly",
-                };
+                // The strip reads `prefs[provider][meter.key()]`; the path is built from the same.
+                let path = format!("{provider}.{}", meter.key());
                 chip.connect_toggled(move |chip| {
                     if let Some(ui) = weak.upgrade() {
-                        ui.set_usage_pref(path, json!(chip.is_active()));
+                        ui.set_usage_pref(&path, json!(chip.is_active()));
                     }
                 });
                 chips.append(&chip);
             }
             let weak = Rc::downgrade(self);
             let toggled = chips.clone();
-            let path = if provider == "claude" { "claude.enabled" } else { "codex.enabled" };
+            let path = format!("{provider}.enabled");
             switch.connect_active_notify(move |switch| {
                 toggled.set_sensitive(switch.is_active());
                 if let Some(ui) = weak.upgrade() {
-                    ui.set_usage_pref(path, json!(switch.is_active()));
+                    ui.set_usage_pref(&path, json!(switch.is_active()));
                 }
             });
             row.append(&chips);
@@ -933,8 +924,8 @@ mod tests {
         assert!(!enabled(&prefs, "codex", "enabled"));
         assert!(enabled(&prefs, "codex", "weekly"));
         assert_eq!(interval(&prefs), 15);
-        assert_eq!(ago(30), "just now");
-        assert_eq!(ago(3 * 60 + 5), "3m ago");
+        assert_eq!(ago(now() - 30), "just now");
+        assert_eq!(ago(now() - 3 * 60 - 5), "3m ago");
         assert_eq!(span(2 * 86_400 + 5 * 3600), "2d 5h");
         assert_eq!(humanize("seven_day_opus"), "Seven day opus");
     }

@@ -71,25 +71,19 @@ pub async fn refresh(ui: &Rc<Ui>, name: &str, project: i64) {
         "skills" => return skills::refresh(ui, project).await,
         "plugins" => return plugins::refresh(ui, project).await,
         "devices" => return devices::refresh(ui, project).await,
-        _ => {}
+        "dashboard" => {}
+        _ => return,
     }
     let generation = ui.generation.get();
-    if name == "dashboard" {
-        let wait = DASHBOARD.with(|d| d.borrow().0.map(|at| DASHBOARD_INTERVAL.saturating_sub(at.elapsed())));
-        if let Some(wait) = wait.filter(|wait| !wait.is_zero()) {
-            glib::timeout_future(wait).await;
-            if !current(ui, name, project, generation) {
-                return;
-            }
+    let wait = DASHBOARD.with(|d| d.borrow().0.map(|at| DASHBOARD_INTERVAL.saturating_sub(at.elapsed())));
+    if let Some(wait) = wait.filter(|wait| !wait.is_zero()) {
+        glib::timeout_future(wait).await;
+        if !current(ui, name, project, generation) {
+            return;
         }
-        DASHBOARD.with(|d| d.borrow_mut().0 = Some(Instant::now()));
     }
-    let (op, payload) = match name {
-        "dashboard" => ("dashboard.get", json!({})),
-        "notifications" => ("notify.list", json!({"limit": 200})),
-        _ => return,
-    };
-    let result = ui.call(op, payload).await;
+    DASHBOARD.with(|d| d.borrow_mut().0 = Some(Instant::now()));
+    let result = ui.call("dashboard.get", json!({})).await;
     if !current(ui, name, project, generation) {
         return;
     }
@@ -101,33 +95,31 @@ pub async fn refresh(ui: &Rc<Ui>, name: &str, project: i64) {
         }
     };
     let page = &ui.pages[name];
-    if name == "dashboard" {
-        if page.first_child().is_some() && DASHBOARD.with(|d| d.borrow().1 == data) {
-            return;
-        }
-        DASHBOARD.with(|d| d.borrow_mut().1 = data.clone());
+    if page.first_child().is_some() && DASHBOARD.with(|d| d.borrow().1 == data) {
+        return;
     }
+    DASHBOARD.with(|d| d.borrow_mut().1 = data.clone());
     clear(page);
-    match name {
-        "dashboard" => dashboard(ui, page, &data),
-        "notifications" => notifications(ui, page, &data),
-        _ => {}
-    }
+    dashboard(ui, page, &data);
 }
 
-fn navigate(ui: &Rc<Ui>, parent: &gtk::Box, title: &str, page: &'static str) {
-    let key = button(title, "quiet");
+/// A quiet key that opens `page`; the caller gives it its contents and places it.
+fn navigate(ui: &Rc<Ui>, page: &'static str) -> gtk::Button {
+    let key = gtk::Button::new();
+    key.add_css_class("quiet");
     let weak = Rc::downgrade(ui);
     key.connect_clicked(move |_| {
         if let Some(ui) = weak.upgrade() {
             ui.navigate(page);
         }
     });
-    parent.append(&key);
+    key
 }
 
-fn navigate_session(ui: &Rc<Ui>, parent: &gtk::Box, title: &str, session: &str) {
-    let key = button(title, "quiet");
+/// A quiet key that opens the project an agent session belongs to, like [`navigate`].
+fn navigate_session(ui: &Rc<Ui>, session: &str) -> gtk::Button {
+    let key = gtk::Button::new();
+    key.add_css_class("quiet");
     let weak = Rc::downgrade(ui);
     let session = session.to_string();
     key.connect_clicked(move |key| {
@@ -149,7 +141,7 @@ fn navigate_session(ui: &Rc<Ui>, parent: &gtk::Box, title: &str, session: &str) 
             key.set_sensitive(true);
         });
     });
-    parent.append(&key);
+    key
 }
 
 fn dashboard_panel(title: &str, caption: &str) -> gtk::Box {
@@ -222,13 +214,12 @@ fn dashboard(ui: &Rc<Ui>, page: &gtk::Box, data: &Value) {
         ("Code", "code", "code"),
         ("Notes", "notes", "notes"),
     ] {
-        navigate(ui, &quick, title, destination);
-        if let Some(key) = quick.last_child().and_downcast::<gtk::Button>() {
-            let contents = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-            contents.append(&crate::icons::image(icon, 13));
-            contents.append(&label(title, "dashboard-action"));
-            key.set_child(Some(&contents));
-        }
+        let key = navigate(ui, destination);
+        let contents = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        contents.append(&crate::icons::image(icon, 13));
+        contents.append(&label(title, "dashboard-action"));
+        key.set_child(Some(&contents));
+        quick.append(&key);
     }
     let refresh = crate::app::icon_button("refresh", "Refresh dashboard");
     let weak = Rc::downgrade(ui);
@@ -405,22 +396,21 @@ fn dashboard(ui: &Rc<Ui>, page: &gtk::Box, data: &Value) {
         needs.append(&key);
     }
     for peer in peers.iter().filter(|p| text(p, "state") == "blocked") {
-        navigate_session(ui, &needs, "", text(peer, "session"));
-        if let Some(key) = needs.last_child().and_downcast::<gtk::Button>() {
-            key.add_css_class("dashboard-queue-row");
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 9);
-            let icon = crate::icons::image("terminal", 14);
-            icon.add_css_class("dashboard-signal");
-            row.append(&icon);
-            row.append(&dashboard_copy(
-                &format!("{} is blocked", text(peer, "session")),
-                peer["intent"]
-                    .as_str()
-                    .or(peer["task_title"].as_str())
-                    .unwrap_or(text(peer, "branch")),
-            ));
-            key.set_child(Some(&row));
-        }
+        let key = navigate_session(ui, text(peer, "session"));
+        key.add_css_class("dashboard-queue-row");
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 9);
+        let icon = crate::icons::image("terminal", 14);
+        icon.add_css_class("dashboard-signal");
+        row.append(&icon);
+        row.append(&dashboard_copy(
+            &format!("{} is blocked", text(peer, "session")),
+            peer["intent"]
+                .as_str()
+                .or(peer["task_title"].as_str())
+                .unwrap_or(text(peer, "branch")),
+        ));
+        key.set_child(Some(&row));
+        needs.append(&key);
     }
     for review in reviews {
         let key = button("", "dashboard-queue-row");
@@ -573,35 +563,34 @@ fn dashboard(ui: &Rc<Ui>, page: &gtk::Box, data: &Value) {
         );
     }
     for peer in peers.iter().take(6) {
-        navigate_session(ui, &active, "", text(peer, "session"));
-        if let Some(key) = active.last_child().and_downcast::<gtk::Button>() {
-            key.add_css_class("dashboard-agent-row");
-            let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 9);
-            let lamp = label("", "lamp");
-            lamp.set_valign(gtk::Align::Center);
-            lamp.set_halign(gtk::Align::Center);
-            lamp.add_css_class(match text(peer, "state") {
-                "running" | "spawning" => "live",
-                "blocked" => "held",
-                _ => "waiting",
-            });
-            row.append(&lamp);
-            row.append(&dashboard_copy(
-                text(peer, "session"),
-                peer["intent"]
-                    .as_str()
-                    .or(peer["task_title"].as_str())
-                    .unwrap_or("No task assigned"),
-            ));
-            let provider = gtk::Box::new(gtk::Orientation::Vertical, 2);
-            provider.append(&label(text(peer, "provider"), "dashboard-row-subtitle"));
-            provider.append(&label(text(peer, "role"), "dashboard-row-subtitle"));
-            row.append(&provider);
-            content.append(&row);
-            content.append(&label(text(peer, "branch"), "dashboard-project-meta"));
-            key.set_child(Some(&content));
-        }
+        let key = navigate_session(ui, text(peer, "session"));
+        key.add_css_class("dashboard-agent-row");
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 9);
+        let lamp = label("", "lamp");
+        lamp.set_valign(gtk::Align::Center);
+        lamp.set_halign(gtk::Align::Center);
+        lamp.add_css_class(match text(peer, "state") {
+            "running" | "spawning" => "live",
+            "blocked" => "held",
+            _ => "waiting",
+        });
+        row.append(&lamp);
+        row.append(&dashboard_copy(
+            text(peer, "session"),
+            peer["intent"]
+                .as_str()
+                .or(peer["task_title"].as_str())
+                .unwrap_or("No task assigned"),
+        ));
+        let provider = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        provider.append(&label(text(peer, "provider"), "dashboard-row-subtitle"));
+        provider.append(&label(text(peer, "role"), "dashboard-row-subtitle"));
+        row.append(&provider);
+        content.append(&row);
+        content.append(&label(text(peer, "branch"), "dashboard-project-meta"));
+        key.set_child(Some(&content));
+        active.append(&key);
     }
     let events = rows(data, "notifications");
     let timeline = gtk::Grid::builder()
@@ -619,60 +608,5 @@ fn dashboard(ui: &Rc<Ui>, page: &gtk::Box, data: &Value) {
     activity.append(&timeline);
     if events.is_empty() {
         dashboard_empty(&activity, "No recent activity", "");
-    }
-}
-
-fn notifications(ui: &Rc<Ui>, page: &gtk::Box, data: &Value) {
-    page.append(&label("Notifications", "title"));
-    action(ui, page, "Mark all read", "notify.ack_all", json!({}));
-    let entries = rows(data, "notifications");
-    if entries.is_empty() {
-        page.append(&paragraph("No notifications yet."));
-    }
-    for item in entries {
-        let row = section(page, text(&item, "title"));
-        row.append(&paragraph(text(&item, "body")));
-        row.append(&label(
-            &format!(
-                "{} · {}",
-                text(&item, "category"),
-                text(&item, "created_at")
-            ),
-            "dim",
-        ));
-        if !item["read"].as_bool().unwrap_or(false) {
-            action(
-                ui,
-                &row,
-                "Mark read",
-                "notify.ack",
-                json!({"notification_id":item["id"]}),
-            );
-        }
-        let key = button("Open workspace", "quiet");
-        row.append(&key);
-        let weak = Rc::downgrade(ui);
-        key.connect_clicked(move |_| {
-            if let Some(ui) = weak.upgrade() {
-                let project = item["project_id"].as_i64().unwrap_or(ui.project.get());
-                let payload = &item["link"]["payload"];
-                let page = match text(&item["link"], "op") {
-                    "ui.page.switch" => payload["page"].as_str().unwrap_or("notifications"),
-                    "task.get" => "board",
-                    _ => match text(&item, "category") {
-                        "agent_done" | "integration" => "board",
-                        "guardrail" => "guardrails",
-                        "provider" => "settings",
-                        _ => "agents",
-                    },
-                };
-                ui.open_project(project, page);
-                if ui.project.get() == project && text(&item["link"], "op") == "task.get" {
-                    if let Some(id) = payload["task_id"].as_i64() {
-                        crate::pages::open_task(&ui, id);
-                    }
-                }
-            }
-        });
     }
 }

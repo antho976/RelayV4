@@ -70,20 +70,33 @@ async fn whole(ui: &Rc<Ui>, skill: &Value) -> Result<Value, Error> {
     }
 }
 
-/// The `description:` line of the SKILL.md frontmatter, or the first line of prose.
+/// The `description:` of the SKILL.md front matter, or the first line of prose.
 fn description(skill: &Value) -> String {
-    let body = text(skill, "body");
-    let mut lines = body.lines();
-    if body.trim_start().starts_with("---") {
-        lines.next();
-        for line in lines.by_ref() {
-            let line = line.trim();
-            if line == "---" {
+    about(text(skill, "body"))
+}
+
+/// Keys are read at column 0 as the engine's `plugins::frontmatter` does, so a `description:`
+/// nested under another key is not taken for the skill's own. The block may follow blank lines;
+/// a `>` or `|` value is folded from the indented lines under it.
+fn about(body: &str) -> String {
+    let mut lines = body.lines().skip_while(|line| line.trim().is_empty()).peekable();
+    if lines.next_if(|line| line.trim() == "---").is_some() {
+        while let Some(line) = lines.next() {
+            if line.trim() == "---" {
                 break;
             }
-            if let Some(value) = line.strip_prefix("description:") {
-                return value.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+            let Some(value) = line.trim_end().strip_prefix("description:") else {
+                continue;
+            };
+            let value = value.trim();
+            if !value.starts_with(['>', '|']) {
+                return value.trim_matches('"').trim_matches('\'').to_string();
             }
+            let mut folded = Vec::new();
+            while let Some(line) = lines.next_if(|line| line.starts_with([' ', '\t']) || line.trim().is_empty()) {
+                folded.push(line.trim());
+            }
+            return folded.into_iter().filter(|line| !line.is_empty()).collect::<Vec<_>>().join(" ");
         }
     }
     lines
@@ -230,21 +243,7 @@ fn detail(ui: &Rc<Ui>, market: &Rc<Market>, skill: &Value, parent: &gtk::Box) {
     remove.add_css_class("ext-danger");
     remove.set_tooltip_text(Some("Remove this skill from every project"));
     let weak = Rc::downgrade(ui);
-    let armed = Rc::new(Cell::new(false));
-    remove.connect_clicked(move |key| {
-        if !armed.replace(true) {
-            key.set_label("Click again to remove");
-            key.add_css_class("armed");
-            let (key, armed) = (key.downgrade(), armed.clone());
-            glib::timeout_add_local_once(std::time::Duration::from_secs(4), move || {
-                if let Some(key) = key.upgrade() {
-                    armed.set(false);
-                    key.set_label("Remove");
-                    key.remove_css_class("armed");
-                }
-            });
-            return;
-        }
+    crate::app::confirm_inline(&remove, "Click again to remove", move |key| {
         if let Some(ui) = weak.upgrade() {
             ui.mutate("skill.delete", json!({"skill_id": id}), key);
         }
@@ -550,4 +549,21 @@ fn edit(ui: &Rc<Ui>, skill: Option<Value>) {
         });
     });
     window.present();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::about;
+
+    #[test]
+    fn the_description_comes_from_the_top_level_key_of_the_front_matter() {
+        assert_eq!(about("---\nname: foo\ndescription: \"Does foo\"\n---\n# Foo\nProse."), "Does foo");
+        // A blank line before the block used to show its first key instead.
+        assert_eq!(about("\n---\nname: foo\ndescription: Does foo\n---\n"), "Does foo");
+        assert_eq!(about("\n---\nname: foo\n---\nFirst prose.\n"), "First prose.");
+        // Nested keys belong to something else.
+        assert_eq!(about("---\nmetadata:\n  description: nested\ndescription: top\n---\n"), "top");
+        assert_eq!(about("---\ndescription: >\n  Folded over\n  two lines.\nname: foo\n---\n"), "Folded over two lines.");
+        assert_eq!(about("# Title\n\nNo front matter here.\n"), "No front matter here.");
+    }
 }

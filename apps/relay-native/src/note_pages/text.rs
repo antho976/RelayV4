@@ -266,6 +266,13 @@ pub fn display_title(title: &str, body: &str) -> String {
         .unwrap_or_else(|| "Untitled".into())
 }
 
+/// The title a copy of a note is stored under. An untitled note's copy stays untitled, so its
+/// name keeps following the body instead of freezing a clipped first line.
+pub fn copy_title(title: &str) -> Option<String> {
+    let title = title.trim();
+    (!title.is_empty()).then(|| format!("{title} (copy)"))
+}
+
 /// A one-line preview of the text that is not already the title.
 pub fn preview(title: &str, body: &str) -> String {
     let name = display_title(title, body);
@@ -389,6 +396,8 @@ mod tests {
         assert_eq!(display_title("  Plan ", "body"), "Plan");
         assert_eq!(display_title("", "\n# Groceries\n- milk"), "Groceries");
         assert_eq!(display_title("", ""), "Untitled");
+        assert_eq!(copy_title(" Plan "), Some("Plan (copy)".into()));
+        assert_eq!(copy_title("  "), None);
         assert_eq!(preview("", "# Groceries\n- milk"), "milk");
         assert_eq!(preview("Plan", "first line"), "first line");
         assert_eq!(zoom_step(100, 1), 110);

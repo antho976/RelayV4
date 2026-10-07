@@ -185,12 +185,8 @@ impl Pane {
         terminal.set_scrollback_lines(10_000);
         terminal.set_scroll_on_output(false);
         terminal.set_scroll_on_keystroke(true);
-        let mut font = gtk::pango::FontDescription::from_string("Fira Mono");
-        font.set_absolute_size(13.0 * gtk::pango::SCALE as f64);
-        terminal.set_font(Some(&font));
+        // Font and colours come from `apply_appearance`, which the caller runs next.
         terminal.set_cell_height_scale(1.25);
-        terminal.set_color_foreground(&gtk::gdk::RGBA::parse("#ececea").unwrap());
-        terminal.set_color_background(&gtk::gdk::RGBA::parse("#0a0a0b").unwrap());
         terminal.set_cursor_blink_mode(vte4::CursorBlinkMode::Off);
         terminal.set_margin_start(10);
         terminal.set_margin_end(2);
@@ -402,11 +398,7 @@ impl Pane {
     }
 
     pub fn apply_appearance(&self, mode: &str, points: f64) {
-        let background = match mode {
-            "oled" => "#000000",
-            "dark" => "#08090a",
-            _ => "#0a0a0b",
-        };
+        let background = crate::fonts::palette(mode)[crate::fonts::SCREEN];
         let color = |value: &str| gtk::gdk::RGBA::parse(value).expect("Relay terminal color");
         let palette = [
             "#1a1a1d", "#e5382e", "#3fbf74", "#e0b04a", "#5b9cf6", "#c979d6", "#3ec5cf", "#c8c8c6",
@@ -433,9 +425,13 @@ impl Pane {
         font.set_absolute_size(points.clamp(8.0, 24.0) * 96.0 / 72.0 * gtk::pango::SCALE as f64);
         self.terminal.set_font(Some(&font));
     }
+    /// Shown and attached to its session, so input reaches the agent.
+    pub fn is_ready(&self) -> bool {
+        self.active.get() && self.client.borrow().is_some()
+    }
     pub fn verify_ready(&self) {
         assert!(
-            self.active.get() && self.client.borrow().is_some(),
+            self.is_ready(),
             "{} has no ready terminal attachment (active={})",
             self.name,
             self.active.get()

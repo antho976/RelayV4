@@ -1,34 +1,15 @@
 //! Device leases: sessions sharing one phone see who is using it, and a conflicting install is
 //! refused with `device.busy` instead of clobbering the other session's build.
 
-use relay_bus::{Actor, Request, Response};
-use relay_core::engine::{Door, Engine};
-use relay_core::{Instance, Store};
+mod common;
+
+use common::{call_as as call, committed_repo, engine_with_project, ok_as as ok, refused as refusal};
+use relay_bus::{Actor, Response};
+use relay_core::engine::Engine;
 use serde_json::{json, Value};
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
-use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-fn git(repo: &Path, args: &[&str]) {
-    let status = Command::new("git").arg("-C").arg(repo).args(args).status().unwrap();
-    assert!(status.success(), "git {args:?}");
-}
-
-fn call(engine: &Engine, actor: Actor, op: &str, payload: Value) -> Response {
-    engine.dispatch(Request::new(actor, op, payload), Door::InProcess)
-}
-
-fn ok(engine: &Engine, actor: Actor, op: &str, payload: Value) -> Value {
-    call(engine, actor, op, payload)
-        .into_result()
-        .unwrap_or_else(|error| panic!("{op} failed: {} {}", error.code, error.message))
-}
-
-fn refusal(response: Response) -> relay_bus::BusError {
-    response.error.expect("expected a refusal")
-}
 
 struct Fixture {
     _root: tempfile::TempDir,
@@ -40,20 +21,11 @@ fn fixture() -> Fixture {
     let base = std::fs::canonicalize(root.path()).unwrap();
     let ws = base.join("ws");
     let repo = ws.join("app");
-    std::fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "-q", "-b", "main"]);
-    git(&repo, &["config", "user.email", "t@t"]);
-    git(&repo, &["config", "user.name", "t"]);
-    std::fs::write(repo.join("README.md"), "hi\n").unwrap();
-    git(&repo, &["add", "."]);
-    git(&repo, &["commit", "-q", "-m", "init"]);
+    committed_repo(&repo, &[("README.md", "hi\n")]);
     let adb = base.join("adb");
     std::fs::write(&adb, "#!/bin/sh\nif [ \"$1\" = devices ]; then printf 'List of devices attached\\nrelay-phone device product:relay model:Pixel_9 device:relay transport_id:1\\n'; fi\nexit 0\n").unwrap();
     std::fs::set_permissions(&adb, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let store = Store::open(&base.join("store/store.db"), false).unwrap();
-    let engine = Engine::new(Instance::Test, store);
-    ok(&engine, Actor::User, "workspace.create", json!({"path": ws}));
-    ok(&engine, Actor::User, "project.add", json!({"workspace_id": 1, "path": repo}));
+    let engine = engine_with_project(&base, &ws, &repo);
     ok(&engine, Actor::User, "settings.set", json!({"path": "device.adb_path", "value": adb}));
     // A run whose "install" outlives the test's assertions; stopped explicitly below.
     ok(&engine, Actor::User, "project.update", json!({"project_id": 1, "run_cmd": "sleep 30"}));

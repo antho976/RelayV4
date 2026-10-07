@@ -3,16 +3,38 @@ use super::*;
 /// The most agents one launch configures: the count keys offer 1 to 6.
 const AGENTS: usize = 6;
 
+/// Group `keys` and bind them both ways to the hidden `control` that holds their choice,
+/// which is what payloads and the smoke tests read. The keys hold only a weak reference to
+/// `control`: the form must own it (append it, hidden), or the keys silently stop working.
+fn bind_keys(control: &gtk::DropDown, keys: Vec<gtk::ToggleButton>) {
+    for (index, key) in keys.iter().enumerate() {
+        if index > 0 {
+            key.set_group(keys.first());
+        }
+        key.set_active(control.selected() == index as u32);
+        let weak = control.downgrade();
+        key.connect_toggled(move |key| {
+            if key.is_active() {
+                if let Some(control) = weak.upgrade() {
+                    control.set_selected(index as u32);
+                }
+            }
+        });
+    }
+    control.connect_selected_notify(move |control| {
+        for (index, key) in keys.iter().enumerate() {
+            key.set_active(control.selected() == index as u32);
+        }
+    });
+}
+
 fn choice_cards(control: &gtk::DropDown, choices: &[(&str, &str, &str)]) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 7);
     row.set_homogeneous(true);
     let mut buttons: Vec<gtk::ToggleButton> = Vec::new();
-    for (index, (icon, title, copy)) in choices.iter().enumerate() {
+    for (icon, title, copy) in choices {
         let key = gtk::ToggleButton::new();
         key.add_css_class("launch-choice");
-        if let Some(first) = buttons.first() {
-            key.set_group(Some(first));
-        }
         let content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         let mark = crate::icons::image(icon, 16);
         mark.add_css_class("launch-mode-icon");
@@ -32,23 +54,10 @@ fn choice_cards(control: &gtk::DropDown, choices: &[(&str, &str, &str)]) -> gtk:
         check.set_halign(gtk::Align::Center);
         content.append(&check);
         key.set_child(Some(&content));
-        key.set_active(control.selected() == index as u32);
-        let selected = control.downgrade();
-        key.connect_toggled(move |key| {
-            if key.is_active() {
-                if let Some(selected) = selected.upgrade() {
-                    selected.set_selected(index as u32);
-                }
-            }
-        });
         row.append(&key);
         buttons.push(key);
     }
-    control.connect_selected_notify(move |control| {
-        for (index, key) in buttons.iter().enumerate() {
-            key.set_active(control.selected() == index as u32);
-        }
-    });
+    bind_keys(control, buttons);
     row
 }
 
@@ -57,28 +66,12 @@ fn segments(control: &gtk::DropDown, choices: &[&str]) -> gtk::Box {
     row.add_css_class("launch-segmented");
     row.set_homogeneous(true);
     let mut keys: Vec<gtk::ToggleButton> = Vec::new();
-    for (index, title) in choices.iter().enumerate() {
+    for title in choices {
         let key = gtk::ToggleButton::with_label(title);
-        if let Some(first) = keys.first() {
-            key.set_group(Some(first));
-        }
-        key.set_active(control.selected() == index as u32);
-        let weak = control.downgrade();
-        key.connect_toggled(move |key| {
-            if key.is_active() {
-                if let Some(control) = weak.upgrade() {
-                    control.set_selected(index as u32);
-                }
-            }
-        });
         row.append(&key);
         keys.push(key);
     }
-    control.connect_selected_notify(move |control| {
-        for (i, key) in keys.iter().enumerate() {
-            key.set_active(i as u32 == control.selected());
-        }
-    });
+    bind_keys(control, keys);
     let weak = row.downgrade();
     control.connect_sensitive_notify(move |control| {
         if let Some(row) = weak.upgrade() {
@@ -163,15 +156,9 @@ impl Profile {
         providers.set_homogeneous(true);
         providers.set_hexpand(true);
         let mut provider_cards: Vec<(gtk::ToggleButton, gtk::Label, gtk::Label)> = Vec::new();
-        for (i, (icon, title)) in [("claude", "Claude Code"), ("codex", "Codex")]
-            .iter()
-            .enumerate()
-        {
+        for (icon, title) in [("claude", "Claude Code"), ("codex", "Codex")] {
             let key = gtk::ToggleButton::new();
             key.add_css_class("launch-provider-card");
-            if let Some((first, _, _)) = provider_cards.first() {
-                key.set_group(Some(first));
-            }
             let card = gtk::Box::new(gtk::Orientation::Vertical, 10);
             let top = gtk::Box::new(gtk::Orientation::Horizontal, 9);
             let mark = crate::icons::image(icon, 18);
@@ -197,18 +184,10 @@ impl Profile {
             facts.set_wrap(true);
             card.append(&facts);
             key.set_child(Some(&card));
-            key.set_active(provider.selected() == i as u32);
-            let selected = provider.downgrade();
-            key.connect_toggled(move |key| {
-                if key.is_active() {
-                    if let Some(selected) = selected.upgrade() {
-                        selected.set_selected(i as u32);
-                    }
-                }
-            });
             providers.append(&key);
             provider_cards.push((key, account, facts));
         }
+        bind_keys(&provider, provider_cards.iter().map(|(key, _, _)| key.clone()).collect());
         provider.set_visible(false);
         root.append(&provider);
         configuration.append(&providers);
@@ -351,8 +330,7 @@ impl Profile {
             .effort
             .selected_item()
             .and_downcast::<gtk::StringObject>()
-            .map(|s| s.string().to_string())
-            .filter(|s| s != "Default");
+            .map(|s| s.string().to_string());
         let mut payload = json!({"project_id":project,"provider":if self.provider.selected()==0{"claude"}else{"codex"},"role":role,"model":if model.is_empty(){None}else{Some(model)},"effort":effort,"bus_writes":self.writes.is_active(),"allow_ui":self.ui_access.is_active(),"prompt":self.prompt()});
         let worktree = self.worktree.text().trim().to_string();
         if !worktree.is_empty() {
@@ -592,20 +570,13 @@ impl Ui {
         }
         members.append(&members_title);
         body.append(&members);
-        let count = gtk::SpinButton::with_range(1.0, AGENTS as f64, 1.0);
-        count.set_value(1.0);
+        // The solo agent count: entry n launches n + 1 agents.
+        let count = gtk::DropDown::from_strings(&["1", "2", "3", "4", "5", "6"]);
         count.set_visible(false);
+        count.set_widget_name("launch-count-control");
         members.append(&count);
-        let count_select = gtk::DropDown::from_strings(&["1", "2", "3", "4", "5", "6"]);
-        // Segmented keys hold weak references to their backing control. Keep it owned
-        // by the form, just like the mode and builder controls.
-        count_select.set_visible(false);
-        count_select.set_widget_name("launch-count-control");
-        members.append(&count_select);
-        let count_keys = segments(&count_select, &["1", "2", "3", "4", "5", "6"]);
+        let count_keys = segments(&count, &["1", "2", "3", "4", "5", "6"]);
         count_keys.add_css_class("launch-count");
-        let spin = count.clone();
-        count_select.connect_selected_notify(move |c| spin.set_value((c.selected() + 1) as f64));
         members.append(&count_keys);
         let builders =
             gtk::DropDown::from_strings(&["One builder + reviewer", "Two builders + reviewer"]);
@@ -626,7 +597,7 @@ impl Ui {
         body.append(&stack);
         let mut member_keys: Vec<gtk::ToggleButton> = Vec::new();
         for (i, p) in profiles.iter().enumerate() {
-            stack.add_titled(&p.root, Some(&format!("agent-{i}")), &format!("{}", i + 1));
+            stack.add_named(&p.root, Some(&format!("agent-{i}")));
             let key = gtk::ToggleButton::new();
             key.add_css_class("launch-member-card");
             if let Some(first) = member_keys.first() {
@@ -732,15 +703,10 @@ impl Ui {
                     let visible = if group {
                         i == 0 || i == 2 || (i == 1 && builders.selected() == 1)
                     } else {
-                        i < count.value_as_int() as usize
+                        i <= count.selected() as usize
                     };
                     stack.page(&p.root).set_visible(visible);
                     member_keys[i].set_visible(visible);
-                    stack.page(&p.root).set_title(&format!(
-                        "{}\n{}",
-                        i + 1,
-                        if group && i == 2 { "Reviewer" } else { "Agent" }
-                    ));
                     p.role.set_sensitive(!group);
                     p.worktree.set_sensitive(!group || i == 0);
                     if group {
@@ -751,12 +717,10 @@ impl Ui {
                 stack.set_visible_child_name("agent-0");
             }
         });
-        for d in [&mode, &builders] {
+        for d in [&mode, &builders, &count] {
             let update = update.clone();
             d.connect_selected_notify(move |_| update());
         }
-        let u = update.clone();
-        count.connect_value_changed(move |_| u());
         update();
         let hint=label("Each solo agent gets the project's default checkout: its own worktree, or the primary checkout when a plugin asks for it. A review group shares one branch, with a separate reviewer and one or two builders. Choose the group's task queue on agent 1.","dim");
         hint.set_wrap(true);
@@ -789,12 +753,17 @@ impl Ui {
                 ui.call("provider.list", json!({}))
             );
             if !launch_is_current(&ui, project, generation, &form) {
+                if launch_is_shown(&ui, &form) {
+                    status.set_text(STALE);
+                }
                 return;
             }
-            let provider_data = providers
-                .ok()
-                .map(|v| rows(&v, "providers"))
-                .unwrap_or_default();
+            // A failed check says so and leaves both providers open: session.create still
+            // refuses one that is not installed.
+            let (provider_data, provider_error) = match providers {
+                Ok(v) => (rows(&v, "providers"), None),
+                Err(e) => (Vec::new(), Some(e.to_string())),
+            };
             match task_result {
                 Ok(v) => {
                     let tasks = rows(&v, "tasks");
@@ -804,13 +773,15 @@ impl Ui {
                             let name = if i == 0 { "claude" } else { "codex" };
                             let info = provider_data.iter().find(|p| text(p, "provider") == name);
                             let installed = info.is_some_and(|p| p["installed"] == true);
-                            key.set_sensitive(installed);
+                            key.set_sensitive(installed || provider_error.is_some());
                             account.set_text(
                                 &info
                                     .and_then(|p| p["signed_in_as"].as_str())
                                     .map(|s| format!("Signed in as {s}"))
                                     .unwrap_or_else(|| {
-                                        if installed {
+                                        if provider_error.is_some() {
+                                            "Could not check the CLI".into()
+                                        } else if installed {
                                             "Not signed in".into()
                                         } else {
                                             "CLI not installed".into()
@@ -828,6 +799,13 @@ impl Ui {
                                 }
                             ));
                         }
+                        // Start on an installed provider: a Codex-only machine opens on Codex.
+                        let cards = &profile.provider_cards;
+                        if !cards[profile.provider.selected() as usize].0.is_sensitive() {
+                            if let Some((key, _, _)) = cards.iter().find(|(key, _, _)| key.is_sensitive()) {
+                                key.set_active(true);
+                            }
+                        }
                     }
                     // Agent 1 now, with the task the sheet was opened for; any other agent
                     // when its key is first pressed.
@@ -836,7 +814,10 @@ impl Ui {
                         p[index].fill_tasks(&tasks, None);
                     }
                     *loaded.borrow_mut() = Some(tasks);
-                    status.set_text("Ready to launch");
+                    match &provider_error {
+                        Some(e) => status.set_text(&format!("Ready to launch · could not check the provider CLIs: {e}")),
+                        None => status.set_text("Ready to launch"),
+                    }
                     ready.set_sensitive(true);
                 }
                 Err(e) => status.set_text(&e.to_string()),
@@ -845,15 +826,19 @@ impl Ui {
         let weak = Rc::downgrade(self);
         start.connect_clicked(move|key|{
             let Some(ui)=weak.upgrade()else{return;};
-            if !launch_is_current(&ui,project,generation,&heading){return;}
+            if !launch_is_current(&ui,project,generation,&heading){
+                // Still on screen after the engine reconnected: say so instead of doing nothing.
+                if launch_is_shown(&ui,&heading){ui.show_error(STALE);}
+                return;
+            }
             if ui.launch_busy.replace(true){return;}
-            let group=mode.selected()==1;let two=builders.selected()==1;let indexes=if group{if two{vec![0,2,1]}else{vec![0,2]}}else{(0..count.value_as_int()as usize).collect()};
+            let group=mode.selected()==1;let two=builders.selected()==1;let indexes=if group{if two{vec![0,2,1]}else{vec![0,2]}}else{(0..=count.selected()as usize).collect()};
             let mut profiles_data=Vec::new();
             for index in indexes{
                 let p=&profiles[index];if !p.provider_cards[p.provider.selected() as usize].0.is_sensitive(){ui.launch_busy.set(false);ui.show_error("Choose an installed provider for every agent.");return;}let payload=p.payload(project,if group{Some(if index==2{"reviewer"}else{"builder"})}else{None});
                 let tasks=if !group||index==0{p.selected_tasks()}else{Vec::new()};profiles_data.push((payload,tasks,p.prompt()));
             }
-            key.set_sensitive(false);let key=key.clone();ui.launch_box.set_sensitive(false);let progress=progress.clone();
+            key.set_sensitive(false);let key=key.clone();ui.launch_box.set_sensitive(false);
             // The sheet steps aside on the click and the new agents appear at once, each pane
             // saying which step it is on; the worktree fetch and checkout happen behind them.
             let clicked=std::time::Instant::now();
@@ -871,7 +856,6 @@ impl Ui {
                     // session.create refreshes new-branch refs before allocation.
                     let mut allocated: Vec<(Value, Vec<i64>, String)> = Vec::new();
                     for (index,(mut payload,tasks,prompt)) in profiles_data.into_iter().enumerate(){
-                        progress.set_text(&format!("Allocating agent {}",index+1));
                         ui.launch_progress(&placeholders[index],if group&&index>0{"Joining the shared worktree…"}else{"Preparing worktree…"});
                         if group&&index>0{payload["pair_with"]=json!(text(&allocated[index-1].0,"name"));payload.as_object_mut().unwrap().remove("worktree");}
                         if let Some(task)=tasks.first(){payload["task_id"]=json!(task);}
@@ -880,14 +864,14 @@ impl Ui {
                         tracing::debug!(session=text(&session,"name"),elapsed_ms=clicked.elapsed().as_millis() as u64,"launch: session created");
                         // Stage this agent's queue now, so a later agent's failure cannot cost it.
                         unstaged.extend(&tasks);
-                        for task in &tasks{progress.set_text(&format!("Staging task #{task}"));ui.launch_progress(text(&session,"name"),&format!("Staging task #{task}…"));ui.call("task.dispatch",json!({"task_id":task,"session":session["name"],"start":false})).await?;unstaged.retain(|t|t!=task);}
+                        for task in &tasks{ui.launch_progress(text(&session,"name"),&format!("Staging task #{task}…"));ui.call("task.dispatch",json!({"task_id":task,"session":session["name"],"start":false})).await?;unstaged.retain(|t|t!=task);}
                         allocated.push((session,tasks,prompt));
                     }
                     // Start reviewers first so their mailbox is live before builders publish files.
                     allocated.sort_by_key(|(s,_,_)|text(s,"role")!="reviewer");
                     for(session,_,prompt)in allocated{
                         let name=text(&session,"name").to_string();
-                        progress.set_text(&format!("Starting {name}"));ui.launch_progress(&name,"Starting the provider…");
+                        ui.launch_progress(&name,"Starting the provider…");
                         let started=ui.call("session.spawn",json!({"session":name,"prompt":prompt})).await;
                         ui.launch_done(&name);
                         let started=started?;ui.upsert_session(&started);
@@ -908,9 +892,13 @@ impl Ui {
     }
 }
 
+const STALE: &str = "This form is out of date after a reconnect. Close it and open New session again.";
+
 fn launch_is_current(ui: &Ui, project: i64, generation: u64, heading: &gtk::Box) -> bool {
-    ui.project.get() == project
-        && ui.generation.get() == generation
-        && ui.launch.reveals_child()
-        && ui.launch_box.first_child().as_ref() == Some(heading.upcast_ref())
+    ui.project.get() == project && ui.generation.get() == generation && launch_is_shown(ui, heading)
+}
+
+/// This form is the one the sheet shows, whatever has changed under it.
+fn launch_is_shown(ui: &Ui, heading: &gtk::Box) -> bool {
+    ui.launch.reveals_child() && ui.launch_box.first_child().as_ref() == Some(heading.upcast_ref())
 }

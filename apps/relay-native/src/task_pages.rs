@@ -2,7 +2,33 @@ use super::*;
 use crate::app::scrolled;
 use std::cell::Cell;
 
-pub const COLUMNS: &[&str] = &["backlog", "ready", "active", "in_review", "done"];
+/// The task vocabulary, written once: the bus's column, type, priority and size values in the
+/// order a picker lists them. The board and the task pages derive every other order from these.
+pub const COLUMN_TITLES: [(&str, &str); 5] = [
+    ("backlog", "Backlog"),
+    ("ready", "Ready"),
+    ("active", "Active"),
+    ("in_review", "In review"),
+    ("done", "Done"),
+];
+pub const COLUMNS: &[&str] = &{
+    let mut names = [""; COLUMN_TITLES.len()];
+    let mut i = 0;
+    while i < names.len() {
+        names[i] = COLUMN_TITLES[i].0;
+        i += 1;
+    }
+    names
+};
+/// Every column but Done, the last, which only approval reaches.
+pub const OPEN_COLUMNS: &[&str] = COLUMNS.split_at(COLUMNS.len() - 1).0;
+pub const TYPES: [&str; 5] = ["task", "feature", "bug", "chore", "spike"];
+/// Least urgent first.
+pub const PRIORITIES: [&str; 4] = ["low", "medium", "high", "urgent"];
+/// `""` first: a task need not have a size.
+pub const SIZES: [&str; 4] = ["", "S", "M", "L"];
+/// A task's execution states.
+const STATES: [&str; 6] = ["none", "dispatched", "running", "blocked", "failed", "awaiting_review"];
 pub fn choose(values: &[&str], selected: &str) -> gtk::ComboBoxText {
     let control = gtk::ComboBoxText::new();
     for value in values {
@@ -365,16 +391,16 @@ pub fn compose(ui: &Rc<Ui>, project: i64) {
     form.append(&primary);
     let classify = gtk::Box::new(gtk::Orientation::Vertical, 12);
     classify.add_css_class("task-compose-section");
-    let kind = choose(&["task", "feature", "bug", "chore", "spike"], "task");
-    let priority = choose(&["low", "medium", "high", "urgent"], "medium");
-    let size = choose(&["", "S", "M", "L"], "");
+    let kind = choose(&TYPES, "task");
+    let priority = choose(&PRIORITIES, "medium");
+    let size = choose(&SIZES, "");
     classify.append(&label("CLASSIFY", "section-label"));
     classify.append(&paragraph(
         "Type is the first-class classification; labels are the free-form tags under it.",
     ));
     field(
         "Type",
-        &classification_choices(&kind, "type", &["task", "feature", "bug", "chore", "spike"]),
+        &classification_choices(&kind, "type", &TYPES),
         &classify,
     );
     let labels = gtk::Entry::builder()
@@ -395,14 +421,14 @@ pub fn compose(ui: &Rc<Ui>, project: i64) {
     let priority_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
     field(
         "Priority",
-        &classification_choices(&priority, "priority", &["low", "medium", "high", "urgent"]),
+        &classification_choices(&priority, "priority", &PRIORITIES),
         &priority_box,
     );
     metadata.append(&priority_box);
     let size_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
     field(
         "Size",
-        &classification_choices(&size, "size", &["", "S", "M", "L"]),
+        &classification_choices(&size, "size", &SIZES),
         &size_box,
     );
     metadata.append(&size_box);
@@ -417,17 +443,7 @@ pub fn compose(ui: &Rc<Ui>, project: i64) {
     let advanced = gtk::Expander::new(Some("Advanced · column and execution state"));
     let advanced_fields = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     let column = choose(COLUMNS, "backlog");
-    let state = choose(
-        &[
-            "none",
-            "dispatched",
-            "running",
-            "blocked",
-            "failed",
-            "awaiting_review",
-        ],
-        "none",
-    );
+    let state = choose(&STATES, "none");
     field("Column", &column, &advanced_fields);
     field("State", &state, &advanced_fields);
     advanced.set_child(Some(&advanced_fields));
@@ -609,26 +625,10 @@ fn detail(ui: &Rc<Ui>, task: Value, modules: Vec<Value>, tasks: Result<Vec<Value
     meta.set_column_spacing(8);
     meta.set_row_spacing(6);
     meta.add_css_class("task-metadata");
-    let priority = choose(
-        &["low", "medium", "high", "urgent"],
-        text(&task, "priority"),
-    );
-    let kind = choose(
-        &["task", "feature", "bug", "chore", "spike"],
-        text(&task, "type"),
-    );
-    let size = choose(&["", "S", "M", "L"], text(&task, "size"));
-    let state = choose(
-        &[
-            "none",
-            "dispatched",
-            "running",
-            "blocked",
-            "failed",
-            "awaiting_review",
-        ],
-        text(&task, "state"),
-    );
+    let priority = choose(&PRIORITIES, text(&task, "priority"));
+    let kind = choose(&TYPES, text(&task, "type"));
+    let size = choose(&SIZES, text(&task, "size"));
+    let state = choose(&STATES, text(&task, "state"));
     let module = gtk::ComboBoxText::new();
     module.append(Some(""), "No module");
     let current_module = task["module_id"].as_i64();
@@ -685,7 +685,7 @@ fn detail(ui: &Rc<Ui>, task: Value, modules: Vec<Value>, tasks: Result<Vec<Value
     // Done is reached by approval (the engine refuses a plain move there), so Move offers
     // the other columns and Approve stands beside it until the task is done.
     let done = text(&task, "column") == "done";
-    let column = choose(&COLUMNS[..4], if done { "in_review" } else { text(&task, "column") });
+    let column = choose(OPEN_COLUMNS, if done { "in_review" } else { text(&task, "column") });
     transitions.append(&column);
     action(
         ui,

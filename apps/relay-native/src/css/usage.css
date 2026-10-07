@@ -72,10 +72,6 @@
 .usage-option-row { min-height: 30px; }
 .usage-option-name { color: @ink; font-size: 12px; }
 .usage-option-row:disabled .usage-option-name { color: @faint; }
-.usage-options switch { min-width: 30px; min-height: 16px; border-radius: 2px; border: 1px solid @strong; background: @slab; background-image: none; box-shadow: none; }
-.usage-options switch:checked { background: @ink; border-color: @ink; }
-.usage-options switch slider { min-width: 14px; min-height: 14px; margin: 1px; border-radius: 2px; border: 0; background: @faint; box-shadow: none; }
-.usage-options switch:checked slider { background: @wall; }
 .usage-chips { border: 1px solid @strong; border-radius: 2px; }
 .usage-chips button.usage-chip { min-height: 24px; padding: 0 8px; border: 0; border-left: 1px solid @strong; border-radius: 0; background: @console; color: @secondary; font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif; font-size: 11px; letter-spacing: 0.04em; }
 .usage-chips button.usage-chip:first-child { border-left: 0; }

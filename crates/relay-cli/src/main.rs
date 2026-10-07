@@ -364,8 +364,11 @@ async fn run(cli: Cli) -> Result<u8> {
             Ok(0)
         }
         Command::Events { filter } => {
+            // As whoever is asking: inside a session the socket refuses a `user` claim (D165).
+            let (actor, token) = actor_from_env(cli.actor.as_deref())?;
             let mut c = connect(instance).await?;
-            let req = Request::new(Actor::User, "bus.subscribe", json!({ "events": filter }));
+            let mut req = Request::new(actor, "bus.subscribe", json!({ "events": filter }));
+            if let Some(t) = token { req = req.with_token(t); }
             let resp = c.call(&req, |_| {}).await?;
             if !resp.ok {
                 println!("{}", serde_json::to_string(&resp)?);

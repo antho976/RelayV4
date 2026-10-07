@@ -1,12 +1,7 @@
 //! Editor glyphs the shared icon set does not carry, drawn on the same 16px grid and
-//! painted the same way (see `icons.rs`). Shared names are delegated to `icons::image`.
-use gtk4::{self as gtk, prelude::*};
-use std::cell::RefCell;
-use std::collections::HashMap;
-
-thread_local! {
-    static RENDERED: RefCell<HashMap<String, gtk::Svg>> = RefCell::new(HashMap::new());
-}
+//! painted by the same painter and cache (`icons::from_geometry`). Shared names are delegated
+//! to `icons::image`.
+use gtk4 as gtk;
 
 fn geometry(name: &str) -> Option<&'static str> {
     Some(match name {
@@ -38,15 +33,10 @@ fn geometry(name: &str) -> Option<&'static str> {
             r##"<rect x="2" y="2.5" width="12" height="11" /><path d="M6.5 6L4.5 8l2 2M9.5 6l2 2-2 2" />"##
         }
         "code-inline" => r##"<path d="M5.5 4.5L2 8l3.5 3.5M10.5 4.5L14 8l-3.5 3.5" />"##,
-        "rule" => r##"<path d="M2 8h12" /><path d="M5 4.5h6M5 11.5h6" stroke-opacity=".45" />"##,
         "sort" => r##"<path d="M4.5 3v10M2.5 11l2 2 2-2" /><path d="M8.5 4h5.5M8.5 8h4M8.5 12h2.5" />"##,
         "note-new" => {
             r##"<path d="M4 2h5l3 3v9H4z" /><path d="M9 2v3h3" /><path d="M8 7.5v4.5M5.75 9.75h4.5" />"##
         }
-        "calendar" => {
-            r##"<rect x="2.5" y="3.5" width="11" height="10" /><path d="M2.5 6.5h11M5.5 2v3M10.5 2v3" />"##
-        }
-        "goto" => r##"<path d="M3 8h9M8.5 4.5L12 8l-3.5 3.5" /><path d="M14 3v10" />"##,
         _ => return None,
     })
 }
@@ -55,25 +45,5 @@ pub fn glyph(name: &str, size: i32) -> gtk::Image {
     let Some(geometry) = geometry(name) else {
         return crate::icons::image(name, size);
     };
-    let image = gtk::Image::new();
-    image.set_pixel_size(size);
-    let paint = move |image: &gtk::Image| {
-        let color = image.color();
-        let document = format!(
-            r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" color="{color}" stroke="{color}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">{geometry}</svg>"##
-        );
-        let svg = RENDERED.with(|cache| {
-            let hit = cache.borrow().get(&document).cloned();
-            hit.unwrap_or_else(|| {
-                let svg = gtk::Svg::from_bytes(&glib::Bytes::from_owned(document.clone().into_bytes()));
-                cache.borrow_mut().insert(document, svg.clone());
-                svg
-            })
-        });
-        image.set_paintable(Some(&svg));
-    };
-    // GTK 4.22 SVG paintables do not inherit currentColor from their widget.
-    image.connect_map(paint);
-    image.connect_state_flags_changed(move |image, _| paint(image));
-    image
+    crate::icons::from_geometry(geometry, size, 1.5)
 }
