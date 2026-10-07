@@ -158,6 +158,13 @@ named = inspect({"mesh": "/Game/Manny"})
 unreal.BONES[:] = real_bones
 check(named["frame"]["left_right_pairs_found"] == 6 and named["frame"]["right_axis_in_mesh_space"] == [-1.0, 0.0, 0.0], "-L/-R pairs: %s" % named["frame"])
 
+# 3ds Max Biped names carry the side as a word: "Bip01 L Hand" / "Bip01 R Hand".
+biped_name = lambda n: n and ("Bip01 %s %s" % (n[-1].upper(), n[:-2]) if n.endswith(("_l", "_r")) else n)
+unreal.BONES[:] = [(biped_name(n), biped_name(p), loc) for n, p, loc in real_bones]
+biped = inspect({"mesh": "/Game/Manny"})
+unreal.BONES[:] = real_bones
+check(biped["frame"]["left_right_pairs_found"] == 6 and biped["frame"]["right_axis_in_mesh_space"] == [-1.0, 0.0, 0.0], "Biped L/R pairs: %s" % biped["frame"])
+
 # Without any left/right names the mesh is assumed to face +Y, as a Blender export arrives, and
 # the report says the axes are assumed.
 unsided = [(n.replace("_l", "_a").replace("_r", "_b"), p and p.replace("_l", "_a").replace("_r", "_b"), loc) for n, p, loc in real_bones]

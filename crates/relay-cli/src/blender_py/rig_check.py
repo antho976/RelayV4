@@ -1,7 +1,6 @@
 # blender_rig_check: the rig and skin problems that turn into wrong-handed, mis-scaled or
 # broken characters after export. The mesh checks are mesh_check's (common.mesh_issues); the
 # skin checks on top read the weights on the original mesh.
-import re
 problems, warnings = [], []
 
 
@@ -47,28 +46,8 @@ for l, r in pairs:
         asym.append("%s/%s off by %.1f cm" % (l, r, off))
 if asym:
     warn(arm.name, "%d bone pairs are not mirror images: %s" % (len(asym), "; ".join(asym[:6])), "Armature > Symmetrize from the correct side, unless the asymmetry is intended")
-SIDE_WORD = re.compile(r"Left|Right|(?<![A-Za-z])(?:left|right)")
-SWAP = {"Left": "Right", "Right": "Left", "left": "right", "right": "left"}
-
-
-def other_side(n):
-    """The other side's name of a side-named bone, either way round (twin() maps only left to
-    right), or None. Left/Right count only as a word, so cleft_chin has no side."""
-    for left, right in PAIRS:
-        for a, b in ((left, right), (right, left)):
-            if a not in SWAP and n.endswith(a):
-                return n[: -len(a)] + b
-    m = SIDE_WORD.search(n)
-    if m:
-        return n[: m.start()] + SWAP[m.group()] + n[m.end():]
-    for left, right in PREFIXES:
-        for a, b in ((left, right), (right, left)):
-            if n.startswith(a):
-                return b + n[len(a):]
-    return None
-
-
-side_named = [n for n in names if other_side(n) and other_side(n) not in names]
+# Either side: a right-side bone without its left twin is as wrong as the reverse.
+side_named = [n for n in names if other_side(n) and other_side(n)[1] not in names]
 if side_named:
     warn(arm.name, "side-named bones without a twin: %s" % ", ".join(side_named[:8]), "check the naming (.L/.R) so mirroring and retargeting pair them")
 frame = body_frame(arm)
