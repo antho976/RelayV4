@@ -152,6 +152,72 @@ fn session_update_undoes_after_spawn_and_never_renames_the_primary_branch() {
     assert_ne!(user(e, "session.get", json!({"session": own}))["branch"], "relay/custom");
 }
 
+fn last_update(e: &Engine) -> i64 {
+    user(e, "audit.list", json!({"op_prefix": "session.update", "limit": 1}))["rows"][0]["id"].as_i64().unwrap()
+}
+
+/// RA-403: every report of a running session moves its `updated_at`, so the undo checks the
+/// fields the update wrote instead; an older row that recorded only `updated_at` still works.
+#[test]
+fn session_update_undo_checks_the_fields_it_wrote_not_updated_at() {
+    let f = fixture();
+    let e = &f.engine;
+    let s = name(&user(e, "session.create", json!({"project_id": 1, "provider": "claude"})));
+    let get = |field: &str| user(e, "session.get", json!({"session": s}))[field].clone();
+    user(e, "session.update", json!({"session": s, "allow_ui": true}));
+    let audit = last_update(e);
+    let stamp = get("updated_at");
+    std::thread::sleep(Duration::from_millis(5));
+    ok(e, Actor::agent(&s), "session.report", json!({"session": s, "kind": "session_start"}));
+    ok(e, Actor::agent(&s), "session.report", json!({"session": s, "kind": "tool_use"}));
+    assert_ne!(get("updated_at"), stamp, "a report moves updated_at");
+    user(e, "audit.undo", json!({"audit_id": audit}));
+    assert_eq!(get("allow_ui"), false);
+
+    // A field the update wrote was written again since: stale, unless forced.
+    user(e, "session.update", json!({"session": s, "allow_ui": true}));
+    let audit = last_update(e);
+    user(e, "session.update", json!({"session": s, "allow_ui": false}));
+    assert_eq!(code(e, Actor::User, "audit.undo", json!({"audit_id": audit})), "audit.stale");
+    user(e, "audit.undo", json!({"audit_id": audit, "force": true}));
+
+    // A row recorded before the change carries only `updated_at`, and is checked against it.
+    user(e, "session.update", json!({"session": s, "allow_ui": true}));
+    let audit = last_update(e);
+    let expect = |updated_at: &str| e.store.lock().execute(
+        "UPDATE audit SET undo_op=json_set(undo_op,'$.expect',json_object('updated_at',?1)) WHERE id=?2",
+        rusqlite::params![updated_at, audit],
+    ).unwrap();
+    expect("2000-01-01T00:00:00Z");
+    assert_eq!(code(e, Actor::User, "audit.undo", json!({"audit_id": audit})), "audit.stale");
+    expect(get("updated_at").as_str().unwrap());
+    user(e, "audit.undo", json!({"audit_id": audit}));
+    assert_eq!(get("allow_ui"), false);
+}
+
+/// RA-403: undoing an update that queued a task takes back the queue row it added, and only
+/// that one.
+#[test]
+fn undoing_a_task_attach_drops_the_queue_row_it_added_and_keeps_an_older_one() {
+    let f = fixture();
+    let e = &f.engine;
+    let created = user(e, "session.create", json!({"project_id": 1, "provider": "claude"}));
+    let (s, sid) = (name(&created), created["id"].as_i64().unwrap());
+    let queued = || count(e, &format!("SELECT COUNT(*) FROM task_sessions WHERE task_id=1 AND session_id={sid}"));
+    assert_eq!(queued(), 0);
+    user(e, "session.update", json!({"session": s, "task_id": 1}));
+    assert_eq!(queued(), 1);
+    user(e, "audit.undo", json!({"audit_id": last_update(e)}));
+    assert_eq!(queued(), 0, "the row the update added outlived its undo");
+    assert_eq!(user(e, "session.get", json!({"session": s}))["task_id"], Value::Null);
+
+    // Queued before the update: the row is the queue's, and stays.
+    e.store.lock().execute("INSERT INTO task_sessions(task_id,session_id,ord,queue_ord) VALUES (1,?1,0,0)", [sid]).unwrap();
+    user(e, "session.update", json!({"session": s, "task_id": 1}));
+    user(e, "audit.undo", json!({"audit_id": last_update(e)}));
+    assert_eq!(queued(), 1, "an undo removed a row the update did not add");
+}
+
 /// RA-404.
 #[test]
 fn an_agent_lists_only_its_own_projects_restorable_sessions() {

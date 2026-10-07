@@ -46,17 +46,20 @@ pub(crate) fn next_queued_task(
 
 /// Queue `task_id` at the end of each session's queue, after the task's existing assignees.
 /// Already queued is a no-op. Every attach path — create, update, task dispatch — goes through
-/// here for the whole review group, so members' queues cannot diverge (RA-645).
-pub(crate) fn enqueue(conn: &Connection, task_id: Id, session_ids: &[Id]) -> Result<(), BusError> {
+/// here for the whole review group, so members' queues cannot diverge (RA-645). Returns the
+/// sessions it queued the task for, those that were not already: what an undo takes back.
+pub(crate) fn enqueue(conn: &Connection, task_id: Id, session_ids: &[Id]) -> Result<Vec<Id>, BusError> {
+    let mut added = Vec::new();
     for &session_id in session_ids {
-        conn.prepare_cached(
+        let inserted = conn.prepare_cached(
             "INSERT OR IGNORE INTO task_sessions(task_id,session_id,ord,queue_ord) VALUES (?1,?2,
                (SELECT COALESCE(MAX(ord),-1)+1 FROM task_sessions WHERE task_id=?1),
                (SELECT COALESCE(MAX(queue_ord),-1)+1 FROM task_sessions WHERE session_id=?2))",
         ).bus()?
         .execute(params![task_id, session_id]).bus()?;
+        if inserted > 0 { added.push(session_id); }
     }
-    Ok(())
+    Ok(added)
 }
 
 /// The running PTY of a session, or the typed refusal the input fallbacks give for one that
@@ -1872,25 +1875,35 @@ pub fn register(e: &mut Engine) {
         ).bus()?;
         // A task attached here is queued for the whole group, as dispatch does; an update that
         // leaves the task alone only re-asserts this session's own row.
+        let mut queued = Vec::new();
         if let Some(task_id) = task_id {
             let ids = if p.task_id.is_some() { group_ids(ctx.tx(), s)? } else { vec![s.id] };
-            enqueue(ctx.tx(), task_id, &ids)?;
+            queued = enqueue(ctx.tx(), task_id, &ids)?.into_iter().map(|sid| json!([task_id, sid])).collect();
         }
         let updated = sessions::by_id(ctx.tx(), s.id)?.ok_or_else(|| BusError::internal("session vanished"))?;
         // The inverse names only what this update changed. Branch, model and effort change only
         // before the first spawn, so an inverse that always carried them was refused as soon as
         // the session had started, whatever the update was about (RA-403).
+        // Its precondition is those fields still holding what this update wrote, not the row's
+        // `updated_at`, which every `session.report` of a running session moves on. And the
+        // queue rows it added go with it: `expect.queued` names the (task, session) pairs that
+        // were not queued before, as UpdateIn has no field for them.
         let mut inverse = serde_json::Map::new();
+        let mut fields = serde_json::Map::new();
         inverse.insert("session".into(), json!(s.name));
         let u = &updated.session;
-        if u.branch != s.branch { inverse.insert("branch".into(), json!(s.branch)); }
-        if u.model != s.model { inverse.insert("model".into(), json!(s.model)); }
-        if u.effort != s.effort { inverse.insert("effort".into(), json!(s.effort)); }
-        if u.task_id != s.task_id { inverse.insert("task_id".into(), json!(s.task_id)); }
-        if u.module_id != s.module_id { inverse.insert("module_id".into(), json!(s.module_id)); }
-        if u.bus_writes != s.bus_writes { inverse.insert("bus_writes".into(), json!(s.bus_writes)); }
-        if u.allow_ui != s.allow_ui { inverse.insert("allow_ui".into(), json!(s.allow_ui)); }
-        ctx.set_undo("session.update", Value::Object(inverse), Some(json!({"updated_at":u.updated_at})));
+        let mut changed = |name: &str, before: Value, after: Value| if before != after {
+            inverse.insert(name.into(), before);
+            fields.insert(name.into(), after);
+        };
+        changed("branch", json!(s.branch), json!(u.branch));
+        changed("model", json!(s.model), json!(u.model));
+        changed("effort", json!(s.effort), json!(u.effort));
+        changed("task_id", json!(s.task_id), json!(u.task_id));
+        changed("module_id", json!(s.module_id), json!(u.module_id));
+        changed("bus_writes", json!(s.bus_writes), json!(u.bus_writes));
+        changed("allow_ui", json!(s.allow_ui), json!(u.allow_ui));
+        ctx.set_undo("session.update", Value::Object(inverse), Some(json!({"fields": fields, "queued": queued})));
         emit_session(ctx, &updated.session);
         Ok(updated.session)
     });
