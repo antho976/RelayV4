@@ -14,9 +14,24 @@ const PALETTES: [(&str, [&str; 10]); 3] = [
     ("oled", ["#000000", "#000000", "#0d0d0e", "#161618", "#000000", "#ececea", "#a5a5a3", "#1f1f22", "#77777a", "#333336"]),
 ];
 
+/// The status tokens, the same in every appearance mode: theme.css defines them for the
+/// window, and the editor schemes take them from here. Change both.
+const STATUS: [(&str, &str); 3] = [("live", "#2ec469"), ("held", "#e5382e"), ("waiting", "#f0a828")];
+
 /// The tokens of `mode`; an unknown mode is matte.
 pub fn palette(mode: &str) -> [&'static str; 10] {
     PALETTES.iter().find(|(name, _)| *name == mode).unwrap_or(&PALETTES[0]).1
+}
+
+/// The Code editor's style scheme for one appearance mode: relay-editor.xml with each
+/// `@token` replaced by that mode's colour.
+fn editor_scheme(mode: &str, colors: [&str; 10]) -> String {
+    let mut scheme = include_str!("../resources/relay-editor.xml").replace("RELAY_MODE", mode);
+    // No token name is a prefix of another, so each `@token` replaces whole.
+    for (token, color) in TOKENS.iter().zip(colors).chain(STATUS.iter().map(|(t, c)| (t, *c))) {
+        scheme = scheme.replace(&format!("@{token}"), color);
+    }
+    scheme
 }
 
 pub fn install(window: &gtk4::ApplicationWindow) {
@@ -52,9 +67,7 @@ pub fn install(window: &gtk4::ApplicationWindow) {
         let styles = directory.join("styles");
         std::fs::create_dir_all(&styles)?;
         for (mode, colors) in PALETTES {
-            let scheme = include_str!("../resources/relay-editor.xml")
-                .replace("RELAY_MODE", mode)
-                .replace("RELAY_BACKGROUND", colors[SCREEN]);
+            let scheme = editor_scheme(mode, colors);
             let path = styles.join(format!("relay-{mode}.xml"));
             if std::fs::read_to_string(&path).ok().as_deref() != Some(&scheme) {
                 std::fs::write(path, scheme)?;
@@ -66,5 +79,17 @@ pub fn install(window: &gtk4::ApplicationWindow) {
     })();
     if let Err(error) = result {
         tracing::warn!(%error, "Could not register bundled Relay fonts");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn editor_schemes_resolve_every_token() {
+        for (mode, colors) in super::PALETTES {
+            let scheme = super::editor_scheme(mode, colors);
+            assert!(!scheme.contains('@'), "{mode}: unresolved token in relay-editor.xml");
+            assert!(scheme.contains(&format!("background=\"{}\"", colors[super::SCREEN])));
+        }
     }
 }

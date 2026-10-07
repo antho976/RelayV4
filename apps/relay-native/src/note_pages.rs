@@ -117,7 +117,8 @@ thread_local! {
     static SCHEME: OnceCell<Option<sourceview5::StyleScheme>> = const { OnceCell::new() };
 }
 
-/// The Notes paper: the text view's background here, `@notes_paper` in css/notes.css.
+/// The Notes paper: the text view's background here, `@notes_paper` in css/notes.css. It is
+/// deliberately the same in every appearance mode; change both together.
 const NOTES_PAPER: &str = "#0c0c0e";
 
 const NOTES_SCHEME: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
@@ -1418,15 +1419,10 @@ pub fn workspace(ui: &Rc<Ui>, _name: &str, project: i64, notes: &[Value]) {
     }
 }
 
-/// Fixture checks for the editor's pure helpers and GtkSourceView search, run by smoke.
+/// Fixture checks for what needs GtkSourceView itself (the language, the scheme and search),
+/// run by smoke. The pure list, prefix and go-to helpers are unit-tested in `note_pages/text.rs`.
 pub fn verify_tools() {
     use sourceview5::prelude::*;
-    assert_eq!(text::list_enter("- milk", ""), Some(text::Enter::Continue("- ".into())));
-    assert_eq!(text::list_enter("3. three", ""), Some(text::Enter::Continue("4. ".into())));
-    assert_eq!(text::list_enter("- [ ] ", ""), Some(text::Enter::End));
-    assert_eq!(text::toggle_lines(&["a", "b"], text::Prefix::Bullet), ["- a", "- b"]);
-    assert_eq!(text::toggle_lines(&["## a"], text::Prefix::Heading(2)), ["a"]);
-    assert_eq!(text::parse_goto("12:4"), Some((12, Some(4))));
     assert!(sourceview5::LanguageManager::default().language("markdown").is_some());
     assert!(scheme().is_some(), "Notes colour scheme");
     let buffer = sourceview5::Buffer::new(None);

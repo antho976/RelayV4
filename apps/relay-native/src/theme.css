@@ -8,6 +8,7 @@
 @define-color faint #77777a;
 @define-color strong #37373c;
 @define-color edge #252529;
+/* live, held and waiting are the same in every mode; fonts::STATUS gives them to the editor. */
 @define-color live #2ec469;
 @define-color held #e5382e;
 @define-color waiting #f0a828;
