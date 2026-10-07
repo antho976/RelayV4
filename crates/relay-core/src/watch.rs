@@ -218,7 +218,7 @@ pub fn ensure(engine: &Engine, root: &Path, project_id: relay_bus::types::Id) {
     let registered = watcher.is_some();
     {
         let mut watchers = engine.watchers.lock().unwrap();
-        if !watchers.get(&key).is_some_and(|known| known.watcher.is_some()) {
+        if watchers.get(&key).is_none_or(|known| known.watcher.is_none()) {
             // Room first: worktrees that no longer exist, then the least recently requested.
             watchers.retain(|path, _| Path::new(path).exists());
             while watchers.len() >= MAX_ROOTS {
