@@ -247,22 +247,45 @@ pub fn register(e: &mut Engine) {
         changed(ctx, project_id, &root, &p.path);
         Ok(DeleteOut { trash_id: id })
     });
+    // Locked throughout: resolving the checkout is a few stats and small reads (`worktree::
+    // contains` reads `.git` pointers, it runs no `git worktree list`).
     e.register::<Restore>(|ctx: &mut Ctx, p| {
         let project = get_project(ctx.tx(), p.project_id)?;
-        let own = own_checkout(ctx.tx(), &ctx.actor, ctx.actor_session_id(), project.id)?;
-        let row: Option<(String,String,String)> = ctx.tx().query_row(
+        let row: Option<(String,String,String)> = ctx.tx().prepare_cached(
             "SELECT worktree, original_path, trash_path FROM file_trash WHERE id=?1 AND project_id=?2 AND restored_at IS NULL",
-            params![p.trash_id, project.id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
-        ).optional().bus()?;
+        ).bus()?.query_row(params![p.trash_id, project.id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().bus()?;
         let (root_s, rel_s, trash_s) = row.ok_or_else(|| BusError::not_found("file.trash_not_found", format!("no open trash {}", p.trash_id)))?;
-        let root = PathBuf::from(root_s); confine(own, &root)?;
+        // A named checkout is addressed and confined like any other mutation's (RA-148). Unnamed,
+        // it goes back where it was deleted from while that is still a worktree of this project;
+        // a session's worktree is removed with the session, while the bytes outlive it in the
+        // primary checkout's trash, so then it goes to the primary checkout (RA-214).
+        let (root, fallback) = if p.worktree.is_some() {
+            (root_mut(ctx, project.id, p.worktree.as_deref())?.1, false)
+        } else {
+            let own = own_checkout(ctx.tx(), &ctx.actor, ctx.actor_session_id(), project.id)?;
+            let original = match fs::canonicalize(&root_s) {
+                Ok(original) => crate::worktree::contains(Path::new(&project.path), &original)
+                    .map_err(|e| BusError::unavailable("worktree.list_failed", e.to_string()))?
+                    .then_some(original),
+                Err(_) => None,
+            };
+            let (root, fallback) = match original {
+                Some(original) => (original, false),
+                None => (root_verify(&project, PathBuf::from(&project.path), "file.worktree")?, true),
+            };
+            confine(own, &root)?;
+            (root, fallback)
+        };
+        if trash_s.is_empty() || !occupied(Path::new(&trash_s)) {
+            return Err(BusError::not_found("file.trash_unavailable", format!("trash {} is no longer on disk", p.trash_id)));
+        }
         let rel = rel(&rel_s, false)?; let path = safe_join(&root, &rel, true)?;
         if occupied(&path) { return Err(BusError::conflict("file.restore_conflict", format!("{} already exists", rel.display()))); }
         if let Some(parent) = path.parent() { fs::create_dir_all(parent).map_err(|e| io_err("file.restore_failed", &rel, e))?; }
         fs::rename(&trash_s, &path).map_err(|e| io_err("file.restore_failed", &rel, e))?;
         ctx.tx().execute("UPDATE file_trash SET restored_at=?1 WHERE id=?2", params![ctx.now, p.trash_id]).bus()?;
         changed(ctx, project.id, &root, &rel_s);
-        entry(&root, &path, &HashMap::new())
+        Ok(RestoreOut { entry: entry(&root, &path, &HashMap::new())?, worktree: root.display().to_string(), fallback })
     });
     e.register_unlocked::<TrashList>(|ctx, p| {
         let limit = p.limit.unwrap_or(200).clamp(1, 1000);
