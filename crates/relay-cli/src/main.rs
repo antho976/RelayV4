@@ -736,11 +736,21 @@ async fn lifecycle_report(instance: Instance, actor_override: Option<&str>, kind
     let mut request = Request::new(actor, "session.report", json!({
         "session": session,
         "kind": kind,
-        "data": data,
+        "data": report_data(data),
     }));
     if let Some(token) = token { request = request.with_token(token); }
     let response = client.call(&request, |_| {}).await?;
     response.into_result().map(|_| ()).map_err(|error| anyhow!("{}: {}", error.code, error.message))
+}
+
+/// The hook payload as `session.report` gets it. A PostToolUse payload carries the tool's whole
+/// output in `tool_response` — a file read, a build log — which the report never reads, yet it
+/// crossed the socket and was hashed into the audit on every tool call (RA-401).
+fn report_data(mut data: Value) -> Value {
+    if let Some(object) = data.as_object_mut() {
+        object.remove("tool_response");
+    }
+    data
 }
 
 fn required_string<'a>(object: &'a serde_json::Map<String, Value>, key: &str) -> Result<&'a str> {
@@ -828,6 +838,21 @@ async fn do_cmd(instance: Instance, actor_override: Option<&str>, op: String, pa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RA-401: the tool's output is not forwarded; what session.report reads is.
+    #[test]
+    fn a_lifecycle_report_drops_the_tool_response() {
+        let hook = json!({
+            "session_id": "abc", "hook_event_name": "PostToolUse", "tool_name": "Bash",
+            "tool_input": {"command": "adb install app.apk"}, "tool_response": {"stdout": "x".repeat(100_000)},
+        });
+        let sent = report_data(hook);
+        assert!(sent.get("tool_response").is_none());
+        assert_eq!(sent["session_id"], "abc");
+        assert_eq!(sent["tool_input"]["command"], "adb install app.apk");
+        assert_eq!(report_data(json!({"message": "hi"})), json!({"message": "hi"}));
+        assert_eq!(report_data(json!(null)), json!(null));
+    }
 
     #[tokio::test]
     async fn a_guardrail_that_never_answers_blocks_before_the_provider_gives_up() {
