@@ -10,6 +10,9 @@ ExecStart=%h/.cargo/bin/relay serve --remote
 Restart=on-failure
 RestartSec=2
 Environment=RELAY_LOG=info
+# The user manager's default soft limit is 1024 descriptors, shared by the engine, every agent's
+# terminal and the phone door; the door caps its own connections, this keeps headroom anyway.
+LimitNOFILE=65536
 
 [Install]
 WantedBy=default.target

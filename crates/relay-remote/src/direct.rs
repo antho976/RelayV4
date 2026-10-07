@@ -1,20 +1,51 @@
 //! The WiFi door: a WebSocket listener on the LAN. A phone that scanned the pairing code
-//! connects here first, because a link that never leaves the room is the private one.
+//! connects here first, because a link that never leaves the room is the shortest one.
 //!
 //! `GET /info` answers plain HTTP with the host's name so a phone can tell "wrong network"
 //! from "wrong machine" before it starts a handshake.
+//!
+//! The door runs inside the engine (`relay serve --remote`), so a stranger on the network must
+//! not be able to spend the engine's resources: until this machine has a paired phone or an
+//! open pairing window it answers nothing, every connection gets a deadline to say what it is,
+//! and the number of connections — and of those not yet proven — is capped.
 
 use crate::bridge::{self, Ctx, OUTBOUND_QUEUE};
 use crate::registry::Registry;
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
+use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+use tokio_tungstenite::tungstenite::http::StatusCode;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
+
+/// How long a connection has to say what it is: the `/info` probe or a finished WebSocket
+/// upgrade. After the upgrade the bridge's own hello deadline takes over.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Connections the door holds at once. A phone keeps one or two; the cap is far below the
+/// engine's descriptor limit so the desktop, the CLI and agent hooks always find room.
+const MAX_CONNECTIONS: usize = 64;
+
+/// Of those, how many may still be unproven, in all and from one address. A stranger can only
+/// occupy unproven slots, and only a few of them, so a paired phone is not locked out by
+/// connections that will never say hello.
+const MAX_UNPROVEN: usize = 16;
+const MAX_UNPROVEN_PER_PEER: usize = 4;
+
+/// The largest message a phone may send. Bus requests are small; a file write is the biggest.
+const MAX_MESSAGE: usize = 8 << 20;
+
+/// A live phone sends `bus.ping` every 25 s. A connection silent for this long is a phone that
+/// dropped off without a FIN; closing it frees its slot instead of waiting out TCP retries.
+const PHONE_SILENCE: Duration = Duration::from_secs(90);
 
 pub struct DirectServer {
     pub local_addr: SocketAddr,
@@ -34,15 +65,26 @@ impl DirectServer {
             .with_context(|| format!("binding {addr}"))?;
         let local_addr = listener.local_addr()?;
         tracing::info!(addr = %local_addr, "remote door open (direct)");
+        let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        let unproven = Arc::new(Unproven::default());
         let accept = tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, peer)) => {
+                        // Refuse at once rather than queue: a socket waiting for a slot still
+                        // holds a descriptor.
+                        let (Ok(slot), Some(unproven)) =
+                            (slots.clone().try_acquire_owned(), unproven.enter(peer.ip()))
+                        else {
+                            tracing::debug!(peer = %peer, "direct door full; connection refused");
+                            continue;
+                        };
                         let ctx = ctx.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle(ctx, stream).await {
+                            if let Err(e) = handle(ctx, stream, unproven).await {
                                 tracing::debug!(peer = %peer, error = %e, "direct connection ended");
                             }
+                            drop(slot);
                         });
                     }
                     Err(e) => {
@@ -53,6 +95,50 @@ impl DirectServer {
             }
         });
         Ok(DirectServer { local_addr, accept })
+    }
+}
+
+/// The unproven connections, counted in all and per address.
+struct Unproven {
+    total: Arc<Semaphore>,
+    per_peer: Mutex<HashMap<IpAddr, usize>>,
+}
+
+impl Default for Unproven {
+    fn default() -> Unproven {
+        Unproven { total: Arc::new(Semaphore::new(MAX_UNPROVEN)), per_peer: Mutex::default() }
+    }
+}
+
+impl Unproven {
+    fn enter(self: &Arc<Self>, ip: IpAddr) -> Option<UnprovenSlot> {
+        let permit = self.total.clone().try_acquire_owned().ok()?;
+        let mut per_peer = self.per_peer.lock().unwrap();
+        let held = per_peer.entry(ip).or_default();
+        if *held >= MAX_UNPROVEN_PER_PEER {
+            return None;
+        }
+        *held += 1;
+        Some(UnprovenSlot { unproven: self.clone(), ip, _permit: permit })
+    }
+}
+
+/// One unproven connection's place; the bridge drops it once the device is admitted.
+struct UnprovenSlot {
+    unproven: Arc<Unproven>,
+    ip: IpAddr,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Drop for UnprovenSlot {
+    fn drop(&mut self) {
+        let mut per_peer = self.unproven.per_peer.lock().unwrap();
+        if let Some(held) = per_peer.get_mut(&self.ip) {
+            *held -= 1;
+            if *held == 0 {
+                per_peer.remove(&self.ip);
+            }
+        }
     }
 }
 
@@ -70,25 +156,52 @@ pub fn info_json(ctx: &Ctx) -> String {
     .to_string()
 }
 
-async fn handle(ctx: Arc<Ctx>, mut stream: TcpStream) -> Result<()> {
-    // A plain HTTP probe never upgrades; answer it by hand and get out of the way.
-    let mut head = [0u8; 16];
-    let n = stream.peek(&mut head).await?;
-    if head[..n].starts_with(b"GET /info") {
-        let body = info_json(&ctx);
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        stream.write_all(response.as_bytes()).await?;
-        stream.shutdown().await?;
+/// Whether the door has anyone to talk to: a paired phone, or an open pairing window. Until
+/// then a connection is closed unanswered, so a machine that never paired a phone shows the
+/// network nothing. `relay remote pair` only writes `remote.json`, so this reads it each time.
+fn door_in_use(ctx: &Ctx) -> bool {
+    Registry::load(&ctx.registry_path).is_ok_and(|r| !r.devices.is_empty() || !r.pending.is_empty())
+}
+
+/// A browser always sends `Origin`; a page on another site must not be able to open this door
+/// from the person's own browser. React Native sends the URL's own origin, so the host must match.
+#[allow(clippy::result_large_err)]
+fn check_origin(req: &Request, resp: Response) -> std::result::Result<Response, ErrorResponse> {
+    let Some(origin) = req.headers().get("origin") else {
+        return Ok(resp);
+    };
+    let host_of = |authority: &str| -> String {
+        let authority = authority.trim_end_matches('/');
+        let host = match authority.strip_prefix('[') {
+            Some(v6) => v6.split(']').next().unwrap_or(""),
+            None => authority.rsplit_once(':').map_or(authority, |(h, _)| h),
+        };
+        host.to_ascii_lowercase()
+    };
+    let origin_host = origin
+        .to_str()
+        .ok()
+        .and_then(|o| o.split_once("://"))
+        .map(|(_, rest)| host_of(rest));
+    let host = req.headers().get("host").and_then(|h| h.to_str().ok()).map(host_of);
+    if origin_host.is_some() && origin_host == host {
+        return Ok(resp);
+    }
+    let mut refusal = ErrorResponse::new(Some("cross-origin requests are not accepted".into()));
+    *refusal.status_mut() = StatusCode::FORBIDDEN;
+    Err(refusal)
+}
+
+async fn handle(ctx: Arc<Ctx>, stream: TcpStream, unproven: UnprovenSlot) -> Result<()> {
+    if !door_in_use(&ctx) {
         return Ok(());
     }
-
-    let ws = tokio_tungstenite::accept_async(stream)
-        .await
-        .context("websocket handshake")?;
+    let ws = match tokio::time::timeout(HANDSHAKE_TIMEOUT, open(&ctx, stream)).await {
+        Err(_) => anyhow::bail!("no handshake within {}s", HANDSHAKE_TIMEOUT.as_secs()),
+        Ok(Err(e)) => return Err(e),
+        Ok(Ok(None)) => return Ok(()),
+        Ok(Ok(Some(ws))) => ws,
+    };
     let (mut sink, mut source) = ws.split();
     let (in_tx, in_rx) = mpsc::channel::<String>(64);
     let (out_tx, mut out_rx) = mpsc::channel::<String>(OUTBOUND_QUEUE);
@@ -102,7 +215,7 @@ async fn handle(ctx: Arc<Ctx>, mut stream: TcpStream) -> Result<()> {
         let _ = sink.close().await;
     });
     let reader = tokio::spawn(async move {
-        while let Some(msg) = source.next().await {
+        while let Ok(Some(msg)) = tokio::time::timeout(PHONE_SILENCE, source.next()).await {
             match msg {
                 Ok(Message::Text(text)) => {
                     if in_tx.send(text.to_string()).await.is_err() {
@@ -120,11 +233,36 @@ async fn handle(ctx: Arc<Ctx>, mut stream: TcpStream) -> Result<()> {
         }
     });
 
-    let result = bridge::run(ctx, in_rx, out_tx).await;
+    let result = bridge::run(ctx, in_rx, out_tx, unproven).await;
     reader.abort();
     // Let queued lines drain, then the writer closes the socket.
     let _ = writer.await;
     result.map_err(|e| anyhow::anyhow!(e))
+}
+
+/// Answer a `/info` probe (`None`), or finish the WebSocket upgrade.
+async fn open(ctx: &Ctx, mut stream: TcpStream) -> Result<Option<tokio_tungstenite::WebSocketStream<TcpStream>>> {
+    // A plain HTTP probe never upgrades; answer it by hand and get out of the way.
+    let mut head = [0u8; 16];
+    let n = stream.peek(&mut head).await?;
+    if head[..n].starts_with(b"GET /info") {
+        let body = info_json(ctx);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).await?;
+        stream.shutdown().await?;
+        return Ok(None);
+    }
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(MAX_MESSAGE))
+        .max_frame_size(Some(MAX_MESSAGE));
+    let ws = tokio_tungstenite::accept_hdr_async_with_config(stream, check_origin, Some(config))
+        .await
+        .context("websocket handshake")?;
+    Ok(Some(ws))
 }
 
 /// A Tailscale address: tailnets hand out 100.64.0.0/10. A phone on the same tailnet reaches

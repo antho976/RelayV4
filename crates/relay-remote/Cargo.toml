@@ -19,6 +19,9 @@ sha2.workspace = true
 rand.workspace = true
 jiff.workspace = true
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
+# tokio-tungstenite builds rustls with no crypto provider, and `ClientConfig::builder()` panics
+# without one. Exactly one provider feature: enabling a second makes the choice ambiguous again.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 qrcode = { version = "0.14", default-features = false }
 if-addrs = "0.15"

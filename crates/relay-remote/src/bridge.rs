@@ -13,6 +13,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
+use tokio::task::AbortHandle;
 
 /// What every bridge needs to know about the engine it fronts.
 #[derive(Debug, Clone)]
@@ -34,13 +35,22 @@ impl Ctx {
     }
 }
 
-/// How long a phone has to answer the greeting. A TCP connection that never speaks holds
-/// nothing but a task.
+/// How long a phone has to answer the greeting. The transport bounds the time before the
+/// greeting (`direct.rs`'s handshake deadline); this bounds the time after it.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Lines queued toward the phone before the transport applies backpressure. Terminal output
 /// arrives in bursts; a phone on a poor link must not park unbounded memory here.
 pub const OUTBOUND_QUEUE: usize = 256;
+
+/// Aborts a task when dropped, so a conversation that is itself aborted takes its helpers with it.
+pub struct AbortOnDrop(pub AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 /// Why a connection ended before or during the bus phase. Logged, never fatal.
 #[derive(Debug, thiserror::Error)]
@@ -108,11 +118,13 @@ pub fn greeting(ctx: &Ctx, registry: &Registry, challenge: &str) -> Greeting {
 }
 
 /// Run one conversation to its end. `inbound` carries text frames from the phone; `outbound`
-/// carries lines to it. Returns when either side goes away.
+/// carries lines to it. Returns when either side goes away. `unproven` is whatever the transport
+/// holds for a connection that has not yet proved itself; it is dropped once the device is admitted.
 pub async fn run(
     ctx: Arc<Ctx>,
     mut inbound: mpsc::Receiver<String>,
     outbound: mpsc::Sender<String>,
+    unproven: impl Send,
 ) -> std::result::Result<(), BridgeEnd> {
     let registry = Registry::load(&ctx.registry_path).map_err(BridgeEnd::Other)?;
     let challenge = crate::registry::random_hex(16);
@@ -151,6 +163,7 @@ pub async fn run(
         .await
         .map_err(|_| BridgeEnd::ClosedEarly)?;
     tracing::info!(device = %admitted.device_id, instance = %ctx.instance, "remote device admitted");
+    drop(unproven);
 
     // Only now does the engine hear about this connection.
     let stream = UnixStream::connect(&ctx.socket_path)
@@ -167,6 +180,8 @@ pub async fn run(
             }
         }
     });
+    // A transport that aborts this conversation must not leave the engine connection open.
+    let pump_guard = AbortOnDrop(pump.abort_handle());
 
     let instance = ctx.instance;
     let result: Result<()> = async {
@@ -189,7 +204,7 @@ pub async fn run(
         Ok(())
     }
     .await;
-    pump.abort();
+    drop(pump_guard);
     tracing::info!(device = %admitted.device_id, "remote device left");
     result.map_err(BridgeEnd::Other)
 }

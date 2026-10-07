@@ -28,8 +28,14 @@ ready() { timeout 2 "$relay" --instance "$RELAY_INSTANCE" ping >/dev/null 2>&1; 
 if ! ready; then
     log="$PWD/target/engine-$RELAY_INSTANCE.log"
     # --remote also opens the phone door (docs/MOBILE.md): the desktop and the phone share
-    # this engine, and pairing is `relay remote pair` with nothing else to start.
-    nohup "$relay" --instance "$RELAY_INSTANCE" serve --remote >>"$log" 2>&1 </dev/null &
+    # this engine, and pairing is `relay remote pair` with nothing else to start. The door
+    # answers nobody until a phone is paired or a pairing window is open.
+    #
+    # setsid puts the engine in its own session: Ctrl+C or Ctrl+Z in this terminal must not
+    # reach it, since it outlives the window and holds every agent's terminal. This script runs
+    # without job control, so the background child is not a group leader, setsid does not fork,
+    # and $! is still the engine's pid.
+    setsid nohup "$relay" --instance "$RELAY_INSTANCE" serve --remote >>"$log" 2>&1 </dev/null &
     engine_pid=$!
     deadline=$((SECONDS + 15))
     until ready; do

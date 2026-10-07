@@ -4,10 +4,14 @@
 //! Two routes, one protocol:
 //!
 //! - **direct** (`direct.rs`): the engine listens on the LAN; the phone connects when it is on
-//!   the same WiFi. Nothing leaves the network.
+//!   the same WiFi. Nothing leaves the network, but the network can read it: plain `ws://`.
 //! - **via a rendezvous** (`rendezvous.rs`, `tunnel.rs`): the engine dials out to a server the
-//!   person hosts, and phones anywhere join through it. The server copies lines and reads none
-//!   of them; every check still happens here.
+//!   person hosts, and phones anywhere join through it. The server only copies lines, and every
+//!   credential check happens here — but it can read the lines, and write into them.
+//!
+//! Neither route seals the lines after the handshake or authenticates the PC to the phone, so
+//! an on-path attacker can read and inject (docs/MOBILE.md §6). Sealing them is a wire change on
+//! both ends, still to come.
 //!
 //! Both routes hand `bridge.rs` a pair of channels. It greets, verifies the device against
 //! `remote.json` (`registry.rs`), then forwards bus lines to the socket door as actor `user`
