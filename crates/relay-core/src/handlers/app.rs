@@ -254,6 +254,10 @@ fn resource_snapshot(rows: Vec<ResourceRow>, engine: &Engine, refresh_disk: bool
         rss_mb: proc_rss_mb(relay_pid).unwrap_or(0.0),
         cpu_pct: proc_ticks(relay_pid).map(|ticks| cpu_pct(engine, relay_pid, ticks)).unwrap_or(0.0),
     };
+    // Only the pids sampled now keep a baseline: a pid that is gone, and later reused, must
+    // not be measured against its predecessor's ticks.
+    let sampled: HashSet<i64> = panes.iter().filter_map(|pane| pane.pid).chain([relay_pid]).collect();
+    engine.resource_cpu.lock().unwrap().retain(|pid, _| sampled.contains(&pid.abs()));
     Ok(ResourcesOut { relay, panes, worktrees, store_mb, total_rss_mb })
 }
 
@@ -300,15 +304,31 @@ fn proc_ticks(pid: i64) -> Option<u64> {
     Some(fields.get(11)?.parse::<u64>().ok()? + fields.get(12)?.parse::<u64>().ok()?)
 }
 
+/// The shortest window a CPU reading is taken over. At CLK_TCK=100 a window of a millisecond
+/// or two holds zero ticks or one, so a busy pane would read 0% or 1000% (RA-348).
+const CPU_MIN_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// CPU% of `pid` since an earlier sample. Every reader shares the baselines — the watch loop,
+/// `app.resources.get`, its disk refresh, `dashboard.get` — so `pid` holds the latest one and
+/// `-pid` (pids are positive) the one before it. A reader that comes too soon after the latest
+/// measures from the earlier one instead and leaves both in place.
 fn cpu_pct(engine: &Engine, pid: i64, ticks: u64) -> f64 {
     let now = Instant::now();
     let mut samples = engine.resource_cpu.lock().unwrap();
-    let result = samples.get(&pid).map(|(prior, at)| {
-        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as f64;
-        (ticks.saturating_sub(*prior) as f64 / hz / now.duration_since(*at).as_secs_f64() * 100.0).max(0.0)
-    }).unwrap_or(0.0);
-    samples.insert(pid, (ticks, now));
-    result
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as f64;
+    let pct = |(prior, at): (u64, Instant)| {
+        (ticks.saturating_sub(prior) as f64 / hz / now.duration_since(at).as_secs_f64() * 100.0).max(0.0)
+    };
+    match samples.get(&pid).copied() {
+        Some(latest) if now.duration_since(latest.1) < CPU_MIN_WINDOW => {
+            samples.get(&-pid).copied().map(pct).unwrap_or(0.0)
+        }
+        latest => {
+            if let Some(latest) = latest { samples.insert(-pid, latest); }
+            samples.insert(pid, (ticks, now));
+            latest.map(pct).unwrap_or(0.0)
+        }
+    }
 }
 
 
@@ -357,5 +377,24 @@ mod tests {
         std::fs::write(root.path().join("src/main.rs"), b"source").unwrap();
         std::fs::write(root.path().join("target/debug/app"), b"build-output").unwrap();
         assert_eq!(dir_usage(root.path()), (18, 12));
+    }
+
+    #[test]
+    fn a_cpu_reading_right_after_another_measures_from_the_earlier_baseline() {
+        let engine = Engine::new(crate::Instance::Test, crate::Store::open_memory().unwrap());
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
+        let start = Instant::now() - std::time::Duration::from_secs(2);
+        engine.resource_cpu.lock().unwrap().insert(7, (0, start));
+        // Two seconds at one full core: 100%.
+        let first = cpu_pct(&engine, 7, 2 * hz);
+        assert!((first - 100.0).abs() < 5.0, "{first}");
+        // Milliseconds later, one more tick: the reading still covers about two seconds, never
+        // the millisecond window that would make it 0% or 1000%.
+        let again = cpu_pct(&engine, 7, 2 * hz + 1);
+        assert!((90.0..110.0).contains(&again), "{again}");
+        assert_eq!(engine.resource_cpu.lock().unwrap()[&7].0, 2 * hz, "the short read moved the baseline");
+        // A pid no longer among the sessions loses its baselines.
+        resource_snapshot(Vec::new(), &engine, false).unwrap();
+        assert!(!engine.resource_cpu.lock().unwrap().keys().any(|pid| pid.abs() == 7));
     }
 }
