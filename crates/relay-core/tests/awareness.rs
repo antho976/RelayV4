@@ -1,33 +1,14 @@
 //! Phase 5: standing context, persistent mailbox, deterministic briefs, lifecycle reports,
 //! completion, and file/symbol overlap detection. Every feature assertion crosses the bus.
 
-use relay_bus::{Actor, Request, Response};
-use relay_core::engine::{Door, Engine};
-use relay_core::{Instance, Store};
+mod common;
+
+use common::{call_as as call, committed_repo, engine_with_project, ok_as as ok};
+use relay_bus::Actor;
+use relay_core::engine::Engine;
 use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 use std::sync::Arc;
-
-fn git(repo: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .status()
-        .unwrap();
-    assert!(status.success(), "git {args:?}");
-}
-
-fn call(engine: &Engine, actor: Actor, op: &str, payload: Value) -> Response {
-    engine.dispatch(Request::new(actor, op, payload), Door::InProcess)
-}
-
-fn ok(engine: &Engine, actor: Actor, op: &str, payload: Value) -> Value {
-    call(engine, actor, op, payload)
-        .into_result()
-        .unwrap_or_else(|error| panic!("{op} failed: {} {}", error.code, error.message))
-}
 
 struct Fixture {
     _root: tempfile::TempDir,
@@ -41,32 +22,11 @@ impl Fixture {
         let root = tempfile::tempdir().unwrap();
         let ws = root.path().join("ws");
         let repo = ws.join("app");
-        std::fs::create_dir_all(repo.join("src")).unwrap();
-        git(&repo, &["init", "-q", "-b", "main"]);
-        git(&repo, &["config", "user.email", "phase5@relay.test"]);
-        git(&repo, &["config", "user.name", "Phase Five"]);
-        std::fs::write(
-            repo.join("src/lib.rs"),
+        committed_repo(&repo, &[(
+            "src/lib.rs",
             "pub fn shared() -> i32 { 1 }\n\npub fn untouched() -> i32 { 9 }\n",
-        )
-        .unwrap();
-        git(&repo, &["add", "."]);
-        git(&repo, &["commit", "-q", "-m", "init"]);
-
-        let store = Store::open(&root.path().join("store/store.db"), false).unwrap();
-        let engine = Engine::new(Instance::Test, store);
-        ok(
-            &engine,
-            Actor::User,
-            "workspace.create",
-            json!({"path": ws}),
-        );
-        ok(
-            &engine,
-            Actor::User,
-            "project.add",
-            json!({"workspace_id": 1, "path": repo}),
-        );
+        )]);
+        let engine = engine_with_project(root.path(), &ws, &repo);
         engine.store.with_tx(|tx| {
             tx.execute(
                 "INSERT INTO modules(project_id,name,created_at,updated_at) VALUES (1,'Core',?1,?1)",

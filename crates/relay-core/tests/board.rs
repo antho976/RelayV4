@@ -2,34 +2,16 @@
 //! stored blocked-by / duplicate-of edges. Every assertion crosses the bus door, because the
 //! CLI and agents reach this model through exactly the same ops the UI does.
 
-use relay_bus::{Actor, Request, Response};
-use relay_core::engine::{Door, Engine};
+mod common;
+
+use common::{call_as as call, code, committed_repo, engine_with_project, ok};
+use relay_bus::Actor;
+use relay_core::engine::Engine;
 use relay_core::{Instance, Store};
 use serde_json::{json, Value};
 use std::path::Path;
-use std::process::Command;
 use std::sync::Arc;
 
-fn git(repo: &Path, args: &[&str]) {
-    assert!(Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .status()
-        .unwrap()
-        .success());
-}
-fn call(engine: &Engine, actor: Actor, op: &str, payload: Value) -> Response {
-    engine.dispatch(Request::new(actor, op, payload), Door::InProcess)
-}
-fn ok(engine: &Engine, op: &str, payload: Value) -> Value {
-    call(engine, Actor::User, op, payload)
-        .into_result()
-        .unwrap_or_else(|e| panic!("{op}: {} {}", e.code, e.message))
-}
-fn code(response: Response) -> String {
-    response.error.expect("expected error").code
-}
 fn ids(value: &Value) -> Vec<i64> {
     value
         .as_array()
@@ -68,19 +50,8 @@ impl Fixture {
         let root = tempfile::tempdir().unwrap();
         let ws = root.path().join("ws");
         let repo = ws.join("app");
-        std::fs::create_dir_all(&repo).unwrap();
-        git(&repo, &["init", "-q", "-b", "main"]);
-        git(&repo, &["config", "user.email", "board@relay.test"]);
-        git(&repo, &["config", "user.name", "Board"]);
-        std::fs::write(repo.join("README.md"), "board\n").unwrap();
-        git(&repo, &["add", "."]);
-        git(&repo, &["commit", "-q", "-m", "init"]);
-        let engine = Engine::new(
-            Instance::Test,
-            Store::open(&root.path().join("store/store.db"), false).unwrap(),
-        );
-        ok(&engine, "workspace.create", json!({"path":ws}));
-        ok(&engine, "project.add", json!({"workspace_id":1,"path":repo}));
+        committed_repo(&repo, &[("README.md", "board\n")]);
+        let engine = engine_with_project(root.path(), &ws, &repo);
         let claude = fake_provider(root.path(), "claude");
         ok(&engine, "settings.set", json!({"path":"providers.claude.path","value":claude}));
         Self {

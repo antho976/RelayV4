@@ -1,37 +1,16 @@
 //! Phase 9 bus coverage: chrome state, layouts, notifications, dashboard, usage, resources.
 
-use relay_bus::{Actor, Request, Response};
-use relay_core::engine::{Door, Engine};
-use relay_core::{Instance, Store};
-use serde_json::{json, Value};
-use std::process::Command;
-use std::sync::Arc;
+mod common;
 
-fn engine() -> Arc<Engine> {
-    Engine::new(Instance::Test, Store::open_memory().unwrap())
-}
-fn call(engine: &Engine, op: &str, payload: Value) -> Response {
-    engine.dispatch(Request::new(Actor::User, op, payload), Door::InProcess)
-}
-fn git(repo: &std::path::Path, args: &[&str]) {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "git {}: {}",
-        args.join(" "),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
+use common::{call, engine, init_repo};
+use relay_bus::{Actor, Request};
+use relay_core::engine::{Door, Engine};
+use serde_json::json;
+
 fn project(engine: &Engine) -> tempfile::TempDir {
     let workspace = tempfile::tempdir().unwrap();
     let repo = workspace.path().join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "-b", "main"]);
+    init_repo(&repo);
     call(engine, "workspace.create", json!({"path":workspace.path()}))
         .into_result()
         .unwrap();

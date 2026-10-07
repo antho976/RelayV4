@@ -1,19 +1,16 @@
 //! Phase 4 adversarial suite: effective policy, durable decisions, confirmation,
 //! authorization and the installed enforcement adapters. Policy calls go through the bus.
 
-use relay_bus::{Actor, ErrorKind, Request, Response};
+mod common;
+
+use common::{call_as as call, committed_repo, engine_with_project, err as error, git, git_command, ok_as as ok};
+use relay_bus::{Actor, ErrorKind, Request};
 use relay_core::engine::{Door, Engine};
-use relay_core::{Instance, Store};
+use relay_core::Instance;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 use uuid::Uuid;
-
-fn git(repo: &Path, args: &[&str]) {
-    let status = Command::new("git").arg("-C").arg(repo).args(args).status().unwrap();
-    assert!(status.success(), "git {args:?}");
-}
 
 struct Fixture {
     _root: tempfile::TempDir,
@@ -26,17 +23,8 @@ impl Fixture {
         let root = tempfile::tempdir().unwrap();
         let ws = root.path().join("ws");
         let repo = ws.join("app");
-        std::fs::create_dir_all(&repo).unwrap();
-        git(&repo, &["init", "-q", "-b", "main"]);
-        git(&repo, &["config", "user.email", "phase4@relay.test"]);
-        git(&repo, &["config", "user.name", "Phase Four"]);
-        std::fs::write(repo.join("README.md"), "relay\n").unwrap();
-        git(&repo, &["add", "."]);
-        git(&repo, &["commit", "-q", "-m", "init"]);
-        let store = Store::open(&root.path().join("store/store.db"), false).unwrap();
-        let engine = Engine::new(Instance::Test, store);
-        ok(&engine, Actor::User, "workspace.create", json!({"path": ws}));
-        ok(&engine, Actor::User, "project.add", json!({"workspace_id": 1, "path": repo}));
+        committed_repo(&repo, &[("README.md", "relay\n")]);
+        let engine = engine_with_project(root.path(), &ws, &repo);
         Self { _root: root, repo, engine }
     }
 
@@ -50,26 +38,12 @@ impl Fixture {
     }
 }
 
-fn call(engine: &Engine, actor: Actor, op: &str, payload: Value) -> Response {
-    engine.dispatch(Request::new(actor, op, payload), Door::InProcess)
-}
-
-fn ok(engine: &Engine, actor: Actor, op: &str, payload: Value) -> Value {
-    call(engine, actor, op, payload)
-        .into_result()
-        .unwrap_or_else(|error| panic!("{op} failed: {} {}", error.code, error.message))
-}
-
 fn count(engine: &Engine, table: &str) -> i64 {
     engine
         .store
         .lock()
         .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
         .unwrap()
-}
-
-fn error(response: &Response) -> &relay_bus::BusError {
-    response.error.as_ref().expect("expected error response")
 }
 
 #[test]
@@ -446,9 +420,7 @@ fn sessions_install_git_and_claude_hooks_without_clobbering_local_settings() {
     let session = fixture.session("builder", "claude");
     let name = session["name"].as_str().unwrap();
     let worktree = PathBuf::from(session["worktree"].as_str().unwrap());
-    let hook_dir = Command::new("git")
-        .arg("-C")
-        .arg(&worktree)
+    let hook_dir = git_command(&worktree)
         .args(["config", "--worktree", "--get", "core.hooksPath"])
         .output()
         .unwrap();
@@ -529,9 +501,7 @@ fn sessions_install_git_and_claude_hooks_without_clobbering_local_settings() {
         json!({"project_id": 1, "provider": "codex", "worktree": "primary"}),
     );
     let primary_name = primary["name"].as_str().unwrap();
-    let configured = Command::new("git")
-        .arg("-C")
-        .arg(&fixture.repo)
+    let configured = git_command(&fixture.repo)
         .args(["config", "--worktree", "--get", "core.hooksPath"])
         .output()
         .unwrap();
@@ -542,9 +512,7 @@ fn sessions_install_git_and_claude_hooks_without_clobbering_local_settings() {
         "session.close",
         json!({"session": primary_name}),
     );
-    let restored = Command::new("git")
-        .arg("-C")
-        .arg(&fixture.repo)
+    let restored = git_command(&fixture.repo)
         .args(["config", "--worktree", "--get", "core.hooksPath"])
         .output()
         .unwrap();

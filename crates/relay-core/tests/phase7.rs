@@ -1,45 +1,13 @@
 //! Phase 7: board, dispatch, modules, changelog, and undo. Assertions cross the bus door.
 
-use relay_bus::{Actor, Request, Response};
-use relay_core::engine::{Door, Engine};
-use relay_core::{Instance, Store};
-use serde_json::{json, Value};
+mod common;
+
+use common::{call_as as call, code, committed_repo, engine_with_project, git, ok_as as ok};
+use relay_bus::Actor;
+use relay_core::engine::Engine;
+use serde_json::json;
 use std::path::Path;
-use std::process::Command;
 use std::sync::Arc;
-
-fn git(repo: &Path, args: &[&str]) {
-    assert!(Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .status()
-        .unwrap()
-        .success());
-}
-
-fn git_output(repo: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    String::from_utf8(output.stdout).unwrap().trim().to_string()
-}
-
-fn call(engine: &Engine, actor: Actor, op: &str, payload: Value) -> Response {
-    engine.dispatch(Request::new(actor, op, payload), Door::InProcess)
-}
-fn ok(engine: &Engine, actor: Actor, op: &str, payload: Value) -> Value {
-    call(engine, actor, op, payload)
-        .into_result()
-        .unwrap_or_else(|e| panic!("{op}: {} {}", e.code, e.message))
-}
-fn code(response: Response) -> String {
-    response.error.expect("expected error").code
-}
 
 struct Fixture {
     _root: tempfile::TempDir,
@@ -50,24 +18,8 @@ impl Fixture {
         let root = tempfile::tempdir().unwrap();
         let ws = root.path().join("ws");
         let repo = ws.join("app");
-        std::fs::create_dir_all(&repo).unwrap();
-        git(&repo, &["init", "-q", "-b", "main"]);
-        git(&repo, &["config", "user.email", "phase7@relay.test"]);
-        git(&repo, &["config", "user.name", "Phase Seven"]);
-        std::fs::write(repo.join("README.md"), "phase 7\n").unwrap();
-        git(&repo, &["add", "."]);
-        git(&repo, &["commit", "-q", "-m", "init"]);
-        let engine = Engine::new(
-            Instance::Test,
-            Store::open(&root.path().join("store/store.db"), false).unwrap(),
-        );
-        ok(&engine, Actor::User, "workspace.create", json!({"path":ws}));
-        ok(
-            &engine,
-            Actor::User,
-            "project.add",
-            json!({"workspace_id":1,"path":repo}),
-        );
+        committed_repo(&repo, &[("README.md", "phase 7\n")]);
+        let engine = engine_with_project(root.path(), &ws, &repo);
         Self {
             _root: root,
             engine,
@@ -357,7 +309,7 @@ fn approve_uses_the_recorded_branch_after_the_assigned_session_is_closed() {
     assert_eq!(done["commits"][0]["branch"], branch);
     assert_eq!(
         done["commits"][0]["sha"],
-        git_output(&f._root.path().join("ws/app"), &["rev-parse", "HEAD"])
+        git(&f._root.path().join("ws/app"), &["rev-parse", "HEAD"])
     );
 
     let approve_audit = ok(
@@ -394,8 +346,8 @@ fn approve_survives_branch_cleanup_deleting_the_recorded_branch() {
         let name = session["name"].as_str().unwrap().to_string();
         let branch = session["branch"].as_str().unwrap().to_string();
         ok(e, Actor::User, "session.close", json!({"session":name,"remove_worktree":false}));
-        git_output(&repo, &["worktree", "remove", "--force", session["worktree"].as_str().unwrap()]);
-        git_output(&repo, &["branch", "-D", &branch]);
+        git(&repo, &["worktree", "remove", "--force", session["worktree"].as_str().unwrap()]);
+        git(&repo, &["branch", "-D", &branch]);
         task
     };
 
@@ -404,7 +356,7 @@ fn approve_survives_branch_cleanup_deleting_the_recorded_branch() {
     let done = ok(e, Actor::User, "task.approve", json!({"task_id":task["id"]}));
     assert_eq!(done["column"], "done");
     assert_eq!(done["commits"][0]["branch"], "main");
-    assert_eq!(done["commits"][0]["sha"], git_output(&repo, &["rev-parse", "main"]));
+    assert_eq!(done["commits"][0]["sha"], git(&repo, &["rev-parse", "main"]));
 
     // A commit `session.done` (or anyone) already linked wins over the base tip.
     let task = closed("Linked before cleanup");
@@ -437,7 +389,7 @@ fn approve_without_a_session_links_the_project_head() {
     assert_eq!(done["commits"][0]["branch"], "main");
     assert_eq!(
         done["commits"][0]["sha"],
-        git_output(&f._root.path().join("ws/app"), &["rev-parse", "HEAD"])
+        git(&f._root.path().join("ws/app"), &["rev-parse", "HEAD"])
     );
 }
 

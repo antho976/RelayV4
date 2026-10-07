@@ -2,28 +2,13 @@
 //! a wake-up, a plan preflight, honest completion, peer intent, and one call that says who
 //! you are (docs/DECISIONS.md D115 … D119). Exercised as a bound agent, through the bus.
 
-use relay_bus::{Actor, Request, Response};
+mod common;
+
+use common::{call_as as call, committed_repo, engine_with_project, ok_as as ok};
+use relay_bus::{Actor, Request};
 use relay_core::engine::{Door, Engine};
-use relay_core::{Instance, Store};
 use serde_json::{json, Value};
-use std::path::Path;
-use std::process::Command;
 use std::sync::Arc;
-
-fn git(repo: &Path, args: &[&str]) {
-    let out = Command::new("git").arg("-C").arg(repo).args(args).output().unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-}
-
-fn call(engine: &Engine, actor: Actor, op: &str, payload: Value) -> Response {
-    engine.dispatch(Request::new(actor, op, payload), Door::InProcess)
-}
-
-fn ok(engine: &Engine, actor: Actor, op: &str, payload: Value) -> Value {
-    call(engine, actor, op, payload)
-        .into_result()
-        .unwrap_or_else(|error| panic!("{op} failed: {} {}", error.code, error.message))
-}
 
 fn refusal(engine: &Engine, actor: Actor, op: &str, payload: Value) -> relay_bus::error::BusError {
     call(engine, actor, op, payload)
@@ -43,18 +28,8 @@ impl Fixture {
         let root = tempfile::tempdir().unwrap();
         let ws = root.path().join("ws");
         let repo = ws.join("app");
-        std::fs::create_dir_all(repo.join("src")).unwrap();
-        git(&repo, &["init", "-q", "-b", "main"]);
-        git(&repo, &["config", "user.email", "features@relay.test"]);
-        git(&repo, &["config", "user.name", "Features"]);
-        std::fs::write(repo.join("src/lib.rs"), "pub fn one() -> i32 { 1 }\n").unwrap();
-        git(&repo, &["add", "."]);
-        git(&repo, &["commit", "-qm", "init"]);
-
-        let store = Store::open(&root.path().join("store/store.db"), false).unwrap();
-        let engine = Engine::new(Instance::Test, store);
-        ok(&engine, Actor::User, "workspace.create", json!({"path": ws}));
-        ok(&engine, Actor::User, "project.add", json!({"workspace_id": 1, "path": repo}));
+        committed_repo(&repo, &[("src/lib.rs", "pub fn one() -> i32 { 1 }\n")]);
+        let engine = engine_with_project(root.path(), &ws, &repo);
         engine.store.with_tx(|tx| {
             tx.execute(
                 "INSERT INTO tasks(project_id,title,body,changelog,col,state,position,created_at,updated_at)

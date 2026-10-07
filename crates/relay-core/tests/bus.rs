@@ -1,36 +1,23 @@
 //! Bus-driven integration tests (SPEC §16): the bus is the test API — the same door agents use.
 
-use relay_bus::{Actor, BusError, ErrorKind, Request, Response};
+mod common;
+
+use common::{call_as as call, err, git, wait_until};
+use relay_bus::{Actor, ErrorKind, Request};
 use relay_core::engine::{Door, Engine};
 use relay_core::{Instance, Store};
 use serde_json::{json, Value};
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use uuid::Uuid;
 
 fn engine(inst: Instance) -> Arc<Engine> {
     Engine::new(inst, Store::open_memory().unwrap())
 }
 
-fn call(e: &Engine, actor: Actor, op: &str, payload: Value) -> Response {
-    e.dispatch(Request::new(actor, op, payload), Door::InProcess)
-}
-
-fn err(r: &Response) -> &BusError {
-    r.error.as_ref().expect("expected an error response")
-}
-
 fn audit_rows(e: &Engine) -> Vec<Value> {
     call(e, Actor::User, "audit.list", json!({"limit": 1000})).into_result().unwrap()["rows"].as_array().unwrap().clone()
-}
-
-fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !f() {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(20));
-    }
 }
 
 fn tmp_repo() -> (tempfile::TempDir, String) {
@@ -234,8 +221,7 @@ fn device_discovery_mirror_input_and_run_lifecycle() {
     call(&e, Actor::User, "device.mirror.stop", json!({"mirror_id":mirror_id})).into_result().unwrap();
 
     let (workspace, repo) = tmp_repo();
-    let initialized = std::process::Command::new("git").args(["-C", &repo, "init", "-b", "trunk"]).output().unwrap();
-    assert!(initialized.status.success());
+    git(std::path::Path::new(&repo), &["init", "-b", "trunk"]);
     let workspace_path = std::fs::canonicalize(workspace.path()).unwrap().display().to_string();
     call(&e, Actor::User, "workspace.create", json!({"path":workspace_path})).into_result().unwrap();
     let project = call(&e, Actor::User, "project.add", json!({"workspace_id":1,"path":repo})).into_result().unwrap();
@@ -311,11 +297,7 @@ fn device_release_build_records_its_artifact() {
     .unwrap();
 
     let (workspace, repo) = tmp_repo();
-    let initialized = std::process::Command::new("git")
-        .args(["-C", &repo, "init", "-b", "trunk"])
-        .output()
-        .unwrap();
-    assert!(initialized.status.success());
+    git(std::path::Path::new(&repo), &["init", "-b", "trunk"]);
     let workspace_path = std::fs::canonicalize(workspace.path())
         .unwrap()
         .display()

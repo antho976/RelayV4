@@ -1,25 +1,14 @@
 //! Phase 12: current-directory onboarding, repository discovery/clone, and AVD management.
 
-use relay_bus::{Actor, Request, Response};
-use relay_core::{Door, Engine, Instance, Store};
+mod common;
+
+use common::{call, committed_repo, engine, git, ok};
 use serde_json::{json, Value};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
-use std::sync::Arc;
 
-fn engine() -> Arc<Engine> { Engine::new(Instance::Test, Store::open_memory().unwrap()) }
-fn call(engine: &Engine, op: &str, payload: Value) -> Response {
-    engine.dispatch(Request::new(Actor::User, op, payload), Door::InProcess)
-}
-fn ok(engine: &Engine, op: &str, payload: Value) -> Value {
-    call(engine, op, payload).into_result().unwrap_or_else(|error| panic!("{op}: {} {}", error.code, error.message))
-}
-fn command(dir: &Path, args: &[&str]) {
-    let output = Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
-    assert!(output.status.success(), "git {}: {}", args.join(" "), String::from_utf8_lossy(&output.stderr));
-}
 fn executable(path: &Path, body: &str) {
     fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
     let mut permissions = fs::metadata(path).unwrap().permissions();
@@ -38,12 +27,7 @@ fn workspace_defaults_to_cwd_and_local_clone_registers_project() {
 
     let root = tempfile::tempdir().unwrap();
     let source = tempfile::tempdir().unwrap();
-    command(source.path(), &["init", "-b", "main"]);
-    command(source.path(), &["config", "user.name", "Relay Test"]);
-    command(source.path(), &["config", "user.email", "relay@example.test"]);
-    fs::write(source.path().join("README.md"), "# source\n").unwrap();
-    command(source.path(), &["add", "README.md"]);
-    command(source.path(), &["commit", "-m", "Initial"]);
+    committed_repo(source.path(), &[("README.md", "# source\n")]);
 
     let workspace = ok(&engine, "workspace.create", json!({"path":root.path()}));
     let cloned = ok(&engine, "project.clone", json!({"workspace_id":workspace["id"],"url":source.path(),"dest":"cloned"}));
@@ -132,8 +116,8 @@ fn clone_uses_workspace_when_engine_directory_was_removed() {
     let workspace = root.path().join("workspace");
     let removed = root.path().join("removed-launch-worktree");
     for path in [&source, &workspace, &removed] { fs::create_dir(path).unwrap(); }
-    command(&source, &["init", "-b", "main"]);
-    command(&source, &["-c", "user.name=Fixture", "-c", "user.email=fixture@relay.test", "commit", "--allow-empty", "-m", "Initial"]);
+    git(&source, &["init", "-b", "main"]);
+    git(&source, &["-c", "user.name=Fixture", "-c", "user.email=fixture@relay.test", "commit", "--allow-empty", "-m", "Initial"]);
     let helper = root.path().join("upload");
     // A local transport reproduces remote helpers needing a readable CWD, without GitHub/network.
     fs::write(&helper, format!("#!/usr/bin/env python3\nimport os\nassert os.getcwd() == {}\nos.execvp('git', ['git', 'upload-pack', {}])\n",
