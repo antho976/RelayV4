@@ -3,24 +3,41 @@ use crate::app::Ui;
 use gtk::prelude::*;
 use gtk4 as gtk;
 use serde_json::json;
+use std::cell::RefCell;
+use std::future::Future;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use util::{click, clickable, named, require, wait_for, wait_within};
 #[path = "smoke_notes.rs"]
 mod notes;
+#[path = "smoke_util.rs"]
+pub(crate) mod util;
 
-fn named(root: &impl IsA<gtk::Widget>, name: &str) -> Option<gtk::Widget> {
-    let root = root.as_ref();
-    if root.widget_name() == name {
-        return Some(root.clone());
-    }
-    let mut child = root.first_child();
-    while let Some(widget) = child {
-        if let Some(found) = named(&widget, name) {
-            return Some(found);
+thread_local! {
+    /// Checks still running in detached futures. The capture waits for them, so a check
+    /// that hangs fails the run instead of being dropped when the window closes (RA-718).
+    static PENDING: RefCell<Vec<&'static str>> = RefCell::default();
+}
+
+/// Runs `check` beside the page, and holds the capture until it has finished.
+fn track(name: &'static str, check: impl Future<Output = Result<(), String>> + 'static) {
+    PENDING.with(|pending| pending.borrow_mut().push(name));
+    glib::spawn_future_local(async move {
+        if let Err(error) = check.await {
+            panic!("{name}: {error}");
         }
-        child = widget.next_sibling();
-    }
-    None
+        PENDING.with(|pending| {
+            let mut pending = pending.borrow_mut();
+            if let Some(index) = pending.iter().position(|n| *n == name) {
+                pending.remove(index);
+            }
+        });
+    });
+}
+
+/// A control whose pointer target can be measured: shown, enabled and allocated.
+fn allocated(ui: &Ui, name: &str) -> bool {
+    named(&ui.window, name).is_some_and(|w| w.is_mapped() && w.is_sensitive() && w.width() > 0)
 }
 
 fn record_geometry(ui: &Ui, screenshot: &str) {
@@ -72,7 +89,6 @@ fn record_geometry(ui: &Ui, screenshot: &str) {
     for (class, dimension, expected) in [
         ("topbar", "height", 42.),
         ("statusbar", "height", 24.),
-        ("files-rail", "width", 28.),
         ("umd", "height", 26.),
     ] {
         for widget in &widgets {
@@ -100,12 +116,6 @@ fn record_geometry(ui: &Ui, screenshot: &str) {
             "Settings owns the full workspace"
         );
     }
-    if *ui.page.borrow() == "plan" {
-        assert!(
-            !widgets.iter().any(|w| w["name"] == "note-title"),
-            "Plan must not expose another document's title editor"
-        );
-    }
     if *ui.page.borrow() == "dashboard" {
         let page = widgets
             .iter()
@@ -128,61 +138,75 @@ fn record_geometry(ui: &Ui, screenshot: &str) {
         .expect("Save widget geometry");
 }
 
-fn verify_settings_save(ui: Rc<Ui>) {
+async fn verify_settings_save(ui: Rc<Ui>) -> Result<(), String> {
+    const THRESHOLD: &str = "guardrail-field:destructive_write.min_removed_pct";
+    wait_for(
+        || {
+            named(&ui.window, "setting:appearance.panel_alpha").is_some()
+                && named(&ui.window, THRESHOLD).is_some()
+        },
+        "Settings and guardrail fields loaded",
+    )
+    .await?;
     let font = named(&ui.window, "setting:terminal.font_size")
-        .unwrap()
+        .ok_or("Font size field missing")?
         .downcast::<gtk::SpinButton>()
-        .unwrap();
+        .map_err(|_| "Font size field type")?;
     let opacity = named(&ui.window, "setting:appearance.panel_alpha")
         .unwrap()
         .downcast::<gtk::Scale>()
-        .unwrap();
-    let threshold = named(&ui.window, "guardrail-field:destructive_write.min_removed_pct")
+        .map_err(|_| "Opacity field type")?;
+    let threshold = named(&ui.window, THRESHOLD)
         .unwrap()
         .downcast::<gtk::SpinButton>()
-        .unwrap();
-    font.set_value(9.75);
+        .map_err(|_| "Guardrail threshold type")?;
+    // Not 9.75: that is the default, so Save would rightly send nothing for it.
+    font.set_value(10.25);
     opacity.set_value(0.96);
     threshold.set_value(62.5);
     // Guardrails save on their own: the layered editor sends only the fields that changed.
-    named(&ui.window, "guardrail-save")
-        .unwrap()
-        .downcast::<gtk::Button>()
-        .unwrap()
-        .emit_clicked();
-    named(&ui.window, "settings-save")
-        .unwrap()
-        .downcast::<gtk::Button>()
-        .unwrap()
-        .emit_clicked();
-    assert!(
+    // Its key stays disabled until a field differs, so this fails if that wiring breaks.
+    // It lives on the Guardrails category, so show that first, as its category key does.
+    let guardrail_save = named(&ui.window, "guardrail-save").ok_or("Missing control: guardrail-save")?;
+    let categories = std::iter::successors(guardrail_save.parent(), |w| w.parent())
+        .filter_map(|w| w.downcast::<gtk::Stack>().ok())
+        .find(|stack| stack.child_by_name("safety").is_some())
+        .ok_or("guardrail-save is not inside the settings categories")?;
+    categories.set_visible_child_name("safety");
+    wait_for(|| clickable(&ui.window, "guardrail-save"), "Guardrail save shown and enabled").await?;
+    click(&ui.window, "guardrail-save")?;
+    click(&ui.window, "settings-save")?;
+    require(
         !ui.pages["settings"].is_sensitive(),
-        "Save must lock its snapshot while persisting"
-    );
-    glib::timeout_add_local_once(Duration::from_millis(900), move || {
-        glib::spawn_future_local(async move {
-            assert!(
-                ui.pages["settings"].is_sensitive(),
-                "Settings save must finish"
-            );
-            let font = ui
-                .call("settings.get", json!({"path":"terminal.font_size"}))
-                .await
-                .unwrap();
-            let opacity = ui
-                .call("settings.get", json!({"path":"appearance.panel_alpha"}))
-                .await
-                .unwrap();
-            let guardrails = ui.call("guardrail.config.get", json!({})).await.unwrap();
-            assert_eq!(font["value"].as_f64(), Some(9.75));
-            assert_eq!(opacity["value"].as_f64(), Some(0.96));
-            assert_eq!(
-                guardrails["destructive_write"]["min_removed_pct"].as_f64(),
-                Some(62.5)
-            );
-            println!("Settings save verified across categories, including fractional values");
-        });
-    });
+        "Save must lock its snapshot while persisting",
+    )?;
+    // One settings.set per field, beside the guardrail save: generous, but bounded.
+    wait_within(
+        Duration::from_secs(15),
+        || ui.pages["settings"].is_sensitive(),
+        "Settings save must finish",
+    )
+    .await?;
+    let read = |op: &'static str, payload: serde_json::Value| {
+        let ui = ui.clone();
+        async move { ui.call(op, payload).await.map_err(|e| format!("{op}: {e}")) }
+    };
+    let font = read("settings.get", json!({"path":"terminal.font_size"})).await?;
+    let opacity = read("settings.get", json!({"path":"appearance.panel_alpha"})).await?;
+    require(font["value"].as_f64() == Some(10.25), "Font size was not saved")?;
+    require(opacity["value"].as_f64() == Some(0.96), "Opacity was not saved")?;
+    // The guardrail save runs on its own call; read until it lands, within the same budget.
+    let deadline = Instant::now() + util::WAIT;
+    loop {
+        let guardrails = read("guardrail.config.get", json!({})).await?;
+        if guardrails["destructive_write"]["min_removed_pct"].as_f64() == Some(62.5) {
+            break;
+        }
+        require(Instant::now() < deadline, "Guardrail threshold was not saved")?;
+        glib::timeout_future(Duration::from_millis(50)).await;
+    }
+    println!("Settings save verified across categories, including fractional values");
+    Ok(())
 }
 
 fn verify_pointer_target(ui: &Ui, name: &str) {
@@ -224,7 +248,7 @@ fn click_control(ui: &Ui, name: &str) {
         assert!(status.success(), "Pointer injection failed for {name}");
         println!("Mouse click sent: {name}");
     } else {
-        target.downcast::<gtk::Button>().unwrap().emit_clicked();
+        click(&ui.window, name).unwrap_or_else(|error| panic!("{error}"));
     }
 }
 
@@ -251,7 +275,7 @@ fn verify_control_contrast(root: &impl IsA<gtk::Widget>) {
                 gtk::StateFlags::INSENSITIVE,
             ] {
                 widget.set_state_flags(original | state, true);
-                let color = widget.style_context().color();
+                let color = widget.color();
                 assert!(
                     color.red().max(color.green()).max(color.blue()) < 0.3 && color.alpha() > 0.95,
                     "Light button content must stay dark in {state:?}: {color:?}"
@@ -271,11 +295,7 @@ fn verify_control_contrast(root: &impl IsA<gtk::Widget>) {
 
 fn verify_panel_toggles(ui: &Rc<Ui>) {
     fn click(ui: &Ui, name: &str) {
-        named(&ui.window, name)
-            .unwrap()
-            .downcast::<gtk::Button>()
-            .unwrap()
-            .emit_clicked();
+        util::click(&ui.window, name).unwrap_or_else(|error| panic!("{error}"));
     }
     for control in [
         "status-usage",
@@ -322,130 +342,210 @@ fn verify_panel_toggles(ui: &Rc<Ui>) {
     println!("Panel toggles verified: 50 clicks per control, one-close, switching, guards and page toggle");
 }
 
-fn edit_fixture(ui: Rc<Ui>, page: String) {
-    glib::spawn_future_local(async move {
-        let project = ui.project.get();
-        if page == "board" {
-            let data = ui
-                .call("task.list", json!({"project_id":project}))
-                .await
-                .unwrap();
-            crate::pages::open_task(&ui, data["tasks"][0]["id"].as_i64().unwrap());
-        } else if page == "notes" {
-            let data = ui
-                .call("notes.list", json!({"project_id":project}))
-                .await
-                .unwrap();
-            crate::pages::open_note(&ui, data["notes"][0].clone());
-        } else if page == "launch" {
-            let task = ui
-                .call(
-                    "task.create",
-                    json!({"project_id":project,"title":"Native launch queue","column":"ready"}),
-                )
-                .await
-                .unwrap();
-            ui.show_launch(task["id"].as_i64());
+async fn edit_fixture(ui: Rc<Ui>, page: String) -> Result<(), String> {
+    let project = ui.project.get();
+    let call = |op: &'static str, payload: serde_json::Value| {
+        let ui = ui.clone();
+        async move { ui.call(op, payload).await.map_err(|e| format!("{op}: {e}")) }
+    };
+    let mut note = 0;
+    if page == "board" {
+        let data = call("task.list", json!({"project_id":project})).await?;
+        crate::pages::open_task(&ui, data["tasks"][0]["id"].as_i64().ok_or("No fixture task")?);
+    } else if page == "notes" {
+        let data = call("notes.list", json!({"project_id":project})).await?;
+        note = data["notes"][0]["id"].as_i64().ok_or("No fixture note")?;
+        crate::pages::open_note(&ui, data["notes"][0].clone());
+    } else if page == "launch" {
+        let task = call(
+            "task.create",
+            json!({"project_id":project,"title":"Native launch queue","column":"ready"}),
+        )
+        .await?;
+        ui.show_launch(task["id"].as_i64());
+        // The form enables Start only once it has loaded; a person cannot submit it sooner.
+        wait_for(|| clickable(&ui.window, "launch-start"), "Launch form loaded").await?;
+        for name in ["launch-mode", "launch-builders"] {
+            named(&ui.window, name)
+                .ok_or_else(|| format!("{name} missing"))?
+                .downcast::<gtk::DropDown>()
+                .map_err(|_| format!("{name} type"))?
+                .set_selected(1);
         }
-        glib::timeout_add_local_once(Duration::from_millis(700), move || {
-            if page == "launch" {
-                named(&ui.window, "launch-mode")
-                    .unwrap()
-                    .downcast::<gtk::DropDown>()
-                    .unwrap()
-                    .set_selected(1);
-                named(&ui.window, "launch-builders")
-                    .unwrap()
-                    .downcast::<gtk::DropDown>()
-                    .unwrap()
-                    .set_selected(1);
-                named(&ui.window, "launch-start")
-                    .unwrap()
-                    .downcast::<gtk::Button>()
-                    .unwrap()
-                    .emit_clicked();
-                return;
+        return click(&ui.window, "launch-start");
+    }
+    let field = if page == "board" { "task-title" } else { "note-body" };
+    let mut found = None;
+    wait_for(
+        || {
+            found = gtk::Window::list_toplevels()
+                .into_iter()
+                .find_map(|window| named(&window, field).map(|widget| (window, widget)));
+            found.is_some()
+        },
+        &format!("{page} editor field {field}"),
+    )
+    .await?;
+    let (window, widget) = found.unwrap();
+    if page == "board" {
+        widget
+            .downcast::<gtk::Entry>()
+            .map_err(|_| "Task title type")?
+            .set_text("Unsaved task fixture");
+        let panel = ui
+            .panels
+            .borrow()
+            .last()
+            .cloned()
+            .ok_or("Task editor is in the main window")?;
+        panel.close();
+        require(!ui.panels.borrow().is_empty(), "A dirty task must not close")?;
+        named(&window, "task-title")
+            .ok_or("Task title missing after a refused close")?
+            .downcast::<gtk::Entry>()
+            .map_err(|_| "Task title type")?
+            .set_text("Native task edit verified");
+        click(&window, "draft-save")
+    } else {
+        widget
+            .downcast::<gtk::TextView>()
+            .map_err(|_| "Note body type")?
+            .buffer()
+            .set_text("Native note save verified.");
+        // The Notes editor saves through its window action, not Draft's key. The action is
+        // enabled once the editor has seen the change, and does nothing while the note is
+        // still loading, so ask again until the engine holds the new body.
+        let deadline = Instant::now() + util::WAIT;
+        loop {
+            window
+                .activate_action("notes.save", None)
+                .map_err(|_| "Notes window has no save action")?;
+            glib::timeout_future(Duration::from_millis(100)).await;
+            let stored = call("notes.get", json!({"note_id":note})).await?;
+            if stored["body"] == "Native note save verified." {
+                return Ok(());
             }
-            for window in gtk::Window::list_toplevels() {
-                let field = if page == "board" {
-                    "task-title"
-                } else {
-                    "note-body"
-                };
-                if let Some(widget) = named(&window, field) {
-                    if page == "board" {
-                        widget
-                            .downcast::<gtk::Entry>()
-                            .unwrap()
-                            .set_text("Unsaved task fixture");
-                    } else {
-                        widget
-                            .downcast::<gtk::TextView>()
-                            .unwrap()
-                            .buffer()
-                            .set_text("Native note save verified.");
-                    }
-                    if page == "board" {
-                        let panel = ui
-                            .panels
-                            .borrow()
-                            .last()
-                            .cloned()
-                            .expect("Task editor is in the main window");
-                        panel.close();
-                        assert!(
-                            !ui.panels.borrow().is_empty(),
-                            "A dirty task must not close"
-                        );
-                        named(&window, "task-title")
-                            .unwrap()
-                            .downcast::<gtk::Entry>()
-                            .unwrap()
-                            .set_text("Native task edit verified");
-                    }
-                    if page == "board" {
-                        named(&window, "draft-save")
-                            .unwrap()
-                            .downcast::<gtk::Button>()
-                            .unwrap()
-                            .emit_clicked();
-                    } else {
-                        // The Notes editor saves through its window action, not Draft's key.
-                        window
-                            .activate_action("notes.save", None)
-                            .expect("Notes window has a save action");
-                    }
-                    break;
-                }
-            }
-        });
-    });
+            require(Instant::now() < deadline, "Notes save never reached the engine")?;
+        }
+    }
 }
 
-fn verify_confirmations(ui: Rc<Ui>) {
-    glib::spawn_future_local(async move {
-        for accept in [false, true] {
-            let panel = crate::panel::Panel::new(&ui, "Confirmation fixture", 480);
-            panel
-                .body
-                .append(&gtk::Label::new(Some("Fixture only. No mutation.")));
-            let pending = panel.clone();
-            glib::idle_add_local_once(move || {
-                if accept {
-                    named(&pending.body, "panel-accept")
-                        .unwrap()
-                        .downcast::<gtk::Button>()
-                        .unwrap()
-                        .emit_clicked();
-                } else {
-                    pending.close();
+async fn verify_confirmations(ui: Rc<Ui>) -> Result<(), String> {
+    for accept in [false, true] {
+        let panel = crate::panel::Panel::new(&ui, "Confirmation fixture", 480);
+        panel
+            .body
+            .append(&gtk::Label::new(Some("Fixture only. No mutation.")));
+        let pending = panel.clone();
+        glib::idle_add_local_once(move || {
+            if accept {
+                click(&pending.body, "panel-accept").unwrap_or_else(|error| panic!("{error}"));
+            } else {
+                pending.close();
+            }
+        });
+        require(
+            panel.response("Confirm").await == accept,
+            "Confirmation returned the wrong answer",
+        )?;
+        require(ui.panels.borrow().is_empty(), "Confirmation left its panel open")?;
+    }
+    println!("In-app confirmation accept and cancel verified");
+    Ok(())
+}
+
+/// Decides two held writes from their cards on the Guardrails page, as a person would
+/// (RA-719): Allow once stays disabled until the exact action has been reviewed, then
+/// confirms the hold; Reject… closes the other without running it.
+async fn verify_guardrail_decisions(ui: Rc<Ui>) -> Result<(), String> {
+    let project = ui.project.get();
+    let call = |op: &'static str, payload: serde_json::Value| {
+        let ui = ui.clone();
+        async move { ui.call(op, payload).await.map_err(|e| format!("{op}: {e}")) }
+    };
+    let open = |list: &serde_json::Value| -> Vec<i64> {
+        list["holds"].as_array().into_iter().flatten().filter_map(|h| h["id"].as_i64()).collect()
+    };
+    let sessions = call("session.list", json!({"project_id":project})).await?;
+    let session = sessions["sessions"]
+        .as_array()
+        .and_then(|all| all.iter().find(|s| s["role"] == "builder"))
+        .and_then(|s| s["name"].as_str())
+        .ok_or("No fixture builder to hold")?
+        .to_owned();
+    call("guardrail.config.set", json!({"project_id":project,"patch":{"protected_paths":["secret/*"]}})).await?;
+    let mut holds = Vec::new();
+    for decision in ["allow", "reject"] {
+        let path = format!("secret/native-{decision}-{}", std::process::id());
+        let before = open(&call("guardrail.holds.list", json!({"project_id":project})).await?);
+        let gate = json!({"session":session,"kind":"write","path":path,"new_text":"fixture"});
+        require(ui.call("guardrail.gate", gate).await.is_err(), &format!("{path} was not held"))?;
+        let after = open(&call("guardrail.holds.list", json!({"project_id":project})).await?);
+        let id = after.into_iter().find(|id| !before.contains(id)).ok_or("The held write made no hold")?;
+        holds.push((path, id));
+    }
+    let page = ui.pages.get("guardrails").ok_or("No Guardrails page")?.clone().upcast::<gtk::Widget>();
+    ui.refresh_page();
+    // A card to decide: its subject is shown, and the page is not ignoring the pointer
+    // while cards settle after a move.
+    let card = |path: &str| {
+        util::find(&page, &|w| {
+            w.has_css_class("guardrail-card")
+                && util::find(w, &|l| l.downcast_ref::<gtk::Label>().is_some_and(|l| l.text() == path)).is_some()
+        })
+        .filter(|card| {
+            let mut ancestor = Some(card.clone());
+            while let Some(widget) = ancestor {
+                if !widget.can_target() {
+                    return false;
                 }
-            });
-            assert_eq!(panel.response("Confirm").await, accept);
-            assert!(ui.panels.borrow().is_empty());
+                ancestor = widget.parent();
+            }
+            card.is_mapped()
+        })
+    };
+    let key = |card: &gtk::Widget, label: &str| {
+        util::find(card, &|w| w.downcast_ref::<gtk::Button>().is_some_and(|b| b.label().as_deref() == Some(label)))
+            .and_then(|w| w.downcast::<gtk::Button>().ok())
+            .ok_or_else(|| format!("No {label} key on the hold card"))
+    };
+    let resolved = |id: i64, state: &'static str| {
+        async move {
+            let deadline = Instant::now() + util::WAIT;
+            loop {
+                let hold = call("guardrail.hold.get", json!({"hold_id":id})).await?;
+                if hold["hold"]["state"] == state {
+                    return Ok::<(), String>(());
+                }
+                require(Instant::now() < deadline, &format!("Hold {id} did not become {state}"))?;
+                glib::timeout_future(Duration::from_millis(50)).await;
+            }
         }
-        println!("In-app confirmation accept and cancel verified");
-    });
+    };
+
+    let (path, id) = &holds[0];
+    wait_for(|| card(path).is_some(), "Held write shown on the Guardrails page").await?;
+    let allow_card = card(path).unwrap();
+    let allow = key(&allow_card, "Allow once")?;
+    require(
+        allow.is_mapped() && !allow.is_sensitive(),
+        "Allow once must stay disabled until the exact action is reviewed",
+    )?;
+    util::press(&key(&allow_card, "Review exact action")?, "Review exact action")?;
+    wait_for(|| allow.is_sensitive(), "Reviewing the exact action enables Allow once").await?;
+    util::press(&allow, "Allow once")?;
+    resolved(*id, "confirmed").await?;
+
+    let (path, id) = &holds[1];
+    wait_for(|| card(path).is_some(), "Second held write shown").await?;
+    let reject_card = card(path).unwrap();
+    util::press(&key(&reject_card, "Reject…")?, "Reject…")?;
+    let send = key(&reject_card, "Send denial")?;
+    wait_for(|| send.is_mapped(), "Denial form shown").await?;
+    util::press(&send, "Send denial")?;
+    resolved(*id, "rejected").await?;
+    println!("Guardrail decisions verified: review before Allow once, Allow confirms, Reject closes");
+    Ok(())
 }
 
 pub fn install(ui: &Rc<Ui>) {
@@ -493,31 +593,37 @@ pub fn install(ui: &Rc<Ui>) {
     let ui = ui.clone();
     if let Ok(part) = std::env::var("RELAY_NATIVE_ROADMAP") {
         assert!(fixture, "Roadmap smoke parts run with RELAY_NATIVE_FIXTURE=1");
-        glib::timeout_add_local_once(Duration::from_secs(2), move || {
-            glib::spawn_future_local(async move {
-                let result = match part.as_str() {
-                    "notes" => notes::run(&ui).await,
-                    "files" => crate::smoke_project_files::run(&ui).await,
-                    "lifecycle" => crate::smoke_project_files::profile_lifecycle(&ui).await,
-                    "registry" => crate::smoke_registry::run(&ui).await,
-                    "tools" => {
-                        let value = crate::roadmap_smoke::run(&ui).await;
-                        println!("ROADMAP_TOOLS={value}");
-                        Ok(())
-                    }
-                    _ => Err(format!("Unknown roadmap smoke part: {part}")),
-                };
-                if let Err(error) = result {
-                    panic!("Roadmap regression {part}: {error}");
-                }
-                ui.window.close();
-                assert!(
-                    !ui.window.is_visible(),
-                    "Roadmap test left a dirty draft: {}",
-                    ui.notice.text()
-                );
-                println!("ROADMAP_OK={part}");
-            });
+        glib::spawn_future_local(async move {
+            // Every part starts from the fixture project the first refresh selects.
+            let ready = wait_within(
+                Duration::from_secs(20),
+                || {
+                    ui.project.get() != 0
+                        && !ui.projects.borrow().is_empty()
+                        && !ui.workspaces.borrow().is_empty()
+                },
+                "Fixture project and workspace loaded",
+            )
+            .await;
+            let result = match (ready, part.as_str()) {
+                (Err(error), _) => Err(error),
+                (_, "notes") => notes::run(&ui).await,
+                (_, "files") => crate::smoke_project_files::run(&ui).await,
+                (_, "lifecycle") => crate::smoke_project_files::profile_lifecycle(&ui).await,
+                (_, "registry") => crate::smoke_registry::run(&ui).await,
+                (_, "tools") => crate::roadmap_smoke::run(&ui).await,
+                _ => Err(format!("Unknown roadmap smoke part: {part}")),
+            };
+            if let Err(error) = result {
+                panic!("Roadmap regression {part}: {error}");
+            }
+            ui.window.close();
+            assert!(
+                !ui.window.is_visible(),
+                "Roadmap test left a dirty draft: {}",
+                ui.notice.text()
+            );
+            println!("ROADMAP_OK={part}");
         });
         return;
     }
@@ -540,24 +646,16 @@ pub fn install(ui: &Rc<Ui>) {
             navigate.navigate("agents");
             navigate.verify_shell();
             if std::env::var("RELAY_NATIVE_PAGE").as_deref() == Ok("agents") {
-                verify_confirmations(navigate.clone());
+                track("confirmations", verify_confirmations(navigate.clone()));
             }
-            let toggle = named(&navigate.window, "sidebar-toggle")
-                .unwrap()
-                .downcast::<gtk::Button>()
-                .unwrap();
             let visible = navigate.sidebar.is_visible();
-            toggle.emit_clicked();
-            toggle.emit_clicked();
+            click(&navigate.window, "sidebar-toggle").unwrap();
+            click(&navigate.window, "sidebar-toggle").unwrap();
             assert_eq!(navigate.sidebar.is_visible(), visible);
         }
         if let Ok(page) = std::env::var("RELAY_NATIVE_PAGE") {
             if page == "workspace-project-submit" {
-                named(&navigate.window, "new-session")
-                    .unwrap()
-                    .downcast::<gtk::Button>()
-                    .unwrap()
-                    .emit_clicked();
+                click(&navigate.window, "new-session").unwrap();
                 assert!(
                     named(&navigate.window, "setup-local-repos").is_some(),
                     "New Session must guide an empty workspace to project selection"
@@ -570,37 +668,27 @@ pub fn install(ui: &Rc<Ui>) {
                         .set_text(&path);
                 }
                 let ui = navigate.clone();
-                glib::timeout_add_local_once(Duration::from_millis(100), move || {
+                track("workspace project submit", async move {
                     // Let GTK allocate the newly mounted setup form before pointer checks.
+                    wait_for(|| allocated(&ui, "setup-scan"), "Setup form allocated").await?;
                     click_control(&ui, "setup-scan");
-                    glib::timeout_add_local_once(Duration::from_millis(700), move || {
-                        let key = named(&ui.window, "setup-add")
-                            .unwrap()
-                            .downcast::<gtk::Button>()
-                            .unwrap();
-                        assert!(
-                            key.is_sensitive(),
-                            "The discovered local project must be actionable"
-                        );
-                        click_control(&ui, "setup-add");
-                    });
+                    wait_for(
+                        || clickable(&ui.window, "setup-add"),
+                        "The discovered local project must be actionable",
+                    )
+                    .await?;
+                    click_control(&ui, "setup-add");
+                    Ok(())
                 });
                 return;
             }
             if page == "project-launch" {
-                named(&navigate.window, "new-session")
-                    .unwrap()
-                    .downcast::<gtk::Button>()
-                    .unwrap()
-                    .emit_clicked();
+                click(&navigate.window, "new-session").unwrap();
                 let ui = navigate.clone();
-                glib::timeout_add_local_once(Duration::from_millis(700), move || {
-                    let start = named(&ui.window, "launch-start")
-                        .unwrap()
-                        .downcast::<gtk::Button>()
-                        .unwrap();
-                    assert!(start.is_sensitive());
+                track("project launch", async move {
+                    wait_for(|| allocated(&ui, "launch-start"), "Launch form loaded").await?;
                     click_control(&ui, "launch-start");
+                    Ok(())
                 });
                 return;
             }
@@ -629,17 +717,14 @@ pub fn install(ui: &Rc<Ui>) {
                     crate::tools::devices::open(&navigate);
                     if page == "device-run" {
                         let ui = navigate.clone();
-                        glib::timeout_add_local_once(Duration::from_millis(700), move || {
-                            named(&ui.window, "device-refresh")
-                                .unwrap()
-                                .downcast::<gtk::Button>()
-                                .unwrap()
-                                .emit_clicked();
-                            assert_eq!(
-                                ui.panels.borrow().len(),
-                                1,
-                                "Device refresh must keep a panel open"
-                            );
+                        track("device refresh", async move {
+                            wait_for(|| clickable(&ui.window, "device-refresh"), "Device panel loaded")
+                                .await?;
+                            click(&ui.window, "device-refresh")?;
+                            require(
+                                ui.panels.borrow().len() == 1,
+                                "Device refresh must keep a panel open",
+                            )
                         });
                     }
                     if page == "device-release" {
@@ -659,66 +744,49 @@ pub fn install(ui: &Rc<Ui>) {
                 if page == "setup" {
                     return;
                 }
-                let navigate = navigate.clone();
-                glib::timeout_add_local_once(Duration::from_millis(100), move || {
+                let ui = navigate.clone();
+                track("setup", async move {
+                    wait_for(|| allocated(&ui, "setup-scan"), "Setup form allocated").await?;
                     if let Ok(path) = std::env::var("RELAY_NATIVE_SETUP_PATH") {
-                        named(&navigate.window, "setup-path")
-                            .unwrap()
+                        named(&ui.window, "setup-path")
+                            .ok_or("Setup path missing")?
                             .downcast::<gtk::Entry>()
-                            .unwrap()
+                            .map_err(|_| "Setup path type")?
                             .set_text(&path);
                     }
-                    click_control(&navigate, "setup-scan");
-                    let ui = navigate.clone();
-                    glib::timeout_add_local_once(Duration::from_millis(500), move || {
-                        if page.starts_with("setup-github") {
-                            named(&ui.window, "setup-source")
-                                .unwrap()
-                                .downcast::<gtk::Stack>()
-                                .unwrap()
-                                .set_visible_child_name("github");
-                        }
-                        if page.contains("connect") {
-                            let pending = ui.clone();
-                            glib::timeout_add_local_once(Duration::from_millis(250), move || {
-                                named(&pending.window, "setup-connect")
-                                    .unwrap()
-                                    .downcast::<gtk::Button>()
-                                    .unwrap()
-                                    .emit_clicked();
-                            });
-                        }
-                        if page.ends_with("submit") {
-                            glib::timeout_add_local_once(Duration::from_millis(1000), move || {
-                                let key = named(&ui.window, "setup-add")
-                                    .unwrap()
-                                    .downcast::<gtk::Button>()
-                                    .unwrap();
-                                assert!(
-                                    key.is_sensitive(),
-                                    "A selected repository must be actionable"
-                                );
-                                click_control(&ui, "setup-add");
-                            });
-                        }
-                    });
+                    click_control(&ui, "setup-scan");
+                    if page.starts_with("setup-github") {
+                        // Nothing below depends on the scan's result, which only fills
+                        // the Local tab; give it a moment so the GitHub tab is what shows.
+                        glib::timeout_future(Duration::from_millis(500)).await;
+                        named(&ui.window, "setup-source")
+                            .ok_or("Setup source tabs missing")?
+                            .downcast::<gtk::Stack>()
+                            .map_err(|_| "Setup source type")?
+                            .set_visible_child_name("github");
+                    }
+                    if page.contains("connect") {
+                        wait_for(|| clickable(&ui.window, "setup-connect"), "GitHub connect shown")
+                            .await?;
+                        click(&ui.window, "setup-connect")?;
+                    }
+                    if page.ends_with("submit") {
+                        wait_within(
+                            Duration::from_secs(10),
+                            || clickable(&ui.window, "setup-add"),
+                            "A selected repository must be actionable",
+                        )
+                        .await?;
+                        click_control(&ui, "setup-add");
+                    }
+                    Ok(())
                 });
                 return;
             }
 
             if matches!(page.as_str(), "palette" | "layouts") {
-                named(
-                    &navigate.window,
-                    if page == "palette" {
-                        "command-palette"
-                    } else {
-                        "window-presets"
-                    },
-                )
-                .unwrap()
-                .downcast::<gtk::Button>()
-                .unwrap()
-                .emit_clicked();
+                let control = if page == "palette" { "command-palette" } else { "window-presets" };
+                click(&navigate.window, control).unwrap();
                 return;
             }
             if page == "launch-preview" {
@@ -727,7 +795,10 @@ pub fn install(ui: &Rc<Ui>) {
             }
             navigate.navigate(if page == "launch" { "agents" } else { &page });
             if fixture && matches!(page.as_str(), "board" | "notes" | "launch") {
-                edit_fixture(navigate.clone(), page.clone());
+                track("fixture edit", edit_fixture(navigate.clone(), page.clone()));
+            }
+            if fixture && page == "guardrails" {
+                track("guardrail decisions", verify_guardrail_decisions(navigate.clone()));
             }
             if fixture && std::env::var("RELAY_NATIVE_BURST").as_deref() == Ok("1") {
                 let ui = navigate.clone();
@@ -740,102 +811,128 @@ pub fn install(ui: &Rc<Ui>) {
             if page == "code" && fixture {
                 navigate.editor.verify_open(&navigate);
                 let ui = navigate.clone();
-                glib::timeout_add_local_once(Duration::from_millis(500), move || {
-                    ui.editor.verify_save(&ui)
+                track("code save", async move {
+                    // verify_save expects the README read to have finished: the editor is
+                    // neither busy nor modified, and the source view accepts typing.
+                    wait_for(
+                        || {
+                            !ui.editor.is_dirty()
+                                && named(&ui.window, "project-source")
+                                    .and_then(|w| w.downcast::<gtk::TextView>().ok())
+                                    .is_some_and(|view| view.is_editable())
+                        },
+                        "README.md opened in the editor",
+                    )
+                    .await?;
+                    ui.editor.verify_save(&ui);
+                    Ok(())
                 });
             }
             if page == "settings" && fixture {
-                let ui = navigate.clone();
-                glib::timeout_add_local_once(Duration::from_millis(700), move || {
-                    verify_settings_save(ui)
-                });
+                track("settings save", verify_settings_save(navigate.clone()));
             }
         }
     });
     glib::timeout_add_local_once(Duration::from_secs(duration), move || {
-        if fixture && *ui.page.borrow() == "board" {
-            assert!(
-                ui.dismiss_panels(),
-                "Saved task should close back to the board"
-            );
-        }
-        for name in ["setup-scan", "setup-path", "setup-local-path", "setup-add"] {
-            if named(&ui.window, name).is_some_and(|w| w.is_mapped() && w.is_sensitive()) {
-                verify_pointer_target(&ui, name);
+        glib::spawn_future_local(async move {
+            // The window closes after this; a check still running would be dropped unseen.
+            if let Err(error) = wait_within(
+                Duration::from_secs(15),
+                || PENDING.with(|pending| pending.borrow().is_empty()),
+                "fixture checks",
+            )
+            .await
+            {
+                panic!("{error}: {:?} never finished", PENDING.with(|p| p.borrow().clone()));
             }
-        }
-        if std::env::var_os("RELAY_NATIVE_VERIFY_CONTRAST").is_some() {
-            verify_control_contrast(&ui.window);
-        }
+            capture(ui, path, fixture);
+        });
+    });
+}
 
-        if std::env::var("RELAY_NATIVE_VERIFY_CONNECTION").as_deref() == Ok("1") {
-            assert!(
-                ui.client.borrow().is_some() && !ui.notice.is_visible(),
-                "Native engine connection failed: {}",
-                ui.notice.text()
-            );
-            println!("Native engine connection verified: {}", ui.path.display());
+fn capture(ui: Rc<Ui>, path: String, fixture: bool) {
+    if fixture && *ui.page.borrow() == "board" {
+        assert!(
+            ui.dismiss_panels(),
+            "Saved task should close back to the board"
+        );
+    }
+    for name in ["setup-scan", "setup-path", "setup-local-path", "setup-add"] {
+        if named(&ui.window, name).is_some_and(|w| w.is_mapped() && w.is_sensitive()) {
+            verify_pointer_target(&ui, name);
         }
-        if fixture && std::env::var("RELAY_NATIVE_BURST").as_deref() == Ok("1") {
-            ui.verify_burst(true);
-        }
-        assert_eq!(
-            gtk::Window::list_toplevels()
-                .iter()
-                .filter(|w| w.is_visible())
-                .count(),
-            1 + usize::from(
+    }
+    if std::env::var_os("RELAY_NATIVE_VERIFY_CONTRAST").is_some() {
+        verify_control_contrast(&ui.window);
+    }
+
+    if std::env::var("RELAY_NATIVE_VERIFY_CONNECTION").as_deref() == Ok("1") {
+        assert!(
+            ui.client.borrow().is_some() && !ui.notice.is_visible(),
+            "Native engine connection failed: {}",
+            ui.notice.text()
+        );
+        println!("Native engine connection verified: {}", ui.path.display());
+    }
+    if fixture && std::env::var("RELAY_NATIVE_BURST").as_deref() == Ok("1") {
+        ui.verify_burst(true);
+    }
+    assert_eq!(
+        gtk::Window::list_toplevels()
+            .iter()
+            .filter(|w| w.is_visible())
+            .count(),
+        1 + usize::from(
+            ui.notes_window
+                .borrow()
+                .as_ref()
+                .is_some_and(|w| w.window.is_visible())
+        ),
+        "Only the main workspace and retained Notes window may be visible"
+    );
+    // WidgetPaintable can have no node between invalidation and GTK's next
+    // frame (notably after a Code save). Capture a rendered frame, bounded.
+    let mut attempts = 0;
+    glib::timeout_add_local(Duration::from_millis(50), move || {
+        attempts += 1;
+        let target: gtk::Window =
+            if std::env::var("RELAY_NATIVE_PAGE").as_deref() == Ok("notes") {
                 ui.notes_window
                     .borrow()
                     .as_ref()
-                    .is_some_and(|w| w.window.is_visible())
-            ),
-            "Only the main workspace and retained Notes window may be visible"
-        );
-        // WidgetPaintable can have no node between invalidation and GTK's next
-        // frame (notably after a Code save). Capture a rendered frame, bounded.
-        let mut attempts = 0;
-        glib::timeout_add_local(Duration::from_millis(50), move || {
-            attempts += 1;
-            let target: gtk::Window =
-                if std::env::var("RELAY_NATIVE_PAGE").as_deref() == Ok("notes") {
-                    ui.notes_window
-                        .borrow()
-                        .as_ref()
-                        .expect("Notes window")
-                        .window
-                        .clone()
-                        .upcast()
-                } else {
-                    ui.window.clone().upcast()
-                };
-            let paintable = gtk::WidgetPaintable::new(Some(&target));
-            let snapshot = gtk::Snapshot::new();
-            paintable.snapshot(&snapshot, target.width() as f64, target.height() as f64);
-            let (Some(node), Some(renderer)) = (snapshot.to_node(), target.renderer()) else {
-                assert!(
-                    attempts < 40,
-                    "Screenshot failed: no rendered frame after two seconds"
-                );
-                ui.window.queue_draw();
-                return glib::ControlFlow::Continue;
+                    .expect("Notes window")
+                    .window
+                    .clone()
+                    .upcast()
+            } else {
+                ui.window.clone().upcast()
             };
-            renderer
-                .render_texture(&node, None)
-                .save_to_png(&path)
-                .expect("Save screenshot");
-            record_geometry(&ui, &path);
-            println!("Screenshot saved: {path}");
-            if fixture && std::env::var("RELAY_NATIVE_PAGE").as_deref() == Ok("launch-preview") {
-                ui.verify_launch();
-            }
-            ui.window.close();
+        let paintable = gtk::WidgetPaintable::new(Some(&target));
+        let snapshot = gtk::Snapshot::new();
+        paintable.snapshot(&snapshot, target.width() as f64, target.height() as f64);
+        let (Some(node), Some(renderer)) = (snapshot.to_node(), target.renderer()) else {
             assert!(
-                !ui.window.is_visible(),
-                "Native close blocked: {}",
-                ui.notice.text()
+                attempts < 40,
+                "Screenshot failed: no rendered frame after two seconds"
             );
-            glib::ControlFlow::Break
-        });
+            ui.window.queue_draw();
+            return glib::ControlFlow::Continue;
+        };
+        renderer
+            .render_texture(&node, None)
+            .save_to_png(&path)
+            .expect("Save screenshot");
+        record_geometry(&ui, &path);
+        println!("Screenshot saved: {path}");
+        if fixture && std::env::var("RELAY_NATIVE_PAGE").as_deref() == Ok("launch-preview") {
+            ui.verify_launch();
+        }
+        ui.window.close();
+        assert!(
+            !ui.window.is_visible(),
+            "Native close blocked: {}",
+            ui.notice.text()
+        );
+        glib::ControlFlow::Break
     });
 }

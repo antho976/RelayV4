@@ -1,51 +1,20 @@
 //! Project files regression, limited to the disposable native fixture.
 use crate::app::Ui;
 use gtk4 as gtk;
+use crate::smoke::util::{self, named, require};
 use serde_json::json;
 use sourceview5::prelude::*;
 use std::{rc::Rc, time::Duration};
 
-fn named(root: &impl IsA<gtk::Widget>, name: &str) -> Option<gtk::Widget> {
-    let root = root.as_ref();
-    if root.widget_name() == name {
-        return Some(root.clone());
-    }
-    let mut child = root.first_child();
-    while let Some(widget) = child {
-        if let Some(found) = named(&widget, name) {
-            return Some(found);
-        }
-        child = widget.next_sibling();
-    }
-    None
-}
-fn require(condition: bool, reason: &str) -> Result<(), String> {
-    if condition {
-        Ok(())
-    } else {
-        Err(reason.into())
-    }
-}
-async fn wait_for(mut predicate: impl FnMut() -> bool, reason: &str) -> Result<(), String> {
+async fn wait_for(predicate: impl FnMut() -> bool, reason: &str) -> Result<(), String> {
     println!("PROJECT_WAIT={reason}");
-    for _ in 0..160 {
-        if predicate() {
-            println!("PROJECT_READY={reason}");
-            return Ok(());
-        }
-        glib::timeout_future(Duration::from_millis(25)).await;
-    }
-    Err(format!("Timed out: {reason}"))
+    util::wait_for(predicate, reason).await?;
+    println!("PROJECT_READY={reason}");
+    Ok(())
 }
 fn click(ui: &Ui, name: &str) -> Result<(), String> {
     println!("PROJECT_CLICK={name}");
-    let key = named(&ui.window, name)
-        .ok_or_else(|| format!("Missing control: {name}"))?
-        .downcast::<gtk::Button>()
-        .map_err(|_| format!("Not a button: {name}"))?;
-    require(key.is_sensitive(), name)?;
-    key.emit_clicked();
-    Ok(())
+    util::click(&ui.window, name)
 }
 async fn file_action(
     ui: &Rc<Ui>,
@@ -142,8 +111,22 @@ pub async fn run(ui: &Rc<Ui>) -> Result<(), String> {
             .is_some_and(|text| text.contains("Project view edit preserved.")),
         "Project save reaches engine",
     )?;
-    // Let prior file events settle, then a burst should yield one tree reconstruction.
-    glib::timeout_future(Duration::from_millis(1250)).await;
+    // Let the save's own file events settle: the tree must hold still for well over the
+    // 1 s client debounce, so a late event's refresh lands before the burst starts (RA-717).
+    let mut revision = ui.editor.tree_revision.get();
+    let mut still = std::time::Instant::now();
+    util::wait_within(
+        Duration::from_secs(10),
+        || {
+            let now = ui.editor.tree_revision.get();
+            if now != revision {
+                (revision, still) = (now, std::time::Instant::now());
+            }
+            still.elapsed() > Duration::from_millis(2500)
+        },
+        "File tree settles after the save",
+    )
+    .await?;
     let revision = ui.editor.tree_revision.get();
     for _ in 0..20 {
         ui.editor.invalidate(ui, None);
@@ -153,12 +136,17 @@ pub async fn run(ui: &Rc<Ui>) -> Result<(), String> {
         ui.editor.tree_revision.get() == revision,
         "File events must not rebuild multiple times per second",
     )?;
-    glib::timeout_future(Duration::from_millis(1000)).await;
+    wait_for(
+        || ui.editor.tree_revision.get() != revision,
+        "Coalesced tree refresh",
+    )
+    .await?;
     require(
         ui.editor.tree_revision.get() == revision + 1,
         "File events coalesce into one tree refresh",
     )?;
-    glib::timeout_future(Duration::from_millis(1100)).await;
+    // Idle for more than two debounce periods: a poll would rebuild the tree in that time.
+    glib::timeout_future(Duration::from_millis(2500)).await;
     require(
         ui.editor.tree_revision.get() == revision + 1,
         "File tree must not poll when idle",
@@ -177,18 +165,12 @@ pub async fn run(ui: &Rc<Ui>) -> Result<(), String> {
     .await?;
     let folder =
         named(&ui.window, "project-file:project-smoke-folder").ok_or("Folder row missing")?;
-    let controllers = folder.observe_controllers();
-    let target = (0..controllers.n_items())
-        .find_map(|i| {
-            controllers
-                .item(i)
-                .and_then(|item| item.downcast::<gtk::DropTarget>().ok())
-        })
-        .ok_or("Folder drop target missing")?;
-    let data = json!({"project":project,"worktree":"","path":"project-smoke.txt"}).to_string();
-    let boxed = glib::BoxedValue(data.to_value());
+    // The payload comes from the file row's own DragSource, so the drop sees what a real
+    // drag between rows carries (RA-722).
+    let file = named(&ui.window, "project-file:project-smoke.txt").ok_or("File row missing")?;
+    let payload = util::drag_payload(&file)?;
     require(
-        target.emit_by_name::<bool>("drop", &[&boxed, &0_f64, &0_f64]),
+        util::drop_on(&folder, payload)?,
         "Folder accepts scoped file move",
     )?;
     wait_for(
@@ -201,7 +183,7 @@ pub async fn run(ui: &Rc<Ui>) -> Result<(), String> {
         .downcast::<gtk::Button>()
         .map_err(|_| "Folder row type")?;
     // Explorer folders are rows that toggle their children, as in VS Code.
-    folder.emit_clicked();
+    util::press(&folder, "project-file:project-smoke-folder")?;
     wait_for(
         || {
             named(

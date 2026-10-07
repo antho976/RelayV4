@@ -3,38 +3,9 @@ use crate::app::Ui;
 use gtk::prelude::*;
 use gtk4 as gtk;
 use serde_json::json;
+use super::util::{click, named, require, wait_for};
 use std::{rc::Rc, time::Duration};
 
-fn named(root: &impl IsA<gtk::Widget>, name: &str) -> Option<gtk::Widget> {
-    let root = root.as_ref();
-    if root.widget_name() == name {
-        return Some(root.clone());
-    }
-    let mut child = root.first_child();
-    while let Some(widget) = child {
-        if let Some(found) = named(&widget, name) {
-            return Some(found);
-        }
-        child = widget.next_sibling();
-    }
-    None
-}
-async fn wait_for(mut predicate: impl FnMut() -> bool, reason: &str) -> Result<(), String> {
-    for _ in 0..160 {
-        if predicate() {
-            return Ok(());
-        }
-        glib::timeout_future(Duration::from_millis(25)).await;
-    }
-    Err(format!("Timed out: {reason}"))
-}
-fn require(condition: bool, reason: &str) -> Result<(), String> {
-    if condition {
-        Ok(())
-    } else {
-        Err(reason.to_string())
-    }
-}
 pub async fn run(ui: &Rc<Ui>) -> Result<(), String> {
     let project = ui.project.get();
     require(project != 0, "Fixture project must be ready")?;
@@ -163,7 +134,9 @@ pub async fn run(ui: &Rc<Ui>) -> Result<(), String> {
         ui.note_drafts.borrow().contains_key(&id),
         "Window close discarded a draft",
     )?;
-    glib::timeout_future(Duration::from_millis(850)).await;
+    // Prove a negative: wait past the autosave debounce (1.5 s, note_pages/doc.rs), so a
+    // Plan that did autosave would already show it here (RA-721).
+    glib::timeout_future(Duration::from_millis(2000)).await;
     let stored = ui
         .call("notes.get", json!({"note_id":id}))
         .await
@@ -194,11 +167,7 @@ pub async fn run(ui: &Rc<Ui>) -> Result<(), String> {
         .downcast::<gtk::Paned>()
         .map_err(|_| "Library split type")?;
     split.set_position(331);
-    let toggle = named(&owner.window, "notes-library-toggle")
-        .ok_or("Library collapse control missing")?
-        .downcast::<gtk::Button>()
-        .map_err(|_| "Library toggle type")?;
-    toggle.emit_clicked();
+    click(&owner.window, "notes-library-toggle")?;
     require(owner.rail_collapsed.get(), "Library did not collapse")?;
     let renders = owner.renders.get();
     crate::pages::refresh_notes(ui);
@@ -219,23 +188,28 @@ pub async fn run(ui: &Rc<Ui>) -> Result<(), String> {
         owner.rail_collapsed.get() && owner.rail_width.get() == 331,
         "Reopen reset rail state",
     )?;
-    glib::timeout_future(Duration::from_millis(500)).await;
-    let settings = ui
-        .call("settings.get", json!({"path":"native.notes.window"}))
-        .await
-        .map_err(|e| e.to_string())?;
-    require(
-        settings["value"]["rail_width"] == 331 && settings["value"]["rail_collapsed"] == true,
-        "Rail state was not persisted",
-    )?;
+    // The rail state is written after a debounce; read until it lands.
+    let deadline = std::time::Instant::now() + super::util::WAIT;
+    loop {
+        let settings = ui
+            .call("settings.get", json!({"path":"native.notes.window"}))
+            .await
+            .map_err(|e| e.to_string())?;
+        if settings["value"]["rail_width"] == 331 && settings["value"]["rail_collapsed"] == true {
+            break;
+        }
+        require(std::time::Instant::now() < deadline, "Rail state was not persisted")?;
+        glib::timeout_future(Duration::from_millis(50)).await;
+    }
     body.buffer().set_text("Ordinary Plan fixture");
     draft.close();
     require(
         !ui.note_drafts.borrow().contains_key(&id),
         "Clean tab close retained stale draft",
     )?;
+    let renders = owner.renders.get();
     crate::pages::refresh_notes(ui);
-    glib::timeout_future(Duration::from_millis(200)).await;
+    wait_for(|| owner.renders.get() > renders, "Notes refresh after tab close").await?;
     require(
         !ui.note_drafts.borrow().contains_key(&id),
         "Refresh reopened a deliberately closed tab",
