@@ -6,6 +6,11 @@ mod registry;
 mod agent_menu;
 pub(super) use agent_menu::is_closing;
 
+thread_local! {
+    /// The bell's notify.list is in flight; see refresh_notification_count.
+    static BELL_LOADING: Cell<bool> = const { Cell::new(false) };
+}
+
 impl Ui {
     /// Open `project` on `page`: an explicit destination, which the project's saved layout
     /// does not override.
@@ -113,7 +118,12 @@ impl Ui {
             items.insert(index + usize::from(after), item);
             ui.projects_box.set_sensitive(false);
             glib::spawn_future_local(async move {
+                // Each update is its own event and undo entry, so only the items whose order
+                // changed (the moved range) are written.
                 for (order, item) in items.into_iter().enumerate() {
+                    if item["order"].as_i64() == Some(order as i64) {
+                        continue;
+                    }
                     let payload = if workspace {
                         json!({"workspace_id":item["id"],"order":order})
                     } else {
@@ -166,8 +176,9 @@ impl Ui {
         let focus = self.focused.borrow().clone();
         let mode = self.mode.borrow().clone();
         self.wall_right.set_visible(
-            matches!(mode.as_str(), "review" | "mosaic")
-                || (mode == "grid" && self.columns.get() == 2 && names.len() > 1),
+            names.len() > 1
+                && (matches!(mode.as_str(), "review" | "mosaic")
+                    || (mode == "grid" && self.columns.get() == 2)),
         );
         clear(&self.focus_tabs);
         self.focus_tabs
@@ -187,16 +198,12 @@ impl Ui {
                     .iter()
                     .find(|s| text(s, "name") == name)
                 {
-                    match text(session, "state") {
-                        "running" | "spawning" => lamp.add_css_class("live"),
-                        "blocked" => lamp.add_css_class("held"),
-                        "restorable" => lamp.add_css_class("waiting"),
-                        _ => (),
-                    }
+                    tab_lamp(&lamp, text(session, "state"));
                 }
                 row.append(&lamp);
                 row.append(&label(name, ""));
                 b.set_child(Some(&row));
+                b.set_widget_name(&format!("focus-tab-{name}"));
                 if focus.as_ref() == Some(name) {
                     b.add_css_class("selected");
                 }
@@ -573,7 +580,10 @@ impl Ui {
             let grid = modes.downgrade();
             b.connect_clicked(move |key| {
                 if let Some(ui) = weak.upgrade() {
-                    ui.columns.set(columns);
+                    // Columns are the grid's alone; focus must not leave a one-column grid behind.
+                    if mode == "grid" {
+                        ui.columns.set(columns);
+                    }
                     ui.set_mode(mode);
                     if let Some(grid) = grid.upgrade() {
                         let mut child = grid.first_child();
@@ -649,16 +659,38 @@ impl Ui {
                         let delete = icon_button("edit-delete-symbolic", "Delete preset");
                         row.append(&delete);
                         saved.append(&row);
-                        for (key, op) in [(apply, "ui.layout.apply"), (delete, "ui.layout.delete")]
-                        {
-                            let weak = Rc::downgrade(&ui);
-                            let name = name.to_string();
-                            key.connect_clicked(move |b| {
-                                if let Some(ui) = weak.upgrade() {
-                                    ui.mutate(op, json!({"project_id":project,"name":name}), b);
+                        let weak = Rc::downgrade(&ui);
+                        let preset = name.to_string();
+                        apply.connect_clicked(move |b| {
+                            if let Some(ui) = weak.upgrade() {
+                                ui.mutate("ui.layout.apply", json!({"project_id":project,"name":preset}), b);
+                            }
+                        });
+                        // The list is read once, so a deleted preset leaves it here.
+                        let weak = Rc::downgrade(&ui);
+                        let preset = name.to_string();
+                        let row = row.downgrade();
+                        crate::app::confirm_inline(&delete, "Delete", move |key| {
+                            let Some(ui) = weak.upgrade() else { return };
+                            let payload = json!({"project_id":project,"name":preset});
+                            let (key, row) = (key.clone(), row.clone());
+                            key.set_sensitive(false);
+                            glib::spawn_future_local(async move {
+                                match ui.call("ui.layout.delete", payload).await {
+                                    Ok(_) => {
+                                        if let Some(row) = row.upgrade() {
+                                            if let Some(list) = row.parent().and_downcast::<gtk::Box>() {
+                                                list.remove(&row);
+                                            }
+                                        }
+                                        ui.refresh();
+                                    }
+                                    Err(e) => ui.show_error(&e.to_string()),
                                 }
+                                key.set_sensitive(true);
+                                ui.refresh_page();
                             });
-                        }
+                        });
                     }
                 }
                 Err(e) => ui.show_error(&e.to_string()),
@@ -704,6 +736,18 @@ impl Ui {
         pane.root.add_controller(drop_target);
     }
     pub(super) fn session_actions(self: &Rc<Self>, pane: &Rc<Pane>, session: &Value) {
+        // reconcile lays out only when the order changes, so a state change alone reaches the
+        // focus tabs here; an agent turning blocked must not keep its running lamp.
+        let tab = format!("focus-tab-{}", text(session, "name"));
+        let mut child = self.focus_tabs.first_child();
+        while let Some(widget) = child {
+            child = widget.next_sibling();
+            if widget.widget_name() == tab {
+                if let Some(lamp) = widget.first_child().and_then(|row| row.first_child()) {
+                    tab_lamp(&lamp, text(session, "state"));
+                }
+            }
+        }
         self.clear_agent_actions(pane);
         clear(&pane.slate_actions);
         if self.agent_overrides(pane, session) {
@@ -778,20 +822,33 @@ impl Ui {
         }
         self.agent_controls(pane, session);
     }
+    /// Every notify event lands here. A burst of them shares one list, as refresh() does: the
+    /// list in flight runs once more when it answers if the revision moved meanwhile.
     pub(super) fn refresh_notification_count(self: &Rc<Self>) {
-        let revision = self.notification_revision.get().wrapping_add(1);
-        self.notification_revision.set(revision);
-        let generation = self.generation.get();
+        self.notification_revision
+            .set(self.notification_revision.get().wrapping_add(1));
+        if BELL_LOADING.with(|loading| loading.replace(true)) {
+            return;
+        }
         let ui = self.clone();
         glib::spawn_future_local(async move {
-            if let Ok(result) = ui
-                .call("notify.list", json!({"unread_only":true,"limit":100}))
-                .await
-            {
-                if ui.generation.get() != generation || ui.notification_revision.get() != revision {
+            let (result, generation) = loop {
+                let revision = ui.notification_revision.get();
+                let generation = ui.generation.get();
+                let result = ui
+                    .call("notify.list", json!({"unread_only":true,"limit":100}))
+                    .await;
+                if ui.notification_revision.get() == revision {
+                    break (result, generation);
+                }
+            };
+            BELL_LOADING.with(|loading| loading.set(false));
+            if let Ok(result) = result {
+                if ui.generation.get() != generation {
                     return;
                 }
                 let unread = rows(&result, "notifications");
+                notification_center::unread(unread.len());
                 ui.notification_count.set_visible(!unread.is_empty());
                 ui.notification_count.set_text(&if unread.len() > 99 {
                     String::from("99+")
@@ -1087,7 +1144,7 @@ impl Ui {
         let keys = gtk::EventControllerKey::new();
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         let weak = Rc::downgrade(self);
-        keys.connect_key_pressed(move |_, key, _, mods| {
+        keys.connect_key_pressed(move |_, key, keycode, mods| {
             let Some(ui) = weak.upgrade() else {
                 return glib::Propagation::Proceed;
             };
@@ -1098,6 +1155,7 @@ impl Ui {
             let in_terminal = GtkWindowExt::focus(&ui.window).is_some_and(|w| {
                 w.is::<vte4::Terminal>() || w.ancestor(vte4::Terminal::static_type()).is_some()
             });
+            let key = crate::shortcuts::latin(key, keycode);
             for (action, _, fallback) in crate::shortcuts::DEFAULTS {
                 let bindings = ui.keybindings.borrow();
                 let chord = bindings[action].as_str().unwrap_or(fallback);
@@ -1274,5 +1332,18 @@ impl Ui {
                 p.schedule_resize();
             }
         });
+    }
+}
+
+/// A focus tab's lamp shows its session's state.
+fn tab_lamp(lamp: &impl IsA<gtk::Widget>, state: &str) {
+    for class in ["live", "held", "waiting"] {
+        lamp.remove_css_class(class);
+    }
+    match state {
+        "running" | "spawning" => lamp.add_css_class("live"),
+        "blocked" => lamp.add_css_class("held"),
+        "restorable" => lamp.add_css_class("waiting"),
+        _ => (),
     }
 }

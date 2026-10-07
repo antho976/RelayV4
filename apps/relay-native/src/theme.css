@@ -252,7 +252,6 @@ button.skill-pick:checked { background: @wash; }
 .document-library, .document-library scrolledwindow, .document-library viewport { background: @console; }
 .document-library { border-right: 1px solid @edge; }
 .document-library-head { min-height: 39px; padding: 0 11px; border-bottom: 1px solid @edge; }
-.document-library searchentry { margin: 7px; min-height: 31px; }
 button.document-row { padding: 9px 11px; border-top: 1px solid @edge; border-radius: 0; background: transparent; }
 button.document-row:hover { background: @slab; }
 .document-row-title { color: @ink; font-size: 12px; font-weight: 500; }
@@ -388,7 +387,6 @@ checkbutton check:checked { background: @ink; border-color: @ink; color: @wall; 
 .notes-app-head .title { font-size: 18px; }
 .notes-workspace > separator { min-width: 0; }
 .document-library { min-width: 269px; }
-.document-library searchentry { font-size: 12px; }
 .document-toolbar { min-height: 24px; padding: 3px 7px; }
 .document-status { min-height: 24px; }
 .code-bar { min-height: 35px; }
@@ -486,8 +484,8 @@ window.notes-window, window.notes-window > box { padding: 0; margin: 0; border: 
 .task-detail-tabs { margin-bottom: 8px; }
 .task-detail-tabs button { min-height: 26px; padding: 0 12px; border-radius: 0; }
 .task-activity-row { padding: 10px 0; border-bottom: 1px solid @edge; }
-.task-relations expander { padding: 6px 0; }
-.task-relations expander > title { min-height: 24px; }
+.task-relations expander-widget { padding: 6px 0; }
+.task-relations expander-widget > box > title { min-height: 24px; }
 
 .skills-workspace > separator { min-width: 5px; background: @edge; }
 .skills-directory > title { padding: 5px 8px; color: @secondary; }

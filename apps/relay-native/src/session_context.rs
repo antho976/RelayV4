@@ -59,6 +59,21 @@ fn local_stamp(ts: &str) -> Option<String> {
     local.format("%b %-d, %H:%M").ok().map(|s| s.to_string())
 }
 
+/// `ts` as "5 min ago · Oct 4, 14:02". The card is drawn once and not redrawn as time passes,
+/// so the clock reading keeps a stale "just now" from misleading.
+fn moment(ts: &str) -> String {
+    with_stamp(relative_time(ts), local_stamp(ts))
+}
+
+fn with_stamp(relative: String, stamp: Option<String>) -> String {
+    match stamp.filter(|s| *s != relative) {
+        // "Sep 27 · Sep 27, 15:48" says the date twice; the stamp alone is enough.
+        Some(stamp) if stamp.starts_with(&relative) => stamp,
+        Some(stamp) => format!("{relative} · {stamp}"),
+        None => relative,
+    }
+}
+
 /// What `session.done` / a blocked report said last, newest first in `notifications`.
 fn last_report<'a>(session: &Value, notifications: &'a [Value]) -> Option<&'a Value> {
     let prefix = format!("{} ", text(session, "name"));
@@ -188,7 +203,7 @@ fn render(card: &gtk::Box, session: &Value, task: Option<&Value>, report: Option
     }
     if let Some(report) = report {
         let mut value = text(report, "body").trim().to_string();
-        let when = relative_time(text(report, "created_at"));
+        let when = moment(text(report, "created_at"));
         if text(report, "category") == "agent_blocked" {
             value = format!("Blocked: {value}");
         }
@@ -222,12 +237,7 @@ fn render(card: &gtk::Box, session: &Value, task: Option<&Value>, report: Option
         .into_iter()
         .find(|ts| !ts.is_empty());
     if let Some(ts) = active {
-        let mut value = relative_time(ts);
-        // "Sep 27 · Sep 27, 15:48" says the date twice; the stamp alone is enough.
-        if let Some(stamp) = local_stamp(ts).filter(|s| *s != value) {
-            value = if stamp.starts_with(&value) { stamp } else { format!("{value} · {stamp}") };
-        }
-        add("LAST ACTIVE", &value, "", 1);
+        add("LAST ACTIVE", &moment(ts), "", 1);
     }
     card.append(&grid);
     if !recorded {
@@ -254,6 +264,14 @@ mod tests {
         assert_eq!(relative_time(&ago(3 * 60 + 10)), "3 h ago");
         assert_eq!(relative_time("not a time"), "not a time");
         assert!(!relative_time(&ago(9 * 24 * 60)).contains("ago"));
+    }
+
+    #[test]
+    fn a_moment_carries_its_clock_reading_once() {
+        let stamp = || Some(String::from("Oct 4, 14:02"));
+        assert_eq!(with_stamp("just now".into(), stamp()), "just now · Oct 4, 14:02");
+        assert_eq!(with_stamp("Oct 4".into(), stamp()), "Oct 4, 14:02");
+        assert_eq!(with_stamp("just now".into(), None), "just now");
     }
 
     #[test]

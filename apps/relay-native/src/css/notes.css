@@ -6,10 +6,10 @@
 /* ---- titlebar: menu bar · document name · window keys ---- */
 .notes-chrome { min-height: 30px; background: @console; border-bottom: 1px solid @edge; }
 .notes-chrome-mark { margin: 0 4px 0 11px; color: @faint; }
-.notes-chrome popovermenubar { background: transparent; padding: 0; }
-.notes-chrome popovermenubar > item { min-height: 30px; padding: 0 9px; border-radius: 0; color: @secondary; font-size: 12px; font-weight: 500; }
-.notes-chrome popovermenubar > item:hover,
-.notes-chrome popovermenubar > item:selected { background: @wash; color: @ink; }
+.notes-chrome menubar { background: transparent; padding: 0; }
+.notes-chrome menubar > item { min-height: 30px; padding: 0 9px; border-radius: 0; color: @secondary; font-size: 12px; font-weight: 500; }
+.notes-chrome menubar > item:hover,
+.notes-chrome menubar > item:selected { background: @wash; color: @ink; }
 .notes-heading { color: @secondary; font-size: 12px; font-weight: 500; }
 .notes-chrome-controls button { min-height: 30px; min-width: 40px; padding: 0; border: 0; border-radius: 0; background: transparent; color: @secondary; }
 .notes-chrome-controls button:hover { background: @wash; color: @ink; }
@@ -74,7 +74,7 @@ notebook.notes-tabs > header { min-height: 0; padding: 0; background: @console; 
 notebook.notes-tabs > header > tabs > tab { min-height: 32px; padding: 0 4px 0 12px; margin: 0; border: 0; border-right: 1px solid @edge; border-radius: 0; background: transparent; color: @secondary; box-shadow: none; }
 notebook.notes-tabs > header > tabs > tab:hover { background: alpha(@ink, 0.03); color: @ink; }
 notebook.notes-tabs > header > tabs > tab:checked { background: @notes_paper; color: @ink; box-shadow: inset 0 2px @ink; }
-notebook.notes-tabs > header > arrow { min-width: 24px; color: @secondary; }
+notebook.notes-tabs > header > tabs > arrow { min-width: 24px; color: @secondary; }
 notebook.notes-tabs > stack { background: @notes_paper; }
 .notes-tab-label { font-size: 12px; }
 tab:checked .notes-tab-label { font-weight: 500; }
@@ -92,7 +92,7 @@ entry.notes-title:focus-within { box-shadow: inset 0 -1px alpha(@ink, 0.25); }
 button.notes-pin { min-width: 28px; min-height: 28px; padding: 0; border: 0; border-radius: 3px; background: transparent; color: @faint; }
 button.notes-pin:hover { background: @wash; color: @ink; }
 button.notes-pin:checked { color: @waiting; background: alpha(@waiting, 0.10); }
-.notes-scroll, .notes-scroll > viewport { background: @notes_paper; }
+.notes-scroll { background: @notes_paper; }
 textview.notes-source { padding: 0; background: @notes_paper; }
 textview.notes-source > text { background: @notes_paper; }
 textview.notes-source > border.left gutter { background: @notes_paper; }
@@ -114,7 +114,7 @@ button.notes-find-key:hover { background: @wash; color: @ink; }
 button.notes-find-option { min-width: 30px; min-height: 28px; padding: 0 6px; border: 1px solid transparent; border-radius: 3px; background: transparent; color: @secondary; font-family: 'Fira Mono', monospace; font-size: 11px; }
 button.notes-find-option:hover { background: @wash; color: @ink; }
 button.notes-find-option:checked { background: alpha(@ink, 0.10); border-color: @strong; color: @ink; }
-button.notes-find-word { text-decoration: underline; }
+button.notes-find-word label { text-decoration-line: underline; }
 button.notes-find-button { min-height: 28px; padding: 0 12px; font-size: 12px; }
 
 /* ---- status bar ---- */
