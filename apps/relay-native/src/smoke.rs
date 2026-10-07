@@ -452,6 +452,26 @@ pub fn install(ui: &Rc<Ui>) {
     let Ok(path) = std::env::var("RELAY_NATIVE_SCREENSHOT") else {
         return;
     };
+    let fixture = std::env::var("RELAY_NATIVE_FIXTURE").as_deref() == Ok("1");
+    // A fixture, a page or a roadmap part writes through the engine: it types into
+    // terminals, edits notes, tasks, files and settings, and launches sessions. Arm any
+    // of them only against a disposable engine the driver started under the temp
+    // directory, never the live one an inherited variable happens to reach. A bare
+    // screenshot (with VERIFY_CONNECTION or VERIFY_CONTRAST) only reads, so it may
+    // look at any engine.
+    let acts = fixture
+        || std::env::var_os("RELAY_NATIVE_PAGE").is_some()
+        || std::env::var_os("RELAY_NATIVE_ROADMAP").is_some();
+    let isolated = ui.path.starts_with(std::env::temp_dir())
+        && !ui.path.components().any(|c| c == std::path::Component::ParentDir);
+    if acts && !isolated {
+        eprintln!(
+            "Smoke harness refused: RELAY_NATIVE_FIXTURE/PAGE/ROADMAP act on the engine, and {} is not under {}. Point RELAY_NATIVE_SOCKET at a disposable engine there.",
+            ui.path.display(),
+            std::env::temp_dir().display()
+        );
+        std::process::exit(1);
+    }
     // A panic in a detached GLib future must fail the fixture, rather than leave
     // an idle window until the harness timeout.
     let previous = std::panic::take_hook();
@@ -471,9 +491,8 @@ pub fn install(ui: &Rc<Ui>) {
         }
     }
     let ui = ui.clone();
-    let fixture = std::env::var("RELAY_NATIVE_FIXTURE").as_deref() == Ok("1");
     if let Ok(part) = std::env::var("RELAY_NATIVE_ROADMAP") {
-        assert!(fixture && std::env::var("RELAY_INSTANCE").as_deref() == Ok("test"));
+        assert!(fixture, "Roadmap smoke parts run with RELAY_NATIVE_FIXTURE=1");
         glib::timeout_add_local_once(Duration::from_secs(2), move || {
             glib::spawn_future_local(async move {
                 let result = match part.as_str() {

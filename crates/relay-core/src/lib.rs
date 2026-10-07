@@ -1,5 +1,6 @@
 //! RELAY v4 engine (BUS.md §5, §6): the store, the audit log, the request pipeline and the
-//! socket door. Headless: `relay serve` runs exactly this; the Tauri shell embeds it.
+//! socket door. `relay serve` runs exactly this, with or without a display; the native client
+//! and the phone door are clients of its socket.
 
 // `BusError` is ~250 bytes and is the *normal* path for typed refusals; boxing it in every
 // handler signature would obscure the API for no measurable gain.

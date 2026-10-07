@@ -1,9 +1,13 @@
-# Rigging recipes (verified in Blender 4.0 background mode)
+# Rigging recipes (verified in background mode on Blender 4.0.2 and 5.2.1)
 
 Each block runs as `blender_python` `code`. The tool's scope has `bpy`, `Vector`, `Matrix`,
 `math`, `ARGS`; import anything else (`Euler`, `Quaternion`, `bmesh`) yourself. Names below
 (`Hero`, `HeroBody`, `hand.R`) are examples - read the real ones with `blender_info` first. Use
 `save_as` for results unless you mean to overwrite the source.
+
+Every block was re-run in order on 5.2.1 after recipe 8's F-curve loop moved to
+`action_fcurves` (5.0 removed `Action.fcurves`); the helper's 4.x branch has not been re-run on a
+4.x build since.
 
 ## 1. Inventory the armature
 
@@ -190,9 +194,30 @@ sword.parent, sword.parent_type, sword.parent_bone = arm, "BONE", "hand.R"
 sword.matrix_world = Matrix.Translation(grip_world) @ Matrix.Rotation(math.pi, 4, "Z")
 ```
 
-Pick up at frame 10, drop at frame 30, with no jump at either switch:
+Pick up at frame 10, drop at frame 30, with no jump at either switch. `action_fcurves` is the
+version-tolerant F-curve helper from `blender-animation/reference/animation-recipes.md`:
 
 ```python
+def action_fcurves(act, obj=None, ensure=False):
+    """F-curves of `act` on any Blender. Since 4.4 they live in a channelbag per action slot;
+    5.0 removed Action.fcurves. Uses obj's assigned slot when obj plays `act`, else the first
+    slot. ensure=True creates the slot (assigned to obj), layer, strip and channelbag."""
+    if not hasattr(act, "slots"):                                   # 4.3 and older
+        return act.fcurves
+    ad = obj.animation_data if obj is not None else None
+    mine = ad is not None and ad.action == act
+    slot = (ad.action_slot if mine else None) or (act.slots[0] if len(act.slots) else None)
+    if not ensure:
+        bags = [st.channelbag(slot) for ly in act.layers for st in ly.strips] if slot else []
+        return next((cb.fcurves for cb in bags if cb), [])
+    if slot is None:
+        slot = act.slots.new(id_type="OBJECT", name=obj.name if obj is not None else act.name)
+    if mine and ad.action_slot != slot:
+        ad.action_slot = slot
+    layer = act.layers[0] if len(act.layers) else act.layers.new("Layer")
+    strip = layer.strips[0] if len(layer.strips) else layer.strips.new(type="KEYFRAME")
+    return strip.channelbag(slot, ensure=True).fcurves
+
 scene = bpy.context.scene
 arm, cup = bpy.data.objects["Hero"], bpy.data.objects["Cup"]
 PICK, DROP, HAND = 10, 30, "hand.R"
@@ -209,7 +234,7 @@ con.influence = 1.0; con.keyframe_insert("influence", frame=DROP)
 con.influence = 0.0; con.keyframe_insert("influence", frame=DROP + 1)
 cup.matrix_world = dropped
 cup.keyframe_insert("location", frame=DROP + 1); cup.keyframe_insert("rotation_euler", frame=DROP + 1)
-for k in (k for fc in cup.animation_data.action.fcurves for k in fc.keyframe_points):
+for k in (k for fc in action_fcurves(cup.animation_data.action, cup) for k in fc.keyframe_points):
     k.interpolation = "CONSTANT"                    # switches must step, not blend
 for f in (PICK - 1, PICK, DROP, DROP + 1):
     scene.frame_set(f); print(f, [round(c, 3) for c in cup.matrix_world.translation])

@@ -1,7 +1,9 @@
 # Rig recipes (verified in background mode)
 
 Armature, keys, skinning and rig repair snippets, run in this order with
-`blender -b --factory-startup` on Blender 4.0.2 (each block uses what the previous one made).
+`blender -b --factory-startup` on Blender 4.0.2, and again on 5.2.1 after the F-curve and
+selection fixes below (each block uses what the previous one made). The 4.x branch of
+`action_fcurves` has not been re-run on a 4.x build since.
 Paste into `blender_python` `code`; `bpy`, `Vector`, `Matrix`, `math` are in scope, `bmesh` is
 not. For the general recipes (create, apply transforms, origin, modifiers, bmesh, UVs,
 materials) see `bpy-recipes.md`. Rigging depth lives in `blender-rigging`; export rules for the
@@ -68,8 +70,30 @@ print("unweighted", sum(1 for v in me.vertices if not any(g.weight > 0 for g in 
 ## Apply an armature's scale, with its animation
 
 `transform_apply` rescales rest bones and children but not bone location keys; scale them.
+`action_fcurves` is the version-tolerant F-curve helper from
+`blender-animation/reference/animation-recipes.md` (5.0 removed `Action.fcurves`):
 
 ```python
+def action_fcurves(act, obj=None, ensure=False):
+    """F-curves of `act` on any Blender. Since 4.4 they live in a channelbag per action slot;
+    5.0 removed Action.fcurves. Uses obj's assigned slot when obj plays `act`, else the first
+    slot. ensure=True creates the slot (assigned to obj), layer, strip and channelbag."""
+    if not hasattr(act, "slots"):                                   # 4.3 and older
+        return act.fcurves
+    ad = obj.animation_data if obj is not None else None
+    mine = ad is not None and ad.action == act
+    slot = (ad.action_slot if mine else None) or (act.slots[0] if len(act.slots) else None)
+    if not ensure:
+        bags = [st.channelbag(slot) for ly in act.layers for st in ly.strips] if slot else []
+        return next((cb.fcurves for cb in bags if cb), [])
+    if slot is None:
+        slot = act.slots.new(id_type="OBJECT", name=obj.name if obj is not None else act.name)
+    if mine and ad.action_slot != slot:
+        ad.action_slot = slot
+    layer = act.layers[0] if len(act.layers) else act.layers.new("Layer")
+    strip = layer.strips[0] if len(layer.strips) else layer.strips.new(type="KEYFRAME")
+    return strip.channelbag(slot, ensure=True).fcurves
+
 arm = bpy.data.objects["Armature"]
 arm.scale = (0.5, 0.5, 0.5)                                  # e.g. 0.01 after an FBX import
 bpy.context.view_layer.update()
@@ -80,7 +104,7 @@ with bpy.context.temp_override(active_object=arm, object=arm, selected_objects=s
     bpy.ops.object.transform_apply(location=False, rotation=True, scale=True)
 bones = set(arm.pose.bones.keys())
 for act in bpy.data.actions:                                 # every action written for this rig
-    for fc in act.fcurves:
+    for fc in action_fcurves(act, arm):
         if fc.data_path.endswith(".location") and fc.data_path.startswith("pose.bones"):
             if fc.data_path.split('"')[1] in bones:
                 for k in fc.keyframe_points:
@@ -95,10 +119,15 @@ print(arm.scale[:])
 import bmesh
 arm = bpy.data.objects["Armature"]
 body = bpy.data.objects["SK_Hero_Body"]
+# Limit Total and Normalize All act on the objects SELECTED IN THE VIEW LAYER, not the override:
+# unselected, they return {'FINISHED'} and change nothing. Select the mesh, and only the mesh.
+for o in bpy.context.view_layer.objects:
+    o.select_set(o == body)
 bpy.context.view_layer.objects.active = body
 with bpy.context.temp_override(object=body, active_object=body):       # >8 influences
     bpy.ops.object.vertex_group_limit_total(group_select_mode='BONE_DEFORM', limit=8)   # 4 for mobile
     bpy.ops.object.vertex_group_normalize_all(group_select_mode='BONE_DEFORM', lock_active=False)
+print("max influences", max((len(v.groups) for v in body.data.vertices), default=0))  # must be <= limit
 for g in [g for g in body.vertex_groups if g.name not in arm.data.bones]:   # groups without bones
     body.vertex_groups.remove(g)
 bm = bmesh.new(); bm.from_mesh(body.data)                    # loose verts, degenerate faces, inside-out

@@ -1,7 +1,8 @@
 # Modeling recipes (verified)
 
 Every block below was run, in this order, in one `blender -b --factory-startup` session on
-Blender 4.0.2. Paste the helpers you need into `blender_python` (they depend on each other
+Blender 4.0.2, and again on 5.2.1 after the geometry-nodes input fix (`set_gn_input`); its 4.x
+branch has not been re-run on a 4.x build since that change. Paste the helpers you need into `blender_python` (they depend on each other
 only as noted). All sizes are metres (1 unit = 1 m). Read results back with `print()`.
 
 ## Scene setup and a box with its pivot at the min corner
@@ -290,7 +291,12 @@ L.new(inst.outputs['Instances'], real.inputs['Geometry'])
 L.new(gi.outputs['Geometry'], join.inputs['Geometry']); L.new(real.outputs['Geometry'], join.inputs['Geometry'])
 L.new(join.outputs['Geometry'], go.inputs['Geometry'])
 gm = crate.modifiers.new("Bolts", 'NODES'); gm.node_group = ng
-gm[dens.identifier] = 40.0                      # modifier inputs are keyed by socket identifier
+def set_gn_input(mod, ident, value):            # ident: the interface socket's .identifier
+    if hasattr(mod, "properties"):              # 5.x: mod[ident] = v raises TypeError
+        getattr(mod.properties.inputs, ident).value = value
+    else:                                       # 4.x: inputs are keyed by socket identifier
+        mod[ident] = value
+set_gn_input(gm, dens.identifier, 40.0)
 ```
 
 ## Measuring (evaluated, world space, cm) and triangle count

@@ -12,7 +12,7 @@ op!(Watch, "device.watch", WatchIn => Empty,
 payload!(#[schemars(rename = "DeviceMirrorStartIn")] MirrorStartIn { pub device: String, pub max_size: Option<u32>, pub bitrate: Option<u32> });
 result!(#[schemars(rename = "DeviceMirrorStartOut")] MirrorStartOut { pub mirror_id: Id, pub width: u32, pub height: u32 });
 op!(MirrorStart, "device.mirror.start", MirrorStartIn => MirrorStartOut,
-    OpMeta::mutation(Scope::Global, 10, "Start a scrcpy-class H.264 mirror; frames on a dedicated native or Tauri connection").actors(Actors::UserOnly).stream("mirror").emits(&["mirror.changed"]));
+    OpMeta::mutation(Scope::Global, 10, "Start a scrcpy-class H.264 mirror; frames on the socket connection that started it").actors(Actors::UserOnly).stream("mirror").emits(&["mirror.changed"]));
 payload!(#[schemars(rename = "DeviceMirrorIdIn")] MirrorIdIn { pub mirror_id: Id });
 op!(MirrorStop, "device.mirror.stop", MirrorIdIn => Empty, OpMeta::mutation(Scope::Global, 10, "Stop a mirror").actors(Actors::UserOnly).emits(&["mirror.changed"]));
 payload!(#[schemars(rename = "DeviceMirrorInputIn")] MirrorInputIn { pub mirror_id: Id, pub event: Value });

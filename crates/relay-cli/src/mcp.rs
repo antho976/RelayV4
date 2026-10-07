@@ -2,7 +2,7 @@
 //! call is still a normal request through the socket door and the engine pipeline.
 
 use anyhow::{Context, Result};
-use relay_bus::registry::{Doors, OpEntry, OpKind, Registry};
+use relay_bus::registry::{OpEntry, OpKind, Registry};
 use relay_bus::{Actor, MailHint, Request};
 use relay_core::socket::Client;
 use relay_core::Instance;
@@ -158,7 +158,6 @@ async fn call_tool(instance: Instance, actor: &Actor, token: Option<&str>, name:
 
 fn exposed(entry: &OpEntry) -> bool {
     entry.meta.stream.is_none()
-        && entry.meta.doors != Doors::TauriOnly
         && !matches!(entry.name, "bus.subscribe" | "bus.unsubscribe")
 }
 

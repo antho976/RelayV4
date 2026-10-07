@@ -40,9 +40,6 @@ fn drop_on(ui: &Ui, kind: &str, source: i64, target: i64) -> Result<(), String> 
 }
 
 pub async fn run(ui: &Rc<Ui>) -> Result<(), String> {
-    assert_eq!(std::env::var("RELAY_INSTANCE").as_deref(), Ok("test"));
-    assert_eq!(std::env::var("RELAY_NATIVE_FIXTURE").as_deref(), Ok("1"));
-    assert!(ui.path.starts_with(std::env::temp_dir()));
     let project = ui.project.get();
     let sidebar_width = ui.sidebar.width();
     let ws = ui.workspaces.borrow()[0].clone();

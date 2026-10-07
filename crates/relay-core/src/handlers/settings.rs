@@ -1,10 +1,14 @@
 //! `settings.*` (BUS.md §10.16): a dotted-path tree stored as leaf rows, overlaid on defaults.
 
 use crate::engine::{Ctx, Engine, IntoBus};
+use crate::guardrail::{self, ConfigScope};
 use relay_bus::error::BusError;
 use relay_bus::ops::notify::{SettingsGet, SettingsReset, SettingsSet, ValueOut};
+use relay_bus::types::{GuardrailConfig, Id};
 use rusqlite::{params, Transaction};
 use serde_json::{json, Map, Value};
+use std::collections::BTreeSet;
+use std::sync::Mutex;
 
 /// Defaults for the top-level keys BUS.md §10.16 names. Each feature fills its subtree in
 /// when it lands; unknown paths are allowed (settings are a tree, not a schema).
@@ -200,8 +204,70 @@ fn delete_under(tx: &Transaction, path: &str) -> Result<(), BusError> {
     Ok(())
 }
 
+// ---------------------------------------------------------------- guardrails
+
+/// The guardrail layers a write at `path` stores: `(settings path, scope to read back, value)`.
+/// Global keys are one layer; each `projects.<id>` and `workspaces.<id>` is its own. Empty
+/// when the write does not reach `guardrails`.
+fn guardrail_layers(path: &str, value: &Value) -> Result<Vec<(String, Option<ConfigScope>, Value)>, BusError> {
+    if !(path.is_empty() || path == "guardrails" || path.starts_with("guardrails.")) {
+        return Ok(Vec::new());
+    }
+    let mut tree = json!({});
+    set_at(&mut tree, path, value.clone());
+    let mut global = match tree.get_mut("guardrails").map(Value::take) {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Object(map)) => map,
+        Some(_) => return Err(BusError::invalid("guardrail.config", "guardrails must be an object")),
+    };
+    let mut layers = Vec::new();
+    for kind in ["projects", "workspaces"] {
+        let scope = |id: Id| if kind == "projects" { ConfigScope::Project(id) } else { ConfigScope::Workspace(id) };
+        match global.remove(kind) {
+            None | Some(Value::Null) => {}
+            Some(Value::Object(by_id)) => {
+                for (id, layer) in by_id {
+                    layers.push((format!("guardrails.{kind}.{id}"), id.parse().ok().map(scope), layer));
+                }
+            }
+            Some(_) => return Err(BusError::invalid("guardrail.config", format!("guardrails.{kind} must be an object keyed by id"))),
+        }
+    }
+    layers.push(("guardrails".to_string(), Some(ConfigScope::Global), Value::Object(global)));
+    Ok(layers)
+}
+
+/// `guardrails` is the one subtree with a fixed shape, and every guardrail check reads it. A key
+/// the typed config does not know is refused at write time, from `settings.set` and
+/// `guardrail.config.set` alike, so a typo cannot reach the store.
+fn check_guardrail_keys(path: &str, value: &Value) -> Result<(), BusError> {
+    for (at, _, mut layer) in guardrail_layers(path, value)? {
+        let unknown = GuardrailConfig::strip_unknown(&mut layer);
+        if !unknown.is_empty() {
+            let keys: Vec<String> = unknown.iter().map(|key| format!("{at}.{key}")).collect();
+            return Err(BusError::invalid(
+                "guardrail.config",
+                format!("unknown guardrail setting {}; guardrail.config.get shows the keys, guardrail.config.set writes them", keys.join(", ")),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The read side of [`check_guardrail_keys`]: a stored key this build does not know is dropped
+/// before the typed read, with one warning per key rather than one per read.
+pub fn ignore_unknown_guardrail_keys(root: &mut Value) {
+    static WARNED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+    for key in GuardrailConfig::strip_unknown(root) {
+        if WARNED.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(key.clone()) {
+            tracing::warn!(key = %key, "ignoring a stored guardrail setting this build does not know");
+        }
+    }
+}
+
 pub fn set(tx: &Transaction, path: &str, value: &Value, now: &str) -> Result<(), BusError> {
     valid_path(path)?;
+    check_guardrail_keys(path, value)?;
     delete_under(tx, path)?;
     let mut leaves = Vec::new();
     flatten(path, value, &mut leaves);
@@ -227,6 +293,14 @@ pub fn register(e: &mut Engine) {
     e.register::<SettingsSet>(|ctx: &mut Ctx, p| {
         let before = get(ctx.tx(), Some(&p.path))?;
         set(ctx.tx(), &p.path, &p.value, &ctx.now.clone())?;
+        // Read the touched guardrail layers back, as guardrail.config.set does: a value of the
+        // wrong type or out of range fails the typed read, and the transaction rolls back.
+        for (_, scope, _) in guardrail_layers(&p.path, &p.value)? {
+            match scope.map(|scope| guardrail::config_for(ctx.tx(), scope)) {
+                Some(Err(error)) if error.code != "project.not_found" => return Err(error),
+                _ => {}
+            }
+        }
         set_bounded_undo(ctx, &p.path, before);
         let value = get(ctx.tx(), Some(&p.path))?;
         ctx.emit("settings.changed", json!({ "path": p.path, "value": value }));
@@ -236,6 +310,8 @@ pub fn register(e: &mut Engine) {
         let path = p.path.unwrap_or_default();
         valid_path(&path)?;
         let before = get(ctx.tx(), Some(&path))?;
+        // No guardrail read-back here: a reset only removes overrides, and it is how a bad
+        // `guardrails.*` row is cleared, so it must not depend on the rest reading cleanly.
         delete_under(ctx.tx(), &path)?;
         set_bounded_undo(ctx, &path, before);
         let value = get(ctx.tx(), Some(&path))?;
