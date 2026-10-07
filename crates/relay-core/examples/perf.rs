@@ -1101,7 +1101,6 @@ fn cases() -> Vec<Case> {
     fixed_as(&mut c, "git.diff.staged", "git.diff", U, Mid, json!({"project_id": 1, "staged": true}));
     per(&mut c, "git.diff.file", "git.diff.file", U, Mid, |fx| json!({"project_id": 1, "path": fx.dirty_file}));
     fixed(&mut c, "git.log", U, Mid, json!({"project_id": 1, "limit": 50}));
-    fixed_as(&mut c, "git.log.graph", "git.log", U, Mid, json!({"project_id": 1, "limit": 50, "graph": true}));
     per(&mut c, "git.show", "git.show", U, Mid, |fx| json!({"project_id": 1, "sha": fx.head_sha}));
     fixed(&mut c, "git.branches", U, Mid, json!({"project_id": 1}));
     created(&mut c, "git.branch.create", "git.branch.create", U, Mid, move |fx| json!({"project_id": 1, "name": format!("perf/b-{}", one(fx)), "checkout": false}), |r| ("git.branch.delete", json!({"project_id": 1, "name": r["name"].as_str().or_else(|| r["branch"].as_str()).unwrap_or("")})));
