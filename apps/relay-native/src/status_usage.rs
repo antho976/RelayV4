@@ -443,7 +443,7 @@ impl Ui {
         *self.usage.timer.borrow_mut() = Some(source);
     }
 
-    fn set_usage_pref(self: &Rc<Self>, path: &'static str, value: Value) {
+    fn set_usage_pref(self: &Rc<Self>, path: &str, value: Value) {
         if pref_matches(&self.usage.prefs.borrow(), path, &value) {
             return;
         }
@@ -453,8 +453,8 @@ impl Ui {
             self.schedule_usage();
         }
         let ui = self.clone();
+        let payload = json!({"path": format!("usage.{path}"), "value": value});
         glib::spawn_future_local(async move {
-            let payload = json!({"path": format!("usage.{path}"), "value": value});
             if let Err(e) = ui.call("settings.set", payload).await {
                 ui.show_error(&e.to_string());
                 ui.reload_usage_prefs();
@@ -784,27 +784,22 @@ impl Ui {
                 chip.set_tooltip_text(Some(&format!("Show {name}'s {} limit", meter.title().to_lowercase())));
                 controls.chips.push((chip.downgrade(), provider, meter.key()));
                 let weak = Rc::downgrade(self);
-                let path: &'static str = match (provider, meter) {
-                    ("claude", Meter::FiveHour) => "claude.five_hour",
-                    ("claude", Meter::Weekly) => "claude.weekly",
-                    ("claude", Meter::Fable) => "claude.fable",
-                    (_, Meter::FiveHour) => "codex.five_hour",
-                    _ => "codex.weekly",
-                };
+                // The strip reads `prefs[provider][meter.key()]`; the path is built from the same.
+                let path = format!("{provider}.{}", meter.key());
                 chip.connect_toggled(move |chip| {
                     if let Some(ui) = weak.upgrade() {
-                        ui.set_usage_pref(path, json!(chip.is_active()));
+                        ui.set_usage_pref(&path, json!(chip.is_active()));
                     }
                 });
                 chips.append(&chip);
             }
             let weak = Rc::downgrade(self);
             let toggled = chips.clone();
-            let path = if provider == "claude" { "claude.enabled" } else { "codex.enabled" };
+            let path = format!("{provider}.enabled");
             switch.connect_active_notify(move |switch| {
                 toggled.set_sensitive(switch.is_active());
                 if let Some(ui) = weak.upgrade() {
-                    ui.set_usage_pref(path, json!(switch.is_active()));
+                    ui.set_usage_pref(&path, json!(switch.is_active()));
                 }
             });
             row.append(&chips);

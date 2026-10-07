@@ -15,6 +15,8 @@ pub(crate) fn startup(ui: &Rc<Ui>) {
             ui.provider_updates_checked.set(false);
             return;
         };
+        // One notice for both providers: a second message would replace the first unread.
+        let mut outcomes = Vec::new();
         for provider in ["claude", "codex"] {
             if config["value"][provider]["auto_update"] == true {
                 match ui
@@ -25,12 +27,15 @@ pub(crate) fn startup(ui: &Rc<Ui>) {
                     .await
                 {
                     Ok(result) if result["started"] != true => {
-                        ui.show_error(&format!("{provider}: {}", text(&result, "message")))
+                        outcomes.push(format!("{provider}: {}", text(&result, "message")))
                     }
-                    Err(error) => ui.show_error(&format!("{provider} update: {error}")),
+                    Err(error) => outcomes.push(format!("{provider} update: {error}")),
                     _ => {}
                 }
             }
+        }
+        if !outcomes.is_empty() {
+            ui.show_error(&outcomes.join(" · "));
         }
     });
 }
@@ -48,13 +53,12 @@ pub(crate) fn update(ui: &Rc<Ui>, provider: &'static str) {
     });
 }
 
+/// The engine sends `notify.new` with every finished update, and that repaints the Settings
+/// page's provider cards; nothing else on screen shows a provider version.
 pub(crate) fn event(ui: &Rc<Ui>, value: &Value) {
     ui.show_error(&format!(
         "{}: {}",
         text(value, "provider"),
         text(value, "message")
     ));
-    if text(value, "state") != "updating" {
-        ui.refresh();
-    }
 }

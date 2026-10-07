@@ -28,17 +28,6 @@ pub(crate) fn explain_error(op: &str, error: &Error) -> String {
     }
 }
 
-/// For a caller that kept only the message: prefer `explain_error`, which reads the code.
-pub(crate) fn explain(error: &str) -> String {
-    if error.contains("plugin.")
-        && (error.contains("unknown field") || error.contains("not implemented"))
-    {
-        STALE_ENGINE.to_string()
-    } else {
-        error.to_string()
-    }
-}
-
 pub async fn refresh(ui: &Rc<Ui>, project: i64) {
     market::refresh(ui, &SPEC, project).await
 }

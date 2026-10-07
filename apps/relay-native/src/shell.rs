@@ -866,12 +866,18 @@ impl Ui {
             }
         });
     }
-    pub(super) fn project_skills(self: &Rc<Self>) {
-        let project = self.project.get();
-        let Some((panel, body)) = self.sheet("Agent skills", 390, 560) else {
-            return;
-        };
-        panel.top(560);
+    /// The frame the Agent skills and Plugins sheets share, presented: the project's name, an
+    /// intro, a list showing `loading` until it is filled, a hidden feedback line, and a footer
+    /// whose key closes the sheet and opens `page`. Returns the name, the list and the line.
+    fn switch_sheet(
+        self: &Rc<Self>,
+        panel: &Rc<crate::panel::Panel>,
+        body: &gtk::Box,
+        project: i64,
+        intro: &str,
+        loading: &str,
+        (scope, manage, page): (&str, &str, &'static str),
+    ) -> (String, gtk::Box, gtk::Label) {
         panel.add_css_class("agent-skills-popover");
         let name = self
             .projects
@@ -881,16 +887,12 @@ impl Ui {
             .map(|p| text(p, "name").to_owned())
             .unwrap_or_else(|| "No project".into());
         body.set_spacing(0);
-        let scope = label(&name.to_uppercase(), "section-label");
-        body.append(&scope);
-        let intro = label(
-            "Change the project instructions used when agents start or resume. Running agents keep the context already loaded.",
-            "agent-skills-intro",
-        );
+        body.append(&label(&name.to_uppercase(), "section-label"));
+        let intro = label(intro, "agent-skills-intro");
         intro.set_wrap(true);
         body.append(&intro);
         let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        list.append(&label("Loading skills…", "dim"));
+        list.append(&label(loading, "dim"));
         body.append(&list);
         let feedback = label("", "dim");
         feedback.set_wrap(true);
@@ -898,23 +900,39 @@ impl Ui {
         body.append(&feedback);
         let footer = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         footer.add_css_class("agent-skills-footer");
-        let scope = label("PROJECT-WIDE", "section-label");
+        let scope = label(scope, "section-label");
         scope.set_hexpand(true);
         footer.append(&scope);
-        let manage = button("Open skill library", "quiet");
+        let manage = button(manage, "quiet");
         footer.append(&manage);
         body.append(&footer);
         let weak = Rc::downgrade(self);
-        let panel_weak = Rc::downgrade(&panel);
+        let panel_weak = Rc::downgrade(panel);
         manage.connect_clicked(move |_| {
             if let Some(panel) = panel_weak.upgrade() {
                 panel.close();
             }
             if let Some(ui) = weak.upgrade() {
-                ui.navigate("skills");
+                ui.navigate(page);
             }
         });
         panel.present();
+        (name, list, feedback)
+    }
+    pub(super) fn project_skills(self: &Rc<Self>) {
+        let project = self.project.get();
+        let Some((panel, body)) = self.sheet("Agent skills", 390, 560) else {
+            return;
+        };
+        panel.top(560);
+        let (name, list, feedback) = self.switch_sheet(
+            &panel,
+            &body,
+            project,
+            "Change the project instructions used when agents start or resume. Running agents keep the context already loaded.",
+            "Loading skills…",
+            ("PROJECT-WIDE", "Open skill library", "skills"),
+        );
         let ui = self.clone();
         let panel = Rc::downgrade(&panel);
         glib::spawn_future_local(async move {
@@ -977,7 +995,7 @@ impl Ui {
             }
         });
     }
-    /// The plugin switches of one project, opened from its row in the sidebar.
+    /// The plugin switches of `project` (the agents toolbar's Plugins key passes the one in view).
     pub(super) fn project_plugins(self: &Rc<Self>, project: i64) {
         let Some((panel, body)) = self.sheet("Plugins", 440, 640) else {
             return;
@@ -985,48 +1003,14 @@ impl Ui {
         panel.top(640);
         // Filled asynchronously; without a floor the panel keeps its "Loading" height.
         panel.min_height(460);
-        panel.add_css_class("agent-skills-popover");
-        let name = self
-            .projects
-            .borrow()
-            .iter()
-            .find(|p| p["id"].as_i64() == Some(project))
-            .map(|p| text(p, "name").to_owned())
-            .unwrap_or_else(|| "No project".into());
-        body.set_spacing(0);
-        body.append(&label(&name.to_uppercase(), "section-label"));
-        let intro = label(
+        let (_, list, feedback) = self.switch_sheet(
+            &panel,
+            &body,
+            project,
             "A plugin that is on gives every agent here its skills, standing rules and MCP tools. Skills reach running agents now; rules and tools apply when an agent starts or resumes.",
-            "agent-skills-intro",
+            "Loading plugins…",
+            ("THIS PROJECT", "All plugins", "plugins"),
         );
-        intro.set_wrap(true);
-        body.append(&intro);
-        let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        list.append(&label("Loading plugins…", "dim"));
-        body.append(&list);
-        let feedback = label("", "dim");
-        feedback.set_wrap(true);
-        feedback.set_visible(false);
-        body.append(&feedback);
-        let footer = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        footer.add_css_class("agent-skills-footer");
-        let scope = label("THIS PROJECT", "section-label");
-        scope.set_hexpand(true);
-        footer.append(&scope);
-        let manage = button("All plugins", "quiet");
-        footer.append(&manage);
-        body.append(&footer);
-        let weak = Rc::downgrade(self);
-        let panel_weak = Rc::downgrade(&panel);
-        manage.connect_clicked(move |_| {
-            if let Some(panel) = panel_weak.upgrade() {
-                panel.close();
-            }
-            if let Some(ui) = weak.upgrade() {
-                ui.navigate("plugins");
-            }
-        });
-        panel.present();
         let ui = self.clone();
         glib::spawn_future_local(async move {
             match ui.call("plugin.list", json!({"project_id":project})).await {
@@ -1072,7 +1056,7 @@ impl Ui {
                 }
                 Err(error) => {
                     clear(&list);
-                    feedback.set_text(&crate::tools::plugins::explain(&error.to_string()));
+                    feedback.set_text(&crate::tools::plugins::explain_error("plugin.list", &error));
                     feedback.set_visible(true);
                 }
             }
@@ -1226,37 +1210,9 @@ impl Ui {
                 ui.font_size
                     .set(value["value"].as_f64().unwrap_or(9.75).clamp(8.0, 24.0));
             }
-            let colors = match ui.palette.borrow().as_str() {
-                "dark" => [
-                    "#0a0b0d", "#101114", "#16171b", "#1e1f24", "#08090a", "#eef0f2", "#a3a7ad",
-                    "#202228", "#70747b", "#33363d",
-                ],
-                "oled" => [
-                    "#000000", "#000000", "#0d0d0e", "#161618", "#000000", "#ececea", "#a5a5a3",
-                    "#1f1f22", "#77777a", "#333336",
-                ],
-                _ => [
-                    "#0e0e10", "#141416", "#1b1b1e", "#232327", "#0a0a0b", "#ececea", "#a5a5a3",
-                    "#252529", "#77777a", "#37373c",
-                ],
-            };
+            let colors = crate::fonts::palette(&ui.palette.borrow());
             let css: [String; 10] = std::array::from_fn(|i| {
-                format!(
-                    "@define-color {} {};",
-                    [
-                        "wall",
-                        "console",
-                        "slab",
-                        "wash",
-                        "screen",
-                        "ink",
-                        "secondary",
-                        "edge",
-                        "faint",
-                        "strong"
-                    ][i],
-                    colors[i]
-                )
+                format!("@define-color {} {};", crate::fonts::TOKENS[i], colors[i])
             });
             let mut css = css.join("\n");
             let alpha = alpha
@@ -1288,14 +1244,8 @@ impl Ui {
             } else {
                 (((alpha + 0.05).min(1.) - wall) / (1. - wall)).clamp(0., 1.)
             };
-            css += &format!("\n@define-color plate alpha({},{plate:.3});", colors[4]);
-            css += &format!(
-                "\n@define-color backbox alpha({},{});\n@define-color backbox_chrome alpha({},{});",
-                colors[0],
-                alpha.max(0.84),
-                colors[1],
-                alpha.max(0.84)
-            );
+            css += &format!("\n@define-color plate alpha({},{plate:.3});", colors[crate::fonts::SCREEN]);
+            css += &format!("\n@define-color backbox_chrome alpha({},{});", colors[1], alpha.max(0.84));
             ui.appearance.load_from_string(&css);
             ui.wallpaper_dim.set_opacity(
                 dim.ok()

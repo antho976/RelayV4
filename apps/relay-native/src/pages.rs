@@ -51,7 +51,6 @@ pub async fn refresh(ui: &Rc<Ui>, name: &str, project: i64) {
         "board" => ("task.list", "tasks"),
         "mailbox" => ("mailbox.list", "messages"),
         "guardrails" => ("guardrail.holds.list", "holds"),
-        "notes" => ("notes.list", "notes"),
         "modules" => ("module.list", "modules"),
         _ => return,
     };
@@ -97,10 +96,6 @@ pub async fn refresh(ui: &Rc<Ui>, name: &str, project: i64) {
             }
         }
     }
-    if name == "notes" {
-        note_pages::workspace(ui, name, project, &data);
-        return;
-    }
     if name == "board" {
         board_view::show(ui, &ui.pages[name], project, data);
         return;
@@ -114,21 +109,16 @@ pub async fn refresh(ui: &Rc<Ui>, name: &str, project: i64) {
         if name == "modules" {
             page.append(&board_switcher(ui, "modules"));
         }
-        if name != "board" {
-            page.append(&label(
-                match name {
-                    "board" => "Board",
-                    "mailbox" => "Mailbox",
-                    "guardrails" => "Guardrails",
-                    "modules" => "Modules",
-                    _ => "Notes",
-                },
-                "title",
-            ));
-        }
+        page.append(&label(
+            match name {
+                "mailbox" => "Mailbox",
+                "modules" => "Modules",
+                _ => "Guardrails",
+            },
+            "title",
+        ));
         match name {
             "mailbox" => mail_composer(ui, page, project),
-            "notes" => note_composer(ui, page, project),
             "modules" => note_pages::module_composer(ui, page, project),
             _ => page.append(&paragraph(
                 "Answer agents that need an exception, decide which held actions may proceed, and see the exceptions still in force.",
@@ -147,10 +137,8 @@ pub async fn refresh(ui: &Rc<Ui>, name: &str, project: i64) {
     clear(&body);
     if data.is_empty() {
         body.append(&paragraph(match name {
-            "board" => "No tasks yet. Add a task above to assign work.",
             "mailbox" => "No messages in this project.",
-            "guardrails" => "Nothing is waiting for you: no exception requests and no held actions.",
-            _ => "No project notes yet.",
+            _ => "No modules yet. Create one above.",
         }));
     }
     match name {
@@ -190,6 +178,7 @@ pub async fn refresh(ui: &Rc<Ui>, name: &str, project: i64) {
                 body.append(&row);
             }
         }
+        // Unreachable (Notes has its own window); goes with note_pages::note_row.
         "notes" => {
             for note in data {
                 note_pages::note_row(ui, &body, note);
@@ -405,57 +394,6 @@ fn mail_composer(ui: &Rc<Ui>, page: &gtk::Box, project: i64) {
                         buffer.set_text("");
                     }
                     ui.show_error(&format!("Message: {}", crate::app::text(&v, "delivery")));
-                    ui.refresh_page();
-                }
-                Err(e) => ui.show_error(&e.to_string()),
-            }
-            b.set_sensitive(true);
-        });
-    });
-}
-fn note_composer(ui: &Rc<Ui>, page: &gtk::Box, project: i64) {
-    let title = gtk::Entry::builder().placeholder_text("Note title").build();
-    let body = gtk::TextView::new();
-    body.set_size_request(-1, 90);
-    body.set_wrap_mode(gtk::WrapMode::WordChar);
-    page.append(&title);
-    page.append(&body);
-    let add = button("Add note", "primary");
-    page.append(&add);
-    let weak = Rc::downgrade(ui);
-    add.connect_clicked(move |b| {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        let name = title.text().trim().to_string();
-        if name.is_empty() {
-            return;
-        }
-        let buffer = body.buffer();
-        let text = buffer
-            .text(&buffer.start_iter(), &buffer.end_iter(), false)
-            .to_string();
-        let title = title.clone();
-        b.set_sensitive(false);
-        let b = b.clone();
-        glib::spawn_future_local(async move {
-            match ui
-                .call(
-                    "notes.create",
-                    json!({"project_id":project,"title":name,"body":text}),
-                )
-                .await
-            {
-                Ok(_) => {
-                    if title.text().trim() == name
-                        && buffer
-                            .text(&buffer.start_iter(), &buffer.end_iter(), false)
-                            .as_str()
-                            == text
-                    {
-                        title.set_text("");
-                        buffer.set_text("");
-                    }
                     ui.refresh_page();
                 }
                 Err(e) => ui.show_error(&e.to_string()),
