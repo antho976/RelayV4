@@ -1081,6 +1081,7 @@ impl Ui {
             if let Some(notes) = owned.notes_window.borrow_mut().take() {
                 notes.window.destroy();
             }
+            crate::mirror::close_all();
             owned.generation.set(owned.generation.get() + 1);
             owned.connected.set(false);
             owned.client.borrow_mut().take();
@@ -1160,6 +1161,9 @@ impl Ui {
         }
         self.panes.borrow_mut().clear();
         self.ordered.borrow_mut().clear();
+        // The first refresh after connecting re-applies the saved pane order and focus, and no
+        // save writes the cleared wall over them before it has.
+        self.restored_project.set(0);
         self.layout();
         self.show_error("Connecting to the Relay engine…");
         let ui = self.clone();
@@ -1400,6 +1404,7 @@ impl Ui {
             while ui.refresh_dirty.replace(false) {
                 let generation = ui.generation.get();
                 let layout_revision = ui.layout_revision.get();
+                let layout_project = ui.project.get();
                 if ui.registry_dirty.replace(false) {
                     let (projects, workspaces) = tokio::join!(
                         ui.call("project.list", json!({})),
@@ -1467,7 +1472,7 @@ impl Ui {
                     Ok(_) => {}
                     Err(e) => ui.show_error(&e.to_string()),
                 }
-                ui.restore_layout(layout_revision).await;
+                ui.restore_layout(layout_project, layout_revision).await;
                 crate::pages::refresh_notes(&ui);
                 if matches!(ui.page.borrow().as_str(), "board" | "dashboard") {
                     ui.refresh_page();

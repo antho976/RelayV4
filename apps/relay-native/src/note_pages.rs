@@ -1365,7 +1365,7 @@ fn module_detail(ui: &Rc<Ui>, module: Value) {
         move || json!({"name":name.text().trim(),"priority":chosen(&priority),"icon":if icon.text().trim().is_empty(){Value::Null}else{json!(icon.text().trim())}}),
     );
     let d = Draft::new(ui, "Module", module.clone(), snapshot, form);
-    d.controls(ui, "module.get", "module.update", "module_id", id);
+    d.controls(ui, "module.update", "module_id", id);
     for column in super::task_pages::COLUMNS {
         d.form.append(&label(
             &column.replace('_', " ").to_uppercase(),

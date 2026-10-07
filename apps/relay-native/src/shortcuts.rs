@@ -34,6 +34,12 @@ pub fn valid(chord: &str) -> bool {
     })
 }
 
+/// Ctrl+letter is a control character a terminal program reads (Ctrl+K kills to the end of
+/// the line, Ctrl+N is next history), so a focused agent terminal keeps it.
+pub fn terminal_owns(chord: &str) -> bool {
+    parse(chord).is_some_and(|(mods, key)| mods == ModifierType::CONTROL_MASK && key.is_ascii_alphabetic())
+}
+
 pub fn matches(key: Key, mods: ModifierType, chord: &str) -> bool {
     let mask = ModifierType::CONTROL_MASK
         | ModifierType::META_MASK
@@ -58,4 +64,7 @@ fn chords_preserve_modifiers_and_allow_disabling() {
     assert!(!valid("K"));
     assert!(!valid("Ctrl+Foo"));
     assert!(!valid("Ctrl+K+L"));
+    assert!(terminal_owns("Ctrl+K"));
+    assert!(!terminal_owns("Ctrl+1"));
+    assert!(!terminal_owns("Ctrl+Shift+B"));
 }

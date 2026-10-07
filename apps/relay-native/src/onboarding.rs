@@ -513,12 +513,24 @@ impl Setup {
             }
         }
         glib::spawn_future_local(async move {
+            // A workspace this attempt created is kept only if its project is added too, so a
+            // retry uses the directory and name as they are then, not as they were.
+            let fresh = RefCell::new(None::<Value>);
             let result = async {
                 if setup.workspace.borrow()["id"].is_null() {
                     let path = setup.workspace_path.text().trim().to_owned();
                     if !std::path::Path::new(&path).is_absolute() { return Err(Error::Protocol("Choose an absolute workspace directory.".into())); }
                     let known = setup.ui.workspaces.borrow().iter().find(|w| text(w,"path")==path).cloned();
-                    let workspace = if let Some(known) = known { known } else { setup.ui.call("workspace.create",json!({"path":path,"name":if setup.workspace_name.text().trim().is_empty() {None} else {Some(setup.workspace_name.text().trim().to_owned())}})).await? };
+                    let workspace = if let Some(known) = known { known } else {
+                        match setup.ui.call("workspace.create",json!({"path":path,"name":if setup.workspace_name.text().trim().is_empty() {None} else {Some(setup.workspace_name.text().trim().to_owned())}})).await {
+                            Ok(workspace) => { *fresh.borrow_mut() = Some(workspace["id"].clone()); workspace }
+                            // The same directory spelled differently (a trailing slash, a symlink).
+                            Err(Error::Bus(e)) if e.code == "workspace.exists" && e.details.as_ref().is_some_and(|d| d["workspace_id"].is_i64()) => {
+                                json!({"id": e.details.as_ref().map(|d| d["workspace_id"].clone()), "path": path})
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    };
                     *setup.workspace.borrow_mut() = workspace;
                 }
                 let saved = setup.created_project.borrow().clone();
@@ -532,6 +544,13 @@ impl Setup {
                 if !source.is_empty() { setup.ui.call("app.import.v3",json!({"source":source,"project_id":project["id"]})).await?; }
                 Ok::<Value,Error>(project)
             }.await;
+            if result.is_err() && setup.created_project.borrow().is_none() {
+                if let Some(id) = fresh.take() {
+                    // Empty, so this never removes a project; a refusal leaves it in the sidebar.
+                    let _ = setup.ui.call("workspace.remove", json!({"workspace_id": id})).await;
+                    *setup.workspace.borrow_mut() = Value::Null;
+                }
+            }
             setup.busy.set(false);
             setup.body.set_sensitive(true);
             setup.update_action();

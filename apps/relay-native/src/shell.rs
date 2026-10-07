@@ -333,9 +333,10 @@ impl Ui {
         };
         json!({"page":page,"agent_layout":*self.mode.borrow(),"columns":self.columns.get(),"focused":*self.focused.borrow(),"order":*self.ordered.borrow(),"sidebar":if self.page.borrow().as_str() == "settings" { self.settings_sidebar.get() } else { self.sidebar.is_visible() },"split":self.wall_split.position(),"width":self.window.width(),"height":self.window.height(),"project_tools":self.editor.layout_state()})
     }
-    pub(super) async fn restore_layout(self: &Rc<Self>, revision: u64) {
-        let project = self.project.get();
-        if self.restored_project.get() == project {
+    /// `project` and `revision` are what the refresh saw when it began: an iteration that
+    /// outlived a project switch must not mark, or save over, the new project's layout.
+    pub(super) async fn restore_layout(self: &Rc<Self>, project: i64, revision: u64) {
+        if self.project.get() != project || self.restored_project.get() == project {
             return;
         }
         self.restored_project.set(project);
@@ -356,12 +357,16 @@ impl Ui {
         if self.project.get() != project || (self.layout_revision.get() != revision && !explicit) {
             return;
         }
-        if let Ok(v) = result {
-            if !v["value"].is_null() {
+        match result {
+            Ok(v) if !v["value"].is_null() => {
                 let applying = self.applying_ui.replace(true);
                 self.apply_layout_keeping(&v["value"], explicit);
                 self.applying_ui.set(applying);
             }
+            Ok(_) => {}
+            // Unread is not restored: retry on the next refresh rather than let a save
+            // replace a layout that was never applied.
+            Err(_) => self.restored_project.set(0),
         }
         self.refresh_page();
     }
@@ -895,23 +900,12 @@ impl Ui {
                         )));
                         row.append(&toggle);
                         list.append(&row);
-                        let weak = Rc::downgrade(&ui);
                         let feedback = feedback.clone();
-                        toggle.connect_state_set(move |key,on| {
-                            if let Some(ui) = weak.upgrade() {
-                                let key = key.clone();
-                                let feedback = feedback.clone();
-                                let id = skill["id"].clone();
-                                key.set_sensitive(false);
-                                glib::spawn_future_local(async move {
-                                    match ui.call("skill.enable", json!({"skill_id":id,"project_id":project,"enabled":on})).await {
-                                        Ok(_) => feedback.set_visible(false),
-                                        Err(error) => { key.set_active(!on); feedback.set_text(&error.to_string()); feedback.set_visible(true); }
-                                    }
-                                    key.set_sensitive(true);
-                                });
+                        crate::tools::enable_switch(&ui, &toggle, "skill.enable", "skill_id", skill["id"].clone(), project, move |_, result| {
+                            match result {
+                                Ok(_) => feedback.set_visible(false),
+                                Err(error) => { feedback.set_text(&error); feedback.set_visible(true); }
                             }
-                            glib::Propagation::Proceed
                         });
                     }
                 }
@@ -1100,16 +1094,24 @@ impl Ui {
             if !ui.panels.borrow().is_empty() {
                 return glib::Propagation::Proceed;
             }
+            // Capture runs before the focused terminal sees the key.
+            let in_terminal = GtkWindowExt::focus(&ui.window).is_some_and(|w| {
+                w.is::<vte4::Terminal>() || w.ancestor(vte4::Terminal::static_type()).is_some()
+            });
             for (action, _, fallback) in crate::shortcuts::DEFAULTS {
                 let bindings = ui.keybindings.borrow();
                 let chord = bindings[action].as_str().unwrap_or(fallback);
-                if !crate::shortcuts::matches(key, mods, chord) {
+                if !crate::shortcuts::matches(key, mods, chord)
+                    || (in_terminal && crate::shortcuts::terminal_owns(chord))
+                {
                     continue;
                 }
                 drop(bindings);
                 match action {
                     "palette" => ui.command_palette(),
                     "agents" | "code" | "board" | "settings" => ui.navigate(action),
+                    // Rebuilding an open sheet would discard what is being typed into it.
+                    "new_session" if ui.launch.reveals_child() => {}
                     "new_session" => ui.show_launch(None),
                     "sidebar" => {
                         ui.sidebar.set_visible(!ui.sidebar.is_visible());
