@@ -793,3 +793,22 @@ fn dispatch_with_create_starts_the_session_and_a_refused_one_leaves_nothing_behi
     assert_eq!(ok(e, "task.get", json!({"task_id":other["id"]}))["column"], "backlog");
     ok(e, "session.close", json!({"session":name}));
 }
+
+#[test]
+fn task_list_is_paged_and_a_summary_leaves_out_the_long_fields() {
+    let f = Fixture::new();
+    let e = &f.engine;
+    for n in 0..5 {
+        f.task(&format!("Task {n}"), json!({"body": "a long body", "changelog": "notes"}));
+    }
+    let first = ok(e, "task.list", json!({"project_id":1,"limit":2}));
+    assert_eq!(first["tasks"].as_array().unwrap().len(), 2);
+    assert_eq!(first["next_offset"], 2);
+    let last = ok(e, "task.list", json!({"project_id":1,"limit":2,"offset":4}));
+    assert_eq!(last["tasks"].as_array().unwrap().len(), 1);
+    assert!(last.get("next_offset").is_none());
+    let all = ok(e, "task.list", json!({"project_id":1}));
+    assert_eq!(all["tasks"].as_array().unwrap().len(), 5, "the default page holds a normal board");
+    let summary = ok(e, "task.list", json!({"project_id":1,"summary":true}));
+    assert!(summary["tasks"].as_array().unwrap().iter().all(|t| t["body"] == "" && t["changelog"] == "" && t["title"] != ""));
+}

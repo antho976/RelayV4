@@ -720,6 +720,10 @@ fn discard_created(engine: &Engine, created: &[String]) {
     }
 }
 
+/// `task.list` page size when the caller names none, and the most it may ask for.
+const TASK_PAGE: u32 = 1000;
+const TASK_PAGE_MAX: u32 = 2000;
+
 pub fn register(e: &mut Engine) {
     e.register::<Create>(|ctx: &mut Ctx, p| {
         crate::handlers::workspace::get_project(ctx.tx(), p.project_id)?;
@@ -847,13 +851,28 @@ pub fn register(e: &mut Engine) {
             "updated" => sql.push_str(" ORDER BY updated_at DESC,id DESC"),
             _ => sql.push_str(" ORDER BY CASE col WHEN 'backlog' THEN 0 WHEN 'in_review' THEN 1 WHEN 'ready' THEN 2 WHEN 'active' THEN 3 ELSE 4 END,position,id"),
         }
+        // The reply is bounded: every task ever made, done ones included, each with its body,
+        // changelog and roll-up, grew past what a client accepts on one line (RA-027).
+        let limit = p.limit.unwrap_or(TASK_PAGE).clamp(1, TASK_PAGE_MAX);
+        let offset = p.offset.unwrap_or(0);
+        sql.push_str(" LIMIT ? OFFSET ?");
+        args.push(Box::new(limit as i64 + 1));
+        args.push(Box::new(offset as i64));
         // A dozen filter shapes at most, and the store's statement cache holds 128: the built
         // statement is compiled once per shape, not once per call.
         let mut stmt=ctx.tx().prepare_cached(&sql).bus()?;
         let mut rows=stmt.query(rusqlite::params_from_iter(args.iter().map(|v| v.as_ref()))).bus()?;
         let mut tasks=Vec::new();
         while let Some(row)=rows.next().bus()? { tasks.push(row_task(ctx.tx(), row).bus()?); }
-        Ok(ListOut { tasks })
+        let next_offset = (tasks.len() > limit as usize).then_some(offset + limit);
+        tasks.truncate(limit as usize);
+        if p.summary.unwrap_or(false) {
+            for task in &mut tasks {
+                task.body.clear();
+                task.changelog.clear();
+            }
+        }
+        Ok(ListOut { tasks, next_offset })
     });
 
     e.register::<Update>(|ctx: &mut Ctx, p| {
@@ -1277,7 +1296,7 @@ pub fn register(e: &mut Engine) {
         for id in ids {
             tasks.push(get_task(ctx.tx(), id, false)?);
         }
-        Ok(ListOut { tasks })
+        Ok(ListOut { tasks, next_offset: None })
     });
 
     e.register::<LabelAdd>(|ctx: &mut Ctx, p| {

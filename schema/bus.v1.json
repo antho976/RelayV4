@@ -7194,6 +7194,31 @@
           "format": "int64",
           "description": "`Some(Some(id))` = children of that task, `Some(None)` = roots only, absent = every task.",
           "default": null
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "Page size, default 1000, at most 2000. Done cards sort last, so a page cut short drops\nthe oldest finished work first."
+        },
+        "offset": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "Skip this many tasks of the ordered result: the previous page's `next_offset`."
+        },
+        "summary": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Leave each task's `body` and `changelog` empty: a board needs titles, not essays."
         }
       }
     },
@@ -7205,6 +7230,15 @@
           "items": {
             "$ref": "#/$defs/Task"
           }
+        },
+        "next_offset": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "Set when more tasks match than this page holds: pass it as `offset`."
         }
       },
       "required": [

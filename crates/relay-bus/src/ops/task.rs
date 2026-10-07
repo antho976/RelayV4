@@ -44,8 +44,20 @@ payload!(#[schemars(rename = "TaskListIn")] ListIn {
     pub session: Option<String>,
     /// `Some(Some(id))` = children of that task, `Some(None)` = roots only, absent = every task.
     #[serde(default, deserialize_with = "crate::nullable")] pub parent_id: Option<Option<Id>>,
+    /// Page size, default 1000, at most 2000. Done cards sort last, so a page cut short drops
+    /// the oldest finished work first.
+    pub limit: Option<u32>,
+    /// Skip this many tasks of the ordered result: the previous page's `next_offset`.
+    pub offset: Option<u32>,
+    /// Leave each task's `body` and `changelog` empty: a board needs titles, not essays.
+    pub summary: Option<bool>,
 });
-result!(#[schemars(rename = "TaskListOut")] ListOut { pub tasks: Vec<Task> });
+result!(#[schemars(rename = "TaskListOut")] ListOut {
+    pub tasks: Vec<Task>,
+    /// Set when more tasks match than this page holds: pass it as `offset`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<u32>,
+});
 op!(List, "task.list", ListIn => ListOut, OpMeta::query(Scope::Global, 7, "Tasks, filtered; project_id optional for cross-project views"));
 
 payload!(#[schemars(rename = "TaskUpdateIn")] UpdateIn {
