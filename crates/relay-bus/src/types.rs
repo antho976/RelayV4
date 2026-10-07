@@ -650,6 +650,9 @@ pub struct Skill {
     pub body: String,
     pub source_url: Option<String>,
     pub source_path: Option<String>,
+    /// The branch or tag a GitHub skill was installed from; `None` is the repository's
+    /// default branch (or a local skill). A refresh pulls this ref again.
+    pub source_ref: Option<String>,
     pub revision: Option<String>,
     pub enabled_in: Vec<Id>,
     pub created_at: Ts,

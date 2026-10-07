@@ -23,6 +23,8 @@ pub struct DownloadedSkill {
     pub body: String,
     pub source_url: String,
     pub source_path: String,
+    /// The branch or tag cloned; `None` is the repository's default branch.
+    pub source_ref: Option<String>,
     pub revision: String,
     /// The skill's whole folder, staged outside the clone: reference documents and scripts a
     /// `SKILL.md` points at are part of the skill, not decoration (D147). `None` when the
@@ -102,12 +104,15 @@ pub fn repositories() -> Result<Vec<GitHubRepo>, BusError> {
     Ok(repositories)
 }
 
+/// `reference` (a branch or tag) overrides the one a `tree/<ref>` URL names.
 pub fn download_skills(
     url: &str,
     requested_subdir: Option<&str>,
+    reference: Option<&str>,
     stage: Option<&Path>,
 ) -> Result<Vec<DownloadedSkill>, BusError> {
-    let (source_url, branch, url_subdir) = parse_github_url(url)?;
+    let (source_url, url_branch, url_subdir) = parse_github_url(url)?;
+    let branch = reference.map(str::to_string).or(url_branch);
     let subdir = requested_subdir.filter(|value| !value.trim().is_empty()).map(str::trim).or(url_subdir.as_deref());
     let temp = std::env::temp_dir().join(format!("relay-skill-{}", uuid::Uuid::new_v4()));
     let mut command = Command::new("git");
@@ -128,12 +133,14 @@ pub fn download_skills(
         let _ = fs::remove_dir_all(&temp);
         return Err(BusError::unavailable("skill.clone_failed", message));
     }
-    let result = collect_skills(&temp, &source_url, subdir, stage);
+    let result = collect_skills(&temp, &source_url, branch.as_deref(), subdir, stage);
     let _ = fs::remove_dir_all(&temp);
     result
 }
 
-fn parse_github_url(value: &str) -> Result<(String, Option<String>, Option<String>), BusError> {
+/// The clone URL Relay records for a GitHub URL, the ref a `tree/<ref>/...` or `blob/<ref>/...`
+/// form names, and the folder below it.
+pub fn parse_github_url(value: &str) -> Result<(String, Option<String>, Option<String>), BusError> {
     let value = value.trim().trim_end_matches('/');
     let path = if let Some(path) = value.strip_prefix("https://github.com/") {
         path
@@ -164,6 +171,7 @@ fn parse_github_url(value: &str) -> Result<(String, Option<String>, Option<Strin
 fn collect_skills(
     root: &Path,
     source_url: &str,
+    source_ref: Option<&str>,
     subdir: Option<&str>,
     stage: Option<&Path>,
 ) -> Result<Vec<DownloadedSkill>, BusError> {
@@ -202,7 +210,7 @@ fn collect_skills(
                 }
             }
         });
-        Ok(DownloadedSkill { name, body, source_url: source_url.to_string(), source_path, revision: revision.clone(), assets })
+        Ok(DownloadedSkill { name, body, source_url: source_url.to_string(), source_path, source_ref: source_ref.map(str::to_string), revision: revision.clone(), assets })
     }).collect()
 }
 
@@ -261,10 +269,11 @@ mod tests {
         fs::create_dir_all(folder.join("reference")).unwrap();
         fs::write(folder.join("reference/audit.md"), "audit").unwrap();
         let stage = tempfile::tempdir().unwrap();
-        let skills = collect_skills(root.path(), "https://github.com/example/skills.git", Some("skills/review"), Some(stage.path())).unwrap();
+        let skills = collect_skills(root.path(), "https://github.com/example/skills.git", Some("dev"), Some("skills/review"), Some(stage.path())).unwrap();
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "Review carefully");
         assert_eq!(skills[0].source_path, "skills/review/SKILL.md");
+        assert_eq!(skills[0].source_ref.as_deref(), Some("dev"), "the ref travels with the skill");
         // The folder travels with the instructions, not just the SKILL.md the row stores.
         let assets = skills[0].assets.as_deref().expect("skill folder staged");
         assert_eq!(fs::read_to_string(assets.join("reference/audit.md")).unwrap(), "audit");

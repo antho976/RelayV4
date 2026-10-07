@@ -38,6 +38,7 @@ const SHIPPED_MIGRATIONS: &[&str] = &[
     "7767c3211ab0dbdbb83cc4571fccc3530ae1ffcb021a5bb0708c63fdb05214d6", // v19
     "8a0cb54342844cf8d525cf58e77f562853bdaa7bd311dc67e570a7118feb3c28", // v20
     "62681b138e192280c0e12cbb2a9abf5c7c4fde9506337682d16d091e3f46b39e", // v21
+    "91c29598127eea523390db607475e48c670a6cfc4cbfd3eb3cf5e8ebb95a0e49", // v22
 ];
 
 #[test]
@@ -150,7 +151,13 @@ fn every_prior_version_migrates_forward() {
             }
             c.pragma_update(None, "user_version", k as i64).unwrap();
             c.execute("INSERT INTO meta(key, value) VALUES ('created_at', 'then')", []).unwrap();
-            seed(&c, k)
+            let rows = seed(&c, k);
+            if (11..22).contains(&k) {
+                // Skills installed from GitHub before v22 recorded no ref; seed leaves the
+                // nullable source columns empty, so give both rows one.
+                c.execute("UPDATE skills SET source_url='https://github.com/o/r.git', source_path='skills/'||id||'/SKILL.md'", []).unwrap();
+            }
+            rows
         };
         let s = Store::open(&path, false).unwrap_or_else(|e| panic!("opening a v{k} store: {e}"));
         assert_eq!(s.version().unwrap(), SCHEMA_VERSION, "v{k} did not migrate to latest");
@@ -168,6 +175,11 @@ fn every_prior_version_migrates_forward() {
                 // v14 backfills the queue order from the task id for assignments that predate it.
                 let off: i64 = conn.query_row("SELECT COUNT(*) FROM task_sessions WHERE queue_ord != task_id", [], |r| r.get(0)).unwrap();
                 assert_eq!(off, 0, "v{k}: existing assignments were not given a queue order");
+            }
+            if (11..22).contains(&k) {
+                // v22: what was cloned then was the default branch, which a NULL ref still means.
+                let sourced: i64 = conn.query_row("SELECT COUNT(*) FROM skills WHERE source_url IS NOT NULL AND source_ref IS NULL", [], |r| r.get(0)).unwrap();
+                assert_eq!(sourced, 2, "v{k}: installed skills lost their GitHub source");
             }
         }
         // every table has its FK indexes: no FK column without an index (SPEC §1)

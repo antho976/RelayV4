@@ -147,7 +147,7 @@ pub fn register(e: &mut Engine) {
                 }
                 Some((id, Some(_), _)) => {
                     ctx.tx().execute(
-                    "UPDATE skills SET name=?1,body=?2,source_url=NULL,source_path=NULL,revision=NULL,deleted_at=NULL,updated_at=?3 WHERE id=?4",
+                    "UPDATE skills SET name=?1,body=?2,source_url=NULL,source_path=NULL,source_ref=NULL,revision=NULL,deleted_at=NULL,updated_at=?3 WHERE id=?4",
                     params![name,payload.body,ctx.now,id],
                 ).bus()?;
                     id
@@ -243,8 +243,9 @@ pub fn register(e: &mut Engine) {
         |ctx, payload| {
             // A skill is its folder, not only its SKILL.md: reference documents and scripts are
             // staged beside the store and adopted into the library once the row has an id (D147).
+            let reference = install_ref(ctx, payload)?;
             let staging = Staging(ctx.engine().store.skills_dir().join(".staging").join(uuid::Uuid::new_v4().to_string()));
-            let items = crate::github::download_skills(&payload.url, payload.subdir.as_deref(), Some(&staging.0))
+            let items = crate::github::download_skills(&payload.url, payload.subdir.as_deref(), reference.as_deref(), Some(&staging.0))
                 .and_then(deduplicate_downloaded_skills)?;
             Ok((staging, items))
         },
@@ -428,6 +429,32 @@ fn deduplicate_downloaded_skills(items: Vec<DownloadedSkill>) -> Result<Vec<Down
     Ok(unique.into_values().collect())
 }
 
+/// The ref an install clones: the one asked for, else the one a `tree/<ref>` URL names, else
+/// the ref the installed skill at `subdir` came from (see [`recorded_ref`]). `None` clones the
+/// default branch.
+fn install_ref(ctx: &crate::engine::Unlocked, payload: &SkillInstallIn) -> Result<Option<String>, relay_bus::BusError> {
+    let (source_url, url_ref, _) = crate::github::parse_github_url(&payload.url)?;
+    let asked = payload.source_ref.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    if let Some(reference) = asked.map(str::to_string).or(url_ref) {
+        return Ok(Some(reference));
+    }
+    let Some(path) = payload.subdir.as_deref().map(str::trim).filter(|value| !value.is_empty()) else { return Ok(None) };
+    ctx.read(|conn| recorded_ref(conn, &source_url, path))
+}
+
+/// "Update from GitHub" sends a skill's stored URL and `source_path` and no ref; without this
+/// the refresh would quietly switch a skill installed from a branch to the default branch. Only
+/// an unambiguous answer is inherited: when that folder is installed from the default branch
+/// too, or from two refs, the request means the default branch, as it says.
+fn recorded_ref(conn: &Connection, source_url: &str, source_path: &str) -> Result<Option<String>, relay_bus::BusError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT DISTINCT source_ref FROM skills WHERE source_url=?1 AND source_path=?2 AND deleted_at IS NULL",
+    ).bus()?;
+    let refs = stmt.query_map(params![source_url, source_path], |row| row.get::<_, Option<String>>(0)).bus()?
+        .collect::<rusqlite::Result<Vec<_>>>().bus()?;
+    Ok(match refs.as_slice() { [only] => only.clone(), _ => None })
+}
+
 fn skill_path_rank(path: &str) -> u8 {
     if path.starts_with("skills/") { 0 }
     else if path.starts_with(".agents/skills/") { 1 }
@@ -441,6 +468,7 @@ struct SkillIdentity {
     name: String,
     source_url: Option<String>,
     source_path: Option<String>,
+    source_ref: Option<String>,
     revision: Option<String>,
     deleted_at: Option<String>,
 }
@@ -451,6 +479,7 @@ fn skill_identity(row: &Row) -> rusqlite::Result<SkillIdentity> {
         name: row.get("name")?,
         source_url: row.get("source_url")?,
         source_path: row.get("source_path")?,
+        source_ref: row.get("source_ref")?,
         revision: row.get("revision")?,
         deleted_at: row.get("deleted_at")?,
     })
@@ -469,8 +498,9 @@ fn install_downloaded_skill(
     valid_skill_body(&item.body)?;
     let source_match: Option<SkillIdentity> = conn
         .query_row(
-            "SELECT * FROM skills WHERE source_url=?1 AND source_path=?2",
-            params![item.source_url, item.source_path],
+            // A branch is part of the source: the same folder from another ref is another skill.
+            "SELECT * FROM skills WHERE source_url=?1 AND source_path=?2 AND source_ref IS ?3",
+            params![item.source_url, item.source_path, item.source_ref],
             skill_identity,
         )
         .optional()
@@ -512,6 +542,7 @@ fn install_downloaded_skill(
                     "name": named.name,
                     "source_url": named.source_url,
                     "source_path": named.source_path,
+                    "source_ref": named.source_ref,
                     "revision": named.revision,
                     "visible": named.deleted_at.is_none()
                 },
@@ -519,6 +550,7 @@ fn install_downloaded_skill(
                     "name": name,
                     "source_url": item.source_url,
                     "source_path": item.source_path,
+                    "source_ref": item.source_ref,
                     "revision": item.revision
                 },
                 "can_replace": named.deleted_at.is_none() && source_match.is_none()
@@ -535,14 +567,14 @@ fn install_downloaded_skill(
 
     let id = if let Some(id) = target_id {
         conn.execute(
-            "UPDATE skills SET name=?1,body=?2,source_url=?3,source_path=?4,revision=?5,deleted_at=NULL,updated_at=?6 WHERE id=?7",
-            params![name,item.body,item.source_url,item.source_path,item.revision,now,id],
+            "UPDATE skills SET name=?1,body=?2,source_url=?3,source_path=?4,source_ref=?5,revision=?6,deleted_at=NULL,updated_at=?7 WHERE id=?8",
+            params![name,item.body,item.source_url,item.source_path,item.source_ref,item.revision,now,id],
         ).bus()?;
         id
     } else {
         conn.execute(
-            "INSERT INTO skills(name,body,source_url,source_path,revision,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?6)",
-            params![name,item.body,item.source_url,item.source_path,item.revision,now],
+            "INSERT INTO skills(name,body,source_url,source_path,source_ref,revision,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?7)",
+            params![name,item.body,item.source_url,item.source_path,item.source_ref,item.revision,now],
         ).bus()?;
         conn.last_insert_rowid()
     };
@@ -591,6 +623,7 @@ fn skill_row(conn: &rusqlite::Connection, row: &Row) -> rusqlite::Result<Skill> 
         body: row.get("body")?,
         source_url: row.get("source_url")?,
         source_path: row.get("source_path")?,
+        source_ref: row.get("source_ref")?,
         revision: row.get("revision")?,
         enabled_in,
         created_at: row.get("created_at")?,
@@ -655,6 +688,7 @@ mod tests {
             body: format!("---\nname: {name}\n---\nCurrent instructions.\n"),
             source_url: "https://github.com/example/skills.git".into(),
             source_path: path.into(),
+            source_ref: None,
             revision: revision.into(),
             assets: None,
         }
@@ -725,6 +759,43 @@ mod tests {
             Some("replacement/SKILL.md")
         );
         assert_eq!(replaced.revision.as_deref(), Some("def"));
+    }
+
+    #[test]
+    fn a_ref_is_part_of_a_github_skill_source_and_a_refresh_keeps_it() {
+        let store = Store::open_memory().unwrap();
+        let url = "https://github.com/example/skills.git";
+        let path = "skills/x/SKILL.md";
+        let from = |name: &str, reference: Option<&str>, revision: &str| {
+            let mut item = downloaded(name, path, revision);
+            item.source_ref = reference.map(str::to_string);
+            item
+        };
+        let install = |item: DownloadedSkill| store.with_tx(|tx| Ok(install_downloaded_skill(tx, "t", item, None)));
+        let recorded = || store.with_tx(|tx| Ok(recorded_ref(tx, url, path))).unwrap().unwrap();
+
+        let dev = install(from("x", Some("dev"), "a")).unwrap().unwrap();
+        assert_eq!(dev.source_ref.as_deref(), Some("dev"));
+        assert_eq!(recorded(), Some("dev".into()), "Update from GitHub stays on the branch the skill came from");
+        let refreshed = install(from("x", Some("dev"), "b")).unwrap().unwrap();
+        assert_eq!((refreshed.id, refreshed.revision.as_deref()), (dev.id, Some("b")));
+
+        // The default branch's copy of the folder no longer overwrites the dev row in place.
+        let error = install(from("x", None, "c")).unwrap().unwrap_err();
+        assert_eq!(error.code, "skill.name_exists");
+        assert_eq!(error.details.as_ref().unwrap()["installed_skill"]["source_ref"], "dev");
+        // Under another name both sources are kept, and a refresh without a ref is the default branch.
+        let main = install(from("x-main", None, "c")).unwrap().unwrap();
+        assert_ne!(main.id, dev.id);
+        assert_eq!(main.source_ref, None);
+        assert_eq!(recorded(), None);
+        let twice = store.with_tx(|tx| {
+            Ok(tx.execute(
+                "INSERT INTO skills(name,body,source_url,source_path,created_at,updated_at) VALUES ('y','b',?1,?2,'t','t')",
+                [url, path],
+            ).is_err())
+        });
+        assert!(twice.unwrap(), "one folder from the default branch is still one row");
     }
 
     #[test]

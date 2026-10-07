@@ -290,7 +290,8 @@ never pruned. `session.report` and `usage.report` keep 2 KB of readable payload 
 
 ### 5.4 Soft delete
 
-`task`, `module`, `note`, `file` (files go to `.relay/trash/<id>/`, not the OS trash) and
+`task`, `module`, `note`, `file` (files go to the primary checkout's `.relay/trash/<id>/`, not
+the OS trash, so removing a session's worktree does not take them along) and
 `session` (closed) are soft-deleted: `deleted_at` set, excluded from `list` unless
 `include_deleted: true`, restorable by `*.restore` for the grace window (`settings:
 undo.grace_days`, default 7; `0` keeps them), then hard-deleted by the reconcile pass. Hard
@@ -729,9 +730,9 @@ unique; nothing else is.
 
 | op | attrs | payload → result |
 |---|---|---|
-| `notes.list` | query | `{ project_id, pinned_only? }` → `{ notes: Note[] }` |
+| `notes.list` | query | `{ project_id, pinned_only?, include_deleted?, summary? }` → `{ notes: Note[] }` — `summary` cuts each `body` to its first 240 characters (`notes.get` has it whole) |
 | `notes.get` | query | `{ note_id }` → `Note` |
-| `notes.create` | mutation · always · inverse | `{ project_id, title?, body, pinned? }` → `Note` |
+| `notes.create` | mutation · always · inverse | `{ project_id, title?, body, pinned? }` → `Note` — a body is at most 1 MiB here, in `notes.update` and after `notes.append` (`invalid` / `notes.body`). `notes.changed` carries the note without its body, plus `body_bytes` |
 | `notes.update` | mutation · always · inverse | `{ note_id, title?, body?, pinned? }` → `Note` |
 | `notes.append` | mutation · always | `{ note_id?, project_id?, target?: "standing" \| "suggestions", text }` → `Note` — appends to an explicit note, the standing note by default, or the unpinned per-project Agent suggestions note. Suggestions require a bound agent with a current task; Relay adds timestamp, session, and task identity and never injects this note into a brief. |
 | `notes.pin` | mutation · always · inverse | `{ note_id, pinned: bool }` → `Note` |
@@ -817,13 +818,14 @@ Provider-neutral Markdown; the same for both providers.
 | op | attrs | payload → result |
 |---|---|---|
 | `guardrail.gate` | mutation · always · session · agent | `{ session, kind: "write"\|"commit"\|"exec", path?, new_text?, diff?, command? }` → `{ verdict: "allow"\|"refuse"\|"hold", error?: BusError, hold_id?: Id }` — the enforcement door (§9.3); may create a hold |
-| `guardrail.holds.list` | query | `{ project_id?, session?, open_only? = true }` → `{ holds: Hold[] }` |
+| `guardrail.holds.list` | query | `{ project_id?, session?, open_only? = true, limit? (200, ≤1000) }` → `{ holds: Hold[] }` — newest first; a string over 64 KiB in `details` is cut to its first 4 KiB |
+| `guardrail.hold.get` | query · user | `{ hold_id, full? }` → `{ hold, request, elided? }` — the frozen action without its auth; unless `full`, each string over 64 KiB in `request.payload` or `hold.details` is cut to its first 4 KiB and its JSON pointer listed in `elided`. `guardrail.confirm` replays the stored action whole |
 | `guardrail.confirm` | mutation · always · user | `{ hold_id, scope? }` → `{ hold: Hold, outcome: Response }` (§9.4); for an exception request `scope` is `once`\|`session` and nothing is replayed (§9.5) |
 | `guardrail.reject` | mutation · always · user | `{ hold_id, reason? }` → `{ hold: Hold }` |
 | `guardrail.config.get` | query | `{ workspace_id? \| project_id? }` → `GuardrailConfig` (§9.6) |
 | `guardrail.config.set` | mutation · always · inverse · user | `{ workspace_id? \| project_id?, patch: Partial<GuardrailConfig> }` → `GuardrailConfig` — patches that one layer's overrides |
 | `guardrail.config.layers` | query | `{ workspace_id? \| project_id? }` → `{ scope, workspace_id?, project_id?, effective, inherited, overrides, sources }` (§9.6) |
-| `guardrail.request` | mutation · always · session · agent (every role) | `{ session, kind, value, reason, scope? }` → `{ request: GuardrailException, created, wait_for }` (§9.5) |
+| `guardrail.request` | mutation · always · session · agent (every role) | `{ session, kind, value, reason, scope? }` → `{ request: GuardrailException, created, wait_for }` (§9.5); `reason` at most 4 KiB, `value` at most 8 KiB |
 | `guardrail.request.get` | query | `{ request_id }` → `GuardrailException` |
 | `guardrail.requests.list` | query | `{ project_id?, session?, state?: "open"\|"active"\|"all" }` → `{ requests: GuardrailException[] }` |
 | `guardrail.grant.revoke` | mutation · always · user | `{ request_id }` → `GuardrailException` |
@@ -866,7 +868,7 @@ All paths are relative to the worktree root; `..` and absolute paths are `invali
 
 | op | attrs | payload → result |
 |---|---|---|
-| `file.tree` | query | `{ project_id, worktree?, path? = "", depth? = 1, git_badges? = true }` → `{ entries: Entry[] }` (optional git badges; omits VCS metadata and high-churn build/cache directories) |
+| `file.tree` | query | `{ project_id, worktree?, path? = "", depth? = 1, git_badges? = true, limit? (2000, ≤5000) }` → `{ entries: Entry[], truncated?: {path: total} }` (optional git badges; omits VCS metadata and high-churn build/cache directories). Each directory lists at most `limit` entries, folders first; one cut short is named in `truncated` with its full count |
 | `file.read` | query | `{ project_id, worktree?, path, max_bytes? }` → `{ text?, bytes_b64?, mime, size, truncated }` |
 | `file.write` | mutation · always · project | `{ project_id, worktree?, path, text }` → `{ bytes, removed_lines, added_lines }` — guardrails §9.2 |
 | `file.create` | mutation · always | `{ project_id, worktree?, path, kind: "file"\|"dir", text? }` → `Entry` |
@@ -874,9 +876,10 @@ All paths are relative to the worktree root; `..` and absolute paths are `invali
 | `file.move` | mutation · always | `{ project_id, worktree?, path, into: string }` → `Entry` |
 | `file.delete` | mutation · always · inverse (restore) | `{ project_id, worktree?, path }` → `{ trash_id }` |
 | `file.restore` | mutation · always | `{ project_id, trash_id }` → `Entry` |
+| `file.trash.list` | query · user | `{ project_id, limit? (200, ≤1000) }` → `{ entries: {id, original_path, worktree, created_at, available}[] }` — the project's trashed files not yet restored or expired, newest first; `id` is the `trash_id` for `file.restore`, `available` whether the bytes are still on disk |
 | `file.import` | mutation · always | `{ project_id, worktree?, into, sources: path[] }` → `{ entries: Entry[] }` — OS drag-in |
 | `file.restore_head` | mutation · always · user | `{ project_id, worktree?, path }` → `Entry` — `git checkout -- <path>`; the one-click answer to a post-hoc `guardrail.violation` (§9.3) |
-| `file.search` | query | `{ project_id, worktree?, query, glob?, regex?, limit? }` → `{ hits: {path, line, col, text}[] }`; searches regular text files only (a symlink only when it stays inside the worktree), skipping generated trees, files over 8 MiB and any with a NUL in the first 8 KiB |
+| `file.search` | query | `{ project_id, worktree?, query, glob?, regex?, limit? }` → `{ hits: {path, line, col, text, text_offset?}[] }`; `col` is the match's 1-based byte offset in the line, and `text` the line, or for one over 240 bytes a window of it around the match starting at byte `text_offset`; searches regular text files only (a symlink only when it stays inside the worktree), skipping generated trees, files over 8 MiB and any with a NUL in the first 8 KiB |
 
 ### 10.14 device (SPEC §9)
 
@@ -925,7 +928,7 @@ All paths are relative to the worktree root; `..` and absolute paths are `invali
 | op | attrs | payload → result |
 |---|---|---|
 | `notify.list` | query | `{ project_id?, unread_only?, category?, limit? }` → `{ notifications: Notification[] }` |
-| `dashboard.get` | query · global | `{}` → `{ projects: DashboardProject[], sessions_live: Peer[], in_review: Task[], holds_open: Hold[], notifications: Notification[], resources: {…as app.resources.get} }` — project workload counts, decisions, activity, and resource pulse in one round trip |
+| `dashboard.get` | query · global | `{}` → `{ projects: DashboardProject[], sessions_live: Peer[], in_review: Task[], holds_open: Hold[] (newest 100), notifications: Notification[], resources: {…as app.resources.get} }` — project workload counts, decisions, activity, and resource pulse in one round trip |
 | `notify.ack` / `notify.ack_all` | mutation · never | `{ notification_id }` / `{ category? }` → `{}` |
 | `notify.settings.get` / `notify.settings.set` | query / mutation · always · inverse | `{}` → `NotifySettings` / `{ patch }` → `NotifySettings` |
 | `settings.get` | query | `{ path?: string }` → `{ value }` — dotted path into the settings tree, whole tree if absent |
@@ -933,8 +936,10 @@ All paths are relative to the worktree root; `..` and absolute paths are `invali
 | `settings.reset` | mutation · always · inverse | `{ path? }` → `{ value }` |
 
 Settings tree top-level keys (each documented where its feature lands): `appearance`,
-`notifications`, `providers`, `guardrails`, `undo`, `parking`, `layout`, `theme`,
-`keybindings` (shortcut → op envelope, SPEC §2), `roles` (the §9.1 allow-sets).
+`notifications`, `providers`, `guardrails` (its `roles` are the §9.1 allow-sets), `undo`,
+`audit`, `usage`, `device`, `layout` (`layout.current.<project>`), `keybindings` (shortcut → op
+envelope, SPEC §2). Unread defaults were dropped (RA-253): `parking`, `theme` and a top-level
+`roles` are no longer part of the tree, though an arbitrary path can still be written.
 
 ### 10.17 ui (executor: ui — §6.5)
 

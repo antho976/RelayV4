@@ -4,7 +4,7 @@
   "title": "RELAY v4 command bus",
   "description": "Generated from crates/relay-bus by `relay schema`. Do not edit; see docs/BUS.md.",
   "version": 1,
-  "op_count": 223,
+  "op_count": 224,
   "envelope": {
     "request": {
       "$ref": "#/$defs/Request"
@@ -2094,7 +2094,7 @@
       }
     },
     "session.restorable": {
-      "summary": "Sessions offering resume at launch",
+      "summary": "Sessions offering resume at launch, optionally one project's or one session's",
       "kind": "query",
       "audit": "never",
       "undo": "none",
@@ -2106,7 +2106,7 @@
       "since": "1.0",
       "phase": 6,
       "payload": {
-        "$ref": "#/$defs/Empty"
+        "$ref": "#/$defs/SessionRestorableIn"
       },
       "result": {
         "$ref": "#/$defs/SessionRestorableOut"
@@ -3207,6 +3207,25 @@
       },
       "result": {
         "$ref": "#/$defs/Entry"
+      }
+    },
+    "file.trash.list": {
+      "summary": "Trashed files not yet restored or expired",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "project",
+      "executor": "core",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 8,
+      "payload": {
+        "$ref": "#/$defs/FileTrashListIn"
+      },
+      "result": {
+        "$ref": "#/$defs/FileTrashListOut"
       }
     },
     "file.restore_head": {
@@ -8436,6 +8455,20 @@
             "boolean",
             "null"
           ]
+        },
+        "include_deleted": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Also list soft-deleted notes (`deleted_at` set), which `notes.restore` brings back."
+        },
+        "summary": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Cut each `body` to a preview of its first 240 characters; `notes.get` has the whole note."
         }
       },
       "required": [
@@ -9739,6 +9772,27 @@
         "seq"
       ]
     },
+    "SessionRestorableIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "project_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "Only this project's sessions. Each one costs a `git status` of its worktree, so a\nclient describing one project's panes should not pay for every project's (RA-235)."
+        },
+        "session": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Only this session."
+        }
+      }
+    },
     "SessionRestorableOut": {
       "type": "object",
       "properties": {
@@ -10008,6 +10062,15 @@
             "boolean",
             "null"
           ]
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "Newest first; default 200, at most 1000."
         }
       }
     },
@@ -10115,6 +10178,13 @@
         "hold_id": {
           "type": "integer",
           "format": "int64"
+        },
+        "full": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Return every string whole, however large. By default a string over 64 KiB in the\npayload or details is cut to its first 4 KiB and named in `elided`."
         }
       },
       "required": [
@@ -10129,7 +10199,14 @@
         },
         "request": {
           "$ref": "#/$defs/Request",
-          "description": "The exact frozen action, with authentication material removed."
+          "description": "The exact frozen action, with authentication material removed. `guardrail.confirm`\nreplays the stored action whole, whatever was elided here."
+        },
+        "elided": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "JSON pointers (`/request/payload/new_text`, `/hold/details/reason`) of the strings cut short."
         }
       },
       "required": [
@@ -11128,7 +11205,20 @@
           "type": "array",
           "items": {
             "$ref": "#/$defs/FileStatus"
-          }
+          },
+          "description": "A wholly untracked directory is one entry, its path ending in `/`. At most a few thousand\nentries: conflicts first, then other tracked changes, then untracked ones."
+        },
+        "truncated": {
+          "type": "boolean",
+          "description": "Whether `files` stops short of every change git reported.",
+          "default": false
+        },
+        "total": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "How many entries git reported, `files` included; more than `files.len()` when truncated.",
+          "default": 0
         }
       },
       "required": [
@@ -11264,6 +11354,20 @@
             "string",
             "null"
           ]
+        },
+        "staged": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Compare with the index, what a commit would record, instead of the working tree."
+        },
+        "old_path": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "For a rename, the file's path in the old side (`renamed_from` in `git.status`)."
         }
       },
       "required": [
@@ -12213,6 +12317,15 @@
             "boolean",
             "null"
           ]
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "Most entries listed per directory, default 2000, at most 5000."
         }
       },
       "required": [
@@ -12227,6 +12340,15 @@
           "items": {
             "$ref": "#/$defs/Entry"
           }
+        },
+        "truncated": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "description": "Directories cut short at `limit`, by worktree-relative path, with how many entries each\nreally holds. Ask for one again with its `path` and a larger `limit` to see more."
         }
       },
       "required": [
@@ -12550,6 +12672,74 @@
         "trash_id"
       ]
     },
+    "FileTrashListIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "project_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "Default 200, at most 1000."
+        }
+      },
+      "required": [
+        "project_id"
+      ]
+    },
+    "FileTrashListOut": {
+      "type": "object",
+      "properties": {
+        "entries": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/FileTrashEntry"
+          },
+          "description": "Newest first."
+        }
+      },
+      "required": [
+        "entries"
+      ]
+    },
+    "FileTrashEntry": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64",
+          "description": "The `trash_id` that `file.restore` takes."
+        },
+        "original_path": {
+          "type": "string"
+        },
+        "worktree": {
+          "type": "string",
+          "description": "The checkout it was deleted from, and where `file.restore` puts it back."
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "available": {
+          "type": "boolean",
+          "description": "Whether the trashed bytes are still on disk."
+        }
+      },
+      "required": [
+        "id",
+        "original_path",
+        "worktree",
+        "created_at",
+        "available"
+      ]
+    },
     "ImportIn": {
       "type": "object",
       "additionalProperties": false,
@@ -12665,10 +12855,21 @@
         "col": {
           "type": "integer",
           "format": "uint32",
-          "minimum": 0
+          "minimum": 0,
+          "description": "1-based byte offset of the match in the whole line."
         },
         "text": {
-          "type": "string"
+          "type": "string",
+          "description": "The line, or for a long one a window of it around the match."
+        },
+        "text_offset": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "Set when `text` is a window: the byte offset in the line where it starts, so the match\nbegins `col - 1 - text_offset` bytes into `text`."
         }
       },
       "required": [
@@ -13524,6 +13725,13 @@
             "null"
           ]
         },
+        "source_ref": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The branch or tag a GitHub skill was installed from; `None` is the repository's\ndefault branch (or a local skill). A refresh pulls this ref again."
+        },
         "revision": {
           "type": [
             "string",
@@ -13641,6 +13849,13 @@
             "string",
             "null"
           ]
+        },
+        "source_ref": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Branch or tag to clone; overrides one named by a `tree/<ref>` URL. When neither names\none and `subdir` is an installed skill's `source_path`, its recorded `source_ref` is\nkept, so \"Update from GitHub\" stays on the branch the skill came from."
         },
         "replace_skill_id": {
           "type": [

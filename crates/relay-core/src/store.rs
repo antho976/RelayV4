@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 /// The schema version this build knows. Bump when appending to [`MIGRATIONS`].
-pub const SCHEMA_VERSION: i64 = 21;
+pub const SCHEMA_VERSION: i64 = 22;
 
 /// Numbered migrations; index 0 brings a fresh DB to `user_version = 1`.
 pub const MIGRATIONS: &[&str] = &[
@@ -376,6 +376,15 @@ pub const MIGRATIONS: &[&str] = &[
     r#"
     CREATE INDEX notifications_recent ON notifications(created_at, id);
     CREATE INDEX notifications_unread_recent ON notifications(read, created_at, id);
+    "#,
+    // v22 - a GitHub skill remembers the branch or tag it was installed from (NULL: the
+    // repository's default branch), so a refresh pulls that ref again, and the same folder
+    // installed from two refs is two sources rather than one row each install overwrites.
+    r#"
+    ALTER TABLE skills ADD COLUMN source_ref TEXT;
+    DROP INDEX skills_source;
+    CREATE UNIQUE INDEX skills_source ON skills(source_url, source_path, IFNULL(source_ref, ''))
+      WHERE source_url IS NOT NULL;
     "#,
 ];
 
