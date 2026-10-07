@@ -152,6 +152,52 @@ pub fn peers(
     Ok(out)
 }
 
+/// Each brief section's budget (RA-385). The compact half is injected into every spawn — for
+/// Codex as one argv element, cut at 64 KiB — so one long standing note or a module of hundreds
+/// of tasks crowded out everything after it. A section that is cut says so and names the op
+/// that returns the whole of it.
+const SECTION_LINES: usize = 40;
+const SECTION_BYTES: usize = 8 * 1024;
+const NOTES_BYTES: usize = 16 * 1024;
+/// Per task body and per changelog, in the current-state section.
+const TASK_TEXT_BYTES: usize = 4 * 1024;
+
+/// `lines`, one per line, at most [`SECTION_LINES`] of them and about [`SECTION_BYTES`]; when
+/// some are left out, a last line counts them and names `rest`, the op with the full list.
+fn capped_lines(lines: Vec<String>, rest: &str) -> String {
+    let total = lines.len();
+    let mut out = String::new();
+    let mut kept = 0;
+    for line in lines {
+        if kept == SECTION_LINES || (kept > 0 && out.len() + 1 + line.len() > SECTION_BYTES) {
+            break;
+        }
+        if kept > 0 {
+            out.push('\n');
+        }
+        out.push_str(&line);
+        kept += 1;
+    }
+    if kept < total {
+        out.push_str(&format!("\n- … and {} more, not shown here; the full list: {rest}", total - kept));
+    }
+    out
+}
+
+/// `text` cut to at most `max` bytes, at a line break when one is near, then a line that says
+/// it was cut and names `whole`, the op that returns all of it.
+fn capped_text(text: &str, max: usize, whole: &str) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut at = max;
+    while !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    let at = text[..at].rfind('\n').filter(|line| *line >= at / 2).unwrap_or(at);
+    format!("{}\n[… cut here: {at} of {} bytes shown; the whole text: {whole}]", text[..at].trim_end(), text.len())
+}
+
 /// Whether the session is on its first launch, or not launched yet. Every spawn, fresh or
 /// resumed, moves `epoch` on by one from 0, so a relaunch is past 1 — the same line the launch
 /// nudge draws with `spawned_at` before it spawns (RA-397).
@@ -249,11 +295,12 @@ pub fn brief(
                 "\n\nTask #{} [{}]: {}\ncolumn: {}\ntask_state: {}",
                 task.id, queue_state, task.title, task.column, task.state,
             ));
+            let whole = format!("`task.get {{\"task_id\": {}}}`", task.id);
             if !task.body.is_empty() {
-                state.push_str(&format!("\nTask body:\n{}", task.body));
+                state.push_str(&format!("\nTask body:\n{}", capped_text(&task.body, TASK_TEXT_BYTES, &whole)));
             }
             if !task.changelog.is_empty() {
-                state.push_str(&format!("\nTask changelog:\n{}", task.changelog));
+                state.push_str(&format!("\nTask changelog:\n{}", capped_text(&task.changelog, TASK_TEXT_BYTES, &whole)));
             }
         }
     } else {
@@ -277,7 +324,7 @@ pub fn brief(
     let peers_text = if peer_rows.is_empty() {
         "No live peers.".to_string()
     } else {
-        peer_rows
+        let lines = peer_rows
             .iter()
             .map(|p| {
                 let task = p.task_title.as_deref().unwrap_or("unassigned");
@@ -296,8 +343,8 @@ pub fn brief(
                     claims
                 )
             })
-            .collect::<Vec<_>>()
-            .join("\n")
+            .collect::<Vec<_>>();
+        capped_lines(lines, "`session.peers`")
     };
 
     let notes = conn
@@ -312,7 +359,7 @@ pub fn brief(
     let notes = if notes.is_empty() {
         "No standing notes.".to_string()
     } else {
-        notes
+        capped_text(&notes, NOTES_BYTES, &format!("`notes.standing {{\"project_id\": {}}}`", session.project_id))
     };
 
     let adjacent = if let Some(module_id) = module_id {
@@ -341,7 +388,7 @@ pub fn brief(
         if lines.is_empty() {
             "No adjacent tasks.".to_string()
         } else {
-            lines.join("\n")
+            capped_lines(lines, &format!("`task.list {{\"module_id\": {module_id}}}`"))
         }
     } else {
         "No module context.".to_string()
@@ -382,8 +429,8 @@ pub fn brief(
                     crate::skills::TARGETS[1]
                 )
             })
-            .collect::<Vec<_>>()
-            .join("\n");
+            .collect::<Vec<_>>();
+        let listed = capped_lines(listed, "`skill.list`");
         format!(
             "These are installed in this checkout as skill folders. Load one through your own skill mechanism before work it covers; if your provider has none, read its SKILL.md at the path below.\n{listed}\nFull bodies, inline: {SESSION_SKILLS_PATH}"
         )

@@ -884,7 +884,11 @@ before each provider launch. It comes in two halves, because delivering it whole
   spawn, appended to the provider-native role instruction — Claude's appended-system-prompt file
   or Codex `developer_instructions` — because a session spawned with no assignment is exactly the
   one that most needs to know who its peers are. It never carries the launch assignment: for
-  Codex it lands in argv, and `session.bootstrap` already returns it privately.
+  Codex it lands in argv, and `session.bootstrap` already returns it privately. Each section has
+  a budget (RA-385): peers, adjacent tasks and the skill list at most 40 lines / 8 KiB, the
+  standing note 16 KiB, each task body and changelog 4 KiB. A section that is cut ends with a
+  line naming the op that returns the whole (`session.peers`, `task.list {module_id}`,
+  `skill.list`, `notes.standing {project_id}`, `task.get {task_id}`).
 - **skills** — `skill.list {enabled: true}` bodies, written to `.relay/session-skills.md`. The
   compact half names each enabled skill and the folder it is materialized in
   (`.claude/skills/<name>/`, `.agents/skills/<name>/`, and the provider's own home, D147), so an
