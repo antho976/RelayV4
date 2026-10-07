@@ -118,30 +118,31 @@ fn haystack(task: &Value) -> String {
     .to_lowercase()
 }
 
+/// A group's sort rank, a space, then its heading: priority and size keep their own order and
+/// the fallback groups (`Unassigned`, `No module`…) sort after every named one.
 fn group_of(task: &Value, grouping: &str) -> String {
+    let named = |name: Option<&str>, none: &str| match name {
+        Some(name) => format!("0 {name}"),
+        None => format!("9 {none}"),
+    };
     match grouping {
-        "parent" => task["_parent_title"].as_str().unwrap_or("Top level").to_string(),
-        "module" => task["_module_name"].as_str().unwrap_or("No module").to_string(),
-        "session" => task["sessions"]
-            .as_array()
-            .and_then(|v| v.last())
-            .and_then(Value::as_str)
-            .unwrap_or("Unassigned")
-            .to_string(),
+        "parent" => named(task["_parent_title"].as_str(), "Top level"),
+        "module" => named(task["_module_name"].as_str(), "No module"),
+        "session" => named(task["sessions"].as_array().and_then(|v| v.last()).and_then(Value::as_str), "Unassigned"),
         "" => String::new(),
         "priority" => {
             let p = text(task, "priority");
             format!("{} {p}", PRIORITIES.iter().position(|x| *x == p).unwrap_or(9))
         }
-        key => task[key].as_str().unwrap_or("None").to_string(),
+        "size" => match text(task, "size") {
+            "" => "9 None".into(),
+            s => format!("{} {s}", SIZES.iter().position(|x| *x == s).unwrap_or(8)),
+        },
+        key => named(task[key].as_str(), "None"),
     }
 }
-fn group_title(group: &str, grouping: &str) -> String {
-    if grouping == "priority" {
-        group.split_once(' ').map(|(_, p)| p).unwrap_or(group).to_string()
-    } else {
-        group.to_string()
-    }
+fn group_title(group: &str) -> String {
+    group.split_once(' ').map(|(_, g)| g).unwrap_or(group).to_string()
 }
 
 /// `5m`, `3h`, `2d`: how long ago an RFC 3339 timestamp was, at a glance.
@@ -166,6 +167,15 @@ fn ago(ts: &str) -> String {
     glib::DateTime::now_utc()
         .map(|now| ago_between(ts, &now))
         .unwrap_or_default()
+}
+/// The peek's longer reading of an [`ago`]: `just now`, `5m ago`, `on Mar 1`, or a dash.
+fn since(age: &str) -> String {
+    match age {
+        "" => "—".into(),
+        "now" => "just now".into(),
+        date if date.contains(' ') => format!("on {date}"),
+        age => format!("{age} ago"),
+    }
 }
 
 fn hue(name: &str) -> usize {
@@ -455,6 +465,9 @@ struct Board {
     project: i64,
     page: gtk::Box,
     keys: gtk::EventControllerKey,
+    /// Holds the workspace picker, rebuilt when the projects or workspaces it lists change.
+    picker: gtk::Box,
+    picker_key: RefCell<String>,
     count: gtk::Label,
     query: gtk::SearchEntry,
     filter: gtk::MenuButton,
@@ -474,8 +487,8 @@ struct Board {
     peeked: Cell<Option<i64>>,
     dragged: Cell<Option<i64>>,
     layout: RefCell<Lanes>,
-    /// The horizontal board scroller first, then each lane's, to keep places across renders.
-    scrolls: RefCell<Vec<gtk::Adjustment>>,
+    /// Each scroller by role (`board`, `lane:<column>`, `list`), to keep places across renders.
+    scrolls: RefCell<Vec<(String, gtk::Adjustment)>>,
     /// What the peek last drew (`peek_key`): an unchanged peek keeps its scroll and focus.
     peek_key: RefCell<Option<String>>,
     peek_shown: Cell<Option<i64>>,
@@ -493,16 +506,25 @@ pub fn show(ui: &Rc<Ui>, page: &gtk::Box, project: i64, tasks: Vec<Value>) {
         Some(board) if owner == Some(project) && board.project == project => board,
         old => {
             fresh = true;
-            if let Some(old) = old {
+            if let Some(old) = &old {
                 page.remove_controller(&old.keys);
             }
             clear(page);
             ui.page_projects.borrow_mut().insert("board".into(), project);
             let board = Board::mount(ui, page, project);
+            // The view, hidden columns and grouping follow the person across projects; the
+            // filters name one project's modules, labels and agents, so they start empty.
+            if let Some(old) = old {
+                board.list.set(old.list.get());
+                board.views[old.list.get() as usize].set_active(true);
+                *board.hidden.borrow_mut() = old.hidden.borrow().clone();
+                *board.group.borrow_mut() = old.group.borrow().clone();
+            }
             BOARD.with(|slot| *slot.borrow_mut() = Some(board.clone()));
             board
         }
     };
+    board.refresh_picker(ui);
     let mut tasks = tasks;
     let titles: BTreeMap<i64, Value> = tasks
         .iter()
@@ -529,7 +551,8 @@ impl Board {
         let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         header.add_css_class("board-head");
         header.append(&board_switcher(ui, "board"));
-        header.append(&workspace_picker(ui, project, "board"));
+        let picker = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        header.append(&picker);
         let count = label("", "board-count");
         count.set_widget_name("board-count");
         count.set_hexpand(true);
@@ -624,7 +647,9 @@ impl Board {
         rail.add_css_class("board-drag-rail");
         rail.append(&label("DROP TO SET", "board-rail-caption"));
         rail.set_visible(false);
-        page.append(&rail);
+        // Floats over the lanes: shown at drag start, it must not push the card under the pointer.
+        rail.set_valign(gtk::Align::Start);
+        rail.set_halign(gtk::Align::Start);
 
         let main = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         main.set_vexpand(true);
@@ -638,7 +663,10 @@ impl Board {
         peek.set_size_request(380, -1);
         peek.set_visible(false);
         main.append(&peek);
-        page.append(&main);
+        let stack = gtk::Overlay::new();
+        stack.set_child(Some(&main));
+        stack.add_overlay(&rail);
+        page.append(&stack);
 
         let hints = gtk::Box::new(gtk::Orientation::Horizontal, 5);
         hints.add_css_class("board-shortcuts");
@@ -668,6 +696,8 @@ impl Board {
             project,
             page: page.clone(),
             keys: keys.clone(),
+            picker,
+            picker_key: RefCell::new(String::new()),
             count,
             query: query.clone(),
             filter: filter.clone(),
@@ -767,7 +797,8 @@ impl Board {
         let weak = Rc::downgrade(&board);
         add.connect_clicked(move |_| {
             if let Some(board) = weak.upgrade() {
-                let column = board.current().map(|(column, _)| column);
+                // The click took focus from the card, so start in the last focused card's column.
+                let column = board.focused.get().and_then(|id| board.task(id)).map(|t| text(&t, "column").to_string());
                 board.open_quick(column.as_deref().unwrap_or("backlog"));
             }
         });
@@ -822,6 +853,23 @@ impl Board {
 
     fn ui(&self) -> Option<Rc<Ui>> {
         self.ui.upgrade()
+    }
+    /// Rebuilds the workspace picker once a project or workspace it lists is added, renamed or
+    /// removed, unless its menu is open.
+    fn refresh_picker(&self, ui: &Rc<Ui>) {
+        let key = {
+            let pick = |rows: &[Value], keys: &[&str]| -> Vec<Value> {
+                rows.iter().map(|row| Value::Array(keys.iter().map(|k| row[*k].clone()).collect())).collect()
+            };
+            json!([pick(&ui.projects.borrow(), &["id", "name", "workspace_id"]), pick(&ui.workspaces.borrow(), &["id", "name"])])
+                .to_string()
+        };
+        if *self.picker_key.borrow() == key || crate::app::open_popover(self.picker.upcast_ref()).is_some() {
+            return;
+        }
+        *self.picker_key.borrow_mut() = key;
+        clear(&self.picker);
+        self.picker.append(&workspace_picker(ui, self.project, "board"));
     }
     fn task(&self, id: i64) -> Option<Value> {
         self.tasks
@@ -1008,7 +1056,8 @@ impl Board {
             "type": pick(&self.quick.kind, &TYPES),
             "priority": pick(&self.quick.priority, &QUICK_PRIORITIES),
         });
-        self.quick.title.set_sensitive(false);
+        // The whole bar, Create included, waits for the reply: a second click would create twice.
+        self.quick.bar.set_sensitive(false);
         let board = self.clone();
         glib::spawn_future_local(async move {
             match ui.call("task.create", payload).await {
@@ -1021,7 +1070,7 @@ impl Board {
                 }
                 Err(error) => board.quick.note.set_text(&error.to_string()),
             }
-            board.quick.title.set_sensitive(true);
+            board.quick.bar.set_sensitive(true);
             board.quick.title.grab_focus();
             ui.refresh_page();
         });
@@ -1040,13 +1089,14 @@ impl Board {
             self.content.grab_focus();
         }
     }
-    /// The focused card as (column, index in its lane), if focus is on one.
+    /// The focused card as (column, index in its lane), if focus is on one. A button inside the
+    /// card, or its menu, is not the card: Enter and Space press it.
     fn current(&self) -> Option<(String, usize)> {
         let focus = self.page.root().and_then(|root| root.focus())?;
         self.layout.borrow().iter().find_map(|(column, cards)| {
             cards
                 .iter()
-                .position(|(_, card)| focus == *card || focus.is_ancestor(card))
+                .position(|(_, card)| focus == *card)
                 .map(|at| (column.clone(), at))
         })
     }
@@ -1072,13 +1122,20 @@ impl Board {
         let focus = self.page.root().and_then(|root| root.focus());
         let mut ancestor = focus.clone();
         while let Some(widget) = ancestor {
-            if widget.is::<gtk::Editable>() || widget.is::<gtk::TextView>() {
+            // Menus and pickers keep their own keys: arrows, Enter and Escape act inside them.
+            if widget.is::<gtk::Editable>() || widget.is::<gtk::TextView>() || widget.is::<gtk::Popover>() {
                 return glib::Propagation::Proceed;
             }
             ancestor = widget.parent();
         }
-        if mods.contains(gdk::ModifierType::CONTROL_MASK) && key == Key::z {
-            self.undo.emit_clicked();
+        // Caps Lock sends uppercase letters without Shift: the intent to reorder is Shift alone.
+        let key = key.to_lower();
+        let shift = mods.contains(gdk::ModifierType::SHIFT_MASK);
+        if mods.contains(gdk::ModifierType::CONTROL_MASK) && !shift && key == Key::z {
+            // emit_clicked runs even while an undo is in flight and the key is insensitive.
+            if self.undo.is_sensitive() {
+                self.undo.emit_clicked();
+            }
             return glib::Propagation::Stop;
         }
         if mods.intersects(
@@ -1088,7 +1145,6 @@ impl Board {
         ) {
             return glib::Propagation::Proceed;
         }
-        let shift = mods.contains(gdk::ModifierType::SHIFT_MASK);
         let lanes: Vec<(String, usize)> = self
             .layout
             .borrow()
@@ -1106,8 +1162,8 @@ impl Board {
         let card_command = matches!(
             key,
             Key::Return | Key::KP_Enter | Key::ISO_Enter | Key::space | Key::period | Key::Menu
-                | Key::bracketleft | Key::bracketright | Key::p | Key::J | Key::K
-        ) || (shift && matches!(key, Key::Up | Key::Down));
+                | Key::bracketleft | Key::bracketright | Key::p
+        ) || (shift && matches!(key, Key::j | Key::k | Key::Up | Key::Down));
         if card_command && task.is_none() {
             return glib::Propagation::Proceed;
         }
@@ -1123,7 +1179,7 @@ impl Board {
                     return glib::Propagation::Proceed;
                 }
             }
-            Key::J | Key::K if shift => self.nudge(task.as_ref(), if key == Key::J { 1 } else { -1 }),
+            Key::j | Key::k if shift => self.nudge(task.as_ref(), if key == Key::j { 1 } else { -1 }),
             Key::Down | Key::Up if shift => {
                 self.nudge(task.as_ref(), if key == Key::Down { 1 } else { -1 })
             }
@@ -1288,7 +1344,7 @@ impl Board {
             .root()
             .and_then(|root| root.focus())
             .is_some_and(|focus| focus.is_ancestor(&self.content));
-        let saved: Vec<f64> = self.scrolls.borrow().iter().map(|a| a.value()).collect();
+        let saved: BTreeMap<String, f64> = self.scrolls.borrow().iter().map(|(role, a)| (role.clone(), a.value())).collect();
         clear(&self.content);
         self.layout.borrow_mut().clear();
         self.scrolls.borrow_mut().clear();
@@ -1323,11 +1379,12 @@ impl Board {
         } else {
             self.render_columns(&tasks, &visible);
         }
-        // Keep each scroller where it was: restore once the new content has its size.
-        for (adjustment, value) in self.scrolls.borrow().iter().zip(saved) {
-            if value <= 0. {
+        // Keep each scroller where it was: restore once the new content has its size. A scroller
+        // the last render did not have (another view, a column shown again) starts at the top.
+        for (role, adjustment) in self.scrolls.borrow().iter() {
+            let Some(value) = saved.get(role).copied().filter(|v| *v > 0.) else {
                 continue;
-            }
+            };
             let done = Cell::new(false);
             adjustment.connect_changed(move |a| {
                 if !done.get() && a.upper() - a.page_size() >= value {
@@ -1690,10 +1747,16 @@ impl Board {
                 return false;
             };
             let Some(task) = board.task(id) else { return false };
-            if text(&task, "column") == column {
-                return false;
-            }
             board.focused.set(Some(id));
+            if text(&task, "column") == column {
+                // Below the last card of its own lane: to the bottom, unless it is already there.
+                let order = board.column_order(column);
+                if column == "done" || order.last() == Some(&id) {
+                    return false;
+                }
+                board.move_to(&task, column, Some(order.len() - 1));
+                return true;
+            }
             board.move_to(&task, column, None);
             true
         });
@@ -1711,7 +1774,7 @@ impl Board {
             .hexpand(true)
             .child(&grid)
             .build();
-        self.scrolls.borrow_mut().push(scroller.hadjustment());
+        self.scrolls.borrow_mut().push(("board".into(), scroller.hadjustment()));
         self.content.append(&scroller);
         let grouping = self.group.borrow().clone();
         let hidden = self.hidden.borrow().clone();
@@ -1736,7 +1799,7 @@ impl Board {
             cards.add_css_class("board-cards");
             let scroll = crate::app::scrolled(&cards);
             scroll.set_hscrollbar_policy(gtk::PolicyType::Never);
-            self.scrolls.borrow_mut().push(scroll.vadjustment());
+            self.scrolls.borrow_mut().push((format!("lane:{column}"), scroll.vadjustment()));
             lane.append(&scroll);
             self.lane_drop(&lane, column);
             let mut placed = Vec::new();
@@ -1748,7 +1811,7 @@ impl Board {
                 if !grouping.is_empty() {
                     let group = group_of(task, &grouping);
                     if previous.as_ref() != Some(&group) {
-                        cards.append(&label(&group_title(&group, &grouping), "board-group-heading"));
+                        cards.append(&label(&group_title(&group), "board-group-heading"));
                         previous = Some(group);
                     }
                 }
@@ -1956,7 +2019,7 @@ impl Board {
         list.add_css_class("board-list");
         let scroll = crate::app::scrolled(&list);
         scroll.set_hscrollbar_policy(gtk::PolicyType::Never);
-        self.scrolls.borrow_mut().push(scroll.vadjustment());
+        self.scrolls.borrow_mut().push(("list".into(), scroll.vadjustment()));
         self.content.append(&scroll);
         let hidden = self.hidden.borrow().clone();
         let grouping = self.group.borrow().clone();
@@ -1984,7 +2047,7 @@ impl Board {
                 if !grouping.is_empty() {
                     let group = group_of(task, &grouping);
                     if previous.as_ref() != Some(&group) {
-                        section.append(&label(&group_title(&group, &grouping), "list-group-heading"));
+                        section.append(&label(&group_title(&group), "list-group-heading"));
                         previous = Some(group);
                     }
                 }
@@ -2525,8 +2588,8 @@ impl Board {
         if let Some(parent) = task["parent_id"].as_i64().and_then(|p| tasks.iter().find(|t| t["id"].as_i64() == Some(p))) {
             prop("Parent", self.task_link(parent).upcast_ref());
         }
-        prop("Updated", &value(&format!("{} ago", ago(text(&task, "updated_at"))).replace("now ago", "just now")));
-        prop("Created", &value(&format!("{} ago", ago(text(&task, "created_at"))).replace("now ago", "just now")));
+        prop("Updated", &value(&since(&ago(text(&task, "updated_at")))));
+        prop("Created", &value(&since(&ago(text(&task, "created_at")))));
         body.append(&grid);
 
         if let Some(tags) = labels_row(&task, 12) {
@@ -2677,5 +2740,21 @@ mod tests {
         assert_eq!(ago_between("2026-09-14T12:00:00Z", &now), "3w");
         assert_eq!(ago_between("2026-03-01T12:00:00Z", &now), "Mar 1");
         assert_eq!(ago_between("", &now), "");
+        assert_eq!(since("now"), "just now");
+        assert_eq!(since("45m"), "45m ago");
+        assert_eq!(since("Mar 1"), "on Mar 1");
+        assert_eq!(since(""), "—");
+    }
+    #[test]
+    fn groups_sort_in_their_own_order_with_fallbacks_last() {
+        let sizes: Vec<String> = ["L", "", "S", "M"]
+            .iter()
+            .map(|s| group_of(&json!({"size": s}), "size"))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        assert_eq!(sizes.iter().map(|g| group_title(g)).collect::<Vec<_>>(), ["S", "M", "L", "None"]);
+        assert!(group_of(&json!({"sessions":[]}), "session") > group_of(&json!({"sessions":["zebra"]}), "session"));
+        assert_eq!(group_title(&group_of(&json!({}), "module")), "No module");
     }
 }

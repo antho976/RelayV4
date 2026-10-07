@@ -6,10 +6,9 @@ use std::collections::HashMap;
 thread_local! {
     /// Rendered icons, by their exact SVG document.
     ///
-    /// Icons repaint on map *and on every state change* — hover, focus, pressed, insensitive —
-    /// and the shell has dozens of them, several per session row. Re-parsing the same handful
-    /// of documents on each of those was work the toolkit did not need to see; the set is tiny
-    /// and bounded by the pinned geometry above, so it is simply kept.
+    /// A document depends only on the glyph and its stroke, never on a colour (the paintable
+    /// is symbolic), so every image of one glyph shares one paintable; the set is tiny and
+    /// bounded by the pinned geometry below, so it is simply kept.
     static RENDERED: RefCell<HashMap<String, gtk::Svg>> = RefCell::new(HashMap::new());
 }
 
@@ -24,6 +23,9 @@ fn rendered(document: String) -> gtk::Svg {
         svg
     })
 }
+
+/// GtkSvg's paint server for the symbolic foreground: the CSS `color` of the widget drawing it.
+const FOREGROUND: &str = "url(#gpa:foreground)";
 
 pub fn image(name: &str, size: i32) -> gtk::Image {
     image_with_stroke(name, size, 1.5)
@@ -68,8 +70,10 @@ pub fn image_with_stroke(name: &str, size: i32, stroke: f64) -> gtk::Image {
             r##"<path d="M4 11V7.5A4 4 0 0 1 12 7.5V11l1.5 2h-11L4 11z" /><path d="M6.5 13.5a1.5 1.5 0 0 0 3 0" />"##
         }
         "search" => r##"<circle cx="7" cy="7" r="4.5" /><path d="M10.5 10.5L14 14" />"##,
+        // The knobs are gaps in the rails rather than discs of a background colour, so they
+        // sit right on any surface.
         "settings" | "sliders" => {
-            r##"<path d="M2 4.5h12M2 8h12M2 11.5h12" /><circle cx="5.5" cy="4.5" r="1.5" fill="#141416" /><circle cx="10.5" cy="8" r="1.5" fill="#141416" /><circle cx="6.5" cy="11.5" r="1.5" fill="#141416" />"##
+            r##"<path d="M2 4.5h2M7 4.5h7M2 8h7M12 8h2M2 11.5h3M8 11.5h6" /><circle cx="5.5" cy="4.5" r="1.5" /><circle cx="10.5" cy="8" r="1.5" /><circle cx="6.5" cy="11.5" r="1.5" />"##
         }
         "close" => r##"<path d="M4 4l8 8M12 4l-8 8" />"##,
         "minimize" => r##"<path d="M3.5 8h9" />"##,
@@ -208,28 +212,15 @@ pub fn image_with_stroke(name: &str, size: i32, stroke: f64) -> gtk::Image {
         }
         _ => r##"<circle cx="8" cy="8" r="3"/>"##,
     };
-    let image = gtk::Image::new();
+    // Symbolic: GtkImage hands the paintable the widget's CSS colour on every draw, so an icon
+    // follows hover, its parent's classes (a selected nav key) and a palette reload alike.
+    // `currentColor` would resolve inside the document, where no colour is set.
+    let geometry = geometry.replace("currentColor", FOREGROUND);
+    let document = format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="{FOREGROUND}" stroke-width="{stroke}" stroke-linecap="round" stroke-linejoin="round">{geometry}</svg>"##
+    );
+    let image = gtk::Image::from_paintable(Some(&rendered(document)));
     image.set_pixel_size(size);
-    let paint = move |image: &gtk::Image| {
-        let color = image.color();
-        let background = image
-            .style_context()
-            .lookup_color("console")
-            .map(|color| color.to_string())
-            .unwrap_or_else(|| "#141416".into());
-        let geometry = if geometry.contains("#141416") {
-            std::borrow::Cow::Owned(geometry.replace("#141416", &background))
-        } else {
-            std::borrow::Cow::Borrowed(geometry)
-        };
-        let document = format!(
-            r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" color="{color}" stroke="{color}" stroke-width="{stroke}" stroke-linecap="round" stroke-linejoin="round">{geometry}</svg>"##
-        );
-        image.set_paintable(Some(&rendered(document)));
-    };
-    // GTK 4.22 SVG paintables do not inherit currentColor from their widget.
-    image.connect_map(paint);
-    image.connect_state_flags_changed(move |image, _| paint(image));
     image
 }
 

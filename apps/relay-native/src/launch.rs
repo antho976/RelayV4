@@ -789,12 +789,17 @@ impl Ui {
                 ui.call("provider.list", json!({}))
             );
             if !launch_is_current(&ui, project, generation, &form) {
+                if launch_is_shown(&ui, &form) {
+                    status.set_text(STALE);
+                }
                 return;
             }
-            let provider_data = providers
-                .ok()
-                .map(|v| rows(&v, "providers"))
-                .unwrap_or_default();
+            // A failed check says so and leaves both providers open: session.create still
+            // refuses one that is not installed.
+            let (provider_data, provider_error) = match providers {
+                Ok(v) => (rows(&v, "providers"), None),
+                Err(e) => (Vec::new(), Some(e.to_string())),
+            };
             match task_result {
                 Ok(v) => {
                     let tasks = rows(&v, "tasks");
@@ -804,13 +809,15 @@ impl Ui {
                             let name = if i == 0 { "claude" } else { "codex" };
                             let info = provider_data.iter().find(|p| text(p, "provider") == name);
                             let installed = info.is_some_and(|p| p["installed"] == true);
-                            key.set_sensitive(installed);
+                            key.set_sensitive(installed || provider_error.is_some());
                             account.set_text(
                                 &info
                                     .and_then(|p| p["signed_in_as"].as_str())
                                     .map(|s| format!("Signed in as {s}"))
                                     .unwrap_or_else(|| {
-                                        if installed {
+                                        if provider_error.is_some() {
+                                            "Could not check the CLI".into()
+                                        } else if installed {
                                             "Not signed in".into()
                                         } else {
                                             "CLI not installed".into()
@@ -828,6 +835,13 @@ impl Ui {
                                 }
                             ));
                         }
+                        // Start on an installed provider: a Codex-only machine opens on Codex.
+                        let cards = &profile.provider_cards;
+                        if !cards[profile.provider.selected() as usize].0.is_sensitive() {
+                            if let Some((key, _, _)) = cards.iter().find(|(key, _, _)| key.is_sensitive()) {
+                                key.set_active(true);
+                            }
+                        }
                     }
                     // Agent 1 now, with the task the sheet was opened for; any other agent
                     // when its key is first pressed.
@@ -836,7 +850,10 @@ impl Ui {
                         p[index].fill_tasks(&tasks, None);
                     }
                     *loaded.borrow_mut() = Some(tasks);
-                    status.set_text("Ready to launch");
+                    match &provider_error {
+                        Some(e) => status.set_text(&format!("Ready to launch · could not check the provider CLIs: {e}")),
+                        None => status.set_text("Ready to launch"),
+                    }
                     ready.set_sensitive(true);
                 }
                 Err(e) => status.set_text(&e.to_string()),
@@ -845,7 +862,11 @@ impl Ui {
         let weak = Rc::downgrade(self);
         start.connect_clicked(move|key|{
             let Some(ui)=weak.upgrade()else{return;};
-            if !launch_is_current(&ui,project,generation,&heading){return;}
+            if !launch_is_current(&ui,project,generation,&heading){
+                // Still on screen after the engine reconnected: say so instead of doing nothing.
+                if launch_is_shown(&ui,&heading){ui.show_error(STALE);}
+                return;
+            }
             if ui.launch_busy.replace(true){return;}
             let group=mode.selected()==1;let two=builders.selected()==1;let indexes=if group{if two{vec![0,2,1]}else{vec![0,2]}}else{(0..count.value_as_int()as usize).collect()};
             let mut profiles_data=Vec::new();
@@ -908,9 +929,13 @@ impl Ui {
     }
 }
 
+const STALE: &str = "This form is out of date after a reconnect. Close it and open New session again.";
+
 fn launch_is_current(ui: &Ui, project: i64, generation: u64, heading: &gtk::Box) -> bool {
-    ui.project.get() == project
-        && ui.generation.get() == generation
-        && ui.launch.reveals_child()
-        && ui.launch_box.first_child().as_ref() == Some(heading.upcast_ref())
+    ui.project.get() == project && ui.generation.get() == generation && launch_is_shown(ui, heading)
+}
+
+/// This form is the one the sheet shows, whatever has changed under it.
+fn launch_is_shown(ui: &Ui, heading: &gtk::Box) -> bool {
+    ui.launch.reveals_child() && ui.launch_box.first_child().as_ref() == Some(heading.upcast_ref())
 }

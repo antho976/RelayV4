@@ -34,6 +34,7 @@ struct Phone {
     /// The label of the popover currently showing this session, if one is open.
     view: Option<glib::WeakRef<gtk::Label>>,
     stop: Option<glib::WeakRef<gtk::Button>>,
+    install: Option<glib::WeakRef<gtk::Button>>,
 }
 
 thread_local! {
@@ -88,7 +89,7 @@ fn phone_error(error: &Error) -> String {
         Some("device.not_ready") | Some("device.none") => "The phone is not connected or has not authorized this computer. Reconnect it and accept the USB debugging prompt.".into(),
         Some("device.worktree") => "This agent's worktree is missing or does not belong to the project.".into(),
         Some("device.busy") => error.to_string(),
-        Some("device.sdk_missing") | Some("device.adb_missing") => format!("Android SDK not found: {error}"),
+        Some("avd.sdk_missing") | Some("device.adb_missing") => format!("Android SDK not found: {error}"),
         _ => error.to_string(),
     }
 }
@@ -104,7 +105,10 @@ impl Ui {
         let closed = text(payload, "state") == "closed";
         if closed {
             // Settles a close whose answer timed out while the engine was still removing its worktree.
-            with(|a| a.closing.remove(&name));
+            with(|a| {
+                a.closing.remove(&name);
+                a.phone.remove(&name);
+            });
         }
         // The board shows a session only as a name on its task, so only a new task link changes it.
         let mut relinked = !closed && payload["task_id"].is_i64();
@@ -702,6 +706,7 @@ impl Ui {
             let phone = a.phone.entry(name.clone()).or_default();
             phone.view = Some(status.downgrade());
             phone.stop = Some(stop.downgrade());
+            phone.install = Some(install.downgrade());
             phone.clone()
         });
         status.set_text(&phone.status);
@@ -856,9 +861,8 @@ fn phone_status(name: &str, status: &str, busy: bool, run: Option<i64>) {
         let phone = a.phone.entry(name.to_string()).or_default();
         phone.status = status.to_string();
         phone.busy = busy;
-        if run.is_some() {
-            phone.run = run;
-        }
+        // A new install starts with no run, so Stop can never reach the previous one.
+        phone.run = run;
         phone.clone()
     });
     if let Some(view) = phone.view.as_ref().and_then(|view| view.upgrade()) {
@@ -867,6 +871,10 @@ fn phone_status(name: &str, status: &str, busy: bool, run: Option<i64>) {
     }
     if let Some(stop) = phone.stop.as_ref().and_then(|stop| stop.upgrade()) {
         stop.set_visible(busy && phone.run.is_some());
+    }
+    // A popover opened while a run was live shows its own key; it comes back with the run's end.
+    if let Some(install) = phone.install.as_ref().and_then(|install| install.upgrade()) {
+        install.set_sensitive(!busy);
     }
 }
 

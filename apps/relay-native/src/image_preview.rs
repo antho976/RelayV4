@@ -394,6 +394,7 @@ impl Editor {
         row: &impl IsA<gtk::Widget>,
         path: &str,
         stamp: String,
+        size: Option<u64>,
     ) {
         if !is_image(path) {
             return;
@@ -490,30 +491,47 @@ impl Editor {
                     show_thumb(&card, &picture, &note, &thumb);
                     return;
                 }
+                // The tree already knows the size: a file the engine would only truncate is not
+                // worth 16 MiB on the wire to learn that.
+                if size.is_some_and(|size| size > MAX_BYTES) {
+                    let thumb = Thumb { texture: None, caption: "No preview · Image exceeds the 16 MiB preview limit.".into() };
+                    remember(key, thumb.clone());
+                    show_thumb(&card, &picture, &note, &thumb);
+                    return;
+                }
                 let path = path.clone();
                 glib::spawn_future_local(async move {
                     let result = crate::client::Client::image_read(&ui.rt, ui.path.clone(),
                         json!({"project_id":project,"worktree":optional_scope(&worktree),"path":path,"max_bytes":MAX_BYTES}))
-                        .await
-                        .map_err(|err| err.to_string());
-                    let size = result.as_ref().ok().and_then(|v| v["size"].as_u64()).unwrap_or(0);
+                        .await;
+                    // Only what the file itself decides is kept: a timeout or a lost connection
+                    // is retried on the next hover rather than shown until the file changes.
                     let decoded = match result {
-                        Ok(value) => ui
-                            .rt
-                            .spawn_blocking(move || decode_to(value, THUMB_EDGE))
-                            .await
-                            .map_err(|e| e.to_string())
-                            .and_then(|v| v),
-                        Err(error) => Err(error),
+                        Ok(value) => {
+                            // The pointer moved on while the bytes came: no one would see the
+                            // thumbnail, and a full-size decode is the expensive half.
+                            if !popover.is_visible() {
+                                return;
+                            }
+                            let size = value["size"].as_u64().unwrap_or(0);
+                            match ui.rt.spawn_blocking(move || decode_to(value, THUMB_EDGE)).await {
+                                Ok(decoded) => Ok((decoded, size)),
+                                Err(error) => Err(error.to_string()),
+                            }
+                        }
+                        Err(error) => Err(error.to_string()),
                     };
-                    let thumb = match decoded {
-                        Ok(decoded) => Thumb {
+                    let (thumb, keep) = match decoded {
+                        Ok((Ok(decoded), size)) => (Thumb {
                             caption: caption(&decoded, size, &path),
                             texture: Some(decoded.texture()),
-                        },
-                        Err(error) => Thumb { texture: None, caption: format!("No preview · {error}") },
+                        }, true),
+                        Ok((Err(error), _)) => (Thumb { texture: None, caption: format!("No preview · {error}") }, true),
+                        Err(error) => (Thumb { texture: None, caption: format!("No preview · {error}") }, false),
                     };
-                    remember(key, thumb.clone());
+                    if keep {
+                        remember(key, thumb.clone());
+                    }
                     show_thumb(&card, &picture, &note, &thumb);
                 });
             });
