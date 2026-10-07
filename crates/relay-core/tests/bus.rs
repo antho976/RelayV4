@@ -220,7 +220,16 @@ fn device_discovery_mirror_input_and_run_lifecycle() {
     assert_eq!(mirror["height"], 1280);
     let mirror_id = mirror["mirror_id"].as_i64().unwrap();
     call(&e, Actor::User, "device.mirror.input", json!({"mirror_id":mirror_id,"event":{"type":"tap","x":100,"y":200}})).into_result().unwrap();
-    call(&e, Actor::User, "device.mirror.input", json!({"mirror_id":mirror_id,"event":{"type":"swipe","x1":0,"y1":0,"x2":575,"y2":1279,"duration_ms":300}})).into_result().unwrap();
+    call(&e, Actor::User, "device.mirror.input", json!({"mirror_id":mirror_id,"event":{"type":"swipe","x1":0,"y1":0,"x2":575,"y2":1279}})).into_result().unwrap();
+    // A swipe is instant; a duration it would ignore is refused rather than dropped.
+    let timed = call(&e, Actor::User, "device.mirror.input", json!({"mirror_id":mirror_id,"event":{"type":"swipe","x1":0,"y1":0,"x2":575,"y2":1279,"duration_ms":300}})).into_result().unwrap_err();
+    assert_eq!(timed.code, "device.input");
+    assert!(timed.message.contains("duration_ms"), "{}", timed.message);
+    // One clipboard message cannot be split: too long is an error, not a pasted prefix.
+    let long = "x".repeat(relay_core::mirror::SET_CLIPBOARD_MAX_LENGTH + 1);
+    let clipped = call(&e, Actor::User, "device.mirror.input", json!({"mirror_id":mirror_id,"event":{"type":"setclipboard","text":long,"paste":true}})).into_result().unwrap_err();
+    assert_eq!(clipped.code, "device.input");
+    call(&e, Actor::User, "device.mirror.input", json!({"mirror_id":mirror_id,"event":{"type":"setclipboard","text":"x".repeat(relay_core::mirror::SET_CLIPBOARD_MAX_LENGTH),"paste":true}})).into_result().unwrap();
     call(&e, Actor::User, "device.mirror.stop", json!({"mirror_id":mirror_id})).into_result().unwrap();
 
     let (workspace, repo) = tmp_repo();
