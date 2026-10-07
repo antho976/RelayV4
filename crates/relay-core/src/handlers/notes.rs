@@ -44,18 +44,25 @@ fn get_note(
     .ok_or_else(|| BusError::not_found("notes.not_found", format!("no note {id}")))
 }
 
-fn assert_actor_project(ctx: &Ctx, project_id: Id) -> Result<(), BusError> {
-    crate::handlers::workspace::get_project(ctx.tx(), project_id)?;
+/// The project a bound session acts in; `None` for the person, who reaches every project.
+pub(crate) fn actor_project(ctx: &Ctx) -> Result<Option<Id>, BusError> {
     if let Some(session_id) = ctx.actor_session_id() {
         let row = sessions::by_id(ctx.tx(), session_id)?
             .ok_or_else(|| BusError::actor("bound session no longer exists"))?;
-        if row.session.project_id != project_id {
-            return Err(BusError::not_own("project"));
-        }
+        Ok(Some(row.session.project_id))
     } else if ctx.actor.is_agent() {
-        return Err(BusError::actor(
+        Err(BusError::actor(
             "agent actor is not bound to a live session",
-        ));
+        ))
+    } else {
+        Ok(None)
+    }
+}
+
+pub(crate) fn assert_actor_project(ctx: &Ctx, project_id: Id) -> Result<(), BusError> {
+    crate::handlers::workspace::get_project(ctx.tx(), project_id)?;
+    if actor_project(ctx)?.is_some_and(|own| own != project_id) {
+        return Err(BusError::not_own("project"));
     }
     Ok(())
 }
@@ -480,8 +487,18 @@ pub fn register(e: &mut Engine) {
         Ok(note)
     });
     e.register::<Append>(|ctx: &mut Ctx, p| {
-        let target = p.target.as_deref().unwrap_or("standing");
-        let (id, text) = match (p.note_id, p.project_id, target) {
+        let mut target = p.target.as_deref().unwrap_or("standing");
+        let mut note_id = p.note_id;
+        let mut project_id = p.project_id;
+        // The suggestions note is written only through its own arm, stamped and capped. Named
+        // by id it took unstamped text of any length that read as another session's entry
+        // (RA-385).
+        if let (Some(id), None, None) = (p.note_id, p.project_id, p.target.as_deref()) {
+            if let Ok((note, _, true)) = get_note(ctx.tx(), id, false) {
+                (target, note_id, project_id) = ("suggestions", None, Some(note.project_id));
+            }
+        }
+        let (id, text) = match (note_id, project_id, target) {
             (Some(id), None, "standing") if p.target.is_none() => (id, p.text),
             (None, Some(project_id), "standing") => {
                 assert_actor_project(ctx, project_id)?;

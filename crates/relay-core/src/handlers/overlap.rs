@@ -79,20 +79,28 @@ fn actor_session_in(
     Ok(row)
 }
 
-fn relative_path(raw: &str) -> Result<String, BusError> {
-    let path = Path::new(raw);
-    if raw.is_empty()
-        || path.is_absolute()
-        || path
-            .components()
-            .any(|c| !matches!(c, Component::Normal(_)))
-    {
-        return Err(BusError::invalid(
-            "overlap.path",
-            "path must be a normalized project-relative path",
-        ));
+/// A project-relative path in the one spelling claims and changed files share: its normal
+/// components joined by `/`, so `./src//a.rs` is `src/a.rs`, as git status reports it. `None`
+/// for an empty, absolute or escaping path. Claims are compared as strings, so every way in
+/// must store them through this, `session.claim` included, or `./src/a.rs` never meets a
+/// peer's `src/a.rs` (RA-387).
+pub(crate) fn normalize_relative(raw: &str) -> Option<String> {
+    let mut parts = Vec::new();
+    for component in Path::new(raw.trim()).components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+            Component::CurDir => {}
+            _ => return None,
+        }
     }
-    Ok(path.to_string_lossy().replace('\\', "/"))
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
+fn relative_path(raw: &str) -> Result<String, BusError> {
+    normalize_relative(raw).ok_or_else(|| BusError::invalid(
+        "overlap.path",
+        "path must be a project-relative path with no ..",
+    ))
 }
 
 fn changed_files(worktree: &Path) -> Result<BTreeSet<String>, BusError> {
@@ -351,7 +359,15 @@ fn collect_changes(targets: &[(String, String)]) -> Result<Changes, BusError> {
         let changed = match scanned.get(&checkout) {
             Some(changed) => changed.clone(),
             None => {
-                let files = changed_files(path)?;
+                let files = match changed_files(path) {
+                    Ok(files) => files,
+                    // One broken checkout (half removed, pruned, unreadable) is left out like a
+                    // missing one, not allowed to fail every flag in the project (RA-388).
+                    Err(error) => {
+                        tracing::warn!(session = %name, worktree = %worktree, error = %error.message, "overlap scan skipped a checkout it could not read");
+                        continue;
+                    }
+                };
                 let symbols = changed_symbols(path, &files);
                 let changed: Changed = std::sync::Arc::new((files, symbols));
                 scanned.insert(checkout.clone(), changed.clone());
@@ -363,10 +379,19 @@ fn collect_changes(targets: &[(String, String)]) -> Result<Changes, BusError> {
     Ok(changes)
 }
 
+/// How long an inactive overlap row is kept, so an ack survives a collision that comes and goes.
+const INACTIVE_KEEP_DAYS: i64 = 30;
+
 /// The store half again: cross the collected changes with the claims and write the findings.
-/// A session that closed while the scan ran simply has no row to collide with.
-fn apply_scan(tx: &Transaction, project_id: Id, now: &str, changes: Changes) -> Result<Vec<Overlap>, BusError> {
+/// The changes were read before the transaction opened, so a session that closed meanwhile is
+/// dropped from them first: its close deactivated its overlaps, and a finding from the stale
+/// snapshot would turn them back on (RA-389).
+fn apply_scan(tx: &Transaction, project_id: Id, now: &str, mut changes: Changes) -> Result<Vec<Overlap>, BusError> {
     crate::handlers::workspace::get_project(tx, project_id)?;
+    let live = tx.prepare_cached("SELECT name FROM sessions WHERE project_id=?1 AND state!='closed'").bus()?
+        .query_map([project_id], |r| r.get::<_, String>(0)).bus()?
+        .collect::<rusqlite::Result<BTreeSet<_>>>().bus()?;
+    changes.retain(|name, _| live.contains(name));
     let mut findings = BTreeMap::<String, Finding>::new();
     let names = changes.keys().cloned().collect::<Vec<_>>();
     for left in 0..names.len() {
@@ -481,11 +506,13 @@ fn apply_scan(tx: &Transaction, project_id: Id, now: &str, changes: Changes) -> 
         }
     }
 
-    tx.execute(
-        "UPDATE overlaps SET active=0 WHERE project_id=?1",
-        [project_id],
-    )
-    .bus()?;
+    // Every scan rewrote every historical row too, and nothing ever removed one, while new
+    // session pairs keep minting them (RA-390). A row already inactive and long unseen goes;
+    // then only the active rows are touched.
+    tx.prepare_cached("DELETE FROM overlaps WHERE project_id=?1 AND active=0 AND last_seen<?2").bus()?
+        .execute(params![project_id, crate::time::days_ago(INACTIVE_KEEP_DAYS)]).bus()?;
+    tx.prepare_cached("UPDATE overlaps SET active=0 WHERE project_id=?1 AND active=1").bus()?
+        .execute([project_id]).bus()?;
     for (fingerprint, finding) in findings {
         tx.execute(
             "INSERT INTO overlaps(project_id, fingerprint, sessions, path, symbol, kind, first_seen, last_seen, active)
@@ -587,7 +614,12 @@ pub fn register(e: &mut Engine) {
                 params![p.project_id, own.session.id, own.session.name, path, symbol, p.note, ctx.now],
             ).bus()?;
             let overlaps = apply_scan(ctx.tx(), p.project_id, &ctx.now, changes)?;
-            let overlap = overlaps.into_iter().find(|overlap| overlap.kind == OverlapKind::Claim && overlap.path == path && overlap.sessions.contains(&own.session.name))
+            // The claim just made: same path and symbol, and the caller's own row before a pair
+            // that shares it (RA-391).
+            let wanted = (!symbol.is_empty()).then_some(symbol.as_str());
+            let overlap = overlaps.into_iter()
+                .filter(|overlap| overlap.kind == OverlapKind::Claim && overlap.path == path && overlap.symbol.as_deref() == wanted && overlap.sessions.contains(&own.session.name))
+                .min_by_key(|overlap| overlap.sessions.len() != 1)
                 .ok_or_else(|| BusError::internal("claim did not produce an overlap row"))?;
             ctx.set_project(p.project_id);
             ctx.emit("overlap.changed", serde_json::to_value(&overlap).bus()?);
@@ -733,5 +765,44 @@ mod tests {
         // Nothing changed: no event for a window to refresh on.
         rescan(&engine, 1).unwrap();
         assert!(!std::iter::from_fn(|| events.try_recv().ok()).any(|event| event.ev == "overlap.changed"));
+
+        // A flag answers with the claim it made, symbol and all, not the first one on the path
+        // (RA-391), and `./` names the same file git status does (RA-387).
+        let flag = |path: &str, symbol: Option<&str>| engine.dispatch(
+            Request::new(Actor::agent(&a), "overlap.flag", serde_json::json!({"project_id": 1, "path": path, "symbol": symbol})),
+            crate::engine::Door::InProcess,
+        ).into_result().unwrap_or_else(|error| panic!("overlap.flag: {} {}", error.code, error.message));
+        let whole = flag("./lib.rs", None);
+        assert_eq!((whole["path"].as_str(), whole["symbol"].as_str()), (Some("lib.rs"), None), "{whole}");
+        let one = flag("lib.rs", Some("one"));
+        assert_eq!(one["symbol"], "one", "{one}");
+        assert_eq!(one["sessions"], serde_json::json!([a]), "{one}");
+
+        // A scan read before a session closed must not bring its overlaps back (RA-389), and a
+        // checkout that cannot be read is skipped rather than failing the scan (RA-388).
+        let broken = root.path().join("not-a-repo");
+        std::fs::create_dir_all(&broken).unwrap();
+        let mut targets = scan_targets(&engine.store.lock(), 1).unwrap();
+        targets.push(("ghost".into(), broken.display().to_string()));
+        let stale = collect_changes(&targets).unwrap();
+        assert!(stale.contains_key(&c) && !stale.contains_key("ghost"));
+        engine.store.lock().execute("UPDATE sessions SET state='closed' WHERE name=?1", [&c]).unwrap();
+        let after = {
+            let mut conn = engine.store.lock();
+            let tx = conn.transaction().unwrap();
+            let after = apply_scan(&tx, 1, &crate::time::now(), stale).unwrap();
+            tx.commit().unwrap();
+            after
+        };
+        assert!(after.iter().all(|overlap| !overlap.sessions.contains(&c)), "{after:?}");
+    }
+
+    #[test]
+    fn claim_paths_have_one_spelling() {
+        assert_eq!(normalize_relative(" ./src//a.rs ").as_deref(), Some("src/a.rs"));
+        assert_eq!(normalize_relative("src/./a.rs/").as_deref(), Some("src/a.rs"));
+        for bad in ["", ".", "/etc/passwd", "../a.rs", "src/../../a.rs"] {
+            assert_eq!(normalize_relative(bad), None, "{bad:?}");
+        }
     }
 }

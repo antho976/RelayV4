@@ -317,7 +317,7 @@ pub fn register(engine: &mut Engine) {
         guardrail::fill_payload_hashes(ctx.tx())?;
         let mut sql = String::from("SELECT * FROM holds WHERE 1=1");
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        if let Some(project_id) = payload.project_id {
+        if let Some(project_id) = visible_project(ctx, payload.project_id)? {
             sql.push_str(" AND project_id = ?");
             args.push(Box::new(project_id));
         }
@@ -349,6 +349,7 @@ pub fn register(engine: &mut Engine) {
     engine.register::<HoldGet>(|ctx, payload| {
         guardrail::fill_payload_hashes(ctx.tx())?;
         let mut hold = guardrail::hold_by_id(ctx.tx(), payload.hold_id)?;
+        assert_visible(ctx, hold.project_id)?;
         // A large text the hold kept beside the store is read back only when asked for whole;
         // the envelope holds it already cut. Confirm always replays it whole.
         let full = payload.full.unwrap_or(false);
@@ -390,13 +391,17 @@ pub fn register(engine: &mut Engine) {
     );
     engine.register::<Reject>(reject);
     engine.register::<ExceptionRequest>(request);
-    engine.register::<ExceptionGet>(|ctx, payload| grants::by_id(ctx.tx(), payload.request_id));
+    engine.register::<ExceptionGet>(|ctx, payload| {
+        let request = grants::by_id(ctx.tx(), payload.request_id)?;
+        assert_visible(ctx, request.project_id)?;
+        Ok(request)
+    });
     engine.register::<ExceptionsList>(|ctx, payload| {
         // Whether the asking session is still alive decides whether its grant is (RA-105).
         let live = "EXISTS(SELECT 1 FROM sessions s WHERE s.id = holds.session_id AND s.state != 'closed')";
         let mut sql = format!("SELECT holds.*, {live} AS live FROM holds WHERE op = 'guardrail.request'");
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        if let Some(project_id) = payload.project_id {
+        if let Some(project_id) = visible_project(ctx, payload.project_id)? {
             sql.push_str(" AND project_id = ?");
             args.push(Box::new(project_id));
         }
@@ -431,6 +436,35 @@ pub fn register(engine: &mut Engine) {
         Ok(ExceptionsListOut { requests })
     });
     engine.register::<GrantRevoke>(revoke);
+}
+
+/// The project an agent's session belongs to, or `None` for a person. An agent sees holds and
+/// exception requests in its own project and nothing outside it — the line `session.list`
+/// draws (D106, RA-379).
+fn actor_project(ctx: &Ctx) -> Result<Option<Id>, BusError> {
+    let Some(session_id) = ctx.actor_session_id() else {
+        if ctx.actor.is_agent() {
+            return Err(BusError::actor("agent actor is not bound to a live session"));
+        }
+        return Ok(None);
+    };
+    let own = sessions::by_id(ctx.tx(), session_id)?.ok_or_else(|| BusError::actor("bound session vanished"))?;
+    Ok(Some(own.session.project_id))
+}
+
+/// The project a list may show: the one asked for, narrowed to an agent's own.
+fn visible_project(ctx: &Ctx, asked: Option<Id>) -> Result<Option<Id>, BusError> {
+    match (actor_project(ctx)?, asked) {
+        (Some(own), Some(asked)) if own != asked => Err(BusError::not_own("project")),
+        (own, asked) => Ok(own.or(asked)),
+    }
+}
+
+fn assert_visible(ctx: &Ctx, project_id: Option<Id>) -> Result<(), BusError> {
+    match actor_project(ctx)? {
+        Some(own) if project_id != Some(own) => Err(BusError::not_own("project")),
+        _ => Ok(()),
+    }
 }
 
 /// `guardrail.request`: an agent that cannot progress asks a person to let it past one rule.
@@ -768,6 +802,10 @@ fn confirm(
                 &ctx.now,
             )?;
             error = error.with_confirm("guardrail.confirm", json!({"hold_id": next_id}));
+            // A new hold, as gate() would have made it: every surface that follows holds and
+            // the notification centre hear of it (RA-380).
+            ctx.emit("guardrail.held", json!({"hold_id": next_id, "session": gate_payload.session, "policy": policy}));
+            ctx.emit("notify.new", json!({"category": "guardrail", "project_id": session.session.project_id, "hold_id": next_id}));
             Response::err(ctx.req_id, error)
         }
     };

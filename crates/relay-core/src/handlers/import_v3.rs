@@ -133,6 +133,19 @@ struct V3Task {
 }
 
 pub fn import(ctx: &mut Ctx, p: ImportV3In) -> Result<ImportV3Out, BusError> {
+    // Attachment files are copied before the transaction commits. When the import fails after
+    // some were, the rows roll back and the copies are removed with them (RA-382).
+    let mut copied = Vec::new();
+    let out = import_into(ctx, p, &mut copied);
+    if out.is_err() {
+        for path in &copied {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    out
+}
+
+fn import_into(ctx: &mut Ctx, p: ImportV3In, copied: &mut Vec<PathBuf>) -> Result<ImportV3Out, BusError> {
     let project = get_project(ctx.tx(), p.project_id)?;
     ctx.set_project(project.id);
     let dry = p.dry_run.unwrap_or(false);
@@ -167,11 +180,13 @@ pub fn import(ctx: &mut Ctx, p: ImportV3In) -> Result<ImportV3Out, BusError> {
     {
         let mut st = v3.prepare_cached("SELECT id, name, created_at FROM modules ORDER BY id").bus()?;
         let rows: Vec<(i64, String, i64)> = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).bus()?.collect::<Result<_, _>>().bus()?;
+        // After the project's own modules, as module.create orders a new one (RA-381).
+        let first: i64 = tx.query_row("SELECT COALESCE(MAX(ord),-1)+1 FROM modules WHERE project_id=?1 AND deleted_at IS NULL", [project.id], |r| r.get(0)).bus()?;
         for (i, (old, name, created)) in rows.into_iter().enumerate() {
             let created = epoch_to_ts(created);
             let new_id: Id = if dry { -(old) } else {
                 tx.execute("INSERT INTO modules(project_id, name, icon, priority, ord, created_at, updated_at) VALUES (?1, ?2, NULL, 'medium', ?3, ?4, ?4)",
-                    params![project.id, name, i as i64, created]).bus()?;
+                    params![project.id, name, first + i as i64, created]).bus()?;
                 tx.last_insert_rowid()
             };
             id_map.modules.insert(old.to_string(), new_id);
@@ -200,7 +215,14 @@ pub fn import(ctx: &mut Ctx, p: ImportV3In) -> Result<ImportV3Out, BusError> {
     for t in &tasks {
         let col = columns.get(&t.column_id).copied().unwrap_or(Column::Backlog);
         let col_s = column_str(col);
-        let pos = positions.entry(col_s).or_insert(0);
+        // Each column continues after the tasks already in it, as task.create appends: an
+        // import into a populated project used to interleave with them (RA-381).
+        let pos = match positions.entry(col_s) {
+            std::collections::btree_map::Entry::Occupied(at) => at.into_mut(),
+            std::collections::btree_map::Entry::Vacant(at) => at.insert(tx.query_row(
+                "SELECT COALESCE(MAX(position),-1)+1 FROM tasks WHERE project_id=?1 AND col=?2 AND deleted_at IS NULL",
+                params![project.id, col_s], |r| r.get(0)).bus()?),
+        };
         let position = *pos;
         *pos += 1;
         // body
@@ -272,6 +294,7 @@ pub fn import(ctx: &mut Ctx, p: ImportV3In) -> Result<ImportV3Out, BusError> {
                 let dest_dir = attach_root.join(new_id.to_string());
                 std::fs::create_dir_all(&dest_dir).bus()?;
                 let dest = copy_new(&src, &dest_dir, &name).bus()?;
+                copied.push(dest.clone());
                 tx.execute("INSERT INTO attachments(task_id, name, mime, bytes, path, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![new_id, name, mime_for(&name), bytes, dest.display().to_string(), epoch_to_ts(at)]).bus()?;
             }
@@ -296,6 +319,11 @@ pub fn import(ctx: &mut Ctx, p: ImportV3In) -> Result<ImportV3Out, BusError> {
                     let title = n.get("title").and_then(Value::as_str).map(str::to_string);
                     let body = n.get("body").and_then(Value::as_str).unwrap_or("").to_string();
                     let pinned = n.get("pinned").and_then(Value::as_bool).unwrap_or(false);
+                    // v4 notes have no tags; say so rather than drop them unseen (RA-381).
+                    if let Some(tags) = n.get("tags").and_then(Value::as_array).filter(|tags| !tags.is_empty()) {
+                        let tags: Vec<String> = tags.iter().map(|tag| tag.as_str().map(str::to_string).unwrap_or_else(|| tag.to_string())).collect();
+                        warnings.push(format!("note {old} had tags {} that v4 notes do not keep", tags.join(", ")));
+                    }
                     let created = n.get("created_at").and_then(Value::as_i64).map(epoch_to_ts).unwrap_or_else(|| now.clone());
                     let updated = n.get("updated_at").and_then(Value::as_i64).map(epoch_to_ts).unwrap_or_else(|| created.clone());
                     let new_id: Id = if dry { -old } else {

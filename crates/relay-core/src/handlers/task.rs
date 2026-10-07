@@ -359,8 +359,17 @@ pub(crate) fn get_task(tx: &rusqlite::Connection, id: Id, include_deleted: bool)
     } else {
         "SELECT * FROM tasks WHERE id=?1 AND deleted_at IS NULL"
     };
-    tx.query_row(sql, [id], |row| row_task(tx, row))
-        .optional()
+    tx.prepare_cached(sql)
+        .and_then(|mut stmt| stmt.query_row([id], |row| row_task(tx, row)).optional())
+        .bus()?
+        .ok_or_else(|| BusError::not_found("task.not_found", format!("no task {id}")))
+}
+
+/// A live task's `project_id` and `parent_id`, without hydrating it: `assert_parent` walks every
+/// ancestor, and `get_task` rolled up each one's whole subtree to read two columns (RA-408).
+fn parent_link(tx: &rusqlite::Connection, id: Id) -> Result<(Id, Option<Id>), BusError> {
+    tx.prepare_cached("SELECT project_id,parent_id FROM tasks WHERE id=?1 AND deleted_at IS NULL")
+        .and_then(|mut stmt| stmt.query_row([id], |r| Ok((r.get(0)?, r.get(1)?))).optional())
         .bus()?
         .ok_or_else(|| BusError::not_found("task.not_found", format!("no task {id}")))
 }
@@ -387,21 +396,21 @@ fn assert_parent(
     child: Option<Id>,
     parent_id: Id,
 ) -> Result<(), BusError> {
-    let parent = get_task(tx, parent_id, false)?;
-    if parent.project_id != project_id {
+    let (parent_project, grandparent) = parent_link(tx, parent_id)?;
+    if parent_project != project_id {
         return Err(BusError::conflict(
             "task.parent_project",
             "a sub-task must stay in its parent's project",
         ));
     }
-    if Some(parent.id) == child {
+    if Some(parent_id) == child {
         return Err(BusError::conflict(
             "task.parent_cycle",
             "a task cannot be its own parent",
         ));
     }
     if let Some(child) = child {
-        let mut cursor = parent.parent_id;
+        let mut cursor = grandparent;
         while let Some(id) = cursor {
             if id == child {
                 return Err(BusError::conflict(
@@ -409,14 +418,14 @@ fn assert_parent(
                     "that parent is already a descendant of this task",
                 ));
             }
-            cursor = get_task(tx, id, false)?.parent_id;
+            cursor = parent_link(tx, id)?.1;
         }
     }
     let below = match child {
         Some(child) => subtree_height(tx, child)?,
         None => 0,
     };
-    if parent.depth + 1 + below >= TASK_DEPTH_MAX {
+    if depth_of(tx, parent_id).bus()? + 1 + below >= TASK_DEPTH_MAX {
         return Err(BusError::conflict(
             "task.depth",
             format!("sub-tasks nest {TASK_DEPTH_MAX} levels deep at most"),
@@ -425,7 +434,7 @@ fn assert_parent(
     let held: i64 = tx
         .query_row(
             "SELECT COUNT(*) FROM tasks WHERE parent_id=?1 AND deleted_at IS NULL AND id IS NOT ?2",
-            params![parent.id, child],
+            params![parent_id, child],
             |r| r.get(0),
         )
         .bus()?;
@@ -533,20 +542,19 @@ fn attach_bytes(
     let dir = attachment_root(ctx.engine()).join(task.id.to_string());
     std::fs::create_dir_all(&dir).bus()?;
     let path = dir.join(format!("{id}-{name}"));
-    std::fs::write(&path, bytes).bus()?;
-    ctx.tx()
-        .execute(
-            "UPDATE attachments SET path=?1 WHERE id=?2",
-            params![path.display().to_string(), id],
-        )
-        .bus()?;
-    ctx.tx()
-        .query_row(
-            "SELECT * FROM attachments WHERE id=?1",
-            [id],
-            attachment_row,
-        )
-        .bus()
+    let recorded = std::fs::write(&path, bytes).bus().and_then(|()| {
+        ctx.tx()
+            .execute(
+                "UPDATE attachments SET path=?1 WHERE id=?2",
+                params![path.display().to_string(), id],
+            )
+            .and_then(|_| ctx.tx().query_row("SELECT * FROM attachments WHERE id=?1", [id], attachment_row))
+            .bus()
+    });
+    if recorded.is_err() {
+        let _ = std::fs::remove_file(&path);
+    }
+    recorded
 }
 
 /// An attachment copied into `attachments/.staging` by `task.attach`'s read phase. Removed on
@@ -840,6 +848,12 @@ pub fn register(e: &mut Engine) {
         assert_module(ctx.tx(), p.project_id, p.module_id)?;
         if let Some(parent_id) = p.parent_id { assert_parent(ctx.tx(), p.project_id, None, parent_id)?; }
         let column = p.column.unwrap_or(Column::Backlog);
+        // An agent files work; it does not start or finish it. Active means a dispatched
+        // session and done a linked commit, and task.move refuses both to an agent — creating
+        // straight into them was the way around that. A person keeps the escape hatch (RA-410).
+        if ctx.actor.is_agent() && (matches!(column, Column::Active | Column::Done) || p.state.is_some_and(|s| s != TaskState::None)) {
+            return Err(BusError::conflict("task.column_transition", "agents create tasks in backlog, ready or in_review, with no run state"));
+        }
         let position = next_position(ctx.tx(), p.project_id, column)?;
         ctx.tx().execute(
             "INSERT INTO tasks(project_id,module_id,title,body,changelog,col,position,state,priority,size,kind,parent_id,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?13)",
@@ -848,10 +862,20 @@ pub fn register(e: &mut Engine) {
         let id = ctx.tx().last_insert_rowid();
         let mut task = get_task(ctx.tx(), id, false)?;
         if let Some(labels) = p.labels.as_ref() { set_labels(ctx, &task, labels)?; }
+        // The files are written before the transaction commits: one this request wrote is
+        // removed again when a later attachment refuses and the rows roll back (RA-409).
+        let mut written = Vec::new();
         for input in p.attachments.unwrap_or_default() {
-            let bytes = base64::engine::general_purpose::STANDARD.decode(&input.bytes_b64)
-                .map_err(|_| BusError::invalid("task.attachment_base64", "attachment bytes_b64 is invalid"))?;
-            attach_bytes(ctx, &task, &input.name, &input.mime, &bytes)?;
+            let stored = base64::engine::general_purpose::STANDARD.decode(&input.bytes_b64)
+                .map_err(|_| BusError::invalid("task.attachment_base64", "attachment bytes_b64 is invalid"))
+                .and_then(|bytes| attach_bytes(ctx, &task, &input.name, &input.mime, &bytes));
+            match stored {
+                Ok(attachment) => written.push(PathBuf::from(attachment.path)),
+                Err(error) => {
+                    for path in &written { let _ = std::fs::remove_file(path); }
+                    return Err(error);
+                }
+            }
         }
         task = get_task(ctx.tx(), id, false)?;
         ctx.set_undo("task.delete", json!({"task_id": id}), Some(json!({"updated_at": task.updated_at})));
@@ -930,7 +954,13 @@ pub fn register(e: &mut Engine) {
     });
     e.register::<Get>(|ctx, p| get_task(ctx.tx(), p.task_id, false));
 
-    e.register::<List>(|ctx, p| {
+    e.register::<List>(|ctx, mut p| {
+        // An agent reads its own project's board, as it does its notes and peers (D106): it is
+        // refused a task of the next project by task.get, and task.list handed it over (RA-411).
+        if let Some(own) = crate::handlers::notes::actor_project(ctx)? {
+            if p.project_id.is_some_and(|id| id != own) { return Err(BusError::not_own("project")) }
+            p.project_id = Some(own);
+        }
         if let Some(project_id) = p.project_id { crate::handlers::workspace::get_project(ctx.tx(), project_id)?; }
         if let Some(sort) = p.sort.as_deref() {
             if !matches!(sort, "column" | "priority" | "updated") { return Err(BusError::invalid("task.sort", "sort must be column, priority, or updated")) }
@@ -1141,7 +1171,9 @@ pub fn register(e: &mut Engine) {
         std::fs::create_dir_all(&staging).bus()?;
         let staged = StagedFile(staging.join(uuid::Uuid::new_v4().to_string()));
         let (name, mime, bytes) = match (&p.path, &p.name, &p.mime, &p.bytes_b64) {
-            (Some(path), None, None, None) => {
+            // A path may carry the name and type to store it under: undoing task.detach does,
+            // or the stored `{id}-{name}` and a generic type came back in their place (RA-414).
+            (Some(path), name, mime, None) => {
                 let src = PathBuf::from(path);
                 if !src.is_file() {
                     return Err(BusError::not_found(
@@ -1149,13 +1181,13 @@ pub fn register(e: &mut Engine) {
                         format!("no file {path}"),
                     ));
                 }
-                let name = src
+                let name = name.clone().unwrap_or_else(|| src
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("attachment")
-                    .to_string();
+                    .to_string());
                 let bytes = std::fs::copy(&src, &staged.0).bus()?;
-                (name, "application/octet-stream".to_string(), bytes)
+                (name, mime.clone().unwrap_or_else(|| "application/octet-stream".to_string()), bytes)
             }
             (None, Some(name), Some(mime), Some(encoded)) => {
                 let bytes = base64::engine::general_purpose::STANDARD
@@ -1172,7 +1204,7 @@ pub fn register(e: &mut Engine) {
             _ => {
                 return Err(BusError::invalid(
                     "task.attachment_input",
-                    "provide either path or name + mime + bytes_b64",
+                    "provide either path (optionally with name and mime) or name + mime + bytes_b64",
                 ))
             }
         };
@@ -1212,7 +1244,7 @@ pub fn register(e: &mut Engine) {
             .bus()?;
         ctx.set_undo(
             "task.attach",
-            json!({"task_id":task.id,"path":attachment.path}),
+            json!({"task_id":task.id,"path":attachment.path,"name":attachment.name,"mime":attachment.mime}),
             None,
         );
         emit_task(ctx, &get_task(ctx.tx(), task.id, false)?)?;
@@ -1265,9 +1297,17 @@ pub fn register(e: &mut Engine) {
         })?;
         let mut created = Vec::new();
         if let Some(template) = &p.create {
-            for _ in 0..=children.len() {
+            for at in 0..=children.len() {
                 let mut create = template.clone();
                 create.task_id = None;
+                // The template is whole only for the task dispatched by name. Its branch is
+                // checked out once already, its prompt is that task's assignment and its pair
+                // partner pairs with one session: a fanned sub-task gets none of them (RA-415).
+                if at > 0 {
+                    create.branch = None;
+                    create.prompt = None;
+                    create.pair_with = None;
+                }
                 let out = ctx.engine().dispatch(
                     relay_bus::Request::new(ctx.actor.clone(), "session.create", serde_json::to_value(&create).bus()?),
                     crate::engine::Door::InProcess,
@@ -1422,7 +1462,17 @@ pub fn register(e: &mut Engine) {
         if let Some(parent_id) = p.parent_id {
             assert_parent(ctx.tx(), before.project_id, Some(before.id), parent_id)?;
         }
-        let position = p.position.unwrap_or(before.position).max(0);
+        // `position` is the board's column order, so it is taken as an index in the task's
+        // column, the way task.move takes it, and the column renumbered around it. Written raw it
+        // reordered the column by accident, and a huge one broke every append to it (RA-417).
+        let mut undo = json!({"task_id":before.id,"parent_id":before.parent_id});
+        let position = match p.position {
+            Some(at) => {
+                undo["position"] = json!(column_index(ctx.tx(), &before)?);
+                open_slot(ctx.tx(), before.project_id, before.column, before.id, at)?
+            }
+            None => before.position,
+        };
         ctx.tx()
             .execute(
                 "UPDATE tasks SET parent_id=?1,position=?2,updated_at=?3 WHERE id=?4",
@@ -1432,7 +1482,7 @@ pub fn register(e: &mut Engine) {
         let task = get_task(ctx.tx(), before.id, false)?;
         ctx.set_undo(
             "task.parent.set",
-            json!({"task_id":before.id,"parent_id":before.parent_id,"position":before.position}),
+            undo,
             Some(json!({"updated_at":task.updated_at})),
         );
         emit_task(ctx, &task)?;
@@ -1503,7 +1553,7 @@ pub fn register(e: &mut Engine) {
     });
 
     e.register::<LabelList>(|ctx, p| {
-        crate::handlers::workspace::get_project(ctx.tx(), p.project_id)?;
+        crate::handlers::notes::assert_actor_project(ctx, p.project_id)?;
         let mut stmt = ctx
             .tx()
             .prepare_cached("SELECT id,project_id,name,created_at FROM labels WHERE project_id=?1 ORDER BY name COLLATE NOCASE")
@@ -1523,12 +1573,13 @@ pub fn register(e: &mut Engine) {
         let other = assert_relatable(ctx.tx(), &task, p.other_id)?;
         let rel = relation_str(p.relation);
         // duplicate_of is single-valued: a task duplicates one other task, so a second call
-        // replaces the first rather than stacking edges.
-        let replaced = if p.relation == TaskRelation::DuplicateOf { task.duplicate_of } else { None };
-        if replaced.is_some() {
-            ctx.tx().execute("DELETE FROM task_relations WHERE from_task=?1 AND rel='duplicate_of'", [task.id]).bus()?;
+        // replaces the first rather than stacking edges — every first, an edge to a deleted
+        // task included, which `task.duplicate_of` does not show (RA-418).
+        let replaced = if p.relation == TaskRelation::DuplicateOf { task.duplicate_of.filter(|prior| *prior != other) } else { None };
+        if p.relation == TaskRelation::DuplicateOf {
+            ctx.tx().execute("DELETE FROM task_relations WHERE from_task=?1 AND rel='duplicate_of' AND to_task<>?2", params![task.id, other]).bus()?;
         }
-        ctx.tx()
+        let added = ctx.tx()
             .execute(
                 "INSERT OR IGNORE INTO task_relations(from_task,to_task,rel,created_at) VALUES (?1,?2,?3,?4)",
                 params![task.id, other, rel, ctx.now],
@@ -1536,15 +1587,16 @@ pub fn register(e: &mut Engine) {
             .bus()?;
         touch(ctx, task.id)?;
         let task = get_task(ctx.tx(), task.id, false)?;
+        // Re-linking an edge that is already there changes nothing, and an undo of it would
+        // drop the edge that was there before.
         let undo = match replaced {
-            Some(prior) => json!({"task_id":task.id,"relation":rel,"other_id":prior}),
-            None => json!({"task_id":task.id,"relation":rel,"other_id":other}),
+            Some(prior) => Some(("task.relate", json!({"task_id":task.id,"relation":rel,"other_id":prior}))),
+            None if added > 0 => Some(("task.unrelate", json!({"task_id":task.id,"relation":rel,"other_id":other}))),
+            None => None,
         };
-        ctx.set_undo(
-            if replaced.is_some() { "task.relate" } else { "task.unrelate" },
-            undo,
-            Some(json!({"updated_at":task.updated_at})),
-        );
+        if let Some((op, undo)) = undo {
+            ctx.set_undo(op, undo, Some(json!({"updated_at":task.updated_at})));
+        }
         emit_task(ctx, &task)?;
         emit_task(ctx, &get_task(ctx.tx(), other, false)?)?;
         Ok(task)

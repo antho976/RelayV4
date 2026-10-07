@@ -56,12 +56,15 @@ pub fn register(e: &mut Engine) {
                 }
             }
         }
-        let released = leases.release_where(|lease| {
+        let selected = |lease: &Lease| {
             !matches!(lease.kind, Kind::Run(_))
                 && device.as_ref().is_none_or(|device| &lease.device == device)
                 && (lease.holder == holder || (user && device.is_some()))
-        });
-        let views = released.iter().map(Lease::view).collect();
+        };
+        let released = leases.release_where(selected);
+        // release_where also drops every lapsed lease, whoever held it: those are announced, but
+        // the answer lists only what the caller asked to give back.
+        let views = released.iter().filter(|lease| selected(lease)).map(Lease::view).collect();
         for lease in released { ctx.emit(RELEASED, lease.event()); }
         Ok(ReleaseOut { released: views })
     });
@@ -113,11 +116,13 @@ fn session_running(conn: &Connection, id: Id) -> bool {
 }
 
 /// Take a lease inside a request: prune, acquire, queue the events. `device.busy` on conflict.
+/// What the prune dropped is gone whatever the request's outcome, so its releases go out at
+/// once rather than with the request's events, which a refusal rolls back unsent.
 pub(crate) fn acquire(ctx: &mut Ctx, lease: Lease) -> Result<(), BusError> {
     let mut released = prune(ctx.engine(), ctx.tx());
     let event = lease.event();
     let taken = ctx.engine().device_leases.acquire(lease, &mut released);
-    for gone in released { ctx.emit(RELEASED, gone.event()); }
+    for gone in released { ctx.engine().emit_system(RELEASED, gone.event()); }
     if taken? { ctx.emit(ACQUIRED, event); }
     ensure_sweeper(ctx.engine());
     Ok(())
@@ -142,9 +147,10 @@ fn ensure_sweeper(engine: &Engine) {
     });
 }
 
-/// Refuse early, before any slow work, when `holder` could not take `device`.
+/// Refuse early, before any slow work, when `holder` could not take `device`. Releases go out
+/// at once, as in [`acquire`]: the refusal this exists to return would discard them.
 pub(crate) fn check(ctx: &mut Ctx, device: &str, holder: &Holder) -> Result<(), BusError> {
-    for gone in prune(ctx.engine(), ctx.tx()) { ctx.emit(RELEASED, gone.event()); }
+    for gone in prune(ctx.engine(), ctx.tx()) { ctx.engine().emit_system(RELEASED, gone.event()); }
     ctx.engine().device_leases.check(device, holder)
 }
 
@@ -184,5 +190,31 @@ pub fn release_run(engine: &Engine, run_id: Id) {
 pub fn release_session(engine: &Engine, session_id: Id) {
     for lease in engine.device_leases.release_session(session_id) {
         engine.emit_system(RELEASED, lease.event());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use relay_bus::{Actor, Request};
+
+    #[test]
+    fn a_release_answers_only_for_the_callers_own_leases() {
+        let engine = Engine::new(crate::paths::Instance::Test, crate::Store::open_memory().unwrap());
+        let mut events = engine.subscribe();
+        let other = Holder::Session { id: 99, name: "other".into() };
+        engine.device_leases.acquire(Lease::new("phone-b", other, Kind::Claim, "testing", Some(Duration::from_millis(1))), &mut Vec::new()).unwrap();
+        engine.device_leases.acquire(Lease::new("phone-a", Holder::User, Kind::Claim, "testing", Some(Duration::from_secs(60))), &mut Vec::new()).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        let out = engine.dispatch(Request::new(Actor::User, "device.release", serde_json::json!({})), crate::engine::Door::InProcess)
+            .into_result().unwrap();
+        let released = out["released"].as_array().unwrap();
+        assert_eq!(released.len(), 1, "{out}");
+        assert_eq!(released[0]["device"], "phone-a");
+        // The other session's lapsed lease is announced, just not claimed as the caller's.
+        let mut announced = Vec::new();
+        while let Ok(event) = events.try_recv() { if event.ev == RELEASED { announced.push(event.payload["device"].clone()); } }
+        announced.sort_by_key(|device| device.to_string());
+        assert_eq!(announced, ["phone-a", "phone-b"]);
     }
 }
