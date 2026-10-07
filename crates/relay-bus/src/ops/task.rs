@@ -99,7 +99,9 @@ op!(Attach, "task.attach", AttachIn => Attachment,
     OpMeta::mutation(Scope::Project, 7, "Attach an image by bytes or by path").emits(&["task.changed"]));
 payload!(#[schemars(rename = "TaskDetachIn")] DetachIn { pub task_id: Id, pub attachment_id: Id });
 op!(Detach, "task.detach", DetachIn => Empty,
-    OpMeta::mutation(Scope::Project, 7, "Remove an attachment").undo(Undo::Inverse).emits(&["task.changed"]));
+    OpMeta::mutation(Scope::Project, 7, "Remove an attachment (soft: task.attachment.restore brings it back)").undo(Undo::Inverse).emits(&["task.changed"]));
+op!(AttachmentRestore, "task.attachment.restore", DetachIn => Attachment,
+    OpMeta::mutation(Scope::Project, 7, "Restore a detached attachment with its id and file").undo(Undo::Inverse).emits(&["task.changed"]));
 
 payload!(#[schemars(rename = "TaskDispatchIn")] DispatchIn {
     pub task_id: Id, pub session: Option<String>, pub create: Option<crate::ops::session::CreateIn>,
@@ -179,6 +181,7 @@ entries!(
     ChangelogWrite,
     Attach,
     Detach,
+    AttachmentRestore,
     ParentSet,
     Children,
     LabelAdd,

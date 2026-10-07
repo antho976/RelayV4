@@ -160,11 +160,23 @@ fn attachment_undo_and_refused_create() {
     let e = &f.engine;
     let task = f.task("Shot", json!({}));
     let attached = ok(e, "task.attach", json!({"task_id":task["id"],"name":"shot.png","mime":"image/png","bytes_b64":b64(b"png")}));
+    let files = files_under(&f.attachments()).len();
     ok(e, "task.detach", json!({"task_id":task["id"],"attachment_id":attached["id"]}));
-    ok(e, "audit.undo", json!({"audit_id":f.last_audit("task.detach")["id"]}));
+    let detached = f.last_audit("task.detach");
+    assert_eq!(ok(e, "task.get", json!({"task_id":task["id"]}))["attachments"], json!([]));
+    assert!(ok(e, "task.list", json!({"project_id":1}))["tasks"][0]["attachments"].as_array().unwrap().is_empty());
+    assert_eq!(code(call(e, Actor::User, "task.detach", json!({"task_id":task["id"],"attachment_id":attached["id"]}))), "task.attachment_not_found");
+    assert!(Path::new(attached["path"].as_str().unwrap()).is_file(), "a detach keeps the file for its undo");
+    ok(e, "audit.undo", json!({"audit_id":detached["id"]}));
+    // RA-414: the same row comes back — id, path and all — and no second copy of the file.
     let back = &ok(e, "task.get", json!({"task_id":task["id"]}))["attachments"][0];
-    assert_eq!(back["name"], "shot.png");
-    assert_eq!(back["mime"], "image/png");
+    assert_eq!(back, &attached);
+    assert_eq!(files_under(&f.attachments()).len(), files);
+    assert_eq!(code(call(e, Actor::User, "task.attachment.restore", json!({"task_id":task["id"],"attachment_id":attached["id"]}))), "task.attachment_not_found");
+    // Redo detaches it again; restore called directly brings it back too.
+    ok(e, "audit.undo", json!({"audit_id":f.last_audit("audit.undo")["id"]}));
+    assert_eq!(ok(e, "task.get", json!({"task_id":task["id"]}))["attachments"], json!([]));
+    assert_eq!(ok(e, "task.attachment.restore", json!({"task_id":task["id"],"attachment_id":attached["id"]})), attached);
 
     let stored = files_under(&f.attachments()).len();
     let refused = call(e, Actor::User, "task.create", json!({"project_id":1,"title":"Two","attachments":[

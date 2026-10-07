@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 /// The schema version this build knows. Bump when appending to [`MIGRATIONS`].
-pub const SCHEMA_VERSION: i64 = 23;
+pub const SCHEMA_VERSION: i64 = 24;
 
 /// Numbered migrations; index 0 brings a fresh DB to `user_version = 1`.
 pub const MIGRATIONS: &[&str] = &[
@@ -399,6 +399,13 @@ pub const MIGRATIONS: &[&str] = &[
       PRIMARY KEY (hold_id, pointer)
     );
     CREATE INDEX hold_blobs_hash ON hold_blobs(hash);
+    "#,
+    // v24 - task.detach soft-deletes the attachment, keeping its id and its file, so undoing it
+    // restores that row instead of copying the file in again under a new id (RA-414). Every
+    // read of a task's attachments filters `deleted_at IS NULL`; the retention pass removes the
+    // row and its file once the undo grace window is past. Existing rows are live.
+    r#"
+    ALTER TABLE attachments ADD COLUMN deleted_at TEXT;
     "#,
 ];
 

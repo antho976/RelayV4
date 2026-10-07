@@ -224,6 +224,22 @@ fn attachment_row(row: &Row) -> rusqlite::Result<Attachment> {
     })
 }
 
+/// Attachment `id` of `task_id`: a live one, or with `detached` one `task.detach` soft-deleted.
+fn attachment_on(tx: &Transaction, task_id: Id, id: Id, detached: bool) -> Result<Attachment, BusError> {
+    let sql = if detached {
+        "SELECT * FROM attachments WHERE id=?1 AND task_id=?2 AND deleted_at IS NOT NULL"
+    } else {
+        "SELECT * FROM attachments WHERE id=?1 AND task_id=?2 AND deleted_at IS NULL"
+    };
+    tx.prepare_cached(sql)
+        .and_then(|mut stmt| stmt.query_row(params![id, task_id], attachment_row).optional())
+        .bus()?
+        .ok_or_else(|| {
+            let what = if detached { "detached attachment" } else { "attachment" };
+            BusError::not_found("task.attachment_not_found", format!("no {what} {id} on task {task_id}"))
+        })
+}
+
 /// Every statement here is `prepare_cached`: a task list hydrates each row with seven of them,
 /// and compiling five of those per row was 61 % of `task.list` (PERF §1.2).
 pub(crate) fn row_task(tx: &rusqlite::Connection, row: &Row) -> Result<Task, rusqlite::Error> {
@@ -252,7 +268,7 @@ pub(crate) fn row_task(tx: &rusqlite::Connection, row: &Row) -> Result<Task, rus
     };
     let attachments = {
         let mut stmt =
-            tx.prepare_cached("SELECT * FROM attachments WHERE task_id=?1 ORDER BY id")?;
+            tx.prepare_cached("SELECT * FROM attachments WHERE task_id=?1 AND deleted_at IS NULL ORDER BY id")?;
         let values = stmt
             .query_map([id], attachment_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1141,8 +1157,9 @@ pub fn register(e: &mut Engine) {
         std::fs::create_dir_all(&staging).bus()?;
         let staged = StagedFile(staging.join(uuid::Uuid::new_v4().to_string()));
         let (name, mime, bytes) = match (&p.path, &p.name, &p.mime, &p.bytes_b64) {
-            // A path may carry the name and type to store it under: undoing task.detach does,
-            // or the stored `{id}-{name}` and a generic type came back in their place (RA-414).
+            // A path may carry the name and type to store it under; without them the file's
+            // own name and a generic type are used (RA-414). Undoing a task.detach older than
+            // soft-detach (audit rows from before v24) still comes through here.
             (Some(path), name, mime, None) => {
                 let src = PathBuf::from(path);
                 if !src.is_file() {
@@ -1192,33 +1209,35 @@ pub fn register(e: &mut Engine) {
         emit_task(ctx, &get_task(ctx.tx(), task.id, false)?)?;
         Ok(attachment)
     });
+    // Soft (RA-414): the row and its file stay until the retention pass, so the undo restores
+    // the same id and file instead of copying the file in again under a new one.
     e.register::<Detach>(|ctx: &mut Ctx, p| {
         let task = get_task(ctx.tx(), p.task_id, false)?;
-        let attachment = ctx
-            .tx()
-            .query_row(
-                "SELECT * FROM attachments WHERE id=?1 AND task_id=?2",
-                params![p.attachment_id, task.id],
-                attachment_row,
-            )
-            .optional()
-            .bus()?
-            .ok_or_else(|| {
-                BusError::not_found(
-                    "task.attachment_not_found",
-                    format!("no attachment {} on task {}", p.attachment_id, task.id),
-                )
-            })?;
+        let attachment = attachment_on(ctx.tx(), task.id, p.attachment_id, false)?;
         ctx.tx()
-            .execute("DELETE FROM attachments WHERE id=?1", [attachment.id])
+            .execute("UPDATE attachments SET deleted_at=?1 WHERE id=?2", params![ctx.now, attachment.id])
             .bus()?;
         ctx.set_undo(
-            "task.attach",
-            json!({"task_id":task.id,"path":attachment.path,"name":attachment.name,"mime":attachment.mime}),
+            "task.attachment.restore",
+            json!({"task_id":task.id,"attachment_id":attachment.id}),
             None,
         );
         emit_task(ctx, &get_task(ctx.tx(), task.id, false)?)?;
         Ok(Empty {})
+    });
+    e.register::<AttachmentRestore>(|ctx: &mut Ctx, p| {
+        let task = get_task(ctx.tx(), p.task_id, false)?;
+        let attachment = attachment_on(ctx.tx(), task.id, p.attachment_id, true)?;
+        ctx.tx()
+            .execute("UPDATE attachments SET deleted_at=NULL WHERE id=?1", [attachment.id])
+            .bus()?;
+        ctx.set_undo(
+            "task.detach",
+            json!({"task_id":task.id,"attachment_id":attachment.id}),
+            None,
+        );
+        emit_task(ctx, &get_task(ctx.tx(), task.id, false)?)?;
+        Ok(attachment)
     });
     // Staged (D149): creating a session fetches and checks out, and launching one installs
     // hooks and writes files. Both run as their own requests with the store unlocked — the
