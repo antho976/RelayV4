@@ -30,7 +30,6 @@ pub fn register(e: &mut Engine) {
             uptime_s: eng.uptime_s(),
             store_path: eng.store.path().display().to_string(),
             socket_path: eng.socket_path.lock().unwrap().clone().unwrap_or_default(),
-            ui_connected: eng.ui_connected.load(Ordering::Relaxed),
             sessions_live: eng.live_pty_count() as i64,
             providers: crate::providers::list(ctx.tx())?,
         })

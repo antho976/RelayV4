@@ -200,7 +200,10 @@ loose verts, zero-area faces and inside-out closed meshes on any mesh.
 
 - Build node groups in Python with the 4.0 interface API:
   `ng.interface.new_socket(name, in_out='INPUT'|'OUTPUT', socket_type='NodeSocketGeometry')`
-  (the pre-4.0 `ng.inputs.new` is gone). Set a modifier input via `mod[socket.identifier] = value`.
+  (the pre-4.0 `ng.inputs.new` is gone). Set a modifier input by the socket's `identifier`:
+  `getattr(mod.properties.inputs, socket.identifier).value = value` on 5.x (where
+  `mod[identifier] = value` raises `TypeError`), `mod[socket.identifier] = value` on 4.x; branch
+  on `hasattr(mod, "properties")` (`set_gn_input` in the recipes).
 - Everything not realized is not exported: end instancing chains with Realize Instances.
 - Node and socket names change between versions; look them up with
   `[s.name for s in node.inputs]` before linking by name.

@@ -167,6 +167,15 @@ fn refusals_holds_confirmation_replay_and_expiry_are_durable() {
     assert!(inspected["request"].get("token").is_none());
     assert!(!call(engine, actor.clone(), "guardrail.hold.get", json!({"hold_id": bypass_id})).ok,
         "an agent must not inspect another actor's frozen action");
+    // Nor read it back out of the audit trail, which stores the same payload.
+    let held_row = ok(engine, Actor::User, "audit.list", json!({"op_prefix": "guardrail.gate"}))["rows"]
+        .as_array().unwrap().iter()
+        .find(|row| row["code"] == "guardrail.user_bypass").unwrap()["id"].clone();
+    assert_eq!(ok(engine, Actor::User, "audit.get", json!({"audit_id": held_row}))["payload"]["new_text"], "x");
+    for (op, payload) in [("audit.list", json!({"op_prefix": "guardrail.gate"})), ("audit.get", json!({"audit_id": held_row}))] {
+        let refused = call(engine, actor.clone(), op, payload);
+        assert_eq!(error(&refused).kind, ErrorKind::Refused, "{op}");
+    }
     let bypass = ok(
         engine,
         Actor::User,
@@ -625,6 +634,57 @@ fn workspace_layer_sits_between_global_and_project_and_null_clears_back() {
     assert_eq!(error(&missing).code, "workspace.not_found");
     let nested = call(engine, Actor::User, "guardrail.config.set", json!({"patch": {"workspaces": {"1": {}}}}));
     assert_eq!(error(&nested).code, "guardrail.config");
+}
+
+#[test]
+fn a_bad_guardrails_key_is_refused_on_write_and_ignored_when_already_stored() {
+    let fixture = Fixture::new();
+    let engine = &fixture.engine;
+    let rows = count(engine, "settings");
+    // settings.set reaches the tree guardrail.config.set writes, so it is checked the same way.
+    for (path, value) in [
+        ("guardrails.caps.file", json!(3)),
+        ("guardrails.caps.files", json!("40")),
+        ("guardrails.caps", json!({"files": 0})),
+        ("guardrails.projects.1.destructive_write.min_removed", json!(5)),
+        ("guardrails", json!({"roles": {"reviewr": []}})),
+        ("", json!({"guardrails": {"shape_gates": [{"path": "a.json", "validator": "json", "strict": true}]}})),
+    ] {
+        let refused = call(engine, Actor::User, "settings.set", json!({"path": path, "value": value}));
+        assert_eq!(error(&refused).code, "guardrail.config", "{path} {value}");
+    }
+    let typo = call(engine, Actor::User, "guardrail.config.set", json!({"patch": {"caps": {"file": 3}}}));
+    assert_eq!(error(&typo).code, "guardrail.config", "the typed write path stays strict");
+    assert_eq!(count(engine, "settings"), rows, "every refused write rolled back");
+    ok(engine, Actor::User, "settings.set", json!({"path": "guardrails.caps.files", "value": 12}));
+    assert_eq!(ok(engine, Actor::User, "guardrail.config.get", json!({}))["caps"]["files"], 12);
+
+    // A store that already holds keys this build does not know — a newer build's, or one
+    // written before the check — still yields a working config, at every layer.
+    for (path, value) in [
+        ("guardrails.caps.file", "3"),
+        ("guardrails.future_rule", r#"{"on":true}"#),
+        ("guardrails.workspaces.1.destructive_write.newer_knob", "1"),
+        ("guardrails.projects.1.shape_gates", r#"[{"path":"a.json","validator":"json","strict":true}]"#),
+    ] {
+        engine.store.lock()
+            .execute("INSERT INTO settings(path, value, updated_at) VALUES (?1, ?2, '2026-01-01T00:00:00Z')", [path, value])
+            .unwrap();
+    }
+    assert_eq!(ok(engine, Actor::User, "guardrail.config.get", json!({}))["caps"], json!({"files": 12, "lines": 2000}));
+    let project = ok(engine, Actor::User, "guardrail.config.get", json!({"project_id": 1}));
+    assert_eq!(project["shape_gates"], json!([{"path": "a.json", "validator": "json"}]));
+    ok(engine, Actor::User, "guardrail.config.layers", json!({"project_id": 1}));
+    let session = fixture.session("builder", "codex");
+    let name = session["name"].as_str().unwrap();
+    let agent = Actor::agent(name);
+    ok(engine, agent.clone(), "bus.whoami", json!({}));
+    ok(engine, agent.clone(), "guardrail.gate", json!({"session": name, "kind": "write", "path": "src/a.rs", "new_text": "x"}));
+    ok(engine, agent, "session.intent", json!({"session": name, "text": "still works"}));
+    // The stray rows clear the ordinary way.
+    ok(engine, Actor::User, "settings.reset", json!({"path": "guardrails.future_rule"}));
+    ok(engine, Actor::User, "guardrail.config.set", json!({"patch": {"caps": {"file": null}}}));
+    assert_eq!(ok(engine, Actor::User, "guardrail.config.get", json!({}))["caps"]["files"], 12);
 }
 
 #[test]

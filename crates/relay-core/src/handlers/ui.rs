@@ -1,4 +1,9 @@
 //! Phase 9 shell state and durable named layouts.
+//!
+//! The shell state is the engine's own in-memory model (`Engine::ui`), not a mirror of any
+//! window: no client executes `ui.*` ops, so they succeed headless too. The native client reads
+//! only the page and a focused pane's `target.session` from `ui.changed`, and shows `ui.toast`;
+//! every other pane and window op changes this model alone (BUS.md §6.5).
 
 use crate::engine::{Ctx, Engine, IntoBus};
 use relay_bus::ops::ui::*;

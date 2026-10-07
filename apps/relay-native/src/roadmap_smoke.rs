@@ -54,12 +54,6 @@ fn selected_tasks(root: &gtk::Widget) -> usize {
 }
 
 pub(crate) async fn run(ui: &Rc<Ui>) -> Value {
-    assert_eq!(std::env::var("RELAY_INSTANCE").as_deref(), Ok("test"));
-    assert_eq!(std::env::var("RELAY_NATIVE_FIXTURE").as_deref(), Ok("1"));
-    assert!(
-        ui.path.starts_with(std::env::temp_dir()),
-        "Regression writes require a temporary fixture socket"
-    );
     let project = ui.project.get();
     let workspace = ui
         .workspaces

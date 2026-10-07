@@ -35,14 +35,6 @@ impl Instance {
             Instance::Test => "test",
         }
     }
-    /// The Tauri bundle identifier this instance corresponds to.
-    pub fn bundle_id(self) -> &'static str {
-        match self {
-            Instance::Stable => "com.quietsoftware.relay",
-            Instance::Dev => "com.quietsoftware.relay.dev",
-            Instance::Test => "com.quietsoftware.relay.test",
-        }
-    }
     /// `test` actors are only accepted by dev/test engines (BUS.md §4.1).
     pub fn accepts_test_actor(self) -> bool {
         !matches!(self, Instance::Stable)

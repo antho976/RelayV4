@@ -17,7 +17,11 @@ scrcpy server and its upstream license are documented in
 `docs/upstream-v3/` is a verbatim snapshot. Its dates, task numbers, paths,
 completed gates, decisions, ownership rules and instructions describe V3, not
 this checkout. Relative links between archived documents remain intact.
-`docs/engine/` preserves Relay-2's bus/spec/decision reference.
+`docs/engine/` began as Relay-2's bus/spec/decision reference and is now this
+checkout's current contract: `BUS.md` and `DECISIONS.md` are kept in step with
+the code, which cites them, and decisions are appended, not rewritten. `SPEC.md`
+is the product spec they refer to and is updated less often; where it still
+describes Relay-2's Tauri and Svelte app, the code and `BUS.md` are the truth.
 
 Both reference repositories remain untouched. No state migration or retirement
 of either application is implied by this rebuild.

@@ -70,7 +70,7 @@ GROUP_TITLES = {
     "device": "device (no Android SDK on the measuring machine: refusal paths)", "avd": "avd (same)",
     "provider": "provider", "usage": "usage", "skill": "skill", "github": "github (no gh on the measuring machine)",
     "plugin": "plugin", "notify": "notify", "settings": "settings", "dashboard": "dashboard",
-    "ui": "ui (no client attached in-process: what the engine does before the UI executor)", "os": "os (same)",
+    "ui": "ui (core's in-memory shell model; no client involved)", "os": "os (spawns xdg-open after commit)",
     "path": "paths that are not ops",
 }
 

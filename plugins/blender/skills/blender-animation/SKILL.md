@@ -41,11 +41,14 @@ its key frames.** If a check cannot run, say the result is unverified.
   unassigns it, and a strip in tweak mode blocks reassigning the active action.
 - One armature per character, many actions. Two characters in one file each get their own
   actions (section 6).
-- **Blender 4.4+ (slotted actions):** an action has slots; `action.fcurves` is a legacy view that
-  works for single-slot actions and is removed in 5.0. `pose_bone.keyframe_insert(...)` works in
-  every version - prefer it where speed does not matter, and after assigning an action by code
-  check `obj.animation_data.action_slot` on those versions. Verify with `dir()` before relying
-  on either API.
+- **Blender 4.4+ (slotted actions):** an action has slots, and its F-curves live in a channelbag
+  per slot. `action.fcurves` is a legacy view in 4.4-4.5 and is **removed in 5.0**. Reach
+  F-curves only through `action_fcurves(act, obj)` from the top of
+  [reference/animation-recipes.md](reference/animation-recipes.md), which works on every version.
+  `pose_bone.keyframe_insert(...)` works in every version and creates and assigns the slot itself
+  - prefer it where speed does not matter, and after assigning an action by code check
+  `obj.animation_data.action_slot`. Bone selection moved too: `pose_bone.select` on 5.0+,
+  `pose_bone.bone.select` before (recipe 6).
 
 ## 2. Keyframing from Python
 
@@ -56,8 +59,9 @@ its key frames.** If a check cannot run, say the result is unverified.
 - Pose values are in the **bone's local rest axes**: Y runs along the bone, Z is set by roll.
   "Rotate the arm forward" is a different axis for each bone; test one key and measure with
   `blender_anim_inspect track` before writing a whole move.
-- For hundreds of keys, write F-curves directly (`act.fcurves.new(data_path, index=i,
-  action_group=bone)`, `keyframe_points.add(n)`, `foreach_set("co", ...)`, then `fc.update()`).
+- For hundreds of keys, write F-curves directly: `fcs = action_fcurves(act, arm, ensure=True)`,
+  `fcs.new(data_path, index=i, group_name=bone)` (`action_group=` before 4.4),
+  `keyframe_points.add(n)`, `foreach_set("co", ...)`, then `fc.update()` - recipe 3's `set_keys`.
 - Interpolation per key: `BEZIER` with `AUTO_CLAMPED` handles for organic motion, `LINEAR` for
   root travel and mechanical parts, `CONSTANT` for stepped holds and switches (Child Of
   influence, visibility).

@@ -1042,7 +1042,8 @@ fn cases() -> Vec<Case> {
     });
     fixed(&mut c, "dashboard.get", U, Cheap, json!({}));
 
-    // ---- ui / os (executor = ui; no client is attached in-process, so this is the refusal path)
+    // ---- ui / os (core answers ui.* from its in-memory shell model, client or not; os.* spawns
+    // xdg-open after commit)
     fixed(&mut c, "ui.state", U, Cheap, json!({}));
     fixed(&mut c, "ui.page.switch", U, Cheap, json!({"page": "board", "project_id": 1}));
     fixed(&mut c, "ui.pane.open", U, Cheap, json!({"kind": "notes"}));
