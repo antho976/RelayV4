@@ -5,16 +5,40 @@ use crate::handlers::workspace::get_project;
 use crate::worktree;
 use relay_bus::error::BusError;
 use relay_bus::ops::git::*;
-use relay_bus::types::{Integration, IntegrationState};
+use relay_bus::types::{Id, Integration, IntegrationState};
 use relay_bus::Empty;
 use rusqlite::{params, OptionalExtension, Row};
 use serde_json::json;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// An agent reaches only its own project's integrations, like every other project-scoped op
+/// that names a `project_id` (`not_own("project")`).
+fn assert_own_project(ctx: &Ctx, project_id: Id) -> Result<(), BusError> {
+    if let Some(session_id) = ctx.actor_session_id() {
+        let row = crate::sessions::by_id(ctx.tx(), session_id)?
+            .ok_or_else(|| BusError::actor("bound session no longer exists"))?;
+        if row.session.project_id != project_id {
+            return Err(BusError::not_own("project"));
+        }
+    } else if ctx.actor.is_agent() {
+        return Err(BusError::actor("agent actor is not bound to a live session"));
+    }
+    Ok(())
+}
 
 pub fn register(e: &mut Engine) {
     e.register::<IntegrationRequest>(|ctx: &mut Ctx, p| {
         let project = get_project(ctx.tx(), p.project_id)?;
+        assert_own_project(ctx, project.id)?;
+        // A deploy is a `device.run`, which is user-only: an agent asking for one here would
+        // reach the device through a side door.
+        if p.deploy.is_some() && ctx.actor.is_agent() {
+            return Err(BusError::allowlist("device.run", "agent")
+                .with_hint("deploy is user-only; request the integration without deploy and ask the user to run it"));
+        }
         let mut branches = p.branches.unwrap_or_default();
         for session in p.sessions.unwrap_or_default() {
             let branch: Option<String> = ctx.tx().query_row(
@@ -26,7 +50,11 @@ pub fn register(e: &mut Engine) {
         branches.retain(|b| !b.trim().is_empty()); branches.sort(); branches.dedup();
         if branches.len() < 2 { return Err(BusError::invalid("integration.branches", "select at least two distinct session branches")); }
         let repo = gix::open(&project.path).map_err(|e| BusError::unavailable("git.open_failed", e.to_string()))?;
-        for branch in &branches { repo.rev_parse_single(branch.as_str()).map_err(|e| BusError::invalid("integration.branch", format!("{branch}: {e}")))?; }
+        for branch in &branches {
+            // `git merge` would read a ref spelled like an option as one.
+            if branch.starts_with('-') { return Err(BusError::invalid("integration.branch", format!("{branch}: a branch name cannot start with '-'"))); }
+            repo.rev_parse_single(branch.as_str()).map_err(|e| BusError::invalid("integration.branch", format!("{branch}: {e}")))?;
+        }
         ctx.tx().execute(
             "INSERT INTO integrations(project_id,branches,state,build,deploy,created_at) VALUES (?1,?2,'queued',?3,?4,?5)",
             params![project.id, serde_json::to_string(&branches).bus()?, p.build.unwrap_or(true) as i64, p.deploy, ctx.now],
@@ -40,9 +68,14 @@ pub fn register(e: &mut Engine) {
         ctx.after_commit(move |engine| enqueue(engine, project_id, id, parent));
         Ok(integration)
     });
-    e.register::<IntegrationGet>(|ctx, p| get(ctx.tx(), p.integration_id));
+    e.register::<IntegrationGet>(|ctx, p| {
+        let integration = get(ctx.tx(), p.integration_id)?;
+        assert_own_project(ctx, integration.project_id)?;
+        Ok(integration)
+    });
     e.register::<IntegrationList>(|ctx, p| {
         get_project(ctx.tx(), p.project_id)?;
+        assert_own_project(ctx, p.project_id)?;
         let mut st = ctx
             .tx()
             .prepare_cached("SELECT * FROM integrations WHERE project_id=?1 ORDER BY id DESC LIMIT 100")
@@ -70,6 +103,8 @@ pub fn register(e: &mut Engine) {
             return Err(BusError::conflict("integration.in_use", "a device run is using this integration's checkout")
                 .with_hint("stop the run, then discard"));
         }
+        // A build still running in the checkout is stopped before the checkout goes.
+        stop_runner(ctx.engine(), integration.id, Stop::Discard);
         if let Some(path) = &integration.worktree {
             remove_checkout(Path::new(&project.path), Path::new(path), integration.id)
                 .map_err(|e| BusError::conflict("integration.discard_failed", e.to_string()))?;
@@ -172,7 +207,156 @@ pub(crate) fn remove_checkout(repo: &Path, path: &Path, id: i64) -> anyhow::Resu
     Ok(())
 }
 
-fn run(engine: std::sync::Arc<Engine>, id: i64, parent: uuid::Uuid) {
+/// The longest a build may run. Generous — a cold Gradle build — but never unbounded (D144).
+const BUILD_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+/// One `git merge-tree` probe while naming the branches a failed merge conflicts on.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+/// How much of a build's output is kept while it runs; the row keeps a shorter tail still.
+const OUTPUT_KEEP: usize = 64 * 1024;
+/// How often a waiting runner looks for a stop or the deadline.
+const STEP_POLL: Duration = Duration::from_millis(100);
+/// How long the pipes may stay open after the build's process group is gone: only a daemon
+/// that left the group can hold them, and the runner does not wait for it.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
+/// How long a discard waits for the runner it stopped to let go of the checkout.
+const STOP_WAIT: Duration = Duration::from_secs(10);
+/// How long a runner stopped by a discard waits for that discard to record `discarded`
+/// (removing a large build output takes a while) before it closes the row itself.
+const DISCARD_WAIT: Duration = Duration::from_secs(5 * 60);
+
+/// Why a runner was asked to stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stop {
+    Discard,
+    Quit,
+}
+
+/// A runner at work on one integration: the stop it was asked for, and the process group of
+/// the build it is waiting on, so that a stop kills the build at once instead of leaving it
+/// running in a checkout that is about to be deleted.
+#[derive(Default)]
+struct Runner {
+    stop: Mutex<Option<Stop>>,
+    child: Mutex<Option<u32>>,
+}
+
+impl Runner {
+    fn stopped(&self) -> Option<Stop> {
+        *self.stop.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+/// Runners at work, keyed by engine and integration id, like [`QUEUES`].
+type Runners = std::collections::HashMap<(usize, i64), Arc<Runner>>;
+static RUNNERS: Mutex<Option<Runners>> = Mutex::new(None);
+
+fn runners() -> std::sync::MutexGuard<'static, Option<Runners>> {
+    RUNNERS.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+fn engine_key(engine: &Engine) -> usize {
+    engine as *const Engine as usize
+}
+
+fn kill_group(pid: u32) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+}
+
+fn signal(runner: &Runner, why: Stop) {
+    runner.stop.lock().unwrap_or_else(|p| p.into_inner()).get_or_insert(why);
+    if let Some(pid) = *runner.child.lock().unwrap_or_else(|p| p.into_inner()) {
+        kill_group(pid);
+    }
+}
+
+/// Stop the runner working on integration `id`, if there is one, and wait (bounded) for it to
+/// let go of the checkout. Called with the store unlocked.
+fn stop_runner(engine: &Engine, id: i64, why: Stop) {
+    let key = (engine_key(engine), id);
+    let Some(runner) = runners().as_ref().and_then(|r| r.get(&key).cloned()) else {
+        return;
+    };
+    signal(&runner, why);
+    let deadline = Instant::now() + STOP_WAIT;
+    while Instant::now() < deadline && runners().as_ref().is_some_and(|r| r.contains_key(&key)) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Engine shutdown: kill every build this engine's runners are waiting on, drop what is still
+/// queued, and close the rows, so a quit leaves nothing `merging`/`building`/`deploying` to
+/// block `project.remove` until the next start (startup recovery closes what a crash leaves).
+pub fn shutdown(engine: &Engine) {
+    let key = engine_key(engine);
+    let live: Vec<Arc<Runner>> = runners()
+        .as_ref()
+        .map(|r| r.iter().filter(|((e, _), _)| *e == key).map(|(_, runner)| runner.clone()).collect())
+        .unwrap_or_default();
+    for runner in &live {
+        signal(runner, Stop::Quit);
+    }
+    if let Some(queues) = QUEUES.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+        for ((e, _), waiting) in queues.iter_mut() {
+            if *e == key {
+                waiting.clear();
+            }
+        }
+    }
+    let conn = engine.store.lock();
+    let _ = conn.execute(
+        "UPDATE integrations SET state='failed',finished_at=COALESCE(finished_at,?1),
+         log_tail=COALESCE(log_tail,'')||'\nInterrupted: Relay quit before this integration finished.'
+         WHERE state IN ('queued','merging','building','deploying')",
+        [crate::time::now()],
+    );
+}
+
+fn is_live(state: IntegrationState) -> bool {
+    matches!(state, IntegrationState::Queued | IntegrationState::Merging | IntegrationState::Building | IntegrationState::Deploying)
+}
+
+fn state_of(engine: &Engine, id: i64) -> Option<IntegrationState> {
+    let conn = engine.store.lock();
+    get(&conn, id).ok().map(|i| i.state)
+}
+
+fn run(engine: Arc<Engine>, id: i64, parent: uuid::Uuid) {
+    let key = (engine_key(&engine), id);
+    let runner = Arc::new(Runner::default());
+    runners().get_or_insert_with(Default::default).insert(key, runner.clone());
+    let driven = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drive(&engine, &runner, id, parent)));
+    if let Some(r) = runners().as_mut() {
+        r.remove(&key);
+    }
+    // However the drive ended, the row must not stay live with nothing behind it: it would
+    // block project.remove and workspace.remove until the next start.
+    let stop = runner.stopped();
+    match stop {
+        // Shutdown closes the rows itself.
+        Some(Stop::Quit) => return,
+        // The discard that stopped this run records `discarded` once the checkout is gone.
+        Some(Stop::Discard) => {
+            let deadline = Instant::now() + DISCARD_WAIT;
+            while state_of(&engine, id).is_some_and(is_live) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        None => {}
+    }
+    if state_of(&engine, id).is_some_and(is_live) {
+        let why = match (driven.is_err(), stop) {
+            (true, _) => "The integration runner crashed before it finished.",
+            (false, Some(_)) => "Stopped for a discard that did not complete.",
+            (false, None) => "The integration runner stopped without a result.",
+        };
+        fail(&engine, id, parent, IntegrationState::Failed, why, None);
+    }
+}
+
+fn drive(engine: &Arc<Engine>, runner: &Runner, id: i64, parent: uuid::Uuid) {
     let loaded = {
         let conn = engine.store.lock();
         let integration = get(&conn, id);
@@ -185,6 +369,10 @@ fn run(engine: std::sync::Arc<Engine>, id: i64, parent: uuid::Uuid) {
     let Some((integration, project)) = loaded else {
         return;
     };
+    // Discarded (or closed by a quit) while it waited in the queue.
+    if integration.state != IntegrationState::Queued {
+        return;
+    }
     let repo = PathBuf::from(&project.path);
     let path = repo
         .join(".relay")
@@ -192,7 +380,7 @@ fn run(engine: std::sync::Arc<Engine>, id: i64, parent: uuid::Uuid) {
         .join(id.to_string());
     let branch = format!("relay/integration-{id}");
     let _ = set_state(
-        &engine,
+        engine,
         id,
         parent,
         IntegrationState::Merging,
@@ -204,7 +392,7 @@ fn run(engine: std::sync::Arc<Engine>, id: i64, parent: uuid::Uuid) {
     let created = worktree::create(&repo, &path, &branch, Some(&project.base_branch));
     if let Err(error) = created {
         fail(
-            &engine,
+            engine,
             id,
             parent,
             IntegrationState::Failed,
@@ -213,35 +401,21 @@ fn run(engine: std::sync::Arc<Engine>, id: i64, parent: uuid::Uuid) {
         );
         return;
     }
-    let discarded = {
-        let conn = engine.store.lock();
-        get(&conn, id)
-            .map(|run| run.state == IntegrationState::Discarded)
-            .unwrap_or(true)
-    };
-    if discarded {
+    if state_of(engine, id).is_none_or(|state| state == IntegrationState::Discarded) {
         let _ = worktree::remove(&repo, &path, true);
         let _ = worktree::git_mutate(&repo, &["branch", "-D", &branch]);
         return;
     }
+    if runner.stopped().is_some() {
+        return;
+    }
     let merge_args: Vec<&str> = std::iter::once("merge")
-        .chain(["--no-ff", "--no-edit"])
+        .chain(["--no-ff", "--no-edit", "--"])
         .chain(integration.branches.iter().map(String::as_str))
         .collect();
     if let Err(error) = worktree::git_mutate(&path, &merge_args) {
-        let pair = integration
-            .branches
-            .first()
-            .cloned()
-            .zip(integration.branches.get(1).cloned());
-        fail(
-            &engine,
-            id,
-            parent,
-            IntegrationState::Conflict,
-            &format!("merge: {error}"),
-            pair,
-        );
+        let (state, pair, log) = merge_failure(&path, &project.base_branch, &integration.branches, &error.to_string());
+        fail(engine, id, parent, state, &log, pair);
         return;
     }
     let build: bool = {
@@ -255,8 +429,11 @@ fn run(engine: std::sync::Arc<Engine>, id: i64, parent: uuid::Uuid) {
     let mut log = String::from("Merge passed.\n");
     if build {
         if let Some(command) = project.build_cmd.as_deref() {
+            if runner.stopped().is_some() {
+                return;
+            }
             let _ = set_state(
-                &engine,
+                engine,
                 id,
                 parent,
                 IntegrationState::Building,
@@ -265,13 +442,14 @@ fn run(engine: std::sync::Arc<Engine>, id: i64, parent: uuid::Uuid) {
                 false,
                 None,
             );
-            match shell(&path, command, None) {
-                Ok(text) => log.push_str(&text),
-                Err(text) => {
+            match step(runner, &path, command, BUILD_TIMEOUT) {
+                Step::Passed(text) => log.push_str(&text),
+                Step::Failed(text) => {
                     log.push_str(&text);
-                    fail(&engine, id, parent, IntegrationState::Failed, &log, None);
+                    fail(engine, id, parent, IntegrationState::Failed, &log, None);
                     return;
                 }
+                Step::Stopped => return,
             }
         } else {
             log.push_str("No build command configured.\n");
@@ -286,38 +464,48 @@ fn run(engine: std::sync::Arc<Engine>, id: i64, parent: uuid::Uuid) {
         .flatten()
     };
     if let Some(device) = deploy {
-        let Some(command) = project.run_cmd.as_deref() else {
-            fail(
-                &engine,
-                id,
-                parent,
-                IntegrationState::Failed,
-                "Deploy requested but no run command is configured.",
-                None,
-            );
+        if runner.stopped().is_some() {
             return;
-        };
+        }
+        // The deploy is a `device.run` of this checkout, so it holds the device lease, targets
+        // the device by serial and falls back to the Gradle install like any other run. That op
+        // runs only a passed integration: the row passes first, and is finished (or failed)
+        // with what the run's start said.
+        log.push_str(&format!("Deploying to {device} with device.run.\n"));
         let _ = set_state(
-            &engine,
+            engine,
             id,
             parent,
-            IntegrationState::Deploying,
+            IntegrationState::Passed,
             Some(&path),
             &log,
             false,
             None,
         );
-        match shell(&path, command, Some(&device)) {
-            Ok(text) => log.push_str(&text),
-            Err(text) => {
-                log.push_str(&text);
-                fail(&engine, id, parent, IntegrationState::Failed, &log, None);
+        let started = engine
+            .dispatch(
+                relay_bus::Request::new(
+                    relay_bus::Actor::User,
+                    "device.run",
+                    json!({"project_id": project.id, "device": device, "integration_id": id}),
+                ),
+                crate::engine::Door::InProcess,
+            )
+            .into_result();
+        match started {
+            Ok(run) => log.push_str(&format!(
+                "Device run {} started; it reports through run.changed.\n",
+                run["id"]
+            )),
+            Err(error) => {
+                log.push_str(&format!("Deploy refused: {} ({})\n", error.message, error.code));
+                fail(engine, id, parent, IntegrationState::Failed, &log, None);
                 return;
             }
         }
     }
     let _ = set_state(
-        &engine,
+        engine,
         id,
         parent,
         IntegrationState::Passed,
@@ -328,20 +516,155 @@ fn run(engine: std::sync::Arc<Engine>, id: i64, parent: uuid::Uuid) {
     );
 }
 
-fn shell(cwd: &Path, command: &str, device: Option<&str>) -> Result<String, String> {
+/// What a build child came to.
+enum Step {
+    Passed(String),
+    Failed(String),
+    /// A discard or a quit stopped it; whoever stopped it records the outcome.
+    Stopped,
+}
+
+/// Run `command` through the login shell in `cwd`, in its own process group, until it exits,
+/// [`Runner`]'s stop arrives or `timeout` elapses; either of the last two kills the group.
+/// Only the last [`OUTPUT_KEEP`] bytes of its interleaved output are kept.
+fn step(runner: &Runner, cwd: &Path, command: &str, timeout: Duration) -> Step {
     let mut cmd = Command::new("fish");
-    cmd.current_dir(cwd).args(["-lc", command]);
-    if let Some(device) = device {
-        cmd.env("RELAY_DEVICE", device);
+    cmd.current_dir(cwd)
+        .args(["-lc", command])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
     }
-    let out = cmd.output().map_err(|e| e.to_string())?;
-    let mut text = String::from_utf8_lossy(&out.stdout).to_string();
-    text.push_str(&String::from_utf8_lossy(&out.stderr));
-    if out.status.success() {
-        Ok(text)
-    } else {
-        Err(text)
+    let mut child = {
+        // Spawned under the child lock: a stop either finds the pid or came first and is seen here.
+        let mut slot = runner.child.lock().unwrap_or_else(|p| p.into_inner());
+        if runner.stopped().is_some() {
+            return Step::Stopped;
+        }
+        match cmd.spawn() {
+            Ok(child) => {
+                *slot = Some(child.id());
+                child
+            }
+            Err(error) => return Step::Failed(format!("cannot start fish: {error}\n")),
+        }
+    };
+    let tail = Arc::new(Mutex::new(Vec::new()));
+    let (done_tx, done) = std::sync::mpsc::channel::<()>();
+    if let Some(pipe) = child.stdout.take() {
+        keep_tail(pipe, tail.clone(), done_tx.clone());
     }
+    if let Some(pipe) = child.stderr.take() {
+        keep_tail(pipe, tail.clone(), done_tx.clone());
+    }
+    drop(done_tx);
+    let deadline = Instant::now() + timeout;
+    let outcome = loop {
+        let mut slot = runner.child.lock().unwrap_or_else(|p| p.into_inner());
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                *slot = None;
+                break Ok(status);
+            }
+            Ok(None) if runner.stopped().is_none() && Instant::now() < deadline => {}
+            waited => {
+                kill_group(child.id());
+                let _ = child.wait();
+                *slot = None;
+                break Err(waited.err());
+            }
+        }
+        drop(slot);
+        std::thread::sleep(STEP_POLL);
+    };
+    // Both senders drop at EOF; this returns as soon as they have, or after the grace.
+    let _ = done.recv_timeout(DRAIN_GRACE);
+    let text = String::from_utf8_lossy(&tail.lock().unwrap_or_else(|p| p.into_inner())).into_owned();
+    match outcome {
+        Ok(status) if status.success() => Step::Passed(text),
+        Ok(status) => Step::Failed(format!("{text}\nBuild command {status}.\n")),
+        Err(_) if runner.stopped().is_some() => Step::Stopped,
+        Err(Some(error)) => Step::Failed(format!("{text}\nwaiting on the build: {error}\n")),
+        Err(None) => Step::Failed(format!(
+            "{text}\nThe build did not finish within {} minutes and was stopped.\n",
+            timeout.as_secs() / 60
+        )),
+    }
+}
+
+/// Read `pipe` on its own thread into `tail`, keeping the newest [`OUTPUT_KEEP`] bytes.
+fn keep_tail<R: std::io::Read + Send + 'static>(mut pipe: R, tail: Arc<Mutex<Vec<u8>>>, done: std::sync::mpsc::Sender<()>) {
+    std::thread::spawn(move || {
+        let _done = done;
+        let mut chunk = [0u8; 8192];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let mut tail = tail.lock().unwrap_or_else(|p| p.into_inner());
+                    tail.extend_from_slice(&chunk[..n]);
+                    if tail.len() > 2 * OUTPUT_KEEP {
+                        let cut = tail.len() - OUTPUT_KEEP;
+                        tail.drain(..cut);
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+/// Why the octopus merge failed. `git merge` reports only that the octopus did not work, so
+/// each branch is tried against the base, then against each other branch, with `git
+/// merge-tree` (which touches neither the checkout nor a ref) to name the pair that really
+/// conflicts. A failure that is no conflict at all (a timeout, a missing ref) is `failed`.
+fn merge_failure(path: &Path, base: &str, branches: &[String], error: &str) -> (IntegrationState, Option<(String, String)>, String) {
+    let mut pairs: Vec<(&str, &str, &str)> = branches.iter().map(|b| ("HEAD", base, b.as_str())).collect();
+    for (i, left) in branches.iter().enumerate() {
+        for right in &branches[i + 1..] {
+            pairs.push((left, left, right));
+        }
+    }
+    for (left, left_name, right) in pairs {
+        if let Some(files) = conflict_between(path, left, right) {
+            let log = format!("merge: {error}\n{left_name} and {right} conflict in: {}\n", files.join(", "));
+            return (IntegrationState::Conflict, Some((left_name.to_string(), right.to_string())), log);
+        }
+    }
+    let unmerged: Vec<String> = git_probe(path, &["diff", "--name-only", "--diff-filter=U"])
+        .map(|(_, out)| out.lines().filter(|l| !l.is_empty()).map(str::to_string).collect())
+        .unwrap_or_default();
+    if !unmerged.is_empty() {
+        return (IntegrationState::Conflict, None, format!("merge: {error}\nUnmerged: {}\n", unmerged.join(", ")));
+    }
+    (IntegrationState::Failed, None, format!("merge: {error}\n"))
+}
+
+/// The files `left` and `right` conflict in, or `None` when they merge cleanly or the probe
+/// could not tell. `merge-tree` exits 1 both for a conflict and for a bad ref; only a
+/// conflict prints the resulting tree first.
+fn conflict_between(path: &Path, left: &str, right: &str) -> Option<Vec<String>> {
+    let (code, out) = git_probe(path, &["merge-tree", "--write-tree", "--name-only", "--no-messages", left, right])?;
+    let mut lines = out.lines();
+    let tree = lines.next()?;
+    if code != 1 || tree.len() < 40 || !tree.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut files: Vec<String> = lines.filter(|l| !l.is_empty()).map(str::to_string).collect();
+    files.dedup();
+    Some(files)
+}
+
+fn git_probe(path: &Path, args: &[&str]) -> Option<(i32, String)> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(path).args(args);
+    let out = crate::proc::output_with_timeout(&mut command, PROBE_TIMEOUT).ok()??;
+    Some((out.status.code()?, String::from_utf8_lossy(&out.stdout).into_owned()))
 }
 
 fn fail(
