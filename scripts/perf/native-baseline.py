@@ -31,6 +31,9 @@ ENGINE = ROOT / "target/debug/relay"
 NATIVE = ROOT / "target/debug/relay-native"
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 PAGE = os.sysconf("SC_PAGE_SIZE")
+# Seconds the client stays open past the 2 s settle and the measured window, so the window
+# never overlaps its scheduled capture and exit (perf record returns a little late).
+EXIT_MARGIN = 5
 
 PAGES = ["agents", "board", "code", "notes", "modules", "plan", "settings", "skills", "dashboard", "notifications", "devices", "launch-preview", "palette", "layouts"]
 
@@ -80,19 +83,29 @@ def window(pid, seconds):
     t0 = time.monotonic()
     time.sleep(seconds)
     b = counters(pid)
-    el = time.monotonic() - t0
+    return delta(a, b, time.monotonic() - t0)
+
+
+def delta(a, b, el):
     return {"seconds": round(el, 2), "cpu_percent": round((b["cpu_ticks"] - a["cpu_ticks"]) / CLK_TCK / el * 100, 2),
             "cpu_ms": round((b["cpu_ticks"] - a["cpu_ticks"]) / CLK_TCK * 1000, 1), "wakeups_per_s": round((b["vol"] - a["vol"]) / el, 1),
             "rss_mb": round(b["rss"] / 1024 / 1024, 1), "threads": b["threads"]}
 
 
-def perf_profile(pid, seconds, out_data):
-    """A sampling profile of the client for `seconds`, folded by DSO and by symbol."""
-    if not shutil.which("perf"):
-        return None
+def perf_record(pid, seconds, out_data):
+    """A sampling profile of the client for `seconds`, with the counter window over the same seconds.
+
+    The counters are read on both sides of `perf record` and nothing else, so the steady numbers
+    describe the profiled window; folding the report (perf_fold) waits until the client is gone."""
+    a = counters(pid)
+    t0 = time.monotonic()
     rec = subprocess.run(["perf", "record", "-F", "997", "-g", "-p", str(pid), "-o", str(out_data), "--", "sleep", str(seconds)], capture_output=True, text=True)
-    if rec.returncode != 0:
-        return {"error": rec.stderr[-500:]}
+    steady = delta(a, counters(pid), time.monotonic() - t0)
+    return steady, (None if rec.returncode == 0 else {"error": rec.stderr[-500:]})
+
+
+def perf_fold(out_data):
+    """Fold a recorded profile by DSO and by symbol."""
     result = {}
     for key, sort in (("by_dso", "dso"), ("by_symbol", "dso,symbol")):
         rep = subprocess.run(["perf", "report", "-i", str(out_data), "--stdio", "--no-children", "--percent-limit", "0.5", "--sort", sort], capture_output=True, text=True)
@@ -209,7 +222,7 @@ def main():
                 shot = out_dir / f"{label}.png"
                 shot.unlink(missing_ok=True)
                 penv = dict(desktop_env, RELAY_NATIVE_SCREENSHOT=str(shot), RELAY_NATIVE_SIZE=args.size, RELAY_NATIVE_PAGE=page,
-                            RELAY_NATIVE_SMOKE_SECONDS=str(seconds + 2), GDK_DEBUG="frames", **extra_env)
+                            RELAY_NATIVE_SMOKE_SECONDS=str(seconds + 2 + EXIT_MARGIN), GDK_DEBUG="frames", **extra_env)
                 row = {"page": page}
                 with open(out_dir / f"{label}.log", "w") as plog:
                     t0 = time.monotonic()
@@ -222,13 +235,14 @@ def main():
                         if streaming:
                             for name in sessions:
                                 call("session.input", {"session": name, "data": streaming + "\n"})
+                        perf_data = out_dir / f"{label}.perf.data"
                         if result["perf"]:
-                            row["profile"] = perf_profile(native.pid, seconds, out_dir / f"{label}.perf.data")
-                            # The perf window and the counter window are the same seconds: sample once more, short, for the counters.
-                            row["steady"] = window(native.pid, 1.0)
+                            row["steady"], row["profile"] = perf_record(native.pid, seconds, perf_data)
                         else:
                             row["steady"] = window(native.pid, seconds)
                         code = native.wait(timeout=60)
+                        if result["perf"] and row["profile"] is None:
+                            row["profile"] = perf_fold(perf_data)
                         row["exit_code"] = code
                         row["total_wall_s"] = round(time.monotonic() - t0, 2)
                     finally:

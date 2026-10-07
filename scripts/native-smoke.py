@@ -15,6 +15,8 @@ OUT = ROOT / ".impeccable/review"
 OUT.mkdir(parents=True, exist_ok=True)
 ENGINE = ROOT / "target/debug/relay"
 NATIVE = ROOT / "target/debug/relay-native"
+# The in-app roadmap regressions (apps/relay-native/src/smoke.rs, RELAY_NATIVE_ROADMAP).
+ROADMAP_PARTS = ("notes", "files", "lifecycle", "tools", "registry")
 
 
 def git(repo, *args):
@@ -124,8 +126,8 @@ for line in sys.stdin:
                 assert time.monotonic() < deadline, output
                 time.sleep(0.05)
             assert "\x1b[31mRed" in output and "\x1b[38;2;217;119;87mTruecolor" in output, output
-        if os.environ.get("RELAY_SMOKE_ROADMAP_ONLY"):
-            for part in os.environ["RELAY_SMOKE_ROADMAP_ONLY"].split(","):
+        def run_roadmap(parts):
+            for part in parts:
                 with (OUT / f"roadmap-{part}.log").open("w") as native_log:
                     native = subprocess.Popen([str(NATIVE)], env=dict(desktop_env,
                         RELAY_NATIVE_SCREENSHOT=str(OUT / f"roadmap-{part}.png"),
@@ -139,7 +141,13 @@ for line in sys.stdin:
                             native.wait(timeout=5)
                 assert f"ROADMAP_OK={part}" in (OUT / f"roadmap-{part}.log").read_text(), part
                 check_gtk_log((OUT / f"roadmap-{part}.log").read_text())
-            print("Roadmap native regressions passed: " + os.environ["RELAY_SMOKE_ROADMAP_ONLY"])
+            print("Roadmap native regressions passed: " + ",".join(parts))
+        # RELAY_SMOKE_ROADMAP_ONLY=notes,files narrows a run to those roadmap parts. Without it
+        # every part runs, after the page captures and their assertions: the parts move, rename
+        # and trash files, remove a registry entry and launch sessions, which would break the
+        # session counts and README check below. registry goes last for the same reason.
+        if os.environ.get("RELAY_SMOKE_ROADMAP_ONLY"):
+            run_roadmap(os.environ["RELAY_SMOKE_ROADMAP_ONLY"].split(","))
             raise SystemExit(0)
         measurements=[]
         captured=[]
@@ -206,7 +214,8 @@ for line in sys.stdin:
             call("session.park", {"session": session["name"]})
         saved=call("file.read", {"project_id":project["id"],"path":"README.md"})["text"]
         assert "Native editor save verified." in saved, saved
-        print(json.dumps({"screenshots": captured + ["burst.png"], "sessions_survived_window_close": len(live), "native_paste_echoes_verified":6,"native_editor_saved":True,"native_task_saved":True,"native_note_saved":True,"native_review_group_launched":True,"burst_native_tail_markers":11,"burst_lines_per_session":2048,"burst_completion_budget_seconds":5,"real_provider_calls": 0}))
+        run_roadmap(ROADMAP_PARTS)
+        print(json.dumps({"screenshots": captured + ["burst.png"], "sessions_survived_window_close": len(live), "native_paste_echoes_verified":6,"native_editor_saved":True,"native_task_saved":True,"native_note_saved":True,"native_review_group_launched":True,"burst_native_tail_markers":11,"burst_lines_per_session":2048,"burst_completion_budget_seconds":5,"roadmap_parts_passed": list(ROADMAP_PARTS),"real_provider_calls": 0}))
     finally:
         connection.close()
         engine.terminate()
