@@ -77,6 +77,9 @@ pub fn register(e: &mut Engine) {
                 taken_at,
             });
         }
+        // What a provider left behind wins over a report, whatever their ages. A test engine
+        // never reads the developer's own provider state; `tests/usage_source.rs` drives this
+        // path on a dev instance with the provider homes in a temp dir.
         if ctx.engine().instance != crate::Instance::Test {
             for provider in [
                 relay_bus::types::Provider::Claude,
@@ -660,10 +663,12 @@ fn skill_row(conn: &rusqlite::Connection, row: &Row) -> rusqlite::Result<Skill> 
     let enabled_in = stmt
         .query_map([id], |row| row.get(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    let body: String = row.get("body")?;
     Ok(Skill {
         id,
         name: row.get("name")?,
-        body: row.get("body")?,
+        description: crate::plugins::skill_description(&body),
+        body,
         source_url: row.get("source_url")?,
         source_path: row.get("source_path")?,
         source_ref: row.get("source_ref")?,
@@ -764,6 +769,7 @@ mod tests {
         );
         assert_eq!(restored.source_path.as_deref(), Some("ponytail/SKILL.md"));
         assert_eq!(restored.revision.as_deref(), Some("abc"));
+        assert_eq!(restored.description, "Current instructions.", "no description key: the first prose line");
 
         let error = store
             .with_tx(|tx| {
@@ -802,6 +808,22 @@ mod tests {
             Some("replacement/SKILL.md")
         );
         assert_eq!(replaced.revision.as_deref(), Some("def"));
+    }
+
+    /// RA-709: the description is read from the whole body, so a summary that cuts the front
+    /// matter short still carries it.
+    #[test]
+    fn a_summary_keeps_the_description_its_cut_body_lost() {
+        let store = Store::open_memory().unwrap();
+        let body = format!("---\nname: long\nnotes: {}\ndescription: \"Past the cut\"\n---\nProse.\n", "n".repeat(SKILL_SUMMARY_BYTES));
+        let id = store.with_tx(|tx| {
+            tx.execute("INSERT INTO skills(name,body,created_at,updated_at) VALUES ('long',?1,'t','t')", [&body])?;
+            Ok(tx.last_insert_rowid())
+        }).unwrap();
+        let mut skill = get_skill(&store.lock(), id).unwrap();
+        summarize(&mut skill);
+        assert!(!skill.body.contains("Past the cut"));
+        assert_eq!(skill.description, "Past the cut");
     }
 
     #[test]

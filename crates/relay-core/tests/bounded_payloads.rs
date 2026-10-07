@@ -1,39 +1,20 @@
 //! Replies a client cannot bound itself are bounded by the engine (RA-210, 212, 214, 217, 227):
 //! the desktop's control socket drops any line over 2 MiB, and with it the whole connection.
 
-use relay_bus::{Actor, ErrorKind, Request, Response};
+mod common;
+
+use common::{call, committed_repo, engine, git, ok};
+use relay_bus::{Actor, ErrorKind, Request};
 use relay_core::engine::{Door, Engine};
-use relay_core::{Instance, Store};
 use serde_json::{json, Value};
-use std::path::Path;
-use std::process::Command;
 use std::sync::Arc;
 
-fn engine() -> Arc<Engine> {
-    Engine::new(Instance::Test, Store::open_memory().unwrap())
-}
-fn call(e: &Engine, op: &str, payload: Value) -> Response {
-    e.dispatch(Request::new(Actor::User, op, payload), Door::InProcess)
-}
-fn ok(e: &Engine, op: &str, payload: Value) -> Value {
-    call(e, op, payload).into_result().unwrap_or_else(|error| panic!("{op}: {error:?}"))
-}
-fn git(repo: &Path, args: &[&str]) {
-    let out = Command::new("git").arg("-C").arg(repo).args(args).output().unwrap();
-    assert!(out.status.success(), "git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr));
-}
 /// A workspace holding one committed repository, added as project 1.
 fn project() -> (Arc<Engine>, tempfile::TempDir, std::path::PathBuf) {
     let e = engine();
     let ws = tempfile::tempdir().unwrap();
     let repo = ws.path().join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "-b", "main"]);
-    git(&repo, &["config", "user.name", "Relay Test"]);
-    git(&repo, &["config", "user.email", "relay@example.test"]);
-    std::fs::write(repo.join("README.md"), "# Relay\n").unwrap();
-    git(&repo, &["add", "README.md"]);
-    git(&repo, &["commit", "-m", "Initial"]);
+    committed_repo(&repo, &[("README.md", "# Relay\n")]);
     let repo = std::fs::canonicalize(&repo).unwrap();
     ok(&e, "workspace.create", json!({"path": std::fs::canonicalize(ws.path()).unwrap()}));
     ok(&e, "project.add", json!({"workspace_id": 1, "path": repo}));

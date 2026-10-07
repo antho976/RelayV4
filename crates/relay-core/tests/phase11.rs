@@ -1,18 +1,12 @@
 //! Phase 11: durable project skills, bundled plugins, and first-run workspace creation.
 
-use relay_bus::{Actor, Request, Response};
-use relay_core::engine::{Door, Engine};
+mod common;
+
+use common::{call, ok};
+use relay_core::engine::Engine;
 use relay_core::{Instance, Store};
-use serde_json::{json, Value};
+use serde_json::json;
 use std::sync::Arc;
-
-fn call(engine: &Engine, op: &str, payload: Value) -> Response {
-    engine.dispatch(Request::new(Actor::User, op, payload), Door::InProcess)
-}
-
-fn ok(engine: &Engine, op: &str, payload: Value) -> Value {
-    call(engine, op, payload).into_result().unwrap_or_else(|error| panic!("{op}: {} {}", error.code, error.message))
-}
 
 fn fixture() -> (tempfile::TempDir, Arc<Engine>) {
     let root = tempfile::tempdir().unwrap();

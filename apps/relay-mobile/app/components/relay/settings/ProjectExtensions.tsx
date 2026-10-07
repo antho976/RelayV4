@@ -14,7 +14,7 @@ import {
 } from '@components/relay'
 
 import { attempt, settingsHref } from './common'
-import { Plugin, Skill, skillSummary } from './types'
+import { Plugin, Skill } from './types'
 
 /**
  * The skills and plugins one project's agents get, each with its switch (the desktop's
@@ -82,7 +82,7 @@ const ProjectExtensions: React.FC<{ projectId: number }> = ({ projectId }) => {
                         <SwitchRow
                             key={skill.id}
                             label={skill.name}
-                            description={skillSummary(skill.body) || undefined}
+                            description={skill.description || undefined}
                             value={skill.enabled_in.includes(projectId)}
                             onChange={(value) => toggleSkill(skill, value)}
                         />

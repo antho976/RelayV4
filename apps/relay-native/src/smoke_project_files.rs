@@ -246,10 +246,11 @@ fn terminals(root: &impl IsA<gtk::Widget>, found: &mut Vec<vte4::Terminal>) {
 pub async fn profile_lifecycle(ui: &Rc<Ui>) -> Result<(), String> {
     use vte4::prelude::TerminalExt;
     ui.navigate("agents");
+    // The roadmap gate waits for the registry, not the first session list: until the fixture
+    // sessions are on the wall, their panes would land mid-sample and pass for the new one.
+    wait_for(|| !ui.sessions.borrow().is_empty(), "Fixture sessions on the wall").await?;
     let mut results = Vec::new();
     for _ in 0..5 {
-        let mut before = Vec::new();
-        terminals(&ui.window, &mut before);
         let start = std::time::Instant::now();
         let session = ui
             .call(
@@ -268,20 +269,24 @@ pub async fn profile_lifecycle(ui: &Rc<Ui>) -> Result<(), String> {
             .await
             .map_err(|e| e.to_string())?;
         let spawned = spawn.elapsed().as_secs_f64() * 1000.0;
+        // Follow this session's own terminal, not a count of the wall's, which other panes
+        // arriving or leaving would move.
+        let mut added = None;
         wait_for(
             || {
                 let mut widgets = Vec::new();
                 terminals(&ui.window, &mut widgets);
-                widgets.len() > before.len()
-                    && widgets.iter().any(|terminal| {
-                        terminal
-                            .text_format(vte4::Format::Text)
-                            .is_some_and(|text| text.contains(&format!("Session: {name}")))
-                    })
+                added = widgets.into_iter().find(|terminal| {
+                    terminal
+                        .text_format(vte4::Format::Text)
+                        .is_some_and(|text| text.contains(&format!("Session: {name}")))
+                });
+                added.is_some()
             },
             "New VTE renders provider output",
         )
         .await?;
+        let added = added.ok_or("New VTE missing")?;
         let rendered = start.elapsed().as_secs_f64() * 1000.0;
         let close = std::time::Instant::now();
         ui.call("session.close", json!({"session":name}))
@@ -292,7 +297,7 @@ pub async fn profile_lifecycle(ui: &Rc<Ui>) -> Result<(), String> {
             || {
                 let mut widgets = Vec::new();
                 terminals(&ui.window, &mut widgets);
-                widgets.len() == before.len()
+                !widgets.contains(&added)
             },
             "Closed VTE removed",
         )

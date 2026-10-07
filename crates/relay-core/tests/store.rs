@@ -1,15 +1,14 @@
 //! Phase 2: migrations at every prior version, upgrade backups, backup ops, and the v3 importer.
 
-use relay_bus::{Actor, Request, Response};
-use relay_core::engine::{Door, Engine};
+mod common;
+
+use common::{call, call_as};
+use relay_bus::Actor;
+use relay_core::engine::Engine;
 use relay_core::store::{MIGRATIONS, SCHEMA_VERSION};
 use relay_core::{Instance, Store};
-use serde_json::{json, Value};
+use serde_json::json;
 use std::sync::Arc;
-
-fn call(e: &Engine, op: &str, payload: Value) -> Response {
-    e.dispatch(Request::new(Actor::User, op, payload), Door::InProcess)
-}
 
 /// SHA-256 of every migration that has shipped, by version. A store in the wild was built by
 /// exactly this text, so the test below rebuilds old stores from it: if a shipped migration is
@@ -220,18 +219,38 @@ fn backups_via_bus_keep_last_five() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("store.db"), false).unwrap();
     let e = Engine::new(Instance::Test, store);
+    // Two older backups already on disk: a manual one, which retention must count with the
+    // new ones and drop first, and an upgrade one, which is kept by reason (RA-678).
+    let backups = e.store.backup_dir();
+    std::fs::create_dir_all(&backups).unwrap();
+    let old_manual = backups.join("store-2000-01-01T00-00-00Z-manual.db");
+    let old_upgrade = backups.join("store-2000-01-01T00-00-00Z-upgrade.db");
+    std::fs::write(&old_manual, b"").unwrap();
+    std::fs::write(&old_upgrade, b"").unwrap();
+    let mut made = Vec::new();
     for _ in 0..7 {
         let r = call(&e, "app.backup.now", json!({})).into_result().unwrap();
         assert!(r["bytes"].as_u64().unwrap() > 0);
+        made.push(r["path"].as_str().unwrap().to_string());
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
     let l = call(&e, "app.backup.list", json!({})).into_result().unwrap();
-    let b = l["backups"].as_array().unwrap();
-    assert_eq!(b.len(), 5);
-    assert!(b[0]["created_at"].as_str().unwrap() >= b[4]["created_at"].as_str().unwrap(), "newest first");
-    assert_eq!(b[0]["reason"], "manual");
+    let listed = |reason: &str| -> Vec<String> {
+        l["backups"].as_array().unwrap().iter()
+            .filter(|b| b["reason"] == reason)
+            .map(|b| b["path"].as_str().unwrap().to_string())
+            .collect()
+    };
+    // The five kept are the last five made, newest first; the planted one and the first two
+    // made are gone from disk, not just from the list.
+    let newest: Vec<String> = made[2..].iter().rev().cloned().collect();
+    assert_eq!(listed("manual"), newest);
+    for gone in [&old_manual.display().to_string(), &made[0], &made[1]] {
+        assert!(!std::path::Path::new(gone).exists(), "{gone} outlived retention");
+    }
+    assert_eq!(listed("upgrade"), vec![old_upgrade.display().to_string()], "manual backups never push out an upgrade one");
     // an agent may not back up
-    let r = e.dispatch(Request::new(Actor::agent("x"), "app.backup.now", json!({})), Door::InProcess);
+    let r = call_as(&e, Actor::agent("x"), "app.backup.now", json!({}));
     assert_eq!(r.error.unwrap().code, "actor.allowlist");
 }
 

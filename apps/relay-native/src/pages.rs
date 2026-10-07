@@ -64,38 +64,19 @@ pub async fn refresh(ui: &Rc<Ui>, name: &str, project: i64) {
         "mailbox" => json!({"project_id":project,"limit":MAILBOX_LIMIT.with(|limit| limit.get())}),
         _ => json!({"project_id":project}),
     };
-    // The board labels cards with module names, completed modules included (a task keeps its
-    // module after the module completes); both lists are asked for at once.
-    let (result, modules) = if name == "board" {
-        let (tasks, modules) = tokio::join!(
-            ui.call(op, payload),
-            ui.call("module.list", json!({"project_id":project,"include_archived":true}))
-        );
-        (tasks, Some(modules))
-    } else {
-        (ui.call(op, payload).await, None)
-    };
+    // The board labels cards with each row's `module_name`, which task.list joins in itself
+    // (completed modules included), so the board needs no module.list of its own.
+    let result = ui.call(op, payload).await;
     if ui.project.get() != project || *ui.page.borrow() != name {
         return;
     }
-    let (mut data, older) = match result {
+    let (data, older) = match result {
         Ok(v) => (rows(&v, key), v.get("next_before").is_some_and(|before| !before.is_null())),
         Err(e) => {
             ui.show_error(&e.to_string());
             return;
         }
     };
-    if let Some(Ok(modules)) = modules {
-        let modules = rows(&modules, "modules");
-        for task in &mut data {
-            if let Some(module) = modules
-                .iter()
-                .find(|module| module["id"] == task["module_id"])
-            {
-                task["_module_name"] = module["name"].clone();
-            }
-        }
-    }
     if name == "board" {
         board_view::show(ui, &ui.pages[name], project, data);
         return;

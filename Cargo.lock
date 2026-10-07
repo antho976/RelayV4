@@ -406,6 +406,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ctor"
+version = "1.0.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "914a755b7c2d4af2bdcff7ce1739e2db9a1b81a9b07123d8015786ae03c0980d"
+dependencies = [
+ "link-section",
+ "linktime-proc-macro",
+]
+
+[[package]]
 name = "dashmap"
 version = "6.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2105,6 +2115,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "link-section"
+version = "0.19.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39c29a617ce3df32c08497bdc1ab6e2376e0b17948ac166a2fbe5977c5954cd9"
+
+[[package]]
+name = "linktime-proc-macro"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e57c38c1e860fd37c604281cdfb1dd2216977fd76a50f85ba2f388ef3219616"
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2535,6 +2557,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "relay-board"
+version = "4.0.0-dev"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "relay-bus"
 version = "4.0.0-dev"
 dependencies = [
@@ -2566,11 +2595,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "relay-client"
+version = "4.0.0-dev"
+dependencies = [
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "relay-core"
 version = "4.0.0-dev"
 dependencies = [
  "anyhow",
  "base64",
+ "ctor",
  "directories",
  "gix",
  "jiff",
@@ -2580,6 +2618,7 @@ dependencies = [
  "rand 0.9.5",
  "regex",
  "relay-bus",
+ "relay-client",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2607,7 +2646,9 @@ dependencies = [
  "glib",
  "gtk4",
  "pango",
+ "relay-board",
  "relay-bus",
+ "relay-client",
  "serde_json",
  "sha2",
  "sourceview5",

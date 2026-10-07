@@ -1,30 +1,12 @@
 //! Retention, undo staleness and backups: the reconcile pass (RA-132), audit.undo's checks
 //! (RA-133, RA-172), audit.list bounds (RA-085) and app.backup.now (RA-128).
 
-use relay_bus::{Actor, Request, Response};
-use relay_core::engine::{Door, Engine};
-use relay_core::{Instance, Store};
-use serde_json::{json, Value};
-use std::path::Path;
-use std::process::Command;
+mod common;
+
+use common::{call, code, committed_repo, engine_with_project, ok, wait_until};
+use relay_core::engine::Engine;
+use serde_json::json;
 use std::sync::Arc;
-
-fn call(engine: &Engine, op: &str, payload: Value) -> Response {
-    engine.dispatch(Request::new(Actor::User, op, payload), Door::InProcess)
-}
-
-fn ok(engine: &Engine, op: &str, payload: Value) -> Value {
-    call(engine, op, payload).into_result().unwrap_or_else(|e| panic!("{op}: {e:?}"))
-}
-
-fn code(response: Response) -> String {
-    response.error.expect("expected an error").code
-}
-
-fn git(repo: &Path, args: &[&str]) {
-    let out = Command::new("git").current_dir(repo).args(args).output().unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-}
 
 /// The id of the newest successful audit row for `op`.
 fn last_audit(engine: &Engine, op: &str) -> i64 {
@@ -41,16 +23,8 @@ fn fixture() -> Fixture {
     let root = tempfile::tempdir().unwrap();
     let ws = root.path().join("ws");
     let repo = ws.join("app");
-    std::fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "-q", "-b", "main"]);
-    git(&repo, &["config", "user.email", "retention@relay.test"]);
-    git(&repo, &["config", "user.name", "Retention"]);
-    std::fs::write(repo.join("README.md"), "retention\n").unwrap();
-    git(&repo, &["add", "."]);
-    git(&repo, &["commit", "-q", "-m", "init"]);
-    let engine = Engine::new(Instance::Test, Store::open(&root.path().join("store/store.db"), false).unwrap());
-    ok(&engine, "workspace.create", json!({"path": ws}));
-    ok(&engine, "project.add", json!({"workspace_id": 1, "path": repo}));
+    committed_repo(&repo, &[("README.md", "retention\n")]);
+    let engine = engine_with_project(root.path(), &ws, &repo);
     Fixture { root, engine }
 }
 
@@ -156,11 +130,7 @@ fn reconcile_removes_expired_trash_from_disk() {
     assert!(dir.join("payload").exists());
     f.engine.store.lock().execute("UPDATE file_trash SET created_at='2000-01-01T00:00:00Z'", []).unwrap();
     ok(&f.engine, "app.reconcile", json!({}));
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while dir.exists() {
-        assert!(std::time::Instant::now() < deadline, "trash directory was never removed");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    wait_until("the trash directory to be removed", || !dir.exists());
     assert!(repo.join("README.md").exists());
 }
 

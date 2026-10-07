@@ -731,6 +731,8 @@ fn list_backups(dir: &Path) -> Result<Vec<BackupInfo>> {
             reason,
         });
     }
-    v.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    // Newest first by instant: the stamp's fractional seconds vary in width, so its text does
+    // not sort in time order (`…21Z` would sort after `…21.5Z`).
+    v.sort_by_cached_key(|b| std::cmp::Reverse((b.created_at.parse::<jiff::Timestamp>().ok(), b.created_at.clone())));
     Ok(v)
 }

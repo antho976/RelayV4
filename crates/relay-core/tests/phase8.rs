@@ -633,10 +633,10 @@ fn file_save_expectation_rejects_stale_content_and_deleted_files() {
 #[test]
 fn filesystem_reads_do_not_retrigger_refresh_but_writes_do() {
     use std::time::{Duration, Instant};
-    // The watcher emits from a thread that sleeps 125 ms after the first event of a burst
-    // (watch.rs). A "nothing arrived" check only means something if its window is well past
-    // that, or a delayed thread lets it pass without testing anything.
-    const QUIET: Duration = Duration::from_millis(8 * 125);
+    // The watcher emits from a thread that sleeps `watch::DEBOUNCE` after the first event of a
+    // burst. A "nothing arrived" check only means something if its window is well past that,
+    // or a delayed thread lets it pass without testing anything.
+    const QUIET: Duration = relay_core::watch::DEBOUNCE.saturating_mul(8);
     let e = engine();
     let (ws, repo) = real_repo();
     add_project(&e, &ws, &repo);

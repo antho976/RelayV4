@@ -1,10 +1,10 @@
 //! Helpers the engine's integration tests share (RA-671). Every file under `tests/` is its own
 //! crate and pulls these in with `mod common;`.
 //!
-//! Fixture git is hermetic (RA-672): it reads no global or system config, so a developer's
-//! `core.hooksPath`, `commit.gpgsign` or `init.templateDir` never reaches a fixture repository.
-//! The engine's own git calls still inherit that config; of it, only what `init_repo` writes
-//! locally (identity, no signing) is pinned for them.
+//! Git is hermetic (RA-672): neither fixture git nor the in-process engine's reads global or
+//! system config, so a developer's `core.hooksPath`, `commit.gpgsign` or `init.templateDir`
+//! never reaches a test. A test file that uses none of these helpers still needs `mod common;`
+//! for that.
 
 // Each test crate uses a different subset of these.
 #![allow(dead_code)]
@@ -18,6 +18,19 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Before `main`, while this test process has one thread: its git (fixtures and the engine's own
+/// calls alike) reads no global or system config (RA-672), so a developer's `core.hooksPath`,
+/// signing or templates never reach a test. The real engine keeps reading the user's config;
+/// only test binaries carry this.
+#[ctor::ctor(unsafe)]
+fn hermetic_git() {
+    // SAFETY: runs before main, so no other thread can be reading the environment.
+    unsafe {
+        libc::setenv(c"GIT_CONFIG_GLOBAL".as_ptr(), c"/dev/null".as_ptr(), 1);
+        libc::setenv(c"GIT_CONFIG_NOSYSTEM".as_ptr(), c"1".as_ptr(), 1);
+    }
+}
 
 pub const GIT_NAME: &str = "Relay Test";
 pub const GIT_EMAIL: &str = "relay@example.test";

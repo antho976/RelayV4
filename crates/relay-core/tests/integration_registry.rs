@@ -2,42 +2,20 @@
 //! failures that name the branches that really conflict, a discard that stops a running build,
 //! ids that are never recycled, and the store backup taken before a removal.
 
-use relay_bus::{Actor, BusError, Request, Response};
-use relay_core::engine::{Door, Engine};
-use relay_core::{Instance, Store};
+mod common;
+
+use common::{call_as, committed_repo, engine_with_project, git, ok, ok_as, refused};
+use relay_bus::Actor;
+use relay_core::engine::Engine;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-fn call_as(e: &Engine, actor: Actor, op: &str, payload: Value) -> Response {
-    e.dispatch(Request::new(actor, op, payload), Door::InProcess)
-}
-fn ok(e: &Engine, op: &str, payload: Value) -> Value {
-    match call_as(e, Actor::User, op, payload).into_result() {
-        Ok(v) => v,
-        Err(err) => panic!("{op} failed: {} {}", err.code, err.message),
-    }
-}
-fn refused(r: Response) -> BusError {
-    r.error.expect("expected an error")
-}
-
-fn git(repo: &Path, args: &[&str]) {
-    let st = Command::new("git").arg("-C").arg(repo).args(args).output().unwrap();
-    assert!(st.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&st.stderr));
-}
-
 fn repo_in(ws: &Path, name: &str) -> PathBuf {
     let repo = ws.join(name);
-    std::fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "-q", "-b", "main"]);
-    git(&repo, &["config", "user.email", "t@t"]);
-    git(&repo, &["config", "user.name", "t"]);
-    std::fs::write(repo.join("README.md"), "hi\n").unwrap();
-    git(&repo, &["add", "."]);
-    git(&repo, &["commit", "-q", "-m", "init"]);
+    committed_repo(&repo, &[("README.md", "hi\n")]);
     repo
 }
 
@@ -63,10 +41,7 @@ fn fixture() -> Fixture {
     let root = std::fs::canonicalize(tmp.path()).unwrap();
     let ws = root.join("ws");
     let repo = repo_in(&ws, "app");
-    let store = Store::open(&root.join("store").join("store.db"), false).unwrap();
-    let engine = Engine::new(Instance::Test, store);
-    ok(&engine, "workspace.create", json!({"path": ws}));
-    ok(&engine, "project.add", json!({"workspace_id": 1, "path": repo}));
+    let engine = engine_with_project(&root, &ws, &repo);
     Fixture { _tmp: tmp, root, ws, repo, engine }
 }
 
@@ -136,9 +111,6 @@ fn an_agents_build_waits_for_a_person_unless_the_project_trusts_agent_builds() {
     assert_eq!(count(), 4);
 }
 
-fn ok_as(e: &Engine, actor: Actor, op: &str, payload: Value) -> Value {
-    call_as(e, actor, op, payload).into_result().unwrap_or_else(|err| panic!("{op}: {err:?}"))
-}
 
 #[test]
 fn a_failed_merge_names_the_branches_that_really_conflict() {

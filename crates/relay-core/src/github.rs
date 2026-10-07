@@ -251,16 +251,9 @@ fn find_skill_files(path: &Path, depth: usize, out: &mut Vec<PathBuf>) -> std::i
 }
 
 fn frontmatter_name(body: &str) -> Option<String> {
-    let mut lines = body.lines();
-    if lines.next()?.trim() != "---" { return None; }
-    for line in lines {
-        if line.trim() == "---" { break; }
-        if let Some(name) = line.trim().strip_prefix("name:") {
-            let name = name.trim().trim_matches(['\'', '"']);
-            if !name.is_empty() { return Some(name.chars().take(120).collect()); }
-        }
-    }
-    None
+    crate::plugins::frontmatter(body, "name")
+        .filter(|name| !name.is_empty())
+        .map(|name| name.chars().take(120).collect())
 }
 
 #[cfg(test)]

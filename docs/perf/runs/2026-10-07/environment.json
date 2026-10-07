@@ -1,0 +1,20 @@
+{
+  "date": "2026-10-07",
+  "git_sha": "48566aa856491c2e86c7e69d8a93a542ed61a186",
+  "git_branch": "relay/brisk-heron",
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01) (Arch Linux rust 1:1.98.1-1.1)",
+  "profile": "dev (opt-level 1 workspace, 3 dependencies; the profile run.sh launches)",
+  "kernel": "7.2.7-1-cachyos",
+  "cpu": "AMD Ryzen 7 9800X3D 8-Core Processor",
+  "cores": 16,
+  "mem_gib": 30.5,
+  "valgrind": null,
+  "strace": "strace -- version 7.2",
+  "load_at_start": [
+    4.5673828125,
+    13.2626953125,
+    16.2265625
+  ],
+  "container": false,
+  "quick": false
+}

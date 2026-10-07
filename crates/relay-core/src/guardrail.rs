@@ -825,8 +825,12 @@ pub fn write_roots(cfg: &GuardrailConfig, worktree: &Path) -> Vec<PathBuf> {
         // Claude shares auto-memory across a repository's worktrees. Keep the
         // older per-checkout location usable too, without granting transcripts.
         // https://code.claude.com/docs/en/memory
-        let primary = gix::open(worktree).ok().and_then(|repo|
-            repo.common_dir().parent().map(Path::to_path_buf));
+        // A linked worktree's common dir reads `.git/worktrees/<name>/../..`; resolve it before
+        // taking the parent, or the parent is `.git/worktrees` rather than the primary checkout.
+        let primary = gix::open(worktree).ok().and_then(|repo| {
+            let common = std::fs::canonicalize(repo.common_dir()).ok()?;
+            common.parent().map(Path::to_path_buf)
+        });
         for project in std::iter::once(worktree).chain(primary.as_deref()) {
             let project = std::fs::canonicalize(project).unwrap_or_else(|_| project.to_path_buf());
             let project_key: String = project.to_string_lossy().chars()

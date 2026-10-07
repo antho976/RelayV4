@@ -41,6 +41,20 @@ pub fn get_project(tx: &Connection, id: Id) -> Result<Project, BusError> {
         .ok_or_else(|| BusError::not_found("project.not_found", format!("no project {id}")))
 }
 
+/// A reorder names each row once, and at least one (`project.reorder` / `workspace.reorder`).
+fn check_orders(code: &str, ids: impl Iterator<Item = Id>) -> Result<(), BusError> {
+    let mut seen = std::collections::HashSet::new();
+    for id in ids {
+        if !seen.insert(id) {
+            return Err(BusError::invalid(code, format!("{id} is named twice; give each one order")));
+        }
+    }
+    if seen.is_empty() {
+        return Err(BusError::invalid(code, "orders is empty; name every row whose order changes"));
+    }
+    Ok(())
+}
+
 fn canon(path: &str, code: &str) -> Result<PathBuf, BusError> {
     let p = Path::new(path);
     if !p.is_absolute() {
@@ -156,6 +170,29 @@ pub fn register(e: &mut Engine) {
             Some(json!({ "updated_at": ws.updated_at })));
         ctx.emit("workspace.changed", serde_json::to_value(&ws).bus()?);
         Ok(ws)
+    });
+    // A sidebar drag renumbers a whole group: one transaction, so a failure part-way leaves
+    // nothing half-applied, one undo entry that restores every previous order, and one event
+    // carrying every row it touched (RA-502).
+    e.register::<WsReorder>(|ctx: &mut Ctx, p| {
+        check_orders("workspace.orders", p.orders.iter().map(|o| o.workspace_id))?;
+        let mut previous = Vec::with_capacity(p.orders.len());
+        for o in &p.orders {
+            previous.push(json!({ "workspace_id": o.workspace_id, "order": get_workspace(ctx.tx(), o.workspace_id)?.order }));
+        }
+        let now = ctx.now.clone();
+        let mut workspaces = Vec::with_capacity(p.orders.len());
+        {
+            let mut update = ctx.tx().prepare_cached("UPDATE workspaces SET ord = ?1, updated_at = ?2 WHERE id = ?3").bus()?;
+            let mut read = ctx.tx().prepare_cached("SELECT * FROM workspaces WHERE id = ?1").bus()?;
+            for o in &p.orders {
+                update.execute(params![o.order, now, o.workspace_id]).bus()?;
+                workspaces.push(read.query_row([o.workspace_id], ws_row).bus()?);
+            }
+        }
+        ctx.set_undo("workspace.reorder", json!({ "orders": previous }), Some(json!({ "updated_at": now })));
+        ctx.emit("workspace.changed", json!({ "workspaces": workspaces }));
+        Ok(WsListOut { workspaces })
     });
     // Closing an agent undoes its hooks (git subprocesses, file writes): that half of every
     // close runs here, before the transaction, as does the store backup (RA-194, RA-195).
@@ -336,6 +373,26 @@ pub fn register(e: &mut Engine) {
         }), Some(json!({ "updated_at": pr.updated_at })));
         ctx.emit("project.changed", serde_json::to_value(&pr).bus()?);
         Ok(pr)
+    });
+    // As `workspace.reorder` (RA-502). Pinned projects still sort first within a workspace.
+    e.register::<ProjectReorder>(|ctx: &mut Ctx, p| {
+        check_orders("project.orders", p.orders.iter().map(|o| o.project_id))?;
+        let mut previous = Vec::with_capacity(p.orders.len());
+        for o in &p.orders {
+            previous.push(json!({ "project_id": o.project_id, "order": get_project(ctx.tx(), o.project_id)?.order }));
+        }
+        let now = ctx.now.clone();
+        let mut projects = Vec::with_capacity(p.orders.len());
+        {
+            let mut update = ctx.tx().prepare_cached("UPDATE projects SET ord = ?1, updated_at = ?2 WHERE id = ?3").bus()?;
+            for o in &p.orders {
+                update.execute(params![o.order, now, o.project_id]).bus()?;
+                projects.push(get_project(ctx.tx(), o.project_id)?);
+            }
+        }
+        ctx.set_undo("project.reorder", json!({ "orders": previous }), Some(json!({ "updated_at": now })));
+        ctx.emit("project.changed", json!({ "projects": projects }));
+        Ok(ProjectListOut { projects })
     });
     // As `workspace.remove`: hook teardown and the store backup before the transaction opens.
     e.register_staged::<ProjectRemove, ProjectRemoval>(|ctx, p| {

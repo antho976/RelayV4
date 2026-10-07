@@ -1,6 +1,8 @@
 //! RA-109: an agent's own commits can skip Relay's pre-commit gate, so `guardrail.gate` refuses
 //! the ways of switching the hook off, and `session.done` judges the branch's commits again.
 
+mod common;
+
 use relay_bus::{Actor, Request, Response};
 use relay_core::engine::{Door, Engine};
 use relay_core::{Instance, Store};

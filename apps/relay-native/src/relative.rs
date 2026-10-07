@@ -1,6 +1,6 @@
 //! How long ago a moment was, worded the same way in every panel. Each unit is whole and
 //! truncated, so 90 minutes is "1 h ago" in the guardrail tray, the session card and the
-//! notification list alike, and "1h" on the board.
+//! notification list alike, and "1h" on the board. [`span`] words the time until a moment.
 use glib::DateTime;
 
 /// The wording a panel has room for.
@@ -26,6 +26,23 @@ pub fn ago_unix(at: u64, form: Form) -> String {
     match (DateTime::from_unix_utc(at as i64), DateTime::now_utc()) {
         (Ok(then), Ok(now)) => between(&then, &now, form),
         _ => String::new(),
+    }
+}
+
+/// How long until a moment `seconds` away: "2d 5h", "4h 30m", "5m", "under a minute". It is
+/// worked out here rather than read from the engine's `resets_in`, which is as old as the last
+/// `usage.get` while the panel redraws every 30 s; the units match the engine's
+/// (`relay_core::time::span`).
+pub fn span(seconds: u64) -> String {
+    let (days, hours, minutes) = (seconds / 86_400, seconds % 86_400 / 3600, seconds % 3600 / 60);
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m")
+    } else {
+        "under a minute".into()
     }
 }
 
@@ -119,6 +136,14 @@ mod tests {
         assert_eq!(read(30, Form::CompactAgo), "just now");
         assert_eq!(read(45 * 60, Form::CompactAgo), "45m ago");
         assert_eq!(read(136 * 86_400, Form::CompactAgo), "on Mar 1");
+    }
+
+    #[test]
+    fn a_span_ahead_shows_its_two_largest_units() {
+        assert_eq!(span(2 * 86_400 + 5 * 3600 + 9 * 60), "2d 5h");
+        assert_eq!(span(4 * 3600 + 30 * 60), "4h 30m");
+        assert_eq!(span(5 * 60 + 59), "5m");
+        assert_eq!(span(59), "under a minute");
     }
 
     #[test]

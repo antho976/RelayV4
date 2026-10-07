@@ -80,7 +80,8 @@ formatting of the code around a change.
 
 CI runs the engine, bus and CLI half of that list — `cargo test --locked` and
 `cargo clippy --locked --all-targets -- -D warnings` — on every push and pull
-request. The native client is not covered: it pins GTK 4.22, VTE 0.84,
+request, along with the client logic kept out of GTK (`relay-board`,
+`relay-client`). The native client itself is not covered: it pins GTK 4.22, VTE 0.84,
 GtkSourceView 5.18 and pango 1.56, which the hosted runners do not carry, so its
 checks and the display smoke test still have to be run on a machine that has
 them. `.github/workflows/ci.yml` records what a runner would need to close that

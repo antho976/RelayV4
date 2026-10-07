@@ -182,7 +182,9 @@ Every op is registered with, and the schema publishes:
 
 ### 3.3 Event names
 
-`noun.changed` (entity upserted; payload is the full entity, or a re-query hint), `noun.deleted` (payload `{id}`),
+`noun.changed` (entity upserted; payload is the full entity, a re-query hint, or, from a batch op such as
+`project.reorder` / `workspace.reorder`, `{projects: Project[]}` / `{workspaces: Workspace[]}`
+with every entity it changed), `noun.deleted` (payload `{id}`),
 plus domain events (`session.state`, `session.output` on the data plane, `guardrail.held`,
 `notify.new`, `integration.result`, `provider.version`, `resource.sample`, `ui.changed` and
 `ui.toast` from the shell model of §6.5). Rule: **every
@@ -357,7 +359,9 @@ their audit row — the inverse envelope plus the entity's `updated_at` *after* 
 `updated_at` no longer matches `expect` (someone edited it since) it is `conflict` /
 `audit.stale` unless `force: true` — an undo never silently clobbers a later edit. The undo's
 own audit row carries `undo_of: <audit_id>` and its own `undo_op` (the original envelope), so
-undoing an undo is a redo, and the original row gets `undone_by`. Board ops (`task.move`,
+undoing an undo is a redo, and the original row gets `undone_by`. A batch op
+(`project.reorder`, `workspace.reorder`) records one inverse for all its rows; it stamps them
+all with one `updated_at`, and the undo is stale once any of them no longer carries it. Board ops (`task.move`,
 `task.update`, `task.delete`, `module.*`) are `inverse`; the UI's Ctrl+Z is `audit.undo` on the
 last un-undone board row by `user`. Nothing that touches a PTY, git or the filesystem is
 undoable through the bus — those have their own restore paths (trash, reflog).
@@ -618,9 +622,11 @@ callers of it wherever the provider lets us:
   like, inside `sh -c` too — with an overwrite or delete carrying the line count it removes.
   Targets built from variables or globs, and files a program opens by itself, are not seen
   (D163). Phase 5 extends the
-  same local file with `SessionStart`/`PostToolUse`/`Stop`/`Notification` hooks and a
-  `statusLine` command that call `session.report` / `usage.report` (§10.8). This is v3's
-  `agenthooks.rs`, now a bus client instead of bespoke files.
+  same local file with `SessionStart`/`PostToolUse`/`Stop`/`Notification` hooks that call
+  `session.report` (§10.8), and a `statusLine` command that writes Claude's rate-limit payload
+  to `${CLAUDE_CONFIG_DIR:-$HOME}/.claude/relay-usage.json` for `usage.get` to read (D64); it
+  calls nothing on the bus. This is v3's `agenthooks.rs`, now a bus client instead of bespoke
+  files.
 - **git**: every Relay-created worktree gets a `pre-commit` hook calling `relay cmd
   guardrail.gate '{"kind":"commit"}'`; the hook exits non-zero on `refuse`/`hold`. This binds
   both providers' commits, and yours.
@@ -770,12 +776,14 @@ unique; nothing else is.
 | `workspace.discover` | query | `{ path? }` → `{ path, repositories: {path,name}[] }`; resolves blank to the parent of the Git checkout holding the *engine's* working directory (or that directory outside a checkout) — under `relay serve` the engine home, not the caller's directory, so a client that means "here" sends its own absolute path — and scans bounded descendants for Git roots, skipping any it cannot read |
 | `workspace.list` | query | `{}` → `{ workspaces: Workspace[] }` |
 | `workspace.update` | mutation · always · inverse | `{ workspace_id, name?, order? }` → `Workspace` |
+| `workspace.reorder` | mutation · always · inverse · global | `{ orders: { workspace_id, order }[] }` → `{ workspaces: Workspace[] }` — a sidebar drag in one call: every named workspace takes its `order` in one transaction, unnamed ones keep theirs; one audit row whose inverse is a `workspace.reorder` back to the previous orders, and one `workspace.changed {workspaces}` carrying the rows it wrote. `not_found`/`workspace.not_found` for an unknown id (nothing written); `invalid`/`workspace.orders` for an empty list or an id named twice |
 | `workspace.remove` | mutation · always · global | `{ workspace_id, force?: bool, remove_worktrees?: bool }` → `{ projects_removed, sessions_closed }` — `conflict` (`workspace.has_projects`, `details.projects`) if it still has projects, unless `force`, which runs `project.remove { force }` for each of them first |
 | `project.add` | mutation · always · global | `{ workspace_id, path, name? }` → `Project` — path must be a git repo root **inside** `workspace.path` (`invalid`/`project.outside_workspace`); one project per path (`conflict`/`project.exists`) |
 | `project.clone` | mutation · always · global | `{ workspace_id, url, dest? }` → `{ project: Project }`; clones inside the workspace and registers the result |
 | `project.list` | query | `{ workspace_id? }` → `{ projects: Project[] }` |
 | `project.get` | query | `{ project_id }` → `Project` |
 | `project.update` | mutation · always · inverse | `{ project_id, name?, build_cmd?, run_cmd?, base_branch?, protected_paths?, critical_files?, order?, pinned? }` → `Project` |
+| `project.reorder` | mutation · always · inverse · global | `{ orders: { project_id, order }[] }` → `{ projects: Project[] }` — as `workspace.reorder`, for projects (`project.not_found`, `project.orders`); emits one `project.changed {projects}`. `pinned` still sorts first in `project.list` |
 | `project.remove` | mutation · always · project | `{ project_id, force?: bool, remove_worktrees?: bool }` → `{ sessions_closed, runs_stopped }` — forgets project-owned Relay metadata but never touches repository files; `conflict` if sessions (`project.sessions_live`, `details.open_sessions`) or device runs are live, unless `force`, which closes every open session through `session.close` and stops the runs first. Closed sessions keep their worktrees and branches unless `remove_worktrees` (Relay-pool checkouts only, deleted once the store unlocks; branches always kept). An integration in progress refuses even with `force` |
 | `project.remove.preview` | query · user | `{ project_id? } \| { workspace_id? }` (exactly one) → `{ projects, tasks, notes, modules }` — what a removal would delete (live, untrashed rows), for the confirmation dialog |
 | `project.relink` | mutation · always · inverse | `{ project_id, path }` → `Project` — the repository moved: `path` must be a git repo root (`invalid`/`project.path`), no other project's path (`conflict`/`project.exists`) and inside a workspace (`invalid`/`project.outside_workspace`); the project stays in its workspace if that still contains it, else joins the innermost one that does. Stored worktree and trash paths under the old root are rewritten and the moved checkouts get `git worktree repair` after the commit. `conflict` (`project.sessions_live` / `project.activity_live`) while sessions are open or an integration or device run is live. Undo relinks to the old path |
@@ -789,7 +797,7 @@ unique; nothing else is.
 |---|---|---|
 | `task.create` | mutation · always · inverse (delete) · project | `{ project_id, title, body?, column?: Column = "backlog", state?: TaskState, priority?: Priority = "medium", size?: Size, module_id?, changelog?, attachments?: AttachmentIn[], type?: TaskType = "task", parent_id?, labels?: string[] }` → `Task` |
 | `task.get` | query | `{ task_id }` → `Task` (with attachments, commits) |
-| `task.list` | query | `{ project_id?, column?, state?, module_id?, priority?, include_deleted?, sort?: "column"\|"priority"\|"updated", type?, label?, session?, parent_id?: Id\|null, limit? (1000, ≤2000), offset?, summary? }` → `{ tasks: Task[], next_offset? }` — a page; `summary` leaves `body` and `changelog` empty. `project_id` optional so the Dashboard can ask "in review, everywhere"; `parent_id: null` is roots only, `session` is "every card this agent was ever sent" |
+| `task.list` | query | `{ project_id?, column?, state?, module_id?, priority?, include_deleted?, sort?: "column"\|"priority"\|"updated", type?, label?, session?, parent_id?: Id\|null, limit? (1000, ≤2000), offset?, summary? }` → `{ tasks: Task[], next_offset? }` — a page; `summary` leaves `body` and `changelog` empty. `project_id` optional so the Dashboard can ask "in review, everywhere"; `parent_id: null` is roots only, `session` is "every card this agent was ever sent". Every task names its module (`module_name`, completed modules included), so a board labels cards without `module.list` |
 | `task.update` | mutation · always · inverse | `{ task_id, title?, body?, priority?, size?, module_id?: Id\|null, state?, changelog?, type? }` → `Task` |
 | `task.move` | mutation · always · inverse | `{ task_id, column: Column, position?: number }` → `Task` — transitions table in §11.1; `position` is the 0-based index the task ends at in the column (the others shift around it, clamped to the end), omitted means last; agents may only move their own task and only `active → in_review` |
 | `task.delete` | mutation · always · inverse (restore) | `{ task_id }` → `{}` |
@@ -920,7 +928,7 @@ Provider-neutral Markdown; the same for both providers.
 | `guardrail.config.get` | query | `{ workspace_id? \| project_id? }` → `GuardrailConfig` (§9.6) |
 | `guardrail.config.set` | mutation · always · inverse · user | `{ workspace_id? \| project_id?, patch: Partial<GuardrailConfig> }` → `GuardrailConfig` — patches that one layer's overrides |
 | `guardrail.config.layers` | query | `{ workspace_id? \| project_id? }` → `{ scope, workspace_id?, project_id?, effective, inherited, overrides, sources }` (§9.6) |
-| `guardrail.request` | mutation · always · session · agent (every role) | `{ session, kind, value, reason, scope? }` → `{ request: GuardrailException, created, wait_for }` (§9.5); `reason` at most 4 KiB, `value` at most 8 KiB |
+| `guardrail.request` | mutation · always · session · agent (every role) | `{ session, kind, value, reason, scope? }` → `{ request: GuardrailException, created, wait_for }` (§9.5); `reason` at most 4 KiB, `value` at most 8 KiB; a `command` value with a bidi control, a zero-width or other format character (Unicode Cf) or a control character other than newline is `invalid`/`guardrail.request`, since the person approving must read exactly the bytes granted |
 | `guardrail.request.get` | query | `{ request_id }` → `GuardrailException` |
 | `guardrail.requests.list` | query | `{ project_id?, session?, state?: "open"\|"active"\|"all" }` → `{ requests: GuardrailException[] }`; an agent sees its own project's only, as for `guardrail.holds.list` |
 | `guardrail.grant.revoke` | mutation · always · user | `{ request_id }` → `GuardrailException` |
@@ -1008,9 +1016,9 @@ at it; one moved by hand without `git worktree move` is refused until `git workt
 |---|---|---|
 | `provider.list` | query | `{}` → `{ providers: ProviderInfo[] }` — installed, path, version, auth (`signed_in_as?`), spawn profile |
 | `provider.refresh` | mutation · never | `{}` → `{ providers: ProviderInfo[] }` — re-detect now |
-| `usage.get` | query | `{ provider?: Provider }` → `{ usage: Usage[] }` — per provider, in its own units and windows; combines stored agent reports with bounded read-only CLI state inspection and never calls a provider endpoint |
-| `usage.report` | mutation · never · session · agent | `{ session, provider, payload: object }` → `{}` — the provider's own metering pushed by its statusLine/hook (v3's `statusline.rs`); core stores the latest per session and derives `usage.get` |
-| `skill.list` | query | `{ project_id?, enabled?, summary? }` → `{ skills: Skill[] }`; with `summary: true` each `body` is cut to its first 4 KiB (the frontmatter and opening), so a large library fits one reply |
+| `usage.get` | query | `{ provider?: Provider }` → `{ usage: Usage[] }` — per provider, in its own units and windows; combines stored agent reports with bounded read-only CLI state inspection and never calls a provider endpoint. Where a provider left state to read (the Claude status-line file, Codex's newest rollout), it wins over a stored report whatever their ages |
+| `usage.report` | mutation · never · session · agent | `{ session, provider, payload: object }` → `{}` — metering an agent reports for its own session; core stores the latest per session as `usage.get`'s fallback. No hook sends it: the Claude status line writes a file instead (D64) |
+| `skill.list` | query | `{ project_id?, enabled?, summary? }` → `{ skills: Skill[] }`; with `summary: true` each `body` is cut to its first 4 KiB (the frontmatter and opening), so a large library fits one reply; `description` is read before the cut |
 | `skill.get` | query | `{ skill_id }` → `Skill` with its whole body; `skill.not_found` |
 | `skill.create` / `skill.update` / `skill.delete` | mutation · always · inverse | `{ name, body }` / `{ skill_id, name?, body? }` / `{ skill_id }`; a skill nobody has enabled anywhere is enabled in every project on create/install (D147) |
 | `skill.enable` | mutation · always · inverse | `{ skill_id, project_id, enabled: bool }` → `Skill`; the per-project override on top of that app-wide default |
@@ -1026,7 +1034,7 @@ at it; one moved by hand without `git worktree move` is refused until `git workt
 
 | op | attrs | payload → result |
 |---|---|---|
-| `notify.list` | query | `{ project_id?, unread_only?, category?, limit? }` → `{ notifications: Notification[] }` |
+| `notify.list` | query | `{ project_id?, unread_only?, category?, limit? (100, ≤500), count_only? }` → `{ notifications: Notification[], unread: number }` — `unread` counts every unread notification under `project_id` / `category`, whatever `limit` and `unread_only` leave out of the page; `count_only` returns it with no rows (`notifications: []`), for a badge |
 | `dashboard.get` | query · global | `{}` → `{ projects: DashboardProject[], sessions_live: Peer[], in_review: Task[], holds_open: Hold[] (newest 100), notifications: Notification[], resources: {…as app.resources.get} }` — project workload counts, decisions, activity, and resource pulse in one round trip |
 | `notify.ack` / `notify.ack_all` | mutation · never | `{ notification_id }` / `{ category? }` → `{}` |
 | `notify.settings.get` / `notify.settings.set` | query / mutation · always · inverse | `{}` → `NotifySettings` / `{ patch }` → `NotifySettings` |
@@ -1089,6 +1097,7 @@ type TaskType = "task" | "feature" | "bug" | "chore" | "spike";
 
 interface Task {
   id; project_id; module_id: Id | null;
+  module_name: string | null;           // module_id's name, completed (archived) modules included
   title: string; body: string; changelog: string;
   column: Column; position: number; state: TaskState;
   priority: Priority; size: Size | null;
@@ -1194,7 +1203,9 @@ interface ProviderInfo { provider; installed: bool; path: string | null; version
   signed_in_as: string | null; last_seen_version: string | null; spawn_profile: object;
   guarded: bool /* true for both providers: Claude Code's hooks in .claude/settings.local.json,
                     Codex's in .codex/hooks.json once trusted in /hooks (§9.3, D132) */ }
-interface Skill { id; name; body; enabled_in: Id[] }
+interface Skill { id; name; description: string /* the SKILL.md front matter's `description`, else
+  its first prose line, else ""; read from the whole body, so a summary's cut body keeps it */;
+  body; enabled_in: Id[] }
 interface Device { serial; model; kind: "usb" | "avd"; state }
 ```
 

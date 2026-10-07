@@ -76,7 +76,7 @@ impl Ui {
         self.refresh_devices();
     }
 
-    fn refresh_devices(self: &Rc<Self>) {
+    pub(super) fn refresh_devices(self: &Rc<Self>) {
         if self.client.borrow().is_none() {
             return;
         }

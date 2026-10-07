@@ -410,6 +410,10 @@ pub struct Task {
     pub id: Id,
     pub project_id: Id,
     pub module_id: Option<Id>,
+    /// The name of `module_id`'s module, completed (archived) ones included, so a card can be
+    /// labelled without a `module.list` (RA-495). Absent from an older engine.
+    #[serde(default)]
+    pub module_name: Option<String>,
     pub title: String,
     pub body: String,
     pub changelog: String,
@@ -694,6 +698,11 @@ pub struct Usage {
 pub struct Skill {
     pub id: Id,
     pub name: String,
+    /// What the skill is for: the `description` of its SKILL.md front matter, else the first
+    /// line of prose after it; empty when there is neither. Read from the whole body, so it is
+    /// there even when `skill.list {summary: true}` cuts the body short.
+    #[serde(default)]
+    pub description: String,
     pub body: String,
     pub source_url: Option<String>,
     pub source_path: Option<String>,

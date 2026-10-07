@@ -17,10 +17,6 @@ struct Center {
     /// A notify.list is in flight, and whether a change since means it must run once more.
     loading: Cell<bool>,
     stale: Cell<bool>,
-    /// Unread notifications as the bell counts them, which reach past the newest 100 listed
-    /// here, and how many rows the list shows and how many of those are unread.
-    unread: Cell<usize>,
-    listed: Cell<(usize, usize)>,
     /// When the popover last closed. A press on the bell that closes an open popover reaches
     /// the bell too; without this it would open the popover again at once.
     closed_at: Cell<i64>,
@@ -74,8 +70,6 @@ pub(super) fn install(ui: &Rc<Ui>, key: &gtk::Button) {
         mark_all,
         loading: Cell::new(false),
         stale: Cell::new(false),
-        unread: Cell::new(0),
-        listed: Cell::new((0, 0)),
         closed_at: Cell::new(0),
     });
     let weak = Rc::downgrade(&center);
@@ -125,14 +119,6 @@ pub(super) fn changed() {
     }
 }
 
-/// The bell counted `count` unread notifications.
-pub(super) fn unread(count: usize) {
-    if let Some(center) = center() {
-        center.unread.set(count);
-        center.summarize();
-    }
-}
-
 impl Center {
     fn show(self: &Rc<Self>) {
         if self.list.first_child().is_none() {
@@ -158,26 +144,21 @@ impl Center {
                     continue;
                 }
                 match result {
-                    Ok(data) => center.render(&ui, &rows(&data, "notifications")),
+                    Ok(data) => {
+                        let entries = rows(&data, "notifications");
+                        // Unread across all notifications, not only the newest 100 listed: an
+                        // older unread one still counts, and Mark all read must still clear it.
+                        let unread = data["unread"].as_u64().map_or_else(
+                            || entries.iter().filter(|n| n["read"] != true).count(),
+                            |n| n as usize,
+                        );
+                        center.render(&ui, &entries, unread)
+                    }
                     Err(e) => center.placeholder("Notifications are unavailable", &e.to_string()),
                 }
             }
             center.loading.set(false);
         });
-    }
-
-    /// The unread count is the larger of the bell's and the list's: an unread notification
-    /// older than the newest 100 is not listed, and Mark all read must still clear it.
-    fn summarize(&self) {
-        let (listed, listed_unread) = self.listed.get();
-        let unread = listed_unread.max(self.unread.get());
-        self.summary.set_text(&match unread {
-            0 if listed == 0 => String::from("Nothing yet"),
-            0 => String::from("All read"),
-            1 => String::from("1 unread"),
-            n => format!("{n} unread"),
-        });
-        self.mark_all.set_sensitive(unread > 0);
     }
 
     fn placeholder(&self, title: &str, detail: &str) {
@@ -201,10 +182,14 @@ impl Center {
         self.list.append(&empty);
     }
 
-    fn render(self: &Rc<Self>, ui: &Rc<Ui>, entries: &[Value]) {
-        let unread = entries.iter().filter(|n| n["read"] != true).count();
-        self.listed.set((entries.len(), unread));
-        self.summarize();
+    fn render(self: &Rc<Self>, ui: &Rc<Ui>, entries: &[Value], unread: usize) {
+        self.summary.set_text(&match unread {
+            0 if entries.is_empty() => String::from("Nothing yet"),
+            0 => String::from("All read"),
+            1 => String::from("1 unread"),
+            n => format!("{n} unread"),
+        });
+        self.mark_all.set_sensitive(unread > 0);
         if entries.is_empty() {
             self.placeholder(
                 "You're all caught up",
@@ -233,9 +218,6 @@ impl Center {
         if unread {
             row.add_css_class("unread");
         }
-        let open = button("", "notification-open");
-        open.set_hexpand(true);
-        open.set_tooltip_text(Some("Open where this happened"));
         let content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         dot.add_css_class("notification-dot");
@@ -273,15 +255,30 @@ impl Center {
         }
         copy.append(&label(&meta.join(" · ").to_uppercase(), "notification-meta"));
         content.append(&copy);
-        open.set_child(Some(&content));
-        row.append(&open);
-        let weak = Rc::downgrade(self);
-        let target = item.clone();
-        open.connect_clicked(move |_| {
-            if let Some(center) = weak.upgrade() {
-                center.follow(&target);
-            }
-        });
+        // A notification whose link the UI cannot route, or that has none, offers no "Open"
+        // (D121): its row is plain text, and only Mark read acts on it.
+        if route(item).is_some() {
+            let open = button("", "notification-open");
+            open.set_hexpand(true);
+            open.set_tooltip_text(Some("Open where this happened"));
+            open.set_child(Some(&content));
+            row.append(&open);
+            let weak = Rc::downgrade(self);
+            let target = item.clone();
+            open.connect_clicked(move |_| {
+                if let Some(center) = weak.upgrade() {
+                    center.follow(&target);
+                }
+            });
+        } else {
+            // The padding button.notification-open would have given it.
+            content.set_hexpand(true);
+            content.set_margin_top(10);
+            content.set_margin_bottom(10);
+            content.set_margin_start(12);
+            content.set_margin_end(12);
+            row.append(&content);
+        }
         if unread {
             let read = icon_button("check", "Mark read");
             read.add_css_class("notification-read");
@@ -308,6 +305,7 @@ impl Center {
     /// Mark `item` read and go where it happened: its task, its page or its project's agents.
     fn follow(&self, item: &Value) {
         let Some(ui) = self.ui.upgrade() else { return };
+        let Some(page) = route(item) else { return };
         self.popover.popdown();
         if item["read"] != true {
             let ui = ui.clone();
@@ -319,22 +317,6 @@ impl Center {
         let project = item["project_id"].as_i64().unwrap_or(ui.project.get());
         let link = &item["link"];
         let payload = &link["payload"];
-        let page = match text(link, "op") {
-            "ui.page.switch" => payload["page"]
-                .as_str()
-                .filter(|p| *p != "notifications")
-                .unwrap_or("agents"),
-            "task.get" => "board",
-            // A hold or exception request waits on its session's tile (D121), which the focus
-            // below brings forward; the Guardrails page would leave that focus on a hidden wall.
-            "session.get" | "guardrail.confirm" => "agents",
-            _ => match text(item, "category") {
-                "agent_done" | "integration" => "board",
-                "guardrail" => "guardrails",
-                "provider" => "settings",
-                _ => "agents",
-            },
-        };
         if project == 0 {
             ui.navigate(page);
             return;
@@ -356,4 +338,22 @@ impl Center {
             }
         }
     }
+}
+
+/// The page following `item` opens, or None when its link names nothing the UI can route
+/// (or it has no link), in which case it shows no "Open" affordance (D121).
+fn route(item: &Value) -> Option<&str> {
+    let link = &item["link"];
+    let payload = &link["payload"];
+    Some(match text(link, "op") {
+        "ui.page.switch" => payload["page"]
+            .as_str()
+            .filter(|p| *p != "notifications")
+            .unwrap_or("agents"),
+        "task.get" => "board",
+        // A hold or exception request waits on its session's tile (D121), which the focus
+        // in follow() brings forward; the Guardrails page would leave that focus on a hidden wall.
+        "session.get" | "guardrail.confirm" => "agents",
+        _ => return None,
+    })
 }

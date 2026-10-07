@@ -1,43 +1,20 @@
 //! Audit findings RA-145 … RA-149 (`file.*`) and RA-188 … RA-191 (`task.*`), each pinned
 //! through the bus door the way a client or an agent reaches it.
 
-use relay_bus::{Actor, Request, Response};
-use relay_core::engine::{Door, Engine};
-use relay_core::{Instance, Store};
+mod common;
+
+use common::{call_as as call, committed_repo, engine_with_project, git, ok};
+use relay_bus::Actor;
+use relay_core::engine::Engine;
 use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-fn git(repo: &Path, args: &[&str]) {
-    let out = Command::new("git").arg("-C").arg(repo).args(args).output().unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-}
-
-fn call(engine: &Engine, actor: Actor, op: &str, payload: Value) -> Response {
-    engine.dispatch(Request::new(actor, op, payload), Door::InProcess)
-}
-
-fn ok(engine: &Engine, op: &str, payload: Value) -> Value {
-    call(engine, Actor::User, op, payload)
-        .into_result()
-        .unwrap_or_else(|e| panic!("{op}: {} {}", e.code, e.message))
-}
-
+/// Unlike `common::refused`, takes the request and names the op that should have refused.
 fn refused(engine: &Engine, actor: Actor, op: &str, payload: Value) -> relay_bus::BusError {
     call(engine, actor, op, payload)
         .into_result()
         .expect_err(&format!("{op} was expected to refuse"))
-}
-
-fn init_repo(path: &Path) {
-    std::fs::create_dir_all(path).unwrap();
-    git(path, &["init", "-q", "-b", "main"]);
-    git(path, &["config", "user.email", "audit@relay.test"]);
-    git(path, &["config", "user.name", "Audit"]);
-    std::fs::write(path.join("README.md"), "audit\n").unwrap();
-    git(path, &["add", "."]);
-    git(path, &["commit", "-q", "-m", "init"]);
 }
 
 struct Fixture {
@@ -51,14 +28,9 @@ impl Fixture {
         let root = tempfile::tempdir().unwrap();
         let ws = root.path().join("ws");
         let repo = ws.join("first");
-        init_repo(&repo);
-        init_repo(&ws.join("second"));
-        let engine = Engine::new(
-            Instance::Test,
-            Store::open(&root.path().join("store/store.db"), false).unwrap(),
-        );
-        ok(&engine, "workspace.create", json!({"path": ws}));
-        ok(&engine, "project.add", json!({"workspace_id": 1, "path": repo}));
+        committed_repo(&repo, &[("README.md", "audit\n")]);
+        committed_repo(&ws.join("second"), &[("README.md", "audit\n")]);
+        let engine = engine_with_project(root.path(), &ws, &repo);
         ok(&engine, "project.add", json!({"workspace_id": 1, "path": ws.join("second")}));
         let repo = std::fs::canonicalize(&repo).unwrap();
         Self { root, engine, repo }
