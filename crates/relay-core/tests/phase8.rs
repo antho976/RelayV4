@@ -2,30 +2,13 @@
 
 mod common;
 
-use common::{call, committed_repo, err, git, git_command};
+use common::{call, committed_repo, engine, err, git, git_command};
 use relay_bus::ErrorKind;
 use relay_core::engine::Engine;
 use relay_core::Instance;
 use serde_json::json;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
-use std::sync::Arc;
-
-/// An engine whose git reads no global or system config (RA-672). The fixture's own git
-/// (`git_command`) already does not, but the engine's runs as this process does, and a
-/// developer's global `core.hooksPath` would chain `git.commit` to their real pre-commit hook.
-/// Pinning `core.hooksPath` in the fixture instead would move the hook-chaining test off git's
-/// default hooks directory, which is what it covers. The engine itself must keep reading the
-/// user's config, so only this test process drops it. Every test here calls this first, so the
-/// one `set_var` runs before any test has started git.
-fn engine() -> Arc<Engine> {
-    static HERMETIC: std::sync::Once = std::sync::Once::new();
-    HERMETIC.call_once(|| {
-        std::env::set_var("GIT_CONFIG_GLOBAL", "/dev/null");
-        std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
-    });
-    common::engine()
-}
 
 fn real_repo() -> (tempfile::TempDir, String) {
     let ws = tempfile::tempdir().unwrap();
