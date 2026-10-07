@@ -538,6 +538,9 @@ mod tests {
 
         let info = run(PY_INFO, &json!({}), Some(&fixture), t).unwrap();
         assert!(info["objects"].as_array().unwrap().iter().any(|o| o["name"] == "Hero" && o["armature"]["left_right_pairs"] == 6));
+        // Blender 5 keeps F-curves in slot channelbags; the count must not read zero there.
+        let swing = info["actions"].as_array().unwrap().iter().find(|a| a["name"] == "Swing").unwrap();
+        assert!(swing["fcurves"].as_u64().unwrap() > 0 && swing["bones_animated"].as_u64().unwrap() > 0, "{} {swing}", info["blender"]);
 
         let rig = run(PY_RIG_CHECK, &json!({"armature": "Hero"}), Some(&fixture), t).unwrap();
         assert_eq!(rig["passed"], true, "{rig}");
@@ -603,6 +606,29 @@ mod tests {
                 assert_eq!(top["identity"], true, "{exported}");
                 assert_eq!(side["identity"], false);
                 assert_eq!(side["rotation_deg"][2], 90.0);
+            }
+            Err(error) => assert!(format!("{error:#}").contains("numpy"), "{error:#}"),
+        }
+
+        // Every way of hiding an object still exports it, and an excluded collection is reported
+        // rather than failing the export or vanishing from it.
+        let hidden_file = dir.path().join("hidden.blend");
+        run(PY_RUN, &json!({
+            "code": "import bmesh\nbpy.ops.wm.read_factory_settings(use_empty=True)\nscene = bpy.context.scene\ndef box(name, coll):\n    me = bpy.data.meshes.new(name)\n    bm = bmesh.new()\n    bmesh.ops.create_cube(bm, size=1.0)\n    bm.to_mesh(me)\n    bm.free()\n    me.uv_layers.new(name='UVMap')\n    o = bpy.data.objects.new(name, me)\n    c = bpy.data.collections.new(coll)\n    scene.collection.children.link(c)\n    c.objects.link(o)\n    return o, c\nbox('SM_Eye', 'Eye')\n_, monitor = box('SM_Monitor', 'Monitor')\nmonitor.hide_viewport = True\n_, unpickable = box('SM_Unpickable', 'Unpickable')\nunpickable.hide_select = True\no, _ = box('SM_Locked', 'Locked')\no.hide_select = True\nbox('RefBox', 'Reference')\nlayers = bpy.context.view_layer.layer_collection.children\nlayers['Eye'].hide_viewport = True\nlayers['Reference'].exclude = True",
+            "save_as": hidden_file,
+        }), None, t).unwrap();
+        let hidden_fbx = dir.path().join("hidden.fbx");
+        match run(PY_EXPORT, &json!({"path": hidden_fbx, "kind": "static"}), Some(&hidden_file), t) {
+            Ok(exported) => {
+                assert_eq!(exported["objects"], json!(["SM_Eye", "SM_Locked", "SM_Monitor", "SM_Unpickable"]), "{exported}");
+                assert_eq!(exported["excluded"], json!(["RefBox"]));
+                let back = run(PY_RUN, &json!({"code": format!(
+                    "bpy.ops.wm.read_factory_settings(use_empty=True)\nbpy.ops.import_scene.fbx(filepath={:?})\nprint(sorted(o.name for o in bpy.data.objects if o.type == 'MESH'))",
+                    hidden_fbx.display().to_string())}), None, t).unwrap();
+                assert_eq!(back["output"].as_str().unwrap().lines().last(), Some("['SM_Eye', 'SM_Locked', 'SM_Monitor', 'SM_Unpickable']"), "{back}");
+                // Named, an excluded object is brought in.
+                let named = run(PY_EXPORT, &json!({"path": dir.path().join("ref.fbx"), "objects": ["RefBox"], "kind": "static"}), Some(&hidden_file), t).unwrap();
+                assert_eq!(named["objects"], json!(["RefBox"]), "{named}");
             }
             Err(error) => assert!(format!("{error:#}").contains("numpy"), "{error:#}"),
         }

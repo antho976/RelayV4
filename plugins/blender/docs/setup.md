@@ -1,6 +1,6 @@
 # Setting up Blender for the Relay plugin
 
-1. **Install Blender** (4.0 or newer; LTS releases are the safest). The official download from
+1. **Install Blender** (4.0 or newer; the tools are tested on 5.2 LTS, and LTS releases are the safest). The official download from
    blender.org bundles everything the tools need.
 2. **Make it findable.** Relay looks for `blender` on `PATH`, then
    `/Applications/Blender.app/Contents/MacOS/Blender`, `/snap/bin/blender`, `/usr/local/bin/blender`

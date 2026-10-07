@@ -42,8 +42,9 @@ for o in scene.objects:
 
 actions = []
 for a in bpy.data.actions:
-    groups = set(fc.data_path.split('"')[1] for fc in a.fcurves if fc.data_path.startswith("pose.bones["))
-    actions.append({"name": a.name, "frame_range": rnd(a.frame_range), "fcurves": len(a.fcurves),
+    curves = action_fcurves(a)
+    groups = set(fc.data_path.split('"')[1] for fc in curves if fc.data_path.startswith("pose.bones["))
+    actions.append({"name": a.name, "frame_range": rnd(a.frame_range), "fcurves": len(curves),
                     "bones_animated": len(groups), "users": a.users, "fake_user": a.use_fake_user})
 
 images = [{"name": i.name, "size": list(i.size), "file": i.filepath, "packed": i.packed_file is not None}
