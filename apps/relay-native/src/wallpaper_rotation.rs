@@ -48,6 +48,9 @@ pub(crate) struct Rotation {
     signature: u64,
     revision: u64,
     running: bool,
+    /// Set while a rotation repaints: it has just read the config and library itself, so the
+    /// `refresh` that repaint starts would only fetch the library a second time.
+    quiet: bool,
     /// The image a rotation put up, with the saved wallpaper it stood in for: a different
     /// saved wallpaper (the user chose one) retires it.
     rotated: Option<(Value, String)>,
@@ -75,10 +78,15 @@ impl Drop for Rotation {
     }
 }
 
+/// What the timer depends on: the config and which images there are. A library can be
+/// megabytes of base64; each tick reads it afresh, so its bytes need not be hashed here.
 fn signature(config: &Value, library: &Value) -> u64 {
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     config.to_string().hash(&mut hash);
-    library.to_string().hash(&mut hash);
+    images(library).len().hash(&mut hash);
+    for item in library.as_array().into_iter().flatten() {
+        item["id"].as_str().hash(&mut hash);
+    }
     hash.finish()
 }
 
@@ -102,24 +110,42 @@ fn images(library: &Value) -> Vec<&str> {
 pub(crate) fn refresh(ui: &Rc<Ui>) {
     let revision = {
         let mut state = ui.wallpaper_rotation.borrow_mut();
+        if state.quiet {
+            return;
+        }
         state.revision += 1;
         state.revision
     };
     let generation = ui.generation.get();
     let ui = ui.clone();
     glib::spawn_future_local(async move {
-        let (config, library) = tokio::join!(
-            ui.call(
+        let stale = |ui: &Ui| {
+            generation != ui.generation.get() || revision != ui.wallpaper_rotation.borrow().revision
+        };
+        let Ok(config) = ui
+            .call(
                 "settings.get",
-                json!({"path":"appearance.wallpaper_rotation"})
-            ),
-            ui.call("settings.get", json!({"path":"appearance.wallpapers"}))
-        );
-        if generation != ui.generation.get() || revision != ui.wallpaper_rotation.borrow().revision
-        {
+                json!({"path":"appearance.wallpaper_rotation"}),
+            )
+            .await
+        else {
+            return;
+        };
+        if stale(&ui) {
             return;
         }
-        if let (Ok(config), Ok(library)) = (config, library) {
+        // Rotation off: the library is not needed, and it is the expensive read.
+        if config["value"]["enabled"] != true {
+            configure(&ui, &config["value"], &Value::Null);
+            return;
+        }
+        let library = ui
+            .call("settings.get", json!({"path":"appearance.wallpapers"}))
+            .await;
+        if stale(&ui) {
+            return;
+        }
+        if let Ok(library) = library {
             configure(&ui, &config["value"], &library["value"]);
         }
     });
@@ -154,13 +180,17 @@ fn configure(ui: &Rc<Ui>, config: &Value, library: &Value) {
             let Some(ui) = weak.upgrade() else {
                 return glib::ControlFlow::Break;
             };
-            if ui.wallpaper_rotation.borrow().running {
+            // No engine connection: skip the tick. The banner already says the engine is gone,
+            // and a rotation error every interval would only cover that up.
+            if ui.wallpaper_rotation.borrow().running || ui.client.borrow().is_none() {
                 return glib::ControlFlow::Continue;
             }
             ui.wallpaper_rotation.borrow_mut().running = true;
             glib::spawn_future_local(async move {
-                if let Err(error) = rotate_once(&ui).await {
-                    ui.show_error(&format!("Wallpaper rotation failed: {error}"));
+                match rotate_once(&ui).await {
+                    // The connection dropped mid-tick: the disconnect is reported already.
+                    Ok(_) | Err(Error::Disconnected) => {}
+                    Err(error) => ui.show_error(&format!("Wallpaper rotation failed: {error}")),
                 }
                 ui.wallpaper_rotation.borrow_mut().running = false;
             });
@@ -199,7 +229,9 @@ pub(crate) async fn rotate_once(ui: &Rc<Ui>) -> Result<bool, Error> {
     let index = uuid::Uuid::new_v4().as_u128() % candidates.len() as u128;
     ui.wallpaper_rotation.borrow_mut().rotated =
         Some((current["value"].clone(), candidates[index as usize].to_string()));
+    ui.wallpaper_rotation.borrow_mut().quiet = true;
     ui.load_appearance();
+    ui.wallpaper_rotation.borrow_mut().quiet = false;
     Ok(true)
 }
 
@@ -224,5 +256,15 @@ mod tests {
             signature(&config, &library),
             signature(&json!({"enabled":false}), &library)
         );
+    }
+    #[test]
+    fn signature_follows_the_images_without_hashing_them() {
+        let config = json!({"enabled":true,"interval_minutes":15});
+        let two = json!([{"id":"a","image":"data:image/png;base64,one"},{"id":"b","image":"data:image/png;base64,two"}]);
+        let three = json!([{"id":"a","image":"data:image/png;base64,one"},{"id":"b","image":"data:image/png;base64,two"},{"id":"c","image":"data:image/png;base64,three"}]);
+        let renamed = json!([{"id":"a","image":"data:image/png;base64,one"},{"id":"d","image":"data:image/png;base64,two"}]);
+        assert_eq!(signature(&config, &two), signature(&config, &two.clone()));
+        assert_ne!(signature(&config, &two), signature(&config, &three));
+        assert_ne!(signature(&config, &two), signature(&config, &renamed));
     }
 }

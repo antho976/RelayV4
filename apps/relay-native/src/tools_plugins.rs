@@ -4,6 +4,7 @@
 use super::market::{self, Market, Spec};
 use super::paragraph;
 use crate::app::{clear, label, rows, text, Ui};
+use crate::client::Error;
 use gtk::prelude::*;
 use gtk4 as gtk;
 use serde_json::{json, Value};
@@ -13,6 +14,21 @@ use std::rc::Rc;
 /// the engine that is running was started from an older build: `run.sh` reuses a running engine.
 pub(crate) const STALE_ENGINE: &str = "The running Relay engine is older than this app and does not know about plugins yet. Restart it: when your agents are idle, run `target/debug/relay --instance dev q app.quit '{\"force\":true}'` (use your instance name), then ./run.sh again. Live agents come back as restorable; resume them from their tiles.";
 
+/// What to say when a `plugin.*` request fails. An engine that predates plugins refuses the op
+/// or its payload, and the bus names that in `code`; its message may change and is not parsed.
+pub(crate) fn explain_error(op: &str, error: &Error) -> String {
+    match error {
+        Error::Bus(bus)
+            if op.starts_with("plugin.")
+                && matches!(bus.code.as_str(), "bus.unknown_op" | "bus.schema" | "bus.not_implemented") =>
+        {
+            STALE_ENGINE.to_string()
+        }
+        _ => error.to_string(),
+    }
+}
+
+/// For a caller that kept only the message: prefer `explain_error`, which reads the code.
 pub(crate) fn explain(error: &str) -> String {
     if error.contains("plugin.")
         && (error.contains("unknown field") || error.contains("not implemented"))
@@ -96,10 +112,14 @@ fn enabled(plugin: &Value, project: i64) -> bool {
         .is_some_and(|ids| ids.iter().any(|id| id.as_i64() == Some(project)))
 }
 
+/// The engine leaves enabled projects out of `suggested_for`, but a switch flipped here patches
+/// only `enabled_in`: a plugin switched on here stops being suggested, and switching it back off
+/// restores that.
 fn suggested(plugin: &Value, project: i64) -> bool {
-    plugin["suggested_for"]
-        .as_array()
-        .is_some_and(|ids| ids.iter().any(|id| id.as_i64() == Some(project)))
+    !enabled(plugin, project)
+        && plugin["suggested_for"]
+            .as_array()
+            .is_some_and(|ids| ids.iter().any(|id| id.as_i64() == Some(project)))
 }
 
 /// A switch that enables `plugin` for `project`, restoring itself when the engine refuses.
@@ -144,12 +164,13 @@ pub(crate) fn switch(
                     }
                     Err(error) => {
                         key.set_active(!on);
+                        let message = explain_error("plugin.enable", &error);
                         match &feedback {
                             Some(feedback) => {
-                                feedback.set_text(&error.to_string());
+                                feedback.set_text(&message);
                                 feedback.set_visible(true);
                             }
-                            None => ui.show_error(&error.to_string()),
+                            None => ui.show_error(&message),
                         }
                     }
                 }
@@ -191,7 +212,7 @@ fn card(ui: &Rc<Ui>, market: &Rc<Market>, plugin: &Value) -> gtk::Widget {
         market::chip(&plural(tool_count(plugin), "MCP tool", "MCP tools"), ""),
         market::chip(&plural(rows(plugin, "docs").len(), "doc", "docs"), ""),
     ];
-    if suggested(plugin, scope) && !enabled(plugin, scope) {
+    if suggested(plugin, scope) {
         let hint = market::chip("Suggested", "hint");
         hint.set_tooltip_text(Some("This project's files match what the plugin is for"));
         tags.push(hint);
@@ -348,27 +369,15 @@ fn skill_list(ui: &Rc<Ui>, market: &Rc<Market>, plugin: &str, skills: &[Value]) 
             let (Some(ui), Some(market)) = (weak.upgrade(), market.upgrade()) else {
                 return;
             };
-            let key = format!("{plugin}/skill/{name}");
-            let cached = market.cache.borrow().get(&key).cloned();
-            if let Some(found) = cached {
-                body.append(&market::markdown(&ui, text(&found["skill"], "body")));
-                return;
-            }
-            body.append(&label("Loading SKILL.md…", "dim"));
-            let (body, plugin, name) = (body.clone(), plugin.clone(), name.clone());
-            glib::spawn_future_local(async move {
-                let result = ui
-                    .call("plugin.get", json!({"plugin_id": plugin, "skill": name}))
-                    .await;
-                clear(&body);
-                match result {
-                    Ok(found) => {
-                        body.append(&market::markdown(&ui, text(&found["skill"], "body")));
-                        market.cache.borrow_mut().insert(key, found);
-                    }
-                    Err(error) => body.append(&paragraph(&explain(&error.to_string()))),
-                }
-            });
+            fetch(
+                &ui,
+                &market,
+                &body,
+                format!("{plugin}/skill/{name}"),
+                json!({"plugin_id": plugin, "skill": name}),
+                "Loading SKILL.md…",
+                |ui, body, found| body.append(&market::markdown(ui, text(&found["skill"], "body"))),
+            );
         });
         list.append(&expander);
     }
@@ -417,26 +426,63 @@ fn documents(ui: &Rc<Ui>, market: &Rc<Market>, plugin: &str) -> gtk::Box {
         let (Some(ui), Some(market)) = (weak.upgrade(), market.upgrade()) else {
             return;
         };
-        let cached = market.cache.borrow().get(&plugin).cloned();
-        if let Some(found) = cached {
-            fill_documents(&ui, page, &found);
-            return;
-        }
-        page.append(&label("Loading rules and documents…", "dim"));
-        let (page, plugin) = (page.clone(), plugin.clone());
-        glib::spawn_future_local(async move {
-            let result = ui.call("plugin.get", json!({"plugin_id": plugin})).await;
-            clear(&page);
-            match result {
-                Ok(found) => {
-                    fill_documents(&ui, &page, &found);
-                    market.cache.borrow_mut().insert(plugin, found);
-                }
-                Err(error) => page.append(&paragraph(&explain(&error.to_string()))),
-            }
-        });
+        fetch(
+            &ui,
+            &market,
+            page,
+            plugin.clone(),
+            json!({"plugin_id": plugin}),
+            "Loading rules and documents…",
+            fill_documents,
+        );
     });
     page
+}
+
+/// Fills `container` from `plugin.get {payload}`, fetched once per engine connection and kept
+/// under `key`. A failure leaves a way to ask again in place of the content.
+fn fetch(
+    ui: &Rc<Ui>,
+    market: &Rc<Market>,
+    container: &gtk::Box,
+    key: String,
+    payload: Value,
+    loading: &'static str,
+    fill: fn(&Ui, &gtk::Box, &Value),
+) {
+    let generation = ui.generation.get();
+    let cached = market.documents(generation).get(&key).cloned();
+    if let Some(found) = cached {
+        fill(ui, container, &found);
+        return;
+    }
+    container.append(&label(loading, "dim"));
+    let (ui, market, container) = (ui.clone(), market.clone(), container.clone());
+    glib::spawn_future_local(async move {
+        let result = ui.call("plugin.get", payload.clone()).await;
+        clear(&container);
+        match result {
+            Ok(found) => {
+                fill(&ui, &container, &found);
+                if ui.generation.get() == generation {
+                    market.documents(generation).insert(key, found);
+                }
+            }
+            Err(error) => {
+                container.append(&paragraph(&explain_error("plugin.get", &error)));
+                let again = crate::app::button("Try again", "quiet");
+                again.set_halign(gtk::Align::Start);
+                container.append(&again);
+                let (weak, owner, target) = (Rc::downgrade(&ui), Rc::downgrade(&market), container.downgrade());
+                again.connect_clicked(move |_| {
+                    if let (Some(ui), Some(market), Some(container)) = (weak.upgrade(), owner.upgrade(), target.upgrade()) {
+                        clear(&container);
+                        fetch(&ui, &market, &container, key.clone(), payload.clone(), loading, fill);
+                    }
+                });
+            }
+        }
+    });
 }
 
 fn fill_documents(ui: &Ui, page: &gtk::Box, found: &Value) {
@@ -465,4 +511,27 @@ fn empty(ui: &Rc<Ui>, _market: &Rc<Market>) -> gtk::Widget {
         &[retry.upcast()],
     )
     .upcast()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use relay_bus::BusError;
+
+    #[test]
+    fn a_stale_engine_is_read_from_the_error_code() {
+        let unknown: Error = BusError::unknown_op("plugin.list").into();
+        assert_eq!(explain_error("plugin.list", &unknown), STALE_ENGINE);
+        assert_eq!(explain_error("skill.list", &unknown), unknown.to_string());
+        let worded: Error = BusError::invalid("plugin.not_found", "plugin. unknown field; not implemented").into();
+        assert_eq!(explain_error("plugin.get", &worded), worded.to_string());
+        assert_eq!(explain_error("plugin.get", &Error::Timeout), Error::Timeout.to_string());
+    }
+
+    #[test]
+    fn a_plugin_switched_on_is_no_longer_suggested() {
+        assert!(suggested(&json!({"suggested_for":[3],"enabled_in":[]}), 3));
+        assert!(!suggested(&json!({"suggested_for":[3],"enabled_in":[3]}), 3));
+        assert!(!suggested(&json!({"suggested_for":[3],"enabled_in":[]}), 4));
+    }
 }

@@ -10,7 +10,7 @@
 //! rename or a new project. `skill.changed` and `plugin.changed` for a project other than the
 //! active one never reach the page (app.rs drops them), so a switch patches local data from the
 //! engine's answer instead of waiting for an event.
-use super::plugins::explain;
+use super::plugins::explain_error;
 use crate::app::{button, clear, label, rows, text, Ui};
 use gtk::prelude::*;
 use gtk4 as gtk;
@@ -80,7 +80,9 @@ pub(crate) struct Market {
     selected: RefCell<Option<String>>,
     filter: Cell<usize>,
     pub tab: RefCell<String>,
-    pub cache: RefCell<HashMap<String, Value>>,
+    /// Documents fetched on demand, and the engine connection they came from: see `documents`.
+    cache: RefCell<HashMap<String, Value>>,
+    cache_generation: Cell<u64>,
     quiet: Cell<bool>,
     rows: RefCell<Vec<(gtk::ListBoxRow, String)>>,
     /// What the list was last drawn against besides the catalog: see `context`.
@@ -127,7 +129,7 @@ pub(crate) async fn refresh(ui: &Rc<Ui>, spec: &'static Spec, project: i64) {
             }
         }
         Err(error) => {
-            let message = explain(&error.to_string());
+            let message = explain_error(spec.list_op, &error);
             if market.loaded.get() {
                 market.say(&message);
             } else {
@@ -191,6 +193,12 @@ fn build(ui: &Rc<Ui>, spec: &'static Spec) -> Rc<Market> {
     scope.append(&label("PROJECT", "ext-scope-label"));
     let picker = gtk::DropDown::from_strings(&[]);
     picker.set_enable_search(true);
+    // Search filters on this expression; without one it matches every project.
+    picker.set_expression(Some(gtk::PropertyExpression::new(
+        gtk::StringObject::static_type(),
+        None::<gtk::Expression>,
+        "string",
+    )));
     picker.set_tooltip_text(Some("The project every switch on this page applies to"));
     let factory = gtk::SignalListItemFactory::new();
     factory.connect_setup(|_, item| {
@@ -371,6 +379,7 @@ fn build(ui: &Rc<Ui>, spec: &'static Spec) -> Rc<Market> {
         filter: Cell::new(0),
         tab: RefCell::new(String::new()),
         cache: RefCell::new(HashMap::new()),
+        cache_generation: Cell::new(0),
         quiet: Cell::new(false),
         rows: RefCell::new(Vec::new()),
         drawn: RefCell::new(Value::Null),
@@ -476,6 +485,15 @@ impl Market {
             .iter()
             .find(|item| (self.spec.id)(item) == id)
             .cloned()
+    }
+
+    /// Documents fetched for engine connection `generation`. A reconnect, perhaps to an engine
+    /// rebuilt with newer bundled plugins, starts empty.
+    pub(crate) fn documents(&self, generation: u64) -> std::cell::RefMut<'_, HashMap<String, Value>> {
+        if self.cache_generation.replace(generation) != generation {
+            self.cache.borrow_mut().clear();
+        }
+        self.cache.borrow_mut()
     }
 
     /// Shows a dismissible message above the catalog.
@@ -737,16 +755,17 @@ pub(crate) fn toggle(
         let Some(market) = market.upgrade() else { return };
         match result {
             Ok(item) => market.set_enabled(ui, &key, item["enabled_in"].clone()),
-            Err(error) => market.say(&explain(&error)),
+            Err(error) => market.say(&error),
         }
     });
     switch
 }
 
 /// Makes `switch` turn `id` on or off for `project` through `op` (`{id_key: id, project_id,
-/// enabled}`), then hands `done` the engine's answer. A refusal flips the switch back while it
-/// is insensitive, and an insensitive switch sends nothing: without that guard the flip back
-/// would send the opposite request, fail the same way, and loop for as long as it fails.
+/// enabled}`), then hands `done` the engine's answer, a refusal as the sentence to show. A
+/// refusal flips the switch back while it is insensitive, and an insensitive switch sends
+/// nothing: without that guard the flip back would send the opposite request, fail the same
+/// way, and loop for as long as it fails.
 pub(crate) fn enable_switch(
     ui: &Rc<Ui>,
     switch: &gtk::Switch,
@@ -771,7 +790,7 @@ pub(crate) fn enable_switch(
         payload[id_key] = id.clone();
         let done = done.clone();
         glib::spawn_future_local(async move {
-            let result = ui.call(op, payload).await.map_err(|error| error.to_string());
+            let result = ui.call(op, payload).await.map_err(|error| explain_error(op, &error));
             if result.is_err() {
                 switch.set_active(!on);
             }

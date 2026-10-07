@@ -266,8 +266,9 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
     });
     let shell = gtk::Box::new(gtk::Orientation::Horizontal, 18);
     shell.add_css_class("settings-body");
-    shell.set_halign(gtk::Align::Start);
-    shell.set_size_request(ui.window.width().clamp(748, 1180), -1);
+    shell.set_hexpand(true);
+    shell.set_size_request(748, -1);
+    cap_width(&shell, page, 1180);
     let stack = gtk::Stack::new();
     stack.set_hexpand(true);
     stack.set_vexpand(true);
@@ -879,6 +880,32 @@ const CATEGORIES: [(&str, &str, &str, &str, &str, &str); 7] = [
     ),
 ];
 
+/// Lets `widget` fill the scrolled `page` up to `max` px. GTK has no max-width, so a right
+/// margin takes up whatever the visible width exceeds it by, following every window resize.
+fn cap_width(widget: &gtk::Box, page: &gtk::Box, max: i32) {
+    let Some(adjustment) = page
+        .ancestor(gtk::ScrolledWindow::static_type())
+        .and_downcast::<gtk::ScrolledWindow>()
+        .map(|scroll| scroll.hadjustment())
+    else {
+        return;
+    };
+    let target = widget.downgrade();
+    let fit = move |adjustment: &gtk::Adjustment| {
+        if let Some(widget) = target.upgrade() {
+            widget.set_margin_end((adjustment.page_size() as i32 - max).max(0));
+        }
+    };
+    fit(&adjustment);
+    let handler = std::cell::Cell::new(Some(adjustment.connect_page_size_notify(fit)));
+    // The page is rebuilt per project; the adjustment outlives every body it sized.
+    widget.connect_destroy(move |_| {
+        if let Some(handler) = handler.take() {
+            adjustment.disconnect(handler);
+        }
+    });
+}
+
 fn category(stack: &gtk::Stack, name: &str, title: &str) -> gtk::Box {
     let outer = gtk::Box::new(gtk::Orientation::Vertical, 12);
     if let Some((_, _, icon, eyebrow, heading, hint)) = CATEGORIES.iter().find(|c| c.0 == name) {
@@ -1122,7 +1149,12 @@ fn render_wallpapers(ui: &Rc<Ui>, block: &gtk::Box, state: &Rc<RefCell<Value>>) 
         glib::spawn_future_local(async move{
             let result=async{
                 let dialog=gtk::FileDialog::builder().title("Choose wallpaper").build();
-                let file=dialog.open_future(Some(&ui.window)).await.map_err(|e|e.to_string())?;
+                // Closing the chooser is not an error.
+                let file=match dialog.open_future(Some(&ui.window)).await {
+                    Ok(file)=>file,
+                    Err(e) if e.matches(gtk::DialogError::Dismissed)||e.matches(gtk::DialogError::Cancelled)=>return Ok(false),
+                    Err(e)=>return Err(e.to_string()),
+                };
                 let path=file.path().ok_or("Choose a local image")?;
                 let name=path.file_name().unwrap_or_default().to_string_lossy().to_string();
                 let bytes=ui.rt.spawn_blocking(move||{
@@ -1140,9 +1172,9 @@ fn render_wallpapers(ui: &Rc<Ui>, block: &gtk::Box, state: &Rc<RefCell<Value>>) 
                 if serde_json::to_vec(&library).unwrap_or_default().len()>1500000{return Err("Wallpaper library is full. Remove an image before adding another.".into());}
                 staged.borrow_mut()["wallpapers"]=json!(library);
                 staged.borrow_mut()["wallpaper"]=json!(image);
-                Ok::<(),String>(())
+                Ok::<bool,String>(true)
             }.await;
-            if let Err(e)=result {ui.show_error(&e);} else {render_wallpapers(&ui,&block,&staged);}
+            match result {Err(e)=>ui.show_error(&e),Ok(true)=>render_wallpapers(&ui,&block,&staged),Ok(false)=>{}}
             key.set_sensitive(true);
         });
     });
