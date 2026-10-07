@@ -567,15 +567,12 @@ fn assign_session(ctx: &mut Ctx, name: &str, task: &Task) -> Result<Vec<Id>, Bus
             "task and session belong to different projects",
         ));
     }
-    let mut stmt = ctx
-        .tx()
-        .prepare_cached("SELECT id FROM sessions WHERE worktree=?1 AND state!='closed' ORDER BY id")
-        .bus()?;
-    let ids = stmt
-        .query_map([&row.session.worktree], |record| record.get::<_, Id>(0))
-        .bus()?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .bus()?;
+    // The task is queued for the session's review group, not for everyone who happens to
+    // share its checkout: independent agents on the primary each work their own tasks.
+    let ids: Vec<Id> = sessions::review_group(ctx.tx(), &row.session)?
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
     let mut newly_current = Vec::new();
     for id in ids {
         let ord: i64 = ctx

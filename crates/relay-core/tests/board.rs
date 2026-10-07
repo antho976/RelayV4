@@ -735,3 +735,34 @@ fn move_with_position_reorders_a_column_and_undo_restores_it() {
     undo_last("task.approve");
     assert_eq!(order("ready"), vec![b, c, d, a, x]);
 }
+
+/// Independent agents that share the primary checkout (every session of an Unreal-plugin
+/// project, D160) are not one review group: each one's task reaches review on its own done,
+/// and dispatching to one never queues the task for the others.
+#[test]
+fn independent_builders_on_the_primary_checkout_do_not_wait_on_each_other() {
+    let f = Fixture::new();
+    let e = &f.engine;
+    let a = ok(e, "session.create", json!({"project_id":1,"provider":"claude","worktree":"primary"}));
+    let b = ok(e, "session.create", json!({"project_id":1,"provider":"claude","worktree":"primary"}));
+    let (a, b) = (a["name"].as_str().unwrap().to_string(), b["name"].as_str().unwrap().to_string());
+    let first = f.task("A's task", json!({}));
+    let second = f.task("B's task", json!({}));
+    ok(e, "task.dispatch", json!({"task_id":first["id"],"session":a,"start":false}));
+    ok(e, "task.dispatch", json!({"task_id":second["id"],"session":b,"start":false}));
+    let mine = |name: &str| ids(&ok(e, "task.list", json!({"project_id":1,"session":name}))["tasks"].as_array().unwrap()
+        .iter().map(|t| t["id"].clone()).collect::<Value>());
+    assert_eq!(mine(&a), [first["id"].as_i64().unwrap()]);
+    assert_eq!(mine(&b), [second["id"].as_i64().unwrap()]);
+
+    let done = |name: &str| call(e, Actor::agent(name), "session.done", json!({"session":name,"summary":"done"}))
+        .into_result().unwrap_or_else(|err| panic!("session.done: {} {}", err.code, err.message));
+    done(&a);
+    assert_eq!(ok(e, "task.get", json!({"task_id":first["id"]}))["column"], "in_review");
+    assert_eq!(ok(e, "task.get", json!({"task_id":second["id"]}))["column"], "active");
+    done(&b);
+    assert_eq!(ok(e, "task.get", json!({"task_id":second["id"]}))["column"], "in_review");
+
+    // Closing either keeps the shared checkout, and is not refused for the other being there.
+    ok(e, "session.close", json!({"session":a}));
+}

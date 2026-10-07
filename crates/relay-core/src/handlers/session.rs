@@ -97,14 +97,19 @@ fn complete_group_assignment(ctx: &mut Ctx, session: &Session, task_id: Id, sha:
     if let Some(sha) = sha.filter(|sha| !sha.trim().is_empty()) {
         ctx.tx().execute("INSERT OR IGNORE INTO task_commits(task_id,sha,branch,linked_at) VALUES (?1,?2,?3,?4)",params![task_id,sha,session.branch,ctx.now]).bus()?;
     }
-    let builders_left: i64 = ctx.tx().query_row(
-        "SELECT COUNT(*) FROM task_sessions ts JOIN sessions s ON s.id=ts.session_id WHERE ts.task_id=?1 AND s.worktree=?2 AND s.role='builder' AND s.state!='closed' AND ts.completed_at IS NULL",
-        params![task_id,session.worktree],|row|row.get(0)).bus()?;
-    if builders_left != 0 { return Ok(()); }
-    let changed = ctx.tx().execute("UPDATE tasks SET col='in_review',state='awaiting_review',updated_at=?1 WHERE id=?2 AND col='active' AND deleted_at IS NULL",params![ctx.now,task_id]).bus()?;
-    let mut stmt = ctx.tx().prepare_cached("SELECT s.id FROM sessions s JOIN task_sessions ts ON ts.session_id=s.id WHERE ts.task_id=?1 AND s.worktree=?2 AND s.state!='closed' ORDER BY s.id").bus()?;
-    let ids = stmt.query_map(params![task_id,session.worktree],|row|row.get::<_,Id>(0)).bus()?.collect::<rusqlite::Result<Vec<_>>>().bus()?;
+    // Only this session's review group waits on itself: an unrelated agent that shares the
+    // checkout (the primary, D160) and happens to hold a queue row for the task is not in it.
+    let group = sessions::review_group(ctx.tx(), session)?;
+    let mut stmt = ctx.tx().prepare_cached("SELECT session_id, completed_at IS NULL FROM task_sessions WHERE task_id=?1").bus()?;
+    let assigned = stmt.query_map([task_id],|row|Ok((row.get::<_,Id>(0)?,row.get::<_,bool>(1)?))).bus()?.collect::<rusqlite::Result<Vec<_>>>().bus()?;
     drop(stmt);
+    let members: Vec<(Id, Role, bool)> = group.iter()
+        .filter_map(|(id, role)| assigned.iter().find(|(sid, _)| sid == id).map(|(_, open)| (*id, *role, *open)))
+        .collect();
+    let left = |want: Role| members.iter().filter(|(_, role, open)| *role == want && *open).count();
+    if left(Role::Builder) != 0 { return Ok(()); }
+    let changed = ctx.tx().execute("UPDATE tasks SET col='in_review',state='awaiting_review',updated_at=?1 WHERE id=?2 AND col='active' AND deleted_at IS NULL",params![ctx.now,task_id]).bus()?;
+    let ids: Vec<Id> = members.iter().map(|(id, _, _)| *id).collect();
     if changed > 0 {
         ctx.emit("task.changed",json!({"task_id":task_id,"col":"in_review","state":"awaiting_review"}));
         for id in &ids {
@@ -113,10 +118,7 @@ fn complete_group_assignment(ctx: &mut Ctx, session: &Session, task_id: Id, sha:
             }
         }
     }
-    let reviewers_left: i64 = ctx.tx().query_row(
-        "SELECT COUNT(*) FROM task_sessions ts JOIN sessions s ON s.id=ts.session_id WHERE ts.task_id=?1 AND s.worktree=?2 AND s.role='reviewer' AND s.state!='closed' AND ts.completed_at IS NULL",
-        params![task_id,session.worktree],|row|row.get(0)).bus()?;
-    if reviewers_left != 0 { return Ok(()); }
+    if left(Role::Reviewer) != 0 { return Ok(()); }
     let next = next_queued_task(ctx.tx(),session.id,task_id)?;
     for id in ids {
         let changed = ctx.tx().execute("UPDATE sessions SET task_id=?1,module_id=?2,updated_at=?3 WHERE id=?4 AND task_id=?5",params![next.map(|v|v.0),next.and_then(|v|v.1),ctx.now,id,task_id]).bus()?;
@@ -805,10 +807,9 @@ fn validate_pair(conn: &Connection, p: &CreateIn, project_id: Id, name: &str) ->
     if pair.session.project_id != project_id { return Err(BusError::invalid("session.pair_project", "PAIR sessions must belong to the same project")); }
     if pair.session.pair_with.is_some() {
         let role = p.role.unwrap_or(Role::Builder);
-        let (builders, reviewers): (i64, i64) = conn.query_row(
-            "SELECT COUNT(*) FILTER (WHERE role='builder'), COUNT(*) FILTER (WHERE role='reviewer') FROM sessions WHERE worktree=?1 AND state!='closed'",
-            [&pair.session.worktree], |row| Ok((row.get(0)?, row.get(1)?)),
-        ).bus()?;
+        let group = sessions::review_group(conn, &pair.session)?;
+        let builders = group.iter().filter(|(_, role)| *role == Role::Builder).count();
+        let reviewers = group.iter().filter(|(_, role)| *role == Role::Reviewer).count();
         if role != Role::Builder || pair.session.role != Role::Reviewer || reviewers != 1 {
             return Err(BusError::conflict("session.pair_exists", format!("session {name} is already paired")));
         }
@@ -1619,7 +1620,10 @@ pub fn register(e: &mut Engine) {
             let s = &row.session;
             let project = crate::handlers::workspace::get_project(conn, s.project_id)?;
             let survivor = survivor_on(conn, s.id, &s.worktree)?;
-            if survivor.is_some() && remove {
+            // Only a pooled checkout is ever removed, so only there does a partner still on it
+            // stand in the way; an independent agent sharing the primary does not.
+            let pooled = Path::new(&s.worktree).starts_with(worktree::pool_dir(Path::new(&project.path)));
+            if survivor.is_some() && remove && pooled {
                 return Err(BusError::conflict("session.pair_live", "close the PAIR partner first or pass remove_worktree:false"));
             }
             let teardown = if survivor.is_none() { Some(read_teardown(conn, &s.worktree)?) } else { None };
