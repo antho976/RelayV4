@@ -6,7 +6,8 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 // A status refresh can rewrite only index stat fields. Compare the staged tree
 // rather than index bytes so this cache maintenance does not trigger another scan.
@@ -40,6 +41,22 @@ impl Defer for Unlocked<'_> {
     }
 }
 
+/// Most worktrees watched at once. Each is an inotify instance and a thread of its own; the
+/// one requested least recently goes first, and a worktree that is deleted goes at once (RA-130).
+const MAX_ROOTS: usize = 32;
+/// Most directories one worktree registers, so one enormous tree cannot spend the user's whole
+/// inotify watch limit.
+const MAX_DIRS: usize = 16 * 1024;
+/// A worktree whose watcher could not be set up is not walked again before this (RA-129).
+const RETRY_AFTER: Duration = Duration::from_secs(60);
+
+/// One watched worktree in [`Engine::watchers`]. `watcher` is `None` after a failed setup;
+/// `used` is then when it failed.
+pub(crate) struct Root {
+    watcher: Option<Arc<Mutex<RecommendedWatcher>>>,
+    used: Instant,
+}
+
 /// Recursive inotify registration may enumerate a large worktree. Start it after the current bus
 /// transaction releases the store lock so first-time registration cannot block PTY or UI requests.
 pub(crate) fn ensure_after_commit(
@@ -50,8 +67,14 @@ pub(crate) fn ensure_after_commit(
     let root = std::fs::canonicalize(&root).unwrap_or(root);
     ctx.defer(Box::new(move |engine| {
         let key = root.display().to_string();
-        if engine.watchers.lock().unwrap().contains_key(&key) {
-            return;
+        if let Some(known) = engine.watchers.lock().unwrap().get_mut(&key) {
+            if known.watcher.is_some() {
+                known.used = Instant::now();
+                return;
+            }
+            if known.used.elapsed() < RETRY_AFTER {
+                return;
+            }
         }
         if !engine
             .watcher_registrations
@@ -83,6 +106,7 @@ pub fn ensure(engine: &Engine, root: &Path, project_id: relay_bus::types::Id) {
     let pending_cb = pending.clone();
     let root = PathBuf::from(&key);
     let callback_root = root.clone();
+    let callback_key = key.clone();
     let mut last_index = index_signature(&root);
     // A build touches thousands of files, and every one of them arrives here as a path to
     // compare. Build the path being compared against once, not once per event path.
@@ -94,6 +118,40 @@ pub fn ensure(engine: &Engine, root: &Path, project_id: relay_bus::types::Id) {
             // Access notifications must not turn one mutation into an idle refresh loop.
             if matches!(event.kind, notify::EventKind::Access(_)) && !event.need_rescan() {
                 return;
+            }
+            // Directories are watched one by one, so a new one is added here — and a deleted
+            // worktree lets its watcher go. Both on another thread: the watcher's own calls
+            // wait on the thread running this callback.
+            let gone = matches!(event.kind, notify::EventKind::Remove(_))
+                && event.paths.iter().any(|path| path == &callback_root);
+            let created: Vec<PathBuf> = match event.kind {
+                notify::EventKind::Create(_) | notify::EventKind::Modify(notify::event::ModifyKind::Name(_)) => event
+                    .paths
+                    .iter()
+                    .filter(|path| {
+                        std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
+                            && watched_dir(&callback_root, path)
+                    })
+                    .cloned()
+                    .collect(),
+                _ => Vec::new(),
+            };
+            if gone || !created.is_empty() {
+                let (weak, key, root) = (weak.clone(), callback_key.clone(), callback_root.clone());
+                std::thread::spawn(move || {
+                    let Some(engine) = weak.upgrade() else { return };
+                    if gone {
+                        engine.watchers.lock().unwrap().remove(&key);
+                        return;
+                    }
+                    let watcher = engine.watchers.lock().unwrap().get(&key).and_then(|known| known.watcher.clone());
+                    if let Some(watcher) = watcher {
+                        let mut watcher = watcher.lock().unwrap();
+                        for dir in created.iter().flat_map(|dir| watch_dirs(&root, dir)) {
+                            let _ = watcher.watch(&dir, RecursiveMode::NonRecursive);
+                        }
+                    }
+                });
             }
             if (!event.need_rescan()
                 && event
@@ -129,27 +187,86 @@ pub fn ensure(engine: &Engine, root: &Path, project_id: relay_bus::types::Id) {
                 }
             });
         });
-    let registered = if let Ok(mut watcher) = watcher {
-        if watcher.watch(&root, RecursiveMode::Recursive).is_ok() {
-            let mut watchers = engine.watchers.lock().unwrap();
-            if watchers.contains_key(&key) {
-                false
-            } else {
-                watchers.insert(key.clone(), watcher);
-                true
+    // Not `RecursiveMode::Recursive`: that walks every build tree and every session checkout
+    // under `.relay/`, follows symlinks out of the worktree, and gives up — dropping what it
+    // had registered — at the first directory the watch limit refuses (RA-129).
+    let watcher = match watcher {
+        Ok(mut watcher) => {
+            let dirs = watch_dirs(&root, &root);
+            let mut added = 0usize;
+            for dir in &dirs {
+                match watcher.watch(dir, RecursiveMode::NonRecursive) {
+                    Ok(()) => added += 1,
+                    Err(error) if matches!(error.kind, notify::ErrorKind::MaxFilesWatch) => {
+                        tracing::warn!(root = %key, added, "inotify watch limit reached; the rest of this worktree is not watched");
+                        break;
+                    }
+                    // Deleted since the walk.
+                    Err(_) => {}
+                }
             }
-        } else {
-            false
+            if dirs.len() >= MAX_DIRS {
+                tracing::warn!(root = %key, limit = MAX_DIRS, "worktree has more directories than are watched");
+            }
+            (added > 0).then_some(watcher)
         }
-    } else {
-        false
+        Err(error) => {
+            tracing::warn!(root = %key, error = %error, "could not watch worktree");
+            None
+        }
     };
+    let registered = watcher.is_some();
+    {
+        let mut watchers = engine.watchers.lock().unwrap();
+        if !watchers.get(&key).is_some_and(|known| known.watcher.is_some()) {
+            // Room first: worktrees that no longer exist, then the least recently requested.
+            watchers.retain(|path, _| Path::new(path).exists());
+            while watchers.len() >= MAX_ROOTS {
+                let Some(oldest) = watchers.iter().min_by_key(|(_, known)| known.used).map(|(path, _)| path.clone()) else { break };
+                watchers.remove(&oldest);
+            }
+            watchers.insert(key.clone(), Root {
+                watcher: watcher.map(|watcher| Arc::new(Mutex::new(watcher))),
+                used: Instant::now(),
+            });
+        }
+    }
     engine.watcher_registrations.lock().unwrap().remove(&key);
     if registered {
         engine.emit_system(
             "file.changed",
             json!({"project_id": project_id, "worktree": root.display().to_string()}),
         );
+    }
+}
+
+/// The directories under `from` that `root`'s watcher covers: no build output, none of Relay's
+/// own checkouts under `.relay/`, nothing reached through a symlink, and of `.git` only the
+/// parts a refresh cares about. At most [`MAX_DIRS`].
+fn watch_dirs(root: &Path, from: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![from.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if out.len() >= MAX_DIRS {
+            break;
+        }
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                // `file_type` does not follow symlinks: a link to a directory is not descended.
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) && watched_dir(root, &entry.path()) {
+                    stack.push(entry.path());
+                }
+            }
+        }
+        out.push(dir);
+    }
+    out
+}
+
+fn watched_dir(root: &Path, dir: &Path) -> bool {
+    match dir.strip_prefix(root).ok().and_then(|relative| relative.strip_prefix(".git").ok()) {
+        Some(git) => git.as_os_str().is_empty() || git.starts_with("refs"),
+        None => !is_generated_path(root, dir),
     }
 }
 
@@ -262,6 +379,60 @@ mod tests {
                 .ev,
             "file.changed"
         );
+    }
+
+    #[test]
+    fn only_the_source_tree_is_walked() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(fixture.path()).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        for dir in ["src/a", "target/debug/deep", "web/node_modules/pkg", ".relay/worktrees/s/src",
+            ".git/objects/ab", ".git/refs/heads", ".git/logs/refs"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        std::fs::create_dir_all(outside.path().join("elsewhere")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("link")).unwrap();
+        let dirs = super::watch_dirs(&root, &root);
+        for wanted in ["", "src", "src/a", "web", ".git", ".git/refs", ".git/refs/heads"] {
+            assert!(dirs.contains(&root.join(wanted)), "{wanted} is not watched: {dirs:?}");
+        }
+        assert_eq!(dirs.len(), 7, "{dirs:?}");
+    }
+
+    /// A new directory is watched as it appears, and a deleted worktree lets its watcher go.
+    #[tokio::test]
+    async fn new_directories_are_watched_and_a_deleted_root_is_dropped() {
+        use std::time::Duration;
+        let fixture = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(fixture.path()).unwrap().join("wt");
+        std::fs::create_dir_all(&root).unwrap();
+        let engine = crate::Engine::new(crate::Instance::Test, crate::Store::open_memory().unwrap());
+        // Subscribed when called, so each one sees only what happens after it.
+        let next = || {
+            let mut events = engine.subscribe();
+            async move { tokio::time::timeout(Duration::from_secs(2), events.recv()).await.map(|ev| ev.unwrap().ev) }
+        };
+        let first = next();
+        super::ensure(&engine, &root, 1);
+        assert_eq!(first.await.unwrap(), "file.changed");
+        let created = next();
+        std::fs::create_dir(root.join("fresh")).unwrap();
+        assert_eq!(created.await.unwrap(), "file.changed");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let written = next();
+        std::fs::write(root.join("fresh/file.txt"), "x").unwrap();
+        assert_eq!(written.await.unwrap(), "file.changed", "an edit in a new directory went unseen");
+
+        let key = root.display().to_string();
+        assert!(engine.watchers.lock().unwrap().get(&key).is_some_and(|known| known.watcher.is_some()));
+        std::fs::remove_dir_all(&root).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while engine.watchers.lock().unwrap().contains_key(&key) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the deleted worktree's watcher is still held");
     }
 
     #[test]

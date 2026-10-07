@@ -11,7 +11,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use similar::{ChangeTag, TextDiff};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -32,9 +32,10 @@ pub fn register(e: &mut Engine) {
         } else {
             HashMap::new()
         };
-        Ok(TreeOut {
-            entries: list_dir(&root, &dir, p.depth.unwrap_or(1).min(20), &badges)?,
-        })
+        let limit = p.limit.unwrap_or(TREE_LIMIT).clamp(1, TREE_LIMIT_MAX) as usize;
+        let mut truncated = BTreeMap::new();
+        let entries = list_dir(&root, &dir, p.depth.unwrap_or(1).min(20), &badges, limit, &mut truncated)?;
+        Ok(TreeOut { entries, truncated })
     });
     e.register_unlocked::<Read>(|ctx, p| {
         let (project, root) = root_unlocked(ctx, p.project_id, p.worktree.as_deref())?;
@@ -70,9 +71,19 @@ pub fn register(e: &mut Engine) {
         })
     });
     e.register::<Write>(|ctx: &mut Ctx, p| {
-        let (project, root) = root(ctx, p.project_id, p.worktree.as_deref())?;
+        let (project, root) = root_mut(ctx, p.project_id, p.worktree.as_deref())?;
         let rel = rel(&p.path, false)?;
         let path = safe_join(&root, &rel, true)?;
+        // A symlink is written through, not replaced: renaming the new text over the link
+        // turned it into a regular file and left its target as it was (RA-146). safe_join has
+        // confirmed the target is inside the worktree, and it is the target that is gated.
+        let (path, target_rel) = if fs::symlink_metadata(&path).is_ok_and(|md| md.file_type().is_symlink()) {
+            let target = fs::canonicalize(&path).map_err(|e| io_err("file.write_failed", &rel, e))?;
+            let target_rel = target.strip_prefix(&root).unwrap_or(&target).to_path_buf();
+            (target, Some(target_rel))
+        } else {
+            (path, None)
+        };
         let old = fs::read_to_string(&path);
         if let Some(expected) = &p.expected_sha256 {
             let matches = old.as_ref().is_ok_and(|text| {
@@ -90,12 +101,13 @@ pub fn register(e: &mut Engine) {
             }
         }
         let old = old.unwrap_or_default();
+        let gated = target_rel.as_ref().map(|t| t.to_string_lossy().to_string());
         guardrail::enforce(
             ctx,
             project.id,
             &root,
             GateKind::Write,
-            Some(&p.path),
+            Some(gated.as_deref().unwrap_or(&p.path)),
             Some(&p.text),
             None,
             None,
@@ -125,10 +137,10 @@ pub fn register(e: &mut Engine) {
         })
     });
     e.register::<Create>(|ctx: &mut Ctx, p| {
-        let (project, root) = root(ctx, p.project_id, p.worktree.as_deref())?;
+        let (project, root) = root_mut(ctx, p.project_id, p.worktree.as_deref())?;
         let rel = rel(&p.path, false)?;
         let path = safe_join(&root, &rel, true)?;
-        if path.exists() {
+        if occupied(&path) {
             return Err(BusError::conflict(
                 "file.exists",
                 format!("{} already exists", p.path),
@@ -159,9 +171,12 @@ pub fn register(e: &mut Engine) {
             _ => return Err(BusError::invalid("file.kind", "kind must be file or dir")),
         }
         changed(ctx, project.id, &root, &p.path);
-        entry(&root, &path, &HashMap::new(), 0)
+        entry(&root, &path, &HashMap::new())
     });
-    e.register::<Rename>(|ctx: &mut Ctx, p| {
+    // Rename, move and delete are staged (D149): a directory source is walked for the gated
+    // paths inside it (RA-147) before the transaction opens, and only the gates and the rename
+    // itself hold the store.
+    e.register_staged::<Rename, PreparedPath>(|ctx, p| {
         if p.new_name.is_empty()
             || Path::new(&p.new_name).components().count() != 1
             || p.new_name == "."
@@ -172,25 +187,16 @@ pub fn register(e: &mut Engine) {
                 "new_name must be one path component",
             ));
         }
-        let (project, root) = root(ctx, p.project_id, p.worktree.as_deref())?;
+        let (project, root) = root_mut_unlocked(ctx, p.project_id, p.worktree.as_deref())?;
         let from_rel = rel(&p.path, false)?;
         let from = safe_join(&root, &from_rel, false)?;
         let into_rel = from_rel.parent().unwrap_or(Path::new("")).join(&p.new_name);
-        let into = safe_join(&root, &into_rel, true)?;
-        guard_path_mutation(ctx, project.id, &root, &from_rel, None)?;
-        guard_path_mutation(ctx, project.id, &root, &into_rel, Some(&from))?;
-        if into.exists() {
-            return Err(BusError::conflict(
-                "file.exists",
-                format!("{} already exists", into_rel.display()),
-            ));
-        }
-        fs::rename(&from, &into).map_err(|e| io_err("file.rename_failed", &from_rel, e))?;
-        changed(ctx, project.id, &root, &into_rel.to_string_lossy());
-        entry(&root, &into, &HashMap::new(), 0)
-    });
-    e.register::<Move>(|ctx: &mut Ctx, p| {
-        let (project, root) = root(ctx, p.project_id, p.worktree.as_deref())?;
+        safe_join(&root, &into_rel, true)?;
+        let inner = covered_inside(ctx, project.id, &from, &[&from_rel, &into_rel])?;
+        Ok(PreparedPath { project_id: project.id, root, from_rel, into_rel: Some(into_rel), inner })
+    }, |ctx: &mut Ctx, _p, prepared| relocate(ctx, prepared, "file.rename_failed"));
+    e.register_staged::<Move, PreparedPath>(|ctx, p| {
+        let (project, root) = root_mut_unlocked(ctx, p.project_id, p.worktree.as_deref())?;
         let from_rel = rel(&p.path, false)?;
         let from = safe_join(&root, &from_rel, false)?;
         let dir_rel = rel(&p.into, true)?;
@@ -205,62 +211,100 @@ pub fn register(e: &mut Engine) {
             .file_name()
             .ok_or_else(|| BusError::invalid("file.path", "path has no name"))?;
         let into_rel = dir_rel.join(name);
-        let into = safe_join(&root, &into_rel, true)?;
-        guard_path_mutation(ctx, project.id, &root, &from_rel, None)?;
-        guard_path_mutation(ctx, project.id, &root, &into_rel, Some(&from))?;
-        if into.exists() {
-            return Err(BusError::conflict(
-                "file.exists",
-                format!("{} already exists", into_rel.display()),
-            ));
+        safe_join(&root, &into_rel, true)?;
+        let inner = covered_inside(ctx, project.id, &from, &[&from_rel, &into_rel])?;
+        Ok(PreparedPath { project_id: project.id, root, from_rel, into_rel: Some(into_rel), inner })
+    }, |ctx: &mut Ctx, _p, prepared| relocate(ctx, prepared, "file.move_failed"));
+    e.register_staged::<Delete, PreparedPath>(|ctx, p| {
+        let (project, root) = root_mut_unlocked(ctx, p.project_id, p.worktree.as_deref())?;
+        let rel = rel(&p.path, false)?;
+        let path = safe_join(&root, &rel, false)?;
+        let inner = covered_inside(ctx, project.id, &path, &[&rel])?;
+        Ok(PreparedPath { project_id: project.id, root, from_rel: rel, into_rel: None, inner })
+    }, |ctx: &mut Ctx, p, prepared| {
+        let PreparedPath { project_id, root, from_rel: rel, inner, .. } = prepared;
+        let path = root.join(&rel);
+        guard_path_mutation(ctx, project_id, &root, &rel, None)?;
+        for inside in &inner {
+            guard_path_mutation(ctx, project_id, &root, &rel.join(inside), None)?;
         }
-        fs::rename(&from, &into).map_err(|e| io_err("file.move_failed", &from_rel, e))?;
-        changed(ctx, project.id, &root, &into_rel.to_string_lossy());
-        entry(&root, &into, &HashMap::new(), 0)
-    });
-    e.register::<Delete>(|ctx: &mut Ctx, p| {
-        let (project, root) = root(ctx, p.project_id, p.worktree.as_deref())?;
-        let rel = rel(&p.path, false)?; let path = safe_join(&root, &rel, false)?;
-        guard_path_mutation(ctx, project.id, &root, &rel, None)?;
         ctx.tx().execute(
             "INSERT INTO file_trash(project_id, worktree, original_path, trash_path, created_at) VALUES (?1,?2,?3,'',?4)",
-            params![project.id, root.display().to_string(), p.path, ctx.now],
+            params![project_id, root.display().to_string(), p.path, ctx.now],
         ).bus()?;
         let id = ctx.tx().last_insert_rowid();
-        let trash = root.join(".relay").join("trash").join(id.to_string()).join("payload");
-        fs::create_dir_all(trash.parent().unwrap()).map_err(|e| io_err("file.delete_failed", &rel, e))?;
-        fs::rename(&path, &trash).map_err(|e| io_err("file.delete_failed", &rel, e))?;
+        // The primary checkout keeps the trash: a session's worktree is removed when the
+        // session ends, and its `.relay/trash` went with it while the row still offered a
+        // restore (RA-214). A worktree a rename cannot leave (another filesystem) keeps its own.
+        let primary = fs::canonicalize(get_project(ctx.tx(), project_id)?.path).ok();
+        let mut bases: Vec<&Path> = primary.iter().map(PathBuf::as_path).collect();
+        if !bases.contains(&root.as_path()) {
+            bases.push(&root);
+        }
+        let trash = trash_into(&bases, id, &path).map_err(|e| io_err("file.delete_failed", &rel, e))?;
         ctx.tx().execute("UPDATE file_trash SET trash_path=?1 WHERE id=?2", params![trash.display().to_string(), id]).bus()?;
-        ctx.set_undo("file.restore", json!({"project_id": project.id, "trash_id": id}), None);
-        changed(ctx, project.id, &root, &p.path);
+        ctx.set_undo("file.restore", json!({"project_id": project_id, "trash_id": id}), None);
+        changed(ctx, project_id, &root, &p.path);
         Ok(DeleteOut { trash_id: id })
     });
     e.register::<Restore>(|ctx: &mut Ctx, p| {
         let project = get_project(ctx.tx(), p.project_id)?;
+        let own = own_checkout(ctx.tx(), &ctx.actor, ctx.actor_session_id(), project.id)?;
         let row: Option<(String,String,String)> = ctx.tx().query_row(
             "SELECT worktree, original_path, trash_path FROM file_trash WHERE id=?1 AND project_id=?2 AND restored_at IS NULL",
             params![p.trash_id, project.id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
         ).optional().bus()?;
         let (root_s, rel_s, trash_s) = row.ok_or_else(|| BusError::not_found("file.trash_not_found", format!("no open trash {}", p.trash_id)))?;
-        let root = PathBuf::from(root_s); let rel = rel(&rel_s, false)?; let path = safe_join(&root, &rel, true)?;
-        if path.exists() { return Err(BusError::conflict("file.restore_conflict", format!("{} already exists", rel.display()))); }
+        let root = PathBuf::from(root_s); confine(own, &root)?;
+        let rel = rel(&rel_s, false)?; let path = safe_join(&root, &rel, true)?;
+        if occupied(&path) { return Err(BusError::conflict("file.restore_conflict", format!("{} already exists", rel.display()))); }
         if let Some(parent) = path.parent() { fs::create_dir_all(parent).map_err(|e| io_err("file.restore_failed", &rel, e))?; }
         fs::rename(&trash_s, &path).map_err(|e| io_err("file.restore_failed", &rel, e))?;
         ctx.tx().execute("UPDATE file_trash SET restored_at=?1 WHERE id=?2", params![ctx.now, p.trash_id]).bus()?;
         changed(ctx, project.id, &root, &rel_s);
-        entry(&root, &path, &HashMap::new(), 0)
+        entry(&root, &path, &HashMap::new())
     });
-    e.register::<RestoreHead>(|ctx: &mut Ctx, p| {
-        let (project, root) = root(ctx, p.project_id, p.worktree.as_deref())?;
+    e.register_unlocked::<TrashList>(|ctx, p| {
+        let limit = p.limit.unwrap_or(200).clamp(1, 1000);
+        let rows = ctx.read(|conn| {
+            get_project(conn, p.project_id)?;
+            conn.prepare_cached(
+                "SELECT id, original_path, worktree, trash_path, created_at FROM file_trash
+                 WHERE project_id = ?1 AND restored_at IS NULL ORDER BY id DESC LIMIT ?2",
+            ).bus()?
+            .query_map(params![p.project_id, limit], |r| {
+                Ok((r.get::<_, Id>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?))
+            }).bus()?
+            .collect::<rusqlite::Result<Vec<_>>>().bus()
+        })?;
+        // Whether the bytes are still there is a stat per row, so it is asked with nothing held.
+        let entries = rows
+            .into_iter()
+            .map(|(id, original_path, worktree, trash_path, created_at)| TrashEntry {
+                id, original_path, worktree, created_at,
+                available: !trash_path.is_empty() && occupied(Path::new(&trash_path)),
+            })
+            .collect();
+        Ok(TrashListOut { entries })
+    });
+    // Staged (D149): the checkout is a subprocess, so it runs before the transaction opens;
+    // the transaction only announces the change. `--literal-pathspecs`: a path is a name, never
+    // a glob, so restoring `[id].tsx` cannot also discard edits to `i.tsx` and `d.tsx` (RA-153).
+    e.register_staged::<RestoreHead, (Id, PathBuf, Entry)>(|ctx, p| {
+        let (project, root) = root_mut_unlocked(ctx, p.project_id, p.worktree.as_deref())?;
         let rel = rel(&p.path, false)?;
-        crate::worktree::git_mutate(&root, &["checkout", "--", &p.path])
+        crate::worktree::git_mutate(&root, &["--literal-pathspecs", "checkout", "--", &p.path])
             .map_err(|e| BusError::conflict("file.restore_head_failed", e.to_string()))?;
         let path = safe_join(&root, &rel, false)?;
-        changed(ctx, project.id, &root, &p.path);
-        entry(&root, &path, &HashMap::new(), 0)
+        Ok((project.id, root.clone(), entry(&root, &path, &HashMap::new())?))
+    }, |ctx: &mut Ctx, p, (project_id, root, restored)| {
+        changed(ctx, project_id, &root, &p.path);
+        Ok(restored)
     });
-    e.register::<Import>(|ctx: &mut Ctx, p| {
-        let (project, root) = root(ctx, p.project_id, p.worktree.as_deref())?;
+    // Staged (D149, RA-190): the sources are copied into the worktree's `.relay/tmp` with
+    // nothing locked; the transaction gates each destination and renames the copies into place.
+    e.register_staged::<Import, PreparedImport>(|ctx, p| {
+        let (project, root) = root_mut_unlocked(ctx, p.project_id, p.worktree.as_deref())?;
         let into_rel = rel(&p.into, true)?;
         let into = safe_join(&root, &into_rel, false)?;
         if !into.is_dir() {
@@ -269,8 +313,9 @@ pub fn register(e: &mut Engine) {
                 "destination is not a directory",
             ));
         }
-        let mut entries = Vec::new();
-        for source in &p.sources {
+        let staging = Staging::new(&root)?;
+        let mut items = Vec::new();
+        for (index, source) in p.sources.iter().enumerate() {
             let source = Path::new(source);
             if !source.is_absolute() || !source.exists() {
                 return Err(BusError::invalid(
@@ -281,19 +326,51 @@ pub fn register(e: &mut Engine) {
             let name = source
                 .file_name()
                 .ok_or_else(|| BusError::invalid("file.source", "source has no name"))?;
-            let dest = into.join(name);
+            // The copy would walk into its own staging directory and never finish.
+            if fs::symlink_metadata(source).is_ok_and(|md| md.is_dir())
+                && fs::canonicalize(source).is_ok_and(|source| root.starts_with(source))
+            {
+                return Err(BusError::invalid(
+                    "file.source",
+                    format!("{} contains the worktree it would be imported into", source.display()),
+                ));
+            }
             let dest_rel = into_rel.join(name);
-            guard_path_mutation(ctx, project.id, &root, &dest_rel, Some(source))?;
-            if dest.exists() {
+            // Checked again under the lock; here it saves copying what cannot land.
+            if occupied(&into.join(name)) {
                 return Err(BusError::conflict(
                     "file.exists",
                     format!("{} already exists", dest_rel.display()),
                 ));
             }
-            copy(source, &dest).map_err(|e| io_err("file.import_failed", &dest_rel, e))?;
-            entries.push(entry(&root, &dest, &HashMap::new(), 0)?);
+            let inner = covered_inside(ctx, project.id, source, &[&dest_rel])?;
+            let staged = staging.0.join(index.to_string());
+            copy(source, &staged).map_err(|e| io_err("file.import_failed", &dest_rel, e))?;
+            items.push(StagedImport { staged, dest_rel, inner });
         }
-        changed(ctx, project.id, &root, &p.into);
+        Ok(PreparedImport { project_id: project.id, root, items, _staging: staging })
+    }, |ctx: &mut Ctx, p, prepared| {
+        let PreparedImport { project_id, root, items, _staging } = prepared;
+        // Every gate and conflict first, so a refusal part-way leaves nothing half-imported.
+        for item in &items {
+            guard_path_mutation(ctx, project_id, &root, &item.dest_rel, Some(&item.staged))?;
+            for inside in &item.inner {
+                guard_path_mutation(ctx, project_id, &root, &item.dest_rel.join(inside), Some(&item.staged.join(inside)))?;
+            }
+            if occupied(&root.join(&item.dest_rel)) {
+                return Err(BusError::conflict(
+                    "file.exists",
+                    format!("{} already exists", item.dest_rel.display()),
+                ));
+            }
+        }
+        let mut entries = Vec::new();
+        for item in &items {
+            let dest = root.join(&item.dest_rel);
+            fs::rename(&item.staged, &dest).map_err(|e| io_err("file.import_failed", &item.dest_rel, e))?;
+            entries.push(entry(&root, &dest, &HashMap::new())?);
+        }
+        changed(ctx, project_id, &root, &p.into);
         Ok(ImportOut { entries })
     });
     e.register_unlocked::<Search>(|ctx, p| {
@@ -359,11 +436,13 @@ pub fn register(e: &mut Engine) {
                     counted_to = at;
                     let start = text[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
                     let end = text[at..].find('\n').map(|i| at + i).unwrap_or(text.len());
+                    let (shown, text_offset) = hit_window(&text[start..end], at - start);
                     hits.push(Hit {
                         path: relp.to_string_lossy().to_string(),
                         line,
                         col: (at - start) as u32 + 1,
-                        text: text[start..end].trim_end_matches('\r').to_string(),
+                        text: shown.trim_end_matches('\r').to_string(),
+                        text_offset: (text_offset > 0).then_some(text_offset as u32),
                     });
                     if hits.len() >= limit {
                         return Ok(SearchOut { hits });
@@ -380,14 +459,7 @@ pub fn register(e: &mut Engine) {
 /// never the project root: defaulting to the root answered a confident, well-formed, wrong
 /// question — "your" diff, read from a tree the agent has never touched — and returned no
 /// error either way (D111). `@project` asks for the root explicitly and loudly.
-pub(crate) fn default_worktree(
-    ctx: &Ctx,
-    project: &relay_bus::types::Project,
-    requested: Option<&str>,
-) -> Result<PathBuf, BusError> {
-    default_worktree_in(ctx.tx(), ctx.actor_session_id(), project, requested)
-}
-
+///
 /// The store half of worktree resolution, split out so the unlocked query context can do it in
 /// one short read and leave the `git worktree list` that validates the answer off the lock (D144).
 pub(crate) fn default_worktree_in(
@@ -411,8 +483,9 @@ pub(crate) fn default_worktree_in(
     }
 }
 
-/// The store half of [`root`]: project row plus the worktree the caller means, before any of it
-/// is checked against the repository. Cheap, and the only part that needs the connection.
+/// The store half of [`root_unlocked`] and [`root_mut`]: project row plus the worktree the
+/// caller means, before any of it is checked against the repository. Cheap, and the only part
+/// that needs the connection.
 pub(crate) fn root_choice(
     conn: &Connection,
     session_id: Option<Id>,
@@ -446,17 +519,8 @@ pub(crate) fn root_verify(
 /// The one spelling that means "the project root, deliberately".
 pub(crate) const PROJECT_ROOT: &str = "@project";
 
-fn root(
-    ctx: &Ctx,
-    project_id: Id,
-    requested: Option<&str>,
-) -> Result<(relay_bus::types::Project, PathBuf), BusError> {
-    let (project, chosen) = root_choice(ctx.tx(), ctx.actor_session_id(), project_id, requested)?;
-    let chosen = root_verify(&project, chosen, "file.worktree")?;
-    Ok((project, chosen))
-}
-
-/// [`root`] for the unlocked query context: one short read, then the subprocess with nothing held.
+/// The tree a query reads: one short read, then the subprocess with nothing held. Mutations
+/// resolve theirs through [`root_mut`], which also confines an agent to its own checkout.
 pub(crate) fn root_unlocked(
     ctx: &Unlocked,
     project_id: Id,
@@ -488,16 +552,111 @@ fn rel(value: &str, allow_empty: bool) -> Result<PathBuf, BusError> {
     Ok(path.to_path_buf())
 }
 
+/// The tree a mutation changes: an agent may change files only in its own project and its own
+/// checkout (RA-148). Naming another project, or another worktree of its own, used to be
+/// enough to write there.
+fn root_mut(
+    ctx: &Ctx,
+    project_id: Id,
+    requested: Option<&str>,
+) -> Result<(relay_bus::types::Project, PathBuf), BusError> {
+    let session_id = ctx.actor_session_id();
+    let (project, chosen) = root_choice(ctx.tx(), session_id, project_id, requested)?;
+    let own = own_checkout(ctx.tx(), &ctx.actor, session_id, project.id)?;
+    let chosen = root_verify(&project, chosen, "file.worktree")?;
+    confine(own, &chosen)?;
+    Ok((project, chosen))
+}
+
+/// [`root_mut`] for the read phase of a staged mutation.
+fn root_mut_unlocked(
+    ctx: &Unlocked,
+    project_id: Id,
+    requested: Option<&str>,
+) -> Result<(relay_bus::types::Project, PathBuf), BusError> {
+    let session_id = ctx.actor_session_id();
+    let (project, chosen, own) = ctx.read(|conn| {
+        let (project, chosen) = root_choice(conn, session_id, project_id, requested)?;
+        let own = own_checkout(conn, &ctx.actor, session_id, project.id)?;
+        Ok((project, chosen, own))
+    })?;
+    let chosen = root_verify(&project, chosen, "file.worktree")?;
+    confine(own, &chosen)?;
+    Ok((project, chosen))
+}
+
+/// The checkout an agent is confined to, or `None` for the user. Refuses another project
+/// outright, the way every other project-scoped agent op does.
+fn own_checkout(
+    conn: &Connection,
+    actor: &relay_bus::Actor,
+    session_id: Option<Id>,
+    project_id: Id,
+) -> Result<Option<PathBuf>, BusError> {
+    let Some(id) = session_id else {
+        if actor.is_agent() {
+            return Err(BusError::actor("agent actor is not bound to a live session"));
+        }
+        return Ok(None);
+    };
+    let row = crate::sessions::by_id(conn, id)?
+        .ok_or_else(|| BusError::actor("bound session vanished"))?;
+    if row.session.project_id != project_id {
+        return Err(BusError::not_own("project"));
+    }
+    Ok(Some(PathBuf::from(row.session.worktree)))
+}
+
+/// `root` (already canonical) must be the agent's own checkout.
+fn confine(own: Option<PathBuf>, root: &Path) -> Result<(), BusError> {
+    match own.map(|own| fs::canonicalize(&own).unwrap_or(own)) {
+        Some(own) if own != root => Err(BusError::not_own("worktree")),
+        _ => Ok(()),
+    }
+}
+
+/// Move `path` to `<base>/.relay/trash/<id>/payload` under the first base a rename reaches,
+/// the shape purge's expiry accepts. A base that fails is left as it was found.
+fn trash_into(bases: &[&Path], id: Id, path: &Path) -> std::io::Result<PathBuf> {
+    let mut failed = None;
+    for base in bases {
+        let dir = base.join(".relay").join("trash").join(id.to_string());
+        let payload = dir.join("payload");
+        let moved = fs::create_dir_all(&dir).and_then(|_| fs::rename(path, &payload));
+        match moved {
+            Ok(()) => return Ok(payload),
+            Err(e) => {
+                let _ = fs::remove_dir(&dir);
+                failed = Some(e);
+            }
+        }
+    }
+    Err(failed.unwrap_or_else(|| std::io::Error::other("no trash directory")))
+}
+
+/// Whether anything — a dangling symlink included — already sits at `path`. `Path::exists`
+/// follows links, so a dangling one read as free and was then written through (RA-146).
+fn occupied(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
+/// `root/rel`, refused when it resolves outside `root` through a symlink. A path that does not
+/// exist yet is judged by its nearest existing ancestor, so a nested create, write or restore
+/// can make its parents (RA-149). A symlink at the path itself must resolve: writing through
+/// a dangling one creates its target wherever it points (RA-146).
 fn safe_join(root: &Path, rel: &Path, may_not_exist: bool) -> Result<PathBuf, BusError> {
     let path = root.join(rel);
-    let check = if path.exists() {
-        fs::canonicalize(&path)
-    } else if may_not_exist {
-        fs::canonicalize(path.parent().unwrap_or(root))
-    } else {
-        fs::canonicalize(&path)
+    let check = match fs::symlink_metadata(&path) {
+        Ok(md) if md.file_type().is_symlink() => fs::canonicalize(&path).map_err(|_| {
+            BusError::invalid("file.path", format!("{} is a dangling symlink", rel.display()))
+        })?,
+        Ok(_) => fs::canonicalize(&path).map_err(|e| io_err("file.not_found", rel, e))?,
+        Err(e) if !may_not_exist => return Err(io_err("file.not_found", rel, e)),
+        Err(_) => {
+            let existing = path.ancestors().skip(1).find(|a| occupied(a)).unwrap_or(root);
+            fs::canonicalize(existing).map_err(|e| io_err("file.not_found", rel, e))?
+        }
     };
-    let check = check.map_err(|e| io_err("file.not_found", rel, e))?;
     if !check.starts_with(root) {
         return Err(BusError::invalid(
             "file.path",
@@ -507,22 +666,49 @@ fn safe_join(root: &Path, rel: &Path, may_not_exist: bool) -> Result<PathBuf, Bu
     Ok(path)
 }
 
+/// `file.tree` entries per directory when the caller names no `limit`, and the most it may ask
+/// for. A folder of ten thousand icons was one reply over the client's 2 MiB line cap (RA-210).
+const TREE_LIMIT: u32 = 2000;
+const TREE_LIMIT_MAX: u32 = 5000;
+
+/// The first `limit` entries of `dir` in display order (folders first, then by name), each
+/// directory among them listed `depth - 1` levels further. A directory cut short is recorded
+/// in `truncated` with its full count. Only the entries kept are stat'ed.
 fn list_dir(
     root: &Path,
     dir: &Path,
     depth: u32,
     badges: &HashMap<String, String>,
+    limit: usize,
+    truncated: &mut BTreeMap<String, u32>,
 ) -> Result<Vec<Entry>, BusError> {
-    let mut out = fs::read_dir(dir)
+    let mut found: Vec<(bool, String, PathBuf)> = fs::read_dir(dir)
         .map_err(|e| io_err("file.tree_failed", dir, e))?
         .flatten()
         .filter(|e| {
             !matches!(e.file_name().to_string_lossy().as_ref(), ".git" | ".relay")
                 && !crate::watch::is_generated_path(root, &e.path())
         })
-        .map(|e| entry(root, &e.path(), badges, depth.saturating_sub(1)))
-        .collect::<Result<Vec<_>, _>>()?;
-    out.sort_by_key(|e| (e.kind != EntryKind::Dir, e.name.to_lowercase()));
+        // `DirEntry::file_type` does not follow links, the same as `entry`'s `symlink_metadata`.
+        .map(|e| {
+            let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
+            (!is_dir, e.file_name().to_string_lossy().to_lowercase(), e.path())
+        })
+        .collect();
+    found.sort();
+    if found.len() > limit {
+        let rel = dir.strip_prefix(root).unwrap_or(dir).to_string_lossy().replace('\\', "/");
+        truncated.insert(rel, found.len() as u32);
+        found.truncate(limit);
+    }
+    let mut out = Vec::with_capacity(found.len());
+    for (_, _, path) in found {
+        let mut item = entry(root, &path, badges)?;
+        if item.kind == EntryKind::Dir && depth > 1 {
+            item.children = Some(list_dir(root, &path, depth - 1, badges, limit, truncated)?);
+        }
+        out.push(item);
+    }
     Ok(out)
 }
 
@@ -530,7 +716,6 @@ fn entry(
     root: &Path,
     path: &Path,
     badges: &HashMap<String, String>,
-    child_depth: u32,
 ) -> Result<Entry, BusError> {
     let md = fs::symlink_metadata(path).map_err(|e| io_err("file.stat_failed", path, e))?;
     let rel = path
@@ -544,11 +729,6 @@ fn entry(
         EntryKind::Dir
     } else {
         EntryKind::File
-    };
-    let children = if kind == EntryKind::Dir && child_depth > 0 {
-        Some(list_dir(root, path, child_depth, badges)?)
-    } else {
-        None
     };
     let modified_at = md
         .modified()
@@ -566,7 +746,7 @@ fn entry(
         size: (kind == EntryKind::File).then_some(md.len() as i64),
         modified_at,
         badge: badges.get(&rel).cloned(),
-        children,
+        children: None,
     })
 }
 
@@ -595,6 +775,120 @@ fn guard_path_mutation(
 /// Shape gates validate configuration files; anything larger is not one, and is held unread.
 const SHAPE_TEXT_MAX: u64 = 4 * 1024 * 1024;
 
+/// Every path inside the directory `dir` that a protected path or shape gate would cover once
+/// it sits under one of `bases` (where it is now, where it is going), relative to `dir`.
+/// Gating a directory by its own path alone let `config/` be deleted or moved with the
+/// protected `config/prod.env` inside it (RA-147). A tree walk, so it runs in the read phase
+/// of the staged op, with nothing locked; symlinked directories are not followed, the same
+/// as the rename or copy they precede. Empty for anything that is not a directory.
+fn covered_inside(
+    ctx: &Unlocked,
+    project_id: Id,
+    dir: &Path,
+    bases: &[&Path],
+) -> Result<Vec<PathBuf>, BusError> {
+    if !fs::symlink_metadata(dir).is_ok_and(|md| md.is_dir()) {
+        return Ok(Vec::new());
+    }
+    let cfg = ctx.read(|conn| crate::guardrail::config(conn, Some(project_id)))?;
+    let patterns: Vec<&str> = cfg
+        .protected_paths
+        .iter()
+        .map(String::as_str)
+        .chain(cfg.shape_gates.iter().map(|gate| gate.path.as_str()))
+        .collect();
+    let mut covered = Vec::new();
+    if patterns.is_empty() {
+        return Ok(covered);
+    }
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let entries = fs::read_dir(&current).map_err(|e| io_err("file.walk_failed", &current, e))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| io_err("file.walk_failed", &current, e))?;
+            let path = entry.path();
+            let inner = path.strip_prefix(dir).unwrap_or(&path).to_path_buf();
+            if bases.iter().any(|base| {
+                let at = base.join(&inner);
+                patterns.iter().any(|pattern| crate::guardrail::path_matches(pattern, &at))
+            }) {
+                covered.push(inner);
+            }
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                stack.push(path);
+            }
+        }
+    }
+    Ok(covered)
+}
+
+/// A scratch path under the worktree's `.relay/tmp`, removed when dropped unless its contents
+/// were moved into place. A staged op that never reaches its transaction — a refused hold, a
+/// failed confirm — leaves nothing behind.
+struct Staging(PathBuf);
+
+impl Staging {
+    fn new(root: &Path) -> Result<Self, BusError> {
+        let path = root.join(".relay").join("tmp").join(format!("import-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&path).map_err(|e| io_err("file.import_failed", &path, e))?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// What a staged rename, move or delete settled before its transaction.
+struct PreparedPath {
+    project_id: Id,
+    root: PathBuf,
+    from_rel: PathBuf,
+    /// Where a rename or move lands; `None` for a delete.
+    into_rel: Option<PathBuf>,
+    /// Paths inside a directory source that a gate covers, relative to it ([`covered_inside`]).
+    inner: Vec<PathBuf>,
+}
+
+/// The transaction half of `file.rename` and `file.move`: gate the source and destination,
+/// and every gated path inside a directory at both ends, then rename.
+fn relocate(ctx: &mut Ctx, prepared: PreparedPath, code: &str) -> Result<Entry, BusError> {
+    let PreparedPath { project_id, root, from_rel, into_rel, inner } = prepared;
+    let into_rel = into_rel.ok_or_else(|| BusError::internal("relocate without a destination"))?;
+    let (from, into) = (root.join(&from_rel), root.join(&into_rel));
+    guard_path_mutation(ctx, project_id, &root, &from_rel, None)?;
+    guard_path_mutation(ctx, project_id, &root, &into_rel, Some(&from))?;
+    for inside in &inner {
+        guard_path_mutation(ctx, project_id, &root, &from_rel.join(inside), None)?;
+        guard_path_mutation(ctx, project_id, &root, &into_rel.join(inside), Some(&from.join(inside)))?;
+    }
+    if occupied(&into) {
+        return Err(BusError::conflict(
+            "file.exists",
+            format!("{} already exists", into_rel.display()),
+        ));
+    }
+    fs::rename(&from, &into).map_err(|e| io_err(code, &from_rel, e))?;
+    changed(ctx, project_id, &root, &into_rel.to_string_lossy());
+    entry(&root, &into, &HashMap::new())
+}
+
+/// One source of a staged `file.import`, already copied into the staging directory.
+struct StagedImport {
+    staged: PathBuf,
+    dest_rel: PathBuf,
+    inner: Vec<PathBuf>,
+}
+
+struct PreparedImport {
+    project_id: Id,
+    root: PathBuf,
+    items: Vec<StagedImport>,
+    _staging: Staging,
+}
+
 fn changed(ctx: &mut Ctx, project_id: Id, root: &Path, path: &str) {
     ctx.set_project(project_id);
     ctx.emit(
@@ -603,10 +897,20 @@ fn changed(ctx: &mut Ctx, project_id: Id, root: &Path, path: &str) {
     );
 }
 
+/// How long `file.write` may spend diffing for its line counts. It runs under the store lock,
+/// and Myers is quadratic in the worst case: a rewrite of a large generated file took seconds
+/// with every other request queued behind it (RA-145). Past the deadline `similar` finishes
+/// with a coarser diff, so the counts stay a true (if not minimal) account of the change.
+const LINE_COUNT_DEADLINE: std::time::Duration = std::time::Duration::from_millis(50);
+
 fn line_counts(old: &str, new: &str) -> (i64, i64) {
     let mut removed = 0;
     let mut added = 0;
-    for change in TextDiff::from_lines(old, new).iter_all_changes() {
+    let diff = TextDiff::configure()
+        .algorithm(similar::Algorithm::Myers)
+        .timeout(LINE_COUNT_DEADLINE)
+        .diff_lines(old, new);
+    for change in diff.iter_all_changes() {
         match change.tag() {
             ChangeTag::Delete => removed += 1,
             ChangeTag::Insert => added += 1,
@@ -684,6 +988,29 @@ fn read_searchable(root: &Path, path: &Path, buffer: &mut Vec<u8>) -> bool {
     file.read_to_end(buffer).is_ok()
 }
 
+/// The longest hit `text` file.search returns, in bytes. Hits were whole lines, and one match
+/// in a minified bundle or source map made a reply the client could not read (RA-212).
+const HIT_TEXT_MAX: usize = 240;
+/// How much of the line before the match a cut hit keeps.
+const HIT_TEXT_BEFORE: usize = 80;
+
+/// `line` whole when it is short, or a window of at most [`HIT_TEXT_MAX`] bytes around the match
+/// at byte `at`, cut on character boundaries. Returns the text and its byte offset in `line`.
+fn hit_window(line: &str, at: usize) -> (&str, usize) {
+    if line.len() <= HIT_TEXT_MAX {
+        return (line, 0);
+    }
+    let mut start = at.saturating_sub(HIT_TEXT_BEFORE);
+    while !line.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = (start + HIT_TEXT_MAX).min(line.len());
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&line[start..end], start)
+}
+
 fn mime(path: &Path) -> String {
     match path
         .extension()
@@ -706,4 +1033,39 @@ fn mime(path: &Path) -> String {
 
 fn io_err(code: &str, path: impl AsRef<Path>, e: std::io::Error) -> BusError {
     BusError::unavailable(code, format!("{}: {e}", path.as_ref().display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RA-145: every line different is Myers' worst case, quadratic in the line count. The
+    /// deadline bounds it, and the counts it settles on are still the whole change.
+    #[test]
+    fn line_counts_for_a_total_rewrite_return_within_the_deadline() {
+        let old: String = (0..20_000).map(|i| format!("old {i}\n")).collect();
+        let new: String = (0..20_000).map(|i| format!("new {i}\n")).collect();
+        let started = std::time::Instant::now();
+        assert_eq!(line_counts(&old, &new), (20_000, 20_000));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "took {:?}", started.elapsed());
+        assert_eq!(line_counts("a\nb\nc\n", "a\nc\nd\n"), (1, 1));
+    }
+
+    /// RA-212: a long line is cut to a window that starts before the match and still holds it,
+    /// on character boundaries, and says where in the line it starts.
+    #[test]
+    fn a_long_hit_line_is_cut_to_a_window_around_the_match() {
+        assert_eq!(hit_window("short line", 6), ("short line", 0));
+        let line = format!("{}needle{}", "é".repeat(5000), "x".repeat(5000));
+        let at = line.find("needle").unwrap();
+        let (text, offset) = hit_window(&line, at);
+        assert!(text.len() <= HIT_TEXT_MAX && text.len() > HIT_TEXT_MAX - 4, "{}", text.len());
+        assert!(offset <= at && at - offset <= HIT_TEXT_BEFORE);
+        assert_eq!(&text[at - offset..at - offset + 6], "needle");
+        assert_eq!(&line[offset..offset + text.len()], text);
+        // At the very start or end of a line the window runs to that edge.
+        assert_eq!(hit_window(&line, 0).1, 0);
+        let (tail, offset) = hit_window(&line, line.len() - 1);
+        assert_eq!(offset + tail.len(), line.len());
+    }
 }

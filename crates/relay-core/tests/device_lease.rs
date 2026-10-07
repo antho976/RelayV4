@@ -115,7 +115,12 @@ fn a_second_session_installing_on_a_held_phone_is_told_who_has_it() {
     // The holder itself is never refused.
     ok(e, Actor::agent(&a), "guardrail.gate", json!({"session": a, "kind": "exec", "command": "adb -s relay-phone shell am start -n com.example/.Main"}));
 
-    // The command finished: the lease survives only for its grace period.
+    // Both commands finished: the lease survives only for its grace period. The first to end
+    // leaves it alone, since the other may still be using the device.
+    ok(e, Actor::agent(&a), "session.report", json!({"session": a, "kind": "tool_use",
+        "data": {"tool_name": "Bash", "tool_input": {"command": "adb -s relay-phone install -r app/build/outputs/apk/debug/app-debug.apk"}}}));
+    let leases = ok(e, Actor::User, "device.leases", json!({}));
+    assert!(leases["leases"][0]["expires_in_s"].as_u64().unwrap() > 90, "{leases}");
     ok(e, Actor::agent(&a), "session.report", json!({"session": a, "kind": "tool_use",
         "data": {"tool_name": "Bash", "tool_input": {"command": "adb -s relay-phone shell am start -n com.example/.Main"}}}));
     let leases = ok(e, Actor::User, "device.leases", json!({}));
@@ -182,6 +187,10 @@ fn a_device_run_holds_the_phone_until_it_stops() {
     ok(e, Actor::User, "device.run.stop", json!({"run_id": run_id}));
     let gone = released(&mut events);
     assert!(gone.iter().any(|lease| lease["run_id"] == run_id), "{gone:?}");
+    // A's own command, taken under the run, still holds the phone until A lets it go.
+    let leases = ok(e, Actor::User, "device.leases", json!({}));
+    assert_eq!(leases["leases"][0]["kind"], "shell", "{leases}");
+    ok(e, Actor::agent(&a), "device.release", json!({}));
     ok(e, Actor::agent(&b), "guardrail.gate", json!({"session": b, "kind": "exec", "command": "adb install other.apk"}));
 }
 
@@ -203,4 +212,22 @@ fn a_run_that_fails_releases_its_lease_on_its_own() {
     assert!(ok(e, Actor::User, "device.leases", json!({}))["leases"].as_array().unwrap().is_empty(), "run {run} kept its lease");
     ok(e, Actor::agent(&b), "guardrail.gate", json!({"session": b, "kind": "exec", "command": "adb install x.apk"}));
     drop(a);
+}
+
+#[test]
+fn a_claim_outlives_the_run_its_holder_starts_under_it() {
+    let f = fixture();
+    let e = &f.engine;
+    let (a, worktree_a) = session(e);
+    let (b, _) = session(e);
+    ok(e, Actor::agent(&a), "device.claim", json!({"device": "relay-phone", "action": "testing the login flow"}));
+    let run = ok(e, Actor::User, "device.run", json!({"project_id": 1, "worktree": worktree_a, "device": "relay-phone"}));
+    let run_id = run["id"].as_i64().unwrap();
+    assert_eq!(ok(e, Actor::User, "device.leases", json!({}))["leases"][0]["kind"], "run");
+    ok(e, Actor::User, "device.run.stop", json!({"run_id": run_id}));
+    // The run is over; the claim it was started under still holds the phone.
+    let leases = ok(e, Actor::User, "device.leases", json!({}));
+    assert_eq!(leases["leases"][0]["kind"], "claim", "{leases}");
+    assert_eq!(leases["leases"][0]["session"], a.as_str());
+    assert_eq!(refusal(gate(e, &b, "adb install other.apk")).code, "device.busy");
 }

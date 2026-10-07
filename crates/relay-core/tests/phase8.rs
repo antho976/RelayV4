@@ -849,6 +849,9 @@ fn commit_publishes_the_gated_object_signs_when_asked_and_concludes_merges() {
     git(path, &["commit", "-qam", "main"]);
     assert!(!Command::new("git").arg("-C").arg(path).args(["merge", "side"]).output().unwrap().status.success());
     std::fs::write(path.join("a.txt"), "both\n").unwrap();
+    // Not until the resolution is staged: `all` would stage markers just the same (RA-204).
+    assert_eq!(err(&call(&e, "git.commit", json!({"project_id":1,"message":"Merge side","all":true}))).code, "git.unmerged");
+    git(path, &["add", "a.txt"]);
     call(&e, "git.commit", json!({"project_id":1,"message":"Merge side","all":true})).into_result().unwrap();
     assert_eq!(head("HEAD^2"), head("side"), "the merge kept its second parent");
 }

@@ -478,8 +478,8 @@ fn open_slot(tx: &Transaction, project_id: Id, column: Column, task_id: Id, inde
     Ok(index)
 }
 
-fn attachment_root(ctx: &Ctx) -> PathBuf {
-    ctx.engine()
+fn attachment_root(engine: &Engine) -> PathBuf {
+    engine
         .store
         .path()
         .parent()
@@ -518,10 +518,51 @@ fn attach_bytes(
     }
     ctx.tx().execute("INSERT INTO attachments(task_id,name,mime,bytes,path,created_at) VALUES (?1,?2,?3,?4,'',?5)", params![task.id, name, mime, bytes.len() as i64, ctx.now]).bus()?;
     let id = ctx.tx().last_insert_rowid();
-    let dir = attachment_root(ctx).join(task.id.to_string());
+    let dir = attachment_root(ctx.engine()).join(task.id.to_string());
     std::fs::create_dir_all(&dir).bus()?;
     let path = dir.join(format!("{id}-{name}"));
     std::fs::write(&path, bytes).bus()?;
+    ctx.tx()
+        .execute(
+            "UPDATE attachments SET path=?1 WHERE id=?2",
+            params![path.display().to_string(), id],
+        )
+        .bus()?;
+    ctx.tx()
+        .query_row(
+            "SELECT * FROM attachments WHERE id=?1",
+            [id],
+            attachment_row,
+        )
+        .bus()
+}
+
+/// An attachment copied into `attachments/.staging` by `task.attach`'s read phase. Removed on
+/// drop unless [`attach_staged`] has already renamed it into place.
+struct StagedFile(PathBuf);
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+struct PreparedAttach {
+    staged: StagedFile,
+    name: String,
+    mime: String,
+    bytes: u64,
+}
+
+/// [`attach_bytes`] for a file already staged: the row, and a rename instead of a write.
+fn attach_staged(ctx: &mut Ctx, task: &Task, prepared: PreparedAttach) -> Result<Attachment, BusError> {
+    let PreparedAttach { staged, name, mime, bytes } = prepared;
+    ctx.tx().execute("INSERT INTO attachments(task_id,name,mime,bytes,path,created_at) VALUES (?1,?2,?3,?4,'',?5)", params![task.id, name, mime, bytes as i64, ctx.now]).bus()?;
+    let id = ctx.tx().last_insert_rowid();
+    let dir = attachment_root(ctx.engine()).join(task.id.to_string());
+    std::fs::create_dir_all(&dir).bus()?;
+    let path = dir.join(format!("{id}-{name}"));
+    std::fs::rename(&staged.0, &path).bus()?;
     ctx.tx()
         .execute(
             "UPDATE attachments SET path=?1 WHERE id=?2",
@@ -609,6 +650,36 @@ fn assign_session(ctx: &mut Ctx, name: &str, task: &Task) -> Result<Vec<Id>, Bus
         }
     }
     Ok(newly_current)
+}
+
+/// Re-emit `parent_id` for its roll-up, unless it is gone: a sub-task left under a deleted
+/// parent by an older build must still be movable out from under it.
+fn emit_live_parent(ctx: &mut Ctx, parent_id: Option<Id>) -> Result<(), BusError> {
+    let Some(parent_id) = parent_id else { return Ok(()) };
+    let parent = get_task(ctx.tx(), parent_id, true)?;
+    if parent.deleted_at.is_none() {
+        emit_task(ctx, &parent)?;
+    }
+    Ok(())
+}
+
+/// The sub-tasks soft-deleted together with `task_id`, by their shared `deleted_at` stamp.
+fn deleted_with(tx: &rusqlite::Connection, task_id: Id, stamp: &str) -> Result<Vec<Id>, BusError> {
+    let mut stmt = tx.prepare_cached("SELECT id FROM tasks WHERE parent_id=?1 AND deleted_at=?2 ORDER BY position,id").bus()?;
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::from([task_id]);
+    let mut frontier = std::collections::VecDeque::from([task_id]);
+    while let Some(current) = frontier.pop_front() {
+        let children = stmt.query_map(params![current, stamp], |r| r.get::<_, Id>(0)).bus()?
+            .collect::<rusqlite::Result<Vec<_>>>().bus()?;
+        for child in children {
+            if seen.insert(child) {
+                out.push(child);
+                frontier.push_back(child);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Bump `updated_at` for edits that live in a side table (labels, relations) so the row the
@@ -720,6 +791,31 @@ fn discard_created(engine: &Engine, created: &[String]) {
     }
 }
 
+/// The audit half of `task.activity`. It used to test every row the project ever audited with
+/// up to three `json_extract`s — the result one for every op — under the store lock, each time
+/// a task was opened (RA-188). Now `audit_op_ts` seeks each task op from just before the task
+/// was made, and only those rows are parsed. `+project_id` keeps the planner off
+/// `audit_project_ts`, which would walk everything the project ran in that window.
+fn activity_sql() -> &'static str {
+    static SQL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SQL.get_or_init(|| {
+        let ops = relay_bus::registry::Registry::global()
+            .entries()
+            .iter()
+            .filter(|op| op.name.starts_with("task.") && matches!(op.meta.kind, relay_bus::registry::OpKind::Mutation))
+            .map(|op| format!("'{}'", op.name))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "SELECT id FROM audit WHERE op IN ({ops}) AND ts >= ?5 AND +project_id = ?1 AND (?3 IS NULL OR id < ?3)
+             AND (json_extract(payload, '$.task_id') = ?2
+               OR (op = 'task.create' AND json_extract(result_summary, '$.id') = ?2)
+               OR (op = 'task.dispatch' AND json_extract(result_summary, '$.task.id') = ?2))
+             ORDER BY id DESC LIMIT ?4"
+        )
+    })
+}
+
 /// `task.list` page size when the caller names none, and the most it may ask for.
 const TASK_PAGE: u32 = 1000;
 const TASK_PAGE_MAX: u32 = 2000;
@@ -754,19 +850,16 @@ pub fn register(e: &mut Engine) {
     e.register::<Activity>(|ctx, p| {
         let task = get_task(ctx.tx(), p.task_id, false)?;
         let limit = p.limit.unwrap_or(100).clamp(1, 500) as usize;
-        let mut stmt = ctx
-            .tx()
-            .prepare_cached(
-                "SELECT id FROM audit WHERE project_id = ?1 AND (?3 IS NULL OR id < ?3)
-             AND ((op LIKE 'task.%' AND json_extract(payload, '$.task_id') = ?2)
-               OR (op = 'task.create' AND json_extract(result_summary, '$.id') = ?2)
-               OR json_extract(result_summary, '$.task.id') = ?2)
-             ORDER BY id DESC LIMIT ?4",
-            )
-            .bus()?;
+        // Nothing is audited about a task before it exists. A day of slack absorbs a clock
+        // step; an unparsable stamp (an imported row) just loses the bound.
+        let since = task.created_at.parse::<jiff::Timestamp>().ok()
+            .and_then(|at| at.checked_sub(jiff::SignedDuration::from_hours(24)).ok())
+            .map(|at| at.to_string())
+            .unwrap_or_default();
+        let mut stmt = ctx.tx().prepare_cached(activity_sql()).bus()?;
         let ids = stmt
             .query_map(
-                params![task.project_id, task.id, p.before_audit, (limit + 1) as i64],
+                params![task.project_id, task.id, p.before_audit, (limit + 1) as i64, since],
                 |row| row.get::<_, i64>(0),
             )
             .bus()?
@@ -845,7 +938,7 @@ pub fn register(e: &mut Engine) {
             None => {}
         }
         if let Some(v)=p.label { sql.push_str(" AND EXISTS(SELECT 1 FROM task_labels tl JOIN labels l ON l.id=tl.label_id WHERE tl.task_id=tasks.id AND l.name=? COLLATE NOCASE)"); args.push(Box::new(normalise_label(&v)?)); }
-        if let Some(v)=p.session { sql.push_str(" AND EXISTS(SELECT 1 FROM task_sessions ts JOIN sessions s ON s.id=ts.session_id WHERE ts.task_id=tasks.id AND s.name=?)"); args.push(Box::new(v)); }
+        if let Some(v)=p.session { sql.push_str(" AND EXISTS(SELECT 1 FROM task_sessions ts WHERE ts.task_id=tasks.id AND ts.session_id=(SELECT MAX(id) FROM sessions WHERE name=?))"); args.push(Box::new(v)); }
         match p.sort.as_deref().unwrap_or("column") {
             "priority" => sql.push_str(" ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,updated_at DESC,id"),
             "updated" => sql.push_str(" ORDER BY updated_at DESC,id DESC"),
@@ -906,59 +999,92 @@ pub fn register(e: &mut Engine) {
     e.register::<Move>(|ctx: &mut Ctx,p| {
         let before=get_task(ctx.tx(),p.task_id,false)?;
         if ctx.actor.is_agent() && !(before.column==Column::Active && p.column==Column::InReview) { return Err(BusError::conflict("task.column_transition","agents may only move their active task to in_review")) }
-        if p.column==Column::Done { return Err(BusError::conflict("task.column_transition","move to done through task.approve")) }
+        // Done means a commit is linked, and task.approve is what links one. A task that already
+        // has one — it left Done, and this is that move undone — may go straight back; refusing
+        // it made every move out of Done un-undoable and jammed the board's Ctrl+Z (RA-189).
+        if p.column==Column::Done && before.column!=Column::Done && before.commits.is_empty() { return Err(BusError::conflict("task.column_transition","move to done through task.approve")) }
         // An explicit position is the index the task ends at in its column; the others shift
         // around it, so a card can be dropped between two others. Without one it goes last.
         let index=column_index(ctx.tx(),&before)?;
         let position=match p.position { Some(at) => open_slot(ctx.tx(),before.project_id,p.column,before.id,at)?, None => next_position(ctx.tx(),before.project_id,p.column)? };
-        let moved_state = if before.column == Column::Done && p.column == Column::InReview { TaskState::AwaitingReview } else { before.state };
+        let moved_state = match (before.column, p.column) {
+            (Column::Done, Column::InReview) => TaskState::AwaitingReview,
+            (from, Column::Done) if from != Column::Done => TaskState::None,
+            _ => before.state,
+        };
         ctx.tx().execute("UPDATE tasks SET col=?1,position=?2,state=?3,updated_at=?4 WHERE id=?5",params![column_str(p.column),position,state_str(moved_state),ctx.now,before.id]).bus()?;
         let task=get_task(ctx.tx(),before.id,false)?;
         ctx.set_undo("task.move",json!({"task_id":before.id,"column":column_str(before.column),"position":index}),Some(json!({"updated_at":task.updated_at})));
         emit_task(ctx,&task)?; Ok(task)
     });
 
+    // A sub-task goes with its parent. Deleting the parent alone left its live sub-tasks
+    // hanging off a row nothing can read — every task.parent.set on them then failed — and a
+    // restore brought hidden subtrees back past the depth and children caps (RA-191).
     e.register::<Delete>(|ctx: &mut Ctx, p| {
         let task = get_task(ctx.tx(), p.task_id, false)?;
-        ctx.tx()
-            .execute(
-                "UPDATE tasks SET deleted_at=?1,updated_at=?1 WHERE id=?2",
-                params![ctx.now, task.id],
-            )
-            .bus()?;
+        let subtree = descendants(ctx.tx(), task.id)?;
+        {
+            let mut delete = ctx.tx().prepare_cached("UPDATE tasks SET deleted_at=?1,updated_at=?1 WHERE id=?2").bus()?;
+            for id in std::iter::once(task.id).chain(subtree.iter().copied()) {
+                delete.execute(params![ctx.now, id]).bus()?;
+            }
+        }
         ctx.set_project(task.project_id);
         ctx.set_undo(
             "task.restore",
             json!({"task_id":task.id}),
             Some(json!({"updated_at":ctx.now})),
         );
-        ctx.emit(
-            "task.deleted",
-            json!({"id":task.id,"project_id":task.project_id}),
-        );
+        for id in std::iter::once(task.id).chain(subtree) {
+            ctx.emit(
+                "task.deleted",
+                json!({"id":id,"project_id":task.project_id}),
+            );
+        }
+        emit_live_parent(ctx, task.parent_id)?;
         Ok(Empty {})
     });
     e.register::<Restore>(|ctx: &mut Ctx, p| {
         let before = get_task(ctx.tx(), p.task_id, true)?;
-        if before.deleted_at.is_none() {
+        let Some(stamp) = before.deleted_at.clone() else {
             return Err(BusError::conflict(
                 "task.not_deleted",
                 format!("task {} is not deleted", before.id),
             ));
+        };
+        // The sub-tasks deleted with it come back with it; one deleted on its own earlier
+        // stays deleted.
+        let subtree = deleted_with(ctx.tx(), before.id, &stamp)?;
+        {
+            let mut restore = ctx.tx().prepare_cached("UPDATE tasks SET deleted_at=NULL,updated_at=?1 WHERE id=?2").bus()?;
+            for id in std::iter::once(before.id).chain(subtree.iter().copied()) {
+                restore.execute(params![ctx.now, id]).bus()?;
+            }
         }
-        ctx.tx()
-            .execute(
-                "UPDATE tasks SET deleted_at=NULL,updated_at=?1 WHERE id=?2",
-                params![ctx.now, before.id],
-            )
-            .bus()?;
+        // A parent that was deleted since, or filled up or deepened while this subtree was
+        // away, cannot take it back: it returns as a top-level task rather than not at all,
+        // so the undo that called this always lands.
+        if let Some(parent_id) = before.parent_id {
+            if let Err(error) = assert_parent(ctx.tx(), before.project_id, Some(before.id), parent_id) {
+                if error.kind == relay_bus::ErrorKind::Internal {
+                    return Err(error);
+                }
+                ctx.tx().execute("UPDATE tasks SET parent_id=NULL WHERE id=?1", [before.id]).bus()?;
+            }
+        }
         let task = get_task(ctx.tx(), before.id, false)?;
         ctx.set_undo(
             "task.delete",
             json!({"task_id":task.id}),
             Some(json!({"updated_at":task.updated_at})),
         );
+        for id in subtree {
+            let child = get_task(ctx.tx(), id, false)?;
+            emit_task(ctx, &child)?;
+        }
         emit_task(ctx, &task)?;
+        emit_live_parent(ctx, task.parent_id)?;
         Ok(task)
     });
     e.register::<LinkCommit>(|ctx: &mut Ctx, p| {
@@ -991,23 +1117,30 @@ pub fn register(e: &mut Engine) {
         emit_task(ctx, &task)?;
         Ok(task)
     });
-    e.register::<Attach>(|ctx: &mut Ctx, p| {
-        let task = get_task(ctx.tx(), p.task_id, false)?;
-        let attachment = match (p.path, p.name, p.mime, p.bytes_b64) {
+    // Staged (D149, RA-190): the file is read and copied into the attachment store with the
+    // lock released — it can be any size — and the transaction only records it and renames the
+    // copy into place.
+    e.register_staged::<Attach, PreparedAttach>(|ctx, p| {
+        ctx.read(|conn| get_task(conn, p.task_id, false))?;
+        let staging = attachment_root(ctx.engine()).join(".staging");
+        std::fs::create_dir_all(&staging).bus()?;
+        let staged = StagedFile(staging.join(uuid::Uuid::new_v4().to_string()));
+        let (name, mime, bytes) = match (&p.path, &p.name, &p.mime, &p.bytes_b64) {
             (Some(path), None, None, None) => {
-                let src = PathBuf::from(&path);
+                let src = PathBuf::from(path);
                 if !src.is_file() {
                     return Err(BusError::not_found(
                         "task.attachment_path",
                         format!("no file {path}"),
                     ));
                 }
-                let bytes = std::fs::read(&src).bus()?;
                 let name = src
                     .file_name()
                     .and_then(|n| n.to_str())
-                    .unwrap_or("attachment");
-                attach_bytes(ctx, &task, name, "application/octet-stream", &bytes)?
+                    .unwrap_or("attachment")
+                    .to_string();
+                let bytes = std::fs::copy(&src, &staged.0).bus()?;
+                (name, "application/octet-stream".to_string(), bytes)
             }
             (None, Some(name), Some(mime), Some(encoded)) => {
                 let bytes = base64::engine::general_purpose::STANDARD
@@ -1018,7 +1151,8 @@ pub fn register(e: &mut Engine) {
                             "attachment bytes_b64 is invalid",
                         )
                     })?;
-                attach_bytes(ctx, &task, &name, &mime, &bytes)?
+                std::fs::write(&staged.0, &bytes).bus()?;
+                (name.clone(), mime.clone(), bytes.len() as u64)
             }
             _ => {
                 return Err(BusError::invalid(
@@ -1027,6 +1161,17 @@ pub fn register(e: &mut Engine) {
                 ))
             }
         };
+        let name = safe_name(&name)?;
+        if bytes == 0 {
+            return Err(BusError::invalid(
+                "task.attachment_empty",
+                "attachment cannot be empty",
+            ));
+        }
+        Ok(PreparedAttach { staged, name, mime, bytes })
+    }, |ctx: &mut Ctx, p, prepared| {
+        let task = get_task(ctx.tx(), p.task_id, false)?;
+        let attachment = attach_staged(ctx, &task, prepared)?;
         emit_task(ctx, &get_task(ctx.tx(), task.id, false)?)?;
         Ok(attachment)
     });
@@ -1278,9 +1423,8 @@ pub fn register(e: &mut Engine) {
         emit_task(ctx, &task)?;
         // The old and the new parent both changed their roll-up; the board reads roll-ups off
         // the parent row, so both have to be re-emitted or a stale n/m survives on screen.
-        for parent in [before.parent_id, task.parent_id].into_iter().flatten() {
-            let parent = get_task(ctx.tx(), parent, false)?;
-            emit_task(ctx, &parent)?;
+        for parent in [before.parent_id, task.parent_id] {
+            emit_live_parent(ctx, parent)?;
         }
         Ok(task)
     });

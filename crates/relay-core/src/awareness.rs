@@ -149,10 +149,13 @@ pub fn peers(
     Ok(out)
 }
 
+/// `git` is [`crate::handlers::git::briefing_state`] for the session, taken by the caller with
+/// the store unlocked: it walks commit history, and this runs under the store lock.
 pub fn brief(
     conn: &Connection,
     session_name: &str,
     engine: Option<&crate::engine::Engine>,
+    git: &str,
 ) -> Result<BriefOut, BusError> {
     let row = sessions::by_name(conn, session_name)?;
     let session = &row.session;
@@ -208,11 +211,7 @@ pub fn brief(
         session.branch,
     );
     state.push('\n');
-    state.push_str(&crate::handlers::git::briefing_state(
-        std::path::Path::new(&session.worktree),
-        &session.branch,
-        &project.2,
-    ));
+    state.push_str(git);
     if let Some(module) = &module_name {
         state.push_str(&format!("\nmodule: {module}"));
     }
@@ -331,15 +330,20 @@ pub fn brief(
 
     let mut skill_stmt = conn
         .prepare_cached(
-            "SELECT s.name,s.body FROM skills s
+            "SELECT s.name,s.body,s.id FROM skills s
              JOIN skill_projects sp ON sp.skill_id=s.id
              WHERE sp.project_id=?1 AND s.deleted_at IS NULL
              ORDER BY s.name COLLATE NOCASE,s.id",
         )
         .bus()?;
+    // The folder the materializer writes, which is not always the bare name (two names can
+    // reduce to one folder).
+    let dirs = crate::skills::folder_names(conn).bus()?;
     let skill_rows = skill_stmt
         .query_map([session.project_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            let name = row.get::<_, String>(0)?;
+            let dir = dirs.get(&row.get::<_, Id>(2)?).cloned().unwrap_or_else(|| crate::skills::folder_name(&name));
+            Ok((name, row.get::<_, String>(1)?, dir))
         })
         .bus()?
         .collect::<rusqlite::Result<Vec<_>>>()
@@ -352,8 +356,7 @@ pub fn brief(
     } else {
         let listed = skill_rows
             .iter()
-            .map(|(name, _)| {
-                let dir = crate::skills::folder_name(name);
+            .map(|(name, _, dir)| {
                 format!(
                     "- {name} — {}/{dir}/, {}/{dir}/",
                     crate::skills::TARGETS[0],
@@ -371,7 +374,7 @@ pub fn brief(
     } else {
         skill_rows
             .into_iter()
-            .map(|(name, body)| format!("### {name}\n\n{body}"))
+            .map(|(name, body, _)| format!("### {name}\n\n{body}"))
             .collect::<Vec<_>>()
             .join("\n\n")
     };

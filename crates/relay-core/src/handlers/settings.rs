@@ -11,14 +11,15 @@ use std::collections::BTreeSet;
 use std::sync::Mutex;
 
 /// Defaults for the top-level keys BUS.md §10.16 names. Each feature fills its subtree in
-/// when it lands; unknown paths are allowed (settings are a tree, not a schema).
+/// when it lands; unknown paths are allowed (settings are a tree, not a schema). A key nothing
+/// reads has no default: it would only advertise a setting that does nothing.
 ///
 /// Guardrail evaluation reads this for every audited agent mutation, so the tree is built
 /// once and handed out by reference; callers clone only the branch they overlay.
 pub fn defaults() -> &'static Value {
     static DEFAULTS: std::sync::LazyLock<Value> = std::sync::LazyLock::new(|| {
         json!({
-            "appearance": { "mode": "dark", "panel_alpha": 1.0, "wallpaper": null, "wallpaper_preview": null },
+            "appearance": { "mode": "dark", "panel_alpha": 1.0, "wallpaper": null },
             "notifications": { "sound": "chime", "volume": 0.7, "categories": {} },
             "providers": { "claude": { "path": null }, "codex": { "path": null } },
             // What the status bar's limit meters show, and how often the window re-reads them
@@ -33,6 +34,7 @@ pub fn defaults() -> &'static Value {
                 "caps": { "files": 40, "lines": 2000 },
                 "destructive_write": { "min_removed_lines": 50, "min_removed_pct": 40, "min_file_lines": 30, "allow_if_recoverable": true },
                 "protected_paths": [],
+                "agent_builds": false,
                 "shape_gates": [],
                 "denied_commands": ["rm -rf", "git reset --hard", "git clean -fd", "git push --force"],
                 "allowed_write_roots": [],
@@ -45,14 +47,12 @@ pub fn defaults() -> &'static Value {
             },
             "undo": { "grace_days": 7 },
             "audit": { "retention_days": 180 },
-            "parking": { "idle_minutes": 30 },
+            // `layout.current.<project>` is the shell's last arrangement (ui.rs).
             "layout": {},
-            "theme": {},
             "keybindings": {
                 "palette": "Ctrl+K", "agents": "Ctrl+1", "code": "Ctrl+2", "board": "Ctrl+3",
                 "new_session": "Ctrl+N", "settings": "Ctrl+,", "sidebar": "Ctrl+Shift+B"
             },
-            "roles": {},
         })
     });
     &DEFAULTS
@@ -318,4 +318,19 @@ pub fn register(e: &mut Engine) {
         ctx.emit("settings.changed", json!({ "path": path, "value": value }));
         Ok(ValueOut { value })
     });
+}
+
+#[cfg(test)]
+mod tests {
+    /// A default is a promise that something reads the key (RA-253).
+    #[test]
+    fn defaults_carry_no_setting_that_nothing_reads() {
+        let defaults = super::defaults();
+        for dead in ["parking", "theme", "roles"] {
+            assert!(defaults.get(dead).is_none(), "{dead} has a default but no reader");
+        }
+        assert!(defaults["appearance"].get("wallpaper_preview").is_none());
+        assert!(defaults["layout"].is_object(), "ui.rs reads layout.current.<project>");
+        assert!(defaults["guardrails"]["roles"].is_object(), "the role allow-sets live here");
+    }
 }

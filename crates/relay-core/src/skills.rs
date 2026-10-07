@@ -4,16 +4,21 @@
 //! `<data>/skills/<id>/` and materialized into every project root and every session worktree
 //! as a real provider skill (`.claude/skills/<name>/`, `.agents/skills/<name>/`), so an agent
 //! in any project can load it. Relay only ever owns folders carrying [`MARKER`]; a skill the
-//! repository checks in itself is left exactly as it is.
+//! repository checks in itself is left exactly as it is, and so is one another Relay store
+//! (the dev instance beside the stable one) wrote.
 
 use anyhow::{Context, Result};
 use relay_bus::types::Id;
 use rusqlite::Connection;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError};
 
-/// Written into every skill folder Relay materializes. Its contents are the freshness stamp;
-/// its absence means the folder belongs to the repository and must not be touched.
+/// Written into every skill folder Relay materializes. Its first line names the store that wrote
+/// it and the rest is the freshness stamp; its absence means the folder belongs to the
+/// repository and must not be touched.
 pub const MARKER: &str = ".relay-skill";
 
 /// Provider folders a materialized skill is written into, relative to a checkout root.
@@ -47,7 +52,9 @@ pub fn library_dir(store: &crate::Store, id: Id) -> PathBuf {
 }
 
 /// Copy a downloaded skill folder into the library, replacing whatever was there. Callers
-/// treat failure as "no assets": the instruction body alone still makes a usable skill.
+/// treat failure as "no assets": the instruction body alone still makes a usable skill. Call it
+/// only once the row it belongs to is committed: a folder adopted for a transaction that then
+/// rolls back is an orphan the next skill given the same id would inherit.
 pub fn adopt(from: &Path, to: &Path) -> Result<()> {
     let _ = fs::remove_dir_all(to);
     if let Some(parent) = to.parent() {
@@ -116,14 +123,36 @@ pub fn folder_name(name: &str) -> String {
     if out.is_empty() { "skill".into() } else { out }
 }
 
+/// The folder of every live installed skill, by id. Distinct names can reduce to one folder
+/// (`Review: carefully` and `review carefully`), and two skills sharing it would rewrite each
+/// other on every pass, so the oldest keeps the plain name and the others take their id as a
+/// suffix. Every live skill counts, enabled or not: a skill's folder must not depend on which
+/// project is asking.
+pub fn folder_names(conn: &Connection) -> Result<HashMap<Id, String>> {
+    let mut stmt = conn.prepare_cached("SELECT id,name FROM skills WHERE deleted_at IS NULL ORDER BY id")?;
+    let rows = stmt.query_map([], |row| Ok((row.get::<_, Id>(0)?, row.get::<_, String>(1)?)))?;
+    let mut used = HashSet::new();
+    let mut out = HashMap::new();
+    for row in rows {
+        let (id, name) = row?;
+        let mut dir = folder_name(&name);
+        while !used.insert(dir.clone()) {
+            dir = format!("{dir}-{id}");
+        }
+        out.insert(id, dir);
+    }
+    Ok(out)
+}
+
 fn enabled(conn: &Connection, project_id: Id) -> Result<Vec<Row>> {
+    let dirs = folder_names(conn)?;
     let mut stmt = conn.prepare_cached(
         "SELECT s.id,s.name,s.body,s.updated_at,COALESCE(s.revision,'') FROM skills s
          JOIN skill_projects sp ON sp.skill_id=s.id
          WHERE sp.project_id=?1 AND s.deleted_at IS NULL
          ORDER BY s.name COLLATE NOCASE,s.id",
     )?;
-    let rows = stmt.query_map([project_id], row_of)?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let rows = stmt.query_map([project_id], |row| row_of(row, &dirs))?.collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(with_plugins(rows, &crate::plugins::enabled_for(conn, project_id)?))
 }
 
@@ -146,13 +175,13 @@ fn with_plugins(mut rows: Vec<Row>, plugins: &[&'static crate::plugins::Loaded])
     rows
 }
 
-fn row_of(row: &rusqlite::Row) -> rusqlite::Result<Row> {
+fn row_of(row: &rusqlite::Row, dirs: &HashMap<Id, String>) -> rusqlite::Result<Row> {
     let id: Id = row.get(0)?;
     let name: String = row.get(1)?;
     let updated_at: String = row.get(3)?;
     let revision: String = row.get(4)?;
     Ok(Row {
-        dir: folder_name(&name),
+        dir: dirs.get(&id).cloned().unwrap_or_else(|| folder_name(&name)),
         body: row.get(2)?,
         stamp: format!("{id} {updated_at} {revision}\n"),
         source: Source::Library(id),
@@ -163,12 +192,13 @@ fn row_of(row: &rusqlite::Row) -> rusqlite::Result<Row> {
 /// so they cannot carry a per-project answer; a project that switched a skill off still keeps
 /// it out of its own checkout, which is where a provider looks first.
 fn enabled_anywhere(conn: &Connection) -> Result<Vec<Row>> {
+    let dirs = folder_names(conn)?;
     let mut stmt = conn.prepare_cached(
         "SELECT s.id,s.name,s.body,s.updated_at,COALESCE(s.revision,'') FROM skills s
          WHERE s.deleted_at IS NULL AND EXISTS(SELECT 1 FROM skill_projects sp WHERE sp.skill_id=s.id)
          ORDER BY s.name COLLATE NOCASE,s.id",
     )?;
-    let rows = stmt.query_map([], row_of)?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let rows = stmt.query_map([], |row| row_of(row, &dirs))?.collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(with_plugins(rows, &crate::plugins::enabled_anywhere(conn)?))
 }
 
@@ -200,8 +230,8 @@ pub fn user_bases(instance: crate::Instance) -> Vec<PathBuf> {
 /// happen without it: skill folders are megabytes, and the store mutex is not where megabytes
 /// belong (D144).
 pub struct Plan {
-    /// Directories that hold one folder per skill.
-    bases: Vec<PathBuf>,
+    /// Directories that hold one folder per skill, each with whether plugin skills go there.
+    bases: Vec<(PathBuf, bool)>,
     /// The checkout those folders sit in, when they do: its `git status` has to stay clean.
     repo: Option<PathBuf>,
     rows: Vec<Row>,
@@ -210,15 +240,20 @@ pub struct Plan {
 /// Read the skills enabled for `project_id` into a plan for the checkout at `root`.
 pub fn plan(conn: &Connection, root: &Path, project_id: Id) -> Result<Plan> {
     Ok(Plan {
-        bases: TARGETS.iter().map(|target| root.join(target)).collect(),
+        bases: TARGETS.iter().map(|target| (root.join(target), true)).collect(),
         repo: Some(root.to_path_buf()),
         rows: enabled(conn, project_id)?,
     })
 }
 
 /// Read every enabled skill into a plan for the machine-wide provider folders.
+///
+/// A plugin is on for some projects only (D159), so its skills stay out of Claude's user scope:
+/// Claude reads each checkout's `.claude/skills`, where the projects that have the plugin on
+/// already carry them. Codex reads skills from its home alone, so a plugin on anywhere is
+/// registered there for every Codex session on the machine — the one place it reaches further.
 pub fn plan_user(conn: &Connection, instance: crate::Instance) -> Result<Plan> {
-    let bases = user_bases(instance);
+    let bases: Vec<(PathBuf, bool)> = user_bases(instance).into_iter().zip([false, true]).collect();
     let rows = if bases.is_empty() { Vec::new() } else { enabled_anywhere(conn)? };
     Ok(Plan { bases, repo: None, rows })
 }
@@ -228,12 +263,14 @@ pub fn plan_user(conn: &Connection, instance: crate::Instance) -> Result<Plan> {
 /// `git status`. Best-effort per skill — one unwritable folder never costs the caller its
 /// session.
 pub fn apply(plan: &Plan, store: &crate::Store) -> Result<()> {
+    let owner = owner_line(store);
     let mut written: Vec<String> = Vec::new();
-    for base in &plan.bases {
-        prune(base, &plan.rows);
-        for row in &plan.rows {
+    for (base, plugins) in &plan.bases {
+        let rows: Vec<&Row> = plan.rows.iter().filter(|row| *plugins || !matches!(row.source, Source::Plugin(_))).collect();
+        prune(base, &rows, &owner);
+        for row in rows {
             let dest = base.join(&row.dir);
-            match write_skill(store, row, &dest) {
+            match write_skill(store, row, &dest, &owner) {
                 Ok(true) => {
                     if let Some(relative) = plan.repo.as_ref().and_then(|repo| dest.strip_prefix(repo).ok()) {
                         written.push(format!("{}/", relative.display()));
@@ -262,9 +299,30 @@ pub fn materialize_user(conn: &Connection, store: &crate::Store, instance: crate
     apply(&plan_user(conn, instance)?, store)
 }
 
+/// Serializes [`refresh_all`] for one engine and folds a burst of requests into one pass.
+/// Every skill or plugin change asks for a refresh on a thread of its own; unserialized, a pass
+/// that planned before the latest change could finish after the pass that saw it, and leave
+/// the folders describing the older state.
+#[derive(Default)]
+pub struct Refresher {
+    /// Passes asked for so far.
+    requested: AtomicU64,
+    /// The request count when the latest pass started planning: every request up to it is
+    /// committed state that pass read.
+    planned: Mutex<u64>,
+}
+
 /// Push every enabled skill into every project root and every session worktree that still
 /// exists. This is what makes a skill installed today show up in workspaces created yesterday.
+/// Passes run one at a time, and a request a later-starting pass already covers is skipped.
 pub fn refresh_all(engine: &crate::engine::Engine) {
+    let refresher = &engine.skill_refresh;
+    let ticket = refresher.requested.fetch_add(1, Ordering::SeqCst) + 1;
+    let mut planned = refresher.planned.lock().unwrap_or_else(PoisonError::into_inner);
+    if *planned >= ticket {
+        return;
+    }
+    *planned = refresher.requested.load(Ordering::SeqCst);
     let plans = {
         let conn = engine.store.lock();
         let mut roots: Vec<(Id, PathBuf)> = Vec::new();
@@ -304,25 +362,40 @@ pub fn refresh_all(engine: &crate::engine::Engine) {
     }
 }
 
+/// The first line of every marker this store writes. Two instances (dev and stable) share the
+/// machine-wide folders and often the same checkouts; each prunes only what it wrote.
+fn owner_line(store: &crate::Store) -> String {
+    format!("owner {}\n", store.skills_dir().display())
+}
+
+/// Whether a folder's marker says this store wrote it. A marker from before owners were
+/// recorded counts as anyone's, which is how every store treated it then.
+fn owned(marker: &Path, owner: &str) -> bool {
+    fs::read_to_string(marker).is_ok_and(|text| !text.starts_with("owner ") || text.starts_with(owner))
+}
+
 /// Returns whether the folder is Relay's to write (a checked-in skill of the same name wins).
-fn write_skill(store: &crate::Store, row: &Row, dest: &Path) -> Result<bool> {
+/// A folder another store wrote is rewritten when this one has a skill there too, and from
+/// then on it is this store's to prune.
+fn write_skill(store: &crate::Store, row: &Row, dest: &Path, owner: &str) -> Result<bool> {
     let marker = dest.join(MARKER);
     if dest.exists() && !marker.is_file() {
         return Ok(false);
     }
-    if fs::read_to_string(&marker).is_ok_and(|stamp| stamp == row.stamp) {
+    let stamp = format!("{owner}{}", row.stamp);
+    if fs::read_to_string(&marker).is_ok_and(|current| current == stamp) {
         return Ok(true);
     }
     // A half-written folder must not survive: without its marker the next pass would read it
     // as a folder the repository owns and never touch it again.
-    if let Err(error) = fill(store, row, dest) {
+    if let Err(error) = fill(store, row, dest, &stamp) {
         let _ = fs::remove_dir_all(dest);
         return Err(error);
     }
     Ok(true)
 }
 
-fn fill(store: &crate::Store, row: &Row, dest: &Path) -> Result<()> {
+fn fill(store: &crate::Store, row: &Row, dest: &Path, stamp: &str) -> Result<()> {
     let _ = fs::remove_dir_all(dest);
     match &row.source {
         Source::Library(id) if library_dir(store, *id).is_dir() => copy_bounded(&library_dir(store, *id), dest)?,
@@ -337,23 +410,22 @@ fn fill(store: &crate::Store, row: &Row, dest: &Path) -> Result<()> {
             }
         }
     }
+    // The stored body is the instructions, whatever the library folder holds: it starts as the
+    // downloaded SKILL.md, and `skill.update` edits only the body.
     let instructions = dest.join("SKILL.md");
-    if !instructions.is_file() {
-        fs::write(&instructions, &row.body)
-            .with_context(|| format!("writing {}", instructions.display()))?;
-    }
+    fs::write(&instructions, &row.body).with_context(|| format!("writing {}", instructions.display()))?;
     let marker = dest.join(MARKER);
-    fs::write(&marker, &row.stamp).with_context(|| format!("writing {}", marker.display()))
+    fs::write(&marker, stamp).with_context(|| format!("writing {}", marker.display()))
 }
 
-/// Remove skill folders Relay owns that no longer correspond to an enabled skill.
-fn prune(base: &Path, rows: &[Row]) {
+/// Remove skill folders this store wrote that no longer correspond to an enabled skill.
+fn prune(base: &Path, rows: &[&Row], owner: &str) {
     let Ok(entries) = fs::read_dir(base) else { return };
     for entry in entries.flatten() {
         let path = entry.path();
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if !path.join(MARKER).is_file() || rows.iter().any(|row| row.dir == name) {
+        if !owned(&path.join(MARKER), owner) || rows.iter().any(|row| row.dir == name) {
             continue;
         }
         let _ = fs::remove_dir_all(&path);
@@ -417,6 +489,102 @@ mod tests {
             "pruning reached a skill the user wrote themselves",
         );
         unsafe { std::env::remove_var("RELAY_SKILLS_HOME") };
+    }
+
+    /// One project with the given skills enabled, in a store of its own (a memory store's
+    /// library is shared by the whole process). The checkout root is `<dir>/checkout`.
+    fn store_with(skills: &[&str]) -> (crate::Store, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::Store::open(&dir.path().join("store/store.db"), false).unwrap();
+        store.with_tx(|tx| {
+            tx.execute("INSERT INTO workspaces(path,name,ord,created_at,updated_at) VALUES ('/w','w',0,'t','t')", [])?;
+            tx.execute("INSERT INTO projects(workspace_id,path,name,base_branch,ord,created_at,updated_at) VALUES (1,'/w/p','p','main',0,'t','t')", [])?;
+            for name in skills {
+                tx.execute("INSERT INTO skills(name,body,created_at,updated_at) VALUES (?1,?2,'t','t')", rusqlite::params![name, format!("body of {name}")])?;
+                tx.execute("INSERT INTO skill_projects(skill_id,project_id) VALUES (last_insert_rowid(),1)", [])?;
+            }
+            Ok(())
+        }).unwrap();
+        (store, dir)
+    }
+
+    fn apply_project(store: &crate::Store, dir: &Path) {
+        let mut plan = plan(&store.lock(), &dir.join("checkout"), 1).unwrap();
+        plan.repo = None;
+        apply(&plan, store).unwrap();
+    }
+
+    #[test]
+    fn names_that_reduce_to_one_folder_get_a_folder_each() {
+        let (store, root) = store_with(&["Review: carefully", "review carefully"]);
+        let dirs = folder_names(&store.lock()).unwrap();
+        assert_eq!(dirs[&1], "review-carefully", "the older skill keeps the plain name");
+        assert_eq!(dirs[&2], "review-carefully-2");
+        apply_project(&store, root.path());
+        let base = root.path().join("checkout/.claude/skills");
+        assert_eq!(fs::read_to_string(base.join("review-carefully/SKILL.md")).unwrap(), "body of Review: carefully");
+        assert_eq!(fs::read_to_string(base.join("review-carefully-2/SKILL.md")).unwrap(), "body of review carefully");
+        // A second pass finds both folders current instead of each rewriting the other.
+        let stamp = fs::read_to_string(base.join("review-carefully").join(MARKER)).unwrap();
+        fs::write(base.join("review-carefully/extra.md"), "kept").unwrap();
+        apply_project(&store, root.path());
+        assert!(base.join("review-carefully/extra.md").is_file(), "an unchanged skill was rewritten");
+        assert_eq!(fs::read_to_string(base.join("review-carefully").join(MARKER)).unwrap(), stamp);
+    }
+
+    #[test]
+    fn the_stored_body_wins_over_the_library_skill_md() {
+        let (store, root) = store_with(&["Polish"]);
+        let library = library_dir(&store, 1);
+        fs::create_dir_all(library.join("reference")).unwrap();
+        fs::write(library.join("SKILL.md"), "as downloaded").unwrap();
+        fs::write(library.join("reference/notes.md"), "notes").unwrap();
+        // `skill.update` edits only the row.
+        store.with_tx(|tx| { tx.execute("UPDATE skills SET body='as edited',updated_at='t2'", [])?; Ok(()) }).unwrap();
+        apply_project(&store, root.path());
+        let folder = root.path().join("checkout/.agents/skills/polish");
+        assert_eq!(fs::read_to_string(folder.join("SKILL.md")).unwrap(), "as edited");
+        assert_eq!(fs::read_to_string(folder.join("reference/notes.md")).unwrap(), "notes");
+    }
+
+    #[test]
+    fn a_store_prunes_only_the_folders_it_wrote() {
+        let (store, root) = store_with(&[]);
+        let base = root.path().join("checkout/.claude/skills");
+        for (name, marker) in [
+            ("other-instance", "owner /somewhere/else/skills\n1 t \n".to_string()),
+            ("before-owners", "1 t \n".to_string()),
+            ("mine", format!("{}1 t \n", owner_line(&store))),
+        ] {
+            fs::create_dir_all(base.join(name)).unwrap();
+            fs::write(base.join(name).join(MARKER), marker).unwrap();
+        }
+        apply_project(&store, root.path());
+        assert!(base.join("other-instance").is_dir(), "pruned a folder another Relay store wrote");
+        assert!(!base.join("before-owners").exists());
+        assert!(!base.join("mine").exists());
+    }
+
+    #[test]
+    fn plugin_skills_stay_out_of_claude_user_scope() {
+        let store = crate::Store::open_memory().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let (claude, codex) = (home.path().join("claude"), home.path().join("codex"));
+        let row = |dir: &str, source| Row { dir: dir.into(), body: dir.into(), stamp: format!("{dir}\n"), source };
+        let plan = Plan {
+            bases: vec![(claude.clone(), false), (codex.clone(), true)],
+            repo: None,
+            rows: vec![row("installed", Source::Library(999_999)), row("from-plugin", Source::Plugin(vec![("SKILL.md", b"from-plugin".as_slice())]))],
+        };
+        apply(&plan, &store).unwrap();
+        assert!(claude.join("installed/SKILL.md").is_file());
+        assert!(!claude.join("from-plugin").exists(), "a per-project plugin reached every Claude session");
+        assert!(codex.join("from-plugin/SKILL.md").is_file());
+        // One written by an earlier engine, before plugins were kept out, is taken back out.
+        fs::create_dir_all(claude.join("from-plugin")).unwrap();
+        fs::write(claude.join("from-plugin").join(MARKER), format!("{}x\n", owner_line(&store))).unwrap();
+        apply(&plan, &store).unwrap();
+        assert!(!claude.join("from-plugin").exists());
     }
 
     #[test]

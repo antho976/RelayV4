@@ -1,6 +1,6 @@
 //! `workspace.*` / `project.*` (BUS.md §10.4). All mutations user-only (registry).
 
-use crate::engine::{Ctx, Engine, IntoBus};
+use crate::engine::{Ctx, Engine, IntoBus, Prepared, Unlocked};
 use relay_bus::error::BusError;
 use relay_bus::ops::workspace::*;
 use relay_bus::types::{Id, Project, Workspace};
@@ -109,15 +109,17 @@ pub fn register(e: &mut Engine) {
         }
         let name = p.name.unwrap_or_else(|| name_of(&path));
         let ord: i64 = ctx.tx().query_row("SELECT COALESCE(MAX(ord), -1) + 1 FROM workspaces", [], |r| r.get(0)).bus()?;
+        let id = next_id(ctx.tx(), NEXT_WORKSPACE_ID, "ids.workspaces")?;
         ctx.tx().execute(
-            "INSERT INTO workspaces(path, name, ord, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)",
-            params![path_s, name, ord, ctx.now],
+            "INSERT INTO workspaces(id, path, name, ord, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            params![id, path_s, name, ord, ctx.now],
         ).bus()?;
-        let ws = get_workspace(ctx.tx(), ctx.tx().last_insert_rowid())?;
+        let ws = get_workspace(ctx.tx(), id)?;
         ctx.emit("workspace.changed", serde_json::to_value(&ws).bus()?);
         Ok(ws)
     });
-    e.register::<WsDiscover>(|_, p| {
+    // A tree walk up to four levels deep that never touches the store (D149).
+    e.register_unlocked::<WsDiscover>(|_, p| {
         let path = if p.path.as_deref().is_none_or(|path| path.trim().is_empty()) {
             suggested_workspace()?
         } else {
@@ -153,36 +155,34 @@ pub fn register(e: &mut Engine) {
         ctx.emit("workspace.changed", serde_json::to_value(&ws).bus()?);
         Ok(ws)
     });
-    e.register::<WsRemove>(|ctx: &mut Ctx, p| {
-        get_workspace(ctx.tx(), p.workspace_id)?;
-        let projects: Vec<Id> = {
-            let mut stmt = ctx.tx().prepare_cached("SELECT id FROM projects WHERE workspace_id = ?1 ORDER BY id").bus()?;
-            let rows = stmt.query_map([p.workspace_id], |r| r.get(0)).bus()?.collect::<rusqlite::Result<Vec<_>>>();
-            rows.bus()?
-        };
-        let n = projects.len();
-        if n > 0 && !p.force.unwrap_or(false) {
-            return Err(BusError::conflict("workspace.has_projects", format!("workspace {} still has {n} project(s)", p.workspace_id))
-                .with_details(json!({ "projects": n }))
-                .with_hint("remove its projects first (project.remove), or pass force to remove them with it"));
-        }
-        // Refuse before closing anything: one project mid-integration must not leave the rest
-        // half-removed. Each project.remove below repeats the check for itself.
+    // Closing an agent undoes its hooks (git subprocesses, file writes): that half of every
+    // close runs here, before the transaction, as does the store backup (RA-194, RA-195).
+    e.register_staged::<WsRemove, WorkspaceRemoval>(|ctx, p| {
+        let force = p.force.unwrap_or(false);
+        let projects = ctx.read(|conn| workspace_scope(conn, p.workspace_id, force))?;
+        let backup = if projects.is_empty() { None } else { backup_before(ctx, "workspace-remove")? };
+        let mut closes = Vec::new();
         for &id in &projects {
-            if integrations_live(ctx.tx(), id)? > 0 {
-                return Err(BusError::conflict("project.activity_live", format!("project {id} has an integration in progress"))
-                    .with_hint("wait for the integration to finish, then remove the workspace"));
-            }
+            let (_, open, _) = ctx.read(|conn| removal_scope(conn, id, true))?;
+            closes.push((id, prepare_closes(ctx, &open)?));
         }
+        Ok(WorkspaceRemoval { closes, backup })
+    }, |ctx: &mut Ctx, p, staged| {
+        let WorkspaceRemoval { mut closes, backup } = staged;
+        let projects = workspace_scope(ctx.tx(), p.workspace_id, p.force.unwrap_or(false))?;
+        let n = projects.len();
         let mut sessions_closed = 0;
-        for id in &projects {
-            let out = ctx.invoke_registered("project.remove", json!({
-                "project_id": id, "force": true, "remove_worktrees": p.remove_worktrees.unwrap_or(false),
-            }))?;
-            sessions_closed += out["sessions_closed"].as_i64().unwrap_or(0);
+        for id in projects {
+            let prepared = closes.iter().position(|(project, _)| *project == id).map(|i| closes.swap_remove(i).1).unwrap_or_default();
+            let out = remove_project(ctx, id, true, p.remove_worktrees.unwrap_or(false), prepared, None)?;
+            sessions_closed += out.sessions_closed;
         }
+        // The workspace's own guardrail layer goes with it, or the next workspace given this
+        // id would inherit it.
+        ctx.tx().execute("DELETE FROM settings WHERE path=?1 OR path LIKE ?2",
+            params![format!("guardrails.workspaces.{}", p.workspace_id), format!("guardrails.workspaces.{}.%", p.workspace_id)]).bus()?;
         ctx.tx().execute("DELETE FROM workspaces WHERE id = ?1", [p.workspace_id]).bus()?;
-        ctx.emit("workspace.deleted", json!({ "id": p.workspace_id }));
+        ctx.emit("workspace.deleted", json!({ "id": p.workspace_id, "backup": backup }));
         Ok(WsRemoveOut { projects_removed: n as i64, sessions_closed })
     });
 
@@ -204,11 +204,12 @@ pub fn register(e: &mut Engine) {
         let name = p.name.unwrap_or_else(|| name_of(&path));
         let ord: i64 = ctx.tx().query_row("SELECT COALESCE(MAX(ord), -1) + 1 FROM projects WHERE workspace_id = ?1", [ws.id], |r| r.get(0)).bus()?;
         let base = detect_default_branch(&path);
+        let id = next_id(ctx.tx(), NEXT_PROJECT_ID, "ids.projects")?;
         ctx.tx().execute(
-            "INSERT INTO projects(workspace_id, path, name, base_branch, ord, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
-            params![ws.id, path_s, name, base, ord, ctx.now],
+            "INSERT INTO projects(id, workspace_id, path, name, base_branch, ord, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+            params![id, ws.id, path_s, name, base, ord, ctx.now],
         ).bus()?;
-        let pr = get_project(ctx.tx(), ctx.tx().last_insert_rowid())?;
+        let pr = get_project(ctx.tx(), id)?;
         // Skills are app-wide (D147): a project added today starts with every installed skill
         // enabled, and gets the folders as soon as the transaction commits.
         ctx.tx().execute(
@@ -329,119 +330,230 @@ pub fn register(e: &mut Engine) {
         ctx.emit("project.changed", serde_json::to_value(&pr).bus()?);
         Ok(pr)
     });
-    e.register::<ProjectRemove>(|ctx: &mut Ctx, p| {
-        let pr = get_project(ctx.tx(), p.project_id)?;
-        let force = p.force.unwrap_or(false);
-        let open: Vec<(String, String)> = {
+    // As `workspace.remove`: hook teardown and the store backup before the transaction opens.
+    e.register_staged::<ProjectRemove, ProjectRemoval>(|ctx, p| {
+        let (_, open, _) = ctx.read(|conn| removal_scope(conn, p.project_id, p.force.unwrap_or(false)))?;
+        let backup = backup_before(ctx, "project-remove")?;
+        Ok(ProjectRemoval { closes: prepare_closes(ctx, &open)?, backup })
+    }, |ctx: &mut Ctx, p, staged| {
+        remove_project(ctx, p.project_id, p.force.unwrap_or(false), p.remove_worktrees.unwrap_or(false), staged.closes, staged.backup)
+    });
+}
+
+/// What `project.remove`'s unlocked half settled: each open session's `session.close`
+/// prepared (its hooks already undone), and the store backup taken first.
+struct ProjectRemoval {
+    closes: Vec<(String, Prepared)>,
+    backup: Option<String>,
+}
+
+/// The same for each project of a removed workspace, and one backup for all of them.
+struct WorkspaceRemoval {
+    closes: Vec<(Id, Vec<(String, Prepared)>)>,
+    backup: Option<String>,
+}
+
+/// The projects `workspace.remove` would remove, or its refusal. Read in both phases.
+fn workspace_scope(conn: &Connection, workspace_id: Id, force: bool) -> Result<Vec<Id>, BusError> {
+    get_workspace(conn, workspace_id)?;
+    let projects: Vec<Id> = {
+        let mut stmt = conn.prepare_cached("SELECT id FROM projects WHERE workspace_id = ?1 ORDER BY id").bus()?;
+        let rows = stmt.query_map([workspace_id], |r| r.get(0)).bus()?.collect::<rusqlite::Result<Vec<_>>>();
+        rows.bus()?
+    };
+    let n = projects.len();
+    if n > 0 && !force {
+        return Err(BusError::conflict("workspace.has_projects", format!("workspace {workspace_id} still has {n} project(s)"))
+            .with_details(json!({ "projects": n }))
+            .with_hint("remove its projects first (project.remove), or pass force to remove them with it"));
+    }
+    // Refuse before closing anything: one project mid-integration must not leave the rest
+    // half-removed. Each project removal repeats the check for itself.
+    for &id in &projects {
+        if integrations_live(conn, id)? > 0 {
+            return Err(BusError::conflict("project.activity_live", format!("project {id} has an integration in progress"))
+                .with_hint("wait for the integration to finish, then remove the workspace"));
+        }
+    }
+    Ok(projects)
+}
+
+/// The project `project.remove` would remove, its open sessions (name, worktree) and its live
+/// device runs, or its refusal. Read in both phases.
+#[allow(clippy::type_complexity)]
+fn removal_scope(conn: &Connection, project_id: Id, force: bool) -> Result<(Project, Vec<(String, String)>, Vec<Id>), BusError> {
+    let pr = get_project(conn, project_id)?;
+    let open: Vec<(String, String)> = {
+        let mut stmt = conn.prepare_cached(
+            "SELECT name, worktree FROM sessions WHERE project_id=?1 AND state!='closed' ORDER BY id",
+        ).bus()?;
+        let rows = stmt.query_map([pr.id], |r| Ok((r.get(0)?, r.get(1)?))).bus()?.collect::<rusqlite::Result<Vec<_>>>();
+        rows.bus()?
+    };
+    if !open.is_empty() && !force {
+        return Err(BusError::conflict("project.sessions_live", format!("project {} still has {} open session(s)", pr.id, open.len()))
+            .with_details(json!({ "open_sessions": open.len() }))
+            .with_hint("close its sessions before removing the project, or pass force to close them with it"));
+    }
+    // An integration may be mid-merge in the primary checkout; never interrupt it, force or not.
+    if integrations_live(conn, pr.id)? > 0 {
+        return Err(BusError::conflict("project.activity_live", "project still has an integration in progress")
+            .with_hint("wait for the integration to finish before removing the project"));
+    }
+    let live_runs: Vec<Id> = {
+        let mut stmt = conn.prepare_cached(
+            "SELECT id FROM device_runs WHERE project_id=?1 AND state IN ('building','running') ORDER BY id",
+        ).bus()?;
+        let rows = stmt.query_map([pr.id], |r| r.get(0)).bus()?.collect::<rusqlite::Result<Vec<_>>>();
+        rows.bus()?
+    };
+    if !live_runs.is_empty() && !force {
+        return Err(BusError::conflict("project.activity_live", "project still has an active device run")
+            .with_details(json!({ "active_runs": live_runs.len() }))
+            .with_hint("stop active runs before removing the project, or pass force to stop them with it"));
+    }
+    Ok((pr, open, live_runs))
+}
+
+fn close_payload(name: &str) -> serde_json::Value {
+    json!({ "session": name, "remove_worktree": false })
+}
+
+/// Run the unlocked half of each `session.close` a removal will make. The last session on a
+/// shared checkout (a PAIR, a review group) is left to the transaction: only once its partners
+/// are closed in there does it see that nobody is left and undo the checkout's hooks.
+fn prepare_closes(ctx: &Unlocked, open: &[(String, String)]) -> Result<Vec<(String, Prepared)>, BusError> {
+    let mut closes = Vec::new();
+    for (i, (name, worktree)) in open.iter().enumerate() {
+        if open[i + 1..].iter().any(|(_, other)| other == worktree) || open.iter().filter(|(_, other)| other == worktree).count() == 1 {
+            if let Some(prepared) = ctx.prepare_registered("session.close", &close_payload(name), ctx.actor.clone(), ctx.actor_session_id())? {
+                closes.push((name.clone(), prepared));
+            }
+        }
+    }
+    Ok(closes)
+}
+
+/// A copy of the store, taken before a removal deletes a project's board, notes and modules
+/// for good; `app.backup.list` lists it. Its path rides on the `*.deleted` event.
+fn backup_before(ctx: &Unlocked, reason: &str) -> Result<Option<String>, BusError> {
+    let store = &ctx.engine().store;
+    if store.path() == Path::new(":memory:") {
+        return Ok(None);
+    }
+    ctx.read(|conn| {
+        store.backup_with(conn, reason).map(|path| Some(path.display().to_string())).map_err(|error| {
+            BusError::unavailable("project.backup_failed", format!("backing up the store before the removal: {error}"))
+                .with_hint("nothing was removed; free space for the store's backups/ directory and try again")
+        })
+    })
+}
+
+/// `project.remove`'s transaction, also run once per project by `workspace.remove`.
+fn remove_project(ctx: &mut Ctx, project_id: Id, force: bool, remove_worktrees: bool, mut closes: Vec<(String, Prepared)>, backup: Option<String>) -> Result<ProjectRemoveOut, BusError> {
+    let (pr, open, live_runs) = removal_scope(ctx.tx(), project_id, force)?;
+    // `force` closes through `session.close` itself, so every teardown rule holds: scrollback
+    // saved, claims released, holds expired, hooks uninstalled. Each close keeps its worktree,
+    // which also defers the agent's kill until the store unlocks; deleting checkouts (build
+    // purge, `git worktree remove`) is seconds of disk work per agent, so `remove_worktrees`
+    // queues it for after the commit too, behind those kills, instead of holding the bus
+    // through all of it (BUS.md §5.1). A checkout shared by a PAIR or review group is in
+    // `open` once per session but removed once, after all of them have closed. A session that
+    // opened after the unlocked half ran has nothing prepared and closes the old way, here.
+    for (name, _) in &open {
+        let prepared = closes.iter().position(|(n, _)| n == name).map(|i| closes.swap_remove(i).1);
+        ctx.invoke_prepared("session.close", close_payload(name), prepared)?;
+    }
+    if remove_worktrees {
+        let repo = PathBuf::from(&pr.path);
+        let pool = crate::worktree::pool_dir(&repo);
+        let mut doomed: Vec<PathBuf> = open.iter().map(|(_, wt)| PathBuf::from(wt)).filter(|wt| wt.starts_with(&pool)).collect();
+        doomed.sort();
+        doomed.dedup();
+        // Integration checkouts and their branches go too: once the rows below are deleted,
+        // nothing else could ever find them again.
+        let integrations: Vec<(Id, String)> = {
             let mut stmt = ctx.tx().prepare_cached(
-                "SELECT name, worktree FROM sessions WHERE project_id=?1 AND state!='closed' ORDER BY id",
+                "SELECT id, worktree FROM integrations WHERE project_id=?1 AND worktree IS NOT NULL AND state!='discarded'",
             ).bus()?;
             let rows = stmt.query_map([pr.id], |r| Ok((r.get(0)?, r.get(1)?))).bus()?.collect::<rusqlite::Result<Vec<_>>>();
             rows.bus()?
         };
-        if !open.is_empty() && !force {
-            return Err(BusError::conflict("project.sessions_live", format!("project {} still has {} open session(s)", pr.id, open.len()))
-                .with_details(json!({ "open_sessions": open.len() }))
-                .with_hint("close its sessions before removing the project, or pass force to close them with it"));
-        }
-        // An integration may be mid-merge in the primary checkout; never interrupt it, force or not.
-        if integrations_live(ctx.tx(), pr.id)? > 0 {
-            return Err(BusError::conflict("project.activity_live", "project still has an integration in progress")
-                .with_hint("wait for the integration to finish before removing the project"));
-        }
-        let live_runs: Vec<Id> = {
-            let mut stmt = ctx.tx().prepare_cached(
-                "SELECT id FROM device_runs WHERE project_id=?1 AND state IN ('building','running') ORDER BY id",
-            ).bus()?;
-            let rows = stmt.query_map([pr.id], |r| r.get(0)).bus()?.collect::<rusqlite::Result<Vec<_>>>();
-            rows.bus()?
-        };
-        if !live_runs.is_empty() && !force {
-            return Err(BusError::conflict("project.activity_live", "project still has an active device run")
-                .with_details(json!({ "active_runs": live_runs.len() }))
-                .with_hint("stop active runs before removing the project, or pass force to stop them with it"));
-        }
-        // `force` closes through `session.close` itself, so every teardown rule holds: scrollback
-        // saved, claims released, holds expired, hooks uninstalled. Each close keeps its worktree,
-        // which also defers the agent's kill until the store unlocks; deleting checkouts (build
-        // purge, `git worktree remove`) is seconds of disk work per agent, so `remove_worktrees`
-        // queues it for after the commit too, behind those kills, instead of holding the bus
-        // through all of it (BUS.md §5.1). A checkout shared by a PAIR or review group is in
-        // `open` once per session but removed once, after all of them have closed.
-        for (name, _) in &open {
-            ctx.invoke_registered("session.close", json!({ "session": name, "remove_worktree": false }))?;
-        }
-        if p.remove_worktrees.unwrap_or(false) {
-            let repo = PathBuf::from(&pr.path);
-            let pool = crate::worktree::pool_dir(&repo);
-            let mut doomed: Vec<PathBuf> = open.iter().map(|(_, wt)| PathBuf::from(wt)).filter(|wt| wt.starts_with(&pool)).collect();
-            doomed.sort();
-            doomed.dedup();
-            // Integration checkouts and their branches go too: once the rows below are deleted,
-            // nothing else could ever find them again.
-            let integrations: Vec<(Id, String)> = {
-                let mut stmt = ctx.tx().prepare_cached(
-                    "SELECT id, worktree FROM integrations WHERE project_id=?1 AND worktree IS NOT NULL AND state!='discarded'",
-                ).bus()?;
-                let rows = stmt.query_map([pr.id], |r| Ok((r.get(0)?, r.get(1)?))).bus()?.collect::<rusqlite::Result<Vec<_>>>();
-                rows.bus()?
-            };
-            if !doomed.is_empty() || !integrations.is_empty() {
-                let project_id = pr.id;
-                ctx.after_commit(move |engine| {
-                    for wt in &doomed {
-                        if let Err(error) = crate::worktree::remove(&repo, wt, true) {
-                            tracing::warn!(worktree = %wt.display(), %error, "removing a removed project's worktree");
-                        }
+        if !doomed.is_empty() || !integrations.is_empty() {
+            let project_id = pr.id;
+            ctx.after_commit(move |engine| {
+                for wt in &doomed {
+                    if let Err(error) = crate::worktree::remove(&repo, wt, true) {
+                        tracing::warn!(worktree = %wt.display(), %error, "removing a removed project's worktree");
                     }
-                    for (id, wt) in &integrations {
-                        if let Err(error) = super::integration::remove_checkout(&repo, Path::new(wt), *id) {
-                            tracing::warn!(worktree = %wt, %error, "removing a removed project's integration");
-                        }
+                }
+                for (id, wt) in &integrations {
+                    if let Err(error) = super::integration::remove_checkout(&repo, Path::new(wt), *id) {
+                        tracing::warn!(worktree = %wt, %error, "removing a removed project's integration");
                     }
-                    engine.emit_system("worktree.changed", json!({ "project_id": project_id }));
-                });
-            }
+                }
+                engine.emit_system("worktree.changed", json!({ "project_id": project_id }));
+            });
         }
-        for run in &live_runs {
-            ctx.invoke_registered("device.run.stop", json!({ "run_id": run }))?;
-        }
+    }
+    for run in &live_runs {
+        ctx.invoke_registered("device.run.stop", json!({ "run_id": run }))?;
+    }
 
-        // `project.remove` forgets Relay metadata only. Audit rows deliberately remain as the
-        // immutable history, while every FK-owned row is removed in dependency order.
-        for sql in [
-            "DELETE FROM message_recipients WHERE message_id IN (SELECT id FROM messages WHERE project_id=?1)",
-            "DELETE FROM messages WHERE project_id=?1",
-            "DELETE FROM session_scrollback WHERE session_id IN (SELECT id FROM sessions WHERE project_id=?1)",
-            "DELETE FROM claims WHERE project_id=?1",
-            "DELETE FROM task_sessions WHERE session_id IN (SELECT id FROM sessions WHERE project_id=?1) OR task_id IN (SELECT id FROM tasks WHERE project_id=?1)",
-            "DELETE FROM sessions WHERE project_id=?1",
-            "DELETE FROM task_commits WHERE task_id IN (SELECT id FROM tasks WHERE project_id=?1)",
-            "DELETE FROM attachments WHERE task_id IN (SELECT id FROM tasks WHERE project_id=?1)",
-            "DELETE FROM module_unlinked_tasks WHERE module_id IN (SELECT id FROM modules WHERE project_id=?1) OR task_id IN (SELECT id FROM tasks WHERE project_id=?1)",
-            "DELETE FROM tasks WHERE project_id=?1",
-            // `task_labels` cascades with the tasks; the vocabulary itself is project-owned.
-            "DELETE FROM labels WHERE project_id=?1",
-            "DELETE FROM modules WHERE project_id=?1",
-            "DELETE FROM notes WHERE project_id=?1",
-            "DELETE FROM notifications WHERE project_id=?1",
-            "DELETE FROM overlaps WHERE project_id=?1",
-            "DELETE FROM file_trash WHERE project_id=?1",
-            "DELETE FROM integrations WHERE project_id=?1",
-            "DELETE FROM ui_layouts WHERE project_id=?1",
-            "DELETE FROM device_runs WHERE project_id=?1",
-            "DELETE FROM skill_projects WHERE project_id=?1",
-            "DELETE FROM plugin_projects WHERE project_id=?1",
-        ] {
-            ctx.tx().execute(sql, [pr.id]).bus()?;
-        }
-        ctx.tx().execute("DELETE FROM settings WHERE path=?1 OR path LIKE ?2",
-            params![format!("layout.current.{}", pr.id), format!("guardrails.projects.{}.%", pr.id)]).bus()?;
-        ctx.tx().execute("DELETE FROM projects WHERE id = ?1", [pr.id]).bus()?;
-        ctx.set_project(pr.id);
-        ctx.emit("project.deleted", json!({ "id": pr.id }));
-        Ok(ProjectRemoveOut { sessions_closed: open.len() as i64, runs_stopped: live_runs.len() as i64 })
-    });
+    // `project.remove` forgets Relay metadata only. Audit rows deliberately remain as the
+    // immutable history, while every FK-owned row is removed in dependency order.
+    for sql in [
+        "DELETE FROM message_recipients WHERE message_id IN (SELECT id FROM messages WHERE project_id=?1)",
+        "DELETE FROM messages WHERE project_id=?1",
+        "DELETE FROM session_scrollback WHERE session_id IN (SELECT id FROM sessions WHERE project_id=?1)",
+        "DELETE FROM claims WHERE project_id=?1",
+        "DELETE FROM task_sessions WHERE session_id IN (SELECT id FROM sessions WHERE project_id=?1) OR task_id IN (SELECT id FROM tasks WHERE project_id=?1)",
+        "DELETE FROM sessions WHERE project_id=?1",
+        "DELETE FROM task_commits WHERE task_id IN (SELECT id FROM tasks WHERE project_id=?1)",
+        "DELETE FROM attachments WHERE task_id IN (SELECT id FROM tasks WHERE project_id=?1)",
+        "DELETE FROM module_unlinked_tasks WHERE module_id IN (SELECT id FROM modules WHERE project_id=?1) OR task_id IN (SELECT id FROM tasks WHERE project_id=?1)",
+        "DELETE FROM tasks WHERE project_id=?1",
+        // `task_labels` cascades with the tasks; the vocabulary itself is project-owned.
+        "DELETE FROM labels WHERE project_id=?1",
+        "DELETE FROM modules WHERE project_id=?1",
+        "DELETE FROM notes WHERE project_id=?1",
+        "DELETE FROM notifications WHERE project_id=?1",
+        "DELETE FROM overlaps WHERE project_id=?1",
+        "DELETE FROM file_trash WHERE project_id=?1",
+        "DELETE FROM integrations WHERE project_id=?1",
+        "DELETE FROM ui_layouts WHERE project_id=?1",
+        "DELETE FROM device_runs WHERE project_id=?1",
+        "DELETE FROM skill_projects WHERE project_id=?1",
+        "DELETE FROM plugin_projects WHERE project_id=?1",
+    ] {
+        ctx.tx().execute(sql, [pr.id]).bus()?;
+    }
+    ctx.tx().execute("DELETE FROM settings WHERE path=?1 OR path=?2 OR path LIKE ?3",
+        params![format!("layout.current.{}", pr.id), format!("guardrails.projects.{}", pr.id), format!("guardrails.projects.{}.%", pr.id)]).bus()?;
+    // A hold no session owns (the user's) would otherwise wait on a project that is gone.
+    ctx.tx().execute("UPDATE holds SET state='expired', resolved_at=?1, resolved_by='system' WHERE project_id=?2 AND state='open'",
+        params![ctx.now, pr.id]).bus()?;
+    ctx.tx().execute("DELETE FROM projects WHERE id = ?1", [pr.id]).bus()?;
+    ctx.set_project(pr.id);
+    ctx.emit("project.deleted", json!({ "id": pr.id, "backup": backup }));
+    Ok(ProjectRemoveOut { sessions_closed: open.len() as i64, runs_stopped: live_runs.len() as i64 })
+}
+
+const NEXT_PROJECT_ID: &str = "SELECT MAX(COALESCE((SELECT MAX(id) FROM projects), 0), COALESCE((SELECT MAX(project_id) FROM audit), 0),
+    COALESCE((SELECT MAX(project_id) FROM holds), 0), COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'ids.projects'), 0)) + 1";
+const NEXT_WORKSPACE_ID: &str = "SELECT MAX(COALESCE((SELECT MAX(id) FROM workspaces), 0),
+    COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'ids.workspaces'), 0)) + 1";
+
+/// The id for a new workspace or project: past every one handed out before, never a removed
+/// one's. The tables predate AUTOINCREMENT, so SQLite gives the next row MAX(id)+1 and reuses
+/// the id of the newest one once it is removed; whatever still names that id — audit history,
+/// a hold, a client's remembered selection — then reads as the new project's. `meta` keeps the
+/// high-water mark from here on; the audit and holds cover projects removed before it existed.
+fn next_id(tx: &Connection, sql: &str, key: &str) -> Result<Id, BusError> {
+    let id: Id = tx.prepare_cached(sql).bus()?.query_row([], |r| r.get(0)).bus()?;
+    tx.prepare_cached("INSERT INTO meta(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value").bus()?
+        .execute(params![key, id.to_string()]).bus()?;
+    Ok(id)
 }
 
 fn integrations_live(tx: &Connection, project_id: Id) -> Result<i64, BusError> {

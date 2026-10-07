@@ -254,7 +254,12 @@ fn done_can_say_blocked_and_the_task_does_not_move() {
     assert_eq!(bootstrap["tasks"][0]["id"], 1, "current task leads the returned queue");
     assert_eq!(bootstrap["tasks"][1]["id"], second["id"]);
 
-    // A second report now applies to the promoted task, not the already reviewed one.
+    // A second report in the same turn is about the work already reported: the promoted task
+    // is only the agent's once that turn's Stop hands it over.
+    ok(&f.engine, f.me(), "session.done", json!({"status": "completed", "summary": "done, again"}));
+    assert_eq!(ok(&f.engine, Actor::User, "task.get", json!({"task_id": 1}))["column"], "active");
+    ok(&f.engine, f.me(), "session.report", json!({"session": f.my_name(), "kind": "stop"}));
+    // The next turn's report applies to the promoted task, not the already reviewed one.
     ok(&f.engine, f.me(), "session.done", json!({"status": "completed", "summary": "queue drained"}));
     assert_eq!(ok(&f.engine, Actor::User, "task.get", json!({"task_id": 1}))["column"], "in_review");
 }

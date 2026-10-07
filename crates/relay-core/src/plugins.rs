@@ -6,7 +6,9 @@
 //! on for a project stores one `plugin_projects` edge; from then on every agent launched in
 //! that project gets the plugin's skills as real provider skill folders (through the same
 //! materializer as installed skills), the plugin's instructions in its brief, and the plugin's
-//! MCP servers in its provider configuration. Nothing is written for a project that has it off.
+//! MCP servers in its provider configuration. Nothing is written for a project that has it off,
+//! with one exception: Codex reads skills only from `$CODEX_HOME/skills`, one folder for the
+//! whole machine, so a plugin on in any project registers its skills there (`skills::plan_user`).
 
 use anyhow::Result;
 use relay_bus::types::{Id, Plugin, PluginDoc, PluginMcpServer, PluginSkill};
@@ -190,7 +192,7 @@ pub fn enabled_for(conn: &Connection, project_id: Id) -> Result<Vec<&'static Loa
     Ok(enabled_ids(conn, project_id)?.iter().filter_map(|id| get(id)).collect())
 }
 
-/// Plugins on for at least one project — what the machine-wide skill folders carry.
+/// Plugins on for at least one project — what the machine-wide Codex skill folder carries.
 pub fn enabled_anywhere(conn: &Connection) -> Result<Vec<&'static Loaded>> {
     let mut stmt = conn.prepare_cached("SELECT DISTINCT plugin_id FROM plugin_projects ORDER BY plugin_id")?;
     let ids = stmt.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;

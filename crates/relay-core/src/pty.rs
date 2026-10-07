@@ -45,8 +45,8 @@ struct Ring {
     buf: VecDeque<u8>,
     /// Absolute byte offset of `buf[0]` since spawn.
     base: u64,
-    /// (seq, absolute offset where that frame starts), oldest first.
-    frames: VecDeque<(u64, u64)>,
+    /// (seq, absolute offset where that frame starts, the terminal state there), oldest first.
+    frames: VecDeque<(u64, u64, Mark)>,
 }
 
 impl Ring {
@@ -54,9 +54,9 @@ impl Ring {
     /// `drain`, never a per-element `pop_front` loop: a provider that writes 64 KiB at a time
     /// would otherwise pay 65 536 individual ring operations for every read once the byte ring
     /// is full, which is the whole cost of the terminal data plane at steady state.
-    fn push(&mut self, seq: u64, data: &[u8]) {
+    fn push(&mut self, seq: u64, data: &[u8], mark: Mark) {
         let start = self.base + self.buf.len() as u64;
-        self.frames.push_back((seq, start));
+        self.frames.push_back((seq, start, mark));
         if self.frames.len() > FRAME_INDEX {
             let excess = self.frames.len() - FRAME_INDEX;
             self.frames.drain(..excess);
@@ -87,18 +87,67 @@ impl Ring {
     /// The first frame boundary after `seq`, if we still know it. Both `seq` and the offsets
     /// increase with every push, so the index is sorted and a scan is never needed.
     fn offset_after(&self, seq: u64) -> Option<u64> {
-        let at = self.frames.partition_point(|(s, _)| *s <= seq);
-        self.frames.get(at).map(|(_, offset)| *offset)
+        let at = self.frames.partition_point(|(s, _, _)| *s <= seq);
+        self.frames.get(at).map(|(_, offset, _)| *offset)
     }
     fn end(&self) -> u64 {
         self.base + self.buf.len() as u64
     }
-    fn bounded_bytes_from(&self, from: u64) -> Vec<u8> {
+    /// Restored history goes in as many frames, each ending on a line, never as one. Catch-up
+    /// starts on a frame boundary, and a single multi-megabyte frame left it two choices: skip
+    /// the whole history once any live frame followed it, or cut into it mid escape sequence
+    /// when none had (RA-116). All of it stays seq 0, before anything this process prints.
+    /// The modes the old process left behind are switched off after it: the new one starts
+    /// on a fresh terminal, not inside its predecessor's alternate screen (RA-242).
+    fn push_history(&mut self, history: &[u8], term: &mut ModeTracker) {
+        const CHUNK: usize = 16 * 1024;
+        let mut rest = history;
+        while !rest.is_empty() {
+            let mut cut = rest.len().min(CHUNK);
+            if cut < rest.len() {
+                match rest[..cut].iter().rposition(|byte| *byte == b'\n') {
+                    Some(newline) => cut = newline + 1,
+                    // One line longer than a chunk: at least never split a character.
+                    None => while cut > 1 && rest[cut] & 0xC0 == 0x80 { cut -= 1; },
+                }
+            }
+            let mark = term.mark();
+            term.feed(&rest[..cut]);
+            self.push(0, &rest[..cut], mark);
+            rest = &rest[cut..];
+        }
+        let left = term.mark();
+        if left != Mark::default() {
+            // CAN abandons a sequence the old process was cut off in the middle of.
+            let mut reset = if left.clean { Vec::new() } else { vec![0x18] };
+            TermModes::default().write_screen(Some(left.modes), &mut reset);
+            TermModes::default().write_rest(Some(left.modes), &mut reset);
+            term.feed(&reset);
+            self.push(0, &reset, left);
+        }
+    }
+    /// At most [`ATTACH_CATCHUP_BYTES`] from `from`, starting on a frame boundary, and the
+    /// terminal state at that start when it is not `from`: the replay was cut short, the
+    /// subscriber never saw how the modes it starts in were set, and it needs them restored.
+    /// A cut start also skips a few frames forward to one that is not inside an escape sequence
+    /// or a character, so the replay never opens with the tail of one printed as text.
+    fn bounded_bytes_from(&self, from: u64) -> (Vec<u8>, Option<Mark>) {
         let earliest = self.end().saturating_sub(ATTACH_CATCHUP_BYTES as u64);
         let requested = from.max(earliest);
-        let at = self.frames.partition_point(|(_, offset)| *offset < requested);
-        let aligned = self.frames.get(at).map(|(_, offset)| *offset).unwrap_or(requested);
-        self.bytes_from(aligned)
+        let mut at = self.frames.partition_point(|(_, offset, _)| *offset < requested);
+        let Some(&(_, aligned, _)) = self.frames.get(at) else {
+            // No boundary at or after it: the request starts inside the last frame or at the end.
+            let cut = (requested > from).then(|| at.checked_sub(1).map_or_else(Mark::default, |i| self.frames[i].2));
+            return (self.bytes_from(requested), cut);
+        };
+        if aligned == from {
+            return (self.bytes_from(aligned), None);
+        }
+        if let Some(clean) = self.frames.range(at..).take(64).position(|(_, _, mark)| mark.clean) {
+            at += clean;
+        }
+        let (_, start, mark) = self.frames[at];
+        (self.bytes_from(start), Some(mark))
     }
     /// The bytes covering the last `lines` newline-terminated lines, so reading a short tail
     /// out of an 8 MiB ring costs the tail rather than the ring.
@@ -122,6 +171,203 @@ impl Ring {
         let start = start.unwrap_or(0);
         self.bytes_from(self.base + start as u64)
     }
+}
+
+/// The DEC private modes (DECSET/DECRST, `CSI ? n h|l`) a full-screen program sets once at
+/// start-up and a subscriber that joins later must be told about (RA-242). Bit set = mode on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TermModes(u16);
+
+const ALT_SCREEN: u16 = 1;
+/// Every tracked mode but the alternate screen: (mode number, bit). The mouse tracking modes
+/// ascend, so a terminal that keeps only one of them (xterm) ends on the one VTE would pick.
+const MODE_BITS: [(u16, u16); 10] = [
+    (1, 1 << 1),     // application cursor keys
+    (25, 1 << 2),    // cursor visible
+    (9, 1 << 3),     // X10 mouse
+    (1000, 1 << 4),  // mouse buttons
+    (1002, 1 << 5),  // mouse drag
+    (1003, 1 << 6),  // all mouse motion
+    (1004, 1 << 7),  // focus events
+    (1005, 1 << 8),  // UTF-8 mouse encoding
+    (1006, 1 << 9),  // SGR mouse encoding
+    (2004, 1 << 10), // bracketed paste
+];
+
+impl Default for TermModes {
+    /// A terminal as it powers on: the cursor shows, everything else is off.
+    fn default() -> Self {
+        TermModes(1 << 2)
+    }
+}
+
+impl TermModes {
+    fn set(&mut self, mode: u16, on: bool) {
+        let bit = match mode {
+            47 | 1047 | 1049 => ALT_SCREEN,
+            _ => match MODE_BITS.iter().find(|(number, _)| *number == mode) {
+                Some((_, bit)) => *bit,
+                None => return,
+            },
+        };
+        if on { self.0 |= bit } else { self.0 &= !bit }
+    }
+    /// Switch the screen of a terminal in modes `from` (`None`: unknown) to this one's.
+    fn write_screen(self, from: Option<TermModes>, out: &mut Vec<u8>) {
+        let alt = self.0 & ALT_SCREEN != 0;
+        if from.is_none_or(|from| (from.0 & ALT_SCREEN != 0) != alt) {
+            out.extend_from_slice(if alt { b"\x1b[?1049h" } else { b"\x1b[?1049l" });
+        }
+    }
+    /// Switch every other mode the same way: all that go off before any that go on, since
+    /// switching one mouse mode off turns all of them off in xterm.
+    fn write_rest(self, from: Option<TermModes>, out: &mut Vec<u8>) {
+        use std::io::Write as _;
+        for on in [false, true] {
+            let mut sep = "\x1b[?";
+            for (number, bit) in MODE_BITS {
+                let changed = from.is_none_or(|from| (from.0 ^ self.0) & bit != 0);
+                if changed && (self.0 & bit != 0) == on {
+                    let _ = write!(out, "{sep}{number}");
+                    sep = ";";
+                }
+            }
+            if sep == ";" { out.push(if on { b'h' } else { b'l' }); }
+        }
+    }
+    /// What goes before a replay cut short: these modes, on a cleared screen. The screen goes
+    /// first so the clear lands on the one the replay draws on; scroll region and attributes
+    /// go back to a fresh terminal's, which is what the replay assumes of both.
+    fn prelude(self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(96);
+        self.write_screen(None, &mut out);
+        out.extend_from_slice(b"\x1b[r\x1b[0m\x1b[H\x1b[2J");
+        self.write_rest(None, &mut out);
+        out
+    }
+}
+
+/// The terminal state at a frame boundary, recorded with the frame that starts there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Mark {
+    modes: TermModes,
+    /// Not inside an escape sequence or a UTF-8 character: a replay may start here.
+    clean: bool,
+}
+
+impl Default for Mark {
+    fn default() -> Self {
+        Mark { modes: TermModes::default(), clean: true }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Scan {
+    #[default]
+    Ground,
+    Esc,
+    /// `ESC` + intermediates (a charset designation and the like), up to its final byte.
+    EscIntermediate,
+    /// `CSI`, parameters being read. `private` is the `?` marker.
+    Csi { private: bool },
+    /// A CSI that cannot be a DECSET/DECRST, up to its final byte.
+    CsiIgnore,
+    /// OSC, DCS, SOS, PM or APC payload, up to BEL or `ESC`.
+    Str,
+}
+
+/// An incremental scanner for [`TermModes`], fed every read as it leaves the PTY. Only `ESC`
+/// matters, so text between sequences is skipped with one search per run; a sequence split
+/// across reads resumes where it stopped. A DEC VT parser in miniature: CAN and SUB abort,
+/// `ESC` anywhere starts over, C0 controls inside a sequence do not end it.
+#[derive(Debug, Default)]
+struct ModeTracker {
+    modes: TermModes,
+    state: Scan,
+    params: [u16; 16],
+    count: usize,
+    /// The last read ended inside a UTF-8 character.
+    mid_char: bool,
+}
+
+impl ModeTracker {
+    fn mark(&self) -> Mark {
+        Mark { modes: self.modes, clean: self.state == Scan::Ground && !self.mid_char }
+    }
+
+    fn feed(&mut self, data: &[u8]) {
+        let mut i = 0;
+        while i < data.len() {
+            match self.state {
+                Scan::Ground => match data[i..].iter().position(|b| *b == 0x1b) {
+                    Some(at) => { i += at + 1; self.state = Scan::Esc; continue; }
+                    None => break,
+                },
+                // A payload can be long (an image); only its terminators matter.
+                Scan::Str => match data[i..].iter().position(|b| matches!(b, 0x07 | 0x18 | 0x1a | 0x1b)) {
+                    Some(at) => i += at,
+                    None => break,
+                },
+                _ => {}
+            }
+            let byte = data[i];
+            i += 1;
+            match byte {
+                0x18 | 0x1a => { self.state = Scan::Ground; continue; }
+                0x1b => { self.state = Scan::Esc; continue; }
+                _ => {}
+            }
+            self.state = match (self.state, byte) {
+                (Scan::Esc, b'[') => {
+                    self.params[0] = 0;
+                    self.count = 0;
+                    Scan::Csi { private: false }
+                }
+                (Scan::Esc, b']' | b'P' | b'X' | b'^' | b'_') => Scan::Str,
+                (Scan::Esc, b'c') => { self.modes = TermModes::default(); Scan::Ground }
+                (Scan::Esc | Scan::EscIntermediate, 0x20..=0x2f) => Scan::EscIntermediate,
+                (Scan::Esc | Scan::EscIntermediate, 0x30..=0x7e) => Scan::Ground,
+                (Scan::Csi { .. }, b'?') if self.count == 0 && self.params[0] == 0 => Scan::Csi { private: true },
+                (Scan::Csi { private }, b'0'..=b'9') => {
+                    let param = &mut self.params[self.count.min(15)];
+                    *param = param.saturating_mul(10).saturating_add((byte - b'0') as u16);
+                    Scan::Csi { private }
+                }
+                (Scan::Csi { private }, b';') => {
+                    self.count += 1;
+                    if self.count < 16 { self.params[self.count] = 0; }
+                    Scan::Csi { private }
+                }
+                (Scan::Csi { private: true }, b'h' | b'l') => {
+                    for mode in &self.params[..(self.count + 1).min(16)] {
+                        self.modes.set(*mode, byte == b'h');
+                    }
+                    Scan::Ground
+                }
+                (Scan::Csi { .. } | Scan::CsiIgnore, 0x40..=0x7e) => Scan::Ground,
+                // Another marker, a sub-parameter, an intermediate: not a mode switch.
+                (Scan::Csi { .. }, 0x20..=0x3f) => Scan::CsiIgnore,
+                (Scan::Str, 0x07) => Scan::Ground,
+                // C0 controls inside a sequence are carried out without ending it; anything
+                // else (DEL, a byte past ASCII) is ignored where it stands.
+                (state, _) => state,
+            };
+        }
+        // Only a read that ends in text can end inside a character.
+        self.mid_char = self.state == Scan::Ground && ends_mid_char(data);
+    }
+}
+
+/// Does `data` stop partway through a UTF-8 character? A tail of continuation bytes with no
+/// lead in sight counts as yes: a replay may skip a boundary, never split a character.
+fn ends_mid_char(data: &[u8]) -> bool {
+    for (back, byte) in data.iter().rev().take(4).enumerate() {
+        if byte & 0xC0 != 0x80 {
+            let len = match byte { 0xC0..=0xDF => 2, 0xE0..=0xEF => 3, 0xF0..=0xF7 => 4, _ => 1 };
+            return len > back + 1;
+        }
+    }
+    !data.is_empty()
 }
 
 struct Shared {
@@ -196,9 +442,8 @@ impl Pty {
 
         let (tx, _) = broadcast::channel(1024);
         let mut ring = Ring { buf: VecDeque::new(), base: 0, frames: VecDeque::new() };
-        if !spec.initial_scrollback.is_empty() {
-            ring.push(0, &spec.initial_scrollback);
-        }
+        let mut term = ModeTracker::default();
+        ring.push_history(&spec.initial_scrollback, &mut term);
         let shared = Arc::new(Shared {
             epoch: spec.epoch,
             seq: AtomicU64::new(0),
@@ -220,9 +465,20 @@ impl Pty {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         sh.last_output_ms.store(unix_millis(), Ordering::Relaxed);
-                        let seq = sh.seq.fetch_add(1, Ordering::SeqCst) + 1;
                         let data = buf[..n].to_vec();
-                        sh.ring.lock().unwrap().push(seq, &data);
+                        // Outside the lock: the scan is this thread's alone (RA-242).
+                        let mark = term.mark();
+                        term.feed(&data);
+                        // Numbered under the ring lock: `attach` reads the seq under it too, so
+                        // a seq it sees is always one whose bytes are already in the ring. Taken
+                        // before the lock, an attach in between skipped that frame as caught up
+                        // when it was not, or found no boundary for it and replayed 256 KiB (RA-117).
+                        let seq = {
+                            let mut ring = sh.ring.lock().unwrap();
+                            let seq = sh.seq.fetch_add(1, Ordering::SeqCst) + 1;
+                            ring.push(seq, &data, mark);
+                            seq
+                        };
                         let _ = sh.tx.send(Arc::new(Frame { epoch: sh.epoch, seq, data }));
                     }
                 }
@@ -326,13 +582,24 @@ impl Pty {
         let rx = self.shared.tx.subscribe();
         let ring = self.shared.ring.lock().unwrap();
         let seq = self.seq();
-        let catch_up = match (from_epoch, from_seq) {
+        let (bytes, cut) = match (from_epoch, from_seq) {
             (Some(e), Some(s)) if e == self.shared.epoch => {
-                if s >= seq { Vec::new() } else { ring.bounded_bytes_from(ring.offset_after(s).unwrap_or(0)) }
+                if s >= seq { (Vec::new(), None) } else { ring.bounded_bytes_from(ring.offset_after(s).unwrap_or(0)) }
             }
             _ => ring.bounded_bytes_from(0),
         };
         drop(ring);
+        // A replay cut short starts on a screen and in modes the subscriber never saw set up:
+        // a TUI enables them once at start-up. Re-establish them and clear what is there, so a
+        // recreated pane keeps bracketed paste and the mouse, and draws on the right screen.
+        let catch_up = match cut {
+            Some(mark) => {
+                let mut prelude = mark.modes.prelude();
+                prelude.extend_from_slice(&bytes);
+                prelude
+            }
+            None => bytes,
+        };
         Attached { epoch: self.shared.epoch, seq, catch_up, rx }
     }
 
@@ -454,8 +721,8 @@ mod tests {
     #[test]
     fn catch_up_is_bounded_and_starts_on_a_frame_boundary() {
         let mut ring = Ring { buf: VecDeque::new(), base: 0, frames: VecDeque::new() };
-        for seq in 1..=1100 { ring.push(seq, &vec![(seq % 251) as u8; 1024]); }
-        let catch_up = ring.bounded_bytes_from(0);
+        for seq in 1..=1100 { ring.push(seq, &vec![(seq % 251) as u8; 1024], Mark::default()); }
+        let catch_up = ring.bounded_bytes_from(0).0;
         assert_eq!(catch_up.len(), ATTACH_CATCHUP_BYTES);
         assert_eq!(catch_up.len() % 1024, 0);
     }
@@ -470,7 +737,7 @@ mod tests {
         let chunk = 64 * 1024;
         let pushes = (SCROLLBACK_BYTES / chunk) + 3;
         for seq in 1..=pushes as u64 {
-            r.push(seq, &vec![(seq % 251) as u8; chunk]);
+            r.push(seq, &vec![(seq % 251) as u8; chunk], Mark::default());
         }
         assert_eq!(r.buf.len(), SCROLLBACK_BYTES);
         assert_eq!(r.base, (pushes * chunk - SCROLLBACK_BYTES) as u64);
@@ -490,20 +757,52 @@ mod tests {
     fn a_single_push_larger_than_the_ring_keeps_its_tail() {
         let mut r = ring();
         let huge = SCROLLBACK_BYTES + 4096;
-        r.push(0, &vec![7u8; huge]);
+        r.push(0, &vec![7u8; huge], Mark::default());
         assert_eq!(r.buf.len(), SCROLLBACK_BYTES);
         assert_eq!(r.base, 4096);
         assert_eq!(r.end(), huge as u64);
     }
 
     #[test]
+    fn restored_history_is_caught_up_from_a_line_boundary() {
+        let mut history = Vec::new();
+        for line in 0..40_000 {
+            history.extend_from_slice(format!("\x1b[32mline {line}\x1b[0m\n").as_bytes());
+        }
+        assert!(history.len() > 2 * ATTACH_CATCHUP_BYTES);
+        let mut r = ring();
+        r.push_history(&history, &mut ModeTracker::default());
+        assert_eq!(r.bytes_from(0), history, "split, not changed");
+        // Nothing printed yet: the tail of the history, starting on a line.
+        let catch_up = r.bounded_bytes_from(0).0;
+        assert!(catch_up.len() > ATTACH_CATCHUP_BYTES - 16 * 1024 && catch_up.len() <= ATTACH_CATCHUP_BYTES);
+        assert!(catch_up.starts_with(b"\x1b[32mline "), "cut mid line: {:?}", &catch_up[..16]);
+        assert!(history.ends_with(&catch_up));
+        // A first live frame does not push the history out of the catch-up.
+        r.push(1, b"$ ", Mark::default());
+        let catch_up = r.bounded_bytes_from(0).0;
+        assert!(catch_up.len() > ATTACH_CATCHUP_BYTES - 16 * 1024, "{}", catch_up.len());
+        assert!(catch_up.starts_with(b"\x1b[32mline ") && catch_up.ends_with(b"line 39999\x1b[0m\n$ "));
+        // A client that saw the history resumes after it.
+        assert_eq!(r.bytes_from(r.offset_after(0).unwrap()), b"$ ");
+        // A line longer than a chunk is cut, but never inside a character.
+        let mut r = ring();
+        let long = "é".repeat(20 * 1024);
+        r.push_history(long.as_bytes(), &mut ModeTracker::default());
+        assert!(r.frames.len() > 1);
+        for (_, offset, _) in r.frames.iter() {
+            assert!(std::str::from_utf8(&r.bytes_from(*offset)).is_ok());
+        }
+    }
+
+    #[test]
     fn frame_lookup_matches_a_linear_scan() {
         let mut r = ring();
         for seq in 1..=500u64 {
-            r.push(seq, &[0u8; 16]);
+            r.push(seq, &[0u8; 16], Mark::default());
         }
         for seq in 0..=501u64 {
-            let scanned = r.frames.iter().find(|(s, _)| *s > seq).map(|(_, o)| *o);
+            let scanned = r.frames.iter().find(|(s, _, _)| *s > seq).map(|(_, o, _)| *o);
             assert_eq!(r.offset_after(seq), scanned, "seq {seq}");
         }
     }
@@ -512,7 +811,7 @@ mod tests {
     fn a_bounded_tail_read_returns_the_same_lines_as_the_whole_ring() {
         let mut r = ring();
         for seq in 1..=400u64 {
-            r.push(seq, format!("line {seq}\n").as_bytes());
+            r.push(seq, format!("line {seq}\n").as_bytes(), Mark::default());
         }
         let whole = String::from_utf8(r.bytes_from(0)).unwrap();
         for lines in [1usize, 5, 399, 400, 4000] {
@@ -534,10 +833,155 @@ mod tests {
             seq += 1;
             let mut line = filler.clone();
             line.push(b'\n');
-            r.push(seq, &line);
+            r.push(seq, &line, Mark::default());
         }
         let tail = String::from_utf8(r.tail_lines(3)).unwrap();
         assert_eq!(tail.lines().count(), 3);
         assert!(tail.lines().all(|l| l.len() == 1024));
+    }
+
+    fn modes_of(chunks: &[&[u8]]) -> ModeTracker {
+        let mut term = ModeTracker::default();
+        for chunk in chunks { term.feed(chunk); }
+        term
+    }
+
+    fn on(term: &ModeTracker, mode: u16) -> bool {
+        let mut probe = TermModes(0);
+        probe.set(mode, true);
+        term.modes.0 & probe.0 != 0
+    }
+
+    #[test]
+    fn modes_are_tracked_across_any_split_of_the_stream() {
+        let stream: &[u8] = "hi \x1b[1;31mred\x1b[0m \x1b[?1049h\x1b[?2004;1006h\x1b]0;tïtle\x07\x1b[?1000h\x1b[?25l é \x1b[?1000l\x1b[?1002h\x1bP+q\x1b\\\x1b[?1h".as_bytes();
+        let whole = modes_of(&[stream]);
+        for (mode, set) in [(1049, true), (2004, true), (1006, true), (1000, false), (1002, true), (25, false), (1, true), (1003, false)] {
+            assert_eq!(on(&whole, mode), set, "mode {mode}");
+        }
+        assert!(whole.mark().clean);
+        // Every cut in two, and one byte at a time, ends in the same state.
+        for cut in 0..=stream.len() {
+            let split = modes_of(&[&stream[..cut], &stream[cut..]]);
+            assert_eq!(split.modes, whole.modes, "cut at {cut}");
+        }
+        let bytes: Vec<&[u8]> = stream.chunks(1).collect();
+        assert_eq!(modes_of(&bytes).modes, whole.modes);
+    }
+
+    #[test]
+    fn only_a_private_set_or_reset_switches_a_mode() {
+        for not_a_switch in [
+            "\x1b[2004h",          // ANSI mode, not DEC private
+            "\x1b[?2004$p",        // DECRQM asks, does not set
+            "\x1b[>2004h",         // another private marker
+            "\x1b[?2004:1h",       // sub-parameters
+            "\x1b]2;?2004h\x07",   // text inside a title
+            "\x1b[?20\x1804h",     // cancelled by CAN
+            "\x1bP?2004h\x1b\\",   // a DCS payload
+        ] {
+            assert_eq!(modes_of(&[not_a_switch.as_bytes()]).modes, TermModes::default(), "{not_a_switch:?}");
+        }
+        // A control inside a sequence is carried out without ending it.
+        assert!(on(&modes_of(&[b"\x1b[?20\n04h"]), 2004));
+        // Full reset.
+        assert_eq!(modes_of(&[b"\x1b[?1049h\x1b[?2004h\x1bc"]).modes, TermModes::default());
+        // 47 and 1047 are the alternate screen too.
+        assert!(on(&modes_of(&[b"\x1b[?47h"]), 1049));
+        assert!(!on(&modes_of(&[b"\x1b[?1049h\x1b[?1047l"]), 1049));
+    }
+
+    #[test]
+    fn a_boundary_inside_a_sequence_or_a_character_is_not_clean() {
+        let mut term = ModeTracker::default();
+        term.feed(b"abc\x1b[?10");
+        assert!(!term.mark().clean);
+        term.feed(b"49h");
+        assert!(term.mark().clean && on(&term, 1049));
+        term.feed(b"x\xc3");
+        assert!(!term.mark().clean);
+        term.feed(b"\xa9y");
+        assert!(term.mark().clean);
+        term.feed("\x1b]0;tïtle".as_bytes());
+        assert!(!term.mark().clean, "inside an OSC");
+        term.feed(b"\x1b\\");
+        assert!(term.mark().clean);
+    }
+
+    /// Feed `data` through `term` and the ring as the reader thread does.
+    fn read(r: &mut Ring, term: &mut ModeTracker, seq: u64, data: &[u8]) {
+        let mark = term.mark();
+        term.feed(data);
+        r.push(seq, data, mark);
+    }
+
+    #[test]
+    fn a_cut_replay_carries_the_modes_it_starts_in_and_never_starts_mid_sequence() {
+        let mut r = ring();
+        let mut term = ModeTracker::default();
+        read(&mut r, &mut term, 1, b"\x1b[?1049h\x1b[?2004h\x1b[?1000;1006h");
+        // Every other read ends inside an SGR sequence the next one finishes.
+        let mut seq = 1;
+        while r.end() < 2 * ATTACH_CATCHUP_BYTES as u64 {
+            seq += 1;
+            let mut data = vec![b'x'; 1000];
+            if seq % 2 == 0 { data.extend_from_slice(b"\x1b[3") } else { data.splice(0..0, *b"1m"); }
+            read(&mut r, &mut term, seq, &data);
+        }
+        let (bytes, cut) = r.bounded_bytes_from(0);
+        let mark = cut.expect("the replay was cut short");
+        assert!(bytes.len() <= ATTACH_CATCHUP_BYTES && bytes.len() > ATTACH_CATCHUP_BYTES - 4096);
+        assert!(bytes.starts_with(b"xxx"), "starts mid sequence: {:?}", &bytes[..8]);
+        assert_eq!(mark.modes, term.modes);
+        let prelude = String::from_utf8(mark.modes.prelude()).unwrap();
+        assert_eq!(prelude, "\x1b[?1049h\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[?1;9;1002;1003;1004;1005l\x1b[?25;1000;1006;2004h");
+        // A replay that is not cut needs nothing: the subscriber saw every byte before it.
+        let resume = r.offset_after(seq - 3).unwrap();
+        assert_eq!(r.bounded_bytes_from(resume).1, None);
+        let mut small = ring();
+        read(&mut small, &mut ModeTracker::default(), 1, b"\x1b[?2004hok");
+        assert_eq!(small.bounded_bytes_from(0), (b"\x1b[?2004hok".to_vec(), None));
+    }
+
+    #[test]
+    fn history_leaves_the_new_process_a_fresh_terminal() {
+        let mut r = ring();
+        let mut term = ModeTracker::default();
+        r.push_history(b"$ claude\n\x1b[?1049h\x1b[?2004hdrawn\x1b[?10", &mut term);
+        assert_eq!(term.mark(), Mark::default());
+        let (_, _, mark) = *r.frames.back().unwrap();
+        assert!(!mark.clean && mark.modes != TermModes::default());
+        assert!(r.bytes_from(0).ends_with(b"drawn\x1b[?10\x18\x1b[?1049l\x1b[?2004l"));
+        // Plain history is left exactly as it was.
+        let mut r = ring();
+        let mut term = ModeTracker::default();
+        r.push_history(b"$ ls\nfile\n", &mut term);
+        assert_eq!(r.bytes_from(0), b"$ ls\nfile\n");
+    }
+
+    #[test]
+    fn attach_prefixes_a_cut_catch_up_with_the_modes_the_program_set() {
+        let script = format!(
+            "printf '\\033[?2004h\\033[?1049h'; head -c {} /dev/zero | tr '\\000' x; printf END",
+            2 * ATTACH_CATCHUP_BYTES,
+        );
+        let spec = SpawnSpec {
+            cmd: "sh".into(), args: vec!["-c".into(), script], env: Vec::new(),
+            cwd: std::env::temp_dir(), cols: 80, rows: 24, epoch: 1, initial_scrollback: Vec::new(),
+        };
+        let pty = Pty::spawn(spec, |_| {}).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let attached = loop {
+            let attached = pty.attach(None, None);
+            if attached.catch_up.ends_with(b"END") { break attached; }
+            assert!(Instant::now() < deadline, "output never finished");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let prelude = TermModes(ALT_SCREEN | 1 << 2 | 1 << 10).prelude();
+        assert!(attached.catch_up.starts_with(&prelude), "{:?}", String::from_utf8_lossy(&attached.catch_up[..64]));
+        assert!(attached.catch_up[prelude.len()..].iter().all(|b| *b == b'x' || b"END\r\n".contains(b)));
+        // Caught up from where it left off: no prelude.
+        assert!(pty.attach(Some(1), Some(pty.seq())).catch_up.is_empty());
+        pty.kill(Duration::from_millis(100));
     }
 }

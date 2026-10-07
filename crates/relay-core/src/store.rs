@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 /// The schema version this build knows. Bump when appending to [`MIGRATIONS`].
-pub const SCHEMA_VERSION: i64 = 20;
+pub const SCHEMA_VERSION: i64 = 22;
 
 /// Numbered migrations; index 0 brings a fresh DB to `user_version = 1`.
 pub const MIGRATIONS: &[&str] = &[
@@ -371,6 +371,21 @@ pub const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX plugin_projects_project ON plugin_projects(project_id, plugin_id);
     "#,
+    // v21 - the shell's global notification list (no project, newest first, optionally unread
+    // only) had no index to walk, so every open was a full scan and sort under the store mutex.
+    r#"
+    CREATE INDEX notifications_recent ON notifications(created_at, id);
+    CREATE INDEX notifications_unread_recent ON notifications(read, created_at, id);
+    "#,
+    // v22 - a GitHub skill remembers the branch or tag it was installed from (NULL: the
+    // repository's default branch), so a refresh pulls that ref again, and the same folder
+    // installed from two refs is two sources rather than one row each install overwrites.
+    r#"
+    ALTER TABLE skills ADD COLUMN source_ref TEXT;
+    DROP INDEX skills_source;
+    CREATE UNIQUE INDEX skills_source ON skills(source_url, source_path, IFNULL(source_ref, ''))
+      WHERE source_url IS NOT NULL;
+    "#,
 ];
 
 pub struct Store {
@@ -509,11 +524,51 @@ impl Store {
     }
 
     /// Copy the live database (SQLite online backup) into `backups/`, keep the newest
-    /// [`KEEP_BACKUPS`]. Returns the new file. Takes the store lock — do not call from inside
-    /// a handler; use [`Store::backup_with`] with the request's connection there.
+    /// [`KEEP_BACKUPS`]. Returns the new file. Takes the store lock one step at a time, so other
+    /// requests run between steps rather than waiting out the whole copy — do not call from
+    /// inside a handler, which already holds it; use [`Store::backup_with`] there.
     pub fn backup(&self, reason: &str) -> Result<PathBuf> {
-        let conn = self.lock();
-        backup_to(&conn, &self.backup_dir(), reason)
+        let dir = self.backup_dir();
+        let dest = backup_dest(&dir, reason)?;
+        let mut out = Connection::open(&dest)?;
+        let copied = {
+            let guard = self.lock();
+            // SAFETY: the connection lives inside `self.conn` for as long as `self`, which this
+            // borrow cannot outlive, and it never moves. The connection is opened NO_MUTEX, so
+            // every call that touches it — `Backup::new`, each `step` and the `finish` in
+            // `Backup`'s drop — is made below with the store mutex held, exactly as if it went
+            // through the guard. Between steps another request may write through the same
+            // connection; SQLite then updates the backup in place rather than restarting it.
+            let src: &Connection = unsafe { &*(&*guard as *const Connection) };
+            let backup = rusqlite::backup::Backup::new(src, &mut out)?;
+            drop(guard);
+            let copied = (|| -> Result<()> {
+                let mut busy = 0;
+                loop {
+                    let step = { let _guard = self.lock(); backup.step(BACKUP_STEP_PAGES)? };
+                    match step {
+                        rusqlite::backup::StepResult::Done => return Ok(()),
+                        rusqlite::backup::StepResult::More => busy = 0,
+                        _ => {
+                            busy += 1;
+                            anyhow::ensure!(busy < BACKUP_BUSY_RETRIES, "the store stayed busy for the whole backup");
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                    }
+                    std::thread::yield_now();
+                }
+            })();
+            let _guard = self.lock();
+            drop(backup);
+            copied
+        };
+        drop(out);
+        if let Err(error) = copied {
+            let _ = std::fs::remove_file(&dest);
+            return Err(error);
+        }
+        prune_backups(&dir)?;
+        Ok(dest)
     }
 
     /// Same, using a connection the caller already holds (a handler's transaction).
@@ -542,7 +597,7 @@ fn tune(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// How many backups `backups/` keeps (SPEC §14).
+/// How many backups of each reason `backups/` keeps (SPEC §14).
 pub const KEEP_BACKUPS: usize = 5;
 
 #[derive(Debug, Clone)]
@@ -553,23 +608,59 @@ pub struct BackupInfo {
     pub reason: String,
 }
 
-fn backup_to(conn: &Connection, dir: &Path, reason: &str) -> Result<PathBuf> {
+/// Pages copied per step of [`Store::backup`]: 1024 × 4 KiB, a few ms of work under the lock.
+const BACKUP_STEP_PAGES: std::os::raw::c_int = 1024;
+/// Busy steps in a row before a backup gives up, 10 ms apart.
+const BACKUP_BUSY_RETRIES: u32 = 200;
+
+fn backup_dest(dir: &Path, reason: &str) -> Result<PathBuf> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let stamp = crate::time::now().replace(':', "-");
-    let dest = dir.join(format!("store-{stamp}-{reason}.db"));
-    let mut out = Connection::open(&dest)?;
-    {
-        let bk = rusqlite::backup::Backup::new(conn, &mut out)?;
-        bk.run_to_completion(256, std::time::Duration::from_millis(0), None)?;
-    }
-    drop(out);
-    // prune
-    let mut all = list_backups(dir)?;
-    while all.len() > KEEP_BACKUPS {
-        if let Some(old) = all.pop() {
-            let _ = std::fs::remove_file(&old.path);
+    Ok(dir.join(format!("store-{stamp}-{reason}.db")))
+}
+
+/// Keep the newest [`KEEP_BACKUPS`] of each reason, so a run of removals or manual backups never
+/// pushes out the one taken before a schema upgrade.
+fn prune_backups(dir: &Path) -> Result<()> {
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for backup in list_backups(dir)? {
+        let count = seen.entry(backup.reason.clone()).or_default();
+        *count += 1;
+        if *count > KEEP_BACKUPS {
+            let _ = std::fs::remove_file(&backup.path);
         }
     }
+    Ok(())
+}
+
+fn backup_to(conn: &Connection, dir: &Path, reason: &str) -> Result<PathBuf> {
+    let dest = backup_dest(dir, reason)?;
+    let mut out = Connection::open(&dest)?;
+    let copied = (|| -> Result<()> {
+        let bk = rusqlite::backup::Backup::new(conn, &mut out)?;
+        let mut busy = 0;
+        loop {
+            match bk.step(-1)? {
+                rusqlite::backup::StepResult::Done => return Ok(()),
+                rusqlite::backup::StepResult::More => {}
+                // The connection being copied has written in its open transaction: SQLite
+                // answers LOCKED on every step until that commits, which no retry can wait out
+                // from here. `run_to_completion` would spin forever.
+                rusqlite::backup::StepResult::Locked => anyhow::bail!("cannot back up a connection with uncommitted writes; back up before writing"),
+                _ => {
+                    busy += 1;
+                    anyhow::ensure!(busy < BACKUP_BUSY_RETRIES, "the store stayed busy for the whole backup");
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+    })();
+    drop(out);
+    if let Err(error) = copied {
+        let _ = std::fs::remove_file(&dest);
+        return Err(error);
+    }
+    prune_backups(dir)?;
     Ok(dest)
 }
 

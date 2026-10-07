@@ -178,6 +178,16 @@ fn is_symbol(kind: &str) -> bool {
 }
 
 fn node_name(node: Node<'_>, source: &[u8]) -> Option<String> {
+    // `impl Display for Foo` has no name; its first identifier is the trait, which every other
+    // `impl Display` shares.
+    if node.kind() == "impl_item" {
+        let text = |field| node.child_by_field_name(field).and_then(|n| n.utf8_text(source).ok());
+        let target = text("type")?;
+        return Some(match text("trait") {
+            Some(of) => format!("impl {of} for {target}"),
+            None => format!("impl {target}"),
+        });
+    }
     if let Some(name) = node.child_by_field_name("name") {
         return name.utf8_text(source).ok().map(str::to_string);
     }
@@ -198,6 +208,10 @@ fn hash_hex(bytes: &[u8]) -> String {
     crate::hex(&Sha256::digest(bytes))
 }
 
+/// Every symbol in a file by its qualified name (`impl Foo::new`, `mod a::helper`), and the
+/// hash of its text. A bare name was not a key: the `new` of one impl overwrote another's, so
+/// an edit to the first went unseen and two sessions in different `new`s looked like one
+/// (RA-173). A name that still repeats (two `#[cfg]` twins) is numbered in source order.
 fn symbols(path: &Path, source: &[u8]) -> BTreeMap<String, String> {
     if source.len() > 2 * 1024 * 1024 {
         return BTreeMap::new();
@@ -205,19 +219,36 @@ fn symbols(path: &Path, source: &[u8]) -> BTreeMap<String, String> {
     let Some(Some(tree)) = with_parser(path, |parser| parser.parse(source, None)) else {
         return BTreeMap::new();
     };
-    let mut stack = vec![tree.root_node()];
+    let mut stack: Vec<(Node, std::rc::Rc<str>)> = vec![(tree.root_node(), "".into())];
     let mut out = BTreeMap::new();
-    while let Some(node) = stack.pop() {
+    while let Some((node, scope)) = stack.pop() {
+        let mut inner = scope;
         if is_symbol(node.kind()) {
             if let Some(name) = node_name(node, source) {
-                let bytes = &source[node.byte_range()];
-                out.insert(name, hash_hex(bytes));
+                let qualified = if inner.is_empty() { name } else { format!("{inner}::{name}") };
+                let mut key = qualified.clone();
+                let mut nth = 1;
+                while out.contains_key(&key) {
+                    nth += 1;
+                    key = format!("{qualified}#{nth}");
+                }
+                out.insert(key.clone(), hash_hex(&source[node.byte_range()]));
+                inner = key.into();
             }
         }
         let mut cursor = node.walk();
-        stack.extend(node.children(&mut cursor));
+        let children: Vec<Node> = node.children(&mut cursor).collect();
+        // Reversed onto the stack, so they come off in source order and numbering is stable.
+        stack.extend(children.into_iter().rev().map(|child| (child, inner.clone())));
     }
     out
+}
+
+/// Whether a changed symbol is the one a claim names. A claim is free text: the qualified name,
+/// or just the item's own name as an agent would write it.
+fn claimed(symbol: &str, claim: &str) -> bool {
+    let leaf = symbol.rsplit("::").next().unwrap_or(symbol);
+    symbol == claim || leaf == claim || leaf.split('#').next() == Some(claim)
 }
 
 fn baseline(repo: &gix::Repository, path: &Path) -> Vec<u8> {
@@ -283,9 +314,12 @@ fn fingerprint(project_id: Id, finding: &Finding) -> String {
     hash_hex(raw.as_bytes())
 }
 
-/// Per session: the files its checkout changed, and per changed file the symbols that differ
-/// from HEAD.
-type Changes = BTreeMap<String, (BTreeSet<String>, BTreeMap<String, BTreeSet<String>>)>;
+/// One checkout's changes: the files, and per changed file the symbols that differ from HEAD.
+type Changed = std::sync::Arc<(BTreeSet<String>, BTreeMap<String, BTreeSet<String>>)>;
+
+/// Per session: its checkout and that checkout's changes. Sessions sharing a checkout (a PAIR
+/// partner, a reviewer on the builder's worktree) share one scan of it.
+type Changes = BTreeMap<String, (String, Changed)>;
 
 /// The store half of a scan: which live checkouts to read. Cheap.
 fn scan_targets(conn: &rusqlite::Connection, project_id: Id) -> Result<Vec<(String, String)>, BusError> {
@@ -307,14 +341,24 @@ fn scan_targets(conn: &rusqlite::Connection, project_id: Id) -> Result<Vec<(Stri
 /// busy wall (PERF §1.1). Now it runs with no lock held (BUS.md §5.1, D149).
 fn collect_changes(targets: &[(String, String)]) -> Result<Changes, BusError> {
     let mut changes = Changes::new();
+    let mut scanned = BTreeMap::<String, Changed>::new();
     for (name, worktree) in targets {
         let path = Path::new(worktree);
         if !path.is_dir() {
             continue;
         }
-        let files = changed_files(path)?;
-        let symbols = changed_symbols(path, &files);
-        changes.insert(name.clone(), (files, symbols));
+        let checkout = std::fs::canonicalize(path).map(|p| p.display().to_string()).unwrap_or_else(|_| worktree.clone());
+        let changed = match scanned.get(&checkout) {
+            Some(changed) => changed.clone(),
+            None => {
+                let files = changed_files(path)?;
+                let symbols = changed_symbols(path, &files);
+                let changed: Changed = std::sync::Arc::new((files, symbols));
+                scanned.insert(checkout.clone(), changed.clone());
+                changed
+            }
+        };
+        changes.insert(name.clone(), (checkout, changed));
     }
     Ok(changes)
 }
@@ -329,8 +373,15 @@ fn apply_scan(tx: &Transaction, project_id: Id, now: &str, changes: Changes) -> 
         for right in left + 1..names.len() {
             let a = &names[left];
             let b = &names[right];
-            let (af, asyms) = &changes[a];
-            let (bf, bsyms) = &changes[b];
+            let (a_checkout, a_changed) = &changes[a];
+            let (b_checkout, b_changed) = &changes[b];
+            // One checkout's edits are not two sessions colliding: they are the same edits,
+            // seen twice (RA-174).
+            if a_checkout == b_checkout {
+                continue;
+            }
+            let (af, asyms) = &**a_changed;
+            let (bf, bsyms) = &**b_changed;
             for path in af.intersection(bf) {
                 let file = Finding {
                     sessions: vec![a.clone(), b.clone()],
@@ -380,12 +431,14 @@ fn apply_scan(tx: &Transaction, project_id: Id, now: &str, changes: Changes) -> 
             kind: OverlapKind::Claim,
         };
         findings.insert(fingerprint(project_id, &own), own);
-        for (other, (files, symbols)) in &changes {
-            if other == session || !files.contains(path) {
+        let own_checkout = changes.get(session).map(|(checkout, _)| checkout);
+        for (other, (checkout, changed)) in &changes {
+            let (files, symbols) = &**changed;
+            if other == session || Some(checkout) == own_checkout || !files.contains(path) {
                 continue;
             }
-            let conflicts =
-                symbol.is_empty() || symbols.get(path).is_some_and(|set| set.contains(symbol));
+            let conflicts = symbol.is_empty()
+                || symbols.get(path).is_some_and(|set| set.iter().any(|changed| claimed(changed, symbol)));
             if conflicts {
                 let mut pair = vec![session.clone(), other.clone()];
                 pair.sort();
@@ -445,6 +498,46 @@ fn apply_scan(tx: &Transaction, project_id: Id, now: &str, changes: Changes) -> 
     list(tx, project_id)
 }
 
+/// How old the stored scan may be before `overlap.list` refreshes it.
+const RESCAN_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+/// (engine, project) → when its last background scan began.
+static RESCANNED: std::sync::Mutex<Option<std::collections::HashMap<(usize, Id), std::time::Instant>>> =
+    std::sync::Mutex::new(None);
+
+fn rescan_due(engine: &Engine, project_id: Id) -> bool {
+    let key = (engine as *const Engine as usize, project_id);
+    let mut rescanned = RESCANNED.lock().unwrap_or_else(|poison| poison.into_inner());
+    let rescanned = rescanned.get_or_insert_with(Default::default);
+    if rescanned.get(&key).is_some_and(|at| at.elapsed() < RESCAN_AFTER) {
+        return false;
+    }
+    rescanned.insert(key, std::time::Instant::now());
+    true
+}
+
+/// The scan `overlap.flag` runs, on behalf of whoever reads the list. File and symbol overlaps
+/// exist only once a scan finds them, and only an agent's flag (or a test's `overlap.scan`) ran
+/// one, so the list a person opens was empty or as old as the last flag (RA-175). Same two
+/// halves as the staged ops: the checkouts are read with the store unlocked. `overlap.changed`
+/// goes out only when the set of overlaps changed, so a window refreshing on it settles.
+pub(crate) fn rescan(engine: &Engine, project_id: Id) -> Result<(), BusError> {
+    let targets = scan_targets(&engine.store.lock(), project_id)?;
+    let changes = collect_changes(&targets)?;
+    let now = crate::time::now();
+    let (before, after) = {
+        let mut conn = engine.store.lock();
+        let tx = conn.transaction().map_err(crate::engine::internal)?;
+        let before: Vec<Id> = list(&tx, project_id)?.iter().map(|overlap| overlap.id).collect();
+        let after = apply_scan(&tx, project_id, &now, changes)?;
+        tx.commit().map_err(crate::engine::internal)?;
+        (before, after)
+    };
+    if before != after.iter().map(|overlap| overlap.id).collect::<Vec<_>>() {
+        engine.emit_system("overlap.changed", serde_json::json!({"project_id": project_id, "count": after.len()}));
+    }
+    Ok(())
+}
+
 pub fn register(e: &mut Engine) {
     e.register::<List>(|ctx, p| {
         crate::handlers::workspace::get_project(ctx.tx(), p.project_id)?;
@@ -455,6 +548,20 @@ pub fn register(e: &mut Engine) {
                 return Err(BusError::not_own("project"));
             }
         }
+        // Answered from what is stored; a stale scan is refreshed behind it, and the window
+        // hears `overlap.changed` if that changes anything.
+        let project_id = p.project_id;
+        ctx.after_commit(move |engine| {
+            if engine.instance == crate::Instance::Test || !rescan_due(&engine, project_id) {
+                return;
+            }
+            let _ = std::thread::Builder::new().name("overlap-scan".into()).spawn(move || {
+                crate::background_priority();
+                if let Err(error) = rescan(&engine, project_id) {
+                    tracing::debug!(project_id, error = %error.message, "background overlap scan failed");
+                }
+            });
+        });
         Ok(ListOut {
             overlaps: list(ctx.tx(), p.project_id)?,
         })
@@ -550,4 +657,81 @@ pub fn register(e: &mut Engine) {
             Ok(ListOut { overlaps })
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use relay_bus::{Actor, Request};
+    use std::path::PathBuf;
+
+    #[test]
+    fn same_named_items_are_told_apart() {
+        let before = b"struct A;\nstruct B;\nimpl A { fn new() -> A { A } }\nimpl B { fn new() -> B { B } }\n\
+            impl std::fmt::Display for A { fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { Ok(()) } }\n\
+            mod inner { fn helper() {} }\n";
+        let path = Path::new("lib.rs");
+        let symbols = symbols(path, before);
+        for name in ["A", "B", "impl A", "impl A::new", "impl B::new", "impl std::fmt::Display for A::fmt", "inner::helper"] {
+            assert!(symbols.contains_key(name), "{name} missing from {:?}", symbols.keys());
+        }
+        let after = String::from_utf8(before.to_vec()).unwrap().replace("fn new() -> B { B }", "fn new() -> B { let b = B; b }");
+        let changed = super::symbols(path, after.as_bytes());
+        let differ: Vec<_> = changed.iter().filter(|(name, hash)| symbols.get(*name) != Some(*hash)).map(|(name, _)| name.as_str()).collect();
+        assert_eq!(differ, ["impl B", "impl B::new"], "an edit to one `new` is that `new` alone");
+        assert!(claimed("impl B::new", "new") && claimed("impl B::new", "impl B::new") && claimed("impl B::new#2", "new"));
+        assert!(!claimed("impl B::new", "B"));
+    }
+
+    fn git(repo: &Path, args: &[&str]) {
+        assert!(std::process::Command::new("git").arg("-C").arg(repo).args(args).status().unwrap().success(), "git {args:?}");
+    }
+
+    fn ok(engine: &Engine, op: &str, payload: serde_json::Value) -> serde_json::Value {
+        engine.dispatch(Request::new(Actor::User, op, payload), crate::engine::Door::InProcess).into_result()
+            .unwrap_or_else(|error| panic!("{op}: {} {}", error.code, error.message))
+    }
+
+    #[test]
+    fn a_shared_checkout_is_scanned_once_and_never_overlaps_itself_and_a_reader_rescans() {
+        let root = tempfile::tempdir().unwrap();
+        let ws = std::fs::canonicalize(root.path()).unwrap().join("ws");
+        let repo = ws.join("app");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["config", "user.email", "t@t"]);
+        git(&repo, &["config", "user.name", "t"]);
+        std::fs::write(repo.join("lib.rs"), "pub fn one() -> i32 { 1 }\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "init"]);
+        let engine = Engine::new(crate::Instance::Test, crate::Store::open_memory().unwrap());
+        ok(&engine, "workspace.create", serde_json::json!({"path": ws}));
+        ok(&engine, "project.add", serde_json::json!({"workspace_id": 1, "path": repo}));
+        let session = |extra: serde_json::Value| {
+            let mut payload = serde_json::json!({"project_id": 1, "provider": "codex"});
+            payload.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            let created = ok(&engine, "session.create", payload);
+            (created["name"].as_str().unwrap().to_string(), PathBuf::from(created["worktree"].as_str().unwrap()))
+        };
+        let (a, a_wt) = session(serde_json::json!({}));
+        let (b, _) = session(serde_json::json!({"worktree": a_wt}));
+        let (c, c_wt) = session(serde_json::json!({}));
+        std::fs::write(a_wt.join("lib.rs"), "pub fn one() -> i32 { 2 }\n").unwrap();
+        std::fs::write(c_wt.join("lib.rs"), "pub fn one() -> i32 { 3 }\n").unwrap();
+
+        let mut events = engine.subscribe();
+        assert!(ok(&engine, "overlap.list", serde_json::json!({"project_id": 1}))["overlaps"].as_array().unwrap().is_empty());
+        rescan(&engine, 1).unwrap();
+        assert!(std::iter::from_fn(|| events.try_recv().ok()).any(|event| event.ev == "overlap.changed"));
+        let listed = ok(&engine, "overlap.list", serde_json::json!({"project_id": 1}));
+        let pairs: BTreeSet<Vec<String>> = listed["overlaps"].as_array().unwrap().iter()
+            .filter(|overlap| overlap["kind"] == "file")
+            .map(|overlap| serde_json::from_value(overlap["sessions"].clone()).unwrap()).collect();
+        let pair = |x: &str, y: &str| { let mut p = vec![x.to_string(), y.to_string()]; p.sort(); p };
+        assert!(pairs.contains(&pair(&a, &c)) && pairs.contains(&pair(&b, &c)), "{listed}");
+        assert!(!pairs.contains(&pair(&a, &b)), "a checkout overlapped itself: {listed}");
+        // Nothing changed: no event for a window to refresh on.
+        rescan(&engine, 1).unwrap();
+        assert!(!std::iter::from_fn(|| events.try_recv().ok()).any(|event| event.ev == "overlap.changed"));
+    }
 }

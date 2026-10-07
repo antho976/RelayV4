@@ -44,6 +44,10 @@ op!(SkillEnable, "skill.enable", SkillEnableIn => Skill,
 payload!(#[schemars(rename = "SkillInstallIn")] SkillInstallIn {
     pub url: String,
     pub subdir: Option<String>,
+    /// Branch or tag to clone; overrides one named by a `tree/<ref>` URL. When neither names
+    /// one and `subdir` is an installed skill's `source_path`, its recorded `source_ref` is
+    /// kept, so "Update from GitHub" stays on the branch the skill came from.
+    pub source_ref: Option<String>,
     /// Explicit permission to replace one visible skill when its name conflicts with the
     /// downloaded SKILL.md. Hidden soft-deleted rows are reclaimed automatically.
     pub replace_skill_id: Option<Id>

@@ -33,6 +33,8 @@ pub async fn start(instance: Instance, store_path: Option<PathBuf>) -> Result<Se
         .ok();
     // Branches whose PR merged after their session closed (branch_cleanup).
     crate::branch_cleanup::spawn_sweeper(&engine);
+    // Retention: soft-deleted rows past the undo window, old notifications and mail (purge).
+    crate::purge::spawn_timer(&engine);
     let socket = SocketServer::start(engine.clone()).await?;
     Ok(Served { engine, socket })
 }
