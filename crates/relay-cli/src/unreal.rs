@@ -133,7 +133,9 @@ fn tools() -> Vec<Value> {
                 "platform":{"type":"string","description":"Linux, Win64 or Mac; defaults to the host"},
                 "configuration":{"type":"string","enum":["Debug","DebugGame","Development","Test","Shipping"]},
                 "timeout_s":{"type":"integer","minimum":30,"maximum":7200,"description":"Default 3600"},
-                "restart_editor":{"type":"boolean","description":"Quit a running editor first (saving), build, then relaunch it and wait until it answers. The way to apply C++ changes on Linux, which has no Live Coding."},
+                "restart_editor":{"type":"boolean","description":"Quit a running editor first (saving), build, then relaunch it and wait until it answers. The way to apply C++ changes on Linux, which has no Live Coding. Refuses when the editor cannot be asked to save (see ue_editor_quit)."},
+                "save":{"type":"boolean","description":"With restart_editor: save dirty packages before quitting (default true)"},
+                "force":{"type":"boolean","description":"With restart_editor: terminate an editor that does not answer Remote Control, losing its unsaved work. Only when the human has said so."},
                 "allow_editor_open":{"type":"boolean","description":"Build even though the editor is running (hot-reload module; usually wrong)"},
                 "keep_crash_reporters":{"type":"boolean","description":"Do not stop leftover CrashReportClient processes before building"}
             }), &[], false),
@@ -311,8 +313,8 @@ fn tools() -> Vec<Value> {
             "Start the Unreal editor on this checkout's project with the Remote Control server enabled: waits until the port is free (a closed editor holds it for a while), launches, and waits until Remote Control answers, reporting a failed bind from the new log. Returns when the editor is ready.",
             json!({"timeout_s":{"type":"integer","minimum":30,"maximum":3600,"description":"Default 900; first starts compile shaders"},"extra_args":{"type":"array","items":{"type":"string"}},"keep_background_throttle":{"type":"boolean","description":"Leave 'Use Less CPU when in Background' as configured (default: off for this session)"}}), &[], false),
         tool("ue_editor_quit",
-            "Quit the editor cleanly (saving dirty packages unless save=false), wait for the process to exit and for the Remote Control port to be released. Use before builds; ue_build restart_editor=true does quit, build and relaunch in one call.",
-            json!({"save":{"type":"boolean"}}), &[], false),
+            "Quit the editor cleanly (saving dirty packages unless save=false), wait for the process to exit and for the Remote Control port to be released. Refuses, leaving the editor running, when a package cannot be saved or when the editor does not answer Remote Control (nothing could be saved); force=true then terminates it without saving. Use before builds; ue_build restart_editor=true does quit, build and relaunch in one call.",
+            json!({"save":{"type":"boolean"},"force":{"type":"boolean","description":"Terminate an editor that does not answer Remote Control, losing its unsaved work. Only when the human has said so."}}), &[], false),
         tool("ue_editor_lock",
             "Who is driving the editor. Live tools that change the editor take this lock automatically, so two agents never script the one editor at once; it frees itself after 15 idle minutes. action=release gives it up when you are done.",
             json!({"action":{"type":"string","enum":["status","release"]}}), &[], false),
@@ -387,7 +389,7 @@ fn call(name: &str, args: &Value) -> Result<Value> {
         "ue_anim_preview" => anim_preview(&Project::find()?, args),
         "ue_play" => play(&Project::find()?, args),
         "ue_editor_launch" => launch_editor(&Project::find()?, args),
-        "ue_editor_quit" => quit_editor(&Project::find()?, args["save"].as_bool().unwrap_or(true)),
+        "ue_editor_quit" => quit_editor(&Project::find()?, args["save"].as_bool().unwrap_or(true), args["force"] == true),
         "ue_blueprint_info" => {
             let project = Project::find()?;
             let start = log_len(&project);
@@ -568,50 +570,109 @@ fn release_lock(project: &Project, me: &str) -> Result<()> {
 // ---------------------------------------------------------------- the editor process
 
 /// Save (optionally), ask the editor to quit, and wait until the process has gone and the
-/// Remote Control port is free again, so the next launch can bind it.
-fn quit_editor(project: &Project, save: bool) -> Result<Value> {
+/// Remote Control port is free again, so the next launch can bind it. An editor that cannot be
+/// asked is never signalled without `force`: whatever it has not saved would go with it.
+fn quit_editor(project: &Project, save: bool, force: bool) -> Result<Value> {
     acquire_lock(project, &holder_id())?;
+    let result = quit_editor_locked(project, save, force);
+    let _ = release_lock(project, &holder_id());
+    result
+}
+
+fn quit_editor_locked(project: &Project, save: bool, force: bool) -> Result<Value> {
     let started = std::time::Instant::now();
+    let round = |d: Duration| (d.as_secs_f64() * 10.0).round() / 10.0;
+    let port = crate::unreal_process::port_of(&remote_base());
     let before: Vec<u32> = crate::unreal_process::editors_for(&project.uproject).iter().map(|p| p.pid).collect();
+    if before.is_empty() {
+        return Ok(json!({"stopped": [], "saved": false, "port_free": crate::unreal_process::port_free(port),
+            "notes": ["no editor is running this project"], "seconds": round(started.elapsed())}));
+    }
+    // A game thread busy loading a map or compiling misses a single short probe.
+    let reachable = (0..3).any(|attempt| {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_secs(2));
+        }
+        remote("GET", "/remote/info", None, Duration::from_secs(3)).is_ok()
+    });
     let mut notes = Vec::new();
-    match remote("GET", "/remote/info", None, Duration::from_secs(3)) {
-        Ok(_) => {
-            guard_project(project)?;
-            let code = format!(
-                "import unreal\n{}unreal.SystemLibrary.quit_editor()\nprint('quitting')\n",
-                if save { "unreal.EditorLoadingAndSavingUtils.save_dirty_packages(True, True)\n" } else { "" }
-            );
-            // The editor may stop answering while it shuts down; do not wait on the reply.
-            if let Err(error) = python_tx(&code, Duration::from_secs(20), false) {
-                notes.push(format!("quit request: {error:#}"));
+    let mut saved = json!(false);
+    // A lingering editor may be signalled only once it has saved and been asked to quit, or
+    // when the caller accepted losing its work.
+    let mut may_signal = force;
+    if reachable {
+        guard_project(project)?;
+        let code = if save {
+            // save_dirty_packages runs without a dialog and silently skips what it cannot save
+            // (an untitled map, a read-only file), so ask again what is still dirty.
+            "import unreal\n\
+             L = unreal.EditorLoadingAndSavingUtils\n\
+             ok = L.save_dirty_packages(True, True)\n\
+             dirty = [p.get_name() for p in list(getattr(L, 'get_dirty_map_packages', list)()) + list(getattr(L, 'get_dirty_content_packages', list)())]\n\
+             if ok and not dirty:\n    unreal.SystemLibrary.quit_editor()\n    print('quitting')\n\
+             else:\n    print('RELAY_UNSAVED:' + (', '.join(dirty) or 'packages the editor would not save'))\n"
+        } else {
+            "import unreal\nunreal.SystemLibrary.quit_editor()\nprint('quitting')\n"
+        };
+        match python_tx(code, Duration::from_secs(20), false) {
+            Ok(result) => {
+                let output = result["output"].as_str().unwrap_or("");
+                if let Some(dirty) = output.lines().find_map(|l| l.trim().strip_prefix("RELAY_UNSAVED:")) {
+                    bail!("the editor could not save {dirty}, so it was not asked to quit and is still running. Ask the human to save or discard those in the editor, or quit with save=false to lose them.");
+                }
+                saved = json!(save);
+                may_signal = true;
+            }
+            // The editor answered and the script failed before quitting: nothing is closing.
+            Err(error) if format!("{error:#}").starts_with("Python failed") => {
+                bail!("the quit script failed, so the editor was left running: {error:#}");
+            }
+            // It stops answering as it shuts down, and a long save outlasts the reply timeout.
+            // Either way, wait for it rather than signal it.
+            Err(error) => {
+                saved = Value::Null;
+                notes.push(format!("quit request: {error:#}; waiting for the editor to exit"));
             }
         }
-        Err(_) => notes.push("the editor did not answer; asking the process to terminate instead (unsaved changes are lost)".into()),
+    } else if force {
+        notes.push("the editor did not answer Remote Control; terminating it as asked with force=true (unsaved changes are lost)".to_string());
+    } else {
+        bail!(
+            "the editor (pid {before:?}) did not answer Remote Control for about 10 s, so nothing could be saved, and it was left running rather than terminated with its unsaved work. It may be busy (loading, compiling) or its web server may be down: try again shortly, check ue_editor_status, or ask the human to save and close it. force=true terminates it without saving."
+        );
     }
     let requested = started.elapsed();
     let deadline = std::time::Instant::now() + Duration::from_secs(90);
     let mut signalled = None;
-    while !crate::unreal_process::editors_for(&project.uproject).is_empty() {
-        if std::time::Instant::now() >= deadline {
-            bail!("the editor is still running after 90 s; close it by hand");
+    loop {
+        // Re-read each time: a PID only stays a target while it is still this project's editor.
+        let left: Vec<u32> = crate::unreal_process::editors_for(&project.uproject).iter().map(|p| p.pid).filter(|pid| before.contains(pid)).collect();
+        if left.is_empty() {
+            break;
         }
-        // Everything is saved by now; an editor that lingers in shutdown gets a terminate
-        // signal (a normal shutdown request) rather than a long wait.
-        if signalled.is_none() && (notes.iter().any(|n| n.contains("terminate")) || started.elapsed() > requested + Duration::from_secs(20)) {
-            for pid in &before {
-                crate::unreal_process::kill(*pid);
+        if std::time::Instant::now() >= deadline {
+            if may_signal {
+                bail!("the editor is still running after 90 s; close it by hand");
             }
-            signalled = Some((started.elapsed().as_secs_f64() * 10.0).round() / 10.0);
+            bail!("the editor has not exited after 90 s and may still be saving; it was not signalled. Check on it, or ask the human to close it.");
+        }
+        // Saved and asked: an editor that lingers in shutdown gets a terminate signal (a normal
+        // shutdown request) rather than a long wait. Forced and unreachable: at once.
+        let lingering = !reachable || started.elapsed() > requested + Duration::from_secs(20);
+        if signalled.is_none() && may_signal && lingering {
+            for pid in &left {
+                if crate::unreal_process::still_editor_for(*pid, &project.uproject) {
+                    crate::unreal_process::kill(*pid);
+                }
+            }
+            signalled = Some(round(started.elapsed()));
         }
         std::thread::sleep(Duration::from_millis(250));
     }
     let exited = started.elapsed();
-    let port = crate::unreal_process::port_of(&remote_base());
     let port_free = crate::unreal_process::wait_port_free(port, Duration::from_secs(90));
-    let _ = release_lock(project, &holder_id());
-    let round = |d: Duration| (d.as_secs_f64() * 10.0).round() / 10.0;
     Ok(json!({
-        "stopped": before, "saved": save, "port_free": port_free, "notes": notes,
+        "stopped": before, "saved": saved, "port_free": port_free, "notes": notes,
         "seconds": round(started.elapsed()),
         // Where the time went, so a slow quit can be told apart from a slow port.
         "timing": {"save_and_request_s": round(requested), "terminate_signal_at_s": signalled, "exited_at_s": round(exited), "port_free_at_s": round(started.elapsed())},
@@ -1516,7 +1577,7 @@ fn build(project: &Project, args: &Value) -> Result<Value> {
     let restart = args["restart_editor"] == true;
     let mut quit = Value::Null;
     if restart && !crate::unreal_process::editors_for(&project.uproject).is_empty() {
-        quit = quit_editor(project, args["save"].as_bool().unwrap_or(true))?;
+        quit = quit_editor(project, args["save"].as_bool().unwrap_or(true), args["force"] == true)?;
     }
     let pre = crate::unreal_process::prebuild(&project.uproject, args["keep_crash_reporters"] != true);
     if pre["editor_running"].as_array().is_some_and(|a| !a.is_empty()) && args["allow_editor_open"] != true {
@@ -1654,7 +1715,7 @@ fn editor_status() -> Result<Value> {
             let recent: Vec<String> = project.as_ref().map(|p| log_since(p, log_len(p).saturating_sub(400_000), None)).unwrap_or_default();
             let bind = crate::unreal_process::bind_failures(&recent);
             let advice = if !bind.is_empty() {
-                format!("The editor is running but its web server could not bind port {port} (a previous editor still held it). In the editor console run `WebControl.StopServer` and then `WebControl.StartServer` (StartServer alone does nothing), or quit the editor, wait for the port, and use ue_editor_launch, which waits for it.")
+                format!("The editor is running but its web server could not bind port {port} (a previous editor still held it). In the editor console run `WebControl.StopServer` and then `WebControl.StartServer` (StartServer alone does nothing), or ask the human to save and restart the editor. ue_editor_quit cannot save through a server it cannot reach, so it refuses rather than terminate the editor.")
             } else if !editors.is_empty() && port_free {
                 "The editor is running but no web server is listening: run `WebControl.StartServer` in its console, or turn on auto-start in Project Settings > Plugins > Remote Control (ue_setup_check with fix=true writes that setting).".to_string()
             } else if editors.is_empty() && !port_free {
@@ -1908,6 +1969,8 @@ pub(crate) fn rpc_error(id: Value, code: i64, message: &str, data: Option<Value>
 mod tests {
     use super::*;
     use std::net::TcpListener;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Stdio;
 
     fn project(dir: &Path, name: &str, descriptor: Value) {
         std::fs::write(dir.join(format!("{name}.uproject")), serde_json::to_string_pretty(&descriptor).unwrap()).unwrap();
@@ -1969,9 +2032,9 @@ mod tests {
             name: "Game".into(),
             descriptor: serde_json::from_str(&std::fs::read_to_string(root.path().join("Game.uproject")).unwrap()).unwrap(),
         };
-        // SAFETY: the only test that reads this variable; it points the live check at a closed
-        // port so the test never reaches a real editor.
-        unsafe { std::env::set_var("UE_REMOTE_CONTROL_URL", "http://127.0.0.1:9") };
+        // SAFETY: every test that sets this variable sets it to the same closed port, so the
+        // live checks never reach a real editor whichever runs first.
+        unsafe { std::env::set_var("UE_REMOTE_CONTROL_URL", CLOSED_REMOTE) };
         let report = setup_check(&found, true).unwrap();
         assert_eq!(report["added_to_uproject"], json!(["RemoteControl", "EditorScriptingUtilities"]));
         assert_eq!(report["editor_reachable"], false);
@@ -2012,6 +2075,39 @@ mod tests {
         assert!(request.contains("ExecutePythonCommandEx"));
         assert_eq!(result["ReturnValue"], true);
         assert_eq!(result["LogOutput"][0]["Output"], "RELAY_JSON:{\"count\":1}");
+    }
+
+    /// Nothing listens here, and it is above 1024 so the quit's port check can bind it.
+    const CLOSED_REMOTE: &str = "http://127.0.0.1:39917";
+
+    #[test]
+    fn an_editor_that_cannot_be_asked_to_save_is_left_running() {
+        let root = tempfile::tempdir().unwrap();
+        let project = bare_project(root.path());
+        std::fs::write(&project.uproject, "{}").unwrap();
+        // A stand-in editor: any long-running binary named UnrealEditor with this project open.
+        let binary = root.path().join("UnrealEditor");
+        std::fs::copy("/usr/bin/tail", &binary).unwrap();
+        let mut editor = Command::new(&binary).arg("-f").arg(&project.uproject).stdout(Stdio::null()).spawn().unwrap();
+        // SAFETY: see setup_fix_adds_only_the_missing_bridge_plugins.
+        unsafe { std::env::set_var("UE_REMOTE_CONTROL_URL", CLOSED_REMOTE) };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while crate::unreal_process::editors_for(&project.uproject).is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let refused = quit_editor(&project, true, false).unwrap_err().to_string();
+        assert!(refused.contains("left running"), "{refused}");
+        assert!(editor.try_wait().unwrap().is_none(), "the editor was signalled");
+        assert!(read_lock(&project)["holder"].is_null(), "a refusal leaves the editor lock behind");
+        let refused = quit_editor(&project, false, false).unwrap_err().to_string();
+        assert!(refused.contains("force=true"), "{refused}");
+        assert!(editor.try_wait().unwrap().is_none());
+
+        let forced = quit_editor(&project, true, true).unwrap();
+        assert_eq!(forced["stopped"], json!([editor.id()]), "{forced}");
+        assert_eq!(forced["saved"], false);
+        assert!(editor.wait().unwrap().signal().is_some());
     }
 
     fn bare_project(root: &Path) -> Project {
