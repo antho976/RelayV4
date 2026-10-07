@@ -162,21 +162,34 @@ pub fn register(e: &mut Engine) {
     e.register_staged::<WsRemove, WorkspaceRemoval>(|ctx, p| {
         let force = p.force.unwrap_or(false);
         let projects = ctx.read(|conn| workspace_scope(conn, p.workspace_id, force))?;
+        let mut scopes = Vec::new();
+        for &id in &projects {
+            let (pr, open, _) = ctx.read(|conn| removal_scope(conn, id, true))?;
+            scopes.push((id, pr.path, open));
+        }
+        // Refused before any backup is taken or any hook undone (RA-405).
+        let doomed: Vec<super::session::Checkout> = if p.remove_worktrees.unwrap_or(false) {
+            scopes.iter().flat_map(|(_, path, open)| pooled_checkouts(Path::new(path), open)).collect()
+        } else {
+            Vec::new()
+        };
+        if !p.discard_changes.unwrap_or(false) {
+            super::session::refuse_dirty(&doomed)?;
+        }
         let backup = if projects.is_empty() { None } else { backup_before(ctx, "workspace-remove")? };
         let mut closes = Vec::new();
-        for &id in &projects {
-            let (_, open, _) = ctx.read(|conn| removal_scope(conn, id, true))?;
-            closes.push((id, prepare_closes(ctx, &open)?));
+        for (id, _, open) in &scopes {
+            closes.push((*id, prepare_closes(ctx, open)?));
         }
-        Ok(WorkspaceRemoval { closes, backup })
+        Ok(WorkspaceRemoval { closes, backup, approved: doomed.into_iter().map(|(wt, _)| wt).collect() })
     }, |ctx: &mut Ctx, p, staged| {
-        let WorkspaceRemoval { mut closes, backup } = staged;
+        let WorkspaceRemoval { mut closes, backup, approved } = staged;
         let projects = workspace_scope(ctx.tx(), p.workspace_id, p.force.unwrap_or(false))?;
         let n = projects.len();
         let mut sessions_closed = 0;
         for id in projects {
             let prepared = closes.iter().position(|(project, _)| *project == id).map(|i| closes.swap_remove(i).1).unwrap_or_default();
-            let out = remove_project(ctx, id, true, p.remove_worktrees.unwrap_or(false), prepared, None)?;
+            let out = remove_project(ctx, id, true, p.remove_worktrees.unwrap_or(false), &approved, prepared, None)?;
             sessions_closed += out.sessions_closed;
         }
         // The workspace's own guardrail layer goes with it, or the next workspace given this
@@ -338,12 +351,18 @@ pub fn register(e: &mut Engine) {
         Ok(pr)
     });
     // As `workspace.remove`: hook teardown and the store backup before the transaction opens.
+    // A checkout `remove_worktrees` would delete with uncommitted work in it refuses the whole
+    // removal first, unless `discard_changes` (RA-405).
     e.register_staged::<ProjectRemove, ProjectRemoval>(|ctx, p| {
-        let (_, open, _) = ctx.read(|conn| removal_scope(conn, p.project_id, p.force.unwrap_or(false)))?;
+        let (pr, open, _) = ctx.read(|conn| removal_scope(conn, p.project_id, p.force.unwrap_or(false)))?;
+        let doomed = if p.remove_worktrees.unwrap_or(false) { pooled_checkouts(Path::new(&pr.path), &open) } else { Vec::new() };
+        if !p.discard_changes.unwrap_or(false) {
+            super::session::refuse_dirty(&doomed)?;
+        }
         let backup = backup_before(ctx, "project-remove")?;
-        Ok(ProjectRemoval { closes: prepare_closes(ctx, &open)?, backup })
+        Ok(ProjectRemoval { closes: prepare_closes(ctx, &open)?, backup, approved: doomed.into_iter().map(|(wt, _)| wt).collect() })
     }, |ctx: &mut Ctx, p, staged| {
-        remove_project(ctx, p.project_id, p.force.unwrap_or(false), p.remove_worktrees.unwrap_or(false), staged.closes, staged.backup)
+        remove_project(ctx, p.project_id, p.force.unwrap_or(false), p.remove_worktrees.unwrap_or(false), &staged.approved, staged.closes, staged.backup)
     });
     e.register::<ProjectRemovePreview>(|ctx, p| {
         let projects: Vec<Id> = match (p.project_id, p.workspace_id) {
@@ -671,16 +690,35 @@ fn restore_project(ctx: &mut Ctx, project_id: Id, copied: Vec<Copied>) -> Result
 }
 
 /// What `project.remove`'s unlocked half settled: each open session's `session.close`
-/// prepared (its hooks already undone), and the store backup taken first.
+/// prepared (its hooks already undone), the store backup taken first, and the checkouts
+/// `remove_worktrees` may delete: those checked for uncommitted work (RA-405).
 struct ProjectRemoval {
     closes: Vec<(String, Prepared)>,
     backup: Option<String>,
+    approved: Vec<PathBuf>,
 }
 
 /// The same for each project of a removed workspace, and one backup for all of them.
 struct WorkspaceRemoval {
     closes: Vec<(Id, Vec<(String, Prepared)>)>,
     backup: Option<String>,
+    approved: Vec<PathBuf>,
+}
+
+/// The Relay-pool checkouts of `open` sessions, each once with the sessions on it: what
+/// `remove_worktrees` deletes.
+fn pooled_checkouts(repo: &Path, open: &[(String, String)]) -> Vec<super::session::Checkout> {
+    let pool = crate::worktree::pool_dir(repo);
+    let mut out: Vec<super::session::Checkout> = Vec::new();
+    for (name, wt) in open {
+        let wt = PathBuf::from(wt);
+        if !wt.starts_with(&pool) { continue; }
+        match out.iter_mut().find(|(seen, _)| *seen == wt) {
+            Some((_, names)) => names.push(name.clone()),
+            None => out.push((wt, vec![name.clone()])),
+        }
+    }
+    out
 }
 
 /// The projects `workspace.remove` would remove, or its refusal. Read in both phases.
@@ -780,7 +818,7 @@ fn backup_before(ctx: &Unlocked, reason: &str) -> Result<Option<String>, BusErro
 }
 
 /// `project.remove`'s transaction, also run once per project by `workspace.remove`.
-fn remove_project(ctx: &mut Ctx, project_id: Id, force: bool, remove_worktrees: bool, mut closes: Vec<(String, Prepared)>, backup: Option<String>) -> Result<ProjectRemoveOut, BusError> {
+fn remove_project(ctx: &mut Ctx, project_id: Id, force: bool, remove_worktrees: bool, approved: &[PathBuf], mut closes: Vec<(String, Prepared)>, backup: Option<String>) -> Result<ProjectRemoveOut, BusError> {
     let (pr, open, live_runs) = removal_scope(ctx.tx(), project_id, force)?;
     // `force` closes through `session.close` itself, so every teardown rule holds: scrollback
     // saved, claims released, holds expired, hooks uninstalled. Each close keeps its worktree,
@@ -789,7 +827,8 @@ fn remove_project(ctx: &mut Ctx, project_id: Id, force: bool, remove_worktrees: 
     // queues it for after the commit too instead of holding the bus through all of it (BUS.md
     // §5.1). A checkout shared by a PAIR or review group is in `open` once per session but
     // removed once, after all of them have closed. A session that opened after the unlocked
-    // half ran has nothing prepared and closes the old way, here.
+    // half ran has nothing prepared and closes the old way, here, and its checkout is kept:
+    // only checkouts the unlocked half checked for uncommitted work are deleted (RA-405).
     let repo = PathBuf::from(&pr.path);
     let pool = crate::worktree::pool_dir(&repo);
     let mut doomed: Vec<PathBuf> = if remove_worktrees {
@@ -797,6 +836,7 @@ fn remove_project(ctx: &mut Ctx, project_id: Id, force: bool, remove_worktrees: 
     } else {
         Vec::new()
     };
+    doomed.retain(|wt| approved.contains(wt));
     doomed.sort();
     doomed.dedup();
     // The agents in a checkout about to be deleted are taken out of the registry here, so their

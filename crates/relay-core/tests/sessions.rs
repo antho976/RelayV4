@@ -693,9 +693,10 @@ fn teardown_leaves_no_orphans() {
         names.push(name);
     }
     assert_eq!(e.live_pty_count(), 5);
-    // close three through the bus, then shut the engine down for the rest
+    // close three through the bus, then shut the engine down for the rest; the fake provider
+    // leaves its child.pid in each checkout, an untracked file (RA-405)
     for name in &names[..3] {
-        ok(e, "session.close", json!({"session": name}));
+        ok(e, "session.close", json!({"session": name, "discard_changes": true}));
     }
     for (pid, child) in &pids[..3] {
         wait_until("closed session's processes gone", || !alive(*pid) && !alive(*child));

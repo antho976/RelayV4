@@ -529,6 +529,50 @@ fn run_teardown(repo: &Path, worktree: &Path, teardown: &Teardown) -> Result<(),
     Ok(())
 }
 
+/// A checkout a removal would delete, and the sessions on it.
+pub(crate) type Checkout = (PathBuf, Vec<String>);
+
+/// Refuse `worktree.dirty` when a checkout a removal is about to delete holds uncommitted
+/// work: tracked edits, staged changes or untracked files (RA-405). Each entry is a checkout
+/// and the sessions on it. One `git status` per checkout, each bounded by its 10 s timeout and
+/// run a few at a time as `session.restorable` does, so this runs with the store unlocked. A
+/// checkout already gone is skipped; one whose status fails counts as dirty, size unknown.
+pub(crate) fn refuse_dirty(checkouts: &[Checkout]) -> Result<(), BusError> {
+    let live: Vec<&Checkout> = checkouts.iter().filter(|(wt, _)| wt.exists()).collect();
+    if live.is_empty() { return Ok(()); }
+    let changed = |wt: &Path| worktree::status_files_with(wt, worktree::Untracked::Directories).ok().map(|files| files.len());
+    let per_worker = live.len().div_ceil(4).max(1);
+    let counts: Vec<Option<usize>> = std::thread::scope(|scope| {
+        let workers: Vec<_> = live.chunks(per_worker)
+            .map(|chunk| scope.spawn(move || chunk.iter().map(|(wt, _)| changed(wt)).collect::<Vec<_>>()))
+            .collect();
+        workers.into_iter().zip(live.chunks(per_worker))
+            .flat_map(|(worker, chunk)| worker.join().unwrap_or_else(|_| vec![None; chunk.len()]))
+            .collect()
+    });
+    let dirty: Vec<(&Checkout, Option<usize>)> = live.into_iter().zip(counts).filter(|(_, n)| *n != Some(0)).collect();
+    if dirty.is_empty() { return Ok(()); }
+    let describe = |((wt, sessions), n): &(&Checkout, Option<usize>)| {
+        let changes = match n {
+            Some(n) => format!("{n} uncommitted change{}", if *n == 1 { "" } else { "s" }),
+            None => "changes that could not be checked".to_string(),
+        };
+        let whose = if sessions.is_empty() { String::new() } else { format!(" (session {})", sessions.join(", ")) };
+        format!("{}{whose} has {changes}", wt.display())
+    };
+    let message = match dirty.as_slice() {
+        [one] => format!("worktree {}; removing it would delete them", describe(one)),
+        many => format!("{} worktrees hold uncommitted work that removing them would delete: {}",
+            many.len(), many.iter().map(describe).collect::<Vec<_>>().join("; ")),
+    };
+    let details: Vec<Value> = dirty.iter()
+        .map(|((wt, sessions), n)| json!({"worktree": wt.display().to_string(), "sessions": sessions, "changed": n}))
+        .collect();
+    Err(BusError::conflict("worktree.dirty", message)
+        .with_details(json!({"worktrees": details}))
+        .with_hint("commit or stash the changes first, or pass discard_changes: true to delete them with the worktree"))
+}
+
 /// Kill a PTY that is already out of the registry without making the caller wait for it.
 /// The SIGTERM grace and the SIGKILL fallback can take seconds; nothing reads the child again.
 fn kill_detached(pty: Arc<Pty>, grace: Duration) {
@@ -1906,6 +1950,10 @@ pub fn register(e: &mut Engine) {
         })?;
         let Hooks { teardown, survivor } = teardown;
         let wt = Path::new(&row.session.worktree);
+        // Only the last session on a pooled checkout deletes it, so only then can it lose work.
+        if teardown.is_some() && wt.starts_with(worktree::pool_dir(&repo)) && !p.discard_changes.unwrap_or(false) {
+            refuse_dirty(&[(wt.to_path_buf(), vec![row.session.name.clone()])])?;
+        }
         if let Some(teardown) = &teardown {
             run_teardown(&repo, wt, teardown)?;
             if wt.starts_with(worktree::pool_dir(&repo)) {
@@ -1948,6 +1996,10 @@ pub fn register(e: &mut Engine) {
         let Hooks { teardown, survivor } = teardown;
         let s = &row.session;
         let wt = Path::new(&s.worktree);
+        // Before anything is stopped or undone: a refused close leaves the agent running.
+        if remove && wt.starts_with(worktree::pool_dir(&repo)) && !p.discard_changes.unwrap_or(false) {
+            refuse_dirty(&[(wt.to_path_buf(), vec![s.name.clone()])])?;
+        }
         // Stop writers before undoing their hooks and deleting their checkout, with a bounded
         // grace period.
         let stopped = remove

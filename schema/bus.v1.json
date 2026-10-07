@@ -1743,7 +1743,7 @@
       }
     },
     "session.close": {
-      "summary": "Kill, purge build output, remove worktree; branch kept",
+      "summary": "Kill, purge build output, remove worktree (refused if dirty unless discard_changes); branch kept",
       "kind": "mutation",
       "audit": "always",
       "undo": "none",
@@ -2103,7 +2103,7 @@
       "since": "1.0",
       "phase": 6,
       "payload": {
-        "$ref": "#/$defs/SessionNameIn"
+        "$ref": "#/$defs/SessionDiscardRestorableIn"
       },
       "result": {
         "$ref": "#/$defs/Empty"
@@ -6062,6 +6062,13 @@
             "null"
           ],
           "description": "With `force`: also delete the Relay-pool worktrees of the sessions it closes. Branches\nare always kept; off by default, so every checkout stays on disk."
+        },
+        "discard_changes": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "With `remove_worktrees`: delete them even with uncommitted changes. Without it, a dirty\none is refused `worktree.dirty` before anything is closed or removed (RA-405)."
         }
       },
       "required": [
@@ -6345,6 +6352,13 @@
             "null"
           ],
           "description": "With `force`: also delete the Relay-pool worktrees of the sessions it closes. Branches\nare always kept; off by default, so every checkout stays on disk."
+        },
+        "discard_changes": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "With `remove_worktrees`: delete them even with uncommitted changes. Without it, a dirty\none is refused `worktree.dirty` before anything is closed or removed (RA-405)."
         }
       },
       "required": [
@@ -8991,6 +9005,13 @@
             "boolean",
             "null"
           ]
+        },
+        "discard_changes": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Delete the worktree even with uncommitted changes (tracked edits or untracked files).\nWithout it, removing a dirty Relay-pool worktree is refused `worktree.dirty` (RA-405)."
         }
       },
       "required": [
@@ -9851,6 +9872,25 @@
         "session",
         "reason",
         "worktree_dirty"
+      ]
+    },
+    "SessionDiscardRestorableIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "session": {
+          "type": "string"
+        },
+        "discard_changes": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Delete the worktree even with uncommitted changes. Without it, a dirty Relay-pool\nworktree that the discard would delete is refused `worktree.dirty` (RA-405)."
+        }
+      },
+      "required": [
+        "session"
       ]
     },
     "OverlapProjectIn": {

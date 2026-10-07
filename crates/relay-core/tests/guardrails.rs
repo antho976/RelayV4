@@ -270,7 +270,8 @@ fn refusals_holds_confirmation_replay_and_expiry_are_durable() {
         json!({"session": name, "kind": "write", "path": "large.txt", "new_text": "tiny\n"}),
     );
     let expiring_id = error(&held_again).confirm.as_ref().unwrap().payload["hold_id"].as_i64().unwrap();
-    ok(engine, Actor::User, "session.close", json!({"session": name}));
+    // The checkout holds the test's uncommitted `large.txt` (RA-405).
+    ok(engine, Actor::User, "session.close", json!({"session": name, "discard_changes": true}));
     let holds = ok(engine, Actor::User, "guardrail.holds.list", json!({"open_only": false}));
     let expired = holds["holds"].as_array().unwrap().iter()
         .find(|hold| hold["id"] == expiring_id).unwrap();
