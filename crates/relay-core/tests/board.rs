@@ -812,3 +812,30 @@ fn task_list_is_paged_and_a_summary_leaves_out_the_long_fields() {
     let summary = ok(e, "task.list", json!({"project_id":1,"summary":true}));
     assert!(summary["tasks"].as_array().unwrap().iter().all(|t| t["body"] == "" && t["changelog"] == "" && t["title"] != ""));
 }
+
+/// Stores written under the old rule still hold the cross-queued rows; the startup check
+/// drops the ones that are certainly another group's, and the deadlock lifts.
+#[test]
+fn startup_drops_task_rows_the_old_shared_checkout_rule_cross_queued() {
+    let f = Fixture::new();
+    let e = &f.engine;
+    let a = ok(e, "session.create", json!({"project_id":1,"provider":"claude","worktree":"primary"}));
+    let b = ok(e, "session.create", json!({"project_id":1,"provider":"claude","worktree":"primary"}));
+    let (a, b) = (a["name"].as_str().unwrap().to_string(), b["name"].as_str().unwrap().to_string());
+    let first = f.task("A's task", json!({}));
+    let second = f.task("B's task", json!({}));
+    ok(e, "task.dispatch", json!({"task_id":first["id"],"session":a,"start":false}));
+    ok(e, "task.dispatch", json!({"task_id":second["id"],"session":b,"start":false}));
+    // What the old rule left behind: each task queued for the other agent too.
+    e.store.lock().execute_batch(&format!(
+        "INSERT INTO task_sessions(task_id, session_id, ord, queue_ord)
+           SELECT {first}, id, 9, 9 FROM sessions WHERE name='{b}';
+         INSERT INTO task_sessions(task_id, session_id, ord, queue_ord)
+           SELECT {second}, id, 9, 9 FROM sessions WHERE name='{a}';",
+        first = first["id"], second = second["id"],
+    )).unwrap();
+    let report = relay_core::recovery::run(e).unwrap();
+    assert!(report.fsck_fixes.iter().any(|fix| fix.contains("dropped 2 task queue row")), "{:?}", report.fsck_fixes);
+    call(e, Actor::agent(&a), "session.done", json!({"session":a,"summary":"done"})).into_result().unwrap();
+    assert_eq!(ok(e, "task.get", json!({"task_id":first["id"]}))["column"], "in_review");
+}
