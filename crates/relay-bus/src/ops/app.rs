@@ -2,7 +2,6 @@
 use crate::registry::{Actors, Audit, OpMeta, Scope};
 use crate::types::{Id, ProviderInfo, Ts};
 use crate::{op, Empty};
-use serde_json::Value;
 use std::collections::BTreeMap;
 
 result!(#[schemars(rename = "BuildInfo")] BuildInfo { pub profile: String, pub git_sha: Option<String>, pub built_at: Option<String> });
@@ -58,8 +57,5 @@ op!(FirstRunState, "app.first_run.state", Empty => FirstRunOut, OpMeta::query(Sc
 result!(#[schemars(rename = "AppReconcileOut")] ReconcileOut { pub actions: Vec<String> });
 op!(Reconcile, "app.reconcile", Empty => ReconcileOut,
     OpMeta::mutation(Scope::Global, 1, "Run the trust-but-verify pass now: retention of soft-deleted rows, notifications and mail").actors(Actors::UserOnly).emits(&["notify.changed"]));
-
-#[allow(dead_code)]
-fn _touch(_: Value) {}
 
 entries!(Version, Status, Quit, ResourcesGet, ResourcesWatch, RecoveryLast, LogTail, BackupNow, BackupList, ImportV3, FirstRunState, Reconcile);

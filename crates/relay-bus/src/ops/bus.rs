@@ -1,5 +1,5 @@
 //! `bus.*` — BUS.md §10.1.
-use crate::registry::{Actors, Doors, OpInfo, OpMeta, Scope};
+use crate::registry::{Doors, OpInfo, OpMeta, Scope};
 use crate::{op, Empty};
 use crate::envelope::Actor;
 use serde_json::Value;
@@ -51,11 +51,8 @@ op!(Whoami, "bus.whoami", Empty => WhoamiOut,
 payload!(#[schemars(rename = "BusSubscribeIn")] SubscribeIn { pub events: Option<Vec<String>> });
 result!(#[schemars(rename = "BusSubscribeOut")] SubscribeOut { pub subscribed: Vec<String> });
 op!(Subscribe, "bus.subscribe", SubscribeIn => SubscribeOut,
-    OpMeta::query(Scope::Global, 1, "Turn this socket connection into an event subscriber (socket door only)").doors(Doors::SocketOnly));
+    OpMeta::query(Scope::Global, 1, "Turn this socket connection into an event subscriber (socket door only); bus.lagged means events were dropped, so refetch").doors(Doors::SocketOnly).emits(&["bus.lagged"]));
 op!(Unsubscribe, "bus.unsubscribe", Empty => Empty,
     OpMeta::query(Scope::Global, 1, "Stop receiving events on this connection").doors(Doors::SocketOnly));
-
-#[allow(dead_code)]
-const _ACTORS_USED: Actors = Actors::All;
 
 entries!(Ping, Schema, Ops, Whoami, Wait, Subscribe, Unsubscribe);
