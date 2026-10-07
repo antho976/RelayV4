@@ -29,6 +29,7 @@ import com.tally.app.ui.plan.GoalRoute
 import com.tally.app.ui.settings.AboutRoute
 import com.tally.app.ui.settings.AppearanceRoute
 import com.tally.app.ui.settings.BackupRoute
+import com.tally.app.ui.settings.PcRoute
 import com.tally.app.ui.settings.ExportRoute
 import com.tally.app.ui.settings.FormatRoute
 import com.tally.app.ui.settings.ImportRoute
@@ -88,6 +89,7 @@ fun TallyNavHost(onboarded: Boolean, incoming: IncomingFiles? = null) {
         composable(Routes.FORMAT) { FormatRoute(nav) }
         composable(Routes.BACKUP) { BackupRoute(nav) }
         composable(Routes.EXPORT) { ExportRoute(nav) }
+        composable(Routes.PC) { PcRoute(nav) }
         composable(Routes.IMPORT, arguments = listOf(stringArg(Args.SOURCE, ""))) { ImportRoute(nav) }
         composable(Routes.ABOUT) { AboutRoute(nav) }
     }

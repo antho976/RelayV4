@@ -7,6 +7,7 @@ import com.tally.app.data.db.AccountEntity
 import com.tally.app.data.db.CategoryEntity
 import com.tally.app.data.db.TallyDatabase
 import com.tally.app.data.db.TransactionEntity
+import com.tally.app.data.db.tally
 import com.tally.app.data.repo.LedgerRepository
 import com.tally.app.data.repo.PlanRepository
 import com.tally.app.data.repo.RecurringPoster
@@ -24,6 +25,7 @@ object RoomTestDb {
     fun create(): TallyDatabase =
         Room.inMemoryDatabaseBuilder(ApplicationProvider.getApplicationContext<Context>(), TallyDatabase::class.java)
             .allowMainThreadQueries()
+            .tally()
             .build()
 }
 

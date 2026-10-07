@@ -12,6 +12,7 @@ import com.tally.app.data.db.GoalDao
 import com.tally.app.data.db.TallyDatabase
 import com.tally.app.data.db.RecurringDao
 import com.tally.app.data.db.TransactionDao
+import com.tally.app.data.db.tally
 import dagger.Binds
 import dagger.Module
 import dagger.Provides
@@ -34,8 +35,10 @@ object DatabaseModule {
     @Provides @Singleton
     fun database(@ApplicationContext context: Context): TallyDatabase =
         Room.databaseBuilder(context, TallyDatabase::class.java, TallyDatabase.NAME)
-            // Version 2 arrives by Room's auto-migration (TallyDatabase), tested in DaoTest. Never
+            // Version 2 arrives by Room's auto-migration, version 3 by SyncSchema's (both tested in
+            // MigrationTest), and tally() adds the sync triggers to a fresh install. Never
             // fallbackToDestructiveMigration on a ledger.
+            .tally()
             .build()
 
     @Provides fun transactions(db: TallyDatabase): TransactionDao = db.transactions()

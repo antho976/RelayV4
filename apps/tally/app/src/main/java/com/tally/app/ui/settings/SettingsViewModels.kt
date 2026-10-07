@@ -14,6 +14,9 @@ import com.tally.app.data.repo.DataRepository
 import com.tally.app.data.repo.DataResult
 import com.tally.app.data.repo.LedgerRepository
 import com.tally.app.data.repo.PlanRepository
+import com.tally.app.data.sync.PcSync
+import com.tally.app.data.sync.SyncPrefs
+import com.tally.app.data.sync.SyncStore
 import com.tally.app.ui.common.Notices
 import com.tally.core.BudgetPeriod
 import com.tally.core.CategoryKind
@@ -47,6 +50,9 @@ data class SettingsState(
     val bills: Int = 0,
     val goals: Int = 0,
     val backup: BackupPrefs = BackupPrefs(),
+    /** The paired PC and where sync with it stands; empty when there is none. */
+    val pc: SyncPrefs = SyncPrefs(),
+    val syncing: Boolean = false,
     val loaded: Boolean = false,
 ) {
     /** The sample loads only into an app with nothing the owner made (the seeded categories aside). */
@@ -58,6 +64,8 @@ class SettingsViewModel @Inject constructor(
     settings: SettingsRepository,
     ledger: LedgerRepository,
     plan: PlanRepository,
+    store: SyncStore,
+    private val sync: PcSync,
     clock: Clock,
 ) : ViewModel() {
 
@@ -86,7 +94,9 @@ class SettingsViewModel @Inject constructor(
         )
     }
 
-    val state: StateFlow<SettingsState> = combine(settings.settings, ledgerCounts, planCounts, settings.backup) { s, l, p, b ->
+    private val pc = combine(store.prefs, sync.busy) { prefs, busy -> prefs to busy }
+
+    val state: StateFlow<SettingsState> = combine(settings.settings, ledgerCounts, planCounts, settings.backup, pc) { s, l, p, b, (prefs, busy) ->
         SettingsState(
             today = today,
             settings = s,
@@ -101,9 +111,16 @@ class SettingsViewModel @Inject constructor(
             bills = p.bills,
             goals = p.goals,
             backup = b,
+            pc = prefs,
+            syncing = busy,
             loaded = true,
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), SettingsState(today = today))
+
+    /** Sync with the paired PC from the Settings list. Quiet either way: the row says how it went. */
+    fun syncNow() {
+        viewModelScope.launch { sync.syncNow() }
+    }
 }
 
 // ── Appearance ───────────────────────────────────────────────────────────────

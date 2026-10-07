@@ -128,7 +128,8 @@ class LedgerRepositoryTest {
         assertEquals(1, db.transactions().count())
 
         ledger.restore(deleted!!)
-        assertEquals(original, db.transactions().get(id))
+        // The same row, uid and all; only its change time moves on, so the paired PC hears of the undo.
+        assertEquals(original, db.transactions().get(id)!!.copy(updatedAt = original.updatedAt))
         assertEquals(2, db.transactions().count())
     }
 
@@ -264,7 +265,7 @@ class LedgerRepositoryTest {
         assertNull(ledger.category(food))
         ledger.restoreCategory(original, 500_00)
 
-        assertEquals(original, ledger.category(food))
+        assertEquals(original, ledger.category(food)!!.copy(updatedAt = original.updatedAt))
         assertEquals(500_00L, db.planRepository(clock).budgetFor(food)?.amount)
         ledger.deleteCategory(food, moveTo = null)
         ledger.restoreCategory(original, null)

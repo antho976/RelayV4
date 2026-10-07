@@ -29,6 +29,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.tally.app.data.sync.SyncScheduler
 import com.tally.app.ui.common.LocalMoney
 import com.tally.app.ui.common.NoticeHost
 import com.tally.app.ui.common.Notices
@@ -47,6 +48,7 @@ class MainActivity : ComponentActivity() {
 
     @Inject lateinit var notices: Notices
     @Inject lateinit var incoming: IncomingFiles
+    @Inject lateinit var syncScheduler: SyncScheduler
 
     private val root: RootViewModel by viewModels()
 
@@ -102,6 +104,12 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         receive(intent)
+    }
+
+    override fun onStart() {
+        super.onStart()
+        // Back in front: catch up with the paired PC, if there is one.
+        syncScheduler.onForeground()
     }
 
     /** Hands a file opened with or shared to Tally to the import. Anything else is ignored. */

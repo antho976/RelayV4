@@ -39,8 +39,9 @@ the end of the month.
 
 **The month is read as a pace, not a total.** Every budget is measured against where an even
 spend would put it today, so "you have spent 62%" becomes "you are 4 days ahead of your money".
-The reading travels with the number it came from. Fully offline: no account, no bank sync, no
-servers, no internet permission *(inferred from Avex's offline promise)*.
+The reading travels with the number it came from. Works fully offline: no account, no bank sync,
+no servers, no cloud. The one connection it makes is to the owner's own PC, once they pair it
+(owner decision 2026-10-07; see principle 4).
 
 ## Operating Context
 
@@ -50,7 +51,8 @@ servers, no internet permission *(inferred from Avex's offline promise)*.
 - Accounts are cash, bank, credit card or savings, each with a starting balance.
 - Recurring entries (rent, subscriptions, salary) post themselves on their due date.
 - Savings goals hold a target and contributions.
-- Data leaves the phone only when the owner exports it (CSV, JSON backup) *(inferred)*.
+- Data leaves the phone only when the owner exports it (CSV, JSON backup), or to the owner's own
+  PC once they pair Tally with Relay there (owner decision 2026-10-07). Nowhere else.
 
 ## Capabilities and Constraints
 
@@ -59,7 +61,10 @@ servers, no internet permission *(inferred from Avex's offline promise)*.
 - Money is stored as integer minor units (cents), never floating point.
 - Currency is chosen by the owner, defaulting to the device locale *(inferred; the owner is
   probably in Québec, so CAD and French-Canadian number formats must render correctly)*.
-- Undecided: bank import, multi-currency accounts, shared budgets, cloud sync. None are built.
+- Undecided: multi-currency accounts, shared budgets. Not built, and not planned: cloud sync.
+- Sync with the owner's PC (Relay, `docs/MONEY.md` at the repository root): the phone and the PC
+  each hold the whole ledger and work as one. Paired in Settings, over the owner's own network
+  (LAN or Tailscale); newest edit wins per row; the first sync makes the PC's copy the phone's.
 
 ## Brand Commitments
 
@@ -89,7 +94,9 @@ servers, no internet permission *(inferred from Avex's offline promise)*.
 2. **Show the reading, not just the verdict.** "Over pace" always travels with the amount and
    the days.
 3. **Honest at zero.** No data, no budget, no accounts: each state is drawn, never hidden.
-4. **Nothing leaves the phone unasked.**
+4. **Nothing leaves your own devices.** No cloud, no servers, no account. The ledger goes to the
+   owner's own PC once they pair it in Settings, and nowhere else (owner decision 2026-10-07; it
+   was "nothing leaves the phone unasked" before the PC sync).
 5. **Reversible by default.** Deletes come with Undo, not a confirm dialog; only erasing
    everything confirms.
 

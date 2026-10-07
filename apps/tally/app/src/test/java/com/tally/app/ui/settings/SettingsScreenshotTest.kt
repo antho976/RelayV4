@@ -8,6 +8,8 @@ import com.tally.app.data.prefs.Accent
 import com.tally.app.data.prefs.BackupPrefs
 import com.tally.app.data.prefs.Settings
 import com.tally.app.data.repo.DataResult
+import com.tally.app.data.sync.PairedPc
+import com.tally.app.data.sync.SyncPrefs
 import com.tally.app.testing.Fixtures
 import com.tally.app.testing.shoot
 import com.tally.core.BudgetPeriod
@@ -125,6 +127,34 @@ class SettingsScreenshotTest {
     @Test fun export200() = compose.shoot("export-200", fontScale = 2f) { ExportScreen(data, ExportActions()) }
 
     @Test fun about() = compose.shoot("about") { AboutScreen(settings) }
+    @Test fun aboutPaired() = compose.shoot("about-paired") { AboutScreen(settings.copy(pc = paired)) }
+
+    // ── Relay on your PC ─────────────────────────────────────────────────────
+
+    private val paired = SyncPrefs(
+        pc = PairedPc(
+            name = "antho desktop", hostId = "h1", instance = "stable", routes = listOf("ws://192.168.1.20:7420"),
+            deviceId = "d1", token = "t", pairedAt = today.minusDays(12).atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli(),
+        ),
+        cursor = 42,
+        replaced = true,
+        lastSuccessAt = today.atTime(14, 20).atZone(ZoneId.systemDefault()).toInstant().toEpochMilli(),
+        lastAttemptAt = today.atTime(14, 20).atZone(ZoneId.systemDefault()).toInstant().toEpochMilli(),
+        lastSent = 3,
+        lastReceived = 2,
+    )
+
+    private val failed = paired.copy(lastError = "The PC could not be reached")
+
+    @Test fun settingsPaired() = compose.shoot("settings-paired") { SettingsScreen(settings.copy(pc = paired), SettingsActions()) }
+    @Test fun pcUnpaired() = compose.shoot("pc-unpaired") { PcScreen(PcState(today = today, loaded = true), PcActions()) }
+    @Test fun pcUnpaired200() = compose.shoot("pc-unpaired-200", fontScale = 2f) { PcScreen(PcState(today = today, loaded = true), PcActions()) }
+    @Test fun pcPaired() = compose.shoot("pc-paired") { PcScreen(PcState(today = today, prefs = paired, loaded = true), PcActions()) }
+    @Test fun pcPaired200() = compose.shoot("pc-paired-200", fontScale = 2f) { PcScreen(PcState(today = today, prefs = paired, loaded = true), PcActions()) }
+    @Test fun pcFailed() = compose.shoot("pc-failed") { PcScreen(PcState(today = today, prefs = failed, loaded = true), PcActions()) }
+    @Test fun pcPairing() = compose.shoot("pc-pairing") {
+        PcScreen(PcState(today = today, busy = true, pairing = true, loaded = true), PcActions())
+    }
 
     private val groceries = CategoryEntity(1, "Groceries", CategoryKind.EXPENSE, 0, "cart")
     private val dining = CategoryEntity(2, "Dining", CategoryKind.EXPENSE, 6, "dining")

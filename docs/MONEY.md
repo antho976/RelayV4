@@ -127,7 +127,7 @@ greeting, pairing code once, then a proof per connection; docs/MOBILE.md §2, §
 bus request, `money.sync`, which is in `PHONE_OPS`.
 
 ```
-money.sync { device, replace?, since, changes: [Change] }  →  { cursor, changes: [Change], replaced }
+money.sync { device, replace?, since, changes: [Change] }  →  { cursor, changes: [Change], replaced, applied, skipped }
 Change = { table, uid, updated_at, deleted, row }
 ```
 
@@ -136,18 +136,28 @@ Change = { table, uid, updated_at, deleted, row }
 - `changes` are the phone's rows changed since it last synced (by the phone's `updatedAt`), and
   its tombstones.
 - **First sync: `replace: true`.** The PC's ledger becomes the phone's: everything on the PC is
-  erased and the phone's rows are applied. The phone is where the ledger lives; the PC is a
-  second view of it. After that, both sides merge.
+  erased and the phone's rows are applied, and the PC answers with no changes, just the cursor.
+  The phone is where the ledger lives; the PC is a second view of it. After that, both sides
+  merge. Tally says so on its pairing page before the first sync runs.
+- A large first sync may come in batches: the first carries `replace: true`, the rest
+  `replace: false` with the cursor the one before answered, tables in order across them.
 - **Newest edit wins, per row**, by `updated_at` (ms since the epoch). An equal or older change
   is ignored. A tombstone (`deleted: true`) wins like any edit.
 - References travel as uids, never local ids: a transaction's `row.account` is the account's
   uid. Budgets are matched by their category (`row.category`, null for the overall budget), not
   by uid, because each category has one budget.
+- A tombstone's `row` is `{}`, except a budget's, which must carry `{ category }`: the PC reads a
+  budget change with no category as the overall budget. Tally keeps the category's uid in its
+  tombstone for that, and sends nothing for a budget whose category is already gone (the
+  category's own tombstone takes it on the PC). A row whose reference the receiving side does
+  not have is skipped (counted in `skipped`), not fatal.
 - A posted bill's uid is `bill:<recurring uid>:<date>` on both devices, so the same rent posted
   on each merges into one row.
 - `table` is one of `settings`, `accounts`, `categories`, `recurring`, `goals`, `transactions`,
   `budgets`, `contributions`, `account_values`, applied in that order. `settings` rows have
-  the setting's name as uid (`currency`, `month_start_day`) and `row: { value }`.
+  the setting's name as uid (`currency`, `month_start_day`, `week_starts_monday`) and
+  `row: { value }`, a string as the PC stores it (`"CAD"`, `"15"`, `"1"`/`"0"`). On the phone
+  they live in DataStore, each with the time it last changed.
 
 Row fields, camelCase as Tally's backup writes them:
 

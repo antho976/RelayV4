@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.CloudOff
+import androidx.compose.material.icons.rounded.Devices
 import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.NoAccounts
 import androidx.compose.material.icons.rounded.Science
@@ -62,10 +63,19 @@ fun AboutScreen(state: SettingsState, onBack: () -> Unit = {}) {
         item(key = "hero") { LedgerHero(state, Modifier.padding(horizontal = GUTTER)) }
         item(key = "tiles") { AboutTiles(state, Modifier.padding(horizontal = GUTTER)) }
         item(key = "promises") {
+            val pc = state.pc.pc
             val rows: List<@Composable (Shape) -> Unit> = listOf(
-                promiseRow(Icons.Rounded.CloudOff, "No internet permission", "Tally cannot send anything anywhere, by design"),
+                promiseRow(
+                    Icons.Rounded.Devices,
+                    "Nothing leaves your own devices",
+                    if (pc == null) "No cloud, no servers. Only a PC you pair with Relay ever gets your ledger" else "No cloud, no servers. Your ledger goes to ${pc.name} and nowhere else",
+                ),
                 promiseRow(Icons.Rounded.NoAccounts, "No account", "Nothing to sign in to, nothing kept about you elsewhere"),
-                promiseRow(Icons.Rounded.Storage, "Kept on this phone", "Your entries live in the app's own storage"),
+                promiseRow(
+                    Icons.Rounded.Storage,
+                    if (pc == null) "Kept on this phone" else "Kept on this phone and your PC",
+                    "Your entries live in the app's own storage",
+                ),
                 promiseRow(Icons.Rounded.Shield, "Bank files stay here", "A statement you import is read on the phone and never kept"),
             )
             Group(rows = rows, modifier = Modifier.padding(horizontal = GUTTER).padding(top = 14.dp), title = "Privacy")
@@ -86,12 +96,12 @@ private fun LedgerHero(state: SettingsState, modifier: Modifier = Modifier) {
         HeroHead("On this phone", end = "OFFLINE")
         Spacer(Modifier.height(12.dp))
         HeroNumber(count, description = Copy.plural(state.entries, "entry", "entries"))
+        val where = state.pc.pc?.let { "kept here and on ${it.name}" } ?: "kept here and nowhere else"
         Text(
             if (state.entries == 0) {
-                "No entries yet. What you log is kept here and nowhere else"
+                "No entries yet. What you log is $where"
             } else {
-                (if (state.entries == 1) "entry" else "entries") + " across " + Copy.plural(state.accounts, "account") +
-                    ", kept here and nowhere else"
+                (if (state.entries == 1) "entry" else "entries") + " across " + Copy.plural(state.accounts, "account") + ", " + where
             },
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -100,7 +110,7 @@ private fun LedgerHero(state: SettingsState, modifier: Modifier = Modifier) {
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             StatChip(Icons.Rounded.CloudOff, "Works offline")
             StatChip(Icons.Rounded.NoAccounts, "No sign-in")
-            StatChip(Icons.Rounded.Lock, "Leaves only when you export")
+            StatChip(Icons.Rounded.Lock, if (state.pc.paired) "Goes only to your PC" else "Leaves only when you export")
             if (state.settings.sampleLoaded) StatChip(Icons.Rounded.Science, "Sample data")
         }
     }

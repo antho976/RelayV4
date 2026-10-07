@@ -41,6 +41,8 @@ private const val LEDGER_WHERE = """
 interface TransactionDao {
 
     @Insert suspend fun insert(tx: TransactionEntity): Long
+    /** -1 when a row with the same uid is already there: a bill the PC posted first. */
+    @Insert(onConflict = OnConflictStrategy.IGNORE) suspend fun insertOrIgnore(tx: TransactionEntity): Long
     @Insert suspend fun insertAll(tx: List<TransactionEntity>)
     @Update suspend fun update(tx: TransactionEntity)
     @Update suspend fun updateAll(tx: List<TransactionEntity>)
@@ -314,7 +316,7 @@ interface BudgetDao {
     @Transaction
     suspend fun setAmount(categoryId: Long, amount: Long) {
         val existing = getFor(categoryId)
-        upsert(BudgetEntity(id = existing?.id ?: 0, categoryId = categoryId, amount = amount))
+        upsert(existing?.copy(amount = amount) ?: BudgetEntity(categoryId = categoryId, amount = amount))
     }
     @Query(
         """SELECT b.id, b.categoryId, b.amount, c.name AS categoryName, c.color AS categoryColor, c.icon AS categoryIcon
@@ -426,4 +428,78 @@ interface AccountValueDao {
     @Query("SELECT * FROM account_values ORDER BY date, id") fun observeAll(): Flow<List<AccountValueEntity>>
     @Query("SELECT * FROM account_values ORDER BY date, id") suspend fun all(): List<AccountValueEntity>
     @Query("DELETE FROM account_values") suspend fun deleteAll()
+}
+
+/** A row's local id and its permanent uid: how references are turned into uids and back. */
+data class IdUid(val id: Long, val uid: String)
+
+/**
+ * What the PC sync reads and writes (data/sync/LedgerSync.kt). The `since` reads include rows
+ * stamped exactly at the watermark: sending one twice is harmless, missing one is not.
+ */
+@Dao
+interface SyncDao {
+    @Query("SELECT * FROM accounts WHERE updatedAt >= :since") suspend fun accountsSince(since: Long): List<AccountEntity>
+    @Query("SELECT * FROM categories WHERE updatedAt >= :since") suspend fun categoriesSince(since: Long): List<CategoryEntity>
+    @Query("SELECT * FROM recurring WHERE updatedAt >= :since") suspend fun recurringSince(since: Long): List<RecurringEntity>
+    @Query("SELECT * FROM goals WHERE updatedAt >= :since") suspend fun goalsSince(since: Long): List<GoalEntity>
+    @Query("SELECT * FROM transactions WHERE updatedAt >= :since") suspend fun transactionsSince(since: Long): List<TransactionEntity>
+    @Query("SELECT * FROM budgets WHERE updatedAt >= :since") suspend fun budgetsSince(since: Long): List<BudgetEntity>
+    @Query("SELECT * FROM goal_contributions WHERE updatedAt >= :since") suspend fun contributionsSince(since: Long): List<ContributionEntity>
+    @Query("SELECT * FROM account_values WHERE updatedAt >= :since") suspend fun valuesSince(since: Long): List<AccountValueEntity>
+    @Query("SELECT * FROM sync_tombstones WHERE deletedAt >= :since") suspend fun tombstonesSince(since: Long): List<TombstoneEntity>
+
+    @Query("SELECT id, uid FROM accounts") suspend fun accountUids(): List<IdUid>
+    @Query("SELECT id, uid FROM categories") suspend fun categoryUids(): List<IdUid>
+    @Query("SELECT id, uid FROM recurring") suspend fun recurringUids(): List<IdUid>
+    @Query("SELECT id, uid FROM goals") suspend fun goalUids(): List<IdUid>
+
+    @Query("SELECT * FROM accounts WHERE uid = :uid") suspend fun account(uid: String): AccountEntity?
+    @Query("SELECT * FROM categories WHERE uid = :uid") suspend fun category(uid: String): CategoryEntity?
+    @Query("SELECT * FROM recurring WHERE uid = :uid") suspend fun recurring(uid: String): RecurringEntity?
+    @Query("SELECT * FROM goals WHERE uid = :uid") suspend fun goal(uid: String): GoalEntity?
+    @Query("SELECT * FROM transactions WHERE uid = :uid") suspend fun transaction(uid: String): TransactionEntity?
+    @Query("SELECT * FROM budgets WHERE uid = :uid") suspend fun budget(uid: String): BudgetEntity?
+    @Query("SELECT * FROM budgets WHERE categoryId = :categoryId") suspend fun budgetFor(categoryId: Long): BudgetEntity?
+    @Query("SELECT * FROM goal_contributions WHERE uid = :uid") suspend fun contribution(uid: String): ContributionEntity?
+    @Query("SELECT * FROM account_values WHERE uid = :uid") suspend fun value(uid: String): AccountValueEntity?
+
+    @Insert suspend fun insertAccount(row: AccountEntity): Long
+    @Insert suspend fun insertCategory(row: CategoryEntity): Long
+    @Insert suspend fun insertRecurring(row: RecurringEntity): Long
+    @Insert suspend fun insertGoal(row: GoalEntity): Long
+    @Insert suspend fun insertTransaction(row: TransactionEntity): Long
+    @Insert suspend fun insertBudget(row: BudgetEntity): Long
+    @Insert suspend fun insertContribution(row: ContributionEntity): Long
+    @Insert suspend fun insertValue(row: AccountValueEntity): Long
+
+    @Update suspend fun updateAccount(row: AccountEntity)
+    @Update suspend fun updateCategory(row: CategoryEntity)
+    @Update suspend fun updateRecurring(row: RecurringEntity)
+    @Update suspend fun updateGoal(row: GoalEntity)
+    @Update suspend fun updateTransaction(row: TransactionEntity)
+    @Update suspend fun updateBudget(row: BudgetEntity)
+    @Update suspend fun updateContribution(row: ContributionEntity)
+    @Update suspend fun updateValue(row: AccountValueEntity)
+
+    @Query("DELETE FROM accounts WHERE id = :id") suspend fun deleteAccount(id: Long)
+    @Query("DELETE FROM categories WHERE id = :id") suspend fun deleteCategory(id: Long)
+    @Query("DELETE FROM recurring WHERE id = :id") suspend fun deleteRecurring(id: Long)
+    @Query("DELETE FROM goals WHERE id = :id") suspend fun deleteGoal(id: Long)
+    @Query("DELETE FROM transactions WHERE id = :id") suspend fun deleteTransaction(id: Long)
+    @Query("DELETE FROM budgets WHERE id = :id") suspend fun deleteBudget(id: Long)
+    @Query("DELETE FROM goal_contributions WHERE id = :id") suspend fun deleteContribution(id: Long)
+    @Query("DELETE FROM account_values WHERE id = :id") suspend fun deleteValue(id: Long)
+
+    /** A deleted account's goals read everything, as on a local delete (GoalDao.forgetAccount). */
+    @Query("UPDATE goals SET accountId = NULL WHERE accountId = :accountId") suspend fun forgetAccount(accountId: Long)
+
+    @Query("SELECT * FROM sync_tombstones WHERE tableName = :table AND uid = :uid") suspend fun tombstone(table: String, uid: String): TombstoneEntity?
+    @Query("DELETE FROM sync_tombstones WHERE tableName = :table AND uid = :uid") suspend fun forgetTombstone(table: String, uid: String)
+    @Query("DELETE FROM sync_tombstones WHERE deletedAt < :before") suspend fun pruneTombstones(before: Long)
+    @Query("SELECT * FROM sync_tombstones") suspend fun tombstones(): List<TombstoneEntity>
+
+    /** While set, local-edit triggers stand aside (SyncSchema). Only inside the apply transaction. */
+    @Query("INSERT OR REPLACE INTO sync_state (`key`, value) VALUES ('applying', 1)") suspend fun beginApplying()
+    @Query("DELETE FROM sync_state WHERE `key` = 'applying'") suspend fun endApplying()
 }

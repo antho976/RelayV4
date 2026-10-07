@@ -3,8 +3,9 @@
 An offline spending and budget tracker for Android. You log what you spend in two seconds, and the
 app answers one question at all times: how much room is left this month, and is the month on pace.
 
-Kotlin, Jetpack Compose and Material 3, Room over SQLite, Hilt. No account, no servers, no
-internet permission. Visual language inherited from Avex.
+Kotlin, Jetpack Compose and Material 3, Room over SQLite, Hilt. No account, no servers, no cloud:
+nothing leaves your own devices. The one connection it ever opens is to your own PC, if you pair
+Tally with Relay there. Visual language inherited from Avex.
 
 ## Install a test build
 
@@ -47,7 +48,13 @@ they can never pass for real data; Erase everything removes them.
   payday budget month, week start, accounts (with Desjardins and Wealthsimple quick starts, and
   recorded values for investment accounts), categories (over a hundred icons, suggested from
   the name), Backup (weekly automatic copies, a folder of your choice, restore), Export (CSV and
-  the backup file), sample data, erase.
+  the backup file), Relay on your PC, sample data, erase.
+- **Relay on your PC** (Settings): pair with Relay on your computer by pasting the
+  `relay://pair` link that `relay remote pair` prints, or by its address and code. The phone and
+  the PC then hold the same ledger and work as one: Tally syncs when it opens, a few seconds after
+  a change, and every half hour while there is a network. Newest edit wins per row; the first
+  sync makes the PC's ledger a copy of the phone's. The wire contract is `docs/MONEY.md` ("Sync")
+  at the repository root.
 
 ## Build
 
@@ -67,9 +74,9 @@ Needs JDK 21 and the Android SDK with `platforms;android-37.0`.
 
 | Job | What it proves |
 |---|---|
-| Guard | wrapper checksum, no keystores or build output committed, no INTERNET permission |
+| Guard | wrapper checksum, no keystores or build output committed, network code only in the PC sync (`data/sync`) |
 | Core | money formatting, budget periods, pace, recurrence, CSV and backup codecs, sample data, voice rules |
-| Verify | Room DAO and repository tests on SQLite, recurring posting, backup round trip, design doctrine, theme contrast, screenshot goldens at 100% and 200% font, Android Lint, R8 release, merged manifest has no INTERNET, APK size budget |
+| Verify | Room DAO and repository tests on SQLite, the version 2 to 3 migration, sync merge rules and the PC sync against a fake Relay door, recurring posting, backup round trip, design doctrine, theme contrast, screenshot goldens at 100% and 200% font, Android Lint, R8 release, merged manifest asks only for the expected permissions, APK size budget |
 | Instrumented | the real UI flow on an emulator with LeakCanary failing any test that leaks, device SQLite, and a cold launch of the minified APK |
 
 `tally-record-screenshots.yml` re-records the goldens and the Room schema on demand;

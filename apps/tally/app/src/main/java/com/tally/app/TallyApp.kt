@@ -9,6 +9,7 @@ import com.tally.app.data.repo.LedgerRepository
 import com.tally.app.data.repo.RecurringPoster
 import com.tally.app.di.AppScope
 import com.tally.app.data.prefs.SettingsRepository
+import com.tally.app.data.sync.SyncScheduler
 import com.tally.app.work.BackupWorker
 import com.tally.app.work.RecurringWorker
 import dagger.hilt.android.HiltAndroidApp
@@ -25,6 +26,7 @@ class TallyApp : Application(), Configuration.Provider {
     @Inject lateinit var ledger: dagger.Lazy<LedgerRepository>
     @Inject lateinit var poster: dagger.Lazy<RecurringPoster>
     @Inject lateinit var settings: dagger.Lazy<SettingsRepository>
+    @Inject lateinit var syncScheduler: dagger.Lazy<SyncScheduler>
     @Inject @AppScope lateinit var appScope: CoroutineScope
 
     override val workManagerConfiguration: Configuration
@@ -38,6 +40,8 @@ class TallyApp : Application(), Configuration.Provider {
             runCatching { poster.get().postDue() }
             // The weekly backup follows its switch in Settings, which is on unless turned off.
             runCatching { BackupWorker.sync(this@TallyApp, settings.get().currentBackup().auto) }
+            // Sync with a paired PC: after changes, and every half hour. Idle until one is paired.
+            runCatching { syncScheduler.get().start() }
         }
         RecurringWorker.schedule(this)
     }

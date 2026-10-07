@@ -10,6 +10,7 @@ import com.tally.core.Recurrence
 import com.tally.core.TxType
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import java.time.LocalDate
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -55,7 +56,10 @@ class RecurringPoster @Inject constructor(
                 val last = fresh.endDate?.takeIf { it.isBefore(today) } ?: today
                 val dates = rule.between(fresh.nextDate, last, limit = CATCH_UP_LIMIT)
                 dates.forEach { date ->
-                    transactions.insert(
+                    // The PC posts the same bill under the same uid, so whichever device posts a
+                    // date first, the two copies are one row once they sync. A date already here
+                    // (posted on the PC and synced) is skipped.
+                    val id = transactions.insertOrIgnore(
                         TransactionEntity(
                             type = fresh.type,
                             amount = fresh.amount,
@@ -66,10 +70,11 @@ class RecurringPoster @Inject constructor(
                             note = fresh.name,
                             recurringId = fresh.id,
                             createdAt = clock.nowMillis(),
+                            uid = billUid(fresh.uid, date),
                         )
                     )
+                    if (id != -1L) posted++
                 }
-                posted += dates.size
                 val next = rule.after(dates.lastOrNull() ?: today)
                 val ended = fresh.endDate != null && next.isAfter(fresh.endDate)
                 recurring.update(fresh.copy(nextDate = next, active = fresh.active && !ended))
@@ -81,5 +86,8 @@ class RecurringPoster @Inject constructor(
     companion object {
         /** A weekly bill a year overdue; anything beyond that is a data problem, not a backlog. */
         const val CATCH_UP_LIMIT = 60
+
+        /** A posted bill's uid on both devices (docs/MONEY.md): `bill:<recurring uid>:<ISO date>`. */
+        fun billUid(recurringUid: String, date: LocalDate): String = "bill:$recurringUid:$date"
     }
 }

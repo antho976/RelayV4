@@ -419,7 +419,7 @@ Tactile and few. A view has one hero action at most.
 - **Bottom bar:** container-low, a 1dp outline-variant top edge, 72dp plus the system inset, three equal full-height tab targets: Home, Plan, Insights. The ledger is not a tab: History opens from Home's Recent panel ("view all"), as Avex reads its log, so the entries are never shown twice. Each item is a 24dp glyph over a body-small label; the picked one puts its glyph in the accent on a 60 by 32dp indicator pill (16dp corners, accent at 16%) and its label in on-ground semibold; idle items are muted. The pill fades in over 150ms. Each item announces as a tab.
 - **Rail (600dp and up):** the same items, 72dp tall each, in an 88dp column under the FAB.
 - **Tab change:** a 150ms cross-fade; each tab keeps its scroll. Pushed screens slide in by an eighth of the width over 320ms with a fade.
-- **Settings:** Avex's grouped list: a search slab at the top that filters every page and setting by its words, then General, Money, Data and Reset groups of slab rows, each led by a neutral glyph badge, then About. Backup, Export, Import and About are pages of their own, each a page head over groups; Reset's acts confirm in a dialog.
+- **Settings:** Avex's grouped list: a search slab at the top that filters every page and setting by its words, then General, Money, Data, Relay on your PC and Reset groups of slab rows, each led by a neutral glyph badge, then About. Backup, Export, Import, Relay on your PC and About are pages of their own, each a page head over groups; Reset's acts confirm in a dialog.
 - **Snackbar:** container-highest with on-ground text and an accent action, lifted clear of the bar and the FAB. Deletes offer Undo here instead of a confirm.
 
 ### Lists and rows

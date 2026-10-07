@@ -9,6 +9,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.AccountBalance
 import androidx.compose.material.icons.rounded.Category
+import androidx.compose.material.icons.rounded.Computer
 import androidx.compose.material.icons.rounded.Contrast
 import androidx.compose.material.icons.rounded.CurrencyExchange
 import androidx.compose.material.icons.rounded.DeleteForever
@@ -19,6 +20,8 @@ import androidx.compose.material.icons.rounded.MoveToInbox
 import androidx.compose.material.icons.rounded.Science
 import androidx.compose.material.icons.rounded.SearchOff
 import androidx.compose.material.icons.rounded.SettingsBackupRestore
+import androidx.compose.material.icons.rounded.Sync
+import androidx.compose.material.icons.rounded.SyncProblem
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -45,6 +48,7 @@ import com.tally.app.ui.common.GlyphBadge
 import com.tally.app.ui.common.Group
 import com.tally.app.ui.common.GroupRow
 import com.tally.app.ui.common.LocalMoney
+import com.tally.app.ui.common.RowPill
 import com.tally.app.ui.nav.AppNav
 import com.tally.core.Copy
 import java.time.Instant
@@ -72,6 +76,7 @@ fun SettingsRoute(nav: AppNav) {
                     SettingsDest.IMPORT -> nav.import()
                     SettingsDest.BACKUP -> nav.backup()
                     SettingsDest.EXPORT -> nav.export()
+                    SettingsDest.PC -> nav.pc()
                     SettingsDest.ABOUT -> nav.about()
                     // The two acts that ask first are the screen's; it never routes them here.
                     SettingsDest.SAMPLE, SettingsDest.ERASE -> Unit
@@ -79,6 +84,7 @@ fun SettingsRoute(nav: AppNav) {
             },
             loadSample = dataModel::loadSample,
             eraseAll = dataModel::eraseAll,
+            syncNow = viewModel::syncNow,
         )
     }
     SettingsScreen(state, actions, data = data)
@@ -90,6 +96,7 @@ data class SettingsActions(
     val open: (SettingsDest) -> Unit = {},
     val loadSample: () -> Unit = {},
     val eraseAll: () -> Unit = {},
+    val syncNow: () -> Unit = {},
 )
 
 /**
@@ -119,7 +126,8 @@ fun SettingsScreen(state: SettingsState, actions: SettingsActions, data: DataSta
         verticalArrangement = Arrangement.spacedBy(if (q.isBlank()) GROUP_SPACING else 14.dp),
     ) {
         item(key = "head") {
-            PageHead("Settings", onBack = actions.back, context = "Tally ${state.version} · on this phone only")
+            val where = state.pc.pc?.let { "synced with ${it.name}" } ?: "on this phone only"
+            PageHead("Settings", onBack = actions.back, context = "Tally ${state.version} · $where")
         }
         item(key = "search") {
             SearchField(q, { typed = it }, Modifier.padding(horizontal = GUTTER), placeholder = "Search settings")
@@ -128,6 +136,7 @@ fun SettingsScreen(state: SettingsState, actions: SettingsActions, data: DataSta
             item(key = "general") { GeneralGroup(state, choose) }
             item(key = "money") { MoneyGroup(state, choose) }
             item(key = "data") { DataGroupRows(state, choose) }
+            item(key = "pc") { PcGroup(state, choose, actions.syncNow) }
             item(key = "reset") { ResetGroup(state, data, choose) }
             item(key = "about") { AboutGroup(state, choose) }
         } else if (hits.isEmpty()) {
@@ -214,6 +223,7 @@ internal fun destIcon(dest: SettingsDest): ImageVector = when (dest) {
     SettingsDest.IMPORT -> Icons.Rounded.MoveToInbox
     SettingsDest.BACKUP -> Icons.Rounded.SettingsBackupRestore
     SettingsDest.EXPORT -> Icons.Rounded.FileDownload
+    SettingsDest.PC -> Icons.Rounded.Computer
     SettingsDest.SAMPLE -> Icons.Rounded.Science
     SettingsDest.ERASE -> Icons.Rounded.DeleteForever
     SettingsDest.ABOUT -> Icons.Rounded.Info
@@ -300,6 +310,47 @@ private fun DataGroupRows(state: SettingsState, onOpen: (SettingsDest) -> Unit) 
     )
 }
 
+/**
+ * Relay on your PC: the paired PC and how its last sync went, with Sync now beside it; before
+ * pairing, one row into the page that pairs.
+ */
+@Composable
+private fun PcGroup(state: SettingsState, onOpen: (SettingsDest) -> Unit, syncNow: () -> Unit) {
+    val p = state.pc
+    val pc = p.pc
+    val lastOn = lastSyncOn(p, state.today)
+    val failed = pc != null && p.lastError != null
+    val pcRow: @Composable (Shape) -> Unit = { shape ->
+        GroupRow(
+            pc?.name ?: "Pair with your PC",
+            shape,
+            subtitle = pcSummary(pc != null, lastOn, p.lastError),
+            leading = {
+                val tint = MaterialTheme.colorScheme.error
+                if (failed) GlyphBadge(Icons.Rounded.SyncProblem, tint = tint, fill = tint.copy(alpha = 0.14f)) else GlyphBadge(Icons.Rounded.Computer)
+            },
+            onClick = { onOpen(SettingsDest.PC) },
+        )
+    }
+    val syncRow: @Composable (Shape) -> Unit = { shape ->
+        GroupRow(
+            if (state.syncing) "Syncing" else "Sync now",
+            shape,
+            subtitle = "Sends what changed here and takes the PC's changes",
+            leading = { GlyphBadge(Icons.Rounded.Sync) },
+            trailing = { RowPill("Sync") },
+            chevron = false,
+            onClick = if (state.syncing) null else syncNow,
+        )
+    }
+    Group(
+        rows = if (pc == null) listOf(pcRow) else listOf(pcRow, syncRow),
+        modifier = GROUP_MODIFIER,
+        title = PC_GROUP,
+        footer = if (pc == null) "Your ledger goes only to a PC you pair, over your own network" else null,
+    )
+}
+
 @Composable
 private fun ResetGroup(state: SettingsState, data: DataState?, onOpen: (SettingsDest) -> Unit) {
     val idle = data?.busy == null
@@ -340,7 +391,7 @@ private fun ResetGroup(state: SettingsState, data: DataState?, onOpen: (Settings
 @Composable
 private fun AboutGroup(state: SettingsState, onOpen: (SettingsDest) -> Unit) {
     val about: @Composable (Shape) -> Unit = { shape ->
-        SettingsRow(SettingsDest.ABOUT, shape, "Version ${state.version} · offline, no account, no internet permission", onOpen)
+        SettingsRow(SettingsDest.ABOUT, shape, "Version ${state.version} · no account, nothing leaves your own devices", onOpen)
     }
     Group(rows = listOf(about), modifier = GROUP_MODIFIER, title = "About")
 }

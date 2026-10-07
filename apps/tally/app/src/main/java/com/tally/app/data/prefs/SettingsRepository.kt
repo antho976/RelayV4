@@ -77,6 +77,19 @@ data class BackupPrefs(
     val folderFailed: Boolean = false,
 )
 
+/** One setting the PC sync carries, as the PC stores it: a string [value] and when it changed. */
+@Immutable
+data class SyncedSetting(val key: String, val value: String, val updatedAt: Long) {
+    companion object {
+        const val CURRENCY = "currency"
+        const val MONTH_START_DAY = "month_start_day"
+        const val WEEK_STARTS_MONDAY = "week_starts_monday"
+    }
+}
+
+@Immutable
+data class SyncedSettings(val all: List<SyncedSetting>)
+
 private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "settings")
 
 @Singleton
@@ -99,6 +112,10 @@ class SettingsRepository @Inject constructor(@ApplicationContext context: Contex
         val backupLastAt = longPreferencesKey("backup_last_at")
         val backupFailed = booleanPreferencesKey("backup_failed")
         val backupFolderFailed = booleanPreferencesKey("backup_folder_failed")
+        // When each synced setting last changed, for the PC sync's newest-wins (epoch millis).
+        val currencyAt = longPreferencesKey("currency_at")
+        val monthStartAt = longPreferencesKey("month_start_day_at")
+        val weekMondayAt = longPreferencesKey("week_starts_monday_at")
     }
 
     val settings: Flow<Settings> = store.data
@@ -151,9 +168,18 @@ class SettingsRepository @Inject constructor(@ApplicationContext context: Contex
         it[Keys.backupFolderFailed] = folderFailed
     }
 
-    suspend fun setCurrency(code: String) = store.edit { it[Keys.currency] = code }
-    suspend fun setMonthStartDay(day: Int) = store.edit { it[Keys.monthStart] = day.coerceIn(1, BudgetPeriod.MAX_START_DAY) }
-    suspend fun setWeekStartsMonday(monday: Boolean) = store.edit { it[Keys.weekMonday] = monday }
+    suspend fun setCurrency(code: String) = store.edit {
+        it[Keys.currency] = code
+        it[Keys.currencyAt] = System.currentTimeMillis()
+    }
+    suspend fun setMonthStartDay(day: Int) = store.edit {
+        it[Keys.monthStart] = day.coerceIn(1, BudgetPeriod.MAX_START_DAY)
+        it[Keys.monthStartAt] = System.currentTimeMillis()
+    }
+    suspend fun setWeekStartsMonday(monday: Boolean) = store.edit {
+        it[Keys.weekMonday] = monday
+        it[Keys.weekMondayAt] = System.currentTimeMillis()
+    }
     suspend fun setAccent(accent: Accent) = store.edit { it[Keys.accent] = accent.key }
     suspend fun setAccentEnabled(enabled: Boolean) = store.edit { it[Keys.accentEnabled] = enabled }
     suspend fun setAmoled(amoled: Boolean) = store.edit { it[Keys.amoled] = amoled }
@@ -167,5 +193,60 @@ class SettingsRepository @Inject constructor(@ApplicationContext context: Contex
         it.remove(Keys.defaultAccount)
         it.remove(Keys.sampleLoaded)
         it.remove(Keys.monthStart)
+        // Back to the 1st is a change too, so the paired PC hears about it.
+        it[Keys.monthStartAt] = System.currentTimeMillis()
+    }
+
+    /** The settings the PC sync carries, each with when it last changed (0: never set here). */
+    suspend fun synced(): SyncedSettings {
+        val p = store.data.catch { if (it is IOException) emit(emptyPreferences()) else throw it }.first()
+        val s = current()
+        return SyncedSettings(
+            listOf(
+                SyncedSetting(SyncedSetting.CURRENCY, s.currency, p[Keys.currencyAt] ?: 0L),
+                SyncedSetting(SyncedSetting.MONTH_START_DAY, s.monthStartDay.toString(), p[Keys.monthStartAt] ?: 0L),
+                SyncedSetting(SyncedSetting.WEEK_STARTS_MONDAY, if (s.weekStartsMonday) "1" else "0", p[Keys.weekMondayAt] ?: 0L),
+            )
+        )
+    }
+
+    /**
+     * Takes a setting from the PC when its change is newer than this phone's, keeping the PC's
+     * change time. True when it was taken. Values that do not read are refused, not guessed.
+     * The currency is only relabelled: the PC rescaled its amounts when it switched, and those
+     * arrive as rows of their own.
+     */
+    suspend fun applySynced(key: String, value: String, at: Long): Boolean {
+        var taken = false
+        store.edit { p ->
+            when (key) {
+                SyncedSetting.CURRENCY -> if ((p[Keys.currencyAt] ?: 0L) < at && runCatching { Currency.getInstance(value) }.isSuccess) {
+                    p[Keys.currency] = value
+                    p[Keys.currencyAt] = at
+                    taken = true
+                }
+                SyncedSetting.MONTH_START_DAY -> {
+                    val day = value.trim().toIntOrNull()?.takeIf { it in 1..BudgetPeriod.MAX_START_DAY }
+                    if ((p[Keys.monthStartAt] ?: 0L) < at && day != null) {
+                        p[Keys.monthStart] = day
+                        p[Keys.monthStartAt] = at
+                        taken = true
+                    }
+                }
+                SyncedSetting.WEEK_STARTS_MONDAY -> {
+                    val monday = when (value.trim().lowercase()) {
+                        "1", "true" -> true
+                        "0", "false" -> false
+                        else -> null
+                    }
+                    if ((p[Keys.weekMondayAt] ?: 0L) < at && monday != null) {
+                        p[Keys.weekMonday] = monday
+                        p[Keys.weekMondayAt] = at
+                        taken = true
+                    }
+                }
+            }
+        }
+        return taken
     }
 }

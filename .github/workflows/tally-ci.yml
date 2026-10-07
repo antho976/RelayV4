@@ -79,13 +79,16 @@ jobs:
           fi
           echo "Clean."
 
-      - name: No INTERNET permission
-        # The product promise: nothing leaves the phone unless the owner exports it. A merged
-        # manifest that gains INTERNET (a library adding it) fails the release check below; this
-        # catches the hand-written one.
+      - name: Network code only in the PC sync
+        # The product promise (PRODUCT.md, principle 4): nothing leaves your own devices. Tally
+        # holds INTERNET for one thing, the WebSocket to the PC the owner paired (data/sync), so
+        # any other code that opens a connection fails here.
         run: |
-          if grep -R "android.permission.INTERNET" app/src/main/AndroidManifest.xml; then
-            echo "::error::Tally must not request INTERNET."; exit 1
+          offenders=$(grep -RlE 'okhttp3|java\.net\.(URL|Socket|HttpURLConnection)\b|HttpsURLConnection|newWebSocket' app/src/main/java \
+            | grep -v '^app/src/main/java/com/tally/app/data/sync/' || true)
+          if [ -n "$offenders" ]; then
+            echo "$offenders"
+            echo "::error::Network code outside data/sync. Only the paired-PC sync may reach out."; exit 1
           fi
 
       - name: CI helper self checks
@@ -218,14 +221,20 @@ jobs:
           set -o pipefail
           ./gradlew :app:assembleDebug :app:assembleRelease -PtallyCiSmokeSigning 2>&1 | tee -a "$RUNNER_TEMP/verify.log"
 
-      - name: No INTERNET in the merged release manifest
+      - name: Only the expected permissions in the merged release manifest
+        # INTERNET and ACCESS_NETWORK_STATE are the PC sync's; the rest are WorkManager's own.
+        # A dependency that adds anything else (location, contacts, the wifi state) fails here.
         if: ${{ !cancelled() }}
         run: |
           manifest=$(find app/build/intermediates/merged_manifests/release -name AndroidManifest.xml | head -1)
           if [ -z "$manifest" ]; then manifest=$(find app/build/intermediates -path '*release*' -name AndroidManifest.xml | grep merged | head -1); fi
           echo "Checking $manifest"
-          if grep -q "android.permission.INTERNET" "$manifest"; then
-            echo "::error::A dependency added INTERNET to the release manifest."; exit 1
+          found=$(grep -oE 'uses-permission[^>]*android:name="[^"]+"' "$manifest" | sed -E 's/.*android:name="([^"]+)"/\1/' | sort -u)
+          echo "$found"
+          unexpected=$(echo "$found" | grep -vxE 'android\.permission\.(INTERNET|ACCESS_NETWORK_STATE|WAKE_LOCK|RECEIVE_BOOT_COMPLETED|FOREGROUND_SERVICE)|.*\.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION' || true)
+          if [ -n "$unexpected" ]; then
+            echo "$unexpected"
+            echo "::error::The release manifest asks for a permission Tally does not use."; exit 1
           fi
 
       - name: APK size budget

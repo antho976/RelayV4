@@ -204,7 +204,10 @@ fn apply(tx: &Transaction, c: &Change) -> Result<bool> {
         return Ok(false);
     }
     // Budgets are one per category, whatever uid each device gave theirs.
-    let existing: Option<(i64, i64)> = if table == "budgets" {
+    // A budget tombstone that does not say its category is matched by uid, never read as the
+    // overall budget.
+    let by_category = table == "budgets" && !(c.deleted && !c.row.contains_key("category"));
+    let existing: Option<(i64, i64)> = if by_category {
         let category = match c.row.get("category").filter(|v| !v.is_null()) {
             None => Some(0),
             Some(Value::String(uid)) => id_of(tx, "categories", uid)?,
@@ -424,9 +427,12 @@ mod tests {
         let mut pc = Ledger::open_in_memory().unwrap();
         let first = pc.sync("Pixel", true, 0, &phone(), "t").unwrap();
         let other_uid = change("budgets", "b-from-elsewhere", 400, json!({"category": null, "amount": 500_00}));
-        pc.sync("Pixel", false, first.cursor, &[other_uid], "t").unwrap();
+        let out = pc.sync("Pixel", false, first.cursor, &[other_uid], "t").unwrap();
         let s = pc.summary(date(2026, 10, 7), &Locale::new("en-CA")).unwrap();
         assert_eq!(s.pace.budget, 500_00);
+        // A tombstone for some other budget, its category unsaid, leaves the overall one alone.
+        pc.sync("Pixel", false, out.cursor, &[tomb("budgets", "b-unknown", 500)], "t").unwrap();
+        assert_eq!(pc.summary(date(2026, 10, 7), &Locale::new("en-CA")).unwrap().pace.budget, 500_00);
     }
 
     #[test]

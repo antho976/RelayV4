@@ -26,6 +26,7 @@ object Routes {
     const val FORMAT = "settings/format"
     const val BACKUP = "settings/backup"
     const val EXPORT = "settings/export"
+    const val PC = "settings/pc"
     const val IMPORT = "settings/import?source={source}"
     const val ABOUT = "settings/about"
 }
@@ -93,6 +94,7 @@ class AppNav(private val controller: NavHostController) {
     fun format() = go(Routes.FORMAT)
     fun backup() = go(Routes.BACKUP)
     fun export() = go(Routes.EXPORT)
+    fun pc() = go(Routes.PC)
     fun about() = go(Routes.ABOUT)
 
     /** The bank import, opened on [source]'s directions ("desjardins", "wealthsimple", or none). */

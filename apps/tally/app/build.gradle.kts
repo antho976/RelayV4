@@ -189,6 +189,8 @@ dependencies {
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.androidx.profileinstaller)
+    // The one network library: a WebSocket to the PC this phone is paired with, nothing else.
+    implementation(libs.okhttp)
 
     // Debug only: LeakCanary watches every destroyed Activity, ViewModel and View for retention.
     debugImplementation(libs.leakcanary.android)
@@ -203,6 +205,7 @@ dependencies {
     testImplementation(libs.androidx.test.core)
     testImplementation(libs.room.testing)
     testImplementation(libs.work.testing)
+    testImplementation(libs.okhttp.mockwebserver)
 
     androidTestImplementation(libs.androidx.test.junit)
     androidTestImplementation(libs.androidx.test.runner)
