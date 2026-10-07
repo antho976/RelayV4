@@ -240,71 +240,107 @@ fn attachment_on(tx: &Transaction, task_id: Id, id: Id, detached: bool) -> Resul
         })
 }
 
-/// Every statement here is `prepare_cached`: a task list hydrates each row with seven of them,
-/// and compiling five of those per row was 61 % of `task.list` (PERF §1.2).
+/// The task row's own columns, with every list field empty and depth 0: [`hydrate`] fills them.
+pub(crate) fn task_columns(row: &Row) -> rusqlite::Result<Task> {
+    Ok(Task {
+        id: row.get("id")?,
+        project_id: row.get("project_id")?,
+        module_id: row.get("module_id")?,
+        title: row.get("title")?,
+        body: row.get("body")?,
+        changelog: row.get("changelog")?,
+        column: parse_column(&row.get::<_, String>("col")?),
+        position: row.get("position")?,
+        state: parse_task_state(&row.get::<_, String>("state")?),
+        priority: parse_priority(&row.get::<_, String>("priority")?),
+        size: parse_size(row.get("size")?),
+        task_type: parse_type(&row.get::<_, String>("kind")?),
+        parent_id: row.get("parent_id")?,
+        depth: 0,
+        children: Vec::new(),
+        rollup: TaskRollup::default(),
+        labels: Vec::new(),
+        blocked_by: Vec::new(),
+        blocks: Vec::new(),
+        duplicate_of: None,
+        sessions: Vec::new(),
+        commits: Vec::new(),
+        attachments: Vec::new(),
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+        deleted_at: row.get("deleted_at")?,
+    })
+}
+
+/// One row as a whole task. A list hydrates its page at once with [`hydrate`] instead.
 pub(crate) fn row_task(tx: &rusqlite::Connection, row: &Row) -> Result<Task, rusqlite::Error> {
-    let id: Id = row.get("id")?;
-    let sessions = {
-        let mut stmt = tx.prepare_cached("SELECT s.name FROM task_sessions ts JOIN sessions s ON s.id=ts.session_id WHERE ts.task_id=?1 ORDER BY ts.ord,ts.session_id")?;
-        let values = stmt
-            .query_map([id], |r| r.get(0))?
-            .collect::<rusqlite::Result<Vec<String>>>()?;
-        values
-    };
-    let commits = {
-        let mut stmt = tx.prepare_cached(
-            "SELECT sha,branch,linked_at FROM task_commits WHERE task_id=?1 ORDER BY id",
-        )?;
-        let values = stmt
-            .query_map([id], |r| {
-                Ok(TaskCommit {
-                    sha: r.get(0)?,
-                    branch: r.get(1)?,
-                    linked_at: r.get(2)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        values
-    };
-    let attachments = {
-        let mut stmt =
-            tx.prepare_cached("SELECT * FROM attachments WHERE task_id=?1 AND deleted_at IS NULL ORDER BY id")?;
-        let values = stmt
-            .query_map([id], attachment_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        values
-    };
-    let labels = {
-        let mut stmt = tx.prepare_cached("SELECT l.name FROM task_labels tl JOIN labels l ON l.id=tl.label_id WHERE tl.task_id=?1 ORDER BY l.name COLLATE NOCASE")?;
-        let values = stmt
-            .query_map([id], |r| r.get(0))?
-            .collect::<rusqlite::Result<Vec<String>>>()?;
-        values
-    };
-    let edges = |sql: &str| -> rusqlite::Result<Vec<Id>> {
+    let mut tasks = [task_columns(row)?];
+    hydrate(tx, &mut tasks)?;
+    let [task] = tasks;
+    Ok(task)
+}
+
+/// Fill in what lives beside the task rows — sessions, commits, attachments, labels, relations
+/// and children — with one statement each for the whole batch, the ids passed as one JSON
+/// array, then the roll-up and depth, which walk the tree per task. `task.list` ran each of
+/// those per task, seven statements a row (RA-412); `task.get` goes through here with one id,
+/// so a task reads the same either way. The ids must be distinct. Every statement is
+/// `prepare_cached` (PERF §1.2).
+pub(crate) fn hydrate(tx: &rusqlite::Connection, tasks: &mut [Task]) -> rusqlite::Result<()> {
+    if tasks.is_empty() {
+        return Ok(());
+    }
+    let at: std::collections::HashMap<Id, usize> = tasks.iter().enumerate().map(|(i, t)| (t.id, i)).collect();
+    let ids = serde_json::to_string(&tasks.iter().map(|t| t.id).collect::<Vec<_>>())
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    // Each statement returns (task id, value) in the per-task order the field is shown in.
+    fn each<T>(tx: &rusqlite::Connection, sql: &str, ids: &str, map: impl FnMut(&Row) -> rusqlite::Result<(Id, T)>) -> rusqlite::Result<Vec<(Id, T)>> {
         let mut stmt = tx.prepare_cached(sql)?;
-        let values = stmt.query_map([id], |r| r.get(0))?.collect();
+        let values = stmt.query_map([ids], map)?.collect();
         values
-    };
-    let blocked_by = edges("SELECT r.to_task FROM task_relations r JOIN tasks t ON t.id=r.to_task WHERE r.from_task=?1 AND r.rel='blocked_by' AND t.deleted_at IS NULL ORDER BY r.to_task")?;
-    let blocks = edges("SELECT r.from_task FROM task_relations r JOIN tasks t ON t.id=r.from_task WHERE r.to_task=?1 AND r.rel='blocked_by' AND t.deleted_at IS NULL ORDER BY r.from_task")?;
-    let duplicate_of = edges("SELECT r.to_task FROM task_relations r JOIN tasks t ON t.id=r.to_task WHERE r.from_task=?1 AND r.rel='duplicate_of' AND t.deleted_at IS NULL ORDER BY r.to_task")?
-        .into_iter()
-        .next();
-    let children = {
-        let mut stmt = tx.prepare_cached(
-            "SELECT id FROM tasks WHERE parent_id=?1 AND deleted_at IS NULL ORDER BY position,id",
-        )?;
-        let values = stmt
-            .query_map([id], |r| r.get(0))?
-            .collect::<rusqlite::Result<Vec<Id>>>()?;
-        values
-    };
-    // Roll-up walks the subtree here rather than in a recursive CTE so it counts exactly the
-    // rows `descendants` would fan out to; depth is capped at 3, so the walk is shallow.
+    }
+    for (id, name) in each(tx, "SELECT ts.task_id, s.name FROM task_sessions ts JOIN sessions s ON s.id=ts.session_id WHERE ts.task_id IN (SELECT value FROM json_each(?1)) ORDER BY ts.task_id,ts.ord,ts.session_id", &ids, |r| Ok((r.get(0)?, r.get(1)?)))? {
+        tasks[at[&id]].sessions.push(name);
+    }
+    for (id, commit) in each(tx, "SELECT task_id,sha,branch,linked_at FROM task_commits WHERE task_id IN (SELECT value FROM json_each(?1)) ORDER BY task_id,id", &ids, |r| {
+        Ok((r.get(0)?, TaskCommit { sha: r.get(1)?, branch: r.get(2)?, linked_at: r.get(3)? }))
+    })? {
+        tasks[at[&id]].commits.push(commit);
+    }
+    for (id, attachment) in each(tx, "SELECT * FROM attachments WHERE task_id IN (SELECT value FROM json_each(?1)) AND deleted_at IS NULL ORDER BY task_id,id", &ids, |r| {
+        Ok((r.get("task_id")?, attachment_row(r)?))
+    })? {
+        tasks[at[&id]].attachments.push(attachment);
+    }
+    for (id, label) in each(tx, "SELECT tl.task_id, l.name FROM task_labels tl JOIN labels l ON l.id=tl.label_id WHERE tl.task_id IN (SELECT value FROM json_each(?1)) ORDER BY tl.task_id, l.name COLLATE NOCASE", &ids, |r| Ok((r.get(0)?, r.get(1)?)))? {
+        tasks[at[&id]].labels.push(label);
+    }
+    for (id, other) in each(tx, "SELECT r.from_task, r.to_task FROM task_relations r JOIN tasks t ON t.id=r.to_task WHERE r.from_task IN (SELECT value FROM json_each(?1)) AND r.rel='blocked_by' AND t.deleted_at IS NULL ORDER BY r.from_task, r.to_task", &ids, |r| Ok((r.get(0)?, r.get(1)?)))? {
+        tasks[at[&id]].blocked_by.push(other);
+    }
+    for (id, other) in each(tx, "SELECT r.to_task, r.from_task FROM task_relations r JOIN tasks t ON t.id=r.from_task WHERE r.to_task IN (SELECT value FROM json_each(?1)) AND r.rel='blocked_by' AND t.deleted_at IS NULL ORDER BY r.to_task, r.from_task", &ids, |r| Ok((r.get(0)?, r.get(1)?)))? {
+        tasks[at[&id]].blocks.push(other);
+    }
+    for (id, other) in each(tx, "SELECT r.from_task, r.to_task FROM task_relations r JOIN tasks t ON t.id=r.to_task WHERE r.from_task IN (SELECT value FROM json_each(?1)) AND r.rel='duplicate_of' AND t.deleted_at IS NULL ORDER BY r.from_task, r.to_task", &ids, |r| Ok((r.get(0)?, r.get(1)?)))? {
+        // The first in id order, as one edge per task should be all there is (RA-418).
+        tasks[at[&id]].duplicate_of.get_or_insert(other);
+    }
+    for (id, child) in each(tx, "SELECT parent_id, id FROM tasks WHERE parent_id IN (SELECT value FROM json_each(?1)) AND deleted_at IS NULL ORDER BY parent_id,position,id", &ids, |r| Ok((r.get(0)?, r.get(1)?)))? {
+        tasks[at[&id]].children.push(child);
+    }
+    for task in tasks.iter_mut() {
+        task.rollup = rollup_of(tx, task.id, &task.children)?;
+        task.depth = depth_of(tx, task.id)?;
+    }
+    Ok(())
+}
+
+/// Roll-up walks the subtree here rather than in a recursive CTE so it counts exactly the
+/// rows `descendants` would fan out to; depth is capped at 3, so the walk is shallow.
+fn rollup_of(tx: &rusqlite::Connection, id: Id, children: &[Id]) -> rusqlite::Result<TaskRollup> {
     let mut rollup = TaskRollup::default();
     let mut counted: std::collections::HashSet<Id> = std::collections::HashSet::from([id]);
-    let mut frontier = children.clone();
+    let mut frontier = children.to_vec();
     while let Some(current) = frontier.pop() {
         if !counted.insert(current) {
             continue;
@@ -327,34 +363,7 @@ pub(crate) fn row_task(tx: &rusqlite::Connection, row: &Row) -> Result<Task, rus
         }
         frontier.extend(kids);
     }
-    Ok(Task {
-        id,
-        project_id: row.get("project_id")?,
-        module_id: row.get("module_id")?,
-        title: row.get("title")?,
-        body: row.get("body")?,
-        changelog: row.get("changelog")?,
-        column: parse_column(&row.get::<_, String>("col")?),
-        position: row.get("position")?,
-        state: parse_task_state(&row.get::<_, String>("state")?),
-        priority: parse_priority(&row.get::<_, String>("priority")?),
-        size: parse_size(row.get("size")?),
-        task_type: parse_type(&row.get::<_, String>("kind")?),
-        parent_id: row.get("parent_id")?,
-        depth: depth_of(tx, id)?,
-        children,
-        rollup,
-        labels,
-        blocked_by,
-        blocks,
-        duplicate_of,
-        sessions,
-        commits,
-        attachments,
-        created_at: row.get("created_at")?,
-        updated_at: row.get("updated_at")?,
-        deleted_at: row.get("deleted_at")?,
-    })
+    Ok(rollup)
 }
 
 pub(crate) fn get_task(tx: &rusqlite::Connection, id: Id, include_deleted: bool) -> Result<Task, BusError> {
@@ -981,9 +990,12 @@ pub fn register(e: &mut Engine) {
         let mut stmt=ctx.tx().prepare_cached(&sql).bus()?;
         let mut rows=stmt.query(rusqlite::params_from_iter(args.iter().map(|v| v.as_ref()))).bus()?;
         let mut tasks=Vec::new();
-        while let Some(row)=rows.next().bus()? { tasks.push(row_task(ctx.tx(), row).bus()?); }
+        while let Some(row)=rows.next().bus()? { tasks.push(task_columns(row).bus()?); }
+        drop(rows);
         let next_offset = (tasks.len() > limit as usize).then_some(offset + limit);
         tasks.truncate(limit as usize);
+        // The page's side tables in one statement each, not seven per task (RA-412).
+        hydrate(ctx.tx(), &mut tasks).bus()?;
         if p.summary.unwrap_or(false) {
             for task in &mut tasks {
                 task.body.clear();

@@ -416,6 +416,55 @@ fn recovery_sweeps_orphaned_attachment_files() {
     assert!(legacy.is_file(), "the undoable audit row still names it");
 }
 
+/// RA-412: task.list hydrates its page in one statement per side table. Every task it returns
+/// must read exactly as task.get returns it: sessions, commits, attachments (not detached
+/// ones), labels, relations, children and roll-up.
+#[test]
+fn task_list_hydrates_each_task_as_task_get_does() {
+    let f = Fixture::new();
+    let e = &f.engine;
+    let a = f.task("A", json!({"labels":["ux","Backend"],"column":"ready"}));
+    let b = f.task("B", json!({"labels":["ux"],"parent_id":a["id"]}));
+    let c = f.task("C", json!({"parent_id":b["id"]}));
+    let d = f.task("D", json!({"column":"in_review"}));
+    let plain = f.task("Plain", json!({}));
+    let session = ok(e, "session.create", json!({"project_id":1,"provider":"claude","worktree":"primary","task_id":a["id"]}));
+    ok(e, "task.dispatch", json!({"task_id":d["id"],"session":session["name"],"start":false}));
+    ok(e, "task.link_commit", json!({"task_id":a["id"],"sha":"aaa","branch":"main"}));
+    ok(e, "task.link_commit", json!({"task_id":a["id"],"sha":"bbb"}));
+    ok(e, "task.approve", json!({"task_id":c["id"],"sha":"ccc"}));
+    for (task, name) in [(&a, "one.png"), (&a, "two.png"), (&b, "three.png")] {
+        ok(e, "task.attach", json!({"task_id":task["id"],"name":name,"mime":"image/png","bytes_b64":b64(name.as_bytes())}));
+    }
+    let gone = ok(e, "task.attach", json!({"task_id":d["id"],"name":"gone.png","mime":"image/png","bytes_b64":b64(b"gone")}));
+    ok(e, "task.detach", json!({"task_id":d["id"],"attachment_id":gone["id"]}));
+    ok(e, "task.relate", json!({"task_id":a["id"],"relation":"blocked_by","other_id":d["id"]}));
+    ok(e, "task.relate", json!({"task_id":plain["id"],"relation":"blocked_by","other_id":d["id"]}));
+    ok(e, "task.relate", json!({"task_id":b["id"],"relation":"duplicate_of","other_id":plain["id"]}));
+
+    let listed = ok(e, "task.list", json!({"project_id":1}))["tasks"].as_array().unwrap().clone();
+    assert_eq!(listed.len(), 5);
+    for task in &listed {
+        assert_eq!(task, &ok(e, "task.get", json!({"task_id":task["id"]})));
+    }
+    let get = |t: &Value| ok(e, "task.get", json!({"task_id":t["id"]}));
+    let a = get(&a);
+    assert!(!a["sessions"].as_array().unwrap().is_empty(), "{a}");
+    assert_eq!(a["commits"].as_array().unwrap().len(), 2);
+    assert_eq!(a["attachments"].as_array().unwrap().len(), 2);
+    assert_eq!(a["labels"], json!(["Backend", "ux"]));
+    assert_eq!(a["children"], json!([b["id"]]));
+    assert_eq!(a["rollup"], json!({"total":2,"done":1}));
+    assert_eq!(get(&d)["blocks"], json!([a["id"], plain["id"]]));
+    assert_eq!(get(&d)["attachments"], json!([]));
+    assert!(!get(&d)["sessions"].as_array().unwrap().is_empty());
+    assert_eq!(get(&b)["duplicate_of"], plain["id"]);
+    assert_eq!(get(&c)["depth"], 2);
+    // A page is hydrated as a whole too.
+    let page = ok(e, "task.list", json!({"project_id":1,"limit":2,"offset":1}))["tasks"].as_array().unwrap().clone();
+    assert_eq!(page, listed[1..3]);
+}
+
 /// RA-416: undoing task.approve is task.unapprove. The task returns to its column, slot and
 /// state, and the commit link the approval added goes; a link that was there before stays.
 #[test]
