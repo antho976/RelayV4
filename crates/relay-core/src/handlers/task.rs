@@ -791,10 +791,11 @@ struct PreparedDispatch {
 }
 
 /// Close sessions this dispatch created when it cannot go on; their checkouts go with them.
+/// Nobody worked in them yet, so whatever a setup step left there is not work to keep (RA-405).
 fn discard_created(engine: &Engine, created: &[String]) {
     for name in created {
         let closed = engine.dispatch(
-            relay_bus::Request::new(relay_bus::Actor::User, "session.close", json!({"session": name, "remove_worktree": true})),
+            relay_bus::Request::new(relay_bus::Actor::User, "session.close", json!({"session": name, "remove_worktree": true, "discard_changes": true})),
             crate::engine::Door::InProcess,
         );
         if let Some(error) = closed.error {

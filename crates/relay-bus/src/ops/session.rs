@@ -33,10 +33,15 @@ op!(Park, "session.park", NameIn => Session,
     OpMeta::mutation(Scope::Session, 6, "Kill the CLI, keep pane/scrollback/worktree/token").actors(Actors::UserOnly).emits(&["session.changed"]));
 op!(Wake, "session.wake", NameIn => Session,
     OpMeta::mutation(Scope::Session, 6, "Respawn a parked session with provider resume").actors(Actors::UserOnly).emits(&["session.changed"]));
-payload!(#[schemars(rename = "SessionCloseIn")] CloseIn { pub session: String, pub remove_worktree: Option<bool>, pub purge_build: Option<bool> });
+payload!(#[schemars(rename = "SessionCloseIn")] CloseIn {
+    pub session: String, pub remove_worktree: Option<bool>, pub purge_build: Option<bool>,
+    /// Delete the worktree even with uncommitted changes (tracked edits or untracked files).
+    /// Without it, removing a dirty Relay-pool worktree is refused `worktree.dirty` (RA-405).
+    pub discard_changes: Option<bool>,
+});
 result!(#[schemars(rename = "SessionCloseOut")] CloseOut { pub freed_mb: f64 });
 op!(Close, "session.close", CloseIn => CloseOut,
-    OpMeta::mutation(Scope::Session, 3, "Kill, purge build output, remove worktree; branch kept").actors(Actors::UserOnly).emits(&["session.changed", "worktree.changed"]));
+    OpMeta::mutation(Scope::Session, 3, "Kill, purge build output, remove worktree (refused if dirty unless discard_changes); branch kept").actors(Actors::UserOnly).emits(&["session.changed", "worktree.changed"]));
 payload!(#[schemars(rename = "SessionDoneIn")] DoneIn {
     pub session: String, pub summary: Option<String>, pub sha: Option<String>,
     /// `completed` (default), `blocked`, or `partial`. An op that can only report success
@@ -183,7 +188,13 @@ payload!(#[schemars(rename = "SessionRestorableIn")] RestorableIn {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub session: Option<String>,
 });
 op!(RestorableList, "session.restorable", RestorableIn => RestorableOut, OpMeta::query(Scope::Global, 6, "Sessions offering resume at launch, optionally one project's or one session's"));
-op!(DiscardRestorable, "session.discard_restorable", NameIn => Empty,
+payload!(#[schemars(rename = "SessionDiscardRestorableIn")] DiscardRestorableIn {
+    pub session: String,
+    /// Delete the worktree even with uncommitted changes. Without it, a dirty Relay-pool
+    /// worktree that the discard would delete is refused `worktree.dirty` (RA-405).
+    pub discard_changes: Option<bool>,
+});
+op!(DiscardRestorable, "session.discard_restorable", DiscardRestorableIn => Empty,
     OpMeta::mutation(Scope::Session, 6, "Decline resume: clean the session").actors(Actors::UserOnly).emits(&["session.changed"]));
 
 entries!(
