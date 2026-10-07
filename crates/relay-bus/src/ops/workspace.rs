@@ -16,6 +16,13 @@ op!(WsList, "workspace.list", Empty => WsListOut, OpMeta::query(Scope::Global, 1
 payload!(#[schemars(rename = "WorkspaceUpdateIn")] WsUpdateIn { pub workspace_id: Id, pub name: Option<String>, pub order: Option<i64> });
 op!(WsUpdate, "workspace.update", WsUpdateIn => Workspace,
     OpMeta::mutation(Scope::Global, 1, "Rename / reorder a workspace").actors(Actors::UserOnly).undo(Undo::Inverse).emits(&["workspace.changed"]));
+payload!(#[schemars(rename = "WorkspaceOrder")] WsOrder { pub workspace_id: Id, pub order: i64 });
+payload!(#[schemars(rename = "WorkspaceReorderIn")] WsReorderIn {
+    /// Every workspace whose `order` changes, each once. The rest keep theirs.
+    pub orders: Vec<WsOrder>,
+});
+op!(WsReorder, "workspace.reorder", WsReorderIn => WsListOut,
+    OpMeta::mutation(Scope::Global, 1, "Set several workspaces' order at once: one transaction, one undo, one event").actors(Actors::UserOnly).undo(Undo::Inverse).emits(&["workspace.changed"]));
 payload!(#[schemars(rename = "WorkspaceRemoveIn")] WsRemoveIn {
     pub workspace_id: Id,
     /// Also remove every project in it, closing their open sessions (`project.remove` with `force`).
@@ -48,6 +55,13 @@ payload!(#[schemars(rename = "ProjectUpdateIn")] ProjectUpdateIn {
 });
 op!(ProjectUpdate, "project.update", ProjectUpdateIn => Project,
     OpMeta::mutation(Scope::Project, 1, "Patch project settings").actors(Actors::UserOnly).undo(Undo::Inverse).emits(&["project.changed"]));
+payload!(#[schemars(rename = "ProjectOrder")] ProjectOrder { pub project_id: Id, pub order: i64 });
+payload!(#[schemars(rename = "ProjectReorderIn")] ProjectReorderIn {
+    /// Every project whose `order` changes, each once. The rest keep theirs.
+    pub orders: Vec<ProjectOrder>,
+});
+op!(ProjectReorder, "project.reorder", ProjectReorderIn => ProjectListOut,
+    OpMeta::mutation(Scope::Global, 1, "Set several projects' order at once: one transaction, one undo, one event").actors(Actors::UserOnly).undo(Undo::Inverse).emits(&["project.changed"]));
 payload!(#[schemars(rename = "ProjectRemoveIn")] ProjectRemoveIn {
     pub project_id: Id,
     /// Close its open sessions (`session.close`, worktree kept) and stop its device runs first.
@@ -92,5 +106,5 @@ op!(ProjectRestore, "project.restore", ProjectRestoreIn => ProjectRestoreOut,
 result!(#[schemars(rename = "ProjectStatsOut")] ProjectStatsOut { pub tasks_by_column: BTreeMap<Column, i64>, pub sessions_live: i64, pub sessions_idle: i64, pub worktrees: i64, pub disk_mb: f64 });
 op!(ProjectStats, "project.stats", ProjectGetIn => ProjectStatsOut, OpMeta::query(Scope::Project, 9, "Sidebar numbers for one project"));
 
-entries!(WsCreate, WsDiscover, WsList, WsUpdate, WsRemove, ProjectAdd, ProjectClone, ProjectList, ProjectGet, ProjectUpdate, ProjectRemove, ProjectStats,
+entries!(WsCreate, WsDiscover, WsList, WsUpdate, WsReorder, WsRemove, ProjectAdd, ProjectClone, ProjectList, ProjectGet, ProjectUpdate, ProjectReorder, ProjectRemove, ProjectStats,
     ProjectRelink, ProjectRemovePreview, ProjectRemovedList, ProjectRestore);

@@ -782,6 +782,7 @@ fn cases() -> Vec<Case> {
     per(&mut c, "workspace.discover", "workspace.discover", U, Mid, |fx| json!({"path": fx.root.join("ws")}));
     fixed(&mut c, "workspace.list", U, Cheap, json!({}));
     fixed(&mut c, "workspace.update", U, Cheap, json!({"workspace_id": 1, "name": "perf"}));
+    fixed(&mut c, "workspace.reorder", U, Cheap, json!({"orders": [{"workspace_id": 1, "order": 0}]}));
     per(&mut c, "workspace.remove", "workspace.remove", U, Mid, move |fx| {
         let dir = fx.root.join(format!("ws-rm-{}", one(fx)));
         std::fs::create_dir_all(&dir).unwrap();
@@ -803,6 +804,7 @@ fn cases() -> Vec<Case> {
     fixed(&mut c, "project.list", U, Cheap, json!({}));
     fixed(&mut c, "project.get", U, Cheap, json!({"project_id": 1}));
     fixed(&mut c, "project.update", U, Cheap, json!({"project_id": 1, "name": "app"}));
+    fixed(&mut c, "project.reorder", U, Cheap, json!({"orders": [{"project_id": 1, "order": 0}]}));
     per(&mut c, "project.remove", "project.remove", U, Mid, move |fx| {
         json!({"project_id": Fixture::id(&fx.user("project.add", json!({"workspace_id": 1, "path": small_repo(fx)})))})
     });

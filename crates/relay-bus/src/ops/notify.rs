@@ -4,8 +4,17 @@ use crate::types::{Hold, Id, Notification, NotifyCategory, Peer, Task};
 use crate::{op, Empty};
 use serde_json::Value;
 
-payload!(#[schemars(rename = "NotifyListIn")] ListIn { pub project_id: Option<Id>, pub unread_only: Option<bool>, pub category: Option<NotifyCategory>, pub limit: Option<u32> });
-result!(#[schemars(rename = "NotifyListOut")] ListOut { pub notifications: Vec<Notification> });
+payload!(#[schemars(rename = "NotifyListIn")] ListIn {
+    pub project_id: Option<Id>, pub unread_only: Option<bool>, pub category: Option<NotifyCategory>, pub limit: Option<u32>,
+    /// Only `unread`: no rows are read and `notifications` comes back empty. For a badge.
+    pub count_only: Option<bool>,
+});
+result!(#[schemars(rename = "NotifyListOut")] ListOut {
+    pub notifications: Vec<Notification>,
+    /// Unread notifications matching `project_id` / `category`, however many `limit` and
+    /// `unread_only` leave out of `notifications` (RA-490). Absent from an older engine.
+    #[serde(default)] pub unread: i64,
+});
 op!(List, "notify.list", ListIn => ListOut, OpMeta::query(Scope::Global, 9, "Notifications"));
 payload!(#[schemars(rename = "NotifyAckIn")] AckIn { pub notification_id: Id });
 op!(Ack, "notify.ack", AckIn => Empty, OpMeta::mutation(Scope::Global, 9, "Mark read").audit(Audit::Never).emits(&["notify.changed"]));

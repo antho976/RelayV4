@@ -70,7 +70,8 @@ fn list(
     }
     sql.push_str(" ORDER BY created_at DESC,id DESC LIMIT ?");
     args.push(Box::new(i64::from(limit.unwrap_or(100).min(500))));
-    let mut stmt = ctx.tx().prepare(&sql).bus()?;
+    // Eight filter shapes at most: each is compiled once, not once per badge refresh.
+    let mut stmt = ctx.tx().prepare_cached(&sql).bus()?;
     let notifications = stmt
         .query_map(
             rusqlite::params_from_iter(args.iter().map(|value| value.as_ref())),
@@ -82,17 +83,37 @@ fn list(
     Ok(notifications)
 }
 
+/// Unread notifications under the same project and category filters as [`list`], with no
+/// limit: the badge and "Mark all read" count what is unread, not what fits in one page (RA-490).
+fn unread(ctx: &Ctx, project_id: Option<i64>, category_: Option<NotifyCategory>) -> Result<i64, relay_bus::BusError> {
+    let category_ = category_.map(category_str);
+    let sql = match (project_id.is_some(), category_.is_some()) {
+        (false, false) => "SELECT COUNT(*) FROM notifications WHERE read=0",
+        (true, false) => "SELECT COUNT(*) FROM notifications WHERE read=0 AND project_id=?1",
+        (false, true) => "SELECT COUNT(*) FROM notifications WHERE read=0 AND category=?2",
+        (true, true) => "SELECT COUNT(*) FROM notifications WHERE read=0 AND project_id=?1 AND category=?2",
+    };
+    let mut stmt = ctx.tx().prepare_cached(sql).bus()?;
+    // Unused numbered parameters are still bound: SQLite numbers them up to the highest used.
+    let count = if category_.is_some() {
+        stmt.query_row(rusqlite::params![project_id, category_], |row| row.get(0))
+    } else if project_id.is_some() {
+        stmt.query_row([project_id], |row| row.get(0))
+    } else {
+        stmt.query_row([], |row| row.get(0))
+    };
+    count.bus()
+}
+
 pub fn register(engine: &mut Engine) {
     engine.register::<List>(|ctx, payload| {
-        Ok(ListOut {
-            notifications: list(
-                ctx,
-                payload.project_id,
-                payload.unread_only,
-                payload.category,
-                payload.limit,
-            )?,
-        })
+        let unread = unread(ctx, payload.project_id, payload.category)?;
+        let notifications = if payload.count_only.unwrap_or(false) {
+            Vec::new()
+        } else {
+            list(ctx, payload.project_id, payload.unread_only, payload.category, payload.limit)?
+        };
+        Ok(ListOut { notifications, unread })
     });
     engine.register::<Ack>(|ctx: &mut Ctx, payload| {
         let changed = ctx

@@ -311,10 +311,22 @@ pub(crate) fn row_task(tx: &rusqlite::Connection, row: &Row) -> Result<Task, rus
         }
         frontier.extend(kids);
     }
+    // `task.list` selects the name with the row; every other read looks it up by key. Neither
+    // asks whether the module is completed: an archived module still names its cards (RA-495).
+    let module_id: Option<Id> = row.get("module_id")?;
+    let module_name = match (row.as_ref().column_index("module_name"), module_id) {
+        (Ok(index), _) => row.get(index)?,
+        (Err(_), Some(module_id)) => tx
+            .prepare_cached("SELECT name FROM modules WHERE id=?1")?
+            .query_row([module_id], |r| r.get(0))
+            .optional()?,
+        (Err(_), None) => None,
+    };
     Ok(Task {
         id,
         project_id: row.get("project_id")?,
-        module_id: row.get("module_id")?,
+        module_id,
+        module_name,
         title: row.get("title")?,
         body: row.get("body")?,
         changelog: row.get("changelog")?,
@@ -923,7 +935,10 @@ pub fn register(e: &mut Engine) {
         if let Some(sort) = p.sort.as_deref() {
             if !matches!(sort, "column" | "priority" | "updated") { return Err(BusError::invalid("task.sort", "sort must be column, priority, or updated")) }
         }
-        let mut sql = String::from("SELECT * FROM tasks WHERE 1=1");
+        // The module's name rides along, completed modules included, so the board needs no
+        // second `module.list` to label cards (RA-495). A keyed subquery is the LEFT JOIN on
+        // `modules.id` without making every filter below name its table.
+        let mut sql = String::from("SELECT *, (SELECT m.name FROM modules m WHERE m.id=tasks.module_id) AS module_name FROM tasks WHERE 1=1");
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if !p.include_deleted.unwrap_or(false) { sql.push_str(" AND deleted_at IS NULL"); }
         if let Some(v)=p.project_id { sql.push_str(" AND project_id=?"); args.push(Box::new(v)); }

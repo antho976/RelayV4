@@ -804,6 +804,30 @@ fn task_list_is_paged_and_a_summary_leaves_out_the_long_fields() {
     assert!(summary["tasks"].as_array().unwrap().iter().all(|t| t["body"] == "" && t["changelog"] == "" && t["title"] != ""));
 }
 
+/// RA-495: every task read names its module, a completed (archived) one included, so the board
+/// labels cards without a second `module.list`.
+#[test]
+fn tasks_name_their_module_even_once_it_is_completed() {
+    let f = Fixture::new();
+    let e = &f.engine;
+    let module = ok(e, "module.create", json!({"project_id":1,"name":"Checkout"}));
+    let task = f.task("Card", json!({"module_id": module["id"]}));
+    assert_eq!(task["module_name"], "Checkout", "task.create");
+    let loose = f.task("Loose", json!({}));
+    assert!(loose["module_name"].is_null(), "{loose}");
+    ok(e, "module.complete", json!({"module_id": module["id"]}));
+    let listed = ok(e, "task.list", json!({"project_id":1}));
+    let card = listed["tasks"].as_array().unwrap().iter().find(|t| t["id"] == task["id"]).unwrap();
+    assert_eq!(card["module_name"], "Checkout", "task.list: {card}");
+    let other = listed["tasks"].as_array().unwrap().iter().find(|t| t["id"] == loose["id"]).unwrap();
+    assert!(other["module_name"].is_null(), "{other}");
+    let filtered = ok(e, "task.list", json!({"project_id":1,"module_id":module["id"],"sort":"priority"}));
+    assert_eq!(filtered["tasks"][0]["module_name"], "Checkout", "filters and sorts still resolve against tasks");
+    assert_eq!(ok(e, "task.get", json!({"task_id": task["id"]}))["module_name"], "Checkout", "task.get");
+    ok(e, "module.update", json!({"module_id": module["id"], "name": "Payments"}));
+    assert_eq!(ok(e, "task.get", json!({"task_id": task["id"]}))["module_name"], "Payments", "the name is read, not copied");
+}
+
 /// Stores written under the old rule still hold the cross-queued rows; the startup check
 /// drops the ones that are certainly another group's, and the deadlock lifts.
 #[test]
