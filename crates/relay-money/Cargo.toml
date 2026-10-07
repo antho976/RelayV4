@@ -1,0 +1,23 @@
+[package]
+name = "relay-money"
+description = "Tally's money rules for the engine: amounts in minor units, budget periods, pace, recurrence, bank statements and the backup file. A port of apps/tally/core, held to the same tests."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+jiff.workspace = true
+regex.workspace = true
+unicode-normalization = "0.1"
+rusqlite = { workspace = true, optional = true }
+schemars.workspace = true
+uuid = { workspace = true, optional = true }
+
+[features]
+default = ["ledger"]
+# The SQLite ledger. Off for crates that only need the money.* contract (relay-bus).
+ledger = ["dep:rusqlite", "dep:uuid"]

@@ -127,6 +127,8 @@ for line in sys.stdin:
         except RuntimeError as error:
             assert "held" in str(error), error
         assert len(call("guardrail.holds.list", {"project_id": project["id"]})["holds"]) == 1
+        # Money's pages read Tally's sample household from the disposable ledger.
+        assert call("money.sample", {})["transactions"] > 0
         desktop_env = dict(os.environ, RELAY_NATIVE_SOCKET=str(path), RELAY_INSTANCE="test")
         for key in ("RELAY_SESSION", "RELAY_TOKEN", "RELAY_BRIEF"):
             desktop_env.pop(key, None)
@@ -165,7 +167,8 @@ for line in sys.stdin:
             raise SystemExit(0)
         measurements=[]
         captured=[]
-        for viewport, size, page in (("desktop", "1440,900", "agents"), ("compact", "1024,768", "agents"), ("launch-preview", "1024,768", "launch-preview"), ("palette", "1024,768", "palette"), ("layouts", "1024,768", "layouts"), ("board", "1440,900", "board"), ("board-compact", "1024,768", "board"), ("mailbox", "1024,768", "mailbox"), ("guardrails", "1024,768", "guardrails"), ("code", "1440,900", "code"), *((name,"1440,900",name) for name in ("notes","modules","settings","skills","dashboard","notifications","devices","launch"))):
+        for viewport, size, page in (("desktop", "1440,900", "agents"), ("compact", "1024,768", "agents"), ("launch-preview", "1024,768", "launch-preview"), ("palette", "1024,768", "palette"), ("layouts", "1024,768", "layouts"), ("board", "1440,900", "board"), ("board-compact", "1024,768", "board"), ("mailbox", "1024,768", "mailbox"), ("guardrails", "1024,768", "guardrails"), ("code", "1440,900", "code"), *((name,"1440,900",name) for name in ("notes","modules","settings","skills","dashboard","notifications","devices","launch")),
+                                     *((name,"1440,900",name) for name in ("money-home","money-transactions","money-data","money-start")), ("money-plan","1024,768","money-plan"), ("money-entry","1024,768","money-entry")):
             output = OUT / f"{viewport}.png"
             output.unlink(missing_ok=True)
             native_env = dict(desktop_env, RELAY_NATIVE_SCREENSHOT=str(output), RELAY_NATIVE_SIZE=size, RELAY_NATIVE_FIXTURE="1",

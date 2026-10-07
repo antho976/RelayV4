@@ -115,6 +115,8 @@ pub const PHONE_OPS: &[&str] = &[
     "mailbox.list", "mailbox.outbox", "mailbox.send",
     "module.changelog.draft", "module.complete", "module.create", "module.delete", "module.get",
     "module.list", "module.reopen", "module.restore", "module.update",
+    // Tally's sync (apps/tally): the one money op a phone calls.
+    "money.sync",
     "notes.append", "notes.create", "notes.delete", "notes.get", "notes.list", "notes.pin",
     "notes.restore", "notes.standing", "notes.update",
     "notify.ack", "notify.ack_all", "notify.list", "notify.settings.get", "notify.settings.set",

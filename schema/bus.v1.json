@@ -4,7 +4,7 @@
   "title": "RELAY v4 command bus",
   "description": "Generated from crates/relay-bus by `relay schema`. Do not edit; see docs/engine/BUS.md.",
   "version": 1,
-  "op_count": 233,
+  "op_count": 248,
   "envelope": {
     "request": {
       "$ref": "#/$defs/Request"
@@ -4522,6 +4522,298 @@
       },
       "result": {
         "$ref": "#/$defs/Empty"
+      }
+    },
+    "money.summary": {
+      "summary": "The Money Home reading: what is left this budget period and its pace, budgets, bills, accounts, goals and recent entries. Posts any bill due by today first",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/MoneySummaryIn"
+      },
+      "result": {
+        "$ref": "#/$defs/MoneySummary"
+      }
+    },
+    "money.lists": {
+      "summary": "The ledger's accounts (with balances) and categories, for pickers",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/Empty"
+      },
+      "result": {
+        "$ref": "#/$defs/MoneyLists"
+      }
+    },
+    "money.tx.list": {
+      "summary": "One budget period's entries, newest first",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/MoneyTxListIn"
+      },
+      "result": {
+        "$ref": "#/$defs/MoneyTxPage"
+      }
+    },
+    "money.tx.add": {
+      "summary": "Add an expense, income or transfer",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [
+        "money.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/MoneyTxAddIn"
+      },
+      "result": {
+        "$ref": "#/$defs/MoneyTx"
+      }
+    },
+    "money.tx.update": {
+      "summary": "Change an entry; absent fields keep their value",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [
+        "money.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/MoneyTxUpdateIn"
+      },
+      "result": {
+        "$ref": "#/$defs/MoneyTx"
+      }
+    },
+    "money.tx.delete": {
+      "summary": "Delete an entry (kept as a tombstone for sync)",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [
+        "money.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/MoneyIdIn"
+      },
+      "result": {
+        "$ref": "#/$defs/Empty"
+      }
+    },
+    "money.tx.restore": {
+      "summary": "Bring back a deleted entry: the Undo of money.tx.delete",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [
+        "money.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/MoneyIdIn"
+      },
+      "result": {
+        "$ref": "#/$defs/MoneyTx"
+      }
+    },
+    "money.budget.set": {
+      "summary": "Set or remove a monthly budget",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [
+        "money.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/MoneyBudgetSetIn"
+      },
+      "result": {
+        "$ref": "#/$defs/Empty"
+      }
+    },
+    "money.account.add": {
+      "summary": "Add an account; the first one also seeds Tally's default categories",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [
+        "money.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/MoneyAccountAddIn"
+      },
+      "result": {
+        "$ref": "#/$defs/MoneyAccount"
+      }
+    },
+    "money.settings.set": {
+      "summary": "Change the currency or the day the budget month starts",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "money.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/MoneySettingsSetIn"
+      },
+      "result": {
+        "$ref": "#/$defs/MoneySettings"
+      }
+    },
+    "money.import": {
+      "summary": "Restore a Tally backup (.json): it replaces the whole ledger, as a restore does on the phone",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "money.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/MoneyPathIn"
+      },
+      "result": {
+        "$ref": "#/$defs/MoneyImportOut"
+      }
+    },
+    "money.export": {
+      "summary": "Write the ledger as a Tally backup the phone can restore",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/MoneyPathIn"
+      },
+      "result": {
+        "$ref": "#/$defs/MoneyExportOut"
+      }
+    },
+    "money.sample": {
+      "summary": "Load Tally's sample household, only into an empty ledger; its accounts are named Sample",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "money.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/Empty"
+      },
+      "result": {
+        "$ref": "#/$defs/MoneySampleOut"
+      }
+    },
+    "money.reset": {
+      "summary": "Erase the whole ledger",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "money.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/Empty"
+      },
+      "result": {
+        "$ref": "#/$defs/Empty"
+      }
+    },
+    "money.sync": {
+      "summary": "Tally's two-way sync (docs/MONEY.md): apply the phone's changes, newest edit winning per row, and answer with the PC's changes since the phone's cursor",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "money.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/MoneySyncIn"
+      },
+      "result": {
+        "$ref": "#/$defs/MoneySyncOut"
       }
     }
   },
@@ -15361,6 +15653,1060 @@
       },
       "required": [
         "url"
+      ]
+    },
+    "MoneySummaryIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "today": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The day to read the month from; today in the engine's time zone when absent."
+        }
+      }
+    },
+    "MoneySummary": {
+      "type": "object",
+      "properties": {
+        "currency": {
+          "type": "string"
+        },
+        "fraction_digits": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "month_start_day": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "empty": {
+          "type": "boolean",
+          "description": "No accounts and no entries: draw the honest empty state."
+        },
+        "period": {
+          "$ref": "#/$defs/MoneyPeriod"
+        },
+        "pace": {
+          "$ref": "#/$defs/PaceReading"
+        },
+        "income": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "spent": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "lines": {
+          "$ref": "#/$defs/MoneyLines"
+        },
+        "budgets": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MoneyEnvelope"
+          }
+        },
+        "accounts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MoneyAccount"
+          }
+        },
+        "net_worth": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "bills": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MoneyBill"
+          }
+        },
+        "goals": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MoneyGoal"
+          }
+        },
+        "recent": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MoneyTx"
+          }
+        }
+      },
+      "required": [
+        "currency",
+        "fraction_digits",
+        "month_start_day",
+        "empty",
+        "period",
+        "pace",
+        "income",
+        "spent",
+        "lines",
+        "budgets",
+        "accounts",
+        "net_worth",
+        "bills",
+        "goals",
+        "recent"
+      ],
+      "description": "The Home reading (docs/MONEY.md)."
+    },
+    "MoneyPeriod": {
+      "type": "object",
+      "properties": {
+        "start": {
+          "type": "string"
+        },
+        "end_exclusive": {
+          "type": "string"
+        },
+        "days": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "days_left": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "start",
+        "end_exclusive",
+        "days",
+        "days_left"
+      ]
+    },
+    "PaceReading": {
+      "type": "object",
+      "properties": {
+        "budget": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "spent": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "total_days": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "elapsed_days": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "expected": {
+          "type": "integer",
+          "format": "int64",
+          "description": "What an even spend would have used by the end of today."
+        },
+        "remaining": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "pace_delta": {
+          "type": "integer",
+          "format": "int64",
+          "description": "Positive when spending runs faster than an even pace."
+        },
+        "days_left": {
+          "type": "integer",
+          "format": "int64",
+          "description": "Days still to spend in, today included."
+        },
+        "daily_allowance": {
+          "type": "integer",
+          "format": "int64",
+          "description": "What can go out each remaining day and still land on budget. Zero once the budget is gone."
+        },
+        "spent_fraction": {
+          "type": "number",
+          "format": "float",
+          "description": "Spent as a fraction of the budget; may exceed 1. Zero without a budget."
+        },
+        "pace_fraction": {
+          "type": "number",
+          "format": "float",
+          "description": "Where the pace tick sits on the meter, 0..1."
+        },
+        "status": {
+          "$ref": "#/$defs/PaceStatus"
+        }
+      },
+      "required": [
+        "budget",
+        "spent",
+        "total_days",
+        "elapsed_days",
+        "expected",
+        "remaining",
+        "pace_delta",
+        "days_left",
+        "daily_allowance",
+        "spent_fraction",
+        "pace_fraction",
+        "status"
+      ]
+    },
+    "PaceStatus": {
+      "type": "string",
+      "enum": [
+        "NO_BUDGET",
+        "UNDER_PACE",
+        "ON_PACE",
+        "OVER_PACE",
+        "OVER_BUDGET"
+      ]
+    },
+    "MoneyLines": {
+      "type": "object",
+      "properties": {
+        "margin": {
+          "type": "string"
+        },
+        "pace": {
+          "type": "string"
+        },
+        "versus_last": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "margin",
+        "pace",
+        "versus_last"
+      ]
+    },
+    "MoneyEnvelope": {
+      "type": "object",
+      "properties": {
+        "category_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "name": {
+          "type": "string"
+        },
+        "icon": {
+          "type": "string"
+        },
+        "color": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "budget": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "spent": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "pace_delta": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "status": {
+          "$ref": "#/$defs/PaceStatus"
+        }
+      },
+      "required": [
+        "category_id",
+        "name",
+        "icon",
+        "color",
+        "budget",
+        "spent",
+        "pace_delta",
+        "status"
+      ]
+    },
+    "MoneyAccount": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "name": {
+          "type": "string"
+        },
+        "type": {
+          "$ref": "#/$defs/AccountType"
+        },
+        "balance": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "archived": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "type",
+        "balance",
+        "archived"
+      ]
+    },
+    "AccountType": {
+      "type": "string",
+      "enum": [
+        "CASH",
+        "CHEQUING",
+        "SAVINGS",
+        "CREDIT",
+        "INVESTMENT"
+      ],
+      "description": "`Investment` holds money put to work (a TFSA, an RRSP, a brokerage account); its value can be\nupdated by hand."
+    },
+    "MoneyBill": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "name": {
+          "type": "string"
+        },
+        "amount": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "type": {
+          "$ref": "#/$defs/TxType"
+        },
+        "next_date": {
+          "type": "string"
+        },
+        "days_until": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "due_line": {
+          "type": "string"
+        },
+        "auto_post": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "amount",
+        "type",
+        "next_date",
+        "days_until",
+        "due_line",
+        "auto_post"
+      ]
+    },
+    "TxType": {
+      "type": "string",
+      "enum": [
+        "EXPENSE",
+        "INCOME",
+        "TRANSFER"
+      ]
+    },
+    "MoneyGoal": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "name": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/GoalKind"
+        },
+        "target": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "saved": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "line": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "kind",
+        "target",
+        "saved",
+        "line"
+      ]
+    },
+    "GoalKind": {
+      "type": "string",
+      "enum": [
+        "SAVINGS",
+        "BALANCE",
+        "INVEST",
+        "SAVE"
+      ],
+      "description": "What a goal measures.\n\n- `Savings`: a pot filled by contributions, toward a target and an optional date.\n- `Balance`: an account (or everything you own, net of what you owe) reaching an amount by a date.\n- `Invest`: each month, money moved into investment accounts: a share of what came in, or a set amount.\n- `Save`: each month, what is kept of what came in: a share of it, or a set amount."
+    },
+    "MoneyTx": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "uid": {
+          "type": "string"
+        },
+        "type": {
+          "$ref": "#/$defs/TxType"
+        },
+        "amount": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "date": {
+          "type": "string"
+        },
+        "account_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "account": {
+          "type": "string"
+        },
+        "to_account_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "to_account": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "category_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "category": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "icon": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "color": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "note": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "uid",
+        "type",
+        "amount",
+        "date",
+        "account_id",
+        "account",
+        "note"
+      ],
+      "description": "One entry as a client draws it, its account and category names joined in."
+    },
+    "MoneyLists": {
+      "type": "object",
+      "properties": {
+        "currency": {
+          "type": "string"
+        },
+        "fraction_digits": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "accounts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MoneyAccount"
+          }
+        },
+        "categories": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MoneyCategory"
+          }
+        },
+        "devices": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MoneyDevice"
+          },
+          "description": "Phones that sync with this ledger, the latest first."
+        }
+      },
+      "required": [
+        "currency",
+        "fraction_digits",
+        "accounts",
+        "categories",
+        "devices"
+      ]
+    },
+    "MoneyCategory": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "name": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/CategoryKind"
+        },
+        "icon": {
+          "type": "string"
+        },
+        "color": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "archived": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "kind",
+        "icon",
+        "color",
+        "archived"
+      ]
+    },
+    "CategoryKind": {
+      "type": "string",
+      "enum": [
+        "EXPENSE",
+        "INCOME"
+      ]
+    },
+    "MoneyDevice": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "last_sync": {
+          "type": "string",
+          "description": "When it last synced (RFC 3339)."
+        }
+      },
+      "required": [
+        "name",
+        "last_sync"
+      ]
+    },
+    "MoneyTxListIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "period_offset": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "0 is the current budget period, -1 the one before."
+        },
+        "query": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Matches the note, category or account in any case and alphabet."
+        },
+        "account_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "category_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "today": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "MoneyTxPage": {
+      "type": "object",
+      "properties": {
+        "period": {
+          "$ref": "#/$defs/MoneyPeriod"
+        },
+        "transactions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MoneyTx"
+          }
+        },
+        "income": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "spent": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "period",
+        "transactions",
+        "income",
+        "spent"
+      ]
+    },
+    "MoneyTxAddIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "$ref": "#/$defs/TxType"
+        },
+        "amount": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "date": {
+          "type": "string"
+        },
+        "account_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "to_account_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "Transfers only: the account the money goes to."
+        },
+        "category_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "Expenses and income only."
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "amount",
+        "date",
+        "account_id"
+      ]
+    },
+    "MoneyTxUpdateIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "type": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TxType"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "amount": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "date": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "account_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "to_account_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "category_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "MoneyIdIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "MoneyBudgetSetIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "category_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "Absent: the overall monthly budget."
+        },
+        "amount": {
+          "type": "integer",
+          "format": "int64",
+          "description": "Zero or less removes the budget."
+        }
+      },
+      "required": [
+        "amount"
+      ]
+    },
+    "MoneyAccountAddIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "type": {
+          "$ref": "#/$defs/AccountType"
+        },
+        "opening_balance": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        }
+      },
+      "required": [
+        "name",
+        "type"
+      ]
+    },
+    "MoneySettingsSetIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "currency": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "An ISO 4217 code, e.g. CAD."
+        },
+        "month_start_day": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "The day the budget month starts on, 1 to 28."
+        }
+      }
+    },
+    "MoneySettings": {
+      "type": "object",
+      "properties": {
+        "currency": {
+          "type": "string"
+        },
+        "month_start_day": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "week_starts_monday": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "currency",
+        "month_start_day",
+        "week_starts_monday"
+      ],
+      "description": "The ledger's own settings, carried in a backup."
+    },
+    "MoneyPathIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "An absolute path on the PC."
+        }
+      },
+      "required": [
+        "path"
+      ]
+    },
+    "MoneyImportOut": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "description": "`backup`: a Tally backup, which replaced the ledger."
+        },
+        "transactions": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "accounts": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "kind",
+        "transactions",
+        "accounts"
+      ]
+    },
+    "MoneyExportOut": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "transactions": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "path",
+        "transactions"
+      ]
+    },
+    "MoneySampleOut": {
+      "type": "object",
+      "properties": {
+        "transactions": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "transactions"
+      ]
+    },
+    "MoneySyncIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "device": {
+          "type": "string",
+          "description": "The phone's name, shown on the PC."
+        },
+        "replace": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "The phone's first sync with this PC: erase the PC's ledger and take the phone's."
+        },
+        "since": {
+          "type": "integer",
+          "format": "int64",
+          "description": "The cursor this PC returned last time; 0 the first time."
+        },
+        "generation": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The generation this PC returned last time; absent the first time. When the PC's ledger\nis no longer that one, the sync is refused with `money.sync_stale`, and the phone takes\nthe PC's ledger whole (`since: 0`, no generation, no changes)."
+        },
+        "changes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MoneyChange"
+          },
+          "description": "The phone's rows changed since its last sync, and its tombstones."
+        }
+      },
+      "required": [
+        "device",
+        "since",
+        "changes"
+      ]
+    },
+    "MoneyChange": {
+      "type": "object",
+      "properties": {
+        "table": {
+          "type": "string"
+        },
+        "uid": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "deleted": {
+          "type": "boolean",
+          "default": false
+        },
+        "row": {
+          "type": "object",
+          "additionalProperties": true,
+          "default": {}
+        }
+      },
+      "required": [
+        "table",
+        "uid",
+        "updated_at"
+      ],
+      "description": "One row's change on the sync wire (docs/MONEY.md, \"Sync\"). `row` holds the table's fields in\ncamelCase, references as uids; empty for a tombstone."
+    },
+    "MoneySyncOut": {
+      "type": "object",
+      "properties": {
+        "cursor": {
+          "type": "integer",
+          "format": "int64",
+          "description": "Store it and send it back as `since` next time."
+        },
+        "generation": {
+          "type": "string",
+          "description": "Store it and send it back as `generation`: it changes when this ledger is restored,\nerased or replaced, and a device holding an old one must take the ledger whole."
+        },
+        "changes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MoneyChange"
+          },
+          "description": "This ledger's changes the device has not seen."
+        },
+        "replaced": {
+          "type": "boolean",
+          "description": "This ledger was replaced by the device's."
+        },
+        "applied": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "description": "The device's changes taken, and those older than what is here or not placeable."
+        },
+        "skipped": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "cursor",
+        "generation",
+        "changes",
+        "replaced",
+        "applied",
+        "skipped"
       ]
     }
   }

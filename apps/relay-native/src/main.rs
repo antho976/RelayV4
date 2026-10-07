@@ -4,6 +4,7 @@ mod editor;
 mod fonts;
 mod icons;
 mod mirror;
+mod money;
 mod pages;
 mod panel;
 mod provider_updates;

@@ -324,6 +324,8 @@ impl Ui {
         // "agents" is both the agent wall and Files and Git; keep which one was showing.
         let page = match self.page.borrow().as_str() {
             "agents" if !self.editor.agents_visible() => String::from("code"),
+            // Money is not a project's layout: Dev comes back on the agent wall.
+            page if crate::money::is_page(page) => String::from("agents"),
             page => page.to_owned(),
         };
         json!({"page":page,"agent_layout":*self.mode.borrow(),"columns":self.columns.get(),"focused":*self.focused.borrow(),"order":*self.ordered.borrow(),"sidebar":if self.page.borrow().as_str() == "settings" { self.settings_sidebar.get() } else { self.sidebar.is_visible() },"split":self.wall_split.position(),"width":self.window.width(),"height":self.window.height(),"project_tools":self.editor.layout_state()})
@@ -1088,6 +1090,19 @@ impl Ui {
                 }
             });
         }
+        for (key, caption) in crate::money::palette_entries() {
+            let b = button(&caption, "nav");
+            list.append(&b);
+            entries.push((caption.to_lowercase(), b.clone()));
+            let weak = Rc::downgrade(self);
+            let w = window.clone();
+            b.connect_clicked(move |_| {
+                if let Some(ui) = weak.upgrade() {
+                    w.close();
+                    crate::money::run_palette(&ui, key);
+                }
+            });
+        }
         for s in self.sessions.borrow().iter() {
             let name = text(s, "name").to_string();
             let b = button(&format!("Focus {name}"), "nav");
@@ -1129,6 +1144,9 @@ impl Ui {
                 w.is::<vte4::Terminal>() || w.ancestor(vte4::Terminal::static_type()).is_some()
             });
             let key = crate::shortcuts::latin(key, keycode);
+            if key == gtk::gdk::Key::Escape && crate::money::escape_start(&ui) {
+                return glib::Propagation::Stop;
+            }
             for (action, _, fallback) in crate::shortcuts::DEFAULTS {
                 let bindings = ui.keybindings.borrow();
                 let chord = bindings[action].as_str().unwrap_or(fallback);
@@ -1141,6 +1159,9 @@ impl Ui {
                 match action {
                     "palette" => ui.command_palette(),
                     "agents" | "code" | "board" | "settings" => ui.navigate(action),
+                    "space" => crate::money::toggle_space(&ui),
+                    // In Money the same chord logs an entry.
+                    "new_session" if crate::money::active() => crate::money::add_entry(&ui),
                     // Rebuilding an open sheet would discard what is being typed into it.
                     "new_session" if ui.launch.reveals_child() => {}
                     "new_session" => ui.show_launch(None),

@@ -12,5 +12,7 @@ serde_json.workspace = true
 schemars.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
+# The money.* contract's shapes; without the SQLite ledger.
+relay-money.workspace = true
 
 [dev-dependencies]

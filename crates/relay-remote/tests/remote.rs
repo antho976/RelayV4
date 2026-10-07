@@ -806,3 +806,41 @@ async fn a_phone_is_let_go_when_the_engine_goes() {
     assert!(closes_within(&mut ws, Duration::from_secs(5)).await, "the phone stayed connected to no engine");
     engine.abort();
 }
+
+/// Tally's sync, as the phone runs it (apps/tally `PcSync`): pair, prove, send the whole ledger
+/// with `replace` the first time, then trade changes by cursor. Everything else in the money
+/// namespace stays behind the door.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tally_syncs_its_ledger_through_the_door() {
+    let h = harness().await;
+    let door = DirectServer::bind(h.ctx.clone(), "127.0.0.1:0".parse::<SocketAddr>().unwrap()).await.unwrap();
+    let url = format!("ws://{}", door.local_addr);
+    let (device, token, _) = pair(&url, &pair_code(&h.ctx)).await;
+    let mut ws = admit(&url, &device, &token).await;
+
+    let first = call(&mut ws, "money.sync", json!({"device": "Test Phone", "replace": true, "since": 0, "changes": [
+        {"table": "transactions", "uid": "t1", "updated_at": 100, "deleted": false, "row": {"type": "EXPENSE", "amount": 4_250,
+            "date": "2026-10-05", "account": "a1", "toAccount": null, "category": null, "note": "Metro", "recurring": null, "createdAt": 100}},
+        {"table": "accounts", "uid": "a1", "updated_at": 100, "deleted": false, "row": {"name": "Chequing", "type": "CHEQUING",
+            "openingBalance": 100_000, "archived": false, "sortOrder": 0}},
+        {"table": "settings", "uid": "currency", "updated_at": 100, "deleted": false, "row": {"value": "CAD"}}
+    ]})).await;
+    assert_eq!(first["ok"], true, "{first}");
+    assert_eq!(first["result"]["applied"], 3);
+    let cursor = first["result"]["cursor"].clone();
+
+    // The PC sees the phone's ledger, and an entry made there goes back on the next sync.
+    let home = at_the_pc(&h, "money.summary", json!({"today": "2026-10-07"}));
+    assert_eq!((home["spent"].as_i64(), home["accounts"][0]["balance"].as_i64()), (Some(4_250), Some(95_750)));
+    at_the_pc(&h, "money.tx.add", json!({"type": "INCOME", "amount": 210_000, "date": "2026-10-06", "account_id": home["accounts"][0]["id"]}));
+    let next = call(&mut ws, "money.sync", json!({"device": "Test Phone", "since": cursor, "changes": []})).await;
+    let changes = next["result"]["changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 1, "{next}");
+    assert_eq!((changes[0]["row"]["account"].as_str(), changes[0]["row"]["amount"].as_i64()), (Some("a1"), Some(210_000)));
+
+    // A phone syncs; it does not read or wipe the ledger through any other door.
+    for op in ["money.summary", "money.reset", "money.import"] {
+        let refused = call(&mut ws, op, json!({})).await;
+        assert_eq!(refused["error"]["code"], "remote.op", "{op}: {refused}");
+    }
+}

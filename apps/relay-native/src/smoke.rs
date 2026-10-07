@@ -894,6 +894,16 @@ pub fn install(ui: &Rc<Ui>) {
                 navigate.show_launch(None);
                 return;
             }
+            // The start screen and the entry sheet, over Money's Home.
+            if matches!(page.as_str(), "money-start" | "money-entry") {
+                navigate.navigate("money-home");
+                if page == "money-start" {
+                    crate::money::show_start(&navigate);
+                } else {
+                    crate::money::add_entry(&navigate);
+                }
+                return;
+            }
             // A task's page (`task:<id>`) or the New task page, over the board.
             if let Some(task) = page.strip_prefix("task:").and_then(|id| id.parse::<i64>().ok()) {
                 navigate.navigate("board");

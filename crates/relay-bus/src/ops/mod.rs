@@ -46,6 +46,7 @@ pub mod device;
 pub mod provider;
 pub mod notify;
 pub mod ui;
+pub mod money;
 
 /// Every op, in catalogue order.
 pub fn all() -> Vec<crate::registry::OpEntry> {
@@ -66,5 +67,6 @@ pub fn all() -> Vec<crate::registry::OpEntry> {
     v.extend(provider::entries());
     v.extend(notify::entries());
     v.extend(ui::entries());
+    v.extend(money::entries());
     v
 }

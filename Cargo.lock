@@ -2567,6 +2567,7 @@ dependencies = [
 name = "relay-bus"
 version = "4.0.0-dev"
 dependencies = [
+ "relay-money",
  "schemars",
  "serde",
  "serde_json",
@@ -2619,6 +2620,7 @@ dependencies = [
  "regex",
  "relay-bus",
  "relay-client",
+ "relay-money",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2638,6 +2640,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "relay-money"
+version = "4.0.0-dev"
+dependencies = [
+ "jiff",
+ "regex",
+ "rusqlite",
+ "schemars",
+ "serde",
+ "serde_json",
+ "unicode-normalization",
+ "uuid",
+]
+
+[[package]]
 name = "relay-native"
 version = "4.0.0-dev"
 dependencies = [
@@ -2649,6 +2665,7 @@ dependencies = [
  "relay-board",
  "relay-bus",
  "relay-client",
+ "relay-money",
  "serde_json",
  "sha2",
  "sourceview5",
