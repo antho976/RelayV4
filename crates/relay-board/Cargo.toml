@@ -1,0 +1,10 @@
+[package]
+name = "relay-board"
+description = "The native board's pure logic: filtering, grouping, ordering and drop indices over task.list rows. No GTK, so CI tests it."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde_json.workspace = true

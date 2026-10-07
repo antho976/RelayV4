@@ -2535,6 +2535,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "relay-board"
+version = "4.0.0-dev"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "relay-bus"
 version = "4.0.0-dev"
 dependencies = [
@@ -2607,6 +2614,7 @@ dependencies = [
  "glib",
  "gtk4",
  "pango",
+ "relay-board",
  "relay-bus",
  "serde_json",
  "sha2",

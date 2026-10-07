@@ -116,6 +116,27 @@ fn agent_glyph(index: usize) -> gtk::Image {
     image
 }
 
+/// The order an agent takes its tasks in: the one the sheet was opened from, then the others
+/// in the order they were ticked. `active` is every selected id in card (board-column) order;
+/// one with no recorded tick keeps that order at the end.
+fn task_order(active: &[i64], preselect: Option<i64>, ticks: &[i64]) -> Vec<i64> {
+    let mut order: Vec<i64> = preselect.filter(|id| active.contains(id)).into_iter().collect();
+    for id in ticks.iter().chain(active) {
+        if active.contains(id) && !order.contains(id) {
+            order.push(*id);
+        }
+    }
+    order
+}
+
+/// Note a card being ticked (to the end of the sequence) or unticked (out of it).
+fn record_tick(ticks: &mut Vec<i64>, id: i64, active: bool) {
+    ticks.retain(|t| *t != id);
+    if active {
+        ticks.push(id);
+    }
+}
+
 struct Profile {
     root: gtk::Box,
     provider: gtk::DropDown,
@@ -127,6 +148,10 @@ struct Profile {
     writes: gtk::CheckButton,
     ui_access: gtk::CheckButton,
     tasks: RefCell<Vec<(i64, gtk::ToggleButton)>>,
+    /// The task the sheet was opened from, and the other ids in the order they were ticked:
+    /// the first selected task becomes the agent's current one (RA-558).
+    preselect: Cell<Option<i64>>,
+    ticks: RefCell<Vec<i64>>,
     task_box: gtk::Grid,
     task_search: gtk::SearchEntry,
     task_filter: gtk::DropDown,
@@ -300,6 +325,8 @@ impl Profile {
             writes,
             ui_access,
             tasks: RefCell::default(),
+            preselect: Cell::new(None),
+            ticks: RefCell::default(),
             task_box,
             task_search,
             task_filter,
@@ -309,12 +336,14 @@ impl Profile {
         })
     }
     fn selected_tasks(&self) -> Vec<i64> {
-        self.tasks
+        let active: Vec<i64> = self
+            .tasks
             .borrow()
             .iter()
             .filter(|(_, b)| b.is_active())
             .map(|(id, _)| *id)
-            .collect()
+            .collect();
+        task_order(&active, self.preselect.get(), &self.ticks.borrow())
     }
     fn payload(&self, project: i64, role: Option<&str>) -> Value {
         // A review group keeps its own fresh worktree unless the user typed one: groups in the
@@ -354,6 +383,7 @@ impl Profile {
             return;
         }
         let profile = self;
+        profile.preselect.set(preselect);
         let mut filters: Vec<(gtk::ToggleButton, String, String)> = Vec::new();
         for (index, row) in tasks
             .iter()
@@ -405,8 +435,9 @@ impl Profile {
             ));
             profile.tasks.borrow_mut().push((id, check.clone()));
             let weak = Rc::downgrade(profile);
-            check.connect_toggled(move |_| {
+            check.connect_toggled(move |check| {
                 if let Some(p) = weak.upgrade() {
+                    record_tick(&mut p.ticks.borrow_mut(), id, check.is_active());
                     p.task_count.set_text(&format!(
                         "{} selected",
                         p.selected_tasks().len()
@@ -901,4 +932,30 @@ fn launch_is_current(ui: &Ui, project: i64, generation: u64, heading: &gtk::Box)
 /// This form is the one the sheet shows, whatever has changed under it.
 fn launch_is_shown(ui: &Ui, heading: &gtk::Box) -> bool {
     ui.launch.reveals_child() && ui.launch_box.first_child().as_ref() == Some(heading.upcast_ref())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{record_tick, task_order};
+
+    #[test]
+    fn the_opening_task_comes_first_then_the_tick_order() {
+        // Card order is backlog first: #3 (backlog), #7 (backlog), #12 (ready).
+        let mut ticks = Vec::new();
+        record_tick(&mut ticks, 7, true);
+        record_tick(&mut ticks, 3, true);
+        assert_eq!(task_order(&[3, 7, 12], Some(12), &ticks), [12, 7, 3]);
+        // Unticking drops a task; ticking it again puts it last.
+        record_tick(&mut ticks, 7, false);
+        assert_eq!(task_order(&[3, 12], Some(12), &ticks), [12, 3]);
+        record_tick(&mut ticks, 7, true);
+        assert_eq!(task_order(&[3, 7, 12], Some(12), &ticks), [12, 3, 7]);
+    }
+
+    #[test]
+    fn an_unticked_opening_task_is_left_out() {
+        assert_eq!(task_order(&[3, 7], Some(12), &[7, 3]), [7, 3]);
+        assert_eq!(task_order(&[3, 7], None, &[7]), [7, 3]);
+        assert!(task_order(&[], Some(12), &[]).is_empty());
+    }
 }

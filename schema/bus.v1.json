@@ -4,7 +4,7 @@
   "title": "RELAY v4 command bus",
   "description": "Generated from crates/relay-bus by `relay schema`. Do not edit; see docs/engine/BUS.md.",
   "version": 1,
-  "op_count": 228,
+  "op_count": 230,
   "envelope": {
     "request": {
       "$ref": "#/$defs/Request"
@@ -511,6 +511,26 @@
         "$ref": "#/$defs/Workspace"
       }
     },
+    "workspace.reorder": {
+      "summary": "Set several workspaces' order at once: one transaction, one undo, one event",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "inverse",
+      "scope": "global",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "workspace.changed"
+      ],
+      "since": "1.0",
+      "phase": 1,
+      "payload": {
+        "$ref": "#/$defs/WorkspaceReorderIn"
+      },
+      "result": {
+        "$ref": "#/$defs/WorkspaceListOut"
+      }
+    },
     "workspace.remove": {
       "summary": "Forget a workspace; conflict if it still has projects unless force removes them too",
       "kind": "mutation",
@@ -627,6 +647,26 @@
       },
       "result": {
         "$ref": "#/$defs/Project"
+      }
+    },
+    "project.reorder": {
+      "summary": "Set several projects' order at once: one transaction, one undo, one event",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "inverse",
+      "scope": "global",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "project.changed"
+      ],
+      "since": "1.0",
+      "phase": 1,
+      "payload": {
+        "$ref": "#/$defs/ProjectReorderIn"
+      },
+      "result": {
+        "$ref": "#/$defs/ProjectListOut"
       }
     },
     "project.remove": {
@@ -6037,6 +6077,40 @@
         "workspace_id"
       ]
     },
+    "WorkspaceReorderIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "orders": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WorkspaceOrder"
+          },
+          "description": "Every workspace whose `order` changes, each once. The rest keep theirs."
+        }
+      },
+      "required": [
+        "orders"
+      ]
+    },
+    "WorkspaceOrder": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "workspace_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "order": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "order"
+      ]
+    },
     "WorkspaceRemoveIn": {
       "type": "object",
       "additionalProperties": false,
@@ -6318,6 +6392,40 @@
       },
       "required": [
         "project_id"
+      ]
+    },
+    "ProjectReorderIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "orders": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ProjectOrder"
+          },
+          "description": "Every project whose `order` changes, each once. The rest keep theirs."
+        }
+      },
+      "required": [
+        "orders"
+      ]
+    },
+    "ProjectOrder": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "project_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "order": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "project_id",
+        "order"
       ]
     },
     "ProjectRemoveIn": {
@@ -6785,6 +6893,14 @@
             "null"
           ],
           "format": "int64"
+        },
+        "module_name": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The name of `module_id`'s module, completed (archived) ones included, so a card can be\nlabelled without a `module.list` (RA-495). Absent from an older engine.",
+          "default": null
         },
         "title": {
           "type": "string"
@@ -14331,6 +14447,13 @@
           ],
           "format": "uint32",
           "minimum": 0
+        },
+        "count_only": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Only `unread`: no rows are read and `notifications` comes back empty. For a badge."
         }
       }
     },
@@ -14354,6 +14477,12 @@
           "items": {
             "$ref": "#/$defs/Notification"
           }
+        },
+        "unread": {
+          "type": "integer",
+          "format": "int64",
+          "description": "Unread notifications matching `project_id` / `category`, however many `limit` and\n`unread_only` leave out of `notifications` (RA-490). Absent from an older engine.",
+          "default": 0
         }
       },
       "required": [

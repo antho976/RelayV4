@@ -118,30 +118,19 @@ impl Ui {
             items.insert(index + usize::from(after), item);
             ui.projects_box.set_sensitive(false);
             glib::spawn_future_local(async move {
-                // Each update is its own event and undo entry, so only the items whose order
-                // changed (the moved range) are written.
-                for (order, item) in items.into_iter().enumerate() {
-                    if item["order"].as_i64() == Some(order as i64) {
-                        continue;
-                    }
-                    let payload = if workspace {
-                        json!({"workspace_id":item["id"],"order":order})
-                    } else {
-                        json!({"project_id":item["id"],"order":order})
-                    };
-                    if let Err(e) = ui
-                        .call(
-                            if workspace {
-                                "workspace.update"
-                            } else {
-                                "project.update"
-                            },
-                            payload,
-                        )
-                        .await
-                    {
+                // One reorder call: all orders in one transaction, one undo entry, one event.
+                // Only the items whose order changed (the moved range) are sent.
+                let key = if workspace { "workspace_id" } else { "project_id" };
+                let orders: Vec<Value> = items
+                    .iter()
+                    .enumerate()
+                    .filter(|(order, item)| item["order"].as_i64() != Some(*order as i64))
+                    .map(|(order, item)| json!({key:item["id"],"order":order}))
+                    .collect();
+                if !orders.is_empty() {
+                    let op = if workspace { "workspace.reorder" } else { "project.reorder" };
+                    if let Err(e) = ui.call(op, json!({"orders":orders})).await {
                         ui.show_error(&e.to_string());
-                        break;
                     }
                 }
                 ui.projects_box.set_sensitive(true);
@@ -821,8 +810,9 @@ impl Ui {
         }
         self.agent_controls(pane, session);
     }
-    /// Every notify event lands here. A burst of them shares one list, as refresh() does: the
-    /// list in flight runs once more when it answers if the revision moved meanwhile.
+    /// Every notify event lands here. A burst of them shares one count, as refresh() does: the
+    /// count in flight runs once more when it answers if the revision moved meanwhile. Only
+    /// counts are asked for (`count_only`): all unread, and the unread held ones that tint it.
     pub(super) fn refresh_notification_count(self: &Rc<Self>) {
         self.notification_revision
             .set(self.notification_revision.get().wrapping_add(1));
@@ -834,30 +824,29 @@ impl Ui {
             let (result, generation) = loop {
                 let revision = ui.notification_revision.get();
                 let generation = ui.generation.get();
-                let result = ui
-                    .call("notify.list", json!({"unread_only":true,"limit":100}))
-                    .await;
+                let result = tokio::join!(
+                    ui.call("notify.list", json!({"count_only":true})),
+                    ui.call("notify.list", json!({"count_only":true,"category":"agent_blocked"})),
+                    ui.call("notify.list", json!({"count_only":true,"category":"guardrail"}))
+                );
                 if ui.notification_revision.get() == revision {
                     break (result, generation);
                 }
             };
             BELL_LOADING.with(|loading| loading.set(false));
-            if let Ok(result) = result {
+            if let (Ok(all), Ok(blocked), Ok(guardrail)) = result {
                 if ui.generation.get() != generation {
                     return;
                 }
-                let unread = rows(&result, "notifications");
-                notification_center::unread(unread.len());
-                ui.notification_count.set_visible(!unread.is_empty());
-                ui.notification_count.set_text(&if unread.len() > 99 {
+                let count = |v: &Value| v["unread"].as_u64().unwrap_or(0);
+                let unread = count(&all);
+                ui.notification_count.set_visible(unread > 0);
+                ui.notification_count.set_text(&if unread > 99 {
                     String::from("99+")
                 } else {
-                    unread.len().to_string()
+                    unread.to_string()
                 });
-                if unread
-                    .iter()
-                    .any(|n| matches!(text(n, "category"), "agent_blocked" | "guardrail"))
-                {
+                if count(&blocked) + count(&guardrail) > 0 {
                     ui.notification_count.add_css_class("held");
                 } else {
                     ui.notification_count.remove_css_class("held");

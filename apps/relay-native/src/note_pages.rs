@@ -145,6 +145,55 @@ const NOTES_SCHEME: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
   <style name="def:comment" foreground="#6e6e70"/>
   <style name="def:string" foreground="#e0b04a"/>
   <style name="def:keyword" foreground="#c979d6"/>
+  <!-- As in resources/relay-editor.xml (RA-530): Adwaita-dark styles some languages' tokens by
+       their own ids, which a lookup finds before the def:* style the language maps them to.
+       Own every def:* style those point at, then point each language id back at it. -->
+  <style name="def:statement" foreground="#c979d6"/>
+  <style name="def:preprocessor" foreground="#c979d6"/>
+  <style name="def:type" foreground="#3ec5cf"/>
+  <style name="def:function" foreground="#5b9cf6"/>
+  <style name="def:character" foreground="#e0b04a"/>
+  <style name="def:number" foreground="#f2cf6b"/>
+  <style name="def:operator" foreground="#a5a5a3"/>
+  <style name="def:identifier" foreground="#dcdcda"/>
+  <style name="def:doc-comment" foreground="#6e6e70"/>
+  <style name="def:doc-comment-element" use-style="def:doc-comment"/>
+  <style name="def:error" foreground="#e5382e"/>
+  <style name="def:constant" use-style="def:number"/>
+  <style name="def:special-constant" use-style="def:number"/>
+  <style name="def:net-address" foreground="#7aa7f0"/>
+  <style name="def:note" foreground="#e0b04a" bold="true"/>
+  <style name="rust:attribute" use-style="def:preprocessor"/>
+  <style name="rust:macro" use-style="def:preprocessor"/>
+  <style name="rust:scope" use-style="def:preprocessor"/>
+  <style name="rust:lifetime" use-style="def:keyword"/>
+  <style name="c:printf" use-style="def:special-char"/>
+  <style name="c:signal-name" use-style="def:constant"/>
+  <style name="c:storage-class" use-style="def:type"/>
+  <style name="c:type-keyword" use-style="def:keyword"/>
+  <style name="c-sharp:format" use-style="def:special-char"/>
+  <style name="c-sharp:preprocessor" use-style="def:preprocessor"/>
+  <style name="go:printf" use-style="def:special-char"/>
+  <style name="vala:attributes" use-style="def:function"/>
+  <style name="python:builtin-function" use-style="def:type"/>
+  <style name="python:class-name" use-style="def:function"/>
+  <style name="python:module-handler" use-style="def:preprocessor"/>
+  <style name="css:id-selector" use-style="def:statement"/>
+  <style name="css:property-name" use-style="def:keyword"/>
+  <style name="css:pseudo-selector" use-style="def:function"/>
+  <style name="css:selector-symbol" use-style="def:operator"/>
+  <style name="css:type-selector" use-style="def:type"/>
+  <style name="css:vendor-specific" use-style="def:keyword"/>
+  <style name="xml:attribute-name" use-style="def:type"/>
+  <style name="xml:attribute-value" use-style="def:string"/>
+  <style name="xml:element-name" use-style="def:identifier"/>
+  <style name="xml:namespace" use-style="def:identifier"/>
+  <style name="xml:processing-instruction" use-style="def:preprocessor"/>
+  <style name="diff:added-line" foreground="#2ec469"/>
+  <style name="diff:removed-line" foreground="#e5382e"/>
+  <style name="diff:changed-line" foreground="#f0a828"/>
+  <style name="diff:location" use-style="def:function"/>
+  <style name="diff:diff-file" use-style="def:keyword"/>
 </style-scheme>
 "##;
 
@@ -1123,6 +1172,8 @@ pub fn edit(ui: &Rc<Ui>, note: Value) {
 pub(super) fn new_note(ui: &Rc<Ui>, title: Option<String>, body: String) {
     let project = current_project(ui);
     if project == 0 {
+        // Ctrl+N and File > New note said nothing here (RA-488).
+        load_error(ui, "No project yet. Add one from the main window to create a note in it.");
         return;
     }
     if let Some(message) = doc::oversize(&body) {
@@ -1531,14 +1582,15 @@ fn module_detail(ui: &Rc<Ui>, module: Value) {
         .hexpand(true)
         .build();
     row.append(&title);
-    super::task_pages::action(
+    // The module editor comes back, with the new task in its list, rather than closing (RA-517).
+    super::task_pages::action_then(
         ui,
         &d,
         &row,
         "Add task",
         "task.create",
         move || json!({"project_id":project,"module_id":id,"title":title.text().trim(),"column":"backlog"}),
-        None,
+        Some(Rc::new(move |ui: &Rc<Ui>| open_module(ui, id))),
     );
     d.form.append(&row);
     let key = button("Draft patch notes", "quiet");
