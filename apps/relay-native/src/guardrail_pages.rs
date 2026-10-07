@@ -59,16 +59,7 @@ fn clip_strings(value: &Value) -> Value {
 
 /// "4 min ago" from an RFC 3339 timestamp; empty when it does not parse.
 fn ago(ts: &str) -> String {
-    let (Ok(then), Ok(now)) = (glib::DateTime::from_iso8601(ts, None), glib::DateTime::now_utc()) else {
-        return String::new();
-    };
-    let seconds = now.difference(&then).as_seconds().max(0);
-    match seconds {
-        0..=44 => "just now".into(),
-        45..=5399 => format!("{} min ago", (seconds + 30) / 60),
-        5400..=129_599 => format!("{} h ago", (seconds + 1800) / 3600),
-        _ => format!("{} days ago", (seconds + 43_200) / 86_400),
-    }
+    crate::relative::ago(ts, crate::relative::Form::Long).unwrap_or_default()
 }
 
 fn is_request(hold: &Value) -> bool {
@@ -145,8 +136,14 @@ fn explain(policy: &str, details: &Value) -> String {
                 .as_f64()
                 .map(|pct| format!(" ({pct:.0}% of {} lines)", number(&details["old_lines"])))
                 .unwrap_or_default();
+            // The engine asks git only when "Allow rewrites git can restore" is on, and the
+            // hold does not say whether it asked: claim git cannot help only when it says so.
+            let git = match &details["recoverable"] {
+                Value::Bool(false) => ", and git cannot restore what is there now",
+                _ => "",
+            };
             format!(
-                "Removes {} lines{share} and adds {}. The limit is {} lines or {}% of a file, and git cannot restore what is there now.",
+                "Removes {} lines{share} and adds {}. The limit is {} lines or {}% of a file{git}.",
                 number(&details["removed_lines"]), number(&details["added_lines"]),
                 number(&details["limit_lines"]), number(&details["limit_pct"]),
             )
@@ -369,6 +366,11 @@ pub fn hold_row(ui: &Rc<Ui>, hold: Value) -> gtk::Box {
     card
 }
 
+/// The hold was answered elsewhere (the phone, the CLI) or is gone: nothing is left to answer.
+fn settled(error: &crate::client::Error) -> bool {
+    matches!(error, crate::client::Error::Bus(e) if matches!(e.code.as_str(), "guardrail.hold_resolved" | "guardrail.hold_not_found"))
+}
+
 /// An inline "why not" form under `keys`, sending `guardrail.reject`. Returns the opener.
 fn denial_form(ui: &Rc<Ui>, card: &gtk::Box, keys: &gtk::Box, id: Value, placeholder: &str) -> impl Fn() + 'static {
     let form = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -404,7 +406,13 @@ fn denial_form(ui: &Rc<Ui>, card: &gtk::Box, keys: &gtk::Box, id: Value, placeho
                     close_prompt(&ui, id.as_i64().unwrap_or_default());
                     ui.refresh_page();
                 }
-                Err(e) => ui.show_error(&e.to_string()),
+                Err(e) => {
+                    ui.show_error(&e.to_string());
+                    if settled(&e) {
+                        close_prompt(&ui, id.as_i64().unwrap_or_default());
+                        ui.refresh_page();
+                    }
+                }
             }
             key.set_sensitive(true);
         });
@@ -476,6 +484,8 @@ pub fn exception_card(ui: &Rc<Ui>, request: &Value, compact: bool) -> gtk::Box {
     let always = button("Approve for this session", if asked == "session" { "primary" } else { "" });
     let deny = button("Deny…", "quiet");
     for key in [&once, &always, &deny] {
+        // A prompt is answered beside a terminal: a click must not pull the keys out of it.
+        key.set_focus_on_click(!compact);
         keys.append(key);
     }
     if compact {
@@ -483,6 +493,7 @@ pub fn exception_card(ui: &Rc<Ui>, request: &Value, compact: bool) -> gtk::Box {
         spacer.set_hexpand(true);
         keys.append(&spacer);
         let later = crate::app::icon_button("close", "Answer later from Guardrails");
+        later.set_focus_on_click(false);
         let weak = Rc::downgrade(ui);
         later.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
@@ -512,7 +523,10 @@ pub fn exception_card(ui: &Rc<Ui>, request: &Value, compact: bool) -> gtk::Box {
                     }
                     Err(e) => {
                         ui.show_error(&e.to_string());
-                        if let Some(keys) = all.upgrade() {
+                        if settled(&e) {
+                            close_prompt(&ui, id);
+                            ui.refresh_page();
+                        } else if let Some(keys) = all.upgrade() {
                             keys.set_sensitive(true);
                         }
                     }
@@ -528,6 +542,13 @@ fn tray(ui: &Rc<Ui>) -> gtk::Box {
     while let Some(widget) = child {
         if widget.widget_name() == TRAY {
             if let Ok(tray) = widget.downcast::<gtk::Box>() {
+                // Overlays stack in the order they were added, and a panel opened since sits
+                // over the tray, frame and scrim. Raise it, unless a denial is being typed in it.
+                let typing = tray.root().and_then(|root| root.focus()).is_some_and(|focus| focus.is_ancestor(&tray));
+                if tray.next_sibling().is_some() && !typing {
+                    ui.overlay.remove_overlay(&tray);
+                    ui.overlay.add_overlay(&tray);
+                }
                 return tray;
             }
             break;
@@ -543,8 +564,8 @@ fn tray(ui: &Rc<Ui>) -> gtk::Box {
     tray.set_margin_end(16);
     tray.set_margin_bottom(40);
     tray.set_size_request(420, -1);
-    // The prompt waits beside whatever you are doing; it never takes keyboard focus.
-    tray.set_focus_on_click(false);
+    // The prompt waits beside whatever you are doing; its keys do not take keyboard focus on
+    // a click (exception_card), and only the Deny form's reason entry asks for it.
     ui.overlay.add_overlay(&tray);
     tray
 }
@@ -573,6 +594,7 @@ fn update_overflow(ui: &Rc<Ui>, tray: &gtk::Box, hidden: usize) {
         return;
     }
     let more = button(&format!("{hidden} more waiting · open Guardrails"), "quiet");
+    more.set_focus_on_click(false);
     more.set_widget_name("guardrail-more");
     more.add_css_class("guardrail-more");
     let weak = Rc::downgrade(ui);
@@ -689,6 +711,14 @@ fn retire(tray: &gtk::Box, slot: &gtk::Widget) {
 /// Take a request's prompt down (answered, expired, or put off), and let a waiting one in.
 fn close_prompt(ui: &Rc<Ui>, id: i64) {
     WAITING.with(|w| w.borrow_mut().retain(|r| r["id"].as_i64() != Some(id)));
+    // Recorded even when it is not showing: a `guardrail.request.get` still in flight for it
+    // must not put it back up.
+    DISMISSED.with(|d| {
+        let mut dismissed = d.borrow_mut();
+        if !dismissed.contains(&id) {
+            dismissed.push(id);
+        }
+    });
     let tray = tray(ui);
     let mut child = tray.first_child();
     let mut removed = false;
@@ -700,7 +730,6 @@ fn close_prompt(ui: &Rc<Ui>, id: i64) {
         }
     }
     if removed {
-        DISMISSED.with(|d| d.borrow_mut().push(id));
         // One mutable borrow, bound before show_prompt borrows WAITING again: a shared borrow
         // held across `then` makes the borrow_mut panic.
         let next = WAITING.with(|w| {
@@ -749,13 +778,14 @@ pub fn restore_prompts(ui: &Rc<Ui>) {
     glib::spawn_future_local(async move {
         let Ok(open) = ui.call("guardrail.requests.list", json!({"state": "open"})).await else { return };
         let open = rows(&open, "requests");
+        // Stale waiting entries go first, so closing a stale prompt cannot promote one.
+        WAITING.with(|w| w.borrow_mut().retain(|r| open.iter().any(|o| o["id"] == r["id"])));
         let tray = tray(&ui);
         for id in prompt_ids(&tray) {
             if !open.iter().any(|r| r["id"].as_i64() == Some(id)) {
                 close_prompt(&ui, id);
             }
         }
-        WAITING.with(|w| w.borrow_mut().retain(|r| open.iter().any(|o| o["id"] == r["id"])));
         // Oldest first: the one that has waited longest is answered first.
         for request in open.iter().rev() {
             show_prompt(&ui, request);

@@ -6,6 +6,11 @@ mod registry;
 mod agent_menu;
 pub(super) use agent_menu::is_closing;
 
+thread_local! {
+    /// The bell's notify.list is in flight; see refresh_notification_count.
+    static BELL_LOADING: Cell<bool> = const { Cell::new(false) };
+}
+
 impl Ui {
     /// Open `project` on `page`: an explicit destination, which the project's saved layout
     /// does not override.
@@ -113,7 +118,12 @@ impl Ui {
             items.insert(index + usize::from(after), item);
             ui.projects_box.set_sensitive(false);
             glib::spawn_future_local(async move {
+                // Each update is its own event and undo entry, so only the items whose order
+                // changed (the moved range) are written.
                 for (order, item) in items.into_iter().enumerate() {
+                    if item["order"].as_i64() == Some(order as i64) {
+                        continue;
+                    }
                     let payload = if workspace {
                         json!({"workspace_id":item["id"],"order":order})
                     } else {
@@ -146,7 +156,6 @@ impl Ui {
         &self,
         title: &str,
         width: i32,
-        _height: i32,
     ) -> Option<(Rc<crate::panel::Panel>, gtk::Box)> {
         let panel = crate::panel::Panel::toggle(self, title, width)?;
         let body = panel.body.clone();
@@ -166,8 +175,9 @@ impl Ui {
         let focus = self.focused.borrow().clone();
         let mode = self.mode.borrow().clone();
         self.wall_right.set_visible(
-            matches!(mode.as_str(), "review" | "mosaic")
-                || (mode == "grid" && self.columns.get() == 2 && names.len() > 1),
+            names.len() > 1
+                && (matches!(mode.as_str(), "review" | "mosaic")
+                    || (mode == "grid" && self.columns.get() == 2)),
         );
         clear(&self.focus_tabs);
         self.focus_tabs
@@ -187,16 +197,12 @@ impl Ui {
                     .iter()
                     .find(|s| text(s, "name") == name)
                 {
-                    match text(session, "state") {
-                        "running" | "spawning" => lamp.add_css_class("live"),
-                        "blocked" => lamp.add_css_class("held"),
-                        "restorable" => lamp.add_css_class("waiting"),
-                        _ => (),
-                    }
+                    tab_lamp(&lamp, text(session, "state"));
                 }
                 row.append(&lamp);
                 row.append(&label(name, ""));
                 b.set_child(Some(&row));
+                b.set_widget_name(&format!("focus-tab-{name}"));
                 if focus.as_ref() == Some(name) {
                     b.add_css_class("selected");
                 }
@@ -495,7 +501,7 @@ impl Ui {
         self.applying_ui.set(false);
     }
     pub(super) fn layout_menu(self: &Rc<Self>) {
-        let Some((window, body)) = self.sheet("Window presets", 390, 420) else {
+        let Some((window, body)) = self.sheet("Window presets", 390) else {
             return;
         };
         window.compact(false, 620);
@@ -573,7 +579,10 @@ impl Ui {
             let grid = modes.downgrade();
             b.connect_clicked(move |key| {
                 if let Some(ui) = weak.upgrade() {
-                    ui.columns.set(columns);
+                    // Columns are the grid's alone; focus must not leave a one-column grid behind.
+                    if mode == "grid" {
+                        ui.columns.set(columns);
+                    }
                     ui.set_mode(mode);
                     if let Some(grid) = grid.upgrade() {
                         let mut child = grid.first_child();
@@ -649,16 +658,38 @@ impl Ui {
                         let delete = icon_button("edit-delete-symbolic", "Delete preset");
                         row.append(&delete);
                         saved.append(&row);
-                        for (key, op) in [(apply, "ui.layout.apply"), (delete, "ui.layout.delete")]
-                        {
-                            let weak = Rc::downgrade(&ui);
-                            let name = name.to_string();
-                            key.connect_clicked(move |b| {
-                                if let Some(ui) = weak.upgrade() {
-                                    ui.mutate(op, json!({"project_id":project,"name":name}), b);
+                        let weak = Rc::downgrade(&ui);
+                        let preset = name.to_string();
+                        apply.connect_clicked(move |b| {
+                            if let Some(ui) = weak.upgrade() {
+                                ui.mutate("ui.layout.apply", json!({"project_id":project,"name":preset}), b);
+                            }
+                        });
+                        // The list is read once, so a deleted preset leaves it here.
+                        let weak = Rc::downgrade(&ui);
+                        let preset = name.to_string();
+                        let row = row.downgrade();
+                        crate::app::confirm_inline(&delete, "Delete", move |key| {
+                            let Some(ui) = weak.upgrade() else { return };
+                            let payload = json!({"project_id":project,"name":preset});
+                            let (key, row) = (key.clone(), row.clone());
+                            key.set_sensitive(false);
+                            glib::spawn_future_local(async move {
+                                match ui.call("ui.layout.delete", payload).await {
+                                    Ok(_) => {
+                                        if let Some(row) = row.upgrade() {
+                                            if let Some(list) = row.parent().and_downcast::<gtk::Box>() {
+                                                list.remove(&row);
+                                            }
+                                        }
+                                        ui.refresh();
+                                    }
+                                    Err(e) => ui.show_error(&e.to_string()),
                                 }
+                                key.set_sensitive(true);
+                                ui.refresh_page();
                             });
-                        }
+                        });
                     }
                 }
                 Err(e) => ui.show_error(&e.to_string()),
@@ -704,6 +735,18 @@ impl Ui {
         pane.root.add_controller(drop_target);
     }
     pub(super) fn session_actions(self: &Rc<Self>, pane: &Rc<Pane>, session: &Value) {
+        // reconcile lays out only when the order changes, so a state change alone reaches the
+        // focus tabs here; an agent turning blocked must not keep its running lamp.
+        let tab = format!("focus-tab-{}", text(session, "name"));
+        let mut child = self.focus_tabs.first_child();
+        while let Some(widget) = child {
+            child = widget.next_sibling();
+            if widget.widget_name() == tab {
+                if let Some(lamp) = widget.first_child().and_then(|row| row.first_child()) {
+                    tab_lamp(&lamp, text(session, "state"));
+                }
+            }
+        }
         self.clear_agent_actions(pane);
         clear(&pane.slate_actions);
         if self.agent_overrides(pane, session) {
@@ -778,20 +821,33 @@ impl Ui {
         }
         self.agent_controls(pane, session);
     }
+    /// Every notify event lands here. A burst of them shares one list, as refresh() does: the
+    /// list in flight runs once more when it answers if the revision moved meanwhile.
     pub(super) fn refresh_notification_count(self: &Rc<Self>) {
-        let revision = self.notification_revision.get().wrapping_add(1);
-        self.notification_revision.set(revision);
-        let generation = self.generation.get();
+        self.notification_revision
+            .set(self.notification_revision.get().wrapping_add(1));
+        if BELL_LOADING.with(|loading| loading.replace(true)) {
+            return;
+        }
         let ui = self.clone();
         glib::spawn_future_local(async move {
-            if let Ok(result) = ui
-                .call("notify.list", json!({"unread_only":true,"limit":100}))
-                .await
-            {
-                if ui.generation.get() != generation || ui.notification_revision.get() != revision {
+            let (result, generation) = loop {
+                let revision = ui.notification_revision.get();
+                let generation = ui.generation.get();
+                let result = ui
+                    .call("notify.list", json!({"unread_only":true,"limit":100}))
+                    .await;
+                if ui.notification_revision.get() == revision {
+                    break (result, generation);
+                }
+            };
+            BELL_LOADING.with(|loading| loading.set(false));
+            if let Ok(result) = result {
+                if ui.generation.get() != generation {
                     return;
                 }
                 let unread = rows(&result, "notifications");
+                notification_center::unread(unread.len());
                 ui.notification_count.set_visible(!unread.is_empty());
                 ui.notification_count.set_text(&if unread.len() > 99 {
                     String::from("99+")
@@ -809,12 +865,18 @@ impl Ui {
             }
         });
     }
-    pub(super) fn project_skills(self: &Rc<Self>) {
-        let project = self.project.get();
-        let Some((panel, body)) = self.sheet("Agent skills", 390, 560) else {
-            return;
-        };
-        panel.top(560);
+    /// The frame the Agent skills and Plugins sheets share, presented: the project's name, an
+    /// intro, a list showing `loading` until it is filled, a hidden feedback line, and a footer
+    /// whose key closes the sheet and opens `page`. Returns the name, the list and the line.
+    fn switch_sheet(
+        self: &Rc<Self>,
+        panel: &Rc<crate::panel::Panel>,
+        body: &gtk::Box,
+        project: i64,
+        intro: &str,
+        loading: &str,
+        (scope, manage, page): (&str, &str, &'static str),
+    ) -> (String, gtk::Box, gtk::Label) {
         panel.add_css_class("agent-skills-popover");
         let name = self
             .projects
@@ -824,16 +886,12 @@ impl Ui {
             .map(|p| text(p, "name").to_owned())
             .unwrap_or_else(|| "No project".into());
         body.set_spacing(0);
-        let scope = label(&name.to_uppercase(), "section-label");
-        body.append(&scope);
-        let intro = label(
-            "Change the project instructions used when agents start or resume. Running agents keep the context already loaded.",
-            "agent-skills-intro",
-        );
+        body.append(&label(&name.to_uppercase(), "section-label"));
+        let intro = label(intro, "agent-skills-intro");
         intro.set_wrap(true);
         body.append(&intro);
         let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        list.append(&label("Loading skills…", "dim"));
+        list.append(&label(loading, "dim"));
         body.append(&list);
         let feedback = label("", "dim");
         feedback.set_wrap(true);
@@ -841,23 +899,39 @@ impl Ui {
         body.append(&feedback);
         let footer = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         footer.add_css_class("agent-skills-footer");
-        let scope = label("PROJECT-WIDE", "section-label");
+        let scope = label(scope, "section-label");
         scope.set_hexpand(true);
         footer.append(&scope);
-        let manage = button("Open skill library", "quiet");
+        let manage = button(manage, "quiet");
         footer.append(&manage);
         body.append(&footer);
         let weak = Rc::downgrade(self);
-        let panel_weak = Rc::downgrade(&panel);
+        let panel_weak = Rc::downgrade(panel);
         manage.connect_clicked(move |_| {
             if let Some(panel) = panel_weak.upgrade() {
                 panel.close();
             }
             if let Some(ui) = weak.upgrade() {
-                ui.navigate("skills");
+                ui.navigate(page);
             }
         });
         panel.present();
+        (name, list, feedback)
+    }
+    pub(super) fn project_skills(self: &Rc<Self>) {
+        let project = self.project.get();
+        let Some((panel, body)) = self.sheet("Agent skills", 390) else {
+            return;
+        };
+        panel.top(560);
+        let (name, list, feedback) = self.switch_sheet(
+            &panel,
+            &body,
+            project,
+            "Change the project instructions used when agents start or resume. Running agents keep the context already loaded.",
+            "Loading skills…",
+            ("PROJECT-WIDE", "Open skill library", "skills"),
+        );
         let ui = self.clone();
         let panel = Rc::downgrade(&panel);
         glib::spawn_future_local(async move {
@@ -920,56 +994,23 @@ impl Ui {
             }
         });
     }
-    /// The plugin switches of one project, opened from its row in the sidebar.
-    pub(super) fn project_plugins(self: &Rc<Self>, project: i64) {
-        let Some((panel, body)) = self.sheet("Plugins", 440, 640) else {
+    /// The plugin switches of the project in view, from the agents toolbar's Plugins key.
+    pub(super) fn project_plugins(self: &Rc<Self>) {
+        let project = self.project.get();
+        let Some((panel, body)) = self.sheet("Plugins", 440) else {
             return;
         };
         panel.top(640);
         // Filled asynchronously; without a floor the panel keeps its "Loading" height.
         panel.min_height(460);
-        panel.add_css_class("agent-skills-popover");
-        let name = self
-            .projects
-            .borrow()
-            .iter()
-            .find(|p| p["id"].as_i64() == Some(project))
-            .map(|p| text(p, "name").to_owned())
-            .unwrap_or_else(|| "No project".into());
-        body.set_spacing(0);
-        body.append(&label(&name.to_uppercase(), "section-label"));
-        let intro = label(
+        let (_, list, feedback) = self.switch_sheet(
+            &panel,
+            &body,
+            project,
             "A plugin that is on gives every agent here its skills, standing rules and MCP tools. Skills reach running agents now; rules and tools apply when an agent starts or resumes.",
-            "agent-skills-intro",
+            "Loading plugins…",
+            ("THIS PROJECT", "All plugins", "plugins"),
         );
-        intro.set_wrap(true);
-        body.append(&intro);
-        let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        list.append(&label("Loading plugins…", "dim"));
-        body.append(&list);
-        let feedback = label("", "dim");
-        feedback.set_wrap(true);
-        feedback.set_visible(false);
-        body.append(&feedback);
-        let footer = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        footer.add_css_class("agent-skills-footer");
-        let scope = label("THIS PROJECT", "section-label");
-        scope.set_hexpand(true);
-        footer.append(&scope);
-        let manage = button("All plugins", "quiet");
-        footer.append(&manage);
-        body.append(&footer);
-        let weak = Rc::downgrade(self);
-        let panel_weak = Rc::downgrade(&panel);
-        manage.connect_clicked(move |_| {
-            if let Some(panel) = panel_weak.upgrade() {
-                panel.close();
-            }
-            if let Some(ui) = weak.upgrade() {
-                ui.navigate("plugins");
-            }
-        });
-        panel.present();
         let ui = self.clone();
         glib::spawn_future_local(async move {
             match ui.call("plugin.list", json!({"project_id":project})).await {
@@ -1015,14 +1056,14 @@ impl Ui {
                 }
                 Err(error) => {
                     clear(&list);
-                    feedback.set_text(&crate::tools::plugins::explain(&error.to_string()));
+                    feedback.set_text(&crate::tools::plugins::explain_error("plugin.list", &error));
                     feedback.set_visible(true);
                 }
             }
         });
     }
     pub(super) fn command_palette(self: &Rc<Self>) {
-        let Some((window, body)) = self.sheet("Command palette", 560, 480) else {
+        let Some((window, body)) = self.sheet("Command palette", 560) else {
             return;
         };
         window.compact(true, 400);
@@ -1087,7 +1128,7 @@ impl Ui {
         let keys = gtk::EventControllerKey::new();
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         let weak = Rc::downgrade(self);
-        keys.connect_key_pressed(move |_, key, _, mods| {
+        keys.connect_key_pressed(move |_, key, keycode, mods| {
             let Some(ui) = weak.upgrade() else {
                 return glib::Propagation::Proceed;
             };
@@ -1098,6 +1139,7 @@ impl Ui {
             let in_terminal = GtkWindowExt::focus(&ui.window).is_some_and(|w| {
                 w.is::<vte4::Terminal>() || w.ancestor(vte4::Terminal::static_type()).is_some()
             });
+            let key = crate::shortcuts::latin(key, keycode);
             for (action, _, fallback) in crate::shortcuts::DEFAULTS {
                 let bindings = ui.keybindings.borrow();
                 let chord = bindings[action].as_str().unwrap_or(fallback);
@@ -1143,7 +1185,6 @@ impl Ui {
         });
     }
     pub(crate) fn load_appearance(self: &Rc<Self>) {
-        crate::wallpaper_rotation::refresh(self);
         let ui = self.clone();
         glib::spawn_future_local(async move {
             let generation = ui.generation.get();
@@ -1168,37 +1209,9 @@ impl Ui {
                 ui.font_size
                     .set(value["value"].as_f64().unwrap_or(9.75).clamp(8.0, 24.0));
             }
-            let colors = match ui.palette.borrow().as_str() {
-                "dark" => [
-                    "#0a0b0d", "#101114", "#16171b", "#1e1f24", "#08090a", "#eef0f2", "#a3a7ad",
-                    "#202228", "#70747b", "#33363d",
-                ],
-                "oled" => [
-                    "#000000", "#000000", "#0d0d0e", "#161618", "#000000", "#ececea", "#a5a5a3",
-                    "#1f1f22", "#77777a", "#333336",
-                ],
-                _ => [
-                    "#0e0e10", "#141416", "#1b1b1e", "#232327", "#0a0a0b", "#ececea", "#a5a5a3",
-                    "#252529", "#77777a", "#37373c",
-                ],
-            };
+            let colors = crate::fonts::palette(&ui.palette.borrow());
             let css: [String; 10] = std::array::from_fn(|i| {
-                format!(
-                    "@define-color {} {};",
-                    [
-                        "wall",
-                        "console",
-                        "slab",
-                        "wash",
-                        "screen",
-                        "ink",
-                        "secondary",
-                        "edge",
-                        "faint",
-                        "strong"
-                    ][i],
-                    colors[i]
-                )
+                format!("@define-color {} {};", crate::fonts::TOKENS[i], colors[i])
             });
             let mut css = css.join("\n");
             let alpha = alpha
@@ -1230,14 +1243,8 @@ impl Ui {
             } else {
                 (((alpha + 0.05).min(1.) - wall) / (1. - wall)).clamp(0., 1.)
             };
-            css += &format!("\n@define-color plate alpha({},{plate:.3});", colors[4]);
-            css += &format!(
-                "\n@define-color backbox alpha({},{});\n@define-color backbox_chrome alpha({},{});",
-                colors[0],
-                alpha.max(0.84),
-                colors[1],
-                alpha.max(0.84)
-            );
+            css += &format!("\n@define-color plate alpha({},{plate:.3});", colors[crate::fonts::SCREEN]);
+            css += &format!("\n@define-color backbox_chrome alpha({},{});", colors[1], alpha.max(0.84));
             ui.appearance.load_from_string(&css);
             ui.wallpaper_dim.set_opacity(
                 dim.ok()
@@ -1274,5 +1281,18 @@ impl Ui {
                 p.schedule_resize();
             }
         });
+    }
+}
+
+/// A focus tab's lamp shows its session's state.
+fn tab_lamp(lamp: &impl IsA<gtk::Widget>, state: &str) {
+    for class in ["live", "held", "waiting"] {
+        lamp.remove_css_class(class);
+    }
+    match state {
+        "running" | "spawning" => lamp.add_css_class("live"),
+        "blocked" => lamp.add_css_class("held"),
+        "restorable" => lamp.add_css_class("waiting"),
+        _ => (),
     }
 }

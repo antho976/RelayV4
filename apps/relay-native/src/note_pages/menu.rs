@@ -271,7 +271,7 @@ pub fn install(ui: &Rc<Ui>, window: &gtk::Window) -> gtk::PopoverMenuBar {
         })
     });
     add("pin", |ui| with_doc(ui, |_, d| super::toggle_pin(d)));
-    add("duplicate", |ui| with_doc(ui, |ui, d| super::new_note(ui, Some(format!("{} copy", d.name())), d.body())));
+    add("duplicate", |ui| with_doc(ui, |ui, d| super::new_note(ui, super::text::copy_title(&d.title.text()), d.body())));
     add("delete", |ui| with_doc(ui, |ui, d| super::confirm_delete(ui, d.id, d.name())));
     add("close-tab", |ui| with_doc(ui, doc::request_close));
     add("close-window", |ui| {
@@ -379,8 +379,8 @@ pub fn install(ui: &Rc<Ui>, window: &gtk::Window) -> gtk::PopoverMenuBar {
     let keys = gtk::EventControllerKey::new();
     keys.set_propagation_phase(gtk::PropagationPhase::Capture);
     let target = weak.clone();
-    keys.connect_key_pressed(move |_, key, _, mods| match target.upgrade() {
-        Some(ui) => shortcut(&ui, key, mods),
+    keys.connect_key_pressed(move |_, key, keycode, mods| match target.upgrade() {
+        Some(ui) => shortcut(&ui, crate::shortcuts::latin(key, keycode), mods),
         None => glib::Propagation::Proceed,
     });
     window.add_controller(keys);

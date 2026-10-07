@@ -6,9 +6,15 @@ from pathlib import Path
 import socket
 import subprocess
 import struct
+import sys
 import tempfile
 import time
 import uuid
+
+# Every check here is an assert statement, and some perform the action they check;
+# under -O they would vanish and the run would report success without doing anything.
+if sys.flags.optimize:
+    raise SystemExit("Run without python -O or PYTHONOPTIMIZE: this script checks with assert.")
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / ".impeccable/review"
@@ -181,6 +187,11 @@ for line in sys.stdin:
             contents = (OUT / f"{viewport}.log").read_text()
             check_gtk_log(contents)
             assert "Shell layouts verified" in contents, contents
+            # smoke.rs holds the capture for these checks; their own lines prove they ran on this page.
+            if page == "agents":
+                assert "In-app confirmation accept and cancel verified" in contents, contents
+            if page == "settings":
+                assert "Settings save verified across categories" in contents, contents
             saved_layout = call("settings.get", {"path": f"native.layout.current.{project['id']}"})["value"]
             assert saved_layout["agent_layout"] == "grid", saved_layout
             assert "stylesheet:" not in contents and "gtk_widget_add_css_class:" not in contents, contents

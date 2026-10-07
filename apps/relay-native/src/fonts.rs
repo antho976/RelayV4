@@ -1,6 +1,24 @@
 //! The same font files as Relay-2, registered only with this application's map.
 use gtk4::prelude::*;
 
+/// The colour tokens every appearance mode defines, in the order of `PALETTES`' columns.
+pub const TOKENS: [&str; 10] =
+    ["wall", "console", "slab", "wash", "screen", "ink", "secondary", "edge", "faint", "strong"];
+/// `@screen`'s column: the terminal and editor background.
+pub const SCREEN: usize = 4;
+/// Each appearance mode's tokens. The window's CSS (`load_appearance`) and the editor
+/// schemes written below both come from this one table.
+const PALETTES: [(&str, [&str; 10]); 3] = [
+    ("matte", ["#0e0e10", "#141416", "#1b1b1e", "#232327", "#0a0a0b", "#ececea", "#a5a5a3", "#252529", "#77777a", "#37373c"]),
+    ("dark", ["#0a0b0d", "#101114", "#16171b", "#1e1f24", "#08090a", "#eef0f2", "#a3a7ad", "#202228", "#70747b", "#33363d"]),
+    ("oled", ["#000000", "#000000", "#0d0d0e", "#161618", "#000000", "#ececea", "#a5a5a3", "#1f1f22", "#77777a", "#333336"]),
+];
+
+/// The tokens of `mode`; an unknown mode is matte.
+pub fn palette(mode: &str) -> [&'static str; 10] {
+    PALETTES.iter().find(|(name, _)| *name == mode).unwrap_or(&PALETTES[0]).1
+}
+
 pub fn install(window: &gtk4::ApplicationWindow) {
     let Some(map) = window.pango_context().font_map() else {
         return;
@@ -33,14 +51,10 @@ pub fn install(window: &gtk4::ApplicationWindow) {
         window.set_font_map(Some(&map));
         let styles = directory.join("styles");
         std::fs::create_dir_all(&styles)?;
-        for (mode, background) in [
-            ("matte", "#0a0a0b"),
-            ("dark", "#08090a"),
-            ("oled", "#000000"),
-        ] {
+        for (mode, colors) in PALETTES {
             let scheme = include_str!("../resources/relay-editor.xml")
                 .replace("RELAY_MODE", mode)
-                .replace("RELAY_BACKGROUND", background);
+                .replace("RELAY_BACKGROUND", colors[SCREEN]);
             let path = styles.join(format!("relay-{mode}.xml"));
             if std::fs::read_to_string(&path).ok().as_deref() != Some(&scheme) {
                 std::fs::write(path, scheme)?;

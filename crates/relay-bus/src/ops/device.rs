@@ -1,4 +1,5 @@
-//! `device.*` — BUS.md §10.14. `avd.*` is reserved for post-4.0.
+//! `device.*` and `avd.*` — BUS.md §10.14. Every mutation is user-only except `device.claim` and
+//! `device.release`, which every role may call to hold a device across steps (§9.1).
 use crate::registry::{Actors, Audit, OpMeta, Scope};
 use crate::types::{Avd, Device, DeviceLease, Id, Run};
 use crate::{op, Empty};

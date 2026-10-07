@@ -107,13 +107,9 @@ fn parse_time(value: &str) -> Option<u64> {
     glib::DateTime::from_iso8601(value, None).ok().map(|at| at.to_unix().max(0) as u64)
 }
 
-fn ago(seconds: u64) -> String {
-    match seconds {
-        0..60 => "just now".into(),
-        60..3600 => format!("{}m ago", seconds / 60),
-        3600..172_800 => format!("{}h ago", seconds / 3600),
-        _ => format!("{}d ago", seconds / 86_400),
-    }
+/// "3m ago" for a Unix time.
+fn ago(at: u64) -> String {
+    crate::relative::ago_unix(at, crate::relative::Form::CompactAgo)
 }
 
 fn span(seconds: u64) -> String {
@@ -177,6 +173,15 @@ fn interval_text(minutes: u64) -> String {
     }
 }
 
+/// Whether `prefs` already holds `value` at `path`, defaults applied. The options panel is
+/// set from the preferences, and setting a control must not write the same value back.
+fn pref_matches(prefs: &Value, path: &str, value: &Value) -> bool {
+    match path.split_once('.') {
+        Some((provider, key)) => value.as_bool() == Some(enabled(prefs, provider, key)),
+        None => path == "refresh_minutes" && value.as_u64() == Some(interval(prefs)),
+    }
+}
+
 /// Writes one dotted leaf into the local copy, creating objects along the way.
 fn put(prefs: &mut Value, path: &str, value: Value) {
     let mut cursor = prefs;
@@ -211,6 +216,17 @@ struct Popup {
     checked: glib::WeakRef<gtk::Label>,
     providers: glib::WeakRef<gtk::Box>,
     refresh: glib::WeakRef<gtk::Button>,
+    options: Options,
+}
+
+/// The display-option controls, kept so a preference read or a refused write shows in them.
+#[derive(Default)]
+struct Options {
+    /// Provider switches, by provider.
+    switches: Vec<(glib::WeakRef<gtk::Switch>, &'static str)>,
+    /// Meter chips, by provider and meter key.
+    chips: Vec<(glib::WeakRef<gtk::ToggleButton>, &'static str, &'static str)>,
+    intervals: Vec<(glib::WeakRef<gtk::ToggleButton>, u64)>,
 }
 
 pub(crate) struct UsageState {
@@ -221,6 +237,8 @@ pub(crate) struct UsageState {
     checked: Cell<Option<u64>>,
     failed: RefCell<Option<String>>,
     prefs: RefCell<Value>,
+    /// `prefs` has been read once; until then it is Null and every default shows.
+    prefs_loaded: Cell<bool>,
     rows: RefCell<Vec<Value>>,
     /// Installed providers, and the connection generation that discovered them.
     installed: RefCell<Option<(u64, Vec<String>)>>,
@@ -253,6 +271,7 @@ impl UsageState {
             checked: Cell::new(None),
             failed: RefCell::default(),
             prefs: RefCell::new(Value::Null),
+            prefs_loaded: Cell::new(false),
             rows: RefCell::default(),
             installed: RefCell::default(),
             busy: Cell::new(false),
@@ -326,6 +345,7 @@ impl Ui {
         let state = &self.usage;
         let generation = self.generation.get();
         let discover = discover
+            || !state.prefs_loaded.get()
             || state.installed.borrow().as_ref().is_none_or(|(seen, _)| *seen != generation);
         if state.busy.get() {
             state.queued.set(Some(state.queued.get().unwrap_or(false) || discover));
@@ -363,6 +383,7 @@ impl Ui {
                 }
                 if let Some(Ok(v)) = prefs {
                     *state.prefs.borrow_mut() = v["value"].clone();
+                    state.prefs_loaded.set(true);
                 }
                 match usage {
                     Ok(v) => {
@@ -388,6 +409,7 @@ impl Ui {
             let generation = ui.generation.get();
             if let Ok(v) = ui.call("settings.get", json!({"path":"usage"})).await {
                 if generation == ui.generation.get() && *ui.usage.prefs.borrow() != v["value"] {
+                    ui.usage.prefs_loaded.set(true);
                     *ui.usage.prefs.borrow_mut() = v["value"].clone();
                     ui.render_usage();
                     ui.schedule_usage();
@@ -417,15 +439,18 @@ impl Ui {
         *self.usage.timer.borrow_mut() = Some(source);
     }
 
-    fn set_usage_pref(self: &Rc<Self>, path: &'static str, value: Value) {
+    fn set_usage_pref(self: &Rc<Self>, path: &str, value: Value) {
+        if pref_matches(&self.usage.prefs.borrow(), path, &value) {
+            return;
+        }
         put(&mut self.usage.prefs.borrow_mut(), path, value.clone());
         self.render_usage();
         if path == "refresh_minutes" {
             self.schedule_usage();
         }
         let ui = self.clone();
+        let payload = json!({"path": format!("usage.{path}"), "value": value});
         glib::spawn_future_local(async move {
-            let payload = json!({"path": format!("usage.{path}"), "value": value});
             if let Err(e) = ui.call("settings.set", payload).await {
                 ui.show_error(&e.to_string());
                 ui.reload_usage_prefs();
@@ -527,7 +552,7 @@ impl Ui {
         let (text, tip) = match (state.checked.get(), state.failed.borrow().as_ref()) {
             (_, Some(error)) => ("update failed".to_string(), format!("The last refresh failed: {error}")),
             (Some(at), None) => (
-                format!("updated {}", ago(now().saturating_sub(at))),
+                format!("updated {}", ago(at)),
                 format!(
                     "Limits checked at {} · {}",
                     glib::DateTime::from_unix_local(at as i64)
@@ -563,9 +588,10 @@ impl Ui {
         let now = now();
         let state = &self.usage;
         let prefs = state.prefs.borrow().clone();
+        self.sync_usage_options(&prefs);
         checked.set_text(&match (state.checked.get(), state.failed.borrow().as_ref()) {
             (_, Some(error)) => format!("The last refresh failed: {error}"),
-            (Some(at), None) => format!("Checked {} · {}", ago(now.saturating_sub(at)), interval_text(interval(&prefs))),
+            (Some(at), None) => format!("Checked {} · {}", ago(at), interval_text(interval(&prefs))),
             (None, None) => "Checking…".into(),
         });
         clear(&list);
@@ -595,7 +621,7 @@ impl Ui {
             let reported = label(
                 &match (&item, reported) {
                     (None, _) => "nothing reported".into(),
-                    (Some(_), Some(at)) => format!("reported {}", ago(now.saturating_sub(at))),
+                    (Some(_), Some(at)) => format!("reported {}", ago(at)),
                     (Some(_), None) => String::new(),
                 },
                 "usage-reported",
@@ -669,7 +695,8 @@ impl Ui {
         let providers = gtk::Box::new(gtk::Orientation::Vertical, 0);
         providers.add_css_class("usage-providers");
         body.append(&providers);
-        body.append(&self.usage_options());
+        let (options, controls) = self.usage_options();
+        body.append(&options);
         let footer = label(
             "Refreshing re-reads what each CLI last saved on this machine. It never contacts a provider or spends tokens.",
             "usage-footnote",
@@ -680,6 +707,7 @@ impl Ui {
             checked: checked.downgrade(),
             providers: providers.downgrade(),
             refresh: refresh.downgrade(),
+            options: controls,
         });
         let weak = Rc::downgrade(self);
         panel.on_closed(move || {
@@ -692,9 +720,40 @@ impl Ui {
         self.refresh_usage(false);
     }
 
+    /// Shows `prefs` in the option controls. Setting one runs its handler, which finds the
+    /// value already held and writes nothing. An interval is only ever switched on; its group
+    /// switches the others off.
+    fn sync_usage_options(&self, prefs: &Value) {
+        let (switches, chips, intervals) = {
+            let popup = self.usage.popup.borrow();
+            let Some(options) = popup.as_ref().map(|p| &p.options) else {
+                return;
+            };
+            (
+                options.switches.iter().filter_map(|(w, p)| Some((w.upgrade()?, *p))).collect::<Vec<_>>(),
+                options.chips.iter().filter_map(|(w, p, k)| Some((w.upgrade()?, *p, *k))).collect::<Vec<_>>(),
+                options.intervals.iter().filter_map(|(w, m)| Some((w.upgrade()?, *m))).collect::<Vec<_>>(),
+            )
+        };
+        for (switch, provider) in switches {
+            switch.set_active(enabled(prefs, provider, "enabled"));
+        }
+        for (chip, provider, key) in chips {
+            chip.set_active(enabled(prefs, provider, key));
+        }
+        let current = interval(prefs);
+        for (choice, minutes) in intervals {
+            if minutes == current && !choice.is_active() {
+                choice.set_active(true);
+            }
+        }
+    }
+
     /// Built once per open: rebuilding would steal focus from the control being used.
-    fn usage_options(self: &Rc<Self>) -> gtk::Box {
+    /// render_usage_popup sets them from the preferences in place.
+    fn usage_options(self: &Rc<Self>) -> (gtk::Box, Options) {
         let prefs = self.usage.prefs.borrow().clone();
+        let mut controls = Options::default();
         let options = gtk::Box::new(gtk::Orientation::Vertical, 8);
         options.add_css_class("usage-options");
         options.append(&label("Show in the status bar", "usage-options-title"));
@@ -705,6 +764,7 @@ impl Ui {
             switch.set_valign(gtk::Align::Center);
             switch.set_active(enabled(&prefs, provider, "enabled"));
             switch.update_property(&[gtk::accessible::Property::Label(&format!("Show {name}"))]);
+            controls.switches.push((switch.downgrade(), provider));
             row.append(&switch);
             let title = label(name, "usage-option-name");
             title.set_hexpand(true);
@@ -718,28 +778,24 @@ impl Ui {
                 chip.add_css_class("usage-chip");
                 chip.set_active(enabled(&prefs, provider, meter.key()));
                 chip.set_tooltip_text(Some(&format!("Show {name}'s {} limit", meter.title().to_lowercase())));
+                controls.chips.push((chip.downgrade(), provider, meter.key()));
                 let weak = Rc::downgrade(self);
-                let path: &'static str = match (provider, meter) {
-                    ("claude", Meter::FiveHour) => "claude.five_hour",
-                    ("claude", Meter::Weekly) => "claude.weekly",
-                    ("claude", Meter::Fable) => "claude.fable",
-                    (_, Meter::FiveHour) => "codex.five_hour",
-                    _ => "codex.weekly",
-                };
+                // The strip reads `prefs[provider][meter.key()]`; the path is built from the same.
+                let path = format!("{provider}.{}", meter.key());
                 chip.connect_toggled(move |chip| {
                     if let Some(ui) = weak.upgrade() {
-                        ui.set_usage_pref(path, json!(chip.is_active()));
+                        ui.set_usage_pref(&path, json!(chip.is_active()));
                     }
                 });
                 chips.append(&chip);
             }
             let weak = Rc::downgrade(self);
             let toggled = chips.clone();
-            let path = if provider == "claude" { "claude.enabled" } else { "codex.enabled" };
+            let path = format!("{provider}.enabled");
             switch.connect_active_notify(move |switch| {
                 toggled.set_sensitive(switch.is_active());
                 if let Some(ui) = weak.upgrade() {
-                    ui.set_usage_pref(path, json!(switch.is_active()));
+                    ui.set_usage_pref(&path, json!(switch.is_active()));
                 }
             });
             row.append(&chips);
@@ -764,6 +820,7 @@ impl Ui {
                 choice.set_group(Some(first));
             }
             choice.set_active(minutes == current);
+            controls.intervals.push((choice.downgrade(), minutes));
             let weak = Rc::downgrade(self);
             choice.connect_toggled(move |choice| {
                 if choice.is_active() {
@@ -777,7 +834,7 @@ impl Ui {
         }
         row.append(&choices);
         options.append(&row);
-        options
+        (options, controls)
     }
 }
 
@@ -867,9 +924,22 @@ mod tests {
         assert!(!enabled(&prefs, "codex", "enabled"));
         assert!(enabled(&prefs, "codex", "weekly"));
         assert_eq!(interval(&prefs), 15);
-        assert_eq!(ago(30), "just now");
-        assert_eq!(ago(3 * 60 + 5), "3m ago");
+        assert_eq!(ago(now() - 30), "just now");
+        assert_eq!(ago(now() - 3 * 60 - 5), "3m ago");
         assert_eq!(span(2 * 86_400 + 5 * 3600), "2d 5h");
         assert_eq!(humanize("seven_day_opus"), "Seven day opus");
+    }
+
+    #[test]
+    fn a_control_set_to_the_held_preference_writes_nothing() {
+        let mut prefs = Value::Null;
+        assert!(pref_matches(&prefs, "claude.fable", &json!(true)), "unset reads as the default");
+        assert!(!pref_matches(&prefs, "claude.fable", &json!(false)));
+        assert!(pref_matches(&prefs, "refresh_minutes", &json!(0)));
+        put(&mut prefs, "codex.enabled", json!(false));
+        put(&mut prefs, "refresh_minutes", json!(15));
+        assert!(pref_matches(&prefs, "codex.enabled", &json!(false)));
+        assert!(!pref_matches(&prefs, "refresh_minutes", &json!(5)));
+        assert!(pref_matches(&prefs, "refresh_minutes", &json!(15)));
     }
 }

@@ -48,9 +48,11 @@ than producing a lumpy blob.
    `"OBJECT"` separates parts, `"MATERIAL"` shows slots, `"TEXTURE"` shows image textures.
    `eevee`/`cycles` for lookdev (cycles is CPU without denoiser: keep size small). `frames` and
    `action` pose a rig. `isolate` (default true) hides other meshes. The file is not changed.
-4. **Checks**: `blender_rig_check` for any rig or skinned mesh (problems must be fixed,
-   warnings judged); `blender_anim_inspect` for any action (sides, grips, clearance, contacts,
-   feet). Re-run after each fix.
+4. **Checks**: `blender_mesh_check` for any mesh, measured with modifiers applied as the
+   export writes it (zero-area faces, zero-length edges, inside-out normals; loose verts,
+   n-gons, missing UVs as warnings); `blender_rig_check` for any rig or skinned mesh (it needs
+   an armature); `blender_anim_inspect` for any action (sides, grips, clearance, contacts,
+   feet). Problems must be fixed, warnings judged. Re-run after each fix.
 5. **Export**: `blender_export` (FBX with Unreal's conventions) or `blender_to_unreal` (export,
    import into the running editor, measure). See `blender-to-unreal`.
 
@@ -120,8 +122,8 @@ the relevant checks. State what you looked at and what the checks returned.
 5. **Some operators fail silently.** `transform_apply` with nothing selected raises nothing and
    does nothing. Print the state after every operator call.
 6. **Check an operator before calling it**: `bpy.ops.object.transform_apply.get_rna_type().properties.keys()`
-   lists its arguments; `hasattr(bpy.ops.object, "shade_auto_smooth")` tells you whether this
-   Blender has it; `help(bpy.types.Mesh.transform)`, `dir(obj)` for the data API. Never invent an
+   lists its arguments; `"shade_auto_smooth" in dir(bpy.ops.object)` tells you whether this
+   Blender has it (not `hasattr`, which is True for any name); `help(bpy.types.Mesh.transform)`, `dir(obj)` for the data API. Never invent an
    API name; check `bpy.app.version` when behaviour differs by version.
 7. **Refresh after changing transforms**: `bpy.context.view_layer.update()` before reading
    `matrix_world`, `dimensions` or `is_negative`; `scene.frame_set(f)` before reading a pose.
@@ -241,8 +243,9 @@ the relevant checks. State what you looked at and what the checks returned.
 - 4.2 LTS: EEVEE Next - the engine id is `BLENDER_EEVEE_NEXT` from 4.2 to 4.5 (it was
   `BLENDER_EEVEE`, and is again from 5.0). `enum_items` does not list the real ids; branch on
   `bpy.app.version`, or assign and read them from the `TypeError`.
-  Many bundled add-ons (Rigify among them) moved to the online extensions platform, so
-  `addons: ["rigify"]` can fail there; check with `addon_utils.modules()`. FBX stays built in.
+  Many bundled add-ons moved to the online extensions platform, so `addons: [...]` can fail
+  for those; check with `addon_utils.modules()`. Rigify and FBX stayed in the core add-ons, so
+  `addons: ["rigify"]` works.
 
 ## Verify your work
 
@@ -251,6 +254,7 @@ the relevant checks. State what you looked at and what the checks returned.
 - [ ] Transforms applied where needed (`blender_info` shows no unapplied rotation/scale).
 - [ ] Sizes in cm are plausible for the object.
 - [ ] Looked at `blender_render` images (front and a three_quarter at least) after the change.
-- [ ] Ran `blender_rig_check` / `blender_anim_inspect` for rigs and actions; fixed problems.
+- [ ] Ran `blender_mesh_check` for meshes, `blender_rig_check` / `blender_anim_inspect` for rigs
+      and actions; fixed problems.
 - [ ] Saved with `save_as` to a new file, or said plainly that the source was overwritten.
 - [ ] Back in object mode; unassigned actions and materials have fake users.

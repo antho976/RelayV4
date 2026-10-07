@@ -2,9 +2,9 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "relay://bus/v1",
   "title": "RELAY v4 command bus",
-  "description": "Generated from crates/relay-bus by `relay schema`. Do not edit; see docs/BUS.md.",
+  "description": "Generated from crates/relay-bus by `relay schema`. Do not edit; see docs/engine/BUS.md.",
   "version": 1,
-  "op_count": 224,
+  "op_count": 228,
   "envelope": {
     "request": {
       "$ref": "#/$defs/Request"
@@ -267,7 +267,7 @@
       }
     },
     "app.log.tail": {
-      "summary": "Reserved: emits app.log.attached and sends no log frames yet; the engine logs to relay serve's output (RELAY_LOG filters it)",
+      "summary": "Not built: answers bus.not_implemented and attaches no stream; the engine logs to relay serve's output (RELAY_LOG filters it)",
       "kind": "query",
       "audit": "never",
       "undo": "none",
@@ -668,6 +668,83 @@
       },
       "result": {
         "$ref": "#/$defs/ProjectStatsOut"
+      }
+    },
+    "project.relink": {
+      "summary": "Point a project at its repository's new location; conflict while it has open sessions",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "inverse",
+      "scope": "project",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "project.changed"
+      ],
+      "since": "1.0",
+      "phase": 1,
+      "payload": {
+        "$ref": "#/$defs/ProjectRelinkIn"
+      },
+      "result": {
+        "$ref": "#/$defs/Project"
+      }
+    },
+    "project.remove.preview": {
+      "summary": "What removing a project (or a workspace's projects) would delete: task, note and module counts",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 1,
+      "payload": {
+        "$ref": "#/$defs/ProjectRemovePreviewIn"
+      },
+      "result": {
+        "$ref": "#/$defs/ProjectRemovePreviewOut"
+      }
+    },
+    "project.removed.list": {
+      "summary": "Removed projects that a removal backup can still restore",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 1,
+      "payload": {
+        "$ref": "#/$defs/Empty"
+      },
+      "result": {
+        "$ref": "#/$defs/ProjectRemovedListOut"
+      }
+    },
+    "project.restore": {
+      "summary": "Bring a removed project's board, notes and modules back from its removal backup",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "project.changed",
+        "workspace.changed"
+      ],
+      "since": "1.0",
+      "phase": 1,
+      "payload": {
+        "$ref": "#/$defs/ProjectRestoreIn"
+      },
+      "result": {
+        "$ref": "#/$defs/ProjectRestoreOut"
       }
     },
     "task.create": {
@@ -2120,7 +2197,9 @@
         "guardrail.refused",
         "guardrail.grant_used",
         "guardrail.resolved",
-        "notify.new"
+        "notify.new",
+        "device.lease.acquired",
+        "device.lease.released"
       ],
       "since": "1.0",
       "phase": 4,
@@ -3049,7 +3128,7 @@
         "$ref": "#/$defs/FileRestoreIn"
       },
       "result": {
-        "$ref": "#/$defs/Entry"
+        "$ref": "#/$defs/FileRestoreOut"
       }
     },
     "file.trash.list": {
@@ -4059,7 +4138,9 @@
       "scope": "global",
       "actors": "all",
       "doors": "all",
-      "emits": [],
+      "emits": [
+        "ui.changed"
+      ],
       "since": "1.0",
       "phase": 9,
       "payload": {
@@ -4077,7 +4158,9 @@
       "scope": "global",
       "actors": "all",
       "doors": "all",
-      "emits": [],
+      "emits": [
+        "ui.changed"
+      ],
       "since": "1.0",
       "phase": 9,
       "payload": {
@@ -4095,7 +4178,9 @@
       "scope": "global",
       "actors": "all",
       "doors": "all",
-      "emits": [],
+      "emits": [
+        "ui.changed"
+      ],
       "since": "1.0",
       "phase": 9,
       "payload": {
@@ -4113,7 +4198,9 @@
       "scope": "global",
       "actors": "all",
       "doors": "all",
-      "emits": [],
+      "emits": [
+        "ui.changed"
+      ],
       "since": "1.0",
       "phase": 9,
       "payload": {
@@ -4131,7 +4218,9 @@
       "scope": "global",
       "actors": "all",
       "doors": "all",
-      "emits": [],
+      "emits": [
+        "ui.changed"
+      ],
       "since": "1.0",
       "phase": 9,
       "payload": {
@@ -4227,7 +4316,9 @@
       "scope": "global",
       "actors": "all",
       "doors": "all",
-      "emits": [],
+      "emits": [
+        "ui.changed"
+      ],
       "since": "1.0",
       "phase": 9,
       "payload": {
@@ -4245,7 +4336,9 @@
       "scope": "global",
       "actors": "all",
       "doors": "all",
-      "emits": [],
+      "emits": [
+        "ui.changed"
+      ],
       "since": "1.0",
       "phase": 9,
       "payload": {
@@ -4281,7 +4374,9 @@
       "scope": "global",
       "actors": "all",
       "doors": "all",
-      "emits": [],
+      "emits": [
+        "ui.toast"
+      ],
       "since": "1.0",
       "phase": 9,
       "payload": {
@@ -4342,7 +4437,7 @@
         "id": {
           "type": "string",
           "format": "uuid",
-          "description": "UUID v4 minted by the caller; idempotency key for 24h."
+          "description": "UUID v4 minted by the caller; the idempotency key. An audited request's id stays\ndeduplicated for as long as its audit row is kept (`audit.retention_days`, BUS.md §5.3)."
         },
         "actor": {
           "$ref": "#/$defs/Actor"
@@ -4373,12 +4468,11 @@
     },
     "Actor": {
       "type": "string",
-      "description": "\"user\" | \"agent:<session-name>\" | \"test\" (\"system\" is internal and rejected at every door)",
-      "pattern": "^(user|test|agent:[A-Za-z0-9_-]{1,64})$"
+      "description": "\"user\" | \"agent:<session-name>\" | \"test\" | \"system\". \"system\" is the engine itself: it appears on events, audit rows and holds, and every door rejects a request that claims it",
+      "pattern": "^(user|test|system|agent:[A-Za-z0-9_-]{1,64})$"
     },
     "Response": {
       "type": "object",
-      "additionalProperties": false,
       "properties": {
         "v": {
           "type": "integer",
@@ -4429,11 +4523,11 @@
       "required": [
         "v",
         "ok"
-      ]
+      ],
+      "description": "A response envelope (BUS.md §1.2). Exactly one of `result` / `error` is present."
     },
     "BusError": {
       "type": "object",
-      "additionalProperties": false,
       "properties": {
         "kind": {
           "$ref": "#/$defs/ErrorKind"
@@ -4484,7 +4578,6 @@
     },
     "Confirm": {
       "type": "object",
-      "additionalProperties": false,
       "properties": {
         "op": {
           "type": "string"
@@ -4499,7 +4592,6 @@
     },
     "MailHint": {
       "type": "object",
-      "additionalProperties": false,
       "properties": {
         "priority": {
           "type": "integer",
@@ -4511,11 +4603,10 @@
       "required": [
         "priority"
       ],
-      "description": "A response envelope (BUS.md §1.2). Exactly one of `result` / `error` is present."
+      "description": "The `mail` sideband on a response (BUS.md §1.2)."
     },
     "Event": {
       "type": "object",
-      "additionalProperties": false,
       "properties": {
         "v": {
           "type": "integer",
@@ -4561,7 +4652,6 @@
     },
     "Frame": {
       "type": "object",
-      "additionalProperties": false,
       "properties": {
         "v": {
           "type": "integer",
@@ -4570,7 +4660,7 @@
         },
         "stream": {
           "type": "string",
-          "description": "`pty` | `logcat` | `mirror`, all on the socket door (BUS.md §7). `app.log.tail` declares\na `log` stream but sends no frames yet."
+          "description": "`pty` | `logcat` | `mirror`, all on the socket door (BUS.md §7). `app.log.tail` declares\na `log` stream but is not built: it sends no frames."
         },
         "session": {
           "type": [
@@ -4976,7 +5066,13 @@
           "description": "How long to block before giving up. Default 60s, clamped to an hour."
         },
         "matching": {
-          "description": "Only an event whose payload has every one of these top-level keys equal to the value\ngiven, e.g. `{\"request_id\": 7}`. Omit to take the first event that matches by name."
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true,
+          "description": "Only an event whose payload has every one of these top-level keys equal to the value\ngiven, e.g. `{\"request_id\": 7}`. Omit to take the first event that matches by name.\nAnything but an object is `bus.schema`: read as \"no filter\", it woke on any event.",
+          "default": null
         }
       }
     },
@@ -6320,6 +6416,171 @@
         "sessions_idle",
         "worktrees",
         "disk_mb"
+      ]
+    },
+    "ProjectRelinkIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "project_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "path": {
+          "type": "string",
+          "description": "The repository's new root: absolute, a git repository, no other project's path, and inside\na workspace (the project moves to the innermost one that contains it)."
+        }
+      },
+      "required": [
+        "project_id",
+        "path"
+      ]
+    },
+    "ProjectRemovePreviewIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "project_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "workspace_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        }
+      }
+    },
+    "ProjectRemovePreviewOut": {
+      "type": "object",
+      "properties": {
+        "projects": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "tasks": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "notes": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "modules": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "projects",
+        "tasks",
+        "notes",
+        "modules"
+      ]
+    },
+    "ProjectRemovedListOut": {
+      "type": "object",
+      "properties": {
+        "removed": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RemovedProject"
+          }
+        }
+      },
+      "required": [
+        "removed"
+      ]
+    },
+    "RemovedProject": {
+      "type": "object",
+      "properties": {
+        "backup_path": {
+          "type": "string",
+          "description": "The backup to pass to `project.restore`: the newest one that still holds the project."
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "project_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "workspace_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "name": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "backup_path",
+        "created_at",
+        "reason",
+        "project_id",
+        "workspace_id",
+        "name",
+        "path"
+      ]
+    },
+    "ProjectRestoreIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "backup_path": {
+          "type": "string",
+          "description": "A file in the store's `backups/` directory, as `project.removed.list` or the removal's\n`project.deleted` event names it."
+        },
+        "project_id": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "backup_path",
+        "project_id"
+      ]
+    },
+    "ProjectRestoreOut": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "$ref": "#/$defs/Project"
+        },
+        "tasks": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "notes": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "modules": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "workspace_restored": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "project",
+        "tasks",
+        "notes",
+        "modules",
+        "workspace_restored"
       ]
     },
     "TaskCreateIn": {
@@ -8177,7 +8438,8 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "description": "Only `\"priority\"`, the default; anything else is refused."
         }
       },
       "required": [
@@ -9769,7 +10031,8 @@
       "type": "object",
       "properties": {
         "verdict": {
-          "$ref": "#/$defs/Verdict"
+          "$ref": "#/$defs/Verdict",
+          "description": "Always `allow`. A refusal arrives as a typed `refused` error and a hold as a typed `held`\nerror whose `confirm` names the hold, never as a verdict here (BUS.md §9.3)."
         },
         "error": {
           "anyOf": [
@@ -9779,14 +10042,16 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Never set; a refusal is the response's `error`."
         },
         "hold_id": {
           "type": [
             "integer",
             "null"
           ],
-          "format": "int64"
+          "format": "int64",
+          "description": "Never set; a hold's id is in the `held` error's `confirm.payload`."
         }
       },
       "required": [
@@ -11221,12 +11486,6 @@
           ],
           "format": "uint32",
           "minimum": 0
-        },
-        "graph": {
-          "type": [
-            "boolean",
-            "null"
-          ]
         }
       },
       "required": [
@@ -12431,11 +12690,77 @@
         "trash_id": {
           "type": "integer",
           "format": "int64"
+        },
+        "worktree": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The checkout to put it back into (`@project` or a worktree path). Default: the one it was\ndeleted from, or the project's primary checkout once that one is gone."
         }
       },
       "required": [
         "project_id",
         "trash_id"
+      ]
+    },
+    "FileRestoreOut": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Relative to the worktree root."
+        },
+        "name": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/EntryKind"
+        },
+        "size": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "modified_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "badge": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Git status badge, if any (`M`, `A`, `D`, `?`)."
+        },
+        "children": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/Entry"
+          }
+        },
+        "worktree": {
+          "type": "string",
+          "description": "The checkout it was put back into."
+        },
+        "fallback": {
+          "type": "boolean",
+          "description": "Set when no `worktree` was named and the one it was deleted from is gone, so it went to\nthe project's primary checkout instead."
+        }
+      },
+      "required": [
+        "path",
+        "name",
+        "kind",
+        "worktree",
+        "fallback"
       ]
     },
     "FileTrashListIn": {
@@ -12488,7 +12813,7 @@
         },
         "worktree": {
           "type": "string",
-          "description": "The checkout it was deleted from, and where `file.restore` puts it back."
+          "description": "The checkout it was deleted from, and where `file.restore` puts it back by default."
         },
         "created_at": {
           "type": "string"
@@ -14468,12 +14793,6 @@
             {
               "type": "null"
             }
-          ]
-        },
-        "at": {
-          "type": [
-            "string",
-            "null"
           ]
         }
       },

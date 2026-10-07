@@ -4,7 +4,6 @@ use std::cell::Cell;
 pub struct NotesWindow {
     pub window: gtk::Window,
     pub project: Cell<i64>,
-    pub rendered_project: Cell<i64>,
     pub rail_width: Cell<i32>,
     pub rail_collapsed: Cell<bool>,
     /// The open note's name, centred in the titlebar.
@@ -86,7 +85,6 @@ impl NotesWindow {
         let owned = Rc::new(Self {
             window,
             project: Cell::new(0),
-            rendered_project: Cell::new(0),
             rail_width: Cell::new(270),
             rail_collapsed: Cell::new(false),
             heading,
@@ -177,9 +175,8 @@ pub fn refresh_notes(ui: &Rc<Ui>) {
     if window.project.get() == 0 {
         window.project.set(ui.project.get());
     }
-    if window.project.get() == 0 {
-        return;
-    }
+    // With no project the settings are still read, so preferences persist, and the window
+    // says why it is empty.
     window.pending.set(true);
     if window.loading.replace(true) {
         return;
@@ -244,6 +241,21 @@ pub fn refresh_notes(ui: &Rc<Ui>) {
                 Err(error) => super::note_pages::load_error(&ui, &error.to_string()),
             }
         }
+        if window.project.get() == 0 {
+            no_project(&ui);
+        }
         window.loading.set(false);
     });
+}
+
+/// A fresh install, or the last project was removed: nothing to load notes from. Only the
+/// loading line is replaced; a library already on screen stays.
+fn no_project(ui: &Rc<Ui>) {
+    let waiting = ui.pages["notes"]
+        .first_child()
+        .and_downcast::<gtk::Label>()
+        .filter(|label| label.has_css_class("notes-window-loading"));
+    if let Some(waiting) = waiting {
+        waiting.set_text("No project yet. Add one from the main window to keep notes in it.");
+    }
 }

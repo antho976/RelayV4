@@ -90,7 +90,9 @@ def measure(path):
         except Exception:
             pass
         entry["materials"] = mats
-        entry["transient_materials"] = [m for m in mats if m and ("/Transient" in m or not m.startswith(("/Game", "/Engine")))]
+        # Plugin and Game Feature content mounts its own root (/MyFeature/...): only the
+        # transient package is not a saved asset.
+        entry["transient_materials"] = [m for m in mats if m and "/Transient" in m]
     if isinstance(a, unreal.SkeletalMesh):
         skel = Skeleton(a)
         root = skel.names[0]
@@ -104,21 +106,28 @@ def measure(path):
         lefts = [n for n in skel.names if "hand" in n.lower() and twin(n) in skel.index]
         hands = [lefts[0], twin(lefts[0])] if lefts else []
         entry["hand_sides"] = dict((n, side(f, pose[n][0])) for n in hands)
+        entry["hand_sides_note"] = "from the bone names, so always left and right: a mirrored rig shows in forward_axis_in_mesh_space, not here"
     if isinstance(a, unreal.AnimSequence):
         entry["length_s"] = anim_length(a)
     return entry
 
 
 def remove(paths):
+    """Delete by object first: after a failed import EditorAssetLibrary's path functions were seen
+    failing for every asset (see asset_exists). `deleted` is what the registry says afterwards,
+    not what a delete call returned."""
     removed = []
     for p in paths:
         package = p.split(".")[0]
-        ok = False
-        try:
-            ok = unreal.EditorAssetLibrary.delete_asset(package)
-        except Exception:
-            pass
-        removed.append({"path": package, "deleted": bool(ok)})
+        for delete in (lambda: unreal.EditorAssetLibrary.delete_loaded_asset(unreal.load_asset(p)),
+                       lambda: unreal.EditorAssetLibrary.delete_asset(package)):
+            try:
+                delete()
+            except Exception:
+                pass
+            if not asset_exists(package):
+                break
+        removed.append({"path": package, "deleted": not asset_exists(package)})
     return removed
 
 
@@ -157,8 +166,8 @@ def fix_sockets(paths):
                 r = socket.get_editor_property("relative_rotation")
                 fixed.append({"mesh": path, "socket": name, "left_as_imported": [round(r.pitch, 2), round(r.yaw, 2), round(r.roll, 2)],
                               "blender_rotation_deg": spec.get("rotation_deg"), "note": "rotated in Blender; check it with ue_screenshot"})
-        if changed:
-            save_asset(mesh)
+        if changed and not save_asset(mesh):
+            fixed.append({"mesh": path, "saved": False, "note": "the socket fixes are in the open editor but the mesh did not save; save it there"})
     return fixed
 
 

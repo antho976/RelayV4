@@ -31,7 +31,11 @@ fn marker(line: &str) -> Option<Marker<'_>> {
     let (indent, rest) = line.split_at(indent_len);
     let bytes = rest.as_bytes();
     if let Some(&first) = bytes.first() {
-        if matches!(first, b'-' | b'*' | b'+') && bytes.get(1) == Some(&b' ') {
+        // `* * *` and `- - -` are thematic breaks, not list items.
+        let rule = first != b'+'
+            && rest.bytes().all(|b| b == first || b == b' ' || b == b'\t')
+            && rest.bytes().filter(|b| *b == first).count() >= 3;
+        if !rule && matches!(first, b'-' | b'*' | b'+') && bytes.get(1) == Some(&b' ') {
             let bullet = first as char;
             if rest.len() >= 6
                 && bytes[2] == b'['
@@ -81,6 +85,12 @@ pub enum Prefix {
 }
 
 fn heading(line: &str) -> Option<(usize, &str)> {
+    // Up to three spaces may indent a heading; four make a code block.
+    let indent = line.bytes().take(4).take_while(|b| *b == b' ').count();
+    if indent > 3 {
+        return None;
+    }
+    let line = &line[indent..];
     let hashes = line.bytes().take_while(|b| *b == b'#').count();
     if (1..=6).contains(&hashes) {
         let rest = &line[hashes..];
@@ -151,6 +161,45 @@ pub fn toggle_lines(lines: &[&str], prefix: Prefix) -> Vec<String> {
         .collect()
 }
 
+/// What an inline format toggle does to a selection.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Inline {
+    /// The markers sit just outside the selection: remove them.
+    Outside,
+    /// The selection starts and ends with the markers: remove them.
+    Inside,
+    /// Add the markers around the selection.
+    Wrap,
+}
+
+/// Toggle `before`/`after` on `selected`, with `ahead` and `behind` the line's text either side.
+/// Markdown's `**` is bold, not `*` twice, so a one-character marker that is both sides' only
+/// marker counts only in an odd run: italic on `**bold**` makes it `***bold***`.
+pub fn inline_toggle(ahead: &str, selected: &str, behind: &str, before: &str, after: &str) -> Inline {
+    let mut chars = before.chars();
+    let single = match (chars.next(), chars.next()) {
+        (Some(c), None) if before == after => Some(c),
+        _ => None,
+    };
+    let lead = |s: &str, c: char| s.chars().take_while(|x| *x == c).count();
+    let tail = |s: &str, c: char| s.chars().rev().take_while(|x| *x == c).count();
+    let odd = |left: usize, right: usize| left.min(right) % 2 == 1;
+    if ahead.ends_with(before)
+        && behind.starts_with(after)
+        && single.is_none_or(|c| odd(tail(ahead, c), lead(behind, c)))
+    {
+        return Inline::Outside;
+    }
+    if selected.chars().count() >= before.chars().count() + after.chars().count()
+        && selected.starts_with(before)
+        && selected.ends_with(after)
+        && single.is_none_or(|c| odd(lead(selected, c), tail(selected, c)))
+    {
+        return Inline::Inside;
+    }
+    Inline::Wrap
+}
+
 /// `12`, `12:5`, `12,5` or `12 5` → line and optional column, both 1-based.
 pub fn parse_goto(value: &str) -> Option<(i32, Option<i32>)> {
     let mut parts = value
@@ -217,6 +266,13 @@ pub fn display_title(title: &str, body: &str) -> String {
         .unwrap_or_else(|| "Untitled".into())
 }
 
+/// The title a copy of a note is stored under. An untitled note's copy stays untitled, so its
+/// name keeps following the body instead of freezing a clipped first line.
+pub fn copy_title(title: &str) -> Option<String> {
+    let title = title.trim();
+    (!title.is_empty()).then(|| format!("{title} (copy)"))
+}
+
 /// A one-line preview of the text that is not already the title.
 pub fn preview(title: &str, body: &str) -> String {
     let name = display_title(title, body);
@@ -248,6 +304,14 @@ pub fn zoom_step(current: u16, direction: i32) -> u16 {
     }
 }
 
+/// Ctrl+scroll travel `acc` plus a scroll of `dy` → zoom steps (positive zooms in, as scrolling
+/// up does) and the travel left over. A notch is one wheel click or 24 touchpad pixels.
+pub fn zoom_notches(acc: f64, dy: f64, pixels: bool) -> (i32, f64) {
+    let travel = acc + dy / if pixels { 24.0 } else { 1.0 };
+    let notches = travel.trunc();
+    (-(notches as i32), travel - notches)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,6 +329,11 @@ mod tests {
         assert_eq!(list_enter("- ", "tail"), Some(Enter::Continue("- ".into())));
         assert_eq!(list_enter("plain text", ""), None);
         assert_eq!(list_enter("---", ""), None);
+        assert_eq!(list_enter("* * *", ""), None);
+        assert_eq!(list_enter("- - -", ""), None);
+        assert_eq!(list_enter("  -  -  - ", ""), None);
+        assert_eq!(list_enter("- - ", ""), Some(Enter::Continue("- ".into())));
+        assert_eq!(list_enter("+ + +", ""), Some(Enter::Continue("+ ".into())));
         assert_eq!(list_enter("**bold**", ""), None);
         assert_eq!(list_enter("2024. was a year", ""), Some(Enter::Continue("2025. ".into())));
     }
@@ -280,10 +349,30 @@ mod tests {
         assert_eq!(toggle_lines(&["Title"], Prefix::Heading(2)), ["## Title"]);
         assert_eq!(toggle_lines(&["# Title"], Prefix::Heading(2)), ["## Title"]);
         assert_eq!(toggle_lines(&["## Title"], Prefix::Heading(2)), ["Title"]);
+        assert_eq!(toggle_lines(&["  ## Title"], Prefix::Heading(2)), ["Title"]);
+        assert_eq!(toggle_lines(&["   # Title"], Prefix::Heading(2)), ["## Title"]);
         assert_eq!(toggle_lines(&["a", "> b"], Prefix::Quote), ["> a", "> > b"]);
         assert_eq!(toggle_lines(&["> a", "> b"], Prefix::Quote), ["a", "b"]);
         assert_eq!(toggle_lines(&[""], Prefix::Bullet), ["- "]);
         assert_eq!(toggle_lines(&["  - a"], Prefix::Number), ["  1. a"]);
+    }
+
+    #[test]
+    fn inline_markers_toggle() {
+        assert_eq!(inline_toggle("a *", "it", "* b", "*", "*"), Inline::Outside);
+        assert_eq!(inline_toggle("a ", "*it*", " b", "*", "*"), Inline::Inside);
+        assert_eq!(inline_toggle("a ", "it", " b", "*", "*"), Inline::Wrap);
+        // Italic on bold adds to it; italic on bold italic leaves the bold.
+        assert_eq!(inline_toggle("**", "bold", "**", "*", "*"), Inline::Wrap);
+        assert_eq!(inline_toggle("", "**bold**", "", "*", "*"), Inline::Wrap);
+        assert_eq!(inline_toggle("***", "both", "***", "*", "*"), Inline::Outside);
+        assert_eq!(inline_toggle("", "***both***", "", "*", "*"), Inline::Inside);
+        assert_eq!(inline_toggle("**", "bold", "**", "**", "**"), Inline::Outside);
+        assert_eq!(inline_toggle("***", "both", "***", "**", "**"), Inline::Outside);
+        assert_eq!(inline_toggle("", "**bold**", "", "**", "**"), Inline::Inside);
+        assert_eq!(inline_toggle("*", "it", "*", "**", "**"), Inline::Wrap);
+        assert_eq!(inline_toggle("", "*", "", "*", "*"), Inline::Wrap);
+        assert_eq!(inline_toggle("[", "x", "](url)", "[", "](url)"), Inline::Outside);
     }
 
     #[test]
@@ -307,12 +396,21 @@ mod tests {
         assert_eq!(display_title("  Plan ", "body"), "Plan");
         assert_eq!(display_title("", "\n# Groceries\n- milk"), "Groceries");
         assert_eq!(display_title("", ""), "Untitled");
+        assert_eq!(copy_title(" Plan "), Some("Plan (copy)".into()));
+        assert_eq!(copy_title("  "), None);
         assert_eq!(preview("", "# Groceries\n- milk"), "milk");
         assert_eq!(preview("Plan", "first line"), "first line");
         assert_eq!(zoom_step(100, 1), 110);
         assert_eq!(zoom_step(100, -1), 90);
         assert_eq!(zoom_step(300, 1), 300);
         assert_eq!(zoom_step(105, -1), 100);
+        assert_eq!(zoom_notches(0.0, -1.0, false), (1, 0.0));
+        assert_eq!(zoom_notches(0.0, 1.0, false), (-1, 0.0));
+        assert_eq!(zoom_notches(0.0, 0.0, false), (0, 0.0));
+        assert_eq!(zoom_notches(0.0, -0.25, false), (0, -0.25));
+        assert_eq!(zoom_notches(-0.875, -0.125, false), (1, 0.0));
+        assert_eq!(zoom_notches(0.0, 12.0, true), (0, 0.5));
+        assert_eq!(zoom_notches(0.5, 12.0, true), (-1, 0.0));
         assert_eq!(clean("plain"), "plain");
         assert_eq!(clean("a\0b"), "a\u{FFFD}b");
     }

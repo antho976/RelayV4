@@ -217,9 +217,6 @@ pub fn confirm_inline_if(
 }
 
 fn track_navigation(stack: &gtk::Stack, key: &gtk::Button, name: &'static str) {
-    if name == "agents" {
-        key.add_css_class("selected");
-    }
     let weak = key.downgrade();
     stack.connect_visible_child_name_notify(move |s| {
         if let Some(key) = weak.upgrade() {
@@ -305,13 +302,15 @@ pub struct Ui {
     page_pending: Cell<bool>,
     page_dirty: Cell<bool>,
     connected: Cell<bool>,
+    /// The title bar's "Reconnect to engine" key: shown only while the engine is not connected.
+    reconnect: gtk::Button,
+    appearance_pending: Cell<bool>,
     launch: gtk::Revealer,
     launch_caption: gtk::Label,
     launch_busy: Cell<bool>,
     launch_box: gtk::Box,
     pub editor: Rc<crate::editor::Editor>,
     pub note_tabs: gtk::Notebook,
-    pub note_drafts: RefCell<BTreeMap<i64, Rc<crate::pages::Draft>>>,
     pub notes_window: RefCell<Option<Rc<crate::pages::NotesWindow>>>,
     pub(crate) wallpaper_rotation: RefCell<crate::wallpaper_rotation::Rotation>,
     pub(crate) wallpaper_draft: RefCell<Option<crate::tools::settings::WallpaperDraft>>,
@@ -645,7 +644,6 @@ impl Ui {
             "settings",
             "skills",
             "plugins",
-            "notifications",
             "devices",
         ] {
             let page = gtk::Box::new(gtk::Orientation::Vertical, 12);
@@ -819,13 +817,14 @@ impl Ui {
             page_pending: Cell::new(false),
             page_dirty: Cell::new(false),
             connected: Cell::new(false),
+            reconnect: reconnect.clone(),
+            appearance_pending: Cell::new(false),
             launch,
             launch_caption,
             launch_busy: Cell::new(false),
             launch_box,
             editor,
             note_tabs: gtk::Notebook::new(),
-            note_drafts: RefCell::default(),
             notes_window: RefCell::default(),
             wallpaper_rotation: RefCell::default(),
             wallpaper_draft: RefCell::default(),
@@ -871,10 +870,11 @@ impl Ui {
         let weak = Rc::downgrade(&ui);
         plugins_key.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
-                ui.project_plugins(ui.project.get());
+                ui.project_plugins();
             }
         });
-        let settings_return = Rc::new(RefCell::new((String::from("agents"), true)));
+        // The page Settings was opened from, which its back key returns to.
+        let settings_return = Rc::new(RefCell::new(String::from("agents")));
         let return_state = settings_return.clone();
         let weak = Rc::downgrade(&ui);
         let back_key = sidebar_key.clone();
@@ -887,8 +887,7 @@ impl Ui {
             let settings = page == "settings";
             if settings && mut_previous.borrow().as_str() != "settings" {
                 ui.settings_sidebar.set(ui.sidebar.is_visible());
-                *return_state.borrow_mut() =
-                    (mut_previous.borrow().clone(), ui.sidebar.is_visible());
+                *return_state.borrow_mut() = mut_previous.borrow().clone();
                 ui.sidebar.set_visible(false);
             } else if !settings && mut_previous.borrow().as_str() == "settings" {
                 ui.sidebar.set_visible(ui.settings_sidebar.get());
@@ -913,7 +912,7 @@ impl Ui {
         sidebar_key.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
                 if ui.page.borrow().as_str() == "settings" {
-                    let page = settings_return.borrow().0.clone();
+                    let page = settings_return.borrow().clone();
                     ui.navigate(&page);
                 } else {
                     ui.sidebar.set_visible(!ui.sidebar.is_visible());
@@ -979,15 +978,13 @@ impl Ui {
             });
         }
         let weak = Rc::downgrade(&ui);
-        let recovery_label_key = reconnect.clone();
-        ui.notice.connect_label_notify(move |notice| {
-            recovery_label_key.set_visible(!notice.text().is_empty());
-        });
-        let recovery_key = reconnect.clone();
-        ui.notice
-            .connect_visible_notify(move |notice| recovery_key.set_visible(notice.is_visible()));
         reconnect.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
+                // Reconnecting recreates every pane, the launch's placeholders included.
+                if ui.launch_busy.get() {
+                    ui.show_error("Wait for agent launch to finish before reconnecting.");
+                    return;
+                }
                 ui.connect();
             }
         });
@@ -1048,55 +1045,54 @@ impl Ui {
             }
         });
         let owned = ui.clone();
-        ui.window.connect_close_request(move |_| {
-            if owned.launch_busy.get() {
-                owned.show_error("Wait for agent launch to finish before closing.");
-                return glib::Propagation::Stop;
-            }
-            if owned
-                .note_drafts
-                .borrow()
-                .values()
-                .any(|d| d.busy.get() || d.dirty())
-            {
-                owned.show_error("Save or discard note changes before closing.");
-                return glib::Propagation::Stop;
-            }
-            if owned.editor.is_dirty() {
-                owned.show_error("Save or discard your editor changes before closing.");
-                return glib::Propagation::Stop;
-            }
-            let panels = owned.panels.borrow().clone();
-            if panels.iter().any(|panel| !panel.can_close()) {
-                owned.show_error("Save or discard panel changes before closing.");
-                return glib::Propagation::Stop;
-            }
-            for panel in panels.iter().rev() {
-                panel.close();
-            }
-            let drafts: Vec<_> = owned.note_drafts.borrow().values().cloned().collect();
-            for draft in drafts {
-                draft.close();
-            }
-            if let Some(notes) = owned.notes_window.borrow_mut().take() {
-                notes.window.destroy();
-            }
-            crate::mirror::close_all();
-            owned.generation.set(owned.generation.get() + 1);
-            owned.connected.set(false);
-            owned.client.borrow_mut().take();
-            for pane in owned.panes.borrow().values() {
-                pane.stop();
-            }
-            owned.panes.borrow_mut().clear();
-            glib::Propagation::Proceed
-        });
+        ui.window.connect_close_request(move |_| owned.close_request());
         ui
+    }
+    /// The main window's close: refused while a launch runs or any work is unsaved, otherwise
+    /// every panel, note, mirror and pane is closed before the window goes.
+    fn close_request(&self) -> glib::Propagation {
+        if self.launch_busy.get() {
+            self.show_error("Wait for agent launch to finish before closing.");
+            return glib::Propagation::Stop;
+        }
+        if crate::pages::unsaved_notes() {
+            self.show_error("Save or discard note changes before closing.");
+            return glib::Propagation::Stop;
+        }
+        if self.editor.is_dirty() {
+            self.show_error("Save or discard your editor changes before closing.");
+            return glib::Propagation::Stop;
+        }
+        let panels = self.panels.borrow().clone();
+        if panels.iter().any(|panel| !panel.can_close()) {
+            self.show_error("Save or discard panel changes before closing.");
+            return glib::Propagation::Stop;
+        }
+        for panel in panels.iter().rev() {
+            panel.close();
+        }
+        crate::pages::close_all_notes();
+        if let Some(notes) = self.notes_window.borrow_mut().take() {
+            notes.window.destroy();
+        }
+        crate::mirror::close_all();
+        self.generation.set(self.generation.get() + 1);
+        self.set_connected(false);
+        self.client.borrow_mut().take();
+        for pane in self.panes.borrow().values() {
+            pane.stop();
+        }
+        self.panes.borrow_mut().clear();
+        glib::Propagation::Proceed
     }
     /// Show `message` in the banner under the title bar. It has a dismiss key and clears itself
     /// once there was time to read it, unless the pointer rests on it. While the engine is not
     /// connected it describes that state, so it stays until the connection comes back.
     pub fn show_error(&self, message: &str) {
+        self.show_notice(message, (6 + message.chars().count() / 20).min(20));
+    }
+    /// `show_error` with its own reading time, in seconds.
+    fn show_notice(&self, message: &str, seconds: usize) {
         self.notice.set_text(message);
         self.notice.set_visible(true);
         let serial = NOTICE_SERIAL.with(|s| {
@@ -1106,7 +1102,7 @@ impl Ui {
         if !self.connected.get() {
             return;
         }
-        let mut remaining = (6 + message.chars().count() / 20).min(20);
+        let mut remaining = seconds;
         let notice = self.notice.downgrade();
         glib::timeout_add_local(std::time::Duration::from_secs(1), move || {
             let Some(notice) = notice.upgrade() else {
@@ -1148,6 +1144,10 @@ impl Ui {
             ui.refresh_page();
         });
     }
+    fn set_connected(&self, connected: bool) {
+        self.connected.set(connected);
+        self.reconnect.set_visible(!connected);
+    }
     fn connect(self: &Rc<Self>) {
         self.navigation_echoes.borrow_mut().clear();
         self.registry_dirty.set(true);
@@ -1155,7 +1155,7 @@ impl Ui {
         self.generation.set(self.generation.get() + 1);
         let generation = self.generation.get();
         self.client.borrow_mut().take();
-        self.connected.set(false);
+        self.set_connected(false);
         for p in self.panes.borrow().values() {
             p.stop();
         }
@@ -1164,6 +1164,8 @@ impl Ui {
         // The first refresh after connecting re-applies the saved pane order and focus, and no
         // save writes the cleared wall over them before it has.
         self.restored_project.set(0);
+        // A launch form built for the old connection would no longer submit (RA-470).
+        self.launch.set_reveal_child(false);
         self.layout();
         self.show_error("Connecting to the Relay engine…");
         let ui = self.clone();
@@ -1174,8 +1176,17 @@ impl Ui {
                         return;
                     }
                     *ui.client.borrow_mut() = Some(client);
-                    if let Err(e)=ui.call("bus.subscribe",json!({"events":["project.changed","project.deleted","workspace.changed","session.changed","task.changed","task.deleted","mailbox.new","mailbox.changed","guardrail.held","guardrail.resolved","guardrail.grant_used","overlap.changed","notes.changed","notes.deleted","file.changed","git.changed","worktree.changed","module.changed","module.deleted","skill.changed","skill.deleted","plugin.changed","settings.changed","provider.update.changed","notify.new","notify.changed","device.changed","device.lease.acquired","device.lease.released","run.changed","run.crash","device.signing.changed","avd.changed","layout.changed","ui.changed","ui.toast","usage.changed","integration.changed","integration.result"]})).await { ui.show_error(&e.to_string()); return; }
-                    ui.connected.set(true);
+                    if let Err(e)=ui.call("bus.subscribe",json!({"events":["project.changed","project.deleted","workspace.changed","workspace.deleted","session.changed","task.changed","task.deleted","mailbox.new","mailbox.changed","guardrail.held","guardrail.resolved","guardrail.grant_used","overlap.changed","notes.changed","notes.deleted","file.changed","git.changed","worktree.changed","module.changed","module.deleted","skill.changed","skill.deleted","plugin.changed","settings.changed","provider.update.changed","notify.new","notify.changed","device.changed","device.lease.acquired","device.lease.released","run.changed","run.crash","device.signing.changed","avd.changed","layout.changed","ui.changed","ui.toast","usage.changed","integration.changed","integration.result"]})).await {
+                        if generation == ui.generation.get() {
+                            ui.show_error(&e.to_string());
+                        }
+                        return;
+                    }
+                    // A newer attempt started while this one subscribed: it owns the UI now.
+                    if generation != ui.generation.get() {
+                        return;
+                    }
+                    ui.set_connected(true);
                     crate::provider_updates::startup(&ui);
                     ui.status.set_text("");
                     ui.refresh_status();
@@ -1184,9 +1195,13 @@ impl Ui {
                     ui.notice.set_visible(false);
                     ui.refresh();
                     ui.load_appearance();
+                    crate::wallpaper_rotation::refresh(&ui);
                     ui.load_keybindings();
                     if *ui.page.borrow() == "devices" {
                         let _ = ui.call("device.watch", json!({"on":true})).await;
+                        if generation != ui.generation.get() {
+                            return;
+                        }
                     }
                     let weak = Rc::downgrade(&ui);
                     drop(ui);
@@ -1243,10 +1258,7 @@ impl Ui {
                                 if e.project_id.is_some_and(|id| id != ui.project.get())
                                     && !e.ev.starts_with("project.")
                                     && !e.ev.starts_with("session.")
-                                    && !matches!(
-                                        ui.page.borrow().as_str(),
-                                        "dashboard" | "notifications"
-                                    )
+                                    && *ui.page.borrow() != "dashboard"
                                 {
                                     continue;
                                 }
@@ -1273,7 +1285,13 @@ impl Ui {
                                 {
                                     ui.apply_layout(&e.payload["state"]);
                                 } else if e.ev == "ui.toast" {
-                                    ui.show_error(text(&e.payload, "text"));
+                                    // Say who sent it: it shares the banner with Relay's own errors.
+                                    let message = match &e.actor {
+                                        relay_bus::Actor::Agent(_) => format!("{}: {}", e.actor, text(&e.payload, "text")),
+                                        _ => text(&e.payload, "text").to_string(),
+                                    };
+                                    let ttl = e.payload["ttl_ms"].as_u64().unwrap_or(4000);
+                                    ui.show_notice(&message, ttl.div_ceil(1000).clamp(2, 60) as usize);
                                 } else if e.ev == "ui.changed" {
                                     ui.apply_ui_event(&e.payload);
                                 } else if e.ev == "settings.changed" {
@@ -1284,11 +1302,26 @@ impl Ui {
                                     if path.starts_with("usage") || path.is_empty() {
                                         ui.reload_usage_prefs();
                                     }
+                                    // Only these read the wallpaper library, which can be
+                                    // megabytes: not every appearance field (RA-529).
+                                    if matches!(path, "appearance.wallpaper_rotation" | "appearance.wallpapers" | "") {
+                                        crate::wallpaper_rotation::refresh(&ui);
+                                    }
                                     if path.starts_with("appearance.")
                                         || path == "terminal.font_size"
                                         || path.is_empty()
                                     {
-                                        ui.load_appearance();
+                                        // One Save writes each changed field on its own; reload
+                                        // the appearance once for the lot.
+                                        if !ui.appearance_pending.replace(true) {
+                                            let weak = Rc::downgrade(&ui);
+                                            glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
+                                                if let Some(ui) = weak.upgrade() {
+                                                    ui.appearance_pending.set(false);
+                                                    ui.load_appearance();
+                                                }
+                                            });
+                                        }
                                     }
                                 } else if *ui.page.borrow() == "mailbox"
                                     && !e.ev.starts_with("mailbox.")
@@ -1301,7 +1334,7 @@ impl Ui {
                             }
                             Notice::Disconnected(e) => {
                                 ui.navigation_echoes.borrow_mut().clear();
-                                ui.connected.set(false);
+                                ui.set_connected(false);
                                 ui.client.borrow_mut().take();
                                 ui.status.set_text(
                                     "Engine disconnected · sessions remain owned by the engine",
@@ -1313,9 +1346,10 @@ impl Ui {
                         }
                     }
                 }
-                Err(e) => ui.show_error(&format!(
+                Err(e) if generation == ui.generation.get() => ui.show_error(&format!(
                     "{e}. Start relay serve for this instance, then reconnect."
                 )),
+                Err(_) => {}
             }
         });
     }
@@ -1405,6 +1439,8 @@ impl Ui {
                 let generation = ui.generation.get();
                 let layout_revision = ui.layout_revision.get();
                 let layout_project = ui.project.get();
+                // The sidebar order before this read, to find a removed project's neighbour.
+                let mut order = None;
                 if ui.registry_dirty.replace(false) {
                     let (projects, workspaces) = tokio::join!(
                         ui.call("project.list", json!({})),
@@ -1415,10 +1451,13 @@ impl Ui {
                     }
                     match (projects, workspaces) {
                         (Ok(p), Ok(w)) => {
+                            order = Some(ui.project_order());
                             *ui.projects.borrow_mut() = rows(&p, "projects");
                             *ui.workspaces.borrow_mut() = rows(&w, "workspaces");
                         }
                         (Err(e), _) | (_, Err(e)) => {
+                            // The registry is still unread: the next refresh must fetch it.
+                            ui.registry_dirty.set(true);
                             ui.show_error(&e.to_string());
                             break;
                         }
@@ -1430,19 +1469,20 @@ impl Ui {
                     .iter()
                     .any(|p| p["id"].as_i64() == Some(ui.project.get()))
                 {
-                    if ui.editor.is_dirty() {
-                        ui.show_error("The selected project was removed. Save or copy your editor changes before selecting another project.");
-                        break;
+                    if ui.project.get() != 0 {
+                        // Removed elsewhere: the same move a removal made here makes.
+                        if !ui.leave_removed_project(&order.unwrap_or_else(|| ui.project_order())) {
+                            break;
+                        }
+                    } else {
+                        // Nothing chosen yet: start on the first project.
+                        let first = ui.projects.borrow().first().and_then(|p| p["id"].as_i64());
+                        if let Some(first) = first {
+                            ui.project.set(first);
+                            ui.editor.reset();
+                            ui.editor.prepare_project(&ui);
+                        }
                     }
-                    ui.project.set(
-                        ui.projects
-                            .borrow()
-                            .first()
-                            .and_then(|p| p["id"].as_i64())
-                            .unwrap_or(0),
-                    );
-                    ui.editor.reset();
-                    ui.editor.prepare_project(&ui);
                 }
                 ui.render_projects();
                 if !ui.setup_checked.replace(true) && ui.projects.borrow().is_empty() {
@@ -1460,11 +1500,21 @@ impl Ui {
                 {
                     Ok(v) if ui.project.get() == project && generation == ui.generation.get() => {
                         let all = rows(&v, "sessions");
-                        *ui.sessions.borrow_mut() = all
+                        // A launch keeps its placeholders, and adopts its own new sessions into
+                        // their places (as `apply_session_event` does while it runs).
+                        let launching = ui.launch_busy.get();
+                        let previous = std::mem::take(&mut *ui.sessions.borrow_mut());
+                        let known = |s: &Value| previous.iter().any(|p| text(p, "name") == text(s, "name"));
+                        let mut sessions: Vec<Value> = all
                             .iter()
                             .filter(|s| s["project_id"].as_i64() == Some(project))
+                            .filter(|s| !launching || text(s, "state") != "created" || known(s))
                             .cloned()
                             .collect();
+                        if launching {
+                            sessions.extend(previous.iter().filter(|s| s["placeholder"] == true).cloned());
+                        }
+                        *ui.sessions.borrow_mut() = sessions;
                         *ui.sidebar_sessions.borrow_mut() = all;
                         ui.render_projects();
                         ui.reconcile();
@@ -1665,9 +1715,16 @@ impl Ui {
             pane.terminal.is_mapped() && text.is_some_and(|text| text.contains(marker))
         })
     }
+    /// Every session has a pane and every pane is attached: what [`Ui::verify_burst`] asserts
+    /// before it feeds input.
+    pub(crate) fn burst_ready(&self) -> bool {
+        let panes = self.panes.borrow();
+        !panes.is_empty() && panes.len() == self.sessions.borrow().len() && panes.values().all(|pane| pane.is_ready())
+    }
     pub fn verify_burst(&self, check: bool) {
         use vte4::prelude::TerminalExt;
-        assert_eq!(self.panes.borrow().len(), 11);
+        let rendered = self.panes.borrow().len();
+        assert!(rendered > 0 && rendered == self.sessions.borrow().len(), "{rendered} panes");
         if !check {
             println!("Burst layout: {}", self.mode.borrow());
         }
@@ -1692,7 +1749,7 @@ impl Ui {
             }
         }
         if check {
-            println!("BURST_RENDERED=11");
+            println!("BURST_RENDERED={rendered}");
         }
     }
     pub fn refresh_page(self: &Rc<Self>) {
@@ -1710,7 +1767,7 @@ impl Ui {
                 }
                 if matches!(
                     page.as_str(),
-                    "dashboard" | "settings" | "skills" | "plugins" | "notifications" | "devices"
+                    "dashboard" | "settings" | "skills" | "plugins" | "devices"
                 ) {
                     crate::tools::refresh(&ui, &page, project).await;
                 } else if project != 0 {

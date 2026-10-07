@@ -184,7 +184,8 @@ Every op is registered with, and the schema publishes:
 
 `noun.changed` (entity upserted; payload is the full entity), `noun.deleted` (payload `{id}`),
 plus domain events (`session.state`, `session.output` on the data plane, `guardrail.held`,
-`notify.new`, `integration.result`, `provider.version`, `resource.sample`). Rule: **every
+`notify.new`, `integration.result`, `provider.version`, `resource.sample`, `ui.changed` and
+`ui.toast` from the shell model of §6.5). Rule: **every
 mutation emits at least one event**, and every event's payload is reproducible by a query op.
 
 ---
@@ -195,6 +196,7 @@ mutation emits at least one event**, and every event's payload is reproducible b
 
 - `user` — you, at the UI or the CLI. Full default rights; guardrails still apply to your
   writes with a `held` + `guardrail.user_bypass` confirm instead of a hard refusal (SPEC §8).
+  On the socket only a process outside Relay's own process tree may claim it (§4.2).
 - `agent:<name>` — a running session's CLI process (Claude Code / Codex) or anything it
   spawns. Rights = the session's allowlist (§9.1). Its ops appear in the peer table and audit
   under its name.
@@ -207,7 +209,23 @@ mutation emits at least one event**, and every event's payload is reproducible b
   door are all its clients): `agent:<name>` requires `token` equal to the session's token, minted at
   `session.spawn` and exported to the child as `RELAY_SESSION=<name>` and
   `RELAY_TOKEN=<token>`. Wrong or missing token → `invalid` / `bus.actor`. `user` needs no
-  token (same uid, same trust — §0.6). `test` needs `RELAY_INSTANCE` ∈ {dev, test}.
+  token (same uid, same trust — §0.6), but it must come from **outside the engine's process
+  tree** (D165). On accept the engine reads the peer's pid (`SO_PEERCRED`, and `SO_PEERPIDFD`
+  where the kernel has it, so a recycled pid is not mistaken for the peer) and follows its
+  `/proc/<pid>/stat` parent links to the top. A peer below a live session's PTY child, or below
+  the engine anywhere else (a session's orphan, a build, a hook), or one that cannot be
+  identified (pid 0 from another pid namespace, an unreadable `/proc`, a process already gone)
+  may not claim `user` or `test`: every such request except `bus.ping` is `refused` /
+  `actor.peer`, with `details.peer` (`session` + `details.session`, `engine_child`, `unknown`).
+  That includes the person's own `!relay …` typed into an agent's pane — every PTY Relay
+  spawns is an agent session; user actions come from the app, the phone, or a terminal outside
+  Relay's sessions. The peer is identified once per connection, so `session.input` and every
+  other request pays one comparison. The engine's own process passes (the phone bridge of
+  `relay serve --remote` connects from it), as does `relay remote serve` started outside Relay.
+  The engine is a child subreaper (`PR_SET_CHILD_SUBREAPER`), so a session descendant that
+  double-forks or calls `setsid` is reparented to the engine rather than to init and stays
+  below it; the engine reaps those orphans itself. `agent:<name>` requests are unaffected.
+  `test` needs `RELAY_INSTANCE` ∈ {dev, test}.
   "Same uid" is checked, not assumed: the engine refuses a runtime directory that is a symlink,
   not its own or open to group/other, and a lock file that is not a regular file of its own;
   clients refuse a socket whose `SO_PEERCRED` uid is not theirs. Without `XDG_RUNTIME_DIR` the
@@ -238,11 +256,15 @@ fields; a payload that fails schema never reaches policy.
 
 ### 5.1 Ordering guarantees
 
-- Steps up to and including the handler run **serially per store** — one request at a time
-  mutates state (a single `tokio::sync::Mutex` around the engine's write side; queries may
-  read concurrently through the WAL). Latency budget: p99 < 5 ms for store-only ops. Anything
-  that takes longer (git, spawn, build) is a handler that returns quickly with a handle and
-  finishes via events (`integration.request` → `integration.result`).
+- Steps up to and including the handler run **serially per store**. The store is one SQLite
+  connection behind one `std::sync::Mutex`, and an ordinary handler runs inside a transaction
+  with it held, so one request at a time touches the store — reads included: a query waits for
+  the lock exactly as a mutation does, and WAL gives no concurrent readers here. Latency budget:
+  p99 < 5 ms for store-only ops; a request that holds or waits for the lock 16 ms or more is
+  logged at `warn` (`store lock over budget`). Slow work therefore belongs in one of the other
+  two handler shapes below, or behind a handle that finishes via events (`integration.request`
+  → `integration.result`). A plain handler that runs a subprocess blocks every other request,
+  keystrokes included, for as long as it runs.
 - Audit append is in the **same SQLite transaction** as the mutation. If the audit row can't
   be written, the mutation didn't happen.
 - Events are emitted after the transaction commits.
@@ -281,8 +303,10 @@ fields; a payload that fails schema never reaches policy.
 
 Payloads are validated against the generated schema **before** policy runs, so a guardrail
 never sees a malformed request and an agent never receives a policy answer for a request that
-would have failed on shape anyway. Unknown fields are an error (`bus.schema`,
-`details.path`), not ignored — silently dropped fields are how v3 shipped no-ops.
+would have failed on shape anyway. Unknown fields are an error (`bus.schema`), not ignored —
+silently dropped fields are how v3 shipped no-ops. A `bus.schema` error carries no `details`:
+its `message` is serde's, which names the field for an unknown, missing or mistyped top-level
+field ("unknown field `x`, expected one of …") but gives no path into a nested value.
 
 ### 5.3 Idempotency
 
@@ -349,8 +373,10 @@ connection into a subscriber: `Event` lines are interleaved with responses (dist
 the `ev` key). Data-plane frames on this door are `{v, stream, session | run_id | mirror_id,
 epoch?, seq, data}` lines (§7).
 
-The socket is served by `relay serve`, the one process that owns the engine, with or without a
-display. `relay serve --remote` also runs the phone door (§4.2) in that process.
+The socket is served by whichever process owns the engine: `relay serve` (headless engine —
+what the test suite and CI drive; also how you run Relay's core on a machine with no display),
+or `relay serve --remote` with the phone door in the same process. The desktop app is a client
+of this socket. Who may claim `user` on it is decided by the connecting process (§4.2).
 
 **One engine per instance.** The engine takes a non-blocking `flock` on
 `$XDG_RUNTIME_DIR/relay-v4/<instance>.lock` before binding. Lock free → anything at the socket
@@ -418,7 +444,7 @@ main window and returned `unavailable` / `ui.absent` headless. V4 never had it, 
 | `pty` | `session.attach {session, from_seq?, epoch?}` | `{v:1, stream:"pty", session, epoch, seq, data: base64}`, one frame per PTY read (up to 64 KiB) | socket lines, after a catch-up from the scrollback ring. A subscriber more than 1024 frames behind loses frames (the engine logs it) and should re-attach from its last `(epoch, seq)`. `epoch` increments on every spawn/wake and `seq` restarts within it; `session.scrollback` returns `{text, epoch, seq}` so a client can resume exactly |
 | `mirror` | `device.mirror.start` | `{v:1, stream:"mirror", mirror_id, seq, data}`: a base64 string is one H.264 packet; an object is the mirror's status (first, on every change, and a terminal one that ends the stream) | on the socket connection that started it; the mirror stops when that connection closes |
 | `logcat` | `device.run`, `device.build` | `{v:1, stream:"logcat", run_id, seq, data: line}` | a build streams Gradle output only, then ends; a subscriber that falls behind loses lines (logged) |
-| `log` | `app.log.tail` | none yet | declared, not implemented: the op emits `app.log.attached` and no frames follow. The engine logs to `relay serve`'s output, filtered by `RELAY_LOG` |
+| `log` | `app.log.tail` | none yet | declared, not implemented: the op answers `unavailable` / `bus.not_implemented` and attaches nothing. The engine logs to `relay serve`'s output, filtered by `RELAY_LOG` |
 
 Input to a PTY is a bus op (`session.input`, `audit: agent_only`), not a stream — it is
 low-volume in bytes and it matters who typed into whose terminal.
@@ -485,7 +511,9 @@ so no door computes this for itself.
 `session.input/resize/discard_restorable`, `audit.undo`, `guardrail.confirm/reject`,
 `guardrail.config.set`, `settings.*` mutations, `app.*` mutations, `workspace.*` and
 `project.*` mutations, `provider.refresh`, `worktree.*` mutations, `git.branch.clean_merged`,
-`integration.discard`, `device.*` mutations, `skill.*` mutations, `notify.settings.set`.
+`integration.discard`, `device.*` and `avd.*` mutations except `device.claim` / `device.release`,
+`skill.*` mutations, `notify.settings.set`. `app.resources.watch` is the one `app.*` mutation
+every actor may call; it only turns resource sampling on and off.
 SPEC §10 says no swarm: an agent never spawns, closes, or types into a session, full stop.
 
 **Layer 2 — row scope (runtime).** See *Own task / self* below: an op naming a `session` or a
@@ -499,8 +527,8 @@ allow-sets, straight from SPEC §3's agent action list plus reads:
 
 | role | may call |
 |---|---|
-| `builder` | all queries · `task.move` (own, `active → in_review`) · `task.link_commit` · `task.changelog.write` (own) · `task.update` (own; body/changelog only) · `mailbox.*` · `notes.append` · `overlap.flag/ack` · `integration.request` · `session.done/report/intent/claim/release` (self) · `usage.report` · `guardrail.gate/check` |
-| `reviewer` | all queries · `mailbox.*` · `notes.append` · `overlap.flag` · `task.changelog.write` on the reviewed task · `session.done/report/intent/claim/release` (self) · `usage.report` · `guardrail.check` — **nothing** that writes files, commits, or moves the task |
+| `builder` | all queries · `task.move` (own, `active → in_review`) · `task.link_commit` · `task.changelog.write` (own) · `task.update` (own; body/changelog only) · `mailbox.*` · `notes.append` · `overlap.flag/ack` · `integration.request` · `session.done/report/intent/claim/release` (self) · `device.claim/release` · `usage.report` · `guardrail.gate/check` |
+| `reviewer` | all queries · `mailbox.*` · `notes.append` · `overlap.flag` · `task.changelog.write` on the reviewed task · `session.done/report/intent/claim/release` (self) · `device.claim/release` · `usage.report` · `guardrail.check` — **nothing** that writes files, commits, or moves the task |
 | `docs` | builder's set minus `task.link_commit`/`integration.request`, plus `notes.create/update` |
 
 Session options widen a role deliberately, per session, never by default:
@@ -533,6 +561,8 @@ instead: `session.peers` with neither means "my project, minus me".
 | destructive write (> N lines removed, or > P% of a file of at least `min_file_lines`) | `gate {kind: write}`, `file.write` | `held` / `guardrail.destructive_write`; `confirm: guardrail.confirm {hold_id}`; notification. The old size is read from the file on disk, for a `new_text` and a `diff` alike; the percentage is skipped for short files, where a share measures nothing (D112) |
 | shape gates (registered validators for critical files) | `gate {kind: write}`, `file.write` | `held` / `guardrail.shape_gate` with `details.validator`, `details.reason` |
 | per-task caps (files, lines) | `gate {kind: commit}`, `git.commit`, `session.done` | `refused` / `guardrail.cap` with the numbers |
+| branch re-check | `session.done {status: completed}` from an agent on a task | every commit since base (newest 200) against protected paths, the net diff against caps and protected paths, and each shape-gated file the branch changes as it is at `HEAD`; uses the session's grants without spending them; `refused` with the policy's code (a per-commit refusal names `details.commit`). A hook can be skipped, so this is the check a skipped hook cannot dodge (RA-109). If git cannot measure, the done is allowed and logged |
+| hook bypass | `gate {kind: exec}` from an agent | `git commit -n`/`--no-verify` (also in flag clusters and abbreviations), any `core.hooksPath` override (`-c`, `--config-env`, `GIT_CONFIG_*`) and `git config` writes to it: `refused` / `guardrail.hook_bypass`, not grantable |
 | write roots | `gate {kind: write}` with a path outside the worktree | allowed inside `guardrails.allowed_write_roots` or the process temp directory (scratch space is not a repo-integrity concern); otherwise `refused` / `guardrail.write_root`, naming the roots that would have worked (D102) |
 | denied commands | `gate {kind: exec}` | matched against the **parsed argv** of each command in the line, never a raw substring, so quoted data naming a pattern is not a match; a `relay … guardrail.check` command is exempt so the dry run is always askable (D103) |
 | user bypass | any of the above when actor is `user` | `held` / `guardrail.user_bypass` — you confirm, it proceeds, audit says you did |
@@ -544,8 +574,11 @@ Claude Code and Codex write files with their **own** tools and commit with their
 callers of it wherever the provider lets us:
 
 - **`guardrail.gate`** (mutation · agent · session) — `{session, kind: "write" | "commit" |
-  "exec", path?, new_text?, diff?, command?}` → `{verdict: "allow" | "refuse" | "hold",
-  error?: BusError}`. Unlike `guardrail.check` (a pure dry run) it may **create a hold** and it
+  "exec", path?, new_text?, diff?, command?}` → `{verdict: "allow"}`. A refusal is not a
+  verdict: it arrives as `ok: false` with a typed `refused` error, and a hold as a typed `held`
+  error whose `confirm` carries `{hold_id}`, so a caller checks `ok` before `result`. (The result
+  type still declares `refuse`/`hold`, `error` and `hold_id`; the gate never sets them.
+  `guardrail.check`, the dry run, does return its verdict in the result.) Unlike `guardrail.check` (a pure dry run) it may **create a hold** and it
   is audited. It is what a hook calls; the hook fails the tool on `hold` as on `refuse`. A
   person who confirms the hold (`guardrail.confirm`) leaves a single-use pass for that exact
   action — same policy, kind, path, text, diff and command — so the agent's identical retry,
@@ -634,8 +667,11 @@ naming the request to make:
   user|test`, any envelope claiming `"actor":"user"`, and any line that sheds `RELAY_SESSION`
   (`unset`, `env -u`, `env -i`, `sudo`, …) or sets `RELAY_ACTOR`. Commands inside `sh -c`,
   heredocs fed to a shell, scripts piped into one and interpreter `-c`/`-e` code are read too;
-  searching for the names (`rg guardrail.confirm`) is not an invocation. The socket does not authenticate the user actor, so this is
-  best effort against the obvious route, not a security boundary.
+  searching for the names (`rg guardrail.confirm`) is not an invocation. Behind that, the socket
+  refuses a `user`/`test` claim from any process in an agent session's tree or elsewhere below
+  the engine (`actor.peer`, §4.2), so a raw envelope written with `socat` or a script fails too.
+  An agent shares the user's uid and can still reach outside the engine's tree (`systemd-run
+  --user`, a cron job, the store file itself), so this is a seatbelt, not a security boundary.
 
 ### 9.6 Configuration layers
 
@@ -663,13 +699,13 @@ optional. Entity shapes are in §11. `Id = number`. Every project-scoped op take
 | `bus.schema` | query · global | `{ op?: string }` → `{ schema: JsonSchema }` (whole `bus.v1.json`, or one op's `{payload, result}`) |
 | `bus.ops` | query · global | `{ actor?: Actor }` → `{ ops: OpInfo[] }` — registry attributes plus the all-layers `call`/`why` verdict for the (given or calling) actor (§9.1) |
 | `bus.whoami` | query · global | `{}` → `{ actor, is_agent, session?, role?, project_id?, project?, worktree?, branch?, can_call: string[], write_roots: string[] }` — identity and capability in one call, for any actor (D119) |
-| `bus.wait` | query · global · socket only | `{ events?: string[], timeout_ms? = 60000, matching?: object }` → `{ event?: Event, timed_out }` — block until a matching event arrives. The wake-up an agent has instead of a poll loop; events fired before the call are not replayed, so read state first, then wait (D115). `matching` takes only an event whose payload has each given top-level key equal to the value given |
+| `bus.wait` | query · global · socket only | `{ events?: string[], timeout_ms? = 60000, matching?: object }` → `{ event?: Event, timed_out }` — block until a matching event arrives. The wake-up an agent has instead of a poll loop; events fired before the call are not replayed, so read state first, then wait (D115). `matching` takes only an event whose payload has each given top-level key equal to the value given; anything but an object is `bus.schema` |
 | `bus.subscribe` | query · global · socket only | `{ events?: string[] }` → `{ subscribed: string[] }` |
 | `bus.unsubscribe` | query · global · socket only | `{}` → `{}` |
 
 ### 10.2 app
 
-All `app.*` mutations are `user_only` (§9.1 layer 1).
+All `app.*` mutations except `app.resources.watch` are `user_only` (§9.1 layer 1).
 
 | op | attrs | payload → result |
 |---|---|---|
@@ -713,6 +749,10 @@ unique; nothing else is.
 | `project.get` | query | `{ project_id }` → `Project` |
 | `project.update` | mutation · always · inverse | `{ project_id, name?, build_cmd?, run_cmd?, base_branch?, protected_paths?, critical_files?, order?, pinned? }` → `Project` |
 | `project.remove` | mutation · always · project | `{ project_id, force?: bool, remove_worktrees?: bool }` → `{ sessions_closed, runs_stopped }` — forgets project-owned Relay metadata but never touches repository files; `conflict` if sessions (`project.sessions_live`, `details.open_sessions`) or device runs are live, unless `force`, which closes every open session through `session.close` and stops the runs first. Closed sessions keep their worktrees and branches unless `remove_worktrees` (Relay-pool checkouts only, deleted once the store unlocks; branches always kept). An integration in progress refuses even with `force` |
+| `project.remove.preview` | query · user | `{ project_id? } \| { workspace_id? }` (exactly one) → `{ projects, tasks, notes, modules }` — what a removal would delete (live, untrashed rows), for the confirmation dialog |
+| `project.relink` | mutation · always · inverse | `{ project_id, path }` → `Project` — the repository moved: `path` must be a git repo root (`invalid`/`project.path`), no other project's path (`conflict`/`project.exists`) and inside a workspace (`invalid`/`project.outside_workspace`); the project stays in its workspace if that still contains it, else joins the innermost one that does. Stored worktree and trash paths under the old root are rewritten and the moved checkouts get `git worktree repair` after the commit. `conflict` (`project.sessions_live` / `project.activity_live`) while sessions are open or an integration or device run is live. Undo relinks to the old path |
+| `project.removed.list` | query · user | `{}` → `{ removed: [{ backup_path, created_at, reason, project_id, workspace_id, name, path }] }` — projects absent from the store that a `project-remove` / `workspace-remove` backup still holds, each from the newest such backup |
+| `project.restore` | mutation · always · global | `{ backup_path, project_id }` → `{ project, tasks, notes, modules, workspace_restored }` — copies a removed project back from its removal backup (read-only, before the transaction), with its original ids, in one transaction: the project, labels, modules, tasks with their labels, relations, commits and attachments, module unlinks, notes, notifications, file-trash records, layouts, skill/plugin enablement and its `guardrails.projects.<id>` / `layout.current.<id>` settings. Sessions (and their mailbox, claims, overlaps), integrations and device runs stay gone. A removed workspace comes back with it unless its directory is a workspace again, which then takes the project. `backup_path` must be a `store-*.db` directly in the store's `backups/` (`invalid`/`project.backup_path`); `conflict`/`project.exists` if the id is live or the path is another project's; `not_found`/`project.not_in_backup` |
 | `project.stats` | query | `{ project_id }` → `{ tasks_by_column, sessions_live, sessions_idle, worktrees, disk_mb }` |
 
 ### 10.5 task (SPEC §6)
@@ -751,7 +791,7 @@ unique; nothing else is.
 | `module.reopen` | mutation · always · inverse | `{ module_id }` → `Module` |
 | `module.delete` / `module.restore` | mutation · always · inverse | `{ module_id }` → `{}` / `Module` — delete unlinks tasks (they keep existing, `module_id: null`) |
 | `module.stats` | query | `{ project_id }` → same as `module.list.header` |
-| `module.changelog.draft` | query | `{ module_id, group_by?: "priority"\|"size" }` → `{ markdown, tasks: Id[] }` |
+| `module.changelog.draft` | query | `{ module_id, group_by?: "priority" }` (the only grouping built; any other value is `invalid` / `module.changelog_group`) → `{ markdown, tasks: Id[] }` |
 
 ### 10.7 notes / mailbox (SPEC §3, §12)
 
@@ -844,7 +884,7 @@ Provider-neutral Markdown; the same for both providers.
 
 | op | attrs | payload → result |
 |---|---|---|
-| `guardrail.gate` | mutation · always · session · agent | `{ session, kind: "write"\|"commit"\|"exec", path?, new_text?, diff?, command? }` → `{ verdict: "allow"\|"refuse"\|"hold", error?: BusError, hold_id?: Id }` — the enforcement door (§9.3); may create a hold |
+| `guardrail.gate` | mutation · always · session · agent | `{ session, kind: "write"\|"commit"\|"exec", path?, new_text?, diff?, command? }` → `{ verdict: "allow" }` — the enforcement door (§9.3); may create a hold. Refuse and hold arrive as typed `refused` / `held` errors, never as a verdict |
 | `guardrail.holds.list` | query | `{ project_id?, session?, open_only? = true, limit? (200, ≤1000) }` → `{ holds: Hold[] }` — newest first; a string over 64 KiB in `details` is cut to its first 4 KiB |
 | `guardrail.hold.get` | query · user | `{ hold_id, full? }` → `{ hold, request, elided? }` — the frozen action without its auth; unless `full`, each string over 64 KiB in `request.payload` or `hold.details` is cut to its first 4 KiB and its JSON pointer listed in `elided`. `guardrail.confirm` replays the stored action whole |
 | `guardrail.confirm` | mutation · always · user | `{ hold_id, scope? }` → `{ hold: Hold, outcome: Response }` (§9.4); for an exception request `scope` is `once`\|`session` and nothing is replayed (§9.5) |
@@ -871,7 +911,7 @@ Provider-neutral Markdown; the same for both providers.
 |  |  | **`worktree` throughout `git.*` and `file.*`:** omitted, it is the caller's own session worktree for an agent and the project root for the user. `"@project"` asks for the project root explicitly. Defaulting an agent to the project root returned confident, well-formed, wrong answers with no error either way (D111) |
 | `git.diff` | query | `{ project_id, worktree?, base?, staged? }` → `{ files: DiffFile[] }` |
 | `git.diff.file` | query | `{ project_id, worktree?, path, base? }` → `{ old, new, hunks }` (for `@codemirror/merge`); refuses a binary file (`git.diff_binary`) or one whose old + new text passes 1 MiB (`git.diff_too_large`) before building the reply |
-| `git.log` | query | `{ project_id, worktree?, branch?, limit? = 200, graph? }` → `{ commits: Commit[] }` |
+| `git.log` | query | `{ project_id, worktree?, branch?, limit? = 200 }` → `{ commits: Commit[] }` |
 | `git.show` | query | `{ project_id, sha }` → `{ commit: Commit, files: DiffFile[] }` |
 | `git.branches` | query | `{ project_id, worktree? }` → `{ current, branches: Branch[] }` (with merged flag and session owner; `current` follows the selected worktree) |
 | `git.branch.create` | mutation · always · user | `{ project_id, worktree?, name, start_point?, checkout? = true }` → `{ name, head, worktree }` — validates with Git, conflicts on an existing branch, and creates only through the selected worktree |
@@ -902,7 +942,7 @@ All paths are relative to the worktree root; `..` and absolute paths are `invali
 | `file.rename` | mutation · always | `{ project_id, worktree?, path, new_name }` → `Entry` |
 | `file.move` | mutation · always | `{ project_id, worktree?, path, into: string }` → `Entry` |
 | `file.delete` | mutation · always · inverse (restore) | `{ project_id, worktree?, path }` → `{ trash_id }` |
-| `file.restore` | mutation · always | `{ project_id, trash_id }` → `Entry` |
+| `file.restore` | mutation · always | `{ project_id, trash_id, worktree? }` → `Entry & { worktree, fallback }` — puts it back into `worktree` (`@project` or a worktree path, an agent confined to its own checkout), by default the checkout it was deleted from; once that checkout is gone, the project's primary checkout, with `fallback: true`. Never overwrites an existing path (`file.restore_conflict`); bytes no longer on disk are `file.trash_unavailable` |
 | `file.trash.list` | query · user | `{ project_id, limit? (200, ≤1000) }` → `{ entries: {id, original_path, worktree, created_at, available}[] }` — the project's trashed files not yet restored or expired, newest first; `id` is the `trash_id` for `file.restore`, `available` whether the bytes are still on disk |
 | `file.import` | mutation · always | `{ project_id, worktree?, into, sources: path[] }` → `{ entries: Entry[] }` — OS drag-in |
 | `file.restore_head` | mutation · always · user | `{ project_id, worktree?, path }` → `Entry` — `git checkout -- <path>`: puts a tracked file back as `HEAD` has it. Nothing calls it for you: there is no post-hoc write watcher (§9.3, D163) |
@@ -978,7 +1018,7 @@ warning rather than failing every guardrail read.
 |---|---|---|
 | `ui.state` | query | `{}` → `{ project_id, page, panes: PaneInfo[], focused: PaneRef, windows: WindowInfo[] }` — the engine's model, not the native window's panes |
 | `ui.page.switch` | mutation · agent_only · inverse | `{ page: "agents"\|"code"\|"board"\|"modules"\|"dashboard"\|"skills"\|"plugins"\|"settings", project_id? }` → `{}` |
-| `ui.pane.open` | mutation · agent_only | `{ kind: PaneKind, target?: PaneTarget, at?: PaneRef \| "split_h" \| "split_v" \| "tab" }` → `{ pane: PaneRef }` — records the pane; the native client acts only on `target.session` (focuses that terminal), so e.g. `{kind:"diff", target:{sha}}` opens nothing on screen |
+| `ui.pane.open` | mutation · agent_only | `{ kind: PaneKind, target?: PaneTarget }` → `{ pane: PaneRef }` — records the pane; the native client acts only on `target.session` (focuses that terminal), so e.g. `{kind:"diff", target:{sha}}` opens nothing on screen |
 | `ui.pane.close` / `ui.pane.focus` | mutation · agent_only | `{ pane: PaneRef }` → `{}` |
 | `ui.pane.move` | mutation · agent_only | `{ pane: PaneRef, to: PaneRef, edge: "top"\|"bottom"\|"left"\|"right"\|"center" }` → `{}` |
 | `ui.layout.list` / `ui.layout.save` / `ui.layout.apply` / `ui.layout.delete` | mutation · always · inverse (save/delete) | `{ project_id }` / `{ project_id, name, state? }` / `{ project_id, name }` / `{ project_id, name }` — opaque shell state is stored in core and an apply emits `layout.changed` for the UI |
@@ -1132,7 +1172,8 @@ interface Device { serial; model; kind: "usb" | "avd"; state }
 
 - The envelope `v` is the schema major. v1 is this document.
 - **Additive changes** (new op, new optional payload field, new result field, new event, new
-  error code) do not bump `v`. Clients ignore unknown result fields; core rejects unknown
+  error code, new optional envelope field) do not bump `v`. Clients ignore unknown result and
+  envelope fields (`Response`, `Event`, frames and `BusError` are lenient); core rejects unknown
   payload fields (§5.2) — so a *new required* payload field is breaking, and a new optional one
   is not.
 - **Breaking changes** (removed op, renamed op, changed field type, new required field,
@@ -1185,7 +1226,9 @@ test that opens a DB at each prior version.
   wrong.
 - **No per-request auth beyond tokens.** Same uid = same trust (§0.6) on the socket; over the
   phone door, `user` is whoever holds a paired device's token (§4.2). Tokens prevent
-  misattribution, not determined impersonation.
+  misattribution, and the peer check on `user` (§4.2) stops an agent's own process tree from
+  claiming the user; neither stops determined impersonation by a same-uid process that gets
+  itself started outside that tree.
 - **No RPC over the network, with one exception.** The engine's own door is the Unix socket
   only. The exception is the paired-phone door (`crates/relay-remote`, `docs/MOBILE.md`): it
   forwards bus lines from a WebSocket to this socket as actor `user`, after a per-connection

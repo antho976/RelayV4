@@ -31,6 +31,8 @@ pub struct Editor {
     search: gtk::SearchEntry,
     git: gtk::Box,
     git_revision: Cell<u64>,
+    /// The project and checkout the Git panel's rows belong to.
+    git_scope: RefCell<(i64, String)>,
     git_refresh_pending: Cell<bool>,
     git_refresh_dirty: Cell<bool>,
     /// The next refresh asks GitHub for pull requests again instead of taking the engine's
@@ -50,12 +52,14 @@ pub struct Editor {
     git_graph: Cell<bool>,
     git_merge_picks: RefCell<std::collections::HashSet<String>>,
     tree_load_pending: Cell<bool>,
-    tree_load_next: RefCell<Option<String>>,
+    /// A `load_tree` arrived while one was in flight: run once more when it answers.
+    tree_load_again: Cell<bool>,
     git_busy: Cell<bool>,
     commit_message: gtk::TextView,
     branch_name: gtk::Entry,
     branch_start: gtk::Entry,
-    invalidate_pending: Cell<bool>,
+    /// An `invalidate` timer is armed; the smoke waits for none before timing a burst.
+    pub(crate) invalidate_pending: Cell<bool>,
     diff: Cell<bool>,
     diff_switch: gtk::Box,
     diff_inline: Cell<bool>,
@@ -79,11 +83,13 @@ pub struct Editor {
     original: RefCell<String>,
     project: Cell<i64>,
     revision: Cell<u64>,
-    directory: RefCell<String>,
     save: gtk::Button,
     discard: gtk::Button,
     handlers: Cell<bool>,
     busy: Cell<bool>,
+    /// A save or an explorer change is in flight. Unlike `busy`, which a file still loading
+    /// also sets, it is work that closing or switching away would lose (RA-455).
+    writing: Cell<bool>,
     pub(crate) tree_revision: Cell<u64>,
     /// What the explorer last drew (`load_tree`); an identical listing is not rebuilt.
     tree_signature: Cell<u64>,
@@ -105,9 +111,8 @@ struct TreeLoadGuard(Rc<Editor>, Rc<Ui>);
 impl Drop for TreeLoadGuard {
     fn drop(&mut self) {
         self.0.tree_load_pending.set(false);
-        let next = self.0.tree_load_next.borrow_mut().take();
-        if let Some(directory) = next {
-            self.0.load_tree(&self.1, Some(directory));
+        if self.0.tree_load_again.replace(false) {
+            self.0.load_tree(&self.1);
         }
     }
 }
@@ -367,6 +372,7 @@ impl Editor {
             search,
             git,
             git_revision: Cell::new(0),
+            git_scope: RefCell::new((0, String::new())),
             git_busy: Cell::new(false),
             commit_message: gtk::TextView::new(),
             branch_name: gtk::Entry::new(),
@@ -385,7 +391,7 @@ impl Editor {
             git_graph: Cell::new(true),
             git_merge_picks: RefCell::default(),
             tree_load_pending: Cell::new(false),
-            tree_load_next: RefCell::new(None),
+            tree_load_again: Cell::new(false),
             diff: Cell::new(false),
             diff_switch,
             diff_inline: Cell::new(false),
@@ -409,11 +415,11 @@ impl Editor {
             original: RefCell::default(),
             project: Cell::new(0),
             revision: Cell::new(0),
-            directory: RefCell::default(),
             save,
             discard,
             handlers: Cell::new(false),
             busy: Cell::new(false),
+            writing: Cell::new(false),
             tree_revision: Cell::new(0),
             tree_signature: Cell::new(0),
             tree_limits: RefCell::default(),
@@ -529,8 +535,14 @@ impl Editor {
         editor.setup_find();
         editor
     }
+    /// Unsaved edits, or a write or Git operation in flight. A file that is only loading is
+    /// not dirty: whatever replaces the document bumps `revision`, which drops the load.
     pub fn is_dirty(&self) -> bool {
-        self.buffer.is_modified() || self.busy.get() || self.git_busy.get()
+        self.buffer.is_modified() || self.writing.get() || self.git_busy.get()
+    }
+    /// `is_dirty`, or a load in flight: the editor's own operations wait for either.
+    fn is_occupied(&self) -> bool {
+        self.is_dirty() || self.busy.get()
     }
     fn set_busy(&self, busy: bool) {
         if busy || !self.agents_visible() {
@@ -586,7 +598,6 @@ impl Editor {
         self.buffer.set_modified(false);
         self.path.borrow_mut().clear();
         self.original.borrow_mut().clear();
-        self.directory.borrow_mut().clear();
         self.view.set_editable(false);
         self.set_busy(false);
         self.disk_text.borrow_mut().take();
@@ -731,8 +742,7 @@ impl Editor {
             // A search's results stay until it is run again: re-reading the whole worktree
             // on every file event is a cost the explorer must not pay.
             if self.search.text().trim().is_empty() {
-                let directory = self.directory.borrow().clone();
-                self.load_tree(ui, Some(directory));
+                self.load_tree(ui);
             }
         } else {
             self.tree_stale.set(true);
@@ -747,13 +757,15 @@ impl Editor {
         self.refresh_scopes(ui);
     }
 
-    pub fn load_tree(self: &Rc<Self>, ui: &Rc<Ui>, directory: Option<String>) {
+    /// List the explorer from the checkout's root, with every expanded folder open. The
+    /// explorer has no directory scope (RA-687).
+    pub fn load_tree(self: &Rc<Self>, ui: &Rc<Ui>) {
         if ui.project.get() == 0 {
             return;
         }
         if self.tree_load_pending.replace(true) {
             self.tree_revision.set(self.tree_revision.get() + 1);
-            *self.tree_load_next.borrow_mut() = Some(directory.unwrap_or_default());
+            self.tree_load_again.set(true);
             return;
         }
         if !self.handlers.replace(true) {
@@ -785,7 +797,6 @@ impl Editor {
         let worktree = self.worktree.borrow().clone();
         self.tree_revision.set(self.tree_revision.get() + 1);
         let revision = self.tree_revision.get();
-        let directory = directory.unwrap_or_default();
         let e = self.clone();
         let ui = ui.clone();
         glib::spawn_future_local(async move {
@@ -793,7 +804,7 @@ impl Editor {
             let result = ui
                 .call(
                     "file.tree",
-                    json!({"project_id":project,"worktree":optional_scope(&worktree),"path":directory,"depth":1,"git_badges":true}),
+                    json!({"project_id":project,"worktree":optional_scope(&worktree),"path":"","depth":1,"git_badges":true}),
                 )
                 .await;
             if !e.matches(&ui, project, &worktree) || e.tree_revision.get() != revision {
@@ -807,7 +818,7 @@ impl Editor {
             // in one go: rebuilding a level per round trip let the content collapse and the
             // view snap to the top on every refresh (RA-209).
             let mut prefetched = std::collections::BTreeMap::new();
-            for folder in e.open_folders(&directory) {
+            for folder in e.open_folders() {
                 let listing = ui
                     .call(
                         "file.tree",
@@ -825,7 +836,6 @@ impl Editor {
             let signature = {
                 use std::hash::{Hash, Hasher};
                 let mut hash = std::collections::hash_map::DefaultHasher::new();
-                directory.hash(&mut hash);
                 v["entries"].to_string().hash(&mut hash);
                 for (folder, entries) in &prefetched {
                     folder.hash(&mut hash);
@@ -840,10 +850,9 @@ impl Editor {
             };
             // Nothing the explorer draws changed: the rows on screen stay, with their focus
             // and any open menu.
-            if signature == e.tree_signature.get() && *e.directory.borrow() == directory {
+            if signature == e.tree_signature.get() {
                 return;
             }
-            *e.directory.borrow_mut() = directory.clone();
             let scroll = e
                 .tree
                 .ancestor(gtk::ScrolledWindow::static_type())
@@ -851,7 +860,7 @@ impl Editor {
                 .map(|s| s.vadjustment())
                 .map(|a| (a.value(), a));
             clear(&e.tree);
-            e.render_tree(&ui, &e.tree, &directory, rows(&v, "entries"), revision, &mut prefetched);
+            e.render_tree(&ui, &e.tree, "", rows(&v, "entries"), revision, &mut prefetched);
             e.tree_signature.set(signature);
             if let Some((value, adjustment)) = scroll {
                 adjustment.set_value(value);
@@ -859,24 +868,14 @@ impl Editor {
             }
         });
     }
-    /// Expanded folders under `directory` whose every ancestor is expanded too: the ones a
-    /// rebuild draws open.
-    fn open_folders(&self, directory: &str) -> Vec<String> {
+    /// Expanded folders whose every ancestor is expanded too: the ones a rebuild draws open.
+    fn open_folders(&self) -> Vec<String> {
         let expanded = self.expanded.borrow();
         expanded
             .iter()
             .filter(|path| {
-                let rest = if directory.is_empty() {
-                    Some(path.as_str())
-                } else {
-                    path.strip_prefix(directory).and_then(|rest| rest.strip_prefix('/'))
-                };
-                let Some(rest) = rest else {
-                    return false;
-                };
-                let base = path.len() - rest.len();
-                rest.match_indices('/')
-                    .all(|(at, _)| expanded.contains(&path[..base + at]))
+                path.match_indices('/')
+                    .all(|(at, _)| expanded.contains(&path[..at]))
             })
             .cloned()
             .collect()
@@ -960,8 +959,12 @@ impl Editor {
                     e.buffer
                         .set_language(manager.guess_language(Some(&path), None).as_ref());
                     e.caption.set_text(&path);
+                    // set_text leaves the caret after the inserted text (RA-456).
                     if let Some((line, col, length)) = goto {
                         e.reveal(line, col, length);
+                    } else {
+                        e.buffer.place_cursor(&e.buffer.start_iter());
+                        e.view.scroll_to_mark(&e.buffer.get_insert(), 0.0, false, 0.0, 0.0);
                     }
                 }
                 Err(err) => ui.show_error(&err.to_string()),
@@ -980,22 +983,26 @@ impl Editor {
         let path = self.path.borrow().clone();
         let worktree = self.worktree.borrow().clone();
         let original = self.original.borrow().clone();
-        let content = self
-            .buffer
-            .text(&self.buffer.start_iter(), &self.buffer.end_iter(), false)
-            .to_string();
+        // The view inserts a bare LF for Enter: keep the file's own convention (RA-457).
+        let content = with_newlines(
+            &self.buffer.text(&self.buffer.start_iter(), &self.buffer.end_iter(), false),
+            crlf_dominant(&original),
+        );
         let e = self.clone();
         let ui = ui.clone();
         self.revision.set(self.revision.get() + 1);
         let revision = self.revision.get();
         self.set_busy(true);
+        self.writing.set(true);
         glib::spawn_future_local(async move {
             use sha2::Digest;
             let expected = sha2::Sha256::digest(original.as_bytes())
                 .iter()
                 .map(|b| format!("{b:02x}"))
                 .collect::<String>();
-            let result = ui.call("file.write", json!({"project_id":project,"worktree":optional_scope(&worktree),"path":path,"text":content,"expected_sha256":expected})).await;
+            // A held write (a protected path) is offered for confirmation here, as Git's are.
+            let result = code_git::guarded(&ui, "file.write", json!({"project_id":project,"worktree":optional_scope(&worktree),"path":path,"text":content,"expected_sha256":expected})).await;
+            e.writing.set(false);
             if e.revision.get() != revision {
                 return;
             }
@@ -1004,7 +1011,8 @@ impl Editor {
                 return;
             }
             match result {
-                Ok(_) => {
+                Ok(None) => e.save.set_sensitive(true),
+                Ok(Some(_)) => {
                     *e.original.borrow_mut() = content;
                     e.buffer.set_modified(false);
                     e.disk_text.borrow_mut().take();
@@ -1085,6 +1093,18 @@ fn snippet(line: &str, col: u32) -> String {
     )
 }
 
+/// Whether CRLF ends more of `text`'s lines than a bare LF does.
+fn crlf_dominant(text: &str) -> bool {
+    let crlf = text.matches("\r\n").count();
+    crlf > text.matches('\n').count() - crlf
+}
+
+/// `text` with every CRLF or bare LF written as `crlf` asks; a lone CR is left alone.
+fn with_newlines(text: &str, crlf: bool) -> String {
+    let lf = text.replace("\r\n", "\n");
+    if crlf { lf.replace('\n', "\r\n") } else { lf }
+}
+
 fn optional_scope(worktree: &str) -> Option<&str> {
     if worktree.is_empty() {
         None
@@ -1112,7 +1132,11 @@ impl Editor {
         let hidden = entries.len().saturating_sub(limit);
         for entry in entries.into_iter().take(limit) {
             let path = text(&entry, "path").to_string();
-            let directory = text(&entry, "kind") == "dir";
+            let directory = match text(&entry, "kind") {
+                "dir" => true,
+                "symlink" => self.links_to_folder(ui, &path),
+                _ => false,
+            };
             let depth = path.matches('/').count();
             let badge = text(&entry, "badge");
             let status = project_files::status_letter(badge);
@@ -1260,7 +1284,7 @@ impl Editor {
             } else {
                 glyph.append(&project_files::file_image(&path, 14));
                 let stamp = format!("{}:{}", entry["size"], entry["modified_at"]);
-                self.bind_image_hover(ui, &row, &path, stamp);
+                self.bind_image_hover(ui, &row, &path, stamp, entry["size"].as_u64());
                 let e = self.clone();
                 let weak = Rc::downgrade(ui);
                 row.connect_clicked(move |row| {
@@ -1268,7 +1292,7 @@ impl Editor {
                         project_files::mark_selected(row);
                         *e.selected_path.borrow_mut() = path.clone();
                         e.selected_directory.set(false);
-                        e.open_path(&ui, path.clone(), None);
+                        e.open_path(&ui, path.clone());
                     }
                 });
                 target.append(&row);
@@ -1295,12 +1319,23 @@ impl Editor {
             more.connect_clicked(move |_| {
                 if let Some(ui) = weak.upgrade() {
                     e.tree_limits.borrow_mut().insert(folder.clone(), limit + TREE_PAGE);
-                    let directory = e.directory.borrow().clone();
-                    e.load_tree(&ui, Some(directory));
+                    e.load_tree(&ui);
                 }
             });
             target.append(&more);
         }
+    }
+    /// A symlink to a folder inside this checkout, which file.tree lists and file.read
+    /// refuses: file.tree reports a link without what it points at (RA-459).
+    fn links_to_folder(&self, ui: &Ui, path: &str) -> bool {
+        let root = match self.worktree.borrow().as_str() {
+            "" => ui.projects.borrow().iter().find(|p| p["id"] == ui.project.get()).map(|p| text(p, "path").to_owned()),
+            worktree => Some(worktree.to_owned()),
+        };
+        let Some(root) = root.and_then(|root| std::fs::canonicalize(root).ok()) else {
+            return false;
+        };
+        std::fs::canonicalize(root.join(path)).is_ok_and(|target| target.starts_with(&root) && target.is_dir())
     }
     fn matches(&self, ui: &Ui, project: i64, worktree: &str) -> bool {
         ui.project.get() == project && self.worktree.borrow().as_str() == worktree
@@ -1312,20 +1347,11 @@ impl Editor {
         }
         extra
     }
-    /// Used by session file rails and task links. A dirty document always keeps its scope.
-    pub fn open_path(self: &Rc<Self>, ui: &Rc<Ui>, path: String, worktree: Option<String>) {
-        if self.is_dirty() {
-            ui.show_error("Save or discard your changes before opening another file or worktree.");
+    /// A file clicked in the explorer. Switching checkout is `select_checkout`'s job.
+    fn open_path(self: &Rc<Self>, ui: &Rc<Ui>, path: String) {
+        if self.is_occupied() {
+            ui.show_error("Save or discard your changes before opening another file.");
             return;
-        }
-        if let Some(worktree) = worktree {
-            if *self.worktree.borrow() != worktree {
-                self.clear_document();
-                *self.worktree.borrow_mut() = worktree;
-                self.refresh_scopes(ui);
-                self.refresh_git(ui);
-                self.load_tree(ui, None);
-            }
         }
         self.open(ui, path);
     }
@@ -1364,8 +1390,7 @@ impl Editor {
         self.file_sidebar.connect_map(move |_| {
             if let Some(ui) = weak.upgrade().filter(|_| e.tree_stale.replace(false)) {
                 if e.search.text().trim().is_empty() {
-                    let directory = e.directory.borrow().clone();
-                    e.load_tree(&ui, Some(directory));
+                    e.load_tree(&ui);
                 }
             }
         });
@@ -1396,7 +1421,7 @@ impl Editor {
         self.search.connect_stop_search(move |search| {
             search.set_text("");
             if let Some(ui) = weak.upgrade() {
-                e.load_tree(&ui, None);
+                e.load_tree(&ui);
             }
         });
         for (icon, title, op) in [
@@ -1423,7 +1448,7 @@ impl Editor {
         let weak = Rc::downgrade(ui);
         refresh.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
-                e.load_tree(&ui, None);
+                e.load_tree(&ui);
                 e.refresh_git(&ui);
             }
         });
@@ -1447,7 +1472,7 @@ impl Editor {
         collapse.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
                 e.expanded.borrow_mut().clear();
-                e.load_tree(&ui, None);
+                e.load_tree(&ui);
             }
         });
         self.file_actions.append(&collapse);
@@ -1547,7 +1572,7 @@ impl Editor {
     fn run_search(self: &Rc<Self>, ui: &Rc<Ui>) {
         let query = self.search.text().to_string();
         if query.trim().is_empty() {
-            self.load_tree(ui, None);
+            self.load_tree(ui);
             return;
         }
         if self.search_pending.replace(true) {
@@ -1647,7 +1672,7 @@ impl Editor {
         });
     }
     fn file_action(self: &Rc<Self>, ui: &Rc<Ui>, op: &'static str) {
-        if self.is_dirty() {
+        if self.is_occupied() {
             ui.show_error("Save or discard the current file before changing files.");
             return;
         }
@@ -1723,7 +1748,7 @@ impl Editor {
         let ui = ui.clone();
         glib::spawn_future_local(async move {
             let accepted = dialog.response(caption).await;
-            if !accepted || !e.matches(&ui, project, &worktree) || e.is_dirty() {
+            if !accepted || !e.matches(&ui, project, &worktree) || e.is_occupied() {
                 return;
             }
             let value = entry.text().trim().to_string();
@@ -1739,13 +1764,16 @@ impl Editor {
                 _ => json!({"path":path}),
             };
             e.set_locked(true);
-            let result = ui.call(op, e.payload(&ui, extra)).await;
+            e.writing.set(true);
+            let result = code_git::guarded(&ui, op, e.payload(&ui, extra)).await;
+            e.writing.set(false);
             e.set_locked(false);
             if !e.matches(&ui, project, &worktree) {
                 return;
             }
             match result {
-                Ok(v) => {
+                Ok(None) => {}
+                Ok(Some(v)) => {
                     *e.selected_path.borrow_mut() = if op == "file.delete" {
                         String::new()
                     } else {
@@ -1754,7 +1782,7 @@ impl Editor {
                     e.selected_directory.set(text(&v, "kind") == "dir");
                     match op {
                         "file.create" => {
-                            e.load_tree(&ui, None);
+                            e.load_tree(&ui);
                             e.refresh_git(&ui);
                         }
                         "file.rename" => e.follow_change(&ui, &path, Some(text(&v, "path"))),
@@ -1762,9 +1790,15 @@ impl Editor {
                     }
                     if op == "file.delete" {
                         // The ID is also kept by the engine; no permanent deletion is offered here.
+                        // One key, for the latest trash; older ones are in Recently trashed (RA-460).
                         let id = v["trash_id"].as_i64().unwrap_or(0);
-                        let restore = button("Undo trash", "quiet");
+                        clear(&e.file_undo);
+                        let restore = button(&format!("Restore {path}"), "quiet");
                         restore.set_widget_name("project-file-undo");
+                        restore.set_tooltip_text(Some(&format!("Restore {path} from Relay trash")));
+                        if let Some(caption) = restore.child().and_downcast::<gtk::Label>() {
+                            caption.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+                        }
                         let weak = Rc::downgrade(&ui);
                         let ed = e.clone();
                         restore.connect_clicked(move |button| {
@@ -1780,8 +1814,10 @@ impl Editor {
                             glib::spawn_future_local(async move {
                                 match restore_trash(&ui, project, id).await {
                                     Ok(_) => {
-                                        button.set_visible(false);
-                                        ed.load_tree(&ui, None);
+                                        if button.parent().as_ref() == Some(ed.file_undo.upcast_ref()) {
+                                            ed.file_undo.remove(&button);
+                                        }
+                                        ed.load_tree(&ui);
                                         ed.refresh_git(&ui);
                                     }
                                     Err(err) => {
@@ -1827,7 +1863,7 @@ impl Editor {
             Some(None) => self.clear_document(),
             None => {}
         }
-        self.load_tree(ui, None);
+        self.load_tree(ui);
         self.refresh_git(ui);
         if agents {
             self.show_agents();
@@ -1853,7 +1889,7 @@ impl Editor {
             };
             if data["project"] != ui.project.get()
                 || data["worktree"] != *ed.worktree.borrow()
-                || ed.is_dirty()
+                || ed.is_occupied()
             {
                 return false;
             }
@@ -1868,11 +1904,14 @@ impl Editor {
             let moved = path.to_owned();
             let ed = ed.clone();
             ed.busy.set(true);
+            ed.writing.set(true);
             glib::spawn_future_local(async move {
-                let result = ui.call("file.move", payload).await;
+                let result = code_git::guarded(&ui, "file.move", payload).await;
                 ed.busy.set(false);
+                ed.writing.set(false);
                 match result {
-                    Ok(value) => ed.follow_change(&ui, &moved, Some(text(&value, "path"))),
+                    Ok(None) => {}
+                    Ok(Some(value)) => ed.follow_change(&ui, &moved, Some(text(&value, "path"))),
                     Err(error) => ui.show_error(&error.to_string()),
                 }
             });
@@ -1954,7 +1993,7 @@ impl Editor {
                             Ok(_) => {
                                 item.set_visible(false);
                                 if ui.project.get() == project {
-                                    ed.load_tree(&ui, None);
+                                    ed.load_tree(&ui);
                                     ed.refresh_git(&ui);
                                 }
                             }
@@ -2025,7 +2064,16 @@ pub fn replace_all(search: &sourceview5::SearchContext, replace: &str) -> Result
 
 #[cfg(test)]
 mod tests {
-    use super::{snippet, SNIPPET_CHARS};
+    use super::{crlf_dominant, snippet, with_newlines, SNIPPET_CHARS};
+
+    #[test]
+    fn a_save_keeps_the_files_own_line_endings() {
+        assert!(crlf_dominant("[a]\r\nb=1\r\nc=2\n"));
+        assert!(!crlf_dominant("a\nb\r\nc\n"));
+        assert!(!crlf_dominant(""));
+        assert_eq!(with_newlines("a\r\nnew\nb\r\n", true), "a\r\nnew\r\nb\r\n");
+        assert_eq!(with_newlines("a\npasted\r\nb\r", false), "a\npasted\nb\r");
+    }
 
     #[test]
     fn a_short_line_is_shown_whole() {

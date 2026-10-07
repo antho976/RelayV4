@@ -208,6 +208,7 @@ class Skeleton(object):
         for n in self.names:
             p = str(comp.get_parent_bone(n))
             self.parent[n] = p if p and p != "None" and p in self.index else None
+        self.fallbacks = set()  # bones local_pose left at the reference pose
         self.ref_local = {}
         for i, n in enumerate(self.names):
             getter = getattr(comp, "get_ref_pose_transform", None)
@@ -217,14 +218,35 @@ class Skeleton(object):
                 self.ref_local[n] = (vec(comp.get_ref_pose_position(i)), (0.0, 0.0, 0.0, 1.0), (1.0, 1.0, 1.0))
 
     def local_pose(self, anim, time):
+        """Every bone's local transform at `time`. The animation is evaluated once per call:
+        AnimationLibrary.get_bone_pose_for_time evaluates the whole pose for each bone it is asked
+        about, which on a large skeleton holds the editor for minutes. A bone the animation
+        cannot pose keeps its reference transform and is counted in `fallbacks`."""
         if anim is None:
             return dict(self.ref_local)
+        bone_pose = None
+        try:
+            ext = unreal.AnimPoseExtensions
+            evaluated = ext.get_anim_pose_at_time(anim, time, unreal.AnimPoseEvaluationOptions())
+            posed = set(str(n) for n in ext.get_bone_names(evaluated))
+            local = unreal.AnimPoseSpaces.LOCAL
+            if posed:
+                bone_pose = lambda n: ext.get_bone_pose(evaluated, n, local) if n in posed else None
+        except Exception:
+            pass
+        if bone_pose is None:  # an engine without AnimPoseExtensions, or a pose it could not evaluate
+            bone_pose = lambda n: unreal.AnimationLibrary.get_bone_pose_for_time(anim, n, time, False)
         pose = {}
         for n in self.names:
             try:
-                pose[n] = from_ue(unreal.AnimationLibrary.get_bone_pose_for_time(anim, n, time, False))
+                t = bone_pose(n)
             except Exception:
+                t = None
+            if t is None:
+                self.fallbacks.add(n)
                 pose[n] = self.ref_local[n]
+            else:
+                pose[n] = from_ue(t)
         return pose
 
     def component_pose(self, local):
@@ -263,12 +285,26 @@ def anim_length(anim):
     return 0.0
 
 
+def load_animation(path, what="animation"):
+    """An animation sequence or montage: anything else (a Blend Space, an Anim Blueprint) cannot be
+    sampled, and every bone would sit at the reference pose."""
+    anim = load(path, what)
+    if not isinstance(anim, unreal.AnimSequenceBase):
+        raise RuntimeError("%s %r is a %s, not an animation sequence or montage" % (what, path, anim.get_class().get_name()))
+    return anim
+
+
+MAX_SAMPLES = 60
+
+
 def sample_times(anim):
     if ARGS.get("times"):
+        if len(ARGS["times"]) > MAX_SAMPLES:
+            raise RuntimeError("%d times; at most %d per call" % (len(ARGS["times"]), MAX_SAMPLES))
         return [float(t) for t in ARGS["times"]]
     if anim is None:
         return [0.0]
-    n = max(2, min(int(ARGS.get("samples", 9)), 60))
+    n = max(2, min(int(ARGS.get("samples", 9)), MAX_SAMPLES))
     total = anim_length(anim)
     return [round(total * i / (n - 1), 4) for i in range(n)]
 
@@ -277,6 +313,7 @@ def body_frame(skel):
     """Character axes in mesh space from the skeleton itself (rig_frame.character_frame, bundled
     after this file): `right` points from left-side bones to their right-side twins, `up` is +Z,
     `forward` = right x up in Unreal's left-handed space. This is why the checks work for any
-    skeleton and any mesh orientation."""
+    skeleton and any mesh orientation. Without pairs the mesh is assumed to face +Y (right is
+    -X), as a Blender export arrives."""
     comp = skel.component_pose(skel.ref_local)
-    return character_frame(skel.names, skel.parent, dict((n, comp[n][0]) for n in skel.names))
+    return character_frame(skel.names, skel.parent, dict((n, comp[n][0]) for n in skel.names), default_right=(-1.0, 0.0, 0.0))

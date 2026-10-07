@@ -10,16 +10,18 @@ use gtk::gdk;
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 
-const COLUMNS: [(&str, &str); 5] = [
-    ("backlog", "Backlog"),
-    ("ready", "Ready"),
-    ("active", "Active"),
-    ("in_review", "In review"),
-    ("done", "Done"),
-];
-const TYPES: [&str; 5] = ["task", "feature", "bug", "chore", "spike"];
-const PRIORITIES: [&str; 4] = ["urgent", "high", "medium", "low"];
-const SIZES: [&str; 4] = ["", "S", "M", "L"];
+use task_pages::{COLUMNS, COLUMN_TITLES, OPEN_COLUMNS, PRIORITIES, SIZES, TYPES};
+
+/// [`PRIORITIES`] most urgent first, the order the board groups and offers them in.
+const URGENT_FIRST: [&str; 4] = {
+    let mut urgent_first = PRIORITIES;
+    let mut i = 0;
+    while i < PRIORITIES.len() {
+        urgent_first[i] = PRIORITIES[PRIORITIES.len() - 1 - i];
+        i += 1;
+    }
+    urgent_first
+};
 const GROUPS: [(&str, &str); 7] = [
     ("", "None"),
     ("parent", "Parent"),
@@ -75,8 +77,17 @@ fn by_id(tasks: &[Value]) -> BTreeMap<i64, &Value> {
     tasks.iter().filter_map(|t| Some((t["id"].as_i64()?, t))).collect()
 }
 
+/// The tasks blocking `task` that are not done yet, looked up in [`by_id`]'s index.
+fn open_blockers<'a>(task: &Value, all: &BTreeMap<i64, &'a Value>) -> Vec<&'a Value> {
+    rows(task, "blocked_by")
+        .iter()
+        .filter_map(|other| other.as_i64().and_then(|other| all.get(&other)).copied())
+        .filter(|t| text(t, "column") != "done")
+        .collect()
+}
+
 fn caption(column: &str) -> &'static str {
-    COLUMNS
+    COLUMN_TITLES
         .iter()
         .find(|(name, _)| *name == column)
         .map(|(_, title)| *title)
@@ -118,54 +129,40 @@ fn haystack(task: &Value) -> String {
     .to_lowercase()
 }
 
+/// A group's sort rank, a space, then its heading: priority and size keep their own order and
+/// the fallback groups (`Unassigned`, `No module`…) sort after every named one.
 fn group_of(task: &Value, grouping: &str) -> String {
+    let named = |name: Option<&str>, none: &str| match name {
+        Some(name) => format!("0 {name}"),
+        None => format!("9 {none}"),
+    };
     match grouping {
-        "parent" => task["_parent_title"].as_str().unwrap_or("Top level").to_string(),
-        "module" => task["_module_name"].as_str().unwrap_or("No module").to_string(),
-        "session" => task["sessions"]
-            .as_array()
-            .and_then(|v| v.last())
-            .and_then(Value::as_str)
-            .unwrap_or("Unassigned")
-            .to_string(),
+        "parent" => named(task["_parent_title"].as_str(), "Top level"),
+        "module" => named(task["_module_name"].as_str(), "No module"),
+        "session" => named(task["sessions"].as_array().and_then(|v| v.last()).and_then(Value::as_str), "Unassigned"),
         "" => String::new(),
         "priority" => {
             let p = text(task, "priority");
-            format!("{} {p}", PRIORITIES.iter().position(|x| *x == p).unwrap_or(9))
+            format!("{} {p}", URGENT_FIRST.iter().position(|x| *x == p).unwrap_or(9))
         }
-        key => task[key].as_str().unwrap_or("None").to_string(),
+        "size" => match text(task, "size") {
+            "" => "9 None".into(),
+            s => format!("{} {s}", SIZES.iter().position(|x| *x == s).unwrap_or(8)),
+        },
+        key => named(task[key].as_str(), "None"),
     }
 }
-fn group_title(group: &str, grouping: &str) -> String {
-    if grouping == "priority" {
-        group.split_once(' ').map(|(_, p)| p).unwrap_or(group).to_string()
-    } else {
-        group.to_string()
-    }
+fn group_title(group: &str) -> String {
+    group.split_once(' ').map(|(_, g)| g).unwrap_or(group).to_string()
 }
 
 /// `5m`, `3h`, `2d`: how long ago an RFC 3339 timestamp was, at a glance.
-fn ago_between(ts: &str, now: &glib::DateTime) -> String {
-    let Some(then) = ts
-        .get(..19)
-        .and_then(|base| glib::DateTime::from_iso8601(&format!("{base}Z"), None).ok())
-    else {
-        return String::new();
-    };
-    let seconds = now.difference(&then).as_seconds().max(0);
-    match seconds {
-        0..60 => "now".into(),
-        60..3_600 => format!("{}m", seconds / 60),
-        3_600..86_400 => format!("{}h", seconds / 3_600),
-        86_400..604_800 => format!("{}d", seconds / 86_400),
-        604_800..3_024_000 => format!("{}w", seconds / 604_800),
-        _ => then.format("%b %-d").map(|s| s.to_string()).unwrap_or_default(),
-    }
-}
 fn ago(ts: &str) -> String {
-    glib::DateTime::now_utc()
-        .map(|now| ago_between(ts, &now))
-        .unwrap_or_default()
+    crate::relative::ago(ts, crate::relative::Form::Compact).unwrap_or_default()
+}
+/// The peek's longer reading of an [`ago`]: `just now`, `5m ago`, `on Mar 1`, or a dash.
+fn since(ts: &str) -> String {
+    crate::relative::ago(ts, crate::relative::Form::CompactAgo).unwrap_or_else(|| "—".into())
 }
 
 fn hue(name: &str) -> usize {
@@ -447,14 +444,15 @@ struct Quick {
     priority: gtk::DropDown,
     note: gtk::Label,
 }
-const QUICK_COLUMNS: [&str; 4] = ["backlog", "ready", "active", "in_review"];
-const QUICK_PRIORITIES: [&str; 4] = ["low", "medium", "high", "urgent"];
 
 struct Board {
     ui: std::rc::Weak<Ui>,
     project: i64,
     page: gtk::Box,
     keys: gtk::EventControllerKey,
+    /// Holds the workspace picker, rebuilt when the projects or workspaces it lists change.
+    picker: gtk::Box,
+    picker_key: RefCell<String>,
     count: gtk::Label,
     query: gtk::SearchEntry,
     filter: gtk::MenuButton,
@@ -474,8 +472,8 @@ struct Board {
     peeked: Cell<Option<i64>>,
     dragged: Cell<Option<i64>>,
     layout: RefCell<Lanes>,
-    /// The horizontal board scroller first, then each lane's, to keep places across renders.
-    scrolls: RefCell<Vec<gtk::Adjustment>>,
+    /// Each scroller by role (`board`, `lane:<column>`, `list`), to keep places across renders.
+    scrolls: RefCell<Vec<(String, gtk::Adjustment)>>,
     /// What the peek last drew (`peek_key`): an unchanged peek keeps its scroll and focus.
     peek_key: RefCell<Option<String>>,
     peek_shown: Cell<Option<i64>>,
@@ -493,16 +491,25 @@ pub fn show(ui: &Rc<Ui>, page: &gtk::Box, project: i64, tasks: Vec<Value>) {
         Some(board) if owner == Some(project) && board.project == project => board,
         old => {
             fresh = true;
-            if let Some(old) = old {
+            if let Some(old) = &old {
                 page.remove_controller(&old.keys);
             }
             clear(page);
             ui.page_projects.borrow_mut().insert("board".into(), project);
             let board = Board::mount(ui, page, project);
+            // The view, hidden columns and grouping follow the person across projects; the
+            // filters name one project's modules, labels and agents, so they start empty.
+            if let Some(old) = old {
+                board.list.set(old.list.get());
+                board.views[old.list.get() as usize].set_active(true);
+                *board.hidden.borrow_mut() = old.hidden.borrow().clone();
+                *board.group.borrow_mut() = old.group.borrow().clone();
+            }
             BOARD.with(|slot| *slot.borrow_mut() = Some(board.clone()));
             board
         }
     };
+    board.refresh_picker(ui);
     let mut tasks = tasks;
     let titles: BTreeMap<i64, Value> = tasks
         .iter()
@@ -529,7 +536,8 @@ impl Board {
         let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         header.add_css_class("board-head");
         header.append(&board_switcher(ui, "board"));
-        header.append(&workspace_picker(ui, project, "board"));
+        let picker = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        header.append(&picker);
         let count = label("", "board-count");
         count.set_widget_name("board-count");
         count.set_hexpand(true);
@@ -585,7 +593,7 @@ impl Board {
 
         let bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         bar.add_css_class("board-quick");
-        let column = gtk::DropDown::from_strings(&QUICK_COLUMNS.map(caption));
+        let column = gtk::DropDown::from_strings(&OPEN_COLUMNS.iter().map(|c| caption(c)).collect::<Vec<_>>());
         column.set_tooltip_text(Some("Column"));
         let title = gtk::Entry::builder()
             .placeholder_text("Task title — Enter creates, Esc closes")
@@ -594,8 +602,8 @@ impl Board {
         title.set_widget_name("board-quick-title");
         let kind = gtk::DropDown::from_strings(&TYPES);
         kind.set_tooltip_text(Some("Type"));
-        let priority = gtk::DropDown::from_strings(&QUICK_PRIORITIES);
-        priority.set_selected(1);
+        let priority = gtk::DropDown::from_strings(&PRIORITIES);
+        priority.set_selected(PRIORITIES.iter().position(|p| *p == "medium").unwrap_or(0) as u32);
         priority.set_tooltip_text(Some("Priority"));
         let create = button("Create", "primary");
         let more = button("More fields…", "quiet");
@@ -624,7 +632,9 @@ impl Board {
         rail.add_css_class("board-drag-rail");
         rail.append(&label("DROP TO SET", "board-rail-caption"));
         rail.set_visible(false);
-        page.append(&rail);
+        // Floats over the lanes: shown at drag start, it must not push the card under the pointer.
+        rail.set_valign(gtk::Align::Start);
+        rail.set_halign(gtk::Align::Start);
 
         let main = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         main.set_vexpand(true);
@@ -638,7 +648,10 @@ impl Board {
         peek.set_size_request(380, -1);
         peek.set_visible(false);
         main.append(&peek);
-        page.append(&main);
+        let stack = gtk::Overlay::new();
+        stack.set_child(Some(&main));
+        stack.add_overlay(&rail);
+        page.append(&stack);
 
         let hints = gtk::Box::new(gtk::Orientation::Horizontal, 5);
         hints.add_css_class("board-shortcuts");
@@ -668,6 +681,8 @@ impl Board {
             project,
             page: page.clone(),
             keys: keys.clone(),
+            picker,
+            picker_key: RefCell::new(String::new()),
             count,
             query: query.clone(),
             filter: filter.clone(),
@@ -702,8 +717,8 @@ impl Board {
         });
 
         for (field, values) in [
-            ("priority", &["low", "medium", "high", "urgent"][..]),
-            ("size", &["S", "M", "L"][..]),
+            ("priority", &PRIORITIES[..]),
+            ("size", &SIZES[1..]),
             ("type", &TYPES[..]),
         ] {
             for value in values {
@@ -767,7 +782,8 @@ impl Board {
         let weak = Rc::downgrade(&board);
         add.connect_clicked(move |_| {
             if let Some(board) = weak.upgrade() {
-                let column = board.current().map(|(column, _)| column);
+                // The click took focus from the card, so start in the last focused card's column.
+                let column = board.focused.get().and_then(|id| board.task(id)).map(|t| text(&t, "column").to_string());
                 board.open_quick(column.as_deref().unwrap_or("backlog"));
             }
         });
@@ -823,6 +839,23 @@ impl Board {
     fn ui(&self) -> Option<Rc<Ui>> {
         self.ui.upgrade()
     }
+    /// Rebuilds the workspace picker once a project or workspace it lists is added, renamed or
+    /// removed, unless its menu is open.
+    fn refresh_picker(&self, ui: &Rc<Ui>) {
+        let key = {
+            let pick = |rows: &[Value], keys: &[&str]| -> Vec<Value> {
+                rows.iter().map(|row| Value::Array(keys.iter().map(|k| row[*k].clone()).collect())).collect()
+            };
+            json!([pick(&ui.projects.borrow(), &["id", "name", "workspace_id"]), pick(&ui.workspaces.borrow(), &["id", "name"])])
+                .to_string()
+        };
+        if *self.picker_key.borrow() == key || crate::app::open_popover(self.picker.upcast_ref()).is_some() {
+            return;
+        }
+        *self.picker_key.borrow_mut() = key;
+        clear(&self.picker);
+        self.picker.append(&workspace_picker(ui, self.project, "board"));
+    }
     fn task(&self, id: i64) -> Option<Value> {
         self.tasks
             .borrow()
@@ -853,13 +886,17 @@ impl Board {
         });
     }
     /// Moves a task to `column` (at a final index when given). Done is reached by approval,
-    /// which links the project checkout's HEAD exactly as the task editor's Approve does.
+    /// exactly as the task editor's Approve: the engine links the last agent's branch tip, or
+    /// the project HEAD for a task that was never dispatched.
     fn move_to(self: &Rc<Self>, task: &Value, column: &str, position: Option<usize>) {
         let from = text(task, "column");
         if column == "done" {
             if from != "done" {
                 if let Some(ui) = self.ui() {
-                    ui.show_error(&format!("Approved #{} into Done · Ctrl+Z undoes it", task["id"]));
+                    ui.show_error(&format!(
+                        "Approved #{} into Done · Ctrl+Z moves it back; the linked commit stays",
+                        task["id"]
+                    ));
                 }
                 self.act("task.approve", json!({"task_id":task["id"]}));
             }
@@ -980,7 +1017,7 @@ impl Board {
     }
 
     fn open_quick(self: &Rc<Self>, column: &str) {
-        let at = QUICK_COLUMNS.iter().position(|c| *c == column).unwrap_or(0);
+        let at = OPEN_COLUMNS.iter().position(|c| *c == column).unwrap_or(0);
         self.quick.column.set_selected(at as u32);
         self.quick.note.set_text("");
         self.quick.bar.set_visible(true);
@@ -1004,11 +1041,12 @@ impl Board {
         let payload = json!({
             "project_id": self.project,
             "title": title,
-            "column": pick(&self.quick.column, &QUICK_COLUMNS),
+            "column": pick(&self.quick.column, OPEN_COLUMNS),
             "type": pick(&self.quick.kind, &TYPES),
-            "priority": pick(&self.quick.priority, &QUICK_PRIORITIES),
+            "priority": pick(&self.quick.priority, &PRIORITIES),
         });
-        self.quick.title.set_sensitive(false);
+        // The whole bar, Create included, waits for the reply: a second click would create twice.
+        self.quick.bar.set_sensitive(false);
         let board = self.clone();
         glib::spawn_future_local(async move {
             match ui.call("task.create", payload).await {
@@ -1021,7 +1059,7 @@ impl Board {
                 }
                 Err(error) => board.quick.note.set_text(&error.to_string()),
             }
-            board.quick.title.set_sensitive(true);
+            board.quick.bar.set_sensitive(true);
             board.quick.title.grab_focus();
             ui.refresh_page();
         });
@@ -1040,13 +1078,14 @@ impl Board {
             self.content.grab_focus();
         }
     }
-    /// The focused card as (column, index in its lane), if focus is on one.
+    /// The focused card as (column, index in its lane), if focus is on one. A button inside the
+    /// card, or its menu, is not the card: Enter and Space press it.
     fn current(&self) -> Option<(String, usize)> {
         let focus = self.page.root().and_then(|root| root.focus())?;
         self.layout.borrow().iter().find_map(|(column, cards)| {
             cards
                 .iter()
-                .position(|(_, card)| focus == *card || focus.is_ancestor(card))
+                .position(|(_, card)| focus == *card)
                 .map(|at| (column.clone(), at))
         })
     }
@@ -1072,13 +1111,20 @@ impl Board {
         let focus = self.page.root().and_then(|root| root.focus());
         let mut ancestor = focus.clone();
         while let Some(widget) = ancestor {
-            if widget.is::<gtk::Editable>() || widget.is::<gtk::TextView>() {
+            // Menus and pickers keep their own keys: arrows, Enter and Escape act inside them.
+            if widget.is::<gtk::Editable>() || widget.is::<gtk::TextView>() || widget.is::<gtk::Popover>() {
                 return glib::Propagation::Proceed;
             }
             ancestor = widget.parent();
         }
-        if mods.contains(gdk::ModifierType::CONTROL_MASK) && key == Key::z {
-            self.undo.emit_clicked();
+        // Caps Lock sends uppercase letters without Shift: the intent to reorder is Shift alone.
+        let key = key.to_lower();
+        let shift = mods.contains(gdk::ModifierType::SHIFT_MASK);
+        if mods.contains(gdk::ModifierType::CONTROL_MASK) && !shift && key == Key::z {
+            // emit_clicked runs even while an undo is in flight and the key is insensitive.
+            if self.undo.is_sensitive() {
+                self.undo.emit_clicked();
+            }
             return glib::Propagation::Stop;
         }
         if mods.intersects(
@@ -1088,7 +1134,6 @@ impl Board {
         ) {
             return glib::Propagation::Proceed;
         }
-        let shift = mods.contains(gdk::ModifierType::SHIFT_MASK);
         let lanes: Vec<(String, usize)> = self
             .layout
             .borrow()
@@ -1106,8 +1151,8 @@ impl Board {
         let card_command = matches!(
             key,
             Key::Return | Key::KP_Enter | Key::ISO_Enter | Key::space | Key::period | Key::Menu
-                | Key::bracketleft | Key::bracketright | Key::p | Key::J | Key::K
-        ) || (shift && matches!(key, Key::Up | Key::Down));
+                | Key::bracketleft | Key::bracketright | Key::p
+        ) || (shift && matches!(key, Key::j | Key::k | Key::Up | Key::Down));
         if card_command && task.is_none() {
             return glib::Propagation::Proceed;
         }
@@ -1123,7 +1168,7 @@ impl Board {
                     return glib::Propagation::Proceed;
                 }
             }
-            Key::J | Key::K if shift => self.nudge(task.as_ref(), if key == Key::J { 1 } else { -1 }),
+            Key::j | Key::k if shift => self.nudge(task.as_ref(), if key == Key::j { 1 } else { -1 }),
             Key::Down | Key::Up if shift => {
                 self.nudge(task.as_ref(), if key == Key::Down { 1 } else { -1 })
             }
@@ -1197,24 +1242,20 @@ impl Board {
             }
             Key::bracketleft | Key::bracketright => {
                 if let Some(task) = task {
-                    let at = COLUMNS
-                        .iter()
-                        .position(|(c, _)| *c == text(&task, "column"))
-                        .unwrap_or(0) as i64;
-                    let next = (at + if key == Key::bracketleft { -1 } else { 1 }).clamp(0, 4);
+                    let at = COLUMNS.iter().position(|c| *c == text(&task, "column")).unwrap_or(0) as i64;
+                    let next = (at + if key == Key::bracketleft { -1 } else { 1 }).clamp(0, COLUMNS.len() as i64 - 1);
                     if next != at {
                         self.focused.set(task["id"].as_i64());
-                        self.move_to(&task, COLUMNS[next as usize].0, None);
+                        self.move_to(&task, COLUMNS[next as usize], None);
                     }
                 }
             }
             Key::p => {
                 if let Some(task) = task {
-                    let order = ["low", "medium", "high", "urgent"];
-                    let at = order.iter().position(|p| *p == text(&task, "priority")).unwrap_or(1);
+                    let at = PRIORITIES.iter().position(|p| *p == text(&task, "priority")).unwrap_or(1);
                     if let Some(id) = task["id"].as_i64() {
                         self.focused.set(Some(id));
-                        self.set_field(id, "priority", json!(order[(at + 1) % 4]));
+                        self.set_field(id, "priority", json!(PRIORITIES[(at + 1) % PRIORITIES.len()]));
                     }
                 }
             }
@@ -1288,7 +1329,7 @@ impl Board {
             .root()
             .and_then(|root| root.focus())
             .is_some_and(|focus| focus.is_ancestor(&self.content));
-        let saved: Vec<f64> = self.scrolls.borrow().iter().map(|a| a.value()).collect();
+        let saved: BTreeMap<String, f64> = self.scrolls.borrow().iter().map(|(role, a)| (role.clone(), a.value())).collect();
         clear(&self.content);
         self.layout.borrow_mut().clear();
         self.scrolls.borrow_mut().clear();
@@ -1318,16 +1359,15 @@ impl Board {
         self.render_strip(&tasks, &visible);
         if tasks.is_empty() {
             self.render_empty();
-        } else if self.list.get() {
-            self.render_list(&tasks, &visible);
         } else {
-            self.render_columns(&tasks, &visible);
+            self.render_lanes(&tasks, &visible);
         }
-        // Keep each scroller where it was: restore once the new content has its size.
-        for (adjustment, value) in self.scrolls.borrow().iter().zip(saved) {
-            if value <= 0. {
+        // Keep each scroller where it was: restore once the new content has its size. A scroller
+        // the last render did not have (another view, a column shown again) starts at the top.
+        for (role, adjustment) in self.scrolls.borrow().iter() {
+            let Some(value) = saved.get(role).copied().filter(|v| *v > 0.) else {
                 continue;
-            }
+            };
             let done = Cell::new(false);
             adjustment.connect_changed(move |a| {
                 if !done.get() && a.upper() - a.page_size() >= value {
@@ -1385,7 +1425,7 @@ impl Board {
         clear(&self.strip);
         self.strip.append(&label("COLUMNS", "board-strip-caption"));
         let hidden = self.hidden.borrow().clone();
-        for (column, title) in COLUMNS {
+        for (column, title) in COLUMN_TITLES {
             let shown = visible.iter().filter(|t| text(t, "column") == column).count();
             let chip = gtk::ToggleButton::new();
             chip.add_css_class("column-chip");
@@ -1500,9 +1540,9 @@ impl Board {
             (
                 "priority",
                 "Priority",
-                PRIORITIES.iter().map(|t| (t.to_string(), t.to_string())).collect(),
+                URGENT_FIRST.iter().map(|t| (t.to_string(), t.to_string())).collect(),
             ),
-            ("size", "Size", ["S", "M", "L"].iter().map(|t| (t.to_string(), t.to_string())).collect()),
+            ("size", "Size", SIZES[1..].iter().map(|t| (t.to_string(), t.to_string())).collect()),
         ];
         let mut modules = BTreeMap::new();
         let mut labels = BTreeSet::new();
@@ -1690,74 +1730,109 @@ impl Board {
                 return false;
             };
             let Some(task) = board.task(id) else { return false };
-            if text(&task, "column") == column {
-                return false;
-            }
             board.focused.set(Some(id));
+            if text(&task, "column") == column {
+                // Below the last card of its own lane: to the bottom, unless it is already there.
+                let order = board.column_order(column);
+                if column == "done" || order.last() == Some(&id) {
+                    return false;
+                }
+                board.move_to(&task, column, Some(order.len() - 1));
+                return true;
+            }
             board.move_to(&task, column, None);
             true
         });
         widget.add_controller(drop);
     }
 
-    fn render_columns(self: &Rc<Self>, tasks: &[Value], visible: &[&Value]) {
-        let grid = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        grid.add_css_class("board-grid");
-        grid.set_homogeneous(true);
-        let scroller = gtk::ScrolledWindow::builder()
-            .hscrollbar_policy(gtk::PolicyType::Automatic)
-            .vscrollbar_policy(gtk::PolicyType::Never)
-            .vexpand(true)
-            .hexpand(true)
-            .child(&grid)
-            .build();
-        self.scrolls.borrow_mut().push(scroller.hadjustment());
-        self.content.append(&scroller);
+    /// The columns view, or the list view when `self.list` is set: one lane (or list section)
+    /// per shown column, each with its head, drop target, empty note, group headings and
+    /// cards (or rows).
+    fn render_lanes(self: &Rc<Self>, tasks: &[Value], visible: &[&Value]) {
+        let list = self.list.get();
+        let outer = if list {
+            let rows = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            rows.add_css_class("board-list");
+            let scroll = crate::app::scrolled(&rows);
+            scroll.set_hscrollbar_policy(gtk::PolicyType::Never);
+            self.scrolls.borrow_mut().push(("list".into(), scroll.vadjustment()));
+            self.content.append(&scroll);
+            rows
+        } else {
+            let grid = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            grid.add_css_class("board-grid");
+            grid.set_homogeneous(true);
+            let scroller = gtk::ScrolledWindow::builder()
+                .hscrollbar_policy(gtk::PolicyType::Automatic)
+                .vscrollbar_policy(gtk::PolicyType::Never)
+                .vexpand(true)
+                .hexpand(true)
+                .child(&grid)
+                .build();
+            self.scrolls.borrow_mut().push(("board".into(), scroller.hadjustment()));
+            self.content.append(&scroller);
+            grid
+        };
         let grouping = self.group.borrow().clone();
         let hidden = self.hidden.borrow().clone();
         let all = by_id(tasks);
         if hidden.len() == COLUMNS.len() {
             let all = label("Every column is hidden. Turn one back on in the COLUMNS strip.", "board-empty");
             all.set_halign(gtk::Align::Center);
-            grid.append(&all);
+            outer.append(&all);
         }
-        for (column, _) in COLUMNS {
+        for &column in COLUMNS {
             if hidden.contains(column) {
                 continue;
             }
             let total = tasks.iter().filter(|t| text(t, "column") == column).count();
             let shown = self.sorted(visible, column);
-            let lane = gtk::Box::new(gtk::Orientation::Vertical, 0);
-            lane.add_css_class("board-lane");
-            lane.add_css_class(&format!("lane-{column}"));
-            lane.set_size_request(232, -1);
-            lane.append(&self.lane_head(column, shown.len(), total, "lane-head"));
-            let cards = gtk::Box::new(gtk::Orientation::Vertical, 6);
-            cards.add_css_class("board-cards");
-            let scroll = crate::app::scrolled(&cards);
-            scroll.set_hscrollbar_policy(gtk::PolicyType::Never);
-            self.scrolls.borrow_mut().push(scroll.vadjustment());
-            lane.append(&scroll);
+            // A list section holds its rows itself; a lane scrolls its cards under its head.
+            let (lane, items) = if list {
+                let section = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                section.add_css_class("list-section");
+                section.append(&self.lane_head(column, shown.len(), total, "list-head"));
+                (section.clone(), section)
+            } else {
+                let lane = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                lane.add_css_class("board-lane");
+                lane.add_css_class(&format!("lane-{column}"));
+                lane.set_size_request(232, -1);
+                lane.append(&self.lane_head(column, shown.len(), total, "lane-head"));
+                let cards = gtk::Box::new(gtk::Orientation::Vertical, 6);
+                cards.add_css_class("board-cards");
+                let scroll = crate::app::scrolled(&cards);
+                scroll.set_hscrollbar_policy(gtk::PolicyType::Never);
+                self.scrolls.borrow_mut().push((format!("lane:{column}"), scroll.vadjustment()));
+                lane.append(&scroll);
+                (lane, cards)
+            };
             self.lane_drop(&lane, column);
-            let mut placed = Vec::new();
             if shown.is_empty() {
-                cards.append(&self.empty_lane(column, total > 0));
+                if list {
+                    items.append(&label(if total > 0 { "No matches" } else { "All quiet" }, "list-empty"));
+                } else {
+                    items.append(&self.empty_lane(column, total > 0));
+                }
             }
+            let heading = if list { "list-group-heading" } else { "board-group-heading" };
+            let mut placed = Vec::new();
             let mut previous: Option<String> = None;
             for task in shown {
                 if !grouping.is_empty() {
                     let group = group_of(task, &grouping);
                     if previous.as_ref() != Some(&group) {
-                        cards.append(&label(&group_title(&group, &grouping), "board-group-heading"));
+                        items.append(&label(&group_title(&group), heading));
                         previous = Some(group);
                     }
                 }
-                let card = self.card(task, &all);
-                cards.append(&card);
-                placed.push((task["id"].as_i64().unwrap_or(0), card.upcast()));
+                let item = if list { self.row(task, &all) } else { self.card(task, &all) };
+                items.append(&item);
+                placed.push((task["id"].as_i64().unwrap_or(0), item.upcast()));
             }
             self.layout.borrow_mut().push((column.to_string(), placed));
-            grid.append(&lane);
+            outer.append(&lane);
         }
     }
 
@@ -1875,12 +1950,7 @@ impl Board {
             rollup.append(&label(&format!("{finished}/{total} sub-tasks"), "task-lineage"));
             card.append(&rollup);
         }
-        let blockers: Vec<&Value> = rows(task, "blocked_by")
-            .into_iter()
-            .filter_map(|other| {
-                other.as_i64().and_then(|other| all.get(&other)).copied().filter(|t| text(t, "column") != "done")
-            })
-            .collect();
+        let blockers = open_blockers(task, all);
         if !blockers.is_empty() && !done {
             let line = gtk::Box::new(gtk::Orientation::Horizontal, 5);
             line.add_css_class("card-blocked");
@@ -1951,52 +2021,6 @@ impl Board {
         card
     }
 
-    fn render_list(self: &Rc<Self>, tasks: &[Value], visible: &[&Value]) {
-        let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        list.add_css_class("board-list");
-        let scroll = crate::app::scrolled(&list);
-        scroll.set_hscrollbar_policy(gtk::PolicyType::Never);
-        self.scrolls.borrow_mut().push(scroll.vadjustment());
-        self.content.append(&scroll);
-        let hidden = self.hidden.borrow().clone();
-        let grouping = self.group.borrow().clone();
-        let all = by_id(tasks);
-        for (column, _) in COLUMNS {
-            if hidden.contains(column) {
-                continue;
-            }
-            let total = tasks.iter().filter(|t| text(t, "column") == column).count();
-            let shown = self.sorted(visible, column);
-            let section = gtk::Box::new(gtk::Orientation::Vertical, 0);
-            section.add_css_class("list-section");
-            section.append(&self.lane_head(column, shown.len(), total, "list-head"));
-            self.lane_drop(&section, column);
-            let mut placed = Vec::new();
-            if shown.is_empty() {
-                let empty = label(
-                    if total > 0 { "No matches" } else { "All quiet" },
-                    "list-empty",
-                );
-                section.append(&empty);
-            }
-            let mut previous: Option<String> = None;
-            for task in shown {
-                if !grouping.is_empty() {
-                    let group = group_of(task, &grouping);
-                    if previous.as_ref() != Some(&group) {
-                        section.append(&label(&group_title(&group, &grouping), "list-group-heading"));
-                        previous = Some(group);
-                    }
-                }
-                let row = self.row(task, &all);
-                section.append(&row);
-                placed.push((task["id"].as_i64().unwrap_or(0), row.upcast()));
-            }
-            self.layout.borrow_mut().push((column.to_string(), placed));
-            list.append(&section);
-        }
-    }
-
     fn row(self: &Rc<Self>, task: &Value, all: &BTreeMap<i64, &Value>) -> gtk::Box {
         let id = task["id"].as_i64().unwrap_or(0);
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 9);
@@ -2039,10 +2063,7 @@ impl Board {
                 "list-meta",
             ));
         }
-        let blocked = rows(task, "blocked_by")
-            .iter()
-            .any(|other| other.as_i64().and_then(|other| all.get(&other)).is_some_and(|t| text(t, "column") != "done"));
-        if blocked && text(task, "column") != "done" {
+        if !open_blockers(task, all).is_empty() && text(task, "column") != "done" {
             let lamp = lamp("blocked-lamp");
             lamp.set_tooltip_text(Some("Blocked by an open task"));
             row.append(&lamp);
@@ -2256,10 +2277,14 @@ impl Board {
         menu.append(&section("MOVE TO"));
         let columns = gtk::Box::new(gtk::Orientation::Horizontal, 2);
         columns.set_homogeneous(true);
-        for (column, title) in COLUMNS {
+        for (column, title) in COLUMN_TITLES {
             let key = button("", "board-menu-choice");
             key.set_child(Some(&status_icon(column, 13)));
-            key.set_tooltip_text(Some(if column == "done" { "Done · approves the task and links the project HEAD" } else { title }));
+            key.set_tooltip_text(Some(if column == "done" {
+                "Done · approves the task and links the last agent's branch tip (the project HEAD if never dispatched)"
+            } else {
+                title
+            }));
             if column == text(&task, "column") {
                 key.add_css_class("selected");
                 key.set_sensitive(false);
@@ -2275,7 +2300,7 @@ impl Board {
         menu.append(&section("PRIORITY"));
         let priorities = gtk::Box::new(gtk::Orientation::Horizontal, 2);
         priorities.set_homogeneous(true);
-        for priority in PRIORITIES {
+        for priority in URGENT_FIRST {
             let key = button("", "board-menu-choice");
             key.set_child(Some(&priority_icon(priority)));
             if priority == text(&task, "priority") {
@@ -2343,7 +2368,7 @@ impl Board {
         pick: impl Fn(&Rc<Board>, &'static str) + Clone + 'static,
     ) -> gtk::MenuButton {
         let name = |value: &str| -> String {
-            if let Some((_, title)) = COLUMNS.iter().find(|(c, _)| *c == value) {
+            if let Some((_, title)) = COLUMN_TITLES.iter().find(|(c, _)| *c == value) {
                 title.to_string()
             } else if value.is_empty() {
                 "None".into()
@@ -2481,7 +2506,7 @@ impl Board {
         prop(
             "Status",
             self.picker(
-                &COLUMNS.map(|(c, _)| c),
+                COLUMNS,
                 &column,
                 |c| Some(status_icon(c, 13).upcast()),
                 move |board, c| board.move_to(&moving, c, None),
@@ -2490,7 +2515,7 @@ impl Board {
         );
         prop(
             "Priority",
-            self.picker(&PRIORITIES, text(&task, "priority"), |p| Some(priority_icon(p).upcast()), move |board, p| {
+            self.picker(&URGENT_FIRST, text(&task, "priority"), |p| Some(priority_icon(p).upcast()), move |board, p| {
                 board.set_field(id, "priority", json!(p));
             })
             .upcast_ref(),
@@ -2525,8 +2550,8 @@ impl Board {
         if let Some(parent) = task["parent_id"].as_i64().and_then(|p| tasks.iter().find(|t| t["id"].as_i64() == Some(p))) {
             prop("Parent", self.task_link(parent).upcast_ref());
         }
-        prop("Updated", &value(&format!("{} ago", ago(text(&task, "updated_at"))).replace("now ago", "just now")));
-        prop("Created", &value(&format!("{} ago", ago(text(&task, "created_at"))).replace("now ago", "just now")));
+        prop("Updated", &value(&since(text(&task, "updated_at"))));
+        prop("Created", &value(&since(text(&task, "created_at"))));
         body.append(&grid);
 
         if let Some(tags) = labels_row(&task, 12) {
@@ -2669,13 +2694,31 @@ mod tests {
     }
     #[test]
     fn ages_read_at_a_glance() {
-        let now = glib::DateTime::from_iso8601("2026-10-05T12:00:00Z", None).unwrap();
-        assert_eq!(ago_between("2026-10-05T11:59:30.123456789Z", &now), "now");
-        assert_eq!(ago_between("2026-10-05T11:15:00Z", &now), "45m");
-        assert_eq!(ago_between("2026-10-05T02:00:00Z", &now), "10h");
-        assert_eq!(ago_between("2026-10-02T12:00:00Z", &now), "3d");
-        assert_eq!(ago_between("2026-09-14T12:00:00Z", &now), "3w");
-        assert_eq!(ago_between("2026-03-01T12:00:00Z", &now), "Mar 1");
-        assert_eq!(ago_between("", &now), "");
+        // The wording itself is relative.rs's; the board owns what an unreadable time shows.
+        let minutes = |m: i32| glib::DateTime::now_utc().unwrap().add_minutes(-m).unwrap().format_iso8601().unwrap().to_string();
+        assert_eq!(ago(&minutes(45)), "45m");
+        assert_eq!(ago(""), "");
+        assert_eq!(since(&minutes(0)), "just now");
+        assert_eq!(since(&minutes(45)), "45m ago");
+        assert_eq!(since(""), "—");
+    }
+    #[test]
+    fn derived_orders_follow_the_one_vocabulary() {
+        assert_eq!(URGENT_FIRST, ["urgent", "high", "medium", "low"]);
+        assert_eq!(COLUMNS, COLUMN_TITLES.map(|(c, _)| c));
+        assert_eq!(OPEN_COLUMNS, &COLUMNS[..COLUMNS.len() - 1]);
+        assert!(!OPEN_COLUMNS.contains(&"done"));
+    }
+    #[test]
+    fn groups_sort_in_their_own_order_with_fallbacks_last() {
+        let sizes: Vec<String> = ["L", "", "S", "M"]
+            .iter()
+            .map(|s| group_of(&json!({"size": s}), "size"))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        assert_eq!(sizes.iter().map(|g| group_title(g)).collect::<Vec<_>>(), ["S", "M", "L", "None"]);
+        assert!(group_of(&json!({"sessions":[]}), "session") > group_of(&json!({"sessions":["zebra"]}), "session"));
+        assert_eq!(group_title(&group_of(&json!({}), "module")), "No module");
     }
 }

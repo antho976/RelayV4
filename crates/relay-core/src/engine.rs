@@ -712,6 +712,17 @@ impl Engine {
             .filter(|p| !p.exited())
             .count()
     }
+    /// Each live session's PTY child pid, with the session's name: the processes whose trees
+    /// may not act as the user on the socket (RA-096). An exited child's pid may already be
+    /// someone else's, so it is left out.
+    pub fn session_pids(&self) -> HashMap<u32, String> {
+        let names: Vec<(String, Id)> = self.pty_ids.lock().unwrap().iter().map(|(name, id)| (name.clone(), *id)).collect();
+        let ptys = self.ptys.lock().unwrap();
+        names
+            .into_iter()
+            .filter_map(|(name, id)| ptys.get(&id).filter(|pty| !pty.exited()).map(|pty| (pty.pid(), name)))
+            .collect()
+    }
     /// Kill every child (SPEC §14 persistence model: after a restart PTYs are dead and the
     /// resume flow takes over) and mark their sessions restorable. Idempotent.
     pub fn shutdown(&self) {

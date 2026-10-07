@@ -3,23 +3,41 @@
 # Python on 3-sequences (tuples or mathutils Vectors), bundled after each engine's common.py in
 # every Blender and Unreal script; the engine's body_frame only gathers the rest-pose points.
 
-# ---- left/right from names: .L/.R, _l/_r, -L/-R, Left/Right, l_/r_ prefixes
+# ---- left/right from names: .L/.R, _l/_r, -L/-R suffixes, Left/Right as a word, 3ds Max Biped
+# and CAT's " L "/" R " ("Bip01 L Hand"), l_/r_ prefixes
+import re
 
-PAIRS = [(".L", ".R"), (".l", ".r"), ("_L", "_R"), ("_l", "_r"), ("-L", "-R"), ("Left", "Right"), ("left", "right")]
+PAIRS = [(".L", ".R"), (".l", ".r"), ("_L", "_R"), ("_l", "_r"), ("-L", "-R")]
 PREFIXES = [("l_", "r_"), ("L_", "R_")]
+# LeftHand, hand_left, Hand Left - but not cleft_chin or bright_eye.
+SIDE_WORD = re.compile(r"Left|Right|(?<![A-Za-z])(?:left|right)| [LR] ")
+SIDE_SWAP = {"Left": "Right", "Right": "Left", "left": "right", "right": "left", " L ": " R ", " R ": " L "}
+
+
+def other_side(name):
+    """("left" or "right", the other side's name) for a side-named bone, or None. Suffixes win
+    over words, words over prefixes."""
+    for left, right in PAIRS:
+        if name.endswith(left):
+            return "left", name[: -len(left)] + right
+        if name.endswith(right):
+            return "right", name[: -len(right)] + left
+    m = SIDE_WORD.search(name)
+    if m:
+        word = m.group()
+        return ("left" if word.strip() in ("Left", "left", "L") else "right"), name[: m.start()] + SIDE_SWAP[word] + name[m.end():]
+    for left, right in PREFIXES:
+        if name.startswith(left):
+            return "left", right + name[len(left):]
+        if name.startswith(right):
+            return "right", left + name[len(right):]
+    return None
 
 
 def twin(name):
-    """The right-side twin of a left-side bone name, or None. Suffixes win over prefixes."""
-    for left, right in PAIRS:
-        if name.endswith(left):
-            return name[: -len(left)] + right
-        if left in ("Left", "left") and left in name:
-            return name.replace(left, right, 1)
-    for left, right in PREFIXES:
-        if name.startswith(left):
-            return right + name[len(left):]
-    return None
+    """The right-side twin of a left-side bone name, or None."""
+    s = other_side(name)
+    return s[1] if s and s[0] == "left" else None
 
 
 def left_right_pairs(names):

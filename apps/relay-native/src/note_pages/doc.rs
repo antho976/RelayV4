@@ -1,7 +1,7 @@
 //! One open note: a GtkSourceView Markdown editor, its find/replace bar, go-to-line,
 //! status bar and tab, wrapped around the shared `Draft` that owns its dirty state.
 use super::glyphs::glyph;
-use super::text::{self as tx, Enter, Prefix};
+use super::text::{self as tx, Enter, Inline, Prefix};
 use super::*;
 use sourceview5::prelude::*;
 
@@ -40,7 +40,9 @@ pub struct Doc {
     pub tab: gtk::Box,
     tab_dot: gtk::Box,
     tab_label: gtk::Label,
-    null_title: Rc<Cell<bool>>,
+    /// The title as stored, which the engine keeps verbatim: the snapshot reports it unchanged
+    /// while the field shows the same text, so surrounding whitespace is not an edit.
+    stored_title: Rc<RefCell<Value>>,
     pub deleted: Cell<bool>,
     pub conflict: Cell<bool>,
     /// Its project was removed: the tab stays on screen whatever project is shown, and Save
@@ -305,15 +307,22 @@ pub fn build(ui: &Rc<Ui>, note: &Value) -> Rc<Doc> {
     tab.append(&tab_label);
     tab.append(&tab_close);
 
-    let null_title = Rc::new(Cell::new(note["title"].is_null()));
+    let stored_title = Rc::new(RefCell::new(note["title"].clone()));
     let snapshot: Rc<dyn Fn() -> Value> = Rc::new({
         let title = title.clone();
         let buffer = buffer.clone();
-        let null_title = null_title.clone();
+        let stored_title = stored_title.clone();
         move || {
             let value = title.text().trim().to_string();
+            let stored = stored_title.borrow();
             json!({
-                "title": if value.is_empty() && null_title.get() { Value::Null } else { json!(value) },
+                "title": if stored.as_str().is_some_and(|s| s.trim() == value) {
+                    stored.clone()
+                } else if value.is_empty() && stored.is_null() {
+                    Value::Null
+                } else {
+                    json!(value)
+                },
                 "body": buffer_text(buffer.upcast_ref()),
             })
         }
@@ -364,7 +373,7 @@ pub fn build(ui: &Rc<Ui>, note: &Value) -> Rc<Doc> {
         tab,
         tab_dot,
         tab_label,
-        null_title,
+        stored_title,
         deleted: Cell::new(false),
         conflict: Cell::new(false),
         orphan: Cell::new(false),
@@ -494,13 +503,21 @@ pub fn build(ui: &Rc<Ui>, note: &Value) -> Rc<Doc> {
     doc.view.add_controller(keys);
     let wheel = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
     let zoom_ui = Rc::downgrade(ui);
+    // Touchpads and high-resolution wheels send many small deltas: zoom per whole notch.
+    let travel = Cell::new(0.0);
     wheel.connect_scroll(move |wheel, _, dy| {
         if wheel.current_event_state().contains(gtk::gdk::ModifierType::CONTROL_MASK) {
-            if let Some(ui) = zoom_ui.upgrade() {
-                super::zoom(&ui, if dy < 0. { 1 } else { -1 });
+            let pixels = wheel.unit() == gtk::gdk::ScrollUnit::Surface;
+            let (steps, rest) = tx::zoom_notches(travel.get(), dy, pixels);
+            travel.set(rest);
+            if steps != 0 {
+                if let Some(ui) = zoom_ui.upgrade() {
+                    super::zoom(&ui, steps.signum());
+                }
             }
             return glib::Propagation::Stop;
         }
+        travel.set(0.0);
         glib::Propagation::Proceed
     });
     doc.view.add_controller(wheel);
@@ -538,7 +555,7 @@ impl Doc {
     }
 
     pub fn set_base(&self, note: Value) {
-        self.null_title.set(note["title"].is_null());
+        *self.stored_title.borrow_mut() = note["title"].clone();
         *self.draft.base.borrow_mut() = note;
         self.sync_pin();
         self.update_meta();
@@ -862,6 +879,12 @@ impl Doc {
 
     /// F3 / Shift+F3 and the bar's arrows. Works with the bar closed, using the last query.
     pub fn find_step(&self, backward: bool) {
+        // Taken first: filling in the last query selects its first match (find_incremental),
+        // and stepping on from that selection would skip it.
+        let (start, end) = self.buffer.selection_bounds().unwrap_or_else(|| {
+            let at = self.buffer.iter_at_mark(&self.buffer.get_insert());
+            (at, at)
+        });
         if self.find.query.text().is_empty() {
             self.find.query.set_text(&super::last_query());
         }
@@ -870,10 +893,6 @@ impl Doc {
             self.open_find(false);
             return;
         }
-        let (start, end) = self.buffer.selection_bounds().unwrap_or_else(|| {
-            let at = self.buffer.iter_at_mark(&self.buffer.get_insert());
-            (at, at)
-        });
         let found = if backward { self.search.backward(&start) } else { self.search.forward(&end) };
         self.select_match(found);
         self.update_count();
@@ -997,25 +1016,33 @@ impl Doc {
             let selected = buffer.text(&start, &end, false).to_string();
             let length = selected.chars().count() as i32;
             let at = start.offset();
-            let room = at >= b && end.offset() + a <= buffer.char_count();
-            let mut outer_start = buffer.iter_at_offset((at - b).max(0));
-            let mut outer_end = buffer.iter_at_offset(end.offset() + a);
-            if room
-                && buffer.text(&outer_start, &start, false) == before
-                && buffer.text(&end, &outer_end, false) == after
-            {
-                buffer.delete(&mut outer_start, &mut outer_end);
-                buffer.insert(&mut buffer.iter_at_offset(at - b), &selected);
-                self.select_offsets(at - b, at - b + length);
-            } else if length >= b + a && selected.starts_with(before) && selected.ends_with(after) {
-                let inner: String = selected.chars().skip(b as usize).take((length - b - a) as usize).collect();
-                buffer.delete(&mut start, &mut end);
-                buffer.insert(&mut buffer.iter_at_offset(at), &inner);
-                self.select_offsets(at, at + length - b - a);
-            } else {
-                buffer.delete(&mut start, &mut end);
-                buffer.insert(&mut buffer.iter_at_offset(at), &format!("{before}{selected}{after}"));
-                self.select_offsets(at + b, at + b + length);
+            let mut line_start = start;
+            line_start.set_line_offset(0);
+            let mut line_end = end;
+            if !line_end.ends_line() {
+                line_end.forward_to_line_end();
+            }
+            let ahead = buffer.text(&line_start, &start, false);
+            let behind = buffer.text(&end, &line_end, false);
+            match tx::inline_toggle(&ahead, &selected, &behind, before, after) {
+                Inline::Outside => {
+                    let mut outer_start = buffer.iter_at_offset(at - b);
+                    let mut outer_end = buffer.iter_at_offset(end.offset() + a);
+                    buffer.delete(&mut outer_start, &mut outer_end);
+                    buffer.insert(&mut buffer.iter_at_offset(at - b), &selected);
+                    self.select_offsets(at - b, at - b + length);
+                }
+                Inline::Inside => {
+                    let inner: String = selected.chars().skip(b as usize).take((length - b - a) as usize).collect();
+                    buffer.delete(&mut start, &mut end);
+                    buffer.insert(&mut buffer.iter_at_offset(at), &inner);
+                    self.select_offsets(at, at + length - b - a);
+                }
+                Inline::Wrap => {
+                    buffer.delete(&mut start, &mut end);
+                    buffer.insert(&mut buffer.iter_at_offset(at), &format!("{before}{selected}{after}"));
+                    self.select_offsets(at + b, at + b + length);
+                }
             }
         } else {
             let at = buffer.cursor_position();
@@ -1212,7 +1239,7 @@ pub fn save(ui: &Rc<Ui>, doc: &Rc<Doc>, then: AfterSave) {
                     "Not saved: this note changed somewhere else since you opened it. Your text is untouched.",
                     vec![
                         ("Save as new note", |ui, doc| save_as(ui, doc)),
-                        ("Reload theirs", |ui, doc| reload(ui, doc, false)),
+                        ("Reload theirs", |ui, doc| reload(ui, doc, true)),
                     ],
                 );
             }
@@ -1240,7 +1267,7 @@ pub fn deleted_notice(ui: &Rc<Ui>, doc: &Rc<Doc>) {
         },
         vec![
             ("Save as new note", |ui, doc| save_as(ui, doc)),
-            ("Close", |ui, doc| discard_close(ui, doc)),
+            ("Close", |ui, doc| request_close(ui, doc)),
         ],
     );
 }
@@ -1263,11 +1290,17 @@ pub fn save_as(ui: &Rc<Ui>, doc: &Rc<Doc>) {
     }
     doc.draft.busy.set(true);
     doc.refresh_state(ui);
-    let mut title = doc.name();
-    if !doc.deleted.get() && snapshot["title"] == doc.draft.base.borrow()["title"] {
-        title = format!("{title} (copy)");
+    // An unchanged title is marked as the copy's; a deleted note's text keeps its own.
+    let typed = text(&snapshot, "title");
+    let title = if !doc.deleted.get() && snapshot["title"] == doc.draft.base.borrow()["title"] {
+        tx::copy_title(typed)
+    } else {
+        Some(typed.trim().to_string()).filter(|t| !t.is_empty())
+    };
+    let mut payload = json!({"project_id":project,"body":snapshot["body"],"pinned":false});
+    if let Some(title) = title {
+        payload["title"] = json!(title);
     }
-    let payload = json!({"project_id":project,"title":title,"body":snapshot["body"],"pinned":false});
     let (ui, doc) = (ui.clone(), doc.clone());
     glib::spawn_future_local(async move {
         let result = ui.call("notes.create", payload).await;
@@ -1350,6 +1383,23 @@ pub fn discard_close(_ui: &Rc<Ui>, doc: &Rc<Doc>) {
     doc.draft.close();
 }
 
+/// Close after a save, unless text was typed while it was in flight. Draft's own refusal
+/// goes to a status label this page took off screen, so the notice bar says it instead.
+fn close_saved(ui: &Rc<Ui>, doc: &Rc<Doc>) {
+    if doc.draft.busy.get() || doc.dirty() {
+        doc.show_notice(
+            ui,
+            "Not closed: this note changed while it was being saved.",
+            vec![
+                ("Save and close", |ui, doc| save(ui, doc, Some(Box::new(close_saved)))),
+                ("Discard and close", discard_close),
+            ],
+        );
+        return;
+    }
+    doc.draft.close();
+}
+
 /// Ctrl+W, the tab's close button and middle-click.
 pub fn request_close(ui: &Rc<Ui>, doc: &Rc<Doc>) {
     if doc.draft.busy.get() {
@@ -1360,7 +1410,7 @@ pub fn request_close(ui: &Rc<Ui>, doc: &Rc<Doc>) {
         return;
     }
     if super::prefs().autosave && !doc.deleted.get() && !doc.conflict.get() {
-        save(ui, doc, Some(Box::new(|_, doc| doc.draft.close())));
+        save(ui, doc, Some(Box::new(close_saved)));
         return;
     }
     let (ui, doc) = (ui.clone(), doc.clone());
@@ -1379,7 +1429,7 @@ pub fn request_close(ui: &Rc<Ui>, doc: &Rc<Doc>) {
                 if doc.deleted.get() {
                     save_as(&ui, &doc);
                 } else {
-                    save(&ui, &doc, Some(Box::new(|_, doc| doc.draft.close())));
+                    save(&ui, &doc, Some(Box::new(close_saved)));
                 }
             }
             _ => {}

@@ -11,7 +11,10 @@ elif ARGS["action"] == "import":
         ok = lib.fill_data_table_from_csv_string(table, ARGS["text"]) if fmt == "csv" else lib.fill_data_table_from_json_string(table, ARGS["text"])
     if not ok:
         raise RuntimeError("the engine rejected the %s; read the log (ue_log filter LogDataTable) for the row and column" % fmt)
-    save_asset(table)
-    emit({"path": ARGS["path"], "rows": len(lib.get_data_table_row_names(table)), "saved": True})
+    saved = save_asset(table)
+    result = {"path": ARGS["path"], "rows": len(lib.get_data_table_row_names(table)), "saved": saved}
+    if not saved:
+        result["note"] = "the table is filled in the open editor but did not save (read-only or checked-out file?); save it there"
+    emit(result)
 else:
     raise RuntimeError("action must be export or import")

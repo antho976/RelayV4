@@ -10,12 +10,20 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::future::Future;
 use std::io::{BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use tokio::sync::mpsc;
 
 const FALLBACK_PROTOCOL: &str = "2025-06-18";
 const SUPPORTED_PROTOCOLS: &[&str] = &["2026-07-28", "2025-11-25", FALLBACK_PROTOCOL];
+/// Images one plugin call may return; each is a full PNG in the agent's context.
+const MAX_IMAGES: usize = 16;
+
+/// The protocol revision to answer an `initialize` with: the client's, when this side speaks it.
+fn protocol(message: &Value) -> &'static str {
+    let requested = message.pointer("/params/protocolVersion").and_then(Value::as_str).unwrap_or(FALLBACK_PROTOCOL);
+    SUPPORTED_PROTOCOLS.iter().copied().find(|version| *version == requested).unwrap_or(FALLBACK_PROTOCOL)
+}
 
 pub async fn serve(instance: Instance, actor: Actor, token: Option<String>) -> Result<u8> {
     dispatch(stdin_lines(), Output::stdout(), move |message| {
@@ -128,6 +136,89 @@ fn serve_sync_on(input: impl BufRead, output: Output, handle: fn(&Value) -> Opti
     Ok(0)
 }
 
+/// A plugin server (`blender-mcp`, `unreal-mcp`): who it is, its tools and how to run one.
+/// [`plugin_reply`] is the JSON-RPC side they share, so a protocol revision or an error code
+/// changes in one place (RA-590).
+pub(crate) struct PluginServer {
+    pub name: &'static str,
+    pub title: &'static str,
+    pub instructions: &'static str,
+    pub tools: fn() -> Vec<Value>,
+    pub call: fn(&str, &Value) -> Result<Value>,
+}
+
+/// The answer to one message for `server`, or `None` for a notification.
+pub(crate) fn plugin_reply(server: &PluginServer, message: &Value) -> Option<Value> {
+    let id = message.get("id").cloned()?;
+    let result = match message.get("method").and_then(Value::as_str) {
+        Some("initialize") => json!({
+            "protocolVersion": protocol(message),
+            "capabilities": {"tools":{"listChanged":false}},
+            "serverInfo": {"name":server.name,"title":server.title,"version":env!("CARGO_PKG_VERSION")},
+            "instructions": server.instructions
+        }),
+        Some("ping") => json!({}),
+        Some("tools/list") => json!({"tools": (server.tools)()}),
+        Some("tools/call") => {
+            let Some(name) = message.pointer("/params/name").and_then(Value::as_str) else {
+                return Some(rpc_error(id, -32602, "Invalid params", Some(json!({"message":"tools/call requires params.name"}))));
+            };
+            let arguments = message.pointer("/params/arguments").cloned().unwrap_or_else(|| json!({}));
+            if !(server.tools)().iter().any(|tool| tool["name"] == name) {
+                return Some(rpc_error(id, -32602, "Unknown tool", Some(json!({"name":name}))));
+            }
+            match (server.call)(name, &arguments) {
+                Ok(value) => tool_result(value, false),
+                Err(error) => tool_result(json!({"error": format!("{error:#}")}), true),
+            }
+        }
+        Some(other) => return Some(rpc_error(id, -32601, "Method not found", Some(json!({"method":other})))),
+        None => return Some(rpc_error(id, -32600, "Invalid Request", None)),
+    };
+    Some(json!({"jsonrpc":"2.0","id":id,"result":result}))
+}
+
+/// A plugin tool's MCP description.
+pub(crate) fn tool(name: &str, description: &str, properties: Value, required: &[&str], read_only: bool) -> Value {
+    json!({
+        "name": name,
+        "description": description,
+        "inputSchema": {"type":"object","properties":properties,"required":required,"additionalProperties":false},
+        "annotations": {"readOnlyHint": read_only, "destructiveHint": !read_only, "openWorldHint": false}
+    })
+}
+
+/// A plugin call's result as MCP content. `_images` (label and PNG path) become image content,
+/// up to [`MAX_IMAGES`]; `_cleanup` names a folder of them to delete once they are read.
+pub(crate) fn tool_result(mut value: Value, is_error: bool) -> Value {
+    let images = value.as_object_mut().and_then(|o| o.remove("_images")).and_then(|v| v.as_array().cloned()).unwrap_or_default();
+    let cleanup = value.as_object_mut().and_then(|o| o.remove("_cleanup"));
+    let mut content = Vec::new();
+    let mut shown = Vec::new();
+    for image in images.iter().take(MAX_IMAGES) {
+        let Some(path) = image["path"].as_str() else { continue };
+        if let Ok(bytes) = std::fs::read(path) {
+            use base64::Engine as _;
+            content.push(json!({"type":"text","text":format!("Image: {}", image["label"].as_str().unwrap_or(""))}));
+            content.push(json!({"type":"image","data":base64::engine::general_purpose::STANDARD.encode(bytes),"mimeType":"image/png"}));
+            shown.push(image["label"].clone());
+        }
+    }
+    if !images.is_empty() {
+        value["images"] = json!({"shown": shown, "requested": images.len(), "limit": MAX_IMAGES});
+    }
+    if let Some(dir) = cleanup.as_ref().and_then(Value::as_str) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    let text = serde_json::to_string_pretty(&value).unwrap_or_default();
+    content.insert(0, json!({"type":"text","text":text}));
+    let mut result = json!({"content":content,"isError":is_error});
+    if !is_error {
+        result["structuredContent"] = value;
+    }
+    result
+}
+
 fn stdin_lines() -> mpsc::UnboundedReceiver<std::io::Result<String>> {
     let (sender, receiver) = mpsc::unbounded_channel();
     std::thread::spawn(move || {
@@ -217,7 +308,8 @@ fn plugin_instance() -> Result<Instance> {
 /// as a plain MCP server. Inside one, an engine that does not answer blocks the call.
 pub(crate) fn plugin_gate(tool: &str, file: Option<&Path>, writes: &[&Path]) -> Result<()> {
     let Some(session) = std::env::var("RELAY_SESSION").ok().filter(|s| !s.is_empty()) else { return Ok(()) };
-    let payloads = plugin_gate_payloads(&session, crate::hook_root(&json!({})).as_deref(), tool, file, writes)?;
+    let root = std::env::var_os("RELAY_WORKTREE").map(PathBuf::from).or_else(|| std::env::current_dir().ok());
+    let payloads = plugin_gate_payloads(&session, root.as_deref(), tool, file, writes);
     if cfg!(test) {
         // Unit tests run inside agent sessions; they must not reach the live engine.
         return Ok(());
@@ -261,18 +353,24 @@ pub(crate) fn session_write_roots() -> Result<Vec<std::path::PathBuf>> {
     Ok(result["write_roots"].as_array().into_iter().flatten().filter_map(Value::as_str).map(std::path::PathBuf::from).collect())
 }
 
-fn plugin_gate_payloads(session: &str, root: Option<&Path>, tool: &str, file: Option<&Path>, writes: &[&Path]) -> Result<Vec<Value>> {
+fn plugin_gate_payloads(session: &str, root: Option<&Path>, tool: &str, file: Option<&Path>, writes: &[&Path]) -> Vec<Value> {
+    // The file a command names is worktree-relative, as exec rules write it; the plugins hand
+    // over files they have already resolved inside the checkout.
     let command = match file {
-        Some(file) => format!("{tool} {}", crate::hook_relative_path(root, &file.to_string_lossy())?),
+        Some(file) => {
+            let root = root.map(|root| std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()));
+            let named = root.as_deref().and_then(|root| file.strip_prefix(root).ok()).unwrap_or(file);
+            format!("{tool} {}", named.display())
+        }
         None => tool.to_string(),
     };
     let mut payloads = vec![json!({"session": session, "kind": "exec", "command": command})];
     for path in writes {
         // Binary files: no text to judge, so the empty diff of an edit in place; the path rules
         // still meet it.
-        payloads.push(crate::write_gate(root, session, path, "diff", json!(""))?);
+        payloads.push(crate::write_gate(session, path, "diff", json!("")));
     }
-    Ok(payloads)
+    payloads
 }
 
 async fn handle(instance: Instance, actor: &Actor, token: Option<&str>, message: Value) -> Option<Value> {
@@ -283,10 +381,8 @@ async fn handle(instance: Instance, actor: &Actor, token: Option<&str>, message:
     };
     let result = match method {
         Some("initialize") => {
-            let requested = message.pointer("/params/protocolVersion").and_then(Value::as_str).unwrap_or(FALLBACK_PROTOCOL);
-            let protocol = SUPPORTED_PROTOCOLS.iter().copied().find(|version| *version == requested).unwrap_or(FALLBACK_PROTOCOL);
             Ok(json!({
-                "protocolVersion": protocol,
+                "protocolVersion": protocol(&message),
                 "capabilities": {"tools":{"listChanged":false}},
                 "serverInfo": {"name":"relay","title":"Relay command bus","version":env!("CARGO_PKG_VERSION")},
                 "instructions":"Relay's typed command bus. Tool names are bus op names; typed refusals are returned as tool errors. The tool list is filtered to what this session may actually call, all three gating layers applied — if an op is missing, your role cannot call it. Result shapes are not inlined here: `bus.schema {op}` returns one op's full payload and result schema. `session.bootstrap` returns your peers, your callable ops and your guardrails."
@@ -338,22 +434,15 @@ async fn tools(instance: Instance, actor: &Actor, token: Option<&str>) -> Result
         let admitted = match &selection {
             // An explicit RELAY_MCP_OPS is a deliberate override: it selects the set, and the
             // engine still refuses anything the role may not call.
-            Some(patterns) => patterns.iter().any(|pattern| pattern_matches(pattern, name)),
+            // Matched the way role allowlists are, so the two cannot drift apart (RA-590).
+            Some(patterns) => patterns.iter().any(|pattern| relay_core::guardrail::op_matches(pattern, name)),
             None => info["call"] != "no",
         };
-        admitted.then(|| tool(entry))
+        admitted.then(|| op_tool(entry))
     }).collect::<Vec<_>>();
 
     report_tool_count(&mut client, actor, token, tools.len()).await;
     Ok(json!({"tools":tools}))
-}
-
-fn pattern_matches(pattern: &str, op: &str) -> bool {
-    pattern == op
-        || pattern == "*"
-        || pattern
-            .strip_suffix(".*")
-            .is_some_and(|prefix| op.starts_with(prefix) && op.as_bytes().get(prefix.len()) == Some(&b'.'))
 }
 
 /// A session that receives zero tools currently fails in silence — the integration looks
@@ -403,7 +492,7 @@ fn exposed(entry: &OpEntry) -> bool {
         && !matches!(entry.name, "bus.subscribe" | "bus.unsubscribe")
 }
 
-fn tool(entry: &OpEntry) -> Value {
+fn op_tool(entry: &OpEntry) -> Value {
     let schema = relay_bus::schema::render_op(entry.name).expect("registry op has schema");
     // Result schemas are two thirds of this document and are only needed *after* choosing an
     // op. They stay one `bus.schema {op}` call away rather than in every session's context.
@@ -452,7 +541,7 @@ fn tool_error(error: Value, mail: Option<&MailHint>) -> Value {
     json!({"content":content,"isError":true})
 }
 
-fn rpc_error(id: Value, code: i64, message: &str, data: Option<Value>) -> Value {
+pub(crate) fn rpc_error(id: Value, code: i64, message: &str, data: Option<Value>) -> Value {
     let mut error = json!({"code":code,"message":message});
     if let Some(data) = data { error["data"] = data; }
     json!({"jsonrpc":"2.0","id":id,"error":error})
@@ -470,7 +559,7 @@ mod tests {
     #[test]
     fn tool_is_the_bus_schema_and_streams_are_not_exposed() {
         let task = Registry::global().get("task.create").unwrap();
-        let value = tool(task);
+        let value = op_tool(task);
         assert_eq!(value["name"], "task.create");
         assert_eq!(value["inputSchema"]["type"], "object");
         assert!(value["inputSchema"]["required"].as_array().unwrap().iter().any(|item| item == "project_id"));
@@ -485,12 +574,41 @@ mod tests {
     }
 
     #[test]
+    fn plugin_servers_share_one_json_rpc_side() {
+        fn tools() -> Vec<Value> {
+            vec![tool("echo", "Echo", json!({"x":{"type":"string"}}), &["x"], true)]
+        }
+        fn call(_name: &str, args: &Value) -> Result<Value> {
+            match args["x"].as_str() {
+                Some(x) => Ok(json!({"x": x})),
+                None => anyhow::bail!("x is required"),
+            }
+        }
+        let server = PluginServer { name: "test", title: "Test", instructions: "Test.", tools, call };
+        let reply = |message: Value| plugin_reply(&server, &message).unwrap();
+        let init = reply(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}));
+        assert_eq!(init["result"]["protocolVersion"], "2025-11-25");
+        assert_eq!(init["result"]["serverInfo"]["name"], "test");
+        let old = reply(json!({"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2020-01-01"}}));
+        assert_eq!(old["result"]["protocolVersion"], FALLBACK_PROTOCOL);
+        assert_eq!(reply(json!({"jsonrpc":"2.0","id":3,"method":"tools/list"}))["result"]["tools"][0]["name"], "echo");
+        let ok = reply(json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"echo","arguments":{"x":"hi"}}}));
+        assert_eq!(ok["result"]["structuredContent"], json!({"x":"hi"}));
+        let failed = reply(json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"echo","arguments":{}}}));
+        assert_eq!(failed["result"]["isError"], true);
+        assert_eq!(reply(json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"nope"}}))["error"]["code"], -32602);
+        assert_eq!(reply(json!({"jsonrpc":"2.0","id":7,"method":"nope"}))["error"]["code"], -32601);
+        assert!(plugin_reply(&server, &json!({"jsonrpc":"2.0","method":"notifications/initialized"})).is_none());
+    }
+
+    #[test]
     fn selection_patterns_are_exact_or_one_namespace() {
-        assert!(pattern_matches("mailbox.send", "mailbox.send"));
-        assert!(pattern_matches("mailbox.*", "mailbox.send"));
-        assert!(pattern_matches("*", "anything.at_all"));
-        assert!(!pattern_matches("mailbox.*", "mailboxes.send"));
-        assert!(!pattern_matches("task.get", "task.list"));
+        use relay_core::guardrail::op_matches;
+        assert!(op_matches("mailbox.send", "mailbox.send"));
+        assert!(op_matches("mailbox.*", "mailbox.send"));
+        assert!(op_matches("*", "anything.at_all"));
+        assert!(!op_matches("mailbox.*", "mailboxes.send"));
+        assert!(!op_matches("task.get", "task.list"));
     }
 
     #[test]
@@ -628,12 +746,12 @@ mod tests {
         let root = dir.path().canonicalize().unwrap();
         let file = root.join("art/hero.blend");
         let copy = root.join("art/hero_v2.blend");
-        let gates = plugin_gate_payloads("calm-otter", Some(&root), "blender_python", Some(&file), &[&copy]).unwrap();
+        let gates = plugin_gate_payloads("calm-otter", Some(&root), "blender_python", Some(&file), &[&copy]);
         assert_eq!(gates, [
             json!({"session": "calm-otter", "kind": "exec", "command": "blender_python art/hero.blend"}),
-            json!({"session": "calm-otter", "kind": "write", "path": "art/hero_v2.blend", "diff": ""}),
+            json!({"session": "calm-otter", "kind": "write", "path": copy, "diff": ""}),
         ]);
-        assert_eq!(plugin_gate_payloads("calm-otter", Some(&root), "ue_python", None, &[]).unwrap(),
+        assert_eq!(plugin_gate_payloads("calm-otter", Some(&root), "ue_python", None, &[]),
             [json!({"session": "calm-otter", "kind": "exec", "command": "ue_python"})]);
     }
 

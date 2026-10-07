@@ -18,6 +18,7 @@ pub mod handlers;
 pub mod hooks;
 pub mod mirror;
 pub mod paths;
+pub mod peer;
 pub mod plugins;
 pub mod proc;
 pub mod providers;

@@ -1,0 +1,181 @@
+//! RA-109: an agent's own commits can skip Relay's pre-commit gate, so `guardrail.gate` refuses
+//! the ways of switching the hook off, and `session.done` judges the branch's commits again.
+
+use relay_bus::{Actor, Request, Response};
+use relay_core::engine::{Door, Engine};
+use relay_core::{Instance, Store};
+use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
+
+fn call_as(e: &Engine, actor: Actor, op: &str, payload: Value) -> Response {
+    e.dispatch(Request::new(actor, op, payload), Door::InProcess)
+}
+fn ok_as(e: &Engine, actor: Actor, op: &str, payload: Value) -> Value {
+    match call_as(e, actor, op, payload).into_result() {
+        Ok(v) => v,
+        Err(err) => panic!("{op} failed: {} {}", err.code, err.message),
+    }
+}
+fn ok(e: &Engine, op: &str, payload: Value) -> Value {
+    ok_as(e, Actor::User, op, payload)
+}
+
+fn git(repo: &Path, args: &[&str]) {
+    let st = Command::new("git").arg("-C").arg(repo).args(args).status().unwrap();
+    assert!(st.success(), "git {args:?}");
+}
+
+struct Fixture {
+    _root: tempfile::TempDir,
+    engine: Arc<Engine>,
+    name: String,
+    task: i64,
+    worktree: PathBuf,
+}
+
+impl Fixture {
+    /// A builder session on its own checkout of a one-commit repository, working on a task,
+    /// with `secret/**` protected and `manifest.json` shape-gated.
+    fn new() -> Fixture {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let ws = root.join("ws");
+        let repo = ws.join("app");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["config", "user.email", "t@t"]);
+        git(&repo, &["config", "user.name", "t"]);
+        std::fs::write(repo.join("README.md"), "hi\n").unwrap();
+        std::fs::write(repo.join("manifest.json"), "{\"name\": \"app\"}\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "init"]);
+        let engine = Engine::new(Instance::Test, Store::open(&root.join("store").join("store.db"), false).unwrap());
+        ok(&engine, "workspace.create", json!({"path": ws}));
+        ok(&engine, "project.add", json!({"workspace_id": 1, "path": repo}));
+        ok(&engine, "guardrail.config.set", json!({"project_id": 1, "patch": {
+            "protected_paths": ["secret/**"],
+            "shape_gates": [{"path": "manifest.json", "validator": "json_non_empty_object"}],
+        }}));
+        let task = ok(&engine, "task.create", json!({"project_id": 1, "title": "work"}))["id"].as_i64().unwrap();
+        let s = ok(&engine, "session.create", json!({"project_id": 1, "provider": "claude", "task_id": task}));
+        let name = s["name"].as_str().unwrap().to_string();
+        engine.store.lock().execute("UPDATE tasks SET col='active' WHERE id=?1", [task]).unwrap();
+        let worktree = PathBuf::from(s["worktree"].as_str().unwrap());
+        ok_as(&engine, Actor::agent(&name), "session.report", json!({"session": name, "kind": "session_start"}));
+        Fixture { _root: tmp, engine, name, task, worktree }
+    }
+
+    fn agent(&self) -> Actor {
+        Actor::agent(&self.name)
+    }
+
+    /// Commit `files` (path, text; `None` deletes) past the hook, as an agent would with `-n`.
+    fn commit(&self, files: &[(&str, Option<&str>)], message: &str) {
+        for (path, text) in files {
+            let at = self.worktree.join(path);
+            match text {
+                Some(text) => {
+                    std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+                    std::fs::write(&at, text).unwrap();
+                }
+                None => std::fs::remove_file(&at).unwrap(),
+            }
+        }
+        git(&self.worktree, &["add", "-A"]);
+        git(&self.worktree, &["commit", "-q", "--no-verify", "-m", message]);
+    }
+
+    fn done(&self) -> Response {
+        call_as(&self.engine, self.agent(), "session.done", json!({"session": self.name, "summary": "done"}))
+    }
+
+    fn column(&self) -> String {
+        ok(&self.engine, "task.get", json!({"task_id": self.task}))["column"].as_str().unwrap().to_string()
+    }
+}
+
+#[test]
+fn the_exec_gate_refuses_an_agent_switching_the_commit_hook_off() {
+    let f = Fixture::new();
+    for command in ["git commit -anm wip", "git commit --no-verify -m wip", "git -c core.hooksPath=/dev/null commit -m wip",
+        "git config --worktree --unset core.hooksPath"]
+    {
+        let refused = call_as(&f.engine, f.agent(), "guardrail.gate", json!({"session": f.name, "kind": "exec", "command": command}))
+            .error.unwrap_or_else(|| panic!("{command:?} must be refused"));
+        assert_eq!(refused.code, "guardrail.hook_bypass", "{command:?}");
+        assert!(refused.hint.unwrap().contains("session.done"), "the hint says why it does not help");
+    }
+    ok_as(&f.engine, f.agent(), "guardrail.gate", json!({"session": f.name, "kind": "exec", "command": "git commit -m 'wip -n'"}));
+    // A person's own commit is theirs to make.
+    ok(&f.engine, "guardrail.gate", json!({"session": f.name, "kind": "exec", "command": "git commit -n -m wip"}));
+}
+
+#[test]
+fn done_judges_every_commit_against_the_protected_paths() {
+    let f = Fixture::new();
+    // Added in one commit and gone again in the next: the net diff never shows it.
+    f.commit(&[("secret/key", Some("hunter2\n")), ("src/a.txt", Some("a\n"))], "add a key");
+    f.commit(&[("secret/key", None)], "drop the key");
+    let refused = f.done().error.expect("a commit touching a protected path refuses the done");
+    assert_eq!(refused.code, "guardrail.protected_path");
+    let details = refused.details.unwrap();
+    assert_eq!(details["path"], "secret/key");
+    assert_eq!(details["commit"].as_str().unwrap().len(), 40, "{details}");
+    assert!(refused.message.starts_with("commit "), "{}", refused.message);
+    assert_eq!(f.column(), "active");
+    // Saying it is stuck is never refused.
+    ok_as(&f.engine, f.agent(), "session.done",
+        json!({"session": f.name, "status": "partial", "blockers": ["a key slipped into history"]}));
+}
+
+#[test]
+fn a_granted_path_passes_and_the_done_does_not_spend_the_grant() {
+    let f = Fixture::new();
+    f.commit(&[("secret/key", Some("rotated\n"))], "rotate the key");
+    assert_eq!(f.done().error.unwrap().code, "guardrail.protected_path");
+    let id = ok_as(&f.engine, f.agent(), "guardrail.request", json!({
+        "session": f.name, "kind": "path", "value": "secret/key", "reason": "the task is rotating it",
+    }))["request"]["id"].as_i64().unwrap();
+    ok(&f.engine, "guardrail.confirm", json!({"hold_id": id}));
+    f.done().into_result().expect("the person let this path through");
+    assert_eq!(f.column(), "in_review");
+    let grant = ok(&f.engine, "guardrail.request.get", json!({"request_id": id}));
+    assert_eq!((grant["uses"].as_u64(), grant["active"].as_bool()), (Some(0), Some(true)), "{grant}");
+}
+
+#[test]
+fn a_once_grant_the_commit_gate_used_still_covers_that_commit_at_done() {
+    let f = Fixture::new();
+    let id = ok_as(&f.engine, f.agent(), "guardrail.request", json!({
+        "session": f.name, "kind": "path", "value": "secret/key", "reason": "rotating it", "scope": "once",
+    }))["request"]["id"].as_i64().unwrap();
+    ok(&f.engine, "guardrail.confirm", json!({"hold_id": id}));
+    // The hook's gate lets the commit through on the grant, and spends it.
+    ok_as(&f.engine, f.agent(), "guardrail.gate",
+        json!({"session": f.name, "kind": "commit", "diff": "1\t0\tsecret/key\n"}));
+    assert_eq!(ok(&f.engine, "guardrail.request.get", json!({"request_id": id}))["active"], false);
+    f.commit(&[("secret/key", Some("rotated\n"))], "rotate the key");
+    f.done().into_result().expect("the commit the grant was used on is not refused again");
+}
+
+#[test]
+fn done_judges_shape_gated_files_as_the_branch_leaves_them() {
+    let f = Fixture::new();
+    f.commit(&[("manifest.json", Some("{}\n"))], "empty the manifest");
+    let refused = f.done().error.expect("a manifest that fails its validator refuses the done");
+    assert_eq!(refused.code, "guardrail.shape_gate");
+    assert_eq!(refused.details.unwrap()["path"], "manifest.json");
+    f.commit(&[("manifest.json", Some("{\"name\": \"app\", \"v\": 2}\n"))], "restore it");
+    f.done().into_result().expect("the branch leaves it valid");
+}
+
+#[test]
+fn done_still_allows_work_git_cannot_measure() {
+    let f = Fixture::new();
+    f.commit(&[("secret/key", Some("x\n"))], "touch the key");
+    // A base that no longer exists: nothing to measure against, so nothing is refused.
+    f.engine.store.lock().execute("UPDATE projects SET base_branch='gone' WHERE id=1", []).unwrap();
+    f.done().into_result().expect("a measurement Relay cannot take never blocks a done");
+}

@@ -262,9 +262,9 @@ pub fn register(e: &mut Engine) {
         changed(ctx, project_id, &root, &p.path);
         Ok(DeleteOut { trash_id: id })
     });
-    // Staged like delete: the stored worktree is verified (a subprocess) and a directory payload
-    // walked for gated paths before the transaction, which then gates the restored path the way
-    // every other file mutation is gated (RA-362) and moves the payload back.
+    // Staged like delete: the checkout is resolved and a directory payload walked for gated paths
+    // before the transaction, which then gates the restored path the way every other file
+    // mutation is gated (RA-362) and moves the payload back.
     e.register_staged::<Restore, PreparedRestore>(|ctx, p| {
         let session_id = ctx.actor_session_id();
         let (project, own, row) = ctx.read(|conn| {
@@ -273,14 +273,35 @@ pub fn register(e: &mut Engine) {
             Ok((project, own, open_trash(conn, p.trash_id, p.project_id)?))
         })?;
         let (root_s, rel_s, trash_s) = row;
-        let root = root_verify(&project, PathBuf::from(root_s), "file.worktree")?;
-        confine(own, &root)?;
+        // A named checkout is addressed and confined like any other mutation's (RA-148). Unnamed,
+        // it goes back where it was deleted from while that is still a worktree of this project;
+        // a session's worktree is removed with the session, while the bytes outlive it in the
+        // primary checkout's trash, so then it goes to the primary checkout (RA-214).
+        let (root, fallback) = if p.worktree.is_some() {
+            (root_mut_unlocked(ctx, project.id, p.worktree.as_deref())?.1, false)
+        } else {
+            let original = match fs::canonicalize(&root_s) {
+                Ok(original) => crate::worktree::contains(Path::new(&project.path), &original)
+                    .map_err(|e| BusError::unavailable("worktree.list_failed", e.to_string()))?
+                    .then_some(original),
+                Err(_) => None,
+            };
+            let (root, fallback) = match original {
+                Some(original) => (original, false),
+                None => (root_verify(&project, PathBuf::from(&project.path), "file.worktree")?, true),
+            };
+            confine(own, &root)?;
+            (root, fallback)
+        };
+        if trash_s.is_empty() || !occupied(Path::new(&trash_s)) {
+            return Err(BusError::not_found("file.trash_unavailable", format!("trash {} is no longer on disk", p.trash_id)));
+        }
         let rel = rel(&rel_s, false)?;
         safe_join(&root, &rel, true)?;
         let inner = covered_inside(ctx, project.id, Path::new(&trash_s), &[&rel])?;
-        Ok(PreparedRestore { project_id: project.id, root, rel, trash: PathBuf::from(trash_s), inner })
+        Ok(PreparedRestore { project_id: project.id, root, fallback, rel, trash: PathBuf::from(trash_s), inner })
     }, |ctx: &mut Ctx, p, prepared| {
-        let PreparedRestore { project_id, root, rel, trash, inner } = prepared;
+        let PreparedRestore { project_id, root, fallback, rel, trash, inner } = prepared;
         // Restored by someone else since the read phase, or not the same payload any more.
         let (_, _, trash_s) = open_trash(ctx.tx(), p.trash_id, project_id)?;
         if Path::new(&trash_s) != trash {
@@ -296,7 +317,7 @@ pub fn register(e: &mut Engine) {
         fs::rename(&trash, &path).map_err(|e| io_err("file.restore_failed", &rel, e))?;
         ctx.tx().execute("UPDATE file_trash SET restored_at=?1 WHERE id=?2", params![ctx.now, p.trash_id]).bus()?;
         changed(ctx, project_id, &root, &rel.to_string_lossy());
-        entry(&root, &path, &HashMap::new())
+        Ok(RestoreOut { entry: entry(&root, &path, &HashMap::new())?, worktree: root.display().to_string(), fallback })
     });
     e.register_unlocked::<TrashList>(|ctx, p| {
         let limit = p.limit.unwrap_or(200).clamp(1, 1000);
@@ -945,8 +966,10 @@ fn relocate(ctx: &mut Ctx, prepared: PreparedPath, code: &str) -> Result<Entry, 
 /// What a staged `file.restore` settled before its transaction.
 struct PreparedRestore {
     project_id: Id,
-    /// The stored worktree, verified as one of the project's and canonical.
+    /// The checkout it goes back to, verified as one of the project's and canonical.
     root: PathBuf,
+    /// The checkout it was deleted from is gone, so `root` is the primary checkout (RA-214).
+    fallback: bool,
     rel: PathBuf,
     trash: PathBuf,
     /// Paths inside a directory payload that a gate covers, relative to it.

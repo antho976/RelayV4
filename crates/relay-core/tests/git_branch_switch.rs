@@ -2,39 +2,18 @@
 //! from the Git panel runs into — untracked files, uncommitted edits, remote-only branches and
 //! branches another checkout already holds.
 
-use relay_bus::{Actor, BusError, Request, Response};
-use relay_core::engine::{Door, Engine};
-use relay_core::{Instance, Store};
+mod common;
+
+use common::{call, committed_repo, engine, err, git};
+use relay_core::engine::Engine;
 use serde_json::{json, Value};
 use std::path::Path;
-use std::process::Command;
-use std::sync::Arc;
 
-fn engine() -> Arc<Engine> {
-    Engine::new(Instance::Test, Store::open_memory().unwrap())
-}
-fn call(e: &Engine, op: &str, payload: Value) -> Response {
-    e.dispatch(Request::new(Actor::User, op, payload), Door::InProcess)
-}
-fn err(r: &Response) -> &BusError {
-    r.error.as_ref().expect("expected an error response")
-}
-fn git(repo: &Path, args: &[&str]) -> String {
-    let out = Command::new("git").arg("-C").arg(repo).args(args).output().unwrap();
-    assert!(out.status.success(), "git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr));
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
 /// A repository with one commit on `main`, registered as project 1.
 fn project(e: &Engine) -> (tempfile::TempDir, String) {
     let ws = tempfile::tempdir().unwrap();
     let repo = ws.path().join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "-b", "main"]);
-    git(&repo, &["config", "user.name", "Relay Test"]);
-    git(&repo, &["config", "user.email", "relay@example.test"]);
-    std::fs::write(repo.join("README.md"), "# Relay\n").unwrap();
-    git(&repo, &["add", "README.md"]);
-    git(&repo, &["commit", "-m", "Initial"]);
+    committed_repo(&repo, &[("README.md", "# Relay\n")]);
     let path = std::fs::canonicalize(&repo).unwrap().display().to_string();
     call(e, "workspace.create", json!({"path":std::fs::canonicalize(ws.path()).unwrap()})).into_result().unwrap();
     call(e, "project.add", json!({"workspace_id":1,"path":path})).into_result().unwrap();

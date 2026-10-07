@@ -46,7 +46,8 @@ for l, r in pairs:
         asym.append("%s/%s off by %.1f cm" % (l, r, off))
 if asym:
     warn(arm.name, "%d bone pairs are not mirror images: %s" % (len(asym), "; ".join(asym[:6])), "Armature > Symmetrize from the correct side, unless the asymmetry is intended")
-side_named = [n for n in names if twin(n) and twin(n) not in names]
+# Either side: a right-side bone without its left twin is as wrong as the reverse.
+side_named = [n for n in names if other_side(n) and other_side(n)[1] not in names]
 if side_named:
     warn(arm.name, "side-named bones without a twin: %s" % ", ".join(side_named[:8]), "check the naming (.L/.R) so mirroring and retargeting pair them")
 frame = body_frame(arm)

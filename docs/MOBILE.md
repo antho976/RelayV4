@@ -12,9 +12,12 @@ Two routes, tried in privacy order by the phone:
 | **via a rendezvous** | phone anywhere | PC dials *out* to a server you host; the phone joins there; the server copies lines between the two and can read them (§6) |
 
 Both end in `bridge.rs` on the PC, which checks the phone's credential and forwards its
-requests to the socket door as actor `user` — the same door, the same rights, the same
-guardrails and audit rows as the CLI. There is no third route: Tailscale, if you use it, only
-carries the direct link, and sees encrypted packets, not bus lines.
+requests to the socket door as actor `user` — the same door, the same guardrails and audit
+rows as the CLI, but not the whole bus: a phone may call only the ops the app uses
+(`PHONE_OPS` in `crates/relay-remote/src/wire.rs`, plus `bus.unsubscribe`). Anything else,
+`settings.set` or `app.quit` for example, is refused at the door with `refused` /
+`remote.op` and never reaches the engine; run it on the PC. There is no third route:
+Tailscale, if you use it, only carries the direct link, and sees encrypted packets, not bus lines.
 
 ## 1. Tonight, in three steps
 
@@ -35,7 +38,9 @@ On the phone: install the app (the `relay-mobile-apk` artifact of the **Mobile A
 run from the Actions tab, or `npm run android` in `apps/relay-mobile` with the Android SDK),
 open it, tap **Pair a PC**, scan. If the engine was running from before the
 door existed, restart it once (`./target/debug/relay --instance dev cmd app.quit '{}'`, then
-`./run.sh`), or run `./target/debug/relay remote serve --pair` alongside it. For the phone to
+`./run.sh`), or run `./target/debug/relay remote serve --pair` alongside it. The quit is refused
+while agents are live (`app.sessions_live`); `app.quit '{"force":true}'` stops them, and their
+sessions come back as restorable. For the phone to
 reach the PC when you are out, see §3 (Tailscale) or §4 (your own server).
 
 ## 2. On the PC
@@ -80,7 +85,7 @@ a paired phone out. A browser page on another site cannot open it (the `Origin` 
 | `RELAY_INSTANCE=dev relay remote serve` | serve the dev engine instead of stable |
 
 State lives in `~/.local/share/relay-v4/<instance>/remote.json`, mode 0600. It holds each
-phone's token, so treat it like a private key.
+phone's token and the rendezvous room secret (§4), so treat it like a private key.
 
 ## 3. From anywhere without a server: Tailscale
 
@@ -129,12 +134,21 @@ Then on the PC:
 
 ```fish
 relay remote via wss://relay.example.org
-relay remote serve --pair
+relay --instance dev cmd app.quit '{"force":true}'    # then ./run.sh
+relay remote pair
 ```
 
-`via` mints a room secret and stores it; `serve` dials the server, and every pairing link from
-then on carries the join address as well as the LAN ones. The phone tries the LAN first and the
-server second; a PC card in the app can pin either. `relay remote via off` clears it.
+`via` mints a room secret and stores it. The PC presents it to the server as
+`Authorization: Bearer <secret>`, so it stays out of URLs and proxy access logs; a server
+that predates the header refuses that, and the PC dials it once more with `?secret=` in the
+URL (and logs a warning to update the server). The process that carries the phone door
+dials the server only when it starts, so restart it: for the `./run.sh` engine (`relay serve --remote`),
+quit it and run `./run.sh` again. `force` stops live agents, whose sessions come back as
+restorable; without it the quit is refused while any is live. (`via` says to restart `relay
+remote serve`; that applies only when a separate `relay remote serve` carries the door. It
+cannot run beside a `serve --remote` engine, which already holds the port.) Every pairing link
+from then on carries the join address as well as the LAN ones. The phone tries the LAN first
+and the server second; a PC card in the app can pin either. `relay remote via off` clears it.
 
 The rendezvous keeps nothing on disk. A room is named by the digest of its secret, so only the
 PC that holds the secret can host it, and a restart forgets nothing worth keeping.
@@ -176,7 +190,8 @@ the PC said yes or no.
 the direct addresses (WiFi and Tailscale) first and the server second; **Direct only** never
 uses the server; **Server only** always goes through the rendezvous. The route in use is marked.
 
-**What you can do.** Everything is an existing bus op, so the list is the bus's:
+**What you can do.** Everything is an existing bus op, limited to the ones the door lets a
+phone call (see the top of this page):
 
 - **New terminal**: pick a project and an agent (claude or codex), optionally a first message,
   and a session starts in its own worktree (`session.create` + `session.spawn`); its terminal
@@ -228,6 +243,13 @@ The phone's own chats and on-device models never touch this link.
 - A phone is the user at the keyboard. The door refuses any envelope whose actor is not
   `user` (or `test` on a dev/test instance) before the engine sees it, so a phone cannot
   borrow an agent's identity even with a guessed token.
+- A phone also gets fewer ops than the user at the keyboard: only those in `PHONE_OPS`
+  (`crates/relay-remote/src/wire.rs`). Ops that reconfigure what the engine runs
+  (`settings.set`, which holds provider and adb paths), quit it, or that no screen of the app
+  uses are refused (`refused` / `remote.op`). A WebSocket frame holding several lines is
+  gated line by line, so a permitted first line cannot carry a refused second one through.
+- **App developers:** an op the phone starts calling must be added to `PHONE_OPS` (it is
+  sorted; the gate binary-searches it), or the door refuses it.
 - Pairing codes live ten minutes and are single use, a new code replaces any older one, and the
   PC approves each phone that presents one before it gets a token (unless `--no-confirm`), so
   a code seen by someone else — a screen share, scrollback — pairs nothing on its own. Every
@@ -246,7 +268,8 @@ The phone's own chats and on-device models never touch this link.
   connection; nothing seals the lines that follow. Someone *on the path* — an active attacker
   on the same WiFi (ARP spoofing, a rogue access point) or whoever runs the rendezvous — can
   read every line, and can inject bus requests as `user` into a connection the phone already
-  opened. That is command execution on the PC. The phone also cannot tell its PC from an
+  opened. That is command execution on the PC: `session.spawn` and `session.input` are among
+  the phone's ops. The phone also cannot tell its PC from an
   impostor answering at a stored address. Passive listening alone gets proofs that are no
   good on another connection, and nothing reaches the engine from a peer that has no proof.
 - Until the link is sealed end to end (a planned wire v2: the PC's public key in the pairing
@@ -257,15 +280,18 @@ The phone's own chats and on-device models never touch this link.
   trust, and treat a rendezvous you do not run as able to act as you.
 - To cut a phone off from the PC side: `relay remote revoke <device id>` (the id is on the
   PC card in the app). An open connection closes within a few seconds.
-- None of this is a sandbox for a hostile phone: a paired phone is you.
+- The op list narrows what a lost phone or an injected line can do; it is not a sandbox for a
+  hostile phone. A paired phone can still start agents and type into their terminals, which
+  is acting as you.
 
-## 6. Verifying
+## 7. Verifying
 
 ```fish
 cargo test -p relay-remote
 ```
 
-covers pairing, proof, revocation, the actor gate, `GET /info`, event interleaving and a
+covers pairing, proof, revocation, the actor gate, the op gate (`settings.set` refused),
+`GET /info`, event interleaving and a
 two-phone rendezvous session against a real engine. It runs in CI with the rest of the
 headless crates. The app itself is typechecked and linted in CI
 (`npx tsc --noEmit -p tsconfig.json && npm run lint` in `apps/relay-mobile`).

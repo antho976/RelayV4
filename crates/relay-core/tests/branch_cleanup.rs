@@ -1,32 +1,18 @@
 //! Branch cleanup: a closed session's branch (and worktree, and merged PR's remote branch) goes
 //! once its work is merged, and never before.
 
-use relay_bus::{Actor, Request, Response};
+mod common;
+
+use common::{committed_repo, engine_with_project, git, git_command, ok};
 use relay_core::branch_cleanup::{self, Options};
-use relay_core::engine::{Door, Engine};
-use relay_core::{Instance, Store};
+use relay_core::engine::Engine;
 use serde_json::{json, Value};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 
-fn git(repo: &Path, args: &[&str]) -> String {
-    let out = Command::new("git").arg("-C").arg(repo).args(args).output().unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
-
 fn has_ref(repo: &Path, reference: &str) -> bool {
-    Command::new("git").arg("-C").arg(repo).args(["show-ref", "--verify", "--quiet", reference]).status().unwrap().success()
-}
-
-fn call(engine: &Engine, op: &str, payload: Value) -> Response {
-    engine.dispatch(Request::new(Actor::User, op, payload), Door::InProcess)
-}
-
-fn ok(engine: &Engine, op: &str, payload: Value) -> Value {
-    call(engine, op, payload).into_result().unwrap_or_else(|error| panic!("{op} failed: {} {}", error.code, error.message))
+    git_command(repo).args(["show-ref", "--verify", "--quiet", reference]).status().unwrap().success()
 }
 
 struct Fixture {
@@ -42,21 +28,12 @@ fn fixture() -> Fixture {
     let base = std::fs::canonicalize(root.path()).unwrap();
     let ws = base.join("ws");
     let repo = ws.join("app");
-    std::fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "-q", "-b", "main"]);
-    git(&repo, &["config", "user.email", "t@t"]);
-    git(&repo, &["config", "user.name", "t"]);
-    std::fs::write(repo.join("README.md"), "hi\n").unwrap();
-    git(&repo, &["add", "."]);
-    git(&repo, &["commit", "--no-verify", "-q", "-m", "init"]);
+    committed_repo(&repo, &[("README.md", "hi\n")]);
     let origin = base.join("origin.git");
     git(&base, &["init", "-q", "--bare", "-b", "main", origin.to_str().unwrap()]);
     git(&repo, &["remote", "add", "origin", origin.to_str().unwrap()]);
     git(&repo, &["push", "-q", "-u", "origin", "main"]);
-    let store = Store::open(&base.join("store/store.db"), false).unwrap();
-    let engine = Engine::new(Instance::Test, store);
-    ok(&engine, "workspace.create", json!({"path": ws}));
-    ok(&engine, "project.add", json!({"workspace_id": 1, "path": repo}));
+    let engine = engine_with_project(&base, &ws, &repo);
     Fixture { _root: root, base, repo, origin, engine }
 }
 
@@ -107,7 +84,9 @@ fn a_merged_branch_goes_and_an_unmerged_one_stays_with_its_reason() {
     git(&f.repo, &["merge", "--no-verify", "-q", "--no-ff", "-m", "merge", &merged.branch]);
     ok(&f.engine, "session.close", json!({"session": merged.name}));
     ok(&f.engine, "session.close", json!({"session": open.name}));
-    assert!(has_ref(&f.repo, &format!("refs/heads/{}", merged.branch)), "close alone keeps the branch for cleanup to judge");
+    // In production session.close starts this same cleanup on a background thread at once;
+    // the test instance skips that so `cleanup` below can drive it synchronously.
+    assert!(has_ref(&f.repo, &format!("refs/heads/{}", merged.branch)), "the test instance defers after-close cleanup to the explicit run");
 
     let row = cleanup(&f, &merged.branch, None);
     assert_eq!(row.outcome, "deleted", "{row:?}");

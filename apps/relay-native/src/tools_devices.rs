@@ -8,7 +8,7 @@ use std::rc::Rc;
 
 pub async fn refresh(ui: &Rc<Ui>, project: i64) {
     let generation = ui.generation.get();
-    let result = ui.call("device.list", json!({})).await;
+    let (result, avds) = tokio::join!(ui.call("device.list", json!({})), ui.call("avd.list", json!({})));
     if !current(ui, "devices", project, generation) {
         return;
     }
@@ -19,6 +19,7 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
             return;
         }
     };
+    let avds = avds.map(|value| rows(&value, "avds"));
     let page = &ui.pages["devices"];
     if ui.page_projects.borrow().get("devices") != Some(&project) {
         ui.page_projects.borrow_mut().remove("devices");
@@ -34,18 +35,13 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
                 ui.refresh_page();
             }
         });
-        let worktrees = match ui
-            .call("worktree.list", json!({"project_id":project}))
-            .await
-        {
-            Ok(v) => rows(&v, "worktrees"),
-            Err(_) => Vec::new(),
-        };
+        let worktrees = worktrees(ui, project).await;
         let last = last_worktree(ui, project).await;
         if !current(ui, "devices", project, generation) {
             return;
         }
-        build_form(ui, page, project, &devices, &worktrees, last.as_deref());
+        let tree = build_form(ui, page, project, &worktrees, last.as_deref());
+        mark_dirty(ui, project, vec![tree]);
         avd_form(ui, page);
         // Devices, release signing and history. Signing holds a form being typed into, so
         // it is rebuilt only when what it shows changes, not on every engine event.
@@ -56,12 +52,10 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
         ui.page_projects
             .borrow_mut()
             .insert("devices".into(), project);
-    } else {
-        sync_targets(&devices);
     }
+    sync_targets(&devices, avds.as_deref().unwrap_or_default());
     // Read everything first, then redraw in one go: a list rebuilt across awaits shrinks
     // under someone scrolled down to the history.
-    let avds = ui.call("avd.list", json!({})).await;
     let (signing, runs) = if project > 0 {
         (
             Some(ui.call("device.signing.get", json!({"project_id":project})).await),
@@ -78,13 +72,7 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
     let list = signing_box.prev_sibling().unwrap().downcast::<gtk::Box>().unwrap();
     clear(&list);
     let all = section(&list, "Devices");
-    let avds = match avds {
-        Ok(value) => rows(&value, "avds"),
-        Err(error) => {
-            all.append(&paragraph(&format!("Virtual devices unavailable: {error}")));
-            Vec::new()
-        }
-    };
+    let avds = listed_avds(&all, avds);
     device_list(ui, &all, &devices, &avds);
     match signing {
         None => clear(&signing_box),
@@ -97,17 +85,7 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
                 text(&signing, "key_alias"),
                 text(&signing, "keystore")
             )));
-            action(
-                ui,
-                &row,
-                if enabled {
-                    "Use project signing"
-                } else {
-                    "Use Relay signing"
-                },
-                "device.signing.set_enabled",
-                json!({"project_id":project,"enabled":!enabled}),
-            );
+            signing_toggle(ui, &row, project, enabled);
         }
         // Keep the form already shown, and whatever is typed into it.
         Some(Ok(_)) if signing_box.first_child().is_some_and(|row| row.widget_name() == "signing-form") => {}
@@ -158,10 +136,7 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
                     let path = artifact.to_string();
                     copy.connect_clicked(move |b| b.clipboard().set_text(&path));
                 }
-                if matches!(
-                    text(&run, "state"),
-                    "building" | "running" | "installing" | "launching"
-                ) {
+                if is_active(&run) {
                     action(
                         ui,
                         &row,
@@ -189,19 +164,52 @@ thread_local! {
     static TARGETS: std::cell::RefCell<Option<Targets>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Connected devices a run can target, as (serial, title).
-fn device_targets(devices: &[Value]) -> Vec<(String, String)> {
+/// Connected devices a run can target, as (serial, title): a running AVD by its name, and a
+/// leased device marked, since a run on it is refused until the lease goes. Both surfaces' pickers.
+fn device_targets(devices: &[Value], avds: &[Value]) -> Vec<(String, String)> {
     devices
         .iter()
         .filter(|device| text(device, "state") == "device")
-        .map(|device| (text(device, "serial").to_string(), format!("{} · {}", text(device, "model"), text(device, "serial"))))
+        .map(|device| {
+            let serial = text(device, "serial");
+            let name = avds.iter().find(|avd| avd["running_serial"] == serial).map_or(text(device, "model"), |avd| text(avd, "name"));
+            let busy = if device["lease"]["action"].is_string() { " · in use" } else { "" };
+            (serial.to_string(), format!("{} · {serial}{busy}", name.replace('_', " ")))
+        })
         .collect()
+}
+
+/// The AVDs `avd.list` gave, or a line in `parent` saying why there are none.
+fn listed_avds(parent: &gtk::Box, avds: Result<Vec<Value>, crate::client::Error>) -> Vec<Value> {
+    match avds {
+        Ok(avds) => avds,
+        Err(error) => {
+            parent.append(&paragraph(&format!("Virtual devices unavailable: {error}")));
+            Vec::new()
+        }
+    }
+}
+
+/// A build or run that is still going, and so has a Stop button.
+fn is_active(run: &Value) -> bool {
+    matches!(text(run, "state"), "building" | "running" | "installing" | "launching")
+}
+
+/// Switches a project with a Relay key between it and the project's own Gradle signing.
+fn signing_toggle(ui: &Rc<Ui>, parent: &gtk::Box, project: i64, enabled: bool) {
+    action(
+        ui,
+        parent,
+        if enabled { "Use Gradle signing" } else { "Use Relay signing" },
+        "device.signing.set_enabled",
+        json!({"project_id":project,"enabled":!enabled}),
+    );
 }
 
 /// Refill "Target device" when the connected devices change, keeping the chosen one if it
 /// is still there. Its `changed` handler recomputes the Run button.
-fn sync_targets(devices: &[Value]) {
-    let next = device_targets(devices);
+fn sync_targets(devices: &[Value], avds: &[Value]) {
+    let next = device_targets(devices, avds);
     let Some(combo) = TARGETS.with(|targets| {
         let mut targets = targets.borrow_mut();
         let targets = targets.as_mut()?;
@@ -230,7 +238,8 @@ struct Checkout {
     /// The project's own checkout: built with no `worktree` in the payload.
     primary: bool,
     session: Option<String>,
-    dirty: bool,
+    /// Filled in by `mark_dirty` after the picker is shown.
+    dirty: std::cell::Cell<bool>,
 }
 
 /// "Build from": a searchable list of the project's checkouts, branch first. The checkout of
@@ -268,6 +277,19 @@ impl WorktreePicker {
     fn choose(&self, index: i32) {
         self.inner.choose(index);
     }
+
+    /// Tags the checkouts with uncommitted changes, from a `worktree.list` that reports them.
+    fn mark_dirty(&self, worktrees: &[Value]) {
+        let picker = &self.inner;
+        for checkout in picker.checkouts.iter() {
+            checkout.dirty.set(worktrees.iter().any(|tree| text(tree, "path") == checkout.path && tree["dirty"] == true));
+        }
+        picker.rows.remove_all();
+        for index in 0..picker.checkouts.len() {
+            picker.rows.append(&picker.row(index));
+        }
+        picker.show_selected();
+    }
 }
 
 impl Picker {
@@ -282,11 +304,11 @@ impl Picker {
                 path: text(tree, "path").to_string(),
                 primary: index == 0,
                 session: tree["session"].as_str().map(str::to_string),
-                dirty: tree["dirty"].as_bool() == Some(true),
+                dirty: std::cell::Cell::new(tree["dirty"].as_bool() == Some(true)),
             })
             .collect();
         if checkouts.is_empty() {
-            checkouts.push(Checkout { branch: "Project checkout".into(), path: String::new(), primary: true, session: None, dirty: false });
+            checkouts.push(Checkout { branch: "Project checkout".into(), path: String::new(), primary: true, session: None, dirty: Default::default() });
         }
         let last = last
             .filter(|path| !path.is_empty())
@@ -437,7 +459,7 @@ impl Picker {
         if let Some(session) = &checkout.session {
             facts.push(session.clone());
         }
-        if checkout.dirty {
+        if checkout.dirty.get() {
             facts.push("uncommitted changes".into());
         }
         let path = label(&facts.join(" · "), "build-from-path");
@@ -497,6 +519,31 @@ fn short_path(path: &str) -> String {
     format!("…/{}", parts.into_iter().rev().collect::<Vec<_>>().join("/"))
 }
 
+/// The project's checkouts for "Build from", without the dirty flags: those cost a full
+/// `git status` per checkout, so the picker is shown first and `mark_dirty` adds them.
+async fn worktrees(ui: &Rc<Ui>, project: i64) -> Vec<Value> {
+    match ui.call("worktree.list", json!({"project_id":project,"include_dirty":false})).await {
+        Ok(v) => rows(&v, "worktrees"),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Marks the checkouts with uncommitted changes in `pickers` once the engine has looked.
+fn mark_dirty(ui: &Rc<Ui>, project: i64, pickers: Vec<WorktreePicker>) {
+    if project <= 0 || pickers.is_empty() {
+        return;
+    }
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        if let Ok(value) = ui.call("worktree.list", json!({"project_id":project,"include_dirty":true})).await {
+            let trees = rows(&value, "worktrees");
+            for picker in &pickers {
+                picker.mark_dirty(&trees);
+            }
+        }
+    });
+}
+
 /// The worktree of the project's most recent build or run, for the picker's default.
 async fn last_worktree(ui: &Rc<Ui>, project: i64) -> Option<String> {
     if project <= 0 {
@@ -523,7 +570,6 @@ pub(crate) async fn verify_worktree_picker(ui: &Rc<Ui>) {
         .build();
     window.set_child(Some(&picker.widget));
     window.present();
-    glib::timeout_future(std::time::Duration::from_millis(100)).await;
     // The last build's checkout is preselected; the primary checkout builds with no worktree.
     assert_eq!(picker.active_id().as_deref(), Some(path.as_str()));
     picker.choose(0);
@@ -535,25 +581,19 @@ pub(crate) async fn verify_worktree_picker(ui: &Rc<Ui>) {
     assert!(!visible(0) && visible(1), "Search must hide branches that do not match");
     picker.inner.search.emit_activate();
     assert_eq!(picker.active_id().as_deref(), Some(path.as_str()));
-    assert!(
-        window.width() <= 430,
-        "Long branch and path must not expand the device surface: {}px",
-        window.width()
-    );
+    // Measure what the picker asks for: an unallocated window reports a width of 0 (RA-721).
+    let minimum = picker.widget.measure(gtk::Orientation::Horizontal, -1).0;
+    assert!(minimum <= 430, "Long branch and path must not expand the device surface: {minimum}px");
     window.close();
 }
 
-fn build_form(ui: &Rc<Ui>, page: &gtk::Box, project: i64, devices: &[Value], worktrees: &[Value], last: Option<&str>) {
+/// The target picker starts empty: `refresh` fills it through `sync_targets` right after.
+fn build_form(ui: &Rc<Ui>, page: &gtk::Box, project: i64, worktrees: &[Value], last: Option<&str>) -> WorktreePicker {
     let form = section(page, "Build & run");
     let tree = WorktreePicker::new(worktrees, last);
     field("Build from", &tree.widget, &form);
     let target = gtk::ComboBoxText::new();
-    let shown = device_targets(devices);
-    for (serial, title) in &shown {
-        target.append(Some(serial), title);
-    }
-    target.set_active(Some(0));
-    TARGETS.with(|targets| *targets.borrow_mut() = Some(Targets { combo: target.downgrade(), shown }));
+    TARGETS.with(|targets| *targets.borrow_mut() = Some(Targets { combo: target.downgrade(), shown: Vec::new() }));
     field("Target device", &target, &form);
     let variant = gtk::Entry::builder().text("debug").build();
     field("Gradle variant", &variant, &form);
@@ -597,6 +637,7 @@ fn build_form(ui: &Rc<Ui>, page: &gtk::Box, project: i64, devices: &[Value], wor
             run_window(&ui,op,payload,title);
         });
     }
+    tree
 }
 
 fn avd_form(ui: &Rc<Ui>, page: &gtk::Box) {
@@ -795,32 +836,48 @@ fn run_window(ui: &Rc<Ui>, op: &'static str, payload: Value, title: &str) {
     output.set_editable(false);
     output.set_monospace(true);
     output.set_wrap_mode(gtk::WrapMode::WordChar);
-    page.append(&crate::app::scrolled(&output));
+    let scroll = crate::app::scrolled(&output);
+    page.append(&scroll);
+    // Right gravity: the mark stays after every line appended at the end.
+    let bottom = output.buffer().create_mark(None, &output.buffer().end_iter(), false);
     let status = label("Connecting…", "dim");
     page.append(&status);
     let ui = ui.clone();
     let task = glib::spawn_future_local(async move {
         match Client::connect(&ui.rt, ui.path.clone()).await {
             Ok((client, notices)) => {
-                match client.request(&ui.rt, op, payload).await {
+                // The run's stream carries its log lines only; its state arrives as run.changed.
+                // Without the subscription the status keeps the first state, and the log runs.
+                let _ = client.request(&ui.rt, "bus.subscribe", json!({"events":["run.changed"]})).await;
+                let id = match client.request(&ui.rt, op, payload).await {
                     Ok(run) => {
-                        status.set_text(&format!("Run #{} · {}", run["id"], text(&run, "state")))
+                        status.set_text(&format!("Run #{} · {}", run["id"], text(&run, "state")));
+                        run["id"].clone()
                     }
                     Err(error) => {
                         status.set_text(&error.to_string());
                         return;
                     }
-                }
+                };
                 ui.refresh_page();
                 while let Ok(notice) = notices.recv().await {
                     match notice {
+                        Notice::Event(event) if event.ev == "run.changed" && event.payload["id"] == id => {
+                            status.set_text(&format!("Run #{id} · {}", text(&event.payload, "state")));
+                        }
                         Notice::Frame(frame) if frame.stream == "logcat" => {
+                            // Follow new output, unless the reader has scrolled up to read.
+                            let at = scroll.vadjustment();
+                            let follow = at.value() + at.page_size() >= at.upper() - 8.;
                             let buffer = output.buffer();
                             let mut end = buffer.end_iter();
                             buffer.insert(
                                 &mut end,
                                 &format!("{}\n", frame.data.as_str().unwrap_or("")),
                             );
+                            if follow {
+                                output.scroll_mark_onscreen(&bottom);
+                            }
                             if buffer.line_count() > 2000 {
                                 if let Some(mut trim) =
                                     buffer.iter_at_line(buffer.line_count() - 2000)
@@ -953,6 +1010,171 @@ fn action_quiet(ui: &Rc<Ui>, parent: &gtk::Box, title: &str, payload: Value) {
     parent.append(&key);
 }
 
+/// The events that change what the footer panel shows, its own actions' included.
+const PANEL_EVENTS: [&str; 6] = [
+    "device.changed",
+    "device.lease.acquired",
+    "device.lease.released",
+    "avd.changed",
+    "run.changed",
+    "device.signing.changed",
+];
+
+/// Which of the footer panel's parts an event changed.
+#[derive(Clone, Copy, Default)]
+struct Parts {
+    devices: bool,
+    runs: bool,
+    signing: bool,
+}
+
+impl Parts {
+    const ALL: Self = Self { devices: true, runs: true, signing: true };
+
+    fn note(&mut self, ev: &str) {
+        match ev {
+            "device.changed" | "device.lease.acquired" | "device.lease.released" | "avd.changed" => self.devices = true,
+            "run.changed" => self.runs = true,
+            "device.signing.changed" => self.signing = true,
+            _ => {}
+        }
+    }
+}
+
+/// The parts of the footer panel that follow the engine while it is open. The pickers, the
+/// artifact format and a signing key being typed stay as they are.
+struct Live {
+    devices: gtk::Box,
+    /// "Run on" and its devices: absent without a project, hidden with no device connected.
+    target: Option<(gtk::Label, gtk::ComboBoxText)>,
+    /// Release signing: absent without a project.
+    signing: Option<gtk::Box>,
+    run_states: gtk::Box,
+    release_states: gtk::Box,
+}
+
+impl Live {
+    /// Reads what `parts` needs, then redraws it in one go.
+    async fn redraw(&self, ui: &Rc<Ui>, project: i64, parts: Parts) {
+        let listed = if parts.devices {
+            Some(tokio::join!(ui.call("device.list", json!({})), ui.call("avd.list", json!({}))))
+        } else {
+            None
+        };
+        let runs = if parts.runs && project > 0 {
+            Some(ui.call("device.run.list", json!({"project_id":project})).await)
+        } else {
+            None
+        };
+        let signing = if parts.signing && project > 0 {
+            Some(ui.call("device.signing.get", json!({"project_id":project})).await)
+        } else {
+            None
+        };
+        if let Some((devices, avds)) = listed {
+            clear(&self.devices);
+            let devices = match devices {
+                Ok(v) => rows(&v, "devices"),
+                Err(e) => {
+                    self.devices.append(&paragraph(&e.to_string()));
+                    Vec::new()
+                }
+            };
+            let avds = listed_avds(&self.devices, avds.map(|value| rows(&value, "avds")));
+            device_list(ui, &self.devices, &devices, &avds);
+            self.sync_target(&devices, &avds);
+        }
+        if let Some(Ok(value)) = runs {
+            self.draw_runs(ui, &value);
+        }
+        if let (Some(Ok(signing)), Some(form)) = (signing, &self.signing) {
+            clear(form);
+            if signing["configured"] == true {
+                form.append(&label(
+                    if signing["enabled"] == true {
+                        "Relay signing configured"
+                    } else {
+                        "Gradle signing"
+                    },
+                    "body",
+                ));
+                signing_toggle(ui, form, project, signing["enabled"] == true);
+            } else {
+                form.append(&label("Gradle signing", "body"));
+                signing_form(ui, form, project);
+            }
+        }
+    }
+
+    /// Refills "Run on", keeping the chosen device while it is still connected.
+    fn sync_target(&self, devices: &[Value], avds: &[Value]) {
+        let Some((caption, target)) = &self.target else { return };
+        let selected = target.active_id();
+        target.remove_all();
+        for (serial, title) in device_targets(devices, avds) {
+            target.append(Some(&serial), &title);
+        }
+        if !selected.is_some_and(|id| target.set_active_id(Some(&id))) {
+            target.set_active(Some(0));
+        }
+        let any = target.active_id().is_some();
+        caption.set_visible(any);
+        target.set_visible(any);
+    }
+
+    /// Active runs with their Stop buttons, and the newest artifact.
+    fn draw_runs(&self, ui: &Rc<Ui>, value: &Value) {
+        clear(&self.run_states);
+        clear(&self.release_states);
+        let runs = rows(value, "runs");
+        for current in runs.iter().filter(|r| is_active(r)) {
+            let state = gtk::Box::new(gtk::Orientation::Horizontal, 9);
+            state.add_css_class("device-release-state");
+            let copy = label(
+                &format!("{} · {}", text(current, "kind"), text(current, "state")),
+                "body",
+            );
+            copy.set_hexpand(true);
+            state.append(&copy);
+            action(
+                ui,
+                &state,
+                "Stop",
+                "device.run.stop",
+                json!({"run_id":current["id"]}),
+            );
+            if text(current, "kind") == "build" {
+                self.release_states.append(&state);
+            } else {
+                self.run_states.append(&state);
+            }
+        }
+        if let Some(last) = runs.iter().find(|r| r["artifact"].is_string()) {
+            let output = gtk::Box::new(gtk::Orientation::Horizontal, 9);
+            output.add_css_class("device-release-state");
+            let copy = gtk::Box::new(gtk::Orientation::Vertical, 3);
+            copy.set_hexpand(true);
+            copy.append(&label(
+                &format!("{} artifact", text(last, "signing")),
+                "body",
+            ));
+            let artifact = text(last, "artifact").to_owned();
+            let path = label(artifact.rsplit('/').next().unwrap_or(&artifact), "mono");
+            path.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+            path.set_tooltip_text(Some(&artifact));
+            copy.append(&path);
+            output.append(&copy);
+            let key = button("Copy path", "quiet");
+            key.connect_clicked(move |key| {
+                key.clipboard().set_text(&artifact);
+                key.set_label("Copied");
+            });
+            output.append(&key);
+            self.release_states.append(&output);
+        }
+    }
+}
+
 /// Footer utility. The full device page retains build history and advanced controls.
 pub fn open(ui: &Rc<Ui>) {
     let Some(panel) = crate::panel::Panel::toggle(ui, "Device control", 430) else {
@@ -987,51 +1209,39 @@ pub fn open(ui: &Rc<Ui>) {
     let ui = ui.clone();
     let task = glib::spawn_future_local(async move {
         let project = ui.project.get();
-        let (devices, trees) = tokio::join!(
-            ui.call("device.list", json!({})),
-            ui.call("worktree.list", json!({"project_id":project}))
-        );
+        let (trees, last) = tokio::join!(worktrees(&ui, project), last_worktree(&ui, project));
         clear(&run);
         clear(&release);
-        let devices = match devices {
-            Ok(v) => rows(&v, "devices"),
-            Err(e) => {
-                run.append(&paragraph(&e.to_string()));
-                Vec::new()
-            }
+        let live = Live {
+            devices: gtk::Box::new(gtk::Orientation::Vertical, 6),
+            target: (project > 0).then(|| (label("Run on", "dim"), gtk::ComboBoxText::new())),
+            signing: (project > 0).then(|| gtk::Box::new(gtk::Orientation::Vertical, 12)),
+            run_states: gtk::Box::new(gtk::Orientation::Vertical, 12),
+            release_states: gtk::Box::new(gtk::Orientation::Vertical, 12),
         };
-        let trees = trees.map(|v| rows(&v, "worktrees")).unwrap_or_default();
-        let (avds, last) = tokio::join!(ui.call("avd.list", json!({})), last_worktree(&ui, project));
-        let avds = avds.map(|v| rows(&v, "avds")).unwrap_or_default();
         run.append(&label("Devices", "title"));
-        device_list(&ui, &run, &devices, &avds);
+        live.devices.append(&paragraph("Loading devices…"));
+        run.append(&live.devices);
         avd_form(&ui, &run);
         release.append(&label("Release artifact", "title"));
         release.append(&paragraph(
             "Build the selected checkout with its Gradle release configuration.",
         ));
+        let mut pickers = Vec::new();
         for (form, is_release) in [(&run, false), (&release, true)] {
-            if project <= 0 {
+            let (Some((caption, target)), Some(signing)) = (&live.target, &live.signing) else {
                 form.append(&paragraph("Select a project to build."));
                 continue;
-            }
+            };
             let tree = WorktreePicker::new(&trees, last.as_deref());
             field("Build from", &tree.widget, form);
-            let target = gtk::ComboBoxText::new();
-            for device in &devices {
-                if text(device, "state") == "device" {
-                    let busy = device["lease"]["action"].is_string();
-                    let serial = text(device, "serial");
-                    let name = avds.iter().find(|avd| avd["running_serial"] == serial).map_or(text(device, "model"), |avd| text(avd, "name"));
-                    target.append(
-                        Some(serial),
-                        &format!("{} · {}{}", name.replace('_', " "), serial, if busy { " · in use" } else { "" }),
-                    );
-                }
-            }
-            target.set_active(Some(0));
-            if !is_release && target.active_id().is_some() {
-                field("Run on", &target, form);
+            pickers.push(tree.clone());
+            if !is_release {
+                // Filled, and shown once a device is connected, by `Live::sync_target`.
+                caption.set_visible(false);
+                target.set_visible(false);
+                form.append(caption);
+                form.append(target);
             }
             let format = gtk::ComboBoxText::new();
             format.append(Some("aab"), "Android App Bundle (.aab) · Google Play");
@@ -1039,35 +1249,7 @@ pub fn open(ui: &Rc<Ui>) {
             format.set_active(Some(0));
             if is_release {
                 field("Artifact", &format, form);
-                if let Ok(signing) = ui
-                    .call("device.signing.get", json!({"project_id":project}))
-                    .await
-                {
-                    if signing["configured"] == true {
-                        form.append(&label(
-                            if signing["enabled"] == true {
-                                "Relay signing configured"
-                            } else {
-                                "Gradle signing"
-                            },
-                            "body",
-                        ));
-                        action(
-                            &ui,
-                            form,
-                            if signing["enabled"] == true {
-                                "Use Gradle signing"
-                            } else {
-                                "Use Relay signing"
-                            },
-                            "device.signing.set_enabled",
-                            json!({"project_id":project,"enabled":signing["enabled"] != true}),
-                        );
-                    } else {
-                        form.append(&label("Gradle signing", "body"));
-                        signing_form(&ui, form, project);
-                    }
-                }
+                form.append(signing);
             }
             let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
             form.append(&actions);
@@ -1085,7 +1267,15 @@ pub fn open(ui: &Rc<Ui>) {
                     },
                     if publish { "quiet" } else { "primary" },
                 );
-                key.set_sensitive(is_release || target.active_id().is_some());
+                key.set_sensitive(is_release);
+                if !is_release {
+                    let run = key.downgrade();
+                    target.connect_changed(move |target| {
+                        if let Some(run) = run.upgrade() {
+                            run.set_sensitive(target.active_id().is_some());
+                        }
+                    });
+                }
                 actions.append(&key);
                 let weak = Rc::downgrade(&ui);
                 let tree = tree.clone();
@@ -1101,64 +1291,8 @@ pub fn open(ui: &Rc<Ui>) {
                 });
             }
         }
-        if project > 0 {
-            if let Ok(value) = ui
-                .call("device.run.list", json!({"project_id":project}))
-                .await
-            {
-                let runs = rows(&value, "runs");
-                for current in runs.iter().filter(|r| {
-                    matches!(
-                        text(r, "state"),
-                        "running" | "building" | "installing" | "launching"
-                    )
-                }) {
-                    let state = gtk::Box::new(gtk::Orientation::Horizontal, 9);
-                    state.add_css_class("device-release-state");
-                    let copy = label(
-                        &format!("{} · {}", text(current, "kind"), text(current, "state")),
-                        "body",
-                    );
-                    copy.set_hexpand(true);
-                    state.append(&copy);
-                    action(
-                        &ui,
-                        &state,
-                        "Stop",
-                        "device.run.stop",
-                        json!({"run_id":current["id"]}),
-                    );
-                    if text(current, "kind") == "build" {
-                        release.append(&state);
-                    } else {
-                        run.append(&state);
-                    }
-                }
-                if let Some(last) = runs.iter().find(|r| r["artifact"].is_string()) {
-                    let output = gtk::Box::new(gtk::Orientation::Horizontal, 9);
-                    output.add_css_class("device-release-state");
-                    let copy = gtk::Box::new(gtk::Orientation::Vertical, 3);
-                    copy.set_hexpand(true);
-                    copy.append(&label(
-                        &format!("{} artifact", text(last, "signing")),
-                        "body",
-                    ));
-                    let artifact = text(last, "artifact").to_owned();
-                    let path = label(artifact.rsplit('/').next().unwrap_or(&artifact), "mono");
-                    path.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-                    path.set_tooltip_text(Some(&artifact));
-                    copy.append(&path);
-                    output.append(&copy);
-                    let key = button("Copy path", "quiet");
-                    key.connect_clicked(move |key| {
-                        key.clipboard().set_text(&artifact);
-                        key.set_label("Copied");
-                    });
-                    output.append(&key);
-                    release.append(&output);
-                }
-            }
-        }
+        run.append(&live.run_states);
+        release.append(&live.release_states);
         let history = button("Build history and advanced controls", "quiet");
         release.append(&history);
         let weak = Rc::downgrade(&ui);
@@ -1168,6 +1302,34 @@ pub fn open(ui: &Rc<Ui>) {
                 ui.navigate("devices");
             }
         });
+        mark_dirty(&ui, project, pickers);
+        // Subscribe before the first read, so nothing that changes in between is missed. The
+        // panel's own Release, Stop, Boot and signing actions come back this way too.
+        let mut events = Client::connect(&ui.rt, ui.path.clone()).await.ok();
+        if let Some((client, _)) = &events {
+            if client.request(&ui.rt, "bus.subscribe", json!({"events":PANEL_EVENTS})).await.is_err() {
+                events = None;
+            }
+        }
+        live.redraw(&ui, project, Parts::ALL).await;
+        let Some((client, notices)) = events else { return };
+        while let Ok(notice) = notices.recv().await {
+            let mut parts = Parts::default();
+            match notice {
+                Notice::Event(event) => parts.note(&event.ev),
+                Notice::Disconnected(_) => break,
+                Notice::Frame(_) => continue,
+            }
+            // A boot or a build sends several in a row: take what has queued and redraw once.
+            glib::timeout_future(std::time::Duration::from_millis(150)).await;
+            while let Ok(notice) = notices.try_recv() {
+                if let Notice::Event(event) = notice {
+                    parts.note(&event.ev);
+                }
+            }
+            live.redraw(&ui, project, parts).await;
+        }
+        drop(client);
     });
     panel.on_closed(move || task.abort());
     panel.present();

@@ -16,7 +16,7 @@ mod task_pages;
 #[path = "board_view.rs"]
 mod board_view;
 pub use notes_window::{refresh_notes, show_notes, NotesWindow};
-pub use task_pages::Draft;
+pub use note_pages::{close_all_notes, open_draft, shown_project, unsaved_notes};
 pub use guardrail_pages::{guardrail_event, hold_summary, restore_prompts, settings_editor as guardrail_settings};
 #[allow(unused_imports)] // entry points for the workspace and project menus
 pub use guardrail_pages::{open_project_guardrails, open_workspace_guardrails};
@@ -51,7 +51,6 @@ pub async fn refresh(ui: &Rc<Ui>, name: &str, project: i64) {
         "board" => ("task.list", "tasks"),
         "mailbox" => ("mailbox.list", "messages"),
         "guardrails" => ("guardrail.holds.list", "holds"),
-        "notes" => ("notes.list", "notes"),
         "modules" => ("module.list", "modules"),
         _ => return,
     };
@@ -65,7 +64,17 @@ pub async fn refresh(ui: &Rc<Ui>, name: &str, project: i64) {
         "mailbox" => json!({"project_id":project,"limit":MAILBOX_LIMIT.with(|limit| limit.get())}),
         _ => json!({"project_id":project}),
     };
-    let result = ui.call(op, payload).await;
+    // The board labels cards with module names, completed modules included (a task keeps its
+    // module after the module completes); both lists are asked for at once.
+    let (result, modules) = if name == "board" {
+        let (tasks, modules) = tokio::join!(
+            ui.call(op, payload),
+            ui.call("module.list", json!({"project_id":project,"include_archived":true}))
+        );
+        (tasks, Some(modules))
+    } else {
+        (ui.call(op, payload).await, None)
+    };
     if ui.project.get() != project || *ui.page.borrow() != name {
         return;
     }
@@ -76,25 +85,16 @@ pub async fn refresh(ui: &Rc<Ui>, name: &str, project: i64) {
             return;
         }
     };
-    if name == "board" {
-        if let Ok(modules) = ui.call("module.list", json!({"project_id":project})).await {
-            let modules = rows(&modules, "modules");
-            for task in &mut data {
-                if let Some(module) = modules
-                    .iter()
-                    .find(|module| module["id"] == task["module_id"])
-                {
-                    task["_module_name"] = module["name"].clone();
-                }
+    if let Some(Ok(modules)) = modules {
+        let modules = rows(&modules, "modules");
+        for task in &mut data {
+            if let Some(module) = modules
+                .iter()
+                .find(|module| module["id"] == task["module_id"])
+            {
+                task["_module_name"] = module["name"].clone();
             }
         }
-        if ui.project.get() != project || *ui.page.borrow() != name {
-            return;
-        }
-    }
-    if name == "notes" {
-        note_pages::workspace(ui, name, project, &data);
-        return;
     }
     if name == "board" {
         board_view::show(ui, &ui.pages[name], project, data);
@@ -109,21 +109,16 @@ pub async fn refresh(ui: &Rc<Ui>, name: &str, project: i64) {
         if name == "modules" {
             page.append(&board_switcher(ui, "modules"));
         }
-        if name != "board" {
-            page.append(&label(
-                match name {
-                    "board" => "Board",
-                    "mailbox" => "Mailbox",
-                    "guardrails" => "Guardrails",
-                    "modules" => "Modules",
-                    _ => "Notes",
-                },
-                "title",
-            ));
-        }
+        page.append(&label(
+            match name {
+                "mailbox" => "Mailbox",
+                "modules" => "Modules",
+                _ => "Guardrails",
+            },
+            "title",
+        ));
         match name {
             "mailbox" => mail_composer(ui, page, project),
-            "notes" => note_composer(ui, page, project),
             "modules" => note_pages::module_composer(ui, page, project),
             _ => page.append(&paragraph(
                 "Answer agents that need an exception, decide which held actions may proceed, and see the exceptions still in force.",
@@ -142,10 +137,8 @@ pub async fn refresh(ui: &Rc<Ui>, name: &str, project: i64) {
     clear(&body);
     if data.is_empty() {
         body.append(&paragraph(match name {
-            "board" => "No tasks yet. Add a task above to assign work.",
             "mailbox" => "No messages in this project.",
-            "guardrails" => "Nothing is waiting for you: no exception requests and no held actions.",
-            _ => "No project notes yet.",
+            _ => "No modules yet. Create one above.",
         }));
     }
     match name {
@@ -183,11 +176,6 @@ pub async fn refresh(ui: &Rc<Ui>, name: &str, project: i64) {
                 row.append(&paragraph(text(&message, "text")));
                 row.append(&label(text(&message, "sent_at"), "dim"));
                 body.append(&row);
-            }
-        }
-        "notes" => {
-            for note in data {
-                note_pages::note_row(ui, &body, note);
             }
         }
         "modules" => note_pages::modules(ui, &body, &data),
@@ -400,57 +388,6 @@ fn mail_composer(ui: &Rc<Ui>, page: &gtk::Box, project: i64) {
                         buffer.set_text("");
                     }
                     ui.show_error(&format!("Message: {}", crate::app::text(&v, "delivery")));
-                    ui.refresh_page();
-                }
-                Err(e) => ui.show_error(&e.to_string()),
-            }
-            b.set_sensitive(true);
-        });
-    });
-}
-fn note_composer(ui: &Rc<Ui>, page: &gtk::Box, project: i64) {
-    let title = gtk::Entry::builder().placeholder_text("Note title").build();
-    let body = gtk::TextView::new();
-    body.set_size_request(-1, 90);
-    body.set_wrap_mode(gtk::WrapMode::WordChar);
-    page.append(&title);
-    page.append(&body);
-    let add = button("Add note", "primary");
-    page.append(&add);
-    let weak = Rc::downgrade(ui);
-    add.connect_clicked(move |b| {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        let name = title.text().trim().to_string();
-        if name.is_empty() {
-            return;
-        }
-        let buffer = body.buffer();
-        let text = buffer
-            .text(&buffer.start_iter(), &buffer.end_iter(), false)
-            .to_string();
-        let title = title.clone();
-        b.set_sensitive(false);
-        let b = b.clone();
-        glib::spawn_future_local(async move {
-            match ui
-                .call(
-                    "notes.create",
-                    json!({"project_id":project,"title":name,"body":text}),
-                )
-                .await
-            {
-                Ok(_) => {
-                    if title.text().trim() == name
-                        && buffer
-                            .text(&buffer.start_iter(), &buffer.end_iter(), false)
-                            .as_str()
-                            == text
-                    {
-                        title.set_text("");
-                        buffer.set_text("");
-                    }
                     ui.refresh_page();
                 }
                 Err(e) => ui.show_error(&e.to_string()),

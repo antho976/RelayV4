@@ -89,8 +89,8 @@ def clean_mesh(mesh, dist=0.0001):
     bmesh.ops.recalc_face_normals(bm, faces=bm.faces)                # outward
     bm.to_mesh(mesh); bm.free(); mesh.update()
 
-def mesh_report(obj):
-    bm = bmesh.new(); bm.from_mesh(obj.data)
+def mesh_report(obj):   # the evaluated mesh (modifiers applied), as the export writes it
+    bm = bmesh.new(); bm.from_object(obj, bpy.context.evaluated_depsgraph_get())
     r = dict(non_manifold_edges=sum(not e.is_manifold for e in bm.edges),
              zero_area=sum(f.calc_area() < 1e-8 for f in bm.faces),
              ngons=sum(len(f.verts) > 4 for f in bm.faces),
@@ -198,7 +198,8 @@ def make_lods(src, ratios=(1.0, 0.5, 0.25, 0.1)):
     base = src.name; src.name = base + "_LOD0"; out = [src]
     for i, r in enumerate(ratios[1:], start=1):
         o = bpy.data.objects.new(f"{base}_LOD{i}", src.data.copy())
-        o.matrix_world = src.matrix_world.copy()
+        # Parent to LOD0 so blender_export of LOD0 brings its _LODn children along.
+        o.parent = src; o.matrix_world = src.matrix_world.copy()
         for c in src.users_collection: c.objects.link(o)
         d = o.modifiers.new("Decimate", 'DECIMATE')
         d.decimate_type = 'COLLAPSE'; d.ratio = r; d.use_collapse_triangulate = True

@@ -189,7 +189,7 @@ import unreal
 with unreal.ScopedEditorTransaction("Set BP_Door defaults"):
     gen_class = unreal.EditorAssetLibrary.load_blueprint_class("/Game/MyGame/Interactables/BP_Door")
     cdo = unreal.get_default_object(gen_class)
-    cdo.set_editor_property("b_enabled", True)       # C++ bEnabled -> Python b_enabled; verify with dir(cdo)
+    cdo.set_editor_property("enabled", True)         # C++ bEnabled -> Python enabled (bools drop the b); verify with dir(cdo)
     cdo.set_editor_property("interact_sound", unreal.load_asset("/Game/Audio/SC_DoorOpen"))
     # C++-defined component: edit through the CDO's component
     mesh = cdo.get_editor_property("door_mesh")      # UPROPERTY TObjectPtr<UStaticMeshComponent> DoorMesh

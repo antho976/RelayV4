@@ -113,11 +113,16 @@ if ARGS.get("folder"):
             paths.append(str(d.package_name))
 limit = int(ARGS.get("limit", 50))
 results = []
+cancelled = False
 with unreal.ScopedSlowTask(min(len(paths), limit), "Reading Blueprints") as task:
+    task.make_dialog(True)  # Cancel stops it and returns what was read so far
     for path in paths[:limit]:
+        if task.should_cancel():
+            cancelled = True
+            break
         task.enter_progress_frame(1)
         try:
             results.append(describe(path))
         except Exception as error:
             results.append({"path": path, "error": str(error)})
-emit({"blueprints": results, "count": len(results), "truncated": len(paths) > limit})
+emit({"blueprints": results, "count": len(results), "truncated": len(paths) > limit, "cancelled": cancelled})
