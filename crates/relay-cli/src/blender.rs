@@ -127,7 +127,7 @@ fn tools() -> Vec<Value> {
                 "touch_distance":{"type":"number","description":"cm, default 5"}
             }), &["file"], true),
         tool("blender_export",
-            "Export FBX for Unreal. kind static (a mesh with its SOCKET_ empties, UCX_/UBX_/USP_ collision and _LODn children), skeletal (an armature and the meshes skinned to it; deform bones only, no leaf bones; animations=true bakes the action) or animation (the armature's action only). Settings are Unreal's usual ones; fbx_options overrides any exporter option. Reports the size in cm to compare after import.",
+            "Export FBX for Unreal. kind static (a mesh with its SOCKET_ empties, UCX_/UBX_/USP_/UCP_ collision and _LODn children), skeletal (an armature and the meshes skinned to it; deform bones only, no leaf bones; animations=true bakes the action) or animation (the armature's action only). Settings are Unreal's usual ones; fbx_options overrides any exporter option except filepath, use_selection and check_existing (use path and objects). Reports the size in cm to compare after import.",
             json!({
                 "file": file_arg(),
                 "objects":{"type":"array","items":{"type":"string"}},
@@ -140,7 +140,7 @@ fn tools() -> Vec<Value> {
                 "allow_problems":{"type":"boolean","description":"Export even when the mesh check or armature scale finds problems"}
             }), &["file","path"], false),
         tool("blender_to_unreal",
-            "Export from Blender and import into the running Unreal editor in one step, then measure the result: imported assets, their size against the Blender size (a 100x difference means a unit problem), a skeletal mesh's root bone scale and which way it faces, and which hand ends up on which side. Needs the Unreal plugin on and the editor open.",
+            "Export from Blender and import into the running Unreal editor in one step, then measure the result: imported assets, their size against the Blender size (a 100x difference means a unit problem), a skeletal mesh's root bone scale and which way it faces (a mirrored rig shows there; hand_sides only reflects bone names). Needs the Unreal plugin on and the editor open.",
             json!({
                 "file": file_arg(),
                 "objects":{"type":"array","items":{"type":"string"}},
@@ -370,9 +370,11 @@ fn run(body: &str, args: &Value, file: Option<&Path>, timeout: Duration) -> Resu
         bail!("Blender failed:\n{}\n(sandbox {})", failure_text(&stdout, &stderr), sandbox.describe());
     }
     let mut value = match result {
-        Some(json_text) => serde_json::from_str(json_text)?,
+        Some(json_text) => serde_json::from_str(json_text).context("the script's RELAY_JSON line is not JSON")?,
         None => json!({}),
     };
+    // Fields are added below; indexing anything but an object would panic (RA-301).
+    anyhow::ensure!(value.is_object(), "the script's result is not a JSON object: {}", tail(&value.to_string(), 5));
     if body == PY_RUN {
         // The agent's own script: its printed output is the result.
         value["output"] = json!(tail(&printed.join("\n"), 300));
@@ -480,6 +482,8 @@ fn to_unreal(root: &Path, args: &Value) -> Result<Value> {
     let fbx_rel = args["fbx_path"].as_str().map(str::to_string).unwrap_or_else(|| format!("Saved/Relay/Exports/{stem}.fbx"));
     let fbx = resolve_new(root, &fbx_rel, "fbx")?;
     crate::mcp::plugin_gate("blender_to_unreal", Some(&file), &[&fbx])?;
+    // The project, the editor on it and its lock, before the export rather than after it.
+    crate::unreal::import_preflight()?;
     let exported = run(PY_EXPORT, &json!({
         "objects": args["objects"], "path": fbx, "kind": kind, "action": args["action"],
         "animations": args["animations"].as_bool().unwrap_or(kind == "animation"),
@@ -510,8 +514,20 @@ fn to_unreal(root: &Path, args: &Value) -> Result<Value> {
 fn compare(exported: &Value, imported: &Value) -> Vec<String> {
     let mut problems = Vec::new();
     if imported["failed"] == true {
+        // Whether each broken asset is gone is what the Asset Registry said after the delete
+        // (`cleaned_up[].deleted`), not assumed (RA-553).
+        let left: Vec<&str> = imported["attempts"].as_array().into_iter().flatten()
+            .flat_map(|attempt| attempt["cleaned_up"].as_array().into_iter().flatten())
+            .filter(|asset| asset["deleted"] == false)
+            .filter_map(|asset| asset["path"].as_str())
+            .collect();
+        let cleanup = if left.is_empty() {
+            "the broken assets were deleted again".to_string()
+        } else {
+            format!("these broken assets could not be deleted and are still in the project: {}", left.join(", "))
+        };
         problems.push(format!(
-            "the import failed with every importer tried and the broken assets were deleted again: {}",
+            "the import failed with every importer tried; {cleanup}: {}",
             serde_json::to_string(&imported["attempts"]).unwrap_or_default()
         ));
     }
@@ -638,6 +654,13 @@ mod tests {
         assert!(problems.iter().any(|p| p.contains("mirrored or turned around")));
         let turned = json!({"imported": [{"path": "/Game/Hero", "size_cm": [60.0, 20.0, 178.0], "forward_axis_in_mesh_space": [1.0, 0.0, 0.0]}]});
         assert!(compare(&exported, &turned)[0].contains("rotated"));
+
+        // A failed import names what the registry still holds, rather than claiming it is gone.
+        let attempt = |deleted: bool| json!({"importer": "legacy", "cleaned_up": [{"path": "/Game/Hero", "deleted": deleted}]});
+        let gone = compare(&exported, &json!({"failed": true, "attempts": [attempt(true)]}));
+        assert!(gone[0].contains("deleted again"), "{gone:?}");
+        let stuck = compare(&exported, &json!({"failed": true, "attempts": [attempt(true), attempt(false)]}));
+        assert!(stuck[0].contains("still in the project: /Game/Hero") && !stuck[0].contains("deleted again"), "{stuck:?}");
     }
 
     #[test]

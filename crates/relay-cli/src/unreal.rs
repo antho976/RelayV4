@@ -11,6 +11,7 @@
 //! engine directory (the one holding `Engine/`), `UE_REMOTE_CONTROL_URL` the editor endpoint
 //! and `UE_REMOTE_CONTROL_PASSPHRASE` its passphrase when one is required.
 
+use crate::mcp::tool;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Map, Value};
 use std::io::{Read, Write};
@@ -19,8 +20,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-const FALLBACK_PROTOCOL: &str = "2025-06-18";
-const SUPPORTED_PROTOCOLS: &[&str] = &["2026-07-28", "2025-11-25", FALLBACK_PROTOCOL];
 const DEFAULT_REMOTE: &str = "http://127.0.0.1:30010";
 const PYTHON_LIBRARY: &str = "/Script/PythonScriptPlugin.Default__PythonScriptLibrary";
 /// Editor plugins the live tools depend on, by `.uproject` plugin name.
@@ -47,8 +46,6 @@ const LOCK_IDLE: Duration = Duration::from_secs(15 * 60);
 const LOCK_HEARTBEAT: Duration = Duration::from_secs(60);
 /// Log lines a tool returns: the first half and the last half of what matched.
 const MAX_LOG_LINES: usize = 300;
-/// Images one call may return; each is a full PNG in the agent's context.
-const MAX_IMAGES: usize = 16;
 
 // Every script gets the character frame and bone naming shared with the Blender tools.
 const PY_COMMON: &str = concat!(include_str!("unreal_py/common.py"), "\n", include_str!("rig_frame.py"));
@@ -78,47 +75,16 @@ fn lane(name: &str, args: &Value) -> crate::mcp::Lane {
     if reads { crate::mcp::Lane::Parallel } else { crate::mcp::Lane::Serial }
 }
 
-fn handle(message: &Value) -> Option<Value> {
-    let id = message.get("id").cloned()?;
-    let result = match message.get("method").and_then(Value::as_str) {
-        Some("initialize") => {
-            let requested = message.pointer("/params/protocolVersion").and_then(Value::as_str).unwrap_or(FALLBACK_PROTOCOL);
-            let protocol = SUPPORTED_PROTOCOLS.iter().copied().find(|v| *v == requested).unwrap_or(FALLBACK_PROTOCOL);
-            json!({
-                "protocolVersion": protocol,
-                "capabilities": {"tools":{"listChanged":false}},
-                "serverInfo": {"name":"unreal","title":"Unreal Engine (Relay plugin)","version":env!("CARGO_PKG_VERSION")},
-                "instructions": "Unreal Engine bridge for the project in this checkout. Start with ue_project_info. ue_build and ue_log work without the editor; ue_python, ue_call, ue_property, ue_search_assets, ue_level_actors and ue_console need the editor open with its Remote Control web server running (check with ue_editor_status, diagnose with ue_setup_check). Load the unreal-editor-automation skill before editor scripting."
-            })
-        }
-        Some("ping") => json!({}),
-        Some("tools/list") => json!({"tools": tools()}),
-        Some("tools/call") => {
-            let Some(name) = message.pointer("/params/name").and_then(Value::as_str) else {
-                return Some(rpc_error(id, -32602, "Invalid params", Some(json!({"message":"tools/call requires params.name"}))));
-            };
-            let arguments = message.pointer("/params/arguments").cloned().unwrap_or_else(|| json!({}));
-            if !tools().iter().any(|tool| tool["name"] == name) {
-                return Some(rpc_error(id, -32602, "Unknown tool", Some(json!({"name":name}))));
-            }
-            match call(name, &arguments) {
-                Ok(value) => tool_result(value, false),
-                Err(error) => tool_result(json!({"error": format!("{error:#}")}), true),
-            }
-        }
-        Some(other) => return Some(rpc_error(id, -32601, "Method not found", Some(json!({"method":other})))),
-        None => return Some(rpc_error(id, -32600, "Invalid Request", None)),
-    };
-    Some(json!({"jsonrpc":"2.0","id":id,"result":result}))
-}
+const SERVER: crate::mcp::PluginServer = crate::mcp::PluginServer {
+    name: "unreal",
+    title: "Unreal Engine (Relay plugin)",
+    instructions: "Unreal Engine bridge for the project in this checkout. Start with ue_project_info. ue_build and ue_log work without the editor; ue_python, ue_call, ue_property, ue_search_assets, ue_level_actors and ue_console need the editor open with its Remote Control web server running (check with ue_editor_status, diagnose with ue_setup_check). Load the unreal-editor-automation skill before editor scripting.",
+    tools,
+    call,
+};
 
-pub(crate) fn tool(name: &str, description: &str, properties: Value, required: &[&str], read_only: bool) -> Value {
-    json!({
-        "name": name,
-        "description": description,
-        "inputSchema": {"type":"object","properties":properties,"required":required,"additionalProperties":false},
-        "annotations": {"readOnlyHint": read_only, "destructiveHint": !read_only, "openWorldHint": false}
-    })
+fn handle(message: &Value) -> Option<Value> {
+    crate::mcp::plugin_reply(&SERVER, message)
 }
 
 fn tools() -> Vec<Value> {
@@ -427,6 +393,16 @@ fn call(name: &str, args: &Value) -> Result<Value> {
     }
 }
 
+/// What `import_fbx` will need, asked before the Blender export that precedes it, which can take
+/// minutes (RA-588): this checkout's project, the editor open on it, and no other agent holding
+/// the editor. Only advisory for the lock, which can change during the export; `import_fbx`
+/// still takes it.
+pub(crate) fn import_preflight() -> Result<()> {
+    let project = Project::find()?;
+    guard_project(&project)?;
+    lock_free_for(&read_lock(&project), &holder_id())
+}
+
 /// Import an FBX into the editor's project and measure what arrived (used by the Blender
 /// plugin's `blender_to_unreal`). Same project guard and editor lock as every live tool.
 pub(crate) fn import_fbx(fbx: &Path, mut args: Value) -> Result<Value> {
@@ -591,8 +567,8 @@ fn acquire_lock(project: &Project, me: &str) -> Result<()> {
     with_lock_file(&lock_path(project), || acquire_lock_locked(project, me))
 }
 
-fn acquire_lock_locked(project: &Project, me: &str) -> Result<()> {
-    let lock = read_lock(project);
+/// Refuses when someone other than `me` holds `lock` and it has not expired.
+fn lock_free_for(lock: &Value, me: &str) -> Result<()> {
     if let Some(holder) = lock["holder"].as_str() {
         if holder != me && lock["expired"] != true {
             bail!(
@@ -601,6 +577,12 @@ fn acquire_lock_locked(project: &Project, me: &str) -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+fn acquire_lock_locked(project: &Project, me: &str) -> Result<()> {
+    let lock = read_lock(project);
+    lock_free_for(&lock, me)?;
     let since = if lock["holder"].as_str() == Some(me) { lock["since"].as_u64().unwrap_or(now_secs()) } else { now_secs() };
     write_lock_at(&lock_path(project), &json!({"holder": me, "since": since, "last_used": now_secs()}))
 }
@@ -2215,43 +2197,6 @@ fn dechunk(mut raw: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
-pub(crate) fn tool_result(mut value: Value, is_error: bool) -> Value {
-    let images = value.as_object_mut().and_then(|o| o.remove("_images")).and_then(|v| v.as_array().cloned()).unwrap_or_default();
-    let cleanup = value.as_object_mut().and_then(|o| o.remove("_cleanup"));
-    let mut content = Vec::new();
-    let mut shown = Vec::new();
-    for image in images.iter().take(MAX_IMAGES) {
-        let Some(path) = image["path"].as_str() else { continue };
-        if let Ok(bytes) = std::fs::read(path) {
-            use base64::Engine as _;
-            content.push(json!({"type":"text","text":format!("Image: {}", image["label"].as_str().unwrap_or(""))}));
-            content.push(json!({"type":"image","data":base64::engine::general_purpose::STANDARD.encode(bytes),"mimeType":"image/png"}));
-            shown.push(image["label"].clone());
-        }
-    }
-    if !images.is_empty() {
-        value["images"] = json!({"shown": shown, "requested": images.len(), "limit": MAX_IMAGES});
-    }
-    if let Some(dir) = cleanup.as_ref().and_then(Value::as_str) {
-        let _ = std::fs::remove_dir_all(dir);
-    }
-    let text = serde_json::to_string_pretty(&value).unwrap_or_default();
-    content.insert(0, json!({"type":"text","text":text}));
-    let mut result = json!({"content":content,"isError":is_error});
-    if !is_error {
-        result["structuredContent"] = value;
-    }
-    result
-}
-
-pub(crate) fn rpc_error(id: Value, code: i64, message: &str, data: Option<Value>) -> Value {
-    let mut error = json!({"code":code,"message":message});
-    if let Some(data) = data {
-        error["data"] = data;
-    }
-    json!({"jsonrpc":"2.0","id":id,"error":error})
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2415,6 +2360,9 @@ mod tests {
         acquire_lock(&project, "calm-otter").expect("the holder keeps its own lock");
         let refused = acquire_lock(&project, "brisk-fox").unwrap_err().to_string();
         assert!(refused.contains("calm-otter"), "{refused}");
+        // blender_to_unreal's preflight asks the same question without taking the lock.
+        assert!(lock_free_for(&read_lock(&project), "brisk-fox").is_err());
+        assert!(lock_free_for(&read_lock(&project), "calm-otter").is_ok());
         assert!(release_lock(&project, "brisk-fox").is_err(), "only the holder releases");
         release_lock(&project, "calm-otter").unwrap();
         acquire_lock(&project, "brisk-fox").unwrap();
@@ -2504,7 +2452,7 @@ mod tests {
             {"view":"front","file":dir.join("shot_front.png")},
             {"view":"right","file":dir.join("shot_right.png")}
         ]})), &dir).unwrap();
-        let result = tool_result(value, false);
+        let result = crate::mcp::tool_result(value, false);
         let content = result["content"].as_array().unwrap();
         let images: Vec<&Value> = content.iter().filter(|c| c["type"] == "image").collect();
         assert_eq!(images.len(), 1);
