@@ -12,7 +12,7 @@ use relay_bus::registry::Op;
 use relay_bus::{Empty, Request};
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,11 +49,21 @@ impl SocketServer {
         Self::start_in(engine, dir).await
     }
 
-    /// Same, in an explicit directory (tests; `relay serve --runtime-dir`).
+    /// Same, in an explicit directory (tests).
     pub async fn start_in(engine: Arc<Engine>, dir: PathBuf) -> Result<SocketServer, BindError> {
         let inst = engine.instance;
-        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        // The lock and the socket are only as safe as the directory holding them: one another
+        // user owns lets them plant a symlink as the lock (truncated below) or swap the socket
+        // for their own (RA-013). So it must be ours, private, and in a parent we trust.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .with_context(|| format!("creating {}", dir.display()))?;
+        crate::paths::check_parent_dir(&dir).with_context(|| format!("refusing runtime dir {}", dir.display()))?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("chmod {}", dir.display()))?;
+        crate::paths::check_private_dir(&dir).with_context(|| "refusing the runtime dir")?;
         let lock_path = dir.join(format!("{}.lock", inst.as_str()));
         let sock_path = dir.join(format!("{}.sock", inst.as_str()));
 
@@ -63,8 +73,19 @@ impl SocketServer {
             .create(true)
             .truncate(false)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&lock_path)
             .with_context(|| format!("opening {}", lock_path.display()))?;
+        {
+            use std::os::unix::fs::MetadataExt;
+            let meta = lock.metadata().with_context(|| format!("stat {}", lock_path.display()))?;
+            if !meta.is_file() || meta.uid() != unsafe { libc::getuid() } {
+                return Err(BindError::Other(anyhow::anyhow!(
+                    "{} is not a regular file of ours; refusing to use it as the lock",
+                    lock_path.display()
+                )));
+            }
+        }
         let rc = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc != 0 {
             // Someone holds the lock. Is their engine alive?
@@ -328,6 +349,9 @@ impl Drop for Borrowed {
     }
 }
 
+/// How many unlocked queries one connection may have running at once.
+const MAX_CONCURRENT_QUERIES: usize = 8;
+
 async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) -> Result<()> {
     // The blocking dispatch keeps this Arc until its ownership update completes,
     // even if the socket task is cancelled while that dispatch is in flight.
@@ -383,8 +407,14 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) -> Result<()> {
         std::collections::HashMap::new();
     // Dropped with the connection, which is when a borrowed size goes back.
     let mut borrowed = Borrowed::default();
+    // Unlocked queries in flight on this connection. One client multiplexes all of its UI
+    // traffic here, so a slow read (a PR listing, a diff, a search) used to hold up every
+    // request queued behind it; D149's parallelism held only across connections (RA-015).
+    let mut inflight = tokio::task::JoinSet::new();
+    let concurrent = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_QUERIES));
 
     while let Some(line) = lines.next_line().await? {
+        while inflight.try_join_next().is_some() {}
         if line.trim().is_empty() {
             continue;
         }
@@ -395,6 +425,27 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) -> Result<()> {
                 continue;
             }
         };
+        if engine.runs_unlocked(&req.op) {
+            // Answered whenever it finishes; the client correlates by id. The permit bounds
+            // how much of the blocking pool one connection can hold, and stops reading the
+            // connection while it is spent.
+            let permit = concurrent.clone().acquire_owned().await?;
+            let (e, tx) = (engine.clone(), out_tx.clone());
+            inflight.spawn(async move {
+                let resp = tokio::task::spawn_blocking(move || e.dispatch(req, Door::Socket)).await;
+                drop(permit);
+                if let Ok(line) = resp.map_err(anyhow::Error::from).and_then(|resp| Ok(serde_json::to_string(&resp)?)) {
+                    let _ = tx.send(line).await;
+                }
+            });
+            continue;
+        }
+        // Everything else keeps its place in line: it waits for the queries sent before it,
+        // so a client that reads then writes still has its read answered first. A keystroke
+        // never touches the store and does not wait.
+        if !engine.answers_from_memory(&req) {
+            while inflight.join_next().await.is_some() {}
+        }
         let resp = if matches!(req.op.as_str(), "device.watch" | "app.resources.watch") {
             let lease = if req.op == "device.watch" {
                 device_watch.clone()
@@ -812,6 +863,7 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) -> Result<()> {
         };
         let _ = out_tx.send(serde_json::to_string(&resp)?).await;
     }
+    while inflight.join_next().await.is_some() {}
     if let Some(h) = forwarder.take() {
         h.abort();
     }
@@ -835,11 +887,22 @@ pub struct Client {
     w: tokio::net::unix::OwnedWriteHalf,
 }
 
+/// Refuse an engine run by another user. Whoever listens at the socket path receives agent
+/// tokens and answers guardrail gates, so a client checks who that is before saying anything
+/// (RA-013).
+pub fn same_user(stream: &UnixStream) -> Result<()> {
+    let peer = stream.peer_cred().context("reading the engine's credentials")?.uid();
+    let me = unsafe { libc::getuid() };
+    anyhow::ensure!(peer == me, "the socket belongs to uid {peer}, not to this user ({me})");
+    Ok(())
+}
+
 impl Client {
     pub async fn connect(path: &Path) -> Result<Client> {
         let stream = UnixStream::connect(path)
             .await
             .with_context(|| format!("connecting to {}", path.display()))?;
+        same_user(&stream).with_context(|| format!("connecting to {}", path.display()))?;
         let (r, w) = stream.into_split();
         Ok(Client {
             lines: BufReader::new(r).lines(),

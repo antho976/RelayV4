@@ -206,6 +206,11 @@ mutation emits at least one event**, and every event's payload is reproducible b
   `session.spawn` and exported to the child as `RELAY_SESSION=<name>` and
   `RELAY_TOKEN=<token>`. Wrong or missing token → `invalid` / `bus.actor`. `user` needs no
   token (same uid, same trust — §0.6). `test` needs `RELAY_INSTANCE` ∈ {dev, test}.
+  "Same uid" is checked, not assumed: the engine refuses a runtime directory that is a symlink,
+  not its own or open to group/other, and a lock file that is not a regular file of its own;
+  clients refuse a socket whose `SO_PEERCRED` uid is not theirs. Without `XDG_RUNTIME_DIR` the
+  runtime directory is `/run/user/<uid>` when that is private, else under `~/.cache` — never a
+  predictable name in `/tmp`.
 - The token is per session-lifetime; parking and waking keep it; `session.close` revokes it.
 
 ---

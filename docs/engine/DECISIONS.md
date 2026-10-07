@@ -474,6 +474,17 @@ The *why* behind anything surprising. Append; never rewrite history. Reference a
   inside quotes, and matches a pattern only against unquoted words in one command. A word that is
   only partly quoted counts as unquoted: when in doubt, still inspect it. A `relay … guardrail.check`
   command is skipped outright, and only that command — anything chained after it is still judged.
+  The 2026-10 audit (RA-010, RA-011) found the reader and the matcher both too literal: commands
+  inside `( )`, `$( )`, backticks and `sh -c` were never seen, and a pattern matched only as its
+  exact words in a row, so `git push origin main --force`, `git clean -fdx`, `rm -fr` and
+  `git -C app reset --hard` all ran. `shell.rs` is now the one reader (the device-lease gate uses
+  it too); it follows POSIX backslash rules, splits on subshells and substitutions, reads
+  `$( )` inside double quotes and the argument of `sh -c` / `eval` as commands of their own. A
+  pattern is read as program, subcommands and flags: the program matches by basename anywhere in
+  the command (so `sudo` and `find -exec` still count), git's value-taking global options are
+  skipped before the subcommand, flags match as a set anywhere after it with clusters expanded
+  (`-fdx` holds `-f` and `-d`), `--force`/`-f` and `-R`/`--recursive`/`-r` are one flag for `rm`
+  and `git`, and `+ref` counts as a forced push. Quoted text containing a space is still data.
 - **D104 One answer to "may I call this?", computed once.** Relay gates in three layers: registry
   `actors`, runtime row scope, and the per-role allowlist. `bus.ops` and the MCP tool list knew
   only the first, so `relay ops --mine` reported 133 callable ops when a builder's real write
@@ -542,7 +553,11 @@ The *why* behind anything surprising. Append; never rewrite history. Reference a
   and a pattern written for one directory locked a whole tree. `*` now matches within a segment
   and `**` crosses them, which is what the documentation always claimed and what anyone writing
   a pattern expects. Over-broad protection is not the safe direction: it trains agents to treat
-  refusals as noise.
+  refusals as noise. A `**/` component matches zero or more whole directories, so `**/*.pem`
+  covers `c.pem` and `a/b/c.pem` alike; the first matcher kept a single backtrack point and
+  matched exactly one directory deep (RA-012). A `**` that is not a whole component (`**.pem`)
+  still crosses separators. A glob naming a directory does not cover its contents; a literal
+  path does.
 - **D114 A destructive write is judged by what would be lost, not by how much changed.** Volume
   is a proxy; the question that matters is whether the content can come back. When the rule is
   about to fire, Relay asks git: a file that is committed and unmodified is one `git checkout --`
@@ -813,6 +828,11 @@ The *why* behind anything surprising. Append; never rewrite history. Reference a
   `usage.get`, `github.status`, `github.repo.list` (unlocked); `git.commit`, `git.fetch`,
   `git.push`, `worktree.create`, `skill.install` (staged). Because each door dispatches from
   `spawn_blocking`, those queries now genuinely run in parallel rather than merely appearing to.
+  (That first held only across connections: the socket door read one connection's next request
+  only after answering the last, and the native client sends all of its UI traffic on one. The
+  door now runs up to eight unlocked queries per connection at once and answers each by id; any
+  other request waits for the queries sent before it on that connection, so a read followed by a
+  write is still answered in that order. RA-015.)
   Two constraints bind. A staged op can still be replayed from inside another transaction —
   `guardrail.confirm` replaying a held `git.commit` — so `invoke_registered` runs the missing
   prepare against the connection it already holds; that path costs what it cost before the split,

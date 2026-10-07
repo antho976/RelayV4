@@ -156,6 +156,7 @@ pub async fn run(
     let stream = UnixStream::connect(&ctx.socket_path)
         .await
         .with_context(|| format!("no engine at {}", ctx.socket_path.display()))?;
+    relay_core::socket::same_user(&stream)?;
     let (reader, mut writer) = stream.into_split();
 
     let to_phone = outbound.clone();

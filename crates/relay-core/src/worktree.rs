@@ -348,12 +348,40 @@ pub fn purge_build(wt: &Path) -> u64 {
     freed
 }
 
+/// The directories Relay creates checkouts in: the session pool and the integration area.
+fn managed_dirs(repo: &Path) -> [PathBuf; 2] {
+    [pool_dir(repo), repo.join(".relay").join("integrations")]
+}
+
 /// Remove a linked worktree (never the primary). Returns bytes freed. The branch is kept.
+///
+/// `path` must be a linked worktree git lists for `repo`, or a directory strictly inside one of
+/// Relay's own checkout areas (a pooled checkout half-deleted, whose admin entry may already be
+/// pruned). Anything else is refused before a byte is touched: this used to purge build
+/// directories under, and then `rm -rf`, whatever path it was handed (RA-017). The plain
+/// `rm -rf` fallback is likewise kept to Relay's own areas; a registered checkout elsewhere that
+/// git will not remove (locked, say) stays where it is.
 pub fn remove(repo: &Path, path: &Path, purge: bool) -> Result<u64> {
+    if !path.is_absolute() {
+        return Err(anyhow!("{} is not an absolute path", path.display()));
+    }
     let repo_c = canon(repo);
     let path_c = canon(path);
     if repo_c == path_c {
         return Err(anyhow!("refusing to remove the primary checkout"));
+    }
+    let managed = managed_dirs(repo).iter().any(|dir| {
+        let dir = PathBuf::from(canon(dir));
+        let path = Path::new(&path_c);
+        path != dir && path.starts_with(&dir)
+    });
+    let registered = list_with_dirty(repo, false)?.iter().skip(1).any(|wt| wt.path == path_c);
+    if !registered && !managed {
+        return Err(anyhow!("{path_c} is not a worktree of {repo_c}"));
+    }
+    // Relay never locks a worktree; someone did so to keep it. Refuse before purging anything.
+    if is_locked(Path::new(&path_c)) {
+        return Err(anyhow!("{path_c} is locked (git worktree unlock it first)"));
     }
     let mut freed = 0;
     if path.exists() {
@@ -361,12 +389,24 @@ pub fn remove(repo: &Path, path: &Path, purge: bool) -> Result<u64> {
         freed += dir_size(path);
         git(repo, &["worktree", "remove", "--force", &path_c])
             .or_else(|e| {
+                if !managed {
+                    return Err(e);
+                }
                 // a half-deleted worktree: remove the dir ourselves and prune
                 std::fs::remove_dir_all(path).map(|_| String::new()).map_err(|io| anyhow!("{e}; and rm -rf failed: {io}"))
             })?;
     }
     let _ = git(repo, &["worktree", "prune"]);
     Ok(freed)
+}
+
+/// Whether `git worktree lock` holds this checkout: its admin slot carries a `locked` file.
+fn is_locked(path: &Path) -> bool {
+    let Ok(pointer) = std::fs::read_to_string(path.join(".git")) else { return false };
+    let Some(gitdir) = pointer.trim().strip_prefix("gitdir:") else { return false };
+    let gitdir = PathBuf::from(gitdir.trim());
+    let gitdir = if gitdir.is_absolute() { gitdir } else { path.join(gitdir) };
+    gitdir.join("locked").exists()
 }
 
 /// Rename the branch checked out by one worktree. Used only before a session's first spawn.

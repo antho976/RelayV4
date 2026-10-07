@@ -302,6 +302,34 @@ fn roles_scope_shape_exec_and_commit_caps_resist_bypass() {
         json!({"session": reviewer_name, "kind": "exec", "command": "cargo test"}),
     );
     assert_eq!(error(&denied).code, "actor.allowlist");
+    // RA-014: a Codex reviewer reaches the bus only through `$RELAY_BIN q …` in its shell, so
+    // a single bus call, and a read-only look at the checkout, pass its closed shell. Anything
+    // chained, redirected, substituted or acting as someone else does not.
+    let gate = |command: &str| {
+        call(
+            engine,
+            Actor::agent(reviewer_name),
+            "guardrail.gate",
+            json!({"session": reviewer_name, "kind": "exec", "command": command}),
+        )
+    };
+    for command in [
+        "$RELAY_BIN q session.bootstrap",
+        "\"$RELAY_BIN\" q mailbox.send '{\"to\":\"x\",\"text\":\"fix line 3; then rerun\"}'",
+        "$RELAY_BIN q session.done '{\"summary\":\"ok\"}'",
+        "bash -lc '$RELAY_BIN q session.bootstrap'",
+        "git diff main...HEAD", "git -C sub log --oneline -5", "rg -n 'fn main' src", "cat src/lib.rs",
+    ] {
+        assert!(gate(command).ok, "a reviewer may run {command:?}: {:?}", gate(command).error);
+    }
+    for command in [
+        "$RELAY_BIN q session.bootstrap; touch x", "$RELAY_BIN q session.bootstrap > out.json",
+        "$RELAY_BIN --actor user q guardrail.confirm '{\"hold_id\":1}'", "RELAY_SESSION= $RELAY_BIN q task.create",
+        "$RELAY_BIN q x \"$(touch y)\"", "relay-evil q session.done", "git -c core.pager=sh diff",
+        "git diff --output=patch.txt", "rg --pre ./run.sh x", "git commit -m x", "cat a | tee b",
+    ] {
+        assert_eq!(error(&gate(command)).code, "actor.allowlist", "a reviewer may not run {command:?}");
+    }
     let query = call(
         engine,
         Actor::agent(reviewer_name),

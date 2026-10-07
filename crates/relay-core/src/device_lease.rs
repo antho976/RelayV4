@@ -317,8 +317,10 @@ pub struct DeviceCommand {
 /// try to be a shell. Whatever it misses runs unleased, as everything did before.
 pub fn device_command(line: &str) -> Option<DeviceCommand> {
     let mut exported_serial: Option<String> = None;
-    for segment in split_commands(line) {
-        let tokens: Vec<String> = segment.split_whitespace().map(unquote).collect();
+    // The same reader the denied-command guardrail uses: `( )`, `$( )`, backticks and
+    // `sh -c '…'` each start a command, and a quoted argument stays one word.
+    for segment in crate::shell::commands(line) {
+        let tokens: Vec<String> = segment.into_iter().map(|word| word.text).collect();
         let mut index = 0;
         let mut serial = exported_serial.clone();
         // Leading assignments and wrappers: `ANDROID_SERIAL=x env timeout 300 ./gradlew …`.
@@ -360,37 +362,6 @@ pub fn device_command(line: &str) -> Option<DeviceCommand> {
         }
     }
     None
-}
-
-fn split_commands(line: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut current = String::new();
-    let mut quote: Option<char> = None;
-    let mut chars = line.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match (quote, ch) {
-            (Some(q), c) if c == q => { quote = None; current.push(c); }
-            (Some(_), c) => current.push(c),
-            (None, '\'' | '"') => { quote = Some(ch); current.push(ch); }
-            (None, ';' | '\n' | '|' | '&' | '(' | ')' | '`') => {
-                if ch == '&' && chars.peek() == Some(&'>') { current.push(ch); continue; }
-                if !current.trim().is_empty() { out.push(std::mem::take(&mut current)); }
-                current.clear();
-            }
-            (None, '$') if chars.peek() == Some(&'(') => {
-                chars.next();
-                if !current.trim().is_empty() { out.push(std::mem::take(&mut current)); }
-                current.clear();
-            }
-            (None, c) => current.push(c),
-        }
-    }
-    if !current.trim().is_empty() { out.push(current); }
-    out
-}
-
-fn unquote(token: &str) -> String {
-    token.trim_matches(|c| c == '\'' || c == '"').to_string()
 }
 
 fn is_assignment(token: &str) -> bool {

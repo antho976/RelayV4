@@ -25,6 +25,7 @@ pub mod pty;
 pub mod recovery;
 pub mod serve;
 pub mod sessions;
+mod shell;
 pub mod skills;
 pub mod socket;
 pub mod store;
