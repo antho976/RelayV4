@@ -69,16 +69,23 @@ fn valid_path(p: &str) -> Result<(), BusError> {
     Ok(())
 }
 
-fn flatten(prefix: &str, v: &Value, out: &mut Vec<(String, Value)>) {
+/// The leaf rows for `v` at `prefix`. Rows are keyed by dotted path, so an object key that is
+/// empty or holds a `.` cannot be stored: `{"ctrl+.": …}` read back as `{"ctrl+": {"": …}}`
+/// (RA-407). Any other key is kept as it is (`ctrl+k` is a keybinding).
+fn flatten(prefix: &str, v: &Value, out: &mut Vec<(String, Value)>) -> Result<(), BusError> {
     match v {
         Value::Object(m) if !m.is_empty() => {
             for (k, v) in m {
+                if k.is_empty() || k.contains('.') {
+                    return Err(BusError::invalid("settings.key", format!("settings key {k:?} under {prefix:?} cannot be empty or contain '.'")));
+                }
                 let p = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
-                flatten(&p, v, out);
+                flatten(&p, v, out)?;
             }
         }
         _ => out.push((prefix.to_string(), v.clone())),
     }
+    Ok(())
 }
 
 fn set_at(root: &mut Value, path: &str, v: Value) {
@@ -267,10 +274,15 @@ pub fn ignore_unknown_guardrail_keys(root: &mut Value) {
 
 pub fn set(tx: &Transaction, path: &str, value: &Value, now: &str) -> Result<(), BusError> {
     valid_path(path)?;
+    // The root is a tree of keys, never a value of its own: a row at "" is applied by a whole-tree
+    // read but by no leaf read, so the two disagreed (RA-407).
+    if path.is_empty() && !value.as_object().is_some_and(|m| !m.is_empty()) {
+        return Err(BusError::invalid("settings.path", "the settings root can only be set to a non-empty object; settings.reset clears it"));
+    }
     check_guardrail_keys(path, value)?;
     delete_under(tx, path)?;
     let mut leaves = Vec::new();
-    flatten(path, value, &mut leaves);
+    flatten(path, value, &mut leaves)?;
     for (p, v) in leaves {
         tx.execute("INSERT INTO settings(path, value, updated_at) VALUES (?1, ?2, ?3)",
             params![p, serde_json::to_string(&v).bus()?, now]).bus()?;
@@ -332,5 +344,27 @@ mod tests {
         assert!(defaults["appearance"].get("wallpaper_preview").is_none());
         assert!(defaults["layout"].is_object(), "ui.rs reads layout.current.<project>");
         assert!(defaults["guardrails"]["roles"].is_object(), "the role allow-sets live here");
+    }
+
+    /// Keys are path segments once stored, so one that would split differently is refused, as is
+    /// a root that is not a tree (RA-407).
+    #[test]
+    fn a_value_that_would_not_read_back_is_refused() {
+        let store = crate::Store::open_memory().unwrap();
+        store.with_tx(|tx| {
+            for (path, value) in [
+                ("keybindings", serde_json::json!({"ctrl+.": {"op": "ui.toast"}})),
+                ("theme", serde_json::json!({"a.b": 1, "a": {"b": 2}})),
+                ("theme", serde_json::json!({"": 1})),
+                ("", serde_json::json!({})),
+                ("", serde_json::json!(1)),
+            ] {
+                let error = super::set(tx, path, &value, "t").unwrap_err();
+                assert!(error.code == "settings.key" || error.code == "settings.path", "{path:?} {value}: {}", error.code);
+            }
+            super::set(tx, "keybindings", &serde_json::json!({"ctrl+k": {"op": "ui.page.switch"}}), "t").unwrap();
+            assert_eq!(super::get(tx, Some("keybindings")).unwrap()["ctrl+k"]["op"], "ui.page.switch");
+            Ok(())
+        }).unwrap();
     }
 }

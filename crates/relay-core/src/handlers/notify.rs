@@ -82,12 +82,31 @@ fn list(
     Ok(notifications)
 }
 
+/// The one project an agent sees (D106; BUS.md §9.1 layer 2), or `None` for a person, who sees
+/// them all. The dashboard and the notification list are otherwise every project's (RA-386).
+fn agent_project(ctx: &Ctx) -> Result<Option<i64>, relay_bus::BusError> {
+    if let Some(session_id) = ctx.actor_session_id() {
+        let row = crate::sessions::by_id(ctx.tx(), session_id)?
+            .ok_or_else(|| relay_bus::BusError::actor("bound session no longer exists"))?;
+        return Ok(Some(row.session.project_id));
+    }
+    if ctx.actor.is_agent() {
+        return Err(relay_bus::BusError::actor("agent actor is not bound to a live session"));
+    }
+    Ok(None)
+}
+
 pub fn register(engine: &mut Engine) {
     engine.register::<List>(|ctx, payload| {
+        let project_id = match (agent_project(ctx)?, payload.project_id) {
+            (Some(own), Some(asked)) if asked != own => return Err(relay_bus::BusError::not_own("project")),
+            (Some(own), _) => Some(own),
+            (None, asked) => asked,
+        };
         Ok(ListOut {
             notifications: list(
                 ctx,
-                payload.project_id,
+                project_id,
                 payload.unread_only,
                 payload.category,
                 payload.limit,
@@ -157,20 +176,22 @@ pub fn register(engine: &mut Engine) {
         Ok(next)
     });
     engine.register::<DashboardGet>(|ctx, _| {
-        let project_ids = ctx.tx().prepare_cached("SELECT id FROM projects ORDER BY id").bus()?
-            .query_map([], |row| row.get::<_, i64>(0)).bus()?
+        // An agent's dashboard is its own project's; NULL is every project.
+        let only = agent_project(ctx)?;
+        let project_ids = ctx.tx().prepare_cached("SELECT id FROM projects WHERE ?1 IS NULL OR id=?1 ORDER BY id").bus()?
+            .query_map([only], |row| row.get::<_, i64>(0)).bus()?
             .collect::<rusqlite::Result<Vec<_>>>().bus()?;
         let mut sessions_live = Vec::new();
         for project_id in project_ids { sessions_live.extend(crate::awareness::peers(ctx.tx(), project_id, None, Some(ctx.engine()))?); }
         sessions_live.retain(|peer| matches!(peer.state, relay_bus::types::SessionState::Spawning | relay_bus::types::SessionState::Running | relay_bus::types::SessionState::Idle | relay_bus::types::SessionState::Blocked));
-        let mut stmt = ctx.tx().prepare_cached("SELECT * FROM tasks WHERE col='in_review' AND deleted_at IS NULL ORDER BY updated_at DESC,id DESC").bus()?;
-        let mut rows = stmt.query([]).bus()?;
+        let mut stmt = ctx.tx().prepare_cached("SELECT * FROM tasks WHERE col='in_review' AND deleted_at IS NULL AND (?1 IS NULL OR project_id=?1) ORDER BY updated_at DESC,id DESC").bus()?;
+        let mut rows = stmt.query([only]).bus()?;
         let mut in_review = Vec::new();
         while let Some(row) = rows.next().bus()? { in_review.push(crate::handlers::task::row_task(ctx.tx(), row).bus()?); }
         // The newest open holds, cut like guardrail.holds.list cuts them: the dashboard is one
         // reply, and a client drops any line over its cap (RA-217).
-        let mut holds_open = ctx.tx().prepare_cached("SELECT * FROM holds WHERE state='open' ORDER BY created_at DESC,id DESC LIMIT 100").bus()?
-            .query_map([], crate::guardrail::hold_row).bus()?
+        let mut holds_open = ctx.tx().prepare_cached("SELECT * FROM holds WHERE state='open' AND (?1 IS NULL OR project_id=?1) ORDER BY created_at DESC,id DESC LIMIT 100").bus()?
+            .query_map([only], crate::guardrail::hold_row).bus()?
             .collect::<rusqlite::Result<Vec<_>>>().bus()?;
         for hold in &mut holds_open { crate::handlers::guardrail::elide_hold(hold, &mut Vec::new()); }
         let projects = ctx.tx().prepare_cached(
@@ -183,13 +204,14 @@ pub fn register(engine: &mut Engine) {
              (SELECT COUNT(*) FROM sessions s WHERE s.project_id=p.id AND s.state IN ('spawning','running','idle','blocked')),
              (SELECT COUNT(*) FROM sessions s WHERE s.project_id=p.id AND s.state='blocked')
              FROM projects p LEFT JOIN tasks t ON t.project_id=p.id AND t.deleted_at IS NULL
+             WHERE ?1 IS NULL OR p.id=?1
              GROUP BY p.id,p.name,p.base_branch ORDER BY p.name,p.id"
-        ).bus()?.query_map([], |row| Ok(DashboardProject {
+        ).bus()?.query_map([only], |row| Ok(DashboardProject {
             project_id: row.get(0)?, name: row.get(1)?, base_branch: row.get(2)?, tasks_open: row.get(3)?,
             ready: row.get(4)?, active: row.get(5)?, in_review: row.get(6)?, done_recent: row.get(7)?,
             live_sessions: row.get(8)?, blocked_sessions: row.get(9)?,
         })).bus()?.collect::<rusqlite::Result<Vec<_>>>().bus()?;
-        let notifications = list(ctx, None, Some(false), None, Some(8))?;
+        let notifications = list(ctx, only, Some(false), None, Some(8))?;
         let resources = crate::handlers::app::resources(ctx.tx(), ctx.engine())?;
         Ok(DashboardOut { projects, sessions_live, in_review, holds_open, notifications, resources })
     });
