@@ -1217,7 +1217,7 @@
       }
     },
     "module.list": {
-      "summary": "Modules index: list + header stats",
+      "summary": "Modules index: list + header stats; an agent sees its own project's",
       "kind": "query",
       "audit": "never",
       "undo": "none",
@@ -2842,7 +2842,7 @@
       }
     },
     "git.branch.clean_merged": {
-      "summary": "Alias of git.branch.cleanup that answers with the names of the branches deleted (or, on a dry run, that would be)",
+      "summary": "Alias of git.branch.cleanup that answers with the names of the branches deleted (or, on a dry run, that would be), and the merged ones it could not delete",
       "kind": "mutation",
       "audit": "always",
       "undo": "none",
@@ -8213,8 +8213,12 @@
       "additionalProperties": false,
       "properties": {
         "project_id": {
-          "type": "integer",
-          "format": "int64"
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "Required from the person; an agent may leave it out for its own project, the only one\nit may name (D106)."
         },
         "include_archived": {
           "type": [
@@ -8222,10 +8226,7 @@
             "null"
           ]
         }
-      },
-      "required": [
-        "project_id"
-      ]
+      }
     },
     "ModuleListOut": {
       "type": "object",
@@ -9420,7 +9421,8 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "description": "The launch prompt, on the session's first launch only: a relaunch may come long after\nthat work was done (RA-397). The brief keeps it as the original launch assignment."
         },
         "brief_path": {
           "type": "string",
@@ -12070,10 +12072,33 @@
           "items": {
             "type": "string"
           }
+        },
+        "failed": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/GitCleanMergedFailed"
+          },
+          "description": "Branches found merged that were not deleted (or, on a dry run, would not be), with why:\na dirty or still-held checkout, a rebase in progress, a failed delete (RA-373).",
+          "default": []
         }
       },
       "required": [
         "deleted"
+      ]
+    },
+    "GitCleanMergedFailed": {
+      "type": "object",
+      "properties": {
+        "branch": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "branch",
+        "reason"
       ]
     },
     "GitBranchCleanupIn": {
@@ -12143,6 +12168,11 @@
         },
         "deleted_remote": {
           "type": "boolean"
+        },
+        "merged": {
+          "type": "boolean",
+          "description": "Its work was found merged; a `kept` row with this set is one cleanup could not delete.",
+          "default": false
         }
       },
       "required": [
