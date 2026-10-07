@@ -337,6 +337,85 @@ fn changelog_and_append_take_an_optional_expected_updated_at() {
     ok(e, "notes.append", json!({"project_id":1,"text":"rule two","expected_updated_at":standing["updated_at"]}));
 }
 
+/// RA-409: the retention pass removes a detached attachment's row and file once its undo
+/// window is past, and not before.
+#[test]
+fn retention_reclaims_detached_attachments_past_the_window() {
+    let f = Fixture::new();
+    let e = &f.engine;
+    let task = f.task("Shots", json!({}));
+    let old = ok(e, "task.attach", json!({"task_id":task["id"],"name":"old.png","mime":"image/png","bytes_b64":b64(b"old")}));
+    let recent = ok(e, "task.attach", json!({"task_id":task["id"],"name":"new.png","mime":"image/png","bytes_b64":b64(b"new")}));
+    let live = ok(e, "task.attach", json!({"task_id":task["id"],"name":"live.png","mime":"image/png","bytes_b64":b64(b"live")}));
+    for a in [&old, &recent] {
+        ok(e, "task.detach", json!({"task_id":task["id"],"attachment_id":a["id"]}));
+    }
+    e.store.lock().execute("UPDATE attachments SET deleted_at='2000-01-01T00:00:00Z' WHERE id=?1", [old["id"].as_i64().unwrap()]).unwrap();
+    let out = ok(e, "app.reconcile", json!({}));
+    assert!(out["actions"].to_string().contains("detached attachment"), "{out}");
+    let path = |a: &Value| PathBuf::from(a["path"].as_str().unwrap());
+    // The files go on a worker after the commit.
+    for _ in 0..200 {
+        if !path(&old).exists() { break }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(!path(&old).exists());
+    assert!(path(&recent).is_file() && path(&live).is_file());
+    let rows: i64 = e.store.lock().query_row("SELECT COUNT(*) FROM attachments", [], |r| r.get(0)).unwrap();
+    assert_eq!(rows, 2);
+    ok(e, "task.attachment.restore", json!({"task_id":task["id"],"attachment_id":recent["id"]}));
+    assert_eq!(code(call(e, Actor::User, "task.attachment.restore", json!({"task_id":task["id"],"attachment_id":old["id"]}))), "task.attachment_not_found");
+}
+
+/// RA-409: recovery removes attachment files nothing references — but not one a row (live or
+/// detached) names, one an undoable pre-v24 detach would bring back, or one a removed project's
+/// backup still holds for project.restore.
+#[test]
+fn recovery_sweeps_orphaned_attachment_files() {
+    let f = Fixture::new();
+    let e = &f.engine;
+    let task = f.task("Shots", json!({}));
+    let live = ok(e, "task.attach", json!({"task_id":task["id"],"name":"live.png","mime":"image/png","bytes_b64":b64(b"live")}));
+    let detached = ok(e, "task.attach", json!({"task_id":task["id"],"name":"gone.png","mime":"image/png","bytes_b64":b64(b"gone")}));
+    ok(e, "task.detach", json!({"task_id":task["id"],"attachment_id":detached["id"]}));
+    let dir = f.attachments().join(task["id"].to_string());
+    let orphan = dir.join("99-orphan.png");
+    std::fs::write(&orphan, b"orphan").unwrap();
+    let stray = f.attachments().join("424242");
+    std::fs::create_dir_all(&stray).unwrap();
+    std::fs::write(stray.join("1-stray.png"), b"stray").unwrap();
+    let legacy = dir.join("98-legacy.png");
+    std::fs::write(&legacy, b"legacy").unwrap();
+    e.store.lock().execute(
+        "INSERT INTO audit(ts, req_id, actor, op, project_id, kind, payload_hash, undo_op) VALUES (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), 'legacy-detach', 'user', 'task.detach', 1, 'ok', 'x', ?1)",
+        [json!({"op":"task.attach","payload":{"task_id":task["id"],"path":legacy,"name":"legacy.png","mime":"image/png"}}).to_string()],
+    ).unwrap();
+    // A fresh staged copy may belong to an attach in flight.
+    let staged = f.attachments().join(".staging/in-flight");
+    std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+    std::fs::write(&staged, b"x").unwrap();
+
+    let report = relay_core::recovery::run(e).unwrap();
+    assert!(report.fsck_fixes.iter().any(|x| x == "removed 2 orphaned attachment file(s)"), "{:?}", report.fsck_fixes);
+    assert!(!orphan.exists() && !stray.exists(), "orphans and their empty directory go");
+    for kept in [PathBuf::from(live["path"].as_str().unwrap()), PathBuf::from(detached["path"].as_str().unwrap()), legacy.clone(), staged.clone()] {
+        assert!(kept.is_file(), "{kept:?} was removed");
+    }
+
+    // A removed project's files wait for its backup: project.restore needs them.
+    ok(e, "project.remove", json!({"project_id":1}));
+    let report = relay_core::recovery::run(e).unwrap();
+    assert!(!report.fsck_fixes.iter().any(|x| x.contains("attachment")), "{:?}", report.fsck_fixes);
+    assert!(PathBuf::from(live["path"].as_str().unwrap()).is_file());
+    for backup in e.store.list_backups().unwrap() {
+        std::fs::remove_file(backup.path).unwrap();
+    }
+    relay_core::recovery::run(e).unwrap();
+    assert!(!PathBuf::from(live["path"].as_str().unwrap()).exists());
+    assert!(!PathBuf::from(detached["path"].as_str().unwrap()).exists());
+    assert!(legacy.is_file(), "the undoable audit row still names it");
+}
+
 /// RA-416: undoing task.approve is task.unapprove. The task returns to its column, slot and
 /// state, and the commit link the approval added goes; a link that was there before stays.
 #[test]
