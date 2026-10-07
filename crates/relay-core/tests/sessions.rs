@@ -291,18 +291,12 @@ fn launch_passes_configured_and_memory_write_roots_to_both_providers() {
             extra.clone(),
             std::env::temp_dir(),
         ];
-        let mut granted: Vec<PathBuf> = args.windows(2).filter(|pair| pair[0] == "--add-dir").map(|pair| PathBuf::from(pair[1])).collect();
-        // Open: the primary checkout's memory folder is keyed on `common_dir().parent()`, and
-        // for a linked worktree gix's common dir is `.git/worktrees/<name>/../..`, whose parent
-        // is `.git/worktrees`, not the primary checkout (guardrail::write_roots). Until that is
-        // fixed this one grant is checked for its place and shape only.
-        assert!(granted.len() == expected.len() && granted[2].starts_with(claude.join("projects")) && granted[2].ends_with("memory"), "{provider}: {granted:?}");
-        granted[2] = expected[2].clone();
+        let granted: Vec<PathBuf> = args.windows(2).filter(|pair| pair[0] == "--add-dir").map(|pair| PathBuf::from(pair[1])).collect();
         assert_eq!(granted, expected, "{provider}: --add-dir grants");
         let check = |path: PathBuf| f.engine.dispatch(Request::new(Actor::agent(session["name"].as_str().unwrap()), "guardrail.check", json!({
             "project_id":1,"kind":"write","path":path,"new_text":"note"
         })), Door::InProcess).into_result().unwrap();
-        for root in expected.iter().filter(|root| **root != expected[2]) {
+        for root in &expected {
             assert_eq!(check(root.join("note.md"))["verdict"], "allow", "{provider}: {root:?}");
         }
         let refused = check(sibling.join("note.md"));

@@ -3,7 +3,14 @@
 use jiff::Timestamp;
 
 pub fn now() -> String {
-    Timestamp::now().to_string()
+    stamp(Timestamp::now())
+}
+
+/// The stored form of an instant: always nine fractional digits, so stamps are one width and
+/// their text sorts in time order. jiff's plain `Display` drops trailing zeros, which puts
+/// `…21Z` after `…21.5Z`.
+pub fn stamp(ts: Timestamp) -> String {
+    format!("{ts:.9}")
 }
 
 pub fn now_ts() -> Timestamp {
@@ -17,10 +24,10 @@ pub fn now_ts() -> Timestamp {
 pub fn days_ago(days: i64) -> String {
     // ~27,000 years, past either end of jiff's range, and small enough not to overflow seconds.
     let hours = days.clamp(-10_000_000, 10_000_000) * 24;
-    Timestamp::now()
+    let cutoff = Timestamp::now()
         .checked_sub(jiff::SignedDuration::from_hours(hours))
-        .unwrap_or(if days >= 0 { Timestamp::MIN } else { Timestamp::MAX })
-        .to_string()
+        .unwrap_or(if days >= 0 { Timestamp::MIN } else { Timestamp::MAX });
+    stamp(cutoff)
 }
 
 /// A caller's `since`/`until` bound in the stored format, so the plain string comparison against
@@ -36,7 +43,7 @@ pub fn bound(field: &str, raw: &str) -> Result<String, relay_bus::error::BusErro
         raw.parse::<Timestamp>().ok()
             .or_else(|| (raw.len() == 10).then(|| raw.parse::<jiff::civil::Date>().ok()).flatten().and_then(|d| d.to_zoned(jiff::tz::TimeZone::UTC).ok()).map(|z| z.timestamp()))
     };
-    parsed.map(|t| t.to_string()).ok_or_else(|| relay_bus::error::BusError::invalid(
+    parsed.map(stamp).ok_or_else(|| relay_bus::error::BusError::invalid(
         "time.invalid",
         format!("{field} must be an RFC 3339 timestamp with an offset, a date, or epoch seconds; got {raw:?}"),
     ))
@@ -76,6 +83,15 @@ mod tests {
     }
 
     #[test]
+    fn stamps_are_one_width_so_text_order_is_time_order() {
+        let whole = Timestamp::new(1_760_000_000, 0).unwrap();
+        let later = Timestamp::new(1_760_000_000, 500_000_000).unwrap();
+        assert!(stamp(whole) < stamp(later), "{} / {}", stamp(whole), stamp(later));
+        assert_eq!(stamp(whole).len(), stamp(later).len());
+        assert_eq!(bound("since", "2025-10-09").unwrap(), "2025-10-09T00:00:00.000000000Z");
+    }
+
+    #[test]
     fn spans_show_the_largest_unit_and_the_next_down() {
         assert_eq!(span(0, Unit::Second), "0s");
         assert_eq!(span(45, Unit::Second), "45s");
@@ -91,11 +107,11 @@ mod tests {
 
     #[test]
     fn bounds_are_normalised_to_the_stored_utc_format() {
-        let utc = "2026-10-07T02:00:00Z";
+        let utc = "2026-10-07T02:00:00.000000000Z";
         for raw in ["2026-10-07T02:00:00Z", "2026-10-07T04:00:00+02:00", "2026-10-07 02:00:00Z", "1791338400", "1791338400000"] {
             assert_eq!(bound("since", raw).unwrap(), utc, "{raw}");
         }
-        assert_eq!(bound("since", "2026-10-07").unwrap(), "2026-10-07T00:00:00Z");
+        assert_eq!(bound("since", "2026-10-07").unwrap(), "2026-10-07T00:00:00.000000000Z");
         for raw in ["yesterday", "2026-10-07T02:00:00", "", "07/10/2026"] {
             assert_eq!(bound("since", raw).unwrap_err().code, "time.invalid", "{raw}");
         }
