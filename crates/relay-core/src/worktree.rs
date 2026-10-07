@@ -83,8 +83,11 @@ pub fn git_dir_of(repo: &Path) -> Result<PathBuf> {
 /// Uncommitted changes of any kind — modified, staged, or untracked (an agent's new file is
 /// a change too). `gix::Repository::is_dirty` ignores untracked files, hence this.
 pub fn is_dirty(r: &gix::Repository) -> bool {
-    // A failed scan cannot establish that deleting/switching a checkout is safe.
-    r.workdir().is_none_or(|root| status_files(root).map_or(true, |files| !files.is_empty()))
+    // A failed scan cannot establish that deleting/switching a checkout is safe. An untracked
+    // directory is one entry, still a change, and not a walk listing every file under it.
+    r.workdir().is_none_or(|root| {
+        status_files_with(root, Untracked::Directories).map_or(true, |files| !files.is_empty())
+    })
 }
 
 /// How often a background status may take the index lock to save the stat data it refreshed.
@@ -129,9 +132,26 @@ fn may_lock_index(root: &Path) -> bool {
 /// outcome rehashes touched-but-unchanged LFS assets on every refresh; writing an
 /// old index snapshot ourselves could lose concurrent staging.
 pub fn status_files(root: &Path) -> Result<Vec<FileStatus>> {
+    status_files_with(root, Untracked::All)
+}
+
+/// How `git status` lists untracked files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Untracked {
+    /// Each file on its own (`--untracked-files=all`): what per-file badges and diffs need.
+    All,
+    /// A directory holding nothing tracked as one entry, `dir/` (`--untracked-files=normal`):
+    /// an un-ignored `venv/` or `node_modules/` is one change, not every file in it (RA-205).
+    Directories,
+}
+
+pub fn status_files_with(root: &Path, untracked: Untracked) -> Result<Vec<FileStatus>> {
     let mut command = Command::new("git");
     command.arg("-C").arg(root)
-        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .args(["status", "--porcelain=v1", "-z", match untracked {
+            Untracked::All => "--untracked-files=all",
+            Untracked::Directories => "--untracked-files=normal",
+        }])
         .env("GIT_OPTIONAL_LOCKS", if may_lock_index(root) { "1" } else { "0" });
     let output = crate::proc::output_with_timeout(&mut command, std::time::Duration::from_secs(10))?
         .ok_or_else(|| anyhow!("Git status timed out after 10 seconds; check repository filters and retry"))?;
@@ -515,6 +535,28 @@ mod status_tests {
         assert_eq!(status_files(root).unwrap()[0].worktree, "M");
         git(root, &["add", "asset.bin"]).unwrap();
         assert_eq!(status_files(root).unwrap()[0].index, "M");
+    }
+
+    /// RA-205: a directory with nothing tracked in it is one entry when collapsed, every file
+    /// otherwise, and a checkout holding only that directory is still dirty.
+    #[test]
+    fn untracked_directories_collapse_without_hiding_the_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        git(root, &["init", "-q", "-b", "main"]).unwrap();
+        git(root, &["config", "user.name", "Fixture"]).unwrap();
+        git(root, &["config", "user.email", "fixture@example.invalid"]).unwrap();
+        std::fs::write(root.join("a"), "a").unwrap();
+        git(root, &["add", "a"]).unwrap();
+        git(root, &["commit", "-qm", "a"]).unwrap();
+        assert!(!is_dirty(&gix::open(root).unwrap()));
+        std::fs::create_dir_all(root.join("vendor/pkg")).unwrap();
+        for n in 0..20 { std::fs::write(root.join(format!("vendor/pkg/{n}")), "x").unwrap(); }
+        let collapsed = status_files_with(root, Untracked::Directories).unwrap();
+        assert_eq!(collapsed.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(), ["vendor/"]);
+        assert_eq!(collapsed[0].worktree, "?");
+        assert_eq!(status_files(root).unwrap().len(), 20);
+        assert!(is_dirty(&gix::open(root).unwrap()));
     }
 
     /// RA-131: only the first scan of a quiet checkout takes the index lock; the scans after it,

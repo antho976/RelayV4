@@ -212,12 +212,18 @@ pub fn register(e: &mut Engine) {
             .map(|n| n.shorten().to_string())
             .unwrap_or_else(|| "HEAD".into());
         let (upstream, ahead, behind) = upstream_metrics(&repo, &branch);
+        let files = worktree::status_files_with(&root, worktree::Untracked::Directories)
+            .map_err(git_mutation("git.status_failed"))?;
+        let total = files.len() as u64;
+        let files = cap_status(files);
         Ok(StatusOut {
             branch,
             upstream,
             ahead,
             behind,
-            files: status_files(&root)?,
+            truncated: (files.len() as u64) < total,
+            total,
+            files,
         })
     });
     e.register_unlocked::<Diff>(|ctx, p| {
@@ -278,6 +284,9 @@ pub fn register(e: &mut Engine) {
     e.register_unlocked::<DiffFileOp>(|ctx, p| {
         let (_project, root) = resolve_root_unlocked(ctx, p.project_id, p.worktree.as_deref())?;
         validate_path(&p.path)?;
+        if let Some(old_path) = &p.old_path {
+            validate_path(old_path)?;
+        }
         // The reply carries both sides and the diff on one line; stop at the editor's limit
         // before reading, rather than build a reply larger than a client can read. Neither
         // side is read past that limit, and a symlink is its target's name, as git stores it,
@@ -285,8 +294,15 @@ pub fn register(e: &mut Engine) {
         let repo = gix::open(&root).map_err(gix_err("git.open_failed"))?;
         let old_tree = revision_tree(&repo, p.base.as_deref().unwrap_or("HEAD"))?;
         let max = DIFF_FILE_MAX as u64;
-        let new = work_side(&root, &p.path, max)?;
-        let old = tree_side(&repo, old_tree.as_ref(), &p.path, max)?;
+        // A staged row is what the commit would record, not the edits made since (RA-206).
+        let new = if p.staged == Some(true) {
+            let index = repo.index_or_empty().map_err(gix_err("git.index"))?;
+            index_side(&repo, &index, &p.path, max)?
+        } else {
+            work_side(&root, &p.path, max)?
+        };
+        // A rename's old side is its source, not an empty file at its new name.
+        let old = tree_side(&repo, old_tree.as_ref(), p.old_path.as_deref().unwrap_or(&p.path), max)?;
         let (old, new) = match (old, new) {
             (Side::TooLarge, _) | (_, Side::TooLarge) => return Err(diff_too_large()),
             (Side::Text(old), Side::Text(new)) if old.len() + new.len() <= DIFF_FILE_MAX => (old, new),
@@ -424,7 +440,8 @@ pub fn register(e: &mut Engine) {
             }
             // Untracked files travel with any switch and git refuses one that would overwrite
             // them, so only tracked changes count as a dirty checkout.
-            let tracked: Vec<_> = status_files(&root)?
+            let tracked: Vec<_> = worktree::status_files_with(&root, worktree::Untracked::Directories)
+                .map_err(git_mutation("git.status_failed"))?
                 .into_iter()
                 .filter(|file| !(file.index.is_empty() && file.worktree == "?"))
                 .collect();
@@ -573,6 +590,9 @@ pub fn register(e: &mut Engine) {
                 ));
             }
             let (project, root) = resolve_root_unlocked(ctx, p.project_id, p.worktree.as_deref())?;
+            // `add -A` would stage a conflicted file, markers and all, as resolved; without
+            // `all`, write-tree refuses with an error that names nothing (RA-204).
+            refuse_unmerged(&root)?;
             if p.all.unwrap_or(false) {
                 worktree::git_mutate(&root, &["add", "-A"])
                     .map_err(git_mutation("git.stage_failed"))?;
@@ -827,6 +847,45 @@ pub fn register(e: &mut Engine) {
     });
 }
 
+/// The most entries `git.status` returns. A client draws a row for each, and the whole reply
+/// is one line on the wire (RA-205).
+const STATUS_MAX_FILES: usize = 5000;
+/// The most path bytes `git.status` returns, well inside a client's 2 MiB line.
+const STATUS_MAX_BYTES: usize = 1024 * 1024;
+
+/// At most [`STATUS_MAX_FILES`] entries and [`STATUS_MAX_BYTES`] of paths, in path order. When
+/// some must go, conflicts are kept first and untracked files last: those are the changes a
+/// commit would otherwise trip over or make unseen.
+fn cap_status(mut files: Vec<FileStatus>) -> Vec<FileStatus> {
+    let size = |file: &FileStatus| file.path.len() + file.renamed_from.as_ref().map_or(0, String::len) + 64;
+    if files.len() <= STATUS_MAX_FILES && files.iter().map(size).sum::<usize>() <= STATUS_MAX_BYTES {
+        return files;
+    }
+    let rank = |file: &FileStatus| {
+        if file.index == "U" || file.worktree == "U" || matches!((file.index.as_str(), file.worktree.as_str()), ("A", "A") | ("D", "D")) {
+            0
+        } else if file.worktree == "?" {
+            2
+        } else {
+            1
+        }
+    };
+    // Stable: path order within each rank.
+    files.sort_by_key(rank);
+    let mut bytes = 0;
+    let mut kept = 0;
+    for file in &files {
+        bytes += size(file);
+        if kept == STATUS_MAX_FILES || bytes > STATUS_MAX_BYTES {
+            break;
+        }
+        kept += 1;
+    }
+    files.truncate(kept);
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    files
+}
+
 pub fn status_badges(root: &Path) -> Result<HashMap<String, String>, BusError> {
     Ok(status_files(root)?
         .into_iter()
@@ -848,6 +907,34 @@ enum StagedCommit {
     /// A merge, cherry-pick, revert or rebase is in progress: `git commit` must conclude it,
     /// and must find `tree` still staged when it does.
     InProgress { tree: String },
+}
+
+/// Refuse while the index still has unmerged entries: a conflict not yet marked resolved.
+fn refuse_unmerged(root: &Path) -> Result<(), BusError> {
+    let repo = gix::open(root).map_err(gix_err("git.open_failed"))?;
+    let index = repo.index_or_empty().map_err(gix_err("git.index"))?;
+    let mut paths: Vec<String> = Vec::new();
+    for entry in index.entries().iter().filter(|entry| entry.stage_raw() != 0) {
+        let path = entry.path(&index).to_string();
+        // A conflict is up to three entries of one path, next to each other.
+        if paths.last() != Some(&path) {
+            paths.push(path);
+        }
+    }
+    if paths.is_empty() {
+        return Ok(());
+    }
+    Err(BusError::conflict(
+        "git.unmerged",
+        format!(
+            "{} file{} still {} merge conflicts ({}). Resolve and stage {} first; nothing was committed.",
+            paths.len(),
+            if paths.len() == 1 { "" } else { "s" },
+            if paths.len() == 1 { "has" } else { "have" },
+            sample_paths(paths.iter().map(String::as_str)),
+            if paths.len() == 1 { "it" } else { "them" },
+        ),
+    ))
 }
 
 /// Build the commit `git commit -m message` would make, without moving any ref, and the
@@ -1919,6 +2006,29 @@ mod tests {
         assert!(out.is_none(), "the child outlived its deadline");
         assert!(!lock.exists(), "the lock outlived the timed-out child");
         assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    }
+
+    #[test]
+    fn a_capped_status_keeps_conflicts_and_tracked_changes_first() {
+        let file = |path: String, index: &str, worktree: &str| FileStatus {
+            path, index: index.into(), worktree: worktree.into(), renamed_from: None,
+        };
+        let mut files: Vec<FileStatus> = (0..STATUS_MAX_FILES + 10).map(|n| file(format!("a/new{n:05}"), "", "?")).collect();
+        files.push(file("z/conflict".into(), "U", "U"));
+        files.push(file("z/both-added".into(), "A", "A"));
+        files.push(file("z/edited".into(), "", "M"));
+        let kept = cap_status(files);
+        assert_eq!(kept.len(), STATUS_MAX_FILES);
+        for path in ["z/conflict", "z/both-added", "z/edited"] {
+            assert!(kept.iter().any(|f| f.path == path), "{path} was dropped");
+        }
+        assert!(kept.windows(2).all(|pair| pair[0].path < pair[1].path), "kept in path order");
+        // Long paths stop at the byte budget instead.
+        let long: Vec<FileStatus> = (0..1000).map(|n| file(format!("{n:04}{}", "x".repeat(4000)), "", "M")).collect();
+        let kept = cap_status(long);
+        assert!(kept.len() < 1000 && kept.iter().map(|f| f.path.len()).sum::<usize>() <= STATUS_MAX_BYTES);
+        let few = vec![file("one".into(), "M", "")];
+        assert_eq!(cap_status(few.clone()), few);
     }
 
     #[test]

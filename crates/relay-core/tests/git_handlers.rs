@@ -252,3 +252,86 @@ fn big_and_binary_files_are_flagged_without_counts() {
         assert_eq!(row["added"], 0, "{name}");
     }
 }
+
+/// RA-206: a staged row diffs HEAD against the index, and a rename against its source.
+#[test]
+fn diff_file_shows_the_staged_side_and_a_rename_source() {
+    let e = engine();
+    let (_ws, repo) = project(&e);
+    let root = Path::new(&repo);
+    std::fs::write(root.join("a.txt"), "one\ntwo\n").unwrap();
+    git(root, &["add", "a.txt"]);
+    git(root, &["commit", "-q", "-m", "Add a"]);
+    std::fs::write(root.join("a.txt"), "one\nstaged\n").unwrap();
+    git(root, &["add", "a.txt"]);
+    std::fs::write(root.join("a.txt"), "one\nstaged\nlater\n").unwrap();
+
+    let staged = ok(&e, "git.diff.file", json!({"project_id":1,"path":"a.txt","staged":true}));
+    assert_eq!((staged["old"].as_str(), staged["new"].as_str()), (Some("one\ntwo\n"), Some("one\nstaged\n")));
+    // Without `staged`, as before: HEAD against the working tree.
+    let work = ok(&e, "git.diff.file", json!({"project_id":1,"path":"a.txt"}));
+    assert_eq!(work["new"], "one\nstaged\nlater\n");
+
+    git(root, &["commit", "-q", "-am", "Edit a"]);
+    git(root, &["mv", "a.txt", "b.txt"]);
+    std::fs::write(root.join("b.txt"), "one\nstaged\nlater\nrenamed\n").unwrap();
+    git(root, &["add", "b.txt"]);
+    let status = ok(&e, "git.status", json!({"project_id":1}));
+    assert_eq!(status["files"][0]["renamed_from"], "a.txt", "{status}");
+    let renamed = ok(&e, "git.diff.file", json!({"project_id":1,"path":"b.txt","staged":true,"old_path":"a.txt"}));
+    assert_eq!(renamed["old"], "one\nstaged\nlater\n");
+    assert_eq!(renamed["new"], "one\nstaged\nlater\nrenamed\n");
+    let text = renamed["hunks"][0]["text"].as_str().unwrap();
+    assert!(text.contains("+renamed") && !text.contains("-one"), "{text}");
+    let escape = call(&e, "git.diff.file", json!({"project_id":1,"path":"b.txt","old_path":"../a.txt"}));
+    assert_eq!(err(&escape).kind, ErrorKind::Invalid);
+}
+
+/// RA-204: no commit, `all` or not, while a conflict is unresolved in the index.
+#[test]
+fn commit_is_refused_while_the_index_is_unmerged() {
+    let e = engine();
+    let (_ws, repo) = project(&e);
+    let root = Path::new(&repo);
+    git(root, &["switch", "-q", "-c", "side"]);
+    std::fs::write(root.join("README.md"), "# Side\n").unwrap();
+    git(root, &["commit", "-q", "-am", "Side"]);
+    git(root, &["switch", "-q", "main"]);
+    std::fs::write(root.join("README.md"), "# Main\n").unwrap();
+    git(root, &["commit", "-q", "-am", "Main"]);
+    let merge = Command::new("git").arg("-C").arg(root).args(["merge", "-q", "side"]).output().unwrap();
+    assert!(!merge.status.success(), "the fixture must conflict");
+    let head = git(root, &["rev-parse", "HEAD"]);
+
+    for all in [true, false] {
+        let refused = call(&e, "git.commit", json!({"project_id":1,"message":"Merge","all":all}));
+        let error = err(&refused);
+        assert_eq!((error.kind, error.code.as_str()), (ErrorKind::Conflict, "git.unmerged"), "{error:?}");
+        assert!(error.message.contains("README.md"), "{}", error.message);
+    }
+    assert_eq!(git(root, &["rev-parse", "HEAD"]), head, "nothing was committed");
+    assert!(!git(root, &["diff", "--name-only", "--diff-filter=U"]).is_empty(), "the conflict is still unresolved");
+
+    std::fs::write(root.join("README.md"), "# Both\n").unwrap();
+    ok(&e, "git.stage", json!({"project_id":1,"paths":["README.md"]}));
+    ok(&e, "git.commit", json!({"project_id":1,"message":"Merge side"}));
+    assert_eq!(git(root, &["log", "-1", "--format=%p"]).split(' ').count(), 2, "the merge was concluded");
+}
+
+/// RA-205: an untracked directory is one status entry, and the dirty check still sees it.
+#[test]
+fn status_lists_an_untracked_directory_once() {
+    let e = engine();
+    let (_ws, repo) = project(&e);
+    let root = Path::new(&repo);
+    std::fs::create_dir_all(root.join("venv/lib")).unwrap();
+    for n in 0..50 {
+        std::fs::write(root.join(format!("venv/lib/m{n}.py")), "x\n").unwrap();
+    }
+    let status = ok(&e, "git.status", json!({"project_id":1}));
+    let paths: Vec<&str> = status["files"].as_array().unwrap().iter().map(|f| f["path"].as_str().unwrap()).collect();
+    assert_eq!(paths, ["venv/"]);
+    assert_eq!((status["truncated"].as_bool(), status["total"].as_u64()), (Some(false), Some(1)));
+    let listed = ok(&e, "worktree.list", json!({"project_id":1}));
+    assert_eq!(listed["worktrees"][0]["dirty"], true, "{listed}");
+}
