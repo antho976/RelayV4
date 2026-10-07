@@ -30,6 +30,15 @@ pub fn open_note(ui: &Rc<Ui>, note: Value) {
 pub fn open_task(ui: &Rc<Ui>, id: i64) {
     task_pages::open(ui, id);
 }
+pub fn open_module_board(ui: &Rc<Ui>, module: i64) {
+    board_view::open_module(ui, module);
+}
+pub fn new_module(ui: &Rc<Ui>, project: i64) {
+    task_pages::compose_module(ui, project);
+}
+pub fn new_task(ui: &Rc<Ui>, project: i64, column: &str) {
+    task_pages::compose(ui, project, column, None);
+}
 
 fn paragraph(value: &str) -> gtk::Label {
     let l = label(value, "body");
@@ -88,8 +97,30 @@ pub async fn refresh(ui: &Rc<Ui>, name: &str, project: i64) {
         clear(page);
         ui.page_projects.borrow_mut().insert(name.into(), project);
         if name == "modules" {
-            page.append(&board_switcher(ui, "modules"));
+            page.add_css_class("modules-page");
+            // The board's header: its tabs, and New module where the board has New task.
+            let head = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            head.add_css_class("modules-head");
+            head.append(&board_switcher(ui, "modules"));
+            let gap = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            gap.set_hexpand(true);
+            head.append(&gap);
+            let add = button("", "primary");
+            add.add_css_class("board-add");
+            let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            content.append(&crate::icons::image("plus", 12));
+            content.append(&label("New module", ""));
+            add.set_child(Some(&content));
+            let weak = Rc::downgrade(ui);
+            add.connect_clicked(move |_| {
+                if let Some(ui) = weak.upgrade() {
+                    task_pages::compose_module(&ui, project);
+                }
+            });
+            head.append(&add);
+            page.append(&head);
         }
+        if name != "modules" {
         page.append(&label(
             match name {
                 "mailbox" => "Mailbox",
@@ -100,10 +131,11 @@ pub async fn refresh(ui: &Rc<Ui>, name: &str, project: i64) {
         ));
         match name {
             "mailbox" => mail_composer(ui, page, project),
-            "modules" => note_pages::module_composer(ui, page, project),
+            "modules" => {}
             _ => page.append(&paragraph(
                 "Answer agents that need an exception, decide which held actions may proceed, and see the exceptions still in force.",
             )),
+        }
         }
         let body = gtk::Box::new(gtk::Orientation::Vertical, 8);
         body.set_vexpand(true);
@@ -119,7 +151,7 @@ pub async fn refresh(ui: &Rc<Ui>, name: &str, project: i64) {
     if data.is_empty() {
         body.append(&paragraph(match name {
             "mailbox" => "No messages in this project.",
-            _ => "No modules yet. Create one above.",
+            _ => "No modules yet. A module bundles tasks into one release: choose New module to start one.",
         }));
     }
     match name {
@@ -292,7 +324,13 @@ fn board_switcher(ui: &Rc<Ui>, selected: &str) -> gtk::Box {
         let weak = Rc::downgrade(ui);
         key.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
-                ui.navigate(name);
+                // Either tab leaves a module's board for the whole project.
+                board_view::leave_module();
+                if name == "board" && ui.page.borrow().as_str() == "board" {
+                    ui.refresh_page();
+                } else {
+                    ui.navigate(name);
+                }
             }
         });
         tabs.append(&key);

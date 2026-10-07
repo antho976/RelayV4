@@ -557,8 +557,8 @@ allow-sets, straight from SPEC §3's agent action list plus reads:
 
 | role | may call |
 |---|---|
-| `builder` | all queries · `task.move` (own, `active → in_review`) · `task.link_commit` · `task.changelog.write` (own) · `task.update` (own; body/changelog only) · `mailbox.*` · `notes.append` · `overlap.flag/ack` · `integration.request` · `session.done/report/intent/claim/release` (self) · `device.claim/release` · `usage.report` · `guardrail.gate/check` |
-| `reviewer` | all queries · `mailbox.*` · `notes.append` · `overlap.flag` · `task.changelog.write` on the reviewed task · `session.done/report/intent/claim/release` (self) · `device.claim/release` · `usage.report` · `guardrail.check` — **nothing** that writes files, commits, or moves the task |
+| `builder` | all queries · `task.move` (own, `active → in_review`) · `task.link_commit` · `task.changelog.write` (own) · `task.comment` (own) · `task.update` (own; body/changelog only) · `mailbox.*` · `notes.append` · `overlap.flag/ack` · `integration.request` · `session.done/report/intent/claim/release` (self) · `device.claim/release` · `usage.report` · `guardrail.gate/check` |
+| `reviewer` | all queries · `mailbox.*` · `notes.append` · `overlap.flag` · `task.changelog.write` / `task.comment` on the reviewed task · `session.done/report/intent/claim/release` (self) · `device.claim/release` · `usage.report` · `guardrail.check` — **nothing** that writes files, commits, or moves the task |
 | `docs` | builder's set minus `task.link_commit`/`integration.request`, plus `notes.create/update` |
 
 Session options widen a role deliberately, per session, never by default:
@@ -808,6 +808,7 @@ unique; nothing else is.
 | `task.restore` | mutation · always · inverse (delete) | `{ task_id }` → `Task` |
 | `task.link_commit` | mutation · always | `{ task_id, sha, branch? }` → `Task` |
 | `task.changelog.write` | mutation · always · inverse | `{ task_id, text, expected_updated_at? }` → `Task` — `expected_updated_at` is the task's `updated_at` as the caller last read it: given and no longer current, the write is refused (`conflict` / `task.edit_conflict`, the code `task.update`'s `expected` uses); omitted, it writes as before. Nothing tracks reads (RA-413) |
+| `task.comment` | mutation · always · project | `{ task_id, body }` → `TaskComment { id, task_id, author, body, created_at }` — append-only, GitHub-issue style; `author` is the agent's session name or `user`. A blank body is `invalid`/`task.comment_empty`, one over 64 KiB `invalid`/`task.comment_size`; a deleted task is `task.not_found`. `task.activity` returns every comment oldest first as `comments` and leaves `task.comment` out of `history` |
 | `task.attach` | mutation · always | `{ task_id, name, mime, bytes_b64 }` or `{ task_id, path, name?, mime? }` → `Attachment` — by path, `name` and `mime` set what the copy is stored as (default: the file's own name, `application/octet-stream`) (RA-414) |
 | `task.detach` | mutation · always · inverse (attachment.restore) | `{ task_id, attachment_id }` → `{}` — soft: the row gets `deleted_at` and leaves `Task.attachments`, the file stays. The retention pass removes row and file after `undo.grace_days` (RA-414, RA-409) |
 | `task.attachment.restore` | mutation · always · inverse (detach) | `{ task_id, attachment_id }` → `Attachment` — brings a detached attachment back with its id and file; `task.attachment_not_found` when it is not detached (or was purged) |

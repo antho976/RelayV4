@@ -1,16 +1,11 @@
 use super::*;
 use crate::app::scrolled;
 use std::cell::Cell;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The task vocabulary, written once: the bus's column, type, priority and size values in the
 /// order a picker lists them. The board and the task pages derive every other order from these.
-pub const COLUMN_TITLES: [(&str, &str); 5] = [
-    ("backlog", "Backlog"),
-    ("ready", "Ready"),
-    ("active", "Active"),
-    ("in_review", "In review"),
-    ("done", "Done"),
-];
+pub use relay_board::COLUMN_TITLES;
 pub const COLUMNS: &[&str] = &{
     let mut names = [""; COLUMN_TITLES.len()];
     let mut i = 0;
@@ -25,16 +20,6 @@ pub const OPEN_COLUMNS: &[&str] = COLUMNS.split_at(COLUMNS.len() - 1).0;
 pub const TYPES: [&str; 5] = ["task", "feature", "bug", "chore", "spike"];
 /// Least urgent first; `""` first in sizes. One vocabulary, shared with the board's ordering.
 pub use relay_board::{PRIORITIES, SIZES};
-/// A task's execution states.
-const STATES: [&str; 6] = ["none", "dispatched", "running", "blocked", "failed", "awaiting_review"];
-pub fn choose(values: &[&str], selected: &str) -> gtk::ComboBoxText {
-    let control = gtk::ComboBoxText::new();
-    for value in values {
-        control.append(Some(value), if value.is_empty() { "None" } else { value });
-    }
-    control.set_active_id(Some(selected));
-    control
-}
 pub fn chosen(control: &gtk::ComboBoxText) -> String {
     control
         .active_id()
@@ -67,20 +52,9 @@ pub struct Draft {
     pub busy: Rc<Cell<bool>>,
     unsent_message: Cell<bool>,
     pub snapshot: Rc<dyn Fn() -> Value>,
-    /// The form as it was opened, then as last saved: Save sends only what differs from it.
-    initial: RefCell<Value>,
     pub on_close: RefCell<Option<Box<dyn Fn()>>>,
 }
 impl Draft {
-    pub fn new(
-        ui: &Rc<Ui>,
-        title: &str,
-        base: Value,
-        snapshot: Rc<dyn Fn() -> Value>,
-        form: gtk::Box,
-    ) -> Rc<Self> {
-        Self::build(ui, title, base, snapshot, form, false)
-    }
     pub fn new_note(
         ui: &Rc<Ui>,
         title: &str,
@@ -127,7 +101,6 @@ impl Draft {
             base: Rc::new(RefCell::new(base)),
             busy: Rc::new(Cell::new(false)),
             unsent_message: Cell::new(false),
-            initial: RefCell::new(snapshot()),
             snapshot,
             on_close: RefCell::new(None),
         });
@@ -176,14 +149,6 @@ impl Draft {
         clear(&self.footer);
         clear(&self.form);
     }
-    pub fn present(&self) {
-        if let Some(panel) = &self.panel {
-            panel.present();
-        }
-        if let Some(window) = &self.window {
-            window.present();
-        }
-    }
     pub fn close(&self) {
         if !self.can_close() {
             return;
@@ -198,320 +163,611 @@ impl Draft {
             self.cleanup();
         }
     }
-    /// Drops the edits and an unsent message together, so the close that follows cannot be
-    /// refused and the base is never moved under a draft that stays open.
-    fn discard(&self) {
-        if self.busy.get() {
-            return;
-        }
-        *self.base.borrow_mut() = (self.snapshot)();
-        self.unsent_message.set(false);
-        self.close();
-    }
     pub fn dirty(&self) -> bool {
         let current = (self.snapshot)();
         current
             .as_object()
             .is_some_and(|m| m.iter().any(|(k, v)| self.base.borrow()[k] != *v))
     }
-    pub fn controls(
-        self: &Rc<Self>,
-        ui: &Rc<Ui>,
-        update: &'static str,
-        id_key: &'static str,
-        id: i64,
-    ) {
-        let save = button("Save", "primary");
-        save.set_widget_name("draft-save");
-        self.footer.append(&save);
-        let close = button("Close", "quiet");
-        self.footer.append(&close);
-        let discard = button("Discard and close", "quiet");
-        self.footer.append(&discard);
-        let d = self.clone();
-        close.connect_clicked(move |_| d.close());
-        let d = self.clone();
-        let pending = self.clone();
-        crate::app::confirm_inline_if(&discard, "Confirm discard", move || pending.dirty() || pending.unsent_message.get(), move |_| d.discard());
-        let d = self.clone();
-        let weak = Rc::downgrade(ui);
-        save.connect_clicked(move |_| {
-            let Some(ui) = weak.upgrade() else { return }; if d.busy.get() { return; }
-            // Send and check only the edited fields. The engine moves a task's state, and an
-            // agent writes its changelog, while the form is open; neither conflicts with an edit
-            // elsewhere, and the engine's own check of `expected` is the atomic one.
-            let next = (d.snapshot)();
-            let initial = d.initial.borrow().clone();
-            let keys: Vec<String> = next.as_object().map(|m| m.iter().filter(|(k, v)| initial[k.as_str()] != **v).map(|(k, _)| k.clone()).collect()).unwrap_or_default();
-            if keys.is_empty() { d.status.set_text("Nothing to save"); return; }
-            d.busy.set(true); let d = d.clone(); d.form.set_sensitive(false); d.footer.set_sensitive(false); d.status.set_text("Saving…");
-            glib::spawn_future_local(async move {
-                let base = d.base.borrow().clone();
-                let mut payload = json!({id_key: id});
-                let mut expected = serde_json::Map::new();
-                for k in &keys { payload[k.as_str()] = next[k.as_str()].clone(); expected.insert(k.clone(), base[k.as_str()].clone()); }
-                payload["expected"] = Value::Object(expected);
-                match ui.call(update, payload).await {
-                    Ok(v) => { *d.base.borrow_mut() = v; *d.initial.borrow_mut() = next; d.status.set_text("Saved"); ui.refresh_page(); }
-                    Err(crate::client::Error::Bus(e)) if e.code.ends_with(".edit_conflict") => d.status.set_text("This item changed elsewhere. Your draft is preserved. Copy it before discarding and reopening the latest version."),
-                    Err(e) => d.status.set_text(&e.to_string()),
-                }
-                d.busy.set(false); d.form.set_sensitive(true); d.footer.set_sensitive(true);
-            });
-        });
-        // Weak: the controller lives on the layout, and a strong Save here would keep the
-        // Draft, its panel and its widgets alive after the panel closes.
-        let save = save.downgrade();
-        let key = gtk::EventControllerKey::new();
-        key.connect_key_pressed(move |_, key, _, modifiers| {
-            if key == gtk::gdk::Key::s && modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK) {
-                if let Some(save) = save.upgrade() {
-                    save.emit_clicked();
-                }
-                glib::Propagation::Stop
-            } else {
-                glib::Propagation::Proceed
+}
+
+use super::board_view::{caption, hue, label_chip, priority_icon, since, state_badge, status_icon, titled, wrapped};
+use relay_board::{activity_sentence, actor_name, markdown_markup, URGENT_FIRST};
+
+// ── Pieces the issue-style pages share ────────────────────────────────────────────────────
+
+/// A Markdown field the way GitHub writes one: Write and Preview tabs, a formatting bar that
+/// wraps the selection, and the text under them.
+pub struct MarkdownField {
+    pub root: gtk::Box,
+    pub view: gtk::TextView,
+    write: gtk::ToggleButton,
+}
+impl MarkdownField {
+    pub fn new(initial: &str, placeholder: &str, height: i32) -> Self {
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        root.add_css_class("md-field");
+        let bar = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        bar.add_css_class("md-bar");
+        let write = gtk::ToggleButton::with_label("Write");
+        let preview = gtk::ToggleButton::with_label("Preview");
+        preview.set_group(Some(&write));
+        write.set_active(true);
+        for tab in [&write, &preview] {
+            tab.add_css_class("md-tab");
+            bar.append(tab);
+        }
+        let tools = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        tools.add_css_class("md-tools");
+        tools.set_hexpand(true);
+        tools.set_halign(gtk::Align::End);
+        bar.append(&tools);
+        let view = multiline(initial, height);
+        view.add_css_class("md-input");
+        view.set_top_margin(9);
+        view.set_bottom_margin(9);
+        view.set_left_margin(11);
+        view.set_right_margin(11);
+        // A text view has no placeholder of its own: a hint sits over it while it is empty.
+        let input = gtk::Overlay::new();
+        input.set_child(Some(&view));
+        let hint = label(placeholder, "md-placeholder");
+        hint.set_halign(gtk::Align::Start);
+        hint.set_valign(gtk::Align::Start);
+        hint.set_can_target(false);
+        hint.set_visible(initial.is_empty());
+        input.add_overlay(&hint);
+        let shown = hint.downgrade();
+        view.buffer().connect_changed(move |buffer| {
+            if let Some(hint) = shown.upgrade() {
+                hint.set_visible(buffer.char_count() == 0);
             }
         });
-        self.layout.add_controller(key);
+        let rendered = label("", "md-preview");
+        rendered.set_wrap(true);
+        rendered.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        rendered.set_selectable(true);
+        rendered.set_valign(gtk::Align::Start);
+        rendered.set_size_request(-1, height);
+        let stack = gtk::Stack::new();
+        stack.set_vhomogeneous(false);
+        stack.add_named(&input, Some("write"));
+        stack.add_named(&rendered, Some("preview"));
+        let (source, pane, keys) = (view.downgrade(), stack.downgrade(), tools.downgrade());
+        preview.connect_toggled(move |preview| {
+            let (Some(view), Some(stack), Some(tools)) = (source.upgrade(), pane.upgrade(), keys.upgrade()) else { return };
+            if preview.is_active() {
+                let text = buffer_text(&view.buffer());
+                if text.trim().is_empty() {
+                    rendered.set_markup("<i>Nothing to preview</i>");
+                } else {
+                    rendered.set_markup(&markdown_markup(&text));
+                }
+                stack.set_visible_child_name("preview");
+            } else {
+                stack.set_visible_child_name("write");
+                view.grab_focus();
+            }
+            tools.set_sensitive(!preview.is_active());
+        });
+        for (caption, tip, before, after, whole_line) in [
+            ("H", "Heading", "### ", "", true),
+            ("B", "Bold", "**", "**", false),
+            ("I", "Italic", "*", "*", false),
+            ("❝", "Quote", "> ", "", true),
+            ("<>", "Code", "`", "`", false),
+            ("🔗", "Link", "[", "](url)", false),
+            ("•", "Bulleted list", "- ", "", true),
+            ("1.", "Numbered list", "1. ", "", true),
+            ("☐", "Task list", "- [ ] ", "", true),
+        ] {
+            let key = button(caption, "md-tool");
+            key.set_tooltip_text(Some(tip));
+            key.set_focusable(false);
+            let view = view.downgrade();
+            key.connect_clicked(move |_| {
+                if let Some(view) = view.upgrade() {
+                    wrap_selection(&view, before, after, whole_line);
+                }
+            });
+            tools.append(&key);
+        }
+        root.append(&bar);
+        root.append(&stack);
+        Self { root, view, write }
+    }
+    pub fn text(&self) -> String {
+        buffer_text(&self.view.buffer())
+    }
+    pub fn clear(&self) {
+        self.view.buffer().set_text("");
+        self.write.set_active(true);
     }
 }
 
-fn classification_choices(
-    control: &gtk::ComboBoxText,
-    kind: &'static str,
-    choices: &[&str],
-) -> gtk::Box {
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 3);
-    row.set_homogeneous(true);
-    row.add_css_class("task-choice-row");
-    let mut first = None::<gtk::ToggleButton>;
-    for (index, value) in choices.iter().enumerate() {
-        let key = gtk::ToggleButton::new();
-        key.add_css_class("task-choice");
-        if let Some(first) = &first {
-            key.set_group(Some(first));
-        } else {
-            first = Some(key.clone());
+/// The formatting bar's keys: wrap the selection (or the cursor) in `before`…`after`, or with
+/// `whole_line` prefix every selected line.
+fn wrap_selection(view: &gtk::TextView, before: &str, after: &str, whole_line: bool) {
+    let buffer = view.buffer();
+    let (start, end) = buffer.selection_bounds().unwrap_or_else(|| {
+        let at = buffer.iter_at_mark(&buffer.get_insert());
+        (at, at)
+    });
+    buffer.begin_user_action();
+    if whole_line {
+        for line in (start.line()..=end.line()).rev() {
+            if let Some(mut at) = buffer.iter_at_line(line) {
+                buffer.insert(&mut at, before);
+            }
         }
-        let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        content.set_halign(gtk::Align::Center);
-        content.set_valign(gtk::Align::Center);
-        if kind == "type" {
-            content.append(&super::task_mark(value, 10));
-        } else {
-            let mark = gtk::DrawingArea::new();
-            mark.set_content_width(if kind == "size" { 25 } else { 13 });
-            mark.set_content_height(12);
-            mark.set_halign(gtk::Align::Center);
-            mark.set_draw_func(move |widget, cr, _, _| {
-                let name = if kind == "priority" && index == 3 {
-                    "held"
-                } else if kind == "priority" && index == 2 {
-                    "waiting"
-                } else {
-                    "secondary"
-                };
-                let Some(color) = widget.style_context().lookup_color(name) else {
-                    return;
-                };
-                for i in 0..3 {
-                    let lit = if kind == "size" {
-                        i < index
+    } else {
+        let (from, to) = (start.offset(), end.offset());
+        // The later point first, so the earlier offset still holds.
+        buffer.insert(&mut buffer.iter_at_offset(to), after);
+        buffer.insert(&mut buffer.iter_at_offset(from), before);
+        let shift = before.chars().count() as i32;
+        buffer.select_range(&buffer.iter_at_offset(from + shift), &buffer.iter_at_offset(to + shift));
+    }
+    buffer.end_user_action();
+    view.grab_focus();
+}
+
+/// A round initial in the name's hue: who wrote a comment or did a step.
+fn avatar(name: &str) -> gtk::Label {
+    let initial: String = name.chars().find(|c| c.is_alphanumeric()).map(|c| c.to_uppercase().collect()).unwrap_or_else(|| "?".into());
+    let face = label(&initial, "avatar");
+    face.add_css_class(&format!("avatar-hue-{}", hue(name)));
+    face.set_xalign(0.5);
+    face.set_valign(gtk::Align::Start);
+    face.set_tooltip_text(Some(name));
+    face
+}
+
+/// A choice's icon, drawn fresh for each place it shows.
+type Icon = fn(&str) -> Option<gtk::Widget>;
+/// Each pill's value and key, so a pick can light it and put out the rest.
+type PillKeys = Rc<RefCell<Vec<(String, glib::WeakRef<gtk::Button>)>>>;
+/// Files waiting to go up with a new task: name, MIME type and bytes.
+type Queued = Rc<RefCell<Vec<(String, String, Vec<u8>)>>>;
+fn column_icon(c: &str) -> Option<gtk::Widget> {
+    Some(status_icon(c, 12).upcast())
+}
+fn priority_mark(p: &str) -> Option<gtk::Widget> {
+    Some(priority_icon(p).upcast())
+}
+fn type_icon(t: &str) -> Option<gtk::Widget> {
+    Some(super::task_mark(t, 9).upcast())
+}
+fn no_icon(_: &str) -> Option<gtk::Widget> {
+    None
+}
+
+/// A field's choices laid out as pills, the current one lit: one click picks, nothing pops
+/// up. `choices` are (value, caption); rows wrap at the sidebar's width.
+fn pills(choices: Vec<(String, String)>, current: &str, icon: Icon, pick: impl Fn(&str) + 'static) -> gtk::Box {
+    let keys: PillKeys = Rc::default();
+    let pick = Rc::new(pick);
+    let mut items = Vec::new();
+    for (value, caption) in choices {
+        let key = button("", "choice-pill");
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 5);
+        let mark = icon(&value);
+        let wide = caption.chars().count() + if mark.is_some() { 5 } else { 3 };
+        if let Some(mark) = mark {
+            content.append(&mark);
+        }
+        let name = label(&caption, "");
+        name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        name.set_max_width_chars(18);
+        content.append(&name);
+        key.set_child(Some(&content));
+        key.set_tooltip_text(Some(&caption));
+        if value == current {
+            key.add_css_class("selected");
+        }
+        keys.borrow_mut().push((value.clone(), key.downgrade()));
+        let (keys, pick) = (keys.clone(), pick.clone());
+        key.connect_clicked(move |_| {
+            for (other, key) in keys.borrow().iter() {
+                if let Some(key) = key.upgrade() {
+                    if *other == value {
+                        key.add_css_class("selected");
                     } else {
-                        index >= 2 || (index == 1 && i < 2)
-                    };
-                    cr.set_source_rgba(
-                        color.red() as f64,
-                        color.green() as f64,
-                        color.blue() as f64,
-                        if lit {
-                            1.
-                        } else if kind == "size" {
-                            0.2
-                        } else {
-                            0.28
-                        },
-                    );
-                    if kind == "size" {
-                        let size = [4., 7., 10.][i];
-                        let left = [0., 6., 15.][i];
-                        cr.rectangle(left + 0.5, 12. - size + 0.5, size - 1., size - 1.);
-                        cr.set_line_width(1.);
-                        if lit {
-                            let _ = cr.fill();
-                        } else {
-                            let _ = cr.stroke();
-                        }
-                    } else {
-                        let height = if index >= 2 { [3., 7., 11.][i] } else { 3. };
-                        cr.rectangle(i as f64 * 5., 11. - height, 3., height);
-                        let _ = cr.fill();
+                        key.remove_css_class("selected");
+                    }
+                }
+            }
+            pick(&value);
+        });
+        items.push((key.upcast::<gtk::Widget>(), wide));
+    }
+    let rows = wrapped(items, 34);
+    rows.add_css_class("choice-pills");
+    rows
+}
+fn titled_choices(list: &[&str], none: &str) -> Vec<(String, String)> {
+    list.iter().map(|v| (v.to_string(), if v.is_empty() { none.to_string() } else { titled(v) })).collect()
+}
+fn column_choices(list: &[&str]) -> Vec<(String, String)> {
+    list.iter().map(|c| (c.to_string(), caption(c).to_string())).collect()
+}
+fn module_choices(modules: &[Value], current: Option<i64>) -> Vec<(String, String)> {
+    let mut names = vec![(String::new(), "None".to_string())];
+    for m in modules {
+        // A completed module is offered only to the task that already has it.
+        if !m["completed_at"].is_null() && m["id"].as_i64() != current {
+            continue;
+        }
+        names.push((m["id"].to_string(), text(m, "name").to_string()));
+    }
+    if let Some(module) = current.filter(|m| !names.iter().any(|(id, _)| *id == m.to_string())) {
+        names.push((module.to_string(), format!("Module #{module}")));
+    }
+    names
+}
+
+/// A sidebar section: a quiet heading over its content.
+fn side_section(title: &str) -> gtk::Box {
+    let section = gtk::Box::new(gtk::Orientation::Vertical, 7);
+    section.add_css_class("issue-side-section");
+    if !title.is_empty() {
+        section.append(&label(title, "issue-side-title"));
+    }
+    section
+}
+
+/// The page's width: a centred column with the sidebar beside it, or under it when narrow.
+/// GitHub keeps an issue to a readable measure instead of stretching it across the window.
+fn issue_columns(ui: &Rc<Ui>, panel: &Rc<crate::panel::Panel>, page: &gtk::Box, main: &gtk::Box, side: &gtk::Box) -> gtk::Box {
+    const SIDE: i32 = 264;
+    let columns = gtk::Box::new(gtk::Orientation::Horizontal, 32);
+    columns.add_css_class("issue-columns");
+    main.set_hexpand(false);
+    main.set_valign(gtk::Align::Start);
+    side.set_hexpand(false);
+    side.set_valign(gtk::Align::Start);
+    side.add_css_class("issue-sidebar");
+    columns.append(main);
+    columns.append(side);
+    page.set_halign(gtk::Align::Center);
+    // The page panel spans the window less its sidebar; size the column to what is left.
+    let fit = {
+        let (columns, main, side) = (columns.downgrade(), main.downgrade(), side.downgrade());
+        move |width: i32| {
+            let (Some(columns), Some(main), Some(side)) = (columns.upgrade(), main.upgrade(), side.upgrade()) else { return };
+            let room = (width - 260).max(360);
+            if room >= 940 {
+                columns.set_orientation(gtk::Orientation::Horizontal);
+                main.set_size_request((room - SIDE - 32 - 64).clamp(520, 820), -1);
+                side.set_size_request(SIDE, -1);
+            } else {
+                columns.set_orientation(gtk::Orientation::Vertical);
+                main.set_size_request((room - 48).min(820), -1);
+                side.set_size_request((room - 48).min(820), -1);
+            }
+        }
+    };
+    fit(ui.window.width());
+    if let Some(surface) = ui.window.surface() {
+        let handler = surface.connect_layout(move |_, width, _| fit(width));
+        let handler = RefCell::new(Some(handler));
+        panel.on_closed(move || {
+            if let Some(handler) = handler.borrow_mut().take() {
+                surface.disconnect(handler);
+            }
+        });
+    }
+    columns
+}
+fn project_name(ui: &Ui, project: i64) -> String {
+    ui.projects.borrow().iter().find(|p| p["id"].as_i64() == Some(project)).map(|p| text(p, "name").to_string()).unwrap_or_default()
+}
+
+// ── Attachments: dropped or pasted, never typed ───────────────────────────────────────────
+
+/// A file or image arriving by drop or paste.
+enum Incoming {
+    Path(String),
+    Image { name: String, bytes: Vec<u8> },
+}
+fn mime_of(name: &str) -> &'static str {
+    match name.rsplit('.').next().map(str::to_lowercase).as_deref() {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        Some("pdf") => "application/pdf",
+        Some("txt" | "md" | "log") => "text/plain",
+        Some("json") => "application/json",
+        _ => "application/octet-stream",
+    }
+}
+fn texture_png(texture: &gtk::gdk::Texture) -> Vec<u8> {
+    texture.save_to_png_bytes().to_vec()
+}
+/// Files and images dropped on `widget`, or pasted with Ctrl+V anywhere in it, go to `take`.
+/// A paste of plain text is left to the text field it lands in.
+fn accept_attachments(widget: &impl IsA<gtk::Widget>, take: impl Fn(Vec<Incoming>) + 'static) {
+    use gtk::gdk;
+    let take = Rc::new(take);
+    let drop = gtk::DropTarget::new(glib::Type::INVALID, gdk::DragAction::COPY);
+    drop.set_types(&[gdk::FileList::static_type(), gdk::Texture::static_type()]);
+    let target = widget.as_ref().downgrade();
+    drop.connect_enter(move |_, _, _| {
+        if let Some(w) = target.upgrade() {
+            w.add_css_class("drop-attach");
+        }
+        gdk::DragAction::COPY
+    });
+    let target = widget.as_ref().downgrade();
+    drop.connect_leave(move |_| {
+        if let Some(w) = target.upgrade() {
+            w.remove_css_class("drop-attach");
+        }
+    });
+    let (sink, target) = (take.clone(), widget.as_ref().downgrade());
+    drop.connect_drop(move |_, value, _, _| {
+        if let Some(w) = target.upgrade() {
+            w.remove_css_class("drop-attach");
+        }
+        if let Ok(files) = value.get::<gdk::FileList>() {
+            let paths: Vec<Incoming> = files.files().iter().filter_map(|f| f.path()).map(|p| Incoming::Path(p.to_string_lossy().into_owned())).collect();
+            if !paths.is_empty() {
+                sink(paths);
+                return true;
+            }
+        }
+        if let Ok(texture) = value.get::<gdk::Texture>() {
+            sink(vec![Incoming::Image { name: "dropped.png".into(), bytes: texture_png(&texture) }]);
+            return true;
+        }
+        false
+    });
+    widget.add_controller(drop);
+    let keys = gtk::EventControllerKey::new();
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let source = widget.as_ref().downgrade();
+    keys.connect_key_pressed(move |_, key, _, mods| {
+        if !(matches!(key, gdk::Key::v | gdk::Key::V) && mods.contains(gdk::ModifierType::CONTROL_MASK)) {
+            return glib::Propagation::Proceed;
+        }
+        let Some(widget) = source.upgrade() else { return glib::Propagation::Proceed };
+        let clipboard = widget.clipboard();
+        let formats = clipboard.formats();
+        let sink = take.clone();
+        if formats.contains_type(gdk::FileList::static_type()) && !formats.contain_mime_type("text/plain;charset=utf-8") {
+            glib::spawn_future_local(async move {
+                if let Ok(value) = clipboard.read_value_future(gdk::FileList::static_type(), glib::Priority::DEFAULT).await {
+                    if let Ok(files) = value.get::<gdk::FileList>() {
+                        sink(files.files().iter().filter_map(|f| f.path()).map(|p| Incoming::Path(p.to_string_lossy().into_owned())).collect());
                     }
                 }
             });
-            content.append(&mark);
+            return glib::Propagation::Stop;
         }
-        content.append(&label(
-            if value.is_empty() { "None" } else { value },
-            "task-choice-label",
-        ));
-        key.set_child(Some(&content));
-        key.set_active(chosen(control) == *value);
-        let control = control.downgrade();
-        let value = value.to_string();
-        key.connect_toggled(move |key| {
-            if key.is_active() {
-                if let Some(control) = control.upgrade() {
-                    control.set_active_id(Some(&value));
+        if formats.contains_type(gdk::Texture::static_type()) {
+            glib::spawn_future_local(async move {
+                if let Ok(Some(texture)) = clipboard.read_texture_future().await {
+                    sink(vec![Incoming::Image { name: "pasted.png".into(), bytes: texture_png(&texture) }]);
                 }
-            }
-        });
-        row.append(&key);
+            });
+            return glib::Propagation::Stop;
+        }
+        glib::Propagation::Proceed
+    });
+    widget.add_controller(keys);
+}
+/// A thumbnail for an image (or a named chip for any other file), with a remove key.
+fn attachment_tile(name: &str, mime: &str, image: Option<gtk::gdk::Texture>, path: Option<&str>, remove: impl Fn() + 'static) -> gtk::Overlay {
+    let tile = gtk::Overlay::new();
+    tile.add_css_class("attachment-tile");
+    tile.set_tooltip_text(Some(name));
+    // A gtk::Image scales its picture to one fixed size; a Picture asks for the image's own
+    // width and would stretch the page to it.
+    let face: gtk::Widget = match (mime.starts_with("image/"), image, path) {
+        (true, Some(texture), _) => gtk::Image::from_paintable(Some(&texture)).upcast(),
+        (true, None, Some(path)) => gtk::Image::from_file(path).upcast(),
+        _ => {
+            let chip = gtk::Box::new(gtk::Orientation::Vertical, 4);
+            chip.set_valign(gtk::Align::Center);
+            chip.append(&crate::icons::image("file", 18));
+            let caption = label(name, "attachment-name");
+            caption.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+            caption.set_max_width_chars(12);
+            caption.set_xalign(0.5);
+            chip.append(&caption);
+            chip.upcast()
+        }
+    };
+    if let Some(image) = face.downcast_ref::<gtk::Image>() {
+        image.set_pixel_size(84);
     }
-    row
+    face.set_size_request(104, 88);
+    tile.set_halign(gtk::Align::Start);
+    tile.set_child(Some(&face));
+    let close = crate::app::icon_button("close", "Remove");
+    close.add_css_class("attachment-remove");
+    close.set_halign(gtk::Align::End);
+    close.set_valign(gtk::Align::Start);
+    close.connect_clicked(move |_| remove());
+    tile.add_overlay(&close);
+    tile
 }
 
-pub fn compose(ui: &Rc<Ui>, project: i64) {
-    let panel = crate::panel::Panel::page(ui, "New task");
-    let form = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    form.add_css_class("task-compose");
-    let primary = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    primary.add_css_class("task-compose-section");
-    primary.append(&label("TASK", "section-label"));
-    primary.append(&paragraph("The outcome and context the agent receives."));
-    let title = gtk::Entry::builder()
-        .placeholder_text("A concrete outcome")
-        .build();
-    field("Title", &title, &primary);
-    let description = multiline("", 160);
-    field("Description · Markdown", &description, &primary);
-    form.append(&primary);
-    let classify = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    classify.add_css_class("task-compose-section");
-    let kind = choose(&TYPES, "task");
-    let priority = choose(&PRIORITIES, "medium");
-    let size = choose(&SIZES, "");
-    classify.append(&label("CLASSIFY", "section-label"));
-    classify.append(&paragraph(
-        "Type is the first-class classification; labels are the free-form tags under it.",
-    ));
-    field(
-        "Type",
-        &classification_choices(&kind, "type", &TYPES),
-        &classify,
-    );
-    let labels = gtk::Entry::builder()
-        .placeholder_text("Add a label, separated by commas")
-        .build();
-    field("Labels · optional", &labels, &classify);
-    let parent = choose(&[""], "");
-    field("Parent · makes this a sub-task", &parent, &classify);
-    form.append(&classify);
-    let organize = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    organize.add_css_class("task-compose-section");
-    organize.append(&label("ORGANIZE", "section-label"));
-    organize.append(&paragraph(
-        "Only priority is required. Everything else can be filled later.",
-    ));
-    let metadata = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    metadata.set_homogeneous(true);
-    let priority_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    field(
-        "Priority",
-        &classification_choices(&priority, "priority", &PRIORITIES),
-        &priority_box,
-    );
-    metadata.append(&priority_box);
-    let size_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    field(
-        "Size",
-        &classification_choices(&size, "size", &SIZES),
-        &size_box,
-    );
-    metadata.append(&size_box);
-    let module = choose(&[""], "");
-    let module_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    field("Module", &module, &module_box);
-    metadata.append(&module_box);
-    organize.append(&metadata);
-    let changelog = gtk::Entry::builder().placeholder_text("Added…").build();
-    field("Changelog sentence · optional", &changelog, &organize);
-    form.append(&organize);
-    let advanced = gtk::Expander::new(Some("Advanced · column and execution state"));
-    let advanced_fields = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    let column = choose(COLUMNS, "backlog");
-    let state = choose(&STATES, "none");
-    field("Column", &column, &advanced_fields);
-    field("State", &state, &advanced_fields);
-    advanced.set_child(Some(&advanced_fields));
-    form.append(&advanced);
-    for control in [&kind, &priority, &size] {
-        control.set_visible(false);
-        form.append(control);
-    }
-    let weak = Rc::downgrade(ui);
-    let parents = parent.clone();
-    let modules = module.clone();
-    glib::spawn_future_local(async move {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        let (tasks, available) = tokio::join!(
-            ui.call("task.list", json!({"project_id":project})),
-            ui.call("module.list", json!({"project_id":project}))
-        );
-        if let Ok(tasks) = tasks {
-            for task in rows(&tasks, "tasks")
-                .iter()
-                .filter(|task| task["depth"].as_i64().unwrap_or(0) < 2)
-            {
-                parents.append(
-                    Some(&task["id"].to_string()),
-                    &format!("#{} {}", task["id"], text(task, "title")),
-                );
-            }
-        }
-        if let Ok(available) = available {
-            for module in rows(&available, "modules") {
-                modules.append(Some(&module["id"].to_string()), text(&module, "name"));
-            }
-        }
-    });
+// ── New task ──────────────────────────────────────────────────────────────────────────────
+
+/// GitHub's new-issue page: a title and a Markdown description, images dropped or pasted
+/// onto it, and the task's fields as pills beside it. Create opens the new task (or, with
+/// Create more, clears for the next). From a module's board it starts in that module.
+pub fn compose(ui: &Rc<Ui>, project: i64, column: &str, module: Option<i64>) {
+    let name = project_name(ui, project);
+    let panel = crate::panel::Panel::page(ui, &if name.is_empty() { "New task".into() } else { format!("New task in {name}") });
+    panel.add_css_class("issue-page");
+    panel.hide_scrollbar();
+    let page = gtk::Box::new(gtk::Orientation::Vertical, 14);
+    page.add_css_class("issue-compose");
+    let main = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    let heading = label("", "issue-field-caption");
+    heading.set_markup("Add a title <span foreground=\"#e5382e\">*</span>");
+    main.append(&heading);
+    let title = gtk::Entry::builder().placeholder_text("Title").build();
+    title.set_widget_name("compose-title");
+    title.add_css_class("issue-title-entry");
+    main.append(&title);
+    main.append(&label("Add a description", "issue-field-caption"));
+    let description = MarkdownField::new("", "Type your description here…  Paste or drop images to attach them.", 220);
+    description.view.set_widget_name("compose-body");
+    main.append(&description.root);
+    // Images and files waiting to go up with the task.
+    let queued: Queued = Rc::default();
+    let tray = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    tray.add_css_class("attachment-tray");
+    tray.set_visible(false);
+    main.append(&tray);
     let footer = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    footer.add_css_class("issue-compose-footer");
+    let more = gtk::CheckButton::with_label("Create more");
+    more.set_tooltip_text(Some("Stay here after creating, ready for the next task"));
+    footer.append(&more);
     let status = paragraph("");
     status.set_hexpand(true);
+    status.set_xalign(1.);
     footer.append(&status);
     let cancel = button("Cancel", "quiet");
     footer.append(&cancel);
     let create = button("Create task", "primary");
+    create.set_widget_name("compose-create");
+    create.set_tooltip_text(Some("Create the task (Ctrl+Enter)"));
     footer.append(&create);
-    form.append(&footer);
-    panel.body.append(&form);
+    main.append(&footer);
+
+    // The sidebar's picks, by payload key.
+    let picks: Rc<RefCell<BTreeMap<&'static str, String>>> = Rc::new(RefCell::new(BTreeMap::from([
+        ("column", column.to_string()),
+        ("type", "task".into()),
+        ("priority", "medium".into()),
+        ("size", String::new()),
+        ("module_id", module.map(|m| m.to_string()).unwrap_or_default()),
+    ])));
+    let choose_into = |key: &'static str| {
+        let picks = picks.clone();
+        move |value: &str| {
+            picks.borrow_mut().insert(key, value.to_string());
+        }
+    };
+    let side = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    for (title_text, control) in [
+        ("Status", pills(column_choices(OPEN_COLUMNS), column, column_icon, choose_into("column"))),
+        ("Priority", pills(titled_choices(&URGENT_FIRST, ""), "medium", priority_mark, choose_into("priority"))),
+        ("Size · how much work", pills(titled_choices(&SIZES, "None"), "", no_icon, choose_into("size"))),
+        ("Type", pills(titled_choices(&TYPES, ""), "task", type_icon, choose_into("type"))),
+    ] {
+        let section = side_section(title_text);
+        section.append(&control);
+        side.append(&section);
+    }
+    let modules = side_section("Module");
+    let module_slot = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    module_slot.append(&label("Loading…", "issue-side-empty"));
+    modules.append(&module_slot);
+    side.append(&modules);
+    let tags = side_section("Labels");
+    let labels = gtk::Entry::builder().placeholder_text("ui, perf").build();
+    tags.append(&labels);
+    side.append(&tags);
+
+    page.append(&issue_columns(ui, &panel, &page, &main, &side));
+    panel.body.append(&page);
+
+    let refill = {
+        let (tray, queued) = (tray.downgrade(), queued.clone());
+        Rc::new(move || {
+            let Some(tray) = tray.upgrade() else { return };
+            clear(&tray);
+            for (index, (name, mime, bytes)) in queued.borrow().iter().enumerate() {
+                let image = mime.starts_with("image/").then(|| gtk::gdk::Texture::from_bytes(&glib::Bytes::from(bytes)).ok()).flatten();
+                let (queued, tray_weak) = (queued.clone(), tray.downgrade());
+                let tile = attachment_tile(name, mime, image, None, move || {
+                    if index < queued.borrow().len() {
+                        queued.borrow_mut().remove(index);
+                    }
+                    // Redrawn on the next turn: this key's own tile goes with it.
+                    if let Some(tray) = tray_weak.upgrade() {
+                        tray.activate_action("compose.refill", None).ok();
+                    }
+                });
+                tray.append(&tile);
+            }
+            tray.set_visible(!queued.borrow().is_empty());
+        })
+    };
+    let group = gtk::gio::SimpleActionGroup::new();
+    let redraw = gtk::gio::SimpleAction::new("refill", None);
+    let again = refill.clone();
+    redraw.connect_activate(move |_, _| {
+        let again = again.clone();
+        glib::idle_add_local_once(move || again());
+    });
+    group.add_action(&redraw);
+    page.insert_action_group("compose", Some(&group));
+    let (into, again, note) = (queued.clone(), refill.clone(), status.downgrade());
+    accept_attachments(&page, move |incoming| {
+        for item in incoming {
+            match item {
+                Incoming::Path(path) => match std::fs::read(&path) {
+                    Ok(bytes) => {
+                        let name = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "attachment".into());
+                        let mime = mime_of(&name).to_string();
+                        into.borrow_mut().push((name, mime, bytes));
+                    }
+                    Err(e) => {
+                        if let Some(note) = note.upgrade() {
+                            note.set_text(&format!("Could not read {path}: {e}"));
+                        }
+                    }
+                },
+                Incoming::Image { name, bytes } => into.borrow_mut().push((name, "image/png".into(), bytes)),
+            }
+        }
+        again();
+    });
+
+    let weak = Rc::downgrade(ui);
+    let slot = module_slot.downgrade();
+    let module_pick = choose_into("module_id");
+    glib::spawn_future_local(async move {
+        let Some(ui) = weak.upgrade() else { return };
+        let available = ui.call("module.list", json!({"project_id":project})).await;
+        if let Some(slot) = slot.upgrade() {
+            clear(&slot);
+            let modules = available.map(|a| rows(&a, "modules")).unwrap_or_default();
+            slot.append(&pills(module_choices(&modules, module), &module.map(|m| m.to_string()).unwrap_or_default(), no_icon, module_pick));
+        }
+    });
+
     let permit_close = Rc::new(Cell::new(false));
     let busy = Rc::new(Cell::new(false));
-    let guard_title = title.clone();
-    let guard_body = description.buffer();
-    let guard_status = status.clone();
-    let permit = permit_close.clone();
-    let working = busy.clone();
+    let empty = {
+        let (title, body, queued) = (title.downgrade(), description.view.buffer(), queued.clone());
+        move || title.upgrade().is_none_or(|t| t.text().trim().is_empty()) && buffer_text(&body).trim().is_empty() && queued.borrow().is_empty()
+    };
+    let empty = Rc::new(empty);
+    let (guard_status, permit, working, is_empty) = (status.downgrade(), permit_close.clone(), busy.clone(), empty.clone());
     panel.set_guard(move || {
         if working.get() {
             return false;
         }
-        if permit.get() || (guard_title.text().is_empty() && buffer_text(&guard_body).is_empty()) {
+        if permit.get() || is_empty() {
             return true;
         }
-        guard_status.set_text("Create the task or choose Discard draft before leaving.");
+        if let Some(status) = guard_status.upgrade() {
+            status.set_text("Create the task, or Cancel to discard it.");
+        }
         false
     });
-    cancel.set_label("Discard draft");
-    // Weak captures: both keys sit inside the form the panel owns, so strong ones would keep
-    // the form and the panel alive after it closes.
-    let p = Rc::downgrade(&panel);
-    let permit = permit_close.clone();
-    let working = busy.clone();
-    cancel.connect_clicked(move |_| {
+    let (p, permit, working, is_empty) = (Rc::downgrade(&panel), permit_close.clone(), busy.clone(), empty.clone());
+    crate::app::confirm_inline_if(&cancel, "Discard draft", move || !is_empty(), move |_| {
         if !working.get() {
             permit.set(true);
             if let Some(p) = p.upgrade() {
@@ -521,67 +777,272 @@ pub fn compose(ui: &Rc<Ui>, project: i64) {
     });
     let weak = Rc::downgrade(ui);
     let p = Rc::downgrade(&panel);
-    let form = form.downgrade();
+    let body = description.view.downgrade();
+    let page_weak = page.downgrade();
+    let title_key = title.clone();
     create.connect_clicked(move |_| {
-        let Some(ui) = weak.upgrade() else { return; };
-        let name = title.text().trim().to_string();
-        if name.is_empty() { title.grab_focus(); return; }
-        if busy.replace(true) { return; }
-        let payload = json!({"project_id": project, "title": name, "body": buffer_text(&description.buffer()), "type": chosen(&kind), "priority": chosen(&priority), "size": if chosen(&size).is_empty() {Value::Null} else {json!(chosen(&size))}, "column":chosen(&column),"state":chosen(&state),"parent_id":chosen(&parent).parse::<i64>().ok(),"module_id":chosen(&module).parse::<i64>().ok(),"changelog":changelog.text().to_string(),"labels":labels.text().split(',').map(str::trim).filter(|s|!s.is_empty()).collect::<Vec<_>>()});
-        let Some(form) = form.upgrade() else { return; };
-        form.set_sensitive(false);
-        let status = status.clone(); let p = p.clone();
-        let busy = busy.clone(); let permit = permit_close.clone();
+        let (Some(ui), Some(body), Some(page)) = (weak.upgrade(), body.upgrade(), page_weak.upgrade()) else { return };
+        let name = title_key.text().trim().to_string();
+        if name.is_empty() {
+            status.set_text("A task needs a title.");
+            title_key.grab_focus();
+            return;
+        }
+        if busy.replace(true) {
+            return;
+        }
+        let picked = picks.borrow().clone();
+        let pick = |key: &str| picked.get(key).cloned().unwrap_or_default();
+        use base64::Engine;
+        let attachments: Vec<Value> = queued.borrow().iter().map(|(name, mime, bytes)| json!({"name":name,"mime":mime,"bytes_b64":base64::engine::general_purpose::STANDARD.encode(bytes)})).collect();
+        let payload = json!({"project_id": project, "title": name, "body": buffer_text(&body.buffer()), "type": pick("type"), "priority": pick("priority"), "size": if pick("size").is_empty() {Value::Null} else {json!(pick("size"))}, "column": pick("column"), "module_id": pick("module_id").parse::<i64>().ok(), "labels": labels.text().split(',').map(str::trim).filter(|s| !s.is_empty()).collect::<Vec<_>>(), "attachments": attachments});
+        page.set_sensitive(false);
+        status.set_text("Creating…");
+        let (status, p, busy, permit, title, more, queued, refill) = (status.clone(), p.clone(), busy.clone(), permit_close.clone(), title_key.clone(), more.clone(), queued.clone(), refill.clone());
         glib::spawn_future_local(async move {
             let result = ui.call("task.create", payload).await;
             busy.set(false);
+            page.set_sensitive(true);
             match result {
-                Ok(_) => { permit.set(true); if let Some(p) = p.upgrade() { p.close(); } ui.refresh_page(); },
-                Err(e) => { status.set_text(&e.to_string()); form.set_sensitive(true); }
+                Ok(task) if more.is_active() => {
+                    title.set_text("");
+                    body.buffer().set_text("");
+                    queued.borrow_mut().clear();
+                    refill();
+                    status.set_text(&format!("Created #{}", task["id"]));
+                    title.grab_focus();
+                    ui.refresh_page();
+                }
+                Ok(task) => {
+                    permit.set(true);
+                    if let Some(p) = p.upgrade() {
+                        p.close();
+                    }
+                    ui.refresh_page();
+                    if let Some(id) = task["id"].as_i64() {
+                        open(&ui, id);
+                    }
+                }
+                Err(e) => status.set_text(&e.to_string()),
             }
         });
     });
+    let submit = create.downgrade();
+    let keys = gtk::EventControllerKey::new();
+    keys.connect_key_pressed(move |_, key, _, mods| {
+        if matches!(key, gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter) && mods.contains(gtk::gdk::ModifierType::CONTROL_MASK) {
+            if let Some(submit) = submit.upgrade() {
+                submit.emit_clicked();
+            }
+            return glib::Propagation::Stop;
+        }
+        glib::Propagation::Proceed
+    });
+    page.add_controller(keys);
+    let submit = create.downgrade();
+    title.connect_activate(move |_| {
+        if let Some(submit) = submit.upgrade() {
+            submit.emit_clicked();
+        }
+    });
     panel.present();
+    title.grab_focus();
 }
 
-thread_local! {
-    /// Bumped by every open: only the newest open still in flight may present its detail.
-    static OPEN_SERIAL: Cell<u64> = const { Cell::new(0) };
-    /// Task details on screen, so opening one again shows it instead of stacking a second.
-    static OPEN_DETAILS: RefCell<Vec<(i64, std::rc::Weak<Draft>)>> = const { RefCell::new(Vec::new()) };
+// ── New module ────────────────────────────────────────────────────────────────────────────
+
+/// A module is a version bundle: a name, a priority and the tasks it ships. The page reads
+/// like New task, and Create opens the module's own board.
+pub fn compose_module(ui: &Rc<Ui>, project: i64) {
+    let panel = crate::panel::Panel::page(ui, "New module");
+    panel.add_css_class("issue-page");
+    panel.hide_scrollbar();
+    let page = gtk::Box::new(gtk::Orientation::Vertical, 14);
+    page.add_css_class("issue-compose");
+    let main = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    let heading = label("", "issue-field-caption");
+    heading.set_markup("Name <span foreground=\"#e5382e\">*</span>");
+    main.append(&heading);
+    let name = gtk::Entry::builder().placeholder_text("e.g. v1.4 — Gallery and profile").build();
+    name.add_css_class("issue-title-entry");
+    main.append(&name);
+    main.append(&label("Tasks in this module", "issue-field-caption"));
+    main.append(&label("Tick the tasks it ships. A task belongs to one module; ticking one in another moves it here.", "issue-side-empty"));
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    list.add_css_class("module-pick-list");
+    list.append(&label("Loading…", "issue-side-empty"));
+    main.append(&list);
+    let footer = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    footer.add_css_class("issue-compose-footer");
+    let status = paragraph("");
+    status.set_hexpand(true);
+    status.set_xalign(1.);
+    footer.append(&status);
+    let cancel = button("Cancel", "quiet");
+    footer.append(&cancel);
+    let create = button("Create module", "primary");
+    footer.append(&create);
+    main.append(&footer);
+    let priority = Rc::new(RefCell::new("medium".to_string()));
+    let side = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let section = side_section("Priority");
+    let chosen = priority.clone();
+    section.append(&pills(titled_choices(&URGENT_FIRST, ""), "medium", priority_mark, move |p| *chosen.borrow_mut() = p.to_string()));
+    side.append(&section);
+    let about = side_section("About modules");
+    let note = label("A module groups tasks into one release. It gets its own board with progress and patch notes, and its tasks still show on the main board with the module's name.", "issue-side-empty");
+    note.set_wrap(true);
+    note.set_max_width_chars(32);
+    about.append(&note);
+    side.append(&about);
+    page.append(&issue_columns(ui, &panel, &page, &main, &side));
+    panel.body.append(&page);
+
+    let picked: Rc<RefCell<BTreeSet<i64>>> = Rc::default();
+    let weak = Rc::downgrade(ui);
+    let (rows_box, chosen) = (list.downgrade(), picked.clone());
+    glib::spawn_future_local(async move {
+        let Some(ui) = weak.upgrade() else { return };
+        let tasks = ui.call("task.list", json!({"project_id":project,"summary":true})).await;
+        let Some(list) = rows_box.upgrade() else { return };
+        clear(&list);
+        let tasks: Vec<Value> = tasks.map(|t| rows(&t, "tasks")).unwrap_or_default().into_iter().filter(|t| text(t, "column") != "done").collect();
+        if tasks.is_empty() {
+            list.append(&label("No open tasks yet: add them from the module's board.", "issue-side-empty"));
+        }
+        for task in tasks {
+            let id = task["id"].as_i64().unwrap_or(0);
+            let row = gtk::CheckButton::new();
+            row.add_css_class("module-pick");
+            let content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            content.append(&status_icon(text(&task, "column"), 12));
+            let title = label(text(&task, "title"), "");
+            title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            title.set_hexpand(true);
+            content.append(&title);
+            if let Some(other) = task["module_name"].as_str() {
+                content.append(&label(other, "module-card-meta"));
+            }
+            content.append(&label(&format!("#{id}"), "card-id"));
+            row.set_child(Some(&content));
+            let chosen = chosen.clone();
+            row.connect_toggled(move |row| {
+                if row.is_active() {
+                    chosen.borrow_mut().insert(id);
+                } else {
+                    chosen.borrow_mut().remove(&id);
+                }
+            });
+            list.append(&row);
+        }
+    });
+    let p = Rc::downgrade(&panel);
+    cancel.connect_clicked(move |_| {
+        if let Some(p) = p.upgrade() {
+            p.close();
+        }
+    });
+    let (weak, p, field) = (Rc::downgrade(ui), Rc::downgrade(&panel), name.downgrade());
+    create.connect_clicked(move |key| {
+        let (Some(ui), Some(field)) = (weak.upgrade(), field.upgrade()) else { return };
+        let value = field.text().trim().to_string();
+        if value.is_empty() {
+            status.set_text("A module needs a name.");
+            field.grab_focus();
+            return;
+        }
+        key.set_sensitive(false);
+        status.set_text("Creating…");
+        let (tasks, priority, p, status, key) = (picked.borrow().clone(), priority.borrow().clone(), p.clone(), status.clone(), key.clone());
+        glib::spawn_future_local(async move {
+            match ui.call("module.create", json!({"project_id":project,"name":value,"priority":priority})).await {
+                Ok(module) => {
+                    let id = module["id"].as_i64().unwrap_or(0);
+                    for task in tasks {
+                        if let Err(e) = ui.call("task.update", json!({"task_id":task,"module_id":id})).await {
+                            ui.show_error(&e.to_string());
+                        }
+                    }
+                    if let Some(p) = p.upgrade() {
+                        p.close();
+                    }
+                    super::board_view::open_module(&ui, id);
+                }
+                Err(e) => {
+                    status.set_text(&e.to_string());
+                    key.set_sensitive(true);
+                }
+            }
+        });
+    });
+    let submit = create.downgrade();
+    name.connect_activate(move |_| {
+        if let Some(submit) = submit.upgrade() {
+            submit.emit_clicked();
+        }
+    });
+    panel.present();
+    name.grab_focus();
 }
-fn open_detail(id: i64) -> Option<Rc<Draft>> {
+
+// ── A task, as an issue ───────────────────────────────────────────────────────────────────
+
+thread_local! {
+    /// Bumped by every open: only the newest open still in flight may present its page.
+    static OPEN_SERIAL: Cell<u64> = const { Cell::new(0) };
+    /// Task pages on screen, so opening one again shows it instead of stacking a second.
+    static OPEN_DETAILS: RefCell<Vec<(i64, std::rc::Weak<Detail>)>> = const { RefCell::new(Vec::new()) };
+}
+fn open_detail(id: i64) -> Option<Rc<Detail>> {
     OPEN_DETAILS.with(|open| {
         open.borrow_mut().retain(|(_, d)| d.strong_count() > 0);
         open.borrow().iter().find(|(task, _)| *task == id).and_then(|(_, d)| d.upgrade())
     })
 }
+
+/// Everything a task page draws, fetched together.
+struct Loaded {
+    task: Value,
+    tasks: Result<Vec<Value>, String>,
+    modules: Vec<Value>,
+    activity: Result<Value, String>,
+}
+async fn load(ui: &Rc<Ui>, id: i64, project: i64) -> Result<Loaded, String> {
+    // The task almost always belongs to the project on screen, so its lists are asked for
+    // alongside it; only a task from another project waits for a second pair. Completed
+    // modules too: a task keeps its module after the module is completed.
+    let (task, mut modules, mut tasks, activity) = tokio::join!(
+        ui.call("task.get", json!({"task_id":id})),
+        ui.call("module.list", json!({"project_id":project,"include_archived":true})),
+        ui.call("task.list", json!({"project_id":project,"summary":true})),
+        ui.call("task.activity", json!({"task_id":id,"limit":100}))
+    );
+    let task = task.map_err(|e| e.to_string())?;
+    let owner = task["project_id"].as_i64().unwrap_or(0);
+    if owner != project {
+        (modules, tasks) = tokio::join!(
+            ui.call("module.list", json!({"project_id":owner,"include_archived":true})),
+            ui.call("task.list", json!({"project_id":owner,"summary":true}))
+        );
+    }
+    let modules = modules.map_err(|e| format!("Could not load modules: {e}"))?;
+    Ok(Loaded {
+        task,
+        tasks: tasks.map(|t| rows(&t, "tasks")).map_err(|e| e.to_string()),
+        modules: rows(&modules, "modules"),
+        activity: activity.map_err(|e| e.to_string()),
+    })
+}
+
 pub fn open(ui: &Rc<Ui>, id: i64) {
     if let Some(d) = open_detail(id) {
-        return d.present();
+        return d.panel.present();
     }
     let serial = OPEN_SERIAL.with(|s| { s.set(s.get() + 1); s.get() });
     let (project, page) = (ui.project.get(), ui.page.borrow().clone());
     let ui = ui.clone();
     glib::spawn_future_local(async move {
-        // The task almost always belongs to the project on screen, so its lists are asked for
-        // alongside it; only a task from another project waits for a second pair.
-        // Completed modules too: a task keeps its module after the module is completed,
-        // and a combo that cannot show it reads as an edit and Save would unassign it.
-        let (task, mut modules, mut tasks) = tokio::join!(
-            ui.call("task.get", json!({"task_id":id})),
-            ui.call("module.list", json!({"project_id":project,"include_archived":true})),
-            ui.call("task.list", json!({"project_id":project}))
-        );
-        if let Ok(task) = &task {
-            let owner = task["project_id"].as_i64().unwrap_or(0);
-            if owner != project {
-                (modules, tasks) = tokio::join!(
-                    ui.call("module.list", json!({"project_id":owner,"include_archived":true})),
-                    ui.call("task.list", json!({"project_id":owner}))
-                );
-            }
-        }
+        let loaded = load(&ui, id, project).await;
         // A later open, or a move to another page or project, makes this one stale: presenting
         // it now would cover (and disable) whatever the user went on to.
         let current = OPEN_SERIAL.with(|s| s.get()) == serial;
@@ -589,740 +1050,952 @@ pub fn open(ui: &Rc<Ui>, id: i64) {
             return;
         }
         if let Some(d) = open_detail(id) {
-            return d.present();
+            return d.panel.present();
         }
-        let task = match task {
-            Ok(task) => task,
-            Err(e) => return ui.show_error(&e.to_string()),
-        };
-        let modules = match modules {
-            Ok(modules) => modules,
-            Err(e) => return ui.show_error(&format!("Could not load modules: {e}")),
-        };
-        detail(&ui, task, rows(&modules, "modules"), tasks.map(|tasks| rows(&tasks, "tasks")).map_err(|e| e.to_string()));
+        match loaded {
+            Ok(loaded) => Detail::show(&ui, id, loaded),
+            Err(e) => ui.show_error(&e),
+        }
     });
 }
-fn detail(ui: &Rc<Ui>, task: Value, modules: Vec<Value>, tasks: Result<Vec<Value>, String>) {
-    // Without the project's tasks the parent and link choices would be empty, and an empty
-    // parent choice reads as "Root task": say so, and keep those rows from acting.
-    let (tasks, tasks_error) = match tasks {
-        Ok(tasks) => (tasks, None),
-        Err(e) => (Vec::new(), Some(e)),
-    };
-    let id = task["id"].as_i64().unwrap_or(0);
-    let project = task["project_id"].as_i64().unwrap_or(0);
-    let form = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    form.append(&super::board_view::identity_strip(&task));
-    let title = gtk::Entry::builder().text(text(&task, "title")).build();
-    title.set_widget_name("task-title");
-    field("Title", &title, &form);
-    let meta = gtk::FlowBox::new();
-    meta.set_selection_mode(gtk::SelectionMode::None);
-    meta.set_min_children_per_line(1);
-    meta.set_max_children_per_line(5);
-    meta.set_column_spacing(8);
-    meta.set_row_spacing(6);
-    meta.add_css_class("task-metadata");
-    let priority = choose(&PRIORITIES, text(&task, "priority"));
-    let kind = choose(&TYPES, text(&task, "type"));
-    let size = choose(&SIZES, text(&task, "size"));
-    let state = choose(&STATES, text(&task, "state"));
-    let module = gtk::ComboBoxText::new();
-    module.append(Some(""), "No module");
-    let current_module = task["module_id"].as_i64();
-    for m in &modules {
-        let completed = !m["completed_at"].is_null();
-        if completed && m["id"].as_i64() != current_module {
-            continue;
-        }
-        let name = if completed { format!("{} (completed)", text(m, "name")) } else { text(m, "name").to_string() };
-        module.append(Some(&m["id"].to_string()), &name);
-    }
-    if let Some(id) = current_module.filter(|id| !modules.iter().any(|m| m["id"].as_i64() == Some(*id))) {
-        module.append(Some(&id.to_string()), &format!("Module #{id}"));
-    }
-    module.set_active_id(Some(
-        &task["module_id"]
-            .as_i64()
-            .map(|id| id.to_string())
-            .unwrap_or_default(),
-    ));
-    for (caption, control) in [
-        ("Priority", &priority),
-        ("Type", &kind),
-        ("Size", &size),
-        ("Module", &module),
-        ("State", &state),
-    ] {
-        let group = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        field(caption, control, &group);
-        meta.insert(&group, -1);
-    }
-    form.append(&meta);
-    let body = multiline(text(&task, "body"), 120);
-    body.set_vexpand(false);
-    field("Description · Markdown", &body, &form);
-    let changelog = multiline(text(&task, "changelog"), 48);
-    changelog.set_vexpand(false);
-    field("Changelog sentence", &changelog, &form);
-    let snapshot: Rc<dyn Fn() -> Value> = Rc::new(
-        move || json!({"title":title.text().trim(),"body":buffer_text(&body.buffer()),"changelog":buffer_text(&changelog.buffer()),"priority":chosen(&priority),"state":chosen(&state),"type":chosen(&kind),"size":if chosen(&size).is_empty(){Value::Null}else{json!(chosen(&size))},"module_id":chosen(&module).parse::<i64>().ok()}),
-    );
-    let d = Draft::new(ui, &format!("Task #{id}"), task.clone(), snapshot, form);
-    d.controls(ui, "task.update", "task_id", id);
-    OPEN_DETAILS.with(|open| open.borrow_mut().push((id, Rc::downgrade(&d))));
-    if let Some(panel) = &d.panel {
-        let weak = Rc::downgrade(&d);
+
+/// A task's page in GitHub's issue layout: title and status, the description, sub-tasks and a
+/// timeline of everything that happened to it, a comment box, and a sidebar of its fields that
+/// apply as they are picked.
+pub struct Detail {
+    ui: std::rc::Weak<Ui>,
+    id: i64,
+    project: Cell<i64>,
+    panel: Rc<crate::panel::Panel>,
+    header: gtk::Box,
+    main: gtk::Box,
+    side: gtk::Box,
+    actions: gtk::Box,
+    status: gtk::Label,
+    comment: MarkdownField,
+    recipient: gtk::ComboBoxText,
+    task: RefCell<Value>,
+    busy: Cell<bool>,
+    /// An inline title or description editor holding text that differs from the task.
+    editing: RefCell<Vec<Box<dyn Fn() -> bool>>>,
+    /// Older history and messages fetched with "Load older", kept across redraws.
+    history: RefCell<Vec<Value>>,
+    messages: RefCell<Vec<Value>>,
+    comments: RefCell<Vec<Value>>,
+    cursors: Cell<(Option<i64>, Option<i64>)>,
+}
+
+impl Detail {
+    fn show(ui: &Rc<Ui>, id: i64, loaded: Loaded) {
+        let project = loaded.task["project_id"].as_i64().unwrap_or(0);
+        let name = project_name(ui, project);
+        let panel = crate::panel::Panel::page(ui, &if name.is_empty() { format!("Task #{id}") } else { format!("{name} #{id}") });
+        panel.add_css_class("issue-page");
+        panel.hide_scrollbar();
+        let page = gtk::Box::new(gtk::Orientation::Vertical, 14);
+        page.add_css_class("issue-detail");
+        let header = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        header.add_css_class("issue-header");
+        page.append(&header);
+        let status = paragraph("");
+        status.add_css_class("issue-status");
+        status.set_visible(false);
+        page.append(&status);
+        let main = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 16);
+        main.append(&content);
+        let composer = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        composer.add_css_class("issue-composer");
+        composer.append(&label("Add a comment", "issue-composer-title"));
+        let comment = MarkdownField::new("", "Use Markdown to format your comment", 110);
+        comment.view.set_widget_name("task-message");
+        composer.append(&comment.root);
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let recipient = gtk::ComboBoxText::new();
+        recipient.set_tooltip_text(Some("Also send the comment to an agent's mailbox, linked to this task"));
+        row.append(&recipient);
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        actions.set_hexpand(true);
+        actions.set_halign(gtk::Align::End);
+        row.append(&actions);
+        composer.append(&row);
+        main.append(&composer);
+        let side = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        page.append(&issue_columns(ui, &panel, &page, &main, &side));
+        panel.body.append(&page);
+        let refresh = crate::app::icon_button("refresh", "Reload this task");
+        panel.header_action(&refresh);
+
+        let detail = Rc::new(Self {
+            ui: Rc::downgrade(ui),
+            id,
+            project: Cell::new(project),
+            panel: panel.clone(),
+            header,
+            main: content,
+            side,
+            actions,
+            status,
+            comment,
+            recipient,
+            task: RefCell::new(Value::Null),
+            busy: Cell::new(false),
+            editing: RefCell::new(Vec::new()),
+            history: RefCell::new(Vec::new()),
+            messages: RefCell::new(Vec::new()),
+            comments: RefCell::new(Vec::new()),
+            cursors: Cell::new((None, None)),
+        });
+        let weak = Rc::downgrade(&detail);
+        refresh.connect_clicked(move |_| {
+            if let Some(d) = weak.upgrade() {
+                d.reload();
+            }
+        });
+        let weak = Rc::downgrade(&detail);
+        panel.set_guard(move || {
+            let Some(d) = weak.upgrade() else { return true };
+            if d.busy.get() {
+                return false;
+            }
+            if !d.comment.text().trim().is_empty() {
+                d.say("Post or clear your comment before leaving.");
+                return false;
+            }
+            if d.editing.borrow().iter().any(|changed| changed()) {
+                d.say("Save or cancel your edit before leaving.");
+                return false;
+            }
+            true
+        });
+        OPEN_DETAILS.with(|open| open.borrow_mut().push((id, Rc::downgrade(&detail))));
+        let weak = Rc::downgrade(&detail);
         panel.on_closed(move || OPEN_DETAILS.with(|open| open.borrow_mut().retain(|(_, d)| !d.ptr_eq(&weak))));
+        // The page owns the Detail: its widgets hold only weak references back.
+        let owner = detail.clone();
+        panel.on_closed(move || {
+            owner.editing.borrow_mut().clear();
+        });
+        unsafe { panel.body.set_data("relay-task-detail", detail.clone()) };
+        let weak = Rc::downgrade(&detail);
+        accept_attachments(&panel.body, move |incoming| {
+            if let Some(d) = weak.upgrade() {
+                d.attach(incoming);
+            }
+        });
+        detail.render(loaded);
+        panel.present();
     }
-    let transitions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    transitions.append(&label(
-        &format!("{} · {}", text(&task, "column"), text(&task, "state")),
-        "dim",
-    ));
-    // Done is reached by approval (the engine refuses a plain move there), so Move offers
-    // the other columns and Approve stands beside it until the task is done.
-    let done = text(&task, "column") == "done";
-    let column = choose(OPEN_COLUMNS, if done { "in_review" } else { text(&task, "column") });
-    transitions.append(&column);
-    action(
-        ui,
-        &d,
-        &transitions,
-        "Move",
-        "task.move",
-        move || json!({"task_id":id,"column":chosen(&column)}),
-        Some(id),
-    );
-    if !done {
-        action(
-            ui,
-            &d,
-            &transitions,
-            "Approve task",
-            "task.approve",
-            move || json!({"task_id":id}),
-            Some(id),
-        );
+
+    /// Uploads what was dropped or pasted, then redraws.
+    fn attach(self: &Rc<Self>, incoming: Vec<Incoming>) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        let detail = self.clone();
+        let id = self.id;
+        self.say("Attaching…");
+        glib::spawn_future_local(async move {
+            use base64::Engine;
+            let mut failed = None;
+            for item in incoming {
+                let payload = match item {
+                    Incoming::Path(path) => {
+                        let name = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "attachment".into());
+                        json!({"task_id":id,"path":path,"name":name,"mime":mime_of(&name)})
+                    }
+                    Incoming::Image { name, bytes } => json!({"task_id":id,"name":name,"mime":"image/png","bytes_b64":base64::engine::general_purpose::STANDARD.encode(bytes)}),
+                };
+                if let Err(e) = ui.call("task.attach", payload).await {
+                    failed = Some(e.to_string());
+                }
+            }
+            detail.say(failed.as_deref().unwrap_or(""));
+            detail.reload();
+            ui.refresh_page();
+        });
     }
-    d.form.append(&transitions);
-    let dispatch = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let target = gtk::ComboBoxText::new();
-    target.append(Some(""), "Choose an existing session");
-    for session in ui
-        .sessions
-        .borrow()
-        .iter()
-        .filter(|s| text(s, "state") != "closed" && s["project_id"] == project)
-    {
-        target.append(
-            Some(text(session, "name")),
-            &format!("{} · {}", text(session, "name"), text(session, "role")),
-        );
+
+    fn say(&self, message: &str) {
+        self.status.set_text(message);
+        self.status.set_visible(!message.is_empty());
     }
-    target.set_active(Some(0));
-    dispatch.append(&target);
-    action(
-        ui,
-        &d,
-        &dispatch,
-        "Dispatch",
-        "task.dispatch",
-        move || json!({"task_id":id,"session":chosen(&target)}),
-        Some(id),
-    );
-    let launch = button("New agents / pair", "quiet");
-    dispatch.append(&launch);
-    let weak = Rc::downgrade(ui);
-    let draft = d.clone();
-    launch.connect_clicked(move |_| {
-        if draft.dirty() || draft.unsent_message.get() {
-            draft
-                .status
-                .set_text("Save task changes before dispatching.");
+
+    fn reload(self: &Rc<Self>) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        let detail = self.clone();
+        glib::spawn_future_local(async move {
+            match load(&ui, detail.id, detail.project.get()).await {
+                Ok(loaded) => detail.render(loaded),
+                Err(e) => detail.say(&e),
+            }
+        });
+    }
+
+    /// Runs one task op from this page, then redraws it from the engine's state.
+    fn act(self: &Rc<Self>, op: &'static str, payload: Value) {
+        self.act_then(op, payload, |_| {});
+    }
+    fn act_then(self: &Rc<Self>, op: &'static str, payload: Value, after: impl FnOnce(&Rc<Self>) + 'static) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        if self.busy.replace(true) {
             return;
         }
-        if let Some(ui) = weak.upgrade() {
-            draft.close();
-            ui.show_launch(Some(id));
-        }
-    });
-    d.form.append(&dispatch);
-    for session in rows(&task, "sessions") {
-        if let Some(s) = session.as_str() {
-            d.form.append(&label(s, "dim"));
-        }
-    }
-    d.form.append(&label("Labels", "section-label"));
-    for tag in rows(&task, "labels") {
-        if let Some(name) = tag.as_str() {
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-            row.append(&label(name, "body"));
-            let name = name.to_string();
-            action(
-                ui,
-                &d,
-                &row,
-                "Remove",
-                "task.label.remove",
-                move || json!({"task_id":id,"label":name}),
-                Some(id),
-            );
-            d.form.append(&row);
-        }
-    }
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let tag = gtk::Entry::builder()
-        .placeholder_text("New label")
-        .hexpand(true)
-        .build();
-    row.append(&tag);
-    action(
-        ui,
-        &d,
-        &row,
-        "Add label",
-        "task.label.add",
-        move || json!({"task_id":id,"label":tag.text().trim()}),
-        Some(id),
-    );
-    d.form.append(&row);
-    d.form
-        .append(&label("Subtasks & dependencies", "section-label"));
-    // The task names its own children; the project list only adds their titles.
-    for child_id in rows(&task, "children").iter().filter_map(Value::as_i64) {
-        let key = button(
-            &match tasks.iter().find(|t| t["id"] == child_id) {
-                Some(child) => format!("#{child_id}  {}  · {}", text(child, "title"), text(child, "column")),
-                None => format!("#{child_id}"),
-            },
-            "quiet",
-        );
-        let weak = Rc::downgrade(ui);
-        key.connect_clicked(move |_| {
-            if let Some(ui) = weak.upgrade() {
-                open(&ui, child_id)
+        self.say("Saving…");
+        let detail = self.clone();
+        glib::spawn_future_local(async move {
+            let result = ui.call(op, payload).await;
+            detail.busy.set(false);
+            match result {
+                Ok(_) => {
+                    detail.say("");
+                    after(&detail);
+                    ui.refresh_page();
+                }
+                Err(crate::client::Error::Bus(e)) if e.code.ends_with(".edit_conflict") => {
+                    detail.say("This task changed elsewhere, so the page reloaded with the latest version. Make the change again.");
+                }
+                Err(e) => {
+                    detail.say(&e.to_string());
+                    return;
+                }
+            }
+            if detail.panel.body.root().is_some() {
+                detail.reload();
             }
         });
-        d.form.append(&key);
     }
-    if task["depth"].as_i64().unwrap_or(0) < 2 {
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        let child = gtk::Entry::builder()
-            .placeholder_text("Subtask title")
-            .hexpand(true)
-            .build();
-        row.append(&child);
-        action(
-            ui,
-            &d,
-            &row,
-            "Add subtask",
-            "task.create",
-            move || json!({"project_id":project,"parent_id":id,"title":child.text().trim(),"column":"backlog"}),
-            Some(id),
-        );
-        d.form.append(&row);
+    /// `task.update` of one field, checked against the value this page shows.
+    fn update(self: &Rc<Self>, field: &str, value: Value) {
+        let before = self.task.borrow()[field].clone();
+        if before == value {
+            return;
+        }
+        let mut payload = json!({"task_id": self.id, "expected": {field: before}});
+        payload[field] = value;
+        self.act("task.update", payload);
     }
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let parent = gtk::ComboBoxText::new();
-    parent.append(Some(""), "Root task");
-    for task in tasks.iter().filter(|t| t["id"] != id) {
-        parent.append(
-            Some(&task["id"].to_string()),
-            &format!("#{} {}", task["id"], text(task, "title")),
-        );
-    }
-    if let Some(pid) = task["parent_id"].as_i64().filter(|pid| !tasks.iter().any(|t| t["id"] == *pid)) {
-        parent.append(Some(&pid.to_string()), &format!("#{pid}"));
-    }
-    row.set_sensitive(tasks_error.is_none());
-    parent.set_active_id(Some(
-        &task["parent_id"]
-            .as_i64()
-            .map(|x| x.to_string())
-            .unwrap_or_default(),
-    ));
-    row.append(&parent);
-    action(
-        ui,
-        &d,
-        &row,
-        "Set parent",
-        "task.parent.set",
-        move || json!({"task_id":id,"parent_id":chosen(&parent).parse::<i64>().ok()}),
-        Some(id),
-    );
-    d.form.append(&row);
-    for (field, relation) in [
-        ("blocked_by", "blocked_by"),
-        ("duplicate_of", "duplicate_of"),
-    ] {
-        let ids = if field == "duplicate_of" {
-            task[field].as_i64().into_iter().map(|v| json!(v)).collect()
-        } else {
-            rows(&task, field)
+
+    fn render(self: &Rc<Self>, loaded: Loaded) {
+        let Loaded { task, tasks, modules, activity } = loaded;
+        *self.task.borrow_mut() = task.clone();
+        self.editing.borrow_mut().clear();
+        match &activity {
+            Ok(data) => {
+                *self.history.borrow_mut() = rows(data, "history");
+                *self.messages.borrow_mut() = rows(data, "messages");
+                *self.comments.borrow_mut() = rows(data, "comments");
+                self.cursors.set((data["next_audit"].as_i64(), data["next_message"].as_i64()));
+            }
+            Err(e) => self.say(&format!("Could not load the timeline: {e}")),
+        }
+        let (tasks, tasks_error) = match tasks {
+            Ok(tasks) => (tasks, None),
+            Err(e) => (Vec::new(), Some(e)),
         };
-        for other in ids {
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-            row.append(&label(
-                &format!("{} #{}", field.replace('_', " "), other),
-                "body",
-            ));
-            action(
-                ui,
-                &d,
-                &row,
-                "Remove",
-                "task.unrelate",
-                move || json!({"task_id":id,"relation":relation,"other_id":other}),
-                Some(id),
-            );
-            d.form.append(&row);
+        if let Some(e) = &tasks_error {
+            self.say(&format!("Could not load the project's tasks: {e}. Sub-task titles are unavailable."));
         }
+        self.render_header(&task, &tasks);
+        clear(&self.main);
+        self.main.append(&self.description(&task));
+        if let Some(children) = self.subtasks(&task, &tasks) {
+            self.main.append(&children);
+        }
+        self.main.append(&self.timeline());
+        self.render_actions(&task);
+        self.render_side(&task, &modules);
     }
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let relation = choose(&["blocked_by", "duplicate_of"], "blocked_by");
-    let other = gtk::ComboBoxText::new();
-    other.append(Some(""), "Choose a task");
-    for t in tasks.iter().filter(|t| t["id"] != id) {
-        other.append(
-            Some(&t["id"].to_string()),
-            &format!("#{} {}", t["id"], text(t, "title")),
-        );
+
+    fn render_header(self: &Rc<Self>, task: &Value, tasks: &[Value]) {
+        clear(&self.header);
+        let id = self.id;
+        let line = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        let title = label(text(task, "title"), "issue-title");
+        title.set_wrap(true);
+        title.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        title.set_selectable(true);
+        title.set_hexpand(false);
+        line.append(&title);
+        line.append(&label(&format!("#{id}"), "issue-number"));
+        let edit = crate::app::icon_button("edit", "Edit the title");
+        edit.set_widget_name("task-title-edit");
+        edit.set_valign(gtk::Align::Center);
+        line.append(&edit);
+        self.header.append(&line);
+        // The title editor: hidden until the pencil, as GitHub's is.
+        let editor = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let entry = gtk::Entry::builder().text(text(task, "title")).hexpand(true).build();
+        entry.set_widget_name("task-title");
+        entry.add_css_class("issue-title-entry");
+        editor.append(&entry);
+        let save = button("Save", "primary");
+        save.set_widget_name("draft-save");
+        let cancel = button("Cancel", "quiet");
+        editor.append(&save);
+        editor.append(&cancel);
+        editor.set_visible(false);
+        self.header.append(&editor);
+        let (shown, pane, field) = (line.downgrade(), editor.downgrade(), entry.downgrade());
+        edit.connect_clicked(move |_| {
+            if let (Some(line), Some(editor), Some(entry)) = (shown.upgrade(), pane.upgrade(), field.upgrade()) {
+                line.set_visible(false);
+                editor.set_visible(true);
+                entry.grab_focus();
+            }
+        });
+        let original = text(task, "title").to_string();
+        let (shown, pane, field, was) = (line.downgrade(), editor.downgrade(), entry.downgrade(), original.clone());
+        cancel.connect_clicked(move |_| {
+            if let (Some(line), Some(editor), Some(entry)) = (shown.upgrade(), pane.upgrade(), field.upgrade()) {
+                entry.set_text(&was);
+                editor.set_visible(false);
+                line.set_visible(true);
+            }
+        });
+        let (weak, field) = (Rc::downgrade(self), entry.downgrade());
+        save.connect_clicked(move |_| {
+            let (Some(d), Some(entry)) = (weak.upgrade(), field.upgrade()) else { return };
+            let next = entry.text().trim().to_string();
+            if next.is_empty() {
+                d.say("A task needs a title.");
+                return;
+            }
+            d.update("title", json!(next));
+        });
+        let submit = save.downgrade();
+        entry.connect_activate(move |_| {
+            if let Some(save) = submit.upgrade() {
+                save.emit_clicked();
+            }
+        });
+        let field = entry.downgrade();
+        self.editing.borrow_mut().push(Box::new(move || field.upgrade().is_some_and(|e| e.text().trim() != original)));
+
+        let meta = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        meta.add_css_class("issue-meta");
+        let column = text(task, "column");
+        let pill = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        pill.add_css_class("status-pill");
+        pill.add_css_class(&format!("status-pill-{column}"));
+        pill.append(&status_icon(column, 13));
+        pill.append(&label(caption(column), "status-pill-name"));
+        meta.append(&pill);
+        if let Some(badge) = state_badge(text(task, "state")) {
+            meta.append(&badge);
+        }
+        if let Some(parent) = task["parent_id"].as_i64() {
+            let title = tasks.iter().find(|t| t["id"].as_i64() == Some(parent)).map(|t| text(t, "title").to_string());
+            let key = button("", "issue-pill");
+            let caption = label(&format!("Parent: {}", title.unwrap_or_else(|| format!("#{parent}"))), "");
+            caption.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            caption.set_max_width_chars(36);
+            key.set_child(Some(&caption));
+            let weak = self.ui.clone();
+            key.connect_clicked(move |_| {
+                if let Some(ui) = weak.upgrade() {
+                    open(&ui, parent);
+                }
+            });
+            meta.append(&key);
+        }
+        let opened = label(&format!("opened {} · updated {}", since(text(task, "created_at")), since(text(task, "updated_at"))), "issue-opened");
+        opened.set_tooltip_text(Some(text(task, "created_at")));
+        meta.append(&opened);
+        self.header.append(&meta);
     }
-    other.set_active(Some(0));
-    row.append(&relation);
-    row.append(&other);
-    let choice = other.clone();
-    action(
-        ui,
-        &d,
-        &row,
-        "Link",
-        "task.relate",
-        move || json!({"task_id":id,"relation":chosen(&relation),"other_id":chosen(&choice).parse::<i64>().ok()}),
-        Some(id),
-    );
-    // Link stays off until a task is chosen. Weak: the key's handler already holds the combo.
-    if let Some(link) = row.last_child() {
-        link.set_sensitive(false);
-        let link = link.downgrade();
-        other.connect_changed(move |other| {
-            if let Some(link) = link.upgrade() {
-                link.set_sensitive(!chosen(other).is_empty());
+
+    /// The first comment of the thread: the description, with its own Edit.
+    fn description(self: &Rc<Self>, task: &Value) -> gtk::Box {
+        let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        card.add_css_class("issue-comment");
+        let head = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        head.add_css_class("issue-comment-head");
+        let creator = self.history.borrow().iter().find(|row| text(row, "op") == "task.create").map(|row| actor_name(text(row, "actor")));
+        let who = label("", "issue-comment-who");
+        who.set_markup(&match &creator {
+            Some(name) => format!("<b>{}</b> opened this {}", glib::markup_escape_text(name), glib::markup_escape_text(&since(text(task, "created_at")))),
+            None => format!("Opened {}", glib::markup_escape_text(&since(text(task, "created_at")))),
+        });
+        who.set_hexpand(true);
+        head.append(&who);
+        let edit = button("Edit", "quiet");
+        edit.set_widget_name("task-body-edit");
+        head.append(&edit);
+        card.append(&head);
+        let body = text(task, "body").to_string();
+        let shown = label("", "issue-comment-body");
+        if body.trim().is_empty() {
+            shown.set_markup("<i>No description provided.</i>");
+            shown.add_css_class("dim");
+        } else {
+            shown.set_markup(&markdown_markup(&body));
+        }
+        shown.set_wrap(true);
+        shown.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        shown.set_selectable(true);
+        card.append(&shown);
+        let editor = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        editor.add_css_class("issue-comment-body");
+        let field = MarkdownField::new(&body, "Describe the outcome and the context an agent needs", 200);
+        field.view.set_widget_name("task-body");
+        editor.append(&field.root);
+        let keys = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        keys.set_halign(gtk::Align::End);
+        let cancel = button("Cancel", "quiet");
+        let save = button("Update description", "primary");
+        keys.append(&cancel);
+        keys.append(&save);
+        editor.append(&keys);
+        editor.set_visible(false);
+        card.append(&editor);
+        let files = rows(task, "attachments");
+        let tray = gtk::FlowBox::new();
+        tray.add_css_class("attachment-tray");
+        tray.set_selection_mode(gtk::SelectionMode::None);
+        tray.set_max_children_per_line(8);
+        tray.set_column_spacing(8);
+        tray.set_row_spacing(8);
+        tray.set_halign(gtk::Align::Start);
+        for file in &files {
+            let attachment = file["id"].clone();
+            let weak = Rc::downgrade(self);
+            let tile = attachment_tile(text(file, "name"), text(file, "mime"), None, Some(text(file, "path")), move || {
+                if let Some(d) = weak.upgrade() {
+                    d.act("task.detach", json!({"task_id":d.id,"attachment_id":attachment}));
+                }
+            });
+            tray.insert(&tile, -1);
+        }
+        if !files.is_empty() {
+            card.append(&tray);
+        }
+        let hint = label("Paste or drop images and files anywhere on this page to attach them", "attachment-hint");
+        card.append(&hint);
+        let (display, pane, key) = (shown.downgrade(), editor.downgrade(), edit.downgrade());
+        edit.connect_clicked(move |_| {
+            if let (Some(display), Some(editor), Some(key)) = (display.upgrade(), pane.upgrade(), key.upgrade()) {
+                display.set_visible(false);
+                key.set_visible(false);
+                editor.set_visible(true);
+            }
+        });
+        let view = field.view.downgrade();
+        let (display, pane, key, was) = (shown.downgrade(), editor.downgrade(), edit.downgrade(), body.clone());
+        cancel.connect_clicked(move |_| {
+            if let (Some(display), Some(editor), Some(key), Some(view)) = (display.upgrade(), pane.upgrade(), key.upgrade(), view.upgrade()) {
+                view.buffer().set_text(&was);
+                editor.set_visible(false);
+                display.set_visible(true);
+                key.set_visible(true);
+            }
+        });
+        let (weak, view) = (Rc::downgrade(self), field.view.downgrade());
+        save.connect_clicked(move |_| {
+            if let (Some(d), Some(view)) = (weak.upgrade(), view.upgrade()) {
+                d.update("body", json!(buffer_text(&view.buffer())));
+            }
+        });
+        let view = field.view.downgrade();
+        self.editing.borrow_mut().push(Box::new(move || view.upgrade().is_some_and(|v| buffer_text(&v.buffer()) != body)));
+        card
+    }
+
+    fn subtasks(self: &Rc<Self>, task: &Value, tasks: &[Value]) -> Option<gtk::Box> {
+        let children: Vec<i64> = rows(task, "children").iter().filter_map(Value::as_i64).collect();
+        let can_add = task["depth"].as_i64().unwrap_or(0) < 2;
+        if children.is_empty() && !can_add {
+            return None;
+        }
+        let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        card.add_css_class("issue-comment");
+        let head = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        head.add_css_class("issue-comment-head");
+        head.append(&label("Sub-tasks", "issue-section-title"));
+        // Without any yet, only a key that opens the field, as GitHub's Create sub-issue.
+        let opener = (children.is_empty()).then(|| {
+            let key = button("", "issue-close");
+            key.set_child(Some(&icon_row("plus", "Create sub-task")));
+            key.set_halign(gtk::Align::Start);
+            key
+        });
+        let finished = children.iter().filter(|c| tasks.iter().any(|t| t["id"].as_i64() == Some(**c) && text(t, "column") == "done")).count();
+        if !children.is_empty() {
+            head.append(&label(&format!("{finished} / {}", children.len()), "lane-count"));
+            let meter = gtk::ProgressBar::new();
+            meter.set_fraction(finished as f64 / children.len() as f64);
+            meter.set_valign(gtk::Align::Center);
+            meter.set_hexpand(true);
+            meter.add_css_class("issue-progress");
+            head.append(&meter);
+        }
+        card.append(&head);
+        for child in children {
+            let row = button("", "issue-link");
+            let content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            match tasks.iter().find(|t| t["id"].as_i64() == Some(child)) {
+                Some(t) => {
+                    content.append(&status_icon(text(t, "column"), 13));
+                    let name = label(text(t, "title"), "");
+                    name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                    name.set_hexpand(true);
+                    content.append(&name);
+                    content.append(&label(&format!("#{child}"), "card-id"));
+                }
+                None => content.append(&label(&format!("#{child}"), "")),
+            }
+            row.set_child(Some(&content));
+            let weak = self.ui.clone();
+            row.connect_clicked(move |_| {
+                if let Some(ui) = weak.upgrade() {
+                    open(&ui, child);
+                }
+            });
+            card.append(&row);
+        }
+        if can_add {
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            row.add_css_class("issue-comment-body");
+            let entry = gtk::Entry::builder().placeholder_text("Add a sub-task title").hexpand(true).build();
+            let add = button("Create sub-task", "quiet");
+            row.append(&entry);
+            row.append(&add);
+            let (weak, field) = (Rc::downgrade(self), entry.downgrade());
+            let project = task["project_id"].clone();
+            add.connect_clicked(move |_| {
+                let (Some(d), Some(entry)) = (weak.upgrade(), field.upgrade()) else { return };
+                let title = entry.text().trim().to_string();
+                if !title.is_empty() {
+                    d.act("task.create", json!({"project_id":project,"parent_id":d.id,"title":title,"column":"backlog"}));
+                }
+            });
+            let submit = add.downgrade();
+            entry.connect_activate(move |_| {
+                if let Some(add) = submit.upgrade() {
+                    add.emit_clicked();
+                }
+            });
+            card.append(&row);
+        }
+        if let Some(opener) = opener {
+            card.set_visible(false);
+            let shell = gtk::Box::new(gtk::Orientation::Vertical, 8);
+            let shown = card.downgrade();
+            opener.connect_clicked(move |key| {
+                key.set_visible(false);
+                if let Some(card) = shown.upgrade() {
+                    card.set_visible(true);
+                }
+            });
+            shell.append(&opener);
+            shell.append(&card);
+            return Some(shell);
+        }
+        Some(card)
+    }
+
+    /// Every step, message and comment, oldest first, on one rail.
+    fn timeline(self: &Rc<Self>) -> gtk::Box {
+        let rail = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        rail.add_css_class("issue-timeline");
+        let (older_history, older_messages) = self.cursors.get();
+        if older_history.is_some() || older_messages.is_some() {
+            let more = button("Load older activity", "quiet");
+            more.set_halign(gtk::Align::Start);
+            let weak = Rc::downgrade(self);
+            more.connect_clicked(move |key| {
+                if let Some(d) = weak.upgrade() {
+                    key.set_sensitive(false);
+                    d.load_older();
+                }
+            });
+            rail.append(&more);
+        }
+        // (time, kind, row): kinds sort a comment after a step made in the same instant.
+        let mut items: Vec<(String, u8, Value)> = Vec::new();
+        items.extend(self.history.borrow().iter().map(|r| (text(r, "ts").to_string(), 0, r.clone())));
+        items.extend(self.messages.borrow().iter().map(|r| (text(r, "sent_at").to_string(), 1, r.clone())));
+        items.extend(self.comments.borrow().iter().map(|r| (text(r, "created_at").to_string(), 2, r.clone())));
+        items.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        for (at, kind, row) in items {
+            match kind {
+                0 => {
+                    let Some(sentence) = activity_sentence(&row) else { continue };
+                    let op = text(&row, "op");
+                    let icon: gtk::Widget = match op {
+                        "task.move" => status_icon(row["payload"]["column"].as_str().unwrap_or("backlog"), 14).upcast(),
+                        "task.approve" => status_icon("done", 14).upcast(),
+                        "task.create" => crate::icons::image("plus", 12).upcast(),
+                        "task.dispatch" => crate::icons::image("user", 12).upcast(),
+                        "task.link_commit" => crate::icons::image("commit", 12).upcast(),
+                        "task.parent.set" | "task.relate" | "task.unrelate" => crate::icons::image("branch", 12).upcast(),
+                        "task.delete" => crate::icons::image("trash", 12).upcast(),
+                        "task.restore" | "task.unapprove" => crate::icons::image("undo", 12).upcast(),
+                        _ => crate::icons::image("edit", 12).upcast(),
+                    };
+                    let event = label("", "issue-event-text");
+                    event.set_markup(&format!(
+                        "<b>{}</b> {} <span alpha=\"60%\">{}</span>",
+                        glib::markup_escape_text(&actor_name(text(&row, "actor"))),
+                        glib::markup_escape_text(&sentence),
+                        glib::markup_escape_text(&since(&at))
+                    ));
+                    event.set_wrap(true);
+                    event.set_tooltip_text(Some(&at));
+                    rail.append(&timeline_row(icon, &event, op == "task.approve"));
+                }
+                1 => {
+                    let body = gtk::Box::new(gtk::Orientation::Vertical, 4);
+                    let event = label("", "issue-event-text");
+                    event.set_markup(&format!(
+                        "<b>{}</b> messaged <b>{}</b> <span alpha=\"60%\">{}</span>",
+                        glib::markup_escape_text(&actor_name(text(&row, "from"))),
+                        glib::markup_escape_text(text(&row, "to")),
+                        glib::markup_escape_text(&since(&at))
+                    ));
+                    event.set_wrap(true);
+                    body.append(&event);
+                    let said = label(text(&row, "text"), "issue-message");
+                    said.set_wrap(true);
+                    said.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+                    said.set_selectable(true);
+                    said.set_lines(6);
+                    said.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                    body.append(&said);
+                    rail.append(&timeline_row(crate::icons::image("send", 12).upcast(), &body, false));
+                }
+                _ => {
+                    let who = actor_name(text(&row, "author"));
+                    let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                    card.add_css_class("issue-comment");
+                    card.set_hexpand(true);
+                    let head = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+                    head.add_css_class("issue-comment-head");
+                    let line = label("", "issue-comment-who");
+                    line.set_markup(&format!(
+                        "<b>{}</b> commented <span alpha=\"60%\">{}</span>",
+                        glib::markup_escape_text(&who),
+                        glib::markup_escape_text(&since(&at))
+                    ));
+                    line.set_tooltip_text(Some(&at));
+                    head.append(&line);
+                    card.append(&head);
+                    let body = label("", "issue-comment-body");
+                    body.set_markup(&markdown_markup(text(&row, "body")));
+                    body.set_wrap(true);
+                    body.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+                    body.set_selectable(true);
+                    card.append(&body);
+                    rail.append(&timeline_row(avatar(&who).upcast(), &card, false));
+                }
+            }
+        }
+        rail
+    }
+
+    fn load_older(self: &Rc<Self>) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        let (history, messages) = self.cursors.get();
+        // A cursor of 0 asks a stream that is already complete for nothing.
+        let payload = json!({"task_id":self.id,"before_audit":history.unwrap_or(0),"before_message":messages.unwrap_or(0),"limit":100});
+        let detail = self.clone();
+        glib::spawn_future_local(async move {
+            match ui.call("task.activity", payload).await {
+                Ok(data) => {
+                    detail.history.borrow_mut().extend(rows(&data, "history"));
+                    detail.messages.borrow_mut().extend(rows(&data, "messages"));
+                    detail.cursors.set((
+                        history.and(data["next_audit"].as_i64()),
+                        messages.and(data["next_message"].as_i64()),
+                    ));
+                    // Only the timeline changes: the rest of the page, and any edit in it, stays.
+                    if let Some(old) = detail.main.last_child() {
+                        detail.main.remove(&old);
+                    }
+                    detail.main.append(&detail.timeline());
+                }
+                Err(e) => detail.say(&e.to_string()),
             }
         });
     }
-    row.set_sensitive(tasks_error.is_none());
-    d.form.append(&row);
-    d.form
-        .append(&label("Commits & attachments", "section-label"));
-    for commit in rows(&task, "commits") {
-        d.form.append(&paragraph(&format!(
-            "{}  {}",
-            text(&commit, "sha"),
-            text(&commit, "branch")
-        )));
-    }
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let sha = gtk::Entry::builder()
-        .placeholder_text("Commit SHA")
-        .hexpand(true)
-        .build();
-    row.append(&sha);
-    action(
-        ui,
-        &d,
-        &row,
-        "Link commit",
-        "task.link_commit",
-        move || json!({"task_id":id,"sha":sha.text().trim()}),
-        Some(id),
-    );
-    d.form.append(&row);
-    for attachment in rows(&task, "attachments") {
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        row.append(&paragraph(&format!(
-            "{} · {} bytes",
-            text(&attachment, "name"),
-            attachment["bytes"]
-        )));
-        let attachment_id = attachment["id"].clone();
-        action(
-            ui,
-            &d,
-            &row,
-            "Detach",
-            "task.detach",
-            move || json!({"task_id":id,"attachment_id":attachment_id}),
-            Some(id),
-        );
-        d.form.append(&row);
-    }
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let path = gtk::Entry::builder()
-        .placeholder_text("Absolute image path")
-        .hexpand(true)
-        .build();
-    row.append(&path);
-    action(
-        ui,
-        &d,
-        &row,
-        "Attach image",
-        "task.attach",
-        move || json!({"task_id":id,"path":path.text().trim()}),
-        Some(id),
-    );
-    d.form.append(&row);
-    action(
-        ui,
-        &d,
-        &d.footer,
-        "Delete task",
-        "task.delete",
-        move || json!({"task_id":id}),
-        None,
-    );
-    // Relay-2 keeps editing on the left and relationships/actions on the right.
-    let edit = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    edit.set_hexpand(true);
-    edit.set_valign(gtk::Align::Start);
-    edit.add_css_class("task-edit");
-    let side = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    side.set_valign(gtk::Align::Start);
-    side.add_css_class("task-relations");
-    side.set_size_request(340, -1);
-    let mut relations = false;
-    let mut group: Option<gtk::Box> = None;
-    while let Some(child) = d.form.first_child() {
-        relations |= child == transitions.clone().upcast::<gtk::Widget>();
-        d.form.remove(&child);
-        if relations {
-            if child.has_css_class("section-label") {
-                let title = child
-                    .clone()
-                    .downcast::<gtk::Label>()
-                    .map(|label| label.text().to_string())
-                    .unwrap_or_default();
-                let disclosure = gtk::Expander::new(Some(&title));
-                disclosure.set_expanded(title == "Subtasks & dependencies");
-                let content = gtk::Box::new(gtk::Orientation::Vertical, 6);
-                disclosure.set_child(Some(&content));
-                side.append(&disclosure);
-                group = Some(content);
-            } else if let Some(group) = &group {
-                group.append(&child);
+
+    /// The comment box's keys: close as completed (approve) or reopen, and Comment.
+    fn render_actions(self: &Rc<Self>, task: &Value) {
+        clear(&self.actions);
+        let project = self.project.get();
+        let chosen_before = chosen(&self.recipient);
+        self.recipient.remove_all();
+        self.recipient.append(Some(""), "Comment only");
+        if let Some(ui) = self.ui.upgrade() {
+            for session in ui.sessions.borrow().iter().filter(|s| s["project_id"] == project && text(s, "state") != "closed") {
+                self.recipient.append(Some(text(session, "name")), &format!("Also message {}", text(session, "name")));
+            }
+        }
+        if !self.recipient.set_active_id(Some(&chosen_before)) {
+            self.recipient.set_active(Some(0));
+        }
+        let done = text(task, "column") == "done";
+        let close = button("", "issue-close");
+        close.set_child(Some(&{
+            let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            content.append(&status_icon(if done { "in_review" } else { "done" }, 13));
+            content.append(&label(if done { "Reopen task" } else { "Close as completed" }, ""));
+            content
+        }));
+        close.set_tooltip_text(Some(if done {
+            "Move it back to In review"
+        } else {
+            "Approve it into Done: links the last agent's branch tip, or the project HEAD"
+        }));
+        let weak = Rc::downgrade(self);
+        close.connect_clicked(move |_| {
+            let Some(d) = weak.upgrade() else { return };
+            let (op, payload) = if done {
+                ("task.move", json!({"task_id":d.id,"column":"in_review"}))
             } else {
-                side.append(&child);
+                ("task.approve", json!({"task_id":d.id}))
+            };
+            // A drafted comment goes first, as GitHub's "Close with comment".
+            if d.comment.text().trim().is_empty() {
+                d.act(op, payload);
+            } else {
+                d.post_comment(move |d| d.act(op, payload));
             }
-        } else {
-            edit.append(&child);
-        }
-    }
-    d.layout.remove(&d.status);
-    d.layout.remove(&d.footer);
-    edit.append(&d.footer);
-    let overview = gtk::Box::new(
-        if ui.window.width() >= 1000 {
-            gtk::Orientation::Horizontal
-        } else {
-            gtk::Orientation::Vertical
-        },
-        12,
-    );
-    overview.append(&edit);
-    overview.append(&side);
-    let sections = gtk::Stack::new();
-    sections.set_vexpand(true);
-    sections.set_hhomogeneous(false);
-    sections.set_vhomogeneous(false);
-    sections.add_titled(&overview, Some("info"), "Info & edit");
-    let messages = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    let history = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    sections.add_titled(&messages, Some("messages"), "Messages");
-    sections.add_titled(&history, Some("history"), "History");
-    let tabs = gtk::StackSwitcher::new();
-    tabs.set_stack(Some(&sections));
-    tabs.add_css_class("task-detail-tabs");
-    d.form.set_spacing(8);
-    d.form.set_orientation(gtk::Orientation::Vertical);
-    d.form.append(&d.status);
-    d.form.append(&tabs);
-    d.form.append(&sections);
-    // Messages and history load when one of their tabs is first shown, not with every open.
-    let refresh = task_activity(ui, &d, id, project, &messages, &history).downgrade();
-    let loaded = Cell::new(false);
-    sections.connect_visible_child_name_notify(move |sections| {
-        if sections.visible_child_name().is_some_and(|name| name != "info") && !loaded.replace(true) {
-            if let Some(refresh) = refresh.upgrade() {
-                refresh.emit_clicked();
+        });
+        self.actions.append(&close);
+        let send = button("Comment", "primary");
+        send.set_widget_name("task-comment");
+        let weak = Rc::downgrade(self);
+        send.connect_clicked(move |_| {
+            if let Some(d) = weak.upgrade() {
+                d.post_comment(|d| d.reload());
             }
-        }
-    });
-    if let Some(scroll) = d.layout.first_child().and_downcast::<gtk::ScrolledWindow>() {
-        scroll.set_child(gtk::Widget::NONE);
-        d.layout.remove(&scroll);
-        d.layout.append(&d.form);
+        });
+        self.actions.append(&send);
     }
-    if let (Some(surface), Some(panel)) = (ui.window.surface(), &d.panel) {
-        let weak = overview.downgrade();
-        let handler = surface.connect_layout(move |_, width, _| {
-            if let Some(form) = weak.upgrade() {
-                form.set_orientation(if width >= 1000 {
-                    gtk::Orientation::Horizontal
-                } else {
-                    gtk::Orientation::Vertical
+
+    fn post_comment(self: &Rc<Self>, then: impl FnOnce(&Rc<Self>) + 'static) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        let body = self.comment.text();
+        if body.trim().is_empty() {
+            self.say("Write a comment first.");
+            self.comment.view.grab_focus();
+            return;
+        }
+        if self.busy.replace(true) {
+            return;
+        }
+        let to = chosen(&self.recipient);
+        self.comment.root.set_sensitive(false);
+        self.say("Posting…");
+        let detail = self.clone();
+        glib::spawn_future_local(async move {
+            let posted = ui.call("task.comment", json!({"task_id":detail.id,"body":body})).await;
+            let sent = match (&posted, to.is_empty()) {
+                (Ok(_), false) => ui.call("mailbox.send", json!({"project_id":detail.project.get(),"to":to,"text":body,"re_task":detail.id})).await.map(|_| ()),
+                _ => Ok(()),
+            };
+            detail.busy.set(false);
+            detail.comment.root.set_sensitive(true);
+            match (posted, sent) {
+                (Ok(_), Ok(())) => {
+                    detail.comment.clear();
+                    detail.say("");
+                    then(&detail);
+                }
+                (Ok(_), Err(e)) => {
+                    detail.comment.clear();
+                    detail.say(&format!("Commented, but the message to {to} failed: {e}"));
+                    detail.reload();
+                }
+                (Err(e), _) => detail.say(&e.to_string()),
+            }
+        });
+    }
+
+    /// The fields, as pills that apply on a click: status, priority, size, type and module,
+    /// then labels and who works on it.
+    fn render_side(self: &Rc<Self>, task: &Value, modules: &[Value]) {
+        clear(&self.side);
+        let id = self.id;
+        let project = self.project.get();
+        let Some(ui) = self.ui.upgrade() else { return };
+
+        let column = text(task, "column").to_string();
+        let weak = Rc::downgrade(self);
+        let from = column.clone();
+        let status = pills(column_choices(COLUMNS), &column, column_icon, move |to| {
+            let Some(d) = weak.upgrade() else { return };
+            if to == from {
+                return;
+            }
+            if to == "done" {
+                d.act("task.approve", json!({"task_id":id}));
+            } else {
+                d.act("task.move", json!({"task_id":id,"column":to}));
+            }
+        });
+        let weak = Rc::downgrade(self);
+        let priority = pills(titled_choices(&URGENT_FIRST, ""), text(task, "priority"), priority_mark, move |p| {
+            if let Some(d) = weak.upgrade() {
+                d.update("priority", json!(p));
+            }
+        });
+        let weak = Rc::downgrade(self);
+        let size = pills(titled_choices(&SIZES, "None"), text(task, "size"), no_icon, move |s| {
+            if let Some(d) = weak.upgrade() {
+                d.update("size", if s.is_empty() { Value::Null } else { json!(s) });
+            }
+        });
+        let weak = Rc::downgrade(self);
+        let kind = pills(titled_choices(&TYPES, ""), text(task, "type"), type_icon, move |t| {
+            if let Some(d) = weak.upgrade() {
+                d.update("type", json!(t));
+            }
+        });
+        let current = task["module_id"].as_i64();
+        let weak = Rc::downgrade(self);
+        let module = pills(module_choices(modules, current), &current.map(|m| m.to_string()).unwrap_or_default(), no_icon, move |m| {
+            if let Some(d) = weak.upgrade() {
+                d.update("module_id", m.parse::<i64>().map(Value::from).unwrap_or(Value::Null));
+            }
+        });
+        for (title, control) in [("Status", status), ("Priority", priority), ("Size · how much work", size), ("Type", kind), ("Module", module)] {
+            let section = side_section(title);
+            section.append(&control);
+            self.side.append(&section);
+        }
+
+        // Labels: removable chips and a field to add one.
+        let tags = side_section("Labels");
+        let mut chips: Vec<(gtk::Widget, usize)> = Vec::new();
+        for tag in rows(task, "labels").iter().filter_map(|v| v.as_str().map(str::to_string)) {
+            let wide = tag.chars().count() + 6;
+            let key = button("", "issue-label");
+            let content = label_chip(&tag);
+            content.append(&crate::icons::image("close", 9));
+            key.set_child(Some(&content));
+            key.set_tooltip_text(Some(&format!("Remove {tag}")));
+            let weak = Rc::downgrade(self);
+            key.connect_clicked(move |_| {
+                if let Some(d) = weak.upgrade() {
+                    d.act("task.label.remove", json!({"task_id":id,"label":tag}));
+                }
+            });
+            chips.push((key.upcast(), wide));
+        }
+        if !chips.is_empty() {
+            tags.append(&wrapped(chips, 34));
+        }
+        let entry = gtk::Entry::builder().placeholder_text("Add a label").build();
+        entry.add_css_class("issue-side-entry");
+        let weak = Rc::downgrade(self);
+        entry.connect_activate(move |entry| {
+            let tag = entry.text().trim().to_string();
+            if let (Some(d), false) = (weak.upgrade(), tag.is_empty()) {
+                d.act("task.label.add", json!({"task_id":id,"label":tag}));
+            }
+        });
+        tags.append(&entry);
+        self.side.append(&tags);
+
+        // Assignees: the agents it went to, and sending it to a live one.
+        let people = side_section("Assignees");
+        let agents: Vec<String> = rows(task, "sessions").iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+        if agents.is_empty() {
+            people.append(&label("No agent yet", "issue-side-empty"));
+        }
+        for agent in &agents {
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            row.append(&avatar(agent));
+            row.append(&label(agent, "issue-side-value"));
+            people.append(&row);
+        }
+        let live: Vec<(String, String)> = ui
+            .sessions
+            .borrow()
+            .iter()
+            .filter(|s| text(s, "state") != "closed" && s["project_id"] == project && !agents.iter().any(|a| a == text(s, "name")))
+            .map(|s| (text(s, "name").to_string(), text(s, "name").to_string()))
+            .collect();
+        if !live.is_empty() {
+            people.append(&label("Send to a live agent", "issue-side-empty"));
+            let weak = Rc::downgrade(self);
+            people.append(&pills(live, "", no_icon, move |session| {
+                if let Some(d) = weak.upgrade() {
+                    d.act("task.dispatch", json!({"task_id":id,"session":session}));
+                }
+            }));
+        }
+        let launch = button("", "issue-side-key");
+        launch.set_child(Some(&icon_row("plus", "Start new agents on it")));
+        launch.set_halign(gtk::Align::Start);
+        let weak = Rc::downgrade(self);
+        launch.connect_clicked(move |_| {
+            let Some(d) = weak.upgrade() else { return };
+            if !d.panel.can_close() {
+                return;
+            }
+            if let Some(ui) = d.ui.upgrade() {
+                d.panel.close();
+                ui.show_launch(Some(id));
+            }
+        });
+        people.append(&launch);
+        self.side.append(&people);
+
+        let danger = side_section("");
+        let delete = button("", "issue-delete");
+        delete.set_child(Some(&icon_row("trash", "Delete task")));
+        delete.set_halign(gtk::Align::Start);
+        delete.set_tooltip_text(Some("Ctrl+Z on the board restores it"));
+        let weak = Rc::downgrade(self);
+        crate::app::confirm_inline(&delete, "Delete this task?", move |_| {
+            if let Some(d) = weak.upgrade() {
+                d.editing.borrow_mut().clear();
+                d.act_then("task.delete", json!({"task_id":id}), |d| {
+                    d.busy.set(false);
+                    d.panel.close();
                 });
             }
         });
-        let handler = RefCell::new(Some(handler));
-        panel.on_closed(move || {
-            if let Some(handler) = handler.borrow_mut().take() {
-                surface.disconnect(handler);
-            }
-        });
+        danger.append(&delete);
+        self.side.append(&danger);
     }
-    if let Some(e) = tasks_error {
-        d.status.set_text(&format!("Could not load the project's tasks: {e}. Subtask titles, Set parent and Link are unavailable."));
-    }
-    d.present();
-}
-// Auxiliary changes never invalidate an unsaved editor. Successful actions reopen
-// a fresh detail, so labels, relations and state always reflect the engine response.
-fn task_activity(
-    ui: &Rc<Ui>,
-    draft: &Rc<Draft>,
-    id: i64,
-    project: i64,
-    messages: &gtk::Box,
-    history: &gtk::Box,
-) -> gtk::Button {
-    let compose = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let recipient = gtk::ComboBoxText::new();
-    recipient.append(Some(""), "Choose an agent");
-    for session in ui
-        .sessions
-        .borrow()
-        .iter()
-        .filter(|s| s["project_id"] == project && text(s, "state") != "closed")
-    {
-        recipient.append(Some(text(session, "name")), text(session, "name"));
-    }
-    recipient.set_active(Some(0));
-    let text_input = multiline("", 64);
-    text_input.set_widget_name("task-message");
-    text_input.set_hexpand(true);
-    let weak_draft = Rc::downgrade(draft);
-    text_input.buffer().connect_changed(move |buffer| {
-        if let Some(draft) = weak_draft.upgrade() {
-            draft
-                .unsent_message
-                .set(!buffer_text(buffer).trim().is_empty());
-        }
-    });
-    let send = button("Send message", "primary");
-    send.set_valign(gtk::Align::End);
-    compose.append(&recipient);
-    compose.append(&text_input);
-    compose.append(&send);
-    messages.append(&compose);
-    let notice = label("Messages are explicitly linked to this task.", "dim");
-    messages.append(&notice);
-    let message_rows = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    let history_rows = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    messages.append(&message_rows);
-    history.append(&history_rows);
-    let refresh = button("Refresh", "quiet");
-    messages.append(&refresh);
-    let more = button("Load older activity", "quiet");
-    history.append(&more);
-    let message_more = button("Load older messages", "quiet");
-    messages.append(&message_more);
-    // Shown once the first load says there is more.
-    more.set_visible(false);
-    message_more.set_visible(false);
-    let cursors = Rc::new(RefCell::new((None::<i64>, None::<i64>)));
-    let loading = Rc::new(Cell::new(false));
-    // A refresh asked for while a page loads (a message just sent) runs when that load ends.
-    let pending = Rc::new(Cell::new(false));
-    // Each "older" key pages its own stream: a cursor of 0 asks the other stream for nothing.
-    for (button, older_history, older_messages) in [(&refresh, true, true), (&more, true, false), (&message_more, false, true)] {
-        let reset = older_history && older_messages;
-        let weak = Rc::downgrade(ui);
-        let refresh = refresh.downgrade();
-        let pending = pending.clone();
-        let messages = message_rows.downgrade();
-        let history = history_rows.downgrade();
-        let notice = notice.downgrade();
-        let more = more.downgrade();
-        let message_more = message_more.downgrade();
-        let cursors = cursors.clone();
-        let loading = loading.clone();
-        button.connect_clicked(move |_| {
-            let (Some(ui),Some(messages),Some(history),Some(notice),Some(more),Some(message_more)) =
-                (weak.upgrade(),messages.upgrade(),history.upgrade(),notice.upgrade(),more.upgrade(),message_more.upgrade()) else { return; };
-            if loading.replace(true) { if reset { pending.set(true); } return; }
-            let (audit, message) = match (reset, older_history) { (true, _) => (None,None), (false, true) => (cursors.borrow().0, Some(0)), (false, false) => (Some(0), cursors.borrow().1) };
-            let cursors = cursors.clone();
-            let loading = loading.clone();
-            let (refresh, pending) = (refresh.clone(), pending.clone());
-            glib::spawn_future_local(async move {
-                match ui.call("task.activity",json!({"task_id":id,"before_audit":audit,"before_message":message,"limit":100})).await {
-                    Ok(data) => {
-                        if reset { clear(&messages); clear(&history); }
-                        for message in rows(&data,"messages").into_iter().filter(|_| older_messages) {
-                            let row = gtk::Box::new(gtk::Orientation::Vertical, 4);
-                            row.add_css_class("task-activity-row");
-                            row.append(&label(&format!("{} → {} · {}",text(&message,"from"),text(&message,"to"),text(&message,"sent_at")),"dim"));
-                            row.append(&paragraph(text(&message,"text")));
-                            messages.append(&row);
-                        }
-                        for event in rows(&data,"history").into_iter().filter(|_| older_history) {
-                            let row = gtk::Box::new(gtk::Orientation::Vertical, 4);
-                            row.add_css_class("task-activity-row");
-                            let old = event["undo_op"]["payload"]["column"].as_str();
-                            let new = event["payload"]["column"].as_str().or(event["result_summary"]["column"].as_str()).or(event["result_summary"]["task"]["column"].as_str());
-                            let change = match (old,new) { (Some(old),Some(new)) if old != new => format!("{old} → {new}"), _ => text(&event,"op").to_string() };
-                            row.append(&label(&change,"title"));
-                            row.append(&label(&format!("{} · {} · {}",text(&event,"ts"),text(&event,"actor"),text(&event,"kind")),"dim"));
-                            history.append(&row);
-                        }
-                        if reset && messages.first_child().is_none() { messages.append(&label("No messages linked to this task yet.","dim")); }
-                        if reset && history.first_child().is_none() { history.append(&label("No recorded activity.","dim")); }
-                        let next_audit = data["next_audit"].as_i64();
-                        let next_message = data["next_message"].as_i64();
-                        let mut cursors = cursors.borrow_mut();
-                        if older_history { cursors.0 = Some(next_audit.unwrap_or(0)); more.set_visible(next_audit.is_some()); }
-                        if older_messages { cursors.1 = Some(next_message.unwrap_or(0)); message_more.set_visible(next_message.is_some()); }
-                        notice.set_text("Messages are explicitly linked to this task.");
-                    }
-                    Err(error) => notice.set_text(&error.to_string()),
-                }
-                loading.set(false);
-                if pending.replace(false) {
-                    if let Some(refresh) = refresh.upgrade() { refresh.emit_clicked(); }
-                }
-            });
-        });
-    }
-    let weak = Rc::downgrade(ui);
-    let refresh_key = refresh.downgrade();
-    send.connect_clicked(move |key| {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        let to = chosen(&recipient);
-        let body = buffer_text(&text_input.buffer());
-        if to.is_empty() || body.trim().is_empty() {
-            notice.set_text("Choose an agent and enter a message.");
-            return;
-        }
-        key.set_sensitive(false);
-        recipient.set_sensitive(false);
-        text_input.set_sensitive(false);
-        let (key, recipient, text_input, notice, refresh) = (
-            key.clone(),
-            recipient.clone(),
-            text_input.clone(),
-            notice.clone(),
-            refresh_key.clone(),
-        );
-        glib::spawn_future_local(async move {
-            match ui
-                .call(
-                    "mailbox.send",
-                    json!({"project_id":project,"to":to,"text":body,"re_task":id}),
-                )
-                .await
-            {
-                Ok(_) => {
-                    text_input.buffer().set_text("");
-                    if let Some(refresh) = refresh.upgrade() {
-                        refresh.emit_clicked();
-                    }
-                }
-                Err(error) => notice.set_text(&error.to_string()),
-            }
-            key.set_sensitive(true);
-            recipient.set_sensitive(true);
-            text_input.set_sensitive(true);
-        });
-    });
-    refresh
 }
 
-pub fn action(
-    ui: &Rc<Ui>,
-    d: &Rc<Draft>,
-    row: &gtk::Box,
-    caption: &str,
-    op: &'static str,
-    payload: impl Fn() -> Value + 'static,
-    reopen: Option<i64>,
-) {
-    let reopen = reopen.map(|id| Rc::new(move |ui: &Rc<Ui>| open(ui, id)) as Reopen);
-    action_then(ui, d, row, caption, op, payload, reopen);
+fn icon_row(icon: &str, caption: &str) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    row.append(&crate::icons::image(icon, 12));
+    row.append(&label(caption, ""));
+    row
 }
 
-pub type Reopen = Rc<dyn Fn(&Rc<Ui>)>;
-/// `action`, reopening any editor afterwards: a module editor's "Add task" passes its own
-/// opener so the editor comes back with the new task listed.
-pub fn action_then(
-    ui: &Rc<Ui>,
-    d: &Rc<Draft>,
-    row: &gtk::Box,
-    caption: &str,
-    op: &'static str,
-    payload: impl Fn() -> Value + 'static,
-    reopen: Option<Reopen>,
-) {
-    let key = button(caption, "quiet");
-    row.append(&key);
-    let weak = Rc::downgrade(ui);
-    let d = d.clone();
-    // A delete confirms on the key itself, and only when it would actually go ahead.
-    let confirm = op.ends_with(".delete").then(|| d.clone());
-    let act = move |_: &gtk::Button| {
-        let Some(ui) = weak.upgrade() else { return };
-        if d.busy.get() {
-            return;
-        }
-        if d.dirty() || d.unsent_message.get() {
-            d.status
-                .set_text("Save task changes and send or clear your message before this action.");
-            return;
-        }
-        d.busy.set(true);
-        d.form.set_sensitive(false);
-        d.footer.set_sensitive(false);
-        let payload = payload();
-        let d = d.clone();
-        let reopen = reopen.clone();
-        glib::spawn_future_local(async move {
-            match ui.call(op, payload).await {
-                Ok(_) => {
-                    d.busy.set(false);
-                    d.close();
-                    ui.refresh_page();
-                    if let Some(reopen) = reopen {
-                        reopen(&ui)
-                    }
-                }
-                Err(e) => {
-                    d.status.set_text(&e.to_string());
-                    d.busy.set(false);
-                    d.form.set_sensitive(true);
-                    d.footer.set_sensitive(true);
-                }
-            }
-        });
-    };
-    match confirm {
-        Some(d) => crate::app::confirm_inline_if(&key, "Confirm delete", move || !d.busy.get() && !d.dirty() && !d.unsent_message.get(), act),
-        None => {
-            key.connect_clicked(act);
-        }
+/// One step on the timeline: its badge on the rail, then what happened.
+fn timeline_row(icon: gtk::Widget, content: &impl IsA<gtk::Widget>, closed: bool) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    row.add_css_class("issue-event");
+    let rail = gtk::Overlay::new();
+    rail.add_css_class("issue-rail");
+    let line = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    line.add_css_class("issue-rail-line");
+    line.set_halign(gtk::Align::Center);
+    line.set_vexpand(true);
+    rail.set_child(Some(&line));
+    let badge = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    badge.add_css_class("issue-badge");
+    if closed {
+        badge.add_css_class("issue-badge-closed");
     }
+    badge.set_halign(gtk::Align::Center);
+    badge.set_valign(gtk::Align::Start);
+    icon.set_halign(gtk::Align::Center);
+    icon.set_valign(gtk::Align::Center);
+    icon.set_hexpand(true);
+    badge.append(&icon);
+    rail.add_overlay(&badge);
+    rail.set_size_request(32, -1);
+    row.append(&rail);
+    content.set_hexpand(true);
+    content.set_valign(gtk::Align::Center);
+    row.append(content);
+    row
 }

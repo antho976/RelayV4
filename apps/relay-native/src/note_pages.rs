@@ -11,7 +11,7 @@ mod menu;
 #[path = "note_pages/text.rs"]
 mod text;
 
-use super::task_pages::{buffer_text, choose, chosen, multiline, Draft};
+use super::task_pages::{buffer_text, Draft};
 use super::*;
 use doc::Doc;
 use glyphs::{glyph, glyph_stroke};
@@ -1736,203 +1736,78 @@ pub fn verify_tools() {
     assert_eq!(buffer_text(buffer.upcast_ref()), "one+ ONE two");
 }
 
+/// The project's modules as GitHub-style cards: name, priority and state, then progress and
+/// how many of its tasks sit in each column. A card opens its module.
 pub fn modules(ui: &Rc<Ui>, body: &gtk::Box, modules: &[Value]) {
+    use super::board_view::{priority_icon, status_icon, titled};
+    let grid = gtk::FlowBox::new();
+    grid.add_css_class("module-grid");
+    grid.set_selection_mode(gtk::SelectionMode::None);
+    grid.set_homogeneous(true);
+    grid.set_min_children_per_line(1);
+    grid.set_max_children_per_line(3);
+    grid.set_column_spacing(10);
+    grid.set_row_spacing(10);
+    grid.set_valign(gtk::Align::Start);
+    if !modules.is_empty() {
+        body.append(&grid);
+    }
     for module in modules {
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-        row.add_css_class("record");
-        let name = label(text(module, "name"), "title");
-        name.set_hexpand(true);
-        row.append(&name);
-        row.append(&label(
-            &format!(
-                "{} · {:.0}% done{}",
-                text(module, "priority"),
-                module["progress_pct"].as_f64().unwrap_or(0.),
-                if module["completed_at"].is_string() {
-                    " · archived"
-                } else {
-                    ""
-                }
-            ),
-            "dim",
-        ));
-        let key = button("Open module", "quiet");
+        let card = button("", "module-card");
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        let head = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        head.append(&crate::icons::image("modules", 14));
+        let name = label(text(module, "name"), "module-card-name");
+        name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        head.append(&name);
+        let priority = text(module, "priority");
+        let pill = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        pill.add_css_class("field-pill");
+        pill.add_css_class(&format!("pill-priority-{priority}"));
+        pill.append(&priority_icon(priority));
+        pill.append(&label(&titled(priority), "field-pill-name"));
+        head.append(&pill);
+        if module["completed_at"].is_string() {
+            head.append(&label("Completed", "module-card-done"));
+        }
+        let total: i64 = module["counts"].as_object().map(|c| c.values().filter_map(Value::as_i64).sum()).unwrap_or(0);
+        let tally = label(&format!("{total} task{}", if total == 1 { "" } else { "s" }), "module-card-meta");
+        tally.set_hexpand(true);
+        tally.set_xalign(1.);
+        head.append(&tally);
+        content.append(&head);
+        let progress = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        let pct = module["progress_pct"].as_f64().unwrap_or(0.);
+        let meter = gtk::ProgressBar::new();
+        meter.add_css_class("issue-progress");
+        meter.set_fraction((pct / 100.).clamp(0., 1.));
+        meter.set_hexpand(true);
+        meter.set_valign(gtk::Align::Center);
+        progress.append(&meter);
+        progress.append(&label(&format!("{pct:.0}% done"), "module-card-meta"));
+        content.append(&progress);
+        let columns = gtk::Box::new(gtk::Orientation::Horizontal, 14);
+        for (column, title) in super::task_pages::COLUMN_TITLES {
+            let count = module["counts"][column].as_i64().unwrap_or(0);
+            let part = gtk::Box::new(gtk::Orientation::Horizontal, 5);
+            part.append(&status_icon(column, 12));
+            part.append(&label(&format!("{title} {count}"), "module-card-meta"));
+            if count == 0 {
+                part.set_opacity(0.5);
+            }
+            columns.append(&part);
+        }
+        content.append(&columns);
+        card.set_child(Some(&content));
+        card.set_tooltip_text(Some("Open the module's board"));
+        card.set_size_request(340, -1);
         let weak = Rc::downgrade(ui);
         let id = module["id"].as_i64().unwrap_or(0);
-        key.connect_clicked(move |_| {
+        card.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
-                open_module(&ui, id)
+                super::board_view::open_module(&ui, id)
             }
         });
-        row.append(&key);
-        body.append(&row);
+        grid.insert(&card, -1);
     }
-}
-pub fn module_composer(ui: &Rc<Ui>, page: &gtk::Box, project: i64) {
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let name = gtk::Entry::builder()
-        .placeholder_text("Release outcome")
-        .hexpand(true)
-        .build();
-    let priority = choose(&["low", "medium", "high", "urgent"], "medium");
-    let key = button("Create module", "primary");
-    row.append(&name);
-    row.append(&priority);
-    row.append(&key);
-    page.append(&row);
-    let weak = Rc::downgrade(ui);
-    key.connect_clicked(move |b| {
-        let Some(ui) = weak.upgrade() else { return };
-        let value = name.text().trim().to_string();
-        if value.is_empty() {
-            return;
-        }
-        let priority = chosen(&priority);
-        b.set_sensitive(false);
-        let b = b.clone();
-        let name = name.clone();
-        glib::spawn_future_local(async move {
-            match ui
-                .call(
-                    "module.create",
-                    json!({"project_id":project,"name":value,"priority":priority}),
-                )
-                .await
-            {
-                Ok(m) => {
-                    if name.text().trim() == value {
-                        name.set_text("")
-                    }
-                    ui.refresh_page();
-                    open_module(&ui, m["id"].as_i64().unwrap_or(0));
-                }
-                Err(e) => ui.show_error(&e.to_string()),
-            }
-            b.set_sensitive(true);
-        });
-    });
-}
-fn open_module(ui: &Rc<Ui>, id: i64) {
-    let ui = ui.clone();
-    glib::spawn_future_local(async move {
-        match ui.call("module.get", json!({"module_id":id})).await {
-            Ok(module) => module_detail(&ui, module),
-            Err(e) => ui.show_error(&e.to_string()),
-        }
-    });
-}
-fn module_detail(ui: &Rc<Ui>, module: Value) {
-    let id = module["id"].as_i64().unwrap_or(0);
-    let project = module["project_id"].as_i64().unwrap_or(0);
-    let form = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    let name = gtk::Entry::builder().text(text(&module, "name")).build();
-    let priority = choose(
-        &["low", "medium", "high", "urgent"],
-        text(&module, "priority"),
-    );
-    let icon = gtk::Entry::builder()
-        .text(text(&module, "icon"))
-        .placeholder_text("Icon name")
-        .build();
-    field("Module name", &name, &form);
-    field("Priority", &priority, &form);
-    field("Icon", &icon, &form);
-    let snapshot: Rc<dyn Fn() -> Value> = Rc::new(
-        move || json!({"name":name.text().trim(),"priority":chosen(&priority),"icon":if icon.text().trim().is_empty(){Value::Null}else{json!(icon.text().trim())}}),
-    );
-    let d = Draft::new(ui, "Module", module.clone(), snapshot, form);
-    d.controls(ui, "module.update", "module_id", id);
-    for column in super::task_pages::COLUMNS {
-        d.form.append(&label(
-            &column.replace('_', " ").to_uppercase(),
-            "section-label",
-        ));
-        for task in rows(&module["tasks_by_state"], column) {
-            let key = button(
-                &format!("#{} {}", task["id"], text(&task, "title")),
-                "quiet",
-            );
-            let weak = Rc::downgrade(ui);
-            let task_id = task["id"].as_i64().unwrap_or(0);
-            key.connect_clicked(move |_| {
-                if let Some(ui) = weak.upgrade() {
-                    super::task_pages::open(&ui, task_id)
-                }
-            });
-            d.form.append(&key);
-        }
-    }
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let title = gtk::Entry::builder()
-        .placeholder_text("Add module task")
-        .hexpand(true)
-        .build();
-    row.append(&title);
-    // The module editor comes back, with the new task in its list, rather than closing (RA-517).
-    super::task_pages::action_then(
-        ui,
-        &d,
-        &row,
-        "Add task",
-        "task.create",
-        move || json!({"project_id":project,"module_id":id,"title":title.text().trim(),"column":"backlog"}),
-        Some(Rc::new(move |ui: &Rc<Ui>| open_module(ui, id))),
-    );
-    d.form.append(&row);
-    let key = button("Draft patch notes", "quiet");
-    d.form.append(&key);
-    let preview = multiline("", 140);
-    preview.set_editable(false);
-    d.form.append(&preview);
-    let copy = button("Copy patch notes", "quiet");
-    let buffer = preview.buffer();
-    copy.connect_clicked(move |b| b.clipboard().set_text(&buffer_text(&buffer)));
-    d.form.append(&copy);
-    let weak = Rc::downgrade(ui);
-    let status = d.status.clone();
-    key.connect_clicked(move |b| {
-        let Some(ui) = weak.upgrade() else { return };
-        let buffer = preview.buffer();
-        let status = status.clone();
-        b.set_sensitive(false);
-        let b = b.clone();
-        glib::spawn_future_local(async move {
-            match ui
-                .call("module.changelog.draft", json!({"module_id":id}))
-                .await
-            {
-                Ok(v) => buffer.set_text(text(&v, "markdown")),
-                Err(e) => status.set_text(&e.to_string()),
-            }
-            b.set_sensitive(true);
-        });
-    });
-    let archived = module["completed_at"].is_string();
-    super::task_pages::action(
-        ui,
-        &d,
-        &d.footer,
-        if archived {
-            "Reopen"
-        } else {
-            "Complete module"
-        },
-        if archived {
-            "module.reopen"
-        } else {
-            "module.complete"
-        },
-        move || json!({"module_id":id}),
-        None,
-    );
-    super::task_pages::action(
-        ui,
-        &d,
-        &d.footer,
-        "Delete module",
-        "module.delete",
-        move || json!({"module_id":id}),
-        None,
-    );
-    d.present();
 }
