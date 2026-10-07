@@ -75,12 +75,18 @@ result!(#[schemars(rename = "FileTrashListOut")] TrashListOut {
 op!(TrashList, "file.trash.list", TrashListIn => TrashListOut,
     OpMeta::query(Scope::Project, 8, "Trashed files not yet restored or expired").actors(Actors::UserOnly));
 op!(RestoreHead, "file.restore_head", PathIn => Entry,
-    OpMeta::mutation(Scope::Project, 8, "git checkout -- <path>: put a tracked file back as HEAD has it").actors(Actors::UserOnly).emits(&["file.changed"]));
+    OpMeta::mutation(Scope::Project, 8, "git checkout HEAD -- <path>: put a tracked file back as HEAD has it, in the index and the worktree").actors(Actors::UserOnly).emits(&["file.changed"]));
 payload!(#[schemars(rename = "ImportIn")] ImportIn { pub project_id: Id, pub worktree: Option<String>, pub into: String, pub sources: Vec<String> });
 result!(#[schemars(rename = "ImportOut")] ImportOut { pub entries: Vec<Entry> });
 op!(Import, "file.import", ImportIn => ImportOut,
     OpMeta::mutation(Scope::Project, 8, "Copy files in from the OS (drag-in)").actors(Actors::UserOnly).emits(&["file.changed"]));
-payload!(#[schemars(rename = "FileSearchIn")] SearchIn { pub project_id: Id, pub worktree: Option<String>, pub query: String, pub glob: Option<String>, pub regex: Option<bool>, pub limit: Option<u32> });
+payload!(#[schemars(rename = "FileSearchIn")] SearchIn {
+    pub project_id: Id, pub worktree: Option<String>, pub query: String,
+    /// A glob without `/` (`*.rs`) matches the file name at any depth; one with `/`, or a
+    /// leading `/` to anchor it, matches the whole worktree-relative path.
+    pub glob: Option<String>,
+    pub regex: Option<bool>, pub limit: Option<u32>,
+});
 result!(#[schemars(rename = "Hit")] Hit {
     pub path: String, pub line: u32,
     /// 1-based byte offset of the match in the whole line.

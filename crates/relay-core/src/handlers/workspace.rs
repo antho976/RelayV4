@@ -358,6 +358,12 @@ pub fn register(e: &mut Engine) {
             "UPDATE projects SET name=?1, build_cmd=?2, run_cmd=?3, base_branch=?4, protected_paths=?5, critical_files=?6, ord=?7, pinned=?8, updated_at=?9 WHERE id=?10",
             params![name, build_cmd, run_cmd, base_branch, serde_json::to_string(&protected).bus()?, serde_json::to_string(&critical).bus()?, ord, pinned as i64, ctx.now, b.id],
         ).bus()?;
+        // These legacy columns feed the project's guardrail config: one bad pattern there makes
+        // it unreadable and refuses every agent mutation in the project, so it is checked the
+        // way `guardrail.config.set` checks its own before the write commits (RA-422).
+        if p.protected_paths.is_some() || p.critical_files.is_some() {
+            crate::guardrail::config(ctx.tx(), Some(b.id))?;
+        }
         let pr = get_project(ctx.tx(), b.id)?;
         ctx.set_project(pr.id);
         ctx.set_undo("project.update", json!({
@@ -836,20 +842,41 @@ fn remove_project(ctx: &mut Ctx, project_id: Id, force: bool, remove_worktrees: 
     // saved, claims released, holds expired, hooks uninstalled. Each close keeps its worktree,
     // which also defers the agent's kill until the store unlocks; deleting checkouts (build
     // purge, `git worktree remove`) is seconds of disk work per agent, so `remove_worktrees`
-    // queues it for after the commit too, behind those kills, instead of holding the bus
-    // through all of it (BUS.md §5.1). A checkout shared by a PAIR or review group is in
-    // `open` once per session but removed once, after all of them have closed. A session that
-    // opened after the unlocked half ran has nothing prepared and closes the old way, here.
+    // queues it for after the commit too instead of holding the bus through all of it (BUS.md
+    // §5.1). A checkout shared by a PAIR or review group is in `open` once per session but
+    // removed once, after all of them have closed. A session that opened after the unlocked
+    // half ran has nothing prepared and closes the old way, here.
+    let repo = PathBuf::from(&pr.path);
+    let pool = crate::worktree::pool_dir(&repo);
+    let mut doomed: Vec<PathBuf> = if remove_worktrees {
+        open.iter().map(|(_, wt)| PathBuf::from(wt)).filter(|wt| wt.starts_with(&pool)).collect()
+    } else {
+        Vec::new()
+    };
+    doomed.sort();
+    doomed.dedup();
+    // The agents in a checkout about to be deleted are taken out of the registry here, so their
+    // `session.close` finds no PTY to kill on a detached thread; the closure below kills them
+    // and waits for it before deleting anything, as `session.close` does when it removes its
+    // own checkout. Otherwise an agent mid-build writes into a tree being deleted (RA-423).
+    let mut writers = Vec::new();
+    if !doomed.is_empty() {
+        let rows: Vec<(Id, String)> = {
+            let mut stmt = ctx.tx().prepare_cached("SELECT id, worktree FROM sessions WHERE project_id=?1 AND state!='closed'").bus()?;
+            let rows = stmt.query_map([pr.id], |r| Ok((r.get(0)?, r.get(1)?))).bus()?.collect::<rusqlite::Result<Vec<_>>>();
+            rows.bus()?
+        };
+        for (id, wt) in rows {
+            if doomed.iter().any(|d| d.as_path() == Path::new(&wt)) {
+                writers.extend(ctx.engine().take_pty(id));
+            }
+        }
+    }
     for (name, _) in &open {
         let prepared = closes.iter().position(|(n, _)| n == name).map(|i| closes.swap_remove(i).1);
         ctx.invoke_prepared("session.close", close_payload(name), prepared)?;
     }
     if remove_worktrees {
-        let repo = PathBuf::from(&pr.path);
-        let pool = crate::worktree::pool_dir(&repo);
-        let mut doomed: Vec<PathBuf> = open.iter().map(|(_, wt)| PathBuf::from(wt)).filter(|wt| wt.starts_with(&pool)).collect();
-        doomed.sort();
-        doomed.dedup();
         // Integration checkouts and their branches go too: once the rows below are deleted,
         // nothing else could ever find them again.
         let integrations: Vec<(Id, String)> = {
@@ -862,6 +889,12 @@ fn remove_project(ctx: &mut Ctx, project_id: Id, force: bool, remove_worktrees: 
         if !doomed.is_empty() || !integrations.is_empty() {
             let project_id = pr.id;
             ctx.after_commit(move |engine| {
+                std::thread::scope(|scope| {
+                    for pty in &writers {
+                        pty.silence_exit();
+                        scope.spawn(move || pty.kill(std::time::Duration::from_millis(150)));
+                    }
+                });
                 for wt in &doomed {
                     if let Err(error) = crate::worktree::remove(&repo, wt, true) {
                         tracing::warn!(worktree = %wt.display(), %error, "removing a removed project's worktree");
@@ -908,8 +941,13 @@ fn remove_project(ctx: &mut Ctx, project_id: Id, force: bool, remove_worktrees: 
     ] {
         ctx.tx().execute(sql, [pr.id]).bus()?;
     }
-    ctx.tx().execute("DELETE FROM settings WHERE path=?1 OR path=?2 OR path LIKE ?3",
-        params![format!("layout.current.{}", pr.id), format!("guardrails.projects.{}", pr.id), format!("guardrails.projects.{}.%", pr.id)]).bus()?;
+    // Each key with everything under it: the shell saves its arrangement as a tree, and the
+    // native client under its own `native.` key, which ui.rs reads first (RA-419).
+    for path in [format!("layout.current.{}", pr.id), format!("native.layout.current.{}", pr.id), format!("guardrails.projects.{}", pr.id)] {
+        let under = format!("{}.%", path.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
+        ctx.tx().prepare_cached("DELETE FROM settings WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'").bus()?
+            .execute(params![path, under]).bus()?;
+    }
     // A hold no session owns (the user's) would otherwise wait on a project that is gone.
     ctx.tx().execute("UPDATE holds SET state='expired', resolved_at=?1, resolved_by='system' WHERE project_id=?2 AND state='open'",
         params![ctx.now, pr.id]).bus()?;
@@ -949,9 +987,19 @@ fn discover_repositories(root: &Path) -> Result<Vec<relay_bus::types::LocalRepo>
             return Ok(());
         }
         if depth >= 4 { return Ok(()); }
-        for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() || entry.file_type()?.is_symlink() { continue; }
+        // Only the workspace itself must be readable: one root-owned folder in it (a container
+        // volume, lost+found) is skipped rather than hiding every repository beside it (RA-424).
+        let entries = match fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(error) if depth > 0 => {
+                tracing::debug!(path = %path.display(), %error, "skipping an unreadable folder");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else { continue };
+            if !kind.is_dir() || kind.is_symlink() { continue; }
             let name = entry.file_name();
             if matches!(name.to_str(), Some(".git" | ".relay" | "node_modules" | "target" | "build" | ".gradle")) { continue; }
             if name.to_str().is_some_and(|name| name.starts_with(CLONE_SCRATCH)) { continue; }
@@ -1003,5 +1051,22 @@ mod tests {
         let directory = root.path().join("projects");
         fs::create_dir_all(&directory).unwrap();
         assert_eq!(suggested_workspace_from(&directory), directory);
+    }
+
+    /// RA-424: an unreadable folder in the workspace is skipped, not fatal to the discovery.
+    #[test]
+    fn discovery_skips_a_folder_it_cannot_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("repo/.git")).unwrap();
+        let locked = root.path().join("locked");
+        fs::create_dir_all(locked.join("inner")).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let found = discover_repositories(root.path());
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        let found = found.unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].path, root.path().join("repo").display().to_string());
+        assert!(discover_repositories(&root.path().join("missing")).is_err(), "the workspace itself must be readable");
     }
 }

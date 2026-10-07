@@ -1412,7 +1412,8 @@ fn pair_sessions_share_checkout_and_teardown_safely() {
     ok(&f.engine, "session.close", json!({"session": builder_name, "remove_worktree": false}));
     let worktree = PathBuf::from(reviewer["worktree"].as_str().unwrap());
     assert!(worktree.exists());
-    assert!(ok(&f.engine, "session.get", json!({"session": reviewer_name}))["pair_with"].is_null());
+    // The reviewer keeps its second builder rather than leaving the group half-linked (RA-398).
+    assert_eq!(ok(&f.engine, "session.get", json!({"session": reviewer_name}))["pair_with"], second_builder_name);
     assert_eq!(code(call(&f.engine, "session.close", json!({"session": reviewer_name}))), "session.pair_live");
     ok(&f.engine, "session.close", json!({"session": reviewer_name, "remove_worktree": false}));
     assert!(ok(&f.engine, "session.get", json!({"session": second_builder_name}))["pair_with"].is_null());

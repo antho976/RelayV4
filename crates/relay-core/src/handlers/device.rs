@@ -153,7 +153,8 @@ pub fn register(e: &mut Engine) {
             let integration_root = p.integration_id.map(|id| integration_root(conn, project.id, id)).transpose()?;
             Ok((holder, released, adb_path(conn), android_sdk_root(conn), integration_root))
         })?;
-        for lease in released { ctx.emit(super::device_lease::RELEASED, lease.event()); }
+        // Gone whatever this request's outcome: announced now, not with events a refusal drops.
+        for lease in released { ctx.engine().emit_system(super::device_lease::RELEASED, lease.event()); }
         ctx.engine().device_leases.check(&p.device, &holder)?;
         let adb = adb?;
         let device = require_device(&adb, &p.device)?;
@@ -374,10 +375,14 @@ pub fn register(e: &mut Engine) {
     });
     e.register_staged::<AvdBoot, PathBuf>(|ctx, p| {
         let name = valid_avd_name(&p.name)?;
-        let emulator = ctx.read(|conn| sdk_tool(conn, "device.emulator_path", "emulator"))?;
-        // Only the names matter here; whether it is already running is the emulator's business.
+        let (emulator, adb) = ctx.read(|conn| Ok((sdk_tool(conn, "device.emulator_path", "emulator")?, adb_path(conn).ok())))?;
         if !list_avds_with(&emulator, None)?.iter().any(|avd| avd.name == name) {
             return Err(BusError::not_found("avd.not_found", format!("no AVD named {name}")));
+        }
+        // A second emulator on a running AVD exits at once (the AVD is locked), headless and so
+        // silently. Without adb nothing can be known, and the emulator's own refusal is reported.
+        if let Some(serial) = adb.and_then(|adb| running_avds_with(&adb).ok()).and_then(|mut running| running.remove(&name)) {
+            return Err(BusError::conflict("avd.already_running", format!("{name} is already running as {serial}")));
         }
         Ok(emulator)
     }, |ctx: &mut Ctx, p, emulator| {
@@ -391,9 +396,17 @@ pub fn register(e: &mut Engine) {
             // gets, rather than a second emulator UI beside it.
             command.arg(format!("@{event_name}")).arg("-no-window");
             if cold { command.arg("-no-snapshot-load"); }
-            command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-            let state = if command.spawn().is_ok() { "started" } else { "failed" };
-            engine.emit_system("avd.changed", json!({"name":event_name,"state":state}));
+            command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            match command.spawn() {
+                Ok(child) => {
+                    engine.emit_system("avd.changed", json!({"name":event_name,"state":"started"}));
+                    // Weak: an emulator can outlive the engine that booted it.
+                    let engine = Arc::downgrade(&engine);
+                    let _ = std::thread::Builder::new().name("avd-reaper".into())
+                        .spawn(move || reap_emulator(&engine, &event_name, child));
+                }
+                Err(error) => engine.emit_system("avd.changed", json!({"name":event_name,"state":"failed","message":error.to_string()})),
+            }
         });
         Ok(Empty {})
     });
@@ -416,6 +429,56 @@ pub fn register(e: &mut Engine) {
         });
         Ok(Empty {})
     });
+}
+
+/// An emulator that exits this soon after its boot never came up: a missing system image, no
+/// KVM, an AVD locked by another emulator.
+const AVD_EARLY_EXIT: Duration = Duration::from_secs(10);
+/// How much of a booting emulator's output is kept to explain an exit.
+const AVD_TAIL_LINES: usize = 40;
+
+/// Wait on a booted emulator, so it never lingers as a zombie, and say so when it goes on its
+/// own: `failed` with its last error when it never came up, `stopped` when a running one died.
+/// A clean exit later is avd.stop's `emu kill`, which announces itself.
+fn reap_emulator(engine: &std::sync::Weak<Engine>, name: &str, mut child: std::process::Child) {
+    let started = Instant::now();
+    let tail = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+    let pipes: [Option<Box<dyn Read + Send>>; 2] = [
+        child.stdout.take().map(|pipe| Box::new(pipe) as Box<dyn Read + Send>),
+        child.stderr.take().map(|pipe| Box::new(pipe) as Box<dyn Read + Send>),
+    ];
+    // Drained on their own threads: a child the emulator forks may hold them open past its exit.
+    let drains: Vec<_> = pipes.into_iter().flatten().map(|pipe| {
+        let tail = tail.clone();
+        std::thread::spawn(move || {
+            // Lossy and to the end: a drain that stopped early would leave the emulator blocked
+            // on a full pipe.
+            let (mut reader, mut buffer) = (BufReader::new(pipe), Vec::new());
+            while let Ok(Some(line)) = read_lossy_line(&mut reader, &mut buffer) {
+                let mut tail = tail.lock().unwrap_or_else(|poison| poison.into_inner());
+                if tail.len() == AVD_TAIL_LINES { tail.pop_front(); }
+                tail.push_back(line);
+            }
+        })
+    }).collect();
+    let status = child.wait();
+    let settle = Instant::now() + Duration::from_millis(500);
+    while drains.iter().any(|drain| !drain.is_finished()) && Instant::now() < settle { std::thread::sleep(Duration::from_millis(20)); }
+    let early = started.elapsed() < AVD_EARLY_EXIT;
+    if !early && status.as_ref().is_ok_and(|status| status.success()) { return; }
+    let lines: Vec<String> = tail.lock().unwrap_or_else(|poison| poison.into_inner()).iter().cloned().collect();
+    let message = emulator_exit_message(&lines).unwrap_or_else(|| match &status {
+        Ok(status) => format!("emulator exited ({status})"),
+        Err(error) => format!("emulator could not be waited on: {error}"),
+    });
+    let Some(engine) = engine.upgrade().filter(|engine| !engine.is_quitting()) else { return };
+    engine.emit_system("avd.changed", json!({"name":name,"state":if early { "failed" } else { "stopped" },"message":message}));
+}
+
+/// The line of an emulator's output that says why it quit: its last error, else its last line.
+fn emulator_exit_message(lines: &[String]) -> Option<String> {
+    let error = lines.iter().rev().find(|line| ["ERROR", "PANIC", "FATAL"].iter().any(|word| line.contains(word)));
+    error.or_else(|| lines.iter().rev().find(|line| !line.trim().is_empty())).map(|line| line.trim().to_string())
 }
 
 /// The first wait before `adb track-devices` is started again, doubling to the second.
@@ -545,12 +608,19 @@ fn find_avdmanager(sdk: &Path) -> Option<PathBuf> {
     let latest = sdk.join("cmdline-tools/latest/bin/avdmanager");
     if latest.is_file() { return Some(latest); }
     let mut candidates = std::fs::read_dir(sdk.join("cmdline-tools")).ok()?.flatten()
-        .map(|entry| entry.path().join("bin/avdmanager")).filter(|path| path.is_file()).collect::<Vec<_>>();
+        .map(|entry| (numeric_version(&entry.file_name().to_string_lossy()), entry.path().join("bin/avdmanager")))
+        .filter(|(_, path)| path.is_file()).collect::<Vec<_>>();
+    // Newest version last: 19.0 after 9.0, which plain path order gets backwards.
     candidates.sort();
-    candidates.pop().or_else(|| {
+    candidates.pop().map(|(_, path)| path).or_else(|| {
         let legacy = sdk.join("tools/bin/avdmanager");
         legacy.is_file().then_some(legacy)
     })
+}
+
+/// `19.0` → `[19, 0]`, for ordering versioned SDK directories; `None` for any other name.
+fn numeric_version(name: &str) -> Option<Vec<u64>> {
+    name.split('.').map(|part| part.parse().ok()).collect()
 }
 
 fn installed_system_images(sdk: &Path) -> Result<Vec<String>, BusError> {
@@ -710,35 +780,43 @@ fn list_with_adb(adb: &Path) -> Result<Vec<Device>, BusError> {
             String::from_utf8_lossy(&output.stderr).trim().to_string(),
         ));
     }
-    let mut devices = Vec::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines().skip(1) {
-        let mut fields = line.split_whitespace();
-        let Some(serial) = fields.next() else {
-            continue;
-        };
-        let Some(state) = fields.next() else { continue };
-        if serial.starts_with('*') {
-            continue;
-        }
-        let extras: Vec<_> = fields.collect();
-        let model = extras
-            .iter()
-            .find_map(|field| field.strip_prefix("model:"))
-            .unwrap_or(serial)
-            .replace('_', " ");
-        devices.push(Device {
-            serial: serial.to_string(),
-            model,
-            kind: if serial.starts_with("emulator-") {
-                DeviceKind::Avd
-            } else {
-                DeviceKind::Usb
-            },
-            state: state.to_string(),
-            lease: None,
-        });
+    Ok(String::from_utf8_lossy(&output.stdout).lines().skip(1).filter_map(parse_device_line).collect())
+}
+
+/// One line of `adb devices -l`. The state is every word before the first `key:value` extra,
+/// so `no permissions (user in plugdev group; ...); see [http://...]` stays whole rather than
+/// becoming `no`.
+fn parse_device_line(line: &str) -> Option<Device> {
+    let mut fields = line.split_whitespace().peekable();
+    let serial = fields.next()?;
+    if serial.starts_with('*') {
+        return None;
     }
-    Ok(devices)
+    let extra = |field: &str| field.split_once(':').is_some_and(|(key, _)| !key.is_empty() && key.chars().all(|c| c.is_ascii_lowercase() || c == '_'));
+    let mut state = Vec::new();
+    while let Some(field) = fields.next_if(|field| !extra(field)) {
+        state.push(field);
+    }
+    if state.is_empty() {
+        return None;
+    }
+    let extras: Vec<_> = fields.collect();
+    let model = extras
+        .iter()
+        .find_map(|field| field.strip_prefix("model:"))
+        .unwrap_or(serial)
+        .replace('_', " ");
+    Some(Device {
+        serial: serial.to_string(),
+        model,
+        kind: if serial.starts_with("emulator-") {
+            DeviceKind::Avd
+        } else {
+            DeviceKind::Usb
+        },
+        state: state.join(" "),
+        lease: None,
+    })
 }
 
 fn require_device(adb: &Path, serial: &str) -> Result<Device, BusError> {
@@ -1228,13 +1306,20 @@ fn run_command(
     Ok(format!("{wrapper}{init} {task}"))
 }
 
-/// `./gradlew` as the run command spells it, from the project root or a `forge-android`
-/// subproject; `None` when the checkout has no wrapper at all.
+/// `./gradlew` as the run command spells it, from the project root, or else from the one
+/// subdirectory that has a wrapper (an Android app nested in a larger repository); `None` when
+/// the checkout has none. Commands run from the root, and Gradle looks for the build where it
+/// is started rather than beside the wrapper, so a nested one is pointed at its own directory.
 fn gradle_wrapper(root: &Path) -> Option<String> {
-    let wrapper = [root.join("gradlew"), root.join("forge-android/gradlew")]
-        .into_iter()
-        .find(|path| path.is_file())?;
-    Some(format!("./{}", wrapper.strip_prefix(root).unwrap_or(&wrapper).display()))
+    if root.join("gradlew").is_file() {
+        return Some("./gradlew".into());
+    }
+    let mut nested = std::fs::read_dir(root).ok()?.flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| !name.starts_with('.') && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
+        .filter(|name| root.join(name).join("gradlew").is_file());
+    let dir = nested.next()?;
+    nested.next().is_none().then(|| format!("./{dir}/gradlew -p {dir}"))
 }
 
 /// `release` → `Release`: the variant as Gradle spells it inside a task name. Rejects
@@ -1641,13 +1726,21 @@ fn generate_signing_keystore(instance: Instance, path: &Path, alias: &str, passw
         .map_err(|error| BusError::unavailable("device.keytool_missing", error.to_string()))?
         .ok_or_else(|| BusError::unavailable("device.keytool_timeout", "keytool did not finish within 90 seconds"))?;
     if !output.status.success() {
-        return Err(BusError::conflict(
-            "device.keytool_failed",
-            String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        ));
+        return Err(BusError::conflict("device.keytool_failed", keytool_error(&output.stdout, &output.stderr)));
     }
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
         .map_err(|error| BusError::unavailable("device.signing_store_failed", error.to_string()))
+}
+
+/// Why keytool failed. It prints `keytool error: ...` on stdout; stderr has only its progress
+/// line (`Generating 4096-bit RSA key pair ...`), which is reported only when stdout is empty.
+fn keytool_error(stdout: &[u8], stderr: &[u8]) -> String {
+    let stdout = String::from_utf8_lossy(stdout);
+    let stderr = String::from_utf8_lossy(stderr);
+    stdout.lines().map(str::trim).find(|line| line.starts_with("keytool error"))
+        .map(str::to_string)
+        .or_else(|| Some(stdout.trim().to_string()).filter(|text| !text.is_empty()))
+        .unwrap_or_else(|| stderr.trim().to_string())
 }
 
 fn store_signing_secret(
@@ -2119,7 +2212,7 @@ fn run_worker(engine: Arc<Engine>, runtime: Arc<RunRuntime>, parent: uuid::Uuid,
     while !runtime.stopped() {
         // Lossy: one line of binary or mis-encoded log must not end the stream.
         let Ok(Some(line)) = read_lossy_line(&mut reader, &mut buffer) else { break };
-        if !crash_reported && line.contains("FATAL EXCEPTION") {
+        if !crash_reported && crash_line(&line) {
             crash_reported = true;
             report_crash(&engine, runtime.id, parent, &line);
         }
@@ -2138,6 +2231,12 @@ fn run_worker(engine: Arc<Engine>, runtime: Arc<RunRuntime>, parent: uuid::Uuid,
         let _ = advance_run(&engine, runtime.id, parent, "finished", true);
     }
     end_run(&engine, &runtime);
+}
+
+/// A line of the app's own log that says it crashed: Java's `FATAL EXCEPTION`, or libc's
+/// `Fatal signal 11 (SIGSEGV)` for a native one (its tombstone comes from another pid).
+fn crash_line(line: &str) -> bool {
+    line.contains("FATAL EXCEPTION") || line.contains("Fatal signal")
 }
 
 /// Read one line, invalid UTF-8 replaced rather than refused. `Ok(None)` at end of stream.
@@ -2209,30 +2308,34 @@ fn stream_command(
     if runtime.stopped() {
         return Streamed::Stopped;
     }
+    // stdout and stderr share one pipe, so every command of a chained run_cmd reaches the log
+    // with its errors in order; a ` 2>&1` suffix would cover only the last one.
+    let Ok((output, stdout, stderr)) = std::io::pipe().and_then(|(output, writer)| Ok((output, writer.try_clone()?, writer))) else {
+        fail_run(engine, runtime, parent, "device.run_spawn_failed", "run command had no output stream");
+        return Streamed::Failed;
+    };
     let mut spawn = Command::new(shell);
     // Its own process group, so a stop reaches the Gradle client the shell forked, not
     // only the shell (which would leave the build installing onto a released device).
     std::os::unix::process::CommandExt::process_group(&mut spawn, 0);
     spawn
         .current_dir(root)
-        .args(["-lc", &format!("{command} 2>&1")])
+        .args(["-lc", command])
         .envs(env.iter().copied())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stdout(stdout)
+        .stderr(stderr);
     if let Some(sdk_root) = sdk_root {
         spawn.env("ANDROID_HOME", sdk_root).env("ANDROID_SDK_ROOT", sdk_root);
     }
-    let Ok(mut child) = spawn.spawn() else {
+    let spawned = spawn.spawn();
+    // The parent's copies of the write end go with the Command, or the log never reaches EOF.
+    drop(spawn);
+    let Ok(child) = spawned else {
         fail_run(engine, runtime, parent, "device.run_spawn_failed", "could not start the run command");
         return Streamed::Failed;
     };
-    let Some(stdout) = child.stdout.take() else {
-        let _ = child.kill();
-        fail_run(engine, runtime, parent, "device.run_spawn_failed", "run command had no output stream");
-        return Streamed::Failed;
-    };
     runtime.set_group_child(child);
-    let mut reader = BufReader::new(stdout);
+    let mut reader = BufReader::new(output);
     let mut buffer = Vec::new();
     loop {
         if runtime.stopped() {
@@ -2454,6 +2557,7 @@ fn launch_installed_app(adb: &str, device: &str, root: &Path, variant: &str) -> 
             .lines()
             .map(str::trim)
             .find(|line| line.starts_with(&format!("{package}/")))
+            .filter(|line| line[package.len() + 1..].chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '$')))
             .map(str::to_string);
         let Some(component) = component.filter(|_| resolved.status.success()) else {
             let detail = String::from_utf8_lossy(&resolved.stderr).trim().to_string();
@@ -2517,10 +2621,21 @@ fn variant_application_ids(root: &Path, variant: &str) -> Vec<String> {
         .filter_map(|text| serde_json::from_str::<Value>(&text).ok())
         .filter(|value| value.get("variantName").and_then(Value::as_str).is_some_and(|name| name.eq_ignore_ascii_case(variant)))
         .filter_map(|value| value.get("applicationId").and_then(Value::as_str).map(str::to_string))
+        // Each goes into an `adb shell` line the device's shell parses: only a real package name.
+        .filter(|package| valid_application_id(package))
         .collect::<Vec<_>>();
     packages.sort();
     packages.dedup();
     packages
+}
+
+/// A Java package name, as Android requires of an applicationId: two or more dot-separated
+/// segments of letters, digits and underscores, each starting with a letter.
+fn valid_application_id(value: &str) -> bool {
+    value.split('.').count() >= 2
+        && value.split('.').all(|segment| {
+            segment.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) && segment.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
 }
 
 fn collect_apk_metadata(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
@@ -2896,6 +3011,96 @@ E/AndroidRuntime( 1234): \tat com.example.app.MainActivity.onCreate(MainActivity
         let project = dispatch("project.add", json!({"workspace_id": workspace_id, "path": path.join("repo")}));
         let project_id = project["id"].as_i64().unwrap();
         (engine, workspace, project_id)
+    }
+
+    #[test]
+    fn a_lease_pruned_by_a_refused_run_is_still_announced() {
+        use relay_bus::{Actor, Request};
+        let (engine, _workspace, project_id) = run_engine();
+        let mut events = engine.subscribe();
+        // Held by a session that does not exist: the next request that prunes drops it.
+        let gone = crate::device_lease::Holder::Session { id: 9_999, name: "gone".into() };
+        let lease = crate::device_lease::Lease::new("phone-b", gone, crate::device_lease::Kind::Claim, "testing", None);
+        engine.device_leases.acquire(lease, &mut Vec::new()).unwrap();
+        let refused = engine.dispatch(Request::new(Actor::User, "device.run", json!({"project_id": project_id, "device": "no-such-phone"})), crate::engine::Door::InProcess);
+        assert!(refused.error.is_some(), "no such device: the run is refused");
+        assert!(engine.device_leases.is_empty());
+        let mut announced = Vec::new();
+        while let Ok(event) = events.try_recv() { if event.ev == super::super::device_lease::RELEASED { announced.push(event.payload); } }
+        assert_eq!(announced.len(), 1, "{announced:?}");
+        assert_eq!(announced[0]["device"], "phone-b");
+    }
+
+    #[test]
+    fn adb_device_lines_keep_a_multi_word_state() {
+        let device = parse_device_line("R5CT1234ABC            no permissions (user in plugdev group; are your udev rules wrong?); see [http://developer.android.com/tools/device.html] usb:1-1 transport_id:2").unwrap();
+        assert_eq!(device.serial, "R5CT1234ABC");
+        assert_eq!(device.state, "no permissions (user in plugdev group; are your udev rules wrong?); see [http://developer.android.com/tools/device.html]");
+        let device = parse_device_line("emulator-5554          device product:sdk_gphone64 model:sdk_gphone64_x86_64 device:emu64x transport_id:1").unwrap();
+        assert_eq!((device.state.as_str(), device.model.as_str(), device.kind), ("device", "sdk gphone64 x86 64", DeviceKind::Avd));
+        assert_eq!(parse_device_line("0123456789ABCDEF\tunauthorized usb:2-1 transport_id:3").map(|device| device.state), Some("unauthorized".into()));
+        assert!(parse_device_line("").is_none());
+        assert!(parse_device_line("* daemon started successfully").is_none());
+    }
+
+    #[test]
+    fn the_newest_cmdline_tools_wins_by_version_not_by_spelling() {
+        let sdk = tempfile::tempdir().unwrap();
+        for version in ["9.0", "19.0", "custom"] {
+            let bin = sdk.path().join("cmdline-tools").join(version).join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::write(bin.join("avdmanager"), "").unwrap();
+        }
+        assert_eq!(find_avdmanager(sdk.path()), Some(sdk.path().join("cmdline-tools/19.0/bin/avdmanager")));
+        assert!(numeric_version("10.0") > numeric_version("9.0"));
+        assert_eq!(numeric_version("latest-2"), None);
+    }
+
+    #[test]
+    fn a_nested_gradle_wrapper_is_pointed_at_its_own_project() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(gradle_wrapper(root.path()), None);
+        std::fs::create_dir_all(root.path().join("android")).unwrap();
+        std::fs::write(root.path().join("android/gradlew"), "").unwrap();
+        assert_eq!(gradle_wrapper(root.path()).as_deref(), Some("./android/gradlew -p android"));
+        std::fs::create_dir_all(root.path().join("other")).unwrap();
+        std::fs::write(root.path().join("other/gradlew"), "").unwrap();
+        assert_eq!(gradle_wrapper(root.path()), None, "two nested wrappers: neither is guessed");
+        std::fs::write(root.path().join("gradlew"), "").unwrap();
+        assert_eq!(gradle_wrapper(root.path()).as_deref(), Some("./gradlew"));
+    }
+
+    #[test]
+    fn keytool_failures_report_keytools_own_error() {
+        let stderr = b"Generating 4096-bit RSA key pair and self-signed certificate (SHA384withRSA) with a validity of 10000 days\n";
+        assert_eq!(keytool_error(b"keytool error: java.io.FileNotFoundException: /x (No such file or directory)\n", stderr),
+            "keytool error: java.io.FileNotFoundException: /x (No such file or directory)");
+        assert_eq!(keytool_error(b"", b"something broke\n"), "something broke");
+    }
+
+    #[test]
+    fn native_crashes_count_as_crashes() {
+        assert!(crash_line("F libc    : Fatal signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x0 in tid 4242 (main), pid 4242 (com.example)"));
+        assert!(crash_line("E AndroidRuntime: FATAL EXCEPTION: main"));
+        assert!(!crash_line("I ActivityManager: Displayed com.example/.Main"));
+    }
+
+    #[test]
+    fn only_a_package_name_is_taken_as_an_application_id() {
+        assert!(valid_application_id("com.example.app"));
+        assert!(valid_application_id("com.example_2.App"));
+        for bad in ["x; pm uninstall com.other", "com.example$(id)", "single", "com..example", "com.1example", ""] {
+            assert!(!valid_application_id(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn an_emulator_exit_is_explained_by_its_last_error() {
+        let lines: Vec<String> = ["INFO    | Android emulator version 35.1", "ERROR   | x86_64 emulation currently requires hardware acceleration!", "INFO    | exiting"]
+            .into_iter().map(str::to_string).collect();
+        assert_eq!(emulator_exit_message(&lines).as_deref(), Some("ERROR   | x86_64 emulation currently requires hardware acceleration!"));
+        assert_eq!(emulator_exit_message(&["only line".to_string()]).as_deref(), Some("only line"));
+        assert_eq!(emulator_exit_message(&[]), None);
     }
 
     #[test]
