@@ -273,7 +273,8 @@ pub(super) fn set_prefs(ui: &Rc<Ui>, next: Prefs) {
     }
     PREFS.with(|p| p.set(next));
     apply_prefs(ui, &next, before.sort_title != next.sort_title);
-    if next.autosave && !before.autosave {
+    // Either way: re-arming with autosave off cancels a timer already running.
+    if next.autosave != before.autosave {
         for doc in docs() {
             doc.schedule_autosave(ui);
         }
@@ -1287,6 +1288,11 @@ pub fn workspace(ui: &Rc<Ui>, _name: &str, project: i64, notes: &[Value]) {
             doc::reconcile(ui, &doc, notes.iter().find(|n| n["id"].as_i64() == Some(doc.id)));
         }
     }
+    if changed {
+        // Another project's list starts at its top, without the last project's error.
+        shell.list_scroll.vadjustment().set_value(0.0);
+        shell.banner.set_visible(false);
+    }
     if fresh {
         render_rows(ui, &shell);
     }
@@ -1497,7 +1503,7 @@ pub fn module_composer(ui: &Rc<Ui>, page: &gtk::Box, project: i64) {
                     if name.text().trim() == value {
                         name.set_text("")
                     }
-                    super::refresh_notes(&ui);
+                    ui.refresh_page();
                     open_module(&ui, m["id"].as_i64().unwrap_or(0));
                 }
                 Err(e) => ui.show_error(&e.to_string()),
