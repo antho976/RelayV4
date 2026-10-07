@@ -41,7 +41,6 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
         for path in [
             "providers",
             "device",
-            "parking",
             "keybindings",
             "appearance.mode",
             "appearance.panel_alpha",
@@ -187,7 +186,7 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
         let hint = match name {
             "appearance" => "Theme, opacity, wallpaper",
             "notifications" => "Sounds and categories",
-            "agents" => "Providers and parking",
+            "agents" => "Providers and updates",
             "safety" => "Caps and protected paths",
             "android" => "SDK and device tools",
             "keyboard" => "Global shortcuts",
@@ -367,7 +366,7 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
     );
 
     agents.append(&paragraph(
-        "Provider discovery, executable overrides and process parking.",
+        "Provider discovery, updates and executable overrides.",
     ));
     for provider in rows(&data["detected"], "providers") {
         let info = section(&agents, text(&provider, "provider"));
@@ -425,15 +424,6 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
             data["providers"][provider]["path"].as_str().unwrap_or(""),
         );
     }
-    setting_number(
-        ui,
-        &agents,
-        "Park idle sessions after (minutes)",
-        "parking.idle_minutes",
-        data["parking"]["idle_minutes"].as_f64().unwrap_or(30.),
-        0.,
-        1440.,
-    );
 
     let android = category(&stack, "android", "Android");
     android.append(&paragraph(
@@ -714,7 +704,7 @@ const CATEGORIES: [(&str, &str, &str, &str, &str, &str); 7] = [
         "terminal",
         "Runtime",
         "Provider and session behavior",
-        "Local CLI discovery, authentication state, executable overrides, and process parking.",
+        "Local CLI discovery, authentication state, updates, and executable overrides.",
     ),
     (
         "safety",
