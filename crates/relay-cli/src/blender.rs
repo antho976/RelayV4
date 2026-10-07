@@ -25,7 +25,8 @@ const ASSET_EXTENSIONS: [&str; 7] = ["blend", "fbx", "obj", "glb", "gltf", "abc"
 /// run.py keeps no more than this of what the agent's script prints, so the pipe stays small too.
 const MAX_OUTPUT: usize = 60_000;
 
-const PY_COMMON: &str = include_str!("blender_py/common.py");
+// Every script gets the character frame and bone naming shared with the Unreal tools.
+const PY_COMMON: &str = concat!(include_str!("blender_py/common.py"), "\n", include_str!("rig_frame.py"));
 const PY_INFO: &str = include_str!("blender_py/info.py");
 const PY_RUN: &str = include_str!("blender_py/run.py");
 const PY_RENDER: &str = include_str!("blender_py/render.py");
@@ -189,20 +190,21 @@ fn call(name: &str, args: &Value) -> Result<Value> {
         },
         "blender_python" => {
             let mut a = args.clone();
-            if let Some(save_as) = args["save_as"].as_str() {
-                let target = resolve_new(&root, save_as, "blend")?;
-                if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-                }
-                a["save_as"] = json!(target);
-            }
+            let save_as = args["save_as"].as_str().map(|save_as| resolve_new(&root, save_as, "blend")).transpose()?;
             let file = args["file"].as_str().filter(|f| !f.is_empty()).map(|f| resolve(&root, f)).transpose()?;
             // Two calls saving one .blend in a shared checkout: the second is refused up front by
             // the lock, and a save over a file someone changed since it was opened (run.py checks
             // this stamp, taken before Blender reads the file) is refused instead of losing work.
-            let target = a["save_as"].as_str().map(PathBuf::from).or_else(|| file.clone().filter(|_| args["save"] == true));
-            // Agent code meets the guardrail before it runs (RA-077; mcp::plugin_gate says what that can and cannot cover).
+            let target = save_as.clone().or_else(|| file.clone().filter(|_| args["save"] == true));
+            // Agent code meets the guardrail before it runs, and before anything is written for it
+            // (RA-077; mcp::plugin_gate says what that can and cannot cover).
             crate::mcp::plugin_gate("blender_python", file.as_deref(), &target.as_deref().into_iter().collect::<Vec<_>>())?;
+            if let Some(save_as) = &save_as {
+                if let Some(parent) = save_as.parent() {
+                    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+                }
+                a["save_as"] = json!(save_as);
+            }
             let _lock = target.as_deref().map(|t| SaveLock::take(t, secs(args, 300))).transpose()?;
             if let Some(file) = &file {
                 a["_opened"] = opened_stamp(file)?;
@@ -236,7 +238,9 @@ fn call(name: &str, args: &Value) -> Result<Value> {
         "blender_export" => {
             let file = resolve(&root, required(args, "file")?)?;
             let mut a = args.clone();
-            a["path"] = json!(resolve_new(&root, required(args, "path")?, "fbx")?);
+            let path = resolve_new(&root, required(args, "path")?, "fbx")?;
+            crate::mcp::plugin_gate("blender_export", Some(&file), &[&path])?;
+            a["path"] = json!(path);
             run(PY_EXPORT, &a, Some(&file), secs(args, 600))
         }
         "blender_to_unreal" => to_unreal(&root, args),
@@ -351,6 +355,10 @@ fn run(body: &str, args: &Value, file: Option<&Path>, timeout: Duration) -> Resu
     if let Some(file) = file.and_then(Path::parent) {
         command.current_dir(file);
     }
+    // Confined to the session's write roots where bwrap can (RA-077; blender_sandbox).
+    let sandbox = crate::blender_sandbox::Sandbox::current(&checkout_root()?);
+    let out_dir: Vec<PathBuf> = args["out_dir"].as_str().map(PathBuf::from).into_iter().collect();
+    let mut command = sandbox.wrap(command, &dir, &out_dir).inspect_err(|_| { let _ = std::fs::remove_dir_all(&dir); })?;
     let output = relay_core::proc::output_with_timeout(&mut command, timeout);
     let _ = std::fs::remove_dir_all(&dir);
     let output = output.with_context(|| format!("running {}", blender.display()))?
@@ -364,7 +372,7 @@ fn run(body: &str, args: &Value, file: Option<&Path>, timeout: Duration) -> Resu
         .collect();
     let result = stdout.lines().rev().find_map(|l| l.strip_prefix("RELAY_JSON:"));
     if !output.status.success() || (result.is_none() && body != PY_RUN) {
-        bail!("Blender failed:\n{}", failure_text(&stdout, &stderr));
+        bail!("Blender failed:\n{}\n(sandbox {})", failure_text(&stdout, &stderr), sandbox.describe());
     }
     let mut value = match result {
         Some(json_text) => serde_json::from_str(json_text)?,
@@ -375,6 +383,7 @@ fn run(body: &str, args: &Value, file: Option<&Path>, timeout: Duration) -> Resu
         value["output"] = json!(tail(&printed.join("\n"), 300));
         value["saved"] = stdout.lines().find_map(|l| l.strip_prefix("RELAY_SAVED:")).and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
     }
+    value["sandbox"] = json!(sandbox.describe());
     Ok(value)
 }
 
@@ -456,6 +465,7 @@ fn to_unreal(root: &Path, args: &Value) -> Result<Value> {
         .unwrap_or_else(|| file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Export".into()));
     let fbx_rel = args["fbx_path"].as_str().map(str::to_string).unwrap_or_else(|| format!("Saved/Relay/Exports/{stem}.fbx"));
     let fbx = resolve_new(root, &fbx_rel, "fbx")?;
+    crate::mcp::plugin_gate("blender_to_unreal", Some(&file), &[&fbx])?;
     let exported = run(PY_EXPORT, &json!({
         "objects": args["objects"], "path": fbx, "kind": kind, "action": args["action"],
         "animations": args["animations"].as_bool().unwrap_or(kind == "animation"),
@@ -599,6 +609,36 @@ mod tests {
         assert!(SaveLock::take(&blend, Duration::from_secs(60)).is_ok());
     }
 
+    /// RA-077: agent code in a sandboxed run cannot write outside the write roots, and can inside.
+    #[test]
+    fn sandboxed_scripts_write_only_inside_the_write_roots() {
+        if find_blender().is_err() || !crate::blender_sandbox::available() {
+            eprintln!("Blender or a working bwrap missing; skipping");
+            return;
+        }
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let _sandbox = crate::blender_sandbox::test_roots(&[allowed.path()]);
+        let t = Duration::from_secs(120);
+        let write = |dir: &Path| json!({"code": format!("open({:?}, 'w').write('x')\nprint('wrote')", dir.join("probe.txt"))});
+
+        let inside = run(PY_RUN, &write(allowed.path()), None, t).unwrap();
+        assert_eq!(inside["output"].as_str().unwrap().trim(), "wrote", "{inside}");
+        assert!(inside["sandbox"].as_str().unwrap().starts_with("bwrap:"), "{inside}");
+        assert!(allowed.path().join("probe.txt").is_file());
+
+        let error = format!("{:#}", run(PY_RUN, &write(outside.path()), None, t).unwrap_err());
+        assert!(error.contains("Read-only file system"), "{error}");
+        assert!(error.contains("sandbox bwrap:"), "a failure says it ran sandboxed: {error}");
+        assert!(!outside.path().join("probe.txt").exists());
+        let home = std::env::var("HOME").unwrap();
+        let error = format!("{:#}", run(PY_RUN, &json!({"code": format!("open({:?}, 'w')", format!("{home}/.relay-sandbox-probe"))}), None, t).unwrap_err());
+        assert!(error.contains("Read-only file system"), "{error}");
+        // No network either.
+        let net = run(PY_RUN, &json!({"code": "import socket\ntry:\n    socket.create_connection(('1.1.1.1', 80), timeout=2)\n    print('online')\nexcept OSError:\n    print('offline')"}), None, t).unwrap();
+        assert_eq!(net["output"].as_str().unwrap().trim(), "offline");
+    }
+
     /// Runs every Blender script against a fixture built by `blender_py/tests/make_fixture.py`,
     /// with real Blender. Skipped where Blender is not installed (CI runners do not carry it).
     #[test]
@@ -608,6 +648,8 @@ mod tests {
             return;
         };
         let dir = tempfile::tempdir().unwrap();
+        // Under the sandbox where bwrap works, so the real tools are known to work confined.
+        let _sandbox = crate::blender_sandbox::test_roots(&[dir.path()]);
         let fixture = dir.path().join("fixture.blend");
         let maker = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/blender_py/tests/make_fixture.py");
         let status = Command::new(&blender).args(["-b", "--factory-startup", "--python"]).arg(&maker).arg("--").arg(&fixture)
@@ -616,6 +658,7 @@ mod tests {
         let t = Duration::from_secs(300);
 
         let info = run(PY_INFO, &json!({}), Some(&fixture), t).unwrap();
+        assert!(!crate::blender_sandbox::available() || info["sandbox"].as_str().unwrap().starts_with("bwrap:"), "{}", info["sandbox"]);
         assert!(info["objects"].as_array().unwrap().iter().any(|o| o["name"] == "Hero" && o["armature"]["left_right_pairs"] == 6));
         // Blender 5 keeps F-curves in slot channelbags; the count must not read zero there.
         let swing = info["actions"].as_array().unwrap().iter().find(|a| a["name"] == "Swing").unwrap();
@@ -780,6 +823,8 @@ mod tests {
             return;
         };
         let dir = tempfile::tempdir().unwrap();
+        // Under the sandbox where bwrap works, so the real tools are known to work confined.
+        let _sandbox = crate::blender_sandbox::test_roots(&[dir.path()]);
         let fixture = dir.path().join("fixture.blend");
         let maker = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/blender_py/tests/make_fixture.py");
         Command::new(&blender).args(["-b", "--factory-startup", "--python"]).arg(&maker).arg("--").arg(&fixture).output().unwrap();

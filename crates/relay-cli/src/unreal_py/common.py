@@ -190,21 +190,6 @@ def rnd(p, digits=1):
 
 # ---- skeletons
 
-LEFT_RIGHT = [("_l", "_r"), ("_L", "_R"), (".l", ".r"), (".L", ".R"), ("Left", "Right"), ("left", "right"), ("l_", "r_"), ("L_", "R_")]
-
-
-def mirror_name(name):
-    """The right-side twin of a left-side bone name, or None."""
-    for left, right in LEFT_RIGHT:
-        if name.endswith(left):
-            return name[: -len(left)] + right
-        if name.startswith(left) and left.endswith("_"):
-            return right + name[len(left):]
-        if left in ("Left", "left") and left in name:
-            return name.replace(left, right, 1)
-    return None
-
-
 class Skeleton(object):
     """The bone hierarchy of a skeletal mesh, read through an unregistered component."""
 
@@ -289,40 +274,9 @@ def sample_times(anim):
 
 
 def body_frame(skel):
-    """Character axes in mesh space from the skeleton itself: `right` points from left-side
-    bones to their right-side twins, `up` is +Z, `forward` completes the frame. This is why the
-    checks work for any skeleton and any mesh orientation."""
+    """Character axes in mesh space from the skeleton itself (rig_frame.character_frame, bundled
+    after this file): `right` points from left-side bones to their right-side twins, `up` is +Z,
+    `forward` = right x up in Unreal's left-handed space. This is why the checks work for any
+    skeleton and any mesh orientation."""
     comp = skel.component_pose(skel.ref_local)
-    pairs = []
-    for n in skel.names:
-        twin = mirror_name(n)
-        if twin and twin in comp and twin != n:
-            pairs.append((n, twin))
-    lateral = (0.0, 0.0, 0.0)
-    for left, right in pairs:
-        lateral = add(lateral, sub(comp[right][0], comp[left][0]))
-    up = (0.0, 0.0, 1.0)
-    right = normalize(sub(lateral, mul(up, dot(lateral, up))))
-    if length(right) < 0.5:
-        right = (0.0, 1.0, 0.0)
-    forward = normalize(cross(right, up))
-    feet = [comp[n][0][2] for n in skel.names if "foot" in n.lower() or "ball" in n.lower() or "toe" in n.lower()]
-    ground = min(feet) if feet else min(p[0][2] for p in comp.values())
-    center = (0.0, 0.0, 0.0)
-    if pairs:
-        for left, right_name in pairs:
-            center = add(center, mul(add(comp[left][0], comp[right_name][0]), 0.5))
-        center = mul(center, 1.0 / len(pairs))
-    return {"right": right, "forward": forward, "up": up, "center": (center[0], center[1], ground),
-            "pairs": pairs[:6], "found_pairs": len(pairs)}
-
-
-def to_body(frame, p):
-    d = sub(p, frame["center"])
-    return (dot(d, frame["forward"]), dot(d, frame["right"]), dot(d, frame["up"]))
-
-
-def side(frame, p, tolerance=3.0):
-    r = to_body(frame, p)[1]
-    return "right" if r > tolerance else ("left" if r < -tolerance else "center")
-
+    return character_frame(skel.names, skel.parent, dict((n, comp[n][0]) for n in skel.names))

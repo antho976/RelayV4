@@ -16,6 +16,7 @@ mod mcp;
 mod unreal;
 mod unreal_process;
 mod blender;
+mod blender_sandbox;
 mod remote;
 mod write_targets;
 
@@ -229,8 +230,14 @@ async fn run(cli: Cli) -> Result<u8> {
             let (actor, token) = actor_from_env(cli.actor.as_deref())?;
             mcp::serve(instance, actor, token).await
         }
-        Command::UnrealMcp => unreal::serve(),
-        Command::BlenderMcp => blender::serve(),
+        Command::UnrealMcp => {
+            mcp::use_instance(instance);
+            unreal::serve()
+        }
+        Command::BlenderMcp => {
+            mcp::use_instance(instance);
+            blender::serve()
+        }
         Command::Remote { remote } => remote::run(instance, remote).await,
         Command::Schema { op } => {
             match op {

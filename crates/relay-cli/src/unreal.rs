@@ -47,7 +47,8 @@ const MAX_LOG_LINES: usize = 300;
 /// Images one call may return; each is a full PNG in the agent's context.
 const MAX_IMAGES: usize = 16;
 
-const PY_COMMON: &str = include_str!("unreal_py/common.py");
+// Every script gets the character frame and bone naming shared with the Blender tools.
+const PY_COMMON: &str = concat!(include_str!("unreal_py/common.py"), "\n", include_str!("rig_frame.py"));
 const PY_PROJECT_CHECK: &str = include_str!("unreal_py/project_check.py");
 const PY_CAPTURE: &str = include_str!("unreal_py/capture.py");
 // The checks are shared with blender_anim_inspect (`anim_rules.py`); the script only poses the skeleton.

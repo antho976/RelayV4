@@ -2,7 +2,8 @@
 # problem caught before export is measured the same way after import). Each engine's script
 # poses its rig at a sample and hands over points through a `rig` adapter; everything here is
 # plain Python on (x, y, z) tuples in centimetres, Z up, so a rule fixed here is fixed in both.
-# Bundled between the engine's common.py and its anim_inspect.py.
+# Bundled after the engine's common.py (with rig_frame.py: names, body filters, to_body) and
+# before its anim_inspect.py.
 #
 # The adapter:
 #   rig.pose(key)           pose the rig (and partner) at a sample: a Blender frame or an Unreal time
@@ -18,36 +19,6 @@
 #   rig.frame               {center, forward, right, up}: the character's frame, same space and units
 
 ITEM_ENDS = ("end_a", "end_b", "center")
-# Bones that are not body volume: fingers, twist and helper bones, props, face, control rigs.
-NOT_BODY = ("finger", "thumb", "index", "middle", "ring", "pinky", "metacarpal", "twist", "weapon", "prop", "attach",
-            "socket", "root", "camera", "correct", "eye", "jaw", "tongue", "pole", "ctrl", "mch", "org")
-NOT_BODY_TOKENS = ("ik", "end", "tip")
-PROBES = ("hand", "foot", "head", "forearm", "lowerarm", "shin", "calf")
-
-
-def _tokens(name):
-    out, word = [], ""
-    for ch in name.lower():
-        if ch.isalnum():
-            word += ch
-        elif word:
-            out.append(word)
-            word = ""
-    return out + [word] if word else out
-
-
-def body_bone(name):
-    """Whether a bone is part of the body's volume, by name: the same filter in both engines."""
-    low = name.lower()
-    return not any(k in low for k in NOT_BODY) and not any(t in NOT_BODY_TOKENS or t.startswith("ik") for t in _tokens(name))
-
-
-def probe_bone(name):
-    return body_bone(name) and any(k in name.lower() for k in PROBES)
-
-
-def foot_bone(name):
-    return body_bone(name) and "foot" in name.lower()
 
 
 def _sub(a, b): return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
@@ -60,16 +31,6 @@ def _seg(p, a, b):
     denom = _dot(ab, ab)
     t = 0.0 if denom < 1e-9 else max(0.0, min(1.0, _dot(_sub(p, a), ab) / denom))
     return _len(_sub(p, (a[0] + ab[0] * t, a[1] + ab[1] * t, a[2] + ab[2] * t)))
-
-
-def _body(frame, p):
-    d = _sub(p, frame["center"])
-    return (_dot(d, frame["forward"]), _dot(d, frame["right"]), _dot(d, frame["up"]))
-
-
-def _side(frame, p, tolerance=3.0):
-    r = _body(frame, p)[1]
-    return "right" if r > tolerance else ("left" if r < -tolerance else "center")
 
 
 def _nearest(p, segments, skip=()):
@@ -149,7 +110,7 @@ def inspect_animation(rig, keys, args, key="frame", row_key=None):
         row = {row_key: k, "points": {}, "checks": []}
         for ref in args.get("track") or []:
             p = rig.point(ref)
-            row["points"][ref] = {"fwd_right_up": [round(c, 1) for c in _body(rig.frame, p)], "side": _side(rig.frame, p)}
+            row["points"][ref] = {"fwd_right_up": rnd(to_body(rig.frame, p)), "side": side(rig.frame, p)}
 
         body = rig.segments()
         for it in rig.items:

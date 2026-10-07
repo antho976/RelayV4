@@ -83,63 +83,20 @@ def rnd(v, digits=1):
     return [round(c, digits) for c in v]
 
 
-# ---- left/right from names (Blender: .L/.R, _L/_R, Left/Right, l_/r_)
-
-PAIRS = [(".L", ".R"), (".l", ".r"), ("_L", "_R"), ("_l", "_r"), ("-L", "-R"), ("Left", "Right"), ("left", "right")]
-
-
-def twin(name):
-    for left, right in PAIRS:
-        if name.endswith(left):
-            return name[: -len(left)] + right
-        if left in ("Left", "left") and left in name:
-            return name.replace(left, right, 1)
-    for left, right in (("l_", "r_"), ("L_", "R_")):
-        if name.startswith(left):
-            return right + name[len(left):]
-    return None
-
-
-def left_right_pairs(names):
-    names = set(names)
-    return [(n, twin(n)) for n in sorted(names) if twin(n) in names and twin(n) != n]
-
+# ---- the character frame: rig_frame.py (bundled after this file) holds the naming and the maths
 
 def body_frame(arm):
     """Character axes in world space from the armature's own bone pairs at rest. Blender is
-    right-handed Z-up: forward = up x right. Without pairs, Blender's front convention (-Y) is used."""
-    pairs = left_right_pairs([b.name for b in arm.data.bones])
+    right-handed Z-up: forward = up x right. Without pairs, Blender's front convention (-Y) is used.
+    Axes and centre come back as Vectors in Blender units; to_body reports centimetres."""
     mw = arm.matrix_world
-    lateral = Vector((0, 0, 0))
-    center = Vector((0, 0, 0))
-    for l, r in pairs:
-        hl, hr = mw @ arm.data.bones[l].head_local, mw @ arm.data.bones[r].head_local
-        lateral += hr - hl
-        center += (hl + hr) / 2
-    up = Vector((0, 0, 1))
-    right = lateral - up * lateral.dot(up)
-    if right.length < 1e-6:
-        right = Vector((-1, 0, 0))
-    right.normalize()
-    forward = up.cross(right).normalized()
-    heads = [mw @ b.head_local for b in arm.data.bones] + [mw @ b.tail_local for b in arm.data.bones]
-    ground = min(h.z for h in heads)
-    if pairs:
-        center /= len(pairs)
-    else:
-        center = sum(heads, Vector((0, 0, 0))) / len(heads)
-    center.z = ground
-    return {"right": right, "forward": forward, "up": up, "center": center, "pairs": pairs}
-
-
-def to_body(frame, p):
-    d = p - frame["center"]
-    return Vector((d.dot(frame["forward"]), d.dot(frame["right"]), d.dot(frame["up"]))) * TO_CM
-
-
-def side(frame, p, tolerance_cm=3.0):
-    r = to_body(frame, p).y
-    return "right" if r > tolerance_cm else ("left" if r < -tolerance_cm else "center")
+    bones = arm.data.bones
+    f = character_frame([b.name for b in bones], dict((b.name, b.parent.name if b.parent else None) for b in bones),
+                        dict((b.name, tuple(mw @ b.head_local)) for b in bones), dict((b.name, tuple(mw @ b.tail_local)) for b in bones),
+                        default_right=(-1.0, 0.0, 0.0), right_handed=True, scale=TO_CM)
+    for k in ("right", "forward", "up", "center"):
+        f[k] = Vector(f[k])
+    return f
 
 
 def world_bbox(objects):
@@ -152,13 +109,6 @@ def world_bbox(objects):
             lo = p.copy() if lo is None else Vector(map(min, lo, p))
             hi = p.copy() if hi is None else Vector(map(max, hi, p))
     return lo, hi
-
-
-def segment_distance(p, a, b):
-    ab = b - a
-    denom = ab.dot(ab)
-    t = 0.0 if denom < 1e-12 else max(0.0, min(1.0, (p - a).dot(ab) / denom))
-    return (p - (a + ab * t)).length
 
 
 def set_action(arm, action_name):

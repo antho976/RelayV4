@@ -101,8 +101,8 @@ def measure(path):
         entry["right_axis_in_mesh_space"] = rnd(f["right"], 3)
         entry["left_right_pairs"] = f["found_pairs"]
         pose = skel.component_pose(skel.ref_local)
-        lefts = [n for n in skel.names if "hand" in n.lower() and mirror_name(n) in skel.index]
-        hands = [lefts[0], mirror_name(lefts[0])] if lefts else []
+        lefts = [n for n in skel.names if "hand" in n.lower() and twin(n) in skel.index]
+        hands = [lefts[0], twin(lefts[0])] if lefts else []
         entry["hand_sides"] = dict((n, side(f, pose[n][0])) for n in hands)
     if isinstance(a, unreal.AnimSequence):
         entry["length_s"] = anim_length(a)

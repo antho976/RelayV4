@@ -184,6 +184,22 @@ impl Output {
     }
 }
 
+static PLUGIN_INSTANCE: OnceLock<Instance> = OnceLock::new();
+
+/// The engine instance a plugin server's `relay --instance …` names; its guardrail is the one
+/// that counts for this session.
+pub(crate) fn use_instance(instance: Instance) {
+    let _ = PLUGIN_INSTANCE.set(instance);
+}
+
+fn plugin_instance() -> Result<Instance> {
+    if let Some(instance) = PLUGIN_INSTANCE.get() {
+        return Ok(*instance);
+    }
+    let instance = std::env::var("RELAY_INSTANCE").unwrap_or_else(|_| "stable".into());
+    Instance::parse(&instance).ok_or_else(|| anyhow::anyhow!("bad RELAY_INSTANCE {instance:?}"))
+}
+
 /// Plugin tools that run agent-supplied code (`blender_python`, `ue_python`, `ue_console`, …)
 /// meet `guardrail.gate` before they run, as a Bash call does through the PreToolUse hook
 /// (RA-077): an `exec` gate naming the tool, so a denied-command rule such as `blender_python`
@@ -206,8 +222,7 @@ pub(crate) fn plugin_gate(tool: &str, file: Option<&Path>, writes: &[&Path]) -> 
         // Unit tests run inside agent sessions; they must not reach the live engine.
         return Ok(());
     }
-    let instance = std::env::var("RELAY_INSTANCE").unwrap_or_else(|_| "stable".into());
-    let instance = Instance::parse(&instance).ok_or_else(|| anyhow::anyhow!("bad RELAY_INSTANCE {instance:?}"))?;
+    let instance = plugin_instance()?;
     let (actor, token) = crate::actor_from_env(None)?;
     // These servers are synchronous; the bus client is not. A thread of its own keeps the
     // short-lived runtime clear of any runtime the caller may already be inside.
@@ -222,6 +237,28 @@ pub(crate) fn plugin_gate(tool: &str, file: Option<&Path>, writes: &[&Path]) -> 
         Ok(Some(error)) => anyhow::bail!("RELAY blocked {tool}: {}", crate::refusal_text(error.as_ref())),
         Err(error) => anyhow::bail!("RELAY guardrail unavailable, so {tool} was not run: {error:#}"),
     }
+}
+
+/// The folders this session may write to, as the guardrail reckons them (`bus.whoami`'s
+/// `write_roots`: the worktree first, then scratch and memory roots and configured extras).
+/// The Blender sandbox lets a child write there and nowhere else.
+pub(crate) fn session_write_roots() -> Result<Vec<std::path::PathBuf>> {
+    let instance = plugin_instance()?;
+    let (actor, token) = crate::actor_from_env(None)?;
+    let query = async {
+        let mut client = connect(instance).await?;
+        let mut request = Request::new(actor, "bus.whoami", json!({}));
+        if let Some(token) = token { request = request.with_token(token); }
+        let response = client.call(&request, |_| {}).await?;
+        response.into_result().map_err(|error| anyhow::anyhow!("{}: {}", error.code, error.message))
+    };
+    let result = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            tokio::runtime::Builder::new_current_thread().enable_all().build()?
+                .block_on(async { tokio::time::timeout(crate::GATE_DEADLINE, query).await.map_err(|_| anyhow::anyhow!("bus.whoami did not answer"))? })
+        }).join()
+    }).map_err(|_| anyhow::anyhow!("bus.whoami panicked"))??;
+    Ok(result["write_roots"].as_array().into_iter().flatten().filter_map(Value::as_str).map(std::path::PathBuf::from).collect())
 }
 
 fn plugin_gate_payloads(session: &str, root: Option<&Path>, tool: &str, file: Option<&Path>, writes: &[&Path]) -> Result<Vec<Value>> {

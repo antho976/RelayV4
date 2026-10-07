@@ -166,7 +166,7 @@ emit({
     "frame": {
         "note": "Positions are [forward, right, up] in cm from the character's centre at ground level, derived from the skeleton's left/right bone pairs. right > 0 is the character's right hand side.",
         "right_axis_in_mesh_space": rnd(frame["right"], 3), "forward_axis_in_mesh_space": rnd(frame["forward"], 3),
-        "left_right_pairs_found": frame["found_pairs"], "sample_pairs": frame["pairs"],
+        "left_right_pairs_found": frame["found_pairs"], "sample_pairs": frame["pairs"][:6],
     },
     "attachments": attach_sides,
     "problems": result["problems"],

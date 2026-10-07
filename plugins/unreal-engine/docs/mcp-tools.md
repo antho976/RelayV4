@@ -67,6 +67,11 @@ Runs the code as a file through `PythonScriptLibrary.ExecutePythonCommandEx`. Re
 printed `output` (warnings and errors are prefixed with their type) and the command `result`.
 A Python exception is a tool error carrying the traceback.
 
+Inside a Relay session, `ue_python`, `ue_console`, `ue_call`, `ue_play` and `ue_profile` first pass
+Relay's guardrail (`guardrail.gate`), so deny rules and holds apply and every call is audited.
+The code itself is not sandboxed: it runs inside your open editor with all of the editor's access.
+Cancelling a call only drops its answer; Unreal cannot interrupt Python that is already running.
+
 ### `ue_call` — `{ object_path, function, parameters?, transaction? }`
 `PUT /remote/object/call`. For a static `BlueprintCallable` function, call it on the class default
 object: `/Script/<Module>.Default__<Class>`, e.g.

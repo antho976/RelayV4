@@ -9,10 +9,12 @@ import unreal
 
 
 def inspect(args):
-    # The bundle unreal.rs sends: arguments, common.py, the shared anim_rules.py, the script.
-    code = "ARGS_JSON = %s\n%s\n%s\n%s" % (json.dumps(json.dumps(args)),
-                                           open(os.path.join(SRC, "common.py")).read(),
-                                           open(os.path.join(os.path.dirname(SRC), "anim_rules.py")).read(),
+    # The bundle unreal.rs sends: arguments, common.py with the shared rig_frame.py, the shared
+    # anim_rules.py, the script.
+    shared = lambda name: open(os.path.join(os.path.dirname(SRC), name)).read()
+    code = "ARGS_JSON = %s\n%s\n%s\n%s\n%s" % (json.dumps(json.dumps(args)),
+                                               open(os.path.join(SRC, "common.py")).read(), shared("rig_frame.py"),
+                                               shared("anim_rules.py"),
                                            open(os.path.join(SRC, "anim_inspect.py")).read())
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
@@ -109,6 +111,14 @@ del unreal.BONES[-2:]
 grounds = [p["time"] for p in sunk["problems"] if p["kind"] == "ground"]
 check(grounds == [1.0], "a foot 5 cm into the floor is reported, 1 cm is not: %s" % sunk["problems"])
 check(sunk["samples"][0]["feet_height"] == {"foot_l": 0.0, "foot_r": 0.0}, "planted feet read 0: %s" % sunk["samples"][0])
+
+# The left/right naming is Blender's too: a rig named hand-L/hand-R gets its pairs and facing.
+dashed = [(n.replace("_l", "-L").replace("_r", "-R"), p and p.replace("_l", "-L").replace("_r", "-R"), loc) for n, p, loc in unreal.BONES]
+real_bones = unreal.BONES[:]
+unreal.BONES[:] = dashed
+named = inspect({"mesh": "/Game/Manny"})
+unreal.BONES[:] = real_bones
+check(named["frame"]["left_right_pairs_found"] == 6 and named["frame"]["right_axis_in_mesh_space"] == [-1.0, 0.0, 0.0], "-L/-R pairs: %s" % named["frame"])
 
 # A socket from a Blender empty: its 100x scale is divided back once, and only once.
 helpers = {"ARGS_JSON": "{}"}
