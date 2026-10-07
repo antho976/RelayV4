@@ -43,6 +43,8 @@ pub struct Draft {
     pub busy: Rc<Cell<bool>>,
     unsent_message: Cell<bool>,
     pub snapshot: Rc<dyn Fn() -> Value>,
+    /// The form as it was opened, then as last saved: Save sends only what differs from it.
+    initial: RefCell<Value>,
     pub on_close: RefCell<Option<Box<dyn Fn()>>>,
 }
 impl Draft {
@@ -101,6 +103,7 @@ impl Draft {
             base: Rc::new(RefCell::new(base)),
             busy: Rc::new(Cell::new(false)),
             unsent_message: Cell::new(false),
+            initial: RefCell::new(snapshot()),
             snapshot,
             on_close: RefCell::new(None),
         });
@@ -180,7 +183,6 @@ impl Draft {
     pub fn controls(
         self: &Rc<Self>,
         ui: &Rc<Ui>,
-        get: &'static str,
         update: &'static str,
         id_key: &'static str,
         id: i64,
@@ -205,29 +207,38 @@ impl Draft {
         let d = self.clone();
         let weak = Rc::downgrade(ui);
         save.connect_clicked(move |_| {
-            let Some(ui) = weak.upgrade() else { return }; if d.busy.replace(true) { return; }
-            let next = (d.snapshot)(); let d = d.clone(); d.form.set_sensitive(false); d.footer.set_sensitive(false); d.status.set_text("Saving…");
+            let Some(ui) = weak.upgrade() else { return }; if d.busy.get() { return; }
+            // Send and check only the edited fields. The engine moves a task's state, and an
+            // agent writes its changelog, while the form is open; neither conflicts with an edit
+            // elsewhere, and the engine's own check of `expected` is the atomic one.
+            let next = (d.snapshot)();
+            let initial = d.initial.borrow().clone();
+            let keys: Vec<String> = next.as_object().map(|m| m.iter().filter(|(k, v)| initial[k.as_str()] != **v).map(|(k, _)| k.clone()).collect()).unwrap_or_default();
+            if keys.is_empty() { d.status.set_text("Nothing to save"); return; }
+            d.busy.set(true); let d = d.clone(); d.form.set_sensitive(false); d.footer.set_sensitive(false); d.status.set_text("Saving…");
             glib::spawn_future_local(async move {
-                match ui.call(get, json!({id_key:id})).await {
-                    Ok(latest) => {
-                        let base = d.base.borrow().clone();
-                        let keys: Vec<String> = next.as_object().unwrap().keys().cloned().collect();
-                        if draft_conflicts(&base, &latest, &keys) {
-                            d.status.set_text("This item changed elsewhere. Your draft is preserved. Copy it before discarding and reopening the latest version.");
-                        } else {
-                            let expected: serde_json::Map<String,Value> = keys.iter().map(|k|(k.clone(),base[k].clone())).collect();
-                            let mut payload = next; payload[id_key] = json!(id); payload["expected"] = Value::Object(expected);
-                            match ui.call(update, payload).await { Ok(v) => { *d.base.borrow_mut() = v; d.status.set_text("Saved"); ui.refresh_page(); }, Err(e) => d.status.set_text(&e.to_string()) }
-                        }
-                    }, Err(e) => d.status.set_text(&e.to_string())
+                let base = d.base.borrow().clone();
+                let mut payload = json!({id_key: id});
+                let mut expected = serde_json::Map::new();
+                for k in &keys { payload[k.as_str()] = next[k.as_str()].clone(); expected.insert(k.clone(), base[k.as_str()].clone()); }
+                payload["expected"] = Value::Object(expected);
+                match ui.call(update, payload).await {
+                    Ok(v) => { *d.base.borrow_mut() = v; *d.initial.borrow_mut() = next; d.status.set_text("Saved"); ui.refresh_page(); }
+                    Err(crate::client::Error::Bus(e)) if e.code.ends_with(".edit_conflict") => d.status.set_text("This item changed elsewhere. Your draft is preserved. Copy it before discarding and reopening the latest version."),
+                    Err(e) => d.status.set_text(&e.to_string()),
                 }
                 d.busy.set(false); d.form.set_sensitive(true); d.footer.set_sensitive(true);
             });
         });
+        // Weak: the controller lives on the layout, and a strong Save here would keep the
+        // Draft, its panel and its widgets alive after the panel closes.
+        let save = save.downgrade();
         let key = gtk::EventControllerKey::new();
         key.connect_key_pressed(move |_, key, _, modifiers| {
             if key == gtk::gdk::Key::s && modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK) {
-                save.emit_clicked();
+                if let Some(save) = save.upgrade() {
+                    save.emit_clicked();
+                }
                 glib::Propagation::Stop
             } else {
                 glib::Propagation::Proceed
@@ -616,7 +627,7 @@ fn detail(ui: &Rc<Ui>, task: Value, modules: Vec<Value>, tasks: Vec<Value>) {
         move || json!({"title":title.text().trim(),"body":buffer_text(&body.buffer()),"changelog":buffer_text(&changelog.buffer()),"priority":chosen(&priority),"state":chosen(&state),"type":chosen(&kind),"size":if chosen(&size).is_empty(){Value::Null}else{json!(chosen(&size))},"module_id":chosen(&module).parse::<i64>().ok()}),
     );
     let d = Draft::new(ui, &format!("Task #{id}"), task.clone(), snapshot, form);
-    d.controls(ui, "task.get", "task.update", "task_id", id);
+    d.controls(ui, "task.update", "task_id", id);
     let transitions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     transitions.append(&label(
         &format!("{} · {}", text(&task, "column"), text(&task, "state")),
@@ -1208,26 +1219,5 @@ pub fn action(
         None => {
             key.connect_clicked(act);
         }
-    }
-}
-
-fn draft_conflicts(base: &Value, latest: &Value, fields: &[String]) -> bool {
-    latest["deleted_at"].is_string() || fields.iter().any(|key| latest[key] != base[key])
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn edited_fields_and_deleted_records_conflict_but_unrelated_activity_does_not() {
-        let base = json!({"title":"Original","body":"Text","column":"ready","deleted_at":null});
-        let fields = vec!["title".into(), "body".into()];
-        let mut latest = base.clone();
-        latest["column"] = json!("active");
-        assert!(!draft_conflicts(&base, &latest, &fields));
-        latest["body"] = json!("Agent edit");
-        assert!(draft_conflicts(&base, &latest, &fields));
-        latest = base.clone();
-        latest["deleted_at"] = json!("2026-09-04");
-        assert!(draft_conflicts(&base, &latest, &fields));
     }
 }

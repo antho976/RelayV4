@@ -169,6 +169,11 @@ pub fn refresh_notes(ui: &Rc<Ui>) {
     let Some(window) = ui.notes_window.borrow().clone() else {
         return;
     };
+    // Nobody reads a hidden library, and every main-window refresh and notes event lands
+    // here; showing the window (show_project) refreshes it.
+    if !window.window.is_visible() {
+        return;
+    }
     if window.project.get() == 0 {
         window.project.set(ui.project.get());
     }
@@ -185,39 +190,58 @@ pub fn refresh_notes(ui: &Rc<Ui>) {
             window.loading.set(false);
             return;
         };
-        if !window.restored.replace(true) {
-            if let Ok(value) = ui
+        if !window.restored.get() {
+            match ui
                 .call("settings.get", json!({"path":"native.notes.window"}))
                 .await
             {
-                if let Some(width) = value["value"]["rail_width"].as_i64() {
-                    window.rail_width.set(width.clamp(180, 600) as i32);
+                Ok(value) => {
+                    if let Some(width) = value["value"]["rail_width"].as_i64() {
+                        window.rail_width.set(width.clamp(180, 600) as i32);
+                    }
+                    window
+                        .rail_collapsed
+                        .set(value["value"]["rail_collapsed"].as_bool().unwrap_or(false));
+                    super::note_pages::restore_state(&ui, &value["value"]);
+                    window.restored.set(true);
+                    window.loaded.set(true);
+                    if window.persist_wanted.replace(false) {
+                        window.persist(&ui);
+                    }
                 }
-                window
-                    .rail_collapsed
-                    .set(value["value"]["rail_collapsed"].as_bool().unwrap_or(false));
-                super::note_pages::restore_state(&ui, &value["value"]);
-            }
-            window.loaded.set(true);
-            if window.persist_wanted.replace(false) {
-                window.persist(&ui);
+                // The first render persists the window, so it waits for the saved settings:
+                // rendering on defaults would overwrite them. The next refresh reads again.
+                Err(error) => {
+                    window.pending.set(false);
+                    window.loading.set(false);
+                    super::note_pages::load_error(&ui, &format!("Could not open Notes: {error}"));
+                    return;
+                }
             }
         }
         while window.pending.replace(false) {
             let project = window.project.get();
+            if project == 0 {
+                break;
+            }
             match ui.call("notes.list", json!({"project_id":project})).await {
                 Ok(value) if project == window.project.get() => {
                     super::note_pages::workspace(&ui, "notes", project, &rows(&value, "notes"))
                 }
                 Ok(_) => window.pending.set(true),
-                Err(error) => {
-                    if window.rendered_project.get() == 0 {
-                        clear(&ui.pages["notes"]);
-                        ui.pages["notes"].append(&label(&error.to_string(), "error"));
-                    } else {
-                        ui.show_error(&error.to_string());
+                // The project was removed. Show the main window's project if that one still
+                // exists, else an empty library; never ask for the removed one again.
+                Err(crate::client::Error::Bus(error)) if error.code == "project.not_found" => {
+                    if project == window.project.get() {
+                        let fallback = ui.project.get();
+                        let alive = fallback != project
+                            && ui.projects.borrow().iter().any(|p| p["id"].as_i64() == Some(fallback));
+                        window.project.set(if alive { fallback } else { 0 });
+                        super::note_pages::project_gone(&ui, project);
                     }
+                    window.pending.set(true);
                 }
+                Err(error) => super::note_pages::load_error(&ui, &error.to_string()),
             }
         }
         window.loading.set(false);

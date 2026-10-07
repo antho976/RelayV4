@@ -7,7 +7,7 @@ use super::*;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const PROVIDERS: [(&str, &str); 2] = [("claude", "Claude"), ("codex", "Codex")];
-/// Minutes; 0 leaves refreshes to engine events and the refresh keys.
+/// Minutes; 0 leaves refreshes to finished turns, engine events and the refresh keys.
 const INTERVALS: [(u64, &str); 6] = [(0, "Off"), (1, "1m"), (5, "5m"), (15, "15m"), (30, "30m"), (60, "1h")];
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -171,7 +171,7 @@ fn interval(prefs: &Value) -> u64 {
 
 fn interval_text(minutes: u64) -> String {
     match minutes {
-        0 => "refreshes on new reports and on demand".into(),
+        0 => "refreshes when an agent finishes a turn and on demand".into(),
         60 => "refreshes every hour".into(),
         m => format!("refreshes every {m} min"),
     }
@@ -227,6 +227,9 @@ pub(crate) struct UsageState {
     busy: Cell<bool>,
     queued: Cell<Option<bool>>,
     stale_windows: Cell<usize>,
+    /// Idle sessions as (name, updated_at) at the last clock tick: a new pair is a finished
+    /// turn, after which the providers have saved fresh limits.
+    turns: RefCell<Option<std::collections::HashSet<(String, String)>>>,
     timer: RefCell<Option<glib::SourceId>>,
     popup: RefCell<Option<Popup>>,
 }
@@ -255,6 +258,7 @@ impl UsageState {
             busy: Cell::new(false),
             queued: Cell::new(None),
             stale_windows: Cell::new(0),
+            turns: RefCell::default(),
             timer: RefCell::default(),
             popup: RefCell::default(),
         }
@@ -287,7 +291,8 @@ impl UsageState {
 
 impl Ui {
     /// Wires the strip's refresh key and the clock that keeps its "updated" label honest.
-    /// The clock only rewrites labels; it never calls the engine.
+    /// The clock rewrites labels, and re-reads usage only after an agent finished a turn:
+    /// nothing reports usage to the engine, so that is when the saved limits move.
     pub(crate) fn install_usage(self: &Rc<Self>) {
         let weak = Rc::downgrade(self);
         self.usage.refresh.connect_clicked(move |_| {
@@ -300,6 +305,9 @@ impl Ui {
             let Some(ui) = weak.upgrade() else {
                 return glib::ControlFlow::Break;
             };
+            if ui.usage_turn_ended() {
+                ui.refresh_usage(false);
+            }
             let stale = ui.stale_count();
             if stale != ui.usage.stale_windows.get() {
                 ui.render_usage();
@@ -423,6 +431,24 @@ impl Ui {
                 ui.reload_usage_prefs();
             }
         });
+    }
+
+    /// Whether a session went idle since the last tick. The first tick only takes stock: the
+    /// connection's own refresh already read usage.
+    fn usage_turn_ended(&self) -> bool {
+        if !self.connected.get() {
+            self.usage.turns.borrow_mut().take();
+            return false;
+        }
+        let idle: std::collections::HashSet<(String, String)> = self
+            .sidebar_sessions
+            .borrow()
+            .iter()
+            .filter(|s| text(s, "state") == "idle")
+            .map(|s| (text(s, "name").to_string(), text(s, "updated_at").to_string()))
+            .collect();
+        let before = self.usage.turns.replace(Some(idle.clone()));
+        before.is_some_and(|before| !idle.is_subset(&before))
     }
 
     fn stale_count(&self) -> usize {
@@ -723,7 +749,7 @@ impl Ui {
         row.add_css_class("usage-option-row");
         let title = label("Auto refresh", "usage-option-name");
         title.set_hexpand(true);
-        title.set_tooltip_text(Some("Re-read the saved limits on a timer. Off still refreshes on new reports."));
+        title.set_tooltip_text(Some("Re-read the saved limits on a timer. Off still refreshes when an agent finishes a turn."));
         row.append(&title);
         let choices = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         choices.add_css_class("linked");

@@ -28,6 +28,8 @@ struct Sidebar {
     /// The first project the filter matches, opened by Enter.
     first_match: Option<i64>,
     filter: Option<gtk::SearchEntry>,
+    /// Hash of what the tree last rendered; `None` forces the next render to rebuild.
+    rendered: Option<u64>,
 }
 
 thread_local! {
@@ -123,17 +125,23 @@ impl Ui {
         }
         let (collapsed, expanded) = sidebar(|s| (s.collapsed.clone(), s.expanded.clone()));
         let sessions = self.sidebar_sessions.borrow().clone();
-        // Only registry, session state, folding or filter changes rebuild the tree.
-        let signature = format!(
-            "{active}:{}:{}:{:?}:{collapsed:?}:{expanded:?}:{query}",
-            serde_json::to_string(&projects).unwrap_or_default(),
-            serde_json::to_string(&workspaces).unwrap_or_default(),
-            sessions.iter().map(|s| (s["project_id"].as_i64(), text(s, "state").to_owned())).collect::<Vec<_>>()
-        );
-        if self.projects_box.widget_name() == signature {
+        // Only registry, lamp, folding or filter changes rebuild the tree: an agent going
+        // idle in a project that still has one running leaves its lamp, and the tree, as is.
+        let signature = {
+            use std::hash::{Hash, Hasher};
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            (active, &collapsed, &expanded, &query).hash(&mut hash);
+            serde_json::to_string(&projects).unwrap_or_default().hash(&mut hash);
+            serde_json::to_string(&workspaces).unwrap_or_default().hash(&mut hash);
+            for project in &projects {
+                let agents = agents_in(&sessions, &[id_of(project)]);
+                (agents.open, agents.held, agents.running).hash(&mut hash);
+            }
+            hash.finish()
+        };
+        if sidebar(|s| s.rendered.replace(signature)) == Some(signature) {
             return;
         }
-        self.projects_box.set_widget_name(&signature);
         clear(&self.projects_box);
         let mut first_match = None;
         for workspace in &workspaces {
@@ -234,7 +242,7 @@ impl Ui {
                     s.loaded = true;
                     s.loading = false;
                 });
-                ui.projects_box.set_widget_name("");
+                sidebar(|s| s.rendered = None);
                 ui.render_projects();
             });
         }
@@ -695,7 +703,7 @@ impl Ui {
                 }
             }
         }
-        self.projects_box.set_widget_name("");
+        sidebar(|s| s.rendered = None);
         self.refresh();
     }
 

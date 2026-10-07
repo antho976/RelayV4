@@ -115,8 +115,38 @@ fn sync_counts(ahead: Option<i64>, behind: Option<i64>) -> Option<gtk::Box> {
     Some(counts)
 }
 
+/// Rows drawn per change group or commit; the rest is one "more files" line.
+const CHANGE_ROWS: usize = 500;
+const UNRESOLVED: &str = "Resolve the merge conflicts and mark them resolved before committing";
+
+fn more_files(total: usize) -> Option<gtk::Label> {
+    let hidden = total.checked_sub(CHANGE_ROWS).filter(|n| *n > 0)?;
+    let more = label(
+        &format!("{hidden} more file{} not listed", if hidden == 1 { "" } else { "s" }),
+        "dim",
+    );
+    more.set_xalign(0.);
+    more.set_margin_start(12);
+    more.set_margin_top(4);
+    more.set_margin_bottom(4);
+    Some(more)
+}
+
+/// Whether a file still holds a `<<<<<<<` … `>>>>>>>` block, as git writes for a conflict.
+fn has_conflict_markers(content: &str) -> bool {
+    let mut open = false;
+    for line in content.lines() {
+        if line.starts_with("<<<<<<< ") || line == "<<<<<<<" {
+            open = true;
+        } else if open && (line.starts_with(">>>>>>> ") || line == ">>>>>>>") {
+            return true;
+        }
+    }
+    false
+}
+
 fn is_conflict(file: &Value) -> bool {
-    text(file, "index") == "U" || text(file, "worktree") == "U"
+    project_files::is_unmerged(file)
 }
 fn is_staged(file: &Value) -> bool {
     !matches!(text(file, "index").trim(), "" | "?" | "!")
@@ -400,7 +430,9 @@ impl Editor {
                     {
                         if let (Some(ui), Some(editor)) = (weak.upgrade(), editor.upgrade()) {
                             let message = commit_text(&editor.commit_message).trim().to_string();
-                            if !message.is_empty() {
+                            if editor.git.has_css_class("has-conflicts") {
+                                ui.show_error(UNRESOLVED);
+                            } else if !message.is_empty() {
                                 // Like VS Code's smart commit: staged changes if any, else all.
                                 let all = !editor.git.has_css_class("has-staged");
                                 editor.git_action(
@@ -421,6 +453,14 @@ impl Editor {
                 e.git.remove_css_class("has-staged");
             } else {
                 e.git.add_css_class("has-staged");
+            }
+            // `all` stages with `git add -A`, which would record the conflict markers as resolved;
+            // git itself refuses a commit while the index is unmerged. Resolve first.
+            let resolving = !conflicts.is_empty();
+            if resolving {
+                e.git.add_css_class("has-conflicts");
+            } else {
+                e.git.remove_css_class("has-conflicts");
             }
             detach(&message);
             message.set_wrap_mode(gtk::WrapMode::WordChar);
@@ -469,8 +509,10 @@ impl Editor {
             commit.set_widget_name("git-commit");
             commit.add_css_class("scm-commit-key");
             commit.set_hexpand(true);
-            commit.set_sensitive(!files.is_empty());
-            commit.set_tooltip_text(Some(if smart_all {
+            commit.set_sensitive(!files.is_empty() && !resolving);
+            commit.set_tooltip_text(Some(if resolving {
+                UNRESOLVED
+            } else if smart_all {
                 "Nothing is staged, so every change is committed"
             } else {
                 "Commit the staged changes · Ctrl Enter"
@@ -479,7 +521,7 @@ impl Editor {
             commit_more.add_css_class("scm-commit-more");
             commit_more.set_tooltip_text(Some("More commit options"));
             commit_more.set_child(Some(&crate::icons::image("chevron-down", 12)));
-            commit_more.set_sensitive(!files.is_empty());
+            commit_more.set_sensitive(!files.is_empty() && !resolving);
             let more = gtk::Popover::new();
             more.add_css_class("scm-menu");
             more.set_has_arrow(false);
@@ -606,14 +648,23 @@ impl Editor {
                 all.set_widget_name(&format!("git-{id}-all"));
                 let ed = e.clone();
                 let weak = Rc::downgrade(&ui);
+                let resolve = id == "conflicts";
                 all.connect_clicked(move |_| {
                     if let Some(ui) = weak.upgrade() {
-                        ed.git_action(&ui, op, json!({"paths":paths}), None);
+                        if resolve {
+                            ed.mark_resolved(&ui, paths.clone());
+                        } else {
+                            ed.git_action(&ui, op, json!({"paths":paths}), None);
+                        }
                     }
                 });
                 group_section.actions.append(&all);
-                for file in group {
+                // Each row is several widgets; an un-ignored build directory would be thousands.
+                for file in group.iter().take(CHANGE_ROWS) {
                     group_section.body.append(&e.change_row(&ui, file, staged_group));
+                }
+                if let Some(more) = more_files(group.len()) {
+                    group_section.body.append(&more);
                 }
                 upper.append(&group_section.root);
             }
@@ -1072,9 +1123,23 @@ impl Editor {
         let ed = self.clone();
         let weak = Rc::downgrade(ui);
         let diff_path = path.clone();
+        // git.diff.file compares HEAD with the working tree only; say when that is not the
+        // change this row lists, until it can diff the index and a rename's old path.
+        let caveat = if let Some(from) = file["renamed_from"].as_str() {
+            Some(format!("The diff compares {path} with HEAD, not with {from}, so it shows as new."))
+        } else if staged && is_unstaged(file) {
+            Some(format!("The diff of {path} also shows edits that are not staged."))
+        } else {
+            None
+        };
         open.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
+                // open_diff refuses a dirty buffer and shows an image instead; keep its message.
+                let text_diff = !ed.is_dirty() && !super::image_preview::is_image(&diff_path);
                 ed.open_diff(&ui, diff_path.clone());
+                if let Some(caveat) = caveat.as_deref().filter(|_| text_diff) {
+                    ui.show_error(caveat);
+                }
             }
         });
         self.bind_image_hover(ui, &open, &path, format!("{code}:{}", self.git_revision.get()));
@@ -1091,9 +1156,14 @@ impl Editor {
         action.set_valign(gtk::Align::Center);
         let ed = self.clone();
         let weak = Rc::downgrade(ui);
+        let resolve = !staged && code == "U";
         action.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
-                ed.git_action(&ui, op, json!({"paths":[path]}), None);
+                if resolve {
+                    ed.mark_resolved(&ui, vec![path.clone()]);
+                } else {
+                    ed.git_action(&ui, op, json!({"paths":[path]}), None);
+                }
             }
         });
         row.append(&action);
@@ -1497,6 +1567,46 @@ impl Editor {
             }
         });
     }
+    /// Stage conflicted files as resolved, asking first when one still holds conflict markers.
+    fn mark_resolved(self: &Rc<Self>, ui: &Rc<Ui>, paths: Vec<String>) {
+        if self.git_busy.get() {
+            return;
+        }
+        let project = ui.project.get();
+        let worktree = self.worktree.borrow().clone();
+        let e = self.clone();
+        let ui = ui.clone();
+        glib::spawn_future_local(async move {
+            let mut marked = Vec::new();
+            for path in &paths {
+                // A side that deleted the file, or a binary one, has no text to check.
+                let read = ui
+                    .call(
+                        "file.read",
+                        json!({"project_id":project,"worktree":optional_scope(&worktree),"path":path,"max_bytes":1048576}),
+                    )
+                    .await;
+                if read.is_ok_and(|v| v["text"].as_str().is_some_and(has_conflict_markers)) {
+                    marked.push(path.as_str());
+                }
+            }
+            if !e.matches(&ui, project, &worktree) {
+                return;
+            }
+            if !marked.is_empty() {
+                let copy = format!(
+                    "These files still contain conflict markers (<<<<<<< … >>>>>>>). Marking them resolved stages the markers, and the next commit records them.\n\n{}",
+                    marked.join("\n")
+                );
+                if !confirm(&ui, "Mark as resolved with conflict markers?", &copy).await
+                    || !e.matches(&ui, project, &worktree)
+                {
+                    return;
+                }
+            }
+            e.git_action(&ui, "git.stage", json!({"paths":paths}), None);
+        });
+    }
     fn open_diff(self: &Rc<Self>, ui: &Rc<Ui>, path: String) {
         if self.is_dirty() {
             ui.show_error("Save or discard your edits before opening a diff.");
@@ -1658,7 +1768,7 @@ impl Editor {
                     dialog.body.append(&heading);
                     let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
                     list.add_css_class("commit-files");
-                    for file in &files {
+                    for file in files.iter().take(CHANGE_ROWS) {
                         let path = text(file, "path");
                         let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
                         row.add_css_class("commit-file");
@@ -1698,6 +1808,9 @@ impl Editor {
                         }
                         row.set_tooltip_text(Some(path));
                         list.append(&row);
+                    }
+                    if let Some(more) = more_files(files.len()) {
+                        list.append(&more);
                     }
                     dialog.body.append(&list);
                     dialog.present();
@@ -1957,7 +2070,7 @@ fn change_summary(files: &[Value]) -> String {
     let mut groups: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
     for file in files {
         let statuses = format!("{}{}", text(file, "index"), text(file, "worktree"));
-        let category = if statuses.contains('U') {
+        let category = if is_conflict(file) {
             "Conflicted"
         } else if statuses.contains('R') {
             "Renamed"
@@ -2190,6 +2303,16 @@ mod graph_tests {
         assert!(is_staged(&partial) && is_unstaged(&partial));
         assert!(!is_staged(&untracked) && is_unstaged(&untracked));
         assert!(is_conflict(&conflict));
+        // Both added and both deleted are unmerged too; a lone add or delete is not.
+        assert!(is_conflict(&json!({"path":"d.rs","index":"A","worktree":"A"})));
+        assert!(is_conflict(&json!({"path":"e.rs","index":"D","worktree":"D"})));
+        assert!(!is_conflict(&json!({"path":"f.rs","index":"A","worktree":"M"})));
+        assert!(!is_conflict(&json!({"path":"g.rs","index":"D","worktree":""})));
+        assert!(change_summary(&[json!({"path":"d.rs","index":"A","worktree":"A"})]).starts_with("Conflicted 1"));
+        assert!(has_conflict_markers("a\n<<<<<<< HEAD\nb\n=======\nc\n>>>>>>> theirs\nd\n"));
+        // A Markdown underline, or a lone marker, is not a conflict.
+        assert!(!has_conflict_markers("Title\n=======\n"));
+        assert!(!has_conflict_markers(">>>>>>> quoted\n<<<<<<< later\n"));
         assert_eq!(project_files::status_letter("?").map(|s| s.0), Some("U"));
         assert_eq!(project_files::file_glyph("src/main.rs"), ("file-rust", "ft-rust"));
         assert_eq!(project_files::file_glyph("Cargo.lock").0, "file-lock");

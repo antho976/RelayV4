@@ -1,4 +1,4 @@
-use super::{action, current, paragraph, section};
+use super::{current, paragraph, section};
 use crate::app::{button, clear, field, label, rows, text, Ui};
 use gtk::prelude::*;
 use gtk4 as gtk;
@@ -10,6 +10,8 @@ pub(crate) struct WallpaperDraft {
     state: Rc<RefCell<Value>>,
     saved: Rc<RefCell<Value>>,
     gallery: glib::WeakRef<gtk::Box>,
+    /// The saved wallpaper changed while the gallery was hidden: redraw it on the way back.
+    stale: std::cell::Cell<bool>,
 }
 
 pub(crate) fn sync_wallpaper(ui: &Rc<Ui>, image: &Value) {
@@ -25,23 +27,103 @@ pub(crate) fn sync_wallpaper(ui: &Rc<Ui>, image: &Value) {
     if !dirty {
         draft.state.borrow_mut()["wallpaper"] = image.clone();
         if let Some(gallery) = draft.gallery.upgrade() {
-            render_wallpapers(ui, &gallery, &draft.state);
+            // Hidden, the gallery waits for Settings to show again instead of redrawing.
+            if gallery.is_mapped() {
+                render_wallpapers(ui, &gallery, &draft.state);
+            } else {
+                draft.stale.set(true);
+            }
         }
     }
 }
 
+/// What the page's controls held when it was built or last saved: Save sends only what
+/// differs, so it neither reverts a value changed elsewhere nor re-clamps one it never showed.
+#[derive(PartialEq)]
+struct Snapshot {
+    settings: std::collections::BTreeMap<String, Value>,
+    notifications: Value,
+}
+
+fn snapshot(page: &gtk::Widget) -> Result<Snapshot, String> {
+    let mut settings = Vec::new();
+    let mut notifications = json!({"categories":{}});
+    let mut guardrails = json!({"caps":{},"destructive_write":{}});
+    collect_settings(page, &mut settings, &mut notifications, &mut guardrails)?;
+    let settings = settings
+        .into_iter()
+        .filter_map(|(_, payload)| Some((payload["path"].as_str()?.to_string(), payload["value"].clone())))
+        .collect();
+    Ok(Snapshot { settings, notifications })
+}
+
+/// The mounted page. It is built once per connection, not per project: nothing on it is per
+/// project, and rebuilding it on a project switch threw unsaved edits away.
+struct Mounted {
+    page: glib::WeakRef<gtk::Box>,
+    baseline: Rc<RefCell<Option<Snapshot>>>,
+    providers: glib::WeakRef<gtk::Box>,
+    detected: RefCell<Value>,
+}
+
+thread_local! {
+    static MOUNTED: RefCell<Option<Rc<Mounted>>> = const { RefCell::new(None) };
+}
+
+impl Mounted {
+    /// Whether a control or the wallpaper draft differs from what was loaded or saved.
+    fn dirty(&self, ui: &Ui) -> bool {
+        let wallpaper = ui.wallpaper_draft.borrow().as_ref().is_some_and(|draft| *draft.state.borrow() != *draft.saved.borrow());
+        let controls = match (self.page.upgrade(), self.baseline.borrow().as_ref()) {
+            (Some(page), Some(baseline)) => snapshot(page.upcast_ref()).ok().as_ref() != Some(baseline),
+            _ => false,
+        };
+        wallpaper || controls
+    }
+
+    /// Redraws the provider cards when `provider.list` or `provider.refresh` says something new.
+    fn show_providers(&self, detected: &Value) {
+        let Some(parent) = self.providers.upgrade() else {
+            return;
+        };
+        if *self.detected.borrow() == *detected && parent.first_child().is_some() {
+            return;
+        }
+        *self.detected.borrow_mut() = detected.clone();
+        clear(&parent);
+        providers(&parent, detected);
+    }
+}
+
 pub async fn refresh(ui: &Rc<Ui>, project: i64) {
-    if ui.page_projects.borrow().get("settings") == Some(&project) {
+    let generation = ui.generation.get();
+    let mounted = MOUNTED.with(|m| m.borrow().clone()).filter(|m| m.page.upgrade().is_some());
+    let built = ui.page_projects.borrow().get("settings").copied();
+    if let Some(mounted) = mounted.filter(|m| built == Some(generation as i64) || (built.is_some() && m.dirty(ui))) {
+        // Keep the form, and any edits in it, across project switches and a reconnect; only
+        // re-read the providers, which change behind the page (an install, an update).
+        ui.page_projects.borrow_mut().insert("settings".into(), generation as i64);
+        if let Some(draft) = ui.wallpaper_draft.borrow().as_ref() {
+            if draft.stale.replace(false) {
+                if let Some(gallery) = draft.gallery.upgrade() {
+                    render_wallpapers(ui, &gallery, &draft.state);
+                }
+            }
+        }
+        let detected = ui.call("provider.list", json!({})).await;
+        if current(ui, "settings", project, generation) {
+            if let Ok(detected) = detected {
+                mounted.show_providers(&detected);
+            }
+        }
         return;
     }
-    let generation = ui.generation.get();
     // Read narrow subtrees: wallpaper libraries can be megabytes and are not needed here.
     let result = async {
         let mut data = json!({});
         for path in [
             "providers",
             "device",
-            "parking",
             "keybindings",
             "appearance.mode",
             "appearance.panel_alpha",
@@ -83,7 +165,8 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
     page.set_spacing(0);
     ui.page_projects
         .borrow_mut()
-        .insert("settings".into(), project);
+        .insert("settings".into(), generation as i64);
+    let baseline = Rc::new(RefCell::new(None::<Snapshot>));
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     header.add_css_class("settings-head");
     let title = gtk::Box::new(gtk::Orientation::Vertical, 2);
@@ -112,22 +195,39 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
     let weak = Rc::downgrade(ui);
     let wallpaper_state = wallpapers.clone();
     let saved_for_save = saved_wallpapers.clone();
+    let loaded = baseline.clone();
     reload.connect_clicked(move |_| {
         let (Some(ui), Some(page)) = (weak.upgrade(), target.upgrade()) else {
             return;
         };
+        let now = match snapshot(page.upcast_ref()) {
+            Ok(now) => now,
+            Err(error) => {
+                ui.show_error(&error);
+                return;
+            }
+        };
         let mut settings = Vec::new();
-        let mut notifications = json!({"categories":{}});
-        let mut guardrails = json!({"caps":{},"destructive_write":{}});
-        if let Err(error) = collect_settings(
-            page.upcast_ref(),
-            &mut settings,
-            &mut notifications,
-            &mut guardrails,
-        ) {
-            ui.show_error(&error);
-            return;
+        let before = loaded.borrow();
+        for (path, value) in &now.settings {
+            if before.as_ref().and_then(|b| b.settings.get(path)) != Some(value) {
+                settings.push(("settings.set", json!({"path":path,"value":value})));
+            }
         }
+        let mut notifications = json!({});
+        for key in ["sound", "volume"] {
+            if before.as_ref().map(|b| &b.notifications[key]) != Some(&now.notifications[key]) {
+                notifications[key] = now.notifications[key].clone();
+            }
+        }
+        if let Some(categories) = now.notifications["categories"].as_object() {
+            for (category, on) in categories {
+                if before.as_ref().map(|b| &b.notifications["categories"][category]) != Some(on) {
+                    notifications["categories"][category] = on.clone();
+                }
+            }
+        }
+        drop(before);
         let wallpaper_snapshot = wallpaper_state.borrow().clone();
         for field in ["wallpapers", "wallpaper"] {
             if wallpaper_snapshot[field] != saved_for_save.borrow()[field] {
@@ -138,7 +238,10 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
             }
         }
         let saved_wallpapers = saved_for_save.clone();
-        settings.push(("notify.settings.set", json!({"patch":notifications})));
+        if notifications.as_object().is_some_and(|patch| !patch.is_empty()) {
+            settings.push(("notify.settings.set", json!({"patch":notifications})));
+        }
+        let loaded = loaded.clone();
         let save_caption = save_caption.clone();
         page.set_sensitive(false);
         save_caption.set_text("Saving…");
@@ -156,6 +259,7 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
                 ui.show_error(&error);
             } else {
                 *saved_wallpapers.borrow_mut() = wallpaper_snapshot;
+                *loaded.borrow_mut() = Some(now);
                 ui.refresh();
             }
         });
@@ -187,7 +291,7 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
         let hint = match name {
             "appearance" => "Theme, opacity, wallpaper",
             "notifications" => "Sounds and categories",
-            "agents" => "Providers and parking",
+            "agents" => "Providers and updates",
             "safety" => "Caps and protected paths",
             "android" => "SDK and device tools",
             "keyboard" => "Global shortcuts",
@@ -332,6 +436,7 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
         state: wallpapers.clone(),
         saved: saved_wallpapers,
         gallery: gallery.downgrade(),
+        stale: std::cell::Cell::new(false),
     });
     let rotation = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     rotation.add_css_class("settings-wallpaper-rotation");
@@ -367,39 +472,42 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
     );
 
     agents.append(&paragraph(
-        "Provider discovery, executable overrides and process parking.",
+        "Provider discovery, updates and executable overrides.",
     ));
-    for provider in rows(&data["detected"], "providers") {
-        let info = section(&agents, text(&provider, "provider"));
-        info.append(&paragraph(&format!(
-            "{} · {}\n{}",
-            if provider["installed"].as_bool() == Some(true) {
-                "Installed"
-            } else {
-                "Not installed"
-            },
-            text(&provider, "version"),
-            text(&provider, "path")
-        )));
-        if let Some(account) = provider["signed_in_as"].as_str() {
-            info.append(&label(account, "dim"));
-        }
-        info.append(&label(
-            if provider["guarded"].as_bool() == Some(true) {
-                "Guardrail adapter available"
-            } else {
-                "No native guardrail adapter"
-            },
-            "dim",
-        ));
-    }
-    action(
-        ui,
-        &agents,
-        "Refresh providers",
-        "provider.refresh",
-        json!({}),
-    );
+    let detected = gtk::Box::new(gtk::Orientation::Vertical, 13);
+    agents.append(&detected);
+    providers(&detected, &data["detected"]);
+    let mounted = Rc::new(Mounted {
+        page: page.downgrade(),
+        baseline: baseline.clone(),
+        providers: detected.downgrade(),
+        detected: RefCell::new(data["detected"].clone()),
+    });
+    MOUNTED.with(|m| *m.borrow_mut() = Some(mounted.clone()));
+    // Called directly, not through Ui::mutate: its answer is the providers to show.
+    let rediscover = button("Refresh providers", "quiet");
+    agents.append(&rediscover);
+    let weak = Rc::downgrade(ui);
+    let shown = Rc::downgrade(&mounted);
+    rediscover.connect_clicked(move |key| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        key.set_sensitive(false);
+        let key = key.clone();
+        let shown = shown.clone();
+        glib::spawn_future_local(async move {
+            match ui.call("provider.refresh", json!({})).await {
+                Ok(detected) => {
+                    if let Some(mounted) = shown.upgrade() {
+                        mounted.show_providers(&detected);
+                    }
+                }
+                Err(error) => ui.show_error(&error.to_string()),
+            }
+            key.set_sensitive(true);
+        });
+    });
     for provider in ["claude", "codex"] {
         let updates = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         let automatic = gtk::CheckButton::with_label(&format!("Update {provider} at startup"));
@@ -425,15 +533,6 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
             data["providers"][provider]["path"].as_str().unwrap_or(""),
         );
     }
-    setting_number(
-        ui,
-        &agents,
-        "Park idle sessions after (minutes)",
-        "parking.idle_minutes",
-        data["parking"]["idle_minutes"].as_f64().unwrap_or(30.),
-        0.,
-        1440.,
-    );
 
     let android = category(&stack, "android", "Android");
     android.append(&paragraph(
@@ -584,6 +683,36 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
             }
         }
     });
+    // Taken from the built controls, so a value a range clamped counts as unchanged.
+    *baseline.borrow_mut() = snapshot(page.upcast_ref()).ok();
+}
+
+/// One card per provider from a `provider.list` / `provider.refresh` answer.
+fn providers(parent: &gtk::Box, detected: &Value) {
+    for provider in rows(detected, "providers") {
+        let info = section(parent, text(&provider, "provider"));
+        info.append(&paragraph(&format!(
+            "{} · {}\n{}",
+            if provider["installed"].as_bool() == Some(true) {
+                "Installed"
+            } else {
+                "Not installed"
+            },
+            text(&provider, "version"),
+            text(&provider, "path")
+        )));
+        if let Some(account) = provider["signed_in_as"].as_str() {
+            info.append(&label(account, "dim"));
+        }
+        info.append(&label(
+            if provider["guarded"].as_bool() == Some(true) {
+                "Guardrail adapter available"
+            } else {
+                "No native guardrail adapter"
+            },
+            "dim",
+        ));
+    }
 }
 
 fn settings_search_text(widget: &gtk::Widget) -> String {
@@ -714,7 +843,7 @@ const CATEGORIES: [(&str, &str, &str, &str, &str, &str); 7] = [
         "terminal",
         "Runtime",
         "Provider and session behavior",
-        "Local CLI discovery, authentication state, executable overrides, and process parking.",
+        "Local CLI discovery, authentication state, updates, and executable overrides.",
     ),
     (
         "safety",
@@ -835,22 +964,12 @@ fn render_wallpapers(ui: &Rc<Ui>, block: &gtk::Box, state: &Rc<RefCell<Value>>) 
         let pick = gtk::Button::new();
         pick.add_css_class("quiet");
         let words = gtk::Box::new(gtk::Orientation::Vertical, 5);
-        if let Some(encoded) = item["preview"]
-            .as_str()
-            .or(item["image"].as_str())
-            .and_then(|s| s.split_once(',').map(|(_, data)| data))
-        {
-            use base64::Engine;
-            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded) {
-                if let Ok(texture) = gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes))
-                {
-                    let picture = gtk::Picture::for_paintable(&texture);
-                    picture.set_content_fit(gtk::ContentFit::Cover);
-                    picture.set_size_request(132, 66);
-                    picture.set_can_shrink(true);
-                    words.append(&picture);
-                }
-            }
+        if let Some(texture) = item_texture(item) {
+            let picture = gtk::Picture::for_paintable(&texture);
+            picture.set_content_fit(gtk::ContentFit::Cover);
+            picture.set_size_request(132, 66);
+            picture.set_can_shrink(true);
+            words.append(&picture);
         }
         let name = label(text(item, "name"), "body");
         name.set_ellipsize(gtk::pango::EllipsizeMode::End);
@@ -900,7 +1019,14 @@ fn render_wallpapers(ui: &Rc<Ui>, block: &gtk::Box, state: &Rc<RefCell<Value>>) 
     let name = current
         .and_then(|item| item["name"].as_str())
         .unwrap_or("Wallpaper");
-    let texture = wallpaper_texture(current_image);
+    let texture = match current {
+        Some(item) => item_texture(item),
+        None => wallpaper_texture(current_image),
+    };
+    // Forget images no longer in the library.
+    TEXTURES.with(|t| {
+        t.borrow_mut().retain(|id, _| library.iter().any(|item| item["id"].as_str() == Some(id.as_str())))
+    });
     let empty = label(
         if texture.is_some() {
             name
@@ -1008,7 +1134,9 @@ fn render_wallpapers(ui: &Rc<Ui>, block: &gtk::Box, state: &Rc<RefCell<Value>>) 
                 use base64::Engine;
                 let image=format!("data:image/jpeg;base64,{}",base64::engine::general_purpose::STANDARD.encode(bytes));
                 let mut library=staged.borrow()["wallpapers"].as_array().cloned().unwrap_or_default();
-                library.push(json!({"id":uuid::Uuid::new_v4().to_string(),"name":name,"image":image,"preview":image}));
+                // A legacy `preview` was a second copy of `image` and counted twice against the cap.
+                for item in &mut library { if let Some(item)=item.as_object_mut() { item.remove("preview"); } }
+                library.push(json!({"id":uuid::Uuid::new_v4().to_string(),"name":name,"image":image}));
                 if serde_json::to_vec(&library).unwrap_or_default().len()>1500000{return Err("Wallpaper library is full. Remove an image before adding another.".into());}
                 staged.borrow_mut()["wallpapers"]=json!(library);
                 staged.borrow_mut()["wallpaper"]=json!(image);
@@ -1018,6 +1146,25 @@ fn render_wallpapers(ui: &Rc<Ui>, block: &gtk::Box, state: &Rc<RefCell<Value>>) 
             key.set_sensitive(true);
         });
     });
+}
+
+thread_local! {
+    /// Decoded library images by id: a gallery redraw (a pick, a removal, a new saved
+    /// wallpaper) otherwise decodes every full-size image again on the UI thread.
+    static TEXTURES: RefCell<std::collections::HashMap<String, gtk::gdk::Texture>> = RefCell::default();
+}
+
+fn item_texture(item: &Value) -> Option<gtk::gdk::Texture> {
+    let image = item["image"].as_str()?;
+    let Some(id) = item["id"].as_str() else {
+        return wallpaper_texture(image);
+    };
+    if let Some(texture) = TEXTURES.with(|t| t.borrow().get(id).cloned()) {
+        return Some(texture);
+    }
+    let texture = wallpaper_texture(image)?;
+    TEXTURES.with(|t| t.borrow_mut().insert(id.to_string(), texture.clone()));
+    Some(texture)
 }
 
 fn wallpaper_texture(image: &str) -> Option<gtk::gdk::Texture> {

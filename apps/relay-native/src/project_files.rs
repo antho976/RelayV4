@@ -66,7 +66,19 @@ impl Editor {
         self.refresh_git(ui);
         self.update_scope_label(ui);
     }
-    pub(super) fn update_scope_label(&self, ui: &Ui) {
+    pub(super) fn update_scope_label(self: &Rc<Self>, ui: &Rc<Ui>) {
+        // The viewed checkout is gone from a loaded list (its session closed, or branch cleanup
+        // removed it): every scope is picked from that list, so it was removed, not unknown.
+        let current = self.worktree.borrow().clone();
+        let removed = !current.is_empty() && {
+            let worktrees = self.worktrees.borrow();
+            !worktrees.is_empty() && !worktrees.iter().any(|w| text(w, "path") == current)
+        };
+        if removed && !self.is_dirty() {
+            ui.show_error(&format!("The checkout {current} was removed; showing the primary checkout."));
+            self.select_checkout(ui, "");
+            return;
+        }
         let projects = ui.projects.borrow();
         let project = projects.iter().find(|p| p["id"] == ui.project.get());
         let project_name = project.map(|p| text(p, "name")).unwrap_or("Project");
@@ -76,11 +88,17 @@ impl Editor {
         let worktrees = self.worktrees.borrow();
         let selected = worktrees
             .iter()
-            .find(|w| text(w, "path") == self.worktree.borrow().as_str())
+            .find(|w| text(w, "path") == current)
             .or_else(|| worktrees.first());
-        let branch = selected
-            .map(|w| text(w, "branch"))
-            .unwrap_or("Primary checkout");
+        // Unsaved edits keep a removed checkout open; say so rather than name the primary.
+        let branch = if removed {
+            format!("{} (removed)", current.rsplit('/').next().unwrap_or(&current))
+        } else {
+            selected
+                .map(|w| text(w, "branch"))
+                .unwrap_or("Primary checkout")
+                .to_owned()
+        };
         self.scope_label
             .set_text(&format!("{workspace_name} / {project_name} · {branch}"));
     }
@@ -324,7 +342,7 @@ impl Editor {
         let weak = Rc::downgrade(ui);
         let ed = self.clone();
         if directory {
-            self.bind_tree_drop(ui, row, path);
+            self.bind_folder_drop(ui, row, path);
         }
         let path = path.to_owned();
         source.connect_prepare(move |_, _, _| {
@@ -335,70 +353,6 @@ impl Editor {
             Some(gtk::gdk::ContentProvider::for_value(&data.to_value()))
         });
         row.add_controller(source);
-    }
-    pub(super) fn bind_tree_drop(
-        self: &Rc<Self>,
-        ui: &Rc<Ui>,
-        row: &impl IsA<gtk::Widget>,
-        into: &str,
-    ) {
-        let drop = gtk::DropTarget::new(String::static_type(), gtk::gdk::DragAction::MOVE);
-        let ed = self.clone();
-        let weak = Rc::downgrade(ui);
-        let into = into.to_owned();
-        drop.connect_drop(move |_, value, _, _| {
-            let Some(ui) = weak.upgrade() else {
-                return false;
-            };
-            let Ok(data) = value.get::<String>() else {
-                return false;
-            };
-            let Ok(data) = serde_json::from_str::<Value>(&data) else {
-                return false;
-            };
-            if data["project"] != ui.project.get()
-                || data["worktree"] != *ed.worktree.borrow()
-                || ed.is_dirty()
-            {
-                return false;
-            }
-            let Some(path) = data["path"].as_str().filter(|path| !path.is_empty()) else {
-                return false;
-            };
-            if into == path || into.starts_with(&format!("{path}/")) {
-                return false;
-            }
-            let payload = ed.payload(&ui, json!({"path":path,"into":into}));
-            let moved = path.to_owned();
-            let document = ed.path.borrow().clone();
-            let agents = ed.agents_visible();
-            let ed = ed.clone();
-            ed.busy.set(true);
-            glib::spawn_future_local(async move {
-                let result = ui.call("file.move", payload).await;
-                ed.busy.set(false);
-                match result {
-                    Ok(value) => {
-                        let suffix = document
-                            .strip_prefix(&moved)
-                            .filter(|suffix| suffix.is_empty() || suffix.starts_with('/'));
-                        if let Some(suffix) = suffix {
-                            let new_path = format!("{}{suffix}", text(&value, "path"));
-                            ed.clear_document();
-                            ed.open(&ui, new_path);
-                        }
-                        ed.load_tree(&ui, None);
-                        ed.refresh_git(&ui);
-                        if agents {
-                            ed.show_agents();
-                        }
-                    }
-                    Err(error) => ui.show_error(&error.to_string()),
-                }
-            });
-            true
-        });
-        row.add_controller(drop);
     }
 }
 fn button_row(title: &str, icon: &str) -> gtk::Button {
@@ -485,6 +439,13 @@ pub(super) fn file_image(path: &str, size: i32) -> gtk::Image {
     image
 }
 
+/// Whether a porcelain entry is unmerged: git marks these DD, AU, UD, UA, DU, AA and UU,
+/// so either column U, or both added, or both deleted.
+pub(super) fn is_unmerged(file: &Value) -> bool {
+    let (index, worktree) = (text(file, "index"), text(file, "worktree"));
+    index == "U" || worktree == "U" || matches!((index, worktree), ("A", "A") | ("D", "D"))
+}
+
 /// One porcelain status code as VS Code letters it, with its colour class.
 pub(super) fn status_letter(code: &str) -> Option<(&'static str, &'static str, &'static str)> {
     Some(match code.trim() {
@@ -503,9 +464,12 @@ pub(super) fn status_letter(code: &str) -> Option<(&'static str, &'static str, &
 thread_local! {
     /// The explorer row last selected, so a new selection can clear it.
     static SELECTED_ROW: RefCell<Option<glib::WeakRef<gtk::Widget>>> = const { RefCell::new(None) };
-    /// Changed paths from the last `git.status`, for tinting folders that contain them.
-    static CHANGED: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
+    /// Each folder holding a change from the last `git.status`, with the strongest status
+    /// under it (`FOLDER_CLASSES` order), so tinting a folder is one lookup.
+    static CHANGED: RefCell<std::collections::HashMap<String, usize>> = RefCell::default();
 }
+
+const FOLDER_CLASSES: [&str; 3] = ["git-untracked", "git-modified", "git-conflict"];
 
 pub(super) fn mark_selected(row: &impl IsA<gtk::Widget>) {
     let row = row.as_ref();
@@ -520,24 +484,7 @@ pub(super) fn mark_selected(row: &impl IsA<gtk::Widget>) {
 
 /// The strongest status among the changes under a folder, if any.
 pub(super) fn folder_status(path: &str) -> Option<&'static str> {
-    let prefix = format!("{path}/");
-    CHANGED.with(|changed| {
-        let changed = changed.borrow();
-        let codes: Vec<&str> = changed
-            .iter()
-            .filter(|(file, _)| file.starts_with(&prefix))
-            .map(|(_, code)| code.as_str())
-            .collect();
-        if codes.is_empty() {
-            None
-        } else if codes.contains(&"U") {
-            Some("git-conflict")
-        } else if codes.iter().any(|code| *code != "?") {
-            Some("git-modified")
-        } else {
-            Some("git-untracked")
-        }
-    })
+    CHANGED.with(|changed| changed.borrow().get(path).map(|rank| FOLDER_CLASSES[*rank]))
 }
 
 const STATUS_CLASSES: [&str; 7] = [
@@ -548,19 +495,27 @@ impl Editor {
     /// Record the latest status and re-tint the folders already drawn in the explorer.
     pub(super) fn note_changes(&self, files: &[Value]) {
         CHANGED.with(|changed| {
-            *changed.borrow_mut() = files
-                .iter()
-                .map(|file| {
-                    let code = if !text(file, "worktree").trim().is_empty() {
-                        text(file, "worktree")
-                    } else {
-                        text(file, "index")
-                    };
-                    let code = if text(file, "index") == "U" { "U" } else { code };
-                    (text(file, "path").to_owned(), code.trim().to_owned())
-                })
-                .filter(|(_, code)| code != "!")
-                .collect();
+            let mut folders = std::collections::HashMap::new();
+            for file in files {
+                let code = if !text(file, "worktree").trim().is_empty() {
+                    text(file, "worktree")
+                } else {
+                    text(file, "index")
+                };
+                let rank = match code.trim() {
+                    _ if is_unmerged(file) => 2,
+                    "!" => continue,
+                    "?" => 0,
+                    _ => 1,
+                };
+                let mut path = text(file, "path");
+                while let Some((folder, _)) = path.rsplit_once('/') {
+                    let strongest = folders.entry(folder.to_owned()).or_insert(rank);
+                    *strongest = (*strongest).max(rank);
+                    path = folder;
+                }
+            }
+            *changed.borrow_mut() = folders;
         });
         fn walk(widget: &gtk::Widget) {
             if widget.has_css_class("code-folder") {
