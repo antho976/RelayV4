@@ -1972,19 +1972,33 @@ mod tests {
 
     #[test]
     fn github_cli_paginates_and_failure_is_not_an_empty_list() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let gh = dir.path().join("gh");
-        std::fs::write(&gh, "#!/usr/bin/env python3\nimport sys\nassert sys.argv[1:4] == ['api','--paginate','--slurp']\nassert 'state=all' in sys.argv[4]\nprint('[[], []]')\n").unwrap();
-        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_script(&gh, "#!/usr/bin/env python3\nimport sys\nassert sys.argv[1:4] == ['api','--paginate','--slurp']\nassert 'state=all' in sys.argv[4]\nprint('[[], []]')\n");
         let result = list_pull_requests(&gh, dir.path()).unwrap();
         assert!(result.complete && result.pull_requests.is_empty());
-        std::fs::write(
-            &gh,
-            "#!/usr/bin/env python3\nimport sys\nprint('[[]]')\nsys.exit(1)\n",
-        )
-        .unwrap();
-        assert!(list_pull_requests(&gh, dir.path()).is_err());
+        let failing = dir.path().join("gh-failing");
+        write_script(&failing, "#!/usr/bin/env python3\nimport sys\nprint('[[]]')\nsys.exit(1)\n");
+        assert!(list_pull_requests(&failing, dir.path()).is_err());
+    }
+
+    /// Writes an executable script and waits until it can be run. A test thread that forks while
+    /// this one still holds the file open for writing gives its child a copy of that descriptor
+    /// until the child execs, and until then running the script fails with ETXTBSY.
+    fn write_script(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match std::process::Command::new(path).arg("--probe").stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status() {
+                Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) && std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => panic!("{}: {error}", path.display()),
+                Ok(_) => return,
+            }
+        }
     }
 
     #[test]
