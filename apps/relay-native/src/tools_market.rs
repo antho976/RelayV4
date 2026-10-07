@@ -3,8 +3,11 @@
 //! switches both pages use.
 //!
 //! A page is mounted once and keeps its own state (data, scope, selection, search, filter,
-//! the open detail tab and lazily fetched documents), because every engine event repaints it
-//! through `tools::refresh`. `skill.changed` and `plugin.changed` for a project other than the
+//! the open detail tab and lazily fetched documents), because engine events re-read it through
+//! `tools::refresh`; a re-read that brings the same catalog, projects and palette repaints
+//! nothing. Project and workspace events do not reach the page (app.rs only reloads the
+//! registry), so the next re-read, including the one on returning to the page, picks up a
+//! rename or a new project. `skill.changed` and `plugin.changed` for a project other than the
 //! active one never reach the page (app.rs drops them), so a switch patches local data from the
 //! engine's answer instead of waiting for an event.
 use super::plugins::explain;
@@ -80,7 +83,16 @@ pub(crate) struct Market {
     pub cache: RefCell<HashMap<String, Value>>,
     quiet: Cell<bool>,
     rows: RefCell<Vec<(gtk::ListBoxRow, String)>>,
-    shown: RefCell<Option<(Value, i64)>>,
+    /// What the list was last drawn against besides the catalog: see `context`.
+    drawn: RefCell<Value>,
+    /// The detail pane's item, scope and context, so a repaint keeps an unchanged pane.
+    shown: RefCell<Option<(Value, i64, Value)>>,
+}
+
+/// Everything a page reads besides its catalog: the active project, project and workspace
+/// names, and the palette the documents are highlighted in.
+fn context(ui: &Ui) -> Value {
+    json!([ui.project.get(), *ui.projects.borrow(), *ui.workspaces.borrow(), *ui.palette.borrow()])
 }
 
 thread_local! {
@@ -100,13 +112,19 @@ pub(crate) async fn refresh(ui: &Rc<Ui>, spec: &'static Spec, project: i64) {
     }
     match result {
         Ok(value) => {
-            *market.data.borrow_mut() = rows(&value, spec.list_key);
-            if !market.loaded.replace(true) {
+            let data = rows(&value, spec.list_key);
+            let first = !market.loaded.replace(true);
+            if first {
                 // Named once there is data behind them: callers wait on these names.
                 market.picker.set_widget_name(&format!("{}-project", spec.page));
                 market.split.set_widget_name(&format!("{}-split", spec.page));
             }
-            market.render(ui);
+            // Most events that reach the page changed nothing on it. Rebuilding every row
+            // anyway drops focus and hover, fights the scroll and can swallow a switch press.
+            if first || *market.data.borrow() != data || *market.drawn.borrow() != context(ui) {
+                *market.data.borrow_mut() = data;
+                market.render(ui);
+            }
         }
         Err(error) => {
             let message = explain(&error.to_string());
@@ -355,6 +373,7 @@ fn build(ui: &Rc<Ui>, spec: &'static Spec) -> Rc<Market> {
         cache: RefCell::new(HashMap::new()),
         quiet: Cell::new(false),
         rows: RefCell::new(Vec::new()),
+        drawn: RefCell::new(Value::Null),
         shown: RefCell::new(None),
     });
     market
@@ -531,6 +550,7 @@ impl Market {
             return;
         }
         self.quiet.set(true);
+        *self.drawn.borrow_mut() = context(ui);
         self.sync_picker(ui);
         let scope = self.scope.get();
         let data = self.data.borrow().clone();
@@ -631,12 +651,13 @@ impl Market {
 
     fn show_detail(self: &Rc<Self>, ui: &Rc<Ui>, item: Option<&Value>) {
         let scope = self.scope.get();
-        let next = item.map(|v| (v.clone(), scope));
+        // The detail also shows project names and switches, and documents in the palette.
+        let next = item.map(|v| (v.clone(), scope, context(ui)));
         if *self.shown.borrow() == next {
             return;
         }
         let same = match (self.shown.borrow().as_ref(), item) {
-            (Some((old, _)), Some(new)) => (self.spec.id)(old) == (self.spec.id)(new),
+            (Some((old, _, _)), Some(new)) => (self.spec.id)(old) == (self.spec.id)(new),
             _ => false,
         };
         let adjustment = self.detail_scroll.vadjustment();
@@ -710,36 +731,55 @@ pub(crate) fn toggle(
     };
     switch.set_tooltip_text(Some(&tip));
     switch.update_property(&[gtk::accessible::Property::Label(&tip)]);
-    let weak = Rc::downgrade(ui);
     let market = Rc::downgrade(market);
-    let id = item["id"].clone();
     let key = (spec.id)(item);
+    enable_switch(ui, &switch, spec.enable_op, spec.id_key, item["id"].clone(), project, move |ui, result| {
+        let Some(market) = market.upgrade() else { return };
+        match result {
+            Ok(item) => market.set_enabled(ui, &key, item["enabled_in"].clone()),
+            Err(error) => market.say(&explain(&error)),
+        }
+    });
+    switch
+}
+
+/// Makes `switch` turn `id` on or off for `project` through `op` (`{id_key: id, project_id,
+/// enabled}`), then hands `done` the engine's answer. A refusal flips the switch back while it
+/// is insensitive, and an insensitive switch sends nothing: without that guard the flip back
+/// would send the opposite request, fail the same way, and loop for as long as it fails.
+pub(crate) fn enable_switch(
+    ui: &Rc<Ui>,
+    switch: &gtk::Switch,
+    op: &'static str,
+    id_key: &'static str,
+    id: Value,
+    project: i64,
+    done: impl Fn(&Rc<Ui>, Result<Value, String>) + 'static,
+) {
+    let weak = Rc::downgrade(ui);
+    let done = Rc::new(done);
     switch.connect_state_set(move |switch, on| {
-        // A rejected write restores the switch while it is disabled.
         if !switch.is_sensitive() {
             return glib::Propagation::Proceed;
         }
-        let (Some(ui), Some(market)) = (weak.upgrade(), market.upgrade()) else {
+        let Some(ui) = weak.upgrade() else {
             return glib::Propagation::Proceed;
         };
         switch.set_sensitive(false);
         let switch = switch.clone();
         let mut payload = json!({"project_id": project, "enabled": on});
-        payload[spec.id_key] = id.clone();
-        let key = key.clone();
+        payload[id_key] = id.clone();
+        let done = done.clone();
         glib::spawn_future_local(async move {
-            match ui.call(spec.enable_op, payload).await {
-                Ok(item) => market.set_enabled(&ui, &key, item["enabled_in"].clone()),
-                Err(error) => {
-                    switch.set_active(!on);
-                    market.say(&explain(&error.to_string()));
-                }
+            let result = ui.call(op, payload).await.map_err(|error| error.to_string());
+            if result.is_err() {
+                switch.set_active(!on);
             }
+            done(&ui, result);
             switch.set_sensitive(true);
         });
         glib::Propagation::Proceed
     });
-    switch
 }
 
 /// The big "On in X" panel at the top of a detail pane, with its lamp and switch.
