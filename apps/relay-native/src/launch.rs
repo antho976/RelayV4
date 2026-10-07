@@ -3,32 +3,94 @@ use super::*;
 /// The most agents one launch configures: the count keys offer 1 to 6.
 const AGENTS: usize = 6;
 
-/// Group `keys` and bind them both ways to the hidden `control` that holds their choice,
-/// which is what payloads and the smoke tests read. The keys hold only a weak reference to
-/// `control`: the form must own it (append it, hidden), or the keys silently stop working.
-fn bind_keys(control: &gtk::DropDown, keys: Vec<gtk::ToggleButton>) {
-    for (index, key) in keys.iter().enumerate() {
-        if index > 0 {
-            key.set_group(keys.first());
-        }
-        key.set_active(control.selected() == index as u32);
-        let weak = control.downgrade();
-        key.connect_toggled(move |key| {
-            if key.is_active() {
-                if let Some(control) = weak.upgrade() {
-                    control.set_selected(index as u32);
-                }
-            }
-        });
-    }
-    control.connect_selected_notify(move |control| {
-        for (index, key) in keys.iter().enumerate() {
-            key.set_active(control.selected() == index as u32);
-        }
-    });
+/// The reasoning efforts the effort keys offer, in key order.
+const EFFORTS: [&str; 6] = ["minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// One choice made with a row of grouped toggle keys (RA-690). The keys are the control: the
+/// chosen index lives in a cell beside them, not in a hidden widget the form has to keep in
+/// the tree. The smoke harness drives the row, named, through its keys as a person would.
+/// A handler connected to keys should hold [`Choice::downgrade`], not a clone: a clone holds
+/// the row, and a row whose key handler holds the row is never freed.
+#[derive(Clone)]
+struct Choice {
+    row: gtk::Box,
+    keys: Vec<gtk::ToggleButton>,
+    index: Rc<Cell<u32>>,
 }
 
-fn choice_cards(control: &gtk::DropDown, choices: &[(&str, &str, &str)]) -> gtk::Box {
+#[derive(Clone)]
+struct WeakChoice {
+    row: glib::WeakRef<gtk::Box>,
+    keys: Vec<glib::WeakRef<gtk::ToggleButton>>,
+    index: Rc<Cell<u32>>,
+}
+
+impl Choice {
+    /// Groups `keys`, already in `row`, with key `initial` chosen.
+    fn new(row: gtk::Box, keys: Vec<gtk::ToggleButton>, initial: u32) -> Self {
+        let index = Rc::new(Cell::new(initial));
+        for (i, key) in keys.iter().enumerate() {
+            if i > 0 {
+                key.set_group(keys.first());
+            }
+            key.set_active(i as u32 == initial);
+            let index = index.clone();
+            key.connect_toggled(move |key| {
+                if key.is_active() {
+                    index.set(i as u32);
+                }
+            });
+        }
+        Choice { row, keys, index }
+    }
+    fn selected(&self) -> u32 {
+        self.index.get()
+    }
+    fn set_selected(&self, index: u32) {
+        if let Some(key) = self.keys.get(index as usize) {
+            key.set_active(true);
+        }
+    }
+    /// Runs `changed` with the new index each time another key is chosen; `selected()`
+    /// already returns it.
+    fn connect_changed(&self, changed: impl Fn(u32) + 'static) {
+        let changed = Rc::new(changed);
+        for (i, key) in self.keys.iter().enumerate() {
+            let changed = changed.clone();
+            key.connect_toggled(move |key| {
+                if key.is_active() {
+                    changed(i as u32);
+                }
+            });
+        }
+    }
+    fn set_sensitive(&self, sensitive: bool) {
+        self.row.set_sensitive(sensitive);
+    }
+    fn downgrade(&self) -> WeakChoice {
+        WeakChoice {
+            row: self.row.downgrade(),
+            keys: self.keys.iter().map(|key| key.downgrade()).collect(),
+            index: self.index.clone(),
+        }
+    }
+}
+
+impl WeakChoice {
+    /// The chosen index, which outlives the keys.
+    fn selected(&self) -> u32 {
+        self.index.get()
+    }
+    fn upgrade(&self) -> Option<Choice> {
+        Some(Choice {
+            row: self.row.upgrade()?,
+            keys: self.keys.iter().map(|key| key.upgrade()).collect::<Option<_>>()?,
+            index: self.index.clone(),
+        })
+    }
+}
+
+fn choice_cards(choices: &[(&str, &str, &str)]) -> Choice {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 7);
     row.set_homogeneous(true);
     let mut buttons: Vec<gtk::ToggleButton> = Vec::new();
@@ -57,11 +119,10 @@ fn choice_cards(control: &gtk::DropDown, choices: &[(&str, &str, &str)]) -> gtk:
         row.append(&key);
         buttons.push(key);
     }
-    bind_keys(control, buttons);
-    row
+    Choice::new(row, buttons, 0)
 }
 
-fn segments(control: &gtk::DropDown, choices: &[&str]) -> gtk::Box {
+fn segments(choices: &[&str], initial: u32) -> Choice {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     row.add_css_class("launch-segmented");
     row.set_homogeneous(true);
@@ -71,14 +132,7 @@ fn segments(control: &gtk::DropDown, choices: &[&str]) -> gtk::Box {
         row.append(&key);
         keys.push(key);
     }
-    bind_keys(control, keys);
-    let weak = row.downgrade();
-    control.connect_sensitive_notify(move |control| {
-        if let Some(row) = weak.upgrade() {
-            row.set_sensitive(control.is_sensitive());
-        }
-    });
-    row
+    Choice::new(row, keys, initial)
 }
 
 fn launch_heading(title: &str, hint: &str) -> gtk::Box {
@@ -139,10 +193,10 @@ fn record_tick(ticks: &mut Vec<i64>, id: i64, active: bool) {
 
 struct Profile {
     root: gtk::Box,
-    provider: gtk::DropDown,
-    role: gtk::DropDown,
+    provider: Choice,
+    role: Choice,
     model: gtk::Entry,
-    effort: gtk::DropDown,
+    effort: Choice,
     worktree: gtk::Entry,
     prompt: gtk::TextView,
     writes: gtk::CheckButton,
@@ -154,7 +208,7 @@ struct Profile {
     ticks: RefCell<Vec<i64>>,
     task_box: gtk::Grid,
     task_search: gtk::SearchEntry,
-    task_filter: gtk::DropDown,
+    task_filter: Choice,
     task_count: gtk::Label,
     /// Whether the task cards were built: only once the agent is first shown.
     filled: Cell<bool>,
@@ -164,8 +218,6 @@ impl Profile {
     fn new(index: usize, compact: bool) -> Rc<Self> {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 8);
         root.set_widget_name(&format!("launch-profile-{index}"));
-        let provider = gtk::DropDown::from_strings(&["Claude", "Codex"]);
-        provider.set_widget_name(&format!("launch-provider-{index}"));
         root.add_css_class("launch-profile");
         let heading = launch_heading(
             &format!("Configure Agent {}", index + 1),
@@ -178,6 +230,7 @@ impl Profile {
         let configuration = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         configuration.add_css_class("launch-configuration");
         let providers = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        providers.set_widget_name(&format!("launch-provider-{index}"));
         providers.set_homogeneous(true);
         providers.set_hexpand(true);
         let mut provider_cards: Vec<(gtk::ToggleButton, gtk::Label, gtk::Label)> = Vec::new();
@@ -212,17 +265,14 @@ impl Profile {
             providers.append(&key);
             provider_cards.push((key, account, facts));
         }
-        bind_keys(&provider, provider_cards.iter().map(|(key, _, _)| key.clone()).collect());
-        provider.set_visible(false);
-        root.append(&provider);
+        let keys = provider_cards.iter().map(|(key, _, _)| key.clone()).collect();
+        let provider = Choice::new(providers.clone(), keys, 0);
         configuration.append(&providers);
         let controls = gtk::Box::new(gtk::Orientation::Vertical, 10);
         controls.set_size_request(260, -1);
-        let role = gtk::DropDown::from_strings(&["Builder", "Reviewer", "Docs"]);
+        let role = segments(&["Builder", "Reviewer", "Docs"], 0);
         controls.append(&label("ROLE", "section-label"));
-        controls.append(&segments(&role, &["Builder", "Reviewer", "Docs"]));
-        role.set_visible(false);
-        controls.append(&role);
+        controls.append(&role.row);
         let model = gtk::Entry::builder()
             .placeholder_text("Provider default, or enter a model ID")
             .build();
@@ -230,32 +280,24 @@ impl Profile {
         model.set_width_chars(1);
         model.set_hexpand(true);
         field("Model", &model, &controls);
-        let effort =
-            gtk::DropDown::from_strings(&["minimal", "low", "medium", "high", "xhigh", "max"]);
-        effort.set_widget_name(&format!("launch-effort-{index}"));
-        effort.set_selected(3);
+        let effort = segments(&EFFORTS, 3);
+        effort.row.set_widget_name(&format!("launch-effort-{index}"));
         controls.append(&label("REASONING EFFORT", "section-label"));
-        let effort_keys = segments(
-            &effort,
-            &["minimal", "low", "medium", "high", "xhigh", "max"],
-        );
-        effort_keys.first_child().unwrap().set_visible(false);
+        // Minimal is Codex's alone and max Claude's alone.
+        effort.keys[0].set_visible(false);
         let weak_effort = effort.downgrade();
-        let weak_keys = effort_keys.downgrade();
-        provider.connect_selected_notify(move |provider| {
-            let (Some(effort), Some(keys)) = (weak_effort.upgrade(), weak_keys.upgrade()) else {
+        provider.connect_changed(move |provider| {
+            let Some(effort) = weak_effort.upgrade() else {
                 return;
             };
-            let codex = provider.selected() == 1;
-            keys.first_child().unwrap().set_visible(codex);
-            keys.last_child().unwrap().set_visible(!codex);
+            let codex = provider == 1;
+            effort.keys[0].set_visible(codex);
+            effort.keys[5].set_visible(!codex);
             if (codex && effort.selected() == 5) || (!codex && effort.selected() == 0) {
                 effort.set_selected(3);
             }
         });
-        controls.append(&effort_keys);
-        effort.set_visible(false);
-        controls.append(&effort);
+        controls.append(&effort.row);
         configuration.append(&controls);
         root.append(&configuration);
         let prompt = gtk::TextView::new();
@@ -294,14 +336,8 @@ impl Profile {
         let task_count = label("0 selected", "mono");
         search_row.append(&task_count);
         tools.append(&search_row);
-        let task_filter =
-            gtk::DropDown::from_strings(&["All open", "Backlog", "Ready", "Active", "In review"]);
-        tools.append(&segments(
-            &task_filter,
-            &["All open", "Backlog", "Ready", "Active", "In review"],
-        ));
-        task_filter.set_visible(false);
-        tools.append(&task_filter);
+        let task_filter = segments(&["All open", "Backlog", "Ready", "Active", "In review"], 0);
+        tools.append(&task_filter.row);
         assignment.append(&tools);
         let task_box = gtk::Grid::builder()
             .column_homogeneous(true)
@@ -355,11 +391,7 @@ impl Profile {
             _ => "builder",
         });
         let model = self.model.text().trim().to_string();
-        let effort = self
-            .effort
-            .selected_item()
-            .and_downcast::<gtk::StringObject>()
-            .map(|s| s.string().to_string());
+        let effort = EFFORTS.get(self.effort.selected() as usize);
         let mut payload = json!({"project_id":project,"provider":if self.provider.selected()==0{"claude"}else{"codex"},"role":role,"model":if model.is_empty(){None}else{Some(model)},"effort":effort,"bus_writes":self.writes.is_active(),"allow_ui":self.ui_access.is_active(),"prompt":self.prompt()});
         let worktree = self.worktree.text().trim().to_string();
         if !worktree.is_empty() {
@@ -480,9 +512,7 @@ impl Profile {
         });
         let f = filter.clone();
         profile.task_search.connect_search_changed(move |_| f());
-        profile
-            .task_filter
-            .connect_selected_notify(move |_| filter());
+        profile.task_filter.connect_changed(move |_| filter());
         if tasks.iter().all(|t| text(t, "column") == "done") {
             profile.task_box.attach(
                 &label(
@@ -565,16 +595,13 @@ impl Ui {
         body.add_css_class("launch-body");
         self.launch_box.append(&scrolled(&body));
 
-        let mode = gtk::DropDown::from_strings(&["Solo agents", "Review group"]);
-        mode.set_widget_name("launch-mode");
         if !compact {
             body.append(&launch_heading(
                 "Session type",
                 "Choose how the agents share a worktree.",
             ));
         }
-        body.append(&choice_cards(
-            &mode,
+        let mode = choice_cards(
             &[
                 (
                     "user",
@@ -587,9 +614,9 @@ impl Ui {
                     "Builders and one read-only reviewer share a branch.",
                 ),
             ],
-        ));
-        mode.set_visible(false);
-        body.append(&mode);
+        );
+        mode.row.set_widget_name("launch-mode");
+        body.append(&mode.row);
         let members = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         let members_title = launch_heading(
             "Agents",
@@ -601,20 +628,15 @@ impl Ui {
         }
         members.append(&members_title);
         body.append(&members);
-        // The solo agent count: entry n launches n + 1 agents.
-        let count = gtk::DropDown::from_strings(&["1", "2", "3", "4", "5", "6"]);
-        count.set_visible(false);
-        count.set_widget_name("launch-count-control");
-        members.append(&count);
-        let count_keys = segments(&count, &["1", "2", "3", "4", "5", "6"]);
-        count_keys.add_css_class("launch-count");
-        members.append(&count_keys);
-        let builders =
-            gtk::DropDown::from_strings(&["One builder + reviewer", "Two builders + reviewer"]);
-        builders.set_visible(false);
-        members.append(&builders);
-        let builder_keys = segments(&builders, &["1 builder", "2 builders"]);
-        members.append(&builder_keys);
+        // The solo agent count: key n launches n + 1 agents.
+        let count = segments(&["1", "2", "3", "4", "5", "6"], 0);
+        count.row.add_css_class("launch-count");
+        count.row.set_widget_name("launch-count");
+        members.append(&count.row);
+        // A review group: one or two builders, plus the reviewer.
+        let builders = segments(&["1 builder", "2 builders"], 0);
+        builders.row.set_widget_name("launch-builders");
+        members.append(&builders.row);
         // Six solo agents at most; a review group uses the first three.
         let profiles: Rc<Vec<_>> = Rc::new((0..AGENTS).map(|i| Profile::new(i, compact)).collect());
         // The open tasks, once task.list answers; each agent's cards are built from them when
@@ -652,7 +674,7 @@ impl Ui {
                 let title = title.clone();
                 let mode = mode.downgrade();
                 move || {
-                    let (Some(p), Some(mode)) = (p.upgrade(), mode.upgrade()) else {
+                    let Some(p) = p.upgrade() else {
                         return;
                     };
                     let role = match p.role.selected() {
@@ -669,12 +691,7 @@ impl Ui {
                     } else {
                         format!("Agent {}", i + 1)
                     });
-                    let effort = p
-                        .effort
-                        .selected_item()
-                        .and_downcast::<gtk::StringObject>()
-                        .map(|s| s.string().to_string())
-                        .unwrap_or_default();
+                    let effort = EFFORTS.get(p.effort.selected() as usize).unwrap_or(&"");
                     facts.set_text(&format!(
                         "{} · {} · {}",
                         if p.provider.selected() == 0 {
@@ -687,9 +704,9 @@ impl Ui {
                     ));
                 }
             });
-            for d in [&p.provider, &p.role, &p.effort, &mode] {
+            for choice in [&p.provider, &p.role, &p.effort, &mode] {
                 let refresh = refresh.clone();
-                d.connect_selected_notify(move |_| refresh());
+                choice.connect_changed(move |_| refresh());
             }
             refresh();
             let stack = stack.downgrade();
@@ -715,16 +732,11 @@ impl Ui {
             let count = count.downgrade();
             let builders = builders.downgrade();
             let stack = stack.downgrade();
-            let count_keys = count_keys.clone();
-            let builder_keys = builder_keys.clone();
             let member_keys = member_keys.clone();
             move || {
-                let (Some(mode), Some(count), Some(builders), Some(stack)) = (
-                    mode.upgrade(),
-                    count.upgrade(),
-                    builders.upgrade(),
-                    stack.upgrade(),
-                ) else {
+                let (Some(count_keys), Some(builder_keys), Some(stack)) =
+                    (count.row.upgrade(), builders.row.upgrade(), stack.upgrade())
+                else {
                     return;
                 };
                 let group = mode.selected() == 1;
@@ -748,9 +760,9 @@ impl Ui {
                 stack.set_visible_child_name("agent-0");
             }
         });
-        for d in [&mode, &builders, &count] {
+        for choice in [&mode, &builders, &count] {
             let update = update.clone();
-            d.connect_selected_notify(move |_| update());
+            choice.connect_changed(move |_| update());
         }
         update();
         let hint=label("Each solo agent gets the project's default checkout: its own worktree, or the primary checkout when a plugin asks for it. A review group shares one branch, with a separate reviewer and one or two builders. Choose the group's task queue on agent 1.","dim");
@@ -763,7 +775,6 @@ impl Ui {
         progress.set_wrap(true);
         progress.set_hexpand(true);
         footer.append(&progress);
-        builders.set_widget_name("launch-builders");
         let start = button("Launch session", "primary");
         start.set_valign(gtk::Align::Center);
         start.set_widget_name("launch-start");

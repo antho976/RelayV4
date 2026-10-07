@@ -3761,7 +3761,7 @@
       }
     },
     "usage.report": {
-      "summary": "Provider metering pushed by its statusLine/hook",
+      "summary": "Provider metering an agent reports for its own session",
       "kind": "mutation",
       "audit": "never",
       "undo": "none",
@@ -14081,6 +14081,11 @@
         },
         "name": {
           "type": "string"
+        },
+        "description": {
+          "type": "string",
+          "description": "What the skill is for: the `description` of its SKILL.md front matter, else the first\nline of prose after it; empty when there is neither. Read from the whole body, so it is\nthere even when `skill.list {summary: true}` cuts the body short.",
+          "default": ""
         },
         "body": {
           "type": "string"

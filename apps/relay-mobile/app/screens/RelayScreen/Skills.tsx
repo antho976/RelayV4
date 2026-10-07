@@ -19,7 +19,7 @@ import {
     useProjectParam,
 } from '@components/relay'
 import { attempt, errorCode, errorText, settingsHref } from '@components/relay/settings/common'
-import { Skill, skillSummary } from '@components/relay/settings/types'
+import { Skill } from '@components/relay/settings/types'
 import { Logger } from '@lib/state/Logger'
 import { Theme } from '@lib/theme/ThemeManager'
 
@@ -135,7 +135,7 @@ const SkillsScreen = () => {
                                 key={skill.id}
                                 label={skill.name}
                                 detail={
-                                    skillSummary(skill.body) ||
+                                    skill.description ||
                                     (skill.source_url ? skill.source_url : undefined)
                                 }
                                 icon="book"

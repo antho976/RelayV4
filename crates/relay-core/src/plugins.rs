@@ -150,7 +150,7 @@ fn load(bundle: &'static BundledPlugin) -> Result<Loaded> {
         entry.files.push((inner, bytes));
         if inner == "SKILL.md" {
             entry.body = String::from_utf8_lossy(bytes).into_owned();
-            entry.description = frontmatter(&entry.body, "description").unwrap_or_default();
+            entry.description = skill_description(&entry.body);
         }
     }
     Ok(Loaded {
@@ -160,23 +160,53 @@ fn load(bundle: &'static BundledPlugin) -> Result<Loaded> {
     })
 }
 
-/// One single-line value from a `SKILL.md` YAML front matter block.
+/// One value from a `SKILL.md` YAML front matter block, the one reader of it for plugin skills,
+/// installed skills' names (`github.rs`) and every skill's bus `description` (RA-709). The block
+/// opens the body, blank lines before it aside, and `key` sits at column 0: a key nested under
+/// another one belongs to that one. A plain value has its quotes trimmed; a `>` or `|` block is
+/// folded from the indented lines under it into one line.
 pub fn frontmatter(body: &str, key: &str) -> Option<String> {
-    let mut lines = body.lines();
+    let mut lines = body.lines().skip_while(|line| line.trim().is_empty()).peekable();
     if lines.next()?.trim() != "---" {
         return None;
     }
-    for line in lines {
+    while let Some(line) = lines.next() {
         let line = line.trim_end();
         if line.trim() == "---" {
             return None;
         }
-        if let Some(value) = line.strip_prefix(key).and_then(|rest| rest.strip_prefix(':')) {
-            let value = value.trim().trim_matches('"').trim_matches('\'');
-            return Some(value.to_string());
+        let Some(value) = line.strip_prefix(key).and_then(|rest| rest.strip_prefix(':')) else {
+            continue;
+        };
+        let value = value.trim();
+        let block = value.starts_with(['>', '|']) && value[1..].chars().all(|c| matches!(c, '-' | '+' | '1'..='9'));
+        if !block {
+            return Some(value.trim_matches('"').trim_matches('\'').to_string());
         }
+        let mut folded = Vec::new();
+        while let Some(line) = lines.next_if(|line| line.starts_with([' ', '\t']) || line.trim().is_empty()) {
+            folded.push(line.trim());
+        }
+        return Some(folded.into_iter().filter(|line| !line.is_empty()).collect::<Vec<_>>().join(" "));
     }
     None
+}
+
+/// What a skill is for: its front matter's `description`, else the first line of prose after
+/// the block (a heading is not prose); empty when there is neither.
+pub fn skill_description(body: &str) -> String {
+    if let Some(description) = frontmatter(body, "description").filter(|value| !value.is_empty()) {
+        return description;
+    }
+    let mut lines = body.lines().skip_while(|line| line.trim().is_empty()).peekable();
+    if lines.next_if(|line| line.trim() == "---").is_some() {
+        lines.by_ref().find(|line| line.trim() == "---");
+    }
+    lines
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with("---"))
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// Ids of the bundled plugins switched on for a project, in id order.
@@ -392,6 +422,24 @@ mod tests {
         assert_eq!(frontmatter(body, "name").as_deref(), Some("unreal-ai"));
         assert_eq!(frontmatter(body, "description").as_deref(), Some("Behavior trees, EQS"));
         assert_eq!(frontmatter("# no block\ndescription: x", "description"), None);
+        // A blank line before the block used to hide it from the client's own reader.
+        assert_eq!(frontmatter("\n---\nname: foo\n---\n", "name").as_deref(), Some("foo"));
+        // Nested keys belong to something else.
+        assert_eq!(frontmatter("---\nmetadata:\n  description: nested\ndescription: top\n---\n", "description").as_deref(), Some("top"));
+        assert_eq!(frontmatter("---\nmetadata:\n  name: nested\n---\n", "name"), None);
+        assert_eq!(frontmatter("---\ndescription: >\n  Folded over\n\n  two lines.\nname: foo\n---\n", "description").as_deref(), Some("Folded over two lines."));
+        assert_eq!(frontmatter("---\ndescription: |-\n  Kept\n  apart\n---\n", "description").as_deref(), Some("Kept apart"));
+        assert_eq!(frontmatter("---\ndescription: >= 2 of them\n---\n", "description").as_deref(), Some(">= 2 of them"));
+    }
+
+    #[test]
+    fn a_skill_without_a_description_is_described_by_its_first_prose() {
+        assert_eq!(skill_description("---\nname: foo\ndescription: \"Does foo\"\n---\n# Foo\nProse."), "Does foo");
+        assert_eq!(skill_description("\n---\nname: foo\n---\nFirst prose.\n"), "First prose.");
+        assert_eq!(skill_description("---\nname: foo\ndescription:\n---\n\n# Foo\n\nFirst prose.\n"), "First prose.");
+        assert_eq!(skill_description("# Title\n\nNo front matter here.\n"), "No front matter here.");
+        assert_eq!(skill_description("---\nname: foo\n"), "", "an unclosed block has no prose after it");
+        assert_eq!(skill_description(""), "");
     }
 
     #[test]

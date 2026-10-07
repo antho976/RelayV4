@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Instant;
 
 pub fn register(e: &mut Engine) {
@@ -111,34 +112,15 @@ pub fn register(e: &mut Engine) {
             ctx.after_commit(move |engine| {
                 let Ok(handle) = tokio::runtime::Handle::try_current() else { return };
                 handle.spawn(async move {
-                    // CPU and RSS are two /proc reads and refresh every tick. Disk is a tree walk,
-                    // so it re-measures every 15th tick (30 s) on a blocking worker instead.
                     let mut tick: u32 = 0;
                     while engine.resource_watch.load(Ordering::SeqCst) && engine.resource_watch_epoch.load(Ordering::SeqCst) == epoch {
                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                         if !engine.resource_watch.load(Ordering::SeqCst) || engine.resource_watch_epoch.load(Ordering::SeqCst) != epoch { break; }
                         tick = tick.wrapping_add(1);
-                        if tick.is_multiple_of(15) {
-                            // Its own thread rather than a pool one, so the walk can run niced
-                            // without leaving a pool thread demoted for whatever runs there next.
-                            let engine = engine.clone();
-                            std::thread::Builder::new()
-                                .name("resource-disk".into())
-                                .spawn(move || {
-                                    crate::background_priority();
-                                    refresh_disk_cache(&engine)
-                                })
-                                .ok();
-                            continue;
-                        }
-                        // The store mutex and the /proc reads on a blocking worker: waiting on the
-                        // lock here would park a runtime thread the socket door needs (RA-341).
-                        let sampler = engine.clone();
-                        let value = tokio::task::spawn_blocking(move || {
-                            let rows = resource_rows(&sampler.store.lock()).ok()?;
-                            resource_snapshot(rows, &sampler, false).ok().and_then(|value| serde_json::to_value(value).ok())
-                        }).await.ok().flatten();
-                        if let Some(value) = value { engine.emit_system("resource.sample", value); }
+                        // The store mutex and the /proc reads on a blocking worker: waiting on the lock here
+                        // would park a runtime thread the socket door needs (RA-341).
+                        let worker = engine.clone();
+                        let _ = tokio::task::spawn_blocking(move || { watch_tick(&worker, tick); }).await;
                     }
                 });
             });
@@ -172,6 +154,34 @@ pub fn register(e: &mut Engine) {
         }
         Ok(ReconcileOut { actions: purged.actions })
     });
+}
+
+/// The resource watch re-measures disk on every this-many ticks (30 s at one tick per 2 s).
+const DISK_EVERY: u32 = 15;
+
+/// One resource-watch tick, without its timer. CPU and RSS are two /proc reads, so most ticks
+/// publish a `resource.sample` with them and the cached disk numbers. Disk is a tree walk, so
+/// every [`DISK_EVERY`]th tick re-measures it instead, on a thread of its own rather than a
+/// pool one, so the walk can run niced without leaving a pool thread demoted for whatever runs
+/// there next; that thread publishes its own sample. Returns it when one was started.
+fn watch_tick(engine: &Arc<Engine>, tick: u32) -> Option<std::thread::JoinHandle<()>> {
+    if tick.is_multiple_of(DISK_EVERY) {
+        let engine = engine.clone();
+        return std::thread::Builder::new()
+            .name("resource-disk".into())
+            .spawn(move || {
+                crate::background_priority();
+                refresh_disk_cache(&engine)
+            })
+            .ok();
+    }
+    let rows = {
+        let conn = engine.store.lock();
+        resource_rows(&conn).ok()
+    };
+    let value = rows.and_then(|rows| resource_snapshot(rows, engine, false).ok()).and_then(|value| serde_json::to_value(value).ok());
+    if let Some(value) = value { engine.emit_system("resource.sample", value); }
+    None
 }
 
 /// A snapshot from the disk cache. Never walks the filesystem, so it is safe to call from inside
@@ -339,6 +349,42 @@ mod tests {
         *engine.resource_disk_refresh.lock().unwrap() = (false, Some(completed));
         refresh_disk_cache(&engine);
         assert_eq!(*engine.resource_disk_refresh.lock().unwrap(), (false, Some(completed)));
+    }
+
+    /// RA-674: the watch loop's body. Ticks between disk refreshes sample from the cache and
+    /// never walk a worktree; every 15th re-measures disk on its own thread, and later ticks
+    /// carry what it found.
+    #[test]
+    fn every_fifteenth_watch_tick_refreshes_disk_and_the_rest_read_the_cache() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("asset"), b"asset").unwrap();
+        let engine = Engine::new(crate::Instance::Test, crate::Store::open_memory().unwrap());
+        engine.store.with_tx(|tx| {
+            tx.execute("INSERT INTO workspaces(path,name,ord,created_at,updated_at) VALUES ('/w','w',0,'t','t')", [])?;
+            tx.execute("INSERT INTO projects(workspace_id,path,name,base_branch,ord,created_at,updated_at) VALUES (1,'/w/p','p','main',0,'t','t')", [])?;
+            tx.execute("INSERT INTO sessions(name,project_id,provider,worktree,state,created_at,updated_at) VALUES ('fixture',1,'claude',?1,'running','t','t')",
+                [root.path().display().to_string()])?;
+            Ok(())
+        }).unwrap();
+        let mut events = engine.subscribe();
+        let mut sample = || {
+            let event = events.try_recv().expect("tick published no sample");
+            assert_eq!(event.ev, "resource.sample");
+            event.payload
+        };
+        for tick in 1..DISK_EVERY {
+            assert!(watch_tick(&engine, tick).is_none(), "tick {tick} started a disk walk");
+            let value = sample();
+            assert_eq!(value["panes"][0]["session"], "fixture");
+            assert_eq!(value["worktrees"], json!([]), "tick {tick} walked the worktree");
+        }
+        assert_eq!(*engine.resource_disk_refresh.lock().unwrap(), (false, None));
+        watch_tick(&engine, DISK_EVERY).expect("tick 15 started no disk walk").join().unwrap();
+        assert_eq!(sample()["worktrees"][0]["disk_mb"], bytes_mb(5));
+        assert!(engine.resource_disk_refresh.lock().unwrap().1.is_some());
+        std::fs::write(root.path().join("asset"), b"asset changed").unwrap();
+        assert!(watch_tick(&engine, DISK_EVERY + 1).is_none());
+        assert_eq!(sample()["worktrees"][0]["disk_mb"], bytes_mb(5), "a sampling tick re-measured disk");
     }
 
     #[test]

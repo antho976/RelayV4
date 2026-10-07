@@ -35,6 +35,11 @@ async fn until(ui: &Rc<Ui>, op: &str, done: impl Fn(&Value) -> bool, reason: &st
 
 pub async fn run(ui: &Rc<Ui>) -> Result<(), String> {
     let project = ui.project.get();
+    // Start from the wall with the sidebar drawn. The startup layout restore may still be
+    // reading, and may reopen the page an earlier run left (Settings, after the tools part),
+    // where the project sidebar is hidden; navigating first also drops a restore still pending.
+    ui.navigate("agents");
+    wait_for(|| ui.sidebar.is_mapped() && ui.sidebar.width() > 0, "Project sidebar drawn").await?;
     let sidebar_width = ui.sidebar.width();
     let ws = ui.workspaces.borrow().first().cloned().ok_or("Fixture workspace missing")?;
     let ws_id = ws["id"].as_i64().unwrap();

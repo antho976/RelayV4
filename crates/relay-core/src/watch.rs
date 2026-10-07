@@ -9,6 +9,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// How long the watcher waits after the first event of a burst before it emits one
+/// `file.changed`. Tests derive their "nothing arrived" windows from it.
+pub const DEBOUNCE: Duration = Duration::from_millis(125);
+
 // A status refresh can rewrite only index stat fields. Compare the staged tree
 // rather than index bytes so this cache maintenance does not trigger another scan.
 fn index_signature(root: &Path) -> Option<u64> {
@@ -170,7 +174,7 @@ pub fn ensure(engine: &Engine, root: &Path, project_id: relay_bus::types::Id) {
             let pending = pending_cb.clone();
             let root = callback_root.clone();
             std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(125));
+                std::thread::sleep(DEBOUNCE);
                 pending.store(false, Ordering::SeqCst);
                 if let Some(engine) = weak.upgrade() {
                     let payload =

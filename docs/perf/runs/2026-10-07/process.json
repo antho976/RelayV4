@@ -1,0 +1,95 @@
+{
+  "window_seconds": 30,
+  "phases": {
+    "idle_six_quiet_sessions": {
+      "seconds": 30.01,
+      "cpu_percent": 0.033,
+      "cpu_ms_total": 10.0,
+      "wakeups_per_s": 4.8,
+      "preemptions_per_s": 0.2,
+      "rss_mb": 4.0,
+      "threads": 32
+    },
+    "idle_resources_watch_on": {
+      "seconds": 30.01,
+      "cpu_percent": 0.033,
+      "cpu_ms_total": 10.0,
+      "wakeups_per_s": 5.5,
+      "preemptions_per_s": 0.6,
+      "rss_mb": 4.8,
+      "threads": 32
+    },
+    "output_60_lines_per_s_unattached": {
+      "seconds": 30.01,
+      "cpu_percent": 0.1,
+      "cpu_ms_total": 30.0,
+      "wakeups_per_s": 65.7,
+      "preemptions_per_s": 2.6,
+      "rss_mb": 5.9,
+      "threads": 32
+    },
+    "output_60_lines_per_s_attached": {
+      "seconds": 30.01,
+      "cpu_percent": 0.2,
+      "cpu_ms_total": 60.0,
+      "wakeups_per_s": 212.3,
+      "preemptions_per_s": 4.5,
+      "rss_mb": 4.3,
+      "threads": 32,
+      "client_frames": 1869,
+      "client_bytes": 504328
+    },
+    "burst_50k_lines_attached": {
+      "seconds_until_stream_quiet": 1.067,
+      "engine_cpu_ms": 80.0,
+      "payload_bytes": 4900000,
+      "payload_bytes_received": 4877565,
+      "wire_bytes_received": 8668424,
+      "frames": 27881,
+      "frames_dropped": 1362,
+      "mib_per_s_to_client": 7.7
+    }
+  },
+  "startup_s_fresh_store": 0.035,
+  "rss_mb_fresh": 17.0,
+  "rss_mb_six_sessions": 24.2,
+  "recovery_report": {
+    "at": "2026-10-07T18:03:13.989138166Z",
+    "reaped_pids": [],
+    "fsck_fixes": [
+      "session sly-puffin: running \u2192 restorable (pid 4121429 is dead)",
+      "session amber-bison: running \u2192 restorable (pid 4121475 is dead)",
+      "session quick-narwhal: running \u2192 restorable (pid 4121521 is dead)",
+      "session tidy-gannet: running \u2192 restorable (pid 4121567 is dead)",
+      "session calm-otter: running \u2192 restorable (pid 4121613 is dead)",
+      "session nimble-moose: running \u2192 restorable (pid 4121659 is dead)"
+    ],
+    "dirty_worktrees": [],
+    "tasks_reset_offered": []
+  },
+  "restart_s": {
+    "with_six_live_sessions": 0.016,
+    "clean": [
+      0.01,
+      0.005
+    ]
+  },
+  "cli": {
+    "ping": {
+      "min_ms": 1.07,
+      "p50_ms": 1.21,
+      "max_ms": 1.97
+    },
+    "q_session_list": {
+      "min_ms": 1.17,
+      "p50_ms": 1.42,
+      "max_ms": 2.06
+    },
+    "q_app_status": {
+      "min_ms": 1.23,
+      "p50_ms": 1.46,
+      "max_ms": 2.62
+    }
+  },
+  "engine_binary_bytes": 418137488
+}

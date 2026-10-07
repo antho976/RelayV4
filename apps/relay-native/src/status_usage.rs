@@ -112,19 +112,6 @@ fn ago(at: u64) -> String {
     crate::relative::ago_unix(at, crate::relative::Form::CompactAgo)
 }
 
-fn span(seconds: u64) -> String {
-    let (days, hours, minutes) = (seconds / 86_400, seconds % 86_400 / 3600, seconds % 3600 / 60);
-    if days > 0 {
-        format!("{days}d {hours}h")
-    } else if hours > 0 {
-        format!("{hours}h {minutes}m")
-    } else if minutes > 0 {
-        format!("{minutes}m")
-    } else {
-        "under a minute".into()
-    }
-}
-
 /// "21:30" today, "Tue 21:30" on another day.
 fn wall_clock(at: u64) -> Option<String> {
     let when = glib::DateTime::from_unix_local(at as i64).ok()?;
@@ -139,8 +126,8 @@ fn reset_text(window: &Window, now: u64) -> String {
     }
     match (window.resets_at, &window.resets_in) {
         (Some(at), _) => match wall_clock(at) {
-            Some(clock) => format!("Resets in {} · {clock}", span(at - now)),
-            None => format!("Resets in {}", span(at - now)),
+            Some(clock) => format!("Resets in {} · {clock}", crate::relative::span(at - now)),
+            None => format!("Resets in {}", crate::relative::span(at - now)),
         },
         (None, Some(label)) => format!("Resets in {label}"),
         (None, None) => "Reset time not reported".into(),
@@ -926,7 +913,6 @@ mod tests {
         assert_eq!(interval(&prefs), 15);
         assert_eq!(ago(now() - 30), "just now");
         assert_eq!(ago(now() - 3 * 60 - 5), "3m ago");
-        assert_eq!(span(2 * 86_400 + 5 * 3600), "2d 5h");
         assert_eq!(humanize("seven_day_opus"), "Seven day opus");
     }
 

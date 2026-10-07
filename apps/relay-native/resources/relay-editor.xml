@@ -1,12 +1,15 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- Relay-2 theme.ts SYN_MATTE, shared by its three palettes. -->
+<!-- Relay-2 theme.ts SYN_MATTE, shared by its three palettes. fonts.rs writes one copy per
+     appearance mode: each token name after an at sign becomes that mode's value from
+     fonts::PALETTES, and live, held and waiting the fixed status colours (fonts::STATUS). The remaining
+     literals are the syntax palette, which is the same in every mode. -->
 <style-scheme id="relay-RELAY_MODE" name="Relay RELAY_MODE" version="1.0" parent-scheme="Adwaita-dark">
-  <style name="text" foreground="#dcdcda" background="RELAY_BACKGROUND"/>
+  <style name="text" foreground="#dcdcda" background="@screen"/>
   <style name="selection" background="#3c3c3b"/>
-  <style name="cursor" foreground="#ececea"/>
+  <style name="cursor" foreground="@ink"/>
   <style name="current-line" background="#101012"/>
-  <style name="line-numbers" foreground="#77777a" background="RELAY_BACKGROUND"/>
-  <style name="current-line-number" foreground="#ececea" background="RELAY_BACKGROUND"/>
+  <style name="line-numbers" foreground="@faint" background="@screen"/>
+  <style name="current-line-number" foreground="@ink" background="@screen"/>
   <style name="def:keyword" foreground="#c979d6" bold="false"/>
   <style name="def:statement" foreground="#c979d6" bold="false"/>
   <style name="def:type" foreground="#3ec5cf"/>
@@ -20,10 +23,10 @@
   <style name="def:boolean" foreground="#f2cf6b"/>
   <style name="def:comment" foreground="#6e6e70" italic="false"/>
   <style name="def:doc-comment" foreground="#6e6e70"/>
-  <style name="def:operator" foreground="#a5a5a3"/>
+  <style name="def:operator" foreground="@secondary"/>
   <style name="def:identifier" foreground="#dcdcda"/>
   <style name="def:preprocessor" foreground="#c979d6"/>
-  <style name="def:error" foreground="#e5382e"/>
+  <style name="def:error" foreground="@held"/>
   <!-- Adwaita-dark styles some languages' tokens by their own ids, which a lookup finds
        before the def:* style the language maps them to: point each back at this palette, and
        own the def:* styles that Adwaita-dark would otherwise lend. -->
@@ -66,9 +69,9 @@
   <style name="xml:element-name" use-style="def:identifier"/>
   <style name="xml:namespace" use-style="def:identifier"/>
   <style name="xml:processing-instruction" use-style="def:preprocessor"/>
-  <style name="diff:added-line" foreground="#2ec469"/>
-  <style name="diff:removed-line" foreground="#e5382e"/>
-  <style name="diff:changed-line" foreground="#f0a828"/>
+  <style name="diff:added-line" foreground="@live"/>
+  <style name="diff:removed-line" foreground="@held"/>
+  <style name="diff:changed-line" foreground="@waiting"/>
   <style name="diff:location" use-style="def:function"/>
   <style name="diff:diff-file" use-style="def:keyword"/>
 </style-scheme>

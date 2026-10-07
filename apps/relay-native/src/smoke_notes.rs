@@ -11,7 +11,7 @@ pub async fn run(ui: &Rc<Ui>) -> Result<(), String> {
     require(project != 0, "Fixture project must be ready")?;
     let note = ui.call("notes.create",json!({"project_id":project,"title":"Plan","body":"Ordinary Plan fixture","pinned":true})).await.map_err(|e|e.to_string())?;
     let id = note["id"].as_i64().ok_or("Missing fixture note id")?;
-    crate::pages::open_note(ui, note);
+    crate::pages::open_note(ui, note.clone());
     let owner = ui
         .notes_window
         .borrow()
@@ -26,6 +26,10 @@ pub async fn run(ui: &Rc<Ui>) -> Result<(), String> {
         "Notes library loaded",
     )
     .await?;
+    // The first load restores the tabs an earlier run left open (a full smoke run's notes page
+    // leaves its own note active), and that may take the tab from Plan. Open it again, as a
+    // person would from the library, so the checks below look at Plan.
+    crate::pages::open_note(ui, note);
     require(
         owner.window.is_decorated()
             && owner.window.is_resizable()

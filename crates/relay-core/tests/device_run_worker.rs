@@ -1,20 +1,15 @@
 //! RA-141: a device run follows its app, not one pid forever. The run ends when the app exits,
 //! and an app that dies during startup is reported as a crash, with its stack.
 
-use relay_bus::{Actor, Request};
-use relay_core::engine::{Door, Engine};
-use relay_core::{Instance, Store};
+mod common;
+
+use common::ok;
+use relay_core::engine::Engine;
 use serde_json::{json, Value};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-fn ok(e: &Engine, op: &str, payload: Value) -> Value {
-    e.dispatch(Request::new(Actor::User, op, payload), Door::InProcess)
-        .into_result()
-        .unwrap_or_else(|error| panic!("{op} failed: {error:?}"))
-}
 
 fn executable(path: &Path, script: &str) {
     std::fs::write(path, script).unwrap();
@@ -52,7 +47,7 @@ exit 1
 }
 
 fn fixture(pids: &str, crash: &str) -> (Arc<Engine>, tempfile::TempDir, i64) {
-    let e = Engine::new(Instance::Test, Store::open_memory().unwrap());
+    let e = common::engine();
     let dir = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(dir.path()).unwrap();
     let adb = fake_adb(&root, pids, crash);

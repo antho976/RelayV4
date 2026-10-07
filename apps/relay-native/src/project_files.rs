@@ -441,12 +441,8 @@ pub(super) fn file_image(path: &str, size: i32) -> gtk::Image {
     image
 }
 
-/// Whether a porcelain entry is unmerged: git marks these DD, AU, UD, UA, DU, AA and UU,
-/// so either column U, or both added, or both deleted.
-pub(super) fn is_unmerged(file: &Value) -> bool {
-    let (index, worktree) = (text(file, "index"), text(file, "worktree"));
-    index == "U" || worktree == "U" || matches!((index, worktree), ("A", "A") | ("D", "D"))
-}
+// Whether a porcelain entry is unmerged (DD, AU, UD, UA, DU, AA or UU), as the Git panel reads it.
+use relay_client::git_view::is_conflict as is_unmerged;
 
 /// One porcelain status code as VS Code letters it, with its colour class.
 pub(super) fn status_letter(code: &str) -> Option<(&'static str, &'static str, &'static str)> {

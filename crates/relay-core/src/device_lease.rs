@@ -457,12 +457,7 @@ fn clock(ts: &str) -> String {
 }
 
 fn ago(elapsed: Duration) -> String {
-    let secs = elapsed.as_secs();
-    match secs {
-        0..=59 => format!("{secs}s"),
-        60..=3599 => format!("{}m {}s", secs / 60, secs % 60),
-        _ => format!("{}h {}m", secs / 3600, (secs % 3600) / 60),
-    }
+    crate::time::span(elapsed.as_secs(), crate::time::Unit::Second)
 }
 
 /// What an agent's shell command does to a device, when it does anything that could clobber

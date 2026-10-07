@@ -13,8 +13,10 @@ caught before it is merged rather than in use.
 **Do not run `cargo test --workspace` in a headless environment.** The workspace
 includes `relay-native`, and building it stops at `pango-sys` long before any
 test runs. Plain `cargo test` uses the default members, which are exactly the
-five headless crates (`relay-bus`, `relay-core`, `relay-cli`, `relay-remote`,
-`relay-board` — the native board's GTK-free logic).
+six headless crates (`relay-bus`, `relay-core`, `relay-cli`, `relay-remote`, and
+the native client's GTK-free logic: `relay-board` for the board, `relay-client`
+for the Git panel's diff/graph/status helpers and the device mirror's decoder
+gate and input payloads).
 The full list in `README.md` is for a developer machine with GTK.
 
 ## The mobile app: `apps/relay-mobile`

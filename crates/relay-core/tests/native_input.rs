@@ -1,16 +1,18 @@
 //! The native client's `device.mirror.input` wire format, pinned on the engine side (RA-692).
 //!
 //! `apps/relay-native` cannot be built in CI (GTK 4.22), so the JSON its mirror sends would
-//! otherwise never meet the engine in a test. Every payload below is copied literally from the
-//! client — field names and value types as its `json!` builds them — with the function it
-//! mirrors named beside it. Each must be accepted and must reach the device's control socket
-//! as exactly the bytes the matching `relay_core::mirror` encoder produces. If the client
-//! changes a payload, change it here too; if the engine stops accepting one, the mirror broke.
+//! otherwise never meet the engine in a test. Every payload below is built by the client's own
+//! builders in `relay_client::mirror::input` (the headless half of `relay-native`'s mirror),
+//! with the call site that sends it named beside it, so a payload change cannot drift past this
+//! test. Each must be accepted and must reach the device's control socket as exactly the bytes
+//! the matching `relay_core::mirror` encoder produces; if the engine stops accepting one, the
+//! mirror broke.
 
 mod common;
 
 use common::ok;
 use relay_core::engine::Engine;
+use relay_client::mirror::input;
 use relay_core::mirror::{self, ACTION_DOWN, ACTION_MOVE, ACTION_UP, META_NONE};
 use serde_json::{json, Value};
 use std::io::Read;
@@ -82,22 +84,18 @@ impl Mirror {
     }
 }
 
-/// `mirror::input::touch` — the client's only touch builder, used by `MirrorView::wire_pointer`
-/// for drag begin (DOWN), update (MOVE), end and cancel (UP). `w`/`h` are the stream size.
-fn client_touch(action: u8, (x, y): (i32, i32), (w, h): (i32, i32)) -> Value {
-    let pressure = if action == 1 { 0.0 } else { 1.0 };
-    json!({"type":"touch","action":action,"x":x,"y":y,"w":w,"h":h,"pressure":pressure})
-}
-
 #[test]
 fn a_drag_lands_as_down_move_up_touches() {
+    // `input::touch`, the client's only touch builder: `MirrorView::wire_pointer` sends it for
+    // drag begin (DOWN), update (MOVE), end and cancel (UP). `w`/`h` are the stream size.
     let mut m = mirror();
     let (w, h) = (m.size.0 as i32, m.size.1 as i32);
-    // The client's DOWN/UP/MOVE constants are 0/1/2, which must be the engine's.
+    // The client's DOWN/UP/MOVE constants must be the engine's, and are 0/1/2 on the wire.
+    assert_eq!((input::DOWN, input::UP, input::MOVE), (ACTION_DOWN, ACTION_UP, ACTION_MOVE));
     assert_eq!((ACTION_DOWN, ACTION_UP, ACTION_MOVE), (0, 1, 2));
-    m.sends(client_touch(0, (10, 20), (w, h)), &mirror::touch(ACTION_DOWN, 10, 20, w as u16, h as u16, 1.0));
-    m.sends(client_touch(2, (30, 40), (w, h)), &mirror::touch(ACTION_MOVE, 30, 40, w as u16, h as u16, 1.0));
-    m.sends(client_touch(1, (w - 1, h - 1), (w, h)), &mirror::touch(ACTION_UP, w - 1, h - 1, w as u16, h as u16, 0.0));
+    m.sends(input::touch(input::DOWN, (10, 20), (w, h)), &mirror::touch(ACTION_DOWN, 10, 20, w as u16, h as u16, 1.0));
+    m.sends(input::touch(input::MOVE, (30, 40), (w, h)), &mirror::touch(ACTION_MOVE, 30, 40, w as u16, h as u16, 1.0));
+    m.sends(input::touch(input::UP, (w - 1, h - 1), (w, h)), &mirror::touch(ACTION_UP, w - 1, h - 1, w as u16, h as u16, 0.0));
 }
 
 #[test]
@@ -106,19 +104,19 @@ fn secondary_and_middle_click_send_back_and_home() {
     let mut m = mirror();
     let mut back = mirror::back_or_screen_on(ACTION_DOWN).to_vec();
     back.extend_from_slice(&mirror::back_or_screen_on(ACTION_UP));
-    m.sends(json!({"type":"back"}), &back);
-    m.sends(json!({"type":"home"}), &mirror::key_press(mirror::KEYCODE_HOME, META_NONE));
+    m.sends(input::button("back"), &back);
+    m.sends(input::button("home"), &mirror::key_press(mirror::KEYCODE_HOME, META_NONE));
 }
 
 #[test]
 fn wheel_and_touchpad_scroll_at_the_pointer() {
-    // `MirrorView::wire_pointer`, the scroll controller. `hscroll`/`vscroll` are the f32 pair
-    // `input::scroll_amount` returns: a wheel notch is ±1, a touchpad a fraction of one.
+    // `MirrorView::wire_pointer`, the scroll controller: `input::scroll` with the f32 pair
+    // `input::scroll_amount` returns — a wheel notch is ±1, a touchpad a fraction of one.
     let mut m = mirror();
     let (w, h) = (m.size.0 as i32, m.size.1 as i32);
     for (at, hscroll, vscroll) in [((w / 2, h / 2), 0.0_f32, -1.0_f32), ((5, 7), 0.5_f32, 0.25_f32), ((0, h - 1), -1.0_f32, 1.0_f32)] {
         m.sends(
-            json!({"type":"scroll","x":at.0,"y":at.1,"w":w,"h":h,"hscroll":hscroll,"vscroll":vscroll}),
+            input::scroll(at, (w, h), hscroll, vscroll),
             &mirror::scroll(at.0, at.1, w as u16, h as u16, hscroll, vscroll),
         );
     }
@@ -126,37 +124,36 @@ fn wheel_and_touchpad_scroll_at_the_pointer() {
 
 #[test]
 fn ctrl_v_pastes_the_desktop_clipboard() {
-    // `MirrorView::wire_keys`, Ctrl+V: one clipboard message with `paste`, no `sequence`.
+    // `MirrorView::wire_keys`, Ctrl+V: `input::paste`, one clipboard message, no `sequence`.
     let mut m = mirror();
     let text = "pasted from the desktop — ünïcode too";
-    m.sends(json!({"type":"setclipboard","text":text,"paste":true}), &mirror::set_clipboard(true, text));
+    m.sends(input::paste(text), &mirror::set_clipboard(true, text));
 }
 
 #[test]
 fn keys_go_down_and_up_with_their_meta_state() {
-    // `MirrorView::wire_keys`: key_pressed sends action 0, key_released action 1, `meta` from
+    // `MirrorView::wire_keys`: `input::key`, DOWN on key_pressed and UP on release, `meta` from
     // `input::meta` (shift 0x1, alt 0x2, ctrl 0x1000). Enter plain; Ctrl+Shift+Z as a chord.
     let mut m = mirror();
     for (keycode, meta) in [(66_u32, 0_u32), (54, 0x1001), (4, 0x2)] {
-        m.sends(json!({"type":"key","action":0,"keycode":keycode,"meta":meta}), &mirror::keycode(ACTION_DOWN, keycode, 0, meta));
-        m.sends(json!({"type":"key","action":1,"keycode":keycode,"meta":meta}), &mirror::keycode(ACTION_UP, keycode, 0, meta));
+        m.sends(input::key(input::DOWN, keycode, meta), &mirror::keycode(ACTION_DOWN, keycode, 0, meta));
+        m.sends(input::key(input::UP, keycode, meta), &mirror::keycode(ACTION_UP, keycode, 0, meta));
     }
 }
 
 #[test]
 fn printable_keys_go_as_text_one_character_at_a_time() {
-    // `MirrorView::wire_keys`: an unmodified printable key is `c.to_string()`.
+    // `MirrorView::wire_keys`: an unmodified printable key is `input::text(c)`.
     let mut m = mirror();
     for c in ['a', 'Z', ' ', 'é', '€'] {
-        let text = c.to_string();
-        m.sends(json!({"type":"text","text":text}), &mirror::text_chunks(&text).concat());
+        m.sends(input::text(c), &mirror::text_chunks(&c.to_string()).concat());
     }
 }
 
 #[test]
 fn rail_buttons_send_their_widget_name_as_the_type() {
-    // `MirrorView::new` names each rail key, and `MirrorView::wire` sends
-    // `{"type": key.widget_name()}`. The names, in the rail's order:
+    // `MirrorView::new` names each rail key after its kind in `input::RAIL`, and
+    // `MirrorView::wire` sends `input::button(key.widget_name())`. The kinds, in the rail's order:
     let mut m = mirror();
     let mut back = mirror::back_or_screen_on(ACTION_DOWN).to_vec();
     back.extend_from_slice(&mirror::back_or_screen_on(ACTION_UP));
@@ -171,22 +168,25 @@ fn rail_buttons_send_their_widget_name_as_the_type() {
         ("notifications", mirror::expand_notification_panel().to_vec()),
         ("quicksettings", mirror::expand_settings_panel().to_vec()),
     ];
+    // A key added to, dropped from or reordered in the client's rail fails here.
+    let kinds: Vec<&str> = input::RAIL.iter().flatten().map(|(_, _, kind)| *kind).collect();
+    assert_eq!(kinds, rail.iter().map(|(kind, _)| *kind).collect::<Vec<_>>());
     for (kind, expected) in rail {
-        m.sends(json!({"type":kind}), &expected);
+        m.sends(input::button(kind), &expected);
     }
 }
 
 #[test]
 fn the_display_key_turns_the_panel_off_and_on() {
-    // `MirrorView::wire`, the display key: `{"type":"displaypower","on":on}`, toggling.
+    // `MirrorView::wire`, the display key: `input::display_power(on)`, toggling.
     let mut m = mirror();
-    m.sends(json!({"type":"displaypower","on":false}), &mirror::set_display_power(false));
-    m.sends(json!({"type":"displaypower","on":true}), &mirror::set_display_power(true));
+    m.sends(input::display_power(false), &mirror::set_display_power(false));
+    m.sends(input::display_power(true), &mirror::set_display_power(true));
 }
 
 #[test]
 fn a_stalled_decoder_asks_for_resetvideo() {
-    // `stream`'s send loop answers a decoder resync with `{"type":"resetvideo"}`.
+    // `stream`'s send loop answers a decoder resync with `input::reset_video()`.
     let mut m = mirror();
-    m.sends(json!({"type":"resetvideo"}), &mirror::reset_video());
+    m.sends(input::reset_video(), &mirror::reset_video());
 }

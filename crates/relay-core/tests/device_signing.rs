@@ -1,24 +1,13 @@
 //! RA-136: a Relay signing profile that broke, or was left half-created, can be switched off
 //! and created again, and a switched-off one never refuses a release build.
 
-use relay_bus::{Actor, BusError, Request, Response};
-use relay_core::engine::{Door, Engine};
+mod common;
+
+use common::{call, ok, refused as refusal};
+use relay_core::engine::Engine;
 use relay_core::{Instance, Store};
-use serde_json::{json, Value};
+use serde_json::json;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-
-fn call(e: &Engine, op: &str, payload: Value) -> Response {
-    e.dispatch(Request::new(Actor::User, op, payload), Door::InProcess)
-}
-
-fn ok(e: &Engine, op: &str, payload: Value) -> Value {
-    call(e, op, payload).into_result().unwrap_or_else(|error| panic!("{op} failed: {error:?}"))
-}
-
-fn refusal(response: Response) -> BusError {
-    response.error.expect("expected a refusal")
-}
 
 fn create(e: &Engine, project_id: i64) -> PathBuf {
     let profile = ok(e, "device.signing.create", json!({"project_id": project_id, "key_alias": "upload", "password": "test-secret-123"}));
@@ -37,7 +26,10 @@ fn profile_dirs(directory: &Path) -> Vec<PathBuf> {
 
 #[test]
 fn a_broken_or_half_created_signing_profile_can_be_switched_off_and_recreated() {
-    let e: Arc<Engine> = Engine::new(Instance::Test, Store::open_memory().unwrap());
+    // A store on disk, so the profile (keystore, plaintext test password) lands in this
+    // directory's `signing/` and goes with it (RA-665); an in-memory store puts it in /tmp.
+    let data = tempfile::tempdir().unwrap();
+    let e = Engine::new(Instance::Test, Store::open(&data.path().join("store.db"), false).unwrap());
     let workspace = tempfile::tempdir().unwrap();
     let repo = workspace.path().join("repo");
     std::fs::create_dir_all(repo.join(".git")).unwrap();
@@ -80,8 +72,5 @@ fn a_broken_or_half_created_signing_profile_can_be_switched_off_and_recreated() 
     assert_eq!(ok(&e, "device.signing.get", json!({"project_id": project_id}))["configured"], false);
     assert_eq!(create(&e, project_id), directory);
     assert_eq!(ok(&e, "device.signing.get", json!({"project_id": project_id}))["enabled"], true);
-
-    for path in profile_dirs(&directory) {
-        std::fs::remove_dir_all(path).unwrap();
-    }
+    assert!(directory.starts_with(data.path().join("signing")), "{directory:?}");
 }

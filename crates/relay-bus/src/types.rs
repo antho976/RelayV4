@@ -698,6 +698,11 @@ pub struct Usage {
 pub struct Skill {
     pub id: Id,
     pub name: String,
+    /// What the skill is for: the `description` of its SKILL.md front matter, else the first
+    /// line of prose after it; empty when there is neither. Read from the whole body, so it is
+    /// there even when `skill.list {summary: true}` cuts the body short.
+    #[serde(default)]
+    pub description: String,
     pub body: String,
     pub source_url: Option<String>,
     pub source_path: Option<String>,
