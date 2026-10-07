@@ -377,12 +377,26 @@ pub fn register(e: &mut Engine) {
             let mut doomed: Vec<PathBuf> = open.iter().map(|(_, wt)| PathBuf::from(wt)).filter(|wt| wt.starts_with(&pool)).collect();
             doomed.sort();
             doomed.dedup();
-            if !doomed.is_empty() {
+            // Integration checkouts and their branches go too: once the rows below are deleted,
+            // nothing else could ever find them again.
+            let integrations: Vec<(Id, String)> = {
+                let mut stmt = ctx.tx().prepare_cached(
+                    "SELECT id, worktree FROM integrations WHERE project_id=?1 AND worktree IS NOT NULL AND state!='discarded'",
+                ).bus()?;
+                let rows = stmt.query_map([pr.id], |r| Ok((r.get(0)?, r.get(1)?))).bus()?.collect::<rusqlite::Result<Vec<_>>>();
+                rows.bus()?
+            };
+            if !doomed.is_empty() || !integrations.is_empty() {
                 let project_id = pr.id;
                 ctx.after_commit(move |engine| {
                     for wt in &doomed {
                         if let Err(error) = crate::worktree::remove(&repo, wt, true) {
                             tracing::warn!(worktree = %wt.display(), %error, "removing a removed project's worktree");
+                        }
+                    }
+                    for (id, wt) in &integrations {
+                        if let Err(error) = super::integration::remove_checkout(&repo, Path::new(wt), *id) {
+                            tracing::warn!(worktree = %wt, %error, "removing a removed project's integration");
                         }
                     }
                     engine.emit_system("worktree.changed", json!({ "project_id": project_id }));

@@ -726,3 +726,49 @@ fn a_confirmed_write_over_the_comparison_cap_goes_through() {
     assert_eq!(confirmed["outcome"]["ok"], true, "{confirmed}");
     assert_eq!(std::fs::read_to_string(std::path::Path::new(&repo).join("big.dat")).unwrap(), "small now\n");
 }
+
+#[test]
+fn integrations_run_one_at_a_time_and_only_the_newest_keep_their_checkouts() {
+    let e = engine();
+    let (ws, repo) = real_repo();
+    add_project(&e, &ws, &repo);
+    let path = std::path::Path::new(&repo);
+    for branch in ["feature-a", "feature-b"] {
+        git(path, &["checkout", "-b", branch]);
+        std::fs::write(path.join(format!("{branch}.txt")), "x\n").unwrap();
+        git(path, &["add", "."]);
+        git(path, &["commit", "-m", branch]);
+        git(path, &["checkout", "main"]);
+    }
+    // Five clicks in a row: they queue behind each other instead of five concurrent checkouts.
+    let ids: Vec<i64> = (0..5).map(|_| {
+        call(&e, "integration.request", json!({"project_id":1,"branches":["feature-a","feature-b"],"build":false}))
+            .into_result().unwrap()["id"].as_i64().unwrap()
+    }).collect();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let list = call(&e, "integration.list", json!({"project_id":1})).into_result().unwrap();
+        let states: Vec<String> = list["integrations"].as_array().unwrap().iter().map(|i| i["state"].as_str().unwrap().to_string()).collect();
+        let live = states.iter().filter(|s| matches!(s.as_str(), "merging" | "building" | "deploying")).count();
+        assert!(live <= 1, "integrations ran concurrently: {states:?}");
+        // Pruning follows each finish, so wait for it as well as for the last result.
+        if states.iter().all(|s| matches!(s.as_str(), "passed" | "discarded"))
+            && states.iter().filter(|s| *s == "discarded").count() == 2 { break; }
+        assert!(std::time::Instant::now() < deadline, "integrations never finished: {states:?}");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // Retention: the newest three keep their checkout; the older two are discarded, branch and all.
+    for (n, id) in ids.iter().enumerate() {
+        let value = call(&e, "integration.get", json!({"integration_id":id})).into_result().unwrap();
+        let wt = std::path::Path::new(value["worktree"].as_str().unwrap());
+        let branch = format!("refs/heads/relay/integration-{id}");
+        let has_branch = Command::new("git").arg("-C").arg(path).args(["rev-parse", "--verify", "--quiet", &branch]).status().unwrap().success();
+        if n < 2 {
+            assert_eq!(value["state"], "discarded", "integration {id}");
+            assert!(!wt.exists() && !has_branch, "integration {id} kept its checkout");
+        } else {
+            assert_eq!(value["state"], "passed", "integration {id}");
+            assert!(wt.exists() && has_branch, "integration {id} lost its checkout");
+        }
+    }
+}

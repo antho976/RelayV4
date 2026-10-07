@@ -226,3 +226,17 @@ fn a_project_with_labelled_tasks_removes_and_so_does_its_workspace() {
     assert_eq!(out["projects_removed"], 1);
     assert_eq!(count(e, "SELECT COUNT(*) FROM labels"), 0);
 }
+
+#[test]
+fn an_integration_interrupted_by_a_restart_no_longer_blocks_removal() {
+    let f = fixture();
+    let e = &f.engine;
+    e.store.lock().execute(
+        "INSERT INTO integrations(project_id, branches, state, created_at) VALUES (1, '[]', 'building', 'now')", [],
+    ).unwrap();
+    assert_eq!(refused(call(e, "project.remove", json!({"project_id": 1}))).code, "project.activity_live");
+    relay_core::recovery::run(e).unwrap();
+    let state: String = e.store.lock().query_row("SELECT state FROM integrations", [], |r| r.get(0)).unwrap();
+    assert_eq!(state, "failed");
+    ok(e, "project.remove", json!({"project_id": 1}));
+}

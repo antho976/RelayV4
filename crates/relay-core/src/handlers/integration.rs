@@ -36,9 +36,8 @@ pub fn register(e: &mut Engine) {
         let parent = ctx.req_id;
         ctx.set_project(project.id);
         ctx.emit("integration.changed", serde_json::to_value(&integration).bus()?);
-        ctx.after_commit(move |engine| {
-            std::thread::spawn(move || run(engine, id, parent));
-        });
+        let project_id = project.id;
+        ctx.after_commit(move |engine| enqueue(engine, project_id, id, parent));
         Ok(integration)
     });
     e.register::<IntegrationGet>(|ctx, p| get(ctx.tx(), p.integration_id));
@@ -55,18 +54,122 @@ pub fn register(e: &mut Engine) {
             .bus()?;
         Ok(IntegrationListOut { integrations: rows })
     });
-    e.register::<IntegrationDiscard>(|ctx: &mut Ctx, p| {
-        let integration = get(ctx.tx(), p.integration_id)?;
-        if let Some(path) = &integration.worktree {
-            let project = get_project(ctx.tx(), integration.project_id)?;
-            worktree::remove(Path::new(&project.path), Path::new(path), true)
-                .map_err(|e| BusError::conflict("integration.discard_failed", e.to_string()))?;
-            let _ = worktree::git_mutate(Path::new(&project.path), &["branch", "-D", &format!("relay/integration-{}", integration.id)]);
+    // Removing a checkout walks and deletes its build output: seconds to minutes for a large
+    // one, so it happens before the transaction opens (D149), which then only records it.
+    e.register_staged::<IntegrationDiscard, Option<i64>>(|ctx, p| {
+        let (integration, project, in_use) = ctx.read(|conn| {
+            let integration = get(conn, p.integration_id)?;
+            let project = get_project(conn, integration.project_id)?;
+            let in_use = match &integration.worktree {
+                Some(path) => runs_in(conn, path)?,
+                None => 0,
+            };
+            Ok((integration, project, in_use))
+        })?;
+        if in_use > 0 {
+            return Err(BusError::conflict("integration.in_use", "a device run is using this integration's checkout")
+                .with_hint("stop the run, then discard"));
         }
+        if let Some(path) = &integration.worktree {
+            remove_checkout(Path::new(&project.path), Path::new(path), integration.id)
+                .map_err(|e| BusError::conflict("integration.discard_failed", e.to_string()))?;
+        }
+        Ok(Some(integration.project_id))
+    }, |ctx: &mut Ctx, p, project_id| {
         ctx.tx().execute("UPDATE integrations SET state='discarded',finished_at=COALESCE(finished_at,?1) WHERE id=?2", params![ctx.now,p.integration_id]).bus()?;
-        ctx.set_project(integration.project_id); ctx.emit("integration.changed", json!({"integration_id": integration.id,"state":"discarded"}));
+        if let Some(project_id) = project_id { ctx.set_project(project_id); }
+        ctx.emit("integration.changed", json!({"integration_id": p.integration_id,"state":"discarded"}));
         Ok(Empty {})
     });
+}
+
+/// How many finished integrations per project keep their checkout for inspection or a device
+/// run (D38). Older ones are discarded as each new one finishes.
+const KEEP_FINISHED: usize = 3;
+
+/// Integrations waiting for their project's runner, keyed by engine and project. A key is
+/// present while a runner thread is working through that project: one integration at a time
+/// per project, so repeated "Test together" clicks queue rather than start concurrent
+/// checkouts and builds. The runner holds the engine, so its address cannot be reused while
+/// the key exists.
+type Queues = std::collections::HashMap<(usize, i64), std::collections::VecDeque<(i64, uuid::Uuid)>>;
+static QUEUES: std::sync::Mutex<Option<Queues>> = std::sync::Mutex::new(None);
+
+fn enqueue(engine: std::sync::Arc<Engine>, project_id: i64, id: i64, parent: uuid::Uuid) {
+    let key = (std::sync::Arc::as_ptr(&engine) as usize, project_id);
+    {
+        let mut queues = QUEUES.lock().unwrap_or_else(|p| p.into_inner());
+        let queues = queues.get_or_insert_with(Default::default);
+        if let Some(waiting) = queues.get_mut(&key) {
+            waiting.push_back((id, parent));
+            return;
+        }
+        queues.insert(key, Default::default());
+    }
+    let spawned = std::thread::Builder::new().name(format!("integration-{project_id}")).spawn(move || {
+        let mut next = Some((id, parent));
+        while let Some((id, parent)) = next {
+            run(engine.clone(), id, parent);
+            prune(&engine, project_id);
+            let mut queues = QUEUES.lock().unwrap_or_else(|p| p.into_inner());
+            let queues = queues.get_or_insert_with(Default::default);
+            next = queues.get_mut(&key).and_then(|waiting| waiting.pop_front());
+            if next.is_none() {
+                queues.remove(&key);
+            }
+        }
+    });
+    if spawned.is_err() {
+        if let Some(queues) = QUEUES.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+            queues.remove(&key);
+        }
+    }
+}
+
+/// Discard every finished integration of `project_id` past the newest [`KEEP_FINISHED`] that
+/// still has a checkout, unless a device run is using it. Runs on the integration thread.
+fn prune(engine: &Engine, project_id: i64) {
+    let doomed: Vec<(i64, String, String)> = {
+        let conn = engine.store.lock();
+        let rows = conn.prepare_cached(
+            "SELECT i.id, i.worktree, p.path FROM integrations i JOIN projects p ON p.id=i.project_id
+             WHERE i.project_id=?1 AND i.state IN ('passed','failed','conflict') AND i.worktree IS NOT NULL
+             ORDER BY i.id DESC LIMIT -1 OFFSET ?2",
+        ).and_then(|mut stmt| stmt.query_map(params![project_id, KEEP_FINISHED as i64], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>());
+        match rows {
+            Ok(rows) => rows.into_iter().filter(|(_, path, _)| runs_in(&conn, path).is_ok_and(|n| n == 0)).collect(),
+            Err(error) => {
+                tracing::warn!(project_id, %error, "listing integrations to prune");
+                return;
+            }
+        }
+    };
+    for (id, path, repo) in doomed {
+        if let Err(error) = remove_checkout(Path::new(&repo), Path::new(&path), id) {
+            tracing::warn!(integration = id, %error, "pruning an old integration");
+            continue;
+        }
+        let _ = engine.system_write("integration.prune", None, Some(project_id), None, json!({"integration_id": id}), |tx, now| {
+            tx.execute("UPDATE integrations SET state='discarded',finished_at=COALESCE(finished_at,?1) WHERE id=?2", params![now, id]).bus()?;
+            Ok(((), vec![("integration.changed".into(), json!({"integration_id": id, "state": "discarded"}))]))
+        });
+    }
+}
+
+/// Live device runs whose checkout is `path`.
+fn runs_in(conn: &rusqlite::Connection, path: &str) -> Result<i64, BusError> {
+    conn.prepare_cached("SELECT COUNT(*) FROM device_runs WHERE worktree=?1 AND state IN ('building','running')").bus()?
+        .query_row([path], |r| r.get(0)).bus()
+}
+
+/// An integration's checkout, its build output and its `relay/integration-<id>` branch.
+pub(crate) fn remove_checkout(repo: &Path, path: &Path, id: i64) -> anyhow::Result<()> {
+    if path.exists() {
+        worktree::remove(repo, path, true)?;
+    }
+    let _ = worktree::git_mutate(repo, &["branch", "-D", &format!("relay/integration-{id}")]);
+    Ok(())
 }
 
 fn run(engine: std::sync::Arc<Engine>, id: i64, parent: uuid::Uuid) {

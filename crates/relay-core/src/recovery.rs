@@ -120,6 +120,21 @@ pub fn run_with(engine: &Engine, dirty_scan: DirtyScan) -> Result<RecoveryReport
                 .push(format!("closed {changed} interrupted device run(s)"));
         }
     }
+    //    An integration the engine was merging, building or deploying, or had queued in
+    //    memory, has nothing left to drive it; a live row would also block project.remove.
+    {
+        let changed = tx.execute(
+            "UPDATE integrations SET state='failed',finished_at=COALESCE(finished_at,?1),
+             log_tail=COALESCE(log_tail,'')||'\nInterrupted: Relay stopped before this integration finished.'
+             WHERE state IN ('queued','merging','building','deploying')",
+            [&now],
+        )?;
+        if changed > 0 {
+            report
+                .fsck_fixes
+                .push(format!("closed {changed} interrupted integration(s)"));
+        }
+    }
     // 5. generated hook directories with no session behind them. Stale ones accumulate one
     //    per closed session and make `.relay/hooks` misreport the live fleet.
     {
