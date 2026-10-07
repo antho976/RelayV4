@@ -1022,7 +1022,19 @@ The *why* behind anything surprising. Append; never rewrite history. Reference a
   taken first, and diffing a tree inside a gate would hold the store lock. Separately, the
   adapter gives up after 20 s and exits 2: a provider kills a hook at 30 s and then runs the tool
   unchecked, so a store-lock stall used to wave every tool through (D23).
-- **D164 Only a process outside the engine's tree may claim `user` on the socket.** `user` and
+- **D164 `ui.*` is a shell model core holds, not a door a client executes.** BUS.md §6.5 described
+  Relay-2's plan: `ui.*` forwarded to the main window over a Tauri executor door, `ui.absent` when
+  headless. V4 has no Tauri app and never had that door; core answered `ui.*` from its in-memory
+  model (D40), and the GTK client follows only the page, a focused pane's `target.session` and
+  `ui.toast`. The leftovers that claimed otherwise are removed rather than made true: the
+  `executor` registry attribute (and `.ui()`), which nothing read, `Doors::TauriOnly`, the engine's
+  `Door::Tauri`, and `app.status.ui_connected`, which was never set and which no client read. This
+  supersedes D40's `executor: ui` boundary; `session.allow_ui` (an op-name prefix check) is the
+  agent gate, as it always was. The `ui.*` ops keep their behaviour and shapes: a pane or pop-out
+  that opens nothing on screen still answers success, because it did update the model, and the op
+  summaries now say which ops reach the screen, since a summary is all an agent reading `bus.ops`
+  or an MCP tool list sees.
+- **D165 Only a process outside the engine's tree may claim `user` on the socket.** `user` and
   `test` carry no token, so an agent refused by a guardrail could answer its own hold by writing
   `{"actor":"user","op":"guardrail.confirm",…}` to the socket; the command-line check (§9.5)
   sees only command lines. The socket now identifies the process behind each connection once, on
@@ -1050,15 +1062,3 @@ The *why* behind anything surprising. Append; never rewrite history. Reference a
   then opens a terminal) is below the engine, so `relay` typed there is refused as the user.
   This is a seatbelt against an agent's own tree, not a boundary against a same-uid process that
   gets itself started elsewhere (`systemd-run --user`, cron, editing the store).
-- **D165 `ui.*` is a shell model core holds, not a door a client executes.** BUS.md §6.5 described
-  Relay-2's plan: `ui.*` forwarded to the main window over a Tauri executor door, `ui.absent` when
-  headless. V4 has no Tauri app and never had that door; core answered `ui.*` from its in-memory
-  model (D40), and the GTK client follows only the page, a focused pane's `target.session` and
-  `ui.toast`. The leftovers that claimed otherwise are removed rather than made true: the
-  `executor` registry attribute (and `.ui()`), which nothing read, `Doors::TauriOnly`, the engine's
-  `Door::Tauri`, and `app.status.ui_connected`, which was never set and which no client read. This
-  supersedes D40's `executor: ui` boundary; `session.allow_ui` (an op-name prefix check) is the
-  agent gate, as it always was. The `ui.*` ops keep their behaviour and shapes: a pane or pop-out
-  that opens nothing on screen still answers success, because it did update the model, and the op
-  summaries now say which ops reach the screen, since a summary is all an agent reading `bus.ops`
-  or an MCP tool list sees.

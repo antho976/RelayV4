@@ -473,7 +473,7 @@ impl Drop for Borrowed {
 const MAX_CONCURRENT_QUERIES: usize = 8;
 
 async fn handle_conn(engine: Arc<Engine>, recent: Arc<Recent>, stream: UnixStream) -> Result<()> {
-    // Who connected, once: a process never leaves the tree it was born in (RA-096, D164).
+    // Who connected, once: a process never leaves the tree it was born in (RA-096, D165).
     let peer = crate::peer::identify(&stream, &engine);
     // The blocking dispatch keeps this Arc until its ownership update completes,
     // even if the socket task is cancelled while that dispatch is in flight.

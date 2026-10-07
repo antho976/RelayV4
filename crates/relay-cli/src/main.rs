@@ -364,7 +364,7 @@ async fn run(cli: Cli) -> Result<u8> {
             Ok(0)
         }
         Command::Events { filter } => {
-            // As whoever is asking: inside a session the socket refuses a `user` claim (D164).
+            // As whoever is asking: inside a session the socket refuses a `user` claim (D165).
             let (actor, token) = actor_from_env(cli.actor.as_deref())?;
             let mut c = connect(instance).await?;
             let mut req = Request::new(actor, "bus.subscribe", json!({ "events": filter }));
