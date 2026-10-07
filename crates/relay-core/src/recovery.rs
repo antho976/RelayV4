@@ -163,7 +163,7 @@ pub fn run_with(engine: &Engine, dirty_scan: DirtyScan) -> Result<RecoveryReport
         let mut swept = 0;
         for (repo, live) in repos {
             let live: Vec<String> = live.lines().map(str::to_string).collect();
-            swept += crate::hooks::sweep_hook_dirs(Path::new(&repo), &live);
+            swept += crate::hooks::sweep_hook_dirs(Path::new(&repo), &live, engine.instance);
         }
         if swept > 0 {
             report.fsck_fixes.push(format!("removed {swept} stale hook director(ies)"));

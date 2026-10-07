@@ -533,8 +533,8 @@ fn sessions_install_git_and_claude_hooks_without_clobbering_local_settings() {
         .args(["config", "--worktree", "--get", "core.hooksPath"])
         .output()
         .unwrap();
-    assert!(restored.status.success());
-    assert!(!String::from_utf8_lossy(&restored.stdout).contains(".relay/hooks"));
+    // The primary checkout had no hook path of its own, so it has none again (RA-106).
+    assert!(!restored.status.success(), "close pinned {}", String::from_utf8_lossy(&restored.stdout));
 }
 
 #[test]

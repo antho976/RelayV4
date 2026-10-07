@@ -222,49 +222,50 @@ pub fn register(e: &mut Engine) {
     });
     e.register_unlocked::<Diff>(|ctx, p| {
         let (_project, root) = resolve_root_unlocked(ctx, p.project_id, p.worktree.as_deref())?;
-        let mut files = if let Some(base) = p.base.as_deref() {
-            let repo = gix::open(&root).map_err(gix_err("git.open_failed"))?;
-            let old_tree = repo
-                .rev_parse_single(base)
-                .map_err(gix_err("git.revision"))?
-                .object()
-                .map_err(gix_err("git.diff_failed"))?
-                .peel_to_commit()
-                .map_err(gix_err("git.diff_failed"))?
-                .tree()
-                .map_err(gix_err("git.diff_failed"))?;
-            let new_tree = repo
-                .head_commit()
-                .map_err(gix_err("git.diff_failed"))?
-                .tree()
-                .map_err(gix_err("git.diff_failed"))?;
-            tree_diff_files(&repo, &old_tree, &new_tree, "git.diff_failed")?
+        // One repository, one comparison tree and one index for every file, not one of each
+        // per file (RA-157).
+        let mut repo = gix::open(&root).map_err(gix_err("git.open_failed"))?;
+        repo.object_cache_size_if_unset(16 * 1024 * 1024);
+        let old_tree = revision_tree(&repo, p.base.as_deref().unwrap_or("HEAD"))?;
+        let mut files = match (&p.base, &old_tree) {
+            (Some(_), Some(old_tree)) => {
+                let new_tree = repo
+                    .head_commit()
+                    .map_err(gix_err("git.diff_failed"))?
+                    .tree()
+                    .map_err(gix_err("git.diff_failed"))?;
+                tree_diff_files(&repo, old_tree, &new_tree, "git.diff_failed")?
+            }
+            _ => Vec::new(),
+        };
+        let staged = p.staged == Some(true);
+        let index = if staged {
+            Some(repo.index_or_empty().map_err(gix_err("git.index"))?)
         } else {
-            Vec::new()
+            None
         };
         for status in status_files(&root)? {
-            if p.staged == Some(true) && status.index.is_empty() {
+            if staged && status.index.is_empty() {
                 continue;
             }
-            let old = revision_text(&root, p.base.as_deref().unwrap_or("HEAD"), &status.path)?;
-            let new = if p.staged == Some(true) {
-                index_text(&root, &status.path)?
-            } else {
-                working_text(&root, &status.path)?
+            // A rename's old side is its source, not an empty file at its new name.
+            let source = status.renamed_from.as_deref().unwrap_or(&status.path);
+            let old = tree_side(&repo, old_tree.as_ref(), source, DIFF_COUNT_MAX)?;
+            let new = match &index {
+                Some(index) => index_side(&repo, index, &status.path, DIFF_COUNT_MAX)?,
+                None => work_side(&root, &status.path, DIFF_COUNT_MAX)?,
             };
-            let (added, removed) = counts(&old, &new);
-            let file = DiffFile {
-                path: status.path,
-                old_path: status.renamed_from,
-                status: if !status.index.is_empty() {
+            let file = diff_file(
+                status.path,
+                status.renamed_from,
+                if !status.index.is_empty() {
                     status.index
                 } else {
                     status.worktree
                 },
-                added,
-                removed,
-                binary: old.contains('\0') || new.contains('\0'),
-            };
+                &old,
+                &new,
+            );
             if let Some(existing) = files.iter_mut().find(|existing| existing.path == file.path) {
                 *existing = file;
             } else {
@@ -278,20 +279,21 @@ pub fn register(e: &mut Engine) {
         let (_project, root) = resolve_root_unlocked(ctx, p.project_id, p.worktree.as_deref())?;
         validate_path(&p.path)?;
         // The reply carries both sides and the diff on one line; stop at the editor's limit
-        // before reading, rather than build a reply larger than a client can read.
-        let size = std::fs::metadata(root.join(&p.path)).map_or(0, |m| m.len());
-        if size > DIFF_FILE_MAX as u64 {
-            return Err(diff_too_large());
-        }
-        let old = revision_text(&root, p.base.as_deref().unwrap_or("HEAD"), &p.path)?;
-        let new = working_text(&root, &p.path)?;
-        if old.len() + new.len() > DIFF_FILE_MAX {
-            return Err(diff_too_large());
-        }
-        // Same test git.diff uses for its `binary` flag.
-        if old.contains('\0') || new.contains('\0') {
-            return Err(BusError::refused("git.diff_binary", "This file is binary; there is no text diff to show."));
-        }
+        // before reading, rather than build a reply larger than a client can read. Neither
+        // side is read past that limit, and a symlink is its target's name, as git stores it,
+        // never the file it points at (RA-156).
+        let repo = gix::open(&root).map_err(gix_err("git.open_failed"))?;
+        let old_tree = revision_tree(&repo, p.base.as_deref().unwrap_or("HEAD"))?;
+        let max = DIFF_FILE_MAX as u64;
+        let new = work_side(&root, &p.path, max)?;
+        let old = tree_side(&repo, old_tree.as_ref(), &p.path, max)?;
+        let (old, new) = match (old, new) {
+            (Side::TooLarge, _) | (_, Side::TooLarge) => return Err(diff_too_large()),
+            (Side::Text(old), Side::Text(new)) if old.len() + new.len() <= DIFF_FILE_MAX => (old, new),
+            (Side::Text(_), Side::Text(_)) => return Err(diff_too_large()),
+            // Same test git.diff uses for its `binary` flag.
+            _ => return Err(BusError::refused("git.diff_binary", "This file is binary; there is no text diff to show.")),
+        };
         let hunks = if old == new {
             Vec::new()
         } else {
@@ -300,7 +302,9 @@ pub fn register(e: &mut Engine) {
                 old_lines: old.lines().count() as i64,
                 new_start: 1,
                 new_lines: new.lines().count() as i64,
-                text: TextDiff::from_lines(&old, &new)
+                text: TextDiff::configure()
+                    .deadline(std::time::Instant::now() + DIFF_DEADLINE)
+                    .diff_lines(&old, &new)
                     .unified_diff()
                     .context_radius(3)
                     .to_string(),
@@ -310,19 +314,25 @@ pub fn register(e: &mut Engine) {
     });
     e.register_unlocked::<Log>(|ctx, p| {
         let (_project, root) = resolve_root_unlocked(ctx, p.project_id, p.worktree.as_deref())?;
-        let repo = gix::open(&root).map_err(gix_err("git.open_failed"))?;
+        let mut repo = gix::open(&root).map_err(gix_err("git.open_failed"))?;
+        repo.object_cache_size_if_unset(16 * 1024 * 1024);
         let tip = repo
             .rev_parse_single(p.branch.as_deref().unwrap_or("HEAD"))
             .map_err(gix_err("git.revision"))?;
-        let walk = repo
-            .rev_walk([tip.detach()])
-            .all()
+        // `git log --topo-order`, as `--graph` uses: no parent before all of its children. The
+        // default breadth-first walk put a parent above a child on another line of history,
+        // and the graph drew a lane for each such inversion (RA-150). The commit-graph file,
+        // when there is one, keeps the walk from reading all of history first.
+        let walk = gix::traverse::commit::topo::Builder::from_iters(&repo.objects, [tip.detach()], None::<Vec<gix::ObjectId>>)
+            .sorting(gix::traverse::commit::topo::Sorting::TopoOrder)
+            .with_commit_graph(repo.commit_graph_if_enabled().ok().flatten())
+            .build()
             .map_err(gix_err("git.log_failed"))?;
         let mut commits = Vec::new();
         for info in walk.take(p.limit.unwrap_or(50).min(500) as usize) {
             let info = info.map_err(gix_err("git.log_failed"))?;
             commits.push(commit_from_gix(
-                info.object().map_err(gix_err("git.log_failed"))?,
+                repo.find_commit(info.id).map_err(gix_err("git.log_failed"))?,
             )?);
         }
         Ok(LogOut { commits })
@@ -348,59 +358,19 @@ pub fn register(e: &mut Engine) {
             let owners = worktree_owners_by_branch(conn, project.id)?;
             Ok(owners)
         })?;
-        let repo = gix::open(&root).map_err(gix_err("git.open_failed"))?;
-        let current = repo
-            .head_name()
-            .ok()
-            .flatten()
-            .map(|n| n.shorten().to_string())
-            .unwrap_or_default();
-        let head = repo
-            .rev_parse_single(project.base_branch.as_str())
-            .ok()
-            .map(|id| id.detach());
         let owners: HashMap<String, String> = owner_rows.into_iter().collect();
-        let mut branches = Vec::new();
-        let platform = repo.references().map_err(gix_err("git.branches_failed"))?;
-        let refs = platform
-            .local_branches()
-            .map_err(gix_err("git.branches_failed"))?;
-        for reference in refs {
-            let reference = reference.map_err(gix_err("git.branches_failed"))?;
-            let name = reference
-                .name()
-                .as_bstr()
-                .to_string()
-                .trim_start_matches("refs/heads/")
-                .to_string();
-            let Some(id) = reference.try_id() else {
-                continue;
-            };
-            let merged = head
-                .as_ref()
-                .and_then(|h| repo.merge_base(*h, id.detach()).ok())
-                .map(|base| base.detach() == id.detach())
-                .unwrap_or(false);
-            let (upstream, ahead, behind) = upstream_metrics(&repo, &name);
-            branches.push(Branch {
-                name: name.clone(),
-                head: id.to_string(),
-                upstream,
-                ahead,
-                behind,
-                merged,
-                session: owners.get(&name).cloned(),
-                current: name == current,
-            });
-        }
-        branches.sort_by_key(|b| (!b.current, b.name.clone()));
-        let remote_branches = remote_branches(&repo, &platform, &branches)?;
-        Ok(BranchesOut { current, branches, remote_branches })
+        // The same single walk and object cache as branch.delete and clean_merged (RA-151).
+        branches_with(&root, &project.base_branch, &owners, true)
     });
     // `git switch -c <name> <start>` checks out whatever differs from the start point, through
     // any LFS or clean/smudge filters: never under the store lock (D149).
     e.register_staged::<BranchCreate, _>(|ctx, p| {
         let (project, root) = resolve_root_unlocked(ctx, p.project_id, p.worktree.as_deref())?;
+        // Checking the new branch out moves the checkout's branch, which in a live session's
+        // checkout is its agent's call — the same rule git.branch.switch keeps (RA-152).
+        if p.checkout.unwrap_or(true) {
+            refuse_session_checkout(ctx, project.id, &root)?;
+        }
         let name = validate_branch_name(&root, &p.name)?;
         let repo = gix::open(&root).map_err(gix_err("git.open_failed"))?;
         let full_name = format!("refs/heads/{name}");
@@ -444,20 +414,7 @@ pub fn register(e: &mut Engine) {
     e.register_staged::<BranchSwitch, _>(
         |ctx, p| {
             let (project, root) = resolve_root_unlocked(ctx, p.project_id, p.worktree.as_deref())?;
-            let checkout = root.to_string_lossy().to_string();
-            let owner = ctx.read(|conn| {
-                let mut st = conn
-                    .prepare_cached("SELECT name FROM sessions WHERE project_id=?1 AND worktree=?2 AND state!='closed' LIMIT 1")
-                    .bus()?;
-                let mut rows = st.query(rusqlite::params![project.id, checkout]).bus()?;
-                rows.next().bus()?.map(|row| row.get::<_, String>(0)).transpose().bus()
-            })?;
-            if let Some(session) = owner {
-                return Err(BusError::conflict(
-                    "git.checkout_session_owned",
-                    format!("This checkout belongs to the live session {session}; its agent decides its branch. Select another checkout, or end the session first."),
-                ));
-            }
+            refuse_session_checkout(ctx, project.id, &root)?;
             let target = switch_target(&root, &p.name)?;
             let current = gix::open(&root)
                 .ok()
@@ -517,7 +474,7 @@ pub fn register(e: &mut Engine) {
                 format!("cannot delete the base branch {name}"),
             ));
         }
-        let branches = branches_with(&project, &owners)?;
+        let branches = branches_with(root, &project.base_branch, &owners, false)?;
         let branch = branches
             .branches
             .iter()
@@ -567,7 +524,9 @@ pub fn register(e: &mut Engine) {
         for path in &p.paths {
             validate_path(path)?;
         }
-        let mut args = vec!["add", "--"];
+        // A path is a file name, never a pattern: without this, staging `a[1].txt` also staged
+        // `a1.txt` (RA-153).
+        let mut args = vec!["--literal-pathspecs", "add", "--"];
         args.extend(p.paths.iter().map(String::as_str));
         worktree::git_mutate(&root, &args).map_err(git_mutation("git.stage_failed"))?;
         Ok((project, root))
@@ -590,9 +549,9 @@ pub fn register(e: &mut Engine) {
             .map(|repo| repo.head_id().is_err())
             .unwrap_or(true);
         let mut args = if unborn {
-            vec!["rm", "--cached", "--"]
+            vec!["--literal-pathspecs", "rm", "--cached", "--"]
         } else {
-            vec!["reset", "HEAD", "--"]
+            vec!["--literal-pathspecs", "reset", "HEAD", "--"]
         };
         args.extend(p.paths.iter().map(String::as_str));
         worktree::git_mutate(&root, &args).map_err(git_mutation("git.unstage_failed"))?;
@@ -627,13 +586,17 @@ pub fn register(e: &mut Engine) {
             .map_err(|error| BusError::unavailable("git.hook_refresh_failed", error.to_string()))?;
             crate::hooks::run_user_pre_commit(Path::new(&project.path), &root)
                 .map_err(|error| BusError::conflict("git.pre_commit_failed", error.to_string()))?;
-            let numstat = staged_numstat(&root)?;
+            // The commit is made without git's own hooks, so the user's commit-msg hook runs here
+            // and may refuse or rewrite the message (RA-110).
+            let message = crate::hooks::run_user_commit_msg(Path::new(&project.path), &root, &p.message)
+                .map_err(|error| BusError::conflict("git.commit_msg_failed", error.to_string()))?;
             // The commit object itself — and a signing prompt, if commit.gpgSign asks for one —
-            // is made here too. The transaction gates exactly that object and publishes it.
-            let staged = stage_commit(&root, &p.message)?;
-            Ok((project, root, numstat, staged))
+            // is made here too. The transaction gates exactly that object's tree and publishes
+            // it; the numstat is of that tree, not of an index read a moment earlier (RA-154).
+            let (staged, numstat) = stage_commit(&root, &message)?;
+            Ok((project, root, numstat, staged, message))
         },
-        |ctx: &mut Ctx, p, (project, root, numstat, staged)| {
+        |ctx: &mut Ctx, _p, (project, root, numstat, staged, message)| {
             super::guardrail::enforce(
                 ctx,
                 project.id,
@@ -647,8 +610,17 @@ pub fn register(e: &mut Engine) {
             match staged {
                 // A merge, cherry-pick, revert or rebase in progress has state only `git commit`
                 // knows how to finish; those stay the slow path they always were.
-                StagedCommit::InProgress => {
-                    worktree::git_mutate(&root, &["commit", "--no-verify", "-m", &p.message])
+                StagedCommit::InProgress { tree } => {
+                    // `git commit` reads the index again: it must still hold the tree the gate
+                    // judged, or this would commit something nobody checked (RA-154).
+                    let now = worktree::git_mutate(&root, &["write-tree"]).map_err(git_mutation("git.commit_failed"))?;
+                    if now.trim() != tree {
+                        return Err(BusError::conflict(
+                            "git.commit_raced",
+                            "the staged changes changed while this commit was being made; nothing was committed",
+                        ));
+                    }
+                    worktree::git_mutate(&root, &["commit", "--no-verify", "-m", &message])
                         .map_err(git_mutation("git.commit_failed"))?;
                 }
                 StagedCommit::Object { sha, parent, subject } => {
@@ -815,7 +787,7 @@ pub fn register(e: &mut Engine) {
             let owners = branch_owners(conn, project.id)?;
             Ok((project, owners))
         })?;
-        let branches = branches_with(&project, &owners)?;
+        let branches = branches_with(Path::new(&project.path), &project.base_branch, &owners, false)?;
         let checked_out = worktree::list_with_dirty(Path::new(&project.path), false)
             .map_err(|error| BusError::unavailable("worktree.list_failed", error.to_string()))?;
         let candidates: Vec<String> = branches
@@ -873,27 +845,30 @@ pub fn status_badges(root: &Path) -> Result<HashMap<String, String>, BusError> {
 enum StagedCommit {
     /// A commit object for the staged tree, not yet on any branch.
     Object { sha: String, parent: Option<String>, subject: String },
-    /// A merge, cherry-pick, revert or rebase is in progress: `git commit` must conclude it.
-    InProgress,
+    /// A merge, cherry-pick, revert or rebase is in progress: `git commit` must conclude it,
+    /// and must find `tree` still staged when it does.
+    InProgress { tree: String },
 }
 
-/// Build the commit `git commit -m message` would make, without moving any ref.
-fn stage_commit(root: &Path, message: &str) -> Result<StagedCommit, BusError> {
+/// Build the commit `git commit -m message` would make, without moving any ref, and the
+/// numstat of exactly its tree for the commit gate.
+fn stage_commit(root: &Path, message: &str) -> Result<(StagedCommit, String), BusError> {
     let repo = gix::open(root).map_err(gix_err("git.open_failed"))?;
     // Per-worktree state: a linked checkout's own git dir, not the shared one.
     let git_dir = repo.path().to_path_buf();
-    if ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "sequencer", "rebase-merge", "rebase-apply"]
+    let in_progress = ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "sequencer", "rebase-merge", "rebase-apply"]
         .iter()
-        .any(|name| git_dir.join(name).exists())
-    {
-        return Ok(StagedCommit::InProgress);
-    }
+        .any(|name| git_dir.join(name).exists());
     let message = clean_message(message);
-    if message.is_empty() {
+    if !in_progress && message.is_empty() {
         return Err(BusError::invalid("git.message", "commit message cannot be empty"));
     }
     let tree = worktree::git_mutate(root, &["write-tree"]).map_err(git_mutation("git.commit_failed"))?.trim().to_string();
     let parent = repo.head_id().ok().map(|id| id.to_string());
+    if in_progress {
+        let numstat = tree_numstat(root, &repo, parent.as_deref(), &tree)?;
+        return Ok((StagedCommit::InProgress { tree }, numstat));
+    }
     if let Some(parent) = &parent {
         let parent_tree = worktree::git_mutate(root, &["rev-parse", &format!("{parent}^{{tree}}")])
             .map_err(git_mutation("git.commit_failed"))?;
@@ -901,6 +876,7 @@ fn stage_commit(root: &Path, message: &str) -> Result<StagedCommit, BusError> {
             return Err(BusError::conflict("git.commit_failed", "nothing to commit: no staged changes"));
         }
     }
+    let numstat = tree_numstat(root, &repo, parent.as_deref(), &tree)?;
     // `commit-tree` ignores commit.gpgSign, so honour it here the way `git commit` would.
     let sign = worktree::git_mutate(root, &["config", "--bool", "--get", "commit.gpgsign"])
         .is_ok_and(|value| value.trim() == "true");
@@ -914,7 +890,43 @@ fn stage_commit(root: &Path, message: &str) -> Result<StagedCommit, BusError> {
     args.extend(["-m", message.as_str()]);
     let sha = worktree::git_mutate(root, &args).map_err(git_mutation("git.commit_failed"))?.trim().to_string();
     let subject = message.lines().next().unwrap_or_default().to_string();
-    Ok(StagedCommit::Object { sha, parent, subject })
+    Ok((StagedCommit::Object { sha, parent, subject }, numstat))
+}
+
+/// The commit gate's numstat for `tree` against `parent` (or nothing), as git's own
+/// `diff-tree` counts it — submodule bumps, binaries and big files included (RA-155, RA-157) —
+/// in the `added\tremoved\tpath` lines the gate reads. A rename is its destination's real
+/// change plus a `0\t0` line for its source, so a protected file cannot be moved out
+/// unchallenged and a move does not count as a whole new file (RA-158).
+fn tree_numstat(root: &Path, repo: &gix::Repository, parent: Option<&str>, tree: &str) -> Result<String, BusError> {
+    let empty = repo.empty_tree().id.to_string();
+    let from = parent.unwrap_or(&empty);
+    let raw = worktree::git_mutate(
+        root,
+        &["diff-tree", "-r", "-z", "-M", "--numstat", "--no-ext-diff", "--no-textconv", from, tree],
+    )
+    .map_err(git_mutation("git.commit_failed"))?;
+    Ok(numstat_lines(&raw))
+}
+
+/// `diff-tree -z --numstat` records — `a\tr\tpath\0`, or `a\tr\t\0source\0dest\0` for a
+/// rename — as the gate's lines.
+fn numstat_lines(raw: &str) -> String {
+    let mut out = String::new();
+    let mut fields = raw.split('\0');
+    while let Some(record) = fields.next() {
+        let mut parts = record.splitn(3, '\t');
+        let (Some(added), Some(removed), Some(path)) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        if path.is_empty() {
+            let (Some(source), Some(dest)) = (fields.next(), fields.next()) else { break };
+            out.push_str(&format!("0\t0\t{source}\n{added}\t{removed}\t{dest}\n"));
+        } else {
+            out.push_str(&format!("{added}\t{removed}\t{path}\n"));
+        }
+    }
+    out
 }
 
 /// `git commit -m`'s default cleanup: trailing whitespace off every line, runs of blank lines
@@ -993,11 +1005,70 @@ fn diff_too_large() -> BusError {
     BusError::refused("git.diff_too_large", "This diff is larger than the 1 MiB editor limit.")
 }
 
-fn revision_text(root: &Path, revision: &str, path: &str) -> Result<String, BusError> {
-    let repo = gix::open(root).map_err(gix_err("git.open_failed"))?;
+/// The most bytes of one side git.diff and git.show read to count its lines. Git itself calls
+/// a file over `core.bigFileThreshold` binary; past this a whole-file line diff is not worth
+/// its memory or its time (RA-157).
+const DIFF_COUNT_MAX: u64 = 8 * 1024 * 1024;
+/// How long one file's line diff may run before it settles for a coarser, still valid edit
+/// script instead of the minimal one (RA-157).
+const DIFF_DEADLINE: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// One side of a file's diff.
+enum Side {
+    Text(String),
+    /// A NUL byte: git's own test for binary content.
+    Binary,
+    /// Over the reader's limit, and never read whole.
+    TooLarge,
+}
+
+impl Side {
+    fn empty() -> Self {
+        Side::Text(String::new())
+    }
+}
+
+fn side_from(bytes: Vec<u8>) -> Side {
+    if bytes.contains(&0) {
+        return Side::Binary;
+    }
+    Side::Text(String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
+}
+
+/// What git diffs for a submodule: the commit it points at, as one line.
+fn gitlink_side(id: impl std::fmt::Display) -> Side {
+    Side::Text(format!("Subproject commit {id}\n"))
+}
+
+/// An object as git diffs it. A gitlink names a commit in another repository, not an object
+/// in this one (RA-155); a blob's size comes from its header, before it is inflated.
+fn object_side(
+    repo: &gix::Repository,
+    id: gix::ObjectId,
+    mode: gix::object::tree::EntryMode,
+    max: u64,
+) -> Result<Side, BusError> {
+    if mode.is_commit() {
+        return Ok(gitlink_side(id));
+    }
+    if mode.is_tree() {
+        return Ok(Side::empty());
+    }
+    if repo.find_header(id).map_err(gix_err("git.object"))?.size() > max {
+        return Ok(Side::TooLarge);
+    }
+    let object = repo.find_object(id).map_err(gix_err("git.object"))?;
+    Ok(match object.try_into_blob() {
+        Ok(mut blob) => side_from(std::mem::take(&mut blob.data)),
+        Err(_) => Side::empty(),
+    })
+}
+
+/// The tree of `revision`; none for the unborn HEAD of a repository with no commits yet.
+fn revision_tree<'repo>(repo: &'repo gix::Repository, revision: &str) -> Result<Option<gix::Tree<'repo>>, BusError> {
     let id = match repo.rev_parse_single(revision) {
         Ok(id) => id,
-        Err(_) if revision == "HEAD" => return Ok(String::new()),
+        Err(_) if revision == "HEAD" => return Ok(None),
         Err(error) => return Err(BusError::unavailable("git.revision", error.to_string())),
     };
     let tree = id
@@ -1007,63 +1078,119 @@ fn revision_text(root: &Path, revision: &str, path: &str) -> Result<String, BusE
         .map_err(gix_err("git.object"))?
         .tree()
         .map_err(gix_err("git.object"))?;
-    let Some(entry) = tree
-        .lookup_entry_by_path(path)
-        .map_err(gix_err("git.object"))?
-    else {
-        return Ok(String::new());
-    };
-    let object = entry.object().map_err(gix_err("git.object"))?;
-    let Ok(blob) = object.try_into_blob() else {
-        return Ok(String::new());
-    };
-    Ok(String::from_utf8_lossy(&blob.data).to_string())
+    Ok(Some(tree))
 }
 
-fn index_text(root: &Path, path: &str) -> Result<String, BusError> {
-    use gix::bstr::ByteSlice;
-    let repo = gix::open(root).map_err(gix_err("git.open_failed"))?;
-    let index = repo.index_or_empty().map_err(gix_err("git.index"))?;
-    let Some(entry) = index.entry_by_path(path.as_bytes().as_bstr()) else {
-        return Ok(String::new());
+fn tree_side(repo: &gix::Repository, tree: Option<&gix::Tree<'_>>, path: &str, max: u64) -> Result<Side, BusError> {
+    let Some(tree) = tree else {
+        return Ok(Side::empty());
     };
-    let obj = repo.find_object(entry.id).map_err(gix_err("git.object"))?;
-    let Ok(blob) = obj.try_into_blob() else {
-        return Ok(String::new());
-    };
-    Ok(String::from_utf8_lossy(&blob.data).to_string())
-}
-fn working_text(root: &Path, path: &str) -> Result<String, BusError> {
-    validate_path(path)?;
-    match std::fs::read(root.join(path)) {
-        Ok(v) => Ok(String::from_utf8_lossy(&v).to_string()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-        Err(e) => Err(BusError::unavailable("git.read_failed", e.to_string())),
+    match tree.lookup_entry_by_path(path).map_err(gix_err("git.object"))? {
+        Some(entry) => object_side(repo, entry.object_id(), entry.mode(), max),
+        None => Ok(Side::empty()),
     }
 }
-fn counts(old: &str, new: &str) -> (i64, i64) {
+
+fn index_side(repo: &gix::Repository, index: &gix::index::State, path: &str, max: u64) -> Result<Side, BusError> {
+    use gix::bstr::ByteSlice;
+    let Some(entry) = index.entry_by_path(path.as_bytes().as_bstr()) else {
+        return Ok(Side::empty());
+    };
+    match entry.mode.to_tree_entry_mode() {
+        Some(mode) => object_side(repo, entry.id, mode, max),
+        None => Ok(Side::empty()),
+    }
+}
+
+/// The file at `path` as git sees it in the checkout. A symlink is the name of its target,
+/// never what it points at, and a path under a symlinked directory is not in the checkout at
+/// all; a FIFO, socket or device is never opened, and no file is read past `max` (RA-156).
+fn work_side(root: &Path, path: &str, max: u64) -> Result<Side, BusError> {
+    use std::io::Read;
+    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    validate_path(path)?;
+    let relative = Path::new(path);
+    let read_failed = |e: std::io::Error| BusError::unavailable("git.read_failed", e.to_string());
+    let through_link = relative
+        .ancestors()
+        .skip(1)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .any(|dir| std::fs::symlink_metadata(root.join(dir)).is_ok_and(|md| md.file_type().is_symlink()));
+    if through_link {
+        return Ok(Side::empty());
+    }
+    let full = root.join(relative);
+    let md = match std::fs::symlink_metadata(&full) {
+        Ok(md) => md,
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => {
+            return Ok(Side::empty())
+        }
+        Err(e) => return Err(read_failed(e)),
+    };
+    let kind = md.file_type();
+    if kind.is_symlink() {
+        return Ok(side_from(std::fs::read_link(&full).map_err(read_failed)?.into_os_string().into_vec()));
+    }
+    if kind.is_dir() {
+        // A submodule's checkout, or a nested repository: its HEAD, as git diffs a gitlink.
+        return Ok(gix::open(&full)
+            .ok()
+            .and_then(|repo| repo.head_id().ok().map(gitlink_side))
+            .unwrap_or_else(Side::empty));
+    }
+    if !kind.is_file() {
+        return Ok(Side::empty());
+    }
+    if md.len() > max {
+        return Ok(Side::TooLarge);
+    }
+    // O_NOFOLLOW and O_NONBLOCK: a file swapped for a link or a FIFO since the check above
+    // cannot redirect or hang the read.
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&full)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Side::empty()),
+        Err(e) => return Err(read_failed(e)),
+    };
+    if !file.metadata().is_ok_and(|md| md.is_file()) {
+        return Ok(Side::empty());
+    }
+    let mut bytes = Vec::new();
+    file.take(max + 1).read_to_end(&mut bytes).map_err(read_failed)?;
+    if bytes.len() as u64 > max {
+        return Ok(Side::TooLarge);
+    }
+    Ok(side_from(bytes))
+}
+
+/// Lines added and removed; none when either side is not text to count.
+fn counts(old: &Side, new: &Side) -> Option<(i64, i64)> {
+    let (Side::Text(old), Side::Text(new)) = (old, new) else {
+        return None;
+    };
     let (mut a, mut r) = (0, 0);
-    for c in TextDiff::from_lines(old, new).iter_all_changes() {
+    let diff = TextDiff::configure()
+        .deadline(std::time::Instant::now() + DIFF_DEADLINE)
+        .diff_lines(old, new);
+    for c in diff.iter_all_changes() {
         match c.tag() {
             ChangeTag::Insert => a += 1,
             ChangeTag::Delete => r += 1,
             _ => {}
         }
     }
-    (a, r)
+    Some((a, r))
 }
-fn staged_numstat(root: &Path) -> Result<String, BusError> {
-    let mut out = String::new();
-    for s in status_files(root)? {
-        if s.index.is_empty() {
-            continue;
-        }
-        let old = revision_text(root, "HEAD", &s.path)?;
-        let new = index_text(root, &s.path)?;
-        let (a, r) = counts(&old, &new);
-        out.push_str(&format!("{a}\t{r}\t{}\n", s.path));
-    }
-    Ok(out)
+
+/// A changed file's row: binary (or too large to count, as git's big-file rule) has no counts.
+fn diff_file(path: String, old_path: Option<String>, status: String, old: &Side, new: &Side) -> DiffFile {
+    let counted = counts(old, new);
+    let (added, removed) = counted.unwrap_or((0, 0));
+    DiffFile { path, old_path, status, added, removed, binary: counted.is_none() }
 }
 
 fn commit_from_gix(c: gix::Commit<'_>) -> Result<Commit, BusError> {
@@ -1358,87 +1485,59 @@ fn tree_diff_files(
     new_tree: &gix::Tree<'_>,
     code: &'static str,
 ) -> Result<Vec<DiffFile>, BusError> {
+    // Bounded like git.diff's sides; an unreadable object is an empty side, as it always was.
+    let side = |id: gix::Id<'_>, mode: gix::object::tree::EntryMode| {
+        object_side(repo, id.detach(), mode, DIFF_COUNT_MAX).unwrap_or_else(|_| Side::empty())
+    };
     let mut files = Vec::new();
     old_tree
         .changes()
         .map_err(gix_err(code))?
         .for_each_to_obtain_tree(new_tree, |change| {
             use gix::object::tree::diff::Change;
+            // A directory is not a changed file; the entries under it are reported on their
+            // own (RA-159).
             let (path, old_path, status, old, new) = match change {
-                Change::Addition { location, id, .. } => (
-                    location.to_string(),
-                    None,
-                    "A",
-                    String::new(),
-                    repo.find_object(id.detach())
-                        .ok()
-                        .and_then(|o| o.try_into_blob().ok())
-                        .map(|b| String::from_utf8_lossy(&b.data).to_string())
-                        .unwrap_or_default(),
-                ),
-                Change::Deletion { location, id, .. } => (
-                    location.to_string(),
-                    None,
-                    "D",
-                    repo.find_object(id.detach())
-                        .ok()
-                        .and_then(|o| o.try_into_blob().ok())
-                        .map(|b| String::from_utf8_lossy(&b.data).to_string())
-                        .unwrap_or_default(),
-                    String::new(),
-                ),
-                Change::Modification {
-                    location,
-                    previous_id,
-                    id,
-                    ..
-                } => (
+                Change::Addition { entry_mode, .. } | Change::Deletion { entry_mode, .. } if entry_mode.is_tree() => {
+                    return Ok(std::ops::ControlFlow::Continue(()));
+                }
+                Change::Modification { previous_entry_mode, entry_mode, .. }
+                    if previous_entry_mode.is_tree() && entry_mode.is_tree() =>
+                {
+                    return Ok(std::ops::ControlFlow::Continue(()));
+                }
+                Change::Addition { location, entry_mode, id, .. } => {
+                    (location.to_string(), None, "A", Side::empty(), side(id, entry_mode))
+                }
+                Change::Deletion { location, entry_mode, id, .. } => {
+                    (location.to_string(), None, "D", side(id, entry_mode), Side::empty())
+                }
+                Change::Modification { location, previous_entry_mode, previous_id, entry_mode, id, .. } => (
                     location.to_string(),
                     None,
                     "M",
-                    repo.find_object(previous_id.detach())
-                        .ok()
-                        .and_then(|o| o.try_into_blob().ok())
-                        .map(|b| String::from_utf8_lossy(&b.data).to_string())
-                        .unwrap_or_default(),
-                    repo.find_object(id.detach())
-                        .ok()
-                        .and_then(|o| o.try_into_blob().ok())
-                        .map(|b| String::from_utf8_lossy(&b.data).to_string())
-                        .unwrap_or_default(),
+                    side(previous_id, previous_entry_mode),
+                    side(id, entry_mode),
                 ),
                 Change::Rewrite {
                     source_location,
-                    location,
+                    source_entry_mode,
                     source_id,
+                    location,
+                    entry_mode,
                     id,
+                    copy,
                     ..
                 } => (
                     location.to_string(),
                     Some(source_location.to_string()),
-                    "R",
-                    repo.find_object(source_id.detach())
-                        .ok()
-                        .and_then(|o| o.try_into_blob().ok())
-                        .map(|b| String::from_utf8_lossy(&b.data).to_string())
-                        .unwrap_or_default(),
-                    repo.find_object(id.detach())
-                        .ok()
-                        .and_then(|o| o.try_into_blob().ok())
-                        .map(|b| String::from_utf8_lossy(&b.data).to_string())
-                        .unwrap_or_default(),
+                    if copy { "C" } else { "R" },
+                    side(source_id, source_entry_mode),
+                    side(id, entry_mode),
                 ),
             };
             if !path.is_empty() {
-                let (added, removed) = counts(&old, &new);
-                files.push(DiffFile {
-                    path,
-                    old_path,
-                    status: status.into(),
-                    added,
-                    removed,
-                    binary: old.contains('\0') || new.contains('\0'),
-                });
+                files.push(diff_file(path, old_path, status.into(), &old, &new));
             }
             Ok::<_, std::io::Error>(std::ops::ControlFlow::Continue(()))
         })
@@ -1460,12 +1559,11 @@ fn validate_branch_name(root: &Path, value: &str) -> Result<String, BusError> {
             "branch name cannot be empty",
         ));
     }
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["check-ref-format", "--branch", name])
-        .output()
-        .map_err(|e| BusError::unavailable("git.unavailable", e.to_string()))?;
+    let mut command = std::process::Command::new("git");
+    command.arg("-C").arg(root).args(["check-ref-format", "--branch", name]);
+    let out = crate::proc::output_with_timeout(&mut command, std::time::Duration::from_secs(10))
+        .map_err(|e| BusError::unavailable("git.unavailable", e.to_string()))?
+        .ok_or_else(|| BusError::unavailable("git.unavailable", "git check-ref-format did not finish within 10 s"))?;
     if !out.status.success() {
         return Err(BusError::invalid(
             "git.branch_name",
@@ -1499,6 +1597,25 @@ fn merged_tips(
         }
     }
     merged
+}
+
+/// Refuse to change the branch of a checkout a live session works in.
+fn refuse_session_checkout(ctx: &Unlocked, project_id: relay_bus::types::Id, root: &Path) -> Result<(), BusError> {
+    let checkout = root.to_string_lossy().to_string();
+    let owner = ctx.read(|conn| {
+        let mut st = conn
+            .prepare_cached("SELECT name FROM sessions WHERE project_id=?1 AND worktree=?2 AND state!='closed' LIMIT 1")
+            .bus()?;
+        let mut rows = st.query(rusqlite::params![project_id, checkout]).bus()?;
+        rows.next().bus()?.map(|row| row.get::<_, String>(0)).transpose().bus()
+    })?;
+    match owner {
+        Some(session) => Err(BusError::conflict(
+            "git.checkout_session_owned",
+            format!("This checkout belongs to the live session {session}; its agent decides its branch. Select another checkout, or end the session first."),
+        )),
+        None => Ok(()),
+    }
 }
 
 /// What `git.branch.switch` checks out: a local branch, or a new local tracking branch for a
@@ -1655,11 +1772,14 @@ fn branch_owners(conn: &rusqlite::Connection, project_id: relay_bus::types::Id) 
 }
 
 /// The branch listing, merged state included: history walks, so never under the store lock.
+/// `current` is `root`'s branch; remote branches only when `with_remotes`.
 fn branches_with(
-    project: &relay_bus::types::Project,
+    root: &Path,
+    base_branch: &str,
     owners: &HashMap<String, String>,
+    with_remotes: bool,
 ) -> Result<BranchesOut, BusError> {
-    let mut repo = gix::open(&project.path).map_err(gix_err("git.open_failed"))?;
+    let mut repo = gix::open(root).map_err(gix_err("git.open_failed"))?;
     // Every walk below decompresses commits; without a cache each branch paid for its own.
     repo.object_cache_size_if_unset(16 * 1024 * 1024);
     let current = repo
@@ -1669,7 +1789,7 @@ fn branches_with(
         .map(|n| n.shorten().to_string())
         .unwrap_or_default();
     let head = repo
-        .rev_parse_single(project.base_branch.as_str())
+        .rev_parse_single(base_branch)
         .ok()
         .map(|id| id.detach());
     let mut tips = Vec::new();
@@ -1709,7 +1829,9 @@ fn branches_with(
             current: name == current,
         });
     }
-    Ok(BranchesOut { current, branches, remote_branches: Vec::new() })
+    branches.sort_by_key(|b| (!b.current, b.name.clone()));
+    let remote_branches = if with_remotes { remote_branches(&repo, &platform, &branches)? } else { Vec::new() };
+    Ok(BranchesOut { current, branches, remote_branches })
 }
 
 #[cfg(test)]
@@ -1779,6 +1901,35 @@ mod tests {
         assert!(cached_prs(&repo.join("other")).is_none(), "a listing answers only its own repository");
         forget_prs(repo);
         assert!(cached_prs(repo).is_none());
+    }
+
+    /// RA-160: a timed-out child gets SIGTERM, which is when git deletes its `index.lock`,
+    /// before anything is SIGKILLed.
+    #[test]
+    fn a_timed_out_child_may_clean_up_its_lock_before_it_is_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("index.lock");
+        let mut command = std::process::Command::new("sh");
+        command.current_dir(dir.path()).args([
+            "-c",
+            "trap 'rm -f index.lock; exit 143' TERM; : > index.lock; while :; do sleep 0.05; done",
+        ]);
+        let started = std::time::Instant::now();
+        let out = crate::proc::output_with_timeout(&mut command, std::time::Duration::from_millis(300)).unwrap();
+        assert!(out.is_none(), "the child outlived its deadline");
+        assert!(!lock.exists(), "the lock outlived the timed-out child");
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    }
+
+    #[test]
+    fn numstat_records_become_gate_lines_with_a_rename_source_of_its_own() {
+        let raw = "1\t2\tsrc/a.rs\0-\t-\tlogo.png\0\
+                   0\t1\t\0secret/key.txt\0public/key.txt\0";
+        assert_eq!(
+            numstat_lines(raw),
+            "1\t2\tsrc/a.rs\n-\t-\tlogo.png\n0\t0\tsecret/key.txt\n0\t1\tpublic/key.txt\n"
+        );
+        assert_eq!(numstat_lines(""), "");
     }
 
     fn git(root: &Path, args: &[&str]) -> String {
