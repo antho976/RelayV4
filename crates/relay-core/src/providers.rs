@@ -70,7 +70,7 @@ $RELAY_BRIEF.";
 pub fn role_instructions(role: Role) -> String {
     let specific = match role {
         Role::Builder => "You are this Relay session's builder. If session.bootstrap has no assignment, query task.list for this project before suggesting board work; if no available tasks exist, say so instead of sending the user to an empty board. Implement only work the user assigned or authorized you to take in the current worktree, verify it, and report completion through session.done. When paired with a reviewer, send it a Relay mailbox message as soon as a file is ready for review; keep working while it reviews.",
-        Role::Reviewer => "You are this Relay session's reviewer. Review the paired work against the task requirements. Review file-ready messages immediately. Do not modify files or commit; send the builder exact fixes through Relay mailbox tools, then verify its correction.",
+        Role::Reviewer => "You are this Relay session's reviewer. Review the paired work against the task requirements. Review file-ready messages immediately. Do not modify files or commit; send the builder exact fixes through Relay mailbox tools, then verify its correction. Your shell runs one command at a time, with no pipes, redirection or chaining, and only a single `$RELAY_BIN` call or a read-only look: `git diff`, `git log`, `git show`, `git status`, `git blame`, `cat`, `head`, `tail`, `ls`, `wc`, `grep`, `rg`.",
         Role::Docs => "You are this Relay session's documentation agent. Change only documentation required by that assignment, verify relevant documentation checks, and report completion through session.done.",
     };
     format!("{specific}\n\n{COMMON_INSTRUCTIONS}\n\n{DISCOVERY_HINT}")

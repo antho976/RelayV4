@@ -58,7 +58,8 @@ fn read_codex() -> Option<Usage> {
     collect_jsonl(&root, 0, &mut files);
     files.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
     for (path, _) in files.into_iter().take(MAX_CODEX_FILES) {
-        let raw = read_tail(&path, CODEX_TAIL).ok()?;
+        // One unreadable rollout says nothing about the others.
+        let Ok(raw) = read_tail(&path, CODEX_TAIL) else { continue };
         for line in raw.lines().rev() {
             let Ok(value) = serde_json::from_str::<Value>(line) else { continue };
             let limits = value.pointer("/payload/rate_limits")
@@ -74,12 +75,25 @@ fn read_codex() -> Option<Usage> {
     None
 }
 
+/// How many rollouts the walk stats before it stops. Only a bound against a pathological tree:
+/// a stat is cheap, and the newest file has to be among those seen for the sort to find it.
+const MAX_CODEX_WALK: usize = 20_000;
+
+/// Every rollout under `dir` with its mtime. Codex files them as `YYYY/MM/DD/*.jsonl`, and
+/// `read_dir` order is creation order on btrfs, hash order on ext4 — never date order. So the
+/// walk takes every file and the caller sorts by mtime (a resumed session appends to a file in
+/// an older day's directory); directories are visited newest name first so that, if the bound
+/// above is ever reached, what is dropped is the oldest days, not the newest (RA-016).
 fn collect_jsonl(dir: &Path, depth: u8, out: &mut Vec<(PathBuf, SystemTime)>) {
-    if depth > 4 || out.len() > 256 { return; }
+    if depth > 4 || out.len() >= MAX_CODEX_WALK { return; }
     let Ok(entries) = fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.file_name()));
+    for entry in entries {
+        if out.len() >= MAX_CODEX_WALK { return; }
+        let Ok(kind) = entry.file_type() else { continue };
         let path = entry.path();
-        if path.is_dir() { collect_jsonl(&path, depth + 1, out); }
+        if kind.is_dir() { collect_jsonl(&path, depth + 1, out); }
         else if path.extension().is_some_and(|extension| extension == "jsonl") {
             let modified = entry.metadata().and_then(|metadata| metadata.modified()).unwrap_or(UNIX_EPOCH);
             out.push((path, modified));
@@ -92,8 +106,11 @@ fn read_tail(path: &Path, max: u64) -> std::io::Result<String> {
     let len = file.metadata()?.len();
     let start = len.saturating_sub(max);
     file.seek(SeekFrom::Start(start))?;
-    let mut raw = String::new();
-    file.read_to_string(&mut raw)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    // The seek can land inside a multi-byte character; that partial first line is dropped
+    // below anyway, so decode lossily rather than reject the whole tail.
+    let mut raw = String::from_utf8_lossy(&bytes).into_owned();
     if start > 0 {
         raw = raw.split_once('\n').map(|(_, rest)| rest.to_string()).unwrap_or_default();
     }
@@ -221,5 +238,43 @@ mod tests {
         assert!((595..=605).contains(&age), "taken_at follows the file's mtime, got {age}s old");
         fs::write(&path, r#"{"timestamp":"2026-01-02T03:04:05Z","rate_limits":{"seven_day":{"utilization":9}}}"#).unwrap();
         assert_eq!(read_claude_file(&path).unwrap().taken_at, "2026-01-02T03:04:05Z");
+    }
+
+    /// RA-016: the walk used to stop after ~256 files in `read_dir` order, which on btrfs is
+    /// oldest-first, so the newest rollouts were never even looked at.
+    #[test]
+    fn the_newest_codex_rollout_is_found_however_many_older_ones_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = SystemTime::now() - std::time::Duration::from_secs(400 * 86_400);
+        // Created oldest first, as Codex would have written them.
+        for day in 0..40u64 {
+            let folder = dir.path().join(format!("2026/{:02}/{:02}", 1 + day / 28, 1 + day % 28));
+            fs::create_dir_all(&folder).unwrap();
+            for n in 0..10u64 {
+                let path = folder.join(format!("rollout-{n}.jsonl"));
+                fs::write(&path, "{}\n").unwrap();
+                let at = base + std::time::Duration::from_secs((day * 10 + n) * 3600);
+                File::options().write(true).open(&path).unwrap().set_modified(at).unwrap();
+            }
+        }
+        // A resumed session appends to a file in an old day's folder: newest by mtime.
+        let resumed = dir.path().join("2026/01/02/rollout-3.jsonl");
+        File::options().write(true).open(&resumed).unwrap().set_modified(SystemTime::now()).unwrap();
+
+        let mut files = Vec::new();
+        collect_jsonl(dir.path(), 0, &mut files);
+        assert_eq!(files.len(), 400, "every rollout is seen");
+        files.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
+        assert_eq!(files[0].0, resumed);
+        assert!(files[1].0.ends_with("2026/02/12/rollout-9.jsonl"), "{:?}", files[1].0);
+    }
+
+    #[test]
+    fn a_tail_that_starts_inside_a_character_still_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        fs::write(&path, "ééééé\n{\"a\":1}\n").unwrap();
+        // 11 bytes from the end lands in the middle of the last `é`.
+        assert_eq!(read_tail(&path, 11).unwrap(), "{\"a\":1}\n");
     }
 }

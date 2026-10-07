@@ -129,6 +129,10 @@ pub fn register(e: &mut Engine) {
     e.register::<WorktreeRemove>(|ctx: &mut Ctx, p| {
         let project = get_project(ctx.tx(), p.project_id)?;
         let repo = Path::new(&project.path);
+        // A relative path would resolve against the engine's cwd ($HOME under `relay serve`).
+        if !Path::new(&p.path).is_absolute() {
+            return Err(BusError::invalid("worktree.path", format!("{:?} must be an absolute path", p.path)));
+        }
         let want = std::fs::canonicalize(&p.path).map(|c| c.display().to_string()).unwrap_or(p.path.clone());
         let owner: Option<String> = ctx.tx().query_row(
             "SELECT name FROM sessions WHERE project_id = ?1 AND worktree = ?2 AND state != 'closed'",

@@ -997,6 +997,79 @@ fn store_migrations() {
     assert!(Store::open(&path, false).is_err());
 }
 
+/// RA-013: the lock file was opened following symlinks and then truncated, so whoever could
+/// plant `<instance>.lock` in the runtime dir could have the engine empty any file of ours.
+#[tokio::test]
+async fn the_socket_door_refuses_a_planted_lock_and_tightens_its_dir() {
+    use relay_core::socket::SocketServer;
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let victim = root.path().join("authorized_keys");
+    std::fs::write(&victim, "ssh-ed25519 AAAA keep-me\n").unwrap();
+    let dir = root.path().join("run");
+    std::fs::create_dir(&dir).unwrap();
+    std::os::unix::fs::symlink(&victim, dir.join("test.lock")).unwrap();
+    assert!(SocketServer::start_in(engine(Instance::Test), dir.clone()).await.is_err());
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "ssh-ed25519 AAAA keep-me\n");
+
+    // A runtime dir that is a symlink is refused too, wherever it points.
+    let link = root.path().join("linked");
+    std::os::unix::fs::symlink(root.path().join("elsewhere"), &link).unwrap();
+    std::fs::create_dir(root.path().join("elsewhere")).unwrap();
+    assert!(SocketServer::start_in(engine(Instance::Test), link).await.is_err());
+
+    // Our own directory, left open, is closed down to 0700 before anything is put in it.
+    let open = root.path().join("open");
+    std::fs::create_dir(&open).unwrap();
+    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let server = SocketServer::start_in(engine(Instance::Test), open.clone()).await.unwrap();
+    assert_eq!(std::fs::metadata(&open).unwrap().permissions().mode() & 0o777, 0o700);
+    drop(server);
+}
+
+/// RA-015: unlocked queries on one connection run side by side and answer by id, while a
+/// mutation still waits its turn behind the queries sent before it.
+#[tokio::test]
+async fn one_connection_runs_its_queries_concurrently_and_keeps_writes_in_order() {
+    use relay_core::socket::{Client, Line, SocketServer};
+    let dir = tempfile::tempdir().unwrap();
+    let e = engine(Instance::Test);
+    // The ops the door handles itself must never take the concurrent path.
+    for op in ["bus.wait", "bus.subscribe", "bus.unsubscribe", "session.attach", "session.detach", "session.resize",
+        "device.watch", "app.resources.watch", "device.run", "device.build", "device.mirror.start", "device.run.stop"] {
+        assert!(!e.runs_unlocked(op), "{op} is connection bookkeeping, not a free-standing query");
+    }
+    assert!(e.runs_unlocked("git.pr.list") && e.runs_unlocked("file.search"));
+
+    let server = SocketServer::start_in(e.clone(), dir.path().to_path_buf()).await.unwrap();
+    let mut c = Client::connect(&server.path).await.unwrap();
+    let mut sent = Vec::new();
+    for n in 0..20 {
+        let req = if n == 15 {
+            Request::new(Actor::User, "workspace.create", json!({"path": dir.path().join("ws")}))
+        } else {
+            Request::new(Actor::User, "worktree.list", json!({"project_id": 99}))
+        };
+        c.send_raw(&serde_json::to_string(&req).unwrap()).await.unwrap();
+        sent.push(req.id);
+    }
+    let mut answered = Vec::new();
+    while answered.len() < sent.len() {
+        if let Some(Line::Response(r)) = c.next().await.unwrap() {
+            answered.push(r.id.unwrap());
+        }
+    }
+    let mut sorted = answered.clone();
+    sorted.sort();
+    let mut expected = sent.clone();
+    expected.sort();
+    assert_eq!(sorted, expected, "every request is answered exactly once");
+    let write_at = answered.iter().position(|id| *id == sent[15]).unwrap();
+    for earlier in &sent[..15] {
+        assert!(answered.iter().position(|id| id == earlier).unwrap() < write_at, "a write overtook a query sent before it");
+    }
+}
+
 #[tokio::test]
 async fn socket_door_round_trip_and_events() {
     use relay_core::socket::{Client, Line, SocketServer};

@@ -472,3 +472,31 @@ fn a_large_rewrite_holds_only_when_the_content_would_be_lost() {
         json!({"patch": {"destructive_write": {"allow_if_recoverable": false}}}));
     assert_eq!(check("tracked.rs")["verdict"], "hold", "the escape can be switched off");
 }
+
+/// RA-009: confirming a held agent `file.write` replays it as that agent, session included. The
+/// replay used to run with the confirmer's session (none, for the user), so a write that named
+/// no `worktree` resolved to the project's primary checkout instead of the agent's own.
+#[test]
+fn a_confirmed_agent_write_lands_in_the_agents_worktree() {
+    let f = Fixture::new();
+    let writer = ok(&f.engine, Actor::User, "session.create",
+        json!({"project_id": 1, "provider": "claude", "role": "builder", "bus_writes": true}));
+    let agent = Actor::agent(writer["name"].as_str().unwrap());
+    let worktree = Path::new(writer["worktree"].as_str().unwrap()).to_path_buf();
+    let primary = Path::new(&ok(&f.engine, Actor::User, "project.get", json!({"project_id": 1}))["path"]
+        .as_str().unwrap().to_string()).to_path_buf();
+    assert_ne!(worktree, primary);
+
+    // Untracked, so git cannot restore it: the rewrite is held as a destructive write.
+    let long: String = (0..200).map(|line| format!("line-{line}\n")).collect();
+    std::fs::write(worktree.join("scratch.rs"), &long).unwrap();
+    let held = refusal(&f.engine, agent, "file.write",
+        json!({"project_id": 1, "path": "scratch.rs", "text": "fn main() {}\n"}));
+    assert_eq!(held.code, "guardrail.destructive_write");
+    let hold_id = held.confirm.as_ref().unwrap().payload["hold_id"].as_i64().unwrap();
+
+    let confirmed = ok(&f.engine, Actor::User, "guardrail.confirm", json!({"hold_id": hold_id}));
+    assert_eq!(confirmed["outcome"]["ok"], true, "{}", confirmed["outcome"]);
+    assert_eq!(std::fs::read_to_string(worktree.join("scratch.rs")).unwrap(), "fn main() {}\n");
+    assert!(!primary.join("scratch.rs").exists(), "the replay wrote into the primary checkout");
+}
