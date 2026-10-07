@@ -2882,7 +2882,7 @@
       }
     },
     "git.branch.clean_merged": {
-      "summary": "Alias of git.branch.cleanup that answers with the names of the branches deleted (or, on a dry run, that would be)",
+      "summary": "Alias of git.branch.cleanup that answers with the names of the branches deleted (or, on a dry run, that would be), and the merged ones it could not delete",
       "kind": "mutation",
       "audit": "always",
       "undo": "none",
@@ -12186,10 +12186,33 @@
           "items": {
             "type": "string"
           }
+        },
+        "failed": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/GitCleanMergedFailed"
+          },
+          "description": "Branches found merged that were not deleted (or, on a dry run, would not be), with why:\na dirty or still-held checkout, a rebase in progress, a failed delete (RA-373).",
+          "default": []
         }
       },
       "required": [
         "deleted"
+      ]
+    },
+    "GitCleanMergedFailed": {
+      "type": "object",
+      "properties": {
+        "branch": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "branch",
+        "reason"
       ]
     },
     "GitBranchCleanupIn": {
@@ -12259,6 +12282,11 @@
         },
         "deleted_remote": {
           "type": "boolean"
+        },
+        "merged": {
+          "type": "boolean",
+          "description": "Its work was found merged; a `kept` row with this set is one cleanup could not delete.",
+          "default": false
         }
       },
       "required": [
