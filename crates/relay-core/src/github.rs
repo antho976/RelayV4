@@ -6,7 +6,16 @@ use relay_bus::types::{GitHubRepo, GitHubStatus};
 use serde::Deserialize;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+use std::time::Duration;
+
+/// `gh api` calls are network round trips; a stalled one must fail its request rather than hold
+/// a bus worker forever, so every subprocess here goes through [`crate::proc::output_with_timeout`].
+const API_TIMEOUT: Duration = Duration::from_secs(30);
+/// `--paginate` over every repository the user can see is many round trips.
+const LIST_TIMEOUT: Duration = Duration::from_secs(120);
+/// `gh auth login --web` waits for the person to finish in the browser.
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug)]
 pub struct DownloadedSkill {
@@ -42,9 +51,9 @@ pub fn status() -> GitHubStatus {
     let Ok(gh) = which::which("gh") else {
         return GitHubStatus { installed: false, connected: false, login: None };
     };
-    let output = Command::new(gh).args(["api", "user", "--jq", ".login"]).output();
+    let output = crate::proc::output_with_timeout(Command::new(gh).args(["api", "user", "--jq", ".login"]), API_TIMEOUT);
     match output {
-        Ok(output) if output.status.success() => GitHubStatus {
+        Ok(Some(output)) if output.status.success() => GitHubStatus {
             installed: true,
             connected: true,
             login: Some(String::from_utf8_lossy(&output.stdout).trim().to_string()).filter(|value| !value.is_empty()),
@@ -53,22 +62,20 @@ pub fn status() -> GitHubStatus {
     }
 }
 
+/// A login abandoned in the browser counts as not connected once [`LOGIN_TIMEOUT`] passes.
 pub fn connect(gh: PathBuf) -> std::io::Result<bool> {
-    Command::new(gh)
-        .args(["auth", "login", "--hostname", "github.com", "--web", "--clipboard", "--git-protocol", "https"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
+    let mut command = Command::new(gh);
+    command.args(["auth", "login", "--hostname", "github.com", "--web", "--clipboard", "--git-protocol", "https"]);
+    Ok(crate::proc::output_with_timeout(&mut command, LOGIN_TIMEOUT)?.is_some_and(|output| output.status.success()))
 }
 
 pub fn repositories() -> Result<Vec<GitHubRepo>, BusError> {
     let gh = gh_path()?;
-    let output = Command::new(gh)
-        .args(["api", "--paginate", "user/repos?per_page=100&sort=updated&direction=desc"])
-        .output()
-        .map_err(|error| BusError::unavailable("github.list_failed", error.to_string()))?;
+    let mut command = Command::new(gh);
+    command.args(["api", "--paginate", "user/repos?per_page=100&sort=updated&direction=desc"]);
+    let output = crate::proc::output_with_timeout(&mut command, LIST_TIMEOUT)
+        .map_err(|error| BusError::unavailable("github.list_failed", error.to_string()))?
+        .ok_or_else(|| BusError::unavailable("github.list_timeout", "GitHub did not list repositories within 2 minutes"))?;
     if !output.status.success() {
         return Err(BusError::unavailable(
             "github.not_connected",
@@ -160,8 +167,8 @@ fn collect_skills(
     subdir: Option<&str>,
     stage: Option<&Path>,
 ) -> Result<Vec<DownloadedSkill>, BusError> {
-    let revision = Command::new("git").args(["-C", root.to_string_lossy().as_ref(), "rev-parse", "HEAD"])
-        .output().ok().filter(|output| output.status.success())
+    let revision = crate::proc::output_with_timeout(Command::new("git").args(["-C", root.to_string_lossy().as_ref(), "rev-parse", "HEAD"]), Duration::from_secs(10))
+        .ok().flatten().filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string()).unwrap_or_default();
     let start = if let Some(subdir) = subdir {
         let relative = safe_relative(subdir)?;
