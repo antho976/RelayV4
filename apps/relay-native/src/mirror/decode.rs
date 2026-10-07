@@ -258,6 +258,21 @@ mod tests {
         assert!(ppm(&mut reader).await.is_err());
     }
 
+    #[tokio::test]
+    async fn a_picture_the_decoder_did_not_finish_is_an_error_not_a_frame() {
+        for data in [
+            &b"P3\n1 1\n255\n\0\0\0"[..],  // ASCII PPM, not raw RGB
+            b"P6\n1 1\n65535\n\0\0\0\0\0\0", // 16-bit samples
+            b"P6\n0 1\n255\n",              // zero-sized
+            b"P6\n2\n255\n\0\0\0\0\0\0",    // one dimension
+            b"P6\n2 1\n255\nabc",           // pixels cut off mid-picture
+            b"",                            // decoder exited
+        ] {
+            let mut reader = BufReader::new(data);
+            assert!(ppm(&mut reader).await.is_err(), "{:?}", String::from_utf8_lossy(data));
+        }
+    }
+
     #[test]
     fn the_decoder_line_is_the_measured_one() {
         let args = ffmpeg_args();

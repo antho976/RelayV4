@@ -1,10 +1,19 @@
 //! The mirror's control glyphs. Same anatomy as `icons.rs` — 16-unit view box, 1.5 strokes,
 //! round caps and joins, painted in the widget's own color — but kept here because they only
 //! mean something next to a phone: the Android navigation triad, hardware buttons, panels.
+//! Shapes the shared set already draws are delegated to `icons::image`.
 use gtk4::{self as gtk, prelude::*};
+use std::cell::RefCell;
+use std::collections::HashMap;
 
-fn geometry(name: &str) -> &'static str {
-    match name {
+thread_local! {
+    /// Rendered glyphs by document, for the same reason as `icons.rs`: every hover, press and
+    /// window focus change repaints each key, and the set of documents is small and bounded.
+    static RENDERED: RefCell<HashMap<String, gtk::Svg>> = RefCell::new(HashMap::new());
+}
+
+fn geometry(name: &str) -> Option<&'static str> {
+    Some(match name {
         // Android's own navigation marks, so the bar under the phone reads at a glance.
         "back" => r##"<path d="M11 3.5L4.5 8l6.5 4.5z" />"##,
         "home" => r##"<circle cx="8" cy="8" r="4.5" />"##,
@@ -22,25 +31,31 @@ fn geometry(name: &str) -> &'static str {
         "undock" => r##"<path d="M6 3H3v10h10v-3M9 3h4v4M13 3L7 9" />"##,
         "fullscreen" => r##"<path d="M2.5 6V2.5H6M10 2.5h3.5V6M13.5 10v3.5H10M6 13.5H2.5V10" />"##,
         "exit-fullscreen" => r##"<path d="M6 2.5V6H2.5M13.5 6H10V2.5M10 13.5V10h3.5M2.5 10H6v3.5" />"##,
-        "retry" => r##"<path d="M13 8a5 5 0 1 1-1.5-3.5" /><path d="M13 2.5V5h-2.5" />"##,
-        "device" => r##"<rect x="4.25" y="1.5" width="7.5" height="13" rx="1" /><path d="M6.5 3h3M7.25 12.5h1.5" />"##,
-        "chevron-down" => r##"<path d="M4 6l4 4 4-4" />"##,
-        "close" => r##"<path d="M4 4l8 8M12 4l-8 8" />"##,
-        "check" => r##"<path d="M3 8.5l3 3 7-7" />"##,
-        _ => r##"<circle cx="8" cy="8" r="3"/>"##,
-    }
+        _ => return None,
+    })
 }
 
 pub fn image(name: &str, size: i32) -> gtk::Image {
+    let Some(shape) = geometry(name) else {
+        // `device`, `close`, `check` and `chevron-down` are the shared shapes; `retry` is its `refresh`.
+        return crate::icons::image(if name == "retry" { "refresh" } else { name }, size);
+    };
     let image = gtk::Image::new();
     image.set_pixel_size(size);
-    let shape = geometry(name);
     let paint = move |image: &gtk::Image| {
         let color = image.color();
         let document = format!(
             r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" color="{color}" stroke="{color}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">{shape}</svg>"##
         );
-        image.set_paintable(Some(&gtk::Svg::from_bytes(&glib::Bytes::from_owned(document.into_bytes()))));
+        let svg = RENDERED.with(|cache| {
+            let hit = cache.borrow().get(&document).cloned();
+            hit.unwrap_or_else(|| {
+                let svg = gtk::Svg::from_bytes(&glib::Bytes::from_owned(document.clone().into_bytes()));
+                cache.borrow_mut().insert(document, svg.clone());
+                svg
+            })
+        });
+        image.set_paintable(Some(&svg));
     };
     // GTK 4.22 SVG paintables do not inherit currentColor; repaint on state changes like icons.rs.
     image.connect_map(paint);

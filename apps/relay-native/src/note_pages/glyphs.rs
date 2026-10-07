@@ -38,15 +38,10 @@ fn geometry(name: &str) -> Option<&'static str> {
             r##"<rect x="2" y="2.5" width="12" height="11" /><path d="M6.5 6L4.5 8l2 2M9.5 6l2 2-2 2" />"##
         }
         "code-inline" => r##"<path d="M5.5 4.5L2 8l3.5 3.5M10.5 4.5L14 8l-3.5 3.5" />"##,
-        "rule" => r##"<path d="M2 8h12" /><path d="M5 4.5h6M5 11.5h6" stroke-opacity=".45" />"##,
         "sort" => r##"<path d="M4.5 3v10M2.5 11l2 2 2-2" /><path d="M8.5 4h5.5M8.5 8h4M8.5 12h2.5" />"##,
         "note-new" => {
             r##"<path d="M4 2h5l3 3v9H4z" /><path d="M9 2v3h3" /><path d="M8 7.5v4.5M5.75 9.75h4.5" />"##
         }
-        "calendar" => {
-            r##"<rect x="2.5" y="3.5" width="11" height="10" /><path d="M2.5 6.5h11M5.5 2v3M10.5 2v3" />"##
-        }
-        "goto" => r##"<path d="M3 8h9M8.5 4.5L12 8l-3.5 3.5" /><path d="M14 3v10" />"##,
         _ => return None,
     })
 }

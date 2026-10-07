@@ -102,11 +102,10 @@
 
 /* Actions */
 .ext-page .ext-action-bar button { min-height: 30px; padding: 0 12px; }
-.ext-page button.ext-danger label { color: @secondary; }
-.ext-page button.ext-danger:hover { background: alpha(@held, 0.1); }
-.ext-page button.ext-danger:hover label { color: @held; }
-.ext-page button.ext-danger.armed { border-color: alpha(@held, 0.6); background: alpha(@held, 0.08); }
-.ext-page button.ext-danger.armed label { color: @held; }
+/* Armed, it is the shared inline confirm (sessions.css `.confirm-armed`); these are its resting tints. */
+.ext-page button.ext-danger:not(.confirm-armed) label { color: @secondary; }
+.ext-page button.ext-danger:not(.confirm-armed):hover { background: alpha(@held, 0.1); }
+.ext-page button.ext-danger:not(.confirm-armed):hover label { color: @held; }
 
 /* Facts */
 .ext-page .ext-facts { padding: 14px 0; border-top: 1px solid @edge; border-bottom: 1px solid @edge; }
