@@ -121,6 +121,11 @@ pub async fn refresh(ui: &Rc<Ui>, name: &str, project: i64) {
         page.append(&body);
     }
     let body = page.last_child().unwrap().downcast::<gtk::Box>().unwrap();
+    // Guardrails reconciles its cards instead of rebuilding them (`guardrail_pages::page`).
+    if name == "guardrails" {
+        guardrail_pages::page(ui, &body, project, data).await;
+        return;
+    }
     clear(&body);
     if data.is_empty() {
         body.append(&paragraph(match name {
@@ -151,28 +156,6 @@ pub async fn refresh(ui: &Rc<Ui>, name: &str, project: i64) {
                 row.append(&paragraph(text(&message, "text")));
                 row.append(&label(text(&message, "sent_at"), "dim"));
                 body.append(&row);
-            }
-        }
-        "guardrails" => {
-            guardrail_pages::page(ui, &body, project, data).await;
-            if ui.project.get() != project || *ui.page.borrow() != name {
-                return;
-            }
-            if let Ok(overlaps) = ui.call("overlap.list", json!({"project_id":project})).await {
-                if ui.project.get() != project || *ui.page.borrow() != name {
-                    return;
-                }
-                let overlaps = rows(&overlaps, "overlaps");
-                if !overlaps.is_empty() {
-                    body.append(&label("Shared file activity", "title"));
-                }
-                for overlap in overlaps {
-                    body.append(&paragraph(&format!(
-                        "{}\n{}",
-                        text(&overlap, "path"),
-                        text(&overlap, "note")
-                    )));
-                }
             }
         }
         "notes" => {

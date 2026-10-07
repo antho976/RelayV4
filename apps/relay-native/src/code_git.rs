@@ -165,21 +165,6 @@ type GitResults = (
     Result<Value, Error>,
 );
 
-/// A popover open somewhere under `root`.
-fn open_popover(root: &gtk::Widget) -> Option<gtk::Popover> {
-    let mut child = root.first_child();
-    while let Some(widget) = child {
-        if let Some(popover) = widget.downcast_ref::<gtk::Popover>().filter(|p| p.is_visible()) {
-            return Some(popover.clone());
-        }
-        if let Some(found) = open_popover(&widget) {
-            return Some(found);
-        }
-        child = widget.next_sibling();
-    }
-    None
-}
-
 /// Every scroller's position under `root`, in tree order.
 fn scroll_positions(root: &gtk::Widget) -> Vec<f64> {
     let mut positions = Vec::new();
@@ -281,7 +266,7 @@ impl Editor {
             }
             // A rebuild would close an open branch picker or commit menu under the pointer:
             // wait for it to close.
-            if let Some(popover) = open_popover(e.git.upcast_ref()) {
+            if let Some(popover) = crate::app::open_popover(e.git.upcast_ref()) {
                 if !e.git_deferred.replace(true) {
                     let (ed, weak) = (Rc::downgrade(&e), Rc::downgrade(&ui));
                     popover.connect_closed(move |_| {

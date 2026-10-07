@@ -130,8 +130,13 @@ impl Ui {
         }
         self.render_projects();
         self.reconcile();
-        if matches!(self.page.borrow().as_str(), "board" | "dashboard") {
-            self.refresh_page();
+        // The board shows this project's sessions only; the dashboard shows every project.
+        let here = payload["project_id"].as_i64() == Some(self.project.get());
+        let page = self.page.borrow().clone();
+        match page.as_str() {
+            "dashboard" => self.refresh_page(),
+            "board" if here => self.refresh_page(),
+            _ => {}
         }
         true
     }
