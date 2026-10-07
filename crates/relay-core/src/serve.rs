@@ -1,4 +1,4 @@
-//! `relay serve` and the Tauri shell both do this: open the store exclusively, build the
+//! `relay serve` (and `relay serve --remote`) does this: open the store exclusively, build the
 //! engine, open the socket door, run until quit.
 
 use crate::engine::Engine;

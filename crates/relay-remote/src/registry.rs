@@ -2,12 +2,17 @@
 //! now, and where the rendezvous server is. One small file per instance next to the store,
 //! mode 0600, re-read on every handshake so `relay remote pair` in a second terminal and the
 //! serving process never have to talk to each other.
+//!
+//! Several processes change it (the door, `relay remote pair`, `revoke`, …), and the door changes
+//! it from many connections at once, so every change is a `Registry::update`: a read-modify-write
+//! under an exclusive lock on a sibling `remote.json.lock`, saved through a temp file of its own.
 
 use anyhow::{Context, Result};
 use jiff::{Timestamp, ToSpan};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 /// A phone that completed pairing. The token is the whole credential: it is sent once, at
 /// pairing, and afterwards only proven with a per-connection challenge (`wire.rs`).
@@ -27,6 +32,46 @@ pub struct Pending {
     pub code: String,
     pub created_at: String,
     pub expires_at: String,
+    /// The PC must approve the device that presents this code before it gets a token: the
+    /// `relay remote pair` that opened the window asks. Without it the first presenter wins.
+    #[serde(default)]
+    pub confirm: bool,
+    /// The device that presented the code and is waiting for the PC's answer. A code answers
+    /// one device: a second presenter is refused while this one waits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<PairRequest>,
+}
+
+/// A device waiting at the door with a code, as the PC is asked about it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PairRequest {
+    pub device_name: String,
+    /// Which door and from where: `direct 192.0.2.7` or `rendezvous`.
+    pub origin: String,
+    pub at: String,
+    /// The PC's answer; `None` until someone gives one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved: Option<bool>,
+}
+
+/// What presenting a pairing code got.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Presented {
+    /// No such open code, or another device is already waiting on it.
+    Invalid,
+    /// A first-come code: the device is paired.
+    Paired(Device),
+    /// The PC has to approve; ask `outcome` until it has.
+    Waiting,
+}
+
+/// Where a waiting pairing stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    Waiting,
+    Approved(Device),
+    /// Declined, cancelled or expired: the code is gone either way.
+    Declined,
 }
 
 /// The self-hosted rendezvous this engine dials out to (`tunnel.rs`), if any.
@@ -60,6 +105,11 @@ pub struct Registry {
 pub const DEFAULT_PORT: u16 = 7420;
 pub const DEFAULT_RENDEZVOUS_PORT: u16 = 7430;
 const PAIR_TTL_MINUTES: i64 = 10;
+
+/// Serializes `Registry::update` between threads of one process; the file lock does the same
+/// between processes (and between descriptors, so it alone would do — this keeps the wait off
+/// the kernel when the door's own connections are the ones racing).
+static UPDATE: Mutex<()> = Mutex::new(());
 
 pub fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
@@ -116,6 +166,13 @@ fn pair_code() -> String {
     )
 }
 
+/// A name a device chose for itself, made safe to store and to print in a terminal prompt.
+fn device_label(name: &str) -> String {
+    let name: String = name.chars().filter(|c| !c.is_control()).take(64).collect();
+    let name = name.trim();
+    if name.is_empty() { "phone".to_string() } else { name.to_string() }
+}
+
 /// Codes are compared without case, dashes or spaces: what a person types is never exact.
 pub fn normalize_code(code: &str) -> String {
     code.chars()
@@ -156,26 +213,76 @@ impl Registry {
         }
     }
 
+    /// Replace the file atomically: a temp file of this write's own, flushed, renamed over the
+    /// old one, and the directory flushed so the rename survives a crash. A reader sees the old
+    /// file or the new one, never a mix. This does not lock: a read-modify-write is `update`.
     pub fn save(&self, path: &Path) -> Result<()> {
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        }
-        let tmp = path.with_extension("json.tmp");
-        {
+        let dir = parent_dir(path);
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("remote.json");
+        let tmp = dir.join(format!(".{name}.{}.{}.tmp", std::process::id(), random_hex(6)));
+        let written = (|| -> Result<()> {
             let mut f = std::fs::OpenOptions::new()
                 .write(true)
-                .create(true)
-                .truncate(true)
+                .create_new(true)
                 .mode(0o600)
                 .open(&tmp)
                 .with_context(|| format!("writing {}", tmp.display()))?;
             f.write_all(serde_json::to_string_pretty(self)?.as_bytes())?;
             f.write_all(b"\n")?;
+            f.sync_all().with_context(|| format!("flushing {}", tmp.display()))?;
+            std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
+            Ok(())
+        })();
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
         }
-        std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
+        written?;
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
         Ok(())
+    }
+
+    /// The lock file `update` holds: next to the registry, never renamed, so every process
+    /// locks the same inode.
+    pub fn lock_path(path: &Path) -> PathBuf {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("remote.json");
+        parent_dir(path).join(format!("{name}.lock"))
+    }
+
+    /// Load, change and save under an exclusive lock, so two writers — the door admitting a
+    /// phone while `relay remote revoke` runs, two phones at once — never undo each other.
+    /// `f` returning an error saves nothing. Nothing slow belongs in `f`: the lock is held
+    /// throughout, and the door's connections wait on it.
+    pub fn update<R, E>(path: &Path, f: impl FnOnce(&mut Registry) -> std::result::Result<R, E>) -> std::result::Result<R, E>
+    where
+        E: From<anyhow::Error>,
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let _thread = UPDATE.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = parent_dir(path);
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        let lock_path = Registry::lock_path(path);
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&lock_path)
+            .with_context(|| format!("opening {}", lock_path.display()))?;
+        lock.lock().with_context(|| format!("locking {}", lock_path.display()))?;
+        let mut registry = Registry::load(path)?;
+        let before = registry.clone();
+        let out = f(&mut registry)?;
+        if registry != before {
+            registry.save(path)?;
+        }
+        // Dropping `lock` closes the descriptor, which releases the lock.
+        Ok(out)
     }
 
     /// Drop pairing codes that expired.
@@ -189,41 +296,98 @@ impl Registry {
         });
     }
 
-    /// Open a pairing window: one code, ten minutes, single use.
-    pub fn begin_pair(&mut self) -> Pending {
+    /// Open a pairing window: one code, ten minutes, single use. It replaces any window still
+    /// open, so a code shown earlier — on a screen share, in scrollback — stops working.
+    /// `confirm` makes the PC approve the device that presents it (`Presented::Waiting`).
+    pub fn begin_pair(&mut self, confirm: bool) -> Pending {
         let created = now();
         let pending = Pending {
             code: pair_code(),
             created_at: created.to_string(),
             expires_at: (created + PAIR_TTL_MINUTES.minutes()).to_string(),
+            confirm,
+            request: None,
         };
+        self.pending.clear();
         self.pending.push(pending.clone());
         pending
     }
 
-    /// Redeem a code for a device credential. The code is consumed whether or not the rest of
-    /// the handshake succeeds, so it cannot be tried twice.
-    pub fn redeem(&mut self, code: &str, device_name: &str) -> Option<Device> {
+    fn pending_index(&mut self, code: &str) -> Option<usize> {
         self.prune();
         let wanted = normalize_code(code);
         if wanted.is_empty() {
             return None;
         }
-        let idx = self
-            .pending
-            .iter()
-            .position(|p| normalize_code(&p.code) == wanted)?;
-        self.pending.remove(idx);
-        let name = device_name.trim();
+        self.pending.iter().position(|p| normalize_code(&p.code) == wanted)
+    }
+
+    fn mint(&mut self, device_name: &str) -> Device {
         let device = Device {
             id: random_hex(6),
-            name: if name.is_empty() { "phone".to_string() } else { name.chars().take(64).collect() },
+            name: device_label(device_name),
             token: random_hex(32),
             created_at: now().to_string(),
             last_seen: None,
         };
         self.devices.push(device.clone());
-        Some(device)
+        device
+    }
+
+    /// A device presents a code. A first-come code is consumed and pairs it at once; a code
+    /// that needs the PC's approval records the device as waiting, and answers no one else.
+    pub fn present(&mut self, code: &str, device_name: &str, origin: &str) -> Presented {
+        let Some(idx) = self.pending_index(code) else { return Presented::Invalid };
+        let pending = &mut self.pending[idx];
+        if !pending.confirm {
+            self.pending.remove(idx);
+            return Presented::Paired(self.mint(device_name));
+        }
+        if pending.request.is_some() {
+            return Presented::Invalid;
+        }
+        pending.request = Some(PairRequest {
+            device_name: device_label(device_name),
+            origin: origin.chars().filter(|c| !c.is_control()).take(80).collect(),
+            at: now().to_string(),
+            approved: None,
+        });
+        Presented::Waiting
+    }
+
+    /// Where the device waiting on `code` stands. An answer, either way, consumes the code.
+    pub fn outcome(&mut self, code: &str) -> Outcome {
+        let Some(idx) = self.pending_index(code) else { return Outcome::Declined };
+        match self.pending[idx].request.as_ref().and_then(|r| r.approved.map(|a| (a, r.device_name.clone()))) {
+            None => Outcome::Waiting,
+            Some((false, _)) => {
+                self.pending.remove(idx);
+                Outcome::Declined
+            }
+            Some((true, name)) => {
+                self.pending.remove(idx);
+                Outcome::Approved(self.mint(&name))
+            }
+        }
+    }
+
+    /// The PC's answer to the device waiting on `code`. `false` when no device is waiting.
+    pub fn decide(&mut self, code: &str, approve: bool) -> bool {
+        let Some(idx) = self.pending_index(code) else { return false };
+        match self.pending[idx].request.as_mut() {
+            Some(request) if request.approved.is_none() => {
+                request.approved = Some(approve);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Close a pairing window, answered or not.
+    pub fn abandon(&mut self, code: &str) {
+        if let Some(idx) = self.pending_index(code) {
+            self.pending.remove(idx);
+        }
     }
 
     pub fn device(&self, id: &str) -> Option<&Device> {
@@ -260,6 +424,13 @@ impl Registry {
     }
 }
 
+fn parent_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,15 +438,50 @@ mod tests {
     #[test]
     fn a_code_pairs_once_and_then_is_gone() {
         let mut reg = Registry::fresh();
-        let pending = reg.begin_pair();
+        let pending = reg.begin_pair(false);
         assert_eq!(pending.code.len(), 9);
-        let device = reg.redeem(&pending.code.to_lowercase().replace('-', " "), "  Pixel 8 ").unwrap();
-        assert_eq!(device.name, "Pixel 8");
+        let Presented::Paired(device) = reg.present(&pending.code.to_lowercase().replace('-', " "), "  Pixel 8\u{1b}[2J ", "test") else {
+            panic!("a first-come code pairs at once")
+        };
+        assert_eq!(device.name, "Pixel 8[2J", "control characters never reach a terminal");
         assert_eq!(device.token.len(), 64);
-        assert!(reg.redeem(&pending.code, "again").is_none(), "codes are single use");
+        assert_eq!(reg.present(&pending.code, "again", "test"), Presented::Invalid, "codes are single use");
         assert_eq!(reg.device(&device.id).map(|d| &d.token), Some(&device.token));
         assert!(reg.revoke(&device.id));
         assert!(reg.device(&device.id).is_none());
+    }
+
+    #[test]
+    fn a_confirmed_code_waits_for_the_pc_and_answers_one_device() {
+        let mut reg = Registry::fresh();
+        let code = reg.begin_pair(true).code;
+        assert_eq!(reg.present(&code, "Pixel", "direct 192.0.2.7"), Presented::Waiting);
+        assert_eq!(reg.present(&code, "Imposter", "rendezvous"), Presented::Invalid, "one device per code");
+        assert_eq!(reg.outcome(&code), Outcome::Waiting);
+        assert!(reg.devices.is_empty(), "no token before the PC says yes");
+        assert_eq!(reg.pending[0].request.as_ref().unwrap().device_name, "Pixel");
+        assert!(reg.decide(&code, true));
+        assert!(!reg.decide(&code, false), "an answer is final");
+        let Outcome::Approved(device) = reg.outcome(&code) else { panic!("approved") };
+        assert_eq!(device.name, "Pixel");
+        assert!(reg.pending.is_empty());
+
+        let code = reg.begin_pair(true).code;
+        assert!(!reg.decide(&code, true), "nobody is waiting yet");
+        assert_eq!(reg.present(&code, "Stranger", "rendezvous"), Presented::Waiting);
+        assert!(reg.decide(&code, false));
+        assert_eq!(reg.outcome(&code), Outcome::Declined);
+        assert_eq!(reg.present(&code, "Stranger", "rendezvous"), Presented::Invalid, "a declined code is spent");
+        assert_eq!(reg.devices.len(), 1);
+    }
+
+    #[test]
+    fn a_new_window_closes_the_old_one() {
+        let mut reg = Registry::fresh();
+        let old = reg.begin_pair(false).code;
+        let new = reg.begin_pair(false).code;
+        assert_eq!(reg.present(&old, "late", "test"), Presented::Invalid);
+        assert!(matches!(reg.present(&new, "phone", "test"), Presented::Paired(_)));
     }
 
     #[test]
@@ -285,8 +491,10 @@ mod tests {
             code: "AAAA-BBBB".into(),
             created_at: "2020-01-01T00:00:00Z".into(),
             expires_at: "2020-01-01T00:10:00Z".into(),
+            confirm: false,
+            request: None,
         });
-        assert!(reg.redeem("AAAA-BBBB", "late").is_none());
+        assert_eq!(reg.present("AAAA-BBBB", "late", "test"), Presented::Invalid);
         assert!(reg.pending.is_empty());
     }
 
@@ -296,7 +504,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("remote.json");
         let mut reg = Registry::fresh();
-        reg.begin_pair();
+        reg.begin_pair(true);
         reg.set_rendezvous("wss://relay.example.org/");
         reg.save(&path).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;

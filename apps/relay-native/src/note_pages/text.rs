@@ -228,6 +228,16 @@ pub fn preview(title: &str, body: &str) -> String {
         .unwrap_or_default()
 }
 
+/// GTK takes C strings, so engine text with a NUL in it aborts the client in a debug build and
+/// leaves the widget empty in a release one. U+FFFD stands in for each NUL on screen.
+pub fn clean(value: &str) -> std::borrow::Cow<'_, str> {
+    if value.contains('\0') {
+        value.replace('\0', "\u{FFFD}").into()
+    } else {
+        value.into()
+    }
+}
+
 pub const ZOOMS: [u16; 12] = [50, 67, 80, 90, 100, 110, 125, 150, 175, 200, 250, 300];
 
 pub fn zoom_step(current: u16, direction: i32) -> u16 {
@@ -303,5 +313,7 @@ mod tests {
         assert_eq!(zoom_step(100, -1), 90);
         assert_eq!(zoom_step(300, 1), 300);
         assert_eq!(zoom_step(105, -1), 100);
+        assert_eq!(clean("plain"), "plain");
+        assert_eq!(clean("a\0b"), "a\u{FFFD}b");
     }
 }

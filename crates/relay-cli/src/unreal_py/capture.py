@@ -1,5 +1,6 @@
 # ue_screenshot and ue_anim_preview's camera: renders views with a temporary SceneCapture2D and
-# writes PNGs, synchronously, inside this one script.
+# writes PNGs, synchronously, inside this one script. The camera is transient, so the level is
+# not left modified.
 
 import os
 
@@ -35,26 +36,37 @@ def views_around(center, radius, forward, right, names):
     return out
 
 
-def coverage(rt):
-    """Share of sampled pixels that differ from the corner (background) pixel: 0 means the
-    subject did not render (an invisible mesh draws only its shadow, or nothing)."""
-    try:
-        bg = unreal.RenderingLibrary.read_render_target_pixel(world, rt, 1, 1)
-        hits, total = 0, 0
-        for gx in range(1, 24):
-            for gy in range(1, 24):
-                c = unreal.RenderingLibrary.read_render_target_pixel(world, rt, int(width * gx / 24), int(height * gy / 24))
-                total += 1
-                if abs(c.r - bg.r) + abs(c.g - bg.g) + abs(c.b - bg.b) > 24:
-                    hits += 1
-        return round(hits / float(total), 3)
-    except Exception:
-        return None
+GRID = 48
 
 
-def capture(shots, hidden):
+def samples(rt):
+    """Colours on a GRID x GRID lattice over the render target. Read back in one go where the
+    engine can; a failed read raises rather than passing for an image."""
+    reader = getattr(unreal.RenderingLibrary, "read_render_target", None)
+    points = [(int(width * gx / GRID), int(height * gy / GRID)) for gx in range(1, GRID) for gy in range(1, GRID)]
+    if reader is not None:
+        pixels = reader(world, rt)
+        if not pixels or len(pixels) < width * height:
+            raise RuntimeError("reading the render target back failed")
+        picked = [pixels[y * width + x] for x, y in points]
+    else:
+        picked = [unreal.RenderingLibrary.read_render_target_pixel(world, rt, x, y) for x, y in points]
+    return [(int(c.r), int(c.g), int(c.b)) for c in picked]
+
+
+def differing(reference, shot, tolerance=24):
+    """Share of samples that differ between a capture with the subject hidden and one with it
+    shown. Sky gradients, ground and the subject's shadow (hidden actors still cast one) are in
+    both, so only the subject itself counts: 0 means it did not render."""
+    if not reference or len(reference) != len(shot):
+        raise RuntimeError("the background-only capture has no matching samples")
+    hits = sum(1 for a, b in zip(reference, shot) if abs(a[0] - b[0]) + abs(a[1] - b[1]) + abs(a[2] - b[2]) > tolerance)
+    return round(hits / float(len(shot)), 4)
+
+
+def capture(shots, hidden, subjects):
     rt = unreal.RenderingLibrary.create_render_target2d(world, width, height, unreal.TextureRenderTargetFormat.RTF_RGBA8)
-    cam = actor_subsystem().spawn_actor_from_class(unreal.SceneCapture2D, unreal.Vector(0, 0, 0), unreal.Rotator())
+    cam = spawn_helper(unreal.SceneCapture2D, unreal.Vector(0, 0, 0), unreal.Rotator())
     files = []
     try:
         comp = cam.get_editor_property("capture_component2d")
@@ -69,12 +81,33 @@ def capture(shots, hidden):
             comp.set_editor_property("hidden_actors", hidden)
         for name, eye, rot in shots:
             cam.set_actor_location_and_rotation(unreal.Vector(*eye), rot, False, True)
+            reference, problem = None, None
+            if ARGS.get("coverage"):
+                # The same view without the subject: what the background looks like here.
+                if not subjects:
+                    problem = "coverage needs actors to compare against a capture without them"
+                else:
+                    try:
+                        comp.set_editor_property("hidden_actors", list(hidden) + list(subjects))
+                        comp.capture_scene()
+                        reference = samples(rt)
+                    except Exception as e:
+                        problem = "background capture failed: %s" % e
+                    comp.set_editor_property("hidden_actors", list(hidden))
             comp.capture_scene()
             file_name = "%s_%s.png" % (ARGS.get("prefix", "shot"), name)
             unreal.RenderingLibrary.export_render_target(world, rt, out_dir, file_name)
             entry = {"view": name, "file": os.path.join(out_dir, file_name)}
             if ARGS.get("coverage"):
-                entry["coverage"] = coverage(rt)
+                # Unknown (None, with the reason) is never reported as visible.
+                entry["coverage"] = None
+                if problem is None:
+                    try:
+                        entry["coverage"] = differing(reference, samples(rt))
+                    except Exception as e:
+                        problem = "reading the capture failed: %s" % e
+                if problem is not None:
+                    entry["coverage_error"] = problem
             files.append(entry)
     finally:
         actor_subsystem().destroy_actor(cam)
@@ -84,7 +117,7 @@ def capture(shots, hidden):
 def target_frame():
     """Centre, radius and facing of what to frame."""
     if ARGS.get("actors"):
-        actors = [find_actor(a) for a in ARGS["actors"]]
+        actors = subjects
         lo, hi = None, None
         for a in actors:
             origin, extent = a.get_actor_bounds(False)
@@ -123,6 +156,7 @@ def neighbours(targets, center, radius):
 
 shots = []
 hidden = []
+subjects = [find_actor(a) for a in ARGS.get("actors") or []]
 if ARGS.get("center") is not None:
     # Framing given by the caller (animation previews frame the posed skeleton, which actor
     # bounds do not follow).
@@ -131,8 +165,8 @@ if ARGS.get("center") is not None:
     forward = normalize(tuple(ARGS.get("forward") or (1.0, 0.0, 0.0)))
     right = normalize(cross((0.0, 0.0, 1.0), forward))
     shots = views_around(center, radius, forward, right, ARGS.get("views") or ["front", "right"])
-    if ARGS.get("isolate") and ARGS.get("actors"):
-        hidden = neighbours([find_actor(a) for a in ARGS["actors"]], center, radius)
+    if ARGS.get("isolate") and subjects:
+        hidden = neighbours(subjects, center, radius)
 elif ARGS.get("camera"):
     c = ARGS["camera"]
     r = c.get("rotation", [0, 0, 0])
@@ -148,4 +182,4 @@ else:
         if ARGS.get("isolate"):
             hidden = neighbours(actors, center, radius)
 
-emit({"files": capture(shots, hidden), "width": width, "height": height, "hidden_for_isolation": len(hidden)})
+emit({"files": capture(shots, hidden, subjects), "width": width, "height": height, "hidden_for_isolation": len(hidden)})

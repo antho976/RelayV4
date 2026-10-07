@@ -10,10 +10,12 @@ payload!(#[schemars(rename = "AuditListIn")] ListIn {
     pub since: Option<Ts>, pub until: Option<Ts>, pub limit: Option<u32>,
 });
 result!(#[schemars(rename = "AuditListOut")] ListOut { pub rows: Vec<AuditRow> });
-op!(List, "audit.list", ListIn => ListOut, OpMeta::query(Scope::Global, 1, "Audit rows, filtered; limit ≤ 1000"));
+// Both reads are the user's: stored payloads carry held actions, launch prompts and private
+// mail, which guardrail.hold.get and task.activity already keep from agents.
+op!(List, "audit.list", ListIn => ListOut, OpMeta::query(Scope::Global, 1, "Audit rows, filtered; limit ≤ 1000").actors(Actors::UserOnly));
 
 payload!(#[schemars(rename = "AuditGetIn")] GetIn { pub audit_id: Id });
-op!(Get, "audit.get", GetIn => AuditRow, OpMeta::query(Scope::Global, 1, "One audit row with its stored payload"));
+op!(Get, "audit.get", GetIn => AuditRow, OpMeta::query(Scope::Global, 1, "One audit row with its stored payload").actors(Actors::UserOnly));
 
 payload!(#[schemars(rename = "AuditUndoIn")] UndoIn { pub audit_id: Id, pub force: Option<bool> });
 result!(#[schemars(rename = "AuditUndoOut")] UndoOut { pub undone: Id, pub by: Id });

@@ -35,6 +35,28 @@ fn mono(value: &str) -> gtk::Label {
     l
 }
 
+/// The most of one agent-supplied string a card puts in a label. Nothing bounds a reason,
+/// a value or a held write's text, and a wrapping label of megabytes stalls every relayout.
+const SHOWN_CHARS: usize = 4000;
+
+/// `value` cut to [`SHOWN_CHARS`], saying how much was left out.
+fn clip(value: &str) -> String {
+    match value.char_indices().nth(SHOWN_CHARS) {
+        None => value.to_owned(),
+        Some((at, _)) => format!("{}… [{} more bytes not shown]", &value[..at], value.len() - at),
+    }
+}
+
+/// `value` with every long string clipped, for showing a frozen payload.
+fn clip_strings(value: &Value) -> Value {
+    match value {
+        Value::String(s) => Value::String(clip(s)),
+        Value::Array(items) => Value::Array(items.iter().map(clip_strings).collect()),
+        Value::Object(map) => Value::Object(map.iter().map(|(k, v)| (k.clone(), clip_strings(v))).collect()),
+        other => other.clone(),
+    }
+}
+
 /// "4 min ago" from an RFC 3339 timestamp; empty when it does not parse.
 fn ago(ts: &str) -> String {
     let (Ok(then), Ok(now)) = (glib::DateTime::from_iso8601(ts, None), glib::DateTime::now_utc()) else {
@@ -213,7 +235,7 @@ fn details_grid(details: &Value) -> Option<gtk::Expander> {
     grid.add_css_class("guardrail-details");
     for (row, (name, value)) in pairs.iter().enumerate() {
         grid.attach(&label(name, "faint"), 0, row as i32, 1, 1);
-        let value = paragraph(value, "body");
+        let value = paragraph(&clip(value), "body");
         value.set_hexpand(true);
         grid.attach(&value, 1, row as i32, 1, 1);
     }
@@ -257,11 +279,11 @@ pub fn hold_row(ui: &Rc<Ui>, hold: Value) -> gtk::Box {
     );
     card.append(&heading);
     if !what.is_empty() {
-        card.append(&mono(&what));
+        card.append(&mono(&clip(&what)));
     }
     let why = explain(&policy, &details);
     if !why.is_empty() {
-        card.append(&paragraph(&why, "body"));
+        card.append(&paragraph(&clip(&why), "body"));
     }
     if let Some(grid) = details_grid(&details) {
         card.append(&grid);
@@ -330,7 +352,7 @@ pub fn hold_row(ui: &Rc<Ui>, hold: Value) -> gtk::Box {
                 Ok(v) => {
                     let request = &v["request"];
                     let mut shown = format!("{}\n", text(request, "op"));
-                    shown.push_str(&serde_json::to_string_pretty(&request["payload"]).unwrap_or_default());
+                    shown.push_str(&serde_json::to_string_pretty(&clip_strings(&request["payload"])).unwrap_or_default());
                     exact.set_text(&shown);
                     exact.set_visible(true);
                     key.set_label("Hide exact action");
@@ -415,7 +437,15 @@ pub fn exception_card(ui: &Rc<Ui>, request: &Value, compact: bool) -> gtk::Box {
         card.add_css_class("record");
     }
     card.set_widget_name(&format!("guardrail-request-{id}"));
-    card.append(&head("Exception request", &ago(text(&request, "created_at"))));
+    // A prompt pops up over any project; say which one it is from when it is not this one.
+    let from = request["project_id"].as_i64().filter(|p| compact && *p != ui.project.get()).and_then(|p| {
+        ui.projects.borrow().iter().find(|row| row["id"].as_i64() == Some(p)).map(|row| text(row, "name").to_owned())
+    });
+    let eyebrow = match from {
+        Some(name) if !name.is_empty() => format!("Exception request · {name}"),
+        _ => "Exception request".to_owned(),
+    };
+    card.append(&head(&eyebrow, &ago(text(&request, "created_at"))));
     let session = text(&request, "session");
     let kind = text(&request, "kind");
     let value = text(&request, "value");
@@ -424,11 +454,11 @@ pub fn exception_card(ui: &Rc<Ui>, request: &Value, compact: bool) -> gtk::Box {
     heading.set_xalign(0.0);
     card.append(&heading);
     if !value.is_empty() {
-        card.append(&mono(value));
+        card.append(&mono(&clip(value)));
     }
     let reason = text(&request, "reason");
     if !reason.is_empty() {
-        let why = paragraph(&format!("“{reason}”"), "body");
+        let why = paragraph(&format!("“{}”", clip(reason)), "body");
         why.add_css_class("guardrail-reason");
         card.append(&why);
     }
@@ -548,7 +578,13 @@ fn update_overflow(ui: &Rc<Ui>, tray: &gtk::Box, hidden: usize) {
     let weak = Rc::downgrade(ui);
     more.connect_clicked(move |_| {
         if let Some(ui) = weak.upgrade() {
-            ui.navigate("guardrails");
+            // Prompts come from every project, but the Guardrails page lists one: open the
+            // project whose request has waited longest.
+            let oldest = WAITING.with(|w| w.borrow().first().and_then(|r| r["project_id"].as_i64()));
+            match oldest {
+                Some(project) if project != ui.project.get() => ui.open_project(project, "guardrails"),
+                _ => ui.navigate("guardrails"),
+            }
         }
     });
     tray.append(&more);
@@ -894,7 +930,7 @@ fn grant_row(ui: &Rc<Ui>, grant: &Value) -> gtk::Box {
         "body",
     ));
     if !text(grant, "value").is_empty() {
-        copy.append(&mono(text(grant, "value")));
+        copy.append(&mono(&clip(text(grant, "value"))));
     }
     let uses = grant["uses"].as_u64().unwrap_or(0);
     let lasting = if scope == "session" {

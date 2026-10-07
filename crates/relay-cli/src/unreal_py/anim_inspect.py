@@ -1,26 +1,14 @@
 # ue_anim_inspect: numbers, not impressions. Poses a skeleton at sample times straight from the
 # animation data (no level, no ticking), carries attached items and an optional partner along,
-# and reports sides, contacts, clearances and ground contact in the character's own frame.
+# and reports sides, contacts, clearances and ground contact in the character's own frame. The
+# checks are anim_rules.py's, shared with blender_anim_inspect; this script only poses.
 
 mesh = load(ARGS["mesh"], "skeletal mesh")
 anim = load(ARGS["animation"], "animation") if ARGS.get("animation") else None
 skel = Skeleton(mesh)
 frame = body_frame(skel)
 times = sample_times(anim)
-radius = float(ARGS.get("body_radius", 8.0))
-touch = float(ARGS.get("touch_distance", 5.0))
-problems = []
-minimum = {}
-
-
-def keep_min(key, clearance, near, t):
-    if key not in minimum or clearance < minimum[key][0]:
-        minimum[key] = (clearance, near, t)
-
-
-def problem(t, kind, text):
-    if len(problems) < 80:
-        problems.append({"time": t, "kind": kind, "detail": text})
+ref_pose = skel.component_pose(skel.ref_local)
 
 
 # ---- attached items: a transform chain from a character bone or socket
@@ -69,7 +57,6 @@ if ARGS.get("partner"):
         "place": (tuple(float(c) for c in spec.get("location", [0, 150, 0])), yaw_quat(float(spec.get("yaw", 180))), (1.0, 1.0, 1.0)),
         "time_offset": float(spec.get("time_offset", 0.0)),
     }
-    partner["segments"] = body_segments(partner["skel"])
 
 
 def resolve(ref, pose, p_pose):
@@ -86,108 +73,80 @@ def resolve(ref, pose, p_pose):
     return skel.point(pose, ref)[0]
 
 
-segments = body_segments(skel)
-feet = [n for n in skel.names if "foot" in n.lower() and skel.parent.get(n)]
-ref_pose = skel.component_pose(skel.ref_local)
-ground = frame["center"][2]
-
-# Which character bones an item may legitimately touch: the chain it hangs from and the hands
-# that grip it.
-def allowed_near(item):
-    allowed = set()
-    bone = skel.socket(item.attach)[0] if item.attach not in skel.index and skel.socket(item.attach) else item.attach
-    for _ in range(3):
-        if bone is None:
-            break
-        allowed.add(bone)
-        bone = skel.parent.get(bone)
-    for grip in item.grips:
-        b = grip.get("bone")
-        for _ in range(3):
-            if b is None:
-                break
-            allowed.add(b)
-            b = skel.parent.get(b)
-    return allowed
+def body_segments(skel):
+    """(parent, child) joint pairs that carry body volume; a bone hanging from the root is not."""
+    return [(n, (skel.parent[n], n)) for n in skel.names
+            if skel.parent[n] is not None and skel.parent.get(skel.parent[n]) is not None and body_bone(n)]
 
 
-rows = []
-track = ARGS.get("track") or []
-for t in times:
-    local = skel.local_pose(anim, t)
-    pose = skel.component_pose(local)
-    p_pose = None
-    if partner:
-        pt = t + partner["time_offset"]
-        p_pose = partner["skel"].component_pose(partner["skel"].local_pose(partner["anim"], pt))
-    row = {"t": t, "points": {}, "checks": []}
+def owner(sk, ref):
+    """The bone a bone or socket name sits on, or None."""
+    if ref in sk.index:
+        return ref
+    s = sk.socket(ref)
+    return s[0] if s and s[0] in sk.index else None
 
-    for ref in track:
-        p = resolve(ref, pose, p_pose)
-        b = to_body(frame, p)
-        row["points"][ref] = {"fwd_right_up": rnd(b), "side": side(frame, p)}
 
-    for item in items.values():
-        near = allowed_near(item)
-        for end in ("end_a", "end_b", "center"):
-            p = item.point(pose, end)
-            best = (1e9, None)
-            for a, b in segments:
-                if a in near or b in near:
-                    continue
-                d = segment_distance(p, pose[a][0], pose[b][0])
-                if d < best[0]:
-                    best = (d, b)
-            key = "item:%s:%s clearance to own body" % (item.name, end)
-            keep_min(key, round(best[0] - radius, 1), best[1], t)
-            if best[0] < radius:
-                problem(t, "clipping", "%s of %r is %.1f cm inside the body near %s" % (end, item.name, radius - best[0], best[1]))
-        for grip in item.grips:
-            g = item.point(pose, grip["socket"])
-            h = skel.point(pose, grip["bone"])[0]
-            d = length(sub(g, h))
-            row["checks"].append({"grip": "%s.%s -> %s" % (item.name, grip["socket"], grip["bone"]), "distance": round(d, 1)})
-            if d > float(grip.get("tolerance", touch)):
-                problem(t, "grip", "%s is %.1f cm from %s's grip %r (tolerance %.1f)" % (grip["bone"], d, item.name, grip["socket"], float(grip.get("tolerance", touch))))
+def below(sk, bone):
+    """A bone and every bone under it."""
+    out, todo = [], [bone]
+    while todo:
+        b = todo.pop()
+        out.append(b)
+        todo.extend(n for n in sk.names if sk.parent[n] == b)
+    return out
 
-    for c in ARGS.get("contacts", []):
-        d = length(sub(resolve(c["a"], pose, p_pose), resolve(c["b"], pose, p_pose)))
-        expect = c.get("expect", "touch")
-        limit = float(c.get("distance", touch if expect == "touch" else 10.0))
-        row["checks"].append({"contact": "%s ~ %s" % (c["a"], c["b"]), "distance": round(d, 1), "expect": expect})
-        in_window = not c.get("window") or (c["window"][0] <= t <= c["window"][1])
-        if in_window and expect == "touch" and d > limit:
-            problem(t, "contact", "%s and %s should touch but are %.1f cm apart" % (c["a"], c["b"], d))
-        if in_window and expect == "apart" and d < limit:
-            problem(t, "contact", "%s and %s should stay %.0f cm apart but are %.1f cm" % (c["a"], c["b"], limit, d))
 
-    if partner:
-        probes = [n for n in skel.names if any(k in n.lower() for k in ("hand", "foot", "head", "lowerarm", "calf"))
-                  and not any(k in n.lower() for k in ("twist", "ik_", "finger"))]
-        probe_points = [(n, pose[n][0]) for n in probes]
-        for item in items.values():
-            probe_points += [("item:%s:%s" % (item.name, e), item.point(pose, e)) for e in ("end_a", "end_b", "center")]
-        for name, p in probe_points:
-            best = (1e9, None)
-            for a, b in partner["segments"]:
-                pa = compose(partner["place"], p_pose[a])[0]
-                pb = compose(partner["place"], p_pose[b])[0]
-                d = segment_distance(p, pa, pb)
-                if d < best[0]:
-                    best = (d, b)
-            key = "%s clearance to partner" % name
-            keep_min(key, round(best[0] - radius, 1), best[1], t)
-            allowed = any(c.get("expect", "touch") == "touch" and name in (c["a"], c["b"]) for c in ARGS.get("contacts", []))
-            if best[0] < radius and not allowed:
-                problem(t, "partner_clipping", "%s is %.1f cm inside the partner near %s" % (name, radius - best[0], best[1]))
+if partner:
+    partner["segments"] = body_segments(partner["skel"])
 
-    if feet:
-        heights = dict((f, round(pose[f][0][2] - ground, 1)) for f in feet)
-        row["feet_height"] = heights
-        low = min(heights.values())
-        if low < -2.0:
-            problem(t, "ground", "a foot is %.1f cm below the reference ground" % -low)
-    rows.append(row)
+
+class Rig(object):
+    """What anim_rules needs, in mesh space: a segment is a (parent, child) joint pair and exempts
+    by either joint; partner points are carried into this character's space by its placement."""
+
+    def __init__(self):
+        self.frame = frame
+        self.body = body_segments(skel)
+        self.probes = [n for n in skel.names if probe_bone(n)]
+        self.items = [{"name": it.name, "holder": owner(skel, it.attach),
+                       "grips": [dict(g, label="%s.%s" % (it.name, g["socket"]), point="item:%s:%s" % (it.name, g["socket"])) for g in it.grips]}
+                      for it in items.values()]
+        feet = [n for n in skel.names if foot_bone(n) and skel.parent.get(n)]
+        self.feet = dict((f, below(skel, f)) for f in feet)
+        self.rest_feet = dict((f, [ref_pose[n][0] for n in chain]) for f, chain in self.feet.items())
+        self.pose_at, self.p_pose = None, None
+
+    def pose(self, t):
+        self.pose_at = skel.component_pose(skel.local_pose(anim, t))
+        if partner:
+            p = partner["skel"]
+            self.p_pose = p.component_pose(p.local_pose(partner["anim"], t + partner["time_offset"]))
+
+    def point(self, ref):
+        return resolve(ref, self.pose_at, self.p_pose)
+
+    def owner(self, ref):
+        return None if ref.startswith(("item:", "partner:")) else owner(skel, ref)
+
+    def parent(self, bone):
+        return skel.parent.get(bone)
+
+    def segments(self):
+        return [(n, ab, self.pose_at[ab[0]][0], self.pose_at[ab[1]][0]) for n, ab in self.body]
+
+    def partner_segments(self):
+        if not partner:
+            return []
+        place = partner["place"]
+        return [(n, ab, compose(place, self.p_pose[ab[0]])[0], compose(place, self.p_pose[ab[1]])[0]) for n, ab in partner["segments"]]
+
+    def partner_bones(self, ref):
+        bone = owner(partner["skel"], ref.split(":", 1)[1]) if partner else None
+        return [bone] if bone else None
+
+
+result = inspect_animation(Rig(), times, ARGS, key="time", row_key="t")
 
 # Sides at the reference pose: the quickest way to catch an item on the wrong hand.
 attach_sides = {}
@@ -207,11 +166,11 @@ emit({
     "frame": {
         "note": "Positions are [forward, right, up] in cm from the character's centre at ground level, derived from the skeleton's left/right bone pairs. right > 0 is the character's right hand side.",
         "right_axis_in_mesh_space": rnd(frame["right"], 3), "forward_axis_in_mesh_space": rnd(frame["forward"], 3),
-        "left_right_pairs_found": frame["found_pairs"], "sample_pairs": frame["pairs"],
+        "left_right_pairs_found": frame["found_pairs"], "sample_pairs": frame["pairs"][:6],
     },
     "attachments": attach_sides,
-    "problems": problems,
-    "passed": not problems,
-    "closest_approach": dict((k, {"clearance_cm": v[0], "near": v[1], "time": v[2]}) for k, v in sorted(minimum.items())),
-    "samples": rows,
+    "problems": result["problems"],
+    "passed": not result["problems"],
+    "closest_approach": result["closest_approach"],
+    "samples": result["samples"],
 })

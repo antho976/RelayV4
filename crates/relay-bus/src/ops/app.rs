@@ -11,9 +11,9 @@ op!(Version, "app.version", Empty => VersionOut, OpMeta::query(Scope::Global, 1,
 
 result!(#[schemars(rename = "AppStatusOut")] StatusOut {
     pub pid: u32, pub uptime_s: u64, pub store_path: String, pub socket_path: String,
-    pub ui_connected: bool, pub sessions_live: i64, pub providers: Vec<ProviderInfo>,
+    pub sessions_live: i64, pub providers: Vec<ProviderInfo>,
 });
-op!(Status, "app.status", Empty => StatusOut, OpMeta::query(Scope::Global, 1, "Engine status: paths, UI connected, live sessions, providers"));
+op!(Status, "app.status", Empty => StatusOut, OpMeta::query(Scope::Global, 1, "Engine status: paths, live sessions, providers"));
 
 payload!(#[schemars(rename = "AppQuitIn")] QuitIn { pub force: Option<bool> });
 op!(Quit, "app.quit", QuitIn => Empty,
@@ -36,7 +36,7 @@ result!(#[schemars(rename = "RecoveryReport")] RecoveryReport {
 op!(RecoveryLast, "app.recovery.last", Empty => Option<RecoveryReport>, OpMeta::query(Scope::Global, 3, "What crash recovery did at the last launch"));
 
 payload!(#[schemars(rename = "AppLogTailIn")] LogTailIn { pub level: Option<String>, pub filter: Option<String> });
-op!(LogTail, "app.log.tail", LogTailIn => Empty, OpMeta::query(Scope::Global, 9, "Attach the log stream (Relay's own structured log)").stream("log"));
+op!(LogTail, "app.log.tail", LogTailIn => Empty, OpMeta::query(Scope::Global, 9, "Reserved: answers bus.not_implemented, no log stream exists yet; the engine logs to relay serve's output (RELAY_LOG filters it)").stream("log"));
 
 result!(#[schemars(rename = "BackupOut")] BackupOut { pub path: String, pub bytes: u64 });
 op!(BackupNow, "app.backup.now", Empty => BackupOut, OpMeta::mutation(Scope::Global, 2, "Copy store.db to the backup dir now; keep last 5").actors(Actors::UserOnly));

@@ -4,7 +4,7 @@
 
 use crate::bridge::{self, AbortOnDrop, Ctx};
 use crate::registry::Rendezvous;
-use crate::rendezvous::Lane;
+use crate::rendezvous::{Lane, MAX_LANE_LINE};
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
@@ -149,6 +149,13 @@ pub async fn connect_once(ctx: Arc<Ctx>, rendezvous: &Rendezvous) -> Result<()> 
                         tokio::spawn(async move {
                             while let Some(l) = out_rx.recv().await {
                                 let line = Lane::Data { c: id.clone(), l }.to_line();
+                                if line.len() > MAX_LANE_LINE {
+                                    // Sent, it would break the socket every lane shares; closing
+                                    // this lane costs one phone a reconnect instead.
+                                    tracing::warn!(lane = %id, bytes = line.len(), "engine line too large for the rendezvous; closing the lane");
+                                    let _ = to_server.send(Message::text(Lane::Close { c: id.clone() }.to_line())).await;
+                                    break;
+                                }
                                 if to_server.send(Message::text(line)).await.is_err() {
                                     break;
                                 }
@@ -157,7 +164,7 @@ pub async fn connect_once(ctx: Arc<Ctx>, rendezvous: &Rendezvous) -> Result<()> 
                     };
                     // Aborting this lane must not leave the forwarder behind.
                     let _forward_guard = AbortOnDrop(forward.abort_handle());
-                    if let Err(e) = bridge::run(ctx, in_rx, out_tx, ()).await {
+                    if let Err(e) = bridge::run(ctx, in_rx, out_tx, (), "rendezvous".to_string()).await {
                         tracing::debug!(lane = %id, error = %e, "lane ended");
                     }
                     let _ = forward.await;

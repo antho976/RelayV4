@@ -43,9 +43,13 @@ const MAX_UNPROVEN_PER_PEER: usize = 4;
 /// The largest message a phone may send. Bus requests are small; a file write is the biggest.
 const MAX_MESSAGE: usize = 8 << 20;
 
-/// A live phone sends `bus.ping` every 25 s. A connection silent for this long is a phone that
-/// dropped off without a FIN; closing it frees its slot instead of waiting out TCP retries.
+/// A live phone sends `bus.ping` every 25 s, and answers the door's own pings even when its
+/// app is asleep. A connection silent for this long is a phone that dropped off without a FIN;
+/// closing it frees its slot and its engine connection instead of waiting out TCP retries.
 const PHONE_SILENCE: Duration = Duration::from_secs(90);
+
+/// How often the door pings the phone, so a dead link is noticed from this side too.
+pub(crate) const PING_EVERY: Duration = Duration::from_secs(30);
 
 pub struct DirectServer {
     pub local_addr: SocketAddr,
@@ -81,7 +85,7 @@ impl DirectServer {
                         };
                         let ctx = ctx.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle(ctx, stream, unproven).await {
+                            if let Err(e) = handle(ctx, stream, unproven, peer).await {
                                 tracing::debug!(peer = %peer, error = %e, "direct connection ended");
                             }
                             drop(slot);
@@ -192,7 +196,7 @@ fn check_origin(req: &Request, resp: Response) -> std::result::Result<Response, 
     Err(refusal)
 }
 
-async fn handle(ctx: Arc<Ctx>, stream: TcpStream, unproven: UnprovenSlot) -> Result<()> {
+async fn handle(ctx: Arc<Ctx>, stream: TcpStream, unproven: UnprovenSlot, peer: SocketAddr) -> Result<()> {
     if !door_in_use(&ctx) {
         return Ok(());
     }
@@ -207,8 +211,16 @@ async fn handle(ctx: Arc<Ctx>, stream: TcpStream, unproven: UnprovenSlot) -> Res
     let (out_tx, mut out_rx) = mpsc::channel::<String>(OUTBOUND_QUEUE);
 
     let writer = tokio::spawn(async move {
-        while let Some(line) = out_rx.recv().await {
-            if sink.send(Message::text(line)).await.is_err() {
+        let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + PING_EVERY, PING_EVERY);
+        loop {
+            let msg = tokio::select! {
+                line = out_rx.recv() => match line {
+                    Some(line) => Message::text(line),
+                    None => break,
+                },
+                _ = ping.tick() => Message::Ping(Vec::new().into()),
+            };
+            if sink.send(msg).await.is_err() {
                 break;
             }
         }
@@ -233,7 +245,7 @@ async fn handle(ctx: Arc<Ctx>, stream: TcpStream, unproven: UnprovenSlot) -> Res
         }
     });
 
-    let result = bridge::run(ctx, in_rx, out_tx, unproven).await;
+    let result = bridge::run(ctx, in_rx, out_tx, unproven, format!("direct {}", peer.ip())).await;
     reader.abort();
     // Let queued lines drain, then the writer closes the socket.
     let _ = writer.await;

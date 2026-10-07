@@ -102,9 +102,17 @@ impl Ui {
         }
         let name = text(payload, "name").to_string();
         let closed = text(payload, "state") == "closed";
+        if closed {
+            // Settles a close whose answer timed out while the engine was still removing its worktree.
+            with(|a| a.closing.remove(&name));
+        }
+        // The board shows a session only as a name on its task, so only a new task link changes it.
+        let mut relinked = !closed && payload["task_id"].is_i64();
         {
             let mut all = self.sidebar_sessions.borrow_mut();
-            match all.iter().position(|s| text(s, "name") == name) {
+            let at = all.iter().position(|s| text(s, "name") == name);
+            relinked &= at.is_none_or(|i| all[i]["task_id"] != payload["task_id"]);
+            match at {
                 Some(i) if closed => {
                     all.remove(i);
                 }
@@ -130,12 +138,13 @@ impl Ui {
         }
         self.render_projects();
         self.reconcile();
-        // The board shows this project's sessions only; the dashboard shows every project.
+        // The board shows this project's tasks only; the dashboard shows every project. A state
+        // change a card shows (blocked, done) arrives as its own task.changed.
         let here = payload["project_id"].as_i64() == Some(self.project.get());
         let page = self.page.borrow().clone();
         match page.as_str() {
             "dashboard" => self.refresh_page(),
-            "board" if here => self.refresh_page(),
+            "board" if here && relinked => self.refresh_page(),
             _ => {}
         }
         true
@@ -160,8 +169,24 @@ impl Ui {
         let ui = self.clone();
         glib::spawn_future_local(async move {
             let result = ui.call("session.close", payload).await;
-            with(|a| a.closing.remove(&name));
             tracing::debug!(session = %name, elapsed_ms = clicked.elapsed().as_millis() as u64, ok = result.is_ok(), "close: engine answered");
+            if matches!(result, Err(crate::client::Error::Timeout)) {
+                // Removing a large worktree can outlast the request: the close is still running,
+                // and its session.changed(closed) settles it. The pane comes back only if that
+                // never arrives.
+                ui.show_error(&format!("Still closing {name}: removing its worktree takes a while."));
+                for _ in 0..120 {
+                    glib::timeout_future_seconds(5).await;
+                    if !is_closing(&name) {
+                        return;
+                    }
+                }
+                with(|a| a.closing.remove(&name));
+                ui.show_error(&format!("{name} has not finished closing; check its worktree before closing it again."));
+                ui.refresh();
+                return;
+            }
+            with(|a| a.closing.remove(&name));
             match result {
                 Ok(_) => {
                     ui.sidebar_sessions.borrow_mut().retain(|s| text(s, "name") != name);
@@ -527,6 +552,7 @@ impl Ui {
         save.add_css_class("agent-menu-save");
         save.set_sensitive(false);
         let original = (text(session, "model").to_string(), text(session, "effort").to_string(), session["bus_writes"] == true, session["allow_ui"] == true);
+        let saved = original.clone();
         let dirty: Rc<dyn Fn()> = Rc::new({
             let (model, effort, writes, control, save) = (model.downgrade(), effort.downgrade(), switches[0].downgrade(), switches[1].downgrade(), save.downgrade());
             move || {
@@ -548,10 +574,27 @@ impl Ui {
         let p = popover.downgrade();
         save.connect_clicked(move |key| {
             let Some(ui) = weak.upgrade() else { return };
-            let mut payload = json!({"session": n, "bus_writes": writes.is_active(), "allow_ui": control.is_active()});
+            // Only what changed: the engine refuses an empty model or effort, and any model or
+            // effort at all once the agent has started.
+            let (old_model, old_effort, old_writes, old_control) = &saved;
+            let mut payload = json!({"session": n});
+            if writes.is_active() != *old_writes {
+                payload["bus_writes"] = writes.is_active().into();
+            }
+            if control.is_active() != *old_control {
+                payload["allow_ui"] = control.is_active().into();
+            }
             if !spawned {
-                payload["model"] = model.text().as_str().into();
-                payload["effort"] = effort.text().as_str().into();
+                for (key, entry, old) in [("model", &model, old_model), ("effort", &effort, old_effort)] {
+                    let value = entry.text().trim().to_string();
+                    if !value.is_empty() && value != *old {
+                        payload[key] = value.into();
+                    }
+                }
+            }
+            if payload.as_object().is_some_and(|fields| fields.len() == 1) {
+                ui.show_error("Nothing to save: a model or effort cannot be cleared back to the provider default.");
+                return;
             }
             key.set_sensitive(false);
             let key = key.clone();

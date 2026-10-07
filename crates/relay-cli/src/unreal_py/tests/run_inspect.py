@@ -5,12 +5,17 @@ import io, json, os, sys, contextlib
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 SRC = os.path.dirname(HERE)
+import unreal
 
 
 def inspect(args):
-    code = "ARGS_JSON = %s\n%s\n%s" % (json.dumps(json.dumps(args)),
-                                       open(os.path.join(SRC, "common.py")).read(),
-                                       open(os.path.join(SRC, "anim_inspect.py")).read())
+    # The bundle unreal.rs sends: arguments, common.py with the shared rig_frame.py, the shared
+    # anim_rules.py, the script.
+    shared = lambda name: open(os.path.join(os.path.dirname(SRC), name)).read()
+    code = "ARGS_JSON = %s\n%s\n%s\n%s\n%s" % (json.dumps(json.dumps(args)),
+                                               open(os.path.join(SRC, "common.py")).read(), shared("rig_frame.py"),
+                                               shared("anim_rules.py"),
+                                           open(os.path.join(SRC, "anim_inspect.py")).read())
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
         exec(compile(code, "anim_inspect.py", "exec"), {})
@@ -62,8 +67,60 @@ check(sides[0] == "right" and sides[-1] == "left", "the swing crosses the body: 
 partner = inspect({"mesh": "/Game/Manny", "animation": "/Game/Swing", "samples": 5,
                    "partner": {"mesh": "/Game/Manny", "location": [45, 0, 0], "yaw": 0}})
 check(any(p["kind"] == "partner_clipping" for p in partner["problems"]), "hand inside the partner is reported")
+
+# An off-hand grip names a socket (a palm socket on hand_l): the hand it sits on, and its arm,
+# are exempt from the item's clearance like the holding hand's chain.
+real_socket = unreal.SkeletalMesh.find_socket
+unreal.SkeletalMesh.find_socket = lambda s, n: unreal._Sock("hand_l", (0, 0, 0)) if n == "palm_l" else real_socket(s, n)
+pole = dict(sword, location=[130, 0, 0], grips=[{"socket": "Grip", "bone": "palm_l", "tolerance": 20}])
+held = inspect({"mesh": "/Game/Manny", "attachments": [pole]})
+check(not any(p["kind"] in ("clipping", "grip") for p in held["problems"]), "the off-hand's grip exempts its arm: %s" % held["problems"])
+loose = inspect({"mesh": "/Game/Manny", "attachments": [dict(pole, grips=[])]})
+check(any(p["kind"] == "clipping" and ("lowerarm_l" in p["detail"] or "hand_l" in p["detail"]) for p in loose["problems"]), "without the grip it clips the left arm: %s" % loose["problems"])
+unreal.SkeletalMesh.find_socket = real_socket
+
+# A touch with the partner excuses clipping only inside its window and only against the bone it
+# names. The partner faces the character 55 cm ahead; at t=0.5 the right hand, swung forward,
+# is 5 cm from the partner's upperarm_l joint.
+facing = {"mesh": "/Game/Manny", "location": [0, 55, 0], "yaw": 180}
+def touching(window, bone="upperarm_l", distance=10):
+    return inspect({"mesh": "/Game/Manny", "animation": "/Game/Swing", "times": [0, 0.5, 1], "partner": facing,
+                    "contacts": [{"a": "hand_r", "b": "partner:" + bone, "expect": "touch", "distance": distance, "window": window}]})
+def clipped(result):
+    return [(p["time"], p["detail"]) for p in result["problems"] if p["kind"] == "partner_clipping"]
+inside = touching([0.4, 0.6])
+check(inside["passed"], "a touch inside its window passes: %s" % inside["problems"])
+outside = touching([0.9, 1.0])
+check([t for t, _ in clipped(outside)] == [0.5], "clipping outside the window is reported: %s" % clipped(outside))
+elsewhere = touching([0.4, 0.6], bone="head", distance=100)
+check([t for t, _ in clipped(elsewhere)] == [0.5] and "upperarm_l" in clipped(elsewhere)[0][1],
+      "a touch on the head does not excuse the arm: %s" % clipped(elsewhere))
+
+# Ground: each foot is measured by its lowest point (here a ball joint 5 cm under the ankle),
+# against the lowest rest point of the feet - not the ankle against the floor.
+unreal.BONES.extend([("ball_r", "foot_r", (0, 10, -5)), ("ball_l", "foot_l", (0, 10, -5))])
+real_pose = unreal.AnimationLibrary.get_bone_pose_for_time
+def sinking(anim, bone, t, rm):
+    if bone == "pelvis":
+        return unreal.Transform((0, 0, 95 - 5 * t))
+    return real_pose(anim, bone, t, rm)
+unreal.AnimationLibrary.get_bone_pose_for_time = staticmethod(sinking)
+sunk = inspect({"mesh": "/Game/Manny", "animation": "/Game/Swing", "times": [0, 0.2, 1]})
+unreal.AnimationLibrary.get_bone_pose_for_time = staticmethod(real_pose)
+del unreal.BONES[-2:]
+grounds = [p["time"] for p in sunk["problems"] if p["kind"] == "ground"]
+check(grounds == [1.0], "a foot 5 cm into the floor is reported, 1 cm is not: %s" % sunk["problems"])
+check(sunk["samples"][0]["feet_height"] == {"foot_l": 0.0, "foot_r": 0.0}, "planted feet read 0: %s" % sunk["samples"][0])
+
+# The left/right naming is Blender's too: a rig named hand-L/hand-R gets its pairs and facing.
+dashed = [(n.replace("_l", "-L").replace("_r", "-R"), p and p.replace("_l", "-L").replace("_r", "-R"), loc) for n, p, loc in unreal.BONES]
+real_bones = unreal.BONES[:]
+unreal.BONES[:] = dashed
+named = inspect({"mesh": "/Game/Manny"})
+unreal.BONES[:] = real_bones
+check(named["frame"]["left_right_pairs_found"] == 6 and named["frame"]["right_axis_in_mesh_space"] == [-1.0, 0.0, 0.0], "-L/-R pairs: %s" % named["frame"])
+
 # A socket from a Blender empty: its 100x scale is divided back once, and only once.
-import unreal
 helpers = {"ARGS_JSON": "{}"}
 exec(compile(open(os.path.join(SRC, "common.py")).read(), "common.py", "exec"), helpers)
 

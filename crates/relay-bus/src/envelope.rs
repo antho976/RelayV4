@@ -258,20 +258,22 @@ impl Event {
 #[serde(deny_unknown_fields)]
 pub struct Frame {
     pub v: u32,
-    /// `pty` | `logcat` | `log` (mirror is Tauri-channel only).
+    /// `pty` | `logcat` | `mirror`, all on the socket door (BUS.md §7). `app.log.tail` declares
+    /// a `log` stream but sends no frames yet.
     pub stream: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<Id>,
-    /// Tauri-only mirror stream handle.
+    /// `mirror` only: which `device.mirror.start` this frame belongs to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mirror_id: Option<Id>,
     /// `pty` only: increments on every spawn/wake; `seq` restarts at 0 within it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epoch: Option<u64>,
     pub seq: u64,
-    /// base64 for `pty`; a line for `logcat`; a JSON record for `log`.
+    /// base64 for `pty`; a line for `logcat`; for `mirror`, a base64 video packet or a status
+    /// object (state, picture size, device, and the typed reason on the last one).
     pub data: Value,
 }
 

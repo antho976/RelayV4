@@ -1,6 +1,7 @@
 # blender_anim_inspect: the same measurements as Unreal's ue_anim_inspect, on a Blender action,
 # before anything is exported. Items are objects already attached in the scene (bone parent or
-# Child Of constraint); sockets are empties.
+# Child Of constraint); sockets are empties. The checks are anim_rules.py's; this script only
+# poses the rigs and hands over points in centimetres.
 
 arm = obj(ARGS["armature"], "ARMATURE") if ARGS.get("armature") else first("ARMATURE")
 if arm is None:
@@ -8,9 +9,6 @@ if arm is None:
 frame = body_frame(arm)  # rest pose, before any action is applied
 set_action(arm, ARGS.get("action"))
 frames = sample_frames(arm)
-radius = float(ARGS.get("body_radius", 8.0)) / TO_CM
-touch = float(ARGS.get("touch_distance", 5.0))
-problems, minimum, rows = [], {}, []
 
 partner = None
 if ARGS.get("partner"):
@@ -18,12 +16,9 @@ if ARGS.get("partner"):
     partner = obj(p["armature"], "ARMATURE")
     set_action(partner, p.get("action"))
 
-SKIP = ("finger", "thumb", "index", "middle", "ring", "pinky", "metacarpal", "twist", "ik", "weapon", "prop", "root",
-        "eye", "jaw", "tongue", "pole", "ctrl", "mch", "org")
-
 
 def segments(a):
-    return [b.name for b in a.data.bones if b.use_deform and b.parent is not None and not any(k in b.name.lower() for k in SKIP)]
+    return [b.name for b in a.data.bones if b.use_deform and b.parent is not None and body_bone(b.name)]
 
 
 arm_segments = segments(arm)
@@ -60,6 +55,14 @@ for spec in ARGS.get("attachments", []):
     items[spec.get("name", o.name)] = {"object": o, "points": item_points(o), "holder": holder, "grips": spec.get("grips", [])}
 
 
+def bone_ref(a, ref):
+    """`bone` is the bone's head, `bone:tail` its tail."""
+    name = ref[:-5] if ref.endswith(":tail") else ref
+    if name not in a.pose.bones:
+        raise RuntimeError("no bone %r in %s" % (name, a.name))
+    return tail(a, name) if ref.endswith(":tail") else head(a, name)
+
+
 def resolve(ref):
     if ref.startswith("item:"):
         _, name, which = ref.split(":", 2)
@@ -70,95 +73,69 @@ def resolve(ref):
     if ref.startswith("obj:"):
         return obj(ref[4:]).matrix_world.translation.copy()
     if ref.startswith("partner:"):
-        return head(partner, ref.split(":", 1)[1])
-    if ref.endswith(":tail"):
-        return tail(arm, ref[:-5])
-    if ref not in arm.pose.bones:
-        raise RuntimeError("no bone %r in %s" % (ref, arm.name))
-    return head(arm, ref)
+        if partner is None:
+            raise RuntimeError("%r needs a partner" % ref)
+        return bone_ref(partner, ref.split(":", 1)[1])
+    return bone_ref(arm, ref)
 
 
-def near_chain(bone):
-    out, b = set(), arm.data.bones.get(bone) if bone else None
-    for _ in range(3):
-        if b is None:
-            break
-        out.add(b.name)
-        b = b.parent
+def cm3(v):
+    return (v.x * TO_CM, v.y * TO_CM, v.z * TO_CM)
+
+
+def foot_chain(f):
+    """A foot and the deform bones below it (toes)."""
+    out, todo = [], [arm.data.bones[f]]
+    while todo:
+        b = todo.pop()
+        out.append(b)
+        todo.extend(c for c in b.children if c.use_deform)
     return out
 
 
-def keep_min(key, value, near, f):
-    if key not in minimum or value < minimum[key][0]:
-        minimum[key] = (value, near, f)
+class Rig(object):
+    def __init__(self):
+        self.frame = {"center": cm3(frame["center"]), "forward": tuple(frame["forward"]), "right": tuple(frame["right"]), "up": tuple(frame["up"])}
+        self.probes = [b.name for b in arm.data.bones if b.use_deform and probe_bone(b.name)]
+        self.items = [{"name": n, "holder": it["holder"], "grips": [dict(g, label=g["point"]) for g in it["grips"]]} for n, it in items.items()]
+        feet = [b.name for b in arm.data.bones if b.use_deform and foot_bone(b.name)]
+        self.feet = dict((f, [r for c in foot_chain(f) for r in (c.name, c.name + ":tail")]) for f in feet)
+        self.rest_feet = dict((f, [cm3(arm.matrix_world @ p) for c in foot_chain(f) for p in (c.head_local, c.tail_local)]) for f in feet)
+
+    def pose(self, f):
+        scene.frame_set(f)
+
+    def point(self, ref):
+        return cm3(resolve(ref))
+
+    def owner(self, ref):
+        if ref.startswith(("item:", "obj:", "partner:")):
+            return None
+        name = ref[:-5] if ref.endswith(":tail") else ref
+        return name if name in arm.data.bones else None
+
+    def parent(self, bone):
+        b = arm.data.bones.get(bone)
+        return b.parent.name if b is not None and b.parent is not None else None
+
+    def segments(self):
+        return [(s, (s,), cm3(head(arm, s)), cm3(tail(arm, s))) for s in arm_segments]
+
+    def partner_segments(self):
+        return [(s, (s,), cm3(head(partner, s)), cm3(tail(partner, s))) for s in p_segments]
+
+    def partner_bones(self, ref):
+        # A bone's head is where its parent ends; its tail is where its children start.
+        name = ref.split(":", 1)[1]
+        at_tail = name.endswith(":tail")
+        b = partner.data.bones.get(name[:-5] if at_tail else name) if partner else None
+        if b is None:
+            return None
+        return [x.name for x in [b] + (list(b.children) if at_tail else [b.parent] if b.parent else [])]
 
 
-def problem(f, kind, text):
-    if len(problems) < 80:
-        problems.append({"frame": f, "kind": kind, "detail": text})
-
-
-feet = [b.name for b in arm.data.bones if "foot" in b.name.lower() and b.use_deform]
-ground = frame["center"].z
-for f in frames:
-    scene.frame_set(f)
-    row = {"frame": f, "points": {}, "checks": []}
-    for ref in ARGS.get("track") or []:
-        p = resolve(ref)
-        row["points"][ref] = {"fwd_right_up": rnd(to_body(frame, p)), "side": side(frame, p)}
-    for name, it in items.items():
-        allowed = near_chain(it["holder"])
-        for g in it["grips"]:
-            allowed |= near_chain(g.get("bone"))
-        for end in ("end_a", "end_b", "center"):
-            p = it["object"].matrix_world @ it["points"][end]
-            best = (1e9, None)
-            for s in arm_segments:
-                if s in allowed:
-                    continue
-                d = segment_distance(p, head(arm, s), tail(arm, s))
-                if d < best[0]:
-                    best = (d, s)
-            keep_min("item:%s:%s clearance to own body" % (name, end), round((best[0] - radius) * TO_CM, 1), best[1], f)
-            if best[0] < radius:
-                problem(f, "clipping", "%s of %r is %.1f cm inside the body near %s" % (end, name, (radius - best[0]) * TO_CM, best[1]))
-        for g in it["grips"]:
-            gp = resolve(g["point"])
-            bp = resolve(g["bone"])
-            d = (gp - bp).length * TO_CM
-            row["checks"].append({"grip": "%s -> %s" % (g["point"], g["bone"]), "distance": round(d, 1)})
-            tol = float(g.get("tolerance", touch))
-            if d > tol:
-                problem(f, "grip", "%s is %.1f cm from %s (tolerance %.1f)" % (g["bone"], d, g["point"], tol))
-    for c in ARGS.get("contacts", []):
-        d = (resolve(c["a"]) - resolve(c["b"])).length * TO_CM
-        expect = c.get("expect", "touch")
-        limit = float(c.get("distance", touch if expect == "touch" else 10.0))
-        row["checks"].append({"contact": "%s ~ %s" % (c["a"], c["b"]), "distance": round(d, 1), "expect": expect})
-        inside = not c.get("window") or c["window"][0] <= f <= c["window"][1]
-        if inside and expect == "touch" and d > limit:
-            problem(f, "contact", "%s and %s should touch but are %.1f cm apart" % (c["a"], c["b"], d))
-        if inside and expect == "apart" and d < limit:
-            problem(f, "contact", "%s and %s should stay %.0f cm apart but are %.1f cm" % (c["a"], c["b"], limit, d))
-    if partner:
-        probes = [b.name for b in arm.data.bones if b.use_deform and any(k in b.name.lower() for k in ("hand", "foot", "head", "forearm", "lowerarm", "shin", "calf"))]
-        points = [(n, head(arm, n)) for n in probes] + [("item:%s:%s" % (n, e), it["object"].matrix_world @ it["points"][e]) for n, it in items.items() for e in ("end_a", "end_b", "center")]
-        for name, p in points:
-            best = (1e9, None)
-            for s in p_segments:
-                d = segment_distance(p, head(partner, s), tail(partner, s))
-                if d < best[0]:
-                    best = (d, s)
-            keep_min("%s clearance to partner" % name, round((best[0] - radius) * TO_CM, 1), best[1], f)
-            intended = any(c.get("expect", "touch") == "touch" and name in (c["a"], c["b"]) for c in ARGS.get("contacts", []))
-            if best[0] < radius and not intended:
-                problem(f, "partner_clipping", "%s is %.1f cm inside the partner near %s" % (name, (radius - best[0]) * TO_CM, best[1]))
-    if feet:
-        heights = dict((n, round((head(arm, n).z - ground) * TO_CM, 1)) for n in feet)
-        row["feet_height"] = heights
-        if min(heights.values()) < -2.0:
-            problem(f, "ground", "a foot is %.1f cm below the rest-pose ground" % -min(heights.values()))
-    rows.append(row)
+result = inspect_animation(Rig(), frames, ARGS, key="frame")
+problems = result["problems"]
 
 scene.frame_set(frames[0])
 attach = {}
@@ -177,5 +154,5 @@ emit({"armature": arm.name, "action": arm.animation_data.action.name if arm.anim
       "frame": {"note": "Positions are [forward, right, up] in cm from the character's centre at ground level, from the rig's own .L/.R bone pairs; right > 0 is the character's right.",
                 "forward_world": rnd(frame["forward"], 3), "right_world": rnd(frame["right"], 3), "left_right_pairs_found": len(frame["pairs"])},
       "attachments": attach, "problems": problems, "passed": not problems,
-      "closest_approach": dict((k, {"clearance_cm": v[0], "near": v[1], "frame": v[2]}) for k, v in sorted(minimum.items())),
-      "samples": rows})
+      "closest_approach": result["closest_approach"],
+      "samples": result["samples"]})

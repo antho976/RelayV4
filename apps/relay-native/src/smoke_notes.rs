@@ -36,11 +36,6 @@ fn require(condition: bool, reason: &str) -> Result<(), String> {
     }
 }
 pub async fn run(ui: &Rc<Ui>) -> Result<(), String> {
-    require(
-        std::env::var("RELAY_NATIVE_FIXTURE").as_deref() == Ok("1")
-            && std::env::var("RELAY_INSTANCE").as_deref() == Ok("test"),
-        "Notes/task lifecycle smoke requires the isolated test instance and fixture flag",
-    )?;
     let project = ui.project.get();
     require(project != 0, "Fixture project must be ready")?;
     let note = ui.call("notes.create",json!({"project_id":project,"title":"Plan","body":"Ordinary Plan fixture","pinned":true})).await.map_err(|e|e.to_string())?;

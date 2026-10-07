@@ -174,7 +174,10 @@ Every op is registered with, and the schema publishes:
   the audit row and `audit.undo` can replay it (§5.5)
 - `scope`: `global` | `project` | `session` — which id the payload must carry
 - `actors`: default allow-set before per-session allowlists apply (§9.1)
-- `executor`: `core` | `ui` — `ui` ops are forwarded to the UI client and answered by it (§6.5)
+- `doors`: `all` | `socket_only` — a socket-only op (`bus.subscribe`, `bus.unsubscribe`,
+  `bus.wait`) acts on the connection that sends it, so the socket door answers it; dispatched
+  to the engine directly it is `invalid` / `bus.door`
+- `stream`: the data-plane stream the op attaches, if any (§7)
 - `emits`: event names it can produce
 
 ### 3.3 Event names
@@ -200,9 +203,8 @@ mutation emits at least one event**, and every event's payload is reproducible b
 
 ### 4.2 Binding
 
-- **UI door**: the envelope's `actor` must be `user`; anything else is `invalid` /
-  `bus.actor`. (The webview is us.)
-- **Socket door**: `agent:<name>` requires `token` equal to the session's token, minted at
+- **Socket door** (the only door the engine has; the native client, the CLI, MCP and the phone
+  door are all its clients): `agent:<name>` requires `token` equal to the session's token, minted at
   `session.spawn` and exported to the child as `RELAY_SESSION=<name>` and
   `RELAY_TOKEN=<token>`. Wrong or missing token → `invalid` / `bus.actor`. `user` needs no
   token (same uid, same trust — §0.6). `test` needs `RELAY_INSTANCE` ∈ {dev, test}.
@@ -211,6 +213,15 @@ mutation emits at least one event**, and every event's payload is reproducible b
   clients refuse a socket whose `SO_PEERCRED` uid is not theirs. Without `XDG_RUNTIME_DIR` the
   runtime directory is `/run/user/<uid>` when that is private, else under `~/.cache` — never a
   predictable name in `/tmp`.
+- **Phone door** (`crates/relay-remote`, `docs/MOBILE.md`): a paired phone's lines reach the
+  socket door over a WebSocket, on the LAN or through a rendezvous server, after a
+  per-connection proof of the device's token. The door forwards only `user` (and `test` on a
+  dev/test instance); any other actor is `invalid` / `bus.actor` before the socket sees it. So
+  "`user` needs no token" means, in practice, *same uid* on the socket and *holds a paired
+  device's token* over the network — and, until that channel is sealed end to end, anyone on
+  the path of a paired connection, who can inject lines into it (MOBILE.md §6). A `user_only`
+  op is reachable from the network; it is a boundary against agents, not against the LAN.
+- **In process** (the test harness): trusted; `agent:<name>` is bound by name without a token.
 - The token is per session-lifetime; parking and waking keep it; `session.close` revokes it.
 
 ---
@@ -252,7 +263,7 @@ fields; a payload that fails schema never reaches policy.
   `project.clone`, `device.run`, `device.build`, `session.spawn`) causes a second row when it finishes:
   `actor: system`, `op: "<op>.completed"`, a fresh `req_id`, `parent_req` = the original
   request id, `kind: ok | error`, `code`, `result_summary`. "What happened to my request" is
-  always `audit.list {parent_req}`.
+  always `audit.list {parent_req}` (a user query, §10.3).
 
 ### 5.1a What is audited
 
@@ -319,34 +330,34 @@ undoable through the bus — those have their own restore paths (trash, reflog).
 
 ## 6. Doors
 
-### 6.1 Tauri (UI)
+### 6.1 Native client (UI)
 
-`invoke("bus", { req: Request, channel }) → ()`, then `bus:response` carries the correlated
-`Response` by request id. The command returns its acknowledgement synchronously before dispatch
-continues on Tauri's async runtime, so WebKitGTK never owns a custom-URI response across backend
-work. There is still one command and one engine pipeline. Events arrive on the Tauri event
-`bus:event` (payload `Event`), and the UI filters client-side; at our event rates (tens per
-second worst case during a dispatch storm, not thousands) that is cheaper than server-side
-subscription plumbing in the webview. Data-plane streams use Tauri `Channel`s (§7).
+`apps/relay-native` (GTK) is a client of the socket door (§6.2) like any other: it sends `user`
+requests, takes events through `bus.subscribe`, and attaches `pty`, `logcat` and `mirror`
+streams on its own connections. It has no private door and no command the CLI lacks. Relay-2's
+Tauri `invoke` door (`bus:response`, `bus:event`, Tauri `Channel`s) does not exist in V4; there
+is no Tauri shell or webview.
 
 ### 6.2 Unix socket
 
-`$XDG_RUNTIME_DIR/relay/<instance>.sock`, mode 0600, `instance ∈ {stable, dev, test}`,
-matching the bundle id (`com.quietsoftware.relay` / `.relay.dev`). Newline-delimited JSON:
-each line is one `Request`, each response line is one `Response`; correlation by `id`;
-pipelining allowed. `bus.subscribe {events?: string[]}` turns the connection into a
-subscriber: `Event` lines are interleaved with responses (distinguished by the `ev` key).
-Data-plane frames on this door are `{stream, session, seq, data}` lines (§7).
+`$XDG_RUNTIME_DIR/relay-v4/<instance>.sock` (without that variable, the fallbacks in §4.2),
+`instance ∈ {stable, dev, test}`; the directory is 0700 and the socket 0600. Relay-2 and V3 used
+`$XDG_RUNTIME_DIR/relay/`; a client pointed there reaches a different engine and store.
+Newline-delimited JSON: each line is one `Request`, each response line is one `Response`;
+correlation by `id`; pipelining allowed. `bus.subscribe {events?: string[]}` turns the
+connection into a subscriber: `Event` lines are interleaved with responses (distinguished by
+the `ev` key). Data-plane frames on this door are `{v, stream, session | run_id | mirror_id,
+epoch?, seq, data}` lines (§7).
 
-The socket is served by whichever process owns the engine: the Tauri app, or `relay serve`
-(headless engine — what the test suite and CI drive; also how you run Relay's core on a
-machine with no display).
+The socket is served by `relay serve`, the one process that owns the engine, with or without a
+display. `relay serve --remote` also runs the phone door (§4.2) in that process.
 
-**One engine per instance.** The engine takes `flock` on
-`$XDG_RUNTIME_DIR/relay/<instance>.lock` before binding. If the lock is held it probes the
-socket: alive → exit 5 with "engine already running (pid N)"; dead → unlink the stale socket
-and take over. The store is opened with `locking_mode=EXCLUSIVE` by the engine, so a second
-process cannot even open it read-write by mistake.
+**One engine per instance.** The engine takes a non-blocking `flock` on
+`$XDG_RUNTIME_DIR/relay-v4/<instance>.lock` before binding. Lock free → anything at the socket
+path is stale and is unlinked. Lock held → `relay serve` exits 5 with "engine already running
+for instance … (pid N)", whether or not the socket answers: a held lock with a dead socket is
+refused, not taken over (D7). The store is opened with `locking_mode=EXCLUSIVE` by the engine,
+so a second process cannot even open it read-write by mistake.
 
 ### 6.3 CLI
 
@@ -357,8 +368,8 @@ shaping and exit codes.
 
 `relay mcp` is the stdio MCP server. Each implemented control-plane op the caller may actually
 call becomes a tool of the same name, and the actor is bound from the MCP process environment
-exactly like the CLI. Stream attachments and Tauri-only ops remain on their native data planes and
-are not advertised as MCP tools. Tool calls cross the Unix socket and the normal engine pipeline;
+exactly like the CLI. Stream attachments and `bus.subscribe` / `bus.unsubscribe` need a live
+connection and are not advertised as MCP tools. Tool calls cross the Unix socket and the normal engine pipeline;
 the MCP process contains no domain logic.
 
 `tools/list` is filtered by all three §9.1 layers — every tool in it is one the role can really
@@ -369,18 +380,34 @@ than drops (D104). `RELAY_MCP_OPS` overrides the selection with a comma-separate
 or `namespace.*` patterns; the engine still refuses anything the role may not call. A list that
 comes out empty is reported through `session.report`, and on stderr, instead of failing silently.
 
-### 6.5 UI-executed ops
+### 6.5 `ui.*` ops: a shell model held by core
 
-`ui.*` ops are accepted by core (validated, allowlisted, audited if `agent_only` and the actor
-is an agent), then forwarded to the UI client over `bus:ui-op`; the UI answers on
-`bus:ui-result` and core relays that as the response. If no UI is connected (headless), they
-return `unavailable` / `ui.absent`. This is how an agent opens a diff pane or switches you to
-Board without there being a second API.
+No client executes `ui.*` ops. Core answers every one itself, like any other op (validated,
+allowlisted — agents need `session.allow_ui` — and audited when `agent_only` and the caller is
+an agent), against an in-memory shell model: page, project, panes, focus and windows. The model
+starts at the dashboard with one `main` window, is not persisted, and is the same whether or not
+a client is connected, so a headless engine answers `ui.*` with success too; there is no
+`ui.absent`. Every change emits `ui.changed` with the whole model, except `ui.pane.move`, which
+emits `{move: {pane, to, edge}}` (D40).
 
-**Exactly one executor.** Only the main window registers as the `ui.*` executor; pop-out
-(satellite) windows are separate JS worlds that never register and never answer. `ui.window.*`
-is answered by main, which owns the satellites. A `ui.*` op that concerns a pane living in a
-satellite is still answered by main, which forwards internally — core neither knows nor cares.
+What reaches the screen is what the native client does with those events:
+
+| op | native client |
+|---|---|
+| `ui.page.switch` | follows: opens that project and page. It also sends `ui.page.switch` itself when you navigate, so `ui.state.page` tracks the window, and drops the echo of its own request |
+| `ui.pane.open` / `ui.pane.focus` | follows only a focused pane whose `target.session` is set: it focuses that session's terminal (on Agents). Any other target — a diff, a note, a file, a run, a mirror — opens nothing |
+| `ui.pane.close`, `ui.pane.move` | nothing |
+| `ui.window.popout` / `.close` | nothing: no OS window opens or closes |
+| `ui.toast` | shows the text in its notice bar; `level` and `ttl_ms` are carried but ignored |
+| `ui.layout.apply` | applies the stored state from `layout.changed` |
+| `ui.state`, `ui.window.list` | report the model: panes and windows recorded by `ui.*` ops, never the native window's own panes |
+
+`os.reveal` and `os.open_url` run `xdg-open` on the engine's machine after commit; they involve
+no client either.
+
+Relay-2 planned a UI executor door (`bus:ui-op` / `bus:ui-result`) that answered `ui.*` from the
+main window and returned `unavailable` / `ui.absent` headless. V4 never had it, and the
+`executor` registry attribute that described it was removed on 2026-10-06 (D164).
 
 ---
 
@@ -388,10 +415,10 @@ satellite is still answered by main, which forwards internally — core neither 
 
 | stream | attached by | frames | notes |
 |---|---|---|---|
-| `pty` | `session.attach {session, from_seq?, epoch?}` | `{v:1, stream:"pty", session, epoch, seq, data: base64}` at ≤ 60 fps, coalesced per frame | Tauri: `Channel<Frame>`; socket: lines. Backpressure: coalesce, never drop. `epoch` increments on every spawn/wake and `seq` restarts at 0 within it; `session.scrollback` returns `{text, epoch, seq}` so a client can resume exactly |
-| `mirror` | `device.mirror.start` | H.264 NAL units | Tauri `Channel<Bytes>` only; socket door returns `unavailable` |
-| `logcat` | `device.run`, `device.build` | `{v:1, stream:"logcat", run_id, seq, line}` | a build streams Gradle output only, then ends |
-| `log` | `app.log.tail` | `{v:1, stream:"log", seq, record}` | Relay's own structured log |
+| `pty` | `session.attach {session, from_seq?, epoch?}` | `{v:1, stream:"pty", session, epoch, seq, data: base64}`, one frame per PTY read (up to 64 KiB) | socket lines, after a catch-up from the scrollback ring. A subscriber more than 1024 frames behind loses frames (the engine logs it) and should re-attach from its last `(epoch, seq)`. `epoch` increments on every spawn/wake and `seq` restarts within it; `session.scrollback` returns `{text, epoch, seq}` so a client can resume exactly |
+| `mirror` | `device.mirror.start` | `{v:1, stream:"mirror", mirror_id, seq, data}`: a base64 string is one H.264 packet; an object is the mirror's status (first, on every change, and a terminal one that ends the stream) | on the socket connection that started it; the mirror stops when that connection closes |
+| `logcat` | `device.run`, `device.build` | `{v:1, stream:"logcat", run_id, seq, data: line}` | a build streams Gradle output only, then ends; a subscriber that falls behind loses lines (logged) |
+| `log` | `app.log.tail` | none yet | declared, not implemented: the op answers `unavailable`/`bus.not_implemented`. The engine logs to `relay serve`'s output, filtered by `RELAY_LOG` |
 
 Input to a PTY is a bus op (`session.input`, `audit: agent_only`), not a stream — it is
 low-volume in bytes and it matters who typed into whose terminal.
@@ -624,7 +651,7 @@ empties is dropped rather than stored as `{}` (which used to replace the subtree
 
 ## 10. Op catalogue
 
-Notation: `op — kind · audit · undo · scope · executor` then `payload → result`, TS-ish, `?`
+Notation: `op — kind · audit · undo · scope` then `payload → result`, TS-ish, `?`
 optional. Entity shapes are in §11. `Id = number`. Every project-scoped op takes
 `project_id: Id` unless the payload names a session (sessions know their project).
 
@@ -647,7 +674,7 @@ All `app.*` mutations are `user_only` (§9.1 layer 1).
 | op | attrs | payload → result |
 |---|---|---|
 | `app.version` | query | `{}` → `{ version, instance, build: {profile, git_sha, built_at} }` |
-| `app.status` | query | `{}` → `{ pid, uptime_s, store_path, socket_path, ui_connected: bool, sessions_live: number, providers: ProviderInfo[] }` |
+| `app.status` | query | `{}` → `{ pid, uptime_s, store_path, socket_path, sessions_live: number, providers: ProviderInfo[] }` |
 | `app.quit` | mutation · always · global | `{ force?: bool }` → `{}` — refuses (`conflict`/`app.sessions_live`) unless `force` or no live sessions |
 | `app.resources.get` | query | `{}` → `{ relay: {pid, rss_mb, cpu_pct}, panes: {session, pid, rss_mb, cpu_pct}[], worktrees: {path, disk_mb}[], store_mb, total_rss_mb }` |
 | `app.resources.watch` | mutation · never · global | `{ on: bool }` → `{}` — while any client watches, `resource.sample` events flow (§1.3); otherwise none |
@@ -663,8 +690,8 @@ All `app.*` mutations are `user_only` (§9.1 layer 1).
 
 | op | attrs | payload → result |
 |---|---|---|
-| `audit.list` | query | `{ project_id?, actor?, session_id?, op_prefix?, parent_req?, since?, until?, limit?: ≤1000 }` → `{ rows: AuditRow[] }` — `since`/`until` take RFC 3339 with any offset, a bare date (UTC midnight) or epoch seconds/ms; anything else is `invalid`/`time.invalid` |
-| `audit.get` | query | `{ audit_id }` → `AuditRow` (with stored payload if kept) |
+| `audit.list` | query · user | `{ project_id?, actor?, session_id?, op_prefix?, parent_req?, since?, until?, limit?: ≤1000 }` → `{ rows: AuditRow[] }` — `since`/`until` take RFC 3339 with any offset, a bare date (UTC midnight) or epoch seconds/ms; anything else is `invalid`/`time.invalid` |
+| `audit.get` | query · user | `{ audit_id }` → `AuditRow` (with stored payload if kept) — both reads are `user_only`: stored payloads hold frozen actions, launch prompts and private mail |
 | `audit.undo` | mutation · always · undo none · global · user | `{ audit_id, force?: bool }` → `{ undone: Id, by: Id }` — `conflict`/`audit.not_undoable` if the row has no inverse or was already undone; `conflict`/`audit.stale` if the entity changed since (§5.5) |
 
 ### 10.4 workspace / project
@@ -878,7 +905,7 @@ All paths are relative to the worktree root; `..` and absolute paths are `invali
 | `file.restore` | mutation · always | `{ project_id, trash_id }` → `Entry` |
 | `file.trash.list` | query · user | `{ project_id, limit? (200, ≤1000) }` → `{ entries: {id, original_path, worktree, created_at, available}[] }` — the project's trashed files not yet restored or expired, newest first; `id` is the `trash_id` for `file.restore`, `available` whether the bytes are still on disk |
 | `file.import` | mutation · always | `{ project_id, worktree?, into, sources: path[] }` → `{ entries: Entry[] }` — OS drag-in |
-| `file.restore_head` | mutation · always · user | `{ project_id, worktree?, path }` → `Entry` — `git checkout -- <path>`; the one-click answer to a post-hoc `guardrail.violation` (§9.3) |
+| `file.restore_head` | mutation · always · user | `{ project_id, worktree?, path }` → `Entry` — `git checkout -- <path>`: puts a tracked file back as `HEAD` has it. Nothing calls it for you: there is no post-hoc write watcher (§9.3, D163) |
 | `file.search` | query | `{ project_id, worktree?, query, glob?, regex?, limit? }` → `{ hits: {path, line, col, text, text_offset?}[] }`; `col` is the match's 1-based byte offset in the line, and `text` the line, or for one over 240 bytes a window of it around the match starting at byte `text_offset`; searches regular text files only (a symlink only when it stays inside the worktree), skipping generated trees, files over 8 MiB and any with a NUL in the first 8 KiB |
 
 ### 10.14 device (SPEC §9)
@@ -893,7 +920,7 @@ All paths are relative to the worktree root; `..` and absolute paths are `invali
 | `device.run` | mutation · always | `{ project_id, worktree?, device, variant?, integration_id? }` → `Run` (state `building`) + `logcat` stream; crashes surface as `run.crash` events |
 | `device.build` | mutation · always | `{ project_id, worktree?, variant?, format?, publish?, integration_id? }` → `Run` (state `building`, `kind: "build"`, no device) + `logcat` stream; `variant` defaults to `release`, `format` is `apk` (default) or `bundle`, and `publish` runs Gradle Play Publisher's `publish<Variant><Format>` to upload to Google Play. A saved Relay profile overrides release signing for this invocation; otherwise Gradle's project configuration signs as before. Play credentials stay in the target project. Build rows persist `variant`, `format`, and `publish`; a finished build adds `artifact` plus `signing: signed | unsigned | unverified` after checking the APK with SDK `apksigner` or the AAB with JDK `jarsigner` |
 | `device.signing.get` | query · user | `{ project_id }` → `{ configured, enabled, key_alias?, keystore? }`; returns metadata only, never a password |
-| `device.signing.create` | mutation · never · user · Tauri only | `{ project_id, key_alias, password }` → `{ configured, enabled, key_alias, keystore }`; creates one PKCS12 upload key below Relay's private data directory and saves the password in Linux Secret Service. The op is deliberately unaudited and unavailable over the socket so its secret never reaches audit, CLI arguments, or agents |
+| `device.signing.create` | mutation · never · user | `{ project_id, key_alias, password }` → `{ configured, enabled, key_alias, keystore }`; creates one PKCS12 upload key below Relay's private data directory and saves the password in Linux Secret Service. The op is deliberately unaudited and `user_only`, so its secret never reaches the audit log or an agent. It travels the socket like every op (the native client calls it there); from the CLI, pass the payload on stdin (`relay cmd device.signing.create -`) rather than as an argument |
 | `device.signing.set_enabled` | mutation · user | `{ project_id, enabled }` → signing profile metadata; explicitly switches release builds between the saved Relay key and the Android project's Gradle signing configuration without deleting either identity |
 | `device.run.stop` | mutation · always | `{ run_id }` → `{}`; also stops a build |
 | `device.run.list` | query | `{ project_id }` → `{ runs: Run[] }` |
@@ -940,21 +967,26 @@ Settings tree top-level keys (each documented where its feature lands): `appeara
 `audit`, `usage`, `device`, `layout` (`layout.current.<project>`), `keybindings` (shortcut → op
 envelope, SPEC §2). Unread defaults were dropped (RA-253): `parking`, `theme` and a top-level
 `roles` are no longer part of the tree, though an arbitrary path can still be written.
+`guardrails` is the one subtree with a fixed shape: `settings.set` under it refuses a key the
+guardrail config does not know and reads the touched layers back the way `guardrail.config.set`
+does (`invalid`/`guardrail.config`); a stored key this build does not know is ignored with a
+warning rather than failing every guardrail read.
 
-### 10.17 ui (executor: ui — §6.5)
+### 10.17 ui (core-held shell model — §6.5)
 
 | op | attrs | payload → result |
 |---|---|---|
-| `ui.state` | query | `{}` → `{ project_id, page, panes: PaneInfo[], focused: PaneRef, windows: WindowInfo[] }` |
+| `ui.state` | query | `{}` → `{ project_id, page, panes: PaneInfo[], focused: PaneRef, windows: WindowInfo[] }` — the engine's model, not the native window's panes |
 | `ui.page.switch` | mutation · agent_only · inverse | `{ page: "agents"\|"code"\|"board"\|"modules"\|"dashboard"\|"skills"\|"plugins"\|"settings", project_id? }` → `{}` |
-| `ui.pane.open` | mutation · agent_only | `{ kind: PaneKind, target?: PaneTarget, at?: PaneRef \| "split_h" \| "split_v" \| "tab" }` → `{ pane: PaneRef }` — e.g. open a diff for `{kind:"diff", target:{sha}}` |
+| `ui.pane.open` | mutation · agent_only | `{ kind: PaneKind, target?: PaneTarget, at?: PaneRef \| "split_h" \| "split_v" \| "tab" }` → `{ pane: PaneRef }` — records the pane; the native client acts only on `target.session` (focuses that terminal), so e.g. `{kind:"diff", target:{sha}}` opens nothing on screen |
 | `ui.pane.close` / `ui.pane.focus` | mutation · agent_only | `{ pane: PaneRef }` → `{}` |
 | `ui.pane.move` | mutation · agent_only | `{ pane: PaneRef, to: PaneRef, edge: "top"\|"bottom"\|"left"\|"right"\|"center" }` → `{}` |
 | `ui.layout.list` / `ui.layout.save` / `ui.layout.apply` / `ui.layout.delete` | mutation · always · inverse (save/delete) | `{ project_id }` / `{ project_id, name, state? }` / `{ project_id, name }` / `{ project_id, name }` — opaque shell state is stored in core and an apply emits `layout.changed` for the UI |
-| `ui.window.popout` / `ui.window.close` / `ui.window.list` | mutation · agent_only | `{ pane: PaneRef }` → `{ window_id }` / `{ window_id }` / `{}` |
-| `ui.toast` | mutation · agent_only | `{ text, level?: "info"\|"warn"\|"error", ttl_ms? }` → `{}` |
-| `os.reveal` | mutation · never | `{ path }` → `{}` — file manager |
-| `os.open_url` | mutation · never | `{ url }` → `{}` |
+| `ui.window.popout` / `ui.window.close` | mutation · agent_only | `{ pane: PaneRef }` → `{ window_id }` / `{ window_id }` → `{}` — model only: no OS window opens or closes |
+| `ui.window.list` | query | `{}` → `{ windows: WindowInfo[] }` — the model's windows |
+| `ui.toast` | mutation · agent_only | `{ text, level?: "info"\|"warn"\|"error", ttl_ms? }` → `{}` — emits `ui.toast`; the native client shows the text in its notice bar |
+| `os.reveal` | mutation · never | `{ path }` → `{}` — file manager, via `xdg-open` on the engine's machine |
+| `os.open_url` | mutation · never | `{ url }` → `{}` — `http(s)` only, via `xdg-open` on the engine's machine |
 
 ---
 
@@ -1088,7 +1120,8 @@ interface Integration { id; project_id; branches: string[]; worktree: string | n
   conflict: [string, string] | null; log_tail: string; started_at; finished_at }
 interface ProviderInfo { provider; installed: bool; path: string | null; version: string | null;
   signed_in_as: string | null; last_seen_version: string | null; spawn_profile: object;
-  guarded: bool /* false = Relay's PreToolUse guardrail and lifecycle reports do not bind here */ }
+  guarded: bool /* true for both providers: Claude Code's hooks in .claude/settings.local.json,
+                    Codex's in .codex/hooks.json once trusted in /hooks (§9.3, D132) */ }
 interface Skill { id; name; body; enabled_in: Id[] }
 interface Device { serial; model; kind: "usb" | "avd"; state }
 ```
@@ -1150,7 +1183,8 @@ test that opens a DB at each prior version.
 
 - **No pagination cursors.** One user; `limit ≤ 1000`; if a list is bigger, the filter is
   wrong.
-- **No per-request auth beyond tokens.** Same uid = same trust (§0.6). Tokens prevent
+- **No per-request auth beyond tokens.** Same uid = same trust (§0.6) on the socket; over the
+  phone door, `user` is whoever holds a paired device's token (§4.2). Tokens prevent
   misattribution, not determined impersonation.
 - **No RPC over the network, with one exception.** The engine's own door is the Unix socket
   only. The exception is the paired-phone door (`crates/relay-remote`, `docs/MOBILE.md`): it
@@ -1177,8 +1211,9 @@ Phase 1 (SPEC §17.1) ships: this document · `relay-bus` crate (envelope, error
 schema generation, pipeline traits) · `relay-core` engine skeleton with the store's
 `audit`/`holds`/`settings` tables and migrations framework · socket door and `relay serve` ·
 `relay` CLI (`cmd`, `q`, `events`, `schema`, `ops`, `ping`, `serve`) · Tauri shell **stub**
-(door #1 exists — one `bus` command, `bus:event` forwarding, a ping page — no chrome; SPEC puts
-the real shell in phase 9) · ops actually executable in phase 1: all of
+(Relay-2's door #1 — one `bus` command, `bus:event` forwarding, a ping page — no chrome; SPEC
+puts the real shell in phase 9. V4 has no Tauri shell: its UI is a socket client, §6.1) · ops
+actually executable in phase 1: all of
 `bus.*`, `app.version`, `app.status`, `app.reconcile` (no-op list), `audit.list/get`,
 `settings.*`, `workspace.*`, `project.add/list/get/update/remove` (no git yet: path must
 contain `.git`). Every other op in §10 is registered with its schema and returns

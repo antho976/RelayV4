@@ -1,7 +1,6 @@
 # blender_rig_check: the rig and skin problems that turn into wrong-handed, mis-scaled or
-# broken characters after export.
-import bmesh
-
+# broken characters after export. The mesh checks are mesh_check's (common.mesh_issues); the
+# skin checks on top read the weights on the original mesh.
 problems, warnings = [], []
 
 
@@ -21,11 +20,10 @@ names = [b.name for b in bones]
 
 if any(abs(s - 1.0) > 1e-4 for s in arm.scale):
     problem(arm.name, "armature object scale is %s, not applied" % rnd(arm.scale, 3), "Object > Apply > Scale (with the meshes) before rigging further or exporting")
-if any(abs(r) > 1e-4 for r in arm.rotation_euler):
-    problem(arm.name, "armature object rotation is not applied", "Object > Apply > Rotation")
+if unapplied_rotation(arm):
+    problem(arm.name, "armature object rotation is not applied (%s deg)" % unapplied_rotation(arm), "Object > Apply > Rotation")
 
 roots = [b.name for b in bones if b.parent is None]
-deform_roots = [b.name for b in bones if b.parent is None and b.use_deform]
 if len(roots) > 1:
     problem(arm.name, "%d root bones (%s); Unreal needs one" % (len(roots), ", ".join(roots[:6])), "parent every root under a single root bone at the origin")
 deform = [b for b in bones if b.use_deform]
@@ -57,13 +55,7 @@ if pairs and frame["forward"].y > -0.7:
     warn(arm.name, "the character faces %s, not -Y (Blender's front view)" % facing, "rotate the rig and meshes to face -Y and apply rotation, so exports land facing the way Unreal expects")
 
 deform_names = set(b.name for b in deform)
-skinned = []
-for o in scene.objects:
-    if o.type != "MESH":
-        continue
-    uses = any(m.type == "ARMATURE" and m.object == arm for m in o.modifiers) or (o.parent == arm and o.parent_type == "ARMATURE")
-    if uses and (not ARGS.get("meshes") or o.name in ARGS["meshes"]):
-        skinned.append(o)
+skinned = [o for o in skinned_meshes(arm) if not ARGS.get("meshes") or o.name in ARGS["meshes"]]
 if not skinned:
     warn(arm.name, "no meshes are skinned to this armature", "add an Armature modifier pointing at it (Ctrl+P > With Automatic Weights)")
 
@@ -71,8 +63,8 @@ mesh_reports = []
 lo, hi = None, None
 for o in skinned:
     me = o.data
-    r = {"mesh": o.name, "vertices": len(me.vertices), "triangles": sum(len(p.vertices) - 2 for p in me.polygons)}
-    if any(abs(s - 1.0) > 1e-4 for s in o.scale) or any(abs(x) > 1e-4 for x in o.rotation_euler):
+    r = {"mesh": o.name, "vertices": len(me.vertices)}
+    if any(abs(s - 1.0) > 1e-4 for s in o.scale) or unapplied_rotation(o):
         problem(o.name, "mesh transform not applied", "Object > Apply > All Transforms before skinning")
     groups = dict((g.index, g.name) for g in o.vertex_groups)
     orphan_groups = [n for n in groups.values() if n not in names]
@@ -103,24 +95,13 @@ for o in skinned:
         warn(o.name, "%d vertices use more than 8 bones" % over8, "Weights > Limit Total (8, or 4 for mobile) then Normalize All")
     for name, count in sorted(non_deform_weight.items())[:6]:
         problem(o.name, "%d vertices are weighted to non-deform bone %s, which is not exported" % (count, name), "move the weights to a deform bone, or enable Deform on %s" % name)
-    if not me.uv_layers:
-        problem(o.name, "no UV map", "unwrap it; Unreal needs UVs for textures (and a second channel if you use baked lightmaps)")
-    bm = bmesh.new()
-    bm.from_mesh(me)
-    non_manifold = sum(1 for e in bm.edges if not e.is_manifold)
-    loose = sum(1 for v in bm.verts if not v.link_edges)
-    degenerate = sum(1 for f in bm.faces if f.calc_area() < 1e-10)
-    volume = bm.calc_volume(signed=True) if non_manifold == 0 and bm.faces else None
-    bm.free()
-    r.update({"non_manifold_edges": non_manifold, "loose_vertices": loose, "degenerate_faces": degenerate})
-    if loose:
-        warn(o.name, "%d loose vertices" % loose, "Mesh > Clean Up > Delete Loose")
-    if degenerate:
-        warn(o.name, "%d zero-area faces" % degenerate, "Mesh > Clean Up > Degenerate Dissolve")
-    if volume is not None and volume < 0:
-        problem(o.name, "normals point inward (the closed mesh has negative volume)", "Mesh > Normals > Recalculate Outside")
+    counts, issues = mesh_issues(o)
+    r.update(counts)
+    for level, text, fix in issues:
+        (problem if level == "problem" else warn)(o.name, text, fix)
     mesh_reports.append(r)
-    a, b = world_bbox([o])
+    with rest_pose([arm]):
+        a, b = world_bbox([o])
     lo = a if lo is None else Vector(map(min, lo, a))
     hi = b if hi is None else Vector(map(max, hi, b))
 

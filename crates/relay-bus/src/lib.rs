@@ -1,8 +1,9 @@
 //! RELAY v4 command bus — the app's entire API, as types.
 //!
-//! This crate is the schema. It has no I/O: `relay-core` executes ops, the doors (Tauri,
-//! socket/CLI, MCP) carry envelopes, and `schema/bus.v1.json` is rendered from here.
-//! `docs/BUS.md` is the human-readable form of the same contract.
+//! This crate is the schema. It has no I/O: `relay-core` executes ops, the doors (the Unix
+//! socket the native client, CLI and MCP share, and the phone door that forwards to it) carry
+//! envelopes, and `schema/bus.v1.json` is rendered from here. `docs/engine/BUS.md` is the
+//! human-readable form of the same contract.
 
 // `BusError` is ~250 bytes and is the *normal* path for typed refusals; boxing it in every
 // handler signature would obscure the API for no measurable gain.
@@ -18,7 +19,7 @@ pub mod ops;
 pub use envelope::{Actor, Event, MailHint, Request, Response, ENVELOPE_V};
 pub use error::{BusError, Confirm, ErrorKind};
 pub use registry::{
-    Actors, Audit, Doors, Executor, Op, OpEntry, OpKind, OpMeta, Registry, Scope, Undo,
+    Actors, Audit, Doors, Op, OpEntry, OpKind, OpMeta, Registry, Scope, Undo,
 };
 pub use types::Id;
 

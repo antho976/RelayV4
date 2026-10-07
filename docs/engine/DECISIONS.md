@@ -19,6 +19,10 @@ The *why* behind anything surprising. Append; never rewrite history. Reference a
 - **D5 Guardrails bind agents through hooks, not `file.write`.** Providers write with their own
   tools; `guardrail.gate` + Claude Code PreToolUse hooks + a git pre-commit hook are the
   enforcement doors; Codex writes are post-hoc (BUS.md §9.3).
+  *Note 2026-10-06:* the Codex clause is superseded by D132 and D163. Codex is hooked through
+  `.codex/hooks.json`, its `apply_patch` edits meet one `write` gate per file and its shell
+  commands the `exec` gate plus a `write` gate per visible target; no post-hoc watcher or
+  `guardrail.violation` was ever built.
 - **D6 `guardrail.confirm` re-executes with the confirm request's id** so the original id keeps
   replaying `held`; confirmer is the actor, original actor is `on_behalf_of` (BUS.md §9.4).
 - **D7 One engine per instance** via `flock` on `<instance>.lock` plus a socket probe; the store is
@@ -1018,3 +1022,15 @@ The *why* behind anything surprising. Append; never rewrite history. Reference a
   taken first, and diffing a tree inside a gate would hold the store lock. Separately, the
   adapter gives up after 20 s and exits 2: a provider kills a hook at 30 s and then runs the tool
   unchecked, so a store-lock stall used to wave every tool through (D23).
+- **D164 `ui.*` is a shell model core holds, not a door a client executes.** BUS.md §6.5 described
+  Relay-2's plan: `ui.*` forwarded to the main window over a Tauri executor door, `ui.absent` when
+  headless. V4 has no Tauri app and never had that door; core answered `ui.*` from its in-memory
+  model (D40), and the GTK client follows only the page, a focused pane's `target.session` and
+  `ui.toast`. The leftovers that claimed otherwise are removed rather than made true: the
+  `executor` registry attribute (and `.ui()`), which nothing read, `Doors::TauriOnly`, the engine's
+  `Door::Tauri`, and `app.status.ui_connected`, which was never set and which no client read. This
+  supersedes D40's `executor: ui` boundary; `session.allow_ui` (an op-name prefix check) is the
+  agent gate, as it always was. The `ui.*` ops keep their behaviour and shapes: a pane or pop-out
+  that opens nothing on screen still answers success, because it did update the model, and the op
+  summaries now say which ops reach the screen, since a summary is all an agent reading `bus.ops`
+  or an MCP tool list sees.

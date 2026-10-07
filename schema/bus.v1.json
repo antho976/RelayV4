@@ -29,7 +29,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -48,7 +47,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -67,7 +65,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -86,7 +83,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -105,7 +101,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "socket_only",
       "emits": [],
@@ -124,7 +119,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "socket_only",
       "emits": [],
@@ -143,7 +137,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "socket_only",
       "emits": [],
@@ -162,7 +155,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -176,12 +168,11 @@
       }
     },
     "app.status": {
-      "summary": "Engine status: paths, UI connected, live sessions, providers",
+      "summary": "Engine status: paths, live sessions, providers",
       "kind": "query",
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -200,7 +191,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [],
@@ -219,7 +209,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -238,7 +227,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -259,7 +247,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -280,12 +267,11 @@
       }
     },
     "app.log.tail": {
-      "summary": "Attach the log stream (Relay's own structured log)",
+      "summary": "Reserved: answers bus.not_implemented, no log stream exists yet; the engine logs to relay serve's output (RELAY_LOG filters it)",
       "kind": "query",
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -305,7 +291,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [],
@@ -324,7 +309,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -343,7 +327,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -366,7 +349,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -385,7 +367,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -406,8 +387,7 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
-      "actors": "all",
+      "actors": "user_only",
       "doors": "all",
       "emits": [],
       "since": "1.0",
@@ -425,8 +405,7 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
-      "actors": "all",
+      "actors": "user_only",
       "doors": "all",
       "emits": [],
       "since": "1.0",
@@ -444,7 +423,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [],
@@ -463,7 +441,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -484,7 +461,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -503,7 +479,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -522,7 +497,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "global",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -543,7 +517,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -566,7 +539,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -587,7 +559,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -608,7 +579,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -627,7 +597,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -646,7 +615,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "project",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -667,7 +635,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -691,7 +658,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -710,7 +676,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -731,7 +696,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -750,7 +714,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [],
@@ -769,7 +732,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -788,7 +750,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -809,7 +770,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -830,7 +790,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -851,7 +810,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -872,7 +830,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -893,7 +850,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -914,7 +870,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -935,7 +890,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -956,7 +910,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -977,7 +930,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -996,7 +948,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -1017,7 +968,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -1038,7 +988,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -1057,7 +1006,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -1078,7 +1026,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -1099,7 +1046,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -1121,7 +1067,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "project",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -1142,7 +1087,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -1161,7 +1105,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -1182,7 +1125,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -1201,7 +1143,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -1220,7 +1161,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -1241,7 +1181,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -1262,7 +1201,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -1283,7 +1221,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -1305,7 +1242,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -1326,7 +1262,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -1345,7 +1280,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -1364,7 +1298,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -1383,7 +1316,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -1402,7 +1334,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -1423,7 +1354,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -1444,7 +1374,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -1465,7 +1394,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -1486,7 +1414,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -1507,7 +1434,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -1528,7 +1454,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -1547,7 +1472,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -1568,7 +1492,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -1587,7 +1510,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -1606,7 +1528,6 @@
       "audit": "agent_only",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -1627,7 +1548,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -1648,7 +1568,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "session",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -1669,7 +1588,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "session",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -1690,7 +1608,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "session",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -1711,7 +1628,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "session",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -1732,7 +1648,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "session",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -1753,7 +1668,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "session",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -1775,7 +1689,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "session",
-      "executor": "core",
       "actors": "agent_only",
       "doors": "all",
       "emits": [
@@ -1800,7 +1713,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "session",
-      "executor": "core",
       "actors": "agent_only",
       "doors": "all",
       "emits": [
@@ -1821,7 +1733,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "session",
-      "executor": "core",
       "actors": "agent_only",
       "doors": "all",
       "emits": [
@@ -1842,7 +1753,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "session",
-      "executor": "core",
       "actors": "agent_only",
       "doors": "all",
       "emits": [
@@ -1863,7 +1773,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "session",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -1882,7 +1791,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -1901,7 +1809,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -1920,7 +1827,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "session",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -1939,7 +1845,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "session",
-      "executor": "core",
       "actors": "agent_only",
       "doors": "all",
       "emits": [],
@@ -1958,7 +1863,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "session",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -1979,7 +1883,6 @@
       "audit": "agent_only",
       "undo": "none",
       "scope": "session",
-      "executor": "core",
       "actors": "agent_only",
       "doors": "all",
       "emits": [
@@ -2001,7 +1904,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "session",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -2021,7 +1923,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "session",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -2040,7 +1941,6 @@
       "audit": "agent_only",
       "undo": "none",
       "scope": "session",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -2061,7 +1961,6 @@
       "audit": "agent_only",
       "undo": "none",
       "scope": "session",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [],
@@ -2080,7 +1979,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "session",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -2099,7 +1997,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -2118,7 +2015,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "session",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -2139,7 +2035,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -2158,7 +2053,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -2179,7 +2073,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -2200,7 +2093,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -2221,7 +2113,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "session",
-      "executor": "core",
       "actors": "agent_only",
       "doors": "all",
       "emits": [
@@ -2246,7 +2137,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -2265,7 +2155,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [],
@@ -2284,7 +2173,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -2307,7 +2195,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -2330,7 +2217,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -2349,7 +2235,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "global",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -2370,7 +2255,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -2389,7 +2273,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -2408,7 +2291,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -2427,7 +2309,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "session",
-      "executor": "core",
       "actors": "agent_only",
       "doors": "all",
       "emits": [
@@ -2450,7 +2331,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -2469,7 +2349,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -2488,7 +2367,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -2511,7 +2389,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -2530,7 +2407,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -2551,7 +2427,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -2572,7 +2447,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -2591,7 +2465,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -2610,7 +2483,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -2629,7 +2501,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -2648,7 +2519,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -2667,7 +2537,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -2686,7 +2555,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -2705,7 +2573,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -2726,7 +2593,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -2747,7 +2613,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -2768,7 +2633,6 @@
       "audit": "agent_only",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -2787,7 +2651,6 @@
       "audit": "agent_only",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -2806,7 +2669,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -2827,7 +2689,6 @@
       "audit": "agent_only",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -2848,7 +2709,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -2869,7 +2729,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -2888,7 +2747,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -2907,7 +2765,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -2928,7 +2785,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -2950,7 +2806,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -2969,7 +2824,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -2992,7 +2846,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -3011,7 +2864,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -3030,7 +2882,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -3051,7 +2902,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -3070,7 +2920,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -3089,7 +2938,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -3110,7 +2958,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -3131,7 +2978,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -3152,7 +2998,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -3173,7 +3018,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -3194,7 +3038,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -3229,12 +3072,11 @@
       }
     },
     "file.restore_head": {
-      "summary": "git checkout -- <path>: the one-click answer to a post-hoc violation",
+      "summary": "git checkout -- <path>: put a tracked file back as HEAD has it",
       "kind": "mutation",
       "audit": "always",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -3255,7 +3097,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -3276,7 +3117,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -3295,7 +3135,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -3314,7 +3153,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -3330,12 +3168,11 @@
       }
     },
     "device.mirror.start": {
-      "summary": "Start a scrcpy-class H.264 mirror; frames on a dedicated native or Tauri connection",
+      "summary": "Start a scrcpy-class H.264 mirror; frames on the socket connection that started it",
       "kind": "mutation",
       "audit": "always",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -3357,7 +3194,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -3378,7 +3214,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [],
@@ -3397,7 +3232,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -3423,7 +3257,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -3445,7 +3278,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [],
@@ -3464,7 +3296,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -3485,7 +3316,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -3506,7 +3336,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -3527,7 +3356,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -3546,7 +3374,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -3565,7 +3392,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -3584,7 +3410,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -3605,7 +3430,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -3626,7 +3450,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -3647,7 +3470,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -3666,7 +3488,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -3687,7 +3508,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -3708,7 +3528,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -3727,7 +3546,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -3748,7 +3566,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -3769,7 +3586,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -3788,7 +3604,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "session",
-      "executor": "core",
       "actors": "agent_only",
       "doors": "all",
       "emits": [
@@ -3809,7 +3624,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -3828,7 +3642,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -3847,7 +3660,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "global",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -3868,7 +3680,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "global",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -3889,7 +3700,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "global",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -3910,7 +3720,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "project",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -3931,7 +3740,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -3952,7 +3760,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -3971,7 +3778,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -3992,7 +3798,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -4011,7 +3816,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -4030,7 +3834,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -4049,7 +3852,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "project",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -4070,7 +3872,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -4089,7 +3890,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -4110,7 +3910,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -4131,7 +3930,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -4148,7 +3946,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "global",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -4167,7 +3964,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -4186,7 +3982,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "global",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -4207,7 +4002,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "global",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -4228,7 +4022,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -4242,12 +4035,11 @@
       }
     },
     "ui.state": {
-      "summary": "What the UI has open",
+      "summary": "The engine's shell model: the last page switched to, plus panes and windows recorded by ui.* ops. Not the native window's own panes",
       "kind": "query",
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "ui",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -4261,12 +4053,11 @@
       }
     },
     "ui.page.switch": {
-      "summary": "Switch page",
+      "summary": "Switch the page (and project); the native client follows",
       "kind": "mutation",
       "audit": "agent_only",
       "undo": "inverse",
       "scope": "global",
-      "executor": "ui",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -4280,12 +4071,11 @@
       }
     },
     "ui.pane.open": {
-      "summary": "Open a pane (e.g. a diff for a sha)",
+      "summary": "Record a pane in the shell model. The native client acts only on target.session (it focuses that terminal); other targets open nothing",
       "kind": "mutation",
       "audit": "agent_only",
       "undo": "none",
       "scope": "global",
-      "executor": "ui",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -4299,12 +4089,11 @@
       }
     },
     "ui.pane.close": {
-      "summary": "Close a pane",
+      "summary": "Remove a pane from the shell model; the native client closes nothing",
       "kind": "mutation",
       "audit": "agent_only",
       "undo": "none",
       "scope": "global",
-      "executor": "ui",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -4318,12 +4107,11 @@
       }
     },
     "ui.pane.focus": {
-      "summary": "Focus a pane",
+      "summary": "Focus a pane in the shell model; the native client follows only when the pane has target.session",
       "kind": "mutation",
       "audit": "agent_only",
       "undo": "none",
       "scope": "global",
-      "executor": "ui",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -4337,12 +4125,11 @@
       }
     },
     "ui.pane.move": {
-      "summary": "Re-dock a pane",
+      "summary": "Reorder panes in the shell model; the native client does not move anything",
       "kind": "mutation",
       "audit": "agent_only",
       "undo": "none",
       "scope": "global",
-      "executor": "ui",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -4361,7 +4148,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -4380,7 +4166,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -4401,7 +4186,6 @@
       "audit": "agent_only",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -4422,7 +4206,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "project",
-      "executor": "core",
       "actors": "all",
       "doors": "all",
       "emits": [
@@ -4438,12 +4221,11 @@
       }
     },
     "ui.window.popout": {
-      "summary": "Pop a pane out to its own OS window",
+      "summary": "Record a pop-out window in the shell model; no OS window opens",
       "kind": "mutation",
       "audit": "agent_only",
       "undo": "none",
       "scope": "global",
-      "executor": "ui",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -4457,12 +4239,11 @@
       }
     },
     "ui.window.close": {
-      "summary": "Close a satellite window",
+      "summary": "Remove a pop-out window from the shell model",
       "kind": "mutation",
       "audit": "agent_only",
       "undo": "none",
       "scope": "global",
-      "executor": "ui",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -4476,12 +4257,11 @@
       }
     },
     "ui.window.list": {
-      "summary": "Windows",
+      "summary": "Windows in the shell model (main plus recorded pop-outs), not real OS windows",
       "kind": "query",
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "ui",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -4495,12 +4275,11 @@
       }
     },
     "ui.toast": {
-      "summary": "Show a toast",
+      "summary": "Show text in the native client's notice bar (emits ui.toast; level and ttl_ms are carried but ignored)",
       "kind": "mutation",
       "audit": "agent_only",
       "undo": "none",
       "scope": "global",
-      "executor": "ui",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -4519,7 +4298,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "ui",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -4538,7 +4316,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "ui",
       "actors": "all",
       "doors": "all",
       "emits": [],
@@ -4794,7 +4571,7 @@
         },
         "stream": {
           "type": "string",
-          "description": "`pty` | `logcat` | `log` (mirror is Tauri-channel only)."
+          "description": "`pty` | `logcat` | `mirror`, all on the socket door (BUS.md §7). `app.log.tail` declares\na `log` stream but sends no frames yet."
         },
         "session": {
           "type": [
@@ -4815,7 +4592,7 @@
             "null"
           ],
           "format": "int64",
-          "description": "Tauri-only mirror stream handle."
+          "description": "`mirror` only: which `device.mirror.start` this frame belongs to."
         },
         "epoch": {
           "type": [
@@ -4832,7 +4609,7 @@
           "minimum": 0
         },
         "data": {
-          "description": "base64 for `pty`; a line for `logcat`; a JSON record for `log`."
+          "description": "base64 for `pty`; a line for `logcat`; for `mirror`, a base64 video packet or a status\nobject (state, picture size, device, and the typed reason on the last one)."
         }
       },
       "required": [
@@ -4942,9 +4719,6 @@
         "scope": {
           "$ref": "#/$defs/Scope"
         },
-        "executor": {
-          "$ref": "#/$defs/Executor"
-        },
         "actors": {
           "$ref": "#/$defs/Actors"
         },
@@ -5010,7 +4784,6 @@
         "audit",
         "undo",
         "scope",
-        "executor",
         "actors",
         "doors",
         "emits",
@@ -5051,13 +4824,6 @@
         "session"
       ]
     },
-    "Executor": {
-      "type": "string",
-      "enum": [
-        "core",
-        "ui"
-      ]
-    },
     "Actors": {
       "oneOf": [
         {
@@ -5083,9 +4849,9 @@
       "type": "string",
       "enum": [
         "all",
-        "socket_only",
-        "tauri_only"
-      ]
+        "socket_only"
+      ],
+      "description": "Which doors carry an op. A `socket_only` op acts on the connection that sends it (a\nsubscriber, a wait), so the socket door answers it; the engine refuses it with `bus.door`."
     },
     "Callable": {
       "oneOf": [
@@ -5326,9 +5092,6 @@
         "socket_path": {
           "type": "string"
         },
-        "ui_connected": {
-          "type": "boolean"
-        },
         "sessions_live": {
           "type": "integer",
           "format": "int64"
@@ -5345,7 +5108,6 @@
         "uptime_s",
         "store_path",
         "socket_path",
-        "ui_connected",
         "sessions_live",
         "providers"
       ]

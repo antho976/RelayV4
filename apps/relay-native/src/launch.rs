@@ -1,5 +1,8 @@
 use super::*;
 
+/// The most agents one launch configures: the count keys offer 1 to 6.
+const AGENTS: usize = 6;
+
 fn choice_cards(control: &gtk::DropDown, choices: &[(&str, &str, &str)]) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 7);
     row.set_homogeneous(true);
@@ -135,6 +138,8 @@ struct Profile {
     task_search: gtk::SearchEntry,
     task_filter: gtk::DropDown,
     task_count: gtk::Label,
+    /// Whether the task cards were built: only once the agent is first shown.
+    filled: Cell<bool>,
     provider_cards: Vec<(gtk::ToggleButton, gtk::Label, gtk::Label)>,
 }
 impl Profile {
@@ -320,6 +325,7 @@ impl Profile {
             task_search,
             task_filter,
             task_count,
+            filled: Cell::new(false),
             provider_cards,
         })
     }
@@ -362,6 +368,127 @@ impl Profile {
     }
 }
 
+impl Profile {
+    /// Build this agent's task cards from the open tasks. Each agent gets its own, so they are
+    /// built only for an agent the user opens, once.
+    fn fill_tasks(self: &Rc<Self>, tasks: &[Value], preselect: Option<i64>) {
+        if self.filled.replace(true) {
+            return;
+        }
+        let profile = self;
+        let mut filters: Vec<(gtk::ToggleButton, String, String)> = Vec::new();
+        for (index, row) in tasks
+            .iter()
+            .filter(|t| text(t, "column") != "done")
+            .enumerate()
+        {
+            let id = row["id"].as_i64().unwrap_or(0);
+            let check = gtk::ToggleButton::new();
+            check.set_active(preselect == Some(id));
+            check.add_css_class("launch-task");
+            let card = gtk::Box::new(gtk::Orientation::Vertical, 5);
+            let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            line.append(&label(&format!("#{id}"), "mono"));
+            line.append(&label(&text(row, "column").replace('_', " "), "faint"));
+            card.append(&line);
+            let title = label(text(row, "title"), "body");
+            title.set_wrap(true);
+            title.set_max_width_chars(30);
+            card.append(&title);
+            let desc = label(text(row, "body"), "dim");
+            desc.set_wrap(true);
+            desc.set_lines(2);
+            desc.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            desc.set_max_width_chars(35);
+            card.append(&desc);
+            let overlay = gtk::Overlay::new();
+            overlay.set_child(Some(&card));
+            let mark = crate::icons::image("check", 12);
+            mark.add_css_class("launch-task-check");
+            mark.set_halign(gtk::Align::End);
+            mark.set_valign(gtk::Align::Start);
+            overlay.add_overlay(&mark);
+            check.set_child(Some(&overlay));
+            check.update_property(&[gtk::accessible::Property::Label(text(
+                row, "title",
+            ))]);
+            profile.task_box.attach(
+                &check,
+                (index % 2) as i32,
+                (index / 2) as i32,
+                1,
+                1,
+            );
+            filters.push((
+                check.clone(),
+                text(row, "column").to_owned(),
+                format!("#{id} {} {}", text(row, "title"), text(row, "body"))
+                    .to_lowercase(),
+            ));
+            profile.tasks.borrow_mut().push((id, check.clone()));
+            let weak = Rc::downgrade(profile);
+            check.connect_toggled(move |_| {
+                if let Some(p) = weak.upgrade() {
+                    p.task_count.set_text(&format!(
+                        "{} selected",
+                        p.selected_tasks().len()
+                    ));
+                }
+            });
+        }
+        profile
+            .task_count
+            .set_text(&format!("{} selected", profile.selected_tasks().len()));
+        let filter: Rc<dyn Fn()> = Rc::new({
+            let filters = filters.clone();
+            let search = profile.task_search.downgrade();
+            let column = profile.task_filter.downgrade();
+            let grid = profile.task_box.downgrade();
+            move || {
+                let (Some(search), Some(column), Some(grid)) =
+                    (search.upgrade(), column.upgrade(), grid.upgrade())
+                else {
+                    return;
+                };
+                for (check, _, _) in &filters {
+                    if check.parent().is_some() {
+                        grid.remove(check);
+                    }
+                }
+                let query = search.text().trim().to_lowercase();
+                let columns = ["", "backlog", "ready", "active", "in_review"];
+                let selected = columns[column.selected() as usize];
+                let mut index = 0;
+                for (check, column, content) in &filters {
+                    if (selected.is_empty() || selected == column)
+                        && (query.is_empty() || content.contains(&query))
+                    {
+                        grid.attach(check, index % 2, index / 2, 1, 1);
+                        index += 1;
+                    }
+                }
+            }
+        });
+        let f = filter.clone();
+        profile.task_search.connect_search_changed(move |_| f());
+        profile
+            .task_filter
+            .connect_selected_notify(move |_| filter());
+        if tasks.iter().all(|t| text(t, "column") == "done") {
+            profile.task_box.attach(
+                &label(
+                    "No open tasks. You can launch without an assignment.",
+                    "dim",
+                ),
+                0,
+                0,
+                2,
+                1,
+            );
+        }
+    }
+}
+
 impl Ui {
     pub fn show_launch(self: &Rc<Self>, task: Option<i64>) {
         if self.project.get() == 0 {
@@ -373,11 +500,35 @@ impl Ui {
             self.show_error("A launch is in progress. Allocated sessions will appear on the wall.");
             return;
         }
+        // Already open (Ctrl+N again): keep what the user has filled in.
+        if self.launch.reveals_child() {
+            self.launch_box.child_focus(gtk::DirectionType::TabForward);
+            return;
+        }
         if !self.dismiss_panels() {
             return;
         }
         clear(&self.launch_box);
         self.launch.set_reveal_child(true);
+        // The form holds a card per open task for every agent shown; once the sheet has
+        // finished hiding, however it was closed, nothing keeps it.
+        let hidden: Rc<Cell<Option<glib::SignalHandlerId>>> = Rc::default();
+        let id = {
+            let hidden = hidden.clone();
+            let launch_box = self.launch_box.downgrade();
+            self.launch.connect_child_revealed_notify(move |launch| {
+                if launch.is_child_revealed() || launch.reveals_child() {
+                    return;
+                }
+                if let Some(launch_box) = launch_box.upgrade() {
+                    clear(&launch_box);
+                }
+                if let Some(id) = hidden.take() {
+                    launch.disconnect(id);
+                }
+            })
+        };
+        hidden.set(Some(id));
         let heading = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         heading.add_css_class("launch-heading");
         let title = launch_heading(
@@ -441,7 +592,7 @@ impl Ui {
         }
         members.append(&members_title);
         body.append(&members);
-        let count = gtk::SpinButton::with_range(1.0, 11.0, 1.0);
+        let count = gtk::SpinButton::with_range(1.0, AGENTS as f64, 1.0);
         count.set_value(1.0);
         count.set_visible(false);
         members.append(&count);
@@ -462,7 +613,11 @@ impl Ui {
         members.append(&builders);
         let builder_keys = segments(&builders, &["1 builder", "2 builders"]);
         members.append(&builder_keys);
-        let profiles: Rc<Vec<_>> = Rc::new((0..11).map(|i| Profile::new(i, compact)).collect());
+        // Six solo agents at most; a review group uses the first three.
+        let profiles: Rc<Vec<_>> = Rc::new((0..AGENTS).map(|i| Profile::new(i, compact)).collect());
+        // The open tasks, once task.list answers; each agent's cards are built from them when
+        // the agent is first shown.
+        let open_tasks: Rc<RefCell<Option<Vec<Value>>>> = Rc::default();
         let stack = gtk::Stack::new();
         let selector = gtk::Box::new(gtk::Orientation::Horizontal, 5);
         selector.set_homogeneous(true);
@@ -536,10 +691,15 @@ impl Ui {
             }
             refresh();
             let stack = stack.downgrade();
+            let profile = Rc::downgrade(p);
+            let open_tasks = open_tasks.clone();
             key.connect_toggled(move |key| {
                 if key.is_active() {
                     if let Some(stack) = stack.upgrade() {
                         stack.set_visible_child_name(&format!("agent-{i}"));
+                    }
+                    if let (Some(profile), Some(tasks)) = (profile.upgrade(), open_tasks.borrow().as_ref()) {
+                        profile.fill_tasks(tasks, None);
                     }
                 }
             });
@@ -619,6 +779,8 @@ impl Ui {
         let form = heading.clone();
         let ui = self.clone();
         let p = profiles.clone();
+        let loaded = open_tasks.clone();
+        let shown = stack.downgrade();
         let status = progress.clone();
         let ready = start.clone();
         glib::spawn_future_local(async move {
@@ -636,7 +798,7 @@ impl Ui {
             match task_result {
                 Ok(v) => {
                     let tasks = rows(&v, "tasks");
-                    for (profile_index, profile) in p.iter().enumerate() {
+                    for profile in p.iter() {
                         for (i, (key, account, facts)) in profile.provider_cards.iter().enumerate()
                         {
                             let name = if i == 0 { "claude" } else { "codex" };
@@ -666,117 +828,14 @@ impl Ui {
                                 }
                             ));
                         }
-                        let mut filters: Vec<(gtk::ToggleButton, String, String)> = Vec::new();
-                        for (index, row) in tasks
-                            .iter()
-                            .filter(|t| text(t, "column") != "done")
-                            .enumerate()
-                        {
-                            let id = row["id"].as_i64().unwrap_or(0);
-                            let check = gtk::ToggleButton::new();
-                            check.set_active(profile_index == 0 && task == Some(id));
-                            check.add_css_class("launch-task");
-                            let card = gtk::Box::new(gtk::Orientation::Vertical, 5);
-                            let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-                            line.append(&label(&format!("#{id}"), "mono"));
-                            line.append(&label(&text(row, "column").replace('_', " "), "faint"));
-                            card.append(&line);
-                            let title = label(text(row, "title"), "body");
-                            title.set_wrap(true);
-                            title.set_max_width_chars(30);
-                            card.append(&title);
-                            let desc = label(text(row, "body"), "dim");
-                            desc.set_wrap(true);
-                            desc.set_lines(2);
-                            desc.set_ellipsize(gtk::pango::EllipsizeMode::End);
-                            desc.set_max_width_chars(35);
-                            card.append(&desc);
-                            let overlay = gtk::Overlay::new();
-                            overlay.set_child(Some(&card));
-                            let mark = crate::icons::image("check", 12);
-                            mark.add_css_class("launch-task-check");
-                            mark.set_halign(gtk::Align::End);
-                            mark.set_valign(gtk::Align::Start);
-                            overlay.add_overlay(&mark);
-                            check.set_child(Some(&overlay));
-                            check.update_property(&[gtk::accessible::Property::Label(text(
-                                row, "title",
-                            ))]);
-                            profile.task_box.attach(
-                                &check,
-                                (index % 2) as i32,
-                                (index / 2) as i32,
-                                1,
-                                1,
-                            );
-                            filters.push((
-                                check.clone(),
-                                text(row, "column").to_owned(),
-                                format!("#{id} {} {}", text(row, "title"), text(row, "body"))
-                                    .to_lowercase(),
-                            ));
-                            profile.tasks.borrow_mut().push((id, check.clone()));
-                            let weak = Rc::downgrade(profile);
-                            check.connect_toggled(move |_| {
-                                if let Some(p) = weak.upgrade() {
-                                    p.task_count.set_text(&format!(
-                                        "{} selected",
-                                        p.selected_tasks().len()
-                                    ));
-                                }
-                            });
-                        }
-                        profile
-                            .task_count
-                            .set_text(&format!("{} selected", profile.selected_tasks().len()));
-                        let filter: Rc<dyn Fn()> = Rc::new({
-                            let filters = filters.clone();
-                            let search = profile.task_search.downgrade();
-                            let column = profile.task_filter.downgrade();
-                            let grid = profile.task_box.downgrade();
-                            move || {
-                                let (Some(search), Some(column), Some(grid)) =
-                                    (search.upgrade(), column.upgrade(), grid.upgrade())
-                                else {
-                                    return;
-                                };
-                                for (check, _, _) in &filters {
-                                    if check.parent().is_some() {
-                                        grid.remove(check);
-                                    }
-                                }
-                                let query = search.text().trim().to_lowercase();
-                                let columns = ["", "backlog", "ready", "active", "in_review"];
-                                let selected = columns[column.selected() as usize];
-                                let mut index = 0;
-                                for (check, column, content) in &filters {
-                                    if (selected.is_empty() || selected == column)
-                                        && (query.is_empty() || content.contains(&query))
-                                    {
-                                        grid.attach(check, index % 2, index / 2, 1, 1);
-                                        index += 1;
-                                    }
-                                }
-                            }
-                        });
-                        let f = filter.clone();
-                        profile.task_search.connect_search_changed(move |_| f());
-                        profile
-                            .task_filter
-                            .connect_selected_notify(move |_| filter());
-                        if tasks.iter().all(|t| text(t, "column") == "done") {
-                            profile.task_box.attach(
-                                &label(
-                                    "No open tasks. You can launch without an assignment.",
-                                    "dim",
-                                ),
-                                0,
-                                0,
-                                2,
-                                1,
-                            );
-                        }
                     }
+                    // Agent 1 now, with the task the sheet was opened for; any other agent
+                    // when its key is first pressed.
+                    p[0].fill_tasks(&tasks, task);
+                    if let Some(index) = shown.upgrade().and_then(|s| s.visible_child_name()).and_then(|n| n.strip_prefix("agent-").and_then(|i| i.parse::<usize>().ok())) {
+                        p[index].fill_tasks(&tasks, None);
+                    }
+                    *loaded.borrow_mut() = Some(tasks);
                     status.set_text("Ready to launch");
                     ready.set_sensitive(true);
                 }
@@ -804,6 +863,10 @@ impl Ui {
             tracing::debug!(agents=placeholders.len(),elapsed_us=clicked.elapsed().as_micros() as u64,"launch: placeholders visible");
             glib::spawn_future_local(async move{
                 let mut touched:Vec<String>=placeholders.clone();
+                let agents=profiles_data.len();
+                // What the failure message can truthfully say: sessions that exist, and tasks
+                // that were meant for one of them but are not on its queue.
+                let mut created:Vec<String>=Vec::new();let mut unstaged:Vec<i64>=Vec::new();
                 let result=async{
                     // session.create refreshes new-branch refs before allocation.
                     let mut allocated: Vec<(Value, Vec<i64>, String)> = Vec::new();
@@ -813,11 +876,13 @@ impl Ui {
                         if group&&index>0{payload["pair_with"]=json!(text(&allocated[index-1].0,"name"));payload.as_object_mut().unwrap().remove("worktree");}
                         if let Some(task)=tasks.first(){payload["task_id"]=json!(task);}
                         let session=ui.call("session.create",payload).await?;
-                        ui.launch_adopt(&placeholders[index],&session,"Worktree ready · waiting to start…");touched.push(text(&session,"name").to_string());
+                        ui.launch_adopt(&placeholders[index],&session,"Worktree ready · waiting to start…");touched.push(text(&session,"name").to_string());created.push(text(&session,"name").to_string());
                         tracing::debug!(session=text(&session,"name"),elapsed_ms=clicked.elapsed().as_millis() as u64,"launch: session created");
+                        // Stage this agent's queue now, so a later agent's failure cannot cost it.
+                        unstaged.extend(&tasks);
+                        for task in &tasks{progress.set_text(&format!("Staging task #{task}"));ui.launch_progress(text(&session,"name"),&format!("Staging task #{task}…"));ui.call("task.dispatch",json!({"task_id":task,"session":session["name"],"start":false})).await?;unstaged.retain(|t|t!=task);}
                         allocated.push((session,tasks,prompt));
                     }
-                    for(session,tasks,_)in &allocated{for task in tasks{progress.set_text(&format!("Staging task #{task}"));ui.launch_progress(text(session,"name"),&format!("Staging task #{task}…"));ui.call("task.dispatch",json!({"task_id":task,"session":session["name"],"start":false})).await?;}}
                     // Start reviewers first so their mailbox is live before builders publish files.
                     allocated.sort_by_key(|(s,_,_)|text(s,"role")!="reviewer");
                     for(session,_,prompt)in allocated{
@@ -831,7 +896,12 @@ impl Ui {
                     Ok::<(),Error>(())
                 }.await;
                 ui.launch_abort(&touched);
-                if let Err(e)=result{ui.show_error(&format!("Launch incomplete: {e}. Created sessions and queues are preserved. Start the remaining sessions individually from the wall."));}
+                if let Err(e)=result{
+                    let mut message=if created.is_empty(){format!("Launch failed: {e}. No session was created.")}else{format!("Launch incomplete: {e}. Created {}; start them individually from the wall.",created.join(", "))};
+                    if !created.is_empty()&&created.len()<agents{message.push_str(&format!(" {} of {agents} agents were not created.",agents-created.len()));}
+                    if !unstaged.is_empty(){message.push_str(&format!(" Not queued: {}.",unstaged.iter().map(|t|format!("#{t}")).collect::<Vec<_>>().join(", ")));}
+                    ui.show_error(&message);
+                }
                 ui.launch_busy.set(false);ui.launch_box.set_sensitive(true);key.set_sensitive(true);ui.refresh();
             });
         });

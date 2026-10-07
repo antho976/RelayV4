@@ -81,11 +81,6 @@ async fn file_action(
     .await
 }
 pub async fn run(ui: &Rc<Ui>) -> Result<(), String> {
-    require(
-        std::env::var("RELAY_NATIVE_FIXTURE").as_deref() == Ok("1")
-            && std::env::var("RELAY_INSTANCE").as_deref() == Ok("test"),
-        "Project smoke requires isolated test fixture",
-    )?;
     let project = ui.project.get();
     require(project > 0, "Fixture project ready")?;
     let viewport = ui.window.width();
@@ -266,11 +261,6 @@ fn terminals(root: &impl IsA<gtk::Widget>, found: &mut Vec<vte4::Terminal>) {
 }
 pub async fn profile_lifecycle(ui: &Rc<Ui>) -> Result<(), String> {
     use vte4::prelude::TerminalExt;
-    require(
-        std::env::var("RELAY_NATIVE_FIXTURE").as_deref() == Ok("1")
-            && std::env::var("RELAY_INSTANCE").as_deref() == Ok("test"),
-        "Terminal profile requires isolated fixture",
-    )?;
     ui.navigate("agents");
     let mut results = Vec::new();
     for _ in 0..5 {
