@@ -43,7 +43,7 @@ payload!(#[schemars(rename = "GitDiffFileIn")] DiffFileIn {
 });
 result!(#[schemars(rename = "GitDiffFileOut")] DiffFileOut { pub old: String, pub new: String, pub hunks: Vec<Hunk> });
 op!(DiffFileOp, "git.diff.file", DiffFileIn => DiffFileOut, OpMeta::query(Scope::Project, 8, "One file's old/new text and hunks (for @codemirror/merge)"));
-payload!(#[schemars(rename = "GitLogIn")] LogIn { pub project_id: Id, pub worktree: Option<String>, pub branch: Option<String>, pub limit: Option<u32>, pub graph: Option<bool> });
+payload!(#[schemars(rename = "GitLogIn")] LogIn { pub project_id: Id, pub worktree: Option<String>, pub branch: Option<String>, pub limit: Option<u32> });
 result!(#[schemars(rename = "GitLogOut")] LogOut { pub commits: Vec<Commit> });
 op!(Log, "git.log", LogIn => LogOut, OpMeta::query(Scope::Project, 8, "History"));
 payload!(#[schemars(rename = "GitShowIn")] ShowIn { pub project_id: Id, pub sha: String });
