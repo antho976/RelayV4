@@ -676,7 +676,6 @@
       "audit": "always",
       "undo": "inverse",
       "scope": "project",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
@@ -697,7 +696,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [],
@@ -716,7 +714,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [],
@@ -735,7 +732,6 @@
       "audit": "always",
       "undo": "none",
       "scope": "global",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [
