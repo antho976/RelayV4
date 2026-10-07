@@ -2862,7 +2862,7 @@
       }
     },
     "git.pr.list": {
-      "summary": "All pull request states for the project, across every page",
+      "summary": "All pull request states for the project, across every page; cached for a minute unless refresh",
       "kind": "query",
       "audit": "never",
       "undo": "none",
@@ -2874,7 +2874,7 @@
       "since": "1.0",
       "phase": 8,
       "payload": {
-        "$ref": "#/$defs/GitProjectIn"
+        "$ref": "#/$defs/GitPrListIn"
       },
       "result": {
         "$ref": "#/$defs/GitPrListOut"
@@ -11732,6 +11732,26 @@
             "boolean",
             "null"
           ]
+        }
+      },
+      "required": [
+        "project_id"
+      ]
+    },
+    "GitPrListIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "project_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "refresh": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Ask GitHub now instead of answering from the last listing (kept up to a minute, and\ndropped by `git.push` and `git.pr.open`). For an explicit refresh, not for every redraw."
         }
       },
       "required": [

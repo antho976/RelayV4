@@ -81,6 +81,35 @@ pub fn list_with_owners(
 
 /// How long the paginated GitHub lookup may take before Relay stops waiting on the network.
 const PR_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long one listing answers `git.pr.list` for a repository. The Source Control panel asks
+/// on every refresh, which while agents work is about once a second; every page of every PR
+/// the repository ever had, each time, spends the user's GitHub REST quota (D130).
+const PR_LIST_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+/// `gh pr create` makes several GitHub round trips. Under the desktop client's 30 s request
+/// timeout, so the engine reports a timeout before the client gives up on its own.
+const PR_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
+
+type PrCache = std::collections::HashMap<PathBuf, (std::time::Instant, PrListOut)>;
+static PR_LISTS: std::sync::Mutex<Option<PrCache>> = std::sync::Mutex::new(None);
+
+fn cached_prs(repo: &Path) -> Option<PrListOut> {
+    let cache = PR_LISTS.lock().unwrap_or_else(|p| p.into_inner());
+    cache.as_ref()?.get(repo).filter(|(at, _)| at.elapsed() < PR_LIST_TTL).map(|(_, listed)| listed.clone())
+}
+
+fn remember_prs(repo: &Path, listed: &PrListOut) {
+    let mut cache = PR_LISTS.lock().unwrap_or_else(|p| p.into_inner());
+    let cache = cache.get_or_insert_with(Default::default);
+    cache.retain(|_, (at, _)| at.elapsed() < PR_LIST_TTL);
+    cache.insert(repo.to_path_buf(), (std::time::Instant::now(), listed.clone()));
+}
+
+/// A push or a new PR changes what GitHub would say; the next listing asks again.
+fn forget_prs(repo: &Path) {
+    if let Some(cache) = PR_LISTS.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+        cache.remove(repo);
+    }
+}
 
 pub fn register(e: &mut Engine) {
     e.register_unlocked::<WorktreeList>(|ctx, p| {
@@ -615,6 +644,7 @@ pub fn register(e: &mut Engine) {
                 vec!["push"]
             };
             worktree::git_mutate(&root, &args).map_err(git_mutation("git.push_failed"))?;
+            forget_prs(Path::new(&project.path));
             Ok((project, root))
         },
         |ctx: &mut Ctx, _p, (project, root)| {
@@ -624,8 +654,15 @@ pub fn register(e: &mut Engine) {
     );
     e.register_unlocked::<PrList>(|ctx, p| {
         let project = ctx.read(|conn| get_project(conn, p.project_id))?;
+        let repo = Path::new(&project.path);
+        if !p.refresh.unwrap_or(false) {
+            if let Some(listed) = cached_prs(repo) {
+                return Ok(listed);
+            }
+        }
         let gh = crate::github::gh_path()?;
-        let listed = list_pull_requests(&gh, Path::new(&project.path))?;
+        let listed = list_pull_requests(&gh, repo)?;
+        remember_prs(repo, &listed);
         // A PR merged for a branch a closed session left behind: clean that branch up now
         // rather than at the next sweep (branch_cleanup).
         let merged: Vec<String> = listed.pull_requests.iter()
@@ -635,6 +672,12 @@ pub fn register(e: &mut Engine) {
                 let (candidates, _) = crate::branch_cleanup::candidates(conn, Some(project.id), Some(&merged))?;
                 Ok(candidates.into_iter().map(|candidate| candidate.branch).collect())
             })?;
+            // Closed rows keep their branch name forever; only a branch that still exists is
+            // anything to clean up, or every listing would start another cleanup for it.
+            let local = gix::open(repo).ok();
+            let leftover: Vec<String> = leftover.into_iter()
+                .filter(|branch| local.as_ref().is_some_and(|repo| repo.find_reference(format!("refs/heads/{branch}").as_str()).is_ok()))
+                .collect();
             if !leftover.is_empty() && ctx.engine().instance != crate::Instance::Test {
                 let project_id = project.id;
                 ctx.after_commit(move |engine| crate::branch_cleanup::after_merged_prs(engine, project_id, leftover));
@@ -663,33 +706,41 @@ pub fn register(e: &mut Engine) {
             Ok(BranchCleanupOut { branches: rows })
         },
     );
-    e.register::<PrOpen>(|ctx: &mut Ctx, p| {
-        let (project, root) = resolve_root(ctx, p.project_id, p.worktree.as_deref())?;
-        let gh = crate::github::gh_path()?;
-        let mut cmd = std::process::Command::new(gh);
-        cmd.current_dir(&root).args(["pr", "create"]);
-        if let Some(title) = &p.title {
-            cmd.args(["--title", title]);
-        }
-        if let Some(body) = &p.body {
-            cmd.args(["--body", body]);
-        } else {
-            cmd.arg("--fill");
-        }
-        let out = cmd
-            .output()
-            .map_err(|e| BusError::unavailable("git.gh_unavailable", e.to_string()))?;
-        if !out.status.success() {
-            return Err(BusError::conflict(
-                "git.pr_failed",
-                String::from_utf8_lossy(&out.stderr).trim().to_string(),
-            ));
-        }
-        changed(ctx, project.id, &root);
-        Ok(PrOpenOut {
-            url: String::from_utf8_lossy(&out.stdout).trim().to_string(),
-        })
-    });
+    // `gh pr create` is GitHub round trips: never under the store lock, never unbounded.
+    e.register_staged::<PrOpen, _>(
+        |ctx, p| {
+            let (project, root) = resolve_root_unlocked(ctx, p.project_id, p.worktree.as_deref())?;
+            let gh = crate::github::gh_path()?;
+            let mut cmd = std::process::Command::new(gh);
+            cmd.current_dir(&root).env("GH_PROMPT_DISABLED", "1").args(["pr", "create"]);
+            if let Some(title) = &p.title {
+                cmd.args(["--title", title]);
+            }
+            if let Some(body) = &p.body {
+                cmd.args(["--body", body]);
+            } else {
+                cmd.arg("--fill");
+            }
+            let out = crate::proc::output_with_timeout(&mut cmd, PR_OPEN_TIMEOUT)
+                .map_err(|e| BusError::unavailable("git.gh_unavailable", e.to_string()))?
+                .ok_or_else(|| BusError::unavailable(
+                    "git.pr_timeout",
+                    format!("gh did not finish within {}s; the pull request may or may not have been opened", PR_OPEN_TIMEOUT.as_secs()),
+                ).with_hint("check GitHub, or retry: gh refuses a second pull request for the same branch"))?;
+            forget_prs(Path::new(&project.path));
+            if !out.status.success() {
+                return Err(BusError::conflict(
+                    "git.pr_failed",
+                    String::from_utf8_lossy(&out.stderr).trim().to_string(),
+                ));
+            }
+            Ok((project, root, String::from_utf8_lossy(&out.stdout).trim().to_string()))
+        },
+        |ctx: &mut Ctx, _p, (project, root, url)| {
+            changed(ctx, project.id, &root);
+            Ok(PrOpenOut { url })
+        },
+    );
     e.register::<CleanMerged>(|ctx: &mut Ctx, p| {
         let project = get_project(ctx.tx(), p.project_id)?;
         let branches = branches_for(ctx.tx(), &project)?;
@@ -1559,6 +1610,19 @@ mod tests {
         )
         .unwrap();
         assert!(list_pull_requests(&gh, dir.path()).is_err());
+    }
+
+    #[test]
+    fn pull_request_listings_are_reused_until_a_push_or_new_pr() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        assert!(cached_prs(repo).is_none());
+        let listed = PrListOut { pull_requests: Vec::new(), complete: true };
+        remember_prs(repo, &listed);
+        assert_eq!(cached_prs(repo), Some(listed));
+        assert!(cached_prs(&repo.join("other")).is_none(), "a listing answers only its own repository");
+        forget_prs(repo);
+        assert!(cached_prs(repo).is_none());
     }
 
     fn git(root: &Path, args: &[&str]) -> String {

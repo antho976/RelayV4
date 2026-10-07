@@ -105,7 +105,13 @@ result!(#[schemars(rename = "GitPullRequest")] PullRequest {
     pub same_repository: bool,
 });
 result!(#[schemars(rename = "GitPrListOut")] PrListOut { pub pull_requests: Vec<PullRequest>, pub complete: bool });
-op!(PrList, "git.pr.list", ProjectIn => PrListOut, OpMeta::query(Scope::Project, 8, "All pull request states for the project, across every page"));
+payload!(#[schemars(rename = "GitPrListIn")] PrListIn {
+    pub project_id: Id,
+    /// Ask GitHub now instead of answering from the last listing (kept up to a minute, and
+    /// dropped by `git.push` and `git.pr.open`). For an explicit refresh, not for every redraw.
+    pub refresh: Option<bool>,
+});
+op!(PrList, "git.pr.list", PrListIn => PrListOut, OpMeta::query(Scope::Project, 8, "All pull request states for the project, across every page; cached for a minute unless refresh"));
 payload!(#[schemars(rename = "GitPrOpenIn")] PrOpenIn { pub project_id: Id, pub worktree: Option<String>, pub title: Option<String>, pub body: Option<String> });
 result!(#[schemars(rename = "GitPrOpenOut")] PrOpenOut { pub url: String });
 op!(PrOpen, "git.pr.open", PrOpenIn => PrOpenOut, OpMeta::mutation(Scope::Project, 8, "Open a PR for the branch"));

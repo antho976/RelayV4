@@ -829,8 +829,8 @@ Provider-neutral Markdown; the same for both providers.
 | `git.commit` | mutation · always | `{ project_id, worktree?, message, all?: bool }` → `{ sha }` — caps and protected paths apply |
 | `git.fetch` | mutation · agent_only | `{ project_id }` → `{ ahead, behind }` |
 | `git.push` | mutation · always | `{ project_id, worktree?, set_upstream? = auto }` → `{}` — a branch without an upstream is first-pushed as `git push -u origin <branch>`; explicit `false` keeps plain-push behavior |
-| `git.pr.list` | query | `{ project_id }` → `{ pull_requests: { number, branch, draft, url, title }[] }` — open GitHub PRs reported by the authenticated `gh` CLI |
-| `git.pr.open` | mutation · always | `{ project_id, worktree?, title?, body? }` → `{ url }` |
+| `git.pr.list` | query | `{ project_id, refresh? }` → `{ pull_requests: { number, branch, draft, url, title }[] }` — GitHub PRs reported by the authenticated `gh` CLI. One listing answers for a minute per repository (D130: redraws must not repeat the network request); `refresh` asks GitHub now, and `git.push` / `git.pr.open` drop the cached one |
+| `git.pr.open` | mutation · always | `{ project_id, worktree?, title?, body? }` → `{ url }` — `gh pr create` runs before the store lock, with a 25 s deadline; `git.pr_timeout` means the outcome is unknown |
 | `git.branch.clean_merged` | mutation · always | `{ project_id, dry_run? }` → `{ deleted: string[] }` — never touches branches with a live/parked session |
 | `git.suggest_message` | query | `{ project_id, worktree? }` → `{ message }` — heuristic subject from the diff |
 | `integration.request` | mutation · always | `{ project_id, sessions: string[] \| branches: string[], build?: bool = true, deploy?: DeviceRef }` → `Integration` (state `queued`; results via `integration.result` events) |
