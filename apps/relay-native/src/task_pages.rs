@@ -174,6 +174,16 @@ impl Draft {
             self.cleanup();
         }
     }
+    /// Drops the edits and an unsent message together, so the close that follows cannot be
+    /// refused and the base is never moved under a draft that stays open.
+    fn discard(&self) {
+        if self.busy.get() {
+            return;
+        }
+        *self.base.borrow_mut() = (self.snapshot)();
+        self.unsent_message.set(false);
+        self.close();
+    }
     pub fn dirty(&self) -> bool {
         let current = (self.snapshot)();
         current
@@ -198,12 +208,7 @@ impl Draft {
         close.connect_clicked(move |_| d.close());
         let d = self.clone();
         let pending = self.clone();
-        crate::app::confirm_inline_if(&discard, "Confirm discard", move || pending.dirty() || pending.unsent_message.get(), move |_| {
-            if !d.busy.get() {
-                *d.base.borrow_mut() = (d.snapshot)();
-                d.close();
-            }
-        });
+        crate::app::confirm_inline_if(&discard, "Confirm discard", move || pending.dirty() || pending.unsent_message.get(), move |_| d.discard());
         let d = self.clone();
         let weak = Rc::downgrade(ui);
         save.connect_clicked(move |_| {
@@ -525,32 +530,71 @@ pub fn compose(ui: &Rc<Ui>, project: i64) {
     panel.present();
 }
 
+thread_local! {
+    /// Bumped by every open: only the newest open still in flight may present its detail.
+    static OPEN_SERIAL: Cell<u64> = const { Cell::new(0) };
+    /// Task details on screen, so opening one again shows it instead of stacking a second.
+    static OPEN_DETAILS: RefCell<Vec<(i64, std::rc::Weak<Draft>)>> = const { RefCell::new(Vec::new()) };
+}
+fn open_detail(id: i64) -> Option<Rc<Draft>> {
+    OPEN_DETAILS.with(|open| {
+        open.borrow_mut().retain(|(_, d)| d.strong_count() > 0);
+        open.borrow().iter().find(|(task, _)| *task == id).and_then(|(_, d)| d.upgrade())
+    })
+}
 pub fn open(ui: &Rc<Ui>, id: i64) {
+    if let Some(d) = open_detail(id) {
+        return d.present();
+    }
+    let serial = OPEN_SERIAL.with(|s| { s.set(s.get() + 1); s.get() });
+    let (project, page) = (ui.project.get(), ui.page.borrow().clone());
     let ui = ui.clone();
     glib::spawn_future_local(async move {
-        match ui.call("task.get", json!({"task_id":id})).await {
-            Ok(task) => {
-                let project = task["project_id"].as_i64().unwrap_or(0);
-                // Completed modules too: a task keeps its module after the module is completed,
-                // and a combo that cannot show it reads as an edit and Save would unassign it.
-                let modules = match ui
-                    .call("module.list", json!({"project_id":project,"include_archived":true}))
-                    .await
-                {
-                    Ok(modules) => modules,
-                    Err(e) => return ui.show_error(&format!("Could not load modules: {e}")),
-                };
-                let tasks = ui
-                    .call("task.list", json!({"project_id":project}))
-                    .await
-                    .unwrap_or(Value::Null);
-                detail(&ui, task, rows(&modules, "modules"), rows(&tasks, "tasks"));
+        // The task almost always belongs to the project on screen, so its lists are asked for
+        // alongside it; only a task from another project waits for a second pair.
+        // Completed modules too: a task keeps its module after the module is completed,
+        // and a combo that cannot show it reads as an edit and Save would unassign it.
+        let (task, mut modules, mut tasks) = tokio::join!(
+            ui.call("task.get", json!({"task_id":id})),
+            ui.call("module.list", json!({"project_id":project,"include_archived":true})),
+            ui.call("task.list", json!({"project_id":project}))
+        );
+        if let Ok(task) = &task {
+            let owner = task["project_id"].as_i64().unwrap_or(0);
+            if owner != project {
+                (modules, tasks) = tokio::join!(
+                    ui.call("module.list", json!({"project_id":owner,"include_archived":true})),
+                    ui.call("task.list", json!({"project_id":owner}))
+                );
             }
-            Err(e) => ui.show_error(&e.to_string()),
         }
+        // A later open, or a move to another page or project, makes this one stale: presenting
+        // it now would cover (and disable) whatever the user went on to.
+        let current = OPEN_SERIAL.with(|s| s.get()) == serial;
+        if !current || ui.project.get() != project || *ui.page.borrow() != page {
+            return;
+        }
+        if let Some(d) = open_detail(id) {
+            return d.present();
+        }
+        let task = match task {
+            Ok(task) => task,
+            Err(e) => return ui.show_error(&e.to_string()),
+        };
+        let modules = match modules {
+            Ok(modules) => modules,
+            Err(e) => return ui.show_error(&format!("Could not load modules: {e}")),
+        };
+        detail(&ui, task, rows(&modules, "modules"), tasks.map(|tasks| rows(&tasks, "tasks")).map_err(|e| e.to_string()));
     });
 }
-fn detail(ui: &Rc<Ui>, task: Value, modules: Vec<Value>, tasks: Vec<Value>) {
+fn detail(ui: &Rc<Ui>, task: Value, modules: Vec<Value>, tasks: Result<Vec<Value>, String>) {
+    // Without the project's tasks the parent and link choices would be empty, and an empty
+    // parent choice reads as "Root task": say so, and keep those rows from acting.
+    let (tasks, tasks_error) = match tasks {
+        Ok(tasks) => (tasks, None),
+        Err(e) => (Vec::new(), Some(e)),
+    };
     let id = task["id"].as_i64().unwrap_or(0);
     let project = task["project_id"].as_i64().unwrap_or(0);
     let form = gtk::Box::new(gtk::Orientation::Vertical, 8);
@@ -628,6 +672,11 @@ fn detail(ui: &Rc<Ui>, task: Value, modules: Vec<Value>, tasks: Vec<Value>) {
     );
     let d = Draft::new(ui, &format!("Task #{id}"), task.clone(), snapshot, form);
     d.controls(ui, "task.update", "task_id", id);
+    OPEN_DETAILS.with(|open| open.borrow_mut().push((id, Rc::downgrade(&d))));
+    if let Some(panel) = &d.panel {
+        let weak = Rc::downgrade(&d);
+        panel.on_closed(move || OPEN_DETAILS.with(|open| open.borrow_mut().retain(|(_, d)| !d.ptr_eq(&weak))));
+    }
     let transitions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     transitions.append(&label(
         &format!("{} · {}", text(&task, "column"), text(&task, "state")),
@@ -742,17 +791,15 @@ fn detail(ui: &Rc<Ui>, task: Value, modules: Vec<Value>, tasks: Vec<Value>) {
     d.form.append(&row);
     d.form
         .append(&label("Subtasks & dependencies", "section-label"));
-    for child in tasks.iter().filter(|t| t["parent_id"] == id) {
+    // The task names its own children; the project list only adds their titles.
+    for child_id in rows(&task, "children").iter().filter_map(Value::as_i64) {
         let key = button(
-            &format!(
-                "#{}  {}  · {}",
-                child["id"],
-                text(child, "title"),
-                text(child, "column")
-            ),
+            &match tasks.iter().find(|t| t["id"] == child_id) {
+                Some(child) => format!("#{child_id}  {}  · {}", text(child, "title"), text(child, "column")),
+                None => format!("#{child_id}"),
+            },
             "quiet",
         );
-        let child_id = child["id"].as_i64().unwrap_or(0);
         let weak = Rc::downgrade(ui);
         key.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
@@ -788,6 +835,10 @@ fn detail(ui: &Rc<Ui>, task: Value, modules: Vec<Value>, tasks: Vec<Value>) {
             &format!("#{} {}", task["id"], text(task, "title")),
         );
     }
+    if let Some(pid) = task["parent_id"].as_i64().filter(|pid| !tasks.iter().any(|t| t["id"] == *pid)) {
+        parent.append(Some(&pid.to_string()), &format!("#{pid}"));
+    }
+    row.set_sensitive(tasks_error.is_none());
     parent.set_active_id(Some(
         &task["parent_id"]
             .as_i64()
@@ -835,23 +886,37 @@ fn detail(ui: &Rc<Ui>, task: Value, modules: Vec<Value>, tasks: Vec<Value>) {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     let relation = choose(&["blocked_by", "duplicate_of"], "blocked_by");
     let other = gtk::ComboBoxText::new();
+    other.append(Some(""), "Choose a task");
     for t in tasks.iter().filter(|t| t["id"] != id) {
         other.append(
             Some(&t["id"].to_string()),
             &format!("#{} {}", t["id"], text(t, "title")),
         );
     }
+    other.set_active(Some(0));
     row.append(&relation);
     row.append(&other);
+    let choice = other.clone();
     action(
         ui,
         &d,
         &row,
         "Link",
         "task.relate",
-        move || json!({"task_id":id,"relation":chosen(&relation),"other_id":chosen(&other).parse::<i64>().unwrap_or(0)}),
+        move || json!({"task_id":id,"relation":chosen(&relation),"other_id":chosen(&choice).parse::<i64>().ok()}),
         Some(id),
     );
+    // Link stays off until a task is chosen. Weak: the key's handler already holds the combo.
+    if let Some(link) = row.last_child() {
+        link.set_sensitive(false);
+        let link = link.downgrade();
+        other.connect_changed(move |other| {
+            if let Some(link) = link.upgrade() {
+                link.set_sensitive(!chosen(other).is_empty());
+            }
+        });
+    }
+    row.set_sensitive(tasks_error.is_none());
     d.form.append(&row);
     d.form
         .append(&label("Commits & attachments", "section-label"));
@@ -988,7 +1053,16 @@ fn detail(ui: &Rc<Ui>, task: Value, modules: Vec<Value>, tasks: Vec<Value>) {
     d.form.append(&d.status);
     d.form.append(&tabs);
     d.form.append(&sections);
-    task_activity(ui, &d, id, project, &messages, &history);
+    // Messages and history load when one of their tabs is first shown, not with every open.
+    let refresh = task_activity(ui, &d, id, project, &messages, &history).downgrade();
+    let loaded = Cell::new(false);
+    sections.connect_visible_child_name_notify(move |sections| {
+        if sections.visible_child_name().is_some_and(|name| name != "info") && !loaded.replace(true) {
+            if let Some(refresh) = refresh.upgrade() {
+                refresh.emit_clicked();
+            }
+        }
+    });
     if let Some(scroll) = d.layout.first_child().and_downcast::<gtk::ScrolledWindow>() {
         scroll.set_child(gtk::Widget::NONE);
         d.layout.remove(&scroll);
@@ -1012,6 +1086,9 @@ fn detail(ui: &Rc<Ui>, task: Value, modules: Vec<Value>, tasks: Vec<Value>) {
             }
         });
     }
+    if let Some(e) = tasks_error {
+        d.status.set_text(&format!("Could not load the project's tasks: {e}. Subtask titles, Set parent and Link are unavailable."));
+    }
     d.present();
 }
 // Auxiliary changes never invalidate an unsaved editor. Successful actions reopen
@@ -1023,7 +1100,7 @@ fn task_activity(
     project: i64,
     messages: &gtk::Box,
     history: &gtk::Box,
-) {
+) -> gtk::Button {
     let compose = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     let recipient = gtk::ComboBoxText::new();
     recipient.append(Some(""), "Choose an agent");
@@ -1065,10 +1142,19 @@ fn task_activity(
     history.append(&more);
     let message_more = button("Load older messages", "quiet");
     messages.append(&message_more);
+    // Shown once the first load says there is more.
+    more.set_visible(false);
+    message_more.set_visible(false);
     let cursors = Rc::new(RefCell::new((None::<i64>, None::<i64>)));
     let loading = Rc::new(Cell::new(false));
-    for (button, reset) in [(&refresh, true), (&more, false), (&message_more, false)] {
+    // A refresh asked for while a page loads (a message just sent) runs when that load ends.
+    let pending = Rc::new(Cell::new(false));
+    // Each "older" key pages its own stream: a cursor of 0 asks the other stream for nothing.
+    for (button, older_history, older_messages) in [(&refresh, true, true), (&more, true, false), (&message_more, false, true)] {
+        let reset = older_history && older_messages;
         let weak = Rc::downgrade(ui);
+        let refresh = refresh.downgrade();
+        let pending = pending.clone();
         let messages = message_rows.downgrade();
         let history = history_rows.downgrade();
         let notice = notice.downgrade();
@@ -1079,22 +1165,23 @@ fn task_activity(
         button.connect_clicked(move |_| {
             let (Some(ui),Some(messages),Some(history),Some(notice),Some(more),Some(message_more)) =
                 (weak.upgrade(),messages.upgrade(),history.upgrade(),notice.upgrade(),more.upgrade(),message_more.upgrade()) else { return; };
-            if loading.replace(true) { return; }
-            let (audit, message) = if reset { (None,None) } else { *cursors.borrow() };
+            if loading.replace(true) { if reset { pending.set(true); } return; }
+            let (audit, message) = match (reset, older_history) { (true, _) => (None,None), (false, true) => (cursors.borrow().0, Some(0)), (false, false) => (Some(0), cursors.borrow().1) };
             let cursors = cursors.clone();
             let loading = loading.clone();
+            let (refresh, pending) = (refresh.clone(), pending.clone());
             glib::spawn_future_local(async move {
                 match ui.call("task.activity",json!({"task_id":id,"before_audit":audit,"before_message":message,"limit":100})).await {
                     Ok(data) => {
                         if reset { clear(&messages); clear(&history); }
-                        for message in rows(&data,"messages") {
+                        for message in rows(&data,"messages").into_iter().filter(|_| older_messages) {
                             let row = gtk::Box::new(gtk::Orientation::Vertical, 4);
                             row.add_css_class("task-activity-row");
                             row.append(&label(&format!("{} → {} · {}",text(&message,"from"),text(&message,"to"),text(&message,"sent_at")),"dim"));
                             row.append(&paragraph(text(&message,"text")));
                             messages.append(&row);
                         }
-                        for event in rows(&data,"history") {
+                        for event in rows(&data,"history").into_iter().filter(|_| older_history) {
                             let row = gtk::Box::new(gtk::Orientation::Vertical, 4);
                             row.add_css_class("task-activity-row");
                             let old = event["undo_op"]["payload"]["column"].as_str();
@@ -1108,14 +1195,17 @@ fn task_activity(
                         if reset && history.first_child().is_none() { history.append(&label("No recorded activity.","dim")); }
                         let next_audit = data["next_audit"].as_i64();
                         let next_message = data["next_message"].as_i64();
-                        *cursors.borrow_mut() = (Some(next_audit.unwrap_or(0)),Some(next_message.unwrap_or(0)));
-                        more.set_visible(next_audit.is_some());
-                        message_more.set_visible(next_message.is_some());
+                        let mut cursors = cursors.borrow_mut();
+                        if older_history { cursors.0 = Some(next_audit.unwrap_or(0)); more.set_visible(next_audit.is_some()); }
+                        if older_messages { cursors.1 = Some(next_message.unwrap_or(0)); message_more.set_visible(next_message.is_some()); }
                         notice.set_text("Messages are explicitly linked to this task.");
                     }
                     Err(error) => notice.set_text(&error.to_string()),
                 }
                 loading.set(false);
+                if pending.replace(false) {
+                    if let Some(refresh) = refresh.upgrade() { refresh.emit_clicked(); }
+                }
             });
         });
     }
@@ -1162,7 +1252,7 @@ fn task_activity(
             text_input.set_sensitive(true);
         });
     });
-    refresh.emit_clicked();
+    refresh
 }
 
 pub fn action(
@@ -1173,6 +1263,22 @@ pub fn action(
     op: &'static str,
     payload: impl Fn() -> Value + 'static,
     reopen: Option<i64>,
+) {
+    let reopen = reopen.map(|id| Rc::new(move |ui: &Rc<Ui>| open(ui, id)) as Reopen);
+    action_then(ui, d, row, caption, op, payload, reopen);
+}
+
+pub type Reopen = Rc<dyn Fn(&Rc<Ui>)>;
+/// `action`, reopening any editor afterwards: a module editor's "Add task" passes its own
+/// opener so the editor comes back with the new task listed.
+pub fn action_then(
+    ui: &Rc<Ui>,
+    d: &Rc<Draft>,
+    row: &gtk::Box,
+    caption: &str,
+    op: &'static str,
+    payload: impl Fn() -> Value + 'static,
+    reopen: Option<Reopen>,
 ) {
     let key = button(caption, "quiet");
     row.append(&key);
@@ -1195,14 +1301,15 @@ pub fn action(
         d.footer.set_sensitive(false);
         let payload = payload();
         let d = d.clone();
+        let reopen = reopen.clone();
         glib::spawn_future_local(async move {
             match ui.call(op, payload).await {
                 Ok(_) => {
                     d.busy.set(false);
                     d.close();
                     ui.refresh_page();
-                    if let Some(id) = reopen {
-                        open(&ui, id)
+                    if let Some(reopen) = reopen {
+                        reopen(&ui)
                     }
                 }
                 Err(e) => {

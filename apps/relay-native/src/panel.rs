@@ -105,6 +105,13 @@ impl Panel {
         keys.connect_key_pressed(move |_, key, _, modifiers| {
             if matches!(key, gtk::gdk::Key::Tab | gtk::gdk::Key::ISO_Left_Tab) {
                 if let Some(panel) = weak.upgrade() {
+                    // An editable text area that takes Tab types it; Ctrl+Tab still leaves it.
+                    let typing = !modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK)
+                        && panel.frame.root().and_then(|root| root.focus()).and_downcast::<gtk::TextView>()
+                            .is_some_and(|view| view.accepts_tab() && view.is_editable());
+                    if typing {
+                        return glib::Propagation::Proceed;
+                    }
                     let direction = if modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
                         gtk::DirectionType::TabBackward
                     } else {

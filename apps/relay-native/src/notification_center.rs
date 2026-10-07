@@ -14,7 +14,13 @@ struct Center {
     list: gtk::Box,
     summary: gtk::Label,
     mark_all: gtk::Button,
-    revision: Cell<u64>,
+    /// A notify.list is in flight, and whether a change since means it must run once more.
+    loading: Cell<bool>,
+    stale: Cell<bool>,
+    /// Unread notifications as the bell counts them, which reach past the newest 100 listed
+    /// here, and how many rows the list shows and how many of those are unread.
+    unread: Cell<usize>,
+    listed: Cell<(usize, usize)>,
     /// When the popover last closed. A press on the bell that closes an open popover reaches
     /// the bell too; without this it would open the popover again at once.
     closed_at: Cell<i64>,
@@ -66,7 +72,10 @@ pub(super) fn install(ui: &Rc<Ui>, key: &gtk::Button) {
         list,
         summary,
         mark_all,
-        revision: Cell::new(0),
+        loading: Cell::new(false),
+        stale: Cell::new(false),
+        unread: Cell::new(0),
+        listed: Cell::new((0, 0)),
         closed_at: Cell::new(0),
     });
     let weak = Rc::downgrade(&center);
@@ -80,12 +89,12 @@ pub(super) fn install(ui: &Rc<Ui>, key: &gtk::Button) {
         let Some(center) = weak.upgrade() else { return };
         let Some(ui) = center.ui.upgrade() else { return };
         key.set_sensitive(false);
+        // Its notify.changed event reloads the list and the bell.
         glib::spawn_future_local(async move {
             if let Err(e) = ui.call("notify.ack_all", json!({})).await {
                 ui.show_error(&e.to_string());
+                center.load();
             }
-            ui.refresh_notification_count();
-            center.load();
         });
     });
     key.connect_clicked(|_| {
@@ -116,6 +125,14 @@ pub(super) fn changed() {
     }
 }
 
+/// The bell counted `count` unread notifications.
+pub(super) fn unread(count: usize) {
+    if let Some(center) = center() {
+        center.unread.set(count);
+        center.summarize();
+    }
+}
+
 impl Center {
     fn show(self: &Rc<Self>) {
         if self.list.first_child().is_none() {
@@ -125,21 +142,42 @@ impl Center {
         self.load();
     }
 
+    /// A burst of notify events (an agent retrying a refused command) shares one list: the one
+    /// in flight runs once more when it answers, rather than one request and rebuild per event.
     fn load(self: &Rc<Self>) {
         let Some(ui) = self.ui.upgrade() else { return };
-        let revision = self.revision.get().wrapping_add(1);
-        self.revision.set(revision);
+        self.stale.set(true);
+        if self.loading.replace(true) {
+            return;
+        }
         let center = self.clone();
         glib::spawn_future_local(async move {
-            let result = ui.call("notify.list", json!({"limit": 100})).await;
-            if center.revision.get() != revision {
-                return;
+            while center.stale.replace(false) {
+                let result = ui.call("notify.list", json!({"limit": 100})).await;
+                if center.stale.get() {
+                    continue;
+                }
+                match result {
+                    Ok(data) => center.render(&ui, &rows(&data, "notifications")),
+                    Err(e) => center.placeholder("Notifications are unavailable", &e.to_string()),
+                }
             }
-            match result {
-                Ok(data) => center.render(&ui, &rows(&data, "notifications")),
-                Err(e) => center.placeholder("Notifications are unavailable", &e.to_string()),
-            }
+            center.loading.set(false);
         });
+    }
+
+    /// The unread count is the larger of the bell's and the list's: an unread notification
+    /// older than the newest 100 is not listed, and Mark all read must still clear it.
+    fn summarize(&self) {
+        let (listed, listed_unread) = self.listed.get();
+        let unread = listed_unread.max(self.unread.get());
+        self.summary.set_text(&match unread {
+            0 if listed == 0 => String::from("Nothing yet"),
+            0 => String::from("All read"),
+            1 => String::from("1 unread"),
+            n => format!("{n} unread"),
+        });
+        self.mark_all.set_sensitive(unread > 0);
     }
 
     fn placeholder(&self, title: &str, detail: &str) {
@@ -165,13 +203,8 @@ impl Center {
 
     fn render(self: &Rc<Self>, ui: &Rc<Ui>, entries: &[Value]) {
         let unread = entries.iter().filter(|n| n["read"] != true).count();
-        self.summary.set_text(&match unread {
-            0 if entries.is_empty() => String::from("Nothing yet"),
-            0 => String::from("All read"),
-            1 => String::from("1 unread"),
-            n => format!("{n} unread"),
-        });
-        self.mark_all.set_sensitive(unread > 0);
+        self.listed.set((entries.len(), unread));
+        self.summarize();
         if entries.is_empty() {
             self.placeholder(
                 "You're all caught up",
@@ -263,9 +296,8 @@ impl Center {
                 glib::spawn_future_local(async move {
                     if let Err(e) = ui.call("notify.ack", json!({"notification_id": id})).await {
                         ui.show_error(&e.to_string());
+                        center.load();
                     }
-                    ui.refresh_notification_count();
-                    center.load();
                 });
             });
             row.append(&read);
@@ -281,9 +313,7 @@ impl Center {
             let ui = ui.clone();
             let id = item["id"].clone();
             glib::spawn_future_local(async move {
-                if ui.call("notify.ack", json!({"notification_id": id})).await.is_ok() {
-                    ui.refresh_notification_count();
-                }
+                let _ = ui.call("notify.ack", json!({"notification_id": id})).await;
             });
         }
         let project = item["project_id"].as_i64().unwrap_or(ui.project.get());
@@ -295,7 +325,9 @@ impl Center {
                 .filter(|p| *p != "notifications")
                 .unwrap_or("agents"),
             "task.get" => "board",
-            "session.get" => "agents",
+            // A hold or exception request waits on its session's tile (D121), which the focus
+            // below brings forward; the Guardrails page would leave that focus on a hidden wall.
+            "session.get" | "guardrail.confirm" => "agents",
             _ => match text(item, "category") {
                 "agent_done" | "integration" => "board",
                 "guardrail" => "guardrails",
