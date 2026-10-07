@@ -210,7 +210,9 @@ impl Pane {
         caption.set_max_width_chars(24);
         caption.set_ellipsize(gtk::pango::EllipsizeMode::End);
         caption.add_css_class("session-name");
-        let status = gtk::Label::new(Some("Connecting"));
+        // Empty until the pane attaches: a parked or exited pane never does, and a strip
+        // saying "Connecting" under its slate would read as a stuck connection.
+        let status = gtk::Label::new(None);
         status.add_css_class("dim");
         let actions = gtk::Box::new(gtk::Orientation::Horizontal, 2);
         footer.append(&caption);
@@ -287,6 +289,7 @@ impl Pane {
         status.set_wrap(true);
         status.set_max_width_chars(40);
         status.add_css_class("terminal-status");
+        status.set_visible(false);
         status.connect_label_notify(|label| label.set_visible(!label.text().is_empty()));
         root.append(&status);
         let pane = Rc::new(Self {
@@ -568,6 +571,7 @@ impl Pane {
             self.status.set_text("");
             return;
         }
+        self.status.set_text("Connecting");
         let weak = Rc::downgrade(self);
         *self.stream.borrow_mut() = Some(glib::spawn_future_local(async move {
             let Some(p) = weak.upgrade() else {
