@@ -336,6 +336,82 @@ fn status_lists_an_untracked_directory_once() {
     assert_eq!(listed["worktrees"][0]["dirty"], true, "{listed}");
 }
 
+/// RA-371: a branch created without checkout reports its own tip, not the checkout's HEAD.
+#[test]
+fn branch_create_without_checkout_reports_the_new_branch_tip() {
+    let e = engine();
+    let (_ws, repo) = project(&e);
+    let root = Path::new(&repo);
+    let first = git(root, &["rev-parse", "HEAD"]);
+    commit(root, "second");
+    let out = ok(&e, "git.branch.create", json!({"project_id":1,"name":"from-first","start_point":first,"checkout":false}));
+    assert_eq!(out["head"], first.as_str());
+    assert_eq!(git(root, &["branch", "--show-current"]), "main");
+}
+
+/// RA-374: a commit dated past what jiff can represent is listed with no date, not an error.
+#[test]
+fn log_and_show_survive_an_out_of_range_author_date() {
+    let e = engine();
+    let (_ws, repo) = project(&e);
+    let root = Path::new(&repo);
+    let parent = git(root, &["rev-parse", "HEAD"]);
+    let tree = git(root, &["rev-parse", "HEAD^{tree}"]);
+    let raw = format!(
+        "tree {tree}\nparent {parent}\nauthor Far Future <far@example.test> 999999999999 +0000\ncommitter Far Future <far@example.test> 999999999999 +0000\n\nfrom the far future\n"
+    );
+    let mut child = Command::new("git").arg("-C").arg(root).args(["hash-object", "-t", "commit", "-w", "--literally", "--stdin"])
+        .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().unwrap();
+    std::io::Write::write_all(&mut child.stdin.take().unwrap(), raw.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    git(root, &["update-ref", "refs/heads/main", &sha]);
+    let log = ok(&e, "git.log", json!({"project_id":1,"limit":10}));
+    assert_eq!(log["commits"][0]["subject"], "from the far future");
+    assert_eq!(log["commits"][0]["at"], "");
+    assert_ne!(log["commits"][1]["at"], "", "a normal date is still given");
+    ok(&e, "git.show", json!({"project_id":1,"sha":sha}));
+}
+
+/// RA-373: one branch git refuses to delete does not stop the others, nor hide that they went.
+#[test]
+fn clean_merged_deletes_every_branch_it_can() {
+    let e = engine();
+    let (_ws, repo) = project(&e);
+    let root = Path::new(&repo);
+    git(root, &["branch", "old"]);
+    git(root, &["branch", "at-old"]);
+    commit(root, "advance");
+    git(root, &["branch", "at-main"]);
+    // `git branch -d` asks whether a branch is merged into HEAD: `at-main` is merged into the
+    // base but not into `old`, so git refuses that one.
+    git(root, &["checkout", "-q", "old"]);
+    let out = ok(&e, "git.branch.clean_merged", json!({"project_id":1}));
+    assert_eq!(out["deleted"], json!(["at-old"]));
+    assert!(git(root, &["branch", "--list", "at-old"]).is_empty());
+    assert!(!git(root, &["branch", "--list", "at-main"]).is_empty());
+    // Nothing deletable left: the refusal is the answer.
+    let refused = call(&e, "git.branch.clean_merged", json!({"project_id":1}));
+    assert_eq!(err(&refused).code, "git.branch_delete_failed");
+}
+
+/// RA-422: project.update's legacy guardrail columns are checked like guardrail.config.set's.
+#[test]
+fn project_update_refuses_a_guardrail_pattern_the_config_would_reject() {
+    let e = engine();
+    let (_ws, _repo) = project(&e);
+    for bad in [json!({"protected_paths":["/home/me/secrets"]}), json!({"critical_files":["../outside"]})] {
+        let mut payload = bad.clone();
+        payload["project_id"] = json!(1);
+        let refused = call(&e, "project.update", payload);
+        assert_eq!(err(&refused).code, "guardrail.config", "{bad}");
+    }
+    ok(&e, "project.update", json!({"project_id":1,"protected_paths":["secrets/"]}));
+    let config = ok(&e, "guardrail.config.get", json!({"project_id":1}));
+    assert!(config["protected_paths"].as_array().unwrap().iter().any(|p| p == "secrets/"), "{config}");
+}
+
 /// RA-110: a bus commit runs the user's prepare-commit-msg hook with git's arguments, before
 /// commit-msg, and keeps what it adds. Concluding a merge, `git commit --no-verify` runs it
 /// itself, so it runs exactly once there too, and so does commit-msg.

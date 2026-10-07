@@ -109,7 +109,9 @@ fn complete_group_assignment(ctx: &mut Ctx, session: &Session, task_id: Id, sha:
         if !ready { return Err(BusError::conflict("session.review_not_ready", "Builders must finish the current task before its review can complete")); }
     }
     ctx.tx().execute("UPDATE task_sessions SET completed_at=COALESCE(completed_at,?1) WHERE task_id=?2 AND session_id=?3",params![ctx.now,task_id,session.id]).bus()?;
-    if let Some(sha) = sha.filter(|sha| !sha.trim().is_empty()) {
+    // A reviewer's role may not link commits (task.link_commit is not on its allowlist), so
+    // only a builder's sha is recorded, trimmed as task.link_commit trims it (RA-396).
+    if let Some(sha) = sha.map(str::trim).filter(|sha| !sha.is_empty() && session.role != Role::Reviewer) {
         ctx.tx().execute("INSERT OR IGNORE INTO task_commits(task_id,sha,branch,linked_at) VALUES (?1,?2,?3,?4)",params![task_id,sha,session.branch,ctx.now]).bus()?;
     }
     // Only this session's review group waits on itself: an unrelated agent that shares the
@@ -148,15 +150,20 @@ fn complete_group_assignment(ctx: &mut Ctx, session: &Session, task_id: Id, sha:
 
 }
 
-fn launch_nudge(row: &Row_) -> Option<String> {
-    if let Some(assignment) = row
-        .launch_prompt
-        .as_deref()
-        .filter(|text| !text.trim().is_empty())
-    {
+/// What a fresh launch types into the new PTY. The launch assignment is handed over as the
+/// work to begin only on the session's first spawn: a later fresh start
+/// (`session.clear_restorable`) may come long after that work was finished, so it begins the
+/// current task instead and offers the launch text only as background (RA-397).
+fn launch_nudge(row: &Row_, first_launch: bool) -> Option<String> {
+    let assignment = row.launch_prompt.as_deref().map(str::trim).filter(|text| !text.is_empty());
+    if let Some(assignment) = assignment.filter(|_| first_launch) {
         return Some(format!(
-            "Call session.bootstrap first, then begin this assignment: {}",
-            assignment.trim(),
+            "Call session.bootstrap first, then begin this assignment: {assignment}",
+        ));
+    }
+    if row.session.task_id.is_none() {
+        return assignment.map(|assignment| format!(
+            "Call session.bootstrap first. This session was launched earlier with these instructions, which may already be done; check before acting on them: {assignment}",
         ));
     }
     row.session.task_id.map(|task_id| match row.session.role {
@@ -174,11 +181,15 @@ fn launch_nudge(row: &Row_) -> Option<String> {
 
 /// Agents act on their own session (or their PAIR partner for reads); the user on any.
 fn assert_own(ctx: &Ctx, row: &Row_, reads_ok_for_pair: bool) -> Result<(), BusError> {
-    owns(&ctx.actor, ctx.actor_session_id(), row, reads_ok_for_pair)
+    owns(&ctx.actor, ctx.actor_session_id(), row, reads_ok_for_pair, |sid| sessions::by_id(ctx.tx(), sid))
 }
 
-/// [`assert_own`] for a handler with no transaction.
-fn owns(actor: &relay_bus::envelope::Actor, actor_session_id: Option<Id>, row: &Row_, reads_ok_for_pair: bool) -> Result<(), BusError> {
+/// [`assert_own`] for a handler with no transaction. `actor_row` looks up the actor's own row,
+/// and is called only for a PAIR read the target's own link does not already admit.
+fn owns(
+    actor: &relay_bus::envelope::Actor, actor_session_id: Option<Id>, row: &Row_, reads_ok_for_pair: bool,
+    actor_row: impl FnOnce(Id) -> Result<Option<Row_>, BusError>,
+) -> Result<(), BusError> {
     if let Some(sid) = actor_session_id {
         if sid == row.session.id {
             return Ok(());
@@ -188,6 +199,11 @@ fn owns(actor: &relay_bus::envelope::Actor, actor_session_id: Option<Id>, row: &
                 if Some(pair.as_str()) == actor.session_name() {
                     return Ok(());
                 }
+            }
+            // PAIR runs both ways. A reviewer names only one of its two builders, so the
+            // other is its partner by its own link, as guardrail::authorize reads it (RA-398).
+            if actor_row(sid)?.is_some_and(|own| own.session.pair_with.as_deref() == Some(row.session.name.as_str())) {
+                return Ok(());
             }
         }
         return Err(BusError::not_own("session"));
@@ -199,6 +215,17 @@ fn owns(actor: &relay_bus::envelope::Actor, actor_session_id: Option<Id>, row: &
         }
     }
     Ok(())
+}
+
+/// [`assert_own`] with PAIR reads allowed, for a handler with no transaction: one short read
+/// for the target row and the actor's own.
+fn read_own_or_pair(ctx: &crate::engine::Unlocked, session: &str) -> Result<Row_, BusError> {
+    let (row, own) = ctx.read(|conn| Ok((
+        sessions::by_name(conn, session)?,
+        ctx.actor_session_id().map(|sid| sessions::by_id(conn, sid)).transpose()?.flatten(),
+    )))?;
+    owns(&ctx.actor, ctx.actor_session_id(), &row, true, |_| Ok(own))?;
+    Ok(row)
 }
 
 /// The project an agent actor is confined to, or `None` for the user.
@@ -241,21 +268,13 @@ fn overlay_live_output(ctx: &Ctx, sessions: &mut [Session]) {
     }
 }
 
-/// Claims name worktree-relative paths, like every other path on the bus.
+/// Claims name worktree-relative paths, like every other path on the bus, spelled as
+/// `overlap.flag` spells them so the two always meet (RA-387).
 fn claim_path(raw: &str) -> Result<String, BusError> {
-    let path = Path::new(raw.trim());
-    if raw.trim().is_empty()
-        || path.is_absolute()
-        || path
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        return Err(BusError::invalid(
-            "session.claim_path",
-            format!("{raw:?} must be worktree-relative and contain no .."),
-        ));
-    }
-    Ok(path.display().to_string())
+    crate::handlers::overlap::normalize_relative(raw).ok_or_else(|| BusError::invalid(
+        "session.claim_path",
+        format!("{raw:?} must be worktree-relative and contain no .."),
+    ))
 }
 
 fn emit_session(ctx: &mut Ctx, s: &Session) {
@@ -505,7 +524,16 @@ fn retire_session(ctx: &mut Ctx, s: &Session) -> Result<(), BusError> {
         ctx.after_commit(move |_| kill_detached(pty, Duration::from_millis(150)));
     }
     ctx.tx().execute("UPDATE sessions SET state = 'closed', pid = NULL, closed_at = ?1, updated_at = ?1 WHERE id = ?2", params![ctx.now, s.id]).bus()?;
-    ctx.tx().execute("UPDATE sessions SET pair_with=NULL,updated_at=?1 WHERE pair_with=?2 AND state!='closed'", params![ctx.now, s.name]).bus()?;
+    // A partner left pointing at the closed session takes the next member still linked to it:
+    // a reviewer whose first builder closes keeps its second one, so the group stays whole
+    // for validate_pair and assert_own. Anyone else is unpaired (RA-398).
+    ctx.tx().execute(
+        "UPDATE sessions SET updated_at=?1, pair_with=(
+             SELECT other.name FROM sessions other WHERE other.pair_with=sessions.name AND other.state!='closed'
+             AND other.worktree=sessions.worktree ORDER BY other.id LIMIT 1)
+         WHERE pair_with=?2 AND state!='closed'",
+        params![ctx.now, s.name],
+    ).bus()?;
     ctx.tx().execute("DELETE FROM session_scrollback WHERE session_id=?1", [s.id]).bus()?;
     release_claims(ctx, s)?;
     let expired = ctx.tx().execute(
@@ -645,7 +673,9 @@ fn prepare_launch(engine: &Engine, plan: LaunchPlan) -> Result<PreparedLaunch, B
         .as_deref()
         .filter(|text| !text.trim().is_empty())
     {
-        on_disk.push_str(&format!("\n\nLaunch assignment:\n{assignment}"));
+        // Relaunched, the session may be long past it: name it for what it now is (RA-397).
+        let label = if row.session.spawned_at.is_none() { "Launch assignment" } else { "Original launch assignment (from the first launch; may already be done)" };
+        on_disk.push_str(&format!("\n\n{label}:\n{assignment}"));
     }
     let brief_path = crate::awareness::session_brief_path(&row.session.name);
     let role_path = crate::providers::role_instructions_relative(&row.session.name);
@@ -813,10 +843,7 @@ fn finish_launch(ctx: &mut Ctx, prepared: PreparedLaunch) -> Result<Session, Bus
                     if let Some(row) = sessions::by_id(tx, sid)? {
                         if row.session.role == Role::Builder {
                           if let Some(task_id) = row.session.task_id {
-                            let changed = tx.execute(
-                                "UPDATE tasks SET state='failed',updated_at=?1 WHERE id=?2 AND col='active' AND deleted_at IS NULL",
-                                params![now, task_id],
-                            ).map_err(crate::engine::internal)?;
+                            let changed = exit_fails_task(tx, &row.session, task_id, now).map_err(crate::engine::internal)?;
                             if changed > 0 {
                                 events.push(("task.changed".into(), json!({"task_id":task_id,"state":"failed"})));
                             }
@@ -855,7 +882,7 @@ fn finish_launch(ctx: &mut Ctx, prepared: PreparedLaunch) -> Result<Session, Bus
     let updated =
         sessions::by_id(ctx.tx(), sid)?.ok_or_else(|| BusError::internal("session vanished"))?;
     if matches!(kind, LaunchKind::Fresh) {
-        if let Some(prompt) = launch_nudge(&updated) {
+        if let Some(prompt) = launch_nudge(&updated, current.session.spawned_at.is_none()) {
             ctx.after_commit(move |engine| {
                 if let Some(pty) = engine.pty(sid) {
                     if let Err(error) = pty.write(format!("{prompt}\r").as_bytes()) {
@@ -867,6 +894,51 @@ fn finish_launch(ctx: &mut Ctx, prepared: PreparedLaunch) -> Result<Session, Bus
     }
     emit_session(ctx, &updated.session);
     Ok(updated.session)
+}
+
+/// A builder's exit marks its current task failed, unless this builder already finished it
+/// or another live builder on the same checkout is still working on it (RA-399).
+fn exit_fails_task(conn: &Connection, s: &Session, task_id: Id, now: &str) -> rusqlite::Result<usize> {
+    conn.prepare_cached(
+        "UPDATE tasks SET state='failed',updated_at=?1 WHERE id=?2 AND col='active' AND deleted_at IS NULL
+         AND NOT EXISTS(SELECT 1 FROM task_sessions WHERE task_id=?2 AND session_id=?3 AND completed_at IS NOT NULL)
+         AND NOT EXISTS(SELECT 1 FROM task_sessions ts JOIN sessions o ON o.id=ts.session_id
+             WHERE ts.task_id=?2 AND ts.session_id!=?3 AND ts.completed_at IS NULL AND o.role='builder'
+             AND o.worktree=?4 AND o.state IN ('spawning','running','idle','blocked'))",
+    )?.execute(params![now, task_id, s.id, s.worktree])
+}
+
+/// Model, effort, task and module as `session.update` would write them.
+type UpdateValues = (Option<String>, Option<String>, Option<Id>, Option<Id>);
+
+/// What `session.update` would write, refused as it would be: both of its phases ask, so a
+/// rename never runs for an update the transaction would then refuse.
+fn check_update(conn: &Connection, before: &Row_, p: &UpdateIn) -> Result<UpdateValues, BusError> {
+    let s = &before.session;
+    let spawned = before.epoch > 0 || s.spawned_at.is_some();
+    if spawned && (p.branch.is_some() || p.model.is_some() || p.effort.is_some()) {
+        return Err(BusError::conflict("session.already_spawned", "branch, model, and effort cannot change after first spawn"));
+    }
+    let model = p.model.clone().map(Some).unwrap_or_else(|| s.model.clone());
+    let effort = p.effort.clone().map(Some).unwrap_or_else(|| s.effort.clone());
+    crate::providers::validate_options(s.provider, model.as_deref(), effort.as_deref())?;
+    let task_id = p.task_id.unwrap_or(s.task_id);
+    let module_id = p.module_id.unwrap_or(s.module_id);
+    if let Some(task_id) = task_id {
+        let valid: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1 AND project_id=?2 AND deleted_at IS NULL)",
+            params![task_id, s.project_id], |row| row.get(0),
+        ).bus()?;
+        if !valid { return Err(BusError::not_found("task.not_found", format!("no task {task_id} in project {}", s.project_id))); }
+    }
+    if let Some(module_id) = module_id {
+        let valid: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM modules WHERE id=?1 AND project_id=?2 AND deleted_at IS NULL)",
+            params![module_id, s.project_id], |row| row.get(0),
+        ).bus()?;
+        if !valid { return Err(BusError::not_found("module.not_found", format!("no module {module_id} in project {}", s.project_id))); }
+    }
+    Ok((model, effort, task_id, module_id))
 }
 
 /// Mirror the session state we just persisted onto its live PTY. `session.input` reads this
@@ -1325,8 +1397,7 @@ pub fn register(e: &mut Engine) {
 
     e.register_unlocked::<Brief>(|ctx, p| {
         // Metadata is project-visible; a peer's brief and scrollback are not.
-        let row = ctx.read(|conn| sessions::by_name(conn, &p.session))?;
-        owns(&ctx.actor, ctx.actor_session_id(), &row, true)?;
+        read_own_or_pair(ctx, &p.session)?;
         let git = brief_git(ctx, &p.session)?;
         ctx.read(|conn| crate::awareness::brief(conn, &p.session, Some(ctx.engine()), &git))
     });
@@ -1417,7 +1488,11 @@ pub fn register(e: &mut Engine) {
             }
         }
         let session_state = if status == "completed" { "idle" } else { "blocked" };
-        release_claims(ctx, s)?;
+        // A blocked or partial task stays current and the agent comes back to it, so the files
+        // it declared stay its own, as they do through a blocked session.report (RA-400).
+        if status == "completed" {
+            release_claims(ctx, s)?;
+        }
         ctx.tx().execute(
             "UPDATE sessions SET state=?1, last_output_at=?2, updated_at=?2 WHERE id=?3",
             params![session_state, ctx.now, s.id],
@@ -1584,9 +1659,9 @@ pub fn register(e: &mut Engine) {
         assert_own(ctx, &row, false)?;
         let s = &row.session;
         let data = p.data.unwrap_or_else(|| json!({}));
-        let pending_stop: Option<Id> = ctx.tx().query_row(
-            "SELECT done_pending_stop FROM sessions WHERE id=?1", [s.id], |row| row.get(0),
-        ).bus()?;
+        // Every agent tool call lands here, so its statements are all cached (RA-401).
+        let pending_stop: Option<Id> = ctx.tx().prepare_cached("SELECT done_pending_stop FROM sessions WHERE id=?1").bus()?
+            .query_row([s.id], |row| row.get(0)).bus()?;
         let done = pending_stop.filter(|id| *id != ASSIGNMENT_AT_STOP);
         let completed_without_done = p.kind == "stop" && done.is_none() && s.state == SessionState::Running;
         let provider_ref = data.get("session_id").or_else(|| data.get("provider_ref")).and_then(Value::as_str);
@@ -1626,19 +1701,14 @@ pub fn register(e: &mut Engine) {
             _ => state,
         };
         let state_changed = state != sessions::state_str(s.state);
-        ctx.tx().execute(
-            "UPDATE sessions SET state=?1, provider_ref=COALESCE(?2, provider_ref), last_output_at=?3, updated_at=?3 WHERE id=?4",
-            params![state, provider_ref, ctx.now, s.id],
-        ).bus()?;
-        match p.kind.as_str() {
-            "stop" => { ctx.tx().execute("UPDATE sessions SET done_pending_stop=NULL WHERE id=?1", [s.id]).bus()?; }
-            // A fresh provider session starts no turn a done could belong to; an assignment
-            // still waiting for a Stop keeps waiting.
-            "session_start" => {
-                ctx.tx().execute("UPDATE sessions SET done_pending_stop=NULL WHERE id=?1 AND done_pending_stop!=?2", params![s.id, ASSIGNMENT_AT_STOP]).bus()?;
-            }
-            _ => {}
-        }
+        // A Stop ends the turn a pending done belonged to. A fresh provider session starts no
+        // turn a done could belong to; an assignment still waiting for a Stop keeps waiting.
+        ctx.tx().prepare_cached(
+            "UPDATE sessions SET state=?1, provider_ref=COALESCE(?2, provider_ref), last_output_at=?3, updated_at=?3,
+             done_pending_stop=CASE WHEN ?5='stop' THEN NULL WHEN ?5='session_start' AND done_pending_stop!=?6 THEN NULL
+                                    ELSE done_pending_stop END
+             WHERE id=?4",
+        ).bus()?.execute(params![state, provider_ref, ctx.now, s.id, p.kind, ASSIGNMENT_AT_STOP]).bus()?;
         note_pty_state(ctx, s.id, state);
         if matches!(p.kind.as_str(), "tool_use" | "stop") {
             // The command behind a device lease has finished; keep the lease only briefly.
@@ -1653,10 +1723,9 @@ pub fn register(e: &mut Engine) {
         if s.role == Role::Builder {
             let task_state = match state { "running" => Some("running"), "blocked" => Some("blocked"), _ => None };
             if let (Some(task_state), Some(task_id)) = (task_state, s.task_id) {
-                let changed = ctx.tx().execute(
+                let changed = ctx.tx().prepare_cached(
                     "UPDATE tasks SET state=?1,updated_at=?2 WHERE id=?3 AND col='active' AND deleted_at IS NULL AND state!=?1",
-                    params![task_state, ctx.now, task_id],
-                ).bus()?;
+                ).bus()?.execute(params![task_state, ctx.now, task_id]).bus()?;
                 if changed > 0 {
                     ctx.emit("task.changed", json!({"task_id":task_id,"state":task_state}));
                 }
@@ -1691,37 +1760,39 @@ pub fn register(e: &mut Engine) {
         Ok(Empty {})
     });
 
-    e.register::<Update>(|ctx: &mut Ctx, p| {
+    // A branch rename is git subprocesses, so it runs before the transaction opens (RA-402);
+    // the transaction then requires the row to still carry the branch that was renamed.
+    e.register_staged::<Update, _>(|ctx, p| {
+        let Some(branch) = p.branch.as_deref() else { return Ok(None) };
+        let (before, project_path, shared) = ctx.read(|conn| {
+            let before = sessions::by_name(conn, &p.session)?;
+            check_update(conn, &before, p)?;
+            let project = crate::handlers::workspace::get_project(conn, before.session.project_id)?;
+            let shared = survivor_on(conn, before.session.id, &before.session.worktree)?;
+            Ok((before, project.path, shared))
+        })?;
+        let s = &before.session;
+        if branch == s.branch { return Ok(None); }
+        if s.pair_with.is_some() { return Err(BusError::conflict("session.pair_branch", "a PAIR branch cannot be renamed independently")); }
+        // `git branch -m` renames whatever the checkout has out: on the primary that is the
+        // project's own base branch, and on a shared checkout every other session's branch too.
+        let canonical = |path: &str| fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
+        if canonical(&s.worktree) == canonical(&project_path) {
+            return Err(BusError::conflict("session.branch_primary", "a session on the primary checkout cannot rename its branch: it is the project's own"));
+        }
+        if let Some(other) = shared {
+            return Err(BusError::conflict("session.branch_shared", format!("session {other} shares this checkout, so its branch cannot be renamed for one session")));
+        }
+        worktree::rename_branch(Path::new(&s.worktree), branch)
+            .map_err(|error| BusError::conflict("session.branch", error.to_string()))?;
+        Ok(Some(s.branch.clone()))
+    }, |ctx: &mut Ctx, p, renamed_from: Option<String>| {
         let before = sessions::by_name(ctx.tx(), &p.session)?;
         let s = &before.session;
-        let spawned = before.epoch > 0 || s.spawned_at.is_some();
-        if spawned && (p.branch.is_some() || p.model.is_some() || p.effort.is_some()) {
-            return Err(BusError::conflict("session.already_spawned", "branch, model, and effort cannot change after first spawn"));
-        }
+        let (model, effort, task_id, module_id) = check_update(ctx.tx(), &before, &p)?;
         let branch = p.branch.clone().unwrap_or_else(|| s.branch.clone());
-        let model = p.model.clone().map(Some).unwrap_or_else(|| s.model.clone());
-        let effort = p.effort.clone().map(Some).unwrap_or_else(|| s.effort.clone());
-        crate::providers::validate_options(s.provider, model.as_deref(), effort.as_deref())?;
-        let task_id = p.task_id.unwrap_or(s.task_id);
-        let module_id = p.module_id.unwrap_or(s.module_id);
-        if let Some(task_id) = task_id {
-            let valid: bool = ctx.tx().query_row(
-                "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1 AND project_id=?2 AND deleted_at IS NULL)",
-                params![task_id, s.project_id], |row| row.get(0),
-            ).bus()?;
-            if !valid { return Err(BusError::not_found("task.not_found", format!("no task {task_id} in project {}", s.project_id))); }
-        }
-        if let Some(module_id) = module_id {
-            let valid: bool = ctx.tx().query_row(
-                "SELECT EXISTS(SELECT 1 FROM modules WHERE id=?1 AND project_id=?2 AND deleted_at IS NULL)",
-                params![module_id, s.project_id], |row| row.get(0),
-            ).bus()?;
-            if !valid { return Err(BusError::not_found("module.not_found", format!("no module {module_id} in project {}", s.project_id))); }
-        }
-        if branch != s.branch {
-            if s.pair_with.is_some() { return Err(BusError::conflict("session.pair_branch", "a PAIR branch cannot be renamed independently")); }
-            worktree::rename_branch(Path::new(&s.worktree), &branch)
-                .map_err(|error| BusError::conflict("session.branch", error.to_string()))?;
+        if branch != s.branch && renamed_from.as_deref() != Some(s.branch.as_str()) {
+            return Err(BusError::conflict("session.branch", format!("session {} changed while its branch was being renamed", s.name)));
         }
         ctx.tx().execute(
             "UPDATE sessions SET branch=?1,model=?2,effort=?3,task_id=?4,module_id=?5,bus_writes=?6,allow_ui=?7,updated_at=?8 WHERE id=?9",
@@ -1734,20 +1805,40 @@ pub fn register(e: &mut Engine) {
             ctx.tx().execute("INSERT OR IGNORE INTO task_sessions(task_id,session_id,ord,queue_ord) VALUES (?1,?2,?3,?4)", params![task_id,s.id,ord,queue_ord]).bus()?;
         }
         let updated = sessions::by_id(ctx.tx(), s.id)?.ok_or_else(|| BusError::internal("session vanished"))?;
-        ctx.set_undo("session.update", json!({
-            "session": s.name, "branch": s.branch, "model": s.model, "effort": s.effort,
-            "task_id": s.task_id, "module_id": s.module_id, "bus_writes": s.bus_writes, "allow_ui": s.allow_ui,
-        }), Some(json!({"updated_at":updated.session.updated_at})));
+        // The inverse names only what this update changed. Branch, model and effort change only
+        // before the first spawn, so an inverse that always carried them was refused as soon as
+        // the session had started, whatever the update was about (RA-403).
+        let mut inverse = serde_json::Map::new();
+        inverse.insert("session".into(), json!(s.name));
+        let u = &updated.session;
+        if u.branch != s.branch { inverse.insert("branch".into(), json!(s.branch)); }
+        if u.model != s.model { inverse.insert("model".into(), json!(s.model)); }
+        if u.effort != s.effort { inverse.insert("effort".into(), json!(s.effort)); }
+        if u.task_id != s.task_id { inverse.insert("task_id".into(), json!(s.task_id)); }
+        if u.module_id != s.module_id { inverse.insert("module_id".into(), json!(s.module_id)); }
+        if u.bus_writes != s.bus_writes { inverse.insert("bus_writes".into(), json!(s.bus_writes)); }
+        if u.allow_ui != s.allow_ui { inverse.insert("allow_ui".into(), json!(s.allow_ui)); }
+        ctx.set_undo("session.update", Value::Object(inverse), Some(json!({"updated_at":u.updated_at})));
         emit_session(ctx, &updated.session);
         Ok(updated.session)
     });
 
     e.register_unlocked::<RestorableList>(|ctx, p| {
         let rows = ctx.read(|conn| {
+            // An agent sees its own project's sessions and nothing outside it, as in
+            // session.list (D106, RA-404).
+            let scope = match ctx.actor_session_id() {
+                Some(sid) => Some(sessions::by_id(conn, sid)?.ok_or_else(|| BusError::actor("bound session vanished"))?.session.project_id),
+                None if ctx.actor.is_agent() => return Err(BusError::actor("agent actor is not bound to a live session")),
+                None => None,
+            };
+            if let (Some(own), Some(asked)) = (scope, p.project_id) {
+                if own != asked { return Err(BusError::not_own("project")); }
+            }
             let mut stmt = conn.prepare_cached(
                 "SELECT * FROM sessions WHERE state='restorable' AND (?1 IS NULL OR project_id=?1) AND (?2 IS NULL OR name=?2) ORDER BY id",
             ).bus()?;
-            let rows = stmt.query_map(params![p.project_id, p.session], |row| Ok((sessions::row(row)?, row.get::<_, Option<String>>("restore_reason")?)))
+            let rows = stmt.query_map(params![scope.or(p.project_id), p.session], |row| Ok((sessions::row(row)?, row.get::<_, Option<String>>("restore_reason")?)))
                 .bus()?.collect::<rusqlite::Result<Vec<_>>>().bus()?;
             Ok(rows)
         })?;
@@ -1932,15 +2023,16 @@ pub fn register(e: &mut Engine) {
             .map_err(|e| BusError::conflict("session.io", e.to_string()))?;
         Ok(Empty {})
     });
-    e.register::<Scrollback>(|ctx, p| {
-        let row = sessions::by_name(ctx.tx(), &p.session)?;
-        assert_own(ctx, &row, true)?;
+    // Up to the whole 8 MiB ring, copied, decoded and serialized: the store is taken only to
+    // resolve the row and, for a session with no PTY, to load its saved copy (RA-406).
+    e.register_unlocked::<Scrollback>(|ctx, p| {
+        let row = read_own_or_pair(ctx, &p.session)?;
         let pty = ctx.engine().pty(row.session.id);
         let size = pty.as_ref().map(|pty| pty.size());
         let (text, epoch, seq) = match pty {
             Some(pty) => pty.scrollback(p.lines.map(|n| n as usize)),
             None => {
-                let (text, epoch, seq) = sessions::load_scrollback(ctx.tx(), row.session.id)?
+                let (text, epoch, seq) = ctx.read(|conn| sessions::load_scrollback(conn, row.session.id))?
                     .ok_or_else(|| {
                         BusError::conflict(
                             "session.not_spawned",

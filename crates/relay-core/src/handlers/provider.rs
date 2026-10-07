@@ -8,6 +8,10 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde_json::json;
 use std::collections::BTreeMap;
 
+/// The key `usage.report` adds to a stored report object: when it was reported. `usage.get`
+/// dates and ranks reports by it and strips it from the windows it returns.
+const REPORTED_AT: &str = "relay_reported_at";
+
 pub fn register(e: &mut Engine) {
     crate::provider_updates::register(e);
     e.register_unlocked::<List>(|ctx, _| {
@@ -50,18 +54,26 @@ pub fn register(e: &mut Engine) {
     // The reported half is three columns of SQLite; the discovered half walks each provider's
     // session directory and tails JSONL files. Only the first belongs on the lock (D144).
     e.register_unlocked::<UsageGet>(|ctx, payload| {
+        // The newest report per provider, dated by when it was reported: `updated_at` moves on
+        // every state change, so it neither picks the freshest report nor dates it (RA-392).
+        // A row stored before the report time was recorded falls back to `updated_at`.
         let reported = ctx.read(|conn| {
             let mut stmt = conn.prepare_cached(
-                "SELECT provider,usage,updated_at FROM sessions WHERE usage IS NOT NULL ORDER BY updated_at DESC,id DESC",
+                "SELECT provider,usage,MAX(COALESCE(json_extract(usage,'$.relay_reported_at'),updated_at)) FROM sessions
+                 WHERE usage IS NOT NULL AND json_valid(usage) GROUP BY provider",
             ).bus()?;
             let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))).bus()?;
             rows.collect::<rusqlite::Result<Vec<_>>>().bus()
         })?;
         let mut latest = BTreeMap::new();
         for (provider, windows, taken_at) in reported {
-            latest.entry(provider.clone()).or_insert_with(|| Usage {
+            let mut windows: serde_json::Value = serde_json::from_str(&windows).unwrap_or(serde_json::Value::Null);
+            if let Some(map) = windows.as_object_mut() {
+                map.remove(REPORTED_AT);
+            }
+            latest.insert(provider.clone(), Usage {
                 provider: crate::sessions::parse_provider(&provider),
-                windows: serde_json::from_str(&windows).unwrap_or(serde_json::Value::Null),
+                windows,
                 taken_at,
             });
         }
@@ -85,8 +97,13 @@ pub fn register(e: &mut Engine) {
         if ctx.actor.session_name() != Some(payload.session.as_str()) || row.session.provider != payload.provider {
             return Err(relay_bus::BusError::refused("usage.session", "usage reports must match the bound session and provider"));
         }
+        // The report carries its own time: `updated_at` is any change to the session.
+        let mut stored = payload.payload.clone();
+        if let Some(map) = stored.as_object_mut() {
+            map.insert(REPORTED_AT.into(), json!(ctx.now));
+        }
         ctx.tx().execute("UPDATE sessions SET usage=?1,updated_at=?2 WHERE id=?3",
-            params![serde_json::to_string(&payload.payload).bus()?,ctx.now,row.session.id]).bus()?;
+            params![serde_json::to_string(&stored).bus()?,ctx.now,row.session.id]).bus()?;
         ctx.set_project(row.session.project_id);
         ctx.emit("usage.changed", json!({"session":payload.session,"provider":crate::sessions::provider_str(payload.provider),"usage":payload.payload}));
         Ok(relay_bus::Empty {})
@@ -188,12 +205,14 @@ pub fn register(e: &mut Engine) {
         let name = match payload.name { Some(name) => valid_skill_name(&name)?, None => before.name.clone() };
         let body = payload.body.unwrap_or_else(|| before.body.clone());
         valid_skill_body(&body)?;
-        let duplicate: Option<Id> = ctx.tx().query_row(
-            "SELECT id FROM skills WHERE name=?1 COLLATE NOCASE AND id!=?2",
-            params![name,before.id], |row| row.get(0),
+        let duplicate: Option<(Id, bool)> = ctx.tx().query_row(
+            "SELECT id,deleted_at IS NOT NULL FROM skills WHERE name=?1 COLLATE NOCASE AND id!=?2",
+            params![name,before.id], |row| Ok((row.get(0)?, row.get(1)?)),
         ).optional().bus()?;
-        if let Some(id) = duplicate {
-            return Err(relay_bus::BusError::conflict("skill.name_exists", format!("that name is used by skill {id}")));
+        match duplicate {
+            Some((id, true)) => free_removed_name(ctx.tx(), id, &name)?,
+            Some((id, false)) => return Err(relay_bus::BusError::conflict("skill.name_exists", format!("that name is used by skill {id}"))),
+            None => {}
         }
         ctx.tx().execute("UPDATE skills SET name=?1,body=?2,updated_at=?3 WHERE id=?4 AND deleted_at IS NULL",
             params![name,body,ctx.now,before.id]).bus()?;
@@ -520,6 +539,12 @@ fn install_downloaded_skill(
         // Removed skills are absent from skill.list, so reclaim the row instead of reporting a
         // conflict the user cannot see. The same id keeps audit history and project enables.
         Some(named) if named.deleted_at.is_some() && source_match.is_none() => Some(named.id),
+        // The name is a removed row's and the source another row's: the source row is the
+        // skill being refreshed, and the removed one gives its name up (RA-393).
+        Some(named) if named.deleted_at.is_some() => {
+            free_removed_name(conn, named.id, &named.name)?;
+            source_id
+        }
         Some(named)
             if named.deleted_at.is_none()
                 && replace_skill_id == Some(named.id)
@@ -565,6 +590,10 @@ fn install_downloaded_skill(
         None => source_id,
     };
 
+    // Only a skill new to the library is switched on everywhere. A refresh, a replacement or a
+    // reinstall from the same source keeps the switches it has, even when that is none at all:
+    // a skill turned off in every project stays off after "Update from GitHub" (RA-395).
+    let fresh = target_id.is_none_or(|id| Some(id) != source_id && replace_skill_id != Some(id));
     let id = if let Some(id) = target_id {
         conn.execute(
             "UPDATE skills SET name=?1,body=?2,source_url=?3,source_path=?4,source_ref=?5,revision=?6,deleted_at=NULL,updated_at=?7 WHERE id=?8",
@@ -578,7 +607,9 @@ fn install_downloaded_skill(
         ).bus()?;
         conn.last_insert_rowid()
     };
-    enable_everywhere(conn, id)?;
+    if fresh {
+        enable_everywhere(conn, id)?;
+    }
     get_skill(conn, id)
 }
 
@@ -596,6 +627,18 @@ fn enable_everywhere(conn: &Connection, id: Id) -> Result<(), relay_bus::BusErro
             [id],
         ).bus()?;
     }
+    Ok(())
+}
+
+/// A removed skill keeps its row — the id carries its audit history and the undo of its
+/// removal — but not its name once another skill wants that name: `skill.list` hides the row,
+/// so a conflict naming it is one the user can neither see nor clear (RA-393). The leading
+/// space keeps the placeholder clear of every live name, which [`valid_skill_name`] trims.
+fn free_removed_name(conn: &Connection, id: Id, name: &str) -> Result<(), relay_bus::BusError> {
+    conn.execute(
+        "UPDATE skills SET name=?1 WHERE id=?2 AND deleted_at IS NOT NULL",
+        params![format!(" {name} (removed skill {id})"), id],
+    ).bus()?;
     Ok(())
 }
 
@@ -869,5 +912,62 @@ mod tests {
         let unique = deduplicate_downloaded_skills(vec![generic_agent, relay_agents]).unwrap();
         assert_eq!(unique.len(), 1);
         assert_eq!(unique[0].source_path, ".agents/skills/impeccable/SKILL.md");
+    }
+
+    #[test]
+    fn a_refresh_keeps_a_skill_switched_off_everywhere() {
+        let store = Store::open_memory().unwrap();
+        store.with_tx(|tx| {
+            tx.execute("INSERT INTO workspaces(id,path,name,created_at,updated_at) VALUES (1,'/w','w','t','t')", [])?;
+            tx.execute("INSERT INTO projects(id,workspace_id,path,name,created_at,updated_at) VALUES (1,1,'/w/a','a','t','t')", [])?;
+            Ok(())
+        }).unwrap();
+        let install = |now: &str, revision: &str| store.with_tx(|tx| {
+            Ok(install_downloaded_skill(tx, now, downloaded("Ponytail", "skills/ponytail/SKILL.md", revision), None)?)
+        }).unwrap();
+        let first = install("t1", "abc");
+        assert_eq!(first.enabled_in, vec![1], "a new skill is on everywhere");
+        store.with_tx(|tx| { tx.execute("DELETE FROM skill_projects", [])?; Ok(()) }).unwrap();
+        let refreshed = install("t2", "def");
+        assert_eq!(refreshed.id, first.id);
+        assert!(refreshed.enabled_in.is_empty(), "Update from GitHub switched it back on (RA-395)");
+    }
+
+    #[test]
+    fn a_removed_skill_gives_its_name_up() {
+        let store = Store::open_memory().unwrap();
+        let (removed, refreshed) = store.with_tx(|tx| {
+            tx.execute("INSERT INTO skills(name,body,created_at,updated_at,deleted_at) VALUES ('Ponytail','old','t','t','t')", [])?;
+            let removed = tx.last_insert_rowid();
+            tx.execute(
+                "INSERT INTO skills(name,body,source_url,source_path,revision,created_at,updated_at)
+                 VALUES ('Old name','x','https://github.com/example/skills.git','skills/ponytail/SKILL.md','abc','t','t')",
+                [],
+            )?;
+            Ok((removed, tx.last_insert_rowid()))
+        }).unwrap();
+        // The upstream skill was renamed to the name a removed local skill still holds.
+        let skill = store.with_tx(|tx| {
+            Ok(install_downloaded_skill(tx, "t2", downloaded("Ponytail", "skills/ponytail/SKILL.md", "def"), None)?)
+        }).unwrap();
+        assert_eq!(skill.id, refreshed);
+        assert_eq!(skill.name, "Ponytail");
+        let renamed: String = store.with_tx(|tx| Ok(tx.query_row("SELECT name FROM skills WHERE id=?1", [removed], |row| row.get(0))?)).unwrap();
+        assert_ne!(renamed.trim(), "Ponytail");
+
+        // skill.update over a removed skill's name.
+        let root = tempfile::tempdir().unwrap();
+        let engine = crate::engine::Engine::new(crate::Instance::Test, Store::open(&root.path().join("store/store.db"), false).unwrap());
+        let call = |op: &str, payload: serde_json::Value| {
+            engine.dispatch(relay_bus::Request::new(relay_bus::Actor::User, op, payload), crate::engine::Door::InProcess).into_result()
+        };
+        let braid = call("skill.create", json!({"name":"braid","body":"b"})).unwrap();
+        call("skill.delete", json!({"skill_id":braid["id"]})).unwrap();
+        let other = call("skill.create", json!({"name":"other","body":"o"})).unwrap();
+        let renamed = call("skill.update", json!({"skill_id":other["id"],"name":"Braid"})).unwrap();
+        assert_eq!(renamed["name"], "Braid", "a hidden removed skill refused the rename (RA-393)");
+        let live = call("skill.create", json!({"name":"live","body":"l"})).unwrap();
+        let error = call("skill.update", json!({"skill_id":live["id"],"name":"braid"})).unwrap_err();
+        assert_eq!(error.code, "skill.name_exists", "a live name still conflicts");
     }
 }

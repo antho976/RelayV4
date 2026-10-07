@@ -710,29 +710,26 @@ fn set_state(
     finished: bool,
     conflict: Option<(String, String)>,
 ) -> Result<(), BusError> {
-    {
-        let conn = engine.store.lock();
-        if get(&conn, id)?.state == IntegrationState::Discarded {
-            return Ok(());
-        }
-    }
     let state_s = state_name(state);
     let tail = tail(log, 12_000);
-    let project_id = {
-        let conn = engine.store.lock();
-        conn.query_row(
-            "SELECT project_id FROM integrations WHERE id=?1",
-            [id],
-            |r| r.get::<_, i64>(0),
-        )
-        .bus()?
-    };
-    engine.system_write("integration.advance",Some(parent),Some(project_id),None,json!({"integration_id":id,"state":state_s}),|tx,now|{
-        tx.execute("UPDATE integrations SET state=?1,worktree=COALESCE(?2,worktree),log_tail=?3,conflict=?4,started_at=COALESCE(started_at,?5),finished_at=CASE WHEN ?6 THEN ?5 ELSE finished_at END WHERE id=?7",params![state_s,path.map(|p|p.display().to_string()),tail,conflict.as_ref().map(|v|serde_json::to_string(v).unwrap()),now,finished as i64,id]).bus()?;
+    let project_id = get(&engine.store.lock(), id)?.project_id;
+    // A discard is final. It is checked in the write itself: checked under an earlier lock, a
+    // discard committing in between was overwritten with a result and a notification (RA-384).
+    let written = engine.system_write("integration.advance",Some(parent),Some(project_id),None,json!({"integration_id":id,"state":state_s}),|tx,now|{
+        let changed = tx.execute("UPDATE integrations SET state=?1,worktree=COALESCE(?2,worktree),log_tail=?3,conflict=?4,started_at=COALESCE(started_at,?5),finished_at=CASE WHEN ?6 THEN ?5 ELSE finished_at END WHERE id=?7 AND state!='discarded'",params![state_s,path.map(|p|p.display().to_string()),tail,conflict.as_ref().map(|v|serde_json::to_string(v).unwrap()),now,finished as i64,id]).bus()?;
+        // Rolled back, audit row and all: nothing happened.
+        if changed == 0 { return Err(BusError::conflict(DISCARDED, format!("integration {id} was discarded"))); }
         if finished { tx.execute("INSERT INTO notifications(project_id,category,title,body,link,read,created_at) VALUES (?1,'integration',?2,?3,NULL,0,?4)",params![project_id,format!("Integration {state_s}"),format!("Integration {id}: {}",tail.lines().last().unwrap_or(state_s)),now]).bus()?; }
         let value=serde_json::to_value(get(tx,id)?).bus()?;let mut events=vec![("integration.changed".into(),value.clone())];if finished{events.push(("integration.result".into(),value));events.push(("notify.new".into(),json!({"category":"integration","project_id":project_id,"integration_id":id})));}Ok(((),events))
-    })
+    });
+    match written {
+        Err(error) if error.code == DISCARDED => Ok(()),
+        written => written,
+    }
 }
+
+/// The internal refusal [`set_state`] rolls back with when the row was discarded under it.
+const DISCARDED: &str = "integration.discarded";
 
 fn get(conn: &rusqlite::Connection, id: i64) -> Result<Integration, BusError> {
     conn.query_row("SELECT * FROM integrations WHERE id=?1", [id], row)
@@ -788,4 +785,30 @@ fn tail(value: &str, max: usize) -> String {
         start += 1;
     }
     value[start..].to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A runner finishing after a discard leaves the row discarded, with no result and no
+    /// notification (RA-384).
+    #[test]
+    fn a_transition_never_overwrites_a_discard() {
+        let engine = Engine::new(crate::Instance::Test, crate::Store::open_memory().unwrap());
+        engine.store.lock().execute_batch(
+            "INSERT INTO workspaces(id,path,name,created_at,updated_at) VALUES (1,'/w','w','t','t');
+             INSERT INTO projects(id,workspace_id,path,name,created_at,updated_at) VALUES (1,1,'/w/p','p','t','t');
+             INSERT INTO integrations(id,project_id,branches,state,created_at) VALUES (1,1,'[\"a\",\"b\"]','building','t');",
+        ).unwrap();
+        let mut events = engine.subscribe();
+        engine.store.lock().execute("UPDATE integrations SET state='discarded' WHERE id=1", []).unwrap();
+        set_state(&engine, 1, uuid::Uuid::new_v4(), IntegrationState::Passed, Some(Path::new("/gone")), "Merge passed.\n", true, None).unwrap();
+        let conn = engine.store.lock();
+        let integration = get(&conn, 1).unwrap();
+        assert_eq!((integration.state, integration.worktree), (IntegrationState::Discarded, None));
+        let notified: i64 = conn.query_row("SELECT COUNT(*) FROM notifications", [], |r| r.get(0)).unwrap();
+        assert_eq!(notified, 0);
+        assert!(events.try_recv().is_err(), "no integration.changed for a transition that did not happen");
+    }
 }

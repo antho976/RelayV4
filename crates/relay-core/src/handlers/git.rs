@@ -332,9 +332,8 @@ pub fn register(e: &mut Engine) {
         let (_project, root) = resolve_root_unlocked(ctx, p.project_id, p.worktree.as_deref())?;
         let mut repo = gix::open(&root).map_err(gix_err("git.open_failed"))?;
         repo.object_cache_size_if_unset(16 * 1024 * 1024);
-        let tip = repo
-            .rev_parse_single(p.branch.as_deref().unwrap_or("HEAD"))
-            .map_err(gix_err("git.revision"))?;
+        let revision = p.branch.as_deref().unwrap_or("HEAD");
+        let tip = repo.rev_parse_single(revision).map_err(revision_err(revision))?;
         // `git log --topo-order`, as `--graph` uses: no parent before all of its children. The
         // default breadth-first walk put a parent above a child on another line of history,
         // and the graph drew a lane for each such inversion (RA-150). The commit-graph file,
@@ -358,7 +357,7 @@ pub fn register(e: &mut Engine) {
         let repo = gix::open(&project.path).map_err(gix_err("git.open_failed"))?;
         let id = repo
             .rev_parse_single(p.sha.as_str())
-            .map_err(gix_err("git.revision"))?;
+            .map_err(revision_err(&p.sha))?;
         let object = id
             .object()
             .map_err(gix_err("git.show_failed"))?
@@ -415,8 +414,14 @@ pub fn register(e: &mut Engine) {
             args.push(revision);
         }
         worktree::git_mutate(&root, &args).map_err(git_mutation("git.branch_create_failed"))?;
+        // The new branch's tip: `git branch` leaves HEAD where it was (RA-371).
         let repo = gix::open(&root).map_err(gix_err("git.open_failed"))?;
-        let head = repo.head_id().map_err(gix_err("git.head"))?.to_string();
+        let head = repo
+            .find_reference(full_name.as_str())
+            .map_err(gix_err("git.head"))?
+            .peel_to_id()
+            .map_err(gix_err("git.head"))?
+            .to_string();
         Ok((project, root, name, head))
     }, |ctx: &mut Ctx, _p, (project, root, name, head)| {
         changed(ctx, project.id, &root);
@@ -710,7 +715,7 @@ pub fn register(e: &mut Engine) {
             } else {
                 vec!["push"]
             };
-            worktree::git_mutate(&root, &args).map_err(git_mutation("git.push_failed"))?;
+            run_push(&root, &args)?;
             forget_prs(Path::new(&project.path));
             Ok((project, root))
         },
@@ -829,13 +834,26 @@ pub fn register(e: &mut Engine) {
             })
             .map(|b| b.name)
             .collect();
-        if !p.dry_run.unwrap_or(false) {
-            for branch in &candidates {
-                worktree::git_mutate(Path::new(&project.path), &["branch", "-d", branch])
-                    .map_err(git_mutation("git.branch_delete_failed"))?;
+        if p.dry_run.unwrap_or(false) {
+            return Ok((project, candidates));
+        }
+        // Every candidate gets its try: stopping at the first refusal would report a failure for
+        // branches already gone, with no git.changed and no audit row for them (RA-373).
+        let mut deleted = Vec::new();
+        let mut failed = Vec::new();
+        for branch in candidates {
+            match worktree::git_mutate(Path::new(&project.path), &["branch", "-d", &branch]) {
+                Ok(_) => deleted.push(branch),
+                Err(error) => failed.push(format!("{branch}: {error}")),
             }
         }
-        Ok((project, candidates))
+        if deleted.is_empty() && !failed.is_empty() {
+            return Err(BusError::conflict("git.branch_delete_failed", failed.join("; ")));
+        }
+        if !failed.is_empty() {
+            tracing::warn!(project = project.id, failed = %failed.join("; "), "git.branch.clean_merged kept branches git refused to delete");
+        }
+        Ok((project, deleted))
     }, |ctx: &mut Ctx, _p, (project, candidates)| {
         changed(ctx, project.id, Path::new(&project.path));
         Ok(CleanMergedOut {
@@ -1173,7 +1191,7 @@ fn revision_tree<'repo>(repo: &'repo gix::Repository, revision: &str) -> Result<
     let id = match repo.rev_parse_single(revision) {
         Ok(id) => id,
         Err(_) if revision == "HEAD" => return Ok(None),
-        Err(error) => return Err(BusError::unavailable("git.revision", error.to_string())),
+        Err(error) => return Err(revision_err(revision)(error)),
     };
     let tree = id
         .object()
@@ -1305,9 +1323,11 @@ fn commit_from_gix(c: gix::Commit<'_>) -> Result<Commit, BusError> {
         .body
         .map(|b| b.to_string().trim_end().to_string())
         .unwrap_or_default();
+    // git accepts dates jiff cannot represent (past year 9999); one such commit in an imported
+    // history must not fail the whole page, so its date is left unknown (RA-374).
     let at = jiff::Timestamp::from_second(author.seconds())
-        .map_err(|e| BusError::internal(e.to_string()))?
-        .to_string();
+        .map(|at| at.to_string())
+        .unwrap_or_default();
     Ok(Commit {
         sha: c.id.to_string(),
         parents: c.parent_ids().map(|p| p.to_string()).collect(),
@@ -1323,7 +1343,10 @@ fn upstream_metrics(
     repo: &gix::Repository,
     branch: &str,
 ) -> (Option<String>, Option<i64>, Option<i64>) {
-    let Ok(reference) = repo.find_reference(branch) else {
+    // The full name: a short one is probed as `refs/<name>` and `refs/tags/<name>` first, so a
+    // tag `v2` or `refs/stash` would shadow the branch of the same name (RA-375).
+    let full = format!("refs/heads/{}", branch.trim_start_matches("refs/heads/"));
+    let Ok(reference) = repo.find_reference(full.as_str()) else {
         return (None, None, None);
     };
     let Some(Ok(name)) = reference.remote_tracking_ref_name(gix::remote::Direction::Fetch) else {
@@ -1359,8 +1382,36 @@ fn divergence(
     Some((count(local, remote)?, count(remote, local)?))
 }
 
-/// Bounded network preflight, called outside the store transaction.
+/// One lock per repository (keyed by its common git dir, so every worktree of a clone shares
+/// it), holding when its last successful fetch finished. Two `git fetch --all --prune` in one
+/// repository race on the same remote-tracking ref locks and one of them fails (RA-376).
+type FetchLock = std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>;
+fn fetch_lock(root: &Path) -> FetchLock {
+    static LOCKS: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, FetchLock>>> = std::sync::OnceLock::new();
+    let key = gix::open(root)
+        .map(|repo| repo.common_dir().to_path_buf())
+        .unwrap_or_else(|_| root.to_path_buf());
+    let key = std::fs::canonicalize(&key).unwrap_or(key);
+    let mut locks = LOCKS.get_or_init(Default::default).lock().unwrap_or_else(|p| p.into_inner());
+    locks.entry(key).or_default().clone()
+}
+
+/// Bounded network preflight, called outside the store transaction. Fetches of one repository
+/// run one at a time, and a caller that waited on another's fetch reuses it when it succeeded:
+/// it finished after this caller asked, so it is at most one fetch's duration staler than its own.
 pub fn fetch_remote(root: &Path) -> Result<(), BusError> {
+    let asked = std::time::Instant::now();
+    let lock = fetch_lock(root);
+    let mut last = lock.lock().unwrap_or_else(|p| p.into_inner());
+    if last.is_some_and(|done| done >= asked) {
+        return Ok(());
+    }
+    fetch_remote_now(root)?;
+    *last = Some(std::time::Instant::now());
+    Ok(())
+}
+
+fn fetch_remote_now(root: &Path) -> Result<(), BusError> {
     let mut command = std::process::Command::new("git");
     command
         .current_dir(root)
@@ -1757,11 +1808,31 @@ fn switch_target(root: &Path, requested: &str) -> Result<SwitchTarget, BusError>
     Err(BusError::not_found("git.branch_not_found", format!("no local or remote branch {name}")))
 }
 
+/// `git push`, bounded, and never prompting for credentials on whatever terminal the engine was
+/// started from: a push that needs them fails instead of waiting for a person who is not there
+/// (RA-372). As generous as any other git mutation, since an LFS upload can be large.
+fn run_push(root: &Path, args: &[&str]) -> Result<(), BusError> {
+    let mut command = std::process::Command::new("git");
+    command.arg("-C").arg(root).args(args).env("GIT_TERMINAL_PROMPT", "0").stdin(std::process::Stdio::null());
+    let output = crate::proc::output_with_timeout(&mut command, std::time::Duration::from_secs(600))
+        .map_err(|error| BusError::conflict("git.push_failed", error.to_string()))?
+        .ok_or_else(|| BusError::unavailable("git.push_failed", "git push did not finish within 10 minutes; check the remote before pushing again"))?;
+    if !output.status.success() {
+        return Err(BusError::conflict(
+            "git.push_failed",
+            format!("git {} failed: {}", args.join(" "), String::from_utf8_lossy(&output.stderr).trim()),
+        ));
+    }
+    Ok(())
+}
+
 /// `git switch`, bounded, with its refusals turned into errors a person can act on. Git never
 /// discards anything on these paths: every refusal leaves the checkout as it was.
 fn run_switch(root: &Path, args: &[&str], branch: &str) -> Result<(), BusError> {
     let mut command = std::process::Command::new("git");
-    command.arg("-C").arg(root).args(args).env("GIT_TERMINAL_PROMPT", "0");
+    // Its refusals are told apart by their English text below, which gettext would translate.
+    command.arg("-C").arg(root).args(args).env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C").env("LANGUAGE", "C");
     let output = crate::proc::output_with_timeout(&mut command, std::time::Duration::from_secs(120))
         .map_err(|error| BusError::unavailable("git.branch_switch_failed", error.to_string()))?
         .ok_or_else(|| BusError::unavailable("git.branch_switch_failed", "git switch did not finish within 2 minutes"))?;
@@ -1855,6 +1926,57 @@ fn remote_branches(
 
 fn gix_err<E: std::fmt::Display>(code: &'static str) -> impl Fn(E) -> BusError {
     move |e| BusError::unavailable(code, e.to_string())
+}
+
+/// A revision that did not resolve is the caller's to fix, not an outage (RA-369): one git
+/// cannot parse is `invalid`, a well-formed one naming nothing is `not_found`, and only a
+/// failure to read the repository on the way stays `unavailable`.
+fn revision_err(spec: &str) -> impl Fn(gix::revision::spec::parse::single::Error) -> BusError + '_ {
+    move |error| {
+        use gix::revision::spec::parse::single::Error;
+        let message = format!("{spec}: {error}");
+        let Error::Parse(source) = &error else {
+            return BusError::invalid("git.revision", message);
+        };
+        let unreadable = source.sources().any(|e| {
+            e.downcast_ref::<std::io::Error>().is_some_and(|io| io.kind() != std::io::ErrorKind::NotFound)
+        });
+        if unreadable {
+            BusError::unavailable("git.revision", message)
+        } else if revision_syntax_ok(spec) {
+            BusError::not_found("git.revision", message)
+        } else {
+            BusError::invalid("git.revision", message)
+        }
+    }
+}
+
+/// Whether `spec` is a well-formed revspec, by git's grammar alone: every lookup succeeds.
+fn revision_syntax_ok(spec: &str) -> bool {
+    use gix::bstr::BStr;
+    use gix::revision::plumbing::spec::parse::{delegate, Delegate};
+    use gix::Exn;
+    struct Grammar;
+    impl delegate::Revision for Grammar {
+        fn find_ref(&mut self, _: &BStr) -> Result<(), Exn> { Ok(()) }
+        fn disambiguate_prefix(&mut self, _: gix::hash::Prefix, _: Option<delegate::PrefixHint<'_>>) -> Result<(), Exn> { Ok(()) }
+        fn reflog(&mut self, _: delegate::ReflogLookup) -> Result<(), Exn> { Ok(()) }
+        fn nth_checked_out_branch(&mut self, _: usize) -> Result<(), Exn> { Ok(()) }
+        fn sibling_branch(&mut self, _: delegate::SiblingBranch) -> Result<(), Exn> { Ok(()) }
+    }
+    impl delegate::Navigate for Grammar {
+        fn traverse(&mut self, _: delegate::Traversal) -> Result<(), Exn> { Ok(()) }
+        fn peel_until(&mut self, _: delegate::PeelTo<'_>) -> Result<(), Exn> { Ok(()) }
+        fn find(&mut self, _: &BStr, _: bool) -> Result<(), Exn> { Ok(()) }
+        fn index_lookup(&mut self, _: &BStr, _: u8) -> Result<(), Exn> { Ok(()) }
+    }
+    impl delegate::Kind for Grammar {
+        fn kind(&mut self, _: gix::revision::plumbing::spec::Kind) -> Result<(), Exn> { Ok(()) }
+    }
+    impl Delegate for Grammar {
+        fn done(&mut self) -> Result<(), Exn> { Ok(()) }
+    }
+    gix::revision::plumbing::spec::parse(spec.into(), &mut Grammar).is_ok()
 }
 
 /// Which open session owns each branch of a project: the one store read behind a listing.
@@ -2155,5 +2277,78 @@ mod tests {
         assert!(fetch_remote(root).is_err());
         assert_eq!(git(root, &["rev-parse", "main"]), local);
         assert_eq!(new_worktree_base(root, "main").unwrap_err().code, "git.base_diverged");
+    }
+
+    /// RA-375: a tag (or `refs/<name>`) with a branch's name does not hide its upstream.
+    #[test]
+    fn upstream_metrics_finds_a_branch_shadowed_by_a_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-b", "main"]);
+        git(root, &["config", "user.name", "Fixture"]);
+        git(root, &["config", "user.email", "fixture@example.test"]);
+        git(root, &["commit", "--allow-empty", "-m", "base"]);
+        let base = git(root, &["rev-parse", "HEAD"]);
+        git(root, &["config", "branch.main.remote", "origin"]);
+        git(root, &["config", "branch.main.merge", "refs/heads/main"]);
+        git(root, &["config", "remote.origin.url", "/nonexistent/relay-fixture"]);
+        git(root, &["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"]);
+        git(root, &["update-ref", "refs/remotes/origin/main", &base]);
+        git(root, &["tag", "main"]);
+        let metrics = upstream_metrics(&gix::open(root).unwrap(), "main");
+        assert_eq!(metrics, (Some("origin/main".into()), Some(0), Some(0)));
+    }
+
+    /// RA-376: fetches into one repository wait for each other instead of racing on its
+    /// remote-tracking ref locks, where one of them used to fail.
+    #[test]
+    fn concurrent_fetches_of_one_repository_all_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = dir.path().join("origin");
+        let checkout = dir.path().join("checkout");
+        std::fs::create_dir(&origin).unwrap();
+        git(&origin, &["init", "-b", "main"]);
+        git(&origin, &["config", "user.name", "Fixture"]);
+        git(&origin, &["config", "user.email", "fixture@example.test"]);
+        git(&origin, &["commit", "--allow-empty", "-m", "initial"]);
+        git(dir.path(), &["clone", origin.to_str().unwrap(), checkout.to_str().unwrap()]);
+        let linked = dir.path().join("linked");
+        git(&checkout, &["worktree", "add", "-b", "linked", linked.to_str().unwrap()]);
+        for round in 0..3 {
+            git(&origin, &["commit", "--allow-empty", "-m", &format!("advance {round}")]);
+            let results: Vec<_> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..4)
+                    .map(|n| {
+                        let root = if n % 2 == 0 { checkout.clone() } else { linked.clone() };
+                        scope.spawn(move || fetch_remote(&root))
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            for result in results {
+                result.unwrap();
+            }
+            assert_eq!(git(&checkout, &["rev-parse", "origin/main"]), git(&origin, &["rev-parse", "HEAD"]));
+        }
+    }
+
+    /// RA-369: a revision that names nothing is not_found, one git cannot parse is invalid.
+    #[test]
+    fn unresolved_revisions_are_the_callers_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-b", "main"]);
+        git(root, &["config", "user.name", "Fixture"]);
+        git(root, &["config", "user.email", "fixture@example.test"]);
+        git(root, &["commit", "--allow-empty", "-m", "base"]);
+        let repo = gix::open(root).unwrap();
+        let kind = |spec: &str| repo.rev_parse_single(spec).map(|_| ()).map_err(|e| revision_err(spec)(e).kind);
+        assert_eq!(kind("main"), Ok(()));
+        for unknown in ["no-such-branch", "main~5", "deadbeefdeadbeef"] {
+            assert_eq!(kind(unknown), Err(relay_bus::ErrorKind::NotFound), "{unknown}");
+        }
+        for malformed in ["main@{", "main^{nonsense}", "main..main"] {
+            assert_eq!(kind(malformed), Err(relay_bus::ErrorKind::Invalid), "{malformed}");
+        }
     }
 }

@@ -34,14 +34,36 @@ fn valid_name(name: &str) -> Result<&str, relay_bus::BusError> {
     Ok(name)
 }
 
+/// The arrangement `ui.layout.save` stores when it is given none: the one the native client
+/// last saved for the project (`native.layout.current.<id>`), then the older engine key, then a
+/// plain grid. Reading only the older key, which nothing writes now, saved the grid every time
+/// (RA-419).
 fn fallback_state(ctx: &Ctx, project_id: i64) -> Result<Value, relay_bus::BusError> {
-    let current =
-        crate::handlers::settings::get(ctx.tx(), Some(&format!("layout.current.{project_id}")))?;
-    Ok(if current.is_null() {
-        json!({"page":"agents","agent_layout":"grid"})
-    } else {
-        current
-    })
+    for path in [format!("native.layout.current.{project_id}"), format!("layout.current.{project_id}")] {
+        let current = crate::handlers::settings::get(ctx.tx(), Some(&path))?;
+        if !current.is_null() {
+            return Ok(current);
+        }
+    }
+    Ok(json!({"page":"agents","agent_layout":"grid"}))
+}
+
+/// A popout window whose last pane left it is gone; only `main` may stand empty.
+fn drop_empty_windows(windows: &mut Vec<WindowInfo>) {
+    windows.retain(|window| window.main || !window.panes.is_empty());
+}
+
+/// `xdg-open` returns as soon as it has handed the target over; wait for it on a thread of its
+/// own so it is reaped rather than left defunct for the engine's lifetime (RA-421).
+fn xdg_open(target: &std::ffi::OsStr) {
+    match std::process::Command::new("xdg-open").arg(target).spawn() {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(error) => tracing::warn!(error = %error, "xdg-open"),
+    }
 }
 
 pub fn register(engine: &mut Engine) {
@@ -116,8 +138,12 @@ pub fn register(engine: &mut Engine) {
         for window in &mut ui.windows {
             window.panes.retain(|pane| pane != &payload.pane);
         }
+        drop_empty_windows(&mut ui.windows);
         if ui.focused.as_deref() == Some(payload.pane.as_str()) {
             ui.focused = ui.panes.last().map(|pane| pane.pane.clone());
+            if let Some(last) = ui.panes.last_mut() {
+                last.focused = true;
+            }
         }
         drop(ui);
         ctx.emit(
@@ -166,24 +192,43 @@ pub fn register(engine: &mut Engine) {
                     format!("no pane {}", payload.pane),
                 )
             })?;
-        let to = ui
-            .panes
-            .iter()
-            .position(|pane| pane.pane == payload.to)
-            .ok_or_else(|| {
-                relay_bus::BusError::not_found(
-                    "ui.pane_not_found",
-                    format!("no pane {}", payload.to),
-                )
-            })?;
-        let pane = ui.panes.remove(from);
-        let at = to.min(ui.panes.len());
+        if !ui.panes.iter().any(|pane| pane.pane == payload.to) {
+            return Err(relay_bus::BusError::not_found(
+                "ui.pane_not_found",
+                format!("no pane {}", payload.to),
+            ));
+        }
+        if payload.pane == payload.to {
+            return Err(relay_bus::BusError::invalid(
+                "ui.pane_move",
+                "a pane cannot be moved relative to itself",
+            ));
+        }
+        // The model is an ordered list per window, so an edge says which side of the target
+        // the pane lands on: before it for top and left, after it for bottom, right and center
+        // (stacked onto it). The pane joins the target's window (RA-420).
+        let after = matches!(payload.edge.as_str(), "bottom" | "right" | "center");
+        let mut pane = ui.panes.remove(from);
+        let (to, window_id) = ui.panes.iter().enumerate()
+            .find(|(_, item)| item.pane == payload.to)
+            .map(|(at, item)| (at, item.window_id.clone()))
+            .unwrap_or((ui.panes.len(), pane.window_id.clone()));
+        pane.window_id = window_id.clone();
+        let at = (to + usize::from(after)).min(ui.panes.len());
         ui.panes.insert(at, pane);
+        for window in &mut ui.windows {
+            window.panes.retain(|item| item != &payload.pane);
+            if window.window_id == window_id {
+                let at = window.panes.iter().position(|item| item == &payload.to).map_or(window.panes.len(), |at| at + usize::from(after));
+                window.panes.insert(at, payload.pane.clone());
+            }
+        }
+        drop_empty_windows(&mut ui.windows);
         drop(ui);
-        ctx.emit(
-            "ui.changed",
-            json!({"move":{"pane":payload.pane,"to":payload.to,"edge":payload.edge}}),
-        );
+        // The whole model, as every other ui op sends it, and the move itself as D40 named it.
+        let mut changed = serde_json::to_value(state(ctx.engine())).bus()?;
+        changed["move"] = json!({"pane":payload.pane,"to":payload.to,"edge":payload.edge});
+        ctx.emit("ui.changed", changed);
         Ok(Empty {})
     });
     engine.register::<LayoutList>(|ctx, payload| {
@@ -282,6 +327,7 @@ pub fn register(engine: &mut Engine) {
         for window in &mut ui.windows {
             window.panes.retain(|pane| pane != &payload.pane);
         }
+        drop_empty_windows(&mut ui.windows);
         ui.windows.push(WindowInfo {
             window_id: window_id.clone(),
             main: false,
@@ -345,10 +391,23 @@ pub fn register(engine: &mut Engine) {
                 "path must be absolute",
             ));
         }
-        ctx.after_commit(move |_| {
-            let target = path.parent().unwrap_or(&path);
-            let _ = std::process::Command::new("xdg-open").arg(target).spawn();
-        });
+        // Reveal shows a folder: the path itself when it is one, else the folder holding it.
+        // Opening `parent()` blindly handed a file (`/x/app.jar` for `/x/app.jar/y`) to its
+        // desktop handler instead (RA-421).
+        let target = if path.is_dir() {
+            path
+        } else {
+            match path.parent() {
+                Some(parent) if parent.is_dir() => parent.to_path_buf(),
+                _ => {
+                    return Err(relay_bus::BusError::not_found(
+                        "os.path",
+                        format!("no folder to reveal for {}", path.display()),
+                    ))
+                }
+            }
+        };
+        ctx.after_commit(move |_| xdg_open(target.as_os_str()));
         Ok(Empty {})
     });
     engine.register::<OsOpenUrl>(|ctx: &mut Ctx, payload| {
@@ -358,11 +417,7 @@ pub fn register(engine: &mut Engine) {
                 "only http and https URLs are supported",
             ));
         }
-        ctx.after_commit(move |_| {
-            let _ = std::process::Command::new("xdg-open")
-                .arg(payload.url)
-                .spawn();
-        });
+        ctx.after_commit(move |_| xdg_open(payload.url.as_ref()));
         Ok(Empty {})
     });
 }
