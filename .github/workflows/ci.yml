@@ -27,7 +27,16 @@ jobs:
     name: engine, bus and CLI
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # The hosted runner's disk fills up with the workspace's debug-info test binaries; line
+    # tables are kept so a panic's backtrace still names its file and line.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
+      # The image ships toolchains this job never uses; dropping them frees about 20 GB.
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL && df -h /
+
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
