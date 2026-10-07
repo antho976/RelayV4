@@ -435,8 +435,9 @@ allowlisted — agents need `session.allow_ui` — and audited when `agent_only`
 an agent), against an in-memory shell model: page, project, panes, focus and windows. The model
 starts at the dashboard with one `main` window, is not persisted, and is the same whether or not
 a client is connected, so a headless engine answers `ui.*` with success too; there is no
-`ui.absent`. Every change emits `ui.changed` with the whole model, except `ui.pane.move`, which
-emits `{move: {pane, to, edge}}` (D40).
+`ui.absent`. Every change emits `ui.changed` with the whole model (D40); `ui.pane.move` adds
+`move: {pane, to, edge}` beside it (RA-420), so a client follows a move as it follows any other
+change.
 
 What reaches the screen is what the native client does with those events:
 
@@ -444,7 +445,7 @@ What reaches the screen is what the native client does with those events:
 |---|---|
 | `ui.page.switch` | follows: opens that project and page. It also sends `ui.page.switch` itself when you navigate, so `ui.state.page` tracks the window, and drops the echo of its own request |
 | `ui.pane.open` / `ui.pane.focus` | follows only a focused pane whose `target.session` is set: it focuses that session's terminal (on Agents). Any other target — a diff, a note, a file, a run, a mirror — opens nothing |
-| `ui.pane.close`, `ui.pane.move` | nothing |
+| `ui.pane.close`, `ui.pane.move` | nothing of their own; their `ui.changed` carries the whole model, so the client re-applies its page and focused session as for any other change (a no-op when they already match) |
 | `ui.window.popout` / `.close` | nothing: no OS window opens or closes |
 | `ui.toast` | shows the text in its notice bar; `level` and `ttl_ms` are carried but ignored |
 | `ui.layout.apply` | applies the stored state from `layout.changed` |
@@ -862,7 +863,7 @@ are `user_only` (§9.1). Agents get `done`, `report`, `attach`/`scrollback`, `bo
 | `session.peers` | query | `{ session }` or `{ project_id }` or `{}` → `{ peers: Peer[] }` — the live peer table (name, provider, branch, claimed files, task title, state). For an agent, neither target means "my project, minus me" |
 | `session.brief` | query | `{ session }` → `{ text, compact, parts: {state, peers, notes, adjacent, skills}: string }` — the knowledge injection, inspectable. `compact` is the half injected on every spawn: state, peers, notes and adjacent work, naming the enabled skills and the folders they are registered in (bodies stay on disk) and the launch assignment omitted (D101, D147). Own session or PAIR partner only |
 | `session.bootstrap` | query · agent | `{}` → `{ session, role, project_id, project, base_branch, worktree, branch, module?, task?, tasks: Task[], pair?, assignment?, brief_path, peers: Peer[], can_call: string[], discovery, comms, guardrails: {caps, denied_commands, write_roots, dry_run} }` — the one call every agent makes first, so it answers "who else is here and what may I do?" as well as "who am I" (D105). `discovery` points to `bus.ops`/`bus.schema` and their shell equivalents; `can_call` is the §9.1 verdict. User/unbound calls are `invalid`/`bus.actor` |
-| `session.update` | mutation · always · inverse · user | `{ session, branch?, model?, effort?, task_id?: Id\|null, module_id?: Id\|null, bus_writes?, allow_ui? }` → `Session` — `branch`/`model`/`effort` are `conflict`/`session.already_spawned` after first spawn; the rest any time |
+| `session.update` | mutation · always · inverse · user | `{ session, branch?, model?, effort?, task_id?: Id\|null, module_id?: Id\|null, bus_writes?, allow_ui? }` → `Session` — `branch`/`model`/`effort` are `conflict`/`session.already_spawned` after first spawn; the rest any time. A branch rename is refused `conflict`/`session.branch_primary` on the project's primary checkout and `conflict`/`session.branch_shared` on a checkout another session shares (RA-402) |
 | `session.report` | mutation · agent_only · session · agent | `{ session, kind: "session_start"\|"tool_use"\|"stop"\|"notification"\|"idle"\|"blocked", data?: object }` → `{}` — the provider's hooks calling home (§9.3); this is where `state: blocked`, `provider_ref` and "agent asking" notifications come from. Codex, having no hooks, degrades to PTY-derived idle/busy |
 | `session.attach` | query · stream | `{ session, from_seq?: number }` → attaches `pty` stream (replays scrollback from `from_seq`) |
 | `session.detach` | query | `{ session }` → `{}` |
@@ -999,7 +1000,7 @@ at it; one moved by hand without `git worktree move` is refused until `git workt
 | `avd.list` | query | `{}` → `{ avds: Avd[] }`; includes a running emulator serial when available |
 | `avd.catalog` | query | `{}` → `{ system_images, devices }`; installed SDK choices only |
 | `avd.create` | mutation · always | `{ name, package, device? }` → `Avd` |
-| `avd.boot` | mutation · always | `{ name, cold? }` → `{}`; boots headless (`-no-window`) — Relay's mirror is its screen. The emulator then appears through `device.list` and uses the normal deploy pipeline |
+| `avd.boot` | mutation · always | `{ name, cold? }` → `{}`; boots headless (`-no-window`) — Relay's mirror is its screen. The emulator then appears through `device.list` and uses the normal deploy pipeline. An AVD adb already lists as running is refused `conflict`/`avd.already_running`. `avd.changed {name, state, message?}` follows it: `booting`, then `started`, or `failed` / `stopped` with the emulator's `message` when it exits early (RA-349) |
 | `avd.stop` | mutation · always | `{ name }` → `{}`; `adb emu kill` on the running AVD (`avd.not_running` otherwise), since a headless emulator has no window to close |
 
 ### 10.15 provider / usage / skill / plugin
@@ -1053,7 +1054,7 @@ warning rather than failing every guardrail read.
 | `ui.pane.open` | mutation · agent_only | `{ kind: PaneKind, target?: PaneTarget }` → `{ pane: PaneRef }` — records the pane; the native client acts only on `target.session` (focuses that terminal), so e.g. `{kind:"diff", target:{sha}}` opens nothing on screen |
 | `ui.pane.close` / `ui.pane.focus` | mutation · agent_only | `{ pane: PaneRef }` → `{}` |
 | `ui.pane.move` | mutation · agent_only | `{ pane: PaneRef, to: PaneRef, edge: "top"\|"bottom"\|"left"\|"right"\|"center" }` → `{}` |
-| `ui.layout.list` / `ui.layout.save` / `ui.layout.apply` / `ui.layout.delete` | mutation · always · inverse (save/delete) | `{ project_id }` / `{ project_id, name, state? }` / `{ project_id, name }` / `{ project_id, name }` — opaque shell state is stored in core and an apply emits `layout.changed` for the UI |
+| `ui.layout.list` / `ui.layout.save` / `ui.layout.apply` / `ui.layout.delete` | mutation · always · inverse (save/delete) | `{ project_id }` / `{ project_id, name, state? }` / `{ project_id, name }` / `{ project_id, name }` — opaque shell state is stored in core and an apply emits `layout.changed` for the UI. A save without `state` stores the arrangement the native client last saved (`native.layout.current.<id>`), then the older `layout.current.<id>`, then a plain grid (RA-419, D150) |
 | `ui.window.popout` / `ui.window.close` | mutation · agent_only | `{ pane: PaneRef }` → `{ window_id }` / `{ window_id }` → `{}` — model only: no OS window opens or closes |
 | `ui.window.list` | query | `{}` → `{ windows: WindowInfo[] }` — the model's windows |
 | `ui.toast` | mutation · agent_only | `{ text, level?: "info"\|"warn"\|"error", ttl_ms? }` → `{}` — emits `ui.toast`; the native client shows the text in its notice bar |
