@@ -1,4 +1,6 @@
-//! One window-owned timer; only the canonical wallpaper changes between rotations.
+//! One window-owned timer. A rotation paints the next image in this window only: it is not
+//! written to `appearance.wallpaper`, because every audited settings.set keeps the previous
+//! image in the audit table for months. The saved wallpaper stays the user's choice.
 use crate::app::Ui;
 use crate::client::Error;
 use serde_json::{json, Value};
@@ -46,6 +48,23 @@ pub(crate) struct Rotation {
     signature: u64,
     revision: u64,
     running: bool,
+    /// The image a rotation put up, with the saved wallpaper it stood in for: a different
+    /// saved wallpaper (the user chose one) retires it.
+    rotated: Option<(Value, String)>,
+}
+
+/// The image this window shows for the saved wallpaper `saved`: the rotated one while the
+/// saved choice is unchanged, else the saved one.
+pub(crate) fn shown(ui: &Ui, saved: &Value) -> Value {
+    let mut state = ui.wallpaper_rotation.borrow_mut();
+    match &state.rotated {
+        Some((base, image)) if base == saved => json!(image),
+        Some(_) => {
+            state.rotated = None;
+            saved.clone()
+        }
+        None => saved.clone(),
+    }
 }
 
 impl Drop for Rotation {
@@ -117,6 +136,11 @@ fn configure(ui: &Rc<Ui>, config: &Value, library: &Value) {
         timer.remove();
     }
     if config["enabled"] != true || images(library).len() < 2 {
+        // Rotation off, or the library changed under it: show the saved wallpaper again.
+        if state.rotated.take().is_some() {
+            drop(state);
+            ui.load_appearance();
+        }
         return;
     }
     let minutes = config["interval_minutes"]
@@ -167,16 +191,15 @@ pub(crate) async fn rotate_once(ui: &Rc<Ui>) -> Result<bool, Error> {
     if images.len() < 2 {
         return Ok(false);
     }
+    let showing = shown(ui, &current["value"]);
     let candidates: Vec<_> = images
         .into_iter()
-        .filter(|image| Some(*image) != current["value"].as_str())
+        .filter(|image| Some(*image) != showing.as_str())
         .collect();
     let index = uuid::Uuid::new_v4().as_u128() % candidates.len() as u128;
-    ui.call(
-        "settings.set",
-        json!({"path":"appearance.wallpaper","value":candidates[index as usize]}),
-    )
-    .await?;
+    ui.wallpaper_rotation.borrow_mut().rotated =
+        Some((current["value"].clone(), candidates[index as usize].to_string()));
+    ui.load_appearance();
     Ok(true)
 }
 

@@ -136,3 +136,21 @@ fn clone_uses_workspace_when_engine_directory_was_removed() {
     assert!(workspace.join("cloned/.git").is_dir());
     assert_eq!(project["project"]["workspace_id"], ws["id"]);
 }
+
+#[test]
+fn a_settings_write_over_the_audit_limit_keeps_no_inverse() {
+    let engine = engine();
+    let image = format!("data:image/png;base64,{}", "A".repeat(80 * 1024));
+    ok(&engine, "settings.set", json!({"path":"appearance.wallpaper","value":image}));
+    ok(&engine, "settings.set", json!({"path":"appearance.wallpaper","value":"data:image/png;base64,small"}));
+    let rows = ok(&engine, "audit.list", json!({"op_prefix":"settings.set","limit":1}));
+    let id = rows["rows"][0]["id"].as_i64().unwrap();
+    // The previous image is not copied into the audit row, so this write cannot be undone.
+    let undo = call(&engine, "audit.undo", json!({"audit_id":id})).into_result().unwrap_err();
+    assert_eq!(undo.code, "audit.not_undoable");
+    // A small previous value still has its inverse.
+    ok(&engine, "settings.set", json!({"path":"appearance.wallpaper","value":"data:image/png;base64,other"}));
+    let rows = ok(&engine, "audit.list", json!({"op_prefix":"settings.set","limit":1}));
+    ok(&engine, "audit.undo", json!({"audit_id":rows["rows"][0]["id"]}));
+    assert_eq!(ok(&engine, "settings.get", json!({"path":"appearance.wallpaper"}))["value"], "data:image/png;base64,small");
+}

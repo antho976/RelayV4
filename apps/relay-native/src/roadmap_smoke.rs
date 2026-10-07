@@ -481,21 +481,18 @@ pub(crate) async fn run(ui: &Rc<Ui>) -> Value {
         crate::wallpaper_rotation::rotate_once(ui).await.unwrap(),
         "Enabled rotation must select a distinct next image"
     );
-    let rotated =
-        call(ui, "settings.get", json!({"path":"appearance.wallpaper"})).await["value"].clone();
+    // A rotation paints this window only; the saved wallpaper, and the audit table, are untouched.
+    let rotated = crate::wallpaper_rotation::shown(ui, &second);
     assert_ne!(rotated, second);
-    let selected = presets
-        .iter()
-        .position(|preset| preset["image"] == rotated)
-        .expect("Rotation chooses another bundled wallpaper");
-    wait(
-        || {
-            named(&ui.window, &format!("settings-wallpaper-pick-{selected}"))
-                .is_some_and(|w| w.has_css_class("active"))
-        },
-        "Canonical rotation updates the retained Settings selection",
-    )
-    .await;
+    assert!(
+        presets.iter().any(|preset| preset["image"] == rotated),
+        "Rotation chooses another bundled wallpaper"
+    );
+    assert_eq!(
+        call(ui, "settings.get", json!({"path":"appearance.wallpaper"})).await["value"],
+        second,
+        "Rotation must not rewrite the saved wallpaper"
+    );
     assert_eq!(
         call(ui, "settings.get", json!({"path":"appearance.panel_alpha"})).await["value"],
         0.81,

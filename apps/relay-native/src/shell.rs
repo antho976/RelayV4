@@ -1113,7 +1113,7 @@ impl Ui {
             }
         });
     }
-    pub(super) fn load_appearance(self: &Rc<Self>) {
+    pub(crate) fn load_appearance(self: &Rc<Self>) {
         crate::wallpaper_rotation::refresh(self);
         let ui = self.clone();
         glib::spawn_future_local(async move {
@@ -1217,9 +1217,11 @@ impl Ui {
                     .clamp(0., 0.85),
             );
             if let Ok(v) = image {
+                // Settings keeps showing the saved choice; a rotation only paints this window.
                 crate::tools::settings::sync_wallpaper(&ui, &v["value"]);
+                let image = crate::wallpaper_rotation::shown(&ui, &v["value"]);
                 use base64::Engine;
-                if let Some(data) = v["value"].as_str().and_then(|s| {
+                if let Some(data) = image.as_str().and_then(|s| {
                     s.strip_prefix("data:image/jpeg;base64,")
                         .or_else(|| s.strip_prefix("data:image/png;base64,"))
                 }) {
