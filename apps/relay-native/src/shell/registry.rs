@@ -280,7 +280,7 @@ impl Ui {
             let Some(ui) = weak.upgrade() else { return };
             if let Some(id) = sidebar(|s| s.first_match) {
                 entry.set_text("");
-                ui.open_project(id, "agents");
+                ui.switch_project(id);
             }
         });
         entry.connect_stop_search(|entry| entry.set_text(""));
@@ -413,7 +413,7 @@ impl Ui {
         let weak = Rc::downgrade(self);
         b.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
-                ui.open_project(id, "agents");
+                ui.switch_project(id);
             }
         });
         row.set_child(Some(&b));

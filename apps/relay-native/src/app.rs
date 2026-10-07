@@ -277,6 +277,9 @@ pub struct Ui {
     pub(crate) workspaces: RefCell<Vec<Value>>,
     rendered_sessions: RefCell<BTreeMap<String, Value>>,
     restored_project: Cell<i64>,
+    /// The project an explicit destination was opened for: its layout restore applies
+    /// everything but the saved page.
+    explicit_page: Cell<i64>,
     layout_revision: Cell<u64>,
     layout_saves: RefCell<BTreeMap<i64, Value>>,
     layout_saving: Cell<bool>,
@@ -790,6 +793,7 @@ impl Ui {
             workspaces: RefCell::default(),
             rendered_sessions: RefCell::default(),
             restored_project: Cell::new(0),
+            explicit_page: Cell::new(0),
             layout_revision: Cell::new(0),
             layout_saves: RefCell::default(),
             layout_saving: Cell::new(false),

@@ -236,8 +236,15 @@ pub(crate) async fn run(ui: &Rc<Ui>) -> Value {
     println!("TERMINAL_PROJECT_ROUNDTRIPS=4");
 
     call(ui, "git.branch.create", json!({"project_id":other,"name":"switch-fixture","checkout":false})).await;
-    ui.open_project(other, "files");
+    // An explicit destination survives the project's layout restore; the Git panel is drawn
+    // only while it is shown.
+    ui.open_project(other, "code");
+    let git_hidden = ui.editor.layout_state()["git"] != true;
+    if git_hidden {
+        ui.editor.toggle_git();
+    }
     wait(|| named(&ui.window, "branch-switch-switch-fixture").is_some(), "branch switch control").await;
+    assert!(!ui.editor.agents_visible(), "Files and Git must stay open after the layout restore");
     let switch = named(&ui.window, "branch-switch-switch-fixture").unwrap().downcast::<gtk::Button>().unwrap();
     assert!(switch.is_sensitive());
     switch.emit_clicked();
@@ -250,6 +257,9 @@ pub(crate) async fn run(ui: &Rc<Ui>) -> Value {
         glib::timeout_future(Duration::from_millis(20)).await;
     }
     assert!(switched, "Switch button must check out its branch");
+    if git_hidden {
+        ui.editor.toggle_git();
+    }
     println!("BRANCH_SWITCH_CONTROL=ok");
     ui.open_project(project, "agents");
 
