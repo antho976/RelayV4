@@ -336,7 +336,7 @@ fn log_and_show_survive_an_out_of_range_author_date() {
     let raw = format!(
         "tree {tree}\nparent {parent}\nauthor Far Future <far@example.test> 999999999999 +0000\ncommitter Far Future <far@example.test> 999999999999 +0000\n\nfrom the far future\n"
     );
-    let mut child = Command::new("git").arg("-C").arg(root).args(["hash-object", "-t", "commit", "-w", "--literally", "--stdin"])
+    let mut child = git_command(root).args(["hash-object", "-t", "commit", "-w", "--literally", "--stdin"])
         .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().unwrap();
     std::io::Write::write_all(&mut child.stdin.take().unwrap(), raw.as_bytes()).unwrap();
     let out = child.wait_with_output().unwrap();
