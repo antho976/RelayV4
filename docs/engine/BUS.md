@@ -815,7 +815,7 @@ Provider-neutral Markdown; the same for both providers.
 | `git.status` | query | `{ project_id, worktree? }` → `{ branch, upstream?, ahead, behind, files: FileStatus[] }` |
 |  |  | **`worktree` throughout `git.*` and `file.*`:** omitted, it is the caller's own session worktree for an agent and the project root for the user. `"@project"` asks for the project root explicitly. Defaulting an agent to the project root returned confident, well-formed, wrong answers with no error either way (D111) |
 | `git.diff` | query | `{ project_id, worktree?, base?, staged? }` → `{ files: DiffFile[] }` |
-| `git.diff.file` | query | `{ project_id, worktree?, path, base? }` → `{ old, new, hunks }` (for `@codemirror/merge`) |
+| `git.diff.file` | query | `{ project_id, worktree?, path, base? }` → `{ old, new, hunks }` (for `@codemirror/merge`); refuses a binary file (`git.diff_binary`) or one whose old + new text passes 1 MiB (`git.diff_too_large`) before building the reply |
 | `git.log` | query | `{ project_id, worktree?, branch?, limit? = 200, graph? }` → `{ commits: Commit[] }` |
 | `git.show` | query | `{ project_id, sha }` → `{ commit: Commit, files: DiffFile[] }` |
 | `git.branches` | query | `{ project_id, worktree? }` → `{ current, branches: Branch[] }` (with merged flag and session owner; `current` follows the selected worktree) |
@@ -825,7 +825,7 @@ Provider-neutral Markdown; the same for both providers.
 | `git.commit` | mutation · always | `{ project_id, worktree?, message, all?: bool }` → `{ sha }` — caps and protected paths apply |
 | `git.fetch` | mutation · agent_only | `{ project_id }` → `{ ahead, behind }` |
 | `git.push` | mutation · always | `{ project_id, worktree?, set_upstream? = auto }` → `{}` — a branch without an upstream is first-pushed as `git push -u origin <branch>`; explicit `false` keeps plain-push behavior |
-| `git.pr.list` | query | `{ project_id }` → `{ pull_requests: { number, branch, draft, url, title }[] }` — open GitHub PRs reported by the authenticated `gh` CLI |
+| `git.pr.list` | query | `{ project_id }` → `{ pull_requests: { number, branch, draft, url, title }[] }` — open GitHub PRs reported by the authenticated `gh` CLI; one answer serves the repository for 60 s, and `git.pr.open` clears it |
 | `git.pr.open` | mutation · always | `{ project_id, worktree?, title?, body? }` → `{ url }` |
 | `git.branch.clean_merged` | mutation · always | `{ project_id, dry_run? }` → `{ deleted: string[] }` — never touches branches with a live/parked session |
 | `git.suggest_message` | query | `{ project_id, worktree? }` → `{ message }` — heuristic subject from the diff |
@@ -850,7 +850,7 @@ All paths are relative to the worktree root; `..` and absolute paths are `invali
 | `file.restore` | mutation · always | `{ project_id, trash_id }` → `Entry` |
 | `file.import` | mutation · always | `{ project_id, worktree?, into, sources: path[] }` → `{ entries: Entry[] }` — OS drag-in |
 | `file.restore_head` | mutation · always · user | `{ project_id, worktree?, path }` → `Entry` — `git checkout -- <path>`; the one-click answer to a post-hoc `guardrail.violation` (§9.3) |
-| `file.search` | query | `{ project_id, worktree?, query, glob?, regex?, limit? }` → `{ hits: {path, line, col, text}[] }` |
+| `file.search` | query | `{ project_id, worktree?, query, glob?, regex?, limit? }` → `{ hits: {path, line, col, text}[] }`; searches regular text files only, skipping files over 4 MiB and any with a NUL in the first 8 KiB |
 
 ### 10.14 device (SPEC §9)
 

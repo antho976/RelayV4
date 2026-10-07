@@ -743,7 +743,7 @@ thread_local! {
     /// The page's cards by request or hold, kept across refreshes: a half-typed denial reason,
     /// a reviewed exact action or an open expander survives every event that does not resolve
     /// that card.
-    static CARDS: RefCell<(i64, Vec<(String, gtk::Box)>)> = RefCell::new((0, Vec::new()));
+    static CARDS: RefCell<(i64, Vec<(String, gtk::Box)>)> = const { RefCell::new((0, Vec::new())) };
     /// What the page last drew; an event that changes none of it leaves the page alone.
     static DRAWN: Cell<u64> = const { Cell::new(0) };
 }
