@@ -9,67 +9,108 @@
 .notes-chrome { min-height: 30px; background: @console; border-bottom: 1px solid @edge; }
 .notes-chrome-mark { margin: 0 4px 0 11px; color: @faint; }
 .notes-chrome menubar { background: transparent; padding: 0; }
-.notes-chrome menubar > item { min-height: 30px; padding: 0 9px; border-radius: 0; color: @secondary; font-size: 12px; font-weight: 500; }
+.notes-chrome menubar > item { min-height: 24px; margin: 3px 1px; padding: 0 9px; border-radius: 5px; color: @secondary; font-size: 12px; font-weight: 500; }
 .notes-chrome menubar > item:hover,
-.notes-chrome menubar > item:selected { background: @wash; color: @ink; }
+.notes-chrome menubar > item:selected { background: alpha(@ink, 0.09); color: @ink; }
 .notes-heading { color: @secondary; font-size: 12px; font-weight: 500; }
 .notes-chrome-controls button { min-height: 30px; min-width: 40px; padding: 0; border: 0; border-radius: 0; background: transparent; color: @secondary; }
 .notes-chrome-controls button:hover { background: @wash; color: @ink; }
 /* The conventional window-close red, deliberately outside the palette. */
 .notes-chrome-controls button.notes-window-close:hover { background: #c42b1c; color: white; }
 
-/* ---- menus ---- */
-.notes-window popover.menu > contents { padding: 4px; min-width: 232px; background: @slab; border: 1px solid @strong; border-radius: 3px; }
-.notes-window popover.menu modelbutton { min-height: 27px; padding: 0 10px; border-radius: 2px; color: @ink; font-size: 12px; }
+/* ---- menus: the menu bar's, the library's and the editor's right-click menus ----
+   Popovers are surfaces of their own, so they take the opaque surface colours. */
+.notes-window popover.menu > contents,
+.notes-window popover.notes-customize > contents { padding: 5px; min-width: 236px; background: @slab_solid; border: 1px solid @strong; border-radius: 9px; box-shadow: 0 14px 34px alpha(black, 0.5), 0 2px 8px alpha(black, 0.3); }
+.notes-window popover.menu > arrow { background: @slab_solid; border: 1px solid @strong; }
+.notes-window popover.menu box,
+.notes-window popover.menu modelbutton { background: transparent; }
+.notes-window popover.menu modelbutton { min-height: 30px; padding: 0 10px 0 9px; border-radius: 5px; color: @ink; font-size: 12.5px; transition: background 80ms ease-out; }
 .notes-window popover.menu modelbutton:hover,
-.notes-window popover.menu modelbutton:selected { background: @wash; }
-.notes-window popover.menu modelbutton:disabled { color: @faint; }
-.notes-window popover.menu modelbutton accelerator { margin-left: 28px; color: @faint; font-size: 11px; }
+.notes-window popover.menu modelbutton:selected,
+.notes-window popover.menu modelbutton:focus-visible { background: alpha(@ink, 0.085); outline: none; }
+.notes-window popover.menu modelbutton:active { background: alpha(@ink, 0.13); }
+.notes-window popover.menu modelbutton:disabled { color: alpha(@ink, 0.32); }
+.notes-window popover.menu modelbutton:disabled accelerator { color: alpha(@ink, 0.2); }
+.notes-window popover.menu modelbutton accelerator { margin-left: 32px; color: @faint; font-family: 'Fira Sans', sans-serif; font-size: 11px; font-feature-settings: "tnum"; }
 .notes-window popover.menu modelbutton check,
-.notes-window popover.menu modelbutton radio { min-width: 14px; min-height: 14px; margin-right: 8px; }
-.notes-window popover.menu separator { min-height: 1px; margin: 4px 2px; background: @edge; }
-.notes-window popover.menu .title { padding: 6px 10px 3px; color: @faint; font-size: 11px; font-weight: 600; }
+.notes-window popover.menu modelbutton radio { min-width: 14px; min-height: 14px; margin-right: 9px; border: 1px solid @strong; background: transparent; }
+.notes-window popover.menu modelbutton check { border-radius: 4px; }
+.notes-window popover.menu modelbutton check:checked,
+.notes-window popover.menu modelbutton radio:checked { border-color: @ink; background: @ink; color: @wall_solid; }
+.notes-window popover.menu modelbutton arrow { min-width: 14px; min-height: 14px; color: @faint; }
+.notes-window popover.menu separator { min-height: 1px; margin: 5px 6px; background: @edge; }
+.notes-window popover.menu .title { padding: 7px 10px 4px; color: @faint; font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif; font-size: 10.5px; font-weight: 600; letter-spacing: 0.08em; }
+/* GTK's Cut / Copy / Paste icon row on the editor's menu. */
+.notes-window popover.menu box.inline-buttons { padding: 2px 4px 4px; }
+.notes-window popover.menu box.inline-buttons button { min-width: 34px; min-height: 30px; margin: 0 1px; border: 0; border-radius: 5px; background: transparent; color: @secondary; }
+.notes-window popover.menu box.inline-buttons button:hover { background: alpha(@ink, 0.085); color: @ink; }
+.notes-window popover.menu box.circular-buttons button { min-width: 30px; min-height: 30px; border: 1px solid @edge; border-radius: 99px; background: transparent; color: @secondary; }
+.notes-window popover.menu box.circular-buttons button:hover { background: alpha(@ink, 0.085); color: @ink; }
+/* Other popovers here (sort, project switcher, go to line). */
+.notes-window popover > contents { background: @slab_solid; border-color: @strong; border-radius: 9px; }
 
 /* ---- toolbar ---- */
-.notes-toolbar { min-height: 36px; padding: 0 6px; background: @console; border-bottom: 1px solid @edge; }
+.notes-toolbar { min-height: 38px; padding: 0 6px; background: @console; border-bottom: 1px solid @edge; }
 button.notes-tool,
-.notes-tool-menu > button { min-width: 30px; min-height: 28px; margin: 4px 0; padding: 0; border: 0; border-radius: 3px; background: transparent; color: @secondary; box-shadow: none; }
+.notes-tool-menu > button { min-width: 30px; min-height: 28px; margin: 5px 0; padding: 0 7px; border: 0; border-radius: 6px; background: transparent; color: @secondary; box-shadow: none; transition: background 80ms ease-out, color 80ms ease-out; }
+button.notes-tool.labelled,
+.notes-tool-menu.labelled > button { padding: 0 9px 0 7px; }
 button.notes-tool:hover,
 .notes-tool-menu > button:hover,
-.notes-tool-menu > button:checked { background: @wash; color: @ink; }
-button.notes-tool:active { background: alpha(@ink, 0.12); }
+.notes-tool-menu > button:checked { background: alpha(@ink, 0.08); color: @ink; }
+button.notes-tool:active { background: alpha(@ink, 0.13); }
 button.notes-tool:disabled { opacity: 0.32; }
-button.notes-tool-text,
-.notes-tool-menu > button { font-family: 'Fira Sans', sans-serif; font-size: 14px; }
-button.notes-tool-bold { font-weight: 700; }
-button.notes-tool-italic { font-style: italic; font-family: serif; font-size: 15px; }
-.notes-tool-menu > button { font-weight: 600; }
-.notes-tool-sep { min-width: 1px; margin: 9px 5px; background: @edge; }
-.notes-picker .workspace-picker > button { min-height: 26px; }
+.notes-tool-caption { font-size: 12px; font-weight: 500; }
+.notes-tool-mark { min-width: 16px; font-family: 'Fira Sans', sans-serif; font-size: 14px; font-weight: 600; }
+.notes-tool-mark-bold { font-weight: 800; }
+.notes-tool-mark-italic { font-family: serif; font-style: italic; font-size: 15.5px; font-weight: 500; }
+.notes-tool-mark-heading { font-weight: 700; }
+.notes-tool-sep { min-width: 1px; margin: 11px 5px; background: @edge; }
+
+/* ---- toolbar settings (right-click the toolbar, or View > Customize toolbar) ---- */
+.notes-window popover.notes-customize > contents { padding: 6px 6px 8px; min-width: 330px; }
+.notes-customize-title { padding: 6px 8px 8px; color: @ink; font-size: 13px; font-weight: 600; }
+.notes-customize-row { padding: 6px 8px; margin: 0 0 4px; border-radius: 6px; background: alpha(@ink, 0.04); }
+.notes-customize-caption { color: @ink; font-size: 12px; }
+.notes-customize-section { padding: 10px 8px 4px; color: @faint; font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif; font-size: 10.5px; font-weight: 600; letter-spacing: 0.08em; }
+checkbutton.notes-customize-check { min-height: 30px; padding: 0 8px; border-radius: 5px; }
+checkbutton.notes-customize-check:hover { background: alpha(@ink, 0.06); }
+checkbutton.notes-customize-check > check { margin-right: 9px; min-width: 14px; min-height: 14px; border-radius: 4px; }
+checkbutton.notes-customize-check image,
+checkbutton.notes-customize-check .notes-tool-mark { color: @secondary; }
+.notes-customize-foot { padding: 8px 8px 0; margin-top: 6px; border-top: 1px solid @edge; }
+.notes-customize-hint { color: @faint; font-size: 11px; }
+button.notes-customize-reset { min-height: 26px; padding: 0 10px; border-radius: 5px; font-size: 11.5px; }
 
 /* ---- library ---- */
 .notes-split > separator { min-width: 1px; background: @edge; }
 .notes-library { background: @console; }
 .notes-library scrolledwindow, .notes-library viewport { background: @console; }
-.notes-library-head { min-height: 36px; padding: 0 6px 0 13px; }
-.notes-library-title { color: @faint; font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; }
-.notes-library-count { color: @faint; font-size: 11px; }
+.notes-picker { padding: 8px 8px 4px; }
+.notes-picker .workspace-picker > button { min-height: 32px; padding: 0 10px; border: 1px solid @edge; border-radius: 7px; background: alpha(@ink, 0.03); }
+.notes-picker .workspace-picker > button:hover,
+.notes-picker .workspace-picker > button:checked { border-color: @strong; background: alpha(@ink, 0.07); }
+.notes-picker .workspace-picker-label { color: @ink; font-size: 12px; font-weight: 500; }
+.notes-picker .workspace-picker image { color: @faint; }
+.notes-picker-space { margin-right: 2px; padding: 1px 6px; border-radius: 4px; background: alpha(@ink, 0.07); color: @secondary; font-size: 10.5px; font-weight: 500; }
+.notes-library-head { padding: 4px 6px 8px 8px; }
 button.notes-library-key,
-.notes-library-key > button { min-width: 26px; min-height: 26px; margin: 0; padding: 0; border: 0; border-radius: 3px; background: transparent; color: @secondary; }
+.notes-library-key > button { min-width: 30px; min-height: 30px; margin: 0; padding: 0; border: 0; border-radius: 6px; background: transparent; color: @secondary; }
 button.notes-library-key:hover,
 .notes-library-key > button:hover,
-.notes-library-key > button:checked { background: @wash; color: @ink; }
-entry.notes-library-search { margin: 0 8px 8px; min-height: 28px; background: @wall; border-color: @edge; font-size: 12px; }
-list.notes-list { background: @console; padding-bottom: 8px; }
-list.notes-list > row.notes-row { padding: 8px 12px 9px 11px; border-left: 2px solid transparent; border-radius: 0; background: transparent; }
-list.notes-list > row.notes-row:hover { background: alpha(@ink, 0.035); }
-list.notes-list > row.notes-row:selected { background: alpha(@ink, 0.075); border-left-color: @ink; }
+.notes-library-key > button:checked { background: alpha(@ink, 0.08); color: @ink; }
+entry.search.notes-library-search { margin: 0 2px 0 0; background: @wall_solid; }
+list.notes-list { background: @console; padding: 0 6px 8px; }
+list.notes-list > row.notes-row { margin: 1px 0; padding: 8px 10px 9px 10px; border-radius: 6px; background: transparent; }
+list.notes-list > row.notes-row:hover { background: alpha(@ink, 0.04); }
+list.notes-list > row.notes-row:selected { background: alpha(@ink, 0.09); box-shadow: inset 2px 0 @ink; }
 list.notes-list > row.notes-row:focus-visible { outline: 1px solid alpha(@ink, 0.35); outline-offset: -1px; }
 .notes-row-title { color: @ink; font-size: 13px; font-weight: 500; }
 .notes-row-date { color: @secondary; font-size: 11px; font-feature-settings: "tnum"; }
 .notes-row-preview { color: @faint; font-size: 11px; }
 .notes-row-pin { color: @faint; }
-.notes-list-header { padding: 12px 13px 4px; color: @faint; font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif; font-size: 10px; font-weight: 600; letter-spacing: 0.08em; }
+.notes-list-header { padding: 12px 10px 4px; color: @faint; font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif; font-size: 10px; font-weight: 600; letter-spacing: 0.08em; }
 .notes-list-empty { padding: 28px 18px; color: @faint; font-size: 12px; }
 
 /* ---- tabs ---- */
@@ -106,6 +147,16 @@ textview.notes-source > border.left gutter { background: @notes_paper; }
 button.notes-notice-button { min-height: 24px; padding: 0 9px; font-size: 11px; background: @slab; }
 button.notes-notice-close { min-width: 22px; min-height: 22px; padding: 0; border: 0; background: transparent; color: @secondary; }
 button.notes-notice-close:hover { background: @wash; color: @ink; }
+.notes-notice.info { background: alpha(@live, 0.08); border-color: alpha(@live, 0.26); }
+
+/* ---- checklist boxes and pictures drawn over the text (note_pages/inline.rs) ---- */
+checkbutton.notes-check { padding: 0; min-height: 0; }
+checkbutton.notes-check > check { min-width: 14px; min-height: 14px; margin: 0; border: 1px solid alpha(@ink, 0.5); border-radius: 4px; background: @notes_paper; color: transparent; transition: background 100ms ease-out, border-color 100ms ease-out; }
+checkbutton.notes-check:hover > check { border-color: @ink; }
+checkbutton.notes-check > check:checked { border-color: @live; background: @live; color: @notes_paper; }
+.notes-image { border-radius: 6px; border: 1px solid @edge; background: @wall_solid; box-shadow: 0 6px 18px alpha(black, 0.35); }
+.notes-image:hover { border-color: @strong; }
+.notes-image picture { border-radius: 5px; }
 
 /* ---- find / replace bar ---- */
 .notes-find { padding: 6px 8px 6px 12px; background: @console; border-top: 1px solid @edge; }

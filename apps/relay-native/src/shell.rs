@@ -1223,6 +1223,9 @@ impl Ui {
                     "\n@define-color {name} alpha({color},{});",
                     (alpha + offset).min(1.)
                 );
+                // Windows with no wallpaper behind them (Notes) and menus draw these, so
+                // panel opacity never shows the desktop through them.
+                css += &format!("\n@define-color {name}_solid {color};");
             }
             // Terminal plates sit on one @wall layer; @plate tops that up to slightly
             // denser than the chrome. Matte's opaque default keeps the opaque screen.

@@ -56,6 +56,11 @@ pub struct Doc {
     autosave_timer: RefCell<Option<glib::SourceId>>,
     count_timer: RefCell<Option<glib::SourceId>>,
     state_idle: RefCell<Option<glib::SourceId>>,
+    flash_timer: RefCell<Option<glib::SourceId>>,
+    /// Checkboxes and pictures drawn over the text.
+    pub inline: super::inline::Inline,
+    /// The task the last "Create task" made, for its notice's Open key.
+    last_task: Cell<i64>,
 }
 
 /// The largest body this client sends. Replies and `notes.changed` events carry the whole
@@ -181,6 +186,7 @@ pub fn build(ui: &Rc<Ui>, note: &Value) -> Rc<Doc> {
     view.set_pixels_below_lines(2);
     view.set_pixels_inside_wrap(1);
     view.upcast_ref::<gtk::Widget>().update_property(&[gtk::accessible::Property::Label("Note text")]);
+    view.set_extra_menu(Some(&super::menu::text_menu()));
     let scroll = crate::app::scrolled(&view);
     scroll.add_css_class("notes-scroll");
     form.append(&scroll);
@@ -346,6 +352,7 @@ pub fn build(ui: &Rc<Ui>, note: &Value) -> Rc<Doc> {
     draft.layout.add_css_class("notes-page-body");
     draft.layout.set_vexpand(true);
 
+    let inline = super::inline::Inline::new(&buffer);
     let doc = Rc::new(Doc {
         id,
         project,
@@ -384,6 +391,9 @@ pub fn build(ui: &Rc<Ui>, note: &Value) -> Rc<Doc> {
         autosave_timer: RefCell::new(None),
         count_timer: RefCell::new(None),
         state_idle: RefCell::new(None),
+        flash_timer: RefCell::new(None),
+        inline,
+        last_task: Cell::new(0),
     });
     let weak_ui = Rc::downgrade(ui);
     let weak = Rc::downgrade(&doc);
@@ -398,6 +408,34 @@ pub fn build(ui: &Rc<Ui>, note: &Value) -> Rc<Doc> {
 
     let changed = with(|ui, doc| doc.changed(ui));
     doc.buffer.connect_changed(move |_| changed());
+    let relayout = with(|_, doc| super::inline::schedule(doc));
+    doc.buffer.connect_changed(move |_| relayout());
+    for adjustment in [doc.view.vadjustment(), doc.view.hadjustment()].into_iter().flatten() {
+        let place = with(|_, doc| super::inline::schedule_place(doc));
+        adjustment.connect_changed(move |_| place());
+    }
+    let (weak_ui, weak) = (Rc::downgrade(ui), Rc::downgrade(&doc));
+    doc.view.connect_paste_clipboard(move |view| {
+        if let (Some(ui), Some(doc)) = (weak_ui.upgrade(), weak.upgrade()) {
+            if super::inline::paste(&ui, &doc) {
+                view.stop_signal_emission_by_name("paste-clipboard");
+            }
+        }
+    });
+    for cut in [false, true] {
+        let weak = Rc::downgrade(&doc);
+        let copied = move |view: &sourceview5::View| {
+            if weak.upgrade().is_some_and(|doc| doc.copy_with_images(cut)) {
+                view.stop_signal_emission_by_name(if cut { "cut-clipboard" } else { "copy-clipboard" });
+            }
+        };
+        if cut {
+            doc.view.connect_cut_clipboard(copied);
+        } else {
+            doc.view.connect_copy_clipboard(copied);
+        }
+    }
+    doc.view.add_controller(super::inline::drop_target(ui, &doc));
     let changed = with(|ui, doc| doc.changed(ui));
     doc.title.connect_changed(move |_| changed());
     let focus_body = with(|_, doc| {
@@ -411,6 +449,8 @@ pub fn build(ui: &Rc<Ui>, note: &Value) -> Rc<Doc> {
         }
     });
     doc.buffer.connect_cursor_position_notify(move |_| cursor());
+    let moved = with(|_, doc| super::inline::cursor_moved(doc));
+    doc.buffer.connect_cursor_position_notify(move |_| moved());
     let selection = with(|_, doc| doc.schedule_counts());
     doc.buffer.connect_has_selection_notify(move |_| selection());
     let pinned = with(pin_changed);
@@ -523,6 +563,7 @@ pub fn build(ui: &Rc<Ui>, note: &Value) -> Rc<Doc> {
     doc.view.add_controller(wheel);
 
     doc.apply_prefs(&prefs);
+    super::inline::schedule(&doc);
     doc.update_meta();
     doc.update_position();
     doc.update_counts();
@@ -679,10 +720,77 @@ impl Doc {
     }
 
     pub fn stop_timers(&self) {
-        for timer in [&self.autosave_timer, &self.count_timer, &self.state_idle] {
+        for timer in [&self.autosave_timer, &self.count_timer, &self.state_idle, &self.flash_timer] {
             if let Some(timer) = timer.borrow_mut().take() {
                 timer.remove();
             }
+        }
+        self.inline.stop();
+    }
+
+    /// Say `message` in the status bar for a moment, where the counts are.
+    pub fn flash(self: &Rc<Self>, message: &str) {
+        self.counts.set_text(message);
+        if let Some(timer) = self.flash_timer.borrow_mut().take() {
+            timer.remove();
+        }
+        let weak = Rc::downgrade(self);
+        *self.flash_timer.borrow_mut() = Some(glib::timeout_add_local_once(
+            std::time::Duration::from_millis(1800),
+            move || {
+                if let Some(doc) = weak.upgrade() {
+                    doc.flash_timer.borrow_mut().take();
+                    doc.update_counts();
+                }
+            },
+        ));
+    }
+
+    /// Copy or cut a selection that references images: the files and, for one, the picture
+    /// travel with the text. Returns whether it handled the copy.
+    fn copy_with_images(&self, cut: bool) -> bool {
+        let Some((start, end)) = self.buffer.selection_bounds() else { return false };
+        let selected = self.buffer.text(&start, &end, false).to_string();
+        let images = super::inline::referenced(&selected);
+        if images.is_empty() {
+            return false;
+        }
+        super::inline::copy_images(&self.view.clipboard(), Some(&selected), &images);
+        if cut {
+            self.buffer.begin_user_action();
+            self.buffer.delete_selection(true, true);
+            self.buffer.end_user_action();
+        }
+        true
+    }
+
+    /// Tick or untick the checklist item on `line`, as one undo step.
+    pub fn toggle_check_line(&self, line: i32) -> bool {
+        let buffer = &self.buffer;
+        let Some(start) = buffer.iter_at_line(line) else { return false };
+        let mut end = start;
+        if !end.ends_line() {
+            end.forward_to_line_end();
+        }
+        let Some((column, ticked)) = tx::check_item(&buffer.text(&start, &end, true)) else { return false };
+        let cursor = buffer.cursor_position();
+        let mut from = start;
+        from.set_line_offset(column as i32 + 1);
+        let mut to = from;
+        to.forward_char();
+        buffer.begin_user_action();
+        buffer.delete(&mut from, &mut to);
+        buffer.insert(&mut from, if ticked { " " } else { "x" });
+        buffer.end_user_action();
+        buffer.place_cursor(&buffer.iter_at_offset(cursor));
+        true
+    }
+
+    /// Ctrl+Enter: tick the item under the cursor, or make the line one.
+    pub fn toggle_check_at_cursor(&self) {
+        let line = self.buffer.iter_at_mark(&self.buffer.get_insert()).line();
+        if !self.toggle_check_line(line) {
+            self.toggle_prefix(Prefix::Check);
         }
     }
 
@@ -702,6 +810,7 @@ impl Doc {
     }
 
     pub fn show_notice(self: &Rc<Self>, ui: &Rc<Ui>, message: &str, actions: Vec<Action>) {
+        self.notice.remove_css_class("info");
         self.notice_text.set_text(message);
         while let Some(child) = self.notice_actions.first_child() {
             self.notice_actions.remove(&child);
@@ -1141,6 +1250,44 @@ impl Doc {
         self.buffer.end_user_action();
         self.view.grab_focus();
     }
+}
+
+/// File > Create task from note: the selection, else the whole note, becomes a Backlog task.
+pub fn to_task(ui: &Rc<Ui>, doc: &Rc<Doc>) {
+    if doc.orphan.get() {
+        doc.show_notice(ui, "This note's project was removed, so it has no board to add a task to.", Vec::new());
+        return;
+    }
+    let name = doc.name();
+    let selected = doc
+        .buffer
+        .selection_bounds()
+        .map(|(start, end)| doc.buffer.text(&start, &end, false).to_string())
+        .filter(|text| !text.trim().is_empty());
+    let (title, text) = match selected {
+        Some(text) => (tx::task_title(&text).unwrap_or_else(|| name.clone()), text),
+        None => (name.clone(), doc.body()),
+    };
+    let text = text.trim();
+    let source = format!("From the note “{name}”.");
+    let body = if text.is_empty() { source } else { format!("{text}\n\n{source}") };
+    let payload = json!({"project_id":doc.project,"title":title,"body":body,"column":"backlog"});
+    let (ui, doc) = (ui.clone(), doc.clone());
+    glib::spawn_future_local(async move {
+        match ui.call("task.create", payload).await {
+            Ok(task) => {
+                let id = task["id"].as_i64().unwrap_or(0);
+                doc.last_task.set(id);
+                doc.show_notice(
+                    &ui,
+                    &format!("Created task #{id} “{title}” in Backlog."),
+                    vec![("Open task", |ui, doc| super::super::task_pages::open(ui, doc.last_task.get()))],
+                );
+                doc.notice.add_css_class("info");
+            }
+            Err(error) => doc.show_notice(&ui, &format!("Could not create a task: {error}"), Vec::new()),
+        }
+    });
 }
 
 fn pin_changed(ui: &Rc<Ui>, doc: &Rc<Doc>) {
