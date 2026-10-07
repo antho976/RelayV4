@@ -48,6 +48,8 @@ FBX for Unreal. `static`: the mesh with its `SOCKET_` empties, `UCX_`/`UBX_`/`US
 LOD children. `skeletal`: the armature and the meshes skinned to it (props parented to bones are
 left out), deform bones only, no leaf bones. `animation`: the armature's action only. With an
 `action` and no `all_actions`, the timeline is set to that action's range before baking.
+Without `objects`, every root mesh and armature that renders is taken; hidden ones are exported
+anyway, and objects in excluded collections are listed in `excluded` instead (name them to export them).
 `fbx_options` overrides any exporter option. Returns the objects exported, sockets, collision and
 the size in cm.
 

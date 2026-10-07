@@ -595,7 +595,7 @@ fn confirm(ctx: &mut Ctx, payload: ConfirmIn) -> Result<ConfirmOut, BusError> {
         return approve(ctx, hold, payload.scope);
     }
     if frozen.op != "guardrail.gate" {
-        let outcome = match ctx.replay_registered(&frozen.op, frozen.payload.clone(), hold.actor.clone(), hold.policy.clone()) {
+        let outcome = match ctx.replay_registered(&frozen.op, frozen.payload.clone(), hold.actor.clone(), hold.session_id, hold.policy.clone()) {
             Ok(value) => Response::ok(ctx.req_id, value),
             Err(error) => Response::err(ctx.req_id, error),
         };

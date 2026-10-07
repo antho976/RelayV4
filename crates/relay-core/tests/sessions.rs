@@ -240,6 +240,54 @@ fn worktree_ops() {
     assert_eq!(code(r), "actor.allowlist");
 }
 
+/// RA-017: `worktree.remove` purged build directories under, then `rm -rf`'d, any path it was
+/// handed once git said "not a working tree". Only a linked worktree of the project goes now.
+#[test]
+fn worktree_remove_refuses_anything_that_is_not_a_worktree_of_the_project() {
+    let f = fixture();
+    let e = &f.engine;
+    let assert_kept = |path: &Path, why: &str| {
+        let r = call(e, "worktree.remove", json!({"project_id": 1, "path": path}));
+        assert!(r.clone().into_result().is_err(), "{why}: {} was removed", path.display());
+        assert!(path.join("keep.txt").is_file(), "{why}: contents were touched");
+        assert!(path.join("build/out.bin").is_file(), "{why}: build output was purged");
+    };
+    let plain = f.root.join("notes");
+    let other = f.root.join("other-repo");
+    for dir in [&plain, &other] {
+        std::fs::create_dir_all(dir.join("build")).unwrap();
+        std::fs::write(dir.join("keep.txt"), "mine").unwrap();
+        std::fs::write(dir.join("build/out.bin"), "x").unwrap();
+    }
+    git(&other, &["init", "-q", "-b", "main"]);
+    assert_kept(&plain, "a plain directory");
+    assert_kept(&other, "another repository");
+
+    // The pool directory itself is not a worktree, though every pooled one is inside it.
+    let w = ok(e, "worktree.create", json!({"project_id": 1, "branch": "relay/keep"}));
+    let pooled = PathBuf::from(w["path"].as_str().unwrap());
+    let pool = f.repo.join(".relay/worktrees");
+    std::fs::create_dir_all(pool.join("build")).unwrap();
+    std::fs::write(pool.join("keep.txt"), "mine").unwrap();
+    std::fs::write(pool.join("build/out.bin"), "x").unwrap();
+    assert_kept(&pool, "the pool directory");
+    assert!(pooled.join("README.md").is_file());
+
+    // A locked worktree is one git refuses to remove; that refusal now stands.
+    let locked = f.root.join("locked-wt");
+    git(&f.repo, &["worktree", "add", "-q", "-b", "locked", locked.to_str().unwrap()]);
+    git(&f.repo, &["worktree", "lock", locked.to_str().unwrap()]);
+    std::fs::create_dir_all(locked.join("build")).unwrap();
+    std::fs::write(locked.join("keep.txt"), "mine").unwrap();
+    std::fs::write(locked.join("build/out.bin"), "x").unwrap();
+    assert_kept(&locked, "a locked worktree");
+
+    assert_eq!(code(call(e, "worktree.remove", json!({"project_id": 1, "path": "."}))), "worktree.path");
+    // And a real pooled worktree still goes.
+    ok(e, "worktree.remove", json!({"project_id": 1, "path": pooled}));
+    assert!(!pooled.exists());
+}
+
 #[test]
 fn launch_passes_configured_and_memory_write_roots_to_both_providers() {
     for provider in ["claude", "codex"] {

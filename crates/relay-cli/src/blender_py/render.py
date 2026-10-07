@@ -32,7 +32,9 @@ if ARGS.get("isolate", True):
         if o.type in ("MESH", "CURVE", "SURFACE", "META", "FONT") and o.name not in keep:
             o.hide_render = True
 
-engine = {"workbench": "BLENDER_WORKBENCH", "eevee": "BLENDER_EEVEE", "cycles": "CYCLES"}[ARGS.get("engine", "workbench")]
+# 4.2 to 4.5 call EEVEE Next "BLENDER_EEVEE_NEXT"; 5.0 took the plain name back.
+eevee = "BLENDER_EEVEE_NEXT" if (4, 2, 0) <= bpy.app.version < (5, 0, 0) else "BLENDER_EEVEE"
+engine = {"workbench": "BLENDER_WORKBENCH", "eevee": eevee, "cycles": "CYCLES"}[ARGS.get("engine", "workbench")]
 scene.render.engine = engine
 if engine == "CYCLES":
     scene.cycles.samples = int(ARGS.get("samples", 16))

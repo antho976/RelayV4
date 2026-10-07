@@ -29,9 +29,10 @@ Whether *RemoteControl*, *PythonScriptPlugin* and *EditorScriptingUtilities* are
 `.uproject`, whether the editor answers, whether remote Python runs, and a list of `advice` steps.
 `fix: true` adds the missing plugins to the `.uproject` (tab-indented, other fields untouched).
 
-### `ue_build` — `{ target?, platform?, configuration?, timeout_s?, restart_editor?, allow_editor_open?, keep_crash_reporters? }`
+### `ue_build` — `{ target?, platform?, configuration?, timeout_s?, restart_editor?, save?, force?, allow_editor_open?, keep_crash_reporters? }`
 `restart_editor` saves and quits the editor, builds, relaunches it and waits until it answers
-(the C++ loop on Linux, which has no Live Coding). Before building it stops leftover
+(the C++ loop on Linux, which has no Live Coding). The quit is `ue_editor_quit`'s, `save` and
+`force` included, so it refuses rather than lose unsaved work. Before building it stops leftover
 CrashReportClient processes and refuses while the editor runs; afterwards it warns when
 `UnrealEditor.modules` names a numbered hot-reload module. The engine is found without `UE_ROOT`
 from a running editor, the project log, a surrounding source tree, `Install.ini` or common folders.
@@ -85,12 +86,18 @@ Actors of the open level with label, class, object path, outliner folder and loc
 ### `ue_console` — `{ command }`
 Runs a console command in the editor world. Output lands in the log; read it with `ue_log`.
 
-### `ue_editor_launch` — `{ timeout_s?, extra_args? }` and `ue_editor_quit` — `{ save? }`
+### `ue_editor_launch` — `{ timeout_s?, extra_args? }` and `ue_editor_quit` — `{ save?, force? }`
 Launch waits for the Remote Control port to be free, starts the editor with `-RCWebControlEnable`
 (and with "Use Less CPU when in Background" overridden off unless `keep_background_throttle`),
-and waits until Remote Control answers, failing early on a bind error in the new log. Quit saves
-dirty packages (unless `save: false`), asks the editor to quit, sends a terminate signal if it is
-still running 20 s later, waits for the port to be released, and reports the timing of each step.
+and waits until Remote Control answers, failing early on a bind error in the new log. The editor
+does not carry the agent's `RELAY_*` environment: it belongs to the person, and Relay's crash
+recovery would otherwise take it for the agent's orphan. Quit saves dirty packages (unless
+`save: false`), asks the editor to quit, sends a terminate signal if it is still running 20 s
+later, waits for the port to be released, and reports the timing of each step. It refuses and
+leaves the editor running when a package cannot be saved (an untitled map, a read-only file), or
+when the editor does not answer Remote Control within about 10 s, since nothing could be saved;
+`force: true` terminates an unreachable editor without saving, for when the human has said so.
+Only an editor with this exact `.uproject` open is ever signalled, never another checkout's.
 
 When the editor is unreachable, `ue_editor_status` says which case it is: editor running but no
 server, a failed bind (run `WebControl.StopServer` then `WebControl.StartServer`), or the port

@@ -4,6 +4,7 @@
 
 use crate::engine::IntoBus;
 use crate::sessions;
+use crate::shell::{self, Word};
 use relay_bus::envelope::{Actor, Request};
 use relay_bus::error::BusError;
 use relay_bus::registry::{Callable, OpEntry, OpKind, Registry};
@@ -362,6 +363,16 @@ pub fn authorize(
     let cfg = config(conn, Some(session.project_id))?;
     let allowed = role_allowlist(&cfg, session.role);
     if allowed.iter().any(|pattern| op_matches(pattern, entry.name)) {
+        return Ok(());
+    }
+    // A role whose shell is otherwise closed (the reviewer) may still run what its instructions
+    // depend on: a Codex session reaches the bus only through `$RELAY_BIN q …` in its shell, and
+    // refusing that left a Codex reviewer unable to bootstrap, mail or finish (RA-014). The
+    // gate still judges the command as it judges every other.
+    if entry.name == "guardrail.gate"
+        && payload.get("kind").and_then(Value::as_str) == Some("exec")
+        && payload.get("command").and_then(Value::as_str).is_some_and(read_only_exec)
+    {
         return Ok(());
     }
     let bus_write = entry.name.starts_with("file.")
@@ -913,79 +924,10 @@ fn self_approval(line: &str) -> Option<Vec<String>> {
     None
 }
 
-/// One shell word plus whether *every* character of it came from inside quotes. A partly
-/// quoted word counts as unquoted: when in doubt, still inspect it.
-struct Word {
-    text: String,
-    quoted: bool,
-}
-
-/// Split a command line into the individual commands it runs, each as words. A deliberately
-/// small shell reader — enough to tell an argument from a quoted string, which is the whole
-/// difference between running a denied command and merely naming one (D103).
-#[allow(unused_assignments)] // the final end_command! clears state it will never re-read
+/// Split a command line into the individual commands it runs, each as words (D103). The
+/// reader is shared with the device-lease gate, so both see the same commands.
 fn shell_commands(line: &str) -> Vec<Vec<Word>> {
-    let mut commands: Vec<Vec<Word>> = Vec::new();
-    let mut words: Vec<Word> = Vec::new();
-    let mut text = String::new();
-    let mut any_bare = false;
-    let mut started = false;
-    let mut chars = line.chars().peekable();
-
-    macro_rules! end_word {
-        () => {
-            if started {
-                words.push(Word { text: std::mem::take(&mut text), quoted: !any_bare });
-                any_bare = false;
-                started = false;
-            }
-        };
-    }
-    macro_rules! end_command {
-        () => {{
-            end_word!();
-            if !words.is_empty() {
-                commands.push(std::mem::take(&mut words));
-            }
-        }};
-    }
-
-    while let Some(c) = chars.next() {
-        match c {
-            '\'' | '"' => {
-                started = true;
-                let quote = c;
-                for inner in chars.by_ref() {
-                    if inner == quote {
-                        break;
-                    }
-                    text.push(inner);
-                }
-            }
-            '\\' => {
-                started = true;
-                any_bare = true;
-                if let Some(escaped) = chars.next() {
-                    text.push(escaped);
-                }
-            }
-            ';' | '\n' | '|' | '&' => {
-                // `&&` / `||` are two characters for one separator; a single one separates too.
-                if chars.peek() == Some(&c) {
-                    chars.next();
-                }
-                end_command!();
-            }
-            c if c.is_whitespace() => end_word!(),
-            c => {
-                started = true;
-                any_bare = true;
-                text.push(c);
-            }
-        }
-    }
-    end_command!();
-    commands
+    shell::commands(line)
 }
 
 /// One place a command line runs a denied pattern.
@@ -1000,6 +942,10 @@ struct DeniedMatch {
 /// merely mentions a pattern is not a match. All of them, not the first: a grant has to cover
 /// each one for the line to pass.
 fn denied_matches(patterns: &[String], line: &str) -> Vec<DeniedMatch> {
+    let patterns: Vec<(&String, DeniedPattern)> = patterns
+        .iter()
+        .filter_map(|pattern| DeniedPattern::parse(pattern).map(|parsed| (pattern, parsed)))
+        .collect();
     let mut hits = Vec::new();
     for command in shell_commands(line) {
         if is_guardrail_dry_run(&command) {
@@ -1010,17 +956,10 @@ fn denied_matches(patterns: &[String], line: &str) -> Vec<DeniedMatch> {
             .filter(|word| !word.quoted)
             .map(|word| word.text.to_ascii_lowercase())
             .collect();
-        for pattern in patterns {
-            let wanted: Vec<String> = pattern
-                .split_whitespace()
-                .map(|part| part.to_ascii_lowercase())
-                .collect();
-            if wanted.is_empty() || wanted.len() > bare.len() {
-                continue;
-            }
-            if bare.windows(wanted.len()).any(|window| window == wanted.as_slice()) {
+        for (pattern, parsed) in &patterns {
+            if parsed.runs_in(&command) {
                 hits.push(DeniedMatch {
-                    pattern: pattern.clone(),
+                    pattern: (*pattern).clone(),
                     argv: command.iter().map(|word| word.text.clone()).collect(),
                     bare: bare.clone(),
                 });
@@ -1028,6 +967,185 @@ fn denied_matches(patterns: &[String], line: &str) -> Vec<DeniedMatch> {
         }
     }
     hits
+}
+
+/// A denied pattern read the way its program reads it: `git reset --hard` is the program `git`,
+/// the subcommand `reset` and the flag `--hard`. Matching on that, rather than on the pattern's
+/// literal words in a row, is what makes `git -C app reset HEAD~1 --hard`, `rm -fr build` and
+/// `git push origin main --force` the commands they are (RA-011).
+struct DeniedPattern {
+    program: String,
+    /// The words right after the program that are not options, in order: `reset`, `push`.
+    subcommands: Vec<String>,
+    /// Every flag the pattern names, as a set, clusters expanded: `-rf` is `-r` and `-f`.
+    flags: Vec<String>,
+    /// Any other word the pattern names (`rm -rf /` names `/`), anywhere after the subcommand.
+    operands: Vec<String>,
+}
+
+impl DeniedPattern {
+    fn parse(pattern: &str) -> Option<Self> {
+        let mut words = pattern.split_whitespace();
+        let program = shell::program(words.next()?).to_ascii_lowercase();
+        let mut parsed = Self { program, subcommands: Vec::new(), flags: Vec::new(), operands: Vec::new() };
+        for word in words {
+            if word.starts_with('-') && word.len() > 1 {
+                parsed.flags.extend(expand_flags(&parsed.program, word));
+            } else if parsed.flags.is_empty() && parsed.operands.is_empty() {
+                parsed.subcommands.push(word.to_ascii_lowercase());
+            } else {
+                parsed.operands.push(word.to_ascii_lowercase());
+            }
+        }
+        Some(parsed)
+    }
+
+    /// Whether `command` runs this pattern. The program may sit anywhere in the command, so
+    /// `sudo rm -rf`, `timeout 60 git clean -fd` and `find . -exec rm -rf {} ;` are all seen.
+    fn runs_in(&self, command: &[Word]) -> bool {
+        (0..command.len()).any(|at| self.runs_at(command, at))
+    }
+
+    fn runs_at(&self, command: &[Word], at: usize) -> bool {
+        let word = &command[at];
+        // A quoted program still runs (`"rm" -rf`), but only as the command's own first word;
+        // elsewhere a quoted word is an argument, which is data.
+        if word.quoted && at != 0 || shell::program(&word.text).to_ascii_lowercase() != self.program {
+            return false;
+        }
+        // Quoted text with a space in it is a string, never a flag or a subcommand (D103).
+        let rest: Vec<&str> = command[at + 1..]
+            .iter()
+            .filter(|word| !(word.quoted && word.text.contains(char::is_whitespace)))
+            .map(|word| word.text.as_str())
+            .collect();
+        let mut next = 0;
+        for wanted in &self.subcommands {
+            while let Some(word) = rest.get(next).filter(|word| word.starts_with('-')) {
+                next += if takes_value(&self.program, word) { 2 } else { 1 };
+            }
+            match rest.get(next) {
+                Some(word) if word.eq_ignore_ascii_case(wanted) => next += 1,
+                _ => return false,
+            }
+        }
+        let after = rest.get(next..).unwrap_or_default();
+        let flags: Vec<String> = after
+            .iter()
+            .filter(|word| word.starts_with('-') && word.len() > 1)
+            .flat_map(|word| expand_flags(&self.program, word))
+            .collect();
+        let operands: Vec<String> = after
+            .iter()
+            .filter(|word| !word.starts_with('-'))
+            .map(|word| word.to_ascii_lowercase())
+            .collect();
+        // `git push origin +main` is a force push spelled as a refspec.
+        let plus_refspec = self.program == "git"
+            && self.subcommands.first().is_some_and(|sub| sub == "push")
+            && operands.iter().any(|word| word.len() > 1 && word.starts_with('+'));
+        self.flags.iter().all(|flag| flags.contains(flag) || flag == "-f" && plus_refspec)
+            && self.operands.iter().all(|operand| operands.contains(operand))
+    }
+}
+
+/// A flag word as the individual flags it sets, each spelled one way: `-rf` is `-r` and `-f`;
+/// `--force=x` is `--force`; for `rm` and `git`, `--force` is `-f`; for `rm`, `-R` and
+/// `--recursive` are `-r`. Short flags keep their case — `-X` and `-x` differ in most tools.
+fn expand_flags(program: &str, word: &str) -> Vec<String> {
+    let canonical = |flag: String| -> String {
+        match (program, flag.as_str()) {
+            ("rm" | "git", "--force") => "-f".into(),
+            ("rm", "-R" | "--recursive") => "-r".into(),
+            _ => flag,
+        }
+    };
+    if let Some(long) = word.strip_prefix("--") {
+        if long.is_empty() {
+            return Vec::new();
+        }
+        let name = long.split('=').next().unwrap_or(long).to_ascii_lowercase();
+        return vec![canonical(format!("--{name}"))];
+    }
+    word.chars().skip(1).map(|c| canonical(format!("-{c}"))).collect()
+}
+
+/// Global options that take the next word as their value, so it is not mistaken for the
+/// subcommand: `git -C ../app reset --hard`, `git -c core.x=y push --force`.
+fn takes_value(program: &str, word: &str) -> bool {
+    program == "git" && matches!(word, "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--exec-path" | "--config-env")
+}
+
+/// Is `line` one command that changes nothing but what the bus itself authorizes: a Relay CLI
+/// call through `$RELAY_BIN` (each op is then authorized on its own), or a read-only look at
+/// the checkout (`git diff`, `cat`, `rg`, …)? Deliberately narrow: no chaining, pipes,
+/// redirection, substitution or expansion outside single quotes, and no option that lets a
+/// reader write or run something (`git -c`, `--output`, `--ext-diff`, `rg --pre`).
+pub(crate) fn read_only_exec(line: &str) -> bool {
+    read_only_exec_at(line, 0)
+}
+
+fn read_only_exec_at(line: &str, depth: u8) -> bool {
+    let line = line.trim();
+    let (relay, rest) = ["\"$RELAY_BIN\"", "\"${RELAY_BIN}\"", "$RELAY_BIN", "${RELAY_BIN}"]
+        .iter()
+        .find_map(|bin| line.strip_prefix(bin).filter(|rest| rest.starts_with(char::is_whitespace)))
+        .map_or((false, line), |rest| (true, rest));
+    if !plain_words(rest) {
+        return false;
+    }
+    // The reader also lists what a `bash -lc '…'` runs as a command of its own; the wrapper
+    // case below judges that inner line itself, so only the outer command is read here.
+    let commands = shell_commands(rest);
+    let Some(command) = commands.first() else { return false };
+    let words: Vec<&str> = command.iter().map(|word| word.text.as_str()).collect();
+    let wrapper = depth == 0 && matches!(words.first(), Some(&("bash" | "sh" | "zsh")));
+    if commands.len() != 1 && !wrapper {
+        return false;
+    }
+    if relay {
+        // The session's own identity, never an override: `--actor user` is the user.
+        return matches!(words.first(), Some(&("q" | "cmd" | "ops" | "schema" | "ping")))
+            && !words.iter().any(|word| word.starts_with("--actor") || word.starts_with("--instance"));
+    }
+    let Some((&program, args)) = words.split_first() else { return false };
+    match program {
+        // Codex may hand over its own wrapper: judge the one command inside it.
+        "bash" | "sh" | "zsh" if depth == 0 => {
+            matches!(args, [flag, script] if matches!(*flag, "-c" | "-lc")) && read_only_exec_at(args[1], 1)
+        }
+        "ls" | "cat" | "head" | "tail" | "wc" | "pwd" | "grep" => true,
+        "rg" => !args.iter().any(|arg| arg.starts_with("--pre")),
+        "git" => {
+            // The subcommand is the first word that is neither an option nor `-C`'s directory.
+            let sub = args.iter().enumerate()
+                .find(|(at, arg)| !arg.starts_with('-') && (*at == 0 || args[at - 1] != "-C"))
+                .map(|(_, arg)| arg);
+            matches!(sub, Some(&("diff" | "log" | "show" | "status" | "blame")))
+                && !args.iter().any(|arg| {
+                    *arg == "-c" || ["--output", "--ext-diff", "--exec-path", "--config-env"].iter().any(|bad| arg.starts_with(bad))
+                })
+        }
+        _ => false,
+    }
+}
+
+/// No shell syntax outside single quotes beyond words and spaces: nothing that chains, pipes,
+/// redirects, substitutes or expands. Inside double quotes, no `$`, backtick or backslash.
+fn plain_words(line: &str) -> bool {
+    let mut quote: Option<char> = None;
+    for c in line.chars() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some('\''), _) => {}
+            (Some(_), '$' | '`' | '\\') => return false,
+            (Some(_), _) => {}
+            (None, '\'' | '"') => quote = Some(c),
+            (None, ';' | '&' | '|' | '<' | '>' | '`' | '$' | '(' | ')' | '{' | '}' | '\\' | '\n' | '#') => return false,
+            (None, _) => {}
+        }
+    }
+    quote.is_none()
 }
 
 /// The unquoted words of each command in `line`, lowercased — how a command grant is compared.
@@ -1048,7 +1166,8 @@ fn is_guardrail_dry_run(command: &[Word]) -> bool {
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or(&first.text);
-    binary == "relay" && command.iter().any(|word| word.text == "guardrail.check")
+    (binary == "relay" || first.text.contains("RELAY_BIN"))
+        && command.iter().any(|word| word.text == "guardrail.check")
 }
 
 fn refuse_or_user_hold(
@@ -1194,8 +1313,10 @@ fn validate_pattern(pattern: &str) -> Result<(), BusError> {
 }
 
 /// Exact path, directory prefix, or a glob. `*` matches within one path segment; `**`
-/// crosses separators. The distinction matters: `src/*` used to quietly protect the whole
-/// subtree under `src`, so a pattern written for one directory locked an entire tree (D113).
+/// crosses separators, and a `**/` component matches zero or more whole directories, so
+/// `**/.env` covers the root `.env` as well as `a/b/.env`. The distinction matters: `src/*`
+/// used to quietly protect the whole subtree under `src`, so a pattern written for one
+/// directory locked an entire tree (D113).
 pub fn path_matches(pattern: &str, path: &Path) -> bool {
     let pattern = pattern.trim_matches('/');
     let path = path.to_string_lossy().trim_matches('/').to_string();
@@ -1205,44 +1326,60 @@ pub fn path_matches(pattern: &str, path: &Path) -> bool {
     glob_match(pattern.as_bytes(), path.as_bytes())
 }
 
-/// Backtracking matcher over one `*` (segment-local) or `**` (crosses `/`) at a time.
+/// Recursive matcher: every star gets its own backtrack point. One shared resume point used to
+/// let a later `*` overwrite an earlier `**`'s, so `**/*.pem` matched only one directory deep.
 fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
-    // (pattern index to resume at, text index to retry from, whether that star may cross `/`)
-    let (mut p, mut t) = (0usize, 0usize);
-    let mut star: Option<(usize, usize, bool)> = None;
-    while t < text.len() {
-        if p < pattern.len() && pattern[p] == b'*' {
-            let crosses = pattern.get(p + 1) == Some(&b'*');
-            while p < pattern.len() && pattern[p] == b'*' {
-                p += 1;
-            }
-            // A trailing `**` swallows the rest; a trailing `*` swallows the last segment.
-            if p == pattern.len() {
-                return crosses || !text[t..].contains(&b'/');
-            }
-            star = Some((p, t, crosses));
-            continue;
+    // Every (pattern, text) position is tried at most once, so an agent-supplied
+    // `file.search` glob such as `*a*a*a*a*b` costs pattern x text, not an exponential walk.
+    let mut failed = vec![false; (pattern.len() + 1) * (text.len() + 1)];
+    Glob { pattern, text, failed: &mut failed }.from(0, 0)
+}
+
+struct Glob<'a> {
+    pattern: &'a [u8],
+    text: &'a [u8],
+    failed: &'a mut [bool],
+}
+
+impl Glob<'_> {
+    fn from(&mut self, p: usize, t: usize) -> bool {
+        let slot = p * (self.text.len() + 1) + t;
+        if self.failed[slot] {
+            return false;
         }
-        if p < pattern.len() && pattern[p] == text[t] {
-            p += 1;
-            t += 1;
-            continue;
+        let matched = self.step(p, t);
+        if !matched {
+            self.failed[slot] = true;
         }
-        match star {
-            // Retry with the star consuming one more character — but a segment-local star
-            // may never consume a separator.
-            Some((after_star, star_text, crosses)) if crosses || text[star_text] != b'/' => {
-                t = star_text + 1;
-                p = after_star;
-                star = Some((after_star, t, crosses));
-            }
-            _ => return false,
-        }
+        matched
     }
-    while p < pattern.len() && pattern[p] == b'*' {
-        p += 1;
+
+    fn step(&mut self, p: usize, t: usize) -> bool {
+        let (pattern, text) = (self.pattern, self.text);
+        let Some(&c) = pattern.get(p) else {
+            return t == text.len();
+        };
+        if c != b'*' {
+            return text.get(t) == Some(&c) && self.from(p + 1, t + 1);
+        }
+        let mut after = p;
+        while pattern.get(after) == Some(&b'*') {
+            after += 1;
+        }
+        if after - p == 1 {
+            // A segment-local star: it may consume anything up to, never across, a separator.
+            let end = text[t..].iter().position(|&c| c == b'/').map_or(text.len(), |i| t + i);
+            return (t..=end).any(|i| self.from(after, i));
+        }
+        // `**/` as a whole component matches zero or more directories: nothing at all, or any
+        // run that ends on a separator.
+        if pattern.get(after) == Some(&b'/') && (p == 0 || pattern[p - 1] == b'/') {
+            return self.from(after + 1, t)
+                || (t..text.len()).any(|i| text[i] == b'/' && self.from(after + 1, i + 1));
+        }
+        // Any other `**` (`**.pem`, a trailing `src/**`) crosses separators freely.
+        (t..=text.len()).any(|i| self.from(after, i))
     }
-    p == pattern.len()
 }
 
 // ---------------------------------------------------------------- holds / notifications
@@ -1384,5 +1521,97 @@ mod glob_tests {
         assert!(m("**", "anything/at/all"));
         assert!(m("src/*", "src/main.rs"));
         assert!(!m("src/*", "src/a/b.rs"));
+    }
+
+    /// RA-012: one shared backtrack point let a later `*` overwrite the `**`'s, so these
+    /// patterns matched exactly one directory deep and never at the top level.
+    #[test]
+    fn a_double_star_component_matches_zero_or_more_directories() {
+        for path in ["c.pem", "x/c.pem", "x/y/c.pem", "x/y/z/c.pem"] {
+            assert!(m("**/*.pem", path), "**/*.pem must match {path}");
+        }
+        assert!(!m("**/*.pem", "x/c.pem.bak"));
+        for path in ["src/main.rs", "src/a/main.rs", "src/a/b/main.rs", "src/a/b/c/main.rs"] {
+            assert!(m("src/**/*.rs", path), "src/**/*.rs must match {path}");
+        }
+        assert!(!m("src/**/*.rs", "lib/a/main.rs"));
+        assert!(m("secrets/**/*.json", "secrets/a.json"));
+        assert!(m("secrets/**/*.json", "secrets/x/y/a.json"));
+        assert!(m("**/secrets.toml", "secrets.toml"));
+        assert!(m("**/.env", ".env"));
+        assert!(m("**/.env", "a/b/c/.env"));
+        assert!(!m("**/.env", "a/b/c/x.env"), "`**/` matches whole directories only");
+        assert!(m("**/*.key", "deploy/keys/prod.key"));
+        assert!(m("a/**/b/*.txt", "a/x/b/y/b/z.txt"), "the inner star must not starve the outer");
+        // A `**` that is not a whole component keeps crossing separators, as it always has.
+        assert!(m("**.pem", "x/y/c.pem"));
+        assert!(m("src/**", "src/a/b/c.rs"));
+        assert!(!m("*.pem", "x/c.pem"));
+        let long = "a".repeat(4000);
+        assert!(!m("*a*a*a*a*a*a*a*a*b", &long), "a pathological glob must still finish");
+    }
+}
+
+#[cfg(test)]
+mod denied_tests {
+    use super::{denied_matches, self_approval};
+
+    fn denied(line: &str) -> bool {
+        let defaults = ["rm -rf", "git reset --hard", "git clean -fd", "git push --force"].map(String::from);
+        !denied_matches(&defaults, line).is_empty()
+    }
+
+    /// RA-010 / RA-011: everyday spellings of the default denied commands, and the same
+    /// commands run inside subshells, substitutions and `sh -c`.
+    #[test]
+    fn every_spelling_of_a_denied_command_is_seen() {
+        for line in [
+            "rm -rf build", "rm -fr build", "rm -r -f build", "rm -rfv build", "rm -Rf build",
+            "rm --recursive --force build", "/bin/rm -rf build", "\"rm\" -rf build", "rm '-rf' build",
+            "\\rm -rf build", "sudo rm -rf build", "find . -name x -exec rm -rf {} ;",
+            "git reset --hard", "git reset HEAD~1 --hard", "git -C ../app reset --hard",
+            "git -c core.x=y reset --hard origin/main",
+            "git clean -fd", "git clean -df", "git clean -fdx", "git clean -xfd", "git clean -f -d",
+            "git -C sub clean -fd",
+            "git push --force", "git push -f origin main", "git push origin main --force",
+            "git push origin +main", "git push --force=true origin main",
+            "(git reset --hard)", "cd sub && (git clean -fd)", "(cd frontend && rm -rf node_modules)",
+            "echo $(rm -rf build)", "echo `rm -rf build`", "echo \"$(rm -rf build)\"",
+            "sh -c 'rm -rf build'", "bash -lc \"git reset --hard\"", "eval 'git push -f'",
+            "echo \"\\\"\" ; rm -rf build ; echo \"\\\"\"",
+            "relay q guardrail.check $(rm -rf ~)",
+        ] {
+            assert!(denied(line), "{line:?} runs a denied command");
+        }
+    }
+
+    /// D103 still holds: naming a command is not running it.
+    #[test]
+    fn quoted_mentions_and_near_misses_are_not_denied() {
+        for line in [
+            "echo \"rm -rf /\"", "git commit -m \"git reset --hard was a mistake\"",
+            "relay q guardrail.check '{\"command\":\"rm -rf /\"}'", "rm -r build", "rm -f build",
+            "git reset --soft HEAD~1", "git clean -n", "git push origin main", "git push -u origin main",
+            "git log --grep reset", "cargo test", "grep -rf patterns.txt src",
+        ] {
+            assert!(!denied(line), "{line:?} does not run a denied command");
+        }
+        // A dry run is exempt, and only the dry run.
+        assert!(denied("relay q guardrail.check && rm -rf /tmp/x"));
+    }
+
+    #[test]
+    fn a_pattern_operand_must_be_present() {
+        let patterns = ["rm -rf /".to_string(), "make deploy".to_string()];
+        assert!(!denied_matches(&patterns, "rm -rf build").iter().any(|hit| hit.pattern == "rm -rf /"));
+        assert!(denied_matches(&patterns, "rm -fr /").iter().any(|hit| hit.pattern == "rm -rf /"));
+        assert!(!denied_matches(&patterns, "make -j8 deploy").is_empty());
+        assert!(denied_matches(&patterns, "make test").is_empty());
+    }
+
+    #[test]
+    fn self_approval_is_seen_inside_a_subshell() {
+        assert!(self_approval("(relay --actor user q guardrail.confirm '{\"hold_id\":1}')").is_some());
+        assert!(self_approval("echo $(relay q guardrail.confirm '{}')").is_some());
     }
 }

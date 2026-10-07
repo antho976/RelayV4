@@ -55,8 +55,11 @@ follow the existing assets when they differ from this table.
 
 - Props parented to bones are **not** in a skeletal export. They ship as their own `SM_` and
   attach to a socket in Unreal (`unreal-animation-verification`).
-- `blender_export` without `objects` takes every visible root mesh and armature (skipping
-  `hide_render`); pass `objects` to be exact.
+- `blender_export` without `objects` takes every root mesh and armature that renders (skipping
+  `hide_render` on the object or its collections) and is in the view layer. Hidden objects (eye,
+  monitor, `hide_select`, on the object or its collection) are exported anyway. Objects in an
+  excluded collection are left out and listed in `excluded`; name them in `objects` to export
+  them. Pass `objects` to be exact.
 - `action` picks the action and sets the scene range to it before baking. `all_actions: true`
   writes one take per action, fake-user actions included, so clean out stale actions first
   (Blender names takes `<armature object>|<action>`; check the imported names).

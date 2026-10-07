@@ -368,12 +368,18 @@ impl<'a> Ctx<'a> {
         op: &str,
         payload: Value,
         actor: Actor,
+        session_id: Option<Id>,
         skip_policy: String,
     ) -> Result<Value, BusError> {
+        // The replay runs as the op's original caller, session included: a held agent
+        // `file.write` resolves its worktree, grants and any nested hold from the session, and
+        // the confirmer's (none, for the user) would land it in the primary checkout.
         let prior_actor = std::mem::replace(&mut self.actor, actor);
+        let prior_session = std::mem::replace(&mut self.session_id, session_id);
         let prior_policy = self.skip_policy.replace(skip_policy);
         let result = self.invoke_registered(op, payload);
         self.actor = prior_actor;
+        self.session_id = prior_session;
         self.skip_policy = prior_policy;
         result
     }
@@ -556,6 +562,11 @@ impl Engine {
         self.handlers.insert(O::NAME, Handler { call });
     }
 
+    /// Whether `op` is a query registered with [`Engine::register_unlocked`]: it takes the
+    /// store only for short reads, so a door may run several at once on one connection.
+    pub fn runs_unlocked(&self, op: &str) -> bool {
+        self.unlocked.contains_key(op)
+    }
     pub fn is_implemented(&self, op: &str) -> bool {
         self.handlers.contains_key(op) || self.unlocked.contains_key(op)
     }
