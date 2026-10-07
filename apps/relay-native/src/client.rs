@@ -70,6 +70,9 @@ pub fn is_lifecycle_request(op: &str) -> bool {
             | "session.clear_restorable"
             | "session.discard_restorable"
             | "task.dispatch"
+            // A clone may take many minutes; on the main connection every other request
+            // would wait behind it.
+            | "project.clone"
     )
 }
 

@@ -36,6 +36,10 @@ pub struct Editor {
     /// The next refresh asks GitHub for pull requests again instead of taking the engine's
     /// minute-old listing: set by the Refresh button, never by a file event (D130).
     pr_refresh: Cell<bool>,
+    /// A `file.search` is in flight; `search_dirty` asks for one more when it answers, so file
+    /// events during a slow search coalesce instead of queueing searches on the connection.
+    search_pending: Cell<bool>,
+    search_dirty: Cell<bool>,
     /// Set when an event arrived while the panel was hidden; consumed when it is shown.
     git_stale: Cell<bool>,
     tree_stale: Cell<bool>,
@@ -340,6 +344,8 @@ impl Editor {
             git_refresh_pending: Cell::new(false),
             git_refresh_dirty: Cell::new(false),
             pr_refresh: Cell::new(false),
+            search_pending: Cell::new(false),
+            search_dirty: Cell::new(false),
             git_stale: Cell::new(false),
             tree_stale: Cell::new(false),
             git_signature: Cell::new(0),
@@ -1187,6 +1193,10 @@ impl Editor {
             self.load_tree(ui, None);
             return;
         }
+        if self.search_pending.replace(true) {
+            self.search_dirty.set(true);
+            return;
+        }
         self.tree_revision.set(self.tree_revision.get() + 1);
         let revision = self.tree_revision.get();
         let project = ui.project.get();
@@ -1196,6 +1206,12 @@ impl Editor {
         let ui = ui.clone();
         glib::spawn_future_local(async move {
             let result = ui.call("file.search", payload).await;
+            e.search_pending.set(false);
+            // Something changed while this search ran: its answer is already stale.
+            if e.search_dirty.replace(false) {
+                e.run_search(&ui);
+                return;
+            }
             if !e.matches(&ui, project, &worktree) || e.tree_revision.get() != revision {
                 return;
             }
