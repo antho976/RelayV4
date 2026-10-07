@@ -114,14 +114,16 @@
       }
     },
     "bus.subscribe": {
-      "summary": "Turn this socket connection into an event subscriber (socket door only)",
+      "summary": "Turn this socket connection into an event subscriber (socket door only); bus.lagged means events were dropped, so refetch",
       "kind": "query",
       "audit": "never",
       "undo": "none",
       "scope": "global",
       "actors": "all",
       "doors": "socket_only",
-      "emits": [],
+      "emits": [
+        "bus.lagged"
+      ],
       "since": "1.0",
       "phase": 1,
       "payload": {
@@ -1082,7 +1084,7 @@
       }
     },
     "task.copy_text": {
-      "summary": "The copy-button text: title + body + id",
+      "summary": "A task as plain text: `#id title`, then the body",
       "kind": "query",
       "audit": "never",
       "undo": "none",
@@ -1245,7 +1247,8 @@
       "actors": "all",
       "doors": "all",
       "emits": [
-        "module.changed"
+        "module.changed",
+        "task.changed"
       ],
       "since": "1.0",
       "phase": 7,
@@ -3058,7 +3061,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [],

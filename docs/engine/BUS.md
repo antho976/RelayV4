@@ -182,10 +182,19 @@ Every op is registered with, and the schema publishes:
 
 ### 3.3 Event names
 
-`noun.changed` (entity upserted; payload is the full entity), `noun.deleted` (payload `{id}`),
-plus domain events (`session.state`, `session.output` on the data plane, `guardrail.held`,
-`notify.new`, `integration.result`, `provider.version`, `resource.sample`). Rule: **every
+`noun.changed` (entity upserted; payload is the full entity, or a re-query hint),
+`noun.deleted` (payload `{id}`), plus domain events (`session.state`, `session.output` on the
+data plane, `guardrail.held`, `notify.new`, `integration.result`, `provider.version`,
+`resource.sample`). Rule: **every
 mutation emits at least one event**, and every event's payload is reproducible by a query op.
+
+A full-entity `noun.changed` carries the row with its own `id`. A hint carries the scope it
+touched instead — `task_id`, `module_id` or `project_id`, plus what changed (`state`, `col`,
+`task_ids`, `bulk: true`) — and is not a row: a client that needs the entity re-queries it.
+Session lifecycle transitions (`task.changed {task_id, state}`), module delete/restore
+(`task.changed {module_id, task_ids}`) and the v3 import (`{project_id, bulk: true}`) send
+hints. `bus.wait`'s `matching` is a conjunction, so a wait on `{id: N}` misses the hints and
+one on `{task_id: N}` misses the full rows: wait on the event name and re-read.
 
 ---
 
@@ -239,13 +248,15 @@ fields; a payload that fails schema never reaches policy.
 ### 5.1 Ordering guarantees
 
 - Steps up to and including the handler run **serially per store** — one request at a time
-  mutates state (a single `tokio::sync::Mutex` around the engine's write side; queries may
-  read concurrently through the WAL). Latency budget: p99 < 5 ms for store-only ops. Anything
+  mutates state. The store is one SQLite connection behind one `std::sync::Mutex`, so reads
+  serialize with writes too: a query that reads under the lock queues behind a handler like
+  anything else. Latency budget: p99 < 5 ms for store-only ops. Anything
   that takes longer (git, spawn, build) is a handler that returns quickly with a handle and
   finishes via events (`integration.request` → `integration.result`).
 - Audit append is in the **same SQLite transaction** as the mutation. If the audit row can't
   be written, the mutation didn't happen.
-- Events are emitted after the transaction commits.
+- Events are emitted after the transaction commits, before the store lock is released, so
+  two commits reach subscribers in commit order. After-commit work runs once the lock is gone.
 - **Three handler shapes, one pipeline** (D144, D149). Ordinary handlers run inside the
   transaction as above. A **query** may instead be registered *unlocked*: it takes the store for
   short reads only and does its external work — a subprocess, a network call, a tree walk — with
@@ -288,10 +299,13 @@ would have failed on shape anyway. Unknown fields are an error (`bus.schema`,
 
 `id` is unique per audited request, forever (`audit.req_id UNIQUE`). A duplicate `id` returns
 the recorded response with `replayed: true` and executes nothing — including a recorded `held`,
-which keeps replaying `held` until the hold is resolved (§9.3). Duplicate `id` with a
-*different* payload hash is `conflict` / `bus.id_reused`. Requests that are not audited
-(queries, `invalid`) are not deduplicated — they are safe to repeat by nature. This is what
-makes `relay cmd` safe to retry from a script.
+which keeps replaying `held` even after the hold is resolved: the confirm runs under its own id
+(§9.4). A duplicate that arrives while the first copy is still running waits for it and then
+replays its row. Duplicate `id` with a *different* payload hash is `conflict` /
+`bus.id_reused`. Requests that are not audited (queries, `invalid`) are not deduplicated — they
+are safe to repeat by nature. A script that retries `relay cmd` must send the full-envelope form
+with its own `id` (`relay cmd '{"id":"…","op":"…","payload":{…}}'`); `relay cmd <op> <payload>` mints a
+fresh id per call, so each call is a new request.
 
 "Forever" is bounded by retention (D151): launch recovery prunes audit rows older than
 `settings: audit.retention_days` (default 180, `0` keeps everything), so a request id from
@@ -348,6 +362,16 @@ correlation by `id`; pipelining allowed. `bus.subscribe {events?: string[]}` tur
 connection into a subscriber: `Event` lines are interleaved with responses (distinguished by
 the `ev` key). Data-plane frames on this door are `{v, stream, session | run_id | mirror_id,
 epoch?, seq, data}` lines (§7).
+
+The ops the door answers itself (`bus.subscribe`, `bus.unsubscribe`, `bus.wait`) pass the same
+envelope, actor/token, schema and allowlist checks as any request. An agent's subscription and
+waits carry only its own project's events and project-less ones (`device.*` from any project,
+since devices are shared), and of `mailbox.new` only mail to it, from it, or broadcast. A
+subscriber too slow to keep up is sent `{ev: "bus.lagged", payload: {dropped}}` in place of what
+it missed, and should refetch. A `bus.wait` ends when its client disconnects. A request line is
+at most 64 MiB; a longer one is discarded and answered `bus.too_large` (with no `id`). Once
+`app.quit` (or SIGINT/SIGTERM) is under way, requests are answered `app.quitting`, and the door
+closes, ending its connections, before the engine kills its children.
 
 The socket is served by `relay serve`, the one process that owns the engine, with or without a
 display. `relay serve --remote` also runs the phone door (§4.2) in that process.
@@ -588,11 +612,14 @@ Holds live in the `holds` table with the frozen envelope. `guardrail.confirm {ho
 **user** op that re-executes the held envelope:
 - with the **confirm request's** `id` (the original id stays audited as `held` and keeps
   replaying `held` — §5.3);
-- with `actor` = the confirmer, and `on_behalf_of` = the original actor recorded in the new
-  audit row and in `details`;
+- audited as the held op with `actor` = the confirmer and `on_behalf_of` = the original
+  actor, in the new audit row;
+- run **as the original actor and its session**, not the confirmer: the worktree, grants and
+  any nested hold resolve from the held session, and every policy but the one that raised the
+  hold still judges the original actor;
 - skipping **only** the policy that raised the hold — a protected path still refuses, a cap
-  still refuses; allowlist and own-task checks are the *confirmer's* (so a user confirm never
-  fails on scope);
+  still refuses. Allowlist and own-task checks are not run again: they passed when the
+  original request was held, before the hold was written;
 - returning `{hold: Hold, outcome: Response}` — the outcome is the original op's response.
 
 `guardrail.reject {hold_id, reason?}` closes it. Either way core emits `guardrail.resolved`
@@ -664,7 +691,7 @@ optional. Entity shapes are in §11. `Id = number`. Every project-scoped op take
 | `bus.ops` | query · global | `{ actor?: Actor }` → `{ ops: OpInfo[] }` — registry attributes plus the all-layers `call`/`why` verdict for the (given or calling) actor (§9.1) |
 | `bus.whoami` | query · global | `{}` → `{ actor, is_agent, session?, role?, project_id?, project?, worktree?, branch?, can_call: string[], write_roots: string[] }` — identity and capability in one call, for any actor (D119) |
 | `bus.wait` | query · global · socket only | `{ events?: string[], timeout_ms? = 60000, matching?: object }` → `{ event?: Event, timed_out }` — block until a matching event arrives. The wake-up an agent has instead of a poll loop; events fired before the call are not replayed, so read state first, then wait (D115). `matching` takes only an event whose payload has each given top-level key equal to the value given |
-| `bus.subscribe` | query · global · socket only | `{ events?: string[] }` → `{ subscribed: string[] }` |
+| `bus.subscribe` | query · global · socket only | `{ events?: string[] }` → `{ subscribed: string[] }` — then `Event` lines; `bus.lagged {dropped}` when some were dropped (§6.2) |
 | `bus.unsubscribe` | query · global · socket only | `{}` → `{}` |
 
 ### 10.2 app
@@ -703,7 +730,7 @@ unique; nothing else is.
 | op | attrs | payload → result |
 |---|---|---|
 | `workspace.create` | mutation · always · global | `{ path?, name? }` → `Workspace`; blank/omitted path uses the same repository-aware default as `workspace.discover` |
-| `workspace.discover` | query | `{ path? }` → `{ path, repositories: {path,name}[] }`; resolves blank to the current Git checkout's parent (or the current directory outside a checkout) and scans bounded descendants for Git roots |
+| `workspace.discover` | query | `{ path? }` → `{ path, repositories: {path,name}[] }`; resolves blank to the parent of the Git checkout holding the *engine's* working directory (or that directory outside a checkout) — under `relay serve` the engine home, not the caller's directory, so a client that means "here" sends its own absolute path — and scans bounded descendants for Git roots, skipping any it cannot read |
 | `workspace.list` | query | `{}` → `{ workspaces: Workspace[] }` |
 | `workspace.update` | mutation · always · inverse | `{ workspace_id, name?, order? }` → `Workspace` |
 | `workspace.remove` | mutation · always · global | `{ workspace_id, force?: bool, remove_worktrees?: bool }` → `{ projects_removed, sessions_closed }` — `conflict` (`workspace.has_projects`, `details.projects`) if it still has projects, unless `force`, which runs `project.remove { force }` for each of them first |
@@ -737,7 +764,7 @@ unique; nothing else is.
 | `task.relate` / `task.unrelate` | mutation · always · inverse | `{ task_id, relation: "blocked_by"\|"duplicate_of", other_id }` → `Task` — stored and rendered, never enforced; `duplicate_of` is single-valued, so a second `relate` replaces the first |
 | `task.dispatch` | mutation · always · project · user | `{ task_id, session?: string, create?: SessionCreateIn, fanout?, start?: bool }` → `{ task: Task, session: Session, fanned: { task, session }[] }` — one of `session`/`create`; moves the task to `active`, sets `state: dispatched`, and appends it to the session queue. `start` defaults true; false stages assignments before the provider starts. `fanout` also dispatches every not-done descendant, one fresh session each, and therefore requires `create` (`task.fanout_target`) |
 | `task.approve` | mutation · always · inverse (move back) · project · user | `{ task_id, sha? }` → `Task` — any open column → `done`, links sha (defaults to the recorded session branch head, or the project checkout HEAD without a session) |
-| `task.copy_text` | query | `{ task_id }` → `{ text }` — the "copy button" text, one place |
+| `task.copy_text` | query | `{ task_id }` → `{ text }` — a task as plain text: `#id title`, then the body when it has one. Agents' copy; the desktop board's copy button still builds its own string (title, body, `#id`) and does not call it |
 
 ### 10.6 module (SPEC §7)
 
@@ -751,7 +778,7 @@ unique; nothing else is.
 | `module.reopen` | mutation · always · inverse | `{ module_id }` → `Module` |
 | `module.delete` / `module.restore` | mutation · always · inverse | `{ module_id }` → `{}` / `Module` — delete unlinks tasks (they keep existing, `module_id: null`) |
 | `module.stats` | query | `{ project_id }` → same as `module.list.header` |
-| `module.changelog.draft` | query | `{ module_id, group_by?: "priority"\|"size" }` → `{ markdown, tasks: Id[] }` |
+| `module.changelog.draft` | query | `{ module_id, group_by?: "priority" }` → `{ markdown, tasks: Id[] }` |
 
 ### 10.7 notes / mailbox (SPEC §3, §12)
 
@@ -845,7 +872,7 @@ Provider-neutral Markdown; the same for both providers.
 | op | attrs | payload → result |
 |---|---|---|
 | `guardrail.gate` | mutation · always · session · agent | `{ session, kind: "write"\|"commit"\|"exec", path?, new_text?, diff?, command? }` → `{ verdict: "allow"\|"refuse"\|"hold", error?: BusError, hold_id?: Id }` — the enforcement door (§9.3); may create a hold |
-| `guardrail.holds.list` | query | `{ project_id?, session?, open_only? = true, limit? (200, ≤1000) }` → `{ holds: Hold[] }` — newest first; a string over 64 KiB in `details` is cut to its first 4 KiB |
+| `guardrail.holds.list` | query | `{ project_id?, session?, open_only? = true, limit? (200, ≤1000) }` → `{ holds: Hold[] }` — newest first; a string over 64 KiB in `details` is cut to its first 4 KiB. An agent sees its own project's only (another `project_id` is `actor.scope`) |
 | `guardrail.hold.get` | query · user | `{ hold_id, full? }` → `{ hold, request, elided? }` — the frozen action without its auth; unless `full`, each string over 64 KiB in `request.payload` or `hold.details` is cut to its first 4 KiB and its JSON pointer listed in `elided`. `guardrail.confirm` replays the stored action whole |
 | `guardrail.confirm` | mutation · always · user | `{ hold_id, scope? }` → `{ hold: Hold, outcome: Response }` (§9.4); for an exception request `scope` is `once`\|`session` and nothing is replayed (§9.5) |
 | `guardrail.reject` | mutation · always · user | `{ hold_id, reason? }` → `{ hold: Hold }` |
@@ -854,7 +881,7 @@ Provider-neutral Markdown; the same for both providers.
 | `guardrail.config.layers` | query | `{ workspace_id? \| project_id? }` → `{ scope, workspace_id?, project_id?, effective, inherited, overrides, sources }` (§9.6) |
 | `guardrail.request` | mutation · always · session · agent (every role) | `{ session, kind, value, reason, scope? }` → `{ request: GuardrailException, created, wait_for }` (§9.5); `reason` at most 4 KiB, `value` at most 8 KiB |
 | `guardrail.request.get` | query | `{ request_id }` → `GuardrailException` |
-| `guardrail.requests.list` | query | `{ project_id?, session?, state?: "open"\|"active"\|"all" }` → `{ requests: GuardrailException[] }` |
+| `guardrail.requests.list` | query | `{ project_id?, session?, state?: "open"\|"active"\|"all" }` → `{ requests: GuardrailException[] }`; an agent sees its own project's only, as for `guardrail.holds.list` |
 | `guardrail.grant.revoke` | mutation · always · user | `{ request_id }` → `GuardrailException` |
 | `guardrail.explain` | query | `{ project_id, paths?, lines?, commands? }` → `{ verdict, paths: Item[], commands: Item[], files, lines, caps, over_caps, write_roots }` where `Item = {subject, verdict, policy?, message?}` — preflight a whole plan before the first action (D117). Pure: holds nothing, writes nothing |
 | `guardrail.check` | query | `{ project_id, kind: "write"\|"commit"\|"exec", path?, new_text?, diff?, command? }` → `{ verdict: "allow"\|"refuse"\|"hold", error?: BusError }` — pure dry run of `gate`: nothing created, nothing audited |
@@ -883,6 +910,7 @@ Provider-neutral Markdown; the same for both providers.
 | `git.pr.list` | query | `{ project_id, refresh? }` → `{ pull_requests: { number, branch, draft, url, title }[] }` — GitHub PRs reported by the authenticated `gh` CLI. One listing answers for a minute per repository (D130: redraws must not repeat the network request); `refresh` asks GitHub now, and `git.push` / `git.pr.open` drop the cached one |
 | `git.pr.open` | mutation · always | `{ project_id, worktree?, title?, body? }` → `{ url }` — `gh pr create` runs before the store lock, with a 25 s deadline; `git.pr_timeout` means the outcome is unknown |
 | `git.branch.clean_merged` | mutation · always | `{ project_id, dry_run? }` → `{ deleted: string[] }` — never touches branches with a live/parked session |
+| `git.branch.cleanup` | mutation · always · user | `{ project_id, dry_run? }` → `{ branches: {branch, session?, outcome, reason, pr?, removed_worktree, deleted_remote}[] }` — closed sessions' `relay/*` branches whose work is merged (an ancestor of the base, every commit already upstream by patch id, or a merged GitHub PR containing the tip) are deleted; anything else is `kept` with the reason. A branch checked out in the primary, by an open session or outside the pool, or being rebased or bisected, stays; a clean, unowned pooled checkout holding it is removed first. The remote branch is deleted only for a merged PR, leased on the sha just seen. The same pass runs after `session.close`, when `git.pr.list` sees a closed session's PR merged, and as a background sweep 90 s after start and every 20 min (a kept, unchanged branch is looked at again ever less often, up to weekly). Each deletion writes a `system` audit row and emits `git.changed` |
 | `git.suggest_message` | query | `{ project_id, worktree? }` → `{ message }` — heuristic subject from the diff |
 | `integration.request` | mutation · always | `{ project_id, sessions: string[] \| branches: string[], build?: bool = true, deploy?: DeviceRef }` → `Integration` (state `queued`; results via `integration.result` events). An agent is held to its own project and refused `deploy`; an agent's request that builds (the project's `build_cmd`, run outside any sandbox) is `held` / `integration.agent_build` for a person to confirm unless the project's `guardrails.agent_builds` is on, while a merge-only request (`build: false`) goes straight through |
 | `integration.get` / `integration.list` | query | `{ integration_id }` / `{ project_id }` |
@@ -891,7 +919,10 @@ Provider-neutral Markdown; the same for both providers.
 ### 10.13 file (SPEC §8)
 
 All paths are relative to the worktree root; `..` and absolute paths are `invalid` /
-`file.path`. `worktree` defaults to the project's primary checkout.
+`file.path`. An omitted `worktree` is the caller's own checkout: for an agent its session's
+worktree, for the user the project's primary checkout; `"@project"` names the primary checkout
+explicitly (D111). A `worktree` must be the primary or a linked checkout whose slot points back
+at it; one moved by hand without `git worktree move` is refused until `git worktree repair`.
 
 | op | attrs | payload → result |
 |---|---|---|
@@ -914,9 +945,9 @@ All paths are relative to the worktree root; `..` and absolute paths are `invali
 |---|---|---|
 | `device.list` | query | `{}` → `{ devices: Device[] }` (adb + AVDs later) |
 | `device.watch` | mutation · never · user | `{ on: bool }` → `{}`; while device control is visible, `adb track-devices` emits `device.changed`; off tears it down |
-| `device.mirror.start` | mutation · always | `{ device, max_size?, bitrate? }` → `{ mirror_id, width, height }` + `mirror` stream |
+| `device.mirror.start` | mutation · always | `{ device, max_size?, bitrate? }` → `{ mirror_id, width, height }` + `mirror` stream; the scrcpy server jar is taken from `$RELAY_SCRCPY_SERVER`, else `~/.local/share/relay-v4/scrcpy-server-v4.1`, else the checkout the engine was built from, and checked against its pinned SHA-256 before every push (`device.mirror_server_missing`, `device.mirror_server_mismatch`) |
 | `device.mirror.stop` | mutation · always | `{ mirror_id }` → `{}` |
-| `device.mirror.input` | mutation · never | `{ mirror_id, event: TouchEvent \| KeyEvent }` → `{}` |
+| `device.mirror.input` | mutation · never | `{ mirror_id, event }` → `{}`; `event` is `{type: "tap", x, y}`, `{type: "swipe", x1, y1, x2, y2}` (stream coordinates) or one of scrcpy's input messages (`touch`, `scroll`, `key`, `keypress`, `text`, `setclipboard`, `back`, `home`, …). A `swipe` is instant — DOWN, one MOVE, UP in one write, so it lands as a fling — and refuses any other field (`duration_ms`); send `touch` events for a timed drag. `setclipboard` text is at most 262,130 bytes (one message, never split); longer is `device.input` — use `text`, which is split |
 | `device.run` | mutation · always | `{ project_id, worktree?, device, variant?, integration_id? }` → `Run` (state `building`) + `logcat` stream; crashes surface as `run.crash` events |
 | `device.build` | mutation · always | `{ project_id, worktree?, variant?, format?, publish?, integration_id? }` → `Run` (state `building`, `kind: "build"`, no device) + `logcat` stream; `variant` defaults to `release`, `format` is `apk` (default) or `bundle`, and `publish` runs Gradle Play Publisher's `publish<Variant><Format>` to upload to Google Play. A saved Relay profile overrides release signing for this invocation; otherwise Gradle's project configuration signs as before. Play credentials stay in the target project. Build rows persist `variant`, `format`, and `publish`; a finished build adds `artifact` plus `signing: signed | unsigned | unverified` after checking the APK with SDK `apksigner` or the AAB with JDK `jarsigner` |
 | `device.signing.get` | query · user | `{ project_id }` → `{ configured, enabled, key_alias?, keystore? }`; returns metadata only, never a password |
@@ -1104,7 +1135,7 @@ interface GuardrailConfig {
   protected_paths: string[];
   shape_gates: { path: string; validator: "non_empty" | "json" | "json_non_empty_array" | "json_non_empty_object" }[];
   denied_commands: string[];   /* matched against parsed argv, never a raw substring */
-  allowed_write_roots: string[]; /* absolute; the process temp dir is always allowed too */
+  allowed_write_roots: string[]; /* absolute (a relative or ~ entry fails the config); the process temp dir is always allowed too */
   agent_builds: boolean;  /* default false: an agent's integration build waits for a person */
   roles: { builder: string[]; reviewer: string[]; docs: string[] };
 }
