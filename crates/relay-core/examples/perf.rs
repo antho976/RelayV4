@@ -81,23 +81,55 @@ fn thread_count() -> u64 {
 
 // ------------------------------------------------------------------ the measured region
 
-/// What one iteration reports back: whether the engine said yes, and how big the answer was.
+/// What one iteration reports back: whether the call succeeded, and what it answered. An op's
+/// result is carried out of the measured region whole and sized by [`Outcome::size`] after the
+/// counters are read, so serializing it is not counted as the op's (that is
+/// `path.response.serialize.*`).
 pub struct Outcome {
     pub ok: bool,
     pub code: Option<String>,
+    pub result: Option<Value>,
     pub bytes: usize,
+    /// A "during" case's other op, and when the measured request was issued.
+    pub overlap: Option<Overlap>,
 }
 
 impl Outcome {
-    fn of(resp: &Response) -> Outcome {
-        Outcome {
-            ok: resp.ok,
-            code: resp.error.as_ref().map(|e| e.code.clone()),
-            bytes: resp.result.as_ref().map(|r| r.to_string().len()).unwrap_or(0),
-        }
+    fn of(resp: Response) -> Outcome {
+        Outcome { ok: resp.ok, code: resp.error.map(|e| e.code), result: resp.result, bytes: 0, overlap: None }
     }
     fn plain(bytes: usize) -> Outcome {
-        Outcome { ok: true, code: None, bytes }
+        Outcome { ok: true, code: None, result: None, bytes, overlap: None }
+    }
+    /// A path that can fail: ok only when the call was, with its error as the code.
+    fn res<T, E: std::fmt::Display>(r: Result<T, E>, bytes: impl FnOnce(&T) -> usize) -> Outcome {
+        match r {
+            Ok(v) => Outcome::plain(bytes(&v)),
+            Err(e) => Outcome { ok: false, code: Some(e.to_string()), result: None, bytes: 0, overlap: None },
+        }
+    }
+    fn size(&self) -> usize {
+        self.result.as_ref().map_or(self.bytes, |r| r.to_string().len())
+    }
+}
+
+/// When a "during" case's other op ran, as its own thread saw it.
+#[derive(Default)]
+pub struct Span {
+    start: std::sync::OnceLock<Instant>,
+    end: std::sync::OnceLock<Instant>,
+}
+
+pub struct Overlap {
+    other: Arc<Span>,
+    issued: Instant,
+}
+
+impl Overlap {
+    /// Whether the other op was in flight when the measured request was issued. Read after the
+    /// measured region; an end not recorded yet means it is still running.
+    fn in_flight(&self) -> bool {
+        self.other.start.get().is_some_and(|s| *s <= self.issued) && self.other.end.get().is_none_or(|e| *e > self.issued)
     }
 }
 
@@ -147,6 +179,10 @@ struct Fixture {
     cleanup: Mutex<Vec<(Actor, &'static str, Value)>>,
     /// Threads a measured region started and must not wait for inside the measurement.
     joins: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// Engines a measured region built whose background work (recovery's deferred dirty scan)
+    /// still holds a clone: waited for and dropped before the next iteration, so one
+    /// iteration's `git status` workers do not run under the next one's counters.
+    settle: Mutex<Vec<Arc<Engine>>>,
     /// The store and the checkouts as `populate` left them; every case starts from this.
     baseline: Baseline,
     /// One line per call the engine made to a host tool the fixture stands in for.
@@ -167,6 +203,9 @@ struct Baseline {
     readme: String,
 }
 
+/// Fixture git. It reads no global or system config: [`isolate_host`] has pointed
+/// `GIT_CONFIG_GLOBAL` at the fixture's own file and set `GIT_CONFIG_NOSYSTEM` before the first
+/// call, and every `git` this process or the engine forks inherits both.
 fn git(repo: &Path, args: &[&str]) {
     let out = Command::new("git").arg("-C").arg(repo).args(args).output().expect("git");
     assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
@@ -359,6 +398,7 @@ impl Fixture {
             scale,
             cleanup: Mutex::new(Vec::new()),
             joins: Mutex::new(Vec::new()),
+            settle: Mutex::new(Vec::new()),
             baseline: Baseline::default(),
             host_log,
         };
@@ -401,10 +441,23 @@ impl Fixture {
     fn join_later(&self, handle: std::thread::JoinHandle<()>) {
         self.joins.lock().unwrap().push(handle);
     }
+    fn settle_later(&self, engine: Arc<Engine>) {
+        self.settle.lock().unwrap().push(engine);
+    }
     fn drain_cleanup(&self) {
         let joins: Vec<std::thread::JoinHandle<()>> = std::mem::take(&mut *self.joins.lock().unwrap());
         for handle in joins {
             let _ = handle.join();
+        }
+        let engines: Vec<Arc<Engine>> = std::mem::take(&mut *self.settle.lock().unwrap());
+        for engine in engines {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while Arc::strong_count(&engine) > 1 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if Arc::strong_count(&engine) > 1 {
+                eprint!("(an engine's background work outlived 60 s) ");
+            }
         }
         let pending: Vec<(Actor, &'static str, Value)> = std::mem::take(&mut *self.cleanup.lock().unwrap());
         for (actor, op, payload) in pending {
@@ -614,7 +667,7 @@ struct Case {
 fn dispatch(fx: &Arc<Fixture>, actor: Actor, op: &str, payload: Value) -> Work {
     let engine = fx.engine.clone();
     let req = Request::new(actor, op, payload);
-    Box::new(move || Outcome::of(&engine.dispatch(req, Door::InProcess)))
+    Box::new(move || Outcome::of(engine.dispatch(req, Door::InProcess)))
 }
 
 /// A fixed payload.
@@ -656,7 +709,7 @@ fn created(cases: &mut Vec<Case>, name: &str, op: &'static str, actor: Actor, co
                     let (op, payload) = undo(result);
                     fx.later(Actor::User, op, payload);
                 }
-                Outcome::of(&resp)
+                Outcome::of(resp)
             })
         }),
     });
@@ -732,6 +785,23 @@ fn store_copy(fx: &Fixture) -> PathBuf {
 fn kib(n: usize) -> String {
     let line = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde\n";
     line.repeat(n * 1024 / line.len())
+}
+
+/// Start `other` on its own thread and return once it has begun and `lead` has passed: what a
+/// "during" case issues its request beside. The span records when `other` actually ran.
+fn beside(lead: Duration, other: impl FnOnce() + Send + 'static) -> (Arc<Span>, std::thread::JoinHandle<()>) {
+    let span = Arc::new(Span::default());
+    let ran = span.clone();
+    let handle = std::thread::spawn(move || {
+        let _ = ran.start.set(Instant::now());
+        other();
+        let _ = ran.end.set(Instant::now());
+    });
+    while span.start.get().is_none() {
+        std::thread::yield_now();
+    }
+    std::thread::sleep(lead);
+    (span, handle)
 }
 
 fn cases() -> Vec<Case> {
@@ -926,7 +996,7 @@ fn cases() -> Vec<Case> {
                 if let Some(name) = resp.result.as_ref().and_then(|r| r["name"].as_str()) {
                     fx.close_later(name.to_string());
                 }
-                Outcome::of(&resp)
+                Outcome::of(resp)
             })
         }),
     });
@@ -1002,7 +1072,7 @@ fn cases() -> Vec<Case> {
                 if let Some(id) = resp.error.as_ref().and_then(|e| e.confirm.as_ref()).and_then(|c| c.payload["hold_id"].as_i64()) {
                     fx.later(U, "guardrail.reject", json!({"hold_id": id, "reason": "perf"}));
                 }
-                Outcome::of(&resp)
+                Outcome::of(resp)
             })
         }),
     });
@@ -1242,23 +1312,28 @@ fn cases() -> Vec<Case> {
         // What `relay serve` does before it binds: open the populated store, build the engine,
         // run crash recovery, materialize skills into every checkout. On a backup of the store,
         // because recovery against the live one would reap the fixture's own sessions.
+        // The deferred dirty scan outlives the region on a worker holding the engine; it is
+        // waited for, and the engine dropped, before the next iteration (`settle_later`).
         let path = store_copy(fx);
+        let fx = fx.clone();
         Box::new(move || {
             let store = Store::open(&path, false).unwrap();
             let engine = Engine::new(Instance::Test, store);
-            let _ = relay_core::recovery::run_with(&engine, relay_core::recovery::DirtyScan::Deferred);
+            let r = relay_core::recovery::run_with(&engine, relay_core::recovery::DirtyScan::Deferred);
             relay_core::skills::refresh_all(&engine);
             engine.shutdown();
-            drop(engine);
-            Outcome::plain(0)
+            fx.settle_later(engine);
+            Outcome::res(r, |_| 0)
         })
     });
     path_case(&mut c, "recovery.run", Mid, |fx| {
         let engine = Engine::new(Instance::Test, Store::open(&store_copy(fx), false).unwrap());
+        let fx = fx.clone();
         Box::new(move || {
             let r = relay_core::recovery::run_with(&engine, relay_core::recovery::DirtyScan::Deferred);
             engine.shutdown();
-            Outcome::plain(r.is_ok() as usize)
+            fx.settle_later(engine);
+            Outcome::res(r, |_| 0)
         })
     });
     path_case(&mut c, "skills.refresh_all", Mid, |fx| {
@@ -1270,11 +1345,17 @@ fn cases() -> Vec<Case> {
     });
     path_case(&mut c, "request.parse_8k", Cheap, |_| {
         let line = serde_json::to_string(&Request::new(Actor::User, "notes.create", json!({"project_id": 1, "body": kib(8)}))).unwrap();
-        Box::new(move || Outcome::plain(Engine::parse(&line).map(|r| r.payload.to_string().len()).unwrap_or(0)))
+        let len = line.len();
+        Box::new(move || Outcome::res(Engine::parse(&line).map_err(|r| r.error.map(|e| e.code).unwrap_or_default()), |_| len))
     });
     path_case(&mut c, "response.serialize.session_list", Cheap, |fx| {
         let resp = fx.call(Actor::User, "session.list", json!({"project_id": 1}));
-        Box::new(move || Outcome::plain(serde_json::to_string(&resp).map(|s| s.len()).unwrap_or(0)))
+        Box::new(move || {
+            let ok = resp.ok;
+            let out = Outcome::res(serde_json::to_string(&resp), String::len);
+            // A failed list would measure serializing an error, not the list.
+            Outcome { ok: ok && out.ok, ..out }
+        })
     });
     let socket = |c: &mut Vec<Case>, name: &str, actor: Actor, op: &'static str, payload: Value| {
         path_case(c, name, Cheap, move |fx| {
@@ -1283,7 +1364,7 @@ fn cases() -> Vec<Case> {
             Box::new(move || {
                 let mut client = fx.client.lock().unwrap();
                 let resp = fx.rt.block_on(client.call(&req, |_| {})).unwrap();
-                Outcome::of(&resp)
+                Outcome::of(resp)
             })
         });
     };
@@ -1298,7 +1379,7 @@ fn cases() -> Vec<Case> {
         Box::new(move || {
             let mut client = fx.client.lock().unwrap();
             let resp = fx.rt.block_on(client.call(&req, |_| {})).unwrap();
-            Outcome::of(&resp)
+            Outcome::of(resp)
         })
     });
     path_case(&mut c, "socket.connect", Mid, |fx| {
@@ -1307,7 +1388,7 @@ fn cases() -> Vec<Case> {
             let path = fx.socket_dir.join("test.sock");
             let mut client = fx.rt.block_on(Client::connect(&path)).unwrap();
             let resp = fx.rt.block_on(client.call(&Request::new(Actor::User, "bus.ping", json!({})), |_| {})).unwrap();
-            Outcome::of(&resp)
+            Outcome::of(resp)
         })
     });
     path_case(&mut c, "event.roundtrip", Cheap, |fx| {
@@ -1320,7 +1401,7 @@ fn cases() -> Vec<Case> {
         let n = fx.next();
         Box::new(move || {
             if !ok.ok {
-                return Outcome::of(&ok);
+                return Outcome::of(ok);
             }
             let mut client = fx.client.lock().unwrap();
             let resp = fx.rt.block_on(client.call(&Request::new(Actor::User, "settings.set", json!({"path": "perf.event", "value": n})), |_| {})).unwrap();
@@ -1337,7 +1418,8 @@ fn cases() -> Vec<Case> {
                 .await
                 .unwrap_or(false)
             });
-            Outcome { ok: resp.ok && got, code: resp.error.map(|e| e.code), bytes: 0 }
+            let code = resp.error.map(|e| e.code).or_else(|| (!got).then(|| "no_event".to_string()));
+            Outcome { ok: resp.ok && got, code, result: None, bytes: 0, overlap: None }
         })
     });
     path_case(&mut c, "pty.burst_1mib", Heavy, |fx| {
@@ -1387,20 +1469,25 @@ fn cases() -> Vec<Case> {
         })
     });
     // What the shell pays while something else is running: the other op starts on a second
-    // thread, and the measured region is one request issued a few milliseconds into it. An op
-    // that holds the store mutex makes every locked request wait for all of it; a keystroke
-    // never waits (D148), a session list or a scrollback tail does.
+    // thread, and the measured region is one request issued a millisecond after that thread
+    // began. An op that holds the store mutex makes every locked request wait for all of it; a
+    // keystroke never waits (D148), a session list or a scrollback tail does. Each row says in
+    // how many iterations the other op was still in flight when the request went out
+    // (`overlap`): one that is over by then measures an uncontended request, which is why
+    // `task.list` and a `device.build` with no Gradle wrapper (both well under a millisecond)
+    // are not here. The scan, search and status take a few milliseconds on a fast machine.
     let during = |c: &mut Vec<Case>, name: &str, other: &'static str, payload: Value, measured: &'static str, measured_payload: fn(&Fixture) -> Value| {
         path_case(c, name, Mid, move |fx| {
-            let fx = fx.clone();
             let runner = fx.clone();
             let payload = payload.clone();
-            let running = std::thread::spawn(move || {
+            let (span, running) = beside(Duration::from_millis(1), move || {
                 runner.call(Actor::User, other, payload);
             });
-            std::thread::sleep(Duration::from_millis(5));
+            let fx = fx.clone();
             Box::new(move || {
-                let out = Outcome::of(&fx.call(Actor::User, measured, measured_payload(&fx)));
+                let issued = Instant::now();
+                let mut out = Outcome::of(fx.call(Actor::User, measured, measured_payload(&fx)));
+                out.overlap = Some(Overlap { other: span, issued });
                 fx.join_later(running);
                 out
             })
@@ -1414,21 +1501,21 @@ fn cases() -> Vec<Case> {
     during(&mut c, "session_list.during_overlap_scan", "overlap.scan", json!({"project_id": 1}), "session.list", sessions);
     during(&mut c, "session_list.during_file_search", "file.search", json!({"project_id": 1, "query": "nothing-matches-this", "limit": 10}), "session.list", sessions);
     during(&mut c, "session_list.during_git_status", "git.status", json!({"project_id": 1}), "session.list", sessions);
-    during(&mut c, "session_list.during_task_list", "task.list", json!({"project_id": 1}), "session.list", sessions);
     during(&mut c, "scrollback_tail.during_overlap_scan", "overlap.scan", json!({"project_id": 1}), "session.scrollback", tail);
-    during(&mut c, "scrollback_tail.during_device_build", "device.build", json!({"project_id": 1}), "session.scrollback", tail);
-    // Opening or closing one agent must not stall the panes of every other one.
+    // Opening or closing one agent must not stall the panes of every other one. Half a
+    // millisecond in: closing a session that keeps its checkout takes about 1.5 ms.
     let during_session = |c: &mut Vec<Case>, name: &str, other: &'static str, setup: fn(&Fixture) -> Value| {
         path_case(c, name, Heavy, move |fx| {
-            let fx = fx.clone();
             let runner = fx.clone();
-            let payload = setup(&fx);
-            let running = std::thread::spawn(move || {
+            let payload = setup(fx);
+            let (span, running) = beside(Duration::from_micros(500), move || {
                 runner.call(Actor::User, other, payload);
             });
-            std::thread::sleep(Duration::from_millis(2));
+            let fx = fx.clone();
             Box::new(move || {
-                let out = Outcome::of(&fx.call(Actor::User, "session.list", json!({"project_id": 1})));
+                let issued = Instant::now();
+                let mut out = Outcome::of(fx.call(Actor::User, "session.list", json!({"project_id": 1})));
+                out.overlap = Some(Overlap { other: span, issued });
                 fx.join_later(running);
                 out
             })
@@ -1440,7 +1527,7 @@ fn cases() -> Vec<Case> {
     path_case(&mut c, "keystroke.during_busy_thread", Mid, |fx| {
         // The control: a thread that only burns CPU for 30 ms, no engine involved.
         let fx = fx.clone();
-        let busy = std::thread::spawn(|| {
+        let (span, busy) = beside(Duration::from_millis(5), || {
             let t0 = Instant::now();
             let mut x = 0u64;
             while t0.elapsed() < Duration::from_millis(30) {
@@ -1448,9 +1535,10 @@ fn cases() -> Vec<Case> {
             }
             std::hint::black_box(x);
         });
-        std::thread::sleep(Duration::from_millis(5));
         Box::new(move || {
-            let out = Outcome::of(&fx.call(Actor::User, "session.input", json!({"session": fx.builder, "data": "k"})));
+            let issued = Instant::now();
+            let mut out = Outcome::of(fx.call(Actor::User, "session.input", json!({"session": fx.builder, "data": "k"})));
+            out.overlap = Some(Overlap { other: span, issued });
             fx.join_later(busy);
             out
         })
@@ -1462,13 +1550,13 @@ fn cases() -> Vec<Case> {
     });
     path_case(&mut c, "worktree.status_files", Mid, |fx| {
         let repo = fx.repo.clone();
-        Box::new(move || Outcome::plain(relay_core::worktree::status_files(&repo).map(|s| s.len()).unwrap_or(0)))
+        Box::new(move || Outcome::res(relay_core::worktree::status_files(&repo), Vec::len))
     });
     path_case(&mut c, "guardrail.config_load", Cheap, |fx| {
         let engine = fx.engine.clone();
         Box::new(move || {
             let conn = engine.store.lock();
-            Outcome::plain(relay_core::guardrail::config(&conn, Some(1)).is_ok() as usize)
+            Outcome::res(relay_core::guardrail::config(&conn, Some(1)).map_err(|e| e.code), |_| 0)
         })
     });
     c
@@ -1485,6 +1573,8 @@ struct Stats {
     ok: usize,
     codes: std::collections::BTreeMap<String, usize>,
     bytes: usize,
+    /// "during" cases: iterations whose request went out while the other op was in flight.
+    overlap: Option<usize>,
 }
 
 fn percentile(sorted: &[u64], p: f64) -> u64 {
@@ -1505,44 +1595,107 @@ struct Strace {
     file: PathBuf,
 }
 
+/// Paths the harness `access()`es right before and right after each measured region, so the
+/// strace pass counts what happened between them and not the iteration's setup, its cleanup or
+/// the git processes those fork.
+const STRACE_BEGIN: &std::ffi::CStr = c"/relay-perf-mark/begin";
+const STRACE_END: &std::ffi::CStr = c"/relay-perf-mark/end";
+
+fn strace_mark(path: &std::ffi::CStr) {
+    unsafe { libc::access(path.as_ptr(), libc::F_OK) };
+}
+
+/// Every thread of this process has a tracer.
+fn all_traced() -> bool {
+    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else { return false };
+    tasks.flatten().all(|t| {
+        std::fs::read_to_string(t.path().join("status")).unwrap_or_default().lines()
+            .find_map(|l| l.strip_prefix("TracerPid:"))
+            .is_some_and(|pid| pid.trim() != "0")
+    })
+}
+
 fn strace_start(name: &str) -> Option<Strace> {
     let file = std::env::temp_dir().join(format!("relay-perf-strace-{}-{name}.txt", std::process::id()));
-    let child = Command::new("strace")
-        .args(["-f", "-c", "-o"])
+    // strace is this process's child, and under Yama ptrace_scope 1 a process may only trace its
+    // descendants: let any process attach until `strace_stop`. EINVAL without Yama, which needs
+    // nothing; scope 2 and 3 still refuse, and strace exits.
+    unsafe { libc::prctl(libc::PR_SET_PTRACER, libc::PR_SET_PTRACER_ANY, 0, 0, 0) };
+    let spawned = Command::new("strace")
+        .args(["-f", "-o"])
         .arg(&file)
         .args(["-p", &std::process::id().to_string()])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
-    // Let it attach to every thread before the work starts.
-    std::thread::sleep(Duration::from_millis(400));
-    Some(Strace { child, file })
-}
-
-fn strace_stop(mut s: Strace) -> Value {
-    unsafe { libc::kill(s.child.id() as i32, libc::SIGINT) };
-    let _ = s.child.wait();
-    let text = std::fs::read_to_string(&s.file).unwrap_or_default();
-    let _ = std::fs::remove_file(&s.file);
-    let mut total = 0u64;
-    let mut top = Vec::new();
-    for line in text.lines() {
-        let cols: Vec<&str> = line.split_whitespace().collect();
-        // "% time  seconds  usecs/call  calls  errors  syscall" — errors is optional.
-        if cols.len() >= 5 && cols[0].parse::<f64>().is_ok() && cols[1].parse::<f64>().is_ok() {
-            let calls: u64 = cols[3].parse().unwrap_or(0);
-            let name = cols[cols.len() - 1];
-            // The harness's own clock reads, and strace attaching and detaching, are not
-            // the engine's.
-            if !matches!(name, "total" | "getrusage" | "restart_syscall" | "kill" | "rt_sigreturn") {
-                total += calls;
-                top.push((calls, name.to_string()));
+        .spawn();
+    // Wait until it holds every thread before the work starts, or has given up.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    if let Ok(mut child) = spawned {
+        loop {
+            if all_traced() {
+                return Some(Strace { child, file });
             }
+            if !matches!(child.try_wait(), Ok(None)) || Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
+    eprint!("(strace did not attach) ");
+    unsafe { libc::prctl(libc::PR_SET_PTRACER, 0, 0, 0, 0) };
+    let _ = std::fs::remove_file(&file);
+    None
+}
+
+/// The syscalls between each begin and end mark, every thread, and how many marked regions the
+/// trace holds. Lines are `PID name(args) = ret`; a call another thread interrupted is split
+/// into `name(args <unfinished ...>` and `<... name resumed>`, counted once, at its start.
+fn strace_count(text: &str) -> (std::collections::BTreeMap<String, u64>, usize) {
+    let (begin, end) = (STRACE_BEGIN.to_str().unwrap(), STRACE_END.to_str().unwrap());
+    let mut calls = std::collections::BTreeMap::new();
+    let (mut inside, mut regions) = (false, 0usize);
+    for line in text.lines() {
+        if line.contains(begin) {
+            inside = true;
+            continue;
+        }
+        if line.contains(end) {
+            regions += inside as usize;
+            inside = false;
+            continue;
+        }
+        if !inside {
+            continue;
+        }
+        let rest = line.trim_start().trim_start_matches(|c: char| c.is_ascii_digit()).trim_start();
+        let name = rest.split('(').next().unwrap_or_default();
+        if !name.is_empty() && rest.len() > name.len() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            *calls.entry(name.to_string()).or_default() += 1;
+        }
+    }
+    (calls, regions)
+}
+
+/// Null, not a count, when strace died during the loop or its trace does not hold one marked
+/// region per iteration: a missing count must not read as zero syscalls.
+fn strace_stop(mut s: Strace, iters: usize) -> Value {
+    let alive = matches!(s.child.try_wait(), Ok(None));
+    unsafe { libc::kill(s.child.id() as i32, libc::SIGINT) };
+    let _ = s.child.wait();
+    unsafe { libc::prctl(libc::PR_SET_PTRACER, 0, 0, 0, 0) };
+    let text = std::fs::read_to_string(&s.file).unwrap_or_default();
+    let _ = std::fs::remove_file(&s.file);
+    let (calls, regions) = strace_count(&text);
+    if !alive || regions != iters {
+        eprint!("(strace: {} of {iters} regions{}) ", regions, if alive { "" } else { ", exited early" });
+        return Value::Null;
+    }
+    let mut top: Vec<(u64, String)> = calls.into_iter().map(|(name, n)| (n, name)).collect();
     top.sort_by_key(|t| std::cmp::Reverse(t.0));
-    json!({"total": total, "top": top.iter().take(8).map(|(n, s)| json!({"syscall": s, "calls": n})).collect::<Vec<_>>()})
+    let total: u64 = top.iter().map(|t| t.0).sum();
+    json!({"total": total, "regions": regions, "top": top.iter().take(8).map(|(n, s)| json!({"syscall": s, "calls": n})).collect::<Vec<_>>()})
 }
 
 fn run_case(fx: &Arc<Fixture>, case: &Case, iters: usize, warmup: usize, opts: &Opts) -> Value {
@@ -1551,6 +1704,7 @@ fn run_case(fx: &Arc<Fixture>, case: &Case, iters: usize, warmup: usize, opts: &
         let work = (case.prepare)(fx);
         let _ = work();
     }
+    fx.drain_cleanup();
     let mut stats = Stats::default();
     let rss_before = rss_kb();
     let threads_before = thread_count();
@@ -1568,9 +1722,15 @@ fn run_case(fx: &Arc<Fixture>, case: &Case, iters: usize, warmup: usize, opts: &
         let allocs0 = ALLOCS.load(Ordering::Relaxed);
         let bytes0 = ALLOC_BYTES.load(Ordering::Relaxed);
         let cpu0 = cpu_time();
+        if strace.is_some() {
+            strace_mark(STRACE_BEGIN);
+        }
         let t0 = Instant::now();
         let out = perf_measured(work);
         let wall = t0.elapsed();
+        if strace.is_some() {
+            strace_mark(STRACE_END);
+        }
         let cpu = cpu_time().saturating_sub(cpu0);
         if opts.callgrind {
             callgrind(&["-i", "off"]);
@@ -1582,13 +1742,16 @@ fn run_case(fx: &Arc<Fixture>, case: &Case, iters: usize, warmup: usize, opts: &
         if out.ok {
             stats.ok += 1;
         }
+        stats.bytes = stats.bytes.max(out.size());
+        if let Some(overlap) = &out.overlap {
+            *stats.overlap.get_or_insert(0) += overlap.in_flight() as usize;
+        }
         if let Some(code) = out.code {
             *stats.codes.entry(code).or_default() += 1;
         }
-        stats.bytes = stats.bytes.max(out.bytes);
     }
     let elapsed = started.elapsed();
-    let strace = strace.map(strace_stop);
+    let strace = strace.map(|s| strace_stop(s, iters));
     if opts.callgrind {
         callgrind(&[&format!("--dump={}", case.name)]);
     }
@@ -1606,6 +1769,7 @@ fn run_case(fx: &Arc<Fixture>, case: &Case, iters: usize, warmup: usize, opts: &
         "ok": stats.ok,
         "codes": stats.codes,
         "result_bytes": stats.bytes,
+        "overlap": stats.overlap,
         "wall_ns": {"min": sorted.first().copied().unwrap_or(0), "p50": percentile(&sorted, 0.5), "p95": percentile(&sorted, 0.95), "max": sorted.last().copied().unwrap_or(0), "mean": mean},
         "cpu_ns_per_iter": stats.cpu_ns / n,
         "allocs_per_iter": stats.allocs / n,
@@ -1706,9 +1870,11 @@ fn main() {
             }
         }
         "run" => {
+            // A filter is a scenario name, or a prefix when it ends in `*`: `op.git.diff` is one
+            // case, `op.git.diff*` is three.
             let selected: Vec<&Case> = all
                 .iter()
-                .filter(|c| filters.is_empty() || filters.iter().any(|f| c.name == *f || c.name.starts_with(f.trim_end_matches('*'))))
+                .filter(|c| filters.is_empty() || filters.iter().any(|f| c.name == *f || (f.ends_with('*') && c.name.starts_with(f.trim_end_matches('*')))))
                 .collect();
             if selected.is_empty() {
                 eprintln!("no scenario matches {filters:?}");
@@ -1728,7 +1894,8 @@ fn main() {
                 let mut row = run_case(&fx, case, n, warmup.min(n), &opts);
                 row["name"] = json!(format!("{}{suffix}", case.name));
                 row["scale"] = json!(scale);
-                eprintln!("{:>10.1} µs  {} ok  {}", row["wall_ns"]["p50"].as_u64().unwrap_or(0) as f64 / 1000.0, row["ok"], row["codes"]);
+                let overlap = row["overlap"].as_u64().map(|k| format!("  {k}/{n} beside the other op")).unwrap_or_default();
+                eprintln!("{:>10.1} µs  {} ok  {}{overlap}", row["wall_ns"]["p50"].as_u64().unwrap_or(0) as f64 / 1000.0, row["ok"], row["codes"]);
                 writeln!(sink, "{row}").unwrap();
             }
             sink.flush().unwrap();
@@ -1747,5 +1914,37 @@ fn main() {
             fx.engine.shutdown();
         }
         _ => usage(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // `cargo test -p relay-core --example perf`: the strace pass cannot run where strace is not
+    // installed, so its parser is checked against a trace of the shape `strace -f -o` writes.
+    #[test]
+    fn strace_counts_only_between_marks() {
+        let trace = r#"4101  openat(AT_FDCWD, "/tmp/x/.git/index", O_RDONLY) = 3
+4101  clone3({flags=CLONE_VM|CLONE_VFORK, exit_signal=SIGCHLD, stack=0x7f, stack_size=0x9000}, 88) = 4200
+4200  execve("/usr/bin/git", ["git", "status"], 0x7ffd /* 40 vars */) = 0
+4101  access("/relay-perf-mark/begin", F_OK) = -1 ENOENT (No such file or directory)
+4101  getrandom("\x01\x02", 16, 0) = 16
+4102  futex(0x55d0, FUTEX_WAIT_PRIVATE, 0, NULL <unfinished ...>
+4101  pwrite64(5, "SQLite", 4096, 0) = 4096
+4102  <... futex resumed>) = 0
+4102  --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=4200, si_uid=1000, si_status=0} ---
+4200  +++ exited with 0 +++
+4101  access("/relay-perf-mark/end", F_OK) = -1 ENOENT (No such file or directory)
+4101  unlink("/tmp/x/scratch") = 0
+4101  access("/relay-perf-mark/begin", F_OK <unfinished ...>
+4102  epoll_wait(4,  <unfinished ...>
+4101  <... access resumed>) = -1 ENOENT (No such file or directory)
+4101  pwrite64(5, "SQLite", 4096, 0) = 4096
+4101  access("/relay-perf-mark/end", F_OK) = -1 ENOENT (No such file or directory)
+4101  close(3) = 0
+"#;
+        let (calls, regions) = super::strace_count(trace);
+        assert_eq!(regions, 2);
+        let calls: Vec<(&str, u64)> = calls.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+        assert_eq!(calls, [("epoll_wait", 1), ("futex", 1), ("getrandom", 1), ("pwrite64", 2)]);
     }
 }

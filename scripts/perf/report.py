@@ -50,10 +50,13 @@ def ir(n):
 
 
 def outcome(row):
+    # A "during" case: in how many iterations the other op was still running when the measured
+    # request went out. Fewer than all means some iterations measured an uncontended request.
+    beside = f"; beside the other op {row['overlap']}/{row['iters']}" if row.get("overlap") is not None else ""
     if row["ok"] == row["iters"]:
-        return "ok"
+        return "ok" + beside
     codes = ", ".join(f"`{c}`" for c in row.get("codes", {}))
-    return f"{row['ok']}/{row['iters']} ok, {codes}" if row["ok"] else codes or "error"
+    return (f"{row['ok']}/{row['iters']} ok, {codes}" if row["ok"] else codes or "error") + beside
 
 
 def group_of(name):
@@ -81,9 +84,9 @@ def main():
     native = read_jsonl(run / "native.jsonl")
     scale = {r["name"].split("@")[0]: r for r in read_jsonl(run / "scale10.jsonl")}
     strace = {r["name"]: r for r in read_jsonl(run / "strace.jsonl")}
-    # A strace that could not attach (Yama ptrace_scope, see baseline.py's strace_blocked) leaves
-    # perf.rs an empty count file, which it reports as 0 for every scenario. No real pass is empty
-    # across the board, so read that as "no data", not as zero syscalls.
+    # A strace that could not attach (Yama ptrace_scope, see baseline.py's strace_blocked) is
+    # `"strace": null` from perf.rs, and `{"total": 0, "top": []}` in runs made before it said so.
+    # No real pass is empty across the board, so read either as "no data", not as zero syscalls.
     strace_note = env.get("strace_skipped")
     if strace and not any(((r.get("strace") or {}).get("top")) for r in strace.values()):
         strace_note = "every scenario came back with no syscalls at all, so strace did not attach; the column is empty"
@@ -110,7 +113,7 @@ def main():
     p("- **p50 / p95**: wall time of one iteration of the measured region, in process, no socket unless the name says so.")
     p("- **cpu**: process CPU time per iteration (user + system, every thread). Above wall means other threads worked; below means the iteration waited.")
     p("- **allocs / bytes**: heap allocations and bytes requested per iteration, counted by a global allocator wrapper.")
-    p("- **syscalls**: from a separate strace pass with fewer iterations; the count is per iteration, every thread.")
+    p("- **syscalls**: from a separate strace pass with fewer iterations; per iteration, every thread, counted between marks around the measured region, so not the iteration's setup or cleanup.")
     if strace_note:
         p(f"  Not measured in this run: {strace_note}.")
     p("- **Ir**: instructions retired per iteration under callgrind, deterministic. The breakdown is self cost by subsystem.")

@@ -8,7 +8,7 @@ Everything lands in one run directory as JSON, and `report.py` turns it into Mar
 
     python3 scripts/perf/baseline.py                  # full run, docs/perf/runs/<date>/
     python3 scripts/perf/baseline.py --quick          # fewer iterations, no callgrind
-    python3 scripts/perf/baseline.py --only op.task   # a subset
+    python3 scripts/perf/baseline.py --only 'op.task.*'   # a subset: a name, or a prefix ending in *
 
 No user store, no paid provider, no display. The fixture is disposable and lives in a temp dir.
 """
@@ -109,9 +109,10 @@ def environment():
 
 def strace_blocked():
     """Why `perf run --strace` cannot attach here, or None. perf.rs starts strace as its own child
-    and points it at its parent; under Yama ptrace_scope 1 or 2 that needs CAP_SYS_PTRACE, and
-    under 3 nothing may attach. A refused attach is not an error to perf.rs: strace exits, the
-    count file is empty, and every scenario would read 0 syscalls."""
+    and points it at its parent. Under Yama ptrace_scope 1 it lets any process attach first
+    (PR_SET_PTRACER_ANY); under 2 that needs CAP_SYS_PTRACE, and under 3 nothing may attach.
+    Running the pass anyway costs nothing wrong: perf.rs writes `"strace": null` for every
+    scenario it could not trace, but skipping it says why up front."""
     try:
         scope = int(Path("/proc/sys/kernel/yama/ptrace_scope").read_text())
     except (OSError, ValueError):
@@ -123,7 +124,7 @@ def strace_blocked():
                 cap_sys_ptrace = bool(int(line.split()[1], 16) >> 19 & 1)
     except (OSError, ValueError):
         pass
-    if scope == 0 or (scope in (1, 2) and cap_sys_ptrace):
+    if scope in (0, 1) or (scope == 2 and cap_sys_ptrace):
         return None
     return (f"kernel.yama.ptrace_scope is {scope}"
             + ("" if scope == 3 else " and this process lacks CAP_SYS_PTRACE")
@@ -135,7 +136,8 @@ def scenarios():
 
 
 def matches(name, filters):
-    return not filters or any(name == f or name.startswith(f.rstrip("*")) for f in filters)
+    """`perf run`'s rule: a filter is a scenario name, or a prefix when it ends in `*`."""
+    return not filters or any(name == f or (f.endswith("*") and name.startswith(f.rstrip("*"))) for f in filters)
 
 
 def perf_run(args, out, extra_env=None):
@@ -289,17 +291,9 @@ def parse_callgrind(out_dir, rows_by_name):
 
 
 def shards(names, jobs):
-    """Split `names` into `jobs` groups, keeping every name in the group of any name that is its
-    prefix. `perf run` treats each filter as a prefix, so `op.git.diff` in one group and
-    `op.git.diff.file` in another would run (and dump) `op.git.diff.file` in both."""
-    families = {}
-    for name in sorted(names):
-        root = next((r for r in families if name.startswith(r)), name)
-        families.setdefault(root, []).append(name)
-    groups = [[] for _ in range(jobs)]
-    for family in sorted(families.values(), key=len, reverse=True):
-        min(groups, key=len).extend(family)
-    return groups
+    """Split `names` into `jobs` groups. `perf run` matches a name without `*` exactly, so each
+    scenario runs (and dumps) in its own group only."""
+    return [names[i::jobs] for i in range(jobs)]
 
 
 def run_callgrind(out_dir, names, jobs, iters_div):
@@ -669,7 +663,7 @@ def run_process(out_dir, seconds):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out-dir", type=Path, default=None, help="default docs/perf/runs/<date>")
-    ap.add_argument("--only", action="append", default=[], help="scenario name or prefix (repeatable)")
+    ap.add_argument("--only", action="append", default=[], help="scenario name, or a prefix ending in * (repeatable)")
     ap.add_argument("--quick", action="store_true", help="a quarter of the iterations, no callgrind, short process windows")
     ap.add_argument("--skip-callgrind", action="store_true")
     ap.add_argument("--skip-strace", action="store_true")
@@ -704,12 +698,7 @@ def main():
         scale_names = [n for n in SCALE_OPS if n in names]
         if scale_names:
             log("scale pass: the list queries with ten times the rows")
-            scale_out = out_dir / "scale10.jsonl"
-            perf_run([*scale_names, "--scale", "10", *native_args], scale_out)
-            # `perf run` reads each name as a prefix, so op.session.list also ran
-            # op.session.list.all: keep only the rows SCALE_OPS asked for.
-            kept = [r for r in read_jsonl(scale_out) if r["name"].split("@")[0] in scale_names]
-            scale_out.write_text("".join(json.dumps(r, separators=(",", ":")) + "\n" for r in kept))
+            perf_run([*scale_names, "--scale", "10", *native_args], out_dir / "scale10.jsonl")
     if strace_skip:
         log(f"strace pass skipped: {strace_skip}")
     elif not args.skip_strace and shutil.which("strace"):
