@@ -17,7 +17,7 @@ scroll to Artifacts). It holds:
   for leaks.
 
 Unzip, copy to the phone, open it (allow installing from your file manager once). A tagged release
-(`v*`) also publishes the APK on the Releases page.
+(`tally-v*`) also publishes the APK on the Releases page.
 
 To try the app with something in it: on the first screen choose **try it with sample data**, or
 later go to Settings, Reset, Load sample data. Sample accounts are named "Sample ..." so
@@ -62,7 +62,8 @@ Needs JDK 21 and the Android SDK with `platforms;android-37.0`.
 
 ## CI
 
-`.github/workflows/ci.yml`, on every push:
+`.github/workflows/tally-ci.yml` at the RelayV4 root, on every push or pull request that touches
+`apps/tally` (every `run` step starts in `apps/tally`):
 
 | Job | What it proves |
 |---|---|
@@ -71,6 +72,6 @@ Needs JDK 21 and the Android SDK with `platforms;android-37.0`.
 | Verify | Room DAO and repository tests on SQLite, recurring posting, backup round trip, design doctrine, theme contrast, screenshot goldens at 100% and 200% font, Android Lint, R8 release, merged manifest has no INTERNET, APK size budget |
 | Instrumented | the real UI flow on an emulator with LeakCanary failing any test that leaks, device SQLite, and a cold launch of the minified APK |
 
-`record-screenshots.yml` re-records the goldens and the Room schema on demand; `release.yml`
-turns a `v*` tag into a GitHub Release (signed with the real key when the `TALLY_*` secrets are
+`tally-record-screenshots.yml` re-records the goldens and the Room schema on demand;
+`tally-release.yml` turns a `tally-v*` tag into a GitHub Release (signed with the real key when the `TALLY_*` secrets are
 set, otherwise a debug-signed pre-release).

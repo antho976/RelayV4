@@ -44,6 +44,11 @@ through a rendezvous server you host. The phone app lives in `apps/relay-mobile`
 (Expo / React Native; built by the **Mobile APK** workflow). See
 [docs/MOBILE.md](docs/MOBILE.md).
 
+`apps/tally` is Tally, the budget and spending tracker for Android (Kotlin, Compose, Room),
+brought in from its own repository and built by the `tally-*` workflows. Its money rules are
+ported to `crates/relay-money` for the engine, held to the same tests, so the phone and the PC can
+each keep the whole ledger. The plan is [docs/MONEY.md](docs/MONEY.md).
+
 Open a repository from the sidebar, then add solo agents or a group of
 one or two builders sharing a reviewer. Code can edit the primary checkout or
 an agent worktree. Board, Notes, Skills, Settings, usage and Android device tools

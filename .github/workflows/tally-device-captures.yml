@@ -1,4 +1,4 @@
-name: Device captures
+name: Tally Device captures
 
 # Real emulator screenshots of Home, committed to .impeccable/captures for the design finish
 # review. The review asks about the shell around the screen: the status bar, the raised navigation
@@ -12,6 +12,12 @@ on:
 
 permissions:
   contents: write
+
+# Tally lives in apps/tally; every `run` step starts there. `uses` steps ignore this default, so
+# their paths name apps/tally themselves.
+defaults:
+  run:
+    working-directory: apps/tally
 
 jobs:
   capture:
@@ -30,14 +36,14 @@ jobs:
             /usr/local/share/powershell /usr/local/share/chromium || true
           sudo docker image prune --all --force > /dev/null 2>&1 || true
           df -h /
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.ref }}
-      - uses: actions/setup-java@v6
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6
         with:
           distribution: temurin
           java-version: "21"
-      - uses: gradle/actions/setup-gradle@v6
+      - uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6
         with:
           cache-read-only: true
       - name: Install the Android platform
@@ -55,7 +61,7 @@ jobs:
       # A fresh AVD per device on a named hardware profile, booted cold with no snapshot: each
       # capture is a clean install on a real screen size, not CI's cached generic AVD.
       - name: Phone (Pixel 7), then at the 200% font scale
-        uses: reactivecircus/android-emulator-runner@v2
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
         with:
           api-level: 34
           target: google_apis
@@ -68,9 +74,10 @@ jobs:
           force-avd-creation: true
           disable-animations: true
           emulator-options: -no-snapshot -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          working-directory: apps/tally
           script: bash .github/scripts/capture.sh phone
       - name: Tablet (Pixel Tablet)
-        uses: reactivecircus/android-emulator-runner@v2
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
         with:
           api-level: 34
           target: google_apis
@@ -83,6 +90,7 @@ jobs:
           force-avd-creation: true
           disable-animations: true
           emulator-options: -no-snapshot -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          working-directory: apps/tally
           script: bash .github/scripts/capture.sh tablet
       - name: Commit the captures
         shell: bash
@@ -125,9 +133,9 @@ jobs:
           git push origin "HEAD:${GITHUB_REF_NAME}"
       - name: Upload the captures
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: device-captures
-          path: captures/
+          path: apps/tally/captures/
           if-no-files-found: warn
           retention-days: 30
