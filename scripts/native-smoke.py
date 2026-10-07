@@ -62,6 +62,14 @@ for line in sys.stdin:
     if line.strip()=="native-burst":
         for i in range(2048): print(f"B{i:06d} " + "x"*88)
         print("BURST-END-"+os.environ["RELAY_SESSION"],flush=True)
+    elif line.startswith("native-request "):
+        # Only an agent may ask for a guardrail exception: this session asks as itself.
+        import json, subprocess
+        _, kind, value, scope = line.split()
+        payload = json.dumps({"session": os.environ["RELAY_SESSION"], "kind": kind, "value": value,
+                              "reason": "The native smoke fixture needs this exception to go on.", "scope": scope})
+        done = subprocess.run([os.environ["RELAY_BIN"], "cmd", "guardrail.request", payload], capture_output=True, text=True)
+        print("request: " + (done.stdout.strip() or done.stderr.strip()), flush=True)
     else: print("echo: " + line.rstrip(), flush=True)
 ''')
     provider.chmod(0o755)

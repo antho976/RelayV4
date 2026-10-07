@@ -545,6 +545,105 @@ async fn verify_guardrail_decisions(ui: Rc<Ui>) -> Result<(), String> {
     util::press(&send, "Send denial")?;
     resolved(*id, "rejected").await?;
     println!("Guardrail decisions verified: review before Allow once, Allow confirms, Reject closes");
+    verify_exception_requests(&ui, &session).await
+}
+
+/// Approve once, Approve for this session, Deny and Revoke on exception requests (RA-719).
+/// Only an agent may call `guardrail.request`, so the request comes from the live fixture
+/// session itself: native-smoke.py's provider turns a `native-request kind value scope` line
+/// on its terminal into that call, with its own RELAY_SESSION and RELAY_TOKEN.
+async fn verify_exception_requests(ui: &Rc<Ui>, session: &str) -> Result<(), String> {
+    let project = ui.project.get();
+    let call = |op: &'static str, payload: serde_json::Value| {
+        let ui = ui.clone();
+        async move { ui.call(op, payload).await.map_err(|e| format!("{op}: {e}")) }
+    };
+    let mut requests = Vec::new();
+    for (decision, scope) in [("once", "once"), ("session", "session"), ("deny", "once")] {
+        let value = format!("secret/native-request-{decision}-{}", std::process::id());
+        call("session.input", json!({"session":session,"data":format!("native-request path {value} {scope}\n")})).await?;
+        let deadline = Instant::now() + util::WAIT;
+        let id = loop {
+            let open = call("guardrail.requests.list", json!({"project_id":project,"state":"open"})).await?;
+            let found = open["requests"].as_array().into_iter().flatten().find(|r| r["value"] == value.as_str());
+            if let Some(id) = found.and_then(|r| r["id"].as_i64()) {
+                break id;
+            }
+            if Instant::now() >= deadline {
+                let tail = call("session.scrollback", json!({"session":session})).await?;
+                let tail = tail["text"].as_str().unwrap_or_default();
+                let tail: String = tail.chars().rev().take(400).collect::<Vec<_>>().into_iter().rev().collect();
+                return Err(format!("{session} made no request for {value}; its terminal ends: {tail:?}"));
+            }
+            glib::timeout_future(Duration::from_millis(50)).await;
+        };
+        requests.push((value, id));
+    }
+    let page = ui.pages.get("guardrails").ok_or("No Guardrails page")?.clone().upcast::<gtk::Widget>();
+    ui.refresh_page();
+    // The page's own card, not the prompt in the tray, and only once the pointer may reach it.
+    let card = |id: i64| {
+        let name = format!("guardrail-request-{id}");
+        util::find(&page, &|w| w.widget_name() == name.as_str()).filter(|card| {
+            let mut ancestor = Some(card.clone());
+            while let Some(widget) = ancestor {
+                if !widget.can_target() {
+                    return false;
+                }
+                ancestor = widget.parent();
+            }
+            card.is_mapped()
+        })
+    };
+    let key = |root: &gtk::Widget, label: &str| {
+        util::find(root, &|w| w.downcast_ref::<gtk::Button>().is_some_and(|b| b.label().as_deref() == Some(label)))
+            .and_then(|w| w.downcast::<gtk::Button>().ok())
+            .ok_or_else(|| format!("No {label} key"))
+    };
+    let settled = |id: i64, test: fn(&serde_json::Value) -> bool, what: &'static str| async move {
+        let deadline = Instant::now() + util::WAIT;
+        loop {
+            let request = call("guardrail.request.get", json!({"request_id":id})).await?;
+            if test(&request) {
+                return Ok::<(), String>(());
+            }
+            require(Instant::now() < deadline, &format!("Request {id} {what}: {request}"))?;
+            glib::timeout_future(Duration::from_millis(50)).await;
+        }
+    };
+    let answer = |id: i64, label: &'static str| async move {
+        wait_for(|| card(id).is_some(), &format!("Request {id} shown on the Guardrails page")).await?;
+        util::press(&key(&card(id).unwrap(), label)?, label)
+    };
+
+    let (_, once) = requests[0];
+    answer(once, "Approve once").await?;
+    settled(once, |r| r["state"] == "confirmed" && r["scope"] == "once" && r["active"] == true, "approved once").await?;
+
+    let (ref value, always) = requests[1];
+    answer(always, "Approve for this session").await?;
+    settled(always, |r| r["state"] == "confirmed" && r["scope"] == "session" && r["active"] == true, "approved for the session").await?;
+
+    let (_, denied) = requests[2];
+    answer(denied, "Deny…").await?;
+    let send = key(&card(denied).ok_or("Denied request's card gone")?, "Send denial")?;
+    wait_for(|| send.is_mapped(), "Denial form shown").await?;
+    util::press(&send, "Send denial")?;
+    settled(denied, |r| r["state"] == "rejected", "denied").await?;
+
+    // The session grant is listed under ACTIVE EXCEPTIONS with its own Revoke key.
+    ui.refresh_page();
+    let grant = || {
+        util::find(&page, &|w| {
+            w.has_css_class("guardrail-grant")
+                && util::find(w, &|l| l.downcast_ref::<gtk::Label>().is_some_and(|l| l.text() == value.as_str())).is_some()
+        })
+        .filter(|row| row.is_mapped())
+    };
+    wait_for(|| grant().is_some(), "Session grant listed under active exceptions").await?;
+    util::press(&key(&grant().unwrap(), "Revoke")?, "Revoke")?;
+    settled(always, |r| r["active"] == false && !r["revoked_at"].is_null(), "revoked").await?;
+    println!("Exception requests verified: Approve once, Approve for this session, Deny, Revoke");
     Ok(())
 }
 
