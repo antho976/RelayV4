@@ -41,6 +41,8 @@ data class SyncPrefs(
     val pc: PairedPc? = null,
     /** The PC's cursor from the last sync, sent back as `since`. */
     val cursor: Long = 0L,
+    /** Which of the PC's ledgers that cursor counts in; it changes when the PC's is replaced. */
+    val generation: String? = null,
     /** When the last successful sync started: rows stamped from then on are sent next time. */
     val watermark: Long = 0L,
     /** The first sync, which makes the PC's ledger this phone's, has been done. */
@@ -51,6 +53,8 @@ data class SyncPrefs(
     val lastError: String? = null,
     val lastSent: Int = 0,
     val lastReceived: Int = 0,
+    /** News from the last syncs worth a line of its own (the phone took the PC's ledger). */
+    val note: String? = null,
 ) {
     val paired: Boolean get() = pc != null
 }
@@ -75,6 +79,8 @@ class SyncStore @Inject constructor(@ApplicationContext context: Context) {
         val token = stringPreferencesKey("device_token")
         val pairedAt = longPreferencesKey("paired_at")
         val cursor = longPreferencesKey("cursor")
+        val generation = stringPreferencesKey("generation")
+        val note = stringPreferencesKey("note")
         val watermark = longPreferencesKey("watermark")
         val replaced = booleanPreferencesKey("replaced")
         val lastAttemptAt = longPreferencesKey("last_attempt_at")
@@ -104,6 +110,8 @@ class SyncStore @Inject constructor(@ApplicationContext context: Context) {
                     null
                 },
                 cursor = p[Keys.cursor] ?: 0L,
+                generation = p[Keys.generation],
+                note = p[Keys.note],
                 watermark = p[Keys.watermark] ?: 0L,
                 replaced = p[Keys.replaced] ?: false,
                 lastAttemptAt = p[Keys.lastAttemptAt] ?: 0L,
@@ -132,9 +140,18 @@ class SyncStore @Inject constructor(@ApplicationContext context: Context) {
     /** The PC's name as it greeted last; it can be renamed on the PC. */
     suspend fun rename(name: String) = store.edit { if (it[Keys.token] != null) it[Keys.name] = name }
 
-    suspend fun recordSuccess(at: Long, cursor: Long, watermark: Long, sent: Int, received: Int) = store.edit {
+    /**
+     * A sync that worked. [note] is news to keep showing; a later sync that moves anything
+     * either way retires it, one that moves nothing leaves it standing.
+     */
+    suspend fun recordSuccess(at: Long, cursor: Long, generation: String?, watermark: Long, sent: Int, received: Int, note: String? = null) = store.edit {
         if (it[Keys.token] == null) return@edit
         it[Keys.cursor] = cursor
+        if (generation != null) it[Keys.generation] = generation else it.remove(Keys.generation)
+        when {
+            note != null -> it[Keys.note] = note
+            sent + received > 0 -> it.remove(Keys.note)
+        }
         it[Keys.watermark] = watermark
         it[Keys.replaced] = true
         it[Keys.lastAttemptAt] = at
@@ -158,6 +175,8 @@ class SyncStore @Inject constructor(@ApplicationContext context: Context) {
         pair(pc)
         store.edit {
             it[Keys.cursor] = prefs.cursor
+            prefs.generation?.let { g -> it[Keys.generation] = g }
+            prefs.note?.let { n -> it[Keys.note] = n }
             it[Keys.watermark] = prefs.watermark
             it[Keys.replaced] = prefs.replaced
             it[Keys.lastAttemptAt] = prefs.lastAttemptAt

@@ -324,7 +324,7 @@ private fun PcGroup(state: SettingsState, onOpen: (SettingsDest) -> Unit, syncNo
         GroupRow(
             pc?.name ?: "Pair with your PC",
             shape,
-            subtitle = pcSummary(pc != null, lastOn, p.lastError),
+            subtitle = pcSummary(pc != null, lastOn, p.lastError, p.note),
             leading = {
                 val tint = MaterialTheme.colorScheme.error
                 if (failed) GlyphBadge(Icons.Rounded.SyncProblem, tint = tint, fill = tint.copy(alpha = 0.14f)) else GlyphBadge(Icons.Rounded.Computer)

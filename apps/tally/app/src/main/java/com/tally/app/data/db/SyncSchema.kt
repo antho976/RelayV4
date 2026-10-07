@@ -33,8 +33,10 @@ object SyncSchema {
         "lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))), 2) || '-' || " +
             "substr('89ab', 1 + (abs(random()) % 4), 1) || substr(lower(hex(randomblob(2))), 2) || '-' || lower(hex(randomblob(6)))"
 
-    /** The triggers for [table]. Idempotent, so a fresh database and a migrated one get the same set. */
+    /** The triggers for [table], by name and SQL, so a fresh database and a migrated one get the same set. */
     private fun triggers(table: String): List<String> {
+        // One past the stamp of the tombstone a re-created row had, or 0.
+        val buried = "COALESCE((SELECT deletedAt + 1 FROM sync_tombstones WHERE tableName = '$table' AND uid = NEW.uid), 0)"
         // A budget is synced by its category, so its tombstone names it. One whose category is
         // already gone says nothing: the PC drops it with the category's own tombstone.
         val tombstone = if (table == "budgets") {
@@ -42,20 +44,23 @@ object SyncSchema {
                WHEN OLD.categoryId = 0 OR EXISTS (SELECT 1 FROM categories WHERE id = OLD.categoryId)
                BEGIN
                  INSERT OR REPLACE INTO sync_tombstones (tableName, uid, deletedAt, category)
-                 VALUES ('budgets', OLD.uid, $NOW, (SELECT uid FROM categories WHERE id = OLD.categoryId));
+                 VALUES ('budgets', OLD.uid, MAX($NOW, OLD.updatedAt + 1), (SELECT uid FROM categories WHERE id = OLD.categoryId));
                END"""
         } else {
             """CREATE TRIGGER IF NOT EXISTS ${table}_sync_delete AFTER DELETE ON $table
                BEGIN
-                 INSERT OR REPLACE INTO sync_tombstones (tableName, uid, deletedAt, category) VALUES ('$table', OLD.uid, $NOW, NULL);
+                 INSERT OR REPLACE INTO sync_tombstones (tableName, uid, deletedAt, category)
+                 VALUES ('$table', OLD.uid, MAX($NOW, OLD.updatedAt + 1), NULL);
                END"""
         }
         return listOf(
-            // A new row is new now, and a row that comes back (an Undo) is no longer deleted.
+            // A new row is new now, and a row that comes back (an Undo) is no longer deleted:
+            // stamped past its own tombstone, so the coming back outranks the delete everywhere.
             """CREATE TRIGGER IF NOT EXISTS ${table}_sync_insert AFTER INSERT ON $table WHEN $LOCAL
                BEGIN
+                 UPDATE $table SET updatedAt = MAX($NOW, $buried)
+                 WHERE id = NEW.id AND updatedAt < MAX($NOW, $buried);
                  DELETE FROM sync_tombstones WHERE tableName = '$table' AND uid = NEW.uid;
-                 UPDATE $table SET updatedAt = $NOW WHERE id = NEW.id AND updatedAt < $NOW;
                END""",
             // An edit is newer than both the clock and the version it replaced, even when the
             // writer handed back a stale copy of the row.
@@ -78,13 +83,31 @@ object SyncSchema {
         )
     }
 
+    private val SUFFIXES = listOf("sync_insert", "sync_update", "sync_uid", "sync_delete")
+
     fun createTriggers(db: SupportSQLiteDatabase) {
         TABLES.forEach { table -> triggers(table).forEach(db::execSQL) }
     }
 
-    /** Fresh installs: Room creates the tables, this adds the triggers. */
+    /**
+     * Drops and re-creates every sync trigger, so a database always runs the definitions of the
+     * app that opened it, whatever an earlier build of the same schema version created.
+     */
+    fun refreshTriggers(db: SupportSQLiteDatabase) {
+        db.beginTransaction()
+        try {
+            TABLES.forEach { table -> SUFFIXES.forEach { db.execSQL("DROP TRIGGER IF EXISTS ${table}_$it") } }
+            createTriggers(db)
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+    }
+
+    /** Fresh installs: Room creates the tables, this adds the triggers; every open brings them up to date. */
     val callback = object : RoomDatabase.Callback() {
         override fun onCreate(db: SupportSQLiteDatabase) = createTriggers(db)
+        override fun onOpen(db: SupportSQLiteDatabase) = refreshTriggers(db)
     }
 
     /**

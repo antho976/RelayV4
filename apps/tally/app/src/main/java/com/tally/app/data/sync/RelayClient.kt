@@ -21,6 +21,8 @@ class RelayFailure(
     val reason: String,
     /** The PC said this phone is no longer paired: retrying will not help, pairing again will. */
     val unpaired: Boolean = false,
+    /** The bus error's code when the PC refused a request (`money.sync_stale`, …). */
+    val code: String? = null,
 ) : Exception(reason)
 
 /** One admitted connection to the PC: the greeting it opened with, and the bus behind it. */
@@ -49,7 +51,7 @@ class RelaySession internal constructor(
                 "bus.unknown_op" -> "This PC's Relay does not know Tally's sync yet. Update Relay on the PC."
                 else -> response.errorMessage ?: response.errorCode ?: "The PC refused the sync"
             }
-            throw RelayFailure(reason)
+            throw RelayFailure(reason, code = response.errorCode)
         }
         return response.result
     }

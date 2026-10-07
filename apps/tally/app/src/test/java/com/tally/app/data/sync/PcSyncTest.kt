@@ -52,7 +52,7 @@ class PcSyncTest {
     private lateinit var sync: PcSync
     private val door = FakeDoor()
 
-    @Before fun open() = runBlocking {
+    @Before fun open() = runBlocking<Unit> {
         db = RoomTestDb.create()
         store = SyncStore(context)
         store.forget()
@@ -66,7 +66,7 @@ class PcSyncTest {
         door.server.shutdown()
     }
 
-    @Test fun pairingRunsAFirstSyncThatReplacesThePcsLedger() = runBlocking {
+    @Test fun pairingRunsAFirstSyncThatReplacesThePcsLedger() = runBlocking<Unit> {
         val account = db.addAccount("Chequing")
         db.addExpense(42_50, day, account, note = "Metro")
         door.connection()
@@ -89,7 +89,7 @@ class PcSyncTest {
         assertEquals("Settings first, then the ledger in the PC's order", listOf("settings", "settings", "settings", "accounts", "transactions"), tables)
     }
 
-    @Test fun laterSyncsProveTheKeySendWhatChangedAndTakeThePcsChanges() = runBlocking {
+    @Test fun laterSyncsProveTheKeySendWhatChangedAndTakeThePcsChanges() = runBlocking<Unit> {
         val account = db.addAccount("Chequing")
         door.connection()
         sync.pair(PairLink.manual(door.address, "ABCD-EFGH")!!)
@@ -125,9 +125,10 @@ class PcSyncTest {
         assertEquals(12L, store.current().cursor)
         assertEquals(listOf("Coffee", "Lunch"), db.transactions().all().map { it.note }.sorted())
         assertEquals(15, settings.current().monthStartDay)
+        settings.setMonthStartDay(1)
     }
 
-    @Test fun aRevokedPhoneIsToldInWordsAndNothingIsThrown() = runBlocking {
+    @Test fun aRevokedPhoneIsToldInWordsAndNothingIsThrown() = runBlocking<Unit> {
         door.connection()
         sync.pair(PairLink.manual(door.address, "ABCD-EFGH")!!)
         door.token = "another"
@@ -139,20 +140,106 @@ class PcSyncTest {
         assertEquals("The PC no longer accepts this phone's key. Pair it again.", store.current().lastError)
     }
 
-    @Test fun aWrongCodePairsNothing() = runBlocking {
+    @Test fun aWrongCodePairsNothing() = runBlocking<Unit> {
         door.connection()
         val outcome = sync.pair(PairLink.manual(door.address, "WRONG-CODE")!!)
         assertTrue(outcome is SyncOutcome.Failed)
         assertFalse(store.current().paired)
     }
 
-    @Test fun anUnreachablePcFailsQuietly() = runBlocking {
+    @Test fun anUnreachablePcFailsQuietly() = runBlocking<Unit> {
         door.connection()
         sync.pair(PairLink.manual(door.address, "ABCD-EFGH")!!)
         door.server.shutdown()
         val outcome = sync.syncNow()
         assertTrue(outcome is SyncOutcome.Failed)
         assertEquals("The PC could not be reached", store.current().lastError)
+    }
+
+    @Test fun theGenerationIsKeptAndSentBack() = runBlocking<Unit> {
+        door.connection()
+        sync.pair(PairLink.manual(door.address, "ABCD-EFGH")!!)
+        assertEquals("gen-1", store.current().generation)
+        assertNull("The first sync names no generation", door.syncs.single()["generation"])
+        door.connection()
+        sync.syncNow()
+        assertEquals("gen-1", door.syncs.last()["generation"]!!.jsonPrimitive.content)
+    }
+
+    /**
+     * The PC's ledger was restored since the last sync: it refuses to merge, and the phone takes
+     * its ledger whole, stamps and uids kept, with nothing of its own left behind.
+     */
+    @Test fun aStalePhoneTakesThePcsLedgerWhole() = runBlocking<Unit> {
+        val mine = db.addAccount("Old chequing")
+        db.addExpense(4_00, day, mine, note = "Coffee")
+        door.connection()
+        sync.pair(PairLink.manual(door.address, "ABCD-EFGH")!!)
+        Thread.sleep(5)
+        db.addExpense(9_00, day, mine, note = "Made since")
+
+        val stamp = 1_700_000_000_000L
+        door.generation = "gen-2"
+        door.whole = listOf(
+            Change("settings", "month_start_day", stamp, row = buildJsonObject { put("value", "15") }),
+            Change("accounts", "a-pc", stamp, row = buildJsonObject {
+                put("name", "Restored chequing"); put("type", "CHEQUING"); put("openingBalance", 100); put("archived", false); put("sortOrder", 0)
+            }),
+            Change("transactions", "t-pc", stamp, row = buildJsonObject {
+                put("type", "EXPENSE"); put("amount", 12_00); put("date", "2026-10-04"); put("account", "a-pc")
+                put("toAccount", JsonNull); put("category", JsonNull); put("note", "Restored"); put("recurring", JsonNull); put("createdAt", 1)
+            }),
+            Change("transactions", "gone", stamp, deleted = true),
+            Change("transactions", "bill:r1:2026-10-01", stamp, deleted = true),
+        )
+        door.connection()
+
+        val outcome = sync.syncNow()
+
+        assertTrue("$outcome", outcome is SyncOutcome.Done)
+        val refused = door.syncs[door.syncs.size - 2]
+        assertEquals("gen-1", refused["generation"]!!.jsonPrimitive.content)
+        val take = door.syncs.last()
+        assertEquals(0L, take["since"]!!.jsonPrimitive.long)
+        assertNull(take["generation"])
+        assertFalse(take["replace"]!!.jsonPrimitive.boolean)
+        assertTrue("Nothing of the phone's goes to a ledger it no longer shares", take["changes"]!!.jsonArray.isEmpty())
+
+        assertEquals(listOf("a-pc"), db.accounts().all().map { it.uid })
+        val tx = db.transactions().all().single()
+        assertEquals("t-pc", tx.uid)
+        assertEquals("The PC's stamps are kept", stamp, tx.updatedAt)
+        assertEquals("No tombstones for the rows it replaced, only the PC's deleted bill", listOf("bill:r1:2026-10-01"), db.sync().tombstones().map { it.uid })
+        assertEquals(15, settings.current().monthStartDay)
+
+        val prefs = store.current()
+        assertEquals(40L, prefs.cursor)
+        assertEquals("gen-2", prefs.generation)
+        assertEquals("Your PC's ledger had changed, so this phone took it", prefs.note)
+        assertTrue("Merging starts from now", prefs.watermark >= tx.updatedAt)
+
+        // From here the two merge again, under the new generation.
+        door.connection()
+        sync.syncNow()
+        assertEquals("gen-2", door.syncs.last()["generation"]!!.jsonPrimitive.content)
+        assertEquals(40L, door.syncs.last()["since"]!!.jsonPrimitive.long)
+    }
+
+    @Test fun settingStampsNeverGoBackAndACurrencyWithOtherDecimalsStaysOnThePhone() = runBlocking<Unit> {
+        settings.setCurrency("CAD")
+        val future = System.currentTimeMillis() + 3_600_000L
+        // The PC, its clock ahead, set the month to start on the 15th.
+        assertTrue(settings.applySynced("month_start_day", "15", future))
+        settings.setMonthStartDay(1)
+        val mine = settings.synced().all.single { it.key == "month_start_day" }
+        assertTrue("A later edit here outranks the PC's even with a slower clock", mine.updatedAt > future)
+        assertFalse(settings.applySynced("month_start_day", "20", future + 1))
+
+        assertTrue("Same decimals: taken", settings.applySynced("currency", "USD", future + 10))
+        assertFalse("Other decimals: the PC cannot have converted, so it is refused", settings.applySynced("currency", "JPY", future + 20))
+        assertEquals("USD", settings.current().currency)
+        assertTrue("With the PC's whole ledger it comes along", settings.applySynced("currency", "JPY", future + 30, force = true))
+        settings.applySynced("currency", "CAD", future + 40, force = true)
     }
 }
 
@@ -161,10 +248,15 @@ private class FakeDoor {
     val server = MockWebServer()
     @Volatile var token = "tok-1"
     @Volatile var proven = false
+    /** Which of its ledgers the PC holds; a sync naming another is stale. */
+    @Volatile var generation = "gen-1"
+    /** What the PC answers a phone that takes its ledger whole. */
+    @Volatile var whole: List<Change> = emptyList()
     val syncs = CopyOnWriteArrayList<JsonObject>()
     @Volatile var answer: (JsonObject) -> JsonObject = { payload ->
         buildJsonObject {
             put("cursor", 7)
+            put("generation", generation)
             put("changes", JsonArray(emptyList()))
             put("replaced", payload["replace"]?.jsonPrimitive?.boolean ?: false)
             put("applied", payload["changes"]!!.jsonArray.size)
@@ -212,6 +304,21 @@ private class FakeDoor {
                 }
                 val payload = o["payload"]!!.jsonObject
                 syncs += payload
+                val theirs = payload["generation"]?.jsonPrimitive?.content
+                if (theirs != null && theirs != generation) {
+                    webSocket.send("""{"v":1,"id":"$id","ok":false,"error":{"code":"money.sync_stale","kind":"conflict","message":"stale"}}""")
+                    return
+                }
+                if (theirs == null && payload["since"]!!.jsonPrimitive.long == 0L && payload["replace"]?.jsonPrimitive?.boolean != true) {
+                    val result = buildJsonObject {
+                        put("cursor", 40)
+                        put("generation", generation)
+                        put("changes", JsonArray(whole.map { it.toJson() }))
+                        put("replaced", false)
+                    }
+                    webSocket.send(buildJsonObject { put("v", 1); put("id", id); put("ok", true); put("result", result) }.toString())
+                    return
+                }
                 // An event first: the client must wait for its own answer.
                 webSocket.send("""{"v":1,"ev":"money.changed","ts":"2026-10-07T12:00:00Z","actor":"user","payload":{}}""")
                 webSocket.send(buildJsonObject { put("v", 1); put("id", id); put("ok", true); put("result", answer(payload)) }.toString())

@@ -9,9 +9,11 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 import javax.inject.Inject
@@ -136,32 +138,30 @@ class PcSync @Inject constructor(
             val since = if (replace) null else prefs.watermark
             val local = settingsChanges(since) + ledger.collect(since)
             var cursor = if (replace) 0L else prefs.cursor
+            // The first sync makes a new generation on the PC; every later one names the last.
+            var generation = if (replace) null else prefs.generation
             val received = ArrayList<Change>()
             // Batched, so a ledger of years stays under the door's message size. Only the first
             // batch replaces; the rest add to what it put there. Tables stay in order across them.
             val batches = local.chunked(BATCH).ifEmpty { listOf(emptyList()) }
-            batches.forEachIndexed { i, batch ->
-                val payload = buildJsonObject {
-                    put("device", deviceName.take(64))
-                    put("replace", replace && i == 0)
-                    put("since", cursor)
-                    put("changes", JsonArray(batch.map { it.toJson() }))
+            for ((i, batch) in batches.withIndex()) {
+                val result = try {
+                    session.request("money.sync", payload(replace && i == 0, cursor, generation, batch))
+                } catch (e: RelayFailure) {
+                    // The PC's ledger was restored, erased or replaced since: take it whole.
+                    if (e.code == STALE) return takeWhole(session)
+                    throw e
                 }
-                val result = session.request("money.sync", payload) as? JsonObject
-                    ?: throw RelayFailure("The PC's answer did not read")
-                cursor = (result["cursor"] as? JsonPrimitive)?.longOrNull ?: throw RelayFailure("The PC's answer did not read")
+                cursor = result.cursor()
+                generation = result.generation() ?: generation
                 (result["changes"] as? JsonArray)?.forEach { c -> Change.fromJson(c)?.let { received += it } }
             }
             val (rows, settingRows) = received.partition { it.table != SyncTables.SETTINGS }
             val applied = ledger.apply(rows)
-            var taken = 0
-            settingRows.forEach { c ->
-                val value = (c.row["value"] as? JsonPrimitive)?.content
-                if (!c.deleted && value != null && settings.applySynced(c.uid, value, c.updatedAt)) taken++
-            }
+            val taken = applySettings(settingRows, whole = false)
             // The PC has every tombstone from before this sync began.
             ledger.pruneTombstones(started)
-            store.recordSuccess(System.currentTimeMillis(), cursor, started, local.size, applied.applied + taken)
+            store.recordSuccess(System.currentTimeMillis(), cursor, generation, started, local.size, applied.applied + taken)
             SyncOutcome.Done(sent = local.size, received = applied.applied + taken)
         } catch (e: CancellationException) {
             throw e
@@ -175,6 +175,47 @@ class PcSync @Inject constructor(
         }
     }
 
+    /**
+     * The PC refused to merge (`money.sync_stale`): its ledger was restored, erased or replaced,
+     * or its file was lost. The latest wholesale act wins, so this phone takes the PC's ledger
+     * whole, keeping the PC's stamps, and merges from there. What changed here since the last
+     * sync is not sent: the ledger it was made in is gone on the PC.
+     */
+    private suspend fun takeWhole(session: RelaySession): SyncOutcome {
+        val result = session.request("money.sync", payload(replace = false, since = 0L, generation = null, changes = emptyList()))
+        val cursor = result.cursor()
+        val generation = result.generation()
+        val received = (result["changes"] as? JsonArray)?.mapNotNull { Change.fromJson(it) }.orEmpty()
+        val (rows, settingRows) = received.partition { it.table != SyncTables.SETTINGS }
+        val applied = ledger.replaceWith(rows)
+        val taken = applySettings(settingRows, whole = true)
+        val now = System.currentTimeMillis()
+        store.recordSuccess(now, cursor, generation, now, 0, applied.applied + taken, note = TOOK_PC_LEDGER)
+        return SyncOutcome.Done(sent = 0, received = applied.applied + taken)
+    }
+
+    private fun payload(replace: Boolean, since: Long, generation: String?, changes: List<Change>) = buildJsonObject {
+        put("device", deviceName.take(64))
+        put("replace", replace)
+        put("since", since)
+        if (generation != null) put("generation", generation)
+        put("changes", JsonArray(changes.map { it.toJson() }))
+    }
+
+    private fun JsonElement?.cursor(): Long =
+        ((this as? JsonObject)?.get("cursor") as? JsonPrimitive)?.longOrNull ?: throw RelayFailure("The PC's answer did not read")
+
+    private fun JsonElement?.generation(): String? =
+        ((this as? JsonObject)?.get("generation") as? JsonPrimitive)?.contentOrNull
+
+    private operator fun JsonElement?.get(key: String): JsonElement? = (this as? JsonObject)?.get(key)
+
+    /** The PC's settings; [whole] takes them whatever their stamps, with the PC's ledger. */
+    private suspend fun applySettings(rows: List<Change>, whole: Boolean): Int = rows.count { c ->
+        val value = (c.row["value"] as? JsonPrimitive)?.contentOrNull
+        !c.deleted && value != null && settings.applySynced(c.uid, value, c.updatedAt, force = whole)
+    }
+
     /** The synced settings changed since [since] (all of them on a first sync), as the PC keeps them. */
     private suspend fun settingsChanges(since: Long?): List<Change> =
         settings.synced().all
@@ -185,5 +226,11 @@ class PcSync @Inject constructor(
     companion object {
         /** Changes per request: a few hundred kilobytes, far under the door's 8 MiB message. */
         const val BATCH = 1_500
+
+        /** The PC's ledger is not the one this phone last merged with (docs/MONEY.md, "Generation"). */
+        const val STALE = "money.sync_stale"
+
+        /** The Settings line after [takeWhole]. */
+        const val TOOK_PC_LEDGER = "Your PC's ledger had changed, so this phone took it"
     }
 }

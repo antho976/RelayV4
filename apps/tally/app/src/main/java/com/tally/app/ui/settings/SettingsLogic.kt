@@ -283,10 +283,14 @@ internal fun syncLine(paired: Boolean, lastOn: String?, error: String?, sent: In
     else -> SyncLine("Synced", lastOn + " · " + syncCounts(sent, received))
 }
 
-/** The Settings row's subtitle for the paired PC: "Synced · Today, 14:20", or why it is not. */
-internal fun pcSummary(paired: Boolean, lastOn: String?, error: String?): String = when {
+/**
+ * The Settings row's subtitle for the paired PC: "Synced · Today, 14:20", or why it is not, or
+ * the [note] a sync left (the phone took the PC's ledger).
+ */
+internal fun pcSummary(paired: Boolean, lastOn: String?, error: String?, note: String? = null): String = when {
     !paired -> "Keep this ledger on your computer too"
     error != null -> "Last sync failed · open for why"
+    note != null -> note
     lastOn == null -> "Paired · not synced yet"
     else -> "Synced · $lastOn"
 }

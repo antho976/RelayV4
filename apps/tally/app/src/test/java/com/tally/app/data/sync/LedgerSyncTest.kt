@@ -284,4 +284,57 @@ class LedgerSyncTest {
         assertEquals(c, Change.fromJson(c.toJson()))
         assertNull(Change.fromJson(JsonPrimitive("nonsense")))
     }
+
+    @Test fun aDeleteOutranksTheRowEvenWhenItsStampIsAhead() = runTest {
+        sync.apply(listOf(Change("accounts", "a1", future, row = accountRow("Chequing"))))
+        db.ledgerRepository(clock).deleteAccount(db.accounts().all().single().id)
+        assertEquals("The tombstone is stamped past the row it removes", future + 1, db.sync().tombstone("accounts", "a1")!!.deletedAt)
+    }
+
+    @Test fun aRowThatComesBackIsStampedPastItsTombstone() = runTest {
+        val ledger = db.ledgerRepository(clock)
+        sync.apply(
+            listOf(
+                Change("accounts", "a1", future, row = accountRow("Chequing")),
+                Change("transactions", "t1", future, row = expenseRow("a1", 10_00)),
+            )
+        )
+        val deleted = ledger.delete(db.transactions().all().single().id)!!
+        val buried = db.sync().tombstone("transactions", "t1")!!.deletedAt
+        ledger.restore(deleted)
+        assertTrue(db.transactions().all().single().updatedAt > buried)
+        assertNull(db.sync().tombstone("transactions", "t1"))
+    }
+
+    @Test fun aBudgetTombstoneWithAnotherUidIsFoundByItsCategory() = runTest {
+        val plan = db.planRepository(clock)
+        val food = db.addCategory("Food")
+        val foodUid = db.categories().get(food)!!.uid
+        plan.setBudget(food, 400_00)
+        plan.setBudget(BudgetEntity.OVERALL, 2_000_00)
+
+        sync.apply(listOf(Change("budgets", "pc-food", future, deleted = true, row = buildJsonObject { put("category", foodUid) })))
+        sync.apply(listOf(Change("budgets", "pc-overall", future, deleted = true, row = buildJsonObject { put("category", JsonNull) })))
+
+        assertTrue(db.budgets().all().isEmpty())
+    }
+
+    @Test fun takingThePcsLedgerWholeLeavesNothingOfThisOneBehind() = runTest {
+        val account = db.addAccount("Mine")
+        db.addExpense(5_00, day, account)
+        db.ledgerRepository(clock).delete(db.addExpense(6_00, day, account))
+
+        val applied = sync.replaceWith(
+            listOf(
+                Change("accounts", "a1", 100, row = accountRow("Theirs")),
+                Change("transactions", "t1", 100, row = expenseRow("a1", 7_00)),
+                Change("transactions", "t-gone", 100, deleted = true),
+            )
+        )
+
+        assertEquals(Applied(2, 0), applied)
+        assertEquals(listOf("Theirs"), db.accounts().all().map { it.name })
+        assertEquals(listOf(100L), db.transactions().all().map { it.updatedAt })
+        assertTrue(db.sync().tombstones().isEmpty())
+    }
 }

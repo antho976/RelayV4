@@ -3,6 +3,7 @@ package com.tally.app.data.prefs
 import android.content.Context
 import androidx.compose.runtime.Immutable
 import androidx.datastore.core.DataStore
+import androidx.datastore.preferences.core.MutablePreferences
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
@@ -12,6 +13,7 @@ import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.tally.core.BudgetPeriod
+import com.tally.core.MoneyFormatter
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
@@ -170,15 +172,23 @@ class SettingsRepository @Inject constructor(@ApplicationContext context: Contex
 
     suspend fun setCurrency(code: String) = store.edit {
         it[Keys.currency] = code
-        it[Keys.currencyAt] = System.currentTimeMillis()
+        it.stamp(Keys.currencyAt)
     }
     suspend fun setMonthStartDay(day: Int) = store.edit {
         it[Keys.monthStart] = day.coerceIn(1, BudgetPeriod.MAX_START_DAY)
-        it[Keys.monthStartAt] = System.currentTimeMillis()
+        it.stamp(Keys.monthStartAt)
     }
     suspend fun setWeekStartsMonday(monday: Boolean) = store.edit {
         it[Keys.weekMonday] = monday
-        it[Keys.weekMondayAt] = System.currentTimeMillis()
+        it.stamp(Keys.weekMondayAt)
+    }
+
+    /**
+     * A change here is newer than the one it replaces even when this phone's clock runs behind
+     * the PC's that stamped it: `max(now, previous + 1)`, as every ledger row is stamped.
+     */
+    private fun MutablePreferences.stamp(key: Preferences.Key<Long>) {
+        this[key] = maxOf(System.currentTimeMillis(), (this[key] ?: 0L) + 1)
     }
     suspend fun setAccent(accent: Accent) = store.edit { it[Keys.accent] = accent.key }
     suspend fun setAccentEnabled(enabled: Boolean) = store.edit { it[Keys.accentEnabled] = enabled }
@@ -194,7 +204,7 @@ class SettingsRepository @Inject constructor(@ApplicationContext context: Contex
         it.remove(Keys.sampleLoaded)
         it.remove(Keys.monthStart)
         // Back to the 1st is a change too, so the paired PC hears about it.
-        it[Keys.monthStartAt] = System.currentTimeMillis()
+        it.stamp(Keys.monthStartAt)
     }
 
     /** The settings the PC sync carries, each with when it last changed (0: never set here). */
@@ -212,22 +222,30 @@ class SettingsRepository @Inject constructor(@ApplicationContext context: Contex
 
     /**
      * Takes a setting from the PC when its change is newer than this phone's, keeping the PC's
-     * change time. True when it was taken. Values that do not read are refused, not guessed.
-     * The currency is only relabelled: the PC rescaled its amounts when it switched, and those
-     * arrive as rows of their own.
+     * change time; [force] takes it whatever the stamps, with the PC's whole ledger. True when it
+     * was taken. Values that do not read are refused, not guessed.
+     *
+     * A currency is only ever relabelled here, never converted. The PC changes it only between
+     * currencies with the same decimals, so one with other decimals is refused and the phone's
+     * stands, unless the PC's whole ledger comes with it (its amounts are already in it).
      */
-    suspend fun applySynced(key: String, value: String, at: Long): Boolean {
+    suspend fun applySynced(key: String, value: String, at: Long, force: Boolean = false): Boolean {
         var taken = false
         store.edit { p ->
+            fun newer(stamp: Preferences.Key<Long>) = force || (p[stamp] ?: 0L) < at
             when (key) {
-                SyncedSetting.CURRENCY -> if ((p[Keys.currencyAt] ?: 0L) < at && runCatching { Currency.getInstance(value) }.isSuccess) {
-                    p[Keys.currency] = value
-                    p[Keys.currencyAt] = at
-                    taken = true
+                SyncedSetting.CURRENCY -> {
+                    val incoming = runCatching { MoneyFormatter(value, Locale.ROOT).fractionDigits }.getOrNull()
+                    val mine = MoneyFormatter(p[Keys.currency] ?: Settings.defaultCurrency(), Locale.ROOT).fractionDigits
+                    if (newer(Keys.currencyAt) && incoming != null && (force || incoming == mine)) {
+                        p[Keys.currency] = value
+                        p[Keys.currencyAt] = at
+                        taken = true
+                    }
                 }
                 SyncedSetting.MONTH_START_DAY -> {
                     val day = value.trim().toIntOrNull()?.takeIf { it in 1..BudgetPeriod.MAX_START_DAY }
-                    if ((p[Keys.monthStartAt] ?: 0L) < at && day != null) {
+                    if (newer(Keys.monthStartAt) && day != null) {
                         p[Keys.monthStart] = day
                         p[Keys.monthStartAt] = at
                         taken = true
@@ -239,7 +257,7 @@ class SettingsRepository @Inject constructor(@ApplicationContext context: Contex
                         "0", "false" -> false
                         else -> null
                     }
-                    if ((p[Keys.weekMondayAt] ?: 0L) < at && monday != null) {
+                    if (newer(Keys.weekMondayAt) && monday != null) {
                         p[Keys.weekMonday] = monday
                         p[Keys.weekMondayAt] = at
                         taken = true

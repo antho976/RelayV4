@@ -56,9 +56,11 @@ class RecurringPoster @Inject constructor(
                 val last = fresh.endDate?.takeIf { it.isBefore(today) } ?: today
                 val dates = rule.between(fresh.nextDate, last, limit = CATCH_UP_LIMIT)
                 dates.forEach { date ->
-                    // The PC posts the same bill under the same uid, so whichever device posts a
-                    // date first, the two copies are one row once they sync. A date already here
-                    // (posted on the PC and synced) is skipped.
+                    // A posted bill's uid is the bill and the date, on the PC too (docs/MONEY.md).
+                    // A date already here is skipped, and so is one you deleted: its tombstone
+                    // stays until the PC has heard, and the date is not posted again under it.
+                    val uid = billUid(fresh.uid, date)
+                    if (db.sync().tombstone("transactions", uid) != null) return@forEach
                     val id = transactions.insertOrIgnore(
                         TransactionEntity(
                             type = fresh.type,
@@ -70,7 +72,7 @@ class RecurringPoster @Inject constructor(
                             note = fresh.name,
                             recurringId = fresh.id,
                             createdAt = clock.nowMillis(),
-                            uid = billUid(fresh.uid, date),
+                            uid = uid,
                         )
                     )
                     if (id != -1L) posted++

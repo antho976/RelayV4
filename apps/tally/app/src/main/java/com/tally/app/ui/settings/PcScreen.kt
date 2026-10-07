@@ -240,10 +240,12 @@ fun PcScreen(state: PcState, actions: PcActions) {
                     rows = listOf(pcRow, syncRow),
                     modifier = Modifier.padding(horizontal = GUTTER),
                     title = "This PC",
-                    footer = if (p.replaced) {
-                        "Tally syncs when you open it, a few seconds after a change, and every half hour while there is a network."
-                    } else {
-                        FIRST_SYNC_NOTE
+                    footer = when {
+                        !p.replaced -> FIRST_SYNC_NOTE
+                        else -> listOfNotNull(
+                            p.note?.let { "$it." },
+                            "Tally syncs when you open it, a few seconds after a change, and every half hour while there is a network.",
+                        ).joinToString(" ")
                     },
                 )
             }

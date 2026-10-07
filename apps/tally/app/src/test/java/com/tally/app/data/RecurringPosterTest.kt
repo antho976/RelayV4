@@ -294,4 +294,23 @@ class RecurringPosterTest {
         assertEquals(listOf("bill:$uid:2026-04-01", "bill:$uid:2026-05-01"), uids)
         assertEquals("bill:$uid:2026-05-01", RecurringPoster.billUid(uid, LocalDate.of(2026, 5, 1)))
     }
+
+    /**
+     * A posted bill you deleted is not posted again, even when the bill's next date falls behind
+     * it (an older copy of the bill from the PC), and its tombstone outlives the pruning a sync does.
+     */
+    @Test fun aDeletedPostedBillIsNotPostedAgain() = runTest {
+        world()
+        val rent = bill(anchor = LocalDate.of(2026, 5, 1))
+        assertEquals(1, poster.postDue())
+        val posted = db.transactions().all().single()
+        db.ledgerRepository(clock).delete(posted.id)
+        db.sync().pruneTombstones(Long.MAX_VALUE)
+
+        val stored = db.recurring().get(rent)!!
+        db.recurring().update(stored.copy(nextDate = LocalDate.of(2026, 5, 1)))
+
+        assertEquals(0, poster.postDue())
+        assertTrue(db.transactions().all().isEmpty())
+    }
 }

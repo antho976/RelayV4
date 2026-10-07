@@ -149,6 +149,24 @@ class LedgerSync @Inject constructor(private val db: TallyDatabase) {
         Applied(applied, skipped)
     }
 
+    /**
+     * The PC's ledger, whole, in place of this one (after `money.sync_stale`). One transaction:
+     * every row here goes, the PC's arrive with their own stamps and uids, and no tombstone is
+     * left for what was removed, since the PC never had those rows in this ledger.
+     */
+    suspend fun replaceWith(changes: List<Change>): Applied = db.withTransaction {
+        dao.beginApplying()
+        dao.wipeLedger()
+        dao.clearTombstones()
+        dao.endApplying()
+        val applied = apply(changes.filter { !it.deleted })
+        dao.clearTombstones()
+        // A posted bill deleted on the PC stays deleted here: the poster skips its date.
+        changes.filter { it.deleted && it.table == SyncTables.TRANSACTIONS && it.uid.startsWith("bill:") }
+            .forEach { dao.insertTombstone(TombstoneEntity("transactions", it.uid, it.updatedAt)) }
+        applied
+    }
+
     /** Tombstones the PC has been told about; kept until a sync after them succeeds. */
     suspend fun pruneTombstones(before: Long) = dao.pruneTombstones(before)
 
@@ -339,9 +357,15 @@ class LedgerSync @Inject constructor(private val db: TallyDatabase) {
         val categoryId: Long? = when {
             !hasCategory -> null
             categoryUid == null -> BudgetEntity.OVERALL
-            else -> categoryId(categoryUid) ?: return c.deleted
+            else -> categoryId(categoryUid) ?: if (c.deleted) null else return false
         }
-        val local = if (categoryId != null) dao.budgetFor(categoryId) else dao.budget(c.uid)
+        // A live budget is its category's; a tombstone is found by its uid first, then by its
+        // category (the PC names it either way).
+        val local = when {
+            c.deleted -> dao.budget(c.uid) ?: categoryId?.let { dao.budgetFor(it) }
+            categoryId != null -> dao.budgetFor(categoryId)
+            else -> dao.budget(c.uid)
+        }
         return merge(
             "budgets", c, local, { it.updatedAt }, { it.id }, { it.uid },
             build = { id ->

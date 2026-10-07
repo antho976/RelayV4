@@ -496,8 +496,29 @@ interface SyncDao {
 
     @Query("SELECT * FROM sync_tombstones WHERE tableName = :table AND uid = :uid") suspend fun tombstone(table: String, uid: String): TombstoneEntity?
     @Query("DELETE FROM sync_tombstones WHERE tableName = :table AND uid = :uid") suspend fun forgetTombstone(table: String, uid: String)
-    @Query("DELETE FROM sync_tombstones WHERE deletedAt < :before") suspend fun pruneTombstones(before: Long)
+    /**
+     * Tombstones the PC has heard about. A deleted posted bill's stays: it is what keeps the
+     * poster from posting that date again if the bill's next date ever falls behind it.
+     */
+    @Query("DELETE FROM sync_tombstones WHERE deletedAt < :before AND uid NOT LIKE 'bill:%'") suspend fun pruneTombstones(before: Long)
     @Query("SELECT * FROM sync_tombstones") suspend fun tombstones(): List<TombstoneEntity>
+    @Query("DELETE FROM sync_tombstones") suspend fun clearTombstones()
+    @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun insertTombstone(t: TombstoneEntity)
+
+    /** Every ledger row, children first. Only for taking the PC's ledger whole (LedgerSync.replaceWith). */
+    @Transaction
+    suspend fun wipeLedger() {
+        wipeValues(); wipeContributions(); wipeGoals(); wipeBudgets()
+        wipeTransactions(); wipeRecurring(); wipeCategories(); wipeAccounts()
+    }
+    @Query("DELETE FROM account_values") suspend fun wipeValues()
+    @Query("DELETE FROM goal_contributions") suspend fun wipeContributions()
+    @Query("DELETE FROM goals") suspend fun wipeGoals()
+    @Query("DELETE FROM budgets") suspend fun wipeBudgets()
+    @Query("DELETE FROM transactions") suspend fun wipeTransactions()
+    @Query("DELETE FROM recurring") suspend fun wipeRecurring()
+    @Query("DELETE FROM categories") suspend fun wipeCategories()
+    @Query("DELETE FROM accounts") suspend fun wipeAccounts()
 
     /** While set, local-edit triggers stand aside (SyncSchema). Only inside the apply transaction. */
     @Query("INSERT OR REPLACE INTO sync_state (`key`, value) VALUES ('applying', 1)") suspend fun beginApplying()

@@ -12,6 +12,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.drop
@@ -38,6 +39,7 @@ class SyncScheduler @Inject constructor(
 ) {
     private var started = false
     private var pending: Job? = null
+    @Volatile private var dirty = false
 
     /** Once, from the Application. */
     @OptIn(FlowPreview::class)
@@ -52,10 +54,26 @@ class SyncScheduler @Inject constructor(
             val ledger = db.invalidationTracker.createFlow(*SyncSchema.TABLES.toTypedArray(), emitInitialState = false).map { }
             val format = settings.settings.map { Triple(it.currency, it.monthStartDay, it.weekStartsMonday) }.distinctUntilChanged().drop(1).map { }
             merge(ledger, format)
-                // The writes a sync makes are the PC's changes, not this phone's.
-                .filter { !sync.busy.value && System.currentTimeMillis() - sync.lastFinishedAt > SETTLE_MS }
+                // While a sync runs, and just after, a write may be the sync's own or an edit
+                // made meanwhile; it cannot be told which, so it is noted and the sync runs once
+                // more when it ends (below). An edit is never left waiting for the next trigger.
+                .filter {
+                    val quiet = !sync.busy.value && System.currentTimeMillis() - sync.lastFinishedAt > SETTLE_MS
+                    if (!quiet) dirty = true
+                    quiet
+                }
                 .debounce(DEBOUNCE_MS)
                 .collect { syncIfPaired() }
+        }
+        scope.launch {
+            sync.busy.collectLatest { busy ->
+                if (busy) return@collectLatest
+                delay(SETTLE_MS + 100)
+                if (dirty && !sync.busy.value) {
+                    dirty = false
+                    later(DEBOUNCE_MS)
+                }
+            }
         }
     }
 
