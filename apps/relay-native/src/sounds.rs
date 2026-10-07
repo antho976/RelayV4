@@ -3,8 +3,14 @@ use serde_json::{json, Value};
 use std::{process::Stdio, rc::Rc, time::Duration};
 use tokio::io::AsyncWriteExt;
 
+thread_local! {
+    /// ffplay is not installed: said once, then every later sound is skipped for this launch
+    /// rather than replacing the notice banner on each notification.
+    static NO_PLAYER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub fn play(ui: &Rc<Ui>, kind: &str, volume: f64) {
-    if kind == "off" || volume <= 0. || ui.sound_busy.replace(true) {
+    if kind == "off" || volume <= 0. || NO_PLAYER.with(|n| n.get()) || ui.sound_busy.replace(true) {
         return;
     }
     let bytes = samples(kind, volume);
@@ -17,7 +23,12 @@ pub fn play(ui: &Rc<Ui>, kind: &str, volume: f64) {
             .await
             .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
         {
-            ui.show_error(&format!("Notification sound: {e}"));
+            if e.kind() == std::io::ErrorKind::NotFound {
+                NO_PLAYER.with(|n| n.set(true));
+                ui.show_error("Notification sounds need ffplay. Install FFmpeg, or set the sound to Off under Settings › Notifications.");
+            } else {
+                ui.show_error(&format!("Notification sound: {e}"));
+            }
         }
         ui.sound_busy.set(false);
     });
