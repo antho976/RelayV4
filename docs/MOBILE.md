@@ -8,8 +8,8 @@ Two routes, tried in privacy order by the phone:
 
 | route | when | what travels where |
 | --- | --- | --- |
-| **direct** | phone and PC on the same network, or the same Tailscale tailnet | LAN only, or Tailscale's end-to-end encrypted tunnel |
-| **via a rendezvous** | phone anywhere | PC dials *out* to a server you host; the phone joins there; the server copies lines and reads none of them |
+| **direct** | phone and PC on the same network, or the same Tailscale tailnet | LAN only (plain `ws://`, readable on the network), or Tailscale's end-to-end encrypted tunnel |
+| **via a rendezvous** | phone anywhere | PC dials *out* to a server you host; the phone joins there; the server copies lines between the two and can read them (§6) |
 
 Both end in `bridge.rs` on the PC, which checks the phone's credential and forwards its
 requests to the socket door as actor `user` — the same door, the same rights, the same
@@ -46,14 +46,21 @@ Or both in one process, which is what a login service wants:
 relay serve --remote            # engine + phone door; `deploy/relay-remote.service` runs this
 ```
 
-The door listens on `0.0.0.0:7420` for phones on the network. A pairing window lasts ten
-minutes and admits one phone; to pair another later, `relay remote pair` in a second terminal.
+The door listens on `0.0.0.0:7420` for phones on the network. Until a phone is paired or a
+pairing window is open it answers nobody: connections are closed unread, `GET /info` included.
+A pairing window lasts ten minutes and admits one phone; to pair another later,
+`relay remote pair` in a second terminal.
+
+Every connection has ten seconds to finish its WebSocket upgrade and thirty more to say hello.
+The door holds at most 64 connections, of which at most 16 may be unproven and at most 4 from
+any one address, so a stranger on the network cannot exhaust the engine's descriptors or lock
+a paired phone out. A browser page on another site cannot open it (the `Origin` must match).
 
 | command | does |
 | --- | --- |
 | `relay remote serve --bind 192.168.1.20:7420` | listen on one address only |
 | `relay remote devices` | list paired phones |
-| `relay remote revoke <id>` | forget a phone; its next connection is refused |
+| `relay remote revoke <id>` | forget a phone; its next connection is refused (once no phone is left, the door goes quiet, so that phone sees the PC as unreachable rather than "no longer paired") |
 | `relay remote name "antho desktop"` | the name phones show |
 | `RELAY_INSTANCE=dev relay remote serve` | serve the dev engine instead of stable |
 
@@ -93,7 +100,9 @@ pings the server every 30 s and redials after 90 s of silence, so a dropped NAT 
 leave phones told "offline" for long.
 
 Put TLS in front of it. The phone sends its pairing code and, once, receives its token over
-this link; `wss://` keeps that between the phone and the PC. A Caddyfile is enough:
+this link; `wss://` keeps that from anyone *between* the phone and the server, but TLS ends at
+the proxy, so the rendezvous process itself sees the token and every line (§6). A Caddyfile is
+enough:
 
 ```
 relay.example.org {
@@ -115,6 +124,11 @@ server second; a PC card in the app can pin either. `relay remote via off` clear
 The rendezvous keeps nothing on disk. A room is named by the digest of its secret, so only the
 PC that holds the secret can host it, and a restart forgets nothing worth keeping.
 `GET /health` reports how many hosts and lanes are up.
+
+The server never waits on one phone. Each phone may have 8 MiB queued toward it; a phone that
+drops off a mobile link without closing fills that and is cut off (it reconnects), and a phone
+silent for 90 s is closed, so it cannot stall the other phones in the room. A room carries at
+most 32 phones at once.
 
 ## 5. On the phone
 
@@ -205,9 +219,23 @@ The phone's own chats and on-device models never touch this link.
   are only good for that connection.
 - The one message that carries the token is the pairing reply. On your own WiFi that is a
   LAN packet; through a rendezvous it should ride `wss://`, which is why `via` warns on
-  `ws://`.
+  `ws://`. Anyone who captures the pairing reply holds the phone's credential for good.
 - The rendezvous server sees the same bytes the LAN would — encrypted by TLS in flight if
   you set it up as above, but readable by whoever runs the server. Run it yourself.
+- **The channel is not authenticated after the handshake, and the PC never proves itself.**
+  The proof shows the PC that the phone holds its token, once, at the start of the
+  connection; nothing seals the lines that follow. Someone *on the path* — an active attacker
+  on the same WiFi (ARP spoofing, a rogue access point) or whoever runs the rendezvous — can
+  read every line, and can inject bus requests as `user` into a connection the phone already
+  opened. That is command execution on the PC. The phone also cannot tell its PC from an
+  impostor answering at a stored address. Passive listening alone gets proofs that are no
+  good on another connection, and nothing reaches the engine from a peer that has no proof.
+- Until the link is sealed end to end (a planned wire v2: the PC's public key in the pairing
+  QR, an ephemeral key exchange with the token as a pre-shared key, every line encrypted and
+  authenticated), the route that resists an active attacker is **Tailscale**: bind the door
+  to the tailnet address only, `relay serve --remote --remote-bind <100.x.y.z>:7420` (or
+  `relay remote serve --bind …`), and pair over it. Use the LAN route only on a network you
+  trust, and treat a rendezvous you do not run as able to act as you.
 - To cut a phone off from the PC side: `relay remote revoke <device id>` (the id is on the
   PC card in the app).
 - None of this is a sandbox for a hostile phone: a paired phone is you.

@@ -67,7 +67,8 @@ impl Welcome {
 /// What a phone sends instead of its token: a digest that is only good for this connection.
 /// Passive listening on the LAN learns the proof, not the credential. A pairing reply is the one
 /// message that carries the token itself, which is why pairing windows are short and pairing
-/// through the rendezvous should go over `wss://`.
+/// through the rendezvous should go over `wss://`. The proof binds nothing that follows: an
+/// on-path attacker can inject into the admitted connection (docs/MOBILE.md §6).
 pub fn proof(challenge: &str, token: &str) -> String {
     crate::registry::sha256_hex(&format!("{challenge}:{token}"))
 }

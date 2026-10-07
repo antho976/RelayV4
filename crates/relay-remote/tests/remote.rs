@@ -154,7 +154,11 @@ async fn a_phone_pairs_proves_itself_and_uses_the_bus_directly() {
         .unwrap();
     let url = format!("ws://{}", door.local_addr);
 
-    // Nobody paired yet: a proof for an unknown device is turned away before the engine hears it.
+    // Nothing paired and no window open: the door shows the network nothing at all.
+    assert!(tokio_tungstenite::connect_async(url.as_str()).await.is_err(), "an unused door answered");
+
+    // A window is open, but a proof for an unknown device is turned away before the engine hears it.
+    let code = pair_code(&h.ctx);
     {
         let (mut ws, _) = tokio_tungstenite::connect_async(url.as_str()).await.unwrap();
         let _greeting = recv_text(&mut ws).await;
@@ -163,7 +167,6 @@ async fn a_phone_pairs_proves_itself_and_uses_the_bus_directly() {
         assert_eq!(welcome.error.as_deref(), Some("auth.unknown_device"));
     }
 
-    let code = pair_code(&h.ctx);
     let (device, token, greeting) = pair(&url, &code).await;
     assert_eq!(greeting.host, Registry::load(&h.ctx.registry_path).unwrap().host_name);
 
@@ -188,7 +191,9 @@ async fn a_phone_pairs_proves_itself_and_uses_the_bus_directly() {
         assert_eq!(welcome.error.as_deref(), Some("auth.bad_proof"));
     }
 
-    // Revoking the device ends its access on the next connection.
+    // Revoking the device ends its access on the next connection. (A second phone keeps the
+    // door answering, so the refusal is the device's, not the door's.)
+    let _second = pair(&url, &pair_code(&h.ctx)).await;
     let mut reg = Registry::load(&h.ctx.registry_path).unwrap();
     assert!(reg.revoke(&device));
     reg.save(&h.ctx.registry_path).unwrap();
@@ -208,16 +213,89 @@ async fn get_info_answers_plain_http_without_a_handshake() {
         .await
         .unwrap();
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut tcp = TcpStream::connect(door.local_addr).await.unwrap();
-    tcp.write_all(b"GET /info HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
-    let mut buf = String::new();
-    tcp.read_to_string(&mut buf).await.unwrap();
+    async fn get_info(addr: SocketAddr) -> String {
+        let mut tcp = TcpStream::connect(addr).await.unwrap();
+        tcp.write_all(b"GET /info HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+        let mut buf = String::new();
+        // A door that closes without reading the request may reset the connection instead.
+        let _ = tcp.read_to_string(&mut buf).await;
+        buf
+    }
+    // Unused, the door does not even say what it is.
+    assert_eq!(get_info(door.local_addr).await, "");
+
+    pair_code(&h.ctx);
+    let buf = get_info(door.local_addr).await;
     assert!(buf.starts_with("HTTP/1.1 200 OK"));
+    // No web page may read it from the person's browser.
+    assert!(!buf.to_ascii_lowercase().contains("access-control-allow-origin"), "{buf}");
     let body = buf.split("\r\n\r\n").nth(1).unwrap();
     let info: Value = serde_json::from_str(body).unwrap();
     assert_eq!(info["relay"], "remote");
     assert_eq!(info["instance"], "test");
-    assert_eq!(info["pairing_open"], false);
+    assert_eq!(info["pairing_open"], true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_web_page_cannot_open_the_door_but_the_phone_can() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let h = harness().await;
+    let door = DirectServer::bind(h.ctx.clone(), "127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .await
+        .unwrap();
+    pair_code(&h.ctx);
+    let url = format!("ws://{}", door.local_addr);
+    let with_origin = |origin: &str| {
+        let mut req = url.as_str().into_client_request().unwrap();
+        req.headers_mut().insert("origin", origin.parse().unwrap());
+        req
+    };
+    // A browser on another site.
+    assert!(tokio_tungstenite::connect_async(with_origin("https://evil.example")).await.is_err());
+    // React Native sends the URL's own origin.
+    let (mut ws, _) = tokio_tungstenite::connect_async(with_origin(&format!("http://{}", door.local_addr)))
+        .await
+        .expect("same-origin upgrade");
+    let greeting: Greeting = serde_json::from_str(&recv_text(&mut ws).await).unwrap();
+    assert_eq!(greeting.relay, "remote");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_address_cannot_take_every_unproven_slot() {
+    use tokio::io::AsyncReadExt;
+    let h = harness().await;
+    let door = DirectServer::bind(h.ctx.clone(), "0.0.0.0:0".parse::<SocketAddr>().unwrap())
+        .await
+        .unwrap();
+    let code = pair_code(&h.ctx);
+    let port = door.local_addr.port();
+
+    // A peer that opens sockets and says nothing gets a few, then is refused at once.
+    let mut idle = Vec::new();
+    for _ in 0..4 {
+        idle.push(TcpStream::connect(("127.0.0.1", port)).await.unwrap());
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut refused = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let mut byte = [0u8; 1];
+    let n = tokio::time::timeout(Duration::from_secs(2), refused.read(&mut byte))
+        .await
+        .expect("the extra connection was held open")
+        .unwrap_or(0);
+    assert_eq!(n, 0);
+
+    // A phone on another address still pairs.
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.2:0".parse().unwrap()).unwrap();
+    let stream = socket.connect(format!("127.0.0.1:{port}").parse().unwrap()).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::client_async(format!("ws://127.0.0.1:{port}"), MaybeTlsStream::Plain(stream))
+        .await
+        .unwrap();
+    let _greeting = recv_text(&mut ws).await;
+    send(&mut ws, json!({"v":1,"pair":code,"device_name":"Phone"}).to_string()).await;
+    let welcome: Welcome = serde_json::from_str(&recv_text(&mut ws).await).unwrap();
+    assert!(welcome.ok, "{welcome:?}");
+    drop(idle);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

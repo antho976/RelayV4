@@ -1,7 +1,13 @@
 //! The server a person hosts themselves so a phone away from home can still reach the engine:
 //! the PC dials out and keeps one WebSocket open; each phone that joins the PC's room gets a
-//! lane on it. The server copies lines between the two and understands none of them — every
-//! credential check still happens on the PC, in `bridge.rs`.
+//! lane on it. The server copies lines between the two and interprets none of them — every
+//! credential check still happens on the PC, in `bridge.rs`. It can read them, though, and
+//! could write into a lane after the check: whoever runs it is trusted (docs/MOBILE.md §6).
+//!
+//! The server forwards between many sockets in one loop per host, so it never waits on any
+//! one phone: each lane has a byte budget, and a phone that lets it fill is cut off and told to
+//! reconnect. Every connection also gets a deadline to finish its upgrade, and the number of
+//! connections and lanes per room is capped.
 //!
 //! Rooms are not configured: a host proves a room by presenting the secret whose digest names
 //! it (`registry::room_for`). The server keeps nothing on disk and forgets everything on exit.
@@ -14,10 +20,12 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
+use tokio::sync::{mpsc, Semaphore};
+use tokio::task::{AbortHandle, JoinHandle};
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -37,12 +45,55 @@ impl Lane {
     }
 }
 
+/// How long a connection has to finish its WebSocket upgrade.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Connections the server holds at once, hosts and phones together.
+const MAX_CONNECTIONS: usize = 1024;
+
+/// Phones one room carries at once. Joining needs no credential, so this bounds what a stranger
+/// who knows a room id can make the PC do.
+const MAX_LANES_PER_ROOM: usize = 32;
+
+/// Bytes queued toward one phone before it is cut off. Large enough for a burst of terminal
+/// output or a re-attach catch-up on a slow link; a phone that drops off without a FIN fills it
+/// and is closed instead of stalling every other lane in the room.
+const LANE_BUDGET: usize = 8 << 20;
+
+/// A live phone sends `bus.ping` every 25 s; a phone silent this long has gone.
+const PHONE_SILENCE: Duration = Duration::from_secs(90);
+
+/// The server's side of one joined phone.
+struct LaneTx {
+    lines: mpsc::UnboundedSender<String>,
+    /// Bytes in `lines` not yet written to the phone's socket.
+    queued: Arc<AtomicUsize>,
+    /// The task writing to the phone. Aborting it drops the socket even while a write is stuck.
+    writer: AbortHandle,
+}
+
+impl LaneTx {
+    /// Queue a line without waiting. `false` means the phone is over budget or gone; the caller
+    /// drops the lane.
+    fn offer(&self, line: String) -> bool {
+        let n = line.len();
+        if self.queued.fetch_add(n, Ordering::AcqRel) + n > LANE_BUDGET {
+            return false;
+        }
+        self.lines.send(line).is_ok()
+    }
+
+    fn cut(self) {
+        self.writer.abort();
+    }
+}
+
 #[derive(Default)]
 struct Room {
     /// Lines for the host's socket.
     host: Option<mpsc::Sender<String>>,
     /// Lines for each joined phone, by lane id.
-    lanes: HashMap<String, mpsc::Sender<String>>,
+    lanes: HashMap<String, LaneTx>,
 }
 
 type Rooms = Arc<Mutex<HashMap<String, Room>>>;
@@ -66,15 +117,21 @@ impl RendezvousServer {
         let local_addr = listener.local_addr()?;
         tracing::info!(addr = %local_addr, "rendezvous open");
         let rooms: Rooms = Arc::default();
+        let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
         let accept = tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, peer)) => {
+                        let Ok(slot) = slots.clone().try_acquire_owned() else {
+                            tracing::debug!(peer = %peer, "rendezvous full; connection refused");
+                            continue;
+                        };
                         let rooms = rooms.clone();
                         tokio::spawn(async move {
                             if let Err(e) = handle(rooms, stream).await {
                                 tracing::debug!(peer = %peer, error = %e, "rendezvous connection ended");
                             }
+                            drop(slot);
                         });
                     }
                     Err(e) => {
@@ -122,7 +179,21 @@ fn refuse((status, body): (u16, &str)) -> ErrorResponse {
     r
 }
 
-async fn handle(rooms: Rooms, mut stream: TcpStream) -> Result<()> {
+async fn handle(rooms: Rooms, stream: TcpStream) -> Result<()> {
+    let (role, ws) = match tokio::time::timeout(HANDSHAKE_TIMEOUT, upgrade(&rooms, stream)).await {
+        Err(_) => anyhow::bail!("no handshake within {}s", HANDSHAKE_TIMEOUT.as_secs()),
+        Ok(Err(e)) => return Err(e),
+        Ok(Ok(None)) => return Ok(()),
+        Ok(Ok(Some(upgraded))) => upgraded,
+    };
+    match role {
+        Role::Host { room } => host(rooms, room, ws).await,
+        Role::Join { room } => join(rooms, room, ws).await,
+    }
+}
+
+/// Answer `/health` (`None`), or finish the WebSocket upgrade and say which side this is.
+async fn upgrade(rooms: &Rooms, mut stream: TcpStream) -> Result<Option<(Role, Ws)>> {
     let mut head = [0u8; 16];
     let n = stream.peek(&mut head).await?;
     if head[..n].starts_with(b"GET /health") {
@@ -140,7 +211,7 @@ async fn handle(rooms: Rooms, mut stream: TcpStream) -> Result<()> {
         );
         stream.write_all(response.as_bytes()).await?;
         stream.shutdown().await?;
-        return Ok(());
+        return Ok(None);
     }
 
     let mut role: Option<Role> = None;
@@ -160,10 +231,7 @@ async fn handle(rooms: Rooms, mut stream: TcpStream) -> Result<()> {
         .await
         .context("websocket handshake")?;
     let role = role.expect("callback ran on success");
-    match role {
-        Role::Host { room } => host(rooms, room, ws).await,
-        Role::Join { room } => join(rooms, room, ws).await,
-    }
+    Ok(Some((role, ws)))
 }
 
 type Ws = tokio_tungstenite::WebSocketStream<TcpStream>;
@@ -176,11 +244,11 @@ async fn host(rooms: Rooms, room: String, ws: Ws) -> Result<()> {
         let entry = rooms.entry(room.clone()).or_default();
         // A second host for the same room replaces the first: a PC that restarted is the
         // common case, and its old socket is about to time out anyway.
-        entry.host = Some(tx);
-        for lane in entry.lanes.values() {
-            let _ = lane.try_send(String::new());
+        entry.host = Some(tx.clone());
+        // Close the old host's phones so they reconnect against this one.
+        for (_, lane) in entry.lanes.drain() {
+            lane.cut();
         }
-        entry.lanes.clear();
     }
     tracing::info!(room = %room, "host joined");
     let writer = tokio::spawn(async move {
@@ -202,23 +270,35 @@ async fn host(rooms: Rooms, room: String, ws: Ws) -> Result<()> {
         };
         match lane {
             Lane::Data { c, l } => {
-                let target = rooms.lock().unwrap().get(&room).and_then(|r| r.lanes.get(&c).cloned());
-                if let Some(target) = target {
-                    let _ = target.send(l).await;
+                // Never wait on one phone here: this loop carries every lane in the room.
+                let mut rooms = rooms.lock().unwrap();
+                let Some(r) = rooms.get_mut(&room) else { continue };
+                let delivered = r.lanes.get(&c).map(|lane| lane.offer(l));
+                if delivered == Some(false) {
+                    tracing::info!(room = %room, lane = %c, "phone fell behind; cutting its lane");
+                    if let Some(lane) = r.lanes.remove(&c) {
+                        lane.cut();
+                    }
+                    let _ = tx.try_send(Lane::Close { c }.to_line());
                 }
             }
             Lane::Close { c } => {
                 let target = rooms.lock().unwrap().get_mut(&room).and_then(|r| r.lanes.remove(&c));
-                drop(target);
+                if let Some(lane) = target {
+                    lane.cut();
+                }
             }
             Lane::Open { .. } => {}
         }
     }
     {
         let mut rooms = rooms.lock().unwrap();
-        if let Some(r) = rooms.get_mut(&room) {
+        // Only if this host is still the room's: a replacement already took the room over.
+        if let Some(r) = rooms.get_mut(&room).filter(|r| r.host.as_ref().is_some_and(|h| h.same_channel(&tx))) {
             r.host = None;
-            r.lanes.clear();
+            for (_, lane) in r.lanes.drain() {
+                lane.cut();
+            }
         }
         rooms.retain(|_, r| r.host.is_some() || !r.lanes.is_empty());
     }
@@ -230,50 +310,72 @@ async fn host(rooms: Rooms, room: String, ws: Ws) -> Result<()> {
 async fn join(rooms: Rooms, room: String, ws: Ws) -> Result<()> {
     let lane_id = crate::registry::random_hex(8);
     let (mut sink, mut source) = ws.split();
-    let (tx, mut rx) = mpsc::channel::<String>(crate::bridge::OUTBOUND_QUEUE);
+    let refuse = |error: &str| Message::text(serde_json::json!({"v":1,"ok":false,"error":error}).to_string());
     let host = {
+        let rooms = rooms.lock().unwrap();
+        match rooms.get(&room) {
+            Some(r) if r.lanes.len() >= MAX_LANES_PER_ROOM => Err("room.full"),
+            Some(r) => r.host.clone().ok_or("host.offline"),
+            None => Err("host.offline"),
+        }
+    };
+    let host = match host {
+        Ok(host) => host,
+        Err(error) => {
+            let _ = sink.send(refuse(error)).await;
+            let _ = sink.close().await;
+            return Ok(());
+        }
+    };
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let queued = Arc::new(AtomicUsize::new(0));
+    let writer = {
+        let queued = queued.clone();
+        tokio::spawn(async move {
+            while let Some(line) = rx.recv().await {
+                let n = line.len();
+                let sent = sink.send(Message::text(line)).await;
+                queued.fetch_sub(n, Ordering::AcqRel);
+                if sent.is_err() {
+                    break;
+                }
+            }
+            let _ = sink.close().await;
+        })
+    };
+    // The writer ending, for any reason, ends this lane.
+    let gone = tx.clone();
+    {
         let mut rooms = rooms.lock().unwrap();
+        // The host may have left or been replaced since it was looked up; the phone reconnects.
         match rooms.get_mut(&room) {
-            Some(r) if r.host.is_some() => {
-                r.lanes.insert(lane_id.clone(), tx);
-                r.host.clone()
+            Some(r) if r.host.as_ref().is_some_and(|h| h.same_channel(&host)) => {
+                r.lanes.insert(lane_id.clone(), LaneTx { lines: tx, queued, writer: writer.abort_handle() });
             }
-            _ => None,
+            _ => {
+                writer.abort();
+                return Ok(());
+            }
         }
-    };
-    let Some(host) = host else {
-        let _ = sink
-            .send(Message::text(
-                serde_json::json!({"v":1,"ok":false,"error":"host.offline"}).to_string(),
-            ))
-            .await;
-        let _ = sink.close().await;
-        return Ok(());
-    };
-    if host.send(Lane::Open { c: lane_id.clone() }.to_line()).await.is_err() {
-        return Ok(());
     }
-    let writer = tokio::spawn(async move {
-        while let Some(line) = rx.recv().await {
-            // An empty line is the host-replaced signal: close the phone's socket so it
-            // reconnects against the new host.
-            if line.is_empty() {
+    if host.send(Lane::Open { c: lane_id.clone() }.to_line()).await.is_ok() {
+        loop {
+            let msg = tokio::select! {
+                _ = gone.closed() => break,
+                next = tokio::time::timeout(PHONE_SILENCE, source.next()) => match next {
+                    Ok(Some(msg)) => msg,
+                    Ok(None) | Err(_) => break,
+                },
+            };
+            let text = match msg {
+                Ok(Message::Text(t)) => t.to_string(),
+                Ok(Message::Close(_)) | Err(_) => break,
+                Ok(_) => continue,
+            };
+            if host.send(Lane::Data { c: lane_id.clone(), l: text }.to_line()).await.is_err() {
                 break;
             }
-            if sink.send(Message::text(line)).await.is_err() {
-                break;
-            }
-        }
-        let _ = sink.close().await;
-    });
-    while let Some(msg) = source.next().await {
-        let text = match msg {
-            Ok(Message::Text(t)) => t.to_string(),
-            Ok(Message::Close(_)) | Err(_) => break,
-            Ok(_) => continue,
-        };
-        if host.send(Lane::Data { c: lane_id.clone(), l: text }.to_line()).await.is_err() {
-            break;
         }
     }
     let _ = host.send(Lane::Close { c: lane_id.clone() }.to_line()).await;
@@ -298,6 +400,24 @@ mod tests {
         assert!(matches!(classify(&format!("/join/{room}")), Ok(Role::Join { .. })));
         assert!(classify("/join/").is_err());
         assert!(classify("/").is_err());
+    }
+
+    #[tokio::test]
+    async fn a_lane_over_its_budget_is_refused_not_waited_on() {
+        let (lines, mut rx) = mpsc::unbounded_channel();
+        let writer = tokio::spawn(std::future::pending::<()>());
+        let lane = LaneTx { lines, queued: Arc::default(), writer: writer.abort_handle() };
+        let chunk = "x".repeat(LANE_BUDGET / 4);
+        for _ in 0..4 {
+            assert!(lane.offer(chunk.clone()));
+        }
+        assert!(!lane.offer("y".into()), "the budget is a ceiling");
+        // What the writer sends frees budget again.
+        rx.recv().await.unwrap();
+        lane.queued.fetch_sub(chunk.len(), Ordering::AcqRel);
+        assert!(lane.offer("y".into()));
+        lane.cut();
+        assert!(writer.await.unwrap_err().is_cancelled());
     }
 
     #[test]

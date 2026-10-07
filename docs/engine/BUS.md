@@ -1119,7 +1119,11 @@ test that opens a DB at each prior version.
   wrong.
 - **No per-request auth beyond tokens.** Same uid = same trust (§0.6). Tokens prevent
   misattribution, not determined impersonation.
-- **No RPC over the network.** Unix socket only. Remote access is an SSH problem.
+- **No RPC over the network, with one exception.** The engine's own door is the Unix socket
+  only. The exception is the paired-phone door (`crates/relay-remote`, `docs/MOBILE.md`): it
+  forwards bus lines from a WebSocket to this socket as actor `user`, after a per-connection
+  proof of a device token. That channel is not yet sealed end to end, so an on-path attacker
+  can read and inject lines; MOBILE.md §6 says so and what to do meanwhile.
 - **No streaming results for ordinary ops.** Slow work returns a handle and emits events.
 - **The bus is not the PTY.** §7. Anyone proposing "just send keystrokes as bus ops" is
   reinventing v3's `pty_write` storm.
