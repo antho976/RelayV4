@@ -16,12 +16,16 @@
 //! Leases live in memory: a restart is a release, which is exactly right for a crash. A lease
 //! also lapses with its run, its session's exit or close, or its own expiry. The map sits behind
 //! its own small mutex and never touches SQLite, so taking one costs nothing in the store lock.
+//!
+//! One holder can hold several leases on one device — a claim, and the run it then starts — and
+//! the strongest is the one others see. Ending the run leaves the claim in place.
 
 use relay_bus::error::BusError;
 use relay_bus::types::{DeviceLease, Id};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// The key of a lease whose command named no device. `adb` without `-s` uses the only device
@@ -91,6 +95,12 @@ pub struct Lease {
     pub since: String,
     started: Instant,
     expires: Option<Instant>,
+    /// Shell commands seen starting under this lease and not yet seen finishing. Parallel tool
+    /// calls each take the lease; it shrinks to the grace period only when the last one ends.
+    commands: u32,
+    /// A command under it went to the background, so its end is never reported: the lease then
+    /// runs out its full [`SHELL_RUNNING`] term instead of shrinking to the grace period.
+    background: bool,
 }
 
 impl Lease {
@@ -104,6 +114,8 @@ impl Lease {
             since: crate::time::now(),
             started: now,
             expires: ttl.map(|ttl| now + ttl),
+            commands: u32::from(kind == Kind::Shell),
+            background: false,
         }
     }
 
@@ -156,53 +168,76 @@ pub fn busy(lease: &Lease) -> BusError {
         .with_details(json!({ "lease": lease.event() }))
 }
 
-#[derive(Default)]
+/// Every holder's leases on one device key, in the order they were taken. All share a holder:
+/// another holder is refused before it can add one.
+type Stack = Vec<Lease>;
+
+/// The lease others see on a device: the strongest unexpired one, the latest among equals.
+fn visible(stack: &[Lease], now: Instant) -> Option<&Lease> {
+    stack.iter().filter(|held| held.expires.is_none_or(|at| at > now)).max_by_key(|held| held.kind.rank())
+}
+
+/// The lease map. A clone is a handle to the same map, which is how the expiry sweeper waits
+/// on it without holding the engine.
+#[derive(Default, Clone)]
 pub struct Leases {
-    inner: Mutex<HashMap<String, Lease>>,
+    shared: Arc<Shared>,
+}
+
+#[derive(Default)]
+struct Shared {
+    map: Mutex<HashMap<String, Stack>>,
+    /// Signalled whenever a lease is added or its expiry moves, so the expiry sweeper re-reads
+    /// the map instead of sleeping past the new deadline.
+    changed: Condvar,
+    sweeping: AtomicBool,
 }
 
 impl Leases {
-    fn map(&self) -> std::sync::MutexGuard<'_, HashMap<String, Lease>> {
-        self.inner.lock().unwrap_or_else(|poison| poison.into_inner())
+    fn map(&self) -> std::sync::MutexGuard<'_, HashMap<String, Stack>> {
+        self.shared.map.lock().unwrap_or_else(|poison| poison.into_inner())
     }
 
     /// Take (or renew) a lease on `lease.device`. Refuses with [`busy`] when someone else holds
     /// that device, or holds every device, or — for `*` — holds any device at all. The same
-    /// holder never conflicts with itself; a weaker lease never replaces a stronger one it holds
-    /// (a shell command during the holder's own run leaves the run's lease alone).
+    /// holder never conflicts with itself, and a holder's leases of different kinds stack: a
+    /// shell command during the holder's own run leaves the run's lease in front, and a run
+    /// started under a claim hands the device back to the claim when it ends.
     ///
-    /// Returns whether a new lease was taken (the caller emits `device.lease.acquired`).
+    /// Returns whether the lease is new and now the one others see (the caller emits
+    /// `device.lease.acquired`).
     pub fn acquire(&self, lease: Lease, pruned: &mut Vec<Lease>) -> Result<bool, BusError> {
         let mut map = self.map();
         pruned.extend(expire(&mut map));
-        if let Some(other) = map.values().filter(|held| held.overlaps(&lease.device) && held.holder != lease.holder)
+        if let Some(other) = map.values().flatten().filter(|held| held.overlaps(&lease.device) && held.holder != lease.holder)
             .min_by_key(|held| held.started)
         {
             return Err(busy(other));
         }
-        match map.get_mut(&lease.device) {
-            Some(held) if held.kind.rank() > lease.kind.rank() => Ok(false),
-            Some(held) if held.kind == lease.kind => {
-                // A renewal: keep when it started, move what it is doing and when it lapses.
-                held.action = lease.action;
-                held.expires = match (held.expires, lease.expires) {
-                    (Some(a), Some(b)) => Some(a.max(b)),
-                    _ => None,
-                };
-                Ok(false)
-            }
-            _ => {
-                map.insert(lease.device.clone(), lease);
-                Ok(true)
-            }
-        }
+        let stack = map.entry(lease.device.clone()).or_default();
+        let taken = if let Some(held) = stack.iter_mut().find(|held| held.kind == lease.kind) {
+            // A renewal: keep when it started, move what it is doing and when it lapses.
+            held.action = lease.action;
+            held.expires = match (held.expires, lease.expires) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                _ => None,
+            };
+            held.commands += lease.commands;
+            false
+        } else {
+            let outranked = stack.iter().any(|held| held.kind.rank() > lease.kind.rank());
+            stack.push(lease);
+            !outranked
+        };
+        self.shared.changed.notify_all();
+        Ok(taken)
     }
 
     /// Would `holder` be refused on `device`? Never takes anything.
     pub fn check(&self, device: &str, holder: &Holder) -> Result<(), BusError> {
         let map = self.map();
         let now = Instant::now();
-        match map.values().filter(|held| held.overlaps(device) && &held.holder != holder)
+        match map.values().flatten().filter(|held| held.overlaps(device) && &held.holder != holder)
             .filter(|held| held.expires.is_none_or(|at| at > now))
             .min_by_key(|held| held.started)
         {
@@ -211,10 +246,11 @@ impl Leases {
         }
     }
 
+    /// The lease others see on each held device.
     pub fn list(&self) -> Vec<Lease> {
         let map = self.map();
         let now = Instant::now();
-        let mut out: Vec<Lease> = map.values().filter(|held| held.expires.is_none_or(|at| at > now)).cloned().collect();
+        let mut out: Vec<Lease> = map.values().filter_map(|stack| visible(stack, now)).cloned().collect();
         out.sort_by(|a, b| a.device.cmp(&b.device));
         out
     }
@@ -223,8 +259,8 @@ impl Leases {
     pub fn holder_of(&self, device: &str) -> Option<Lease> {
         let now = Instant::now();
         let map = self.map();
-        map.get(device).or_else(|| map.get(ANY_DEVICE))
-            .filter(|held| held.expires.is_none_or(|at| at > now))
+        map.get(device).and_then(|stack| visible(stack, now))
+            .or_else(|| map.get(ANY_DEVICE).and_then(|stack| visible(stack, now)))
             .cloned()
     }
 
@@ -232,10 +268,13 @@ impl Leases {
     pub fn release_where(&self, mut select: impl FnMut(&Lease) -> bool) -> Vec<Lease> {
         let mut map = self.map();
         let mut gone = expire(&mut map);
-        let keys: Vec<String> = map.iter().filter(|(_, lease)| select(lease)).map(|(key, _)| key.clone()).collect();
-        for key in keys {
-            if let Some(lease) = map.remove(&key) { gone.push(lease); }
+        for stack in map.values_mut() {
+            let mut index = 0;
+            while index < stack.len() {
+                if select(&stack[index]) { gone.push(stack.remove(index)); } else { index += 1; }
+            }
         }
+        map.retain(|_, stack| !stack.is_empty());
         gone
     }
 
@@ -249,15 +288,29 @@ impl Leases {
         self.release_where(|lease| lease.holder.session_id() == Some(session_id) && !matches!(lease.kind, Kind::Run(_)))
     }
 
-    /// The shell command that took a lease has finished: keep it only for the grace period.
-    pub fn shell_finished(&self, session_id: Id) {
+    /// One shell command that took the session's lease on `device` has finished. The lease keeps
+    /// only the grace period once none of its commands is still running — and keeps its full
+    /// term if one of them went to the background, whose end nobody reports.
+    pub fn shell_command_finished(&self, session_id: Id, device: &str, background: bool) {
         let mut map = self.map();
-        let until = Instant::now() + SHELL_GRACE;
-        for lease in map.values_mut() {
-            if lease.kind == Kind::Shell && lease.holder.session_id() == Some(session_id) {
-                lease.expires = Some(lease.expires.map_or(until, |at| at.min(until)));
-            }
+        let Some(stack) = map.get_mut(device) else { return };
+        for lease in stack.iter_mut().filter(|lease| lease.kind == Kind::Shell && lease.holder.session_id() == Some(session_id)) {
+            lease.commands = lease.commands.saturating_sub(1);
+            lease.background |= background;
+            if lease.commands == 0 { shrink(lease); }
         }
+        self.shared.changed.notify_all();
+    }
+
+    /// The session's turn ended: no foreground command of it is still running, so every shell
+    /// lease it holds keeps only the grace period (unless a background command holds it).
+    pub fn shell_turn_ended(&self, session_id: Id) {
+        let mut map = self.map();
+        for lease in map.values_mut().flatten().filter(|lease| lease.kind == Kind::Shell && lease.holder.session_id() == Some(session_id)) {
+            lease.commands = 0;
+            shrink(lease);
+        }
+        self.shared.changed.notify_all();
     }
 
     /// Drop what has lapsed, plus anything `stale` says is held by something that is gone (a
@@ -269,12 +322,51 @@ impl Leases {
     pub fn is_empty(&self) -> bool {
         self.map().is_empty()
     }
+
+    /// Become the expiry sweeper. True for exactly one caller until [`Leases::wait_expired`]
+    /// finds the map empty and stands the sweeper down.
+    pub fn start_sweeper(&self) -> bool {
+        !self.shared.sweeping.swap(true, Ordering::SeqCst)
+    }
+
+    /// The sweeper's step: sleep until the next lease lapses (at most `cap`, or until a lease
+    /// changes), then drop and return what lapsed, for its `device.lease.released`. `None` once
+    /// nothing is held: the sweeper stops, and the next lease taken starts a new one.
+    pub fn wait_expired(&self, cap: Duration) -> Option<Vec<Lease>> {
+        let mut map = self.map();
+        if map.is_empty() {
+            self.shared.sweeping.store(false, Ordering::SeqCst);
+            return None;
+        }
+        let now = Instant::now();
+        let next = map.values().flatten().filter_map(|lease| lease.expires).min();
+        let wait = next.map_or(cap, |at| at.saturating_duration_since(now).min(cap));
+        if !wait.is_zero() {
+            map = self.shared.changed.wait_timeout(map, wait).unwrap_or_else(|poison| poison.into_inner()).0;
+        }
+        Some(expire(&mut map))
+    }
 }
 
-fn expire(map: &mut HashMap<String, Lease>) -> Vec<Lease> {
+/// A finished shell command's lease keeps only [`SHELL_GRACE`] — unless a background command
+/// may still be using the device.
+fn shrink(lease: &mut Lease) {
+    if lease.background { return; }
+    let until = Instant::now() + SHELL_GRACE;
+    lease.expires = Some(lease.expires.map_or(until, |at| at.min(until)));
+}
+
+fn expire(map: &mut HashMap<String, Stack>) -> Vec<Lease> {
     let now = Instant::now();
-    let keys: Vec<String> = map.iter().filter(|(_, lease)| lease.expires.is_some_and(|at| at <= now)).map(|(key, _)| key.clone()).collect();
-    keys.into_iter().filter_map(|key| map.remove(&key)).collect()
+    let mut gone = Vec::new();
+    for stack in map.values_mut() {
+        let mut index = 0;
+        while index < stack.len() {
+            if stack[index].expires.is_some_and(|at| at <= now) { gone.push(stack.remove(index)); } else { index += 1; }
+        }
+    }
+    map.retain(|_, stack| !stack.is_empty());
+    gone
 }
 
 fn clip(action: &str) -> String {
@@ -374,9 +466,40 @@ fn is_assignment(token: &str) -> bool {
 /// Shell verbs (after `adb shell`) that change what is on the device or on its screen.
 const SHELL_WRITES: &[&str] = &["am", "pm", "cmd", "input", "monkey", "reboot", "svc", "settings", "wm", "setprop", "rm", "mv", "cp", "uiautomator", "su"];
 /// `pm` / `cmd package` verbs that only read.
-const PM_READS: &[&str] = &["list", "path", "dump", "resolve-activity", "query-activities", "get-max-users", "has-feature"];
-/// `am` verbs that only read.
-const AM_READS: &[&str] = &["get-config", "get-current-user", "stack", "task", "monitor", "dumpheap", "profile"];
+const PM_READS: &[&str] = &["list", "path", "dump", "resolve-activity", "query-activities", "get-max-users", "has-feature", "help"];
+/// `am` / `cmd activity` verbs that only read.
+const AM_READS: &[&str] = &["get-config", "get-current-user", "stack", "task", "monitor", "dumpheap", "profile", "help"];
+/// `wm` verbs that print the current value when given none, and set it when given one.
+const WM_QUERIES: &[&str] = &["size", "density", "user-rotation", "fixed-to-user-rotation", "scaling"];
+
+/// Does one command run by `adb shell` change the device? `words` is the command and its
+/// arguments.
+fn shell_writes(words: &[&str]) -> bool {
+    let command = words.first().copied().unwrap_or("");
+    let sub = words.get(1).copied().unwrap_or("");
+    let third = words.get(2).copied().unwrap_or("");
+    match command {
+        "pm" => !PM_READS.contains(&sub),
+        "cmd" => match sub {
+            "package" => !PM_READS.contains(&third),
+            "activity" => !AM_READS.contains(&third),
+            _ => false,
+        },
+        "am" => !AM_READS.contains(&sub),
+        "settings" => !matches!(sub, "" | "get" | "list" | "help"),
+        "wm" => {
+            if sub.is_empty() || sub == "help" { return false; }
+            if !WM_QUERIES.contains(&sub) { return true; }
+            // `wm size -d 1` still only asks, about display 1; any other argument sets.
+            let mut args = words[2..].iter();
+            while let Some(arg) = args.next() {
+                if *arg == "-d" { args.next(); } else { return true; }
+            }
+            false
+        }
+        other => SHELL_WRITES.contains(&other),
+    }
+}
 
 fn adb_command(args: &[String], serial: Option<&str>) -> Option<DeviceCommand> {
     let mut serial = serial.map(str::to_string);
@@ -398,18 +521,10 @@ fn adb_command(args: &[String], serial: Option<&str>) -> Option<DeviceCommand> {
         "install" | "install-multiple" | "install-multi-package" | "uninstall" | "push" | "sync" | "reboot" | "root"
         | "unroot" | "remount" | "sideload" | "disable-verity" | "enable-verity" | "restore" | "emu" => true,
         "shell" | "exec-out" => {
-            let mut words = rest.iter().map(String::as_str).filter(|word| !word.starts_with('-'));
-            // `adb shell "am start …"` arrives as one quoted word; look inside it.
-            let first = words.next().unwrap_or("");
-            let mut inner = first.split_whitespace();
-            let command = inner.next().unwrap_or("");
-            let sub = inner.next().or_else(|| words.next()).unwrap_or("");
-            match command {
-                "pm" => !PM_READS.contains(&sub),
-                "cmd" => sub == "package" || sub == "activity",
-                "am" => !AM_READS.contains(&sub),
-                other => SHELL_WRITES.contains(&other),
-            }
+            // `adb shell "am start …; input tap 1 1"` arrives as one quoted word: look inside
+            // it, and at each command the device's shell will run, not just the first.
+            let line = rest.iter().map(String::as_str).skip_while(|word| word.starts_with('-')).collect::<Vec<_>>().join(" ");
+            line.split([';', '&', '|', '\n']).any(|command| shell_writes(&command.split_whitespace().collect::<Vec<_>>()))
         }
         _ => false,
     };
@@ -474,6 +589,11 @@ mod tests {
         assert!(device("adb -s X shell 'am force-stop com.example'").is_some());
         assert!(device("adb shell input tap 100 200").is_some());
         assert!(device("adb shell pm clear com.example").is_some());
+        assert!(device("adb shell wm size 1080x1920").is_some());
+        assert!(device("adb shell wm size reset").is_some());
+        assert!(device("adb shell settings put global animator_duration_scale 0").is_some());
+        assert!(device("adb shell cmd package install-existing com.example").is_some());
+        assert!(device("adb shell 'wm size; input keyevent 3'").is_some());
         assert!(device("timeout 600 npx expo run:android --device R5CT").unwrap().0 == "R5CT");
         assert!(device("adb uninstall com.example").is_some());
         // Reads are free.
@@ -481,6 +601,12 @@ mod tests {
         assert!(device("adb logcat -d | grep FATAL").is_none());
         assert!(device("adb shell pm list packages | grep example").is_none());
         assert!(device("adb shell getprop ro.build.version.sdk").is_none());
+        assert!(device("adb shell wm size").is_none());
+        assert!(device("adb shell wm density -d 0").is_none());
+        assert!(device("adb -s R5 shell settings get global adb_enabled").is_none());
+        assert!(device("adb shell settings list secure").is_none());
+        assert!(device("adb shell cmd package list packages -3").is_none());
+        assert!(device("adb shell 'cmd activity get-current-user'").is_none());
         assert!(device("adb exec-out screencap -p > shot.png").is_none());
         assert!(device("./gradlew assembleDebug test lint").is_none());
         assert!(device("./gradlew install").is_none());
@@ -508,8 +634,10 @@ mod tests {
         assert!(leases.acquire(Lease::new("R5", a.clone(), Kind::Run(7), "device.run", None), &mut pruned).unwrap());
         assert!(!leases.acquire(Lease::new("R5", a.clone(), Kind::Shell, "adb install", Some(SHELL_RUNNING)), &mut pruned).unwrap());
         assert_eq!(leases.holder_of("R5").unwrap().kind, Kind::Run(7));
-        // Closing the session leaves its run's lease; the run ending releases it.
-        assert!(leases.release_session(1).is_empty());
+        // Closing the session gives back its own shell lease and leaves its run's; the run
+        // ending releases that.
+        assert!(leases.release_session(1).iter().all(|lease| lease.kind == Kind::Shell));
+        assert_eq!(leases.holder_of("R5").unwrap().kind, Kind::Run(7));
         assert_eq!(leases.release_run(7).len(), 1);
         assert!(leases.check("R5", &b).is_ok());
     }
@@ -520,7 +648,7 @@ mod tests {
         let a = Holder::Session { id: 1, name: "a".into() };
         let mut pruned = Vec::new();
         leases.acquire(Lease::new("R5", a.clone(), Kind::Shell, "adb install", Some(SHELL_RUNNING)), &mut pruned).unwrap();
-        leases.shell_finished(1);
+        leases.shell_command_finished(1, "R5", false);
         let left = leases.holder_of("R5").unwrap().view().expires_in_s.unwrap();
         assert!(left <= SHELL_GRACE.as_secs(), "{left}");
         // An already-lapsed lease is dropped by the next acquire and reported for its event.
@@ -528,5 +656,61 @@ mod tests {
         leases.acquire(lapsed, &mut pruned).unwrap();
         leases.acquire(Lease::new("R7", Holder::User, Kind::Claim, "testing", None), &mut pruned).unwrap();
         assert!(pruned.iter().any(|lease| lease.device == "R6"));
+    }
+
+    #[test]
+    fn a_shell_lease_waits_for_every_command_under_it() {
+        let leases = Leases::default();
+        let a = Holder::Session { id: 1, name: "a".into() };
+        let mut pruned = Vec::new();
+        let shell = || Lease::new("R5", a.clone(), Kind::Shell, "adb install", Some(SHELL_RUNNING));
+        // Two device commands in parallel: the first to finish leaves the lease alone.
+        leases.acquire(shell(), &mut pruned).unwrap();
+        leases.acquire(shell(), &mut pruned).unwrap();
+        leases.shell_command_finished(1, "R5", false);
+        assert!(leases.holder_of("R5").unwrap().view().expires_in_s.unwrap() > SHELL_GRACE.as_secs());
+        leases.shell_command_finished(1, "R5", false);
+        assert!(leases.holder_of("R5").unwrap().view().expires_in_s.unwrap() <= SHELL_GRACE.as_secs());
+        // A background command's PostToolUse arrives at once; the lease keeps its full term,
+        // even past the end of the turn.
+        leases.acquire(Lease::new("R6", a.clone(), Kind::Shell, "adb install", Some(SHELL_RUNNING)), &mut pruned).unwrap();
+        leases.shell_command_finished(1, "R6", true);
+        leases.shell_turn_ended(1);
+        assert!(leases.holder_of("R6").unwrap().view().expires_in_s.unwrap() > SHELL_GRACE.as_secs());
+    }
+
+    #[test]
+    fn a_run_started_under_a_claim_hands_the_device_back_to_it() {
+        let leases = Leases::default();
+        let a = Holder::Session { id: 1, name: "a".into() };
+        let b = Holder::Session { id: 2, name: "b".into() };
+        let mut pruned = Vec::new();
+        assert!(leases.acquire(Lease::new("R5", a.clone(), Kind::Claim, "testing login", Some(Duration::from_secs(600))), &mut pruned).unwrap());
+        assert!(leases.acquire(Lease::new("R5", a.clone(), Kind::Run(3), "device.run", None), &mut pruned).unwrap());
+        assert_eq!(leases.list().len(), 1, "one device, one visible lease");
+        assert_eq!(leases.holder_of("R5").unwrap().kind, Kind::Run(3));
+        let gone = leases.release_run(3);
+        assert_eq!(gone.len(), 1);
+        assert_eq!(leases.holder_of("R5").unwrap().kind, Kind::Claim);
+        assert_eq!(leases.check("R5", &b).unwrap_err().code, "device.busy");
+    }
+
+    #[test]
+    fn the_sweeper_hands_back_a_lease_as_it_lapses() {
+        let leases = Leases::default();
+        assert!(leases.wait_expired(Duration::from_secs(5)).is_none(), "nothing held, nothing to sweep");
+        assert!(leases.start_sweeper());
+        assert!(!leases.start_sweeper(), "one sweeper at a time");
+        let mut pruned = Vec::new();
+        leases.acquire(Lease::new("R5", Holder::User, Kind::Claim, "testing", Some(Duration::from_millis(50))), &mut pruned).unwrap();
+        let started = Instant::now();
+        let mut gone = Vec::new();
+        while gone.is_empty() {
+            gone = leases.wait_expired(Duration::from_secs(5)).unwrap();
+            assert!(started.elapsed() < Duration::from_secs(2), "the lapse was never seen");
+        }
+        assert_eq!(gone[0].device, "R5");
+        assert!(leases.wait_expired(Duration::from_secs(5)).is_none());
+        assert!(leases.start_sweeper(), "an emptied map stands the sweeper down");
     }
 }

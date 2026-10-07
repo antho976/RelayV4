@@ -71,13 +71,16 @@ pub fn forward_args(serial: &str, scid: u32) -> Vec<String> {
     ]
 }
 
-pub fn forward_remove_args(serial: &str, scid: u32) -> Vec<String> {
+/// Tear the tunnel down. `adb forward --remove` takes the *local* end — the `tcp:` port
+/// [`forward_args`] printed — and refuses a remote socket name, so every forward removed by
+/// its `localabstract:` name stayed open until the adb server restarted.
+pub fn forward_remove_args(serial: &str, port: u16) -> Vec<String> {
     vec![
         "-s".into(),
         serial.into(),
         "forward".into(),
         "--remove".into(),
-        socket_name(scid),
+        format!("tcp:{port}"),
     ]
 }
 

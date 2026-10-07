@@ -146,7 +146,8 @@ fn fake_adb(dir: &std::path::Path) -> String {
     let path = dir.join("adb");
     std::fs::write(&path, r#"#!/bin/sh
 if [ "$1" = "track-devices" ]; then
-  printf 'relay-phone device product:relay model:Pixel_9_Pro device:relay transport_id:1\n'
+  # As adb sends it: a %04x byte count, then the device list.
+  printf '004frelay-phone device product:relay model:Pixel_9_Pro device:relay transport_id:1\n'
   sleep 5
   exit 0
 fi

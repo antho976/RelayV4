@@ -45,8 +45,13 @@ impl DeviceWatchRuntime {
             let _ = child.kill();
         }
     }
+    /// Reap the watcher once its stream ended. The child leaves the slot before the wait, so a
+    /// `stop()` (`device.watch` off, under the store lock) never queues behind it; it is killed
+    /// first, since an ended stream does not prove `adb track-devices` exited.
     pub fn finish(&self) {
-        if let Some(mut child) = self.child.lock().unwrap().take() {
+        let child = self.child.lock().unwrap().take();
+        if let Some(mut child) = child {
+            let _ = child.kill();
             let _ = child.wait();
         }
     }
@@ -85,6 +90,10 @@ struct MirrorControl {
     socket: Option<TcpStream>,
     pending: VecDeque<Vec<u8>>,
 }
+
+/// How long one control message may take to leave. A device that stops reading its control
+/// socket would otherwise park the writer in `write_all` with the control lock held.
+const CONTROL_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Where a mirror is in its life. `Stopped`, `Failed` and `Lost` are terminal: the
 /// runtime never leaves them, and the socket door ends the window's stream on them.
@@ -143,6 +152,9 @@ pub struct MirrorRuntime {
     child: Mutex<Option<Child>>,
     video: Mutex<Option<TcpStream>>,
     control: Mutex<MirrorControl>,
+    /// A clone of the control socket, under its own lock, so `stop()` can shut it down — and
+    /// so fail a writer blocked inside `send_control` — without waiting for the control lock.
+    control_shutdown: Mutex<Option<TcpStream>>,
     buffer: Mutex<MirrorBuffer>,
     tx: broadcast::Sender<MirrorChunk>,
     /// The stream's current picture size, `width << 32 | height`. Starts at the estimate
@@ -195,6 +207,7 @@ impl MirrorRuntime {
             child: Mutex::new(None),
             video: Mutex::new(None),
             control: Mutex::new(MirrorControl::default()),
+            control_shutdown: Mutex::new(None),
             buffer: Mutex::new(MirrorBuffer {
                 seq: 0,
                 bytes: 0,
@@ -269,6 +282,12 @@ impl MirrorRuntime {
         *self.video.lock().unwrap() = Some(video);
     }
     pub fn install_control(&self, mut socket: TcpStream) -> io::Result<()> {
+        socket.set_write_timeout(Some(CONTROL_WRITE_TIMEOUT))?;
+        *self.control_shutdown.lock().unwrap() = Some(socket.try_clone()?);
+        if self.stopped() {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+            return Ok(());
+        }
         let mut control = self.control.lock().unwrap();
         while let Some(bytes) = control.pending.pop_front() {
             socket.write_all(&bytes)?;
@@ -279,7 +298,17 @@ impl MirrorRuntime {
     pub fn send_control(&self, bytes: Vec<u8>) -> io::Result<()> {
         let mut control = self.control.lock().unwrap();
         if let Some(socket) = control.socket.as_mut() {
-            socket.write_all(&bytes)
+            let written = socket.write_all(&bytes);
+            if written.is_err() {
+                // A write that timed out may have left half a message on the wire; anything
+                // sent after it would be parsed from the middle. The control channel is done.
+                if let Some(socket) = control.socket.take() {
+                    let _ = socket.shutdown(std::net::Shutdown::Both);
+                }
+            }
+            written
+        } else if self.stopped() {
+            Err(io::Error::new(io::ErrorKind::NotConnected, "the mirror has stopped"))
         } else {
             if control.pending.len() == 128 {
                 control.pending.pop_front();
@@ -322,6 +351,11 @@ impl MirrorRuntime {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(video) = self.video.lock().unwrap().take() {
             let _ = video.shutdown(std::net::Shutdown::Both);
+        }
+        // Shut the clone down first: that fails a `send_control` stuck in a write, which is what
+        // lets the control lock below be taken at all.
+        if let Some(control) = self.control_shutdown.lock().unwrap().take() {
+            let _ = control.shutdown(std::net::Shutdown::Both);
         }
         if let Some(control) = self.control.lock().unwrap().socket.take() {
             let _ = control.shutdown(std::net::Shutdown::Both);
@@ -489,6 +523,40 @@ mod tests {
         runtime.set_child(child);
         let status = runtime.take_child().unwrap().wait().unwrap();
         assert!(!status.success());
+    }
+
+    #[test]
+    fn a_watch_stop_never_waits_behind_finish() {
+        let runtime = Arc::new(DeviceWatchRuntime::default());
+        assert!(runtime.install(std::process::Command::new("sleep").arg("30").spawn().unwrap()));
+        let finishing = runtime.clone();
+        let started = std::time::Instant::now();
+        let finisher = std::thread::spawn(move || finishing.finish());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        runtime.stop();
+        finisher.join().unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "finish held the child for {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn a_mirror_stop_fails_a_stalled_control_write_instead_of_waiting_for_it() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        // Accepted and never read: the "device" has stopped reading its control socket.
+        let (_server, _) = listener.accept().unwrap();
+        let runtime = MirrorRuntime::new(MirrorRuntimeConfig {
+            id: 1, device: "S".into(), width: 1080, height: 2400, input_width: 1080, input_height: 2400,
+            max_size: 1600, bitrate: 8_000_000, scid: 1, adb: "adb".into(),
+        });
+        runtime.install_control(client).unwrap();
+        let writer = runtime.clone();
+        let sending = std::thread::spawn(move || writer.send_control(vec![0u8; 64 * 1024 * 1024]));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let started = std::time::Instant::now();
+        runtime.stop();
+        assert!(started.elapsed() < std::time::Duration::from_secs(1), "stop waited {:?} for the writer", started.elapsed());
+        assert!(sending.join().unwrap().is_err());
+        assert!(runtime.send_control(vec![1]).is_err(), "a stopped mirror takes no more input");
     }
 
     #[test]
