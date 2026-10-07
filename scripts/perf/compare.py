@@ -30,6 +30,15 @@ def main():
     a_native, b_native = read_jsonl(args.before / "native.jsonl"), read_jsonl(args.after / "native.jsonl")
     a_prof, b_prof = read_json(args.before / "profiles.json"), read_json(args.after / "profiles.json")
 
+    # Wall time only compares on one machine and toolchain, and --quick runs a quarter of the
+    # iterations. Say so up front rather than let the rows below look like regressions.
+    a_env, b_env = read_json(args.before / "environment.json"), read_json(args.after / "environment.json")
+    a_env.setdefault("quick", False)  # runs from before it was recorded were full runs
+    b_env.setdefault("quick", False)
+    for key in ("cpu", "cores", "mem_gib", "kernel", "rustc", "profile", "container", "quick"):
+        if a_env.get(key) != b_env.get(key):
+            print(f"warning: {key} differs: {a_env.get(key)!r} → {b_env.get(key)!r}")
+
     rows = []
     for name in sorted(set(a_native) | set(b_native)):
         a, b = a_native.get(name), b_native.get(name)
@@ -41,7 +50,10 @@ def main():
         ir = None
         if name in a_prof and name in b_prof:
             ir = b_prof[name]["ir_per_iter"] / max(a_prof[name]["ir_per_iter"], 1)
-        outcome = "" if a.get("codes") == b.get("codes") and a["ok"] == b["ok"] else f"outcome changed: {a.get('codes')} → {b.get('codes')}"
+        # Counts scale with the iteration count; what each iteration came back with does not.
+        a_iters, b_iters = max(a.get("iters", 1), 1), max(b.get("iters", 1), 1)
+        same = set(a.get("codes") or {}) == set(b.get("codes") or {}) and abs(a["ok"] / a_iters - b["ok"] / b_iters) < 0.01
+        outcome = "" if same else f"outcome changed: ok {a['ok']}/{a_iters} {a.get('codes')} → ok {b['ok']}/{b_iters} {b.get('codes')}"
         rows.append((name, outcome, wall, allocs, ir))
 
     def flag(x):

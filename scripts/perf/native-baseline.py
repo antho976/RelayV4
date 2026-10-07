@@ -26,6 +26,10 @@ import time
 import uuid
 from pathlib import Path
 
+# The waits here end on assert statements; under -O a stalled wait would never end.
+if sys.flags.optimize:
+    raise SystemExit("Run without python -O or PYTHONOPTIMIZE: this script times out with assert.")
+
 ROOT = Path(__file__).resolve().parents[2]
 ENGINE = ROOT / "target/debug/relay"
 NATIVE = ROOT / "target/debug/relay-native"
@@ -171,7 +175,10 @@ def main():
             def call(op, payload):
                 stream.write((json.dumps(dict(v=1, id=str(uuid.uuid4()), actor="user", op=op, payload=payload)) + "\n").encode())
                 while True:
-                    msg = json.loads(stream.readline())
+                    line = stream.readline()
+                    if not line:
+                        raise RuntimeError(f"{op}: the fixture engine closed the connection; see engine.log")
+                    msg = json.loads(line)
                     if "ev" in msg or "stream" in msg:
                         continue
                     if not msg["ok"]:
@@ -213,8 +220,12 @@ def main():
             engine_rss = counters(engine.pid)["rss"]
             result["engine_rss_mb_six_sessions"] = round(engine_rss / 1024 / 1024, 1)
 
+            # XDG_RUNTIME_DIR stays the session's own: RELAY_NATIVE_SOCKET already picks the fixture
+            # engine, and a relative WAYLAND_DISPLAY is looked up under it, so moving it would send
+            # GDK to XWayland (or nowhere) instead of the Wayland path the app really runs on.
             desktop_env = dict(os.environ, RELAY_NATIVE_SOCKET=str(sock_path), RELAY_INSTANCE="test", XDG_DATA_HOME=str(base / "data"),
-                               XDG_CONFIG_HOME=str(base / "config"), XDG_CACHE_HOME=str(base / "cache"), XDG_RUNTIME_DIR=str(runtime))
+                               XDG_CONFIG_HOME=str(base / "config"), XDG_CACHE_HOME=str(base / "cache"))
+            result["display"] = {key: os.environ.get(key) for key in ("GDK_BACKEND", "WAYLAND_DISPLAY", "DISPLAY", "XDG_SESSION_TYPE")}
             for key in ("RELAY_SESSION", "RELAY_TOKEN", "RELAY_BRIEF"):
                 desktop_env.pop(key, None)
 

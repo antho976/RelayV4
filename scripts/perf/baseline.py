@@ -18,6 +18,7 @@ import json
 import os
 import platform
 import re
+import select
 import shutil
 import socket
 import subprocess
@@ -28,6 +29,10 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+# The waits here end on assert statements; under -O a stalled wait would never end.
+if sys.flags.optimize:
+    raise SystemExit("Run without python -O or PYTHONOPTIMIZE: this script times out with assert.")
 
 ROOT = Path(__file__).resolve().parents[2]
 PERF = ROOT / "target/debug/examples/perf"
@@ -344,13 +349,15 @@ class Engine:
                 if self.proc.poll() is not None or time.monotonic() > deadline:
                     raise RuntimeError("engine did not come up; see engine.log")
                 time.sleep(0.005)
-        self.stream = self.conn.makefile("rwb", buffering=0)
+        # Buffered: an unbuffered readline is one recv per byte, which the timings would include.
+        self.stream = self.conn.makefile("rwb")
         # Ready means answering, not just accepting.
         self.call("bus.ping", {})
         return time.monotonic() - t0
 
     def call(self, op, payload, actor="user"):
         self.stream.write((json.dumps(dict(v=1, id=str(uuid.uuid4()), actor=actor, op=op, payload=payload)) + "\n").encode())
+        self.stream.flush()
         while True:
             line = self.stream.readline()
             if not line:
@@ -517,30 +524,51 @@ def run_process(out_dir, seconds):
             log("process: one session bursting 50 000 lines while attached")
             sub = socket.socket(socket.AF_UNIX)
             sub.connect(str(engine.socket_path))
-            stream = sub.makefile("rwb", buffering=0)
-            stream.write((json.dumps(dict(v=1, id=str(uuid.uuid4()), actor="user", op="session.attach", payload={"session": names[0]})) + "\n").encode())
-            stream.readline()
-            sub.settimeout(1.0)
+            # Read in large chunks and split the lines here. A raw makefile's readline is one
+            # recv per byte, slow enough to be what this phase measured, and a socket timeout
+            # under a makefile leaves it refusing every read after the first expiry.
+            lines, partial = [], [b""]
+
+            def next_line(timeout):
+                """The next complete line, or None after `timeout` seconds of silence."""
+                while not lines:
+                    if not select.select([sub], [], [], timeout)[0]:
+                        return None
+                    chunk = sub.recv(1 << 16)
+                    if not chunk:
+                        raise RuntimeError("engine closed the attached stream")
+                    *complete, partial[0] = (partial[0] + chunk).split(b"\n")
+                    lines.extend(line + b"\n" for line in reversed(complete))
+                return lines.pop()
+
+            sub.sendall((json.dumps(dict(v=1, id=str(uuid.uuid4()), actor="user", op="session.attach", payload={"session": names[0]})) + "\n").encode())
+            if next_line(10) is None:
+                raise RuntimeError("session.attach did not answer")
             before = proc_counters(pid)
             t0 = time.monotonic()
             engine.call("session.input", {"session": names[0], "data": "burst 50000\n"})
-            wire = payload = frames = 0
+            wire = payload = frames = dropped = 0
+            last_seq = None
             finished_at = None
             while True:
-                try:
-                    line = stream.readline()
-                except socket.timeout:
-                    line = b""
+                line = next_line(1.0)
                 if line:
                     wire += len(line)
                     if b'"stream"' in line:
                         frames += 1
                         try:
-                            data = json.loads(line).get("data")
-                            if isinstance(data, str):
-                                payload += len(data) * 3 // 4
+                            frame = json.loads(line)
                         except ValueError:
-                            pass
+                            continue
+                        data = frame.get("data")
+                        if isinstance(data, str):
+                            payload += len(data) * 3 // 4
+                        # The engine drops frames for a reader that falls behind; seq says how many.
+                        seq = frame.get("seq")
+                        if isinstance(seq, int):
+                            if last_seq is not None and seq > last_seq + 1:
+                                dropped += seq - last_seq - 1
+                            last_seq = seq
                     continue
                 # A second of silence on the stream: the burst is over once the bus says so.
                 if "BURST-END" in engine.call("session.scrollback", {"session": names[0], "lines": 2})["text"]:
@@ -556,6 +584,7 @@ def run_process(out_dir, seconds):
                 "payload_bytes_received": payload,
                 "wire_bytes_received": wire,
                 "frames": frames,
+                "frames_dropped": dropped,
                 "mib_per_s_to_client": round(wire / 1024 / 1024 / max(elapsed, 0.001), 1),
             }
             sub.close()
@@ -618,6 +647,7 @@ def main():
     if not args.skip_build:
         build()
     env = environment()
+    env["quick"] = args.quick  # compare.py warns when two runs differ in this
     (out_dir / "environment.json").write_text(json.dumps(env, indent=2) + "\n")
     names = [n for n in scenarios() if matches(n, args.only)]
     log(f"{len(names)} scenarios")
