@@ -1,0 +1,1010 @@
+{
+ "core-engine#7": {
+  "file": "crates/relay-core/src/socket.rs",
+  "old_line": 411,
+  "new_line": 463,
+  "touched": false
+ },
+ "core-engine#13": {
+  "file": "crates/relay-core/src/socket.rs",
+  "old_line": 385,
+  "new_line": 437,
+  "touched": false
+ },
+ "core-socket-store#1": {
+  "file": "crates/relay-core/src/socket.rs",
+  "old_line": 111,
+  "new_line": 111,
+  "touched": false
+ },
+ "core-socket-store#4": {
+  "file": "crates/relay-core/src/socket.rs",
+  "old_line": 56,
+  "new_line": 56,
+  "touched": false
+ },
+ "core-socket-store#6": {
+  "file": "crates/relay-core/src/socket.rs",
+  "old_line": 335,
+  "new_line": 387,
+  "touched": true
+ },
+ "core-socket-store#8": {
+  "file": "crates/relay-core/src/socket.rs",
+  "old_line": 323,
+  "new_line": 373,
+  "touched": true
+ },
+ "core-socket-store#9": {
+  "file": "crates/relay-core/src/socket.rs",
+  "old_line": 487,
+  "new_line": 539,
+  "touched": false
+ },
+ "core-socket-store#10": {
+  "file": "crates/relay-core/src/socket.rs",
+  "old_line": 469,
+  "new_line": 521,
+  "touched": false
+ },
+ "core-socket-store#13": {
+  "file": "crates/relay-core/src/socket.rs",
+  "old_line": 281,
+  "new_line": 331,
+  "touched": true
+ },
+ "core-socket-store#14": {
+  "file": "crates/relay-core/src/socket.rs",
+  "old_line": 424,
+  "new_line": 476,
+  "touched": false
+ },
+ "core-socket-store#15": {
+  "file": "crates/relay-core/src/socket.rs",
+  "old_line": 385,
+  "new_line": 437,
+  "touched": false
+ },
+ "core-socket-store#17": {
+  "file": "crates/relay-core/src/socket.rs",
+  "old_line": 134,
+  "new_line": 134,
+  "touched": false
+ },
+ "core-socket-store#18": {
+  "file": "crates/relay-core/src/socket.rs",
+  "old_line": 237,
+  "new_line": 237,
+  "touched": false
+ },
+ "core-socket-store#19": {
+  "file": "crates/relay-core/src/socket.rs",
+  "old_line": 362,
+  "new_line": 414,
+  "touched": false
+ },
+ "core-socket-store#20": {
+  "file": "crates/relay-core/src/socket.rs",
+  "old_line": 461,
+  "new_line": 513,
+  "touched": false
+ },
+ "core-socket-store#21": {
+  "file": "crates/relay-core/src/socket.rs",
+  "old_line": 74,
+  "new_line": 74,
+  "touched": false
+ },
+ "core-session#1": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 1358,
+  "new_line": 1358,
+  "touched": false
+ },
+ "core-session#2": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 1596,
+  "new_line": 1596,
+  "touched": false
+ },
+ "core-session#3": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 100,
+  "new_line": 100,
+  "touched": false
+ },
+ "core-session#4": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 945,
+  "new_line": 945,
+  "touched": false
+ },
+ "core-session#5": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 1214,
+  "new_line": 1214,
+  "touched": false
+ },
+ "core-session#6": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 869,
+  "new_line": 869,
+  "touched": false
+ },
+ "core-session#7": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 1166,
+  "new_line": 1166,
+  "touched": false
+ },
+ "core-session#8": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 1361,
+  "new_line": 1361,
+  "touched": false
+ },
+ "core-session#10": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 73,
+  "new_line": 73,
+  "touched": false
+ },
+ "core-session#11": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 1460,
+  "new_line": 1460,
+  "touched": false
+ },
+ "core-session#12": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 451,
+  "new_line": 451,
+  "touched": false
+ },
+ "core-session#14": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 1578,
+  "new_line": 1578,
+  "touched": false
+ },
+ "core-session#15": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 1526,
+  "new_line": 1526,
+  "touched": false
+ },
+ "core-session#17": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 236,
+  "new_line": 236,
+  "touched": false
+ },
+ "core-session#18": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 538,
+  "new_line": 538,
+  "touched": false
+ },
+ "core-session#19": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 321,
+  "new_line": 321,
+  "touched": false
+ },
+ "core-session#20": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 1140,
+  "new_line": 1140,
+  "touched": false
+ },
+ "core-session#21": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 1676,
+  "new_line": 1676,
+  "touched": false
+ },
+ "core-session#22": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 662,
+  "new_line": 662,
+  "touched": false
+ },
+ "core-session#23": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 1482,
+  "new_line": 1482,
+  "touched": false
+ },
+ "core-session#24": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 1705,
+  "new_line": 1707,
+  "touched": true
+ },
+ "core-session#25": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 98,
+  "new_line": 98,
+  "touched": false
+ },
+ "core-session#26": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 821,
+  "new_line": 821,
+  "touched": false
+ },
+ "core-session#27": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 165,
+  "new_line": 165,
+  "touched": false
+ },
+ "core-session#28": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 1474,
+  "new_line": 1474,
+  "touched": false
+ },
+ "core-session#29": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 135,
+  "new_line": 135,
+  "touched": false
+ },
+ "core-session#31": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 1354,
+  "new_line": 1354,
+  "touched": false
+ },
+ "core-pty-providers#3": {
+  "file": "crates/relay-core/src/pty.rs",
+  "old_line": 215,
+  "new_line": 223,
+  "touched": false
+ },
+ "core-pty-providers#4": {
+  "file": "crates/relay-core/src/pty.rs",
+  "old_line": 192,
+  "new_line": 200,
+  "touched": false
+ },
+ "core-pty-providers#10": {
+  "file": "crates/relay-core/src/pty.rs",
+  "old_line": 345,
+  "new_line": 364,
+  "touched": false
+ },
+ "core-pty-providers#11": {
+  "file": "crates/relay-core/src/pty.rs",
+  "old_line": 227,
+  "new_line": 235,
+  "touched": false
+ },
+ "core-pty-providers#12": {
+  "file": "crates/relay-core/src/pty.rs",
+  "old_line": 283,
+  "new_line": 292,
+  "touched": false
+ },
+ "core-pty-providers#13": {
+  "file": "crates/relay-core/src/pty.rs",
+  "old_line": 174,
+  "new_line": 182,
+  "touched": true
+ },
+ "core-pty-providers#19": {
+  "file": "crates/relay-core/src/pty.rs",
+  "old_line": 65,
+  "new_line": 65,
+  "touched": false
+ },
+ "core-device-handler#1": {
+  "file": "crates/relay-core/src/handlers/device.rs",
+  "old_line": 335,
+  "new_line": 335,
+  "touched": false
+ },
+ "core-device-handler#2": {
+  "file": "crates/relay-core/src/handlers/device.rs",
+  "old_line": 1841,
+  "new_line": 1862,
+  "touched": false
+ },
+ "core-device-handler#3": {
+  "file": "crates/relay-core/src/handlers/device.rs",
+  "old_line": 1822,
+  "new_line": 1843,
+  "touched": false
+ },
+ "core-device-handler#4": {
+  "file": "crates/relay-core/src/handlers/device.rs",
+  "old_line": 152,
+  "new_line": 152,
+  "touched": false
+ },
+ "core-device-handler#5": {
+  "file": "crates/relay-core/src/handlers/device.rs",
+  "old_line": 375,
+  "new_line": 396,
+  "touched": false
+ },
+ "core-device-handler#6": {
+  "file": "crates/relay-core/src/handlers/device.rs",
+  "old_line": 381,
+  "new_line": 402,
+  "touched": false
+ },
+ "core-device-handler#7": {
+  "file": "crates/relay-core/src/handlers/device.rs",
+  "old_line": 1779,
+  "new_line": 1800,
+  "touched": false
+ },
+ "core-device-handler#8": {
+  "file": "crates/relay-core/src/handlers/device.rs",
+  "old_line": 1575,
+  "new_line": 1596,
+  "touched": false
+ },
+ "core-device-handler#9": {
+  "file": "crates/relay-core/src/handlers/device.rs",
+  "old_line": 1748,
+  "new_line": 1769,
+  "touched": false
+ },
+ "core-device-handler#10": {
+  "file": "crates/relay-core/src/handlers/device.rs",
+  "old_line": 210,
+  "new_line": 210,
+  "touched": false
+ },
+ "core-device-handler#11": {
+  "file": "crates/relay-core/src/handlers/device.rs",
+  "old_line": 569,
+  "new_line": 590,
+  "touched": false
+ },
+ "core-device-handler#12": {
+  "file": "crates/relay-core/src/handlers/device.rs",
+  "old_line": 1396,
+  "new_line": 1417,
+  "touched": false
+ },
+ "core-device-handler#13": {
+  "file": "crates/relay-core/src/handlers/device.rs",
+  "old_line": 1780,
+  "new_line": 1801,
+  "touched": false
+ },
+ "core-device-handler#14": {
+  "file": "crates/relay-core/src/handlers/device.rs",
+  "old_line": 2046,
+  "new_line": 2067,
+  "touched": false
+ },
+ "core-device-handler#15": {
+  "file": "crates/relay-core/src/handlers/device.rs",
+  "old_line": 444,
+  "new_line": 465,
+  "touched": false
+ },
+ "core-device-handler#16": {
+  "file": "crates/relay-core/src/handlers/device.rs",
+  "old_line": 1060,
+  "new_line": 1081,
+  "touched": false
+ },
+ "core-device-handler#17": {
+  "file": "crates/relay-core/src/handlers/device.rs",
+  "old_line": 147,
+  "new_line": 147,
+  "touched": false
+ },
+ "core-device-handler#18": {
+  "file": "crates/relay-core/src/handlers/device.rs",
+  "old_line": 358,
+  "new_line": 360,
+  "touched": true
+ },
+ "core-device-handler#19": {
+  "file": "crates/relay-core/src/handlers/device.rs",
+  "old_line": 2125,
+  "new_line": 2146,
+  "touched": false
+ },
+ "core-device-handler#20": {
+  "file": "crates/relay-bus/src/ops/device.rs",
+  "old_line": 39,
+  "new_line": 39,
+  "touched": false
+ },
+ "core-device-handler#21": {
+  "file": "crates/relay-core/src/handlers/device.rs",
+  "old_line": 1825,
+  "new_line": 1846,
+  "touched": false
+ },
+ "core-device-handler#22": {
+  "file": "crates/relay-core/src/handlers/device.rs",
+  "old_line": 603,
+  "new_line": 624,
+  "touched": false
+ },
+ "core-device-handler#23": {
+  "file": "crates/relay-core/src/handlers/device.rs",
+  "old_line": 552,
+  "new_line": 573,
+  "touched": false
+ },
+ "core-device-mirror#9": {
+  "file": "crates/relay-core/src/handlers/device.rs",
+  "old_line": 375,
+  "new_line": 396,
+  "touched": false
+ },
+ "core-device-mirror#10": {
+  "file": "crates/relay-core/src/handlers/device.rs",
+  "old_line": 376,
+  "new_line": 397,
+  "touched": false
+ },
+ "core-device-mirror#20": {
+  "file": "docs/engine/BUS.md",
+  "old_line": 381,
+  "new_line": 381,
+  "touched": false
+ },
+ "bus#6": {
+  "file": "crates/relay-bus/src/ops/device.rs",
+  "old_line": 37,
+  "new_line": 37,
+  "touched": false
+ },
+ "bus#14": {
+  "file": "crates/relay-bus/src/ops/session.rs",
+  "old_line": 44,
+  "new_line": 44,
+  "touched": false
+ },
+ "remote#21": {
+  "file": "crates/relay-remote/tests/remote.rs",
+  "old_line": 277,
+  "new_line": 277,
+  "touched": false
+ },
+ "native-mirror#1": {
+  "file": "crates/relay-core/src/handlers/device.rs",
+  "old_line": 335,
+  "new_line": 335,
+  "touched": false
+ },
+ "native-mirror#2": {
+  "file": "apps/relay-native/src/tools_devices.rs",
+  "old_line": 161,
+  "new_line": 104,
+  "touched": false
+ },
+ "native-mirror#3": {
+  "file": "apps/relay-native/src/tools_devices.rs",
+  "old_line": 329,
+  "new_line": 519,
+  "touched": false
+ },
+ "native-mirror#5": {
+  "file": "apps/relay-native/src/mirror.rs",
+  "old_line": 639,
+  "new_line": 682,
+  "touched": false
+ },
+ "native-mirror#6": {
+  "file": "apps/relay-native/src/mirror.rs",
+  "old_line": 587,
+  "new_line": 630,
+  "touched": false
+ },
+ "native-mirror#7": {
+  "file": "apps/relay-native/src/tools_devices.rs",
+  "old_line": 595,
+  "new_line": 893,
+  "touched": false
+ },
+ "native-mirror#9": {
+  "file": "apps/relay-native/src/mirror.rs",
+  "old_line": 943,
+  "new_line": 1051,
+  "touched": false
+ },
+ "native-mirror#10": {
+  "file": "apps/relay-native/src/mirror.rs",
+  "old_line": 528,
+  "new_line": 571,
+  "touched": false
+ },
+ "native-mirror#11": {
+  "file": "apps/relay-native/src/mirror.rs",
+  "old_line": 631,
+  "new_line": 674,
+  "touched": false
+ },
+ "native-mirror#12": {
+  "file": "apps/relay-native/src/tools_devices.rs",
+  "old_line": 843,
+  "new_line": 1060,
+  "touched": false
+ },
+ "native-mirror#13": {
+  "file": "apps/relay-native/src/tools_devices.rs",
+  "old_line": 445,
+  "new_line": 743,
+  "touched": false
+ },
+ "native-mirror#14": {
+  "file": "apps/relay-native/src/mirror.rs",
+  "old_line": 901,
+  "new_line": 1010,
+  "touched": false
+ },
+ "native-mirror#15": {
+  "file": "apps/relay-native/src/tools_devices.rs",
+  "old_line": 241,
+  "new_line": 255,
+  "touched": true
+ },
+ "native-css#9": {
+  "file": "apps/relay-native/src/css/tools.css",
+  "old_line": 159,
+  "new_line": 159,
+  "touched": true
+ },
+ "native-css#10": {
+  "file": "apps/relay-native/src/css/tools.css",
+  "old_line": 108,
+  "new_line": 108,
+  "touched": false
+ },
+ "native-smoke#1": {
+  "file": "apps/relay-native/src/smoke.rs",
+  "old_line": 452,
+  "new_line": 452,
+  "touched": false
+ },
+ "native-smoke#3": {
+  "file": "apps/relay-native/src/smoke.rs",
+  "old_line": 698,
+  "new_line": 710,
+  "touched": false
+ },
+ "native-smoke#4": {
+  "file": "apps/relay-native/src/smoke.rs",
+  "old_line": 162,
+  "new_line": 162,
+  "touched": false
+ },
+ "native-smoke#5": {
+  "file": "apps/relay-native/src/smoke.rs",
+  "old_line": 426,
+  "new_line": 426,
+  "touched": false
+ },
+ "native-smoke#7": {
+  "file": "apps/relay-native/src/smoke.rs",
+  "old_line": 148,
+  "new_line": 148,
+  "touched": false
+ },
+ "native-smoke#9": {
+  "file": "apps/relay-native/src/smoke.rs",
+  "old_line": 103,
+  "new_line": 103,
+  "touched": false
+ },
+ "tests-sessions#1": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 1596,
+  "new_line": 1596,
+  "touched": false
+ },
+ "tests-sessions#6": {
+  "file": "crates/relay-core/tests/sessions.rs",
+  "old_line": 467,
+  "new_line": 469,
+  "touched": false
+ },
+ "tests-sessions#7": {
+  "file": "crates/relay-core/tests/sessions.rs",
+  "old_line": 260,
+  "new_line": 260,
+  "touched": false
+ },
+ "tests-sessions#9": {
+  "file": "crates/relay-core/tests/sessions.rs",
+  "old_line": 1326,
+  "new_line": 1387,
+  "touched": false
+ },
+ "tests-sessions#13": {
+  "file": "crates/relay-core/tests/sessions.rs",
+  "old_line": 915,
+  "new_line": 976,
+  "touched": false
+ },
+ "tests-bus-guardrails#5": {
+  "file": "crates/relay-core/src/handlers/device.rs",
+  "old_line": 1825,
+  "new_line": 1846,
+  "touched": false
+ },
+ "tests-bus-guardrails#6": {
+  "file": "crates/relay-core/src/handlers/device.rs",
+  "old_line": 1818,
+  "new_line": 1839,
+  "touched": false
+ },
+ "tests-mirror-board#7": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 1359,
+  "new_line": 1359,
+  "touched": false
+ },
+ "tests-mirror-board#12": {
+  "file": "crates/relay-core/src/handlers/device.rs",
+  "old_line": 828,
+  "new_line": 849,
+  "touched": false
+ },
+ "tests-features#3": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 1140,
+  "new_line": 1140,
+  "touched": false
+ },
+ "tests-features#6": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 1187,
+  "new_line": 1187,
+  "touched": false
+ },
+ "tests-misc#4": {
+  "file": "crates/relay-core/src/handlers/device.rs",
+  "old_line": 335,
+  "new_line": 335,
+  "touched": false
+ },
+ "tests-misc#9": {
+  "file": "crates/relay-core/src/handlers/device.rs",
+  "old_line": 2157,
+  "new_line": 2178,
+  "touched": false
+ },
+ "tests-misc#10": {
+  "file": "crates/relay-core/tests/phase12.rs",
+  "old_line": 79,
+  "new_line": 80,
+  "touched": true
+ },
+ "perf-harness#1": {
+  "file": "crates/relay-core/examples/perf.rs",
+  "old_line": 1064,
+  "new_line": 1065,
+  "touched": false
+ },
+ "perf-harness#2": {
+  "file": "crates/relay-core/src/handlers/device.rs",
+  "old_line": 335,
+  "new_line": 335,
+  "touched": false
+ },
+ "perf-harness#3": {
+  "file": "crates/relay-core/examples/perf.rs",
+  "old_line": 94,
+  "new_line": 94,
+  "touched": false
+ },
+ "perf-harness#4": {
+  "file": "crates/relay-core/examples/perf.rs",
+  "old_line": 1409,
+  "new_line": 1410,
+  "touched": false
+ },
+ "perf-harness#5": {
+  "file": "crates/relay-core/examples/perf.rs",
+  "old_line": 1359,
+  "new_line": 1360,
+  "touched": false
+ },
+ "perf-harness#6": {
+  "file": "crates/relay-core/examples/perf.rs",
+  "old_line": 1566,
+  "new_line": 1567,
+  "touched": false
+ },
+ "perf-harness#7": {
+  "file": "crates/relay-core/examples/perf.rs",
+  "old_line": 1250,
+  "new_line": 1251,
+  "touched": false
+ },
+ "perf-harness#9": {
+  "file": "crates/relay-core/examples/perf.rs",
+  "old_line": 1098,
+  "new_line": 1099,
+  "touched": false
+ },
+ "perf-harness#14": {
+  "file": "crates/relay-core/examples/perf.rs",
+  "old_line": 1110,
+  "new_line": 1111,
+  "touched": false
+ },
+ "perf-harness#17": {
+  "file": "crates/relay-core/examples/perf.rs",
+  "old_line": 248,
+  "new_line": 248,
+  "touched": false
+ },
+ "perf-harness#18": {
+  "file": "docs/engine/BUS.md",
+  "old_line": 366,
+  "new_line": 366,
+  "touched": false
+ },
+ "plugins-unreal#3": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 1596,
+  "new_line": 1596,
+  "touched": false
+ },
+ "lens-store-mutex#8": {
+  "file": "crates/relay-core/src/handlers/device.rs",
+  "old_line": 335,
+  "new_line": 335,
+  "touched": false
+ },
+ "lens-store-mutex#11": {
+  "file": "crates/relay-core/src/socket.rs",
+  "old_line": 469,
+  "new_line": 521,
+  "touched": false
+ },
+ "lens-store-mutex#12": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 685,
+  "new_line": 685,
+  "touched": false
+ },
+ "lens-store-mutex#17": {
+  "file": "docs/engine/BUS.md",
+  "old_line": 226,
+  "new_line": 226,
+  "touched": false
+ },
+ "lens-subprocess#4": {
+  "file": "crates/relay-core/src/handlers/device.rs",
+  "old_line": 1822,
+  "new_line": 1843,
+  "touched": false
+ },
+ "lens-subprocess#6": {
+  "file": "crates/relay-core/src/handlers/device.rs",
+  "old_line": 335,
+  "new_line": 335,
+  "touched": false
+ },
+ "lens-sqlite#4": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 867,
+  "new_line": 867,
+  "touched": false
+ },
+ "lens-sqlite#12": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 604,
+  "new_line": 604,
+  "touched": false
+ },
+ "lens-sqlite#14": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 1533,
+  "new_line": 1533,
+  "touched": false
+ },
+ "lens-sqlite#16": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 1354,
+  "new_line": 1354,
+  "touched": false
+ },
+ "lens-concurrency#8": {
+  "file": "crates/relay-core/src/pty.rs",
+  "old_line": 215,
+  "new_line": 223,
+  "touched": false
+ },
+ "lens-concurrency#11": {
+  "file": "crates/relay-core/src/socket.rs",
+  "old_line": 469,
+  "new_line": 521,
+  "touched": false
+ },
+ "lens-concurrency#14": {
+  "file": "crates/relay-core/src/handlers/device.rs",
+  "old_line": 1734,
+  "new_line": 1755,
+  "touched": false
+ },
+ "lens-concurrency#15": {
+  "file": "crates/relay-core/src/socket.rs",
+  "old_line": 742,
+  "new_line": 811,
+  "touched": false
+ },
+ "lens-concurrency#20": {
+  "file": "crates/relay-core/src/handlers/device.rs",
+  "old_line": 176,
+  "new_line": 176,
+  "touched": false
+ },
+ "sec-local-ipc#8": {
+  "file": "crates/relay-core/src/socket.rs",
+  "old_line": 362,
+  "new_line": 414,
+  "touched": false
+ },
+ "sec-supply-chain#1": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 1358,
+  "new_line": 1358,
+  "touched": false
+ },
+ "sec-supply-chain#13": {
+  "file": ".github/workflows/mobile-apk.yml",
+  "old_line": 38,
+  "new_line": 38,
+  "touched": false
+ },
+ "sec-supply-chain#17": {
+  "file": "docs/engine/BUS.md",
+  "old_line": 524,
+  "new_line": 524,
+  "touched": false
+ },
+ "lens-data-loss#8": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 1578,
+  "new_line": 1578,
+  "touched": false
+ },
+ "lens-data-loss#12": {
+  "file": "docs/engine/BUS.md",
+  "old_line": 290,
+  "new_line": 290,
+  "touched": false
+ },
+ "lens-errors-panics#7": {
+  "file": "crates/relay-core/src/handlers/device.rs",
+  "old_line": 1779,
+  "new_line": 1800,
+  "touched": false
+ },
+ "lens-errors-panics#10": {
+  "file": "crates/relay-core/src/socket.rs",
+  "old_line": 742,
+  "new_line": 811,
+  "touched": false
+ },
+ "lens-dead-dup#23": {
+  "file": "crates/relay-core/src/handlers/device.rs",
+  "old_line": 559,
+  "new_line": 580,
+  "touched": false
+ },
+ "lens-dead-dup#25": {
+  "file": "apps/relay-native/src/smoke.rs",
+  "old_line": 11,
+  "new_line": 11,
+  "touched": false
+ },
+ "lens-overengineering#6": {
+  "file": "crates/relay-core/src/socket.rs",
+  "old_line": 742,
+  "new_line": 811,
+  "touched": false
+ },
+ "lens-contract#15": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 666,
+  "new_line": 666,
+  "touched": false
+ },
+ "lens-contract#18": {
+  "file": "docs/engine/BUS.md",
+  "old_line": 524,
+  "new_line": 524,
+  "touched": false
+ },
+ "lens-perf#2": {
+  "file": "crates/relay-core/src/socket.rs",
+  "old_line": 335,
+  "new_line": 387,
+  "touched": true
+ },
+ "lens-perf#13": {
+  "file": "crates/relay-core/src/socket.rs",
+  "old_line": 469,
+  "new_line": 521,
+  "touched": false
+ },
+ "lens-perf#15": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 1705,
+  "new_line": 1707,
+  "touched": true
+ },
+ "lens-perf#16": {
+  "file": "apps/relay-native/src/tools_devices.rs",
+  "old_line": 38,
+  "new_line": 38,
+  "touched": true
+ },
+ "lens-perf#20": {
+  "file": "crates/relay-core/src/pty.rs",
+  "old_line": 65,
+  "new_line": 65,
+  "touched": false
+ },
+ "lens-resources#8": {
+  "file": "crates/relay-core/src/handlers/device.rs",
+  "old_line": 1822,
+  "new_line": 1843,
+  "touched": false
+ },
+ "lens-resources#14": {
+  "file": "crates/relay-core/src/socket.rs",
+  "old_line": 335,
+  "new_line": 387,
+  "touched": true
+ },
+ "lens-docs#5": {
+  "file": "crates/relay-core/src/handlers/session.rs",
+  "old_line": 438,
+  "new_line": 438,
+  "touched": false
+ },
+ "lens-docs#7": {
+  "file": "crates/relay-bus/src/ops/device.rs",
+  "old_line": 37,
+  "new_line": 37,
+  "touched": false
+ },
+ "lens-docs#10": {
+  "file": "docs/engine/BUS.md",
+  "old_line": 529,
+  "new_line": 529,
+  "touched": false
+ },
+ "lens-docs#11": {
+  "file": "docs/engine/BUS.md",
+  "old_line": 323,
+  "new_line": 323,
+  "touched": false
+ },
+ "lens-docs#14": {
+  "file": "docs/engine/BUS.md",
+  "old_line": 226,
+  "new_line": 226,
+  "touched": false
+ },
+ "lens-docs#15": {
+  "file": "docs/MOBILE.md",
+  "old_line": 107,
+  "new_line": 107,
+  "touched": false
+ },
+ "lens-docs#17": {
+  "file": "docs/engine/BUS.md",
+  "old_line": 380,
+  "new_line": 380,
+  "touched": false
+ }
+}
