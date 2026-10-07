@@ -118,12 +118,19 @@ fn session_running(conn: &Connection, id: Id) -> bool {
 /// Take a lease inside a request: prune, acquire, queue the events. `device.busy` on conflict.
 /// What the prune dropped is gone whatever the request's outcome, so its releases go out at
 /// once rather than with the request's events, which a refusal rolls back unsent.
+///
+/// The acquisition itself is the request's, like its rows and its `acquired` event: it stands
+/// once the transaction commits, and is taken back if a later step fails or the commit does
+/// (RA-358). A rollback drops the after-commit closure, and the [`device_lease::Pending`] in it
+/// with it.
 pub(crate) fn acquire(ctx: &mut Ctx, lease: Lease) -> Result<(), BusError> {
     let mut released = prune(ctx.engine(), ctx.tx());
     let event = lease.event();
-    let taken = ctx.engine().device_leases.acquire(lease, &mut released);
+    let taken = ctx.engine().device_leases.acquire_pending(lease, &mut released);
     for gone in released { ctx.engine().emit_system(RELEASED, gone.event()); }
-    if taken? { ctx.emit(ACQUIRED, event); }
+    let (taken, pending) = taken?;
+    if taken { ctx.emit(ACQUIRED, event); }
+    ctx.after_commit(move |_| pending.keep());
     ensure_sweeper(ctx.engine());
     Ok(())
 }
