@@ -63,8 +63,15 @@ fn avd_catalog_create_list_and_boot_use_configured_sdk_tools() {
     let avdmanager = root.path().join("avdmanager");
     executable(&adb, "if [ \"$1\" = \"devices\" ]; then echo 'List of devices attached'; fi");
     let boot_log = root.path().join("emulator-boot.log");
-    executable(&emulator, &format!("if [ \"$1\" = \"-list-avds\" ]; then echo 'Pixel_9_API_35'; else echo \"$@\" > '{}'; fi", boot_log.display()));
-    executable(&avdmanager, "if [ \"$1\" = \"list\" ]; then echo 'pixel_9'; fi\nexit 0");
+    // avdmanager logs its create line and records the name it was given, and the emulator lists
+    // whatever was recorded, so avd.create reads back what it made instead of echoing the request.
+    let create_log = root.path().join("avdmanager-create.log");
+    let created_avds = root.path().join("created-avds");
+    executable(&emulator, &format!("if [ \"$1\" = \"-list-avds\" ]; then echo 'Pixel_9_API_35'; cat '{}' 2>/dev/null || true; else echo \"$@\" > '{}'; fi", created_avds.display(), boot_log.display()));
+    executable(&avdmanager, &format!(
+        "case \"$1\" in\n  list) echo 'pixel_9' ;;\n  create) echo \"$@\" > '{}'; [ \"$3\" = --name ] && echo \"$4\" >> '{}' ;;\nesac\nexit 0",
+        create_log.display(), created_avds.display()
+    ));
     for (path, value) in [
         ("device.sdk_path", sdk.display().to_string()),
         ("device.adb_path", adb.display().to_string()),
@@ -77,7 +84,13 @@ fn avd_catalog_create_list_and_boot_use_configured_sdk_tools() {
     assert_eq!(catalog["devices"], json!(["pixel_9"]));
     assert_eq!(ok(&engine, "avd.list", json!({}))["avds"][0]["name"], "Pixel_9_API_35");
     let created = ok(&engine, "avd.create", json!({"name":"New_API_35","package":"system-images;android-35;google_apis;x86_64","device":"pixel_9"}));
+    assert_eq!(fs::read_to_string(&create_log).unwrap().trim(),
+        "create avd --name New_API_35 --package system-images;android-35;google_apis;x86_64 --device pixel_9");
+    // Only the listing fills in a path; the fallback built from the request has none.
     assert_eq!(created["name"], "New_API_35");
+    assert!(created["path"].is_string(), "avd.create did not read the new AVD back: {created}");
+    let names: Vec<Value> = ok(&engine, "avd.list", json!({}))["avds"].as_array().unwrap().iter().map(|avd| avd["name"].clone()).collect();
+    assert_eq!(names, [json!("Pixel_9_API_35"), json!("New_API_35")]);
     ok(&engine, "avd.boot", json!({"name":"Pixel_9_API_35","cold":true}));
     // Booted headless, so the mirror is the only window the emulator gets.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);

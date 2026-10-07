@@ -515,17 +515,21 @@ fn integration_merges_two_branches_and_reports_result() {
     .into_result()
     .unwrap();
     let id = queued["id"].as_i64().unwrap();
-    let mut state = String::new();
-    for _ in 0..100 {
+    // A worktree add and an octopus merge on a background thread, while the other tests run git
+    // too: allow it the time a loaded machine needs, and stop as soon as it settles.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let state = loop {
         let value = call(&e, "integration.get", json!({"integration_id":id}))
             .into_result()
             .unwrap();
-        state = value["state"].as_str().unwrap().to_string();
-        if matches!(state.as_str(), "passed" | "failed" | "conflict") {
-            break;
+        let state = value["state"].as_str().unwrap().to_string();
+        if matches!(state.as_str(), "passed" | "failed" | "conflict")
+            || std::time::Instant::now() >= deadline
+        {
+            break state;
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+    };
     assert_eq!(state, "passed");
     let value = call(&e, "integration.get", json!({"integration_id":id}))
         .into_result()
@@ -633,6 +637,10 @@ fn file_save_expectation_rejects_stale_content_and_deleted_files() {
 #[test]
 fn filesystem_reads_do_not_retrigger_refresh_but_writes_do() {
     use std::time::{Duration, Instant};
+    // The watcher emits from a thread that sleeps 125 ms after the first event of a burst
+    // (watch.rs). A "nothing arrived" check only means something if its window is well past
+    // that, or a delayed thread lets it pass without testing anything.
+    const QUIET: Duration = Duration::from_millis(8 * 125);
     let e = engine();
     let (ws, repo) = real_repo();
     add_project(&e, &ws, &repo);
@@ -648,7 +656,7 @@ fn filesystem_reads_do_not_retrigger_refresh_but_writes_do() {
         assert!(Instant::now() < deadline, "watcher did not register");
         std::thread::sleep(Duration::from_millis(10));
     }
-    std::thread::sleep(Duration::from_millis(250));
+    std::thread::sleep(QUIET);
     while events.try_recv().is_ok() {}
     for _ in 0..3 {
         call(&e, "file.tree", json!({"project_id":1,"depth":1}))
@@ -658,7 +666,7 @@ fn filesystem_reads_do_not_retrigger_refresh_but_writes_do() {
         call(&e, "git.status", json!({"project_id":1}))
             .into_result().unwrap();
     }
-    std::thread::sleep(Duration::from_millis(350));
+    std::thread::sleep(QUIET);
     while let Ok(event) = events.try_recv() {
         assert_ne!(event.ev, "file.changed", "read-only refresh retriggered watcher");
     }
@@ -667,7 +675,7 @@ fn filesystem_reads_do_not_retrigger_refresh_but_writes_do() {
         std::fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
         std::fs::write(root.join(path), "generated output").unwrap();
     }
-    std::thread::sleep(Duration::from_millis(350));
+    std::thread::sleep(QUIET);
     while let Ok(event) = events.try_recv() {
         assert_ne!(event.ev, "file.changed", "LFS or Unreal output retriggered watcher");
     }

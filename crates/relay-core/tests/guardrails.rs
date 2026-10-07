@@ -165,7 +165,7 @@ fn refusals_holds_confirmation_replay_and_expiry_are_durable() {
     assert_eq!(inspected["request"]["payload"]["path"], "secret/key");
     assert_eq!(inspected["request"]["payload"]["new_text"], "x");
     assert!(inspected["request"].get("token").is_none());
-    assert!(!call(engine, actor.clone(), "guardrail.hold.get", json!({"hold_id": bypass_id})).ok,
+    assert_eq!(error(&call(engine, actor.clone(), "guardrail.hold.get", json!({"hold_id": bypass_id}))).code, "actor.allowlist",
         "an agent must not inspect another actor's frozen action");
     // Nor read it back out of the audit trail, which stores the same payload.
     let held_row = ok(engine, Actor::User, "audit.list", json!({"op_prefix": "guardrail.gate"}))["rows"]
@@ -480,19 +480,25 @@ fn sessions_install_git_and_claude_hooks_without_clobbering_local_settings() {
         "session.spawn",
         json!({"session": name}),
     );
+    // session.spawn itself installs the guardrail and reporting hooks, beside the user's own.
+    let installed = || {
+        let settings: Value = serde_json::from_str(
+            &std::fs::read_to_string(claude_dir.join("settings.local.json")).unwrap(),
+        ).unwrap();
+        assert_eq!(settings["permissions"]["allow"][0], "Bash(cargo test)");
+        let groups = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(groups.len(), 2);
+        assert!(groups.iter().any(|group| group["matcher"] == "Edit|Write|MultiEdit|Bash"));
+        for event in ["SessionStart", "PostToolUse", "Stop", "Notification"] {
+            let groups = settings["hooks"][event].as_array().unwrap();
+            assert_eq!(groups.len(), 1, "Relay installed {event} reporting");
+            assert!(groups[0]["hooks"][0]["command"].as_str().unwrap().contains("hook claude-report"));
+        }
+    };
+    installed();
+    // Installing again (the next launch) replaces Relay's groups rather than adding to them.
     relay_core::hooks::install_claude(&worktree, Instance::Test, Path::new("relay")).unwrap();
-    let settings: Value = serde_json::from_str(
-        &std::fs::read_to_string(claude_dir.join("settings.local.json")).unwrap(),
-    ).unwrap();
-    assert_eq!(settings["permissions"]["allow"][0], "Bash(cargo test)");
-    let groups = settings["hooks"]["PreToolUse"].as_array().unwrap();
-    assert_eq!(groups.len(), 2);
-    assert!(groups.iter().any(|group| group["matcher"] == "Edit|Write|MultiEdit|Bash"));
-    for event in ["SessionStart", "PostToolUse", "Stop", "Notification"] {
-        let groups = settings["hooks"][event].as_array().unwrap();
-        assert_eq!(groups.len(), 1, "Relay installed {event} reporting");
-        assert!(groups[0]["hooks"][0]["command"].as_str().unwrap().contains("hook claude-report"));
-    }
+    installed();
     let mcp: Value = serde_json::from_str(&std::fs::read_to_string(worktree.join(".relay/relay.mcp.json")).unwrap()).unwrap();
     assert_eq!(mcp["mcpServers"]["relay"]["args"], json!(["--instance","test","mcp"]));
 

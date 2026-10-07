@@ -116,12 +116,45 @@ fn notifications_settings_dashboard_usage_and_resources() {
         .into_result()
         .unwrap();
     assert_eq!(resources["panes"][0]["session"], name);
+}
+
+/// The watch loop is a tokio task, so this needs a runtime: on a plain #[test] thread
+/// `app.resources.watch` answers Ok and never starts sampling. Client counting and the epoch
+/// are covered in socket.rs; this is the loop itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resource_watch_samples_while_on_and_stops_when_off() {
+    use std::time::Duration;
+    use tokio::sync::broadcast::error::RecvError;
+    use tokio::time::{timeout_at, Instant};
+    let engine = engine();
+    let _workspace = project(&engine);
+    let mut events = engine.subscribe();
     call(&engine, "app.resources.watch", json!({"on":true}))
         .into_result()
         .unwrap();
+    // One tick every 2 s.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let sample = loop {
+        match timeout_at(deadline, events.recv()).await.expect("no resource.sample while watching") {
+            Ok(event) if event.ev == "resource.sample" => break event.payload,
+            Ok(_) | Err(RecvError::Lagged(_)) => {}
+            Err(RecvError::Closed) => panic!("event bus closed"),
+        }
+    };
+    assert!(sample["panes"].is_array(), "{sample}");
     call(&engine, "app.resources.watch", json!({"on":false}))
         .into_result()
         .unwrap();
+    // A tick that read the store just before the switch may still land; let it, then expect
+    // silence for two whole periods.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    while events.try_recv().is_ok() {}
+    let quiet = Instant::now() + Duration::from_secs(4);
+    while let Ok(event) = timeout_at(quiet, events.recv()).await {
+        if let Ok(event) = event {
+            assert_ne!(event.ev, "resource.sample", "sampling continued after the watch was turned off");
+        }
+    }
 }
 
 #[test]

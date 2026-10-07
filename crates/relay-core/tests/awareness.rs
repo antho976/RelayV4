@@ -74,7 +74,7 @@ impl Fixture {
             )?;
             tx.execute(
                 "INSERT INTO tasks(project_id,module_id,title,body,changelog,col,state,position,created_at,updated_at)
-                 VALUES (1,1,'Build awareness','Implement Phase 5','Phase 4 complete','active','working',0,?1,?1)",
+                 VALUES (1,1,'Build awareness','Implement Phase 5','Phase 4 complete','active','dispatched',0,?1,?1)",
                 ["2026-08-17T00:00:00Z"],
             )?;
             tx.execute(
@@ -157,14 +157,13 @@ fn notes_mailbox_and_brief_are_persistent_and_scoped() {
         json!({"project_id":1,"to":"*","text":"Project context changed"}),
     );
     let message_id = broadcast["message"]["id"].as_i64().unwrap();
-    // A send now says where it went, not just that it was stored (F10).
-    assert!(
-        ["queued", "session_parked", "not_running"].contains(&broadcast["delivery"].as_str().unwrap()),
-        "delivery names where the message stands: {}", broadcast["delivery"],
-    );
-    let addressed: Vec<&str> = broadcast["recipients"].as_array().unwrap().iter()
-        .map(|r| r["session"].as_str().unwrap()).collect();
+    // A send now says where it went, not just that it was stored (F10). Neither fixture
+    // session was ever spawned, so nobody will read it until one is started.
+    assert_eq!(broadcast["delivery"], "not_running", "delivery names where the message stands");
+    let recipients = broadcast["recipients"].as_array().unwrap();
+    let addressed: Vec<&str> = recipients.iter().map(|r| r["session"].as_str().unwrap()).collect();
     assert_eq!(addressed.len(), 2, "broadcast names every addressee: {addressed:?}");
+    assert!(recipients.iter().all(|r| r["state"] == "created"), "{recipients:?}");
     let a_mail = ok(
         e,
         Actor::agent(f.a_name()),

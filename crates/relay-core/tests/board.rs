@@ -570,14 +570,33 @@ fn dispatch_fans_out_to_sub_tasks() {
     assert_eq!(mine.as_array().unwrap().len(), 2);
 }
 
+/// Rows written before v16 are typed `task`, parentless, unlabelled and unrelated; the
+/// migration must not invent a classification for them (D139). The row is written by a v15
+/// store and read back through the bus after the current build has migrated it.
 #[test]
-fn existing_tasks_keep_neutral_board_defaults() {
-    let f = Fixture::new();
-    let e = &f.engine;
-    // Rows written before v16 are typed `task`, parentless, unlabelled and unrelated; the
-    // migration must not invent a classification for them.
-    let task = f.task("Written before the redesign", json!({}));
-    let reread = ok(e, "task.get", json!({"task_id":task["id"]}));
+fn tasks_from_before_v16_keep_neutral_board_defaults() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("store.db");
+    {
+        let c = rusqlite::Connection::open(&path).unwrap();
+        c.pragma_update(None, "foreign_keys", "ON").unwrap();
+        for m in &relay_core::store::MIGRATIONS[..15] {
+            c.execute_batch(m).unwrap();
+        }
+        c.pragma_update(None, "user_version", 15).unwrap();
+        c.execute_batch(
+            "INSERT INTO workspaces(path,name,created_at,updated_at) VALUES ('/ws','ws','then','then');
+             INSERT INTO projects(workspace_id,path,name,created_at,updated_at) VALUES (1,'/ws/app','app','then','then');
+             INSERT INTO tasks(project_id,title,col,state,position,created_at,updated_at)
+               VALUES (1,'Written before the redesign','ready','dispatched',0,'then','then');",
+        )
+        .unwrap();
+    }
+    let e = Engine::new(Instance::Test, Store::open(&path, false).unwrap());
+    let reread = ok(&e, "task.get", json!({"task_id":1}));
+    assert_eq!(reread["title"], "Written before the redesign");
+    assert_eq!(reread["column"], "ready");
+    assert_eq!(reread["state"], "dispatched");
     assert_eq!(reread["type"], "task");
     assert!(reread["parent_id"].is_null());
     assert_eq!(reread["depth"], 0);
@@ -589,7 +608,7 @@ fn existing_tasks_keep_neutral_board_defaults() {
 }
 
 #[test]
-fn task_activity_is_exactly_scoped_paginated_and_read_only_for_agents() {
+fn task_activity_is_exactly_scoped_paginated_and_user_only() {
     let f = Fixture::new();
     let e = &f.engine;
     let first = f.task("First task", json!({}));
@@ -672,8 +691,9 @@ fn task_activity_is_exactly_scoped_paginated_and_read_only_for_agents() {
         "task.activity",
         json!({"task_id":first["id"]}),
     );
-    assert!(
-        response.error.is_some(),
+    assert_eq!(
+        code(response),
+        "actor.allowlist",
         "agent cannot read user-wide task conversations"
     );
 }

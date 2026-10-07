@@ -107,7 +107,9 @@ fn a_merged_branch_goes_and_an_unmerged_one_stays_with_its_reason() {
     git(&f.repo, &["merge", "--no-verify", "-q", "--no-ff", "-m", "merge", &merged.branch]);
     ok(&f.engine, "session.close", json!({"session": merged.name}));
     ok(&f.engine, "session.close", json!({"session": open.name}));
-    assert!(has_ref(&f.repo, &format!("refs/heads/{}", merged.branch)), "close alone keeps the branch for cleanup to judge");
+    // In production session.close starts this same cleanup on a background thread at once;
+    // the test instance skips that so `cleanup` below can drive it synchronously.
+    assert!(has_ref(&f.repo, &format!("refs/heads/{}", merged.branch)), "the test instance defers after-close cleanup to the explicit run");
 
     let row = cleanup(&f, &merged.branch, None);
     assert_eq!(row.outcome, "deleted", "{row:?}");
