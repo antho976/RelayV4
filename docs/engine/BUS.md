@@ -508,8 +508,12 @@ callers of it wherever the provider lets us:
 - **`guardrail.gate`** (mutation · agent · session) — `{session, kind: "write" | "commit" |
   "exec", path?, new_text?, diff?, command?}` → `{verdict: "allow" | "refuse" | "hold",
   error?: BusError}`. Unlike `guardrail.check` (a pure dry run) it may **create a hold** and it
-  is audited. It is what a hook calls; the hook blocks the tool while the verdict is `hold`
-  and fails it while `refuse`.
+  is audited. It is what a hook calls; the hook fails the tool on `hold` as on `refuse`. A
+  person who confirms the hold (`guardrail.confirm`) leaves a single-use pass for that exact
+  action — same policy, kind, path, text, diff and command — so the agent's identical retry,
+  or the person's own re-run commit, goes through once; anything different is gated afresh.
+  An agent held on `destructive_write` is also told it may ask for the path
+  (`guardrail.request`).
 - **Claude Code**: at `session.spawn` Relay merges a per-worktree
   `.claude/settings.local.json` (or the equivalent the CLI version accepts — `provider.list`
   reports the spawn profile). Phase 4 installs `PreToolUse` on

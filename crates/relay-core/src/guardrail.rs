@@ -1066,7 +1066,12 @@ fn refuse_or_user_hold(
             json!({"policy": policy, "original_code": code, "original": details}),
         )
     } else if matches!(policy, "destructive_write" | "shape_gate") {
-        hold(policy, code, message, details)
+        // Held for a person; for a destructive write the agent may also ask for the path.
+        let mut error = BusError::held(code, message).with_details(details.clone());
+        if let Some((kind, value)) = grants::suggestion(policy, &details) {
+            error = error.with_hint(grants::hint(kind, &value));
+        }
+        Decision::Hold { policy: policy.to_string(), error, details }
     } else {
         let mut error = BusError::refused(code, message);
         let mut details = details;

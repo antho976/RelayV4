@@ -524,6 +524,21 @@ fn gate(ctx: &mut Ctx, payload: GateIn, skip_policy: Option<&str>) -> Result<Gat
         },
         Some(session.session.id),
     )?;
+    // A person already confirmed exactly this action: judge it again without the policy they
+    // waived, and spend their pass only if it then goes through.
+    if let (None, Decision::Hold { policy, details, .. }) = (skip_policy, &decision) {
+        if let Some(pass) = find_pass(ctx, session.session.id, policy, &payload, details)? {
+            let policy = policy.clone();
+            let out = gate(ctx, payload, Some(&policy));
+            if out.is_ok() {
+                ctx.tx().execute(
+                    "UPDATE holds SET details = json_set(details, '$.pass.used_at', ?1) WHERE id = ?2",
+                    params![ctx.now, pass],
+                ).bus()?;
+            }
+            return out;
+        }
+    }
     match decision {
         Decision::Allow => {
             // A command that writes to an Android device takes this session's device lease, or
@@ -616,6 +631,10 @@ fn confirm(ctx: &mut Ctx, payload: ConfirmIn) -> Result<ConfirmOut, BusError> {
         },
     )?;
 
+    // The hook that asked has already failed the action; the agent (or the person's own
+    // commit) retries it. A confirmed hold therefore leaves a pass for exactly that action,
+    // used once by the next identical gate from the same session (`spend_pass`).
+    let allowed = matches!(decision, Decision::Allow);
     let outcome = match decision {
         Decision::Allow => Response::ok(
             ctx.req_id,
@@ -649,21 +668,51 @@ fn confirm(ctx: &mut Ctx, payload: ConfirmIn) -> Result<ConfirmOut, BusError> {
             params![ctx.now, ctx.actor.to_string(), hold.id],
         )
         .bus()?;
+    if allowed {
+        ctx.tx().execute(
+            "UPDATE holds SET details = json_set(details, '$.pass', json(?1)) WHERE id = ?2",
+            params![json!({"key": pass_key(&hold.policy, &gate_payload, &hold.details), "used_at": null}).to_string(), hold.id],
+        ).bus()?;
+    }
     let resolved = guardrail::hold_by_id(ctx.tx(), hold.id)?;
     ctx.set_project(session.session.project_id);
     ctx.set_session(session.session.id);
     ctx.audit_as(frozen.op, hold.actor.clone());
     ctx.emit("guardrail.resolved", json!({"hold_id": hold.id, "state": "confirmed", "by": ctx.actor.to_string()}));
     if let (Some(project_id), Some(session)) = (hold.project_id, hold.session.as_deref()) {
+        let text = if allowed {
+            format!("Guardrail hold {} was confirmed by {}. Retry the identical action once and it will go through; anything different is checked afresh.", hold.id, ctx.actor)
+        } else {
+            format!("Guardrail hold {} was confirmed by {}.", hold.id, ctx.actor)
+        };
         if let Some(message) = super::notes::send_system_priority(
             ctx.tx(), project_id, session,
-            &format!("Guardrail hold {} was confirmed by {}.", hold.id, ctx.actor),
+            &text,
             None, &ctx.now,
         )? {
             ctx.emit("mailbox.new", serde_json::to_value(message).bus()?);
         }
     }
     Ok(ConfirmOut { hold: resolved, outcome })
+}
+
+/// What a confirmed gate hold lets through: the same policy held for the same action — same
+/// kind, path, text, diff and command, and the same findings (for a commit, which carries none
+/// of those, the files and counts the hold named).
+fn pass_key(policy: &str, payload: &GateIn, details: &Value) -> String {
+    let material = json!([policy, payload.kind, payload.path, payload.new_text, payload.diff, payload.command, details]);
+    use sha2::Digest;
+    crate::hex(&sha2::Sha256::digest(material.to_string().as_bytes()))
+}
+
+/// The unused pass a person's confirmation left for exactly this held action, if any.
+fn find_pass(ctx: &Ctx, session_id: Id, policy: &str, payload: &GateIn, details: &Value) -> Result<Option<Id>, BusError> {
+    use rusqlite::OptionalExtension;
+    ctx.tx().prepare_cached(
+        "SELECT id FROM holds WHERE session_id = ?1 AND op = 'guardrail.gate' AND state = 'confirmed'
+         AND json_extract(details, '$.pass.key') = ?2 AND json_extract(details, '$.pass.used_at') IS NULL
+         ORDER BY id LIMIT 1",
+    ).bus()?.query_row(params![session_id, pass_key(policy, payload, details)], |r| r.get(0)).optional().bus()
 }
 
 /// Apply the phase-4 policy engine to a mutation that is itself a bus op. A hold freezes
