@@ -336,7 +336,23 @@ pub fn register(engine: &mut Engine) {
         request.token = None;
         Ok(HoldGetOut { hold, request })
     });
-    engine.register::<Confirm>(confirm);
+    // Confirming replays the held op. Its read/external phase — for a held `git.commit`, the
+    // staging, the user's pre-commit hook and the signature — runs here, before the
+    // transaction, as the op's original caller; the transaction rechecks the hold and replays.
+    engine.register_staged::<Confirm, Option<Result<crate::engine::Prepared, BusError>>>(
+        |ctx, payload| {
+            let (hold, frozen) = ctx.read(|conn| {
+                let hold = guardrail::hold_by_id(conn, payload.hold_id)?;
+                let frozen = guardrail::frozen_request(conn, hold.id)?;
+                Ok((hold, frozen))
+            })?;
+            if hold.state != HoldState::Open || frozen.op == grants::OP || frozen.op == "guardrail.gate" {
+                return Ok(None);
+            }
+            Ok(ctx.prepare_registered(&frozen.op, &frozen.payload, hold.actor.clone(), hold.session_id).transpose())
+        },
+        |ctx: &mut Ctx, payload, prepared| confirm(ctx, payload, prepared),
+    );
     engine.register::<Reject>(reject);
     engine.register::<ExceptionRequest>(request);
     engine.register::<ExceptionGet>(|ctx, payload| grants::by_id(ctx.tx(), payload.request_id));
@@ -582,7 +598,7 @@ fn gate(ctx: &mut Ctx, payload: GateIn, skip_policy: Option<&str>) -> Result<Gat
     }
 }
 
-fn confirm(ctx: &mut Ctx, payload: ConfirmIn) -> Result<ConfirmOut, BusError> {
+fn confirm(ctx: &mut Ctx, payload: ConfirmIn, prepared: Option<Result<crate::engine::Prepared, BusError>>) -> Result<ConfirmOut, BusError> {
     let hold = guardrail::hold_by_id(ctx.tx(), payload.hold_id)?;
     if hold.state != HoldState::Open {
         return Err(BusError::conflict(
@@ -595,7 +611,14 @@ fn confirm(ctx: &mut Ctx, payload: ConfirmIn) -> Result<ConfirmOut, BusError> {
         return approve(ctx, hold, payload.scope);
     }
     if frozen.op != "guardrail.gate" {
-        let outcome = match ctx.replay_registered(&frozen.op, frozen.payload.clone(), hold.actor.clone(), hold.session_id, hold.policy.clone()) {
+        let replayed = match prepared {
+            Some(Err(error)) => Err(error),
+            prepared => ctx.replay_prepared(
+                &frozen.op, frozen.payload.clone(), hold.actor.clone(), hold.session_id, hold.policy.clone(),
+                prepared.and_then(Result::ok),
+            ),
+        };
+        let outcome = match replayed {
             Ok(value) => Response::ok(ctx.req_id, value),
             Err(error) => Response::err(ctx.req_id, error),
         };

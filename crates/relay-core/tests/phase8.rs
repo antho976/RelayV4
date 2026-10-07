@@ -567,9 +567,20 @@ fn a_held_commit_still_commits_when_confirmed() {
         .as_i64()
         .unwrap();
 
-    let confirmed = call(&e, "guardrail.confirm", json!({"hold_id": hold_id}))
-        .into_result()
-        .unwrap();
+    // The replay's slow half — here a pre-commit hook that takes a second — runs before the
+    // confirm takes the store, so the rest of the bus keeps moving meanwhile.
+    let hook = root.join(".git/hooks/pre-commit");
+    std::fs::write(&hook, "#!/bin/sh\nsleep 1\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let confirming = {
+        let e = e.clone();
+        std::thread::spawn(move || call(&e, "guardrail.confirm", json!({"hold_id": hold_id})))
+    };
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let started = std::time::Instant::now();
+    call(&e, "settings.set", json!({"path":"appearance.panel_alpha","value":0.9})).into_result().unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_millis(500), "a write waited {:?} behind the confirm", started.elapsed());
+    let confirmed = confirming.join().unwrap().into_result().unwrap();
     assert_eq!(confirmed["hold"]["state"], "confirmed");
     assert_eq!(confirmed["outcome"]["ok"], true);
     let sha = confirmed["outcome"]["result"]["sha"].as_str().unwrap();

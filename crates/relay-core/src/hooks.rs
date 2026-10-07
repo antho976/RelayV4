@@ -190,6 +190,9 @@ pub fn refresh_git(repo: &Path, worktree: &Path, instance: Instance, relay: &Pat
 /// Run the user-owned pre-commit hook without re-entering Relay's generated guardrail hook.
 /// `git.commit` already executes the guardrail in-process while its transaction is open; letting
 /// the generated hook call the socket door here would wait on that same transaction forever.
+/// A person's own pre-commit hook (lint, tests) may be slow, but not unbounded.
+const USER_HOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 pub fn run_user_pre_commit(repo: &Path, worktree: &Path) -> Result<()> {
     let configured = git_optional(
         worktree,
@@ -210,10 +213,11 @@ pub fn run_user_pre_commit(repo: &Path, worktree: &Path) -> Result<()> {
     };
     let hook = user_dir.join("pre-commit");
     if !is_executable(&hook) { return Ok(()) }
-    let output = Command::new(&hook)
-        .current_dir(worktree)
-        .output()
-        .with_context(|| format!("running {}", hook.display()))?;
+    let mut command = Command::new(&hook);
+    command.current_dir(worktree);
+    let output = crate::proc::output_with_timeout(&mut command, USER_HOOK_TIMEOUT)
+        .with_context(|| format!("running {}", hook.display()))?
+        .ok_or_else(|| anyhow!("{} did not finish within {} s", hook.display(), USER_HOOK_TIMEOUT.as_secs()))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);

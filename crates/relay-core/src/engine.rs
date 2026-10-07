@@ -157,9 +157,48 @@ pub struct Unlocked<'a> {
     deferred: Vec<Box<dyn FnOnce(Arc<Engine>) + Send + 'static>>,
 }
 
+/// A staged op's read/external phase, already run, waiting for its transaction: what
+/// [`Unlocked::prepare_registered`] hands to [`Ctx::replay_prepared`].
+pub(crate) struct Prepared {
+    op: &'static str,
+    staged: Box<dyn Any + Send>,
+    events: Vec<Event>,
+    deferred: Vec<Box<dyn FnOnce(Arc<Engine>) + Send + 'static>>,
+}
+
 impl Unlocked<'_> {
     pub fn engine(&self) -> &Engine {
         self.engine
+    }
+    /// Run `op`'s prepare phase now, unlocked, as `actor` and `session_id` — so a replay
+    /// (`guardrail.confirm` of a held `git.commit`) does its slow work before the transaction
+    /// opens instead of inside it. `Ok(None)` when `op` has no prepare phase.
+    pub(crate) fn prepare_registered(
+        &self,
+        op: &str,
+        payload: &Value,
+        actor: Actor,
+        session_id: Option<Id>,
+    ) -> Result<Option<Prepared>, BusError> {
+        let entry = Registry::global().get(op).ok_or_else(|| BusError::unknown_op(op))?;
+        (entry.validate)(payload).map_err(|e| BusError::schema(entry.name, e))?;
+        let Some(prepare) = self.engine.prepares.get(entry.name).cloned() else {
+            return Ok(None);
+        };
+        let mut stage = Unlocked {
+            engine: self.engine,
+            held: self.held,
+            actor,
+            req_id: self.req_id,
+            now: self.now.clone(),
+            op: entry.name,
+            session_id,
+            project_id: None,
+            events: Vec::new(),
+            deferred: Vec::new(),
+        };
+        let staged = prepare(&mut stage, payload)?;
+        Ok(Some(Prepared { op: entry.name, staged, events: stage.events, deferred: stage.deferred }))
     }
     pub fn instance(&self) -> Instance {
         self.engine.instance
@@ -311,6 +350,15 @@ impl<'a> Ctx<'a> {
         op: &str,
         payload: Value,
     ) -> Result<Value, BusError> {
+        self.invoke_with(op, payload, None)
+    }
+
+    fn invoke_with(
+        &mut self,
+        op: &str,
+        payload: Value,
+        prepared: Option<Prepared>,
+    ) -> Result<Value, BusError> {
         let entry = Registry::global()
             .get(op)
             .ok_or_else(|| BusError::unknown_op(op))?;
@@ -322,13 +370,22 @@ impl<'a> Ctx<'a> {
             .ok_or_else(|| BusError::not_implemented(entry.name, entry.meta.phase))?
             .call
             .clone();
-        // A staged op reached this way — `guardrail.confirm` replaying a held `git.commit`, or
-        // `project.remove {force}` closing its sessions — has no read/external phase behind it,
-        // so run it here, against the transaction already open: everything its prepare does
-        // then holds the store. Keep slow staged ops off this path; `task.dispatch` creates and
-        // launches its sessions as requests of their own for exactly that reason.
-        let staged = match self.engine.prepares.get(entry.name).cloned() {
-            Some(prepare) => {
+        // A staged op reached this way with nothing prepared — `project.remove {force}` closing
+        // its sessions — has no read/external phase behind it, so run it here, against the
+        // transaction already open: everything its prepare does then holds the store. Keep slow
+        // staged ops off this path: `guardrail.confirm` prepares its replay before it opens
+        // (`Unlocked::prepare_registered`), and `task.dispatch` creates and launches its
+        // sessions as requests of their own.
+        let staged = match (prepared, self.engine.prepares.get(entry.name).cloned()) {
+            (Some(prepared), _) if prepared.op == entry.name => {
+                self.events.extend(prepared.events);
+                self.after_commit.extend(prepared.deferred);
+                Some(prepared.staged)
+            }
+            (Some(prepared), _) => {
+                return Err(BusError::internal(format!("{} was prepared for {}", entry.name, prepared.op)));
+            }
+            (None, Some(prepare)) => {
                 let mut stage = Unlocked {
                     engine: self.engine,
                     held: Some(self.tx),
@@ -349,7 +406,7 @@ impl<'a> Ctx<'a> {
                 self.after_commit.extend(deferred);
                 Some(out)
             }
-            None => None,
+            (None, None) => None,
         };
         let prior = self.op;
         let prior_payload =
@@ -363,21 +420,24 @@ impl<'a> Ctx<'a> {
         result
     }
 
-    pub(crate) fn replay_registered(
+    /// Replay a held op as its original caller (`guardrail.confirm`), with the op's prepare
+    /// phase already run, unlocked, by [`Unlocked::prepare_registered`]; `None` runs it here,
+    /// inside this transaction. The session goes with the actor: a held agent `file.write`
+    /// resolves its worktree, grants and any nested hold from it, and the confirmer's (none,
+    /// for the user) would land it in the primary checkout.
+    pub(crate) fn replay_prepared(
         &mut self,
         op: &str,
         payload: Value,
         actor: Actor,
         session_id: Option<Id>,
         skip_policy: String,
+        prepared: Option<Prepared>,
     ) -> Result<Value, BusError> {
-        // The replay runs as the op's original caller, session included: a held agent
-        // `file.write` resolves its worktree, grants and any nested hold from the session, and
-        // the confirmer's (none, for the user) would land it in the primary checkout.
         let prior_actor = std::mem::replace(&mut self.actor, actor);
         let prior_session = std::mem::replace(&mut self.session_id, session_id);
         let prior_policy = self.skip_policy.replace(skip_policy);
-        let result = self.invoke_registered(op, payload);
+        let result = self.invoke_with(op, payload, prepared);
         self.actor = prior_actor;
         self.session_id = prior_session;
         self.skip_policy = prior_policy;
