@@ -65,6 +65,9 @@ pub fn register(e: &mut Engine) {
                 taken_at,
             });
         }
+        // What a provider left behind wins over a report, whatever their ages. A test engine
+        // never reads the developer's own provider state; `tests/usage_source.rs` drives this
+        // path on a dev instance with the provider homes in a temp dir.
         if ctx.engine().instance != crate::Instance::Test {
             for provider in [
                 relay_bus::types::Provider::Claude,

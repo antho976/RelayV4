@@ -600,9 +600,11 @@ callers of it wherever the provider lets us:
   like, inside `sh -c` too — with an overwrite or delete carrying the line count it removes.
   Targets built from variables or globs, and files a program opens by itself, are not seen
   (D163). Phase 5 extends the
-  same local file with `SessionStart`/`PostToolUse`/`Stop`/`Notification` hooks and a
-  `statusLine` command that call `session.report` / `usage.report` (§10.8). This is v3's
-  `agenthooks.rs`, now a bus client instead of bespoke files.
+  same local file with `SessionStart`/`PostToolUse`/`Stop`/`Notification` hooks that call
+  `session.report` (§10.8), and a `statusLine` command that writes Claude's rate-limit payload
+  to `${CLAUDE_CONFIG_DIR:-$HOME}/.claude/relay-usage.json` for `usage.get` to read (D64); it
+  calls nothing on the bus. This is v3's `agenthooks.rs`, now a bus client instead of bespoke
+  files.
 - **git**: every Relay-created worktree gets a `pre-commit` hook calling `relay cmd
   guardrail.gate '{"kind":"commit"}'`; the hook exits non-zero on `refuse`/`hold`. This binds
   both providers' commits, and yours.
@@ -982,8 +984,8 @@ All paths are relative to the worktree root; `..` and absolute paths are `invali
 |---|---|---|
 | `provider.list` | query | `{}` → `{ providers: ProviderInfo[] }` — installed, path, version, auth (`signed_in_as?`), spawn profile |
 | `provider.refresh` | mutation · never | `{}` → `{ providers: ProviderInfo[] }` — re-detect now |
-| `usage.get` | query | `{ provider?: Provider }` → `{ usage: Usage[] }` — per provider, in its own units and windows; combines stored agent reports with bounded read-only CLI state inspection and never calls a provider endpoint |
-| `usage.report` | mutation · never · session · agent | `{ session, provider, payload: object }` → `{}` — the provider's own metering pushed by its statusLine/hook (v3's `statusline.rs`); core stores the latest per session and derives `usage.get` |
+| `usage.get` | query | `{ provider?: Provider }` → `{ usage: Usage[] }` — per provider, in its own units and windows; combines stored agent reports with bounded read-only CLI state inspection and never calls a provider endpoint. Where a provider left state to read (the Claude status-line file, Codex's newest rollout), it wins over a stored report whatever their ages |
+| `usage.report` | mutation · never · session · agent | `{ session, provider, payload: object }` → `{}` — metering an agent reports for its own session; core stores the latest per session as `usage.get`'s fallback. No hook sends it: the Claude status line writes a file instead (D64) |
 | `skill.list` | query | `{ project_id?, enabled?, summary? }` → `{ skills: Skill[] }`; with `summary: true` each `body` is cut to its first 4 KiB (the frontmatter and opening), so a large library fits one reply |
 | `skill.get` | query | `{ skill_id }` → `Skill` with its whole body; `skill.not_found` |
 | `skill.create` / `skill.update` / `skill.delete` | mutation · always · inverse | `{ name, body }` / `{ skill_id, name?, body? }` / `{ skill_id }`; a skill nobody has enabled anywhere is enabled in every project on create/install (D147) |

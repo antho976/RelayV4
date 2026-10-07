@@ -3717,7 +3717,7 @@
       }
     },
     "usage.report": {
-      "summary": "Provider metering pushed by its statusLine/hook",
+      "summary": "Provider metering an agent reports for its own session",
       "kind": "mutation",
       "audit": "never",
       "undo": "none",

@@ -13,9 +13,10 @@ use uuid::Uuid;
 /// Payloads and results larger than this are hashed but not stored (BUS.md §11.4).
 pub const STORE_LIMIT: usize = 64 * 1024;
 
-/// The provider hooks call `session.report` on every tool use, and `usage.report` on every
-/// window refresh. Their payloads are high-volume and near-identical, and 64 KB of each is what
-/// grew the audit table past the rest of the store put together. The hash still identifies the
+/// The provider hooks call `session.report` on every tool use, and an agent may send
+/// `usage.report` as often as it likes (no hook sends it: the Claude status line writes a file
+/// `usage.get` reads instead). Their payloads are high-volume and near-identical, and 64 KB of
+/// each is what grew the audit table past the rest of the store put together. The hash still identifies the
 /// request and the result summary still replays it; only the readable copy is bounded.
 /// `guardrail.gate` is the hottest of all — the write hook sends it before every agent edit, with
 /// the edit's full new text — and its hold, when there is one, keeps its own frozen envelope.
