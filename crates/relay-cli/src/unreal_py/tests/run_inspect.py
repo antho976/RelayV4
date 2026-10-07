@@ -50,18 +50,56 @@ check(not any(p["kind"] == "grip" for p in wrong["problems"]), "grip at the hand
 # Turned 180 degrees about yaw, the blade points away from the body and nothing clips.
 right = inspect({"mesh": "/Game/Manny", "attachments": [dict(sword, rotation=[0, 180, 0])]})
 check(not any(p["kind"] == "clipping" for p in right["problems"]), "a correctly rotated item passes: %s" % right["problems"])
-check(right["attachments"]["sword"]["end_b_at_start"][1] > right["attachments"]["sword"]["fwd_right_up"][1] - 1, "item extends outward")
+check(right["attachments"]["sword"]["end_a_at_start"][1] > right["attachments"]["sword"]["fwd_right_up"][1] + 50, "item extends outward")
+check(wrong["attachments"]["sword"]["end_a_at_start"][1] < wrong["attachments"]["sword"]["fwd_right_up"][1] - 50, "the wrong way round points inward")
 
 # Moving the grip away from the hand fails the grip check.
 off = inspect({"mesh": "/Game/Manny", "attachments": [dict(sword, location=[0, 0, 12])]})
 check(any(p["kind"] == "grip" for p in off["problems"]), "a grip 12 cm off the hand is reported")
 
 # Contacts across an animation: the right hand swings across; hands must stay apart.
-swing = inspect({"mesh": "/Game/Manny", "animation": "/Game/Swing", "samples": 5,
-                 "contacts": [{"a": "hand_r", "b": "hand_l", "expect": "apart", "distance": 10}],
-                 "track": ["hand_r"]})
+swing_args = {"mesh": "/Game/Manny", "animation": "/Game/Swing", "samples": 5,
+              "contacts": [{"a": "hand_r", "b": "hand_l", "expect": "apart", "distance": 10}],
+              "track": ["hand_r"]}
+swing = inspect(swing_args)
 sides = [r["points"]["hand_r"]["side"] for r in swing["samples"]]
 check(sides[0] == "right" and sides[-1] == "left", "the swing crosses the body: %s" % sides)
+check(swing["passed"], "a fully posed animation has no sampling problem: %s" % swing["problems"])
+
+# The same numbers on an engine without AnimPoseExtensions (one call per bone).
+pose_ext = unreal.AnimPoseExtensions
+del unreal.AnimPoseExtensions
+per_bone = inspect(swing_args)
+unreal.AnimPoseExtensions = pose_ext
+check(per_bone["samples"] == swing["samples"], "the per-bone fallback poses the same: %s" % per_bone["samples"])
+
+# A bone the animation cannot pose stays at the reference pose, and the report says so.
+real_pose = unreal.AnimationLibrary.get_bone_pose_for_time
+def failing(anim, bone, t, rm):
+    if bone == "hand_l":
+        raise TypeError("cannot pose")
+    return real_pose(anim, bone, t, rm)
+unreal.AnimationLibrary.get_bone_pose_for_time = staticmethod(failing)
+unposed = inspect({"mesh": "/Game/Manny", "animation": "/Game/Swing", "samples": 3})
+unreal.AnimationLibrary.get_bone_pose_for_time = staticmethod(real_pose)
+check(any(p["kind"] == "sampling" and "hand_l" in p["detail"] for p in unposed["problems"]), "unposed bones are reported: %s" % unposed["problems"])
+
+# Only an animation sequence or montage can be sampled; a Blend Space is refused, not measured at rest.
+class _Class(object):
+    def get_name(s): return "BlendSpace"
+class BlendSpace(object):
+    def get_class(s): return _Class()
+unreal.ASSETS["/Game/Blend"] = BlendSpace()
+try:
+    inspect({"mesh": "/Game/Manny", "animation": "/Game/Blend"})
+    check(False, "a Blend Space is refused")
+except RuntimeError as error:
+    check("BlendSpace" in str(error), "the refusal names the class: %s" % error)
+try:
+    inspect({"mesh": "/Game/Manny", "animation": "/Game/Swing", "times": [0.0] * 61})
+    check(False, "more than 60 times are refused")
+except RuntimeError as error:
+    check("at most 60" in str(error), "the refusal names the cap: %s" % error)
 
 # A partner standing where the right hand ends up is hit by it.
 partner = inspect({"mesh": "/Game/Manny", "animation": "/Game/Swing", "samples": 5,
@@ -119,6 +157,15 @@ unreal.BONES[:] = dashed
 named = inspect({"mesh": "/Game/Manny"})
 unreal.BONES[:] = real_bones
 check(named["frame"]["left_right_pairs_found"] == 6 and named["frame"]["right_axis_in_mesh_space"] == [-1.0, 0.0, 0.0], "-L/-R pairs: %s" % named["frame"])
+
+# Without any left/right names the mesh is assumed to face +Y, as a Blender export arrives, and
+# the report says the axes are assumed.
+unsided = [(n.replace("_l", "_a").replace("_r", "_b"), p and p.replace("_l", "_a").replace("_r", "_b"), loc) for n, p, loc in real_bones]
+unreal.BONES[:] = unsided
+guessed = inspect({"mesh": "/Game/Manny"})
+unreal.BONES[:] = real_bones
+check(guessed["frame"]["left_right_pairs_found"] == 0 and guessed["frame"]["forward_axis_in_mesh_space"] == [0.0, 1.0, 0.0]
+      and "assumed" in guessed["frame"]["note"], "no pairs: +Y forward, flagged: %s" % guessed["frame"])
 
 # A socket from a Blender empty: its 100x scale is divided back once, and only once.
 helpers = {"ARGS_JSON": "{}"}

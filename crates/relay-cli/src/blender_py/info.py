@@ -27,7 +27,7 @@ for o in scene.objects:
                          "uv_maps": [uv.name for uv in me.uv_layers], "vertex_groups": len(o.vertex_groups),
                          "materials": [m.name if m else None for m in me.materials],
                          "shape_keys": [k.name for k in me.shape_keys.key_blocks] if me.shape_keys else []}
-        if o.name.startswith("UCX_") or o.name.startswith("UBX_") or o.name.startswith("USP_"):
+        if o.name.startswith(COLLISION_PREFIXES):
             entry["unreal_role"] = "collision"
     if o.type == "EMPTY" and o.name.startswith("SOCKET_"):
         entry["unreal_role"] = "socket"

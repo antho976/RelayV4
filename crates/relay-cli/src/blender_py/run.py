@@ -43,7 +43,10 @@ class TailBuffer(io.TextIOBase):
         return head + "".join(self.parts)
 
 
-scope = {"bpy": bpy, "ARGS": ARGS, "Vector": Vector, "Matrix": Matrix, "math": math, "emit": emit}
+# __name__ so a script's `if __name__ == "__main__":` block runs. The result must be an object
+# (the server adds output and saved to it), so emit(3) or emit([...]) arrives as {"value": ...}.
+scope = {"__name__": "__main__", "bpy": bpy, "ARGS": ARGS, "Vector": Vector, "Matrix": Matrix, "math": math,
+         "emit": lambda value: emit(value if isinstance(value, dict) else {"value": value})}
 print("RELAY_OUT_BEGIN", flush=True)
 captured = TailBuffer()
 sys.stdout = sys.stderr = captured

@@ -7,6 +7,8 @@ ARGS = json.load(open(sys.argv[sys.argv.index("--") + 1]))
 scene = bpy.context.scene
 # Scene units: metres per Blender unit. Every length the tools report is in centimetres, like Unreal.
 TO_CM = 100.0 * (scene.unit_settings.scale_length or 1.0)
+# Unreal's collision prefixes: convex hull, box, sphere, capsule. Exported, never rendered.
+COLLISION_PREFIXES = ("UCX_", "UBX_", "USP_", "UCP_")
 
 
 def emit(value):

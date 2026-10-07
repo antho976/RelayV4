@@ -87,8 +87,9 @@ DIRS = {"front": forward, "back": -forward, "right": right, "left": -right, "top
         "three_quarter": (forward + right + up * 0.5).normalized(), "three_quarter_left": (forward - right + up * 0.5).normalized()}
 
 frames = [int(f) for f in ARGS.get("frames") or [scene.frame_current]]
+MAX_FRAMES = 12
 files = []
-for f in frames[:12]:
+for f in frames[:MAX_FRAMES]:
     scene.frame_set(f)
     lo, hi = world_bbox(meshes)
     center = (lo + hi) / 2
@@ -112,4 +113,5 @@ for f in frames[:12]:
 
 emit({"files": files, "engine": engine, "objects": [o.name for o in framed],
       "armature": arm.name if arm is not None else None, "action": action_used(arm)["action"], "action_slot": action_used(arm)["slot"],
-      "facing": {"forward": rnd(forward, 3), "right": rnd(right, 3)}})
+      "facing": {"forward": rnd(forward, 3), "right": rnd(right, 3)},
+      "frames_skipped": frames[MAX_FRAMES:]})

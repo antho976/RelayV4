@@ -143,7 +143,7 @@ for name, it in items.items():
     o = it["object"]
     attach[name] = {"object": o.name, "held_by": it["holder"], "side": side(frame, o.matrix_world.translation),
                     "fwd_right_up": rnd(to_body(frame, o.matrix_world.translation)), "long_axis": it["points"]["_axis"],
-                    "length_cm": round(it["points"]["_length"] * TO_CM * max(o.scale), 1),
+                    "length_cm": round((o.matrix_world @ it["points"]["end_a"] - o.matrix_world @ it["points"]["end_b"]).length * TO_CM, 1),
                     "end_a_at_start": rnd(to_body(frame, o.matrix_world @ it["points"]["end_a"])),
                     "end_b_at_start": rnd(to_body(frame, o.matrix_world @ it["points"]["end_b"]))}
     if it["holder"] is None:
