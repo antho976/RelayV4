@@ -1,0 +1,487 @@
+<title>RelayV4 Code Audit</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: a reading column under a sticky section bar; findings open in a side panel so the reader never loses their place. */
+:root {
+  --bg: #f6f7f9; --surface: #ffffff; --sunk: #eceff3; --fg: #18202b; --muted: #5a6574; --line: #d9dee5;
+  --accent: #0b6b70; --accent-soft: #d7ecec;
+  --high: #c2410c; --high-soft: #fde8dc; --med: #a16207; --med-soft: #fbf0cf; --low: #526071; --low-soft: #e7ebf0;
+  --f-display: "Bricolage Grotesque", "Segoe UI", system-ui, sans-serif;
+  --f-body: "Atkinson Hyperlegible", "Segoe UI", system-ui, sans-serif;
+  --f-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --shadow: 0 10px 40px rgb(15 23 42 / .18);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #12161c; --surface: #1a2028; --sunk: #222a34; --fg: #e6eaf0; --muted: #9aa6b5; --line: #2e3844;
+    --accent: #5cc5c9; --accent-soft: #173c3f;
+    --high: #ff9a6b; --high-soft: #4a2414; --med: #f2c25a; --med-soft: #3d3112; --low: #a9b5c4; --low-soft: #29323d;
+    --shadow: 0 10px 40px rgb(0 0 0 / .5); color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #12161c; --surface: #1a2028; --sunk: #222a34; --fg: #e6eaf0; --muted: #9aa6b5; --line: #2e3844;
+  --accent: #5cc5c9; --accent-soft: #173c3f;
+  --high: #ff9a6b; --high-soft: #4a2414; --med: #f2c25a; --med-soft: #3d3112; --low: #a9b5c4; --low-soft: #29323d;
+  --shadow: 0 10px 40px rgb(0 0 0 / .5); color-scheme: dark;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { background: var(--bg); color: var(--fg); font: 16px/1.6 var(--f-body); margin: 0; }
+a { color: var(--accent); }
+code, .mono { font-family: var(--f-mono); font-size: .86em; }
+code { background: var(--sunk); padding: .05em .35em; border-radius: 4px; overflow-wrap: anywhere; }
+h1, h2, h3 { font-family: var(--f-display); text-wrap: balance; line-height: 1.2; margin: 0; }
+button { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.wrap { max-width: 1080px; margin: 0 auto; padding-inline: 16px; }
+header.top { padding-block: 32px 20px; }
+.eyebrow { font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); font-weight: 700; }
+header.top h1 { font-size: clamp(28px, 4.5vw, 42px); font-weight: 700; margin-top: 6px; }
+.facts { display: flex; flex-wrap: wrap; gap: 6px 20px; margin-top: 12px; color: var(--muted); font-size: 14px; }
+.facts b { color: var(--fg); font-weight: 700; }
+
+nav.tabs { position: sticky; top: env(safe-area-inset-top, 0px); z-index: 5; background: var(--bg); border-bottom: 1px solid var(--line); }
+nav.tabs .wrap { display: flex; gap: 4px; overflow-x: auto; }
+nav.tabs a { text-decoration: none; color: var(--muted); padding: 12px 14px; border-bottom: 3px solid transparent; font-weight: 700; white-space: nowrap; }
+nav.tabs a[aria-current="page"] { color: var(--fg); border-bottom-color: var(--accent); }
+nav.tabs a .n { font-weight: 400; font-size: 13px; color: var(--muted); margin-left: 4px; }
+
+main section { padding-block: 28px 64px; }
+.lede { font-size: 18px; max-width: 68ch; }
+.lede p { margin: 0 0 12px; }
+h2 { font-size: 24px; font-weight: 700; margin: 36px 0 6px; }
+h2 + .sub { color: var(--muted); margin: 0 0 16px; max-width: 68ch; }
+
+/* severity bar */
+.sevbar { display: flex; height: 14px; border-radius: 7px; overflow: hidden; margin: 18px 0 10px; background: var(--sunk); }
+.sevbar span { display: block; height: 100%; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 14px; color: var(--muted); }
+.legend b { color: var(--fg); font-variant-numeric: tabular-nums; }
+.dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; vertical-align: 0; }
+.bg-high { background: var(--high); } .bg-medium { background: var(--med); } .bg-low { background: var(--low); }
+
+/* fix-first */
+ol.fixes { list-style: none; padding: 0; margin: 0; display: grid; gap: 10px; counter-reset: fx; }
+ol.fixes li { counter-increment: fx; display: grid; grid-template-columns: 2.2em 1fr; gap: 0 12px; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+ol.fixes li::before { content: counter(fx); font-family: var(--f-display); font-weight: 700; font-size: 22px; color: var(--accent); line-height: 1.2; text-align: right; font-variant-numeric: tabular-nums; }
+ol.fixes .t { font-weight: 700; }
+ol.fixes .d { color: var(--muted); margin-top: 2px; }
+ol.fixes .refs, .theme .refs { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; grid-column: 2; }
+.ref { border: 1px solid var(--line); background: var(--sunk); border-radius: 6px; padding: 1px 8px; font-family: var(--f-mono); font-size: 12.5px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }
+.ref:hover { border-color: var(--accent); }
+.ref .dot { width: 8px; height: 8px; margin: 0; }
+.effort { font-family: var(--f-mono); font-size: 12px; color: var(--muted); }
+
+/* heat table */
+.tablewrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+table.heat { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; font-size: 14.5px; }
+table.heat th, table.heat td { padding: 8px 12px; text-align: right; border-bottom: 1px solid var(--line); white-space: nowrap; }
+table.heat th:first-child, table.heat td:first-child { text-align: left; }
+table.heat thead th { font-size: 12px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+table.heat tbody tr:last-child td { border-bottom: 0; }
+table.heat td.cell button { all: unset; cursor: pointer; display: inline-block; min-width: 2.6em; padding: 2px 8px; border-radius: 6px; text-align: right; }
+table.heat td.cell button:focus-visible { outline: 2px solid var(--accent); }
+table.heat td.zero { color: var(--line); }
+table.heat tfoot td { font-weight: 700; border-top: 2px solid var(--line); border-bottom: 0; }
+
+.two { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+.note { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+.note h3 { font-size: 16px; margin-bottom: 6px; }
+.note ul { margin: 0; padding-left: 18px; color: var(--muted); }
+.note li { margin: 4px 0; }
+
+/* themes */
+.themes { display: grid; gap: 14px; }
+.theme { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; }
+.theme h3 { font-size: 19px; }
+.theme .why { color: var(--muted); margin: 4px 0 10px; max-width: 72ch; }
+.theme ul.items { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; }
+.row { display: grid; grid-template-columns: auto 4.6em 1fr auto; gap: 10px; align-items: baseline; padding: 7px 8px; border-radius: 6px; cursor: pointer; width: 100%; text-align: left; background: none; border: 0; }
+.row:hover { background: var(--sunk); }
+.row .id { font-family: var(--f-mono); font-size: 12.5px; color: var(--muted); }
+.row .tt { min-width: 0; }
+.row .loc { font-family: var(--f-mono); font-size: 12px; color: var(--muted); overflow-wrap: anywhere; display: block; }
+.pill { font-size: 11.5px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; padding: 1px 8px; border-radius: 999px; text-align: center; }
+.pill.high { color: var(--high); background: var(--high-soft); }
+.pill.medium { color: var(--med); background: var(--med-soft); }
+.pill.low { color: var(--low); background: var(--low-soft); }
+
+/* findings browser */
+.browser { display: grid; grid-template-columns: 240px 1fr; gap: 24px; align-items: start; }
+.filters { position: sticky; top: calc(env(safe-area-inset-top, 0px) + 60px); display: grid; gap: 18px; max-height: calc(100vh - 80px); overflow: auto; padding-bottom: 12px; }
+.filters h4 { margin: 0 0 6px; font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+.filters label { display: flex; align-items: center; gap: 8px; font-size: 14.5px; padding: 2px 0; cursor: pointer; }
+.filters label .c { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; font-size: 13px; }
+.filters select, .search { width: 100%; font: inherit; font-size: 15px; color: var(--fg); background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+.toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 14px; }
+.toolbar .search { flex: 1 1 260px; }
+.toolbar .count { color: var(--muted); font-size: 14px; font-variant-numeric: tabular-nums; }
+.linkbtn { background: none; border: 0; color: var(--accent); cursor: pointer; padding: 0; font-weight: 700; font-size: 14px; }
+.group { margin-bottom: 18px; min-width: 0; }
+.group h3 { font-size: 17px; display: flex; gap: 10px; align-items: baseline; padding: 6px 8px; border-bottom: 1px solid var(--line); margin-bottom: 4px; }
+.group h3 .c { font-family: var(--f-body); font-weight: 400; font-size: 14px; color: var(--muted); }
+.empty { color: var(--muted); padding: 32px 0; }
+.list { min-width: 0; }
+
+/* method */
+.prose { max-width: 70ch; }
+.prose p, .prose li { margin: 0 0 10px; }
+.prose ul { padding-left: 20px; }
+.prose h3 { font-size: 18px; margin: 24px 0 8px; }
+dl.rubric { display: grid; grid-template-columns: auto 1fr; gap: 8px 14px; margin: 0; }
+dl.rubric dt { font-weight: 700; }
+dl.rubric dd { margin: 0; color: var(--muted); }
+
+/* detail panel */
+.scrim { position: fixed; inset: 0; background: rgb(10 14 20 / .4); z-index: 20; }
+aside.panel { position: fixed; top: 0; right: 0; bottom: 0; width: min(720px, 100%); background: var(--surface); z-index: 21; box-shadow: var(--shadow); display: flex; flex-direction: column; padding-top: env(safe-area-inset-top, 0px); padding-bottom: env(safe-area-inset-bottom, 0px); }
+.panel .ph { padding: 16px 20px 12px; border-bottom: 1px solid var(--line); display: grid; gap: 8px; }
+.panel .meta { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 13.5px; color: var(--muted); }
+.panel .meta .mono { color: var(--fg); }
+.panel h2 { margin: 0; font-size: 21px; }
+.panel .close { margin-left: auto; background: var(--sunk); border: 1px solid var(--line); border-radius: 8px; padding: 4px 12px; cursor: pointer; }
+.panel .pb { overflow-y: auto; padding: 4px 20px 32px; }
+.panel h4 { font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin: 20px 0 6px; }
+.panel .pb p { margin: 0 0 10px; max-width: 70ch; }
+.panel .fix { background: var(--accent-soft); border-radius: 8px; padding: 12px 14px; }
+.panel .fix p:last-child { margin-bottom: 0; }
+.panel details { border-top: 1px solid var(--line); padding-top: 4px; margin-top: 16px; }
+.panel summary { cursor: pointer; font-weight: 700; padding: 8px 0; }
+.panel .vnote { border-left: 3px solid var(--line); padding-left: 12px; margin: 10px 0; }
+.panel .vnote b { display: block; font-size: 13px; color: var(--muted); }
+.locs { display: flex; flex-wrap: wrap; gap: 6px; }
+.locs code { font-size: 12px; }
+.copy { background: none; border: 1px solid var(--line); border-radius: 6px; padding: 0 8px; cursor: pointer; font-size: 12.5px; color: var(--muted); }
+.nav2 { display: flex; gap: 8px; }
+.nav2 button { background: var(--sunk); border: 1px solid var(--line); border-radius: 8px; padding: 4px 10px; cursor: pointer; font-size: 13px; }
+
+@media (max-width: 760px) {
+  .browser { grid-template-columns: 1fr; }
+  .filters { position: static; max-height: none; grid-template-columns: 1fr 1fr; gap: 12px 16px; }
+  .filters .wide { grid-column: 1 / -1; }
+  .row { grid-template-columns: 4.4em 1fr; }
+  .row .id { grid-column: 1 / -1; }
+  .row .effort { display: none; }
+  ol.fixes li { grid-template-columns: 1.6em 1fr; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  aside.panel { animation: slide .18s ease-out; }
+  @keyframes slide { from { transform: translateX(24px); opacity: .6; } }
+}
+</style>
+
+<header class="top wrap">
+  <div class="eyebrow">First full code audit · 6 October 2026</div>
+  <h1>RelayV4 Code Audit</h1>
+  <div class="facts" id="facts"></div>
+</header>
+
+<nav class="tabs" aria-label="Sections"><div class="wrap">
+  <a href="#overview" data-tab="overview">Overview</a>
+  <a href="#themes" data-tab="themes">Themes</a>
+  <a href="#findings" data-tab="findings">All findings<span class="n" id="tabn"></span></a>
+  <a href="#method" data-tab="method">How it was done</a>
+</div></nav>
+
+<main class="wrap">
+  <section id="tab-overview">
+    <div class="lede">
+      <p>RelayV4's foundations hold up. The single-store engine, the typed bus and one worktree per agent are sound, and the audit found no known-vulnerable dependency. The serious problems sit in four places. Guardrails can be walked around in ordinary ways. Slow work under the store lock can freeze every session. The phone door is exposed on the network without channel security. The desktop client rebuilds whole panels on every event.</p>
+      <p>Nothing stayed critical after verification. The one claimed critical, a confirmed hold landing in the wrong checkout, is real but needs uncommitted edits to the same file before it destroys work, so it is rated high.</p>
+    </div>
+    <div class="sevbar" id="sevbar" role="img"></div>
+    <div class="legend" id="legend"></div>
+
+    <h2>Fix these first</h2>
+    <p class="sub">Ordered by harm prevented per unit of work. Each item links to its findings; S, M and L are the auditors' effort estimates.</p>
+    <ol class="fixes" id="fixes"></ol>
+
+    <h2>Where the findings are</h2>
+    <p class="sub">Unique findings by area and severity. Select a number to see those findings.</p>
+    <div class="tablewrap"><table class="heat" id="heat"></table></div>
+
+    <h2>Good news and ruled out</h2>
+    <div class="two">
+      <div class="note"><h3>Found clean</h3><ul>
+        <li><code>cargo audit</code>: no known vulnerabilities. Two transitive warnings via <code>gix</code>: <code>faster-hex</code> is unsound and <code>bisync</code> is yanked.</li>
+        <li>The engine crates are clippy-clean.</li>
+        <li>No memory-safety finding, and only 5 overengineering findings.</li>
+      </ul></div>
+      <div class="note"><h3>Refuted or dropped</h3><ul>
+        <li>23 round-1 candidates were refuted. One example is stream frames racing their response, which cannot happen under the scheduler in use.</li>
+        <li>13 completeness candidates were dropped on reading the code, such as idempotency replays, which execute nothing.</li>
+        <li>No high finding was refuted by the blind re-check.</li>
+      </ul></div>
+    </div>
+  </section>
+
+  <section id="tab-themes" hidden>
+    <div class="lede"><p>The same few mistakes recur across the codebase. Each theme below lists the findings it covers, high ones first; fixing the shared cause usually fixes several at once.</p></div>
+    <div class="themes" id="themelist"></div>
+  </section>
+
+  <section id="tab-findings" hidden>
+    <div class="browser">
+      <div class="filters" id="filters" aria-label="Filters"></div>
+      <div class="list">
+        <div class="toolbar">
+          <input class="search" id="q" type="search" placeholder="Search titles, files, symbols, text" aria-label="Search findings">
+          <span class="count" id="count"></span>
+          <button class="linkbtn" id="reset" type="button">Reset filters</button>
+        </div>
+        <div id="groups"></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-method" hidden>
+    <div class="prose">
+      <h3>Scope</h3>
+      <p>The audit covered everything except the phone app:</p>
+      <ul>
+        <li>the engine (<code>relay-core</code>) and the bus types (<code>relay-bus</code>);</li>
+        <li>the CLI and MCP servers, including the embedded Blender and Unreal Python;</li>
+        <li>the phone door;</li>
+        <li>the GTK desktop client;</li>
+        <li>tests, scripts, CI, plugins and docs.</li>
+      </ul>
+      <p>The audited commit was <code>361c6f9</code>. Line numbers refer to the current <code>main</code> (<code>d04b526</code>), which is identical outside the 19 files that PR #30 and PR #31 changed.</p>
+      <h3>Round 1: find and verify</h3>
+      <ul>
+        <li>475 agents at maximum effort, over about 19 hours.</li>
+        <li>41 auditors each read one area in full.</li>
+        <li>18 more each followed one concern across the whole codebase, such as the CLAUDE.md invariants, SQLite use, concurrency, security, data loss, GTK main-thread health, dead code, performance and misleading docs.</li>
+        <li>Every finding went to a verifier told to refute it, and every high one to a second skeptic.</li>
+        <li>Result: 1,126 candidates, 23 refuted.</li>
+      </ul>
+      <h3>Round 2: consolidate and re-check</h3>
+      <ul>
+        <li><b>Duplicates merged.</b> Two findings are one when a single fix resolves both, even when they cite different lines; a shared theme is not enough. 366 duplicates were folded into 197 groups, leaving 737 unique. A merged finding keeps every location and lists the reports it absorbed.</li>
+        <li><b>Blind re-check.</b> Each of the 63 high or critical findings went to a fresh verifier that saw no earlier verdict or severity. It was told to refute by default and to rate severity anew. All 63 were confirmed. Seven were lowered to medium, and the one critical became high.</li>
+        <li><b>Completeness pass.</b> Auditors' notes about issues they saw outside their area were mined for anything unreported. There were 21 such observations: 8 became verified findings and 13 were dropped.</li>
+        <li><b>Recheck after the newer merges.</b> Ten findings sat near code that PR #30 or #31 edited. Six are still present, three changed and one is fixed. Other line numbers in those files were remapped through the diff.</li>
+      </ul>
+      <p>Medium and low findings had one adversarial verifier each, and no blind re-check.</p>
+      <h3>Severity</h3>
+      <p>Severity is judged for a single-user desktop app with a local engine, many concurrent agent sessions, and an optional phone door.</p>
+      <dl class="rubric">
+        <dt>Critical</dt><dd>Data loss. A hole reachable by another local user, a network peer or an agent escaping its guardrails. An engine-wide hang.</dd>
+        <dt>High</dt><dd>Likely wrong behaviour in a normal flow, a bus or UI freeze, unbounded growth, or a safety check that is silently bypassed.</dd>
+        <dt>Medium</dt><dd>A real bug in a less common path, or a design problem with a concrete ongoing cost.</dd>
+        <dt>Low</dt><dd>A minor edge case or a modest cleanup.</dd>
+      </dl>
+      <h3>Tooling</h3>
+      <ul>
+        <li><code>cargo test</code> has one failure: the Blender rig test on Blender 5.2.1 (<a href="#ra-008" data-rid="RA-008">RA-008</a>).</li>
+        <li>Clippy is clean for the engine, bus, CLI and remote crates.</li>
+        <li>The desktop client trips one new Rust 1.98 lint in a test; CI pins Rust 1.94.</li>
+      </ul>
+      <p>The full Markdown report, the raw data and the scripts that built this page are in <code>outputs/audit-2026-10-06/</code> on branch <code>relay/quick-moose</code>.</p>
+    </div>
+  </section>
+</main>
+
+<div class="scrim" id="scrim" hidden></div>
+<aside class="panel" id="panel" hidden role="dialog" aria-modal="true" aria-labelledby="ptitle"></aside>
+
+<script id="data" type="application/json">__DATA__</script>
+<script>
+const D = JSON.parse(document.getElementById('data').textContent);
+const F = D.findings.filter(f => f.status !== 'disputed');
+const BY = Object.fromEntries(F.map(f => [f.rid, f]));
+const SEVS = ['high', 'medium', 'low'];
+const SEVNAME = { high: 'High', medium: 'Medium', low: 'Low' };
+const CATNAME = { bug: 'Bug', security: 'Security', concurrency: 'Concurrency', invariant: 'Invariant', performance: 'Performance', 'resource-leak': 'Resource leak', 'error-handling': 'Error handling', 'data-loss': 'Data loss', 'dead-code': 'Dead code', duplication: 'Duplication', overengineering: 'Overengineering', 'code-quality': 'Code quality', 'test-quality': 'Test quality', 'docs-drift': 'Docs drift' };
+const DEFECT = new Set(['bug', 'security', 'concurrency', 'invariant', 'performance', 'resource-leak', 'error-handling', 'data-loss']);
+const SEVRANK = { critical: 0, high: 1, medium: 2, low: 3 };
+
+const FIX_FIRST = [
+  { t: "Make confirmed holds replay in the agent's worktree", d: "guardrail.confirm replays a held agent file.write with no session bound, so the write lands in your main checkout and the agent's worktree never gets it.", ids: ['RA-009'] },
+  { t: "Make worktree.remove refuse anything that is not one of the project's worktrees", d: "It accepts any path, even a relative one, and falls back to remove_dir_all.", ids: ['RA-017'] },
+  { t: "Fail closed when the guardrail hook is slow", d: "When the engine is busy past the provider's 30-second hook timeout, the provider kills the hook and runs the tool unchecked.", ids: ['RA-002'] },
+  { t: "Gate Codex edits and shell writes as writes", d: "No write guardrail runs for Codex edits. None runs for redirections, sed -i, tee or cp through the Bash tool either.", ids: ['RA-003', 'RA-001'] },
+  { t: "Validate provider_ref", d: "A string an agent stores lands in the provider's argv on resume, for example a flag that turns off the sandbox.", ids: ['RA-030'] },
+  { t: "Keep the hooks folder while other sessions still share the checkout", d: "Closing one session deletes the folder core.hooksPath points at, silently disabling the commit gate for the others.", ids: ['RA-031'] },
+  { t: "Close the phone door's network exposure", d: "run.sh opens it on 0.0.0.0 at every launch. Add a handshake timeout and a connection cap now; channel security is the larger follow-up.", ids: ['RA-056', 'RA-053', 'RA-052'] },
+  { t: "Move subprocesses out of the store lock, under deadlines", d: "Git mutations, project.clone, gh pr create, avd.create/boot and task.dispatch can each freeze every session, keystrokes included.", ids: ['RA-022', 'RA-034', 'RA-023', 'RA-018', 'RA-032'] },
+  { t: "Stop one large reply from dropping the desktop client's connection", d: "Any reply line over 2 MiB tears down the client's only connection to the engine. Mailbox history and the Skills page reach that size in normal use.", ids: ['RA-037', 'RA-027', 'RA-050'] },
+  { t: "Fix the two desktop client crashes", d: "One is a RefCell double borrow in the guardrail prompt queue. The other is Replace All with zero matches in notes, which aborts the client and loses unsaved notes.", ids: ['RA-042', 'RA-044'] },
+  { t: "Start the engine in its own session from run.sh", d: "Ctrl+C in the launching terminal currently kills every agent.", ids: ['RA-055'] },
+  { t: "Port the Blender scripts to Blender 5's layered actions", d: "This is the one failing cargo test.", ids: ['RA-008'] },
+];
+
+const THEMES = [
+  { name: "Guardrails can be walked around", why: "Denied commands match only one literal spelling, Codex edits and shell writes skip the write checks, a slow engine lets tools run unchecked, and an agent can act as the user. BUS.md calls guardrails best effort; the code is weaker than that wording suggests.", ids: ['RA-001', 'RA-002', 'RA-003', 'RA-010', 'RA-011', 'RA-012', 'RA-025', 'RA-030', 'RA-031', 'RA-096', 'RA-109', 'RA-104', 'RA-273'] },
+  { name: "Slow work under the store lock", why: "CLAUDE.md forbids slow work while the store mutex is held, but a dozen handlers run git, gh, clones, emulators or whole-file reads under it. The socket also serves each connection strictly in order, so one slow request stalls the whole UI. One shared subprocess runner with a mandatory deadline would remove most of this.", ids: ['RA-032', 'RA-022', 'RA-034', 'RA-023', 'RA-018', 'RA-020', 'RA-021', 'RA-015'] },
+  { name: "Writes and kills that hit the wrong target", why: "A confirmed write lands in the wrong checkout, a remove deletes any folder, Stop leaves Gradle running, and crash recovery or the Unreal tools kill editors the user still owns.", ids: ['RA-009', 'RA-017', 'RA-019', 'RA-006', 'RA-004', 'RA-005'] },
+  { name: "Session and task flows that dead-end", why: "Sessions that share a checkout deadlock each other's review, exited sessions cannot be relaunched, and approving or removing fails once cleanup has run.", ids: ['RA-028', 'RA-029', 'RA-033', 'RA-035', 'RA-014', 'RA-043'] },
+  { name: "Things that grow forever", why: "Integration worktrees, mailbox history, trash and audit rows are never cleaned up; the documented reconcile pass is a stub.", ids: ['RA-026', 'RA-049', 'RA-027', 'RA-132'] },
+  { name: "The desktop client rebuilds instead of updating", why: "Whole panels are torn down on every engine event, which closes menus, loses half-typed text, leaks widgets through strong closure references, and re-downloads the repository's PR history.", ids: ['RA-036', 'RA-038', 'RA-045', 'RA-046', 'RA-039', 'RA-047', 'RA-024', 'RA-040', 'RA-041', 'RA-037', 'RA-042', 'RA-044'] },
+  { name: "The phone door assumes a trusted network", why: "The token crosses the wire in clear, later frames are unauthenticated, the LAN listener has no limits, and one slow phone stalls every lane.", ids: ['RA-056', 'RA-052', 'RA-053', 'RA-054', 'RA-051'] },
+  { name: "Docs describe the plan, not the build", why: "Docs drift is the subject of 36 findings, most in BUS.md, where the Codex guard, the reconcile pass and the ui.* executor read as planned rather than as built.", cat: 'docs-drift' },
+];
+
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const inline = s => esc(s).replace(/`([^`]+)`/g, '<code>$1</code>');
+const paras = s => String(s || '').trim().split(/\n\s*\n/).map(p => `<p>${inline(p).replace(/\n/g, '<br>')}</p>`).join('');
+const loc = f => f.line ? `${f.file}:${f.line}` : f.file;
+const pill = s => `<span class="pill ${s}">${SEVNAME[s] || s}</span>`;
+function store(k, v) { try { if (v === undefined) return JSON.parse(localStorage.getItem('audit:' + k)); localStorage.setItem('audit:' + k, JSON.stringify(v)); } catch (e) { return null; } }
+
+const count = s => F.filter(f => f.final_severity === s).length;
+const crit = F.filter(f => f.final_severity === 'critical').length;
+document.getElementById('facts').innerHTML = [
+  `<span><b>${F.length}</b> unique findings</span>`,
+  `<span><b>${crit}</b> critical · <b>${count('high')}</b> high · <b>${count('medium')}</b> medium · <b>${count('low')}</b> low</span>`,
+  `<span>Audited at <span class="mono">361c6f9</span>, lines at <span class="mono">d04b526</span></span>`,
+  `<span>Phone app out of scope</span>`,
+].join('');
+document.getElementById('tabn').textContent = F.length;
+
+// severity bar, drawn to scale
+const bar = document.getElementById('sevbar');
+bar.setAttribute('aria-label', SEVS.map(s => `${count(s)} ${s}`).join(', '));
+bar.innerHTML = SEVS.map(s => `<span class="bg-${s}" style="width:${(100 * count(s) / F.length).toFixed(2)}%"></span>`).join('');
+document.getElementById('legend').innerHTML = `<span><span class="dot" style="background:var(--line)"></span>Critical <b>${crit}</b></span>` +
+  SEVS.map(s => `<span><span class="dot bg-${s}"></span>${SEVNAME[s]} <b>${count(s)}</b></span>`).join('') +
+  `<span>Defects and security <b>${F.filter(f => DEFECT.has(f.final_category)).length}</b> · Quality and design <b>${F.filter(f => !DEFECT.has(f.final_category)).length}</b></span>`;
+
+const ref = rid => { const f = BY[rid]; return f ? `<button class="ref" type="button" data-rid="${rid}" title="${esc(f.title)}"><span class="dot bg-${f.final_severity}"></span>${rid}<span class="effort">${esc(f.effort || '')}</span></button>` : ''; };
+document.getElementById('fixes').innerHTML = FIX_FIRST.map(x => `<li><div><div class="t">${esc(x.t)}</div><div class="d">${esc(x.d)}</div></div><div class="refs">${x.ids.map(ref).join('')}</div></li>`).join('');
+
+// area x severity table
+const areas = [...new Set(F.map(f => f.area))].sort((a, b) => F.filter(f => f.area === b).length - F.filter(f => f.area === a).length);
+const maxCell = Math.max(...areas.flatMap(a => SEVS.map(s => F.filter(f => f.area === a && f.final_severity === s).length)));
+const tint = (s, n) => n ? `background: color-mix(in srgb, var(--${s === 'medium' ? 'med' : s}) ${Math.round(8 + 42 * n / maxCell)}%, transparent)` : '';
+document.getElementById('heat').innerHTML =
+  `<thead><tr><th>Area</th>${SEVS.map(s => `<th>${SEVNAME[s]}</th>`).join('')}<th>Total</th></tr></thead><tbody>` +
+  areas.map(a => {
+    const cells = SEVS.map(s => { const n = F.filter(f => f.area === a && f.final_severity === s).length;
+      return n ? `<td class="cell"><button type="button" data-area="${esc(a)}" data-sev="${s}" style="${tint(s, n)}">${n}</button></td>` : `<td class="cell zero">0</td>`; }).join('');
+    return `<tr><td>${esc(a)}</td>${cells}<td class="cell"><button type="button" data-area="${esc(a)}">${F.filter(f => f.area === a).length}</button></td></tr>`;
+  }).join('') + `</tbody><tfoot><tr><td>All areas</td>${SEVS.map(s => `<td>${count(s)}</td>`).join('')}<td>${F.length}</td></tr></tfoot>`;
+
+// themes
+const rowHtml = f => `<button class="row" type="button" data-rid="${f.rid}"><span class="id">${f.rid}</span>${pill(f.final_severity)}<span class="tt">${inline(f.title)}<span class="loc">${esc(loc(f))}</span></span><span class="effort" title="Effort to fix: S, M or L">effort ${esc(f.effort || '?')}</span></button>`;
+document.getElementById('themelist').innerHTML = THEMES.map((t, i) => {
+  const items = (t.ids ? t.ids.map(r => BY[r]).filter(Boolean) : F.filter(f => f.final_category === t.cat))
+    .sort((a, b) => SEVRANK[a.final_severity] - SEVRANK[b.final_severity] || a.rid.localeCompare(b.rid));
+  const shown = t.cat ? items.filter(f => f.final_severity !== 'low') : items;
+  const more = t.cat ? `<p><button class="linkbtn" type="button" data-cat="${t.cat}">See all ${items.length} in the findings list</button></p>` : '';
+  return `<article class="theme" id="theme-${i + 1}"><h3>${esc(t.name)}</h3><p class="why">${esc(t.why)}</p><ul class="items">${shown.map(f => `<li>${rowHtml(f)}</li>`).join('')}</ul>${more}</article>`;
+}).join('');
+
+// findings browser
+const DEFAULT = { sev: ['high', 'medium'], area: '', cat: '', part: '', q: '' };
+let st = Object.assign({}, DEFAULT, store('filters') || {});
+const cats = [...new Set(F.map(f => f.final_category))].sort((a, b) => (CATNAME[a] || a).localeCompare(CATNAME[b] || b));
+function filtersHtml() {
+  return `<div class="wide"><h4>Severity</h4>${SEVS.map(s => `<label><input type="checkbox" name="sev" value="${s}" ${st.sev.includes(s) ? 'checked' : ''}> ${pill(s)}<span class="c">${count(s)}</span></label>`).join('')}</div>
+  <div><h4>Kind</h4><select id="part" aria-label="Kind"><option value="">Everything</option><option value="A">Defects and security</option><option value="B">Quality and design</option></select></div>
+  <div><h4>Area</h4><select id="area" aria-label="Area"><option value="">All areas</option>${areas.map(a => `<option>${esc(a)}</option>`).join('')}</select></div>
+  <div class="wide"><h4>Category</h4><select id="cat" aria-label="Category"><option value="">All categories</option>${cats.map(c => `<option value="${c}">${esc(CATNAME[c] || c)}</option>`).join('')}</select></div>`;
+}
+const fl = document.getElementById('filters');
+fl.innerHTML = filtersHtml();
+const sync = () => { for (const k of ['part', 'area', 'cat']) document.getElementById(k).value = st[k]; document.getElementById('q').value = st.q;
+  fl.querySelectorAll('input[name=sev]').forEach(i => i.checked = st.sev.includes(i.value)); };
+fl.addEventListener('change', e => {
+  if (e.target.name === 'sev') st.sev = [...fl.querySelectorAll('input[name=sev]:checked')].map(i => i.value);
+  else st[e.target.id] = e.target.value;
+  renderList();
+});
+document.getElementById('q').addEventListener('input', e => { st.q = e.target.value; renderList(); });
+document.getElementById('reset').addEventListener('click', () => { st = Object.assign({}, DEFAULT, { sev: [...DEFAULT.sev] }); sync(); renderList(); });
+const hay = f => (f._h ||= [f.rid, f.title, f.file, f.symbol, f.evidence, f.impact, f.fix, (f.related || []).join(' ')].join(' ').toLowerCase());
+let visible = [];
+function renderList() {
+  store('filters', st);
+  const q = st.q.trim().toLowerCase();
+  visible = F.filter(f => st.sev.includes(f.final_severity) && (!st.area || f.area === st.area) && (!st.cat || f.final_category === st.cat) &&
+    (!st.part || (st.part === 'A') === DEFECT.has(f.final_category)) && (!q || hay(f).includes(q)))
+    .sort((a, b) => SEVRANK[a.final_severity] - SEVRANK[b.final_severity] || a.rid.localeCompare(b.rid));
+  document.getElementById('count').textContent = `${visible.length} of ${F.length}`;
+  const groups = areas.map(a => [a, visible.filter(f => f.area === a)]).filter(([, l]) => l.length);
+  document.getElementById('groups').innerHTML = groups.length ? groups.map(([a, l]) =>
+    `<div class="group"><h3>${esc(a)} <span class="c">${l.length}</span></h3>${l.map(rowHtml).join('')}</div>`).join('')
+    : '<p class="empty">No findings match these filters. Try adding Low, or reset the filters.</p>';
+}
+sync(); renderList();
+
+// tabs
+const TABS = ['overview', 'themes', 'findings', 'method'];
+function showTab(t, scroll) {
+  TABS.forEach(x => { document.getElementById('tab-' + x).hidden = x !== t;
+    document.querySelector(`[data-tab="${x}"]`).toggleAttribute('aria-current', x === t);
+    if (x === t) document.querySelector(`[data-tab="${x}"]`).setAttribute('aria-current', 'page'); });
+  if (scroll) window.scrollTo({ top: 0 });
+}
+document.querySelectorAll('nav.tabs a').forEach(a => a.addEventListener('click', e => { e.preventDefault(); showTab(a.dataset.tab, true); history.replaceState(null, '', '#' + a.dataset.tab); }));
+
+// detail panel
+const panel = document.getElementById('panel'), scrim = document.getElementById('scrim');
+let lastFocus = null, current = null;
+const NOTE = /^(Verifier|Skeptic|Blind re-check|Recheck after PR #30\/#31): /;
+function openFinding(rid) {
+  const f = BY[rid]; if (!f) return;
+  current = rid; lastFocus = lastFocus || document.activeElement;
+  const themes = THEMES.filter(t => t.ids ? t.ids.includes(rid) : f.final_category === t.cat).map(t => t.name);
+  const notes = (f.notes || []).map(n => { const m = n.match(NOTE); return `<div class="vnote"><b>${esc(m ? m[1] : 'Verifier')}</b>${paras(m ? n.slice(m[0].length) : n)}</div>`; }).join('');
+  const idx = visible.findIndex(x => x.rid === rid);
+  panel.innerHTML = `<div class="ph">
+      <div class="meta">${pill(f.final_severity)}<span class="mono">${rid}</span><span>${esc(CATNAME[f.final_category] || f.final_category)}</span><span>effort ${esc(f.effort || '?')}</span><span>${esc(f.status)}</span>
+        <span class="nav2">${idx >= 0 ? `<button type="button" data-step="-1" ${idx === 0 ? 'disabled' : ''}>Previous</button><button type="button" data-step="1" ${idx === visible.length - 1 ? 'disabled' : ''}>Next</button>` : ''}</span>
+        <button class="close" type="button" id="close">Close</button></div>
+      <h2 id="ptitle">${inline(f.title)}</h2>
+      <div class="meta"><span class="mono">${esc(loc(f))}</span><button class="copy" type="button" data-copy="${esc(loc(f))}">Copy</button><span>${esc(f.area)}</span>${f.recheck ? `<span>${esc(f.recheck)}</span>` : ''}</div>
+    </div>
+    <div class="pb">
+      <h4>What goes wrong</h4>${paras(f.impact)}
+      <h4>Fix</h4><div class="fix">${paras(f.fix)}</div>
+      <h4>Evidence</h4>${paras(f.evidence)}
+      ${notes ? `<details ${f.final_severity === 'high' ? 'open' : ''}><summary>Verifier notes (${(f.notes || []).length})</summary>${notes}<p class="effort">Where a note disagrees with the text above, the note is right; the latest pass is last.</p></details>` : ''}
+      ${(f.related || []).length ? `<h4>Also at</h4><div class="locs">${f.related.map(r => `<code>${esc(r)}</code>`).join('')}</div>` : ''}
+      ${(f.merged_from || []).length ? `<h4>Merged reports</h4><p class="effort">${esc(f.merged_from.join(', '))}</p>` : ''}
+      ${themes.length ? `<h4>Theme</h4><p>${themes.map(esc).join(', ')}</p>` : ''}
+    </div>`;
+  panel.hidden = false; scrim.hidden = false; document.body.style.overflow = 'hidden';
+  history.replaceState(null, '', '#' + rid.toLowerCase());
+  document.getElementById('close').focus();
+}
+function closePanel() {
+  panel.hidden = true; scrim.hidden = true; document.body.style.overflow = ''; current = null;
+  const tab = TABS.find(t => !document.getElementById('tab-' + t).hidden);
+  history.replaceState(null, '', '#' + tab);
+  if (lastFocus && document.contains(lastFocus)) lastFocus.focus(); lastFocus = null;
+}
+scrim.addEventListener('click', closePanel);
+document.addEventListener('keydown', e => {
+  if (panel.hidden) return;
+  if (e.key === 'Escape') closePanel();
+  if (e.key === 'Tab') { const fs = [...panel.querySelectorAll('button:not([disabled]), summary, a')]; if (!fs.length) return;
+    if (e.shiftKey && document.activeElement === fs[0]) { e.preventDefault(); fs[fs.length - 1].focus(); }
+    else if (!e.shiftKey && document.activeElement === fs[fs.length - 1]) { e.preventDefault(); fs[0].focus(); } }
+});
+panel.addEventListener('click', e => {
+  const b = e.target.closest('button'); if (!b) return;
+  if (b.id === 'close') closePanel();
+  else if (b.dataset.step) { const i = visible.findIndex(x => x.rid === current) + Number(b.dataset.step); if (visible[i]) openFinding(visible[i].rid); }
+  else if (b.dataset.copy) { const t = b.dataset.copy;
+    Promise.resolve().then(() => navigator.clipboard.writeText(t)).then(() => b.textContent = 'Copied', () => b.textContent = 'Select to copy'); }
+});
+document.addEventListener('click', e => {
+  const el = e.target.closest('[data-rid], [data-area], [data-cat]'); if (!el || panel.contains(el)) return;
+  if (el.dataset.rid) { e.preventDefault(); lastFocus = el; openFinding(el.dataset.rid); return; }
+  st = Object.assign({}, DEFAULT, { sev: el.dataset.sev ? [el.dataset.sev] : [...SEVS], area: el.dataset.area || '', cat: el.dataset.cat || '' });
+  sync(); renderList(); showTab('findings', true); history.replaceState(null, '', '#findings');
+});
+
+// deep links: #overview, #themes, #findings, #method or #ra-009
+const h = location.hash.slice(1).toLowerCase();
+if (/^ra-\d{3}$/.test(h)) { showTab('overview'); openFinding(h.toUpperCase()); }
+else showTab(TABS.includes(h) ? h : 'overview');
+</script>
