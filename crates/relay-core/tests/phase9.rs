@@ -20,6 +20,41 @@ fn project(engine: &Engine) -> tempfile::TempDir {
     workspace
 }
 
+/// RA-490 / RA-507: `unread` counts every unread notification under the filters, past
+/// `limit` and regardless of `unread_only`; `count_only` returns the count without rows.
+#[test]
+fn notify_list_counts_unread_beyond_the_page() {
+    let engine = engine();
+    let _workspace = project(&engine);
+    {
+        let conn = engine.store.lock();
+        for n in 0..5 {
+            let (category, read) = if n < 3 { ("system", 0) } else { ("disk", n % 2) };
+            conn.execute(
+                "INSERT INTO notifications(project_id,category,title,body,link,read,created_at) VALUES (1,?1,'n','',NULL,?2,?3)",
+                rusqlite::params![category, read, format!("2026-08-17T12:00:0{n}Z")],
+            ).unwrap();
+        }
+    }
+    let ok = |payload: serde_json::Value| call(&engine, "notify.list", payload).into_result().unwrap();
+    // Rows 0-2 are unread system ones, 3 is an unread disk one, 4 a read disk one.
+    let page = ok(json!({"limit":1}));
+    assert_eq!(page["notifications"].as_array().unwrap().len(), 1);
+    assert_eq!(page["unread"], 4, "{page}");
+    assert_eq!(ok(json!({"unread_only":true,"limit":2}))["unread"], 4);
+    assert_eq!(ok(json!({"category":"disk"}))["unread"], 1);
+    assert_eq!(ok(json!({"project_id":1,"category":"system"}))["unread"], 3);
+    assert_eq!(ok(json!({"project_id":2}))["unread"], 0);
+    let count = ok(json!({"count_only":true}));
+    assert!(count["notifications"].as_array().unwrap().is_empty(), "{count}");
+    assert_eq!(count["unread"], 4);
+    call(&engine, "notify.ack_all", json!({})).into_result().unwrap();
+    assert_eq!(ok(json!({"count_only":true}))["unread"], 0);
+    // An older reply without `unread` still reads as the typed result.
+    let old: relay_bus::ops::notify::ListOut = serde_json::from_value(json!({"notifications":[]})).unwrap();
+    assert_eq!(old.unread, 0);
+}
+
 #[test]
 fn notifications_settings_dashboard_usage_and_resources() {
     let engine = engine();

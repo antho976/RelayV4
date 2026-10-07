@@ -23,10 +23,8 @@ pub const COLUMNS: &[&str] = &{
 /// Every column but Done, the last, which only approval reaches.
 pub const OPEN_COLUMNS: &[&str] = COLUMNS.split_at(COLUMNS.len() - 1).0;
 pub const TYPES: [&str; 5] = ["task", "feature", "bug", "chore", "spike"];
-/// Least urgent first.
-pub const PRIORITIES: [&str; 4] = ["low", "medium", "high", "urgent"];
-/// `""` first: a task need not have a size.
-pub const SIZES: [&str; 4] = ["", "S", "M", "L"];
+/// Least urgent first; `""` first in sizes. One vocabulary, shared with the board's ordering.
+pub use relay_board::{PRIORITIES, SIZES};
 /// A task's execution states.
 const STATES: [&str; 6] = ["none", "dispatched", "running", "blocked", "failed", "awaiting_review"];
 pub fn choose(values: &[&str], selected: &str) -> gtk::ComboBoxText {

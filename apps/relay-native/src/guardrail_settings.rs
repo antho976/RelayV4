@@ -194,6 +194,12 @@ impl Editor {
 
     fn refresh_row(&self, row: &Row) {
         let layers = self.layers.borrow();
+        if layers["effective"].is_null() {
+            // Nothing read for this scope (yet): no caption, and nothing to reset.
+            row.source.set_text("");
+            row.reset.set_visible(false);
+            return;
+        }
         let layer = self.scope.get().layer();
         let source = layers["sources"][row.spec.path].as_str().unwrap_or("default");
         let inherited = at(&layers["inherited"], row.spec.path);
@@ -303,10 +309,17 @@ impl Editor {
         let generation = self.generation.get();
         let scope = self.scope.get();
         self.describe_scope(&ui);
-        self.status.set_text("Loading…");
+        // Forget the previous scope's layers until this one's arrive: a Reset judged against
+        // them would clear a field at the new scope that was never shown. With no layers,
+        // dirty() is 0, so the Reset keys hide and Save and Discard turn off; a failed read
+        // leaves it that way, inputs off too.
+        *self.layers.borrow_mut() = Value::Null;
         for row in &self.rows {
+            row.cleared.set(false);
             row.input_widget_sensitive(false);
         }
+        self.refresh();
+        self.status.set_text("Loading…");
         let editor = self.clone();
         glib::spawn_future_local(async move {
             let result = ui.call("guardrail.config.layers", scope.payload()).await;
@@ -355,6 +368,10 @@ impl Editor {
 
     fn save(self: &Rc<Self>) {
         let Some(ui) = self.ui.upgrade() else { return };
+        // Nothing read for this scope: every field would read as changed against nothing.
+        if self.layers.borrow()["effective"].is_null() {
+            return;
+        }
         let patch = self.patch();
         if patch.as_object().is_none_or(Map::is_empty) {
             self.status.set_text("Nothing to save.");
@@ -592,6 +609,9 @@ fn build(ui: &Rc<Ui>, scope: Scope) -> (gtk::Box, Weak<Editor>) {
             let Some(editor) = weak.upgrade() else { return };
             let row = &editor.rows[index];
             let layers = editor.layers.borrow().clone();
+            if layers["effective"].is_null() {
+                return;
+            }
             let layer = editor.scope.get().layer();
             let here = layers["sources"][row.spec.path].as_str() == Some(layer);
             editor.filling.set(true);
