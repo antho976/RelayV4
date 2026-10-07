@@ -4,6 +4,8 @@
 //! PTY sessions, a populated board) and measures every bus op plus the paths that are not ops —
 //! store open, engine construction, socket round trips, PTY throughput — with the same
 //! instrumentation: wall time per iteration, process CPU time, allocation count and bytes, RSS.
+//! Every case starts from the same fixture ([`Fixture::reset`]), and no case reaches a host
+//! tool — a browser, `gh`, `adb`, the emulator — only the stand-ins [`isolate_host`] installs.
 //!
 //! Every measured region runs inside [`perf_measured`]. Under `valgrind --tool=callgrind
 //! --instr-atstart=no`, `--callgrind` switches instrumentation on around exactly that call and
@@ -145,6 +147,24 @@ struct Fixture {
     cleanup: Mutex<Vec<(Actor, &'static str, Value)>>,
     /// Threads a measured region started and must not wait for inside the measurement.
     joins: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// The store and the checkouts as `populate` left them; every case starts from this.
+    baseline: Baseline,
+    /// One line per call the engine made to a host tool the fixture stands in for.
+    host_log: PathBuf,
+}
+
+/// What [`Fixture::reset`] puts back between cases, so a case measures the fixture and not the
+/// rows, commits, branches and worktrees every case before it left behind — and so a number
+/// at `--scale 10` is compared with one taken on the same store at scale 1, not on a store a
+/// few hundred cases have used.
+#[derive(Default)]
+struct Baseline {
+    store: PathBuf,
+    refs: Vec<String>,
+    origin_refs: Vec<String>,
+    worktrees: Vec<String>,
+    untracked: Vec<String>,
+    readme: String,
 }
 
 fn git(repo: &Path, args: &[&str]) {
@@ -160,6 +180,61 @@ fn git_out(repo: &Path, args: &[&str]) -> String {
 fn write_exec(path: &Path, body: &str) {
     std::fs::write(path, body).unwrap();
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn lines(repo: &Path, args: &[&str]) -> Vec<String> {
+    git_out(repo, args).lines().map(str::to_string).filter(|l| !l.is_empty()).collect()
+}
+
+/// The host tools an op can reach. On a developer machine they are real: `xdg-open` opens a
+/// browser tab per iteration, `gh auth login --web` starts a login, `gh api` spends the
+/// person's token, `adb` starts a server. Each is replaced by a stand-in that logs its argv and
+/// refuses, found first on PATH or through the settings the engine reads, so every case that
+/// reaches one measures Relay's refusal path and nothing leaves the fixture.
+const HOST_TOOLS: &[&str] = &["xdg-open", "gh", "adb", "emulator", "avdmanager", "sdkmanager", "keytool", "secret-tool", "apksigner", "jarsigner"];
+
+/// Install the stand-ins and point the process at them. Runs before the engine, the runtime or
+/// any other thread exists, which is what makes changing the environment sound.
+fn isolate_host(root: &Path) -> PathBuf {
+    let bin = root.join("host-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let log = root.join("host-tools.log");
+    for tool in HOST_TOOLS {
+        write_exec(&bin.join(tool), &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"{tool} $*\" >> '{}'\nexit 1\n",
+            log.display()));
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut dirs = vec![bin];
+    dirs.extend(std::env::split_paths(&path));
+    std::env::set_var("PATH", std::env::join_paths(dirs).unwrap());
+    // The Android SDK, the JDK and the person's provider configuration are found through these.
+    for var in ["ANDROID_SDK_ROOT", "ANDROID_HOME", "JAVA_HOME"] {
+        std::env::remove_var(var);
+    }
+    let home = root.join("host-home");
+    for (var, dir) in [("ANDROID_AVD_HOME", "avd"), ("CLAUDE_CONFIG_DIR", ".claude"), ("CODEX_HOME", ".codex"), ("GH_CONFIG_DIR", "gh")] {
+        std::fs::create_dir_all(home.join(dir)).unwrap();
+        std::env::set_var(var, home.join(dir));
+    }
+    // git reads no global or system config: no credential helper, hooks path or signing key
+    // of the person's runs against the fixture's repositories. No background `gc --auto`
+    // either, which would pack the objects a clone of the fixture is copying.
+    let gitconfig = home.join("gitconfig");
+    std::fs::write(&gitconfig, "[user]\n\tname = perf\n\temail = perf@relay.test\n[credential]\n\thelper =\n[commit]\n\tgpgsign = false\n[gc]\n\tauto = 0\n[maintenance]\n\tauto = false\n").unwrap();
+    std::env::set_var("GIT_CONFIG_GLOBAL", &gitconfig);
+    std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
+    std::env::set_var("GIT_TERMINAL_PROMPT", "0");
+    log
+}
+
+/// Calls to each stand-in host tool so far.
+fn host_calls(log: &Path) -> std::collections::BTreeMap<String, u64> {
+    let mut calls = std::collections::BTreeMap::new();
+    for line in std::fs::read_to_string(log).unwrap_or_default().lines() {
+        *calls.entry(line.split(' ').next().unwrap_or_default().to_string()).or_default() += 1;
+    }
+    calls
 }
 
 /// A repository shaped like a small application: `dirs × files` source files across nested
@@ -236,6 +311,7 @@ impl Fixture {
         if keep {
             eprintln!("fixture at {}", root.display());
         }
+        let host_log = isolate_host(&root);
         let (repo, origin, head_sha) = build_repo(&root, 30, 50);
         let provider = root.join("provider.sh");
         write_exec(&provider, PROVIDER_SH);
@@ -283,8 +359,11 @@ impl Fixture {
             scale,
             cleanup: Mutex::new(Vec::new()),
             joins: Mutex::new(Vec::new()),
+            baseline: Baseline::default(),
+            host_log,
         };
         fx.populate();
+        fx.baseline = fx.snapshot();
         // The temp dir must outlive `keep`; leaking it is the point.
         if keep {
             let path = std::mem::replace(&mut fx._tmp, tempfile::tempdir().unwrap());
@@ -332,6 +411,62 @@ impl Fixture {
             let _ = self.call(actor, op, payload);
         }
     }
+    fn snapshot(&self) -> Baseline {
+        let store = self.root.join("baseline.db");
+        self.engine.store.lock().backup(rusqlite::MAIN_DB, &store, None).unwrap();
+        Baseline {
+            store,
+            refs: lines(&self.repo, &["for-each-ref", "--format=%(refname) %(objectname)"]),
+            origin_refs: lines(&self.origin, &["for-each-ref", "--format=%(refname) %(objectname)"]),
+            worktrees: self.worktrees(),
+            untracked: lines(&self.repo, &["ls-files", "--others", "--exclude-standard", "--directory"]),
+            readme: std::fs::read_to_string(self.repo.join("README.md")).unwrap(),
+        }
+    }
+
+    fn worktrees(&self) -> Vec<String> {
+        lines(&self.repo, &["worktree", "list", "--porcelain"]).into_iter()
+            .filter_map(|l| l.strip_prefix("worktree ").map(str::to_string)).collect()
+    }
+
+    /// Put the store and the repositories back to [`Baseline`], uncounted, between cases. The
+    /// live PTYs are the fixture's own two sessions, whose rows the snapshot holds unchanged;
+    /// everything a case opened has been closed by its cleanup before this runs.
+    fn reset(&self) {
+        self.drain_cleanup();
+        let base = &self.baseline;
+        self.engine.store.lock().restore(rusqlite::MAIN_DB, &base.store, None::<fn(rusqlite::backup::Progress)>).unwrap();
+        // Worktrees a case left (a kept session checkout, an integration) before the branches
+        // they hold, then every ref back to where it was.
+        for path in self.worktrees().into_iter().filter(|w| !base.worktrees.contains(w)) {
+            let _ = Command::new("git").arg("-C").arg(&self.repo).args(["worktree", "remove", "--force", &path]).output();
+            let _ = std::fs::remove_dir_all(&path);
+        }
+        let _ = Command::new("git").arg("-C").arg(&self.repo).args(["worktree", "prune"]).output();
+        let _ = Command::new("git").arg("-C").arg(&self.clean_worktree).args(["checkout", "-q", "-f", "relay/perf-clean"]).output();
+        for (repo, refs) in [(&self.repo, &base.refs), (&self.origin, &base.origin_refs)] {
+            for line in lines(repo, &["for-each-ref", "--format=%(refname) %(objectname)"]) {
+                let name = line.split(' ').next().unwrap_or_default();
+                if !refs.iter().any(|r| r.split(' ').next() == Some(name)) {
+                    let _ = Command::new("git").arg("-C").arg(repo).args(["update-ref", "-d", name]).output();
+                }
+            }
+            for line in refs {
+                if let Some((name, sha)) = line.split_once(' ') {
+                    let _ = Command::new("git").arg("-C").arg(repo).args(["update-ref", name, sha]).output();
+                }
+            }
+        }
+        git(&self.repo, &["reset", "-q", "--hard"]);
+        for path in lines(&self.repo, &["ls-files", "--others", "--exclude-standard", "--directory"]) {
+            if !base.untracked.contains(&path) {
+                let path = self.repo.join(&path);
+                let _ = std::fs::remove_dir_all(&path).or_else(|_| std::fs::remove_file(&path));
+            }
+        }
+        std::fs::write(self.repo.join("README.md"), &base.readme).unwrap();
+    }
+
     /// Live row counts, so a number can be read against the store it was measured on.
     fn rows(&self) -> Value {
         let conn = self.engine.store.lock();
@@ -368,6 +503,15 @@ impl Fixture {
             self.user("settings.set", json!({"path": format!("providers.{name}.path"), "value": self.provider}));
         }
         self.user("provider.refresh", json!({}));
+        // The Android tools by setting, so neither PATH nor a real SDK under ~/Android is
+        // consulted: adb, the emulator and avdmanager are the stand-ins from `isolate_host`.
+        let bin = self.root.join("host-bin");
+        let sdk = self.root.join("host-home").join("android-sdk");
+        std::fs::create_dir_all(&sdk).unwrap();
+        for (path, value) in [("device.adb_path", bin.join("adb")), ("device.emulator_path", bin.join("emulator")),
+                              ("device.avdmanager_path", bin.join("avdmanager")), ("device.sdk_path", sdk)] {
+            self.user("settings.set", json!({"path": path, "value": value}));
+        }
         self.user("guardrail.config.set", json!({"project_id": 1, "patch": {"protected_paths": ["secret/*"]}}));
         for m in 0..5 {
             let module = self.user("module.create", json!({"project_id": 1, "name": format!("Module {m}"), "priority": "high"}));
@@ -919,6 +1063,7 @@ fn cases() -> Vec<Case> {
         git(&fx.repo, &["commit", "-qm", "perf: push"]);
         json!({"project_id": 1})
     });
+    // These reach gh: the refusing stand-in.
     fixed(&mut c, "git.pr.list", U, Mid, json!({"project_id": 1}));
     fixed(&mut c, "git.pr.open", U, Mid, json!({"project_id": 1, "title": "perf"}));
     fixed(&mut c, "git.branch.clean_merged", U, Mid, json!({"project_id": 1, "dry_run": true}));
@@ -987,7 +1132,8 @@ fn cases() -> Vec<Case> {
     fixed(&mut c, "file.search", U, Mid, json!({"project_id": 1, "query": "item_03_", "limit": 100}));
     fixed_as(&mut c, "file.search.regex", "file.search", U, Mid, json!({"project_id": 1, "query": "fn item_\\d+_1_", "regex": true, "limit": 100}));
 
-    // ---- device / avd (no SDK here: these measure the refusal path)
+    // ---- device / avd: adb, the emulator and avdmanager are refusing stand-ins (`isolate_host`),
+    // so these measure the refusal path and never reach a real device, server or AVD.
     fixed(&mut c, "device.list", U, Mid, json!({}));
     fixed(&mut c, "device.watch", U, Mid, json!({"on": true}));
     fixed(&mut c, "device.mirror.start", U, Mid, json!({"device": "emulator-5554"}));
@@ -1018,6 +1164,7 @@ fn cases() -> Vec<Case> {
     per(&mut c, "skill.delete", "skill.delete", U, Mid, move |fx| json!({"skill_id": Fixture::id(&fx.user("skill.create", json!({"name": format!("skd-{}", one(fx)), "body": "b"})))}));
     per(&mut c, "skill.enable", "skill.enable", U, Mid, move |fx| json!({"skill_id": fx.skill_id, "project_id": 1, "enabled": one(fx) % 2 == 0}));
     per(&mut c, "skill.install", "skill.install", U, Heavy, |fx| json!({"url": fx.skill_repo, "replace_skill_id": fx.user("skill.list", json!({})).get("skills").and_then(|s| s.as_array()).and_then(|s| s.iter().find(|s| s["name"] == "perf-skill")).map(Fixture::id)}));
+    // gh is a refusing stand-in: the not-connected path, never a login, an API call or a token.
     fixed(&mut c, "github.status", U, Mid, json!({}));
     fixed(&mut c, "github.connect", U, Mid, json!({}));
     fixed(&mut c, "github.repo.list", U, Mid, json!({}));
@@ -1042,8 +1189,8 @@ fn cases() -> Vec<Case> {
     });
     fixed(&mut c, "dashboard.get", U, Cheap, json!({}));
 
-    // ---- ui / os (core answers ui.* from its in-memory shell model, client or not; os.* spawns
-    // xdg-open after commit)
+    // ---- ui / os (core answers ui.* from its in-memory shell model, client or not; os.* hand the
+    // target to `xdg-open` after commit — the stand-in, which logs it)
     fixed(&mut c, "ui.state", U, Cheap, json!({}));
     fixed(&mut c, "ui.page.switch", U, Cheap, json!({"page": "board", "project_id": 1}));
     fixed(&mut c, "ui.pane.open", U, Cheap, json!({"kind": "notes"}));
@@ -1575,6 +1722,7 @@ fn main() {
                 let n = iters.unwrap_or(case.cost.iters()) / iters_div;
                 let n = n.max(1);
                 eprint!("{:<40} ", case.name);
+                fx.reset();
                 let mut row = run_case(&fx, case, n, warmup.min(n), &opts);
                 row["name"] = json!(format!("{}{suffix}", case.name));
                 row["scale"] = json!(scale);
@@ -1582,6 +1730,9 @@ fn main() {
                 writeln!(sink, "{row}").unwrap();
             }
             sink.flush().unwrap();
+            // Some of these land after the case that caused them (os.* spawn after commit), so
+            // they are counted for the run and not per case.
+            eprintln!("host tool calls answered by the fixture's stand-ins: {:?}", host_calls(&fx.host_log));
             fx.engine.shutdown();
         }
         "soak" => {

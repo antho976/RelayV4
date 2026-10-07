@@ -3,7 +3,13 @@ use crate::registry::{Audit, OpMeta, Scope, Undo};
 use crate::types::{Id, Message, Note, SessionState, Ts};
 use crate::{op, Empty};
 
-payload!(#[schemars(rename = "NotesListIn")] ListIn { pub project_id: Id, pub pinned_only: Option<bool> });
+payload!(#[schemars(rename = "NotesListIn")] ListIn {
+    pub project_id: Id, pub pinned_only: Option<bool>,
+    /// Also list soft-deleted notes (`deleted_at` set), which `notes.restore` brings back.
+    pub include_deleted: Option<bool>,
+    /// Cut each `body` to a preview of its first 240 characters; `notes.get` has the whole note.
+    pub summary: Option<bool>,
+});
 result!(#[schemars(rename = "NotesListOut")] ListOut { pub notes: Vec<Note> });
 op!(List, "notes.list", ListIn => ListOut, OpMeta::query(Scope::Project, 5, "Notes for a project"));
 payload!(#[schemars(rename = "NotesIdIn")] IdIn { pub note_id: Id });

@@ -137,34 +137,50 @@ pub fn register(e: &mut Engine) {
         Ok(Empty {})
     });
 
-    e.register::<RunOp>(|ctx: &mut Ctx, p| {
-        let project = get_project(ctx.tx(), p.project_id)?;
+    // `adb devices` (up to 2 s, longer when the server is cold), the checkout and wrapper probes
+    // and the branch lookup all run in the prepare phase with nothing locked (D149). The
+    // transaction only records the run and takes the device lease.
+    e.register_staged::<RunOp, RunPrepared>(|ctx, p| {
+        let project = ctx.read(|conn| get_project(conn, p.project_id))?;
         // The device lease (device_lease): refuse before any adb or Gradle work when another
         // session is installing on this device, and name it.
         let requested_root = p.worktree.clone().unwrap_or_else(|| project.path.clone());
         let requested_root = std::fs::canonicalize(&requested_root).map(|path| path.display().to_string()).unwrap_or(requested_root);
-        let holder = match ctx.actor_session_id() {
-            Some(id) => sessions_holder(ctx, id)?,
-            None => super::device_lease::worktree_holder(ctx.tx(), project.id, &requested_root)?,
-        };
-        super::device_lease::check(ctx, &p.device, &holder)?;
-        let adb = adb_path(ctx.tx())?;
+        let session = ctx.actor_session_id();
+        let (holder, released, adb, sdk_root, integration_root) = ctx.read(|conn| {
+            let holder = run_holder(conn, session, project.id, &requested_root)?;
+            let released = super::device_lease::prune(ctx.engine(), conn);
+            let integration_root = p.integration_id.map(|id| integration_root(conn, project.id, id)).transpose()?;
+            Ok((holder, released, adb_path(conn), android_sdk_root(conn), integration_root))
+        })?;
+        for lease in released { ctx.emit(super::device_lease::RELEASED, lease.event()); }
+        ctx.engine().device_leases.check(&p.device, &holder)?;
+        let adb = adb?;
         let device = require_device(&adb, &p.device)?;
         if device.state != "device" {
             return Err(BusError::unavailable("device.not_ready", format!("{} is {}", device.model, device.state)));
         }
         let default_gradle_command = project.run_cmd.as_deref().is_none_or(|command| command.trim().is_empty());
         let gradle_init = default_gradle_command.then(gradle_init_script).transpose()?;
-        let root = resolve_run_root(ctx, project.id, &project.path, p.worktree.as_deref(), p.integration_id)?;
+        let selected = integration_root.unwrap_or_else(|| PathBuf::from(p.worktree.as_deref().unwrap_or(&project.path)));
+        let root = checked_run_root(&project.path, &selected)?;
         let project_root = std::fs::canonicalize(&project.path)
             .map_err(|error| BusError::invalid("project.path", error.to_string()))?;
         let sync_primary = p.integration_id.is_none() && root == project_root;
         let command = run_command(&root, project.run_cmd.as_deref(), p.variant.as_deref(), gradle_init.as_ref().map(|file| file.path()))?;
-        let sdk_root = match android_sdk_root(ctx.tx()) {
+        let sdk_root = match sdk_root {
             Ok(path) => Some(path),
             Err(error) if default_gradle_command => return Err(error),
             Err(_) => None,
         };
+        let source = run_source(&root, &project.path);
+        Ok(RunPrepared { adb, requested_root, root, command, gradle_init, sdk_root, default_gradle_command, sync_primary, source })
+    }, |ctx: &mut Ctx, p, prepared| {
+        let RunPrepared { adb, requested_root, root, command, gradle_init, sdk_root, default_gradle_command, sync_primary, source } = prepared;
+        let project = get_project(ctx.tx(), p.project_id)?;
+        let holder = run_holder(ctx.tx(), ctx.actor_session_id(), project.id, &requested_root)?;
+        // Again under the lock: the device may have been taken while adb was answering.
+        super::device_lease::check(ctx, &p.device, &holder)?;
         ctx.tx().execute(
             "INSERT INTO device_runs(project_id,device,worktree,state,started_at) VALUES (?1,?2,?3,'building',?4)",
             params![project.id,p.device,root.display().to_string(),ctx.now],
@@ -172,12 +188,11 @@ pub fn register(e: &mut Engine) {
         let id = ctx.tx().last_insert_rowid();
         let run = get_run(ctx.tx(), id)?;
         let runtime = RunRuntime::new(id);
-        let action = format!("device.run {} from {}", p.variant.as_deref().unwrap_or("debug"), run_source(&root, &project.path));
-        ctx.engine().device_runs.lock().unwrap().insert(id, runtime.clone());
-        if let Err(error) = super::device_lease::acquire(ctx, crate::device_lease::Lease::new(&p.device, holder, crate::device_lease::Kind::Run(id), &action, None)) {
-            ctx.engine().device_runs.lock().unwrap().remove(&id);
-            return Err(error);
-        }
+        let action = format!("device.run {} from {source}", p.variant.as_deref().unwrap_or("debug"));
+        // From here the run exists in memory as well as in this transaction: the guard takes it
+        // back out (runtime and lease) unless the transaction commits.
+        let pending = PendingRun::register(ctx.engine(), runtime.clone())?;
+        super::device_lease::acquire(ctx, crate::device_lease::Lease::new(&p.device, holder, crate::device_lease::Kind::Run(id), &action, None))?;
         let parent = ctx.req_id;
         let device_serial = p.device;
         let variant = p.variant.unwrap_or_else(|| "debug".to_string());
@@ -196,6 +211,7 @@ pub fn register(e: &mut Engine) {
             sync_primary,
         };
         ctx.after_commit(move |engine| {
+            pending.keep();
             std::thread::spawn(move || run_worker(engine, runtime, parent, request));
         });
         Ok(run)
@@ -203,11 +219,11 @@ pub fn register(e: &mut Engine) {
 
     e.register::<Build>(|ctx: &mut Ctx, p| {
         let project = get_project(ctx.tx(), p.project_id)?;
-        let root = resolve_run_root(ctx, project.id, &project.path, p.worktree.as_deref(), p.integration_id)?;
+        let root = resolve_run_root(ctx.tx(), project.id, &project.path, p.worktree.as_deref(), p.integration_id)?;
         let variant = p.variant.unwrap_or_else(|| "release".to_string());
         let format = p.format.unwrap_or_else(|| "apk".to_string());
         let publish = p.publish.unwrap_or(false);
-        let signing_profile = load_signing_profile(ctx.engine(), &project.path)?.filter(|profile| profile.enabled);
+        let signing_profile = build_signing_profile(ctx.engine(), &project.path)?;
         let signing_init = signing_profile.as_ref().map(|_| signing_init_script()).transpose()?;
         // A release build is Gradle's alone: no adb, no device, and no `build_cmd` detour —
         // that one belongs to the integration verifier. Builds also skip the primary-checkout
@@ -221,12 +237,13 @@ pub fn register(e: &mut Engine) {
         let id = ctx.tx().last_insert_rowid();
         let run = get_run(ctx.tx(), id)?;
         let runtime = RunRuntime::new(id);
-        ctx.engine().device_runs.lock().unwrap().insert(id, runtime.clone());
+        let pending = PendingRun::register(ctx.engine(), runtime.clone())?;
         let parent = ctx.req_id;
         ctx.set_project(project.id);
         ctx.emit("run.changed", serde_json::to_value(&run).bus()?);
         let request = BuildWorkerRequest { root, command, sdk_root, variant, format, signing_profile, _signing_init: signing_init };
         ctx.after_commit(move |engine| {
+            pending.keep();
             std::thread::spawn(move || build_worker(engine, runtime, parent, request));
         });
         Ok(run)
@@ -235,6 +252,7 @@ pub fn register(e: &mut Engine) {
     e.register_unlocked::<SigningGet>(|ctx, p| {
         let project = ctx.read(|conn| get_project(conn, p.project_id))?;
         signing_profile_out(ctx.engine(), &project.path)
+            .map_err(|error| error.with_hint("switch Relay signing off, or create the profile again"))
     });
 
     // Key generation and Secret Service can both wait on external processes. The transaction
@@ -400,23 +418,60 @@ pub fn register(e: &mut Engine) {
     });
 }
 
+/// The first wait before `adb track-devices` is started again, doubling to the second.
+const WATCH_RETRY_MIN: Duration = Duration::from_millis(500);
+const WATCH_RETRY_MAX: Duration = Duration::from_secs(10);
+
+/// Follow `adb track-devices` for as long as any client holds a watch. The stream ends when the
+/// adb server restarts (another adb of a different version, `adb kill-server`, a crash); the
+/// worker then starts it again, which also starts the server, until the last client lets go.
 fn device_watch_worker(engine: Arc<Engine>, runtime: Arc<DeviceWatchRuntime>, adb: PathBuf) {
-    if runtime.stopped() { return; }
-    let child = Command::new(adb).args(["track-devices", "-l"]).stdout(Stdio::piped()).stderr(Stdio::null()).spawn();
-    let Ok(mut child) = child else { clear_device_watch(&engine, &runtime); return; };
-    let Some(stdout) = child.stdout.take() else { let _ = child.kill(); clear_device_watch(&engine, &runtime); return; };
-    if !runtime.install(child) { return; }
-    let mut reader = BufReader::new(stdout);
-    let mut line = String::new();
+    let mut retry = WATCH_RETRY_MIN;
     while !runtime.stopped() {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => engine.emit_system("device.changed", json!({"reason":"system"})),
+        let started = Instant::now();
+        let child = Command::new(&adb).args(["track-devices", "-l"]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn();
+        if let Ok(mut child) = child {
+            match child.stdout.take() {
+                Some(stdout) => {
+                    if !runtime.install(child) { break; }
+                    // Every frame is the whole device list, the first one included: a server that
+                    // came back with a different list is reported by that first frame.
+                    let mut reader = BufReader::new(stdout);
+                    while !runtime.stopped() {
+                        match read_track_frame(&mut reader) {
+                            Ok(Some(_)) => engine.emit_system("device.changed", json!({"reason":"system"})),
+                            Ok(None) | Err(_) => break,
+                        }
+                    }
+                    runtime.finish();
+                }
+                None => { let _ = child.kill(); let _ = child.wait(); }
+            }
         }
+        // A stream that ran for a while was healthy; one that died at once backs off.
+        if started.elapsed() > WATCH_RETRY_MAX { retry = WATCH_RETRY_MIN; }
+        let until = Instant::now() + retry;
+        while !runtime.stopped() && Instant::now() < until { std::thread::sleep(Duration::from_millis(50)); }
+        retry = (retry * 2).min(WATCH_RETRY_MAX);
     }
-    runtime.finish();
     clear_device_watch(&engine, &runtime);
+}
+
+/// One message of `adb track-devices`: a `%04x` byte count, then that many bytes of device
+/// list (one device per line, none at all once the last one is unplugged — which is why the
+/// stream cannot be read by lines). `Ok(None)` when the stream ends between messages.
+fn read_track_frame(reader: &mut impl Read) -> std::io::Result<Option<Vec<u8>>> {
+    let mut header = [0u8; 4];
+    if let Err(error) = reader.read_exact(&mut header) {
+        return if error.kind() == std::io::ErrorKind::UnexpectedEof { Ok(None) } else { Err(error) };
+    }
+    let length = std::str::from_utf8(&header).ok()
+        .filter(|header| header.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .and_then(|header| usize::from_str_radix(header, 16).ok())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("not an adb length prefix: {:?}", String::from_utf8_lossy(&header))))?;
+    let mut payload = vec![0u8; length];
+    reader.read_exact(&mut payload)?;
+    Ok(Some(payload))
 }
 
 fn clear_device_watch(engine: &Engine, runtime: &Arc<DeviceWatchRuntime>) {
@@ -452,25 +507,38 @@ fn sdk_tool(conn: &rusqlite::Connection, setting: &str, name: &str) -> Result<Pa
 }
 
 fn android_sdk_root(conn: &rusqlite::Connection) -> Result<PathBuf, BusError> {
-    let configured: Option<String> = conn.query_row("SELECT value FROM settings WHERE path='device.sdk_path'", [], |row| row.get(0)).optional().bus()?;
-    if let Some(value) = configured.and_then(|value| serde_json::from_str::<String>(&value).ok()).filter(|value| !value.is_empty()) {
-        let path = PathBuf::from(value);
-        if path.is_dir() { return Ok(path); }
-    }
-    for key in ["ANDROID_SDK_ROOT", "ANDROID_HOME"] {
-        if let Some(path) = std::env::var_os(key).map(PathBuf::from).filter(|path| path.is_dir()) { return Ok(path); }
-    }
-    if let Some(home) = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) {
-        for path in [home.join("Android/Sdk"), home.join("Android/sdk")] {
-            if path.is_dir() { return Ok(path); }
-        }
-    }
+    if let Some(root) = located_sdk_root(conn)? { return Ok(root); }
     if let Ok(adb) = adb_path(conn) {
         if adb.parent().and_then(Path::file_name).is_some_and(|name| name == "platform-tools") {
             if let Some(root) = adb.parent().and_then(Path::parent).filter(|path| path.is_dir()) { return Ok(root.to_path_buf()); }
         }
     }
     Err(BusError::unavailable("avd.sdk_missing", "Android SDK root could not be detected").with_hint("set the Android SDK path in Settings"))
+}
+
+/// The SDK root from Settings, the environment or the usual install location — everything
+/// [`android_sdk_root`] tries except deriving it from adb, so [`adb_path`] can look there too.
+fn located_sdk_root(conn: &rusqlite::Connection) -> Result<Option<PathBuf>, BusError> {
+    let configured: Option<String> = conn.prepare_cached("SELECT value FROM settings WHERE path='device.sdk_path'").bus()?
+        .query_row([], |row| row.get(0)).optional().bus()?;
+    if let Some(value) = configured.and_then(|value| serde_json::from_str::<String>(&value).ok()).filter(|value| !value.is_empty()) {
+        let path = PathBuf::from(value);
+        if path.is_dir() { return Ok(Some(path)); }
+    }
+    for key in ["ANDROID_SDK_ROOT", "ANDROID_HOME"] {
+        if let Some(path) = std::env::var_os(key).map(PathBuf::from).filter(|path| path.is_dir()) { return Ok(Some(path)); }
+    }
+    if let Some(home) = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) {
+        for path in [home.join("Android/Sdk"), home.join("Android/sdk")] {
+            if path.is_dir() { return Ok(Some(path)); }
+        }
+    }
+    Ok(None)
+}
+
+/// The adb an Android SDK ships, when it has one.
+fn sdk_adb(sdk: &Path) -> Option<PathBuf> {
+    Some(sdk.join("platform-tools/adb")).filter(|path| path.is_file())
 }
 
 fn find_avdmanager(sdk: &Path) -> Option<PathBuf> {
@@ -582,13 +650,14 @@ pub fn run_by_id(engine: &Engine, id: Id) -> Result<Arc<RunRuntime>, BusError> {
         })
 }
 
+/// adb from Settings, else PATH, else the discovered Android SDK's `platform-tools` — the
+/// order `sdk_tool` uses for the emulator and avdmanager. Android Studio installs adb only
+/// there, and a desktop session's PATH rarely includes it.
 fn adb_path(conn: &rusqlite::Connection) -> Result<PathBuf, BusError> {
     let configured: Option<String> = conn
-        .query_row(
-            "SELECT value FROM settings WHERE path='device.adb_path'",
-            [],
-            |row| row.get(0),
-        )
+        .prepare_cached("SELECT value FROM settings WHERE path='device.adb_path'")
+        .bus()?
+        .query_row([], |row| row.get(0))
         .optional()
         .bus()?;
     if let Some(value) = configured.and_then(|value| serde_json::from_str::<String>(&value).ok()) {
@@ -601,8 +670,12 @@ fn adb_path(conn: &rusqlite::Connection) -> Result<PathBuf, BusError> {
             format!("configured adb does not exist: {}", path.display()),
         ));
     }
-    which::which("adb").map_err(|_| {
-        BusError::unavailable("device.adb_missing", "adb is not installed or not on PATH")
+    if let Ok(path) = which::which("adb") {
+        return Ok(path);
+    }
+    located_sdk_root(conn)?.as_deref().and_then(sdk_adb).ok_or_else(|| {
+        BusError::unavailable("device.adb_missing", "adb is not on PATH or in the Android SDK")
+            .with_hint("install the Android SDK platform-tools, or set the adb path in Settings")
     })
 }
 
@@ -822,7 +895,7 @@ pub fn mirror_worker(engine: Arc<Engine>, runtime: Arc<MirrorRuntime>) {
         }
     };
     if runtime.stopped() {
-        let _ = mirror_adb(&runtime, mirror::forward_remove_args(&runtime.device, runtime.scid), MIRROR_FORWARD_TIMEOUT);
+        let _ = mirror_adb(&runtime, mirror::forward_remove_args(&runtime.device, port), MIRROR_FORWARD_TIMEOUT);
         engine.mirrors.lock().unwrap().remove(&runtime.id);
         return;
     }
@@ -838,7 +911,7 @@ pub fn mirror_worker(engine: Arc<Engine>, runtime: Arc<MirrorRuntime>) {
     let mut server = match command.spawn() {
         Ok(server) => server,
         Err(error) => {
-            let _ = mirror_adb(&runtime, mirror::forward_remove_args(&runtime.device, runtime.scid), MIRROR_FORWARD_TIMEOUT);
+            let _ = mirror_adb(&runtime, mirror::forward_remove_args(&runtime.device, port), MIRROR_FORWARD_TIMEOUT);
             fail("device.mirror_spawn_failed", error.to_string());
             return;
         }
@@ -928,7 +1001,7 @@ pub fn mirror_worker(engine: Arc<Engine>, runtime: Arc<MirrorRuntime>) {
     if let Some(mut child) = runtime.take_child() {
         let _ = child.wait();
     }
-    let _ = mirror_adb(&runtime, mirror::forward_remove_args(&runtime.device, runtime.scid), MIRROR_FORWARD_TIMEOUT);
+    let _ = mirror_adb(&runtime, mirror::forward_remove_args(&runtime.device, port), MIRROR_FORWARD_TIMEOUT);
     match result {
         Err(error) if !requested_stop => {
             if device_present(&runtime) {
@@ -998,10 +1071,61 @@ pub fn send_input(runtime: &MirrorRuntime, event: &Value) -> Result<(), BusError
         .map_err(|error| BusError::unavailable("device.input_failed", error.to_string()))
 }
 
-/// The lease holder for a run an agent session asked for itself.
-fn sessions_holder(ctx: &Ctx, id: Id) -> Result<crate::device_lease::Holder, BusError> {
-    let row = crate::sessions::by_id(ctx.tx(), id)?.ok_or_else(|| BusError::internal("bound session vanished"))?;
-    Ok(crate::device_lease::Holder::Session { id, name: row.session.name })
+/// What `device.run` settled with nothing locked (D149): the device answered, the checkout,
+/// its command and its SDK are resolved. The transaction only records the run.
+struct RunPrepared {
+    adb: PathBuf,
+    requested_root: String,
+    root: PathBuf,
+    command: String,
+    gradle_init: Option<tempfile::NamedTempFile>,
+    sdk_root: Option<PathBuf>,
+    default_gradle_command: bool,
+    sync_primary: bool,
+    source: String,
+}
+
+/// A run registered in memory — its live runtime and, for a device run, its lease — by a
+/// request whose transaction has not committed yet. Neither is part of the transaction, so a
+/// rollback alone would leave a phantom run holding the device forever. The guard rides in
+/// the request's after-commit closure: committed, the closure runs and [`PendingRun::keep`]
+/// disarms it; rolled back, the closure is dropped unrun and the guard takes both back out.
+struct PendingRun {
+    engine: Option<Arc<Engine>>,
+    id: Id,
+}
+
+impl PendingRun {
+    fn register(engine: &Engine, runtime: Arc<RunRuntime>) -> Result<Self, BusError> {
+        let engine = engine.arc().ok_or_else(|| BusError::internal("the engine is shutting down"))?;
+        let id = runtime.id;
+        engine.device_runs.lock().unwrap().insert(id, runtime);
+        Ok(Self { engine: Some(engine), id })
+    }
+    fn keep(mut self) {
+        self.engine = None;
+    }
+}
+
+impl Drop for PendingRun {
+    fn drop(&mut self) {
+        let Some(engine) = self.engine.take() else { return };
+        engine.device_runs.lock().unwrap().remove(&self.id);
+        // Silently: the acquisition's event was never sent either.
+        engine.device_leases.release_run(self.id);
+    }
+}
+
+/// Who a run's lease belongs to: the agent session that asked for it, else the live session
+/// that owns the checkout, else the user.
+fn run_holder(conn: &rusqlite::Connection, session: Option<Id>, project_id: Id, requested_root: &str) -> Result<crate::device_lease::Holder, BusError> {
+    match session {
+        Some(id) => {
+            let row = crate::sessions::by_id(conn, id)?.ok_or_else(|| BusError::internal("bound session vanished"))?;
+            Ok(crate::device_lease::Holder::Session { id, name: row.session.name })
+        }
+        None => super::device_lease::worktree_holder(conn, project_id, requested_root),
+    }
 }
 
 /// `relay/brisk-otter` for a pooled checkout, `the primary checkout` otherwise: what a refused
@@ -1017,52 +1141,59 @@ fn run_source(root: &Path, project_path: &str) -> String {
 }
 
 fn resolve_run_root(
-    ctx: &Ctx,
+    conn: &rusqlite::Connection,
     project_id: Id,
     project_path: &str,
     requested: Option<&str>,
     integration_id: Option<Id>,
 ) -> Result<PathBuf, BusError> {
-    let selected = if let Some(integration_id) = integration_id {
-        let row: Option<(Id, Option<String>, String)> = ctx
-            .tx()
-            .query_row(
-                "SELECT project_id,worktree,state FROM integrations WHERE id=?1",
-                [integration_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()
-            .bus()?;
-        let (owner, path, state) = row.ok_or_else(|| {
-            BusError::not_found(
-                "integration.not_found",
-                format!("no integration {integration_id}"),
-            )
-        })?;
-        if owner != project_id {
-            return Err(BusError::invalid(
-                "device.integration_project",
-                "integration belongs to another project",
-            ));
-        }
-        if state != "passed" {
-            return Err(BusError::conflict(
-                "device.integration_not_ready",
-                format!("integration {integration_id} is {state}"),
-            ));
-        }
-        PathBuf::from(path.ok_or_else(|| {
-            BusError::conflict(
-                "device.integration_not_ready",
-                "integration has no worktree",
-            )
-        })?)
-    } else {
-        requested
+    let selected = match integration_id {
+        Some(integration_id) => integration_root(conn, project_id, integration_id)?,
+        None => requested
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(project_path))
+            .unwrap_or_else(|| PathBuf::from(project_path)),
     };
-    let selected = std::fs::canonicalize(&selected)
+    checked_run_root(project_path, &selected)
+}
+
+/// The worktree a passed integration left behind: the store half of [`resolve_run_root`].
+fn integration_root(conn: &rusqlite::Connection, project_id: Id, integration_id: Id) -> Result<PathBuf, BusError> {
+    let row: Option<(Id, Option<String>, String)> = conn
+        .prepare_cached("SELECT project_id,worktree,state FROM integrations WHERE id=?1")
+        .bus()?
+        .query_row([integration_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .optional()
+        .bus()?;
+    let (owner, path, state) = row.ok_or_else(|| {
+        BusError::not_found(
+            "integration.not_found",
+            format!("no integration {integration_id}"),
+        )
+    })?;
+    if owner != project_id {
+        return Err(BusError::invalid(
+            "device.integration_project",
+            "integration belongs to another project",
+        ));
+    }
+    if state != "passed" {
+        return Err(BusError::conflict(
+            "device.integration_not_ready",
+            format!("integration {integration_id} is {state}"),
+        ));
+    }
+    Ok(PathBuf::from(path.ok_or_else(|| {
+        BusError::conflict(
+            "device.integration_not_ready",
+            "integration has no worktree",
+        )
+    })?))
+}
+
+/// The filesystem half of [`resolve_run_root`]: `selected`, canonical, and one of the project's
+/// checkouts.
+fn checked_run_root(project_path: &str, selected: &Path) -> Result<PathBuf, BusError> {
+    let selected = std::fs::canonicalize(selected)
         .map_err(|e| BusError::invalid("device.worktree", e.to_string()))?;
     // Membership only. Listing the worktrees with a dirty check ran a `git status` per checkout
     // before a build had even looked for its Gradle wrapper (PERF §1.4).
@@ -1300,6 +1431,40 @@ fn load_signing_profile(engine: &Engine, project: &str) -> Result<Option<Signing
     }))
 }
 
+/// The profile a release build signs with, if any. A profile that cannot be loaded refuses
+/// the build only while it is still enabled: one switched off is ignored whatever state its
+/// keystore is in, so a broken profile never holds every release build hostage.
+fn build_signing_profile(engine: &Engine, project: &str) -> Result<Option<SigningRuntimeProfile>, BusError> {
+    match load_signing_profile(engine, project) {
+        Ok(profile) => Ok(profile.filter(|profile| profile.enabled)),
+        Err(_) if signing_profile_switched_off(&signing_directory(engine, project)) => Ok(None),
+        Err(error) => Err(error.with_hint("switch Relay signing off, or create the profile again")),
+    }
+}
+
+/// Whether the saved profile, read leniently, says `"enabled": false`.
+fn signing_profile_switched_off(directory: &Path) -> bool {
+    fs::read_to_string(directory.join(SIGNING_PROFILE_FILE)).ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|value| value.get("enabled").and_then(Value::as_bool))
+        == Some(false)
+}
+
+/// Move a profile directory that cannot be used out of the way, keeping it: a broken profile
+/// may still hold the only copy of an upload key. Gone already (a racing create) is fine.
+fn quarantine_signing_directory(directory: &Path) -> Result<(), BusError> {
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|elapsed| elapsed.as_millis()).unwrap_or(0);
+    let name = directory.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+    let aside = (0..).map(|n| directory.with_file_name(format!("{name}.broken-{stamp}-{n}")))
+        .find(|path| !path.exists()).expect("an unused name");
+    match fs::rename(directory, aside) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            Err(BusError::unavailable("device.signing_store_failed", error.to_string()))
+        }
+        _ => Ok(()),
+    }
+}
+
 fn signing_profile_out(engine: &Engine, project: &str) -> Result<SigningProfileOut, BusError> {
     let Some(profile) = load_signing_profile(engine, project)? else {
         return Ok(SigningProfileOut { configured: false, enabled: false, key_alias: None, keystore: None });
@@ -1325,6 +1490,15 @@ fn create_signing_profile(
     fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
         .map_err(|error| BusError::unavailable("device.signing_store_failed", error.to_string()))?;
     let directory = signing_directory(engine, project);
+    let _creating = CreatingSigning::claim(&directory)?;
+    // Only a usable profile blocks a new one. A directory left half-created by a crash, or a
+    // profile whose file or keystore broke, is set aside so the project can start over.
+    if directory.exists() {
+        if let Ok(Some(_)) = load_signing_profile_disk(engine, project) {
+            return Err(BusError::conflict("device.signing_exists", "this project already has a Relay signing profile"));
+        }
+        quarantine_signing_directory(&directory)?;
+    }
     fs::create_dir(&directory).map_err(|error| {
         if error.kind() == std::io::ErrorKind::AlreadyExists {
             BusError::conflict("device.signing_exists", "this project already has a Relay signing profile")
@@ -1362,8 +1536,41 @@ fn create_signing_profile(
     result
 }
 
+/// Profile directories a `device.signing.create` is filling in right now. A directory with no
+/// usable profile is abandoned — safe to set aside — only when no create in this process owns it.
+static SIGNING_CREATING: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+struct CreatingSigning(PathBuf);
+
+impl CreatingSigning {
+    fn claim(directory: &Path) -> Result<Self, BusError> {
+        let mut creating = SIGNING_CREATING.lock().unwrap_or_else(|poison| poison.into_inner());
+        if creating.iter().any(|path| path == directory) {
+            return Err(BusError::conflict("device.signing_exists", "a Relay signing profile is already being created for this project"));
+        }
+        creating.push(directory.to_path_buf());
+        Ok(Self(directory.to_path_buf()))
+    }
+}
+
+impl Drop for CreatingSigning {
+    fn drop(&mut self) {
+        SIGNING_CREATING.lock().unwrap_or_else(|poison| poison.into_inner()).retain(|path| path != &self.0);
+    }
+}
+
 fn set_signing_enabled(engine: &Engine, project: &str, enabled: bool) -> Result<SigningProfileOut, BusError> {
-    let Some((directory, mut profile)) = load_signing_profile_disk(engine, project)? else {
+    let loaded = match load_signing_profile_disk(engine, project) {
+        // Switching off a profile that cannot be loaded sets it aside: it could never sign
+        // anything, and it must not keep refusing builds or a fresh `device.signing.create`.
+        Err(_) if !enabled => {
+            quarantine_signing_directory(&signing_directory(engine, project))?;
+            return signing_profile_out(engine, project);
+        }
+        Err(error) => return Err(error.with_hint("create the Relay signing profile again")),
+        Ok(loaded) => loaded,
+    };
+    let Some((directory, mut profile)) = loaded else {
         return Err(BusError::not_found(
             "device.signing_missing",
             "this project has no Relay signing profile",
@@ -1540,13 +1747,23 @@ impl PrimarySyncError {
     }
 }
 
+/// A local git query (rev-parse, config, merge-base, diff) on the primary checkout.
+const SYNC_GIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// The one network step of the primary sync. A remote that stops answering fails the run
+/// instead of leaving it in 'building' with its device lease held.
+const SYNC_FETCH_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// `git -C root args` under a deadline. `Err` carries what to tell the run.
+fn git_output(root: &Path, args: &[&str]) -> Result<std::process::Output, String> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(root).args(args);
+    crate::proc::output_with_timeout(&mut command, SYNC_GIT_TIMEOUT)
+        .map_err(|error| format!("could not run git: {error}"))?
+        .ok_or_else(|| format!("git {} did not finish within {} s", args.join(" "), SYNC_GIT_TIMEOUT.as_secs()))
+}
+
 fn git_capture(root: &Path, args: &[&str]) -> Result<String, PrimarySyncError> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .output()
-        .map_err(|error| PrimarySyncError::new("device.sync_failed", format!("could not run git: {error}")))?;
+    let output = git_output(root, args).map_err(|message| PrimarySyncError::new("device.sync_failed", message))?;
     if !output.status.success() {
         let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(PrimarySyncError::new(
@@ -1558,30 +1775,38 @@ fn git_capture(root: &Path, args: &[&str]) -> Result<String, PrimarySyncError> {
 }
 
 fn git_optional(root: &Path, args: &[&str]) -> Option<String> {
-    Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .output()
+    git_output(root, args)
         .ok()
         .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn git_is_ancestor(root: &Path, ancestor: &str, descendant: &str) -> Result<bool, PrimarySyncError> {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["merge-base", "--is-ancestor", ancestor, descendant])
-        .status()
-        .map_err(|error| PrimarySyncError::new("device.sync_failed", format!("could not compare revisions: {error}")))?;
-    match status.code() {
+    let output = git_output(root, &["merge-base", "--is-ancestor", ancestor, descendant])
+        .map_err(|message| PrimarySyncError::new("device.sync_failed", format!("could not compare revisions: {message}")))?;
+    match output.status.code() {
         Some(0) => Ok(true),
         Some(1) => Ok(false),
         _ => Err(PrimarySyncError::new(
             "device.sync_failed",
             "git could not compare the primary branch with its upstream",
         )),
+    }
+}
+
+/// Fetch `remote` without ever waiting on a person (no credential prompt) or a stalled link.
+fn git_fetch(root: &Path, remote: &str) -> Result<(), String> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(root);
+    crate::proc::quiet_network_git(&mut command);
+    command.args(["fetch", "--quiet", "--no-tags", remote]);
+    let output = crate::proc::output_with_timeout(&mut command, SYNC_FETCH_TIMEOUT)
+        .map_err(|error| format!("could not run git: {error}"))?
+        .ok_or_else(|| format!("git fetch did not finish within {} s", SYNC_FETCH_TIMEOUT.as_secs()))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
     }
 }
 
@@ -1615,7 +1840,7 @@ fn sync_primary_checkout(root: &Path) -> Result<String, PrimarySyncError> {
 
     let remote = git_capture(root, &["config", "--get", &format!("branch.{branch}.remote")])?;
     if remote != "." {
-        worktree::git_mutate(root, &["fetch", "--quiet", "--no-tags", &remote]).map_err(|error| {
+        git_fetch(root, &remote).map_err(|error| {
             PrimarySyncError::new(
                 "device.sync_fetch_failed",
                 format!("could not refresh {upstream}: {error}"),
@@ -1692,6 +1917,28 @@ struct RunWorkerRequest {
     sync_primary: bool,
 }
 
+/// `adb shell` probes the worker makes — `pidof`, `resolve-activity`, `logcat -c` / `-d` — and
+/// a deadline on each, so a device that stops answering fails the run instead of leaving it
+/// in 'building' with its lease held.
+const ADB_SHELL_TIMEOUT: Duration = Duration::from_secs(15);
+/// `am start -W` waits for the activity to draw its first frame.
+const ADB_LAUNCH_TIMEOUT: Duration = Duration::from_secs(60);
+/// One `pidof` while waiting for the launched app to appear.
+const ADB_PIDOF_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often a running app is checked for having exited.
+const APP_EXIT_POLL: Duration = Duration::from_secs(2);
+/// apksigner and jarsigner are JVMs.
+const SIGNING_VERIFY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// `adb args` under `timeout`; `Err` says what to put in the run log.
+fn adb_output(adb: &str, args: &[&str], timeout: Duration) -> Result<std::process::Output, String> {
+    let mut command = Command::new(adb);
+    command.args(args);
+    crate::proc::output_with_timeout(&mut command, timeout)
+        .map_err(|error| format!("could not run adb: {error}"))?
+        .ok_or_else(|| format!("adb {} did not answer within {} s", args.join(" "), timeout.as_secs()))
+}
+
 fn run_worker(engine: Arc<Engine>, runtime: Arc<RunRuntime>, parent: uuid::Uuid, request: RunWorkerRequest) {
     let RunWorkerRequest {
         root,
@@ -1705,6 +1952,10 @@ fn run_worker(engine: Arc<Engine>, runtime: Arc<RunRuntime>, parent: uuid::Uuid,
         sync_primary,
     } = request;
     if sync_primary {
+        // A stop that landed before the worker started must not fetch or fast-forward anything.
+        if runtime.stopped() {
+            return end_run(&engine, &runtime);
+        }
         match sync_primary_checkout(&root) {
             Ok(message) => runtime.push(message),
             Err(error) => {
@@ -1727,9 +1978,12 @@ fn run_worker(engine: Arc<Engine>, runtime: Arc<RunRuntime>, parent: uuid::Uuid,
         Streamed::Ok => {}
         Streamed::Stopped | Streamed::Failed => return,
     }
-    let _ = Command::new(&adb)
-        .args(["-s", &device, "logcat", "-c"])
-        .output();
+    // From here on every step checks for a stop: `device.run.stop` between the install and the
+    // launch must not see the app opened and its row turned back to 'running' afterwards.
+    if runtime.stopped() {
+        return end_run(&engine, &runtime);
+    }
+    let _ = adb_output(&adb, &["-s", &device, "logcat", "-c"], ADB_SHELL_TIMEOUT);
     let launched = if launch_after_build {
         match launch_installed_app(&adb, &device, &root, &variant) {
             Ok(app) => {
@@ -1764,18 +2018,36 @@ fn run_worker(engine: Arc<Engine>, runtime: Arc<RunRuntime>, parent: uuid::Uuid,
         );
         return;
     };
-    let Some(pid) = wait_for_app_pid(&adb, &device, &launched.package, Duration::from_secs(10)) else {
-        fail_run(
-            &engine,
-            &runtime,
-            parent,
-            "device.pid_missing",
-            "the installed app did not expose a process after launch",
-        );
+    let Some(pid) = wait_for_app_pid(&adb, &device, &launched.package, Duration::from_secs(10), &runtime) else {
+        if runtime.stopped() {
+            return end_run(&engine, &runtime);
+        }
+        // No process usually means it already died. The crash buffer says why; `logcat -c`
+        // emptied it before the launch, so whatever is there for this package is this launch.
+        let dump = adb_output(&adb, &["-s", &device, "logcat", "-d", "-v", "brief", "-b", "crash"], ADB_SHELL_TIMEOUT)
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .unwrap_or_default();
+        if let Some(crash) = startup_crash(&dump, &launched.package) {
+            let headline = crash.iter().find(|line| line.contains("FATAL EXCEPTION")).unwrap_or(&crash[0]).clone();
+            report_crash(&engine, runtime.id, parent, &headline);
+            for line in crash {
+                runtime.push(line);
+            }
+            fail_run(&engine, &runtime, parent, "device.app_crashed", "the app crashed during startup");
+        } else {
+            fail_run(
+                &engine,
+                &runtime,
+                parent,
+                "device.pid_missing",
+                "the installed app did not expose a process after launch",
+            );
+        }
         return;
     };
+    // Refused when the row already left 'building' (a stop won the race): nothing to attach.
     if advance_run(&engine, runtime.id, parent, "running", false).is_err() {
-        return;
+        return end_run(&engine, &runtime);
     }
     runtime.push(format!("logcat attached pid={pid}"));
     let mut logcat = Command::new(&adb);
@@ -1804,6 +2076,7 @@ fn run_worker(engine: Arc<Engine>, runtime: Arc<RunRuntime>, parent: uuid::Uuid,
     };
     let Some(stdout) = child.stdout.take() else {
         let _ = child.kill();
+        let _ = child.wait();
         fail_run(
             &engine,
             &runtime,
@@ -1813,31 +2086,99 @@ fn run_worker(engine: Arc<Engine>, runtime: Arc<RunRuntime>, parent: uuid::Uuid,
         );
         return;
     };
+    let logcat_pid = child.id();
     runtime.set_child(child);
-    let mut crash_reported = false;
-    for line in BufReader::new(stdout).lines() {
-        if runtime.stopped() {
-            if let Some(mut child) = runtime.take_child() {
-                let _ = child.wait();
+    // `logcat --pid` outlives the process it follows, so the run would never end on its own:
+    // watch the app and end the stream once it is gone.
+    let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (done, finished) = std::sync::mpsc::channel::<()>();
+    let watcher = {
+        let (adb, device, package, exited) = (adb.clone(), device.clone(), launched.package.clone(), exited.clone());
+        std::thread::spawn(move || loop {
+            match finished.recv_timeout(APP_EXIT_POLL) {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                _ => return,
             }
-            return;
-        }
-        let Ok(line) = line else { break };
+            let output = adb_output(&adb, &["-s", &device, "shell", "pidof", "-s", &package], ADB_PIDOF_TIMEOUT).ok();
+            let alive = output.as_ref().and_then(|output| {
+                pid_alive(&String::from_utf8_lossy(&output.stdout), &String::from_utf8_lossy(&output.stderr), pid)
+            });
+            if alive == Some(false) {
+                exited.store(true, Ordering::SeqCst);
+                // The crash lines a dying app writes are already on their way; let them land.
+                if !matches!(finished.recv_timeout(Duration::from_millis(500)), Err(std::sync::mpsc::RecvTimeoutError::Timeout)) { return; }
+                // Not reaped yet: the worker joins this thread before it waits on logcat.
+                unsafe { libc::kill(logcat_pid as i32, libc::SIGTERM); }
+                return;
+            }
+        })
+    };
+    let mut crash_reported = false;
+    let mut reader = BufReader::new(stdout);
+    let mut buffer = Vec::new();
+    while !runtime.stopped() {
+        // Lossy: one line of binary or mis-encoded log must not end the stream.
+        let Ok(Some(line)) = read_lossy_line(&mut reader, &mut buffer) else { break };
         if !crash_reported && line.contains("FATAL EXCEPTION") {
             crash_reported = true;
             report_crash(&engine, runtime.id, parent, &line);
         }
         runtime.push(line);
     }
+    drop(done);
+    let _ = watcher.join();
     if let Some(mut child) = runtime.take_child() {
+        let _ = child.kill();
         let _ = child.wait();
     }
     if !runtime.stopped() {
+        if exited.load(Ordering::SeqCst) {
+            runtime.push(format!("app exited (pid {pid})"));
+        }
         let _ = advance_run(&engine, runtime.id, parent, "finished", true);
     }
-    engine.device_runs.lock().unwrap().remove(&runtime.id);
-    super::device_lease::release_run(&engine, runtime.id);
+    end_run(&engine, &runtime);
 }
+
+/// Read one line, invalid UTF-8 replaced rather than refused. `Ok(None)` at end of stream.
+fn read_lossy_line(reader: &mut impl BufRead, buffer: &mut Vec<u8>) -> std::io::Result<Option<String>> {
+    buffer.clear();
+    if reader.read_until(b'\n', buffer)? == 0 {
+        return Ok(None);
+    }
+    while matches!(buffer.last(), Some(b'\n' | b'\r')) {
+        buffer.pop();
+    }
+    Ok(Some(String::from_utf8_lossy(buffer).into_owned()))
+}
+
+/// Whether `pidof -s` output says `pid` is still the app's process. `None` when adb itself
+/// failed (device gone, server restarting) and the answer is unknown; a different pid means
+/// the app died and was started again, which ends this run's stream too.
+fn pid_alive(stdout: &str, stderr: &str, pid: u32) -> Option<bool> {
+    let pids: Vec<u32> = stdout.split_whitespace().filter_map(|value| value.parse().ok()).collect();
+    if pids.contains(&pid) {
+        Some(true)
+    } else if pids.is_empty() && !stderr.trim().is_empty() {
+        None
+    } else {
+        Some(false)
+    }
+}
+
+/// The crash in a `logcat -b crash` dump that belongs to `package`: from its `FATAL EXCEPTION`
+/// line to the next one, at most [`STARTUP_CRASH_LINES`] lines. `None` when it has none.
+fn startup_crash(dump: &str, package: &str) -> Option<Vec<String>> {
+    let lines: Vec<&str> = dump.lines().collect();
+    let process = lines.iter().position(|line| {
+        line.split_once("Process: ").is_some_and(|(_, rest)| rest.split([',', ' ']).next() == Some(package))
+    })?;
+    let start = lines[..process].iter().rposition(|line| line.contains("FATAL EXCEPTION")).unwrap_or(process);
+    let end = lines[process + 1..].iter().position(|line| line.contains("FATAL EXCEPTION")).map_or(lines.len(), |offset| process + 1 + offset);
+    Some(lines[start..end].iter().take(STARTUP_CRASH_LINES).map(|line| line.to_string()).collect())
+}
+
+const STARTUP_CRASH_LINES: usize = 200;
 
 /// Outcome of one streamed shell command. `Failed` has already failed the run; `Stopped`
 /// means `device.run.stop` won the race and the worker owns nothing more.
@@ -1891,15 +2232,19 @@ fn stream_command(
         return Streamed::Failed;
     };
     runtime.set_group_child(child);
-    for line in BufReader::new(stdout).lines() {
+    let mut reader = BufReader::new(stdout);
+    let mut buffer = Vec::new();
+    loop {
         if runtime.stopped() {
             if let Some(mut child) = runtime.take_child() {
                 let _ = child.wait();
             }
             return Streamed::Stopped;
         }
-        match line {
-            Ok(line) => runtime.push(line),
+        // Lossy, so a tool printing Latin-1 or raw bytes cannot cut the build log short.
+        match read_lossy_line(&mut reader, &mut buffer) {
+            Ok(Some(line)) => runtime.push(line),
+            Ok(None) => break,
             Err(error) => {
                 runtime.push(format!("output: {error}"));
                 break;
@@ -1981,7 +2326,7 @@ fn build_worker(engine: Arc<Engine>, runtime: Arc<RunRuntime>, parent: uuid::Uui
     runtime.push(format!("signing: {signing}"));
     runtime.push(format!("artifact: {}", artifact.display()));
     let _ = finish_build(&engine, runtime.id, parent, &artifact, signing);
-    engine.device_runs.lock().unwrap().remove(&runtime.id);
+    end_run(&engine, &runtime);
 }
 
 /// Verify the artifact after Gradle writes it. Relay never asks for a keystore or password:
@@ -1989,16 +2334,16 @@ fn build_worker(engine: Arc<Engine>, runtime: Arc<RunRuntime>, parent: uuid::Uui
 fn artifact_signing(sdk_root: &Path, artifact: &Path, format: &str) -> &'static str {
     let output = if format == "apk" {
         let Some(apksigner) = latest_build_tool(sdk_root, "apksigner") else { return "unverified" };
-        Command::new(apksigner).args(["verify", artifact.to_string_lossy().as_ref()]).env("LC_ALL", "C").output()
+        crate::proc::output_with_timeout(Command::new(apksigner).args(["verify", artifact.to_string_lossy().as_ref()]).env("LC_ALL", "C"), SIGNING_VERIFY_TIMEOUT)
     } else {
         let jarsigner = std::env::var_os("JAVA_HOME")
             .map(PathBuf::from)
             .map(|home| home.join("bin/jarsigner"))
             .filter(|path| path.is_file())
             .unwrap_or_else(|| PathBuf::from("jarsigner"));
-        Command::new(jarsigner).args(["-verify", artifact.to_string_lossy().as_ref()]).env("LC_ALL", "C").output()
+        crate::proc::output_with_timeout(Command::new(jarsigner).args(["-verify", artifact.to_string_lossy().as_ref()]).env("LC_ALL", "C"), SIGNING_VERIFY_TIMEOUT)
     };
-    let Ok(output) = output else { return "unverified" };
+    let Ok(Some(output)) = output else { return "unverified" };
     let detail = format!("{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr)).to_ascii_lowercase();
     if (format == "apk" && output.status.success()) || (format == "bundle" && detail.contains("jar verified")) {
         "signed"
@@ -2085,8 +2430,9 @@ fn launch_installed_app(adb: &str, device: &str, root: &Path, variant: &str) -> 
     }
     let mut resolution_errors = Vec::new();
     for package in packages {
-        let resolved = Command::new(adb)
-            .args([
+        let resolved = adb_output(
+            adb,
+            &[
                 "-s",
                 device,
                 "shell",
@@ -2099,9 +2445,10 @@ fn launch_installed_app(adb: &str, device: &str, root: &Path, variant: &str) -> 
                 "-c",
                 "android.intent.category.LAUNCHER",
                 &package,
-            ])
-            .output()
-            .map_err(|error| format!("could not resolve launcher for {package}: {error}"))?;
+            ],
+            ADB_SHELL_TIMEOUT,
+        )
+        .map_err(|error| format!("could not resolve launcher for {package}: {error}"))?;
         let stdout = String::from_utf8_lossy(&resolved.stdout);
         let component = stdout
             .lines()
@@ -2113,9 +2460,7 @@ fn launch_installed_app(adb: &str, device: &str, root: &Path, variant: &str) -> 
             resolution_errors.push(if detail.is_empty() { package } else { format!("{package}: {detail}") });
             continue;
         };
-        let launched = Command::new(adb)
-            .args(["-s", device, "shell", "am", "start", "-W", "-n", &component])
-            .output()
+        let launched = adb_output(adb, &["-s", device, "shell", "am", "start", "-W", "-n", &component], ADB_LAUNCH_TIMEOUT)
             .map_err(|error| format!("could not launch {component}: {error}"))?;
         let stdout = String::from_utf8_lossy(&launched.stdout);
         let stderr = String::from_utf8_lossy(&launched.stderr);
@@ -2141,13 +2486,14 @@ fn wait_for_app_pid(
     device: &str,
     package: &str,
     timeout: Duration,
+    runtime: &RunRuntime,
 ) -> Option<u32> {
     let deadline = Instant::now() + timeout;
     loop {
-        let output = Command::new(adb)
-            .args(["-s", device, "shell", "pidof", "-s", package])
-            .output()
-            .ok();
+        if runtime.stopped() {
+            return None;
+        }
+        let output = adb_output(adb, &["-s", device, "shell", "pidof", "-s", package], ADB_PIDOF_TIMEOUT).ok();
         if let Some(pid) = output
             .filter(|output| output.status.success())
             .and_then(|output| String::from_utf8(output.stdout).ok())
@@ -2210,8 +2556,23 @@ fn collect_output_metadata(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
 fn fail_run(engine: &Engine, runtime: &RunRuntime, parent: uuid::Uuid, code: &str, message: &str) {
     runtime.push(format!("{code}: {message}"));
     let _ = advance_run(engine, runtime.id, parent, "failed", true);
+    end_run(engine, runtime);
+}
+
+/// The worker is done with the run: no live stream, no lease. Idempotent, since
+/// `device.run.stop` has usually done both already.
+fn end_run(engine: &Engine, runtime: &RunRuntime) {
     engine.device_runs.lock().unwrap().remove(&runtime.id);
     super::device_lease::release_run(engine, runtime.id);
+}
+
+/// A worker's write to a run that is no longer live — stopped by `device.run.stop`, or already
+/// ended — is refused here, inside its transaction, so it can never turn the row back.
+fn require_live_run(written: usize, id: Id) -> Result<(), BusError> {
+    if written == 0 {
+        return Err(BusError::conflict("device.run_ended", format!("run {id} has already ended")));
+    }
+    Ok(())
 }
 
 /// A finished build records its artifact in the same write that finishes the run, so
@@ -2223,7 +2584,7 @@ fn finish_build(engine: &Engine, id: Id, parent: uuid::Uuid, artifact: &Path, si
     };
     let artifact = artifact.display().to_string();
     engine.system_write("device.build.finish",Some(parent),Some(project_id),None,json!({"run_id":id,"artifact":artifact,"signing":signing}),|tx,now|{
-        tx.execute("UPDATE device_runs SET state='finished',finished_at=?1,artifact=?2,signing=?3 WHERE id=?4",params![now,artifact,signing,id]).bus()?;
+        require_live_run(tx.execute("UPDATE device_runs SET state='finished',finished_at=?1,artifact=?2,signing=?3 WHERE id=?4 AND state IN ('building','running')",params![now,artifact,signing,id]).bus()?,id)?;
         let run=get_run(tx,id)?;
         Ok(((),vec![("run.changed".into(),serde_json::to_value(run).bus()?)]))
     })
@@ -2246,7 +2607,7 @@ fn advance_run(
         .bus()?
     };
     engine.system_write("device.run.advance",Some(parent),Some(project_id),None,json!({"run_id":id,"state":state}),|tx,now|{
-        tx.execute("UPDATE device_runs SET state=?1,finished_at=CASE WHEN ?2 THEN ?3 ELSE finished_at END WHERE id=?4",params![state,finished as i64,now,id]).bus()?;
+        require_live_run(tx.execute("UPDATE device_runs SET state=?1,finished_at=CASE WHEN ?2 THEN ?3 ELSE finished_at END WHERE id=?4 AND state IN ('building','running')",params![state,finished as i64,now,id]).bus()?,id)?;
         let run=get_run(tx,id)?;
         Ok(((),vec![("run.changed".into(),serde_json::to_value(run).bus()?)]))
     })
@@ -2429,5 +2790,151 @@ mod tests {
         assert_eq!(error.code, "device.sync_fetch_failed");
         assert_eq!(git(&checkout, &["rev-parse", "HEAD"]), head);
         assert!(checkout.join("keep.txt").is_file());
+    }
+
+    #[test]
+    fn track_devices_frames_parse_including_the_empty_list() {
+        // Two devices, then the last one unplugged: an empty frame with no newline anywhere.
+        let list = "emulator-5554\tdevice\nR58M\tdevice\n";
+        let stream = format!("{:04x}{list}0000{:04x}R58M\toffline\n", list.len(), "R58M\toffline\n".len());
+        let mut reader = std::io::Cursor::new(stream.into_bytes());
+        assert_eq!(read_track_frame(&mut reader).unwrap().unwrap(), list.as_bytes());
+        assert_eq!(read_track_frame(&mut reader).unwrap().unwrap(), b"");
+        assert_eq!(read_track_frame(&mut reader).unwrap().unwrap(), b"R58M\toffline\n");
+        assert!(read_track_frame(&mut reader).unwrap().is_none(), "a clean end between frames");
+    }
+
+    #[test]
+    fn track_devices_rejects_a_stream_that_is_not_framed() {
+        let mut unframed = std::io::Cursor::new(b"relay-phone device\n".to_vec());
+        assert!(read_track_frame(&mut unframed).is_err());
+        let mut signed = std::io::Cursor::new(b"+00a".to_vec());
+        assert!(read_track_frame(&mut signed).is_err());
+        let mut truncated = std::io::Cursor::new(b"0010short".to_vec());
+        assert!(read_track_frame(&mut truncated).is_err());
+    }
+
+    #[test]
+    fn lossy_lines_survive_invalid_utf8_and_crlf() {
+        let mut reader = std::io::Cursor::new(b"ok\r\nbad \xff\xfe byte\nlast".to_vec());
+        let mut buffer = Vec::new();
+        assert_eq!(read_lossy_line(&mut reader, &mut buffer).unwrap().as_deref(), Some("ok"));
+        assert_eq!(read_lossy_line(&mut reader, &mut buffer).unwrap().as_deref(), Some("bad \u{fffd}\u{fffd} byte"));
+        assert_eq!(read_lossy_line(&mut reader, &mut buffer).unwrap().as_deref(), Some("last"));
+        assert_eq!(read_lossy_line(&mut reader, &mut buffer).unwrap(), None);
+    }
+
+    #[test]
+    fn an_app_is_alive_only_under_its_own_pid() {
+        assert_eq!(pid_alive("1000\n", "", 1000), Some(true));
+        assert_eq!(pid_alive("", "", 1000), Some(false), "pidof found nothing: it exited");
+        assert_eq!(pid_alive("2044\n", "", 1000), Some(false), "restarted under another pid");
+        assert_eq!(pid_alive("", "error: device 'x' not found\n", 1000), None, "adb failed: unknown");
+    }
+
+    #[test]
+    fn a_startup_crash_is_cut_out_of_the_crash_buffer() {
+        let dump = "\
+E/AndroidRuntime( 900): FATAL EXCEPTION: main
+E/AndroidRuntime( 900): Process: com.other.app, PID: 900
+E/AndroidRuntime( 900): java.lang.Error: not ours
+E/AndroidRuntime( 1234): FATAL EXCEPTION: main
+E/AndroidRuntime( 1234): Process: com.example.app, PID: 1234
+E/AndroidRuntime( 1234): java.lang.IllegalStateException: boom
+E/AndroidRuntime( 1234): \tat com.example.app.MainActivity.onCreate(MainActivity.kt:12)
+";
+        let crash = startup_crash(dump, "com.example.app").unwrap();
+        assert_eq!(crash.len(), 4, "{crash:?}");
+        assert!(crash[0].contains("FATAL EXCEPTION"));
+        assert!(crash[2].contains("IllegalStateException: boom"));
+        assert!(crash[3].contains("MainActivity.kt:12"));
+        // A prefix of another package's name is not this package.
+        assert!(startup_crash(dump, "com.example").is_none());
+        assert!(startup_crash("", "com.example.app").is_none());
+    }
+
+    #[test]
+    fn adb_is_found_in_the_sdk_platform_tools() {
+        let sdk = tempfile::tempdir().unwrap();
+        assert_eq!(sdk_adb(sdk.path()), None);
+        std::fs::create_dir_all(sdk.path().join("platform-tools")).unwrap();
+        std::fs::write(sdk.path().join("platform-tools/adb"), "").unwrap();
+        assert_eq!(sdk_adb(sdk.path()), Some(sdk.path().join("platform-tools/adb")));
+    }
+
+    #[test]
+    fn a_broken_signing_profile_is_set_aside_not_deleted() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("abc123");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join(SIGNING_KEYSTORE_FILE), "key").unwrap();
+        std::fs::write(directory.join(SIGNING_PROFILE_FILE), r#"{"enabled": false, "project": 3}"#).unwrap();
+        assert!(signing_profile_switched_off(&directory), "read leniently, even when invalid");
+        quarantine_signing_directory(&directory).unwrap();
+        assert!(!directory.exists());
+        let kept: Vec<_> = std::fs::read_dir(root.path()).unwrap().flatten().map(|entry| entry.path()).collect();
+        assert_eq!(kept.len(), 1);
+        assert!(kept[0].file_name().unwrap().to_string_lossy().starts_with("abc123.broken-"));
+        assert!(kept[0].join(SIGNING_KEYSTORE_FILE).is_file(), "the key survives");
+        // Already gone (a racing create moved it first) is not an error.
+        quarantine_signing_directory(&directory).unwrap();
+        assert!(!signing_profile_switched_off(&directory));
+    }
+
+    fn run_engine() -> (Arc<Engine>, tempfile::TempDir, Id) {
+        use relay_bus::{Actor, Request};
+        let engine = Engine::new(Instance::Test, crate::Store::open_memory().unwrap());
+        let workspace = tempfile::tempdir().unwrap();
+        let repo = workspace.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/trunk\n").unwrap();
+        let dispatch = |op: &str, payload: Value| {
+            engine.dispatch(Request::new(Actor::User, op, payload), crate::engine::Door::InProcess).into_result().unwrap()
+        };
+        let path = std::fs::canonicalize(workspace.path()).unwrap();
+        let workspace_id = dispatch("workspace.create", json!({"path": path}))["id"].as_i64().unwrap();
+        let project = dispatch("project.add", json!({"workspace_id": workspace_id, "path": path.join("repo")}));
+        let project_id = project["id"].as_i64().unwrap();
+        (engine, workspace, project_id)
+    }
+
+    #[test]
+    fn a_run_registered_by_a_transaction_that_never_commits_is_taken_back() {
+        let (engine, _workspace, _) = run_engine();
+        let lease = |id| crate::device_lease::Lease::new("relay-phone", crate::device_lease::Holder::User, crate::device_lease::Kind::Run(id), "device.run", None);
+        // Rolled back: the after-commit closure holding the guard is dropped unrun.
+        let pending = PendingRun::register(&engine, RunRuntime::new(7)).unwrap();
+        assert!(engine.device_leases.acquire(lease(7), &mut Vec::new()).unwrap());
+        assert!(run_by_id(&engine, 7).is_ok());
+        drop(pending);
+        assert!(run_by_id(&engine, 7).is_err(), "no phantom live run");
+        assert!(engine.device_leases.holder_of("relay-phone").is_none(), "the device is free again");
+        // Committed: the closure ran and kept it.
+        PendingRun::register(&engine, RunRuntime::new(8)).unwrap().keep();
+        assert!(engine.device_leases.acquire(lease(8), &mut Vec::new()).unwrap());
+        assert!(run_by_id(&engine, 8).is_ok());
+        assert!(engine.device_leases.holder_of("relay-phone").is_some());
+    }
+
+    #[test]
+    fn a_worker_never_rewrites_a_stopped_run() {
+        let (engine, _workspace, project_id) = run_engine();
+        let id = {
+            let conn = engine.store.lock();
+            conn.execute(
+                "INSERT INTO device_runs(project_id,device,worktree,state,started_at) VALUES (?1,'relay-phone','/tmp','building','t')",
+                [project_id],
+            ).unwrap();
+            conn.last_insert_rowid()
+        };
+        let parent = uuid::Uuid::new_v4();
+        advance_run(&engine, id, parent, "running", false).unwrap();
+        engine.store.lock().execute("UPDATE device_runs SET state='stopped' WHERE id=?1", [id]).unwrap();
+        // The install finished after the stop; the worker's late writes are all refused.
+        assert_eq!(advance_run(&engine, id, parent, "running", false).unwrap_err().code, "device.run_ended");
+        assert!(advance_run(&engine, id, parent, "failed", true).is_err());
+        assert!(finish_build(&engine, id, parent, Path::new("/tmp/app.apk"), "signed").is_err());
+        let state: String = engine.store.lock().query_row("SELECT state FROM device_runs WHERE id=?1", [id], |row| row.get(0)).unwrap();
+        assert_eq!(state, "stopped");
     }
 }

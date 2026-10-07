@@ -6,7 +6,16 @@ use relay_bus::types::{GitHubRepo, GitHubStatus};
 use serde::Deserialize;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+use std::time::Duration;
+
+/// `gh api` calls are network round trips; a stalled one must fail its request rather than hold
+/// a bus worker forever, so every subprocess here goes through [`crate::proc::output_with_timeout`].
+const API_TIMEOUT: Duration = Duration::from_secs(30);
+/// `--paginate` over every repository the user can see is many round trips.
+const LIST_TIMEOUT: Duration = Duration::from_secs(120);
+/// `gh auth login --web` waits for the person to finish in the browser.
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug)]
 pub struct DownloadedSkill {
@@ -14,6 +23,8 @@ pub struct DownloadedSkill {
     pub body: String,
     pub source_url: String,
     pub source_path: String,
+    /// The branch or tag cloned; `None` is the repository's default branch.
+    pub source_ref: Option<String>,
     pub revision: String,
     /// The skill's whole folder, staged outside the clone: reference documents and scripts a
     /// `SKILL.md` points at are part of the skill, not decoration (D147). `None` when the
@@ -42,9 +53,9 @@ pub fn status() -> GitHubStatus {
     let Ok(gh) = which::which("gh") else {
         return GitHubStatus { installed: false, connected: false, login: None };
     };
-    let output = Command::new(gh).args(["api", "user", "--jq", ".login"]).output();
+    let output = crate::proc::output_with_timeout(Command::new(gh).args(["api", "user", "--jq", ".login"]), API_TIMEOUT);
     match output {
-        Ok(output) if output.status.success() => GitHubStatus {
+        Ok(Some(output)) if output.status.success() => GitHubStatus {
             installed: true,
             connected: true,
             login: Some(String::from_utf8_lossy(&output.stdout).trim().to_string()).filter(|value| !value.is_empty()),
@@ -53,22 +64,20 @@ pub fn status() -> GitHubStatus {
     }
 }
 
+/// A login abandoned in the browser counts as not connected once [`LOGIN_TIMEOUT`] passes.
 pub fn connect(gh: PathBuf) -> std::io::Result<bool> {
-    Command::new(gh)
-        .args(["auth", "login", "--hostname", "github.com", "--web", "--clipboard", "--git-protocol", "https"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
+    let mut command = Command::new(gh);
+    command.args(["auth", "login", "--hostname", "github.com", "--web", "--clipboard", "--git-protocol", "https"]);
+    Ok(crate::proc::output_with_timeout(&mut command, LOGIN_TIMEOUT)?.is_some_and(|output| output.status.success()))
 }
 
 pub fn repositories() -> Result<Vec<GitHubRepo>, BusError> {
     let gh = gh_path()?;
-    let output = Command::new(gh)
-        .args(["api", "--paginate", "user/repos?per_page=100&sort=updated&direction=desc"])
-        .output()
-        .map_err(|error| BusError::unavailable("github.list_failed", error.to_string()))?;
+    let mut command = Command::new(gh);
+    command.args(["api", "--paginate", "user/repos?per_page=100&sort=updated&direction=desc"]);
+    let output = crate::proc::output_with_timeout(&mut command, LIST_TIMEOUT)
+        .map_err(|error| BusError::unavailable("github.list_failed", error.to_string()))?
+        .ok_or_else(|| BusError::unavailable("github.list_timeout", "GitHub did not list repositories within 2 minutes"))?;
     if !output.status.success() {
         return Err(BusError::unavailable(
             "github.not_connected",
@@ -95,12 +104,15 @@ pub fn repositories() -> Result<Vec<GitHubRepo>, BusError> {
     Ok(repositories)
 }
 
+/// `reference` (a branch or tag) overrides the one a `tree/<ref>` URL names.
 pub fn download_skills(
     url: &str,
     requested_subdir: Option<&str>,
+    reference: Option<&str>,
     stage: Option<&Path>,
 ) -> Result<Vec<DownloadedSkill>, BusError> {
-    let (source_url, branch, url_subdir) = parse_github_url(url)?;
+    let (source_url, url_branch, url_subdir) = parse_github_url(url)?;
+    let branch = reference.map(str::to_string).or(url_branch);
     let subdir = requested_subdir.filter(|value| !value.trim().is_empty()).map(str::trim).or(url_subdir.as_deref());
     let temp = std::env::temp_dir().join(format!("relay-skill-{}", uuid::Uuid::new_v4()));
     let mut command = Command::new("git");
@@ -121,12 +133,14 @@ pub fn download_skills(
         let _ = fs::remove_dir_all(&temp);
         return Err(BusError::unavailable("skill.clone_failed", message));
     }
-    let result = collect_skills(&temp, &source_url, subdir, stage);
+    let result = collect_skills(&temp, &source_url, branch.as_deref(), subdir, stage);
     let _ = fs::remove_dir_all(&temp);
     result
 }
 
-fn parse_github_url(value: &str) -> Result<(String, Option<String>, Option<String>), BusError> {
+/// The clone URL Relay records for a GitHub URL, the ref a `tree/<ref>/...` or `blob/<ref>/...`
+/// form names, and the folder below it.
+pub fn parse_github_url(value: &str) -> Result<(String, Option<String>, Option<String>), BusError> {
     let value = value.trim().trim_end_matches('/');
     let path = if let Some(path) = value.strip_prefix("https://github.com/") {
         path
@@ -157,11 +171,12 @@ fn parse_github_url(value: &str) -> Result<(String, Option<String>, Option<Strin
 fn collect_skills(
     root: &Path,
     source_url: &str,
+    source_ref: Option<&str>,
     subdir: Option<&str>,
     stage: Option<&Path>,
 ) -> Result<Vec<DownloadedSkill>, BusError> {
-    let revision = Command::new("git").args(["-C", root.to_string_lossy().as_ref(), "rev-parse", "HEAD"])
-        .output().ok().filter(|output| output.status.success())
+    let revision = crate::proc::output_with_timeout(Command::new("git").args(["-C", root.to_string_lossy().as_ref(), "rev-parse", "HEAD"]), Duration::from_secs(10))
+        .ok().flatten().filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string()).unwrap_or_default();
     let start = if let Some(subdir) = subdir {
         let relative = safe_relative(subdir)?;
@@ -195,7 +210,7 @@ fn collect_skills(
                 }
             }
         });
-        Ok(DownloadedSkill { name, body, source_url: source_url.to_string(), source_path, revision: revision.clone(), assets })
+        Ok(DownloadedSkill { name, body, source_url: source_url.to_string(), source_path, source_ref: source_ref.map(str::to_string), revision: revision.clone(), assets })
     }).collect()
 }
 
@@ -254,10 +269,11 @@ mod tests {
         fs::create_dir_all(folder.join("reference")).unwrap();
         fs::write(folder.join("reference/audit.md"), "audit").unwrap();
         let stage = tempfile::tempdir().unwrap();
-        let skills = collect_skills(root.path(), "https://github.com/example/skills.git", Some("skills/review"), Some(stage.path())).unwrap();
+        let skills = collect_skills(root.path(), "https://github.com/example/skills.git", Some("dev"), Some("skills/review"), Some(stage.path())).unwrap();
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "Review carefully");
         assert_eq!(skills[0].source_path, "skills/review/SKILL.md");
+        assert_eq!(skills[0].source_ref.as_deref(), Some("dev"), "the ref travels with the skill");
         // The folder travels with the instructions, not just the SKILL.md the row stores.
         let assets = skills[0].assets.as_deref().expect("skill folder staged");
         assert_eq!(fs::read_to_string(assets.join("reference/audit.md")).unwrap(), "audit");

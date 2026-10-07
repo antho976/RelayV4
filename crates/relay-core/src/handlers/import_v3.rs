@@ -190,6 +190,12 @@ pub fn import(ctx: &mut Ctx, p: ImportV3In) -> Result<ImportV3Out, BusError> {
         rows.bus()?
     };
     let attach_root = ctx.engine().store.path().parent().map(|d| d.join("attachments")).unwrap_or_else(|| PathBuf::from("attachments"));
+    // A v3 store is data from a repository, not instructions: its attachment rows may only
+    // name files inside that repository (or the project), never `~/.ssh/id_ed25519`.
+    let source_roots: Vec<PathBuf> = [dir.parent().filter(|_| dir.file_name().is_some_and(|n| n == ".relay")).unwrap_or(&dir), Path::new(&project.path)]
+        .into_iter()
+        .filter_map(|root| std::fs::canonicalize(root).ok())
+        .collect();
     let mut positions: BTreeMap<&'static str, i64> = BTreeMap::new();
     for t in &tasks {
         let col = columns.get(&t.column_id).copied().unwrap_or(Column::Backlog);
@@ -255,12 +261,17 @@ pub fn import(ctx: &mut Ctx, p: ImportV3In) -> Result<ImportV3Out, BusError> {
                     candidates.iter().map(|c| c.display().to_string()).collect::<Vec<_>>().join(", ")));
                 continue;
             };
+            // Resolved through every symlink before the check, so a link cannot lead out.
+            let Some(src) = std::fs::canonicalize(&src).ok().filter(|src| source_roots.iter().any(|root| src.starts_with(root))) else {
+                warnings.push(format!("attachment {name:?} of task {} points outside the repository ({path}); skipped", t.id));
+                continue;
+            };
+            let name = attachment_name(&name);
             let bytes = std::fs::metadata(&src).map(|m| m.len() as i64).unwrap_or(0);
             if !dry {
                 let dest_dir = attach_root.join(new_id.to_string());
                 std::fs::create_dir_all(&dest_dir).bus()?;
-                let dest = dest_dir.join(&name);
-                std::fs::copy(&src, &dest).bus()?;
+                let dest = copy_new(&src, &dest_dir, &name).bus()?;
                 tx.execute("INSERT INTO attachments(task_id, name, mime, bytes, path, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![new_id, name, mime_for(&name), bytes, dest.display().to_string(), epoch_to_ts(at)]).bus()?;
             }
@@ -310,11 +321,23 @@ pub fn import(ctx: &mut Ctx, p: ImportV3In) -> Result<ImportV3Out, BusError> {
                 let repo_c = std::fs::canonicalize(repo).map(|p| p.display().to_string()).unwrap_or(repo.to_string());
                 if repo_c == repo_canon {
                     counts.sessions += 1;
-                    let files = s.get("max_files").and_then(Value::as_i64);
-                    let lines = s.get("max_lines").and_then(Value::as_i64);
+                    // The guardrail config refuses a cap of 0 and cannot hold one past u32: a bad
+                    // value stored here would fail every agent mutation in the project.
+                    let mut caps = serde_json::Map::new();
+                    for (key, field) in [("files", "max_files"), ("lines", "max_lines")] {
+                        match s.get(field) {
+                            None | Some(Value::Null) => {}
+                            Some(value) => match value.as_i64().filter(|n| (1..=i64::from(u32::MAX)).contains(n)) {
+                                Some(n) => { caps.insert(key.into(), json!(n)); }
+                                None => warnings.push(format!("sessions.json {field} = {value} is not a usable cap; the default stays")),
+                            },
+                        }
+                    }
                     if !dry {
-                        let path = format!("guardrails.projects.{}.caps", project.id);
-                        crate::handlers::settings::set(tx, &path, &json!({ "files": files, "lines": lines }), &now)?;
+                        if !caps.is_empty() {
+                            let path = format!("guardrails.projects.{}.caps", project.id);
+                            crate::handlers::settings::set(tx, &path, &Value::Object(caps), &now)?;
+                        }
                         if let Some(name) = s.get("name").and_then(Value::as_str) {
                             if !name.is_empty() && name != project.name {
                                 tx.execute("UPDATE projects SET name = ?1, updated_at = ?2 WHERE id = ?3", params![name, now, project.id]).bus()?;
@@ -334,6 +357,38 @@ pub fn import(ctx: &mut Ctx, p: ImportV3In) -> Result<ImportV3Out, BusError> {
         }
     }
     Ok(ImportV3Out { counts, id_map, warnings })
+}
+
+/// An attachment's stored name as one plain file name: a v3 row is free text, and joined as-is
+/// a `../../x` would land outside the task's attachment directory.
+fn attachment_name(name: &str) -> String {
+    Path::new(name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| "attachment".to_string())
+}
+
+/// Copy `src` into `dir` as `name`, or `name-1`, `name-2`, … when that is taken: never over a
+/// file (or through a symlink) that is already there.
+fn copy_new(src: &Path, dir: &Path, name: &str) -> std::io::Result<PathBuf> {
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => (stem, format!(".{ext}")),
+        _ => (name, String::new()),
+    };
+    for n in 0..1000 {
+        let dest = if n == 0 { dir.join(name) } else { dir.join(format!("{stem}-{n}{ext}")) };
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&dest) {
+            Ok(mut out) => {
+                std::io::copy(&mut std::fs::File::open(src)?, &mut out)?;
+                return Ok(dest);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, format!("{name}: no free name in {}", dir.display())))
 }
 
 /// v3 kept its project list at `~/.config/dev.antho.relay/sessions.json`.

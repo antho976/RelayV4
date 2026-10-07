@@ -1,17 +1,17 @@
 //! `guardrail.*` (SPEC §5, BUS.md §9): pure checks, enforcing gates, durable holds,
 //! confirmation/rejection and effective configuration.
 
-use crate::engine::{Ctx, Engine, IntoBus};
-use crate::guardrail::{self, grants, ConfigScope, Decision, GateRequest};
+use crate::engine::{Ctx, Engine, IntoBus, Unlocked};
+use crate::guardrail::{self, grants, ConfigScope, Decision, GateRequest, Probes};
 use crate::handlers::workspace::{get_project, get_workspace};
 use crate::sessions;
-use relay_bus::envelope::{Request, Response};
+use relay_bus::envelope::{Actor, Request, Response};
 use relay_bus::error::BusError;
 use relay_bus::ops::guardrail::*;
 use relay_bus::types::{GateKind, GrantScope, GuardrailLayer, HoldState, Id, Verdict};
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Which layer a `workspace_id` / `project_id` pair names. Both at once is ambiguous: a project
 /// already sits on its workspace.
@@ -148,39 +148,55 @@ pub fn register(engine: &mut Engine) {
         })
     });
 
-    engine.register::<Check>(|ctx, payload| {
-        let project = get_project(ctx.tx(), payload.project_id)?;
-        // A dry run has to judge the tree the write would land in. Judging the project root
-        // would answer a question the caller did not ask (D111).
-        let worktree = crate::handlers::file::default_worktree(ctx, &project, None)?;
+    // A dry run reads the file it would replace and may ask git about it, so it runs with the
+    // store lock released: one short read for the project, config and grants, then the
+    // judging with nothing held (D149, RA-100).
+    engine.register_unlocked::<Check>(|ctx, payload| {
+        let session_id = ctx.actor_session_id();
+        let agent = ctx.actor.is_agent();
+        let (project_id, worktree, cfg, granted) = ctx.read(|conn| {
+            let project = get_project(conn, payload.project_id)?;
+            // A dry run has to judge the tree the write would land in. Judging the project root
+            // would answer a question the caller did not ask (D111).
+            let worktree = crate::handlers::file::default_worktree_in(conn, session_id, &project, None)?;
+            let cfg = guardrail::config(conn, Some(project.id))?;
+            Ok((project.id, worktree, cfg, session_grants(conn, session_id, agent)?))
+        })?;
         // A dry run honours this session's grants, so an agent can see an approval land; it
         // never uses one up.
-        let (decision, _) = guardrail::evaluate_granted(
-            ctx.tx(),
-            &GateRequest {
-                actor: &ctx.actor,
-                project_id: project.id,
-                worktree: &worktree,
-                kind: payload.kind,
-                path: payload.path.as_deref(),
-                new_text: payload.new_text.as_deref(),
-                diff: payload.diff.as_deref(),
-                command: payload.command.as_deref(),
-                skip_policy: None,
-                grants: None, path_only: false,
-            },
-            ctx.actor_session_id(),
-        )?;
+        let request = GateRequest {
+            actor: &ctx.actor,
+            project_id,
+            worktree: &worktree,
+            kind: payload.kind,
+            path: payload.path.as_deref(),
+            new_text: payload.new_text.as_deref(),
+            diff: payload.diff.as_deref(),
+            command: payload.command.as_deref(),
+            skip_policy: None,
+            grants: None, path_only: false, probes: None,
+        };
+        let first = guardrail::evaluate_with(&cfg, &request)?;
+        let (decision, _) = guardrail::granted_retry(&cfg, &request, first, &granted)?;
         Ok(check_out(decision))
     });
 
-    engine.register::<Explain>(|ctx, payload| {
+    engine.register_unlocked::<Explain>(|ctx, payload| {
         // `guardrail.check` answers one action. A plan is decided before the first action, and
         // learning at minute zero that it will trip a cap is worth more than learning it at
         // commit time (D117). Pure: it evaluates, it never holds and never writes.
-        let project = get_project(ctx.tx(), payload.project_id)?;
-        let worktree = crate::handlers::file::default_worktree(ctx, &project, None)?;
-        let cfg = guardrail::config(ctx.tx(), Some(project.id))?;
+        let session_id = ctx.actor_session_id();
+        let agent = ctx.actor.is_agent();
+        let (project_id, worktree, cfg, granted) = ctx.read(|conn| {
+            let project = get_project(conn, payload.project_id)?;
+            let worktree = crate::handlers::file::default_worktree_in(conn, session_id, &project, None)?;
+            let cfg = guardrail::config(conn, Some(project.id))?;
+            Ok((project.id, worktree, cfg, session_grants(conn, session_id, agent)?))
+        })?;
+        let judge = |request: GateRequest<'_>| -> Result<Decision, BusError> {
+            let first = guardrail::evaluate_with(&cfg, &request)?;
+            guardrail::granted_retry(&cfg, &request, first, &granted).map(|(decision, _)| decision)
+        };
         let mut worst = Verdict::Allow;
         let mut note = |verdict: Verdict| {
             // refuse beats hold beats allow
@@ -197,22 +213,18 @@ pub fn register(engine: &mut Engine) {
             // No text yet, so this reports the policies that can be judged from a path alone:
             // protected paths, write roots, and whether a shape gate will demand full text.
             // An approved exception counts, as it does in guardrail.check; neither uses it up.
-            let decision = guardrail::evaluate_granted(
-                ctx.tx(),
-                &GateRequest {
-                    actor: &ctx.actor,
-                    project_id: project.id,
-                    worktree: &worktree,
-                    kind: GateKind::Write,
-                    path: Some(path),
-                    new_text: None,
-                    diff: Some(""),
-                    command: None,
-                    skip_policy: None,
-                    grants: None, path_only: false,
-                },
-                ctx.actor_session_id(),
-            ).map(|(decision, _)| decision);
+            let decision = judge(GateRequest {
+                actor: &ctx.actor,
+                project_id,
+                worktree: &worktree,
+                kind: GateKind::Write,
+                path: Some(path),
+                new_text: None,
+                diff: Some(""),
+                command: None,
+                skip_policy: None,
+                grants: None, path_only: false, probes: None,
+            });
             let item = match decision {
                 Ok(guardrail::Decision::Allow) => ExplainItem {
                     subject: path.clone(), verdict: Verdict::Allow, policy: None, message: None,
@@ -236,22 +248,18 @@ pub fn register(engine: &mut Engine) {
 
         let mut commands = Vec::new();
         for command in payload.commands.unwrap_or_default() {
-            let (decision, _) = guardrail::evaluate_granted(
-                ctx.tx(),
-                &GateRequest {
-                    actor: &ctx.actor,
-                    project_id: project.id,
-                    worktree: &worktree,
-                    kind: GateKind::Exec,
-                    path: None,
-                    new_text: None,
-                    diff: None,
-                    command: Some(&command),
-                    skip_policy: None,
-                    grants: None, path_only: false,
-                },
-                ctx.actor_session_id(),
-            )?;
+            let decision = judge(GateRequest {
+                actor: &ctx.actor,
+                project_id,
+                worktree: &worktree,
+                kind: GateKind::Exec,
+                path: None,
+                new_text: None,
+                diff: None,
+                command: Some(&command),
+                skip_policy: None,
+                grants: None, path_only: false, probes: None,
+            })?;
             let item = match decision {
                 guardrail::Decision::Allow => ExplainItem {
                     subject: command, verdict: Verdict::Allow, policy: None, message: None,
@@ -271,10 +279,6 @@ pub fn register(engine: &mut Engine) {
 
         let files = requested.len() as u32;
         let lines = payload.lines.unwrap_or(0);
-        let granted = match ctx.actor_session_id().filter(|_| ctx.actor.is_agent()) {
-            Some(session_id) => guardrail::Grants::load(ctx.tx(), session_id)?,
-            None => guardrail::Grants::default(),
-        };
         let over_caps = (files > cfg.caps.files || lines > cfg.caps.lines)
             && !granted.covers_caps(files, lines, &cfg.caps);
         if over_caps {
@@ -301,7 +305,13 @@ pub fn register(engine: &mut Engine) {
         })
     });
 
-    engine.register::<Gate>(|ctx: &mut Ctx, payload| gate(ctx, payload, None));
+    // The gate reads the old file, asks git whether it could restore it, and reads the staged
+    // numstat: all of that happens first, with the store lock released, and the transaction
+    // only judges what was read and records the hold or refusal (D149, RA-100).
+    engine.register_staged::<Gate, Probes>(
+        |ctx, payload| Ok(warm_gate(ctx, ctx.actor.clone(), payload, None)),
+        |ctx: &mut Ctx, payload, probes| gate(ctx, payload, None, &probes),
+    );
 
     engine.register::<HoldsList>(|ctx, payload| {
         let mut sql = String::from("SELECT * FROM holds WHERE 1=1");
@@ -317,9 +327,11 @@ pub fn register(engine: &mut Engine) {
         if payload.open_only.unwrap_or(true) {
             sql.push_str(" AND state = 'open'");
         }
-        sql.push_str(" ORDER BY id DESC LIMIT 1000");
-        let mut stmt = ctx.tx().prepare(&sql).bus()?;
-        let holds = stmt
+        // A page, newest first: every client fetches this whole, on a socket that caps a line.
+        sql.push_str(" ORDER BY id DESC LIMIT ?");
+        args.push(Box::new(payload.limit.unwrap_or(HOLDS_PAGE).clamp(1, HOLDS_PAGE_MAX)));
+        let mut stmt = ctx.tx().prepare_cached(&sql).bus()?;
+        let mut holds = stmt
             .query_map(
                 rusqlite::params_from_iter(args.iter().map(|arg| arg.as_ref())),
                 guardrail::hold_row,
@@ -327,37 +339,57 @@ pub fn register(engine: &mut Engine) {
             .bus()?
             .collect::<rusqlite::Result<Vec<_>>>()
             .bus()?;
+        for hold in &mut holds {
+            elide_hold(hold, &mut Vec::new());
+        }
         Ok(HoldsListOut { holds })
     });
 
     engine.register::<HoldGet>(|ctx, payload| {
-        let hold = guardrail::hold_by_id(ctx.tx(), payload.hold_id)?;
+        let mut hold = guardrail::hold_by_id(ctx.tx(), payload.hold_id)?;
         let mut request = guardrail::frozen_request(ctx.tx(), payload.hold_id)?;
         request.token = None;
-        Ok(HoldGetOut { hold, request })
+        // Only the copy shown is cut: the stored envelope, which confirm replays, stays whole.
+        let mut elided = Vec::new();
+        if !payload.full.unwrap_or(false) {
+            elide_hold(&mut hold, &mut elided);
+            elide_strings(&mut request.payload, "/request/payload", &mut elided);
+        }
+        Ok(HoldGetOut { hold, request, elided })
     });
     // Confirming replays the held op. Its read/external phase — for a held `git.commit`, the
     // staging, the user's pre-commit hook and the signature — runs here, before the
     // transaction, as the op's original caller; the transaction rechecks the hold and replays.
-    engine.register_staged::<Confirm, Option<Result<crate::engine::Prepared, BusError>>>(
+    // A held gate is judged again on confirm: what that reads is read here, before the lock.
+    engine.register_staged::<Confirm, (Option<Result<crate::engine::Prepared, BusError>>, Probes)>(
         |ctx, payload| {
             let (hold, frozen) = ctx.read(|conn| {
                 let hold = guardrail::hold_by_id(conn, payload.hold_id)?;
                 let frozen = guardrail::frozen_request(conn, hold.id)?;
                 Ok((hold, frozen))
             })?;
-            if hold.state != HoldState::Open || frozen.op == grants::OP || frozen.op == "guardrail.gate" {
-                return Ok(None);
+            if hold.state != HoldState::Open || frozen.op == grants::OP {
+                return Ok((None, Probes::default()));
             }
-            Ok(ctx.prepare_registered(&frozen.op, &frozen.payload, hold.actor.clone(), hold.session_id).transpose())
+            if frozen.op == "guardrail.gate" {
+                let probes = match serde_json::from_value::<GateIn>(frozen.payload.clone()) {
+                    Ok(gate) => warm_gate(ctx, hold.actor.clone(), &gate, Some(&hold.policy)),
+                    Err(_) => Probes::default(),
+                };
+                return Ok((None, probes));
+            }
+            let prepared = ctx.prepare_registered(&frozen.op, &frozen.payload, hold.actor.clone(), hold.session_id).transpose();
+            Ok((prepared, Probes::default()))
         },
-        |ctx: &mut Ctx, payload, prepared| confirm(ctx, payload, prepared),
+        |ctx: &mut Ctx, payload, (prepared, probes)| confirm(ctx, payload, prepared, &probes),
     );
     engine.register::<Reject>(reject);
     engine.register::<ExceptionRequest>(request);
     engine.register::<ExceptionGet>(|ctx, payload| grants::by_id(ctx.tx(), payload.request_id));
     engine.register::<ExceptionsList>(|ctx, payload| {
-        let mut sql = String::from("SELECT * FROM holds WHERE op = 'guardrail.request'");
+        // Whether the asking session is still alive decides whether its grant is (RA-105).
+        let live = "EXISTS(SELECT 1 FROM sessions s WHERE s.id = holds.session_id AND s.state != 'closed')";
+        let mut sql = format!("SELECT holds.*, {live} AS live FROM holds WHERE op = 'guardrail.request'");
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(project_id) = payload.project_id {
             sql.push_str(" AND project_id = ?");
@@ -370,19 +402,25 @@ pub fn register(engine: &mut Engine) {
         let filter = payload.state.unwrap_or(ExceptionFilter::All);
         match filter {
             ExceptionFilter::Open => sql.push_str(" AND state = 'open'"),
-            ExceptionFilter::Active => sql.push_str(" AND state = 'confirmed'"),
+            ExceptionFilter::Active => sql.push_str(&format!(" AND state = 'confirmed' AND {live}")),
             ExceptionFilter::All => {}
         }
         sql.push_str(" ORDER BY id DESC LIMIT 500");
         let mut stmt = ctx.tx().prepare(&sql).bus()?;
         let holds = stmt
-            .query_map(rusqlite::params_from_iter(args.iter().map(|arg| arg.as_ref())), guardrail::hold_row)
+            .query_map(rusqlite::params_from_iter(args.iter().map(|arg| arg.as_ref())), |row| {
+                Ok((guardrail::hold_row(row)?, row.get::<_, bool>("live")?))
+            })
             .bus()?
             .collect::<rusqlite::Result<Vec<_>>>()
             .bus()?;
         let requests = holds
             .iter()
-            .map(grants::exception)
+            .map(|(hold, live)| {
+                let mut request = grants::exception(hold);
+                request.active &= *live;
+                request
+            })
             .filter(|request| filter != ExceptionFilter::Active || request.active)
             .collect();
         Ok(ExceptionsListOut { requests })
@@ -514,7 +552,48 @@ fn revoke(ctx: &mut Ctx, payload: GrantRevokeIn) -> Result<relay_bus::types::Gua
     Ok(revoked)
 }
 
-fn gate(ctx: &mut Ctx, payload: GateIn, skip_policy: Option<&str>) -> Result<GateOut, BusError> {
+/// The grants an agent's session holds, or none for anyone else.
+fn session_grants(conn: &Connection, session_id: Option<Id>, agent: bool) -> Result<guardrail::Grants, BusError> {
+    match session_id.filter(|_| agent) {
+        Some(session_id) => guardrail::Grants::load(conn, session_id),
+        None => Ok(guardrail::Grants::default()),
+    }
+}
+
+/// The read phase of `guardrail.gate` (and of confirming a held one): read the session, its
+/// config and grants in one short burst, then everything slow the evaluation could ask for —
+/// the old file, `git status`, the staged numstat — with the store lock released. Anything
+/// that fails here is simply not cached; the transaction then reports it as it always did.
+fn warm_gate(ctx: &Unlocked, actor: Actor, payload: &GateIn, skip_policy: Option<&str>) -> Probes {
+    let probes = Probes::default();
+    let caller = ctx.actor_session_id();
+    let read = ctx.read(|conn| {
+        let session = sessions::by_name(conn, &payload.session)?;
+        if caller.is_some_and(|id| id != session.session.id) {
+            return Err(BusError::not_own("session"));
+        }
+        let cfg = guardrail::config(conn, Some(session.session.project_id))?;
+        let granted = session_grants(conn, Some(session.session.id), actor.is_agent())?;
+        Ok((session.session.project_id, PathBuf::from(&session.session.worktree), cfg, granted))
+    });
+    if let Ok((project_id, worktree, cfg, granted)) = read {
+        guardrail::warm(&cfg, &GateRequest {
+            actor: &actor,
+            project_id,
+            worktree: &worktree,
+            kind: payload.kind,
+            path: payload.path.as_deref(),
+            new_text: payload.new_text.as_deref(),
+            diff: payload.diff.as_deref(),
+            command: payload.command.as_deref(),
+            skip_policy,
+            grants: None, path_only: false, probes: Some(&probes),
+        }, &granted);
+    }
+    probes
+}
+
+fn gate(ctx: &mut Ctx, payload: GateIn, skip_policy: Option<&str>, probes: &Probes) -> Result<GateOut, BusError> {
     let session = sessions::by_name(ctx.tx(), &payload.session)?;
     if let Some(actor_session_id) = ctx.actor_session_id() {
         if actor_session_id != session.session.id {
@@ -536,7 +615,7 @@ fn gate(ctx: &mut Ctx, payload: GateIn, skip_policy: Option<&str>) -> Result<Gat
             diff: payload.diff.as_deref(),
             command: payload.command.as_deref(),
             skip_policy,
-            grants: None, path_only: false,
+            grants: None, path_only: false, probes: Some(probes),
         },
         Some(session.session.id),
     )?;
@@ -545,7 +624,7 @@ fn gate(ctx: &mut Ctx, payload: GateIn, skip_policy: Option<&str>) -> Result<Gat
     if let (None, Decision::Hold { policy, details, .. }) = (skip_policy, &decision) {
         if let Some(pass) = find_pass(ctx, session.session.id, policy, &payload, details)? {
             let policy = policy.clone();
-            let out = gate(ctx, payload, Some(&policy));
+            let out = gate(ctx, payload, Some(&policy), probes);
             if out.is_ok() {
                 ctx.tx().execute(
                     "UPDATE holds SET details = json_set(details, '$.pass.used_at', ?1) WHERE id = ?2",
@@ -598,7 +677,9 @@ fn gate(ctx: &mut Ctx, payload: GateIn, skip_policy: Option<&str>) -> Result<Gat
     }
 }
 
-fn confirm(ctx: &mut Ctx, payload: ConfirmIn, prepared: Option<Result<crate::engine::Prepared, BusError>>) -> Result<ConfirmOut, BusError> {
+fn confirm(
+    ctx: &mut Ctx, payload: ConfirmIn, prepared: Option<Result<crate::engine::Prepared, BusError>>, probes: &Probes,
+) -> Result<ConfirmOut, BusError> {
     let hold = guardrail::hold_by_id(ctx.tx(), payload.hold_id)?;
     if hold.state != HoldState::Open {
         return Err(BusError::conflict(
@@ -650,7 +731,7 @@ fn confirm(ctx: &mut Ctx, payload: ConfirmIn, prepared: Option<Result<crate::eng
             diff: gate_payload.diff.as_deref(),
             command: gate_payload.command.as_deref(),
             skip_policy: Some(&hold.policy),
-            grants: None, path_only: false,
+            grants: None, path_only: false, probes: Some(probes),
         },
     )?;
 
@@ -764,7 +845,7 @@ fn enforce_request(
     let session_id = ctx.actor_session_id();
     let (decision, used) = guardrail::evaluate_granted(ctx.tx(), &GateRequest {
         actor: &ctx.actor, project_id, worktree, kind, path, new_text, diff, command,
-        skip_policy: ctx.skip_policy(), grants: None, path_only,
+        skip_policy: ctx.skip_policy(), grants: None, path_only, probes: None,
     }, session_id)?;
     match decision {
         Decision::Allow => use_grants(ctx, &used, None),
@@ -775,22 +856,29 @@ fn enforce_request(
             ctx.emit("notify.new", json!({"category": "guardrail", "project_id": project_id}));
             Err(error)
         }
-        Decision::Hold { policy, mut error, details } => {
-            let frozen = Request::new(ctx.actor.clone(), ctx.op, ctx.payload().clone()).with_id(ctx.req_id);
-            let session_id = ctx.actor_session_id();
-            let session = session_id.and_then(|id| ctx.tx().query_row(
-                "SELECT name FROM sessions WHERE id = ?1", [id], |r| r.get::<_, String>(0),
-            ).ok());
-            let hold_id = guardrail::insert_hold(
-                ctx.tx(), &frozen, project_id, session_id, session.as_deref(), &policy, &details, &ctx.now,
-            )?;
-            error = error.with_confirm("guardrail.confirm", json!({"hold_id": hold_id}));
-            ctx.commit_error(Some(hold_id));
-            ctx.emit("guardrail.held", json!({"hold_id": hold_id, "op": ctx.op, "policy": policy}));
-            ctx.emit("notify.new", json!({"category": "guardrail", "project_id": project_id, "hold_id": hold_id}));
-            Err(error)
-        }
+        Decision::Hold { policy, error, details } => Err(hold_op(ctx, project_id, &policy, error, &details)?),
     }
+}
+
+/// Freeze the running bus op as a hold under `policy` and return the `held` error to answer it
+/// with. `guardrail.confirm` replays the frozen op with `policy` waived (`Ctx::skip_policy`), so
+/// a handler that holds itself must let the request through when that is the policy skipped.
+pub(crate) fn hold_op(
+    ctx: &mut Ctx, project_id: Id, policy: &str, error: BusError, details: &Value,
+) -> Result<BusError, BusError> {
+    let frozen = Request::new(ctx.actor.clone(), ctx.op, ctx.payload().clone()).with_id(ctx.req_id);
+    let session_id = ctx.actor_session_id();
+    let session = session_id.and_then(|id| ctx.tx().query_row(
+        "SELECT name FROM sessions WHERE id = ?1", [id], |r| r.get::<_, String>(0),
+    ).ok());
+    let hold_id = guardrail::insert_hold(
+        ctx.tx(), &frozen, project_id, session_id, session.as_deref(), policy, details, &ctx.now,
+    )?;
+    let error = error.with_confirm("guardrail.confirm", json!({"hold_id": hold_id}));
+    ctx.commit_error(Some(hold_id));
+    ctx.emit("guardrail.held", json!({"hold_id": hold_id, "op": ctx.op, "policy": policy}));
+    ctx.emit("notify.new", json!({"category": "guardrail", "project_id": project_id, "hold_id": hold_id}));
+    Ok(error)
 }
 
 fn reject(ctx: &mut Ctx, payload: RejectIn) -> Result<RejectOut, BusError> {
@@ -855,6 +943,50 @@ fn use_grants(ctx: &mut Ctx, used: &[Id], session: Option<&str>) -> Result<(), B
         ctx.emit("guardrail.resolved", json!({"hold_id": id, "request_id": id, "state": "used"}));
     }
     Ok(())
+}
+
+/// `guardrail.holds.list` page size when the caller names none, and the most it may ask for.
+const HOLDS_PAGE: u32 = 200;
+const HOLDS_PAGE_MAX: u32 = 1000;
+/// A string in a hold shown to a person is cut past this size: a held rewrite of a large file
+/// carries the whole file, and a reply over the client's line cap tore its connection down
+/// (RA-217).
+const SHOWN_STRING_MAX: usize = 64 * 1024;
+/// How much of a cut string is kept.
+const SHOWN_STRING_KEEP: usize = 4 * 1024;
+
+/// Cut the large strings in a hold's details, for a list or an inspection.
+pub(crate) fn elide_hold(hold: &mut relay_bus::types::Hold, elided: &mut Vec<String>) {
+    elide_strings(&mut hold.details, "/hold/details", elided);
+}
+
+/// Replace every string in `value` over [`SHOWN_STRING_MAX`] bytes by its first
+/// [`SHOWN_STRING_KEEP`] and a note of what was dropped, recording each one's JSON pointer.
+fn elide_strings(value: &mut Value, pointer: &str, elided: &mut Vec<String>) {
+    match value {
+        Value::String(text) if text.len() > SHOWN_STRING_MAX => {
+            let mut end = SHOWN_STRING_KEEP;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            let dropped = text.len() - end;
+            text.truncate(end);
+            text.push_str(&format!("… [{dropped} more bytes elided]"));
+            elided.push(pointer.to_string());
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter_mut().enumerate() {
+                elide_strings(item, &format!("{pointer}/{index}"), elided);
+            }
+        }
+        Value::Object(map) => {
+            for (key, item) in map.iter_mut() {
+                let key = key.replace('~', "~0").replace('/', "~1");
+                elide_strings(item, &format!("{pointer}/{key}"), elided);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn check_out(decision: Decision) -> CheckOut {

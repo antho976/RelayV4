@@ -83,7 +83,7 @@ pub fn run_with(engine: &Engine, dirty_scan: DirtyScan) -> Result<RecoveryReport
             .collect::<Result<_, _>>()?;
         for (id, name, state, pid) in rows {
             let why = match pid {
-                Some(p) if pty::pid_alive(p as u32) => {
+                Some(p) if pty::pid_alive(p as u32) && is_our_session(p as u32, instance, &store_path, &name) => {
                     // alive but not ours (we just started) — reap unless it was already
                     kill_wait(p as u32);
                     if !report.reaped_pids.contains(&p) {
@@ -91,6 +91,8 @@ pub fn run_with(engine: &Engine, dirty_scan: DirtyScan) -> Result<RecoveryReport
                     }
                     format!("pid {p} still alive from a previous engine; reaped")
                 }
+                // The pid was recycled: whatever holds it now is not this session's agent.
+                Some(p) if pty::pid_alive(p as u32) => format!("pid {p} now belongs to another process; left alone"),
                 Some(p) => format!("pid {p} is dead"),
                 None => "no pid recorded".to_string(),
             };
@@ -161,7 +163,7 @@ pub fn run_with(engine: &Engine, dirty_scan: DirtyScan) -> Result<RecoveryReport
         let mut swept = 0;
         for (repo, live) in repos {
             let live: Vec<String> = live.lines().map(str::to_string).collect();
-            swept += crate::hooks::sweep_hook_dirs(Path::new(&repo), &live);
+            swept += crate::hooks::sweep_hook_dirs(Path::new(&repo), &live, engine.instance);
         }
         if swept > 0 {
             report.fsck_fixes.push(format!("removed {swept} stale hook director(ies)"));
@@ -238,9 +240,10 @@ pub fn run_with(engine: &Engine, dirty_scan: DirtyScan) -> Result<RecoveryReport
     let json = serde_json::to_string(&report)?;
     tx.execute("INSERT INTO meta(key, value) VALUES ('recovery.last', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [json])?;
     tx.commit()?;
-    // Deleted pages are free space, not reclaimed space. Compact only when a prune actually
-    // happened, so the usual launch pays nothing for it.
-    if pruned > 0 {
+    // Deleted pages are free space, not reclaimed space, and SQLite reuses them for new rows. Once
+    // the log is older than the window, nearly every launch prunes a day's worth, so a prune alone
+    // is no reason to rewrite the whole file: compact only when free pages are a real share of it.
+    if pruned > 0 && worth_compacting(&conn) {
         if let Err(error) = conn.execute_batch("VACUUM") {
             tracing::warn!(error = %error, "could not compact the store after pruning the audit log");
         }
@@ -279,6 +282,22 @@ pub fn run_with(engine: &Engine, dirty_scan: DirtyScan) -> Result<RecoveryReport
         );
     }
     Ok(report)
+}
+
+/// At least a quarter of the file, and at least 4 MiB of it, is free pages.
+fn worth_compacting(conn: &rusqlite::Connection) -> bool {
+    let pragma = |name: &str| conn.query_row(&format!("PRAGMA {name}"), [], |r| r.get::<_, i64>(0)).unwrap_or(0);
+    let (free, pages, page_size) = (pragma("freelist_count"), pragma("page_count"), pragma("page_size"));
+    free > 0 && free * 4 >= pages && free * page_size >= 4 * 1024 * 1024
+}
+
+/// Whether `pid` is the agent this store spawned for `session`: its environment carries our
+/// instance, store and session name. A stale `sessions.pid` can name a process the kernel has
+/// since handed to something else entirely, and that one — and its group — must not be killed.
+fn is_our_session(pid: u32, instance: &str, store: &str, session: &str) -> bool {
+    let Some(env) = pty::proc_env(pid) else { return false };
+    let var = |key: &str| env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
+    var("RELAY_INSTANCE") == Some(instance) && var("RELAY_STORE") == Some(store) && var("RELAY_SESSION") == Some(session)
 }
 
 /// Pooled checkouts with uncommitted changes. The primary checkout being dirty is normal;
@@ -332,4 +351,24 @@ fn drop_cross_queued(tx: &rusqlite::Transaction) -> anyhow::Result<usize> {
         }
     }
     Ok(removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_store_that_is_mostly_free_pages_is_compacted() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("t.db")).unwrap();
+        conn.execute_batch("CREATE TABLE t(v BLOB)").unwrap();
+        for _ in 0..80 {
+            conn.execute("INSERT INTO t(v) VALUES (zeroblob(100000))", []).unwrap();
+        }
+        assert!(!worth_compacting(&conn), "nothing is free yet");
+        conn.execute("DELETE FROM t WHERE rowid <= 4", []).unwrap();
+        assert!(!worth_compacting(&conn), "a day's prune is reused, not compacted");
+        conn.execute("DELETE FROM t WHERE rowid <= 60", []).unwrap();
+        assert!(worth_compacting(&conn));
+    }
 }
