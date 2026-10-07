@@ -953,7 +953,10 @@ The *why* behind anything surprising. Append; never rewrite history. Reference a
   instructions and skill descriptions join the injected half of the D101 brief under "Enabled
   plugins", and its MCP servers are merged into `.relay/relay.mcp.json` for Claude and passed as
   `--config mcp_servers.<name>.*` overrides to Codex on every start and resume. A manifest command
-  of `relay` means this Relay binary; a plugin can never replace the `relay` server. Skill folders
+  of `relay` means this Relay binary; a plugin can never replace the `relay` server. A plugin's
+  skills go only into the checkouts of projects that have it on, never into the machine-wide
+  `~/.claude/skills`, which would reach every project (RA-123); Codex, which has no per-project
+  skill folder, still gets them in `$CODEX_HOME/skills`. Skill folders
   update in running checkouts at once; the brief and MCP servers apply on the next start or
   resume, which is when a provider reads them. The first plugin, Unreal Engine, serves its tools
   from `relay unreal-mcp`: a stdio MCP server independent of the bus that reads the project on

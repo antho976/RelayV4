@@ -59,20 +59,32 @@ pub(crate) fn announce_assignment(ctx: &mut Ctx, session: &Session, task_id: Id,
     deliver_assignment(ctx, session, task_id, review)
 }
 
+/// `sessions.done_pending_stop` holds the task a `session.done` closed in the provider's
+/// current turn (0 for none) until that turn's Stop. This value instead says no done is
+/// pending, only an assignment the session could not take when it was made — busy with a
+/// turn, or stopped at a prompt — which its next Stop types in.
+const ASSIGNMENT_AT_STOP: Id = -1;
+
+/// The `session.done` still waiting for its turn's Stop, if any.
+fn done_pending(conn: &Connection, session_id: Id) -> Result<Option<Id>, BusError> {
+    let marker: Option<Id> = conn.prepare_cached("SELECT done_pending_stop FROM sessions WHERE id=?1").bus()?
+        .query_row([session_id], |row| row.get(0)).bus()?;
+    Ok(marker.filter(|id| *id != ASSIGNMENT_AT_STOP))
+}
+
 fn deliver_assignment(ctx: &mut Ctx, session: &Session, task_id: Id, review: bool) -> Result<(), BusError> {
     // Done runs inside the provider's old turn. Its trailing Stop is the safe handoff
     // edge; hookless providers retain the assignment in durable mail instead.
-    let awaiting_stop: bool = ctx.tx().query_row(
-        "SELECT done_pending_stop IS NOT NULL FROM sessions WHERE id=?1", [session.id], |row| row.get(0),
-    ).bus()?;
-    if awaiting_stop { return Ok(()); }
+    if done_pending(ctx.tx(), session.id)?.is_some() { return Ok(()); }
+    // Typed now if the session is idle; otherwise this stays set and its next Stop delivers.
+    ctx.tx().execute("UPDATE sessions SET done_pending_stop=?1 WHERE id=?2", params![ASSIGNMENT_AT_STOP, session.id]).bus()?;
     let text = assignment_text(task_id, review);
     let (id, project) = (session.id, session.project_id);
     ctx.after_commit(move |engine| {
         let Some(pty) = engine.pty(id) else { return; };
         if !pty.claim_idle_edge() { return; }
         let changed = engine.system_write("session.assignment.ready", None, Some(project), Some(id), json!({"task_id":task_id}), |tx, now| {
-            let changed = tx.execute("UPDATE sessions SET state='running',updated_at=?1 WHERE id=?2 AND task_id=?3 AND state='idle' AND done_pending_stop IS NULL", params![now,id,task_id]).bus()?;
+            let changed = tx.execute("UPDATE sessions SET state='running',done_pending_stop=NULL,updated_at=?1 WHERE id=?2 AND task_id=?3 AND state='idle' AND done_pending_stop=?4", params![now,id,task_id,ASSIGNMENT_AT_STOP]).bus()?;
             let mut events = Vec::new();
             if changed > 0 {
                 if let Some(row) = sessions::by_id(tx,id)? { events.push(("session.changed".into(),serde_json::to_value(row.session).bus()?)); }
@@ -89,7 +101,10 @@ fn deliver_assignment(ctx: &mut Ctx, session: &Session, task_id: Id, review: boo
 }
 
 fn complete_group_assignment(ctx: &mut Ctx, session: &Session, task_id: Id, sha: Option<&str>) -> Result<(), BusError> {
-    if session.role == Role::Reviewer {
+    // A task deleted while the group held it has nothing left to build or review: whoever
+    // reports done on it is released, and the group moves on without waiting for a review.
+    let deleted: bool = ctx.tx().query_row("SELECT NOT EXISTS(SELECT 1 FROM tasks WHERE id=?1 AND deleted_at IS NULL)",[task_id],|row|row.get(0)).bus()?;
+    if session.role == Role::Reviewer && !deleted {
         let ready: bool = ctx.tx().query_row("SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1 AND col IN ('in_review','done') AND deleted_at IS NULL)",[task_id],|row|row.get(0)).bus()?;
         if !ready { return Err(BusError::conflict("session.review_not_ready", "Builders must finish the current task before its review can complete")); }
     }
@@ -118,7 +133,7 @@ fn complete_group_assignment(ctx: &mut Ctx, session: &Session, task_id: Id, sha:
             }
         }
     }
-    if left(Role::Reviewer) != 0 { return Ok(()); }
+    if left(Role::Reviewer) != 0 && !deleted { return Ok(()); }
     let next = next_queued_task(ctx.tx(),session.id,task_id)?;
     for id in ids {
         let changed = ctx.tx().execute("UPDATE sessions SET task_id=?1,module_id=?2,updated_at=?3 WHERE id=?4 AND task_id=?5",params![next.map(|v|v.0),next.and_then(|v|v.1),ctx.now,id,task_id]).bus()?;
@@ -159,22 +174,27 @@ fn launch_nudge(row: &Row_) -> Option<String> {
 
 /// Agents act on their own session (or their PAIR partner for reads); the user on any.
 fn assert_own(ctx: &Ctx, row: &Row_, reads_ok_for_pair: bool) -> Result<(), BusError> {
-    if let Some(sid) = ctx.actor_session_id() {
+    owns(&ctx.actor, ctx.actor_session_id(), row, reads_ok_for_pair)
+}
+
+/// [`assert_own`] for a handler with no transaction.
+fn owns(actor: &relay_bus::envelope::Actor, actor_session_id: Option<Id>, row: &Row_, reads_ok_for_pair: bool) -> Result<(), BusError> {
+    if let Some(sid) = actor_session_id {
         if sid == row.session.id {
             return Ok(());
         }
         if reads_ok_for_pair {
             if let Some(pair) = &row.session.pair_with {
-                if Some(pair.as_str()) == ctx.actor.session_name() {
+                if Some(pair.as_str()) == actor.session_name() {
                     return Ok(());
                 }
             }
         }
         return Err(BusError::not_own("session"));
     }
-    if ctx.actor.is_agent() {
+    if actor.is_agent() {
         // an agent through the in-process door without a bound session: only its own name
-        if ctx.actor.session_name() != Some(row.session.name.as_str()) {
+        if actor.session_name() != Some(row.session.name.as_str()) {
             return Err(BusError::not_own("session"));
         }
     }
@@ -266,10 +286,13 @@ fn record_agent_notification(ctx: &mut Ctx, s: &Session, category: &str, title: 
         params![s.project_id, category, title, link], |row| row.get::<_, i64>(0),
     ).optional().bus()?;
     if let Some(id) = existing {
-        if body != "Agent turn completed" {
-            ctx.tx().execute("UPDATE notifications SET body=?1 WHERE id=?2", params![body, id]).bus()?;
-            ctx.emit("notify.changed", json!({"notification_id":id,"project_id":s.project_id}));
-        }
+        // The card now stands for this report, so it takes this report's time: notify.list and
+        // the client's LAST REPORT order by created_at, and a stale one buried it (RA-234). The
+        // generic hook body never replaces a real summary. Still unread: only unread rows match.
+        let keep_body = body == "Agent turn completed";
+        ctx.tx().prepare_cached("UPDATE notifications SET body=CASE WHEN ?1 THEN body ELSE ?2 END,created_at=?3 WHERE id=?4").bus()?
+            .execute(params![keep_body, body, ctx.now, id]).bus()?;
+        ctx.emit("notify.changed", json!({"notification_id":id,"project_id":s.project_id}));
         return Ok(false);
     }
     ctx.tx().execute(
@@ -307,21 +330,64 @@ enum LaunchKind {
     Resume,
 }
 
+/// Write one of Relay's launch files into a worktree the agent can write to. A symlink the
+/// agent planted on the way — a directory of the path, or the file itself — would otherwise
+/// carry Relay's write outside the sandbox: such links are replaced by real directories, and
+/// the file lands through a fresh temporary file (never opened through a link) renamed over
+/// whatever is at the path, which replaces a link rather than following it.
 fn write_session_file(
     worktree: &Path,
     relative: &str,
     text: &str,
     code: &'static str,
 ) -> Result<(), BusError> {
-    let path = worktree.join(relative);
-    let parent = path
-        .parent()
-        .ok_or_else(|| BusError::internal("session brief path has no parent"))?;
-    fs::create_dir_all(parent).map_err(|error| {
-        BusError::unavailable(code, format!("cannot create {}: {error}", parent.display()))
-    })?;
-    fs::write(&path, text).map_err(|error| {
-        BusError::unavailable(code, format!("cannot write {}: {error}", path.display()))
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let fail = |what: &str, path: &Path, error: std::io::Error| {
+        BusError::unavailable(code, format!("cannot {what} {}: {error}", path.display()))
+    };
+    let relative = Path::new(relative);
+    let file_name = relative.file_name()
+        .ok_or_else(|| BusError::internal("session file path has no file name"))?;
+    let mut dir = worktree.to_path_buf();
+    for part in relative.parent().into_iter().flat_map(Path::components) {
+        let std::path::Component::Normal(part) = part else {
+            return Err(BusError::internal(format!("session file path {} must be plain", relative.display())));
+        };
+        dir.push(part);
+        match fs::symlink_metadata(&dir) {
+            Ok(meta) if meta.is_dir() => continue,
+            Ok(meta) if meta.file_type().is_symlink() => {
+                tracing::warn!(path = %dir.display(), "replacing a symlink in the way of a session file");
+                fs::remove_file(&dir).map_err(|error| fail("remove", &dir, error))?;
+            }
+            Ok(_) => return Err(BusError::unavailable(code, format!("{} is not a directory", dir.display()))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(fail("inspect", &dir, error)),
+        }
+        match fs::create_dir(&dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists
+                && fs::symlink_metadata(&dir).is_ok_and(|meta| meta.is_dir()) => {}
+            Err(error) => return Err(fail("create", &dir, error)),
+        }
+    }
+    let path = dir.join(file_name);
+    let tmp = dir.join(format!(
+        ".{}.relay-{}-{:x}",
+        file_name.to_string_lossy(), std::process::id(), rand::random::<u64>(),
+    ));
+    let written = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(0o644)
+        .open(&tmp)
+        .and_then(|mut file| file.write_all(text.as_bytes()))
+        .and_then(|()| fs::rename(&tmp, &path));
+    written.map_err(|error| {
+        let _ = fs::remove_file(&tmp);
+        fail("write", &path, error)
     })
 }
 
@@ -427,6 +493,49 @@ fn mark_exited_detached(engine: &Engine, sid: Id, project_id: Id) {
     });
 }
 
+/// The locked half of retiring a session, shared by `session.close` and
+/// `session.discard_restorable` so the two cannot drift apart: the row goes `closed`, and
+/// everything that hung off it while it lived — PTY, partner link, scrollback, claims, open
+/// holds, device leases, a merged branch — goes with it.
+fn retire_session(ctx: &mut Ctx, s: &Session) -> Result<(), BusError> {
+    if let Some(pty) = ctx.engine().take_pty(s.id) {
+        // Provider shutdown hooks may need the bus, and the grace period is the child's to
+        // spend: neither is worth a request, let alone the store lock. The row is `closed`
+        // by the time the child exits, so its exit callback changes nothing.
+        ctx.after_commit(move |_| kill_detached(pty, Duration::from_millis(150)));
+    }
+    ctx.tx().execute("UPDATE sessions SET state = 'closed', pid = NULL, closed_at = ?1, updated_at = ?1 WHERE id = ?2", params![ctx.now, s.id]).bus()?;
+    ctx.tx().execute("UPDATE sessions SET pair_with=NULL,updated_at=?1 WHERE pair_with=?2 AND state!='closed'", params![ctx.now, s.name]).bus()?;
+    ctx.tx().execute("DELETE FROM session_scrollback WHERE session_id=?1", [s.id]).bus()?;
+    release_claims(ctx, s)?;
+    let expired = ctx.tx().execute(
+        "UPDATE holds SET state = 'expired', resolved_at = ?1, resolved_by = 'system'
+         WHERE session_id = ?2 AND state = 'open'",
+        params![ctx.now, s.id],
+    ).bus()?;
+    let row = sessions::by_id(ctx.tx(), s.id)?.ok_or_else(|| BusError::internal("session vanished"))?;
+    emit_session(ctx, &row.session);
+    if expired > 0 {
+        ctx.emit("guardrail.resolved", json!({
+            "session": s.name,
+            "state": "expired",
+            "count": expired,
+        }));
+    }
+    ctx.emit("worktree.changed", json!({ "project_id": s.project_id }));
+    // Off the request: the session's device leases go, and its branch is deleted if its
+    // work is already merged (or kept, with the reason audited) — `branch_cleanup`.
+    let (session_id, project_id, branch) = (s.id, s.project_id, s.branch.clone());
+    ctx.after_commit(move |engine| {
+        crate::handlers::device_lease::release_session(&engine, session_id);
+        // Tests drive the cleanup synchronously instead (`branch_cleanup::run`).
+        if engine.instance != crate::Instance::Test {
+            crate::branch_cleanup::after_close(engine, project_id, branch);
+        }
+    });
+    Ok(())
+}
+
 /// Everything a launch reads from the store, gathered in one short read. The hooks, skill
 /// folders and brief files it implies are then written with the store unlocked (D149).
 struct LaunchPlan {
@@ -459,7 +568,7 @@ struct PreparedLaunch {
     spec: SpawnSpec,
 }
 
-fn plan_launch(conn: &Connection, engine: &Engine, row: Row_, kind: LaunchKind) -> Result<LaunchPlan, BusError> {
+fn plan_launch(conn: &Connection, engine: &Engine, row: Row_, kind: LaunchKind, git: &str) -> Result<LaunchPlan, BusError> {
     let cmd = crate::providers::executable(conn, row.session.provider)?;
     let relay_bin = crate::hooks::relay_bin();
     let project = crate::handlers::workspace::get_project(conn, row.session.project_id)?;
@@ -477,7 +586,7 @@ fn plan_launch(conn: &Connection, engine: &Engine, row: Row_, kind: LaunchKind) 
     }
     // The brief is delivered on *every* spawn, not only with a dispatched task: an agent with
     // no assignment is exactly the one that most needs to know who its peers are (D101).
-    let brief = crate::awareness::brief(conn, &row.session.name, Some(engine))?;
+    let brief = crate::awareness::brief(conn, &row.session.name, Some(engine), git)?;
     let cfg = crate::guardrail::config(conn, Some(row.session.project_id))?;
     let write_roots = crate::guardrail::write_roots(&cfg, &cwd).into_iter().filter(|root| root != &cwd).collect();
     let initial_scrollback = match kind {
@@ -626,6 +735,17 @@ fn prepare_launch(engine: &Engine, plan: LaunchPlan) -> Result<PreparedLaunch, B
     })
 }
 
+/// The brief's git lines for `session`. They walk commit history, so the store is taken
+/// only to find the checkout and released before git is read.
+fn brief_git(ctx: &crate::engine::Unlocked, session: &str) -> Result<String, BusError> {
+    let (worktree, branch, base) = ctx.read(|conn| {
+        let row = sessions::by_name(conn, session)?;
+        let project = crate::handlers::workspace::get_project(conn, row.session.project_id)?;
+        Ok((row.session.worktree, row.session.branch, project.base_branch))
+    })?;
+    Ok(crate::handlers::git::briefing_state(Path::new(&worktree), &branch, &base))
+}
+
 /// Read and prepare a launch from the unlocked phase of a staged handler.
 fn stage_launch(
     ctx: &crate::engine::Unlocked,
@@ -635,11 +755,12 @@ fn stage_launch(
     adjust: impl FnOnce(&mut Row_),
 ) -> Result<PreparedLaunch, BusError> {
     let engine = ctx.engine();
+    let git = brief_git(ctx, session)?;
     let plan = ctx.read(|conn| {
         let mut row = sessions::by_name(conn, session)?;
         check(&row)?;
         adjust(&mut row);
-        plan_launch(conn, engine, row, kind)
+        plan_launch(conn, engine, row, kind, &git)
     })?;
     prepare_launch(engine, plan)
 }
@@ -874,6 +995,47 @@ fn finish_create(ctx: &mut Ctx, p: &CreateIn, prepared: &mut PreparedCreate) -> 
     Ok(row.session)
 }
 
+/// The branch Relay names for a new session. Session names are reused once a session closes,
+/// and its `relay/<name>` branch may outlive it, unmerged; a session given that name starts
+/// from base on a branch of its own rather than silently picking up the earlier one's work.
+/// A branch the caller names is reattached on purpose, so this applies only to Relay's choice.
+fn own_branch(repo: &Path, name: &str) -> Result<String, BusError> {
+    let first = worktree::branch_for(name);
+    for n in 1..1000 {
+        let candidate = if n == 1 { first.clone() } else { format!("{first}-{n}") };
+        if !super::git::existing_worktree_branch(repo, Some(&candidate))? {
+            return Ok(candidate);
+        }
+    }
+    Err(BusError::conflict("session.branch", format!("every {first}-<n> branch is taken")))
+}
+
+/// What the session's branch changes against the project base, as `git diff --numstat`:
+/// the work a finished task hands to review. `None` when git cannot say (no base, no
+/// history); a measurement Relay cannot take never blocks a done.
+fn task_numstat(worktree: &Path, base: &str) -> Option<String> {
+    let out = crate::proc::output_with_timeout(
+        std::process::Command::new("git").arg("-C").arg(worktree)
+            .args(["diff", "--numstat", "--no-renames", &format!("{base}...HEAD"), "--"]),
+        Duration::from_secs(10),
+    );
+    match out {
+        Ok(Some(out)) if out.status.success() => Some(String::from_utf8_lossy(&out.stdout).into_owned()),
+        Ok(Some(out)) => {
+            tracing::debug!(worktree = %worktree.display(), stderr = %String::from_utf8_lossy(&out.stderr).trim(), "measuring task work");
+            None
+        }
+        Ok(None) => {
+            tracing::warn!(worktree = %worktree.display(), "measuring task work timed out");
+            None
+        }
+        Err(error) => {
+            tracing::warn!(worktree = %worktree.display(), %error, "measuring task work");
+            None
+        }
+    }
+}
+
 pub fn register(e: &mut Engine) {
     e.register_staged::<Create, _>(|ctx, p| {
         let mut prepared = ctx.read(|conn| {
@@ -909,7 +1071,10 @@ pub fn register(e: &mut Engine) {
             }
             "new" => {
                 super::git::refresh_new_worktree(&repo, p.branch.as_deref())?;
-                let branch = p.branch.clone().unwrap_or_else(|| worktree::branch_for(&prepared.name));
+                let branch = match p.branch.clone() {
+                    Some(branch) => branch,
+                    None => own_branch(&repo, &prepared.name)?,
+                };
                 let path = worktree::pooled_path(&repo, &prepared.name);
                 let from = if super::git::existing_worktree_branch(&repo, Some(&branch))? {
                     None
@@ -1184,11 +1349,12 @@ pub fn register(e: &mut Engine) {
         })
     });
 
-    e.register::<Brief>(|ctx, p| {
+    e.register_unlocked::<Brief>(|ctx, p| {
         // Metadata is project-visible; a peer's brief and scrollback are not.
-        let row = sessions::by_name(ctx.tx(), &p.session)?;
-        assert_own(ctx, &row, true)?;
-        crate::awareness::brief(ctx.tx(), &p.session, Some(ctx.engine()))
+        let row = ctx.read(|conn| sessions::by_name(conn, &p.session))?;
+        owns(&ctx.actor, ctx.actor_session_id(), &row, true)?;
+        let git = brief_git(ctx, &p.session)?;
+        ctx.read(|conn| crate::awareness::brief(conn, &p.session, Some(ctx.engine()), &git))
     });
 
     e.register::<Bootstrap>(|ctx, _| {
@@ -1200,7 +1366,23 @@ pub fn register(e: &mut Engine) {
         crate::awareness::bootstrap(ctx.tx(), &row.session.name, ctx.engine())
     });
 
-    e.register::<Done>(|ctx: &mut Ctx, p| {
+    // Staged (D149) for the per-task caps (BUS.md §9.2): measuring the task's work is a git
+    // subprocess, so it runs before the transaction opens.
+    e.register_staged::<Done, _>(|ctx, p| {
+        if !ctx.actor.is_agent() || !matches!(p.status.as_deref(), None | Some("completed")) {
+            return Ok(None);
+        }
+        let measure = ctx.read(|conn| {
+            let row = sessions::by_name(conn, &p.session)?;
+            let s = &row.session;
+            if s.role == Role::Reviewer || s.task_id.is_none() || done_pending(conn, s.id)?.is_some() {
+                return Ok(None);
+            }
+            let project = crate::handlers::workspace::get_project(conn, s.project_id)?;
+            Ok(Some((PathBuf::from(&s.worktree), project.base_branch)))
+        })?;
+        Ok(measure.and_then(|(worktree, base)| task_numstat(&worktree, &base)))
+    }, |ctx: &mut Ctx, p, numstat: Option<String>| {
         let row = sessions::by_name(ctx.tx(), &p.session)?;
         assert_own(ctx, &row, false)?;
         let s = &row.session;
@@ -1222,9 +1404,31 @@ pub fn register(e: &mut Engine) {
             ));
         }
         let current_task_id = s.task_id;
-        if status == "completed" {
-            ctx.tx().execute("UPDATE sessions SET done_pending_stop=?1 WHERE id=?2", params![current_task_id.unwrap_or(0),s.id]).bus()?;
+        // A done already landed in this turn and moved the session on to a task it has not
+        // been told about yet (the turn's Stop does that): a second call — a retry, or a
+        // report on the same work — must not complete that task too.
+        let pending = done_pending(ctx.tx(), s.id)?;
+        if pending.is_some_and(|done| current_task_id.is_some_and(|current| current != done)) {
+            return Ok(row.session);
         }
+        // Agents may commit with --no-verify, past the commit gate: the work the task brings
+        // to review is measured here too, against the same caps (BUS.md §9.2).
+        if let (Some(numstat), "completed") = (numstat.as_deref(), status) {
+            let request = crate::guardrail::GateRequest {
+                actor: &ctx.actor, project_id: s.project_id, worktree: Path::new(&s.worktree),
+                kind: relay_bus::types::GateKind::Commit, path: None, new_text: None,
+                diff: Some(numstat), command: None,
+                // Protected paths answer at the commit gate; done applies only the caps.
+                skip_policy: Some("protected_path"), grants: None, path_only: false, probes: None,
+            };
+            match crate::guardrail::evaluate_granted(ctx.tx(), &request, ctx.actor_session_id())?.0 {
+                crate::guardrail::Decision::Allow => {}
+                crate::guardrail::Decision::Refuse(error) | crate::guardrail::Decision::Hold { error, .. } => return Err(error),
+            }
+        }
+        // Every outcome holds until the turn's Stop: a `blocked` done must survive the tool
+        // and Stop reports that trail it in the same turn.
+        ctx.tx().execute("UPDATE sessions SET done_pending_stop=?1 WHERE id=?2", params![current_task_id.unwrap_or(0),s.id]).bus()?;
         if matches!(s.role, Role::Builder | Role::Reviewer) && status == "completed" {
             if let Some(task_id) = current_task_id { complete_group_assignment(ctx,s,task_id,p.sha.as_deref())?; }
         }
@@ -1417,7 +1621,8 @@ pub fn register(e: &mut Engine) {
         let pending_stop: Option<Id> = ctx.tx().query_row(
             "SELECT done_pending_stop FROM sessions WHERE id=?1", [s.id], |row| row.get(0),
         ).bus()?;
-        let completed_without_done = p.kind == "stop" && pending_stop.is_none() && s.state == SessionState::Running;
+        let done = pending_stop.filter(|id| *id != ASSIGNMENT_AT_STOP);
+        let completed_without_done = p.kind == "stop" && done.is_none() && s.state == SessionState::Running;
         let provider_ref = data.get("session_id").or_else(|| data.get("provider_ref")).and_then(Value::as_str);
         // It is replayed into the provider's argv on resume (`--resume <id>`), so a value a CLI
         // could parse as an option must never be stored.
@@ -1435,20 +1640,43 @@ pub fn register(e: &mut Engine) {
             }
             _ => return Err(BusError::invalid("session.report_kind", "kind must be session_start, tool_use, stop, notification, idle, or blocked")),
         };
-        let state_changed = state != sessions::state_str(s.state);
         let provider_ref_changed = provider_ref.is_some_and(|value| s.provider_ref.as_deref() != Some(value));
+        // A hook that lands after its session was parked, exited or closed speaks for a process
+        // that is gone. It may still name the conversation; it changes nothing else.
+        if !sessions::is_live(s.state) && s.state != SessionState::Created {
+            if provider_ref_changed {
+                ctx.tx().execute("UPDATE sessions SET provider_ref=?1, updated_at=?2 WHERE id=?3", params![provider_ref, ctx.now, s.id]).bus()?;
+                let updated = sessions::by_id(ctx.tx(), s.id)?.ok_or_else(|| BusError::internal("session vanished"))?;
+                emit_session(ctx, &updated.session);
+            }
+            return Ok(Empty {});
+        }
+        // `session.done` decided how this turn ends. The tool events that trail it in the same
+        // turn — the done call's own PostToolUse among them — and the turn's Stop keep that
+        // outcome: a blocked done stays blocked.
+        let state = match (done, p.kind.as_str()) {
+            (Some(_), "tool_use" | "idle") => sessions::state_str(s.state),
+            (Some(_), "stop") if s.state == SessionState::Blocked => "blocked",
+            _ => state,
+        };
+        let state_changed = state != sessions::state_str(s.state);
         ctx.tx().execute(
             "UPDATE sessions SET state=?1, provider_ref=COALESCE(?2, provider_ref), last_output_at=?3, updated_at=?3 WHERE id=?4",
             params![state, provider_ref, ctx.now, s.id],
         ).bus()?;
-        if matches!(p.kind.as_str(), "stop" | "session_start") {
-            ctx.tx().execute("UPDATE sessions SET done_pending_stop=NULL WHERE id=?1", [s.id]).bus()?;
+        match p.kind.as_str() {
+            "stop" => { ctx.tx().execute("UPDATE sessions SET done_pending_stop=NULL WHERE id=?1", [s.id]).bus()?; }
+            // A fresh provider session starts no turn a done could belong to; an assignment
+            // still waiting for a Stop keeps waiting.
+            "session_start" => {
+                ctx.tx().execute("UPDATE sessions SET done_pending_stop=NULL WHERE id=?1 AND done_pending_stop!=?2", params![s.id, ASSIGNMENT_AT_STOP]).bus()?;
+            }
+            _ => {}
         }
         note_pty_state(ctx, s.id, state);
         if matches!(p.kind.as_str(), "tool_use" | "stop") {
             // The command behind a device lease has finished; keep the lease only briefly.
-            let command = data.pointer("/tool_input/command").and_then(Value::as_str);
-            crate::handlers::device_lease::command_finished(ctx.engine(), s.id, command, p.kind == "stop");
+            crate::handlers::device_lease::command_finished(ctx.engine(), s.id, data.get("tool_input"), p.kind == "stop");
         }
         if p.kind == "stop" {
             if let (Some(completed), Some(current)) = (pending_stop, s.task_id) {
@@ -1548,24 +1776,33 @@ pub fn register(e: &mut Engine) {
         Ok(updated.session)
     });
 
-    e.register_unlocked::<RestorableList>(|ctx, _| {
+    e.register_unlocked::<RestorableList>(|ctx, p| {
         let rows = ctx.read(|conn| {
-            let mut stmt = conn.prepare_cached("SELECT * FROM sessions WHERE state='restorable' ORDER BY id").bus()?;
-            let rows = stmt.query_map([], |row| Ok((sessions::row(row)?, row.get::<_, Option<String>>("restore_reason")?)))
+            let mut stmt = conn.prepare_cached(
+                "SELECT * FROM sessions WHERE state='restorable' AND (?1 IS NULL OR project_id=?1) AND (?2 IS NULL OR name=?2) ORDER BY id",
+            ).bus()?;
+            let rows = stmt.query_map(params![p.project_id, p.session], |row| Ok((sessions::row(row)?, row.get::<_, Option<String>>("restore_reason")?)))
                 .bus()?.collect::<rusqlite::Result<Vec<_>>>().bus()?;
             Ok(rows)
         })?;
-        let mut out = Vec::new();
-        for (row, reason) in rows {
-            let dirty = gix::open(&row.session.worktree)
-                .ok()
-                .is_some_and(|repo| worktree::is_dirty(&repo));
-            out.push(Restorable {
-                session: row.session,
-                reason: reason.unwrap_or_else(|| "app_restart".into()),
-                worktree_dirty: dirty,
-            });
-        }
+        // One `git status` per worktree, each up to its 10 s timeout. Run side by side, a few at
+        // a time, so the answer costs the slowest checkout rather than the sum of them (RA-235).
+        let dirty = |checkout: &str| gix::open(checkout).ok().is_some_and(|repo| worktree::is_dirty(&repo));
+        let per_worker = rows.len().div_ceil(4).max(1);
+        let flags: Vec<bool> = std::thread::scope(|scope| {
+            let workers: Vec<_> = rows.chunks(per_worker)
+                .map(|chunk| scope.spawn(move || chunk.iter().map(|(row, _)| dirty(&row.session.worktree)).collect::<Vec<_>>()))
+                .collect();
+            // A worker that panicked reports its checkouts dirty, as a failed scan does.
+            workers.into_iter().zip(rows.chunks(per_worker))
+                .flat_map(|(worker, chunk)| worker.join().unwrap_or_else(|_| vec![true; chunk.len()]))
+                .collect()
+        });
+        let out = rows.into_iter().zip(flags).map(|((row, reason), dirty)| Restorable {
+            session: row.session,
+            reason: reason.unwrap_or_else(|| "app_restart".into()),
+            worktree_dirty: dirty,
+        }).collect();
         Ok(RestorableOut { sessions: out })
     });
 
@@ -1599,13 +1836,7 @@ pub fn register(e: &mut Engine) {
         if !matches!(s.state, SessionState::Restorable | SessionState::Exited) {
             return Err(BusError::conflict("session.state", format!("session {} is not restorable or exited", s.name)));
         }
-        ctx.tx().execute("UPDATE sessions SET state='closed',pid=NULL,closed_at=?1,updated_at=?1 WHERE id=?2", params![ctx.now,s.id]).bus()?;
-        release_claims(ctx, s)?;
-        ctx.tx().execute("UPDATE sessions SET pair_with=NULL,updated_at=?1 WHERE pair_with=?2 AND state!='closed'", params![ctx.now,s.name]).bus()?;
-        ctx.tx().execute("DELETE FROM session_scrollback WHERE session_id=?1", [s.id]).bus()?;
-        let updated = sessions::by_id(ctx.tx(), s.id)?.ok_or_else(|| BusError::internal("session vanished"))?;
-        emit_session(ctx, &updated.session);
-        ctx.emit("worktree.changed", json!({"project_id":s.project_id}));
+        retire_session(ctx, s)?;
         Ok(Empty {})
     });
 
@@ -1670,42 +1901,7 @@ pub fn register(e: &mut Engine) {
     }, |ctx: &mut Ctx, p, (id, freed): (Id, u64)| {
         let row = sessions::by_id(ctx.tx(), id)?
             .ok_or_else(|| BusError::not_found("session.not_found", format!("no session {}", p.session)))?;
-        let s = &row.session;
-        if let Some(pty) = ctx.engine().take_pty(s.id) {
-            // Provider shutdown hooks may need the bus, and the grace period is the child's to
-            // spend: neither is worth a request, let alone the store lock. The row is `closed`
-            // by the time the child exits, so its exit callback changes nothing.
-            ctx.after_commit(move |_| kill_detached(pty, Duration::from_millis(150)));
-        }
-        ctx.tx().execute("UPDATE sessions SET state = 'closed', pid = NULL, closed_at = ?1, updated_at = ?1 WHERE id = ?2", params![ctx.now, s.id]).bus()?;
-        ctx.tx().execute("UPDATE sessions SET pair_with=NULL,updated_at=?1 WHERE pair_with=?2 AND state!='closed'", params![ctx.now, s.name]).bus()?;
-        ctx.tx().execute("DELETE FROM session_scrollback WHERE session_id=?1", [s.id]).bus()?;
-        release_claims(ctx, s)?;
-        let expired = ctx.tx().execute(
-            "UPDATE holds SET state = 'expired', resolved_at = ?1, resolved_by = 'system'
-             WHERE session_id = ?2 AND state = 'open'",
-            params![ctx.now, s.id],
-        ).bus()?;
-        let row = sessions::by_id(ctx.tx(), s.id)?.ok_or_else(|| BusError::internal("session vanished"))?;
-        emit_session(ctx, &row.session);
-        if expired > 0 {
-            ctx.emit("guardrail.resolved", json!({
-                "session": s.name,
-                "state": "expired",
-                "count": expired,
-            }));
-        }
-        ctx.emit("worktree.changed", json!({ "project_id": s.project_id }));
-        // Off the request: the session's device leases go, and its branch is deleted if its
-        // work is already merged (or kept, with the reason audited) — `branch_cleanup`.
-        let (session_id, project_id, branch) = (s.id, s.project_id, s.branch.clone());
-        ctx.after_commit(move |engine| {
-            crate::handlers::device_lease::release_session(&engine, session_id);
-            // Tests drive the cleanup synchronously instead (`branch_cleanup::run`).
-            if engine.instance != crate::Instance::Test {
-                crate::branch_cleanup::after_close(engine, project_id, branch);
-            }
-        });
+        retire_session(ctx, &row.session)?;
         Ok(CloseOut { freed_mb: freed as f64 / (1024.0 * 1024.0) })
     });
 
@@ -1811,4 +2007,46 @@ pub fn pty_by_name(engine: &Engine, name: &str) -> Result<(Id, Arc<Pty>), BusErr
         BusError::conflict("session.not_spawned", format!("session {name} has no PTY"))
     })?;
     Ok((row.session.id, pty))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn launch_files_replace_planted_symlinks_instead_of_following_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path().join("wt");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(worktree.join(".relay/sessions/s")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("victim"), "keep").unwrap();
+        // The file itself, then a directory on its path, pointed outside the worktree.
+        symlink(outside.join("victim"), worktree.join(".relay/sessions/s/brief.md")).unwrap();
+        write_session_file(&worktree, ".relay/sessions/s/brief.md", "brief", "test").unwrap();
+        assert_eq!(fs::read_to_string(outside.join("victim")).unwrap(), "keep");
+        assert!(!fs::symlink_metadata(worktree.join(".relay/sessions/s/brief.md")).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read_to_string(worktree.join(".relay/sessions/s/brief.md")).unwrap(), "brief");
+
+        fs::remove_dir_all(worktree.join(".relay/sessions")).unwrap();
+        symlink(&outside, worktree.join(".relay/sessions")).unwrap();
+        write_session_file(&worktree, ".relay/sessions/victim", "brief", "test").unwrap();
+        assert_eq!(fs::read_to_string(outside.join("victim")).unwrap(), "keep");
+        assert_eq!(fs::read_to_string(worktree.join(".relay/sessions/victim")).unwrap(), "brief");
+        assert!(fs::read_dir(worktree.join(".relay/sessions")).unwrap().count() == 1, "no temporary file left behind");
+    }
+
+    #[test]
+    fn a_new_session_does_not_reattach_a_namesakes_leftover_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let git = |args: &[&str]| assert!(std::process::Command::new("git").arg("-C").arg(repo).args(args).status().unwrap().success());
+        git(&["init", "-q", "-b", "main"]);
+        git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "init"]);
+        assert_eq!(own_branch(repo, "amber-heron").unwrap(), "relay/amber-heron");
+        git(&["branch", "relay/amber-heron"]);
+        git(&["branch", "relay/amber-heron-2"]);
+        assert_eq!(own_branch(repo, "amber-heron").unwrap(), "relay/amber-heron-3");
+    }
 }

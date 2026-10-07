@@ -86,6 +86,12 @@ pub fn role_instructions(role: Role) -> String {
     format!("{specific}\n\n{COMMON_INSTRUCTIONS}\n\n{DISCOVERY_HINT}")
 }
 
+/// How much of the brief Codex gets inline, measured as JSON-escaped bytes. The whole setting
+/// is one argv element, and Linux refuses any single one over 128 KiB (`MAX_ARG_STRLEN`): a
+/// brief past that made every Codex launch in the project fail with E2BIG. The rest is in the
+/// brief file, which the instructions point at.
+const CODEX_BRIEF_LIMIT: usize = 64 * 1024;
+
 /// Codex takes no `--mcp-config`, so Relay's bus instructions travel through this provider-native
 /// setting. Guardrail and lifecycle enforcement bind separately through project hooks (D132).
 fn codex_developer_instructions(role: Role, brief: Option<&str>) -> String {
@@ -97,10 +103,30 @@ role may call.",
     );
     if let Some(brief) = brief.map(str::trim).filter(|brief| !brief.is_empty()) {
         text.push_str("\n\n");
-        text.push_str(brief);
+        let mut used = 0;
+        let cut = brief.char_indices().find_map(|(at, ch)| {
+            used += json_escaped_len(ch);
+            (used > CODEX_BRIEF_LIMIT).then_some(at)
+        });
+        match cut {
+            None => text.push_str(brief),
+            Some(at) => {
+                text.push_str(&brief[..at]);
+                text.push_str("\n\n[The brief is cut short here. Read the whole of it at $RELAY_BRIEF.]");
+            }
+        }
     }
     let value = serde_json::to_string(&text).expect("Relay role instructions serialize");
     format!("developer_instructions={value}")
+}
+
+/// The bytes `ch` takes inside a JSON string.
+fn json_escaped_len(ch: char) -> usize {
+    match ch {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        ch if (ch as u32) < 0x20 => 6,
+        ch => ch.len_utf8(),
+    }
 }
 
 pub fn codex_notify_config(relay: &Path) -> String {
@@ -108,14 +134,42 @@ pub fn codex_notify_config(relay: &Path) -> String {
     format!("notify={}", serde_json::to_string(&command).expect("Codex notify command serializes"))
 }
 
+/// The variables a Relay launch adds to the agent's environment (see `prepare_launch`).
+const RELAY_LAUNCH_ENV: &[&str] = &[
+    "RELAY_SESSION", "RELAY_TOKEN", "RELAY_INSTANCE", "RELAY_PROJECT", "RELAY_WORKTREE",
+    "RELAY_BRIEF", "RELAY_BIN", "RELAY_STORE",
+];
+
 /// `--config` overrides that register one plugin MCP server with Codex, which takes no MCP
 /// config file (D159). Values are JSON strings and arrays, which TOML reads identically; a
 /// name that is not a bare TOML key is refused rather than quoted into a different key.
+///
+/// Codex starts an MCP server with a scrubbed environment (PATH, HOME and a few more) plus the
+/// names in its `env_vars`. Claude passes its whole environment on, and the plugins are written
+/// for that (`UE_ROOT`, `RELAY_WORKTREE`, …), so the server is given the same here: every
+/// variable of the engine's environment, which the agent inherits, and Relay's launch variables.
 pub fn codex_mcp_config(
     name: &str,
     command: &str,
     args: &[String],
     env: &std::collections::BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut forwarded: Vec<String> = std::env::vars_os()
+        .filter_map(|(key, _)| key.into_string().ok())
+        .chain(RELAY_LAUNCH_ENV.iter().map(|key| key.to_string()))
+        .filter(|key| !env.contains_key(key))
+        .collect();
+    forwarded.sort();
+    forwarded.dedup();
+    codex_mcp_config_with(name, command, args, env, &forwarded)
+}
+
+fn codex_mcp_config_with(
+    name: &str,
+    command: &str,
+    args: &[String],
+    env: &std::collections::BTreeMap<String, String>,
+    forwarded: &[String],
 ) -> Vec<String> {
     let bare = |key: &str| !key.is_empty() && key.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-');
     if !bare(name) || !env.keys().all(|key| bare(key)) {
@@ -131,6 +185,12 @@ pub fn codex_mcp_config(
     if !env.is_empty() {
         let pairs = env.iter().map(|(key, value)| format!("{key}={}", quote(value))).collect::<Vec<_>>().join(",");
         out.extend(["--config".into(), format!("mcp_servers.{name}.env={{{pairs}}}")]);
+    }
+    if !forwarded.is_empty() {
+        out.extend([
+            "--config".into(),
+            format!("mcp_servers.{name}.env_vars={}", serde_json::to_string(forwarded).expect("strings serialize")),
+        ]);
     }
     out
 }
@@ -182,7 +242,7 @@ impl Driver for Claude {
     fn args(&self, session: &Session, launch: Launch<'_>, _brief: Option<&str>) -> Vec<String> {
         let mut args = vec![
             "--mcp-config".into(), crate::hooks::MCP_CONFIG_RELATIVE.into(),
-            "--settings".into(), crate::hooks::CLAUDE_SETTINGS_RELATIVE.into(),
+            "--settings".into(), crate::hooks::claude_settings(),
             "--append-system-prompt-file".into(), role_instructions_relative(&session.name),
         ];
         match launch {
@@ -202,8 +262,8 @@ impl Driver for Claude {
     }
     fn profile(&self) -> Value {
         json!({
-            "binary": "claude", "fresh": ["--mcp-config", ".relay/relay.mcp.json", "--settings", ".relay/relay.settings.json", "--append-system-prompt-file", ".relay/sessions/<session>/role-instructions.md", "--name", "<session>", "[--model]", "[--effort]"],
-            "resume": ["--mcp-config", ".relay/relay.mcp.json", "--settings", ".relay/relay.settings.json", "--append-system-prompt-file", ".relay/sessions/<session>/role-instructions.md", "--resume", "<provider_ref>"], "fallback_resume": ["--mcp-config", ".relay/relay.mcp.json", "--settings", ".relay/relay.settings.json", "--append-system-prompt-file", ".relay/sessions/<session>/role-instructions.md", "--continue"],
+            "binary": "claude", "fresh": ["--mcp-config", ".relay/relay.mcp.json", "--settings", "<inline statusLine settings JSON>", "--append-system-prompt-file", ".relay/sessions/<session>/role-instructions.md", "--name", "<session>", "[--model]", "[--effort]"],
+            "resume": ["--mcp-config", ".relay/relay.mcp.json", "--settings", "<inline statusLine settings JSON>", "--append-system-prompt-file", ".relay/sessions/<session>/role-instructions.md", "--resume", "<provider_ref>"], "fallback_resume": ["--mcp-config", ".relay/relay.mcp.json", "--settings", "<inline statusLine settings JSON>", "--append-system-prompt-file", ".relay/sessions/<session>/role-instructions.md", "--continue"],
             "auth": ["auth", "status"], "lifecycle_hooks": true, "guarded": true,
         })
     }
@@ -317,18 +377,30 @@ pub fn list(conn: &Connection) -> Result<Vec<ProviderInfo>, BusError> {
     }).collect()
 }
 
+/// Probe and record in one step, for a caller that already holds a transaction.
 pub fn refresh(tx: &Transaction, now: &str) -> Result<Vec<Discovery>, BusError> {
-    let inputs = [Provider::Claude, Provider::Codex].into_iter().map(|provider| {
-        let drv = driver(provider);
-        let old: Option<(Option<String>, Option<String>)> = tx.query_row(
-            "SELECT version, last_seen_version FROM provider_cache WHERE provider=?1",
-            [drv.binary()], |row| Ok((row.get(0)?, row.get(1)?)),
-        ).optional().bus()?;
-        let path = executable(tx, provider).ok();
-        Ok((provider, path, old))
-    }).collect::<Result<Vec<_>, BusError>>()?;
-    let probed = thread::scope(|scope| {
-        inputs.into_iter().map(|(provider, path, old)| scope.spawn(move || {
+    record(tx, now, probe(paths(tx)))
+}
+
+/// Where each provider's binary is, read under the store lock: the input to [`probe`].
+pub fn paths(conn: &Connection) -> Vec<(Provider, Option<PathBuf>)> {
+    [Provider::Claude, Provider::Codex].into_iter().map(|provider| (provider, executable(conn, provider).ok())).collect()
+}
+
+/// What one provider's binary said about itself, gathered with no lock held.
+pub struct Probe {
+    provider: Provider,
+    path: Option<PathBuf>,
+    version: Option<String>,
+    signed_in_as: Option<String>,
+}
+
+/// Run every provider's `--version` and auth probe, in parallel. These are subprocesses, so
+/// `provider.refresh` runs them before its transaction opens (D149): each one may take up to
+/// [`PROBE_TIMEOUT`], and the store mutex is not where that wait belongs.
+pub fn probe(paths: Vec<(Provider, Option<PathBuf>)>) -> Vec<Probe> {
+    thread::scope(|scope| {
+        paths.into_iter().map(|(provider, path)| scope.spawn(move || {
             let drv = driver(provider);
             let (version, signed_in_as) = thread::scope(|scope| {
                 let version = scope.spawn(|| path.as_deref().and_then(|path| command_output(path, &["--version"]))
@@ -336,12 +408,20 @@ pub fn refresh(tx: &Transaction, now: &str) -> Result<Vec<Discovery>, BusError> 
                 let auth = scope.spawn(|| path.as_deref().and_then(|path| drv.auth(path)));
                 (version.join().expect("provider version probe panicked"), auth.join().expect("provider auth probe panicked"))
             });
-            (provider, path, old, version, signed_in_as)
+            Probe { provider, path, version, signed_in_as }
         })).collect::<Vec<_>>().into_iter().map(|handle| handle.join().expect("provider probe panicked")).collect::<Vec<_>>()
-    });
+    })
+}
+
+/// Store what [`probe`] found, comparing against the cached version inside `tx`.
+pub fn record(tx: &Transaction, now: &str, probes: Vec<Probe>) -> Result<Vec<Discovery>, BusError> {
     let mut out = Vec::new();
-    for (provider, path, old, version, signed_in_as) in probed {
+    for Probe { provider, path, version, signed_in_as } in probes {
         let drv = driver(provider);
+        let old: Option<(Option<String>, Option<String>)> = tx.query_row(
+            "SELECT version, last_seen_version FROM provider_cache WHERE provider=?1",
+            [drv.binary()], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional().bus()?;
         let previous_version = old.as_ref().and_then(|old| old.0.clone());
         let version_changed = previous_version.is_some() && previous_version != version;
         let last_seen_version = if version_changed { previous_version.clone() } else { old.and_then(|old| old.1) };
@@ -365,8 +445,8 @@ pub fn refresh(tx: &Transaction, now: &str) -> Result<Vec<Discovery>, BusError> 
 
 struct Output { success: bool, stdout: String }
 
-/// Provider probes (`<binary> --version`) run inside the request transaction, so the deadline is
-/// what keeps a wedged binary from holding the store mutex indefinitely (D144).
+/// Provider probes (`<binary> --version`) are bounded so a wedged binary cannot hang a refresh, or
+/// the store mutex where a caller still probes under it (`provider.update`'s follow-up, D144).
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn command_output(path: &Path, args: &[&str]) -> Option<Output> {
@@ -417,10 +497,11 @@ mod tests {
         assert!(role_instructions(Role::Builder).contains("query task.list"));
         assert_eq!(codex_notify_config(Path::new("/opt/Relay 2/relay")), "notify=[\"/opt/Relay 2/relay\",\"hook\",\"codex-notify\"]");
         let claude = session(Provider::Claude);
+        let settings = crate::hooks::claude_settings();
         assert_eq!(driver(Provider::Claude).args(&claude, Launch::Fresh, None),
-            ["--mcp-config", ".relay/relay.mcp.json", "--settings", ".relay/relay.settings.json", "--append-system-prompt-file", ".relay/sessions/calm-otter/role-instructions.md", "--name", "calm-otter", "--model", "model-x", "--effort", "high"]);
+            ["--mcp-config", ".relay/relay.mcp.json", "--settings", settings.as_str(), "--append-system-prompt-file", ".relay/sessions/calm-otter/role-instructions.md", "--name", "calm-otter", "--model", "model-x", "--effort", "high"]);
         assert_eq!(driver(Provider::Claude).args(&claude, Launch::Resume { provider_ref: Some("cc-id") }, None),
-            ["--mcp-config", ".relay/relay.mcp.json", "--settings", ".relay/relay.settings.json", "--append-system-prompt-file", ".relay/sessions/calm-otter/role-instructions.md", "--resume", "cc-id", "--model", "model-x", "--effort", "high"]);
+            ["--mcp-config", ".relay/relay.mcp.json", "--settings", settings.as_str(), "--append-system-prompt-file", ".relay/sessions/calm-otter/role-instructions.md", "--resume", "cc-id", "--model", "model-x", "--effort", "high"]);
         let mut codex = session(Provider::Codex);
         codex.role = Role::Reviewer;
         let args = driver(Provider::Codex).args(&codex, Launch::Resume { provider_ref: Some("cx-id") }, None);
@@ -466,5 +547,31 @@ mod tests {
         assert!(config.contains("$RELAY_BIN q"), "codex is not told how to reach the bus");
         assert!(driver(Provider::Codex).guarded());
         assert!(driver(Provider::Claude).guarded());
+    }
+
+    #[test]
+    fn a_huge_brief_is_cut_to_fit_one_argv_element() {
+        let codex = session(Provider::Codex);
+        // Quotes and newlines double in JSON; the cap is measured after escaping.
+        let brief = "## Live peers\n- sly-egret \"quoted\"\n".repeat(20_000);
+        let args = driver(Provider::Codex).args(&codex, Launch::Fresh, Some(&brief));
+        let config = args.iter().find(|arg| arg.starts_with("developer_instructions=")).unwrap();
+        assert!(config.len() < 128 * 1024, "{} bytes cannot be exec'd", config.len());
+        assert!(config.contains("sly-egret"));
+        assert!(config.contains("Read the whole of it at $RELAY_BRIEF"));
+        let short = driver(Provider::Codex).args(&codex, Launch::Fresh, Some("- sly-egret"));
+        assert!(!short.iter().any(|arg| arg.contains("cut short")));
+    }
+
+    #[test]
+    fn codex_mcp_servers_get_the_environment_claude_would_give_them() {
+        let env = std::collections::BTreeMap::from([("UE_ROOT".to_string(), "/opt/ue".to_string())]);
+        let args = codex_mcp_config_with("unreal", "/bin/relay", &["unreal-mcp".into()], &env,
+            &["RELAY_WORKTREE".into(), "UE_PROJECT".into()]);
+        assert!(args.contains(&"mcp_servers.unreal.env={UE_ROOT=\"/opt/ue\"}".to_string()), "{args:?}");
+        assert!(args.contains(&"mcp_servers.unreal.env_vars=[\"RELAY_WORKTREE\",\"UE_PROJECT\"]".to_string()), "{args:?}");
+        let live = codex_mcp_config("unreal", "/bin/relay", &[], &env).join(" ");
+        assert!(live.contains("\"RELAY_SESSION\"") && live.contains("\"RELAY_TOKEN\""), "{live}");
+        assert!(!live.contains("\"UE_ROOT\""), "a fixed value is not also forwarded: {live}");
     }
 }

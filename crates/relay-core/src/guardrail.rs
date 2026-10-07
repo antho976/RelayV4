@@ -13,9 +13,12 @@ use relay_bus::types::{
 };
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use serde_json::{json, Value};
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub mod grants;
@@ -53,6 +56,72 @@ pub struct GateRequest<'a> {
     /// path rules apply — where it lands, protected paths, and a shape gate on a destination
     /// (validated against `new_text` when the caller supplies it). Never reads the file.
     pub path_only: bool,
+    /// What the disk and git said, read before the store lock was taken (D149). `None` reads
+    /// them on the spot, which is what an in-transaction caller (`file.*`) still does.
+    pub probes: Option<&'a Probes>,
+}
+
+/// The file a write would replace, as the destructive-write rule can measure it.
+#[derive(Debug)]
+pub enum OldFile {
+    Missing,
+    Text(String),
+    /// Past the comparison cap: never read into memory.
+    TooLarge(u64),
+    /// There, but not something a line count can describe: not UTF-8, unreadable, or not a
+    /// regular file. It used to read as empty, so replacing it never counted as destructive.
+    Opaque(&'static str),
+}
+
+/// The slow facts a gate judges by — the old file, git's view of it, the staged numstat —
+/// memoized per request. `guardrail.gate`, `.check` and `.explain` fill these with the store
+/// lock released; the evaluation inside the transaction then only looks them up (D149).
+#[derive(Debug, Default)]
+pub struct Probes {
+    old: RefCell<HashMap<PathBuf, Arc<OldFile>>>,
+    recoverable: RefCell<HashMap<PathBuf, Option<&'static str>>>,
+    numstat: RefCell<HashMap<PathBuf, Result<String, BusError>>>,
+}
+
+impl GateRequest<'_> {
+    fn old_file(&self, path: &Path) -> Arc<OldFile> {
+        let absolute = self.worktree.join(path);
+        match self.probes {
+            Some(probes) => probes.old.borrow_mut().entry(absolute.clone()).or_insert_with(|| Arc::new(read_old(&absolute))).clone(),
+            None => Arc::new(read_old(&absolute)),
+        }
+    }
+
+    fn recoverable(&self, path: &Path) -> Option<&'static str> {
+        match self.probes {
+            Some(probes) => *probes.recoverable.borrow_mut().entry(self.worktree.join(path)).or_insert_with(|| recoverable(self.worktree, path)),
+            None => recoverable(self.worktree, path),
+        }
+    }
+
+    fn staged_numstat(&self) -> Result<String, BusError> {
+        let read = || git_output(self.worktree, &["diff", "--cached", "--numstat", "-z", "--no-renames", "--no-ext-diff"]);
+        match self.probes {
+            Some(probes) => probes.numstat.borrow_mut().entry(self.worktree.to_path_buf()).or_insert_with(read).clone(),
+            None => read(),
+        }
+    }
+}
+
+const COMPARISON_CAP: u64 = 64 * 1024 * 1024;
+
+fn read_old(absolute: &Path) -> OldFile {
+    match std::fs::metadata(absolute) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => OldFile::Missing,
+        Err(_) => OldFile::Opaque("unreadable"),
+        // A FIFO would block the read for good; a directory cannot be overwritten as text.
+        Ok(meta) if !meta.is_file() => OldFile::Opaque("not a regular file"),
+        Ok(meta) if meta.len() > COMPARISON_CAP => OldFile::TooLarge(meta.len()),
+        Ok(_) => match std::fs::read(absolute) {
+            Ok(bytes) => String::from_utf8(bytes).map_or(OldFile::Opaque("not UTF-8 text"), OldFile::Text),
+            Err(_) => OldFile::Opaque("unreadable"),
+        },
+    }
 }
 
 // ---------------------------------------------------------------- configuration
@@ -482,11 +551,16 @@ pub fn op_matches(pattern: &str, op: &str) -> bool {
 // ---------------------------------------------------------------- policy evaluation
 
 pub fn evaluate(conn: &Connection, request: &GateRequest<'_>) -> Result<Decision, BusError> {
-    let cfg = config(conn, Some(request.project_id))?;
+    evaluate_with(&config(conn, Some(request.project_id))?, request)
+}
+
+/// [`evaluate`] against a config already read: touches no connection, so it can run with the
+/// store lock released.
+pub fn evaluate_with(cfg: &GuardrailConfig, request: &GateRequest<'_>) -> Result<Decision, BusError> {
     match request.kind {
-        GateKind::Write => evaluate_write(&cfg, request),
-        GateKind::Commit => evaluate_commit(&cfg, request),
-        GateKind::Exec => evaluate_exec(&cfg, request),
+        GateKind::Write => evaluate_write(cfg, request),
+        GateKind::Commit => evaluate_commit(cfg, request),
+        GateKind::Exec => evaluate_exec(cfg, request),
     }
 }
 
@@ -498,7 +572,8 @@ pub fn evaluate_granted(
     request: &GateRequest<'_>,
     session_id: Option<Id>,
 ) -> Result<(Decision, Vec<Id>), BusError> {
-    let first = evaluate(conn, request)?;
+    let cfg = config(conn, Some(request.project_id))?;
+    let first = evaluate_with(&cfg, request)?;
     let (Some(session_id), true) = (session_id, request.actor.is_agent()) else {
         return Ok((first, Vec::new()));
     };
@@ -506,40 +581,82 @@ pub fn evaluate_granted(
         return Ok((first, Vec::new()));
     }
     let grants = Grants::load(conn, session_id)?;
-    if grants.is_empty() {
+    granted_retry(&cfg, request, first, &grants)
+}
+
+/// The second half of [`evaluate_granted`], for a caller that loaded the grants itself.
+pub fn granted_retry(
+    cfg: &GuardrailConfig,
+    request: &GateRequest<'_>,
+    first: Decision,
+    grants: &Grants,
+) -> Result<(Decision, Vec<Id>), BusError> {
+    if matches!(first, Decision::Allow) || grants.is_empty() || !request.actor.is_agent() {
         return Ok((first, Vec::new()));
     }
-    let second = evaluate(conn, &GateRequest { grants: Some(&grants), ..request.clone() })?;
+    let second = evaluate_with(cfg, &GateRequest { grants: Some(grants), ..request.clone() })?;
     let used = if matches!(second, Decision::Allow) { grants.used() } else { Vec::new() };
     Ok((second, used))
+}
+
+/// Read, with nothing locked, every slow fact `request` could be judged by — as itself, with
+/// the session's grants, and with the policy a hold names waived (a confirmed pass) — so the
+/// evaluation that follows inside the transaction finds them all in `probes`.
+pub fn warm(cfg: &GuardrailConfig, request: &GateRequest<'_>, grants: &Grants) {
+    let Ok(first) = evaluate_with(cfg, request) else { return };
+    if let Decision::Hold { policy, .. } = &first {
+        let _ = evaluate_with(cfg, &GateRequest { skip_policy: Some(policy), ..request.clone() });
+    }
+    let _ = granted_retry(cfg, request, first, grants);
 }
 
 fn granted_path(request: &GateRequest<'_>, path: &Path) -> bool {
     request.grants.is_some_and(|grants| grants.covers_path(request.worktree, path))
 }
 
+/// A write that lands in the worktree: the worktree-relative path it really reaches, symlinks
+/// followed, and the path as it was spelled when that differs. Both are judged: a protected
+/// path stays protected whether it is reached through `./`, `a//b` or a symlink (RA-101).
+struct Target {
+    path: PathBuf,
+    written: Option<PathBuf>,
+}
+
 fn evaluate_write(cfg: &GuardrailConfig, request: &GateRequest<'_>) -> Result<Decision, BusError> {
     let raw_path = request.path.ok_or_else(|| {
         BusError::invalid("guardrail.path", "kind=write requires path")
     })?;
-    let path = match write_target(cfg, request, raw_path)? {
-        WriteTarget::InWorktree(path) => path,
+    let target = match write_target(cfg, request, raw_path)? {
+        WriteTarget::InWorktree(target) => target,
         WriteTarget::Scratch => return Ok(Decision::Allow),
         WriteTarget::Outside(decision) => return Ok(*decision),
     };
-    if let Some(pattern) = cfg.protected_paths.iter().find(|p| path_matches(p, &path)) {
-        if request.skip_policy != Some("protected_path") && !granted_path(request, &path) {
+    let path = target.path.as_path();
+    let written = target.written.as_deref();
+    let matches = |pattern: &str| path_matches(pattern, path) || written.is_some_and(|w| path_matches(pattern, w));
+    let resolved_protected = cfg.protected_paths.iter().any(|p| path_matches(p, path));
+    if let Some(pattern) = cfg.protected_paths.iter().find(|p| matches(p)) {
+        // A grant names where the write lands; one for the spelling only counts when the place
+        // it lands is not itself protected.
+        let granted = granted_path(request, path)
+            || !resolved_protected && written.is_some_and(|w| granted_path(request, w));
+        if request.skip_policy != Some("protected_path") && !granted {
+            let shown = match written {
+                Some(w) => format!("{} (which is {})", w.display(), path.display()),
+                None => path.display().to_string(),
+            };
             return Ok(refuse_or_user_hold(
                 request.actor,
                 "protected_path",
                 "guardrail.protected_path",
-                format!("{} is protected by {pattern:?}", path.display()),
-                json!({"path": path, "pattern": pattern}),
+                format!("{shown} is protected by {pattern:?}"),
+                json!({"path": path, "written": written, "pattern": pattern}),
             ));
         }
     }
+    let gate = cfg.shape_gates.iter().find(|g| matches(&g.path));
     if request.path_only {
-        if let Some(gate) = cfg.shape_gates.iter().find(|g| path_matches(&g.path, &path)) {
+        if let Some(gate) = gate {
             if request.skip_policy != Some("shape_gate") {
                 let Some(new_text) = request.new_text else {
                     return Ok(hold(
@@ -565,7 +682,7 @@ fn evaluate_write(cfg: &GuardrailConfig, request: &GateRequest<'_>) -> Result<De
     let Some(new_text) = request.new_text else {
         // Edit hooks may only provide a diff. Destructive counts still work from it; shape
         // gates need complete text, so a critical path without text is held conservatively.
-        if let Some(gate) = cfg.shape_gates.iter().find(|g| path_matches(&g.path, &path)) {
+        if let Some(gate) = gate {
             if request.skip_policy != Some("shape_gate") {
                 return Ok(hold(
                     "shape_gate",
@@ -579,7 +696,11 @@ fn evaluate_write(cfg: &GuardrailConfig, request: &GateRequest<'_>) -> Result<De
             // The file itself is right there. Measuring it is strictly better than inferring
             // a size from the diff, which is what made every diff-only write read as 100%.
             let (removed, added) = diff_counts(diff);
-            return destructive_decision(cfg, request, &path, removed, added, file_lines(request.worktree, &path));
+            let old_lines = match &*request.old_file(path) {
+                OldFile::Text(text) => Some(text.lines().count() as u32),
+                _ => None,
+            };
+            return destructive_decision(cfg, request, path, removed, added, old_lines);
         }
         return Err(BusError::invalid(
             "guardrail.write",
@@ -587,7 +708,7 @@ fn evaluate_write(cfg: &GuardrailConfig, request: &GateRequest<'_>) -> Result<De
         ));
     };
 
-    if let Some(gate) = cfg.shape_gates.iter().find(|g| path_matches(&g.path, &path)) {
+    if let Some(gate) = gate {
         if request.skip_policy != Some("shape_gate") {
             if let Err(reason) = validate_shape(gate, new_text) {
                 return Ok(refuse_or_user_hold(
@@ -601,39 +722,53 @@ fn evaluate_write(cfg: &GuardrailConfig, request: &GateRequest<'_>) -> Result<De
         }
     }
 
-    let absolute = request.worktree.join(&path);
-    let old = match std::fs::metadata(&absolute) {
-        // A confirmed hold or a path grant lifts this exactly as it lifts the line counts;
-        // without that, a confirm replayed straight back into the same hold.
-        Ok(meta) if meta.len() > 64 * 1024 * 1024 => {
-            if request.skip_policy == Some("destructive_write") || granted_path(request, &path) {
-                return Ok(Decision::Allow);
-            }
-            return Ok(hold(
-                "destructive_write",
-                "guardrail.destructive_write",
+    let old = request.old_file(path);
+    let old = match &*old {
+        OldFile::Missing => "",
+        OldFile::Text(text) => text.as_str(),
+        OldFile::TooLarge(bytes) => {
+            return Ok(unmeasured(
+                cfg, request, path,
                 format!("{} is larger than the 64 MiB comparison cap", path.display()),
-                json!({"path": path, "bytes": meta.len(), "reason": "comparison_cap"}),
+                json!({"path": path, "bytes": bytes, "reason": "comparison_cap"}),
             ));
         }
-        Ok(_) => std::fs::read_to_string(&absolute).unwrap_or_default(),
-        Err(_) => String::new(),
+        // Replacing bytes Relay cannot count in lines is the whole file going, not none of it.
+        OldFile::Opaque(why) => {
+            return Ok(unmeasured(
+                cfg, request, path,
+                format!("{} replaces a file whose content cannot be compared ({why})", path.display()),
+                json!({"path": path, "reason": why}),
+            ));
+        }
     };
-    let (removed, added) = changed_line_counts(&old, new_text);
+    let (removed, added) = changed_line_counts(old, new_text);
     destructive_decision(
         cfg,
         request,
-        &path,
+        path,
         removed,
         added,
         Some(old.lines().count() as u32),
     )
 }
 
+/// A rewrite of a file that cannot be measured is judged as a destructive one: a confirmed
+/// hold, a path grant or git being able to restore it lets it through, nothing else.
+fn unmeasured(cfg: &GuardrailConfig, request: &GateRequest<'_>, path: &Path, message: String, details: Value) -> Decision {
+    if request.skip_policy == Some("destructive_write") || granted_path(request, path) {
+        return Decision::Allow;
+    }
+    if cfg.destructive_write.allow_if_recoverable && request.recoverable(path).is_some() {
+        return Decision::Allow;
+    }
+    refuse_or_user_hold(request.actor, "destructive_write", "guardrail.destructive_write", message, details)
+}
+
 /// Where a write is aimed. Scratch space outside the worktree is allowed outright: it is not
 /// a repo-integrity concern, and refusing it puts an agent between two mandatory systems (D102).
 enum WriteTarget {
-    InWorktree(PathBuf),
+    InWorktree(Target),
     Scratch,
     Outside(Box<Decision>),
 }
@@ -667,53 +802,126 @@ pub fn write_roots(cfg: &GuardrailConfig, worktree: &Path) -> Vec<PathBuf> {
     roots
 }
 
+/// Where an absolute path really leads: every symlink along it followed (dangling ones too,
+/// which is where a write through one would create the file), `.` and `..` applied, and the
+/// parts that do not exist yet kept as written — `realpath -m`. A path whose links loop is
+/// returned as far as it got.
+pub(crate) fn resolve(path: &Path) -> PathBuf {
+    let mut todo: Vec<OsString> = Vec::new();
+    push_parts(&mut todo, path);
+    let mut out = PathBuf::from("/");
+    let mut hops = 0;
+    while let Some(part) = todo.pop() {
+        if part == "." || part.is_empty() {
+            continue;
+        }
+        if part == ".." {
+            out.pop();
+            continue;
+        }
+        let next = out.join(&part);
+        match std::fs::symlink_metadata(&next) {
+            Ok(meta) if meta.file_type().is_symlink() && hops < 40 => {
+                hops += 1;
+                let Ok(link) = std::fs::read_link(&next) else {
+                    out = next;
+                    continue;
+                };
+                if link.is_absolute() {
+                    out = PathBuf::from("/");
+                }
+                push_parts(&mut todo, &link);
+            }
+            _ => out = next,
+        }
+    }
+    out
+}
+
+/// Push `path`'s parts onto a stack so the first part pops first.
+fn push_parts(todo: &mut Vec<OsString>, path: &Path) {
+    let parts: Vec<OsString> = path
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(part) => Some(part.to_os_string()),
+            Component::ParentDir => Some(OsString::from("..")),
+            _ => None,
+        })
+        .collect();
+    todo.extend(parts.into_iter().rev());
+}
+
+/// A worktree-relative path with `.` parts and doubled separators taken out.
+fn normalized(path: &Path) -> PathBuf {
+    path.components().filter(|c| !matches!(c, Component::CurDir)).collect()
+}
+
 fn write_target(
     cfg: &GuardrailConfig,
     request: &GateRequest<'_>,
     raw_path: &str,
 ) -> Result<WriteTarget, BusError> {
     let candidate = Path::new(raw_path);
-    if !candidate.is_absolute() {
-        return relative_path(raw_path).map(WriteTarget::InWorktree);
+    let absolute = if candidate.is_absolute() {
+        if candidate.components().any(|c| matches!(c, Component::ParentDir)) {
+            return Err(BusError::invalid(
+                "guardrail.path",
+                format!("{raw_path:?} must contain no .."),
+            ));
+        }
+        candidate.to_path_buf()
+    } else {
+        request.worktree.join(relative_path(raw_path)?)
+    };
+    let as_written = absolute.strip_prefix(request.worktree).ok().map(normalized);
+    if as_written.as_ref().is_some_and(|relative| relative.as_os_str().is_empty()) {
+        return Err(BusError::invalid("guardrail.path", "write target is the worktree itself"));
     }
-    if candidate.components().any(|c| matches!(c, Component::ParentDir)) {
-        return Err(BusError::invalid(
-            "guardrail.path",
-            format!("{raw_path:?} must contain no .."),
-        ));
-    }
-    if let Ok(relative) = candidate.strip_prefix(request.worktree) {
+    // Where the write really lands. A rename, move or delete acts on the last part itself, so
+    // only the directories above it are followed; a write follows the file's own link too.
+    let landing = match (request.path_only, absolute.parent(), absolute.file_name()) {
+        (true, Some(parent), Some(name)) => resolve(parent).join(name),
+        _ => resolve(&absolute),
+    };
+    let worktree = resolve(request.worktree);
+    if let Ok(relative) = landing.strip_prefix(&worktree) {
         if relative.as_os_str().is_empty() {
             return Err(BusError::invalid("guardrail.path", "write target is the worktree itself"));
         }
-        return Ok(WriteTarget::InWorktree(relative.to_path_buf()));
+        let path = relative.to_path_buf();
+        let written = as_written.filter(|written| *written != path);
+        return Ok(WriteTarget::InWorktree(Target { path, written }));
     }
+    // Outside the worktree — as written, or because a symlink inside it leads out. Judged by
+    // where it lands: a link in scratch space must not reach the repository or anywhere else.
     let roots = write_roots(cfg, request.worktree);
-    if roots.iter().skip(1).any(|root| candidate.starts_with(root)) {
+    if roots.iter().skip(1).any(|root| landing.starts_with(root) || landing.starts_with(resolve(root))) {
         return Ok(WriteTarget::Scratch);
     }
     // A person let this session write here. It is outside the repository, so nothing below
     // (protected paths, shape gates, rewrite size) has anything left to judge.
-    if request.grants.is_some_and(|grants| grants.covers_root(candidate)) {
+    if request.grants.is_some_and(|grants| grants.covers_root(&landing)) {
         return Ok(WriteTarget::Scratch);
     }
     let listed: Vec<String> = roots.iter().map(|root| root.display().to_string()).collect();
+    let shown = if landing == absolute { raw_path.to_string() } else { format!("{raw_path} (which is {})", landing.display()) };
     Ok(WriteTarget::Outside(Box::new(refuse_or_user_hold(
         request.actor,
         "write_root",
         "guardrail.write_root",
         format!(
-            "{raw_path} is outside every root this session may write to ({})",
+            "{shown} is outside every root this session may write to ({})",
             listed.join(", ")
         ),
-        json!({"path": raw_path, "write_roots": listed}),
+        json!({"path": landing, "written": raw_path, "write_roots": listed}),
     ))))
 }
 
 /// Can git put this file back exactly as it is now? Returns why, or `None` when the content
-/// would be lost for good. Committed-and-unmodified is restorable with `git checkout --`;
-/// an ignored file is build output or scratch, not repository content. Untracked or modified
-/// files carry work that exists nowhere else — those are the ones worth stopping (D114).
+/// would be lost for good. Committed-and-unmodified is restorable with `git checkout --`.
+/// Untracked, modified and ignored files carry bytes that exist nowhere else — an ignored file
+/// is as often `.env`, local config or Terraform state as it is build output, and git cannot
+/// bring any of them back (D114, RA-094).
 fn recoverable(worktree: &Path, path: &Path) -> Option<&'static str> {
     let out = crate::proc::output_with_timeout(
         Command::new("git")
@@ -731,21 +939,9 @@ fn recoverable(worktree: &Path, path: &Path) -> Option<&'static str> {
     match status.trim_end().lines().next() {
         // No status line at all: git is tracking it and it matches HEAD.
         None => Some("committed and unmodified"),
-        Some(line) if line.starts_with("!!") => Some("ignored by git"),
-        // Untracked, staged, or modified — the current bytes exist only here.
+        // Untracked, ignored, staged, or modified — the current bytes exist only here.
         Some(_) => None,
     }
-}
-
-/// How many lines the file on disk has, or `None` when it does not exist or cannot be read.
-/// Files past the comparison cap are treated as unmeasured rather than read into memory.
-fn file_lines(worktree: &Path, path: &Path) -> Option<u32> {
-    let absolute = worktree.join(path);
-    let metadata = std::fs::metadata(&absolute).ok()?;
-    if metadata.len() > 64 * 1024 * 1024 {
-        return None;
-    }
-    Some(std::fs::read_to_string(&absolute).ok()?.lines().count() as u32)
 }
 
 fn destructive_decision(
@@ -770,7 +966,7 @@ fn destructive_decision(
         // Volume is a proxy; what actually matters is whether the work can come back. Asked
         // only here, on the path that was about to block, so the common write pays nothing.
         if limits.allow_if_recoverable {
-            if let Some(reason) = recoverable(request.worktree, path) {
+            if let Some(reason) = request.recoverable(path) {
                 tracing::debug!(path = %path.display(), reason, "large rewrite allowed: git can restore it");
                 return Ok(Decision::Allow);
             }
@@ -801,22 +997,114 @@ fn destructive_decision(
     Ok(Decision::Allow)
 }
 
+/// One file a commit changes, from `git diff --numstat`: its counts and every path it names
+/// (both sides of a rename).
+#[derive(Debug, PartialEq)]
+struct NumstatEntry {
+    added: u32,
+    removed: u32,
+    paths: Vec<String>,
+}
+
+/// Read numstat output. Relay's own probe asks for `-z --no-renames`, where each record is
+/// `added\tremoved\tpath\0` with the path verbatim. A caller-supplied numstat may be the
+/// plain form instead: a path git C-quoted (`"caf\303\251.txt"`) is unquoted, and a rename
+/// (`old => new`, `src/{a => b}/x`) names both sides — the old reading saw neither, so a
+/// renamed or non-ASCII protected path never matched (RA-095).
+fn parse_numstat(text: &str) -> Vec<NumstatEntry> {
+    let counts = |field: Option<&str>| field.and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(0);
+    let mut entries = Vec::new();
+    if text.contains('\0') {
+        let mut records = text.split('\0');
+        while let Some(record) = records.next() {
+            let mut fields = record.splitn(3, '\t');
+            let (added, removed) = (counts(fields.next()), counts(fields.next()));
+            let Some(path) = fields.next() else { continue };
+            let paths = if path.is_empty() {
+                // `-z` with renames on: the two sides follow as records of their own.
+                records.by_ref().take(2).filter(|p| !p.is_empty()).map(str::to_owned).collect()
+            } else {
+                vec![path.to_string()]
+            };
+            entries.push(NumstatEntry { added, removed, paths });
+        }
+        return entries;
+    }
+    for line in text.lines() {
+        let mut fields = line.splitn(3, '\t');
+        let (added, removed) = (counts(fields.next()), counts(fields.next()));
+        let Some(path) = fields.next() else { continue };
+        entries.push(NumstatEntry { added, removed, paths: rename_sides(&unquote_c(path)) });
+    }
+    entries
+}
+
+/// Git's C-style path quoting undone: `"a\tb\303\251"` is `a<TAB>bé`. Unquoted text is as is.
+fn unquote_c(path: &str) -> String {
+    let Some(inner) = path.strip_prefix('"').and_then(|p| p.strip_suffix('"')) else {
+        return path.to_string();
+    };
+    let bytes = inner.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' || i + 1 >= bytes.len() {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        let next = bytes[i + 1];
+        let octal = bytes.get(i + 1..i + 4).filter(|d| d.iter().all(|b| (b'0'..=b'7').contains(b)));
+        if let Some(digits) = octal {
+            out.push(digits.iter().fold(0u8, |acc, d| acc.wrapping_mul(8).wrapping_add(d - b'0')));
+            i += 4;
+            continue;
+        }
+        out.push(match next {
+            b'n' => b'\n',
+            b't' => b'\t',
+            b'r' => b'\r',
+            b'a' => 7,
+            b'b' => 8,
+            b'f' => 12,
+            b'v' => 11,
+            other => other,
+        });
+        i += 2;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Both sides of a numstat rename: `old => new`, or `pre{old => new}post`. Anything else is
+/// one path.
+fn rename_sides(path: &str) -> Vec<String> {
+    if let (Some(open), Some(close)) = (path.find('{'), path.rfind('}')) {
+        if open < close {
+            if let Some((old, new)) = path[open + 1..close].split_once(" => ") {
+                let (pre, post) = (&path[..open], &path[close + 1..]);
+                let join = |middle: &str| format!("{pre}{middle}{post}").replace("//", "/");
+                return vec![join(old), join(new)];
+            }
+        }
+    }
+    match path.split_once(" => ") {
+        Some((old, new)) => vec![old.to_string(), new.to_string()],
+        None => vec![path.to_string()],
+    }
+}
+
 fn evaluate_commit(cfg: &GuardrailConfig, request: &GateRequest<'_>) -> Result<Decision, BusError> {
     let numstat = match request.diff {
         Some(diff) => diff.to_string(),
-        None => git_output(request.worktree, &["diff", "--cached", "--numstat"])? ,
+        None => request.staged_numstat()?,
     };
     let mut files = 0u32;
     let mut lines = 0u32;
     let mut touched = Vec::new();
-    for line in numstat.lines() {
-        let mut fields = line.splitn(3, '\t');
-        let added = fields.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
-        let removed = fields.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
-        let Some(path) = fields.next() else { continue };
+    for entry in parse_numstat(&numstat) {
         files += 1;
-        lines = lines.saturating_add(added).saturating_add(removed);
-        touched.push(path.to_string());
+        lines = lines.saturating_add(entry.added).saturating_add(entry.removed);
+        touched.extend(entry.paths);
     }
     // Every protected path the commit touches needs its own grant.
     if let Some((path, pattern)) = touched.iter().find_map(|path| {
@@ -875,10 +1163,12 @@ fn evaluate_exec(cfg: &GuardrailConfig, request: &GateRequest<'_>) -> Result<Dec
     if request.skip_policy == Some("denied_command") {
         return Ok(Decision::Allow);
     }
-    let uncovered = denied_matches(&cfg.denied_commands, command).into_iter().find(|hit| {
-        !request.grants.is_some_and(|grants| grants.covers_command(&hit.bare))
+    let commands = shell_commands(command);
+    let uncovered = denied_matches_in(&cfg.denied_commands, &commands).into_iter().find(|hit| {
+        !request.grants.is_some_and(|grants| grants.covers_command(&hit.words, &commands))
     });
-    if let Some(DeniedMatch { pattern, argv, .. }) = uncovered {
+    if let Some(DeniedMatch { pattern, words, .. }) = uncovered {
+        let argv: Vec<&str> = words.iter().map(|word| word.text.as_str()).collect();
         return Ok(refuse_or_user_hold(
             request.actor,
             "denied_command",
@@ -899,73 +1189,536 @@ const USER_ONLY_ANSWERS: &[&str] = &[
     "guardrail.confirm", "guardrail.reject", "guardrail.config.set", "guardrail.grant.revoke", "settings.set", "settings.reset",
 ];
 
+/// The environment the CLI takes its identity from (`actor_from_env`): without `RELAY_SESSION`
+/// it falls back to the user.
+const IDENTITY_VARS: &[&str] = &["RELAY_SESSION", "RELAY_TOKEN", "RELAY_ACTOR"];
+
+/// Programs that run their argument as another user or with a fresh environment, so whatever
+/// they start no longer carries the session's identity.
+const IDENTITY_RESETTERS: &[&str] = &["sudo", "su", "doas", "runuser", "pkexec", "systemd-run", "machinectl"];
+
 /// Does a command line invoke Relay as the user, or answer a guardrail through it? Returns the
 /// offending argv.
+///
+/// Read through the same expanded command list as the denied-command rule, so `bash -c`,
+/// `env …`, `python -c`, a script piped into `sh` and a heredoc fed to a shell are all seen.
+/// Searching for these names (`rg guardrail.confirm crates/relay-core`) is not running them:
+/// only a Relay *invocation* — `relay`/`$RELAY_BIN` followed by `q`/`cmd` and an op — counts,
+/// and then both of the CLI's forms, `q <op>` and `cmd '<envelope>'` (RA-096, RA-097).
 fn self_approval(line: &str) -> Option<Vec<String>> {
-    for command in shell_commands(line) {
+    if claims_user_envelope(line) {
+        return Some(vec![line.to_string()]);
+    }
+    let commands = shell_commands(line);
+    let runs_relay = commands.iter().any(|command| !data_only(command) && command.iter().any(|word| is_relay(&word.text)));
+    for command in &commands {
+        if data_only(command) {
+            continue;
+        }
         let words: Vec<&str> = command.iter().map(|word| word.text.as_str()).collect();
-        let relay = words.iter().any(|word| {
-            let stem = Path::new(word).file_stem().and_then(|stem| stem.to_str()).unwrap_or(word);
-            stem.to_ascii_lowercase().starts_with("relay") || word.contains("RELAY_BIN")
-        });
-        // Clearing the session identity makes the CLI fall back to the user actor.
-        let sheds_identity = words.iter().enumerate().any(|(at, word)| {
-            word.starts_with("RELAY_ACTOR=")
-                || word.starts_with("RELAY_SESSION=")
-                || (*word == "-u" || *word == "--unset") && words.get(at + 1) == Some(&"RELAY_SESSION")
-                || *word == "unset" && words.get(at + 1) == Some(&"RELAY_SESSION")
-        });
-        let as_user = words.iter().enumerate().any(|(at, word)| {
+        let argv = || command.iter().map(|word| word.text.clone()).collect();
+        if sheds_identity(&words, runs_relay) {
+            return Some(argv());
+        }
+        let impersonates = words.iter().enumerate().any(|(at, word)| {
             matches!(*word, "--actor=user" | "--actor=test")
                 || *word == "--actor" && matches!(words.get(at + 1), Some(&"user") | Some(&"test"))
         });
-        let answers = words.iter().any(|word| USER_ONLY_ANSWERS.contains(word));
-        if (relay && (as_user || answers)) || sheds_identity {
-            return Some(command.iter().map(|word| word.text.clone()).collect());
+        let relay_at: Vec<usize> = (0..words.len()).filter(|at| is_relay(words[*at])).collect();
+        // A renamed copy of the binary is still the CLI: `--actor user` next to `q`/`cmd`.
+        if impersonates && (!relay_at.is_empty() || words.iter().any(|word| matches!(*word, "q" | "cmd"))) {
+            return Some(argv());
+        }
+        for at in relay_at {
+            let Some(op) = relay_call(&words, at) else { continue };
+            let answers = match op {
+                // `q` with nothing after it takes the op from somewhere this line does not show.
+                None => true,
+                Some(op) if op.trim_start().starts_with('{') => {
+                    USER_ONLY_ANSWERS.iter().any(|answer| op.contains(answer)) || op.contains("\"actor\"")
+                }
+                Some(op) => USER_ONLY_ANSWERS.contains(&op) || op.contains(['$', '`']),
+            };
+            if answers {
+                return Some(argv());
+            }
         }
     }
     None
 }
 
-/// Split a command line into the individual commands it runs, each as words (D103). The
-/// reader is shared with the device-lease gate, so both see the same commands.
+/// A raw request envelope that claims the user (or test) actor for an op, in any quoting:
+/// `{"actor":"user","op":…}` written to the socket with `socat`, `nc` or a script.
+fn claims_user_envelope(line: &str) -> bool {
+    let bare: String = line.chars().filter(|c| !c.is_whitespace() && !matches!(c, '\\' | '"' | '\'')).collect();
+    (bare.contains("actor:user") || bare.contains("actor:test")) && bare.contains("op:")
+}
+
+/// The Relay CLI, by name or through `$RELAY_BIN`: `relay`, `/usr/bin/relay`, `relay-cli`
+/// (`cargo run -p relay-cli`). A word with spaces in it is text, not a program.
+fn is_relay(word: &str) -> bool {
+    word.contains("RELAY_BIN")
+        || !word.contains(char::is_whitespace) && shell::program(word).to_ascii_lowercase().starts_with("relay")
+}
+
+/// The op a Relay CLI call at `at` runs: `Some(Some(op))` for `relay [flags] q|cmd <op>`,
+/// `Some(None)` when `q`/`cmd` has no op after it, `None` when this is no bus call at all.
+fn relay_call<'w>(words: &[&'w str], at: usize) -> Option<Option<&'w str>> {
+    let skip_flags = |mut at: usize| {
+        while let Some(word) = words.get(at) {
+            if matches!(*word, "--instance" | "--actor") {
+                at += 2;
+            } else if word.starts_with('-') {
+                at += 1;
+            } else {
+                break;
+            }
+        }
+        at
+    };
+    let sub = skip_flags(at + 1);
+    if !matches!(words.get(sub), Some(&"q") | Some(&"cmd")) {
+        return None;
+    }
+    Some(words.get(skip_flags(sub + 1)).copied())
+}
+
+/// Clearing or overriding the session identity, which makes the CLI fall back to the user:
+/// `RELAY_SESSION=`, `unset RELAY_SESSION`, `env -u RELAY_SESSION` / `--unset=…` / `-uRELAY_…`,
+/// and — when the line runs Relay at all — `env -i` or a program that resets the environment.
+fn sheds_identity(words: &[&str], runs_relay: bool) -> bool {
+    let names = |word: &str| IDENTITY_VARS.contains(&word);
+    let program = words.first().map(|word| shell::program(word)).unwrap_or_default();
+    words.iter().enumerate().any(|(at, word)| {
+        IDENTITY_VARS.iter().any(|var| word.strip_prefix(var).is_some_and(|rest| rest.starts_with('=')))
+            || matches!(*word, "-u" | "--unset") && words.get(at + 1).is_some_and(|next| names(next))
+            || word.strip_prefix("--unset=").or_else(|| word.strip_prefix("-u")).is_some_and(names)
+            || program == "unset" && at > 0 && names(word)
+            || runs_relay && IDENTITY_RESETTERS.contains(&shell::program(word))
+            || runs_relay && shell::program(word) == "env" && words[at + 1..].iter().take_while(|w| w.starts_with('-')).any(|flag| {
+                *flag == "-" || *flag == "--ignore-environment" || !flag.starts_with("--") && flag.contains('i')
+            })
+    })
+}
+
+/// A command whose program reads its arguments as data — text to print, a pattern to search
+/// for — and never runs them: `echo rm -rf /`, `rg guardrail.confirm crates/relay-core`.
+/// Only its own program word is a command (RA-099).
+fn data_only(command: &[Word]) -> bool {
+    let Some(first) = command.first() else { return false };
+    match shell::program(&first.text) {
+        "echo" | "printf" | "grep" | "egrep" | "fgrep" | "ag" | "ack" | "man" | "which" | "whatis" | "apropos" => true,
+        // `rg --pre` runs a program on every file it searches.
+        "rg" => !command.iter().any(|word| word.text.starts_with("--pre")),
+        _ => false,
+    }
+}
+
+/// Shells whose script can come from `-c`, standard input or a heredoc.
+const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish"];
+
+/// An interpreter whose inline code (`python3 -c`, `perl -e`, `node -e`) can run a command.
+fn is_interpreter(program: &str) -> bool {
+    let program = program.to_ascii_lowercase();
+    program == "nodejs"
+        || ["python", "perl", "ruby", "node", "php", "lua", "deno", "bun"].iter().any(|name| {
+            program.strip_prefix(name).is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit() || c == '.'))
+        })
+}
+
+/// How many levels of script-inside-a-line are followed beyond what [`shell::commands`] reads.
+const MAX_SCRIPT_DEPTH: usize = 4;
+
+/// Every command `line` runs, each as its words (D103): what [`shell::commands`] reads, minus
+/// what is only data — a comment, a heredoc body fed to `cat` — plus what it cannot see on its
+/// own: a heredoc or a quoted script fed to a shell on standard input (`echo '…' | sh`,
+/// `bash <<< '…'`, `bash <<EOF`), and the strings in an interpreter's inline code
+/// (`python3 -c "os.system('…')"`), each read as a command line (RA-098, RA-099). A script
+/// file (`bash deploy.sh`) is not opened.
 fn shell_commands(line: &str) -> Vec<Vec<Word>> {
-    shell::commands(line)
+    let mut out = Vec::new();
+    expand(line, 0, &mut out);
+    out
+}
+
+fn expand(line: &str, depth: usize, out: &mut Vec<Vec<Word>>) {
+    let (code, mut scripts) = strip_data(line);
+    let commands: Vec<Vec<Word>> = shell::commands(&code)
+        .into_iter()
+        .map(|mut command| {
+            // A comment inside a nested script, which `strip_data` did not see.
+            if let Some(at) = command.iter().position(|word| !word.quoted && word.text.starts_with('#')) {
+                command.truncate(at);
+            }
+            command
+        })
+        .filter(|command| !command.is_empty())
+        .collect();
+    let stdin_script = commands.iter().any(|command| reads_stdin_script(command));
+    for command in &commands {
+        if let Some(code) = inline_code(command) {
+            scripts.extend(literal_lines(code));
+        }
+        if stdin_script {
+            scripts.extend(command.iter().filter(|word| word.quoted).map(|word| word.text.clone()));
+            if data_only(command) && command.len() > 1 {
+                scripts.push(command[1..].iter().map(|word| word.text.as_str()).collect::<Vec<_>>().join(" "));
+            }
+        }
+    }
+    out.extend(commands);
+    if depth < MAX_SCRIPT_DEPTH {
+        for script in scripts {
+            expand(&script, depth + 1, out);
+        }
+    }
+}
+
+/// Is this a shell reading its script from standard input — `sh`, `bash -s`, `bash <<< …` —
+/// rather than from `-c` or a file?
+fn reads_stdin_script(command: &[Word]) -> bool {
+    if data_only(command) {
+        return false;
+    }
+    let Some(at) = command
+        .iter()
+        .enumerate()
+        .position(|(at, word)| (at == 0 || !word.quoted) && SHELLS.contains(&shell::program(&word.text)))
+    else {
+        return false;
+    };
+    let rest = &command[at + 1..];
+    let mut i = 0;
+    while let Some(word) = rest.get(i) {
+        let text = word.text.as_str();
+        if text == "-s" || text == "<<<" {
+            return true;
+        }
+        if text.starts_with('-') && !text.starts_with("--") && text.contains('c') {
+            return false;
+        }
+        if matches!(text, "-o" | "+o" | "-O" | "+O" | "<" | "--rcfile" | "--init-file") {
+            i += 2;
+        } else if text.starts_with(['-', '+', '<', '>']) || text.starts_with(|c: char| c.is_ascii_digit()) && text.contains(['<', '>']) {
+            i += 1;
+        } else {
+            // A script file: its content is not on this line.
+            return false;
+        }
+    }
+    true
+}
+
+/// The inline code an interpreter runs from its arguments: `python3 -c CODE`, `perl -ne CODE`,
+/// `node --eval CODE`, `php -r CODE`.
+fn inline_code(command: &[Word]) -> Option<&str> {
+    if data_only(command) {
+        return None;
+    }
+    let at = command
+        .iter()
+        .enumerate()
+        .position(|(at, word)| (at == 0 || !word.quoted) && is_interpreter(shell::program(&word.text)))?;
+    let mut i = at + 1;
+    while let Some(word) = command.get(i) {
+        let text = word.text.as_str();
+        if matches!(text, "--eval" | "--print" | "--command") {
+            return command.get(i + 1).map(|word| word.text.as_str());
+        }
+        if let Some(code) = text.strip_prefix("--eval=").or_else(|| text.strip_prefix("--print=")) {
+            return Some(code);
+        }
+        if text.starts_with("--") {
+            i += 1;
+        } else if text.starts_with('-') && text.len() > 1 {
+            if text.ends_with(['c', 'e', 'E', 'r', 'p']) {
+                return command.get(i + 1).map(|word| word.text.as_str());
+            }
+            i += 1;
+        } else {
+            return None;
+        }
+    }
+    None
+}
+
+/// The string literals in a piece of interpreter code, each a possible command line, and all
+/// of them joined: `os.system('rm -rf /')` and `subprocess.run(["rm", "-rf", "/"])` both run
+/// `rm -rf /`.
+fn literal_lines(code: &str) -> Vec<String> {
+    let chars: Vec<char> = code.chars().collect();
+    let mut literals = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let quote = chars[i];
+        i += 1;
+        if !matches!(quote, '\'' | '"' | '`') {
+            continue;
+        }
+        let mut text = String::new();
+        while i < chars.len() && chars[i] != quote {
+            if chars[i] == '\\' && i + 1 < chars.len() {
+                text.push(match chars[i + 1] {
+                    'n' => '\n',
+                    't' => '\t',
+                    other => other,
+                });
+                i += 2;
+                continue;
+            }
+            text.push(chars[i]);
+            i += 1;
+        }
+        i += 1;
+        if !text.trim().is_empty() {
+            literals.push(text);
+        }
+    }
+    if literals.len() > 1 {
+        literals.push(literals.join(" "));
+    }
+    literals
+}
+
+/// Who reads a heredoc's body.
+#[derive(Clone, Copy, PartialEq)]
+enum Feed {
+    Shell,
+    Interpreter,
+    Data,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Frame {
+    /// Live shell code: the line itself, or the inside of `$( )` (`subst`).
+    Code { subst: bool, parens: u32 },
+    Double,
+    Backtick,
+}
+
+/// `line` with what is only data taken out — `#` comments, and heredoc bodies fed to anything
+/// but a shell or an interpreter — and the scripts it feeds elsewhere: a heredoc body fed to a
+/// shell, the strings of one fed to an interpreter, and the substitutions an unquoted heredoc
+/// still expands. A heredoc whose terminator never comes is left in place, read as commands.
+fn strip_data(line: &str) -> (String, Vec<String>) {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = String::with_capacity(line.len());
+    let mut scripts = Vec::new();
+    let mut stack = vec![Frame::Code { subst: false, parens: 0 }];
+    // (delimiter, `<<-`, expands, who reads it)
+    let mut pending: Vec<(String, bool, bool, Feed)> = Vec::new();
+    let mut line_start = 0;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let top = *stack.last().unwrap_or(&Frame::Code { subst: false, parens: 0 });
+        if top == Frame::Double {
+            match c {
+                '"' => {
+                    stack.pop();
+                }
+                '\\' => {
+                    out.push(c);
+                    i += 1;
+                    if let Some(&next) = chars.get(i) {
+                        out.push(next);
+                        i += 1;
+                    }
+                    continue;
+                }
+                '$' if chars.get(i + 1) == Some(&'(') => {
+                    out.push_str("$(");
+                    stack.push(Frame::Code { subst: true, parens: 0 });
+                    i += 2;
+                    continue;
+                }
+                '`' => stack.push(Frame::Backtick),
+                _ => {}
+            }
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        let at_word_start = i == 0 || matches!(chars[i - 1], ' ' | '\t' | '\n' | ';' | '&' | '|' | '(' | ')');
+        match c {
+            '\\' => {
+                out.push(c);
+                i += 1;
+                if let Some(&next) = chars.get(i) {
+                    out.push(next);
+                    i += 1;
+                }
+                continue;
+            }
+            '\'' => {
+                out.push(c);
+                i += 1;
+                while i < chars.len() && chars[i] != '\'' {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+                if i < chars.len() {
+                    out.push('\'');
+                    i += 1;
+                }
+                continue;
+            }
+            '"' => stack.push(Frame::Double),
+            '`' if top == Frame::Backtick => {
+                stack.pop();
+            }
+            '`' => stack.push(Frame::Backtick),
+            '$' if chars.get(i + 1) == Some(&'(') => {
+                out.push_str("$(");
+                stack.push(Frame::Code { subst: true, parens: 0 });
+                i += 2;
+                continue;
+            }
+            '(' => {
+                if let Some(Frame::Code { parens, .. }) = stack.last_mut() {
+                    *parens += 1;
+                }
+            }
+            ')' => match stack.last_mut() {
+                Some(Frame::Code { parens, .. }) if *parens > 0 => *parens -= 1,
+                Some(Frame::Code { subst: true, .. }) => {
+                    stack.pop();
+                }
+                _ => {}
+            },
+            '#' if at_word_start => {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            '<' if chars.get(i + 1) == Some(&'<')
+                && chars.get(i + 2) != Some(&'<')
+                && (i == 0 || chars[i - 1] != '<') =>
+            {
+                let mut j = i + 2;
+                let strip_tabs = chars.get(j) == Some(&'-');
+                if strip_tabs {
+                    j += 1;
+                }
+                while matches!(chars.get(j), Some(' ' | '\t')) {
+                    j += 1;
+                }
+                let mut delimiter = String::new();
+                let mut quoted = false;
+                while let Some(&d) = chars.get(j) {
+                    if d.is_whitespace() || matches!(d, ';' | '&' | '|' | '(' | ')' | '<' | '>') {
+                        break;
+                    }
+                    if matches!(d, '\'' | '"' | '\\') {
+                        quoted = true;
+                    } else {
+                        delimiter.push(d);
+                    }
+                    j += 1;
+                }
+                if !delimiter.is_empty() {
+                    let end = chars[i..].iter().position(|&d| d == '\n').map_or(chars.len(), |n| i + n);
+                    let physical: String = chars[line_start..end].iter().collect();
+                    pending.push((delimiter, strip_tabs, !quoted, feed_of(&physical)));
+                }
+                out.extend(&chars[i..j]);
+                i = j;
+                continue;
+            }
+            '\n' => {
+                out.push('\n');
+                i += 1;
+                line_start = i;
+                for (delimiter, strip_tabs, expands, feed) in std::mem::take(&mut pending) {
+                    let mut at = i;
+                    let mut body = String::new();
+                    let mut closed = false;
+                    while at < chars.len() {
+                        let end = chars[at..].iter().position(|&d| d == '\n').map_or(chars.len(), |n| at + n);
+                        let text: String = chars[at..end].iter().collect();
+                        at = (end + 1).min(chars.len());
+                        let check = if strip_tabs { text.trim_start_matches('\t') } else { text.as_str() };
+                        if check == delimiter {
+                            closed = true;
+                            break;
+                        }
+                        body.push_str(&text);
+                        body.push('\n');
+                    }
+                    if !closed {
+                        // No terminator: keep the rest as commands rather than guess.
+                        break;
+                    }
+                    match feed {
+                        Feed::Shell => scripts.push(body),
+                        Feed::Interpreter => scripts.extend(literal_lines(&body)),
+                        // Data, but an unquoted delimiter still runs `$( )` and backticks in it.
+                        Feed::Data if expands && body.contains(['$', '`']) => {
+                            scripts.push(format!("echo \"{}\"", body.replace('"', "\\\"")));
+                        }
+                        Feed::Data => {}
+                    }
+                    i = at;
+                    line_start = i;
+                }
+                continue;
+            }
+            _ => {}
+        }
+        out.push(c);
+        i += 1;
+    }
+    (out, scripts)
+}
+
+/// Who reads a heredoc started on this physical line: a shell or an interpreter anywhere on
+/// it (`cat <<EOF | sh`, `python3 - <<EOF`), else it is data (`cat <<EOF > notes.md`).
+fn feed_of(line: &str) -> Feed {
+    let mut feed = Feed::Data;
+    for token in line.split(|c: char| c.is_whitespace() || matches!(c, '|' | ';' | '&' | '(' | ')' | '<' | '>')) {
+        let token: String = token.chars().filter(|c| !matches!(c, '\'' | '"' | '\\')).collect();
+        let program = shell::program(&token);
+        if SHELLS.contains(&program) || matches!(program, "eval" | "source" | ".") {
+            return Feed::Shell;
+        }
+        if is_interpreter(program) {
+            feed = Feed::Interpreter;
+        }
+    }
+    feed
 }
 
 /// One place a command line runs a denied pattern.
 struct DeniedMatch {
     pattern: String,
-    argv: Vec<String>,
-    /// The command's unquoted words, lowercased.
-    bare: Vec<String>,
+    /// The command, every word as written: what a command grant is compared with.
+    words: Vec<Word>,
 }
 
 /// Every command in `line` that actually *runs* one of the denied patterns. Quoted data that
 /// merely mentions a pattern is not a match. All of them, not the first: a grant has to cover
 /// each one for the line to pass.
+#[cfg(test)]
 fn denied_matches(patterns: &[String], line: &str) -> Vec<DeniedMatch> {
+    denied_matches_in(patterns, &shell_commands(line))
+}
+
+fn denied_matches_in(patterns: &[String], commands: &[Vec<Word>]) -> Vec<DeniedMatch> {
     let patterns: Vec<(&String, DeniedPattern)> = patterns
         .iter()
         .filter_map(|pattern| DeniedPattern::parse(pattern).map(|parsed| (pattern, parsed)))
         .collect();
     let mut hits = Vec::new();
-    for command in shell_commands(line) {
-        if is_guardrail_dry_run(&command) {
+    for command in commands {
+        if is_guardrail_dry_run(command) {
             continue;
         }
-        let bare: Vec<String> = command
-            .iter()
-            .filter(|word| !word.quoted)
-            .map(|word| word.text.to_ascii_lowercase())
-            .collect();
+        // The arguments of `echo` or `rg` are data; only the program itself runs.
+        let data = data_only(command);
         for (pattern, parsed) in &patterns {
-            if parsed.runs_in(&command) {
-                hits.push(DeniedMatch {
-                    pattern: (*pattern).clone(),
-                    argv: command.iter().map(|word| word.text.clone()).collect(),
-                    bare: bare.clone(),
-                });
+            if if data { parsed.runs_at(command, 0) } else { parsed.runs_in(command) } {
+                hits.push(DeniedMatch { pattern: (*pattern).clone(), words: command.clone() });
             }
         }
     }
@@ -1099,7 +1852,7 @@ fn read_only_exec_at(line: &str, depth: u8) -> bool {
     }
     // The reader also lists what a `bash -lc '…'` runs as a command of its own; the wrapper
     // case below judges that inner line itself, so only the outer command is read here.
-    let commands = shell_commands(rest);
+    let commands = shell::commands(rest);
     let Some(command) = commands.first() else { return false };
     let words: Vec<&str> = command.iter().map(|word| word.text.as_str()).collect();
     let wrapper = depth == 0 && matches!(words.first(), Some(&("bash" | "sh" | "zsh")));
@@ -1151,26 +1904,13 @@ fn plain_words(line: &str) -> bool {
     quote.is_none()
 }
 
-/// The unquoted words of each command in `line`, lowercased — how a command grant is compared.
-pub(crate) fn command_words(line: &str) -> Vec<Vec<String>> {
-    shell_commands(line)
-        .into_iter()
-        .map(|command| {
-            command.iter().filter(|word| !word.quoted).map(|word| word.text.to_ascii_lowercase()).collect()
-        })
-        .collect()
-}
-
 /// `relay q guardrail.check ...` is the sanctioned way to ask "would this be allowed?".
-/// Blocking the question would make the safe path the unavailable one, so it stays open.
+/// Blocking the question would make the safe path the unavailable one, so it stays open — the
+/// call itself, read as the CLI reads it, not any line that mentions `guardrail.check`.
 fn is_guardrail_dry_run(command: &[Word]) -> bool {
-    let Some(first) = command.first() else { return false };
-    let binary = Path::new(&first.text)
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or(&first.text);
-    (binary == "relay" || first.text.contains("RELAY_BIN"))
-        && command.iter().any(|word| word.text == "guardrail.check")
+    let words: Vec<&str> = command.iter().map(|word| word.text.as_str()).collect();
+    words.first().is_some_and(|first| is_relay(first))
+        && matches!(relay_call(&words, 0), Some(Some("guardrail.check" | "guardrail.explain")))
 }
 
 fn refuse_or_user_hold(
@@ -1449,6 +2189,18 @@ pub fn insert_refusal_notification(
     Ok(())
 }
 
+/// Forget answered holds resolved before `cutoff` (RA-102). Each frozen envelope carries the
+/// whole action — for a held write, the whole new file — so they are not kept forever. Open
+/// holds stay, and so does anything confirmed for a session still alive: its exception grant
+/// or its one-time pass may yet be used.
+pub fn prune_holds(tx: &Transaction, cutoff: &str) -> rusqlite::Result<usize> {
+    tx.prepare_cached(
+        "DELETE FROM holds WHERE state != 'open' AND COALESCE(resolved_at, created_at) < ?1
+           AND NOT (state = 'confirmed' AND session_id IN (SELECT id FROM sessions WHERE state != 'closed'))",
+    )?
+    .execute([cutoff])
+}
+
 pub fn hold_by_id(conn: &Connection, id: Id) -> Result<Hold, BusError> {
     conn.query_row("SELECT * FROM holds WHERE id = ?1", [id], hold_row)
         .optional()
@@ -1616,5 +2368,126 @@ mod denied_tests {
     fn self_approval_is_seen_inside_a_subshell() {
         assert!(self_approval("(relay --actor user q guardrail.confirm '{\"hold_id\":1}')").is_some());
         assert!(self_approval("echo $(relay q guardrail.confirm '{}')").is_some());
+    }
+
+    /// RA-099: a comment, a heredoc body written to a file, and the arguments of `echo` or a
+    /// search are data. A comment no longer hides the next line behind its apostrophe either.
+    #[test]
+    fn comments_heredoc_data_and_plain_arguments_are_not_commands() {
+        for line in [
+            "echo rm -rf build", "printf '%s\\n' rm -rf build", "rg -n 'rm -rf' src", "grep -r git reset --hard .",
+            "ls # rm -rf /", "cargo test # then git push --force",
+            "cat <<'EOF' > notes.md\nrm -rf build is what broke it\nEOF",
+            "cat > notes.md <<-EOF\n\tgit reset --hard\n\tEOF\necho done",
+            "git commit -m \"$(cat <<'EOF'\nStop running rm -rf build by hand\nEOF\n)\"",
+        ] {
+            assert!(!denied(line), "{line:?} only mentions a denied command");
+        }
+        for line in [
+            "ls # it's fine\nrm -rf build",
+            "cat <<'EOF' > notes.md\nnotes\nEOF\nrm -rf build",
+            "cat <<EOF | bash\nrm -rf build\nEOF",
+            "bash <<'EOF'\ngit reset --hard\nEOF",
+            "cat <<EOF > out.txt\n$(rm -rf build)\nEOF",
+            "cat <<EOF\nrm -rf build",
+            "echo x; rm -rf build",
+        ] {
+            assert!(denied(line), "{line:?} runs a denied command");
+        }
+    }
+
+    /// RA-098: a script handed to a shell on standard input, `-c` in every shell, `env`, and
+    /// the strings an interpreter's inline code runs.
+    #[test]
+    fn wrapped_commands_are_seen() {
+        for line in [
+            "echo 'rm -rf build' | sh", "echo rm -rf build | bash", "printf 'git reset --hard' | bash -s",
+            "bash <<< 'rm -rf build'", "sh -c 'rm -rf build'", "zsh -c \"rm -rf build\"", "dash -c 'rm -rf build'",
+            "env FOO=1 rm -rf build", "env -i bash -c 'git clean -fd'",
+            "python3 -c \"import os; os.system('rm -rf build')\"",
+            "python3 -c 'import subprocess; subprocess.run([\"rm\", \"-rf\", \"build\"])'",
+            "perl -e 'system \"git push --force\"'",
+            "node -e \"require('child_process').execSync('rm -rf build')\"",
+            "python3 - <<'EOF'\nimport os\nos.system('git reset --hard')\nEOF",
+        ] {
+            assert!(denied(line), "{line:?} runs a denied command");
+        }
+        assert!(!denied("python3 -c 'print(1)'"));
+        assert!(!denied("echo hello | sh"));
+    }
+
+    /// RA-096 / RA-097: the CLI's envelope form, every way of shedding the session identity,
+    /// and the raw socket; and a search for the op names is not an invocation.
+    #[test]
+    fn self_approval_covers_envelopes_and_identity_shedding_but_not_searches() {
+        for line in [
+            "relay cmd '{\"op\":\"guardrail.confirm\",\"payload\":{\"hold_id\":1}}'",
+            "$RELAY_BIN cmd '{\"actor\":\"user\",\"op\":\"task.list\",\"payload\":{}}'",
+            "echo '{\"actor\": \"user\", \"op\": \"guardrail.confirm\", \"payload\": {\"hold_id\": 1}}' | socat - UNIX-CONNECT:/run/relay.sock",
+            "env -i relay q task.list", "env -i PATH=/usr/bin relay q task.list",
+            "env --unset=RELAY_SESSION relay q task.list", "env -uRELAY_SESSION relay q task.list",
+            "unset -v RELAY_TOKEN RELAY_SESSION", "export RELAY_SESSION=", "RELAY_ACTOR=user relay q task.list",
+            "sudo -u me relay q task.list", "cargo run -p relay-cli -- --actor user q task.list",
+            "/tmp/renamed --actor user q task.list", "relay --instance dev q guardrail.confirm '{}'",
+            "relay q \"$OP\" '{}'", "echo guardrail.confirm | xargs relay q",
+            "bash -c 'relay --actor user q task.list'", "echo 'relay q guardrail.confirm {}' | sh",
+            "python3 -c \"import os; os.system('relay --actor user q guardrail.confirm {}')\"",
+            "python3 -c 'import subprocess; subprocess.run([\"relay\", \"q\", \"guardrail.reject\", \"{}\"])'",
+        ] {
+            assert!(self_approval(line).is_some(), "{line:?} answers as the user");
+        }
+        for line in [
+            "rg guardrail.confirm crates/relay-core", "grep -rn 'RELAY_SESSION=' crates", "git log --grep guardrail.confirm",
+            "relay q guardrail.check '{\"command\":\"relay --actor user q guardrail.confirm\"}'",
+            "cargo test -p relay-core guardrail", "$RELAY_BIN q session.done '{\"summary\":\"fixed guardrail.confirm\"}'",
+            "relay q task.list", "env RUST_LOG=debug cargo test",
+        ] {
+            assert!(self_approval(line).is_none(), "{line:?} is not self-approval");
+        }
+        // The dry-run exemption is the call itself, not a mention of it.
+        assert!(denied("relay q guardrail.confirm guardrail.check && rm -rf x"));
+        assert!(!denied("relay q guardrail.check '{\"command\":\"rm -rf /\"}'"));
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::{parse_numstat, resolve, NumstatEntry};
+    use std::path::Path;
+
+    fn paths(text: &str) -> Vec<Vec<String>> {
+        parse_numstat(text).into_iter().map(|entry| entry.paths).collect()
+    }
+
+    /// RA-095: every way git can spell a path in numstat names the real path.
+    #[test]
+    fn numstat_reads_renames_quoting_and_nul_separated_records() {
+        assert_eq!(
+            parse_numstat("3\t1\tsecret/key\0-\t-\tlogo.png\0"),
+            vec![
+                NumstatEntry { added: 3, removed: 1, paths: vec!["secret/key".into()] },
+                NumstatEntry { added: 0, removed: 0, paths: vec!["logo.png".into()] },
+            ]
+        );
+        assert_eq!(paths("0\t0\t\0old/key\0secret/key\0"), vec![vec!["old/key".to_string(), "secret/key".into()]]);
+        assert_eq!(paths("0\t0\told => secret/key\n"), vec![vec!["old".to_string(), "secret/key".into()]]);
+        assert_eq!(paths("1\t2\tsrc/{a => secret}/key\n"), vec![vec!["src/a/key".to_string(), "src/secret/key".into()]]);
+        assert_eq!(paths("1\t0\t{ => secret}/key\n"), vec![vec!["/key".to_string(), "secret/key".into()]]);
+        assert_eq!(paths("1\t0\t\"caf\\303\\251/k\\tey\"\n"), vec![vec!["café/k\tey".to_string()]]);
+    }
+
+    /// RA-101: a symlink, dangling or not, and `..` after one, lead where the OS would go.
+    #[test]
+    fn resolve_follows_links_like_the_kernel() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(root.join("real/secret")).unwrap();
+        std::os::unix::fs::symlink(root.join("real/secret"), root.join("link")).unwrap();
+        std::os::unix::fs::symlink("real/secret/new.key", root.join("dangling")).unwrap();
+        assert_eq!(resolve(&root.join("link/key")), root.join("real/secret/key"));
+        assert_eq!(resolve(&root.join("dangling")), root.join("real/secret/new.key"));
+        assert_eq!(resolve(&root.join("link/../x")), root.join("real/x"));
+        assert_eq!(resolve(&root.join("./a//b")), root.join("a/b"));
+        assert_eq!(resolve(Path::new("/")), Path::new("/"));
     }
 }

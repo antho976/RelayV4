@@ -11,26 +11,177 @@ fn call(e: &Engine, op: &str, payload: Value) -> Response {
     e.dispatch(Request::new(Actor::User, op, payload), Door::InProcess)
 }
 
-/// Build a DB at schema version `k` the way a build of that era would have, then open it with
-/// the current build: it must migrate to the latest version and pass integrity_check.
+/// SHA-256 of every migration that has shipped, by version. A store in the wild was built by
+/// exactly this text, so the test below rebuilds old stores from it: if a shipped migration is
+/// edited, those rebuilds stop matching any real store and the test proves nothing. Never edit
+/// one — append a new migration (and its hash here) instead. A version that has not shipped
+/// yet may still change; update its hash with it.
+const SHIPPED_MIGRATIONS: &[&str] = &[
+    "3822a76b947b8b42c12f1a4927f0002f614b5c9caadeb901de7e6d849a99c67b", // v1
+    "0a79d47ecb22a13afe2e0f7e67dcce3f6888642abc1ab2342bf10b69cae8a1dc", // v2
+    "531a1949c26351b8b76d51e769d8ff840f49545e7e4b927feff0a504a0edec86", // v3
+    "d340613c5d56e8f7827d874f730c6b5bfdb98db8ab9685473def73c8d229a181", // v4
+    "33b81b0d70123844652deac1cd4866bd1dd2b25759ae2f82be61866c79cdfcdb", // v5
+    "d51daa43dc93895b4b2f7039d2fcca77b2de453af457730fb7e9ef69dc023e36", // v6
+    "49f0625694cf2518dd96371f3e11f4f3557e427216f1acc6c5e1ea84f1061bed", // v7
+    "edfd6f65719e7a9025bd521e8cfb32b8a417a2c683a959464063b37c9092e5d1", // v8
+    "808b62553c8c0cab053f02200dd89fb6090a3257005c5e76f3ba6f8c7c141c35", // v9
+    "92db2e1dcb85c03714cbfe21cd65c35e2680eedcc0e0f9b032aee4b7dd50889e", // v10
+    "8501046b07e691979867dc734ada0f3cb6a6b8bb93c28c9697be2543a5c1eba2", // v11
+    "a57514c2ad1b9990bd5413d3a21df8a236c9c40a56d91cff9683c5bf4fd42c60", // v12
+    "0a0a9507f8b057536664d7b611b0c88d472480b9d314f174978614700fbbc1d1", // v13
+    "c6b5848f5977b9ff522b39e99444072b2b5f578473349f96df591e19547a367a", // v14
+    "cb1d0f1dca5040b2777ffd2c26f7ecbf3147111e22638c7e1124ae3c0aa540e9", // v15
+    "1531c3890ae1d6263f4b5cb112a71b98139c499578a1a7eb90d65ba84c558382", // v16
+    "8cd59b0caadc346f4a2df8d8f7f0dac48219e0ac34af306ffdc08c14d956d783", // v17
+    "9a57275a79ceed0b1fd7c3a1b9c36bac2ce5c66035d92ca79c0003c21cfedf4a", // v18
+    "7767c3211ab0dbdbb83cc4571fccc3530ae1ffcb021a5bb0708c63fdb05214d6", // v19
+    "8a0cb54342844cf8d525cf58e77f562853bdaa7bd311dc67e570a7118feb3c28", // v20
+    "62681b138e192280c0e12cbb2a9abf5c7c4fde9506337682d16d091e3f46b39e", // v21
+    "91c29598127eea523390db607475e48c670a6cfc4cbfd3eb3cf5e8ebb95a0e49", // v22
+];
+
+#[test]
+fn shipped_migrations_are_never_edited() {
+    use sha2::{Digest, Sha256};
+    for (i, migration) in MIGRATIONS.iter().enumerate() {
+        let hash: String = Sha256::digest(migration.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+        let v = i + 1;
+        let Some(&shipped) = SHIPPED_MIGRATIONS.get(i) else {
+            panic!("v{v} is new: add its hash to SHIPPED_MIGRATIONS ({hash})");
+        };
+        assert_eq!(hash, shipped, "migration v{v} was edited after it shipped; append a new migration instead");
+    }
+    assert_eq!(SHIPPED_MIGRATIONS.len(), MIGRATIONS.len(), "a shipped migration was removed");
+}
+
+/// Two rows in every table that exists at this version, parents before children, with every
+/// foreign key pointing at a real row and every `CHECK (col IN (...))` satisfied — the shape of
+/// a store that has been used, so a migration that only works on empty tables fails here.
+/// Returns the row count per table.
+fn seed(c: &rusqlite::Connection, k: usize) -> Vec<(String, i64)> {
+    let mut st = c.prepare("SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").unwrap();
+    let mut pending: Vec<(String, String)> = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(|r| r.unwrap()).collect();
+    let mut done: Vec<String> = Vec::new();
+    while !pending.is_empty() {
+        let before = pending.len();
+        pending.retain(|(table, sql)| {
+            let mut fk = c.prepare(&format!("PRAGMA foreign_key_list({table})")).unwrap();
+            // (referenced table, from column)
+            let fks: Vec<(String, String)> = fk.query_map([], |r| Ok((r.get(2)?, r.get(3)?))).unwrap().map(|r| r.unwrap()).collect();
+            if fks.iter().any(|(parent, _)| parent != table && !done.contains(parent)) {
+                return true;
+            }
+            let mut ti = c.prepare(&format!("PRAGMA table_info({table})")).unwrap();
+            // (name, declared type, not null, default, pk)
+            let cols: Vec<(String, String, bool, Option<String>, i64)> = ti
+                .query_map([], |r| Ok((r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
+                .unwrap().map(|r| r.unwrap()).collect();
+            for i in 1..=2i64 {
+                let mut names = Vec::new();
+                let mut values: Vec<rusqlite::types::Value> = Vec::new();
+                for (name, ty, not_null, default, pk) in &cols {
+                    let parent = fks.iter().find(|(_, from)| from == name).map(|(parent, _)| parent);
+                    let value = if let Some(parent) = parent {
+                        // A self-reference (undo_of, parent_id) stays NULL: one level is enough.
+                        if parent == table { continue; }
+                        // Both rows share their first parent (two tasks in one project) unless
+                        // it is part of the key; any later one differs, so keys stay distinct.
+                        let first = cols.iter().map(|c| &c.0)
+                            .find(|col| fks.iter().any(|(p, from)| p != table && from == *col)) == Some(name);
+                        rusqlite::types::Value::Integer(if first && *pk == 0 { 1 } else { i })
+                    } else if let Some(literal) = check_literal(sql, name, i as usize - 1) {
+                        literal
+                    } else if *pk > 0 && ty.eq_ignore_ascii_case("INTEGER") {
+                        rusqlite::types::Value::Integer(i)
+                    } else if (!*not_null || default.is_some()) && *pk == 0 {
+                        continue;
+                    } else if ty.eq_ignore_ascii_case("INTEGER") {
+                        rusqlite::types::Value::Integer(i)
+                    } else if name.ends_with("_at") || name == "ts" || name.ends_with("_seen") {
+                        rusqlite::types::Value::Text(format!("2026-0{i}-01T00:00:00.000Z"))
+                    } else if ty.eq_ignore_ascii_case("BLOB") {
+                        rusqlite::types::Value::Blob(format!("v{k} {table} {i}").into_bytes())
+                    } else {
+                        rusqlite::types::Value::Text(format!("v{k}-{table}-{name}-{i}"))
+                    };
+                    names.push(name.clone());
+                    values.push(value);
+                }
+                let marks = vec!["?"; names.len()].join(",");
+                c.execute(&format!("INSERT INTO {table}({}) VALUES ({marks})", names.join(",")), rusqlite::params_from_iter(values))
+                    .unwrap_or_else(|e| panic!("seeding {table} at v{k}: {e}"));
+            }
+            done.push(table.clone());
+            false
+        });
+        assert!(pending.len() < before, "foreign keys between {pending:?} cannot be ordered at v{k}");
+    }
+    done.into_iter().map(|t| { let n = c.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0)).unwrap(); (t, n) }).collect()
+}
+
+/// The `nth` literal (wrapping) a `CHECK (col IN (...))` allows, wherever the check is written.
+fn check_literal(sql: &str, col: &str, nth: usize) -> Option<rusqlite::types::Value> {
+    let at = sql.find(&format!("CHECK ({col} IN ("))
+        .or_else(|| sql.find(&format!("{col} IS NULL OR {col} IN (")))?;
+    let list = &sql[at..];
+    let open = list.find("IN (")? + 4;
+    let allowed: Vec<&str> = list[open..list[open..].find(')')? + open].split(',').map(str::trim).collect();
+    let literal = allowed[nth % allowed.len()];
+    Some(match literal.parse::<i64>() {
+        Ok(n) => rusqlite::types::Value::Integer(n),
+        Err(_) => rusqlite::types::Value::Text(literal.trim_matches('\'').to_string()),
+    })
+}
+
+/// Build a DB at schema version `k` the way a build of that era would have — its migrations,
+/// then rows in every table — and open it with the current build: it must migrate to the
+/// latest version, keep every row, and pass integrity_check and foreign_key_check.
 #[test]
 fn every_prior_version_migrates_forward() {
     assert_eq!(MIGRATIONS.len() as i64, SCHEMA_VERSION);
     for k in 1..=MIGRATIONS.len() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("store.db");
-        {
+        let seeded = {
             let c = rusqlite::Connection::open(&path).unwrap();
+            c.pragma_update(None, "foreign_keys", "ON").unwrap();
             for m in &MIGRATIONS[..k] {
                 c.execute_batch(m).unwrap();
             }
             c.pragma_update(None, "user_version", k as i64).unwrap();
             c.execute("INSERT INTO meta(key, value) VALUES ('created_at', 'then')", []).unwrap();
-        }
+            let rows = seed(&c, k);
+            if (11..22).contains(&k) {
+                // Skills installed from GitHub before v22 recorded no ref; seed leaves the
+                // nullable source columns empty, so give both rows one.
+                c.execute("UPDATE skills SET source_url='https://github.com/o/r.git', source_path='skills/'||id||'/SKILL.md'", []).unwrap();
+            }
+            rows
+        };
         let s = Store::open(&path, false).unwrap_or_else(|e| panic!("opening a v{k} store: {e}"));
         assert_eq!(s.version().unwrap(), SCHEMA_VERSION, "v{k} did not migrate to latest");
         let ok: String = s.lock().query_row("PRAGMA integrity_check", [], |r| r.get(0)).unwrap();
         assert_eq!(ok, "ok");
+        {
+            let conn = s.lock();
+            let dangling: i64 = conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r.get(0)).unwrap();
+            assert_eq!(dangling, 0, "v{k}: the upgrade left foreign keys pointing nowhere");
+            for (table, rows) in &seeded {
+                let now: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0)).unwrap();
+                assert_eq!(now, *rows, "v{k}: {table} lost rows in the upgrade");
+            }
+            if k < 14 {
+                // v14 backfills the queue order from the task id for assignments that predate it.
+                let off: i64 = conn.query_row("SELECT COUNT(*) FROM task_sessions WHERE queue_ord != task_id", [], |r| r.get(0)).unwrap();
+                assert_eq!(off, 0, "v{k}: existing assignments were not given a queue order");
+            }
+            if (11..22).contains(&k) {
+                // v22: what was cloned then was the default branch, which a NULL ref still means.
+                let sourced: i64 = conn.query_row("SELECT COUNT(*) FROM skills WHERE source_url IS NOT NULL AND source_ref IS NULL", [], |r| r.get(0)).unwrap();
+                assert_eq!(sourced, 2, "v{k}: installed skills lost their GitHub source");
+            }
+        }
         // every table has its FK indexes: no FK column without an index (SPEC §1)
         let conn = s.lock();
         let mut st = conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").unwrap();

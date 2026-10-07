@@ -462,12 +462,15 @@ fn a_large_rewrite_holds_only_when_the_content_would_be_lost() {
     std::fs::write(worktree.join("tracked.rs"), format!("{long}extra\n")).unwrap();
     assert_eq!(check("tracked.rs")["verdict"], "hold", "uncommitted edits would be lost");
 
-    // Ignored: build output, not repository content.
+    // Ignored: as often `.env` or local config as build output, and git cannot restore it (RA-094).
     std::fs::write(worktree.join(".gitignore"), "generated.rs\n").unwrap();
     std::fs::write(worktree.join("generated.rs"), &long).unwrap();
-    assert_eq!(check("generated.rs")["verdict"], "allow", "ignored files are not repo content");
+    assert_eq!(check("generated.rs")["verdict"], "hold", "git cannot bring an ignored file back");
 
-    // The escape is a setting, not a law.
+    // The escape is a setting, not a law. Back to the committed content first, which the escape
+    // allows, so the hold below can only come from switching it off.
+    std::fs::write(worktree.join("tracked.rs"), &long).unwrap();
+    assert_eq!(check("tracked.rs")["verdict"], "allow", "clean again, so git can restore it");
     ok(&f.engine, Actor::User, "guardrail.config.set",
         json!({"patch": {"destructive_write": {"allow_if_recoverable": false}}}));
     assert_eq!(check("tracked.rs")["verdict"], "hold", "the escape can be switched off");

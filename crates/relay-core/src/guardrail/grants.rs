@@ -7,6 +7,7 @@
 //! lives in the hold's `details.grant`.
 
 use crate::engine::IntoBus;
+use crate::shell::Word;
 use relay_bus::envelope::Actor;
 use relay_bus::error::BusError;
 use relay_bus::types::{ExceptionKind, GrantScope, GuardrailCaps, GuardrailException, Hold, HoldState, Id};
@@ -50,6 +51,7 @@ impl Grants {
             .prepare_cached(
                 "SELECT id, details FROM holds
                  WHERE session_id = ?1 AND op = 'guardrail.request' AND state = 'confirmed'
+                   AND EXISTS (SELECT 1 FROM sessions WHERE id = ?1 AND state != 'closed')
                  ORDER BY id",
             )
             .bus()?;
@@ -134,17 +136,21 @@ impl Grants {
         hit.map(|grant| self.mark(grant.id)).is_some()
     }
 
-    /// One command that runs a denied pattern, as its unquoted words, lowercased. A grant
-    /// covers it when the grant is that exact command — `rm -rf target` lifts `rm -rf target`
-    /// and not `rm -rf target /`. A grant ending in a lone `*` covers everything that starts
-    /// with the words before it, and the person approving it reads that `*`.
-    pub fn covers_command(&self, bare: &[String]) -> bool {
+    /// One command that runs a denied pattern, every word as written, quoted ones included,
+    /// out of the line `commands`. A grant covers it when the grant is that exact command:
+    /// `rm -rf target` lifts `rm -rf target`, not `rm -rf target /`, and an approved
+    /// `rm -rf "$TMPDIR/x"` does not lift `rm -rf "/"` (RA-104). A `*` is the shell's glob,
+    /// never a wildcard over the rest of the line: approving `rm -rf *` once granted `rm -rf /`
+    /// (RA-103). A grant of several commands (`cd dist && rm -rf *`) covers only that whole
+    /// line, since each of its commands means what it does only after the ones before it.
+    pub(crate) fn covers_command(&self, hit: &[Word], commands: &[Vec<Word>]) -> bool {
         let hit = self.of(ExceptionKind::Command).find(|grant| {
-            super::command_words(&grant.value).iter().any(|words| match words.split_last() {
-                Some((last, head)) if last == "*" => !head.is_empty() && bare.starts_with(head),
-                Some(_) => bare == words.as_slice(),
-                None => false,
-            })
+            let granted = super::shell_commands(&grant.value);
+            match granted.as_slice() {
+                [] => false,
+                [one] => one.as_slice() == hit,
+                _ => granted.as_slice() == commands,
+            }
         });
         hit.map(|grant| self.mark(grant.id)).is_some()
     }
@@ -191,12 +197,30 @@ pub fn consume(conn: &Connection, ids: &[Id], now: &str) -> Result<Vec<Id>, BusE
     Ok(spent)
 }
 
+/// The longest `reason` a request may carry. A person reads it in a prompt that pops up by
+/// itself, and every open request is fetched whole on each client connect (RA-217).
+pub const REASON_MAX: usize = 4 * 1024;
+/// The longest `value`: a command line, a path or a pair of caps.
+pub const VALUE_MAX: usize = 8 * 1024;
+
 /// Check a request's shape before it reaches a person.
 pub fn validate(kind: ExceptionKind, value: &str, reason: &str) -> Result<(), BusError> {
     if reason.trim().is_empty() {
         return Err(BusError::invalid("guardrail.request", "reason must say why you cannot progress without this"));
     }
+    if reason.trim().len() > REASON_MAX {
+        return Err(BusError::invalid(
+            "guardrail.request",
+            format!("reason is {} bytes; the limit is {REASON_MAX}", reason.trim().len()),
+        ).with_hint("say in a few sentences why you need it; put logs in a file and name it"));
+    }
     let value = value.trim();
+    if value.len() > VALUE_MAX {
+        return Err(BusError::invalid(
+            "guardrail.request",
+            format!("value is {} bytes; the limit is {VALUE_MAX}", value.len()),
+        ));
+    }
     match kind {
         ExceptionKind::Command if value.is_empty() => {
             Err(BusError::invalid("guardrail.request", "value must be the exact command you need to run"))
@@ -306,7 +330,20 @@ pub fn by_id(conn: &Connection, id: Id) -> Result<GuardrailException, BusError> 
             format!("hold {id} is not an exception request"),
         ));
     }
-    Ok(exception(&hold))
+    let mut request = exception(&hold);
+    request.active &= session_live(conn, hold.session_id)?;
+    Ok(request)
+}
+
+/// Whether the session a grant belongs to can still use it. A grant "for this session" ends
+/// with the session; without this, a closed session's grants read as active forever and filled
+/// every "Active exceptions" list (RA-105).
+pub fn session_live(conn: &Connection, session_id: Option<Id>) -> Result<bool, BusError> {
+    let Some(session_id) = session_id else { return Ok(false) };
+    conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1 AND state != 'closed')")
+        .bus()?
+        .query_row([session_id], |r| r.get(0))
+        .bus()
 }
 
 /// The `guardrail.request_resolved` event a waiter would have seen had it been listening when
@@ -435,4 +472,54 @@ pub fn existing(conn: &Connection, session_id: Id, kind: ExceptionKind, value: &
                 && request.value == value.trim()
                 && (request.state == HoldState::Open || request.active)
         }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Grant, Grants};
+    use relay_bus::types::{ExceptionKind, GrantScope};
+
+    fn covered(grant: &str, line: &str) -> bool {
+        let grants = Grants {
+            list: vec![Grant { id: 1, kind: ExceptionKind::Command, value: grant.into(), scope: GrantScope::Session }],
+            used: Default::default(),
+        };
+        let patterns = ["rm -rf".to_string(), "git push --force".to_string()];
+        let commands = super::super::shell_commands(line);
+        let hits = super::super::denied_matches_in(&patterns, &commands);
+        !hits.is_empty() && hits.iter().all(|hit| grants.covers_command(&hit.words, &commands))
+    }
+
+    /// RA-103: a `*` is the shell's glob. A grant of several commands covers that line only.
+    #[test]
+    fn a_star_is_a_glob_not_a_wildcard_and_a_chain_is_judged_whole() {
+        assert!(covered("cd dist && rm -rf *", "cd dist && rm -rf *"));
+        assert!(!covered("cd dist && rm -rf *", "rm -rf /"));
+        assert!(!covered("cd dist && rm -rf *", "cd / && rm -rf *"));
+        assert!(!covered("rm -rf *", "rm -rf /"));
+        assert!(covered("rm -rf *", "rm -rf *"));
+        assert!(covered("git push --force origin main", "cd repo && git push --force origin main"));
+        assert!(!covered("git push --force origin main", "git push --force origin main other"));
+    }
+
+    /// RA-104: quoted words are part of the command a person approved.
+    #[test]
+    fn quoted_targets_are_part_of_the_grant() {
+        assert!(covered("rm -rf \"$TMPDIR/x\"", "rm -rf \"$TMPDIR/x\""));
+        assert!(!covered("rm -rf \"$TMPDIR/x\"", "rm -rf \"/\""));
+        assert!(!covered("rm -rf \"$TMPDIR/x\"", "rm -rf \"$TMPDIR/x\" \"/\""));
+        assert!(!covered("rm -rf build", "rm -rf Build"), "arguments keep their case");
+    }
+
+    /// RA-217: a pasted build log as the reason, or a megabyte as the value, is refused before
+    /// it reaches a prompt.
+    #[test]
+    fn reason_and_value_are_bounded() {
+        let ok = super::validate(ExceptionKind::Command, "cargo publish", &"r".repeat(super::REASON_MAX));
+        assert!(ok.is_ok(), "{ok:?}");
+        let long = super::validate(ExceptionKind::Command, "cargo publish", &"r".repeat(super::REASON_MAX + 1));
+        assert_eq!(long.unwrap_err().kind, relay_bus::ErrorKind::Invalid);
+        let long = super::validate(ExceptionKind::Path, &"a/".repeat(super::VALUE_MAX), "need it");
+        assert_eq!(long.unwrap_err().kind, relay_bus::ErrorKind::Invalid);
+    }
 }

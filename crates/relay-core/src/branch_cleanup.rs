@@ -10,10 +10,16 @@
 //! - GitHub (`gh`) reports a merged pull request whose head is the branch tip, or contains it (a
 //!   squash merge, which no local git check can prove).
 //!
+//! Only Relay's own `relay/<name>` branches are ever considered: a session can also work on a
+//! user's branch (an existing checkout, the primary, a name the user chose), and closing that
+//! session does not make the branch Relay's to delete (RA-086).
+//!
 //! A branch with commits that neither covers is kept, and the reason is recorded. A worktree
 //! still holding the branch is removed first only when it is a pooled checkout that no live
-//! session owns and that has no uncommitted changes. The remote branch is deleted only when a
-//! merged PR proves it, and only while it still points at that PR's head.
+//! session owns, with no uncommitted changes and no git-ignored files outside build output —
+//! and never by the cleanup that follows a close, since a checkout still there then is one the
+//! user just chose to keep (RA-087). The remote branch is deleted only when a merged PR proves
+//! it, and only while it still points at that PR's head.
 //!
 //! It runs after a session closes, when `git.pr.list` sees a PR merged for a closed session's
 //! branch, on a slow background sweep, and on demand (`git.branch.cleanup`). All of it is
@@ -42,6 +48,11 @@ const SWEEP_FIRST: Duration = Duration::from_secs(90);
 const SWEEP_EVERY: Duration = Duration::from_secs(20 * 60);
 /// A sweep does not ask GitHub again about an unchanged, unmerged branch more often than this.
 const GH_RECHECK: Duration = Duration::from_secs(60 * 60);
+/// The longest a sweep leaves a kept, unchanged branch alone. The wait doubles from
+/// [`GH_RECHECK`] every time a sweep finds it as it was.
+const SWEEP_BACKOFF_MAX: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// The namespace Relay creates session branches in ([`worktree::branch_for`]).
+const RELAY_BRANCHES: &str = "relay/";
 
 /// One closed session's branch, as the store knows it.
 #[derive(Debug, Clone)]
@@ -75,6 +86,7 @@ pub fn candidates(conn: &Connection, project_id: Option<Id>, only: Option<&[Stri
     let mut statement = conn.prepare_cached(
         "SELECT s.project_id, p.path, p.base_branch, s.branch, s.name FROM sessions s JOIN projects p ON p.id = s.project_id
          WHERE s.state = 'closed' AND s.branch != '' AND s.branch != p.base_branch AND (?1 IS NULL OR s.project_id = ?1)
+           AND substr(s.branch, 1, 6) = 'relay/'
            AND NOT EXISTS (SELECT 1 FROM sessions o WHERE o.project_id = s.project_id AND o.branch = s.branch AND o.state != 'closed')
          ORDER BY s.id DESC",
     ).map_err(crate::engine::internal)?;
@@ -196,8 +208,34 @@ fn remember_gh(repo: &Path, branch: &str, tip: &str) {
 /// How a branch's work was found merged.
 struct Merged { reason: String, pr: Option<GhPr> }
 
+/// What Relay itself writes into a checkout, kept out of git through `info/exclude`.
+const RELAY_WRITTEN: &[&str] = &[".claude/settings.local.json", ".codex/hooks.json", ".claude/skills/", ".agents/skills/"];
+
+/// Git-ignored paths in a checkout that are neither build output nor Relay's own files: an
+/// `.env`, local settings, notes. Removing the checkout would delete them, and nothing in git
+/// could bring them back.
+fn ignored_keepers(path: &Path) -> Result<Vec<String>, String> {
+    // `matching` names an ignored directory once and the files Relay writes one by one, where
+    // the default would fold `.claude/settings.local.json` into an opaque `.claude/`.
+    let ran = Git { repo: path }.run(&["status", "--porcelain=v1", "-z", "--ignored=matching", "--untracked-files=all"], GIT_TIMEOUT)?;
+    if !ran.ok {
+        return Err(ran.err);
+    }
+    Ok(ran.out.split('\0')
+        .filter_map(|record| record.strip_prefix("!! "))
+        .filter(|ignored| !RELAY_WRITTEN.iter().any(|ours| ignored.starts_with(ours)))
+        .filter(|ignored| !crate::watch::is_generated_path(path, &path.join(ignored)))
+        .map(str::to_string)
+        .collect())
+}
+
 /// Decide one candidate and, unless `dry_run`, act on it.
 pub fn evaluate(candidate: &Candidate, live_worktrees: &[String], options: &Options) -> BranchCleanupRow {
+    evaluate_as(candidate, live_worktrees, options, false)
+}
+
+/// [`evaluate`], keeping any checkout that still holds the branch when `keep_worktree`.
+fn evaluate_as(candidate: &Candidate, live_worktrees: &[String], options: &Options, keep_worktree: bool) -> BranchCleanupRow {
     let git = Git { repo: &candidate.repo };
     let branch = candidate.branch.as_str();
     let mut row = BranchCleanupRow {
@@ -210,6 +248,9 @@ pub fn evaluate(candidate: &Candidate, live_worktrees: &[String], options: &Opti
         deleted_remote: false,
     };
     let kept = |mut row: BranchCleanupRow, reason: String| { row.reason = reason; row };
+    if !branch.starts_with(RELAY_BRANCHES) {
+        return kept(row, format!("not a Relay branch (only {RELAY_BRANCHES}* branches are cleaned up)"));
+    }
     let Some(tip) = git.resolve(&format!("refs/heads/{branch}")) else {
         row.outcome = "gone".into();
         row.reason = "the branch no longer exists".into();
@@ -293,9 +334,18 @@ pub fn evaluate(candidate: &Candidate, live_worktrees: &[String], options: &Opti
     row.reason = merged.reason;
 
     if let Some(path) = &removable {
+        if keep_worktree {
+            return kept(row.clone(), format!("{}, but it is checked out at {}, which was kept at close", row.reason, path.display()));
+        }
         match worktree::status_files(path) {
             Ok(files) if files.is_empty() => {}
             Ok(files) => return kept(row.clone(), format!("{}, but {} has {} uncommitted change(s)", row.reason, path.display(), files.len())),
+            Err(error) => return kept(row.clone(), format!("{}, but {} could not be checked: {error}", row.reason, path.display())),
+        }
+        match ignored_keepers(path) {
+            Ok(ignored) if ignored.is_empty() => {}
+            Ok(ignored) => return kept(row.clone(), format!("{}, but {} holds git-ignored files ({}) that removing it would delete",
+                row.reason, path.display(), ignored.iter().take(3).cloned().collect::<Vec<_>>().join(", "))),
             Err(error) => return kept(row.clone(), format!("{}, but {} could not be checked: {error}", row.reason, path.display())),
         }
     }
@@ -349,20 +399,76 @@ pub fn evaluate(candidate: &Candidate, live_worktrees: &[String], options: &Opti
     row
 }
 
+/// (repo, branch) → (the refs a sweep judged it by, when to look again, the wait after that).
+type SweepMemo = HashMap<(PathBuf, String), (String, Instant, Duration)>;
+static SWEPT: Mutex<Option<SweepMemo>> = Mutex::new(None);
+
+/// One `for-each-ref` per repo for a sweep: every Relay branch tip and the base's two refs.
+/// What a branch is judged by is in here, so an unchanged one needs no git at all.
+fn sweep_refs(repo: &Path, base: &str) -> Option<HashMap<String, String>> {
+    let (local, remote) = (format!("refs/heads/{base}"), format!("refs/remotes/origin/{base}"));
+    let ran = Git { repo }.run(&["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads/relay/", &local, &remote], GIT_TIMEOUT).ok()?;
+    ran.ok.then(|| ran.out.lines().filter_map(|line| line.split_once(' ')).map(|(name, sha)| (name.to_string(), sha.to_string())).collect())
+}
+
 /// Clean up every candidate of `project_id` (all projects when `None`), narrowed to `only`.
 /// Takes the store only to read the candidates and to append audit rows.
 pub fn run(engine: &Engine, project_id: Option<Id>, only: Option<&[String]>, options: &Options) -> Result<Vec<BranchCleanupRow>, BusError> {
+    run_as(engine, project_id, only, options, false)
+}
+
+fn run_as(engine: &Engine, project_id: Option<Id>, only: Option<&[String]>, options: &Options, keep_worktrees: bool) -> Result<Vec<BranchCleanupRow>, BusError> {
     let _one_at_a_time = SWEEPING.lock().unwrap_or_else(|poison| poison.into_inner());
     let (candidates, live) = {
         let conn = engine.store.lock();
         candidates(&conn, project_id, only)?
     };
+    // The periodic sweep sees every closed session there ever was. Without this it ran a dozen
+    // git commands, and logged a line, for each of them every 20 minutes for good (RA-088):
+    // a branch already deleted is now skipped on one listing, and one kept with its tip and
+    // base unchanged is looked at again only after a wait that doubles each time.
+    let sweep = options.use_gh_cache;
+    let mut listed: HashMap<(PathBuf, String), Option<HashMap<String, String>>> = HashMap::new();
     let mut out = Vec::new();
     for candidate in &candidates {
         if engine.is_quitting() { break; }
         if !candidate.repo.is_dir() { continue; }
-        let row = evaluate(candidate, live.get(&candidate.project_id).map(Vec::as_slice).unwrap_or_default(), options);
+        let memo_key = (candidate.repo.clone(), candidate.branch.clone());
+        let judged_by = match sweep {
+            true => match listed.entry((candidate.repo.clone(), candidate.base.clone()))
+                .or_insert_with(|| sweep_refs(&candidate.repo, &candidate.base)) {
+                Some(refs) => {
+                    let Some(tip) = refs.get(&format!("refs/heads/{}", candidate.branch)) else {
+                        SWEPT.lock().unwrap_or_else(|poison| poison.into_inner()).get_or_insert_with(HashMap::new).remove(&memo_key);
+                        continue;
+                    };
+                    let base = |name: String| refs.get(&name).map(String::as_str).unwrap_or("");
+                    let judged_by = format!("{tip} {} {}", base(format!("refs/heads/{}", candidate.base)), base(format!("refs/remotes/origin/{}", candidate.base)));
+                    let memo = SWEPT.lock().unwrap_or_else(|poison| poison.into_inner());
+                    if memo.as_ref().and_then(|memo| memo.get(&memo_key)).is_some_and(|(seen, next, _)| *seen == judged_by && Instant::now() < *next) {
+                        continue;
+                    }
+                    Some(judged_by)
+                }
+                None => None,
+            },
+            false => None,
+        };
+        let row = evaluate_as(candidate, live.get(&candidate.project_id).map(Vec::as_slice).unwrap_or_default(), options, keep_worktrees);
         if row.outcome == "gone" { continue; }
+        if let Some(judged_by) = judged_by {
+            let mut memo = SWEPT.lock().unwrap_or_else(|poison| poison.into_inner());
+            let memo = memo.get_or_insert_with(HashMap::new);
+            if row.outcome == "kept" {
+                let wait = match memo.get(&memo_key) {
+                    Some((seen, _, wait)) if *seen == judged_by => (*wait * 2).min(SWEEP_BACKOFF_MAX),
+                    _ => GH_RECHECK,
+                };
+                memo.insert(memo_key, (judged_by, Instant::now() + wait, wait));
+            } else {
+                memo.remove(&memo_key);
+            }
+        }
         record(engine, candidate, &row, options);
         out.push(row);
     }
@@ -376,6 +482,8 @@ fn record(engine: &Engine, candidate: &Candidate, row: &BranchCleanupRow, option
     });
     match row.outcome.as_str() {
         "deleted" => tracing::info!(branch = %row.branch, reason = %row.reason, remote = row.deleted_remote, "deleted merged session branch"),
+        // The sweep keeps the same branches over and over; only a decision someone waits on is news.
+        "kept" if options.use_gh_cache => tracing::debug!(branch = %row.branch, reason = %row.reason, "kept session branch"),
         "kept" => tracing::info!(branch = %row.branch, reason = %row.reason, "kept session branch"),
         _ => {}
     }
@@ -401,12 +509,13 @@ pub fn gh() -> Option<PathBuf> {
     which::which("gh").ok()
 }
 
-/// After `session.close`: settle that one branch now, off the request thread.
+/// After `session.close`: settle that one branch now, off the request thread. A checkout still
+/// holding it is one the close kept — the user's choice, which this does not overrule.
 pub fn after_close(engine: Arc<Engine>, project_id: Id, branch: String) {
     std::thread::Builder::new().name("branch-cleanup".into()).spawn(move || {
         crate::background_priority();
         let options = Options { gh: gh(), audit_kept: true, ..Options::default() };
-        if let Err(error) = run(&engine, Some(project_id), Some(std::slice::from_ref(&branch)), &options) {
+        if let Err(error) = run_as(&engine, Some(project_id), Some(std::slice::from_ref(&branch)), &options, true) {
             tracing::warn!(branch, error = %error.message, "branch cleanup after close failed");
         }
     }).ok();

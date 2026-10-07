@@ -58,8 +58,14 @@ pub(crate) fn register(engine: &mut Engine) {
                     Ok(message) => ("complete", message.clone()),
                     Err(message) => ("failed", message.clone()),
                 };
+                // Probe the updated binaries before taking the store: `--version` and the auth
+                // check are subprocesses, and only their answers belong inside the write (D149).
+                let probes = result.is_ok().then(|| {
+                    let paths = crate::providers::paths(&engine.store.lock());
+                    crate::providers::probe(paths)
+                });
                 let _ = engine.system_write("provider.update.finished", None, None, None, json!({"provider":name,"state":state}), |tx, now| {
-                    if result.is_ok() { let _ = crate::providers::refresh(tx, now); }
+                    if let Some(probes) = probes { let _ = crate::providers::record(tx, now, probes); }
                     tx.execute("INSERT INTO notifications(project_id,category,title,body,link,read,created_at) VALUES (NULL,'provider',?1,?2,NULL,0,?3)",
                         params![format!("{name} update {state}"),message,now]).bus()?;
                     Ok(((), vec![

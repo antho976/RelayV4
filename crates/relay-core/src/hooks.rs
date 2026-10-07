@@ -15,9 +15,15 @@ const CLAUDE_PRE_TOOL: &str = "hook claude-pre-tool";
 const CODEX_HOOK_MARKER: &str = "hook codex-";
 const CODEX_PRE_TOOL: &str = "hook codex-pre-tool";
 const PREVIOUS_HOOKS_PATH: &str = ".relay-previous-hooks-path";
+/// The instance that wrote a hook directory. Dev and stable Relay share `<repo>/.relay/hooks`,
+/// and each instance's sweep must leave the other's live directories alone.
+const HOOK_OWNER: &str = ".relay-instance";
 pub const MCP_CONFIG_RELATIVE: &str = ".relay/relay.mcp.json";
-pub const CLAUDE_SETTINGS_RELATIVE: &str = ".relay/relay.settings.json";
-const CLAUDE_STATUSLINE_RELATIVE: &str = ".relay/agent-statusline.sh";
+/// Where older Relay wrote the status-line settings and script. Both sat in the agent-writable
+/// checkout while Claude executed the script on every turn, outside any guardrail; the settings
+/// now travel inline in argv ([`claude_settings`]) and these are only ever removed.
+const LEGACY_CLAUDE_SETTINGS_RELATIVE: &str = ".relay/relay.settings.json";
+const LEGACY_CLAUDE_STATUSLINE_RELATIVE: &str = ".relay/agent-statusline.sh";
 
 /// Prefer an explicit CLI, then the CLI shipped/built beside the current executable, then PATH.
 /// Desktop launchers commonly have a reduced PATH, so hooks must persist an absolute sibling path
@@ -63,8 +69,166 @@ pub fn writes() -> std::sync::MutexGuard<'static, ()> {
     WRITES.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// The hooks git runs from `core.hooksPath` that Relay does not gate. Each gets a forwarder to
+/// the user's own directory, checked when it runs, so a hook installed later (`git lfs
+/// install`) still runs; without them a session checkout lost git-lfs's pre-push upload,
+/// post-checkout and every other hook the moment Relay pointed `core.hooksPath` at its own dir.
+const FORWARDED_HOOKS: &[&str] = &[
+    "applypatch-msg", "pre-applypatch", "post-applypatch", "pre-merge-commit",
+    "prepare-commit-msg", "commit-msg", "post-commit", "pre-rebase", "post-checkout",
+    "post-merge", "pre-push", "post-rewrite", "pre-auto-gc",
+];
+
+fn absolute_in(worktree: &Path, path: impl Into<PathBuf>) -> PathBuf {
+    let path = path.into();
+    if path.is_absolute() { path } else { worktree.join(path) }
+}
+
+/// The hooks directory git would use in `worktree` without a worktree-level `core.hooksPath`:
+/// the value from any other config scope, else the repository's own `hooks`.
+fn inherited_hooks_dir(worktree: &Path) -> Option<PathBuf> {
+    let configured = git_optional(worktree, &["config", "--show-scope", "--get-all", "core.hooksPath"])
+        .and_then(|out| out.lines()
+            .rev()
+            .filter_map(|line| line.split_once('\t'))
+            .find(|(scope, _)| *scope != "worktree")
+            .map(|(_, value)| value.to_string()));
+    match configured {
+        Some(path) => Some(absolute_in(worktree, path)),
+        None => git_optional(worktree, &["rev-parse", "--git-common-dir"])
+            .map(|dir| absolute_in(worktree, dir).join("hooks")),
+    }
+}
+
+fn read_record(dir: &Path) -> Option<String> {
+    fs::read_to_string(dir.join(PREVIOUS_HOOKS_PATH))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// What a checkout had before Relay: its own worktree-level `core.hooksPath` (`config`, `None`
+/// when it had none, which is what uninstalling restores) and the directory the user's hooks
+/// actually live in (`chain`), never one of Relay's.
+struct Previous {
+    config: Option<String>,
+    chain: Option<PathBuf>,
+}
+
+fn previous_hooks(repo: &Path, worktree: &Path) -> Previous {
+    let relay_hooks = repo.join(".relay").join("hooks");
+    let config = match git_optional(worktree, &["config", "--worktree", "--get", "core.hooksPath"]) {
+        // Replacing a Relay dir: what it replaced is in its record.
+        Some(configured) if absolute_in(worktree, &configured).starts_with(&relay_hooks) => {
+            read_record(&absolute_in(worktree, configured))
+        }
+        other => other,
+    };
+    let inherited = inherited_hooks_dir(worktree);
+    // Older Relay recorded the effective directory even when the checkout had no value of its
+    // own. That is the inherited one; restoring it would pin it at worktree level for good.
+    let config = config.filter(|value| Some(absolute_in(worktree, value)) != inherited);
+    let chain = config
+        .as_ref()
+        .map(|value| absolute_in(worktree, value))
+        .or(inherited)
+        .filter(|dir| !dir.starts_with(&relay_hooks));
+    Previous { config, chain }
+}
+
+/// `root/relative` as a real directory, created as needed. A symlink an agent planted on the
+/// way is removed and replaced, so nothing Relay writes below it lands outside `root`.
+fn real_dir(root: &Path, relative: &str) -> Result<PathBuf> {
+    let mut dir = root.to_path_buf();
+    for part in Path::new(relative).components() {
+        let std::path::Component::Normal(part) = part else {
+            return Err(anyhow!("{relative} must be a plain relative path"));
+        };
+        dir.push(part);
+        match fs::symlink_metadata(&dir) {
+            Ok(meta) if meta.is_dir() => continue,
+            Ok(meta) if meta.file_type().is_symlink() => {
+                tracing::warn!(path = %dir.display(), "replacing a symlink in the way of a Relay file");
+                fs::remove_file(&dir).with_context(|| format!("removing {}", dir.display()))?;
+            }
+            Ok(_) => return Err(anyhow!("{} is not a directory", dir.display())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).with_context(|| format!("inspecting {}", dir.display())),
+        }
+        match fs::create_dir(&dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists
+                && fs::symlink_metadata(&dir).is_ok_and(|meta| meta.is_dir()) => {}
+            Err(error) => return Err(error).with_context(|| format!("creating {}", dir.display())),
+        }
+    }
+    Ok(dir)
+}
+
+/// Replace `path` through a fresh temp file beside it and a rename. The temp file is opened
+/// `O_CREAT|O_EXCL|O_NOFOLLOW` and the rename replaces a link rather than following it, so a
+/// symlink an agent planted at either name never redirects the write. `path`'s directory must
+/// already be real ([`real_dir`]).
+fn write_replacing(path: &Path, contents: &str, mode: u32) -> Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let name = path.file_name().ok_or_else(|| anyhow!("{} has no file name", path.display()))?;
+    let tmp = path.with_file_name(format!("{}.relay-tmp", name.to_string_lossy()));
+    match fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("removing {}", tmp.display())),
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&tmp)
+        .with_context(|| format!("creating {}", tmp.display()))?;
+    file.write_all(contents.as_bytes()).with_context(|| format!("writing {}", tmp.display()))?;
+    drop(file);
+    // `mode` passed to open is masked by the umask; an executable hook must be executable.
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))?;
+    fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))
+}
+
+fn write_executable(path: &Path, contents: &str) -> Result<()> {
+    write_replacing(path, contents, 0o755)
+}
+
+/// Forward every hook but pre-commit from `hook_dir` to the user's `chain` directory: the
+/// fixed [`FORWARDED_HOOKS`], plus any other executable hook `chain` holds right now. Stale
+/// forwarders from an earlier install are removed.
+fn write_forwarders(hook_dir: &Path, chain: Option<&Path>) -> Result<()> {
+    let mut names: Vec<String> = Vec::new();
+    if let Some(chain) = chain {
+        names.extend(FORWARDED_HOOKS.iter().map(|name| name.to_string()));
+        for entry in fs::read_dir(chain).into_iter().flatten().flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
+            if name != "pre-commit" && !name.contains('.') && !names.contains(&name) && is_executable(&entry.path()) {
+                names.push(name);
+            }
+        }
+        for name in &names {
+            let script = format!(
+                "#!/bin/sh\nhook={}\nif [ -x \"$hook\" ]; then exec \"$hook\" \"$@\"; fi\nexit 0\n",
+                shell_quote_path(&chain.join(name)),
+            );
+            write_executable(&hook_dir.join(name), &script)?;
+        }
+    }
+    for entry in fs::read_dir(hook_dir).into_iter().flatten().flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
+        if name != "pre-commit" && !name.starts_with('.') && !names.contains(&name) && entry.path().is_file() {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+    Ok(())
+}
+
 /// Give one worktree its own hook path, preserving any pre-existing pre-commit hook by
-/// chaining it before Relay's gate.
+/// chaining it before Relay's gate, and forwarding every other hook to where it lived.
 pub fn install_git(
     repo: &Path,
     worktree: &Path,
@@ -73,43 +237,15 @@ pub fn install_git(
     relay: &Path,
 ) -> Result<()> {
     git(repo, &["config", "extensions.worktreeConfig", "true"])?;
+    // `.relay/` and the provider adapters land in the primary checkout too, which no
+    // `worktree::create` ever excluded them from; a commit of everything would sweep them in.
+    crate::worktree::ensure_excluded(repo).context("excluding Relay's files from git")?;
 
-    let configured = git_optional(
-        worktree,
-        &["config", "--worktree", "--get", "core.hooksPath"],
-    );
-    let relay_hooks = repo.join(".relay").join("hooks");
-    let previous_dir = match configured.map(PathBuf::from) {
-        Some(configured) => {
-            let absolute = if configured.is_absolute() {
-                configured.clone()
-            } else {
-                worktree.join(&configured)
-            };
-            if absolute.starts_with(&relay_hooks) {
-                // A Relay dir with no record of what it replaced (deleted under a live
-                // hooksPath) chains to nothing: `rev-parse --git-path hooks` would answer with
-                // that same dead dir, and the user's own hook would drop out of the chain.
-                fs::read_to_string(absolute.join(PREVIOUS_HOOKS_PATH))
-                    .ok()
-                    .map(|path| PathBuf::from(path.trim()))
-            } else {
-                Some(configured)
-            }
-        }
-        None => git_optional(worktree, &["rev-parse", "--git-path", "hooks"]).map(PathBuf::from),
-    };
-
-    let hook_dir = relay_hooks.join(session);
-    fs::create_dir_all(&hook_dir)
-        .with_context(|| format!("creating {}", hook_dir.display()))?;
+    let before = previous_hooks(repo, worktree);
+    // In the primary checkout `.relay/` is as writable to the agent as any other file.
+    let hook_dir = real_dir(repo, &format!(".relay/hooks/{session}"))?;
     let hook_path = hook_dir.join("pre-commit");
-    let previous_hook = previous_dir
-        .as_ref()
-        .cloned()
-        .map(|dir| if dir.is_absolute() { dir } else { worktree.join(dir) })
-        .map(|dir| dir.join("pre-commit"))
-        .filter(|path| path != &hook_path);
+    let previous_hook = before.chain.as_ref().map(|dir| dir.join("pre-commit"));
 
     let user_payload = serde_json::to_string(&json!({"session": session, "kind": "commit"}))?;
     let previous = previous_hook
@@ -138,17 +274,16 @@ pub fn install_git(
         shell_quote(instance.as_str()),
         shell_quote(&user_payload),
     );
-    fs::write(&hook_path, script)
-        .with_context(|| format!("writing {}", hook_path.display()))?;
-    if let Some(previous_dir) = &previous_dir {
-        fs::write(
-            hook_dir.join(PREVIOUS_HOOKS_PATH),
-            format!("{}\n", previous_dir.display()),
-        )?;
-    }
-    let mut permissions = fs::metadata(&hook_path)?.permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&hook_path, permissions)?;
+    write_executable(&hook_path, &script)?;
+    // Always written, empty when the checkout had no hook path of its own: uninstalling then
+    // unsets it instead of pinning whatever was in effect.
+    write_replacing(
+        &hook_dir.join(PREVIOUS_HOOKS_PATH),
+        &format!("{}\n", before.config.as_deref().unwrap_or_default()),
+        0o644,
+    )?;
+    write_forwarders(&hook_dir, before.chain.as_deref())?;
+    write_replacing(&hook_dir.join(HOOK_OWNER), &format!("{}\n", instance.as_str()), 0o644)?;
 
     let hook_dir_s = hook_dir.display().to_string();
     git(
@@ -194,27 +329,37 @@ pub fn refresh_git(repo: &Path, worktree: &Path, instance: Instance, relay: &Pat
 const USER_HOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 pub fn run_user_pre_commit(repo: &Path, worktree: &Path) -> Result<()> {
-    let configured = git_optional(
-        worktree,
-        &["config", "--worktree", "--get", "core.hooksPath"],
-    );
-    let relay_hooks = repo.join(".relay").join("hooks");
-    let active_dir = configured
-        .map(PathBuf::from)
-        .or_else(|| git_optional(worktree, &["rev-parse", "--git-path", "hooks"]).map(PathBuf::from));
-    let Some(active_dir) = active_dir else { return Ok(()) };
-    let active_dir = if active_dir.is_absolute() { active_dir } else { worktree.join(active_dir) };
-    let user_dir = if active_dir.starts_with(&relay_hooks) {
-        let Ok(previous) = fs::read_to_string(active_dir.join(PREVIOUS_HOOKS_PATH)) else { return Ok(()) };
-        let previous = PathBuf::from(previous.trim());
-        if previous.is_absolute() { previous } else { worktree.join(previous) }
-    } else {
-        active_dir
-    };
-    let hook = user_dir.join("pre-commit");
-    if !is_executable(&hook) { return Ok(()) }
-    let mut command = Command::new(&hook);
-    command.current_dir(worktree);
+    let Some(dir) = previous_hooks(repo, worktree).chain else { return Ok(()) };
+    run_user_hook(&dir.join("pre-commit"), worktree, &[])
+}
+
+/// Run the user's own commit-msg hook on `message` and return the message as the hook left it
+/// (a hook may rewrite it, as Gerrit's adds a Change-Id). `git.commit` commits with
+/// `--no-verify` or `commit-tree`, neither of which runs commit-msg, so it calls this right
+/// after [`run_user_pre_commit`] and commits what comes back. With no such hook the message is
+/// returned unchanged.
+pub fn run_user_commit_msg(repo: &Path, worktree: &Path, message: &str) -> Result<String> {
+    let Some(dir) = previous_hooks(repo, worktree).chain else { return Ok(message.to_string()) };
+    let hook = dir.join("commit-msg");
+    if !is_executable(&hook) {
+        return Ok(message.to_string());
+    }
+    // The file `git commit` itself hands the hook: per checkout, so concurrent commits in two
+    // worktrees never share it.
+    let file = absolute_in(worktree, git(worktree, &["rev-parse", "--git-path", "COMMIT_EDITMSG"])?);
+    let mut text = message.to_string();
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    write_replacing(&file, &text, 0o644)?;
+    run_user_hook(&hook, worktree, &[file.as_os_str()])?;
+    fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))
+}
+
+fn run_user_hook(hook: &Path, worktree: &Path, args: &[&std::ffi::OsStr]) -> Result<()> {
+    if !is_executable(hook) { return Ok(()) }
+    let mut command = Command::new(hook);
+    command.args(args).current_dir(worktree);
     let output = crate::proc::output_with_timeout(&mut command, USER_HOOK_TIMEOUT)
         .with_context(|| format!("running {}", hook.display()))?
         .ok_or_else(|| anyhow!("{} did not finish within {} s", hook.display(), USER_HOOK_TIMEOUT.as_secs()))?;
@@ -260,14 +405,19 @@ pub fn uninstall_git_any(repo: &Path, worktree: &Path, sessions: &[String]) -> R
         if !owned {
             return Ok(());
         }
-        match fs::read_to_string(current_absolute.join(PREVIOUS_HOOKS_PATH)) {
-            Ok(previous) if !previous.trim().is_empty() => {
+        // A record that names the inherited directory came from an older Relay that recorded
+        // the effective path; restoring it would pin it, so it unsets like an empty one.
+        // Asked only when there is a record, so a close of a checkout that had none spawns nothing more.
+        match read_record(&current_absolute)
+            .filter(|previous| Some(absolute_in(worktree, previous)) != inherited_hooks_dir(worktree))
+        {
+            Some(previous) => {
                 git(
                     worktree,
-                    &["config", "--worktree", "core.hooksPath", previous.trim()],
+                    &["config", "--worktree", "core.hooksPath", &previous],
                 )?;
             }
-            _ => {
+            None => {
                 let mut cmd = Command::new("git");
                 cmd.arg("-C")
                     .arg(worktree)
@@ -315,8 +465,11 @@ pub fn remove_hook_dir(repo: &Path, session: &str) {
 }
 
 /// Remove generated hook directories with no session behind them. Called from the launch
-/// fsck, where the live set is already known — never on a timer (SPEC §15).
-pub fn sweep_hook_dirs(repo: &Path, live: &[String]) -> usize {
+/// fsck, where the live set is already known — never on a timer (SPEC §15). Only `instance`'s
+/// own directories are judged: `live` lists its sessions alone, so another instance's would all
+/// look dead. A directory with no owner (written before the marker existed) is kept too, since
+/// deleting a live one silently turns its checkout's commit gate off; its next install marks it.
+pub fn sweep_hook_dirs(repo: &Path, live: &[String], instance: Instance) -> usize {
     let dir = repo.join(".relay").join("hooks");
     let Ok(entries) = fs::read_dir(&dir) else { return 0 };
     let mut removed = 0;
@@ -328,6 +481,10 @@ pub fn sweep_hook_dirs(repo: &Path, live: &[String]) -> usize {
         if live.iter().any(|session| session == &name) {
             continue;
         }
+        let owner = fs::read_to_string(entry.path().join(HOOK_OWNER)).unwrap_or_default();
+        if owner.trim() != instance.as_str() {
+            continue;
+        }
         if fs::remove_dir_all(entry.path()).is_ok() {
             removed += 1;
         }
@@ -337,9 +494,8 @@ pub fn sweep_hook_dirs(repo: &Path, live: &[String]) -> usize {
 
 /// Merge Relay's enforcement and lifecycle adapters into Claude's local, untracked settings.
 pub fn install_claude(worktree: &Path, instance: Instance, relay: &Path) -> Result<()> {
-    let dir = worktree.join(".claude");
+    let dir = real_dir(worktree, ".claude")?;
     let path = dir.join("settings.local.json");
-    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let mut root: Value = match fs::read_to_string(&path) {
         Ok(raw) => serde_json::from_str(&raw)
             .with_context(|| format!("parsing {}", path.display()))?,
@@ -353,32 +509,24 @@ pub fn install_claude(worktree: &Path, instance: Instance, relay: &Path) -> Resu
     let hooks = hooks
         .as_object_mut()
         .ok_or_else(|| anyhow!("{}.hooks must be an object", path.display()))?;
+    // Relay's handlers are replaced, never kept: one left from an older launch may name a relay
+    // binary or instance that is gone (the guardrail then fails open with exit 127), and one an
+    // agent wrote merely *mentioning* the marker must not pass for the real guardrail.
+    strip_handlers(hooks, CLAUDE_HOOK_MARKER);
     let pre = hooks.entry("PreToolUse").or_insert_with(|| json!([]));
     let pre = pre
         .as_array_mut()
         .ok_or_else(|| anyhow!("{}.hooks.PreToolUse must be an array", path.display()))?;
-
-    let already_installed = pre.iter().any(|group| {
-        group["hooks"].as_array().is_some_and(|handlers| {
-            handlers.iter().any(|handler| {
-                handler["command"]
-                    .as_str()
-                    .is_some_and(|command| command.contains(CLAUDE_PRE_TOOL))
-            })
-        })
-    });
-    if !already_installed {
-        let command = format!(
-            "{} --instance {} {}",
-            shell_quote_path(relay),
-            shell_quote(instance.as_str()),
-            CLAUDE_PRE_TOOL,
-        );
-        pre.push(json!({
-            "matcher": "Edit|Write|MultiEdit|Bash",
-            "hooks": [{"type": "command", "command": command, "timeout": 30}]
-        }));
-    }
+    let command = format!(
+        "{} --instance {} {}",
+        shell_quote_path(relay),
+        shell_quote(instance.as_str()),
+        CLAUDE_PRE_TOOL,
+    );
+    pre.push(json!({
+        "matcher": "Edit|Write|MultiEdit|Bash",
+        "hooks": [{"type": "command", "command": command, "timeout": 30}]
+    }));
 
     for (event, kind) in [
         ("SessionStart", "session_start"),
@@ -389,54 +537,28 @@ pub fn install_claude(worktree: &Path, instance: Instance, relay: &Path) -> Resu
         let groups = hooks.entry(event).or_insert_with(|| json!([]));
         let groups = groups.as_array_mut()
             .ok_or_else(|| anyhow!("{}.hooks.{event} must be an array", path.display()))?;
-        let installed = groups.iter().any(|group| group["hooks"].as_array().is_some_and(|handlers| {
-            handlers.iter().any(|handler| handler["command"].as_str().is_some_and(|command| command.contains("hook claude-report")))
+        let command = format!(
+            "{} --instance {} hook claude-report {}",
+            shell_quote_path(relay), shell_quote(instance.as_str()), shell_quote(kind),
+        );
+        groups.push(json!({
+            "hooks": [{"type": "command", "command": command, "timeout": 10}]
         }));
-        if !installed {
-            let command = format!(
-                "{} --instance {} hook claude-report {}",
-                shell_quote_path(relay), shell_quote(instance.as_str()), shell_quote(kind),
-            );
-            groups.push(json!({
-                "hooks": [{"type": "command", "command": command, "timeout": 10}]
-            }));
-        }
     }
 
-    let tmp = dir.join("settings.local.json.relay-tmp");
-    fs::write(&tmp, format!("{}\n", serde_json::to_string_pretty(&root)?))
-        .with_context(|| format!("writing {}", tmp.display()))?;
-    fs::rename(&tmp, &path)
-        .with_context(|| format!("replacing {}", path.display()))?;
+    write_replacing(&path, &format!("{}\n", serde_json::to_string_pretty(&root)?), 0o644)?;
 
-    // Claude already receives account rate limits on each normal turn. A silent status-line
-    // command captures that payload for `usage.get`; it makes no provider or network request.
-    let statusline_path = worktree.join(CLAUDE_STATUSLINE_RELATIVE);
-    if let Some(parent) = statusline_path.parent() { fs::create_dir_all(parent)?; }
-    let statusline_tmp = statusline_path.with_extension("sh.relay-tmp");
-    fs::write(&statusline_tmp, claude_statusline_script())?;
-    let mut permissions = fs::metadata(&statusline_tmp)?.permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&statusline_tmp, permissions)?;
-    fs::rename(&statusline_tmp, &statusline_path)?;
-    let provider_settings = worktree.join(CLAUDE_SETTINGS_RELATIVE);
-    let settings_tmp = provider_settings.with_extension("json.relay-tmp");
-    fs::write(&settings_tmp, format!("{}\n", serde_json::to_string_pretty(&json!({
-        "statusLine": {"type":"command", "command":statusline_path, "padding":0}
-    }))?))?;
-    fs::rename(&settings_tmp, &provider_settings)?;
+    let _ = fs::remove_file(worktree.join(LEGACY_CLAUDE_STATUSLINE_RELATIVE));
+    let _ = fs::remove_file(worktree.join(LEGACY_CLAUDE_SETTINGS_RELATIVE));
 
     // Explicit per-launch MCP config: it inherits the session/token/project environment from
     // the Claude process, so no credentials are ever written to disk.
-    let mcp_path = worktree.join(MCP_CONFIG_RELATIVE);
-    if let Some(parent) = mcp_path.parent() { fs::create_dir_all(parent)?; }
+    let mcp_path = real_dir(worktree, ".relay")?.join("relay.mcp.json");
     let config = json!({"mcpServers":{"relay":{
         "command":relay.display().to_string(),
         "args":["--instance",instance.as_str(),"mcp"]
     }}});
-    let mcp_tmp = mcp_path.with_extension("json.relay-tmp");
-    fs::write(&mcp_tmp, format!("{}\n", serde_json::to_string_pretty(&config)?))?;
-    fs::rename(&mcp_tmp, &mcp_path)?;
+    write_replacing(&mcp_path, &format!("{}\n", serde_json::to_string_pretty(&config)?), 0o644)?;
     Ok(())
 }
 
@@ -465,27 +587,21 @@ pub fn add_claude_mcp_servers(
         }
         entries.insert(name.clone(), entry);
     }
-    let mcp_tmp = mcp_path.with_extension("json.relay-tmp");
-    fs::write(&mcp_tmp, format!("{}\n", serde_json::to_string_pretty(&config)?))?;
-    fs::rename(&mcp_tmp, &mcp_path)?;
+    let mcp_path = real_dir(worktree, ".relay")?.join("relay.mcp.json");
+    write_replacing(&mcp_path, &format!("{}\n", serde_json::to_string_pretty(&config)?), 0o644)?;
     Ok(())
 }
 
 /// Remove only Relay's Claude handlers; all user/project-local settings survive.
 pub fn uninstall_claude(worktree: &Path) -> Result<()> {
     let _ = fs::remove_file(worktree.join(MCP_CONFIG_RELATIVE));
-    let _ = fs::remove_file(worktree.join(CLAUDE_SETTINGS_RELATIVE));
-    let _ = fs::remove_file(worktree.join(CLAUDE_STATUSLINE_RELATIVE));
+    let _ = fs::remove_file(worktree.join(LEGACY_CLAUDE_SETTINGS_RELATIVE));
+    let _ = fs::remove_file(worktree.join(LEGACY_CLAUDE_STATUSLINE_RELATIVE));
     let dir = worktree.join(".claude");
     let path = dir.join("settings.local.json");
     let raw = match fs::read_to_string(&path) {
         Ok(raw) => raw,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let _ = fs::remove_file(worktree.join(MCP_CONFIG_RELATIVE));
-            let _ = fs::remove_file(worktree.join(CLAUDE_SETTINGS_RELATIVE));
-            let _ = fs::remove_file(worktree.join(CLAUDE_STATUSLINE_RELATIVE));
-            return Ok(());
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
     };
     let mut root: Value = serde_json::from_str(&raw)
@@ -494,25 +610,9 @@ pub fn uninstall_claude(worktree: &Path) -> Result<()> {
     else {
         return Ok(());
     };
-    for groups in hooks.values_mut().filter_map(Value::as_array_mut) {
-        for group in groups.iter_mut() {
-            if let Some(handlers) = group.get_mut("hooks").and_then(Value::as_array_mut) {
-                handlers.retain(|handler| {
-                    !handler["command"]
-                        .as_str()
-                        .is_some_and(|command| command.contains(CLAUDE_HOOK_MARKER))
-                });
-            }
-        }
-        groups.retain(|group| {
-            group["hooks"]
-                .as_array()
-                .is_none_or(|handlers| !handlers.is_empty())
-        });
-    }
-    let tmp = dir.join("settings.local.json.relay-tmp");
-    fs::write(&tmp, format!("{}\n", serde_json::to_string_pretty(&root)?))?;
-    fs::rename(&tmp, &path)?;
+    strip_handlers(hooks, CLAUDE_HOOK_MARKER);
+    let path = real_dir(worktree, ".claude")?.join("settings.local.json");
+    write_replacing(&path, &format!("{}\n", serde_json::to_string_pretty(&root)?), 0o644)?;
     let _ = fs::remove_file(worktree.join(MCP_CONFIG_RELATIVE));
     Ok(())
 }
@@ -520,9 +620,7 @@ pub fn uninstall_claude(worktree: &Path) -> Result<()> {
 /// Merge Relay's adapters into Codex's project hook layer. Codex asks the user to trust the
 /// exact generated hook once through `/hooks`; Relay never bypasses that provider boundary.
 pub fn install_codex(worktree: &Path, instance: Instance, relay: &Path) -> Result<()> {
-    let dir = worktree.join(".codex");
-    let path = dir.join("hooks.json");
-    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let path = real_dir(worktree, ".codex")?.join("hooks.json");
     let mut root: Value = match fs::read_to_string(&path) {
         Ok(raw) => serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({
@@ -535,44 +633,33 @@ pub fn install_codex(worktree: &Path, instance: Instance, relay: &Path) -> Resul
     let hooks = object.entry("hooks").or_insert_with(|| json!({})).as_object_mut()
         .ok_or_else(|| anyhow!("{}.hooks must be an object", path.display()))?;
 
+    // Replaced on every launch, as for Claude: a stale path must not survive, nor a look-alike.
+    strip_handlers(hooks, CODEX_HOOK_MARKER);
     let pre = hooks.entry("PreToolUse").or_insert_with(|| json!([])).as_array_mut()
         .ok_or_else(|| anyhow!("{}.hooks.PreToolUse must be an array", path.display()))?;
-    let installed = pre.iter().any(|group| group["hooks"].as_array().is_some_and(|handlers| {
-        handlers.iter().any(|handler| handler["command"].as_str().is_some_and(|command| command.contains(CODEX_PRE_TOOL)))
+    pre.push(json!({
+        "matcher": "Bash|apply_patch|Edit|Write",
+        "hooks": [{
+            "type": "command",
+            "command": format!("{} --instance {} {}", shell_quote_path(relay), shell_quote(instance.as_str()), CODEX_PRE_TOOL),
+            "timeout": 30,
+            "statusMessage": "Checking Relay guardrails"
+        }]
     }));
-    if !installed {
-        pre.push(json!({
-            "matcher": "Bash|apply_patch|Edit|Write",
-            "hooks": [{
-                "type": "command",
-                "command": format!("{} --instance {} {}", shell_quote_path(relay), shell_quote(instance.as_str()), CODEX_PRE_TOOL),
-                "timeout": 30,
-                "statusMessage": "Checking Relay guardrails"
-            }]
-        }));
-    }
 
     for (event, kind) in [("SessionStart", "session_start"), ("PostToolUse", "tool_use"), ("Stop", "stop")] {
         let groups = hooks.entry(event).or_insert_with(|| json!([])).as_array_mut()
             .ok_or_else(|| anyhow!("{}.hooks.{event} must be an array", path.display()))?;
-        let installed = groups.iter().any(|group| group["hooks"].as_array().is_some_and(|handlers| {
-            handlers.iter().any(|handler| handler["command"].as_str().is_some_and(|command| command.contains("hook codex-report")))
+        groups.push(json!({
+            "hooks": [{
+                "type": "command",
+                "command": format!("{} --instance {} hook codex-report {}", shell_quote_path(relay), shell_quote(instance.as_str()), shell_quote(kind)),
+                "timeout": 10
+            }]
         }));
-        if !installed {
-            groups.push(json!({
-                "hooks": [{
-                    "type": "command",
-                    "command": format!("{} --instance {} hook codex-report {}", shell_quote_path(relay), shell_quote(instance.as_str()), shell_quote(kind)),
-                    "timeout": 10
-                }]
-            }));
-        }
     }
 
-    let tmp = dir.join("hooks.json.relay-tmp");
-    fs::write(&tmp, format!("{}\n", serde_json::to_string_pretty(&root)?))
-        .with_context(|| format!("writing {}", tmp.display()))?;
-    fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display()))?;
+    write_replacing(&path, &format!("{}\n", serde_json::to_string_pretty(&root)?), 0o644)?;
     Ok(())
 }
 
@@ -587,22 +674,38 @@ pub fn uninstall_codex(worktree: &Path) -> Result<()> {
     };
     let mut root: Value = serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
     let Some(hooks) = root.get_mut("hooks").and_then(Value::as_object_mut) else { return Ok(()) };
-    for groups in hooks.values_mut().filter_map(Value::as_array_mut) {
-        for group in groups.iter_mut() {
-            if let Some(handlers) = group.get_mut("hooks").and_then(Value::as_array_mut) {
-                handlers.retain(|handler| !handler["command"].as_str().is_some_and(|command| command.contains(CODEX_HOOK_MARKER)));
-            }
-        }
-        groups.retain(|group| group["hooks"].as_array().is_none_or(|handlers| !handlers.is_empty()));
-    }
-    let tmp = worktree.join(".codex/hooks.json.relay-tmp");
-    fs::write(&tmp, format!("{}\n", serde_json::to_string_pretty(&root)?))?;
-    fs::rename(&tmp, &path)?;
+    strip_handlers(hooks, CODEX_HOOK_MARKER);
+    let path = real_dir(worktree, ".codex")?.join("hooks.json");
+    write_replacing(&path, &format!("{}\n", serde_json::to_string_pretty(&root)?), 0o644)?;
     Ok(())
 }
 
+/// Remove every handler whose command carries `marker`, and each group that held only those.
+/// A user's group that was already empty is left as it was.
+fn strip_handlers(hooks: &mut serde_json::Map<String, Value>, marker: &str) {
+    for groups in hooks.values_mut().filter_map(Value::as_array_mut) {
+        groups.retain_mut(|group| {
+            let Some(handlers) = group.get_mut("hooks").and_then(Value::as_array_mut) else { return true };
+            let before = handlers.len();
+            handlers.retain(|handler| !handler["command"].as_str().is_some_and(|command| command.contains(marker)));
+            before == 0 || !handlers.is_empty()
+        });
+    }
+}
+
+/// Claude already receives account rate limits on each normal turn. A silent status-line
+/// command captures that payload for `usage.get`; it makes no provider or network request. It is
+/// a shell command line rather than a script file, so nothing in the checkout is executed.
 fn claude_statusline_script() -> &'static str {
-    "#!/bin/sh\ninput=$(cat)\ncase \"$input\" in\n  *'\"rate_limits\"'*) ;;\n  *) exit 0 ;;\nesac\nout=\"${CLAUDE_CONFIG_DIR:-$HOME}/.claude/relay-usage.json\"\nmkdir -p \"${out%/*}\" 2>/dev/null\nprintf '%s\\n' \"$input\" > \"$out\" 2>/dev/null\nexit 0\n"
+    "input=$(cat); case \"$input\" in *'\"rate_limits\"'*) ;; *) exit 0 ;; esac; \
+     out=\"${CLAUDE_CONFIG_DIR:-$HOME}/.claude/relay-usage.json\"; mkdir -p \"${out%/*}\" 2>/dev/null; \
+     printf '%s\\n' \"$input\" > \"$out\" 2>/dev/null; exit 0"
+}
+
+/// The `--settings` value for a Claude launch: inline JSON, which Claude accepts in place of a
+/// file path, so the command it runs every turn cannot be rewritten by the agent it serves.
+pub fn claude_settings() -> String {
+    json!({"statusLine": {"type": "command", "command": claude_statusline_script(), "padding": 0}}).to_string()
 }
 
 /// Hook setup is a handful of local `git config` calls; one that outlives this is stuck.
@@ -638,8 +741,8 @@ fn shell_quote(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{claude_statusline_script, install_git, refresh_git, relay_bin_from,
-        remove_hook_dir, shell_quote, sweep_hook_dirs};
+    use super::{claude_statusline_script, install_claude, install_git, refresh_git, relay_bin_from,
+        remove_hook_dir, run_user_commit_msg, shell_quote, sweep_hook_dirs, uninstall_git};
     use crate::Instance;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
@@ -673,20 +776,26 @@ mod tests {
     fn stale_hook_directories_are_swept_and_live_ones_are_kept() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
-        for session in ["live-otter", "dead-koala", "dead-ferret"] {
+        for session in ["live-otter", "dead-koala", "dead-ferret", "stable-heron", "legacy-mole"] {
             std::fs::create_dir_all(repo.join(".relay/hooks").join(session)).unwrap();
+            let owner = if session == "stable-heron" { "stable" } else { "test" };
+            if session != "legacy-mole" {
+                std::fs::write(repo.join(".relay/hooks").join(session).join(super::HOOK_OWNER), format!("{owner}\n")).unwrap();
+            }
         }
         std::fs::write(repo.join(".relay/hooks/not-a-dir"), "").unwrap();
 
-        assert_eq!(sweep_hook_dirs(repo, &["live-otter".to_string()]), 2);
+        assert_eq!(sweep_hook_dirs(repo, &["live-otter".to_string()], Instance::Test), 2);
         assert!(repo.join(".relay/hooks/live-otter").is_dir());
         assert!(!repo.join(".relay/hooks/dead-koala").exists());
+        assert!(repo.join(".relay/hooks/stable-heron").is_dir(), "another instance's live hook was swept");
+        assert!(repo.join(".relay/hooks/legacy-mole").is_dir(), "an unowned hook may be live");
         assert!(repo.join(".relay/hooks/not-a-dir").is_file(), "only directories are swept");
 
         remove_hook_dir(repo, "live-otter");
         assert!(!repo.join(".relay/hooks/live-otter").exists());
         // A repository with no hook directory at all is not an error.
-        assert_eq!(sweep_hook_dirs(&repo.join("nowhere"), &[]), 0);
+        assert_eq!(sweep_hook_dirs(&repo.join("nowhere"), &[], Instance::Test), 0);
     }
 
     #[test]
@@ -709,5 +818,191 @@ mod tests {
         let script = std::fs::read_to_string(&hook).unwrap();
         assert!(script.contains("relay_bin='/bin/true'"));
         assert!(Command::new(&hook).status().unwrap().success());
+    }
+
+    fn init_repo(dir: &Path) -> std::path::PathBuf {
+        let repo = dir.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let init = Command::new("git").arg("-C").arg(&repo).args(["init", "-q", "-b", "main"]).output().unwrap();
+        assert!(init.status.success());
+        repo
+    }
+
+    fn hooks_path(repo: &Path) -> Option<String> {
+        let out = Command::new("git").arg("-C").arg(repo)
+            .args(["config", "--worktree", "--get", "core.hooksPath"]).output().unwrap();
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
+    fn executable(path: &Path, body: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn statusline_command_records_rate_limits_and_ignores_the_rest() {
+        let home = tempfile::tempdir().unwrap();
+        let run = |input: &str| {
+            use std::io::Write;
+            let mut child = Command::new("sh").arg("-c").arg(claude_statusline_script())
+                .env("HOME", home.path()).env_remove("CLAUDE_CONFIG_DIR")
+                .stdin(std::process::Stdio::piped()).spawn().unwrap();
+            child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+            assert!(child.wait().unwrap().success());
+        };
+        let out = home.path().join(".claude/relay-usage.json");
+        run("{\"model\":{}}");
+        assert!(!out.exists());
+        run("{\"rate_limits\":{\"five_hour\":1}}");
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "{\"rate_limits\":{\"five_hour\":1}}\n");
+        let settings: serde_json::Value = serde_json::from_str(&super::claude_settings()).unwrap();
+        assert_eq!(settings["statusLine"]["command"], claude_statusline_script());
+    }
+
+    /// A checkout with no hook path of its own gets none back, not the one that was in effect;
+    /// one with its own gets exactly that back; and a record an older Relay wrote with the
+    /// effective directory no longer pins it.
+    #[test]
+    fn uninstall_restores_the_checkouts_own_hook_path_or_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        install_git(&repo, &repo, "calm-otter", Instance::Test, Path::new("/bin/true")).unwrap();
+        assert!(hooks_path(&repo).unwrap().ends_with(".relay/hooks/calm-otter"));
+        uninstall_git(&repo, &repo, "calm-otter").unwrap();
+        assert_eq!(hooks_path(&repo), None, "uninstall pinned a hook path the checkout never had");
+
+        let set = Command::new("git").arg("-C").arg(&repo)
+            .args(["config", "--worktree", "core.hooksPath", "user-hooks"]).status().unwrap();
+        assert!(set.success());
+        install_git(&repo, &repo, "calm-otter", Instance::Test, Path::new("/bin/true")).unwrap();
+        install_git(&repo, &repo, "sly-egret", Instance::Test, Path::new("/bin/true")).unwrap();
+        uninstall_git(&repo, &repo, "sly-egret").unwrap();
+        assert_eq!(hooks_path(&repo).as_deref(), Some("user-hooks"));
+
+        let unset = Command::new("git").arg("-C").arg(&repo)
+            .args(["config", "--worktree", "--unset", "core.hooksPath"]).status().unwrap();
+        assert!(unset.success());
+        install_git(&repo, &repo, "old-relay", Instance::Test, Path::new("/bin/true")).unwrap();
+        std::fs::write(repo.join(".relay/hooks/old-relay").join(super::PREVIOUS_HOOKS_PATH), ".git/hooks\n").unwrap();
+        uninstall_git(&repo, &repo, "old-relay").unwrap();
+        assert_eq!(hooks_path(&repo), None, "a legacy record of the default directory was pinned");
+    }
+
+    #[test]
+    fn every_other_hook_reaches_the_users_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        let user = repo.join(".git/hooks");
+        executable(&user.join("pre-push"), "#!/bin/sh\necho \"$@\" > \"$GIT_DIR_OUT\"\ncat >> \"$GIT_DIR_OUT\"\nexit 3\n");
+        executable(&user.join("reference-transaction"), "#!/bin/sh\nexit 0\n");
+        install_git(&repo, &repo, "calm-otter", Instance::Test, Path::new("/bin/true")).unwrap();
+        let relay = repo.join(".relay/hooks/calm-otter");
+        assert!(relay.join("reference-transaction").is_file(), "a hook the user has was not forwarded");
+        assert!(!relay.join("pre-push.sample").exists());
+
+        // Arguments, stdin and the exit status all pass through.
+        use std::io::Write;
+        let out = dir.path().join("pre-push.out");
+        let mut child = Command::new(relay.join("pre-push")).args(["origin", "url"])
+            .env("GIT_DIR_OUT", &out).stdin(std::process::Stdio::piped()).spawn().unwrap();
+        child.stdin.take().unwrap().write_all(b"refs/heads/main sha\n").unwrap();
+        assert_eq!(child.wait().unwrap().code(), Some(3));
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "origin url\nrefs/heads/main sha\n");
+        // A hook the user does not have is a no-op, as it would be for git.
+        assert!(Command::new(relay.join("post-checkout")).status().unwrap().success());
+
+        std::fs::remove_file(user.join("reference-transaction")).unwrap();
+        install_git(&repo, &repo, "calm-otter", Instance::Test, Path::new("/bin/true")).unwrap();
+        assert!(!relay.join("reference-transaction").exists(), "a stale forwarder survived");
+        assert!(relay.join(super::PREVIOUS_HOOKS_PATH).is_file());
+    }
+
+    #[test]
+    fn relay_files_are_excluded_in_the_primary_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        install_git(&repo, &repo, "calm-otter", Instance::Test, Path::new("/bin/true")).unwrap();
+        install_claude(&repo, Instance::Test, Path::new("/bin/true")).unwrap();
+        let status = Command::new("git").arg("-C").arg(&repo).args(["status", "--porcelain", "--untracked-files=all"]).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&status.stdout), "", "Relay's files would be committed");
+    }
+
+    #[test]
+    fn commit_msg_hook_can_refuse_or_rewrite_a_bus_commit_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        install_git(&repo, &repo, "calm-otter", Instance::Test, Path::new("/bin/true")).unwrap();
+        assert_eq!(run_user_commit_msg(&repo, &repo, "no hook").unwrap(), "no hook");
+
+        executable(&repo.join(".git/hooks/commit-msg"),
+            "#!/bin/sh\ngrep -q WIP \"$1\" && { echo 'no WIP commits' >&2; exit 1; }\nprintf '\\nChange-Id: I123\\n' >> \"$1\"\n");
+        assert_eq!(run_user_commit_msg(&repo, &repo, "Fix the thing").unwrap(), "Fix the thing\n\nChange-Id: I123\n");
+        let refused = run_user_commit_msg(&repo, &repo, "WIP").unwrap_err().to_string();
+        assert!(refused.contains("no WIP commits"), "{refused}");
+    }
+
+    /// A handler from an older launch names a relay binary that may be gone, and an agent can
+    /// write one that only mentions the marker; neither may stand in for the real guardrail.
+    #[test]
+    fn install_claude_replaces_stale_and_look_alike_relay_handlers() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path();
+        std::fs::create_dir_all(worktree.join(".claude")).unwrap();
+        std::fs::write(worktree.join(".claude/settings.local.json"), serde_json::json!({"hooks": {
+            "PreToolUse": [
+                {"matcher": "Bash", "hooks": [{"type": "command", "command": "true # hook claude-pre-tool"}]},
+                {"matcher": "Read", "hooks": [{"type": "command", "command": "mine"}]},
+                {"matcher": "Glob", "hooks": []},
+            ],
+            "Stop": [{"hooks": [{"type": "command", "command": "'/gone/relay' --instance 'dev' hook claude-report 'stop'"}]}],
+        }}).to_string()).unwrap();
+        std::fs::create_dir_all(worktree.join(".relay")).unwrap();
+        std::fs::write(worktree.join(".relay/agent-statusline.sh"), "#!/bin/sh\nrm -rf /\n").unwrap();
+
+        install_claude(worktree, Instance::Test, Path::new("/opt/relay")).unwrap();
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(worktree.join(".claude/settings.local.json")).unwrap()).unwrap();
+        let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre.len(), 3, "{pre:?}");
+        assert_eq!(pre[0]["matcher"], "Read");
+        assert_eq!(pre[1]["matcher"], "Glob", "a user's empty group is theirs to keep");
+        assert_eq!(pre[2]["hooks"][0]["command"], "'/opt/relay' --instance 'test' hook claude-pre-tool");
+        let stop = settings["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 1);
+        assert!(stop[0]["hooks"][0]["command"].as_str().unwrap().starts_with("'/opt/relay' --instance 'test'"));
+        assert!(!worktree.join(".relay/agent-statusline.sh").exists(), "the old executable status line survived");
+    }
+
+    /// Every file Relay writes into a checkout goes through a temp file opened without
+    /// following links, and a linked directory on the way is replaced by a real one.
+    #[test]
+    fn adapter_writes_never_follow_a_planted_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let victim = outside.join("victim");
+        std::fs::write(&victim, "precious\n").unwrap();
+
+        symlink(&outside, repo.join(".claude")).unwrap();
+        std::fs::create_dir_all(repo.join(".codex")).unwrap();
+        symlink(&victim, repo.join(".codex/hooks.json.relay-tmp")).unwrap();
+        std::fs::create_dir_all(repo.join(".relay/hooks/calm-otter")).unwrap();
+        symlink(&victim, repo.join(".relay/hooks/calm-otter/pre-commit")).unwrap();
+
+        install_git(&repo, &repo, "calm-otter", Instance::Test, Path::new("/bin/true")).unwrap();
+        install_claude(&repo, Instance::Test, Path::new("/opt/relay")).unwrap();
+        super::install_codex(&repo, Instance::Test, Path::new("/opt/relay")).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious\n");
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1, "something was written through the link");
+        for path in [".claude", ".relay/hooks/calm-otter/pre-commit", ".codex/hooks.json"] {
+            assert!(!std::fs::symlink_metadata(repo.join(path)).unwrap().file_type().is_symlink(), "{path} is still a link");
+        }
+        assert!(repo.join(".claude/settings.local.json").is_file());
+        let mode = std::fs::metadata(repo.join(".relay/hooks/calm-otter/pre-commit")).unwrap().permissions().mode();
+        assert_eq!(mode & 0o111, 0o111, "the hook is not executable");
     }
 }

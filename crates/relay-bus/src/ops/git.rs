@@ -18,12 +18,29 @@ result!(#[schemars(rename = "WorktreeDiskOut")] WorktreeDiskOut { pub worktrees:
 op!(WorktreeDisk, "worktree.disk", ProjectIn => WorktreeDiskOut, OpMeta::query(Scope::Project, 3, "Disk per worktree, build output separately"));
 
 payload!(#[schemars(rename = "GitWtIn")] WtIn { pub project_id: Id, pub worktree: Option<String> });
-result!(#[schemars(rename = "GitStatusOut")] StatusOut { pub branch: String, pub upstream: Option<String>, pub ahead: Option<i64>, pub behind: Option<i64>, pub files: Vec<FileStatus> });
+result!(#[schemars(rename = "GitStatusOut")] StatusOut {
+    pub branch: String, pub upstream: Option<String>, pub ahead: Option<i64>, pub behind: Option<i64>,
+    /// A wholly untracked directory is one entry, its path ending in `/`. At most a few thousand
+    /// entries: conflicts first, then other tracked changes, then untracked ones.
+    pub files: Vec<FileStatus>,
+    /// Whether `files` stops short of every change git reported.
+    #[serde(default)]
+    pub truncated: bool,
+    /// How many entries git reported, `files` included; more than `files.len()` when truncated.
+    #[serde(default)]
+    pub total: u64,
+});
 op!(Status, "git.status", WtIn => StatusOut, OpMeta::query(Scope::Project, 8, "Working tree status (gix)"));
 payload!(#[schemars(rename = "GitDiffIn")] DiffIn { pub project_id: Id, pub worktree: Option<String>, pub base: Option<String>, pub staged: Option<bool> });
 result!(#[schemars(rename = "GitDiffOut")] DiffOut { pub files: Vec<DiffFile> });
 op!(Diff, "git.diff", DiffIn => DiffOut, OpMeta::query(Scope::Project, 8, "Changed files with counts"));
-payload!(#[schemars(rename = "GitDiffFileIn")] DiffFileIn { pub project_id: Id, pub worktree: Option<String>, pub path: String, pub base: Option<String> });
+payload!(#[schemars(rename = "GitDiffFileIn")] DiffFileIn {
+    pub project_id: Id, pub worktree: Option<String>, pub path: String, pub base: Option<String>,
+    /// Compare with the index, what a commit would record, instead of the working tree.
+    pub staged: Option<bool>,
+    /// For a rename, the file's path in the old side (`renamed_from` in `git.status`).
+    pub old_path: Option<String>,
+});
 result!(#[schemars(rename = "GitDiffFileOut")] DiffFileOut { pub old: String, pub new: String, pub hunks: Vec<Hunk> });
 op!(DiffFileOp, "git.diff.file", DiffFileIn => DiffFileOut, OpMeta::query(Scope::Project, 8, "One file's old/new text and hunks (for @codemirror/merge)"));
 payload!(#[schemars(rename = "GitLogIn")] LogIn { pub project_id: Id, pub worktree: Option<String>, pub branch: Option<String>, pub limit: Option<u32>, pub graph: Option<bool> });
