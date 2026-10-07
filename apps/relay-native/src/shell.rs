@@ -829,7 +829,7 @@ impl Ui {
         let ui = self.clone();
         let panel = Rc::downgrade(&panel);
         glib::spawn_future_local(async move {
-            match ui.call("skill.list", json!({"project_id":project})).await {
+            match ui.call("skill.list", json!({"project_id":project,"summary":true})).await {
                 Ok(result) => {
                     clear(&list);
                     let skills = rows(&result, "skills");

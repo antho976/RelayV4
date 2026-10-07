@@ -235,8 +235,21 @@ pub fn register(e: &mut Engine) {
     e.register_unlocked::<DiffFileOp>(|ctx, p| {
         let (_project, root) = resolve_root_unlocked(ctx, p.project_id, p.worktree.as_deref())?;
         validate_path(&p.path)?;
+        // The reply carries both sides and the diff on one line; stop at the editor's limit
+        // before reading, rather than build a reply larger than a client can read.
+        let size = std::fs::metadata(root.join(&p.path)).map_or(0, |m| m.len());
+        if size > DIFF_FILE_MAX as u64 {
+            return Err(diff_too_large());
+        }
         let old = revision_text(&root, p.base.as_deref().unwrap_or("HEAD"), &p.path)?;
         let new = working_text(&root, &p.path)?;
+        if old.len() + new.len() > DIFF_FILE_MAX {
+            return Err(diff_too_large());
+        }
+        // Same test git.diff uses for its `binary` flag.
+        if old.contains('\0') || new.contains('\0') {
+            return Err(BusError::refused("git.diff_binary", "This file is binary; there is no text diff to show."));
+        }
         let hunks = if old == new {
             Vec::new()
         } else {
@@ -797,6 +810,14 @@ fn validate_path(path: &str) -> Result<(), BusError> {
     } else {
         Ok(())
     }
+}
+
+/// The largest combined old + new text git.diff.file returns: the desktop editor's limit,
+/// and well inside every client's 2 MiB line.
+const DIFF_FILE_MAX: usize = 1024 * 1024;
+
+fn diff_too_large() -> BusError {
+    BusError::refused("git.diff_too_large", "This diff is larger than the 1 MiB editor limit.")
 }
 
 fn revision_text(root: &Path, revision: &str, path: &str) -> Result<String, BusError> {

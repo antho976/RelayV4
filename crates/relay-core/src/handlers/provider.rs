@@ -104,8 +104,12 @@ pub fn register(e: &mut Engine) {
                 None => skill.enabled_in.is_empty() != enabled,
             });
         }
+        if payload.summary == Some(true) {
+            skills.iter_mut().for_each(summarize);
+        }
         Ok(SkillListOut { skills })
     });
+    e.register::<SkillGet>(|ctx, payload| get_skill(ctx.tx(), payload.skill_id));
     e.register::<SkillCreate>(|ctx: &mut Ctx, payload| {
         let name = valid_skill_name(&payload.name)?;
         valid_skill_body(&payload.body)?;
@@ -241,6 +245,8 @@ pub fn register(e: &mut Engine) {
         }
         let _ = std::fs::remove_dir_all(&staging);
         refresh_checkouts(ctx);
+        // A whole repository's bodies on one reply line can outgrow a client's line limit.
+        skills.iter_mut().for_each(summarize);
         Ok(SkillInstallOut { skills })
         },
     );
@@ -556,6 +562,20 @@ fn skill_row(conn: &rusqlite::Connection, row: &Row) -> rusqlite::Result<Skill> 
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
     })
+}
+
+/// How much of a body a summary keeps: the frontmatter and the opening lines, enough to
+/// describe a skill without every body of a large library riding on one reply.
+const SKILL_SUMMARY_BYTES: usize = 4096;
+
+fn summarize(skill: &mut Skill) {
+    if skill.body.len() > SKILL_SUMMARY_BYTES {
+        let mut end = SKILL_SUMMARY_BYTES;
+        while !skill.body.is_char_boundary(end) {
+            end -= 1;
+        }
+        skill.body.truncate(end);
+    }
 }
 
 fn get_skill(conn: &rusqlite::Connection, id: Id) -> Result<Skill, relay_bus::BusError> {

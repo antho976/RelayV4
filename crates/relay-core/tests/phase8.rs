@@ -225,6 +225,14 @@ fn git_status_diff_commit_log_show_and_branches() {
     .unwrap();
     assert_eq!(diff["old"], "");
     assert!(diff["new"].as_str().unwrap().contains("two"));
+    // A binary or oversized file is refused before its reply outgrows a client's line.
+    let root = std::path::Path::new(&repo);
+    std::fs::write(root.join("blob.bin"), b"head\0tail").unwrap();
+    std::fs::write(root.join("huge.txt"), "line\n".repeat(300_000)).unwrap();
+    assert_eq!(err(&call(&e, "git.diff.file", json!({"project_id":1,"path":"blob.bin"}))).code, "git.diff_binary");
+    assert_eq!(err(&call(&e, "git.diff.file", json!({"project_id":1,"path":"huge.txt"}))).code, "git.diff_too_large");
+    std::fs::remove_file(root.join("blob.bin")).unwrap();
+    std::fs::remove_file(root.join("huge.txt")).unwrap();
     call(
         &e,
         "git.stage",
