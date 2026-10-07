@@ -139,13 +139,8 @@ pub fn register(e: &mut Engine) {
                     format!("{} already exists", path.display()),
                 ));
             }
-            let from = if p.from.is_none() && !existing_worktree_branch(repo, Some(&p.branch))? {
-                refresh_new_worktree(repo, Some(&p.branch))?;
-                new_worktree_base(repo, &project.base_branch)?
-            } else {
-                p.from.clone()
-            };
-            let wt = worktree::create(repo, &path, &p.branch, from.as_deref())
+            let start = new_worktree_start(repo, &p.branch, &project.base_branch, p.from.as_deref())?;
+            let wt = worktree::create_at(repo, &path, &p.branch, &start)
                 .map_err(|e| BusError::conflict("worktree.create_failed", e.to_string()))?;
             Ok((project, wt))
         },
@@ -191,11 +186,12 @@ pub fn register(e: &mut Engine) {
         let worktrees = wts
             .iter()
             .map(|w| {
-                let path = Path::new(&w.path);
+                // One walk for both figures; the build dirs used to be walked a second time (RA-629).
+                let (total, build) = worktree::disk_usage(Path::new(&w.path));
                 WorktreeDiskRow {
                     path: w.path.clone(),
-                    disk_mb: worktree::dir_size(path) as f64 / (1024.0 * 1024.0),
-                    build_mb: Some(worktree::build_size(path) as f64 / (1024.0 * 1024.0)),
+                    disk_mb: total as f64 / (1024.0 * 1024.0),
+                    build_mb: Some(build as f64 / (1024.0 * 1024.0)),
                 }
             })
             .collect();
@@ -374,7 +370,7 @@ pub fn register(e: &mut Engine) {
             Ok(owners)
         })?;
         let owners: HashMap<String, String> = owner_rows.into_iter().collect();
-        // The same single walk and object cache as branch.delete and clean_merged (RA-151).
+        // The same single walk and object cache as branch.delete (RA-151).
         branches_with(&root, &project.base_branch, &owners, true)
     });
     // `git switch -c <name> <start>` checks out whatever differs from the start point, through
@@ -759,23 +755,9 @@ pub fn register(e: &mut Engine) {
     });
     // Every git and gh call is a subprocess; the transaction only attributes the result (D149).
     e.register_staged::<BranchCleanup, _>(
-        |ctx, p| {
-            let project = ctx.read(|conn| get_project(conn, p.project_id))?;
-            let options = crate::branch_cleanup::Options {
-                dry_run: p.dry_run.unwrap_or(false),
-                gh: crate::branch_cleanup::gh(),
-                audit_kept: false,
-                use_gh_cache: false,
-            };
-            let rows = crate::branch_cleanup::run(ctx.engine(), Some(project.id), None, &options)?;
-            Ok((project, rows))
-        },
+        |ctx, p| branch_cleanup(ctx, p.project_id, p.dry_run),
         |ctx: &mut Ctx, _p, (project, rows)| {
-            changed(ctx, project.id, Path::new(&project.path));
-            if rows.iter().any(|row| row.removed_worktree) {
-                ctx.emit("worktree.changed", json!({ "project_id": project.id }));
-            }
-            Ok(BranchCleanupOut { branches: rows })
+            Ok(BranchCleanupOut { branches: branch_cleaned(ctx, &project, rows) })
         },
     );
     // `gh pr create` is GitHub round trips: never under the store lock, never unbounded.
@@ -813,53 +795,24 @@ pub fn register(e: &mut Engine) {
             Ok(PrOpenOut { url })
         },
     );
-    e.register_staged::<CleanMerged, _>(|ctx, p| {
-        let (project, owners) = ctx.read(|conn| {
-            let project = get_project(conn, p.project_id)?;
-            let owners = branch_owners(conn, project.id)?;
-            Ok((project, owners))
-        })?;
-        let branches = branches_with(Path::new(&project.path), &project.base_branch, &owners, false)?;
-        let checked_out = worktree::list_with_dirty(Path::new(&project.path), false)
-            .map_err(|error| BusError::unavailable("worktree.list_failed", error.to_string()))?;
-        let candidates: Vec<String> = branches
-            .branches
-            .into_iter()
-            .filter(|b| {
-                b.merged
-                    && !b.current
-                    && b.session.is_none()
-                    && b.name != project.base_branch
-                    && !checked_out.iter().any(|worktree| worktree.branch == b.name)
-            })
-            .map(|b| b.name)
-            .collect();
-        if p.dry_run.unwrap_or(false) {
-            return Ok((project, candidates));
-        }
-        // Every candidate gets its try: stopping at the first refusal would report a failure for
-        // branches already gone, with no git.changed and no audit row for them (RA-373).
-        let mut deleted = Vec::new();
-        let mut failed = Vec::new();
-        for branch in candidates {
-            match worktree::git_mutate(Path::new(&project.path), &["branch", "-d", &branch]) {
-                Ok(_) => deleted.push(branch),
-                Err(error) => failed.push(format!("{branch}: {error}")),
+    // The older name for git.branch.cleanup, kept for the clients that call it. It had rules of
+    // its own that had drifted from cleanup's (any merged branch, by any name); now it is the
+    // same cleanup, answering with the branches deleted, or on a dry run that would be (RA-740),
+    // and the merged ones it found but could not delete, with why (RA-373).
+    e.register_staged::<CleanMerged, _>(
+        |ctx, p| branch_cleanup(ctx, p.project_id, p.dry_run),
+        |ctx: &mut Ctx, _p, (project, rows)| {
+            let (mut deleted, mut failed) = (Vec::new(), Vec::new());
+            for row in branch_cleaned(ctx, &project, rows) {
+                match row.outcome.as_str() {
+                    "kept" if row.merged => failed.push(CleanMergedFailed { branch: row.branch, reason: row.reason }),
+                    "kept" => {}
+                    _ => deleted.push(row.branch),
+                }
             }
-        }
-        if deleted.is_empty() && !failed.is_empty() {
-            return Err(BusError::conflict("git.branch_delete_failed", failed.join("; ")));
-        }
-        if !failed.is_empty() {
-            tracing::warn!(project = project.id, failed = %failed.join("; "), "git.branch.clean_merged kept branches git refused to delete");
-        }
-        Ok((project, deleted))
-    }, |ctx: &mut Ctx, _p, (project, candidates)| {
-        changed(ctx, project.id, Path::new(&project.path));
-        Ok(CleanMergedOut {
-            deleted: candidates,
-        })
-    });
+            Ok(CleanMergedOut { deleted, failed })
+        },
+    );
     e.register_unlocked::<SuggestMessage>(|ctx, p| {
         let (_project, root) = resolve_root_unlocked(ctx, p.project_id, p.worktree.as_deref())?;
         let files = status_files(&root)?;
@@ -1079,12 +1032,40 @@ fn run_post_commit(root: PathBuf) {
     });
 }
 
+/// The unlocked half of git.branch.cleanup (and its alias clean_merged): every git and gh call.
+fn branch_cleanup(
+    ctx: &Unlocked,
+    project_id: relay_bus::types::Id,
+    dry_run: Option<bool>,
+) -> Result<(relay_bus::types::Project, Vec<BranchCleanupRow>), BusError> {
+    let project = ctx.read(|conn| get_project(conn, project_id))?;
+    let options = crate::branch_cleanup::Options {
+        dry_run: dry_run.unwrap_or(false),
+        gh: crate::branch_cleanup::gh(),
+        audit_kept: false,
+        use_gh_cache: false,
+    };
+    let rows = crate::branch_cleanup::run(ctx.engine(), Some(project.id), None, &options)?;
+    Ok((project, rows))
+}
+
+/// The transaction half: announce what [`branch_cleanup`] changed.
+fn branch_cleaned(ctx: &mut Ctx, project: &relay_bus::types::Project, rows: Vec<BranchCleanupRow>) -> Vec<BranchCleanupRow> {
+    changed(ctx, project.id, Path::new(&project.path));
+    if rows.iter().any(|row| row.removed_worktree) {
+        ctx.emit("worktree.changed", json!({ "project_id": project.id }));
+    }
+    rows
+}
+
 fn status_files(root: &Path) -> Result<Vec<FileStatus>, BusError> {
     worktree::status_files(root).map_err(git_mutation("git.status_failed"))
 }
 
 /// The project and the checkout a git op means: one short read for the project row and the
-/// session's worktree, then `git worktree list` with the store lock released (D144).
+/// session's worktree, then [`crate::worktree::contains`] confirms it is a checkout of this
+/// repository. That reads `.git` pointer files, no subprocess; the git op that follows is what
+/// keeps the store lock released (D144).
 fn resolve_root_unlocked(
     ctx: &Unlocked,
     project_id: relay_bus::types::Id,
@@ -1440,13 +1421,19 @@ pub(super) fn existing_worktree_branch(root: &Path, branch: Option<&str>) -> Res
     Ok(branch.is_some_and(|branch| repo.find_reference(format!("refs/heads/{branch}").as_str()).is_ok()))
 }
 
-/// Only new branches need refreshing. Reattaching an existing branch preserves its work,
-/// including offline sessions. A failed fetch must never silently launch from stale refs.
-pub(super) fn refresh_new_worktree(root: &Path, branch: Option<&str>) -> Result<(), BusError> {
-    if !existing_worktree_branch(root, branch)? {
-        fetch_remote(root)?;
+/// Where a new worktree on `branch` starts, for worktree.create and session.create alike
+/// (RA-640). An existing branch is reattached as it is, preserving its work, offline sessions
+/// included. A new one starts at `from` when the caller names it, and otherwise at the freshest
+/// `base` after a fetch: a failed fetch must never silently launch from stale refs.
+pub(super) fn new_worktree_start(root: &Path, branch: &str, base: &str, from: Option<&str>) -> Result<worktree::Start, BusError> {
+    if existing_worktree_branch(root, Some(branch))? {
+        return Ok(worktree::Start::Existing);
     }
-    Ok(())
+    if let Some(from) = from {
+        return Ok(worktree::Start::New(Some(from.to_string())));
+    }
+    fetch_remote(root)?;
+    Ok(worktree::Start::New(new_worktree_base(root, base)?))
 }
 
 /// Pin the freshest base commit without moving the primary checkout. Preserve local-only

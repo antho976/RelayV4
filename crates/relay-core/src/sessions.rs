@@ -205,14 +205,6 @@ pub fn review_group(conn: &Connection, session: &Session) -> Result<Vec<(Id, Rol
     Ok(open.into_iter().filter(|(_, name, _, _)| members.contains(name)).map(|(id, _, role, _)| (id, role)).collect())
 }
 
-pub fn set_state(conn: &Connection, id: Id, state: SessionState, now: &str) -> Result<(), BusError> {
-    conn.prepare_cached("UPDATE sessions SET state = ?1, updated_at = ?2 WHERE id = ?3")
-        .map_err(crate::engine::internal)?
-        .execute(params![state_str(state), now, id])
-        .map(|_| ())
-        .map_err(crate::engine::internal)
-}
-
 pub fn is_live(s: SessionState) -> bool {
     matches!(s, SessionState::Spawning | SessionState::Running | SessionState::Idle | SessionState::Blocked)
 }

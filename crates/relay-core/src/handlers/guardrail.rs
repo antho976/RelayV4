@@ -27,12 +27,6 @@ fn scope_of(conn: &Connection, workspace_id: Option<Id>, project_id: Option<Id>)
     }
 }
 
-fn delete_settings_under(conn: &Connection, path: &str) -> Result<(), BusError> {
-    let like = format!("{}.%", path.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
-    conn.execute("DELETE FROM settings WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'", params![path, like]).bus()?;
-    Ok(())
-}
-
 pub fn register(engine: &mut Engine) {
     engine.register::<ConfigGet>(|ctx, payload| {
         let scope = scope_of(ctx.tx(), payload.workspace_id, payload.project_id)?;
@@ -70,10 +64,13 @@ pub fn register(engine: &mut Engine) {
             ConfigScope::Project(id) => Some(format!("guardrails.projects.{id}")),
         };
         match &layer_path {
+            // `settings::set` replaces the subtree it writes; a layer or key cleared to nothing
+            // has no write, so its old rows are deleted instead.
             Some(path) => {
-                delete_settings_under(ctx.tx(), path)?;
                 if merged.as_object().is_some_and(|map| !map.is_empty()) {
                     crate::handlers::settings::set(ctx.tx(), path, &merged, &now)?;
+                } else {
+                    crate::handlers::settings::delete_under(ctx.tx(), path)?;
                 }
             }
             None => {
@@ -87,9 +84,9 @@ pub fn register(engine: &mut Engine) {
                     .collect();
                 for key in keys {
                     let path = format!("guardrails.{key}");
-                    delete_settings_under(ctx.tx(), &path)?;
-                    if let Some(value) = merged.get(&key) {
-                        crate::handlers::settings::set(ctx.tx(), &path, value, &now)?;
+                    match merged.get(&key) {
+                        Some(value) => crate::handlers::settings::set(ctx.tx(), &path, value, &now)?,
+                        None => crate::handlers::settings::delete_under(ctx.tx(), &path)?,
                     }
                 }
             }

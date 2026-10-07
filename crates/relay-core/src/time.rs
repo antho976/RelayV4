@@ -13,10 +13,6 @@ pub fn stamp(ts: Timestamp) -> String {
     format!("{ts:.9}")
 }
 
-pub fn now_ts() -> Timestamp {
-    Timestamp::now()
-}
-
 /// The same format `days` in the past, for retention windows compared against stored `ts` values.
 /// RFC 3339 UTC sorts lexicographically, so a plain `ts < cutoff` is the comparison.
 /// A window reaching past the earliest representable instant is clamped to it rather than

@@ -256,6 +256,10 @@ fn notes_mailbox_and_brief_are_persistent_and_scoped() {
     assert!(multi_brief["text"].as_str().unwrap().contains("current_task: #1"));
     assert!(multi_brief["text"].as_str().unwrap().contains("Task #2 [QUEUED]: Adjacent task"));
     assert!(multi_brief["text"].as_str().unwrap().contains("Task #1 [CURRENT]: Build awareness"));
+    // A queued task moved back to the backlog is announced as parked, not as in review.
+    ok(e, Actor::User, "task.move", json!({"task_id":2,"column":"backlog"}));
+    let parked = ok(e, Actor::agent(f.a_name()), "session.brief", json!({"session":f.a_name()}));
+    assert!(parked["text"].as_str().unwrap().contains("Task #2 [BACKLOG]: Adjacent task"), "{}", parked["text"]);
 }
 
 #[test]

@@ -1,7 +1,7 @@
 //! `device.*` (phase 10): request-driven ADB discovery, H.264 mirrors, Gradle deploys,
 //! and bounded logcat streams. Nothing starts until a bus op asks for it.
 
-use crate::device::{mirror_server_path, DeviceWatchRuntime, MirrorRuntime, MirrorRuntimeConfig, MirrorState, RunRuntime};
+use crate::device::{mirror_server, DeviceWatchRuntime, MirrorRuntime, MirrorRuntimeConfig, MirrorState, RunRuntime};
 use crate::engine::{Ctx, Engine, IntoBus};
 use crate::handlers::workspace::get_project;
 use crate::mirror;
@@ -68,8 +68,12 @@ pub fn register(e: &mut Engine) {
     });
 
     // `adb devices` and `wm size` are two subprocesses, seconds when the adb server is cold;
-    // both run in the prepare phase with nothing locked, each under a deadline (D149).
+    // both run in the prepare phase with nothing locked, each under a deadline (D149), as does
+    // hashing the server jar.
     e.register_staged::<MirrorStart, _>(|ctx, p| {
+        if ctx.engine().instance != Instance::Test {
+            mirror_server().map_err(|(code, message)| BusError::unavailable(code, message))?;
+        }
         let adb = ctx.read(adb_path)?;
         let device = require_device(&adb, &p.device)?;
         if device.state != "device" {
@@ -83,16 +87,11 @@ pub fn register(e: &mut Engine) {
         let (width, height) = mirror::fit_size(physical_width, physical_height, max_size);
         let id = ctx.engine().next_mirror.fetch_add(1, Ordering::SeqCst);
         let scid = new_scid(id);
-        if ctx.engine().instance != Instance::Test && mirror_server_path().is_none() {
-            return Err(BusError::unavailable("device.mirror_server_missing", "the bundled scrcpy server is missing"));
-        }
         let runtime = MirrorRuntime::new(MirrorRuntimeConfig {
             id,
             device: p.device,
             width,
             height,
-            input_width: physical_width,
-            input_height: physical_height,
             max_size,
             bitrate,
             scid,
@@ -120,11 +119,14 @@ pub fn register(e: &mut Engine) {
                 )
             })?;
         runtime.stop();
-        runtime.finish(MirrorState::Stopped, None, None);
-        ctx.emit(
-            "mirror.changed",
-            json!({"mirror_id":p.mirror_id,"device":runtime.device,"state":"stopped"}),
-        );
+        // A mirror that already ended (lost, failed) keeps the state it ended with, and its
+        // stop was announced then: only the transition this call makes is news (RA-334).
+        if runtime.finish(MirrorState::Stopped, None, None) {
+            ctx.emit(
+                "mirror.changed",
+                json!({"mirror_id":p.mirror_id,"device":runtime.device,"state":"stopped"}),
+            );
+        }
         Ok(Empty {})
     });
 
@@ -146,9 +148,10 @@ pub fn register(e: &mut Engine) {
         // session is installing on this device, and name it.
         let requested_root = p.worktree.clone().unwrap_or_else(|| project.path.clone());
         let requested_root = std::fs::canonicalize(&requested_root).map(|path| path.display().to_string()).unwrap_or(requested_root);
-        let session = ctx.actor_session_id();
+        // `device.run` is user-only, so the lease is never the caller's own: it goes to the live
+        // session that owns the checkout, else the user.
         let (holder, released, adb, sdk_root, integration_root) = ctx.read(|conn| {
-            let holder = run_holder(conn, session, project.id, &requested_root)?;
+            let holder = super::device_lease::worktree_holder(conn, project.id, &requested_root)?;
             let released = super::device_lease::prune(ctx.engine(), conn);
             let integration_root = p.integration_id.map(|id| integration_root(conn, project.id, id)).transpose()?;
             Ok((holder, released, adb_path(conn), android_sdk_root(conn), integration_root))
@@ -179,7 +182,7 @@ pub fn register(e: &mut Engine) {
     }, |ctx: &mut Ctx, p, prepared| {
         let RunPrepared { adb, requested_root, root, command, gradle_init, sdk_root, default_gradle_command, sync_primary, source } = prepared;
         let project = get_project(ctx.tx(), p.project_id)?;
-        let holder = run_holder(ctx.tx(), ctx.actor_session_id(), project.id, &requested_root)?;
+        let holder = super::device_lease::worktree_holder(ctx.tx(), project.id, &requested_root)?;
         // Again under the lock: the device may have been taken while adb was answering.
         super::device_lease::check(ctx, &p.device, &holder)?;
         ctx.tx().execute(
@@ -551,7 +554,8 @@ fn valid_avd_name(value: &str) -> Result<String, BusError> {
 }
 
 fn sdk_tool(conn: &rusqlite::Connection, setting: &str, name: &str) -> Result<PathBuf, BusError> {
-    let configured: Option<String> = conn.query_row("SELECT value FROM settings WHERE path=?1", [setting], |row| row.get(0)).optional().bus()?;
+    let configured: Option<String> = conn.prepare_cached("SELECT value FROM settings WHERE path=?1").bus()?
+        .query_row([setting], |row| row.get(0)).optional().bus()?;
     if let Some(value) = configured.and_then(|value| serde_json::from_str::<String>(&value).ok()).filter(|value| !value.is_empty()) {
         let path = PathBuf::from(value);
         if path.is_file() { return Ok(path); }
@@ -954,9 +958,13 @@ pub fn mirror_worker(engine: Arc<Engine>, runtime: Arc<MirrorRuntime>) {
         mirror_failure(&engine, &runtime, MirrorState::Failed, code, message);
         engine.mirrors.lock().unwrap().remove(&runtime.id);
     };
-    let Some(server_jar) = mirror_server_path() else {
-        fail("device.mirror_server_missing", "the bundled scrcpy server is missing".into());
-        return;
+    // Checked again here, right before the push: the start request's check ran before adb did.
+    let server_jar = match mirror_server() {
+        Ok(path) => path,
+        Err((code, message)) => {
+            fail(code, message);
+            return;
+        }
     };
 
     if let Err(error) = mirror_adb(&runtime, mirror::push_args(&runtime.device, &server_jar.to_string_lossy()), MIRROR_PUSH_TIMEOUT) {
@@ -978,11 +986,9 @@ pub fn mirror_worker(engine: Arc<Engine>, runtime: Arc<MirrorRuntime>) {
         return;
     }
 
-    let mut options = mirror::MirrorOptions::for_capture(runtime.max_size);
-    options.video_bit_rate = runtime.bitrate;
     let mut command = Command::new(&runtime.adb);
     command
-        .args(mirror::server_shell_args_with(&runtime.device, runtime.scid, &options))
+        .args(mirror::server_shell_args(&runtime.device, runtime.scid, runtime.max_size, runtime.bitrate))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1017,6 +1023,8 @@ pub fn mirror_worker(engine: Arc<Engine>, runtime: Arc<MirrorRuntime>) {
         let mut drain = control.try_clone().map_err(|error| error.to_string())?;
         runtime.set_video(keepalive);
         runtime.install_control(control).map_err(|error| format!("mirror control socket: {error}"))?;
+        // Device→host messages (clipboard pushes) have no consumer; read and drop them so the
+        // device never blocks on a full socket.
         std::thread::spawn(move || {
             let mut bytes = [0u8; 4096];
             while drain.read(&mut bytes).is_ok_and(|count| count > 0) {}
@@ -1113,9 +1121,23 @@ fn event_coordinate(event: &Value, name: &str, limit: u32) -> Result<i32, BusErr
     Ok(value as i32)
 }
 
+/// Only the named fields: a `tap` or `swipe` carrying anything else (a `duration_ms`, say) is
+/// refused rather than run without it.
+fn event_fields(event: &Value, kind: &str, fields: &[&str]) -> Result<(), BusError> {
+    let extra = event.as_object().into_iter().flatten().map(|(key, _)| key.as_str()).find(|key| *key != "type" && !fields.contains(key));
+    match extra {
+        Some(key) => Err(BusError::invalid("device.input", format!("{kind} takes only {}; event.{key} is not supported", fields.join(", ")))),
+        None => Ok(()),
+    }
+}
+
 /// Encode and write one `device.mirror.input` event. Pure memory and one socket write — no
 /// store access — which is what lets the engine answer it on the fast path. `tap`/`swipe`
 /// coordinates are in the stream's *current* size, rotation included.
+///
+/// A `swipe` is instant: DOWN, one MOVE and UP in a single write, so the view sees a fling, not
+/// a timed drag. A caller that needs a slow drag sends its own `touch` stream (DOWN, MOVEs, UP)
+/// at the pace it wants, as the native client does.
 pub fn send_input(runtime: &MirrorRuntime, event: &Value) -> Result<(), BusError> {
     let kind = event.get("type").and_then(Value::as_str)
         .ok_or_else(|| BusError::invalid("device.input", "event.type is required"))?;
@@ -1123,6 +1145,7 @@ pub fn send_input(runtime: &MirrorRuntime, event: &Value) -> Result<(), BusError
     let (w, h) = (width as u16, height as u16);
     let message = match kind {
         "tap" => {
+            event_fields(event, kind, &["x", "y"])?;
             let x = event_coordinate(event, "x", width)?;
             let y = event_coordinate(event, "y", height)?;
             let mut bytes = mirror::touch(mirror::ACTION_DOWN, x, y, w, h, 1.0).to_vec();
@@ -1130,6 +1153,7 @@ pub fn send_input(runtime: &MirrorRuntime, event: &Value) -> Result<(), BusError
             bytes
         }
         "swipe" => {
+            event_fields(event, kind, &["x1", "y1", "x2", "y2"])?;
             let x1 = event_coordinate(event, "x1", width)?;
             let y1 = event_coordinate(event, "y1", height)?;
             let x2 = event_coordinate(event, "x2", width)?;
@@ -1142,6 +1166,16 @@ pub fn send_input(runtime: &MirrorRuntime, event: &Value) -> Result<(), BusError
         _ => {
             let input = serde_json::from_value::<mirror::InputMsg>(event.clone())
                 .map_err(|error| BusError::invalid("device.input", error.to_string()))?;
+            // One clipboard message cannot be split; cut short, the phone would paste a prefix
+            // and the caller would never know.
+            if let mirror::InputMsg::SetClipboard { text, .. } = &input {
+                if text.len() > mirror::SET_CLIPBOARD_MAX_LENGTH {
+                    return Err(BusError::invalid("device.input", format!(
+                        "clipboard text is {} bytes; one setclipboard carries at most {}",
+                        text.len(), mirror::SET_CLIPBOARD_MAX_LENGTH,
+                    )).with_hint("send it as type \"text\", which is split into as many messages as it needs"));
+                }
+            }
             mirror::encode_input(&input)
         }
     };
@@ -1191,18 +1225,6 @@ impl Drop for PendingRun {
         engine.device_runs.lock().unwrap().remove(&self.id);
         // Silently: the acquisition's event was never sent either.
         engine.device_leases.release_run(self.id);
-    }
-}
-
-/// Who a run's lease belongs to: the agent session that asked for it, else the live session
-/// that owns the checkout, else the user.
-fn run_holder(conn: &rusqlite::Connection, session: Option<Id>, project_id: Id, requested_root: &str) -> Result<crate::device_lease::Holder, BusError> {
-    match session {
-        Some(id) => {
-            let row = crate::sessions::by_id(conn, id)?.ok_or_else(|| BusError::internal("bound session vanished"))?;
-            Ok(crate::device_lease::Holder::Session { id, name: row.session.name })
-        }
-        None => super::device_lease::worktree_holder(conn, project_id, requested_root),
     }
 }
 
@@ -2224,13 +2246,15 @@ fn run_worker(engine: Arc<Engine>, runtime: Arc<RunRuntime>, parent: uuid::Uuid,
         let _ = child.kill();
         let _ = child.wait();
     }
-    if !runtime.stopped() {
-        if exited.load(Ordering::SeqCst) {
-            runtime.push(format!("app exited (pid {pid})"));
-        }
+    let stopped = runtime.stopped();
+    if !stopped && exited.load(Ordering::SeqCst) {
+        runtime.push(format!("app exited (pid {pid})"));
+    }
+    // Lease first, as in `fail_run`: a client that reads the run as finished can take the device.
+    end_run(&engine, &runtime);
+    if !stopped {
         let _ = advance_run(&engine, runtime.id, parent, "finished", true);
     }
-    end_run(&engine, &runtime);
 }
 
 /// A line of the app's own log that says it crashed: Java's `FATAL EXCEPTION`, or libc's
@@ -2301,10 +2325,6 @@ fn stream_command(
     failure: &str,
 ) -> Streamed {
     runtime.push(format!("$ {command}"));
-    // Keep bus tests independent of the developer's interactive shell. Production
-    // run commands still use Fish, while the test instance only executes portable
-    // fixture commands and must also work on bare CI runners.
-    let shell = if engine.instance == Instance::Test { "sh" } else { "fish" };
     if runtime.stopped() {
         return Streamed::Stopped;
     }
@@ -2314,13 +2334,14 @@ fn stream_command(
         fail_run(engine, runtime, parent, "device.run_spawn_failed", "run command had no output stream");
         return Streamed::Failed;
     };
-    let mut spawn = Command::new(shell);
+    let shell = shell_args(engine.instance, command, sdk_root);
+    let mut spawn = Command::new(&shell[0]);
     // Its own process group, so a stop reaches the Gradle client the shell forked, not
     // only the shell (which would leave the build installing onto a released device).
     std::os::unix::process::CommandExt::process_group(&mut spawn, 0);
     spawn
         .current_dir(root)
-        .args(["-lc", command])
+        .args(&shell[1..])
         .envs(env.iter().copied())
         .stdout(stdout)
         .stderr(stderr);
@@ -2363,6 +2384,28 @@ fn stream_command(
         return Streamed::Failed;
     }
     Streamed::Ok
+}
+
+/// The shell and arguments a run command executes under. Production runs use a Fish login
+/// shell, so the build sees the user's PATH and JDK; its start-up files run *after* the
+/// environment is set, though, and a `set -gx ANDROID_HOME` in config.fish would beat the
+/// configured SDK for Gradle while adb and apksigner kept the configured one. So the SDK is
+/// exported again inside the command, after start-up. The test instance runs plain `sh -c`,
+/// with no profile at all: bus tests must not depend on /etc/profile or ~/.profile.
+fn shell_args(instance: Instance, command: &str, sdk_root: Option<&Path>) -> Vec<String> {
+    if instance == Instance::Test {
+        return vec!["sh".into(), "-c".into(), command.into()];
+    }
+    let exports = sdk_root.map(|root| {
+        let root = fish_quote(&root.display().to_string());
+        format!("set -gx ANDROID_HOME {root}; set -gx ANDROID_SDK_ROOT {root}; ")
+    });
+    vec!["fish".into(), "-lc".into(), format!("{}{command}", exports.unwrap_or_default())]
+}
+
+/// One Fish word: single quotes, inside which only `\\` and `\'` are escapes.
+fn fish_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
 struct BuildWorkerRequest {
@@ -2476,44 +2519,51 @@ fn variant_artifact(root: &Path, variant: &str, format: &str) -> Option<PathBuf>
         ("outputs/apk", "apk")
     };
     let mut found = Vec::new();
-    collect_build_outputs(root, outputs, variant, extension, 0, &mut found);
+    for_each_build_dir(root, 0, &mut |build| {
+        let outputs = build.join(outputs);
+        let scoped = outputs.join(variant);
+        let wanted = |path: &Path| path.extension().is_some_and(|found| found == extension);
+        collect_under(if scoped.is_dir() { &scoped } else { &outputs }, 0, 3, &wanted, &mut found);
+    });
     found
         .into_iter()
         .max_by_key(|path| std::fs::metadata(path).and_then(|data| data.modified()).ok())
 }
 
-fn collect_build_outputs(dir: &Path, outputs: &str, variant: &str, extension: &str, depth: usize, found: &mut Vec<PathBuf>) {
+/// Every `build` directory under `dir`, at most five levels down, skipping trees that never
+/// hold an Android module's outputs. The one walk behind both the artifact and the APK
+/// metadata lookups, so the skip list and depth live once.
+fn for_each_build_dir(dir: &Path, depth: usize, visit: &mut dyn FnMut(&Path)) {
     if depth > 5 {
         return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
-        let path = entry.path();
         if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             continue;
         }
+        let path = entry.path();
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if name == "build" {
-            let outputs = path.join(outputs);
-            let scoped = outputs.join(variant);
-            collect_files(if scoped.is_dir() { &scoped } else { &outputs }, extension, 0, found);
+            visit(&path);
         } else if !matches!(name.as_ref(), ".git" | ".relay" | "node_modules" | "target") {
-            collect_build_outputs(&path, outputs, variant, extension, depth + 1, found);
+            for_each_build_dir(&path, depth + 1, visit);
         }
     }
 }
 
-fn collect_files(dir: &Path, extension: &str, depth: usize, found: &mut Vec<PathBuf>) {
-    if depth > 3 {
+/// Files under `dir`, `max_depth` levels down at most, that `wanted` accepts.
+fn collect_under(dir: &Path, depth: usize, max_depth: usize, wanted: &dyn Fn(&Path) -> bool, found: &mut Vec<PathBuf>) {
+    if depth > max_depth {
         return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let path = entry.path();
         if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-            collect_files(&path, extension, depth + 1, found);
-        } else if path.extension().is_some_and(|found| found == extension) {
+            collect_under(&path, depth + 1, max_depth, wanted, found);
+        } else if wanted(&path) {
             found.push(path);
         }
     }
@@ -2614,7 +2664,8 @@ fn wait_for_app_pid(
 
 fn variant_application_ids(root: &Path, variant: &str) -> Vec<String> {
     let mut metadata = Vec::new();
-    collect_apk_metadata(root, 0, &mut metadata);
+    let wanted = |path: &Path| path.file_name().is_some_and(|name| name == "output-metadata.json");
+    for_each_build_dir(root, 0, &mut |build| collect_under(&build.join("outputs/apk"), 0, 4, &wanted, &mut metadata));
     let mut packages = metadata
         .into_iter()
         .filter_map(|path| std::fs::read_to_string(path).ok())
@@ -2638,40 +2689,12 @@ fn valid_application_id(value: &str) -> bool {
         })
 }
 
-fn collect_apk_metadata(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
-    if depth > 5 { return; }
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(kind) = entry.file_type() else { continue };
-        if !kind.is_dir() { continue; }
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name == "build" {
-            collect_output_metadata(&path.join("outputs/apk"), 0, found);
-        } else if !matches!(name.as_ref(), ".git" | ".relay" | "node_modules" | "target") {
-            collect_apk_metadata(&path, depth + 1, found);
-        }
-    }
-}
-
-fn collect_output_metadata(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
-    if depth > 4 { return; }
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.file_name().is_some_and(|name| name == "output-metadata.json") {
-            found.push(path);
-        } else if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-            collect_output_metadata(&path, depth + 1, found);
-        }
-    }
-}
-
+/// The device is released before the row says `failed`, never after: otherwise a client that
+/// already reads the run as failed could still be refused with `device.busy` naming it.
 fn fail_run(engine: &Engine, runtime: &RunRuntime, parent: uuid::Uuid, code: &str, message: &str) {
     runtime.push(format!("{code}: {message}"));
-    let _ = advance_run(engine, runtime.id, parent, "failed", true);
     end_run(engine, runtime);
+    let _ = advance_run(engine, runtime.id, parent, "failed", true);
 }
 
 /// The worker is done with the run: no live stream, no lease. Idempotent, since
@@ -2693,10 +2716,7 @@ fn require_live_run(written: usize, id: Id) -> Result<(), BusError> {
 /// A finished build records its artifact in the same write that finishes the run, so
 /// `device.run.list` never shows a finished build without the file it produced.
 fn finish_build(engine: &Engine, id: Id, parent: uuid::Uuid, artifact: &Path, signing: &str) -> Result<(), BusError> {
-    let project_id = {
-        let conn = engine.store.lock();
-        conn.query_row("SELECT project_id FROM device_runs WHERE id=?1", [id], |row| row.get::<_, Id>(0)).bus()?
-    };
+    let project_id = run_project(engine, id).bus()?;
     let artifact = artifact.display().to_string();
     engine.system_write("device.build.finish",Some(parent),Some(project_id),None,json!({"run_id":id,"artifact":artifact,"signing":signing}),|tx,now|{
         require_live_run(tx.execute("UPDATE device_runs SET state='finished',finished_at=?1,artifact=?2,signing=?3 WHERE id=?4 AND state IN ('building','running')",params![now,artifact,signing,id]).bus()?,id)?;
@@ -2712,15 +2732,7 @@ fn advance_run(
     state: &str,
     finished: bool,
 ) -> Result<(), BusError> {
-    let project_id = {
-        let conn = engine.store.lock();
-        conn.query_row(
-            "SELECT project_id FROM device_runs WHERE id=?1",
-            [id],
-            |row| row.get::<_, Id>(0),
-        )
-        .bus()?
-    };
+    let project_id = run_project(engine, id).bus()?;
     engine.system_write("device.run.advance",Some(parent),Some(project_id),None,json!({"run_id":id,"state":state}),|tx,now|{
         require_live_run(tx.execute("UPDATE device_runs SET state=?1,finished_at=CASE WHEN ?2 THEN ?3 ELSE finished_at END WHERE id=?4 AND state IN ('building','running')",params![state,finished as i64,now,id]).bus()?,id)?;
         let run=get_run(tx,id)?;
@@ -2729,24 +2741,21 @@ fn advance_run(
 }
 
 fn report_crash(engine: &Engine, id: Id, parent: uuid::Uuid, line: &str) {
-    let project_id = {
-        let conn = engine.store.lock();
-        conn.query_row(
-            "SELECT project_id FROM device_runs WHERE id=?1",
-            [id],
-            |row| row.get::<_, Id>(0),
-        )
-        .ok()
-    };
-    let Some(project_id) = project_id else { return };
+    let Ok(project_id) = run_project(engine, id) else { return };
     let _=engine.system_write("device.run.crash",Some(parent),Some(project_id),None,json!({"run_id":id}),|tx,now|{
         tx.execute("INSERT INTO notifications(project_id,category,title,body,link,read,created_at) VALUES (?1,'system','App crashed on device',?2,NULL,0,?3)",params![project_id,line,now]).bus()?;
         Ok(((),vec![("run.crash".into(),json!({"run_id":id,"line":line})),("notify.new".into(),json!({"category":"system","project_id":project_id,"run_id":id}))]))
     });
 }
 
+/// The project a run belongs to, for a worker's write (no request open, so its own short read).
+fn run_project(engine: &Engine, id: Id) -> rusqlite::Result<Id> {
+    engine.store.lock().prepare_cached("SELECT project_id FROM device_runs WHERE id=?1")?.query_row([id], |row| row.get(0))
+}
+
 fn get_run(conn: &rusqlite::Connection, id: Id) -> Result<Run, BusError> {
-    conn.query_row("SELECT * FROM device_runs WHERE id=?1", [id], run_row)
+    conn.prepare_cached("SELECT * FROM device_runs WHERE id=?1").bus()?
+        .query_row([id], run_row)
         .optional()
         .bus()?
         .ok_or_else(|| BusError::not_found("device.run_not_found", format!("no run {id}")))
@@ -2945,6 +2954,24 @@ mod tests {
         assert_eq!(pid_alive("", "", 1000), Some(false), "pidof found nothing: it exited");
         assert_eq!(pid_alive("2044\n", "", 1000), Some(false), "restarted under another pid");
         assert_eq!(pid_alive("", "error: device 'x' not found\n", 1000), None, "adb failed: unknown");
+    }
+
+    #[test]
+    fn the_configured_sdk_wins_over_shell_start_up_files() {
+        // Tests read no profile at all.
+        assert_eq!(shell_args(Instance::Test, "./gradlew", Some(Path::new("/sdk"))), ["sh", "-c", "./gradlew"]);
+        // Fish reads config.fish before the command, so the SDK is exported inside it, after.
+        let args = shell_args(Instance::Dev, "./gradlew installDebug", Some(Path::new("/opt/it's \\ sdk")));
+        assert_eq!(&args[..2], ["fish", "-lc"]);
+        assert_eq!(
+            args[2],
+            r"set -gx ANDROID_HOME '/opt/it\'s \\ sdk'; set -gx ANDROID_SDK_ROOT '/opt/it\'s \\ sdk'; ./gradlew installDebug"
+        );
+        assert_eq!(shell_args(Instance::Dev, "make", None)[2], "make");
+        if let Ok(fish) = which::which("fish") {
+            let output = Command::new(fish).args(["--no-config", "-c", &format!("printf %s {}", fish_quote(r"a'b\c d"))]).output().unwrap();
+            assert_eq!(String::from_utf8_lossy(&output.stdout), r"a'b\c d");
+        }
     }
 
     #[test]

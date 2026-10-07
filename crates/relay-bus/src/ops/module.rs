@@ -32,7 +32,7 @@ op!(Reopen, "module.reopen", IdIn => Module,
 op!(Delete, "module.delete", IdIn => Empty,
     OpMeta::mutation(Scope::Project, 7, "Soft-delete a module; its tasks keep existing unlinked").undo(Undo::Inverse).emits(&["module.deleted", "task.changed"]));
 op!(Restore, "module.restore", IdIn => Module,
-    OpMeta::mutation(Scope::Project, 7, "Restore a soft-deleted module").undo(Undo::Inverse).emits(&["module.changed"]));
+    OpMeta::mutation(Scope::Project, 7, "Restore a soft-deleted module").undo(Undo::Inverse).emits(&["module.changed", "task.changed"]));
 
 payload!(#[schemars(rename = "ModuleStatsIn")] StatsIn { pub project_id: Id });
 op!(Stats, "module.stats", StatsIn => ModuleHeader, OpMeta::query(Scope::Project, 7, "Header stats only"));

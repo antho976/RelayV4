@@ -1,4 +1,4 @@
-//! `audit.*` (BUS.md §10.3): list, get. `audit.undo` lands with the board (phase 7).
+//! `audit.*` (BUS.md §10.3): list, get and undo.
 
 use crate::audit as log;
 use crate::engine::{Ctx, Engine, IntoBus};
@@ -98,7 +98,9 @@ fn written_since(ctx: &Ctx, row: &relay_bus::types::AuditRow) -> Result<bool, Bu
 }
 
 pub fn register(e: &mut Engine) {
-    e.register::<List>(|ctx, p| {
+    // Unlocked (D149): a list is up to 1000 rows of up to 64 KB payload and result each. Only
+    // copying the text out holds the store; parsing it runs after the lock is released.
+    e.register_unlocked::<List>(|ctx, p| {
         let since = p.since.as_deref().map(|s| crate::time::bound("since", s)).transpose()?;
         let until = p.until.as_deref().map(|s| crate::time::bound("until", s)).transpose()?;
         let f = log::ListFilter {
@@ -111,11 +113,12 @@ pub fn register(e: &mut Engine) {
             until: until.as_deref(),
             limit: p.limit.unwrap_or(200),
         };
-        let rows = log::list(ctx.tx(), &f).bus()?;
-        Ok(ListOut { rows })
+        let raw = ctx.read(|conn| log::list_raw(conn, &f).bus())?;
+        Ok(ListOut { rows: raw.into_iter().map(log::RawAudit::parse).collect() })
     });
-    e.register::<Get>(|ctx, p| {
-        log::get(ctx.tx(), p.audit_id).bus()?
+    e.register_unlocked::<Get>(|ctx, p| {
+        ctx.read(|conn| log::get_raw(conn, p.audit_id).bus())?
+            .map(log::RawAudit::parse)
             .ok_or_else(|| BusError::not_found("audit.not_found", format!("no audit row {}", p.audit_id)))
     });
     e.register::<Undo>(|ctx: &mut Ctx, p| {

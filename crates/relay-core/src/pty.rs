@@ -1,6 +1,8 @@
 //! PTYs (SPEC §1): one per spawned session. A detached reader thread feeds a scrollback ring
 //! and a broadcast of frames (BUS.md §7: `epoch` per spawn, `seq` per frame). Teardown is
-//! kill child → drop master → the reader ends on EIO, in that order, always.
+//! signal the child's process group → drop master, in that order, always. The reader holds its
+//! own dup of the master, so it ends (EIO) only once every holder of the slave is gone: that
+//! is why [`Pty::kill`] escalates on the whole group, not just on the leader (RA-332).
 
 use anyhow::{anyhow, Context, Result};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
@@ -50,10 +52,17 @@ struct Ring {
 }
 
 impl Ring {
+    /// The byte ring is reserved at its cap up front. Pages are only touched as output fills
+    /// them, and a full ring never reallocates: grown on demand, the first push past a full
+    /// ring doubled it to 16 MiB and copied 8 MiB under the ring lock (RA-329).
+    fn new() -> Ring {
+        Ring { buf: VecDeque::with_capacity(SCROLLBACK_BYTES), base: 0, frames: VecDeque::new() }
+    }
     /// Append one frame and trim both rings back to their caps. Trimming is a single bulk
     /// `drain`, never a per-element `pop_front` loop: a provider that writes 64 KiB at a time
     /// would otherwise pay 65 536 individual ring operations for every read once the byte ring
-    /// is full, which is the whole cost of the terminal data plane at steady state.
+    /// is full, which is the whole cost of the terminal data plane at steady state. Room is
+    /// made before the bytes go in, so the ring never holds more than its cap even briefly.
     fn push(&mut self, seq: u64, data: &[u8], mark: Mark) {
         let start = self.base + self.buf.len() as u64;
         self.frames.push_back((seq, start, mark));
@@ -61,13 +70,14 @@ impl Ring {
             let excess = self.frames.len() - FRAME_INDEX;
             self.frames.drain(..excess);
         }
+        // Of a frame larger than the whole ring only its tail survives.
+        let skip = data.len().saturating_sub(SCROLLBACK_BYTES);
+        let data = &data[skip..];
+        let excess = (self.buf.len() + data.len()).saturating_sub(SCROLLBACK_BYTES);
+        self.buf.drain(..excess);
+        self.base += (excess + skip) as u64;
         // `extend` from a slice copies in bulk; `data.iter().copied()` would not.
         self.buf.extend(data);
-        if self.buf.len() > SCROLLBACK_BYTES {
-            let excess = self.buf.len() - SCROLLBACK_BYTES;
-            self.buf.drain(..excess);
-            self.base += excess as u64;
-        }
     }
     /// Bytes from absolute offset `from` (clamped to what we still have). Copied through the
     /// deque's two contiguous halves — an element-wise iterator over 8 MiB is the same answer
@@ -380,7 +390,10 @@ struct Shared {
     ring: Mutex<Ring>,
     tx: broadcast::Sender<Arc<Frame>>,
     exited: AtomicBool,
-    exit_code: Mutex<Option<i32>>,
+    /// Nothing was left in the child's process group the last time it was looked at after the
+    /// child was reaped. Sticky: once the group is empty its id may be reused by a stranger,
+    /// so it is never signalled again.
+    group_gone: AtomicBool,
     /// Mirror of `sessions.state == 'idle'`, kept here so `session.input` can decide whether a
     /// keystroke needs a database write without reading the database (D148). Only the
     /// idle→running edge does; every other keystroke is pure memory.
@@ -396,7 +409,6 @@ pub struct Pty {
     shared: Arc<Shared>,
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
     writer: Mutex<Option<Box<dyn Write + Send>>>,
-    started: Instant,
     /// The size last set, `cols << 16 | rows`: a client that resizes for itself (a phone)
     /// reads it first so it can hand the terminal back as it found it.
     size: AtomicU32,
@@ -416,8 +428,13 @@ pub struct Attached {
 
 impl Pty {
     /// Spawn `spec` on a fresh PTY. `on_exit` runs on a detached thread once the child is
-    /// reaped (with its exit code, `None` if killed by signal).
+    /// reaped (with its exit code, `None` if killed by signal). A `cwd` that is not a directory
+    /// is refused with [`CwdMissing`]: portable-pty would start the child in `$HOME` instead,
+    /// where an agent's relative `--settings` and hook files are not Relay's (RA-330).
     pub fn spawn(spec: SpawnSpec, on_exit: impl FnOnce(Option<i32>) + Send + 'static) -> Result<Arc<Pty>> {
+        if !spec.cwd.is_dir() {
+            return Err(CwdMissing(spec.cwd).into());
+        }
         let sys = native_pty_system();
         let (cols, rows) = (spec.cols.max(2), spec.rows.max(2));
         let pair = sys
@@ -441,7 +458,7 @@ impl Pty {
         let writer = pair.master.take_writer().map_err(|e| anyhow!("take writer: {e}"))?;
 
         let (tx, _) = broadcast::channel(1024);
-        let mut ring = Ring { buf: VecDeque::new(), base: 0, frames: VecDeque::new() };
+        let mut ring = Ring::new();
         let mut term = ModeTracker::default();
         ring.push_history(&spec.initial_scrollback, &mut term);
         let shared = Arc::new(Shared {
@@ -453,7 +470,7 @@ impl Pty {
             idle: AtomicBool::new(false),
             silent: AtomicBool::new(false),
             exited: AtomicBool::new(false),
-            exit_code: Mutex::new(None),
+            group_gone: AtomicBool::new(false),
         });
 
         // reader: detached; ends when the master is dropped (EIO) or the child closes the slave
@@ -485,11 +502,13 @@ impl Pty {
             }
         })?;
 
-        // waiter: reaps the child, records the exit code, runs the callback
+        // waiter: reaps the child and runs the callback. portable-pty reports a signal death
+        // as code 1 beside the signal's name; that is no exit code, and recorded as one it read
+        // as an ordinary error exit (RA-331).
         let sh = shared.clone();
         std::thread::Builder::new().name(format!("pty-wait-{pid}")).spawn(move || {
-            let code = child.wait().ok().map(|s| s.exit_code() as i32);
-            *sh.exit_code.lock().unwrap() = code;
+            let code = child.wait().ok().filter(|s| s.signal().is_none()).map(|s| s.exit_code() as i32);
+            if !group_alive(pid) { sh.group_gone.store(true, Ordering::SeqCst); }
             sh.exited.store(true, Ordering::SeqCst);
             if !sh.silent.load(Ordering::SeqCst) {
                 on_exit(code);
@@ -501,16 +520,12 @@ impl Pty {
             shared,
             master: Mutex::new(Some(pair.master)),
             writer: Mutex::new(Some(writer)),
-            started: Instant::now(),
             size: AtomicU32::new(pack_size(cols, rows)),
         }))
     }
 
     pub fn pid(&self) -> u32 {
         self.pid
-    }
-    pub fn epoch(&self) -> u64 {
-        self.shared.epoch
     }
     pub fn seq(&self) -> u64 {
         self.shared.seq.load(Ordering::SeqCst)
@@ -545,11 +560,11 @@ impl Pty {
     pub fn silence_exit(&self) {
         self.shared.silent.store(true, Ordering::SeqCst);
     }
-    pub fn exit_code(&self) -> Option<i32> {
-        *self.shared.exit_code.lock().unwrap()
-    }
-    pub fn uptime(&self) -> Duration {
-        self.started.elapsed()
+
+    /// Nobody is writing right now. A keystroke is answered on a runtime thread only then: one
+    /// queued behind a paste that is waiting for the child to drain would park that thread.
+    pub fn writer_idle(&self) -> bool {
+        self.writer.try_lock().is_ok()
     }
 
     pub fn write(&self, data: &[u8]) -> Result<()> {
@@ -626,34 +641,70 @@ impl Pty {
     }
 
     /// Kill the child (SIGTERM to its process group, then SIGKILL after `grace`), then drop
-    /// the master so the reader ends. Idempotent.
+    /// the master so the reader ends. Idempotent. [`kill_all`] does the same for many at once.
     pub fn kill(&self, grace: Duration) {
-        if !self.exited() {
-            unsafe {
-                // the child is a session leader on its own pty, so -pid reaches its children
-                libc::kill(-(self.pid as i32), libc::SIGTERM);
-                libc::kill(self.pid as i32, libc::SIGTERM);
-            }
-            let deadline = Instant::now() + grace;
-            while !self.exited() && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            if !self.exited() {
-                unsafe {
-                    libc::kill(-(self.pid as i32), libc::SIGKILL);
-                    libc::kill(self.pid as i32, libc::SIGKILL);
-                }
-                let deadline = Instant::now() + Duration::from_secs(2);
-                while !self.exited() && Instant::now() < deadline {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-            }
+        kill_all(&[self], grace);
+    }
+
+    /// Send `signal` to the child's process group, and to the child itself while it lives.
+    /// The group is signalled even after the leader is gone: members that outlived it (a
+    /// provider that crashed, or was told `/exit`) would otherwise run on (RA-332).
+    fn signal(&self, signal: libc::c_int) {
+        unsafe {
+            // the child is a session leader on its own pty, so -pid reaches its children
+            if !self.shared.group_gone.load(Ordering::SeqCst) { libc::kill(-(self.pid as i32), signal); }
+            if !self.exited() { libc::kill(self.pid as i32, signal); }
         }
-        // drop writer then master: the reader thread sees EIO and ends
+    }
+
+    /// The child is reaped and nothing is left in its process group. A grandchild that left
+    /// the group (`setsid`) is out of reach either way; recovery reaps it by `RELAY_SESSION`.
+    fn settled(&self) -> bool {
+        if !self.exited() { return false; }
+        if self.shared.group_gone.load(Ordering::SeqCst) { return true; }
+        let gone = !group_alive(self.pid);
+        if gone { self.shared.group_gone.store(true, Ordering::SeqCst); }
+        gone
+    }
+
+    /// Drop writer then master. The reader's own dup of the master ends on EIO once the
+    /// group is gone and the slave with it.
+    fn close(&self) {
         self.writer.lock().unwrap().take();
         self.master.lock().unwrap().take();
     }
 }
+
+/// [`Pty::kill`] for many PTYs against one shared deadline: SIGTERM to every group, one wait
+/// of at most `grace` for all of them, SIGKILL to whatever remains, then at most 2 s more.
+/// Killing one at a time cost up to `grace` per stubborn session, which at shutdown summed to
+/// more than a desktop logout or a service stop allows (RA-311).
+pub fn kill_all(ptys: &[&Pty], grace: Duration) {
+    let wait = |deadline: Instant| {
+        while Instant::now() < deadline && !ptys.iter().all(|pty| pty.settled()) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let pending: Vec<&&Pty> = ptys.iter().filter(|pty| !pty.settled()).collect();
+    for pty in &pending { pty.signal(libc::SIGTERM); }
+    if !pending.is_empty() { wait(Instant::now() + grace); }
+    let stubborn: Vec<&&Pty> = pending.into_iter().filter(|pty| !pty.settled()).collect();
+    for pty in &stubborn { pty.signal(libc::SIGKILL); }
+    if !stubborn.is_empty() { wait(Instant::now() + Duration::from_secs(2)); }
+    for pty in ptys { pty.close(); }
+}
+
+/// [`Pty::spawn`]'s refusal of a working directory that is not one (`anyhow` downcasts to it).
+#[derive(Debug)]
+pub struct CwdMissing(pub PathBuf);
+
+impl std::fmt::Display for CwdMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "working directory {} is gone", self.0.display())
+    }
+}
+
+impl std::error::Error for CwdMissing {}
 
 fn unix_millis() -> u64 {
     std::time::SystemTime::now()
@@ -674,6 +725,11 @@ impl Drop for Pty {
             }
         }
     }
+}
+
+/// Is anything left in process group `pgid`? (signal 0 to the group)
+fn group_alive(pgid: u32) -> bool {
+    unsafe { libc::kill(-(pgid as i32), 0) == 0 }
 }
 
 /// Is `pid` alive? (signal 0)
@@ -983,5 +1039,78 @@ mod tests {
         // Caught up from where it left off: no prelude.
         assert!(pty.attach(Some(1), Some(pty.seq())).catch_up.is_empty());
         pty.kill(Duration::from_millis(100));
+    }
+
+    #[test]
+    fn a_full_ring_never_grows_past_its_reservation() {
+        let mut r = Ring::new();
+        let reserved = r.buf.capacity();
+        let mut seq = 0;
+        // Odd-sized frames, so no push lands exactly on the cap, then one larger than the ring.
+        while r.end() < 2 * SCROLLBACK_BYTES as u64 {
+            seq += 1;
+            r.push(seq, &[b'x'; 70_001], Mark::default());
+            assert!(r.buf.len() <= SCROLLBACK_BYTES);
+        }
+        r.push(seq + 1, &vec![b'y'; SCROLLBACK_BYTES + 3], Mark::default());
+        assert_eq!(r.buf.capacity(), reserved, "the ring reallocated");
+        assert_eq!(r.buf.len(), SCROLLBACK_BYTES);
+        assert_eq!(r.base + SCROLLBACK_BYTES as u64, r.end());
+        assert!(r.bytes_from(0).iter().all(|b| *b == b'y'));
+    }
+
+    fn sh(script: &str) -> SpawnSpec {
+        SpawnSpec {
+            cmd: "sh".into(), args: vec!["-c".into(), script.into()], env: Vec::new(),
+            cwd: std::env::temp_dir(), cols: 80, rows: 24, epoch: 1, initial_scrollback: Vec::new(),
+        }
+    }
+
+    fn wait_for(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < deadline, "{what} never happened");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_missing_working_directory_is_refused_not_replaced_by_home() {
+        let mut spec = sh("true");
+        spec.cwd = std::env::temp_dir().join("relay-no-such-worktree-RA-330");
+        let error = Pty::spawn(spec, |_| {}).err().expect("spawned in a directory that does not exist");
+        assert!(error.downcast_ref::<CwdMissing>().is_some(), "{error:#}");
+    }
+
+    #[test]
+    fn a_signal_death_has_no_exit_code() {
+        for (script, expect) in [("exit 3", Some(3)), ("kill -9 $$", None)] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let _pty = Pty::spawn(sh(script), move |code| { let _ = tx.send(code); }).unwrap();
+            assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), expect, "{script}");
+        }
+    }
+
+    #[test]
+    fn kill_reaches_group_members_that_outlive_the_leader() {
+        // The member ignores TERM and HUP, so neither the leader's exit nor SIGTERM ends it.
+        let pty = Pty::spawn(sh("(trap '' TERM HUP; exec sleep 30) & sleep 0.2; exit 0"), |_| {}).unwrap();
+        wait_for("the leader's exit", || pty.exited());
+        assert!(group_alive(pty.pid()), "the member should still be running");
+        pty.kill(Duration::from_millis(100));
+        assert!(!group_alive(pty.pid()), "a member survived kill");
+    }
+
+    #[test]
+    fn kill_all_waits_once_for_every_pty() {
+        let ptys: Vec<_> = (0..3).map(|_| Pty::spawn(sh("trap '' TERM; echo ready; sleep 30"), |_| {}).unwrap()).collect();
+        for pty in &ptys {
+            wait_for("the trap", || String::from_utf8_lossy(&pty.attach(None, None).catch_up).contains("ready"));
+        }
+        let started = Instant::now();
+        kill_all(&ptys.iter().map(|pty| &**pty).collect::<Vec<_>>(), Duration::from_secs(1));
+        // One at a time this is at least 3 s of grace; the shared deadline makes it about 1.
+        assert!(started.elapsed() < Duration::from_millis(2500), "{:?}", started.elapsed());
+        assert!(ptys.iter().all(|pty| pty.exited() && !group_alive(pty.pid())));
     }
 }

@@ -138,14 +138,14 @@ const GitScreen = () => {
             await confirm({
                 title: 'Nothing to clean',
                 message:
-                    'No merged branch is free to delete: the base branch, checked-out branches and session branches are kept.',
+                    'Nothing to clean up: only merged relay/* branches of closed sessions are deleted, with their unused checkouts. Your own branches are kept.',
                 confirmLabel: 'OK',
             })
             return
         }
         const yes = await confirm({
             title: `Delete ${preview.deleted.length} merged branch${preview.deleted.length === 1 ? '' : 'es'}?`,
-            message: 'Merged into the base branch, not checked out, no live or parked session.',
+            message: 'Merged relay/* branches of closed sessions, with their unused checkouts. Your own branches are kept.',
             confirmLabel: 'Delete',
             destructive: true,
             body: <Text style={styles.list}>{preview.deleted.join('\n')}</Text>,

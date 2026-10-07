@@ -1,7 +1,7 @@
 //! Event-driven worktree watchers. A short trailing debounce folds editor saves and git's
 //! lock/rename sequence into one refresh event without introducing an idle polling loop.
 
-use crate::engine::{Ctx, Engine, Unlocked};
+use crate::engine::{Engine, Unlocked};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -29,22 +29,6 @@ fn index_signature(root: &Path) -> Option<u64> {
     Some(hash.finish())
 }
 
-/// Both request contexts can defer work: [`Ctx`] until after its transaction commits, [`Unlocked`]
-/// until its handler returns. Watcher registration only cares that the store lock is not held.
-pub(crate) trait Defer {
-    fn defer(&mut self, f: Box<dyn FnOnce(Arc<Engine>) + Send + 'static>);
-}
-impl Defer for Ctx<'_> {
-    fn defer(&mut self, f: Box<dyn FnOnce(Arc<Engine>) + Send + 'static>) {
-        self.after_commit(f);
-    }
-}
-impl Defer for Unlocked<'_> {
-    fn defer(&mut self, f: Box<dyn FnOnce(Arc<Engine>) + Send + 'static>) {
-        self.after_commit(f);
-    }
-}
-
 /// Most worktrees watched at once. Each is an inotify instance and a thread of its own; the
 /// one requested least recently goes first, and a worktree that is deleted goes at once (RA-130).
 const MAX_ROOTS: usize = 32;
@@ -61,15 +45,15 @@ pub(crate) struct Root {
     used: Instant,
 }
 
-/// Recursive inotify registration may enumerate a large worktree. Start it after the current bus
-/// transaction releases the store lock so first-time registration cannot block PTY or UI requests.
+/// Registration may enumerate a large worktree. Start it once the current (unlocked) handler
+/// returns, on a thread of its own, so first-time registration cannot block PTY or UI requests.
 pub(crate) fn ensure_after_commit(
-    ctx: &mut impl Defer,
+    ctx: &mut Unlocked<'_>,
     root: PathBuf,
     project_id: relay_bus::types::Id,
 ) {
     let root = std::fs::canonicalize(&root).unwrap_or(root);
-    ctx.defer(Box::new(move |engine| {
+    ctx.after_commit(move |engine| {
         let key = root.display().to_string();
         if let Some(known) = engine.watchers.lock().unwrap().get_mut(&key) {
             if known.watcher.is_some() {
@@ -96,7 +80,7 @@ pub(crate) fn ensure_after_commit(
         {
             engine.watcher_registrations.lock().unwrap().remove(&key);
         }
-    }));
+    });
 }
 
 pub fn ensure(engine: &Engine, root: &Path, project_id: relay_bus::types::Id) {
@@ -113,8 +97,16 @@ pub fn ensure(engine: &Engine, root: &Path, project_id: relay_bus::types::Id) {
     let callback_key = key.clone();
     let mut last_index = index_signature(&root);
     // A build touches thousands of files, and every one of them arrives here as a path to
-    // compare. Build the path being compared against once, not once per event path.
-    let index_path = root.join(".git/index");
+    // compare. Build the path being compared against once, not once per event path. A linked
+    // worktree's index and HEAD are in its slot under the primary's `.git/worktrees/`, outside
+    // this root: that slot is watched too, or staging there never refreshed anything (RA-344).
+    let git_dir = crate::worktree::checkout_git_dir(&root)
+        .and_then(|dir| std::fs::canonicalize(dir).ok())
+        .unwrap_or_else(|| root.join(".git"));
+    let slot = (!git_dir.starts_with(&root)).then(|| git_dir.clone());
+    let callback_slot = slot.clone();
+    let index_path = git_dir.join("index");
+    let head_path = git_dir.join("HEAD");
     let watcher: notify::Result<RecommendedWatcher> =
         notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
             let Ok(event) = event else { return };
@@ -133,7 +125,8 @@ pub fn ensure(engine: &Engine, root: &Path, project_id: relay_bus::types::Id) {
                     .paths
                     .iter()
                     .filter(|path| {
-                        std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
+                        path.starts_with(&callback_root)
+                            && std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
                             && watched_dir(&callback_root, path)
                     })
                     .cloned()
@@ -167,6 +160,8 @@ pub fn ensure(engine: &Engine, root: &Path, project_id: relay_bus::types::Id) {
                             let unchanged = next.is_some() && next == last_index;
                             last_index = next;
                             unchanged
+                        } else if callback_slot.as_ref().is_some_and(|slot| path.starts_with(slot)) {
+                            path != &head_path
                         } else {
                             is_generated_path(&callback_root, path)
                         }
@@ -208,6 +203,9 @@ pub fn ensure(engine: &Engine, root: &Path, project_id: relay_bus::types::Id) {
                     // Deleted since the walk.
                     Err(_) => {}
                 }
+            }
+            if let Some(slot) = &slot {
+                let _ = watcher.watch(slot, RecursiveMode::NonRecursive);
             }
             if dirs.len() >= MAX_DIRS {
                 tracing::warn!(root = %key, limit = MAX_DIRS, "worktree has more directories than are watched");
@@ -287,25 +285,29 @@ pub(crate) fn is_generated_path(root: &Path, path: &Path) -> bool {
             || git_path == Path::new("config")
             || (git_path.starts_with("refs") && !git_path.to_string_lossy().ends_with(".lock")));
     }
-    relative.components().any(|component| {
-        let value = component.as_os_str().to_string_lossy();
-        matches!(
-            value.as_ref(),
-            ".relay"
-                | "node_modules"
-                | "target"
-                | "build"
-                | ".gradle"
-                | ".svelte-kit"
-                | ".next"
-                | "dist"
-                | "coverage"
-                | "Intermediate"
-                | "Saved"
-                | "DerivedDataCache"
-                | "Binaries"
-        )
-    })
+    relative.components().any(|component| generated_name(&component.as_os_str().to_string_lossy()))
+}
+
+/// A directory name that is build output or a cache wherever it appears. Cheap and by name only:
+/// right for filtering watcher events, but a tracked directory can carry one of these names too
+/// (a committed `dist/`), so `file.tree` and `file.search` also ask the index (RA-345).
+pub(crate) fn generated_name(value: &str) -> bool {
+    matches!(
+        value,
+        ".relay"
+            | "node_modules"
+            | "target"
+            | "build"
+            | ".gradle"
+            | ".svelte-kit"
+            | ".next"
+            | "dist"
+            | "coverage"
+            | "Intermediate"
+            | "Saved"
+            | "DerivedDataCache"
+            | "Binaries"
+    )
 }
 
 #[cfg(test)]
@@ -437,6 +439,34 @@ mod tests {
         })
         .await
         .expect("the deleted worktree's watcher is still held");
+    }
+
+    /// RA-344: a linked worktree's index lives in its slot under the primary's `.git`, outside
+    /// the watched root. Staging there must still refresh it.
+    #[tokio::test]
+    async fn staging_in_a_linked_worktree_refreshes_it() {
+        use std::time::Duration;
+        let fixture = tempfile::tempdir().unwrap();
+        let repo = std::fs::canonicalize(fixture.path()).unwrap().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |dir: &Path, args: &[&str]| assert!(std::process::Command::new("git").arg("-C").arg(dir).args(args).status().unwrap().success());
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["-c", "user.name=F", "-c", "user.email=f@f", "commit", "-q", "--allow-empty", "-m", "a"]);
+        let linked = repo.parent().unwrap().join("linked");
+        git(&repo, &["worktree", "add", "-q", "-b", "side", linked.to_str().unwrap()]);
+        std::fs::write(linked.join("new.txt"), "x").unwrap();
+        let engine = crate::Engine::new(crate::Instance::Test, crate::Store::open_memory().unwrap());
+        let next = || {
+            let mut events = engine.subscribe();
+            async move { tokio::time::timeout(Duration::from_secs(2), events.recv()).await.map(|ev| ev.unwrap().ev) }
+        };
+        let first = next();
+        super::ensure(&engine, &linked, 1);
+        assert_eq!(first.await.unwrap(), "file.changed");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let staged = next();
+        git(&linked, &["add", "new.txt"]);
+        assert_eq!(staged.await.expect("staging in a linked worktree went unseen"), "file.changed");
     }
 
     #[test]

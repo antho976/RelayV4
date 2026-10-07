@@ -260,3 +260,25 @@ fn the_sweep_skips_a_kept_branch_until_its_refs_move() {
     assert_eq!(again.len(), 1, "{again:?}");
     assert_eq!(again[0].outcome, "deleted", "{again:?}");
 }
+
+/// RA-309: `git worktree list` shows a checkout mid-rebase as detached, and `update-ref -d` does
+/// not refuse the branch it is rebasing; cleanup looks for one just before it deletes.
+#[test]
+fn a_branch_being_rebased_or_bisected_is_kept() {
+    let f = fixture();
+    let work = session_with_commit(&f, "rebased.txt");
+    git(&f.repo, &["merge", "--no-verify", "-q", "--no-ff", "-m", "merge", &work.branch]);
+    ok(&f.engine, "session.close", json!({"session": work.name}));
+    let rebase = f.repo.join(".git/rebase-merge");
+    std::fs::create_dir_all(&rebase).unwrap();
+    std::fs::write(rebase.join("head-name"), format!("refs/heads/{}\n", work.branch)).unwrap();
+    let row = cleanup(&f, &work.branch, None);
+    assert_eq!(row.outcome, "kept", "{row:?}");
+    assert!(row.reason.contains("rebase or bisect"), "{row:?}");
+    assert!(has_ref(&f.repo, &format!("refs/heads/{}", work.branch)));
+    std::fs::remove_dir_all(&rebase).unwrap();
+    std::fs::write(f.repo.join(".git/BISECT_START"), format!("{}\n", work.branch)).unwrap();
+    assert_eq!(cleanup(&f, &work.branch, None).outcome, "kept");
+    std::fs::remove_file(f.repo.join(".git/BISECT_START")).unwrap();
+    assert_eq!(cleanup(&f, &work.branch, None).outcome, "deleted");
+}

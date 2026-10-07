@@ -127,7 +127,7 @@ fn ctrl_v_pastes_the_desktop_clipboard() {
     // `MirrorView::wire_keys`, Ctrl+V: `input::paste`, one clipboard message, no `sequence`.
     let mut m = mirror();
     let text = "pasted from the desktop — ünïcode too";
-    m.sends(input::paste(text), &mirror::set_clipboard(0, true, text));
+    m.sends(input::paste(text), &mirror::set_clipboard(true, text));
 }
 
 #[test]

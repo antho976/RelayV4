@@ -1,6 +1,6 @@
 //! The Unix-socket door (BUS.md §6.2): newline-delimited JSON, one `Request` per line,
 //! responses correlated by id, `bus.subscribe` turns the connection into a subscriber.
-//! One engine per instance, enforced with a lock file + probe.
+//! One engine per instance, enforced with a lock file ([`InstanceLock`]).
 
 use crate::engine::{Door, Engine};
 use crate::paths::Instance;
@@ -34,24 +34,40 @@ pub enum BindError {
     Other(#[from] anyhow::Error),
 }
 
-/// A bound, listening socket door. Drop = unlink socket + release lock.
+/// A bound, listening socket door. Drop = stop accepting, end every connection, unlink the
+/// socket, release the lock.
 pub struct SocketServer {
     pub path: PathBuf,
     _lock: File,
     accept: Option<JoinHandle<()>>,
+    conns: Arc<std::sync::Mutex<Conns>>,
 }
 
-impl SocketServer {
-    /// Take the instance lock, evict a stale socket, bind, and start accepting — in the
-    /// instance's runtime dir (BUS.md §6.2).
-    pub async fn start(engine: Arc<Engine>) -> Result<SocketServer, BindError> {
-        let dir = engine.instance.runtime_dir();
-        Self::start_in(engine, dir).await
+/// The connections the door is serving. Closing the door ends them too, so nothing keeps
+/// dispatching on a socket nobody can reach while the engine shuts down (RA-333).
+#[derive(Default)]
+struct Conns {
+    closed: bool,
+    set: tokio::task::JoinSet<()>,
+}
+
+/// The instance's lock, held: nobody else is or will become this instance's engine. Taken
+/// before the store is opened, so a second `relay serve` is told the instance is taken rather
+/// than failing on a locked store, or running recovery on another one first (RA-624).
+pub struct InstanceLock {
+    instance: Instance,
+    lock: File,
+    sock_path: PathBuf,
+}
+
+impl InstanceLock {
+    /// In the instance's runtime dir (BUS.md §6.2).
+    pub fn take(instance: Instance) -> Result<InstanceLock, BindError> {
+        Self::take_in(instance, instance.runtime_dir())
     }
 
     /// Same, in an explicit directory (tests).
-    pub async fn start_in(engine: Arc<Engine>, dir: PathBuf) -> Result<SocketServer, BindError> {
-        let inst = engine.instance;
+    pub fn take_in(inst: Instance, dir: PathBuf) -> Result<InstanceLock, BindError> {
         // The lock and the socket are only as safe as the directory holding them: one another
         // user owns lets them plant a symlink as the lock (truncated below) or swap the socket
         // for their own (RA-013). So it must be ours, private, and in a parent we trust.
@@ -64,8 +80,8 @@ impl SocketServer {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
             .with_context(|| format!("chmod {}", dir.display()))?;
         crate::paths::check_private_dir(&dir).with_context(|| "refusing the runtime dir")?;
-        let lock_path = dir.join(format!("{}.lock", inst.as_str()));
-        let sock_path = dir.join(format!("{}.sock", inst.as_str()));
+        let lock_path = dir.join(inst.lock_file());
+        let sock_path = dir.join(inst.socket_file());
 
         let lock = OpenOptions::new()
             .read(true)
@@ -88,35 +104,33 @@ impl SocketServer {
         }
         let rc = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc != 0 {
-            // Someone holds the lock. Is their engine alive?
+            // Someone holds the lock, so someone is this instance's engine — answering or not.
+            // A held lock with a dead socket (a hung engine, a crashed one's child) is refused,
+            // not taken over: only a socket nobody holds the lock for is stale (BUS.md §6.2).
             let pid = std::fs::read_to_string(&lock_path)
                 .ok()
                 .and_then(|s| s.trim().parse().ok());
-            if probe(&sock_path).await {
-                return Err(BindError::AlreadyRunning {
-                    instance: inst,
-                    pid,
-                    socket: sock_path,
-                });
-            }
-            // Lock held but socket dead: a crashed engine's child, or a hung process. Refuse
-            // rather than fight over the store (BUS.md §6.2 says take over only for a *stale*
-            // socket, i.e. nobody holds the lock).
             return Err(BindError::AlreadyRunning {
                 instance: inst,
                 pid,
                 socket: sock_path,
             });
         }
-        // We hold the lock: anything at the socket path is stale.
-        if sock_path.exists() {
-            let _ = std::fs::remove_file(&sock_path);
-        }
         {
             use std::io::Write;
             let mut l = &lock;
             let _ = l.set_len(0);
             let _ = write!(l, "{}", std::process::id());
+        }
+        Ok(InstanceLock { instance: inst, lock, sock_path })
+    }
+
+    /// Evict the stale socket, bind, and start accepting.
+    pub async fn bind(self, engine: Arc<Engine>) -> Result<SocketServer, BindError> {
+        let InstanceLock { instance: inst, lock, sock_path } = self;
+        // We hold the lock: anything at the socket path is stale.
+        if sock_path.exists() {
+            let _ = std::fs::remove_file(&sock_path);
         }
         let listener = UnixListener::bind(&sock_path)
             .with_context(|| format!("binding {}", sock_path.display()))?;
@@ -127,13 +141,20 @@ impl SocketServer {
 
         let eng = engine.clone();
         let recent = Arc::new(Recent::new(&engine));
+        let conns = Arc::new(std::sync::Mutex::new(Conns::default()));
+        let served = conns.clone();
         let accept = tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
+                        let mut conns = served.lock().unwrap_or_else(|poison| poison.into_inner());
+                        if conns.closed {
+                            break;
+                        }
+                        while conns.set.try_join_next().is_some() {}
                         let e = eng.clone();
                         let recent = recent.clone();
-                        tokio::spawn(async move {
+                        conns.set.spawn(async move {
                             if let Err(err) = handle_conn(e, recent, stream).await {
                                 tracing::debug!(error = %err, "connection ended");
                             }
@@ -150,7 +171,21 @@ impl SocketServer {
             path: sock_path,
             _lock: lock,
             accept: Some(accept),
+            conns,
         })
+    }
+}
+
+impl SocketServer {
+    /// Take the instance lock, evict a stale socket, bind, and start accepting — in the
+    /// instance's runtime dir (BUS.md §6.2).
+    pub async fn start(engine: Arc<Engine>) -> Result<SocketServer, BindError> {
+        InstanceLock::take(engine.instance)?.bind(engine).await
+    }
+
+    /// Same, in an explicit directory (tests).
+    pub async fn start_in(engine: Arc<Engine>, dir: PathBuf) -> Result<SocketServer, BindError> {
+        InstanceLock::take_in(engine.instance, dir)?.bind(engine).await
     }
 }
 
@@ -159,6 +194,12 @@ impl Drop for SocketServer {
         if let Some(h) = self.accept.take() {
             h.abort();
         }
+        // Aborting a connection runs its drops — streams, mirrors, watch leases, borrowed
+        // sizes — as it would had the client hung up.
+        let mut conns = self.conns.lock().unwrap_or_else(|poison| poison.into_inner());
+        conns.closed = true;
+        conns.set.abort_all();
+        drop(conns);
         let _ = std::fs::remove_file(&self.path);
     }
 }
@@ -375,12 +416,16 @@ impl Drop for MirrorAttachment {
         // Out of the registry before the stop flag flips: anything that sees the mirror
         // stopped must also no longer find it.
         self.engine.mirrors.lock().unwrap().remove(&self.runtime.id);
-        self.runtime.finish(crate::device::MirrorState::Stopped, None, None);
+        // First terminal state wins: a mirror already lost, failed or stopped was announced
+        // as such, and closing its window must not relabel it "stopped" (RA-334).
+        let stopped_here = self.runtime.finish(crate::device::MirrorState::Stopped, None, None);
         self.runtime.stop();
-        self.engine.emit_system(
-            "mirror.changed",
-            serde_json::json!({"mirror_id":self.runtime.id,"state":"stopped"}),
-        );
+        if stopped_here {
+            self.engine.emit_system(
+                "mirror.changed",
+                serde_json::json!({"mirror_id":self.runtime.id,"device":self.runtime.device,"state":"stopped"}),
+            );
+        }
     }
 }
 
@@ -469,6 +514,165 @@ impl Drop for Borrowed {
     }
 }
 
+/// The longest request line the door reads. Above any payload the bus accepts — a 32 MiB
+/// `file.read` window written back, JSON-escaped — and far below what would take the engine,
+/// and every session in it, down with it (RA-335).
+const MAX_LINE_BYTES: usize = 64 * 1024 * 1024;
+
+/// What one read of the connection produced.
+enum Incoming {
+    Line(String),
+    /// A line over [`MAX_LINE_BYTES`], read to its end and thrown away.
+    TooLong,
+}
+
+/// Request lines with a ceiling. `Lines` buffers a line whole however long it is, so a client
+/// that never wrote a newline grew the engine without bound. Cancel safe: a partial line stays
+/// here across a cancelled [`LineReader::next`], so a `bus.wait` can listen for the client
+/// leaving without losing what it sends.
+struct LineReader {
+    r: BufReader<tokio::net::unix::OwnedReadHalf>,
+    buf: Vec<u8>,
+    over: bool,
+}
+
+impl LineReader {
+    fn new(r: tokio::net::unix::OwnedReadHalf) -> LineReader {
+        LineReader { r: BufReader::new(r), buf: Vec::new(), over: false }
+    }
+
+    /// The next line without its `\n` / `\r\n`; `None` at end of stream. Not UTF-8 is an error,
+    /// as it is for `Lines`.
+    async fn next(&mut self) -> std::io::Result<Option<Incoming>> {
+        loop {
+            let chunk = self.r.fill_buf().await?;
+            if chunk.is_empty() {
+                // A last line without its newline is still a line.
+                if std::mem::take(&mut self.over) {
+                    return Ok(Some(Incoming::TooLong));
+                }
+                if self.buf.is_empty() {
+                    return Ok(None);
+                }
+                return self.take().map(Some);
+            }
+            let end = chunk.iter().position(|b| *b == b'\n');
+            let piece = &chunk[..end.unwrap_or(chunk.len())];
+            if !self.over {
+                if self.buf.len() + piece.len() > MAX_LINE_BYTES {
+                    self.over = true;
+                    self.buf = Vec::new();
+                } else {
+                    self.buf.extend_from_slice(piece);
+                }
+            }
+            let used = end.map_or(chunk.len(), |at| at + 1);
+            self.r.consume(used);
+            if end.is_some() {
+                if std::mem::take(&mut self.over) {
+                    return Ok(Some(Incoming::TooLong));
+                }
+                return self.take().map(Some);
+            }
+        }
+    }
+
+    fn take(&mut self) -> std::io::Result<Incoming> {
+        let mut bytes = std::mem::take(&mut self.buf);
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+        String::from_utf8(bytes)
+            .map(Incoming::Line)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+}
+
+/// What an agent's `bus.subscribe` / `bus.wait` may be handed (RA-337, D106): events of its own
+/// project and those of none; of the mail, only what is addressed to it, broadcast to its
+/// project, or its own. Devices are the one thing every project shares, so their events pass
+/// whichever project's run or claim raised them — a lease held from another project is still
+/// the one an agent waits on. This is consistency with the per-op checks, not confidentiality:
+/// an agent can read the store file.
+struct AgentScope {
+    project_id: relay_bus::types::Id,
+    session: String,
+}
+
+impl AgentScope {
+    fn admits(&self, ev: &Event) -> bool {
+        if ev.ev.starts_with("device.") {
+            return true;
+        }
+        let project = ev.project_id.or_else(|| ev.payload.get("project_id").and_then(serde_json::Value::as_i64));
+        if project.is_some_and(|project| project != self.project_id) {
+            return false;
+        }
+        if ev.ev == "mailbox.new" {
+            let mine = |key: &str| ev.payload.get(key).and_then(serde_json::Value::as_str) == Some(self.session.as_str());
+            return mine("to") || mine("from") || ev.payload.get("to").and_then(serde_json::Value::as_str) == Some("*");
+        }
+        true
+    }
+}
+
+fn visible(scope: Option<&AgentScope>, ev: &Event) -> bool {
+    scope.is_none_or(|scope| scope.admits(ev))
+}
+
+/// The pipeline's checks for the ops the door answers itself (RA-336): envelope, actor and
+/// token, schema, allowlist and role. They are dispatched like any request; their handlers
+/// only say "answered by the door", so that answer means every check passed. `Err` is the
+/// refusal to send; `Ok(Some)` is an agent, scoped to its own project and mail.
+async fn door_preflight(engine: &Arc<Engine>, req: &Request) -> Result<Result<Option<AgentScope>, Response>> {
+    let (e, r) = (engine.clone(), req.clone());
+    Ok(tokio::task::spawn_blocking(move || {
+        let id = r.id;
+        let actor = r.actor.clone();
+        let resp = e.dispatch(r, Door::Socket);
+        if resp.error.as_ref().map(|error| error.code.as_str()) != Some(crate::handlers::bus::DOOR_ONLY) {
+            return Err(resp);
+        }
+        let relay_bus::Actor::Agent(name) = actor else { return Ok(None) };
+        // Authenticated a moment ago; a session gone since is refused, never left unscoped.
+        let row = crate::sessions::by_name(&e.store.lock(), &name)
+            .map_err(|_| Response::err(id, BusError::actor(format!("unknown session {name:?}"))))?;
+        Ok(Some(AgentScope { project_id: row.session.project_id, session: name }))
+    })
+    .await?)
+}
+
+/// `session.attach {}` / `session.detach {}` from an agent mean its own session, which the
+/// pipeline fills in (D110). The door fills it first, so the stream it attaches or detaches is
+/// the one the pipeline checked, not a session named "" (RA-340). The name is the same either
+/// way: an agent's actor is its session's name.
+fn own_session(mut req: Request) -> Request {
+    if let (relay_bus::Actor::Agent(name), Some(object)) = (&req.actor, req.payload.as_object_mut()) {
+        if !object.contains_key("session") {
+            object.insert("session".into(), serde_json::Value::from(name.clone()));
+        }
+    }
+    req
+}
+
+/// The pipeline on the blocking pool: it takes the store lock, which a runtime thread must
+/// not wait on.
+async fn dispatch_blocking(engine: &Arc<Engine>, req: Request) -> Result<Response> {
+    let e = engine.clone();
+    Ok(tokio::task::spawn_blocking(move || e.dispatch(req, Door::Socket)).await?)
+}
+
+/// A `logcat` or `mirror` frame (§7); `pty` frames have their own writer.
+fn stream_frame(stream: &str, run_id: Option<relay_bus::types::Id>, mirror_id: Option<relay_bus::types::Id>, seq: u64, data: serde_json::Value) -> Frame {
+    Frame { v: ENVELOPE_V, stream: stream.into(), session: None, run_id, mirror_id, epoch: None, seq, data }
+}
+
+/// The event a subscriber gets in place of the ones it was too slow to take, so it knows its
+/// picture is stale and refetches rather than carrying on with it (RA-338).
+fn lagged_event(dropped: u64) -> Event {
+    Event::new("bus.lagged", crate::time::now(), relay_bus::Actor::System, serde_json::json!({"dropped": dropped}))
+}
+
 /// How many unlocked queries one connection may have running at once.
 const MAX_CONCURRENT_QUERIES: usize = 8;
 
@@ -516,7 +720,7 @@ async fn handle_conn(engine: Arc<Engine>, recent: Arc<Recent>, stream: UnixStrea
             }
         }
     });
-    let mut lines = BufReader::new(r).lines();
+    let mut reader = LineReader::new(r);
     let mut streams = Streams::default();
 
     let mut attached_mirrors: std::collections::HashMap<relay_bus::types::Id, MirrorAttachment> =
@@ -528,9 +732,29 @@ async fn handle_conn(engine: Arc<Engine>, recent: Arc<Recent>, stream: UnixStrea
     // request queued behind it; D149's parallelism held only across connections (RA-015).
     let mut inflight = tokio::task::JoinSet::new();
     let concurrent = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_QUERIES));
+    // A line that arrived while a `bus.wait` listened for the client leaving: next in line.
+    let mut pending: Option<Incoming> = None;
 
-    while let Some(line) = lines.next_line().await? {
+    'conn: loop {
+        let incoming = match pending.take() {
+            Some(incoming) => incoming,
+            None => match reader.next().await? {
+                Some(incoming) => incoming,
+                None => break,
+            },
+        };
         while inflight.try_join_next().is_some() {}
+        let line = match incoming {
+            Incoming::Line(line) => line,
+            Incoming::TooLong => {
+                let refused = BusError::invalid(
+                    "bus.too_large",
+                    format!("a request line may be at most {} MiB; this one was discarded", MAX_LINE_BYTES >> 20),
+                );
+                let _ = out_tx.send(serde_json::to_string(&Response::unparsed(refused))?).await;
+                continue;
+            }
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -541,6 +765,14 @@ async fn handle_conn(engine: Arc<Engine>, recent: Arc<Recent>, stream: UnixStrea
                 continue;
             }
         };
+        drop(line);
+        // Once the engine is going down, the door takes nothing new: a session spawned now
+        // would land after shutdown drained the PTYs, neither killed nor restorable (RA-333).
+        if engine.is_quitting() {
+            let refused = BusError::unavailable("app.quitting", "the engine is shutting down");
+            let _ = out_tx.send(serde_json::to_string(&Response::err(req.id, refused))?).await;
+            continue;
+        }
         // `user` and `test` carry no token: what vouches for them is the process that connected.
         // A liveness ping claims nothing, so `socket::probe` works from anywhere.
         if matches!(req.actor, relay_bus::Actor::User | relay_bus::Actor::Test)
@@ -599,164 +831,190 @@ async fn handle_conn(engine: Arc<Engine>, recent: Arc<Recent>, stream: UnixStrea
             })
             .await?
         } else if req.op == relay_bus::ops::bus::Subscribe::NAME {
-            match serde_json::from_value::<SubscribeIn>(req.payload.clone()) {
-                Err(e) => Response::err(req.id, BusError::schema(&req.op, e)),
-                Ok(p) => {
-                    if let Some(h) = streams.forwarder.take() {
-                        h.abort();
-                    }
-                    let filter = Filter(p.events.clone().unwrap_or_default());
-                    let mut rx = engine.subscribe();
-                    let tx = out_tx.clone();
-                    let f = filter.clone();
-                    streams.forwarder = Some(tokio::spawn(async move {
-                        loop {
-                            match rx.recv().await {
-                                Ok(ev) => {
-                                    if f.matches(&ev.ev) {
-                                        if let Ok(s) = serde_json::to_string(&ev) {
-                                            if tx.send(s).await.is_err() {
-                                                break;
-                                            }
-                                        }
+            match door_preflight(&engine, &req).await? {
+                Err(refused) => refused,
+                Ok(scope) => match serde_json::from_value::<SubscribeIn>(req.payload.clone()) {
+                    Err(e) => Response::err(req.id, BusError::schema(&req.op, e)),
+                    Ok(p) => {
+                        if let Some(h) = streams.forwarder.take() {
+                            h.abort();
+                        }
+                        let filter = Filter(p.events.clone().unwrap_or_default());
+                        let mut rx = engine.subscribe();
+                        let tx = out_tx.clone();
+                        let f = filter.clone();
+                        streams.forwarder = Some(tokio::spawn(async move {
+                            loop {
+                                let line = match rx.recv().await {
+                                    Ok(ev) if f.matches(&ev.ev) && visible(scope.as_ref(), &ev) => serde_json::to_string(&ev),
+                                    Ok(_) => continue,
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                        tracing::warn!(lagged = n, "subscriber lagged; events dropped");
+                                        serde_json::to_string(&lagged_event(n))
+                                    }
+                                    Err(_) => break,
+                                };
+                                if let Ok(s) = line {
+                                    if tx.send(s).await.is_err() {
+                                        break;
                                     }
                                 }
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                    tracing::warn!(lagged = n, "subscriber lagged; events dropped");
-                                }
-                                Err(_) => break,
                             }
-                        }
-                    }));
-                    let subscribed = if filter.0.is_empty() {
-                        vec!["*".to_string()]
-                    } else {
-                        filter.0.clone()
-                    };
-                    Response::ok(req.id, serde_json::to_value(SubscribeOut { subscribed })?)
-                }
+                        }));
+                        let subscribed = if filter.0.is_empty() {
+                            vec!["*".to_string()]
+                        } else {
+                            filter.0.clone()
+                        };
+                        Response::ok(req.id, serde_json::to_value(SubscribeOut { subscribed })?)
+                    }
+                },
             }
         } else if req.op == relay_bus::ops::bus::Wait::NAME {
             // The wake-up an agent has instead of a poll loop. It blocks on the event
             // broadcast inside this connection's task — no timer anywhere, and the engine's
             // store lock is never held while waiting (SPEC §15, D115).
-            match serde_json::from_value::<WaitIn>(req.payload.clone()) {
-                Err(e) => Response::err(req.id, BusError::schema(&req.op, e)),
-                Ok(p) => {
-                    let filter = Filter(p.events.clone().unwrap_or_default());
-                    let timeout = Duration::from_millis(
-                        p.timeout_ms.unwrap_or(60_000).clamp(1_000, 3_600_000),
-                    );
-                    let mut rx = engine.subscribe();
-                    // Subscribed first, so an answer is either already stored or still to come.
-                    let answered = match exception_waited(&filter, p.matching.as_ref()) {
-                        Some(id) => {
-                            let e = engine.clone();
-                            tokio::task::spawn_blocking(move || {
-                                crate::guardrail::grants::resolved_event(&e.store.lock(), id)
-                            })
-                            .await?
-                            .filter(|ev| payload_matches(&ev.payload, p.matching.as_ref()))
-                        }
-                        None => None,
-                    };
-                    // Then whatever fired between this agent's last refusal and now.
-                    let answered = answered.or_else(|| recent.replay(&req, &filter, p.matching.as_ref()));
-                    let waited = tokio::time::timeout(timeout, async {
-                        if answered.is_some() {
-                            return answered;
-                        }
-                        loop {
-                            match rx.recv().await {
-                                Ok(ev) if filter.matches(&ev.ev) && payload_matches(&ev.payload, p.matching.as_ref()) => return Some(ev),
-                                Ok(_) => continue,
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                    tracing::warn!(lagged = n, "waiter lagged; events dropped");
-                                }
-                                Err(_) => return None,
-                            }
-                        }
-                    })
-                    .await;
-                    let (event, timed_out) = match waited {
-                        Ok(event) => (event, false),
-                        Err(_) => (None, true),
-                    };
-                    match serde_json::to_value(WaitOut { event, timed_out }) {
-                        Ok(value) => Response::ok(req.id, value),
-                        Err(e) => Response::err(req.id, BusError::internal(e.to_string())),
-                    }
-                }
-            }
-        } else if req.op == relay_bus::ops::bus::Unsubscribe::NAME {
-            if let Some(h) = streams.forwarder.take() {
-                h.abort();
-            }
-            Response::ok(req.id, serde_json::to_value(Empty {})?)
-        } else if req.op == relay_bus::ops::session::Attach::NAME {
-            // control-plane validation first, then the data plane (BUS.md §7)
-            let e = engine.clone();
-            let r2 = req.clone();
-            let resp = tokio::task::spawn_blocking(move || e.dispatch(r2, Door::Socket)).await?;
-            if resp.ok {
-                let p: relay_bus::ops::session::AttachIn = serde_json::from_value(
-                    req.payload.clone(),
-                )
-                .unwrap_or(relay_bus::ops::session::AttachIn {
-                    session: String::new(),
-                    from_seq: None,
-                    epoch: None,
-                });
-                match crate::handlers::session::pty_by_name(&engine, &p.session) {
-                    Ok((_, pty)) => {
-                        if let Some(h) = streams.attached.remove(&p.session) {
-                            h.abort();
-                        }
-                        let att = pty.attach(p.epoch, p.from_seq);
-                        let tx = out_tx.clone();
-                        let name = p.session.clone();
-                        streams.attached.insert(p.session.clone(), tokio::spawn(async move {
-                            let head = pty_frame_head(&name);
-                            let mut rx = att.rx;
-                            if !att.catch_up.is_empty() {
-                                let line = pty_frame_line(&head, att.epoch, att.seq, &att.catch_up);
-                                if tx.send(line).await.is_err() { return; }
+            match door_preflight(&engine, &req).await? {
+                Err(refused) => refused,
+                Ok(scope) => match serde_json::from_value::<WaitIn>(req.payload.clone()) {
+                    Err(e) => Response::err(req.id, BusError::schema(&req.op, e)),
+                    Ok(p) => {
+                        let filter = Filter(p.events.clone().unwrap_or_default());
+                        let timeout = Duration::from_millis(
+                            p.timeout_ms.unwrap_or(60_000).clamp(1_000, 3_600_000),
+                        );
+                        let mut rx = engine.subscribe();
+                        // Subscribed first, so an answer is either already stored or still to come.
+                        let exception = exception_waited(&filter, p.matching.as_ref());
+                        let answered = match exception {
+                            Some(id) => stored_answer(&engine, id, p.matching.as_ref()).await?,
+                            None => None,
+                        };
+                        // Then whatever fired between this agent's last refusal and now.
+                        let answered = answered
+                            .or_else(|| recent.replay(&req, &filter, p.matching.as_ref()))
+                            .filter(|ev| visible(scope.as_ref(), ev));
+                        let wait = tokio::time::timeout(timeout, async {
+                            if answered.is_some() {
+                                return Ok::<_, anyhow::Error>(answered);
                             }
                             loop {
                                 match rx.recv().await {
-                                    Ok(fr) => {
-                                        if fr.seq <= att.seq && fr.epoch == att.epoch { continue; } // already in catch-up
-                                        let line = pty_frame_line(&head, fr.epoch, fr.seq, &fr.data);
-                                        if tx.send(line).await.is_err() { break; }
-                                    }
+                                    Ok(ev) if filter.matches(&ev.ev) && payload_matches(&ev.payload, p.matching.as_ref()) && visible(scope.as_ref(), &ev) => return Ok(Some(ev)),
+                                    Ok(_) => continue,
+                                    // The answer may be among what was dropped. A stored one is
+                                    // still there to read, rather than sleeping to the timeout (RA-338).
                                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                        tracing::warn!(lagged = n, session = %name, "pty subscriber lagged; frames dropped — client should re-attach from its last seq");
+                                        tracing::warn!(lagged = n, "waiter lagged; events dropped");
+                                        if let Some(id) = exception {
+                                            if let Some(ev) = stored_answer(&engine, id, p.matching.as_ref()).await? {
+                                                return Ok(Some(ev));
+                                            }
+                                        }
                                     }
-                                    Err(_) => break,
+                                    Err(_) => return Ok(None),
                                 }
                             }
-                        }));
+                        });
+                        tokio::pin!(wait);
+                        let waited = loop {
+                            tokio::select! {
+                                waited = &mut wait => break waited,
+                                // A client that leaves mid-wait — a parked agent, a cancelled MCP
+                                // call — ends it, rather than holding this task, its socket and its
+                                // receiver for up to an hour (RA-339). A request sent meanwhile is
+                                // read now and answered after the wait, in order.
+                                next = reader.next(), if pending.is_none() => match next? {
+                                    Some(incoming) => pending = Some(incoming),
+                                    None => break 'conn,
+                                },
+                            }
+                        };
+                        let (event, timed_out) = match waited {
+                            Ok(event) => (event?, false),
+                            Err(_) => (None, true),
+                        };
+                        match serde_json::to_value(WaitOut { event, timed_out }) {
+                            Ok(value) => Response::ok(req.id, value),
+                            Err(e) => Response::err(req.id, BusError::internal(e.to_string())),
+                        }
                     }
-                    Err(e) => {
-                        let _ = out_tx
-                            .send(serde_json::to_string(&Response::err(req.id, e))?)
-                            .await;
-                        continue;
+                },
+            }
+        } else if req.op == relay_bus::ops::bus::Unsubscribe::NAME {
+            match door_preflight(&engine, &req).await? {
+                Err(refused) => refused,
+                Ok(_) => {
+                    if let Some(h) = streams.forwarder.take() {
+                        h.abort();
                     }
+                    Response::ok(req.id, serde_json::to_value(Empty {})?)
                 }
+            }
+        } else if req.op == relay_bus::ops::session::Attach::NAME {
+            // control-plane validation first, then the data plane (BUS.md §7)
+            let req = own_session(req);
+            let parsed = serde_json::from_value::<relay_bus::ops::session::AttachIn>(req.payload.clone()).ok();
+            let (e, r2, name) = (engine.clone(), req.clone(), parsed.as_ref().map(|p| p.session.clone()));
+            // The PTY is found through the store, so on the blocking pool with the dispatch
+            // rather than parking a runtime thread on the store lock (RA-341).
+            let (resp, pty) = tokio::task::spawn_blocking(move || {
+                let resp = e.dispatch(r2, Door::Socket);
+                let pty = match (resp.ok, name) {
+                    (true, Some(name)) => Some(crate::handlers::session::pty_by_name(&e, &name)),
+                    _ => None,
+                };
+                (resp, pty)
+            })
+            .await?;
+            match (pty, parsed) {
+                (Some(Ok((_, pty))), Some(p)) => {
+                    if let Some(h) = streams.attached.remove(&p.session) {
+                        h.abort();
+                    }
+                    let att = pty.attach(p.epoch, p.from_seq);
+                    let tx = out_tx.clone();
+                    let name = p.session.clone();
+                    streams.attached.insert(p.session.clone(), tokio::spawn(async move {
+                        let head = pty_frame_head(&name);
+                        let mut rx = att.rx;
+                        if !att.catch_up.is_empty() {
+                            let line = pty_frame_line(&head, att.epoch, att.seq, &att.catch_up);
+                            if tx.send(line).await.is_err() { return; }
+                        }
+                        loop {
+                            match rx.recv().await {
+                                Ok(fr) => {
+                                    if fr.seq <= att.seq && fr.epoch == att.epoch { continue; } // already in catch-up
+                                    let line = pty_frame_line(&head, fr.epoch, fr.seq, &fr.data);
+                                    if tx.send(line).await.is_err() { break; }
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                    tracing::warn!(lagged = n, session = %name, "pty subscriber lagged; frames dropped — client should re-attach from its last seq");
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    }));
+                }
+                (Some(Err(e)), _) => {
+                    let _ = out_tx
+                        .send(serde_json::to_string(&Response::err(req.id, e))?)
+                        .await;
+                    continue;
+                }
+                _ => {}
             }
             resp
         } else if req.op == relay_bus::ops::session::Detach::NAME {
-            let e = engine.clone();
-            let r2 = req.clone();
-            let resp = tokio::task::spawn_blocking(move || e.dispatch(r2, Door::Socket)).await?;
-            if resp.ok {
-                if let Some(name) = req.payload.get("session").and_then(|v| v.as_str()) {
-                    if let Some(h) = streams.attached.remove(name) {
-                        h.abort();
-                    }
-                    borrowed.release(name);
+            let req = own_session(req);
+            let name = req.payload.get("session").and_then(|v| v.as_str()).map(str::to_string);
+            let resp = dispatch_blocking(&engine, req).await?;
+            if let (true, Some(name)) = (resp.ok, name) {
+                if let Some(h) = streams.attached.remove(&name) {
+                    h.abort();
                 }
+                borrowed.release(&name);
             }
             resp
         } else if req.op == relay_bus::ops::session::Resize::NAME {
@@ -768,18 +1026,14 @@ async fn handle_conn(engine: Arc<Engine>, recent: Arc<Recent>, stream: UnixStrea
             let resp = if engine.answers_from_memory(&req) {
                 engine.dispatch(req, Door::Socket)
             } else {
-                let e = engine.clone();
-                tokio::task::spawn_blocking(move || e.dispatch(req, Door::Socket)).await?
+                dispatch_blocking(&engine, req).await?
             };
             if let (true, Some(p)) = (resp.ok, parsed) {
                 borrowed.resized(&p, prior);
             }
             resp
         } else if req.op == relay_bus::ops::device::MirrorStart::NAME {
-            let e = engine.clone();
-            let request = req.clone();
-            let response =
-                tokio::task::spawn_blocking(move || e.dispatch(request, Door::Socket)).await?;
+            let response = dispatch_blocking(&engine, req).await?;
             if response.ok {
                 if let Some(id) = response
                     .result
@@ -793,38 +1047,32 @@ async fn handle_conn(engine: Arc<Engine>, recent: Arc<Recent>, stream: UnixStrea
                     // stream — the window learns that the device went away from the stream it is
                     // already reading, without subscribing to anything (it used to wait forever).
                     let status_frame = move |status: &crate::device::MirrorStatus| {
-                        serde_json::to_string(&Frame {
-                            v: 1,
-                            stream: "mirror".into(),
-                            session: None,
-                            run_id: None,
-                            mirror_id: Some(id),
-                            epoch: None,
-                            seq: 0,
-                            data: serde_json::to_value(status).unwrap_or_default(),
-                        })
+                        serde_json::to_string(&stream_frame(
+                            "mirror",
+                            None,
+                            Some(id),
+                            0,
+                            serde_json::to_value(status).unwrap_or_default(),
+                        ))
                     };
                     match crate::handlers::device::mirror_by_id(&engine, id) {
                         Ok(runtime) => {
-                            let (cursor, history, mut rx) = runtime.attach();
+                            let mut rx = runtime.attach();
                             let mut status = runtime.watch_status();
                             let tx = out_tx.clone();
                             let task = tokio::spawn(async move {
                                 use base64::Engine as _;
                                 let frame = |item: crate::device::MirrorChunk| {
-                                    serde_json::to_string(&Frame {
-                                        v: 1,
-                                        stream: "mirror".into(),
-                                        session: None,
-                                        run_id: None,
-                                        mirror_id: Some(id),
-                                        epoch: None,
-                                        seq: item.seq,
-                                        data: serde_json::Value::String(
+                                    serde_json::to_string(&stream_frame(
+                                        "mirror",
+                                        None,
+                                        Some(id),
+                                        item.seq,
+                                        serde_json::Value::String(
                                             base64::engine::general_purpose::STANDARD
                                                 .encode(&*item.data),
                                         ),
-                                    })
+                                    ))
                                 };
                                 let first = status.borrow_and_update().clone();
                                 let Ok(line) = status_frame(&first) else { return };
@@ -833,13 +1081,6 @@ async fn handle_conn(engine: Arc<Engine>, recent: Arc<Recent>, stream: UnixStrea
                                 }
                                 if first.state.is_terminal() {
                                     return;
-                                }
-                                for item in history {
-                                    if let Ok(line) = frame(item) {
-                                        if tx.send(line).await.is_err() {
-                                            return;
-                                        }
-                                    }
                                 }
                                 loop {
                                     tokio::select! {
@@ -855,14 +1096,13 @@ async fn handle_conn(engine: Arc<Engine>, recent: Arc<Recent>, stream: UnixStrea
                                             }
                                         }
                                         item = rx.recv() => match item {
-                                            Ok(item) if item.seq > cursor => {
+                                            Ok(item) => {
                                                 if let Ok(line) = frame(item) {
                                                     if tx.send(line).await.is_err() {
                                                         break;
                                                     }
                                                 }
                                             }
-                                            Ok(_) => {}
                                             // A slow window skipped packets. The seq gap tells it so;
                                             // it asks the device for a fresh key frame and resumes —
                                             // no reason to end a mirror over one hiccup.
@@ -905,9 +1145,8 @@ async fn handle_conn(engine: Arc<Engine>, recent: Arc<Recent>, stream: UnixStrea
         } else if req.op == relay_bus::ops::device::RunOp::NAME
             || req.op == relay_bus::ops::device::Build::NAME
         {
-            let e = engine.clone();
-            let r2 = req.clone();
-            let resp = tokio::task::spawn_blocking(move || e.dispatch(r2, Door::Socket)).await?;
+            let req_id = req.id;
+            let resp = dispatch_blocking(&engine, req).await?;
             if resp.ok {
                 if let Some(id) = resp
                     .result
@@ -923,18 +1162,17 @@ async fn handle_conn(engine: Arc<Engine>, recent: Arc<Recent>, stream: UnixStrea
                             let (cursor, history, mut rx) = runtime.attach();
                             let tx = out_tx.clone();
                             streams.runs.insert(id, tokio::spawn(async move {
+                                let frame = |item: &crate::device::LogLine| {
+                                    serde_json::to_string(&stream_frame(
+                                        "logcat",
+                                        Some(id),
+                                        None,
+                                        item.seq,
+                                        serde_json::Value::String((*item.line).clone()),
+                                    ))
+                                };
                                 for item in history {
-                                    let frame = Frame {
-                                        v: 1,
-                                        stream: "logcat".into(),
-                                        session: None,
-                                        run_id: Some(id),
-                                        mirror_id: None,
-                                        epoch: None,
-                                        seq: item.seq,
-                                        data: serde_json::Value::String((*item.line).clone()),
-                                    };
-                                    if let Ok(line) = serde_json::to_string(&frame) {
+                                    if let Ok(line) = frame(&item) {
                                         if tx.send(line).await.is_err() {
                                             return;
                                         }
@@ -943,17 +1181,7 @@ async fn handle_conn(engine: Arc<Engine>, recent: Arc<Recent>, stream: UnixStrea
                                 loop {
                                     match rx.recv().await {
                                         Ok(item) if item.seq > cursor => {
-                                            let frame = Frame {
-                                                v: 1,
-                                                stream: "logcat".into(),
-                                                session: None,
-                                                run_id: Some(id),
-                                                mirror_id: None,
-                                                epoch: None,
-                                                seq: item.seq,
-                                                data: serde_json::Value::String((*item.line).clone()),
-                                            };
-                                            if let Ok(line) = serde_json::to_string(&frame) {
+                                            if let Ok(line) = frame(&item) {
                                                 if tx.send(line).await.is_err() {
                                                     break;
                                                 }
@@ -970,7 +1198,7 @@ async fn handle_conn(engine: Arc<Engine>, recent: Arc<Recent>, stream: UnixStrea
                         }
                         Err(error) => {
                             let _ = out_tx
-                                .send(serde_json::to_string(&Response::err(req.id, error))?)
+                                .send(serde_json::to_string(&Response::err(req_id, error))?)
                                 .await;
                             continue;
                         }
@@ -980,8 +1208,7 @@ async fn handle_conn(engine: Arc<Engine>, recent: Arc<Recent>, stream: UnixStrea
             resp
         } else if req.op == relay_bus::ops::device::RunStop::NAME {
             let run_id = req.payload.get("run_id").and_then(|value| value.as_i64());
-            let e = engine.clone();
-            let resp = tokio::task::spawn_blocking(move || e.dispatch(req, Door::Socket)).await?;
+            let resp = dispatch_blocking(&engine, req).await?;
             if resp.ok {
                 if let Some(id) = run_id {
                     if let Some(task) = streams.runs.remove(&id) {
@@ -996,8 +1223,7 @@ async fn handle_conn(engine: Arc<Engine>, recent: Arc<Recent>, stream: UnixStrea
             // blocking pool and back for a map lookup and a write.
             engine.dispatch(req, Door::Socket)
         } else {
-            let e = engine.clone();
-            tokio::task::spawn_blocking(move || e.dispatch(req, Door::Socket)).await?
+            dispatch_blocking(&engine, req).await?
         };
         recent.refused(arrival, &resp);
         let _ = out_tx.send(serde_json::to_string(&resp)?).await;
@@ -1010,6 +1236,13 @@ async fn handle_conn(engine: Arc<Engine>, recent: Arc<Recent>, stream: UnixStrea
     drop(out_tx);
     let _ = writer.await;
     Ok(())
+}
+
+/// A stored answer to the exception request a `bus.wait` is waiting on, if it matches.
+async fn stored_answer(engine: &Arc<Engine>, id: relay_bus::types::Id, matching: Option<&serde_json::Value>) -> Result<Option<Event>> {
+    let e = engine.clone();
+    let event = tokio::task::spawn_blocking(move || crate::guardrail::grants::resolved_event(&e.store.lock(), id)).await?;
+    Ok(event.filter(|ev| payload_matches(&ev.payload, matching)))
 }
 
 /// A tiny client for tests and the CLI: one connection, request/response by line.
@@ -1279,29 +1512,204 @@ mod conn_tests {
         (engine, fixture, server)
     }
 
+    /// Two projects with one live agent each: `ghost` (token `tok-ghost`) in 1, `bystander`
+    /// (token `tok-bystander`) in 2.
+    fn agents(engine: &Engine) {
+        engine.store.lock().execute_batch(
+            "INSERT INTO workspaces(id, path, name, created_at, updated_at) VALUES (1, '/ws', 'ws', 'now', 'now');
+             INSERT INTO projects(id, workspace_id, path, name, created_at, updated_at) VALUES
+               (1, 1, '/ws/one', 'one', 'now', 'now'), (2, 1, '/ws/two', 'two', 'now', 'now');
+             INSERT INTO sessions(name, project_id, provider, role, state, token, created_at, updated_at) VALUES
+               ('ghost', 1, 'claude', 'builder', 'running', 'tok-ghost', 'now', 'now'),
+               ('bystander', 2, 'claude', 'builder', 'running', 'tok-bystander', 'now', 'now');",
+        ).unwrap();
+    }
+
+    fn agent(name: &str, op: &str, payload: serde_json::Value) -> Request {
+        Request::new(Actor::agent(name), op, payload).with_token(format!("tok-{name}"))
+    }
+
+    async fn wait_as(client: &mut Client, req: Request) -> serde_json::Value {
+        let resp = client.call(&req, |_| {}).await.unwrap();
+        assert!(resp.ok, "{:?}", resp.error);
+        resp.result.unwrap()
+    }
+
     async fn wait(client: &mut Client, actor: Actor) -> serde_json::Value {
-        let wait = Request::new(actor, "bus.wait", json!({"events": ["device.lease.released"], "timeout_ms": 1000}));
-        client.call(&wait, |_| {}).await.unwrap().result.unwrap()
+        let payload = json!({"events": ["device.lease.released"], "timeout_ms": 1000});
+        let req = match &actor {
+            Actor::Agent(name) => agent(name, "bus.wait", payload),
+            _ => Request::new(actor, "bus.wait", payload),
+        };
+        wait_as(client, req).await
     }
 
     /// RA-127: a release between the refusal and the wait is still the agent's to wake on.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_wait_after_a_refusal_sees_what_fired_in_between() {
         let (engine, _fixture, server) = server().await;
-        let mut agent = Client::connect(&server.path).await.unwrap();
+        agents(&engine);
+        let mut agent_conn = Client::connect(&server.path).await.unwrap();
         engine.emit_system("device.lease.released", json!({"device": "before"}));
-        let refused = agent.call(&Request::new(Actor::agent("ghost"), "session.get", json!({"session": "nope"})), |_| {}).await.unwrap();
+        let refused = agent_conn.call(&agent("ghost", "session.get", json!({"session": "nope"})), |_| {}).await.unwrap();
         assert!(!refused.ok);
         engine.emit_system("device.lease.released", json!({"device": "between"}));
-        let woken = wait(&mut agent, Actor::agent("ghost")).await;
+        let woken = wait(&mut agent_conn, Actor::agent("ghost")).await;
         assert_eq!(woken["timed_out"], false, "{woken}");
         assert_eq!(woken["event"]["payload"]["device"], "between", "only what fired after the refusal: {woken}");
         // The mark is spent: the next wait waits for a new event.
-        assert_eq!(wait(&mut agent, Actor::agent("ghost")).await["timed_out"], true);
+        assert_eq!(wait(&mut agent_conn, Actor::agent("ghost")).await["timed_out"], true);
         // Nobody else is handed history.
         let mut other = Client::connect(&server.path).await.unwrap();
         assert_eq!(wait(&mut other, Actor::agent("bystander")).await["timed_out"], true);
         assert_eq!(wait(&mut other, Actor::User).await["timed_out"], true);
+    }
+
+    /// RA-336: the ops the door answers itself are refused exactly as the pipeline refuses.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn door_answered_ops_check_the_envelope_and_the_actor() {
+        let (engine, _fixture, server) = server().await;
+        agents(&engine);
+        let mut client = Client::connect(&server.path).await.unwrap();
+        for op in ["bus.subscribe", "bus.wait", "bus.unsubscribe"] {
+            let code = |resp: Response| resp.error.map(|e| e.code).unwrap_or_default();
+            let system = client.call(&Request::new(Actor::System, op, json!({})), |_| {}).await.unwrap();
+            assert_eq!(code(system), "bus.actor", "{op} as system");
+            let tokenless = client.call(&Request::new(Actor::agent("ghost"), op, json!({})), |_| {}).await.unwrap();
+            assert_eq!(code(tokenless), "bus.actor", "{op} without a token");
+            let forged = Request::new(Actor::agent("ghost"), op, json!({})).with_token("tok-bystander");
+            assert_eq!(code(client.call(&forged, |_| {}).await.unwrap()), "bus.actor", "{op} with another's token");
+            let mut old = Request::new(Actor::User, op, json!({}));
+            old.v = 0;
+            assert_eq!(code(client.call(&old, |_| {}).await.unwrap()), "bus.envelope", "{op} at v0");
+            let bogus = client.call(&Request::new(Actor::User, op, json!({"bogus": 1})), |_| {}).await.unwrap();
+            assert_eq!(code(bogus), "bus.schema", "{op} with a stray field");
+        }
+        let subscribed = client.call(&agent("ghost", "bus.subscribe", json!({})), |_| {}).await.unwrap();
+        assert!(subscribed.ok, "{:?}", subscribed.error);
+    }
+
+    /// RA-337: an agent hears its own project, shared devices, and only its own mail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_agent_is_handed_only_its_own_projects_events_and_mail() {
+        let (engine, _fixture, server) = server().await;
+        agents(&engine);
+        let mut sub = Client::connect(&server.path).await.unwrap();
+        assert!(sub.call(&agent("ghost", "bus.subscribe", json!({})), |_| {}).await.unwrap().ok);
+        let mut user = Client::connect(&server.path).await.unwrap();
+        assert!(user.call(&Request::new(Actor::User, "bus.subscribe", json!({})), |_| {}).await.unwrap().ok);
+        // Tagged through the payload, as session.changed and the hints are.
+        let emit = |ev: &str, project: Option<i64>, mut payload: serde_json::Value| {
+            if let Some(project) = project {
+                payload["project_id"] = json!(project);
+            }
+            engine.emit_system(ev, payload);
+        };
+        emit("task.changed", Some(2), json!({"id": 1, "mark": "theirs"}));
+        emit("session.changed", Some(2), json!({"mark": "their session"}));
+        emit("mailbox.new", Some(1), json!({"from": "user", "to": "someone-else", "mark": "not mine"}));
+        emit("device.lease.released", Some(2), json!({"device": "phone", "mark": "shared device"}));
+        emit("mailbox.new", Some(1), json!({"from": "user", "to": "ghost", "mark": "to me"}));
+        emit("mailbox.new", Some(1), json!({"from": "someone-else", "to": "*", "mark": "broadcast"}));
+        emit("task.changed", Some(1), json!({"id": 2, "mark": "mine"}));
+        emit("settings.changed", None, json!({"mark": "global"}));
+        async fn marks(client: &mut Client, count: usize) -> Vec<String> {
+            let mut seen = Vec::new();
+            while seen.len() < count {
+                if let Line::Event(ev) = tokio::time::timeout(Duration::from_secs(2), client.next()).await.unwrap().unwrap().unwrap() {
+                    seen.push(ev.payload["mark"].as_str().unwrap().to_string());
+                }
+            }
+            seen
+        }
+        assert_eq!(marks(&mut sub, 5).await, ["shared device", "to me", "broadcast", "mine", "global"]);
+        assert_eq!(marks(&mut user, 8).await.len(), 8, "the user hears everything");
+        // A waiter is scoped the same way: another project's event does not wake it.
+        let mut waiter = Client::connect(&server.path).await.unwrap();
+        let wake = agent("ghost", "bus.wait", json!({"events": ["task.changed"], "timeout_ms": 5000}));
+        let waited = tokio::spawn(async move { wait_as(&mut waiter, wake).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        emit("task.changed", Some(2), json!({"mark": "theirs"}));
+        emit("task.changed", Some(1), json!({"mark": "mine"}));
+        let woken = tokio::time::timeout(Duration::from_secs(5), waited).await.unwrap().unwrap();
+        assert_eq!(woken["event"]["payload"]["mark"], "mine", "{woken}");
+    }
+
+    /// RA-338: a subscriber that fell behind is told so, rather than left with a stale picture.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lagging_subscriber_is_told_it_missed_events() {
+        let (engine, _fixture, server) = server().await;
+        let mut sub = Client::connect(&server.path).await.unwrap();
+        assert!(sub.call(&Request::new(Actor::User, "bus.subscribe", json!({})), |_| {}).await.unwrap().ok);
+        // Far more than the broadcast, the connection's queue and the socket buffer hold together.
+        let filler = "x".repeat(512);
+        for n in 0..40_000 {
+            engine.emit_system("settings.changed", json!({"n": n, "filler": filler}));
+        }
+        let lagged = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let Some(Line::Event(ev)) = sub.next().await.unwrap() {
+                    if ev.ev == "bus.lagged" {
+                        return ev.payload["dropped"].as_u64().unwrap();
+                    }
+                }
+            }
+        })
+        .await
+        .expect("no bus.lagged after dropping events");
+        assert!(lagged > 0);
+    }
+
+    /// RA-339: a request sent while a wait is in progress is read, and answered after it; RA-335:
+    /// a line past the ceiling is refused and the connection carries on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_door_keeps_reading_during_a_wait_and_refuses_an_endless_line() {
+        let (_engine, _fixture, server) = server().await;
+        let mut client = Client::connect(&server.path).await.unwrap();
+        let wait = Request::new(Actor::User, "bus.wait", json!({"events": ["nothing.happens"], "timeout_ms": 1000}));
+        let ping = Request::new(Actor::User, "bus.ping", json!({}));
+        client.send_raw(&serde_json::to_string(&wait).unwrap()).await.unwrap();
+        client.send_raw(&serde_json::to_string(&ping).unwrap()).await.unwrap();
+        let mut order = Vec::new();
+        while order.len() < 2 {
+            if let Some(Line::Response(r)) = client.next().await.unwrap() {
+                order.push(r.id.unwrap());
+            }
+        }
+        assert_eq!(order, [wait.id, ping.id]);
+
+        let huge = vec![b'x'; MAX_LINE_BYTES + 1];
+        client.w.write_all(&huge).await.unwrap();
+        client.w.write_all(b"\n").await.unwrap();
+        match client.next().await.unwrap().unwrap() {
+            Line::Response(r) => assert_eq!(r.error.unwrap().code, "bus.too_large"),
+            _ => panic!("expected a response"),
+        }
+        let r = client.call(&Request::new(Actor::User, "bus.ping", json!({})), |_| {}).await.unwrap();
+        assert!(r.ok, "the connection survives an over-long line");
+    }
+
+    /// RA-333: once quitting, the door takes nothing new; closing it ends its connections.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quitting_refuses_requests_and_closing_the_door_ends_connections() {
+        let (engine, _fixture, server) = server().await;
+        let mut client = Client::connect(&server.path).await.unwrap();
+        assert!(client.call(&Request::new(Actor::User, "bus.subscribe", json!({})), |_| {}).await.unwrap().ok);
+        engine.request_quit();
+        let r = client.call(&Request::new(Actor::User, "bus.ping", json!({})), |_| {}).await.unwrap();
+        assert_eq!(r.error.unwrap().code, "app.quitting");
+        drop(server);
+        let ended = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                engine.emit_system("settings.changed", json!({}));
+                match client.next().await {
+                    Ok(Some(_)) => tokio::time::sleep(Duration::from_millis(20)).await,
+                    _ => return,
+                }
+            }
+        })
+        .await;
+        assert!(ended.is_ok(), "a connection outlived the door");
     }
 
     /// RA-126: a connection that ends on an error stops streaming to its socket.

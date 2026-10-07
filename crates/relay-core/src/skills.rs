@@ -262,7 +262,14 @@ pub fn plan_user(conn: &Connection, instance: crate::Instance) -> Result<Plan> {
 /// that are no longer enabled are removed, and results inside a checkout stay out of
 /// `git status`. Best-effort per skill — one unwritable folder never costs the caller its
 /// session.
+///
+/// One apply at a time, process-wide. A launch, a [`refresh_all`] pass and a new project's
+/// first fill can run at once, and they rewrite the same machine-wide folders (remove, then
+/// copy) and read-modify-write one repository's `info/exclude`; interleaved, one's removal lands
+/// in the middle of the other's copy. The lock is a leaf: nothing is taken under it.
 pub fn apply(plan: &Plan, store: &crate::Store) -> Result<()> {
+    static APPLYING: Mutex<()> = Mutex::new(());
+    let _applying = APPLYING.lock().unwrap_or_else(PoisonError::into_inner);
     let owner = owner_line(store);
     let mut written: Vec<String> = Vec::new();
     for (base, plugins) in &plan.bases {
@@ -286,17 +293,6 @@ pub fn apply(plan: &Plan, store: &crate::Store) -> Result<()> {
         crate::worktree::exclude_paths(repo, &entries)?;
     }
     Ok(())
-}
-
-/// Plan and apply in one step, for callers already holding the transaction that launched.
-pub fn materialize(conn: &Connection, store: &crate::Store, root: &Path, project_id: Id) -> Result<()> {
-    apply(&plan(conn, root, project_id)?, store)
-}
-
-/// The same for the machine-wide folders, so a launching session finds its skills registered
-/// with whichever provider it is.
-pub fn materialize_user(conn: &Connection, store: &crate::Store, instance: crate::Instance) -> Result<()> {
-    apply(&plan_user(conn, instance)?, store)
 }
 
 /// Serializes [`refresh_all`] for one engine and folds a burst of requests into one pass.
@@ -469,19 +465,17 @@ mod tests {
         fs::create_dir_all(&hand_written).unwrap();
         fs::write(hand_written.join("SKILL.md"), "mine").unwrap();
 
-        {
-            let conn = store.lock();
-            materialize_user(&conn, &store, crate::Instance::Test).unwrap();
-        }
+        // Planned under the lock, copied after it is released (D147).
+        let plan = plan_user(&store.lock(), crate::Instance::Test).unwrap();
+        apply(&plan, &store).unwrap();
         for base in &bases {
             assert_eq!(fs::read_to_string(base.join("impeccable/SKILL.md")).unwrap(), "design well");
         }
         // Switching it off in the only project that had it takes it out of the shared homes.
         store.with_tx(|tx| { tx.execute("DELETE FROM skill_projects", [])?; Ok(()) }).unwrap();
-        {
-            let conn = store.lock();
-            materialize_user(&conn, &store, crate::Instance::Test).unwrap();
-        }
+        // Planned under the lock, copied after it is released (D147).
+        let plan = plan_user(&store.lock(), crate::Instance::Test).unwrap();
+        apply(&plan, &store).unwrap();
         assert!(!bases[1].join("impeccable").exists(), "a disabled skill stayed in the codex home");
         assert_eq!(
             fs::read_to_string(hand_written.join("SKILL.md")).unwrap(),

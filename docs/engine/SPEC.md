@@ -32,7 +32,8 @@ One binary, agent-native, Linux-first. Clean-slate rewrite; v3 data imported.
   every column that appears in a WHERE. WAL mode.
 - **notify** — inotify watchers per worktree; git panel and file tree refresh
   on events. NO polling timers anywhere in v4. A 60s "trust but verify"
-  reconcile pass is the only clock-driven work in the app.
+  reconcile pass and the 20-minute merged-branch sweep (`git.branch.cleanup`,
+  BUS.md §10.12) are the only clock-driven work in the app.
 - **serde + schemars** — bus message types with generated JSON schema.
 
 ## Build & Release
@@ -350,7 +351,8 @@ provider-neutral snapshot is written to `.relay/sessions/<session>/session-brief
   - Webview reload: Rust alive → PTYs survive → reattach listeners,
     scrollback intact, nothing lost.
   - App restart / crash / hard-lock: PTYs dead → resume flow (§10);
-    scrollback restored from disk buffers flushed on interval.
+    scrollback restored from the last park or graceful-shutdown snapshot; a
+    crash loses output since then (nothing flushes on an interval).
 - **Crash recovery on launch:** reap orphaned claude/codex processes,
   fsck sessions table against live PIDs, flag worktrees with uncommitted
   changes, offer reset for tasks stuck in active, log what it did.

@@ -5,12 +5,10 @@ use relay_bus::types::Provider;
 use relay_bus::BusError;
 use rusqlite::params;
 use serde_json::json;
-use std::io::Read;
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
 
 fn installation(provider: Provider, path: &Path, home: &Path) -> Option<&'static str> {
     match provider {
@@ -40,8 +38,10 @@ pub(crate) fn register(engine: &mut Engine) {
         if home.as_os_str().is_empty() || method.is_none() || path.metadata().map(|m| m.uid()).ok() != Some(unsafe { libc::geteuid() }) {
             return Ok(UpdateOut { started: false, method: "managed_or_unknown".into(), message: "Update this installation with its package manager or installer. Relay only self-updates known user-owned native installations.".into() });
         }
+        // A row with a pid has a process on the binary. Nothing marks a launch that is still
+        // being prepared (no row is ever `spawning`, RA-622), so that short window is not seen.
         let active: bool = ctx.tx().query_row(
-            "SELECT EXISTS(SELECT 1 FROM sessions WHERE provider=?1 AND (pid IS NOT NULL OR state='spawning') AND state NOT IN ('closed','exited'))",
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE provider=?1 AND pid IS NOT NULL AND state NOT IN ('closed','exited'))",
             [name], |row| row.get(0),
         ).bus()?;
         if active {
@@ -80,66 +80,22 @@ pub(crate) fn register(engine: &mut Engine) {
     });
 }
 
-fn drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
-    std::thread::spawn(move || {
-        let mut saved = Vec::new();
-        let mut bytes = [0; 4096];
-        while let Ok(count) = pipe.read(&mut bytes) {
-            if count == 0 {
-                break;
-            }
-            let keep = count.min(65536usize.saturating_sub(saved.len()));
-            saved.extend_from_slice(&bytes[..keep]);
-        }
-        saved
-    })
-}
-
+/// Run `<path> update` through the shared bounded runner (SIGTERM then SIGKILL of the whole
+/// group at the deadline, drains that never outwait it) and keep only the message shaping here.
+/// The message is the outcome line: stdout's last on success, stderr's on failure, since an
+/// updater's progress and its errors go to stderr while its result goes to stdout (RA-327).
 fn run(path: &Path, timeout: Duration) -> Result<String, String> {
-    let mut child = Command::new(path)
-        .arg("update")
-        .process_group(0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Could not start update: {e}"))?;
-    let group = child.id() as i32;
-    let stdout = drain(child.stdout.take().unwrap());
-    let stderr = drain(child.stderr.take().unwrap());
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            Ok(None) => {
-                break Err(
-                    "Update timed out. Check the provider version before retrying.".to_string(),
-                )
-            }
-            Err(e) => break Err(format!("Could not read update status: {e}")),
-        }
+    let output = crate::proc::output_with_timeout(Command::new(path).arg("update"), timeout)
+        .map_err(|e| format!("Could not start update: {e}"))?
+        .ok_or_else(|| "Update timed out. Check the provider version before retrying.".to_string())?;
+    let last = |bytes: &[u8]| {
+        String::from_utf8_lossy(bytes).lines().rev().map(str::trim).find(|line| !line.is_empty())
+            .map(|line| line.chars().take(1000).collect::<String>())
     };
-    // Self-updaters may spawn helpers inheriting output pipes. Close the whole group before
-    // joining readers so neither a timeout nor a completed launcher can leave an orphan.
-    unsafe {
-        libc::kill(-group, libc::SIGKILL);
-    }
-    let _ = child.wait();
-    let mut output = stdout.join().unwrap_or_default();
-    output.extend(stderr.join().unwrap_or_default());
-    let output = String::from_utf8_lossy(&output);
-    let message = output
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or("Update command completed.")
-        .chars()
-        .take(1000)
-        .collect::<String>();
-    if status?.success() {
-        Ok(message)
+    if output.status.success() {
+        Ok(last(&output.stdout).or_else(|| last(&output.stderr)).unwrap_or_else(|| "Update command completed.".into()))
     } else {
+        let message = last(&output.stderr).or_else(|| last(&output.stdout)).unwrap_or_else(|| output.status.to_string());
         Err(format!("Update failed: {message}"))
     }
 }
@@ -148,6 +104,7 @@ fn run(path: &Path, timeout: Duration) -> Result<String, String> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::time::Instant;
     fn script(root: &Path, body: &str) -> PathBuf {
         let path = root.join("provider");
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
@@ -194,6 +151,11 @@ mod tests {
         assert!(run(&path, Duration::from_secs(2))
             .unwrap_err()
             .contains("download-failed"));
+        // Progress on stderr does not stand in for the outcome on stdout, nor the reverse.
+        script(root.path(), "echo 'Updated to 2.0'\necho 'downloading 100%' >&2");
+        assert_eq!(run(&path, Duration::from_secs(2)).unwrap(), "Updated to 2.0");
+        script(root.path(), "echo 'checking' \necho 'no space left' >&2\necho 'cleaning up'\nexit 1");
+        assert_eq!(run(&path, Duration::from_secs(2)).unwrap_err(), "Update failed: no space left");
     }
     #[test]
     fn updater_kills_a_hung_process_group_and_bounds_output() {

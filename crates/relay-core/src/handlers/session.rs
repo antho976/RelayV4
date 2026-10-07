@@ -26,21 +26,67 @@ fn done_link(s: &Session) -> String {
     }
 }
 
-fn next_queued_task(
+/// The session's first open, active queued task other than `except`, with its module. The one
+/// "what is next" query: group advance and task dispatch both pick from it (RA-645).
+pub(crate) fn next_queued_task(
     conn: &Connection,
     session_id: Id,
-    completed_task_id: Id,
+    except: Option<Id>,
 ) -> Result<Option<(Id, Option<Id>)>, BusError> {
-    conn.query_row(
+    conn.prepare_cached(
         "SELECT t.id,t.module_id
          FROM task_sessions ts JOIN tasks t ON t.id=ts.task_id
-         WHERE ts.session_id=?1 AND t.id!=?2 AND t.deleted_at IS NULL AND t.col='active' AND ts.completed_at IS NULL
+         WHERE ts.session_id=?1 AND (?2 IS NULL OR t.id!=?2) AND t.deleted_at IS NULL AND t.col='active' AND ts.completed_at IS NULL
          ORDER BY ts.queue_ord,t.position,t.id LIMIT 1",
-        params![session_id, completed_task_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )
+    ).bus()?
+    .query_row(params![session_id, except], |row| Ok((row.get(0)?, row.get(1)?)))
     .optional()
     .bus()
+}
+
+/// Queue `task_id` at the end of each session's queue, after the task's existing assignees.
+/// Already queued is a no-op. Every attach path — create, update, task dispatch — goes through
+/// here for the whole review group, so members' queues cannot diverge (RA-645).
+pub(crate) fn enqueue(conn: &Connection, task_id: Id, session_ids: &[Id]) -> Result<(), BusError> {
+    for &session_id in session_ids {
+        conn.prepare_cached(
+            "INSERT OR IGNORE INTO task_sessions(task_id,session_id,ord,queue_ord) VALUES (?1,?2,
+               (SELECT COALESCE(MAX(ord),-1)+1 FROM task_sessions WHERE task_id=?1),
+               (SELECT COALESCE(MAX(queue_ord),-1)+1 FROM task_sessions WHERE session_id=?2))",
+        ).bus()?
+        .execute(params![task_id, session_id]).bus()?;
+    }
+    Ok(())
+}
+
+/// The running PTY of a session, or the typed refusal the input fallbacks give for one that
+/// does not exist, was never spawned, or has exited. One short read; the PTY itself is memory.
+fn live_pty(ctx: &crate::engine::Unlocked, name: &str) -> Result<(Id, Arc<Pty>), BusError> {
+    let id = ctx.read(|conn| Ok(sessions::by_name(conn, name)?.session.id))?;
+    let pty = ctx.engine().pty(id)
+        .ok_or_else(|| BusError::conflict("session.not_spawned", format!("session {name} has no PTY")))?;
+    if pty.exited() { return Err(BusError::conflict("session.exited", format!("session {name} has exited"))); }
+    Ok((id, pty))
+}
+
+/// The session's review group, by id.
+fn group_ids(conn: &Connection, session: &Session) -> Result<Vec<Id>, BusError> {
+    Ok(sessions::review_group(conn, session)?.into_iter().map(|(id, _)| id).collect())
+}
+
+/// Refuse a task or module that is not a live record of `project_id`.
+fn check_task_module(conn: &Connection, project_id: Id, task_id: Option<Id>, module_id: Option<Id>) -> Result<(), BusError> {
+    if let Some(task_id) = task_id {
+        let valid: bool = conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1 AND project_id=?2 AND deleted_at IS NULL)").bus()?
+            .query_row(params![task_id, project_id], |row| row.get(0)).bus()?;
+        if !valid { return Err(BusError::not_found("task.not_found", format!("no task {task_id} in project {project_id}"))); }
+    }
+    if let Some(module_id) = module_id {
+        let valid: bool = conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM modules WHERE id=?1 AND project_id=?2 AND deleted_at IS NULL)").bus()?
+            .query_row(params![module_id, project_id], |row| row.get(0)).bus()?;
+        if !valid { return Err(BusError::not_found("module.not_found", format!("no module {module_id} in project {project_id}"))); }
+    }
+    Ok(())
 }
 
 fn assignment_text(task_id: Id, review: bool) -> String {
@@ -136,7 +182,7 @@ fn complete_group_assignment(ctx: &mut Ctx, session: &Session, task_id: Id, sha:
         }
     }
     if left(Role::Reviewer) != 0 && !deleted { return Ok(()); }
-    let next = next_queued_task(ctx.tx(),session.id,task_id)?;
+    let next = next_queued_task(ctx.tx(),session.id,Some(task_id))?;
     for id in ids {
         let changed = ctx.tx().execute("UPDATE sessions SET task_id=?1,module_id=?2,updated_at=?3 WHERE id=?4 AND task_id=?5",params![next.map(|v|v.0),next.and_then(|v|v.1),ctx.now,id,task_id]).bus()?;
         if changed > 0 {
@@ -347,6 +393,14 @@ fn notify_completion(ctx: &mut Ctx, s: &Session, summary: &str) -> Result<(), Bu
 enum LaunchKind {
     Fresh,
     Resume,
+}
+
+/// A repository that tracks `.codex/hooks.json` is the person's to fix, not an engine fault.
+fn codex_hooks_error(error: anyhow::Error) -> BusError {
+    match error.downcast_ref::<crate::hooks::CodexHooksTracked>() {
+        Some(tracked) => BusError::conflict("session.codex_hooks_tracked", tracked.to_string()),
+        None => crate::engine::internal(error),
+    }
 }
 
 /// Write one of Relay's launch files into a worktree the agent can write to. A symlink the
@@ -654,8 +708,11 @@ fn prepare_launch(engine: &Engine, plan: LaunchPlan) -> Result<PreparedLaunch, B
         crate::hooks::install_claude(&cwd, instance, &relay_bin).bus()?;
         crate::hooks::add_claude_mcp_servers(&cwd, &plugin_servers).bus()?;
     } else if row.session.provider == Provider::Codex {
-        crate::hooks::install_codex(&cwd, instance, &relay_bin).bus()?;
+        crate::hooks::install_codex(&cwd, instance, &relay_bin).map_err(codex_hooks_error)?;
     }
+    // Skill folders have their own lock (`skills::apply`); copying them under this one held up
+    // every other launch, create, close and bus commit for as long as the copy took (RA-322).
+    drop(writes);
     // Every enabled skill becomes a real provider skill folder in this worktree, whatever
     // project it belongs to (D147); Codex reads skills only from its own home, so the machine
     // folders are refreshed too. A skill folder that cannot be written is never worth failing
@@ -730,7 +787,6 @@ fn prepare_launch(engine: &Engine, plan: LaunchPlan) -> Result<PreparedLaunch, B
         }
         args.extend(["--add-dir".into(), root.display().to_string()]);
     }
-    drop(writes);
     let spec = SpawnSpec {
         cmd: cmd.display().to_string(),
         args,
@@ -858,7 +914,10 @@ fn finish_launch(ctx: &mut Ctx, prepared: PreparedLaunch) -> Result<Session, Bus
         if exited.unwrap_or(false) {
             crate::handlers::device_lease::release_session(&engine, sid);
         }
-    }).map_err(|error| BusError::unavailable("session.spawn_failed", error.to_string()))?;
+    }).map_err(|error| match error.downcast_ref::<crate::pty::CwdMissing>() {
+        Some(gone) => BusError::conflict("session.worktree_missing", gone.to_string()),
+        None => BusError::unavailable("session.spawn_failed", error.to_string()),
+    })?;
     ctx.tx().execute(
         "UPDATE sessions SET state='running',pid=?1,epoch=?2,spawned_at=COALESCE(spawned_at,?3),
          exit_code=NULL,restore_reason=NULL,done_pending_stop=NULL,updated_at=?3 WHERE id=?4",
@@ -924,20 +983,7 @@ fn check_update(conn: &Connection, before: &Row_, p: &UpdateIn) -> Result<Update
     crate::providers::validate_options(s.provider, model.as_deref(), effort.as_deref())?;
     let task_id = p.task_id.unwrap_or(s.task_id);
     let module_id = p.module_id.unwrap_or(s.module_id);
-    if let Some(task_id) = task_id {
-        let valid: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1 AND project_id=?2 AND deleted_at IS NULL)",
-            params![task_id, s.project_id], |row| row.get(0),
-        ).bus()?;
-        if !valid { return Err(BusError::not_found("task.not_found", format!("no task {task_id} in project {}", s.project_id))); }
-    }
-    if let Some(module_id) = module_id {
-        let valid: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM modules WHERE id=?1 AND project_id=?2 AND deleted_at IS NULL)",
-            params![module_id, s.project_id], |row| row.get(0),
-        ).bus()?;
-        if !valid { return Err(BusError::not_found("module.not_found", format!("no module {module_id} in project {}", s.project_id))); }
-    }
+    check_task_module(conn, s.project_id, task_id, module_id)?;
     Ok((model, effort, task_id, module_id))
 }
 
@@ -976,20 +1022,7 @@ impl Drop for PreparedCreate {
 fn validate_create(conn: &Connection, p: &CreateIn) -> Result<relay_bus::types::Project, BusError> {
     let project = crate::handlers::workspace::get_project(conn, p.project_id)?;
     crate::providers::validate_options(p.provider, p.model.as_deref(), p.effort.as_deref())?;
-    if let Some(task_id) = p.task_id {
-        let valid: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1 AND project_id=?2 AND deleted_at IS NULL)",
-            params![task_id, project.id], |row| row.get(0),
-        ).bus()?;
-        if !valid { return Err(BusError::not_found("task.not_found", format!("no task {task_id} in project {}", project.id))); }
-    }
-    if let Some(module_id) = p.module_id {
-        let valid: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM modules WHERE id=?1 AND project_id=?2 AND deleted_at IS NULL)",
-            params![module_id, project.id], |row| row.get(0),
-        ).bus()?;
-        if !valid { return Err(BusError::not_found("module.not_found", format!("no module {module_id} in project {}", project.id))); }
-    }
+    check_task_module(conn, project.id, p.task_id, p.module_id)?;
     Ok(project)
 }
 
@@ -1056,12 +1089,11 @@ fn finish_create(ctx: &mut Ctx, p: &CreateIn, prepared: &mut PreparedCreate) -> 
         ).bus()?;
         }
     }
-    if let Some(task_id) = p.task_id {
-        let ord: i64 = ctx.tx().query_row("SELECT COALESCE(MAX(ord), -1) + 1 FROM task_sessions WHERE task_id = ?1", [task_id], |r| r.get(0)).bus()?;
-        let queue_ord: i64 = ctx.tx().query_row("SELECT COALESCE(MAX(queue_ord), -1) + 1 FROM task_sessions WHERE session_id = ?1", [id], |r| r.get(0)).bus()?;
-        ctx.tx().execute("INSERT OR IGNORE INTO task_sessions(task_id, session_id, ord, queue_ord) VALUES (?1, ?2, ?3, ?4)", params![task_id, id, ord, queue_ord]).bus()?;
-    }
     let row = sessions::by_id(ctx.tx(), id)?.ok_or_else(|| BusError::internal("session vanished"))?;
+    if let Some(task_id) = p.task_id {
+        // A session joining a pair queues its task for the whole group, as dispatch does.
+        enqueue(ctx.tx(), task_id, &group_ids(ctx.tx(), &row.session)?)?;
+    }
     emit_session(ctx, &row.session);
     ctx.emit("worktree.changed", json!({ "project_id": project.id }));
     Ok(row.session)
@@ -1116,18 +1148,13 @@ pub fn register(e: &mut Engine) {
                 (primary.path.clone(), primary.branch.clone())
             }
             "new" => {
-                super::git::refresh_new_worktree(&repo, p.branch.as_deref())?;
                 let branch = match p.branch.clone() {
                     Some(branch) => branch,
                     None => own_branch(&repo, &prepared.name)?,
                 };
                 let path = worktree::pooled_path(&repo, &prepared.name);
-                let from = if super::git::existing_worktree_branch(&repo, Some(&branch))? {
-                    None
-                } else {
-                    super::git::new_worktree_base(&repo, &prepared.project.base_branch)?
-                };
-                let wt = worktree::create(&repo, &path, &branch, from.as_deref())
+                let start = super::git::new_worktree_start(&repo, &branch, &prepared.project.base_branch, None)?;
+                let wt = worktree::create_at(&repo, &path, &branch, &start)
                     .map_err(|e| BusError::conflict("worktree.create_failed", e.to_string()))?;
                 (wt.path, wt.branch)
             }
@@ -1799,10 +1826,11 @@ pub fn register(e: &mut Engine) {
             params![branch, model, effort, task_id, module_id, p.bus_writes.unwrap_or(s.bus_writes) as i64,
                 p.allow_ui.unwrap_or(s.allow_ui) as i64, ctx.now, s.id],
         ).bus()?;
+        // A task attached here is queued for the whole group, as dispatch does; an update that
+        // leaves the task alone only re-asserts this session's own row.
         if let Some(task_id) = task_id {
-            let ord: i64 = ctx.tx().query_row("SELECT COALESCE(MAX(ord),-1)+1 FROM task_sessions WHERE task_id=?1", [task_id], |row| row.get(0)).bus()?;
-            let queue_ord: i64 = ctx.tx().query_row("SELECT COALESCE(MAX(queue_ord),-1)+1 FROM task_sessions WHERE session_id=?1", [s.id], |row| row.get(0)).bus()?;
-            ctx.tx().execute("INSERT OR IGNORE INTO task_sessions(task_id,session_id,ord,queue_ord) VALUES (?1,?2,?3,?4)", params![task_id,s.id,ord,queue_ord]).bus()?;
+            let ids = if p.task_id.is_some() { group_ids(ctx.tx(), s)? } else { vec![s.id] };
+            enqueue(ctx.tx(), task_id, &ids)?;
         }
         let updated = sessions::by_id(ctx.tx(), s.id)?.ok_or_else(|| BusError::internal("session vanished"))?;
         // The inverse names only what this update changed. Branch, model and effort change only
@@ -1982,47 +2010,26 @@ pub fn register(e: &mut Engine) {
         assert_own(ctx, &row, true)?;
         Ok(Empty {})
     });
-    e.register::<Input>(|ctx, p| {
-        let row = sessions::by_name(ctx.tx(), &p.session)?;
-        let pty = ctx.engine().pty(row.session.id).ok_or_else(|| {
-            BusError::conflict(
-                "session.not_spawned",
-                format!("session {} has no PTY", row.session.name),
-            )
-        })?;
-        if pty.exited() {
-            return Err(BusError::conflict(
-                "session.exited",
-                format!("session {} has exited", row.session.name),
-            ));
-        }
-        pty.write(p.data.as_bytes())
-            .map_err(|e| BusError::conflict("session.io", e.to_string()))?;
-        if row.session.state == SessionState::Idle && !p.data.is_empty() {
-            ctx.tx()
-                .execute(
-                    "UPDATE sessions SET state='running',updated_at=?1 WHERE id=?2",
-                    params![ctx.now, row.session.id],
-                )
-                .bus()?;
-            let updated = sessions::by_id(ctx.tx(), row.session.id)?
-                .ok_or_else(|| BusError::internal("session vanished"))?;
+    // The engine answers every user keystroke and resize against a registered PTY from memory
+    // (`Engine::pty_fast_path`, D148). These are the fallbacks for the rest: they own the typed
+    // not_found / not_spawned / exited refusals, and in the narrow race where the PTY registers
+    // between the fast-path miss and here, they write the way the fast path does — with the
+    // store unlocked, so a paste into a full input queue blocks only itself, and the idle edge
+    // claimed from the PTY rather than read from the row (RA-646).
+    e.register_staged::<Input, _>(|ctx, p| {
+        let (id, pty) = live_pty(ctx, &p.session)?;
+        Ok((id, crate::engine::write_input(&pty, &p.data)?))
+    }, |ctx: &mut Ctx, _p, (id, edge): (Id, bool)| {
+        if edge && ctx.tx().execute("UPDATE sessions SET state='running',updated_at=?1 WHERE id=?2 AND state='idle'", params![ctx.now, id]).bus()? > 0 {
+            let updated = sessions::by_id(ctx.tx(), id)?.ok_or_else(|| BusError::internal("session vanished"))?;
             emit_session(ctx, &updated.session);
         }
         Ok(Empty {})
     });
-    e.register::<Resize>(|ctx, p| {
-        let row = sessions::by_name(ctx.tx(), &p.session)?;
-        let pty = ctx.engine().pty(row.session.id).ok_or_else(|| {
-            BusError::conflict(
-                "session.not_spawned",
-                format!("session {} has no PTY", row.session.name),
-            )
-        })?;
-        pty.resize(p.cols, p.rows)
-            .map_err(|e| BusError::conflict("session.io", e.to_string()))?;
-        Ok(Empty {})
-    });
+    e.register_staged::<Resize, _>(|ctx, p| {
+        let (_, pty) = live_pty(ctx, &p.session)?;
+        pty.resize(p.cols, p.rows).map_err(|e| BusError::conflict("session.io", e.to_string()))
+    }, |_ctx: &mut Ctx, _p, ()| Ok(Empty {}));
     // Up to the whole 8 MiB ring, copied, decoded and serialized: the store is taken only to
     // resolve the row and, for a session with no PTY, to load its saved copy (RA-406).
     e.register_unlocked::<Scrollback>(|ctx, p| {

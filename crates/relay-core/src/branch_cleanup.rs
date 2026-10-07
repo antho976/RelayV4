@@ -147,9 +147,14 @@ impl Git<'_> {
     }
 }
 
-/// Where a branch is checked out, from `git worktree list --porcelain`.
-fn checkouts(git: &Git, branch: &str) -> Vec<PathBuf> {
-    let Ok(ran) = git.run(&["worktree", "list", "--porcelain"], GIT_TIMEOUT) else { return Vec::new() };
+/// Where a branch is checked out, from `git worktree list --porcelain`. An error when git could
+/// not say: a listing that failed or timed out used to read as "checked out nowhere", and the
+/// branch under a live checkout was deleted (RA-309). A good listing always names the primary.
+fn checkouts(git: &Git, branch: &str) -> Result<Vec<PathBuf>, String> {
+    let ran = git.run(&["worktree", "list", "--porcelain"], GIT_TIMEOUT)?;
+    if !ran.ok || !ran.out.starts_with("worktree ") {
+        return Err(format!("git worktree list failed: {}", ran.err));
+    }
     let mut out = Vec::new();
     let mut path: Option<PathBuf> = None;
     let full = format!("refs/heads/{branch}");
@@ -160,7 +165,27 @@ fn checkouts(git: &Git, branch: &str) -> Vec<PathBuf> {
             if let Some(path) = path.take() { out.push(path); }
         }
     }
-    out
+    Ok(out)
+}
+
+/// A checkout in the middle of rebasing or bisecting `branch`. `git worktree list` shows such a
+/// checkout as detached, and `update-ref -d` would pull the branch out from under it.
+fn in_progress_on(git: &Git, branch: &str) -> Result<Option<PathBuf>, String> {
+    let common = git.value(&["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .ok_or_else(|| "git rev-parse --git-common-dir failed".to_string())?;
+    let common = PathBuf::from(common);
+    let full = format!("refs/heads/{branch}");
+    let mut dirs = vec![common.clone()];
+    if let Ok(slots) = std::fs::read_dir(common.join("worktrees")) {
+        dirs.extend(slots.flatten().map(|slot| slot.path()));
+    }
+    let names = |file: PathBuf| std::fs::read_to_string(file).is_ok_and(|named| {
+        let named = named.trim();
+        named == full || named == branch
+    });
+    Ok(dirs.into_iter().find(|dir| {
+        names(dir.join("rebase-merge/head-name")) || names(dir.join("rebase-apply/head-name")) || names(dir.join("BISECT_START"))
+    }))
 }
 
 fn canon(path: &Path) -> PathBuf {
@@ -246,6 +271,7 @@ fn evaluate_as(candidate: &Candidate, live_worktrees: &[String], options: &Optio
         pr: None,
         removed_worktree: false,
         deleted_remote: false,
+        merged: false,
     };
     let kept = |mut row: BranchCleanupRow, reason: String| { row.reason = reason; row };
     if !branch.starts_with(RELAY_BRANCHES) {
@@ -261,7 +287,11 @@ fn evaluate_as(candidate: &Candidate, live_worktrees: &[String], options: &Optio
     let primary = canon(&candidate.repo);
     let pool = canon(&worktree::pool_dir(&candidate.repo));
     let mut removable = None;
-    for path in checkouts(&git, branch) {
+    let listed = match checkouts(&git, branch) {
+        Ok(listed) => listed,
+        Err(error) => return kept(row, format!("could not tell where it is checked out: {error}")),
+    };
+    for path in listed {
         let path = canon(&path);
         if path == primary {
             return kept(row, "checked out in the primary checkout".into());
@@ -332,6 +362,7 @@ fn evaluate_as(candidate: &Candidate, live_worktrees: &[String], options: &Optio
     };
     row.pr = merged.pr.as_ref().map(|pr| pr.number);
     row.reason = merged.reason;
+    row.merged = true;
 
     if let Some(path) = &removable {
         if keep_worktree {
@@ -359,6 +390,18 @@ fn evaluate_as(candidate: &Candidate, live_worktrees: &[String], options: &Optio
         }
         row.removed_worktree = true;
     }
+    // Looked at again now, not as it was when judged: a checkout or a rebase may have taken the
+    // branch up since, and `update-ref` would not refuse either (RA-309).
+    match checkouts(&git, branch) {
+        Ok(listed) if listed.is_empty() => {}
+        Ok(listed) => return kept(row.clone(), format!("{}, but it is now checked out at {}", row.reason, listed[0].display())),
+        Err(error) => return kept(row.clone(), format!("{}, but where it is checked out could not be told: {error}", row.reason)),
+    }
+    match in_progress_on(&git, branch) {
+        Ok(None) => {}
+        Ok(Some(dir)) => return kept(row.clone(), format!("{}, but a rebase or bisect is in progress on it ({})", row.reason, dir.display())),
+        Err(error) => return kept(row.clone(), format!("{}, but it could not be checked for a rebase or bisect: {error}", row.reason)),
+    }
     // Compare-and-delete: if anything committed to the branch since it was judged, this fails
     // and the new work stays.
     match git.run(&["update-ref", "-d", &format!("refs/heads/{branch}"), &tip], GIT_TIMEOUT) {
@@ -376,7 +419,10 @@ fn evaluate_as(candidate: &Candidate, live_worktrees: &[String], options: &Optio
                 let live_tip = ran.out.split_whitespace().next().map(str::to_string);
                 match live_tip {
                     Some(sha) if sha == pr.head || sha == tip => {
-                        match git.run(&["push", &remote, "--delete", branch], NETWORK_TIMEOUT) {
+                        // Leased on the sha just seen: a push landing between the look and the
+                        // delete makes the delete fail instead of dropping it (RA-310).
+                        let lease = format!("--force-with-lease=refs/heads/{branch}:{sha}");
+                        match git.run(&["push", &lease, &remote, &format!(":refs/heads/{branch}")], NETWORK_TIMEOUT) {
                             Ok(ran) if ran.ok => {
                                 row.deleted_remote = true;
                                 let _ = git.run(&["update-ref", "-d", &format!("refs/remotes/{remote}/{branch}")], GIT_TIMEOUT);
@@ -478,7 +524,7 @@ fn run_as(engine: &Engine, project_id: Option<Id>, only: Option<&[String]>, opti
 fn record(engine: &Engine, candidate: &Candidate, row: &BranchCleanupRow, options: &Options) {
     let summary = json!({
         "branch": row.branch, "session": row.session, "outcome": row.outcome, "reason": row.reason,
-        "pr": row.pr, "removed_worktree": row.removed_worktree, "deleted_remote": row.deleted_remote,
+        "pr": row.pr, "removed_worktree": row.removed_worktree, "deleted_remote": row.deleted_remote, "merged": row.merged,
     });
     match row.outcome.as_str() {
         "deleted" => tracing::info!(branch = %row.branch, reason = %row.reason, remote = row.deleted_remote, "deleted merged session branch"),
@@ -534,22 +580,17 @@ pub fn after_merged_prs(engine: Arc<Engine>, project_id: Id, branches: Vec<Strin
 }
 
 /// The slow sweep for branches whose PR merged after their session closed. Holds only a weak
-/// reference, so it never keeps an engine alive.
+/// reference, so it never keeps an engine alive. It sleeps out the whole interval: it used to
+/// wake every second to see whether the engine had gone, which is nothing it needs to know
+/// before its next sweep (RA-603).
 pub fn spawn_sweeper(engine: &Arc<Engine>) {
     let weak: Weak<Engine> = Arc::downgrade(engine);
     std::thread::Builder::new().name("branch-sweep".into()).spawn(move || {
         crate::background_priority();
         let mut wait = SWEEP_FIRST;
         loop {
-            let deadline = Instant::now() + wait;
-            while Instant::now() < deadline {
-                std::thread::sleep(Duration::from_secs(1));
-                match weak.upgrade() {
-                    Some(engine) if !engine.is_quitting() => {}
-                    _ => return,
-                }
-            }
-            let Some(engine) = weak.upgrade() else { return };
+            std::thread::sleep(wait);
+            let Some(engine) = weak.upgrade().filter(|engine| !engine.is_quitting()) else { return };
             let options = Options { gh: gh(), use_gh_cache: true, ..Options::default() };
             match run(&engine, None, None, &options) {
                 Ok(rows) => {

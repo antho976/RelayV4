@@ -54,7 +54,7 @@ op!(Whoami, "bus.whoami", Empty => WhoamiOut,
 payload!(#[schemars(rename = "BusSubscribeIn")] SubscribeIn { pub events: Option<Vec<String>> });
 result!(#[schemars(rename = "BusSubscribeOut")] SubscribeOut { pub subscribed: Vec<String> });
 op!(Subscribe, "bus.subscribe", SubscribeIn => SubscribeOut,
-    OpMeta::query(Scope::Global, 1, "Turn this socket connection into an event subscriber (socket door only)").doors(Doors::SocketOnly));
+    OpMeta::query(Scope::Global, 1, "Turn this socket connection into an event subscriber (socket door only); bus.lagged means events were dropped, so refetch").doors(Doors::SocketOnly).emits(&["bus.lagged"]));
 op!(Unsubscribe, "bus.unsubscribe", Empty => Empty,
     OpMeta::query(Scope::Global, 1, "Stop receiving events on this connection").doors(Doors::SocketOnly));
 

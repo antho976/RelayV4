@@ -210,6 +210,13 @@ pub fn layers(conn: &Connection, scope: ConfigScope) -> Result<Layers, BusError>
             (&mut global, relative.to_string())
         };
         let value: Value = serde_json::from_str(&raw).map_err(crate::engine::internal)?;
+        // A layer is an object of overrides. A scalar stored as the whole layer (a raw
+        // `settings.set` from before writes were checked) used to replace the tree and panic
+        // the project read below; now it fails the read, closed, as a bad global key does.
+        if at.is_empty() && !(value.is_object() || value.is_null()) {
+            return Err(BusError::invalid("guardrail.config", format!("{path} must be an object of overrides, not {value}"))
+                .with_hint(format!("settings.reset {{\"path\":\"{path}\"}} clears it")));
+        }
         put_raw(target, &at, value);
     }
 
@@ -245,11 +252,13 @@ pub fn layers(conn: &Connection, scope: ConfigScope) -> Result<Layers, BusError>
         );
         protected_paths.sort();
         protected_paths.dedup();
-        next["protected_paths"] = json!(protected_paths);
+        let not_object = || BusError::invalid("guardrail.config", "a guardrail layer must be an object");
+        let map = next.as_object_mut().ok_or_else(not_object)?;
+        map.insert("protected_paths".into(), json!(protected_paths));
 
         let critical: Vec<String> = serde_json::from_str(&critical).unwrap_or_default();
         legacy |= !critical.is_empty();
-        let gates = next["shape_gates"].as_array_mut().ok_or_else(|| {
+        let gates = map.get_mut("shape_gates").and_then(Value::as_array_mut).ok_or_else(|| {
             BusError::invalid("guardrail.config", "shape_gates must be an array")
         })?;
         for path in critical {
@@ -376,6 +385,16 @@ pub fn validate_config(cfg: &GuardrailConfig) -> Result<(), BusError> {
     for path in &cfg.protected_paths {
         validate_pattern(path)?;
     }
+    // `write_roots` keeps absolute entries only; a `~/scratch` or `build/out` used to be
+    // dropped there without a word, and every write to it still refused (RA-319).
+    for root in &cfg.allowed_write_roots {
+        if !Path::new(root).is_absolute() {
+            return Err(BusError::invalid(
+                "guardrail.config",
+                format!("allowed_write_roots entry {root:?} must be an absolute path (no ~, nothing relative)"),
+            ));
+        }
+    }
     for gate in &cfg.shape_gates {
         validate_pattern(&gate.path)?;
         if !matches!(gate.validator.as_str(), "non_empty" | "json" | "json_non_empty_array" | "json_non_empty_object") {
@@ -433,10 +452,9 @@ pub fn authorize(
         return Ok(());
     }
     let cfg = config(conn, Some(session.project_id))?;
-    let allowed = role_allowlist(&cfg, session.role);
-    if allowed.iter().any(|pattern| op_matches(pattern, entry.name)) {
+    let Err(hatch) = layer3(&cfg, session, entry.name) else {
         return Ok(());
-    }
+    };
     // A role whose shell is otherwise closed (the reviewer) may still run what its instructions
     // depend on: a Codex session reaches the bus only through `$RELAY_BIN q …` in its shell, and
     // refusing that left a Codex reviewer unable to bootstrap, mail or finish (RA-014). The
@@ -447,27 +465,61 @@ pub fn authorize(
     {
         return Ok(());
     }
-    let bus_write = entry.name.starts_with("file.")
-        || matches!(entry.name, "git.stage" | "git.unstage" | "git.commit");
-    if bus_write && session.bus_writes {
-        return Ok(());
-    }
-    let ui = entry.name.starts_with("ui.") || entry.name.starts_with("os.");
-    if ui && session.allow_ui {
-        return Ok(());
-    }
     let role = sessions::role_str(session.role);
     let mut err = BusError::allowlist(entry.name, role);
-    if bus_write {
+    if let Some(hatch) = hatch {
         err = err
-            .with_details(json!({"op": entry.name, "role": role, "option": "bus_writes"}))
-            .with_hint("enable bus_writes for this session deliberately");
-    } else if ui {
-        err = err
-            .with_details(json!({"op": entry.name, "role": role, "option": "allow_ui"}))
-            .with_hint("enable allow_ui for this session deliberately");
+            .with_details(json!({"op": entry.name, "role": role, "option": hatch.option()}))
+            .with_hint(format!("enable {} for this session deliberately", hatch.option()));
     }
     Err(err)
+}
+
+/// The two deliberate per-session escape hatches from a role's allowlist (BUS.md §9.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hatch {
+    /// `file.*` and the git index/commit ops, through the bus.
+    BusWrites,
+    /// `ui.*` and `os.*`.
+    AllowUi,
+}
+
+impl Hatch {
+    fn of(op: &str) -> Option<Hatch> {
+        if op.starts_with("file.") || matches!(op, "git.stage" | "git.unstage" | "git.commit") {
+            Some(Hatch::BusWrites)
+        } else if op.starts_with("ui.") || op.starts_with("os.") {
+            Some(Hatch::AllowUi)
+        } else {
+            None
+        }
+    }
+    fn option(self) -> &'static str {
+        match self {
+            Hatch::BusWrites => "bus_writes",
+            Hatch::AllowUi => "allow_ui",
+        }
+    }
+    fn open(self, session: &Session) -> bool {
+        match self {
+            Hatch::BusWrites => session.bus_writes,
+            Hatch::AllowUi => session.allow_ui,
+        }
+    }
+}
+
+/// Layer 3 for one session: its role's allowlist, then the escape hatch the op belongs to.
+/// `Ok(None)` is the allowlist, `Ok(Some(hatch))` an open hatch; `Err` carries the hatch that
+/// would admit it, if any. [`authorize`] and [`callability`] both answer from this, so
+/// discovery and execution cannot disagree (D104).
+fn layer3(cfg: &GuardrailConfig, session: &Session, op: &str) -> Result<Option<Hatch>, Option<Hatch>> {
+    if role_admits(cfg, session.role, op) {
+        return Ok(None);
+    }
+    match Hatch::of(op) {
+        Some(hatch) if hatch.open(session) => Ok(Some(hatch)),
+        hatch => Err(hatch),
+    }
 }
 
 /// All three gating layers, answered for one op without calling it (BUS.md §9.1). This is
@@ -503,25 +555,12 @@ pub fn callability(
     let Some(cfg) = cfg else {
         return (Callable::No, "guardrail config unavailable".to_string());
     };
-    if role_admits(cfg, session.role, entry.name) {
-        return self_only(format!("role:{role} allowlist"));
+    match layer3(cfg, session, entry.name) {
+        Ok(None) => self_only(format!("role:{role} allowlist")),
+        Ok(Some(hatch)) => self_only(format!("session.{}", hatch.option())),
+        Err(None) => (Callable::No, format!("role:{role} not in allowlist")),
+        Err(Some(hatch)) => (Callable::No, format!("role:{role} not in allowlist (needs session.{})", hatch.option())),
     }
-    let bus_write = entry.name.starts_with("file.")
-        || matches!(entry.name, "git.stage" | "git.unstage" | "git.commit");
-    if bus_write && session.bus_writes {
-        return self_only("session.bus_writes".to_string());
-    }
-    let ui = entry.name.starts_with("ui.") || entry.name.starts_with("os.");
-    if ui && session.allow_ui {
-        return self_only("session.allow_ui".to_string());
-    }
-    let mut why = format!("role:{role} not in allowlist");
-    if bus_write {
-        why.push_str(" (needs session.bus_writes)");
-    } else if ui {
-        why.push_str(" (needs session.allow_ui)");
-    }
-    (Callable::No, why)
 }
 
 /// The allow-set for one role, as configured (BUS.md §9.1 layer 3).
@@ -2378,20 +2417,60 @@ fn validate_shape(gate: &ShapeGate, text: &str) -> Result<(), String> {
     }
 }
 
+/// Lines a unified diff removes and adds. `---`/`+++` are file headers only outside a hunk:
+/// inside one, `--- x` is a removed `-- x` (an SQL or Lua comment, a YAML separator) and
+/// counts like any other removed line (RA-321). A hunk ends when the line counts its `@@`
+/// header promised are used up; one whose header does not parse runs to the next `diff`/`@@`.
 fn diff_counts(diff: &str) -> (u32, u32) {
     let mut removed = 0;
     let mut added = 0;
+    // `(old, new)` lines left in the current hunk; `None` between hunks.
+    let mut hunk: Option<(u32, u32)> = None;
     for line in diff.lines() {
-        if line.starts_with("---") || line.starts_with("+++") {
+        if line.starts_with("@@") {
+            hunk = Some(hunk_lengths(line).unwrap_or((u32::MAX, u32::MAX))).filter(|&(old, new)| old > 0 || new > 0);
             continue;
         }
-        if line.starts_with('-') {
-            removed += 1;
-        } else if line.starts_with('+') {
-            added += 1;
+        if line.starts_with("diff ") {
+            hunk = None;
+            continue;
+        }
+        let Some((old, new)) = hunk.as_mut() else {
+            if line.starts_with("---") || line.starts_with("+++") {
+                continue;
+            }
+            // A diff with no hunk headers at all: every marked line is a change.
+            if line.starts_with('-') {
+                removed += 1;
+            } else if line.starts_with('+') {
+                added += 1;
+            }
+            continue;
+        };
+        match line.as_bytes().first() {
+            Some(b'-') => { removed += 1; *old = old.saturating_sub(1); }
+            Some(b'+') => { added += 1; *new = new.saturating_sub(1); }
+            Some(b'\\') => {}
+            _ => { *old = old.saturating_sub(1); *new = new.saturating_sub(1); }
+        }
+        if *old == 0 && *new == 0 {
+            hunk = None;
         }
     }
     (removed, added)
+}
+
+/// The old and new line counts of a `@@ -a[,b] +c[,d] @@` header; a missing count is 1.
+fn hunk_lengths(header: &str) -> Option<(u32, u32)> {
+    let mut parts = header.strip_prefix("@@")?.split_whitespace();
+    let count = |part: Option<&str>, sign: char| -> Option<u32> {
+        let range = part?.strip_prefix(sign)?;
+        match range.split_once(',') {
+            Some((_, n)) => n.parse().ok(),
+            None => range.parse::<u32>().ok().map(|_| 1),
+        }
+    };
+    Some((count(parts.next(), '-')?, count(parts.next(), '+')?))
 }
 
 /// Linear multiset line comparison. Moving an unchanged line is not destructive; removing
@@ -3070,7 +3149,7 @@ mod denied_tests {
 
 #[cfg(test)]
 mod path_tests {
-    use super::{parse_numstat, resolve, split_commits, NumstatEntry};
+    use super::{diff_counts, parse_numstat, resolve, split_commits, NumstatEntry};
     use std::path::Path;
 
     fn paths(text: &str) -> Vec<Vec<String>> {
@@ -3092,6 +3171,16 @@ mod path_tests {
         assert_eq!(paths("1\t2\tsrc/{a => secret}/key\n"), vec![vec!["src/a/key".to_string(), "src/secret/key".into()]]);
         assert_eq!(paths("1\t0\t{ => secret}/key\n"), vec![vec!["/key".to_string(), "secret/key".into()]]);
         assert_eq!(paths("1\t0\t\"caf\\303\\251/k\\tey\"\n"), vec![vec!["café/k\tey".to_string()]]);
+    }
+
+    /// RA-321: inside a hunk `--- x` is a removed `-- x`; only the file headers are skipped.
+    #[test]
+    fn diff_counts_skips_headers_but_not_removed_comment_lines() {
+        let diff = "diff --git a/q.sql b/q.sql\n--- a/q.sql\n+++ b/q.sql\n@@ -1,4 +1,2 @@\n--- one\n--- two\n select 1;\n-select 2;\n+++ added\n\
+                    --- b.yml\n+++ b.yml\n@@ -1 +1 @@\n----\n+++\n";
+        assert_eq!(diff_counts(diff), (4, 2));
+        // No hunk headers at all: the old reading, headers skipped and every marked line counted.
+        assert_eq!(diff_counts("--- a\n+++ b\n-x\n+y\n+z\n"), (1, 2));
     }
 
     /// RA-109: `diff-tree --stdin -z` output, one commit after another, renames and all.

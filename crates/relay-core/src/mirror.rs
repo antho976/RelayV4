@@ -11,9 +11,12 @@
 //!
 //! Scope is deliberate, not partial. Relay implements the control messages that delete a
 //! physical trip to the phone — navigation, hardware buttons, display power, rotation,
-//! the notification/settings panels, and clipboard in both directions. It does not
-//! implement UHID create/input/destroy or the hard-keyboard settings shortcut (Relay has
-//! no HID device to create; text goes over INJECT_TEXT and the clipboard), START_APP
+//! the notification/settings panels, and setting (and pasting) the device clipboard. It
+//! does not read the clipboard back: GET_CLIPBOARD and the device→host messages (CLIPBOARD,
+//! ACK_CLIPBOARD) have no consumer, so the control socket's reverse direction is drained
+//! unparsed. Nor does it implement UHID create/input/destroy or the hard-keyboard settings
+//! shortcut (Relay has no HID device to create; text goes over INJECT_TEXT and the
+//! clipboard), START_APP
 //! (`android.rs` launches through adb with an explicit activity because it needs the pid
 //! back, which START_APP does not give), or the audio stream (the mirror decodes video
 //! only). Their type bytes are still written down below, because the ordinals are
@@ -25,6 +28,12 @@ use serde::{Deserialize, Serialize};
 /// mismatch by design.
 pub const SCRCPY_VERSION: &str = "4.1";
 
+/// SHA-256 of the vendored `scrcpy-server-v4.1` (upstream v4.1's published hash, and the one
+/// in `apps/relay-native/resources/README.md`). The jar runs on the device as the shell user,
+/// so it is checked against this before every push: changing the jar takes a visible code
+/// change here, not a binary diff nobody can review.
+pub const SCRCPY_SERVER_SHA256: &str = "deacb991ed2509715160ffdc7907e47b4160eb30d1566217e9047fd5b8850cae";
+
 /// Where the server jar lives on the device. Named distinctly from stock scrcpy's
 /// path so Relay and a host-installed scrcpy never fight over the same file.
 pub const MIRROR_SERVER_DEVICE_PATH: &str = "/data/local/tmp/scrcpy-server-relay.jar";
@@ -32,8 +41,8 @@ pub const MIRROR_SERVER_DEVICE_PATH: &str = "/data/local/tmp/scrcpy-server-relay
 /// Raw codec id the server sends at video-stream start: ASCII "h264".
 pub const CODEC_ID_H264: u32 = 0x6832_3634;
 
-/// `adb push` of the vendored jar. `local_jar` is the host-side path (resolved by
-/// the shell from its bundled resources).
+/// `adb push` of the vendored jar. `local_jar` is the host-side path, found and
+/// hash-checked by `device::mirror_server`.
 pub fn push_args(serial: &str, local_jar: &str) -> Vec<String> {
     vec![
         "-s".into(),
@@ -84,100 +93,6 @@ pub fn forward_remove_args(serial: &str, port: u16) -> Vec<String> {
     ]
 }
 
-/// How the server should pin the captured orientation. Unlocked (the default) lets the
-/// stream follow the device, which is why the reader has to handle a mid-stream
-/// [`StreamUnit::Session`]; pinning one angle keeps a recorded macro's coordinates
-/// meaningful across a rotation the app does on its own.
-///
-/// v4.1 has no `lock_video_orientation` — it became `capture_orientation`, whose value is
-/// `[@]<angle>` with `@` meaning "locked". The old key is unknown to the pinned jar, and an
-/// unknown key makes the server refuse to start, so the old spelling was a hard failure
-/// waiting for the first caller that set it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum LockOrientation {
-    #[default]
-    Unlocked,
-    Deg0,
-    Deg90,
-    Deg180,
-    Deg270,
-}
-
-impl LockOrientation {
-    /// The `capture_orientation` value (`Options.parseCaptureOrientation` in the jar):
-    /// a bare angle captures at that angle and still follows the device, `@angle` locks it.
-    /// "Unlocked" is therefore `0` — the server default spelled out.
-    fn as_arg(self) -> &'static str {
-        match self {
-            LockOrientation::Unlocked => "0",
-            LockOrientation::Deg0 => "@0",
-            LockOrientation::Deg90 => "@90",
-            LockOrientation::Deg180 => "@180",
-            LockOrientation::Deg270 => "@270",
-        }
-    }
-}
-
-/// The server options Relay actually varies. Deliberately not "every scrcpy flag": the
-/// pinned jar hard-fails on an unknown key, so every option here is one we have a reason
-/// to send, and anything left at its server-side default is *not emitted at all* — a key
-/// we never send can never be the key that refuses to boot after a jar bump.
-///
-/// [`MirrorOptions::default`] reproduces the historical hardcoded launch line exactly
-/// (there is a test pinning that), so switching a call site to the builder cannot change
-/// behaviour by accident.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MirrorOptions {
-    /// Longest edge of the encoded stream, in pixels. 0 = the device's own size.
-    pub max_size: u32,
-    /// Video bitrate in bits per second.
-    pub video_bit_rate: u32,
-    pub max_fps: u32,
-    /// `None` leaves the key off the line entirely (server default: unlocked).
-    pub capture_orientation: Option<LockOrientation>,
-    /// Relay decodes video only; the audio socket would just be another thing to drain.
-    pub audio: bool,
-    /// Keep the device awake while plugged in — a mirror that watches a screen that
-    /// sleeps after 30 s is a mirror you stop trusting.
-    pub stay_awake: bool,
-    /// Turn the display off when the mirror stops. Off by default: surprising on a
-    /// phone sitting on the desk next to you.
-    pub power_off_on_close: bool,
-    /// Server log verbosity; its lines are the only diagnostics when it dies.
-    pub log_level: String,
-}
-
-impl Default for MirrorOptions {
-    fn default() -> Self {
-        Self {
-            max_size: 1024,
-            video_bit_rate: 8_000_000,
-            max_fps: 60,
-            capture_orientation: None,
-            audio: false,
-            stay_awake: true,
-            power_off_on_close: false,
-            log_level: "info".into(),
-        }
-    }
-}
-
-impl MirrorOptions {
-    /// Relay's defaults, captured at the rung covering `px` pixels of long edge. The
-    /// two fields the capture ladder owns — [`MirrorOptions::max_size`] and the bit rate
-    /// that has to move with it — are the only ones it touches; everything else stays at
-    /// the standing default. `for_capture(CAPTURE_MIN)` is `default()` exactly, which is
-    /// what keeps the historical launch line pinned.
-    pub fn for_capture(px: u32) -> Self {
-        let max_size = capture_size_for(px);
-        Self {
-            max_size,
-            video_bit_rate: capture_bit_rate(max_size),
-            ..Self::default()
-        }
-    }
-}
-
 /// Capture rungs for `max_size` — the cap scrcpy applies to the *longer* edge of the
 /// captured picture. A short fixed ladder rather than a free integer for two reasons:
 /// the encoder wants dimensions that stay a multiple of 8 after scaling, and a monotone
@@ -220,23 +135,22 @@ pub fn fit_size(width: u32, height: u32, max_size: u32) -> (u32, u32) {
     if w >= h { (max_size, minor) } else { (minor, max_size) }
 }
 
-/// The full `adb shell … app_process` invocation that boots the server on-device, with
-/// Relay's standing defaults and one capture rung. Options kept to long-stable names —
-/// the server hard-fails on any unknown key. Meta preludes (dummy byte, device name,
-/// codec id) and frame meta stay on by default; the reader depends on them.
+/// The full `adb shell … app_process` invocation that boots the server on-device at one
+/// capture size and bit rate — the only two values Relay varies. Everything else is a fixed
+/// key with a long-stable name, since the server hard-fails on any unknown key: no audio
+/// (the mirror decodes video only), stay awake while plugged in, info-level server logs (the
+/// only diagnostics when it dies). Meta preludes (dummy byte, device name, codec id) and
+/// frame meta stay on by default; the reader depends on them.
 ///
-/// `max_size` is snapped to a [`CAPTURE_SIZES`] rung (and its bit rate derived) by
-/// [`MirrorOptions::for_capture`], so no caller can hand the server an off-ladder value.
-pub fn server_shell_args(serial: &str, scid: u32, max_size: u32) -> Vec<String> {
-    server_shell_args_with(serial, scid, &MirrorOptions::for_capture(max_size))
-}
-
-/// Same launch line, built from an explicit option set. Argument order is fixed and
-/// tested: the server parses the version positionally (right after the class name) and
-/// everything after it as `key=value`, so a stable order is what makes the launch line
-/// something you can diff against a log instead of guessing at.
-pub fn server_shell_args_with(serial: &str, scid: u32, opts: &MirrorOptions) -> Vec<String> {
-    let mut args = vec![
+/// `max_size` is snapped to a [`CAPTURE_SIZES`] rung here, so no caller can hand the server
+/// an off-ladder value. Argument order is fixed and tested: the server parses the version
+/// positionally (right after the class name) and everything after it as `key=value`, so a
+/// stable order is what makes the launch line something you can diff against a log.
+///
+/// Adding an option back: v4.1 spells an orientation lock `capture_orientation=@<angle>`;
+/// the pre-3.0 `lock_video_orientation` key is unknown to it and stops it booting.
+pub fn server_shell_args(serial: &str, scid: u32, max_size: u32, video_bit_rate: u32) -> Vec<String> {
+    vec![
         "-s".into(),
         serial.into(),
         "shell".into(),
@@ -246,23 +160,16 @@ pub fn server_shell_args_with(serial: &str, scid: u32, opts: &MirrorOptions) -> 
         "com.genymobile.scrcpy.Server".into(),
         SCRCPY_VERSION.into(),
         format!("scid={scid:08x}"),
-        format!("log_level={}", opts.log_level),
-        format!("audio={}", opts.audio),
+        "log_level=info".into(),
+        "audio=false".into(),
         "video_codec=h264".into(),
-        format!("max_size={}", opts.max_size),
-        format!("video_bit_rate={}", opts.video_bit_rate),
-        format!("max_fps={}", opts.max_fps),
-        format!("stay_awake={}", opts.stay_awake),
-    ];
-    if let Some(lock) = opts.capture_orientation {
-        args.push(format!("capture_orientation={}", lock.as_arg()));
-    }
-    if opts.power_off_on_close {
-        args.push("power_off_on_close=true".into());
-    }
-    // Last, always: the tunnel mode is what the shell's connect sequence assumes.
-    args.push("tunnel_forward=true".into());
-    args
+        format!("max_size={}", capture_size_for(max_size)),
+        format!("video_bit_rate={video_bit_rate}"),
+        "max_fps=60".into(),
+        "stay_awake=true".into(),
+        // Last, always: the tunnel mode is what the shell's connect sequence assumes.
+        "tunnel_forward=true".into(),
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -326,7 +233,7 @@ const TYPE_BACK_OR_SCREEN_ON: u8 = 4;
 const TYPE_EXPAND_NOTIFICATION_PANEL: u8 = 5;
 const TYPE_EXPAND_SETTINGS_PANEL: u8 = 6;
 const TYPE_COLLAPSE_PANELS: u8 = 7;
-const TYPE_GET_CLIPBOARD: u8 = 8;
+// 8 GET_CLIPBOARD — unimplemented, see the module-level note on scope.
 const TYPE_SET_CLIPBOARD: u8 = 9;
 const TYPE_SET_DISPLAY_POWER: u8 = 10;
 const TYPE_ROTATE_DEVICE: u8 = 11;
@@ -567,48 +474,18 @@ pub fn collapse_panels() -> [u8; 1] {
     [TYPE_COLLAPSE_PANELS]
 }
 
-/// Which key the device should synthesise before reading the clipboard, so "get the
-/// clipboard" can also mean "copy the selection, then get it".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum CopyKey {
-    /// Read what is already on the clipboard.
-    #[default]
-    None,
-    /// Press Ctrl+C first.
-    Copy,
-    /// Press Ctrl+X first.
-    Cut,
-}
-
-impl CopyKey {
-    fn code(self) -> u8 {
-        match self {
-            CopyKey::None => 0,
-            CopyKey::Copy => 1,
-            CopyKey::Cut => 2,
-        }
-    }
-}
-
-/// GET_CLIPBOARD: 2 bytes. The device answers asynchronously on the control socket's
-/// reverse direction with a CLIPBOARD message — see [`parse_device_event`]. There is no
-/// correlation id, so a caller that issues two of these cannot tell the replies apart;
-/// treat it as "latest wins".
-pub fn get_clipboard(copy: CopyKey) -> [u8; 2] {
-    [TYPE_GET_CLIPBOARD, copy.code()]
-}
-
 /// SET_CLIPBOARD: 14-byte header + UTF-8 payload.
 /// `[type][u64 sequence][u8 paste][u32 len][text]`.
 ///
 /// `paste` asks the device to press Ctrl+V after setting the clipboard, which is the
 /// correct way to get a long string into a field: one message instead of N text injects,
-/// no per-character IME churn, and nothing lost to the 300-byte cap. A non-zero
-/// `sequence` asks for an ACK_CLIPBOARD carrying it back, so a caller can wait for the
-/// clipboard to actually be set before doing anything that depends on it; 0 means "no
-/// ack wanted" and the device stays silent.
-pub fn set_clipboard(sequence: u64, paste: bool, s: &str) -> Vec<u8> {
+/// no per-character IME churn, and nothing lost to the 300-byte cap. The sequence is always
+/// 0, "no ack wanted": nothing reads an ACK_CLIPBOARD back.
+///
+/// One message cannot be split, so text over [`SET_CLIPBOARD_MAX_LENGTH`] is cut on a char
+/// boundary here; `handlers::device::send_input` refuses such text before it gets this far,
+/// so a caller hears about it instead of pasting a prefix.
+pub fn set_clipboard(paste: bool, s: &str) -> Vec<u8> {
     let mut end = s.len().min(SET_CLIPBOARD_MAX_LENGTH);
     while !s.is_char_boundary(end) {
         end -= 1;
@@ -616,7 +493,7 @@ pub fn set_clipboard(sequence: u64, paste: bool, s: &str) -> Vec<u8> {
     let bytes = &s.as_bytes()[..end];
     let mut m = Vec::with_capacity(14 + bytes.len());
     m.push(TYPE_SET_CLIPBOARD);
-    m.extend_from_slice(&sequence.to_be_bytes());
+    m.extend_from_slice(&0u64.to_be_bytes());
     m.push(u8::from(paste));
     m.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
     m.extend_from_slice(bytes);
@@ -643,119 +520,6 @@ pub fn rotate_device() -> [u8; 1] {
 /// has only one recovery: tear the whole mirror down and push the jar again.
 pub fn reset_video() -> [u8; 1] {
     [TYPE_RESET_VIDEO]
-}
-
-// ---------------------------------------------------------------------------
-// device messages (device -> client) — drain-only framing
-// ---------------------------------------------------------------------------
-
-const DEV_TYPE_CLIPBOARD: u8 = 0;
-const DEV_TYPE_ACK_CLIPBOARD: u8 = 1;
-const DEV_TYPE_UHID_OUTPUT: u8 = 2;
-
-/// Framing result for the control socket's reverse direction. A drain that only needs to
-/// keep the socket from filling uses this; a caller that wants the *content* (the reply
-/// to [`get_clipboard`], the ack for [`set_clipboard`]) uses [`parse_device_event`],
-/// which frames identically and additionally decodes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeviceMsg {
-    /// Buffer holds a partial message — read more first.
-    NeedMore,
-    /// A complete message occupies this many leading bytes; discard them.
-    Skip(usize),
-    /// Unrecognized type byte — framing is lost, the drain should stop parsing.
-    Unknown(u8),
-}
-
-/// Total length of the message at the head of `buf`, or `None` if it is not all here.
-/// Single source of truth for both parsers: two framing implementations of the same wire
-/// format is one of them being wrong later.
-fn device_msg_len(buf: &[u8]) -> Option<Option<usize>> {
-    // Outer None = unknown type; inner None = need more bytes.
-    let kind = *buf.first()?;
-    let len = match kind {
-        // [type][u32 len][utf-8]
-        DEV_TYPE_CLIPBOARD => {
-            if buf.len() < 5 {
-                return Some(None);
-            }
-            let len = read_u32be(&buf[1..5]) as usize;
-            5usize.checked_add(len)?
-        }
-        // [type][u64 sequence]
-        DEV_TYPE_ACK_CLIPBOARD => 9,
-        // [type][u16 id][u16 size][data]
-        DEV_TYPE_UHID_OUTPUT => {
-            if buf.len() < 5 {
-                return Some(None);
-            }
-            5 + u16::from_be_bytes([buf[3], buf[4]]) as usize
-        }
-        _ => return None,
-    };
-    Some((buf.len() >= len).then_some(len))
-}
-
-pub fn parse_device_msg(buf: &[u8]) -> DeviceMsg {
-    if buf.is_empty() {
-        return DeviceMsg::NeedMore;
-    }
-    match device_msg_len(buf) {
-        Some(Some(len)) => DeviceMsg::Skip(len),
-        Some(None) => DeviceMsg::NeedMore,
-        None => DeviceMsg::Unknown(buf[0]),
-    }
-}
-
-/// A decoded device→host message, framing included. `consumed` is what the caller must
-/// drain, and it is on every variant so the drain loop never has to re-derive the length
-/// it just parsed.
-///
-/// Kept separate from [`DeviceMsg`] rather than folded into it: the shell's drain thread
-/// matches [`DeviceMsg`] exhaustively and allocates nothing, and a mirror that is only
-/// being watched should not be building a `String` per clipboard change on the device.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DeviceEvent {
-    /// Buffer holds a partial message — read more first.
-    NeedMore,
-    /// The device's clipboard: either the reply to [`get_clipboard`], or an unsolicited
-    /// push when the device's clipboard changes while mirroring.
-    Clipboard { consumed: usize, text: String },
-    /// The device confirming a [`set_clipboard`] that carried a non-zero sequence.
-    ClipboardAck { consumed: usize, sequence: u64 },
-    /// Output report from a UHID device Relay did not create — framed and skippable so
-    /// the stream survives it.
-    UhidOutput { consumed: usize, id: u16, data: Vec<u8> },
-    /// Unrecognized type byte — framing is lost, the caller should stop parsing.
-    Unknown(u8),
-}
-
-/// Decode one device→host message. Text is lossy-decoded: the device sends whatever the
-/// clipboard holds, and one bad byte from an app must not stall the control socket.
-pub fn parse_device_event(buf: &[u8]) -> DeviceEvent {
-    if buf.is_empty() {
-        return DeviceEvent::NeedMore;
-    }
-    let consumed = match device_msg_len(buf) {
-        Some(Some(len)) => len,
-        Some(None) => return DeviceEvent::NeedMore,
-        None => return DeviceEvent::Unknown(buf[0]),
-    };
-    match buf[0] {
-        DEV_TYPE_CLIPBOARD => DeviceEvent::Clipboard {
-            consumed,
-            text: String::from_utf8_lossy(&buf[5..consumed]).into_owned(),
-        },
-        DEV_TYPE_ACK_CLIPBOARD => DeviceEvent::ClipboardAck {
-            consumed,
-            sequence: u64::from_be_bytes(buf[1..9].try_into().unwrap()),
-        },
-        _ => DeviceEvent::UhidOutput {
-            consumed,
-            id: u16::from_be_bytes([buf[1], buf[2]]),
-            data: buf[5..consumed].to_vec(),
-        },
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -809,19 +573,12 @@ pub enum InputMsg {
     /// Device panel on/off while mirroring continues.
     DisplayPower { on: bool },
     /// Put `text` on the device clipboard. `paste` (default false) makes the device paste
-    /// it immediately — the right way to fill a long field.
+    /// it immediately — the right way to fill a long field. At most
+    /// [`SET_CLIPBOARD_MAX_LENGTH`] bytes: one message, so it cannot be split.
     SetClipboard {
         text: String,
         #[serde(default)]
         paste: bool,
-        /// Non-zero asks for a ClipboardAck carrying this value back.
-        #[serde(default)]
-        sequence: u64,
-    },
-    /// Ask for the device clipboard; the answer arrives as a `DeviceEvent::Clipboard`.
-    GetClipboard {
-        #[serde(default)]
-        copy: CopyKey,
     },
     /// Make the server re-send codec config + a key frame, so a stalled decoder can
     /// rejoin without restarting the mirror.
@@ -858,8 +615,7 @@ pub fn encode_input(msg: &InputMsg) -> Vec<u8> {
         InputMsg::QuickSettings => expand_settings_panel().to_vec(),
         InputMsg::Collapse => collapse_panels().to_vec(),
         InputMsg::DisplayPower { on } => set_display_power(*on).to_vec(),
-        InputMsg::SetClipboard { text: s, paste, sequence } => set_clipboard(*sequence, *paste, s),
-        InputMsg::GetClipboard { copy } => get_clipboard(*copy).to_vec(),
+        InputMsg::SetClipboard { text: s, paste } => set_clipboard(*paste, s),
         InputMsg::ResetVideo => reset_video().to_vec(),
     }
 }

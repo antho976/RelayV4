@@ -43,12 +43,19 @@ fn git(repo: &Path, args: &[&str]) -> Result<String> {
 pub fn git_mutate(repo: &Path, args: &[&str]) -> Result<String> { git(repo, args) }
 
 /// Make sure `.relay/` is excluded in this repo without touching its tracked `.gitignore`.
+/// `.codex/hooks.json` is not: a project may commit its own, so `hooks::install_codex` excludes
+/// it only once Relay's handlers are in an untracked one.
 pub fn ensure_excluded(repo: &Path) -> Result<()> {
-    exclude_paths(repo, &[".relay/", ".claude/settings.local.json", ".codex/hooks.json"])
+    exclude_paths(repo, &[".relay/", ".claude/settings.local.json"])
 }
 
 /// Same, for paths Relay writes into a checkout on demand (materialized skill folders).
 pub fn exclude_paths(repo: &Path, entries: &[&str]) -> Result<()> {
+    // One read-modify-write at a time: skills call this under their own lock, the hook
+    // adapters under `hooks::writes()`, and both edit the one `info/exclude` a repository's
+    // worktrees share.
+    static EXCLUDE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = EXCLUDE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let git_dir = git_dir_of(repo)?;
     let info = git_dir.join("info");
     std::fs::create_dir_all(&info)?;
@@ -97,13 +104,19 @@ const INDEX_BUSY: std::time::Duration = std::time::Duration::from_secs(5);
 static INDEX_REFRESHED: std::sync::Mutex<Option<std::collections::HashMap<PathBuf, std::time::Instant>>> =
     std::sync::Mutex::new(None);
 
-/// The index file of the checkout at `root`, a linked worktree's included.
-fn index_file(root: &Path) -> Option<PathBuf> {
+/// The git dir of the checkout at `root`: `.git` itself, or for a linked worktree the slot its
+/// `.git` file points at, where its own index and HEAD live.
+pub(crate) fn checkout_git_dir(root: &Path) -> Option<PathBuf> {
     let dotgit = root.join(".git");
-    if dotgit.is_dir() { return Some(dotgit.join("index")); }
+    if dotgit.is_dir() { return Some(dotgit); }
     let pointer = std::fs::read_to_string(&dotgit).ok()?;
     let gitdir = PathBuf::from(pointer.trim().strip_prefix("gitdir:")?.trim());
-    Some(if gitdir.is_absolute() { gitdir } else { root.join(gitdir) }.join("index"))
+    Some(if gitdir.is_absolute() { gitdir } else { root.join(gitdir) })
+}
+
+/// The index file of the checkout at `root`, a linked worktree's included.
+fn index_file(root: &Path) -> Option<PathBuf> {
+    Some(checkout_git_dir(root)?.join("index"))
 }
 
 /// Whether this status may take git's optional index lock. Holding it for the length of a scan
@@ -223,7 +236,11 @@ pub fn list_with_dirty(repo: &Path, include_dirty: bool) -> Result<Vec<Worktree>
 /// the repository: every project-scoped file and git op calls this to check its root, and a
 /// `gix::open` plus a worktree enumeration was a third of a tree listing (PERF §1.6). The
 /// primary checkout is the project path; a linked checkout's `.git` is a file pointing at its
-/// slot under the common dir's `worktrees/`, which is exactly what `git worktree list` reads.
+/// slot under the common dir's `worktrees/`, and that slot's `gitdir` file must point back at
+/// this checkout, which is what `git worktree list` reads. Without the second half a `cp -r` of
+/// a worktree passed, and git ops there ran against the original's index and HEAD (RA-346).
+/// A checkout moved by hand, whose slot still names the old place, is an error asking for
+/// `git worktree repair` rather than "not a worktree".
 pub fn contains(repo: &Path, candidate: &Path) -> Result<bool> {
     let want = canon(candidate);
     if canon(repo) == want { return Ok(true); }
@@ -232,7 +249,20 @@ pub fn contains(repo: &Path, candidate: &Path) -> Result<bool> {
     let gitdir = PathBuf::from(gitdir.trim());
     let gitdir = if gitdir.is_absolute() { gitdir } else { Path::new(&want).join(gitdir) };
     let slots = canon(&common_dir(repo)?.join("worktrees"));
-    Ok(canon(&gitdir).starts_with(&slots) && gitdir.join("gitdir").is_file())
+    if !canon(&gitdir).starts_with(&slots) { return Ok(false); }
+    let Ok(back) = std::fs::read_to_string(gitdir.join("gitdir")) else { return Ok(false) };
+    // `<checkout>/.git`, absolute, or relative to the slot (`worktree.useRelativePaths`).
+    let back = PathBuf::from(back.trim());
+    let back = if back.is_absolute() { back } else { gitdir.join(back) };
+    let named = back.parent().map(canon).unwrap_or_default();
+    if named == want { return Ok(true); }
+    // The checkout the slot names still points at the slot: this is a copy of it.
+    let slot = canon(&gitdir);
+    let still_there = std::fs::read_to_string(&back).ok()
+        .and_then(|pointer| pointer.trim().strip_prefix("gitdir:").map(|p| PathBuf::from(p.trim())))
+        .is_some_and(|p| canon(&if p.is_absolute() { p } else { Path::new(&named).join(p) }) == slot);
+    if still_there { return Ok(false); }
+    Err(anyhow!("{want} uses the worktree slot of {named}, which is gone; if the checkout was moved by hand, run `git worktree repair` in it"))
 }
 
 /// The common git dir of `repo` from its `.git` alone; gix only when that is not a plain
@@ -258,21 +288,37 @@ fn canon(p: &Path) -> String {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()).display().to_string()
 }
 
+/// Where a new worktree's branch comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Start {
+    /// The branch exists already: check it out as it is.
+    Existing,
+    /// Create the branch, at this commit or ref (`None`: HEAD, or an unborn base).
+    New(Option<String>),
+}
+
 /// `git worktree add -b <branch> <path> [<from>]`; if the branch exists already, check it out
-/// instead of creating it.
+/// instead of creating it. A caller that already knows which calls [`create_at`].
 pub fn create(repo: &Path, path: &Path, branch: &str, from: Option<&str>) -> Result<Worktree> {
+    let exists = gix::open(repo)?.find_reference(format!("refs/heads/{branch}").as_str()).is_ok();
+    let start = if exists { Start::Existing } else { Start::New(from.map(str::to_string)) };
+    create_at(repo, path, branch, &start)
+}
+
+/// `git worktree add` for a branch whose [`Start`] the caller has settled (RA-640).
+pub fn create_at(repo: &Path, path: &Path, branch: &str, start: &Start) -> Result<Worktree> {
     ensure_excluded(repo)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let path_s = path.display().to_string();
-    let exists = git(repo, &["show-ref", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok();
-    let args = if exists {
-        vec!["worktree", "add", &path_s, branch]
-    } else {
-        let mut args = vec!["worktree", "add", "-b", branch, &path_s];
-        if let Some(f) = from { args.push(f); }
-        args
+    let args = match start {
+        Start::Existing => vec!["worktree", "add", &path_s, branch],
+        Start::New(from) => {
+            let mut args = vec!["worktree", "add", "-b", branch, &path_s];
+            if let Some(f) = from { args.push(f); }
+            args
+        }
     };
     let mut command = Command::new("git");
     command.arg("-C").arg(repo).args(args).env("GIT_TERMINAL_PROMPT", "0");
@@ -307,18 +353,46 @@ pub fn dir_size(dir: &Path) -> u64 {
 /// `target/` is usually far bigger than the rest put together, so walking them in sequence
 /// means waiting for it alone.
 pub fn build_size(wt: &Path) -> u64 {
-    let roots: Vec<PathBuf> = BUILD_DIRS.iter().map(|d| wt.join(d)).collect();
-    dir_size_all(&roots)
+    let roots: Vec<PathBuf> = build_dirs(wt).collect();
+    walk(&roots, &[]).0
+}
+
+/// (all bytes, build-output bytes) under a worktree, in one walk. Build output is exactly what
+/// [`purge_build`] would delete, so the resources panel's figure predicts what a purge frees.
+pub fn disk_usage(wt: &Path) -> (u64, u64) {
+    let build: Vec<PathBuf> = build_dirs(wt).collect();
+    walk(std::slice::from_ref(&wt.to_path_buf()), &build)
+}
+
+/// The [`BUILD_DIRS`] of `wt` that are real directories inside it. Every component is checked
+/// without following symlinks: `node_modules` linked to a shared install must not have that
+/// install's `.cache` purged or counted as this worktree's (RA-347).
+fn build_dirs(wt: &Path) -> impl Iterator<Item = PathBuf> + '_ {
+    BUILD_DIRS.iter().filter_map(move |d| {
+        let mut at = wt.to_path_buf();
+        for part in Path::new(d).components() {
+            at.push(part);
+            if !std::fs::symlink_metadata(&at).is_ok_and(|meta| meta.is_dir()) { return None; }
+        }
+        Some(at)
+    })
 }
 
 fn dir_size_all(roots: &[PathBuf]) -> u64 {
+    walk(roots, &[]).0
+}
+
+/// Bytes under `roots`, and how many of them lie under `build` (directories met on the way).
+fn walk(roots: &[PathBuf], build: &[PathBuf]) -> (u64, u64) {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
 
-    let pending: Vec<PathBuf> = roots.iter().filter(|r| r.is_dir()).cloned().collect();
+    let pending: Vec<(PathBuf, bool)> = roots.iter().filter(|r| r.is_dir()).map(|r| (r.clone(), build.contains(r))).collect();
     if pending.is_empty() {
-        return 0;
+        return (0, 0);
     }
+    let build_total = Arc::new(AtomicU64::new(0));
+    let build: Arc<[PathBuf]> = build.into();
     let total = Arc::new(AtomicU64::new(0));
     // `stack` plus `busy` (workers holding a directory) is the whole termination condition:
     // the walk is done when nothing is queued and nobody is still producing.
@@ -328,6 +402,8 @@ fn dir_size_all(roots: &[PathBuf]) -> u64 {
 
     let worker = {
         let total = total.clone();
+        let build_total = build_total.clone();
+        let build = build.clone();
         let stack = stack.clone();
         let busy = busy.clone();
         move || {
@@ -346,7 +422,7 @@ fn dir_size_all(roots: &[PathBuf]) -> u64 {
                         queue = wake.wait(queue).unwrap_or_else(|p| p.into_inner());
                     }
                 };
-                let Some(dir) = dir else {
+                let Some((dir, in_build)) = dir else {
                     wake.notify_all();
                     return;
                 };
@@ -359,7 +435,9 @@ fn dir_size_all(roots: &[PathBuf]) -> u64 {
                             continue;
                         }
                         if meta.is_dir() {
-                            found.push(entry.path());
+                            let path = entry.path();
+                            let child_build = in_build || build.contains(&path);
+                            found.push((path, child_build));
                         } else {
                             bytes += meta.len();
                         }
@@ -367,6 +445,7 @@ fn dir_size_all(roots: &[PathBuf]) -> u64 {
                 }
                 if bytes > 0 {
                     total.fetch_add(bytes, Ordering::Relaxed);
+                    if in_build { build_total.fetch_add(bytes, Ordering::Relaxed); }
                 }
                 let mut queue = queue.lock().unwrap_or_else(|p| p.into_inner());
                 queue.append(&mut found);
@@ -397,18 +476,15 @@ fn dir_size_all(roots: &[PathBuf]) -> u64 {
     for handle in handles {
         let _ = handle.join();
     }
-    total.load(Ordering::Acquire)
+    (total.load(Ordering::Acquire), build_total.load(Ordering::Acquire))
 }
 
 /// Delete build output. Returns bytes freed.
 pub fn purge_build(wt: &Path) -> u64 {
     let mut freed = 0;
-    for d in BUILD_DIRS {
-        let p = wt.join(d);
-        if p.is_dir() {
-            freed += dir_size(&p);
-            let _ = std::fs::remove_dir_all(&p);
-        }
+    for p in build_dirs(wt).collect::<Vec<_>>() {
+        freed += dir_size(&p);
+        let _ = std::fs::remove_dir_all(&p);
     }
     freed
 }
@@ -585,6 +661,51 @@ mod status_tests {
         // A linked worktree's index is its own, and an index written just now means git is busy.
         assert_eq!(index_file(&linked).unwrap(), root.join(".git/worktrees/linked/index"));
         assert!(!may_lock_index(&linked));
+    }
+
+    /// RA-346: a copy of a linked worktree names a real slot, but the slot names the original.
+    /// One moved by hand is told to run `git worktree repair` rather than refused as a stranger.
+    #[test]
+    fn only_the_checkout_a_slot_points_back_at_is_a_worktree() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = &std::fs::canonicalize(directory.path()).unwrap().join("repo");
+        std::fs::create_dir_all(root).unwrap();
+        git(root, &["init", "-q", "-b", "main"]).unwrap();
+        git(root, &["-c", "user.name=F", "-c", "user.email=f@f", "commit", "-q", "--allow-empty", "-m", "a"]).unwrap();
+        let linked = root.parent().unwrap().join("linked");
+        git(root, &["worktree", "add", "-q", "-b", "side", linked.to_str().unwrap()]).unwrap();
+        assert!(contains(root, root).unwrap());
+        assert!(contains(root, &linked).unwrap());
+        let copy = root.parent().unwrap().join("copy");
+        std::fs::create_dir_all(&copy).unwrap();
+        std::fs::copy(linked.join(".git"), copy.join(".git")).unwrap();
+        assert!(!contains(root, &copy).unwrap(), "a copy borrowing the original's slot passed");
+        let moved = root.parent().unwrap().join("moved");
+        std::fs::rename(&linked, &moved).unwrap();
+        let error = contains(root, &moved).unwrap_err().to_string();
+        assert!(error.contains("git worktree repair"), "{error}");
+        git(&moved, &["worktree", "repair"]).unwrap();
+        assert!(contains(root, &moved).unwrap());
+    }
+
+    /// RA-347: a build dir reached through a symlinked parent is someone else's: neither purged
+    /// nor counted. A real one is both, and the one-pass usage agrees with the purge.
+    #[test]
+    fn build_dirs_behind_a_symlink_are_left_alone() {
+        let directory = tempfile::tempdir().unwrap();
+        let wt = directory.path().join("wt");
+        let shared = directory.path().join("shared/node_modules");
+        std::fs::create_dir_all(shared.join(".cache")).unwrap();
+        std::fs::write(shared.join(".cache/blob"), b"shared").unwrap();
+        std::fs::create_dir_all(wt.join("target/debug")).unwrap();
+        std::fs::write(wt.join("target/debug/app"), b"build").unwrap();
+        std::fs::write(wt.join("main.rs"), b"src").unwrap();
+        std::os::unix::fs::symlink(&shared, wt.join("node_modules")).unwrap();
+        assert_eq!(build_size(&wt), 5);
+        assert_eq!(disk_usage(&wt), (8, 5));
+        assert_eq!(purge_build(&wt), 5);
+        assert!(shared.join(".cache/blob").exists(), "the shared install's cache was purged");
+        assert!(!wt.join("target").exists() && wt.join("main.rs").exists());
     }
 
     /// The shared-stack walk must total exactly what a single-threaded walk would, terminate

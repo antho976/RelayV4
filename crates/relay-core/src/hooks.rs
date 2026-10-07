@@ -14,6 +14,7 @@ const CLAUDE_HOOK_MARKER: &str = "hook claude-";
 const CLAUDE_PRE_TOOL: &str = "hook claude-pre-tool";
 const CODEX_HOOK_MARKER: &str = "hook codex-";
 const CODEX_PRE_TOOL: &str = "hook codex-pre-tool";
+const CODEX_HOOKS_RELATIVE: &str = ".codex/hooks.json";
 const PREVIOUS_HOOKS_PATH: &str = ".relay-previous-hooks-path";
 /// The instance that wrote a hook directory. Dev and stable Relay share `<repo>/.relay/hooks`,
 /// and each instance's sweep must leave the other's live directories alone.
@@ -60,10 +61,12 @@ fn is_executable(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
-/// Serializes the hook and adapter writes of launches, creates and closes. They used to be
-/// serialized by the store mutex; now that they run with it released, two of them touching one
-/// repository at once would race on `.git/config`'s lock file and on the adapters' temp files.
-/// Held for milliseconds, never across a network call.
+/// Serializes the hook and adapter writes of launches, creates and closes, and a bus commit's
+/// [`refresh_git`]. They used to be serialized by the store mutex; now that they run with it
+/// released, two of them touching one repository at once would race on `.git/config`'s lock
+/// file and on the adapters' temp files. Held across local `git config` calls and file writes,
+/// never across a network call, and released before a launch copies skill folders, which
+/// `skills::apply` serializes with its own lock.
 pub fn writes() -> std::sync::MutexGuard<'static, ()> {
     static WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
     WRITES.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -111,13 +114,16 @@ fn read_record(dir: &Path) -> Option<String> {
 /// when it had none, which is what uninstalling restores) and the directory the user's hooks
 /// actually live in (`chain`), never one of Relay's.
 struct Previous {
+    /// The checkout's worktree-level `core.hooksPath` as it stands, Relay's or not.
+    current: Option<String>,
     config: Option<String>,
     chain: Option<PathBuf>,
 }
 
 fn previous_hooks(repo: &Path, worktree: &Path) -> Previous {
     let relay_hooks = repo.join(".relay").join("hooks");
-    let config = match git_optional(worktree, &["config", "--worktree", "--get", "core.hooksPath"]) {
+    let current = git_optional(worktree, &["config", "--worktree", "--get", "core.hooksPath"]);
+    let config = match current.clone() {
         // Replacing a Relay dir: what it replaced is in its record.
         Some(configured) if absolute_in(worktree, &configured).starts_with(&relay_hooks) => {
             read_record(&absolute_in(worktree, configured))
@@ -133,7 +139,7 @@ fn previous_hooks(repo: &Path, worktree: &Path) -> Previous {
         .map(|value| absolute_in(worktree, value))
         .or(inherited)
         .filter(|dir| !dir.starts_with(&relay_hooks));
-    Previous { config, chain }
+    Previous { current, config, chain }
 }
 
 /// `root/relative` as a real directory, created as needed. A symlink an agent planted on the
@@ -168,10 +174,16 @@ fn real_dir(root: &Path, relative: &str) -> Result<PathBuf> {
 /// Replace `path` through a fresh temp file beside it and a rename. The temp file is opened
 /// `O_CREAT|O_EXCL|O_NOFOLLOW` and the rename replaces a link rather than following it, so a
 /// symlink an agent planted at either name never redirects the write. `path`'s directory must
-/// already be real ([`real_dir`]).
+/// already be real ([`real_dir`]). A regular file that already holds `contents` with `mode` is
+/// left as it is: a commit refreshes the hooks every time, and almost always finds them current.
 fn write_replacing(path: &Path, contents: &str, mode: u32) -> Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
+    if fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o7777 == mode)
+        && fs::read(path).is_ok_and(|current| current == contents.as_bytes())
+    {
+        return Ok(());
+    }
     let name = path.file_name().ok_or_else(|| anyhow!("{} has no file name", path.display()))?;
     let tmp = path.with_file_name(format!("{}.relay-tmp", name.to_string_lossy()));
     match fs::remove_file(&tmp) {
@@ -236,7 +248,11 @@ pub fn install_git(
     instance: Instance,
     relay: &Path,
 ) -> Result<()> {
-    git(repo, &["config", "extensions.worktreeConfig", "true"])?;
+    // Read first: setting it rewrites the shared `.git/config` even when it is already on, and
+    // fails outright while any other git command holds the config lock.
+    if git_optional(repo, &["config", "--type=bool", "--get", "extensions.worktreeConfig"]).as_deref() != Some("true") {
+        git(repo, &["config", "extensions.worktreeConfig", "true"])?;
+    }
     // `.relay/` and the provider adapters land in the primary checkout too, which no
     // `worktree::create` ever excluded them from; a commit of everything would sweep them in.
     crate::worktree::ensure_excluded(repo).context("excluding Relay's files from git")?;
@@ -286,15 +302,18 @@ pub fn install_git(
     write_replacing(&hook_dir.join(HOOK_OWNER), &format!("{}\n", instance.as_str()), 0o644)?;
 
     let hook_dir_s = hook_dir.display().to_string();
-    git(
-        worktree,
-        &["config", "--worktree", "core.hooksPath", &hook_dir_s],
-    )?;
+    if before.current.as_deref() != Some(hook_dir_s.as_str()) {
+        git(
+            worktree,
+            &["config", "--worktree", "core.hooksPath", &hook_dir_s],
+        )?;
+    }
     Ok(())
 }
 
 /// Rewrite the currently active Relay-owned hook with the current CLI path. Existing worktrees can
 /// outlive the Relay process that created them, so a commit is also a repair point for stale hooks.
+/// Takes [`writes`]; only what is out of date is rewritten.
 pub fn refresh_git(repo: &Path, worktree: &Path, instance: Instance, relay: &Path) -> Result<bool> {
     let Some(configured) = git_optional(
         worktree,
@@ -318,6 +337,7 @@ pub fn refresh_git(repo: &Path, worktree: &Path, instance: Instance, relay: &Pat
     let session = session
         .to_str()
         .ok_or_else(|| anyhow!("Relay hook session name is not UTF-8"))?;
+    let _writes = writes();
     install_git(repo, worktree, session, instance, relay)?;
     Ok(true)
 }
@@ -433,12 +453,7 @@ pub fn uninstall_git_any(repo: &Path, worktree: &Path, sessions: &[String]) -> R
                 )?;
             }
             None => {
-                let mut cmd = Command::new("git");
-                cmd.arg("-C")
-                    .arg(worktree)
-                    .args(["config", "--worktree", "--unset", "core.hooksPath"]);
-                let output = crate::proc::output_with_timeout(&mut cmd, GIT_TIMEOUT)?
-                    .ok_or_else(|| anyhow!("git config --worktree --unset core.hooksPath timed out"))?;
+                let output = run_git(worktree, &["config", "--worktree", "--unset", "core.hooksPath"])?;
                 if !output.status.success() && output.status.code() != Some(5) {
                     return Err(anyhow!(
                         "git config --worktree --unset core.hooksPath failed: {}",
@@ -525,8 +540,9 @@ pub fn install_claude(worktree: &Path, instance: Instance, relay: &Path) -> Resu
         .as_object_mut()
         .ok_or_else(|| anyhow!("{}.hooks must be an object", path.display()))?;
     // Relay's handlers are replaced, never kept: one left from an older launch may name a relay
-    // binary or instance that is gone (the guardrail then fails open with exit 127), and one an
-    // agent wrote merely *mentioning* the marker must not pass for the real guardrail.
+    // binary or instance that is gone (the guardrail then fails open with exit 127). They are
+    // known by the shape Relay generates ([`is_relay_handler`]), so a user's own command that
+    // merely contains the words survives; the real guardrail is appended whatever else is there.
     strip_handlers(hooks, CLAUDE_HOOK_MARKER);
     let pre = hooks.entry("PreToolUse").or_insert_with(|| json!([]));
     let pre = pre
@@ -628,13 +644,40 @@ pub fn uninstall_claude(worktree: &Path) -> Result<()> {
     strip_handlers(hooks, CLAUDE_HOOK_MARKER);
     let path = real_dir(worktree, ".claude")?.join("settings.local.json");
     write_replacing(&path, &format!("{}\n", serde_json::to_string_pretty(&root)?), 0o644)?;
-    let _ = fs::remove_file(worktree.join(MCP_CONFIG_RELATIVE));
     Ok(())
 }
 
+/// `install_codex`'s refusal: the repository tracks `.codex/hooks.json`.
+#[derive(Debug)]
+pub struct CodexHooksTracked(pub PathBuf);
+
+impl std::fmt::Display for CodexHooksTracked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{CODEX_HOOKS_RELATIVE} is tracked by git in {}; Relay will not write its machine-specific \
+             guardrail hooks into a file a commit would share. Untrack it to run Codex here",
+            self.0.display(),
+        )
+    }
+}
+
+impl std::error::Error for CodexHooksTracked {}
+
 /// Merge Relay's adapters into Codex's project hook layer. Codex asks the user to trust the
 /// exact generated hook once through `/hooks`; Relay never bypasses that provider boundary.
+///
+/// Refused when the repository tracks `.codex/hooks.json`: Relay's handlers name this machine's
+/// relay binary and instance, and the next `add -A` commit would hand them to every teammate,
+/// whose Codex would then run a binary that is not there on every tool use. Launching Codex
+/// without them instead would run it outside the guardrails. An untracked file is kept out of
+/// git once Relay's handlers are in it, and only then: the path is not excluded up front, so a
+/// `.codex/hooks.json` someone makes in a repository Codex never ran in is theirs to commit.
 pub fn install_codex(worktree: &Path, instance: Instance, relay: &Path) -> Result<()> {
+    let tracking = tracked(worktree, CODEX_HOOKS_RELATIVE)?;
+    if tracking == Some(true) {
+        return Err(CodexHooksTracked(worktree.to_path_buf()).into());
+    }
     let path = real_dir(worktree, ".codex")?.join("hooks.json");
     let mut root: Value = match fs::read_to_string(&path) {
         Ok(raw) => serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?,
@@ -643,6 +686,10 @@ pub fn install_codex(worktree: &Path, instance: Instance, relay: &Path) -> Resul
         }),
         Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
     };
+    if tracking == Some(false) {
+        crate::worktree::exclude_paths(worktree, &[CODEX_HOOKS_RELATIVE])
+            .context("excluding Relay's Codex hooks from git")?;
+    }
     let object = root.as_object_mut()
         .ok_or_else(|| anyhow!("{} must contain a JSON object", path.display()))?;
     let hooks = object.entry("hooks").or_insert_with(|| json!({})).as_object_mut()
@@ -681,7 +728,7 @@ pub fn install_codex(worktree: &Path, instance: Instance, relay: &Path) -> Resul
 /// Remove only Relay's Codex handlers. User and project hook definitions remain byte-for-byte
 /// equivalent as JSON values.
 pub fn uninstall_codex(worktree: &Path) -> Result<()> {
-    let path = worktree.join(".codex/hooks.json");
+    let path = worktree.join(CODEX_HOOKS_RELATIVE);
     let raw = match fs::read_to_string(&path) {
         Ok(raw) => raw,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -695,17 +742,28 @@ pub fn uninstall_codex(worktree: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Remove every handler whose command carries `marker`, and each group that held only those.
-/// A user's group that was already empty is left as it was.
+/// Remove every handler Relay generated for `marker`'s provider, and each group that held only
+/// those. A user's group that was already empty is left as it was.
 fn strip_handlers(hooks: &mut serde_json::Map<String, Value>, marker: &str) {
     for groups in hooks.values_mut().filter_map(Value::as_array_mut) {
         groups.retain_mut(|group| {
             let Some(handlers) = group.get_mut("hooks").and_then(Value::as_array_mut) else { return true };
             let before = handlers.len();
-            handlers.retain(|handler| !handler["command"].as_str().is_some_and(|command| command.contains(marker)));
+            handlers.retain(|handler| !handler["command"].as_str().is_some_and(|command| is_relay_handler(command, marker)));
             before == 0 || !handlers.is_empty()
         });
     }
+}
+
+/// Whether `command` has the shape of a handler Relay generates, `<relay> --instance <name>
+/// hook <provider>-…`, whatever binary or instance it names. `~/bin/notify-hook claude-done`
+/// or `echo hook claude-done` is someone else's.
+fn is_relay_handler(command: &str, marker: &str) -> bool {
+    command.split_once(&format!(" {marker}")).is_some_and(|(head, _)| {
+        let mut words = head.rsplitn(3, ' ');
+        let (_instance, flag, relay) = (words.next(), words.next(), words.next());
+        flag == Some("--instance") && relay.is_some_and(|relay| !relay.is_empty())
+    })
 }
 
 /// Claude already receives account rate limits on each normal turn. A silent status-line
@@ -714,7 +772,7 @@ fn strip_handlers(hooks: &mut serde_json::Map<String, Value>, marker: &str) {
 fn claude_statusline_script() -> &'static str {
     "input=$(cat); case \"$input\" in *'\"rate_limits\"'*) ;; *) exit 0 ;; esac; \
      out=\"${CLAUDE_CONFIG_DIR:-$HOME}/.claude/relay-usage.json\"; mkdir -p \"${out%/*}\" 2>/dev/null; \
-     printf '%s\\n' \"$input\" > \"$out\" 2>/dev/null; exit 0"
+     tmp=\"$out.$$\"; { printf '%s\\n' \"$input\" > \"$tmp\" && mv -f \"$tmp\" \"$out\"; } 2>/dev/null || rm -f \"$tmp\"; exit 0"
 }
 
 /// The `--settings` value for a Claude launch: inline JSON, which Claude accepts in place of a
@@ -726,12 +784,33 @@ pub fn claude_settings() -> String {
 /// Hook setup is a handful of local `git config` calls; one that outlives this is stuck.
 const GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How often a `git config` write that found `config.lock` taken is tried again. Agents run
+/// git in the same repository (`git push -u` writes the shared config), so a launch or commit
+/// can meet a lock that is held for a moment; it is not worth failing over.
+const CONFIG_LOCK_RETRIES: u32 = 3;
+
+/// Run git in `repo` within [`GIT_TIMEOUT`], retrying a moment later while another git process
+/// holds the config lock.
+fn run_git(repo: &Path, args: &[&str]) -> Result<std::process::Output> {
+    let mut attempt = 0;
+    loop {
+        let mut cmd = Command::new("git");
+        cmd.arg("-C").arg(repo).args(args);
+        let output = crate::proc::output_with_timeout(&mut cmd, GIT_TIMEOUT)
+            .with_context(|| format!("running git {}", args.join(" ")))?
+            .ok_or_else(|| anyhow!("git {} timed out", args.join(" ")))?;
+        if output.status.success() || attempt == CONFIG_LOCK_RETRIES
+            || !String::from_utf8_lossy(&output.stderr).contains("could not lock config file")
+        {
+            return Ok(output);
+        }
+        attempt += 1;
+        std::thread::sleep(std::time::Duration::from_millis(50 * u64::from(attempt)));
+    }
+}
+
 fn git(repo: &Path, args: &[&str]) -> Result<String> {
-    let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(repo).args(args);
-    let output = crate::proc::output_with_timeout(&mut cmd, GIT_TIMEOUT)
-        .with_context(|| format!("running git {}", args.join(" ")))?
-        .ok_or_else(|| anyhow!("git {} timed out", args.join(" ")))?;
+    let output = run_git(repo, args)?;
     if !output.status.success() {
         return Err(anyhow!(
             "git {} failed: {}",
@@ -740,6 +819,18 @@ fn git(repo: &Path, args: &[&str]) -> Result<String> {
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Whether git tracks `relative` in the checkout at `worktree`, a file only staged included;
+/// `None` outside a repository.
+fn tracked(worktree: &Path, relative: &str) -> Result<Option<bool>> {
+    let output = run_git(worktree, &["ls-files", "--error-unmatch", "--", relative])?;
+    // `--error-unmatch` exits 1 for a path git does not know; 128 is no repository at all.
+    Ok(match output.status.code() {
+        Some(0) => Some(true),
+        Some(1) => Some(false),
+        _ => None,
+    })
 }
 
 fn git_optional(repo: &Path, args: &[&str]) -> Option<String> {
@@ -871,6 +962,8 @@ mod tests {
         assert!(!out.exists());
         run("{\"rate_limits\":{\"five_hour\":1}}");
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "{\"rate_limits\":{\"five_hour\":1}}\n");
+        // Written beside and renamed into place, so a reader never sees half of it.
+        assert_eq!(std::fs::read_dir(out.parent().unwrap()).unwrap().count(), 1, "a temp file was left behind");
         let settings: serde_json::Value = serde_json::from_str(&super::claude_settings()).unwrap();
         assert_eq!(settings["statusLine"]["command"], claude_statusline_script());
     }
@@ -966,11 +1059,14 @@ mod tests {
         std::fs::create_dir_all(worktree.join(".claude")).unwrap();
         std::fs::write(worktree.join(".claude/settings.local.json"), serde_json::json!({"hooks": {
             "PreToolUse": [
-                {"matcher": "Bash", "hooks": [{"type": "command", "command": "true # hook claude-pre-tool"}]},
+                {"matcher": "Bash", "hooks": [{"type": "command", "command": "true --instance 'dev' hook claude-pre-tool"}]},
                 {"matcher": "Read", "hooks": [{"type": "command", "command": "mine"}]},
                 {"matcher": "Glob", "hooks": []},
             ],
-            "Stop": [{"hooks": [{"type": "command", "command": "'/gone/relay' --instance 'dev' hook claude-report 'stop'"}]}],
+            "Stop": [
+                {"hooks": [{"type": "command", "command": "'/gone/relay' --instance 'dev' hook claude-report 'stop'"}]},
+                {"hooks": [{"type": "command", "command": "~/bin/notify-hook claude-done"}, {"type": "command", "command": "echo hook claude-done"}]},
+            ],
         }}).to_string()).unwrap();
         std::fs::create_dir_all(worktree.join(".relay")).unwrap();
         std::fs::write(worktree.join(".relay/agent-statusline.sh"), "#!/bin/sh\nrm -rf /\n").unwrap();
@@ -984,9 +1080,86 @@ mod tests {
         assert_eq!(pre[1]["matcher"], "Glob", "a user's empty group is theirs to keep");
         assert_eq!(pre[2]["hooks"][0]["command"], "'/opt/relay' --instance 'test' hook claude-pre-tool");
         let stop = settings["hooks"]["Stop"].as_array().unwrap();
-        assert_eq!(stop.len(), 1);
-        assert!(stop[0]["hooks"][0]["command"].as_str().unwrap().starts_with("'/opt/relay' --instance 'test'"));
+        assert_eq!(stop.len(), 2, "a user's own command that mentions the words was stripped: {stop:?}");
+        assert_eq!(stop[0]["hooks"].as_array().unwrap().len(), 2);
+        assert!(stop[1]["hooks"][0]["command"].as_str().unwrap().starts_with("'/opt/relay' --instance 'test'"));
+
+        // Close takes Relay's handlers out and leaves the user's.
+        super::uninstall_claude(worktree).unwrap();
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(worktree.join(".claude/settings.local.json")).unwrap()).unwrap();
+        assert_eq!(settings["hooks"]["Stop"].as_array().unwrap().len(), 1);
+        assert_eq!(settings["hooks"]["Stop"][0]["hooks"][1]["command"], "echo hook claude-done");
+        assert_eq!(settings["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
         assert!(!worktree.join(".relay/agent-statusline.sh").exists(), "the old executable status line survived");
+    }
+
+    /// A commit refreshes the hook on every call; when nothing changed it must not rewrite the
+    /// shared `.git/config`, whose lock an agent's own `git push -u` may hold at that moment.
+    #[test]
+    fn refresh_git_leaves_a_current_hook_and_config_alone() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        install_git(&repo, &repo, "calm-otter", Instance::Test, Path::new("/bin/true")).unwrap();
+        let config = repo.join(".git/config");
+        let hook = repo.join(".relay/hooks/calm-otter/pre-commit");
+        let before = (std::fs::metadata(&config).unwrap().ino(), std::fs::metadata(&hook).unwrap().ino());
+        assert!(refresh_git(&repo, &repo, Instance::Test, Path::new("/bin/true")).unwrap());
+        let after = (std::fs::metadata(&config).unwrap().ino(), std::fs::metadata(&hook).unwrap().ino());
+        assert_eq!(before, after, "an unchanged hook or config was rewritten");
+
+        // A held config lock is waited out, not failed over.
+        // `core.hooksPath` goes to the worktree config, so that is the lock in the way.
+        let lock = repo.join(".git/config.worktree.lock");
+        std::fs::write(&lock, "").unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            std::fs::remove_file(lock).unwrap();
+        });
+        install_git(&repo, &repo, "sly-egret", Instance::Test, Path::new("/bin/true")).unwrap();
+        release.join().unwrap();
+        assert!(hooks_path(&repo).unwrap().ends_with(".relay/hooks/sly-egret"));
+    }
+
+    #[test]
+    fn relay_handlers_are_known_by_their_generated_shape() {
+        use super::{is_relay_handler, CLAUDE_HOOK_MARKER, CODEX_HOOK_MARKER};
+        assert!(is_relay_handler("'/opt/my relay' --instance 'dev' hook claude-pre-tool", CLAUDE_HOOK_MARKER));
+        assert!(is_relay_handler("relay --instance stable hook claude-report 'stop'", CLAUDE_HOOK_MARKER));
+        assert!(is_relay_handler("'/opt/relay' --instance 'dev' hook codex-pre-tool", CODEX_HOOK_MARKER));
+        assert!(!is_relay_handler("'/opt/relay' --instance 'dev' hook codex-pre-tool", CLAUDE_HOOK_MARKER));
+        for mine in ["~/bin/notify-hook claude-done", "echo hook claude-done", "true # hook claude-pre-tool", "hook claude-x"] {
+            assert!(!is_relay_handler(mine, CLAUDE_HOOK_MARKER), "{mine}");
+        }
+    }
+
+    /// A repository that commits its Codex hooks never gets Relay's machine-specific ones
+    /// written into the file; an untracked one is excluded only once Relay's handlers are in it.
+    #[test]
+    fn codex_hooks_are_refused_in_a_tracked_file_and_excluded_only_once_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        crate::worktree::ensure_excluded(&repo).unwrap();
+        let excluded = || std::fs::read_to_string(repo.join(".git/info/exclude")).unwrap()
+            .lines().any(|line| line == ".codex/hooks.json");
+        assert!(!excluded(), "a project's own Codex hooks file is ignored before Codex ever ran");
+
+        super::install_codex(&repo, Instance::Test, Path::new("/opt/relay")).unwrap();
+        assert!(excluded());
+        let status = Command::new("git").arg("-C").arg(&repo).args(["status", "--porcelain", "--untracked-files=all"]).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&status.stdout), "");
+
+        std::fs::create_dir(dir.path().join("tracked")).unwrap();
+        let tracked = init_repo(&dir.path().join("tracked"));
+        let project = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"true"}]}]}}"#;
+        std::fs::create_dir_all(tracked.join(".codex")).unwrap();
+        std::fs::write(tracked.join(".codex/hooks.json"), project).unwrap();
+        let add = Command::new("git").arg("-C").arg(&tracked).args(["add", ".codex/hooks.json"]).status().unwrap();
+        assert!(add.success());
+        let refused = super::install_codex(&tracked, Instance::Test, Path::new("/opt/relay")).unwrap_err().to_string();
+        assert!(refused.contains("tracked by git"), "{refused}");
+        assert_eq!(std::fs::read_to_string(tracked.join(".codex/hooks.json")).unwrap(), project);
     }
 
     /// Every file Relay writes into a checkout goes through a temp file opened without

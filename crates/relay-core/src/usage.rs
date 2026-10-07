@@ -186,15 +186,12 @@ fn number(value: &Value) -> Option<f64> {
 fn reset_label(value: &Value) -> Option<String> {
     let seconds = reset_epoch(value)? as f64;
     let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs_f64();
-    Some(crate::time::span(seconds.saturating_sub(now) as u64, crate::time::Unit::Minute))
+    Some(crate::time::span((seconds - now).max(0.0) as u64, crate::time::Unit::Minute))
 }
 
 fn clean_name(value: &str) -> String {
     value.trim().to_ascii_lowercase().replace([' ', '-'], "_")
 }
-
-trait SaturatingSubF64 { fn saturating_sub(self, rhs: Self) -> Self; }
-impl SaturatingSubF64 for f64 { fn saturating_sub(self, rhs: Self) -> Self { (self - rhs).max(0.0) } }
 
 #[cfg(test)]
 mod tests {
