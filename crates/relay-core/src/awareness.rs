@@ -20,6 +20,8 @@ struct AssignedTask {
     column: String,
     state: String,
     module_id: Option<Id>,
+    /// This session already reported the task done; the rest of its group has not.
+    completed: bool,
 }
 
 /// `sessions.task_id` is the current task, while `task_sessions` is the ordered queue.
@@ -27,7 +29,7 @@ struct AssignedTask {
 fn assigned_tasks(conn: &Connection, session_id: Id) -> Result<Vec<AssignedTask>, BusError> {
     let mut stmt = conn
         .prepare(
-            "SELECT t.id,t.title,t.body,t.changelog,t.col,t.state,t.module_id
+            "SELECT t.id,t.title,t.body,t.changelog,t.col,t.state,t.module_id,ts.completed_at IS NOT NULL
          FROM task_sessions ts JOIN tasks t ON t.id=ts.task_id
          WHERE ts.session_id=?1 AND t.deleted_at IS NULL AND t.col!='done'
          ORDER BY CASE WHEN t.id=(SELECT task_id FROM sessions WHERE id=?1) THEN 0 ELSE 1 END,
@@ -45,6 +47,7 @@ fn assigned_tasks(conn: &Connection, session_id: Id) -> Result<Vec<AssignedTask>
                 column: record.get(4)?,
                 state: record.get(5)?,
                 module_id: record.get(6)?,
+                completed: record.get(7)?,
             })
         })
         .bus()?
@@ -221,12 +224,19 @@ pub fn brief(
         }
         state.push_str(&format!("\nassigned_tasks: {}", tasks.len()));
         for task in &tasks {
+            // Labelled from the task's real column: a task moved back to the backlog is
+            // parked, not in review (RA-308).
             let queue_state = if Some(task.id) == session.task_id {
                 "CURRENT"
-            } else if task.column == "active" {
-                "QUEUED"
+            } else if task.completed {
+                "DONE, WAITING FOR GROUP"
             } else {
-                "IN REVIEW"
+                match task.column.as_str() {
+                    "active" => "QUEUED",
+                    "in_review" => "IN REVIEW",
+                    "ready" => "READY",
+                    _ => "BACKLOG",
+                }
             };
             state.push_str(&format!(
                 "\n\nTask #{} [{}]: {}\ncolumn: {}\ntask_state: {}",

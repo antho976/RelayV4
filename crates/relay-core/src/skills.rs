@@ -288,17 +288,6 @@ pub fn apply(plan: &Plan, store: &crate::Store) -> Result<()> {
     Ok(())
 }
 
-/// Plan and apply in one step, for callers already holding the transaction that launched.
-pub fn materialize(conn: &Connection, store: &crate::Store, root: &Path, project_id: Id) -> Result<()> {
-    apply(&plan(conn, root, project_id)?, store)
-}
-
-/// The same for the machine-wide folders, so a launching session finds its skills registered
-/// with whichever provider it is.
-pub fn materialize_user(conn: &Connection, store: &crate::Store, instance: crate::Instance) -> Result<()> {
-    apply(&plan_user(conn, instance)?, store)
-}
-
 /// Serializes [`refresh_all`] for one engine and folds a burst of requests into one pass.
 /// Every skill or plugin change asks for a refresh on a thread of its own; unserialized, a pass
 /// that planned before the latest change could finish after the pass that saw it, and leave
@@ -469,19 +458,17 @@ mod tests {
         fs::create_dir_all(&hand_written).unwrap();
         fs::write(hand_written.join("SKILL.md"), "mine").unwrap();
 
-        {
-            let conn = store.lock();
-            materialize_user(&conn, &store, crate::Instance::Test).unwrap();
-        }
+        // Planned under the lock, copied after it is released (D147).
+        let plan = plan_user(&store.lock(), crate::Instance::Test).unwrap();
+        apply(&plan, &store).unwrap();
         for base in &bases {
             assert_eq!(fs::read_to_string(base.join("impeccable/SKILL.md")).unwrap(), "design well");
         }
         // Switching it off in the only project that had it takes it out of the shared homes.
         store.with_tx(|tx| { tx.execute("DELETE FROM skill_projects", [])?; Ok(()) }).unwrap();
-        {
-            let conn = store.lock();
-            materialize_user(&conn, &store, crate::Instance::Test).unwrap();
-        }
+        // Planned under the lock, copied after it is released (D147).
+        let plan = plan_user(&store.lock(), crate::Instance::Test).unwrap();
+        apply(&plan, &store).unwrap();
         assert!(!bases[1].join("impeccable").exists(), "a disabled skill stayed in the codex home");
         assert_eq!(
             fs::read_to_string(hand_written.join("SKILL.md")).unwrap(),

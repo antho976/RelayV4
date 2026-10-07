@@ -8,8 +8,7 @@ use crate::pty;
 use anyhow::Result;
 use relay_bus::ops::app::RecoveryReport;
 use relay_bus::types::Id;
-use rusqlite::params;
-use serde_json::Value;
+use rusqlite::{params, OptionalExtension};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -96,6 +95,9 @@ pub fn run_with(engine: &Engine, dirty_scan: DirtyScan) -> Result<RecoveryReport
                 Some(p) => format!("pid {p} is dead"),
                 None => "no pid recorded".to_string(),
             };
+            // No scrollback is saved here: the PTY died with the old engine, so a resume shows
+            // the last park or graceful-shutdown snapshot, if any. Nothing flushes on an
+            // interval (no timers, SPEC §15).
             tx.execute("UPDATE sessions SET state='restorable',pid=NULL,restore_reason='crash',updated_at=?1 WHERE id=?2", params![now, id])?;
             report
                 .fsck_fixes
@@ -313,17 +315,20 @@ fn dirty_worktrees(repos: &[String]) -> Vec<String> {
     out
 }
 
+/// A failed read is an error, not "nothing happened"; a stored report that no longer parses is
+/// logged and reads as none, since the next launch's recovery overwrites it (RA-620).
 pub fn last(conn: &rusqlite::Connection) -> Result<Option<RecoveryReport>> {
     let raw: Option<String> = conn
-        .query_row(
-            "SELECT value FROM meta WHERE key = 'recovery.last'",
-            [],
-            |r| r.get(0),
-        )
-        .ok();
-    Ok(raw
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .and_then(|v| serde_json::from_value(v).ok()))
+        .prepare_cached("SELECT value FROM meta WHERE key = 'recovery.last'")?
+        .query_row([], |r| r.get(0))
+        .optional()?;
+    Ok(raw.and_then(|s| match serde_json::from_str::<RecoveryReport>(&s) {
+        Ok(report) => Some(report),
+        Err(error) => {
+            tracing::warn!(%error, "stored recovery report does not parse");
+            None
+        }
+    }))
 }
 
 /// Delete open `task_sessions` rows that queue a task for a session outside the review group
