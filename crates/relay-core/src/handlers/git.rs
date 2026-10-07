@@ -1545,7 +1545,7 @@ struct GhRepo {
 
 fn list_pull_requests(gh: &Path, root: &Path) -> Result<PrListOut, BusError> {
     let mut command = std::process::Command::new(gh);
-    command.current_dir(root).args([
+    command.current_dir(root).env("GH_PROMPT_DISABLED", "1").args([
         "api",
         "--paginate",
         "--slurp",
