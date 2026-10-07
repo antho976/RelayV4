@@ -1235,7 +1235,8 @@ test that opens a DB at each prior version.
 
 - **No pagination cursors.** One user; `limit ≤ 1000`; if a list is bigger, the filter is
   wrong.
-- **No per-request auth beyond tokens.** Same uid = same trust (§0.6). Tokens prevent
+- **No per-request auth beyond tokens.** Same uid = same trust (§0.6) on the socket; over the
+  phone door, `user` is whoever holds a paired device's token (§4.2). Tokens prevent
   misattribution, and the peer check on `user` (§4.2) stops an agent's own process tree from
   claiming the user; neither stops determined impersonation by a same-uid process that gets
   itself started outside that tree.
