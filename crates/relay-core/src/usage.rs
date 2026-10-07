@@ -186,7 +186,7 @@ fn number(value: &Value) -> Option<f64> {
 fn reset_label(value: &Value) -> Option<String> {
     let seconds = reset_epoch(value)? as f64;
     let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs_f64();
-    let remaining = seconds.saturating_sub(now) as u64;
+    let remaining = (seconds - now).max(0.0) as u64;
     let days = remaining / 86_400;
     let hours = (remaining % 86_400) / 3600;
     let minutes = (remaining % 3600) / 60;
@@ -196,9 +196,6 @@ fn reset_label(value: &Value) -> Option<String> {
 fn clean_name(value: &str) -> String {
     value.trim().to_ascii_lowercase().replace([' ', '-'], "_")
 }
-
-trait SaturatingSubF64 { fn saturating_sub(self, rhs: Self) -> Self; }
-impl SaturatingSubF64 for f64 { fn saturating_sub(self, rhs: Self) -> Self { (self - rhs).max(0.0) } }
 
 #[cfg(test)]
 mod tests {
