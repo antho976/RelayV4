@@ -203,6 +203,28 @@ pub const REASON_MAX: usize = 4 * 1024;
 /// The longest `value`: a command line, a path or a pair of caps.
 pub const VALUE_MAX: usize = 8 * 1024;
 
+/// Unicode's format characters (general category Cf): bidi embeddings, overrides and isolates,
+/// zero-width spaces and joiners, the word joiner and invisible operators, the byte-order mark,
+/// and the rest. None is visible as itself, and the bidi ones reorder what is around them.
+const FORMAT_CHARS: &[(char, char)] = &[
+    ('\u{00AD}', '\u{00AD}'), ('\u{0600}', '\u{0605}'), ('\u{061C}', '\u{061C}'), ('\u{06DD}', '\u{06DD}'),
+    ('\u{070F}', '\u{070F}'), ('\u{0890}', '\u{0891}'), ('\u{08E2}', '\u{08E2}'), ('\u{180E}', '\u{180E}'),
+    ('\u{200B}', '\u{200F}'), ('\u{202A}', '\u{202E}'), ('\u{2060}', '\u{2064}'), ('\u{2066}', '\u{206F}'),
+    ('\u{FEFF}', '\u{FEFF}'), ('\u{FFF9}', '\u{FFFB}'), ('\u{110BD}', '\u{110BD}'), ('\u{110CD}', '\u{110CD}'),
+    ('\u{13430}', '\u{1343F}'), ('\u{1BCA0}', '\u{1BCA3}'), ('\u{1D173}', '\u{1D17A}'), ('\u{E0001}', '\u{E0001}'),
+    ('\u{E0020}', '\u{E007F}'),
+];
+
+/// The first character of a command that would not read as itself in an approval prompt: a
+/// format character (bidi controls, zero-width characters, see [`FORMAT_CHARS`]) or a control
+/// character other than a newline (RA-555). The person approves what they read, and the grant
+/// covers the bytes, so the two must be the same.
+fn hidden_char(value: &str) -> Option<char> {
+    value.chars().find(|&c| {
+        (c.is_control() && c != '\n') || FORMAT_CHARS.iter().any(|&(lo, hi)| (lo..=hi).contains(&c))
+    })
+}
+
 /// Check a request's shape before it reaches a person.
 pub fn validate(kind: ExceptionKind, value: &str, reason: &str) -> Result<(), BusError> {
     if reason.trim().is_empty() {
@@ -220,6 +242,12 @@ pub fn validate(kind: ExceptionKind, value: &str, reason: &str) -> Result<(), Bu
             "guardrail.request",
             format!("value is {} bytes; the limit is {VALUE_MAX}", value.len()),
         ));
+    }
+    if let (ExceptionKind::Command, Some(c)) = (kind, hidden_char(value)) {
+        return Err(BusError::invalid(
+            "guardrail.request",
+            format!("value contains U+{:04X}, an invisible, bidi or control character; a person must be able to read the exact command", c as u32),
+        ).with_hint("write the command in plain visible characters; a tab or carriage return is a space or a newline"));
     }
     match kind {
         ExceptionKind::Command if value.is_empty() => {
@@ -521,5 +549,20 @@ mod tests {
         assert_eq!(long.unwrap_err().kind, relay_bus::ErrorKind::Invalid);
         let long = super::validate(ExceptionKind::Path, &"a/".repeat(super::VALUE_MAX), "need it");
         assert_eq!(long.unwrap_err().kind, relay_bus::ErrorKind::Invalid);
+    }
+
+    /// RA-555: a command whose bytes would not read as themselves in the prompt is refused:
+    /// bidi controls, zero-width and other format characters, and controls other than newline.
+    #[test]
+    fn hidden_characters_in_a_command_are_refused() {
+        for c in ['\u{202A}', '\u{202E}', '\u{2066}', '\u{2069}', '\u{200E}', '\u{200F}', '\u{061C}',
+                  '\u{200B}', '\u{200D}', '\u{2060}', '\u{FEFF}', '\u{00AD}', '\u{E0041}', '\t', '\r', '\u{1B}', '\u{7F}', '\u{85}'] {
+            let err = super::validate(ExceptionKind::Command, &format!("rm -rf {c}target"), "need it").unwrap_err();
+            assert_eq!(err.kind, relay_bus::ErrorKind::Invalid, "{c:?}");
+            assert!(err.message.contains(&format!("U+{:04X}", c as u32)), "{c:?}: {}", err.message);
+        }
+        assert!(super::validate(ExceptionKind::Command, "cd dist\nrm -rf target", "need it").is_ok(), "a newline separates commands");
+        assert!(super::validate(ExceptionKind::Command, "echo 'héllo wörld' ✓", "need it").is_ok(), "visible non-ASCII is fine");
+        assert!(super::validate(ExceptionKind::Path, "/tmp/a\u{200B}b", "need it").is_ok(), "only commands are checked");
     }
 }

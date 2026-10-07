@@ -18,6 +18,9 @@ const TRAY_LIMIT: usize = 3;
 /// How long a prompt takes to slide in, and to slide away once it is answered.
 const PROMPT_IN_MS: u32 = 260;
 const PROMPT_OUT_MS: u32 = 180;
+/// How long a prompt's Approve keys stay off once it has slid fully in, as a browser's
+/// permission prompt does: it arrives unannounced, under wherever the pointer was aimed.
+const ARM_MS: u64 = 500;
 /// The name a prompt takes while it slides away, so it no longer counts as showing.
 const LEAVING: &str = "guardrail-leaving";
 
@@ -31,6 +34,94 @@ fn paragraph(value: &str, class: &str) -> gtk::Label {
 
 fn mono(value: &str) -> gtk::Label {
     let l = paragraph(value, "guardrail-subject");
+    l.add_css_class("mono");
+    l
+}
+
+/// The color hidden-character escapes and their card's warning are drawn in: theme.css's @held.
+/// Markup, not a style class, so the escape stands out inside a label of ordinary text.
+const HIDDEN_COLOR: &str = "#e5382e";
+
+/// A character that changes how text reads without showing itself: bidi embeddings, overrides,
+/// isolates and marks, zero-width and other invisible format characters, the separators a label
+/// breaks lines on, and every control character but a newline.
+fn is_hidden(c: char) -> bool {
+    matches!(c,
+        '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}' | '\u{061C}'
+        | '\u{200B}'..='\u{200D}' | '\u{2060}'..='\u{2064}' | '\u{206A}'..='\u{206F}' | '\u{FEFF}'
+        | '\u{00AD}' | '\u{034F}' | '\u{115F}' | '\u{1160}' | '\u{17B4}' | '\u{17B5}' | '\u{180B}'..='\u{180F}'
+        | '\u{2028}' | '\u{2029}' | '\u{3164}' | '\u{FFA0}' | '\u{FE00}'..='\u{FE0F}' | '\u{FFF9}'..='\u{FFFB}'
+        | '\u{E0000}'..='\u{E007F}' | '\u{E0100}'..='\u{E01EF}')
+        || (c.is_control() && c != '\n')
+}
+
+/// Agent-supplied text made safe to read: each hidden character replaced by a visible escape.
+#[derive(Debug, PartialEq)]
+struct Revealed {
+    /// For a plain-text label or a notice: `<U+202E>` in place of the character.
+    plain: String,
+    /// The same as Pango markup, the escapes highlighted so a literal `<U+202E>` reads apart.
+    markup: String,
+    /// How many characters were replaced.
+    hidden: usize,
+}
+
+/// Every agent-supplied string a guardrail card shows passes through here. Pango applies the
+/// bidi algorithm to label text and draws zero-width characters as nothing, so a command or a
+/// path could otherwise read differently from the bytes being approved.
+fn reveal(value: &str) -> Revealed {
+    let mut out = Revealed { plain: String::with_capacity(value.len()), markup: String::new(), hidden: 0 };
+    let mut run = String::new();
+    for c in value.chars() {
+        if !is_hidden(c) {
+            out.plain.push(c);
+            run.push(c);
+            continue;
+        }
+        let escape = format!("<U+{:04X}>", c as u32);
+        out.markup.push_str(&glib::markup_escape_text(&run));
+        run.clear();
+        out.markup.push_str(&format!(
+            "<span foreground=\"{HIDDEN_COLOR}\" weight=\"bold\">{}</span>",
+            glib::markup_escape_text(&escape)
+        ));
+        out.plain.push_str(&escape);
+        out.hidden += 1;
+    }
+    out.markup.push_str(&glib::markup_escape_text(&run));
+    out
+}
+
+/// The line a card shows, hidden until needed, when agent text in it carried hidden characters.
+fn hidden_flag() -> gtk::Label {
+    let flag = label("", "body");
+    flag.set_markup(&format!(
+        "<span foreground=\"{HIDDEN_COLOR}\" weight=\"bold\">Contains hidden characters.</span> \
+         They are shown below as &lt;U+…&gt;; what was sent may read differently from what it does."
+    ));
+    flag.set_wrap(true);
+    flag.set_visible(false);
+    flag
+}
+
+/// Put agent-supplied `value` in `target` with its hidden characters escaped, showing the
+/// card's `flag` when there were any.
+fn set_agent_text(target: &gtk::Label, value: &str, flag: &gtk::Label) {
+    let shown = reveal(value);
+    target.set_markup(&shown.markup);
+    if shown.hidden > 0 {
+        flag.set_visible(true);
+    }
+}
+
+fn agent_paragraph(value: &str, class: &str, flag: &gtk::Label) -> gtk::Label {
+    let l = paragraph("", class);
+    set_agent_text(&l, value, flag);
+    l
+}
+
+fn agent_mono(value: &str, flag: &gtk::Label) -> gtk::Label {
+    let l = agent_paragraph(value, "guardrail-subject", flag);
     l.add_css_class("mono");
     l
 }
@@ -185,16 +276,16 @@ pub fn hold_summary(hold: &Value) -> (String, String) {
     if is_request(hold) {
         let request = as_request(hold);
         return (
-            format!("{} asks for an exception", text(&request, "session")),
-            format!("{} {}", kind_verb(text(&request, "kind")), text(&request, "value")),
+            reveal(&format!("{} asks for an exception", text(&request, "session"))).plain,
+            reveal(&format!("{} {}", kind_verb(text(&request, "kind")), clip(text(&request, "value")))).plain,
         );
     }
     let (policy, details) = effective(hold);
     let session = text(hold, "session");
-    let what = subject(hold, &details);
+    let what = clip(&subject(hold, &details));
     (
         format!("Guardrail: {}", policy_title(&policy).to_lowercase()),
-        [session, what.as_str()].iter().filter(|s| !s.is_empty()).copied().collect::<Vec<_>>().join(" · "),
+        reveal(&[session, what.as_str()].iter().filter(|s| !s.is_empty()).copied().collect::<Vec<_>>().join(" · ")).plain,
     )
 }
 
@@ -223,7 +314,7 @@ fn detail_pairs(details: &Value) -> Vec<(String, String)> {
         .collect()
 }
 
-fn details_grid(details: &Value) -> Option<gtk::Expander> {
+fn details_grid(details: &Value, flag: &gtk::Label) -> Option<gtk::Expander> {
     let pairs = detail_pairs(details);
     if pairs.is_empty() {
         return None;
@@ -232,7 +323,7 @@ fn details_grid(details: &Value) -> Option<gtk::Expander> {
     grid.add_css_class("guardrail-details");
     for (row, (name, value)) in pairs.iter().enumerate() {
         grid.attach(&label(name, "faint"), 0, row as i32, 1, 1);
-        let value = paragraph(&clip(value), "body");
+        let value = agent_paragraph(&clip(value), "body", flag);
         value.set_hexpand(true);
         grid.attach(&value, 1, row as i32, 1, 1);
     }
@@ -264,25 +355,29 @@ pub fn hold_row(ui: &Rc<Ui>, hold: Value) -> gtk::Box {
     card.add_css_class("record");
     card.add_css_class("guardrail-card");
     card.append(&head(policy_title(&policy), &ago(text(&hold, "created_at"))));
+    let flag = hidden_flag();
+    card.append(&flag);
     let who = text(&hold, "session");
     let what = subject(&hold, &details);
-    let heading = label(
+    let heading = label("", "title");
+    set_agent_text(
+        &heading,
         &if who.is_empty() || text(&hold, "actor") == "user" {
             "Your own action is held".to_string()
         } else {
             format!("{who} is waiting on you")
         },
-        "title",
+        &flag,
     );
     card.append(&heading);
     if !what.is_empty() {
-        card.append(&mono(&clip(&what)));
+        card.append(&agent_mono(&clip(&what), &flag));
     }
     let why = explain(&policy, &details);
     if !why.is_empty() {
-        card.append(&paragraph(&clip(&why), "body"));
+        card.append(&agent_paragraph(&clip(&why), "body", &flag));
     }
-    if let Some(grid) = details_grid(&details) {
+    if let Some(grid) = details_grid(&details, &flag) {
         card.append(&grid);
     }
     let exact = mono("");
@@ -319,7 +414,7 @@ pub fn hold_row(ui: &Rc<Ui>, hold: Value) -> gtk::Box {
                 Ok(v) => {
                     if v["outcome"]["ok"] == false {
                         let error = &v["outcome"]["error"];
-                        ui.show_error(&format!("Allowed, but the action then failed: {}", text(error, "message")));
+                        ui.show_error(&reveal(&format!("Allowed, but the action then failed: {}", clip(text(error, "message")))).plain);
                     }
                     ui.refresh_page();
                 }
@@ -342,6 +437,7 @@ pub fn hold_row(ui: &Rc<Ui>, hold: Value) -> gtk::Box {
         key.set_sensitive(false);
         let key = key.clone();
         let exact = exact.clone();
+        let flag = flag.clone();
         let allow_key = allow_key.clone();
         let id = id.clone();
         glib::spawn_future_local(async move {
@@ -349,8 +445,10 @@ pub fn hold_row(ui: &Rc<Ui>, hold: Value) -> gtk::Box {
                 Ok(v) => {
                     let request = &v["request"];
                     let mut shown = format!("{}\n", text(request, "op"));
+                    // JSON escapes only quotes, backslashes and C0 controls: a bidi override
+                    // in the payload would otherwise reach the label raw.
                     shown.push_str(&serde_json::to_string_pretty(&clip_strings(&request["payload"])).unwrap_or_default());
-                    exact.set_text(&shown);
+                    set_agent_text(&exact, &shown, &flag);
                     exact.set_visible(true);
                     key.set_label("Hide exact action");
                     if let Some(allow) = allow_key.upgrade() {
@@ -432,8 +530,24 @@ fn denial_form(ui: &Rc<Ui>, card: &gtk::Box, keys: &gtk::Box, id: Value, placeho
     }
 }
 
+/// What the notice says once a request is approved: who may now do what, and for how long.
+fn approved_notice(request: &Value, scope: &str) -> String {
+    let value = text(request, "value");
+    let what = match value.char_indices().nth(120) {
+        None if value.is_empty() => String::new(),
+        None => format!(" “{value}”"),
+        Some((at, _)) => format!(" “{}…”", &value[..at]),
+    };
+    reveal(&format!(
+        "Approved: {} may {}{what} {}. The agent has been told to retry.",
+        text(request, "session"), kind_verb(text(request, "kind")), scope_phrase(scope),
+    ))
+    .plain
+}
+
 /// An agent's request for an exception, with the three answers. `compact` is the prompt form.
-pub fn exception_card(ui: &Rc<Ui>, request: &Value, compact: bool) -> gtk::Box {
+/// Also returns the two Approve keys; a prompt's start insensitive, for `prompt_slot` to arm.
+pub fn exception_card(ui: &Rc<Ui>, request: &Value, compact: bool) -> (gtk::Box, [gtk::Button; 2]) {
     let request = as_request(request);
     let id = request["id"].as_i64().unwrap_or_default();
     let card = gtk::Box::new(gtk::Orientation::Vertical, 8);
@@ -454,30 +568,36 @@ pub fn exception_card(ui: &Rc<Ui>, request: &Value, compact: bool) -> gtk::Box {
         _ => "Exception request".to_owned(),
     };
     card.append(&head(&eyebrow, &ago(text(&request, "created_at"))));
+    let flag = hidden_flag();
+    card.append(&flag);
     let session = text(&request, "session");
     let kind = text(&request, "kind");
     let value = text(&request, "value");
-    let heading = label(&format!("{session} asks to {}", kind_verb(kind)), "title");
+    let heading = label("", "title");
+    set_agent_text(&heading, &format!("{session} asks to {}", kind_verb(kind)), &flag);
     heading.set_wrap(true);
     heading.set_xalign(0.0);
     card.append(&heading);
     if !value.is_empty() {
-        card.append(&mono(&clip(value)));
+        card.append(&agent_mono(&clip(value), &flag));
     }
     let reason = text(&request, "reason");
     if !reason.is_empty() {
-        let why = paragraph(&format!("“{}”", clip(reason)), "body");
+        let why = agent_paragraph(&format!("“{}”", clip(reason)), "body", &flag);
         why.add_css_class("guardrail-reason");
         card.append(&why);
     }
     let asked = text(&request, "requested_scope");
-    card.append(&label(
+    let lifted = label("", "faint");
+    set_agent_text(
+        &lifted,
         &format!(
             "Asked for {}. Only this rule is lifted, and only for {session}.",
             if asked == "session" { "the rest of the session" } else { "one use" },
         ),
-        "faint",
-    ));
+        &flag,
+    );
+    card.append(&lifted);
     let keys = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     keys.add_css_class("guardrail-keys");
     let once = button("Approve once", if asked == "session" { "" } else { "primary" });
@@ -506,19 +626,26 @@ pub fn exception_card(ui: &Rc<Ui>, request: &Value, compact: bool) -> gtk::Box {
     let opener = denial_form(ui, &card, &keys, json!(id), "Why not? The agent reads this");
     deny.connect_clicked(move |_| opener());
     for (key, scope) in [(&once, "once"), (&always, "session")] {
+        if compact {
+            // Off until the prompt has been on screen a moment (prompt_slot): it arrives
+            // unannounced, and a click meant for the terminal under it must not approve it.
+            key.set_sensitive(false);
+        }
         let weak = Rc::downgrade(ui);
         let all = keys.downgrade();
+        let notice = approved_notice(&request, scope);
         key.connect_clicked(move |_| {
             let Some(ui) = weak.upgrade() else { return };
             if let Some(keys) = all.upgrade() {
                 keys.set_sensitive(false);
             }
             let all = all.clone();
+            let notice = notice.clone();
             glib::spawn_future_local(async move {
                 match ui.call("guardrail.confirm", json!({"hold_id": id, "scope": scope})).await {
                     Ok(_) => {
                         close_prompt(&ui, id);
-                        ui.show_error(&format!("Exception approved {}. The agent has been told to retry.", scope_phrase(scope)));
+                        ui.show_error(&notice);
                         ui.refresh_page();
                     }
                     Err(e) => {
@@ -534,7 +661,7 @@ pub fn exception_card(ui: &Rc<Ui>, request: &Value, compact: bool) -> gtk::Box {
             });
         });
     }
-    card
+    (card, [once, always])
 }
 
 fn tray(ui: &Rc<Ui>) -> gtk::Box {
@@ -639,26 +766,45 @@ fn show_prompt(ui: &Rc<Ui>, request: &Value) {
         // A request shown in the tray is no longer waiting, whichever path brought it here.
         WAITING.with(|w| w.borrow_mut().retain(|r| r["id"] != request["id"]));
         // The overflow line is re-added below, so it always ends the tray.
-        tray.append(&prompt_slot(&exception_card(ui, request, true), id));
+        let (card, approve) = exception_card(ui, request, true);
+        tray.append(&prompt_slot(&card, approve, id));
     }
     let hidden = WAITING.with(|w| w.borrow().len());
     update_overflow(ui, &tray, hidden);
 }
 
 /// A prompt card inside a revealer: it slides up and fades in on the next frame, rather than
-/// appearing all at once over whatever you are doing.
-fn prompt_slot(card: &gtk::Box, id: i64) -> gtk::Revealer {
+/// appearing all at once over whatever you are doing. Its `approve` keys come on [`ARM_MS`]
+/// after it has finished sliding in.
+fn prompt_slot(card: &gtk::Box, approve: [gtk::Button; 2], id: i64) -> gtk::Revealer {
     let slot = gtk::Revealer::new();
     slot.set_widget_name(&format!("guardrail-request-{id}"));
     slot.set_transition_type(gtk::RevealerTransitionType::SlideUp);
     slot.set_transition_duration(PROMPT_IN_MS);
     card.add_css_class("leaving");
     slot.set_child(Some(card));
+    let approve = approve.map(|key| key.downgrade());
+    let armed = Cell::new(false);
     // A revealer clips its child, shadow included. Clip only while sliding.
-    slot.connect_child_revealed_notify(|slot| {
-        if slot.is_child_revealed() {
-            slot.set_overflow(gtk::Overflow::Visible);
+    slot.connect_child_revealed_notify(move |slot| {
+        if !slot.is_child_revealed() {
+            return;
         }
+        slot.set_overflow(gtk::Overflow::Visible);
+        if armed.replace(true) {
+            return;
+        }
+        let approve = approve.clone();
+        let slot = slot.downgrade();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(ARM_MS), move || {
+            // Answered or put off in the meantime: it is sliding away, and stays off.
+            if slot.upgrade().is_none_or(|slot| slot.widget_name() == LEAVING) {
+                return;
+            }
+            for key in approve.iter().filter_map(|key| key.upgrade()) {
+                key.set_sensitive(true);
+            }
+        });
     });
     // Started from a frame callback so the hidden state is drawn once and the fade has
     // something to fade from.
@@ -892,7 +1038,7 @@ pub async fn page(ui: &Rc<Ui>, body: &gtk::Box, project: i64, holds: Vec<Value>)
         section(body, "EXCEPTION REQUESTS", "Agents that cannot progress without passing a guardrail. Approving lifts only the named rule, for that session.");
         for request in &requests {
             let key = format!("request-{}", as_request(request)["id"]);
-            place(key, &|| exception_card(ui, request, false));
+            place(key, &|| exception_card(ui, request, false).0);
         }
     }
     if !held.is_empty() {
@@ -919,7 +1065,9 @@ pub async fn page(ui: &Rc<Ui>, body: &gtk::Box, project: i64, holds: Vec<Value>)
             body.append(&label("Shared file activity", "title"));
         }
         for overlap in overlaps {
-            body.append(&paragraph(&format!("{}\n{}", text(&overlap, "path"), text(&overlap, "note")), "body"));
+            let flag = hidden_flag();
+            body.append(&agent_paragraph(&format!("{}\n{}", text(&overlap, "path"), clip(text(&overlap, "note"))), "body", &flag));
+            body.append(&flag);
         }
     }
 
@@ -955,13 +1103,14 @@ fn grant_row(ui: &Rc<Ui>, grant: &Value) -> gtk::Box {
     let copy = gtk::Box::new(gtk::Orientation::Vertical, 4);
     copy.set_hexpand(true);
     let scope = text(grant, "scope");
-    copy.append(&label(
-        &format!("{} may {}", text(grant, "session"), kind_verb(text(grant, "kind"))),
-        "body",
-    ));
+    let flag = hidden_flag();
+    let who = label("", "body");
+    set_agent_text(&who, &format!("{} may {}", text(grant, "session"), kind_verb(text(grant, "kind"))), &flag);
+    copy.append(&who);
     if !text(grant, "value").is_empty() {
-        copy.append(&mono(&clip(text(grant, "value"))));
+        copy.append(&agent_mono(&clip(text(grant, "value")), &flag));
     }
+    copy.append(&flag);
     let uses = grant["uses"].as_u64().unwrap_or(0);
     let lasting = if scope == "session" {
         match uses {
@@ -999,4 +1148,81 @@ fn grant_row(ui: &Rc<Ui>, grant: &Value) -> gtk::Box {
     });
     row.append(&revoke);
     row
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plain_text_passes_through_and_is_markup_escaped() {
+        let shown = reveal("rm -rf build/ && echo <done>\nnext line");
+        assert_eq!(shown.hidden, 0);
+        assert_eq!(shown.plain, "rm -rf build/ && echo <done>\nnext line");
+        assert_eq!(shown.markup, "rm -rf build/ &amp;&amp; echo &lt;done&gt;\nnext line");
+    }
+
+    #[test]
+    fn bidi_controls_become_visible_escapes() {
+        let shown = reveal("cp a\u{202E}b c");
+        assert_eq!(shown.hidden, 1);
+        assert_eq!(shown.plain, "cp a<U+202E>b c");
+        assert!(shown.markup.contains("&lt;U+202E&gt;</span>"), "{}", shown.markup);
+        assert!(shown.markup.starts_with("cp a<span ") && shown.markup.ends_with("</span>b c"));
+    }
+
+    #[test]
+    fn every_listed_character_is_caught() {
+        let listed = [
+            '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}',
+            '\u{2069}', '\u{200E}', '\u{200F}', '\u{061C}', '\u{200B}', '\u{200C}', '\u{200D}', '\u{2060}',
+            '\u{FEFF}', '\t', '\r', '\0', '\u{7F}', '\u{85}', '\u{E0041}',
+        ];
+        for c in listed {
+            let shown = reveal(&format!("a{c}b"));
+            assert_eq!(shown.hidden, 1, "{:04X}", c as u32);
+            assert_eq!(shown.plain, format!("a<U+{:04X}>b", c as u32));
+        }
+        assert_eq!(reveal("x\u{E0041}").plain, "x<U+E0041>");
+    }
+
+    #[test]
+    fn ordinary_unicode_is_left_alone() {
+        let shown = reveal("café/日本語/עברית “quoted” — ok\n");
+        assert_eq!(shown.hidden, 0);
+        assert_eq!(shown.plain, "café/日本語/עברית “quoted” — ok\n");
+    }
+
+    #[test]
+    fn a_typed_escape_is_not_counted_or_highlighted() {
+        let shown = reveal("<U+202E>");
+        assert_eq!(shown.hidden, 0);
+        assert_eq!(shown.markup, "&lt;U+202E&gt;");
+    }
+
+    #[test]
+    fn summaries_and_notices_escape_hidden_characters() {
+        let hold = json!({
+            "op": "guardrail.request", "session": "agent\u{200B}one",
+            "details": {"kind": "command", "value": "git push \u{2066}--force\u{2069}"},
+        });
+        let (title, summary) = hold_summary(&hold);
+        assert_eq!(title, "agent<U+200B>one asks for an exception");
+        assert_eq!(summary, "run git push <U+2066>--force<U+2069>");
+        let notice = approved_notice(&as_request(&hold), "once");
+        assert_eq!(notice, "Approved: agent<U+200B>one may run “git push <U+2066>--force<U+2069>” once. The agent has been told to retry.");
+    }
+
+    #[test]
+    fn notice_names_the_session_and_scope() {
+        let request = json!({"session": "worker", "kind": "path", "value": "/etc/hosts"});
+        assert_eq!(
+            approved_notice(&request, "session"),
+            "Approved: worker may write to “/etc/hosts” for the rest of the session. The agent has been told to retry."
+        );
+        let caps = json!({"session": "worker", "kind": "cap", "value": ""});
+        assert_eq!(approved_notice(&caps, "once"), "Approved: worker may commit past the change caps once. The agent has been told to retry.");
+        let long = json!({"session": "w", "kind": "command", "value": "x".repeat(500)});
+        assert!(approved_notice(&long, "once").contains(&format!("“{}…”", "x".repeat(120))));
+    }
 }

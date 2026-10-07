@@ -246,6 +246,13 @@ pub(crate) fn task_columns(row: &Row) -> rusqlite::Result<Task> {
         id: row.get("id")?,
         project_id: row.get("project_id")?,
         module_id: row.get("module_id")?,
+        // `task.list` selects the name with the row; [`hydrate`] looks up the rest by key.
+        // Neither asks whether the module is completed: an archived module still names its
+        // cards (RA-495).
+        module_name: match row.as_ref().column_index("module_name") {
+            Ok(index) => row.get(index)?,
+            Err(_) => None,
+        },
         title: row.get("title")?,
         body: row.get("body")?,
         changelog: row.get("changelog")?,
@@ -327,6 +334,11 @@ pub(crate) fn hydrate(tx: &rusqlite::Connection, tasks: &mut [Task]) -> rusqlite
     }
     for (id, child) in each(tx, "SELECT parent_id, id FROM tasks WHERE parent_id IN (SELECT value FROM json_each(?1)) AND deleted_at IS NULL ORDER BY parent_id,position,id", &ids, |r| Ok((r.get(0)?, r.get(1)?)))? {
         tasks[at[&id]].children.push(child);
+    }
+    if tasks.iter().any(|t| t.module_name.is_none() && t.module_id.is_some()) {
+        for (id, name) in each(tx, "SELECT t.id, m.name FROM tasks t JOIN modules m ON m.id=t.module_id WHERE t.id IN (SELECT value FROM json_each(?1))", &ids, |r| Ok((r.get(0)?, r.get(1)?)))? {
+            tasks[at[&id]].module_name.get_or_insert(name);
+        }
     }
     for task in tasks.iter_mut() {
         task.rollup = rollup_of(tx, task.id, &task.children)?;
@@ -958,7 +970,10 @@ pub fn register(e: &mut Engine) {
         if let Some(sort) = p.sort.as_deref() {
             if !matches!(sort, "column" | "priority" | "updated") { return Err(BusError::invalid("task.sort", "sort must be column, priority, or updated")) }
         }
-        let mut sql = String::from("SELECT * FROM tasks WHERE 1=1");
+        // The module's name rides along, completed modules included, so the board needs no
+        // second `module.list` to label cards (RA-495). A keyed subquery is the LEFT JOIN on
+        // `modules.id` without making every filter below name its table.
+        let mut sql = String::from("SELECT *, (SELECT m.name FROM modules m WHERE m.id=tasks.module_id) AS module_name FROM tasks WHERE 1=1");
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if !p.include_deleted.unwrap_or(false) { sql.push_str(" AND deleted_at IS NULL"); }
         if let Some(v)=p.project_id { sql.push_str(" AND project_id=?"); args.push(Box::new(v)); }

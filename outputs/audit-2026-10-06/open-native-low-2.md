@@ -67,3 +67,13 @@ or for after it releases the files, rather than edited in parallel.
 - **RA-491**: following a guardrail notification now opens the agents wall (D121). Notifications
   without a link still show an "Open" affordance, which D121's last sentence says they should not.
   Either the code or `docs/engine/DECISIONS.md` should change.
+
+## Closed afterwards on `relay/plucky-ferret` (2026-10-07)
+
+Everything above is now fixed, on top of `relay/spry-zebra`. The engine ops are `notify.list`
+`count_only` and `unread`, `module_name` on every task row, and `project.reorder` and
+`workspace.reorder` (one transaction, one undo entry, one event). `grants::validate` now refuses
+hidden characters in command values. RA-491 follows D121: a notification with no link the client
+can route has no Open button. RA-743's helpers live in the new default member `crates/relay-board`.
+RA-525 was already closed by spry-zebra. As before, none of the native changes has been run in
+the app.

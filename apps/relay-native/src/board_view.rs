@@ -11,17 +11,9 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use task_pages::{COLUMNS, COLUMN_TITLES, OPEN_COLUMNS, PRIORITIES, SIZES, TYPES};
+// The board's pure logic lives in relay-board, which builds without GTK so CI tests it.
+use relay_board::{drop_index, group_of, group_title, task_matches, zone, Filters, Nudge, Zone, URGENT_FIRST};
 
-/// [`PRIORITIES`] most urgent first, the order the board groups and offers them in.
-const URGENT_FIRST: [&str; 4] = {
-    let mut urgent_first = PRIORITIES;
-    let mut i = 0;
-    while i < PRIORITIES.len() {
-        urgent_first[i] = PRIORITIES[PRIORITIES.len() - 1 - i];
-        i += 1;
-    }
-    urgent_first
-};
 const GROUPS: [(&str, &str); 7] = [
     ("", "None"),
     ("parent", "Parent"),
@@ -32,7 +24,6 @@ const GROUPS: [(&str, &str); 7] = [
     ("session", "Agent"),
 ];
 
-type Filters = BTreeMap<String, BTreeSet<String>>;
 /// Rendered lanes (or list sections) in order, each with its visible cards in order.
 type Lanes = Vec<(String, Vec<(i64, gtk::Widget)>)>;
 type Action = Box<dyn Fn(&Rc<Board>)>;
@@ -42,34 +33,6 @@ thread_local! {
 }
 fn current() -> Option<Rc<Board>> {
     BOARD.with(|board| board.borrow().clone())
-}
-
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum Zone {
-    Before,
-    Into,
-    After,
-}
-/// Where a drop lands on a card: its top and bottom 30% insert beside it, the middle nests.
-fn zone(y: f64, height: f64) -> Zone {
-    if height <= 0. || y < height * 0.3 {
-        Zone::Before
-    } else if y > height * 0.7 {
-        Zone::After
-    } else {
-        Zone::Into
-    }
-}
-
-/// The index `moving` should end at when dropped beside `onto`, in a column's board order
-/// (`task.move` positions are final indices among the column's other tasks).
-fn drop_index(order: &[i64], moving: i64, onto: i64, after: bool) -> usize {
-    let others: Vec<_> = order.iter().filter(|id| **id != moving).collect();
-    others
-        .iter()
-        .position(|id| **id == onto)
-        .map(|at| at + after as usize)
-        .unwrap_or(others.len())
 }
 
 /// Every task by id, built once per render: a card's links are looked up, not scanned for.
@@ -92,68 +55,6 @@ fn caption(column: &str) -> &'static str {
         .find(|(name, _)| *name == column)
         .map(|(_, title)| *title)
         .unwrap_or("Backlog")
-}
-
-fn task_matches(task: &Value, filters: &Filters, query: &str) -> bool {
-    filters.iter().all(|(key, values)| {
-        values.is_empty()
-            || values.iter().any(|value| match key.as_str() {
-                "parent" if value == "roots" => task["parent_id"].is_null(),
-                "parent" | "module" => task[if key == "parent" { "parent_id" } else { "module_id" }]
-                    .as_i64()
-                    .is_some_and(|id| id.to_string() == *value),
-                "label" | "session" => task[if key == "label" { "labels" } else { "sessions" }]
-                    .as_array()
-                    .is_some_and(|list| list.iter().any(|v| v.as_str() == Some(value))),
-                key => text(task, key) == value,
-            })
-    }) && (query.is_empty() || haystack(task).contains(query))
-}
-fn haystack(task: &Value) -> String {
-    let join = |key: &str| {
-        rows(task, key)
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
-    format!(
-        "#{} {} {} {} {} {}",
-        task["id"],
-        text(task, "title"),
-        text(task, "body"),
-        join("labels"),
-        join("sessions"),
-        text(task, "_module_name")
-    )
-    .to_lowercase()
-}
-
-/// A group's sort rank, a space, then its heading: priority and size keep their own order and
-/// the fallback groups (`Unassigned`, `No module`…) sort after every named one.
-fn group_of(task: &Value, grouping: &str) -> String {
-    let named = |name: Option<&str>, none: &str| match name {
-        Some(name) => format!("0 {name}"),
-        None => format!("9 {none}"),
-    };
-    match grouping {
-        "parent" => named(task["_parent_title"].as_str(), "Top level"),
-        "module" => named(task["_module_name"].as_str(), "No module"),
-        "session" => named(task["sessions"].as_array().and_then(|v| v.last()).and_then(Value::as_str), "Unassigned"),
-        "" => String::new(),
-        "priority" => {
-            let p = text(task, "priority");
-            format!("{} {p}", URGENT_FIRST.iter().position(|x| *x == p).unwrap_or(9))
-        }
-        "size" => match text(task, "size") {
-            "" => "9 None".into(),
-            s => format!("{} {s}", SIZES.iter().position(|x| *x == s).unwrap_or(8)),
-        },
-        key => named(task[key].as_str(), "None"),
-    }
-}
-fn group_title(group: &str) -> String {
-    group.split_once(' ').map(|(_, g)| g).unwrap_or(group).to_string()
 }
 
 /// `5m`, `3h`, `2d`: how long ago an RFC 3339 timestamp was, at a glance.
@@ -865,15 +766,7 @@ impl Board {
     }
     /// Every live task of `column` in board order, filters ignored: the order positions index.
     fn column_order(&self, column: &str) -> Vec<i64> {
-        let mut tasks: Vec<_> = self
-            .tasks
-            .borrow()
-            .iter()
-            .filter(|t| text(t, "column") == column)
-            .map(|t| (t["position"].as_i64().unwrap_or(0), t["id"].as_i64().unwrap_or(0)))
-            .collect();
-        tasks.sort();
-        tasks.into_iter().map(|(_, id)| id).collect()
+        relay_board::column_order(&self.tasks.borrow(), column)
     }
 
     fn act(self: &Rc<Self>, op: &'static str, payload: Value) {
@@ -1280,21 +1173,29 @@ impl Board {
         if column == "done" {
             return;
         }
-        let neighbour = self.layout.borrow().iter().find(|(lane, _)| *lane == column).and_then(|(_, cards)| {
-            let at = cards.iter().position(|(card, _)| *card == id)? as i64 + delta;
-            usize::try_from(at).ok().and_then(|at| cards.get(at)).map(|(card, _)| *card)
-        });
-        let Some(neighbour) = neighbour.and_then(|other| self.task(other)) else { return };
-        let grouping = self.group.borrow().clone();
-        if group_of(task, &grouping) != group_of(&neighbour, &grouping) {
-            if let Some(ui) = self.ui() {
-                ui.show_error("Cards keep to their group: change the task or the grouping to move it past one.");
+        let step = {
+            let tasks = self.tasks.borrow();
+            let all = by_id(&tasks);
+            let layout = self.layout.borrow();
+            let lane: Vec<&Value> = layout
+                .iter()
+                .find(|(lane, _)| *lane == column)
+                .map(|(_, cards)| cards.iter().filter_map(|(card, _)| all.get(card).copied()).collect())
+                .unwrap_or_default();
+            relay_board::nudge(&lane, &relay_board::column_order(&tasks, &column), id, delta, &self.group.borrow())
+        };
+        match step {
+            Nudge::Edge => {}
+            Nudge::CrossesGroup => {
+                if let Some(ui) = self.ui() {
+                    ui.show_error("Cards keep to their group: change the task or the grouping to move it past one.");
+                }
             }
-            return;
+            Nudge::To(at) => {
+                self.focused.set(Some(id));
+                self.move_to(task, &column, Some(at));
+            }
         }
-        let Some(onto) = neighbour["id"].as_i64() else { return };
-        self.focused.set(Some(id));
-        self.move_to(task, &column, Some(drop_index(&self.column_order(&column), id, onto, delta > 0)));
     }
 
     fn toggle_peek(self: &Rc<Self>, id: i64) {
@@ -1462,7 +1363,7 @@ impl Board {
                     "module" => tasks
                         .iter()
                         .find(|t| t["module_id"].as_i64() == value.parse().ok())
-                        .and_then(|t| t["_module_name"].as_str())
+                        .and_then(|t| t["module_name"].as_str())
                         .unwrap_or(value)
                         .to_string(),
                     "parent" if value == "roots" => "top level".into(),
@@ -1552,7 +1453,7 @@ impl Board {
             if let Some(id) = task["module_id"].as_i64() {
                 modules.insert(
                     id.to_string(),
-                    task["_module_name"].as_str().map(str::to_string).unwrap_or_else(|| format!("Module #{id}")),
+                    task["module_name"].as_str().map(str::to_string).unwrap_or_else(|| format!("Module #{id}")),
                 );
             }
             labels.extend(rows(task, "labels").iter().filter_map(|v| v.as_str().map(str::to_string)));
@@ -1657,19 +1558,7 @@ impl Board {
     }
 
     fn sorted<'a>(&self, visible: &[&'a Value], column: &str) -> Vec<&'a Value> {
-        let grouping = self.group.borrow().clone();
-        let mut tasks: Vec<&Value> = visible
-            .iter()
-            .copied()
-            .filter(|t| text(t, "column") == column)
-            .collect();
-        tasks.sort_by(|a, b| {
-            group_of(a, &grouping)
-                .cmp(&group_of(b, &grouping))
-                .then_with(|| a["position"].as_i64().cmp(&b["position"].as_i64()))
-                .then_with(|| a["id"].as_i64().cmp(&b["id"].as_i64()))
-        });
-        tasks
+        relay_board::sorted(visible, column, &self.group.borrow())
     }
 
     fn lane_head(self: &Rc<Self>, column: &str, shown: usize, total: usize, class: &str) -> gtk::Box {
@@ -1978,7 +1867,7 @@ impl Board {
 
         let foot = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         foot.add_css_class("card-foot");
-        if let Some(module) = task["_module_name"].as_str() {
+        if let Some(module) = task["module_name"].as_str() {
             let caption = label(module, "card-module");
             caption.set_ellipsize(gtk::pango::EllipsizeMode::End);
             caption.set_max_width_chars(16);
@@ -2074,7 +1963,7 @@ impl Board {
         if let Some(badge) = state_badge(text(task, "state")) {
             row.append(&badge);
         }
-        if let Some(module) = task["_module_name"].as_str() {
+        if let Some(module) = task["module_name"].as_str() {
             let caption = label(module, "list-meta");
             caption.set_ellipsize(gtk::pango::EllipsizeMode::End);
             caption.set_max_width_chars(14);
@@ -2542,7 +2431,7 @@ impl Board {
                 .map(|b| b.upcast::<gtk::Widget>())
                 .unwrap_or_else(|| value("Idle")),
         );
-        if let Some(module) = task["_module_name"].as_str() {
+        if let Some(module) = task["module_name"].as_str() {
             prop("Module", &value(module));
         }
         let agents: Vec<String> = rows(&task, "sessions").iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
@@ -2654,44 +2543,6 @@ impl Board {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn filters(pairs: &[(&str, &str)]) -> Filters {
-        let mut map = Filters::new();
-        for (k, v) in pairs {
-            map.entry(k.to_string()).or_default().insert(v.to_string());
-        }
-        map
-    }
-    #[test]
-    fn lens_combines_metadata_and_text_without_matching_unrelated_fields() {
-        let task = json!({"id":9,"title":"Fix notes","body":"Keep drafts","type":"bug","priority":"high","size":"M","parent_id":2,"module_id":3,"labels":["native"],"sessions":["egret"]});
-        assert!(task_matches(
-            &task,
-            &filters(&[("type", "bug"), ("label", "native"), ("session", "egret"), ("parent", "2")]),
-            "drafts"
-        ));
-        assert!(!task_matches(&task, &filters(&[("parent", "roots")]), ""));
-        assert!(!task_matches(&task, &filters(&[("module", "4")]), ""));
-        assert!(!task_matches(&task, &Filters::new(), "high"));
-        // Several values of one key are alternatives; keys still all have to match.
-        assert!(task_matches(&task, &filters(&[("type", "bug"), ("type", "chore")]), ""));
-        assert!(!task_matches(&task, &filters(&[("type", "bug"), ("priority", "low")]), ""));
-        assert!(task_matches(&task, &Filters::new(), "#9"));
-    }
-    #[test]
-    fn drops_beside_a_card_compute_its_final_index() {
-        let order = [1, 2, 3, 4];
-        // Down the column: the moving card is not counted among the others.
-        assert_eq!(drop_index(&order, 1, 3, false), 1);
-        assert_eq!(drop_index(&order, 1, 3, true), 2);
-        // Up the column.
-        assert_eq!(drop_index(&order, 4, 2, false), 1);
-        // From another column.
-        assert_eq!(drop_index(&order, 9, 4, true), 4);
-        assert_eq!(drop_index(&order, 9, 7, false), 4);
-        assert_eq!(zone(1., 100.), Zone::Before);
-        assert_eq!(zone(50., 100.), Zone::Into);
-        assert_eq!(zone(90., 100.), Zone::After);
-    }
     #[test]
     fn ages_read_at_a_glance() {
         // The wording itself is relative.rs's; the board owns what an unreadable time shows.
@@ -2704,21 +2555,8 @@ mod tests {
     }
     #[test]
     fn derived_orders_follow_the_one_vocabulary() {
-        assert_eq!(URGENT_FIRST, ["urgent", "high", "medium", "low"]);
         assert_eq!(COLUMNS, COLUMN_TITLES.map(|(c, _)| c));
         assert_eq!(OPEN_COLUMNS, &COLUMNS[..COLUMNS.len() - 1]);
         assert!(!OPEN_COLUMNS.contains(&"done"));
-    }
-    #[test]
-    fn groups_sort_in_their_own_order_with_fallbacks_last() {
-        let sizes: Vec<String> = ["L", "", "S", "M"]
-            .iter()
-            .map(|s| group_of(&json!({"size": s}), "size"))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        assert_eq!(sizes.iter().map(|g| group_title(g)).collect::<Vec<_>>(), ["S", "M", "L", "None"]);
-        assert!(group_of(&json!({"sessions":[]}), "session") > group_of(&json!({"sessions":["zebra"]}), "session"));
-        assert_eq!(group_title(&group_of(&json!({}), "module")), "No module");
     }
 }

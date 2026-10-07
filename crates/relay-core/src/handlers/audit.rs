@@ -8,6 +8,13 @@ use rusqlite::OptionalExtension;
 use serde_json::Value;
 
 fn target_updated_at(ctx: &Ctx, op: &str, payload: &Value) -> Result<Option<String>, BusError> {
+    if let Some((table, key)) = match op {
+        "project.reorder" => Some(("projects", "project_id")),
+        "workspace.reorder" => Some(("workspaces", "workspace_id")),
+        _ => None,
+    } {
+        return reordered_at(ctx, table, key, payload);
+    }
     let (table, key) = if op.starts_with("task.") {
         ("tasks", "task_id")
     } else if op.starts_with("module.") {
@@ -44,6 +51,24 @@ fn open_session(ctx: &Ctx, payload: &Value) -> Result<Option<Value>, BusError> {
     let Some(id) = id else { return Ok(None) };
     let Some(row) = crate::sessions::by_id(ctx.tx(), id)? else { return Ok(None) };
     serde_json::to_value(&row.session).map(Some).bus()
+}
+
+/// A reorder stamps every row it writes with one `updated_at`. That stamp while all of them
+/// still carry it; `None` (stale) once any one was edited since, removed, or not named.
+fn reordered_at(ctx: &Ctx, table: &str, key: &str, payload: &Value) -> Result<Option<String>, BusError> {
+    let sql = format!("SELECT updated_at FROM {table} WHERE id=?1");
+    let mut stmt = ctx.tx().prepare_cached(&sql).bus()?;
+    let mut shared: Option<String> = None;
+    for entry in payload.get("orders").and_then(Value::as_array).into_iter().flatten() {
+        let Some(id) = entry.get(key).and_then(Value::as_i64) else { return Ok(None) };
+        let Some(at) = stmt.query_row([id], |row| row.get::<_, String>(0)).optional().bus()? else { return Ok(None) };
+        match &shared {
+            Some(first) if *first != at => return Ok(None),
+            Some(_) => {}
+            None => shared = Some(at),
+        }
+    }
+    Ok(shared)
 }
 
 /// The settings subtree an op writes: `""` is the whole tree.
