@@ -1,11 +1,69 @@
 # Audit findings left open: native code quality, engine tests, perf harness
 
-Scope: the Low findings RA-650..722 and RA-741/742, fixed on branch `relay/spry-zebra`
-(2026-10-07). Each entry below is open in full or in part. It says why, and what closing it
-would take. Findings not listed are fixed, or were already fixed when checked (RA-669's CI
-timeout, RA-680, RA-688's editor side, RA-699's and RA-703's app.rs parts).
+Scope: the Low findings RA-650..722 and RA-741/742, fixed on branch `relay/spry-zebra` and then
+on `relay/brisk-heron` (both 2026-10-07). "Still open" is the current list; the history section
+keeps the list as spry-zebra left it, with what closing each item would take. Findings named
+nowhere here are fixed, or were already fixed when checked (RA-669's CI timeout, RA-680,
+RA-688's editor side, RA-699's and RA-703's app.rs parts).
 
-## Held by another session the whole time (amber-heron)
+## Closed on `relay/brisk-heron` (2026-10-07)
+
+Everything the list below used to hold as open was taken up again on `relay/brisk-heron`.
+What is still open, in full or in part, is under "Still open"; the rest is fixed:
+
+- perf.rs halves of RA-650..657, plus RA-652 and RA-653: the response leaves the timed
+  region before it is sized, `ok` comes from the call, "during" rows report their overlap
+  (`device.build`/`task.list` variants dropped), startup/recovery scans are drained between
+  iterations, strace attaches under Yama scope 1 and counts only between markers, and filters
+  match exactly unless they end in `*` (`baseline.py` follows). RA-651 needed no change:
+  `isolate_host` already points git at the fixture's own config.
+- RA-675..678, RA-742 (sessions.rs, store.rs), RA-671 (every listed file uses `tests/common`),
+  RA-665 (the signing test opens a file store in a TempDir).
+- RA-672: every relay-core test binary sets `GIT_CONFIG_GLOBAL=/dev/null` and
+  `GIT_CONFIG_NOSYSTEM=1` before `main` (a `ctor` in `lib.rs` tests and `tests/common`); the
+  whole suite passes with a global `core.hooksPath` pointing at a failing hook.
+- RA-673 (`watch::DEBOUNCE`), RA-674 (`watch_tick`, tested), RA-689 (`time::span`;
+  `relative::span` in the client), RA-709 (`Skill.description` from one parser; the native and
+  mobile parsers are gone).
+- RA-663: the `usage.report` doc drift is corrected and `tests/usage_source.rs` tests which
+  source `usage.get` prefers.
+- RA-686 and RA-692: the pure git-view and mirror logic, and the client's mirror payload
+  builders, live in the headless `relay-client` crate, which CI tests; `tests/native_input.rs`
+  builds its payloads with them, so it can no longer drift from the client.
+- RA-681, RA-690 (`Choice`), RA-707, RA-710 (editor scheme from the palette table; the
+  extensions summary uses `@secondary`; the Notes close red `#c42b1c` stays, by decision),
+  RA-717, RA-719, RA-720.
+- The roadmap tools part: the skills widget names were still current; it failed earlier, at
+  the branch picker's switch key, and now opens the picker first.
+
+Found and fixed on the way: `guardrail::write_roots` keyed a linked worktree's primary memory
+root on `.git/worktrees`; stored stamps had variable-width fractions, so their text did not
+sort in time order (now nine digits always, and `list_backups` sorts by instant); the fake
+`gh` unit test could fail with ETXTBSY; and since 54a6cdd the native client never restored the
+saved layout at launch, and dropped layout changes until a later refresh (`refresh` passed
+`restore_layout` project 0 on the first pass). With that fixed, `scripts/native-smoke.py` was run
+on a live display and passed end to end: every page, burst, and the roadmap parts `notes`,
+`files`, `lifecycle`, `tools` and `registry`. That also needed four harness fixes, none of them
+app bugs: Notes reopens its note after the library restores tabs, lifecycle follows the new
+session's own pane, the tools check skips parked panes, and registry returns to Agents first.
+
+## Still open
+
+- **RA-655, RA-656, live.** strace is not installed on the machine this was done on, so the
+  attach under scope 1 and the marker counting ran only against a synthetic trace (unit test
+  `cargo test -p relay-core --example perf`).
+- **RA-663, production half.** `usage.get`'s test-instance branch stays: the test instance
+  must not read the developer's real provider files, and the real path is now tested on a dev
+  instance. After-close cleanup and `after_merged_prs` stay off in tests: turning them on
+  starts a thread that runs the real `gh` and races `branch_cleanup.rs`'s assertions.
+  `sh` vs `fish` would need a setting nobody asked for.
+- **RA-686.** The `image_preview.rs` tests decode Pixbufs and stay in relay-native.
+- **New figures.** BASELINE and FIXES keep their historical numbers, with the notes about
+  the old harness reworded; no new run was taken with the fixed harness.
+
+## History: as left by `relay/spry-zebra`
+
+### Held by another session the whole time (amber-heron)
 
 `crates/relay-core/examples/perf.rs`, `tests/sessions.rs`, `tests/store.rs` and
 `tests/agent_surface.rs` stayed claimed by amber-heron, which was still fixing Medium engine
@@ -53,7 +111,7 @@ findings in them, so they were not edited here.
   in-memory store, so it still leaves `/tmp/relay-signing-test-*` directories behind. Fix: open
   a file store in a `TempDir`, as `bus.rs` now does.
 
-## Needs engine changes (production code other sessions hold)
+### Needs engine changes (production code other sessions hold)
 
 - **RA-663, production half.** `handlers/session.rs` (after-close cleanup), `git.rs`
   (`after_merged_prs`), `provider.rs` (usage file reads) and `device.rs` (`sh` vs `fish`)
@@ -77,7 +135,7 @@ findings in them, so they were not edited here.
   by `status_usage.rs` `span()`) still format time themselves. The native client now has one
   helper, `relative.rs`.
 
-## CI cannot build the native client
+### CI cannot build the native client
 
 - **RA-686.** The pure diff, graph and status logic in `code_git.rs` is tested only inside
   relay-native, which CI never builds (GTK 4.14 on the runners, 4.22 needed). Plan: move
@@ -91,7 +149,7 @@ findings in them, so they were not edited here.
   `mirror/decode.rs`; `coalesce`, `map_point` and `scroll_amount` in `mirror/input.rs`) still
   build only with relay-native. Moving them needs a headless module in the default members.
 
-## Deliberately not done (cost out of proportion for a Low)
+### Deliberately not done (cost out of proportion for a Low)
 
 - **RA-681, the split.** The dead state is gone and the close policy is its own method.
   Splitting `Ui::build` into per-area builders is a long reshuffle of a GTK constructor for
@@ -118,7 +176,7 @@ findings in them, so they were not edited here.
   cards.
 - **RA-720, the rest.** Trimming `verify_tools` in `note_pages.rs`.
 
-## Found while verifying, outside this range
+### Found while verifying, outside this range
 
 - The roadmap `tools` smoke part looks for `skills-split`, `skills-project` and
   `skill-enabled-*`. No widget has had those names since the Skills page rebuild (280ae4b), so
