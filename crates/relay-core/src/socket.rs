@@ -126,13 +126,15 @@ impl SocketServer {
         tracing::info!(socket = %sock_path.display(), instance = %inst, "socket door open");
 
         let eng = engine.clone();
+        let recent = Arc::new(Recent::new(&engine));
         let accept = tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
                         let e = eng.clone();
+                        let recent = recent.clone();
                         tokio::spawn(async move {
-                            if let Err(err) = handle_conn(e, stream).await {
+                            if let Err(err) = handle_conn(e, recent, stream).await {
                                 tracing::debug!(error = %err, "connection ended");
                             }
                         });
@@ -223,6 +225,124 @@ fn exception_waited(filter: &Filter, matching: Option<&serde_json::Value>) -> Op
         return None;
     }
     matching?.get("request_id")?.as_i64()
+}
+
+/// How far back a `bus.wait` may look for an event it was too late to see live.
+const REPLAY_WINDOW: Duration = Duration::from_secs(10 * 60);
+const REPLAY_EVENTS: usize = 1024;
+
+/// The events an agent's `bus.wait` can still be handed after they fired (RA-127).
+///
+/// A refusal names the event to wait for (`device.busy` → `device.lease.released`), but the
+/// wait subscribes only when it arrives: a release in the seconds an agent spends between the
+/// two was lost, and the agent slept to its timeout on a free phone. So a refused agent request
+/// marks where the event stream stood when it arrived, and the agent's next wait first takes the
+/// earliest matching event since that mark. Only a refusal marks, and the wait consumes the
+/// mark, so an agent that waits for mail is never handed mail it was already woken for.
+///
+/// Recording is lazy: a receiver of its own is drained into the ring whenever an agent request
+/// needs it, so nothing runs while no agent is talking to the engine.
+struct Recent {
+    inner: std::sync::Mutex<RecentInner>,
+}
+
+struct RecentInner {
+    rx: tokio::sync::broadcast::Receiver<Event>,
+    seq: u64,
+    events: std::collections::VecDeque<(u64, std::time::Instant, Event)>,
+    /// Agent name → (the stream position when its latest refused request arrived, when).
+    refused: std::collections::HashMap<String, (u64, std::time::Instant)>,
+}
+
+impl RecentInner {
+    fn drain(&mut self) -> u64 {
+        use tokio::sync::broadcast::error::TryRecvError;
+        loop {
+            match self.rx.try_recv() {
+                Ok(event) => {
+                    self.seq += 1;
+                    self.events.push_back((self.seq, std::time::Instant::now(), event));
+                }
+                Err(TryRecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+        while self.events.len() > REPLAY_EVENTS
+            || self.events.front().is_some_and(|(_, at, _)| at.elapsed() > REPLAY_WINDOW)
+        {
+            self.events.pop_front();
+        }
+        self.seq
+    }
+}
+
+impl Recent {
+    fn new(engine: &Engine) -> Recent {
+        Recent {
+            inner: std::sync::Mutex::new(RecentInner {
+                rx: engine.subscribe(),
+                seq: 0,
+                events: Default::default(),
+                refused: Default::default(),
+            }),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, RecentInner> {
+        self.inner.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Where the stream stands as an agent's request arrives; `None` for anyone else.
+    fn arrival(&self, req: &Request) -> Option<(String, u64)> {
+        let relay_bus::Actor::Agent(name) = &req.actor else { return None };
+        Some((name.clone(), self.lock().drain()))
+    }
+
+    /// That request was refused: the agent's next wait looks back to its arrival.
+    fn refused(&self, arrival: Option<(String, u64)>, response: &Response) {
+        let Some((name, at)) = arrival.filter(|_| !response.ok) else { return };
+        let mut inner = self.lock();
+        inner.refused.retain(|_, (_, when)| when.elapsed() < REPLAY_WINDOW);
+        inner.refused.insert(name, (at, std::time::Instant::now()));
+    }
+
+    /// For an agent's wait: the earliest event since its last refusal that the wait would have
+    /// taken live. The mark is spent either way; the wait now covers everything after it.
+    fn replay(&self, req: &Request, filter: &Filter, matching: Option<&serde_json::Value>) -> Option<Event> {
+        let relay_bus::Actor::Agent(name) = &req.actor else { return None };
+        let mut inner = self.lock();
+        let (floor, _) = inner.refused.remove(name)?;
+        inner.drain();
+        inner.events.iter()
+            .find(|(seq, _, event)| *seq > floor && filter.matches(&event.ev) && payload_matches(&event.payload, matching))
+            .map(|(_, _, event)| event.clone())
+    }
+}
+
+/// Every task streaming output to one connection. Aborted on drop, so a connection that ends on
+/// an error — any `?` in its loop — takes its streams with it instead of leaving a socket that
+/// keeps writing terminal output and never reads another request (RA-126).
+#[derive(Default)]
+struct Streams {
+    forwarder: Option<JoinHandle<()>>,
+    /// pty streams attached on this connection, by session name
+    attached: std::collections::HashMap<String, JoinHandle<()>>,
+    /// device.run is a socket-capable op; its bounded log stream follows the response.
+    runs: std::collections::HashMap<relay_bus::types::Id, JoinHandle<()>>,
+}
+
+impl Drop for Streams {
+    fn drop(&mut self) {
+        if let Some(h) = self.forwarder.take() {
+            h.abort();
+        }
+        for (_, h) in self.attached.drain() {
+            h.abort();
+        }
+        for (_, h) in self.runs.drain() {
+            h.abort();
+        }
+    }
 }
 
 /// Event filter for `bus.subscribe {events}`: exact, `prefix.*`, or `*`. Empty = everything.
@@ -352,7 +472,7 @@ impl Drop for Borrowed {
 /// How many unlocked queries one connection may have running at once.
 const MAX_CONCURRENT_QUERIES: usize = 8;
 
-async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) -> Result<()> {
+async fn handle_conn(engine: Arc<Engine>, recent: Arc<Recent>, stream: UnixStream) -> Result<()> {
     // The blocking dispatch keeps this Arc until its ownership update completes,
     // even if the socket task is cancelled while that dispatch is in flight.
     let device_watch = Arc::new(WatchLease {
@@ -395,13 +515,7 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) -> Result<()> {
         }
     });
     let mut lines = BufReader::new(r).lines();
-    let mut forwarder: Option<JoinHandle<()>> = None;
-    // pty streams attached on this connection, by session name
-    let mut attached: std::collections::HashMap<String, JoinHandle<()>> =
-        std::collections::HashMap::new();
-    // device.run is a socket-capable op; its bounded log stream follows the response.
-    let mut attached_runs: std::collections::HashMap<relay_bus::types::Id, JoinHandle<()>> =
-        std::collections::HashMap::new();
+    let mut streams = Streams::default();
 
     let mut attached_mirrors: std::collections::HashMap<relay_bus::types::Id, MirrorAttachment> =
         std::collections::HashMap::new();
@@ -425,15 +539,24 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) -> Result<()> {
                 continue;
             }
         };
+        // A keystroke is never refused into a wait, and must not queue on the replay lock.
+        let arrival = if req.op == relay_bus::ops::bus::Wait::NAME || engine.answers_from_memory(&req) {
+            None
+        } else {
+            recent.arrival(&req)
+        };
         if engine.runs_unlocked(&req.op) {
             // Answered whenever it finishes; the client correlates by id. The permit bounds
             // how much of the blocking pool one connection can hold, and stops reading the
             // connection while it is spent.
             let permit = concurrent.clone().acquire_owned().await?;
-            let (e, tx) = (engine.clone(), out_tx.clone());
+            let (e, tx, recent) = (engine.clone(), out_tx.clone(), recent.clone());
             inflight.spawn(async move {
                 let resp = tokio::task::spawn_blocking(move || e.dispatch(req, Door::Socket)).await;
                 drop(permit);
+                if let Ok(resp) = &resp {
+                    recent.refused(arrival, resp);
+                }
                 if let Ok(line) = resp.map_err(anyhow::Error::from).and_then(|resp| Ok(serde_json::to_string(&resp)?)) {
                     let _ = tx.send(line).await;
                 }
@@ -466,14 +589,14 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) -> Result<()> {
             match serde_json::from_value::<SubscribeIn>(req.payload.clone()) {
                 Err(e) => Response::err(req.id, BusError::schema(&req.op, e)),
                 Ok(p) => {
-                    if let Some(h) = forwarder.take() {
+                    if let Some(h) = streams.forwarder.take() {
                         h.abort();
                     }
                     let filter = Filter(p.events.clone().unwrap_or_default());
                     let mut rx = engine.subscribe();
                     let tx = out_tx.clone();
                     let f = filter.clone();
-                    forwarder = Some(tokio::spawn(async move {
+                    streams.forwarder = Some(tokio::spawn(async move {
                         loop {
                             match rx.recv().await {
                                 Ok(ev) => {
@@ -524,6 +647,8 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) -> Result<()> {
                         }
                         None => None,
                     };
+                    // Then whatever fired between this agent's last refusal and now.
+                    let answered = answered.or_else(|| recent.replay(&req, &filter, p.matching.as_ref()));
                     let waited = tokio::time::timeout(timeout, async {
                         if answered.is_some() {
                             return answered;
@@ -551,7 +676,7 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) -> Result<()> {
                 }
             }
         } else if req.op == relay_bus::ops::bus::Unsubscribe::NAME {
-            if let Some(h) = forwarder.take() {
+            if let Some(h) = streams.forwarder.take() {
                 h.abort();
             }
             Response::ok(req.id, serde_json::to_value(Empty {})?)
@@ -571,13 +696,13 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) -> Result<()> {
                 });
                 match crate::handlers::session::pty_by_name(&engine, &p.session) {
                     Ok((_, pty)) => {
-                        if let Some(h) = attached.remove(&p.session) {
+                        if let Some(h) = streams.attached.remove(&p.session) {
                             h.abort();
                         }
                         let att = pty.attach(p.epoch, p.from_seq);
                         let tx = out_tx.clone();
                         let name = p.session.clone();
-                        attached.insert(p.session.clone(), tokio::spawn(async move {
+                        streams.attached.insert(p.session.clone(), tokio::spawn(async move {
                             let head = pty_frame_head(&name);
                             let mut rx = att.rx;
                             if !att.catch_up.is_empty() {
@@ -614,7 +739,7 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) -> Result<()> {
             let resp = tokio::task::spawn_blocking(move || e.dispatch(r2, Door::Socket)).await?;
             if resp.ok {
                 if let Some(name) = req.payload.get("session").and_then(|v| v.as_str()) {
-                    if let Some(h) = attached.remove(name) {
+                    if let Some(h) = streams.attached.remove(name) {
                         h.abort();
                     }
                     borrowed.release(name);
@@ -779,12 +904,12 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) -> Result<()> {
                 {
                     match crate::handlers::device::run_by_id(&engine, id) {
                         Ok(runtime) => {
-                            if let Some(task) = attached_runs.remove(&id) {
+                            if let Some(task) = streams.runs.remove(&id) {
                                 task.abort();
                             }
                             let (cursor, history, mut rx) = runtime.attach();
                             let tx = out_tx.clone();
-                            attached_runs.insert(id, tokio::spawn(async move {
+                            streams.runs.insert(id, tokio::spawn(async move {
                                 for item in history {
                                     let frame = Frame {
                                         v: 1,
@@ -846,7 +971,7 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) -> Result<()> {
             let resp = tokio::task::spawn_blocking(move || e.dispatch(req, Door::Socket)).await?;
             if resp.ok {
                 if let Some(id) = run_id {
-                    if let Some(task) = attached_runs.remove(&id) {
+                    if let Some(task) = streams.runs.remove(&id) {
                         task.abort();
                     }
                 }
@@ -861,18 +986,11 @@ async fn handle_conn(engine: Arc<Engine>, stream: UnixStream) -> Result<()> {
             let e = engine.clone();
             tokio::task::spawn_blocking(move || e.dispatch(req, Door::Socket)).await?
         };
+        recent.refused(arrival, &resp);
         let _ = out_tx.send(serde_json::to_string(&resp)?).await;
     }
     while inflight.join_next().await.is_some() {}
-    if let Some(h) = forwarder.take() {
-        h.abort();
-    }
-    for (_, h) in attached.drain() {
-        h.abort();
-    }
-    for (_, h) in attached_runs.drain() {
-        h.abort();
-    }
+    drop(streams);
     attached_mirrors.clear();
     drop(device_watch);
     drop(resource_watch);
@@ -1132,6 +1250,67 @@ mod watch_tests {
         until_clients(&e, 0).await;
         assert!(runtime.stopped());
         assert!(e.device_watch.lock().unwrap().runtime.is_none());
+    }
+}
+
+#[cfg(test)]
+mod conn_tests {
+    use super::*;
+    use relay_bus::Actor;
+    use serde_json::json;
+
+    async fn server() -> (Arc<Engine>, tempfile::TempDir, SocketServer) {
+        let engine = Engine::new(crate::Instance::Test, crate::Store::open_memory().unwrap());
+        let fixture = tempfile::tempdir().unwrap();
+        let server = SocketServer::start_in(engine.clone(), fixture.path().join("socket")).await.unwrap();
+        (engine, fixture, server)
+    }
+
+    async fn wait(client: &mut Client, actor: Actor) -> serde_json::Value {
+        let wait = Request::new(actor, "bus.wait", json!({"events": ["device.lease.released"], "timeout_ms": 1000}));
+        client.call(&wait, |_| {}).await.unwrap().result.unwrap()
+    }
+
+    /// RA-127: a release between the refusal and the wait is still the agent's to wake on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_wait_after_a_refusal_sees_what_fired_in_between() {
+        let (engine, _fixture, server) = server().await;
+        let mut agent = Client::connect(&server.path).await.unwrap();
+        engine.emit_system("device.lease.released", json!({"device": "before"}));
+        let refused = agent.call(&Request::new(Actor::agent("ghost"), "session.get", json!({"session": "nope"})), |_| {}).await.unwrap();
+        assert!(!refused.ok);
+        engine.emit_system("device.lease.released", json!({"device": "between"}));
+        let woken = wait(&mut agent, Actor::agent("ghost")).await;
+        assert_eq!(woken["timed_out"], false, "{woken}");
+        assert_eq!(woken["event"]["payload"]["device"], "between", "only what fired after the refusal: {woken}");
+        // The mark is spent: the next wait waits for a new event.
+        assert_eq!(wait(&mut agent, Actor::agent("ghost")).await["timed_out"], true);
+        // Nobody else is handed history.
+        let mut other = Client::connect(&server.path).await.unwrap();
+        assert_eq!(wait(&mut other, Actor::agent("bystander")).await["timed_out"], true);
+        assert_eq!(wait(&mut other, Actor::User).await["timed_out"], true);
+    }
+
+    /// RA-126: a connection that ends on an error stops streaming to its socket.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connection_that_fails_closes_its_streams() {
+        let (engine, _fixture, server) = server().await;
+        let mut client = Client::connect(&server.path).await.unwrap();
+        let subscribed = client.call(&Request::new(Actor::User, "bus.subscribe", json!({})), |_| {}).await.unwrap();
+        assert!(subscribed.ok);
+        // Not UTF-8: reading the line fails and the handler returns early.
+        client.w.write_all(b"\xff\xfe\n").await.unwrap();
+        let closed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                engine.emit_system("settings.changed", json!({}));
+                match client.next().await {
+                    Ok(Some(_)) => tokio::time::sleep(Duration::from_millis(20)).await,
+                    _ => return,
+                }
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "the subscriber kept streaming after its connection failed");
     }
 }
 

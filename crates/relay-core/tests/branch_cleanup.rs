@@ -205,3 +205,79 @@ fn open_sessions_are_never_candidates_and_the_op_dry_runs() {
     assert!(has_ref(&f.repo, &format!("refs/heads/{}", live.branch)), "a live session's branch is untouched");
     assert!(live.worktree.exists());
 }
+
+/// RA-086: a session on a branch Relay did not name is not Relay's to clean up after.
+#[test]
+fn a_users_own_branch_is_never_a_candidate() {
+    let f = fixture();
+    let created = ok(&f.engine, "session.create", json!({"project_id": 1, "provider": "codex", "branch": "feature/mine"}));
+    let name = created["name"].as_str().unwrap();
+    let worktree = PathBuf::from(created["worktree"].as_str().unwrap());
+    git(&worktree, &["config", "user.email", "t@t"]);
+    git(&worktree, &["config", "user.name", "t"]);
+    std::fs::write(worktree.join("mine.txt"), "mine\n").unwrap();
+    git(&worktree, &["add", "mine.txt"]);
+    git(&worktree, &["commit", "--no-verify", "-q", "-m", "mine"]);
+    git(&f.repo, &["merge", "--no-verify", "-q", "--no-ff", "-m", "merge mine", "feature/mine"]);
+    ok(&f.engine, "session.close", json!({"session": name}));
+    let rows = branch_cleanup::run(&f.engine, Some(1), None, &Options::default()).unwrap();
+    assert!(rows.is_empty(), "{rows:?}");
+    assert!(has_ref(&f.repo, "refs/heads/feature/mine"), "a merged user branch is still the user's");
+}
+
+/// RA-087: a checkout kept at close stays, and a later cleanup never deletes ignored files.
+#[test]
+fn a_worktree_kept_at_close_and_its_ignored_files_survive_cleanup() {
+    let f = fixture();
+    let work = session_with_commit(&f, "kept.txt");
+    git(&f.repo, &["merge", "--no-verify", "-q", "--no-ff", "-m", "merge", &work.branch]);
+    ok(&f.engine, "session.close", json!({"session": work.name, "remove_worktree": false}));
+
+    branch_cleanup::after_close(f.engine.clone(), 1, work.branch.clone());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while audited(&f, &work.branch).is_empty() {
+        assert!(std::time::Instant::now() < deadline, "the after-close cleanup never reported");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let audit = audited(&f, &work.branch);
+    assert!(audit[0].to_string().contains("kept at close"), "{audit:?}");
+    assert!(work.worktree.exists(), "the checkout the user kept is gone");
+    assert!(has_ref(&f.repo, &format!("refs/heads/{}", work.branch)));
+
+    // Later, a cleanup may take the checkout — but not with a git-ignored `.env` in it.
+    let exclude = f.repo.join(".git/info/exclude");
+    let mut rules = std::fs::read_to_string(&exclude).unwrap_or_default();
+    rules.push_str(".env\n");
+    std::fs::write(&exclude, rules).unwrap();
+    std::fs::write(work.worktree.join(".env"), "TOKEN=secret\n").unwrap();
+    let row = cleanup(&f, &work.branch, None);
+    assert_eq!(row.outcome, "kept", "{row:?}");
+    assert!(row.reason.contains("git-ignored") && row.reason.contains(".env"), "{row:?}");
+    assert!(work.worktree.join(".env").exists());
+
+    std::fs::remove_file(work.worktree.join(".env")).unwrap();
+    let row = cleanup(&f, &work.branch, None);
+    assert_eq!(row.outcome, "deleted", "Relay's own hook files are not the user's: {row:?}");
+    assert!(row.removed_worktree && !work.worktree.exists());
+}
+
+/// RA-088: the periodic sweep does not re-judge a kept branch whose refs have not moved.
+#[test]
+fn the_sweep_skips_a_kept_branch_until_its_refs_move() {
+    let f = fixture();
+    let open = session_with_commit(&f, "unmerged.txt");
+    ok(&f.engine, "session.close", json!({"session": open.name}));
+    let sweep = Options { use_gh_cache: true, ..Options::default() };
+    let only = [open.branch.clone()];
+    let first = branch_cleanup::run(&f.engine, Some(1), Some(&only), &sweep).unwrap();
+    assert_eq!(first.len(), 1, "{first:?}");
+    assert_eq!(first[0].outcome, "kept");
+    assert!(branch_cleanup::run(&f.engine, Some(1), Some(&only), &sweep).unwrap().is_empty(), "judged again with nothing changed");
+    // Asked for directly, it is still answered.
+    assert_eq!(cleanup(&f, &open.branch, None).outcome, "kept");
+    // Its base moving is a reason to look again — here, because it is now merged.
+    git(&f.repo, &["merge", "--no-verify", "-q", "--no-ff", "-m", "merge", &open.branch]);
+    let again = branch_cleanup::run(&f.engine, Some(1), Some(&only), &sweep).unwrap();
+    assert_eq!(again.len(), 1, "{again:?}");
+    assert_eq!(again[0].outcome, "deleted", "{again:?}");
+}

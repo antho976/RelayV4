@@ -87,6 +87,44 @@ pub fn is_dirty(r: &gix::Repository) -> bool {
     r.workdir().is_none_or(|root| status_files(root).map_or(true, |files| !files.is_empty()))
 }
 
+/// How often a background status may take the index lock to save the stat data it refreshed.
+const INDEX_REFRESH_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+/// An index written this recently means someone is running git in the checkout right now.
+const INDEX_BUSY: std::time::Duration = std::time::Duration::from_secs(5);
+static INDEX_REFRESHED: std::sync::Mutex<Option<std::collections::HashMap<PathBuf, std::time::Instant>>> =
+    std::sync::Mutex::new(None);
+
+/// The index file of the checkout at `root`, a linked worktree's included.
+fn index_file(root: &Path) -> Option<PathBuf> {
+    let dotgit = root.join(".git");
+    if dotgit.is_dir() { return Some(dotgit.join("index")); }
+    let pointer = std::fs::read_to_string(&dotgit).ok()?;
+    let gitdir = PathBuf::from(pointer.trim().strip_prefix("gitdir:")?.trim());
+    Some(if gitdir.is_absolute() { gitdir } else { root.join(gitdir) }.join("index"))
+}
+
+/// Whether this status may take git's optional index lock. Holding it for the length of a scan
+/// made a person's own `git add` or `git commit` in the same checkout fail on `index.lock`,
+/// and Relay scans after every burst of file changes (RA-131). Without the lock, though, git
+/// cannot save the stat data it refreshed, and touched-but-unchanged LFS assets are rehashed
+/// by every scan. So: at most once a minute per checkout, and never while git is visibly busy
+/// there (its lock is held, or it wrote the index a moment ago).
+fn may_lock_index(root: &Path) -> bool {
+    let Some(index) = index_file(root) else { return false };
+    if index.with_extension("lock").exists()
+        || std::fs::metadata(&index).and_then(|meta| meta.modified())
+            .is_ok_and(|at| at.elapsed().is_ok_and(|age| age < INDEX_BUSY))
+    {
+        return false;
+    }
+    let mut refreshed = INDEX_REFRESHED.lock().unwrap_or_else(|poison| poison.into_inner());
+    let refreshed = refreshed.get_or_insert_with(Default::default);
+    refreshed.retain(|_, at| at.elapsed() < INDEX_REFRESH_EVERY);
+    if refreshed.contains_key(root) { return false; }
+    refreshed.insert(root.to_path_buf(), std::time::Instant::now());
+    true
+}
+
 /// Git persists refreshed stat data with its index locking. Dropping gix's status
 /// outcome rehashes touched-but-unchanged LFS assets on every refresh; writing an
 /// old index snapshot ourselves could lose concurrent staging.
@@ -94,7 +132,7 @@ pub fn status_files(root: &Path) -> Result<Vec<FileStatus>> {
     let mut command = Command::new("git");
     command.arg("-C").arg(root)
         .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
-        .env("GIT_OPTIONAL_LOCKS", "1");
+        .env("GIT_OPTIONAL_LOCKS", if may_lock_index(root) { "1" } else { "0" });
     let output = crate::proc::output_with_timeout(&mut command, std::time::Duration::from_secs(10))?
         .ok_or_else(|| anyhow!("Git status timed out after 10 seconds; check repository filters and retry"))?;
     if !output.status.success() {
@@ -463,6 +501,9 @@ mod status_tests {
         std::fs::File::open(&asset).unwrap()
             .set_modified(initial_time + std::time::Duration::from_secs(5)).unwrap();
         std::fs::write(root.join(".git/filter-calls"), "").unwrap();
+        // The commit is a few seconds old: git is done in this checkout (RA-131).
+        std::fs::File::options().write(true).open(root.join(".git/index")).unwrap()
+            .set_modified(initial_time + std::time::Duration::from_secs(10)).unwrap();
         assert!(status_files(root).unwrap().is_empty());
         let first = std::fs::read_to_string(root.join(".git/filter-calls")).unwrap();
         assert!(!first.is_empty(), "Fixture must exercise the clean filter");
@@ -474,6 +515,34 @@ mod status_tests {
         assert_eq!(status_files(root).unwrap()[0].worktree, "M");
         git(root, &["add", "asset.bin"]).unwrap();
         assert_eq!(status_files(root).unwrap()[0].index, "M");
+    }
+
+    /// RA-131: only the first scan of a quiet checkout takes the index lock; the scans after it,
+    /// or any while git is at work there, leave it to whoever runs git next.
+    #[test]
+    fn background_status_takes_the_index_lock_rarely() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = &std::fs::canonicalize(directory.path()).unwrap();
+        git(root, &["init", "-q", "-b", "main"]).unwrap();
+        git(root, &["config", "user.name", "Fixture"]).unwrap();
+        git(root, &["config", "user.email", "fixture@example.invalid"]).unwrap();
+        std::fs::write(root.join("a"), "a").unwrap();
+        git(root, &["add", "a"]).unwrap();
+        git(root, &["commit", "-qm", "a"]).unwrap();
+        let linked = root.join("linked");
+        git(root, &["worktree", "add", "-q", "-b", "side", linked.to_str().unwrap()]).unwrap();
+        let index = root.join(".git/index");
+        let quiet = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        std::fs::File::options().write(true).open(&index).unwrap().set_modified(quiet).unwrap();
+        // Someone holds the lock: never.
+        std::fs::write(root.join(".git/index.lock"), "").unwrap();
+        assert!(!may_lock_index(root));
+        std::fs::remove_file(root.join(".git/index.lock")).unwrap();
+        assert!(may_lock_index(root), "a quiet checkout gets its stat data saved");
+        assert!(!may_lock_index(root), "but not on every scan");
+        // A linked worktree's index is its own, and an index written just now means git is busy.
+        assert_eq!(index_file(&linked).unwrap(), root.join(".git/worktrees/linked/index"));
+        assert!(!may_lock_index(&linked));
     }
 
     /// The shared-stack walk must total exactly what a single-threaded walk would, terminate

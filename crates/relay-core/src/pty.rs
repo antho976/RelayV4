@@ -93,6 +93,26 @@ impl Ring {
     fn end(&self) -> u64 {
         self.base + self.buf.len() as u64
     }
+    /// Restored history goes in as many frames, each ending on a line, never as one. Catch-up
+    /// starts on a frame boundary, and a single multi-megabyte frame left it two choices: skip
+    /// the whole history once any live frame followed it, or cut into it mid escape sequence
+    /// when none had (RA-116). All of it stays seq 0, before anything this process prints.
+    fn push_history(&mut self, history: &[u8]) {
+        const CHUNK: usize = 16 * 1024;
+        let mut rest = history;
+        while !rest.is_empty() {
+            let mut cut = rest.len().min(CHUNK);
+            if cut < rest.len() {
+                match rest[..cut].iter().rposition(|byte| *byte == b'\n') {
+                    Some(newline) => cut = newline + 1,
+                    // One line longer than a chunk: at least never split a character.
+                    None => while cut > 1 && rest[cut] & 0xC0 == 0x80 { cut -= 1; },
+                }
+            }
+            self.push(0, &rest[..cut]);
+            rest = &rest[cut..];
+        }
+    }
     fn bounded_bytes_from(&self, from: u64) -> Vec<u8> {
         let earliest = self.end().saturating_sub(ATTACH_CATCHUP_BYTES as u64);
         let requested = from.max(earliest);
@@ -196,9 +216,7 @@ impl Pty {
 
         let (tx, _) = broadcast::channel(1024);
         let mut ring = Ring { buf: VecDeque::new(), base: 0, frames: VecDeque::new() };
-        if !spec.initial_scrollback.is_empty() {
-            ring.push(0, &spec.initial_scrollback);
-        }
+        ring.push_history(&spec.initial_scrollback);
         let shared = Arc::new(Shared {
             epoch: spec.epoch,
             seq: AtomicU64::new(0),
@@ -220,9 +238,17 @@ impl Pty {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         sh.last_output_ms.store(unix_millis(), Ordering::Relaxed);
-                        let seq = sh.seq.fetch_add(1, Ordering::SeqCst) + 1;
                         let data = buf[..n].to_vec();
-                        sh.ring.lock().unwrap().push(seq, &data);
+                        // Numbered under the ring lock: `attach` reads the seq under it too, so
+                        // a seq it sees is always one whose bytes are already in the ring. Taken
+                        // before the lock, an attach in between skipped that frame as caught up
+                        // when it was not, or found no boundary for it and replayed 256 KiB (RA-117).
+                        let seq = {
+                            let mut ring = sh.ring.lock().unwrap();
+                            let seq = sh.seq.fetch_add(1, Ordering::SeqCst) + 1;
+                            ring.push(seq, &data);
+                            seq
+                        };
                         let _ = sh.tx.send(Arc::new(Frame { epoch: sh.epoch, seq, data }));
                     }
                 }
@@ -494,6 +520,38 @@ mod tests {
         assert_eq!(r.buf.len(), SCROLLBACK_BYTES);
         assert_eq!(r.base, 4096);
         assert_eq!(r.end(), huge as u64);
+    }
+
+    #[test]
+    fn restored_history_is_caught_up_from_a_line_boundary() {
+        let mut history = Vec::new();
+        for line in 0..40_000 {
+            history.extend_from_slice(format!("\x1b[32mline {line}\x1b[0m\n").as_bytes());
+        }
+        assert!(history.len() > 2 * ATTACH_CATCHUP_BYTES);
+        let mut r = ring();
+        r.push_history(&history);
+        assert_eq!(r.bytes_from(0), history, "split, not changed");
+        // Nothing printed yet: the tail of the history, starting on a line.
+        let catch_up = r.bounded_bytes_from(0);
+        assert!(catch_up.len() > ATTACH_CATCHUP_BYTES - 16 * 1024 && catch_up.len() <= ATTACH_CATCHUP_BYTES);
+        assert!(catch_up.starts_with(b"\x1b[32mline "), "cut mid line: {:?}", &catch_up[..16]);
+        assert!(history.ends_with(&catch_up));
+        // A first live frame does not push the history out of the catch-up.
+        r.push(1, b"$ ");
+        let catch_up = r.bounded_bytes_from(0);
+        assert!(catch_up.len() > ATTACH_CATCHUP_BYTES - 16 * 1024, "{}", catch_up.len());
+        assert!(catch_up.starts_with(b"\x1b[32mline ") && catch_up.ends_with(b"line 39999\x1b[0m\n$ "));
+        // A client that saw the history resumes after it.
+        assert_eq!(r.bytes_from(r.offset_after(0).unwrap()), b"$ ");
+        // A line longer than a chunk is cut, but never inside a character.
+        let mut r = ring();
+        let long = "é".repeat(20 * 1024);
+        r.push_history(long.as_bytes());
+        assert!(r.frames.len() > 1);
+        for (_, offset) in r.frames.iter() {
+            assert!(std::str::from_utf8(&r.bytes_from(*offset)).is_ok());
+        }
     }
 
     #[test]
