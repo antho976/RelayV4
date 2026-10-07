@@ -107,6 +107,29 @@ def environment():
     }
 
 
+def strace_blocked():
+    """Why `perf run --strace` cannot attach here, or None. perf.rs starts strace as its own child
+    and points it at its parent; under Yama ptrace_scope 1 or 2 that needs CAP_SYS_PTRACE, and
+    under 3 nothing may attach. A refused attach is not an error to perf.rs: strace exits, the
+    count file is empty, and every scenario would read 0 syscalls."""
+    try:
+        scope = int(Path("/proc/sys/kernel/yama/ptrace_scope").read_text())
+    except (OSError, ValueError):
+        return None  # no Yama: ordinary ptrace rules, a process may trace its parent
+    cap_sys_ptrace = False
+    try:
+        for line in Path("/proc/self/status").read_text().splitlines():
+            if line.startswith("CapEff:"):
+                cap_sys_ptrace = bool(int(line.split()[1], 16) >> 19 & 1)
+    except (OSError, ValueError):
+        pass
+    if scope == 0 or (scope in (1, 2) and cap_sys_ptrace):
+        return None
+    return (f"kernel.yama.ptrace_scope is {scope}"
+            + ("" if scope == 3 else " and this process lacks CAP_SYS_PTRACE")
+            + ": strace cannot attach to the perf process (try `sudo sysctl kernel.yama.ptrace_scope=0` for the run)")
+
+
 def scenarios():
     return sh([str(PERF), "list"]).stdout.split()
 
@@ -265,10 +288,24 @@ def parse_callgrind(out_dir, rows_by_name):
     return profiles
 
 
+def shards(names, jobs):
+    """Split `names` into `jobs` groups, keeping every name in the group of any name that is its
+    prefix. `perf run` treats each filter as a prefix, so `op.git.diff` in one group and
+    `op.git.diff.file` in another would run (and dump) `op.git.diff.file` in both."""
+    families = {}
+    for name in sorted(names):
+        root = next((r for r in families if name.startswith(r)), name)
+        families.setdefault(root, []).append(name)
+    groups = [[] for _ in range(jobs)]
+    for family in sorted(families.values(), key=len, reverse=True):
+        min(groups, key=len).extend(family)
+    return groups
+
+
 def run_callgrind(out_dir, names, jobs, iters_div):
     cg_dir = out_dir / "callgrind"
     cg_dir.mkdir(exist_ok=True)
-    groups = [names[i::jobs] for i in range(jobs)]
+    groups = shards(names, jobs)
 
     def one(i, group):
         if not group:
@@ -383,8 +420,11 @@ class Engine:
     def fixture(self, sessions):
         repo = self.base / "workspace" / "app"
         repo.mkdir(parents=True, exist_ok=True)
+        # Only the repository's own config: a global commit.gpgsign or hooksPath would otherwise
+        # sign (or prompt for) the fixture commit and run the developer's hooks on it.
+        git_env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
         def git(*args):
-            subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, env=git_env)
         git("init", "-q", "-b", "main")
         git("config", "user.name", "perf")
         git("config", "user.email", "perf@relay.test")
@@ -648,6 +688,11 @@ def main():
         build()
     env = environment()
     env["quick"] = args.quick  # compare.py warns when two runs differ in this
+    strace_skip = None
+    if not args.skip_strace and shutil.which("strace"):
+        strace_skip = strace_blocked()
+        if strace_skip:
+            env["strace_skipped"] = strace_skip  # report.py says why the column is empty
     (out_dir / "environment.json").write_text(json.dumps(env, indent=2) + "\n")
     names = [n for n in scenarios() if matches(n, args.only)]
     log(f"{len(names)} scenarios")
@@ -659,8 +704,15 @@ def main():
         scale_names = [n for n in SCALE_OPS if n in names]
         if scale_names:
             log("scale pass: the list queries with ten times the rows")
-            perf_run([*scale_names, "--scale", "10", *native_args], out_dir / "scale10.jsonl")
-    if not args.skip_strace and shutil.which("strace"):
+            scale_out = out_dir / "scale10.jsonl"
+            perf_run([*scale_names, "--scale", "10", *native_args], scale_out)
+            # `perf run` reads each name as a prefix, so op.session.list also ran
+            # op.session.list.all: keep only the rows SCALE_OPS asked for.
+            kept = [r for r in read_jsonl(scale_out) if r["name"].split("@")[0] in scale_names]
+            scale_out.write_text("".join(json.dumps(r, separators=(",", ":")) + "\n" for r in kept))
+    if strace_skip:
+        log(f"strace pass skipped: {strace_skip}")
+    elif not args.skip_strace and shutil.which("strace"):
         log("strace pass: syscalls per iteration")
         perf_run([*names, "--strace", "--iters-div", "8" if args.quick else "4"], out_dir / "strace.jsonl")
     if not args.skip_soak:
