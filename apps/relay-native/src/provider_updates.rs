@@ -10,6 +10,9 @@ pub(crate) fn startup(ui: &Rc<Ui>) {
     let ui = ui.clone();
     glib::spawn_future_local(async move {
         let Ok(config) = ui.call("settings.get", json!({"path":"providers"})).await else {
+            // Nothing was attempted (the engine dropped right after connect); the next connect
+            // tries again rather than skipping the update for the rest of the launch.
+            ui.provider_updates_checked.set(false);
             return;
         };
         for provider in ["claude", "codex"] {

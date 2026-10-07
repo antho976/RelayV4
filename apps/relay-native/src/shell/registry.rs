@@ -868,11 +868,13 @@ impl Ui {
         row.append(&remove);
         danger.append(&row);
 
+        // Trimmed as the form compares them: a value stored with spaces around it (from the CLI)
+        // must not read as an unsaved change that keeps the sheet from closing.
         let original = (
-            text(&value, "name").to_string(),
+            text(&value, "name").trim().to_string(),
             text(&value, "base_branch").to_string(),
-            text(&value, "build_cmd").to_string(),
-            text(&value, "run_cmd").to_string(),
+            text(&value, "build_cmd").trim().to_string(),
+            text(&value, "run_cmd").trim().to_string(),
             value["pinned"] == true,
         );
         let original = Rc::new(original);

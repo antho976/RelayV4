@@ -24,4 +24,51 @@
   <style name="def:identifier" foreground="#dcdcda"/>
   <style name="def:preprocessor" foreground="#c979d6"/>
   <style name="def:error" foreground="#e5382e"/>
+  <!-- Adwaita-dark styles some languages' tokens by their own ids, which a lookup finds
+       before the def:* style the language maps them to: point each back at this palette, and
+       own the def:* styles that Adwaita-dark would otherwise lend. -->
+  <style name="def:constant" use-style="def:number"/>
+  <style name="def:special-constant" use-style="def:number"/>
+  <style name="def:special-char" use-style="def:keyword"/>
+  <style name="def:heading" foreground="#f4f4f2" bold="true"/>
+  <style name="def:link-text" foreground="#5b9cf6"/>
+  <style name="def:link-destination" foreground="#6e6e70"/>
+  <style name="def:net-address" foreground="#5b9cf6"/>
+  <style name="def:inline-code" use-style="def:string"/>
+  <style name="def:preformatted-section" use-style="def:string"/>
+  <style name="def:list-marker" foreground="#e0b04a" bold="true"/>
+  <style name="def:note" foreground="#e0b04a" bold="true"/>
+  <style name="def:shebang" use-style="def:comment"/>
+  <style name="def:doc-comment-element" use-style="def:doc-comment"/>
+  <style name="rust:attribute" use-style="def:preprocessor"/>
+  <style name="rust:macro" use-style="def:preprocessor"/>
+  <style name="rust:scope" use-style="def:preprocessor"/>
+  <style name="rust:lifetime" use-style="def:keyword"/>
+  <style name="c:printf" use-style="def:special-char"/>
+  <style name="c:signal-name" use-style="def:constant"/>
+  <style name="c:storage-class" use-style="def:type"/>
+  <style name="c:type-keyword" use-style="def:keyword"/>
+  <style name="c-sharp:format" use-style="def:special-char"/>
+  <style name="c-sharp:preprocessor" use-style="def:preprocessor"/>
+  <style name="go:printf" use-style="def:special-char"/>
+  <style name="vala:attributes" use-style="def:function"/>
+  <style name="python:builtin-function" use-style="def:type"/>
+  <style name="python:class-name" use-style="def:function"/>
+  <style name="python:module-handler" use-style="def:preprocessor"/>
+  <style name="css:id-selector" use-style="def:statement"/>
+  <style name="css:property-name" use-style="def:keyword"/>
+  <style name="css:pseudo-selector" use-style="def:function"/>
+  <style name="css:selector-symbol" use-style="def:operator"/>
+  <style name="css:type-selector" use-style="def:type"/>
+  <style name="css:vendor-specific" use-style="def:keyword"/>
+  <style name="xml:attribute-name" use-style="def:type"/>
+  <style name="xml:attribute-value" use-style="def:string"/>
+  <style name="xml:element-name" use-style="def:identifier"/>
+  <style name="xml:namespace" use-style="def:identifier"/>
+  <style name="xml:processing-instruction" use-style="def:preprocessor"/>
+  <style name="diff:added-line" foreground="#2ec469"/>
+  <style name="diff:removed-line" foreground="#e5382e"/>
+  <style name="diff:changed-line" foreground="#f0a828"/>
+  <style name="diff:location" use-style="def:function"/>
+  <style name="diff:diff-file" use-style="def:keyword"/>
 </style-scheme>

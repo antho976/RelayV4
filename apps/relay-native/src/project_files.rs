@@ -164,7 +164,8 @@ impl Editor {
         }
         list.append(&label("CHECKOUTS & BRANCHES", "section-label"));
         let mut choices = vec![(String::new(), String::from("Primary checkout"))];
-        choices.extend(self.worktrees.borrow().iter().map(|w| {
+        // worktree.list names the primary checkout first; it is the entry above, under "".
+        choices.extend(self.worktrees.borrow().iter().skip(1).map(|w| {
             (
                 text(w, "path").to_string(),
                 format!(
@@ -201,7 +202,6 @@ impl Editor {
         let weak = Rc::downgrade(ui);
         let pop = popover.downgrade();
         let query = search.clone();
-        let revision = self.scope_revision.get();
         let project = ui.project.get();
         let worktree = self.worktree.borrow().clone();
         let payload = self.payload(ui, json!({}));
@@ -210,7 +210,9 @@ impl Editor {
                 return;
             };
             let result = ui.call("git.branches", payload).await;
-            if !ed.matches(&ui, project, &worktree) || ed.scope_revision.get() != revision {
+            // Not scope_revision: every invalidate bumps it, and the branches are still those of
+            // this project and checkout.
+            if !ed.matches(&ui, project, &worktree) {
                 return;
             }
             match result {

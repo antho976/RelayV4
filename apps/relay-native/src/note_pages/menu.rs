@@ -379,8 +379,8 @@ pub fn install(ui: &Rc<Ui>, window: &gtk::Window) -> gtk::PopoverMenuBar {
     let keys = gtk::EventControllerKey::new();
     keys.set_propagation_phase(gtk::PropagationPhase::Capture);
     let target = weak.clone();
-    keys.connect_key_pressed(move |_, key, _, mods| match target.upgrade() {
-        Some(ui) => shortcut(&ui, key, mods),
+    keys.connect_key_pressed(move |_, key, keycode, mods| match target.upgrade() {
+        Some(ui) => shortcut(&ui, crate::shortcuts::latin(key, keycode), mods),
         None => glib::Propagation::Proceed,
     });
     window.add_controller(keys);

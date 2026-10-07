@@ -22,6 +22,9 @@ struct Setup {
     created_project: RefCell<Option<Value>>,
     skip_import: gtk::Button,
     discovery_generation: Cell<u64>,
+    /// The repository whose name `destination` was last filled from, so re-filtering the list
+    /// keeps a folder name the user typed.
+    destination_for: RefCell<Option<String>>,
 }
 
 pub fn open(ui: &Rc<Ui>, workspace: Option<Value>) {
@@ -73,7 +76,8 @@ pub fn open(ui: &Rc<Ui>, workspace: Option<Value>) {
         workspace_path: gtk::Entry::builder()
             .text(
                 std::env::current_dir()
-                    .map(|p| p.to_string_lossy().into_owned())
+                    .and_then(std::fs::canonicalize)
+                    .map(|p| suggested_workspace(&p).to_string_lossy().into_owned())
                     .unwrap_or_default(),
             )
             .build(),
@@ -83,6 +87,7 @@ pub fn open(ui: &Rc<Ui>, workspace: Option<Value>) {
         created_project: RefCell::new(None),
         skip_import: button("Skip import", "quiet"),
         discovery_generation: Cell::new(0),
+        destination_for: RefCell::new(None),
     });
     setup.connect.set_widget_name("setup-connect");
     setup.message.set_wrap(true);
@@ -278,17 +283,23 @@ impl Setup {
             let Some(setup) = weak.upgrade() else {
                 return;
             };
-            let repo = c.active_id().and_then(|id| {
+            // Searching rebuilds the list and reselects the same repository; only a different
+            // one replaces the folder name.
+            let id = c.active_id().map(|id| id.to_string());
+            if id.is_some() && *setup.destination_for.borrow() != id {
+                let repo = id.as_deref().and_then(|id| {
+                    setup
+                        .repos
+                        .borrow()
+                        .iter()
+                        .find(|r| text(r, "full_name") == id)
+                        .cloned()
+                });
                 setup
-                    .repos
-                    .borrow()
-                    .iter()
-                    .find(|r| text(r, "full_name") == id)
-                    .cloned()
-            });
-            setup
-                .destination
-                .set_text(repo.as_ref().map(|r| text(r, "name")).unwrap_or(""));
+                    .destination
+                    .set_text(repo.as_ref().map(|r| text(r, "name")).unwrap_or(""));
+                *setup.destination_for.borrow_mut() = id;
+            }
             setup.update_action();
         });
         let weak = Rc::downgrade(self);
@@ -324,6 +335,10 @@ impl Setup {
         self.local.set_text("");
         let generation = self.discovery_generation.get().wrapping_add(1);
         self.discovery_generation.set(generation);
+        // An earlier scan's error describes a directory that is no longer the one shown.
+        if !self.github.get() {
+            self.message.set_text("");
+        }
         let path = self.workspace.borrow()["path"]
             .as_str()
             .map(str::to_owned)
@@ -331,20 +346,20 @@ impl Setup {
         let setup = self.clone();
         let found = found.clone();
         glib::spawn_future_local(async move {
-            match setup
+            let result = setup
                 .ui
                 .call("workspace.discover", json!({"path":path}))
-                .await
-            {
+                .await;
+            // A newer scan must not be replaced by a result, or an error, for an older directory.
+            let current = setup.workspace.borrow()["path"]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| setup.workspace_path.text().trim().to_owned());
+            if current != path || setup.discovery_generation.get() != generation {
+                return;
+            }
+            match result {
                 Ok(v) => {
-                    // A newer scan must not be replaced by a result for an older directory.
-                    let current = setup.workspace.borrow()["path"]
-                        .as_str()
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| setup.workspace_path.text().trim().to_owned());
-                    if current != path || setup.discovery_generation.get() != generation {
-                        return;
-                    }
                     for repo in rows(&v, "repositories").into_iter().filter(|r| {
                         !setup
                             .ui
@@ -577,6 +592,19 @@ impl Setup {
     }
 }
 
+/// The workspace to offer for a GUI started in `cwd`: when that directory lies inside a Git
+/// checkout, the checkout's parent, so discovery lists the repository instead of the workspace
+/// becoming the repository itself (the engine applies the same rule to an empty path, but to
+/// its own working directory, not this process's).
+fn suggested_workspace(cwd: &std::path::Path) -> std::path::PathBuf {
+    for ancestor in cwd.ancestors() {
+        if ancestor.join(".git").exists() {
+            return ancestor.parent().unwrap_or(ancestor).to_path_buf();
+        }
+    }
+    cwd.to_path_buf()
+}
+
 fn browse(ui: &Rc<Ui>, body: &gtk::Box, entry: &gtk::Entry, title: &'static str) {
     let key = button("Browse…", "quiet");
     body.append(&key);
@@ -596,4 +624,21 @@ fn browse(ui: &Rc<Ui>, body: &gtk::Box, entry: &gtk::Entry, title: &'static str)
             }
         });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::suggested_workspace;
+
+    #[test]
+    fn a_cwd_inside_a_checkout_suggests_the_checkout_parent() {
+        let root = std::env::temp_dir().join(format!("relay-onboarding-{}", std::process::id()));
+        let repo = root.join("repo");
+        let deep = repo.join("target").join("debug");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        assert_eq!(suggested_workspace(&deep), root);
+        assert_eq!(suggested_workspace(&repo), root);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
