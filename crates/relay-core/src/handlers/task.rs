@@ -224,71 +224,123 @@ fn attachment_row(row: &Row) -> rusqlite::Result<Attachment> {
     })
 }
 
-/// Every statement here is `prepare_cached`: a task list hydrates each row with seven of them,
-/// and compiling five of those per row was 61 % of `task.list` (PERF §1.2).
+/// Attachment `id` of `task_id`: a live one, or with `detached` one `task.detach` soft-deleted.
+fn attachment_on(tx: &Transaction, task_id: Id, id: Id, detached: bool) -> Result<Attachment, BusError> {
+    let sql = if detached {
+        "SELECT * FROM attachments WHERE id=?1 AND task_id=?2 AND deleted_at IS NOT NULL"
+    } else {
+        "SELECT * FROM attachments WHERE id=?1 AND task_id=?2 AND deleted_at IS NULL"
+    };
+    tx.prepare_cached(sql)
+        .and_then(|mut stmt| stmt.query_row(params![id, task_id], attachment_row).optional())
+        .bus()?
+        .ok_or_else(|| {
+            let what = if detached { "detached attachment" } else { "attachment" };
+            BusError::not_found("task.attachment_not_found", format!("no {what} {id} on task {task_id}"))
+        })
+}
+
+/// The task row's own columns, with every list field empty and depth 0: [`hydrate`] fills them.
+pub(crate) fn task_columns(row: &Row) -> rusqlite::Result<Task> {
+    Ok(Task {
+        id: row.get("id")?,
+        project_id: row.get("project_id")?,
+        module_id: row.get("module_id")?,
+        title: row.get("title")?,
+        body: row.get("body")?,
+        changelog: row.get("changelog")?,
+        column: parse_column(&row.get::<_, String>("col")?),
+        position: row.get("position")?,
+        state: parse_task_state(&row.get::<_, String>("state")?),
+        priority: parse_priority(&row.get::<_, String>("priority")?),
+        size: parse_size(row.get("size")?),
+        task_type: parse_type(&row.get::<_, String>("kind")?),
+        parent_id: row.get("parent_id")?,
+        depth: 0,
+        children: Vec::new(),
+        rollup: TaskRollup::default(),
+        labels: Vec::new(),
+        blocked_by: Vec::new(),
+        blocks: Vec::new(),
+        duplicate_of: None,
+        sessions: Vec::new(),
+        commits: Vec::new(),
+        attachments: Vec::new(),
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+        deleted_at: row.get("deleted_at")?,
+    })
+}
+
+/// One row as a whole task. A list hydrates its page at once with [`hydrate`] instead.
 pub(crate) fn row_task(tx: &rusqlite::Connection, row: &Row) -> Result<Task, rusqlite::Error> {
-    let id: Id = row.get("id")?;
-    let sessions = {
-        let mut stmt = tx.prepare_cached("SELECT s.name FROM task_sessions ts JOIN sessions s ON s.id=ts.session_id WHERE ts.task_id=?1 ORDER BY ts.ord,ts.session_id")?;
-        let values = stmt
-            .query_map([id], |r| r.get(0))?
-            .collect::<rusqlite::Result<Vec<String>>>()?;
-        values
-    };
-    let commits = {
-        let mut stmt = tx.prepare_cached(
-            "SELECT sha,branch,linked_at FROM task_commits WHERE task_id=?1 ORDER BY id",
-        )?;
-        let values = stmt
-            .query_map([id], |r| {
-                Ok(TaskCommit {
-                    sha: r.get(0)?,
-                    branch: r.get(1)?,
-                    linked_at: r.get(2)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        values
-    };
-    let attachments = {
-        let mut stmt =
-            tx.prepare_cached("SELECT * FROM attachments WHERE task_id=?1 ORDER BY id")?;
-        let values = stmt
-            .query_map([id], attachment_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        values
-    };
-    let labels = {
-        let mut stmt = tx.prepare_cached("SELECT l.name FROM task_labels tl JOIN labels l ON l.id=tl.label_id WHERE tl.task_id=?1 ORDER BY l.name COLLATE NOCASE")?;
-        let values = stmt
-            .query_map([id], |r| r.get(0))?
-            .collect::<rusqlite::Result<Vec<String>>>()?;
-        values
-    };
-    let edges = |sql: &str| -> rusqlite::Result<Vec<Id>> {
+    let mut tasks = [task_columns(row)?];
+    hydrate(tx, &mut tasks)?;
+    let [task] = tasks;
+    Ok(task)
+}
+
+/// Fill in what lives beside the task rows — sessions, commits, attachments, labels, relations
+/// and children — with one statement each for the whole batch, the ids passed as one JSON
+/// array, then the roll-up and depth, which walk the tree per task. `task.list` ran each of
+/// those per task, seven statements a row (RA-412); `task.get` goes through here with one id,
+/// so a task reads the same either way. The ids must be distinct. Every statement is
+/// `prepare_cached` (PERF §1.2).
+pub(crate) fn hydrate(tx: &rusqlite::Connection, tasks: &mut [Task]) -> rusqlite::Result<()> {
+    if tasks.is_empty() {
+        return Ok(());
+    }
+    let at: std::collections::HashMap<Id, usize> = tasks.iter().enumerate().map(|(i, t)| (t.id, i)).collect();
+    let ids = serde_json::to_string(&tasks.iter().map(|t| t.id).collect::<Vec<_>>())
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    // Each statement returns (task id, value) in the per-task order the field is shown in.
+    fn each<T>(tx: &rusqlite::Connection, sql: &str, ids: &str, map: impl FnMut(&Row) -> rusqlite::Result<(Id, T)>) -> rusqlite::Result<Vec<(Id, T)>> {
         let mut stmt = tx.prepare_cached(sql)?;
-        let values = stmt.query_map([id], |r| r.get(0))?.collect();
+        let values = stmt.query_map([ids], map)?.collect();
         values
-    };
-    let blocked_by = edges("SELECT r.to_task FROM task_relations r JOIN tasks t ON t.id=r.to_task WHERE r.from_task=?1 AND r.rel='blocked_by' AND t.deleted_at IS NULL ORDER BY r.to_task")?;
-    let blocks = edges("SELECT r.from_task FROM task_relations r JOIN tasks t ON t.id=r.from_task WHERE r.to_task=?1 AND r.rel='blocked_by' AND t.deleted_at IS NULL ORDER BY r.from_task")?;
-    let duplicate_of = edges("SELECT r.to_task FROM task_relations r JOIN tasks t ON t.id=r.to_task WHERE r.from_task=?1 AND r.rel='duplicate_of' AND t.deleted_at IS NULL ORDER BY r.to_task")?
-        .into_iter()
-        .next();
-    let children = {
-        let mut stmt = tx.prepare_cached(
-            "SELECT id FROM tasks WHERE parent_id=?1 AND deleted_at IS NULL ORDER BY position,id",
-        )?;
-        let values = stmt
-            .query_map([id], |r| r.get(0))?
-            .collect::<rusqlite::Result<Vec<Id>>>()?;
-        values
-    };
-    // Roll-up walks the subtree here rather than in a recursive CTE so it counts exactly the
-    // rows `descendants` would fan out to; depth is capped at 3, so the walk is shallow.
+    }
+    for (id, name) in each(tx, "SELECT ts.task_id, s.name FROM task_sessions ts JOIN sessions s ON s.id=ts.session_id WHERE ts.task_id IN (SELECT value FROM json_each(?1)) ORDER BY ts.task_id,ts.ord,ts.session_id", &ids, |r| Ok((r.get(0)?, r.get(1)?)))? {
+        tasks[at[&id]].sessions.push(name);
+    }
+    for (id, commit) in each(tx, "SELECT task_id,sha,branch,linked_at FROM task_commits WHERE task_id IN (SELECT value FROM json_each(?1)) ORDER BY task_id,id", &ids, |r| {
+        Ok((r.get(0)?, TaskCommit { sha: r.get(1)?, branch: r.get(2)?, linked_at: r.get(3)? }))
+    })? {
+        tasks[at[&id]].commits.push(commit);
+    }
+    for (id, attachment) in each(tx, "SELECT * FROM attachments WHERE task_id IN (SELECT value FROM json_each(?1)) AND deleted_at IS NULL ORDER BY task_id,id", &ids, |r| {
+        Ok((r.get("task_id")?, attachment_row(r)?))
+    })? {
+        tasks[at[&id]].attachments.push(attachment);
+    }
+    for (id, label) in each(tx, "SELECT tl.task_id, l.name FROM task_labels tl JOIN labels l ON l.id=tl.label_id WHERE tl.task_id IN (SELECT value FROM json_each(?1)) ORDER BY tl.task_id, l.name COLLATE NOCASE", &ids, |r| Ok((r.get(0)?, r.get(1)?)))? {
+        tasks[at[&id]].labels.push(label);
+    }
+    for (id, other) in each(tx, "SELECT r.from_task, r.to_task FROM task_relations r JOIN tasks t ON t.id=r.to_task WHERE r.from_task IN (SELECT value FROM json_each(?1)) AND r.rel='blocked_by' AND t.deleted_at IS NULL ORDER BY r.from_task, r.to_task", &ids, |r| Ok((r.get(0)?, r.get(1)?)))? {
+        tasks[at[&id]].blocked_by.push(other);
+    }
+    for (id, other) in each(tx, "SELECT r.to_task, r.from_task FROM task_relations r JOIN tasks t ON t.id=r.from_task WHERE r.to_task IN (SELECT value FROM json_each(?1)) AND r.rel='blocked_by' AND t.deleted_at IS NULL ORDER BY r.to_task, r.from_task", &ids, |r| Ok((r.get(0)?, r.get(1)?)))? {
+        tasks[at[&id]].blocks.push(other);
+    }
+    for (id, other) in each(tx, "SELECT r.from_task, r.to_task FROM task_relations r JOIN tasks t ON t.id=r.to_task WHERE r.from_task IN (SELECT value FROM json_each(?1)) AND r.rel='duplicate_of' AND t.deleted_at IS NULL ORDER BY r.from_task, r.to_task", &ids, |r| Ok((r.get(0)?, r.get(1)?)))? {
+        // The first in id order, as one edge per task should be all there is (RA-418).
+        tasks[at[&id]].duplicate_of.get_or_insert(other);
+    }
+    for (id, child) in each(tx, "SELECT parent_id, id FROM tasks WHERE parent_id IN (SELECT value FROM json_each(?1)) AND deleted_at IS NULL ORDER BY parent_id,position,id", &ids, |r| Ok((r.get(0)?, r.get(1)?)))? {
+        tasks[at[&id]].children.push(child);
+    }
+    for task in tasks.iter_mut() {
+        task.rollup = rollup_of(tx, task.id, &task.children)?;
+        task.depth = depth_of(tx, task.id)?;
+    }
+    Ok(())
+}
+
+/// Roll-up walks the subtree here rather than in a recursive CTE so it counts exactly the
+/// rows `descendants` would fan out to; depth is capped at 3, so the walk is shallow.
+fn rollup_of(tx: &rusqlite::Connection, id: Id, children: &[Id]) -> rusqlite::Result<TaskRollup> {
     let mut rollup = TaskRollup::default();
     let mut counted: std::collections::HashSet<Id> = std::collections::HashSet::from([id]);
-    let mut frontier = children.clone();
+    let mut frontier = children.to_vec();
     while let Some(current) = frontier.pop() {
         if !counted.insert(current) {
             continue;
@@ -311,34 +363,7 @@ pub(crate) fn row_task(tx: &rusqlite::Connection, row: &Row) -> Result<Task, rus
         }
         frontier.extend(kids);
     }
-    Ok(Task {
-        id,
-        project_id: row.get("project_id")?,
-        module_id: row.get("module_id")?,
-        title: row.get("title")?,
-        body: row.get("body")?,
-        changelog: row.get("changelog")?,
-        column: parse_column(&row.get::<_, String>("col")?),
-        position: row.get("position")?,
-        state: parse_task_state(&row.get::<_, String>("state")?),
-        priority: parse_priority(&row.get::<_, String>("priority")?),
-        size: parse_size(row.get("size")?),
-        task_type: parse_type(&row.get::<_, String>("kind")?),
-        parent_id: row.get("parent_id")?,
-        depth: depth_of(tx, id)?,
-        children,
-        rollup,
-        labels,
-        blocked_by,
-        blocks,
-        duplicate_of,
-        sessions,
-        commits,
-        attachments,
-        created_at: row.get("created_at")?,
-        updated_at: row.get("updated_at")?,
-        deleted_at: row.get("deleted_at")?,
-    })
+    Ok(rollup)
 }
 
 pub(crate) fn get_task(tx: &rusqlite::Connection, id: Id, include_deleted: bool) -> Result<Task, BusError> {
@@ -586,13 +611,15 @@ fn attach_staged(ctx: &mut Ctx, task: &Task, prepared: PreparedAttach) -> Result
         .bus()
 }
 
+/// Link `sha` (trimmed) to the task. Returns it when this call added the link, `None` when it
+/// was already there: `task.approve` undoes only a link it made itself.
 fn link_commit(
     tx: &Transaction,
     task_id: Id,
     sha: &str,
     branch: Option<&str>,
     now: &str,
-) -> Result<(), BusError> {
+) -> Result<Option<String>, BusError> {
     let sha = sha.trim();
     if sha.is_empty() {
         return Err(BusError::invalid(
@@ -600,12 +627,12 @@ fn link_commit(
             "commit sha cannot be empty",
         ));
     }
-    tx.execute(
+    let added = tx.execute(
         "INSERT OR IGNORE INTO task_commits(task_id,sha,branch,linked_at) VALUES (?1,?2,?3,?4)",
         params![task_id, sha, branch, now],
     )
     .bus()?;
-    Ok(())
+    Ok((added > 0).then(|| sha.to_string()))
 }
 
 fn assign_session(ctx: &mut Ctx, name: &str, task: &Task) -> Result<Vec<Id>, BusError> {
@@ -963,9 +990,12 @@ pub fn register(e: &mut Engine) {
         let mut stmt=ctx.tx().prepare_cached(&sql).bus()?;
         let mut rows=stmt.query(rusqlite::params_from_iter(args.iter().map(|v| v.as_ref()))).bus()?;
         let mut tasks=Vec::new();
-        while let Some(row)=rows.next().bus()? { tasks.push(row_task(ctx.tx(), row).bus()?); }
+        while let Some(row)=rows.next().bus()? { tasks.push(task_columns(row).bus()?); }
+        drop(rows);
         let next_offset = (tasks.len() > limit as usize).then_some(offset + limit);
         tasks.truncate(limit as usize);
+        // The page's side tables in one statement each, not seven per task (RA-412).
+        hydrate(ctx.tx(), &mut tasks).bus()?;
         if p.summary.unwrap_or(false) {
             for task in &mut tasks {
                 task.body.clear();
@@ -1109,6 +1139,12 @@ pub fn register(e: &mut Engine) {
     });
     e.register::<ChangelogWrite>(|ctx: &mut Ctx, p| {
         let before = get_task(ctx.tx(), p.task_id, false)?;
+        // Optional, for an agent that read the task and wants its write refused rather than
+        // landing over an edit made since (RA-413). Nothing tracks what it read; it says.
+        if p.expected_updated_at.as_ref().is_some_and(|at| *at != before.updated_at) {
+            return Err(BusError::conflict("task.edit_conflict", "Task changed elsewhere since you read it; your changelog was not saved")
+                .with_details(json!({"expected": p.expected_updated_at, "actual": before.updated_at})));
+        }
         ctx.tx()
             .execute(
                 "UPDATE tasks SET changelog=?1,updated_at=?2 WHERE id=?3",
@@ -1133,8 +1169,9 @@ pub fn register(e: &mut Engine) {
         std::fs::create_dir_all(&staging).bus()?;
         let staged = StagedFile(staging.join(uuid::Uuid::new_v4().to_string()));
         let (name, mime, bytes) = match (&p.path, &p.name, &p.mime, &p.bytes_b64) {
-            // A path may carry the name and type to store it under: undoing task.detach does,
-            // or the stored `{id}-{name}` and a generic type came back in their place (RA-414).
+            // A path may carry the name and type to store it under; without them the file's
+            // own name and a generic type are used (RA-414). Undoing a task.detach older than
+            // soft-detach (audit rows from before v24) still comes through here.
             (Some(path), name, mime, None) => {
                 let src = PathBuf::from(path);
                 if !src.is_file() {
@@ -1184,33 +1221,35 @@ pub fn register(e: &mut Engine) {
         emit_task(ctx, &get_task(ctx.tx(), task.id, false)?)?;
         Ok(attachment)
     });
+    // Soft (RA-414): the row and its file stay until the retention pass, so the undo restores
+    // the same id and file instead of copying the file in again under a new one.
     e.register::<Detach>(|ctx: &mut Ctx, p| {
         let task = get_task(ctx.tx(), p.task_id, false)?;
-        let attachment = ctx
-            .tx()
-            .query_row(
-                "SELECT * FROM attachments WHERE id=?1 AND task_id=?2",
-                params![p.attachment_id, task.id],
-                attachment_row,
-            )
-            .optional()
-            .bus()?
-            .ok_or_else(|| {
-                BusError::not_found(
-                    "task.attachment_not_found",
-                    format!("no attachment {} on task {}", p.attachment_id, task.id),
-                )
-            })?;
+        let attachment = attachment_on(ctx.tx(), task.id, p.attachment_id, false)?;
         ctx.tx()
-            .execute("DELETE FROM attachments WHERE id=?1", [attachment.id])
+            .execute("UPDATE attachments SET deleted_at=?1 WHERE id=?2", params![ctx.now, attachment.id])
             .bus()?;
         ctx.set_undo(
-            "task.attach",
-            json!({"task_id":task.id,"path":attachment.path,"name":attachment.name,"mime":attachment.mime}),
+            "task.attachment.restore",
+            json!({"task_id":task.id,"attachment_id":attachment.id}),
             None,
         );
         emit_task(ctx, &get_task(ctx.tx(), task.id, false)?)?;
         Ok(Empty {})
+    });
+    e.register::<AttachmentRestore>(|ctx: &mut Ctx, p| {
+        let task = get_task(ctx.tx(), p.task_id, false)?;
+        let attachment = attachment_on(ctx.tx(), task.id, p.attachment_id, true)?;
+        ctx.tx()
+            .execute("UPDATE attachments SET deleted_at=NULL WHERE id=?1", [attachment.id])
+            .bus()?;
+        ctx.set_undo(
+            "task.detach",
+            json!({"task_id":task.id,"attachment_id":attachment.id}),
+            None,
+        );
+        emit_task(ctx, &get_task(ctx.tx(), task.id, false)?)?;
+        Ok(attachment)
     });
     // Staged (D149): creating a session fetches and checks out, and launching one installs
     // hooks and writes files. Both run as their own requests with the store unlocked — the
@@ -1398,7 +1437,7 @@ pub fn register(e: &mut Engine) {
                 }
             }
         };
-        link_commit(ctx.tx(), before.id, &sha, branch.as_deref(), &ctx.now)?;
+        let added = link_commit(ctx.tx(), before.id, &sha, branch.as_deref(), &ctx.now)?;
         let index = column_index(ctx.tx(), &before)?;
         ctx.tx()
             .execute(
@@ -1411,11 +1450,49 @@ pub fn register(e: &mut Engine) {
             )
             .bus()?;
         let task = get_task(ctx.tx(), before.id, false)?;
+        // Undone by its own inverse, not a plain move: that left the commit link behind
+        // (RA-416). `sha` is set only when this approval made the link.
         ctx.set_undo(
-            "task.move",
-            json!({"task_id":before.id,"column":column_str(before.column),"position":index}),
+            "task.unapprove",
+            json!({"task_id":before.id,"column":column_str(before.column),"position":index,"state":state_str(before.state),"sha":added}),
             Some(json!({"updated_at":task.updated_at})),
         );
+        emit_task(ctx, &task)?;
+        Ok(task)
+    });
+    e.register::<Unapprove>(|ctx: &mut Ctx, p| {
+        let before = get_task(ctx.tx(), p.task_id, false)?;
+        if before.column != Column::Done {
+            return Err(BusError::conflict("task.column_transition", "task is not done"));
+        }
+        if p.column == Column::Done {
+            return Err(BusError::invalid("task.column", "unapprove moves a task out of done"));
+        }
+        // The commit goes back to the approval that would link it again: the one removed, or
+        // the newest still linked when the approval found its link already there.
+        let mut sha = None;
+        if let Some(removed) = p.sha.as_deref().map(str::trim) {
+            let unlinked = ctx.tx().execute("DELETE FROM task_commits WHERE task_id=?1 AND sha=?2", params![before.id, removed]).bus()?;
+            if unlinked > 0 { sha = Some(removed.to_string()); }
+        }
+        if sha.is_none() {
+            sha = before.commits.last().map(|c| c.sha.clone());
+        }
+        let position = open_slot(ctx.tx(), before.project_id, p.column, before.id, p.position)?;
+        ctx.tx()
+            .execute(
+                "UPDATE tasks SET col=?1,position=?2,state=?3,updated_at=?4 WHERE id=?5",
+                params![column_str(p.column), position, state_str(p.state), ctx.now, before.id],
+            )
+            .bus()?;
+        let task = get_task(ctx.tx(), before.id, false)?;
+        if sha.is_some() {
+            ctx.set_undo(
+                "task.approve",
+                json!({"task_id":before.id,"sha":sha}),
+                Some(json!({"updated_at":task.updated_at})),
+            );
+        }
         emit_task(ctx, &task)?;
         Ok(task)
     });

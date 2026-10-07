@@ -4,7 +4,7 @@
   "title": "RELAY v4 command bus",
   "description": "Generated from crates/relay-bus by `relay schema`. Do not edit; see docs/engine/BUS.md.",
   "version": 1,
-  "op_count": 228,
+  "op_count": 230,
   "envelope": {
     "request": {
       "$ref": "#/$defs/Request"
@@ -924,7 +924,7 @@
       }
     },
     "task.changelog.write": {
-      "summary": "Write the sentence that ships in patch notes",
+      "summary": "Write the sentence that ships in patch notes; pass expected_updated_at (from your last read) to refuse the write if the task changed since",
       "kind": "mutation",
       "audit": "always",
       "undo": "inverse",
@@ -964,7 +964,7 @@
       }
     },
     "task.detach": {
-      "summary": "Remove an attachment",
+      "summary": "Remove an attachment (soft: task.attachment.restore brings it back)",
       "kind": "mutation",
       "audit": "always",
       "undo": "inverse",
@@ -981,6 +981,26 @@
       },
       "result": {
         "$ref": "#/$defs/Empty"
+      }
+    },
+    "task.attachment.restore": {
+      "summary": "Restore a detached attachment with its id and file",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "inverse",
+      "scope": "project",
+      "actors": "all",
+      "doors": "all",
+      "emits": [
+        "task.changed"
+      ],
+      "since": "1.0",
+      "phase": 7,
+      "payload": {
+        "$ref": "#/$defs/TaskDetachIn"
+      },
+      "result": {
+        "$ref": "#/$defs/Attachment"
       }
     },
     "task.parent.set": {
@@ -1155,6 +1175,26 @@
       "phase": 7,
       "payload": {
         "$ref": "#/$defs/TaskApproveIn"
+      },
+      "result": {
+        "$ref": "#/$defs/Task"
+      }
+    },
+    "task.unapprove": {
+      "summary": "Undo task.approve: done task → its old column, slot and state, dropping the commit link the approval added",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "inverse",
+      "scope": "project",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "task.changed"
+      ],
+      "since": "1.0",
+      "phase": 7,
+      "payload": {
+        "$ref": "#/$defs/TaskUnapproveIn"
       },
       "result": {
         "$ref": "#/$defs/Task"
@@ -1449,7 +1489,7 @@
       }
     },
     "notes.append": {
-      "summary": "Append text to a note, the project's standing note, or its agent suggestions note",
+      "summary": "Append text to a note, the project's standing note, or its agent suggestions note; pass expected_updated_at (from your last read) to refuse if the note changed since",
       "kind": "mutation",
       "audit": "always",
       "undo": "none",
@@ -7450,6 +7490,13 @@
         },
         "text": {
           "type": "string"
+        },
+        "expected_updated_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The task's `updated_at` as you last read it. When given and the task has changed since,\nthe write is refused (`task.edit_conflict`) instead of overwriting someone else's edit;\nomitted, the write goes through as before."
         }
       },
       "required": [
@@ -8000,6 +8047,42 @@
       },
       "required": [
         "task_id"
+      ]
+    },
+    "TaskUnapproveIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "task_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "column": {
+          "$ref": "#/$defs/Column",
+          "description": "The column the task goes back to; not `done`."
+        },
+        "position": {
+          "type": "integer",
+          "format": "int64",
+          "description": "Its 0-based index in that column, as in `task.move`."
+        },
+        "state": {
+          "$ref": "#/$defs/TaskState",
+          "description": "The run state it had before the approval."
+        },
+        "sha": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The commit link the approval created, removed again. Absent when the approval linked a\ncommit that was already there, which then stays."
+        }
+      },
+      "required": [
+        "task_id",
+        "column",
+        "position",
+        "state"
       ]
     },
     "TaskCopyTextOut": {
@@ -8670,6 +8753,13 @@
         },
         "text": {
           "type": "string"
+        },
+        "expected_updated_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The target note's `updated_at` as you last read it. When given and the note has changed\nsince, nothing is appended (`notes.edit_conflict`); omitted, the text is appended as before."
         }
       },
       "required": [

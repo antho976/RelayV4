@@ -530,7 +530,7 @@ write surface roughly tenfold and turns a clean upfront refusal into a mid-task 
 so no door computes this for itself.
 
 **Layer 1 — op-level `actors` (registry, fixed).** Lifecycle and configuration ops are
-`user_only`: `task.dispatch`, `task.approve`, `session.create/spawn/resume/park/wake/close`,
+`user_only`: `task.dispatch`, `task.approve/unapprove`, `session.create/spawn/resume/park/wake/close`,
 `session.input/resize/discard_restorable`, `audit.undo`, `guardrail.confirm/reject`,
 `guardrail.config.set`, `settings.*` mutations, `app.*` mutations, `workspace.*` and
 `project.*` mutations, `provider.refresh`, `worktree.*` mutations, `git.branch.clean_merged`,
@@ -790,22 +790,24 @@ unique; nothing else is.
 |---|---|---|
 | `task.create` | mutation · always · inverse (delete) · project | `{ project_id, title, body?, column?: Column = "backlog", state?: TaskState, priority?: Priority = "medium", size?: Size, module_id?, changelog?, attachments?: AttachmentIn[], type?: TaskType = "task", parent_id?, labels?: string[] }` → `Task` |
 | `task.get` | query | `{ task_id }` → `Task` (with attachments, commits) |
-| `task.list` | query | `{ project_id?, column?, state?, module_id?, priority?, include_deleted?, sort?: "column"\|"priority"\|"updated", type?, label?, session?, parent_id?: Id\|null, limit? (1000, ≤2000), offset?, summary? }` → `{ tasks: Task[], next_offset? }` — a page; `summary` leaves `body` and `changelog` empty. `project_id` optional so the Dashboard can ask "in review, everywhere"; `parent_id: null` is roots only, `session` is "every card this agent was ever sent" |
+| `task.list` | query | `{ project_id?, column?, state?, module_id?, priority?, include_deleted?, sort?: "column"\|"priority"\|"updated", type?, label?, session?, parent_id?: Id\|null, limit? (1000, ≤2000), offset?, summary? }` → `{ tasks: Task[], next_offset? }` — a page; `summary` leaves `body` and `changelog` empty. `project_id` optional so the Dashboard can ask "in review, everywhere"; `parent_id: null` is roots only, `session` is "every card this agent was ever sent". Each page reads its sessions, commits, attachments, labels, relations and children in one statement per table, and every task in it equals its `task.get` (RA-412) |
 | `task.update` | mutation · always · inverse | `{ task_id, title?, body?, priority?, size?, module_id?: Id\|null, state?, changelog?, type? }` → `Task` |
 | `task.move` | mutation · always · inverse | `{ task_id, column: Column, position?: number }` → `Task` — transitions table in §11.1; `position` is the 0-based index the task ends at in the column (the others shift around it, clamped to the end), omitted means last; agents may only move their own task and only `active → in_review` |
 | `task.delete` | mutation · always · inverse (restore) | `{ task_id }` → `{}` |
 | `task.restore` | mutation · always · inverse (delete) | `{ task_id }` → `Task` |
 | `task.link_commit` | mutation · always | `{ task_id, sha, branch? }` → `Task` |
-| `task.changelog.write` | mutation · always · inverse | `{ task_id, text }` → `Task` |
-| `task.attach` | mutation · always | `{ task_id, name, mime, bytes_b64 }` or `{ task_id, path }` → `Attachment` |
-| `task.detach` | mutation · always · inverse | `{ task_id, attachment_id }` → `{}` |
+| `task.changelog.write` | mutation · always · inverse | `{ task_id, text, expected_updated_at? }` → `Task` — `expected_updated_at` is the task's `updated_at` as the caller last read it: given and no longer current, the write is refused (`conflict` / `task.edit_conflict`, the code `task.update`'s `expected` uses); omitted, it writes as before. Nothing tracks reads (RA-413) |
+| `task.attach` | mutation · always | `{ task_id, name, mime, bytes_b64 }` or `{ task_id, path, name?, mime? }` → `Attachment` — by path, `name` and `mime` set what the copy is stored as (default: the file's own name, `application/octet-stream`) (RA-414) |
+| `task.detach` | mutation · always · inverse (attachment.restore) | `{ task_id, attachment_id }` → `{}` — soft: the row gets `deleted_at` and leaves `Task.attachments`, the file stays. The retention pass removes row and file after `undo.grace_days` (RA-414, RA-409) |
+| `task.attachment.restore` | mutation · always · inverse (detach) | `{ task_id, attachment_id }` → `Attachment` — brings a detached attachment back with its id and file; `task.attachment_not_found` when it is not detached (or was purged) |
 | `task.parent.set` | mutation · always · inverse · project | `{ task_id, parent_id?: Id\|null, position? }` → `Task` — promote a task into a sub-task, re-parent it, or (no `parent_id`) detach it back to a root. Refuses `task.parent_cycle`, `task.depth`, `task.children_full`, `task.parent_project` |
 | `task.children` | query | `{ task_id, recursive? }` → `{ tasks: Task[] }` — direct children in board order, or the whole subtree |
 | `task.label.add` / `task.label.remove` | mutation · always · inverse | `{ task_id, label }` → `Task` — `add` creates the project label if the name is new; names are matched case-insensitively and the stored spelling wins |
 | `task.label.list` | query | `{ project_id }` → `{ labels: Label[] }` |
 | `task.relate` / `task.unrelate` | mutation · always · inverse | `{ task_id, relation: "blocked_by"\|"duplicate_of", other_id }` → `Task` — stored and rendered, never enforced; `duplicate_of` is single-valued, so a second `relate` replaces the first |
 | `task.dispatch` | mutation · always · project · user | `{ task_id, session?: string, create?: SessionCreateIn, fanout?, start?: bool }` → `{ task: Task, session: Session, fanned: { task, session }[] }` — one of `session`/`create`; moves the task to `active`, sets `state: dispatched`, and appends it to the session queue. `start` defaults true; false stages assignments before the provider starts. `fanout` also dispatches every not-done descendant, one fresh session each, and therefore requires `create` (`task.fanout_target`) |
-| `task.approve` | mutation · always · inverse (move back) · project · user | `{ task_id, sha? }` → `Task` — any open column → `done`, links sha (defaults to the recorded session branch head, or the project checkout HEAD without a session) |
+| `task.approve` | mutation · always · inverse (unapprove) · project · user | `{ task_id, sha? }` → `Task` — any open column → `done`, links sha (defaults to the recorded session branch head, or the project checkout HEAD without a session) |
+| `task.unapprove` | mutation · always · inverse (approve) · project · user | `{ task_id, column: Column, position: number, state: TaskState, sha? }` → `Task` — `task.approve`'s inverse: a `done` task goes back to `column` (not `done`) at index `position`, as `task.move` places it, with run state `state`, and the commit link `sha` is removed. The approval records `sha` only when it created that link, so a commit linked before it stays (RA-416). Refuses `task.column_transition` when the task is not done |
 | `task.copy_text` | query | `{ task_id }` → `{ text }` — a task as plain text: `#id title`, then the body when it has one. Agents' copy; the desktop board's copy button still builds its own string (title, body, `#id`) and does not call it |
 
 ### 10.6 module (SPEC §7)
@@ -829,8 +831,8 @@ unique; nothing else is.
 | `notes.list` | query | `{ project_id, pinned_only?, include_deleted?, summary? }` → `{ notes: Note[] }` — `summary` cuts each `body` to its first 240 characters (`notes.get` has it whole) |
 | `notes.get` | query | `{ note_id }` → `Note` |
 | `notes.create` | mutation · always · inverse | `{ project_id, title?, body, pinned? }` → `Note` — a body is at most 1 MiB here, in `notes.update` and after `notes.append` (`invalid` / `notes.body`). `notes.changed` carries the note without its body, plus `body_bytes` |
-| `notes.update` | mutation · always · inverse | `{ note_id, title?, body?, pinned? }` → `Note` |
-| `notes.append` | mutation · always | `{ note_id?, project_id?, target?: "standing" \| "suggestions", text }` → `Note` — appends to an explicit note, the standing note by default, or the unpinned per-project Agent suggestions note. Suggestions require a bound agent with a current task; Relay adds timestamp, session, and task identity and never injects this note into a brief. |
+| `notes.update` | mutation · always · inverse | `{ note_id, title?, body?, pinned?, expected? }` → `Note` — `expected` holds the original values of the fields being edited; one that no longer matches refuses the write (`conflict` / `notes.edit_conflict`) |
+| `notes.append` | mutation · always | `{ note_id?, project_id?, target?: "standing" \| "suggestions", text, expected_updated_at? }` → `Note` — appends to an explicit note, the standing note by default, or the unpinned per-project Agent suggestions note. Suggestions require a bound agent with a current task; Relay adds timestamp, session, and task identity and never injects this note into a brief. `expected_updated_at` is the target note's `updated_at` as the caller last read it: given and no longer current, nothing is appended (`conflict` / `notes.edit_conflict`); omitted, it appends as before (RA-413). Of the other note writes an agent role can reach, `notes.create` makes a new note and `notes.update` takes `expected`; `notes.pin/delete/restore` are in no agent role |
 | `notes.pin` | mutation · always · inverse | `{ note_id, pinned: bool }` → `Note` |
 | `notes.delete` / `notes.restore` | mutation · always · inverse | `{ note_id }` |
 | `notes.standing` | query | `{ project_id }` → `{ text }` — exactly what gets injected at dispatch |
