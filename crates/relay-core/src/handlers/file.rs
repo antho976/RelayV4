@@ -326,15 +326,28 @@ pub fn register(e: &mut Engine) {
                     }
                     continue;
                 }
+                // Only regular files: a FIFO blocks open() forever, and a link to a device
+                // can feed the buffer without end.
+                if !e.file_type().is_ok_and(|t| t.is_file()) {
+                    continue;
+                }
                 if let Some(glob) = &p.glob {
                     if !crate::guardrail::path_matches(glob, relp) {
                         continue;
                     }
                 }
+                if e.metadata().map_or(true, |m| m.len() > SEARCH_FILE_MAX) {
+                    continue;
+                }
                 buffer.clear();
-                let read = fs::File::open(&path)
-                    .and_then(|mut file| std::io::Read::read_to_end(&mut file, &mut buffer));
-                if read.is_err() {
+                let Ok(mut file) = fs::File::open(&path) else { continue };
+                // A NUL in the first block marks a binary (an asset, an archive): skip it
+                // before reading the rest.
+                let head = std::io::Read::read_to_end(&mut std::io::Read::take(&mut file, SEARCH_SNIFF), &mut buffer);
+                if head.is_err() || buffer.contains(&0) {
+                    continue;
+                }
+                if std::io::Read::read_to_end(&mut file, &mut buffer).is_err() {
                     continue;
                 }
                 // Same rule as `read_to_string`: what is not text is not searched.
@@ -625,6 +638,11 @@ fn copy(from: &Path, to: &Path) -> std::io::Result<()> {
     }
     Ok(())
 }
+
+/// file.search skips files larger than this: generated or asset data, not source.
+const SEARCH_FILE_MAX: u64 = 4 * 1024 * 1024;
+/// How much of a file is read to tell text from binary before the rest is read.
+const SEARCH_SNIFF: u64 = 8 * 1024;
 
 fn skip_dir(path: &Path) -> bool {
     path.components().any(|c| {

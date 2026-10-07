@@ -1244,7 +1244,7 @@ impl Ui {
                                         | "integration.changed"
                                         | "integration.result"
                                 ) {
-                                    ui.editor.invalidate(&ui);
+                                    ui.editor.invalidate(&ui, Some((&e.ev, &e.payload)));
                                 } else if e.ev == "layout.changed"
                                     && e.payload["action"] == "applied"
                                 {

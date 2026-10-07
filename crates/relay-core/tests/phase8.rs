@@ -133,6 +133,17 @@ fn file_lifecycle_search_and_confirmation_replay() {
     .into_result()
     .unwrap();
     assert_eq!(hits["hits"][0]["line"], 1);
+    // Binaries and non-regular files are skipped, not read: a FIFO would block the walk.
+    let src = std::path::Path::new(&repo).join("src");
+    std::fs::write(src.join("asset.bin"), b"println\0").unwrap();
+    let fifo = src.join("pipe");
+    assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    let hits = call(&e, "file.search", json!({"project_id":1,"query":"println","glob":"src/**"}))
+        .into_result()
+        .unwrap();
+    assert_eq!(hits["hits"].as_array().unwrap().len(), 1, "{hits}");
+    std::fs::remove_file(src.join("asset.bin")).unwrap();
+    std::fs::remove_file(fifo).unwrap();
     let deleted = call(
         &e,
         "file.delete",

@@ -638,7 +638,7 @@ pub fn register(e: &mut Engine) {
     e.register_unlocked::<PrList>(|ctx, p| {
         let project = ctx.read(|conn| get_project(conn, p.project_id))?;
         let gh = crate::github::gh_path()?;
-        let listed = list_pull_requests(&gh, Path::new(&project.path))?;
+        let listed = cached_pull_requests(&gh, Path::new(&project.path))?;
         // A PR merged for a branch a closed session left behind: clean that branch up now
         // rather than at the next sweep (branch_cleanup).
         let merged: Vec<String> = listed.pull_requests.iter()
@@ -698,6 +698,7 @@ pub fn register(e: &mut Engine) {
                 String::from_utf8_lossy(&out.stderr).trim().to_string(),
             ));
         }
+        forget_pull_requests(Path::new(&project.path));
         changed(ctx, project.id, &root);
         Ok(PrOpenOut {
             url: String::from_utf8_lossy(&out.stdout).trim().to_string(),
@@ -1099,6 +1100,33 @@ struct GhBranch {
 #[derive(Deserialize)]
 struct GhRepo {
     full_name: String,
+}
+
+/// How long one `gh api --paginate` answer serves git.pr.list. The desktop Git panel asks on
+/// every refresh, up to once a second while agents work, and each answer costs a GitHub API
+/// call per page of the repository's whole PR history.
+const PR_LIST_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+type PrCache = std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, (std::time::Instant, PrListOut)>>;
+static PR_CACHE: std::sync::OnceLock<PrCache> = std::sync::OnceLock::new();
+
+fn cached_pull_requests(gh: &Path, root: &Path) -> Result<PrListOut, BusError> {
+    let cache = PR_CACHE.get_or_init(Default::default);
+    if let Some((at, listed)) = cache.lock().unwrap().get(root) {
+        if at.elapsed() < PR_LIST_TTL {
+            return Ok(listed.clone());
+        }
+    }
+    let listed = list_pull_requests(gh, root)?;
+    cache.lock().unwrap().insert(root.to_path_buf(), (std::time::Instant::now(), listed.clone()));
+    Ok(listed)
+}
+
+/// A PR this engine just opened shows at once rather than after the cache expires.
+fn forget_pull_requests(root: &Path) {
+    if let Some(cache) = PR_CACHE.get() {
+        cache.lock().unwrap().remove(root);
+    }
 }
 
 fn list_pull_requests(gh: &Path, root: &Path) -> Result<PrListOut, BusError> {
