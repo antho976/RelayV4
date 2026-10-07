@@ -2665,6 +2665,7 @@ dependencies = [
  "relay-board",
  "relay-bus",
  "relay-client",
+ "relay-money",
  "serde_json",
  "sha2",
  "sourceview5",

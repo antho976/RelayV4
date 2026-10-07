@@ -379,6 +379,7 @@ pub fn run(rt: Handle) -> glib::ExitCode {
             include_str!("css/guardrails.css"),
             include_str!("css/usage.css"),
             include_str!("css/tools.css"),
+            include_str!("css/money.css"),
         ));
         if let Some(display) = gtk::gdk::Display::default() {
             gtk::style_context_add_provider_for_display(
@@ -412,6 +413,7 @@ struct TopBar {
     reconnect: gtk::Button,
     launch_key: gtk::Button,
     launch_caption: gtk::Label,
+    money_add: gtk::Button,
 }
 
 fn top_bar(window: &gtk::ApplicationWindow) -> TopBar {
@@ -430,6 +432,7 @@ fn top_bar(window: &gtk::ApplicationWindow) -> TopBar {
     top_left.append(&mark);
     let brand = label("RELAY", "brand");
     top_left.append(&brand);
+    top_left.append(&crate::money::switcher());
     top.append(&top_left);
     let top_space = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     top_space.set_hexpand(true);
@@ -476,6 +479,8 @@ fn top_bar(window: &gtk::ApplicationWindow) -> TopBar {
     launch_key.set_valign(gtk::Align::Center);
     launch_key.add_css_class("launch-key");
     top_actions.append(&launch_key);
+    let money_add = crate::money::add_key();
+    top_actions.append(&money_add);
     let window_controls = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     window_controls.add_css_class("window-controls");
     for (icon, caption, size) in [
@@ -528,6 +533,7 @@ fn top_bar(window: &gtk::ApplicationWindow) -> TopBar {
         reconnect,
         launch_key,
         launch_caption,
+        money_add,
     }
 }
 
@@ -566,6 +572,9 @@ fn notice_bar() -> (gtk::Label, gtk::Box) {
 struct Sidebar {
     root: gtk::Box,
     nav: gtk::Box,
+    money_nav: gtk::Box,
+    /// The workspace heading and project list, which the Money space hides.
+    workspaces: [gtk::Widget; 2],
     add_project: gtk::Button,
     projects_box: gtk::Box,
     settings_key: gtk::Button,
@@ -579,6 +588,8 @@ fn sidebar() -> Sidebar {
     let nav = gtk::Box::new(gtk::Orientation::Vertical, 1);
     nav.add_css_class("navigation");
     sidebar.append(&nav);
+    let money_nav = crate::money::sidebar_keys();
+    sidebar.append(&money_nav);
     let section = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     section.add_css_class("workspace-heading");
     let heading = label("WORKSPACES", "section-label");
@@ -597,7 +608,8 @@ fn sidebar() -> Sidebar {
     sidebar_footer.add_css_class("sidebar-footer");
     sidebar_footer.append(&settings_key);
     sidebar.append(&sidebar_footer);
-    Sidebar { root: sidebar, nav, add_project, projects_box, settings_key }
+    let workspaces = [section.upcast(), project_scroll.upcast()];
+    Sidebar { root: sidebar, nav, money_nav, workspaces, add_project, projects_box, settings_key }
 }
 
 /// The agent wall: the panes' grid and its right column, the empty state, and the focus tabs.
@@ -885,6 +897,7 @@ impl Ui {
         }
         content.add_named(&editor.root, Some("agents"));
         let pages = pages(&content);
+        crate::money::add_pages(&content);
         let sheet = launch_sheet(&body);
         let panel_host = gtk::Overlay::new();
         panel_host.set_child(Some(&sheet.overlay));
@@ -976,6 +989,9 @@ impl Ui {
         ui.wire_settings_return(&top, &bar.root);
         ui.wire_keys(&top, &bar, &wall.empty_launch, &side.add_project, &sheet.scrim);
         ui.wire_window();
+        let mut dev_only: Vec<gtk::Widget> = vec![side.nav.clone().upcast(), top.layouts_key.clone().upcast(), top.launch_key.clone().upcast()];
+        dev_only.extend(side.workspaces.iter().cloned());
+        crate::money::install(&ui, &side.money_nav, &top.money_add, dev_only);
         ui
     }
 
@@ -1355,7 +1371,7 @@ impl Ui {
                         return;
                     }
                     *ui.client.borrow_mut() = Some(client);
-                    if let Err(e)=ui.call("bus.subscribe",json!({"events":["project.changed","project.deleted","workspace.changed","workspace.deleted","session.changed","task.changed","task.deleted","mailbox.new","mailbox.changed","guardrail.held","guardrail.resolved","guardrail.grant_used","overlap.changed","notes.changed","notes.deleted","file.changed","git.changed","worktree.changed","module.changed","module.deleted","skill.changed","skill.deleted","plugin.changed","settings.changed","provider.update.changed","notify.new","notify.changed","device.changed","device.lease.acquired","device.lease.released","run.changed","run.crash","device.signing.changed","avd.changed","layout.changed","ui.changed","ui.toast","usage.changed","integration.changed","integration.result"]})).await {
+                    if let Err(e)=ui.call("bus.subscribe",json!({"events":["project.changed","project.deleted","workspace.changed","workspace.deleted","session.changed","task.changed","task.deleted","mailbox.new","mailbox.changed","guardrail.held","guardrail.resolved","guardrail.grant_used","overlap.changed","notes.changed","notes.deleted","file.changed","git.changed","worktree.changed","module.changed","module.deleted","skill.changed","skill.deleted","plugin.changed","settings.changed","provider.update.changed","notify.new","notify.changed","device.changed","device.lease.acquired","device.lease.released","run.changed","run.crash","device.signing.changed","avd.changed","layout.changed","ui.changed","ui.toast","usage.changed","integration.changed","integration.result","money.changed"]})).await {
                         if generation == ui.generation.get() {
                             ui.show_error(&e.to_string());
                         }
@@ -1376,6 +1392,7 @@ impl Ui {
                     ui.load_appearance();
                     crate::wallpaper_rotation::refresh(&ui);
                     ui.load_keybindings();
+                    crate::money::startup(&ui);
                     if *ui.page.borrow() == "devices" {
                         // Its own future, as navigate() does: awaited here, more than 64 events
                         // ahead of its reply would fill the notice channel before anything
@@ -1428,6 +1445,10 @@ impl Ui {
                                 }
                                 if e.ev.starts_with("guardrail.") {
                                     crate::pages::guardrail_event(&ui, &e.ev, &e.payload);
+                                }
+                                if e.ev == "money.changed" {
+                                    crate::money::changed(&ui);
+                                    continue;
                                 }
                                 if e.ev == "provider.update.changed" {
                                     crate::provider_updates::event(&ui, &e.payload);
@@ -1506,6 +1527,9 @@ impl Ui {
                                             });
                                         }
                                     }
+                                } else if crate::money::is_page(&ui.page.borrow()) {
+                                    // Money's pages read only the ledger, which says so with
+                                    // money.changed.
                                 } else if *ui.page.borrow() == "mailbox"
                                     && !e.ev.starts_with("mailbox.")
                                 {
@@ -1565,6 +1589,10 @@ impl Ui {
         }
         let files = page == "code";
         let page = if files { "agents" } else { page };
+        // A restored layout or an engine echo does not take the window out of Money.
+        if self.applying_ui.get() && crate::money::active() && !crate::money::is_page(page) {
+            return;
+        }
         if *self.page.borrow() != page && !self.dismiss_panels() {
             return;
         }
@@ -1599,6 +1627,7 @@ impl Ui {
         }
         *self.page.borrow_mut() = page.into();
         self.content.set_visible_child_name(page);
+        crate::money::follow(self, page, self.applying_ui.get());
         if page == "agents" {
             self.editor.prepare_project(self);
             if files {
@@ -1956,6 +1985,10 @@ impl Ui {
                 let page = ui.page.borrow().clone();
                 let project = ui.project.get();
                 if matches!(page.as_str(), "agents" | "code") {
+                    continue;
+                }
+                if crate::money::is_page(&page) {
+                    crate::money::refresh(&ui, &page).await;
                     continue;
                 }
                 if matches!(

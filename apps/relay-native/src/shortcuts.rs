@@ -1,6 +1,6 @@
 use gtk4::gdk::{self, prelude::*, Key, ModifierType};
 
-pub const DEFAULTS: [(&str, &str, &str); 7] = [
+pub const DEFAULTS: [(&str, &str, &str); 8] = [
     ("palette", "Command palette", "Ctrl+K"),
     ("agents", "Agents", "Ctrl+1"),
     ("code", "Code", "Ctrl+2"),
@@ -8,6 +8,7 @@ pub const DEFAULTS: [(&str, &str, &str); 7] = [
     ("new_session", "New session", "Ctrl+N"),
     ("settings", "Settings", "Ctrl+,"),
     ("sidebar", "Toggle sidebar", "Ctrl+Shift+B"),
+    ("space", "Switch between Dev and Money", "Ctrl+`"),
 ];
 
 fn parse(chord: &str) -> Option<(ModifierType, char)> {

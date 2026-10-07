@@ -892,6 +892,16 @@ pub fn install(ui: &Rc<Ui>) {
                 navigate.show_launch(None);
                 return;
             }
+            // The start screen and the entry sheet, over Money's Home.
+            if matches!(page.as_str(), "money-start" | "money-entry") {
+                navigate.navigate("money-home");
+                if page == "money-start" {
+                    crate::money::show_start(&navigate);
+                } else {
+                    crate::money::add_entry(&navigate);
+                }
+                return;
+            }
             navigate.navigate(if page == "launch" { "agents" } else { &page });
             if fixture && matches!(page.as_str(), "board" | "notes" | "launch") {
                 track("fixture edit", edit_fixture(navigate.clone(), page.clone()));

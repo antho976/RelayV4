@@ -16,6 +16,29 @@ Decided with Antho on 2026-10-07:
   per space with one live line each (Money: "$412 left · 3 days ahead"; Dev: agents and reviews).
 - **The switcher sits at the top left of the top bar,** where the brand is now: Dev | Money.
 
+## Try it
+
+From this branch's checkout, the `test` instance keeps its own store and ledger
+(`~/.local/share/relay-v4/test/money.db`) and leaves the `dev` engine and its agents alone:
+
+```fish
+./run.sh test
+```
+
+Pick **Money** on the start screen (or the Dev | Money switch at the top left). An empty ledger
+offers three ways in: add an account, load Tally's sample household, or import a Tally backup
+(Tally: Settings, Backup, export, then copy the `.json` to the PC).
+
+To sync the phone with the `test` engine, open its phone door on a free port (the `dev`
+engine's door holds 7420) and pair from Tally's Settings, "Relay on your PC":
+
+```fish
+target/debug/relay --instance test remote serve --bind 0.0.0.0:7421 &
+target/debug/relay --instance test remote pair
+```
+
+The first sync makes the PC's ledger the phone's; after that both sides merge.
+
 ## Steps
 
 1. **Tally in the repository** (done). `apps/tally`, squashed from
