@@ -34,16 +34,33 @@ fn geometry(name: &str) -> Option<&'static str> {
         }
         "code-inline" => r##"<path d="M5.5 4.5L2 8l3.5 3.5M10.5 4.5L14 8l-3.5 3.5" />"##,
         "sort" => r##"<path d="M4.5 3v10M2.5 11l2 2 2-2" /><path d="M8.5 4h5.5M8.5 8h4M8.5 12h2.5" />"##,
+        // Rounded, finer redraws of the shared sidebar and save glyphs, for the 1.25 stroke the
+        // toolbar draws with; the shared set keeps its own for the main window.
         "note-new" => {
-            r##"<path d="M4 2h5l3 3v9H4z" /><path d="M9 2v3h3" /><path d="M8 7.5v4.5M5.75 9.75h4.5" />"##
+            r##"<path d="M9.25 2.5H5a1.5 1.5 0 0 0-1.5 1.5v8A1.5 1.5 0 0 0 5 13.5h6a1.5 1.5 0 0 0 1.5-1.5V5.75z" /><path d="M9.25 2.5v2.25a1 1 0 0 0 1 1h2.25" /><path d="M8 7.5v3.5M6.25 9.25h3.5" />"##
         }
+        "sidebar" => {
+            r##"<rect x="2.5" y="3" width="11" height="10" rx="1.75" /><path d="M6.25 3v10" /><path d="M4.1 5.5h.6M4.1 7.25h.6" />"##
+        }
+        "save" => {
+            r##"<path d="M3.5 4.25c0-.97.78-1.75 1.75-1.75h5l2.25 2.25v7c0 .97-.78 1.75-1.75 1.75h-5.5c-.97 0-1.75-.78-1.75-1.75z" /><path d="M5.75 2.75v2.5h3.75v-2.5" /><path d="M5.5 13.25v-3a.75.75 0 0 1 .75-.75h3.5a.75.75 0 0 1 .75.75v3" />"##
+        }
+        "image" => {
+            r##"<rect x="2.5" y="3" width="11" height="10" rx="1.75" /><circle cx="6" cy="6.5" r="1.1" /><path d="M3 11.25l2.75-2.75 2.25 2.25 2.25-2.25 2.75 2.75" />"##
+        }
+        "task" => r##"<rect x="2.5" y="2.5" width="11" height="11" rx="2" /><path d="M5.25 8.25 7 10l3.75-4" />"##,
         _ => return None,
     })
 }
 
 pub fn glyph(name: &str, size: i32) -> gtk::Image {
+    glyph_stroke(name, size, 1.5)
+}
+
+/// `glyph` at another stroke: the toolbar draws 1.25 for a finer line at 16px.
+pub fn glyph_stroke(name: &str, size: i32, stroke: f64) -> gtk::Image {
     let Some(geometry) = geometry(name) else {
-        return crate::icons::image(name, size);
+        return crate::icons::image_with_stroke(name, size, stroke);
     };
-    crate::icons::from_geometry(geometry, size, 1.5)
+    crate::icons::from_geometry(geometry, size, stroke)
 }

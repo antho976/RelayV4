@@ -27,9 +27,30 @@ const GROUPS: [(&str, &str); 7] = [
 /// Rendered lanes (or list sections) in order, each with its visible cards in order.
 type Lanes = Vec<(String, Vec<(i64, gtk::Widget)>)>;
 type Action = Box<dyn Fn(&Rc<Board>)>;
+/// What a View-menu pill does when toggled: on or off.
+type Toggle = Box<dyn Fn(&Rc<Board>, bool)>;
 
 thread_local! {
     static BOARD: RefCell<Option<Rc<Board>>> = const { RefCell::new(None) };
+    /// The module the board is narrowed to: a module is a bundle of tasks, shown on the same
+    /// board with the same create, timeline and done.
+    static SCOPE: Cell<Option<i64>> = const { Cell::new(None) };
+}
+/// Opens the board narrowed to one module.
+pub fn open_module(ui: &Rc<Ui>, module: i64) {
+    SCOPE.with(|scope| scope.set(Some(module)));
+    if ui.page.borrow().as_str() == "board" {
+        ui.refresh_page();
+    } else {
+        ui.navigate("board");
+    }
+}
+/// Back to every task: the Board and Modules tabs both leave a module's board.
+pub fn leave_module() {
+    SCOPE.with(|scope| scope.set(None));
+}
+fn scope() -> Option<i64> {
+    SCOPE.with(|scope| scope.get())
 }
 fn current() -> Option<Rc<Board>> {
     BOARD.with(|board| board.borrow().clone())
@@ -49,7 +70,18 @@ fn open_blockers<'a>(task: &Value, all: &BTreeMap<i64, &'a Value>) -> Vec<&'a Va
         .collect()
 }
 
-fn caption(column: &str) -> &'static str {
+/// The line under a lane's name, as GitHub's project columns carry one.
+fn lane_meaning(column: &str) -> &'static str {
+    match column {
+        "backlog" => "This hasn't been started",
+        "ready" => "This is ready to be picked up",
+        "active" => "This is actively being worked on",
+        "in_review" => "This item is in review",
+        _ => "This has been completed",
+    }
+}
+
+pub(super) fn caption(column: &str) -> &'static str {
     COLUMN_TITLES
         .iter()
         .find(|(name, _)| *name == column)
@@ -58,15 +90,15 @@ fn caption(column: &str) -> &'static str {
 }
 
 /// `5m`, `3h`, `2d`: how long ago an RFC 3339 timestamp was, at a glance.
-fn ago(ts: &str) -> String {
+pub(super) fn ago(ts: &str) -> String {
     crate::relative::ago(ts, crate::relative::Form::Compact).unwrap_or_default()
 }
 /// The peek's longer reading of an [`ago`]: `just now`, `5m ago`, `on Mar 1`, or a dash.
-fn since(ts: &str) -> String {
+pub(super) fn since(ts: &str) -> String {
     crate::relative::ago(ts, crate::relative::Form::CompactAgo).unwrap_or_else(|| "—".into())
 }
 
-fn hue(name: &str) -> usize {
+pub(super) fn hue(name: &str) -> usize {
     name.bytes()
         .fold(2_166_136_261u32, |h, b| (h ^ b as u32).wrapping_mul(16_777_619)) as usize
         % 8
@@ -84,7 +116,7 @@ fn paint(widget: &gtk::Widget, cr: &cairo::Context, alpha: f64) {
 
 /// lific's status glyphs in Relay's state colours: dashed backlog, open ready, half-full
 /// active, three-quarter review and a checked done.
-fn status_icon(column: &str, size: i32) -> gtk::DrawingArea {
+pub(super) fn status_icon(column: &str, size: i32) -> gtk::DrawingArea {
     let area = gtk::DrawingArea::new();
     area.set_content_width(size);
     area.set_content_height(size);
@@ -135,7 +167,7 @@ fn status_icon(column: &str, size: i32) -> gtk::DrawingArea {
 }
 
 /// Signal bars for low/medium/high, a red square with a cut-out `!` for urgent.
-fn priority_icon(priority: &str) -> gtk::DrawingArea {
+pub(super) fn priority_icon(priority: &str) -> gtk::DrawingArea {
     let area = gtk::DrawingArea::new();
     area.set_content_width(13);
     area.set_content_height(13);
@@ -171,7 +203,7 @@ fn priority_icon(priority: &str) -> gtk::DrawingArea {
     area
 }
 
-fn lamp(class: &str) -> gtk::DrawingArea {
+pub(super) fn lamp(class: &str) -> gtk::DrawingArea {
     let area = gtk::DrawingArea::new();
     area.set_content_width(6);
     area.set_content_height(6);
@@ -211,7 +243,7 @@ fn view_glyph(list: bool) -> gtk::DrawingArea {
     area
 }
 
-fn state_badge(state: &str) -> Option<gtk::Box> {
+pub(super) fn state_badge(state: &str) -> Option<gtk::Box> {
     let caption = match state {
         "dispatched" => "Dispatched",
         "running" => "Running",
@@ -230,7 +262,7 @@ fn state_badge(state: &str) -> Option<gtk::Box> {
     Some(badge)
 }
 
-fn label_chip(name: &str) -> gtk::Box {
+pub(super) fn label_chip(name: &str) -> gtk::Box {
     let chip = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     chip.add_css_class("label-chip");
     chip.set_valign(gtk::Align::Center);
@@ -273,6 +305,34 @@ fn labels_row(task: &Value, max: usize) -> Option<gtk::Box> {
     Some(row)
 }
 
+/// Chips in rows that wrap at about `budget` characters, each kept its own width: a FlowBox
+/// would line them up in equal columns.
+pub(super) fn wrapped(items: Vec<(gtk::Widget, usize)>, budget: usize) -> gtk::Box {
+    let rows = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    let mut row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    let mut used = 0;
+    for (item, wide) in items {
+        if used > 0 && used + wide > budget {
+            rows.append(&row);
+            row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+            used = 0;
+        }
+        item.set_valign(gtk::Align::Center);
+        row.append(&item);
+        used += wide;
+    }
+    if used > 0 {
+        rows.append(&row);
+    }
+    rows
+}
+
+/// `high` → `High`: a field value as a pill or picker reads it.
+pub(super) fn titled(value: &str) -> String {
+    let mut chars = value.chars();
+    chars.next().map(|c| c.to_uppercase().chain(chars).collect()).unwrap_or_default()
+}
+
 fn spacer() -> gtk::Box {
     let space = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     space.set_hexpand(true);
@@ -305,38 +365,6 @@ fn drop_id(value: &glib::Value) -> Option<i64> {
         .and_then(|s| s.strip_prefix("relay-task:").and_then(|id| id.parse().ok()))
 }
 
-/// The task editor's identity line, in the board's vocabulary: status, number, priority,
-/// type, execution state and labels at a glance above the editable fields.
-pub(super) fn identity_strip(task: &Value) -> gtk::Box {
-    let strip = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    strip.add_css_class("task-identity");
-    let column = text(task, "column");
-    let item = |icon: gtk::Widget, caption: &str| {
-        let part = gtk::Box::new(gtk::Orientation::Horizontal, 5);
-        part.add_css_class("identity-part");
-        part.append(&icon);
-        part.append(&label(caption, "identity-caption"));
-        part
-    };
-    strip.append(&item(status_icon(column, 13).upcast(), caption(column)));
-    strip.append(&label(&format!("#{}", task["id"]), "card-id"));
-    let priority = text(task, "priority");
-    strip.append(&item(priority_icon(priority).upcast(), priority));
-    let kind = text(task, "type");
-    strip.append(&item(task_mark(kind, 9).upcast(), kind));
-    if let Some(badge) = state_badge(text(task, "state")) {
-        strip.append(&badge);
-    }
-    if let Some(tags) = labels_row(task, 6) {
-        strip.append(&tags);
-    }
-    strip.append(&spacer());
-    let when = label(&format!("updated {}", ago(text(task, "updated_at"))), "card-ago");
-    when.set_tooltip_text(Some(text(task, "updated_at")));
-    strip.append(&when);
-    strip
-}
-
 struct Quick {
     bar: gtk::Box,
     column: gtk::DropDown,
@@ -355,7 +383,13 @@ struct Board {
     picker: gtk::Box,
     picker_key: RefCell<String>,
     count: gtk::Label,
-    query: gtk::SearchEntry,
+    /// Board / Modules: a module's board lights Modules.
+    tabs: gtk::Box,
+    banner: gtk::Box,
+    /// The module in scope, as `module.list` last described it.
+    module: RefCell<Option<Value>>,
+    shown_scope: Cell<Option<i64>>,
+    query: gtk::Entry,
     filter: gtk::MenuButton,
     views: [gtk::ToggleButton; 2],
     strip: gtk::Box,
@@ -411,6 +445,7 @@ pub fn show(ui: &Rc<Ui>, page: &gtk::Box, project: i64, tasks: Vec<Value>) {
         }
     };
     board.refresh_picker(ui);
+    board.load_module(ui);
     let mut tasks = tasks;
     let titles: BTreeMap<i64, Value> = tasks
         .iter()
@@ -423,7 +458,7 @@ pub fn show(ui: &Rc<Ui>, page: &gtk::Box, project: i64, tasks: Vec<Value>) {
     }
     // Most events that refresh the page change no task: leave the board, and any open menu,
     // scroll position and selection on it, alone.
-    if !fresh && *board.tasks.borrow() == tasks {
+    if !fresh && *board.tasks.borrow() == tasks && board.shown_scope.get() == scope() {
         return;
     }
     *board.tasks.borrow_mut() = tasks;
@@ -436,7 +471,8 @@ impl Board {
         page.set_spacing(0);
         let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         header.add_css_class("board-head");
-        header.append(&board_switcher(ui, "board"));
+        let tabs = board_switcher(ui, "board");
+        header.append(&tabs);
         let picker = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         header.append(&picker);
         let count = label("", "board-count");
@@ -444,16 +480,46 @@ impl Board {
         count.set_hexpand(true);
         count.set_ellipsize(gtk::pango::EllipsizeMode::End);
         header.append(&count);
-        let query = gtk::SearchEntry::builder()
-            .placeholder_text("Search tasks   /")
+        // GitHub's project layout: one wide filter bar under the header, its View menu holding
+        // the filters, the grouping and which columns show.
+        let filterbar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        filterbar.add_css_class("board-filterbar");
+        let search = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        search.add_css_class("board-searchbar");
+        search.set_hexpand(true);
+        search.append(&crate::icons::image("search", 14));
+        let query = gtk::Entry::builder()
+            .placeholder_text("Search, or filter by field: priority:high  size:M  module:gallery  label:ui  is:open")
+            .hexpand(true)
+            .has_frame(false)
             .build();
         query.set_widget_name("board-query");
         query.add_css_class("board-search");
-        query.set_size_request(200, -1);
-        header.append(&query);
+        search.append(&query);
+        let wipe = crate::app::icon_button("close", "Clear the search (Esc)");
+        wipe.add_css_class("board-search-clear");
+        wipe.set_visible(false);
+        let field = query.downgrade();
+        wipe.connect_clicked(move |_| {
+            if let Some(field) = field.upgrade() {
+                field.set_text("");
+                field.grab_focus();
+            }
+        });
+        search.append(&wipe);
+        let focus = gtk::GestureClick::new();
+        let field = query.downgrade();
+        focus.connect_pressed(move |_, _, _, _| {
+            if let Some(field) = field.upgrade() {
+                field.grab_focus();
+            }
+        });
+        search.add_controller(focus);
+        filterbar.append(&search);
         let filter = gtk::MenuButton::new();
         filter.add_css_class("board-tool");
-        filter.set_tooltip_text(Some("Filter and group (F)"));
+        filter.set_tooltip_text(Some("Filter, group and choose columns (F)"));
+        filter.set_widget_name("board-view");
         let views = [gtk::ToggleButton::new(), gtk::ToggleButton::new()];
         let toggle = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         toggle.add_css_class("board-view-toggle");
@@ -468,8 +534,8 @@ impl Board {
             toggle.append(key);
         }
         views[0].set_active(true);
-        header.append(&filter);
-        header.append(&toggle);
+        filterbar.append(&filter);
+        filterbar.append(&toggle);
         let undo = crate::app::icon_button("undo", "Undo the last board change (Ctrl+Z)");
         undo.add_css_class("board-tool");
         header.append(&undo);
@@ -479,18 +545,28 @@ impl Board {
             crate::icons::image("plus", 12).upcast_ref(),
             "New task",
         )));
-        add.set_tooltip_text(Some("Quick-create a task (C) · full editor (N)"));
+        add.set_tooltip_text(Some("New task (N) · quick-create in place (C)"));
         header.append(&add);
-        for child in widgets(&header) {
-            if child.parent().as_ref() == Some(header.upcast_ref()) {
-                child.set_valign(gtk::Align::Center);
+        for bar in [&header, &filterbar] {
+            for child in widgets(bar) {
+                if child.parent().as_ref() == Some(bar.upcast_ref()) {
+                    child.set_valign(gtk::Align::Center);
+                }
             }
         }
         page.append(&header);
+        let banner = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        banner.add_css_class("module-banner");
+        banner.set_visible(false);
+        page.append(&banner);
+        page.append(&filterbar);
 
+        // Active filters and the grouping, as removable chips; hidden while there are none.
         let strip = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         strip.add_css_class("board-strip");
-        page.append(&clipped(&strip));
+        let strip_row = clipped(&strip);
+        strip_row.set_visible(false);
+        page.append(&strip_row);
 
         let bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         bar.add_css_class("board-quick");
@@ -554,26 +630,6 @@ impl Board {
         stack.add_overlay(&rail);
         page.append(&stack);
 
-        let hints = gtk::Box::new(gtk::Orientation::Horizontal, 5);
-        hints.add_css_class("board-shortcuts");
-        for (key, action) in [
-            ("J K", "move"),
-            ("H L", "column"),
-            ("↵", "open"),
-            ("Space", "peek"),
-            ("C", "new"),
-            ("[ ]", "change column"),
-            ("⇧J ⇧K", "reorder"),
-            ("P", "priority"),
-            (".", "actions"),
-            ("/", "search"),
-            ("F", "filter"),
-            ("V", "view"),
-        ] {
-            hints.append(&label(key, "board-kbd"));
-            hints.append(&label(action, "board-hint"));
-        }
-        page.append(&clipped(&hints));
 
         let keys = gtk::EventControllerKey::new();
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -585,6 +641,10 @@ impl Board {
             picker,
             picker_key: RefCell::new(String::new()),
             count,
+            tabs,
+            banner: banner.clone(),
+            module: RefCell::new(None),
+            shown_scope: Cell::new(None),
             query: query.clone(),
             filter: filter.clone(),
             views: views.clone(),
@@ -645,20 +705,34 @@ impl Board {
         }
 
         let weak = Rc::downgrade(&board);
-        query.connect_search_changed(move |_| {
+        let clear_key = wipe.downgrade();
+        query.connect_changed(move |entry| {
+            if let Some(key) = clear_key.upgrade() {
+                key.set_visible(!entry.text().is_empty());
+            }
             if let Some(board) = weak.upgrade() {
                 board.render();
             }
         });
+        let escape = gtk::EventControllerKey::new();
         let weak = Rc::downgrade(&board);
-        query.connect_stop_search(move |entry| {
-            entry.set_text("");
+        escape.connect_key_pressed(move |controller, key, _, _| {
+            if key != gdk::Key::Escape {
+                return glib::Propagation::Proceed;
+            }
+            if let Some(entry) = controller.widget().and_downcast::<gtk::Entry>() {
+                entry.set_text("");
+            }
             if let Some(board) = weak.upgrade() {
                 board.focus_board();
             }
+            glib::Propagation::Stop
         });
+        query.add_controller(escape);
         let popover = gtk::Popover::new();
         popover.add_css_class("board-menu");
+        popover.add_css_class("view-popover");
+        popover.set_has_arrow(false);
         filter.set_popover(Some(&popover));
         let weak = Rc::downgrade(&board);
         filter.set_create_popup_func(move |_| {
@@ -685,7 +759,7 @@ impl Board {
             if let Some(board) = weak.upgrade() {
                 // The click took focus from the card, so start in the last focused card's column.
                 let column = board.focused.get().and_then(|id| board.task(id)).map(|t| text(&t, "column").to_string());
-                board.open_quick(column.as_deref().unwrap_or("backlog"));
+                board.compose(column.as_deref().unwrap_or("backlog"));
             }
         });
         let weak = Rc::downgrade(&board);
@@ -710,7 +784,8 @@ impl Board {
         more.connect_clicked(move |_| {
             if let (Some(board), Some(ui)) = (weak.upgrade(), weak.upgrade().and_then(|b| b.ui.upgrade())) {
                 board.close_quick();
-                task_pages::compose(&ui, board.project);
+                let column = OPEN_COLUMNS[(board.quick.column.selected() as usize).min(OPEN_COLUMNS.len() - 1)];
+                task_pages::compose(&ui, board.project, column, scope());
             }
         });
         let escape = gtk::EventControllerKey::new();
@@ -916,6 +991,13 @@ impl Board {
         self.quick.bar.set_visible(true);
         self.quick.title.grab_focus();
     }
+    /// The full New task page, starting in `column` (Done is reached by approval, so Backlog).
+    fn compose(self: &Rc<Self>, column: &str) {
+        if let Some(ui) = self.ui() {
+            let column = if OPEN_COLUMNS.contains(&column) { column } else { "backlog" };
+            task_pages::compose(&ui, self.project, column, scope());
+        }
+    }
     fn close_quick(self: &Rc<Self>) {
         self.quick.bar.set_visible(false);
         self.quick.title.set_text("");
@@ -937,6 +1019,7 @@ impl Board {
             "column": pick(&self.quick.column, OPEN_COLUMNS),
             "type": pick(&self.quick.kind, &TYPES),
             "priority": pick(&self.quick.priority, &PRIORITIES),
+            "module_id": scope(),
         });
         // The whole bar, Create included, waits for the reply: a second click would create twice.
         self.quick.bar.set_sensitive(false);
@@ -1115,9 +1198,8 @@ impl Board {
                 self.open_quick(column.as_deref().unwrap_or("backlog"));
             }
             Key::n => {
-                if let Some(ui) = self.ui() {
-                    task_pages::compose(&ui, self.project);
-                }
+                let column = here.map(|(c, _)| c);
+                self.compose(column.as_deref().unwrap_or("backlog"));
             }
             Key::slash => {
                 self.query.grab_focus();
@@ -1234,12 +1316,27 @@ impl Board {
         clear(&self.content);
         self.layout.borrow_mut().clear();
         self.scrolls.borrow_mut().clear();
-        let tasks = self.tasks.borrow().clone();
+        let everything = self.tasks.borrow().clone();
+        let scope = scope();
+        self.shown_scope.set(scope);
+        let tasks: Vec<Value> = everything
+            .iter()
+            .filter(|t| scope.is_none() || t["module_id"].as_i64() == scope)
+            .cloned()
+            .collect();
+        self.render_banner(&tasks);
+        for (index, tab) in widgets(&self.tabs).into_iter().filter(|w| w.parent().as_ref() == Some(self.tabs.upcast_ref())).enumerate() {
+            if (index == 1) == scope.is_some() {
+                tab.add_css_class("selected");
+            } else {
+                tab.remove_css_class("selected");
+            }
+        }
         let filters = self.filters.borrow().clone();
-        let query = self.query.text().trim().to_lowercase();
+        let query = self.query.text().trim().to_string();
         let visible: Vec<&Value> = tasks
             .iter()
-            .filter(|t| task_matches(t, &filters, &query))
+            .filter(|t| task_matches(t, &filters, "") && relay_board::query_matches(t, &query))
             .collect();
         let open = tasks.iter().filter(|t| text(t, "column") != "done").count();
         let mut summary = format!("{open} open · {} done", tasks.len() - open);
@@ -1250,18 +1347,18 @@ impl Board {
         let active = filters.values().map(BTreeSet::len).sum::<usize>();
         self.filter.set_child(Some(&icon_text(
             crate::icons::image("sliders", 12).upcast_ref(),
-            &if active > 0 { format!("Filter · {active}") } else { "Filter".into() },
+            &if active > 0 { format!("View · {active}") } else { "View".into() },
         )));
         if active > 0 {
             self.filter.add_css_class("active");
         } else {
             self.filter.remove_css_class("active");
         }
-        self.render_strip(&tasks, &visible);
-        if tasks.is_empty() {
+        self.render_strip(&tasks);
+        if everything.is_empty() {
             self.render_empty();
         } else {
-            self.render_lanes(&tasks, &visible);
+            self.render_lanes(&tasks, &everything, &visible);
         }
         // Keep each scroller where it was: restore once the new content has its size. A scroller
         // the last render did not have (another view, a column shown again) starts at the top.
@@ -1290,6 +1387,286 @@ impl Board {
             }
         }
         self.render_peek();
+    }
+
+    /// Fetches the module in scope (its name, priority and whether it is done) for the banner.
+    fn load_module(self: &Rc<Self>, ui: &Rc<Ui>) {
+        let Some(id) = scope() else {
+            *self.module.borrow_mut() = None;
+            return;
+        };
+        let (ui, board, project) = (ui.clone(), self.clone(), self.project);
+        glib::spawn_future_local(async move {
+            let Ok(list) = ui.call("module.list", json!({"project_id":project,"include_archived":true})).await else { return };
+            let found = rows(&list, "modules").into_iter().find(|m| m["id"].as_i64() == Some(id));
+            if found.is_none() {
+                // Deleted elsewhere, or another project's: back to every task.
+                leave_module();
+            }
+            if *board.module.borrow() != found {
+                *board.module.borrow_mut() = found;
+                board.render_when_closed();
+            }
+        });
+    }
+
+    /// A module's head over its board: back to every task, its name and priority, how far
+    /// along it is, and adding tasks, marking it done, renaming and deleting it.
+    fn render_banner(self: &Rc<Self>, tasks: &[Value]) {
+        clear(&self.banner);
+        let (Some(id), Some(module)) = (scope(), self.module.borrow().clone()) else {
+            self.banner.set_visible(false);
+            return;
+        };
+        self.banner.set_visible(true);
+        let back = button("", "module-back");
+        back.set_child(Some(&icon_text(crate::icons::image("arrow-left", 12).upcast_ref(), "All modules")));
+        let weak = self.ui.clone();
+        back.connect_clicked(move |_| {
+            leave_module();
+            if let Some(ui) = weak.upgrade() {
+                ui.navigate("modules");
+            }
+        });
+        self.banner.append(&back);
+        let head = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        head.set_valign(gtk::Align::Center);
+        head.append(&crate::icons::image("modules", 16));
+        let name = label(text(&module, "name"), "module-banner-name");
+        name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        head.append(&name);
+        let priority = text(&module, "priority");
+        let pill = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        pill.add_css_class("field-pill");
+        pill.add_css_class(&format!("pill-priority-{priority}"));
+        pill.append(&priority_icon(priority));
+        pill.append(&label(&titled(priority), "field-pill-name"));
+        pill.set_valign(gtk::Align::Center);
+        head.append(&pill);
+        let done_module = !module["completed_at"].is_null();
+        if done_module {
+            head.append(&label("Completed", "module-card-done"));
+        }
+        self.banner.append(&head);
+        // The editor: rename and reprioritise in place, behind the pencil.
+        let editor = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        editor.add_css_class("module-editor");
+        editor.set_valign(gtk::Align::Center);
+        editor.set_visible(false);
+        let rename = gtk::Entry::builder().text(text(&module, "name")).width_chars(22).build();
+        rename.set_valign(gtk::Align::Center);
+        editor.append(&rename);
+        let chosen = Rc::new(RefCell::new(priority.to_string()));
+        for p in URGENT_FIRST {
+            let key = button("", "choice-pill");
+            key.set_valign(gtk::Align::Center);
+            key.set_child(Some(&icon_text(priority_icon(p).upcast_ref(), &titled(p))));
+            if p == priority {
+                key.add_css_class("selected");
+            }
+            let chosen = chosen.clone();
+            key.connect_clicked(move |key| {
+                *chosen.borrow_mut() = p.to_string();
+                if let Some(row) = key.parent() {
+                    for other in widgets(&row) {
+                        other.remove_css_class("selected");
+                    }
+                }
+                key.add_css_class("selected");
+            });
+            editor.append(&key);
+        }
+        let save = button("Save", "module-action");
+        save.add_css_class("module-save");
+        save.set_valign(gtk::Align::Center);
+        let weak = Rc::downgrade(self);
+        let field = rename.downgrade();
+        save.connect_clicked(move |_| {
+            let (Some(board), Some(field)) = (weak.upgrade(), field.upgrade()) else { return };
+            let name = field.text().trim().to_string();
+            if !name.is_empty() {
+                board.act("module.update", json!({"module_id":id,"name":name,"priority":*chosen.borrow()}));
+                *board.module.borrow_mut() = None;
+                if let Some(ui) = board.ui() {
+                    board.load_module(&ui);
+                }
+            }
+        });
+        editor.append(&save);
+        let cancel = button("Cancel", "module-action");
+        cancel.set_valign(gtk::Align::Center);
+        editor.append(&cancel);
+        self.banner.append(&editor);
+        let edit = crate::app::icon_button("edit", "Rename or change priority");
+        edit.set_valign(gtk::Align::Center);
+        let (shown, pane) = (head.downgrade(), editor.downgrade());
+        cancel.connect_clicked(move |_| {
+            if let (Some(head), Some(editor)) = (shown.upgrade(), pane.upgrade()) {
+                editor.set_visible(false);
+                head.set_visible(true);
+            }
+        });
+        let (shown, pane) = (head.downgrade(), editor.downgrade());
+        edit.connect_clicked(move |_| {
+            if let (Some(head), Some(editor)) = (shown.upgrade(), pane.upgrade()) {
+                let open = !editor.is_visible();
+                editor.set_visible(open);
+                head.set_visible(!open);
+            }
+        });
+        self.banner.append(&edit);
+        self.banner.append(&spacer());
+        let finished = tasks.iter().filter(|t| text(t, "column") == "done").count();
+        let fraction = if tasks.is_empty() { 0. } else { finished as f64 / tasks.len() as f64 };
+        let meter = gtk::ProgressBar::new();
+        meter.add_css_class("issue-progress");
+        meter.set_fraction(fraction);
+        meter.set_valign(gtk::Align::Center);
+        meter.set_size_request(160, -1);
+        self.banner.append(&meter);
+        self.banner.append(&label(
+            &format!("{finished} / {} done · {:.0}% · Estimate {}", tasks.len(), fraction * 100., relay_board::estimate(tasks.iter())),
+            "module-card-meta",
+        ));
+        let add = button("", "module-action");
+        add.set_child(Some(&icon_text(crate::icons::image("plus", 12).upcast_ref(), "Add tasks")));
+        add.set_tooltip_text(Some("Bring existing tasks into this module"));
+        let weak = Rc::downgrade(self);
+        add.connect_clicked(move |_| {
+            if let Some(board) = weak.upgrade() {
+                board.add_tasks(id);
+            }
+        });
+        self.banner.append(&add);
+        let finish = button("", "module-action");
+        finish.set_child(Some(&icon_text(
+            status_icon(if done_module { "in_review" } else { "done" }, 12).upcast_ref(),
+            if done_module { "Reopen module" } else { "Mark module done" },
+        )));
+        let weak = Rc::downgrade(self);
+        finish.connect_clicked(move |_| {
+            if let Some(board) = weak.upgrade() {
+                board.act(if done_module { "module.reopen" } else { "module.complete" }, json!({"module_id":id}));
+                *board.module.borrow_mut() = None;
+                if let Some(ui) = board.ui() {
+                    board.load_module(&ui);
+                }
+            }
+        });
+        self.banner.append(&finish);
+        let notes = button("", "module-action");
+        notes.set_child(Some(&icon_text(crate::icons::image("notes", 12).upcast_ref(), "Patch notes")));
+        notes.set_tooltip_text(Some("Draft release notes from the done tasks' changelog sentences"));
+        let weak = self.ui.clone();
+        let title = text(&module, "name").to_string();
+        notes.connect_clicked(move |_| {
+            let Some(ui) = weak.upgrade() else { return };
+            let panel = crate::panel::Panel::new(&ui, &format!("Patch notes · {title}"), 520);
+            let shown = label("Drafting…", "patch-notes");
+            shown.set_wrap(true);
+            shown.set_selectable(true);
+            panel.body.append(&shown);
+            let copy = button("Copy Markdown", "quiet");
+            copy.set_halign(gtk::Align::End);
+            copy.set_sensitive(false);
+            panel.body.append(&copy);
+            panel.present();
+            let (shown, copy) = (shown.downgrade(), copy.downgrade());
+            glib::spawn_future_local(async move {
+                let draft = ui.call("module.changelog.draft", json!({"module_id":id})).await;
+                let (Some(shown), Some(copy)) = (shown.upgrade(), copy.upgrade()) else { return };
+                match draft {
+                    Ok(draft) if !text(&draft, "markdown").trim().is_empty() => {
+                        let markdown = text(&draft, "markdown").to_string();
+                        shown.set_markup(&relay_board::markdown_markup(&markdown));
+                        copy.set_sensitive(true);
+                        copy.connect_clicked(move |key| key.clipboard().set_text(&markdown));
+                    }
+                    Ok(_) => shown.set_text("Nothing to note yet: done tasks with a changelog sentence appear here."),
+                    Err(e) => shown.set_text(&e.to_string()),
+                }
+            });
+        });
+        self.banner.append(&notes);
+        let delete = crate::app::icon_button("trash", "Delete this module; its tasks stay on the board");
+        let weak = Rc::downgrade(self);
+        crate::app::confirm_inline(&delete, "Delete module?", move |_| {
+            if let Some(board) = weak.upgrade() {
+                leave_module();
+                board.act("module.delete", json!({"module_id":id}));
+                if let Some(ui) = board.ui() {
+                    ui.navigate("modules");
+                }
+            }
+        });
+        self.banner.append(&delete);
+    }
+
+    /// A side panel listing the tasks outside the module, to tick and bring in.
+    fn add_tasks(self: &Rc<Self>, module: i64) {
+        let Some(ui) = self.ui() else { return };
+        let name = self.module.borrow().as_ref().map(|m| text(m, "name").to_string()).unwrap_or_default();
+        let panel = crate::panel::Panel::new(&ui, &format!("Add tasks to {name}"), 440);
+        let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        list.add_css_class("module-pick-list");
+        let picked: Rc<RefCell<BTreeSet<i64>>> = Rc::default();
+        let tasks = self.tasks.borrow().clone();
+        let outside: Vec<&Value> = tasks.iter().filter(|t| t["module_id"].as_i64() != Some(module) && text(t, "column") != "done").collect();
+        if outside.is_empty() {
+            list.append(&label("Every open task is already in this module.", "issue-side-empty"));
+        }
+        for task in outside {
+            let id = task["id"].as_i64().unwrap_or(0);
+            let row = gtk::CheckButton::new();
+            let content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            content.append(&status_icon(text(task, "column"), 12));
+            let title = label(text(task, "title"), "");
+            title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            title.set_hexpand(true);
+            content.append(&title);
+            if let Some(other) = task["module_name"].as_str() {
+                content.append(&label(other, "module-card-meta"));
+            }
+            row.set_child(Some(&content));
+            let picked = picked.clone();
+            row.connect_toggled(move |row| {
+                if row.is_active() {
+                    picked.borrow_mut().insert(id);
+                } else {
+                    picked.borrow_mut().remove(&id);
+                }
+            });
+            list.append(&row);
+        }
+        panel.body.append(&list);
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        actions.set_halign(gtk::Align::End);
+        let add = button("Add to module", "primary");
+        actions.append(&add);
+        panel.body.append(&actions);
+        let (weak, p) = (Rc::downgrade(self), Rc::downgrade(&panel));
+        add.connect_clicked(move |key| {
+            let (Some(board), Some(ui)) = (weak.upgrade(), weak.upgrade().and_then(|b| b.ui())) else { return };
+            let chosen: Vec<i64> = picked.borrow().iter().copied().collect();
+            if chosen.is_empty() {
+                return;
+            }
+            key.set_sensitive(false);
+            let p = p.clone();
+            glib::spawn_future_local(async move {
+                for id in chosen {
+                    if let Err(e) = ui.call("task.update", json!({"task_id":id,"module_id":module})).await {
+                        ui.show_error(&e.to_string());
+                    }
+                }
+                if let Some(p) = p.upgrade() {
+                    p.close();
+                }
+                ui.refresh_page();
+                drop(board);
+            });
+        });
+        panel.present();
     }
 
     fn render_empty(self: &Rc<Self>) {
@@ -1322,40 +1699,18 @@ impl Board {
         self.content.append(&empty);
     }
 
-    fn render_strip(self: &Rc<Self>, tasks: &[Value], visible: &[&Value]) {
+    fn render_strip(self: &Rc<Self>, tasks: &[Value]) {
         clear(&self.strip);
-        self.strip.append(&label("COLUMNS", "board-strip-caption"));
-        let hidden = self.hidden.borrow().clone();
-        for (column, title) in COLUMN_TITLES {
-            let shown = visible.iter().filter(|t| text(t, "column") == column).count();
-            let chip = gtk::ToggleButton::new();
-            chip.add_css_class("column-chip");
-            let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-            content.append(&status_icon(column, 12));
-            content.append(&label(title, "column-chip-name"));
-            content.append(&label(&shown.to_string(), "column-chip-count"));
-            chip.set_child(Some(&content));
-            chip.set_active(!hidden.contains(column));
-            chip.set_tooltip_text(Some(&format!("Show or hide {title}")));
-            let weak = Rc::downgrade(self);
-            chip.connect_toggled(move |chip| {
-                if let Some(board) = weak.upgrade() {
-                    if chip.is_active() {
-                        board.hidden.borrow_mut().remove(column);
-                    } else {
-                        board.hidden.borrow_mut().insert(column.to_string());
-                    }
-                    glib::idle_add_local_once(move || board.render());
-                }
-            });
-            self.strip.append(&chip);
-        }
         let filters = self.filters.borrow().clone();
         let group = self.group.borrow().clone();
-        if filters.values().any(|v| !v.is_empty()) || !group.is_empty() {
-            let rule = gtk::Separator::new(gtk::Orientation::Vertical);
-            rule.add_css_class("board-strip-rule");
-            self.strip.append(&rule);
+        let hidden = self.hidden.borrow().clone();
+        if let Some(row) = self.strip.ancestor(gtk::ScrolledWindow::static_type()) {
+            row.set_visible(filters.values().any(|v| !v.is_empty()) || !group.is_empty() || !hidden.is_empty());
+        }
+        for column in COLUMNS.iter().filter(|c| hidden.contains(**c)) {
+            self.strip.append(&self.removable(&format!("hidden: {}", caption(column)), move |board| {
+                board.hidden.borrow_mut().remove(*column);
+            }));
         }
         for (key, values) in &filters {
             for value in values {
@@ -1412,20 +1767,23 @@ impl Board {
         chip
     }
 
+    /// The View menu: which columns show, how cards group and what filters them, each a row of
+    /// small rounded pills that toggle in place.
     fn filter_menu(self: &Rc<Self>, popover: &gtk::Popover) {
-        let menu = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        menu.add_css_class("board-filter");
-        menu.set_size_request(420, -1);
+        let menu = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        menu.add_css_class("board-view-menu");
+        menu.set_size_request(300, -1);
         let head = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        head.append(&label("FILTER", "board-menu-caption"));
+        head.append(&label("View", "view-menu-title"));
         head.append(&spacer());
-        let reset = button("Clear all", "quiet");
+        let reset = button("Reset", "view-reset");
         let weak = Rc::downgrade(self);
         let pop = popover.downgrade();
         reset.connect_clicked(move |_| {
             if let Some(board) = weak.upgrade() {
                 board.filters.borrow_mut().clear();
                 board.group.borrow_mut().clear();
+                board.hidden.borrow_mut().clear();
                 board.render();
                 if let Some(pop) = pop.upgrade() {
                     board.filter_menu(&pop);
@@ -1434,126 +1792,116 @@ impl Board {
         });
         head.append(&reset);
         menu.append(&head);
-        let tasks = self.tasks.borrow().clone();
-        type Options = Vec<(&'static str, &'static str, Vec<(String, String)>)>;
-        let mut options: Options = vec![
-            ("type", "Type", TYPES.iter().map(|t| (t.to_string(), t.to_string())).collect()),
-            (
-                "priority",
-                "Priority",
-                URGENT_FIRST.iter().map(|t| (t.to_string(), t.to_string())).collect(),
-            ),
-            ("size", "Size", SIZES[1..].iter().map(|t| (t.to_string(), t.to_string())).collect()),
-        ];
-        let mut modules = BTreeMap::new();
-        let mut labels = BTreeSet::new();
-        let mut agents = BTreeSet::new();
-        let mut parents = vec![("roots".to_string(), "Top level only".to_string())];
-        for task in &tasks {
-            if let Some(id) = task["module_id"].as_i64() {
-                modules.insert(
-                    id.to_string(),
-                    task["module_name"].as_str().map(str::to_string).unwrap_or_else(|| format!("Module #{id}")),
-                );
+        // One toggle pill: its state read by `active`, its click handled by `toggled`.
+        let pill = |caption: &str, mark: Option<gtk::Widget>, active: bool, toggled: Toggle| {
+            let key = gtk::ToggleButton::new();
+            key.add_css_class("view-pill");
+            let content = gtk::Box::new(gtk::Orientation::Horizontal, 5);
+            let wide = caption.chars().count().min(18) + if mark.is_some() { 5 } else { 3 };
+            if let Some(mark) = mark {
+                content.append(&mark);
             }
-            labels.extend(rows(task, "labels").iter().filter_map(|v| v.as_str().map(str::to_string)));
-            agents.extend(rows(task, "sessions").iter().filter_map(|v| v.as_str().map(str::to_string)));
-            if tasks.iter().any(|t| t["parent_id"] == task["id"]) {
-                parents.push((task["id"].to_string(), format!("#{} {}", task["id"], text(task, "title"))));
-            }
-        }
-        for (key, title, values) in [
-            ("module", "Module", modules.into_iter().collect::<Vec<_>>()),
-            ("label", "Label", labels.into_iter().map(|l| (l.clone(), l)).collect()),
-            ("session", "Agent", agents.into_iter().map(|a| (a.clone(), a)).collect()),
-            ("parent", "Parent", parents),
-        ] {
-            options.push((key, title, values));
-        }
-        for (key, title, values) in options {
-            if values.is_empty() {
-                continue;
-            }
-            menu.append(&label(&title.to_uppercase(), "board-menu-caption"));
-            let flow = gtk::FlowBox::new();
-            flow.set_selection_mode(gtk::SelectionMode::None);
-            flow.set_max_children_per_line(8);
-            flow.set_column_spacing(4);
-            flow.set_row_spacing(4);
-            for (value, caption) in values {
-                let chip = gtk::ToggleButton::new();
-                chip.add_css_class("filter-option");
-                let mark: Option<gtk::Widget> = match key {
-                    "type" => Some(task_mark(&value, 9).upcast()),
-                    "priority" => Some(priority_icon(&value).upcast()),
-                    "label" => Some(label_chip(&value).upcast()),
-                    _ => None,
-                };
-                let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-                match mark {
-                    Some(mark) if key == "label" => content.append(&mark),
-                    Some(mark) => {
-                        content.append(&mark);
-                        content.append(&label(&caption, ""));
-                    }
-                    None => {
-                        let name = label(&caption, "");
-                        name.set_ellipsize(gtk::pango::EllipsizeMode::End);
-                        name.set_max_width_chars(26);
-                        content.append(&name);
-                    }
-                }
-                chip.set_child(Some(&content));
-                chip.set_active(self.filters.borrow().get(key).is_some_and(|s| s.contains(&value)));
-                let weak = Rc::downgrade(self);
-                chip.connect_toggled(move |chip| {
-                    if let Some(board) = weak.upgrade() {
-                        let mut filters = board.filters.borrow_mut();
-                        let set = filters.entry(key.to_string()).or_default();
-                        if chip.is_active() {
-                            set.insert(value.clone());
-                        } else {
-                            set.remove(&value);
-                        }
-                        if set.is_empty() {
-                            filters.remove(key);
-                        }
-                        drop(filters);
-                        board.render();
-                    }
-                });
-                flow.insert(&chip, -1);
-            }
-            menu.append(&flow);
-        }
-        menu.append(&label("GROUP CARDS BY", "board-menu-caption"));
-        let groups = gtk::FlowBox::new();
-        groups.set_selection_mode(gtk::SelectionMode::None);
-        groups.set_max_children_per_line(7);
-        groups.set_column_spacing(4);
-        let mut first: Option<gtk::ToggleButton> = None;
-        for (group, title) in GROUPS {
-            let chip = gtk::ToggleButton::with_label(title);
-            chip.add_css_class("filter-option");
-            match &first {
-                Some(first) => chip.set_group(Some(first)),
-                None => first = Some(chip.clone()),
-            }
-            chip.set_active(*self.group.borrow() == group);
+            let name = label(caption, "");
+            name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            name.set_max_width_chars(18);
+            content.append(&name);
+            key.set_child(Some(&content));
+            key.set_active(active);
             let weak = Rc::downgrade(self);
-            chip.connect_toggled(move |chip| {
-                if let (true, Some(board)) = (chip.is_active(), weak.upgrade()) {
-                    *board.group.borrow_mut() = group.to_string();
+            key.connect_toggled(move |key| {
+                if let Some(board) = weak.upgrade() {
+                    toggled(&board, key.is_active());
                     board.render();
                 }
             });
-            groups.insert(&chip, -1);
+            (key.upcast::<gtk::Widget>(), wide)
+        };
+        let section = |title: &str, items: Vec<(gtk::Widget, usize)>| {
+            if items.is_empty() {
+                return;
+            }
+            menu.append(&label(title, "view-menu-caption"));
+            menu.append(&wrapped(items, 38));
+        };
+        let hidden = self.hidden.borrow().clone();
+        section("Columns", COLUMN_TITLES.iter().map(|(column, title)| {
+            let column = *column;
+            pill(title, Some(status_icon(column, 11).upcast()), !hidden.contains(column), Box::new(move |board, on| {
+                if on {
+                    board.hidden.borrow_mut().remove(column);
+                } else {
+                    board.hidden.borrow_mut().insert(column.to_string());
+                }
+            }))
+        }).collect());
+        let group = self.group.borrow().clone();
+        let groups: Rc<RefCell<Vec<glib::WeakRef<gtk::ToggleButton>>>> = Rc::default();
+        let mut group_pills = Vec::new();
+        for (key, title) in GROUPS {
+            let (item, wide) = pill(title, None, group == key, Box::new(move |board, on| {
+                if on {
+                    *board.group.borrow_mut() = key.to_string();
+                } else if *board.group.borrow() == key {
+                    board.group.borrow_mut().clear();
+                }
+            }));
+            if let Some(toggle) = item.downcast_ref::<gtk::ToggleButton>() {
+                groups.borrow_mut().push(toggle.downgrade());
+                // One grouping at a time: lighting one puts the others out.
+                let others = groups.clone();
+                toggle.connect_toggled(move |toggle| {
+                    if toggle.is_active() {
+                        for other in others.borrow().iter().filter_map(|w| w.upgrade()) {
+                            if other != *toggle && other.is_active() {
+                                other.set_active(false);
+                            }
+                        }
+                    }
+                });
+            }
+            group_pills.push((item, wide));
         }
-        menu.append(&groups);
+        section("Group by", group_pills);
+        let tasks = self.tasks.borrow().clone();
+        let mut modules = BTreeMap::new();
+        let mut labels = BTreeSet::new();
+        let mut agents = BTreeSet::new();
+        for task in &tasks {
+            if let Some(id) = task["module_id"].as_i64() {
+                modules.insert(id.to_string(), task["module_name"].as_str().map(str::to_string).unwrap_or_else(|| format!("Module #{id}")));
+            }
+            labels.extend(rows(task, "labels").iter().filter_map(|v| v.as_str().map(str::to_string)));
+            agents.extend(rows(task, "sessions").iter().filter_map(|v| v.as_str().map(str::to_string)));
+        }
+        let filters = self.filters.borrow().clone();
+        let on = |key: &str, value: &str| filters.get(key).is_some_and(|set| set.contains(value));
+        let toggle = |key: &'static str, value: String| -> Toggle {
+            Box::new(move |board, active| {
+                let mut filters = board.filters.borrow_mut();
+                let set = filters.entry(key.to_string()).or_default();
+                if active {
+                    set.insert(value.clone());
+                } else {
+                    set.remove(&value);
+                }
+                if set.is_empty() {
+                    filters.remove(key);
+                }
+            })
+        };
+        section("Priority", URGENT_FIRST.iter().map(|p| pill(&titled(p), Some(priority_icon(p).upcast()), on("priority", p), toggle("priority", p.to_string()))).collect());
+        section("Size", SIZES[1..].iter().map(|s| pill(&format!("{s} · {} pt", relay_board::points(s)), None, on("size", s), toggle("size", s.to_string()))).collect());
+        section("Type", TYPES.iter().map(|t| pill(&titled(t), None, on("type", t), toggle("type", t.to_string()))).collect());
+        if scope().is_none() {
+            section("Module", modules.into_iter().map(|(id, name)| pill(&name, None, on("module", &id), toggle("module", id))).collect());
+        }
+        section("Label", labels.into_iter().map(|l| pill(&l, None, on("label", &l), toggle("label", l.clone()))).collect());
+        section("Agent", agents.into_iter().map(|a| pill(&a, None, on("session", &a), toggle("session", a.clone()))).collect());
         let scroll = crate::app::scrolled(&menu);
         scroll.set_propagate_natural_height(true);
-        scroll.set_max_content_height(560);
+        scroll.set_max_content_height(520);
         scroll.set_hscrollbar_policy(gtk::PolicyType::Never);
+        scroll.set_vscrollbar_policy(gtk::PolicyType::External);
         popover.set_child(Some(&scroll));
     }
 
@@ -1561,40 +1909,100 @@ impl Board {
         relay_board::sorted(visible, column, &self.group.borrow())
     }
 
-    fn lane_head(self: &Rc<Self>, column: &str, shown: usize, total: usize, class: &str) -> gtk::Box {
+    /// GitHub's column head: status ring, name, count and the lane's estimate, then a menu and
+    /// an add key; a lane (not a list section) adds the column's one-line meaning under it.
+    fn lane_head(self: &Rc<Self>, column: &'static str, shown: &[&Value], total: usize, class: &str) -> gtk::Box {
+        let outer = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        outer.add_css_class(class);
         let head = gtk::Box::new(gtk::Orientation::Horizontal, 7);
-        head.add_css_class(class);
-        head.append(&status_icon(column, 13));
-        head.append(&label(&caption(column).to_uppercase(), "lane-title"));
-        head.append(&label(
-            &if shown == total { total.to_string() } else { format!("{shown} / {total}") },
-            "lane-count",
-        ));
+        head.add_css_class("lane-head-row");
+        head.append(&status_icon(column, 14));
+        let title = label(caption(column), "lane-title");
+        title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        head.append(&title);
+        let count = shown.len();
+        let count = label(&if count == total { total.to_string() } else { format!("{count} / {total}") }, "lane-count");
+        count.set_valign(gtk::Align::Center);
+        head.append(&count);
+        let points = relay_board::estimate(shown.iter().copied());
+        let estimate = label(&format!("{points} pt"), "lane-estimate");
+        estimate.set_valign(gtk::Align::Center);
+        estimate.set_tooltip_text(Some(&format!("Estimate: {points} points of work shown here (S = 1, M = 3, L = 5)")));
+        head.append(&estimate);
         head.append(&spacer());
+        let more = gtk::MenuButton::new();
+        more.set_child(Some(&crate::icons::image("more", 14)));
+        more.add_css_class("lane-key");
+        more.set_tooltip_text(Some(&format!("{} options", caption(column))));
+        let pop = gtk::Popover::new();
+        pop.add_css_class("board-menu");
+        pop.set_has_arrow(false);
+        let menu = gtk::Box::new(gtk::Orientation::Vertical, 1);
+        let entry = |icon: &str, caption: &str| {
+            let key = button("", "board-menu-item");
+            key.set_child(Some(&icon_text(crate::icons::image(icon, 12).upcast_ref(), caption)));
+            key
+        };
+        if column != "done" {
+            let new = entry("plus", "New task here");
+            let weak = Rc::downgrade(self);
+            let close = pop.downgrade();
+            new.connect_clicked(move |_| {
+                if let Some(pop) = close.upgrade() {
+                    pop.popdown();
+                }
+                if let Some(board) = weak.upgrade() {
+                    board.compose(column);
+                }
+            });
+            menu.append(&new);
+            let quick = entry("edit", "Quick add in place");
+            let weak = Rc::downgrade(self);
+            let close = pop.downgrade();
+            quick.connect_clicked(move |_| {
+                if let Some(pop) = close.upgrade() {
+                    pop.popdown();
+                }
+                if let Some(board) = weak.upgrade() {
+                    board.open_quick(column);
+                }
+            });
+            menu.append(&quick);
+        }
+        let hide = entry("minimize", "Hide column");
+        let weak = Rc::downgrade(self);
+        let close = pop.downgrade();
+        hide.connect_clicked(move |_| {
+            if let Some(pop) = close.upgrade() {
+                pop.popdown();
+            }
+            if let Some(board) = weak.upgrade() {
+                board.hidden.borrow_mut().insert(column.to_string());
+                glib::idle_add_local_once(move || board.render());
+            }
+        });
+        menu.append(&hide);
+        pop.set_child(Some(&menu));
+        more.set_popover(Some(&pop));
+        head.append(&more);
         if column != "done" {
             let add = crate::app::icon_button("plus", &format!("New task in {}", caption(column)));
             add.add_css_class("lane-key");
             let weak = Rc::downgrade(self);
-            let name = column.to_string();
             add.connect_clicked(move |_| {
                 if let Some(board) = weak.upgrade() {
-                    board.open_quick(&name);
+                    board.compose(column);
                 }
             });
             head.append(&add);
         }
-        let hide = crate::app::icon_button("minimize", &format!("Hide {}", caption(column)));
-        hide.add_css_class("lane-key");
-        let weak = Rc::downgrade(self);
-        let name = column.to_string();
-        hide.connect_clicked(move |_| {
-            if let Some(board) = weak.upgrade() {
-                board.hidden.borrow_mut().insert(name.clone());
-                glib::idle_add_local_once(move || board.render());
-            }
-        });
-        head.append(&hide);
-        head
+        outer.append(&head);
+        if class == "lane-head" {
+            let meaning = label(lane_meaning(column), "lane-meaning");
+            meaning.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            outer.append(&meaning);
+        }
+        outer
     }
 
     fn lane_drop(self: &Rc<Self>, widget: &impl IsA<gtk::Widget>, column: &'static str) {
@@ -1638,7 +2046,7 @@ impl Board {
     /// The columns view, or the list view when `self.list` is set: one lane (or list section)
     /// per shown column, each with its head, drop target, empty note, group headings and
     /// cards (or rows).
-    fn render_lanes(self: &Rc<Self>, tasks: &[Value], visible: &[&Value]) {
+    fn render_lanes(self: &Rc<Self>, tasks: &[Value], everything: &[Value], visible: &[&Value]) {
         let list = self.list.get();
         let outer = if list {
             let rows = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -1665,9 +2073,10 @@ impl Board {
         };
         let grouping = self.group.borrow().clone();
         let hidden = self.hidden.borrow().clone();
-        let all = by_id(tasks);
+        let all = by_id(everything);
+        let project = self.project_name();
         if hidden.len() == COLUMNS.len() {
-            let all = label("Every column is hidden. Turn one back on in the COLUMNS strip.", "board-empty");
+            let all = label("Every column is hidden. Turn one back on under View.", "board-empty");
             all.set_halign(gtk::Align::Center);
             outer.append(&all);
         }
@@ -1681,18 +2090,19 @@ impl Board {
             let (lane, items) = if list {
                 let section = gtk::Box::new(gtk::Orientation::Vertical, 0);
                 section.add_css_class("list-section");
-                section.append(&self.lane_head(column, shown.len(), total, "list-head"));
+                section.append(&self.lane_head(column, &shown, total, "list-head"));
                 (section.clone(), section)
             } else {
                 let lane = gtk::Box::new(gtk::Orientation::Vertical, 0);
                 lane.add_css_class("board-lane");
                 lane.add_css_class(&format!("lane-{column}"));
-                lane.set_size_request(232, -1);
-                lane.append(&self.lane_head(column, shown.len(), total, "lane-head"));
+                lane.set_size_request(250, -1);
+                lane.append(&self.lane_head(column, &shown, total, "lane-head"));
                 let cards = gtk::Box::new(gtk::Orientation::Vertical, 6);
                 cards.add_css_class("board-cards");
                 let scroll = crate::app::scrolled(&cards);
                 scroll.set_hscrollbar_policy(gtk::PolicyType::Never);
+                scroll.set_vscrollbar_policy(gtk::PolicyType::External);
                 self.scrolls.borrow_mut().push((format!("lane:{column}"), scroll.vadjustment()));
                 lane.append(&scroll);
                 (lane, cards)
@@ -1716,7 +2126,7 @@ impl Board {
                         previous = Some(group);
                     }
                 }
-                let item = if list { self.row(task, &all) } else { self.card(task, &all) };
+                let item = if list { self.row(task, &all) } else { self.card(task, &all, &project) };
                 items.append(&item);
                 placed.push((task["id"].as_i64().unwrap_or(0), item.upcast()));
             }
@@ -1750,10 +2160,22 @@ impl Board {
         empty
     }
 
-    fn card(self: &Rc<Self>, task: &Value, all: &BTreeMap<i64, &Value>) -> gtk::Box {
+    /// The project's name, as a card's `Project #id` line reads.
+    fn project_name(&self) -> String {
+        self.ui()
+            .and_then(|ui| {
+                ui.projects.borrow().iter().find(|p| p["id"].as_i64() == Some(self.project)).map(|p| text(p, "name").to_string())
+            })
+            .unwrap_or_default()
+    }
+
+    /// A GitHub project card: status ring and `Project #id`, the title, progress and links,
+    /// then pills for how urgent and how much work it is, its type, module and labels.
+    fn card(self: &Rc<Self>, task: &Value, all: &BTreeMap<i64, &Value>, project: &str) -> gtk::Box {
         let id = task["id"].as_i64().unwrap_or(0);
-        let done = text(task, "column") == "done";
-        let card = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        let column = text(task, "column");
+        let done = column == "done";
+        let card = gtk::Box::new(gtk::Orientation::Vertical, 5);
         card.add_css_class("task-card");
         card.set_widget_name("task-card");
         card.set_focusable(true);
@@ -1770,12 +2192,12 @@ impl Board {
             text(task, "priority")
         ))]);
 
-        let top = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let top = gtk::Box::new(gtk::Orientation::Horizontal, 5);
         top.add_css_class("card-top");
-        let mark = task_mark(text(task, "type"), 9);
-        mark.set_tooltip_text(Some(text(task, "type")));
-        top.append(&mark);
-        top.append(&label(&format!("#{id}"), "card-id"));
+        top.append(&status_icon(column, 12));
+        let reference = label(&if project.is_empty() { format!("#{id}") } else { format!("{project} #{id}") }, "card-id");
+        reference.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        top.append(&reference);
         if let Some(badge) = state_badge(text(task, "state")) {
             top.append(&badge);
         }
@@ -1805,7 +2227,6 @@ impl Board {
             tools.append(key);
         }
         top.append(&tools);
-        top.append(&priority_icon(text(task, "priority")));
         card.append(&top);
 
         let title = label(text(task, "title"), "card-title");
@@ -1829,14 +2250,17 @@ impl Board {
         let total = task["rollup"]["total"].as_i64().unwrap_or(0);
         if total > 0 {
             let finished = task["rollup"]["done"].as_i64().unwrap_or(0);
-            let rollup = gtk::Box::new(gtk::Orientation::Horizontal, 7);
+            let fraction = (finished as f64 / total as f64).clamp(0., 1.);
+            let rollup = gtk::Box::new(gtk::Orientation::Horizontal, 8);
             rollup.add_css_class("task-rollup");
+            rollup.append(&label(&format!("{finished} / {total}"), "rollup-count"));
             let meter = gtk::ProgressBar::new();
-            meter.set_fraction((finished as f64 / total as f64).clamp(0., 1.));
+            meter.set_fraction(fraction);
             meter.set_hexpand(true);
             meter.set_valign(gtk::Align::Center);
+            meter.set_tooltip_text(Some(&format!("{finished} of {total} sub-tasks done")));
             rollup.append(&meter);
-            rollup.append(&label(&format!("{finished}/{total} sub-tasks"), "task-lineage"));
+            rollup.append(&label(&format!("{:.0}%", fraction * 100.), "rollup-count"));
             card.append(&rollup);
         }
         let blockers = open_blockers(task, all);
@@ -1861,35 +2285,51 @@ impl Board {
             caption.set_ellipsize(gtk::pango::EllipsizeMode::End);
             card.append(&caption);
         }
-        if let Some(tags) = labels_row(task, 3) {
-            card.append(&tags);
-        }
 
-        let foot = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        foot.add_css_class("card-foot");
-        if let Some(module) = task["module_name"].as_str() {
-            let caption = label(module, "card-module");
-            caption.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            caption.set_max_width_chars(16);
-            foot.append(&caption);
+        // Fields as pills, the way a project card shows its custom fields: urgency and size first.
+        let mut pills: Vec<(gtk::Widget, usize)> = Vec::new();
+        let pill = |icon: Option<gtk::Widget>, caption: &str, class: &str| {
+            let pill = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+            pill.add_css_class("field-pill");
+            if !class.is_empty() {
+                pill.add_css_class(class);
+            }
+            let wide = caption.chars().count().min(16) + if icon.is_some() { 6 } else { 4 };
+            if let Some(icon) = icon {
+                pill.append(&icon);
+            }
+            let name = label(caption, "field-pill-name");
+            name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            name.set_max_width_chars(16);
+            pill.append(&name);
+            (pill.upcast::<gtk::Widget>(), wide)
+        };
+        let priority = text(task, "priority");
+        pills.push(pill(Some(priority_icon(priority).upcast()), &titled(priority), &format!("pill-priority-{priority}")));
+        let size = text(task, "size");
+        if !size.is_empty() {
+            pills.push(pill(None, &format!("{size} · {} pt", relay_board::points(size)), "pill-size"));
         }
-        if !text(task, "size").is_empty() {
-            foot.append(&label(text(task, "size"), "task-chip"));
+        let kind = text(task, "type");
+        if kind != "task" && !kind.is_empty() {
+            pills.push(pill(Some(task_mark(kind, 9).upcast()), &titled(kind), ""));
         }
-        if let Some(commit) = task["commits"]
-            .as_array()
-            .and_then(|list| list.last())
-            .and_then(|c| c["sha"].as_str())
-        {
-            let sha = label(&commit.chars().take(7).collect::<String>(), "card-sha");
-            sha.set_tooltip_text(Some(commit));
-            foot.append(&sha);
+        // On a module's own board every card is in it: the pill would only repeat the banner.
+        if let Some(module) = task["module_name"].as_str().filter(|_| scope().is_none()) {
+            pills.push(pill(Some(crate::icons::image("modules", 11).upcast()), module, "pill-module"));
         }
-        foot.append(&spacer());
-        let when = label(&ago(text(task, "updated_at")), "card-ago");
-        when.set_tooltip_text(Some(&format!("Updated {}", text(task, "updated_at"))));
-        foot.append(&when);
-        card.append(&foot);
+        let tags: Vec<String> = rows(task, "labels").iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+        for tag in tags.iter().take(3) {
+            pills.push((label_chip(tag).upcast(), tag.chars().count().min(14) + 4));
+        }
+        if tags.len() > 3 {
+            let more = label(&format!("+{}", tags.len() - 3), "label-more");
+            more.set_tooltip_text(Some(&tags[3..].join(", ")));
+            pills.push((more.upcast(), 3));
+        }
+        let fields = wrapped(pills, 34);
+        fields.add_css_class("card-fields");
+        card.append(&fields);
 
         let agents: Vec<String> = rows(task, "sessions")
             .iter()
@@ -1962,6 +2402,11 @@ impl Board {
         }
         if let Some(badge) = state_badge(text(task, "state")) {
             row.append(&badge);
+        }
+        if !text(task, "size").is_empty() {
+            let size = label(text(task, "size"), "task-chip");
+            size.set_tooltip_text(Some(&format!("Size {} · {} pt", text(task, "size"), relay_board::points(text(task, "size")))));
+            row.append(&size);
         }
         if let Some(module) = task["module_name"].as_str() {
             let caption = label(module, "list-meta");

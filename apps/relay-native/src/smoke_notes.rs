@@ -3,7 +3,7 @@ use crate::app::Ui;
 use gtk::prelude::*;
 use gtk4 as gtk;
 use serde_json::json;
-use super::util::{click, named, require, wait_for};
+use super::util::{click, find, named, require, wait_for};
 use std::{rc::Rc, time::Duration};
 
 pub async fn run(ui: &Rc<Ui>) -> Result<(), String> {
@@ -213,6 +213,7 @@ pub async fn run(ui: &Rc<Ui>) -> Result<(), String> {
         crate::pages::open_draft(id).is_none(),
         "Refresh reopened a deliberately closed tab",
     )?;
+    features(ui, project, &owner).await?;
     let task = ui
         .call(
             "task.create",
@@ -266,4 +267,107 @@ pub async fn run(ui: &Rc<Ui>) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     println!("NOTES_TASK_LIFECYCLE_OK: custom titlebar, resize, retained window, sourceview markdown, find count, go to line, dirty reopen, persistent shell, rail persistence, ordinary Plan, task message guard");
     Ok(())
+}
+
+/// Checkboxes and pictures over the text, ticking from the box, the toolbar's names and
+/// hidden keys, and Create task from note.
+async fn features(ui: &Rc<Ui>, project: i64, owner: &Rc<crate::pages::NotesWindow>) -> Result<(), String> {
+    let folder = std::env::temp_dir().join(format!("relay-notes-smoke-{}", std::process::id()));
+    std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
+    let image = folder.join("swatch.png");
+    let pixels: Vec<u8> = (0..120 * 80).flat_map(|i| [40, (i % 120 * 2) as u8, 200, 255]).collect();
+    gtk::gdk::MemoryTexture::new(120, 80, gtk::gdk::MemoryFormat::R8g8b8a8, &glib::Bytes::from_owned(pixels), 120 * 4)
+        .save_to_png(&image)
+        .map_err(|e| e.to_string())?;
+    let body = format!("# Groceries\n- [ ] milk\n- [x] eggs\n\n![Image 1]({})\n\nAfter the picture.", image.display());
+    let note = ui
+        .call("notes.create", json!({"project_id":project,"title":"Checklist","body":body}))
+        .await
+        .map_err(|e| e.to_string())?;
+    let id = note["id"].as_i64().ok_or("Missing checklist note id")?;
+    crate::pages::open_note(ui, note);
+    let draft = crate::pages::open_draft(id).ok_or("Checklist draft missing")?;
+    let layout: gtk::Widget = draft.layout.clone().upcast();
+    let boxes = || {
+        let mut found = Vec::new();
+        collect(&layout, &|w| w.has_css_class("notes-check") && w.is_visible(), &mut found);
+        found
+    };
+    wait_for(|| boxes().len() == 2, "Two checklist boxes drawn").await?;
+    let picture = || find(&layout, &|w| w.has_css_class("notes-image") && w.is_mapped());
+    wait_for(|| picture().is_some_and(|p| p.width() == 120 && p.height() >= 80), "Picture drawn at its size").await?;
+    let first = boxes()[0].clone().downcast::<gtk::CheckButton>().map_err(|_| "Checkbox type")?;
+    require(!first.is_active(), "milk starts unticked")?;
+    first.set_active(true);
+    let body = named(&draft.layout, "note-body").ok_or("Note body missing")?.downcast::<gtk::TextView>().map_err(|_| "Body type")?;
+    let text = || {
+        let buffer = body.buffer();
+        buffer.text(&buffer.start_iter(), &buffer.end_iter(), false).to_string()
+    };
+    wait_for(|| text().contains("- [x] milk"), "Ticking the box ticks the Markdown").await?;
+    // Ctrl+Enter's action on the line under the cursor unticks it again.
+    let buffer = body.buffer();
+    buffer.place_cursor(&buffer.iter_at_line(1).ok_or("Line 2")?);
+    owner.window.activate_action("notes.toggle-check", None).map_err(|_| "toggle-check action missing")?;
+    require(text().contains("- [ ] milk"), "Toggle check did not untick the line")?;
+    // Names beside the toolbar's icons, and a hidden key.
+    let mut prefs = crate::pages::notes_prefs();
+    prefs.toolbar_labels = true;
+    prefs.toolbar_hidden = 0b111 << 4;
+    crate::pages::set_notes_prefs(ui, prefs);
+    let root: gtk::Widget = owner.window.clone().upcast();
+    let caption = |name: &str| {
+        let name = name.to_string();
+        find(&root, &move |w| w.downcast_ref::<gtk::Label>().is_some_and(|l| l.has_css_class("notes-tool-caption") && l.text() == name))
+    };
+    require(caption("Bold").is_some_and(|l| l.is_mapped()), "Toolbar labels did not show")?;
+    require(caption("Paste").is_some_and(|l| !l.is_mapped()), "Hidden Paste key still shows")?;
+    if owner.rail_collapsed.get() {
+        owner.window.activate_action("notes.sidebar", None).map_err(|_| "sidebar action missing")?;
+    }
+    glib::timeout_future(Duration::from_millis(250)).await;
+    if let Ok(path) = std::env::var("RELAY_NATIVE_SCREENSHOT") {
+        let path = path.replace(".png", "-features.png");
+        let paintable = gtk::WidgetPaintable::new(Some(&owner.window));
+        let snapshot = gtk::Snapshot::new();
+        paintable.snapshot(&snapshot, owner.window.width() as f64, owner.window.height() as f64);
+        let node = snapshot.to_node().ok_or("Notes snapshot")?;
+        owner.window.renderer().ok_or("Notes renderer")?.render_texture(&node, None).save_to_png(&path).map_err(|e| e.to_string())?;
+        println!("NOTES_FEATURES_SCREENSHOT={path}");
+    }
+    // Right-clicking the toolbar (or View > Customize toolbar) opens its settings.
+    owner.window.activate_action("notes.customize-toolbar", None).map_err(|_| "customize action missing")?;
+    let customize = find(&root, &|w| w.has_css_class("notes-customize")).ok_or("Toolbar settings missing")?;
+    wait_for(|| customize.is_mapped(), "Toolbar settings shown").await?;
+    customize.downcast_ref::<gtk::Popover>().ok_or("Toolbar settings type")?.popdown();
+    crate::pages::set_notes_prefs(ui, crate::pages::NotesPrefs::default());
+    // The whole note becomes a Backlog task.
+    owner.window.activate_action("notes.to-task", None).map_err(|_| "to-task action missing")?;
+    let mut created = None;
+    let deadline = std::time::Instant::now() + super::util::WAIT;
+    while created.is_none() {
+        let tasks = ui.call("task.list", json!({"project_id":project})).await.map_err(|e| e.to_string())?;
+        created = crate::app::rows(&tasks, "tasks").into_iter().find(|t| t["title"] == "Checklist");
+        require(std::time::Instant::now() < deadline, "Create task from note made no task")?;
+        glib::timeout_future(Duration::from_millis(50)).await;
+    }
+    let task = created.unwrap();
+    require(task["body"].as_str().is_some_and(|b| b.contains("- [ ] milk") && b.contains("From the note")), "Task body is not the note")?;
+    ui.call("task.delete", json!({"task_id":task["id"]})).await.map_err(|e| e.to_string())?;
+    crate::pages::discard_note(ui, id);
+    ui.call("notes.delete", json!({"note_id":id})).await.map_err(|e| e.to_string())?;
+    std::fs::remove_dir_all(&folder).ok();
+    println!("NOTES_FEATURES_OK: checklist boxes, tick from box and Ctrl+Enter, picture overlay, toolbar labels and hidden keys, note to task");
+    Ok(())
+}
+
+fn collect(root: &gtk::Widget, test: &impl Fn(&gtk::Widget) -> bool, found: &mut Vec<gtk::Widget>) {
+    if test(root) {
+        found.push(root.clone());
+    }
+    let mut child = root.first_child();
+    while let Some(widget) = child {
+        collect(&widget, test, found);
+        child = widget.next_sibling();
+    }
 }

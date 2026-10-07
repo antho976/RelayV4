@@ -9,6 +9,9 @@ pub struct Panel {
     pub body: gtk::Box,
     title: String,
     modal: Cell<bool>,
+    /// A full page: it hides the surface under it while open, so what shows through its
+    /// see-through panel is the wallpaper, not the page it covers.
+    page: bool,
     layer: gtk::Overlay,
     frame: gtk::Box,
     scroll: gtk::ScrolledWindow,
@@ -42,6 +45,9 @@ impl Panel {
         let scrim = button("", "panel-scrim");
         scrim.set_focusable(false);
         scrim.update_property(&[gtk::accessible::Property::Label("Close panel")]);
+        if page {
+            scrim.add_css_class("page-scrim");
+        }
         layer.set_child(Some(&scrim));
         let frame = gtk::Box::new(gtk::Orientation::Vertical, 0);
         frame.add_css_class("app-panel");
@@ -82,6 +88,7 @@ impl Panel {
             body,
             title: title_text,
             modal: Cell::new(true),
+            page,
             layer,
             frame,
             scroll,
@@ -155,6 +162,12 @@ impl Panel {
         self.scroll
             .set_max_content_height(height.min((self.host.height() - 48).max(200)));
         self.scroll.set_propagate_natural_height(true);
+    }
+
+    /// Scrolls by wheel and touchpad only, with no scrollbar drawn.
+    pub fn hide_scrollbar(&self) {
+        self.scroll.set_vscrollbar_policy(gtk::PolicyType::External);
+        self.scroll.set_hscrollbar_policy(gtk::PolicyType::Never);
     }
 
     pub fn header_action(&self, widget: &impl IsA<gtk::Widget>) {
@@ -251,6 +264,9 @@ impl Panel {
             if self.modal.get() {
                 if let Some(content) = self.host.child() {
                     content.set_sensitive(false);
+                    if self.page {
+                        content.set_opacity(0.);
+                    }
                 }
             }
             self.host.add_overlay(&self.layer);
@@ -276,6 +292,11 @@ impl Panel {
             {
                 if let Some(content) = self.host.child() {
                     content.set_sensitive(true);
+                }
+            }
+            if !panels.borrow().iter().any(|panel| panel.host == self.host && panel.page) {
+                if let Some(content) = self.host.child() {
+                    content.set_opacity(1.);
                 }
             }
         }

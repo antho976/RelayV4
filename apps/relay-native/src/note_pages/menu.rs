@@ -14,13 +14,14 @@ thread_local! {
 
 type Toggle = (&'static str, fn(&Prefs) -> bool, fn(&mut Prefs, bool));
 
-fn toggles() -> [Toggle; 7] {
+fn toggles() -> [Toggle; 8] {
     [
         ("autosave", |p| p.autosave, |p, v| p.autosave = v),
         ("wrap", |p| p.wrap, |p, v| p.wrap = v),
         ("line-numbers", |p| p.line_numbers, |p, v| p.line_numbers = v),
         ("current-line", |p| p.current_line, |p, v| p.current_line = v),
         ("toolbar", |p| p.toolbar, |p, v| p.toolbar = v),
+        ("toolbar-labels", |p| p.toolbar_labels, |p, v| p.toolbar_labels = v),
         ("monospace", |p| p.monospace, |p, v| p.monospace = v),
         ("markdown", |p| p.markdown, |p, v| p.markdown = v),
     ]
@@ -31,7 +32,8 @@ const DOC_ACTIONS: &[&str] = &[
     "save", "save-as", "reload", "rename", "pin", "duplicate", "delete", "close-tab", "undo", "redo",
     "cut", "copy", "paste", "select-all", "datetime", "bold", "italic", "h1", "h2", "h3", "bullets",
     "numbers", "checklist", "quote", "code", "code-block", "link", "rule", "find", "replace",
-    "find-next", "find-prev", "goto", "close-find", "next-tab", "prev-tab",
+    "find-next", "find-prev", "goto", "close-find", "next-tab", "prev-tab", "image", "to-task",
+    "toggle-check", "copy-note",
 ];
 
 fn group() -> Option<gio::SimpleActionGroup> {
@@ -160,8 +162,10 @@ fn model() -> gio::Menu {
                 item("Rename…", "rename", Some("F2")),
                 item("Pin to agents", "pin", None),
                 item("Duplicate", "duplicate", None),
-                item("Delete…", "delete", None),
+                item("Copy note text", "copy-note", None),
+                item("Create task from note", "to-task", Some("<Control><Shift>t")),
             ]),
+            section(&[item("Delete…", "delete", None)]),
             section(&[item("Save automatically", "autosave", None)]),
             section(&[
                 item("Close tab", "close-tab", Some("<Control>w")),
@@ -180,7 +184,11 @@ fn model() -> gio::Menu {
             item("Paste", "paste", Some("<Control>v")),
             item("Select all", "select-all", Some("<Control>a")),
         ]),
-        section(&[item("Insert date and time", "datetime", Some("F5"))]),
+        section(&[
+            item("Insert image…", "image", None),
+            item("Insert date and time", "datetime", Some("F5")),
+        ]),
+        section(&[item("Tick or untick item", "toggle-check", Some("<Control>Return"))]),
     ]);
     edit.append_submenu(Some("Format"), &format_menu());
     bar.append_submenu(Some("_Edit"), &edit);
@@ -201,6 +209,8 @@ fn model() -> gio::Menu {
     let view = menu(&[
         section(&[
             item("Toolbar", "toolbar", None),
+            item("Toolbar labels", "toolbar-labels", None),
+            item("Customize toolbar…", "customize-toolbar", None),
             item("Library", "sidebar", Some("F9")),
         ]),
         section(&[
@@ -311,6 +321,16 @@ pub fn install(ui: &Rc<Ui>, window: &gtk::Window) -> gtk::PopoverMenuBar {
     add("find-prev", |ui| with_doc(ui, |_, d| d.find_step(true)));
     add("close-find", |ui| with_doc(ui, |_, d| d.close_find()));
     add("goto", |ui| with_doc(ui, |_, d| d.position.popup()));
+    add("image", |ui| with_doc(ui, super::inline::choose_image));
+    add("to-task", |ui| with_doc(ui, doc::to_task));
+    add("toggle-check", |ui| with_doc(ui, |_, d| d.toggle_check_at_cursor()));
+    add("copy-note", |ui| {
+        with_doc(ui, |_, d| {
+            d.view.clipboard().set_text(&d.body());
+            d.flash("Note text copied");
+        })
+    });
+    add("customize-toolbar", |ui| super::customize_toolbar(ui, None));
     add("zoom-in", |ui| super::zoom(ui, 1));
     add("zoom-out", |ui| super::zoom(ui, -1));
     add("zoom-reset", |ui| super::zoom(ui, 0));
@@ -372,6 +392,8 @@ pub fn install(ui: &Rc<Ui>, window: &gtk::Window) -> gtk::PopoverMenuBar {
     row("row-pin", super::pin_id);
     row("row-duplicate", super::duplicate_id);
     row("row-delete", super::delete_id);
+    row("row-task", super::task_id);
+    row("row-copy", super::copy_id);
 
     window.insert_action_group("notes", Some(&group));
     GROUP.with(|g| *g.borrow_mut() = Some(group));
@@ -401,11 +423,41 @@ pub fn row_menu(id: i64, pinned: bool) -> gio::Menu {
         section(&[
             targeted("Open", "row-open", target.clone()),
             targeted("Rename…", "row-rename", target.clone()),
-            targeted(if pinned { "Unpin" } else { "Pin to agents" }, "row-pin", target.clone()),
+        ]),
+        section(&[
+            targeted(if pinned { "Unpin from agents" } else { "Pin to agents" }, "row-pin", target.clone()),
             targeted("Duplicate", "row-duplicate", target.clone()),
+            targeted("Copy note text", "row-copy", target.clone()),
+            targeted("Create task from note", "row-task", target.clone()),
         ]),
         section(&[targeted("Delete…", "row-delete", target)]),
     ])
+}
+
+/// What the editor's right-click menu adds below GTK's own Cut / Copy / Paste.
+pub fn text_menu() -> gio::Menu {
+    let format = section(&[
+        item("Bold", "bold", Some("<Control>b")),
+        item("Italic", "italic", Some("<Control>i")),
+        item("Inline code", "code", None),
+        item("Link…", "link", Some("<Control>k")),
+    ]);
+    let lines = section(&[
+        item("Checklist", "checklist", None),
+        item("Bulleted list", "bullets", None),
+        item("Numbered list", "numbers", None),
+        item("Quote", "quote", None),
+    ]);
+    let format_menu = gio::Menu::new();
+    format_menu.append_section(None, &format);
+    format_menu.append_section(None, &headings_menu());
+    format_menu.append_section(None, &lines);
+    let top = section(&[
+        item("Tick or untick item", "toggle-check", Some("<Control>Return")),
+        item("Insert image…", "image", None),
+    ]);
+    top.append_submenu(Some("Format"), &format_menu);
+    menu(&[top, section(&[item("Create task from selection", "to-task", Some("<Control><Shift>t"))])])
 }
 
 fn focus_in(ui: &Rc<Ui>, doc: &Doc) -> bool {
@@ -444,11 +496,13 @@ fn shortcut(ui: &Rc<Ui>, key: Key, mods: ModifierType) -> glib::Propagation {
             Key::_0 | Key::KP_0 => "zoom-reset",
             Key::Tab | Key::KP_Tab | Key::Page_Down => "next-tab",
             Key::Page_Up => "prev-tab",
+            Key::Return | Key::KP_Enter => body("toggle-check"),
             _ => "",
         }
     } else if mods == ctrl | shift {
         match lower {
             Key::s => "save-as",
+            Key::t => "to-task",
             Key::Tab | Key::ISO_Left_Tab => "prev-tab",
             Key::plus | Key::equal => "zoom-in",
             _ => "",

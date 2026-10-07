@@ -1,8 +1,8 @@
 //! `task.*` — BUS.md §10.5.
 use crate::registry::{Actors, OpMeta, Scope, Undo};
 use crate::types::{
-    Attachment, AuditRow, Column, Id, Label, Message, Priority, Session, Size, Task, TaskRelation,
-    TaskState, TaskType, Ts,
+    Attachment, AuditRow, Column, Id, Label, Message, Priority, Session, Size, Task, TaskComment,
+    TaskRelation, TaskState, TaskType, Ts,
 };
 use crate::{op, Empty};
 
@@ -30,9 +30,17 @@ payload!(#[schemars(rename = "TaskActivityIn")] ActivityIn {
 result!(#[schemars(rename = "TaskActivityOut")] ActivityOut {
     pub history: Vec<AuditRow>, pub messages: Vec<Message>,
     pub next_audit: Option<Id>, pub next_message: Option<Id>,
+    /// Every comment on the task, oldest first; not paged. `task.comment` rows stay out of
+    /// `history`, so a comment is reported once.
+    #[serde(default)]
+    pub comments: Vec<TaskComment>,
 });
 op!(Activity, "task.activity", ActivityIn => ActivityOut,
     OpMeta::query(Scope::Project, 7, "Task-scoped audit history and explicitly associated messages, newest first").actors(Actors::UserOnly));
+
+payload!(#[schemars(rename = "TaskCommentIn")] CommentIn { pub task_id: Id, pub body: String });
+op!(Comment, "task.comment", CommentIn => TaskComment,
+    OpMeta::mutation(Scope::Project, 7, "Comment on a task, GitHub-issue style; task.activity lists every comment oldest first"));
 
 payload!(#[schemars(rename = "TaskListIn")] ListIn {
     pub project_id: Option<Id>, pub column: Option<Column>, pub state: Option<TaskState>, pub module_id: Option<Id>,
@@ -172,6 +180,7 @@ entries!(
     Create,
     Get,
     Activity,
+    Comment,
     List,
     Update,
     Move,

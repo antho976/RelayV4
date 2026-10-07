@@ -4,15 +4,17 @@
 mod doc;
 #[path = "note_pages/glyphs.rs"]
 mod glyphs;
+#[path = "note_pages/inline.rs"]
+mod inline;
 #[path = "note_pages/menu.rs"]
 mod menu;
 #[path = "note_pages/text.rs"]
 mod text;
 
-use super::task_pages::{buffer_text, choose, chosen, multiline, Draft};
+use super::task_pages::{buffer_text, Draft};
 use super::*;
 use doc::Doc;
-use glyphs::glyph;
+use glyphs::{glyph, glyph_stroke};
 use std::cell::{Cell, OnceCell};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -28,6 +30,10 @@ pub struct Prefs {
     pub markdown: bool,
     pub zoom: u16,
     pub sort_title: bool,
+    /// Toolbar keys show their names beside their icons.
+    pub toolbar_labels: bool,
+    /// Toolbar keys taken off the bar: bit `i` is `TOOLS[i]`.
+    pub toolbar_hidden: u32,
 }
 impl Default for Prefs {
     fn default() -> Self {
@@ -42,6 +48,8 @@ impl Default for Prefs {
             markdown: true,
             zoom: 100,
             sort_title: false,
+            toolbar_labels: false,
+            toolbar_hidden: 0,
         }
     }
 }
@@ -49,7 +57,9 @@ impl Prefs {
     fn to_json(self) -> Value {
         json!({"autosave":self.autosave,"wrap":self.wrap,"line_numbers":self.line_numbers,
             "current_line":self.current_line,"toolbar":self.toolbar,"monospace":self.monospace,
-            "markdown":self.markdown,"zoom":self.zoom,"sort":if self.sort_title {"title"} else {"modified"}})
+            "markdown":self.markdown,"zoom":self.zoom,"sort":if self.sort_title {"title"} else {"modified"},
+            "toolbar_labels":self.toolbar_labels,
+            "toolbar_hidden":TOOLS.iter().enumerate().filter(|(i, _)| self.toolbar_hidden & (1 << i) != 0).map(|(_, t)| t.id).collect::<Vec<_>>()})
     }
     fn from_json(value: &Value) -> Self {
         let d = Self::default();
@@ -64,8 +74,56 @@ impl Prefs {
             markdown: flag("markdown", d.markdown),
             zoom: value["zoom"].as_u64().map_or(d.zoom, |z| z.clamp(50, 300) as u16),
             sort_title: value["sort"] == "title",
+            toolbar_labels: flag("toolbar_labels", d.toolbar_labels),
+            toolbar_hidden: rows(value, "toolbar_hidden").iter().filter_map(Value::as_str).fold(0, |mask, id| {
+                mask | TOOLS.iter().position(|t| t.id == id).map_or(0, |i| 1 << i)
+            }),
         }
     }
+}
+
+/// One toolbar key. `id` is its `notes.*` action (Heading opens a menu instead), persisted in
+/// `toolbar_hidden`; `icon` is a glyph, or a text mark such as "B" when it starts with `#`.
+pub(super) struct Tool {
+    pub id: &'static str,
+    icon: &'static str,
+    pub caption: &'static str,
+    tip: &'static str,
+    group: u8,
+}
+
+const fn t(id: &'static str, icon: &'static str, caption: &'static str, tip: &'static str, group: u8) -> Tool {
+    Tool { id, icon, caption, tip, group }
+}
+
+pub(super) const TOOLS: [Tool; 21] = [
+    t("new", "note-new", "New", "New note (Ctrl+N)", 0),
+    t("save", "save", "Save", "Save (Ctrl+S)", 0),
+    t("undo", "undo", "Undo", "Undo (Ctrl+Z)", 1),
+    t("redo", "redo", "Redo", "Redo (Ctrl+Shift+Z)", 1),
+    t("cut", "cut", "Cut", "Cut (Ctrl+X)", 2),
+    t("copy", "copy", "Copy", "Copy (Ctrl+C)", 2),
+    t("paste", "paste", "Paste", "Paste (Ctrl+V)", 2),
+    t("find", "search", "Find", "Find (Ctrl+F)", 3),
+    t("replace", "replace", "Replace", "Replace (Ctrl+H)", 3),
+    t("bold", "#B", "Bold", "Bold (Ctrl+B)", 4),
+    t("italic", "#I", "Italic", "Italic (Ctrl+I)", 4),
+    t("heading", "#H", "Heading", "Heading", 4),
+    t("bullets", "list", "Bullets", "Bulleted list", 4),
+    t("numbers", "list-numbered", "Numbers", "Numbered list", 4),
+    t("checklist", "checklist", "Checklist", "Checklist (Ctrl+Enter ticks an item)", 4),
+    t("quote", "quote", "Quote", "Quote", 4),
+    t("code", "code-inline", "Code", "Inline code", 4),
+    t("code-block", "code-block", "Code block", "Code block", 4),
+    t("link", "link", "Link", "Link (Ctrl+K)", 4),
+    t("image", "image", "Image", "Insert an image (or paste or drop one)", 5),
+    t("to-task", "task", "To task", "Create a task from this note, or from the selected text", 5),
+];
+
+/// A toolbar key and the name shown beside its icon when labels are on.
+struct ToolKey {
+    key: gtk::Widget,
+    caption: gtk::Label,
 }
 
 struct Row {
@@ -78,10 +136,15 @@ struct Row {
 struct Shell {
     root: gtk::Box,
     toolbar: gtk::Box,
+    tools: Vec<ToolKey>,
+    /// The line before each group of keys but the first, by group.
+    tool_lines: Vec<gtk::Separator>,
+    customize: gtk::Popover,
+    customize_checks: Vec<gtk::CheckButton>,
+    customize_labels: gtk::Switch,
     picker: gtk::Box,
     split: gtk::Paned,
     library: gtk::Box,
-    count: gtk::Label,
     search: gtk::SearchEntry,
     list: gtk::ListBox,
     list_scroll: gtk::ScrolledWindow,
@@ -119,7 +182,7 @@ thread_local! {
 
 /// The Notes paper: the text view's background here, `@notes_paper` in css/notes.css. It is
 /// deliberately the same in every appearance mode; change both together.
-const NOTES_PAPER: &str = "#0c0c0e";
+pub(super) const NOTES_PAPER: &str = "#0c0c0e";
 
 const NOTES_SCHEME: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
 <!-- Relay Notes: the Code editor's matte palette, with quieter Markdown. -->
@@ -237,6 +300,22 @@ fn doc_by_id(id: i64) -> Option<Rc<Doc>> {
     DOCS.with(|docs| docs.borrow().get(&id).cloned())
 }
 
+/// The Notes preferences, for the smoke harness.
+pub fn notes_prefs() -> Prefs {
+    prefs()
+}
+
+pub fn set_notes_prefs(ui: &Rc<Ui>, next: Prefs) {
+    set_prefs(ui, next);
+}
+
+/// Close note `id`'s tab without saving it.
+pub fn discard_note(ui: &Rc<Ui>, id: i64) {
+    if let Some(doc) = doc_by_id(id) {
+        doc::discard_close(ui, &doc);
+    }
+}
+
 /// Some open note is saving or has unsaved changes: the main window stays open for it.
 pub fn unsaved_notes() -> bool {
     docs().iter().any(|doc| doc.draft.busy.get() || doc.dirty())
@@ -333,9 +412,11 @@ fn apply_prefs(ui: &Rc<Ui>, prefs: &Prefs, rows: bool) {
     apply_font(prefs);
     for doc in docs() {
         doc.apply_prefs(prefs);
+        inline::schedule(&doc);
     }
     if let Some(shell) = shell_if_built() {
         shell.toolbar.set_visible(prefs.toolbar);
+        apply_toolbar(&shell, prefs);
         if rows {
             render_rows(ui, &shell);
         }
@@ -411,9 +492,10 @@ fn current_project(ui: &Rc<Ui>) -> i64 {
     }
 }
 
+/// A small icon key outside the toolbar (the library's New note key).
 fn tool(icon: &str, tip: &str, action: &str) -> gtk::Button {
     let key = gtk::Button::new();
-    key.set_child(Some(&glyph(icon, 16)));
+    key.set_child(Some(&glyph_stroke(icon, 16, 1.25)));
     key.add_css_class("notes-tool");
     key.set_focus_on_click(false);
     key.set_tooltip_text(Some(tip));
@@ -422,21 +504,186 @@ fn tool(icon: &str, tip: &str, action: &str) -> gtk::Button {
     key
 }
 
-fn text_tool(caption: &str, class: &str, tip: &str, action: &str) -> gtk::Button {
-    let key = gtk::Button::with_label(caption);
-    key.add_css_class("notes-tool");
-    key.add_css_class("notes-tool-text");
-    key.add_css_class(class);
-    key.set_focus_on_click(false);
-    key.set_tooltip_text(Some(tip));
-    key.set_action_name(Some(&format!("notes.{action}")));
-    key
+fn tool_key(tool: &Tool) -> ToolKey {
+    let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    content.set_halign(gtk::Align::Center);
+    match tool.icon.strip_prefix('#') {
+        Some(mark) => {
+            let mark = label(mark, "notes-tool-mark");
+            mark.add_css_class(&format!("notes-tool-mark-{}", tool.id));
+            content.append(&mark);
+        }
+        None => content.append(&glyph_stroke(tool.icon, 16, 1.25)),
+    }
+    let caption = label(tool.caption, "notes-tool-caption");
+    caption.set_visible(false);
+    content.append(&caption);
+    let key: gtk::Widget = if tool.id == "heading" {
+        let menu = gtk::MenuButton::new();
+        menu.set_always_show_arrow(false);
+        menu.add_css_class("notes-tool-menu");
+        menu.set_menu_model(Some(&menu::headings_menu()));
+        menu.set_child(Some(&content));
+        menu.upcast()
+    } else {
+        let key = gtk::Button::new();
+        key.add_css_class("notes-tool");
+        key.set_focus_on_click(false);
+        key.set_action_name(Some(&format!("notes.{}", tool.id)));
+        key.set_child(Some(&content));
+        key.upcast()
+    };
+    key.set_tooltip_text(Some(tool.tip));
+    key.update_property(&[gtk::accessible::Property::Label(tool.caption)]);
+    ToolKey { key, caption }
 }
 
 fn tool_separator() -> gtk::Separator {
     let line = gtk::Separator::new(gtk::Orientation::Vertical);
     line.add_css_class("notes-tool-sep");
     line
+}
+
+/// Show the keys the person kept, with or without names, and the line before each group
+/// that still shows something (the library key always stands before the first).
+fn apply_toolbar(shell: &Shell, prefs: &Prefs) {
+    let mut groups = [false; 6];
+    for (i, (tool, key)) in TOOLS.iter().zip(&shell.tools).enumerate() {
+        let visible = prefs.toolbar_hidden & (1 << i) == 0;
+        groups[usize::from(tool.group)] |= visible;
+        key.key.set_visible(visible);
+        key.caption.set_visible(prefs.toolbar_labels);
+        if prefs.toolbar_labels {
+            key.key.add_css_class("labelled");
+        } else {
+            key.key.remove_css_class("labelled");
+        }
+        if let Some(check) = shell.customize_checks.get(i) {
+            if check.is_active() != visible {
+                check.set_active(visible);
+            }
+        }
+    }
+    for (line, shows) in shell.tool_lines.iter().zip(groups) {
+        line.set_visible(shows);
+    }
+    if shell.customize_labels.is_active() != prefs.toolbar_labels {
+        shell.customize_labels.set_active(prefs.toolbar_labels);
+    }
+}
+
+/// The toolbar's own settings: names beside icons, and which keys it shows.
+fn customize_popover(ui: &Rc<Ui>, toolbar: &gtk::Box) -> (gtk::Popover, Vec<gtk::CheckButton>, gtk::Switch) {
+    let popover = gtk::Popover::new();
+    popover.add_css_class("notes-customize");
+    popover.set_has_arrow(false);
+    popover.set_position(gtk::PositionType::Bottom);
+    popover.set_parent(toolbar);
+    let owner = popover.downgrade();
+    toolbar.connect_destroy(move |_| {
+        if let Some(popover) = owner.upgrade() {
+            popover.unparent();
+        }
+    });
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    body.append(&label("Toolbar", "notes-customize-title"));
+    let labels_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    labels_row.add_css_class("notes-customize-row");
+    let caption = label("Show names beside icons", "notes-customize-caption");
+    caption.set_hexpand(true);
+    labels_row.append(&caption);
+    let labels = gtk::Switch::new();
+    labels.set_valign(gtk::Align::Center);
+    labels.set_active(prefs().toolbar_labels);
+    labels_row.append(&labels);
+    body.append(&labels_row);
+    body.append(&label("Keys on the toolbar", "notes-customize-section"));
+    let grid = gtk::Grid::new();
+    grid.add_css_class("notes-customize-grid");
+    grid.set_column_homogeneous(true);
+    grid.set_column_spacing(4);
+    let weak = Rc::downgrade(ui);
+    let mut checks = Vec::new();
+    let hidden = prefs().toolbar_hidden;
+    for (i, tool) in TOOLS.iter().enumerate() {
+        let check = gtk::CheckButton::new();
+        check.add_css_class("notes-customize-check");
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        match tool.icon.strip_prefix('#') {
+            Some(mark) => {
+                let mark = label(mark, "notes-tool-mark");
+                mark.add_css_class(&format!("notes-tool-mark-{}", tool.id));
+                mark.set_width_chars(2);
+                content.append(&mark);
+            }
+            None => content.append(&glyph_stroke(tool.icon, 16, 1.25)),
+        }
+        content.append(&label(tool.caption, "notes-customize-caption"));
+        check.set_child(Some(&content));
+        check.set_active(hidden & (1 << i) == 0);
+        let target = weak.clone();
+        check.connect_toggled(move |check| {
+            let Some(ui) = target.upgrade() else { return };
+            let mut next = prefs();
+            if check.is_active() {
+                next.toolbar_hidden &= !(1 << i);
+            } else {
+                next.toolbar_hidden |= 1 << i;
+            }
+            set_prefs(&ui, next);
+        });
+        grid.attach(&check, (i % 2) as i32, (i / 2) as i32, 1, 1);
+        checks.push(check);
+    }
+    body.append(&grid);
+    let foot = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    foot.add_css_class("notes-customize-foot");
+    let hint = label("Right-click the toolbar to come back here.", "notes-customize-hint");
+    hint.set_hexpand(true);
+    foot.append(&hint);
+    let reset = button("Show all", "notes-customize-reset");
+    let target = weak.clone();
+    reset.connect_clicked(move |_| {
+        if let Some(ui) = target.upgrade() {
+            let mut next = prefs();
+            next.toolbar_hidden = 0;
+            set_prefs(&ui, next);
+        }
+    });
+    foot.append(&reset);
+    body.append(&foot);
+    let target = weak.clone();
+    labels.connect_active_notify(move |switch| {
+        if let Some(ui) = target.upgrade() {
+            let mut next = prefs();
+            next.toolbar_labels = switch.is_active();
+            set_prefs(&ui, next);
+            if let Some(action) = menu::lookup("toolbar-labels") {
+                action.set_state(&next.toolbar_labels.to_variant());
+            }
+        }
+    });
+    popover.set_child(Some(&body));
+    (popover, checks, labels)
+}
+
+/// Open the toolbar settings, under the pointer when right-clicked.
+pub(super) fn customize_toolbar(ui: &Rc<Ui>, at: Option<(f64, f64)>) {
+    let shell = shell(ui);
+    if !shell.toolbar.is_visible() {
+        let mut next = prefs();
+        next.toolbar = true;
+        set_prefs(ui, next);
+        if let Some(action) = menu::lookup("toolbar") {
+            action.set_state(&true.to_variant());
+        }
+    }
+    let rect = match at {
+        Some((x, y)) => gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1),
+        None => gtk::gdk::Rectangle::new(shell.toolbar.width() / 2, shell.toolbar.height(), 1, 1),
+    };
+    shell.customize.set_pointing_to(Some(&rect));
+    shell.customize.popup();
 }
 
 fn shell(ui: &Rc<Ui>) -> Rc<Shell> {
@@ -450,49 +697,36 @@ fn shell(ui: &Rc<Ui>) -> Rc<Shell> {
     let toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 1);
     toolbar.add_css_class("notes-toolbar");
     let collapse = gtk::Button::new();
-    collapse.set_child(Some(&glyph("sidebar", 16)));
+    collapse.set_child(Some(&glyph_stroke("sidebar", 16, 1.25)));
     collapse.add_css_class("notes-tool");
     collapse.set_focus_on_click(false);
     collapse.set_widget_name("notes-library-toggle");
     collapse.set_tooltip_text(Some("Show or hide the library (F9)"));
     collapse.update_property(&[gtk::accessible::Property::Label("Toggle library")]);
     toolbar.append(&collapse);
-    toolbar.append(&tool_separator());
-    toolbar.append(&tool("note-new", "New note (Ctrl+N)", "new"));
-    toolbar.append(&tool("save", "Save (Ctrl+S)", "save"));
-    toolbar.append(&tool_separator());
-    toolbar.append(&tool("undo", "Undo (Ctrl+Z)", "undo"));
-    toolbar.append(&tool("redo", "Redo (Ctrl+Shift+Z)", "redo"));
-    toolbar.append(&tool_separator());
-    toolbar.append(&tool("cut", "Cut (Ctrl+X)", "cut"));
-    toolbar.append(&tool("copy", "Copy (Ctrl+C)", "copy"));
-    toolbar.append(&tool("paste", "Paste (Ctrl+V)", "paste"));
-    toolbar.append(&tool_separator());
-    toolbar.append(&tool("search", "Find (Ctrl+F)", "find"));
-    toolbar.append(&tool("replace", "Replace (Ctrl+H)", "replace"));
-    toolbar.append(&tool_separator());
-    toolbar.append(&text_tool("B", "notes-tool-bold", "Bold (Ctrl+B)", "bold"));
-    toolbar.append(&text_tool("I", "notes-tool-italic", "Italic (Ctrl+I)", "italic"));
-    let headings = gtk::MenuButton::new();
-    headings.set_label("H");
-    headings.set_always_show_arrow(false);
-    headings.add_css_class("notes-tool-menu");
-    headings.set_tooltip_text(Some("Heading"));
-    headings.set_menu_model(Some(&menu::headings_menu()));
-    toolbar.append(&headings);
-    toolbar.append(&tool("list", "Bulleted list", "bullets"));
-    toolbar.append(&tool("list-numbered", "Numbered list", "numbers"));
-    toolbar.append(&tool("checklist", "Checklist", "checklist"));
-    toolbar.append(&tool("quote", "Quote", "quote"));
-    toolbar.append(&tool("code-inline", "Inline code", "code"));
-    toolbar.append(&tool("code-block", "Code block", "code-block"));
-    toolbar.append(&tool("link", "Link (Ctrl+K)", "link"));
-    let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    spacer.set_hexpand(true);
-    toolbar.append(&spacer);
-    let picker = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    picker.add_css_class("notes-picker");
-    toolbar.append(&picker);
+    let mut tools = Vec::new();
+    let mut tool_lines = Vec::new();
+    for tool in &TOOLS {
+        if usize::from(tool.group) == tool_lines.len() {
+            let line = tool_separator();
+            toolbar.append(&line);
+            tool_lines.push(line);
+        }
+        let key = tool_key(tool);
+        toolbar.append(&key.key);
+        tools.push(key);
+    }
+    let (customize, customize_checks, customize_labels) = customize_popover(ui, &toolbar);
+    let right = gtk::GestureClick::new();
+    right.set_button(3);
+    let target = Rc::downgrade(ui);
+    right.connect_pressed(move |gesture, _, x, y| {
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+        if let Some(ui) = target.upgrade() {
+            customize_toolbar(&ui, Some((x, y)));
+        }
+    });
+    toolbar.add_controller(right);
     root.append(&toolbar);
 
     let split = gtk::Paned::new(gtk::Orientation::Horizontal);
@@ -507,15 +741,19 @@ fn shell(ui: &Rc<Ui>) -> Rc<Shell> {
     let library = gtk::Box::new(gtk::Orientation::Vertical, 0);
     library.add_css_class("notes-library");
     library.set_size_request(180, -1);
-    let head = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    // The project the library shows, full width so its name is never cut short.
+    let picker = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    picker.add_css_class("notes-picker");
+    library.append(&picker);
+    let head = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     head.add_css_class("notes-library-head");
-    let heading = label("NOTES", "notes-library-title");
-    head.append(&heading);
-    let count = label("", "notes-library-count");
-    count.set_hexpand(true);
-    head.append(&count);
+    let search = gtk::SearchEntry::new();
+    search.set_placeholder_text(Some("Search notes"));
+    search.add_css_class("notes-library-search");
+    search.set_hexpand(true);
+    head.append(&search);
     let sort = gtk::MenuButton::new();
-    sort.set_child(Some(&glyph("sort", 14)));
+    sort.set_child(Some(&glyph_stroke("sort", 16, 1.25)));
     sort.add_css_class("notes-library-key");
     sort.set_tooltip_text(Some("Sort notes"));
     sort.set_menu_model(Some(&menu::sort_menu()));
@@ -524,10 +762,6 @@ fn shell(ui: &Rc<Ui>) -> Rc<Shell> {
     add.add_css_class("notes-library-key");
     head.append(&add);
     library.append(&head);
-    let search = gtk::SearchEntry::new();
-    search.set_placeholder_text(Some("Search notes"));
-    search.add_css_class("notes-library-search");
-    library.append(&search);
     let list = gtk::ListBox::new();
     list.add_css_class("notes-list");
     list.set_selection_mode(gtk::SelectionMode::Single);
@@ -632,10 +866,14 @@ fn shell(ui: &Rc<Ui>) -> Rc<Shell> {
     let shell = Rc::new(Shell {
         root,
         toolbar,
+        tools,
+        tool_lines,
+        customize,
+        customize_checks,
+        customize_labels,
         picker,
         split,
         library,
-        count,
         search,
         list,
         list_scroll,
@@ -798,6 +1036,7 @@ fn shell(ui: &Rc<Ui>) -> Rc<Shell> {
     let prefs = prefs();
     apply_font(&prefs);
     shell.toolbar.set_visible(prefs.toolbar);
+    apply_toolbar(&shell, &prefs);
     update_placeholder(&shell);
     shell
 }
@@ -910,7 +1149,11 @@ fn render_rows(ui: &Rc<Ui>, shell: &Shell) {
     for row in &widgets {
         shell.list.append(row);
     }
-    shell.count.set_text(&notes.len().to_string());
+    shell.search.set_placeholder_text(Some(&match notes.len() {
+        0 => "Search notes".to_string(),
+        1 => "Search 1 note".to_string(),
+        n => format!("Search {n} notes"),
+    }));
     shell.any_pinned.set(notes.iter().any(|n| n["pinned"] == true));
     update_placeholder(shell);
     shell.list.invalidate_filter();
@@ -1074,7 +1317,30 @@ fn refresh_picker(ui: &Rc<Ui>, shell: &Shell, project: i64) {
     }
     *shell.picker_key.borrow_mut() = key;
     clear(&shell.picker);
-    shell.picker.append(&super::workspace_picker(ui, project, "notes"));
+    let picker = super::workspace_picker(ui, project, "notes");
+    picker.set_hexpand(true);
+    // The shared caption reads "Workspace / Project" and ellipsizes at its end, which cuts the
+    // project's name first: here the project leads, with its workspace small before it.
+    let content = picker.child().and_downcast::<gtk::Box>();
+    if let Some(caption) = content.as_ref().and_then(|c| c.first_child()).and_downcast::<gtk::Label>() {
+        let full = caption.text().to_string();
+        let (space, name) = full.split_once(" / ").unwrap_or(("", full.as_str()));
+        picker.set_tooltip_text(Some(&format!("{name} · {space}\nSwitch project")));
+        caption.set_text(name);
+        caption.set_hexpand(true);
+        caption.set_xalign(0.);
+        caption.set_max_width_chars(-1);
+        if !space.is_empty() {
+            let workspace = label(space, "notes-picker-space");
+            workspace.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            workspace.set_max_width_chars(14);
+            workspace.set_valign(gtk::Align::Center);
+            if let Some(content) = &content {
+                content.prepend(&workspace);
+            }
+        }
+    }
+    shell.picker.append(&picker);
 }
 
 fn tabs_changed(ui: &Rc<Ui>) {
@@ -1286,6 +1552,30 @@ pub(super) fn duplicate_id(ui: &Rc<Ui>, id: i64) {
     new_note(ui, text::copy_title(&title), body);
 }
 
+/// The library's "Create task from note": open the note, then file it as a task.
+pub(super) fn task_id(ui: &Rc<Ui>, id: i64) {
+    open_id(ui, id, false);
+    if let Some(doc) = doc_by_id(id) {
+        doc::to_task(ui, &doc);
+    }
+}
+
+pub(super) fn copy_id(ui: &Rc<Ui>, id: i64) {
+    let body = match doc_by_id(id) {
+        Some(doc) => doc.body(),
+        None => match listed(id) {
+            Some(note) => text(&note, "body").to_string(),
+            None => return,
+        },
+    };
+    if let Some(shell) = shell_if_built() {
+        shell.list.clipboard().set_text(&body);
+    }
+    if let Some(doc) = current_doc(ui) {
+        doc.flash("Note text copied");
+    }
+}
+
 pub(super) fn delete_id(ui: &Rc<Ui>, id: i64) {
     let name = match doc_by_id(id) {
         Some(doc) => doc.name(),
@@ -1446,203 +1736,78 @@ pub fn verify_tools() {
     assert_eq!(buffer_text(buffer.upcast_ref()), "one+ ONE two");
 }
 
+/// The project's modules as GitHub-style cards: name, priority and state, then progress and
+/// how many of its tasks sit in each column. A card opens its module.
 pub fn modules(ui: &Rc<Ui>, body: &gtk::Box, modules: &[Value]) {
+    use super::board_view::{priority_icon, status_icon, titled};
+    let grid = gtk::FlowBox::new();
+    grid.add_css_class("module-grid");
+    grid.set_selection_mode(gtk::SelectionMode::None);
+    grid.set_homogeneous(true);
+    grid.set_min_children_per_line(1);
+    grid.set_max_children_per_line(3);
+    grid.set_column_spacing(10);
+    grid.set_row_spacing(10);
+    grid.set_valign(gtk::Align::Start);
+    if !modules.is_empty() {
+        body.append(&grid);
+    }
     for module in modules {
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-        row.add_css_class("record");
-        let name = label(text(module, "name"), "title");
-        name.set_hexpand(true);
-        row.append(&name);
-        row.append(&label(
-            &format!(
-                "{} · {:.0}% done{}",
-                text(module, "priority"),
-                module["progress_pct"].as_f64().unwrap_or(0.),
-                if module["completed_at"].is_string() {
-                    " · archived"
-                } else {
-                    ""
-                }
-            ),
-            "dim",
-        ));
-        let key = button("Open module", "quiet");
+        let card = button("", "module-card");
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        let head = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        head.append(&crate::icons::image("modules", 14));
+        let name = label(text(module, "name"), "module-card-name");
+        name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        head.append(&name);
+        let priority = text(module, "priority");
+        let pill = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        pill.add_css_class("field-pill");
+        pill.add_css_class(&format!("pill-priority-{priority}"));
+        pill.append(&priority_icon(priority));
+        pill.append(&label(&titled(priority), "field-pill-name"));
+        head.append(&pill);
+        if module["completed_at"].is_string() {
+            head.append(&label("Completed", "module-card-done"));
+        }
+        let total: i64 = module["counts"].as_object().map(|c| c.values().filter_map(Value::as_i64).sum()).unwrap_or(0);
+        let tally = label(&format!("{total} task{}", if total == 1 { "" } else { "s" }), "module-card-meta");
+        tally.set_hexpand(true);
+        tally.set_xalign(1.);
+        head.append(&tally);
+        content.append(&head);
+        let progress = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        let pct = module["progress_pct"].as_f64().unwrap_or(0.);
+        let meter = gtk::ProgressBar::new();
+        meter.add_css_class("issue-progress");
+        meter.set_fraction((pct / 100.).clamp(0., 1.));
+        meter.set_hexpand(true);
+        meter.set_valign(gtk::Align::Center);
+        progress.append(&meter);
+        progress.append(&label(&format!("{pct:.0}% done"), "module-card-meta"));
+        content.append(&progress);
+        let columns = gtk::Box::new(gtk::Orientation::Horizontal, 14);
+        for (column, title) in super::task_pages::COLUMN_TITLES {
+            let count = module["counts"][column].as_i64().unwrap_or(0);
+            let part = gtk::Box::new(gtk::Orientation::Horizontal, 5);
+            part.append(&status_icon(column, 12));
+            part.append(&label(&format!("{title} {count}"), "module-card-meta"));
+            if count == 0 {
+                part.set_opacity(0.5);
+            }
+            columns.append(&part);
+        }
+        content.append(&columns);
+        card.set_child(Some(&content));
+        card.set_tooltip_text(Some("Open the module's board"));
+        card.set_size_request(340, -1);
         let weak = Rc::downgrade(ui);
         let id = module["id"].as_i64().unwrap_or(0);
-        key.connect_clicked(move |_| {
+        card.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
-                open_module(&ui, id)
+                super::board_view::open_module(&ui, id)
             }
         });
-        row.append(&key);
-        body.append(&row);
+        grid.insert(&card, -1);
     }
-}
-pub fn module_composer(ui: &Rc<Ui>, page: &gtk::Box, project: i64) {
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let name = gtk::Entry::builder()
-        .placeholder_text("Release outcome")
-        .hexpand(true)
-        .build();
-    let priority = choose(&["low", "medium", "high", "urgent"], "medium");
-    let key = button("Create module", "primary");
-    row.append(&name);
-    row.append(&priority);
-    row.append(&key);
-    page.append(&row);
-    let weak = Rc::downgrade(ui);
-    key.connect_clicked(move |b| {
-        let Some(ui) = weak.upgrade() else { return };
-        let value = name.text().trim().to_string();
-        if value.is_empty() {
-            return;
-        }
-        let priority = chosen(&priority);
-        b.set_sensitive(false);
-        let b = b.clone();
-        let name = name.clone();
-        glib::spawn_future_local(async move {
-            match ui
-                .call(
-                    "module.create",
-                    json!({"project_id":project,"name":value,"priority":priority}),
-                )
-                .await
-            {
-                Ok(m) => {
-                    if name.text().trim() == value {
-                        name.set_text("")
-                    }
-                    ui.refresh_page();
-                    open_module(&ui, m["id"].as_i64().unwrap_or(0));
-                }
-                Err(e) => ui.show_error(&e.to_string()),
-            }
-            b.set_sensitive(true);
-        });
-    });
-}
-fn open_module(ui: &Rc<Ui>, id: i64) {
-    let ui = ui.clone();
-    glib::spawn_future_local(async move {
-        match ui.call("module.get", json!({"module_id":id})).await {
-            Ok(module) => module_detail(&ui, module),
-            Err(e) => ui.show_error(&e.to_string()),
-        }
-    });
-}
-fn module_detail(ui: &Rc<Ui>, module: Value) {
-    let id = module["id"].as_i64().unwrap_or(0);
-    let project = module["project_id"].as_i64().unwrap_or(0);
-    let form = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    let name = gtk::Entry::builder().text(text(&module, "name")).build();
-    let priority = choose(
-        &["low", "medium", "high", "urgent"],
-        text(&module, "priority"),
-    );
-    let icon = gtk::Entry::builder()
-        .text(text(&module, "icon"))
-        .placeholder_text("Icon name")
-        .build();
-    field("Module name", &name, &form);
-    field("Priority", &priority, &form);
-    field("Icon", &icon, &form);
-    let snapshot: Rc<dyn Fn() -> Value> = Rc::new(
-        move || json!({"name":name.text().trim(),"priority":chosen(&priority),"icon":if icon.text().trim().is_empty(){Value::Null}else{json!(icon.text().trim())}}),
-    );
-    let d = Draft::new(ui, "Module", module.clone(), snapshot, form);
-    d.controls(ui, "module.update", "module_id", id);
-    for column in super::task_pages::COLUMNS {
-        d.form.append(&label(
-            &column.replace('_', " ").to_uppercase(),
-            "section-label",
-        ));
-        for task in rows(&module["tasks_by_state"], column) {
-            let key = button(
-                &format!("#{} {}", task["id"], text(&task, "title")),
-                "quiet",
-            );
-            let weak = Rc::downgrade(ui);
-            let task_id = task["id"].as_i64().unwrap_or(0);
-            key.connect_clicked(move |_| {
-                if let Some(ui) = weak.upgrade() {
-                    super::task_pages::open(&ui, task_id)
-                }
-            });
-            d.form.append(&key);
-        }
-    }
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let title = gtk::Entry::builder()
-        .placeholder_text("Add module task")
-        .hexpand(true)
-        .build();
-    row.append(&title);
-    // The module editor comes back, with the new task in its list, rather than closing (RA-517).
-    super::task_pages::action_then(
-        ui,
-        &d,
-        &row,
-        "Add task",
-        "task.create",
-        move || json!({"project_id":project,"module_id":id,"title":title.text().trim(),"column":"backlog"}),
-        Some(Rc::new(move |ui: &Rc<Ui>| open_module(ui, id))),
-    );
-    d.form.append(&row);
-    let key = button("Draft patch notes", "quiet");
-    d.form.append(&key);
-    let preview = multiline("", 140);
-    preview.set_editable(false);
-    d.form.append(&preview);
-    let copy = button("Copy patch notes", "quiet");
-    let buffer = preview.buffer();
-    copy.connect_clicked(move |b| b.clipboard().set_text(&buffer_text(&buffer)));
-    d.form.append(&copy);
-    let weak = Rc::downgrade(ui);
-    let status = d.status.clone();
-    key.connect_clicked(move |b| {
-        let Some(ui) = weak.upgrade() else { return };
-        let buffer = preview.buffer();
-        let status = status.clone();
-        b.set_sensitive(false);
-        let b = b.clone();
-        glib::spawn_future_local(async move {
-            match ui
-                .call("module.changelog.draft", json!({"module_id":id}))
-                .await
-            {
-                Ok(v) => buffer.set_text(text(&v, "markdown")),
-                Err(e) => status.set_text(&e.to_string()),
-            }
-            b.set_sensitive(true);
-        });
-    });
-    let archived = module["completed_at"].is_string();
-    super::task_pages::action(
-        ui,
-        &d,
-        &d.footer,
-        if archived {
-            "Reopen"
-        } else {
-            "Complete module"
-        },
-        if archived {
-            "module.reopen"
-        } else {
-            "module.complete"
-        },
-        move || json!({"module_id":id}),
-        None,
-    );
-    super::task_pages::action(
-        ui,
-        &d,
-        &d.footer,
-        "Delete module",
-        "module.delete",
-        move || json!({"module_id":id}),
-        None,
-    );
-    d.present();
 }

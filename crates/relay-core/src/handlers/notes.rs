@@ -196,7 +196,7 @@ fn delivery_hint(recipients: &[Recipient]) -> String {
     }
 }
 
-fn actor_name(ctx: &Ctx) -> Result<String, BusError> {
+pub(crate) fn actor_name(ctx: &Ctx) -> Result<String, BusError> {
     if let Some(name) = ctx.actor.session_name() {
         if ctx.actor_session_id().is_none() {
             return Err(BusError::actor(

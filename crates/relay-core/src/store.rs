@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 /// The schema version this build knows. Bump when appending to [`MIGRATIONS`].
-pub const SCHEMA_VERSION: i64 = 24;
+pub const SCHEMA_VERSION: i64 = 25;
 
 /// Numbered migrations; index 0 brings a fresh DB to `user_version = 1`.
 pub const MIGRATIONS: &[&str] = &[
@@ -406,6 +406,16 @@ pub const MIGRATIONS: &[&str] = &[
     // row and its file once the undo grace window is past. Existing rows are live.
     r#"
     ALTER TABLE attachments ADD COLUMN deleted_at TEXT;
+    "#,
+    // v25 - comments on a task, GitHub-issue style (`task.comment`): append-only, read oldest
+    // first by `task.activity`. `author` is the session name for an agent, `user` for a person.
+    r#"
+    CREATE TABLE task_comments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      author TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT NOT NULL
+    );
+    CREATE INDEX task_comments_task ON task_comments(task_id, id);
     "#,
 ];
 

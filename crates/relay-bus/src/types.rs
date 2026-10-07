@@ -405,6 +405,17 @@ pub struct Label {
     pub created_at: Ts,
 }
 
+/// One entry in a task's discussion, GitHub-issue style. `author` is the session name for an
+/// agent and `user` for a person, as `mailbox.send` renders `from`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct TaskComment {
+    pub id: Id,
+    pub task_id: Id,
+    pub author: String,
+    pub body: String,
+    pub created_at: Ts,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Task {
     pub id: Id,

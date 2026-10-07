@@ -1,36 +1,59 @@
 /* board area styles: loaded after theme.css, so rules here override it. */
 
+/* See-through like the terminals (usage.css): every stack and scrolled window paints @wall,
+   and the board nests several between the wallpaper and a card, which compounds to opaque.
+   Inside the board only the page stack keeps its @wall; lanes and cards add a faint wash of
+   ink on top of it instead of another slab. Text entries stay opaque. */
+.board-page stack, .board-page scrolledwindow, .board-page viewport { background: transparent; }
+
 /* ── Header ─────────────────────────────────────────────────────────────── */
-.board-head { min-height: 52px; padding: 0 16px; border-bottom: 1px solid @edge; background: @console; }
+.board-head { min-height: 52px; padding: 0 16px; background: transparent; }
 .board-count { margin-left: 4px; color: @secondary; font-size: 12px; }
 entry.board-search, .board-search { min-height: 28px; }
 .board-head > button, .board-head > menubutton > button, .board-view-toggle button {
-  min-height: 28px; padding: 0 10px; border: 1px solid @edge; border-radius: 2px; background: @slab; color: @secondary; font-size: 12px;
+  min-height: 28px; padding: 0 10px; border: 1px solid @edge; border-radius: 2px; background: alpha(@ink, 0.05); color: @secondary; font-size: 12px;
 }
 .board-head > button:hover, .board-head > menubutton > button:hover, .board-view-toggle button:hover { background: @wash; color: @ink; }
-.board-head > button.primary { background: @ink; border-color: @ink; color: @wall; font-weight: 600; }
-.board-head > button.primary:hover { background: white; border-color: white; }
+.board-head > button.primary, .modules-head > button.primary { min-height: 30px; padding: 0 12px; border-radius: 2px; background: @ink; border-color: @ink; color: @wall; font-weight: 600; }
+.board-head > button.primary label, .modules-head > button.primary label { color: @wall; }
+.board-head > button.primary:hover, .modules-head > button.primary:hover { background: shade(@ink, 0.9); }
+/* The header's own keys sit on the wallpaper like the filter bar's: a hairline over a faint wash. */
+.board-head > button.icon-key { min-height: 30px; min-width: 30px; padding: 0; border: 1px solid @edge; border-radius: 2px; background: alpha(@ink, 0.05); color: @secondary; }
+.board-head > button.icon-key:hover { background: alpha(@ink, 0.1); color: @ink; }
+.board-head .workspace-picker > button { min-height: 30px; padding: 0 10px; border: 1px solid @edge; border-radius: 2px; background: alpha(@ink, 0.05); color: @secondary; }
+.board-head .workspace-picker > button:hover { background: alpha(@ink, 0.1); color: @ink; }
+
+/* Board / Modules tabs: a quiet segmented control; the selected tab is lit, never inverted. */
+.board-switcher { padding: 2px; border: 1px solid @edge; border-radius: 2px; background: alpha(@ink, 0.04); }
+.board-switcher button, .board-switcher button.quiet { min-height: 26px; padding: 0 12px; border: 0; border-radius: 2px; background: transparent; color: @secondary; }
+.board-switcher button label { color: inherit; }
+.board-switcher button:hover { background: alpha(@ink, 0.07); color: @ink; }
+.board-switcher button.selected, .board-switcher button.selected:hover { background: alpha(@ink, 0.14); color: @ink; }
 .board-head > button.icon-key { min-width: 28px; padding: 0; }
 .board-head > menubutton.active > button { border-color: @secondary; color: @ink; background: @wash; }
-.board-view-toggle { padding: 2px; border: 1px solid @edge; background: @screen; border-radius: 2px; }
+.board-view-toggle { padding: 2px; border: 1px solid @edge; background: alpha(@ink, 0.05); border-radius: 2px; }
+.board-view-toggle button { border-radius: 2px; }
+.board-filterbar > menubutton > button { min-height: 34px; padding: 0 12px; border: 1px solid @edge; border-radius: 2px; background: alpha(@ink, 0.05); color: @secondary; font-size: 12px; }
+.board-filterbar > menubutton > button:hover { background: alpha(@ink, 0.08); color: @ink; }
+.board-filterbar > menubutton.active > button { border-color: @secondary; color: @ink; }
+
+/* The filter bar: one search field that also takes key:value filters, the View menu and
+   the layout toggle beside it. */
+.board-filterbar { padding: 0 16px 12px; }
+.board-searchbar { min-height: 34px; padding: 0 4px 0 12px; border: 1px solid @edge; border-radius: 2px; background: alpha(@ink, 0.05); color: @faint; }
+.board-searchbar:focus-within { border-color: alpha(@ink, 0.35); background: alpha(@ink, 0.08); color: @secondary; }
+.board-searchbar entry.board-search, .board-searchbar entry.board-search:focus { min-height: 32px; padding: 0; border: 0; box-shadow: none; outline: 0; background: transparent; color: @ink; font-size: 13px; }
+.board-searchbar button.board-search-clear { min-height: 24px; min-width: 24px; border-radius: 2px; }
 .board-view-toggle button { min-height: 24px; border: 0; background: transparent; }
 .board-view-toggle button:checked { background: @wash; color: @ink; }
 
 /* ── Columns strip and active filters ──────────────────────────────────── */
-.board-strip { min-height: 38px; padding: 0 16px; border-bottom: 1px solid @edge; background: @wall; }
-.board-strip-caption { margin-right: 4px; color: @faint; font-family: 'Fira Sans Condensed'; font-size: 10.5px; font-weight: 600; letter-spacing: 0.08em; }
-button.column-chip { min-height: 24px; padding: 0 9px; border: 1px solid @edge; border-radius: 2px; background: transparent; color: @faint; }
-button.column-chip:checked { background: @slab; color: @ink; border-color: @strong; }
-button.column-chip:hover { background: @wash; }
-.column-chip-name { font-size: 11.5px; }
-.column-chip-count { font-family: 'Fira Mono'; font-size: 10.5px; color: @secondary; }
-button.column-chip:not(:checked) .column-chip-name { text-decoration-line: line-through; }
-.board-strip-rule { margin: 10px 4px; background: @edge; min-width: 1px; }
-button.filter-chip { min-height: 22px; padding: 0 6px 0 8px; border: 1px solid @strong; border-radius: 2px; background: @slab; color: @ink; font-size: 11px; }
-button.filter-chip:hover { border-color: @secondary; background: @wash; }
+.board-strip { min-height: 32px; padding: 0 16px 8px; background: transparent; }
+button.filter-chip { min-height: 22px; padding: 0 6px 0 9px; border: 1px solid @strong; border-radius: 2px; background: alpha(@ink, 0.05); color: @ink; font-size: 11px; }
+button.filter-chip:hover { border-color: @secondary; background: alpha(@ink, 0.1); }
 
 /* ── Quick create and drop rail ────────────────────────────────────────── */
-.board-quick { margin: 10px 16px 0; padding: 6px; border: 1px solid @strong; background: @console; }
+.board-quick { margin: 0 16px 10px; padding: 6px; border: 1px solid @strong; border-radius: 2px; background: @console; }
 .board-quick entry { min-height: 30px; font-size: 13px; }
 .board-quick dropdown > button { min-height: 30px; }
 .board-quick-note { color: @secondary; font-size: 11px; margin: 0 4px; }
@@ -39,57 +62,70 @@ button.filter-chip:hover { border-color: @secondary; background: @wash; }
 .board-drag-rail button:drop(active) { border-color: @ink; background: @wash; color: @ink; }
 .board-rail-caption { margin-right: 6px; color: @faint; font-family: 'Fira Sans Condensed'; font-size: 10.5px; font-weight: 600; letter-spacing: 0.08em; }
 
-/* ── Lanes ──────────────────────────────────────────────────────────────── */
-.board-grid { padding: 12px 16px 10px; }
-.board-lane { background: @console; border: 1px solid @edge; }
-.board-lane.drop-lane, .list-section.drop-lane { border-color: @secondary; }
-.lane-head, .list-head { min-height: 38px; padding: 0 6px 0 11px; border-bottom: 1px solid @edge; }
-.lane-title { color: @ink; font-family: 'Fira Sans Condensed'; font-size: 11.5px; font-weight: 600; letter-spacing: 0.08em; }
-.lane-count { color: @faint; font-family: 'Fira Mono'; font-size: 11px; }
-button.lane-key { min-height: 22px; min-width: 22px; padding: 0; opacity: 0.55; }
-button.lane-key:hover { opacity: 1; }
-.board-cards { padding: 8px; background: @console; }
-.board-lane scrolledwindow, .board-lane viewport { background: @console; }
-.board-empty { min-height: 96px; padding: 18px 10px; border: 1px dashed @edge; }
+/* ── Lanes: GitHub project columns ────────────────────────────────────── */
+.board-grid { padding: 2px 16px 10px; }
+.board-lane { background: alpha(@ink, 0.025); border: 1px solid @edge; border-radius: 2px; }
+.board-lane.drop-lane, .list-section.drop-lane { border-color: @secondary; background: alpha(@ink, 0.05); }
+.lane-head { padding: 10px 8px 8px 12px; }
+.list-head { padding: 6px 8px 6px 12px; border-bottom: 1px solid @edge; }
+.lane-head-row { min-height: 26px; }
+.lane-title { color: @ink; font-size: 13px; font-weight: 600; }
+.lane-count { padding: 0 7px; border-radius: 2px; background: alpha(@ink, 0.08); color: @secondary; font-family: 'Fira Mono'; font-size: 10.5px; }
+.lane-estimate { padding: 0 7px; border: 1px solid @edge; border-radius: 2px; color: @secondary; font-size: 10.5px; }
+.lane-meaning { margin-left: 21px; color: @faint; font-size: 11.5px; }
+button.lane-key, menubutton.lane-key > button { min-height: 24px; min-width: 24px; padding: 0; border: 0; border-radius: 2px; background: transparent; opacity: 0.6; }
+button.lane-key:hover, menubutton.lane-key > button:hover { opacity: 1; background: alpha(@ink, 0.08); }
+.board-cards { padding: 4px 8px 10px; }
+.board-empty { min-height: 96px; padding: 18px 10px; border: 1px dashed @edge; border-radius: 2px; }
 .board-empty-title { color: @secondary; font-size: 12px; font-weight: 500; }
 .board-empty-hint { color: @faint; font-size: 11px; }
 .board-group-heading { margin: 6px 2px 0; color: @faint; font-family: 'Fira Sans Condensed'; font-size: 10.5px; font-weight: 600; letter-spacing: 0.06em; }
 
 /* ── Cards ──────────────────────────────────────────────────────────────── */
-.task-card { margin: 0; padding: 9px 10px 8px; background: @slab; border: 1px solid @edge; border-radius: 2px; }
-.task-card:hover { border-color: @strong; background: shade(@slab, 1.08); }
-.task-card:focus, .list-row:focus { outline: 0; box-shadow: inset 0 0 0 1px @ink; border-color: @ink; }
+.task-card { margin: 0; padding: 9px 11px 10px; background: alpha(@ink, 0.045); border: 1px solid @edge; border-radius: 2px; }
+.task-card:hover { border-color: @strong; background: alpha(@ink, 0.075); }
+.task-card:focus, .list-row:focus { outline: 0; box-shadow: inset 0 0 0 1px @secondary; border-color: @secondary; }
 .task-card:focus-visible, .list-row:focus-visible { outline: 0; }
-.task-card.task-child { margin-left: 0; border-left: 2px solid @strong; }
+.task-card.task-child { border-left: 2px solid @strong; }
 .task-card.dragging, .list-row.dragging { opacity: 0.4; }
 .task-card.drop-before, .list-row.drop-before { box-shadow: inset 0 2px 0 @ink; }
 .task-card.drop-after, .list-row.drop-after { box-shadow: inset 0 -2px 0 @ink; }
-.task-card.drop-into, .list-row.drop-into { border-color: @ink; background: @wash; }
-.card-id { color: @faint; font-family: 'Fira Mono'; font-size: 10.5px; }
-.card-title { color: @ink; font-size: 13px; font-weight: 500; }
-.task-card.done .card-title, .list-row.done .list-title { color: @secondary; text-decoration-line: line-through; }
-.task-card.done { background: alpha(@slab, 0.6); }
+.task-card.drop-into, .list-row.drop-into { border-color: @ink; background: alpha(@ink, 0.1); }
+.card-id { color: @faint; font-size: 11px; }
+.card-title { color: @ink; font-size: 13px; font-weight: 400; }
+.task-card.done .card-title, .list-row.done .list-title { color: @secondary; }
+.task-card.done { background: alpha(@ink, 0.03); }
 .card-tools { opacity: 0; }
 .task-card:hover .card-tools, .task-card:focus-within .card-tools { opacity: 1; }
 button.card-key { min-height: 20px; min-width: 20px; padding: 0; }
 .card-lineage { color: @secondary; }
 .task-lineage { color: @secondary; font-size: 11px; }
-.task-rollup progressbar trough, .task-rollup progressbar progress { min-height: 3px; border-radius: 0; border: 0; }
-.task-rollup progressbar trough { background: @wall; }
-.task-rollup progressbar progress { background: @live; }
+.task-rollup { margin-top: 2px; }
+.rollup-count { color: @secondary; font-family: 'Fira Mono'; font-size: 10.5px; }
+.task-rollup progressbar trough, .task-rollup progressbar progress, progressbar.issue-progress trough, progressbar.issue-progress progress { min-height: 6px; border-radius: 2px; border: 0; }
+.task-rollup progressbar trough, progressbar.issue-progress trough { background: alpha(@ink, 0.1); }
+.task-rollup progressbar progress, progressbar.issue-progress progress { background: #8957e5; }
 .card-blocked-caption { color: @held; font-size: 11px; }
 .blocked-lamp { color: @held; }
-.card-foot { min-height: 16px; }
+.card-fields { margin-top: 2px; }
+.field-pill { padding: 1px 8px; border: 1px solid @edge; border-radius: 2px; background: alpha(@ink, 0.03); }
+.field-pill-name { color: @secondary; font-size: 11px; }
+.pill-priority-high { border-color: alpha(@waiting, 0.45); }
+.pill-priority-high .field-pill-name { color: @waiting; }
+.pill-priority-urgent { border-color: alpha(@held, 0.5); background: alpha(@held, 0.08); }
+.pill-priority-urgent .field-pill-name { color: @held; }
+.pill-size .field-pill-name { font-family: 'Fira Mono'; font-size: 10.5px; }
+.pill-module { color: @secondary; }
 .card-module { color: @secondary; font-size: 11px; }
-.task-chip { font-family: 'Fira Mono'; font-size: 10px; padding: 0 4px; border: 1px solid @edge; color: @secondary; }
+.task-chip { font-family: 'Fira Mono'; font-size: 10px; padding: 0 5px; border: 1px solid @edge; border-radius: 2px; color: @secondary; }
 .card-sha { font-family: 'Fira Mono'; font-size: 10px; color: @faint; }
 .card-ago { color: @faint; font-family: 'Fira Mono'; font-size: 10.5px; }
-.task-agent { min-height: 22px; margin: 2px -10px -8px; padding: 0 10px; background: @console; border-top: 1px solid @edge; color: @secondary; font-size: 10.5px; }
+.task-agent { min-height: 22px; margin-top: 2px; padding-top: 5px; border-top: 1px solid @edge; color: @secondary; font-size: 10.5px; }
 .board-lamp { color: @faint; }
 .board-lamp.live-lamp { color: @live; }
 
 /* Labels: an edge-outlined chip with a muted swatch, so tags read without shouting. */
-.label-chip { padding: 1px 6px 1px 5px; border: 1px solid @edge; border-radius: 2px; }
+.label-chip { padding: 1px 8px 1px 7px; border: 1px solid @edge; border-radius: 2px; }
 .label-chip-name { color: @secondary; font-size: 10.5px; }
 .label-more { color: @faint; font-size: 10.5px; }
 .label-hue-0 { color: #8fa3bf; }
@@ -102,11 +138,12 @@ button.card-key { min-height: 20px; min-width: 20px; padding: 0; }
 .label-hue-7 { color: #c09a8d; }
 
 /* Status glyphs, priority bars and execution-state badges carry the state colours. */
+/* Each column its own ring colour, as a GitHub project's status field. */
 .status-backlog { color: @faint; }
-.status-ready { color: @secondary; }
-.status-active { color: @live; }
-.status-in_review { color: @waiting; }
-.status-done { color: @secondary; }
+.status-ready { color: #4493f8; }
+.status-active { color: @waiting; }
+.status-in_review { color: #ab7df8; }
+.status-done { color: @live; }
 .priority-icon { color: @secondary; }
 .priority-high { color: @waiting; }
 .priority-urgent { color: @held; }
@@ -120,10 +157,10 @@ button.card-key { min-height: 20px; min-width: 20px; padding: 0; }
 .state-blocked .state-caption, .state-failed .state-caption { color: @held; }
 
 /* ── List view ──────────────────────────────────────────────────────────── */
-.board-list { padding: 12px 16px 10px; }
-.list-section { margin-bottom: 10px; background: @console; border: 1px solid @edge; }
-.list-row { min-height: 36px; padding: 0 12px; border-bottom: 1px solid @edge; background: @slab; }
-.list-row:hover { background: @wash; }
+.board-list { padding: 2px 16px 10px; }
+.list-section { margin-bottom: 10px; background: alpha(@ink, 0.025); border: 1px solid @edge; border-radius: 2px; }
+.list-row { min-height: 36px; padding: 0 12px; border-bottom: 1px solid @edge; background: transparent; }
+.list-row:hover { background: alpha(@ink, 0.05); }
 .list-row:last-child { border-bottom: 0; }
 .list-title { color: @ink; font-size: 13px; }
 .list-lineage { color: @faint; font-size: 11px; }
@@ -132,7 +169,7 @@ button.card-key { min-height: 20px; min-width: 20px; padding: 0; }
 .list-group-heading { padding: 6px 12px 3px; color: @faint; font-family: 'Fira Sans Condensed'; font-size: 10.5px; font-weight: 600; letter-spacing: 0.06em; border-bottom: 1px solid @edge; }
 
 /* ── Peek panel ─────────────────────────────────────────────────────────── */
-.board-peek { background: @console; border-left: 1px solid @edge; }
+.board-peek { background: alpha(@ink, 0.035); border-left: 1px solid @edge; }
 .peek-head { min-height: 40px; padding: 0 8px 0 14px; border-bottom: 1px solid @edge; }
 .peek-body { padding: 14px 16px 18px; }
 .peek-title { color: @ink; font-size: 16px; font-weight: 600; }
@@ -170,11 +207,152 @@ button.filter-option:checked { border-color: @ink; background: @wash; color: @in
 .board-blank { padding: 40px; }
 .board-blank-title { color: @ink; font-size: 15px; font-weight: 600; }
 .board-blank-hint { color: @secondary; font-size: 12px; margin-bottom: 6px; }
-.board-shortcuts { min-height: 28px; padding: 0 16px; border-top: 1px solid @edge; background: @console; }
 .board-kbd { padding: 0 4px; border: 1px solid @edge; border-radius: 2px; font-family: 'Fira Mono'; font-size: 10px; color: @secondary; }
 .board-hint { margin-right: 8px; color: @faint; font-size: 11px; }
 
-/* ── Task editor identity line ─────────────────────────────────────────── */
-.task-identity { min-height: 34px; padding: 0 10px; margin-bottom: 4px; border: 1px solid @edge; background: @slab; }
-.identity-part { padding-right: 8px; border-right: 1px solid @edge; }
-.identity-caption { color: @ink; font-size: 12px; }
+/* ── Task pages: GitHub's new-issue form and issue thread ─────────────── */
+/* A full page hides the surface it covers (panel.rs), so one @wall layer over the wallpaper
+   reads exactly as the board does. */
+button.panel-scrim.page-scrim, button.panel-scrim.page-scrim:hover { background: transparent; }
+.app-panel.issue-page { background: @wall; border: 0; }
+.issue-page scrolledwindow, .issue-page viewport, .issue-page stack { background: transparent; }
+.issue-page .panel-body { padding: 0; }
+.see-through, .see-through > viewport { background: transparent; }
+.issue-compose, .issue-detail { padding: 18px 24px 28px; }
+.issue-field-caption { color: @ink; font-size: 13px; font-weight: 600; margin-top: 4px; }
+entry.issue-title-entry { min-height: 34px; border-radius: 2px; font-size: 14px; }
+.issue-compose-footer { margin-top: 6px; }
+.issue-compose-footer button, .issue-composer button, .issue-header button.primary { border-radius: 2px; }
+.issue-page button.primary { min-height: 32px; padding: 0 14px; border-radius: 2px; }
+
+/* The Markdown field: Write / Preview tabs and a formatting bar over the text. */
+.md-field { border: 1px solid @edge; border-radius: 2px; background: alpha(@ink, 0.04); }
+.md-bar { padding: 4px 6px 0; border-bottom: 1px solid @edge; background: alpha(@ink, 0.03); }
+button.md-tab { min-height: 30px; padding: 0 14px; border: 1px solid transparent; border-bottom: 0; border-radius: 2px; background: transparent; color: @secondary; font-size: 12.5px; font-weight: 400; }
+button.md-tab:checked { border-color: @edge; background: alpha(@ink, 0.05); color: @ink; margin-bottom: -1px; }
+button.md-tool { min-height: 26px; min-width: 26px; padding: 0 5px; border: 0; background: transparent; color: @secondary; font-size: 12px; font-weight: 600; }
+button.md-tool:hover { color: @ink; background: alpha(@ink, 0.08); }
+textview.md-input, textview.md-input text { background: transparent; font-size: 13px; }
+.md-placeholder { margin: 9px 13px; color: @faint; font-size: 13px; }
+.md-preview { padding: 10px 12px; color: @ink; font-size: 13px; }
+
+/* The issue header: a large title, its number, then a status pill and the dates. */
+.issue-header { padding-bottom: 14px; border-bottom: 1px solid @edge; }
+.issue-title { color: @ink; font-size: 26px; font-weight: 400; }
+.issue-number { color: @faint; font-size: 26px; font-weight: 300; }
+.status-pill { padding: 4px 12px 4px 9px; border-radius: 2px; background: alpha(@ink, 0.08); }
+.status-pill-name { color: @ink; font-size: 12.5px; font-weight: 600; }
+.status-pill-ready { background: alpha(#4493f8, 0.22); }
+.status-pill-active { background: alpha(@waiting, 0.2); }
+.status-pill-in_review { background: alpha(#ab7df8, 0.22); }
+.status-pill-done { background: #8957e5; }
+.status-pill-done .status-pill-name, .status-pill-done .status-icon { color: white; }
+button.issue-pill { min-height: 26px; padding: 0 10px; border: 1px solid @edge; border-radius: 2px; background: transparent; color: @secondary; font-size: 12px; font-weight: 400; }
+button.issue-pill:hover { color: @ink; border-color: @strong; }
+.issue-opened { color: @faint; font-size: 12px; }
+.issue-status { padding: 8px 12px; border: 1px solid alpha(@waiting, 0.35); border-radius: 2px; background: alpha(@waiting, 0.08); color: @ink; }
+
+/* The thread: comment boxes and the steps between them on one rail. */
+.issue-comment { border: 1px solid @edge; border-radius: 2px; background: alpha(@ink, 0.04); }
+.issue-comment-head { min-height: 38px; padding: 0 8px 0 14px; border-bottom: 1px solid @edge; border-radius: 2px; background: alpha(@ink, 0.04); }
+.issue-comment-who { color: @secondary; font-size: 12.5px; }
+.issue-comment-body { padding: 12px 14px 14px; color: @ink; font-size: 13px; }
+.issue-section-title { color: @ink; font-size: 13px; font-weight: 600; }
+button.issue-link { min-height: 32px; padding: 0 14px; border: 0; border-bottom: 1px solid @edge; border-radius: 2px; background: transparent; color: @ink; font-weight: 400; }
+button.issue-link:hover { background: alpha(@ink, 0.05); }
+.issue-sidebar button.issue-link { min-height: 26px; padding: 0 6px; border: 0; border-radius: 2px; }
+.issue-timeline { margin-top: 4px; }
+.issue-event { min-height: 40px; }
+.issue-rail { min-width: 32px; }
+.issue-rail-line { min-width: 2px; background: @edge; }
+.issue-badge { min-width: 28px; min-height: 28px; margin-top: 6px; border-radius: 2px; background: @slab; border: 2px solid @wall; color: @secondary; }
+.issue-badge-closed { background: #8957e5; }
+.issue-badge-closed .status-icon { color: white; }
+.issue-event > box.issue-comment { margin: 8px 0; }
+.issue-event-text { padding: 10px 0; color: @secondary; font-size: 12.5px; }
+.issue-message { padding: 8px 10px; margin-bottom: 10px; border-left: 2px solid @strong; color: @secondary; font-size: 12px; }
+.avatar { min-width: 28px; min-height: 28px; margin-top: 6px; border-radius: 2px; color: #111; font-size: 12px; font-weight: 700; }
+.issue-sidebar .avatar { min-width: 20px; min-height: 20px; margin-top: 0; border-radius: 2px; font-size: 10px; }
+.avatar-hue-0 { background: #8fa3bf; }
+.avatar-hue-1 { background: #a597c4; }
+.avatar-hue-2 { background: #c4949f; }
+.avatar-hue-3 { background: #c4aa8b; }
+.avatar-hue-4 { background: #8fb89c; }
+.avatar-hue-5 { background: #8db6bd; }
+.avatar-hue-6 { background: #b3b78b; }
+.avatar-hue-7 { background: #c09a8d; }
+.issue-composer { margin-top: 18px; padding-top: 16px; border-top: 2px solid @edge; }
+.issue-composer-title { color: @ink; font-size: 15px; font-weight: 600; }
+button.issue-close { min-height: 32px; padding: 0 12px; border: 1px solid @edge; border-radius: 2px; background: alpha(@ink, 0.04); color: @ink; font-weight: 400; }
+button.issue-close:hover { background: alpha(@ink, 0.09); }
+
+/* The sidebar: compact sections of pills under hairlines. */
+.issue-sidebar { margin-top: 2px; }
+.issue-side-section { padding: 10px 0 12px; border-bottom: 1px solid alpha(@edge, 0.8); }
+.issue-side-section:last-child { border-bottom: 0; }
+.issue-side-title { color: @faint; font-size: 11.5px; font-weight: 600; }
+.issue-side-empty { color: @faint; font-size: 12px; }
+.issue-side-value { color: @ink; font-size: 12.5px; }
+entry.issue-side-entry { min-height: 28px; border: 1px solid @edge; border-radius: 2px; background: alpha(@ink, 0.05); box-shadow: none; font-size: 12px; }
+entry.issue-side-entry:focus-within { border-color: alpha(@ink, 0.4); }
+button.choice-pill { min-height: 24px; padding: 0 10px; border: 1px solid @edge; border-radius: 2px; background: transparent; color: @secondary; font-size: 12px; font-weight: 400; }
+button.choice-pill:hover { background: alpha(@ink, 0.07); color: @ink; }
+button.choice-pill.selected { border-color: alpha(@ink, 0.45); background: alpha(@ink, 0.13); color: @ink; font-weight: 600; }
+button.choice-pill label { color: inherit; }
+button.issue-side-key { min-height: 26px; padding: 0 8px; border: 0; border-radius: 2px; background: transparent; color: @secondary; font-weight: 400; }
+button.issue-side-key:hover { background: alpha(@ink, 0.07); color: @ink; }
+button.issue-label { min-height: 0; padding: 0; border: 0; background: transparent; }
+button.issue-label:hover .label-chip { border-color: @held; }
+button.issue-delete { min-height: 26px; padding: 0 8px; border: 0; border-radius: 2px; background: transparent; color: @faint; font-weight: 400; }
+button.issue-delete:hover { background: alpha(@held, 0.12); color: @held; }
+
+/* Attachments: tiles under the description; the whole page takes drops and pastes. */
+flowbox.attachment-tray { padding: 0 14px 10px; }
+flowbox.attachment-tray > flowboxchild { padding: 0; }
+box.attachment-tray { margin-top: 2px; }
+.attachment-tile { border: 1px solid @edge; border-radius: 2px; background: alpha(@ink, 0.05); }
+.attachment-tile picture { border-radius: 2px; }
+.attachment-name { color: @secondary; font-size: 11px; }
+button.attachment-remove { margin: 3px; min-height: 20px; min-width: 20px; border-radius: 2px; background: alpha(black, 0.55); opacity: 0; }
+.attachment-tile:hover button.attachment-remove { opacity: 1; }
+.attachment-hint { padding: 0 14px 10px; color: @faint; font-size: 11px; }
+.drop-attach { box-shadow: inset 0 0 0 2px alpha(@ink, 0.35); }
+
+/* ── View menu: compact rounded pills, grouped under small captions ───── */
+popover.view-popover contents { padding: 10px 12px 12px; border-radius: 2px; }
+.view-menu-title { color: @ink; font-size: 13px; font-weight: 600; }
+button.view-reset { min-height: 22px; padding: 0 8px; border: 0; border-radius: 2px; background: transparent; color: @secondary; font-size: 11.5px; font-weight: 400; }
+button.view-reset:hover { background: alpha(@ink, 0.08); color: @ink; }
+.view-menu-caption { margin-top: 8px; margin-bottom: 1px; color: @faint; font-size: 11px; font-weight: 600; }
+button.view-pill { min-height: 22px; padding: 0 9px; border: 1px solid @edge; border-radius: 2px; background: transparent; color: @secondary; font-size: 11.5px; font-weight: 400; }
+button.view-pill:hover { background: alpha(@ink, 0.07); color: @ink; }
+button.view-pill:checked { border-color: alpha(@ink, 0.45); background: alpha(@ink, 0.13); color: @ink; }
+button.view-pill label { color: inherit; }
+
+/* ── Modules: version bundles, each with its own board ────────────────── */
+.modules-page { padding: 12px 16px; }
+.modules-head { min-height: 40px; }
+button.module-card { padding: 12px 14px; border: 1px solid @edge; border-radius: 2px; background: alpha(@ink, 0.045); font-weight: 400; }
+button.module-card:hover { border-color: @strong; background: alpha(@ink, 0.075); }
+.module-card-name { color: @ink; font-size: 14px; font-weight: 600; }
+.module-card-meta { color: @secondary; font-size: 11.5px; }
+.module-card-done { padding: 1px 8px; border-radius: 2px; background: #8957e5; color: white; font-size: 11px; font-weight: 600; }
+.module-banner { min-height: 44px; margin: 0 16px 10px; padding: 0 8px 0 4px; border: 1px solid @edge; border-radius: 2px; background: alpha(@ink, 0.05); }
+.module-banner-name { color: @ink; font-size: 15px; font-weight: 600; }
+.module-banner .field-pill { min-height: 0; }
+.module-banner progressbar { margin-right: 4px; }
+button.module-back, button.module-action { min-height: 28px; padding: 0 10px; border: 0; border-radius: 2px; background: transparent; color: @secondary; font-weight: 400; }
+button.module-back:hover, button.module-action:hover { background: alpha(@ink, 0.08); color: @ink; }
+button.module-back { border-right: 1px solid @edge; border-radius: 2px; }
+.module-pick-list checkbutton, checkbutton.module-pick { min-height: 32px; padding: 0 8px; border-radius: 2px; }
+.module-pick-list checkbutton:hover { background: alpha(@ink, 0.05); }
+.patch-notes { color: @ink; font-size: 13px; }
+flowbox.module-grid > flowboxchild { padding: 0; }
+.module-grid button.module-card progressbar { min-width: 120px; }
+/* Renaming a module happens in the banner's own height: a slim field and small pills. */
+.module-editor entry { min-height: 26px; padding: 0 8px; border: 1px solid @edge; border-radius: 2px; background: alpha(@ink, 0.06); box-shadow: none; font-size: 12.5px; }
+.module-editor entry:focus-within { border-color: alpha(@ink, 0.4); }
+.module-editor button.choice-pill { min-height: 24px; padding: 0 8px; }
+button.module-action.module-save { border: 1px solid alpha(@ink, 0.35); background: alpha(@ink, 0.1); color: @ink; }
+button.module-action.module-save:hover { background: alpha(@ink, 0.16); }
+.module-banner > button, .module-banner > box { margin-top: 6px; margin-bottom: 6px; }

@@ -716,7 +716,12 @@ fn pages(content: &gtk::Stack) -> BTreeMap<String, gtk::Box> {
         } else if name == "board" {
             content.add_named(&page, Some(name));
         } else {
-            content.add_named(&scrolled(&page), Some(name));
+            let scroller = scrolled(&page);
+            if name == "modules" {
+                // One layer over the page stack, as the board: see-through to the wallpaper.
+                scroller.add_css_class("see-through");
+            }
+            content.add_named(&scroller, Some(name));
         }
         pages.insert(name.into(), page);
     }
