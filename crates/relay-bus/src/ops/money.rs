@@ -86,6 +86,10 @@ payload!(#[schemars(rename = "MoneySyncIn")] SyncIn {
     pub replace: Option<bool>,
     /// The cursor this PC returned last time; 0 the first time.
     pub since: i64,
+    /// The generation this PC returned last time; absent the first time. When the PC's ledger
+    /// is no longer that one, the sync is refused with `money.sync_stale`, and the phone takes
+    /// the PC's ledger whole (`since: 0`, no generation, no changes).
+    pub generation: Option<String>,
     /// The phone's rows changed since its last sync, and its tombstones.
     pub changes: Vec<Change>,
 });

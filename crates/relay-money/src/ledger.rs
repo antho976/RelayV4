@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// Bumped with every entry appended to [`MIGRATIONS`]; every earlier version must stay openable.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 const MIGRATIONS: &[&str] = &[r"
 CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -141,6 +141,9 @@ UPDATE goals SET seq = 0;
 UPDATE contributions SET seq = 0;
 UPDATE account_values SET seq = 0;
 UPDATE settings SET seq = 0;
+", r"
+-- A budget's tombstone names its category's uid: budgets are matched by category on sync.
+ALTER TABLE tombstones ADD COLUMN category TEXT;
 "];
 
 const TABLES: [&str; 8] =
@@ -152,13 +155,16 @@ pub enum LedgerError {
     /// A refusal the person can act on: a missing account, an amount of zero.
     Invalid(String),
     NotFound(String),
+    /// A device synced with a ledger this one no longer is (restored, erased, replaced by
+    /// another device, or a fresh file): it must take this ledger whole before it merges again.
+    Stale(String),
 }
 
 impl std::fmt::Display for LedgerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LedgerError::Sql(e) => write!(f, "money ledger: {e}"),
-            LedgerError::Invalid(m) | LedgerError::NotFound(m) => f.write_str(m),
+            LedgerError::Invalid(m) | LedgerError::NotFound(m) | LedgerError::Stale(m) => f.write_str(m),
         }
     }
 }
@@ -244,7 +250,7 @@ impl Ledger {
     fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
         conn.prepare_cached(
             "INSERT INTO settings (key, value, updated_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = MAX(excluded.updated_at, settings.updated_at + 1)",
         )?.execute(params![key, value, now_ms()])?;
         Ok(())
     }
@@ -464,14 +470,14 @@ impl Ledger {
         let note = p.note.as_deref().map(str::trim).unwrap_or(&cur.note).to_string();
         self.conn.prepare_cached(
             "UPDATE transactions SET type = ?2, amount = ?3, date = ?4, account_id = ?5, to_account_id = ?6,
-                    category_id = ?7, note = ?8, updated_at = ?9 WHERE id = ?1",
+                    category_id = ?7, note = ?8, updated_at = MAX(?9, updated_at + 1) WHERE id = ?1",
         )?.execute(params![id, name_of(&ty), amount, date, account, to, category, note, now_ms()])?;
         self.tx(id)
     }
 
     /// Deletes are tombstones, so sync can carry them to the other device.
     pub fn tx_delete(&mut self, id: i64) -> Result<()> {
-        let n = self.conn.prepare_cached("UPDATE transactions SET deleted = 1, updated_at = ?2 WHERE id = ?1 AND deleted = 0")?
+        let n = self.conn.prepare_cached("UPDATE transactions SET deleted = 1, updated_at = MAX(?2, updated_at + 1) WHERE id = ?1 AND deleted = 0")?
             .execute(params![id, now_ms()])?;
         if n == 0 {
             return Err(LedgerError::NotFound(format!("No entry {id}")));
@@ -481,7 +487,7 @@ impl Ledger {
 
     /// Brings back a deleted entry: the Undo of [`Ledger::tx_delete`].
     pub fn tx_restore(&mut self, id: i64) -> Result<Tx> {
-        let n = self.conn.prepare_cached("UPDATE transactions SET deleted = 0, updated_at = ?2 WHERE id = ?1 AND deleted = 1")?
+        let n = self.conn.prepare_cached("UPDATE transactions SET deleted = 0, updated_at = MAX(?2, updated_at + 1) WHERE id = ?1 AND deleted = 1")?
             .execute(params![id, now_ms()])?;
         if n == 0 {
             return Err(LedgerError::NotFound(format!("No deleted entry {id}")));
@@ -508,11 +514,11 @@ impl Ledger {
         }
         let now = now_ms();
         if amount <= 0 {
-            self.conn.prepare_cached("UPDATE budgets SET deleted = 1, updated_at = ?2 WHERE category_id = ?1")?.execute(params![key, now])?;
+            self.conn.prepare_cached("UPDATE budgets SET deleted = 1, updated_at = MAX(?2, updated_at + 1) WHERE category_id = ?1")?.execute(params![key, now])?;
         } else {
             self.conn.prepare_cached(
                 "INSERT INTO budgets (uid, category_id, amount, updated_at) VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(category_id) DO UPDATE SET amount = excluded.amount, deleted = 0, updated_at = excluded.updated_at",
+                 ON CONFLICT(category_id) DO UPDATE SET amount = excluded.amount, deleted = 0, updated_at = MAX(excluded.updated_at, budgets.updated_at + 1)",
             )?.execute(params![new_uid(), key, amount, now])?;
         }
         Ok(())
@@ -527,7 +533,14 @@ impl Ledger {
     /// Posts every bill that posts itself and is due by `today`, one entry per date. Each posted
     /// entry's uid is derived from the bill and the date, so the phone and the PC posting the same
     /// rent produce one row once they sync, and posting twice here adds nothing.
+    ///
+    /// Once a phone syncs with this ledger, the phone posts bills and this ledger leaves them be:
+    /// two devices posting the same bill at different times would each stamp it with their own
+    /// time, and the later post would undo an edit or a delete made on the other side between.
     pub fn post_due(&mut self, today: Date) -> Result<usize> {
+        if !self.synced_devices()?.is_empty() {
+            return Ok(0);
+        }
         let due: Vec<DueRow> = {
             let mut st = self.conn.prepare_cached(
                 "SELECT id, uid, type, amount, account_id, to_account_id, category_id, frequency, interval, anchor_date, next_date, end_date
@@ -551,12 +564,13 @@ impl Ledger {
             for date in rule.between(next, through) {
                 posted += tx.prepare_cached(
                     "INSERT OR IGNORE INTO transactions (uid, type, amount, date, account_id, to_account_id, category_id, note, recurring_id, created_at, updated_at)
-                     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, name, id, ?8, ?8 FROM recurring WHERE id = ?9",
+                     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, name, id, ?8, ?8 FROM recurring WHERE id = ?9
+                       AND NOT EXISTS (SELECT 1 FROM tombstones WHERE tbl = 'transactions' AND uid = ?1)",
                 )?.execute(params![format!("bill:{uid}:{date}"), ty, amount, date.to_string(), account, to, category, now, id])?;
             }
             let following = rule.after(today);
             let active = end.is_none_or(|e| following <= e);
-            tx.prepare_cached("UPDATE recurring SET next_date = ?2, active = ?3, updated_at = ?4 WHERE id = ?1")?
+            tx.prepare_cached("UPDATE recurring SET next_date = ?2, active = ?3, updated_at = MAX(?4, updated_at + 1) WHERE id = ?1")?
                 .execute(params![id, following.to_string(), active, now])?;
         }
         tx.commit()?;
@@ -704,22 +718,43 @@ impl Ledger {
 
     /// Erases every row. Each live one leaves a tombstone, so the next sync erases it on the
     /// other device too, unless `quietly` (the phone replacing this ledger has none of them).
+    ///
+    /// Either way the ledger takes a new generation: a device that synced with the old one is
+    /// told so on its next sync (`LedgerError::Stale`) and takes this ledger whole, instead of
+    /// merging two ledgers that no longer share their rows.
     pub(crate) fn clear(tx: &rusqlite::Transaction, quietly: bool) -> Result<()> {
         let now = now_ms();
+        // Every tombstone first: a budget's names its category, which must still be there.
+        for t in TABLES.iter().filter(|_| !quietly) {
+            let category = if *t == "budgets" { "(SELECT c.uid FROM categories c WHERE c.id = budgets.category_id)" } else { "NULL" };
+            tx.execute(
+                &format!(
+                    "INSERT OR REPLACE INTO tombstones (tbl, uid, updated_at, category)
+                     SELECT '{t}', uid, MAX(?1, updated_at + 1), {category} FROM {t} WHERE deleted = 0"
+                ),
+                [now],
+            )?;
+        }
         for t in TABLES {
-            if !quietly {
-                tx.execute(
-                    &format!("INSERT OR REPLACE INTO tombstones (tbl, uid, updated_at) SELECT '{t}', uid, ?1 FROM {t} WHERE deleted = 0"),
-                    [now],
-                )?;
-            }
             tx.execute(&format!("DELETE FROM {t}"), [])?;
         }
-        tx.execute("DELETE FROM settings", [])?;
+        // Which phones sync stays; the ledger's own settings go.
+        tx.execute("DELETE FROM settings WHERE key NOT LIKE 'sync.device.%'", [])?;
         if quietly {
             tx.execute("DELETE FROM tombstones", [])?;
         }
+        Ledger::set_setting(tx, "sync.generation", &new_uid())?;
         Ok(())
+    }
+
+    /// The ledger's generation: changes with every restore, erase or replace.
+    pub fn generation(&self) -> Result<String> {
+        if let Some(g) = self.setting("sync.generation")? {
+            return Ok(g);
+        }
+        let g = new_uid();
+        Ledger::set_setting(&self.conn, "sync.generation", &g)?;
+        Ok(g)
     }
 
     /// Replaces the whole ledger with a Tally backup, as a restore does on the phone. Ids are kept
@@ -879,8 +914,14 @@ impl Ledger {
     }
 
     pub fn set_currency(&mut self, currency: &str) -> Result<()> {
-        if fraction_digits(currency).is_none() {
+        let Some(digits) = fraction_digits(currency) else {
             return invalid(format!("Not a currency code: {currency}"));
+        };
+        // Tally converts every amount when the decimals change; this ledger does not, so it
+        // takes only a change that keeps them.
+        let current = fraction_digits(&self.settings()?.currency).unwrap_or(2);
+        if digits != current && !self.is_empty()? {
+            return invalid("That currency has a different number of decimals. Change it in Tally on your phone, which converts every amount.");
         }
         Ledger::set_setting(&self.conn, "currency", currency)
     }
@@ -1079,6 +1120,30 @@ mod tests {
         l.import_backup(&file).unwrap();
         let balance = l.accounts().unwrap().into_iter().find(|a| a.id == tfsa).unwrap().balance;
         assert_eq!(balance, 6_050_00, "the value holds September's transfer; October's adds to it");
+    }
+
+    #[test]
+    fn the_currency_changes_here_only_when_its_decimals_do_not() {
+        let (mut l, _) = with_account();
+        assert!(l.set_currency("USD").is_ok());
+        assert!(matches!(l.set_currency("JPY"), Err(LedgerError::Invalid(_))), "amounts would be read a hundred times too big");
+        l.reset().unwrap();
+        assert!(l.set_currency("JPY").is_ok(), "nothing to convert in an empty ledger");
+    }
+
+    #[test]
+    fn an_erased_bill_entry_is_not_posted_again() {
+        let (mut l, acct) = with_account();
+        let housing = category(&l, "Housing");
+        let mut file = l.export_backup("x").unwrap();
+        file.recurring.push(RecurringDto {
+            id: 1, name: "Rent".into(), r#type: TxType::Expense, amount: 900_00, account_id: acct, to_account_id: None,
+            category_id: Some(housing), frequency: Frequency::Monthly, interval: 1, anchor_date: "2026-10-01".into(),
+            next_date: "2026-10-01".into(), end_date: None, auto_post: true, active: true,
+        });
+        l.import_backup(&file).unwrap();
+        l.conn.execute("INSERT INTO tombstones (tbl, uid, updated_at) SELECT 'transactions', 'bill:' || uid || ':2026-10-01', 1 FROM recurring", []).unwrap();
+        assert_eq!(l.post_due(date(2026, 10, 7)).unwrap(), 0);
     }
 
     #[test]

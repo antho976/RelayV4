@@ -96,7 +96,11 @@ fn a_phone_syncs_its_ledger_across_the_bus() {
     assert_eq!(home["income"], 210_000);
     assert_eq!(ok(&engine, "money.lists", json!({}))["devices"][0]["name"], "Pixel 9");
     ok(&engine, "money.tx.add", json!({"type": "EXPENSE", "amount": 1_500, "date": "2026-10-06", "account_id": home["accounts"][0]["id"]}));
-    let next = ok(&engine, "money.sync", json!({"device": "Pixel 9", "since": first["cursor"], "changes": []}));
+    let next = ok(&engine, "money.sync", json!({"device": "Pixel 9", "since": first["cursor"], "generation": first["generation"], "changes": []}));
+    // Erasing on the PC makes it another ledger: the phone is told, not merged into it.
+    ok(&engine, "money.reset", json!({}));
+    let stale = call_as(&engine, Actor::User, "money.sync", json!({"device": "Pixel 9", "since": next["cursor"], "generation": first["generation"], "changes": []}));
+    assert_eq!(code(stale), "money.sync_stale");
     let back = next["changes"].as_array().unwrap();
     assert_eq!(back.len(), 1);
     assert_eq!(back[0]["row"]["account"], "a1");

@@ -16541,6 +16541,13 @@
           "format": "int64",
           "description": "The cursor this PC returned last time; 0 the first time."
         },
+        "generation": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The generation this PC returned last time; absent the first time. When the PC's ledger\nis no longer that one, the sync is refused with `money.sync_stale`, and the phone takes\nthe PC's ledger whole (`since: 0`, no generation, no changes)."
+        },
         "changes": {
           "type": "array",
           "items": {
@@ -16593,6 +16600,10 @@
           "format": "int64",
           "description": "Store it and send it back as `since` next time."
         },
+        "generation": {
+          "type": "string",
+          "description": "Store it and send it back as `generation`: it changes when this ledger is restored,\nerased or replaced, and a device holding an old one must take the ledger whole."
+        },
         "changes": {
           "type": "array",
           "items": {
@@ -16618,6 +16629,7 @@
       },
       "required": [
         "cursor",
+        "generation",
         "changes",
         "replaced",
         "applied",

@@ -225,6 +225,9 @@ pub struct Change {
 pub struct SyncOut {
     /// Store it and send it back as `since` next time.
     pub cursor: i64,
+    /// Store it and send it back as `generation`: it changes when this ledger is restored,
+    /// erased or replaced, and a device holding an old one must take the ledger whole.
+    pub generation: String,
     /// This ledger's changes the device has not seen.
     pub changes: Vec<Change>,
     /// This ledger was replaced by the device's.

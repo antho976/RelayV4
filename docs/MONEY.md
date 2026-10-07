@@ -127,7 +127,7 @@ greeting, pairing code once, then a proof per connection; docs/MOBILE.md §2, §
 bus request, `money.sync`, which is in `PHONE_OPS`.
 
 ```
-money.sync { device, replace?, since, changes: [Change] }  →  { cursor, changes: [Change], replaced, applied, skipped }
+money.sync { device, replace?, since, generation?, changes: [Change] }  →  { cursor, generation, changes: [Change], replaced, applied, skipped }
 Change = { table, uid, updated_at, deleted, row }
 ```
 
@@ -143,16 +143,31 @@ Change = { table, uid, updated_at, deleted, row }
   `replace: false` with the cursor the one before answered, tables in order across them.
 - **Newest edit wins, per row**, by `updated_at` (ms since the epoch). An equal or older change
   is ignored. A tombstone (`deleted: true`) wins like any edit.
+- **A stamp never goes backwards.** Every edit on either side is stamped
+  `max(now, the row's stamp + 1)`, so a device whose clock runs behind still wins with the edit
+  it made last. Settings do the same.
+- **Generation.** The PC returns a `generation` with every answer; the phone keeps it and sends it
+  back. It changes when the PC's ledger is restored, erased, sampled or replaced by a device's
+  first sync. A phone whose generation is not the PC's, or whose `since` is above the PC's
+  cursor (the PC's `money.db` was lost), is refused with `money.sync_stale`, and merges nothing.
+  It then takes the PC's ledger whole: `since: 0`, no generation, no changes; it replaces its own
+  ledger with the answer, keeps the new cursor and generation, and merges from then on. The
+  latest wholesale act wins: restoring a backup on the PC reaches the phone, and a reinstalled
+  phone that pairs again makes an older install take the new ledger instead of mixing two.
 - References travel as uids, never local ids: a transaction's `row.account` is the account's
   uid. Budgets are matched by their category (`row.category`, null for the overall budget), not
   by uid, because each category has one budget.
-- A tombstone's `row` is `{}`, except a budget's, which must carry `{ category }`: the PC reads a
-  budget change with no category as the overall budget. Tally keeps the category's uid in its
+- A tombstone's `row` is `{}`, except a budget's, which carries `{ category }` both ways (null
+  for the overall budget); the PC matches a budget tombstone with no category by its uid. Tally keeps the category's uid in its
   tombstone for that, and sends nothing for a budget whose category is already gone (the
   category's own tombstone takes it on the PC). A row whose reference the receiving side does
   not have is skipped (counted in `skipped`), not fatal.
-- A posted bill's uid is `bill:<recurring uid>:<date>` on both devices, so the same rent posted
-  on each merges into one row.
+- A posted bill's uid is `bill:<recurring uid>:<date>` on both devices. **Once a phone syncs, the
+  phone alone posts bills**: two devices posting the same bill at different times would each stamp
+  it with their own time, and the later post would undo an edit or a delete made in between. A
+  PC with no phone posts them itself, and never posts a uid it holds a tombstone for.
+- The PC changes the currency only when the decimals stay the same (CAD to USD); Tally converts
+  every amount when they differ (CAD to JPY), so that change is made on the phone.
 - `table` is one of `settings`, `accounts`, `categories`, `recurring`, `goals`, `transactions`,
   `budgets`, `contributions`, `account_values`, applied in that order. `settings` rows have
   the setting's name as uid (`currency`, `month_start_day`, `week_starts_monday`) and

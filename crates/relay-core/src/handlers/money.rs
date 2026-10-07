@@ -21,6 +21,7 @@ fn bus(e: LedgerError) -> BusError {
     match e {
         LedgerError::Invalid(m) => BusError::invalid("money.invalid", m),
         LedgerError::NotFound(m) => BusError::not_found("money.not_found", m),
+        LedgerError::Stale(m) => BusError::conflict("money.sync_stale", m),
         LedgerError::Sql(e) => BusError::internal(format!("money ledger: {e}")),
     }
 }
@@ -160,7 +161,7 @@ pub fn register(e: &mut Engine) {
         if device.is_empty() || device.chars().count() > 64 || device.contains(char::is_control) {
             return Err(BusError::invalid("money.invalid", "A device name is 1 to 64 printable characters"));
         }
-        let out = ledger(ctx.engine(), |l| l.sync(device, p.replace.unwrap_or(false), p.since, &p.changes, &crate::time::now()))?;
+        let out = ledger(ctx.engine(), |l| l.sync(device, p.replace.unwrap_or(false), p.since, p.generation.as_deref(), &p.changes, &crate::time::now()))?;
         if out.applied > 0 || out.replaced {
             ctx.emit("money.changed", json!({"synced": device, "applied": out.applied}));
         }
