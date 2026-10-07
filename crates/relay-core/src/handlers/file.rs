@@ -55,13 +55,7 @@ pub fn register(e: &mut Engine) {
         let truncated = bytes.len() as u64 > limit;
         bytes.truncate(limit as usize);
         let mime = mime(&rel);
-        let (text, bytes_b64) = match String::from_utf8(bytes.clone()) {
-            Ok(text) if !text.contains('\0') => (Some(text), None),
-            _ => (
-                None,
-                Some(base64::engine::general_purpose::STANDARD.encode(bytes)),
-            ),
-        };
+        let (text, bytes_b64) = decode(bytes, truncated);
         Ok(ReadOut {
             text,
             bytes_b64,
@@ -119,12 +113,17 @@ pub fn register(e: &mut Engine) {
         let temp_dir = root.join(".relay").join("tmp");
         fs::create_dir_all(&temp_dir).map_err(|e| io_err("file.write_failed", &rel, e))?;
         let temp = temp_dir.join(format!("{}.tmp", uuid::Uuid::new_v4()));
-        fs::write(&temp, p.text.as_bytes()).map_err(|e| io_err("file.write_failed", &rel, e))?;
-        if let Ok(metadata) = fs::metadata(&path) {
-            fs::set_permissions(&temp, metadata.permissions())
-                .map_err(|e| io_err("file.write_failed", &rel, e))?;
+        let replaced = fs::write(&temp, p.text.as_bytes())
+            .and_then(|_| match fs::metadata(&path) {
+                Ok(metadata) => fs::set_permissions(&temp, metadata.permissions()),
+                Err(_) => Ok(()),
+            })
+            .and_then(|_| fs::rename(&temp, &path));
+        if let Err(e) = replaced {
+            // A failed save leaves no stray temp file behind (RA-360).
+            let _ = fs::remove_file(&temp);
+            return Err(io_err("file.write_failed", &rel, e));
         }
-        fs::rename(&temp, &path).map_err(|e| io_err("file.write_failed", &rel, e))?;
         ctx.set_project(project.id);
         ctx.emit(
             "file.changed",
@@ -228,11 +227,6 @@ pub fn register(e: &mut Engine) {
         for inside in &inner {
             guard_path_mutation(ctx, project_id, &root, &rel.join(inside), None)?;
         }
-        ctx.tx().execute(
-            "INSERT INTO file_trash(project_id, worktree, original_path, trash_path, created_at) VALUES (?1,?2,?3,'',?4)",
-            params![project_id, root.display().to_string(), p.path, ctx.now],
-        ).bus()?;
-        let id = ctx.tx().last_insert_rowid();
         // The primary checkout keeps the trash: a session's worktree is removed when the
         // session ends, and its `.relay/trash` went with it while the row still offered a
         // restore (RA-214). A worktree a rename cannot leave (another filesystem) keeps its own.
@@ -241,27 +235,67 @@ pub fn register(e: &mut Engine) {
         if !bases.contains(&root.as_path()) {
             bases.push(&root);
         }
-        let trash = trash_into(&bases, id, &path).map_err(|e| io_err("file.delete_failed", &rel, e))?;
+        let worktree = root.display().to_string();
+        let mut slot: Option<Id> = None;
+        let mut attempts = 0;
+        let (id, trash) = loop {
+            ctx.tx().execute(
+                "INSERT INTO file_trash(id, project_id, worktree, original_path, trash_path, created_at) VALUES (?1,?2,?3,?4,'',?5)",
+                params![slot, project_id, worktree, p.path, ctx.now],
+            ).bus()?;
+            let id = ctx.tx().last_insert_rowid();
+            match trash_into(&bases, id, &path) {
+                Ok(trash) => break (id, trash),
+                // `.relay/trash/<id>` is already there: the store's sequence is behind the
+                // directories on disk (a fresh store, a restored backup, a commit that rolled
+                // back after the move). Never move onto it (RA-361); take an id past them all.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempts < 3 => {
+                    attempts += 1;
+                    ctx.tx().execute("DELETE FROM file_trash WHERE id=?1", [id]).bus()?;
+                    slot = Some(highest_trash_slot(&bases).max(id) + 1);
+                }
+                Err(e) => return Err(io_err("file.delete_failed", &rel, e)),
+            }
+        };
         ctx.tx().execute("UPDATE file_trash SET trash_path=?1 WHERE id=?2", params![trash.display().to_string(), id]).bus()?;
         ctx.set_undo("file.restore", json!({"project_id": project_id, "trash_id": id}), None);
         changed(ctx, project_id, &root, &p.path);
         Ok(DeleteOut { trash_id: id })
     });
-    e.register::<Restore>(|ctx: &mut Ctx, p| {
-        let project = get_project(ctx.tx(), p.project_id)?;
-        let own = own_checkout(ctx.tx(), &ctx.actor, ctx.actor_session_id(), project.id)?;
-        let row: Option<(String,String,String)> = ctx.tx().query_row(
-            "SELECT worktree, original_path, trash_path FROM file_trash WHERE id=?1 AND project_id=?2 AND restored_at IS NULL",
-            params![p.trash_id, project.id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
-        ).optional().bus()?;
-        let (root_s, rel_s, trash_s) = row.ok_or_else(|| BusError::not_found("file.trash_not_found", format!("no open trash {}", p.trash_id)))?;
-        let root = PathBuf::from(root_s); confine(own, &root)?;
-        let rel = rel(&rel_s, false)?; let path = safe_join(&root, &rel, true)?;
+    // Staged like delete: the stored worktree is verified (a subprocess) and a directory payload
+    // walked for gated paths before the transaction, which then gates the restored path the way
+    // every other file mutation is gated (RA-362) and moves the payload back.
+    e.register_staged::<Restore, PreparedRestore>(|ctx, p| {
+        let session_id = ctx.actor_session_id();
+        let (project, own, row) = ctx.read(|conn| {
+            let project = get_project(conn, p.project_id)?;
+            let own = own_checkout(conn, &ctx.actor, session_id, project.id)?;
+            Ok((project, own, open_trash(conn, p.trash_id, p.project_id)?))
+        })?;
+        let (root_s, rel_s, trash_s) = row;
+        let root = root_verify(&project, PathBuf::from(root_s), "file.worktree")?;
+        confine(own, &root)?;
+        let rel = rel(&rel_s, false)?;
+        safe_join(&root, &rel, true)?;
+        let inner = covered_inside(ctx, project.id, Path::new(&trash_s), &[&rel])?;
+        Ok(PreparedRestore { project_id: project.id, root, rel, trash: PathBuf::from(trash_s), inner })
+    }, |ctx: &mut Ctx, p, prepared| {
+        let PreparedRestore { project_id, root, rel, trash, inner } = prepared;
+        // Restored by someone else since the read phase, or not the same payload any more.
+        let (_, _, trash_s) = open_trash(ctx.tx(), p.trash_id, project_id)?;
+        if Path::new(&trash_s) != trash {
+            return Err(BusError::conflict("file.restore_conflict", format!("trash {} changed", p.trash_id)));
+        }
+        let path = safe_join(&root, &rel, true)?;
+        guard_path_mutation(ctx, project_id, &root, &rel, Some(&trash))?;
+        for inside in &inner {
+            guard_path_mutation(ctx, project_id, &root, &rel.join(inside), Some(&trash.join(inside)))?;
+        }
         if occupied(&path) { return Err(BusError::conflict("file.restore_conflict", format!("{} already exists", rel.display()))); }
         if let Some(parent) = path.parent() { fs::create_dir_all(parent).map_err(|e| io_err("file.restore_failed", &rel, e))?; }
-        fs::rename(&trash_s, &path).map_err(|e| io_err("file.restore_failed", &rel, e))?;
+        fs::rename(&trash, &path).map_err(|e| io_err("file.restore_failed", &rel, e))?;
         ctx.tx().execute("UPDATE file_trash SET restored_at=?1 WHERE id=?2", params![ctx.now, p.trash_id]).bus()?;
-        changed(ctx, project.id, &root, &rel_s);
+        changed(ctx, project_id, &root, &rel.to_string_lossy());
         entry(&root, &path, &HashMap::new())
     });
     e.register_unlocked::<TrashList>(|ctx, p| {
@@ -290,12 +324,19 @@ pub fn register(e: &mut Engine) {
     // Staged (D149): the checkout is a subprocess, so it runs before the transaction opens;
     // the transaction only announces the change. `--literal-pathspecs`: a path is a name, never
     // a glob, so restoring `[id].tsx` cannot also discard edits to `i.tsx` and `d.tsx` (RA-153).
+    // `HEAD` is the source, so a staged change is put back too rather than surviving in the
+    // index; the path is validated before git runs, and `.` (the whole tree) is refused (RA-364).
     e.register_staged::<RestoreHead, (Id, PathBuf, Entry)>(|ctx, p| {
         let (project, root) = root_mut_unlocked(ctx, p.project_id, p.worktree.as_deref())?;
         let rel = rel(&p.path, false)?;
-        crate::worktree::git_mutate(&root, &["--literal-pathspecs", "checkout", "--", &p.path])
+        let rel: PathBuf = rel.components().filter(|c| !matches!(c, Component::CurDir)).collect();
+        if rel.as_os_str().is_empty() {
+            return Err(BusError::invalid("file.path", "restore_head needs a path inside the worktree, not the worktree itself"));
+        }
+        let path = safe_join(&root, &rel, true)?;
+        let spec = rel.to_string_lossy();
+        crate::worktree::git_mutate(&root, &["--literal-pathspecs", "checkout", "HEAD", "--", &spec])
             .map_err(|e| BusError::conflict("file.restore_head_failed", e.to_string()))?;
-        let path = safe_join(&root, &rel, false)?;
         Ok((project.id, root.clone(), entry(&root, &path, &HashMap::new())?))
     }, |ctx: &mut Ctx, p, (project_id, root, restored)| {
         changed(ctx, project_id, &root, &p.path);
@@ -409,7 +450,7 @@ pub fn register(e: &mut Engine) {
                     continue;
                 }
                 if let Some(glob) = &p.glob {
-                    if !crate::guardrail::path_matches(glob, relp) {
+                    if !search_glob_matches(glob, relp) {
                         continue;
                     }
                 }
@@ -616,14 +657,27 @@ fn confine(own: Option<PathBuf>, root: &Path) -> Result<(), BusError> {
 }
 
 /// Move `path` to `<base>/.relay/trash/<id>/payload` under the first base a rename reaches,
-/// the shape purge's expiry accepts. A base that fails is left as it was found.
+/// the shape purge's expiry accepts. A base that fails is left as it was found. The slot must
+/// be new: an existing `<id>` belongs to an earlier delete the store no longer knows of, and
+/// renaming onto its payload replaced that file or failed for good (RA-361). That case is
+/// reported as `AlreadyExists`, so the caller can take another id.
 fn trash_into(bases: &[&Path], id: Id, path: &Path) -> std::io::Result<PathBuf> {
     let mut failed = None;
+    let mut taken = None;
     for base in bases {
-        let dir = base.join(".relay").join("trash").join(id.to_string());
+        let trash = base.join(".relay").join("trash");
+        let dir = trash.join(id.to_string());
+        let created = fs::create_dir_all(&trash).and_then(|_| fs::create_dir(&dir));
+        if let Err(e) = created {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                taken = Some(e);
+            } else {
+                failed = Some(e);
+            }
+            continue;
+        }
         let payload = dir.join("payload");
-        let moved = fs::create_dir_all(&dir).and_then(|_| fs::rename(path, &payload));
-        match moved {
+        match fs::rename(path, &payload) {
             Ok(()) => return Ok(payload),
             Err(e) => {
                 let _ = fs::remove_dir(&dir);
@@ -631,7 +685,18 @@ fn trash_into(bases: &[&Path], id: Id, path: &Path) -> std::io::Result<PathBuf> 
             }
         }
     }
-    Err(failed.unwrap_or_else(|| std::io::Error::other("no trash directory")))
+    Err(taken.or(failed).unwrap_or_else(|| std::io::Error::other("no trash directory")))
+}
+
+/// The highest `<id>` directory under any base's `.relay/trash`, or 0.
+fn highest_trash_slot(bases: &[&Path]) -> Id {
+    bases
+        .iter()
+        .filter_map(|base| fs::read_dir(base.join(".relay").join("trash")).ok())
+        .flat_map(|entries| entries.flatten())
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<Id>().ok())
+        .max()
+        .unwrap_or(0)
 }
 
 /// Whether anything — a dangling symlink included — already sits at `path`. `Path::exists`
@@ -703,9 +768,11 @@ fn list_dir(
     }
     let mut out = Vec::with_capacity(found.len());
     for (_, _, path) in found {
-        let mut item = entry(root, &path, badges)?;
+        // An entry removed since `read_dir` (an agent's temp file) is skipped, and a folder that
+        // cannot be read is listed without children; either used to fail the whole tree (RA-368).
+        let Ok(mut item) = entry(root, &path, badges) else { continue };
         if item.kind == EntryKind::Dir && depth > 1 {
-            item.children = Some(list_dir(root, &path, depth - 1, badges, limit, truncated)?);
+            item.children = list_dir(root, &path, depth - 1, badges, limit, truncated).ok();
         }
         out.push(item);
     }
@@ -875,6 +942,27 @@ fn relocate(ctx: &mut Ctx, prepared: PreparedPath, code: &str) -> Result<Entry, 
     entry(&root, &into, &HashMap::new())
 }
 
+/// What a staged `file.restore` settled before its transaction.
+struct PreparedRestore {
+    project_id: Id,
+    /// The stored worktree, verified as one of the project's and canonical.
+    root: PathBuf,
+    rel: PathBuf,
+    trash: PathBuf,
+    /// Paths inside a directory payload that a gate covers, relative to it.
+    inner: Vec<PathBuf>,
+}
+
+/// The worktree, original path and payload of trash row `id`, if it is still unrestored.
+fn open_trash(conn: &Connection, id: Id, project_id: Id) -> Result<(String, String, String), BusError> {
+    conn.prepare_cached(
+        "SELECT worktree, original_path, trash_path FROM file_trash WHERE id=?1 AND project_id=?2 AND restored_at IS NULL",
+    ).bus()?
+    .query_row(params![id, project_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+    .optional().bus()?
+    .ok_or_else(|| BusError::not_found("file.trash_not_found", format!("no open trash {id}")))
+}
+
 /// One source of a staged `file.import`, already copied into the staging directory.
 struct StagedImport {
     staged: PathBuf,
@@ -935,6 +1023,15 @@ fn copy(from: &Path, to: &Path) -> std::io::Result<()> {
         fs::copy(from, to)?;
     }
     Ok(())
+}
+
+/// `file.search`'s `glob` against a worktree-relative file path. The guardrail matcher keeps
+/// `*` inside one segment, so `*.rs` found only root-level files; as in ripgrep, a glob with
+/// no `/` also names files anywhere by their file name (RA-367).
+fn search_glob_matches(glob: &str, relp: &Path) -> bool {
+    crate::guardrail::path_matches(glob, relp)
+        || (!glob.contains('/')
+            && relp.file_name().is_some_and(|name| crate::guardrail::path_matches(glob, Path::new(name))))
 }
 
 /// Files larger than this are not searched: at that size they are assets or generated output,
@@ -1011,6 +1108,28 @@ fn hit_window(line: &str, at: usize) -> (&str, usize) {
     (&line[start..end], start)
 }
 
+/// `file.read`'s bytes as text, or as base64 when they are not text. A read cut at `max_bytes`
+/// can end inside a multi-byte character; that incomplete tail is dropped rather than taken as
+/// evidence of binary, which turned a large non-ASCII text file into base64 (RA-359).
+fn decode(bytes: Vec<u8>, truncated: bool) -> (Option<String>, Option<String>) {
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => Ok(text),
+        Err(e) if truncated && e.utf8_error().error_len().is_none() => {
+            let valid = e.utf8_error().valid_up_to();
+            let mut bytes = e.into_bytes();
+            bytes.truncate(valid);
+            String::from_utf8(bytes).map_err(|e| e.into_bytes())
+        }
+        Err(e) => Err(e.into_bytes()),
+    };
+    let b64 = |bytes: &[u8]| Some(base64::engine::general_purpose::STANDARD.encode(bytes));
+    match text {
+        Ok(text) if !text.contains('\0') => (Some(text), None),
+        Ok(text) => (None, b64(text.as_bytes())),
+        Err(bytes) => (None, b64(&bytes)),
+    }
+}
+
 fn mime(path: &Path) -> String {
     match path
         .extension()
@@ -1031,8 +1150,16 @@ fn mime(path: &Path) -> String {
     .to_string()
 }
 
+/// A filesystem error as a bus error whose kind says whose problem it is (RA-369): a missing
+/// path is the caller's `not_found` and an occupied one a `conflict`, not an outage. Permission
+/// errors stay `unavailable`; `refused` is the guardrail's kind and is audited as one.
 fn io_err(code: &str, path: impl AsRef<Path>, e: std::io::Error) -> BusError {
-    BusError::unavailable(code, format!("{}: {e}", path.as_ref().display()))
+    let message = format!("{}: {e}", path.as_ref().display());
+    match e.kind() {
+        std::io::ErrorKind::NotFound => BusError::not_found(code, message),
+        std::io::ErrorKind::AlreadyExists => BusError::conflict(code, message),
+        _ => BusError::unavailable(code, message),
+    }
 }
 
 #[cfg(test)]
@@ -1067,5 +1194,49 @@ mod tests {
         assert_eq!(hit_window(&line, 0).1, 0);
         let (tail, offset) = hit_window(&line, line.len() - 1);
         assert_eq!(offset + tail.len(), line.len());
+    }
+
+    /// RA-359: a read cut inside a multi-byte character is still text, minus the partial
+    /// character; invalid UTF-8 elsewhere, or untruncated, is still binary.
+    #[test]
+    fn a_truncated_read_that_splits_a_character_stays_text() {
+        let mut cut = "héllo é".as_bytes().to_vec();
+        cut.pop();
+        assert_eq!(decode(cut.clone(), true), (Some("héllo ".to_string()), None));
+        assert_eq!(decode(cut, false).0, None);
+        assert_eq!(decode(vec![b'a', 0xff, b'b'], true).0, None);
+        assert_eq!(decode(b"a\0b".to_vec(), false).0, None);
+        assert_eq!(decode(b"plain".to_vec(), false), (Some("plain".to_string()), None));
+    }
+
+    /// RA-367: a glob with no `/` names files at any depth by their file name; one with a `/`
+    /// is matched against the whole path, as before.
+    #[test]
+    fn a_search_glob_without_a_slash_matches_by_file_name() {
+        assert!(search_glob_matches("*.rs", Path::new("main.rs")));
+        assert!(search_glob_matches("*.rs", Path::new("crates/core/src/lib.rs")));
+        assert!(!search_glob_matches("*.rs", Path::new("crates/core/src/lib.ts")));
+        assert!(search_glob_matches("src/**", Path::new("src/a/b.rs")));
+        assert!(!search_glob_matches("src/*.rs", Path::new("lib/src/a.rs")));
+        assert!(search_glob_matches("src", Path::new("src/a.rs")), "the prefix rule still holds");
+    }
+
+    /// RA-361: an existing `.relay/trash/<id>` is never moved onto; the move reports the slot as
+    /// taken and leaves both files where they were.
+    #[test]
+    fn a_taken_trash_slot_is_refused_not_overwritten() {
+        let base = tempfile::tempdir().unwrap();
+        let stale = base.path().join(".relay/trash/1");
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join("payload"), "older").unwrap();
+        let doomed = base.path().join("doomed.txt");
+        fs::write(&doomed, "newer").unwrap();
+        let error = trash_into(&[base.path()], 1, &doomed).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(stale.join("payload")).unwrap(), "older");
+        assert!(doomed.exists());
+        assert_eq!(highest_trash_slot(&[base.path()]), 1);
+        let payload = trash_into(&[base.path()], 2, &doomed).unwrap();
+        assert_eq!(fs::read_to_string(payload).unwrap(), "newer");
     }
 }

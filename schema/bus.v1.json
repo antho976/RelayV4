@@ -3058,7 +3058,6 @@
       "audit": "never",
       "undo": "none",
       "scope": "project",
-      "executor": "core",
       "actors": "user_only",
       "doors": "all",
       "emits": [],
@@ -3072,7 +3071,7 @@
       }
     },
     "file.restore_head": {
-      "summary": "git checkout -- <path>: put a tracked file back as HEAD has it",
+      "summary": "git checkout HEAD -- <path>: put a tracked file back as HEAD has it, in the index and the worktree",
       "kind": "mutation",
       "audit": "always",
       "undo": "none",
@@ -12572,7 +12571,8 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "description": "A glob without `/` (`*.rs`) matches the file name at any depth; one with `/`, or a\nleading `/` to anchor it, matches the whole worktree-relative path."
         },
         "regex": {
           "type": [
