@@ -830,7 +830,8 @@ The *why* behind anything surprising. Append; never rewrite history. Reference a
   Converted: `worktree.list`, `worktree.disk`, `git.status`, `git.diff`, `git.diff.file`,
   `git.log`, `git.show`, `git.branches`, `git.pr.list`, `git.suggest_message`, `file.tree`,
   `file.read`, `file.search`, `device.list`, `avd.list`, `avd.catalog`, `provider.list`,
-  `usage.get`, `github.status`, `github.repo.list` (unlocked); `git.commit`, `git.fetch`,
+  `usage.get`, `github.status`, `github.repo.list`, and later `audit.list` / `audit.get`, which
+  copy the rows out as text under the lock and parse the stored JSON after it (unlocked); `git.commit`, `git.fetch`,
   `git.push`, `worktree.create`, `skill.install` (staged). Because each door dispatches from
   `spawn_blocking`, those queries now genuinely run in parallel rather than merely appearing to.
   (That first held only across connections: the socket door read one connection's next request

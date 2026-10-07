@@ -164,36 +164,72 @@ fn parse_actor(s: &str) -> Actor {
     Actor::parse(s).unwrap_or(Actor::System)
 }
 
-fn row_to_audit(r: &Row) -> rusqlite::Result<AuditRow> {
-    let kind = match r.get::<_, String>("kind")?.as_str() {
-        "ok" => AuditKind::Ok,
-        "held" => AuditKind::Held,
-        "refused" => AuditKind::Refused,
-        _ => AuditKind::Error,
-    };
-    let payload: Option<String> = r.get("payload")?;
-    let summary: Option<String> = r.get("result_summary")?;
-    let undo: Option<String> = r.get("undo_op")?;
-    Ok(AuditRow {
-        id: r.get("id")?,
-        ts: r.get("ts")?,
-        req_id: r.get("req_id")?,
-        parent_req: r.get("parent_req")?,
-        actor: parse_actor(&r.get::<_, String>("actor")?),
-        on_behalf_of: r.get::<_, Option<String>>("on_behalf_of")?.map(|s| parse_actor(&s)),
-        session_id: r.get("session_id")?,
-        op: r.get("op")?,
-        project_id: r.get("project_id")?,
-        kind,
-        code: r.get("code")?,
-        hold_id: r.get("hold_id")?,
-        payload_hash: r.get("payload_hash")?,
-        payload: payload.and_then(|s| serde_json::from_str(&s).ok()),
-        result_summary: summary.and_then(|s| serde_json::from_str(&s).ok()),
-        undo_op: undo.and_then(|s| serde_json::from_str(&s).ok()),
-        undo_of: r.get("undo_of")?,
-        undone_by: r.get("undone_by")?,
+/// An audit row as stored: every column copied out, the JSON ones still text. Reading this is
+/// the only part of `audit.list`/`audit.get` that holds the store; [`RawAudit::parse`] — up to
+/// 1000 rows of 64 KB payload and result each — runs after the lock is released.
+pub struct RawAudit {
+    id: Id,
+    ts: String,
+    req_id: String,
+    parent_req: Option<String>,
+    actor: String,
+    on_behalf_of: Option<String>,
+    session_id: Option<Id>,
+    op: String,
+    project_id: Option<Id>,
+    kind: String,
+    code: Option<String>,
+    hold_id: Option<Id>,
+    payload_hash: String,
+    payload: Option<String>,
+    result_summary: Option<String>,
+    undo_op: Option<String>,
+    undo_of: Option<Id>,
+    undone_by: Option<Id>,
+}
+
+const COLUMNS: &str = "id, ts, req_id, parent_req, actor, on_behalf_of, session_id, op, project_id, kind, code, hold_id,
+                       payload_hash, payload, result_summary, undo_op, undo_of, undone_by";
+
+fn raw_row(r: &Row) -> rusqlite::Result<RawAudit> {
+    Ok(RawAudit {
+        id: r.get(0)?, ts: r.get(1)?, req_id: r.get(2)?, parent_req: r.get(3)?, actor: r.get(4)?,
+        on_behalf_of: r.get(5)?, session_id: r.get(6)?, op: r.get(7)?, project_id: r.get(8)?,
+        kind: r.get(9)?, code: r.get(10)?, hold_id: r.get(11)?, payload_hash: r.get(12)?,
+        payload: r.get(13)?, result_summary: r.get(14)?, undo_op: r.get(15)?, undo_of: r.get(16)?,
+        undone_by: r.get(17)?,
     })
+}
+
+impl RawAudit {
+    pub fn parse(self) -> AuditRow {
+        let kind = match self.kind.as_str() {
+            "ok" => AuditKind::Ok,
+            "held" => AuditKind::Held,
+            "refused" => AuditKind::Refused,
+            _ => AuditKind::Error,
+        };
+        AuditRow {
+            id: self.id,
+            ts: self.ts,
+            req_id: self.req_id,
+            parent_req: self.parent_req,
+            actor: parse_actor(&self.actor),
+            on_behalf_of: self.on_behalf_of.map(|s| parse_actor(&s)),
+            session_id: self.session_id,
+            op: self.op,
+            project_id: self.project_id,
+            kind,
+            code: self.code,
+            hold_id: self.hold_id,
+            payload_hash: self.payload_hash,
+            payload: self.payload.and_then(|s| serde_json::from_str(&s).ok()),
+            result_summary: self.result_summary.and_then(|s| serde_json::from_str(&s).ok()),
+            undo_op: self.undo_op.and_then(|s| serde_json::from_str(&s).ok()),
+            undo_of: self.undo_of,
+            undone_by: self.undone_by,
+        }
+    }
 }
 
 pub struct ListFilter<'a> {
@@ -207,8 +243,9 @@ pub struct ListFilter<'a> {
     pub limit: u32,
 }
 
-pub fn list(conn: &Connection, f: &ListFilter) -> Result<Vec<AuditRow>> {
-    let mut sql = String::from("SELECT * FROM audit WHERE 1=1");
+/// The rows `f` selects, unparsed: run under the lock, then [`RawAudit::parse`] each outside it.
+pub fn list_raw(conn: &Connection, f: &ListFilter) -> Result<Vec<RawAudit>> {
+    let mut sql = format!("SELECT {COLUMNS} FROM audit WHERE 1=1");
     let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     if let Some(p) = f.project_id { sql.push_str(" AND project_id = ?"); args.push(Box::new(p)); }
     if let Some(a) = f.actor { sql.push_str(" AND actor = ?"); args.push(Box::new(a.to_string())); }
@@ -219,11 +256,16 @@ pub fn list(conn: &Connection, f: &ListFilter) -> Result<Vec<AuditRow>> {
     if let Some(u) = f.until { sql.push_str(" AND ts <= ?"); args.push(Box::new(u.to_string())); }
     sql.push_str(" ORDER BY id DESC LIMIT ?");
     args.push(Box::new(f.limit.min(1000)));
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(args.iter().map(|b| b.as_ref())), row_to_audit)?;
+    // Keyed by SQL text, so each combination of filters compiles once.
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(args.iter().map(|b| b.as_ref())), raw_row)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+pub fn get_raw(conn: &Connection, id: Id) -> Result<Option<RawAudit>> {
+    Ok(conn.prepare_cached(&format!("SELECT {COLUMNS} FROM audit WHERE id = ?1"))?.query_row([id], raw_row).optional()?)
+}
+
 pub fn get(conn: &Connection, id: Id) -> Result<Option<AuditRow>> {
-    Ok(conn.query_row("SELECT * FROM audit WHERE id = ?1", [id], row_to_audit).optional()?)
+    Ok(get_raw(conn, id)?.map(RawAudit::parse))
 }

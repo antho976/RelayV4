@@ -687,6 +687,47 @@ fn a_bad_guardrails_key_is_refused_on_write_and_ignored_when_already_stored() {
     assert_eq!(ok(engine, Actor::User, "guardrail.config.get", json!({}))["caps"]["files"], 12);
 }
 
+/// RA-318 / RA-319: a scalar where a layer belongs, and a write root that is not absolute, are
+/// refused on write; a scalar layer already stored fails the read closed instead of panicking.
+#[test]
+fn a_scalar_layer_or_relative_write_root_is_refused_and_never_panics() {
+    let fixture = Fixture::new();
+    let engine = &fixture.engine;
+    for path in ["guardrails.projects.1", "guardrails.workspaces.1"] {
+        let refused = call(engine, Actor::User, "settings.set", json!({"path": path, "value": false}));
+        assert_eq!(error(&refused).code, "guardrail.config", "{path}");
+    }
+    for root in ["~/scratch", "build/out"] {
+        let refused = call(engine, Actor::User, "guardrail.config.set", json!({"patch": {"allowed_write_roots": [root]}}));
+        assert_eq!(error(&refused).code, "guardrail.config", "{root}");
+    }
+    ok(engine, Actor::User, "guardrail.config.set", json!({"patch": {"allowed_write_roots": ["/srv/scratch"]}}));
+
+    engine.store.lock()
+        .execute("INSERT INTO settings(path, value, updated_at) VALUES ('guardrails.projects.1', 'false', '2026-01-01T00:00:00Z')", [])
+        .unwrap();
+    let read = call(engine, Actor::User, "guardrail.config.get", json!({"project_id": 1}));
+    assert_eq!(error(&read).code, "guardrail.config", "a scalar layer fails the read, closed");
+    ok(engine, Actor::User, "guardrail.config.get", json!({}));
+    ok(engine, Actor::User, "settings.reset", json!({"path": "guardrails.projects.1"}));
+    ok(engine, Actor::User, "guardrail.config.get", json!({"project_id": 1}));
+}
+
+/// RA-337: an agent's hold and request listings stop at its own project; the user's do not.
+#[test]
+fn an_agent_lists_only_its_own_projects_holds_and_requests() {
+    let fixture = Fixture::new();
+    let engine = &fixture.engine;
+    let session = fixture.session("builder", "claude");
+    let agent = Actor::agent(session["name"].as_str().unwrap());
+    for op in ["guardrail.holds.list", "guardrail.requests.list"] {
+        ok(engine, agent.clone(), op, json!({}));
+        ok(engine, agent.clone(), op, json!({"project_id": 1}));
+        assert_eq!(error(&call(engine, agent.clone(), op, json!({"project_id": 2}))).code, "actor.scope", "{op}");
+        ok(engine, Actor::User, op, json!({"project_id": 2}));
+    }
+}
+
 #[test]
 fn an_agent_can_ask_but_only_the_user_answers_and_once_means_once() {
     let fixture = Fixture::new();

@@ -27,10 +27,25 @@ fn scope_of(conn: &Connection, workspace_id: Option<Id>, project_id: Option<Id>)
     }
 }
 
-fn delete_settings_under(conn: &Connection, path: &str) -> Result<(), BusError> {
-    let like = format!("{}.%", path.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
-    conn.execute("DELETE FROM settings WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'", params![path, like]).bus()?;
-    Ok(())
+/// The project a hold or request listing may show. The user sees every project, or the one
+/// asked for; an agent sees its own session's project only, as its event stream does (RA-337).
+/// That keeps the listings consistent with the rest of an agent's view, not secret: the agent
+/// can still read the store file.
+fn listing_project(ctx: &Ctx, asked: Option<Id>) -> Result<Option<Id>, BusError> {
+    let Some(session_id) = ctx.actor_session_id() else {
+        if ctx.actor.is_agent() {
+            return Err(BusError::actor("agent actor is not bound to a live session"));
+        }
+        return Ok(asked);
+    };
+    let own = sessions::by_id(ctx.tx(), session_id)?
+        .ok_or_else(|| BusError::actor("bound session no longer exists"))?
+        .session
+        .project_id;
+    match asked {
+        Some(project_id) if project_id != own => Err(BusError::not_own("project")),
+        _ => Ok(Some(own)),
+    }
 }
 
 pub fn register(engine: &mut Engine) {
@@ -70,10 +85,13 @@ pub fn register(engine: &mut Engine) {
             ConfigScope::Project(id) => Some(format!("guardrails.projects.{id}")),
         };
         match &layer_path {
+            // `settings::set` replaces the subtree it writes; a layer or key cleared to nothing
+            // has no write, so its old rows are deleted instead.
             Some(path) => {
-                delete_settings_under(ctx.tx(), path)?;
                 if merged.as_object().is_some_and(|map| !map.is_empty()) {
                     crate::handlers::settings::set(ctx.tx(), path, &merged, &now)?;
+                } else {
+                    crate::handlers::settings::delete_under(ctx.tx(), path)?;
                 }
             }
             None => {
@@ -87,9 +105,9 @@ pub fn register(engine: &mut Engine) {
                     .collect();
                 for key in keys {
                     let path = format!("guardrails.{key}");
-                    delete_settings_under(ctx.tx(), &path)?;
-                    if let Some(value) = merged.get(&key) {
-                        crate::handlers::settings::set(ctx.tx(), &path, value, &now)?;
+                    match merged.get(&key) {
+                        Some(value) => crate::handlers::settings::set(ctx.tx(), &path, value, &now)?,
+                        None => crate::handlers::settings::delete_under(ctx.tx(), &path)?,
                     }
                 }
             }
@@ -316,7 +334,7 @@ pub fn register(engine: &mut Engine) {
     engine.register::<HoldsList>(|ctx, payload| {
         let mut sql = String::from("SELECT * FROM holds WHERE 1=1");
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        if let Some(project_id) = payload.project_id {
+        if let Some(project_id) = listing_project(ctx, payload.project_id)? {
             sql.push_str(" AND project_id = ?");
             args.push(Box::new(project_id));
         }
@@ -391,7 +409,7 @@ pub fn register(engine: &mut Engine) {
         let live = "EXISTS(SELECT 1 FROM sessions s WHERE s.id = holds.session_id AND s.state != 'closed')";
         let mut sql = format!("SELECT holds.*, {live} AS live FROM holds WHERE op = 'guardrail.request'");
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        if let Some(project_id) = payload.project_id {
+        if let Some(project_id) = listing_project(ctx, payload.project_id)? {
             sql.push_str(" AND project_id = ?");
             args.push(Box::new(project_id));
         }

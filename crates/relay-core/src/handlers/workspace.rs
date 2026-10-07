@@ -66,9 +66,11 @@ fn canon_workspace(path: &str) -> Result<PathBuf, BusError> {
     std::fs::canonicalize(p).map_err(|e| BusError::invalid("workspace.path", format!("{path:?}: {e}")))
 }
 
-/// A desktop app may inherit a deep build directory as its process CWD. When that directory
-/// lives inside a Git checkout, use the checkout's parent so discovery presents the repository
-/// itself as a project instead of cloning another copy into its source tree.
+/// The default for a blank workspace path: the *engine's* working directory, or the parent of
+/// the Git checkout it lies in, so discovery presents that repository as a project instead of
+/// cloning another copy into its source tree. The engine cannot see its caller's directory, and
+/// `relay serve` runs from the engine home, so a client that means "here" sends its own path —
+/// the desktop onboarding prefills it (BUS.md §10.4).
 fn suggested_workspace() -> Result<PathBuf, BusError> {
     let cwd = std::env::current_dir()
         .map_err(|error| BusError::unavailable("workspace.cwd", error.to_string()))?;
@@ -179,8 +181,7 @@ pub fn register(e: &mut Engine) {
         }
         // The workspace's own guardrail layer goes with it, or the next workspace given this
         // id would inherit it.
-        ctx.tx().execute("DELETE FROM settings WHERE path=?1 OR path LIKE ?2",
-            params![format!("guardrails.workspaces.{}", p.workspace_id), format!("guardrails.workspaces.{}.%", p.workspace_id)]).bus()?;
+        crate::handlers::settings::delete_under(ctx.tx(), &format!("guardrails.workspaces.{}", p.workspace_id))?;
         ctx.tx().execute("DELETE FROM workspaces WHERE id = ?1", [p.workspace_id]).bus()?;
         ctx.emit("workspace.deleted", json!({ "id": p.workspace_id, "backup": backup }));
         Ok(WsRemoveOut { projects_removed: n as i64, sessions_closed })
@@ -528,8 +529,10 @@ fn remove_project(ctx: &mut Ctx, project_id: Id, force: bool, remove_worktrees: 
     ] {
         ctx.tx().execute(sql, [pr.id]).bus()?;
     }
-    ctx.tx().execute("DELETE FROM settings WHERE path=?1 OR path=?2 OR path LIKE ?3",
-        params![format!("layout.current.{}", pr.id), format!("guardrails.projects.{}", pr.id), format!("guardrails.projects.{}.%", pr.id)]).bus()?;
+    // Its saved layout (every leaf of it, not only the row at its root) and its guardrail layer.
+    for path in [format!("layout.current.{}", pr.id), format!("guardrails.projects.{}", pr.id)] {
+        crate::handlers::settings::delete_under(ctx.tx(), &path)?;
+    }
     // A hold no session owns (the user's) would otherwise wait on a project that is gone.
     ctx.tx().execute("UPDATE holds SET state='expired', resolved_at=?1, resolved_by='system' WHERE project_id=?2 AND state='open'",
         params![ctx.now, pr.id]).bus()?;
@@ -569,11 +572,20 @@ fn discover_repositories(root: &Path) -> Result<Vec<relay_bus::types::LocalRepo>
             return Ok(());
         }
         if depth >= 4 { return Ok(()); }
-        for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() || entry.file_type()?.is_symlink() { continue; }
+        // Below the root an unreadable directory (root-owned, a vanished mount) is skipped: one
+        // of them four levels down used to fail the whole discovery.
+        let entries = match fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(_) if depth > 0 => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        for entry in entries {
+            let Ok(entry) = entry else { continue };
+            let Ok(kind) = entry.file_type() else { continue };
+            if !kind.is_dir() || kind.is_symlink() { continue; }
             let name = entry.file_name();
-            if matches!(name.to_str(), Some(".git" | ".relay" | "node_modules" | "target" | "build" | ".gradle")) { continue; }
+            // Build output and caches hold no repository worth offering (RA-638).
+            if name.to_str().is_some_and(|name| name == ".git" || crate::watch::generated_name(name)) { continue; }
             if name.to_str().is_some_and(|name| name.starts_with(CLONE_SCRATCH)) { continue; }
             walk(&entry.path(), depth + 1, out)?;
         }
@@ -623,5 +635,20 @@ mod tests {
         let directory = root.path().join("projects");
         fs::create_dir_all(&directory).unwrap();
         assert_eq!(suggested_workspace_from(&directory), directory);
+    }
+
+    /// RA-649: one unreadable directory below the root no longer fails the whole discovery.
+    #[test]
+    fn discovery_skips_a_directory_it_cannot_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("a/repo/.git")).unwrap();
+        let locked = root.path().join("locked");
+        fs::create_dir_all(locked.join("inner")).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let found = discover_repositories(root.path());
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        let names: Vec<String> = found.unwrap().into_iter().map(|repo| repo.name).collect();
+        assert_eq!(names, ["repo"]);
     }
 }

@@ -5,7 +5,7 @@ use crate::guardrail::{self, ConfigScope};
 use relay_bus::error::BusError;
 use relay_bus::ops::notify::{SettingsGet, SettingsReset, SettingsSet, ValueOut};
 use relay_bus::types::{GuardrailConfig, Id};
-use rusqlite::{params, Transaction};
+use rusqlite::{params, Connection, Transaction};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeSet;
 use std::sync::Mutex;
@@ -160,18 +160,18 @@ fn subtree(tx: &Transaction, path: &str) -> Result<Value, BusError> {
         .match_indices('.')
         .map(|(i, _)| path[..i].to_string())
         .collect();
-    let like = format!("{}.%", path.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
+    // The subtree as a case-sensitive range, as [`delete_under`] deletes it.
     let mut stmt = tx
         .prepare_cached(
             "SELECT path, value FROM settings
-             WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'
-                OR path IN (SELECT value FROM json_each(?3))
+             WHERE path = ?1 OR (path > ?1 || '.' AND path < ?1 || '/')
+                OR path IN (SELECT value FROM json_each(?2))
              ORDER BY path",
         )
         .bus()?;
     let rows = stmt
         .query_map(
-            params![path, like, serde_json::to_string(&ancestors).bus()?],
+            params![path, serde_json::to_string(&ancestors).bus()?],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
         )
         .bus()?;
@@ -194,13 +194,20 @@ pub fn get(tx: &Transaction, path: Option<&str>) -> Result<Value, BusError> {
     }
 }
 
-fn delete_under(tx: &Transaction, path: &str) -> Result<(), BusError> {
+/// Delete the row at `path` and every leaf under it — the one subtree delete, for settings,
+/// guardrail layers and the rows a removed project or workspace leaves. A range, not `LIKE`:
+/// `LIKE` is ASCII case-insensitive, so `theme.dark` also took `theme.Dark.*` (RA-647). `.`
+/// sorts just below `/`, so everything strictly between `path.` and `path/` is the subtree,
+/// and the primary-key index serves it.
+pub(crate) fn delete_under(conn: &Connection, path: &str) -> Result<(), BusError> {
     if path.is_empty() {
-        tx.execute("DELETE FROM settings", []).bus()?;
+        conn.execute("DELETE FROM settings", []).bus()?;
         return Ok(());
     }
-    tx.execute("DELETE FROM settings WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'",
-        params![path, format!("{}.%", path.replace('%', "\\%").replace('_', "\\_"))]).bus()?;
+    conn.prepare_cached("DELETE FROM settings WHERE path = ?1 OR (path > ?1 || '.' AND path < ?1 || '/')")
+        .bus()?
+        .execute([path])
+        .bus()?;
     Ok(())
 }
 
@@ -227,6 +234,11 @@ fn guardrail_layers(path: &str, value: &Value) -> Result<Vec<(String, Option<Con
             None | Some(Value::Null) => {}
             Some(Value::Object(by_id)) => {
                 for (id, layer) in by_id {
+                    // A layer holds overrides; a scalar in its place would replace the whole
+                    // tree and fail every guardrail read for that scope (RA-318).
+                    if !(layer.is_object() || layer.is_null()) {
+                        return Err(BusError::invalid("guardrail.config", format!("guardrails.{kind}.{id} must be an object of overrides, not {layer}")));
+                    }
                     layers.push((format!("guardrails.{kind}.{id}"), id.parse().ok().map(scope), layer));
                 }
             }
@@ -322,6 +334,24 @@ pub fn register(e: &mut Engine) {
 
 #[cfg(test)]
 mod tests {
+    /// RA-647: a subtree delete and read take exactly the subtree, case-sensitively — not a
+    /// sibling spelled in another case, not a sibling that merely shares the prefix.
+    #[test]
+    fn subtree_delete_and_read_match_the_prefix_exactly() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE settings (path TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)").unwrap();
+        let tx = conn.transaction().unwrap();
+        for path in ["theme.dark", "theme.dark.bg", "theme.dark.fg.a", "theme.Dark.bg", "theme.dark_x.bg", "theme.darker", "theme.dark-x"] {
+            tx.execute("INSERT INTO settings VALUES (?1, '1', 'now')", [path]).unwrap();
+        }
+        let read = super::subtree(&tx, "theme.dark").unwrap();
+        assert_eq!(read, serde_json::json!({"bg": 1, "fg": {"a": 1}}));
+        super::delete_under(&tx, "theme.dark").unwrap();
+        let left: Vec<String> = tx.prepare("SELECT path FROM settings ORDER BY path").unwrap()
+            .query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(left, ["theme.Dark.bg", "theme.dark-x", "theme.dark_x.bg", "theme.darker"]);
+    }
+
     /// A default is a promise that something reads the key (RA-253).
     #[test]
     fn defaults_carry_no_setting_that_nothing_reads() {
