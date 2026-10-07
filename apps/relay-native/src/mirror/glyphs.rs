@@ -51,6 +51,9 @@ pub fn image(name: &str, size: i32) -> gtk::Image {
 /// An icon key with a tooltip and an accessible name — every mirror control has both.
 pub fn key(name: &str, caption: &str) -> gtk::Button {
     let button = gtk::Button::new();
+    // A click leaves focus on the phone: a focused key would take the next Space or Enter
+    // typed for the device and press itself again. Tab still reaches it.
+    button.set_focus_on_click(false);
     button.set_child(Some(&image(name, 16)));
     button.add_css_class("quiet");
     button.add_css_class("icon-key");

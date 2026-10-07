@@ -3,8 +3,10 @@ use base64::Engine;
 use gtk4 as gtk;
 use serde_json::json;
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::Duration;
 use tokio::runtime::Handle;
 use vte4::prelude::*;
 
@@ -38,6 +40,109 @@ impl Sequence {
     }
 }
 
+/// The private modes a full-screen program sets once at start-up and a terminal fed only the
+/// catch-up tail never sees: cursor keys, cursor visibility, the alternate screen, mouse
+/// reporting, focus events and bracketed paste.
+const TRACKED_MODES: [u16; 13] = [1, 25, 47, 1047, 1049, 1000, 1002, 1003, 1004, 1005, 1006, 1015, 2004];
+/// Cursor visible (mode 25) is the only one a fresh terminal starts with.
+const DEFAULT_MODES: u16 = 1 << 1;
+
+thread_local! {
+    /// The modes each session's stream last left on, by name and epoch, so a pane built again
+    /// for the same PTY (project switch, reconnect) restores what its catch-up tail no longer
+    /// carries. A GUI restart starts empty: only the engine could know those (RA-242).
+    static MODES: RefCell<HashMap<String, (u64, Modes)>> = RefCell::default();
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Modes(u16);
+impl Default for Modes {
+    fn default() -> Self {
+        Self(DEFAULT_MODES)
+    }
+}
+impl Modes {
+    fn set(&mut self, mode: u16, on: bool) {
+        if let Some(i) = TRACKED_MODES.iter().position(|m| *m == mode) {
+            if on { self.0 |= 1 << i } else { self.0 &= !(1 << i) }
+        }
+    }
+    /// The DECSET/DECRST sequences that take a fresh terminal to these modes.
+    pub fn prelude(self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (i, mode) in TRACKED_MODES.iter().enumerate() {
+            let on = self.0 & (1 << i) != 0;
+            if on != (DEFAULT_MODES & (1 << i) != 0) {
+                out.extend_from_slice(format!("\x1b[?{mode}{}", if on { 'h' } else { 'l' }).as_bytes());
+            }
+        }
+        out
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+enum Scan {
+    #[default]
+    Ground,
+    Escape,
+    CsiStart,
+    Private,
+    Other,
+}
+
+/// Follows DECSET/DECRST in PTY output, across frame boundaries.
+#[derive(Debug, Default)]
+pub struct ModeTracker {
+    pub modes: Modes,
+    state: Scan,
+    params: Vec<u8>,
+}
+impl ModeTracker {
+    /// Scan `data`; true when it changed a tracked mode.
+    pub fn scan(&mut self, data: &[u8]) -> bool {
+        let before = self.modes;
+        let mut rest = data;
+        while !rest.is_empty() {
+            if self.state == Scan::Ground {
+                let Some(at) = rest.iter().position(|b| *b == 0x1b) else { break };
+                rest = &rest[at..];
+            }
+            let byte = rest[0];
+            rest = &rest[1..];
+            self.state = match (self.state, byte) {
+                (_, 0x1b) => Scan::Escape,
+                (_, 0x18 | 0x1a) => Scan::Ground,
+                (Scan::Escape, b'[') => {
+                    self.params.clear();
+                    Scan::CsiStart
+                }
+                // RIS: a full reset puts every mode back.
+                (Scan::Escape, b'c') => {
+                    self.modes = Modes::default();
+                    Scan::Ground
+                }
+                (Scan::Ground | Scan::Escape, _) => Scan::Ground,
+                (Scan::CsiStart, b'?') => Scan::Private,
+                (Scan::Private, b'0'..=b'9' | b';') if self.params.len() < 64 => {
+                    self.params.push(byte);
+                    Scan::Private
+                }
+                (Scan::Private, b'h' | b'l') => {
+                    for param in self.params.split(|b| *b == b';') {
+                        if let Some(mode) = std::str::from_utf8(param).ok().and_then(|s| s.parse().ok()) {
+                            self.modes.set(mode, byte == b'h');
+                        }
+                    }
+                    Scan::Ground
+                }
+                (_, 0x40..=0x7e) => Scan::Ground,
+                _ => Scan::Other,
+            };
+        }
+        self.modes != before
+    }
+}
+
 pub struct Pane {
     pub root: gtk::Box,
     pub terminal: vte4::Terminal,
@@ -65,6 +170,7 @@ pub struct Pane {
     stream: RefCell<Option<glib::JoinHandle<()>>>,
     input: RefCell<Option<glib::JoinHandle<()>>>,
     sequence: RefCell<Sequence>,
+    modes: RefCell<ModeTracker>,
     size: Cell<(u16, u16)>,
     resize_pending: Cell<bool>,
     active: Cell<bool>,
@@ -209,40 +315,51 @@ impl Pane {
             stream: RefCell::new(None),
             input: RefCell::new(None),
             sequence: RefCell::new(Sequence::default()),
+            modes: RefCell::default(),
             size: Cell::new((0, 0)),
             resize_pending: Cell::new(false),
             active: Cell::new(false),
         });
 
-        let (tx, rx) = async_channel::bounded::<String>(64);
-        let weak = Rc::downgrade(&pane);
+        // Keystrokes are queued, never dropped: they do not depend on the output attachment,
+        // so typing while the pane (re)attaches still reaches the PTY.
+        let (tx, rx) = async_channel::unbounded::<String>();
         pane.terminal.connect_commit(move |_, text, _| {
-            if let Some(p) = weak.upgrade() {
-                if p.client.borrow().is_none() {
-                    p.status.set_text("Input unavailable: reconnect");
-                } else if tx.try_send(text.into()).is_err() {
-                    p.status.set_text("Input queue full: keystroke not sent");
-                }
-            }
+            let _ = tx.try_send(text.into());
         });
         let weak = Rc::downgrade(&pane);
         *pane.input.borrow_mut() = Some(glib::spawn_future_local(async move {
-            while let Ok(data) = rx.recv().await {
+            // Input has its own connection, opened on the first keystroke: on the attachment's,
+            // each reply waited behind the PTY frames queued ahead of it.
+            let mut connection: Option<(Client, async_channel::Receiver<Notice>)> = None;
+            while let Ok(mut data) = rx.recv().await {
+                // What was typed while the last write was in flight goes as one write, in order.
+                while let Ok(more) = rx.try_recv() {
+                    data.push_str(&more);
+                }
                 let Some(p) = weak.upgrade() else {
                     break;
                 };
-                let client = p.client.borrow().clone();
-                if let Some(client) = client {
-                    if let Err(e) = client
-                        .request(
-                            &p.rt,
-                            "session.input",
-                            json!({"session":p.name,"data":data}),
-                        )
-                        .await
-                    {
-                        p.status.set_text(&e.to_string());
+                // A connection the engine closed is reopened before the write, never after it,
+                // so a keystroke is not sent twice.
+                if connection.as_ref().is_some_and(|(_, notices)| notices.is_closed()) {
+                    connection = None;
+                }
+                if connection.is_none() {
+                    match Client::connect(&p.rt, p.path.clone()).await {
+                        Ok(opened) => connection = Some(opened),
+                        Err(e) => {
+                            p.status.set_text(&e.to_string());
+                            continue;
+                        }
                     }
+                }
+                let Some((client, _)) = connection.as_ref() else { continue };
+                if let Err(e) = client
+                    .request(&p.rt, "session.input", json!({"session":p.name,"data":data}))
+                    .await
+                {
+                    p.status.set_text(&e.to_string());
                 }
             }
         }));
@@ -456,16 +573,28 @@ impl Pane {
             let Some(p) = weak.upgrade() else {
                 return;
             };
+            let mut backoff = 1;
             loop {
                 let result = p.attach_and_render().await;
-                p.client.borrow_mut().take();
+                if p.client.borrow_mut().take().is_some() {
+                    backoff = 1;
+                }
                 match result {
                     Ok(()) => {
                         p.status.set_text("Recovering output");
                     }
-                    Err(e) => {
+                    // The engine refused the attachment (no live PTY, say). Mark the pane
+                    // detached so the next reconcile attaches it again once there is one.
+                    Err(e @ Error::Bus(_)) => {
                         p.status.set_text(&e.to_string());
+                        p.active.set(false);
                         break;
+                    }
+                    // A timeout or a dropped connection passes; keep trying while shown.
+                    Err(e) => {
+                        p.status.set_text(&format!("{e} Retrying in {backoff} s."));
+                        glib::timeout_future(Duration::from_secs(backoff)).await;
+                        backoff = (backoff * 2).min(30);
                     }
                 }
             }
@@ -505,14 +634,40 @@ impl Pane {
                                 .ok_or_else(|| Error::Protocol("PTY data missing".into()))?,
                         )
                         .map_err(|e| Error::Protocol(e.to_string()))?;
+                    let fresh = self.sequence.borrow().last.is_none();
                     let step = self.sequence.borrow_mut().observe(epoch, frame.seq);
                     match step {
                         Step::Duplicate => continue,
                         Step::Gap => return Ok(()), // reconnect from the last byte range fed
-                        Step::Reset => self.terminal.reset(true, true),
-                        Step::Feed => {}
+                        _ => {}
                     }
-                    self.terminal.feed(&data);
+                    {
+                        let mut modes = self.modes.borrow_mut();
+                        match step {
+                            Step::Duplicate | Step::Gap => {}
+                            Step::Reset => {
+                                self.terminal.reset(true, true);
+                                modes.modes = Modes::default();
+                            }
+                            // A new terminal for a PTY an earlier pane followed: the catch-up is
+                            // only a tail, so restore the modes that pane saw set before it.
+                            Step::Feed if fresh => {
+                                let known = MODES.with(|m| {
+                                    m.borrow().get(&self.name).filter(|(e, _)| *e == epoch).map(|(_, m)| *m)
+                                });
+                                if let Some(known) = known {
+                                    self.terminal.feed(&known.prelude());
+                                    modes.modes = known;
+                                }
+                            }
+                            Step::Feed => {}
+                        }
+                        self.terminal.feed(&data);
+                        if modes.scan(&data) || step == Step::Reset {
+                            let entry = (epoch, modes.modes);
+                            MODES.with(|m| m.borrow_mut().insert(self.name.clone(), entry));
+                        }
+                    }
                     bytes += data.len();
                     // Bound each GLib dispatch. This is output-driven, never an idle timer.
                     if bytes >= 64 * 1024 {
@@ -603,5 +758,24 @@ mod tests {
         assert_eq!(s.observe(1, 21), Step::Feed);
         assert_eq!(s.observe(2, 0), Step::Reset);
         assert_eq!(s.observe(1, 90), Step::Duplicate);
+    }
+
+    #[test]
+    fn modes_follow_decset_across_frames_and_restore_in_a_prelude() {
+        let mut t = ModeTracker::default();
+        assert!(!t.scan(b"plain text \x1b[1mbold\x1b[0m"));
+        assert_eq!(t.modes.prelude(), b"");
+        // One sequence split over two frames, two modes in one sequence.
+        assert!(!t.scan(b"\x1b[?104"));
+        assert!(t.scan(b"9;2004h\x1b[?25l"));
+        assert!(t.scan(b"\x1b[?1000h\x1b[?1006h\x1b[?1000l"));
+        assert_eq!(t.modes.prelude(), b"\x1b[?25l\x1b[?1049h\x1b[?1006h\x1b[?2004h");
+        // Unknown modes, other CSIs and an aborted sequence change nothing.
+        assert!(!t.scan(b"\x1b[?7l\x1b[2004h\x1b[?1049\x1b[0m"));
+        let mut fresh = ModeTracker::default();
+        assert!(fresh.scan(&t.modes.prelude()));
+        assert_eq!(fresh.modes, t.modes);
+        assert!(t.scan(b"\x1bc"));
+        assert_eq!(t.modes, Modes::default());
     }
 }

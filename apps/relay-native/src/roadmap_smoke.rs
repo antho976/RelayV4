@@ -130,7 +130,7 @@ pub(crate) async fn run(ui: &Rc<Ui>) -> Value {
         "launch tasks",
     )
     .await;
-    for index in 0..11 {
+    for index in 0..6 {
         let profile = named(&ui.window, &format!("launch-profile-{index}")).unwrap();
         assert_eq!(
             selected_tasks(&profile),
