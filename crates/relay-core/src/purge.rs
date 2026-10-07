@@ -111,7 +111,9 @@ pub fn run(tx: &Transaction, store_dir: &Path) -> rusqlite::Result<Purged> {
         )?;
     note(n, "old notification(s)");
 
-    note(crate::guardrail::prune_holds(tx, &crate::time::days_ago(ANSWERED_HOLD_DAYS))?, "answered guardrail hold(s)");
+    let (holds, held_texts) = crate::guardrail::prune_holds(tx, &crate::time::days_ago(ANSWERED_HOLD_DAYS))?;
+    note(holds, "answered guardrail hold(s)");
+    paths.extend(held_texts);
 
     // Mailbox: fully acked messages after a month, any after half a year. Recipients cascade.
     let n = tx.execute(

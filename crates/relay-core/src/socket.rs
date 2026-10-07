@@ -473,6 +473,8 @@ impl Drop for Borrowed {
 const MAX_CONCURRENT_QUERIES: usize = 8;
 
 async fn handle_conn(engine: Arc<Engine>, recent: Arc<Recent>, stream: UnixStream) -> Result<()> {
+    // Who connected, once: a process never leaves the tree it was born in (RA-096, D164).
+    let peer = crate::peer::identify(&stream, &engine);
     // The blocking dispatch keeps this Arc until its ownership update completes,
     // even if the socket task is cancelled while that dispatch is in flight.
     let device_watch = Arc::new(WatchLease {
@@ -539,6 +541,17 @@ async fn handle_conn(engine: Arc<Engine>, recent: Arc<Recent>, stream: UnixStrea
                 continue;
             }
         };
+        // `user` and `test` carry no token: what vouches for them is the process that connected.
+        // A liveness ping claims nothing, so `socket::probe` works from anywhere.
+        if matches!(req.actor, relay_bus::Actor::User | relay_bus::Actor::Test)
+            && !peer.may_act_as_user()
+            && req.op != relay_bus::ops::bus::Ping::NAME
+        {
+            tracing::warn!(?peer, op = %req.op, actor = %req.actor, "refused a user claim from inside Relay's process tree");
+            let refused = Response::err(req.id, peer.refusal(&req.actor.to_string()));
+            let _ = out_tx.send(serde_json::to_string(&refused)?).await;
+            continue;
+        }
         // A keystroke is never refused into a wait, and must not queue on the replay lock.
         let arrival = if req.op == relay_bus::ops::bus::Wait::NAME || engine.answers_from_memory(&req) {
             None
@@ -1311,6 +1324,176 @@ mod conn_tests {
         })
         .await;
         assert!(closed.is_ok(), "the subscriber kept streaming after its connection failed");
+    }
+}
+
+#[cfg(test)]
+mod peer_tests {
+    //! RA-096: the user actor is believed only from outside the engine's process tree.
+    use super::*;
+    use relay_bus::Actor;
+    use serde_json::{json, Value};
+    use std::process::Command;
+
+    /// Connects, sends each `actor op` given on the command line, and writes the answers to
+    /// `out` keyed the same way. With `detach`, it first leaves the test's process tree.
+    const CLIENT: &str = r#"
+import json, os, socket, sys, time, uuid
+sock_path, out_path, mode = sys.argv[1], sys.argv[2], sys.argv[3]
+if mode == "detach":
+    parent = os.getpid()
+    if os.fork() != 0:
+        os._exit(0)
+    while os.getppid() == parent:
+        time.sleep(0.01)
+s = socket.socket(socket.AF_UNIX)
+s.connect(sock_path)
+f = s.makefile("rw")
+answers = {}
+for call in sys.argv[4:]:
+    actor, op = call.split(" ")
+    f.write(json.dumps({"v": 1, "id": str(uuid.uuid4()), "actor": actor, "op": op, "payload": {}}) + "\n")
+    f.flush()
+    answers[call] = json.loads(f.readline())
+with open(out_path + ".tmp", "w") as out:
+    json.dump(answers, out)
+os.replace(out_path + ".tmp", out_path)
+"#;
+
+    const CALLS: [&str; 5] = ["user project.list", "test project.list", "user bus.subscribe", "user bus.ping", "agent:calm-otter project.list"];
+
+    fn python() -> bool {
+        let found = Command::new("python3").args(["-c", ""]).status().is_ok_and(|status| status.success());
+        if !found {
+            eprintln!("skipping: no python3 to act as a foreign client");
+        }
+        found
+    }
+
+    struct Fixture {
+        engine: Arc<Engine>,
+        dir: tempfile::TempDir,
+        server: SocketServer,
+    }
+
+    impl Fixture {
+        async fn new() -> Fixture {
+            let engine = Engine::new(crate::Instance::Test, crate::Store::open_memory().unwrap());
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("client.py"), CLIENT).unwrap();
+            let server = SocketServer::start_in(engine.clone(), dir.path().join("run")).await.unwrap();
+            Fixture { engine, dir, server }
+        }
+
+        fn args(&self, mode: &str) -> Vec<String> {
+            let mut args = vec![
+                self.dir.path().join("client.py").display().to_string(),
+                self.server.path.display().to_string(),
+                self.dir.path().join("out.json").display().to_string(),
+                mode.to_string(),
+            ];
+            args.extend(CALLS.iter().map(|call| call.to_string()));
+            args
+        }
+
+        async fn answers(&self) -> Value {
+            let out = self.dir.path().join("out.json");
+            for _ in 0..400 {
+                if let Ok(text) = std::fs::read_to_string(&out) {
+                    return serde_json::from_str(&text).unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            panic!("the client never answered");
+        }
+    }
+
+    fn code(answers: &Value, call: &str) -> String {
+        answers[call]["error"]["code"].as_str().unwrap_or("ok").to_string()
+    }
+
+    /// The other answers do not depend on who asked.
+    fn unchanged(answers: &Value) {
+        assert_eq!(answers["user bus.ping"]["ok"], true, "a ping claims nothing: {answers}");
+        assert_eq!(code(answers, "agent:calm-otter project.list"), "bus.actor", "an agent still needs its token: {answers}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_process_inside_a_session_cannot_claim_the_user() {
+        if !python() {
+            return;
+        }
+        let f = Fixture::new().await;
+        // `sh` stands in for the session's PTY child; the client is its child, as an agent's
+        // shell command would be. It waits until the pid is registered as the session's.
+        let go = f.dir.path().join("go");
+        let script = format!(
+            "while [ ! -e '{}' ]; do sleep 0.02; done; python3 \"$@\"; sleep 30",
+            go.display()
+        );
+        let mut args = vec!["-c".to_string(), script, "sh".to_string()];
+        args.extend(f.args("attached"));
+        let spec = crate::pty::SpawnSpec {
+            cmd: "sh".into(),
+            args,
+            env: Vec::new(),
+            cwd: f.dir.path().to_path_buf(),
+            cols: 80,
+            rows: 24,
+            epoch: 1,
+            initial_scrollback: Vec::new(),
+        };
+        let pty = crate::pty::Pty::spawn(spec, |_| {}).unwrap();
+        f.engine.set_pty(1, "calm-otter", pty.clone());
+        assert_eq!(f.engine.session_pids().get(&pty.pid()).map(String::as_str), Some("calm-otter"));
+        std::fs::write(&go, "").unwrap();
+        let answers = f.answers().await;
+        pty.kill(Duration::from_millis(200));
+        for call in ["user project.list", "test project.list", "user bus.subscribe"] {
+            assert_eq!(code(&answers, call), "actor.peer", "{call}: {answers}");
+            assert_eq!(answers[call]["error"]["kind"], "refused", "{answers}");
+            assert_eq!(answers[call]["error"]["details"]["session"], "calm-otter", "{answers}");
+        }
+        let message = answers["user project.list"]["error"]["message"].as_str().unwrap();
+        assert!(message.contains("the Relay app, the phone, or a terminal outside Relay's sessions"), "{message}");
+        unchanged(&answers);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_process_the_engine_started_outside_every_session_cannot_claim_the_user() {
+        if !python() {
+            return;
+        }
+        let f = Fixture::new().await;
+        // This test process is the engine; its child is a build, a hook, or a session's orphan.
+        let status = Command::new("python3").args(f.args("attached")).status().unwrap();
+        assert!(status.success());
+        let answers = f.answers().await;
+        for call in ["user project.list", "test project.list", "user bus.subscribe"] {
+            assert_eq!(code(&answers, call), "actor.peer", "{call}: {answers}");
+            assert_eq!(answers[call]["error"]["details"]["peer"], "engine_child", "{answers}");
+        }
+        unchanged(&answers);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_user_outside_the_engine_and_the_engine_itself_still_are_the_user() {
+        if !python() {
+            return;
+        }
+        let f = Fixture::new().await;
+        // A process that left this tree before connecting: a terminal of the user's.
+        let status = Command::new("python3").args(f.args("detach")).status().unwrap();
+        assert!(status.success());
+        let answers = f.answers().await;
+        assert_eq!(code(&answers, "user project.list"), "ok", "{answers}");
+        assert_eq!(code(&answers, "test project.list"), "ok", "{answers}");
+        assert_eq!(code(&answers, "user bus.subscribe"), "ok", "{answers}");
+        unchanged(&answers);
+        // In-process (the phone bridge of `relay serve --remote` connects this way).
+        let mut client = Client::connect(&f.server.path).await.unwrap();
+        let listed = client.call(&Request::new(Actor::User, "project.list", json!({})), |_| {}).await.unwrap();
+        assert!(listed.ok, "{:?}", listed.error);
     }
 }
 

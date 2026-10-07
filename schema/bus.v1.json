@@ -4,7 +4,7 @@
   "title": "RELAY v4 command bus",
   "description": "Generated from crates/relay-bus by `relay schema`. Do not edit; see docs/engine/BUS.md.",
   "version": 1,
-  "op_count": 224,
+  "op_count": 228,
   "envelope": {
     "request": {
       "$ref": "#/$defs/Request"
@@ -668,6 +668,87 @@
       },
       "result": {
         "$ref": "#/$defs/ProjectStatsOut"
+      }
+    },
+    "project.relink": {
+      "summary": "Point a project at its repository's new location; conflict while it has open sessions",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "inverse",
+      "scope": "project",
+      "executor": "core",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "project.changed"
+      ],
+      "since": "1.0",
+      "phase": 1,
+      "payload": {
+        "$ref": "#/$defs/ProjectRelinkIn"
+      },
+      "result": {
+        "$ref": "#/$defs/Project"
+      }
+    },
+    "project.remove.preview": {
+      "summary": "What removing a project (or a workspace's projects) would delete: task, note and module counts",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "executor": "core",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 1,
+      "payload": {
+        "$ref": "#/$defs/ProjectRemovePreviewIn"
+      },
+      "result": {
+        "$ref": "#/$defs/ProjectRemovePreviewOut"
+      }
+    },
+    "project.removed.list": {
+      "summary": "Removed projects that a removal backup can still restore",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "executor": "core",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 1,
+      "payload": {
+        "$ref": "#/$defs/Empty"
+      },
+      "result": {
+        "$ref": "#/$defs/ProjectRemovedListOut"
+      }
+    },
+    "project.restore": {
+      "summary": "Bring a removed project's board, notes and modules back from its removal backup",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "executor": "core",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "project.changed",
+        "workspace.changed"
+      ],
+      "since": "1.0",
+      "phase": 1,
+      "payload": {
+        "$ref": "#/$defs/ProjectRestoreIn"
+      },
+      "result": {
+        "$ref": "#/$defs/ProjectRestoreOut"
       }
     },
     "task.create": {
@@ -3051,7 +3132,7 @@
         "$ref": "#/$defs/FileRestoreIn"
       },
       "result": {
-        "$ref": "#/$defs/Entry"
+        "$ref": "#/$defs/FileRestoreOut"
       }
     },
     "file.trash.list": {
@@ -6339,6 +6420,171 @@
         "sessions_idle",
         "worktrees",
         "disk_mb"
+      ]
+    },
+    "ProjectRelinkIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "project_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "path": {
+          "type": "string",
+          "description": "The repository's new root: absolute, a git repository, no other project's path, and inside\na workspace (the project moves to the innermost one that contains it)."
+        }
+      },
+      "required": [
+        "project_id",
+        "path"
+      ]
+    },
+    "ProjectRemovePreviewIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "project_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "workspace_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        }
+      }
+    },
+    "ProjectRemovePreviewOut": {
+      "type": "object",
+      "properties": {
+        "projects": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "tasks": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "notes": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "modules": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "projects",
+        "tasks",
+        "notes",
+        "modules"
+      ]
+    },
+    "ProjectRemovedListOut": {
+      "type": "object",
+      "properties": {
+        "removed": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RemovedProject"
+          }
+        }
+      },
+      "required": [
+        "removed"
+      ]
+    },
+    "RemovedProject": {
+      "type": "object",
+      "properties": {
+        "backup_path": {
+          "type": "string",
+          "description": "The backup to pass to `project.restore`: the newest one that still holds the project."
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "project_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "workspace_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "name": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "backup_path",
+        "created_at",
+        "reason",
+        "project_id",
+        "workspace_id",
+        "name",
+        "path"
+      ]
+    },
+    "ProjectRestoreIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "backup_path": {
+          "type": "string",
+          "description": "A file in the store's `backups/` directory, as `project.removed.list` or the removal's\n`project.deleted` event names it."
+        },
+        "project_id": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "backup_path",
+        "project_id"
+      ]
+    },
+    "ProjectRestoreOut": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "$ref": "#/$defs/Project"
+        },
+        "tasks": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "notes": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "modules": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "workspace_restored": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "project",
+        "tasks",
+        "notes",
+        "modules",
+        "workspace_restored"
       ]
     },
     "TaskCreateIn": {
@@ -12448,11 +12694,77 @@
         "trash_id": {
           "type": "integer",
           "format": "int64"
+        },
+        "worktree": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The checkout to put it back into (`@project` or a worktree path). Default: the one it was\ndeleted from, or the project's primary checkout once that one is gone."
         }
       },
       "required": [
         "project_id",
         "trash_id"
+      ]
+    },
+    "FileRestoreOut": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Relative to the worktree root."
+        },
+        "name": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/EntryKind"
+        },
+        "size": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "modified_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "badge": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Git status badge, if any (`M`, `A`, `D`, `?`)."
+        },
+        "children": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/Entry"
+          }
+        },
+        "worktree": {
+          "type": "string",
+          "description": "The checkout it was put back into."
+        },
+        "fallback": {
+          "type": "boolean",
+          "description": "Set when no `worktree` was named and the one it was deleted from is gone, so it went to\nthe project's primary checkout instead."
+        }
+      },
+      "required": [
+        "path",
+        "name",
+        "kind",
+        "worktree",
+        "fallback"
       ]
     },
     "FileTrashListIn": {
@@ -12505,7 +12817,7 @@
         },
         "worktree": {
           "type": "string",
-          "description": "The checkout it was deleted from, and where `file.restore` puts it back."
+          "description": "The checkout it was deleted from, and where `file.restore` puts it back by default."
         },
         "created_at": {
           "type": "string"

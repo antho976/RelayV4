@@ -314,6 +314,7 @@ pub fn register(engine: &mut Engine) {
     );
 
     engine.register::<HoldsList>(|ctx, payload| {
+        guardrail::fill_payload_hashes(ctx.tx())?;
         let mut sql = String::from("SELECT * FROM holds WHERE 1=1");
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(project_id) = payload.project_id {
@@ -346,13 +347,17 @@ pub fn register(engine: &mut Engine) {
     });
 
     engine.register::<HoldGet>(|ctx, payload| {
+        guardrail::fill_payload_hashes(ctx.tx())?;
         let mut hold = guardrail::hold_by_id(ctx.tx(), payload.hold_id)?;
-        let mut request = guardrail::frozen_request(ctx.tx(), payload.hold_id)?;
+        // A large text the hold kept beside the store is read back only when asked for whole;
+        // the envelope holds it already cut. Confirm always replays it whole.
+        let full = payload.full.unwrap_or(false);
+        let (mut request, kept_aside) = guardrail::frozen_envelope(ctx.tx(), payload.hold_id, full)?;
         request.token = None;
-        // Only the copy shown is cut: the stored envelope, which confirm replays, stays whole.
         let mut elided = Vec::new();
-        if !payload.full.unwrap_or(false) {
+        if !full {
             elide_hold(&mut hold, &mut elided);
+            elided.extend(kept_aside.iter().map(|pointer| format!("/request/payload{pointer}")));
             elide_strings(&mut request.payload, "/request/payload", &mut elided);
         }
         Ok(HoldGetOut { hold, request, elided })
@@ -948,31 +953,20 @@ fn use_grants(ctx: &mut Ctx, used: &[Id], session: Option<&str>) -> Result<(), B
 /// `guardrail.holds.list` page size when the caller names none, and the most it may ask for.
 const HOLDS_PAGE: u32 = 200;
 const HOLDS_PAGE_MAX: u32 = 1000;
-/// A string in a hold shown to a person is cut past this size: a held rewrite of a large file
-/// carries the whole file, and a reply over the client's line cap tore its connection down
-/// (RA-217).
-const SHOWN_STRING_MAX: usize = 64 * 1024;
-/// How much of a cut string is kept.
-const SHOWN_STRING_KEEP: usize = 4 * 1024;
 
 /// Cut the large strings in a hold's details, for a list or an inspection.
 pub(crate) fn elide_hold(hold: &mut relay_bus::types::Hold, elided: &mut Vec<String>) {
     elide_strings(&mut hold.details, "/hold/details", elided);
 }
 
-/// Replace every string in `value` over [`SHOWN_STRING_MAX`] bytes by its first
-/// [`SHOWN_STRING_KEEP`] and a note of what was dropped, recording each one's JSON pointer.
+/// Cut every string in `value` past [`guardrail::SHOWN_STRING_MAX`] bytes, recording each
+/// one's JSON pointer.
 fn elide_strings(value: &mut Value, pointer: &str, elided: &mut Vec<String>) {
     match value {
-        Value::String(text) if text.len() > SHOWN_STRING_MAX => {
-            let mut end = SHOWN_STRING_KEEP;
-            while !text.is_char_boundary(end) {
-                end -= 1;
+        Value::String(text) => {
+            if guardrail::elide_text(text) {
+                elided.push(pointer.to_string());
             }
-            let dropped = text.len() - end;
-            text.truncate(end);
-            text.push_str(&format!("… [{dropped} more bytes elided]"));
-            elided.push(pointer.to_string());
         }
         Value::Array(items) => {
             for (index, item) in items.iter_mut().enumerate() {

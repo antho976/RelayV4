@@ -1,5 +1,7 @@
-//! `relay serve` (and `relay serve --remote`) does this: open the store exclusively, build the
-//! engine, open the socket door, run until quit.
+//! `relay serve` (and `relay serve --remote`, which adds the phone door in the same process) does
+//! this: become the subreaper for everything below it, open the store exclusively, build the
+//! engine, open the socket door, run until quit. The desktop app is a client of this socket; it
+//! does not host an engine.
 
 use crate::engine::Engine;
 use crate::paths::Instance;
@@ -17,9 +19,18 @@ pub struct Served {
 
 /// Open the store (exclusive), build the engine, bind the socket. Does not block.
 pub async fn start(instance: Instance, store_path: Option<PathBuf>) -> Result<Served, BindError> {
+    // Before any child exists: a session descendant that double-forks must land under the
+    // engine, not init, or the socket door would take it for the user (RA-096, D164).
+    let subreaper = crate::peer::become_subreaper();
+    if !subreaper {
+        tracing::warn!(error = %std::io::Error::last_os_error(), "could not become a child subreaper; a session's orphans can claim the user actor");
+    }
     let path = store_path.unwrap_or_else(|| instance.store_path());
     let store = Store::open(&path, true).map_err(BindError::Other)?;
     let engine = Engine::new(instance, store);
+    if subreaper {
+        crate::peer::spawn_orphan_reaper(&engine);
+    }
     if let Err(e) = crate::recovery::run_with(&engine, crate::recovery::DirtyScan::Deferred) {
         tracing::warn!(error = %e, "crash recovery failed; continuing");
     }
