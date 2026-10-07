@@ -1,12 +1,7 @@
 //! Editor glyphs the shared icon set does not carry, drawn on the same 16px grid and
-//! painted the same way (see `icons.rs`). Shared names are delegated to `icons::image`.
-use gtk4::{self as gtk, prelude::*};
-use std::cell::RefCell;
-use std::collections::HashMap;
-
-thread_local! {
-    static RENDERED: RefCell<HashMap<String, gtk::Svg>> = RefCell::new(HashMap::new());
-}
+//! painted by the same painter and cache (`icons::from_geometry`). Shared names are delegated
+//! to `icons::image`.
+use gtk4 as gtk;
 
 fn geometry(name: &str) -> Option<&'static str> {
     Some(match name {
@@ -50,25 +45,5 @@ pub fn glyph(name: &str, size: i32) -> gtk::Image {
     let Some(geometry) = geometry(name) else {
         return crate::icons::image(name, size);
     };
-    let image = gtk::Image::new();
-    image.set_pixel_size(size);
-    let paint = move |image: &gtk::Image| {
-        let color = image.color();
-        let document = format!(
-            r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" color="{color}" stroke="{color}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">{geometry}</svg>"##
-        );
-        let svg = RENDERED.with(|cache| {
-            let hit = cache.borrow().get(&document).cloned();
-            hit.unwrap_or_else(|| {
-                let svg = gtk::Svg::from_bytes(&glib::Bytes::from_owned(document.clone().into_bytes()));
-                cache.borrow_mut().insert(document, svg.clone());
-                svg
-            })
-        });
-        image.set_paintable(Some(&svg));
-    };
-    // GTK 4.22 SVG paintables do not inherit currentColor from their widget.
-    image.connect_map(paint);
-    image.connect_state_flags_changed(move |image, _| paint(image));
-    image
+    crate::icons::from_geometry(geometry, size, 1.5)
 }

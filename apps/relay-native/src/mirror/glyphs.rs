@@ -1,16 +1,9 @@
 //! The mirror's control glyphs. Same anatomy as `icons.rs` — 16-unit view box, 1.5 strokes,
 //! round caps and joins, painted in the widget's own color — but kept here because they only
 //! mean something next to a phone: the Android navigation triad, hardware buttons, panels.
-//! Shapes the shared set already draws are delegated to `icons::image`.
+//! Shapes the shared set already draws are delegated to `icons::image`; the rest go through
+//! `icons::from_geometry`, the same painter and cache.
 use gtk4::{self as gtk, prelude::*};
-use std::cell::RefCell;
-use std::collections::HashMap;
-
-thread_local! {
-    /// Rendered glyphs by document, for the same reason as `icons.rs`: every hover, press and
-    /// window focus change repaints each key, and the set of documents is small and bounded.
-    static RENDERED: RefCell<HashMap<String, gtk::Svg>> = RefCell::new(HashMap::new());
-}
 
 fn geometry(name: &str) -> Option<&'static str> {
     Some(match name {
@@ -40,27 +33,7 @@ pub fn image(name: &str, size: i32) -> gtk::Image {
         // `device`, `close`, `check` and `chevron-down` are the shared shapes; `retry` is its `refresh`.
         return crate::icons::image(if name == "retry" { "refresh" } else { name }, size);
     };
-    let image = gtk::Image::new();
-    image.set_pixel_size(size);
-    let paint = move |image: &gtk::Image| {
-        let color = image.color();
-        let document = format!(
-            r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" color="{color}" stroke="{color}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">{shape}</svg>"##
-        );
-        let svg = RENDERED.with(|cache| {
-            let hit = cache.borrow().get(&document).cloned();
-            hit.unwrap_or_else(|| {
-                let svg = gtk::Svg::from_bytes(&glib::Bytes::from_owned(document.clone().into_bytes()));
-                cache.borrow_mut().insert(document, svg.clone());
-                svg
-            })
-        });
-        image.set_paintable(Some(&svg));
-    };
-    // GTK 4.22 SVG paintables do not inherit currentColor; repaint on state changes like icons.rs.
-    image.connect_map(paint);
-    image.connect_state_flags_changed(move |image, _| paint(image));
-    image
+    crate::icons::from_geometry(shape, size, 1.5)
 }
 
 /// An icon key with a tooltip and an accessible name — every mirror control has both.

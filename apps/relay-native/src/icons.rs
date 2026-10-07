@@ -212,6 +212,12 @@ pub fn image_with_stroke(name: &str, size: i32, stroke: f64) -> gtk::Image {
         }
         _ => r##"<circle cx="8" cy="8" r="3"/>"##,
     };
+    from_geometry(geometry, size, stroke)
+}
+
+/// Paint SVG geometry on the 16-unit grid through the one painter and cache, so a module with
+/// shapes of its own (the mirror's keys, the editor toolbar) keeps only its shape table.
+pub fn from_geometry(geometry: &str, size: i32, stroke: f64) -> gtk::Image {
     // Symbolic: GtkImage hands the paintable the widget's CSS colour on every draw, so an icon
     // follows hover, its parent's classes (a selected nav key) and a palette reload alike.
     // `currentColor` would resolve inside the document, where no colour is set.
