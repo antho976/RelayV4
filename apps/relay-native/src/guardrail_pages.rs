@@ -59,16 +59,7 @@ fn clip_strings(value: &Value) -> Value {
 
 /// "4 min ago" from an RFC 3339 timestamp; empty when it does not parse.
 fn ago(ts: &str) -> String {
-    let (Ok(then), Ok(now)) = (glib::DateTime::from_iso8601(ts, None), glib::DateTime::now_utc()) else {
-        return String::new();
-    };
-    let seconds = now.difference(&then).as_seconds().max(0);
-    match seconds {
-        0..=44 => "just now".into(),
-        45..=5399 => format!("{} min ago", (seconds + 30) / 60),
-        5400..=129_599 => format!("{} h ago", (seconds + 1800) / 3600),
-        _ => format!("{} days ago", (seconds + 43_200) / 86_400),
-    }
+    crate::relative::ago(ts, crate::relative::Form::Long).unwrap_or_default()
 }
 
 fn is_request(hold: &Value) -> bool {

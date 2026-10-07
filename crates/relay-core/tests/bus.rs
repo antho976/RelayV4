@@ -1,36 +1,23 @@
 //! Bus-driven integration tests (SPEC §16): the bus is the test API — the same door agents use.
 
-use relay_bus::{Actor, BusError, ErrorKind, Request, Response};
+mod common;
+
+use common::{call_as as call, err, git, wait_until};
+use relay_bus::{Actor, ErrorKind, Request};
 use relay_core::engine::{Door, Engine};
 use relay_core::{Instance, Store};
 use serde_json::{json, Value};
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use uuid::Uuid;
 
 fn engine(inst: Instance) -> Arc<Engine> {
     Engine::new(inst, Store::open_memory().unwrap())
 }
 
-fn call(e: &Engine, actor: Actor, op: &str, payload: Value) -> Response {
-    e.dispatch(Request::new(actor, op, payload), Door::InProcess)
-}
-
-fn err(r: &Response) -> &BusError {
-    r.error.as_ref().expect("expected an error response")
-}
-
 fn audit_rows(e: &Engine) -> Vec<Value> {
     call(e, Actor::User, "audit.list", json!({"limit": 1000})).into_result().unwrap()["rows"].as_array().unwrap().clone()
-}
-
-fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !f() {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(20));
-    }
 }
 
 fn tmp_repo() -> (tempfile::TempDir, String) {
@@ -145,8 +132,8 @@ fn fake_adb(dir: &std::path::Path) -> String {
 if [ "$1" = "track-devices" ]; then
   # As adb sends it: a %04x byte count, then the device list.
   printf '004frelay-phone device product:relay model:Pixel_9_Pro device:relay transport_id:1\n'
-  sleep 5
-  exit 0
+  # exec, so stopping the watch kills the sleep itself rather than orphaning it on the pipe.
+  exec sleep 5
 fi
 if [ "$1" = "devices" ]; then
   printf 'List of devices attached\nrelay-phone device product:relay model:Pixel_9_Pro device:relay transport_id:1\n'
@@ -154,15 +141,6 @@ if [ "$1" = "devices" ]; then
 fi
 if [ "$3" = "shell" ] && [ "$4" = "wm" ] && [ "$5" = "size" ]; then
   printf 'Physical size: 1080x2400\n'
-  exit 0
-fi
-if [ "$3" = "exec-out" ]; then
-  printf '\000\000\000\001\147\102\000\036\000\000\000\001\145\210\204'
-  sleep 5
-  exit 0
-fi
-if [ "$3" = "shell" ] && [ "$4" = "cmd" ] && [ "$5" = "input" ]; then
-  printf '%s %s %s %s %s %s\n' "$6" "$7" "$8" "$9" "${10}" "${11}" > "$0.input"
   exit 0
 fi
 if [ "$3" = "shell" ] && [ "$4" = "cmd" ]; then
@@ -181,7 +159,9 @@ if [ "$3" = "logcat" ] && [ "$4" = "-c" ]; then exit 0; fi
 if [ "$3" = "logcat" ]; then
   printf '%s\n' "$*" > "$0.logcat"
   printf '08-17 21:04:27.000  1000  1000 I RelayTest: app ready\n'
-  sleep 5
+  # Live until device.run.stop kills it, or until the fixture directory goes away: no
+  # deadline after which the run would read "finished" instead of "stopped".
+  while [ -e "$0" ]; do sleep 0.1; done
   exit 0
 fi
 exit 1
@@ -221,11 +201,27 @@ fn device_discovery_mirror_input_and_run_lifecycle() {
     let mirror_id = mirror["mirror_id"].as_i64().unwrap();
     call(&e, Actor::User, "device.mirror.input", json!({"mirror_id":mirror_id,"event":{"type":"tap","x":100,"y":200}})).into_result().unwrap();
     call(&e, Actor::User, "device.mirror.input", json!({"mirror_id":mirror_id,"event":{"type":"swipe","x1":0,"y1":0,"x2":575,"y2":1279,"duration_ms":300}})).into_result().unwrap();
+    // The test instance starts no mirror worker, so the input waits in the control queue; a
+    // control socket installed now receives it, in order, as the scrcpy messages it encodes.
+    let runtime = relay_core::handlers::device::mirror_by_id(&e, mirror_id).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    runtime.install_control(std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap()).unwrap();
+    let (mut control, _) = listener.accept().unwrap();
+    use relay_core::mirror::{touch, ACTION_DOWN, ACTION_MOVE, ACTION_UP};
+    let mut expected = Vec::new();
+    for message in [
+        touch(ACTION_DOWN, 100, 200, 576, 1280, 1.0), touch(ACTION_UP, 100, 200, 576, 1280, 0.0),
+        touch(ACTION_DOWN, 0, 0, 576, 1280, 1.0), touch(ACTION_MOVE, 575, 1279, 576, 1280, 1.0), touch(ACTION_UP, 575, 1279, 576, 1280, 0.0),
+    ] {
+        expected.extend_from_slice(&message);
+    }
+    let mut sent = vec![0; expected.len()];
+    std::io::Read::read_exact(&mut control, &mut sent).unwrap();
+    assert_eq!(sent, expected);
     call(&e, Actor::User, "device.mirror.stop", json!({"mirror_id":mirror_id})).into_result().unwrap();
 
     let (workspace, repo) = tmp_repo();
-    let initialized = std::process::Command::new("git").args(["-C", &repo, "init", "-b", "trunk"]).output().unwrap();
-    assert!(initialized.status.success());
+    git(std::path::Path::new(&repo), &["init", "-b", "trunk"]);
     let workspace_path = std::fs::canonicalize(workspace.path()).unwrap().display().to_string();
     call(&e, Actor::User, "workspace.create", json!({"path":workspace_path})).into_result().unwrap();
     let project = call(&e, Actor::User, "project.add", json!({"workspace_id":1,"path":repo})).into_result().unwrap();
@@ -248,15 +244,12 @@ printf 'installed sdk=%s\n' "$ANDROID_HOME"
 }"#).unwrap();
     let run = call(&e, Actor::User, "device.run", json!({"project_id":project_id,"device":"relay-phone","variant":"debug"})).into_result().unwrap();
     let run_id = run["id"].as_i64().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let mut state = "building".to_string();
-    while Instant::now() < deadline {
+    wait_until("the run to reach running", || {
         let result = call(&e, Actor::User, "device.run.list", json!({"project_id":project_id})).into_result().unwrap();
-        state = result["runs"][0]["state"].as_str().unwrap().to_string();
-        if state == "running" { break; }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert_eq!(state, "running");
+        let state = &result["runs"][0]["state"];
+        assert!(state == "building" || state == "running", "{state}");
+        state == "running"
+    });
     let runtime = relay_core::handlers::device::run_by_id(&e, run_id).unwrap();
     let mut history = None;
     wait_until("logcat attachment", || {
@@ -283,7 +276,10 @@ printf 'installed sdk=%s\n' "$ANDROID_HOME"
 
 #[test]
 fn device_release_build_records_its_artifact() {
-    let e = engine(Instance::Test);
+    // A store on disk, so the signing profile (keystore, password file) lands in this
+    // directory's `signing/` and goes with it — an in-memory store would put it in /tmp.
+    let data = tempfile::tempdir().unwrap();
+    let e = Engine::new(Instance::Test, Store::open(&data.path().join("store.db"), false).unwrap());
     let sdk = tempfile::tempdir().unwrap();
     let apksigner = sdk.path().join("build-tools/35.0.0/apksigner");
     std::fs::create_dir_all(apksigner.parent().unwrap()).unwrap();
@@ -301,11 +297,7 @@ fn device_release_build_records_its_artifact() {
     .unwrap();
 
     let (workspace, repo) = tmp_repo();
-    let initialized = std::process::Command::new("git")
-        .args(["-C", &repo, "init", "-b", "trunk"])
-        .output()
-        .unwrap();
-    assert!(initialized.status.success());
+    git(std::path::Path::new(&repo), &["init", "-b", "trunk"]);
     let workspace_path = std::fs::canonicalize(workspace.path())
         .unwrap()
         .display()
@@ -344,6 +336,9 @@ fn device_release_build_records_its_artifact() {
     // the way reading a finished run's buffer can — and leaves the artifact AGP would.
     let wrapper = root.join("gradlew");
     std::fs::write(&wrapper, r#"#!/bin/sh
+printf 'args:%s\n' "$*"
+i=0
+while [ -e hold ] && [ "$i" -lt 400 ]; do i=$((i+1)); sleep 0.05; done
 if [ "$RELAY_SIGNING_STORE_PASSWORD" = "test-secret-123" ]; then secret=set; else secret=bad; fi
 if [ "$secret" = set ]; then
   [ "$2" = "--init-script" ] || exit 5
@@ -424,6 +419,7 @@ esac
 
     // Opting into Relay signing creates one private profile, never audits the password, and
     // adds a temporary init script plus secret environment only to later release builds.
+    let mut events = e.subscribe();
     let signing = e
         .dispatch(
             Request::new(
@@ -439,12 +435,15 @@ esac
     assert_eq!(signing["enabled"], true);
     assert_eq!(signing["key_alias"], "upload");
     assert!(std::path::Path::new(signing["keystore"].as_str().unwrap()).is_file());
+    assert!(signing["keystore"].as_str().unwrap().starts_with(&data.path().join("signing").display().to_string()), "{signing}");
     assert!(
         audit_rows(&e)
             .iter()
             .all(|row| row["op"] != "device.signing.create"),
         "password-bearing operations are never audited"
     );
+    // The wrapper waits on `hold`, so the run's live buffer can be taken before it ends.
+    std::fs::write(root.join("hold"), "").unwrap();
     let profile_build = call(
         &e,
         Actor::User,
@@ -454,6 +453,8 @@ esac
     .into_result()
     .unwrap();
     let profile_build_id = profile_build["id"].as_i64().unwrap();
+    let profile_runtime = relay_core::handlers::device::run_by_id(&e, profile_build_id).unwrap();
+    std::fs::remove_file(root.join("hold")).unwrap();
     wait_until("the Relay-signed build to finish", || {
         let result = call(
             &e,
@@ -478,6 +479,18 @@ esac
         !tasks.contains("test-secret-123"),
         "the signing password must not enter build output"
     );
+    // Nor the run's own log (the command line Relay echoes, the arguments Gradle got), the
+    // events the build raised, or the audit trail.
+    let output: Vec<String> = profile_runtime.attach().1.iter().map(|line| line.line.to_string()).collect();
+    assert!(output.iter().any(|line| line.starts_with("args:assembleRelease")), "{output:?}");
+    assert!(output.iter().all(|line| !line.contains("test-secret-123")), "{output:?}");
+    let mut run_events = 0;
+    while let Ok(event) = events.try_recv() {
+        if event.ev == "run.changed" { run_events += 1; }
+        assert!(!event.payload.to_string().contains("test-secret-123"), "{}: {}", event.ev, event.payload);
+    }
+    assert!(run_events > 0, "the build raised no run.changed to check");
+    assert!(!Value::Array(audit_rows(&e)).to_string().contains("test-secret-123"));
 
     // A generated key can be parked without deleting it when Google Play already expects the
     // project's established upload key. The next build then uses Gradle signing unchanged.
@@ -658,12 +671,7 @@ esac
         "device.build",
         json!({"project_id":project_id}),
     );
-    assert!(!agent.ok, "a release build is user-only");
-
-    let signing_dir = std::path::Path::new(signing["keystore"].as_str().unwrap())
-        .parent()
-        .unwrap();
-    std::fs::remove_dir_all(signing_dir).unwrap();
+    assert_eq!(err(&agent).code, "actor.allowlist", "a release build is user-only");
 }
 
 #[test]
@@ -926,6 +934,9 @@ fn workspace_and_project_flow() {
     // failed mutation left nothing behind, but was audited as error
     let r = call(&e, Actor::User, "project.get", json!({"project_id": 1}));
     assert_eq!(err(&r).code, "project.not_found");
+    let rows = audit_rows(&e);
+    let failed = rows.iter().find(|row| row["op"] == "workspace.remove" && row["kind"] == "error").expect("the refused workspace.remove was audited");
+    assert_eq!(failed["code"], "workspace.has_projects");
 }
 
 #[test]
@@ -1094,14 +1105,16 @@ async fn socket_door_round_trip_and_events() {
     let mut sub = Client::connect(&server.path).await.unwrap();
     let r = sub.call(&Request::new(Actor::User, "bus.subscribe", json!({"events": ["settings.*"]})), |_| {}).await.unwrap();
     assert_eq!(r.result.unwrap()["subscribed"][0], "settings.*");
-    c.call(&Request::new(Actor::User, "settings.set", json!({"path": "x", "value": 1})), |_| {}).await.unwrap();
+    // The workspace event is raised first, so if the filter let it through it would be the
+    // first thing this connection reads.
     let (ws_dir, _) = tmp_repo();
     c.call(&Request::new(Actor::User, "workspace.create", json!({"path": std::fs::canonicalize(ws_dir.path()).unwrap()})), |_| {}).await.unwrap();
+    c.call(&Request::new(Actor::User, "settings.set", json!({"path": "x", "value": 1})), |_| {}).await.unwrap();
     match tokio::time::timeout(std::time::Duration::from_secs(2), sub.next()).await.unwrap().unwrap().unwrap() {
-        Line::Event(ev) => assert_eq!(ev.ev, "settings.changed"),
+        Line::Event(ev) => assert_eq!(ev.ev, "settings.changed", "the workspace event was not filtered out"),
         _ => panic!("expected event"),
     }
-    // the workspace event was filtered out; unsubscribe, then nothing more arrives
+    // unsubscribe, then nothing more arrives
     sub.call(&Request::new(Actor::User, "bus.unsubscribe", json!({})), |_| {}).await.unwrap();
     c.call(&Request::new(Actor::User, "settings.set", json!({"path": "y", "value": 1})), |_| {}).await.unwrap();
     assert!(tokio::time::timeout(std::time::Duration::from_millis(200), sub.next()).await.is_err());
@@ -1117,10 +1130,19 @@ async fn socket_door_round_trip_and_events() {
             .await
             .unwrap()
     });
-    // Give the waiter time to subscribe before the event it is waiting for happens.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    c.call(&Request::new(Actor::User, "settings.set", json!({"path": "z", "value": 1})), |_| {}).await.unwrap();
-    let woken = tokio::time::timeout(std::time::Duration::from_secs(5), wait).await.unwrap().unwrap();
+    // Nothing says when the server has subscribed the waiter, so raise the event until it
+    // wakes: one that lands before the subscription is simply missed, never a failure.
+    let mut wait = wait;
+    let woken = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut n = 0;
+        loop {
+            n += 1;
+            c.call(&Request::new(Actor::User, "settings.set", json!({"path": "z", "value": n})), |_| {}).await.unwrap();
+            if let Ok(woken) = tokio::time::timeout(std::time::Duration::from_millis(50), &mut wait).await {
+                break woken.unwrap();
+            }
+        }
+    }).await.unwrap();
     let result = woken.result.unwrap();
     assert_eq!(result["timed_out"], false);
     assert_eq!(result["event"]["ev"], "settings.changed");
@@ -1138,10 +1160,20 @@ async fn socket_door_round_trip_and_events() {
             .await
             .unwrap()
     });
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    c.call(&Request::new(Actor::User, "settings.set", json!({"path": "theirs", "value": 1})), |_| {}).await.unwrap();
-    c.call(&Request::new(Actor::User, "settings.set", json!({"path": "mine", "value": 2})), |_| {}).await.unwrap();
-    let woken = tokio::time::timeout(std::time::Duration::from_secs(5), wait).await.unwrap().unwrap();
+    // As above, repeated until the waiter wakes; "theirs" always goes first, so a waiter that
+    // ignored `matching` would take it.
+    let mut wait = wait;
+    let woken = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut n = 0;
+        loop {
+            n += 1;
+            c.call(&Request::new(Actor::User, "settings.set", json!({"path": "theirs", "value": n})), |_| {}).await.unwrap();
+            c.call(&Request::new(Actor::User, "settings.set", json!({"path": "mine", "value": n})), |_| {}).await.unwrap();
+            if let Ok(woken) = tokio::time::timeout(std::time::Duration::from_millis(50), &mut wait).await {
+                break woken.unwrap();
+            }
+        }
+    }).await.unwrap();
     let result = woken.result.unwrap();
     assert_eq!(result["event"]["payload"]["path"], "mine", "the waiter took someone else's event");
 

@@ -102,11 +102,10 @@
 
 /* Actions */
 .ext-page .ext-action-bar button { min-height: 30px; padding: 0 12px; }
-.ext-page button.ext-danger label { color: @secondary; }
-.ext-page button.ext-danger:hover { background: alpha(@held, 0.1); }
-.ext-page button.ext-danger:hover label { color: @held; }
-.ext-page button.ext-danger.armed { border-color: alpha(@held, 0.6); background: alpha(@held, 0.08); }
-.ext-page button.ext-danger.armed label { color: @held; }
+/* Armed, it is the shared inline confirm (sessions.css `.confirm-armed`); these are its resting tints. */
+.ext-page button.ext-danger:not(.confirm-armed) label { color: @secondary; }
+.ext-page button.ext-danger:not(.confirm-armed):hover { background: alpha(@held, 0.1); }
+.ext-page button.ext-danger:not(.confirm-armed):hover label { color: @held; }
 
 /* Facts */
 .ext-page .ext-facts { padding: 14px 0; border-top: 1px solid @edge; border-bottom: 1px solid @edge; }
@@ -154,17 +153,6 @@
 .ext-page .ext-state { padding: 40px 28px; }
 .ext-page .ext-state .ext-tile { color: @secondary; }
 .ext-page .ext-state-title { font-size: 15px; font-weight: 600; color: @ink; }
-
-/* Square switches: ink when on, a recessed plate when off. */
-.ext-page switch { min-width: 32px; min-height: 16px; padding: 0; margin: 0; border: 1px solid @strong; border-radius: 2px; background: @screen; background-image: none; box-shadow: none; outline: none; }
-.ext-page switch:hover { border-color: @faint; }
-.ext-page switch:checked { background: @ink; border-color: @ink; }
-.ext-page switch:focus-visible { outline: 2px solid alpha(@ink, 0.35); outline-offset: 1px; }
-.ext-page switch:disabled { opacity: 0.45; }
-.ext-page switch > image { opacity: 0; }
-.ext-page switch > slider { min-width: 14px; min-height: 14px; margin: 1px; border: 0; border-radius: 0; background: @faint; background-image: none; box-shadow: none; }
-.ext-page switch:hover > slider { background: @secondary; }
-.ext-page switch:checked > slider { background: @wall; }
 
 /* ── Devices (tools_devices.rs) ───────────────────────────────────────────────
    Phones and virtual devices share one list: lamp, name over facts, actions. */

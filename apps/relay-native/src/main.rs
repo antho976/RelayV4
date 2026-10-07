@@ -7,6 +7,7 @@ mod mirror;
 mod pages;
 mod panel;
 mod provider_updates;
+mod relative;
 mod roadmap_smoke;
 mod shortcuts;
 mod smoke;

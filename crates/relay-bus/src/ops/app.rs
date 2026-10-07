@@ -1,8 +1,8 @@
-//! `app.*` — BUS.md §10.2. All mutations are user-only (§9.1 layer 1).
+//! `app.*` — BUS.md §10.2. Every mutation but `app.resources.watch`, which only turns sampling
+//! on and off, is user-only (§9.1 layer 1).
 use crate::registry::{Actors, Audit, OpMeta, Scope};
 use crate::types::{Id, ProviderInfo, Ts};
 use crate::{op, Empty};
-use serde_json::Value;
 use std::collections::BTreeMap;
 
 result!(#[schemars(rename = "BuildInfo")] BuildInfo { pub profile: String, pub git_sha: Option<String>, pub built_at: Option<String> });
@@ -36,7 +36,7 @@ result!(#[schemars(rename = "RecoveryReport")] RecoveryReport {
 op!(RecoveryLast, "app.recovery.last", Empty => Option<RecoveryReport>, OpMeta::query(Scope::Global, 3, "What crash recovery did at the last launch"));
 
 payload!(#[schemars(rename = "AppLogTailIn")] LogTailIn { pub level: Option<String>, pub filter: Option<String> });
-op!(LogTail, "app.log.tail", LogTailIn => Empty, OpMeta::query(Scope::Global, 9, "Reserved: emits app.log.attached and sends no log frames yet; the engine logs to relay serve's output (RELAY_LOG filters it)").stream("log"));
+op!(LogTail, "app.log.tail", LogTailIn => Empty, OpMeta::query(Scope::Global, 9, "Not built: answers bus.not_implemented and attaches no stream; the engine logs to relay serve's output (RELAY_LOG filters it)").stream("log"));
 
 result!(#[schemars(rename = "BackupOut")] BackupOut { pub path: String, pub bytes: u64 });
 op!(BackupNow, "app.backup.now", Empty => BackupOut, OpMeta::mutation(Scope::Global, 2, "Copy store.db to the backup dir now; keep last 5").actors(Actors::UserOnly));
@@ -58,8 +58,5 @@ op!(FirstRunState, "app.first_run.state", Empty => FirstRunOut, OpMeta::query(Sc
 result!(#[schemars(rename = "AppReconcileOut")] ReconcileOut { pub actions: Vec<String> });
 op!(Reconcile, "app.reconcile", Empty => ReconcileOut,
     OpMeta::mutation(Scope::Global, 1, "Run the trust-but-verify pass now: retention of soft-deleted rows, notifications and mail").actors(Actors::UserOnly).emits(&["notify.changed"]));
-
-#[allow(dead_code)]
-fn _touch(_: Value) {}
 
 entries!(Version, Status, Quit, ResourcesGet, ResourcesWatch, RecoveryLast, LogTail, BackupNow, BackupList, ImportV3, FirstRunState, Reconcile);

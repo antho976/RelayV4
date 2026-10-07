@@ -12,8 +12,8 @@ class Rotator:
         # yaw only is enough for these tests
         h=math.radians(s.yaw)/2; hp=math.radians(s.pitch)/2
         assert s.roll==0
-        # yaw * pitch (Z then Y) - pitch about +Y
-        qy=(0,0,math.sin(h),math.cos(h)); qp=(0,math.sin(hp),0,math.cos(hp))
+        # yaw * pitch (Z then Y), as FRotator::Quaternion: positive pitch is nose up, Y = -sin(pitch/2)
+        qy=(0,0,math.sin(h),math.cos(h)); qp=(0,-math.sin(hp),0,math.cos(hp))
         ax,ay,az,aw=qy; bx,by,bz,bw=qp
         return Quat(aw*bx+ax*bw+ay*bz-az*by, aw*by-ax*bz+ay*bw+az*bx, aw*bz+ax*by-ay*bx+az*bw, aw*bw-ax*bx-ay*by-az*bz)
 class Transform:
@@ -45,7 +45,8 @@ class SkeletalMeshComponent:
     def get_parent_bone(s,n): return dict((b[0],b[1]) for b in BONES)[n] or "None"
     def get_ref_pose_transform(s,i): return Transform(BONES[i][2])
 def new_object(cls): return cls()
-class Anim:
+class AnimSequenceBase: pass
+class Anim(AnimSequenceBase):
     def get_play_length(s): return 1.0
     def get_path_name(s): return "/Game/Swing"
 class AnimationLibrary:
@@ -56,5 +57,20 @@ class AnimationLibrary:
             a=math.radians(180*t)  # rotate arm about Z
             h=a/2; return Transform(loc,(0,0,-math.sin(h),math.cos(h)))
         return Transform(loc)
+# The whole pose at one time, as the editor evaluates it; built on the per-bone call above so a
+# test that replaces that call changes both.
+class AnimPoseSpaces: LOCAL="local"; WORLD="world"
+class AnimPoseEvaluationOptions: pass
+class _Pose:
+    def __init__(s,anim,t): s.anim,s.t=anim,t
+class AnimPoseExtensions:
+    @staticmethod
+    def get_anim_pose_at_time(anim,t,options): return _Pose(anim,t)
+    @staticmethod
+    def get_bone_names(pose): return [b[0] for b in BONES]
+    @staticmethod
+    def get_bone_pose(pose,bone,space):
+        assert space==AnimPoseSpaces.LOCAL
+        return AnimationLibrary.get_bone_pose_for_time(pose.anim,bone,pose.t,False)
 ASSETS={"/Game/Manny":SkeletalMesh("/Game/Manny"),"/Game/Swing":Anim(),"/Game/Sword":StaticMesh()}
 def load_asset(p): return ASSETS.get(p)

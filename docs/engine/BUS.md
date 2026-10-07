@@ -184,7 +184,8 @@ Every op is registered with, and the schema publishes:
 
 `noun.changed` (entity upserted; payload is the full entity), `noun.deleted` (payload `{id}`),
 plus domain events (`session.state`, `session.output` on the data plane, `guardrail.held`,
-`notify.new`, `integration.result`, `provider.version`, `resource.sample`). Rule: **every
+`notify.new`, `integration.result`, `provider.version`, `resource.sample`, `ui.changed` and
+`ui.toast` from the shell model of §6.5). Rule: **every
 mutation emits at least one event**, and every event's payload is reproducible by a query op.
 
 ---
@@ -255,11 +256,15 @@ fields; a payload that fails schema never reaches policy.
 
 ### 5.1 Ordering guarantees
 
-- Steps up to and including the handler run **serially per store** — one request at a time
-  mutates state (a single `tokio::sync::Mutex` around the engine's write side; queries may
-  read concurrently through the WAL). Latency budget: p99 < 5 ms for store-only ops. Anything
-  that takes longer (git, spawn, build) is a handler that returns quickly with a handle and
-  finishes via events (`integration.request` → `integration.result`).
+- Steps up to and including the handler run **serially per store**. The store is one SQLite
+  connection behind one `std::sync::Mutex`, and an ordinary handler runs inside a transaction
+  with it held, so one request at a time touches the store — reads included: a query waits for
+  the lock exactly as a mutation does, and WAL gives no concurrent readers here. Latency budget:
+  p99 < 5 ms for store-only ops; a request that holds or waits for the lock 16 ms or more is
+  logged at `warn` (`store lock over budget`). Slow work therefore belongs in one of the other
+  two handler shapes below, or behind a handle that finishes via events (`integration.request`
+  → `integration.result`). A plain handler that runs a subprocess blocks every other request,
+  keystrokes included, for as long as it runs.
 - Audit append is in the **same SQLite transaction** as the mutation. If the audit row can't
   be written, the mutation didn't happen.
 - Events are emitted after the transaction commits.
@@ -298,8 +303,10 @@ fields; a payload that fails schema never reaches policy.
 
 Payloads are validated against the generated schema **before** policy runs, so a guardrail
 never sees a malformed request and an agent never receives a policy answer for a request that
-would have failed on shape anyway. Unknown fields are an error (`bus.schema`,
-`details.path`), not ignored — silently dropped fields are how v3 shipped no-ops.
+would have failed on shape anyway. Unknown fields are an error (`bus.schema`), not ignored —
+silently dropped fields are how v3 shipped no-ops. A `bus.schema` error carries no `details`:
+its `message` is serde's, which names the field for an unknown, missing or mistyped top-level
+field ("unknown field `x`, expected one of …") but gives no path into a nested value.
 
 ### 5.3 Idempotency
 
@@ -437,7 +444,7 @@ main window and returned `unavailable` / `ui.absent` headless. V4 never had it, 
 | `pty` | `session.attach {session, from_seq?, epoch?}` | `{v:1, stream:"pty", session, epoch, seq, data: base64}`, one frame per PTY read (up to 64 KiB) | socket lines, after a catch-up from the scrollback ring. A subscriber more than 1024 frames behind loses frames (the engine logs it) and should re-attach from its last `(epoch, seq)`. `epoch` increments on every spawn/wake and `seq` restarts within it; `session.scrollback` returns `{text, epoch, seq}` so a client can resume exactly |
 | `mirror` | `device.mirror.start` | `{v:1, stream:"mirror", mirror_id, seq, data}`: a base64 string is one H.264 packet; an object is the mirror's status (first, on every change, and a terminal one that ends the stream) | on the socket connection that started it; the mirror stops when that connection closes |
 | `logcat` | `device.run`, `device.build` | `{v:1, stream:"logcat", run_id, seq, data: line}` | a build streams Gradle output only, then ends; a subscriber that falls behind loses lines (logged) |
-| `log` | `app.log.tail` | none yet | declared, not implemented: the op emits `app.log.attached` and no frames follow. The engine logs to `relay serve`'s output, filtered by `RELAY_LOG` |
+| `log` | `app.log.tail` | none yet | declared, not implemented: the op answers `unavailable` / `bus.not_implemented` and attaches nothing. The engine logs to `relay serve`'s output, filtered by `RELAY_LOG` |
 
 Input to a PTY is a bus op (`session.input`, `audit: agent_only`), not a stream — it is
 low-volume in bytes and it matters who typed into whose terminal.
@@ -504,7 +511,9 @@ so no door computes this for itself.
 `session.input/resize/discard_restorable`, `audit.undo`, `guardrail.confirm/reject`,
 `guardrail.config.set`, `settings.*` mutations, `app.*` mutations, `workspace.*` and
 `project.*` mutations, `provider.refresh`, `worktree.*` mutations, `git.branch.clean_merged`,
-`integration.discard`, `device.*` mutations, `skill.*` mutations, `notify.settings.set`.
+`integration.discard`, `device.*` and `avd.*` mutations except `device.claim` / `device.release`,
+`skill.*` mutations, `notify.settings.set`. `app.resources.watch` is the one `app.*` mutation
+every actor may call; it only turns resource sampling on and off.
 SPEC §10 says no swarm: an agent never spawns, closes, or types into a session, full stop.
 
 **Layer 2 — row scope (runtime).** See *Own task / self* below: an op naming a `session` or a
@@ -518,8 +527,8 @@ allow-sets, straight from SPEC §3's agent action list plus reads:
 
 | role | may call |
 |---|---|
-| `builder` | all queries · `task.move` (own, `active → in_review`) · `task.link_commit` · `task.changelog.write` (own) · `task.update` (own; body/changelog only) · `mailbox.*` · `notes.append` · `overlap.flag/ack` · `integration.request` · `session.done/report/intent/claim/release` (self) · `usage.report` · `guardrail.gate/check` |
-| `reviewer` | all queries · `mailbox.*` · `notes.append` · `overlap.flag` · `task.changelog.write` on the reviewed task · `session.done/report/intent/claim/release` (self) · `usage.report` · `guardrail.check` — **nothing** that writes files, commits, or moves the task |
+| `builder` | all queries · `task.move` (own, `active → in_review`) · `task.link_commit` · `task.changelog.write` (own) · `task.update` (own; body/changelog only) · `mailbox.*` · `notes.append` · `overlap.flag/ack` · `integration.request` · `session.done/report/intent/claim/release` (self) · `device.claim/release` · `usage.report` · `guardrail.gate/check` |
+| `reviewer` | all queries · `mailbox.*` · `notes.append` · `overlap.flag` · `task.changelog.write` on the reviewed task · `session.done/report/intent/claim/release` (self) · `device.claim/release` · `usage.report` · `guardrail.check` — **nothing** that writes files, commits, or moves the task |
 | `docs` | builder's set minus `task.link_commit`/`integration.request`, plus `notes.create/update` |
 
 Session options widen a role deliberately, per session, never by default:
@@ -565,8 +574,11 @@ Claude Code and Codex write files with their **own** tools and commit with their
 callers of it wherever the provider lets us:
 
 - **`guardrail.gate`** (mutation · agent · session) — `{session, kind: "write" | "commit" |
-  "exec", path?, new_text?, diff?, command?}` → `{verdict: "allow" | "refuse" | "hold",
-  error?: BusError}`. Unlike `guardrail.check` (a pure dry run) it may **create a hold** and it
+  "exec", path?, new_text?, diff?, command?}` → `{verdict: "allow"}`. A refusal is not a
+  verdict: it arrives as `ok: false` with a typed `refused` error, and a hold as a typed `held`
+  error whose `confirm` carries `{hold_id}`, so a caller checks `ok` before `result`. (The result
+  type still declares `refuse`/`hold`, `error` and `hold_id`; the gate never sets them.
+  `guardrail.check`, the dry run, does return its verdict in the result.) Unlike `guardrail.check` (a pure dry run) it may **create a hold** and it
   is audited. It is what a hook calls; the hook fails the tool on `hold` as on `refuse`. A
   person who confirms the hold (`guardrail.confirm`) leaves a single-use pass for that exact
   action — same policy, kind, path, text, diff and command — so the agent's identical retry,
@@ -687,13 +699,13 @@ optional. Entity shapes are in §11. `Id = number`. Every project-scoped op take
 | `bus.schema` | query · global | `{ op?: string }` → `{ schema: JsonSchema }` (whole `bus.v1.json`, or one op's `{payload, result}`) |
 | `bus.ops` | query · global | `{ actor?: Actor }` → `{ ops: OpInfo[] }` — registry attributes plus the all-layers `call`/`why` verdict for the (given or calling) actor (§9.1) |
 | `bus.whoami` | query · global | `{}` → `{ actor, is_agent, session?, role?, project_id?, project?, worktree?, branch?, can_call: string[], write_roots: string[] }` — identity and capability in one call, for any actor (D119) |
-| `bus.wait` | query · global · socket only | `{ events?: string[], timeout_ms? = 60000, matching?: object }` → `{ event?: Event, timed_out }` — block until a matching event arrives. The wake-up an agent has instead of a poll loop; events fired before the call are not replayed, so read state first, then wait (D115). `matching` takes only an event whose payload has each given top-level key equal to the value given |
+| `bus.wait` | query · global · socket only | `{ events?: string[], timeout_ms? = 60000, matching?: object }` → `{ event?: Event, timed_out }` — block until a matching event arrives. The wake-up an agent has instead of a poll loop; events fired before the call are not replayed, so read state first, then wait (D115). `matching` takes only an event whose payload has each given top-level key equal to the value given; anything but an object is `bus.schema` |
 | `bus.subscribe` | query · global · socket only | `{ events?: string[] }` → `{ subscribed: string[] }` |
 | `bus.unsubscribe` | query · global · socket only | `{}` → `{}` |
 
 ### 10.2 app
 
-All `app.*` mutations are `user_only` (§9.1 layer 1).
+All `app.*` mutations except `app.resources.watch` are `user_only` (§9.1 layer 1).
 
 | op | attrs | payload → result |
 |---|---|---|
@@ -779,7 +791,7 @@ unique; nothing else is.
 | `module.reopen` | mutation · always · inverse | `{ module_id }` → `Module` |
 | `module.delete` / `module.restore` | mutation · always · inverse | `{ module_id }` → `{}` / `Module` — delete unlinks tasks (they keep existing, `module_id: null`) |
 | `module.stats` | query | `{ project_id }` → same as `module.list.header` |
-| `module.changelog.draft` | query | `{ module_id, group_by?: "priority"\|"size" }` → `{ markdown, tasks: Id[] }` |
+| `module.changelog.draft` | query | `{ module_id, group_by?: "priority" }` (the only grouping built; any other value is `invalid` / `module.changelog_group`) → `{ markdown, tasks: Id[] }` |
 
 ### 10.7 notes / mailbox (SPEC §3, §12)
 
@@ -872,7 +884,7 @@ Provider-neutral Markdown; the same for both providers.
 
 | op | attrs | payload → result |
 |---|---|---|
-| `guardrail.gate` | mutation · always · session · agent | `{ session, kind: "write"\|"commit"\|"exec", path?, new_text?, diff?, command? }` → `{ verdict: "allow"\|"refuse"\|"hold", error?: BusError, hold_id?: Id }` — the enforcement door (§9.3); may create a hold |
+| `guardrail.gate` | mutation · always · session · agent | `{ session, kind: "write"\|"commit"\|"exec", path?, new_text?, diff?, command? }` → `{ verdict: "allow" }` — the enforcement door (§9.3); may create a hold. Refuse and hold arrive as typed `refused` / `held` errors, never as a verdict |
 | `guardrail.holds.list` | query | `{ project_id?, session?, open_only? = true, limit? (200, ≤1000) }` → `{ holds: Hold[] }` — newest first; a string over 64 KiB in `details` is cut to its first 4 KiB |
 | `guardrail.hold.get` | query · user | `{ hold_id, full? }` → `{ hold, request, elided? }` — the frozen action without its auth; unless `full`, each string over 64 KiB in `request.payload` or `hold.details` is cut to its first 4 KiB and its JSON pointer listed in `elided`. `guardrail.confirm` replays the stored action whole |
 | `guardrail.confirm` | mutation · always · user | `{ hold_id, scope? }` → `{ hold: Hold, outcome: Response }` (§9.4); for an exception request `scope` is `once`\|`session` and nothing is replayed (§9.5) |
@@ -899,7 +911,7 @@ Provider-neutral Markdown; the same for both providers.
 |  |  | **`worktree` throughout `git.*` and `file.*`:** omitted, it is the caller's own session worktree for an agent and the project root for the user. `"@project"` asks for the project root explicitly. Defaulting an agent to the project root returned confident, well-formed, wrong answers with no error either way (D111) |
 | `git.diff` | query | `{ project_id, worktree?, base?, staged? }` → `{ files: DiffFile[] }` |
 | `git.diff.file` | query | `{ project_id, worktree?, path, base? }` → `{ old, new, hunks }` (for `@codemirror/merge`); refuses a binary file (`git.diff_binary`) or one whose old + new text passes 1 MiB (`git.diff_too_large`) before building the reply |
-| `git.log` | query | `{ project_id, worktree?, branch?, limit? = 200, graph? }` → `{ commits: Commit[] }` |
+| `git.log` | query | `{ project_id, worktree?, branch?, limit? = 200 }` → `{ commits: Commit[] }` |
 | `git.show` | query | `{ project_id, sha }` → `{ commit: Commit, files: DiffFile[] }` |
 | `git.branches` | query | `{ project_id, worktree? }` → `{ current, branches: Branch[] }` (with merged flag and session owner; `current` follows the selected worktree) |
 | `git.branch.create` | mutation · always · user | `{ project_id, worktree?, name, start_point?, checkout? = true }` → `{ name, head, worktree }` — validates with Git, conflicts on an existing branch, and creates only through the selected worktree |
@@ -1006,7 +1018,7 @@ warning rather than failing every guardrail read.
 |---|---|---|
 | `ui.state` | query | `{}` → `{ project_id, page, panes: PaneInfo[], focused: PaneRef, windows: WindowInfo[] }` — the engine's model, not the native window's panes |
 | `ui.page.switch` | mutation · agent_only · inverse | `{ page: "agents"\|"code"\|"board"\|"modules"\|"dashboard"\|"skills"\|"plugins"\|"settings", project_id? }` → `{}` |
-| `ui.pane.open` | mutation · agent_only | `{ kind: PaneKind, target?: PaneTarget, at?: PaneRef \| "split_h" \| "split_v" \| "tab" }` → `{ pane: PaneRef }` — records the pane; the native client acts only on `target.session` (focuses that terminal), so e.g. `{kind:"diff", target:{sha}}` opens nothing on screen |
+| `ui.pane.open` | mutation · agent_only | `{ kind: PaneKind, target?: PaneTarget }` → `{ pane: PaneRef }` — records the pane; the native client acts only on `target.session` (focuses that terminal), so e.g. `{kind:"diff", target:{sha}}` opens nothing on screen |
 | `ui.pane.close` / `ui.pane.focus` | mutation · agent_only | `{ pane: PaneRef }` → `{}` |
 | `ui.pane.move` | mutation · agent_only | `{ pane: PaneRef, to: PaneRef, edge: "top"\|"bottom"\|"left"\|"right"\|"center" }` → `{}` |
 | `ui.layout.list` / `ui.layout.save` / `ui.layout.apply` / `ui.layout.delete` | mutation · always · inverse (save/delete) | `{ project_id }` / `{ project_id, name, state? }` / `{ project_id, name }` / `{ project_id, name }` — opaque shell state is stored in core and an apply emits `layout.changed` for the UI |
@@ -1160,7 +1172,8 @@ interface Device { serial; model; kind: "usb" | "avd"; state }
 
 - The envelope `v` is the schema major. v1 is this document.
 - **Additive changes** (new op, new optional payload field, new result field, new event, new
-  error code) do not bump `v`. Clients ignore unknown result fields; core rejects unknown
+  error code, new optional envelope field) do not bump `v`. Clients ignore unknown result and
+  envelope fields (`Response`, `Event`, frames and `BusError` are lenient); core rejects unknown
   payload fields (§5.2) — so a *new required* payload field is breaking, and a new optional one
   is not.
 - **Breaking changes** (removed op, renamed op, changed field type, new required field,

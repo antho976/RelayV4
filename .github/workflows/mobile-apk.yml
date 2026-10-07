@@ -34,8 +34,12 @@ on:
             - 'apps/relay-mobile/**'
             - '.github/workflows/mobile-apk.yml'
 
+# Read-only by default. The build runs npm install scripts, Expo prebuild and the Gradle/CMake
+# build, none of which needs to write to the repository; only the `release` job below, which
+# runs nothing but the upload, gets `contents: write`. Actions are pinned to commits, with the
+# tag they were resolved from beside them, so a moved tag cannot change what runs here.
 permissions:
-    contents: write
+    contents: read
 
 jobs:
     build-apk:
@@ -65,7 +69,9 @@ jobs:
                 working-directory: apps/relay-mobile
         steps:
             - name: Checkout
-              uses: actions/checkout@v4
+              uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+              with:
+                  persist-credentials: false
 
             # The runner image leaves about 20 GB free, and three llama.cpp variants with
             # debug info plus the app's own build filled it: the first full build died in
@@ -85,26 +91,26 @@ jobs:
                   df -h / | tail -n 1
 
             - name: Set up JDK 17
-              uses: actions/setup-java@v4
+              uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
               with:
                   distribution: temurin
                   java-version: '17'
 
             - name: Set up Node
-              uses: actions/setup-node@v4
+              uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
               with:
                   node-version: '22'
                   cache: npm
                   cache-dependency-path: apps/relay-mobile/package-lock.json
 
             - name: Set up Gradle cache
-              uses: gradle/actions/setup-gradle@v4
+              uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
 
             # Every native compile goes through ccache (see the build step), so a rebuild that
             # leaves llama.cpp alone compiles almost none of it. A cache saved on the default
             # branch is restored by every branch; one saved on a branch, only by that branch.
             - name: Set up compiler cache
-              uses: hendrikmuhs/ccache-action@v1.2
+              uses: hendrikmuhs/ccache-action@5ebbd400eff9e74630f759d94ddd7b6c26299639 # v1.2
               with:
                   key: mobile-apk-${{ env.ARCHS }}
                   max-size: 2G
@@ -186,6 +192,14 @@ jobs:
                       --no-daemon
                   df -h / | tail -n 1
 
+            # Signing needs the key inside Gradle, so this cannot keep it from the build; it does
+            # keep it from the steps after it and from the cache actions' post-job hooks.
+            - name: Remove signing material
+              if: ${{ always() && env.HAS_KEYSTORE == 'true' }}
+              run: |
+                  rm -f android/app/release.keystore
+                  if [ -f android/gradle.properties ]; then sed -i '/^RELEASE_/d' android/gradle.properties; fi
+
             - name: Collect APK
               id: collect
               run: |
@@ -200,14 +214,29 @@ jobs:
                   ls -la dist
 
             - name: Upload APK artifact
-              uses: actions/upload-artifact@v4
+              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
               with:
                   name: ${{ github.ref_type == 'tag' && format('relay-mobile-{0}', github.ref_name) || 'relay-mobile-apk' }}
                   path: ${{ steps.collect.outputs.apk }}
                   if-no-files-found: error
 
-            - name: Attach APK to release
-              if: ${{ github.ref_type == 'tag' }}
-              uses: softprops/action-gh-release@v2
+    # The only job that can write to the repository, and it runs no project code: it takes the
+    # APK the build uploaded and attaches it to the tag's release.
+    release:
+        needs: build-apk
+        if: ${{ github.ref_type == 'tag' }}
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        permissions:
+            contents: write
+        steps:
+            - name: Download APK artifact
+              uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
               with:
-                  files: ${{ steps.collect.outputs.apk }}
+                  name: relay-mobile-${{ github.ref_name }}
+                  path: dist
+
+            - name: Attach APK to release
+              uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+              with:
+                  files: dist/*.apk

@@ -154,9 +154,18 @@ pub fn engine_root(uproject: &Path, project_root: &Path, association: &str, log:
         }
     }
     tried.push("a running editor for this project".into());
-    // The last editor session logged its binary directory.
-    if let Ok(text) = std::fs::read_to_string(log) {
-        for line in text.lines().take(400) {
+    // The last editor session logged its binary directory, near the top: only the head is read,
+    // however long the log has grown (RA-287).
+    if let Ok(file) = std::fs::File::open(log) {
+        use std::io::BufRead;
+        let mut head = std::io::BufReader::new(file);
+        let mut raw = Vec::new();
+        for _ in 0..400 {
+            raw.clear();
+            if !matches!(head.read_until(b'\n', &mut raw), Ok(n) if n > 0) {
+                break;
+            }
+            let line = String::from_utf8_lossy(&raw);
             if let Some(rest) = line.split("Base Directory:").nth(1) {
                 let dir = PathBuf::from(rest.trim());
                 if let Some(root) = dir.ancestors().find(|a| valid(a)) {
@@ -238,14 +247,26 @@ pub fn editor_binary(engine: &Path) -> PathBuf {
 
 // ---------------------------------------------------------------- before and after a build
 
+/// Whether a crash reporter is this project's: its command line names a path inside the
+/// project's folder (the crash folder under Saved/Crashes, or the .uproject).
+fn reports_for(p: &Proc, uproject: &Path) -> bool {
+    let Some(root) = uproject.parent().filter(|r| !r.as_os_str().is_empty()) else { return false };
+    let roots: Vec<String> = [root.to_path_buf(), root.canonicalize().unwrap_or_else(|_| root.to_path_buf())]
+        .iter().map(|r| r.to_string_lossy().trim_end_matches('/').to_string()).filter(|r| !r.is_empty()).collect();
+    p.cmdline.iter().skip(1).any(|a| roots.iter().any(|r| a.contains(&format!("{r}/")) || a.trim_matches('"') == r))
+}
+
 /// What stands between a build and an editor that runs the new code. A leftover crash reporter
 /// makes UnrealBuildTool believe an editor is running and build a hot-reload module instead.
+/// Only this project's reporters are stopped: another project's crash dialog may still be
+/// waiting on its human (RA-293), so those are reported and left alone.
 pub fn prebuild(uproject: &Path, kill_crash_reporters: bool) -> Value {
     let editors = editors_for(uproject);
     let reporters = crash_reporters();
+    let (ours, others): (Vec<&Proc>, Vec<&Proc>) = reporters.iter().partition(|r| reports_for(r, uproject));
     let mut killed = Vec::new();
     if kill_crash_reporters {
-        for r in &reporters {
+        for r in &ours {
             if kill(r.pid) {
                 killed.push(r.pid);
             }
@@ -258,6 +279,7 @@ pub fn prebuild(uproject: &Path, kill_crash_reporters: bool) -> Value {
         "editor_running": editors.iter().map(|p| p.pid).collect::<Vec<_>>(),
         "crash_reporters": reporters.iter().map(|p| p.pid).collect::<Vec<_>>(),
         "killed_crash_reporters": killed,
+        "other_crash_reporters": others.iter().map(|p| p.pid).collect::<Vec<_>>(),
     })
 }
 
@@ -284,8 +306,22 @@ pub fn module_manifest(project_root: &Path, platform: &str) -> Value {
 
 // ---------------------------------------------------------------- the Remote Control port
 
+/// An `http://` URL's `host[:port]` (as the Host header carries it), its host name and its port,
+/// 80 when it names none. Requests and the launch and quit port checks all read the URL through
+/// this, so they never wait on one port and talk to another (RA-294).
+pub fn remote_addr(url: &str) -> Option<(String, String, u16)> {
+    let rest = url.trim().strip_prefix("http://")?;
+    let host = rest.split('/').next().unwrap_or(rest);
+    let (name, port) = match host.rsplit_once(':') {
+        // `[::1]` alone: the colons are the address's own.
+        Some((name, port)) if !port.ends_with(']') => (name, port.parse().ok()?),
+        _ => (host, 80),
+    };
+    Some((host.to_string(), name.trim_start_matches('[').trim_end_matches(']').to_string(), port))
+}
+
 pub fn port_of(url: &str) -> u16 {
-    url.rsplit(':').next().and_then(|p| p.trim_end_matches('/').parse().ok()).unwrap_or(30010)
+    remote_addr(url).map(|(_, _, port)| port).unwrap_or(30010)
 }
 
 /// Whether nothing is listening on (or still holding) the port.
@@ -321,8 +357,14 @@ pub fn launch(engine: &Path, uproject: &Path, port: u16, extra: &[String]) -> Re
         bail!("port {port} is still held (a previous editor, or another program). Wait, or free it, before launching: the new editor could not start its Remote Control server");
     }
     let mut command = launch_command(&binary, uproject, extra);
-    let child = command.spawn().with_context(|| format!("starting {}", binary.display()))?;
-    Ok(child.id())
+    let mut child = command.spawn().with_context(|| format!("starting {}", binary.display()))?;
+    let pid = child.id();
+    // Reaped when it exits, however long that is: a dropped Child is never waited on, and each
+    // editor would stay a zombie under this server until it quits (RA-295).
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(pid)
 }
 
 fn launch_command(binary: &Path, uproject: &Path, extra: &[String]) -> std::process::Command {
@@ -425,6 +467,32 @@ mod tests {
         assert!(wait_port_free(port, Duration::from_secs(5)));
         assert_eq!(port_of("http://127.0.0.1:30010"), 30010);
         assert_eq!(port_of("http://localhost:31000/"), 31000);
+        // The same reading of the URL as the requests themselves.
+        assert_eq!(port_of("http://127.0.0.1:31000/remote"), 31000);
+        assert_eq!(port_of("http://localhost"), 80);
+        assert_eq!(port_of("not a url"), 30010);
+        assert_eq!(remote_addr("http://[::1]:31000/"), Some(("[::1]:31000".into(), "::1".into(), 31000)));
+        assert_eq!(remote_addr("http://[::1]"), Some(("[::1]".into(), "::1".into(), 80)));
+    }
+
+    #[test]
+    fn only_this_projects_crash_reporters_are_its_own() {
+        let root = tempfile::tempdir().unwrap();
+        let game = root.path().join("Game");
+        std::fs::create_dir_all(&game).unwrap();
+        let uproject = game.join("Game.uproject");
+        let reporter = |args: &[String]| Proc {
+            pid: 1,
+            exe: PathBuf::from("/opt/UE/Engine/Binaries/Linux/CrashReportClientEditor"),
+            cmdline: std::iter::once("CrashReportClientEditor".to_string()).chain(args.iter().cloned()).collect(),
+        };
+        let crash = format!("{}/Saved/Crashes/crashinfo-Game-pid-42/", game.display());
+        assert!(reports_for(&reporter(&[crash, "-Unattended".into()]), &uproject));
+        let canonical = format!("\"{}/Saved/Crashes/x\"", game.canonicalize().unwrap().display());
+        assert!(reports_for(&reporter(&[canonical]), &uproject));
+        let other = format!("{}Other/Saved/Crashes/crashinfo-GameOther-pid-7/", game.display());
+        assert!(!reports_for(&reporter(&[other]), &uproject), "a folder whose name merely starts the same way");
+        assert!(!reports_for(&reporter(&["-Unattended".into()]), &uproject), "a reporter that names no project is not ours");
     }
 
     #[test]

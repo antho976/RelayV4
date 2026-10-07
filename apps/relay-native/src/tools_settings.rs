@@ -4,6 +4,7 @@ use gtk::prelude::*;
 use gtk4 as gtk;
 use serde_json::{json, Value};
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 pub(crate) struct WallpaperDraft {
@@ -41,26 +42,55 @@ pub(crate) fn sync_wallpaper(ui: &Rc<Ui>, image: &Value) {
 /// differs, so it neither reverts a value changed elsewhere nor re-clamps one it never showed.
 #[derive(PartialEq)]
 struct Snapshot {
-    settings: std::collections::BTreeMap<String, Value>,
-    notifications: Value,
+    settings: BTreeMap<String, Value>,
+    /// `sound`, `volume` and `categories.<name>`.
+    notifications: BTreeMap<String, Value>,
 }
 
-fn snapshot(page: &gtk::Widget) -> Result<Snapshot, String> {
-    let mut settings = Vec::new();
-    let mut notifications = json!({"categories":{}});
-    let mut guardrails = json!({"caps":{},"destructive_write":{}});
-    collect_settings(page, &mut settings, &mut notifications, &mut guardrails)?;
-    let settings = settings
-        .into_iter()
-        .filter_map(|(_, payload)| Some((payload["path"].as_str()?.to_string(), payload["value"].clone())))
-        .collect();
-    Ok(Snapshot { settings, notifications })
+/// One control's current value: `None` when it has nothing to save (a mode with no card
+/// chosen) or the control is gone.
+type Reader = Box<dyn Fn() -> Result<Option<Value>, String>>;
+
+/// Every control Save writes, registered with where it saves to as the control is built.
+#[derive(Default)]
+struct Fields {
+    /// `settings.set` paths.
+    settings: Vec<(String, Reader)>,
+    /// `notify.settings.set` keys, as in `Snapshot::notifications`.
+    notifications: Vec<(String, Reader)>,
+}
+
+impl Fields {
+    fn setting(&mut self, path: impl Into<String>, read: Reader) {
+        self.settings.push((path.into(), read));
+    }
+
+    fn snapshot(&self) -> Result<Snapshot, String> {
+        let read = |fields: &[(String, Reader)]| {
+            let mut values = BTreeMap::new();
+            for (key, read) in fields {
+                if let Some(value) = read()? {
+                    values.insert(key.clone(), value);
+                }
+            }
+            Ok::<_, String>(values)
+        };
+        Ok(Snapshot { settings: read(&self.settings)?, notifications: read(&self.notifications)? })
+    }
+}
+
+/// Reads `widget` through `get` while it exists. Weak, so the page's fields do not keep a
+/// page that was cleared alive.
+fn reader<W: IsA<gtk::Widget>>(widget: &W, get: impl Fn(&W) -> Result<Value, String> + 'static) -> Reader {
+    let weak = widget.downgrade();
+    Box::new(move || weak.upgrade().map(|widget| get(&widget)).transpose())
 }
 
 /// The mounted page. It is built once per connection, not per project: nothing on it is per
 /// project, and rebuilding it on a project switch threw unsaved edits away.
 struct Mounted {
     page: glib::WeakRef<gtk::Box>,
+    fields: Rc<RefCell<Fields>>,
     baseline: Rc<RefCell<Option<Snapshot>>>,
     providers: glib::WeakRef<gtk::Box>,
     detected: RefCell<Value>,
@@ -75,7 +105,7 @@ impl Mounted {
     fn dirty(&self, ui: &Ui) -> bool {
         let wallpaper = ui.wallpaper_draft.borrow().as_ref().is_some_and(|draft| *draft.state.borrow() != *draft.saved.borrow());
         let controls = match (self.page.upgrade(), self.baseline.borrow().as_ref()) {
-            (Some(page), Some(baseline)) => snapshot(page.upcast_ref()).ok().as_ref() != Some(baseline),
+            (Some(_), Some(baseline)) => self.fields.borrow().snapshot().ok().as_ref() != Some(baseline),
             _ => false,
         };
         wallpaper || controls
@@ -167,6 +197,7 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
         .borrow_mut()
         .insert("settings".into(), generation as i64);
     let baseline = Rc::new(RefCell::new(None::<Snapshot>));
+    let fields = Rc::new(RefCell::new(Fields::default()));
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     header.add_css_class("settings-head");
     let title = gtk::Box::new(gtk::Orientation::Vertical, 2);
@@ -196,11 +227,12 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
     let wallpaper_state = wallpapers.clone();
     let saved_for_save = saved_wallpapers.clone();
     let loaded = baseline.clone();
+    let saved_fields = fields.clone();
     reload.connect_clicked(move |_| {
         let (Some(ui), Some(page)) = (weak.upgrade(), target.upgrade()) else {
             return;
         };
-        let now = match snapshot(page.upcast_ref()) {
+        let now = match saved_fields.borrow().snapshot() {
             Ok(now) => now,
             Err(error) => {
                 ui.show_error(&error);
@@ -215,15 +247,11 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
             }
         }
         let mut notifications = json!({});
-        for key in ["sound", "volume"] {
-            if before.as_ref().map(|b| &b.notifications[key]) != Some(&now.notifications[key]) {
-                notifications[key] = now.notifications[key].clone();
-            }
-        }
-        if let Some(categories) = now.notifications["categories"].as_object() {
-            for (category, on) in categories {
-                if before.as_ref().map(|b| &b.notifications["categories"][category]) != Some(on) {
-                    notifications["categories"][category] = on.clone();
+        for (key, value) in &now.notifications {
+            if before.as_ref().and_then(|b| b.notifications.get(key)) != Some(value) {
+                match key.strip_prefix("categories.") {
+                    Some(category) => notifications["categories"][category] = value.clone(),
+                    None => notifications[key.as_str()] = value.clone(),
                 }
             }
         }
@@ -327,6 +355,7 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
     let modes = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     modes.set_homogeneous(true);
     let mut first = None::<gtk::ToggleButton>;
+    let mut cards = Vec::new();
     for (id, title, hint, background, plate) in [
         (
             "matte",
@@ -387,7 +416,12 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
         key.set_child(Some(&card));
         key.set_active(data["appearance.mode"].as_str().unwrap_or("matte") == id);
         modes.append(&key);
+        cards.push((key.downgrade(), id));
     }
+    fields.borrow_mut().setting(
+        "appearance.mode",
+        Box::new(move || Ok(cards.iter().find(|(key, _)| key.upgrade().is_some_and(|key| key.is_active())).map(|(_, id)| json!(id)))),
+    );
     mode_field.append(&modes);
     appearance.append(&mode_field);
     let legibility = gtk::Box::new(gtk::Orientation::Horizontal, 16);
@@ -409,6 +443,7 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
         let input = gtk::Scale::with_range(gtk::Orientation::Horizontal, min, max, 0.01);
         input.set_widget_name(&format!("setting:{path}"));
         input.set_value(data[path].as_f64().unwrap_or(default));
+        fields.borrow_mut().setting(path, reader(&input, |input| Ok(json!(input.value()))));
         input.set_hexpand(true);
         input.set_draw_value(false);
         let caption = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -444,6 +479,7 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
     let enabled = gtk::CheckButton::with_label("Rotate wallpapers randomly");
     enabled.set_widget_name("setting:appearance.wallpaper_rotation.enabled");
     enabled.set_active(data["appearance.wallpaper_rotation"]["enabled"] == true);
+    fields.borrow_mut().setting("appearance.wallpaper_rotation.enabled", reader(&enabled, |input| Ok(json!(input.is_active()))));
     enabled.set_hexpand(true);
     rotation.append(&enabled);
     rotation.append(&label("Every", "dim"));
@@ -455,6 +491,10 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
             .unwrap_or(15.)
             .clamp(1., 1440.),
     );
+    fields.borrow_mut().setting(
+        "appearance.wallpaper_rotation.interval_minutes",
+        reader(&minutes, |input| Ok(json!(input.value_as_int()))),
+    );
     rotation.append(&minutes);
     rotation.append(&label("minutes", "dim"));
     appearance.append(&rotation);
@@ -463,7 +503,7 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
 
     let agents = category(&stack, "agents", "Agents");
     setting_number(
-        ui,
+        &mut fields.borrow_mut(),
         &agents,
         "Terminal font size (points)",
         "terminal.font_size",
@@ -480,6 +520,7 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
     providers(&detected, &data["detected"]);
     let mounted = Rc::new(Mounted {
         page: page.downgrade(),
+        fields: fields.clone(),
         baseline: baseline.clone(),
         providers: detected.downgrade(),
         detected: RefCell::new(data["detected"].clone()),
@@ -514,6 +555,7 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
         let automatic = gtk::CheckButton::with_label(&format!("Update {provider} at startup"));
         automatic.set_widget_name(&format!("setting:providers.{provider}.auto_update"));
         automatic.set_active(data["providers"][provider]["auto_update"] == true);
+        fields.borrow_mut().setting(format!("providers.{provider}.auto_update"), reader(&automatic, |input| Ok(json!(input.is_active()))));
         automatic.set_hexpand(true);
         updates.append(&automatic);
         let update = button("Update now", "quiet");
@@ -527,7 +569,7 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
         updates.append(&update);
         agents.append(&updates);
         setting_entry(
-            ui,
+            &mut fields.borrow_mut(),
             &agents,
             &format!("{provider} executable"),
             &format!("providers.{provider}.path"),
@@ -546,7 +588,7 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
         ("avdmanager_path", "AVD manager executable"),
     ] {
         setting_entry(
-            ui,
+            &mut fields.borrow_mut(),
             &android,
             title,
             &format!("device.{key}"),
@@ -570,9 +612,12 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
     );
     sound.set_widget_name("notify:sound");
     field("Sound", &sound, &notifications);
+    let picked = reader(&sound, move |input| Ok(json!(sounds.get(input.selected() as usize).copied().unwrap_or("off"))));
+    fields.borrow_mut().notifications.push(("sound".into(), picked));
     let volume = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0., 1., 0.01);
     volume.set_widget_name("notify:volume");
     volume.set_value(data["notifications"]["volume"].as_f64().unwrap_or(0.7));
+    fields.borrow_mut().notifications.push(("volume".into(), reader(&volume, |input| Ok(json!(input.value())))));
     field("Volume", &volume, &notifications);
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     notifications.append(&row);
@@ -602,6 +647,7 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
         check.set_active(enabled);
         check.set_widget_name(&format!("notify:category:{category}"));
         notifications.append(&check);
+        fields.borrow_mut().notifications.push((format!("categories.{category}"), reader(&check, |input| Ok(json!(input.is_active())))));
     }
     let maintenance = category(&stack, "maintenance", "Storage");
     maintenance.append(&paragraph(
@@ -636,6 +682,18 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
         let input = gtk::Entry::new();
         input.set_text(data["keybindings"][name].as_str().unwrap_or(fallback));
         input.set_widget_name(&format!("setting:keybindings.{name}"));
+        // A shortcut is saved as typed, empty included: empty turns it off.
+        fields.borrow_mut().setting(
+            format!("keybindings.{name}"),
+            reader(&input, move |input| {
+                let value = input.text();
+                let value = value.trim();
+                if !value.is_empty() && !crate::shortcuts::valid(value) {
+                    return Err(format!("Invalid shortcut for {name}. Use Ctrl+Key notation or leave it empty."));
+                }
+                Ok(json!(value))
+            }),
+        );
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         row.append(&input);
         field(title, &row, &keyboard);
@@ -685,7 +743,7 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
         }
     });
     // Taken from the built controls, so a value a range clamped counts as unchanged.
-    *baseline.borrow_mut() = snapshot(page.upcast_ref()).ok();
+    *baseline.borrow_mut() = fields.borrow().snapshot().ok();
 }
 
 /// One card per provider from a `provider.list` / `provider.refresh` answer.
@@ -731,94 +789,6 @@ fn settings_search_text(widget: &gtk::Widget) -> String {
         child = widget.next_sibling();
     }
     result.to_lowercase()
-}
-
-fn collect_settings(
-    widget: &gtk::Widget,
-    settings: &mut Vec<(&'static str, Value)>,
-    notifications: &mut Value,
-    guardrails: &mut Value,
-) -> Result<(), String> {
-    let name = widget.widget_name();
-    if let Some(path) = name.strip_prefix("setting:") {
-        let value = if let Some(key) = widget.downcast_ref::<gtk::ToggleButton>() {
-            if key.is_active() {
-                let (_, mode) = path.split_once('=').ok_or("Invalid palette control")?;
-                Some(json!(mode))
-            } else {
-                None
-            }
-        } else if let Some(input) = widget.downcast_ref::<gtk::CheckButton>() {
-            Some(json!(input.is_active()))
-        } else if let Some(input) = widget.downcast_ref::<gtk::SpinButton>() {
-            Some(if path == "terminal.font_size" {
-                json!(input.value())
-            } else {
-                json!(input.value_as_int())
-            })
-        } else if let Some(input) = widget.downcast_ref::<gtk::Scale>() {
-            Some(json!(input.value()))
-        } else if let Some(input) = widget.downcast_ref::<gtk::Entry>() {
-            let value = input.text();
-            let value = value.trim();
-            if path.starts_with("keybindings.")
-                && !value.is_empty()
-                && !crate::shortcuts::valid(value)
-            {
-                return Err(format!(
-                    "Invalid shortcut for {}. Use Ctrl+Key notation or leave it empty.",
-                    path.trim_start_matches("keybindings.")
-                ));
-            }
-            Some(if value.is_empty() && !path.starts_with("keybindings.") {
-                Value::Null
-            } else {
-                json!(value)
-            })
-        } else {
-            None
-        };
-        if let Some(value) = value {
-            settings.push((
-                "settings.set",
-                json!({"path":path.split('=').next().unwrap_or(path),"value":value}),
-            ));
-        }
-    } else if name == "notify:sound" {
-        let input = widget.downcast_ref::<gtk::DropDown>().unwrap();
-        notifications["sound"] =
-            json!(["off", "chime", "glass", "pulse", "signal"][input.selected() as usize]);
-    } else if name == "notify:volume" {
-        notifications["volume"] = json!(widget.downcast_ref::<gtk::Scale>().unwrap().value());
-    } else if let Some(category) = name.strip_prefix("notify:category:") {
-        notifications["categories"][category] = json!(widget
-            .downcast_ref::<gtk::CheckButton>()
-            .unwrap()
-            .is_active());
-    } else if let Some(path) = name.strip_prefix("guardrail:") {
-        if let Some(input) = widget.downcast_ref::<gtk::SpinButton>() {
-            let (group, key) = path.split_once('.').ok_or("Invalid guardrail control")?;
-            guardrails[group][key] = if key == "min_removed_pct" {
-                json!(input.value())
-            } else {
-                json!(input.value_as_int())
-            };
-        } else if let Some(input) = widget.downcast_ref::<gtk::TextView>() {
-            let b = input.buffer();
-            let text = b.text(&b.start_iter(), &b.end_iter(), false);
-            guardrails[path] = json!(text
-                .lines()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .collect::<Vec<_>>());
-        }
-    }
-    let mut child = widget.first_child();
-    while let Some(widget) = child {
-        child = widget.next_sibling();
-        collect_settings(&widget, settings, notifications, guardrails)?;
-    }
-    Ok(())
 }
 
 const CATEGORIES: [(&str, &str, &str, &str, &str, &str); 7] = [
@@ -935,18 +905,24 @@ fn category(stack: &gtk::Stack, name: &str, title: &str) -> gtk::Box {
     page
 }
 
-fn setting_entry(_ui: &Rc<Ui>, parent: &gtk::Box, title: &str, path: &str, value: &str) {
+/// An override path: empty saves null, which means "discover it".
+fn setting_entry(fields: &mut Fields, parent: &gtk::Box, title: &str, path: &str, value: &str) {
     let input = gtk::Entry::builder()
         .text(value)
         .hexpand(true)
         .placeholder_text("Automatic")
         .build();
     input.set_widget_name(&format!("setting:{path}"));
+    fields.setting(path, reader(&input, |input| {
+        let value = input.text();
+        let value = value.trim();
+        Ok(if value.is_empty() { Value::Null } else { json!(value) })
+    }));
     field(title, &input, parent);
 }
 
 fn setting_number(
-    _ui: &Rc<Ui>,
+    fields: &mut Fields,
     parent: &gtk::Box,
     title: &str,
     path: &str,
@@ -959,6 +935,9 @@ fn setting_number(
     input.set_digits(if fractional { 2 } else { 0 });
     input.set_value(value);
     input.set_widget_name(&format!("setting:{path}"));
+    fields.setting(path, reader(&input, move |input| {
+        Ok(if fractional { json!(input.value()) } else { json!(input.value_as_int()) })
+    }));
     field(title, &input, parent);
 }
 

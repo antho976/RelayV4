@@ -151,8 +151,11 @@ Deforming meshes (characters, cloth, hoses, anything skinned):
 
 Run the recipe `clean_mesh`: remove_doubles (merge by distance, 0.01-0.1 mm), dissolve
 degenerate, delete loose verts/edges, recalc outward normals. Then report non-manifold
-edges, zero-area faces, n-gons, loose verts (`mesh_report`). `blender_rig_check` also flags
-loose verts, zero-area faces and inside-out closed meshes on any mesh.
+edges, zero-area faces, n-gons, loose verts (`mesh_report`). `blender_mesh_check {file,
+objects}` checks the mesh as it will be exported, modifiers applied: zero-area faces (a bevel
+wider than a thin part), zero-length edges and inside-out normals are problems; loose verts,
+n-gons and missing UVs are warnings. `blender_export` runs the same check and refuses a broken
+mesh.
 
 ## 11. UVs
 
@@ -180,7 +183,8 @@ loose verts, zero-area faces and inside-out closed meshes on any mesh.
   Collapse keeps UV layers (verified); re-check shading afterwards (re-run sharp_by_angle /
   Weighted Normal on the LOD if needed) and the silhouette with `blender_render`.
 - Names `<Mesh>_LOD0`, `<Mesh>_LOD1`, ... on the same pivot. `blender_export` (static) includes
-  `_LODn` children; confirm the LOD count on the Unreal asset after import (`blender_to_unreal`
+  `_LODn` children, so parent LOD1+ to LOD0 (the recipe `make_lods` does); confirm the LOD
+  count on the Unreal asset after import (`blender_to_unreal`
   reports what arrived). If they arrive as separate meshes, import each LOD file onto the
   base mesh in Unreal (see `unreal-editor-automation`) or use UE's auto LOD reduction.
 - Planar decimation (`decimate_type='DISSOLVE'`) is for hard-surface cleanup, not LODs of
@@ -231,10 +235,11 @@ loose verts, zero-area faces and inside-out closed meshes on any mesh.
 2. `blender_render` views front, three_quarter, top with `color: "RANDOM"` (separate parts
    and stray pieces show up), and workbench default (cavity shows shading/normal problems).
    Render LODs side by side. Render modular pieces together to check joins.
-3. Run `mesh_report` from the recipes: 0 non-manifold edges on closed props, 0 zero-area faces,
-   0 loose verts; n-gons only where planar.
+3. `blender_mesh_check {file, objects}`: no problems; warnings judged (n-gons only where
+   planar). Run `mesh_report` from the recipes as well for non-manifold edges: 0 on closed
+   props.
 4. Texel density within 10% of the project target.
-5. `blender_rig_check` also works as a mesh check (inside-out, loose, zero-area, missing UVs).
+5. Skinned meshes: `blender_rig_check` (it needs an armature in the file).
 6. When the Unreal editor is up, `blender_to_unreal` and read its size and problem report.
 
 Never report a mesh done without having looked at at least one render of it. Save to a new

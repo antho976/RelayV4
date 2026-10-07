@@ -1,25 +1,14 @@
 //! Phase 12: current-directory onboarding, repository discovery/clone, and AVD management.
 
-use relay_bus::{Actor, Request, Response};
-use relay_core::{Door, Engine, Instance, Store};
+mod common;
+
+use common::{call, committed_repo, engine, git, ok};
 use serde_json::{json, Value};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
-use std::sync::Arc;
 
-fn engine() -> Arc<Engine> { Engine::new(Instance::Test, Store::open_memory().unwrap()) }
-fn call(engine: &Engine, op: &str, payload: Value) -> Response {
-    engine.dispatch(Request::new(Actor::User, op, payload), Door::InProcess)
-}
-fn ok(engine: &Engine, op: &str, payload: Value) -> Value {
-    call(engine, op, payload).into_result().unwrap_or_else(|error| panic!("{op}: {} {}", error.code, error.message))
-}
-fn command(dir: &Path, args: &[&str]) {
-    let output = Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
-    assert!(output.status.success(), "git {}: {}", args.join(" "), String::from_utf8_lossy(&output.stderr));
-}
 fn executable(path: &Path, body: &str) {
     fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
     let mut permissions = fs::metadata(path).unwrap().permissions();
@@ -38,12 +27,7 @@ fn workspace_defaults_to_cwd_and_local_clone_registers_project() {
 
     let root = tempfile::tempdir().unwrap();
     let source = tempfile::tempdir().unwrap();
-    command(source.path(), &["init", "-b", "main"]);
-    command(source.path(), &["config", "user.name", "Relay Test"]);
-    command(source.path(), &["config", "user.email", "relay@example.test"]);
-    fs::write(source.path().join("README.md"), "# source\n").unwrap();
-    command(source.path(), &["add", "README.md"]);
-    command(source.path(), &["commit", "-m", "Initial"]);
+    committed_repo(source.path(), &[("README.md", "# source\n")]);
 
     let workspace = ok(&engine, "workspace.create", json!({"path":root.path()}));
     let cloned = ok(&engine, "project.clone", json!({"workspace_id":workspace["id"],"url":source.path(),"dest":"cloned"}));
@@ -63,8 +47,15 @@ fn avd_catalog_create_list_and_boot_use_configured_sdk_tools() {
     let avdmanager = root.path().join("avdmanager");
     executable(&adb, "if [ \"$1\" = \"devices\" ]; then echo 'List of devices attached'; fi");
     let boot_log = root.path().join("emulator-boot.log");
-    executable(&emulator, &format!("if [ \"$1\" = \"-list-avds\" ]; then echo 'Pixel_9_API_35'; else echo \"$@\" > '{}'; fi", boot_log.display()));
-    executable(&avdmanager, "if [ \"$1\" = \"list\" ]; then echo 'pixel_9'; fi\nexit 0");
+    // avdmanager logs its create line and records the name it was given, and the emulator lists
+    // whatever was recorded, so avd.create reads back what it made instead of echoing the request.
+    let create_log = root.path().join("avdmanager-create.log");
+    let created_avds = root.path().join("created-avds");
+    executable(&emulator, &format!("if [ \"$1\" = \"-list-avds\" ]; then echo 'Pixel_9_API_35'; cat '{}' 2>/dev/null || true; else echo \"$@\" > '{}'; fi", created_avds.display(), boot_log.display()));
+    executable(&avdmanager, &format!(
+        "case \"$1\" in\n  list) echo 'pixel_9' ;;\n  create) echo \"$@\" > '{}'; [ \"$3\" = --name ] && echo \"$4\" >> '{}' ;;\nesac\nexit 0",
+        create_log.display(), created_avds.display()
+    ));
     for (path, value) in [
         ("device.sdk_path", sdk.display().to_string()),
         ("device.adb_path", adb.display().to_string()),
@@ -77,7 +68,13 @@ fn avd_catalog_create_list_and_boot_use_configured_sdk_tools() {
     assert_eq!(catalog["devices"], json!(["pixel_9"]));
     assert_eq!(ok(&engine, "avd.list", json!({}))["avds"][0]["name"], "Pixel_9_API_35");
     let created = ok(&engine, "avd.create", json!({"name":"New_API_35","package":"system-images;android-35;google_apis;x86_64","device":"pixel_9"}));
+    assert_eq!(fs::read_to_string(&create_log).unwrap().trim(),
+        "create avd --name New_API_35 --package system-images;android-35;google_apis;x86_64 --device pixel_9");
+    // Only the listing fills in a path; the fallback built from the request has none.
     assert_eq!(created["name"], "New_API_35");
+    assert!(created["path"].is_string(), "avd.create did not read the new AVD back: {created}");
+    let names: Vec<Value> = ok(&engine, "avd.list", json!({}))["avds"].as_array().unwrap().iter().map(|avd| avd["name"].clone()).collect();
+    assert_eq!(names, [json!("Pixel_9_API_35"), json!("New_API_35")]);
     ok(&engine, "avd.boot", json!({"name":"Pixel_9_API_35","cold":true}));
     // Booted headless, so the mirror is the only window the emulator gets.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -119,8 +116,8 @@ fn clone_uses_workspace_when_engine_directory_was_removed() {
     let workspace = root.path().join("workspace");
     let removed = root.path().join("removed-launch-worktree");
     for path in [&source, &workspace, &removed] { fs::create_dir(path).unwrap(); }
-    command(&source, &["init", "-b", "main"]);
-    command(&source, &["-c", "user.name=Fixture", "-c", "user.email=fixture@relay.test", "commit", "--allow-empty", "-m", "Initial"]);
+    git(&source, &["init", "-b", "main"]);
+    git(&source, &["-c", "user.name=Fixture", "-c", "user.email=fixture@relay.test", "commit", "--allow-empty", "-m", "Initial"]);
     let helper = root.path().join("upload");
     // A local transport reproduces remote helpers needing a readable CWD, without GitHub/network.
     fs::write(&helper, format!("#!/usr/bin/env python3\nimport os\nassert os.getcwd() == {}\nos.execvp('git', ['git', 'upload-pack', {}])\n",

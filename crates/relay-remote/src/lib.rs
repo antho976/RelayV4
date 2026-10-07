@@ -15,7 +15,8 @@
 //!
 //! Both routes hand `bridge.rs` a pair of channels. It greets, verifies the device against
 //! `remote.json` (`registry.rs`), then forwards bus lines to the socket door as actor `user`
-//! and back. The phone never gets a door the CLI does not have.
+//! and back — only the ops the app uses (`wire::PHONE_OPS`). The phone never gets a door the
+//! CLI does not have, and gets less of it.
 
 pub mod bridge;
 pub mod direct;

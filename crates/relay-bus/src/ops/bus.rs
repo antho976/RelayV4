@@ -1,8 +1,8 @@
 //! `bus.*` — BUS.md §10.1.
-use crate::registry::{Actors, Doors, OpInfo, OpMeta, Scope};
+use crate::registry::{Doors, OpInfo, OpMeta, Scope};
 use crate::{op, Empty};
 use crate::envelope::Actor;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 result!(#[schemars(rename = "BusPong")] Pong { pub pong: bool, pub instance: String, pub version: String, pub uptime_s: u64 });
 op!(Ping, "bus.ping", Empty => Pong, OpMeta::query(Scope::Global, 1, "Liveness: instance, version, uptime"));
@@ -22,6 +22,9 @@ payload!(#[schemars(rename = "BusWaitIn")] WaitIn {
     pub timeout_ms: Option<u64>,
     /// Only an event whose payload has every one of these top-level keys equal to the value
     /// given, e.g. `{"request_id": 7}`. Omit to take the first event that matches by name.
+    /// Anything but an object is `bus.schema`: read as "no filter", it woke on any event.
+    #[serde(default, deserialize_with = "matching_object")]
+    #[schemars(with = "Option<Map<String, Value>>")]
     pub matching: Option<Value>,
 });
 result!(#[schemars(rename = "BusWaitOut")] WaitOut {
@@ -55,7 +58,10 @@ op!(Subscribe, "bus.subscribe", SubscribeIn => SubscribeOut,
 op!(Unsubscribe, "bus.unsubscribe", Empty => Empty,
     OpMeta::query(Scope::Global, 1, "Stop receiving events on this connection").doors(Doors::SocketOnly));
 
-#[allow(dead_code)]
-const _ACTORS_USED: Actors = Actors::All;
+/// `bus.wait {matching}` stays a `Value` for the door that reads it; only its shape is checked.
+fn matching_object<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
+    let matching: Option<Map<String, Value>> = serde::Deserialize::deserialize(d)?;
+    Ok(matching.map(Value::Object))
+}
 
 entries!(Ping, Schema, Ops, Whoami, Wait, Subscribe, Unsubscribe);

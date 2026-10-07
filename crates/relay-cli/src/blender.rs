@@ -8,7 +8,7 @@
 //!
 //! Environment: `BLENDER_BIN` names the Blender executable when it is not on `PATH`.
 
-use crate::unreal::{rpc_error, tool, tool_result};
+use crate::mcp::tool;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 use std::io::Write;
@@ -16,11 +16,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-const FALLBACK_PROTOCOL: &str = "2025-06-18";
-const SUPPORTED_PROTOCOLS: &[&str] = &["2026-07-28", "2025-11-25", FALLBACK_PROTOCOL];
 /// Folders a file listing never enters.
 const SKIP_DIRS: [&str; 9] = [".git", "node_modules", ".relay", "Binaries", "Intermediate", "Saved", "DerivedDataCache", "target", ".venv"];
 const ASSET_EXTENSIONS: [&str; 7] = ["blend", "fbx", "obj", "glb", "gltf", "abc", "usd"];
+/// The most art files one listing returns, and how many folders deep it looks.
+const MAX_LISTED: usize = 500;
+const MAX_DEPTH: usize = 8;
 /// The most of a run's printed output (or failure text) a reply carries, like the Unreal server.
 /// run.py keeps no more than this of what the agent's script prints, so the pipe stays small too.
 const MAX_OUTPUT: usize = 60_000;
@@ -46,38 +47,16 @@ fn lane(name: &str, _args: &Value) -> crate::mcp::Lane {
     if name == "blender_to_unreal" { crate::mcp::Lane::Serial } else { crate::mcp::Lane::Parallel }
 }
 
+const SERVER: crate::mcp::PluginServer = crate::mcp::PluginServer {
+    name: "blender",
+    title: "Blender (Relay plugin)",
+    instructions: "Blender in background mode on .blend files in this checkout; no Blender window is needed. Start with blender_info (no file lists the art files). Look with blender_render, check rigs with blender_rig_check, measure animations with blender_anim_inspect, export with blender_export, and send to a running Unreal editor with blender_to_unreal. Load the blender-fundamentals skill first.",
+    tools,
+    call,
+};
+
 fn handle(message: &Value) -> Option<Value> {
-    let id = message.get("id").cloned()?;
-    let result = match message.get("method").and_then(Value::as_str) {
-        Some("initialize") => {
-            let requested = message.pointer("/params/protocolVersion").and_then(Value::as_str).unwrap_or(FALLBACK_PROTOCOL);
-            let protocol = SUPPORTED_PROTOCOLS.iter().copied().find(|v| *v == requested).unwrap_or(FALLBACK_PROTOCOL);
-            json!({
-                "protocolVersion": protocol,
-                "capabilities": {"tools":{"listChanged":false}},
-                "serverInfo": {"name":"blender","title":"Blender (Relay plugin)","version":env!("CARGO_PKG_VERSION")},
-                "instructions": "Blender in background mode on .blend files in this checkout; no Blender window is needed. Start with blender_info (no file lists the art files). Look with blender_render, check rigs with blender_rig_check, measure animations with blender_anim_inspect, export with blender_export, and send to a running Unreal editor with blender_to_unreal. Load the blender-fundamentals skill first."
-            })
-        }
-        Some("ping") => json!({}),
-        Some("tools/list") => json!({"tools": tools()}),
-        Some("tools/call") => {
-            let Some(name) = message.pointer("/params/name").and_then(Value::as_str) else {
-                return Some(rpc_error(id, -32602, "Invalid params", Some(json!({"message":"tools/call requires params.name"}))));
-            };
-            let arguments = message.pointer("/params/arguments").cloned().unwrap_or_else(|| json!({}));
-            if !tools().iter().any(|tool| tool["name"] == name) {
-                return Some(rpc_error(id, -32602, "Unknown tool", Some(json!({"name":name}))));
-            }
-            match call(name, &arguments) {
-                Ok(value) => tool_result(value, false),
-                Err(error) => tool_result(json!({"error": format!("{error:#}")}), true),
-            }
-        }
-        Some(other) => return Some(rpc_error(id, -32601, "Method not found", Some(json!({"method":other})))),
-        None => return Some(rpc_error(id, -32600, "Invalid Request", None)),
-    };
-    Some(json!({"jsonrpc":"2.0","id":id,"result":result}))
+    crate::mcp::plugin_reply(&SERVER, message)
 }
 
 fn file_arg() -> Value {
@@ -148,7 +127,7 @@ fn tools() -> Vec<Value> {
                 "touch_distance":{"type":"number","description":"cm, default 5"}
             }), &["file"], true),
         tool("blender_export",
-            "Export FBX for Unreal. kind static (a mesh with its SOCKET_ empties, UCX_/UBX_/USP_ collision and _LODn children), skeletal (an armature and the meshes skinned to it; deform bones only, no leaf bones; animations=true bakes the action) or animation (the armature's action only). Settings are Unreal's usual ones; fbx_options overrides any exporter option. Reports the size in cm to compare after import.",
+            "Export FBX for Unreal. kind static (a mesh with its SOCKET_ empties, UCX_/UBX_/USP_/UCP_ collision and _LODn children), skeletal (an armature and the meshes skinned to it; deform bones only, no leaf bones; animations=true bakes the action) or animation (the armature's action only). Settings are Unreal's usual ones; fbx_options overrides any exporter option except filepath, use_selection and check_existing (use path and objects). Reports the size in cm to compare after import.",
             json!({
                 "file": file_arg(),
                 "objects":{"type":"array","items":{"type":"string"}},
@@ -161,7 +140,7 @@ fn tools() -> Vec<Value> {
                 "allow_problems":{"type":"boolean","description":"Export even when the mesh check or armature scale finds problems"}
             }), &["file","path"], false),
         tool("blender_to_unreal",
-            "Export from Blender and import into the running Unreal editor in one step, then measure the result: imported assets, their size against the Blender size (a 100x difference means a unit problem), a skeletal mesh's root bone scale and which way it faces, and which hand ends up on which side. Needs the Unreal plugin on and the editor open.",
+            "Export from Blender and import into the running Unreal editor in one step, then measure the result: imported assets, their size against the Blender size (a 100x difference means a unit problem), a skeletal mesh's root bone scale and which way it faces (a mirrored rig shows there; hand_sides only reflects bone names). Needs the Unreal plugin on and the editor open.",
             json!({
                 "file": file_arg(),
                 "objects":{"type":"array","items":{"type":"string"}},
@@ -276,31 +255,51 @@ fn resolve_new(root: &Path, file: &str, extension: &str) -> Result<PathBuf> {
     Ok(root.join(file))
 }
 
+/// The art files in the checkout, at most `MAX_LISTED` of them. A listing that stopped at the
+/// cap or did not look below `MAX_DEPTH` says so, rather than passing for complete (RA-281).
 fn list_files(root: &Path) -> Value {
-    fn walk(dir: &Path, root: &Path, depth: usize, out: &mut Vec<Value>) {
-        if depth > 8 || out.len() >= 500 {
-            return;
-        }
+    #[derive(Default)]
+    struct Listing { files: Vec<Value>, truncated: bool, too_deep: usize }
+    fn walk(dir: &Path, root: &Path, depth: usize, out: &mut Listing) {
         let Ok(entries) = std::fs::read_dir(dir) else { return };
         let mut entries: Vec<_> = entries.flatten().collect();
         entries.sort_by_key(|e| e.file_name());
         for entry in entries {
+            if out.truncated {
+                return;
+            }
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
             if path.is_dir() {
-                if !SKIP_DIRS.contains(&name.as_str()) && !name.starts_with('.') {
+                if SKIP_DIRS.contains(&name.as_str()) || name.starts_with('.') {
+                    continue;
+                }
+                if depth >= MAX_DEPTH {
+                    out.too_deep += 1;
+                } else {
                     walk(&path, root, depth + 1, out);
                 }
             } else if path.extension().is_some_and(|e| ASSET_EXTENSIONS.contains(&e.to_string_lossy().to_lowercase().as_str())) {
+                if out.files.len() >= MAX_LISTED {
+                    out.truncated = true;
+                    return;
+                }
                 let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                out.push(json!({"file": path.strip_prefix(root).unwrap_or(&path), "bytes": size}));
+                out.files.push(json!({"file": path.strip_prefix(root).unwrap_or(&path), "bytes": size}));
             }
         }
     }
-    let mut files = Vec::new();
-    walk(root, root, 0, &mut files);
+    let mut listing = Listing::default();
+    walk(root, root, 0, &mut listing);
     let blender = find_blender().map(|p| p.display().to_string()).map_err(|e| e.to_string());
-    json!({"root": root, "files": files, "blender": blender.as_ref().ok(), "blender_problem": blender.err()})
+    let mut value = json!({"root": root, "files": listing.files, "blender": blender.as_ref().ok(), "blender_problem": blender.err()});
+    if listing.truncated {
+        value["truncated"] = json!(format!("only the first {MAX_LISTED} art files are listed; open a file by name with blender_info file"));
+    }
+    if listing.too_deep > 0 {
+        value["not_searched"] = json!(format!("folders more than {MAX_DEPTH} levels deep were not searched: {}", listing.too_deep));
+    }
+    value
 }
 
 fn find_blender() -> Result<PathBuf> {
@@ -365,19 +364,17 @@ fn run(body: &str, args: &Value, file: Option<&Path>, timeout: Duration) -> Resu
         .ok_or_else(|| anyhow!("Blender did not finish within {} s and was stopped", timeout.as_secs()))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    // The agent's script prints between markers; Blender's own start-up lines stay out.
-    let printed: Vec<&str> = stdout.lines()
-        .skip_while(|l| *l != "RELAY_OUT_BEGIN").skip(1)
-        .take_while(|l| *l != "RELAY_OUT_END")
-        .collect();
+    let printed = printed(&stdout);
     let result = stdout.lines().rev().find_map(|l| l.strip_prefix("RELAY_JSON:"));
     if !output.status.success() || (result.is_none() && body != PY_RUN) {
         bail!("Blender failed:\n{}\n(sandbox {})", failure_text(&stdout, &stderr), sandbox.describe());
     }
     let mut value = match result {
-        Some(json_text) => serde_json::from_str(json_text)?,
+        Some(json_text) => serde_json::from_str(json_text).context("the script's RELAY_JSON line is not JSON")?,
         None => json!({}),
     };
+    // Fields are added below; indexing anything but an object would panic (RA-301).
+    anyhow::ensure!(value.is_object(), "the script's result is not a JSON object: {}", tail(&value.to_string(), 5));
     if body == PY_RUN {
         // The agent's own script: its printed output is the result.
         value["output"] = json!(tail(&printed.join("\n"), 300));
@@ -387,12 +384,29 @@ fn run(body: &str, args: &Value, file: Option<&Path>, timeout: Duration) -> Resu
     Ok(value)
 }
 
-/// The traceback and error lines of a failed run, without Blender's start-up noise.
+/// What the agent's script printed: run.py puts it between markers, so Blender's own start-up
+/// lines stay out.
+fn printed(stdout: &str) -> Vec<&str> {
+    stdout.lines()
+        .skip_while(|l| *l != "RELAY_OUT_BEGIN").skip(1)
+        .take_while(|l| *l != "RELAY_OUT_END")
+        .collect()
+}
+
+/// The traceback and error lines of a failed run, without Blender's start-up noise, after the
+/// end of what the script printed. The traceback reaches stderr after everything printed to
+/// stdout, so starting at it dropped the output that shows how far the script got (RA-282).
 fn failure_text(stdout: &str, stderr: &str) -> String {
     let all: Vec<&str> = stdout.lines().chain(stderr.lines()).collect();
     let start = all.iter().position(|l| l.starts_with("Traceback")).unwrap_or(all.len().saturating_sub(40));
     let lines: Vec<&str> = all[start..].iter().copied().filter(|l| !l.starts_with("EGL Error") && !l.trim().is_empty()).collect();
-    tail(&lines.join("\n"), 60)
+    let printed = printed(stdout);
+    match all.iter().position(|l| *l == "RELAY_OUT_END") {
+        Some(end) if end < start && !printed.is_empty() => {
+            tail(&format!("printed before it failed:\n{}\n\n{}", tail(&printed.join("\n"), 40), tail(&lines.join("\n"), 60)), 110)
+        }
+        _ => tail(&lines.join("\n"), 60),
+    }
 }
 
 /// The last `lines` lines, and at most `MAX_OUTPUT` bytes of them (cut on a char boundary).
@@ -460,19 +474,23 @@ impl Drop for SaveLock {
 fn to_unreal(root: &Path, args: &Value) -> Result<Value> {
     let file = resolve(root, required(args, "file")?)?;
     let kind = required(args, "kind")?;
+    // Asked before an export that can take minutes, not after it (RA-588).
+    let destination = required(args, "destination")?;
     let stem = args["name"].as_str().map(str::to_string)
         .or_else(|| args["objects"][0].as_str().map(str::to_string))
         .unwrap_or_else(|| file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Export".into()));
     let fbx_rel = args["fbx_path"].as_str().map(str::to_string).unwrap_or_else(|| format!("Saved/Relay/Exports/{stem}.fbx"));
     let fbx = resolve_new(root, &fbx_rel, "fbx")?;
     crate::mcp::plugin_gate("blender_to_unreal", Some(&file), &[&fbx])?;
+    // The project, the editor on it and its lock, before the export rather than after it.
+    crate::unreal::import_preflight()?;
     let exported = run(PY_EXPORT, &json!({
         "objects": args["objects"], "path": fbx, "kind": kind, "action": args["action"],
         "animations": args["animations"].as_bool().unwrap_or(kind == "animation"),
         "allow_problems": args["allow_problems"],
     }), Some(&file), Duration::from_secs(600))?;
     let mut import_args = json!({
-        "kind": kind, "destination": required(args, "destination")?, "name": args["name"],
+        "kind": kind, "destination": destination, "name": args["name"],
         "skeleton": args["skeleton"], "animations": args["animations"], "materials": args["materials"],
     });
     import_args["sockets"] = exported["socket_details"].clone();
@@ -496,8 +514,20 @@ fn to_unreal(root: &Path, args: &Value) -> Result<Value> {
 fn compare(exported: &Value, imported: &Value) -> Vec<String> {
     let mut problems = Vec::new();
     if imported["failed"] == true {
+        // Whether each broken asset is gone is what the Asset Registry said after the delete
+        // (`cleaned_up[].deleted`), not assumed (RA-553).
+        let left: Vec<&str> = imported["attempts"].as_array().into_iter().flatten()
+            .flat_map(|attempt| attempt["cleaned_up"].as_array().into_iter().flatten())
+            .filter(|asset| asset["deleted"] == false)
+            .filter_map(|asset| asset["path"].as_str())
+            .collect();
+        let cleanup = if left.is_empty() {
+            "the broken assets were deleted again".to_string()
+        } else {
+            format!("these broken assets could not be deleted and are still in the project: {}", left.join(", "))
+        };
         problems.push(format!(
-            "the import failed with every importer tried and the broken assets were deleted again: {}",
+            "the import failed with every importer tried; {cleanup}: {}",
             serde_json::to_string(&imported["attempts"]).unwrap_or_default()
         ));
     }
@@ -577,6 +607,42 @@ mod tests {
     }
 
     #[test]
+    fn the_art_file_listing_says_when_it_is_cut_short() {
+        let root = tempfile::tempdir().unwrap();
+        let listed = list_files(root.path());
+        assert!(listed["truncated"].is_null() && listed["not_searched"].is_null(), "{listed}");
+        // The cap holds inside one folder too, after a subfolder already filled the list.
+        std::fs::create_dir_all(root.path().join("a")).unwrap();
+        for n in 0..MAX_LISTED {
+            std::fs::write(root.path().join(format!("a/{n:03}.fbx")), "").unwrap();
+        }
+        std::fs::write(root.path().join("b.obj"), "").unwrap();
+        // Named to be walked first, before the cap ends the walk.
+        let mut deep = root.path().to_path_buf();
+        for _ in 0..=MAX_DEPTH {
+            deep.push("0");
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        let listed = list_files(root.path());
+        assert_eq!(listed["files"].as_array().unwrap().len(), MAX_LISTED);
+        assert!(listed["truncated"].as_str().unwrap().contains("first 500"), "{listed}");
+        assert!(listed["not_searched"].as_str().unwrap().ends_with("searched: 1"), "{listed}");
+    }
+
+    #[test]
+    fn a_failure_keeps_what_the_script_printed_before_it() {
+        let stdout = "Blender 5.2\nRELAY_OUT_BEGIN\nstep 1 done\nstep 2 done\nRELAY_OUT_END\n";
+        let stderr = "Traceback (most recent call last):\n  File \"script\", line 3\nValueError: nope\n";
+        let text = failure_text(stdout, stderr);
+        assert!(text.starts_with("printed before it failed:\nstep 1 done\nstep 2 done\n\nTraceback"), "{text}");
+        assert!(text.ends_with("ValueError: nope") && !text.contains("Blender 5.2"), "{text}");
+        // Other scripts print no markers, and a traceback the script printed itself is not repeated.
+        assert_eq!(failure_text("Blender 5.2\n", stderr), failure_text("", stderr));
+        let caught = "RELAY_OUT_BEGIN\nTraceback (most recent call last):\nKeyError: 'x'\nRELAY_OUT_END\n";
+        assert!(!failure_text(caught, stderr).contains("printed before"));
+    }
+
+    #[test]
     fn a_round_trip_flags_units_root_scale_and_facing() {
         let exported = json!({"size_cm": [60.0, 20.0, 178.0], "forward_world": [0.0, -1.0, 0.0]});
         let good = json!({"imported": [{"path": "/Game/Hero", "size_cm": [60.0, 20.0, 178.2], "root_bone_scale": [1.0, 1.0, 1.0], "forward_axis_in_mesh_space": [0.0, 1.0, 0.0]}]});
@@ -588,6 +654,13 @@ mod tests {
         assert!(problems.iter().any(|p| p.contains("mirrored or turned around")));
         let turned = json!({"imported": [{"path": "/Game/Hero", "size_cm": [60.0, 20.0, 178.0], "forward_axis_in_mesh_space": [1.0, 0.0, 0.0]}]});
         assert!(compare(&exported, &turned)[0].contains("rotated"));
+
+        // A failed import names what the registry still holds, rather than claiming it is gone.
+        let attempt = |deleted: bool| json!({"importer": "legacy", "cleaned_up": [{"path": "/Game/Hero", "deleted": deleted}]});
+        let gone = compare(&exported, &json!({"failed": true, "attempts": [attempt(true)]}));
+        assert!(gone[0].contains("deleted again"), "{gone:?}");
+        let stuck = compare(&exported, &json!({"failed": true, "attempts": [attempt(true), attempt(false)]}));
+        assert!(stuck[0].contains("still in the project: /Game/Hero") && !stuck[0].contains("deleted again"), "{stuck:?}");
     }
 
     #[test]
@@ -809,8 +882,9 @@ mod tests {
         let output = chatty["output"].as_str().unwrap();
         assert!(output.len() <= MAX_OUTPUT && output.ends_with("yyy"), "{}", output.len());
 
-        let broken = run(PY_RUN, &json!({"code": "raise ValueError('nope')"}), None, t).unwrap_err();
+        let broken = run(PY_RUN, &json!({"code": "print('got this far')\nraise ValueError('nope')"}), None, t).unwrap_err();
         assert!(format!("{broken:#}").contains("ValueError: nope"), "{broken:#}");
+        assert!(format!("{broken:#}").contains("got this far"), "what the script printed is kept: {broken:#}");
     }
 
     /// The anim_rules fixes (shared with ue_anim_inspect), on a variant of the fixture: a bar at

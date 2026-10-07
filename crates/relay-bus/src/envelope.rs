@@ -44,7 +44,13 @@ impl Actor {
             "test" => Ok(Actor::Test),
             "system" => Ok(Actor::System),
             _ => match s.strip_prefix("agent:") {
-                Some(name) if !name.is_empty() && name.len() <= 64 => {
+                // The same set the schema's `pattern` publishes: a session name, never a path or
+                // anything with spaces, so what the type accepts is what the contract says.
+                Some(name)
+                    if !name.is_empty()
+                        && name.len() <= 64
+                        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') =>
+                {
                     Ok(Actor::Agent(name.to_string()))
                 }
                 _ => Err(format!(
@@ -86,8 +92,8 @@ impl JsonSchema for Actor {
     fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
         schemars::json_schema!({
             "type": "string",
-            "description": "\"user\" | \"agent:<session-name>\" | \"test\" (\"system\" is internal and rejected at every door)",
-            "pattern": "^(user|test|agent:[A-Za-z0-9_-]{1,64})$"
+            "description": "\"user\" | \"agent:<session-name>\" | \"test\" | \"system\". \"system\" is the engine itself: it appears on events, audit rows and holds, and every door rejects a request that claims it",
+            "pattern": "^(user|test|system|agent:[A-Za-z0-9_-]{1,64})$"
         })
     }
 }
@@ -98,7 +104,8 @@ impl JsonSchema for Actor {
 pub struct Request {
     /// Envelope schema major; must equal [`ENVELOPE_V`].
     pub v: u32,
-    /// UUID v4 minted by the caller; idempotency key for 24h.
+    /// UUID v4 minted by the caller; the idempotency key. An audited request's id stays
+    /// deduplicated for as long as its audit row is kept (`audit.retention_days`, BUS.md §5.3).
     pub id: Uuid,
     pub actor: Actor,
     /// `noun.verb` or `noun.sub.verb`.
@@ -136,16 +143,19 @@ impl Request {
     }
 }
 
-/// A response envelope (BUS.md §1.2). Exactly one of `result` / `error` is present.
+// Server-to-client shapes (this, `Response`, `Event`, `Frame`, `BusError`, `Confirm`) accept
+// unknown fields: an additive change does not bump `v` (BUS.md §12), and a strict reader would
+// drop the connection on the first line from a newer engine. Requests and payloads stay strict.
+
+/// The `mail` sideband on a response (BUS.md §1.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct MailHint {
     /// Number of unread priority messages for the authenticated agent session.
     pub priority: u32,
 }
 
+/// A response envelope (BUS.md §1.2). Exactly one of `result` / `error` is present.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct Response {
     pub v: u32,
     /// `null` only when the request could not be parsed far enough to read one (`bus.parse`).
@@ -215,7 +225,6 @@ impl Response {
 
 /// A fact about a mutation that already happened (BUS.md §1.3).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct Event {
     pub v: u32,
     /// `noun.changed`, `noun.deleted`, or a domain event.
@@ -247,19 +256,14 @@ impl Event {
         self.cause = Some(id);
         self
     }
-    pub fn in_project(mut self, project_id: Id) -> Self {
-        self.project_id = Some(project_id);
-        self
-    }
 }
 
 /// A data-plane frame (BUS.md §7) as carried on the socket door.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct Frame {
     pub v: u32,
     /// `pty` | `logcat` | `mirror`, all on the socket door (BUS.md §7). `app.log.tail` declares
-    /// a `log` stream but sends no frames yet.
+    /// a `log` stream but is not built: it sends no frames.
     pub stream: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
@@ -275,15 +279,6 @@ pub struct Frame {
     /// base64 for `pty`; a line for `logcat`; for `mirror`, a base64 video packet or a status
     /// object (state, picture size, device, and the typed reason on the last one).
     pub data: Value,
-}
-
-/// Any line that can appear on the socket door.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum WireLine {
-    Response(Response),
-    Event(Event),
-    Frame(Frame),
 }
 
 #[cfg(test)]

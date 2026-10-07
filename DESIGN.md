@@ -117,8 +117,9 @@ Live and held colors retain their meanings in every mode.
 - **Live Green** (`live`): running session lamp.
 - **Attention Red** (`held`): held session lamp and session name;
   also the notice underline.
-- **Waiting Amber** (`waiting`): reserved in the theme for waiting states.
-  Waiting lamps currently use secondary ink. All terminal frames remain neutral.
+- **Waiting Amber** (`waiting`): waiting states. Starting and restorable session
+  lamps, the mirror's waiting lamp, review and pending markers, unsaved notes and
+  the guardrail prompt's top rule use it. All terminal frames remain neutral.
 
 ### Neutral
 - **Wall**: canvas and gaps between plates. **Console**: bars, sidebar and strips.
@@ -138,9 +139,10 @@ not CSS pixels. GTK owns scaling and metrics.
 
 Body, titles, controls and labels use their frontmatter roles. Status text is
 11px plain sans; session names are 13px semibold. The RELAY wordmark increases
-tracking to 0.16em. GtkSourceView uses system monospace and the installed
-Adwaita-dark syntax scheme when available; it does not yet reproduce the full
-Relay-2 editor palette.
+tracking to 0.16em. The Code editor's GtkSourceView sets Fira Mono at 12.5px
+(`.code-source`) and the bundled Relay scheme (`resources/relay-editor.xml`,
+Relay-2's syntax colours over Adwaita-dark), installed as `relay-matte`,
+`relay-dark` and `relay-oled` with each mode's background.
 
 ## Layout
 
@@ -163,9 +165,8 @@ Grid mode uses square terminal plates with 2px gutters and one, two or three
 columns. The two-column wall has a draggable divider. Focus shows one session
 with session tabs; Review places the focused session beside the remaining
 stack. Plates request at least 280 by 280 and the wall scrolls vertically.
-Sessions can be reordered or focused within the wall. A collapsible
-file rail sits beside the wall. Layout selection, order and split position can
-be saved. There are no automatic mobile breakpoints.
+Sessions can be reordered or focused within the wall. Layout selection, order
+and split position can be saved. There are no automatic mobile breakpoints.
 
 Code uses resizable file-tree, editor and Git regions with a worktree selector.
 Its tree split starts at 240px; file and Git regions can be hidden. Notes uses a
@@ -204,20 +205,25 @@ names also turn red.
 ## Components
 
 ### Buttons
-Keys have a 28px minimum height. Ordinary keys use slab, primary keys use ink,
+Keys have a 26px minimum height. Ordinary keys use slab, primary keys use ink,
 and quiet keys are transparent with secondary text. Hover uses wash except for
-primary keys, which brighten to white. Keyboard focus uses an inset 2px ink
-outline; disabled keys use 45% opacity.
+primary keys, which brighten to white. Keyboard focus draws a 2px outline of ink
+at 35% alpha just outside the key (`outline-offset: 0`). Disabled keys use 40%
+opacity; a few compact controls dim further or less (0.32 to 0.55).
 
 ### Inputs / Fields
-Entries use screen fill, an edge stroke and a 30px minimum height. Focus changes
+Entries use screen fill, an edge stroke and a 28px minimum height. Focus changes
 the stroke to secondary. Native text views have 8px padding and ink carets.
 GTK supplies editing, selection and accessibility semantics.
 
 ### Navigation
 Sidebar navigation selects with wash and ink. Compact project rows have a 30px
 minimum height; the active project adds a 2px ink rail. Focus-session tabs use
-neutral wash for selection. GTK owns window controls and menus.
+neutral wash for selection. The main window draws its own minimize, maximize
+and close keys in the top bar (`.window-control`: transparent, wash on hover,
+held red when hovering close). The Notes window styles its own titlebar
+controls, menu bar and popover menus (`css/notes.css`), and the sidebar row,
+board, Git and branch menus carry their own popover styling.
 
 ### Icons
 `apps/relay-native/src/icons.rs` carries the pinned Relay-2 SVG path geometry.
@@ -231,7 +237,7 @@ matching path geometry alone is not proof of complete rendering fidelity.
 
 ### Records / Containers
 Records are flat square slabs with 12px padding. Board lanes use console fill
-and 4px padding. Notices use slab, ink and an attention-colored bottom rule.
+and 8px padding. Notices use slab, ink and an attention-colored bottom rule.
 
 ### Terminal plate
 VTE owns rendering and scrolling. Terminal margins are 10px left, 2px right,
@@ -279,7 +285,11 @@ requirements, not evidence that every corresponding surface is complete.
 - Do preserve native keyboard focus, selection and clipboard behavior.
 
 ### Don't:
-- Don't add decorative accent colors, pill surfaces or idle animation.
+- Don't add decorative accent colors, pill surfaces or idle animation. The
+  guardrail prompt is the deliberate exception: as the one floating surface it is
+  rounded (10px card, 6px keys, round icon and "more" keys), shadowed and fades
+  in and out (`css/guardrails.css`). The adb lease card (8px) and the mirror's
+  device screen (12px) are rounded too.
 - Don't copy web layout rules into GTK without checking native behavior.
 - Don't treat imported roadmap surfaces as implemented UI.
 - Don't claim full parity, sustained performance or complete accessibility from screenshots alone.

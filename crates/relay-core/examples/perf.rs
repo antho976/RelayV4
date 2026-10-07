@@ -1189,7 +1189,7 @@ fn cases() -> Vec<Case> {
     });
     fixed(&mut c, "dashboard.get", U, Cheap, json!({}));
 
-    // ---- ui / os (core answers ui.* from its in-memory shell model, client or not; os.* hand the
+    // ---- ui / os (core answers ui.* from its in-memory shell model, client or not; os.* hands the
     // target to `xdg-open` after commit — the stand-in, which logs it)
     fixed(&mut c, "ui.state", U, Cheap, json!({}));
     fixed(&mut c, "ui.page.switch", U, Cheap, json!({"page": "board", "project_id": 1}));

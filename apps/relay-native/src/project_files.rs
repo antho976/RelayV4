@@ -61,7 +61,7 @@ impl Editor {
         );
     }
     pub fn prepare_project(self: &Rc<Self>, ui: &Rc<Ui>) {
-        self.load_tree(ui, None);
+        self.load_tree(ui);
         self.refresh_scopes(ui);
         self.refresh_git(ui);
         self.update_scope_label(ui);
@@ -119,7 +119,7 @@ impl Editor {
         self.expanded.borrow_mut().clear();
         *self.worktree.borrow_mut() = path.into();
         self.search.set_text("");
-        self.load_tree(ui, None);
+        self.load_tree(ui);
         self.refresh_git(ui);
         self.update_scope_label(ui);
         if agents {

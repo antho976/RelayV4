@@ -59,6 +59,11 @@ and richer conflict handling remain in the Code roadmap.
 `relay remote serve` (`crates/relay-remote`) fronts the same socket door for a paired
 phone over a WebSocket: directly on the LAN, or through a rendezvous server the person
 hosts (`relay remote rendezvous`) that the engine dials out to. Every line a phone sends is
-gated to actor `user` and then written to the Unix socket unchanged; every line back is
-forwarded as-is, `pty` frames included. The door adds pairing and a per-connection proof of
-the device token; it adds no ops. See `docs/MOBILE.md`.
+gated, one line at a time even when a frame carries several: the actor must be `user`, and
+the op must be in `wire::PHONE_OPS` (the ops the app calls, plus `bus.unsubscribe`); anything
+else is answered by the door (`bus.actor` for a wrong actor, `refused` / `remote.op` for an
+op outside the list). A line that passes is written to the Unix socket unchanged; every line
+back is forwarded as-is, `pty` frames included. The door adds pairing and a per-connection
+proof of the device token; it adds no ops. The PC dials the rendezvous with the room secret
+in an `Authorization: Bearer` header, retrying once with `?secret=` for an older server. See
+`docs/MOBILE.md`.

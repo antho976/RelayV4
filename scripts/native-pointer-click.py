@@ -4,6 +4,11 @@ import ctypes as c
 import ctypes.util
 import sys
 
+# Every check here is an assert statement, and some perform the action they check;
+# under -O they would vanish and the run would report success without doing anything.
+if sys.flags.optimize:
+    raise SystemExit("Run without python -O or PYTHONOPTIMIZE: this script checks with assert.")
+
 x = c.CDLL(ctypes.util.find_library('X11'))
 t = c.CDLL(ctypes.util.find_library('Xtst'))
 Window = c.c_ulong
@@ -53,7 +58,8 @@ try:
     window = find(root)
     assert window, 'The disposable test window was not found'
     px, py, child = c.c_int(), c.c_int(), Window()
-    assert translate(display, window, root, int(sys.argv[2]), int(sys.argv[3]), c.byref(px), c.byref(py), c.byref(child))
+    if not translate(display, window, root, int(sys.argv[2]), int(sys.argv[3]), c.byref(px), c.byref(py), c.byref(child)):
+        raise SystemExit('Could not translate the click into root window coordinates')
     raise_window(display, window)
     focus(display, window, 2, 0)
     motion(display, -1, px.value, py.value, 0)

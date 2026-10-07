@@ -81,6 +81,13 @@ def main():
     native = read_jsonl(run / "native.jsonl")
     scale = {r["name"].split("@")[0]: r for r in read_jsonl(run / "scale10.jsonl")}
     strace = {r["name"]: r for r in read_jsonl(run / "strace.jsonl")}
+    # A strace that could not attach (Yama ptrace_scope, see baseline.py's strace_blocked) leaves
+    # perf.rs an empty count file, which it reports as 0 for every scenario. No real pass is empty
+    # across the board, so read that as "no data", not as zero syscalls.
+    strace_note = env.get("strace_skipped")
+    if strace and not any(((r.get("strace") or {}).get("top")) for r in strace.values()):
+        strace_note = "every scenario came back with no syscalls at all, so strace did not attach; the column is empty"
+        strace = {}
     profiles = json.loads((run / "profiles.json").read_text()) if (run / "profiles.json").exists() else {}
     soak = json.loads((run / "soak.json").read_text()) if (run / "soak.json").exists() else None
     process = json.loads((run / "process.json").read_text()) if (run / "process.json").exists() else None
@@ -104,6 +111,8 @@ def main():
     p("- **cpu**: process CPU time per iteration (user + system, every thread). Above wall means other threads worked; below means the iteration waited.")
     p("- **allocs / bytes**: heap allocations and bytes requested per iteration, counted by a global allocator wrapper.")
     p("- **syscalls**: from a separate strace pass with fewer iterations; the count is per iteration, every thread.")
+    if strace_note:
+        p(f"  Not measured in this run: {strace_note}.")
     p("- **Ir**: instructions retired per iteration under callgrind, deterministic. The breakdown is self cost by subsystem.")
     p("- **result**: size of the JSON result the op returned, which is what crosses the socket to a client.")
     p("- A row whose outcome is an error code measured that refusal path; the note beside the group says why.")
@@ -152,7 +161,7 @@ def main():
         p("|---|---:|---:|---:|---:|---:|---:|---:|---:|---|")
         for r in rows:
             st = strace.get(r["name"], {}).get("strace") or {}
-            sc = round(st["total"] / strace[r["name"]]["iters"], 1) if st and strace[r["name"]]["iters"] else "–"
+            sc = round(st["total"] / strace[r["name"]]["iters"], 1) if st.get("total") is not None and strace[r["name"]]["iters"] else "–"
             pr = profiles.get(r["name"], {})
             p(f"| `{r['name']}` | {us(r['wall_ns']['p50'])} | {us(r['wall_ns']['p95'])} | {us(r['cpu_ns_per_iter'])} | {r['allocs_per_iter']} | {kb(r['alloc_bytes_per_iter'])} | {sc} | {kb(r['result_bytes'])} | {ir(pr.get('ir_per_iter'))} | {outcome(r)} |")
         p("")
@@ -191,7 +200,7 @@ def main():
             p("")
 
     if soak:
-        p("## Memory over 20 000 mixed operations")
+        p(f"## Memory over {soak.get('ops', 20000):,} mixed operations".replace(",", " "))
         p("")
         p("Ten ops per round (session.list, task.list, a keystroke, a scrollback tail, task.update, notes.list, settings.set, mailbox.list, app.status, git.status). Live heap is what the allocator wrapper has handed out and not been given back; RSS is the process; store is the SQLite file.")
         p("")
@@ -219,7 +228,7 @@ def main():
         b = process["phases"].get("burst_50k_lines_attached")
         if b:
             p("")
-            p(f"- burst of 50 000 lines (4.9 MB) to an attached client: stream quiet after **{b['seconds_until_stream_quiet']} s** (includes a 1 s silence wait), {b['engine_cpu_ms']} ms engine CPU, {b['frames']} frames, {kb(b['wire_bytes_received'])} on the wire carrying {kb(b['payload_bytes_received'])} of the {kb(b['payload_bytes'])} payload")
+            p(f"- burst of 50 000 lines (4.9 MB) to an attached client: stream quiet after **{b['seconds_until_stream_quiet']} s** (includes a 1 s silence wait), {b['engine_cpu_ms']} ms engine CPU, {b['frames']} frames{', ' + str(b['frames_dropped']) + ' dropped by the engine' if 'frames_dropped' in b else ''}, {kb(b['wire_bytes_received'])} on the wire carrying {kb(b['payload_bytes_received'])} of the {kb(b['payload_bytes'])} payload")
         if process.get("cli"):
             p("")
             p("| CLI call | min | p50 | max |")

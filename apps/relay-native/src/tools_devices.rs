@@ -8,7 +8,7 @@ use std::rc::Rc;
 
 pub async fn refresh(ui: &Rc<Ui>, project: i64) {
     let generation = ui.generation.get();
-    let result = ui.call("device.list", json!({})).await;
+    let (result, avds) = tokio::join!(ui.call("device.list", json!({})), ui.call("avd.list", json!({})));
     if !current(ui, "devices", project, generation) {
         return;
     }
@@ -19,6 +19,7 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
             return;
         }
     };
+    let avds = avds.map(|value| rows(&value, "avds"));
     let page = &ui.pages["devices"];
     if ui.page_projects.borrow().get("devices") != Some(&project) {
         ui.page_projects.borrow_mut().remove("devices");
@@ -39,7 +40,7 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
         if !current(ui, "devices", project, generation) {
             return;
         }
-        let tree = build_form(ui, page, project, &devices, &worktrees, last.as_deref());
+        let tree = build_form(ui, page, project, &worktrees, last.as_deref());
         mark_dirty(ui, project, vec![tree]);
         avd_form(ui, page);
         // Devices, release signing and history. Signing holds a form being typed into, so
@@ -51,12 +52,10 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
         ui.page_projects
             .borrow_mut()
             .insert("devices".into(), project);
-    } else {
-        sync_targets(&devices);
     }
+    sync_targets(&devices, avds.as_deref().unwrap_or_default());
     // Read everything first, then redraw in one go: a list rebuilt across awaits shrinks
     // under someone scrolled down to the history.
-    let avds = ui.call("avd.list", json!({})).await;
     let (signing, runs) = if project > 0 {
         (
             Some(ui.call("device.signing.get", json!({"project_id":project})).await),
@@ -73,13 +72,7 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
     let list = signing_box.prev_sibling().unwrap().downcast::<gtk::Box>().unwrap();
     clear(&list);
     let all = section(&list, "Devices");
-    let avds = match avds {
-        Ok(value) => rows(&value, "avds"),
-        Err(error) => {
-            all.append(&paragraph(&format!("Virtual devices unavailable: {error}")));
-            Vec::new()
-        }
-    };
+    let avds = listed_avds(&all, avds);
     device_list(ui, &all, &devices, &avds);
     match signing {
         None => clear(&signing_box),
@@ -92,17 +85,7 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
                 text(&signing, "key_alias"),
                 text(&signing, "keystore")
             )));
-            action(
-                ui,
-                &row,
-                if enabled {
-                    "Use project signing"
-                } else {
-                    "Use Relay signing"
-                },
-                "device.signing.set_enabled",
-                json!({"project_id":project,"enabled":!enabled}),
-            );
+            signing_toggle(ui, &row, project, enabled);
         }
         // Keep the form already shown, and whatever is typed into it.
         Some(Ok(_)) if signing_box.first_child().is_some_and(|row| row.widget_name() == "signing-form") => {}
@@ -153,10 +136,7 @@ pub async fn refresh(ui: &Rc<Ui>, project: i64) {
                     let path = artifact.to_string();
                     copy.connect_clicked(move |b| b.clipboard().set_text(&path));
                 }
-                if matches!(
-                    text(&run, "state"),
-                    "building" | "running" | "installing" | "launching"
-                ) {
+                if is_active(&run) {
                     action(
                         ui,
                         &row,
@@ -184,19 +164,52 @@ thread_local! {
     static TARGETS: std::cell::RefCell<Option<Targets>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Connected devices a run can target, as (serial, title).
-fn device_targets(devices: &[Value]) -> Vec<(String, String)> {
+/// Connected devices a run can target, as (serial, title): a running AVD by its name, and a
+/// leased device marked, since a run on it is refused until the lease goes. Both surfaces' pickers.
+fn device_targets(devices: &[Value], avds: &[Value]) -> Vec<(String, String)> {
     devices
         .iter()
         .filter(|device| text(device, "state") == "device")
-        .map(|device| (text(device, "serial").to_string(), format!("{} · {}", text(device, "model"), text(device, "serial"))))
+        .map(|device| {
+            let serial = text(device, "serial");
+            let name = avds.iter().find(|avd| avd["running_serial"] == serial).map_or(text(device, "model"), |avd| text(avd, "name"));
+            let busy = if device["lease"]["action"].is_string() { " · in use" } else { "" };
+            (serial.to_string(), format!("{} · {serial}{busy}", name.replace('_', " ")))
+        })
         .collect()
+}
+
+/// The AVDs `avd.list` gave, or a line in `parent` saying why there are none.
+fn listed_avds(parent: &gtk::Box, avds: Result<Vec<Value>, crate::client::Error>) -> Vec<Value> {
+    match avds {
+        Ok(avds) => avds,
+        Err(error) => {
+            parent.append(&paragraph(&format!("Virtual devices unavailable: {error}")));
+            Vec::new()
+        }
+    }
+}
+
+/// A build or run that is still going, and so has a Stop button.
+fn is_active(run: &Value) -> bool {
+    matches!(text(run, "state"), "building" | "running" | "installing" | "launching")
+}
+
+/// Switches a project with a Relay key between it and the project's own Gradle signing.
+fn signing_toggle(ui: &Rc<Ui>, parent: &gtk::Box, project: i64, enabled: bool) {
+    action(
+        ui,
+        parent,
+        if enabled { "Use Gradle signing" } else { "Use Relay signing" },
+        "device.signing.set_enabled",
+        json!({"project_id":project,"enabled":!enabled}),
+    );
 }
 
 /// Refill "Target device" when the connected devices change, keeping the chosen one if it
 /// is still there. Its `changed` handler recomputes the Run button.
-fn sync_targets(devices: &[Value]) {
-    let next = device_targets(devices);
+fn sync_targets(devices: &[Value], avds: &[Value]) {
+    let next = device_targets(devices, avds);
     let Some(combo) = TARGETS.with(|targets| {
         let mut targets = targets.borrow_mut();
         let targets = targets.as_mut()?;
@@ -557,7 +570,6 @@ pub(crate) async fn verify_worktree_picker(ui: &Rc<Ui>) {
         .build();
     window.set_child(Some(&picker.widget));
     window.present();
-    glib::timeout_future(std::time::Duration::from_millis(100)).await;
     // The last build's checkout is preselected; the primary checkout builds with no worktree.
     assert_eq!(picker.active_id().as_deref(), Some(path.as_str()));
     picker.choose(0);
@@ -569,25 +581,19 @@ pub(crate) async fn verify_worktree_picker(ui: &Rc<Ui>) {
     assert!(!visible(0) && visible(1), "Search must hide branches that do not match");
     picker.inner.search.emit_activate();
     assert_eq!(picker.active_id().as_deref(), Some(path.as_str()));
-    assert!(
-        window.width() <= 430,
-        "Long branch and path must not expand the device surface: {}px",
-        window.width()
-    );
+    // Measure what the picker asks for: an unallocated window reports a width of 0 (RA-721).
+    let minimum = picker.widget.measure(gtk::Orientation::Horizontal, -1).0;
+    assert!(minimum <= 430, "Long branch and path must not expand the device surface: {minimum}px");
     window.close();
 }
 
-fn build_form(ui: &Rc<Ui>, page: &gtk::Box, project: i64, devices: &[Value], worktrees: &[Value], last: Option<&str>) -> WorktreePicker {
+/// The target picker starts empty: `refresh` fills it through `sync_targets` right after.
+fn build_form(ui: &Rc<Ui>, page: &gtk::Box, project: i64, worktrees: &[Value], last: Option<&str>) -> WorktreePicker {
     let form = section(page, "Build & run");
     let tree = WorktreePicker::new(worktrees, last);
     field("Build from", &tree.widget, &form);
     let target = gtk::ComboBoxText::new();
-    let shown = device_targets(devices);
-    for (serial, title) in &shown {
-        target.append(Some(serial), title);
-    }
-    target.set_active(Some(0));
-    TARGETS.with(|targets| *targets.borrow_mut() = Some(Targets { combo: target.downgrade(), shown }));
+    TARGETS.with(|targets| *targets.borrow_mut() = Some(Targets { combo: target.downgrade(), shown: Vec::new() }));
     field("Target device", &target, &form);
     let variant = gtk::Entry::builder().text("debug").build();
     field("Gradle variant", &variant, &form);
@@ -1074,7 +1080,7 @@ impl Live {
                     Vec::new()
                 }
             };
-            let avds = avds.map(|v| rows(&v, "avds")).unwrap_or_default();
+            let avds = listed_avds(&self.devices, avds.map(|value| rows(&value, "avds")));
             device_list(ui, &self.devices, &devices, &avds);
             self.sync_target(&devices, &avds);
         }
@@ -1092,17 +1098,7 @@ impl Live {
                     },
                     "body",
                 ));
-                action(
-                    ui,
-                    form,
-                    if signing["enabled"] == true {
-                        "Use Gradle signing"
-                    } else {
-                        "Use Relay signing"
-                    },
-                    "device.signing.set_enabled",
-                    json!({"project_id":project,"enabled":signing["enabled"] != true}),
-                );
+                signing_toggle(ui, form, project, signing["enabled"] == true);
             } else {
                 form.append(&label("Gradle signing", "body"));
                 signing_form(ui, form, project);
@@ -1115,16 +1111,8 @@ impl Live {
         let Some((caption, target)) = &self.target else { return };
         let selected = target.active_id();
         target.remove_all();
-        for device in devices {
-            if text(device, "state") == "device" {
-                let busy = device["lease"]["action"].is_string();
-                let serial = text(device, "serial");
-                let name = avds.iter().find(|avd| avd["running_serial"] == serial).map_or(text(device, "model"), |avd| text(avd, "name"));
-                target.append(
-                    Some(serial),
-                    &format!("{} · {}{}", name.replace('_', " "), serial, if busy { " · in use" } else { "" }),
-                );
-            }
+        for (serial, title) in device_targets(devices, avds) {
+            target.append(Some(&serial), &title);
         }
         if !selected.is_some_and(|id| target.set_active_id(Some(&id))) {
             target.set_active(Some(0));
@@ -1139,12 +1127,7 @@ impl Live {
         clear(&self.run_states);
         clear(&self.release_states);
         let runs = rows(value, "runs");
-        for current in runs.iter().filter(|r| {
-            matches!(
-                text(r, "state"),
-                "running" | "building" | "installing" | "launching"
-            )
-        }) {
+        for current in runs.iter().filter(|r| is_active(r)) {
             let state = gtk::Box::new(gtk::Orientation::Horizontal, 9);
             state.add_css_class("device-release-state");
             let copy = label(

@@ -48,9 +48,6 @@ pub(crate) struct Rotation {
     signature: u64,
     revision: u64,
     running: bool,
-    /// Set while a rotation repaints: it has just read the config and library itself, so the
-    /// `refresh` that repaint starts would only fetch the library a second time.
-    quiet: bool,
     /// The image a rotation put up, with the saved wallpaper it stood in for: a different
     /// saved wallpaper (the user chose one) retires it.
     rotated: Option<(Value, String)>,
@@ -110,9 +107,6 @@ fn images(library: &Value) -> Vec<&str> {
 pub(crate) fn refresh(ui: &Rc<Ui>) {
     let revision = {
         let mut state = ui.wallpaper_rotation.borrow_mut();
-        if state.quiet {
-            return;
-        }
         state.revision += 1;
         state.revision
     };
@@ -229,9 +223,7 @@ pub(crate) async fn rotate_once(ui: &Rc<Ui>) -> Result<bool, Error> {
     let index = uuid::Uuid::new_v4().as_u128() % candidates.len() as u128;
     ui.wallpaper_rotation.borrow_mut().rotated =
         Some((current["value"].clone(), candidates[index as usize].to_string()));
-    ui.wallpaper_rotation.borrow_mut().quiet = true;
     ui.load_appearance();
-    ui.wallpaper_rotation.borrow_mut().quiet = false;
     Ok(true)
 }
 

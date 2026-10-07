@@ -2,28 +2,13 @@
 //! a wake-up, a plan preflight, honest completion, peer intent, and one call that says who
 //! you are (docs/DECISIONS.md D115 … D119). Exercised as a bound agent, through the bus.
 
-use relay_bus::{Actor, Request, Response};
+mod common;
+
+use common::{call_as as call, committed_repo, engine_with_project, ok_as as ok};
+use relay_bus::{Actor, Request};
 use relay_core::engine::{Door, Engine};
-use relay_core::{Instance, Store};
 use serde_json::{json, Value};
-use std::path::Path;
-use std::process::Command;
 use std::sync::Arc;
-
-fn git(repo: &Path, args: &[&str]) {
-    let out = Command::new("git").arg("-C").arg(repo).args(args).output().unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-}
-
-fn call(engine: &Engine, actor: Actor, op: &str, payload: Value) -> Response {
-    engine.dispatch(Request::new(actor, op, payload), Door::InProcess)
-}
-
-fn ok(engine: &Engine, actor: Actor, op: &str, payload: Value) -> Value {
-    call(engine, actor, op, payload)
-        .into_result()
-        .unwrap_or_else(|error| panic!("{op} failed: {} {}", error.code, error.message))
-}
 
 fn refusal(engine: &Engine, actor: Actor, op: &str, payload: Value) -> relay_bus::error::BusError {
     call(engine, actor, op, payload)
@@ -43,22 +28,12 @@ impl Fixture {
         let root = tempfile::tempdir().unwrap();
         let ws = root.path().join("ws");
         let repo = ws.join("app");
-        std::fs::create_dir_all(repo.join("src")).unwrap();
-        git(&repo, &["init", "-q", "-b", "main"]);
-        git(&repo, &["config", "user.email", "features@relay.test"]);
-        git(&repo, &["config", "user.name", "Features"]);
-        std::fs::write(repo.join("src/lib.rs"), "pub fn one() -> i32 { 1 }\n").unwrap();
-        git(&repo, &["add", "."]);
-        git(&repo, &["commit", "-qm", "init"]);
-
-        let store = Store::open(&root.path().join("store/store.db"), false).unwrap();
-        let engine = Engine::new(Instance::Test, store);
-        ok(&engine, Actor::User, "workspace.create", json!({"path": ws}));
-        ok(&engine, Actor::User, "project.add", json!({"workspace_id": 1, "path": repo}));
+        committed_repo(&repo, &[("src/lib.rs", "pub fn one() -> i32 { 1 }\n")]);
+        let engine = engine_with_project(root.path(), &ws, &repo);
         engine.store.with_tx(|tx| {
             tx.execute(
                 "INSERT INTO tasks(project_id,title,body,changelog,col,state,position,created_at,updated_at)
-                 VALUES (1,'Ship the thing','','','active','working',0,?1,?1)",
+                 VALUES (1,'Ship the thing','','','active','dispatched',0,?1,?1)",
                 ["2026-08-19T00:00:00Z"],
             )?;
             Ok(())
@@ -118,7 +93,7 @@ fn claims_are_declarable_releasable_and_report_who_else_holds_the_file() {
     assert_eq!(refusal(&f.engine, f.me(), "session.claim", json!({"paths": []})).code, "session.claim");
 }
 
-/// A one-line answer to "what is that session doing?", which no amount of branch name gives.
+/// Done, close and discard each free the session's claims for the next agent.
 #[test]
 fn finishing_or_closing_releases_claims_for_the_next_agent() {
     for action in ["done", "close", "discard"] {
@@ -137,6 +112,7 @@ fn finishing_or_closing_releases_claims_for_the_next_agent() {
     }
 }
 
+/// A one-line answer to "what is that session doing?", which no amount of branch name gives.
 #[test]
 fn intent_is_one_line_and_reaches_the_peer_table() {
     let f = Fixture::new();
@@ -212,7 +188,8 @@ fn done_can_say_blocked_and_the_task_does_not_move() {
         json!({"session": f.my_name(), "task_id": second["id"]}));
     ok(&f.engine, f.me(), "task.update",
         json!({"task_id": 1, "body": "The first task remains agent-owned after another is attached"}));
-    let queued_state = ok(&f.engine, Actor::User, "task.get", json!({"task_id": 1}))["state"].clone();
+    assert_eq!(ok(&f.engine, Actor::User, "task.get", json!({"task_id": 1}))["state"], "dispatched",
+        "a body edit keeps the queued task's state");
     let blocked = ok(&f.engine, f.me(), "session.done", json!({
         "status": "blocked",
         "summary": "parser extracted",
@@ -222,7 +199,7 @@ fn done_can_say_blocked_and_the_task_does_not_move() {
 
     let task = ok(&f.engine, Actor::User, "task.get", json!({"task_id": 1}));
     assert_eq!(task["column"], "active");
-    assert_eq!(task["state"], queued_state, "blocking the current task must not touch its queue");
+    assert_eq!(task["state"], "dispatched", "blocking the current task must not touch its queue");
     let second_task = ok(&f.engine, Actor::User, "task.get", json!({"task_id": second["id"]}));
     assert_eq!(second_task["state"], "blocked", "only the scalar current task is blocked");
 

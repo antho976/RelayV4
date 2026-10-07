@@ -1,7 +1,12 @@
 # blender_python: the agent's own script, with `bpy` and `ARGS`, then an optional save.
 import addon_utils, collections, io, os
 for module in ARGS.get("addons") or []:
-    addon_utils.enable(module, default_set=True)
+    # enable() prints a failure and returns None instead of raising; carrying on would surface
+    # later as an unrelated "operator could not be found".
+    if addon_utils.enable(module, default_set=True) is None:
+        known = sorted(m.__name__ for m in addon_utils.modules())
+        raise RuntimeError("add-on %r did not load: %s" % (module, "it is installed, so it failed while loading (its error is printed above)" if module in known
+                           else "no add-on by that name; installed: %s" % ", ".join(known[:40])))
 # No .blend1 backups: an overwrite would leave a full-size untracked copy next to the art, which
 # nothing ignores or puts in LFS. Factory-startup preferences are never saved, so this stays here.
 bpy.context.preferences.filepaths.save_version = 0
@@ -43,7 +48,10 @@ class TailBuffer(io.TextIOBase):
         return head + "".join(self.parts)
 
 
-scope = {"bpy": bpy, "ARGS": ARGS, "Vector": Vector, "Matrix": Matrix, "math": math, "emit": emit}
+# __name__ so a script's `if __name__ == "__main__":` block runs. The result must be an object
+# (the server adds output and saved to it), so emit(3) or emit([...]) arrives as {"value": ...}.
+scope = {"__name__": "__main__", "bpy": bpy, "ARGS": ARGS, "Vector": Vector, "Matrix": Matrix, "math": math,
+         "emit": lambda value: emit(value if isinstance(value, dict) else {"value": value})}
 print("RELAY_OUT_BEGIN", flush=True)
 captured = TailBuffer()
 sys.stdout = sys.stderr = captured

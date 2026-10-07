@@ -229,14 +229,16 @@ fn keycode_is_byte_exact() {
 #[test]
 fn text_prefixes_length_and_truncates_on_char_boundary() {
     assert_eq!(mirror::text("hi"), vec![1, 0, 0, 0, 2, b'h', b'i']);
-    // 300-byte cap must not split a multi-byte char: 149 two-byte chars = 298
-    // bytes, one more would land on 300 exactly; use é (2 bytes) * 151 = 302.
-    let s = "é".repeat(151);
+    // 300-byte cap must not split a multi-byte char. A leading ASCII byte puts every
+    // é (2 bytes) on odd offsets, so the one at 299..301 straddles the cap and has to
+    // be dropped whole: 1 + 149 * 2 = 299 bytes. Without the offset 300 is already a
+    // boundary and a naive byte slice would pass.
+    let s = format!("a{}", "é".repeat(150));
     let m = mirror::text(&s);
     let len = u32::from_be_bytes(m[1..5].try_into().unwrap()) as usize;
-    assert_eq!(len, 300); // 150 chars * 2 bytes — boundary-safe
+    assert_eq!(len, 299);
     assert_eq!(m.len(), 5 + len);
-    assert!(std::str::from_utf8(&m[5..]).is_ok());
+    assert_eq!(&m[5..], &s.as_bytes()[..299]);
 }
 
 #[test]
@@ -256,10 +258,12 @@ fn text_chunks_never_truncate_and_stay_under_the_cap() {
     assert_eq!(payload, s.as_bytes());
     assert!(mirror::text_chunks("").is_empty());
 
-    // Multi-byte chars never split: 151 * "é" = 302 bytes -> 300 + 2.
-    let s = "é".repeat(151);
+    // Multi-byte chars never split: "a" + 150 * "é" = 301 bytes, and the é at 299..301
+    // straddles the cap, so the split is 299 + 2 rather than 300 + 1.
+    let s = format!("a{}", "é".repeat(150));
     let chunks = mirror::text_chunks(&s);
-    assert_eq!(chunks.len(), 2);
+    let lens: Vec<usize> = chunks.iter().map(|c| c.len() - 5).collect();
+    assert_eq!(lens, [299, 2]);
     for c in &chunks {
         assert!(std::str::from_utf8(&c[5..]).is_ok());
     }
@@ -652,6 +656,7 @@ mod runtime {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -810,13 +815,36 @@ esac
         call(&e, "device.mirror.stop", json!({"mirror_id":id})).unwrap();
     }
 
+    /// Accept on a non-blocking listener until `stop` is set. The worker can end without ever
+    /// connecting (a push or forward the fake adb does not know), and a blocking accept would
+    /// then hang the test instead of failing it.
+    fn accept_until(listener: &TcpListener, stop: &AtomicBool) -> Option<TcpStream> {
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    return Some(stream);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if stop.load(Ordering::SeqCst) {
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("accept: {e}"),
+            }
+        }
+    }
+
     /// Play the scrcpy server on `listener`: handshake, one session packet, a config and a key
-    /// frame, then drop both sockets the way an unplugged phone does.
-    fn serve_then_vanish(listener: TcpListener) -> std::thread::JoinHandle<()> {
+    /// frame, then drop both sockets the way an unplugged phone does. Returns whether the
+    /// worker ever connected; gives up waiting for it once `stop` is set.
+    fn serve_then_vanish(listener: TcpListener, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<bool> {
+        listener.set_nonblocking(true).unwrap();
         std::thread::spawn(move || {
-            let (mut video, _) = listener.accept().unwrap();
+            let Some(mut video) = accept_until(&listener, &stop) else { return false };
             video.write_all(&[0]).unwrap();
-            let (control, _) = listener.accept().unwrap();
+            let Some(control) = accept_until(&listener, &stop) else { return false };
             let mut name = [0u8; 64];
             name[..5].copy_from_slice(b"Pixel");
             video.write_all(&name).unwrap();
@@ -834,6 +862,7 @@ esac
             std::thread::sleep(Duration::from_millis(200));
             drop(control);
             drop(video);
+            true
         })
     }
 
@@ -851,7 +880,8 @@ esac
         let id = started["mirror_id"].as_i64().unwrap();
         let runtime = relay_core::handlers::device::mirror_by_id(&e, id).unwrap();
         let mut status = runtime.watch_status();
-        let server = serve_then_vanish(listener);
+        let stop = Arc::new(AtomicBool::new(false));
+        let server = serve_then_vanish(listener, stop.clone());
         let worker = {
             let (e, r) = (e.clone(), runtime.clone());
             std::thread::spawn(move || relay_core::handlers::device::mirror_worker(e, r))
@@ -861,8 +891,13 @@ esac
             assert!(Instant::now() < deadline, "worker never reported an end: {:?}", runtime.status());
             std::thread::sleep(Duration::from_millis(20));
         }
+        stop.store(true, Ordering::SeqCst);
         worker.join().unwrap();
-        server.join().unwrap();
+        assert!(
+            matches!(server.join(), Ok(true)),
+            "worker ended before it was served: {:?}",
+            runtime.status()
+        );
         // The session packet set the size before "running" was announced.
         assert_eq!(runtime.size(), (1024, 464));
         let mut seen = Vec::new();

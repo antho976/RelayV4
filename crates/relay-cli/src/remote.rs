@@ -182,11 +182,11 @@ pub async fn serve_with_door(
             None
         }
     };
+    // A door that did not open clears the port: a stale one would send `relay remote pair`'s
+    // link to whichever door holds it now, often another instance's.
     let port = door.as_ref().map(|d| d.local_addr.port());
     let registry = Registry::update(&ctx.registry_path, |r| {
-        if port.is_some() {
-            r.direct_port = port;
-        }
+        r.direct_port = port;
         Ok::<_, anyhow::Error>(r.clone())
     });
     let (door, registry) = match registry {
@@ -323,7 +323,7 @@ pub async fn run(requested: Instance, cmd: RemoteCommand) -> Result<u8> {
             let port = registry.direct_port.unwrap_or(DEFAULT_PORT);
             let link = PairLink::build(&registry, instance.as_str(), &code, port, &lan_addresses());
             if registry.direct_port.is_none() {
-                println!("note: `relay remote serve` has not run yet on this instance; the link assumes port {DEFAULT_PORT}");
+                println!("note: the {instance} engine has no phone door open: `relay remote serve` has not run for it, or `relay serve --remote` could not open its port (another instance's door may hold it). The link assumes port {DEFAULT_PORT}, which may be another instance's door; `relay remote serve --bind 0.0.0.0:<port>` opens one on a free port.");
             }
             print_pair_link(&link, confirm);
             if confirm {

@@ -1,0 +1,44 @@
+name: Dependencies
+
+# RustSec advisories, banned crates and dependency sources for the locked tree (deny.toml).
+#
+# A new advisory can land on any day, against a crate no change of ours touched. On a push or a
+# pull request it is reported but does not fail the check, so it does not block unrelated work;
+# the weekly run is where it goes red and gets noticed. Sources (crates.io only, no git) are
+# enforced everywhere, since only a change here can break them.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Bans and sources
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2 (v2.1.1)
+        with:
+          command: check bans sources
+
+      - name: Advisories
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2 (v2.1.1)
+        continue-on-error: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
+        with:
+          command: check advisories

@@ -52,12 +52,14 @@ pub struct Editor {
     git_graph: Cell<bool>,
     git_merge_picks: RefCell<std::collections::HashSet<String>>,
     tree_load_pending: Cell<bool>,
-    tree_load_next: RefCell<Option<String>>,
+    /// A `load_tree` arrived while one was in flight: run once more when it answers.
+    tree_load_again: Cell<bool>,
     git_busy: Cell<bool>,
     commit_message: gtk::TextView,
     branch_name: gtk::Entry,
     branch_start: gtk::Entry,
-    invalidate_pending: Cell<bool>,
+    /// An `invalidate` timer is armed; the smoke waits for none before timing a burst.
+    pub(crate) invalidate_pending: Cell<bool>,
     diff: Cell<bool>,
     diff_switch: gtk::Box,
     diff_inline: Cell<bool>,
@@ -81,7 +83,6 @@ pub struct Editor {
     original: RefCell<String>,
     project: Cell<i64>,
     revision: Cell<u64>,
-    directory: RefCell<String>,
     save: gtk::Button,
     discard: gtk::Button,
     handlers: Cell<bool>,
@@ -110,9 +111,8 @@ struct TreeLoadGuard(Rc<Editor>, Rc<Ui>);
 impl Drop for TreeLoadGuard {
     fn drop(&mut self) {
         self.0.tree_load_pending.set(false);
-        let next = self.0.tree_load_next.borrow_mut().take();
-        if let Some(directory) = next {
-            self.0.load_tree(&self.1, Some(directory));
+        if self.0.tree_load_again.replace(false) {
+            self.0.load_tree(&self.1);
         }
     }
 }
@@ -391,7 +391,7 @@ impl Editor {
             git_graph: Cell::new(true),
             git_merge_picks: RefCell::default(),
             tree_load_pending: Cell::new(false),
-            tree_load_next: RefCell::new(None),
+            tree_load_again: Cell::new(false),
             diff: Cell::new(false),
             diff_switch,
             diff_inline: Cell::new(false),
@@ -415,7 +415,6 @@ impl Editor {
             original: RefCell::default(),
             project: Cell::new(0),
             revision: Cell::new(0),
-            directory: RefCell::default(),
             save,
             discard,
             handlers: Cell::new(false),
@@ -599,7 +598,6 @@ impl Editor {
         self.buffer.set_modified(false);
         self.path.borrow_mut().clear();
         self.original.borrow_mut().clear();
-        self.directory.borrow_mut().clear();
         self.view.set_editable(false);
         self.set_busy(false);
         self.disk_text.borrow_mut().take();
@@ -744,8 +742,7 @@ impl Editor {
             // A search's results stay until it is run again: re-reading the whole worktree
             // on every file event is a cost the explorer must not pay.
             if self.search.text().trim().is_empty() {
-                let directory = self.directory.borrow().clone();
-                self.load_tree(ui, Some(directory));
+                self.load_tree(ui);
             }
         } else {
             self.tree_stale.set(true);
@@ -760,13 +757,15 @@ impl Editor {
         self.refresh_scopes(ui);
     }
 
-    pub fn load_tree(self: &Rc<Self>, ui: &Rc<Ui>, directory: Option<String>) {
+    /// List the explorer from the checkout's root, with every expanded folder open. The
+    /// explorer has no directory scope (RA-687).
+    pub fn load_tree(self: &Rc<Self>, ui: &Rc<Ui>) {
         if ui.project.get() == 0 {
             return;
         }
         if self.tree_load_pending.replace(true) {
             self.tree_revision.set(self.tree_revision.get() + 1);
-            *self.tree_load_next.borrow_mut() = Some(directory.unwrap_or_default());
+            self.tree_load_again.set(true);
             return;
         }
         if !self.handlers.replace(true) {
@@ -798,7 +797,6 @@ impl Editor {
         let worktree = self.worktree.borrow().clone();
         self.tree_revision.set(self.tree_revision.get() + 1);
         let revision = self.tree_revision.get();
-        let directory = directory.unwrap_or_default();
         let e = self.clone();
         let ui = ui.clone();
         glib::spawn_future_local(async move {
@@ -806,7 +804,7 @@ impl Editor {
             let result = ui
                 .call(
                     "file.tree",
-                    json!({"project_id":project,"worktree":optional_scope(&worktree),"path":directory,"depth":1,"git_badges":true}),
+                    json!({"project_id":project,"worktree":optional_scope(&worktree),"path":"","depth":1,"git_badges":true}),
                 )
                 .await;
             if !e.matches(&ui, project, &worktree) || e.tree_revision.get() != revision {
@@ -820,7 +818,7 @@ impl Editor {
             // in one go: rebuilding a level per round trip let the content collapse and the
             // view snap to the top on every refresh (RA-209).
             let mut prefetched = std::collections::BTreeMap::new();
-            for folder in e.open_folders(&directory) {
+            for folder in e.open_folders() {
                 let listing = ui
                     .call(
                         "file.tree",
@@ -838,7 +836,6 @@ impl Editor {
             let signature = {
                 use std::hash::{Hash, Hasher};
                 let mut hash = std::collections::hash_map::DefaultHasher::new();
-                directory.hash(&mut hash);
                 v["entries"].to_string().hash(&mut hash);
                 for (folder, entries) in &prefetched {
                     folder.hash(&mut hash);
@@ -853,10 +850,9 @@ impl Editor {
             };
             // Nothing the explorer draws changed: the rows on screen stay, with their focus
             // and any open menu.
-            if signature == e.tree_signature.get() && *e.directory.borrow() == directory {
+            if signature == e.tree_signature.get() {
                 return;
             }
-            *e.directory.borrow_mut() = directory.clone();
             let scroll = e
                 .tree
                 .ancestor(gtk::ScrolledWindow::static_type())
@@ -864,7 +860,7 @@ impl Editor {
                 .map(|s| s.vadjustment())
                 .map(|a| (a.value(), a));
             clear(&e.tree);
-            e.render_tree(&ui, &e.tree, &directory, rows(&v, "entries"), revision, &mut prefetched);
+            e.render_tree(&ui, &e.tree, "", rows(&v, "entries"), revision, &mut prefetched);
             e.tree_signature.set(signature);
             if let Some((value, adjustment)) = scroll {
                 adjustment.set_value(value);
@@ -872,24 +868,14 @@ impl Editor {
             }
         });
     }
-    /// Expanded folders under `directory` whose every ancestor is expanded too: the ones a
-    /// rebuild draws open.
-    fn open_folders(&self, directory: &str) -> Vec<String> {
+    /// Expanded folders whose every ancestor is expanded too: the ones a rebuild draws open.
+    fn open_folders(&self) -> Vec<String> {
         let expanded = self.expanded.borrow();
         expanded
             .iter()
             .filter(|path| {
-                let rest = if directory.is_empty() {
-                    Some(path.as_str())
-                } else {
-                    path.strip_prefix(directory).and_then(|rest| rest.strip_prefix('/'))
-                };
-                let Some(rest) = rest else {
-                    return false;
-                };
-                let base = path.len() - rest.len();
-                rest.match_indices('/')
-                    .all(|(at, _)| expanded.contains(&path[..base + at]))
+                path.match_indices('/')
+                    .all(|(at, _)| expanded.contains(&path[..at]))
             })
             .cloned()
             .collect()
@@ -1306,7 +1292,7 @@ impl Editor {
                         project_files::mark_selected(row);
                         *e.selected_path.borrow_mut() = path.clone();
                         e.selected_directory.set(false);
-                        e.open_path(&ui, path.clone(), None);
+                        e.open_path(&ui, path.clone());
                     }
                 });
                 target.append(&row);
@@ -1333,8 +1319,7 @@ impl Editor {
             more.connect_clicked(move |_| {
                 if let Some(ui) = weak.upgrade() {
                     e.tree_limits.borrow_mut().insert(folder.clone(), limit + TREE_PAGE);
-                    let directory = e.directory.borrow().clone();
-                    e.load_tree(&ui, Some(directory));
+                    e.load_tree(&ui);
                 }
             });
             target.append(&more);
@@ -1362,20 +1347,11 @@ impl Editor {
         }
         extra
     }
-    /// Used by session file rails and task links. A dirty document always keeps its scope.
-    pub fn open_path(self: &Rc<Self>, ui: &Rc<Ui>, path: String, worktree: Option<String>) {
+    /// A file clicked in the explorer. Switching checkout is `select_checkout`'s job.
+    fn open_path(self: &Rc<Self>, ui: &Rc<Ui>, path: String) {
         if self.is_occupied() {
-            ui.show_error("Save or discard your changes before opening another file or worktree.");
+            ui.show_error("Save or discard your changes before opening another file.");
             return;
-        }
-        if let Some(worktree) = worktree {
-            if *self.worktree.borrow() != worktree {
-                self.clear_document();
-                *self.worktree.borrow_mut() = worktree;
-                self.refresh_scopes(ui);
-                self.refresh_git(ui);
-                self.load_tree(ui, None);
-            }
         }
         self.open(ui, path);
     }
@@ -1414,8 +1390,7 @@ impl Editor {
         self.file_sidebar.connect_map(move |_| {
             if let Some(ui) = weak.upgrade().filter(|_| e.tree_stale.replace(false)) {
                 if e.search.text().trim().is_empty() {
-                    let directory = e.directory.borrow().clone();
-                    e.load_tree(&ui, Some(directory));
+                    e.load_tree(&ui);
                 }
             }
         });
@@ -1446,7 +1421,7 @@ impl Editor {
         self.search.connect_stop_search(move |search| {
             search.set_text("");
             if let Some(ui) = weak.upgrade() {
-                e.load_tree(&ui, None);
+                e.load_tree(&ui);
             }
         });
         for (icon, title, op) in [
@@ -1473,7 +1448,7 @@ impl Editor {
         let weak = Rc::downgrade(ui);
         refresh.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
-                e.load_tree(&ui, None);
+                e.load_tree(&ui);
                 e.refresh_git(&ui);
             }
         });
@@ -1497,7 +1472,7 @@ impl Editor {
         collapse.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
                 e.expanded.borrow_mut().clear();
-                e.load_tree(&ui, None);
+                e.load_tree(&ui);
             }
         });
         self.file_actions.append(&collapse);
@@ -1597,7 +1572,7 @@ impl Editor {
     fn run_search(self: &Rc<Self>, ui: &Rc<Ui>) {
         let query = self.search.text().to_string();
         if query.trim().is_empty() {
-            self.load_tree(ui, None);
+            self.load_tree(ui);
             return;
         }
         if self.search_pending.replace(true) {
@@ -1807,7 +1782,7 @@ impl Editor {
                     e.selected_directory.set(text(&v, "kind") == "dir");
                     match op {
                         "file.create" => {
-                            e.load_tree(&ui, None);
+                            e.load_tree(&ui);
                             e.refresh_git(&ui);
                         }
                         "file.rename" => e.follow_change(&ui, &path, Some(text(&v, "path"))),
@@ -1842,7 +1817,7 @@ impl Editor {
                                         if button.parent().as_ref() == Some(ed.file_undo.upcast_ref()) {
                                             ed.file_undo.remove(&button);
                                         }
-                                        ed.load_tree(&ui, None);
+                                        ed.load_tree(&ui);
                                         ed.refresh_git(&ui);
                                     }
                                     Err(err) => {
@@ -1888,7 +1863,7 @@ impl Editor {
             Some(None) => self.clear_document(),
             None => {}
         }
-        self.load_tree(ui, None);
+        self.load_tree(ui);
         self.refresh_git(ui);
         if agents {
             self.show_agents();
@@ -2018,7 +1993,7 @@ impl Editor {
                             Ok(_) => {
                                 item.set_visible(false);
                                 if ui.project.get() == project {
-                                    ed.load_tree(&ui, None);
+                                    ed.load_tree(&ui);
                                     ed.refresh_git(&ui);
                                 }
                             }

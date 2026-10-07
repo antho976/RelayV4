@@ -1,40 +1,14 @@
 //! Opt-in checks against the isolated native smoke engine, never installed providers.
 use crate::app::Ui;
+use crate::smoke::util::{click, named, press, wait_for};
 use gtk::prelude::*;
 use gtk4 as gtk;
 use serde_json::{json, Value};
 use std::rc::Rc;
 use std::time::Duration;
 
-fn named(root: &impl IsA<gtk::Widget>, name: &str) -> Option<gtk::Widget> {
-    let root = root.as_ref();
-    if root.widget_name() == name {
-        return Some(root.clone());
-    }
-    let mut child = root.first_child();
-    while let Some(widget) = child {
-        if let Some(found) = named(&widget, name) {
-            return Some(found);
-        }
-        child = widget.next_sibling();
-    }
-    None
-}
-
-async fn wait(mut ready: impl FnMut() -> bool, message: &str) {
-    for _ in 0..250 {
-        if ready() {
-            return;
-        }
-        glib::timeout_future(Duration::from_millis(20)).await;
-    }
-    panic!("Roadmap smoke timed out: {message}");
-}
-
-async fn call(ui: &Rc<Ui>, op: &str, payload: Value) -> Value {
-    ui.call(op, payload)
-        .await
-        .unwrap_or_else(|error| panic!("{op}: {error}"))
+async fn call(ui: &Rc<Ui>, op: &str, payload: Value) -> Result<Value, String> {
+    ui.call(op, payload).await.map_err(|error| format!("{op}: {error}"))
 }
 
 fn selected_tasks(root: &gtk::Widget) -> usize {
@@ -53,7 +27,7 @@ fn selected_tasks(root: &gtk::Widget) -> usize {
     count
 }
 
-pub(crate) async fn run(ui: &Rc<Ui>) -> Value {
+pub(crate) async fn run(ui: &Rc<Ui>) -> Result<(), String> {
     let project = ui.project.get();
     let workspace = ui
         .workspaces
@@ -98,10 +72,10 @@ pub(crate) async fn run(ui: &Rc<Ui>) -> Value {
         "project.add",
         json!({"workspace_id":workspace["id"],"path":root,"name":"Roadmap scope with a deliberately very long project name that must remain inside its sidebar"}),
     )
-    .await;
+    .await?;
     let other = other["id"].as_i64().unwrap();
     ui.refresh();
-    wait(
+    wait_for(
         || {
             ui.projects
                 .borrow()
@@ -110,20 +84,20 @@ pub(crate) async fn run(ui: &Rc<Ui>) -> Value {
         },
         "second fixture project",
     )
-    .await;
+    .await?;
     let task = call(
         ui,
         "task.create",
         json!({"project_id":project,"title":"Roadmap launch selection","column":"ready"}),
     )
-    .await;
+    .await?;
     ui.navigate("agents");
     ui.show_launch(task["id"].as_i64());
-    wait(
+    wait_for(
         || named(&ui.window, "launch-start").is_some_and(|w| w.is_sensitive()),
         "launch tasks",
     )
-    .await;
+    .await?;
     for index in 0..6 {
         let profile = named(&ui.window, &format!("launch-profile-{index}")).unwrap();
         assert_eq!(
@@ -164,17 +138,19 @@ pub(crate) async fn run(ui: &Rc<Ui>) -> Value {
         .unwrap()
         .downcast::<gtk::Button>()
         .unwrap();
-    let before = call(ui, "session.list", json!({"project_id":project})).await["sessions"]
+    let before = call(ui, "session.list", json!({"project_id":project})).await?["sessions"]
         .as_array()
         .unwrap()
         .len();
     ui.open_project(other, "agents");
     assert!(ui.sessions.borrow().is_empty(), "Old project sessions must disappear before the next bus response");
     ui.verify_shell();
+    // Deliberately raw: this replays a click that was already in flight when the project
+    // switched, which no sensitivity check could have stopped.
     stale_submit.emit_clicked();
     glib::timeout_future(Duration::from_millis(120)).await;
     assert_eq!(
-        call(ui, "session.list", json!({"project_id":project})).await["sessions"]
+        call(ui, "session.list", json!({"project_id":project})).await?["sessions"]
             .as_array()
             .unwrap()
             .len(),
@@ -182,7 +158,7 @@ pub(crate) async fn run(ui: &Rc<Ui>) -> Value {
         "Old launch callback cannot create a session after switching projects"
     );
     assert!(
-        call(ui, "session.list", json!({"project_id":other})).await["sessions"]
+        call(ui, "session.list", json!({"project_id":other})).await?["sessions"]
             .as_array()
             .unwrap()
             .is_empty()
@@ -192,7 +168,7 @@ pub(crate) async fn run(ui: &Rc<Ui>) -> Value {
     // Exercise the visible count keys after show_launch has returned. An unowned
     // backing DropDown used to be destroyed, silently leaving the count at one.
     ui.show_launch(None);
-    wait(|| named(&ui.window, "launch-start").is_some_and(|w| w.is_sensitive()), "multi-agent form").await;
+    wait_for(|| named(&ui.window, "launch-start").is_some_and(|w| w.is_sensitive()), "multi-agent form").await?;
     let control = named(&ui.window, "launch-count-control").unwrap();
     let mut sibling = control.next_sibling();
     let mut count_keys = None;
@@ -206,9 +182,9 @@ pub(crate) async fn run(ui: &Rc<Ui>) -> Value {
     assert_eq!(control.downcast::<gtk::DropDown>().unwrap().selected(), 1);
     let submit = named(&ui.window, "launch-start").unwrap().downcast::<gtk::Button>().unwrap();
     let started = std::time::Instant::now();
-    submit.emit_clicked();
-    wait(|| submit.is_sensitive(), "two-agent launch").await;
-    let all = call(ui, "session.list", json!({"project_id":project})).await;
+    press(&submit, "launch-start")?;
+    wait_for(|| submit.is_sensitive(), "two-agent launch").await?;
+    let all = call(ui, "session.list", json!({"project_id":project})).await?;
     assert_eq!(all["sessions"].as_array().unwrap().len(), before + 2, "Count keys must launch two agents");
     // Both new sessions are running even if event refresh already cached them.
     assert!(all["sessions"].as_array().unwrap().iter().all(|s| s["state"] != "created"));
@@ -218,18 +194,18 @@ pub(crate) async fn run(ui: &Rc<Ui>) -> Value {
     // Revisit unchanged sessions: their widgets were destroyed while the render signatures
     // used to survive. A fresh pane must initialize its header and dismiss the blank slate.
     for _ in 0..3 {
-        wait(|| ui.sessions.borrow().len() == before, "returning session panels").await;
+        wait_for(|| ui.sessions.borrow().len() == before, "returning session panels").await?;
         ui.verify_shell();
         ui.open_project(other, "agents");
-        wait(|| ui.sessions.borrow().is_empty(), "empty project panels").await;
+        wait_for(|| ui.sessions.borrow().is_empty(), "empty project panels").await?;
         ui.open_project(project, "agents");
     }
-    wait(|| ui.sessions.borrow().len() == before, "final session panels").await;
+    wait_for(|| ui.sessions.borrow().len() == before, "final session panels").await?;
     ui.verify_shell();
-    wait(|| ui.terminal_contents_contain("RELAY NATIVE VERIFICATION"), "terminal output after project switches").await;
+    wait_for(|| ui.terminal_contents_contain("RELAY NATIVE VERIFICATION"), "terminal output after project switches").await?;
     println!("TERMINAL_PROJECT_ROUNDTRIPS=4");
 
-    call(ui, "git.branch.create", json!({"project_id":other,"name":"switch-fixture","checkout":false})).await;
+    call(ui, "git.branch.create", json!({"project_id":other,"name":"switch-fixture","checkout":false})).await?;
     // An explicit destination survives the project's layout restore; the Git panel is drawn
     // only while it is shown.
     ui.open_project(other, "code");
@@ -237,14 +213,12 @@ pub(crate) async fn run(ui: &Rc<Ui>) -> Value {
     if git_hidden {
         ui.editor.toggle_git();
     }
-    wait(|| named(&ui.window, "branch-switch-switch-fixture").is_some(), "branch switch control").await;
+    wait_for(|| named(&ui.window, "branch-switch-switch-fixture").is_some(), "branch switch control").await?;
     assert!(!ui.editor.agents_visible(), "Files and Git must stay open after the layout restore");
-    let switch = named(&ui.window, "branch-switch-switch-fixture").unwrap().downcast::<gtk::Button>().unwrap();
-    assert!(switch.is_sensitive());
-    switch.emit_clicked();
+    click(&ui.window, "branch-switch-switch-fixture")?;
     let mut switched = false;
     for _ in 0..100 {
-        if call(ui, "git.status", json!({"project_id":other})).await["branch"] == "switch-fixture" {
+        if call(ui, "git.status", json!({"project_id":other})).await?["branch"] == "switch-fixture" {
             switched = true;
             break;
         }
@@ -263,28 +237,30 @@ pub(crate) async fn run(ui: &Rc<Ui>) -> Value {
         "skill.create",
         json!({"name":"Roadmap scope fixture","body":"# Scope fixture\nInstructions."}),
     )
-    .await;
+    .await?;
     for project_id in [project, other] {
         call(
             ui,
             "skill.enable",
             json!({"skill_id":skill["id"],"project_id":project_id,"enabled":true}),
         )
-        .await;
+        .await?;
     }
     ui.navigate("skills");
-    wait(
+    wait_for(
         || named(&ui.window, "skills-project").is_some(),
         "Skills project picker",
     )
-    .await;
+    .await?;
     let split = named(&ui.window, "skills-split")
         .unwrap()
         .downcast::<gtk::Paned>()
         .unwrap();
     let position = split.position();
     split.set_position(position + 40);
-    assert_eq!(split.position(), position + 40);
+    // Read back the layout, not the property just set: the library really is that wide.
+    let library = split.start_child().ok_or("Skills split has no library")?;
+    wait_for(|| library.width() == position + 40, "Skills split resized").await?;
     assert!(split.vexpands());
     let picker = named(&ui.window, "skills-project")
         .unwrap()
@@ -312,8 +288,8 @@ pub(crate) async fn run(ui: &Rc<Ui>) -> Value {
         .unwrap();
     assert!(toggle.is_active());
     toggle.set_active(false);
-    wait(|| toggle.is_sensitive(), "Skills enablement save").await;
-    let listed = call(ui, "skill.list", json!({})).await;
+    wait_for(|| toggle.is_sensitive(), "Skills enablement save").await?;
+    let listed = call(ui, "skill.list", json!({})).await?;
     let listed = listed["skills"]
         .as_array()
         .unwrap()
@@ -342,7 +318,7 @@ pub(crate) async fn run(ui: &Rc<Ui>) -> Value {
     for path in paths {
         saved.push((
             path,
-            call(ui, "settings.get", json!({"path":path})).await["value"].clone(),
+            call(ui, "settings.get", json!({"path":path})).await?["value"].clone(),
         ));
     }
     let library = crate::wallpaper_rotation::library_or_defaults(&Value::Null);
@@ -374,27 +350,27 @@ pub(crate) async fn run(ui: &Rc<Ui>) -> Value {
         "settings.set",
         json!({"path":"appearance.wallpapers","value":null}),
     )
-    .await;
+    .await?;
     call(
         ui,
         "settings.set",
         json!({"path":"appearance.wallpaper","value":null}),
     )
-    .await;
-    call(ui, "settings.set", json!({"path":"appearance.wallpaper_rotation","value":{"enabled":false,"interval_minutes":15}})).await;
+    .await?;
+    call(ui, "settings.set", json!({"path":"appearance.wallpaper_rotation","value":{"enabled":false,"interval_minutes":15}})).await?;
     ui.page_projects.borrow_mut().remove("settings");
     ui.navigate("settings");
-    wait(
+    wait_for(
         || named(&ui.window, "settings-wallpaper-pick-2").is_some(),
         "Settings offers three bundled wallpapers for an unset library",
     )
-    .await;
+    .await?;
     assert!(named(&ui.window, "settings-wallpaper-pick-3").is_none());
     assert!(
-        call(ui, "settings.get", json!({"path":"appearance.wallpapers"})).await["value"].is_null()
+        call(ui, "settings.get", json!({"path":"appearance.wallpapers"})).await?["value"].is_null()
     );
     assert!(
-        call(ui, "settings.get", json!({"path":"appearance.wallpaper"})).await["value"].is_null(),
+        call(ui, "settings.get", json!({"path":"appearance.wallpaper"})).await?["value"].is_null(),
         "Opening Settings keeps an unset background plain"
     );
     let search = named(&ui.window, "settings-search")
@@ -402,43 +378,35 @@ pub(crate) async fn run(ui: &Rc<Ui>) -> Value {
         .downcast::<gtk::SearchEntry>()
         .unwrap();
     search.set_text("Android SDK");
-    wait(
+    wait_for(
         || named(&ui.window, "setting:device.sdk_path").is_some_and(|w| w.is_mapped()),
         "Settings search finds Android field",
     )
-    .await;
+    .await?;
     search.set_text("wallpaper");
-    wait(
+    wait_for(
         || named(&ui.window, "settings-wallpaper-pick-1").is_some_and(|w| w.is_mapped()),
         "Settings search returns Appearance",
     )
-    .await;
+    .await?;
     let alpha = named(&ui.window, "setting:appearance.panel_alpha")
         .unwrap()
         .downcast::<gtk::Scale>()
         .unwrap();
     alpha.set_value(0.81);
-    named(&ui.window, "settings-wallpaper-pick-1")
-        .unwrap()
-        .downcast::<gtk::Button>()
-        .unwrap()
-        .emit_clicked();
+    click(&ui.window, "settings-wallpaper-pick-1")?;
     assert_eq!(
         alpha.value(),
         0.81,
         "Wallpaper selection preserves another staged field"
     );
     assert_eq!(
-        call(ui, "settings.get", json!({"path":"appearance.wallpaper"})).await["value"],
+        call(ui, "settings.get", json!({"path":"appearance.wallpaper"})).await?["value"],
         Value::Null,
         "Wallpaper selection is staged until Save"
     );
     assert!(named(&ui.window, "settings-wallpaper-preview").is_some());
-    named(&ui.window, "settings-wallpaper-open")
-        .unwrap()
-        .downcast::<gtk::Button>()
-        .unwrap()
-        .emit_clicked();
+    click(&ui.window, "settings-wallpaper-open")?;
     let preview = gtk::Window::list_toplevels()
         .into_iter()
         .filter_map(|w| w.downcast::<gtk::Window>().ok())
@@ -457,27 +425,23 @@ pub(crate) async fn run(ui: &Rc<Ui>) -> Value {
         .downcast::<gtk::CheckButton>()
         .unwrap();
     rotation.set_active(true);
-    named(&ui.window, "settings-save")
-        .unwrap()
-        .downcast::<gtk::Button>()
-        .unwrap()
-        .emit_clicked();
-    wait(
+    click(&ui.window, "settings-save")?;
+    wait_for(
         || ui.pages["settings"].is_sensitive(),
         "Settings Save changes",
     )
-    .await;
+    .await?;
     assert_eq!(
-        call(ui, "settings.get", json!({"path":"appearance.wallpapers"})).await["value"],
+        call(ui, "settings.get", json!({"path":"appearance.wallpapers"})).await?["value"],
         library,
         "Save persists the offered preset library"
     );
     assert_eq!(
-        call(ui, "settings.get", json!({"path":"appearance.wallpaper"})).await["value"],
+        call(ui, "settings.get", json!({"path":"appearance.wallpaper"})).await?["value"],
         second
     );
     assert_eq!(
-        call(ui, "settings.get", json!({"path":"appearance.panel_alpha"})).await["value"],
+        call(ui, "settings.get", json!({"path":"appearance.panel_alpha"})).await?["value"],
         0.81
     );
     glib::timeout_future(Duration::from_millis(120)).await;
@@ -493,22 +457,23 @@ pub(crate) async fn run(ui: &Rc<Ui>) -> Value {
         "Rotation chooses another bundled wallpaper"
     );
     assert_eq!(
-        call(ui, "settings.get", json!({"path":"appearance.wallpaper"})).await["value"],
+        call(ui, "settings.get", json!({"path":"appearance.wallpaper"})).await?["value"],
         second,
         "Rotation must not rewrite the saved wallpaper"
     );
     assert_eq!(
-        call(ui, "settings.get", json!({"path":"appearance.panel_alpha"})).await["value"],
+        call(ui, "settings.get", json!({"path":"appearance.panel_alpha"})).await?["value"],
         0.81,
         "Rotation must not overwrite appearance edits"
     );
     for (path, value) in saved {
-        call(ui, "settings.set", json!({"path":path,"value":value})).await;
+        call(ui, "settings.set", json!({"path":path,"value":value})).await?;
     }
-    call(ui, "skill.delete", json!({"skill_id":skill["id"]})).await;
-    call(ui, "project.remove", json!({"project_id":other})).await;
+    call(ui, "skill.delete", json!({"skill_id":skill["id"]})).await?;
+    call(ui, "project.remove", json!({"project_id":other})).await?;
     std::fs::remove_dir_all(root).unwrap();
     ui.page_projects.borrow_mut().remove("settings");
     ui.open_project(project, "agents");
-    json!({"launch_scope":true,"all_claude":true,"provider_effort":true,"device_selector":true,"skills_project":true,"settings_search":true,"wallpaper_staging":true,"wallpaper_presets":true,"wallpaper_rotation":true})
+    println!("ROADMAP_TOOLS_OK: launch scope, all Claude, provider effort, device selector, skills project, settings search, wallpaper staging, presets and rotation");
+    Ok(())
 }

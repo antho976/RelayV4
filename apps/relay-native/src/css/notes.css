@@ -1,6 +1,7 @@
 /* notes area styles: loaded after theme.css, so rules here override it. */
 /* Notes is a desktop text editor in the KWrite mould: menu bar, toolbar, library,
    tabbed documents on one paper surface, a find bar and a status bar. */
+/* NOTES_SCHEME (note_pages.rs) writes the same paper into the text view; change both. */
 @define-color notes_paper #0c0c0e;
 
 /* ---- titlebar: menu bar · document name · window keys ---- */

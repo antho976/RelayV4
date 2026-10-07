@@ -117,16 +117,19 @@ thread_local! {
     static SCHEME: OnceCell<Option<sourceview5::StyleScheme>> = const { OnceCell::new() };
 }
 
+/// The Notes paper: the text view's background here, `@notes_paper` in css/notes.css.
+const NOTES_PAPER: &str = "#0c0c0e";
+
 const NOTES_SCHEME: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
 <!-- Relay Notes: the Code editor's matte palette, with quieter Markdown. -->
 <style-scheme id="relay-notes" name="Relay Notes" version="1.0" parent-scheme="Adwaita-dark">
-  <style name="text" foreground="#dcdcda" background="#0c0c0e"/>
+  <style name="text" foreground="#dcdcda" background="NOTES_PAPER"/>
   <style name="selection" background="#3a3a3f"/>
   <style name="cursor" foreground="#ececea"/>
   <style name="current-line" background="#131316"/>
-  <style name="line-numbers" foreground="#47474c" background="#0c0c0e"/>
-  <style name="current-line-number" foreground="#a5a5a3" background="#0c0c0e"/>
-  <style name="search-match" foreground="#0c0c0e" background="#e0b04a"/>
+  <style name="line-numbers" foreground="#47474c" background="NOTES_PAPER"/>
+  <style name="current-line-number" foreground="#a5a5a3" background="NOTES_PAPER"/>
+  <style name="search-match" foreground="NOTES_PAPER" background="#e0b04a"/>
   <style name="def:heading" foreground="#f4f4f2" bold="true"/>
   <style name="def:emphasis" italic="true"/>
   <style name="def:strong-emphasis" bold="true"/>
@@ -151,11 +154,12 @@ pub(super) fn scheme() -> Option<sourceview5::StyleScheme> {
             let manager = sourceview5::StyleSchemeManager::default();
             let directory = glib::user_cache_dir().join("relay-v4/notes-styles");
             let path = directory.join("relay-notes.xml");
+            let scheme = NOTES_SCHEME.replace("NOTES_PAPER", NOTES_PAPER);
             let written = std::fs::create_dir_all(&directory).and_then(|_| {
-                if std::fs::read_to_string(&path).ok().as_deref() == Some(NOTES_SCHEME) {
+                if std::fs::read_to_string(&path).ok().as_deref() == Some(scheme.as_str()) {
                     Ok(())
                 } else {
-                    std::fs::write(&path, NOTES_SCHEME)
+                    std::fs::write(&path, &scheme)
                 }
             });
             match written {
@@ -181,6 +185,28 @@ fn docs() -> Vec<Rc<Doc>> {
 
 fn doc_by_id(id: i64) -> Option<Rc<Doc>> {
     DOCS.with(|docs| docs.borrow().get(&id).cloned())
+}
+
+/// Some open note is saving or has unsaved changes: the main window stays open for it.
+pub fn unsaved_notes() -> bool {
+    docs().iter().any(|doc| doc.draft.busy.get() || doc.dirty())
+}
+
+/// The editor of note `id` while its tab is open.
+pub fn open_draft(id: i64) -> Option<Rc<Draft>> {
+    doc_by_id(id).map(|doc| doc.draft.clone())
+}
+
+/// The project whose library Notes shows; 0 before the first render or once it is removed.
+pub fn shown_project() -> i64 {
+    shell_if_built().map_or(0, |shell| shell.project.get())
+}
+
+/// Close every open note, as the main window closes.
+pub fn close_all_notes() {
+    for doc in docs() {
+        doc.draft.close();
+    }
 }
 
 fn owner(ui: &Rc<Ui>) -> Option<Rc<NotesWindow>> {
@@ -969,11 +995,6 @@ pub(super) fn project_gone(ui: &Rc<Ui>, dead: i64) {
     if SESSION.with(|s| s.borrow_mut().remove(&dead.to_string())).is_some() {
         persist(ui);
     }
-    if let Some(owner) = owner(ui) {
-        if owner.rendered_project.get() == dead {
-            owner.rendered_project.set(0);
-        }
-    }
     if let Some(shell) = shell_if_built() {
         if shell.project.get() == dead {
             shell.project.set(0);
@@ -1069,7 +1090,6 @@ pub(super) fn open_doc(ui: &Rc<Ui>, note: Value, position: Option<u32>) -> Rc<Do
             }
         }
         DOCS.with(|docs| docs.borrow_mut().remove(&id));
-        ui.note_drafts.borrow_mut().remove(&id);
         if let Some(shell) = shell_if_built() {
             for row in shell.rows.borrow().iter() {
                 if row.note["id"].as_i64() == Some(id) {
@@ -1080,7 +1100,6 @@ pub(super) fn open_doc(ui: &Rc<Ui>, note: Value, position: Option<u32>) -> Rc<Do
         tabs_changed(&ui);
     }));
     DOCS.with(|docs| docs.borrow_mut().insert(id, doc.clone()));
-    ui.note_drafts.borrow_mut().insert(id, doc.draft.clone());
     tabs.set_current_page(Some(page));
     tabs_changed(ui);
     doc
@@ -1206,13 +1225,13 @@ pub(super) fn pin_id(ui: &Rc<Ui>, id: i64) {
 
 pub(super) fn duplicate_id(ui: &Rc<Ui>, id: i64) {
     let (title, body) = match doc_by_id(id) {
-        Some(doc) => (doc.name(), doc.body()),
+        Some(doc) => (doc.title.text().to_string(), doc.body()),
         None => match listed(id) {
-            Some(note) => (text::display_title(text(&note, "title"), text(&note, "body")), text(&note, "body").to_string()),
+            Some(note) => (text(&note, "title").to_string(), text(&note, "body").to_string()),
             None => return,
         },
     };
-    new_note(ui, Some(format!("{title} copy")), body);
+    new_note(ui, text::copy_title(&title), body);
 }
 
 pub(super) fn delete_id(ui: &Rc<Ui>, id: i64) {
@@ -1265,7 +1284,6 @@ pub fn workspace(ui: &Rc<Ui>, _name: &str, project: i64, notes: &[Value]) {
     let changed = shell.project.replace(project) != project;
     let owner = owner(ui);
     if let Some(owner) = &owner {
-        owner.rendered_project.set(project);
         if !shell.rail_applied.replace(true) {
             shell.split.set_position(owner.rail_width.get());
             shell.library.set_visible(!owner.rail_collapsed.get());
@@ -1379,61 +1397,6 @@ pub fn verify_tools() {
     settings.set_search_text(Some("absent"));
     assert_eq!(crate::editor::replace_all(&search, "x").expect("replace none"), 0);
     assert_eq!(buffer_text(buffer.upcast_ref()), "one+ ONE two");
-}
-
-pub fn note_row(ui: &Rc<Ui>, body: &gtk::Box, note: Value) {
-    let row = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    row.add_css_class("record");
-    let heading = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let name = text::clean(text(&note, "title"));
-    let title = label(
-        if name.is_empty() {
-            "Untitled"
-        } else {
-            &name
-        },
-        "title",
-    );
-    title.set_hexpand(true);
-    heading.append(&title);
-    let edit_key = button("Open editor", "quiet");
-    let weak = Rc::downgrade(ui);
-    let n = note.clone();
-    edit_key.connect_clicked(move |_| {
-        if let Some(ui) = weak.upgrade() {
-            edit(&ui, n.clone())
-        }
-    });
-    heading.append(&edit_key);
-    let pin = button(
-        if note["pinned"] == true {
-            "Unpin"
-        } else {
-            "Pin"
-        },
-        "quiet",
-    );
-    let weak = Rc::downgrade(ui);
-    let id = note["id"].clone();
-    let pinned = note["pinned"] != true;
-    pin.connect_clicked(move |b| {
-        if let Some(ui) = weak.upgrade() {
-            ui.mutate("notes.pin", json!({"note_id":id,"pinned":pinned}), b)
-        }
-    });
-    heading.append(&pin);
-    row.append(&heading);
-    let preview: String = text::clean(text(&note, "body")).chars().take(500).collect();
-    row.append(&paragraph(&preview));
-    row.append(&label(
-        if note["pinned"] == true {
-            "PINNED · shared with agents"
-        } else {
-            "Project note"
-        },
-        "dim",
-    ));
-    body.append(&row);
 }
 
 pub fn modules(ui: &Rc<Ui>, body: &gtk::Box, modules: &[Value]) {

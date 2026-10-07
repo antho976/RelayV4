@@ -11,6 +11,7 @@
 //! engine directory (the one holding `Engine/`), `UE_REMOTE_CONTROL_URL` the editor endpoint
 //! and `UE_REMOTE_CONTROL_PASSPHRASE` its passphrase when one is required.
 
+use crate::mcp::tool;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Map, Value};
 use std::io::{Read, Write};
@@ -19,8 +20,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-const FALLBACK_PROTOCOL: &str = "2025-06-18";
-const SUPPORTED_PROTOCOLS: &[&str] = &["2026-07-28", "2025-11-25", FALLBACK_PROTOCOL];
 const DEFAULT_REMOTE: &str = "http://127.0.0.1:30010";
 const PYTHON_LIBRARY: &str = "/Script/PythonScriptPlugin.Default__PythonScriptLibrary";
 /// Editor plugins the live tools depend on, by `.uproject` plugin name.
@@ -28,6 +27,9 @@ const BRIDGE_PLUGINS: [&str; 3] = ["RemoteControl", "PythonScriptPlugin", "Edito
 /// Folders a project scan never enters: generated, cached or version-control state.
 const SKIP_DIRS: [&str; 7] = ["Binaries", "Intermediate", "Saved", "DerivedDataCache", ".git", "node_modules", ".relay"];
 const MAX_OUTPUT: usize = 60_000;
+/// The largest reply read from the editor. A script printing in a loop over every asset is
+/// refused here rather than held in memory several times over (RA-292).
+const MAX_REPLY: u64 = 64 * 1024 * 1024;
 /// Tools that act on the running editor. Each first checks the editor has this checkout's
 /// project open: an agent in a worktree would otherwise edit assets in a different copy.
 /// `ue_editor_lock` is not one: the lock is a file, and releasing it must work when the editor
@@ -44,8 +46,6 @@ const LOCK_IDLE: Duration = Duration::from_secs(15 * 60);
 const LOCK_HEARTBEAT: Duration = Duration::from_secs(60);
 /// Log lines a tool returns: the first half and the last half of what matched.
 const MAX_LOG_LINES: usize = 300;
-/// Images one call may return; each is a full PNG in the agent's context.
-const MAX_IMAGES: usize = 16;
 
 // Every script gets the character frame and bone naming shared with the Blender tools.
 const PY_COMMON: &str = concat!(include_str!("unreal_py/common.py"), "\n", include_str!("rig_frame.py"));
@@ -75,47 +75,16 @@ fn lane(name: &str, args: &Value) -> crate::mcp::Lane {
     if reads { crate::mcp::Lane::Parallel } else { crate::mcp::Lane::Serial }
 }
 
-fn handle(message: &Value) -> Option<Value> {
-    let id = message.get("id").cloned()?;
-    let result = match message.get("method").and_then(Value::as_str) {
-        Some("initialize") => {
-            let requested = message.pointer("/params/protocolVersion").and_then(Value::as_str).unwrap_or(FALLBACK_PROTOCOL);
-            let protocol = SUPPORTED_PROTOCOLS.iter().copied().find(|v| *v == requested).unwrap_or(FALLBACK_PROTOCOL);
-            json!({
-                "protocolVersion": protocol,
-                "capabilities": {"tools":{"listChanged":false}},
-                "serverInfo": {"name":"unreal","title":"Unreal Engine (Relay plugin)","version":env!("CARGO_PKG_VERSION")},
-                "instructions": "Unreal Engine bridge for the project in this checkout. Start with ue_project_info. ue_build and ue_log work without the editor; ue_python, ue_call, ue_property, ue_search_assets, ue_level_actors and ue_console need the editor open with its Remote Control web server running (check with ue_editor_status, diagnose with ue_setup_check). Load the unreal-editor-automation skill before editor scripting."
-            })
-        }
-        Some("ping") => json!({}),
-        Some("tools/list") => json!({"tools": tools()}),
-        Some("tools/call") => {
-            let Some(name) = message.pointer("/params/name").and_then(Value::as_str) else {
-                return Some(rpc_error(id, -32602, "Invalid params", Some(json!({"message":"tools/call requires params.name"}))));
-            };
-            let arguments = message.pointer("/params/arguments").cloned().unwrap_or_else(|| json!({}));
-            if !tools().iter().any(|tool| tool["name"] == name) {
-                return Some(rpc_error(id, -32602, "Unknown tool", Some(json!({"name":name}))));
-            }
-            match call(name, &arguments) {
-                Ok(value) => tool_result(value, false),
-                Err(error) => tool_result(json!({"error": format!("{error:#}")}), true),
-            }
-        }
-        Some(other) => return Some(rpc_error(id, -32601, "Method not found", Some(json!({"method":other})))),
-        None => return Some(rpc_error(id, -32600, "Invalid Request", None)),
-    };
-    Some(json!({"jsonrpc":"2.0","id":id,"result":result}))
-}
+const SERVER: crate::mcp::PluginServer = crate::mcp::PluginServer {
+    name: "unreal",
+    title: "Unreal Engine (Relay plugin)",
+    instructions: "Unreal Engine bridge for the project in this checkout. Start with ue_project_info. ue_build and ue_log work without the editor; ue_python, ue_call, ue_property, ue_search_assets, ue_level_actors and ue_console need the editor open with its Remote Control web server running (check with ue_editor_status, diagnose with ue_setup_check). Load the unreal-editor-automation skill before editor scripting.",
+    tools,
+    call,
+};
 
-pub(crate) fn tool(name: &str, description: &str, properties: Value, required: &[&str], read_only: bool) -> Value {
-    json!({
-        "name": name,
-        "description": description,
-        "inputSchema": {"type":"object","properties":properties,"required":required,"additionalProperties":false},
-        "annotations": {"readOnlyHint": read_only, "destructiveHint": !read_only, "openWorldHint": false}
-    })
+fn handle(message: &Value) -> Option<Value> {
+    crate::mcp::plugin_reply(&SERVER, message)
 }
 
 fn tools() -> Vec<Value> {
@@ -136,8 +105,9 @@ fn tools() -> Vec<Value> {
                 "restart_editor":{"type":"boolean","description":"Quit a running editor first (saving), build, then relaunch it and wait until it answers. The way to apply C++ changes on Linux, which has no Live Coding. Refuses when the editor cannot be asked to save (see ue_editor_quit)."},
                 "save":{"type":"boolean","description":"With restart_editor: save dirty packages before quitting (default true)"},
                 "force":{"type":"boolean","description":"With restart_editor: terminate an editor that does not answer Remote Control, losing its unsaved work. Only when the human has said so."},
+                "launch_timeout_s":{"type":"integer","minimum":30,"maximum":3600,"description":"With restart_editor: how long to wait for the relaunched editor to answer, default 900 (a first start compiles shaders)"},
                 "allow_editor_open":{"type":"boolean","description":"Build even though the editor is running (hot-reload module; usually wrong)"},
-                "keep_crash_reporters":{"type":"boolean","description":"Do not stop leftover CrashReportClient processes before building"}
+                "keep_crash_reporters":{"type":"boolean","description":"Do not stop this project's leftover CrashReportClient processes before building (other projects' are never stopped)"}
             }), &[], false),
         tool("ue_log",
             "Tail the project's editor/game log (Saved/Logs/<Project>.log), optionally keeping only lines that match a regex such as 'Error|Warning' or 'LogBlueprint'.",
@@ -272,7 +242,7 @@ fn tools() -> Vec<Value> {
                 "folder":{"type":"string"},
                 "compile":{"type":"boolean"},
                 "limit":{"type":"integer","minimum":1,"maximum":500,"description":"Default 50"}
-            }), &[], true),
+            }), &[], false),
         tool("ue_asset_audit",
             "Find asset problems with facts: textures (not power of two, oversized, normal maps with the wrong compression, masks in sRGB, Never Stream, no mips), static meshes (no collision, dense without Nanite or LODs), references to missing assets, and redirectors. Each finding says how to fix it.",
             json!({
@@ -359,7 +329,7 @@ fn call(name: &str, args: &Value) -> Result<Value> {
             if let Some(parameters) = args.get("parameters").filter(|p| p.is_object()) {
                 body["parameters"] = parameters.clone();
             }
-            remote("PUT", "/remote/object/call", Some(&body), Duration::from_secs(120))
+            remote("PUT", "/remote/object/call", Some(&body), Duration::from_secs(120)).map(capped)
         }
         "ue_property" => {
             let property = required(args, "property")?;
@@ -371,7 +341,7 @@ fn call(name: &str, args: &Value) -> Result<Value> {
                 }
                 None => body["access"] = json!("READ_ACCESS"),
             }
-            remote("PUT", "/remote/object/property", Some(&body), Duration::from_secs(30))
+            remote("PUT", "/remote/object/property", Some(&body), Duration::from_secs(30)).map(capped)
         }
         "ue_search_assets" => python_json(&search_assets_script(args), Duration::from_secs(120)),
         "ue_level_actors" => python_json(&level_actors_script(args), Duration::from_secs(60)),
@@ -421,6 +391,16 @@ fn call(name: &str, args: &Value) -> Result<Value> {
         }
         other => bail!("unknown tool {other}"),
     }
+}
+
+/// What `import_fbx` will need, asked before the Blender export that precedes it, which can take
+/// minutes (RA-588): this checkout's project, the editor open on it, and no other agent holding
+/// the editor. Only advisory for the lock, which can change during the export; `import_fbx`
+/// still takes it.
+pub(crate) fn import_preflight() -> Result<()> {
+    let project = Project::find()?;
+    guard_project(&project)?;
+    lock_free_for(&read_lock(&project), &holder_id())
 }
 
 /// Import an FBX into the editor's project and measure what arrived (used by the Blender
@@ -551,6 +531,25 @@ fn read_lock(project: &Project) -> Value {
     read_lock_at(&lock_path(project))
 }
 
+/// Every read-modify-write of the lock file runs holding an OS lock on a file beside it, so two
+/// agents that both find the editor free cannot both take it (RA-285).
+fn with_lock_file<T>(path: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let guard = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path.with_extension("lock"))?;
+    guard.lock()?;
+    f()
+}
+
+/// Written beside it and renamed into place: a reader never sees a half-written lock as free.
+fn write_lock_at(path: &Path, lock: &Value) -> Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, lock.to_string())?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 fn read_lock_at(path: &Path) -> Value {
     let Ok(raw) = std::fs::read_to_string(path) else { return Value::Null };
     let mut lock: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
@@ -565,7 +564,11 @@ fn read_lock_at(path: &Path) -> Value {
 /// One agent drives the editor at a time. The lock is a file in the project's `Saved/`, which
 /// every agent sharing the checkout sees and git ignores.
 fn acquire_lock(project: &Project, me: &str) -> Result<()> {
-    let lock = read_lock(project);
+    with_lock_file(&lock_path(project), || acquire_lock_locked(project, me))
+}
+
+/// Refuses when someone other than `me` holds `lock` and it has not expired.
+fn lock_free_for(lock: &Value, me: &str) -> Result<()> {
     if let Some(holder) = lock["holder"].as_str() {
         if holder != me && lock["expired"] != true {
             bail!(
@@ -574,23 +577,27 @@ fn acquire_lock(project: &Project, me: &str) -> Result<()> {
             );
         }
     }
-    let path = lock_path(project);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let since = if lock["holder"].as_str() == Some(me) { lock["since"].as_u64().unwrap_or(now_secs()) } else { now_secs() };
-    std::fs::write(&path, json!({"holder": me, "since": since, "last_used": now_secs()}).to_string())?;
     Ok(())
+}
+
+fn acquire_lock_locked(project: &Project, me: &str) -> Result<()> {
+    let lock = read_lock(project);
+    lock_free_for(&lock, me)?;
+    let since = if lock["holder"].as_str() == Some(me) { lock["since"].as_u64().unwrap_or(now_secs()) } else { now_secs() };
+    write_lock_at(&lock_path(project), &json!({"holder": me, "since": since, "last_used": now_secs()}))
 }
 
 /// Move the idle clock to now, if `me` still holds the lock. A lock released or taken over in
 /// the meantime is left alone.
 fn touch_lock(path: &Path, me: &str) {
-    let lock = read_lock_at(path);
-    if lock["holder"].as_str() == Some(me) {
-        let since = lock["since"].as_u64().unwrap_or(now_secs());
-        let _ = std::fs::write(path, json!({"holder": me, "since": since, "last_used": now_secs()}).to_string());
-    }
+    let _ = with_lock_file(path, || {
+        let lock = read_lock_at(path);
+        if lock["holder"].as_str() == Some(me) {
+            let since = lock["since"].as_u64().unwrap_or(now_secs());
+            write_lock_at(path, &json!({"holder": me, "since": since, "last_used": now_secs()}))?;
+        }
+        Ok(())
+    });
 }
 
 /// The editor lock, held for the length of one call. The idle clock otherwise moves only when a
@@ -633,15 +640,17 @@ impl Drop for LockHold {
 }
 
 fn release_lock(project: &Project, me: &str) -> Result<()> {
-    let lock = read_lock(project);
-    match lock["holder"].as_str() {
-        Some(holder) if holder != me && lock["expired"] != true => bail!("the lock belongs to {holder}, not to you"),
-        Some(_) => {
-            std::fs::remove_file(lock_path(project))?;
-            Ok(())
+    with_lock_file(&lock_path(project), || {
+        let lock = read_lock(project);
+        match lock["holder"].as_str() {
+            Some(holder) if holder != me && lock["expired"] != true => bail!("the lock belongs to {holder}, not to you"),
+            Some(_) => {
+                std::fs::remove_file(lock_path(project))?;
+                Ok(())
+            }
+            None => Ok(()),
         }
-        None => Ok(()),
-    }
+    })
 }
 
 // ---------------------------------------------------------------- playing, testing, measuring
@@ -786,12 +795,8 @@ fn launch_editor(project: &Project, args: &Value) -> Result<Value> {
     if args["keep_background_throttle"] != true {
         let platform_dir = if cfg!(target_os = "windows") { "WindowsEditor" } else if cfg!(target_os = "macos") { "MacEditor" } else { "LinuxEditor" };
         let ini = project.root.join("Saved/Config").join(platform_dir).join("EditorPerProjectUserSettings.ini");
-        let text = std::fs::read_to_string(&ini).unwrap_or_default();
-        let merged = merge_ini(&text, "[/Script/UnrealEd.EditorPerformanceSettings]", &[("bThrottleCPUWhenNotForeground".to_string(), "False".to_string())]);
-        if merged != text {
-            if let Some(parent) = ini.parent() { let _ = std::fs::create_dir_all(parent); }
-            let _ = std::fs::write(&ini, merged);
-        }
+        // A file it cannot read is left alone; the command line below still turns it off.
+        let _ = merge_ini_file(&ini, PERF_SECTION, &[(PERF_KEY.to_string(), "False".to_string())]);
         extra.push("-ini:EditorPerProjectUserSettings:[/Script/UnrealEd.EditorPerformanceSettings]:bThrottleCPUWhenNotForeground=False".to_string());
     }
     // The log as it stood before the launch: until the new editor starts its own file, what is
@@ -801,7 +806,6 @@ fn launch_editor(project: &Project, args: &Value) -> Result<Value> {
     let timeout = Duration::from_secs(args["timeout_s"].as_u64().unwrap_or(900).clamp(30, 3600));
     loop {
         if remote("GET", "/remote/info", None, Duration::from_secs(3)).is_ok() {
-            // The editor now owns the project; tell the next status call to ask again.
             return Ok(json!({"pid": pid, "reachable": true, "seconds": started.elapsed().as_secs(), "engine": engine, "args": extra}));
         }
         // Every line since the launch that could be one, not a tail: the failure is logged
@@ -823,12 +827,12 @@ fn launch_editor(project: &Project, args: &Value) -> Result<Value> {
 
 /// `Config/DefaultRemoteControl.ini` settings the bridge needs, merged into the project's file.
 /// Keys are checked against the engine's RemoteControlSettings.h when it can be found, so a
-/// key an engine version does not have is reported instead of written blindly.
+/// key an engine version does not have is reported instead of written blindly. Remote console
+/// commands are not among them: ue_console runs its command through Python (RA-550).
 const RC_SECTION: &str = "[/Script/RemoteControlCommon.RemoteControlSettings]";
-const RC_KEYS: [(&str, &str); 4] = [
+const RC_KEYS: [(&str, &str); 3] = [
     ("bAutoStartWebServer", "True"),
     ("bEnableRemotePythonExecution", "True"),
-    ("bAllowConsoleCommandRemoteExecution", "True"),
     ("bAllowAnyRemoteFunctionCall", "True"),
 ];
 
@@ -856,14 +860,9 @@ fn write_remote_control_ini(project: &Project) -> Result<Value> {
     let header = engine_root(project).ok().and_then(|e| rc_header(&e));
     let (keys, unknown): (Vec<_>, Vec<_>) = RC_KEYS.iter().partition(|(k, _)| header.as_ref().is_none_or(|h| h.contains(k)));
     let path = project.root.join("Config/DefaultRemoteControl.ini");
-    let text = std::fs::read_to_string(&path).unwrap_or_default();
-    let merged = merge_ini(&text, RC_SECTION, &keys.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>());
-    if merged != text {
-        if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
-        std::fs::write(&path, &merged)?;
-    }
+    let changed = merge_ini_file(&path, RC_SECTION, &keys.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>())?;
     Ok(json!({
-        "file": path, "changed": merged != text,
+        "file": path, "changed": changed,
         "written": keys.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>(),
         "not_in_this_engine": unknown.iter().map(|(k, _)| k.to_string()).collect::<Vec<_>>(),
         "checked_against_engine_source": header.is_some(),
@@ -888,16 +887,36 @@ fn write_editor_settings_ini(project: &Project) -> Result<Value> {
         }
     }
     let mut changed = Vec::new();
+    let mut skipped = Vec::new();
     for path in &files {
-        let text = std::fs::read_to_string(path).unwrap_or_default();
-        let merged = merge_ini(&text, PERF_SECTION, &keys);
-        if merged != text {
-            if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
-            std::fs::write(path, &merged)?;
-            changed.push(path.clone());
+        match merge_ini_file(path, PERF_SECTION, &keys) {
+            Ok(true) => changed.push(path.clone()),
+            Ok(false) => {}
+            Err(error) => skipped.push(format!("{error:#}")),
         }
     }
-    Ok(json!({"files": files, "changed": changed, "written": format!("{PERF_KEY}=False")}))
+    Ok(json!({"files": files, "changed": changed, "skipped": skipped, "written": format!("{PERF_KEY}=False")}))
+}
+
+/// `merge_ini` on a file. Only a missing file counts as empty: one that cannot be read (not
+/// UTF-8, no permission) is left as it is with an error rather than replaced by one section,
+/// and the new text is renamed into place, so a crash never leaves it half written (RA-286).
+/// Whether the file changed.
+fn merge_ini_file(path: &Path, section: &str, keys: &[(String, String)]) -> Result<bool> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error).with_context(|| format!("reading {}; left unchanged", path.display())),
+    };
+    let merged = merge_ini(&text, section, keys);
+    if merged == text {
+        return Ok(false);
+    }
+    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+    let tmp = path.with_extension("ini.relay-tmp");
+    std::fs::write(&tmp, &merged).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
+    Ok(true)
 }
 
 /// Set keys inside one ini section, keeping every other line and section as it was.
@@ -958,9 +977,14 @@ fn new_session_start(project: &Project, mark: Option<(u64, u64)>) -> u64 {
 /// one). Callers that parse the lines get all of them; what goes back to the agent is capped
 /// with `cap_lines`.
 fn log_since(project: &Project, start: u64, filter: Option<&str>) -> Vec<String> {
-    let Ok(bytes) = std::fs::read(project.log_path()) else { return Vec::new() };
-    let start = (start as usize).min(bytes.len());
-    let text = String::from_utf8_lossy(&bytes[start..]);
+    use std::io::Seek;
+    // Only the bytes past `start`: callers poll a log that can run to hundreds of MB (RA-287).
+    let Ok(mut file) = std::fs::File::open(project.log_path()) else { return Vec::new() };
+    let mut bytes = Vec::new();
+    if file.seek(std::io::SeekFrom::Start(start)).is_err() || file.read_to_end(&mut bytes).is_err() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&bytes);
     let re = filter.and_then(|f| regex::Regex::new(f).ok());
     text.lines().filter(|l| re.as_ref().is_none_or(|re| re.is_match(l))).map(str::to_string).collect()
 }
@@ -1129,6 +1153,8 @@ fn play(project: &Project, args: &Value) -> Result<Value> {
         Ok(())
     })();
     let last = if requested { play_step("status", json!({})).ok() } else { None };
+    // The session's length ends here: stopping and cleaning up are not frames played (RA-288).
+    let played = t0.elapsed();
     let stopped = if requested && args["stop"].as_bool().unwrap_or(true) {
         play_step("stop", json!({"restore_throttle": started["was_throttled"]})).and_then(|_| wait_for_play(false)).err().map(|e| format!("{e:#}"))
     } else {
@@ -1154,13 +1180,13 @@ fn play(project: &Project, args: &Value) -> Result<Value> {
     // Frames per wall-clock second over the session: a throttled or overloaded editor shows
     // here before it shows as a flaky test.
     let fps = match (first.as_ref().and_then(|v| v["frame"].as_u64()), last.as_ref().and_then(|v| v["frame"].as_u64())) {
-        (Some(a), Some(b)) if b > a => Some(((b - a) as f64 / t0.elapsed().as_secs_f64() * 10.0).round() / 10.0),
+        (Some(a), Some(b)) if b > a => Some(((b - a) as f64 / played.as_secs_f64() * 10.0).round() / 10.0),
         _ => None,
     };
     let images: Vec<Value> = shots.iter().filter(|s| s["file"].is_string()).map(|s| json!({"label": s["view"], "path": s["file"]})).collect();
     Ok(json!({
         "mode": started["requested"],
-        "played_s": t0.elapsed().as_secs_f64().min(seconds + 5.0),
+        "played_s": played.as_secs_f64().min(seconds + 5.0),
         "average_fps": fps,
         "fps_warning": if fps.is_some_and(|f| f < 20.0) { json!("Under 20 fps: timings, physics and animation in this session are not representative. If the editor window was in the background, check Editor Preferences > Performance > Use Less CPU when in Background.") } else { Value::Null },
         "checkpoints": checkpoints,
@@ -1311,7 +1337,9 @@ fn editor_cmd(engine: &Path) -> PathBuf {
 
 fn run_tests(project: &Project, args: &Value) -> Result<Value> {
     let filter = required(args, "filter")?;
-    anyhow::ensure!(!filter.contains(';') && !filter.contains('"'), "filter must be a test path prefix");
+    // -ExecCmds splits its commands on ',' and the automation command on ';': either would cut
+    // off the Quit and leave the headless editor idling until the timeout (RA-551).
+    anyhow::ensure!(!filter.contains([';', '"', ',']), "filter must be a test path prefix; separate several with '+', e.g. MyGame.A+MyGame.B");
     if args["in_editor"] == true {
         guard_project(project)?;
         // Refreshed while the tests run: a long suite must not look abandoned.
@@ -1336,10 +1364,19 @@ fn run_tests(project: &Project, args: &Value) -> Result<Value> {
     anyhow::ensure!(cmd.is_file(), "{} does not exist (build the editor, or use in_editor=true)", cmd.display());
     let report = project.root.join("Saved/Relay/TestReport").join(uuid::Uuid::new_v4().to_string());
     std::fs::create_dir_all(&report)?;
-    let mut command = Command::new(&cmd);
+    let result = run_tests_headless(project, args, &cmd, &filter, &report);
+    // Gone on every path, a timeout included.
+    let _ = std::fs::remove_dir_all(&report);
+    result
+}
+
+fn run_tests_headless(project: &Project, args: &Value, cmd: &Path, filter: &str, report: &Path) -> Result<Value> {
+    let mut command = Command::new(cmd);
     command
         .arg(&project.uproject)
         .arg(format!("-ExecCmds=Automation RunTests {filter};Quit"))
+        // A backstop: the editor exits once the queue is empty even if Quit never ran.
+        .arg("-TestExit=Automation Test Queue Empty")
         .arg(format!("-ReportExportPath={}", report.display()))
         .args(["-unattended", "-nopause", "-nosplash", "-nullrhi", "-NoSound", "-stdout", "-FullStdOutLogOutput"]);
     let started = std::time::Instant::now();
@@ -1363,7 +1400,6 @@ fn run_tests(project: &Project, args: &Value) -> Result<Value> {
     };
     value["exit_code"] = json!(output.status.code());
     value["seconds"] = json!(started.elapsed().as_secs());
-    let _ = std::fs::remove_dir_all(&report);
     Ok(value)
 }
 
@@ -1721,7 +1757,7 @@ fn setup_check(project: &Project, fix: bool) -> Result<Value> {
         advice.push("The .uproject now lists the bridge plugins; the editor must be restarted to load them.".to_string());
     }
     if ini.as_ref().is_some_and(|i| i["changed"] == true) {
-        advice.push("Config/DefaultRemoteControl.ini now enables the web server at start-up, remote Python, console commands and remote function calls; restart the editor (ue_editor_quit, then ue_editor_launch) to apply it.".to_string());
+        advice.push("Config/DefaultRemoteControl.ini now enables the web server at start-up, remote Python and remote function calls; restart the editor (ue_editor_quit, then ue_editor_launch) to apply it. That file is shared project config: once committed, every teammate's editor serves unauthenticated remote Python on localhost. Commit it only with the team's agreement (or set a passphrase and UE_REMOTE_CONTROL_PASSPHRASE).".to_string());
     }
     if throttled == Some(true) && !fix {
         advice.push("Use Less CPU when in Background is on: the editor barely ticks while another window has focus. Run ue_setup_check with fix=true to turn it off for good (it writes Config/DefaultEditorPerProjectUserSettings.ini).".to_string());
@@ -1803,21 +1839,29 @@ fn build(project: &Project, args: &Value) -> Result<Value> {
     if let Some(killed) = pre["killed_crash_reporters"].as_array().filter(|a| !a.is_empty()) {
         warnings.push(format!("stopped leftover crash reporter(s) {killed:?} that made the build tool think an editor was running"));
     }
+    if let Some(others) = pre["other_crash_reporters"].as_array().filter(|a| !a.is_empty()) {
+        warnings.push(format!("left crash reporter(s) {others:?} running: their command lines name no path in this project, so they may be another project's open crash dialog. If this build still made a numbered hot-reload module, close them and build again."));
+    }
     if let Some(numbered) = manifest["hot_reload_modules"].as_array().filter(|a| !a.is_empty()) {
         warnings.push(format!(
             "UnrealEditor.modules points at numbered hot-reload modules {numbered:?}: the editor may run old code. Quit the editor, delete the numbered files from Binaries/{platform}, and build again."
         ));
     }
-    let relaunched = if restart && output.status.success() {
-        Some(launch_editor(project, &json!({"timeout_s": args["launch_timeout_s"]}))?)
+    // A failed relaunch is reported beside the build's result, not instead of it (RA-290).
+    let (relaunched, relaunch_error) = if restart && output.status.success() {
+        match launch_editor(project, &json!({"timeout_s": args["launch_timeout_s"]})) {
+            Ok(value) => (Some(value), None),
+            Err(error) => (None, Some(format!("{error:#}"))),
+        }
     } else {
-        None
+        (None, None)
     };
     Ok(json!({
         "success": output.status.success(),
         "warnings": warnings,
         "quit_editor": quit,
         "relaunched_editor": relaunched,
+        "relaunch_error": relaunch_error,
         "exit_code": output.status.code(),
         "command": format!("{} {target} {platform} {configuration} -Project=\"{}\" -WaitMutex -FromMsBuild", script.display(), project.uproject.display()),
         "seconds": started.elapsed().as_secs(),
@@ -1860,7 +1904,8 @@ fn log(project: &Project, args: &Value) -> Result<Value> {
     Ok(json!({
         "file": path,
         "matching_lines": total,
-        "lines": tail(&kept.join("\n"), lines),
+        // Only the tail is joined, not every match (RA-287).
+        "lines": tail(&kept[total.saturating_sub(lines)..].join("\n"), lines),
     }))
 }
 
@@ -1949,7 +1994,7 @@ fn python_run(code: &str, timeout: Duration, transaction: bool) -> Result<(Value
     let result = json!({
         "ok": ok,
         "output": tail(&output, 2000),
-        "result": response["CommandResult"],
+        "result": capped(response["CommandResult"].clone()),
     });
     if !ok {
         bail!("Python failed:\n{}", serde_json::to_string_pretty(&result)?);
@@ -2054,15 +2099,20 @@ fn remote(method: &str, path: &str, body: Option<&Value>, timeout: Duration) -> 
 }
 
 fn remote_at(base: &str, method: &str, path: &str, body: Option<&Value>, timeout: Duration) -> Result<Value> {
-    let rest = base.strip_prefix("http://").ok_or_else(|| anyhow!("UE_REMOTE_CONTROL_URL must be an http:// URL, got {base}"))?;
-    let host = rest.trim_end_matches('/').split('/').next().unwrap_or(rest).to_string();
-    let address = if host.contains(':') { host.clone() } else { format!("{host}:80") };
-    let socket = address
-        .to_socket_addrs()
-        .with_context(|| format!("resolving {address}"))?
-        .next()
-        .ok_or_else(|| anyhow!("{address} resolves to nothing"))?;
-    let mut stream = TcpStream::connect_timeout(&socket, Duration::from_secs(3))
+    let (host, name, port) = crate::unreal_process::remote_addr(base)
+        .ok_or_else(|| anyhow!("UE_REMOTE_CONTROL_URL must be an http:// URL, got {base}"))?;
+    let sockets: Vec<_> = (name.as_str(), port).to_socket_addrs().with_context(|| format!("resolving {host}"))?.collect();
+    anyhow::ensure!(!sockets.is_empty(), "{host} resolves to nothing");
+    // Every address in turn: `localhost` resolves to ::1 first while the editor listens on
+    // 127.0.0.1 (RA-291).
+    let mut connected = Err(std::io::Error::other("no address tried"));
+    for socket in &sockets {
+        connected = TcpStream::connect_timeout(socket, Duration::from_secs(3));
+        if connected.is_ok() {
+            break;
+        }
+    }
+    let mut stream = connected
         .with_context(|| format!("the Unreal editor is not answering at {base} (Remote Control web server not running?)"))?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
@@ -2081,7 +2131,12 @@ fn remote_at(base: &str, method: &str, path: &str, body: Option<&Value>, timeout
     stream.write_all(request.as_bytes())?;
     stream.write_all(&payload)?;
     let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).context("reading the editor's reply (a long editor operation may need a larger timeout)")?;
+    (&mut stream).take(MAX_REPLY + 1).read_to_end(&mut raw).context("reading the editor's reply (a long editor operation may need a larger timeout)")?;
+    anyhow::ensure!(
+        raw.len() as u64 <= MAX_REPLY,
+        "the editor's reply is larger than {} MB and was not read; print less (a summary, or the first rows), or write the data to a file in the project and read that",
+        MAX_REPLY / (1024 * 1024)
+    );
     let (status, body) = parse_response(&raw)?;
     let text = String::from_utf8_lossy(&body).into_owned();
     let value: Value = if text.trim().is_empty() { json!({}) } else { serde_json::from_str(&text).unwrap_or(json!({"body": text})) };
@@ -2089,6 +2144,21 @@ fn remote_at(base: &str, method: &str, path: &str, body: Option<&Value>, timeout
         bail!("Remote Control answered HTTP {status}: {}", serde_json::to_string(&value)?);
     }
     Ok(value)
+}
+
+/// A Remote Control value passed straight back to the agent, cut to its first `MAX_OUTPUT`
+/// bytes of JSON when longer: a large array or map property would fill its context (RA-292).
+fn capped(value: Value) -> Value {
+    let text = value.to_string();
+    if text.len() <= MAX_OUTPUT {
+        return value;
+    }
+    let mut cut = MAX_OUTPUT;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    json!({"truncated": true, "bytes": text.len(), "json_head": &text[..cut],
+        "note": "the editor's reply was too long to return whole; read a narrower property, or use ue_python to print what you need"})
 }
 
 fn parse_response(raw: &[u8]) -> Result<(u16, Vec<u8>)> {
@@ -2125,43 +2195,6 @@ fn dechunk(mut raw: &[u8]) -> Result<Vec<u8>> {
         out.extend_from_slice(&raw[..size]);
         raw = raw.get(size + 2..).unwrap_or(&[]);
     }
-}
-
-pub(crate) fn tool_result(mut value: Value, is_error: bool) -> Value {
-    let images = value.as_object_mut().and_then(|o| o.remove("_images")).and_then(|v| v.as_array().cloned()).unwrap_or_default();
-    let cleanup = value.as_object_mut().and_then(|o| o.remove("_cleanup"));
-    let mut content = Vec::new();
-    let mut shown = Vec::new();
-    for image in images.iter().take(MAX_IMAGES) {
-        let Some(path) = image["path"].as_str() else { continue };
-        if let Ok(bytes) = std::fs::read(path) {
-            use base64::Engine as _;
-            content.push(json!({"type":"text","text":format!("Image: {}", image["label"].as_str().unwrap_or(""))}));
-            content.push(json!({"type":"image","data":base64::engine::general_purpose::STANDARD.encode(bytes),"mimeType":"image/png"}));
-            shown.push(image["label"].clone());
-        }
-    }
-    if !images.is_empty() {
-        value["images"] = json!({"shown": shown, "requested": images.len(), "limit": MAX_IMAGES});
-    }
-    if let Some(dir) = cleanup.as_ref().and_then(Value::as_str) {
-        let _ = std::fs::remove_dir_all(dir);
-    }
-    let text = serde_json::to_string_pretty(&value).unwrap_or_default();
-    content.insert(0, json!({"type":"text","text":text}));
-    let mut result = json!({"content":content,"isError":is_error});
-    if !is_error {
-        result["structuredContent"] = value;
-    }
-    result
-}
-
-pub(crate) fn rpc_error(id: Value, code: i64, message: &str, data: Option<Value>) -> Value {
-    let mut error = json!({"code":code,"message":message});
-    if let Some(data) = data {
-        error["data"] = data;
-    }
-    json!({"jsonrpc":"2.0","id":id,"error":error})
 }
 
 #[cfg(test)]
@@ -2327,6 +2360,9 @@ mod tests {
         acquire_lock(&project, "calm-otter").expect("the holder keeps its own lock");
         let refused = acquire_lock(&project, "brisk-fox").unwrap_err().to_string();
         assert!(refused.contains("calm-otter"), "{refused}");
+        // blender_to_unreal's preflight asks the same question without taking the lock.
+        assert!(lock_free_for(&read_lock(&project), "brisk-fox").is_err());
+        assert!(lock_free_for(&read_lock(&project), "calm-otter").is_ok());
         assert!(release_lock(&project, "brisk-fox").is_err(), "only the holder releases");
         release_lock(&project, "calm-otter").unwrap();
         acquire_lock(&project, "brisk-fox").unwrap();
@@ -2339,6 +2375,74 @@ mod tests {
     }
 
     #[test]
+    fn two_agents_never_both_take_a_free_editor() {
+        let root = tempfile::tempdir().unwrap();
+        let project = std::sync::Arc::new(bare_project(root.path()));
+        let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let agents: Vec<_> = (0..8).map(|n| {
+            let (project, start) = (project.clone(), start.clone());
+            std::thread::spawn(move || {
+                start.wait();
+                acquire_lock(&project, &format!("agent-{n}")).is_ok()
+            })
+        }).collect();
+        let took = agents.into_iter().map(|a| a.join().unwrap()).filter(|ok| *ok).count();
+        assert_eq!(took, 1, "exactly one agent holds the editor");
+        assert!(read_lock(&project)["holder"].as_str().unwrap().starts_with("agent-"));
+    }
+
+    #[test]
+    fn an_ini_that_cannot_be_read_is_left_as_it_was() {
+        let root = tempfile::tempdir().unwrap();
+        let project = bare_project(root.path());
+        // Latin-1, as another tool may have saved it: not UTF-8.
+        let latin1 = b"[/Script/Other]\nTitle=Caf\xe9\n".to_vec();
+        let config = root.path().join("Config");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("DefaultEditorPerProjectUserSettings.ini"), &latin1).unwrap();
+        let keys = [(PERF_KEY.to_string(), "False".to_string())];
+        assert!(merge_ini_file(&config.join("DefaultEditorPerProjectUserSettings.ini"), PERF_SECTION, &keys).is_err());
+        let result = write_editor_settings_ini(&project).unwrap();
+        assert_eq!(result["changed"], json!([]), "{result}");
+        assert_eq!(result["skipped"].as_array().unwrap().len(), 1, "{result}");
+        assert_eq!(std::fs::read(config.join("DefaultEditorPerProjectUserSettings.ini")).unwrap(), latin1, "the file was replaced");
+        // A missing file is simply created.
+        assert!(merge_ini_file(&config.join("New.ini"), PERF_SECTION, &keys).unwrap());
+        assert!(!merge_ini_file(&config.join("New.ini"), PERF_SECTION, &keys).unwrap());
+        assert!(!config.join("New.ini.relay-tmp").exists());
+    }
+
+    #[test]
+    fn a_long_remote_value_is_cut_before_it_reaches_the_agent() {
+        assert_eq!(capped(json!({"a": 1})), json!({"a": 1}));
+        let long = json!({"Items": (0..20_000).map(|n| format!("é{n}")).collect::<Vec<_>>()});
+        let cut = capped(long.clone());
+        assert_eq!(cut["truncated"], true);
+        assert_eq!(cut["bytes"], long.to_string().len());
+        assert!(cut["json_head"].as_str().unwrap().len() <= MAX_OUTPUT);
+    }
+
+    #[test]
+    fn a_host_name_is_tried_at_every_address_it_resolves_to() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 4096];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..n]);
+            }
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"ok\":true}").unwrap();
+        });
+        // `localhost` may resolve to ::1 first, where nothing listens.
+        let reply = remote_at(&format!("http://localhost:{port}/"), "GET", "/remote/info", None, Duration::from_secs(5)).unwrap();
+        server.join().unwrap();
+        assert_eq!(reply["ok"], true);
+    }
+
+    #[test]
     fn captured_images_become_image_content_and_the_folder_is_removed() {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("cap");
@@ -2348,7 +2452,7 @@ mod tests {
             {"view":"front","file":dir.join("shot_front.png")},
             {"view":"right","file":dir.join("shot_right.png")}
         ]})), &dir).unwrap();
-        let result = tool_result(value, false);
+        let result = crate::mcp::tool_result(value, false);
         let content = result["content"].as_array().unwrap();
         let images: Vec<&Value> = content.iter().filter(|c| c["type"] == "image").collect();
         assert_eq!(images.len(), 1);
