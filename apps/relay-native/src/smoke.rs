@@ -301,7 +301,7 @@ fn verify_panel_toggles(ui: &Rc<Ui>) {
         util::click(&ui.window, name).unwrap_or_else(|error| panic!("{error}"));
     }
     for control in [
-        "status-usage",
+        "sidebar-usage-options",
         "status-resources",
         "status-devices",
         "command-palette",
@@ -319,7 +319,7 @@ fn verify_panel_toggles(ui: &Rc<Ui>) {
         click(ui, "panel-close");
         assert!(ui.panels.borrow().is_empty(), "One X closes {control}");
     }
-    click(ui, "status-usage");
+    click(ui, "sidebar-usage-options");
     click(ui, "status-resources");
     assert_eq!(
         ui.panels.borrow().len(),
@@ -888,8 +888,12 @@ pub fn install(ui: &Rc<Ui>) {
                 return;
             }
 
-            if matches!(page.as_str(), "palette" | "layouts") {
-                let control = if page == "palette" { "command-palette" } else { "window-presets" };
+            if matches!(page.as_str(), "palette" | "layouts" | "usage") {
+                let control = match page.as_str() {
+                    "palette" => "command-palette",
+                    "layouts" => "window-presets",
+                    _ => "sidebar-usage-options",
+                };
                 click(&navigate.window, control).unwrap();
                 return;
             }

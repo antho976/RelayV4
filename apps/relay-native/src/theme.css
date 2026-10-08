@@ -161,7 +161,7 @@ button.launch-choice:checked { border-color: @ink; background: @wash; }
 .utility-panel stackswitcher button { min-height: 24px; }
 .utility-panel .title { font-size: 13px; }
 .utility-panel .body { font-size: 12px; }
-.usage-meter progress, .resource-meter progress { background-image: none; border: 0; box-shadow: none; }
+.resource-meter progress { background-image: none; border: 0; box-shadow: none; }
 .setup-body { padding: 24px 0; }
 .setup-body > .title { font-size: 22px; }
 
@@ -334,6 +334,9 @@ button.settings-key:hover image { color: @ink; }
 .view-tabs button.quiet { min-height: 28px; padding: 0 12px; border-radius: 9px; color: @faint; font-size: 13px; font-weight: 500; }
 .view-tabs button.quiet:hover { background: transparent; color: @ink; }
 .view-tabs button.quiet.selected { background: @track; color: @ink; }
+/* Files and Git open beside the view: a lighter mark than the view that is showing. */
+.view-tabs button.quiet.open { background: alpha(@ink, 0.07); color: @secondary; }
+.view-tabs button.quiet.open:hover { color: @ink; }
 /* The terminal panes keep the look they had before this rework: their own text faces, and
    their scrollbar. */
 .terminal-plate .umd label { font-family: 'Fira Sans', sans-serif; }

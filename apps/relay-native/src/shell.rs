@@ -757,7 +757,7 @@ impl Ui {
             _ => ("Park", "media-playback-pause-symbolic", "session.park", "Park: release the process, keep the worktree and scrollback"),
         };
         let action = icon_button(icon, tooltip);
-        action.set_child(Some(&crate::icons::image(icon, 13)));
+        action.set_child(Some(&crate::icons::image(icon, 15)));
         if matches!(state, "created" | "parked" | "restorable" | "exited") {
             let slate_action = button(
                 if state == "created" {
