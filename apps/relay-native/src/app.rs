@@ -62,7 +62,7 @@ pub fn first_name() -> String {
 pub fn nav_button(caption: &str, icon: &str) -> gtk::Button {
     let b = button("", "nav");
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 9);
-    let image = crate::icons::image(icon, 16);
+    let image = crate::icons::image(icon, 18);
     row.append(&image);
     row.append(&label(caption, "nav-label"));
     b.set_child(Some(&row));
@@ -271,7 +271,6 @@ pub struct Ui {
     pub page_projects: RefCell<BTreeMap<String, i64>>,
     pub notice: gtk::Label,
     status: gtk::Label,
-    usage_meters: gtk::Box,
     usage: status::UsageState,
     device_status: gtk::Label,
     pub(super) resource_status: gtk::Box,
@@ -494,7 +493,7 @@ fn top_bar(window: &gtk::ApplicationWindow) -> TopBar {
     plugins_key.set_widget_name("project-plugins");
     let notifications_key = icon_button("alarm-symbolic", "Notifications");
     let bell = gtk::Overlay::new();
-    bell.set_child(Some(&crate::icons::image("bell", 16)));
+    bell.set_child(Some(&crate::icons::image("bell", 18)));
     let notification_count = label("", "notification-count");
     notification_count.set_halign(gtk::Align::End);
     notification_count.set_valign(gtk::Align::Start);
@@ -502,6 +501,9 @@ fn top_bar(window: &gtk::ApplicationWindow) -> TopBar {
     notification_count.set_can_target(false);
     bell.add_overlay(&notification_count);
     notifications_key.set_child(Some(&bell));
+    for (key, icon) in [(&skills_key, "skills"), (&plugins_key, "plugins"), (&layouts_key, "layout")] {
+        key.set_child(Some(&crate::icons::image(icon, 18)));
+    }
     for key in [
         &palette_key,
         &skills_key,
@@ -839,15 +841,13 @@ struct StatusBar {
     status_project: gtk::Label,
     status_branch: gtk::Label,
     status: gtk::Label,
-    usage_key: gtk::Button,
-    usage_meters: gtk::Box,
     devices_key: gtk::Button,
     device_status: gtk::Label,
     resources_key: gtk::Button,
     resource_status: gtk::Box,
 }
 
-/// The bar, and the usage strip it shows.
+/// The bar, and the usage state behind the sidebar's card (placed by `Ui::new`).
 fn status_bar() -> (StatusBar, status::UsageState) {
     let bottom = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     bottom.add_css_class("statusbar");
@@ -868,11 +868,6 @@ fn status_bar() -> (StatusBar, status::UsageState) {
     bottom.append(&spacer);
     let status = label("Engine disconnected", "");
     bottom.append(&status);
-    let usage_key = button("", "quiet");
-    usage_key.set_tooltip_text(Some("Provider usage"));
-    usage_key.set_widget_name("status-usage");
-    let usage_meters = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    usage_key.set_child(Some(&usage_meters));
     let devices_key = button("", "quiet");
     devices_key.set_widget_name("status-devices");
     let device_status = label("No device", "mono");
@@ -887,9 +882,7 @@ fn status_bar() -> (StatusBar, status::UsageState) {
     let resource_status = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     resource_content.append(&resource_status);
     resources_key.set_child(Some(&resource_content));
-    bottom.append(&usage_key);
     let usage = status::UsageState::new();
-    bottom.append(&usage.strip);
     bottom.append(&gtk::Separator::new(gtk::Orientation::Vertical));
     bottom.append(&devices_key);
     bottom.append(&gtk::Separator::new(gtk::Orientation::Vertical));
@@ -899,8 +892,6 @@ fn status_bar() -> (StatusBar, status::UsageState) {
         status_project,
         status_branch,
         status,
-        usage_key,
-        usage_meters,
         devices_key,
         device_status,
         resources_key,
@@ -995,7 +986,6 @@ impl Ui {
             page_projects: RefCell::default(),
             notice,
             status: bar.status.clone(),
-            usage_meters: bar.usage_meters.clone(),
             usage,
             device_status: bar.device_status.clone(),
             resource_status: bar.resource_status.clone(),
@@ -1010,7 +1000,7 @@ impl Ui {
             focus_tabs: wall.focus_tabs,
             mode: RefCell::new("grid".into()),
             overlay: panel_host,
-            start_chrome: [top.left.clone().upcast(), top.actions.clone().upcast()]
+            start_chrome: [top.left.clone().upcast(), top.settings_tools.clone().upcast(), top.actions.clone().upcast()]
                 .into_iter()
                 .chain(bar.root.observe_children().into_iter().filter_map(|c| c.ok()?.downcast::<gtk::Widget>().ok()))
                 .collect(),
@@ -1208,12 +1198,6 @@ impl Ui {
         bar.resources_key.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
                 ui.resources();
-            }
-        });
-        let weak = Rc::downgrade(ui);
-        bar.usage_key.connect_clicked(move |_| {
-            if let Some(ui) = weak.upgrade() {
-                ui.usage_panel();
             }
         });
         for b in [&top.launch_key, empty_launch] {

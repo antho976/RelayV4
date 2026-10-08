@@ -1,4 +1,4 @@
-//! Provider limit meters: the status-bar strip, its popup and the opt-in refresh interval.
+//! Provider limit meters: the sidebar's card, its panel and the opt-in refresh interval.
 //!
 //! `usage.get` only re-reads what Claude Code and Codex already saved on this machine, so a
 //! refresh never contacts a provider or spends a token. What shows, and whether the window
@@ -25,13 +25,6 @@ impl Meter {
         match self {
             Meter::FiveHour => "five_hour",
             Meter::Weekly => "weekly",
-            Meter::Fable => "fable",
-        }
-    }
-    fn caption(self) -> &'static str {
-        match self {
-            Meter::FiveHour => "5h",
-            Meter::Weekly => "wk",
             Meter::Fable => "fable",
         }
     }
@@ -220,11 +213,8 @@ struct Options {
 }
 
 pub(crate) struct UsageState {
-    pub(crate) strip: gtk::Box,
     /// The sidebar's card, which `app.rs` places above you at the foot.
     card: card::Card,
-    age: gtk::Label,
-    refresh: gtk::Button,
     /// Unix seconds of the last successful `usage.get`.
     checked: Cell<Option<u64>>,
     failed: RefCell<Option<String>>,
@@ -250,21 +240,8 @@ impl UsageState {
     }
 
     pub(crate) fn new() -> Self {
-        let strip = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        strip.add_css_class("usage-strip");
-        let age = label("", "usage-age");
-        age.set_widget_name("status-usage-age");
-        strip.append(&age);
-        let refresh = icon_button("refresh", "Re-read usage limits");
-        refresh.set_child(Some(&crate::icons::image("refresh", 12)));
-        refresh.add_css_class("usage-refresh");
-        refresh.set_widget_name("status-usage-refresh");
-        strip.append(&refresh);
         Self {
-            strip,
             card: card::Card::new(),
-            age,
-            refresh,
             checked: Cell::new(None),
             failed: RefCell::default(),
             prefs: RefCell::new(Value::Null),
@@ -282,7 +259,6 @@ impl UsageState {
 
     fn set_busy(&self, busy: bool) {
         self.busy.set(busy);
-        self.refresh.set_sensitive(!busy);
         if let Some(key) = self.popup.borrow().as_ref().and_then(|p| p.refresh.upgrade()) {
             key.set_sensitive(!busy);
         }
@@ -306,16 +282,10 @@ impl UsageState {
 }
 
 impl Ui {
-    /// Wires the strip's refresh key and the clock that keeps its "updated" label honest.
+    /// Wires the card and the clock that keeps its "reported" and "resets" labels honest.
     /// The clock rewrites labels, and re-reads usage only after an agent finished a turn:
     /// nothing reports usage to the engine, so that is when the saved limits move.
     pub(crate) fn install_usage(self: &Rc<Self>) {
-        let weak = Rc::downgrade(self);
-        self.usage.refresh.connect_clicked(move |_| {
-            if let Some(ui) = weak.upgrade() {
-                ui.refresh_usage(true);
-            }
-        });
         let weak = Rc::downgrade(self);
         glib::timeout_add_seconds_local(30, move || {
             let Some(ui) = weak.upgrade() else {
@@ -328,7 +298,6 @@ impl Ui {
             if stale != ui.usage.stale_windows.get() {
                 ui.render_usage();
             } else {
-                ui.render_usage_age();
                 ui.render_usage_popup();
                 ui.render_usage_card();
             }
@@ -488,90 +457,8 @@ impl Ui {
 
     fn render_usage(&self) {
         self.usage.stale_windows.set(self.stale_count());
-        self.render_usage_meters();
-        self.render_usage_age();
         self.render_usage_popup();
         self.render_usage_card();
-    }
-
-    fn render_usage_meters(&self) {
-        let now = now();
-        let prefs = self.usage.prefs.borrow().clone();
-        clear(&self.usage_meters);
-        let mut tooltip = Vec::new();
-        for (provider, name, item) in self.usage.visible() {
-            if self.usage_meters.first_child().is_some() {
-                self.usage_meters.append(&label("·", "faint"));
-            }
-            let group = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-            group.add_css_class("usage-group");
-            group.append(&label(name, "usage-name"));
-            let found = item.as_ref().map(windows).unwrap_or_default();
-            let mut shown = 0;
-            for &meter in meters(provider) {
-                if !enabled(&prefs, provider, meter.key()) {
-                    continue;
-                }
-                let Some(window) = found.iter().find(|w| classify(&w.name) == Some(meter)) else {
-                    continue;
-                };
-                let stale = window.stale(now);
-                group.append(&label(meter.caption(), "usage-caption"));
-                group.append(&bar(window.pct, stale, "usage-meter"));
-                let pct = label(&format!("{:.0}%", window.pct), "usage-value");
-                if stale {
-                    pct.add_css_class("stale");
-                } else if let Some(level) = level(window.pct) {
-                    pct.add_css_class(level);
-                }
-                group.append(&pct);
-                tooltip.push(format!("{name} {}  {:.0}% · {}", meter.title(), window.pct, reset_text(window, now)));
-                shown += 1;
-            }
-            if shown == 0 {
-                group.append(&label("–", "usage-caption"));
-                tooltip.push(format!(
-                    "{name}: {}",
-                    if item.is_some() { "no shown meter reported" } else { "no limits reported yet" }
-                ));
-            }
-            self.usage_meters.append(&group);
-        }
-        if self.usage_meters.first_child().is_none() {
-            self.usage_meters.append(&label("Usage", "usage-name"));
-            tooltip.push("Usage limits".into());
-        }
-        self.usage_meters.append(&crate::icons::image("chevron-down", 10));
-        tooltip.push("Click for details and display options".into());
-        self.usage_meters.set_tooltip_text(Some(&tooltip.join("\n")));
-    }
-
-    fn render_usage_age(&self) {
-        let state = &self.usage;
-        let minutes = interval(&state.prefs.borrow());
-        let (text, tip) = match (state.checked.get(), state.failed.borrow().as_ref()) {
-            (_, Some(error)) => ("update failed".to_string(), format!("The last refresh failed: {error}")),
-            (Some(at), None) => (
-                format!("updated {}", ago(at)),
-                format!(
-                    "Limits checked at {} · {}",
-                    glib::DateTime::from_unix_local(at as i64)
-                        .ok()
-                        .and_then(|d| d.format("%H:%M:%S").ok())
-                        .map(|s| s.to_string())
-                        .unwrap_or_default(),
-                    interval_text(minutes)
-                ),
-            ),
-            (None, None) => ("not checked".to_string(), "Limits have not been read yet".to_string()),
-        };
-        state.age.set_text(&text);
-        state.age.set_tooltip_text(Some(&tip));
-        if state.failed.borrow().is_some() {
-            state.age.add_css_class("failed");
-        } else {
-            state.age.remove_css_class("failed");
-        }
     }
 
     fn render_usage_popup(&self) {
@@ -613,7 +500,7 @@ impl Ui {
             section.add_css_class("usage-provider");
             let head = gtk::Box::new(gtk::Orientation::Horizontal, 8);
             head.add_css_class("usage-provider-head");
-            head.append(&crate::icons::image(provider, 14));
+            head.append(&crate::icons::image(provider, 16));
             let title = label(name, "usage-provider-name");
             title.set_hexpand(true);
             head.append(&title);
@@ -675,7 +562,7 @@ impl Ui {
         let Some(panel) = crate::panel::Panel::toggle(self, "Usage limits", 420) else {
             return;
         };
-        panel.bottom(480);
+        panel.beside(&self.page_overlay, &self.usage.card.root, 480);
         panel.add_css_class("usage-panel");
         let refresh = icon_button("refresh", "Re-read usage limits");
         refresh.set_widget_name("usage-panel-refresh");
@@ -691,6 +578,8 @@ impl Ui {
         body.add_css_class("usage-body");
         body.set_spacing(0);
         let checked = label("", "usage-checked");
+        checked.set_wrap(true);
+        checked.set_xalign(0.0);
         body.append(&checked);
         let providers = gtk::Box::new(gtk::Orientation::Vertical, 0);
         providers.add_css_class("usage-providers");
@@ -717,6 +606,7 @@ impl Ui {
         });
         self.render_usage_popup();
         panel.present();
+        panel.fit();
         self.refresh_usage(false);
     }
 
@@ -754,21 +644,28 @@ impl Ui {
     fn usage_options(self: &Rc<Self>) -> (gtk::Box, Options) {
         let prefs = self.usage.prefs.borrow().clone();
         let mut controls = Options::default();
+        // Settings' shape: a quiet heading over a rounded card of rows, the control on the right.
         let options = gtk::Box::new(gtk::Orientation::Vertical, 8);
         options.add_css_class("usage-options");
-        options.append(&label("Show in the status bar and sidebar", "usage-options-title"));
+        let heading = label("Show in the sidebar", "usage-options-title");
+        heading.set_xalign(0.0);
+        options.append(&heading);
+        let rows = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        rows.add_css_class("usage-options-card");
+        options.append(&rows);
         for (provider, name) in PROVIDERS {
             let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
             row.add_css_class("usage-option-row");
+            let title = label(name, "usage-option-name");
+            title.set_hexpand(true);
+            title.set_xalign(0.0);
+            row.append(&title);
             let switch = gtk::Switch::new();
+            switch.add_css_class("settings-switch");
             switch.set_valign(gtk::Align::Center);
             switch.set_active(enabled(&prefs, provider, "enabled"));
             switch.update_property(&[gtk::accessible::Property::Label(&format!("Show {name}"))]);
             controls.switches.push((switch.downgrade(), provider));
-            row.append(&switch);
-            let title = label(name, "usage-option-name");
-            title.set_hexpand(true);
-            row.append(&title);
             let chips = gtk::Box::new(gtk::Orientation::Horizontal, 0);
             chips.add_css_class("linked");
             chips.add_css_class("usage-chips");
@@ -780,7 +677,7 @@ impl Ui {
                 chip.set_tooltip_text(Some(&format!("Show {name}'s {} limit", meter.title().to_lowercase())));
                 controls.chips.push((chip.downgrade(), provider, meter.key()));
                 let weak = Rc::downgrade(self);
-                // The strip reads `prefs[provider][meter.key()]`; the path is built from the same.
+                // The card reads `prefs[provider][meter.key()]`; the path is built from the same.
                 let path = format!("{provider}.{}", meter.key());
                 chip.connect_toggled(move |chip| {
                     if let Some(ui) = weak.upgrade() {
@@ -798,13 +695,16 @@ impl Ui {
                     ui.set_usage_pref(&path, json!(switch.is_active()));
                 }
             });
+            chips.set_valign(gtk::Align::Center);
             row.append(&chips);
-            options.append(&row);
+            row.append(&switch);
+            rows.append(&row);
         }
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         row.add_css_class("usage-option-row");
         let title = label("Auto refresh", "usage-option-name");
         title.set_hexpand(true);
+        title.set_xalign(0.0);
         title.set_tooltip_text(Some("Re-read the saved limits on a timer. Off still refreshes when an agent finishes a turn."));
         row.append(&title);
         let choices = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -832,8 +732,9 @@ impl Ui {
             choices.append(&choice);
             first.get_or_insert(choice);
         }
+        choices.set_valign(gtk::Align::Center);
         row.append(&choices);
-        options.append(&row);
+        rows.append(&row);
         (options, controls)
     }
 }

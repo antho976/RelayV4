@@ -1,8 +1,9 @@
 //! The sidebar's usage card, above you at the foot: one provider at a time, its plan, the
 //! 5-hour and weekly meters as bars, and when the 5-hour window resets.
 //!
-//! It reads the same rows and preferences as the status-bar strip (`UsageState`); which
-//! provider it shows and whether it is folded live under `usage.card` in settings.
+//! It reads the rows and preferences `UsageState` keeps; which provider it shows and whether
+//! it is folded live under `usage.card` in settings. Its sliders key opens the usage panel
+//! beside it.
 use super::*;
 
 /// The card's widgets, built once: the tabs keep their focus across refreshes, and only the
@@ -40,7 +41,7 @@ impl Card {
         }
         head.append(&strip);
         let options = icon_button("sliders", "Usage details and display options");
-        options.set_child(Some(&crate::icons::image("sliders", 14)));
+        options.set_child(Some(&crate::icons::image("sliders", 15)));
         options.set_widget_name("sidebar-usage-options");
         options.set_valign(gtk::Align::Center);
         head.append(&options);
@@ -56,7 +57,7 @@ impl Card {
     }
 }
 
-/// The card's own names for the meters; the strip's are too terse for a sentence-case row.
+/// The card's own names for the meters; the panel's are too terse for a sentence-case row.
 fn title(meter: Meter) -> &'static str {
     match meter {
         Meter::FiveHour => "5 hour window",
@@ -65,7 +66,7 @@ fn title(meter: Meter) -> &'static str {
     }
 }
 
-/// "Resets in 3h 41m", without the strip's wall clock: the card has no room for it.
+/// "Resets in 3h 41m", without the panel's wall clock: the card has no room for it.
 fn reset_line(window: &Window, now: u64) -> String {
     if window.stale(now) {
         return "Reset since the last report".into();
@@ -198,6 +199,12 @@ impl Ui {
         let (provider, _, item) = &visible[index];
         let caption = label(&caption(item.as_ref()), "usage-card-caption");
         caption.set_xalign(0.0);
+        // A refresh that failed says so where the plan goes; the meters keep the last read.
+        if let Some(error) = state.failed.borrow().as_ref() {
+            caption.set_text("Couldn't re-read usage");
+            caption.add_css_class("failed");
+            caption.set_tooltip_text(Some(&format!("The last refresh failed: {error}")));
+        }
         card.body.append(&caption);
         let found = item.as_ref().map(windows).unwrap_or_default();
         let mut reset: Option<&Window> = None;
