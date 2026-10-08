@@ -175,7 +175,7 @@ for line in sys.stdin:
         measurements=[]
         captured=[]
         # The start screen's opening, held at points of its timeline (start.rs).
-        START_FRAMES = {"start-frame-20": "0.2", "start-frame-45": "0.45", "start-frame-70": "0.7"}
+        START_FRAMES = {"start-frame-20": "0.2", "start-frame-45": "0.45", "start-frame-60": "0.6", "start-frame-80": "0.8"}
         # RELAY_SMOKE_PAGES=start,start-frame-45 captures only those pages and stops there, for a
         # quick look at one screen; the checks after the captures need every page.
         PAGES_ONLY = [p for p in os.environ.get("RELAY_SMOKE_PAGES", "").split(",") if p]
