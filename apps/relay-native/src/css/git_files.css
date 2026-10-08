@@ -41,8 +41,17 @@
 .git-ignored { color: #6c6c70; }
 .tree-name.git-deleted, .scm-name.git-deleted { text-decoration-line: line-through; }
 
+/* ---- See-through project view ----
+   The page stack already paints @wall once over the wallpaper. Every bar, panel, scroller and
+   list here painted another layer of @console or @wall on top, which compounds to black, so
+   inside the project view they stay clear and the panes are told apart by hairlines. */
+.code-surface .code-bar, .code-surface .toolbar, .code-surface .code-position,
+.code-files, .code-files scrolledwindow, .code-files viewport, .file-tree,
+.code-git, .code-git scrolledwindow, .code-git viewport, .code-git stack,
+.code-history-pane { background: transparent; }
+.code-split > separator { min-width: 1px; background: alpha(@ink, 0.07); }
+
 /* ---- Explorer ---- */
-.code-files { background: @console; }
 .explorer-head { min-height: 35px; padding: 0 4px 0 12px; }
 .explorer-head .section-label { padding: 0; color: @secondary; letter-spacing: 0.1em; }
 .explorer-actions button.explorer-key, .code-bar .explorer-actions button.explorer-key {
@@ -50,7 +59,7 @@
 }
 .explorer-actions button.explorer-key:hover { background: @wash; color: @ink; }
 .code-search { margin: 6px 8px 4px; min-height: 26px; font-size: 12px; }
-.file-tree { padding: 2px 0 10px; background: @console; }
+.file-tree { padding: 2px 0 10px; }
 button.tree-row {
   min-height: 22px; padding: 0 8px 0 4px; border: 0; border-radius: 0;
   background: transparent; color: @ink; font-size: 12.5px; font-weight: 400;
@@ -96,7 +105,6 @@ popover.image-hover > contents {
 .image-hover-meta.error { color: @git_removed; font-family: 'Geist', sans-serif; font-size: 11.5px; }
 
 /* ---- Source Control: header and branch picker ---- */
-.code-git { background: @console; }
 .git-head { min-height: 38px; padding: 0 4px 0 6px; }
 .git-branch-picker > button, .code-bar .git-branch-picker > button {
   min-height: 28px; padding: 0 8px; border: 1px solid transparent; border-radius: 2px;
@@ -143,21 +151,26 @@ button.branch-delete { min-width: 26px; min-height: 26px; margin-right: 6px; pad
 button.branch-delete:hover { color: @git_removed; }
 
 /* ---- Source Control: commit box ---- */
-.scm-commit { padding: 10px 10px 8px; border-bottom: 1px solid @edge; }
-.code-commit-message {
-  min-height: 46px; padding: 6px 8px; border: 1px solid @strong; border-radius: 2px;
-  background: @screen; font-size: 12.5px;
+/* The field and keys wear the app's general shape: 10px corners, a raised wash, the white
+   primary key. The text node carries its own ground (theme.css), cleared so the corners show. */
+.scm-commit { padding: 12px 12px 10px; border-bottom: 1px solid @edge; }
+textview.code-commit-message {
+  min-height: 64px; padding: 9px 11px; border: 1px solid @strong; border-radius: 10px;
+  background: alpha(@ink, 0.04); font-size: 13px; transition: border-color 120ms ease-out, background 120ms ease-out;
 }
-.code-commit-message:focus-within { border-color: @secondary; }
-.code-commit-placeholder { padding: 7px 9px; color: @faint; font-size: 12.5px; }
-.scm-commit-split button.scm-commit-key { min-height: 28px; border-radius: 2px 0 0 2px; font-size: 12.5px; }
+textview.code-commit-message > text { background: transparent; }
+textview.code-commit-message:hover { border-color: @line_emphasis; }
+textview.code-commit-message:focus-within { border-color: @secondary; background: alpha(@ink, 0.06); }
+.code-commit-placeholder { padding: 10px 12px; color: @faint; font-size: 13px; }
+.scm-commit-split button.scm-commit-key { min-height: 32px; border-radius: 10px 0 0 10px; font-size: 13px; }
 .scm-commit-more > button {
-  min-height: 28px; min-width: 26px; padding: 0; border-radius: 0 2px 2px 0;
+  min-height: 32px; min-width: 30px; padding: 0; border-radius: 0 10px 10px 0;
   background: @ink; border: 1px solid @ink; border-left: 1px solid alpha(@wall, 0.35); color: @wall;
 }
-.scm-commit-more > button:hover { background: white; }
+.scm-commit-more > button:hover { background: white; border-color: white; border-left-color: alpha(@wall, 0.35); }
 .scm-commit-more > button:disabled { opacity: 0.4; }
-button.scm-suggest { min-height: 28px; padding: 0 10px; border: 1px solid @strong; color: @secondary; }
+button.scm-suggest { min-height: 32px; padding: 0 14px; border: 1px solid @strong; border-radius: 10px; color: @secondary; }
+button.scm-suggest:hover { border-color: @line_emphasis; color: @ink; }
 popover.scm-menu > contents { padding: 4px 0; }
 button.scm-menu-item { min-height: 28px; padding: 0 14px; border-radius: 0; color: @ink; font-weight: 400; }
 .scm-clean { padding: 14px 14px 12px; border-bottom: 1px solid @edge; color: @live; }
@@ -217,7 +230,6 @@ button.scm-open:focus-visible { outline: 1px solid alpha(@ink, 0.38); outline-of
 
 /* ---- History ---- */
 .code-git-split > separator { min-height: 1px; background: @edge; }
-.code-history-pane { background: @console; }
 .scm-history { border-bottom: 0; }
 button.code-graph-toggle { min-height: 20px; margin-right: 2px; padding: 0 7px; font-size: 10.5px; border-radius: 2px; }
 button.code-commit { min-height: 40px; padding: 0 10px 0 8px; border: 0; border-radius: 0; background: transparent; }

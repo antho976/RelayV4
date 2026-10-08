@@ -131,6 +131,7 @@ impl Editor {
 
     pub fn new() -> Rc<Self> {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        root.add_css_class("code-surface");
         let tools = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         tools.add_css_class("toolbar");
         tools.add_css_class("code-bar");
@@ -162,9 +163,6 @@ impl Editor {
         agents_button.set_widget_name("project-agents");
         agents_button.add_css_class("selected");
         views.append(&agents_button);
-        let document_button = button("Editor", "quiet");
-        document_button.set_widget_name("project-editor");
-        views.append(&document_button);
         root.append(&project_tools);
 
         let caption = label("No file open", "title");
@@ -196,6 +194,7 @@ impl Editor {
 
         let split = gtk::Paned::new(gtk::Orientation::Horizontal);
         split.set_position(260);
+        split.add_css_class("code-split");
         split.set_resize_start_child(false);
         split.set_shrink_start_child(false);
         split.set_shrink_end_child(false);
@@ -326,6 +325,7 @@ impl Editor {
         position.add_css_class("code-position");
         content.append(&position);
         let workspace = gtk::Paned::new(gtk::Orientation::Horizontal);
+        workspace.add_css_class("code-split");
         workspace.set_start_child(Some(&content));
         workspace.set_resize_start_child(true);
         workspace.set_shrink_start_child(false);
@@ -508,12 +508,6 @@ impl Editor {
             }
         });
         let weak = Rc::downgrade(&editor);
-        document_button.connect_clicked(move |_| {
-            if let Some(editor) = weak.upgrade() {
-                editor.show_files();
-            }
-        });
-        let weak = Rc::downgrade(&editor);
         files_button.connect_clicked(move |_| {
             if let Some(editor) = weak.upgrade() {
                 editor.toggle_files();
@@ -526,15 +520,13 @@ impl Editor {
             }
         });
         let weak = Rc::downgrade(&editor);
-        let (agents_tab, editor_tab) = (agents_button.clone(), document_button.clone());
+        let agents_tab = agents_button.clone();
         editor
             .content_stack
             .connect_visible_child_name_notify(move |_| {
                 if let Some(editor) = weak.upgrade() {
                     let document = !editor.agents_visible();
-                    for (tab, lit) in [(&agents_tab, !document), (&editor_tab, document)] {
-                        if lit { tab.add_css_class("selected") } else { tab.remove_css_class("selected") }
-                    }
+                    if document { agents_tab.remove_css_class("selected") } else { agents_tab.add_css_class("selected") }
                     editor.document_tools.set_visible(document && !editor.image_mode.get());
                     editor.position.set_visible(document);
                     if !document || editor.image_mode.get() {
