@@ -76,7 +76,7 @@ pub async fn run(ui: &Rc<Ui>) -> Result<(), String> {
         buffer.is_modified(),
         "Agents return must retain unsaved edits",
     )?;
-    click(ui, "project-editor")?;
+    ui.editor.show_files();
     require(!ui.editor.agents_visible(), "Editor return action")?;
     require(
         buffer.text(&buffer.start_iter(), &buffer.end_iter(), true) == snapshot,
@@ -351,7 +351,7 @@ async fn image_preview(ui: &Rc<Ui>) -> Result<(), String> {
     require(texture.width() == 1024 && texture.height() == 768, "Image dimensions")?;
     require(!named(&ui.window, "project-save").unwrap().is_sensitive(), "Image cannot be saved as text")?;
     click(ui, "project-agents")?;
-    click(ui, "project-editor")?;
+    ui.editor.show_files();
     require(picture.is_mapped(), "Returning to editor restores image")?;
     // Capture the actual editor preview, including fit and surrounding chrome.
     glib::timeout_future(Duration::from_millis(150)).await;
