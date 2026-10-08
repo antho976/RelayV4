@@ -422,10 +422,7 @@ async fn tools(instance: Instance, actor: &Actor, token: Option<&str>) -> Result
     // ~115 of the tools were ops the role allowlist refuses at runtime, and the payload was
     // large enough that a harness could drop the lot — so the working integration reached
     // nobody at all (D104).
-    let selection = std::env::var("RELAY_MCP_OPS").ok();
-    let selection: Option<Vec<String>> = selection.map(|raw| {
-        raw.split(',').map(str::trim).filter(|part| !part.is_empty()).map(str::to_string).collect()
-    });
+    let selection = selection();
     let tools = listed.into_iter().filter_map(|info| {
         if info["implemented"] != true { return None; }
         let name = info["name"].as_str()?;
@@ -435,7 +432,7 @@ async fn tools(instance: Instance, actor: &Actor, token: Option<&str>) -> Result
             // An explicit RELAY_MCP_OPS is a deliberate override: it selects the set, and the
             // engine still refuses anything the role may not call.
             // Matched the way role allowlists are, so the two cannot drift apart (RA-590).
-            Some(patterns) => patterns.iter().any(|pattern| relay_core::guardrail::op_matches(pattern, name)),
+            Some(_) => selected(selection.as_deref(), name),
             None => info["call"] != "no",
         };
         admitted.then(|| op_tool(entry))
@@ -466,7 +463,26 @@ async fn report_tool_count(client: &mut Client, actor: &Actor, token: Option<&st
     let _ = client.call(&request, |_| {}).await;
 }
 
+/// `RELAY_MCP_OPS`: the op patterns this server was started for, when it was given a set.
+fn selection() -> Option<Vec<String>> {
+    std::env::var("RELAY_MCP_OPS").ok().map(|raw| {
+        raw.split(',').map(str::trim).filter(|part| !part.is_empty()).map(str::to_string).collect()
+    })
+}
+
+/// Whether `name` may be called here. A server given a set answers only that set, whatever a
+/// client asks for: a thread's agent runs as the person, and its set is all it may change.
+fn selected(selection: Option<&[String]>, name: &str) -> bool {
+    selection.is_none_or(|patterns| patterns.iter().any(|pattern| relay_core::guardrail::op_matches(pattern, name)))
+}
+
 async fn call_tool(instance: Instance, actor: &Actor, token: Option<&str>, name: &str, message: &Value) -> Result<Value> {
+    if !selected(selection().as_deref(), name) {
+        return Ok(tool_error(
+            json!({"kind":"refused","code":"bus.allowlist","message":format!("{name} is not one of the tools this server was started with")}),
+            None,
+        ));
+    }
     let arguments = message.pointer("/params/arguments").cloned().unwrap_or_else(|| json!({}));
     if !arguments.is_object() {
         return Ok(tool_error(
@@ -609,6 +625,16 @@ mod tests {
         assert!(op_matches("*", "anything.at_all"));
         assert!(!op_matches("mailbox.*", "mailboxes.send"));
         assert!(!op_matches("task.get", "task.list"));
+    }
+
+    #[test]
+    fn a_server_given_a_set_answers_only_that_set() {
+        let set = vec!["money.tx.add".to_string(), "bus.*".to_string()];
+        assert!(selected(Some(&set), "money.tx.add"));
+        assert!(selected(Some(&set), "bus.schema"));
+        assert!(!selected(Some(&set), "money.reset"));
+        assert!(!selected(Some(&[]), "money.summary"));
+        assert!(selected(None, "money.reset"), "no set: the engine's own checks decide");
     }
 
     #[test]

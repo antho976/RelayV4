@@ -22,7 +22,7 @@ The Money pages are a first step, not the destination. What Antho wants instead 
 a **threads page**: agent first, data second. A thread is a conversation with an agent that works
 on the data of Antho's own apps, and the data shows beside it to read and edit. The apps to bring
 in: money (Tally's budget), investing, AI-run investing later, and the gym app's data. The ledger,
-its ops and sync here are what such a thread would read and write. Not built yet.
+its ops and sync here are what such a thread reads and writes: see `docs/THREADS.md`.
 
 ## Try it
 
