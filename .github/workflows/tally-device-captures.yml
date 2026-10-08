@@ -29,6 +29,8 @@ jobs:
       # Gradle cache, the build and the system image leave a stock runner about 6 GB short.
       # Drop the toolchains this job never uses before anything is restored.
       - name: Free runner disk for the emulator
+        # Before checkout apps/tally does not exist yet, so not the workflow's default directory.
+        working-directory: ${{ github.workspace }}
         run: |
           df -h /
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/boost \
