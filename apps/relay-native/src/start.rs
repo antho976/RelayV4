@@ -150,7 +150,7 @@ pub fn build(greeting: &str, hint: &str, pick: Rc<dyn Fn(bool)>) -> Built {
     let mut lines = Vec::new();
     let mut keys = Vec::new();
     for (index, (to_money, title, about)) in
-        [(false, "Dev", "Agents, tasks and code"), (true, "Money", "Your budget, from Tally")].into_iter().enumerate()
+        [(false, "Dev", "Agents, tasks and code"), (true, "Threads", "Ask about your data, with Tally")].into_iter().enumerate()
     {
         let card = button("", "start-card");
         card.set_widget_name(if to_money { "start-money" } else { "start-dev" });

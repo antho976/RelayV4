@@ -1160,7 +1160,7 @@ impl Ui {
                     "agents" | "code" | "board" | "settings" => ui.navigate(action),
                     "space" => crate::money::toggle_space(&ui),
                     // In Money the same chord logs an entry.
-                    "new_session" if crate::money::active() => crate::money::add_entry(&ui),
+                    "new_session" if crate::money::active() => crate::money::new_thread(&ui),
                     // Rebuilding an open sheet would discard what is being typed into it.
                     "new_session" if ui.launch.reveals_child() => {}
                     "new_session" => ui.show_launch(None),

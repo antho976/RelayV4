@@ -1,0 +1,78 @@
+/* The Threads page (threads_view.rs), in the dev space's tokens (DESIGN.md): the thread list in
+   the sidebar, the conversation, the message box and the Tally panel. Colour means state: the
+   live green of a source that syncs or an agent at work; red for a refusal. */
+
+.threads-root, .threads-scroll, .threads-scroll > viewport { background: @wall; color: @ink; }
+
+/* The strip: the thread's name as Dev's project pill. */
+.threads-strip { border-bottom: 0; }
+menubutton.threads-title-key > button { min-height: 34px; padding: 0 12px; border: 1px solid @edge; border-radius: 10px; background: @slab; }
+menubutton.threads-title-key > button:hover { background: @wash; border-color: @line_emphasis; }
+menubutton.threads-title-key > button image { color: @faint; }
+.threads-title { font-size: 13px; color: @ink; }
+.threads-menu { padding: 10px; }
+
+/* A new thread. */
+.threads-empty { padding: 0 28px 60px; }
+.threads-greeting { font-size: 26px; font-weight: 600; letter-spacing: -0.02em; color: @ink; }
+.threads-greeting-line { font-size: 14px; color: @faint; }
+button.threads-suggestion { padding: 12px 14px; border: 1px solid @edge; border-radius: 14px; background: @slab; }
+button.threads-suggestion:hover { background: @wash; border-color: @line_emphasis; }
+.threads-suggestion-ask { font-size: 13px; font-weight: 500; color: @ink; }
+.threads-suggestion-about { font-size: 12px; color: @faint; }
+
+/* The conversation. */
+.threads-column { padding: 16px 28px 28px; }
+.threads-user { padding: 10px 14px; border-radius: 14px; background: @wash; color: @ink; font-size: 14px; }
+.threads-turn { margin-top: 2px; }
+.threads-reply { font-size: 14px; color: @ink; }
+.threads-h2 { font-size: 16px; font-weight: 600; color: @ink; margin-top: 4px; }
+.threads-h3 { font-size: 14px; font-weight: 600; color: @ink; }
+.threads-marker { font-size: 14px; color: @faint; min-width: 14px; }
+.threads-code { padding: 10px 12px; border-radius: 10px; background: @screen; border: 1px solid @edge; font-family: "Geist Mono", monospace; font-size: 12px; color: @secondary; }
+.threads-table { padding: 10px 14px; border: 1px solid @edge; border-radius: 12px; background: @slab; }
+.threads-table-head { font-size: 12px; font-weight: 600; color: @faint; }
+.threads-table-cell { font-size: 13px; color: @ink; font-feature-settings: "tnum"; }
+.threads-rule { background: @edge; min-height: 1px; }
+.threads-tool { color: @faint; }
+.threads-tool image { color: @ink_dim; }
+.threads-tool-text { font-size: 12px; color: @faint; }
+.threads-tool-failed .threads-tool-text, .threads-tool-failed image { color: #f0786f; }
+.threads-error { font-size: 13px; color: #f0786f; }
+.threads-working { color: @faint; }
+.threads-working-text { font-size: 12px; color: @faint; }
+
+/* What the agent changed: a card, with Undo when it added. */
+.threads-card { padding: 10px 12px; border: 1px solid @edge; border-radius: 14px; background: @slab; }
+.threads-card-title { font-size: 13px; font-weight: 600; color: @ink; }
+.threads-card-detail { font-size: 12px; color: @faint; }
+button.threads-undo { min-height: 28px; }
+
+/* The message box. */
+.threads-dock { padding: 0 28px 18px; }
+.threads-composer { min-width: 640px; padding: 12px 12px 10px 16px; border: 1px solid @strong; border-radius: 14px; background: @raised; }
+.threads-composer:focus-within { border-color: @line_focus; }
+textview.threads-input, textview.threads-input text { background: transparent; color: @ink; font-size: 14px; }
+.threads-composer scrolledwindow { background: transparent; min-height: 44px; }
+.threads-chip { padding: 3px 10px; border: 1px solid @strong; border-radius: 999px; background: @slab; color: @secondary; font-size: 12px; font-weight: 500; }
+.threads-dot, .threads-lamp { min-width: 6px; min-height: 6px; border-radius: 3px; background: @live; }
+button.primary.threads-send { min-width: 34px; min-height: 34px; padding: 0; border-radius: 10px; }
+
+/* The Tally panel. */
+.threads-panel { padding: 0 20px 18px; border-left: 1px solid @edge; background: @wall; }
+.threads-panel .view-tabs button { min-height: 28px; }
+.threads-panel-eyebrow { font-family: "Geist Mono", monospace; font-size: 11.5px; color: @faint; }
+.threads-panel-figure { font-size: 26px; font-weight: 600; letter-spacing: -0.02em; color: @ink; font-feature-settings: "tnum"; }
+.threads-panel-name { font-size: 13px; color: @ink; }
+.threads-panel-detail { font-size: 12px; color: @faint; }
+.threads-panel-figures { font-family: "Geist Mono", monospace; font-size: 11.5px; color: @secondary; font-feature-settings: "tnum"; }
+.threads-caption { font-size: 11px; font-weight: 600; letter-spacing: 0.08em; color: @faint; margin-bottom: 2px; }
+.threads-entry { padding: 8px 0; border-top: 1px solid @line_subtle; }
+
+/* The sidebar's thread list. */
+.threads-list { padding: 0 0 8px; }
+button.threads-row { min-height: 34px; }
+.threads-list-note { padding: 6px 12px; font-size: 12px; color: @faint; }
+.threads-panel-figures.money-over { color: #f0786f; }
+.threads-panel-figures.money-ahead { color: @waiting; }
+.threads-panel-figures.money-in { color: @live; }

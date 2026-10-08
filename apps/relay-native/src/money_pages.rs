@@ -174,12 +174,47 @@ fn plural(n: usize, one: &str) -> String {
     copy::plural(n as i64, one)
 }
 
+/// How a meter's fill reads: Dev's ink, a category's hue, ahead of pace (amber, Dev's waiting),
+/// or over budget (red).
+#[derive(Clone, Copy)]
+pub enum Tone {
+    Plain,
+    Hue(i64),
+    Ahead,
+    Over,
+}
+
+/// A budget's tone from its pace status, in its category's hue when it has one.
+pub fn tone(status: &str, hue: Option<i64>) -> Tone {
+    match status {
+        "OVER_BUDGET" => Tone::Over,
+        "OVER_PACE" => Tone::Ahead,
+        _ => hue.map_or(Tone::Plain, Tone::Hue),
+    }
+}
+
 /// A bar filled to `fraction` with the pace tick at `tick`, red when `over`.
 pub fn meter(fraction: f64, tick: Option<f64>, over: bool, height: i32) -> gtk::DrawingArea {
+    meter_in(fraction, tick, if over { Tone::Over } else { Tone::Plain }, height)
+}
+
+fn rgb(hex: &str) -> (f64, f64, f64) {
+    let v = u32::from_str_radix(hex.trim_start_matches('#'), 16).unwrap_or(0xEDE9E2);
+    (f64::from((v >> 16) & 0xFF) / 255.0, f64::from((v >> 8) & 0xFF) / 255.0, f64::from(v & 0xFF) / 255.0)
+}
+
+/// [`meter`] filled in `tone`.
+pub fn meter_in(fraction: f64, tick: Option<f64>, tone: Tone, height: i32) -> gtk::DrawingArea {
     let area = gtk::DrawingArea::new();
     area.set_content_height(height + 6);
     area.set_hexpand(true);
     area.add_css_class("money-meter");
+    let fill = match tone {
+        Tone::Plain => rgb("#EDE9E2"),
+        Tone::Hue(h) => rgb(HUES[h.rem_euclid(HUES.len() as i64) as usize]),
+        Tone::Ahead => rgb("#f0a828"),
+        Tone::Over => rgb("#f0786f"),
+    };
     area.set_draw_func(move |_, cr, width, _| {
         let (w, h, top) = (width as f64, height as f64, 3.0);
         let rounded = |x: f64, w: f64| {
@@ -189,22 +224,20 @@ pub fn meter(fraction: f64, tick: Option<f64>, over: bool, height: i32) -> gtk::
             cr.arc(x + r, top + r, r, std::f64::consts::FRAC_PI_2, 3.0 * std::f64::consts::FRAC_PI_2);
             cr.close_path();
         };
-        cr.set_source_rgb(0x2A as f64 / 255.0, 0x23 as f64 / 255.0, 0x1C as f64 / 255.0);
+        let (r, g, b) = rgb("#2A2826");
+        cr.set_source_rgb(r, g, b);
         rounded(0.0, w);
         let _ = cr.fill();
         let filled = (fraction.clamp(0.0, 1.0) * w).max(if fraction > 0.0 { h } else { 0.0 });
         if filled > 0.0 {
-            if over {
-                cr.set_source_rgb(0xD9 as f64 / 255.0, 0x53 as f64 / 255.0, 0x4A as f64 / 255.0);
-            } else {
-                cr.set_source_rgb(0xD4 as f64 / 255.0, 0x76 as f64 / 255.0, 0x1F as f64 / 255.0);
-            }
+            cr.set_source_rgb(fill.0, fill.1, fill.2);
             rounded(0.0, filled);
             let _ = cr.fill();
         }
         if let Some(tick) = tick.filter(|t| (0.0..=1.0).contains(t)) {
             let x = (tick * w).clamp(1.0, w - 1.0);
-            cr.set_source_rgb(0xF2 as f64 / 255.0, 0xEF as f64 / 255.0, 0xEA as f64 / 255.0);
+            let (r, g, b) = rgb("#8C877F");
+            cr.set_source_rgb(r, g, b);
             cr.set_line_width(2.0);
             cr.move_to(x, 0.0);
             cr.line_to(x, h + 6.0);
@@ -214,8 +247,18 @@ pub fn meter(fraction: f64, tick: Option<f64>, over: bool, height: i32) -> gtk::
     area
 }
 
+/// Over budget: red. Ahead of pace is amber ([`tone`]), not red.
 fn over(status: &str) -> bool {
-    matches!(status, "OVER_PACE" | "OVER_BUDGET")
+    status == "OVER_BUDGET"
+}
+
+/// The figure's class for a pace status: red over budget, amber ahead of pace.
+pub fn tone_class(status: &str) -> Option<&'static str> {
+    match status {
+        "OVER_BUDGET" => Some("money-over"),
+        "OVER_PACE" => Some("money-ahead"),
+        _ => None,
+    }
 }
 
 /// The page title in the serif voice, its context line under it.
@@ -565,6 +608,8 @@ fn home(ui: &Rc<Ui>, page: &Page, s: &Value) {
     hero.add_css_class("money-hero");
     if over(status) {
         hero.add_css_class("money-hero-over");
+    } else if status == "OVER_PACE" {
+        hero.add_css_class("money-hero-ahead");
     }
     let figure = if budgeted { fmt.format(n(pace, "remaining")) } else { fmt.format(n(s, "spent")) };
     let figure = label(&figure, "money-hero-figure");
@@ -584,7 +629,7 @@ fn home(ui: &Rc<Ui>, page: &Page, s: &Value) {
         }
     }
     if budgeted {
-        let bar = meter(pace["spent_fraction"].as_f64().unwrap_or(0.0), pace["pace_fraction"].as_f64(), over(status), 10);
+        let bar = meter_in(pace["spent_fraction"].as_f64().unwrap_or(0.0), pace["pace_fraction"].as_f64(), tone(status, None), 10);
         bar.set_margin_top(10);
         bar.set_tooltip_text(Some("The tick is where an even spend would be today"));
         hero.append(&bar);
@@ -636,13 +681,13 @@ fn home(ui: &Rc<Ui>, page: &Page, s: &Value) {
             name.set_hexpand(true);
             top.append(&name);
             let reading = label(&copy::of_budget(n(b, "spent"), n(b, "budget"), &fmt), "money-row-detail");
-            if over(text(b, "status")) {
-                reading.add_css_class("money-over");
+            if let Some(class) = tone_class(text(b, "status")) {
+                reading.add_css_class(class);
             }
             top.append(&reading);
             row.append(&top);
             let fraction = n(b, "spent") as f64 / n(b, "budget").max(1) as f64;
-            row.append(&meter(fraction, Some(pace_fraction), over(text(b, "status")), 6));
+            row.append(&meter_in(fraction, Some(pace_fraction), tone(text(b, "status"), b["color"].as_i64()), 6));
             list.append(&row);
         }
     }

@@ -25,8 +25,8 @@ The mockup: https://claude.ai/artifact/GPtaPk6YYLiFCHGpeNPMk4
 ## Phases
 
 1. **The thread engine** (built): `threads.db`, the `thread.*` ops, the background agent.
-2. **The Threads space** in `relay-native`: thread list in the sidebar, the conversation, the
-   message box, and the Money pages restyled as the Tally panel beside it.
+2. **The Threads space** in `relay-native` (built): thread list in the sidebar, the conversation,
+   the message box, the Tally panel beside it, and Tally's pages restyled in Dev's tokens.
 3. **Cards:** charts, budget meters and the Undo card, live from the ledger.
 4. **Asking first:** a confirm card for what the agent may not do alone (delete, budgets,
    accounts), run as the person when they approve.
@@ -80,3 +80,24 @@ alone: `thread.create` (optionally with the first message, which also names the 
 
 Tests: `crates/relay-core/tests/threads.rs` drives threads end to end against a stand-in Claude
 that speaks the same stream-json.
+
+## The Threads space (phase 2)
+
+`apps/relay-native/src/threads_view.rs`, styled by `css/threads.css`; the space itself is still
+`money.rs` (the switcher, the sidebar swap, the start screen), which now says Threads.
+
+- **The sidebar** keeps Dev's frame and footer. Its keys are New thread (Ctrl N) and Tally, then
+  the threads grouped Today, Yesterday, This week and Earlier, a green lamp on one at work.
+- **The middle** is a new thread (greeting, the month in a line, the message box, four questions to
+  start) or the open one: the person's messages as bubbles, the agent's Markdown drawn natively
+  (`relay_client::thread_view`: paragraphs, headings, lists, tables, code), each tool call as a
+  quiet line saying what it did, and an entry the agent added as a card with Undo
+  (`money.tx.delete`). Enter sends, Shift+Enter breaks the line; while the agent works the send key
+  stops it.
+- **The Tally panel** (the strip's right key hides it): Overview (what is left, budgets, recent
+  entries), Entries (this month) and Budgets. Meters take the category's hue; amber is ahead of
+  pace, red over budget.
+- **Tally's pages** (Overview, Entries, Plan, Data) open from the sidebar's Tally key with their own
+  tabs, in Dev's tokens (`css/money.css`); the Money space's warm palette is gone.
+
+A display smoke run opens a thread with `RELAY_NATIVE_THREAD=<id>` beside `RELAY_NATIVE_PAGE=threads`.
