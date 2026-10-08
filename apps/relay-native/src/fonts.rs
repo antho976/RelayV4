@@ -9,9 +9,14 @@ pub const SCREEN: usize = 4;
 /// Each appearance mode's tokens. The window's CSS (`load_appearance`) and the editor
 /// schemes written below both come from this one table.
 const PALETTES: [(&str, [&str; 10]); 3] = [
-    ("matte", ["#0e0e10", "#141416", "#1b1b1e", "#232327", "#0a0a0b", "#ececea", "#a5a5a3", "#252529", "#77777a", "#37373c"]),
-    ("dark", ["#0a0b0d", "#101114", "#16171b", "#1e1f24", "#08090a", "#eef0f2", "#a3a7ad", "#202228", "#70747b", "#33363d"]),
-    ("oled", ["#000000", "#000000", "#0d0d0e", "#161618", "#000000", "#ececea", "#a5a5a3", "#1f1f22", "#77777a", "#333336"]),
+    // DESIGN.md's palette is Dark, the default: ground, ground, surface, selected, the
+    // terminals' screen, ink, ink-2, line, ink-3, line-strong. Matte lifts its grounds a step;
+    // OLED sets them on true black. The inks are the same in all three. `screen` paints the
+    // terminals and the code editor and keeps each mode's earlier value: the terminals are not
+    // part of the warm rework.
+    ("matte", ["#171614", "#171614", "#1e1d1b", "#23211f", "#0a0a0b", "#ede9e2", "#b5b0a8", "#292725", "#8c877f", "#2c2a28"]),
+    ("dark", ["#131211", "#131211", "#1a1917", "#1f1d1b", "#08090a", "#ede9e2", "#b5b0a8", "#242220", "#8c877f", "#262422"]),
+    ("oled", ["#000000", "#000000", "#0f0e0d", "#161513", "#000000", "#ede9e2", "#b5b0a8", "#1c1b19", "#8c877f", "#211f1d"]),
 ];
 
 /// The status tokens, the same in every appearance mode: theme.css defines them for the
@@ -60,7 +65,14 @@ pub fn install(window: &gtk4::ApplicationWindow) {
             "fira-sans-condensed-latin-700-normal.ttf",
             "fira-mono-latin-400-normal.ttf",
             "fira-mono-latin-500-normal.ttf",
-            // The wordmark's face on the start screen (start.rs).
+            // The interface's faces (theme.css): Geist for text, Geist Mono for numbers,
+            // keycaps and code. Fira Mono above stays the terminals' face.
+            "geist-latin-400-normal.ttf",
+            "geist-latin-500-normal.ttf",
+            "geist-latin-600-normal.ttf",
+            "geist-mono-latin-400-normal.ttf",
+            "geist-mono-latin-500-normal.ttf",
+            // The wordmark's face (start.rs and the title bar).
             "sora-latin-600-normal.ttf",
         );
         map.changed();

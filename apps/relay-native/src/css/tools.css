@@ -13,7 +13,7 @@
 .ext-page .ext-title { font-size: 18px; font-weight: 600; letter-spacing: -0.01em; color: @ink; }
 .ext-page .ext-subtitle { font-size: 12px; color: @secondary; }
 .ext-page .ext-scope { margin-left: 8px; }
-.ext-page .ext-scope-label { font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; color: @faint; }
+.ext-page .ext-scope-label { font-family: 'Geist', sans-serif; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; color: @faint; }
 .ext-page .ext-scope dropdown > button { min-height: 30px; min-width: 150px; padding: 0 8px 0 10px; background: @slab; border-color: @strong; }
 .ext-page .ext-scope dropdown > button:hover { background: @wash; border-color: @faint; }
 .ext-page .ext-actions { margin-left: 4px; }
@@ -46,7 +46,7 @@
 .ext-page button.ext-filter:hover label { color: @ink; }
 .ext-page button.ext-filter:checked { background: @wash; border-color: @strong; }
 .ext-page button.ext-filter:checked .ext-filter-name { color: @ink; }
-.ext-page .ext-count { font-family: 'Fira Mono', monospace; font-size: 10.5px; color: @faint; font-feature-settings: "tnum"; }
+.ext-page .ext-count { font-family: 'Geist Mono', monospace; font-size: 10.5px; color: @faint; font-feature-settings: "tnum"; }
 .ext-page button.ext-filter .ext-count { color: @faint; }
 .ext-page button.ext-filter:checked .ext-count { color: @secondary; }
 .ext-page .ext-hint { font-size: 11px; color: @faint; }
@@ -59,20 +59,20 @@
 .ext-page list.ext-list > row.ext-row:selected { background: @wash; box-shadow: inset 2px 0 @ink; }
 .ext-page list.ext-list > row.ext-row:focus-visible { outline: 2px solid alpha(@ink, 0.35); outline-offset: -2px; }
 .ext-page list.ext-list > row.ext-group { padding: 16px 14px 7px; border-bottom: 1px solid @edge; }
-.ext-page .ext-group-name { font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; color: @faint; }
-.ext-page .ext-group-count { font-family: 'Fira Mono', monospace; font-size: 10.5px; color: @faint; font-feature-settings: "tnum"; }
+.ext-page .ext-group-name { font-family: 'Geist', sans-serif; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; color: @faint; }
+.ext-page .ext-group-count { font-family: 'Geist Mono', monospace; font-size: 10.5px; color: @faint; font-feature-settings: "tnum"; }
 
 /* Cards */
 .ext-page .ext-card { padding: 13px 14px 13px 16px; }
 .ext-page .ext-name { font-size: 13px; font-weight: 600; color: @ink; }
-.ext-page .ext-version { font-family: 'Fira Mono', monospace; font-size: 10.5px; color: @faint; }
+.ext-page .ext-version { font-family: 'Geist Mono', monospace; font-size: 10.5px; color: @faint; }
 .ext-page .ext-meta { font-size: 11.5px; color: @secondary; }
 .ext-page .ext-summary { font-size: 12px; color: @secondary; }
-.ext-page .ext-path { font-family: 'Fira Mono', monospace; font-size: 10.5px; color: @faint; }
+.ext-page .ext-path { font-family: 'Geist Mono', monospace; font-size: 10.5px; color: @faint; }
 .ext-page list.ext-list > row:selected .ext-name { color: @ink; }
 .ext-page list.ext-list > row:selected .ext-summary { color: @secondary; }
 .ext-page list.ext-list > row:selected .ext-meta { color: @secondary; }
-.ext-page .ext-mark { min-width: 34px; min-height: 34px; background: @slab; border: 1px solid @strong; border-radius: 2px; color: @ink; font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif; font-size: 13px; font-weight: 700; letter-spacing: 0.04em; }
+.ext-page .ext-mark { min-width: 34px; min-height: 34px; background: @slab; border: 1px solid @strong; border-radius: 2px; color: @ink; font-family: 'Geist', sans-serif; font-size: 13px; font-weight: 700; letter-spacing: 0.04em; }
 .ext-page .ext-mark.large { min-width: 52px; min-height: 52px; font-size: 18px; }
 .ext-page list.ext-list > row:selected .ext-mark { background: @console; border-color: @faint; }
 
@@ -82,7 +82,7 @@
 .ext-page .ext-chip { padding: 1px 6px; background: @slab; border: 1px solid @edge; border-radius: 2px; color: @secondary; font-size: 10.5px; font-weight: 500; }
 .ext-page list.ext-list > row:selected .ext-chip { background: @console; border-color: @strong; }
 .ext-page .ext-chip.hint { color: @waiting; background: alpha(@waiting, 0.07); border-color: alpha(@waiting, 0.42); }
-.ext-page .ext-chip.code { padding: 2px 7px; background: @screen; border-color: @edge; color: @ink; font-family: 'Fira Mono', monospace; font-size: 11px; font-weight: 400; }
+.ext-page .ext-chip.code { padding: 2px 7px; background: @screen; border-color: @edge; color: @ink; font-family: 'Geist Mono', monospace; font-size: 11px; font-weight: 400; }
 
 /* Detail pane */
 .ext-page .ext-detail-scroll, .ext-page .ext-detail-scroll > viewport { background: @wall; }
@@ -109,9 +109,9 @@
 
 /* Facts */
 .ext-page .ext-facts { padding: 14px 0; border-top: 1px solid @edge; border-bottom: 1px solid @edge; }
-.ext-page .ext-fact-key { min-width: 76px; font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; color: @faint; }
+.ext-page .ext-fact-key { min-width: 76px; font-family: 'Geist', sans-serif; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; color: @faint; }
 .ext-page .ext-fact { font-size: 12px; color: @ink; }
-.ext-page .ext-fact-mono { font-family: 'Fira Mono', monospace; font-size: 11.5px; color: @ink; }
+.ext-page .ext-fact-mono { font-family: 'Geist Mono', monospace; font-size: 11.5px; color: @ink; }
 
 /* Tabs */
 .ext-page .ext-tabs { border-bottom: 1px solid @edge; }
@@ -124,8 +124,8 @@
 .ext-page button.ext-tab:checked .ext-count { color: @secondary; }
 
 /* Sections and Markdown */
-.ext-page .ext-section-title { font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; color: @faint; }
-.ext-page textview.ext-source { padding: 0; border: 1px solid @edge; font-family: 'Fira Mono', monospace; font-size: 12px; }
+.ext-page .ext-section-title { font-family: 'Geist', sans-serif; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; color: @faint; }
+.ext-page textview.ext-source { padding: 0; border: 1px solid @edge; font-family: 'Geist Mono', monospace; font-size: 12px; }
 
 /* Plugin skills (expanders) */
 .ext-page .ext-entries { border-top: 1px solid @edge; }
@@ -133,18 +133,18 @@
 .ext-page expander-widget.ext-entry > box > title { padding: 11px 6px 11px 2px; }
 .ext-page expander-widget.ext-entry > box > title:hover { background: alpha(@ink, 0.03); }
 .ext-page expander-widget.ext-entry > box > title > expander { color: @faint; }
-.ext-page .ext-entry-name { font-family: 'Fira Mono', monospace; font-size: 12px; font-weight: 500; color: @ink; }
+.ext-page .ext-entry-name { font-family: 'Geist Mono', monospace; font-size: 12px; font-weight: 500; color: @ink; }
 .ext-page .ext-entry-text { font-size: 12px; color: @secondary; }
 .ext-page .ext-entry-body { padding: 2px 0 16px 20px; }
 
 /* MCP servers */
 .ext-page .ext-server { padding: 14px 16px 16px; background: @slab; border: 1px solid @edge; }
-.ext-page .ext-server-name { font-family: 'Fira Mono', monospace; font-size: 13px; font-weight: 600; color: @ink; }
+.ext-page .ext-server-name { font-family: 'Geist Mono', monospace; font-size: 13px; font-weight: 600; color: @ink; }
 
 /* Per-project switches */
 .ext-page .ext-projects-head { padding: 16px 4px 7px; border-bottom: 1px solid @edge; }
 .ext-page .ext-projects-head:first-child { padding-top: 2px; }
-.ext-page .ext-projects-name { font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; color: @faint; }
+.ext-page .ext-projects-name { font-family: 'Geist', sans-serif; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; color: @faint; }
 .ext-page .ext-project { min-height: 32px; padding: 4px 4px 4px 8px; border-bottom: 1px solid alpha(@edge, 0.7); }
 .ext-page .ext-project.scoped { background: alpha(@ink, 0.04); }
 .ext-page .ext-project-name { font-size: 13px; color: @ink; }
@@ -160,14 +160,14 @@
 .device-row { min-height: 40px; padding: 6px 8px 6px 10px; background: @console; border: 1px solid @edge; border-radius: 2px; }
 .device-row button { min-height: 28px; }
 .device-row-name { color: @ink; font-size: 13px; font-weight: 600; }
-.device-row-facts { color: @faint; font-family: 'Fira Mono', monospace; font-size: 10px; }
+.device-row-facts { color: @faint; font-family: 'Geist Mono', monospace; font-size: 10px; }
 
 /* Build from: the chosen branch over its checkout, a tag for the last build. */
 menubutton.build-from > button { min-height: 40px; padding: 4px 10px; background: @console; border: 1px solid @edge; border-radius: 2px; }
 menubutton.build-from > button:hover, menubutton.build-from > button:checked { background: @wash; border-color: @strong; }
 menubutton.build-from image { color: @secondary; }
 .build-from-branch { color: @ink; font-size: 13px; font-weight: 600; }
-.build-from-path { color: @faint; font-family: 'Fira Mono', monospace; font-size: 10px; }
+.build-from-path { color: @faint; font-family: 'Geist Mono', monospace; font-size: 10px; }
 .build-from-tag { padding: 1px 6px; border: 1px solid @strong; border-radius: 2px; color: @secondary; font-size: 10px; }
 .build-from-sheet { padding: 6px; min-width: 340px; }
 list.build-from-list { background: transparent; }

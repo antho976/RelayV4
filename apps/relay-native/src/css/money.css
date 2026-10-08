@@ -50,7 +50,7 @@
 /* Three voices: serif for the figure or title, sans for rows, mono for labels. */
 .money-title { font-family: "Noto Serif", "DejaVu Serif", serif; font-size: 32px; font-weight: 400; color: var(--m-ink); letter-spacing: -0.01em; }
 .money-context { color: var(--m-muted); font-size: 14px; }
-.money-label { font-family: "Fira Mono", monospace; font-size: 11px; letter-spacing: 0.09em; color: var(--m-muted); }
+.money-label { font-family: "Geist Mono", monospace; font-size: 11px; letter-spacing: 0.09em; color: var(--m-muted); }
 .money-muted { color: var(--m-muted); font-size: 14px; }
 .money-row-title { font-size: 15px; color: var(--m-ink); }
 .money-row-detail { font-size: 13px; color: var(--m-muted); font-feature-settings: "tnum"; }
@@ -107,11 +107,11 @@ button.money-row-delete:hover { color: var(--m-over); background: alpha(#D9534A,
 .money-badge.hue-11 { color: #B8664F; background: alpha(#B8664F, 0.15); }
 
 /* Actions: one hero action at most, secondary slabs, text actions in the accent. */
-button.money-text-action { background: transparent; border: 0; box-shadow: none; color: #D4761F; font-family: "Fira Mono", monospace; font-size: 12px; letter-spacing: 0.04em; padding: 2px 6px; min-height: 26px; }
+button.money-text-action { background: transparent; border: 0; box-shadow: none; color: #D4761F; font-family: "Geist Mono", monospace; font-size: 12px; letter-spacing: 0.04em; padding: 2px 6px; min-height: 26px; }
 button.money-text-action:hover { background: alpha(#D4761F, 0.12); border-radius: 8px; }
-.money-root button.primary.money-hero-action, .money-sheet button.primary.money-hero-action { background: #D4761F; border-color: #D4761F; color: #110F0C; border-radius: 12px; min-height: 40px; padding: 0 20px; font-family: "Fira Mono", monospace; font-weight: 700; font-size: 13px; }
+.money-root button.primary.money-hero-action, .money-sheet button.primary.money-hero-action { background: #D4761F; border-color: #D4761F; color: #110F0C; border-radius: 12px; min-height: 40px; padding: 0 20px; font-family: "Geist Mono", monospace; font-weight: 700; font-size: 13px; }
 .money-root button.primary.money-hero-action:hover, .money-sheet button.primary.money-hero-action:hover { background: #E08A3A; border-color: #E08A3A; }
-button.money-secondary, button.money-destructive { background: #221C16; border: 0; color: #F2EFEA; border-radius: 12px; min-height: 40px; padding: 0 18px; font-family: "Fira Mono", monospace; font-size: 13px; box-shadow: none; }
+button.money-secondary, button.money-destructive { background: #221C16; border: 0; color: #F2EFEA; border-radius: 12px; min-height: 40px; padding: 0 18px; font-family: "Geist Mono", monospace; font-size: 13px; box-shadow: none; }
 button.money-secondary:hover, button.money-destructive:hover { background: #2A231C; }
 button.money-destructive { color: #D9534A; }
 button.money-secondary:disabled, button.money-destructive:disabled { color: alpha(#BFB6AA, 0.45); background: #1A1613; }
@@ -125,7 +125,7 @@ button.money-chrome:disabled { color: alpha(#BFB6AA, 0.4); }
 .space-money entry.money-field:focus-within, .space-money entry.money-search:focus-within, .money-sheet entry:focus-within, .space-money spinbutton.money-field:focus-within { border-color: #D4761F; }
 .space-money entry.money-field.error, .money-sheet entry.error { border-color: #D9534A; }
 .space-money entry.money-field, .space-money spinbutton.money-field { font-feature-settings: "tnum"; }
-.money-suffix { font-family: "Fira Mono", monospace; font-size: 12px; letter-spacing: 0.06em; color: #BFB6AA; }
+.money-suffix { font-family: "Geist Mono", monospace; font-size: 12px; letter-spacing: 0.06em; color: #BFB6AA; }
 
 /* The entry sheet. */
 .money-sheet.app-panel { background: #16120F; border-left: 1px solid #2A241F; color: #F2EFEA; }

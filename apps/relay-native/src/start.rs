@@ -52,8 +52,8 @@ fn phase_back(t: f64, (from, to): (f64, f64)) -> f64 {
     1.0 + (c + 1.0) * (x - 1.0).powi(3) + c * (x - 1.0).powi(2)
 }
 
-/// The mark at timeline point `t`, in a `size` square.
-fn draw_mark(cr: &gtk::cairo::Context, size: f64, t: f64) {
+/// The mark at timeline point `t`, in a `size` square. The title bar draws it settled (`t` = 1).
+pub(crate) fn draw_mark(cr: &gtk::cairo::Context, size: f64, t: f64) {
     let s = size / 120.0;
     cr.scale(s, s);
     cr.set_line_width(12.0);

@@ -1069,7 +1069,6 @@ impl Ui {
             ("board", "Board"),
             ("modules", "Modules"),
             ("notes", "Notes"),
-            ("dashboard", "Dashboard"),
             ("skills", "Skills"),
             ("plugins", "Plugins"),
             ("settings", "Settings"),

@@ -60,7 +60,7 @@ button.filter-chip:hover { border-color: @secondary; background: alpha(@ink, 0.1
 .board-drag-rail { margin: 10px 16px 0; padding: 5px 8px; background: @console; border: 1px dashed @strong; }
 .board-drag-rail button { min-height: 22px; padding: 0 8px; font-size: 11px; border: 1px solid transparent; }
 .board-drag-rail button:drop(active) { border-color: @ink; background: @wash; color: @ink; }
-.board-rail-caption { margin-right: 6px; color: @faint; font-family: 'Fira Sans Condensed'; font-size: 10.5px; font-weight: 600; letter-spacing: 0.08em; }
+.board-rail-caption { margin-right: 6px; color: @faint; font-family: 'Geist'; font-size: 10.5px; font-weight: 600; letter-spacing: 0.08em; }
 
 /* ── Lanes: GitHub project columns ────────────────────────────────────── */
 .board-grid { padding: 2px 16px 10px; }
@@ -70,7 +70,7 @@ button.filter-chip:hover { border-color: @secondary; background: alpha(@ink, 0.1
 .list-head { padding: 6px 8px 6px 12px; border-bottom: 1px solid @edge; }
 .lane-head-row { min-height: 26px; }
 .lane-title { color: @ink; font-size: 13px; font-weight: 600; }
-.lane-count { padding: 0 7px; border-radius: 2px; background: alpha(@ink, 0.08); color: @secondary; font-family: 'Fira Mono'; font-size: 10.5px; }
+.lane-count { padding: 0 7px; border-radius: 2px; background: alpha(@ink, 0.08); color: @secondary; font-family: 'Geist Mono'; font-size: 10.5px; }
 .lane-estimate { padding: 0 7px; border: 1px solid @edge; border-radius: 2px; color: @secondary; font-size: 10.5px; }
 .lane-meaning { margin-left: 21px; color: @faint; font-size: 11.5px; }
 button.lane-key, menubutton.lane-key > button { min-height: 24px; min-width: 24px; padding: 0; border: 0; border-radius: 2px; background: transparent; opacity: 0.6; }
@@ -79,7 +79,7 @@ button.lane-key:hover, menubutton.lane-key > button:hover { opacity: 1; backgrou
 .board-empty { min-height: 96px; padding: 18px 10px; border: 1px dashed @edge; border-radius: 2px; }
 .board-empty-title { color: @secondary; font-size: 12px; font-weight: 500; }
 .board-empty-hint { color: @faint; font-size: 11px; }
-.board-group-heading { margin: 6px 2px 0; color: @faint; font-family: 'Fira Sans Condensed'; font-size: 10.5px; font-weight: 600; letter-spacing: 0.06em; }
+.board-group-heading { margin: 6px 2px 0; color: @faint; font-family: 'Geist'; font-size: 10.5px; font-weight: 600; letter-spacing: 0.06em; }
 
 /* ── Cards ──────────────────────────────────────────────────────────────── */
 .task-card { margin: 0; padding: 9px 11px 10px; background: alpha(@ink, 0.045); border: 1px solid @edge; border-radius: 2px; }
@@ -101,7 +101,7 @@ button.card-key { min-height: 20px; min-width: 20px; padding: 0; }
 .card-lineage { color: @secondary; }
 .task-lineage { color: @secondary; font-size: 11px; }
 .task-rollup { margin-top: 2px; }
-.rollup-count { color: @secondary; font-family: 'Fira Mono'; font-size: 10.5px; }
+.rollup-count { color: @secondary; font-family: 'Geist Mono'; font-size: 10.5px; }
 .task-rollup progressbar trough, .task-rollup progressbar progress, progressbar.issue-progress trough, progressbar.issue-progress progress { min-height: 6px; border-radius: 2px; border: 0; }
 .task-rollup progressbar trough, progressbar.issue-progress trough { background: alpha(@ink, 0.1); }
 .task-rollup progressbar progress, progressbar.issue-progress progress { background: #8957e5; }
@@ -114,12 +114,12 @@ button.card-key { min-height: 20px; min-width: 20px; padding: 0; }
 .pill-priority-high .field-pill-name { color: @waiting; }
 .pill-priority-urgent { border-color: alpha(@held, 0.5); background: alpha(@held, 0.08); }
 .pill-priority-urgent .field-pill-name { color: @held; }
-.pill-size .field-pill-name { font-family: 'Fira Mono'; font-size: 10.5px; }
+.pill-size .field-pill-name { font-family: 'Geist Mono'; font-size: 10.5px; }
 .pill-module { color: @secondary; }
 .card-module { color: @secondary; font-size: 11px; }
-.task-chip { font-family: 'Fira Mono'; font-size: 10px; padding: 0 5px; border: 1px solid @edge; border-radius: 2px; color: @secondary; }
-.card-sha { font-family: 'Fira Mono'; font-size: 10px; color: @faint; }
-.card-ago { color: @faint; font-family: 'Fira Mono'; font-size: 10.5px; }
+.task-chip { font-family: 'Geist Mono'; font-size: 10px; padding: 0 5px; border: 1px solid @edge; border-radius: 2px; color: @secondary; }
+.card-sha { font-family: 'Geist Mono'; font-size: 10px; color: @faint; }
+.card-ago { color: @faint; font-family: 'Geist Mono'; font-size: 10.5px; }
 .task-agent { min-height: 22px; margin-top: 2px; padding-top: 5px; border-top: 1px solid @edge; color: @secondary; font-size: 10.5px; }
 .board-lamp { color: @faint; }
 .board-lamp.live-lamp { color: @live; }
@@ -148,7 +148,7 @@ button.card-key { min-height: 20px; min-width: 20px; padding: 0; }
 .priority-high { color: @waiting; }
 .priority-urgent { color: @held; }
 .state-badge { padding: 0 5px; border: 1px solid @edge; border-radius: 2px; min-height: 16px; }
-.state-caption { font-family: 'Fira Sans Condensed'; font-size: 9.5px; font-weight: 600; letter-spacing: 0.06em; color: @secondary; }
+.state-caption { font-family: 'Geist'; font-size: 9.5px; font-weight: 600; letter-spacing: 0.06em; color: @secondary; }
 .state-badge .board-lamp { color: @secondary; }
 .state-running .board-lamp { color: @live; }
 .state-running .state-caption { color: @live; }
@@ -166,7 +166,7 @@ button.card-key { min-height: 20px; min-width: 20px; padding: 0; }
 .list-lineage { color: @faint; font-size: 11px; }
 .list-meta, .list-agent { color: @secondary; font-size: 11px; }
 .list-empty { padding: 10px 12px; color: @faint; font-size: 11.5px; }
-.list-group-heading { padding: 6px 12px 3px; color: @faint; font-family: 'Fira Sans Condensed'; font-size: 10.5px; font-weight: 600; letter-spacing: 0.06em; border-bottom: 1px solid @edge; }
+.list-group-heading { padding: 6px 12px 3px; color: @faint; font-family: 'Geist'; font-size: 10.5px; font-weight: 600; letter-spacing: 0.06em; border-bottom: 1px solid @edge; }
 
 /* ── Peek panel ─────────────────────────────────────────────────────────── */
 .board-peek { background: alpha(@ink, 0.035); border-left: 1px solid @edge; }
@@ -180,7 +180,7 @@ button.card-key { min-height: 20px; min-width: 20px; padding: 0; }
 .peek-text { min-height: 26px; padding-left: 9px; color: @ink; font-size: 12px; }
 .peek-description { color: @ink; font-size: 12.5px; }
 .peek-muted { color: @faint; font-size: 12px; }
-.peek-commit { font-family: 'Fira Mono'; font-size: 11px; color: @secondary; }
+.peek-commit { font-family: 'Geist Mono'; font-size: 11px; color: @secondary; }
 button.peek-link { min-height: 28px; padding: 0 8px; border: 1px solid @edge; border-radius: 2px; background: @slab; color: @ink; font-size: 12px; font-weight: 400; }
 button.peek-link:hover { background: @wash; border-color: @strong; }
 button.peek-link.done label { color: @secondary; }
@@ -189,7 +189,7 @@ button.peek-edit { border: 1px solid @edge; }
 /* ── Menus (context, filter, pickers) ──────────────────────────────────── */
 popover.board-menu contents { padding: 6px; background: @slab; border: 1px solid @strong; }
 .board-menu-title { padding: 4px 6px 6px; color: @ink; font-size: 12px; font-weight: 600; }
-.board-menu-caption { margin-top: 6px; padding: 0 6px; color: @faint; font-family: 'Fira Sans Condensed'; font-size: 10px; font-weight: 600; letter-spacing: 0.08em; }
+.board-menu-caption { margin-top: 6px; padding: 0 6px; color: @faint; font-family: 'Geist'; font-size: 10px; font-weight: 600; letter-spacing: 0.08em; }
 button.board-menu-item { min-height: 28px; padding: 0 8px; border: 0; border-radius: 2px; background: transparent; color: @ink; font-weight: 400; }
 button.board-menu-item:hover { background: @wash; }
 button.board-menu-item.selected { background: @wash; }
@@ -207,7 +207,7 @@ button.filter-option:checked { border-color: @ink; background: @wash; color: @in
 .board-blank { padding: 40px; }
 .board-blank-title { color: @ink; font-size: 15px; font-weight: 600; }
 .board-blank-hint { color: @secondary; font-size: 12px; margin-bottom: 6px; }
-.board-kbd { padding: 0 4px; border: 1px solid @edge; border-radius: 2px; font-family: 'Fira Mono'; font-size: 10px; color: @secondary; }
+.board-kbd { padding: 0 4px; border: 1px solid @edge; border-radius: 2px; font-family: 'Geist Mono'; font-size: 10px; color: @secondary; }
 .board-hint { margin-right: 8px; color: @faint; font-size: 11px; }
 
 /* ── Task pages: GitHub's new-issue form and issue thread ─────────────── */

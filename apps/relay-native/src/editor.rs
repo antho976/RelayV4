@@ -153,12 +153,18 @@ impl Editor {
         let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         spacer.set_hexpand(true);
         project_tools.append(&spacer);
+        // The project's views, one segmented control: the one showing is lit.
+        let views = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        views.add_css_class("view-tabs");
+        views.set_valign(gtk::Align::Center);
+        project_tools.append(&views);
         let agents_button = button("Agents", "quiet");
         agents_button.set_widget_name("project-agents");
-        project_tools.append(&agents_button);
+        agents_button.add_css_class("selected");
+        views.append(&agents_button);
         let document_button = button("Editor", "quiet");
         document_button.set_widget_name("project-editor");
-        project_tools.append(&document_button);
+        views.append(&document_button);
         root.append(&project_tools);
 
         let caption = label("No file open", "title");
@@ -337,12 +343,12 @@ impl Editor {
         tools.append(&find_button);
         let files_button = button("Files", "quiet");
         files_button.set_widget_name("project-files");
-        project_tools.append(&files_button);
+        views.append(&files_button);
         let edit_button = crate::app::icon_button("edit", "Edit file");
         tools.append(&edit_button);
         let git_button = button("Git", "quiet");
         git_button.set_widget_name("project-git");
-        project_tools.append(&git_button);
+        views.append(&git_button);
         let mut control = tools.first_child();
         while let Some(widget) = control {
             control = widget.next_sibling();
@@ -520,11 +526,15 @@ impl Editor {
             }
         });
         let weak = Rc::downgrade(&editor);
+        let (agents_tab, editor_tab) = (agents_button.clone(), document_button.clone());
         editor
             .content_stack
             .connect_visible_child_name_notify(move |_| {
                 if let Some(editor) = weak.upgrade() {
                     let document = !editor.agents_visible();
+                    for (tab, lit) in [(&agents_tab, !document), (&editor_tab, document)] {
+                        if lit { tab.add_css_class("selected") } else { tab.remove_css_class("selected") }
+                    }
                     editor.document_tools.set_visible(document && !editor.image_mode.get());
                     editor.position.set_visible(document);
                     if !document || editor.image_mode.get() {

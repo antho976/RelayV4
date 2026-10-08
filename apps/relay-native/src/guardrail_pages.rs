@@ -271,24 +271,6 @@ fn subject(hold: &Value, details: &Value) -> String {
     }
 }
 
-/// Title and one-line summary, for compact lists such as the dashboard's decision queue.
-pub fn hold_summary(hold: &Value) -> (String, String) {
-    if is_request(hold) {
-        let request = as_request(hold);
-        return (
-            reveal(&format!("{} asks for an exception", text(&request, "session"))).plain,
-            reveal(&format!("{} {}", kind_verb(text(&request, "kind")), clip(text(&request, "value")))).plain,
-        );
-    }
-    let (policy, details) = effective(hold);
-    let session = text(hold, "session");
-    let what = clip(&subject(hold, &details));
-    (
-        format!("Guardrail: {}", policy_title(&policy).to_lowercase()),
-        reveal(&[session, what.as_str()].iter().filter(|s| !s.is_empty()).copied().collect::<Vec<_>>().join(" · ")).plain,
-    )
-}
-
 /// The label/value pairs worth showing under "Details", in reading order.
 fn detail_pairs(details: &Value) -> Vec<(String, String)> {
     const NAMES: &[(&str, &str)] = &[
@@ -1201,14 +1183,11 @@ mod tests {
     }
 
     #[test]
-    fn summaries_and_notices_escape_hidden_characters() {
+    fn notices_escape_hidden_characters() {
         let hold = json!({
             "op": "guardrail.request", "session": "agent\u{200B}one",
             "details": {"kind": "command", "value": "git push \u{2066}--force\u{2069}"},
         });
-        let (title, summary) = hold_summary(&hold);
-        assert_eq!(title, "agent<U+200B>one asks for an exception");
-        assert_eq!(summary, "run git push <U+2066>--force<U+2069>");
         let notice = approved_notice(&as_request(&hold), "once");
         assert_eq!(notice, "Approved: agent<U+200B>one may run “git push <U+2066>--force<U+2069>” once. The agent has been told to retry.");
     }

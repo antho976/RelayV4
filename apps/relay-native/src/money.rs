@@ -421,9 +421,7 @@ pub fn greeting() -> String {
         18..=22 => "Good evening",
         _ => "Good night",
     };
-    let real = glib::real_name().to_string_lossy().trim().to_string();
-    let first = real.split_whitespace().next().filter(|w| !w.eq_ignore_ascii_case("unknown")).map(str::to_string);
-    let name = first.unwrap_or_else(|| glib::user_name().to_string_lossy().to_string());
+    let name = crate::app::first_name();
     if name.is_empty() {
         part.to_string()
     } else {

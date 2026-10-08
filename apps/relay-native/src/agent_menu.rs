@@ -144,12 +144,11 @@ impl Ui {
         }
         self.render_projects();
         self.reconcile();
-        // The board shows this project's tasks only; the dashboard shows every project. A state
+        // The board shows this project's tasks only. A state
         // change a card shows (blocked, done) arrives as its own task.changed.
         let here = payload["project_id"].as_i64() == Some(self.project.get());
         let page = self.page.borrow().clone();
         match page.as_str() {
-            "dashboard" => self.refresh_page(),
             "board" if here && relinked => self.refresh_page(),
             _ => {}
         }

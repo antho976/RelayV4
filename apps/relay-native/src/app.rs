@@ -52,6 +52,13 @@ pub fn icon_button(icon: &str, caption: &str) -> gtk::Button {
     b.update_property(&[gtk::accessible::Property::Label(caption)]);
     b
 }
+/// The person's first name, from their account's real name, else their user name.
+pub fn first_name() -> String {
+    let real = glib::real_name().to_string_lossy().trim().to_string();
+    let first = real.split_whitespace().next().filter(|w| !w.eq_ignore_ascii_case("unknown")).map(str::to_string);
+    first.unwrap_or_else(|| glib::user_name().to_string_lossy().to_string())
+}
+
 pub fn nav_button(caption: &str, icon: &str) -> gtk::Button {
     let b = button("", "nav");
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 9);
@@ -431,11 +438,16 @@ fn top_bar(window: &gtk::ApplicationWindow) -> TopBar {
     top_left.set_size_request(194, -1);
     sidebar_key.set_child(Some(&crate::icons::image("sidebar", 14)));
     top_left.append(&sidebar_key);
-    let mark = label("R", "brand-mark");
+    // The brand's ring mark, settled, beside the Sora wordmark.
+    let mark = gtk::DrawingArea::new();
+    mark.add_css_class("brand-mark");
+    mark.set_content_width(22);
+    mark.set_content_height(22);
     mark.set_valign(gtk::Align::Center);
-    mark.set_xalign(0.5);
+    mark.set_draw_func(|_, cr, w, h| crate::start::draw_mark(cr, f64::from(w.min(h)), 1.0));
     top_left.append(&mark);
-    let brand = label("RELAY", "brand");
+    let brand = label("relay", "brand");
+    brand.set_margin_end(6);
     top_left.append(&brand);
     top_left.append(&crate::money::switcher());
     top.append(&top_left);
@@ -445,8 +457,19 @@ fn top_bar(window: &gtk::ApplicationWindow) -> TopBar {
     let top_actions = gtk::Box::new(gtk::Orientation::Horizontal, 2);
     top_actions.add_css_class("topbar-actions");
     top.append(&top_actions);
-    let palette_key = icon_button("system-search-symbolic", "Command palette · Ctrl K");
+    // The palette's key reads as a search field: what it does, and its chord as a keycap.
+    let palette_key = button("", "command-search");
+    palette_key.set_tooltip_text(Some("Command palette · Ctrl K"));
     palette_key.set_widget_name("command-palette");
+    let palette_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    palette_row.append(&crate::icons::image("search", 14));
+    let palette_text = label("Search or run a command", "command-search-text");
+    palette_text.set_hexpand(true);
+    palette_text.set_xalign(0.0);
+    palette_row.append(&palette_text);
+    palette_row.append(&label("Ctrl K", "keycap"));
+    palette_key.set_child(Some(&palette_row));
+    palette_key.set_valign(gtk::Align::Center);
     let layouts_key = icon_button("view-grid-symbolic", "Window presets");
     layouts_key.set_widget_name("window-presets");
     let skills_key = icon_button("skills", "Skills for this project");
@@ -474,11 +497,11 @@ fn top_bar(window: &gtk::ApplicationWindow) -> TopBar {
     let reconnect = icon_button("view-refresh-symbolic", "Reconnect to engine");
     top_actions.append(&reconnect);
     reconnect.set_visible(false);
-    let launch_key = button("New session", "primary");
+    let launch_key = button("New agent", "primary");
     launch_key.set_widget_name("new-session");
     let launch_label = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     launch_label.append(&crate::icons::image_with_stroke("plus", 14, 2.0));
-    let launch_caption = label("New session", "");
+    let launch_caption = label("New agent", "");
     launch_label.append(&launch_caption);
     launch_key.set_child(Some(&launch_label));
     launch_key.set_valign(gtk::Align::Center);
@@ -588,7 +611,7 @@ struct Sidebar {
 
 fn sidebar() -> Sidebar {
     let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    sidebar.set_size_request(200, -1);
+    sidebar.set_size_request(248, -1);
     sidebar.set_hexpand(false);
     sidebar.add_css_class("sidebar");
     let nav = gtk::Box::new(gtk::Orientation::Vertical, 1);
@@ -598,7 +621,7 @@ fn sidebar() -> Sidebar {
     sidebar.append(&money_nav);
     let section = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     section.add_css_class("workspace-heading");
-    let heading = label("WORKSPACES", "section-label");
+    let heading = label("Workspaces", "section-label");
     heading.set_hexpand(true);
     section.append(&heading);
     let add_project = icon_button("plus", "Open repository");
@@ -608,8 +631,22 @@ fn sidebar() -> Sidebar {
     let project_scroll = scrolled(&projects_box);
     project_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
     sidebar.append(&project_scroll);
-    let settings_key = nav_button("Settings", "settings");
+    // You, at the foot: your initial and first name, and the gear that opens Settings.
+    let settings_key = button("", "nav");
     settings_key.add_css_class("settings-key");
+    settings_key.set_tooltip_text(Some("Settings"));
+    let who = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    let name = crate::app::first_name();
+    let initial = label(&name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default(), "you-avatar");
+    initial.set_xalign(0.5);
+    initial.set_valign(gtk::Align::Center);
+    who.append(&initial);
+    let shown = label(&name, "nav-label");
+    shown.set_hexpand(true);
+    shown.set_xalign(0.0);
+    who.append(&shown);
+    who.append(&crate::icons::image("settings", 16));
+    settings_key.set_child(Some(&who));
     let sidebar_footer = gtk::Box::new(gtk::Orientation::Vertical, 0);
     sidebar_footer.add_css_class("sidebar-footer");
     sidebar_footer.append(&settings_key);
@@ -708,7 +745,6 @@ fn pages(content: &gtk::Stack) -> BTreeMap<String, gtk::Box> {
         "mailbox",
         "guardrails",
         "notes",
-        "dashboard",
         "settings",
         "skills",
         "plugins",
@@ -1016,10 +1052,9 @@ impl Ui {
         let ui = self;
         let nav = &side.nav;
         for (name, caption, icon) in [
-            ("dashboard", "Dashboard", "view-app-grid-symbolic"),
+            ("board", "Board", "view-list-symbolic"),
             ("skills", "Skills", "applications-science-symbolic"),
             ("plugins", "Plugins", "application-x-addon-symbolic"),
-            ("board", "Board", "view-list-symbolic"),
             ("notes", "Notes", "accessories-text-editor-symbolic"),
         ] {
             let b = nav_button(caption, icon);
@@ -1084,7 +1119,7 @@ impl Ui {
             } else if !settings && mut_previous.borrow().as_str() == "settings" {
                 ui.sidebar.set_visible(ui.settings_sidebar.get());
             }
-            brand.set_text(if settings { "SETTINGS" } else { "RELAY" });
+            brand.set_text(if settings { "Settings" } else { "relay" });
             back_key.set_child(Some(&crate::icons::image(
                 if settings { "chevron-left" } else { "sidebar" },
                 14,
@@ -1477,7 +1512,6 @@ impl Ui {
                                 if e.project_id.is_some_and(|id| id != ui.project.get())
                                     && !e.ev.starts_with("project.")
                                     && !e.ev.starts_with("session.")
-                                    && *ui.page.borrow() != "dashboard"
                                 {
                                     continue;
                                 }
@@ -1622,7 +1656,6 @@ impl Ui {
                     | "code"
                     | "board"
                     | "modules"
-                    | "dashboard"
                     | "skills"
                     | "plugins"
                     | "settings"
@@ -1754,7 +1787,7 @@ impl Ui {
                 }
                 ui.restore_layout(layout_project, layout_revision).await;
                 crate::pages::refresh_notes(&ui);
-                if matches!(ui.page.borrow().as_str(), "board" | "dashboard") {
+                if ui.page.borrow().as_str() == "board" {
                     ui.refresh_page();
                 }
             }
@@ -1766,11 +1799,7 @@ impl Ui {
         self.sessions.borrow_mut().retain(|s| !shell::is_closing(text(s, "name")));
         self.render_status_counts();
         let sessions = self.sessions.borrow().clone();
-        self.launch_caption.set_text(if sessions.is_empty() {
-            "New session"
-        } else {
-            "Add agents"
-        });
+        self.launch_caption.set_text("New agent");
         let available: Vec<String> = sessions.iter().map(|s| text(s, "name").into()).collect();
         let mut names = self.ordered.borrow().clone();
         names.retain(|n| available.contains(n));
@@ -2008,7 +2037,7 @@ impl Ui {
                 }
                 if matches!(
                     page.as_str(),
-                    "dashboard" | "settings" | "skills" | "plugins" | "devices"
+                    "settings" | "skills" | "plugins" | "devices"
                 ) {
                     crate::tools::refresh(&ui, &page, project).await;
                 } else if project != 0 {
