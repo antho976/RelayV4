@@ -4,7 +4,7 @@
   "title": "RELAY v4 command bus",
   "description": "Generated from crates/relay-bus by `relay schema`. Do not edit; see docs/engine/BUS.md.",
   "version": 1,
-  "op_count": 255,
+  "op_count": 256,
   "envelope": {
     "request": {
       "$ref": "#/$defs/Request"
@@ -4576,6 +4576,24 @@
       },
       "result": {
         "$ref": "#/$defs/MoneyTxPage"
+      }
+    },
+    "money.series": {
+      "summary": "A chart's numbers: spending, income or net by category, week, day or budget period, over one or more periods",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/MoneySeriesIn"
+      },
+      "result": {
+        "$ref": "#/$defs/MoneySeries"
       }
     },
     "money.tx.add": {
@@ -16453,6 +16471,193 @@
         "transactions",
         "income",
         "spent"
+      ]
+    },
+    "MoneySeriesIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "measure": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MoneySeriesMeasure"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "by": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MoneySeriesBy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "periods": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "How many budget periods, ending with `period_offset`'s: 1 to 6 (24 by period). Default 1."
+        },
+        "period_offset": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "The last period: 0 is the current one, -1 the one before."
+        },
+        "category": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Only this category, by name (any case)."
+        },
+        "cumulative": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Running totals across weeks or days, for pace."
+        },
+        "today": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The day to read the current period from; today in the engine's time zone when absent."
+        }
+      },
+      "description": "The question a chart asks. A chart keeps this, not its numbers, so it redraws when the ledger\nmoves."
+    },
+    "MoneySeriesMeasure": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "spending",
+            "income"
+          ]
+        },
+        {
+          "type": "string",
+          "const": "net",
+          "description": "Income less spending."
+        }
+      ],
+      "description": "What a chart counts."
+    },
+    "MoneySeriesBy": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "category",
+          "description": "One label per category, the largest first; each period is a series."
+        },
+        {
+          "type": "string",
+          "const": "week",
+          "description": "Week 1 is the period's first seven days; each period is a series."
+        },
+        {
+          "type": "string",
+          "const": "day",
+          "description": "Day 1 is the period's first day; each period is a series."
+        },
+        {
+          "type": "string",
+          "const": "period",
+          "description": "One label per budget period, oldest first; one series."
+        }
+      ],
+      "description": "What a chart's labels are."
+    },
+    "MoneySeries": {
+      "type": "object",
+      "properties": {
+        "currency": {
+          "type": "string"
+        },
+        "fraction_digits": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "measure": {
+          "$ref": "#/$defs/MoneySeriesMeasure"
+        },
+        "by": {
+          "$ref": "#/$defs/MoneySeriesBy"
+        },
+        "labels": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "label_colors": {
+          "type": "array",
+          "items": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "description": "Each label's category colour (Tally's palette index), when the labels are categories."
+        },
+        "series": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MoneySeriesLine"
+          }
+        }
+      },
+      "required": [
+        "currency",
+        "fraction_digits",
+        "measure",
+        "by",
+        "labels",
+        "label_colors",
+        "series"
+      ]
+    },
+    "MoneySeriesLine": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "values": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "description": "One value per label, minor units."
+        },
+        "known": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "By week or day, in the period still running: how many labels it has reached. Later ones\nhave not happened yet, so a running total stops here instead of going flat."
+        }
+      },
+      "required": [
+        "name",
+        "values"
       ]
     },
     "MoneyTxAddIn": {

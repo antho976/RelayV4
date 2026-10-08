@@ -21,6 +21,8 @@ mod entry;
 mod pages;
 #[path = "threads_view.rs"]
 pub(crate) mod threads;
+#[path = "threads_chart.rs"]
+mod chart;
 
 /// Tally's pages, in tab order: (stack name, caption, glyph).
 pub const PAGES: [(&str, &str, &str); 4] = [
@@ -420,6 +422,7 @@ pub fn changed(ui: &Rc<Ui>) {
     let page = ui.page.borrow().clone();
     if page == threads::PAGE {
         threads::refresh_panel(ui);
+        chart::refresh_all();
     } else if is_page(&page) {
         ui.refresh_page();
     }

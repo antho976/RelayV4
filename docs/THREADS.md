@@ -27,7 +27,9 @@ The mockup: https://claude.ai/artifact/GPtaPk6YYLiFCHGpeNPMk4
 1. **The thread engine** (built): `threads.db`, the `thread.*` ops, the background agent.
 2. **The Threads space** in `relay-native` (built): thread list in the sidebar, the conversation,
    the message box, the Tally panel beside it, and Tally's pages restyled in Dev's tokens.
-3. **Cards:** charts, budget meters and the Undo card, live from the ledger.
+3. **Charts** (built): the agent writes a `chart` block, Relay draws it from the ledger and redraws
+   it when the ledger moves. (The Undo card came with phase 2; pinning a chart to the panel is
+   still to do.)
 4. **Asking first:** a confirm card for what the agent may not do alone (delete, budgets,
    accounts), run as the person when they approve.
 5. **Investments in Tally:** holdings and their value tracked in the ledger, on the phone and the
@@ -60,8 +62,8 @@ claude -p --input-format stream-json --output-format stream-json --verbose
 - The MCP server is `relay --actor user mcp` with `RELAY_MCP_OPS` set to `threads::AGENT_OPS`. A
   thread has no session of its own, so the agent acts as the person; what it may do is exactly that
   list, which `relay mcp` now enforces on calls as well as on the listing. Today: `bus.schema`,
-  `money.summary`, `money.lists`, `money.tx.list`, `money.tx.add`, `money.tx.update`,
-  `money.tx.restore`.
+  `money.summary`, `money.lists`, `money.tx.list`, `money.series`, `money.tx.add`,
+  `money.tx.update`, `money.tx.restore`.
 - Each message is one stream-json line on the agent's stdin. Its stdout is read on a thread of its
   own: `thread.delta` events carry the reply as it is written, and each finished assistant message
   and tool answer is stored and announced with `thread.message`. Claude's `result` ends the turn.
@@ -101,3 +103,24 @@ that speaks the same stream-json.
   tabs, in Dev's tokens (`css/money.css`); the Money space's warm palette is gone.
 
 A display smoke run opens a thread with `RELAY_NATIVE_THREAD=<id>` beside `RELAY_NATIVE_PAGE=threads`.
+
+## Charts (phase 3)
+
+An agent asks for a chart by writing a fenced block with the language `chart` and one JSON object:
+
+```chart
+{"type": "bar", "title": "Groceries by week", "query": {"by": "week", "periods": 2, "category": "Groceries"}}
+```
+
+- `type` is `bar` (periods side by side), `line` (with `"cumulative": true` for pace) or `donut`
+  (where the money went). `query` is a `money.series` payload; `data`
+  (`{"labels", "series": [{"name", "values"}]}`, minor units) is accepted instead, for numbers that
+  are not the ledger's, and is drawn as written.
+- `money.series` (`crates/relay-money/src/series.rs`): `measure` spending, income or net; `by`
+  category (the largest seven and Other, in their category colours), week, day or period; `periods`
+  how many budget periods end at `period_offset`; `category` by name. A period still running says
+  how far it has got (`known`), so a running total stops at today. It is a reading for the PC, not a
+  money rule, so it has no Kotlin twin.
+- The card (`apps/relay-native/src/threads_chart.rs`) reads its numbers when drawn and again on every
+  `money.changed`. Colour is the data's: the newest period in Relay's lime, earlier ones in blue,
+  orange and on; hovering a group gives its values. Labels and axis are Dev's type.

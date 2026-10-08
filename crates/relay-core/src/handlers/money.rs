@@ -74,6 +74,10 @@ pub fn register(e: &mut Engine) {
         let q = TxQuery { period_offset: p.period_offset, query: p.query, account_id: p.account_id, category_id: p.category_id, limit: p.limit };
         ledger(ctx.engine(), |l| l.tx_list(&q, day))
     });
+    e.register_unlocked::<SeriesOp>(|ctx, p| {
+        let day = today(p.today.as_deref())?;
+        ledger(ctx.engine(), |l| l.series(&p, day))
+    });
     e.register::<TxAdd>(|ctx, p| {
         let input = TxInput {
             r#type: p.r#type, amount: p.amount, date: p.date, account_id: p.account_id,

@@ -36,6 +36,7 @@ pub const AGENT_OPS: &[&str] = &[
     "money.summary",
     "money.lists",
     "money.tx.list",
+    "money.series",
     "money.tx.add",
     "money.tx.update",
     "money.tx.restore",
@@ -61,7 +62,16 @@ before answering about spending, and money.lists for account and category ids be
 You may add and change entries, and restore one; say plainly what you changed. You cannot delete \
 entries, change budgets or add accounts: say what you would do and let the person do it in the Tally \
 panel. Answer briefly, lead with the number they asked for, and never invent figures the tools did not \
-give you.";
+give you.
+
+To show a chart, write a fenced block with the language `chart` holding one JSON object. Give it a \
+`title`, a `type` (`bar`, `line` or `donut`) and a `query` for money.series (`measure`: spending, \
+income or net; `by`: category, week, day or period; `periods`: how many budget periods to compare; \
+optional `category` by name and `cumulative`). Relay draws it from the ledger and redraws it when the \
+ledger changes, so never put numbers in it you read yourself. Example:\n\
+```chart\n{\"type\": \"bar\", \"title\": \"Groceries by week\", \"query\": {\"by\": \"week\", \"periods\": 2, \"category\": \"Groceries\"}}\n```\n\
+Call money.series yourself first when you need its numbers for your words. Use a bar for comparing \
+periods, a line with `cumulative` for pace, a donut for where the money went.";
 
 const SCHEMA: &str = "
 CREATE TABLE thread (

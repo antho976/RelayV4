@@ -108,3 +108,24 @@ fn a_phone_syncs_its_ledger_across_the_bus() {
     let agent = call_as(&engine, Actor::agent("brisk-otter"), "money.sync", json!({"device": "x", "since": 0, "changes": []}));
     assert!(agent.error.is_some());
 }
+
+#[test]
+fn a_chart_asks_its_question_and_reads_the_ledger_now() {
+    let engine = engine();
+    let account = ok(&engine, "money.account.add", json!({"name": "Chequing", "type": "CHEQUING"}));
+    let lists = ok(&engine, "money.lists", json!({}));
+    let groceries = lists["categories"].as_array().unwrap().iter().find(|c| c["name"] == "Groceries").unwrap()["id"].clone();
+    for (amount, date) in [(8_800, "2026-09-03"), (14_100, "2026-09-16"), (4_218, "2026-10-06")] {
+        ok(&engine, "money.tx.add", json!({"type": "EXPENSE", "amount": amount, "date": date, "account_id": account["id"], "category_id": groceries}));
+    }
+    let weeks = ok(&engine, "money.series", json!({"by": "week", "periods": 2, "category": "groceries", "today": "2026-10-07"}));
+    assert_eq!(weeks["labels"][0], "W1");
+    assert_eq!(weeks["series"][0]["name"], "September");
+    assert_eq!(weeks["series"][0]["values"], json!([8_800, 0, 14_100, 0, 0]));
+    assert_eq!(weeks["series"][1]["values"][0], 4_218);
+    let where_it_went = ok(&engine, "money.series", json!({"today": "2026-10-07"}));
+    assert_eq!(where_it_went["labels"], json!(["Groceries"]));
+    assert!(where_it_went["label_colors"][0].is_i64());
+    assert_eq!(code(call_as(&engine, Actor::User, "money.series", json!({"category": "Yachts"}))), "money.invalid");
+    assert_eq!(code(call_as(&engine, Actor::User, "money.series", json!({"by": "fortnight"}))), "bus.schema");
+}

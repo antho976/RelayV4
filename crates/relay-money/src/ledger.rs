@@ -405,6 +405,46 @@ impl Ledger {
         Ok(TxPage { period: PeriodView::of(&period, today), transactions, income, spent })
     }
 
+    /// A chart's series (`crate::series`): spending, income or net over `q`'s budget periods.
+    pub fn series(&self, q: &crate::series::SeriesQuery, today: Date) -> Result<crate::series::Series> {
+        use crate::series::{bucket, period_count, Named, Row, Series};
+        let last = self.period(today)?.shift(q.period_offset.unwrap_or(0).min(0));
+        let count = period_count(q) as i64;
+        let periods: Vec<BudgetPeriod> = (0..count).map(|i| last.shift(i - (count - 1))).collect();
+        let categories: Vec<Named> = self.categories()?.into_iter().map(|c| Named { id: c.id, name: c.name, color: c.color }).collect();
+        let category = match q.category.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+            None => None,
+            Some(name) => {
+                let wanted = name.to_lowercase();
+                let found = categories.iter().find(|c| c.name.to_lowercase() == wanted)
+                    .or_else(|| categories.iter().find(|c| c.name.to_lowercase().contains(&wanted)));
+                match found {
+                    Some(c) => Some(c.id),
+                    None => return invalid(format!("No category named {name}")),
+                }
+            }
+        };
+        let mut st = self.conn.prepare_cached(
+            "SELECT type, amount, date, category_id FROM transactions
+             WHERE deleted = 0 AND type IN ('INCOME', 'EXPENSE') AND date >= ?1 AND date < ?2
+               AND (?3 IS NULL OR category_id = ?3)",
+        )?;
+        let start = periods.first().expect("at least one period").start;
+        let rows = st.query_map(params![start.to_string(), last.end_exclusive.to_string(), category], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<i64>>(3)?))
+        })?;
+        let mut read = Vec::new();
+        for row in rows {
+            let (ty, amount, date, category_id) = row?;
+            let (Some(r#type), Some(date)) = (parse_name::<TxType>(&ty), parse_date(&date)) else { continue };
+            read.push(Row { r#type, amount, date, category_id });
+        }
+        let (measure, by) = (q.measure.unwrap_or_default(), q.by.unwrap_or_default());
+        let (labels, label_colors, series) = bucket(&read, &periods, by, measure, q.cumulative.unwrap_or(false), &categories, today);
+        let currency = self.settings()?.currency;
+        Ok(Series { fraction_digits: fraction_digits(&currency).unwrap_or(2), currency, measure, by, labels, label_colors, series })
+    }
+
     fn check_entry(&self, ty: TxType, amount: i64, date: &str, account: i64, to: Option<i64>, category: Option<i64>) -> Result<()> {
         if amount <= 0 {
             return invalid("An entry needs an amount above zero");

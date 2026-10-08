@@ -76,3 +76,15 @@ button.threads-row { min-height: 34px; }
 .threads-panel-figures.money-over { color: #f0786f; }
 .threads-panel-figures.money-ahead { color: @waiting; }
 .threads-panel-figures.money-in { color: @live; }
+
+/* Charts the agent asks for: a card, the data in colour. */
+.threads-chart { padding: 14px 16px 12px; border: 1px solid @edge; border-radius: 14px; background: @slab; }
+.threads-chart-title { font-size: 13px; font-weight: 600; color: @ink; }
+.threads-chart-legend { font-size: 12px; color: @secondary; }
+.threads-chart-axis { font-family: "Geist Mono", monospace; font-size: 10.5px; color: @faint; }
+.threads-chart-x { font-family: "Geist Mono", monospace; font-size: 11px; color: @secondary; }
+.threads-chart-note { font-size: 12px; color: @faint; }
+.threads-chart-foot { padding-top: 8px; border-top: 1px solid @line_subtle; }
+.threads-chart-total { font-size: 18px; font-weight: 600; color: @ink; font-feature-settings: "tnum"; }
+.threads-chart-value { font-family: "Geist Mono", monospace; font-size: 12px; color: @ink; }
+.threads-chart-share { font-family: "Geist Mono", monospace; font-size: 11.5px; color: @faint; }

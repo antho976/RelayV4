@@ -238,6 +238,58 @@ pub fn tool_writes(name: &str) -> bool {
     matches!(tool_op(name).as_deref(), Some("money.tx.add" | "money.tx.update" | "money.tx.restore"))
 }
 
+/// How a chart is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChartKind {
+    Bar,
+    Line,
+    Donut,
+}
+
+/// A ```` ```chart ```` block: what to draw and the question its numbers come from (`money.series`),
+/// or, failing a question, numbers written in it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChartSpec {
+    pub kind: ChartKind,
+    pub title: String,
+    /// A `money.series` payload.
+    pub query: Option<serde_json::Value>,
+    /// `{"labels", "series": [{"name", "values"}]}`, minor units, when there is no query.
+    pub data: Option<serde_json::Value>,
+}
+
+/// Read a chart block. `None` when it is not one Relay can draw, so it shows as code instead.
+pub fn chart_spec(text: &str) -> Option<ChartSpec> {
+    let v: serde_json::Value = serde_json::from_str(text.trim()).ok()?;
+    let kind = match v["type"].as_str().unwrap_or("bar") {
+        "bar" | "column" => ChartKind::Bar,
+        "line" | "area" => ChartKind::Line,
+        "donut" | "pie" => ChartKind::Donut,
+        _ => return None,
+    };
+    let query = v.get("query").filter(|q| q.is_object()).cloned();
+    let data = v.get("data").filter(|d| d["labels"].is_array() && d["series"].is_array()).cloned();
+    if query.is_none() && data.is_none() {
+        return None;
+    }
+    Some(ChartSpec { kind, title: v["title"].as_str().unwrap_or("").to_string(), query, data })
+}
+
+/// Round axis steps for values up to `max` (minor units, `digits` fraction digits): the step, and
+/// how many steps reach `max`. Steps are 1, 2, 2.5 or 5 times a power of ten in major units.
+pub fn ticks(max: i64, digits: u32) -> (i64, u32) {
+    let unit = 10_i64.pow(digits);
+    let max = max.max(1);
+    let rough = max as f64 / 3.0 / unit as f64;
+    let power = 10_f64.powf(rough.max(1e-9).log10().floor());
+    // A step must be a whole number of minor units: 2.5 yen is not one.
+    let whole = |s: &f64| ((s * unit as f64) - (s * unit as f64).round()).abs() < 1e-6;
+    let step = [1.0, 2.0, 2.5, 5.0, 10.0].iter().map(|m| m * power).find(|s| *s >= rough && whole(s)).unwrap_or(10.0 * power);
+    let step = ((step * unit as f64).round() as i64).max(1);
+    let count = ((max + step - 1) / step).max(1) as u32;
+    (step, count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,6 +317,28 @@ mod tests {
         assert_eq!(blocks[5], Block::Code { lang: "json".into(), text: "{\"a\": 1}".into() });
         assert_eq!(blocks[6], Block::Rule);
         assert_eq!(blocks.len(), 7);
+    }
+
+    #[test]
+    fn chart_blocks_carry_their_question() {
+        let spec = chart_spec(r#"{"type":"line","title":"Pace","query":{"by":"day","cumulative":true}}"#).unwrap();
+        assert_eq!(spec.kind, ChartKind::Line);
+        assert_eq!(spec.query.unwrap()["by"], "day");
+        let fixed = chart_spec(r#"{"type":"pie","data":{"labels":["A"],"series":[{"name":"x","values":[5]}]}}"#).unwrap();
+        assert_eq!(fixed.kind, ChartKind::Donut);
+        assert!(chart_spec(r#"{"type":"radar","query":{}}"#).is_none());
+        assert!(chart_spec(r#"{"type":"bar"}"#).is_none(), "no question and no numbers");
+        assert!(chart_spec("not json").is_none());
+    }
+
+    #[test]
+    fn axis_steps_are_round_and_reach_the_top() {
+        assert_eq!(ticks(14_100, 2), (5_000, 3));
+        assert_eq!(ticks(52_000, 2), (20_000, 3));
+        assert_eq!(ticks(250_000, 2), (100_000, 3));
+        assert_eq!(ticks(7, 0), (5, 2));
+        let (step, count) = ticks(0, 2);
+        assert!(step > 0 && count >= 1);
     }
 
     #[test]

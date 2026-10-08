@@ -8,7 +8,7 @@ use super::pages::{badge, human_date, meter_in, tone, tone_class};
 use crate::app::{button, clear, label, Ui};
 use gtk::prelude::*;
 use gtk4 as gtk;
-use relay_client::thread_view::{markdown, tool_caption, tool_op, tool_writes, Block};
+use relay_client::thread_view::{chart_spec, markdown, tool_caption, tool_op, tool_writes, Block};
 use serde_json::{json, Value};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -606,6 +606,9 @@ fn draw_reply(parent: &gtk::Box, text: &str) {
                     list.append(&row);
                 }
                 list.upcast()
+            }
+            Block::Code { lang, text } if lang == "chart" && chart_spec(&text).is_some() => {
+                super::chart::card(chart_spec(&text).expect("checked")).upcast()
             }
             Block::Code { text, .. } => {
                 let code = label(&text, "threads-code");

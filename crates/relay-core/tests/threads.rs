@@ -15,7 +15,7 @@ fn fake_claude(dir: &Path) -> (PathBuf, PathBuf) {
     let log = dir.join("args.log");
     let script = dir.join("claude");
     let body = r#"#!/bin/sh
-printf '%s\n' "$*" >> "LOG"
+printf '%s\n' "$*" | tr '\n' ' ' >> "LOG"; echo >> "LOG"
 while IFS= read -r line; do
   case "$line" in *die*) exit 3;; esac
   case "$line" in *slow*) sleep 1;; esac
