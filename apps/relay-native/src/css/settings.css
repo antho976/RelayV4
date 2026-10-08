@@ -1,0 +1,154 @@
+/* Settings (tools_settings.rs): a category list beside one column per category. Sections are
+   a quiet heading over a rounded card of rows: title over hint on the left, control on the
+   right, hairlines between. The guardrail editor (guardrail_settings.rs) uses the same rows,
+   in Settings and in its panel, so nothing here is scoped to the page. */
+
+/* Title bar on Settings: the crumb after the wordmark, and the search field. */
+.brand-crumb { margin-left: 2px; }
+.brand-slash { color: @ink_dim; font-size: 16px; font-weight: 400; }
+.brand-page { color: @ink; font-size: 15px; font-weight: 500; letter-spacing: -0.005em; }
+.settings-tools { margin-right: 10px; }
+.settings-tools entry.search { min-height: 34px; }
+
+.page.settings-page { padding: 0; }
+.settings-body { background: @wall; }
+
+/* Category list */
+.settings-nav { padding: 24px 12px; background: @console; border-right: 1px solid @edge; }
+button.settings-category { min-height: 52px; padding: 8px 12px; border: 0; border-radius: 10px; background: transparent; box-shadow: none; }
+button.settings-category:hover { background: alpha(@ink, 0.035); }
+button.settings-category:checked { background: @wash; }
+.settings-category-icon { color: @secondary; }
+button.settings-category:checked .settings-category-icon { color: @ink; }
+.settings-nav-title { color: @ink; font-size: 14px; font-weight: 500; line-height: 1.1; }
+.settings-nav-hint { color: mix(@faint, @secondary, 0.3); font-size: 12px; font-weight: 400; line-height: 1.1; }
+
+/* One category's column */
+.settings-column { padding: 44px 48px 64px; }
+.settings-head { margin-bottom: 4px; }
+.settings-title { color: @ink; font-size: 25px; font-weight: 600; letter-spacing: -0.02em; line-height: 1.1; }
+.settings-lede { color: @secondary; font-size: 14px; line-height: 1.35; }
+.settings-caption { color: @faint; font-size: 12.5px; }
+.settings-empty { padding: 72px 48px; }
+
+/* Sections and cards */
+.settings-section { margin-top: 34px; }
+.settings-section-head { min-height: 24px; padding: 0 2px; }
+.settings-section-title { color: @secondary; font-size: 13px; font-weight: 600; }
+.settings-aside { color: @faint; font-size: 12.5px; }
+.settings-card { background: @slab; border: 1px solid @edge; border-radius: 14px; }
+.settings-row { min-height: 40px; padding: 16px 20px; }
+.settings-row + .settings-row { border-top: 1px solid @edge; }
+.settings-row-title { color: @ink; font-size: 14px; font-weight: 500; line-height: 1.15; }
+.settings-row-hint { color: mix(@faint, @secondary, 0.3); font-size: 12.5px; line-height: 1.3; }
+.settings-unit { color: @faint; font-size: 13px; }
+.settings-value { color: @ink; font-size: 13px; font-feature-settings: "tnum"; }
+.settings-path-text { color: @faint; font-family: 'Geist Mono', monospace; font-size: 11.5px; }
+
+/* Keys that sit on a heading or in a row */
+button.settings-link { min-height: 26px; padding: 0 8px; border: 0; border-radius: 7px; background: transparent; color: @secondary; font-size: 13px; font-weight: 500; }
+button.settings-link label { color: @secondary; }
+button.settings-link:hover { background: alpha(@ink, 0.06); }
+button.settings-link:hover label { color: @ink; }
+button.settings-button { min-height: 32px; padding: 0 14px; border: 1px solid @strong; border-radius: 9px; background: @raised; font-size: 13px; }
+button.settings-button:hover { background: @wash; border-color: @line_emphasis; }
+button.settings-primary { min-height: 32px; padding: 0 16px; border-radius: 9px; }
+button.settings-square { min-width: 34px; min-height: 34px; padding: 0; border: 1px solid @strong; border-radius: 9px; background: @raised; color: @ink; }
+button.settings-square:hover { background: @wash; border-color: @line_emphasis; }
+
+/* Switches: ink with a dark knob when on, a dark well with a grey knob when off. */
+switch.settings-switch { min-width: 40px; min-height: 24px; border: 0; border-radius: 999px; background: @track; }
+switch.settings-switch:hover { background: @line_focus; }
+switch.settings-switch:checked { background: @ink; }
+switch.settings-switch:checked:hover { background: white; }
+switch.settings-switch > slider { min-width: 18px; min-height: 18px; margin: 3px; background: @faint; box-shadow: none; }
+switch.settings-switch:hover > slider { background: @secondary; }
+switch.settings-switch:checked > slider { background: @wall_solid; }
+
+/* Sliders */
+.settings-slider scale { padding: 8px 0; }
+.settings-slider scale trough { min-height: 4px; border-radius: 999px; background: @track; }
+.settings-slider scale highlight { min-height: 4px; border-radius: 999px; background: alpha(@ink, 0.82); }
+.settings-slider scale slider { min-width: 16px; min-height: 16px; margin: -6px 0; border-radius: 999px; background: @ink; box-shadow: 0 1px 3px alpha(black, 0.45); }
+.settings-slider scale:hover slider { background: white; }
+.settings-slider scale:focus-visible slider { outline: 2px solid alpha(@ink, 0.35); outline-offset: 2px; }
+
+/* Drop-downs */
+dropdown.settings-select > button { min-height: 34px; min-width: 150px; padding: 0 10px 0 12px; border: 1px solid @strong; border-radius: 9px; background: @raised; font-weight: 400; }
+dropdown.settings-select > button:hover { background: @wash; border-color: @line_emphasis; }
+dropdown.settings-select > button box, dropdown.settings-select > button stack, dropdown.settings-select > button row, dropdown.settings-select > button label { background: transparent; box-shadow: none; }
+dropdown.settings-select > button arrow { min-width: 12px; min-height: 12px; -gtk-icon-size: 12px; color: @faint; }
+
+/* Stepper: − value + in one rounded field */
+.settings-stepper { border: 1px solid @strong; border-radius: 9px; background: @raised; }
+.settings-stepper > button { min-width: 30px; min-height: 32px; padding: 0; border: 0; border-radius: 8px; background: transparent; color: @faint; }
+.settings-stepper > button:hover { background: alpha(@ink, 0.06); color: @ink; }
+.settings-stepper > entry { min-height: 32px; padding: 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; font-feature-settings: "tnum"; }
+.settings-stepper > entry:focus-within { box-shadow: none; }
+.settings-stepper:focus-within { border-color: @line_focus; }
+
+/* Typed fields */
+entry.settings-path { min-height: 34px; border-radius: 9px; font-family: 'Geist Mono', monospace; font-size: 12px; }
+entry.settings-path > text > placeholder { font-family: 'Geist', sans-serif; font-size: 13px; color: @faint; }
+entry.settings-shortcut { min-height: 32px; border-radius: 9px; font-family: 'Geist Mono', monospace; font-size: 12px; }
+entry.settings-shortcut.invalid { border-color: alpha(@held, 0.7); }
+.settings-row .keycap { padding: 3px 8px; border-color: @strong; background: @raised; color: @secondary; }
+.settings-card spinbutton { min-height: 32px; border: 1px solid @strong; border-radius: 9px; background: @raised; }
+.settings-card spinbutton:focus-within { border-color: @line_focus; }
+.settings-card spinbutton > text { padding: 0 8px; background: transparent; font-feature-settings: "tnum"; }
+.settings-card spinbutton > button { min-width: 26px; min-height: 30px; padding: 0; border: 0; border-left: 1px solid @strong; border-radius: 0; background: transparent; color: @faint; }
+.settings-card spinbutton > button:last-child { border-radius: 0 8px 8px 0; }
+.settings-card spinbutton > button:hover { background: alpha(@ink, 0.06); color: @ink; }
+.settings-card spinbutton > button.up, .settings-card spinbutton > button.down { color: @faint; -gtk-icon-size: 12px; }
+.settings-card spinbutton > button.up:hover, .settings-card spinbutton > button.down:hover { color: @ink; }
+
+/* Segmented keys (the guardrail editor's level) */
+.settings-segmented { padding: 3px; border: 1px solid @edge; border-radius: 10px; background: @raised; }
+.settings-segmented > button { min-height: 26px; padding: 0 12px; border: 0; border-radius: 7px; background: transparent; color: @faint; font-size: 13px; font-weight: 500; }
+.settings-segmented > button:hover { color: @ink; }
+.settings-segmented > button:checked { background: @track; color: @ink; }
+
+/* Theme cards */
+button.settings-theme { padding: 12px; border: 1px solid @edge; border-radius: 14px; background: @slab; box-shadow: none; }
+button.settings-theme:hover { border-color: @line_emphasis; background: @slab; }
+button.settings-theme:checked { border-color: @ink; box-shadow: 0 0 0 1px @ink; }
+.settings-theme-words { padding: 14px 6px 4px 4px; }
+.settings-theme-title { color: @ink; font-size: 14px; font-weight: 500; }
+.settings-theme-hint { color: mix(@faint, @secondary, 0.3); font-size: 12.5px; font-weight: 400; }
+.settings-check { min-width: 20px; min-height: 20px; border-radius: 999px; background: @ink; color: @wall_solid; opacity: 0; }
+button.settings-theme:checked .settings-check { opacity: 1; }
+
+/* Wallpaper: the stage, then the library */
+.settings-stage { border: 1px solid @edge; border-radius: 14px; }
+.settings-stage-ground { background: @wall_solid; }
+.settings-chip { margin: 14px; padding: 6px 10px; border-radius: 8px; background: alpha(@wall_solid, 0.72); color: @ink; font-size: 12.5px; }
+button.settings-chip-key { min-height: 30px; margin: 12px; padding: 0 10px; border: 0; border-radius: 8px; background: alpha(@wall_solid, 0.72); color: @ink; font-size: 12.5px; font-weight: 400; }
+button.settings-chip-key:hover { background: alpha(@wall_solid, 0.9); }
+.settings-wallpapers { margin-top: 4px; }
+.settings-wallpapers > flowboxchild { padding: 0; }
+button.settings-thumb { padding: 0; border: 1px solid @edge; border-radius: 11px; background: @slab; }
+button.settings-thumb:hover { border-color: @line_focus; }
+button.settings-thumb.active { border: 2px solid @ink; }
+.settings-thumb-missing { color: @faint; font-size: 12px; }
+button.settings-thumb-remove { min-width: 24px; min-height: 24px; margin: 7px; padding: 0; border: 0; border-radius: 999px; background: alpha(black, 0.6); color: @ink; }
+button.settings-thumb-remove:hover { background: alpha(black, 0.8); }
+.settings-thumb-name { padding: 0 2px; color: @secondary; font-size: 13px; }
+button.settings-thumb-add { padding: 0; border: 1px dashed @line_focus; border-radius: 11px; background: transparent; color: @secondary; font-size: 13px; font-weight: 400; }
+button.settings-thumb-add:hover { border-color: @faint; background: alpha(@ink, 0.03); color: @ink; }
+
+/* Providers */
+.settings-provider-mark { min-width: 36px; min-height: 36px; border: 1px solid @strong; border-radius: 10px; background: @raised; color: @ink; }
+.settings-state { padding: 4px 10px; border: 1px solid @strong; border-radius: 999px; }
+.settings-state-text { color: @secondary; font-size: 12px; }
+.settings-lamp { min-width: 7px; min-height: 7px; border-radius: 999px; background: @faint; font-size: 0; }
+.settings-lamp.on { background: @live; }
+
+/* The guardrail editor */
+.guardrail-editor > .settings-section:first-child { margin-top: 30px; }
+.guardrail-source { font-size: 11.5px; margin-top: 2px; }
+.guardrail-source.inherited { color: @faint; }
+.guardrail-source.here { color: @ink; }
+.guardrail-source.pending { color: @waiting; }
+.guardrail-list { border: 1px solid @strong; border-radius: 9px; background: @raised; }
+.guardrail-list textview, .guardrail-list textview text { background: transparent; font-family: 'Geist Mono', monospace; font-size: 12px; }
+.guardrail-footer { margin-top: 24px; padding: 0 2px; }

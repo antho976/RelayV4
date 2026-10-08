@@ -282,6 +282,8 @@ pub struct Ui {
     status_branch: gtk::Label,
     pub(crate) sidebar: gtk::Box,
     settings_sidebar: Cell<bool>,
+    /// The title bar's slot for the Settings page's search field, shown on Settings only.
+    pub(crate) settings_tools: gtk::Box,
     focus_tabs: gtk::Box,
     mode: RefCell<String>,
     pub overlay: gtk::Overlay,
@@ -391,6 +393,7 @@ pub fn run(rt: Handle) -> glib::ExitCode {
             include_str!("css/tools.css"),
             include_str!("css/money.css"),
             include_str!("css/start.css"),
+            include_str!("css/settings.css"),
         ));
         if let Some(display) = gtk::gdk::Display::default() {
             gtk::style_context_add_provider_for_display(
@@ -414,7 +417,10 @@ struct TopBar {
     handle: gtk::WindowHandle,
     left: gtk::Box,
     sidebar_key: gtk::Button,
-    brand: gtk::Label,
+    /// "/ Settings" after the wordmark, and the Dev/Money switch it stands in for there.
+    crumb: gtk::Box,
+    switcher: gtk::Box,
+    settings_tools: gtk::Box,
     actions: gtk::Box,
     palette_key: gtk::Button,
     layouts_key: gtk::Button,
@@ -449,11 +455,22 @@ fn top_bar(window: &gtk::ApplicationWindow) -> TopBar {
     let brand = label("relay", "brand");
     brand.set_margin_end(6);
     top_left.append(&brand);
-    top_left.append(&crate::money::switcher());
+    let crumb = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    crumb.add_css_class("brand-crumb");
+    crumb.append(&label("/", "brand-slash"));
+    crumb.append(&label("Settings", "brand-page"));
+    crumb.set_visible(false);
+    top_left.append(&crumb);
+    let switcher = crate::money::switcher();
+    top_left.append(&switcher);
     top.append(&top_left);
     let top_space = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     top_space.set_hexpand(true);
     top.append(&top_space);
+    let settings_tools = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    settings_tools.add_css_class("settings-tools");
+    settings_tools.set_visible(false);
+    top.append(&settings_tools);
     let top_actions = gtk::Box::new(gtk::Orientation::Horizontal, 2);
     top_actions.add_css_class("topbar-actions");
     top.append(&top_actions);
@@ -551,7 +568,9 @@ fn top_bar(window: &gtk::ApplicationWindow) -> TopBar {
         handle,
         left: top_left,
         sidebar_key,
-        brand,
+        crumb,
+        switcher,
+        settings_tools,
         actions: top_actions,
         palette_key,
         layouts_key,
@@ -987,6 +1006,7 @@ impl Ui {
             status_branch: bar.status_branch.clone(),
             sidebar: side.root.clone(),
             settings_sidebar: Cell::new(true),
+            settings_tools: top.settings_tools.clone(),
             focus_tabs: wall.focus_tabs,
             mode: RefCell::new("grid".into()),
             overlay: panel_host,
@@ -1102,7 +1122,8 @@ impl Ui {
     /// status bar, and turns the sidebar key into a back key to the page it was opened from.
     fn wire_settings_return(self: &Rc<Self>, top: &TopBar, bottom: &gtk::Box) {
         let ui = self;
-        let (brand, back_key, top_actions) = (top.brand.clone(), top.sidebar_key.clone(), top.actions.clone());
+        let (back_key, top_actions) = (top.sidebar_key.clone(), top.actions.clone());
+        let (crumb, switcher, settings_tools) = (top.crumb.clone(), top.switcher.clone(), top.settings_tools.clone());
         let (skills_key, plugins_key, bottom) = (top.skills_key.clone(), top.plugins_key.clone(), bottom.clone());
         // The page Settings was opened from, which its back key returns to.
         let settings_return = Rc::new(RefCell::new(String::from("agents")));
@@ -1122,7 +1143,9 @@ impl Ui {
             } else if !settings && mut_previous.borrow().as_str() == "settings" {
                 ui.sidebar.set_visible(ui.settings_sidebar.get());
             }
-            brand.set_text(if settings { "Settings" } else { "relay" });
+            crumb.set_visible(settings);
+            switcher.set_visible(!settings);
+            settings_tools.set_visible(settings);
             back_key.set_child(Some(&crate::icons::image(
                 if settings { "chevron-left" } else { "sidebar" },
                 14,

@@ -7,6 +7,21 @@ use serde_json::{json, Value};
 use std::rc::Rc;
 use std::time::Duration;
 
+/// Waits until the engine holds `expected` at settings `path`: Settings saves on its own, a
+/// moment after the control changes.
+async fn persisted(ui: &Rc<Ui>, path: &str, expected: &Value, reason: &str) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if call(ui, "settings.get", json!({"path":path})).await?["value"] == *expected {
+            return Ok(());
+        }
+        if std::time::Instant::now() > deadline {
+            return Err(format!("{reason}: {path} was not saved"));
+        }
+        glib::timeout_future(Duration::from_millis(50)).await;
+    }
+}
+
 async fn call(ui: &Rc<Ui>, op: &str, payload: Value) -> Result<Value, String> {
     ui.call(op, payload).await.map_err(|error| format!("{op}: {error}"))
 }
@@ -385,11 +400,7 @@ pub(crate) async fn run(ui: &Rc<Ui>) -> Result<(), String> {
         0.81,
         "Wallpaper selection preserves another staged field"
     );
-    assert_eq!(
-        call(ui, "settings.get", json!({"path":"appearance.wallpaper"})).await?["value"],
-        Value::Null,
-        "Wallpaper selection is staged until Save"
-    );
+    persisted(ui, "appearance.wallpaper", &second, "Picking a wallpaper saves it").await?;
     assert!(named(&ui.window, "settings-wallpaper-preview").is_some());
     click(&ui.window, "settings-wallpaper-open")?;
     let preview = gtk::Window::list_toplevels()
@@ -407,28 +418,13 @@ pub(crate) async fn run(ui: &Rc<Ui>) -> Result<(), String> {
     preview.close();
     let rotation = named(&ui.window, "setting:appearance.wallpaper_rotation.enabled")
         .unwrap()
-        .downcast::<gtk::CheckButton>()
+        .downcast::<gtk::Switch>()
         .unwrap();
     rotation.set_active(true);
-    click(&ui.window, "settings-save")?;
-    wait_for(
-        || ui.pages["settings"].is_sensitive(),
-        "Settings Save changes",
-    )
-    .await?;
-    assert_eq!(
-        call(ui, "settings.get", json!({"path":"appearance.wallpapers"})).await?["value"],
-        library,
-        "Save persists the offered preset library"
-    );
-    assert_eq!(
-        call(ui, "settings.get", json!({"path":"appearance.wallpaper"})).await?["value"],
-        second
-    );
-    assert_eq!(
-        call(ui, "settings.get", json!({"path":"appearance.panel_alpha"})).await?["value"],
-        0.81
-    );
+    persisted(ui, "appearance.wallpaper_rotation.enabled", &json!(true), "Rotation switch").await?;
+    persisted(ui, "appearance.wallpapers", &library, "Saving persists the offered preset library").await?;
+    persisted(ui, "appearance.wallpaper", &second, "Wallpaper pick").await?;
+    persisted(ui, "appearance.panel_alpha", &json!(0.81), "Panel opacity").await?;
     glib::timeout_future(Duration::from_millis(120)).await;
     assert!(
         crate::wallpaper_rotation::rotate_once(ui).await.unwrap(),
@@ -459,6 +455,6 @@ pub(crate) async fn run(ui: &Rc<Ui>) -> Result<(), String> {
     std::fs::remove_dir_all(root).unwrap();
     ui.page_projects.borrow_mut().remove("settings");
     ui.open_project(project, "agents");
-    println!("ROADMAP_TOOLS_OK: launch scope, all Claude, provider effort, device selector, skills project, settings search, wallpaper staging, presets and rotation");
+    println!("ROADMAP_TOOLS_OK: launch scope, all Claude, provider effort, device selector, skills project, settings search, wallpaper autosave, presets and rotation");
     Ok(())
 }

@@ -39,21 +39,4 @@
 .guardrail-prompt .guardrail-deny entry { border-radius: 6px; }
 button.guardrail-more { margin-top: 8px; background: @console; border: 1px solid @strong; border-radius: 99px; color: @ink; box-shadow: 0 6px 18px alpha(black, .22); }
 
-/* The layered editor. */
-.guardrail-editor { margin-top: 4px; }
-.guardrail-scope button.guardrail-scope-key { min-width: 92px; min-height: 28px; border-radius: 0; }
-.guardrail-scope .linked > button:first-child { border-radius: 2px 0 0 2px; }
-.guardrail-scope .linked > button:last-child { border-radius: 0 2px 2px 0; }
-.guardrail-scope button.guardrail-scope-key:checked { background: @ink; border-color: @ink; color: @wall; font-weight: 600; }
-.guardrail-scope-note { font-size: 12px; color: @secondary; }
-.guardrail-group { border: 1px solid @edge; background: @slab; padding: 12px 14px 4px; }
-.guardrail-group > .section-label { padding: 0 0 6px; }
-.guardrail-field { padding: 10px 0; border-top: 1px solid @edge; }
-.guardrail-group > .section-label + .guardrail-field { border-top: 0; }
-.guardrail-field .body { font-weight: 500; }
-.guardrail-source { font-size: 11px; margin-top: 2px; }
-.guardrail-source.inherited { color: @faint; }
-.guardrail-source.here { color: @ink; }
-.guardrail-source.pending { color: @waiting; }
-.guardrail-list { border: 1px solid @edge; }
-.guardrail-footer { padding-top: 4px; }
+/* The layered editor is styled with the Settings rows: css/settings.css. */
