@@ -278,6 +278,9 @@ pub struct Ui {
     focus_tabs: gtk::Box,
     mode: RefCell<String>,
     pub overlay: gtk::Overlay,
+    /// What the start screen quiets while it shows: the title bar's keys and the status bar's
+    /// contents. The bars themselves stay, wearing the start screen's ground.
+    pub start_chrome: Vec<gtk::Widget>,
     pub page_overlay: gtk::Overlay,
     pub panels: Rc<RefCell<Vec<Rc<crate::panel::Panel>>>>,
     registry_dirty: Cell<bool>,
@@ -380,6 +383,7 @@ pub fn run(rt: Handle) -> glib::ExitCode {
             include_str!("css/usage.css"),
             include_str!("css/tools.css"),
             include_str!("css/money.css"),
+            include_str!("css/start.css"),
         ));
         if let Some(display) = gtk::gdk::Display::default() {
             gtk::style_context_add_provider_for_display(
@@ -401,6 +405,7 @@ pub fn run(rt: Handle) -> glib::ExitCode {
 /// The title bar, and the keys on it that the rest of the window wires up.
 struct TopBar {
     handle: gtk::WindowHandle,
+    left: gtk::Box,
     sidebar_key: gtk::Button,
     brand: gtk::Label,
     actions: gtk::Box,
@@ -521,6 +526,7 @@ fn top_bar(window: &gtk::ApplicationWindow) -> TopBar {
     window.set_titlebar(Some(&titlebar));
     TopBar {
         handle,
+        left: top_left,
         sidebar_key,
         brand,
         actions: top_actions,
@@ -945,6 +951,10 @@ impl Ui {
             focus_tabs: wall.focus_tabs,
             mode: RefCell::new("grid".into()),
             overlay: panel_host,
+            start_chrome: [top.left.clone().upcast(), top.actions.clone().upcast()]
+                .into_iter()
+                .chain(bar.root.observe_children().into_iter().filter_map(|c| c.ok()?.downcast::<gtk::Widget>().ok()))
+                .collect(),
             page_overlay,
             panels: Rc::default(),
             registry_dirty: Cell::new(true),

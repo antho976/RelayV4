@@ -895,9 +895,9 @@ pub fn install(ui: &Rc<Ui>) {
                 return;
             }
             // The start screen and the entry sheet, over Money's Home.
-            if matches!(page.as_str(), "money-start" | "money-entry") {
+            if matches!(page.as_str(), "start" | "money-entry") {
                 navigate.navigate("money-home");
-                if page == "money-start" {
+                if page == "start" {
                     crate::money::show_start(&navigate);
                 } else {
                     crate::money::add_entry(&navigate);
@@ -1069,6 +1069,16 @@ fn capture(ui: Rc<Ui>, path: String, fixture: bool) {
         println!("Screenshot saved: {path}");
         if fixture && std::env::var("RELAY_NATIVE_PAGE").as_deref() == Ok("launch-preview") {
             ui.verify_launch();
+        }
+        if std::env::var("RELAY_NATIVE_PAGE").as_deref() == Ok("start") {
+            // Leaving the start screen gives the bars their keys and readings back.
+            assert!(ui.window.has_css_class("starting"), "The start screen should have quieted the bars");
+            assert!(crate::money::escape_start(&ui), "Escape should close the start screen");
+            assert!(!ui.window.has_css_class("starting"));
+            for part in &ui.start_chrome {
+                assert!(part.opacity() == 1.0 && part.is_sensitive(), "{} still quiet", part.css_name());
+            }
+            println!("Start screen dismiss verified");
         }
         ui.window.close();
         assert!(

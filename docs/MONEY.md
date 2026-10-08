@@ -16,6 +16,14 @@ Decided with Antho on 2026-10-07:
   per space with one live line each (Money: "$412 left · 3 days ahead"; Dev: agents and reviews).
 - **The switcher sits at the top left of the top bar,** where the brand is now: Dev | Money.
 
+## Where this is going (Antho, 2026-10-07)
+
+The Money pages are a first step, not the destination. What Antho wants instead of a Money tab is
+a **threads page**: agent first, data second. A thread is a conversation with an agent that works
+on the data of Antho's own apps, and the data shows beside it to read and edit. The apps to bring
+in: money (Tally's budget), investing, AI-run investing later, and the gym app's data. The ledger,
+its ops and sync here are what such a thread would read and write. Not built yet.
+
 ## Try it
 
 From this branch's checkout, the `test` instance keeps its own store and ledger
