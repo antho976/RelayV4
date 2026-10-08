@@ -75,6 +75,9 @@ pub fn image_with_stroke(name: &str, size: i32, stroke: f64) -> gtk::Image {
         "settings" | "sliders" => {
             r##"<path d="M2 4.5h2M7 4.5h7M2 8h7M12 8h2M2 11.5h3M8 11.5h6" /><circle cx="5.5" cy="4.5" r="1.5" /><circle cx="10.5" cy="8" r="1.5" /><circle cx="6.5" cy="11.5" r="1.5" />"##
         }
+        "gear" => {
+            r##"<path d="M12.68 6.55L14.31 6.92 14.31 9.08 12.68 9.45 12.33 10.29 13.23 11.69 11.69 13.23 10.29 12.33 9.45 12.68 9.08 14.31 6.92 14.31 6.55 12.68 5.71 12.33 4.31 13.23 2.77 11.69 3.67 10.29 3.32 9.45 1.69 9.08 1.69 6.92 3.32 6.55 3.67 5.71 2.77 4.31 4.31 2.77 5.71 3.67 6.55 3.32 6.92 1.69 9.08 1.69 9.45 3.32 10.29 3.67 11.69 2.77 13.23 4.31 12.33 5.71z" /><circle cx="8" cy="8" r="2" />"##
+        }
         "close" => r##"<path d="M4 4l8 8M12 4l-8 8" />"##,
         "minimize" => r##"<path d="M3.5 8h9" />"##,
         "maximize" => r##"<rect x="3.5" y="3.5" width="9" height="9" />"##,
@@ -138,6 +141,7 @@ pub fn image_with_stroke(name: &str, size: i32, stroke: f64) -> gtk::Image {
         }
         "minus" => r##"<path d="M3 8h10" />"##,
         "chevron-down" => r##"<path d="M4 6l4 4 4-4" />"##,
+        "chevron-up" => r##"<path d="M4 10l4-4 4 4" />"##,
         "chevron-right" => r##"<path d="M6 4l4 4-4 4" />"##,
         "chevron-left" => r##"<path d="M10 4L6 8l4 4" />"##,
         "arrow-left" => r##"<path d="M13 8H3M7 4L3 8l4 4" />"##,
