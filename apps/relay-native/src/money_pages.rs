@@ -76,6 +76,14 @@ fn glyph(key: &str) -> Option<&'static str> {
         "insurance" => r##"<path d="M8 2l5 2v3.5c0 3.3-2 5.5-5 6.8-3-1.3-5-3.5-5-6.8V4z" />"##,
         "sport" | "soccer" | "hiking" | "outdoors" | "pool" => r##"<circle cx="8" cy="8" r="5.5" /><path d="M8 5.5l2.4 1.7-.9 2.8h-3l-.9-2.8z" />"##,
         "haircut" | "beauty" => r##"<circle cx="4.5" cy="11.5" r="2" /><circle cx="11.5" cy="11.5" r="2" /><path d="M6 10L12 2.5M10 10L4 2.5" />"##,
+        // The Tally pages' own marks: what a figure is, what a row does.
+        "calendar" => r##"<rect x="2.5" y="3.5" width="11" height="10" rx="1.5" /><path d="M2.5 6.5h11M5.5 2v3M10.5 2v3" />"##,
+        "chart" => r##"<path d="M2.5 13.5h11" /><path d="M3.5 11l3-3.5 2.5 2 4-5" /><path d="M10.5 4.5h2.5V7" />"##,
+        "income" | "download" => r##"<path d="M8 2.5v7M5 6.5l3 3 3-3" /><path d="M2.5 10.5v2a1 1 0 0 0 1 1h9a1 1 0 0 0 1-1v-2" />"##,
+        "spend" | "upload" => r##"<path d="M8 9.5v-7M5 5.5l3-3 3 3" /><path d="M2.5 10.5v2a1 1 0 0 0 1 1h9a1 1 0 0 0 1-1v-2" />"##,
+        "gauge" => r##"<path d="M2.5 11a5.5 5.5 0 1 1 11 0" /><path d="M8 11l2.5-3" />"##,
+        "trash" => r##"<path d="M3 4.5h10M6.5 4.5V3h3v1.5M4.5 4.5l.7 9h5.6l.7-9" />"##,
+        "plus" => r##"<path d="M8 3v10M3 8h10" />"##,
         _ => return None,
     })
 }
@@ -91,14 +99,22 @@ pub fn glyph_image(key: &str, size: i32) -> gtk::Image {
 
 /// A category's glyph in its hue, on a wash of that hue.
 pub fn badge(icon: &str, color: i64) -> gtk::Box {
+    badge_sized(icon, color, 34)
+}
+
+/// [`badge`] at `size` pixels: 34 on the pages' rows, 28 in compact rows, 24 in the panel.
+pub fn badge_sized(icon: &str, color: i64, size: i32) -> gtk::Box {
     let tile = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     tile.add_css_class("money-badge");
     tile.add_css_class(&format!("hue-{}", color.rem_euclid(HUES.len() as i64)));
+    if size < 34 {
+        tile.add_css_class("money-badge-small");
+    }
     tile.set_valign(gtk::Align::Center);
     tile.set_halign(gtk::Align::Start);
     tile.set_hexpand(false);
-    tile.set_size_request(34, 34);
-    let image = glyph_image(icon, 18);
+    tile.set_size_request(size, size);
+    let image = glyph_image(icon, if size < 30 { 15 } else { 18 });
     image.set_halign(gtk::Align::Center);
     image.set_valign(gtk::Align::Center);
     image.set_hexpand(true);
@@ -174,12 +190,42 @@ fn plural(n: usize, one: &str) -> String {
     copy::plural(n as i64, one)
 }
 
-/// A bar filled to `fraction` with the pace tick at `tick`, red when `over`.
-pub fn meter(fraction: f64, tick: Option<f64>, over: bool, height: i32) -> gtk::DrawingArea {
+/// How a meter's fill reads: Dev's ink, a category's hue, ahead of pace (amber, Dev's waiting),
+/// or over budget (red).
+#[derive(Clone, Copy)]
+pub enum Tone {
+    Plain,
+    Hue(i64),
+    Ahead,
+    Over,
+}
+
+/// A budget's tone from its pace status, in its category's hue when it has one.
+pub fn tone(status: &str, hue: Option<i64>) -> Tone {
+    match status {
+        "OVER_BUDGET" => Tone::Over,
+        "OVER_PACE" => Tone::Ahead,
+        _ => hue.map_or(Tone::Plain, Tone::Hue),
+    }
+}
+
+fn rgb(hex: &str) -> (f64, f64, f64) {
+    let v = u32::from_str_radix(hex.trim_start_matches('#'), 16).unwrap_or(0xEDE9E2);
+    (f64::from((v >> 16) & 0xFF) / 255.0, f64::from((v >> 8) & 0xFF) / 255.0, f64::from(v & 0xFF) / 255.0)
+}
+
+/// [`meter`] filled in `tone`.
+pub fn meter_in(fraction: f64, tick: Option<f64>, tone: Tone, height: i32) -> gtk::DrawingArea {
     let area = gtk::DrawingArea::new();
     area.set_content_height(height + 6);
     area.set_hexpand(true);
     area.add_css_class("money-meter");
+    let fill = match tone {
+        Tone::Plain => rgb("#EDE9E2"),
+        Tone::Hue(h) => rgb(HUES[h.rem_euclid(HUES.len() as i64) as usize]),
+        Tone::Ahead => rgb("#f0a828"),
+        Tone::Over => rgb("#f0786f"),
+    };
     area.set_draw_func(move |_, cr, width, _| {
         let (w, h, top) = (width as f64, height as f64, 3.0);
         let rounded = |x: f64, w: f64| {
@@ -189,22 +235,20 @@ pub fn meter(fraction: f64, tick: Option<f64>, over: bool, height: i32) -> gtk::
             cr.arc(x + r, top + r, r, std::f64::consts::FRAC_PI_2, 3.0 * std::f64::consts::FRAC_PI_2);
             cr.close_path();
         };
-        cr.set_source_rgb(0x2A as f64 / 255.0, 0x23 as f64 / 255.0, 0x1C as f64 / 255.0);
+        let (r, g, b) = rgb("#2A2826");
+        cr.set_source_rgb(r, g, b);
         rounded(0.0, w);
         let _ = cr.fill();
         let filled = (fraction.clamp(0.0, 1.0) * w).max(if fraction > 0.0 { h } else { 0.0 });
         if filled > 0.0 {
-            if over {
-                cr.set_source_rgb(0xD9 as f64 / 255.0, 0x53 as f64 / 255.0, 0x4A as f64 / 255.0);
-            } else {
-                cr.set_source_rgb(0xD4 as f64 / 255.0, 0x76 as f64 / 255.0, 0x1F as f64 / 255.0);
-            }
+            cr.set_source_rgb(fill.0, fill.1, fill.2);
             rounded(0.0, filled);
             let _ = cr.fill();
         }
         if let Some(tick) = tick.filter(|t| (0.0..=1.0).contains(t)) {
             let x = (tick * w).clamp(1.0, w - 1.0);
-            cr.set_source_rgb(0xF2 as f64 / 255.0, 0xEF as f64 / 255.0, 0xEA as f64 / 255.0);
+            let (r, g, b) = rgb("#8C877F");
+            cr.set_source_rgb(r, g, b);
             cr.set_line_width(2.0);
             cr.move_to(x, 0.0);
             cr.line_to(x, h + 6.0);
@@ -214,8 +258,13 @@ pub fn meter(fraction: f64, tick: Option<f64>, over: bool, height: i32) -> gtk::
     area
 }
 
-fn over(status: &str) -> bool {
-    matches!(status, "OVER_PACE" | "OVER_BUDGET")
+/// The figure's class for a pace status: red over budget, amber ahead of pace.
+pub fn tone_class(status: &str) -> Option<&'static str> {
+    match status {
+        "OVER_BUDGET" => Some("money-over"),
+        "OVER_PACE" => Some("money-ahead"),
+        _ => None,
+    }
 }
 
 /// The page title in the serif voice, its context line under it.
@@ -229,51 +278,112 @@ fn title(head: &gtk::Box, name: &str, context: &str) {
     }
 }
 
-/// A section: its mono name, an optional text action, and the box its rows go in.
-fn section(parent: &gtk::Box, name: &str, action: Option<(&str, Action)>) -> gtk::Box {
-    let block = gtk::Box::new(gtk::Orientation::Vertical, 10);
-    block.add_css_class("money-section");
-    let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let caption = label(&name.to_uppercase(), "money-label");
+/// A card: its title, an optional text action on the right, and the box its rows go in.
+fn card(parent: &gtk::Box, name: &str, action: Option<(&str, Action)>) -> gtk::Box {
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    card.add_css_class("tally-card");
+    let head = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    head.add_css_class("tally-card-head");
+    let caption = label(name, "tally-card-title");
     caption.set_hexpand(true);
-    header.append(&caption);
+    head.append(&caption);
     if let Some((text, run)) = action {
-        let key = button(&format!("{text} →"), "money-text-action");
+        let key = button(text, "money-text-action");
         key.connect_clicked(move |_| run());
-        header.append(&key);
+        head.append(&key);
     }
-    block.append(&header);
-    let rows = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    rows.add_css_class("money-group");
-    block.append(&rows);
-    parent.append(&block);
+    card.append(&head);
+    let rows = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    rows.add_css_class("tally-rows");
+    card.append(&rows);
+    parent.append(&card);
     rows
 }
 
-fn go(ui: &Rc<Ui>, page: &'static str) -> Action {
-    let weak = Rc::downgrade(ui);
-    Rc::new(move || {
-        if let Some(ui) = weak.upgrade() {
-            if page == "money-transactions" {
-                super::set_period_offset(0);
-            }
-            ui.navigate(page);
-        }
-    })
+/// `n` columns of equal width under `parent`, side by side.
+fn columns(parent: &gtk::Box, n: usize) -> Vec<gtk::Box> {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 16);
+    row.set_homogeneous(true);
+    let columns = (0..n)
+        .map(|_| {
+            let column = gtk::Box::new(gtk::Orientation::Vertical, 16);
+            row.append(&column);
+            column
+        })
+        .collect();
+    parent.append(&row);
+    columns
 }
 
-/// A plain reading row: start text over an optional detail, a figure at the end.
-fn line_row(title: &str, detail: &str, figure: &str, figure_class: &str) -> gtk::Box {
+/// A summary strip: one card holding a row of figures (see [`cell`]), and the box under them.
+fn strip(parent: &gtk::Box) -> (gtk::Box, gtk::Box) {
+    let strip = gtk::Box::new(gtk::Orientation::Vertical, 14);
+    strip.add_css_class("tally-strip");
+    let cells = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    strip.append(&cells);
+    parent.append(&strip);
+    (strip, cells)
+}
+
+/// One figure of a strip: an icon and what it is, the figure, and a line under it.
+fn cell(cells: &gtk::Box, icon: &str, caption: &str, figure: &str, sub: &str, class: Option<&str>) {
+    if cells.first_child().is_some() {
+        let rule = gtk::Separator::new(gtk::Orientation::Vertical);
+        rule.add_css_class("tally-rule");
+        cells.append(&rule);
+    }
+    let cell = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    cell.add_css_class("tally-cell");
+    cell.set_hexpand(true);
+    let top = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let image = glyph_image(icon, 14);
+    image.add_css_class("tally-cell-icon");
+    top.append(&image);
+    top.append(&label(caption, "tally-cell-caption"));
+    cell.append(&top);
+    let f = label(figure, "tally-cell-figure");
+    if let Some(class) = class {
+        f.add_css_class(class);
+    }
+    cell.append(&f);
+    if !sub.is_empty() {
+        let line = label(sub, "tally-cell-sub");
+        line.set_wrap(true);
+        line.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        cell.append(&line);
+    }
+    cells.append(&cell);
+}
+
+/// A neutral icon tile, for rows that are not a category.
+pub fn tile(icon: &str) -> gtk::Box {
+    let tile = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    tile.add_css_class("tally-tile");
+    tile.set_valign(gtk::Align::Center);
+    // The glyph centres by expanding; the tile itself must not take the row's spare width.
+    tile.set_hexpand(false);
+    tile.set_size_request(28, 28);
+    let image = glyph_image(icon, 15);
+    image.set_halign(gtk::Align::Center);
+    image.set_hexpand(true);
+    tile.append(&image);
+    tile
+}
+
+/// A row of a card: a leading tile, a title over a detail, and a figure at the end.
+fn icon_row(lead: &gtk::Box, title: &str, detail: &str, figure: &str, figure_class: &str) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    row.add_css_class("money-line");
-    let words = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    row.add_css_class("tally-row");
+    row.append(lead);
+    let words = gtk::Box::new(gtk::Orientation::Vertical, 1);
     words.set_hexpand(true);
+    words.set_valign(gtk::Align::Center);
     let name = label(title, "money-row-title");
-    name.set_wrap(true);
+    name.set_ellipsize(gtk::pango::EllipsizeMode::End);
     words.append(&name);
     if !detail.is_empty() {
         let d = label(detail, "money-row-detail");
-        d.set_wrap(true);
+        d.set_ellipsize(gtk::pango::EllipsizeMode::End);
         words.append(&d);
     }
     row.append(&words);
@@ -286,6 +396,62 @@ fn line_row(title: &str, detail: &str, figure: &str, figure_class: &str) -> gtk:
         row.append(&f);
     }
     row
+}
+
+/// An account type's mark.
+fn account_icon(kind: &str) -> &'static str {
+    match kind {
+        "CASH" => "cash",
+        "SAVINGS" => "savings",
+        "CREDIT" => "card",
+        "INVESTMENT" => "chart",
+        _ => "bank",
+    }
+}
+
+/// A budget in one line: its badge and name, the meter with today's pace, spent of budget, and
+/// what is left (or how far over).
+fn budget_line(b: &Value, pace_fraction: f64) -> gtk::Box {
+    let fmt = formatter();
+    let (spent, budget) = (n(b, "spent"), n(b, "budget"));
+    let status = text(b, "status");
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    row.add_css_class("tally-row");
+    row.append(&badge_sized(text(b, "icon"), n(b, "color"), 28));
+    let name = label(text(b, "name"), "money-row-title");
+    name.set_width_chars(11);
+    name.set_max_width_chars(11);
+    name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    row.append(&name);
+    let bar = meter_in(spent as f64 / budget.max(1) as f64, Some(pace_fraction), tone(status, b["color"].as_i64()), 6);
+    bar.set_valign(gtk::Align::Center);
+    bar.set_tooltip_text(Some("The tick is where an even spend would be today"));
+    row.append(&bar);
+    let figures = label(&format!("{} / {}", fmt.format_whole(spent), fmt.format_whole(budget)), "tally-figures");
+    figures.set_width_chars(13);
+    figures.set_xalign(1.0);
+    row.append(&figures);
+    let left = budget - spent;
+    let rest = label(&if left < 0 { format!("{} over", fmt.format_whole(-left)) } else { format!("{} left", fmt.format_whole(left)) }, "tally-left");
+    rest.set_width_chars(11);
+    rest.set_xalign(1.0);
+    if let Some(class) = tone_class(status) {
+        rest.add_css_class(class);
+    }
+    row.append(&rest);
+    row
+}
+
+fn go(ui: &Rc<Ui>, page: &'static str) -> Action {
+    let weak = Rc::downgrade(ui);
+    Rc::new(move || {
+        if let Some(ui) = weak.upgrade() {
+            if page == "money-transactions" {
+                super::set_period_offset(0);
+            }
+            ui.navigate(page);
+        }
+    })
 }
 
 /// Deletes `tx`, with Undo on a toast rather than a confirmation first (Tally's rule). Undo is
@@ -320,46 +486,49 @@ pub fn delete(ui: &Rc<Ui>, tx: Value) {
     });
 }
 
-/// One entry as a tappable slab: its category glyph, what and where, and the amount. Clicking
-/// it edits; the trash key (where `deletable`) deletes with Undo.
-fn tx_row(ui: &Rc<Ui>, tx: &Value, deletable: bool) -> gtk::Box {
+/// One entry as a row: its category badge, what it was (the note, else the category) over
+/// where it sits, and the amount; `dated` adds the day. Clicking it edits; the trash key (shown on
+/// hover, where `deletable`) deletes with Undo.
+fn tx_row(ui: &Rc<Ui>, tx: &Value, deletable: bool, dated: bool) -> gtk::Box {
     let fmt = formatter();
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    row.add_css_class("money-row");
+    row.add_css_class("tally-row");
+    row.add_css_class("tally-entry");
     let main = button("", "money-row-key");
     main.set_hexpand(true);
-    let inner = gtk::Box::new(gtk::Orientation::Horizontal, 14);
+    let inner = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     let kind = text(tx, "type");
     let transfer = kind == "TRANSFER";
-    inner.append(&badge(if transfer { "repeat" } else { text(tx, "icon") }, if transfer { 10 } else { n(tx, "color") }));
-    let words = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    inner.append(&badge_sized(if transfer { "repeat" } else { text(tx, "icon") }, if transfer { 10 } else { n(tx, "color") }, 28));
+    let words = gtk::Box::new(gtk::Orientation::Vertical, 1);
     words.set_hexpand(true);
-    let what = if transfer {
-        String::from("Transfer")
-    } else {
-        match text(tx, "category") {
-            "" => word(kind),
-            name => name.to_string(),
-        }
+    words.set_valign(gtk::Align::Center);
+    let category = match text(tx, "category") {
+        "" if transfer => String::from("Transfer"),
+        "" => word(kind),
+        name => name.to_string(),
     };
+    let note = text(tx, "note").trim();
+    let (what, mut detail) = if note.is_empty() { (category.clone(), Vec::new()) } else { (note.to_string(), vec![category]) };
+    if transfer {
+        detail.push(format!("{} → {}", text(tx, "account"), text(tx, "to_account")));
+    } else {
+        detail.push(text(tx, "account").to_string());
+    }
+    if dated {
+        detail.push(human_date(text(tx, "date")));
+    }
     let name = label(&what, "money-row-title");
     name.set_ellipsize(gtk::pango::EllipsizeMode::End);
     words.append(&name);
-    let mut detail = if transfer {
-        format!("{} → {}", text(tx, "account"), text(tx, "to_account"))
-    } else {
-        text(tx, "account").to_string()
-    };
-    if !text(tx, "note").is_empty() {
-        detail = format!("{detail} · {}", text(tx, "note"));
-    }
-    let d = label(&detail, "money-row-detail");
+    let d = label(&detail.join(" · "), "money-row-detail");
     d.set_ellipsize(gtk::pango::EllipsizeMode::End);
     words.append(&d);
     inner.append(&words);
     let amount = n(tx, "amount");
     let figure = match kind {
         "INCOME" => label(&fmt.format_signed(amount), "money-amount"),
+        "EXPENSE" => label(&format!("−{}", fmt.format(amount)), "money-amount"),
         _ => label(&fmt.format(amount), "money-amount"),
     };
     match kind {
@@ -411,7 +580,7 @@ pub fn install(ui: &Rc<Ui>) {
     }
     let Some(page) = page("money-transactions") else { return };
     clear(&page.head);
-    page.head.append(&label("Transactions", "money-title"));
+    page.head.append(&label("Entries", "money-title"));
     let context = label("", "money-context");
     page.head.append(&context);
     let controls = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -528,209 +697,164 @@ fn failed(ui: &Rc<Ui>, page: &Page, name: &str, error: &Error) {
     page.body.append(&retry);
 }
 
-/// Home: the hero reading, In and Out, budgets furthest over pace, then recent entries, bills,
-/// accounts and goals.
+/// Overview: the period in one strip (left to spend, spent, income, net worth, and the pace), then
+/// budgets beside recent entries, then bills, accounts and goals side by side: one screen.
 fn home(ui: &Rc<Ui>, page: &Page, s: &Value) {
     remember_currency(s);
     let fmt = formatter();
     let period = &s["period"];
-    let days_left = n(period, "days_left");
-    let resets = date(text(period, "end_exclusive"))
-        .and_then(|d| d.format("%-d %b").ok())
-        .map(|d| format!("resets {d}"))
-        .unwrap_or_default();
-    title(
-        &page.head,
-        &period_name(period),
-        &[copy::plural(days_left, "day") + " left", resets].iter().filter(|p| !p.is_empty()).cloned().collect::<Vec<_>>().join(" · "),
-    );
+    let (days, days_left) = (n(period, "days"), n(period, "days_left"));
+    let resets = date(text(period, "end_exclusive")).and_then(|d| d.format("%-d %b").ok()).map(|d| format!("resets {d}")).unwrap_or_default();
+    let context = [format!("Day {} of {days}", (days - days_left + 1).clamp(1, days.max(1))), copy::plural(days_left, "day") + " left", resets];
+    title(&page.head, &period_name(period), &context.iter().filter(|p| !p.is_empty()).cloned().collect::<Vec<_>>().join(" · "));
     clear(&page.body);
     if s["empty"] == true {
         empty_state(ui, &page.body);
         return;
     }
-    let columns = gtk::Box::new(gtk::Orientation::Horizontal, 48);
-    columns.set_homogeneous(true);
-    let start = gtk::Box::new(gtk::Orientation::Vertical, 28);
-    let end = gtk::Box::new(gtk::Orientation::Vertical, 28);
-    columns.append(&start);
-    columns.append(&end);
-    page.body.append(&columns);
-
-    // The hero: what is left, lit by the accent, or by the red when the period is over.
     let pace = &s["pace"];
+    let lines = &s["lines"];
     let status = text(pace, "status");
     let budgeted = status != "NO_BUDGET" && n(pace, "budget") > 0;
-    let hero = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    hero.add_css_class("money-hero");
-    if over(status) {
-        hero.add_css_class("money-hero-over");
-    }
-    let figure = if budgeted { fmt.format(n(pace, "remaining")) } else { fmt.format(n(s, "spent")) };
-    let figure = label(&figure, "money-hero-figure");
-    figure.set_widget_name("money-hero-figure");
-    hero.append(&figure);
-    hero.append(&label(
-        &if budgeted { format!("LEFT OF {}", fmt.format_whole(n(pace, "budget"))) } else { String::from("SPENT THIS PERIOD") },
-        "money-label",
-    ));
-    let lines = &s["lines"];
-    for (key, class) in [("margin", "money-hero-line"), ("pace", "money-pace-line")] {
-        let value = text(lines, key);
-        if !value.is_empty() {
-            let line = label(value, class);
-            line.set_wrap(true);
-            hero.append(&line);
-        }
-    }
+
+    // The strip: four figures, then the pace across the period.
+    let (strip, cells) = strip(&page.body);
     if budgeted {
-        let bar = meter(pace["spent_fraction"].as_f64().unwrap_or(0.0), pace["pace_fraction"].as_f64(), over(status), 10);
-        bar.set_margin_top(10);
-        bar.set_tooltip_text(Some("The tick is where an even spend would be today"));
-        hero.append(&bar);
+        let remaining = n(pace, "remaining");
+        let sub = [format!("of {}", fmt.format_whole(n(pace, "budget"))), text(lines, "margin").to_string()];
+        let class = if remaining < 0 { Some("money-over") } else { None };
+        cell(&cells, "card", "Left to spend", &fmt.format(remaining), &sub.iter().filter(|p| !p.is_empty()).cloned().collect::<Vec<_>>().join(" · "), class);
     } else {
-        let set = button("set a budget →", "money-text-action");
-        set.set_halign(gtk::Align::Start);
-        let run = go(ui, "money-plan");
-        set.connect_clicked(move |_| run());
-        hero.append(&set);
+        cell(&cells, "card", "Left to spend", "No budget", "Set one in Plan to see your pace", None);
     }
-    start.append(&hero);
-
-    // In and Out, then how this compares with the last period.
-    let tiles = gtk::Box::new(gtk::Orientation::Horizontal, 14);
-    tiles.set_homogeneous(true);
-    for (value, caption, class) in [(n(s, "income"), "IN", "money-in"), (n(s, "spent"), "OUT", "")] {
-        let tile = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        tile.add_css_class("money-tile");
-        let figure = label(&fmt.format(value), "money-tile-figure");
-        if !class.is_empty() && value > 0 {
-            figure.add_css_class(class);
+    cell(&cells, "spend", "Spent", &fmt.format(n(s, "spent")), text(lines, "versus_last"), None);
+    let income = n(s, "income");
+    cell(&cells, "income", "Income", &fmt.format(income), "this period", (income > 0).then_some("money-in"));
+    let accounts = rows(s, "accounts");
+    let worth = n(s, "net_worth");
+    cell(&cells, "bank", "Net worth", &fmt.format(worth), &plural(accounts.len(), "account"), (worth < 0).then_some("money-over"));
+    if budgeted {
+        let pace_row = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        pace_row.add_css_class("tally-pace");
+        let bar = meter_in(pace["spent_fraction"].as_f64().unwrap_or(0.0), pace["pace_fraction"].as_f64(), tone(status, None), 8);
+        bar.set_tooltip_text(Some("The tick is where an even spend would be today"));
+        pace_row.append(&bar);
+        let legend = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let said = label(text(lines, "pace"), "tally-cell-sub");
+        said.set_hexpand(true);
+        said.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        if let Some(class) = tone_class(status) {
+            said.add_css_class(class);
         }
-        tile.append(&figure);
-        tile.append(&label(caption, "money-label"));
-        tiles.append(&tile);
-    }
-    start.append(&tiles);
-    let versus = text(lines, "versus_last");
-    if !versus.is_empty() {
-        let line = label(versus, "money-muted");
-        line.set_wrap(true);
-        start.append(&line);
+        legend.append(&said);
+        let spent_share = (pace["spent_fraction"].as_f64().unwrap_or(0.0) * 100.0).round();
+        let time_share = (pace["pace_fraction"].as_f64().unwrap_or(0.0) * 100.0).round();
+        legend.append(&label(&format!("{spent_share:.0}% spent · {time_share:.0}% of the period gone"), "tally-figures"));
+        pace_row.append(&legend);
+        strip.append(&pace_row);
     }
 
-    // Budgets, the furthest over pace first.
+    // Budgets beside recent entries.
     let pace_fraction = pace["pace_fraction"].as_f64().unwrap_or(0.0);
     let mut budgets: Vec<Value> = rows(s, "budgets").into_iter().filter(|b| n(b, "budget") > 0).collect();
     let ahead = |b: &Value| n(b, "spent") as f64 / n(b, "budget").max(1) as f64 - pace_fraction;
     budgets.sort_by(|a, b| ahead(b).total_cmp(&ahead(a)));
-    if !budgets.is_empty() {
-        let list = section(&start, "Budgets", Some(("plan", go(ui, "money-plan"))));
-        list.add_css_class("money-open");
-        for b in budgets.iter().take(6) {
-            let row = gtk::Box::new(gtk::Orientation::Vertical, 6);
-            row.add_css_class("money-budget");
-            let top = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-            top.append(&badge(text(b, "icon"), n(b, "color")));
-            let name = label(text(b, "name"), "money-row-title");
-            name.set_hexpand(true);
-            top.append(&name);
-            let reading = label(&copy::of_budget(n(b, "spent"), n(b, "budget"), &fmt), "money-row-detail");
-            if over(text(b, "status")) {
-                reading.add_css_class("money-over");
-            }
-            top.append(&reading);
-            row.append(&top);
-            let fraction = n(b, "spent") as f64 / n(b, "budget").max(1) as f64;
-            row.append(&meter(fraction, Some(pace_fraction), over(text(b, "status")), 6));
-            list.append(&row);
-        }
+    let pair = columns(&page.body, 2);
+    let list = card(&pair[0], "Budgets", Some(("Plan", go(ui, "money-plan"))));
+    if budgets.is_empty() {
+        list.append(&icon_row(&tile("plan"), "No budgets yet", "Give each category a monthly budget in Plan", "", ""));
     }
-
-    // Recent entries, bills, accounts and goals.
-    let recent = rows(s, "recent");
-    if !recent.is_empty() {
-        let list = section(&end, "Recent", Some(("all", go(ui, "money-transactions"))));
-        for tx in &recent {
-            list.append(&tx_row(ui, tx, false));
-        }
+    for b in budgets.iter().take(8) {
+        list.append(&budget_line(b, pace_fraction));
     }
     let bills = rows(s, "bills");
     if !bills.is_empty() {
-        let list = section(&end, "Bills", None);
-        list.add_css_class("money-open");
-        for bill in &bills {
+        let list = card(&pair[0], "Upcoming bills", None);
+        for bill in bills.iter().take(5) {
             let amount = n(bill, "amount");
-            let (figure, class) = if text(bill, "type") == "INCOME" {
-                (fmt.format_signed(amount), "money-in")
-            } else {
-                (fmt.format(amount), "")
-            };
+            let income = text(bill, "type") == "INCOME";
+            let (figure, class) = if income { (fmt.format_signed(amount), "money-in") } else { (format!("−{}", fmt.format(amount)), "") };
             let detail = format!("{} · {}", text(bill, "due_line"), human_date(text(bill, "next_date")));
-            list.append(&line_row(text(bill, "name"), &detail, &figure, class));
+            let row = icon_row(&tile(if income { "income" } else { "calendar" }), text(bill, "name"), &detail, &figure, class);
+            if n(bill, "days_until") <= 3 && !income {
+                row.add_css_class("tally-soon");
+            }
+            list.append(&row);
         }
     }
-    let accounts = rows(s, "accounts");
+    let recent = rows(s, "recent");
+    let list = card(&pair[1], "Recent", Some(("All entries", go(ui, "money-transactions"))));
+    if recent.is_empty() {
+        list.append(&icon_row(&tile("list"), "Nothing logged this period yet", "Add an entry with the Entry key above", "", ""));
+    }
+    for tx in recent.iter().take(8) {
+        list.append(&tx_row(ui, tx, false, true));
+    }
+
+    // Accounts and goals, those there are, side by side.
+    let goals = rows(s, "goals");
+    let count = usize::from(!accounts.is_empty()) + usize::from(!goals.is_empty());
+    if count == 0 {
+        return;
+    }
+    let mut slots = columns(&page.body, count).into_iter();
     if !accounts.is_empty() {
-        let list = section(&end, "Accounts", None);
-        list.add_css_class("money-open");
+        let list = card(&slots.next().expect("counted"), "Accounts", None);
         for account in &accounts {
             let balance = n(account, "balance");
-            list.append(&line_row(
+            list.append(&icon_row(
+                &tile(account_icon(text(account, "type"))),
                 text(account, "name"),
                 &word(text(account, "type")),
                 &fmt.format(balance),
                 if balance < 0 { "money-over" } else { "" },
             ));
         }
-        let worth = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-        worth.add_css_class("money-worth");
-        let caption = label("NET WORTH", "money-label");
+        let total = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        total.add_css_class("tally-total");
+        let caption = label("Net worth", "money-row-title");
         caption.set_hexpand(true);
-        caption.set_valign(gtk::Align::Center);
-        worth.append(&caption);
-        worth.append(&label(&fmt.format(n(s, "net_worth")), "money-worth-figure"));
-        list.append(&worth);
+        total.append(&caption);
+        total.append(&label(&fmt.format(worth), "tally-total-figure"));
+        list.append(&total);
     }
-    let goals = rows(s, "goals");
     if !goals.is_empty() {
-        let list = section(&end, "Goals", None);
-        list.add_css_class("money-open");
+        let list = card(&slots.next().expect("counted"), "Goals", None);
         for goal in &goals {
-            let row = line_row(text(goal, "name"), text(goal, "line"), "", "");
             let block = gtk::Box::new(gtk::Orientation::Vertical, 6);
-            block.append(&row);
-            if n(goal, "target") > 0 {
-                block.append(&meter(n(goal, "saved") as f64 / n(goal, "target") as f64, None, false, 6));
+            block.add_css_class("tally-row");
+            let (saved, target) = (n(goal, "saved"), n(goal, "target"));
+            let top = icon_row(&tile("spark"), text(goal, "name"), text(goal, "line"), &format!("{} / {}", fmt.format_whole(saved), fmt.format_whole(target)), "");
+            top.remove_css_class("tally-row");
+            block.append(&top);
+            if target > 0 {
+                block.append(&meter_in(saved as f64 / target as f64, None, Tone::Hue(1), 6));
             }
             list.append(&block);
         }
     }
-    if recent.is_empty() && bills.is_empty() && accounts.is_empty() && goals.is_empty() {
-        let quiet = label("Nothing logged this period yet.", "money-muted");
-        end.append(&quiet);
-    }
 }
 
-/// An empty ledger says so, and offers the two ways to fill it.
+/// An empty ledger says so, and offers the three ways to fill it.
 fn empty_state(ui: &Rc<Ui>, body: &gtk::Box) {
     let block = gtk::Box::new(gtk::Orientation::Vertical, 14);
+    block.add_css_class("tally-card");
     block.add_css_class("money-empty");
     block.append(&label("Nothing here yet", "money-empty-title"));
     let about = label(
-        "This ledger is empty. Bring over what Tally holds on your phone with its backup file, start fresh with an account to log against, or load a sample household to look around first.",
+        "Bring over what Tally holds on your phone with its backup file, start fresh with an account, or load a sample household to look around first.",
         "money-muted",
     );
     about.set_wrap(true);
-    about.set_max_width_chars(60);
+    about.set_max_width_chars(70);
     block.append(&about);
-    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-    let import_key = button("Import a Tally backup", "primary");
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let import_key = button("Import a Tally backup…", "primary");
     import_key.add_css_class("money-hero-action");
     import_key.set_widget_name("money-empty-import");
-    let account = button("Add an account", "money-secondary");
+    let account = button("Add an account…", "");
     account.set_widget_name("money-empty-account");
-    let sample = button("Load sample data", "money-secondary");
+    let sample = button("Load sample data", "");
     sample.set_widget_name("money-empty-sample");
     actions.append(&import_key);
     actions.append(&account);
@@ -757,55 +881,69 @@ fn empty_state(ui: &Rc<Ui>, body: &gtk::Box) {
     });
 }
 
-/// Transactions: the period's entries grouped by day.
+/// Entries: the period in a strip (count, in, out, net), then one card of days, each with its
+/// net and its entries.
 fn transactions(ui: &Rc<Ui>, page: &Page, list: &Value, offset: i64, query: &str) {
     let fmt = formatter();
     let entries = rows(list, "transactions");
     let name = period_name(&list["period"]);
+    let count = copy::plural_as(entries.len() as i64, "entry", "entries");
     TX_HEAD.with(|h| {
         if let Some((context, period, next)) = h.borrow().as_ref() {
-            let count = plural(entries.len(), "entry").replace("entrys", "entries");
-            context.set_text(&format!(
-                "{count} · {} in · {} out",
-                fmt.format_whole(n(list, "income")),
-                fmt.format_whole(n(list, "spent"))
-            ));
+            context.set_text(&if query.is_empty() { format!("{count} in {name}") } else { format!("{count} matching \u{201c}{query}\u{201d}") });
             period.set_text(&name);
             next.set_sensitive(offset < 0);
         }
     });
     clear(&page.body);
+    let (income, spent) = (n(list, "income"), n(list, "spent"));
+    let (_, cells) = strip(&page.body);
+    cell(&cells, "list", "Entries", &entries.len().to_string(), &name, None);
+    cell(&cells, "income", "Money in", &fmt.format(income), "income", (income > 0).then_some("money-in"));
+    cell(&cells, "spend", "Money out", &fmt.format(spent), "spending", None);
+    let net = income - spent;
+    cell(&cells, "gauge", "Net", &fmt.format_signed(net), "in less out", Some(if net < 0 { "money-over" } else { "money-in" }));
     if entries.is_empty() {
-        let text = if query.is_empty() {
-            format!("Nothing logged in {name}.")
-        } else {
-            format!("Nothing in {name} matches \u{201c}{query}\u{201d}.")
-        };
-        message(&page.body, &text);
+        let text = if query.is_empty() { format!("Nothing logged in {name}.") } else { format!("Nothing in {name} matches \u{201c}{query}\u{201d}.") };
+        let rows = card(&page.body, "Entries", None);
+        rows.append(&icon_row(&tile("list"), &text, "Add an entry with the Entry key above", "", ""));
         return;
     }
-    let mut day = String::new();
-    let mut group: Option<gtk::Box> = None;
-    for tx in &entries {
-        let date = text(tx, "date");
-        if date != day || group.is_none() {
-            day = date.to_string();
-            let block = gtk::Box::new(gtk::Orientation::Vertical, 8);
-            let header = label(&human_date(date), "money-day");
-            block.append(&header);
-            let rows = gtk::Box::new(gtk::Orientation::Vertical, 2);
-            rows.add_css_class("money-group");
-            block.append(&rows);
-            page.body.append(&block);
-            group = Some(rows);
+    let rows_box = card(&page.body, "By day", None);
+    let mut start = 0;
+    while start < entries.len() {
+        let day = text(&entries[start], "date").to_string();
+        let end = entries[start..].iter().position(|t| text(t, "date") != day).map_or(entries.len(), |p| start + p);
+        let day_net: i64 = entries[start..end]
+            .iter()
+            .map(|t| match text(t, "type") {
+                "INCOME" => n(t, "amount"),
+                "EXPENSE" => -n(t, "amount"),
+                _ => 0,
+            })
+            .sum();
+        let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        header.add_css_class("tally-day");
+        let when = label(&human_date(&day), "tally-day-name");
+        when.set_hexpand(true);
+        header.append(&when);
+        header.append(&label(&copy::plural_as((end - start) as i64, "entry", "entries"), "tally-figures"));
+        let total = label(&fmt.format_signed(day_net), "tally-day-total");
+        total.set_xalign(1.0);
+        if day_net > 0 {
+            total.add_css_class("money-in");
         }
-        if let Some(rows) = &group {
-            rows.append(&tx_row(ui, tx, true));
+        header.append(&total);
+        rows_box.append(&header);
+        for tx in &entries[start..end] {
+            rows_box.append(&tx_row(ui, tx, true, false));
         }
+        start = end;
     }
 }
 
-/// Plan: the monthly budget and one per expense category, edited in place.
+/// Plan: the monthly budget and its split, then every expense category in one table with what it
+/// has spent and its budget field.
 fn plan(ui: &Rc<Ui>, page: &Page, s: &Value, lists: &Value) {
     remember_currency(s);
     let fmt = formatter();
@@ -815,47 +953,64 @@ fn plan(ui: &Rc<Ui>, page: &Page, s: &Value, lists: &Value) {
         .and_downcast::<gtk::Entry>()
         .filter(|e| e.widget_name().starts_with("money-budget"))
         .map(|e| (e.widget_name().to_string(), e.text().to_string(), e.position()));
-    title(&page.head, "Plan", &format!("Budgets for {}. An empty field means no budget.", period_name(&s["period"])));
+    title(&page.head, "Plan", &format!("Budgets for {}. Leave a field empty for no budget; changes save as you leave it.", period_name(&s["period"])));
     // Removing a focused field ends its focus: that is a rebuild, not the person leaving it.
     REBUILDING.with(|r| r.set(true));
     clear(&page.body);
     REBUILDING.with(|r| r.set(false));
     let pace = &s["pace"];
-    let overall = section(&page.body, "Monthly budget", None);
-    overall.add_css_class("money-open");
     let status = text(pace, "status");
     let budget = if status == "NO_BUDGET" { 0 } else { n(pace, "budget") };
-    let detail = if budget > 0 { copy::of_budget(n(pace, "spent"), budget, &fmt) } else { String::from("No budget: Home shows what you spent") };
-    overall.append(&budget_row(ui, None, "Everything", &detail, budget, over(status), None));
     let spent: std::collections::BTreeMap<i64, Value> = rows(s, "budgets").into_iter().map(|b| (n(&b, "category_id"), b)).collect();
-    let list = section(&page.body, "By category", None);
-    list.add_css_class("money-open");
-    let categories: Vec<Value> = rows(lists, "categories")
-        .into_iter()
-        .filter(|c| text(c, "kind") == "EXPENSE" && c["archived"] != true)
-        .collect();
+    let assigned: i64 = spent.values().map(|b| n(b, "budget").max(0)).sum();
+
+    let (_, cells) = strip(&page.body);
+    cell(&cells, "plan", "Monthly budget", &if budget > 0 { fmt.format_whole(budget) } else { String::from("None") }, "everything, every month", None);
+    cell(&cells, "list", "Given to categories", &fmt.format_whole(assigned), &copy::plural(spent.values().filter(|b| n(b, "budget") > 0).count() as i64, "budget"), None);
+    let free = budget - assigned;
+    let (free_text, free_sub, free_class) = if budget == 0 {
+        (String::from("—"), String::from("set a monthly budget first"), None)
+    } else if free < 0 {
+        (fmt.format_whole(-free), String::from("categories exceed the monthly budget"), Some("money-over"))
+    } else {
+        (fmt.format_whole(free), String::from("not given to a category"), None)
+    };
+    cell(&cells, "coins", if free < 0 { "Over by" } else { "Unassigned" }, &free_text, &free_sub, free_class);
+    cell(&cells, "spend", "Spent so far", &fmt.format_whole(n(pace, "spent")), &period_name(&s["period"]), None);
+
+    let overall = card(&page.body, "Monthly budget", None);
+    let detail = if budget > 0 { copy::of_budget(n(pace, "spent"), budget, &fmt) } else { String::from("No budget: Overview shows what you spent") };
+    let fraction = if budget > 0 { n(pace, "spent") as f64 / budget as f64 } else { 0.0 };
+    overall.append(&budget_row(ui, None, "Everything", &detail, budget, tone_class(status), Some(tile("plan")), (budget > 0).then(|| (fraction, tone(status, None)))));
+
+    let list = card(&page.body, "By category", None);
+    let head = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    head.add_css_class("tally-th");
+    let caption = label("Category", "tally-th-text");
+    caption.set_hexpand(true);
+    head.append(&caption);
+    let budget_caption = label("Monthly budget", "tally-th-text");
+    budget_caption.set_xalign(1.0);
+    head.append(&budget_caption);
+    list.append(&head);
+    let categories: Vec<Value> = rows(lists, "categories").into_iter().filter(|c| text(c, "kind") == "EXPENSE" && c["archived"] != true).collect();
     if categories.is_empty() {
-        list.append(&label("No expense categories yet. Import a backup or load sample data.", "money-muted"));
+        list.append(&icon_row(&tile("list"), "No expense categories yet", "Import a backup or load sample data", "", ""));
     }
     for category in &categories {
         let id = n(category, "id");
         let reading = spent.get(&id);
         let amount = reading.map_or(0, |b| n(b, "budget"));
+        let used = reading.map_or(0, |b| n(b, "spent"));
         let detail = match reading {
             Some(b) if amount > 0 => copy::of_budget(n(b, "spent"), amount, &fmt),
-            Some(b) if n(b, "spent") > 0 => format!("{} spent, no budget", fmt.format_whole(n(b, "spent"))),
-            _ => String::new(),
+            _ if used > 0 => format!("{} spent, no budget", fmt.format_whole(used)),
+            _ => String::from("Nothing spent"),
         };
-        let badge = badge(text(category, "icon"), n(category, "color"));
-        list.append(&budget_row(
-            ui,
-            Some(id),
-            text(category, "name"),
-            &detail,
-            amount,
-            reading.is_some_and(|b| over(text(b, "status"))),
-            Some(badge),
-        ));
+        let status = reading.map_or("", |b| text(b, "status"));
+        let meter = (amount > 0).then(|| (used as f64 / amount as f64, tone(status, category["color"].as_i64())));
+        let lead = badge_sized(text(category, "icon"), n(category, "color"), 28);
+        list.append(&budget_row(ui, Some(id), text(category, "name"), &detail, amount, tone_class(status), Some(lead), meter));
     }
     if let Some((name, text, position)) = typing {
         if let Some(entry) = named(page.body.upcast_ref(), &name).and_downcast::<gtk::Entry>() {
@@ -884,44 +1039,55 @@ fn named(root: &gtk::Widget, name: &str) -> Option<gtk::Widget> {
     None
 }
 
-/// A budget line: name, reading, and the amount field that saves on Enter or on leaving it.
+/// A budget line: its mark and name over its reading, a meter of what it has used, and the
+/// amount field that saves on Enter or on leaving it.
+#[allow(clippy::too_many_arguments)]
 fn budget_row(
     ui: &Rc<Ui>,
     category: Option<i64>,
     name: &str,
     detail: &str,
     amount: i64,
-    is_over: bool,
-    badge: Option<gtk::Box>,
+    detail_class: Option<&str>,
+    lead: Option<gtk::Box>,
+    meter: Option<(f64, Tone)>,
 ) -> gtk::Box {
     let fmt = formatter();
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 14);
-    row.add_css_class("money-budget");
-    if let Some(badge) = badge {
-        row.append(&badge);
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    row.add_css_class("tally-row");
+    if let Some(lead) = lead {
+        row.append(&lead);
     }
-    let words = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    words.set_hexpand(true);
+    let words = gtk::Box::new(gtk::Orientation::Vertical, 1);
     words.set_valign(gtk::Align::Center);
-    words.append(&label(name, "money-row-title"));
-    if !detail.is_empty() {
-        let d = label(detail, "money-row-detail");
-        if is_over {
-            d.add_css_class("money-over");
-        }
-        words.append(&d);
+    words.set_size_request(200, -1);
+    let title = label(name, "money-row-title");
+    title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    words.append(&title);
+    let d = label(detail, "money-row-detail");
+    d.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    if let Some(class) = detail_class {
+        d.add_css_class(class);
     }
+    words.append(&d);
     row.append(&words);
+    let track = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    track.set_hexpand(true);
+    track.set_valign(gtk::Align::Center);
+    if let Some((fraction, tone)) = meter {
+        track.append(&meter_in(fraction, None, tone, 6));
+    }
+    row.append(&track);
     let field = gtk::Entry::new();
     field.add_css_class("money-field");
     field.set_widget_name(&match category {
         Some(id) => format!("money-budget-{id}"),
         None => String::from("money-budget-overall"),
     });
-    field.set_width_chars(10);
+    field.set_width_chars(9);
     gtk::prelude::EntryExt::set_alignment(&field, 1.0);
     field.set_valign(gtk::Align::Center);
-    field.set_placeholder_text(Some("No budget"));
+    field.set_placeholder_text(Some("None"));
     if amount > 0 {
         field.set_text(&fmt.format_input(amount));
     }
@@ -976,81 +1142,71 @@ fn budget_row(
     row
 }
 
-/// Data: import, export, sample data, erase.
-fn data(ui: &Rc<Ui>, page: &Page, summary: Option<&Value>, lists: Option<&Value>) {
-    title(&page.head, "Data", "Your ledger lives on this PC, in money.db beside Relay's own store. Nothing here leaves it.");
-    clear(&page.body);
-    let empty = summary.is_none_or(|s| s["empty"] == true);
-    if let Some(lists) = lists {
-        phones(&page.body, lists);
-    }
-    let list = section(&page.body, "Your ledger", None);
-    list.add_css_class("money-open");
-    let action = |title: &str, about: &str, caption: &str, name: &str, class: &str| {
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 20);
-        row.add_css_class("money-data-row");
-        let words = gtk::Box::new(gtk::Orientation::Vertical, 3);
-        words.set_hexpand(true);
-        words.append(&label(title, "money-row-title"));
+/// A settings row: a mark, what it is over a line about it, and its control at the end.
+fn setting_row(list: &gtk::Box, icon: &str, title: &str, about: &str, control: &impl IsA<gtk::Widget>) {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    row.add_css_class("tally-row");
+    row.add_css_class("tally-setting");
+    row.append(&tile(icon));
+    let words = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    words.set_hexpand(true);
+    words.set_valign(gtk::Align::Center);
+    words.append(&label(title, "money-row-title"));
+    if !about.is_empty() {
         let d = label(about, "money-row-detail");
         d.set_wrap(true);
-        d.set_max_width_chars(70);
+        d.set_wrap_mode(gtk::pango::WrapMode::WordChar);
         words.append(&d);
-        row.append(&words);
-        let key = button(caption, class);
-        key.set_widget_name(name);
-        key.set_valign(gtk::Align::Center);
-        row.append(&key);
-        list.append(&row);
-        key
-    };
-    let import_key = action(
-        "Import a Tally backup",
-        "The .json file Tally writes under Settings, Backup. It replaces everything on this PC, as a restore does on the phone.",
-        "Choose a backup…",
-        "money-import",
-        "money-secondary",
-    );
-    let export_key = action(
-        "Export a backup",
-        "The same file Tally reads, to keep somewhere safe or to restore on the phone.",
-        "Export…",
-        "money-export",
-        "money-secondary",
-    );
-    let account = action(
-        "Add an account",
-        "Cash, chequing, savings, credit or investment, with what it holds today. The first one also brings Tally's usual categories.",
-        "Add an account…",
-        "money-account",
-        "money-secondary",
-    );
+    }
+    row.append(&words);
+    control.set_valign(gtk::Align::Center);
+    row.append(control);
+    list.append(&row);
+}
+
+/// Data: the phone that syncs, backups, the ledger itself and its settings, in two columns.
+fn data(ui: &Rc<Ui>, page: &Page, summary: Option<&Value>, lists: Option<&Value>) {
+    title(&page.head, "Data", "Your ledger lives on this PC, in money.db beside Relay's store. Nothing here leaves it.");
+    clear(&page.body);
+    let empty = summary.is_none_or(|s| s["empty"] == true);
+    let pair = columns(&page.body, 2);
+    if let Some(lists) = lists {
+        phones(&pair[0], lists);
+    }
+    let backups = card(&pair[0], "Backups", None);
+    let import_key = button("Import…", "");
+    import_key.set_widget_name("money-import");
+    setting_row(&backups, "download", "Import a Tally backup", "The .json from Tally's Settings, Backup. Replaces everything here.", &import_key);
+    let export_key = button("Export…", "");
+    export_key.set_widget_name("money-export");
+    export_key.set_sensitive(!empty);
+    setting_row(&backups, "upload", "Export a backup", "The same file, to keep or to restore on the phone.", &export_key);
+
+    let ledger = card(&pair[1], "Ledger", None);
+    let account = button("Add…", "");
+    account.set_widget_name("money-account");
+    setting_row(&ledger, "bank", "Add an account", "Cash, chequing, savings, credit or investment. The first brings Tally's categories.", &account);
+    let sample = button("Load", "");
+    sample.set_widget_name("money-sample");
+    sample.set_sensitive(empty);
+    if !empty {
+        sample.set_tooltip_text(Some("Only into an empty ledger: erase everything first"));
+    }
+    setting_row(&ledger, "spark", "Sample household", "Something to look around with. Only into an empty ledger.", &sample);
+    let erase = button("Erase…", "money-destructive");
+    erase.set_widget_name("money-reset");
+    erase.set_sensitive(!empty);
+    setting_row(&ledger, "trash", "Erase everything", "Every entry, account, budget, bill and goal on this PC. The phone keeps its own.", &erase);
+    if let Some(summary) = summary {
+        ledger_settings(ui, &pair[1], summary);
+    }
+
     let weak = Rc::downgrade(ui);
     account.connect_clicked(move |_| {
         if let Some(ui) = weak.upgrade() {
             super::add_account(&ui);
         }
     });
-    let sample = action(
-        "Load sample data",
-        "A sample household to look around with. Only goes into an empty ledger.",
-        "Load sample",
-        "money-sample",
-        "money-secondary",
-    );
-    sample.set_sensitive(empty);
-    if !empty {
-        sample.set_tooltip_text(Some("Only into an empty ledger: erase everything first"));
-    }
-    export_key.set_sensitive(!empty);
-    let erase = action(
-        "Erase everything",
-        "Every entry, account, budget, bill and goal on this PC. Tally on the phone keeps its own.",
-        "Erase everything",
-        "money-reset",
-        "money-destructive",
-    );
-    erase.set_sensitive(!empty);
     let weak = Rc::downgrade(ui);
     import_key.connect_clicked(move |_| {
         if let Some(ui) = weak.upgrade() {
@@ -1069,9 +1225,6 @@ fn data(ui: &Rc<Ui>, page: &Page, summary: Option<&Value>, lists: Option<&Value>
             load_sample(&ui, key);
         }
     });
-    if let Some(summary) = summary {
-        ledger_settings(ui, &page.body, summary);
-    }
     let weak = Rc::downgrade(ui);
     confirm_inline(&erase, "Erase all of it", move |key| {
         let Some(ui) = weak.upgrade() else { return };
@@ -1087,12 +1240,11 @@ fn data(ui: &Rc<Ui>, page: &Page, summary: Option<&Value>, lists: Option<&Value>
 }
 
 /// The phones that sync with this ledger (`money.lists` `devices`, latest first).
-fn phones(body: &gtk::Box, lists: &Value) {
-    let list = section(body, "Your phone", None);
-    list.add_css_class("money-open");
+fn phones(column: &gtk::Box, lists: &Value) {
+    let list = card(column, "Phone sync", None);
     let devices = rows(lists, "devices");
     if devices.is_empty() {
-        list.append(&line_row("No phone syncs with this PC yet", "", "", ""));
+        list.append(&icon_row(&tile("phone"), "No phone syncs with this PC yet", "Pair from Tally's Settings with the link `relay remote pair` prints", "", ""));
     }
     for device in &devices {
         let when = crate::relative::ago(text(device, "last_sync"), crate::relative::Form::Long);
@@ -1101,64 +1253,34 @@ fn phones(body: &gtk::Box, lists: &Value) {
             name => name,
         };
         let line = match when {
-            Some(when) => format!("{name} synced {when}"),
-            None => format!("{name} has not synced yet"),
+            Some(when) => format!("Synced {when}"),
+            None => String::from("Has not synced yet"),
         };
-        list.append(&line_row(&line, "", "", ""));
+        list.append(&icon_row(&tile("phone"), name, &line, "", ""));
     }
-    let hint = label(
-        "Pair a phone from Tally's Settings, with the pairing link that \u{201c}relay remote pair\u{201d} prints on this PC. Both then keep the whole ledger and catch each other up.",
-        "money-row-detail",
-    );
-    hint.set_wrap(true);
-    hint.set_max_width_chars(80);
-    list.append(&hint);
 }
 
 /// The ledger's currency and the day its budget period starts (`money.settings.set`).
-fn ledger_settings(ui: &Rc<Ui>, body: &gtk::Box, summary: &Value) {
-    let list = section(body, "Money settings", None);
-    list.add_css_class("money-open");
-    let row = |title: &str, about: &str, control: &gtk::Widget| {
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 20);
-        row.add_css_class("money-data-row");
-        let words = gtk::Box::new(gtk::Orientation::Vertical, 3);
-        words.set_hexpand(true);
-        words.append(&label(title, "money-row-title"));
-        let d = label(about, "money-row-detail");
-        d.set_wrap(true);
-        d.set_max_width_chars(70);
-        words.append(&d);
-        row.append(&words);
-        control.set_valign(gtk::Align::Center);
-        row.append(control);
-        list.append(&row);
-    };
+fn ledger_settings(ui: &Rc<Ui>, column: &gtk::Box, summary: &Value) {
+    let list = card(column, "Settings", None);
     let currency = gtk::Entry::new();
     currency.add_css_class("money-field");
     currency.set_widget_name("money-currency");
-    currency.set_width_chars(6);
+    currency.set_width_chars(5);
     currency.set_max_length(3);
     currency.set_text(text(summary, "currency"));
     currency.update_property(&[gtk::accessible::Property::Label("Currency code")]);
-    row(
-        "Currency",
-        "The ISO code amounts are kept in, such as CAD, USD or EUR. Changing it relabels amounts; it converts nothing.",
-        currency.upcast_ref(),
-    );
+    setting_row(&list, "coins", "Currency", "An ISO code, such as CAD. Changing it relabels amounts; it converts nothing.", &currency);
     let start = gtk::SpinButton::with_range(1.0, 28.0, 1.0);
     start.add_css_class("money-field");
     start.set_widget_name("money-month-start");
     start.set_value(summary["month_start_day"].as_f64().unwrap_or(1.0));
     start.update_property(&[gtk::accessible::Property::Label("Month start day")]);
-    row(
-        "Month starts on day",
-        "For a budget that follows your pay: 15 runs each period from the 15th to the 14th.",
-        start.upcast_ref(),
-    );
-    let save = button("Save settings", "money-secondary");
+    setting_row(&list, "calendar", "Month starts on day", "To follow your pay: 15 runs each period from the 15th to the 14th.", &start);
+    let save = button("Save settings", "");
     save.set_widget_name("money-settings-save");
     save.set_halign(gtk::Align::End);
+    save.add_css_class("tally-save");
     list.append(&save);
     let weak = Rc::downgrade(ui);
     save.connect_clicked(move |key| {

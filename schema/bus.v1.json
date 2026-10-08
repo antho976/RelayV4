@@ -4,7 +4,7 @@
   "title": "RELAY v4 command bus",
   "description": "Generated from crates/relay-bus by `relay schema`. Do not edit; see docs/engine/BUS.md.",
   "version": 1,
-  "op_count": 248,
+  "op_count": 257,
   "envelope": {
     "request": {
       "$ref": "#/$defs/Request"
@@ -4578,6 +4578,24 @@
         "$ref": "#/$defs/MoneyTxPage"
       }
     },
+    "money.series": {
+      "summary": "A chart's numbers: spending, income or net by category, week, day or budget period, over one or more periods",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/MoneySeriesIn"
+      },
+      "result": {
+        "$ref": "#/$defs/MoneySeries"
+      }
+    },
     "money.tx.add": {
       "summary": "Add an expense, income or transfer",
       "kind": "mutation",
@@ -4814,6 +4832,165 @@
       },
       "result": {
         "$ref": "#/$defs/MoneySyncOut"
+      }
+    },
+    "thread.list": {
+      "summary": "Every thread, most recently used first",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 5,
+      "payload": {
+        "$ref": "#/$defs/Empty"
+      },
+      "result": {
+        "$ref": "#/$defs/ThreadListOut"
+      }
+    },
+    "thread.get": {
+      "summary": "One thread and its messages, oldest first",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 5,
+      "payload": {
+        "$ref": "#/$defs/ThreadGetIn"
+      },
+      "result": {
+        "$ref": "#/$defs/ThreadGetOut"
+      }
+    },
+    "thread.create": {
+      "summary": "Start a thread, optionally with its first message",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "thread.changed",
+        "thread.message"
+      ],
+      "since": "1.0",
+      "phase": 5,
+      "payload": {
+        "$ref": "#/$defs/ThreadCreateIn"
+      },
+      "result": {
+        "$ref": "#/$defs/ThreadView"
+      }
+    },
+    "thread.send": {
+      "summary": "Send a message in a thread; the agent answers in thread.delta and thread.message events",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "thread.changed",
+        "thread.message",
+        "thread.delta"
+      ],
+      "since": "1.0",
+      "phase": 5,
+      "payload": {
+        "$ref": "#/$defs/ThreadSendIn"
+      },
+      "result": {
+        "$ref": "#/$defs/ThreadMessage"
+      }
+    },
+    "thread.stop": {
+      "summary": "Stop the agent's reply in a thread; the next message resumes it",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "thread.changed"
+      ],
+      "since": "1.0",
+      "phase": 5,
+      "payload": {
+        "$ref": "#/$defs/ThreadIdIn"
+      },
+      "result": {
+        "$ref": "#/$defs/Empty"
+      }
+    },
+    "thread.set": {
+      "summary": "Choose a thread's model and effort; a running agent restarts with them on the next message",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "thread.changed"
+      ],
+      "since": "1.0",
+      "phase": 5,
+      "payload": {
+        "$ref": "#/$defs/ThreadSetIn"
+      },
+      "result": {
+        "$ref": "#/$defs/ThreadView"
+      }
+    },
+    "thread.rename": {
+      "summary": "Rename a thread",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "thread.changed"
+      ],
+      "since": "1.0",
+      "phase": 5,
+      "payload": {
+        "$ref": "#/$defs/ThreadRenameIn"
+      },
+      "result": {
+        "$ref": "#/$defs/ThreadView"
+      }
+    },
+    "thread.delete": {
+      "summary": "Delete a thread and its messages, stopping its agent",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "thread.changed"
+      ],
+      "since": "1.0",
+      "phase": 5,
+      "payload": {
+        "$ref": "#/$defs/ThreadIdIn"
+      },
+      "result": {
+        "$ref": "#/$defs/Empty"
       }
     }
   },
@@ -16316,6 +16493,193 @@
         "spent"
       ]
     },
+    "MoneySeriesIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "measure": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MoneySeriesMeasure"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "by": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MoneySeriesBy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "periods": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "How many budget periods, ending with `period_offset`'s: 1 to 6 (24 by period). Default 1."
+        },
+        "period_offset": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "The last period: 0 is the current one, -1 the one before."
+        },
+        "category": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Only this category, by name (any case)."
+        },
+        "cumulative": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Running totals across weeks or days, for pace."
+        },
+        "today": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The day to read the current period from; today in the engine's time zone when absent."
+        }
+      },
+      "description": "The question a chart asks. A chart keeps this, not its numbers, so it redraws when the ledger\nmoves."
+    },
+    "MoneySeriesMeasure": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "spending",
+            "income"
+          ]
+        },
+        {
+          "type": "string",
+          "const": "net",
+          "description": "Income less spending."
+        }
+      ],
+      "description": "What a chart counts."
+    },
+    "MoneySeriesBy": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "category",
+          "description": "One label per category, the largest first; each period is a series."
+        },
+        {
+          "type": "string",
+          "const": "week",
+          "description": "Week 1 is the period's first seven days; each period is a series."
+        },
+        {
+          "type": "string",
+          "const": "day",
+          "description": "Day 1 is the period's first day; each period is a series."
+        },
+        {
+          "type": "string",
+          "const": "period",
+          "description": "One label per budget period, oldest first; one series."
+        }
+      ],
+      "description": "What a chart's labels are."
+    },
+    "MoneySeries": {
+      "type": "object",
+      "properties": {
+        "currency": {
+          "type": "string"
+        },
+        "fraction_digits": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "measure": {
+          "$ref": "#/$defs/MoneySeriesMeasure"
+        },
+        "by": {
+          "$ref": "#/$defs/MoneySeriesBy"
+        },
+        "labels": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "label_colors": {
+          "type": "array",
+          "items": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "description": "Each label's category colour (Tally's palette index), when the labels are categories."
+        },
+        "series": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MoneySeriesLine"
+          }
+        }
+      },
+      "required": [
+        "currency",
+        "fraction_digits",
+        "measure",
+        "by",
+        "labels",
+        "label_colors",
+        "series"
+      ]
+    },
+    "MoneySeriesLine": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "values": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "description": "One value per label, minor units."
+        },
+        "known": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "By week or day, in the period still running: how many labels it has reached. Later ones\nhave not happened yet, so a running total stops here instead of going flat."
+        }
+      },
+      "required": [
+        "name",
+        "values"
+      ]
+    },
     "MoneyTxAddIn": {
       "type": "object",
       "additionalProperties": false,
@@ -16707,6 +17071,249 @@
         "replaced",
         "applied",
         "skipped"
+      ]
+    },
+    "ThreadListOut": {
+      "type": "object",
+      "properties": {
+        "threads": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ThreadView"
+          }
+        }
+      },
+      "required": [
+        "threads"
+      ]
+    },
+    "ThreadView": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "title": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string",
+          "description": "`claude`; the agent that answers in this thread."
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "effort": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "`low`, `medium`, `high`, `xhigh` or `max`; the provider's default when absent."
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "string"
+        },
+        "working": {
+          "type": "boolean",
+          "description": "The agent is writing a reply."
+        },
+        "live": {
+          "type": "boolean",
+          "description": "The agent is running for this thread now, so a new message costs no resume."
+        },
+        "preview": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The start of the last message, for the thread list."
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "provider",
+        "created_at",
+        "updated_at",
+        "working",
+        "live"
+      ]
+    },
+    "ThreadGetIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "after": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "Only the messages stored after this message id."
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "ThreadGetOut": {
+      "type": "object",
+      "properties": {
+        "thread": {
+          "$ref": "#/$defs/ThreadView"
+        },
+        "messages": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ThreadMessage"
+          }
+        }
+      },
+      "required": [
+        "thread",
+        "messages"
+      ]
+    },
+    "ThreadMessage": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "thread_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "role": {
+          "type": "string",
+          "description": "`user`, `assistant` (text and tool calls), `tool` (a tool's answer) or `error`."
+        },
+        "body": {
+          "description": "`{\"text\"}` for `user` and `error`; `{\"blocks\": [...]}` for `assistant`, each block\n`{\"type\":\"text\",\"text\"}` or `{\"type\":\"tool_use\",\"id\",\"name\",\"input\"}`;\n`{\"tool_use_id\",\"is_error\",\"text\"}` for `tool`."
+        },
+        "created_at": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "thread_id",
+        "role",
+        "body",
+        "created_at"
+      ]
+    },
+    "ThreadCreateIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "text": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The first message; the thread is named after it and the agent starts on it."
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "A model for this thread's agent; the provider's default when absent."
+        },
+        "effort": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "How hard it thinks: `low`, `medium`, `high`, `xhigh` or `max`; the default when absent."
+        }
+      }
+    },
+    "ThreadSendIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "text"
+      ]
+    },
+    "ThreadIdIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "ThreadSetIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The agent's model; empty or absent for the provider's default."
+        },
+        "effort": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The agent's effort; empty or absent for the default."
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "ThreadRenameIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "title"
       ]
     }
   }

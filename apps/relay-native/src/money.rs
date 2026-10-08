@@ -1,9 +1,11 @@
-//! The Money space: Tally's ledger on the PC, beside the dev workspace.
+//! The Threads space, beside the dev workspace: conversations with an agent about the person's
+//! own data, and Tally's ledger beside them (docs/THREADS.md).
 //!
-//! The space is a mode of the one window. Money's pages live in the main content stack as
-//! `money-*`; while one of them shows, the window wears `.space-money` (css/money.css) and the
-//! sidebar and title bar trade their dev keys for Money's. The ledger itself is the engine's
-//! (`money.*` ops, docs/MONEY.md); this module only reads and writes it through the bus.
+//! The space is a mode of the one window, in the dev space's own look: only the sidebar's keys
+//! and the middle change. Its pages live in the main content stack: `threads` (`threads_view.rs`)
+//! and Tally's `money-*`. The ledger and the threads are the engine's (`money.*`, `thread.*`);
+//! this module only reads and writes them through the bus. Its names still say money: the space
+//! began as Tally's.
 use crate::app::{button, clear, label, Ui};
 use gtk::prelude::*;
 use gtk4 as gtk;
@@ -17,11 +19,15 @@ use std::rc::Rc;
 mod entry;
 #[path = "money_pages.rs"]
 mod pages;
+#[path = "threads_view.rs"]
+pub(crate) mod threads;
+#[path = "threads_chart.rs"]
+mod chart;
 
-/// Money's pages, in sidebar order: (stack name, caption, glyph).
+/// Tally's pages, in tab order: (stack name, caption, glyph).
 pub const PAGES: [(&str, &str, &str); 4] = [
-    ("money-home", "Home", "home"),
-    ("money-transactions", "Transactions", "list"),
+    ("money-home", "Overview", "home"),
+    ("money-transactions", "Entries", "list"),
     ("money-plan", "Plan", "plan"),
     ("money-data", "Data", "data"),
 ];
@@ -62,7 +68,7 @@ thread_local! {
 }
 
 pub fn is_page(page: &str) -> bool {
-    page.starts_with("money-")
+    page == threads::PAGE || page.starts_with("money-")
 }
 
 /// Whether the Money space is the one showing.
@@ -99,8 +105,7 @@ pub(crate) fn set_query(query: &str) {
     STATE.with(|s| *s.query.borrow_mut() = query.to_string());
 }
 
-/// The title bar's Dev | Threads pill. Wired by [`install`]. Threads is the Money space's name
-/// while it grows into agent threads over your own data; inside, it is still Money's pages.
+/// The title bar's Dev | Threads pill. Wired by [`install`].
 pub fn switcher() -> gtk::Box {
     let pill = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     pill.add_css_class("space-switch");
@@ -111,7 +116,7 @@ pub fn switcher() -> gtk::Box {
     dev.set_tooltip_text(Some("Dev: agents, tasks and code · Ctrl `"));
     let money = gtk::ToggleButton::with_label("Threads");
     money.set_widget_name("space-money");
-    money.set_tooltip_text(Some("Threads: agents on your own data, starting with your budget · Ctrl `"));
+    money.set_tooltip_text(Some("Threads: ask about your data, with Tally beside you · Ctrl `"));
     money.set_group(Some(&dev));
     dev.set_active(true);
     pill.append(&dev);
@@ -137,7 +142,7 @@ pub fn add_key() -> gtk::Button {
     key
 }
 
-/// Money's page keys for the sidebar, hidden until the space is Money.
+/// The Threads space's sidebar: its keys and the thread list, hidden until the space shows.
 pub fn sidebar_keys() -> gtk::Box {
     let nav = gtk::Box::new(gtk::Orientation::Vertical, 1);
     nav.add_css_class("navigation");
@@ -150,13 +155,15 @@ pub fn sidebar_keys() -> gtk::Box {
 
 /// Money's pages, added to the window's content stack.
 pub fn add_pages(content: &gtk::Stack) {
+    content.add_named(&threads::page(), Some(threads::PAGE));
     for (name, _, _) in PAGES {
-        let head = gtk::Box::new(gtk::Orientation::Vertical, 16);
+        let head = gtk::Box::new(gtk::Orientation::Vertical, 4);
         head.add_css_class("money-head");
-        let body = gtk::Box::new(gtk::Orientation::Vertical, 28);
+        let body = gtk::Box::new(gtk::Orientation::Vertical, 16);
         body.add_css_class("money-body");
-        let column = gtk::Box::new(gtk::Orientation::Vertical, 24);
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 18);
         column.add_css_class("money-page");
+        column.append(&tally_tabs(name));
         column.append(&head);
         column.append(&body);
         let scroll = crate::app::scrolled(&column);
@@ -204,6 +211,29 @@ pub fn add_pages(content: &gtk::Stack) {
     }
 }
 
+/// Tally's views as Dev's segmented control, above each Tally page.
+fn tally_tabs(showing: &'static str) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    row.add_css_class("money-tabs");
+    let tabs = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    tabs.add_css_class("view-tabs");
+    tabs.set_halign(gtk::Align::Start);
+    for (name, caption, _) in PAGES {
+        let tab = button(caption, "quiet");
+        if name == showing {
+            tab.add_css_class("selected");
+        }
+        tab.connect_clicked(move |_| {
+            if let Some(ui) = threads::the_ui_pub() {
+                ui.navigate(name);
+            }
+        });
+        tabs.append(&tab);
+    }
+    row.append(&tabs);
+    row
+}
+
 /// A toast on the Money page showing now: `text`, and an Undo key when `undo` is given.
 pub(crate) fn toast(ui: &Ui, text: &str, undo: Option<Action>) {
     let Some(page) = page(&ui.page.borrow()) else {
@@ -241,31 +271,51 @@ pub fn install(ui: &Rc<Ui>, nav: &gtk::Box, add: &gtk::Button, dev_only: Vec<gtk
             });
         }
     }
-    for (name, caption, glyph) in PAGES {
-        let key = button("", "nav");
-        key.set_widget_name(&format!("nav-{name}"));
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 9);
-        row.append(&pages::glyph_image(glyph, 16));
-        row.append(&label(caption, "nav-label"));
-        key.set_child(Some(&row));
-        let weak = key.downgrade();
-        ui.content.connect_visible_child_name_notify(move |stack| {
-            if let Some(key) = weak.upgrade() {
-                if stack.visible_child_name().as_deref() == Some(name) {
-                    key.add_css_class("selected");
-                } else {
-                    key.remove_css_class("selected");
-                }
+    threads::install(ui);
+    // New thread, then Tally (its pages carry their own tabs), then the threads.
+    let new_key = button("", "nav");
+    new_key.set_widget_name("nav-new-thread");
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 9);
+    row.append(&crate::icons::image("plus", 16));
+    let caption = label("New thread", "nav-label");
+    caption.set_hexpand(true);
+    row.append(&caption);
+    // The keycap keeps its own height: a box row would stretch it to the key's.
+    let keycap = label("Ctrl N", "keycap");
+    keycap.set_valign(gtk::Align::Center);
+    row.append(&keycap);
+    new_key.set_child(Some(&row));
+    let weak = Rc::downgrade(ui);
+    new_key.connect_clicked(move |_| {
+        if let Some(ui) = weak.upgrade() {
+            threads::new_thread(&ui);
+        }
+    });
+    nav.append(&new_key);
+    let tally_key = button("", "nav");
+    tally_key.set_widget_name("nav-money-home");
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 9);
+    row.append(&pages::glyph_image("home", 16));
+    row.append(&label("Tally", "nav-label"));
+    tally_key.set_child(Some(&row));
+    let weak = Rc::downgrade(ui);
+    tally_key.connect_clicked(move |_| {
+        if let Some(ui) = weak.upgrade() {
+            ui.navigate("money-home");
+        }
+    });
+    nav.append(&tally_key);
+    let weak = tally_key.downgrade();
+    ui.content.connect_visible_child_name_notify(move |stack| {
+        if let Some(key) = weak.upgrade() {
+            if stack.visible_child_name().is_some_and(|n| n.starts_with("money-")) {
+                key.add_css_class("selected");
+            } else {
+                key.remove_css_class("selected");
             }
-        });
-        let weak = Rc::downgrade(ui);
-        key.connect_clicked(move |_| {
-            if let Some(ui) = weak.upgrade() {
-                ui.navigate(name);
-            }
-        });
-        nav.append(&key);
-    }
+        }
+    });
+    nav.append(&threads::sidebar_list());
     let weak = Rc::downgrade(ui);
     add.connect_clicked(move |_| {
         if let Some(ui) = weak.upgrade() {
@@ -331,13 +381,13 @@ fn remember(ui: &Rc<Ui>, money: bool) {
     });
 }
 
-/// Switch space: Money lands on its Home, Dev on the agent wall.
+/// Switch space: Threads lands on its threads, Dev on the agent wall.
 pub fn set_space(ui: &Rc<Ui>, money: bool) {
     dismiss_start(ui, None);
     if active() != money {
-        ui.navigate(if money { "money-home" } else { "agents" });
+        ui.navigate(if money { threads::PAGE } else { "agents" });
     } else if money && !is_page(&ui.page.borrow()) {
-        ui.navigate("money-home");
+        ui.navigate(threads::PAGE);
     }
     // A refused navigation (unsaved work in a panel) leaves the pill where the window is.
     sync_toggles();
@@ -359,16 +409,41 @@ pub(crate) fn edit_entry(ui: &Rc<Ui>, tx: Value) {
     entry::open(ui, Some(tx));
 }
 
-/// Re-reads the Money page showing, if one is.
+/// Re-reads the page of this space showing, if one is.
 pub async fn refresh(ui: &Rc<Ui>, page: &str) {
-    pages::refresh(ui, page).await;
+    if page == threads::PAGE {
+        threads::refresh(ui).await;
+    } else {
+        // The sidebar's thread list shows over Tally's pages too.
+        threads::refresh_list(ui);
+        pages::refresh(ui, page).await;
+    }
 }
 
 /// `money.changed`: the ledger moved, here or elsewhere.
 pub fn changed(ui: &Rc<Ui>) {
-    if is_page(&ui.page.borrow()) {
+    let page = ui.page.borrow().clone();
+    if page == threads::PAGE {
+        threads::refresh_panel(ui);
+        chart::refresh_all();
+    } else if is_page(&page) {
         ui.refresh_page();
     }
+}
+
+/// A Tally glyph, for the Threads page's own marks.
+pub(crate) fn pages_glyph(key: &str, size: i32) -> gtk::Image {
+    pages::glyph_image(key, size)
+}
+
+/// `thread.*`: a thread moved.
+pub fn thread_event(ui: &Rc<Ui>, ev: &str, payload: &Value) {
+    threads::event(ui, ev, payload);
+}
+
+/// Ctrl N in this space: a new thread.
+pub fn new_thread(ui: &Rc<Ui>) {
+    threads::new_thread(ui);
 }
 
 /// Entries for the command palette: (key, caption).
@@ -376,10 +451,11 @@ pub fn palette_entries() -> Vec<(&'static str, String)> {
     let mut entries = vec![
         ("space", String::from(if active() { "Switch to Dev" } else { "Switch to Threads" })),
         ("start", String::from("Start screen")),
-        ("add", String::from("Add a money entry")),
+        ("thread", String::from("New thread")),
+        ("add", String::from("Add a Tally entry")),
     ];
     for (name, caption, _) in PAGES {
-        entries.push((name, format!("Money {}", caption.to_lowercase())));
+        entries.push((name, format!("Tally {}", caption.to_lowercase())));
     }
     entries
 }
@@ -388,6 +464,7 @@ pub fn run_palette(ui: &Rc<Ui>, key: &str) {
     match key {
         "space" => toggle_space(ui),
         "start" => show_start(ui),
+        "thread" => threads::new_thread(ui),
         "add" => add_entry(ui),
         page => ui.navigate(page),
     }

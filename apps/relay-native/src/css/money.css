@@ -1,7 +1,7 @@
-/* The Money space: Tally's "Lit Ledger" (apps/tally/DESIGN.md) on the desktop.
-   Its tokens live on .space-money, which the window wears only while a Money page shows,
-   so the dev console is untouched. The switcher is shared by both; the start screen has its own
-   look, css/start.css. */
+/* The Threads space's Tally pages (money_pages.rs) and entry sheet, in the dev space's own
+   tokens (DESIGN.md): the two spaces are one app, so nothing here restyles the bars, the sidebar
+   or the switcher. Colour is kept for what it means: a category's hue, money in, over budget.
+   The start screen has its own look, css/start.css. */
 
 /* Space switcher, beside the brand. */
 .space-switch { background: @screen; border: 1px solid @edge; border-radius: 999px; padding: 2px; }
@@ -9,87 +9,58 @@
 .space-switch button:hover { color: @ink; background: @wash; }
 .space-switch button:checked, .space-switch button:checked:hover { background: @ink; color: @wall; }
 .space-switch button:checked label { color: @wall; }
-.space-money .space-switch { background: #0C0A08; border-color: #2A241F; }
-.space-money .space-switch button { color: #BFB6AA; }
-.space-money .space-switch button:hover { color: #F2EFEA; background: #221C16; }
-.space-money .space-switch button:checked, .space-money .space-switch button:checked:hover { background: #D4761F; color: #110F0C; }
-.space-money .space-switch button:checked label { color: #110F0C; }
 
-/* The window while Money shows: a warm near-black ground and its tonal ladder. */
-.space-money {
-  --m-ground: #110F0C;
-  --m-lowest: #0C0A08;
-  --m-low: #16120F;
-  --m-container: #1A1613;
-  --m-high: #221C16;
-  --m-highest: #2A231C;
-  --m-outline: #38302A;
-  --m-edge: #2A241F;
-  --m-ink: #F2EFEA;
-  --m-muted: #BFB6AA;
-  --m-ember: #D4761F;
-  --m-over: #D9534A;
-  --m-under: #6FB98A;
-}
-.space-money .topbar, .space-money .sidebar, .space-money .statusbar { background: var(--m-low); border-color: var(--m-edge); }
-.space-money .statusbar { color: var(--m-muted); }
-.space-money .sidebar-footer { border-color: var(--m-edge); }
-.space-money .brand-mark { background: var(--m-ember); color: var(--m-ground); }
-.space-money button.nav { color: var(--m-muted); border-radius: 10px; min-height: 34px; padding: 0 12px; }
-.space-money button.nav:hover { background: var(--m-high); color: var(--m-ink); }
-.space-money button.nav.selected { background: alpha(#D4761F, 0.16); color: var(--m-ember); }
-.space-money .money-nav { padding: 10px 8px; }
-.space-money .money-nav button.nav { margin-bottom: 2px; }
-.space-money button.money-add-key { background: var(--m-ember); border-color: var(--m-ember); color: var(--m-ground); border-radius: 999px; }
-.space-money button.money-add-key:hover { background: #E08A3A; border-color: #E08A3A; }
+.money-root, scrolledwindow.money-scroll, scrolledwindow.money-scroll > viewport { background: @wall; color: @ink; }
+.money-page { padding: 22px 32px 40px; }
 
-.money-root, scrolledwindow.money-scroll, scrolledwindow.money-scroll > viewport { background: var(--m-ground); color: var(--m-ink); }
-.money-page { padding: 36px 48px 72px; }
-.money-page selection { background: alpha(#D4761F, 0.35); color: #F2EFEA; }
+/* Geist throughout, as in Dev; Geist Mono for figures and labels. */
+.money-title { font-size: 22px; font-weight: 600; color: @ink; letter-spacing: -0.02em; }
+.money-context { color: @faint; font-size: 13px; }
+.money-label { font-size: 11px; font-weight: 600; letter-spacing: 0.08em; color: @faint; }
+.money-muted { color: @faint; font-size: 13px; }
+.money-row-title { font-size: 14px; color: @ink; }
+.money-row-detail { font-size: 12px; color: @faint; font-feature-settings: "tnum"; }
+.money-amount { font-family: "Geist Mono", monospace; font-size: 13px; color: @ink; font-feature-settings: "tnum"; }
+.money-in { color: @live; }
+.money-over { color: #f0786f; }
+.money-ahead { color: @waiting; }
+.money-quiet { color: @faint; }
+.money-day { font-size: 12px; font-weight: 600; color: @faint; margin-top: 6px; }
+.money-period { font-size: 14px; font-weight: 500; color: @ink; }
+.money-problem { color: #f0786f; font-size: 13px; }
 
-/* Three voices: serif for the figure or title, sans for rows, mono for labels. */
-.money-title { font-family: "Noto Serif", "DejaVu Serif", serif; font-size: 32px; font-weight: 400; color: var(--m-ink); letter-spacing: -0.01em; }
-.money-context { color: var(--m-muted); font-size: 14px; }
-.money-label { font-family: "Geist Mono", monospace; font-size: 11px; letter-spacing: 0.09em; color: var(--m-muted); }
-.money-muted { color: var(--m-muted); font-size: 14px; }
-.money-row-title { font-size: 15px; color: var(--m-ink); }
-.money-row-detail { font-size: 13px; color: var(--m-muted); font-feature-settings: "tnum"; }
-.money-amount { font-size: 15px; font-weight: 500; color: var(--m-ink); font-feature-settings: "tnum"; }
-.money-in { color: var(--m-under); }
-.money-over { color: var(--m-over); }
-.money-quiet { color: var(--m-muted); }
-.money-day { font-size: 13px; font-weight: 500; color: var(--m-muted); margin-top: 6px; }
-.money-period { font-size: 15px; font-weight: 500; color: var(--m-ink); }
-.money-problem { color: var(--m-over); font-size: 13px; }
+/* The Tally pages' own tabs, under the title. */
+.money-tabs { margin-bottom: 4px; }
 
-/* The hero: the one lit panel, what is left this period. */
-.money-hero { background: mix(#1A1613, #D4761F, 0.10); border: 1px solid alpha(#D4761F, 0.28); border-radius: 24px; padding: 26px 28px 24px; }
-.money-hero-over { background: mix(#1A1613, #D9534A, 0.11); border-color: alpha(#D9534A, 0.32); }
-.money-hero-figure { font-family: "Noto Serif", "DejaVu Serif", serif; font-size: 52px; font-weight: 400; color: var(--m-ink); font-feature-settings: "tnum"; letter-spacing: -0.02em; }
-.money-hero-line { font-size: 15px; color: var(--m-ink); margin-top: 10px; }
-.money-pace-line { font-size: 14px; color: var(--m-muted); }
-.money-tile { background: var(--m-container); border: 1px solid var(--m-edge); border-radius: 18px; padding: 16px 18px; }
-.money-tile-figure { font-family: "Noto Serif", "DejaVu Serif", serif; font-size: 22px; color: var(--m-ink); font-feature-settings: "tnum"; }
+/* The hero: what is left this period. */
+.money-hero { background: @slab; border: 1px solid @edge; border-radius: 14px; padding: 22px 24px 20px; }
+.money-hero-over { border-color: alpha(#f0786f, 0.45); }
+.money-hero-ahead { border-color: alpha(@waiting, 0.35); }
+.money-hero-figure { font-size: 40px; font-weight: 600; color: @ink; font-feature-settings: "tnum"; letter-spacing: -0.03em; }
+.money-hero-line { font-size: 14px; color: @ink; margin-top: 8px; }
+.money-pace-line { font-size: 13px; color: @faint; }
+.money-tile { background: @slab; border: 1px solid @edge; border-radius: 14px; padding: 14px 16px; }
+.money-tile-figure { font-family: "Geist Mono", monospace; font-size: 18px; color: @ink; font-feature-settings: "tnum"; }
 .money-worth { padding: 14px 4px 0; }
-.money-worth-figure { font-family: "Noto Serif", "DejaVu Serif", serif; font-size: 26px; color: var(--m-ink); font-feature-settings: "tnum"; }
+.money-worth-figure { font-family: "Geist Mono", monospace; font-size: 22px; color: @ink; font-feature-settings: "tnum"; }
 
-/* Sections: a mono name and air, no box around what cannot be clicked. */
 .money-section > box:first-child { min-height: 28px; }
 .money-open { margin: 0 2px; }
 .money-open > .money-line, .money-open > .money-budget, .money-open > box > .money-line { padding: 10px 0; }
 .money-open > .money-data-row { padding: 14px 0; }
 .money-budget { padding: 10px 0; }
 
-/* Tappable slabs: a group cut into rows by 2px seams, rounded only at its ends. */
-.money-group > .money-row { background: var(--m-high); border-radius: 4px; }
-.money-group > .money-row:first-child { border-top-left-radius: 16px; border-top-right-radius: 16px; }
-.money-group > .money-row:last-child { border-bottom-left-radius: 16px; border-bottom-right-radius: 16px; }
-.money-row:hover { background: #2A231C; }
-button.money-row-key { background: transparent; border: 0; box-shadow: none; padding: 12px 18px; min-height: 40px; border-radius: inherit; color: var(--m-ink); }
+/* Rows: one card cut into rows, like Dev's lists. */
+.money-group { background: @slab; border: 1px solid @edge; border-radius: 14px; }
+.money-group > .money-row { border-top: 1px solid @line_subtle; }
+.money-group > .money-row:first-child { border-top: 0; border-top-left-radius: 14px; border-top-right-radius: 14px; }
+.money-group > .money-row:last-child { border-bottom-left-radius: 14px; border-bottom-right-radius: 14px; }
+.money-row:hover { background: @wash; }
+button.money-row-key { background: transparent; border: 0; box-shadow: none; padding: 10px 16px; min-height: 40px; border-radius: inherit; color: @ink; }
 button.money-row-key:hover { background: transparent; }
-button.money-row-key:focus-visible { outline: 2px solid #D4761F; outline-offset: -2px; }
-button.money-row-delete { margin: 0 10px 0 0; color: var(--m-muted); border-radius: 10px; }
-button.money-row-delete:hover { color: var(--m-over); background: alpha(#D9534A, 0.12); }
+button.money-row-key:focus-visible { outline: 2px solid alpha(@ink, 0.35); outline-offset: -2px; }
+button.money-row-delete { margin: 0 8px 0 0; color: @faint; border: 0; background: transparent; border-radius: 10px; }
+button.money-row-delete:hover { color: #f0786f; background: alpha(#f0786f, 0.12); }
 
 /* A category's glyph in its hue, on a 15% wash of it. */
 .money-badge { min-width: 34px; min-height: 34px; border-radius: 10px; }
@@ -106,49 +77,82 @@ button.money-row-delete:hover { color: var(--m-over); background: alpha(#D9534A,
 .money-badge.hue-10 { color: #8D99A6; background: alpha(#8D99A6, 0.15); }
 .money-badge.hue-11 { color: #B8664F; background: alpha(#B8664F, 0.15); }
 
-/* Actions: one hero action at most, secondary slabs, text actions in the accent. */
-button.money-text-action { background: transparent; border: 0; box-shadow: none; color: #D4761F; font-family: "Geist Mono", monospace; font-size: 12px; letter-spacing: 0.04em; padding: 2px 6px; min-height: 26px; }
-button.money-text-action:hover { background: alpha(#D4761F, 0.12); border-radius: 8px; }
-.money-root button.primary.money-hero-action, .money-sheet button.primary.money-hero-action { background: #D4761F; border-color: #D4761F; color: #110F0C; border-radius: 12px; min-height: 40px; padding: 0 20px; font-family: "Geist Mono", monospace; font-weight: 700; font-size: 13px; }
-.money-root button.primary.money-hero-action:hover, .money-sheet button.primary.money-hero-action:hover { background: #E08A3A; border-color: #E08A3A; }
-button.money-secondary, button.money-destructive { background: #221C16; border: 0; color: #F2EFEA; border-radius: 12px; min-height: 40px; padding: 0 18px; font-family: "Geist Mono", monospace; font-size: 13px; box-shadow: none; }
-button.money-secondary:hover, button.money-destructive:hover { background: #2A231C; }
-button.money-destructive { color: #D9534A; }
-button.money-secondary:disabled, button.money-destructive:disabled { color: alpha(#BFB6AA, 0.45); background: #1A1613; }
-button.money-destructive.confirm-armed { background: #D9534A; color: #110F0C; }
-button.money-chrome { background: #221C16; border-radius: 999px; min-width: 34px; min-height: 34px; color: #F2EFEA; }
-button.money-chrome:hover { background: #2A231C; }
-button.money-chrome:disabled { color: alpha(#BFB6AA, 0.4); }
+/* Actions: Dev's keys. The hero action is Dev's primary key. */
+button.money-text-action { background: transparent; border: 0; box-shadow: none; color: @secondary; font-size: 12px; font-weight: 500; padding: 2px 8px; min-height: 26px; }
+button.money-text-action:hover { background: @wash; color: @ink; border-radius: 8px; }
+.money-root button.primary.money-hero-action, .money-sheet button.primary.money-hero-action { min-height: 36px; padding: 0 16px; }
+button.money-secondary, button.money-destructive { min-height: 34px; padding: 0 14px; }
+button.money-destructive { color: #f0786f; }
+button.money-destructive.confirm-armed { background: @held; border-color: @held; color: @wall; }
+button.money-chrome { border-radius: 10px; min-width: 32px; min-height: 32px; }
 
-/* Fields: warm slabs with an ember caret and focus. */
-.space-money entry.money-field, .space-money entry.money-search, .money-sheet entry, .money-sheet spinbutton, .space-money spinbutton.money-field { background: #221C16; color: #F2EFEA; caret-color: #D4761F; border: 1px solid transparent; border-radius: 12px; min-height: 36px; padding: 0 12px; }
-.space-money entry.money-field:focus-within, .space-money entry.money-search:focus-within, .money-sheet entry:focus-within, .space-money spinbutton.money-field:focus-within { border-color: #D4761F; }
-.space-money entry.money-field.error, .money-sheet entry.error { border-color: #D9534A; }
-.space-money entry.money-field, .space-money spinbutton.money-field { font-feature-settings: "tnum"; }
-.money-suffix { font-family: "Geist Mono", monospace; font-size: 12px; letter-spacing: 0.06em; color: #BFB6AA; }
+/* Fields: Dev's raised fields. */
+.money-root entry.money-field, .money-root entry.money-search, .money-sheet entry, .money-sheet spinbutton, .money-root spinbutton.money-field { background: @raised; color: @ink; border: 1px solid @strong; border-radius: 10px; min-height: 34px; padding: 0 10px; }
+.money-root entry.money-field:focus-within, .money-root entry.money-search:focus-within, .money-sheet entry:focus-within, .money-root spinbutton.money-field:focus-within { border-color: @line_focus; }
+.money-root entry.money-field.error, .money-sheet entry.error { border-color: @held; }
+.money-root entry.money-field, .money-root spinbutton.money-field { font-feature-settings: "tnum"; }
+.money-suffix { font-family: "Geist Mono", monospace; font-size: 12px; color: @faint; }
 
 /* The entry sheet. */
-.money-sheet.app-panel { background: #16120F; border-left: 1px solid #2A241F; color: #F2EFEA; }
+.money-sheet.app-panel { background: @console; border-left: 1px solid @edge; color: @ink; }
 .money-sheet .panel-heading { padding: 18px 22px 6px; }
-.money-sheet .section-title { font-family: "Noto Serif", "DejaVu Serif", serif; font-size: 24px; font-weight: 400; color: #F2EFEA; }
+.money-sheet .section-title { font-size: 18px; font-weight: 600; color: @ink; }
 .money-sheet .panel-body { padding: 10px 22px 24px; }
 .money-sheet .panel-body > * { margin-bottom: 8px; }
-.money-segments { background: #0C0A08; border-radius: 12px; padding: 3px; }
-.money-segments button { background: transparent; border: 0; box-shadow: none; border-radius: 10px; min-height: 34px; color: #BFB6AA; font-size: 14px; }
-.money-segments button:checked { background: #2A231C; color: #F2EFEA; }
-.money-sheet entry.money-amount-field { font-family: "Noto Serif", "DejaVu Serif", serif; font-size: 34px; min-height: 64px; font-feature-settings: "tnum"; }
-.money-picker > button, menubutton.money-picker > button { background: #221C16; color: #F2EFEA; border: 0; border-radius: 12px; min-height: 36px; padding: 0 12px; box-shadow: none; }
-.money-picker > button:hover, menubutton.money-picker > button:hover { background: #2A231C; }
+.money-segments { background: @slab; border: 1px solid @edge; border-radius: 12px; padding: 3px; }
+.money-segments button { background: transparent; border: 0; box-shadow: none; border-radius: 9px; min-height: 28px; color: @faint; font-size: 13px; }
+.money-segments button:checked { background: @track; color: @ink; }
+.money-sheet entry.money-amount-field { font-family: "Geist Mono", monospace; font-size: 28px; min-height: 56px; font-feature-settings: "tnum"; }
+.money-picker > button, menubutton.money-picker > button { min-height: 34px; padding: 0 10px; }
 .money-picker stack, .money-picker box { background: transparent; }
-.money-sheet checkbutton { color: #BFB6AA; }
+.money-sheet checkbutton { color: @secondary; }
 .money-sheet-actions { margin-top: 12px; }
 
 /* The Undo toast. */
-.money-toast { background: #2A231C; color: #F2EFEA; border-radius: 14px; padding: 8px 10px 8px 18px; box-shadow: 0 6px 18px alpha(black, 0.45); font-size: 14px; }
+.money-toast { background: @slab; border: 1px solid @strong; color: @ink; border-radius: 12px; padding: 6px 8px 6px 16px; box-shadow: 0 6px 18px alpha(black, 0.45); font-size: 13px; }
 
 /* Empty state. */
 .money-empty { padding: 36px 0; }
-.money-empty-title { font-family: "Noto Serif", "DejaVu Serif", serif; font-size: 26px; color: #F2EFEA; }
+.money-empty-title { font-size: 20px; font-weight: 600; color: @ink; }
 
-.money-controls { margin-top: 4px; }
+.money-controls { margin-top: 10px; }
 .money-data-row { padding: 14px 0; }
+
+/* Cards, strips and rows (money_pages.rs): one card per subject, its rows inside it, a strip of
+   figures at the top of each page. Rows carry their own inner padding, so nothing meets an edge. */
+.tally-card { background: @slab; border: 1px solid @edge; border-radius: 14px; padding: 2px 0 6px; }
+.tally-card-head { padding: 10px 16px 4px; min-height: 28px; }
+.tally-card-title { font-size: 13px; font-weight: 600; color: @ink; }
+.tally-rows > .tally-row, .tally-rows > box.tally-row { padding: 8px 16px; min-height: 34px; border-top: 1px solid @line_subtle; }
+.tally-rows > .tally-row:first-child, .tally-rows > .tally-day + .tally-row, .tally-rows > .tally-th + .tally-row { border-top: 0; }
+.tally-rows > box.tally-entry { padding: 0; }
+.tally-entry > button.money-row-key { padding: 7px 8px 7px 16px; min-height: 34px; border-radius: 0; }
+.tally-entry:hover { background: @wash; }
+.tally-rows > .tally-entry:last-child { border-bottom-left-radius: 13px; border-bottom-right-radius: 13px; }
+.tally-entry button.money-row-delete { opacity: 0; margin-right: 10px; }
+.tally-entry:hover button.money-row-delete, .tally-entry button.money-row-delete:focus-visible { opacity: 1; }
+.tally-day { padding: 12px 46px 4px 16px; border-top: 1px solid @line_subtle; }
+.tally-rows > .tally-day:first-child { border-top: 0; padding-top: 4px; }
+.tally-day-name { font-size: 12px; font-weight: 600; color: @secondary; }
+.tally-day-total { font-family: "Geist Mono", monospace; font-size: 11.5px; color: @secondary; min-width: 84px; }
+.tally-th { padding: 2px 16px 6px; }
+.tally-th-text { font-size: 11px; font-weight: 600; letter-spacing: 0.06em; color: @faint; }
+.tally-setting { padding: 10px 16px; }
+button.tally-save { margin: 8px 16px 4px; }
+.tally-total { padding: 10px 16px 4px; border-top: 1px solid @edge; }
+.tally-total-figure { font-family: "Geist Mono", monospace; font-size: 13px; font-weight: 600; color: @ink; font-feature-settings: "tnum"; }
+.tally-soon .money-row-detail { color: @waiting; }
+.tally-tile { min-width: 28px; min-height: 28px; border-radius: 8px; background: @wash; color: @secondary; }
+.money-badge-small { min-width: 28px; min-height: 28px; border-radius: 8px; }
+
+.tally-strip { background: @slab; border: 1px solid @edge; border-radius: 14px; padding: 16px 0; }
+.tally-cell { padding: 0 20px; }
+.tally-rule { background: @line_subtle; min-width: 1px; margin: 2px 0; }
+.tally-cell-icon { color: @faint; }
+.tally-cell-caption { font-size: 12px; color: @faint; }
+.tally-cell-figure { margin-top: 2px; font-size: 22px; font-weight: 600; letter-spacing: -0.02em; color: @ink; font-feature-settings: "tnum"; }
+.tally-cell-sub { font-size: 12px; color: @faint; }
+.tally-pace { margin: 0 20px; padding-top: 14px; border-top: 1px solid @line_subtle; }
+.tally-figures { font-family: "Geist Mono", monospace; font-size: 11.5px; color: @secondary; font-feature-settings: "tnum"; }
+.tally-left { font-family: "Geist Mono", monospace; font-size: 11.5px; color: @faint; font-feature-settings: "tnum"; }
+.money-empty { padding: 24px; }

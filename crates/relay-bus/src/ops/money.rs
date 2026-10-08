@@ -8,6 +8,7 @@
 use crate::registry::{Actors, OpMeta, Scope};
 use crate::{op, Empty};
 use relay_money::model::{AccountType, TxType};
+use relay_money::series::{Series, SeriesQuery};
 use relay_money::views::{AccountView, Change, Lists, Settings, Summary, SyncOut, Tx, TxPage};
 
 payload!(#[schemars(rename = "MoneySummaryIn")] SummaryIn {
@@ -28,6 +29,8 @@ payload!(#[schemars(rename = "MoneyTxListIn")] TxListIn {
     pub today: Option<String>,
 });
 op!(TxList, "money.tx.list", TxListIn => TxPage, OpMeta::query(Scope::Global, 12, "One budget period's entries, newest first"));
+op!(SeriesOp, "money.series", SeriesQuery => Series,
+    OpMeta::query(Scope::Global, 12, "A chart's numbers: spending, income or net by category, week, day or budget period, over one or more periods"));
 payload!(#[schemars(rename = "MoneyTxAddIn")] TxAddIn {
     pub r#type: TxType, pub amount: i64, pub date: String, pub account_id: i64,
     /// Transfers only: the account the money goes to.
@@ -96,4 +99,4 @@ payload!(#[schemars(rename = "MoneySyncIn")] SyncIn {
 op!(Sync, "money.sync", SyncIn => SyncOut,
     OpMeta::mutation(Scope::Global, 12, "Tally's two-way sync (docs/MONEY.md): apply the phone's changes, newest edit winning per row, and answer with the PC's changes since the phone's cursor").actors(Actors::UserOnly).emits(&["money.changed"]));
 
-entries!(SummaryOp, ListsOp, TxList, TxAdd, TxUpdate, TxDelete, TxRestore, BudgetSet, AccountAdd, SettingsSet, Import, Export, Sample, Reset, Sync);
+entries!(SummaryOp, ListsOp, TxList, SeriesOp, TxAdd, TxUpdate, TxDelete, TxRestore, BudgetSet, AccountAdd, SettingsSet, Import, Export, Sample, Reset, Sync);

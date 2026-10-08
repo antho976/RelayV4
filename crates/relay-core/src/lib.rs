@@ -32,6 +32,7 @@ mod shell;
 pub mod skills;
 pub mod socket;
 pub mod store;
+pub mod threads;
 pub mod time;
 pub mod usage;
 pub mod watch;
