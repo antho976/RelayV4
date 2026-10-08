@@ -22,61 +22,80 @@
 /* The workspace strip above the wall is one layer over the page, not a second slab. */
 .code-bar.workspace-strip { background: transparent; }
 
-/* Status bar: compact meters, then when they were last read and a refresh key. */
-.statusbar .usage-group { margin: 0 1px; }
-.statusbar .usage-name { color: @secondary; font-size: 11px; font-weight: 500; margin-right: 2px; }
-.statusbar .usage-caption { color: @faint; font-family: 'Geist', sans-serif; font-size: 11px; font-weight: 600; letter-spacing: 0.04em; margin-left: 4px; }
-.statusbar .usage-value { color: @secondary; font-family: 'Geist Mono', monospace; font-size: 11px; min-width: 28px; }
-.usage-meter trough { min-width: 34px; min-height: 4px; border-radius: 0; background: alpha(@ink, 0.12); border: 0; }
-.usage-meter progress { min-width: 0; min-height: 4px; border-radius: 0; background: @secondary; }
-.usage-meter.warn progress, .usage-bar.warn progress { background: @waiting; }
-.usage-meter.hot progress, .usage-bar.hot progress { background: @held; }
-.usage-meter.stale progress, .usage-bar.stale progress { background: @faint; }
-.statusbar .usage-value.warn { color: @waiting; }
-.statusbar .usage-value.hot { color: @held; }
-.statusbar .usage-value.stale { color: @faint; }
-.usage-strip { margin-left: -4px; }
-.statusbar .usage-age { color: @faint; font-size: 11px; margin-left: 2px; }
-.statusbar .usage-age.failed { color: @waiting; }
-.statusbar button.usage-refresh { min-width: 21px; min-height: 21px; padding: 0; }
-.statusbar button.usage-refresh image { color: @faint; }
-.statusbar button.usage-refresh:hover image { color: @ink; }
+.usage-bar.warn progress { background: @waiting; }
+.usage-bar.hot progress { background: @held; }
+.usage-bar.stale progress { background: @faint; }
 
-/* Popup: readable over any wallpaper, a restrained lift, sections divided by hairlines. */
-.usage-panel { background: @backbox_chrome; box-shadow: 0 10px 28px rgba(0, 0, 0, 0.42); }
-.usage-panel .panel-heading button.icon-key { min-width: 24px; min-height: 24px; }
-.usage-panel .panel-body.usage-body { padding: 0; }
-.usage-checked { padding: 12px 16px 10px; color: @faint; font-size: 11px; }
-.usage-provider { padding: 14px 16px 16px; border-top: 1px solid @edge; }
-.usage-provider-head { min-height: 18px; }
+/* The panel beside the card, in Settings' vocabulary: a rounded floating sheet, one rounded
+   card per provider, rounded meters, Settings' switches and pill-segmented choices. */
+.usage-panel.floating-panel { border: 1px solid alpha(@ink, 0.09); border-radius: 16px; background: @backbox_chrome; box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45); }
+.usage-panel .panel-heading { min-height: 46px; padding: 0 10px 0 18px; border-bottom: 0; }
+.usage-panel .panel-heading .section-title { color: @ink; font-size: 14px; font-weight: 600; letter-spacing: -0.005em; }
+.usage-panel .panel-heading button.icon-key { min-width: 28px; min-height: 28px; border-radius: 8px; color: @faint; }
+.usage-panel .panel-heading button.icon-key:hover { background: alpha(@ink, 0.06); color: @ink; }
+.usage-panel .panel-body.usage-body { padding: 0 12px 12px; }
+.usage-checked { padding: 0 6px 12px; color: @faint; font-size: 12px; }
+.usage-providers { margin-bottom: 4px; }
+.usage-provider { margin-bottom: 8px; padding: 14px 16px 16px; border: 1px solid alpha(@ink, 0.08); border-radius: 12px; background: alpha(@ink, 0.03); }
+.usage-provider-head { min-height: 20px; }
 .usage-provider-head image { color: @secondary; }
-.usage-provider-name { font-size: 13px; font-weight: 600; color: @ink; }
-.usage-reported { color: @faint; font-size: 11px; }
-.usage-row { margin-top: 2px; }
+.usage-provider-name { font-size: 14px; font-weight: 600; color: @ink; }
+.usage-reported { color: @faint; font-size: 12px; }
+.usage-row { margin-top: 4px; }
 .usage-row.missing { min-height: 22px; }
-.usage-row-title { color: @secondary; font-size: 12px; }
+.usage-row-title { color: @secondary; font-size: 13px; }
 .usage-row.missing .usage-row-title { color: @faint; }
-.usage-pct { font-family: 'Geist Mono', monospace; font-size: 20px; font-weight: 500; color: @ink; line-height: 1; }
+.usage-pct { font-size: 18px; font-weight: 600; font-feature-settings: "tnum"; letter-spacing: -0.01em; color: @ink; line-height: 1; }
 .usage-pct.warn { color: @waiting; }
 .usage-pct.hot { color: @held; }
 .usage-pct.stale { color: @faint; }
-.usage-bar trough { min-height: 6px; border-radius: 0; border: 0; background: alpha(@ink, 0.10); }
-.usage-bar progress { min-height: 6px; border-radius: 0; border: 0; background-image: none; box-shadow: none; background: @ink; }
-.usage-reset { color: @faint; font-size: 11px; }
+.usage-bar trough { min-height: 5px; border-radius: 999px; border: 0; background: alpha(@ink, 0.1); }
+.usage-bar progress { min-height: 5px; border-radius: 999px; border: 0; background-image: none; box-shadow: none; background: @ink; }
+.usage-reset { color: @faint; font-size: 12px; }
 .usage-reset.stale { color: @secondary; }
-.usage-note { color: @secondary; font-size: 12px; padding: 2px 0; }
-.usage-providers > .usage-note { padding: 14px 16px; border-top: 1px solid @edge; }
+.usage-note { color: @secondary; font-size: 13px; padding: 2px 0; }
+.usage-providers > .usage-note { margin-bottom: 8px; padding: 14px 16px; border: 1px solid alpha(@ink, 0.08); border-radius: 12px; }
 
-.usage-options { padding: 14px 16px 16px; border-top: 1px solid @edge; background: alpha(@wall, 0.45); }
-.usage-options-title { color: @ink; font-size: 12px; font-weight: 600; margin-bottom: 2px; }
-.usage-option-row { min-height: 30px; }
-.usage-option-name { color: @ink; font-size: 12px; }
+.usage-options { margin-top: 10px; }
+.usage-options-title { padding: 0 6px; color: @secondary; font-size: 13px; font-weight: 600; }
+.usage-options-card { border: 1px solid alpha(@ink, 0.08); border-radius: 12px; background: alpha(@ink, 0.03); }
+.usage-option-row { min-height: 34px; padding: 10px 12px 10px 16px; }
+.usage-option-row + .usage-option-row { border-top: 1px solid alpha(@ink, 0.07); }
+.usage-option-name { color: @ink; font-size: 13px; font-weight: 500; }
 .usage-option-row:disabled .usage-option-name { color: @faint; }
-.usage-chips { border: 1px solid @strong; border-radius: 2px; }
-.usage-chips button.usage-chip { min-height: 24px; padding: 0 8px; border: 0; border-left: 1px solid @strong; border-radius: 0; background: @console; color: @secondary; font-family: 'Geist', sans-serif; font-size: 11px; letter-spacing: 0.04em; }
-.usage-chips button.usage-chip:first-child { border-left: 0; }
-.usage-chips button.usage-chip:hover { background: @wash; color: @ink; }
-.usage-chips button.usage-chip:checked { background: @ink; color: @wall; }
-.usage-chips button.usage-chip:checked label { color: @wall; }
+.usage-chips { padding: 2px; border: 1px solid alpha(@ink, 0.07); border-radius: 9px; background: alpha(@ink, 0.03); }
+.usage-chips button.usage-chip { min-height: 24px; padding: 0 9px; border: 0; border-radius: 7px; background: transparent; box-shadow: none; color: @faint; font-size: 12px; font-weight: 500; }
+.usage-chips button.usage-chip label { color: @faint; }
+.usage-chips button.usage-chip:hover label { color: @secondary; }
+.usage-chips button.usage-chip:checked { background: alpha(@ink, 0.1); }
+.usage-chips button.usage-chip:checked label { color: @ink; }
 .usage-chips:disabled { opacity: 0.45; }
-.usage-footnote { padding: 10px 16px 14px; border-top: 1px solid @edge; color: @faint; font-size: 11px; }
+.usage-footnote { padding: 12px 6px 0; color: @faint; font-size: 11.5px; }
+
+/* The sidebar's card, above you at the foot: one provider, its meters as thin rounded bars. */
+/* It sits on the sidebar, which is already translucent: a faint veil, not a second slab. */
+.usage-card { margin-bottom: 10px; padding: 10px 10px 12px 12px; border: 1px solid alpha(@ink, 0.08); border-radius: 14px; background: alpha(@ink, 0.025); }
+.usage-card-tabs { padding: 3px; border: 1px solid alpha(@ink, 0.07); border-radius: 10px; background: alpha(@ink, 0.03); }
+.usage-card-tabs button { min-height: 26px; padding: 0 14px; border: 0; border-radius: 7px; background: transparent; color: @faint; font-size: 13px; font-weight: 500; }
+.usage-card-tabs button label { color: @faint; }
+.usage-card-tabs button:hover { background: transparent; }
+.usage-card-tabs button:hover label { color: @secondary; }
+.usage-card-tabs button:checked { background: alpha(@ink, 0.09); }
+.usage-card-tabs button:checked label { color: @ink; }
+.usage-card-head button.icon-key { min-width: 26px; min-height: 26px; color: @faint; }
+.usage-card-head button.icon-key:hover { color: @ink; }
+.usage-card-body { padding-right: 2px; }
+.usage-card-caption { margin: 14px 0 2px; color: @faint; font-size: 12px; }
+.usage-card-row { margin-top: 12px; }
+.usage-card-title { color: @secondary; font-size: 13px; }
+.usage-card-pct { color: @secondary; font-family: 'Geist Mono', monospace; font-size: 12px; }
+.usage-card-pct.warn { color: @waiting; }
+.usage-card-pct.hot { color: @held; }
+.usage-card-pct.stale { color: @faint; }
+.usage-card-bar trough { min-height: 4px; border: 0; border-radius: 999px; background: alpha(@ink, 0.1); }
+.usage-card-bar progress { min-height: 4px; border: 0; border-radius: 999px; background-image: none; box-shadow: none; background: @ink; }
+.usage-card-bar.warn progress { background: @waiting; }
+.usage-card-bar.hot progress { background: @held; }
+.usage-card-bar.stale progress { background: @faint; }
+.usage-card-caption.failed { color: @waiting; }
+.usage-card-reset { margin-top: 14px; color: @faint; font-size: 12px; }

@@ -8,7 +8,7 @@ pub const DEFAULTS: [(&str, &str, &str); 8] = [
     ("new_session", "New session", "Ctrl+N"),
     ("settings", "Settings", "Ctrl+,"),
     ("sidebar", "Toggle sidebar", "Ctrl+Shift+B"),
-    ("space", "Switch between Dev and Money", "Ctrl+`"),
+    ("space", "Switch between Dev and Threads", "Ctrl+`"),
 ];
 
 fn parse(chord: &str) -> Option<(ModifierType, char)> {

@@ -519,6 +519,13 @@ impl Editor {
                 editor.toggle_git();
             }
         });
+        // Files and Git open beside the view rather than replacing it, so their keys show
+        // "open" (a lighter mark than the lit view) while their panel is up.
+        for (panel, key) in [(editor.file_sidebar.clone(), files_button), (editor.git.clone(), git_button)] {
+            panel.connect_visible_notify(move |panel| {
+                if panel.is_visible() { key.add_css_class("open") } else { key.remove_css_class("open") }
+            });
+        }
         let weak = Rc::downgrade(&editor);
         let agents_tab = agents_button.clone();
         editor

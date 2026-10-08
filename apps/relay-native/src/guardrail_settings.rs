@@ -451,10 +451,11 @@ pub fn editor(ui: &Rc<Ui>) -> gtk::Box {
 
 /// Build the editor. The returned widget keeps the editor alive; nothing else needs to.
 fn build(ui: &Rc<Ui>, scope: Scope) -> (gtk::Box, Weak<Editor>) {
-    let root = gtk::Box::new(gtk::Orientation::Vertical, 14);
+    use crate::tools::settings::{card, row, section};
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     root.add_css_class("guardrail-editor");
 
-    let picker = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let picker = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     picker.add_css_class("guardrail-scope");
     let toggles: Vec<gtk::ToggleButton> = ["Global", "Workspace", "Project"]
         .iter()
@@ -465,7 +466,7 @@ fn build(ui: &Rc<Ui>, scope: Scope) -> (gtk::Box, Weak<Editor>) {
         })
         .collect();
     let keys = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    keys.add_css_class("linked");
+    keys.add_css_class("settings-segmented");
     for toggle in &toggles {
         if toggle != &toggles[0] {
             toggle.set_group(Some(&toggles[0]));
@@ -474,35 +475,38 @@ fn build(ui: &Rc<Ui>, scope: Scope) -> (gtk::Box, Weak<Editor>) {
     }
     picker.append(&keys);
     let target = gtk::DropDown::from_strings(&[] as &[&str]);
-    target.set_hexpand(true);
+    target.add_css_class("settings-select");
     target.add_css_class("guardrail-target");
+    target.set_size_request(200, -1);
     picker.append(&target);
-    root.append(&picker);
-    let note = label("", "faint");
-    note.set_wrap(true);
+    let scope_section = section(&root, "Applies to", None::<&gtk::Widget>);
+    let scope_card = card(&scope_section);
+    let (_, note) = row(&scope_card, "Level", "", Some(&picker));
     note.add_css_class("guardrail-scope-note");
-    root.append(&note);
+    note.set_visible(true);
 
     let mut built = Vec::new();
     for (group, specs) in GROUPS {
-        let block = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let block = section(&root, group, None::<&gtk::Widget>);
+        let block = card(&block);
         block.add_css_class("guardrail-group");
-        block.append(&label(&group.to_uppercase(), "section-label"));
         for spec in specs.iter() {
-            let row = gtk::Box::new(gtk::Orientation::Vertical, 6);
+            let row = gtk::Box::new(gtk::Orientation::Vertical, 12);
+            row.add_css_class("settings-row");
             row.add_css_class("guardrail-field");
-            let line = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-            let copy = gtk::Box::new(gtk::Orientation::Vertical, 2);
+            let line = gtk::Box::new(gtk::Orientation::Horizontal, 16);
+            let copy = gtk::Box::new(gtk::Orientation::Vertical, 4);
             copy.set_hexpand(true);
-            copy.append(&label(spec.title, "body"));
-            let hint = label(spec.hint, "faint");
+            copy.set_valign(gtk::Align::Center);
+            copy.append(&label(spec.title, "settings-row-title"));
+            let hint = label(spec.hint, "settings-row-hint");
             hint.set_wrap(true);
             copy.append(&hint);
             let source = label("", "guardrail-source");
             source.set_wrap(true);
             copy.append(&source);
             line.append(&copy);
-            let reset = button("Reset", "quiet");
+            let reset = button("Reset", "settings-link");
             reset.set_valign(gtk::Align::Center);
             reset.set_visible(false);
             let input = match spec.kind {
@@ -521,8 +525,10 @@ fn build(ui: &Rc<Ui>, scope: Scope) -> (gtk::Box, Weak<Editor>) {
                     let view = gtk::TextView::new();
                     view.set_monospace(true);
                     view.set_wrap_mode(gtk::WrapMode::WordChar);
-                    view.set_top_margin(6);
-                    view.set_bottom_margin(6);
+                    view.set_top_margin(8);
+                    view.set_bottom_margin(8);
+                    view.set_left_margin(10);
+                    view.set_right_margin(10);
                     Input::List(view)
                 }
             };
@@ -536,10 +542,11 @@ fn build(ui: &Rc<Ui>, scope: Scope) -> (gtk::Box, Weak<Editor>) {
             match &input {
                 Input::Spin(spin) => {
                     spin.set_valign(gtk::Align::Center);
-                    spin.set_width_chars(10);
+                    spin.set_width_chars(8);
                     line.append(spin);
                 }
                 Input::Switch(switch) => {
+                    switch.add_css_class("settings-switch");
                     switch.set_valign(gtk::Align::Center);
                     line.append(switch);
                 }
@@ -551,22 +558,23 @@ fn build(ui: &Rc<Ui>, scope: Scope) -> (gtk::Box, Weak<Editor>) {
                 scroll.set_min_content_height(84);
                 scroll.set_vexpand(false);
                 scroll.add_css_class("guardrail-list");
+                scroll.set_overflow(gtk::Overflow::Hidden);
                 row.append(&scroll);
             }
             block.append(&row);
             built.push(Row { spec, input, source, reset, cleared: Cell::new(false) });
         }
-        root.append(&block);
     }
 
-    let footer = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let footer = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     footer.add_css_class("guardrail-footer");
-    let status = label("", "faint");
+    let status = label("", "settings-caption");
     status.set_hexpand(true);
     status.set_wrap(true);
     footer.append(&status);
-    let discard = button("Discard", "quiet");
+    let discard = button("Discard", "settings-button");
     let save = button("Save guardrails", "primary");
+    save.add_css_class("settings-primary");
     save.set_widget_name("guardrail-save");
     discard.set_sensitive(false);
     save.set_sensitive(false);

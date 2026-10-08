@@ -62,7 +62,7 @@ pub fn first_name() -> String {
 pub fn nav_button(caption: &str, icon: &str) -> gtk::Button {
     let b = button("", "nav");
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 9);
-    let image = crate::icons::image(icon, 16);
+    let image = crate::icons::image(icon, 18);
     row.append(&image);
     row.append(&label(caption, "nav-label"));
     b.set_child(Some(&row));
@@ -271,7 +271,6 @@ pub struct Ui {
     pub page_projects: RefCell<BTreeMap<String, i64>>,
     pub notice: gtk::Label,
     status: gtk::Label,
-    usage_meters: gtk::Box,
     usage: status::UsageState,
     device_status: gtk::Label,
     pub(super) resource_status: gtk::Box,
@@ -282,6 +281,8 @@ pub struct Ui {
     status_branch: gtk::Label,
     pub(crate) sidebar: gtk::Box,
     settings_sidebar: Cell<bool>,
+    /// The title bar's slot for the Settings page's search field, shown on Settings only.
+    pub(crate) settings_tools: gtk::Box,
     focus_tabs: gtk::Box,
     mode: RefCell<String>,
     pub overlay: gtk::Overlay,
@@ -392,6 +393,7 @@ pub fn run(rt: Handle) -> glib::ExitCode {
             include_str!("css/money.css"),
             include_str!("css/threads.css"),
             include_str!("css/start.css"),
+            include_str!("css/settings.css"),
         ));
         if let Some(display) = gtk::gdk::Display::default() {
             gtk::style_context_add_provider_for_display(
@@ -415,7 +417,10 @@ struct TopBar {
     handle: gtk::WindowHandle,
     left: gtk::Box,
     sidebar_key: gtk::Button,
-    brand: gtk::Label,
+    /// "/ Settings" after the wordmark, and the Dev/Money switch it stands in for there.
+    crumb: gtk::Box,
+    switcher: gtk::Box,
+    settings_tools: gtk::Box,
     actions: gtk::Box,
     palette_key: gtk::Button,
     layouts_key: gtk::Button,
@@ -450,11 +455,22 @@ fn top_bar(window: &gtk::ApplicationWindow) -> TopBar {
     let brand = label("relay", "brand");
     brand.set_margin_end(6);
     top_left.append(&brand);
-    top_left.append(&crate::money::switcher());
+    let crumb = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    crumb.add_css_class("brand-crumb");
+    crumb.append(&label("/", "brand-slash"));
+    crumb.append(&label("Settings", "brand-page"));
+    crumb.set_visible(false);
+    top_left.append(&crumb);
+    let switcher = crate::money::switcher();
+    top_left.append(&switcher);
     top.append(&top_left);
     let top_space = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     top_space.set_hexpand(true);
     top.append(&top_space);
+    let settings_tools = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    settings_tools.add_css_class("settings-tools");
+    settings_tools.set_visible(false);
+    top.append(&settings_tools);
     let top_actions = gtk::Box::new(gtk::Orientation::Horizontal, 2);
     top_actions.add_css_class("topbar-actions");
     top.append(&top_actions);
@@ -478,7 +494,7 @@ fn top_bar(window: &gtk::ApplicationWindow) -> TopBar {
     plugins_key.set_widget_name("project-plugins");
     let notifications_key = icon_button("alarm-symbolic", "Notifications");
     let bell = gtk::Overlay::new();
-    bell.set_child(Some(&crate::icons::image("bell", 16)));
+    bell.set_child(Some(&crate::icons::image("bell", 18)));
     let notification_count = label("", "notification-count");
     notification_count.set_halign(gtk::Align::End);
     notification_count.set_valign(gtk::Align::Start);
@@ -486,6 +502,9 @@ fn top_bar(window: &gtk::ApplicationWindow) -> TopBar {
     notification_count.set_can_target(false);
     bell.add_overlay(&notification_count);
     notifications_key.set_child(Some(&bell));
+    for (key, icon) in [(&skills_key, "skills"), (&plugins_key, "plugins"), (&layouts_key, "layout")] {
+        key.set_child(Some(&crate::icons::image(icon, 18)));
+    }
     for key in [
         &palette_key,
         &skills_key,
@@ -552,7 +571,9 @@ fn top_bar(window: &gtk::ApplicationWindow) -> TopBar {
         handle,
         left: top_left,
         sidebar_key,
-        brand,
+        crumb,
+        switcher,
+        settings_tools,
         actions: top_actions,
         palette_key,
         layouts_key,
@@ -612,6 +633,8 @@ struct Sidebar {
     workspaces: [gtk::Widget; 2],
     add_project: gtk::Button,
     projects_box: gtk::Box,
+    /// The foot: the usage card (placed once usage exists) above you and Settings.
+    footer: gtk::Box,
     settings_key: gtk::Button,
 }
 
@@ -651,14 +674,14 @@ fn sidebar() -> Sidebar {
     shown.set_hexpand(true);
     shown.set_xalign(0.0);
     who.append(&shown);
-    who.append(&crate::icons::image("settings", 16));
+    who.append(&crate::icons::image("gear", 16));
     settings_key.set_child(Some(&who));
     let sidebar_footer = gtk::Box::new(gtk::Orientation::Vertical, 0);
     sidebar_footer.add_css_class("sidebar-footer");
     sidebar_footer.append(&settings_key);
     sidebar.append(&sidebar_footer);
     let workspaces = [section.upcast(), project_scroll.upcast()];
-    Sidebar { root: sidebar, nav, money_nav, workspaces, add_project, projects_box, settings_key }
+    Sidebar { root: sidebar, nav, money_nav, workspaces, add_project, projects_box, footer: sidebar_footer, settings_key }
 }
 
 /// The agent wall: the panes' grid and its right column, the empty state, and the focus tabs.
@@ -824,15 +847,13 @@ struct StatusBar {
     status_project: gtk::Label,
     status_branch: gtk::Label,
     status: gtk::Label,
-    usage_key: gtk::Button,
-    usage_meters: gtk::Box,
     devices_key: gtk::Button,
     device_status: gtk::Label,
     resources_key: gtk::Button,
     resource_status: gtk::Box,
 }
 
-/// The bar, and the usage strip it shows.
+/// The bar, and the usage state behind the sidebar's card (placed by `Ui::new`).
 fn status_bar() -> (StatusBar, status::UsageState) {
     let bottom = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     bottom.add_css_class("statusbar");
@@ -853,11 +874,6 @@ fn status_bar() -> (StatusBar, status::UsageState) {
     bottom.append(&spacer);
     let status = label("Engine disconnected", "");
     bottom.append(&status);
-    let usage_key = button("", "quiet");
-    usage_key.set_tooltip_text(Some("Provider usage"));
-    usage_key.set_widget_name("status-usage");
-    let usage_meters = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    usage_key.set_child(Some(&usage_meters));
     let devices_key = button("", "quiet");
     devices_key.set_widget_name("status-devices");
     let device_status = label("No device", "mono");
@@ -872,9 +888,7 @@ fn status_bar() -> (StatusBar, status::UsageState) {
     let resource_status = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     resource_content.append(&resource_status);
     resources_key.set_child(Some(&resource_content));
-    bottom.append(&usage_key);
     let usage = status::UsageState::new();
-    bottom.append(&usage.strip);
     bottom.append(&gtk::Separator::new(gtk::Orientation::Vertical));
     bottom.append(&devices_key);
     bottom.append(&gtk::Separator::new(gtk::Orientation::Vertical));
@@ -884,8 +898,6 @@ fn status_bar() -> (StatusBar, status::UsageState) {
         status_project,
         status_branch,
         status,
-        usage_key,
-        usage_meters,
         devices_key,
         device_status,
         resources_key,
@@ -972,6 +984,7 @@ impl Ui {
         outer.append(&panel_host);
         let (bar, usage) = status_bar();
         outer.append(&bar.root);
+        side.footer.prepend(usage.card());
         let (wallpaper, wallpaper_dim) = backdrop(&window, &outer);
         let ui = Rc::new(Self {
             window,
@@ -994,7 +1007,6 @@ impl Ui {
             page_projects: RefCell::default(),
             notice,
             status: bar.status.clone(),
-            usage_meters: bar.usage_meters.clone(),
             usage,
             device_status: bar.device_status.clone(),
             resource_status: bar.resource_status.clone(),
@@ -1005,10 +1017,11 @@ impl Ui {
             status_branch: bar.status_branch.clone(),
             sidebar: side.root.clone(),
             settings_sidebar: Cell::new(true),
+            settings_tools: top.settings_tools.clone(),
             focus_tabs: wall.focus_tabs,
             mode: RefCell::new("grid".into()),
             overlay: panel_host,
-            start_chrome: [top.left.clone().upcast(), top.actions.clone().upcast()]
+            start_chrome: [top.left.clone().upcast(), top.settings_tools.clone().upcast(), top.actions.clone().upcast()]
                 .into_iter()
                 .chain(bar.root.observe_children().into_iter().filter_map(|c| c.ok()?.downcast::<gtk::Widget>().ok()))
                 .collect(),
@@ -1073,10 +1086,10 @@ impl Ui {
         let ui = self;
         let nav = &side.nav;
         for (name, caption, icon) in [
-            ("board", "Board", "view-list-symbolic"),
-            ("skills", "Skills", "applications-science-symbolic"),
-            ("plugins", "Plugins", "application-x-addon-symbolic"),
-            ("notes", "Notes", "accessories-text-editor-symbolic"),
+            ("board", "Board", "sidebar"),
+            ("skills", "Skills", "skills"),
+            ("plugins", "Plugins", "dashboard"),
+            ("notes", "Notes", "brief"),
         ] {
             let b = nav_button(caption, icon);
             b.set_widget_name(&format!("nav-{name}"));
@@ -1120,7 +1133,8 @@ impl Ui {
     /// status bar, and turns the sidebar key into a back key to the page it was opened from.
     fn wire_settings_return(self: &Rc<Self>, top: &TopBar, bottom: &gtk::Box) {
         let ui = self;
-        let (brand, back_key, top_actions) = (top.brand.clone(), top.sidebar_key.clone(), top.actions.clone());
+        let (back_key, top_actions) = (top.sidebar_key.clone(), top.actions.clone());
+        let (crumb, switcher, settings_tools) = (top.crumb.clone(), top.switcher.clone(), top.settings_tools.clone());
         let (skills_key, plugins_key, bottom) = (top.skills_key.clone(), top.plugins_key.clone(), bottom.clone());
         // The page Settings was opened from, which its back key returns to.
         let settings_return = Rc::new(RefCell::new(String::from("agents")));
@@ -1140,7 +1154,9 @@ impl Ui {
             } else if !settings && mut_previous.borrow().as_str() == "settings" {
                 ui.sidebar.set_visible(ui.settings_sidebar.get());
             }
-            brand.set_text(if settings { "Settings" } else { "relay" });
+            crumb.set_visible(settings);
+            switcher.set_visible(!settings);
+            settings_tools.set_visible(settings);
             back_key.set_child(Some(&crate::icons::image(
                 if settings { "chevron-left" } else { "sidebar" },
                 14,
@@ -1203,12 +1219,6 @@ impl Ui {
         bar.resources_key.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
                 ui.resources();
-            }
-        });
-        let weak = Rc::downgrade(ui);
-        bar.usage_key.connect_clicked(move |_| {
-            if let Some(ui) = weak.upgrade() {
-                ui.usage_panel();
             }
         });
         for b in [&top.launch_key, empty_launch] {

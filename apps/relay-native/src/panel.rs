@@ -237,6 +237,35 @@ impl Panel {
         self.scroll.set_propagate_natural_height(true);
     }
 
+    /// Opens just inside `content`'s left edge with its foot level with `anchor`'s: the usage
+    /// card's panel, beside the sidebar. An anchor that is not on screen (a hidden sidebar)
+    /// leaves it to `bottom`.
+    pub fn beside(&self, content: &impl IsA<gtk::Widget>, anchor: &impl IsA<gtk::Widget>, height: i32) {
+        let bounds = anchor.is_mapped().then(|| anchor.compute_bounds(&self.host)).flatten();
+        // A point, not `compute_bounds`: the sidebar box beside it reads 0 wide while laid out.
+        let edge = content.compute_point(&self.host, &gtk::graphene::Point::new(0.0, 0.0));
+        let (Some(bounds), Some(edge)) = (bounds, edge) else {
+            return self.bottom(height);
+        };
+        self.modal.set(false);
+        self.layer.add_css_class("utility-layer");
+        self.frame.add_css_class("utility-panel");
+        self.frame.add_css_class("floating-panel");
+        // Rounded like the card it opens from; the corners clip what scrolls under them.
+        self.frame.set_overflow(gtk::Overflow::Hidden);
+        self.frame.set_halign(gtk::Align::Start);
+        self.frame.set_valign(gtk::Align::End);
+        self.frame.set_margin_start(edge.x() as i32 + 8);
+        let bottom = (self.host.height() - (bounds.y() + bounds.height()) as i32).max(8);
+        self.frame.set_margin_bottom(bottom);
+        // The heading takes about 50px of what is left above the anchor's foot.
+        let room = (self.host.height() - bottom - 66).max(200);
+        self.scroll.set_vexpand(false);
+        self.scroll.set_min_content_height(height.min(room));
+        self.scroll.set_max_content_height(room);
+        self.scroll.set_propagate_natural_height(true);
+    }
+
     pub fn add_css_class(&self, name: &str) {
         self.frame.add_css_class(name);
     }

@@ -375,7 +375,7 @@ impl Ui {
     pub(super) fn agent_controls(self: &Rc<Self>, pane: &Rc<Pane>, session: &Value) {
         let name = text(session, "name").to_string();
         let zoom = icon_button("focus", "Focus this agent (show it alone)");
-        zoom.set_child(Some(&crate::icons::image("focus", 13)));
+        zoom.set_child(Some(&crate::icons::image("focus", 15)));
         let weak = Rc::downgrade(self);
         let n = name.clone();
         zoom.connect_clicked(move |_| {
@@ -394,7 +394,7 @@ impl Ui {
             Some(key) => key,
             None => {
                 let key = icon_button("sliders", "Agent settings");
-                key.set_child(Some(&crate::icons::image("sliders", 13)));
+                key.set_child(Some(&crate::icons::image("sliders", 15)));
                 key.add_css_class("agent-settings-key");
                 let weak = Rc::downgrade(self);
                 let n = name.clone();

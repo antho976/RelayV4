@@ -58,6 +58,13 @@ print("Disposable provider fixture, no model connected.", flush=True)
 print("Session: " + os.environ.get("RELAY_SESSION", "fixture"), flush=True)
 print("\\nEngine owns this PTY. VTE renders its output.", flush=True)
 print("  [ok] isolated worktree\\n  [ok] ordered output\\n  [ok] waiting for input", flush=True)
+# Fixed limits for the status bar and the sidebar's usage card: a test engine never reads the
+# providers' own files. A Codex session's Claude report is refused, and that is fine.
+import json as _json, subprocess as _subprocess, time as _time
+_now = int(_time.time())
+_subprocess.run([os.environ["RELAY_BIN"], "cmd", "usage.report", _json.dumps({"session": os.environ.get("RELAY_SESSION", ""),
+    "provider": "claude", "payload": {"five_hour": {"used_pct": 12, "resets_at": _now + 13290, "resets_in": "3h 41m"},
+    "seven_day": {"used_pct": 29, "resets_at": _now + 4 * 86400, "resets_in": "4d 0h"}}})], capture_output=True)
 for line in sys.stdin:
     if line.strip()=="native-burst":
         for i in range(2048): print(f"B{i:06d} " + "x"*88)
@@ -168,11 +175,11 @@ for line in sys.stdin:
         measurements=[]
         captured=[]
         # The start screen's opening, held at points of its timeline (start.rs).
-        START_FRAMES = {"start-frame-20": "0.2", "start-frame-45": "0.45", "start-frame-70": "0.7"}
+        START_FRAMES = {"start-frame-20": "0.2", "start-frame-45": "0.45", "start-frame-60": "0.6", "start-frame-80": "0.8"}
         # RELAY_SMOKE_PAGES=start,start-frame-45 captures only those pages and stops there, for a
         # quick look at one screen; the checks after the captures need every page.
         PAGES_ONLY = [p for p in os.environ.get("RELAY_SMOKE_PAGES", "").split(",") if p]
-        for viewport, size, page in (("desktop", "1440,900", "agents"), ("compact", "1024,768", "agents"), ("launch-preview", "1024,768", "launch-preview"), ("palette", "1024,768", "palette"), ("layouts", "1024,768", "layouts"), ("board", "1440,900", "board"), ("board-compact", "1024,768", "board"), ("mailbox", "1024,768", "mailbox"), ("guardrails", "1024,768", "guardrails"), ("code", "1440,900", "code"), *((name,"1440,900",name) for name in ("notes","modules","settings","skills","notifications","devices","launch")),
+        for viewport, size, page in (("desktop", "1440,900", "agents"), ("compact", "1024,768", "agents"), ("launch-preview", "1024,768", "launch-preview"), ("palette", "1024,768", "palette"), ("layouts", "1024,768", "layouts"), ("usage", "1440,900", "usage"), ("board", "1440,900", "board"), ("board-compact", "1024,768", "board"), ("mailbox", "1024,768", "mailbox"), ("guardrails", "1024,768", "guardrails"), ("code", "1440,900", "code"), *((name,"1440,900",name) for name in ("notes","modules","settings","skills","notifications","devices","launch")),
                                      *((name,"1440,900",name) for name in ("money-home","money-transactions","money-data","start")), ("money-plan","1024,768","money-plan"), ("money-entry","1024,768","money-entry"),
                                      *((frame,"1440,900","start") for frame in START_FRAMES)):
             if PAGES_ONLY and viewport not in PAGES_ONLY:
