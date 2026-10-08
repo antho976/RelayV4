@@ -14,3 +14,8 @@ files carry the typographic family and subfamily the upstream Fira TTFs have
 `Medium` or `SemiBold`), added with FontTools `name.setName` on the same
 platform records as name ID 1. The 400 and Condensed 700 files already use the
 base family and are unchanged.
+
+`sora-latin-600-normal.ttf` is Sora SemiBold (Latin), the Relay wordmark's face, from the
+fontsource CDN build of [Sora](https://github.com/sora-xor/sora-font) under the SIL Open Font
+License (`sora-LICENSE`). Its family is already `Sora`, so it is unchanged. Only the start screen
+(`start.rs`) uses it.

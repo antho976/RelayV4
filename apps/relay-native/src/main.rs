@@ -15,6 +15,7 @@ mod smoke;
 mod smoke_project_files;
 mod smoke_registry;
 mod sounds;
+mod start;
 mod terminal;
 mod tools;
 mod wallpaper_rotation;

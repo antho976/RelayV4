@@ -441,64 +441,14 @@ pub fn show_start(ui: &Rc<Ui>) {
         return;
     }
     let remembered = STATE.with(|s| s.saved.get()).unwrap_or(active());
-    let screen = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    screen.add_css_class("space-start");
-    screen.set_widget_name("start-screen");
-    screen.set_focusable(true);
-    let column = gtk::Box::new(gtk::Orientation::Vertical, 10);
-    column.set_halign(gtk::Align::Center);
-    column.set_valign(gtk::Align::Center);
-    column.set_vexpand(true);
-    let hello = label(&greeting(), "start-greeting");
-    hello.set_xalign(0.5);
-    hello.set_wrap(true);
-    column.append(&hello);
-    let ask = label("What are we working on today?", "start-question");
-    ask.set_xalign(0.5);
-    column.append(&ask);
-    let cards = gtk::Box::new(gtk::Orientation::Horizontal, 16);
-    cards.add_css_class("start-cards");
-    cards.set_halign(gtk::Align::Center);
-    cards.set_homogeneous(true);
-    let mut lines = Vec::new();
-    let mut keys = Vec::new();
-    for (to_money, title, glyph, about) in [
-        (false, "Dev", "code", "Agents, tasks and code"),
-        (true, "Money", "coins", "Your budget, from Tally"),
-    ] {
-        let card = button("", "start-card");
-        card.add_css_class(if to_money { "start-money" } else { "start-dev" });
-        card.set_widget_name(if to_money { "start-money" } else { "start-dev" });
-        let inner = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        let mark = if to_money { pages::glyph_image(glyph, 22) } else { crate::icons::image(glyph, 22) };
-        mark.set_halign(gtk::Align::Start);
-        mark.add_css_class("start-glyph");
-        inner.append(&mark);
-        inner.append(&label(title, "start-title"));
-        inner.append(&label(about, "start-about"));
-        let line = label("Reading…", "start-line");
-        line.set_wrap(true);
-        line.set_max_width_chars(34);
-        inner.append(&line);
-        card.set_child(Some(&inner));
-        let weak = Rc::downgrade(ui);
-        card.connect_clicked(move |_| {
-            if let Some(ui) = weak.upgrade() {
-                dismiss_start(&ui, Some(to_money));
-            }
-        });
-        cards.append(&card);
-        lines.push(line);
-        keys.push(card);
-    }
-    column.append(&cards);
-    let hint = label(
-        &format!("Esc opens {}, where you left off", if remembered { "Money" } else { "Dev" }),
-        "start-hint",
-    );
-    hint.set_xalign(0.5);
-    column.append(&hint);
-    screen.append(&column);
+    let weak = Rc::downgrade(ui);
+    let pick: Rc<dyn Fn(bool)> = Rc::new(move |to_money| {
+        if let Some(ui) = weak.upgrade() {
+            dismiss_start(&ui, Some(to_money));
+        }
+    });
+    let hint = format!("esc · open {}", if remembered { "money" } else { "dev" }).to_uppercase();
+    let crate::start::Built { screen, lines, keys } = crate::start::build(&greeting(), &hint, pick);
     let escape = gtk::EventControllerKey::new();
     escape.set_propagation_phase(gtk::PropagationPhase::Capture);
     let weak = Rc::downgrade(ui);
@@ -515,10 +465,16 @@ pub fn show_start(ui: &Rc<Ui>) {
     if let Some(content) = ui.overlay.child() {
         content.set_sensitive(false);
     }
+    // The bars keep their place and the window controls; their keys and readings step back.
+    ui.window.add_css_class("starting");
+    for part in &ui.start_chrome {
+        part.set_opacity(0.0);
+        part.set_sensitive(false);
+    }
     ui.overlay.add_overlay(&screen);
     STATE.with(|s| *s.start.borrow_mut() = Some(screen.clone().upcast()));
     keys[usize::from(remembered)].grab_focus();
-    let (dev_line, money_line) = (lines[0].clone(), lines[1].clone());
+    let [dev_line, money_line] = lines;
     let reader = ui.clone();
     glib::spawn_future_local(async move {
         let (dashboard, summary) = tokio::join!(
@@ -580,6 +536,11 @@ fn dismiss_start(ui: &Rc<Ui>, pick: Option<bool>) {
         return;
     };
     ui.overlay.remove_overlay(&screen);
+    ui.window.remove_css_class("starting");
+    for part in &ui.start_chrome {
+        part.set_opacity(1.0);
+        part.set_sensitive(true);
+    }
     if ui.panels.borrow().is_empty() {
         if let Some(content) = ui.overlay.child() {
             content.set_sensitive(true);

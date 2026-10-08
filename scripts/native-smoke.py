@@ -167,12 +167,22 @@ for line in sys.stdin:
             raise SystemExit(0)
         measurements=[]
         captured=[]
+        # The start screen's opening, held at points of its timeline (start.rs).
+        START_FRAMES = {"start-frame-20": "0.2", "start-frame-45": "0.45", "start-frame-70": "0.7"}
+        # RELAY_SMOKE_PAGES=start,start-frame-45 captures only those pages and stops there, for a
+        # quick look at one screen; the checks after the captures need every page.
+        PAGES_ONLY = [p for p in os.environ.get("RELAY_SMOKE_PAGES", "").split(",") if p]
         for viewport, size, page in (("desktop", "1440,900", "agents"), ("compact", "1024,768", "agents"), ("launch-preview", "1024,768", "launch-preview"), ("palette", "1024,768", "palette"), ("layouts", "1024,768", "layouts"), ("board", "1440,900", "board"), ("board-compact", "1024,768", "board"), ("mailbox", "1024,768", "mailbox"), ("guardrails", "1024,768", "guardrails"), ("code", "1440,900", "code"), *((name,"1440,900",name) for name in ("notes","modules","settings","skills","dashboard","notifications","devices","launch")),
-                                     *((name,"1440,900",name) for name in ("money-home","money-transactions","money-data","money-start")), ("money-plan","1024,768","money-plan"), ("money-entry","1024,768","money-entry")):
+                                     *((name,"1440,900",name) for name in ("money-home","money-transactions","money-data","start")), ("money-plan","1024,768","money-plan"), ("money-entry","1024,768","money-entry"),
+                                     *((frame,"1440,900","start") for frame in START_FRAMES)):
+            if PAGES_ONLY and viewport not in PAGES_ONLY:
+                continue
             output = OUT / f"{viewport}.png"
             output.unlink(missing_ok=True)
             native_env = dict(desktop_env, RELAY_NATIVE_SCREENSHOT=str(output), RELAY_NATIVE_SIZE=size, RELAY_NATIVE_FIXTURE="1",
                               RELAY_NATIVE_PAGE=page, RELAY_NATIVE_SMOKE_SECONDS="8" if viewport in ("desktop","launch") else "5")
+            if viewport in START_FRAMES:
+                native_env["RELAY_NATIVE_START_T"] = START_FRAMES[viewport]
             with (OUT / f"{viewport}.log").open("w") as native_log:
                 native=subprocess.Popen([str(NATIVE)], env=native_env, stdout=native_log, stderr=native_log)
                 if viewport=="desktop":
@@ -203,9 +213,14 @@ for line in sys.stdin:
                 assert "In-app confirmation accept and cancel verified" in contents, contents
             if page == "settings":
                 assert "Settings save verified across categories" in contents, contents
+            if page == "start":
+                assert "Start screen dismiss verified" in contents, contents
             saved_layout = call("settings.get", {"path": f"native.layout.current.{project['id']}"})["value"]
             assert saved_layout["agent_layout"] == "grid", saved_layout
             assert "stylesheet:" not in contents and "gtk_widget_add_css_class:" not in contents, contents
+        if PAGES_ONLY:
+            print(json.dumps({"screenshots": captured}))
+            raise SystemExit(0)
         (OUT/"measurements.json").write_text(json.dumps(measurements,indent=2)+"\n")
         live = call("session.list", {"project_id": project["id"]})["sessions"]
         assert len(live) == 9 and all(s["state"] == "running" for s in live), live

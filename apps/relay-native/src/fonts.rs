@@ -60,6 +60,8 @@ pub fn install(window: &gtk4::ApplicationWindow) {
             "fira-sans-condensed-latin-700-normal.ttf",
             "fira-mono-latin-400-normal.ttf",
             "fira-mono-latin-500-normal.ttf",
+            // The wordmark's face on the start screen (start.rs).
+            "sora-latin-600-normal.ttf",
         );
         map.changed();
         window.pango_context().changed();

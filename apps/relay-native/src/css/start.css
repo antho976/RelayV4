@@ -1,0 +1,25 @@
+/* The start screen (start.rs): the Relay brand's own ground, apart from both spaces' looks.
+   Ink #EDEEF0, dimmed #63666B, signal #C6F24E on #0F1114; Sora for the wordmark and titles,
+   Fira Mono for the small labels. */
+.start-screen { background: #0F1114; color: #EDEEF0; }
+/* The bars around it take the same ground while it shows (money.rs quiets their keys). */
+window.starting .topbar, window.starting .statusbar { background: #0F1114; border-color: transparent; }
+.start-lockup { margin-bottom: 34px; }
+.start-wordmark { font-family: "Sora"; font-weight: 600; font-size: 46px; letter-spacing: -1.6px; color: #EDEEF0; }
+.start-greeting { font-family: "Sora"; font-weight: 600; font-size: 26px; letter-spacing: -0.5px; color: #EDEEF0; }
+.start-question { font-size: 15px; color: #8B8F96; }
+.start-words { margin-bottom: 30px; }
+button.start-card {
+  background: #16181C; border: 1px solid #202329; border-radius: 16px; padding: 18px 22px 20px;
+  min-width: 290px; color: #EDEEF0; box-shadow: none;
+  transition: background 140ms ease-out, border-color 140ms ease-out;
+}
+button.start-card:hover { background: #1A1D22; border-color: #2E323A; }
+button.start-card:focus-visible { outline: 2px solid alpha(#C6F24E, 0.7); outline-offset: 2px; }
+button.start-card .start-eyebrow { margin: 0; font-family: "Fira Mono", monospace; font-size: 11px; letter-spacing: 0.12em; color: #7C8088; }
+.start-dot { min-width: 8px; min-height: 8px; border-radius: 4px; background: #C6F24E; opacity: 0; transition: opacity 160ms ease-out; }
+button.start-card:hover .start-dot, button.start-card:focus-visible .start-dot { opacity: 1; }
+button.start-card .start-title { margin-top: 22px; font-family: "Sora"; font-weight: 600; font-size: 22px; letter-spacing: -0.5px; }
+button.start-card .start-about { margin-top: 2px; font-size: 13px; color: #8B8F96; }
+button.start-card .start-line { margin-top: 16px; font-family: "Fira Mono", monospace; font-size: 12px; color: #C9CBD0; font-feature-settings: "tnum"; }
+.start-hint { margin-top: 26px; font-family: "Fira Mono", monospace; font-size: 11px; letter-spacing: 0.12em; color: #5E6168; }

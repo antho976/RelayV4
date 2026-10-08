@@ -1,6 +1,7 @@
 /* The Money space: Tally's "Lit Ledger" (apps/tally/DESIGN.md) on the desktop.
    Its tokens live on .space-money, which the window wears only while a Money page shows,
-   so the dev console is untouched. The switcher and the start screen are shared by both. */
+   so the dev console is untouched. The switcher is shared by both; the start screen has its own
+   look, css/start.css. */
 
 /* Space switcher, beside the brand. */
 .space-switch { background: @screen; border: 1px solid @edge; border-radius: 999px; padding: 2px; }
@@ -13,22 +14,6 @@
 .space-money .space-switch button:hover { color: #F2EFEA; background: #221C16; }
 .space-money .space-switch button:checked, .space-money .space-switch button:checked:hover { background: #D4761F; color: #110F0C; }
 .space-money .space-switch button:checked label { color: #110F0C; }
-
-/* Start screen. */
-.space-start { background: #110F0C; color: #F2EFEA; }
-.start-greeting { font-family: "Noto Serif", "DejaVu Serif", serif; font-size: 40px; font-weight: 400; letter-spacing: -0.01em; }
-.start-question { color: #BFB6AA; font-size: 16px; margin-bottom: 28px; }
-.start-cards { margin-top: 6px; }
-button.start-card { background: #1A1613; border: 1px solid #2A241F; border-radius: 20px; padding: 22px 24px; min-width: 300px; color: #F2EFEA; box-shadow: none; transition: background 120ms ease-out, border-color 120ms ease-out; }
-button.start-card:hover { background: #221C16; border-color: #38302A; }
-button.start-card:focus-visible { outline: 2px solid #D4761F; outline-offset: -2px; }
-button.start-card label { margin: 0; }
-.start-glyph { color: #BFB6AA; margin-bottom: 10px; }
-.start-money .start-glyph { color: #D4761F; }
-.start-title { font-family: "Noto Serif", "DejaVu Serif", serif; font-size: 26px; }
-.start-about { color: #BFB6AA; font-size: 13px; }
-.start-line { margin-top: 12px; font-family: "Fira Mono", monospace; font-size: 12px; letter-spacing: 0.04em; color: #F2EFEA; font-feature-settings: "tnum"; }
-.start-hint { margin-top: 26px; color: alpha(#BFB6AA, 0.75); font-size: 12px; }
 
 /* The window while Money shows: a warm near-black ground and its tonal ladder. */
 .space-money {
