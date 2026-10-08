@@ -99,7 +99,8 @@ pub(crate) fn set_query(query: &str) {
     STATE.with(|s| *s.query.borrow_mut() = query.to_string());
 }
 
-/// The title bar's Dev | Money pill. Wired by [`install`].
+/// The title bar's Dev | Threads pill. Wired by [`install`]. Threads is the Money space's name
+/// while it grows into agent threads over your own data; inside, it is still Money's pages.
 pub fn switcher() -> gtk::Box {
     let pill = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     pill.add_css_class("space-switch");
@@ -108,9 +109,9 @@ pub fn switcher() -> gtk::Box {
     let dev = gtk::ToggleButton::with_label("Dev");
     dev.set_widget_name("space-dev");
     dev.set_tooltip_text(Some("Dev: agents, tasks and code · Ctrl `"));
-    let money = gtk::ToggleButton::with_label("Money");
+    let money = gtk::ToggleButton::with_label("Threads");
     money.set_widget_name("space-money");
-    money.set_tooltip_text(Some("Money: your budget, from Tally · Ctrl `"));
+    money.set_tooltip_text(Some("Threads: agents on your own data, starting with your budget · Ctrl `"));
     money.set_group(Some(&dev));
     dev.set_active(true);
     pill.append(&dev);
@@ -373,7 +374,7 @@ pub fn changed(ui: &Rc<Ui>) {
 /// Entries for the command palette: (key, caption).
 pub fn palette_entries() -> Vec<(&'static str, String)> {
     let mut entries = vec![
-        ("space", String::from(if active() { "Switch to Dev" } else { "Switch to Money" })),
+        ("space", String::from(if active() { "Switch to Dev" } else { "Switch to Threads" })),
         ("start", String::from("Start screen")),
         ("add", String::from("Add a money entry")),
     ];
@@ -445,19 +446,23 @@ pub fn show_start(ui: &Rc<Ui>) {
             dismiss_start(&ui, Some(to_money));
         }
     });
-    let hint = format!("esc · open {}", if remembered { "money" } else { "dev" }).to_uppercase();
-    let crate::start::Built { screen, lines, keys } = crate::start::build(&greeting(), &hint, pick);
+    let crate::start::Built { screen, lines, keys } = crate::start::build(&greeting(), remembered, pick);
+    // Escape opens the space used last; 1 and 2 pick Dev and Threads, as the cards say.
     let escape = gtk::EventControllerKey::new();
     escape.set_propagation_phase(gtk::PropagationPhase::Capture);
     let weak = Rc::downgrade(ui);
     escape.connect_key_pressed(move |_, key, _, _| {
-        if key == gtk::gdk::Key::Escape {
-            if let Some(ui) = weak.upgrade() {
-                dismiss_start(&ui, Some(remembered));
-            }
-            return glib::Propagation::Stop;
+        use gtk::gdk::Key;
+        let pick = match key {
+            Key::Escape => remembered,
+            Key::_1 | Key::KP_1 => false,
+            Key::_2 | Key::KP_2 => true,
+            _ => return glib::Propagation::Proceed,
+        };
+        if let Some(ui) = weak.upgrade() {
+            dismiss_start(&ui, Some(pick));
         }
-        glib::Propagation::Proceed
+        glib::Propagation::Stop
     });
     screen.add_controller(escape);
     if let Some(content) = ui.overlay.child() {
@@ -479,14 +484,14 @@ pub fn show_start(ui: &Rc<Ui>) {
             reader.call("dashboard.get", json!({})),
             reader.call("money.summary", json!({}))
         );
-        dev_line.set_text(&match dashboard {
-            Ok(d) => dev_reading(&d),
-            Err(e) => e.to_string(),
-        });
-        money_line.set_text(&match summary {
-            Ok(s) => money_reading(&s),
-            Err(e) => pages::unavailable(&e),
-        });
+        match dashboard {
+            Ok(d) => crate::start::reading(&dev_line, &dev_reading(&d), !d["sessions_live"].as_array().is_none_or(Vec::is_empty)),
+            Err(e) => crate::start::reading(&dev_line, &e.to_string(), false),
+        }
+        match summary {
+            Ok(s) => crate::start::reading(&money_line, &money_reading(&s), s["empty"] != true),
+            Err(e) => crate::start::reading(&money_line, &pages::unavailable(&e), false),
+        }
     });
 }
 
@@ -502,19 +507,25 @@ fn dev_reading(d: &Value) -> String {
     if review == 0 { agents } else { format!("{agents} · {review} in review") }
 }
 
-/// "$412 left · $28 a day for 15 days", from `money.summary`.
+/// "Budget · $412 left · on pace", from `money.summary`: short enough for its card's one line.
 fn money_reading(s: &Value) -> String {
     if s["empty"] == true {
-        return String::from("Set up your budget");
+        return String::from("Start with your budget");
     }
     remember_currency(s);
     let margin = s["lines"]["margin"].as_str().unwrap_or("");
     match s["pace"]["status"].as_str().unwrap_or("") {
         "ON_PACE" | "UNDER_PACE" | "OVER_PACE" => {
             let left = formatter().format_whole(s["pace"]["remaining"].as_i64().unwrap_or(0));
-            format!("{left} left · {margin}")
+            let pace = match s["pace"]["status"].as_str() {
+                Some("OVER_PACE") => "over pace",
+                Some("UNDER_PACE") => "under pace",
+                _ => "on pace",
+            };
+            format!("Budget · {left} left · {pace}")
         }
-        _ => margin.to_string(),
+        _ if margin.is_empty() => String::from("Budget"),
+        _ => format!("Budget · {margin}"),
     }
 }
 
@@ -533,7 +544,10 @@ fn dismiss_start(ui: &Rc<Ui>, pick: Option<bool>) {
     let Some(screen) = STATE.with(|s| s.start.borrow_mut().take()) else {
         return;
     };
-    ui.overlay.remove_overlay(&screen);
+    // It fades out over what it opened into; the bars come back at once.
+    let overlay = ui.overlay.clone();
+    let leaving = screen.clone();
+    crate::start::leave(&screen, move || overlay.remove_overlay(&leaving));
     ui.window.remove_css_class("starting");
     for part in &ui.start_chrome {
         part.set_opacity(1.0);
