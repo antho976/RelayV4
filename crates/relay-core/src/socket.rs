@@ -775,8 +775,13 @@ async fn handle_conn(engine: Arc<Engine>, recent: Arc<Recent>, stream: UnixStrea
         }
         // `user` and `test` carry no token: what vouches for them is the process that connected.
         // A liveness ping claims nothing, so `socket::probe` works from anywhere.
+        // A thread's agent may claim `user` for its own ops alone (`peer::Peer::Thread`).
+        let admitted = match req.actor {
+            relay_bus::Actor::User => peer.may_act_as_user_for(&req.op),
+            _ => peer.may_act_as_user(),
+        };
         if matches!(req.actor, relay_bus::Actor::User | relay_bus::Actor::Test)
-            && !peer.may_act_as_user()
+            && !admitted
             && req.op != relay_bus::ops::bus::Ping::NAME
         {
             tracing::warn!(?peer, op = %req.op, actor = %req.actor, "refused a user claim from inside Relay's process tree");

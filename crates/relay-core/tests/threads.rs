@@ -15,11 +15,14 @@ fn fake_claude(dir: &Path) -> (PathBuf, PathBuf) {
     let log = dir.join("args.log");
     let script = dir.join("claude");
     let body = r#"#!/bin/sh
-printf '%s\n' "$*" | tr '\n' ' ' >> "LOG"; echo >> "LOG"
+printf 'OPS=%s %s\n' "$RELAY_MCP_OPS" "$*" | tr '\n' ' ' >> "LOG"; echo >> "LOG"
 while IFS= read -r line; do
   case "$line" in *die*) exit 3;; esac
   case "$line" in *slow*) sleep 1;; esac
-  echo '{"type":"system","subtype":"init","session_id":"fake-session-1"}'
+  case "$line" in
+    *notools*) echo '{"type":"system","subtype":"init","session_id":"fake-session-1","mcp_servers":[{"name":"relay","status":"failed"}],"tools":[]}';;
+    *) echo '{"type":"system","subtype":"init","session_id":"fake-session-1","mcp_servers":[{"name":"relay","status":"connected"}],"tools":["mcp__relay__money_summary"]}';;
+  esac
   echo '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}},"parent_tool_use_id":null}'
   echo '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu1","name":"mcp__relay__money_summary","input":{}}]},"parent_tool_use_id":null}'
   echo '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu1","content":[{"type":"text","text":"{\"spent\":0}"}]}]},"parent_tool_use_id":null}'
@@ -117,7 +120,8 @@ fn a_message_gets_an_answer_and_a_cold_thread_resumes_by_its_id() {
     assert_eq!(runs.len(), 2);
     assert!(!runs[0].contains("--resume"));
     assert!(runs[1].contains("--resume fake-session-1"), "{}", runs[1]);
-    assert!(runs[1].contains("RELAY_MCP_OPS") && runs[1].contains("money.tx.add") && !runs[1].contains("money.reset"));
+    let ops = runs[1].split_whitespace().next().unwrap();
+    assert!(ops.starts_with("OPS=") && ops.contains("money.tx.add") && !ops.contains("money.reset"), "{ops}");
     ok(&engine, "thread.delete", json!({"id": created["id"]}));
 }
 
@@ -139,4 +143,11 @@ fn one_turn_at_a_time_and_a_dead_agent_says_so() {
     assert_eq!(read["thread"]["live"], false);
 
     ok(&engine, "thread.stop", json!({"id": slow["id"]}));
+
+    // An agent that starts without Relay's tools is said to, rather than left to guess.
+    let blind = ok(&engine, "thread.create", json!({"text": "notools please"}));
+    let read = settled(&engine, &blind["id"], 5);
+    let first = &read["messages"][1];
+    assert_eq!(first["role"], "error");
+    assert!(first["body"]["text"].as_str().unwrap().contains("without Relay's tools (failed)"), "{first}");
 }

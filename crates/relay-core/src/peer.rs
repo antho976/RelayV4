@@ -8,6 +8,11 @@
 //! else under the engine, may not speak as `user` or `test`. The engine is made a child
 //! subreaper (`PR_SET_CHILD_SUBREAPER`) so a session descendant that double-forks or calls
 //! `setsid` is reparented to the engine rather than to init, and stays below it.
+//!
+//! One exception, and a narrow one: a thread's agent (docs/THREADS.md) is the person's own
+//! conversation and has no session, so Relay's MCP server under it speaks as `user`. A process in a
+//! thread agent's tree may, but only for the ops that thread is given (`threads::AGENT_OPS`); the
+//! engine checks the op on every request, whatever the client in between lists.
 
 use crate::engine::Engine;
 use std::collections::{HashMap, HashSet};
@@ -24,6 +29,8 @@ pub enum Peer {
     Engine,
     /// Inside this agent session's process tree.
     Session(String),
+    /// Inside the process tree of this thread's agent.
+    Thread(relay_bus::types::Id),
     /// Below the engine but in no live session: a session's orphan, a build, a hook.
     EngineChild,
     /// Not identifiable: a peer in another pid namespace, an unreadable `/proc`, a process gone.
@@ -37,12 +44,25 @@ impl Peer {
         matches!(self, Peer::Outside | Peer::Engine)
     }
 
+    /// May this connection claim `user` for `op`? As [`Peer::may_act_as_user`], and a thread's
+    /// agent for its own ops alone.
+    pub fn may_act_as_user_for(&self, op: &str) -> bool {
+        match self {
+            Peer::Thread(_) => crate::threads::peer_may_call(op),
+            _ => self.may_act_as_user(),
+        }
+    }
+
     /// The typed refusal for a `user`/`test` claim from this peer.
     pub fn refusal(&self, actor: &str) -> relay_bus::BusError {
         let (whence, details) = match self {
             Peer::Session(name) => (
                 format!("from inside agent session {name:?}'s process tree"),
                 serde_json::json!({"peer": "session", "session": name}),
+            ),
+            Peer::Thread(id) => (
+                format!("from thread {id}'s agent, which acts for you only through that thread's tools"),
+                serde_json::json!({"peer": "thread", "thread": id}),
             ),
             Peer::EngineChild => (
                 "from a process the engine started outside every session (an orphan of a session, a build or a hook)".to_string(),
@@ -77,7 +97,7 @@ pub fn identify(stream: &tokio::net::UnixStream, engine: &Engine) -> Peer {
     // Taken before the walk, so the walk can be shown to have read the process that connected
     // and not a stranger that inherited its number (kernels before 6.5 have no SO_PEERPIDFD).
     let pidfd = peer_pidfd(stream.as_raw_fd());
-    let peer = classify(pid, std::process::id(), &engine.session_pids(), proc_ppid);
+    let peer = classify_with(pid, std::process::id(), &engine.session_pids(), &crate::threads::agent_pids(engine), proc_ppid);
     match pidfd {
         Some(fd) if !still_running(&fd) => Peer::Unknown("the process has exited"),
         _ => peer,
@@ -90,10 +110,22 @@ const MAX_DEPTH: usize = 1024;
 
 /// Walk `peer`'s ancestry. `sessions` maps each live session's PTY child pid to its name;
 /// `ppid_of` reads one parent link (`None` when the process cannot be read).
+#[cfg(test)]
 pub(crate) fn classify(
     peer: u32,
     engine: u32,
     sessions: &HashMap<u32, String>,
+    ppid_of: impl Fn(u32) -> Option<u32>,
+) -> Peer {
+    classify_with(peer, engine, sessions, &HashMap::new(), ppid_of)
+}
+
+/// [`classify`], also knowing each running thread agent's pid (`threads`, pid to thread id).
+pub(crate) fn classify_with(
+    peer: u32,
+    engine: u32,
+    sessions: &HashMap<u32, String>,
+    threads: &HashMap<u32, relay_bus::types::Id>,
     ppid_of: impl Fn(u32) -> Option<u32>,
 ) -> Peer {
     if peer == 0 {
@@ -106,6 +138,9 @@ pub(crate) fn classify(
     for _ in 0..MAX_DEPTH {
         if let Some(name) = sessions.get(&pid) {
             return Peer::Session(name.clone());
+        }
+        if let Some(thread) = threads.get(&pid) {
+            return Peer::Thread(*thread);
         }
         let Some(parent) = ppid_of(pid) else {
             return Peer::Unknown("its ancestry is unreadable");
@@ -340,6 +375,30 @@ mod tests {
         assert!(proc_stat(orphan).is_none(), "reaped on the second look");
         assert!(proc_stat(ours).is_some_and(|stat| stat.state == 'Z'));
         unsafe { libc::waitpid(ours as i32, std::ptr::null_mut(), 0) };
+    }
+
+    #[test]
+    fn a_thread_agent_acts_for_the_person_only_through_its_tools() {
+        // relay mcp 960 → claude 950 (thread 7's agent) → engine 500
+        let links = [(960, 950), (950, ENGINE), (ENGINE, 1), (1, 0)];
+        let threads = HashMap::from([(950, 7)]);
+        let peer = classify_with(960, ENGINE, &sessions(), &threads, tree(&links));
+        assert_eq!(peer, Peer::Thread(7));
+        assert!(!peer.may_act_as_user(), "never a blanket user");
+        assert!(peer.may_act_as_user_for("money.summary"));
+        assert!(peer.may_act_as_user_for("money.tx.add"));
+        assert!(peer.may_act_as_user_for("bus.ops"), "to list its tools");
+        for op in ["money.reset", "money.tx.delete", "guardrail.confirm", "thread.create", "session.input", "settings.set"] {
+            assert!(!peer.may_act_as_user_for(op), "{op}");
+        }
+        // Another engine child is not a thread because a thread runs.
+        let links = [(810, 805), (805, ENGINE), (ENGINE, 1), (1, 0)];
+        let other = classify_with(810, ENGINE, &sessions(), &threads, tree(&links));
+        assert_eq!(other, Peer::EngineChild);
+        assert!(!other.may_act_as_user_for("money.summary"));
+        assert!(!Peer::Session("calm-otter".into()).may_act_as_user_for("money.summary"));
+        assert!(Peer::Outside.may_act_as_user_for("money.reset"));
+        assert!(Peer::Thread(7).refusal("user").message.contains("thread 7"));
     }
 
     #[test]

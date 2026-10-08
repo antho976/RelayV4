@@ -224,6 +224,7 @@ pub fn tool_caption(name: &str) -> String {
         "money.summary" => "Read the budget".into(),
         "money.lists" => "Read accounts and categories".into(),
         "money.tx.list" => "Read entries".into(),
+        "money.series" => "Added up spending".into(),
         "money.tx.add" => "Added an entry".into(),
         "money.tx.update" => "Changed an entry".into(),
         "money.tx.restore" => "Restored an entry".into(),
@@ -346,6 +347,7 @@ mod tests {
         assert_eq!(tool_op("mcp__relay__money_tx_add").as_deref(), Some("money.tx.add"));
         assert_eq!(tool_caption("mcp__relay__money_summary"), "Read the budget");
         assert_eq!(tool_caption("mcp__relay__money_tx_add"), "Added an entry");
+        assert_eq!(tool_caption("mcp__relay__money_series"), "Added up spending");
         assert!(tool_writes("mcp__relay__money_tx_update"));
         assert!(!tool_writes("mcp__relay__money_tx_list"));
         assert_eq!(tool_caption("WebSearch"), "Used WebSearch");

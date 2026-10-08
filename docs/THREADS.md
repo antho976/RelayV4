@@ -59,11 +59,15 @@ claude -p --input-format stream-json --output-format stream-json --verbose
 
 - `--tools ""` removes every built-in tool: no shell, no files, no web. Verified with Claude Code
   2.1.293: the agent's tool list is only the MCP server's tools, and it may call them.
-- The MCP server is `relay --actor user mcp` with `RELAY_MCP_OPS` set to `threads::AGENT_OPS`. A
-  thread has no session of its own, so the agent acts as the person; what it may do is exactly that
-  list, which `relay mcp` now enforces on calls as well as on the listing. Today: `bus.schema`,
-  `money.summary`, `money.lists`, `money.tx.list`, `money.series`, `money.tx.add`,
-  `money.tx.update`, `money.tx.restore`.
+- The MCP server is Relay's own (`relay mcp`, acting as the person), under an agent whose
+  environment sets `RELAY_MCP_OPS` to `threads::AGENT_OPS`. A thread has no session of its own, so
+  the agent acts as the person, and the list is enforced twice: the MCP server lists and answers
+  only those ops, and the socket door, which refuses the person's actor from any process the engine
+  started (`peer.rs`), knows each running agent's pid and admits a process in that tree for those
+  ops and `bus.ops` alone (`Peer::Thread`). Verified with real Claude (Haiku) against a disposable
+  engine: it read the budget and a series through these tools and answered with a chart.
+- The agent's start is checked: when Claude reports Relay's server missing, failed or with no
+  tools, the thread says so in an error message instead of letting the agent answer from nothing.
 - Each message is one stream-json line on the agent's stdin. Its stdout is read on a thread of its
   own: `thread.delta` events carry the reply as it is written, and each finished assistant message
   and tool answer is stored and announced with `thread.message`. Claude's `result` ends the turn.

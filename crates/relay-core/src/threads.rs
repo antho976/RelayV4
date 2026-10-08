@@ -42,6 +42,17 @@ pub const AGENT_OPS: &[&str] = &[
     "money.tx.restore",
 ];
 
+/// Whether a process in a thread agent's tree may call `op` as the person (`peer::Peer::Thread`):
+/// its ops, and `bus.ops`, which Relay's MCP server reads to list them.
+pub fn peer_may_call(op: &str) -> bool {
+    op == "bus.ops" || AGENT_OPS.contains(&op)
+}
+
+/// Each running agent's pid and its thread, for the socket door to know them (`peer::identify`).
+pub fn agent_pids(engine: &Engine) -> HashMap<u32, Id> {
+    lock(&engine.threads.live).agents.iter().map(|(id, agent)| (agent.pid, *id)).collect()
+}
+
 /// How long an agent may sit with nothing to do before it is closed.
 pub const IDLE: Duration = Duration::from_secs(15 * 60);
 /// The most agents running at once; starting another closes the one used longest ago.
@@ -458,12 +469,13 @@ pub fn deliver(engine: &Arc<Engine>, id: Id, text: &str) {
     emit_changed(engine, id);
 }
 
-/// The MCP server the agent is given: Relay's, as the person, answering only [`AGENT_OPS`].
+/// The MCP server the agent is given: Relay's, as the person. It lists only [`AGENT_OPS`] (the
+/// agent's environment carries `RELAY_MCP_OPS`, which the server inherits), and the socket door
+/// answers nothing else from the agent's tree (`peer::Peer::Thread`).
 fn mcp_config(engine: &Engine) -> String {
     json!({"mcpServers": {"relay": {
         "command": crate::hooks::relay_bin().display().to_string(),
         "args": ["--instance", engine.instance.as_str(), "--actor", "user", "mcp"],
-        "env": {"RELAY_MCP_OPS": AGENT_OPS.join(",")},
     }}})
     .to_string()
 }
@@ -505,9 +517,10 @@ fn spawn(engine: &Arc<Engine>, id: Id, first_line: &str) -> Result<(), String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // A thread is not a session: nothing of an agent session the engine may run inside leaks in.
-    for var in ["RELAY_SESSION", "RELAY_TOKEN", "RELAY_PROJECT_ID", "RELAY_WORKTREE", "RELAY_BRIEF", "RELAY_MCP_OPS"] {
+    for var in ["RELAY_SESSION", "RELAY_TOKEN", "RELAY_PROJECT_ID", "RELAY_WORKTREE", "RELAY_BRIEF"] {
         cmd.env_remove(var);
     }
+    cmd.env("RELAY_MCP_OPS", AGENT_OPS.join(","));
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -610,6 +623,19 @@ fn handle(engine: &Engine, id: Id, event: &Value) {
         Some("system") if event["subtype"] == "init" => {
             if let Some(reference) = event["session_id"].as_str().filter(|r| crate::providers::is_provider_ref(r)) {
                 let _ = with_db(engine, |db| db.set_agent_ref(id, reference));
+            }
+            // Without Relay's tools the agent can only guess; say so in the thread rather than
+            // let it answer from nothing.
+            let relay = event["mcp_servers"].as_array().into_iter().flatten().find(|s| s["name"] == "relay");
+            let mut status = relay.and_then(|s| s["status"].as_str()).unwrap_or("missing").to_string();
+            let tools = event["tools"].as_array().into_iter().flatten().filter(|t| t.as_str().is_some_and(|t| t.starts_with("mcp__relay__"))).count();
+            if status == "connected" && tools == 0 {
+                status = String::from("no tools listed");
+            }
+            if status != "connected" {
+                let status = status.as_str();
+                tracing::warn!(thread = id, status, "a thread's agent started without Relay's tools");
+                record(engine, id, "error", json!({"text": format!("The agent started without Relay's tools ({status}), so it cannot read your data.")}));
             }
         }
         Some("stream_event") => {
