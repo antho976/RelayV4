@@ -606,6 +606,8 @@ struct Sidebar {
     workspaces: [gtk::Widget; 2],
     add_project: gtk::Button,
     projects_box: gtk::Box,
+    /// The foot: the usage card (placed once usage exists) above you and Settings.
+    footer: gtk::Box,
     settings_key: gtk::Button,
 }
 
@@ -645,14 +647,14 @@ fn sidebar() -> Sidebar {
     shown.set_hexpand(true);
     shown.set_xalign(0.0);
     who.append(&shown);
-    who.append(&crate::icons::image("settings", 16));
+    who.append(&crate::icons::image("gear", 16));
     settings_key.set_child(Some(&who));
     let sidebar_footer = gtk::Box::new(gtk::Orientation::Vertical, 0);
     sidebar_footer.add_css_class("sidebar-footer");
     sidebar_footer.append(&settings_key);
     sidebar.append(&sidebar_footer);
     let workspaces = [section.upcast(), project_scroll.upcast()];
-    Sidebar { root: sidebar, nav, money_nav, workspaces, add_project, projects_box, settings_key }
+    Sidebar { root: sidebar, nav, money_nav, workspaces, add_project, projects_box, footer: sidebar_footer, settings_key }
 }
 
 /// The agent wall: the panes' grid and its right column, the empty state, and the focus tabs.
@@ -951,6 +953,7 @@ impl Ui {
         outer.append(&panel_host);
         let (bar, usage) = status_bar();
         outer.append(&bar.root);
+        side.footer.prepend(usage.card());
         let (wallpaper, wallpaper_dim) = backdrop(&window, &outer);
         let ui = Rc::new(Self {
             window,
@@ -1052,10 +1055,10 @@ impl Ui {
         let ui = self;
         let nav = &side.nav;
         for (name, caption, icon) in [
-            ("board", "Board", "view-list-symbolic"),
-            ("skills", "Skills", "applications-science-symbolic"),
-            ("plugins", "Plugins", "application-x-addon-symbolic"),
-            ("notes", "Notes", "accessories-text-editor-symbolic"),
+            ("board", "Board", "sidebar"),
+            ("skills", "Skills", "skills"),
+            ("plugins", "Plugins", "dashboard"),
+            ("notes", "Notes", "brief"),
         ] {
             let b = nav_button(caption, icon);
             b.set_widget_name(&format!("nav-{name}"));

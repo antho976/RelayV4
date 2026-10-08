@@ -6,6 +6,9 @@
 use super::*;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[path = "status_usage_card.rs"]
+mod card;
+
 const PROVIDERS: [(&str, &str); 2] = [("claude", "Claude"), ("codex", "Codex")];
 /// Minutes; 0 leaves refreshes to finished turns, engine events and the refresh keys.
 const INTERVALS: [(u64, &str); 6] = [(0, "Off"), (1, "1m"), (5, "5m"), (15, "15m"), (30, "30m"), (60, "1h")];
@@ -218,6 +221,8 @@ struct Options {
 
 pub(crate) struct UsageState {
     pub(crate) strip: gtk::Box,
+    /// The sidebar's card, which `app.rs` places above you at the foot.
+    card: card::Card,
     age: gtk::Label,
     refresh: gtk::Button,
     /// Unix seconds of the last successful `usage.get`.
@@ -240,6 +245,10 @@ pub(crate) struct UsageState {
 }
 
 impl UsageState {
+    pub(crate) fn card(&self) -> &gtk::Box {
+        &self.card.root
+    }
+
     pub(crate) fn new() -> Self {
         let strip = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         strip.add_css_class("usage-strip");
@@ -253,6 +262,7 @@ impl UsageState {
         strip.append(&refresh);
         Self {
             strip,
+            card: card::Card::new(),
             age,
             refresh,
             checked: Cell::new(None),
@@ -320,9 +330,11 @@ impl Ui {
             } else {
                 ui.render_usage_age();
                 ui.render_usage_popup();
+                ui.render_usage_card();
             }
             glib::ControlFlow::Continue
         });
+        self.install_usage_card();
         self.render_usage();
     }
 
@@ -479,6 +491,7 @@ impl Ui {
         self.render_usage_meters();
         self.render_usage_age();
         self.render_usage_popup();
+        self.render_usage_card();
     }
 
     fn render_usage_meters(&self) {
@@ -743,7 +756,7 @@ impl Ui {
         let mut controls = Options::default();
         let options = gtk::Box::new(gtk::Orientation::Vertical, 8);
         options.add_css_class("usage-options");
-        options.append(&label("Show in the status bar", "usage-options-title"));
+        options.append(&label("Show in the status bar and sidebar", "usage-options-title"));
         for (provider, name) in PROVIDERS {
             let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
             row.add_css_class("usage-option-row");

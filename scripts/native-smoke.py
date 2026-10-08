@@ -58,6 +58,13 @@ print("Disposable provider fixture, no model connected.", flush=True)
 print("Session: " + os.environ.get("RELAY_SESSION", "fixture"), flush=True)
 print("\\nEngine owns this PTY. VTE renders its output.", flush=True)
 print("  [ok] isolated worktree\\n  [ok] ordered output\\n  [ok] waiting for input", flush=True)
+# Fixed limits for the status bar and the sidebar's usage card: a test engine never reads the
+# providers' own files. A Codex session's Claude report is refused, and that is fine.
+import json as _json, subprocess as _subprocess, time as _time
+_now = int(_time.time())
+_subprocess.run([os.environ["RELAY_BIN"], "cmd", "usage.report", _json.dumps({"session": os.environ.get("RELAY_SESSION", ""),
+    "provider": "claude", "payload": {"five_hour": {"used_pct": 12, "resets_at": _now + 13290, "resets_in": "3h 41m"},
+    "seven_day": {"used_pct": 29, "resets_at": _now + 4 * 86400, "resets_in": "4d 0h"}}})], capture_output=True)
 for line in sys.stdin:
     if line.strip()=="native-burst":
         for i in range(2048): print(f"B{i:06d} " + "x"*88)

@@ -80,3 +80,29 @@
 .usage-chips button.usage-chip:checked label { color: @wall; }
 .usage-chips:disabled { opacity: 0.45; }
 .usage-footnote { padding: 10px 16px 14px; border-top: 1px solid @edge; color: @faint; font-size: 11px; }
+
+/* The sidebar's card, above you at the foot: one provider, its meters as thin rounded bars. */
+.usage-card { margin-bottom: 10px; padding: 10px 10px 12px 12px; border: 1px solid @edge; border-radius: 14px; background: @slab; }
+.usage-card-tabs { padding: 3px; border: 1px solid @edge; border-radius: 10px; background: @console; }
+.usage-card-tabs button { min-height: 26px; padding: 0 14px; border: 0; border-radius: 7px; background: transparent; color: @faint; font-size: 13px; font-weight: 500; }
+.usage-card-tabs button label { color: @faint; }
+.usage-card-tabs button:hover { background: transparent; }
+.usage-card-tabs button:hover label { color: @secondary; }
+.usage-card-tabs button:checked { background: @track; }
+.usage-card-tabs button:checked label { color: @ink; }
+.usage-card-head button.icon-key { min-width: 26px; min-height: 26px; color: @faint; }
+.usage-card-head button.icon-key:hover { color: @ink; }
+.usage-card-body { padding-right: 2px; }
+.usage-card-caption { margin: 14px 0 2px; color: @faint; font-size: 12px; }
+.usage-card-row { margin-top: 12px; }
+.usage-card-title { color: @secondary; font-size: 13px; }
+.usage-card-pct { color: @secondary; font-family: 'Geist Mono', monospace; font-size: 12px; }
+.usage-card-pct.warn { color: @waiting; }
+.usage-card-pct.hot { color: @held; }
+.usage-card-pct.stale { color: @faint; }
+.usage-card-bar trough { min-height: 4px; border: 0; border-radius: 999px; background: @track; }
+.usage-card-bar progress { min-height: 4px; border: 0; border-radius: 999px; background-image: none; box-shadow: none; background: @ink; }
+.usage-card-bar.warn progress { background: @waiting; }
+.usage-card-bar.hot progress { background: @held; }
+.usage-card-bar.stale progress { background: @faint; }
+.usage-card-reset { margin-top: 14px; color: @faint; font-size: 12px; }
