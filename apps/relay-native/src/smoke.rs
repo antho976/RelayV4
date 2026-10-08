@@ -122,6 +122,14 @@ fn record_geometry(ui: &Ui, screenshot: &str) {
         .expect("Save widget geometry");
 }
 
+/// The stack of settings categories, found from one of its controls.
+fn categories_stack(ui: &Ui) -> Option<gtk::Stack> {
+    let save = named(&ui.window, "guardrail-save")?;
+    std::iter::successors(save.parent(), |w| w.parent())
+        .filter_map(|w| w.downcast::<gtk::Stack>().ok())
+        .find(|stack| stack.child_by_name("safety").is_some())
+}
+
 async fn verify_settings_save(ui: Rc<Ui>) -> Result<(), String> {
     const THRESHOLD: &str = "guardrail-field:destructive_write.min_removed_pct";
     wait_for(
@@ -132,10 +140,9 @@ async fn verify_settings_save(ui: Rc<Ui>) -> Result<(), String> {
         "Settings and guardrail fields loaded",
     )
     .await?;
-    let font = named(&ui.window, "setting:terminal.font_size")
-        .ok_or("Font size field missing")?
-        .downcast::<gtk::SpinButton>()
-        .map_err(|_| "Font size field type")?;
+    // The font size is a stepper: − value +, in steps of a quarter point.
+    let font = named(&ui.window, "setting:terminal.font_size").ok_or("Font size field missing")?;
+    let more = font.last_child().and_downcast::<gtk::Button>().ok_or("Font size stepper has no + key")?;
     let opacity = named(&ui.window, "setting:appearance.panel_alpha")
         .unwrap()
         .downcast::<gtk::Scale>()
@@ -144,41 +151,42 @@ async fn verify_settings_save(ui: Rc<Ui>) -> Result<(), String> {
         .unwrap()
         .downcast::<gtk::SpinButton>()
         .map_err(|_| "Guardrail threshold type")?;
-    // Not 9.75: that is the default, so Save would rightly send nothing for it.
-    font.set_value(10.25);
+    // From 9.75, the default, which a save would rightly leave alone, to 10.25.
+    more.emit_clicked();
+    more.emit_clicked();
     opacity.set_value(0.96);
+    // The layered editor keeps its fields off until the layers are read; a value set before
+    // that is overwritten by the fill.
+    wait_for(|| threshold.is_sensitive(), "Guardrail layers loaded").await?;
     threshold.set_value(62.5);
     // Guardrails save on their own: the layered editor sends only the fields that changed.
     // Its key stays disabled until a field differs, so this fails if that wiring breaks.
     // It lives on the Guardrails category, so show that first, as its category key does.
-    let guardrail_save = named(&ui.window, "guardrail-save").ok_or("Missing control: guardrail-save")?;
-    let categories = std::iter::successors(guardrail_save.parent(), |w| w.parent())
-        .filter_map(|w| w.downcast::<gtk::Stack>().ok())
-        .find(|stack| stack.child_by_name("safety").is_some())
-        .ok_or("guardrail-save is not inside the settings categories")?;
-    categories.set_visible_child_name("safety");
+    let category = |name: &str| -> Result<(), String> {
+        named(&ui.window, &format!("settings-category-{name}"))
+            .and_downcast::<gtk::ToggleButton>()
+            .ok_or(format!("Missing settings category: {name}"))?
+            .set_active(true);
+        Ok(())
+    };
+    category("safety")?;
     wait_for(|| clickable(&ui.window, "guardrail-save"), "Guardrail save shown and enabled").await?;
     click(&ui.window, "guardrail-save")?;
-    click(&ui.window, "settings-save")?;
-    require(
-        !ui.pages["settings"].is_sensitive(),
-        "Save must lock its snapshot while persisting",
-    )?;
-    // One settings.set per field, beside the guardrail save: generous, but bounded.
-    wait_within(
-        Duration::from_secs(15),
-        || ui.pages["settings"].is_sensitive(),
-        "Settings save must finish",
-    )
-    .await?;
     let read = |op: &'static str, payload: serde_json::Value| {
         let ui = ui.clone();
         async move { ui.call(op, payload).await.map_err(|e| format!("{op}: {e}")) }
     };
-    let font = read("settings.get", json!({"path":"terminal.font_size"})).await?;
-    let opacity = read("settings.get", json!({"path":"appearance.panel_alpha"})).await?;
-    require(font["value"].as_f64() == Some(10.25), "Font size was not saved")?;
-    require(opacity["value"].as_f64() == Some(0.96), "Opacity was not saved")?;
+    // Every other control saves itself a moment after it changes.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let font = read("settings.get", json!({"path":"terminal.font_size"})).await?;
+        let opacity = read("settings.get", json!({"path":"appearance.panel_alpha"})).await?;
+        if font["value"].as_f64() == Some(10.25) && opacity["value"].as_f64() == Some(0.96) {
+            break;
+        }
+        require(Instant::now() < deadline, "Font size and opacity were not saved on their own")?;
+        glib::timeout_future(Duration::from_millis(50)).await;
+    }
     // The guardrail save runs on its own call; read until it lands, within the same budget.
     let deadline = Instant::now() + util::WAIT;
     loop {
@@ -188,6 +196,17 @@ async fn verify_settings_save(ui: Rc<Ui>) -> Result<(), String> {
         }
         require(Instant::now() < deadline, "Guardrail threshold was not saved")?;
         glib::timeout_future(Duration::from_millis(50)).await;
+    }
+    // The capture shows Appearance, or the category RELAY_NATIVE_SETTINGS_CATEGORY names.
+    let shown = std::env::var("RELAY_NATIVE_SETTINGS_CATEGORY").unwrap_or_else(|_| "appearance".into());
+    category(&shown)?;
+    // RELAY_NATIVE_SETTINGS_SCROLL scrolls that category's column down by so many pixels.
+    if let Some(offset) = std::env::var("RELAY_NATIVE_SETTINGS_SCROLL").ok().and_then(|v| v.parse::<f64>().ok()) {
+        glib::timeout_future(Duration::from_millis(300)).await;
+        let column = categories_stack(&ui).and_then(|stack| stack.child_by_name(&shown)).and_downcast::<gtk::ScrolledWindow>();
+        if let Some(column) = column {
+            column.vadjustment().set_value(offset);
+        }
     }
     println!("Settings save verified across categories, including fractional values");
     Ok(())
