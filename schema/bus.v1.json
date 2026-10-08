@@ -4,7 +4,7 @@
   "title": "RELAY v4 command bus",
   "description": "Generated from crates/relay-bus by `relay schema`. Do not edit; see docs/engine/BUS.md.",
   "version": 1,
-  "op_count": 256,
+  "op_count": 257,
   "envelope": {
     "request": {
       "$ref": "#/$defs/Request"
@@ -4931,6 +4931,26 @@
       },
       "result": {
         "$ref": "#/$defs/Empty"
+      }
+    },
+    "thread.set": {
+      "summary": "Choose a thread's model and effort; a running agent restarts with them on the next message",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "thread.changed"
+      ],
+      "since": "1.0",
+      "phase": 5,
+      "payload": {
+        "$ref": "#/$defs/ThreadSetIn"
+      },
+      "result": {
+        "$ref": "#/$defs/ThreadView"
       }
     },
     "thread.rename": {
@@ -17087,6 +17107,13 @@
             "null"
           ]
         },
+        "effort": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "`low`, `medium`, `high`, `xhigh` or `max`; the provider's default when absent."
+        },
         "created_at": {
           "type": "string"
         },
@@ -17205,6 +17232,13 @@
             "null"
           ],
           "description": "A model for this thread's agent; the provider's default when absent."
+        },
+        "effort": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "How hard it thinks: `low`, `medium`, `high`, `xhigh` or `max`; the default when absent."
         }
       }
     },
@@ -17232,6 +17266,33 @@
         "id": {
           "type": "integer",
           "format": "int64"
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "ThreadSetIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The agent's model; empty or absent for the provider's default."
+        },
+        "effort": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The agent's effort; empty or absent for the default."
         }
       },
       "required": [

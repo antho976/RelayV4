@@ -128,3 +128,17 @@ An agent asks for a chart by writing a fenced block with the language `chart` an
 - The card (`apps/relay-native/src/threads_chart.rs`) reads its numbers when drawn and again on every
   `money.changed`. Colour is the data's: the newest period in Relay's lime, earlier ones in blue,
   orange and on; hovering a group gives its values. Labels and axis are Dev's type.
+
+## Model and effort, and the Tally pages (2026-10-08)
+
+- **Each thread picks its model and effort** in the message box (Default, Opus 5.5, Sonnet 5.5,
+  Haiku 5.5, Fable 5.1; effort Default, Low to Max). `thread.set` stores them (`threads.db`
+  version 2 adds `effort`) and closes a running agent, so the next message resumes the same
+  conversation with `--model` and `--effort`. A new thread starts with the last choice.
+- **Tally's pages are dense:** each opens on a strip of figures (Overview: left to spend, spent,
+  income, net worth and the pace; Entries: count, in, out, net; Plan: monthly budget, given to
+  categories, unassigned, spent), then cards of compact rows with category badges and icons.
+  Overview fits budgets, bills and recent entries on one screen; Entries groups days with their net;
+  Plan is one table; Data is a two-column settings list.
+- **The sidebar and the Tally panel can be dragged** wider or narrower (sidebar 200 to 420 pixels;
+  the panel opens at 340).

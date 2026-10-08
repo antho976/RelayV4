@@ -120,6 +120,18 @@ fn a_message_gets_an_answer_and_a_cold_thread_resumes_by_its_id() {
     assert_eq!(runs.len(), 2);
     assert!(!runs[0].contains("--resume"));
     assert!(runs[1].contains("--resume fake-session-1"), "{}", runs[1]);
+
+    // A new model and effort close the agent; the next message resumes with them.
+    let set = ok(&engine, "thread.set", json!({"id": created["id"], "model": "claude-sonnet-5-5", "effort": "max"}));
+    assert_eq!((set["model"].as_str(), set["effort"].as_str(), set["live"].as_bool()), (Some("claude-sonnet-5-5"), Some("max"), Some(false)));
+    assert_eq!(code(call(&engine, "thread.set", json!({"id": created["id"], "effort": "ludicrous"}))), "thread.invalid");
+    ok(&engine, "thread.send", json!({"id": created["id"], "text": "And now?"}));
+    settled(&engine, &created["id"], 16);
+    let later = std::fs::read_to_string(&log).unwrap();
+    let last = later.lines().last().unwrap();
+    assert!(last.contains("--model claude-sonnet-5-5") && last.contains("--effort max") && last.contains("--resume fake-session-1"), "{last}");
+    let cleared = ok(&engine, "thread.set", json!({"id": created["id"], "model": "", "effort": ""}));
+    assert!(cleared["model"].is_null() && cleared["effort"].is_null());
     let ops = runs[1].split_whitespace().next().unwrap();
     assert!(ops.starts_with("OPS=") && ops.contains("money.tx.add") && !ops.contains("money.reset"), "{ops}");
     ok(&engine, "thread.delete", json!({"id": created["id"]}));

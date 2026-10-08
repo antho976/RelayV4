@@ -4,7 +4,7 @@
 //! Threads are the engine's (`thread.*`); this page draws them and follows `thread.changed`,
 //! `thread.message` and `thread.delta`. The page is one stack page, `threads`, whose middle shows
 //! either a new thread (a greeting and the message box) or the open one.
-use super::pages::{badge, human_date, meter_in, tone, tone_class};
+use super::pages::{badge, badge_sized, human_date, meter_in, tile, tone, tone_class};
 use crate::app::{button, clear, label, Ui};
 use gtk::prelude::*;
 use gtk4 as gtk;
@@ -25,6 +25,25 @@ const SUGGESTIONS: [(&str, &str); 4] = [
     ("Which entries have no category?", "It suggests one for each, you approve"),
 ];
 
+/// The models a thread may run on: (id, caption). An empty id is Claude's own default.
+const MODELS: [(&str, &str); 5] = [
+    ("", "Default model"),
+    ("claude-opus-5-5", "Opus 5.5"),
+    ("claude-sonnet-5-5", "Sonnet 5.5"),
+    ("claude-haiku-5-5", "Haiku 5.5"),
+    ("claude-fable-5-1", "Fable 5.1"),
+];
+
+/// How hard the agent thinks: (value, caption), as `claude --effort` takes them.
+const EFFORTS: [(&str, &str); 6] = [
+    ("", "Default effort"),
+    ("low", "Low effort"),
+    ("medium", "Medium effort"),
+    ("high", "High effort"),
+    ("xhigh", "Extra high effort"),
+    ("max", "Max effort"),
+];
+
 /// The Tally panel's views: (key, caption).
 const PANEL_TABS: [(&str, &str); 3] = [("overview", "Overview"), ("entries", "Entries"), ("budgets", "Budgets")];
 
@@ -39,12 +58,14 @@ struct View {
     composer: gtk::Box,
     input: gtk::TextView,
     send: gtk::Button,
+    model: (gtk::MenuButton, gtk::Label),
+    effort: (gtk::MenuButton, gtk::Label),
     scroll: gtk::ScrolledWindow,
     column: gtk::Box,
     /// The reply being written: its label, shown while `thread.delta` text arrives.
     pending: gtk::Label,
     working: gtk::Box,
-    panel: gtk::Revealer,
+    panel: gtk::Box,
     panel_body: gtk::Box,
     panel_tabs: Vec<(&'static str, gtk::Button)>,
 }
@@ -65,6 +86,8 @@ struct State {
     panel_tab: Cell<&'static str>,
     listing: Cell<bool>,
     ui: RefCell<std::rc::Weak<Ui>>,
+    /// The model and effort a new thread starts with: the last ones chosen.
+    choice: RefCell<(String, String)>,
 }
 
 thread_local! {
@@ -146,7 +169,9 @@ pub fn page() -> gtk::Box {
     strip.append(&panel_key);
     root.append(&strip);
 
-    let body = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    // The conversation and the Tally panel share a split the person can drag.
+    let body = gtk::Paned::new(gtk::Orientation::Horizontal);
+    body.add_css_class("threads-split");
     body.set_vexpand(true);
     let conversation = gtk::Box::new(gtk::Orientation::Vertical, 0);
     conversation.set_hexpand(true);
@@ -161,7 +186,7 @@ pub fn page() -> gtk::Box {
     empty.add_css_class("threads-empty");
     empty.set_valign(gtk::Align::Center);
     empty.set_halign(gtk::Align::Center);
-    empty.set_size_request(640, -1);
+    empty.set_size_request(460, -1);
     let greeting = label(&super::greeting(), "threads-greeting");
     greeting.set_xalign(0.5);
     let empty_line = label("", "threads-greeting-line");
@@ -242,7 +267,11 @@ pub fn page() -> gtk::Box {
     source.append(&label("Tally", ""));
     source.set_tooltip_text(Some("This thread's agent reads and changes your Tally budget"));
     row.append(&source);
-    let limits = label("Can edit, asks before deleting", "threads-chip");
+    let model = picker("threads-model", "The model this thread's agent runs on", &MODELS, |value| choose(Some(value), None));
+    row.append(&model.0);
+    let effort = picker("threads-effort", "How hard the agent thinks before answering", &EFFORTS, |value| choose(None, Some(value)));
+    row.append(&effort.0);
+    let limits = label("Asks before deleting", "threads-chip");
     limits.set_tooltip_text(Some("It adds and changes entries, each with an Undo. Deleting, budgets and accounts stay yours."));
     row.append(&limits);
     let gap = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -260,16 +289,14 @@ pub fn page() -> gtk::Box {
     dock.add_css_class("threads-dock");
     dock.set_halign(gtk::Align::Center);
     conversation.append(&dock);
-    body.append(&conversation);
+    body.set_start_child(Some(&conversation));
+    body.set_resize_start_child(true);
+    body.set_shrink_start_child(false);
 
-    // The Tally panel.
-    let panel = gtk::Revealer::new();
-    panel.set_transition_type(gtk::RevealerTransitionType::SlideLeft);
-    panel.set_transition_duration(160);
-    panel.set_reveal_child(true);
+    // The Tally panel: 340 pixels as it opens, 280 at the least.
     let side = gtk::Box::new(gtk::Orientation::Vertical, 18);
     side.add_css_class("threads-panel");
-    side.set_size_request(340, -1);
+    side.set_size_request(280, -1);
     let tabs = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     tabs.add_css_class("view-tabs");
     tabs.set_homogeneous(true);
@@ -285,13 +312,23 @@ pub fn page() -> gtk::Box {
     let panel_scroll = crate::app::scrolled(&panel_body);
     panel_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
     side.append(&panel_scroll);
-    panel.set_child(Some(&side));
-    body.append(&panel);
+    body.set_end_child(Some(&side));
+    body.set_resize_end_child(false);
+    body.set_shrink_end_child(false);
+    // Place the split once the page has a width: the panel opens at 340.
+    body.add_tick_callback(|split, _| {
+        if split.width() <= 0 {
+            return glib::ControlFlow::Continue;
+        }
+        split.set_position((split.width() - 340).max(0));
+        glib::ControlFlow::Break
+    });
+    let panel = side.clone();
     root.append(&body);
 
     let built = Rc::new(View {
         title, title_key, rename, middle, empty_slot, empty_line, dock, composer, input,
-        send: send_key, scroll, column, pending, working, panel, panel_body, panel_tabs,
+        send: send_key, model, effort, scroll, column, pending, working, panel, panel_body, panel_tabs,
     });
     STATE.with(|s| {
         s.panel_tab.set("overview");
@@ -354,8 +391,8 @@ fn wire(v: &Rc<View>, delete: &gtk::Button, panel_key: &gtk::Button) {
     });
     let panel = v.panel.clone();
     panel_key.connect_clicked(move |_| {
-        let open = !panel.reveals_child();
-        panel.set_reveal_child(open);
+        let open = !panel.is_visible();
+        panel.set_visible(open);
         if open {
             if let Some(ui) = the_ui() {
                 refresh_panel(&ui);
@@ -392,8 +429,80 @@ fn place_composer(v: &View, empty: bool) {
     v.dock.set_visible(!empty);
 }
 
+/// A chip that opens a list of `options` and runs `pick` with the one chosen.
+fn picker(name: &str, about: &str, options: &'static [(&'static str, &'static str)], pick: fn(&str)) -> (gtk::MenuButton, gtk::Label) {
+    let key = gtk::MenuButton::new();
+    key.add_css_class("threads-picker");
+    key.set_widget_name(name);
+    key.set_tooltip_text(Some(about));
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let shown = label(options[0].1, "");
+    row.append(&shown);
+    row.append(&crate::icons::image("chevron-down", 10));
+    key.set_child(Some(&row));
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    list.add_css_class("threads-menu");
+    let popover = gtk::Popover::new();
+    for (value, caption) in options {
+        let item = button(caption, "nav");
+        item.set_widget_name(&format!("{name}-{}", if value.is_empty() { "default" } else { value }));
+        let popover = popover.downgrade();
+        item.connect_clicked(move |_| {
+            if let Some(p) = popover.upgrade() {
+                p.popdown();
+            }
+            pick(value);
+        });
+        list.append(&item);
+    }
+    popover.set_child(Some(&list));
+    key.set_popover(Some(&popover));
+    (key, shown)
+}
+
+fn caption_of(options: &[(&str, &'static str)], value: &str) -> String {
+    options.iter().find(|(v, _)| *v == value).map_or_else(|| value.to_string(), |(_, c)| c.to_string())
+}
+
+/// Show `model` and `effort` on the pickers.
+fn show_choice(v: &View, model: &str, effort: &str) {
+    v.model.1.set_text(&caption_of(&MODELS, model));
+    v.effort.1.set_text(&caption_of(&EFFORTS, effort));
+}
+
+/// A model or an effort picked: the thread showing takes it (`thread.set`), and new threads start
+/// with it.
+fn choose(model: Option<&str>, effort: Option<&str>) {
+    let (model, effort) = STATE.with(|s| {
+        let mut choice = s.choice.borrow_mut();
+        if let Some(m) = model {
+            choice.0 = m.to_string();
+        }
+        if let Some(e) = effort {
+            choice.1 = e.to_string();
+        }
+        choice.clone()
+    });
+    if let Some(v) = view() {
+        show_choice(&v, &model, &effort);
+    }
+    let (Some(ui), Some(id)) = (the_ui(), current()) else { return };
+    glib::spawn_future_local(async move {
+        match ui.call("thread.set", json!({"id": id, "model": model, "effort": effort})).await {
+            Ok(thread) => {
+                if let Some(v) = view() {
+                    header(&v, &thread);
+                }
+            }
+            Err(e) => ui.show_error(&e.to_string()),
+        }
+    });
+}
+
 fn show_empty(v: &View) {
     v.middle.set_visible_child_name("empty");
+    let (model, effort) = STATE.with(|s| s.choice.borrow().clone());
+    show_choice(v, &model, &effort);
     v.title.set_text("New thread");
     v.title_key.set_visible(false);
     place_composer(v, true);
@@ -488,11 +597,18 @@ fn draw_thread(read: &Value) {
         draw_message(&v, message);
     }
     stick_to_bottom(&v, true);
+    // Charts read their numbers after this and grow the column: land on the newest message again.
+    glib::timeout_add_local_once(std::time::Duration::from_millis(400), || {
+        if let Some(v) = view() {
+            stick_to_bottom(&v, true);
+        }
+    });
     v.input.grab_focus();
 }
 
 fn header(v: &View, thread: &Value) {
     v.title.set_text(thread["title"].as_str().unwrap_or("Thread"));
+    show_choice(v, thread["model"].as_str().unwrap_or(""), thread["effort"].as_str().unwrap_or(""));
     set_working(v, thread["working"] == true);
 }
 
@@ -770,7 +886,11 @@ fn send(ui: &Rc<Ui>, text: &str) {
     glib::spawn_future_local(async move {
         let result = match current() {
             Some(id) => ui.call("thread.send", json!({"id": id, "text": text})).await.map(|_| id),
-            None => ui.call("thread.create", json!({"text": text})).await.map(|t| t["id"].as_i64().unwrap_or(0)),
+            None => {
+                let (model, effort) = STATE.with(|s| s.choice.borrow().clone());
+                let payload = json!({"text": text, "model": (!model.is_empty()).then_some(model), "effort": (!effort.is_empty()).then_some(effort)});
+                ui.call("thread.create", payload).await.map(|t| t["id"].as_i64().unwrap_or(0))
+            }
         };
         match result {
             Ok(id) if current() != Some(id) => open(&ui, id),
@@ -972,7 +1092,7 @@ pub async fn refresh(ui: &Rc<Ui>) {
 /// Re-read the Tally panel's view, if it is open.
 pub fn refresh_panel(ui: &Rc<Ui>) {
     let Some(v) = view() else { return };
-    if !v.panel.reveals_child() {
+    if !v.panel.is_visible() {
         return;
     }
     let tab = STATE.with(|s| s.panel_tab.get());
@@ -1014,6 +1134,22 @@ fn caption(text: &str) -> gtk::Label {
     label(text, "threads-caption")
 }
 
+/// A titled block of the panel: its caption, an optional count on the right, and its rows.
+fn block(body: &gtk::Box, name: &str, aside: &str) -> gtk::Box {
+    let block = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    block.add_css_class("threads-block");
+    let head = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let title = caption(name);
+    title.set_hexpand(true);
+    head.append(&title);
+    if !aside.is_empty() {
+        head.append(&label(aside, "threads-panel-aside"));
+    }
+    block.append(&head);
+    body.append(&block);
+    block
+}
+
 fn panel_overview(ui: &Rc<Ui>, body: &gtk::Box, s: &Value) {
     super::remember_currency(s);
     if s["empty"] == true {
@@ -1034,101 +1170,239 @@ fn panel_overview(ui: &Rc<Ui>, body: &gtk::Box, s: &Value) {
     let fmt = super::formatter();
     let period = &s["period"];
     let days = period["days"].as_i64().unwrap_or(0);
-    let day = days - period["days_left"].as_i64().unwrap_or(0) + 1;
-    let head = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    head.append(&label(&format!("Day {day} of {days}"), "threads-panel-eyebrow"));
-    let budget = s["pace"]["budget"].as_i64().unwrap_or(0);
+    let days_left = period["days_left"].as_i64().unwrap_or(0);
+    let pace = &s["pace"];
+    let status = pace["status"].as_str().unwrap_or("");
+    let budget = pace["budget"].as_i64().unwrap_or(0);
+
+    // What is left, the pace across the period, and the month in two figures.
+    let head = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    head.add_css_class("threads-summary");
+    let when = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    when.append(&crate::money::pages_glyph("calendar", 13));
+    let day = (days - days_left + 1).clamp(1, days.max(1));
+    when.append(&label(&format!("Day {day} of {days} · {} left", copy_days(days_left)), "threads-panel-eyebrow"));
+    head.append(&when);
     if budget > 0 {
-        let left = s["pace"]["remaining"].as_i64().unwrap_or(0);
+        let left = pace["remaining"].as_i64().unwrap_or(0);
         let figure = label(&format!("{} left", fmt.format_whole(left)), "threads-panel-figure");
         if left < 0 {
             figure.add_css_class("money-over");
         }
         head.append(&figure);
-        head.append(&label(&format!("of {} planned this month", fmt.format_whole(budget)), "money-muted"));
+        let daily = pace["daily_allowance"].as_i64().unwrap_or(0);
+        let sub = if daily > 0 {
+            format!("of {} · {} a day from here", fmt.format_whole(budget), fmt.format_whole(daily))
+        } else {
+            format!("of {} planned this month", fmt.format_whole(budget))
+        };
+        head.append(&label(&sub, "money-muted"));
+        let bar = meter_in(pace["spent_fraction"].as_f64().unwrap_or(0.0), pace["pace_fraction"].as_f64(), tone(status, None), 6);
+        bar.set_margin_top(6);
+        bar.set_tooltip_text(Some("The tick is where an even spend would be today"));
+        head.append(&bar);
+        if let Some(line) = s["lines"]["pace"].as_str().filter(|l| !l.is_empty()) {
+            let l = label(line, "threads-panel-detail");
+            l.set_wrap(true);
+            if let Some(class) = tone_class(status) {
+                l.add_css_class(class);
+            }
+            head.append(&l);
+        }
     } else {
         head.append(&label(&format!("{} spent", fmt.format_whole(s["spent"].as_i64().unwrap_or(0))), "threads-panel-figure"));
-    }
-    if let Some(line) = s["lines"]["pace"].as_str().filter(|l| !l.is_empty()) {
-        let l = label(line, "money-muted");
-        l.set_wrap(true);
-        head.append(&l);
+        head.append(&label("No monthly budget yet: set one in Tally's Plan.", "money-muted"));
     }
     body.append(&head);
-    panel_budgets(body, s, 5);
-    let recent = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    recent.append(&caption("Recent"));
-    for tx in s["recent"].as_array().into_iter().flatten().take(6) {
-        recent.append(&entry_row(tx));
+
+    let stats = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    stats.set_homogeneous(true);
+    let spent = s["spent"].as_i64().unwrap_or(0);
+    let income = s["income"].as_i64().unwrap_or(0);
+    for (icon, name, value, class) in [("spend", "Spent", spent, ""), ("income", "Income", income, "money-in")] {
+        let stat = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        stat.add_css_class("threads-stat");
+        let top = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        top.append(&crate::money::pages_glyph(icon, 13));
+        top.append(&label(name, "threads-panel-detail"));
+        stat.append(&top);
+        let figure = label(&fmt.format_whole(value), "threads-stat-figure");
+        if !class.is_empty() && value > 0 {
+            figure.add_css_class(class);
+        }
+        stat.append(&figure);
+        stats.append(&stat);
     }
-    body.append(&recent);
+    body.append(&stats);
+
+    panel_budgets(body, s, 5);
+
+    let bills: Vec<&Value> = s["bills"].as_array().into_iter().flatten().take(3).collect();
+    if !bills.is_empty() {
+        let list = block(body, "Coming up", "");
+        for bill in bills {
+            let income = bill["type"] == "INCOME";
+            let amount = bill["amount"].as_i64().unwrap_or(0);
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+            row.add_css_class("threads-entry");
+            row.append(&tile(if income { "income" } else { "calendar" }));
+            let words = gtk::Box::new(gtk::Orientation::Vertical, 1);
+            words.set_hexpand(true);
+            let name = label(bill["name"].as_str().unwrap_or(""), "threads-panel-name");
+            name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            words.append(&name);
+            let due = label(bill["due_line"].as_str().unwrap_or(""), "threads-panel-detail");
+            if bill["days_until"].as_i64().unwrap_or(99) <= 3 && !income {
+                due.add_css_class("money-ahead");
+            }
+            words.append(&due);
+            row.append(&words);
+            let figure = label(&if income { fmt.format_signed(amount) } else { format!("−{}", fmt.format(amount)) }, "threads-panel-figures");
+            if income {
+                figure.add_css_class("money-in");
+            }
+            figure.set_valign(gtk::Align::Center);
+            row.append(&figure);
+            list.append(&row);
+        }
+    }
+
+    let recent: Vec<&Value> = s["recent"].as_array().into_iter().flatten().take(5).collect();
+    let list = block(body, "Recent", "");
+    if recent.is_empty() {
+        list.append(&label("Nothing logged this period yet.", "money-muted"));
+    }
+    for tx in recent {
+        list.append(&entry_row(tx, true));
+    }
+}
+
+fn copy_days(n: i64) -> String {
+    if n == 1 { String::from("1 day") } else { format!("{n} days") }
 }
 
 fn panel_budgets(body: &gtk::Box, s: &Value, most: usize) {
-    let budgets: Vec<&Value> = s["budgets"].as_array().into_iter().flatten().collect();
-    let block = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    block.append(&caption("Budgets"));
+    let mut budgets: Vec<&Value> = s["budgets"].as_array().into_iter().flatten().filter(|b| b["budget"].as_i64().unwrap_or(0) > 0).collect();
+    let pace = s["pace"]["pace_fraction"].as_f64();
+    let ahead = |b: &Value| b["spent"].as_i64().unwrap_or(0) as f64 / b["budget"].as_i64().unwrap_or(1).max(1) as f64;
+    budgets.sort_by(|a, b| ahead(b).total_cmp(&ahead(a)));
+    let total = budgets.len();
+    let aside = if total > most { format!("{most} of {total}") } else { String::new() };
+    let list = block(body, "Budgets", &aside);
     if budgets.is_empty() {
         let note = label("No budgets yet. Set them in Tally's Plan.", "money-muted");
         note.set_wrap(true);
-        block.append(&note);
+        list.append(&note);
     }
     let fmt = super::formatter();
-    let pace = s["pace"]["pace_fraction"].as_f64();
     for b in budgets.into_iter().take(most) {
         let (spent, budget) = (b["spent"].as_i64().unwrap_or(0), b["budget"].as_i64().unwrap_or(0));
         let status = b["status"].as_str().unwrap_or("");
-        let row = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        row.add_css_class("threads-budget");
+        row.append(&badge_sized(b["icon"].as_str().unwrap_or("dots"), b["color"].as_i64().unwrap_or(10), 24));
+        let right = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        right.set_hexpand(true);
         let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         let name = label(b["name"].as_str().unwrap_or(""), "threads-panel-name");
         name.set_hexpand(true);
+        name.set_ellipsize(gtk::pango::EllipsizeMode::End);
         line.append(&name);
-        let figure = label(&format!("{} / {}", fmt.format_whole(spent), fmt.format_whole(budget)), "threads-panel-figures");
+        let left = budget - spent;
+        let rest = label(&if left < 0 { format!("{} over", fmt.format_whole(-left)) } else { format!("{} left", fmt.format_whole(left)) }, "threads-panel-figures");
         if let Some(class) = tone_class(status) {
-            figure.add_css_class(class);
+            rest.add_css_class(class);
         }
-        line.append(&figure);
-        row.append(&line);
-        let fraction = if budget > 0 { spent as f64 / budget as f64 } else { 0.0 };
-        row.append(&meter_in(fraction, pace, tone(status, b["color"].as_i64()), 4));
-        block.append(&row);
+        line.append(&rest);
+        right.append(&line);
+        let bar = meter_in(spent as f64 / budget.max(1) as f64, pace, tone(status, b["color"].as_i64()), 4);
+        bar.set_tooltip_text(Some(&format!("{} of {}", fmt.format(spent), fmt.format_whole(budget))));
+        right.append(&bar);
+        row.append(&right);
+        list.append(&row);
     }
-    body.append(&block);
 }
 
-fn entry_row(tx: &Value) -> gtk::Box {
+/// One entry in the panel: its badge, what it was over its category and day, and the amount.
+fn entry_row(tx: &Value, dated: bool) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     row.add_css_class("threads-entry");
+    let transfer = tx["type"] == "TRANSFER";
+    row.append(&badge_sized(if transfer { "repeat" } else { tx["icon"].as_str().unwrap_or("dots") }, if transfer { 10 } else { tx["color"].as_i64().unwrap_or(10) }, 24));
     let words = gtk::Box::new(gtk::Orientation::Vertical, 1);
     words.set_hexpand(true);
-    let what = tx["note"].as_str().filter(|n| !n.trim().is_empty()).or(tx["category"].as_str()).unwrap_or("Entry");
-    let title = label(what, "threads-panel-name");
+    let category = tx["category"].as_str().unwrap_or(if transfer { "Transfer" } else { "Entry" });
+    let note = tx["note"].as_str().map(str::trim).filter(|n| !n.is_empty());
+    let title = label(note.unwrap_or(category), "threads-panel-name");
     title.set_ellipsize(gtk::pango::EllipsizeMode::End);
     words.append(&title);
     let mut detail = Vec::new();
-    if let Some(category) = tx["category"].as_str().filter(|c| Some(*c) != Some(what)) {
+    if note.is_some() {
         detail.push(category.to_string());
     }
-    detail.push(human_date(tx["date"].as_str().unwrap_or("")));
-    words.append(&label(&detail.join(" · "), "threads-panel-detail"));
+    if transfer {
+        detail.push(format!("{} → {}", tx["account"].as_str().unwrap_or(""), tx["to_account"].as_str().unwrap_or("")));
+    }
+    if dated {
+        detail.push(human_date(tx["date"].as_str().unwrap_or("")));
+    }
+    if detail.is_empty() {
+        detail.push(tx["account"].as_str().unwrap_or("").to_string());
+    }
+    let d = label(&detail.join(" · "), "threads-panel-detail");
+    d.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    words.append(&d);
     row.append(&words);
     let figure = label(&amount_text(tx), "threads-panel-figures");
     if tx["type"] == "INCOME" {
         figure.add_css_class("money-in");
     }
+    figure.set_valign(gtk::Align::Center);
     row.append(&figure);
     row
 }
 
 fn panel_entries(body: &gtk::Box, page: &Value) {
     let rows: Vec<&Value> = page["transactions"].as_array().into_iter().flatten().collect();
-    let block = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    block.append(&caption("This month"));
+    let fmt = super::formatter();
+    let (income, spent) = (page["income"].as_i64().unwrap_or(0), page["spent"].as_i64().unwrap_or(0));
+    let stats = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    stats.set_homogeneous(true);
+    for (icon, name, value, class) in [("spend", "Out", spent, ""), ("income", "In", income, "money-in")] {
+        let stat = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        stat.add_css_class("threads-stat");
+        let top = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        top.append(&crate::money::pages_glyph(icon, 13));
+        top.append(&label(name, "threads-panel-detail"));
+        stat.append(&top);
+        let figure = label(&fmt.format_whole(value), "threads-stat-figure");
+        if !class.is_empty() && value > 0 {
+            figure.add_css_class(class);
+        }
+        stat.append(&figure);
+        stats.append(&stat);
+    }
+    body.append(&stats);
     if rows.is_empty() {
-        block.append(&label("No entries this month.", "money-muted"));
+        body.append(&label("No entries this month.", "money-muted"));
+        return;
     }
-    for tx in rows {
-        block.append(&entry_row(tx));
+    let mut start = 0;
+    while start < rows.len() {
+        let day = rows[start]["date"].as_str().unwrap_or("").to_string();
+        let end = rows[start..].iter().position(|t| t["date"].as_str().unwrap_or("") != day).map_or(rows.len(), |p| start + p);
+        let net: i64 = rows[start..end]
+            .iter()
+            .map(|t| match t["type"].as_str() {
+                Some("INCOME") => t["amount"].as_i64().unwrap_or(0),
+                Some("EXPENSE") => -t["amount"].as_i64().unwrap_or(0),
+                _ => 0,
+            })
+            .sum();
+        let list = block(body, &human_date(&day), &fmt.format_signed(net));
+        for tx in &rows[start..end] {
+            list.append(&entry_row(tx, false));
+        }
+        start = end;
     }
-    body.append(&block);
 }

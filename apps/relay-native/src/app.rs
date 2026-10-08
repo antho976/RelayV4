@@ -598,6 +598,11 @@ fn notice_bar() -> (gtk::Label, gtk::Box) {
     (notice, notice_bar)
 }
 
+/// The sidebar's width as the window opens, and how narrow and wide a drag may take it.
+const SIDEBAR_WIDTH: i32 = 248;
+const SIDEBAR_MIN: i32 = 200;
+const SIDEBAR_MAX: i32 = 420;
+
 /// The sidebar: page keys, the workspaces and their projects, and Settings at the foot.
 struct Sidebar {
     root: gtk::Box,
@@ -612,7 +617,7 @@ struct Sidebar {
 
 fn sidebar() -> Sidebar {
     let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    sidebar.set_size_request(248, -1);
+    sidebar.set_size_request(SIDEBAR_MIN, -1);
     sidebar.set_hexpand(false);
     sidebar.add_css_class("sidebar");
     let nav = gtk::Box::new(gtk::Orientation::Vertical, 1);
@@ -925,7 +930,20 @@ impl Ui {
         let body = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         body.set_vexpand(true);
         let side = sidebar();
-        body.append(&side.root);
+        // The sidebar and the page share a split the person can drag, from 200 to 420 pixels.
+        let split = gtk::Paned::new(gtk::Orientation::Horizontal);
+        split.add_css_class("sidebar-split");
+        split.set_hexpand(true);
+        split.set_start_child(Some(&side.root));
+        split.set_resize_start_child(false);
+        split.set_shrink_start_child(false);
+        split.set_position(SIDEBAR_WIDTH);
+        split.connect_position_notify(|split| {
+            if split.position() > SIDEBAR_MAX {
+                split.set_position(SIDEBAR_MAX);
+            }
+        });
+        body.append(&split);
         let content = gtk::Stack::new();
         content.set_hhomogeneous(false);
         content.set_vhomogeneous(false);
@@ -933,7 +951,9 @@ impl Ui {
         content.set_vexpand(true);
         let page_overlay = gtk::Overlay::new();
         page_overlay.set_child(Some(&content));
-        body.append(&page_overlay);
+        split.set_end_child(Some(&page_overlay));
+        split.set_resize_end_child(true);
+        split.set_shrink_end_child(false);
         let wall = wall();
         let editor = crate::editor::Editor::new();
         editor.mount_agents(&wall.agents);

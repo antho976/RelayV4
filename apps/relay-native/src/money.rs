@@ -157,11 +157,11 @@ pub fn sidebar_keys() -> gtk::Box {
 pub fn add_pages(content: &gtk::Stack) {
     content.add_named(&threads::page(), Some(threads::PAGE));
     for (name, _, _) in PAGES {
-        let head = gtk::Box::new(gtk::Orientation::Vertical, 16);
+        let head = gtk::Box::new(gtk::Orientation::Vertical, 4);
         head.add_css_class("money-head");
-        let body = gtk::Box::new(gtk::Orientation::Vertical, 28);
+        let body = gtk::Box::new(gtk::Orientation::Vertical, 16);
         body.add_css_class("money-body");
-        let column = gtk::Box::new(gtk::Orientation::Vertical, 24);
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 18);
         column.add_css_class("money-page");
         column.append(&tally_tabs(name));
         column.append(&head);
@@ -280,7 +280,10 @@ pub fn install(ui: &Rc<Ui>, nav: &gtk::Box, add: &gtk::Button, dev_only: Vec<gtk
     let caption = label("New thread", "nav-label");
     caption.set_hexpand(true);
     row.append(&caption);
-    row.append(&label("Ctrl N", "keycap"));
+    // The keycap keeps its own height: a box row would stretch it to the key's.
+    let keycap = label("Ctrl N", "keycap");
+    keycap.set_valign(gtk::Align::Center);
+    row.append(&keycap);
     new_key.set_child(Some(&row));
     let weak = Rc::downgrade(ui);
     new_key.connect_clicked(move |_| {
@@ -426,6 +429,11 @@ pub fn changed(ui: &Rc<Ui>) {
     } else if is_page(&page) {
         ui.refresh_page();
     }
+}
+
+/// A Tally glyph, for the Threads page's own marks.
+pub(crate) fn pages_glyph(key: &str, size: i32) -> gtk::Image {
+    pages::glyph_image(key, size)
 }
 
 /// `thread.*`: a thread moved.

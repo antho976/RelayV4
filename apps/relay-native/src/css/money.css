@@ -11,7 +11,7 @@
 .space-switch button:checked label { color: @wall; }
 
 .money-root, scrolledwindow.money-scroll, scrolledwindow.money-scroll > viewport { background: @wall; color: @ink; }
-.money-page { padding: 28px 40px 64px; }
+.money-page { padding: 22px 32px 40px; }
 
 /* Geist throughout, as in Dev; Geist Mono for figures and labels. */
 .money-title { font-size: 22px; font-weight: 600; color: @ink; letter-spacing: -0.02em; }
@@ -115,5 +115,44 @@ button.money-chrome { border-radius: 10px; min-width: 32px; min-height: 32px; }
 .money-empty { padding: 36px 0; }
 .money-empty-title { font-size: 20px; font-weight: 600; color: @ink; }
 
-.money-controls { margin-top: 4px; }
+.money-controls { margin-top: 10px; }
 .money-data-row { padding: 14px 0; }
+
+/* Cards, strips and rows (money_pages.rs): one card per subject, its rows inside it, a strip of
+   figures at the top of each page. Rows carry their own inner padding, so nothing meets an edge. */
+.tally-card { background: @slab; border: 1px solid @edge; border-radius: 14px; padding: 2px 0 6px; }
+.tally-card-head { padding: 10px 16px 4px; min-height: 28px; }
+.tally-card-title { font-size: 13px; font-weight: 600; color: @ink; }
+.tally-rows > .tally-row, .tally-rows > box.tally-row { padding: 8px 16px; min-height: 34px; border-top: 1px solid @line_subtle; }
+.tally-rows > .tally-row:first-child, .tally-rows > .tally-day + .tally-row, .tally-rows > .tally-th + .tally-row { border-top: 0; }
+.tally-rows > box.tally-entry { padding: 0; }
+.tally-entry > button.money-row-key { padding: 7px 8px 7px 16px; min-height: 34px; border-radius: 0; }
+.tally-entry:hover { background: @wash; }
+.tally-rows > .tally-entry:last-child { border-bottom-left-radius: 13px; border-bottom-right-radius: 13px; }
+.tally-entry button.money-row-delete { opacity: 0; margin-right: 10px; }
+.tally-entry:hover button.money-row-delete, .tally-entry button.money-row-delete:focus-visible { opacity: 1; }
+.tally-day { padding: 12px 46px 4px 16px; border-top: 1px solid @line_subtle; }
+.tally-rows > .tally-day:first-child { border-top: 0; padding-top: 4px; }
+.tally-day-name { font-size: 12px; font-weight: 600; color: @secondary; }
+.tally-day-total { font-family: "Geist Mono", monospace; font-size: 11.5px; color: @secondary; min-width: 84px; }
+.tally-th { padding: 2px 16px 6px; }
+.tally-th-text { font-size: 11px; font-weight: 600; letter-spacing: 0.06em; color: @faint; }
+.tally-setting { padding: 10px 16px; }
+button.tally-save { margin: 8px 16px 4px; }
+.tally-total { padding: 10px 16px 4px; border-top: 1px solid @edge; }
+.tally-total-figure { font-family: "Geist Mono", monospace; font-size: 13px; font-weight: 600; color: @ink; font-feature-settings: "tnum"; }
+.tally-soon .money-row-detail { color: @waiting; }
+.tally-tile { min-width: 28px; min-height: 28px; border-radius: 8px; background: @wash; color: @secondary; }
+.money-badge-small { min-width: 28px; min-height: 28px; border-radius: 8px; }
+
+.tally-strip { background: @slab; border: 1px solid @edge; border-radius: 14px; padding: 16px 0; }
+.tally-cell { padding: 0 20px; }
+.tally-rule { background: @line_subtle; min-width: 1px; margin: 2px 0; }
+.tally-cell-icon { color: @faint; }
+.tally-cell-caption { font-size: 12px; color: @faint; }
+.tally-cell-figure { margin-top: 2px; font-size: 22px; font-weight: 600; letter-spacing: -0.02em; color: @ink; font-feature-settings: "tnum"; }
+.tally-cell-sub { font-size: 12px; color: @faint; }
+.tally-pace { margin: 0 20px; padding-top: 14px; border-top: 1px solid @line_subtle; }
+.tally-figures { font-family: "Geist Mono", monospace; font-size: 11.5px; color: @secondary; font-feature-settings: "tnum"; }
+.tally-left { font-family: "Geist Mono", monospace; font-size: 11.5px; color: @faint; font-feature-settings: "tnum"; }
+.money-empty { padding: 24px; }

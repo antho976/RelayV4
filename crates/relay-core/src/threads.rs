@@ -84,6 +84,9 @@ ledger changes, so never put numbers in it you read yourself. Example:\n\
 Call money.series yourself first when you need its numbers for your words. Use a bar for comparing \
 periods, a line with `cumulative` for pace, a donut for where the money went.";
 
+/// The efforts a thread's agent may be given, as `claude --effort` takes them.
+pub const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
 const SCHEMA: &str = "
 CREATE TABLE thread (
     id INTEGER PRIMARY KEY,
@@ -115,6 +118,7 @@ pub struct Stored {
     pub title: String,
     pub provider: String,
     pub model: Option<String>,
+    pub effort: Option<String>,
     pub agent_ref: Option<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -122,7 +126,7 @@ pub struct Stored {
 }
 
 const THREAD_COLUMNS: &str = "t.id, t.title, t.provider, t.model, t.agent_ref, t.created_at, t.updated_at,
-    (SELECT m.body FROM message m WHERE m.thread_id = t.id AND m.role IN ('user', 'assistant') ORDER BY m.id DESC LIMIT 1)";
+    (SELECT m.body FROM message m WHERE m.thread_id = t.id AND m.role IN ('user', 'assistant') ORDER BY m.id DESC LIMIT 1), t.effort";
 
 fn stored(row: &rusqlite::Row) -> rusqlite::Result<Stored> {
     let last: Option<String> = row.get(7)?;
@@ -135,6 +139,7 @@ fn stored(row: &rusqlite::Row) -> rusqlite::Result<Stored> {
         created_at: row.get(5)?,
         updated_at: row.get(6)?,
         preview: last.and_then(|body| serde_json::from_str::<Value>(&body).ok()).and_then(|body| preview(&body)),
+        effort: row.get(8)?,
     })
 }
 
@@ -200,6 +205,11 @@ impl ThreadStore {
             conn.execute_batch(SCHEMA)?;
             conn.pragma_update(None, "user_version", 1)?;
         }
+        // 2: a thread's effort beside its model.
+        if version < 2 {
+            conn.execute_batch("ALTER TABLE thread ADD COLUMN effort TEXT")?;
+            conn.pragma_update(None, "user_version", 2)?;
+        }
         Ok(ThreadStore { conn })
     }
 
@@ -214,11 +224,15 @@ impl ThreadStore {
         stmt.query_row([id], stored).optional()
     }
 
-    pub fn create(&self, title: &str, provider: &str, model: Option<&str>, now: &str) -> rusqlite::Result<Id> {
+    pub fn create(&self, title: &str, provider: &str, model: Option<&str>, effort: Option<&str>, now: &str) -> rusqlite::Result<Id> {
         self.conn
-            .prepare_cached("INSERT INTO thread (title, provider, model, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)")?
-            .execute(params![title, provider, model, now])?;
+            .prepare_cached("INSERT INTO thread (title, provider, model, effort, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)")?
+            .execute(params![title, provider, model, effort, now])?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn set_agent(&self, id: Id, model: Option<&str>, effort: Option<&str>) -> rusqlite::Result<bool> {
+        Ok(self.conn.prepare_cached("UPDATE thread SET model = ?2, effort = ?3 WHERE id = ?1")?.execute(params![id, model, effort])? > 0)
     }
 
     pub fn rename(&self, id: Id, title: &str) -> rusqlite::Result<bool> {
@@ -326,6 +340,7 @@ fn view(engine: &Engine, t: Stored) -> ThreadView {
         title: t.title,
         provider: t.provider,
         model: t.model,
+        effort: t.effort,
         created_at: t.created_at,
         updated_at: t.updated_at,
         preview: t.preview,
@@ -359,8 +374,37 @@ pub fn checked_text(text: &str) -> Result<String, BusError> {
     Ok(text.to_string())
 }
 
-pub fn create(engine: &Engine, title: &str, model: Option<&str>, now: &str) -> Result<ThreadView, BusError> {
-    let id = with_db(engine, |db| db.create(title, "claude", model, now))?;
+/// A model and an effort as given: empty is the default, and either must be one Claude takes.
+pub fn checked_agent(model: Option<&str>, effort: Option<&str>) -> Result<(Option<String>, Option<String>), BusError> {
+    let model = model.map(str::trim).filter(|m| !m.is_empty());
+    let effort = effort.map(str::trim).filter(|e| !e.is_empty());
+    if model.is_some_and(|m| !crate::providers::is_provider_ref(m)) {
+        return Err(BusError::invalid("thread.invalid", "A model is an id such as claude-opus-5-5"));
+    }
+    if effort.is_some_and(|e| !EFFORTS.contains(&e)) {
+        return Err(BusError::invalid("thread.invalid", format!("An effort is one of {}", EFFORTS.join(", "))));
+    }
+    Ok((model.map(str::to_string), effort.map(str::to_string)))
+}
+
+pub fn create(engine: &Engine, title: &str, model: Option<&str>, effort: Option<&str>, now: &str) -> Result<ThreadView, BusError> {
+    let (model, effort) = checked_agent(model, effort)?;
+    let id = with_db(engine, |db| db.create(title, "claude", model.as_deref(), effort.as_deref(), now))?;
+    get(engine, id)
+}
+
+/// Choose a thread's model and effort. Not mid-reply; a running agent is closed, and the next
+/// message resumes the conversation with the new choice.
+pub fn set_agent(engine: &Engine, id: Id, model: Option<&str>, effort: Option<&str>) -> Result<ThreadView, BusError> {
+    let (model, effort) = checked_agent(model, effort)?;
+    if lock(&engine.threads.live).working.contains(&id) {
+        return Err(BusError::conflict("thread.busy", "The agent is still answering in this thread")
+            .with_hint("wait for its reply, or stop it with thread.stop"));
+    }
+    if !with_db(engine, |db| db.set_agent(id, model.as_deref(), effort.as_deref()))? {
+        return Err(not_found(id));
+    }
+    stop(engine, id);
     get(engine, id)
 }
 
@@ -481,7 +525,7 @@ fn mcp_config(engine: &Engine) -> String {
 }
 
 /// The agent's command line for `thread`: resumed by `agent_ref` when Claude reported one.
-pub fn agent_args(mcp: &str, model: Option<&str>, agent_ref: Option<&str>) -> Vec<String> {
+pub fn agent_args(mcp: &str, model: Option<&str>, effort: Option<&str>, agent_ref: Option<&str>) -> Vec<String> {
     let mut args: Vec<String> = [
         "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
         "--include-partial-messages", "--strict-mcp-config", "--mcp-config", mcp,
@@ -493,6 +537,9 @@ pub fn agent_args(mcp: &str, model: Option<&str>, agent_ref: Option<&str>) -> Ve
     .collect();
     if let Some(model) = model.filter(|m| crate::providers::is_provider_ref(m)) {
         args.extend(["--model".into(), model.into()]);
+    }
+    if let Some(effort) = effort.filter(|e| EFFORTS.contains(e)) {
+        args.extend(["--effort".into(), effort.into()]);
     }
     if let Some(reference) = agent_ref.filter(|r| crate::providers::is_provider_ref(r)) {
         args.extend(["--resume".into(), reference.into()]);
@@ -511,7 +558,7 @@ fn spawn(engine: &Arc<Engine>, id: Id, first_line: &str) -> Result<(), String> {
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
 
     let mut cmd = Command::new(&claude);
-    cmd.args(agent_args(&mcp_config(engine), thread.model.as_deref(), thread.agent_ref.as_deref()))
+    cmd.args(agent_args(&mcp_config(engine), thread.model.as_deref(), thread.effort.as_deref(), thread.agent_ref.as_deref()))
         .current_dir(&dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -737,11 +784,12 @@ mod tests {
 
     #[test]
     fn the_agent_resumes_by_its_own_id_and_never_by_an_option() {
-        let args = agent_args("{}", Some("opus"), Some("eac9663f-1a29"));
+        let args = agent_args("{}", Some("opus"), Some("high"), Some("eac9663f-1a29"));
         assert!(args.windows(2).any(|w| w == ["--resume", "eac9663f-1a29"]));
         assert!(args.windows(2).any(|w| w == ["--model", "opus"]));
+        assert!(args.windows(2).any(|w| w == ["--effort", "high"]));
         assert!(args.windows(2).any(|w| w == ["--tools", ""]), "no built-in tools");
-        let args = agent_args("{}", Some("--dangerously-skip-permissions"), Some("-x"));
-        assert!(!args.iter().any(|a| a == "--resume" || a == "--model"));
+        let args = agent_args("{}", Some("--dangerously-skip-permissions"), Some("--x"), Some("-x"));
+        assert!(!args.iter().any(|a| a == "--resume" || a == "--model" || a == "--effort"));
     }
 }

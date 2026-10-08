@@ -50,7 +50,7 @@ button.threads-undo { min-height: 28px; }
 
 /* The message box. */
 .threads-dock { padding: 0 28px 18px; }
-.threads-composer { min-width: 640px; padding: 12px 12px 10px 16px; border: 1px solid @strong; border-radius: 14px; background: @raised; }
+.threads-composer { min-width: 460px; padding: 12px 12px 10px 16px; border: 1px solid @strong; border-radius: 14px; background: @raised; }
 .threads-composer:focus-within { border-color: @line_focus; }
 textview.threads-input, textview.threads-input text { background: transparent; color: @ink; font-size: 14px; }
 .threads-composer scrolledwindow { background: transparent; min-height: 44px; }
@@ -59,9 +59,11 @@ textview.threads-input, textview.threads-input text { background: transparent; c
 button.primary.threads-send { min-width: 34px; min-height: 34px; padding: 0; border-radius: 10px; }
 
 /* The Tally panel. */
-.threads-panel { padding: 0 20px 18px; border-left: 1px solid @edge; background: @wall; }
+.threads-panel { padding: 0 20px 18px; background: @wall; }
+paned.threads-split > separator { min-width: 1px; margin: 0 -3px; border-left: 3px solid transparent; border-right: 3px solid transparent; background-clip: content-box; background-color: @edge; }
+paned.threads-split > separator:hover { background-color: @line_focus; }
 .threads-panel .view-tabs button { min-height: 28px; }
-.threads-panel-eyebrow { font-family: "Geist Mono", monospace; font-size: 11.5px; color: @faint; }
+.threads-panel-eyebrow { font-size: 12px; color: @faint; }
 .threads-panel-figure { font-size: 26px; font-weight: 600; letter-spacing: -0.02em; color: @ink; font-feature-settings: "tnum"; }
 .threads-panel-name { font-size: 13px; color: @ink; }
 .threads-panel-detail { font-size: 12px; color: @faint; }
@@ -88,3 +90,19 @@ button.threads-row { min-height: 34px; }
 .threads-chart-total { font-size: 18px; font-weight: 600; color: @ink; font-feature-settings: "tnum"; }
 .threads-chart-value { font-family: "Geist Mono", monospace; font-size: 12px; color: @ink; }
 .threads-chart-share { font-family: "Geist Mono", monospace; font-size: 11.5px; color: @faint; }
+
+/* The panel's own blocks: what is left, two figures, then budgets, bills and recent entries. */
+.threads-summary { padding: 4px 0 2px; }
+.threads-summary image, .threads-stat image { color: @faint; }
+.threads-stat { padding: 10px 12px; border: 1px solid @edge; border-radius: 12px; background: @slab; }
+.threads-stat-figure { font-size: 16px; font-weight: 600; color: @ink; font-feature-settings: "tnum"; }
+.threads-block > box:first-child { margin-bottom: 6px; }
+.threads-panel-aside { font-family: "Geist Mono", monospace; font-size: 11px; color: @faint; }
+.threads-budget { padding: 7px 0; }
+.threads-panel-eyebrow { font-size: 12px; }
+
+/* The model and effort pickers: chips like the source chip, with a menu. */
+menubutton.threads-picker > button { min-height: 26px; padding: 0 10px; border: 1px solid @strong; border-radius: 999px; background: @slab; color: @secondary; font-size: 12px; font-weight: 500; }
+menubutton.threads-picker > button:hover { background: @wash; color: @ink; }
+menubutton.threads-picker image { color: @faint; }
+.threads-menu button.nav { min-height: 30px; font-size: 13px; }

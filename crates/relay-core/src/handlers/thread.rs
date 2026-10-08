@@ -21,7 +21,7 @@ pub fn register(e: &mut Engine) {
         let text = p.text.as_deref().map(threads::checked_text).transpose()?;
         let title = text.as_deref().map_or_else(|| "New thread".to_string(), threads::title_from);
         let now = ctx.now.clone();
-        let thread = threads::create(ctx.engine(), &title, p.model.as_deref(), &now)?;
+        let thread = threads::create(ctx.engine(), &title, p.model.as_deref(), p.effort.as_deref(), &now)?;
         ctx.emit("thread.changed", json!({"thread": thread}));
         let Some(text) = text else { return Ok(thread) };
         let message = threads::post(ctx.engine(), thread.id, &text, &now)?;
@@ -45,6 +45,11 @@ pub fn register(e: &mut Engine) {
             ctx.emit("thread.changed", json!({"thread": threads::get(ctx.engine(), p.id)?}));
         }
         Ok(Empty {})
+    });
+    e.register::<Set>(|ctx, p| {
+        let thread = threads::set_agent(ctx.engine(), p.id, p.model.as_deref(), p.effort.as_deref())?;
+        ctx.emit("thread.changed", json!({"thread": thread}));
+        Ok(thread)
     });
     e.register::<Rename>(|ctx, p| {
         let thread = threads::rename(ctx.engine(), p.id, &p.title)?;

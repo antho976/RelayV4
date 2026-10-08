@@ -21,6 +21,8 @@ result!(#[schemars(rename = "ThreadView")] ThreadView {
     /// `claude`; the agent that answers in this thread.
     pub provider: String,
     pub model: Option<String>,
+    /// `low`, `medium`, `high`, `xhigh` or `max`; the provider's default when absent.
+    pub effort: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     /// The agent is writing a reply.
@@ -58,6 +60,8 @@ payload!(#[schemars(rename = "ThreadCreateIn")] CreateIn {
     pub text: Option<String>,
     /// A model for this thread's agent; the provider's default when absent.
     pub model: Option<String>,
+    /// How hard it thinks: `low`, `medium`, `high`, `xhigh` or `max`; the default when absent.
+    pub effort: Option<String>,
 });
 op!(Create, "thread.create", CreateIn => ThreadView,
     OpMeta::mutation(Scope::Global, 5, "Start a thread, optionally with its first message").actors(Actors::UserOnly).emits(&["thread.changed", "thread.message"]));
@@ -71,6 +75,17 @@ payload!(#[schemars(rename = "ThreadIdIn")] IdIn { pub id: Id });
 op!(Stop, "thread.stop", IdIn => Empty,
     OpMeta::mutation(Scope::Global, 5, "Stop the agent's reply in a thread; the next message resumes it").actors(Actors::UserOnly).emits(&["thread.changed"]));
 
+payload!(#[schemars(rename = "ThreadSetIn")] SetIn {
+    pub id: Id,
+    /// The agent's model; empty or absent for the provider's default.
+    pub model: Option<String>,
+    /// The agent's effort; empty or absent for the default.
+    pub effort: Option<String>,
+});
+op!(Set, "thread.set", SetIn => ThreadView,
+    OpMeta::mutation(Scope::Global, 5, "Choose a thread's model and effort; a running agent restarts with them on the next message")
+        .actors(Actors::UserOnly).emits(&["thread.changed"]));
+
 payload!(#[schemars(rename = "ThreadRenameIn")] RenameIn { pub id: Id, pub title: String });
 op!(Rename, "thread.rename", RenameIn => ThreadView,
     OpMeta::mutation(Scope::Global, 5, "Rename a thread").actors(Actors::UserOnly).emits(&["thread.changed"]));
@@ -78,4 +93,4 @@ op!(Rename, "thread.rename", RenameIn => ThreadView,
 op!(Delete, "thread.delete", IdIn => Empty,
     OpMeta::mutation(Scope::Global, 5, "Delete a thread and its messages, stopping its agent").actors(Actors::UserOnly).emits(&["thread.changed"]));
 
-entries!(List, Get, Create, Send, Stop, Rename, Delete);
+entries!(List, Get, Create, Send, Stop, Set, Rename, Delete);
