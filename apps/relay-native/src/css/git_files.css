@@ -66,13 +66,13 @@ button.tree-row:hover .tree-chevron { color: @secondary; }
 .tree-glyph { min-width: 16px; margin-right: 6px; }
 .tree-name { font-size: 12.5px; }
 .tree-badge {
-  min-width: 14px; margin-left: 6px; font-family: 'Fira Mono', monospace;
+  min-width: 14px; margin-left: 6px; font-family: 'Geist Mono', monospace;
   font-size: 11px; font-weight: 600;
 }
 .tree-empty { padding: 4px 12px 4px 38px; color: @faint; font-size: 11.5px; font-style: italic; }
 .tree-dir { color: @faint; font-size: 11px; }
 button.tree-row.search-hit { min-height: 38px; padding: 3px 10px; }
-.search-snippet { color: @secondary; font-family: 'Fira Mono', monospace; font-size: 11px; margin-left: 20px; }
+.search-snippet { color: @secondary; font-family: 'Geist Mono', monospace; font-size: 11px; margin-left: 20px; }
 
 /* ---- Image hover card ---- */
 popover.image-hover > contents {
@@ -92,8 +92,8 @@ popover.image-hover > contents {
   background-position: 0 0, 6px 6px;
 }
 .image-hover-card.loading .image-hover-frame { min-width: 120px; min-height: 80px; }
-.image-hover-meta { color: @secondary; font-family: 'Fira Mono', monospace; font-size: 10.5px; }
-.image-hover-meta.error { color: @git_removed; font-family: 'Fira Sans', sans-serif; font-size: 11.5px; }
+.image-hover-meta { color: @secondary; font-family: 'Geist Mono', monospace; font-size: 10.5px; }
+.image-hover-meta.error { color: @git_removed; font-family: 'Geist', sans-serif; font-size: 11.5px; }
 
 /* ---- Source Control: header and branch picker ---- */
 .code-git { background: @console; }
@@ -103,9 +103,9 @@ popover.image-hover > contents {
   background: transparent; color: @ink; font-size: 12.5px;
 }
 .git-branch-picker > button:hover, .git-branch-picker > button:checked { background: @wash; border-color: @edge; }
-.git-branch-name { font-family: 'Fira Mono', monospace; font-size: 12px; font-weight: 500; color: @ink; }
+.git-branch-name { font-family: 'Geist Mono', monospace; font-size: 12px; font-weight: 500; color: @ink; }
 .git-sync-counts { color: @secondary; margin: 0 2px; }
-.git-sync-count { font-family: 'Fira Mono', monospace; font-size: 10.5px; margin-right: 3px; }
+.git-sync-count { font-family: 'Geist Mono', monospace; font-size: 10.5px; margin-right: 3px; }
 .git-unpublished { color: @faint; }
 .code-bar button.git-head-key { min-width: 26px; min-height: 26px; padding: 0; color: @faint; }
 .code-bar button.git-head-key:hover { color: @ink; }
@@ -114,7 +114,7 @@ popover.branch-popover > contents { padding: 0; border: 1px solid @strong; borde
 .branch-search { margin: 8px; min-height: 30px; font-size: 12.5px; }
 .branch-list { padding: 0 0 6px; }
 .branch-heading {
-  padding: 10px 12px 4px; color: @faint; font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif;
+  padding: 10px 12px 4px; color: @faint; font-family: 'Geist', sans-serif;
   font-size: 10.5px; font-weight: 600; letter-spacing: 0.1em;
 }
 .branch-note { padding: 14px 12px; color: @secondary; font-size: 12px; }
@@ -127,14 +127,14 @@ button.branch-row.current { background: alpha(@live, 0.08); }
 button.branch-row.current image { color: @live; }
 button.branch-row.held-elsewhere .branch-name, button.branch-row.held-elsewhere image { opacity: 0.55; }
 button.branch-row.remote image { color: @faint; }
-.branch-name { font-family: 'Fira Mono', monospace; font-size: 12px; }
+.branch-name { font-family: 'Geist Mono', monospace; font-size: 12px; }
 .branch-tag {
   padding: 1px 6px; border-radius: 2px; background: alpha(@ink, 0.07);
   color: @secondary; font-size: 10.5px;
 }
 button.branch-create { min-height: 30px; border-bottom: 1px solid @edge; }
 button.branch-create image { color: @secondary; }
-button.branch-create .branch-name { font-family: 'Fira Sans', sans-serif; color: @secondary; }
+button.branch-create .branch-name { font-family: 'Geist', sans-serif; color: @secondary; }
 button.branch-create:hover .branch-name { color: @ink; }
 .branch-create-form { padding: 8px 12px 10px; border-bottom: 1px solid @edge; background: alpha(@ink, 0.025); }
 .branch-create-form entry { min-height: 28px; font-size: 12px; }
@@ -174,7 +174,7 @@ button.scm-toggle {
 button.scm-toggle:hover { background: transparent; color: @ink; }
 .scm-chevron { color: @faint; min-width: 14px; }
 .scm-title {
-  font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif; font-size: 11px;
+  font-family: 'Geist', sans-serif; font-size: 11px;
   font-weight: 600; letter-spacing: 0.08em; color: @secondary;
 }
 .scm-count {
@@ -199,7 +199,7 @@ button.scm-open:focus-visible { outline: 1px solid alpha(@ink, 0.38); outline-of
 .scm-row button.scm-action { opacity: 0; margin: 0 2px; }
 .scm-row:hover button.scm-action, .scm-row button.scm-action:focus-visible { opacity: 1; }
 .scm-letter {
-  min-width: 14px; margin-left: 4px; font-family: 'Fira Mono', monospace;
+  min-width: 14px; margin-left: 4px; font-family: 'Geist Mono', monospace;
   font-size: 11px; font-weight: 600;
 }
 .code-git-hint { padding: 6px 14px; font-size: 11.5px; color: @faint; }
@@ -223,7 +223,7 @@ button.code-graph-toggle { min-height: 20px; margin-right: 2px; padding: 0 7px; 
 button.code-commit { min-height: 40px; padding: 0 10px 0 8px; border: 0; border-radius: 0; background: transparent; }
 button.code-commit:hover { background: alpha(@ink, 0.045); }
 .code-commit-subject { font-size: 12.5px; color: @ink; }
-.code-commit-sha { font-family: 'Fira Mono', monospace; font-size: 10.5px; color: @git_sha; }
+.code-commit-sha { font-family: 'Geist Mono', monospace; font-size: 10.5px; color: @git_sha; }
 .code-commit-author { font-size: 11px; color: @faint; }
 
 /* ---- Diff view ---- */
@@ -240,14 +240,14 @@ button.code-commit:hover { background: alpha(@ink, 0.045); }
 .commit-meta { color: @secondary; font-size: 12px; }
 .commit-author { color: @ink; font-size: 12px; }
 .commit-when { color: @faint; font-size: 12px; }
-.commit-sha { font-family: 'Fira Mono', monospace; font-size: 11px; color: @git_sha; }
-.commit-body { padding: 10px 12px; background: @screen; border: 1px solid @edge; border-radius: 2px; font-family: 'Fira Mono', monospace; font-size: 12px; color: @secondary; }
+.commit-sha { font-family: 'Geist Mono', monospace; font-size: 11px; color: @git_sha; }
+.commit-body { padding: 10px 12px; background: @screen; border: 1px solid @edge; border-radius: 2px; font-family: 'Geist Mono', monospace; font-size: 12px; color: @secondary; }
 .commit-files-head { margin-top: 6px; padding-bottom: 6px; border-bottom: 1px solid @edge; }
 .commit-files { margin-top: 2px; }
 .commit-file { min-height: 26px; padding: 0 4px; }
 .commit-file:hover { background: alpha(@ink, 0.04); }
-.diff-plus { color: @git_added; font-family: 'Fira Mono', monospace; font-size: 11px; }
-.diff-minus { color: @git_removed; font-family: 'Fira Mono', monospace; font-size: 11px; }
+.diff-plus { color: @git_added; font-family: 'Geist Mono', monospace; font-size: 11px; }
+.diff-minus { color: @git_removed; font-family: 'Geist Mono', monospace; font-size: 11px; }
 .change-bar { margin-left: 4px; }
 .change-bar > box { border-radius: 1px; }
 .change-bar .bar-added { background: #4fae70; }

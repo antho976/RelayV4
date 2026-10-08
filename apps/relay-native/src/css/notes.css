@@ -32,7 +32,7 @@
 .notes-window popover.menu modelbutton:active { background: alpha(@ink, 0.13); }
 .notes-window popover.menu modelbutton:disabled { color: alpha(@ink, 0.32); }
 .notes-window popover.menu modelbutton:disabled accelerator { color: alpha(@ink, 0.2); }
-.notes-window popover.menu modelbutton accelerator { margin-left: 32px; color: @faint; font-family: 'Fira Sans', sans-serif; font-size: 11px; font-feature-settings: "tnum"; }
+.notes-window popover.menu modelbutton accelerator { margin-left: 32px; color: @faint; font-family: 'Geist', sans-serif; font-size: 11px; font-feature-settings: "tnum"; }
 .notes-window popover.menu modelbutton check,
 .notes-window popover.menu modelbutton radio { min-width: 14px; min-height: 14px; margin-right: 9px; border: 1px solid @strong; background: transparent; }
 .notes-window popover.menu modelbutton check { border-radius: 4px; }
@@ -40,7 +40,7 @@
 .notes-window popover.menu modelbutton radio:checked { border-color: @ink; background: @ink; color: @wall_solid; }
 .notes-window popover.menu modelbutton arrow { min-width: 14px; min-height: 14px; color: @faint; }
 .notes-window popover.menu separator { min-height: 1px; margin: 5px 6px; background: @edge; }
-.notes-window popover.menu .title { padding: 7px 10px 4px; color: @faint; font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif; font-size: 10.5px; font-weight: 600; letter-spacing: 0.08em; }
+.notes-window popover.menu .title { padding: 7px 10px 4px; color: @faint; font-family: 'Geist', sans-serif; font-size: 10.5px; font-weight: 600; letter-spacing: 0.08em; }
 /* GTK's Cut / Copy / Paste icon row on the editor's menu. */
 .notes-window popover.menu box.inline-buttons { padding: 2px 4px 4px; }
 .notes-window popover.menu box.inline-buttons button { min-width: 34px; min-height: 30px; margin: 0 1px; border: 0; border-radius: 5px; background: transparent; color: @secondary; }
@@ -62,7 +62,7 @@ button.notes-tool:hover,
 button.notes-tool:active { background: alpha(@ink, 0.13); }
 button.notes-tool:disabled { opacity: 0.32; }
 .notes-tool-caption { font-size: 12px; font-weight: 500; }
-.notes-tool-mark { min-width: 16px; font-family: 'Fira Sans', sans-serif; font-size: 14px; font-weight: 600; }
+.notes-tool-mark { min-width: 16px; font-family: 'Geist', sans-serif; font-size: 14px; font-weight: 600; }
 .notes-tool-mark-bold { font-weight: 800; }
 .notes-tool-mark-italic { font-family: serif; font-style: italic; font-size: 15.5px; font-weight: 500; }
 .notes-tool-mark-heading { font-weight: 700; }
@@ -73,7 +73,7 @@ button.notes-tool:disabled { opacity: 0.32; }
 .notes-customize-title { padding: 6px 8px 8px; color: @ink; font-size: 13px; font-weight: 600; }
 .notes-customize-row { padding: 6px 8px; margin: 0 0 4px; border-radius: 6px; background: alpha(@ink, 0.04); }
 .notes-customize-caption { color: @ink; font-size: 12px; }
-.notes-customize-section { padding: 10px 8px 4px; color: @faint; font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif; font-size: 10.5px; font-weight: 600; letter-spacing: 0.08em; }
+.notes-customize-section { padding: 10px 8px 4px; color: @faint; font-family: 'Geist', sans-serif; font-size: 10.5px; font-weight: 600; letter-spacing: 0.08em; }
 checkbutton.notes-customize-check { min-height: 30px; padding: 0 8px; border-radius: 5px; }
 checkbutton.notes-customize-check:hover { background: alpha(@ink, 0.06); }
 checkbutton.notes-customize-check > check { margin-right: 9px; min-width: 14px; min-height: 14px; border-radius: 4px; }
@@ -110,7 +110,7 @@ list.notes-list > row.notes-row:focus-visible { outline: 1px solid alpha(@ink, 0
 .notes-row-date { color: @secondary; font-size: 11px; font-feature-settings: "tnum"; }
 .notes-row-preview { color: @faint; font-size: 11px; }
 .notes-row-pin { color: @faint; }
-.notes-list-header { padding: 12px 10px 4px; color: @faint; font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif; font-size: 10px; font-weight: 600; letter-spacing: 0.08em; }
+.notes-list-header { padding: 12px 10px 4px; color: @faint; font-family: 'Geist', sans-serif; font-size: 10px; font-weight: 600; letter-spacing: 0.08em; }
 .notes-list-empty { padding: 28px 18px; color: @faint; font-size: 12px; }
 
 /* ---- tabs ---- */
@@ -165,7 +165,7 @@ entry.notes-find-entry.error { border-color: alpha(@held, 0.7); }
 .notes-find-count { margin: 0 6px; color: @secondary; font-size: 11px; font-feature-settings: "tnum"; }
 button.notes-find-key { min-width: 28px; min-height: 28px; padding: 0; border: 0; border-radius: 3px; background: transparent; color: @secondary; }
 button.notes-find-key:hover { background: @wash; color: @ink; }
-button.notes-find-option { min-width: 30px; min-height: 28px; padding: 0 6px; border: 1px solid transparent; border-radius: 3px; background: transparent; color: @secondary; font-family: 'Fira Mono', monospace; font-size: 11px; }
+button.notes-find-option { min-width: 30px; min-height: 28px; padding: 0 6px; border: 1px solid transparent; border-radius: 3px; background: transparent; color: @secondary; font-family: 'Geist Mono', monospace; font-size: 11px; }
 button.notes-find-option:hover { background: @wash; color: @ink; }
 button.notes-find-option:checked { background: alpha(@ink, 0.10); border-color: @strong; color: @ink; }
 button.notes-find-word label { text-decoration-line: underline; }

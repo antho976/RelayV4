@@ -44,7 +44,7 @@ fn record_geometry(ui: &Ui, screenshot: &str) {
     if let Ok(requested) = std::env::var("RELAY_NATIVE_PAGE") {
         if matches!(
             requested.as_str(),
-            "board" | "modules" | "settings" | "skills" | "dashboard"
+            "board" | "modules" | "settings" | "skills"
         ) {
             assert_eq!(
                 *ui.page.borrow(),
@@ -86,9 +86,10 @@ fn record_geometry(ui: &Ui, screenshot: &str) {
     );
     let mut widgets = Vec::new();
     collect(ui.window.upcast_ref(), &ui.window, &mut widgets);
+    // DESIGN.md's shell: each bar's height and its 1px rule.
     for (class, dimension, expected) in [
-        ("topbar", "height", 42.),
-        ("statusbar", "height", 24.),
+        ("topbar", "height", 53.),
+        ("statusbar", "height", 31.),
         ("umd", "height", 26.),
     ] {
         for widget in &widgets {
@@ -114,23 +115,6 @@ fn record_geometry(ui: &Ui, screenshot: &str) {
                 .iter()
                 .any(|c| c == "sidebar")),
             "Settings owns the full workspace"
-        );
-    }
-    if *ui.page.borrow() == "dashboard" {
-        let page = widgets
-            .iter()
-            .find(|w| {
-                w["classes"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|c| c == "dashboard-page")
-            })
-            .unwrap();
-        assert!(
-            page["x"].as_f64().unwrap() + page["width"].as_f64().unwrap()
-                <= f64::from(ui.window.width()),
-            "Dashboard must fit beside the sidebar"
         );
     }
     let path = std::path::Path::new(screenshot).with_extension("geometry.json");

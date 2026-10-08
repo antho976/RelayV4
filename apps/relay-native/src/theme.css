@@ -1,88 +1,105 @@
-@define-color wall #0e0e10;
-@define-color console #141416;
-@define-color slab #1b1b1e;
-@define-color wash #232327;
-@define-color screen #0a0a0b;
-@define-color ink #ececea;
-@define-color secondary #a5a5a3;
-@define-color faint #77777a;
-@define-color strong #37373c;
-@define-color edge #252529;
+/* The ten mode tokens: Dark's values (the default mode), which shell.rs redefines for the
+   chosen mode (fonts::PALETTES). DESIGN.md names them: ground, ground, surface, selected, idle pane, ink,
+   ink-2, ink-3, line-strong, line. */
+@define-color wall #131211;
+@define-color console #131211;
+@define-color slab #1a1917;
+@define-color wash #1f1d1b;
+@define-color screen #08090a;
+@define-color ink #ede9e2;
+@define-color secondary #b5b0a8;
+@define-color faint #8c877f;
+@define-color strong #262422;
+@define-color edge #242220;
+/* The rest of the scale, the same in every mode. */
+@define-color pane #181715;
+@define-color raised #1c1b19;
+@define-color track #2a2826;
+@define-color line_subtle #211f1d;
+@define-color line_emphasis #33302d;
+@define-color line_focus #3a3733;
+@define-color ink_dim #6e6a64;
 /* Opaque twins of the four surfaces panel opacity makes translucent (shell.rs redefines both). */
-@define-color wall_solid #0e0e10;
-@define-color console_solid #141416;
-@define-color slab_solid #1b1b1e;
-@define-color wash_solid #232327;
+@define-color wall_solid #131211;
+@define-color console_solid #131211;
+@define-color slab_solid #1a1917;
+@define-color wash_solid #1f1d1b;
 /* live, held and waiting are the same in every mode; fonts::STATUS gives them to the editor. */
 @define-color live #2ec469;
 @define-color held #e5382e;
 @define-color waiting #f0a828;
 * { -gtk-icon-style: symbolic; }
-window { background: @wall; color: @ink; font-family: 'Fira Sans', 'Noto Sans', sans-serif; font-size: 13px; }
+window { background: @wall; color: @ink; font-family: 'Geist', sans-serif; font-size: 13px; font-feature-settings: "tnum"; }
 window > box, stack, scrolledwindow { background: @wall; }
 .titlebar { min-height: 0; background: @console; padding: 0; border: 0; box-shadow: none; }
-.topbar { min-height: 41px; padding: 0; background: @console; border-bottom: 1px solid @edge; }
-.brand-mark { background: @ink; color: @wall; font-family: "Fira Sans Condensed"; font-size: 12px; font-weight: 700; min-width: 20px; min-height: 20px; border-radius: 2px; margin: 0 8px 0 7px; }
-.brand, .section-label { font-family: 'Fira Sans Condensed', 'Fira Sans', sans-serif; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; }
-.brand { font-size: 12px; letter-spacing: 0.16em; }
+.topbar { min-height: 52px; padding: 0; background: @console; border-bottom: 1px solid @edge; }
+.brand-mark { margin: 0 2px 0 4px; }
+.section-label { font-family: 'Geist', sans-serif; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; }
+/* The wordmark: Sora 600, tight, beside the drawn mark (app.rs top_bar). */
+.brand { font-family: 'Sora', sans-serif; font-size: 17px; font-weight: 600; letter-spacing: -0.5px; color: @ink; }
 .sidebar { background: @console; border-right: 1px solid @edge; }
 .section-label { padding: 12px 10px 8px; color: @faint; }
-button { min-height: 26px; padding: 0 9px; border: 1px solid @strong; border-radius: 2px; box-shadow: none; background-image: none; background: @slab; color: @ink; font-size: 12px; font-weight: 500; }
-button:hover { background: @wash; border-color: @faint; }
-button:focus-visible { outline: 2px solid alpha(@ink, 0.35); outline-offset: 0; }
+button { min-height: 28px; padding: 0 10px; border: 1px solid @strong; border-radius: 10px; box-shadow: none; background-image: none; background: @slab; color: @ink; font-size: 13px; font-weight: 500; transition: background 120ms ease-out, border-color 120ms ease-out, color 120ms ease-out; }
+button:hover { background: @wash; border-color: @line_emphasis; }
+button:focus-visible { outline: 2px solid alpha(@ink, 0.35); outline-offset: 1px; }
 button:disabled { opacity: 0.4; }
 button.primary { background: @ink; border-color: @ink; color: @wall; font-weight: 600; }
+button.primary:active { background: shade(@ink, 0.92); }
 button.primary:hover { background: white; border-color: white; }
 button.quiet, button.nav, button.file { background: transparent; border-color: transparent; color: @secondary; }
 button.quiet:hover, button.nav:hover, button.file:hover { background: @wash; border-color: transparent; color: @ink; }
 button.file { border-radius: 0; }
-button.nav { border: 0; min-height: 28px; padding: 0 8px; font-size: 13px; font-weight: 500; border-radius: 2px; }
+button.nav { border: 0; min-height: 36px; padding: 0 12px; font-size: 14px; font-weight: 400; border-radius: 10px; }
+button.nav image { color: @faint; }
+button.nav:hover image, button.nav.selected image { color: @ink; }
 button.nav.selected { background: @wash; color: @ink; }
 .title { font-size: 15px; font-weight: 600; }
 .dim { color: @secondary; font-size: 12px; }
 .toolbar { min-height: 38px; padding: 0 12px; background: @console; border-bottom: 1px solid @edge; }
-.statusbar { background: @console; color: @secondary; min-height: 23px; padding: 0 12px; border-top: 1px solid @edge; font-size: 11px; }
+.statusbar { background: @console; color: @faint; min-height: 30px; padding: 0 16px; border-top: 1px solid @edge; font-family: 'Geist Mono', monospace; font-size: 11.5px; }
 .notice { background: @slab; border-bottom: 1px solid @held; color: @ink; padding: 8px 12px; }
 .umd { background: @console; padding: 0 8px; min-height: 25px; border-bottom: 1px solid @edge; }
 .held .session-name { color: @held; }
 .session-name { font-size: 13px; font-weight: 600; }
-.umd button, .umd button.icon-key { min-height: 22px; min-width: 22px; padding: 0; font-size: 11px; }
+/* The terminal panes keep their own anatomy (DESIGN.md, Terminal plate): square keys, Fira. */
+.umd button, .umd button.icon-key { min-height: 22px; min-width: 22px; padding: 0; font-size: 11px; border-radius: 2px; }
 .page { padding: 20px; }
 .record { background: @slab; padding: 12px; }
 .launch { background: @console; border-left: 1px solid @edge; }
-entry, textview, textview text { background: @screen; color: @ink; caret-color: @ink; }
-entry { border: 1px solid @edge; border-radius: 2px; min-height: 28px; padding: 0 9px; background-image: none; box-shadow: none; }
+entry, textview, textview text { background: @raised; color: @ink; caret-color: @ink; }
+entry { border: 1px solid @strong; border-radius: 10px; min-height: 30px; padding: 0 10px; background-image: none; box-shadow: none; }
 textview { padding: 8px; }
-entry:focus-within { border-color: @secondary; }
+entry:focus-within { border-color: @line_focus; box-shadow: 0 0 0 3px alpha(@ink, 0.06); }
 /* Search fields, everywhere: a rounded well with the glass and clear keys quiet inside it. */
-entry.search { min-height: 30px; padding: 0 6px 0 9px; border: 1px solid @edge; border-radius: 7px; background: @screen; color: @ink; transition: border-color 120ms ease-out, box-shadow 120ms ease-out; }
-entry.search:hover { border-color: @strong; }
+entry.search { min-height: 32px; padding: 0 6px 0 10px; border: 1px solid @strong; border-radius: 10px; background: @raised; color: @ink; transition: border-color 120ms ease-out, box-shadow 120ms ease-out; }
+entry.search:hover { border-color: @line_emphasis; }
 entry.search:focus-within { border-color: alpha(@ink, 0.42); box-shadow: 0 0 0 3px alpha(@ink, 0.07); }
 entry.search > image { color: @faint; -gtk-icon-size: 14px; min-width: 16px; }
 entry.search > image:first-child { margin-right: 7px; }
 entry.search:focus-within > image:first-child { color: @secondary; }
 entry.search > image:last-child { margin-left: 4px; padding: 3px; border-radius: 99px; }
 entry.search > image:last-child:hover { color: @ink; background: alpha(@ink, 0.1); }
-entry.search > text { font-size: 12px; }
+entry.search > text { font-size: 13px; }
 entry.search > text > placeholder { color: @faint; }
 selection { background: alpha(@ink, 0.22); color: @ink; }
 dropdown > button { background: @slab; }
-popover contents { background: @slab; color: @ink; border: 1px solid @edge; }
+popover contents { background: @slab; color: @ink; border: 1px solid @edge; border-radius: 12px; box-shadow: 0 12px 32px alpha(black, 0.45); }
 /* Menus hold a stack (and long ones a scrolled window): let the menu's own surface show. */
 popover stack, popover scrolledwindow, popover viewport { background: transparent; }
 scrollbar { background: transparent; }
-scrollbar slider { min-width: 4px; min-height: 4px; margin: 2px; background: #2c2c30; border: 0; border-radius: 0; }
-scrollbar slider:hover { background: #3f3f45; }
+scrollbar slider { min-width: 4px; min-height: 4px; margin: 2px; background: @track; border: 0; border-radius: 999px; }
+scrollbar slider:hover { background: @line_focus; }
 /* Breeze's negative fill margins rely on borders that Relay removes. */
 progressbar progress, scale highlight { margin: 0; }
 
-.navigation { padding: 8px 8px 6px; border-bottom: 1px solid @edge; }
+.navigation { padding: 14px 12px 12px; }
 .workspace-heading .section-label { padding: 0; }
-.mono, .session-branch { font-family: 'Fira Mono', monospace; font-size: 11px; }
-button.icon-key { min-width: 26px; min-height: 26px; padding: 0; }
-.launch-key { margin: 0 6px 0 8px; }
-.statusbar separator { min-width: 1px; min-height: 12px; margin: 5px 0; background: @strong; }
-.status-project { color: @ink; font-weight: 500; }
+.mono { font-family: 'Geist Mono', monospace; font-size: 11.5px; }
+.session-branch { font-family: 'Fira Mono', monospace; font-size: 11px; }
+button.icon-key { min-width: 28px; min-height: 28px; padding: 0; border-radius: 7px; }
+.launch-key { margin: 0 8px 0 10px; min-height: 34px; padding: 0 14px; }
+.statusbar separator { min-width: 0; min-height: 0; margin: 0 2px; background: transparent; }
+.status-project { color: @faint; font-weight: 400; }
 .lamp { min-width: 6px; min-height: 6px; font-size: 0; line-height: 0; border: 1px solid @faint; border-radius: 50%; }
 .live .umd .lamp, .lamp.live { background: @live; border-color: @live; }
 .held .umd .lamp, .lamp.held { background: @held; border-color: @held; }
@@ -111,7 +128,7 @@ button.quiet.selected { color: @ink; background: @wash; }
 .panel-heading { min-height: 42px; padding: 0 16px; border-bottom: 1px solid @edge; }
 .panel-body { padding: 16px; }
 
-.compact-panel { border: 1px solid @edge; box-shadow: 0 8px 28px alpha(black, .35); }
+.compact-panel { border: 1px solid @edge; border-radius: 14px; box-shadow: 0 12px 32px alpha(black, .45); }
 .detail-page { border-left: 0; }
 .detail-page .panel-heading { min-height: 52px; }
 .detail-page .panel-body { padding: 4px; }
@@ -155,10 +172,12 @@ button.primary label, button.primary image,
 .setup-body stackswitcher button:checked label { color: @screen; }
 
 /* Shared Relay-2 shell anatomy. Dimensions include GTK's content and border boxes. */
-.topbar-left { padding: 0 10px 0 6px; }
+.topbar-left { padding: 0 12px 0 16px; }
 .topbar-actions { padding-left: 8px; }
+.topbar-actions > button.icon-key { min-width: 34px; min-height: 34px; color: @faint; }
+.topbar-actions > button.icon-key:hover { color: @ink; }
 .topbar-left .brand-mark { margin: 0; }
-.sidebar-footer { padding: 8px; border-top: 1px solid @edge; }
+.sidebar-footer { padding: 10px 12px 12px; }
 .workspace-row button { min-height: 22px; min-width: 22px; padding: 0; }
 .faint { color: @faint; font-size: 11px; }
 .terminal-identity { color: @faint; font-family: 'Fira Sans Condensed'; font-size: 11px; font-weight: 500; }
@@ -194,14 +213,14 @@ button.settings-mode:checked { border-color: @ink; }
 .skills-installer { margin: 0 16px 8px; padding: 10px; background: @console; border: 1px solid @edge; }
 /* Relay-2 workspace geometry. */
 .page.board-page, .page.notes-page { padding: 0; }
-.board-empty { color: @secondary; font-family: 'Fira Sans Condensed'; font-size: 11px; letter-spacing: 0.08em; }
+.board-empty { color: @secondary; font-family: 'Geist'; font-size: 11px; letter-spacing: 0.08em; }
 .task-compose { margin: 0 16px 24px; }
 .task-compose-section { padding: 14px; border: 1px solid @edge; background: @console; }
 .task-edit { padding: 14px; }
 .task-relations { padding: 0; }
 .code-bar { padding: 0 6px 0 10px; border-bottom: 1px solid @edge; background: @console; }
 .code-bar button { min-height: 24px; font-size: 11px; padding: 0 6px; }
-.code-source { font-family: 'Fira Mono'; font-size: 12.5px; }
+.code-source { font-family: 'Geist Mono'; font-size: 12.5px; }
 .code-commit .dim { font-size: 10px; }
 
 .small-key { min-height: 22px; min-width: 22px; padding: 0; font-size: 11px; }
@@ -216,7 +235,7 @@ button.settings-mode:checked { border-color: @ink; }
 .launch-provider-mark { min-width: 32px; min-height: 32px; border: 1px solid @edge; background: @slab; }
 .launch-provider-facts { padding-top: 7px; border-top: 1px solid @edge; }
 .launch-segmented { border: 1px solid @strong; border-radius: 2px; }
-.launch-segmented button { min-height: 29px; border: 0; border-left: 1px solid @strong; border-radius: 0; background: @console; font-family: 'Fira Sans Condensed'; font-size: 11px; letter-spacing: 0.06em; }
+.launch-segmented button { min-height: 29px; border: 0; border-left: 1px solid @strong; border-radius: 0; background: @console; font-family: 'Geist'; font-size: 11px; letter-spacing: 0.06em; }
 .launch-segmented button:first-child { border-left: 0; }
 .launch-segmented button:checked { background: @ink; color: @wall; }
 .launch-segmented button:checked label { color: @wall; }
@@ -230,7 +249,7 @@ button.launch-member-card:checked { border-color: @ink; background: @wash; }
 .launch-task { min-height: 82px; }
 
 .window-controls { margin-left: 4px; }
-button.window-control { min-width: 40px; min-height: 41px; padding: 0; border: 0; border-radius: 0; background: transparent; color: @secondary; }
+button.window-control { min-width: 44px; min-height: 52px; padding: 0; border: 0; border-radius: 0; background: transparent; color: @faint; }
 button.window-control:hover { background: @wash; color: @ink; }
 button.window-close:hover { background: @held; color: @ink; }
 .agent-skills-popover .panel-body { padding: 0; }
@@ -238,56 +257,10 @@ button.window-close:hover { background: @held; color: @ink; }
 .agent-skills-footer { min-height: 38px; padding: 0 12px; border-top: 1px solid @edge; }
 .agent-skill-row { min-height: 35px; padding: 7px 12px; border-bottom: 1px solid @edge; }
 .agent-skill-row .skill-title { font-size: 12px; }
-.agent-skill-row .skill-source { padding: 0; font-family: 'Fira Sans'; font-size: 10px; color: @faint; background: transparent; }
-.notification-count { min-width: 8px; min-height: 14px; padding: 0 3px; border-radius: 2px; background: @ink; color: @wall; font-family: 'Fira Mono'; font-size: 9px; font-weight: 600; }
-.notification-count.held { background: @held; color: @ink; }
-.page.dashboard-page { padding: 0 0 24px; }
-.dashboard-head { min-height: 82px; padding: 0 18px; border-bottom: 1px solid @edge; background: @console; }
-.dashboard-title { font-size: 24px; font-weight: 600; }
-.dashboard-eyebrow { font-size: 9px; color: @secondary; font-family: 'Fira Sans Condensed'; letter-spacing: 0.08em; }
-.dashboard-head .dim { font-size: 12px; }
-.dashboard-quick button { min-height: 30px; padding: 0 9px; border: 1px solid @edge; background: @console; }
-.dashboard-action { font-size: 11px; }
-.dashboard-metrics { padding: 12px 16px; }
-button.dashboard-metric-key { padding: 0; background: transparent; border-radius: 0; }
-.dashboard-metric { min-height: 72px; padding: 0 12px; border: 1px solid @edge; background: @console; }
-.dashboard-metric-key:hover .dashboard-metric { background: @slab; }
-.dashboard-metric-key.hot .dashboard-metric { border-left: 2px solid @held; }
-.dashboard-metric-icon { min-width: 34px; min-height: 34px; border: 1px solid @edge; background: @slab; }
-.dashboard-metric-value { font-family: 'Fira Mono'; font-size: 22px; }
-.dashboard-metric-label { font-family: 'Fira Sans Condensed'; font-size: 10px; color: @secondary; letter-spacing: 0.05em; }
-.dashboard-metric-hint { font-size: 10px; color: @secondary; }
-.dashboard-grid { padding: 0 16px; }
-.dashboard-panel { background: @console; }
-.dashboard-panel-head { min-height: 48px; padding: 0 10px 0 13px; border-bottom: 1px solid @edge; }
-.dashboard-count { min-width: 25px; min-height: 20px; padding: 0 6px; background: @slab; font-family: 'Fira Mono'; font-size: 11px; }
-.dashboard-count.hot { background: @held; color: @ink; }
-.dashboard-calm { min-height: 112px; padding: 18px; }
-.dashboard-row-title { color: @ink; font-size: 12px; font-weight: 500; }
-.dashboard-row-subtitle { color: @secondary; font-size: 10px; }
-button.dashboard-queue-row { min-height: 49px; padding: 7px 11px; border-top: 1px solid @edge; border-radius: 0; background: transparent; }
-button.dashboard-queue-row:hover, button.dashboard-project-row:hover, button.dashboard-agent-row:hover { background: @slab; }
-.dashboard-signal { min-width: 29px; min-height: 29px; border: 1px solid @edge; color: @held; }
-.dashboard-review { font-size: 10px; color: @waiting; }
-.dashboard-resource-grid { margin: 14px 12px 10px; }
-.dashboard-resource-meter { padding: 10px; border: 1px solid @edge; background: @slab; }
-.dashboard-resource-cell { padding: 7px; border: 1px solid @edge; background: @slab; }
-.dashboard-resource-cell .mono { font-family: 'Fira Mono'; font-size: 12px; }
-.dashboard-cpu { font-size: 18px; font-family: 'Fira Mono'; }
-.dashboard-resource-meter progressbar trough, .dashboard-resource-meter progressbar progress { min-height: 6px; border-radius: 0; border: 0; }
-.dashboard-resource-meter progressbar trough { background: @edge; }
-.dashboard-resource-meter progressbar, .dashboard-resource-meter progressbar trough, .dashboard-resource-meter progressbar progress { min-width: 0; }
-.dashboard-resource-meter progressbar progress { background: @ink; }
-.dashboard-processes { padding: 0 11px 11px; }
-.dashboard-process-row { min-height: 23px; padding: 0 7px; }
-.dashboard-process-bar trough, .dashboard-process-bar progress { min-height: 23px; border-radius: 0; border: 0; }
-.dashboard-process-bar trough { background: @slab; }
-.dashboard-process-bar progress { background: @edge; }
-button.dashboard-project-row { padding: 10px 12px; background: transparent; border-top: 1px solid @edge; border-radius: 0; }
-.dashboard-project-meta { color: @secondary; font-size: 9.5px; }
-button.dashboard-agent-row { min-height: 51px; padding: 7px 11px; background: transparent; border-top: 1px solid @edge; border-radius: 0; }
-.dashboard-timeline { padding: 0 12px; }
-.dashboard-event { min-height: 54px; border-top: 1px solid @edge; }
+.agent-skill-row .skill-source { padding: 0; font-family: 'Geist'; font-size: 10px; color: @faint; background: transparent; }
+.notification-count { min-width: 10px; min-height: 16px; padding: 0 4px; border-radius: 999px; background: @ink; color: @wall; font-family: 'Geist Mono'; font-size: 9.5px; font-weight: 500; }
+/* The count reads the same whatever it holds; the bell's popover says which need you. */
+.notification-count.held { background: @ink; color: @wall; }
 .settings-legibility { padding: 12px; background: @slab; border: 1px solid @edge; }
 .settings-wallpaper-empty { min-height: 90px; background: @screen; border: 1px solid @edge; }
 .settings-wallpaper { min-width: 132px; min-height: 66px; }
@@ -297,16 +270,16 @@ scale { padding: 8px 0; }
 scale trough { min-height: 2px; min-width: 2px; border: 0; border-radius: 0; background: @strong; box-shadow: none; }
 scale highlight { min-height: 2px; border: 0; border-radius: 0; background: @strong; box-shadow: none; }
 scale slider { min-width: 12px; min-height: 12px; margin: -5px 0; border: 0; border-radius: 50%; background: @ink; box-shadow: none; }
-checkbutton check { min-width: 12px; min-height: 12px; border: 1px solid @strong; border-radius: 2px; background: @wall; box-shadow: none; }
+checkbutton check { min-width: 12px; min-height: 12px; border: 1px solid @line_emphasis; border-radius: 4px; background: @wall; box-shadow: none; }
 checkbutton check:checked { background: @ink; border-color: @ink; color: @wall; }
-/* Square switches: ink when on, a recessed plate when off. */
-switch { min-width: 32px; min-height: 16px; padding: 0; margin: 0; border: 1px solid @strong; border-radius: 2px; background: @screen; background-image: none; box-shadow: none; outline: none; }
+/* Pill switches: ink when on, a raised well when off. */
+switch { min-width: 32px; min-height: 16px; padding: 0; margin: 0; border: 1px solid @line_emphasis; border-radius: 999px; background: @raised; background-image: none; box-shadow: none; outline: none; }
 switch:hover { border-color: @faint; }
 switch:checked { background: @ink; border-color: @ink; }
 switch:focus-visible { outline: 2px solid alpha(@ink, 0.35); outline-offset: 1px; }
 switch:disabled { opacity: 0.45; }
 switch > image { opacity: 0; }
-switch > slider { min-width: 14px; min-height: 14px; margin: 1px; border: 0; border-radius: 0; background: @faint; background-image: none; box-shadow: none; }
+switch > slider { min-width: 14px; min-height: 14px; margin: 1px; border: 0; border-radius: 999px; background: @faint; background-image: none; box-shadow: none; }
 switch:hover > slider { background: @secondary; }
 switch:checked > slider { background: @wall; }
 .settings-panel .section-label, .settings-hero .section-label { padding: 0; }
@@ -340,7 +313,7 @@ button.task-choice:hover { background: @slab; }
 .task-choice-label { font-size: 9px; }
 
 .board-switcher { padding: 2px; border: 1px solid @edge; margin-right: 6px; background: @console; }
-.board-switcher button { min-height: 24px; padding: 0 12px; border: 0; color: @secondary; font-family: 'Fira Sans Condensed'; font-size: 12px; font-weight: 600; letter-spacing: .04em; }
+.board-switcher button { min-height: 24px; padding: 0 12px; border: 0; color: @secondary; font-family: 'Geist'; font-size: 12px; font-weight: 600; letter-spacing: .04em; }
 .board-switcher button.selected { background: @ink; color: @screen; }
 .board-shortcuts { font-size: 11px; color: @faint; }
 
@@ -374,3 +347,34 @@ window.notes-window, window.notes-window > box { padding: 0; margin: 0; border: 
 .layout-preset:hover, .layout-preset.selected { border-color: @strong; background: @wash; }
 .task-metadata flowboxchild { padding: 0; }
 .settings-wallpaper button.active { border-color: @ink; }
+
+/* The title bar's palette key, drawn as the search field it stands for. */
+button.command-search { min-width: 300px; min-height: 34px; padding: 0 6px 0 12px; margin-right: 10px; border: 1px solid @strong; border-radius: 10px; background: @raised; color: @faint; font-weight: 400; }
+button.command-search:hover { border-color: @line_emphasis; background: @raised; color: @secondary; }
+button.command-search image { color: @faint; }
+.command-search-text { font-size: 13px; }
+/* A chord, as a keycap. */
+.keycap { padding: 2px 6px; border: 1px solid @line_emphasis; border-radius: 6px; color: @faint; font-family: 'Geist Mono', monospace; font-size: 11px; }
+
+/* You, at the foot of the sidebar. */
+button.settings-key { min-height: 40px; padding: 0 10px 0 6px; }
+.you-avatar { min-width: 28px; min-height: 28px; border-radius: 999px; background: @track; color: @ink; font-size: 12px; font-weight: 600; }
+button.settings-key image { color: @faint; }
+button.settings-key:hover image { color: @ink; }
+
+/* Above the wall: the project crumb as a pill, and the views as one segmented control. */
+.workspace-strip { min-height: 52px; padding: 0 16px; }
+.workspace-strip > menubutton > button { min-height: 34px; padding: 0 12px; border: 1px solid @edge; border-radius: 10px; background: @slab; }
+.workspace-strip > menubutton > button:hover { background: @wash; border-color: @line_emphasis; }
+.workspace-strip > menubutton label.mono { color: @ink; font-family: 'Geist', sans-serif; font-size: 13px; }
+.view-tabs { padding: 3px; border: 1px solid @edge; border-radius: 12px; background: @slab; }
+.view-tabs button.quiet { min-height: 28px; padding: 0 12px; border-radius: 9px; color: @faint; font-size: 13px; font-weight: 500; }
+.view-tabs button.quiet:hover { background: transparent; color: @ink; }
+.view-tabs button.quiet.selected { background: @track; color: @ink; }
+/* The terminal panes keep the look they had before this rework: their own text faces, and
+   their scrollbar. */
+.terminal-plate .umd label { font-family: 'Fira Sans', sans-serif; }
+.terminal-plate .umd .terminal-identity, .terminal-plate .umd .session-state { font-family: 'Fira Sans Condensed'; }
+.terminal-plate .umd .session-branch { font-family: 'Fira Mono', monospace; }
+.terminal-scrollbar slider { background: #2c2c30; border-radius: 0; }
+.terminal-scrollbar slider:hover { background: #3f3f45; }

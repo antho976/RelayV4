@@ -11,7 +11,7 @@
 menubutton.mirror-picker > button { min-width: 30px; min-height: 30px; padding: 0; background: transparent; border-color: transparent; border-radius: 2px; color: @secondary; }
 menubutton.mirror-picker > button:hover, menubutton.mirror-picker > button:checked { background: @wash; border-color: transparent; color: @ink; }
 .mirror-title { color: @ink; font-size: 13px; font-weight: 600; }
-.mirror-meta { color: @faint; font-family: 'Fira Mono', monospace; font-size: 10px; }
+.mirror-meta { color: @faint; font-family: 'Geist Mono', monospace; font-size: 10px; }
 .lamp.mirror-lamp { min-width: 6px; min-height: 6px; margin: 4px 3px 0 0; }
 .lamp.waiting { background: @waiting; border-color: @waiting; }
 
@@ -47,7 +47,7 @@ picture.mirror-picture:focus-visible { outline: none; }
 .mirror-card.problem { border-bottom: 2px solid @held; }
 .mirror-card-title { color: @ink; font-size: 14px; font-weight: 600; }
 .mirror-card-detail { color: @secondary; font-size: 12px; }
-.mirror-card-code { color: @faint; font-family: 'Fira Mono', monospace; font-size: 10px; }
+.mirror-card-code { color: @faint; font-family: 'Geist Mono', monospace; font-size: 10px; }
 .mirror-card-actions { margin-top: 8px; }
 .mirror-card-actions button { min-height: 28px; }
 spinner.mirror-spinner { color: @ink; min-width: 18px; min-height: 18px; margin-bottom: 4px; }
