@@ -624,9 +624,13 @@ internal fun investImportedLine(holdings: Int, activities: Int, accountsCreated:
     ).joinToString(" · ")
 }
 
-/** Where to find Wealthsimple's files, step by step, as the import page lists them. */
+/**
+ * Where to find Wealthsimple's files, step by step, as the import page lists them. The site is
+ * written wealthsimple.com, as the bank row writes it: my.wealthsimple.com is longer than the
+ * column beside a Choose file key and broke mid-word.
+ */
 internal const val WS_HOLDINGS_STEPS =
-    "In a browser at my.wealthsimple.com: your profile, then Documents, then Generate document. Pick Holdings report (CSV), today, every account"
+    "Sign in at wealthsimple.com in a browser: your profile, then Documents, then Generate document. Pick Holdings report (CSV), today, every account"
 
 internal const val WS_ACTIVITIES_STEPS =
     "The same page: Activities export (CSV), over the longest period the first time. A TFSA's or an RRSP's monthly statement reads too"

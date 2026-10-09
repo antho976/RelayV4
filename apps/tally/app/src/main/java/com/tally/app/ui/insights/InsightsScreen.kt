@@ -92,7 +92,6 @@ import com.tally.app.ui.common.StackedBar
 import com.tally.app.ui.common.StatChip
 import com.tally.app.ui.common.StatTile
 import com.tally.app.ui.common.ThinBar
-import com.tally.app.ui.common.TextAction
 import com.tally.app.ui.common.TopBar
 import com.tally.app.ui.common.bounceClick
 import com.tally.app.ui.nav.AppNav
@@ -1255,9 +1254,6 @@ private fun WorthTiles(state: InsightsState, actions: InsightsActions, modifier:
                 )
             },
         )
-        if (w.investmentAccounts > 0) {
-            TextAction("portfolio", actions.openInvestments, Modifier.align(Alignment.End), color = MaterialTheme.colorScheme.primary)
-        }
     }
 }
 
@@ -1271,7 +1267,14 @@ private fun AccountsPanel(state: InsightsState, actions: InsightsActions, modifi
     val money = LocalMoney.current
     val w = state.worth
     Panel(modifier) {
-        PanelHeader("Accounts", meta = w.accounts.size.toString())
+        // With investments, the header's end leads to the portfolio rather than counting rows: a
+        // link on a line of its own under the tiles read as a stray.
+        PanelHeader(
+            "Accounts",
+            meta = w.accounts.size.toString(),
+            action = if (w.investmentAccounts > 0) "portfolio" else null,
+            onAction = actions.openInvestments,
+        )
         Spacer(Modifier.height(4.dp))
         w.accounts.forEach { a ->
             key(a.id) {

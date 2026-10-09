@@ -406,7 +406,7 @@ private fun UpdateGroup(actions: InvestActions, modifier: Modifier = Modifier) {
         GroupRow(
             "Import a Wealthsimple file",
             shape,
-            subtitle = "A holdings report or an activities export, from Documents on my.wealthsimple.com",
+            subtitle = "A holdings report or an activities export, from Documents on wealthsimple.com",
             leading = { GlyphBadge(Icons.AutoMirrored.Rounded.InsertDriveFile) },
             trailing = { RowPill("Choose file") },
             chevron = false,
@@ -466,7 +466,7 @@ private fun ZeroHero(actions: InvestActions, modifier: Modifier = Modifier) {
 @Composable
 private fun HowToGroup(modifier: Modifier = Modifier) {
     val steps = listOf(
-        "Open my.wealthsimple.com in a browser" to "Wealthsimple generates its documents on the website",
+        "Sign in at wealthsimple.com in a browser" to "Wealthsimple generates its documents on the website",
         "Your profile, then Documents, then Generate document" to "Pick Holdings report (CSV), today, and tick every account",
         "Open the file with Tally" to "Share it from your downloads, or choose it with Import. Then do the same with Activities export (CSV)",
     )
