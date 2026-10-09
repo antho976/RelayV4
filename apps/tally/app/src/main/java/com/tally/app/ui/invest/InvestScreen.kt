@@ -33,6 +33,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -372,7 +373,7 @@ private fun IncomePanel(state: InvestState, view: InvestView, modifier: Modifier
 @Composable
 private fun MonthBars(amounts: List<Long>, starts: List<LocalDate?>) {
     val money = LocalMoney.current
-    val locale = Locale.getDefault()
+    val locale: Locale = LocalConfiguration.current.locales[0]
     val labels = starts.map { it?.month?.getDisplayName(TextStyle.NARROW_STANDALONE, locale).orEmpty() }
     val description = "Income by month: " + amounts.mapIndexed { i, v ->
         (starts[i]?.let { Dates.monthShort(it) } ?: "") + " " + money.formatWhole(v)
