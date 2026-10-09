@@ -200,7 +200,19 @@ columns. The two-column wall has a draggable divider. Focus shows one session
 with session tabs; Review places the focused session beside the remaining
 stack. Plates request at least 280 by 280 and the wall scrolls vertically.
 Sessions can be reordered or focused within the wall. Layout selection, order
-and split position can be saved. There are no automatic mobile breakpoints.
+and split position can be saved. The wall has no automatic breakpoints.
+
+The Threads space's pages follow their own width instead, so they never hold the window wider
+than the person made it: their scrollers keep their content's width to themselves, and the page's
+measured width places the content. On the Threads page the conversation, its message box and a new
+thread's greeting share one centered column of at most 720px between 28px gutters (16px under a
+640px conversation); under 640, 520 and 420px the message box's "Edits with Undo" line, its source
+chip and its effort picker step aside in turn, and under 600px the starter questions stack in one
+column. The Tally panel opens at 340px (300px at the least) and steps aside on a page narrower than
+1000px; once the person shows or hides it with its key, that choice holds whatever the width.
+Tally's pages center their content in at most 1200px: under a 980px page their side-by-side cards
+stack, under 900px a table's less needed columns (Holdings' price and weight) hide, and under 760px
+a strip's figures stack with their rules hidden, as do rows of keys and filters.
 
 Code uses resizable file-tree, editor and Git regions with a worktree selector.
 Its tree split starts at 240px; file and Git regions can be hidden. Notes uses a

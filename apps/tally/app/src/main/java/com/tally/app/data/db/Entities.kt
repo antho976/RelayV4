@@ -6,9 +6,12 @@ import androidx.room.ForeignKey
 import androidx.room.Index
 import androidx.room.PrimaryKey
 import com.tally.core.AccountType
+import com.tally.core.ActivityType
 import com.tally.core.CategoryKind
 import com.tally.core.Frequency
 import com.tally.core.GoalKind
+import com.tally.core.Registration
+import com.tally.core.SecurityKind
 import com.tally.core.TxType
 import java.time.LocalDate
 import java.util.UUID
@@ -29,6 +32,12 @@ data class AccountEntity(
     val openingBalance: Long = 0,
     val archived: Boolean = false,
     val sortOrder: Int = 0,
+    /** An INVESTMENT account's tax wrapper (docs/INVESTMENTS.md, version 4); null on every other account. */
+    val registration: Registration? = null,
+    /** Who holds it ("Wealthsimple"); empty when nobody said. */
+    val institution: String = "",
+    /** The institution's own number for it ("HQ7XFMC41CAD"): how an import finds it again. */
+    val externalRef: String = "",
     /** Permanent id across devices (docs/MONEY.md, "Sync"); never changes once written. */
     val uid: String = newUid(),
     /** When this row last changed, in epoch millis. The database keeps it current (SyncSchema). */
@@ -197,6 +206,142 @@ data class AccountValueEntity(
     val accountId: Long,
     val date: LocalDate,
     val value: Long,
+    /** Permanent id across devices (docs/MONEY.md, "Sync"); never changes once written. */
+    val uid: String = newUid(),
+    /** When this row last changed, in epoch millis. The database keeps it current (SyncSchema). */
+    val updatedAt: Long = System.currentTimeMillis(),
+)
+
+// ── Investments (docs/INVESTMENTS.md, version 4) ────────────────────────────────────────────
+//
+// Each table has the same name on the PC, on the wire and here. Units held are at
+// Invest.QTY_SCALE, prices and rates at Invest.PRICE_SCALE and RATE_SCALE. Positions, values,
+// gains and room are read from these rows (Invest.portfolio), never stored. An import writes
+// rows under uids both devices derive the same way (sec:, hold:, imp:, px:, val:, ws:).
+
+/** A thing held: a stock, a fund, cash in a currency. uid `sec:<SYMBOL>`. */
+@Entity(tableName = "securities", indices = [Index(value = ["uid"], unique = true)])
+data class SecurityEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    /** Upper case, as its uid is made from it. */
+    val symbol: String,
+    val name: String = "",
+    /** The ISO code its prices and its market book are in. */
+    val currency: String,
+    val kind: SecurityKind,
+    val exchange: String = "",
+    /** Permanent id across devices (docs/MONEY.md, "Sync"); never changes once written. */
+    val uid: String = newUid(),
+    /** When this row last changed, in epoch millis. The database keeps it current (SyncSchema). */
+    val updatedAt: Long = System.currentTimeMillis(),
+)
+
+/**
+ * One line of an account's holdings snapshot: its rows on its newest [date] are what it held then.
+ * [book] is in the ledger currency, [bookMarket] in the security's. uid
+ * `hold:<account uid>:<security uid>:<date>` when imported.
+ */
+@Entity(
+    tableName = "holdings",
+    foreignKeys = [
+        ForeignKey(entity = AccountEntity::class, parentColumns = ["id"], childColumns = ["accountId"], onDelete = ForeignKey.CASCADE),
+        ForeignKey(entity = SecurityEntity::class, parentColumns = ["id"], childColumns = ["securityId"], onDelete = ForeignKey.CASCADE),
+    ],
+    indices = [Index(value = ["accountId", "date"]), Index("securityId"), Index(value = ["uid"], unique = true)],
+)
+data class HoldingEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val accountId: Long,
+    val securityId: Long,
+    val date: LocalDate,
+    val quantity: Long,
+    val book: Long,
+    val bookMarket: Long,
+    /** Permanent id across devices (docs/MONEY.md, "Sync"); never changes once written. */
+    val uid: String = newUid(),
+    /** When this row last changed, in epoch millis. The database keeps it current (SyncSchema). */
+    val updatedAt: Long = System.currentTimeMillis(),
+)
+
+/**
+ * A buy, a sale, a dividend, money in or out. Never a [TransactionEntity], so it never counts as
+ * spending or income. [quantity], [amount] and [fee] are never negative: [type] gives the
+ * direction. [amount] and [fee] are minor units of [currency]; an FX activity's [amount] leaves in
+ * [currency] and [toAmount] arrives in [toCurrency]. uid `imp:<hash>` when imported.
+ */
+@Entity(
+    tableName = "activities",
+    foreignKeys = [
+        ForeignKey(entity = AccountEntity::class, parentColumns = ["id"], childColumns = ["accountId"], onDelete = ForeignKey.CASCADE),
+        ForeignKey(entity = SecurityEntity::class, parentColumns = ["id"], childColumns = ["securityId"], onDelete = ForeignKey.SET_NULL),
+    ],
+    indices = [Index(value = ["accountId", "date"]), Index("securityId"), Index(value = ["uid"], unique = true)],
+)
+data class ActivityEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val accountId: Long,
+    val securityId: Long? = null,
+    val type: ActivityType,
+    val date: LocalDate,
+    val quantity: Long = 0,
+    val amount: Long,
+    val fee: Long = 0,
+    val currency: String,
+    val toAmount: Long? = null,
+    val toCurrency: String? = null,
+    val note: String = "",
+    /** MANUAL, or WEALTHSIMPLE for an imported line. */
+    val source: String = "MANUAL",
+    val createdAt: Long = 0,
+    /** Permanent id across devices (docs/MONEY.md, "Sync"); never changes once written. */
+    val uid: String = newUid(),
+    /** When this row last changed, in epoch millis. The database keeps it current (SyncSchema). */
+    val updatedAt: Long = System.currentTimeMillis(),
+)
+
+/** A security's price on [date] (IMPORT or MANUAL). uid `px:<security uid>:<date>`. */
+@Entity(
+    tableName = "prices",
+    foreignKeys = [ForeignKey(entity = SecurityEntity::class, parentColumns = ["id"], childColumns = ["securityId"], onDelete = ForeignKey.CASCADE)],
+    indices = [Index(value = ["securityId", "date"]), Index(value = ["uid"], unique = true)],
+)
+data class PriceEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val securityId: Long,
+    val date: LocalDate,
+    val price: Long,
+    val source: String,
+    /** Permanent id across devices (docs/MONEY.md, "Sync"); never changes once written. */
+    val uid: String = newUid(),
+    /** When this row last changed, in epoch millis. The database keeps it current (SyncSchema). */
+    val updatedAt: Long = System.currentTimeMillis(),
+)
+
+/** Units of [quote] for one [base] on [date] (MANUAL or BANK_OF_CANADA). uid `fx:<BASE>:<QUOTE>:<date>`. */
+@Entity(tableName = "fx_rates", indices = [Index(value = ["uid"], unique = true)])
+data class FxRateEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val base: String,
+    val quote: String,
+    val date: LocalDate,
+    val rate: Long,
+    val source: String,
+    /** Permanent id across devices (docs/MONEY.md, "Sync"); never changes once written. */
+    val uid: String = newUid(),
+    /** When this row last changed, in epoch millis. The database keeps it current (SyncSchema). */
+    val updatedAt: Long = System.currentTimeMillis(),
+)
+
+/**
+ * The contribution room CRA gives a registration in [year] (My Account, or the Notice of
+ * Assessment for an RRSP), in the ledger currency. uid `room:<REGISTRATION>:<year>`.
+ */
+@Entity(tableName = "room_facts", indices = [Index(value = ["uid"], unique = true)])
+data class RoomFactEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val registration: Registration,
+    val year: Int,
+    val amount: Long,
     /** Permanent id across devices (docs/MONEY.md, "Sync"); never changes once written. */
     val uid: String = newUid(),
     /** When this row last changed, in epoch millis. The database keeps it current (SyncSchema). */

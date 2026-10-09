@@ -21,6 +21,8 @@ import com.tally.app.ui.activity.TransactionsRoute
 import com.tally.app.ui.categories.CategoriesRoute
 import com.tally.app.ui.categories.CategoryEditRoute
 import com.tally.app.ui.entry.EntryRoute
+import com.tally.app.ui.invest.InvestRoute
+import com.tally.app.ui.invest.RoomEditRoute
 import com.tally.app.ui.onboarding.OnboardingRoute
 import com.tally.app.ui.plan.BillEditRoute
 import com.tally.app.ui.plan.BudgetEditRoute
@@ -92,5 +94,7 @@ fun TallyNavHost(onboarded: Boolean, incoming: IncomingFiles? = null) {
         composable(Routes.PC) { PcRoute(nav) }
         composable(Routes.IMPORT, arguments = listOf(stringArg(Args.SOURCE, ""))) { ImportRoute(nav) }
         composable(Routes.ABOUT) { AboutRoute(nav) }
+        composable(Routes.INVESTMENTS) { InvestRoute(nav) }
+        composable(Routes.ROOM_EDIT, arguments = listOf(stringArg(Args.KIND, "TFSA"))) { RoomEditRoute(nav) }
     }
 }

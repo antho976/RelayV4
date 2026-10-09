@@ -387,8 +387,14 @@ mod tests {
         assert!(!peer.may_act_as_user(), "never a blanket user");
         assert!(peer.may_act_as_user_for("money.summary"));
         assert!(peer.may_act_as_user_for("money.tx.add"));
+        for op in ["money.invest.summary", "money.invest.list", "money.invest.add"] {
+            assert!(peer.may_act_as_user_for(op), "{op}");
+        }
         assert!(peer.may_act_as_user_for("bus.ops"), "to list its tools");
-        for op in ["money.reset", "money.tx.delete", "guardrail.confirm", "thread.create", "session.input", "settings.set"] {
+        for op in [
+            "money.reset", "money.tx.delete", "guardrail.confirm", "thread.create", "session.input", "settings.set",
+            "money.invest.import", "money.invest.preview", "money.invest.delete", "money.invest.room", "money.fx.fetch", "money.account.update",
+        ] {
             assert!(!peer.may_act_as_user_for(op), "{op}");
         }
         // Another engine child is not a thread because a thread runs.

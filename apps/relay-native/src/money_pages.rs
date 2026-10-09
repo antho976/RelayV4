@@ -1,4 +1,5 @@
-//! Money's pages: Home, Transactions, Plan and Data, drawn after Tally's screens.
+//! Money's pages: Home, Transactions, Plan and Data, drawn after Tally's screens. Investments
+//! has its own module (`money_invest.rs`) built from the parts here.
 use super::{formatter, message, page, remember_currency, Action, Page};
 use crate::app::{button, clear, confirm_inline, label, rows, text, Ui};
 use crate::client::Error;
@@ -6,7 +7,7 @@ use gtk::prelude::*;
 use gtk4 as gtk;
 use relay_money::copy;
 use serde_json::{json, Value};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 /// Tally's twelve category hues (apps/tally/DESIGN.md `hue-*`), by stored colour index.
@@ -132,11 +133,11 @@ pub fn unavailable(error: &Error) -> String {
     }
 }
 
-fn n(v: &Value, key: &str) -> i64 {
+pub(super) fn n(v: &Value, key: &str) -> i64 {
     v[key].as_i64().unwrap_or(0)
 }
 
-fn date(value: &str) -> Option<glib::DateTime> {
+pub(super) fn date(value: &str) -> Option<glib::DateTime> {
     let mut parts = value.split('-').map(|p| p.parse::<i32>().ok());
     let (y, m, d) = (parts.next()??, parts.next()??, parts.next()??);
     glib::DateTime::from_local(y, m, d, 0, 0, 0.0).ok()
@@ -165,7 +166,7 @@ pub fn human_date(value: &str) -> String {
 }
 
 /// "October", or "15 Oct to 14 Nov" for a period that does not start on the 1st.
-fn period_name(period: &Value) -> String {
+pub(crate) fn period_name(period: &Value) -> String {
     let (Some(start), Some(end)) = (date(text(period, "start")), date(text(period, "end_exclusive"))) else {
         return String::from("This period");
     };
@@ -180,13 +181,13 @@ fn period_name(period: &Value) -> String {
 }
 
 /// An enum name as a word: `CHEQUING` reads "Chequing".
-fn word(value: &str) -> String {
+pub(super) fn word(value: &str) -> String {
     let lower = value.replace('_', " ").to_lowercase();
     let mut chars = lower.chars();
     chars.next().map(|c| c.to_uppercase().collect::<String>() + chars.as_str()).unwrap_or_default()
 }
 
-fn plural(n: usize, one: &str) -> String {
+pub(super) fn plural(n: usize, one: &str) -> String {
     copy::plural(n as i64, one)
 }
 
@@ -209,7 +210,7 @@ pub fn tone(status: &str, hue: Option<i64>) -> Tone {
     }
 }
 
-fn rgb(hex: &str) -> (f64, f64, f64) {
+pub(super) fn rgb(hex: &str) -> (f64, f64, f64) {
     let v = u32::from_str_radix(hex.trim_start_matches('#'), 16).unwrap_or(0xEDE9E2);
     (f64::from((v >> 16) & 0xFF) / 255.0, f64::from((v >> 8) & 0xFF) / 255.0, f64::from(v & 0xFF) / 255.0)
 }
@@ -258,6 +259,80 @@ pub fn meter_in(fraction: f64, tick: Option<f64>, tone: Tone, height: i32) -> gt
     area
 }
 
+/// A bar cut into `parts`, each a hue (an index into [`HUES`]) and a share of 0 to 1, in order and
+/// filling the width between them, 2px apart. A part too small to see keeps a 2px sliver. Its
+/// accessible label lists the shares; a caller that knows their names says them instead.
+pub(crate) fn allocation_bar(parts: &[(i64, f64)], height: i32) -> gtk::DrawingArea {
+    const GAP: f64 = 2.0;
+    const SLIVER: f64 = 2.0;
+    let area = gtk::DrawingArea::new();
+    area.set_content_height(height);
+    area.set_hexpand(true);
+    area.add_css_class("money-meter");
+    area.set_accessible_role(gtk::AccessibleRole::Img);
+    let parts: Vec<(i64, f64)> = parts.iter().copied().filter(|(_, share)| *share > 0.0).collect();
+    let spoken: Vec<String> = parts.iter().map(|(_, share)| format!("{:.0} percent", share * 100.0)).collect();
+    area.update_property(&[gtk::accessible::Property::Label(&format!("Shares: {}", spoken.join(", ")))]);
+    area.set_draw_func(move |_, cr, width, _| {
+        let (w, h) = (width as f64, height as f64);
+        let rounded = |x: f64, w: f64| {
+            let r = 4.0_f64.min(h / 2.0).min(w / 2.0);
+            cr.new_sub_path();
+            cr.arc(x + w - r, r, r, -std::f64::consts::FRAC_PI_2, 0.0);
+            cr.arc(x + w - r, h - r, r, 0.0, std::f64::consts::FRAC_PI_2);
+            cr.arc(x + r, h - r, r, std::f64::consts::FRAC_PI_2, std::f64::consts::PI);
+            cr.arc(x + r, r, r, std::f64::consts::PI, 3.0 * std::f64::consts::FRAC_PI_2);
+            cr.close_path();
+        };
+        let total: f64 = parts.iter().map(|(_, share)| share).sum();
+        if parts.is_empty() || total <= 0.0 {
+            let (r, g, b) = rgb("#2A2826");
+            cr.set_source_rgb(r, g, b);
+            rounded(0.0, w);
+            let _ = cr.fill();
+            return;
+        }
+        // Slivers take their 2px first; the parts that can be seen share what is left.
+        let room = (w - GAP * (parts.len() - 1) as f64).max(0.0);
+        let thin = |share: f64| share / total * room < SLIVER;
+        let slivers = parts.iter().filter(|(_, share)| thin(*share)).count() as f64;
+        let seen: f64 = parts.iter().filter(|(_, share)| !thin(*share)).map(|(_, share)| share).sum();
+        let spare = (room - SLIVER * slivers).max(0.0);
+        let mut x = 0.0;
+        for (hue, share) in &parts {
+            let part = if thin(*share) || seen <= 0.0 { SLIVER } else { share / seen * spare };
+            let (r, g, b) = rgb(HUES[hue.rem_euclid(HUES.len() as i64) as usize]);
+            cr.set_source_rgb(r, g, b);
+            rounded(x, part);
+            let _ = cr.fill();
+            x += part + GAP;
+        }
+    });
+    area
+}
+
+/// A legend's dot in a hue (an index into [`HUES`]).
+pub(crate) fn dot(hue: i64) -> gtk::DrawingArea {
+    let area = gtk::DrawingArea::new();
+    area.set_content_width(8);
+    area.set_content_height(8);
+    area.set_valign(gtk::Align::Center);
+    // The words beside it say what it marks.
+    area.set_accessible_role(gtk::AccessibleRole::Presentation);
+    let (r, g, b) = rgb(HUES[hue.rem_euclid(HUES.len() as i64) as usize]);
+    area.set_draw_func(move |_, cr, width, height| {
+        cr.set_source_rgb(r, g, b);
+        cr.arc(width as f64 / 2.0, height as f64 / 2.0, 4.0, 0.0, 2.0 * std::f64::consts::PI);
+        let _ = cr.fill();
+    });
+    area
+}
+
+/// "+$1,284" or "−$96": a strip's signed figure, in whole units like the rest of it.
+pub(super) fn signed_whole(fmt: &relay_money::money::MoneyFormatter, minor: i64) -> String {
+    if minor > 0 { format!("+{}", fmt.format_whole(minor)) } else { fmt.format_whole(minor) }
+}
+
 /// The figure's class for a pace status: red over budget, amber ahead of pace.
 pub fn tone_class(status: &str) -> Option<&'static str> {
     match status {
@@ -267,7 +342,7 @@ pub fn tone_class(status: &str) -> Option<&'static str> {
     }
 }
 
-/// The page title in the serif voice, its context line under it.
+/// The page title, its context line under it.
 fn title(head: &gtk::Box, name: &str, context: &str) {
     clear(head);
     head.append(&label(name, "money-title"));
@@ -279,14 +354,24 @@ fn title(head: &gtk::Box, name: &str, context: &str) {
 }
 
 /// A card: its title, an optional text action on the right, and the box its rows go in.
-fn card(parent: &gtk::Box, name: &str, action: Option<(&str, Action)>) -> gtk::Box {
+pub(super) fn card(parent: &gtk::Box, name: &str, action: Option<(&str, Action)>) -> gtk::Box {
+    card_asking(parent, name, action, None)
+}
+
+/// [`card`] with an Ask about this key in its head, when `ask` is given: it starts a thread with
+/// the card's question, in the person's words.
+pub(super) fn card_asking(parent: &gtk::Box, name: &str, action: Option<(&str, Action)>, ask: Option<(&Rc<Ui>, &str)>) -> gtk::Box {
     let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
     card.add_css_class("tally-card");
     let head = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     head.add_css_class("tally-card-head");
     let caption = label(name, "tally-card-title");
     caption.set_hexpand(true);
+    caption.set_ellipsize(gtk::pango::EllipsizeMode::End);
     head.append(&caption);
+    if let Some((ui, question)) = ask {
+        head.append(&ask_key(ui, question));
+    }
     if let Some((text, run)) = action {
         let key = button(text, "money-text-action");
         key.connect_clicked(move |_| run());
@@ -300,8 +385,126 @@ fn card(parent: &gtk::Box, name: &str, action: Option<(&str, Action)>) -> gtk::B
     rows
 }
 
-/// `n` columns of equal width under `parent`, side by side.
-fn columns(parent: &gtk::Box, n: usize) -> Vec<gtk::Box> {
+/// A quiet key that opens a thread asking `question`: the bridge from a page to the agent.
+fn ask_key(ui: &Rc<Ui>, question: &str) -> gtk::Button {
+    let key = button("", "money-text-action");
+    key.add_css_class("money-ask");
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 5);
+    let mark = crate::icons::image("claude", 13);
+    mark.set_valign(gtk::Align::Center);
+    row.append(&mark);
+    row.append(&label("Ask about this", ""));
+    key.set_child(Some(&row));
+    let said = format!("Ask in a thread: \u{201c}{question}\u{201d}");
+    key.set_tooltip_text(Some(&said));
+    key.update_property(&[gtk::accessible::Property::Label(&said)]);
+    let weak = Rc::downgrade(ui);
+    let question = question.to_string();
+    key.connect_clicked(move |_| {
+        if let Some(ui) = weak.upgrade() {
+            super::threads::ask(&ui, &question);
+        }
+    });
+    key
+}
+
+/// How a widget follows the page's width (see [`fit`]): Tally's pages shrink with the window, so
+/// their rows of columns and figures stack instead (DESIGN.md, Layout, records the widths).
+#[derive(Clone, Copy)]
+pub(super) enum Flex {
+    /// A row of columns ([`columns`]): stacked below [`STACK_COLUMNS`].
+    Columns,
+    /// A strip's figures ([`strip`]): stacked below [`STACK_STRIP`], their rules hidden.
+    Strip,
+    /// A row of keys and fields: stacked below [`STACK_STRIP`].
+    Controls,
+    /// A table's less needed column: hidden below [`WIDE`].
+    Wide,
+}
+
+/// The page widths, in pixels of the content area, where Tally's layout changes.
+const STACK_COLUMNS: i32 = 980;
+const STACK_STRIP: i32 = 760;
+const WIDE: i32 = 900;
+/// The widest a Tally page's column of content gets: wider, figures drift far from their names.
+const MEASURE: i32 = 1200;
+/// `.money-page`'s side padding, both sides.
+const PAGE_PADDING: i32 = 64;
+
+thread_local! {
+    /// The content area's width as last measured; 0 before the first measure, laid out wide.
+    static WIDTH: Cell<i32> = const { Cell::new(0) };
+    /// The widgets that follow it. Each read builds new ones; the dropped ones fall out.
+    static FLEXING: RefCell<Vec<(glib::WeakRef<gtk::Widget>, Flex)>> = const { RefCell::new(Vec::new()) };
+}
+
+fn apply(widget: &gtk::Widget, how: Flex, width: i32) {
+    let under = |limit: i32| width > 0 && width < limit;
+    let orientation = |stacked: bool| if stacked { gtk::Orientation::Vertical } else { gtk::Orientation::Horizontal };
+    match how {
+        Flex::Wide => widget.set_visible(!under(WIDE)),
+        Flex::Columns | Flex::Controls => {
+            let Some(row) = widget.downcast_ref::<gtk::Box>() else { return };
+            let columns = matches!(how, Flex::Columns);
+            let stacked = under(if columns { STACK_COLUMNS } else { STACK_STRIP });
+            row.set_orientation(orientation(stacked));
+            if columns {
+                // Stacked, equal heights would leave holes under the shorter cards.
+                row.set_homogeneous(!stacked);
+            }
+        }
+        Flex::Strip => {
+            let Some(cells) = widget.downcast_ref::<gtk::Box>() else { return };
+            let stacked = under(STACK_STRIP);
+            cells.set_orientation(orientation(stacked));
+            if stacked {
+                cells.add_css_class("narrow");
+            } else {
+                cells.remove_css_class("narrow");
+            }
+            let mut child = cells.first_child();
+            while let Some(part) = child {
+                if part.has_css_class("tally-rule") {
+                    part.set_visible(!stacked);
+                }
+                child = part.next_sibling();
+            }
+        }
+    }
+}
+
+/// Makes `widget` follow the page's width, from now on.
+pub(super) fn flex(widget: &impl IsA<gtk::Widget>, how: Flex) {
+    let widget = widget.upcast_ref::<gtk::Widget>();
+    apply(widget, how, WIDTH.with(|w| w.get()));
+    FLEXING.with(|f| {
+        let mut f = f.borrow_mut();
+        f.retain(|(w, _)| w.upgrade().is_some());
+        f.push((widget.downgrade(), how));
+    });
+}
+
+/// The content area is `width` wide: `column` (a page's `.money-page`) is centred in at most
+/// [`MEASURE`] pixels, and what no longer fits side by side stacks. `money::add_pages` measures.
+pub(super) fn fit(column: &gtk::Box, width: i32) {
+    let side = ((width - PAGE_PADDING - MEASURE) / 2).max(0);
+    column.set_margin_start(side);
+    column.set_margin_end(side);
+    if WIDTH.with(|w| w.replace(width)) == width {
+        return;
+    }
+    let flexing: Vec<(gtk::Widget, Flex)> = FLEXING.with(|f| {
+        let mut f = f.borrow_mut();
+        f.retain(|(w, _)| w.upgrade().is_some());
+        f.iter().filter_map(|(w, how)| w.upgrade().map(|w| (w, *how))).collect()
+    });
+    for (widget, how) in &flexing {
+        apply(widget, *how, width);
+    }
+}
+
+/// `n` columns of equal width under `parent`, side by side; stacked on a narrow page.
+pub(super) fn columns(parent: &gtk::Box, n: usize) -> Vec<gtk::Box> {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 16);
     row.set_homogeneous(true);
     let columns = (0..n)
@@ -312,24 +515,29 @@ fn columns(parent: &gtk::Box, n: usize) -> Vec<gtk::Box> {
         })
         .collect();
     parent.append(&row);
+    flex(&row, Flex::Columns);
     columns
 }
 
 /// A summary strip: one card holding a row of figures (see [`cell`]), and the box under them.
-fn strip(parent: &gtk::Box) -> (gtk::Box, gtk::Box) {
+pub(super) fn strip(parent: &gtk::Box) -> (gtk::Box, gtk::Box) {
     let strip = gtk::Box::new(gtk::Orientation::Vertical, 14);
     strip.add_css_class("tally-strip");
     let cells = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    cells.add_css_class("tally-cells");
     strip.append(&cells);
     parent.append(&strip);
+    flex(&cells, Flex::Strip);
     (strip, cells)
 }
 
 /// One figure of a strip: an icon and what it is, the figure, and a line under it.
-fn cell(cells: &gtk::Box, icon: &str, caption: &str, figure: &str, sub: &str, class: Option<&str>) {
+pub(super) fn cell(cells: &gtk::Box, icon: &str, caption: &str, figure: &str, sub: &str, class: Option<&str>) {
     if cells.first_child().is_some() {
         let rule = gtk::Separator::new(gtk::Orientation::Vertical);
         rule.add_css_class("tally-rule");
+        // A strip already stacked keeps its rules hidden (see `apply`).
+        rule.set_visible(!cells.has_css_class("narrow"));
         cells.append(&rule);
     }
     let cell = gtk::Box::new(gtk::Orientation::Vertical, 4);
@@ -371,7 +579,7 @@ pub fn tile(icon: &str) -> gtk::Box {
 }
 
 /// A row of a card: a leading tile, a title over a detail, and a figure at the end.
-fn icon_row(lead: &gtk::Box, title: &str, detail: &str, figure: &str, figure_class: &str) -> gtk::Box {
+pub(super) fn icon_row(lead: &gtk::Box, title: &str, detail: &str, figure: &str, figure_class: &str) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     row.add_css_class("tally-row");
     row.append(lead);
@@ -442,12 +650,43 @@ fn budget_line(b: &Value, pace_fraction: f64) -> gtk::Box {
     row
 }
 
+/// A card's `line` (a `tally-row`) as a key the width of the card, which runs `run`.
+pub(super) fn row_key(line: &gtk::Box, tooltip: &str, run: Action) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    row.add_css_class("tally-row");
+    row.add_css_class("tally-entry");
+    let key = button("", "money-row-key");
+    key.add_css_class("tally-line-key");
+    key.set_hexpand(true);
+    line.remove_css_class("tally-row");
+    key.set_child(Some(line));
+    key.set_tooltip_text(Some(tooltip));
+    key.connect_clicked(move |_| run());
+    row.append(&key);
+    row
+}
+
+/// [`budget_line`] as a key: it opens Entries on that category, this period.
+fn budget_key(ui: &Rc<Ui>, b: &Value, pace_fraction: f64) -> gtk::Box {
+    let weak = Rc::downgrade(ui);
+    let category = b["category_id"].as_i64();
+    let run: Action = Rc::new(move || {
+        if let Some(ui) = weak.upgrade() {
+            super::set_filters(None, category);
+            super::set_period_offset(0);
+            ui.navigate("money-transactions");
+        }
+    });
+    row_key(&budget_line(b, pace_fraction), &format!("See this period's {} entries", text(b, "name")), run)
+}
+
 fn go(ui: &Rc<Ui>, page: &'static str) -> Action {
     let weak = Rc::downgrade(ui);
     Rc::new(move || {
         if let Some(ui) = weak.upgrade() {
             if page == "money-transactions" {
                 super::set_period_offset(0);
+                super::set_filters(None, None);
             }
             ui.navigate(page);
         }
@@ -564,13 +803,39 @@ fn tx_row(ui: &Rc<Ui>, tx: &Value, deletable: bool, dated: bool) -> gtk::Box {
     row
 }
 
-thread_local! {
-    /// The Transactions header's live parts: context line, period caption, next key.
-    static TX_HEAD: RefCell<Option<(gtk::Label, gtk::Label, gtk::Button)>> = const { RefCell::new(None) };
+/// The Entries header's live parts: its context line, period caption and next key, and the
+/// account and category filters with the ids behind their rows (`None` is "All").
+struct TxHead {
+    context: gtk::Label,
+    period: gtk::Label,
+    next: gtk::Button,
+    accounts: gtk::DropDown,
+    categories: gtk::DropDown,
+    account_rows: RefCell<Vec<(Option<i64>, String)>>,
+    category_rows: RefCell<Vec<(Option<i64>, String)>>,
+    /// Set while a read refills the filters, so their change is not taken for the person's.
+    filling: Cell<bool>,
 }
 
-/// Builds the headers that keep their widgets across reads (Transactions' period keys and
-/// search), and shows a first message on every page.
+thread_local! {
+    static TX_HEAD: RefCell<Option<Rc<TxHead>>> = const { RefCell::new(None) };
+}
+
+/// A filter's drop-down, holding only its "All" row until the first read. Typing finds a row.
+fn filter_picker(all: &str, name: &str, spoken: &str) -> gtk::DropDown {
+    let picker = gtk::DropDown::from_strings(&[all]);
+    picker.set_enable_search(true);
+    // Search filters on this expression; without one it matches every row.
+    picker.set_expression(Some(gtk::PropertyExpression::new(gtk::StringObject::static_type(), None::<gtk::Expression>, "string")));
+    picker.add_css_class("money-picker");
+    picker.set_widget_name(name);
+    picker.set_valign(gtk::Align::Center);
+    picker.update_property(&[gtk::accessible::Property::Label(spoken)]);
+    picker
+}
+
+/// Builds the headers that keep their widgets across reads (Entries' period keys, filters and
+/// search, and Investments' keys), and shows a first message on every page.
 pub fn install(ui: &Rc<Ui>) {
     for (name, caption, _) in super::PAGES {
         if let Some(page) = page(name) {
@@ -578,13 +843,20 @@ pub fn install(ui: &Rc<Ui>) {
             message(&page.body, "Reading the ledger…");
         }
     }
+    if let Some(page) = page("money-invest") {
+        super::invest::head(ui, &page);
+    }
     let Some(page) = page("money-transactions") else { return };
     clear(&page.head);
     page.head.append(&label("Entries", "money-title"));
     let context = label("", "money-context");
+    context.set_wrap(true);
     page.head.append(&context);
     let controls = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     controls.add_css_class("money-controls");
+    let periods = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    // It takes the row's spare width, so the filters sit at the far end.
+    periods.set_hexpand(true);
     let previous = crate::app::icon_button("chevron-left", "Previous period");
     previous.add_css_class("money-chrome");
     previous.set_widget_name("money-period-previous");
@@ -594,19 +866,25 @@ pub fn install(ui: &Rc<Ui>) {
     let next = crate::app::icon_button("chevron-right", "Next period");
     next.add_css_class("money-chrome");
     next.set_widget_name("money-period-next");
-    controls.append(&previous);
-    controls.append(&period);
-    controls.append(&next);
-    let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    spacer.set_hexpand(true);
-    controls.append(&spacer);
+    periods.append(&previous);
+    periods.append(&period);
+    periods.append(&next);
+    controls.append(&periods);
+    let filters = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let accounts = filter_picker("All accounts", "money-filter-account", "Show the entries of one account");
+    let categories = filter_picker("All categories", "money-filter-category", "Show the entries of one category");
+    filters.append(&accounts);
+    filters.append(&categories);
     let search = gtk::SearchEntry::new();
     search.set_placeholder_text(Some("Search notes, categories, accounts"));
-    search.set_width_chars(30);
+    search.set_width_chars(24);
     search.add_css_class("money-search");
     search.set_widget_name("money-search");
-    controls.append(&search);
+    filters.append(&search);
+    controls.append(&filters);
     page.head.append(&controls);
+    flex(&controls, Flex::Controls);
+    flex(&filters, Flex::Controls);
     for (key, step) in [(&previous, -1_i64), (&next, 1)] {
         let weak = Rc::downgrade(ui);
         key.connect_clicked(move |_| {
@@ -623,7 +901,80 @@ pub fn install(ui: &Rc<Ui>) {
             ui.refresh_page();
         }
     });
-    TX_HEAD.with(|h| *h.borrow_mut() = Some((context, period, next)));
+    let head = Rc::new(TxHead {
+        context,
+        period,
+        next,
+        accounts,
+        categories,
+        account_rows: RefCell::new(vec![(None, String::from("All accounts"))]),
+        category_rows: RefCell::new(vec![(None, String::from("All categories"))]),
+        filling: Cell::new(false),
+    });
+    for picker in [&head.accounts, &head.categories] {
+        let (weak, read) = (Rc::downgrade(ui), Rc::downgrade(&head));
+        picker.connect_selected_notify(move |_| {
+            let (Some(ui), Some(head)) = (weak.upgrade(), read.upgrade()) else { return };
+            if head.filling.get() {
+                return;
+            }
+            let pick = |picker: &gtk::DropDown, rows: &RefCell<Vec<(Option<i64>, String)>>| rows.borrow().get(picker.selected() as usize).and_then(|row| row.0);
+            super::set_filters(pick(&head.accounts, &head.account_rows), pick(&head.categories, &head.category_rows));
+            ui.refresh_page();
+        });
+    }
+    TX_HEAD.with(|h| *h.borrow_mut() = Some(head));
+}
+
+/// Refills the Entries filters from `money.lists`, keeping the person's choice selected. An
+/// archived account or category stays listed while it is the one chosen. A chosen one the ledger
+/// no longer has (a restore or a sync took it away) is dropped, and this says so: the entries were
+/// read through it, and are read again.
+fn fill_filters(lists: &Value) -> bool {
+    let Some(head) = TX_HEAD.with(|h| h.borrow().clone()) else { return false };
+    let (account, category) = super::filters();
+    let listed = |key: &str, all: &str, chosen: Option<i64>| -> Vec<(Option<i64>, String)> {
+        let mut items = vec![(None, all.to_string())];
+        items.extend(
+            rows(lists, key)
+                .iter()
+                .filter(|v| v["archived"] != true || v["id"].as_i64() == chosen)
+                .map(|v| (v["id"].as_i64(), text(v, "name").to_string())),
+        );
+        items
+    };
+    head.filling.set(true);
+    let mut gone = false;
+    for (picker, rows, items, chosen) in [
+        (&head.accounts, &head.account_rows, listed("accounts", "All accounts", account), account),
+        (&head.categories, &head.category_rows, listed("categories", "All categories", category), category),
+    ] {
+        if *rows.borrow() != items {
+            let names: Vec<&str> = items.iter().map(|(_, name)| name.as_str()).collect();
+            picker.set_model(Some(&gtk::StringList::new(&names)));
+            *rows.borrow_mut() = items;
+        }
+        let found = rows.borrow().iter().position(|row| row.0 == chosen);
+        gone |= found.is_none();
+        let position = found.unwrap_or(0) as u32;
+        if picker.selected() != position {
+            picker.set_selected(position);
+        }
+    }
+    head.filling.set(false);
+    if gone {
+        let kept = |rows: &RefCell<Vec<(Option<i64>, String)>>, id: Option<i64>| id.filter(|id| rows.borrow().iter().any(|row| row.0 == Some(*id)));
+        super::set_filters(kept(&head.account_rows, account), kept(&head.category_rows, category));
+    }
+    gone
+}
+
+/// What the Entries filters show, as words for the context line: "Dining · Visa".
+fn filter_words() -> String {
+    let Some(head) = TX_HEAD.with(|h| h.borrow().clone()) else { return String::new() };
+    let (account, category) = super::filters();
+    let name = |rows: &RefCell<Vec<(Option<i64>, String)>>, id: Option<i64>| id.and_then(|id| rows.borrow().iter().find(|row| row.0 == Some(id)).map(|row| row.1.clone()));
+    [name(&head.category_rows, category), name(&head.account_rows, account)].into_iter().flatten().collect::<Vec<_>>().join(" · ")
 }
 
 pub async fn refresh(ui: &Rc<Ui>, name: &str) {
@@ -640,21 +991,45 @@ pub async fn refresh(ui: &Rc<Ui>, name: &str) {
             }
         }
         "money-transactions" => {
-            let (offset, query) = (super::period_offset(), super::query());
+            let (offset, query, filters) = (super::period_offset(), super::query(), super::filters());
             let mut payload = json!({"period_offset":offset});
             if !query.is_empty() {
                 payload["query"] = json!(query);
             }
+            if let Some(id) = filters.0 {
+                payload["account_id"] = json!(id);
+            }
+            if let Some(id) = filters.1 {
+                payload["category_id"] = json!(id);
+            }
             let (lists, list) = tokio::join!(ui.call("money.lists", json!({})), ui.call("money.tx.list", payload));
-            if *ui.page.borrow() != name || super::period_offset() != offset || super::query() != query {
+            if *ui.page.borrow() != name || super::period_offset() != offset || super::query() != query || super::filters() != filters {
                 return;
             }
             if let Ok(lists) = &lists {
                 remember_currency(lists);
+                if fill_filters(lists) {
+                    ui.refresh_page();
+                    return;
+                }
             }
             match list {
                 Ok(list) => transactions(ui, &page, &list, offset, &query),
                 Err(e) => failed(ui, &page, "", &e),
+            }
+        }
+        "money-invest" => {
+            let (summary, activity, lists) = tokio::join!(
+                ui.call("money.invest.summary", json!({})),
+                ui.call("money.invest.list", json!({"limit":8})),
+                ui.call("money.lists", json!({}))
+            );
+            if *ui.page.borrow() != name {
+                return;
+            }
+            match summary {
+                Ok(s) => super::invest::draw(ui, &page, &s, activity.as_ref().ok(), lists.as_ref().ok()),
+                Err(e) => super::invest::failed(ui, &page, &e),
             }
         }
         "money-plan" => {
@@ -681,7 +1056,7 @@ pub async fn refresh(ui: &Rc<Ui>, name: &str) {
     }
 }
 
-fn failed(ui: &Rc<Ui>, page: &Page, name: &str, error: &Error) {
+pub(super) fn failed(ui: &Rc<Ui>, page: &Page, name: &str, error: &Error) {
     if !name.is_empty() {
         title(&page.head, name, "");
     }
@@ -723,16 +1098,16 @@ fn home(ui: &Rc<Ui>, page: &Page, s: &Value) {
         let remaining = n(pace, "remaining");
         let sub = [format!("of {}", fmt.format_whole(n(pace, "budget"))), text(lines, "margin").to_string()];
         let class = if remaining < 0 { Some("money-over") } else { None };
-        cell(&cells, "card", "Left to spend", &fmt.format(remaining), &sub.iter().filter(|p| !p.is_empty()).cloned().collect::<Vec<_>>().join(" · "), class);
+        cell(&cells, "card", "Left to spend", &fmt.format_whole(remaining), &sub.iter().filter(|p| !p.is_empty()).cloned().collect::<Vec<_>>().join(" · "), class);
     } else {
         cell(&cells, "card", "Left to spend", "No budget", "Set one in Plan to see your pace", None);
     }
-    cell(&cells, "spend", "Spent", &fmt.format(n(s, "spent")), text(lines, "versus_last"), None);
+    cell(&cells, "spend", "Spent", &fmt.format_whole(n(s, "spent")), text(lines, "versus_last"), None);
     let income = n(s, "income");
-    cell(&cells, "income", "Income", &fmt.format(income), "this period", (income > 0).then_some("money-in"));
+    cell(&cells, "income", "Income", &fmt.format_whole(income), "this period", (income > 0).then_some("money-in"));
     let accounts = rows(s, "accounts");
     let worth = n(s, "net_worth");
-    cell(&cells, "bank", "Net worth", &fmt.format(worth), &plural(accounts.len(), "account"), (worth < 0).then_some("money-over"));
+    cell(&cells, "bank", "Net worth", &fmt.format_whole(worth), &plural(accounts.len(), "account"), (worth < 0).then_some("money-over"));
     if budgeted {
         let pace_row = gtk::Box::new(gtk::Orientation::Vertical, 6);
         pace_row.add_css_class("tally-pace");
@@ -760,12 +1135,13 @@ fn home(ui: &Rc<Ui>, page: &Page, s: &Value) {
     let ahead = |b: &Value| n(b, "spent") as f64 / n(b, "budget").max(1) as f64 - pace_fraction;
     budgets.sort_by(|a, b| ahead(b).total_cmp(&ahead(a)));
     let pair = columns(&page.body, 2);
-    let list = card(&pair[0], "Budgets", Some(("Plan", go(ui, "money-plan"))));
+    let ask = (!budgets.is_empty()).then_some((ui, "Which of my budgets are ahead of pace this month, and why?"));
+    let list = card_asking(&pair[0], "Budgets", Some(("Plan", go(ui, "money-plan"))), ask);
     if budgets.is_empty() {
         list.append(&icon_row(&tile("plan"), "No budgets yet", "Give each category a monthly budget in Plan", "", ""));
     }
     for b in budgets.iter().take(8) {
-        list.append(&budget_line(b, pace_fraction));
+        list.append(&budget_key(ui, b, pace_fraction));
     }
     let bills = rows(s, "bills");
     if !bills.is_empty() {
@@ -799,16 +1175,30 @@ fn home(ui: &Rc<Ui>, page: &Page, s: &Value) {
     }
     let mut slots = columns(&page.body, count).into_iter();
     if !accounts.is_empty() {
-        let list = card(&slots.next().expect("counted"), "Accounts", None);
+        let investing = accounts.iter().any(|a| text(a, "type") == "INVESTMENT");
+        let list = card(&slots.next().expect("counted"), "Accounts", investing.then(|| ("Investments", go(ui, "money-invest"))));
         for account in &accounts {
             let balance = n(account, "balance");
-            list.append(&icon_row(
+            let row = icon_row(
                 &tile(account_icon(text(account, "type"))),
                 text(account, "name"),
                 &word(text(account, "type")),
                 &fmt.format(balance),
                 if balance < 0 { "money-over" } else { "" },
-            ));
+            );
+            if text(account, "type") != "INVESTMENT" {
+                list.append(&row);
+                continue;
+            }
+            // An investment account is worth what its statement says: a click records that.
+            let weak = Rc::downgrade(ui);
+            let held = account.clone();
+            let run: Action = Rc::new(move || {
+                if let Some(ui) = weak.upgrade() {
+                    super::record_value(&ui, &held);
+                }
+            });
+            list.append(&row_key(&row, &format!("Record what {} is worth", text(account, "name")), run));
         }
         let total = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         total.add_css_class("tally-total");
@@ -888,28 +1278,50 @@ fn transactions(ui: &Rc<Ui>, page: &Page, list: &Value, offset: i64, query: &str
     let entries = rows(list, "transactions");
     let name = period_name(&list["period"]);
     let count = copy::plural_as(entries.len() as i64, "entry", "entries");
-    TX_HEAD.with(|h| {
-        if let Some((context, period, next)) = h.borrow().as_ref() {
-            context.set_text(&if query.is_empty() { format!("{count} in {name}") } else { format!("{count} matching \u{201c}{query}\u{201d}") });
-            period.set_text(&name);
-            next.set_sensitive(offset < 0);
+    let filtered = filter_words();
+    if let Some(head) = TX_HEAD.with(|h| h.borrow().clone()) {
+        let mut context = if query.is_empty() { format!("{count} in {name}") } else { format!("{count} matching \u{201c}{query}\u{201d}") };
+        if !filtered.is_empty() {
+            context = format!("{context} · {filtered}");
         }
-    });
+        head.context.set_text(&context);
+        head.period.set_text(&name);
+        head.next.set_sensitive(offset < 0);
+    }
     clear(&page.body);
     let (income, spent) = (n(list, "income"), n(list, "spent"));
     let (_, cells) = strip(&page.body);
     cell(&cells, "list", "Entries", &entries.len().to_string(), &name, None);
-    cell(&cells, "income", "Money in", &fmt.format(income), "income", (income > 0).then_some("money-in"));
-    cell(&cells, "spend", "Money out", &fmt.format(spent), "spending", None);
+    cell(&cells, "income", "Money in", &fmt.format_whole(income), "income", (income > 0).then_some("money-in"));
+    cell(&cells, "spend", "Money out", &fmt.format_whole(spent), "spending", None);
     let net = income - spent;
-    cell(&cells, "gauge", "Net", &fmt.format_signed(net), "in less out", Some(if net < 0 { "money-over" } else { "money-in" }));
+    cell(&cells, "gauge", "Net", &signed_whole(&fmt, net), "in less out", Some(if net < 0 { "money-over" } else { "money-in" }));
     if entries.is_empty() {
-        let text = if query.is_empty() { format!("Nothing logged in {name}.") } else { format!("Nothing in {name} matches \u{201c}{query}\u{201d}.") };
+        let text = match (query.is_empty(), filtered.is_empty()) {
+            (true, true) => format!("Nothing logged in {name}."),
+            (true, false) => format!("Nothing in {name} for {filtered}."),
+            (false, _) => format!("Nothing in {name} matches \u{201c}{query}\u{201d}."),
+        };
         let rows = card(&page.body, "Entries", None);
         rows.append(&icon_row(&tile("list"), &text, "Add an entry with the Entry key above", "", ""));
+        if !filtered.is_empty() {
+            let clear_key = button("Show every entry", "money-secondary");
+            clear_key.set_widget_name("money-filter-clear");
+            clear_key.set_halign(gtk::Align::Start);
+            clear_key.add_css_class("tally-save");
+            let weak = Rc::downgrade(ui);
+            clear_key.connect_clicked(move |_| {
+                if let Some(ui) = weak.upgrade() {
+                    super::set_filters(None, None);
+                    ui.refresh_page();
+                }
+            });
+            rows.append(&clear_key);
+        }
         return;
     }
-    let rows_box = card(&page.body, "By day", None);
+    let question = if filtered.is_empty() { format!("Where did my money go in {name}?") } else { format!("What stands out in my {filtered} entries for {name}?") };
+    let rows_box = card_asking(&page.body, "By day", None, Some((ui, &question)));
     let mut start = 0;
     while start < entries.len() {
         let day = text(&entries[start], "date").to_string();
@@ -947,17 +1359,9 @@ fn transactions(ui: &Rc<Ui>, page: &Page, list: &Value, offset: i64, query: &str
 fn plan(ui: &Rc<Ui>, page: &Page, s: &Value, lists: &Value) {
     remember_currency(s);
     let fmt = formatter();
-    // A read that lands while a budget is being typed keeps the typing.
-    let typing = gtk::prelude::GtkWindowExt::focus(&ui.window)
-        .and_then(|w| w.ancestor(gtk::Entry::static_type()))
-        .and_downcast::<gtk::Entry>()
-        .filter(|e| e.widget_name().starts_with("money-budget"))
-        .map(|e| (e.widget_name().to_string(), e.text().to_string(), e.position()));
+    let typed = typing(ui, "money-budget");
     title(&page.head, "Plan", &format!("Budgets for {}. Leave a field empty for no budget; changes save as you leave it.", period_name(&s["period"])));
-    // Removing a focused field ends its focus: that is a rebuild, not the person leaving it.
-    REBUILDING.with(|r| r.set(true));
-    clear(&page.body);
-    REBUILDING.with(|r| r.set(false));
+    clear_rebuilding(&page.body);
     let pace = &s["pace"];
     let status = text(pace, "status");
     let budget = if status == "NO_BUDGET" { 0 } else { n(pace, "budget") };
@@ -983,7 +1387,7 @@ fn plan(ui: &Rc<Ui>, page: &Page, s: &Value, lists: &Value) {
     let fraction = if budget > 0 { n(pace, "spent") as f64 / budget as f64 } else { 0.0 };
     overall.append(&budget_row(ui, None, "Everything", &detail, budget, tone_class(status), Some(tile("plan")), (budget > 0).then(|| (fraction, tone(status, None)))));
 
-    let list = card(&page.body, "By category", None);
+    let list = card_asking(&page.body, "By category", None, Some((ui, "Are my budgets realistic, given what I have been spending?")));
     let head = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     head.add_css_class("tally-th");
     let caption = label("Category", "tally-th-text");
@@ -1012,17 +1416,43 @@ fn plan(ui: &Rc<Ui>, page: &Page, s: &Value, lists: &Value) {
         let lead = badge_sized(text(category, "icon"), n(category, "color"), 28);
         list.append(&budget_row(ui, Some(id), text(category, "name"), &detail, amount, tone_class(status), Some(lead), meter));
     }
-    if let Some((name, text, position)) = typing {
-        if let Some(entry) = named(page.body.upcast_ref(), &name).and_downcast::<gtk::Entry>() {
-            entry.set_text(&text);
-            entry.grab_focus();
-            entry.set_position(position);
-        }
-    }
+    retype(&page.body, typed);
 }
 
 thread_local! {
-    static REBUILDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static REBUILDING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The field being typed in, when its name starts with `prefix`: a read that lands while a
+/// figure is typed keeps the typing ([`retype`]).
+pub(super) fn typing(ui: &Ui, prefix: &str) -> Option<(String, String, i32)> {
+    gtk::prelude::GtkWindowExt::focus(&ui.window)
+        .and_then(|w| w.ancestor(gtk::Entry::static_type()))
+        .and_downcast::<gtk::Entry>()
+        .filter(|e| e.widget_name().starts_with(prefix))
+        .map(|e| (e.widget_name().to_string(), e.text().to_string(), e.position()))
+}
+
+/// Puts [`typing`]'s field back as it was, in the rebuilt `body`.
+pub(super) fn retype(body: &gtk::Box, typed: Option<(String, String, i32)>) {
+    let Some((name, text, position)) = typed else { return };
+    if let Some(entry) = named(body.upcast_ref(), &name).and_downcast::<gtk::Entry>() {
+        entry.set_text(&text);
+        entry.grab_focus();
+        entry.set_position(position);
+    }
+}
+
+/// Clears `body` for a rebuild. Removing a focused field ends its focus: that is a rebuild, not
+/// the person leaving it, so its save-on-leave holds back while [`rebuilding`].
+pub(super) fn clear_rebuilding(body: &gtk::Box) {
+    REBUILDING.with(|r| r.set(true));
+    clear(body);
+    REBUILDING.with(|r| r.set(false));
+}
+
+pub(super) fn rebuilding() -> bool {
+    REBUILDING.with(|r| r.get())
 }
 
 fn named(root: &gtk::Widget, name: &str) -> Option<gtk::Widget> {
@@ -1102,7 +1532,7 @@ fn budget_row(
         let saved = saved.clone();
         move |field: &gtk::Entry| {
             let Some(ui) = weak.upgrade() else { return };
-            if REBUILDING.with(|r| r.get()) {
+            if rebuilding() {
                 return;
             }
             let typed = field.text();
@@ -1186,6 +1616,9 @@ fn data(ui: &Rc<Ui>, page: &Page, summary: Option<&Value>, lists: Option<&Value>
     let account = button("Add…", "");
     account.set_widget_name("money-account");
     setting_row(&ledger, "bank", "Add an account", "Cash, chequing, savings, credit or investment. The first brings Tally's categories.", &account);
+    let wealthsimple = button("Import…", "");
+    wealthsimple.set_widget_name("money-invest-import");
+    setting_row(&ledger, "chart", "Import a Wealthsimple file", "A holdings report, an activities export or a monthly statement (.csv). It adds to what is here.", &wealthsimple);
     let sample = button("Load", "");
     sample.set_widget_name("money-sample");
     sample.set_sensitive(empty);
@@ -1211,6 +1644,12 @@ fn data(ui: &Rc<Ui>, page: &Page, summary: Option<&Value>, lists: Option<&Value>
     import_key.connect_clicked(move |_| {
         if let Some(ui) = weak.upgrade() {
             import(&ui, empty);
+        }
+    });
+    let weak = Rc::downgrade(ui);
+    wealthsimple.connect_clicked(move |_| {
+        if let Some(ui) = weak.upgrade() {
+            super::invest::import_from_page(&ui);
         }
     });
     let weak = Rc::downgrade(ui);

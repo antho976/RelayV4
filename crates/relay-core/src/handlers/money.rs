@@ -1,21 +1,57 @@
-//! `money.*` — the Money space's ledger (docs/MONEY.md).
+//! `money.*` — the Money space's ledger (docs/MONEY.md), and its investments
+//! (docs/INVESTMENTS.md).
 //!
 //! The ledger is its own SQLite file, `money.db` beside the store, behind its own mutex: money has
 //! its own schema versions and is what the phone will sync with. Its work is local and short, so
 //! queries run unlocked and mutations inside the store's transaction like any other op; a money
-//! write is committed in `money.db` whether or not the store transaction around it commits.
+//! write is committed in `money.db` whether or not the store transaction around it commits. A
+//! Wealthsimple file is read before the transaction opens, and the Bank of Canada's rates are
+//! fetched on a thread of their own after it closes: nothing slow runs under either lock.
 
-use crate::engine::{Engine, IntoBus};
+use crate::engine::{Ctx, Engine, IntoBus};
 use relay_bus::ops::money::*;
 use relay_bus::{BusError, Empty};
 use relay_money::backup::{self, BackupReadResult};
+use relay_money::bank_statements::decode_text;
+use relay_money::invest::{parse_scaled, RATE_SCALE, SOURCE_BANK_OF_CANADA, SOURCE_MANUAL};
 use relay_money::ledger::{parse_date, Ledger, LedgerError, TxInput, TxPatch, TxQuery};
 use relay_money::money::Locale;
-use serde_json::json;
+use relay_money::views::{AccountPatch, ActivityInput, ActivityQuery};
+use serde_json::{json, Value};
+use std::io::Read;
 use std::path::Path;
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 /// A backup bigger than this is not one Tally wrote.
 const MAX_BACKUP_BYTES: u64 = 64 << 20;
+/// A Wealthsimple export bigger than this is not one: years of activity are a few megabytes.
+const MAX_EXPORT_BYTES: u64 = 16 << 20;
+
+/// The Bank of Canada's Valet API: the US dollar's daily rate in Canadian dollars over its last ten
+/// business days. It needs no key, and the request carries nothing about the person.
+const VALET_USD_CAD: &str = "https://www.bankofcanada.ca/valet/observations/FXUSDCAD/json?recent=10";
+/// How long the Bank of Canada has to answer.
+const FX_TIMEOUT: Duration = Duration::from_secs(15);
+/// A fetch of the rates is on its way: a second one asked for meanwhile joins it.
+static FX_FETCHING: AtomicBool = AtomicBool::new(false);
+
+/// Holds [`FX_FETCHING`] for one fetch and lets it go however the fetch ends, a panic included, so
+/// a failed fetch never leaves every later one answering `started: false`.
+struct Fetching;
+
+impl Fetching {
+    fn start() -> Option<Fetching> {
+        (!FX_FETCHING.swap(true, Ordering::SeqCst)).then_some(Fetching)
+    }
+}
+
+impl Drop for Fetching {
+    fn drop(&mut self) {
+        FX_FETCHING.store(false, Ordering::SeqCst);
+    }
+}
 
 fn bus(e: LedgerError) -> BusError {
     match e {
@@ -55,6 +91,66 @@ fn absolute(path: &str) -> Result<&Path, BusError> {
         Ok(p)
     } else {
         Err(BusError::invalid("money.path", "Give the file's full path"))
+    }
+}
+
+/// A Wealthsimple file the person chose, read whole and decoded as the phone decodes it (UTF-8,
+/// UTF-16 by its mark, else Windows-1252), so both read the same text. Run before any lock is
+/// taken. Only a regular file is read, and never more than [`MAX_EXPORT_BYTES`] of it: a pipe or a
+/// device would otherwise hold the request open forever.
+fn read_export(path: &str) -> Result<String, BusError> {
+    let path = absolute(path)?;
+    let unreadable = |e: std::io::Error| BusError::invalid("money.path", format!("{}: {e}", path.display()));
+    let too_big = || BusError::invalid("money.import", "That file is too big to be a Wealthsimple export");
+    let meta = std::fs::metadata(path).map_err(unreadable)?;
+    if !meta.is_file() {
+        return Err(BusError::invalid("money.path", format!("{}: not a file", path.display())));
+    }
+    if meta.len() > MAX_EXPORT_BYTES {
+        return Err(too_big());
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path).and_then(|f| f.take(MAX_EXPORT_BYTES + 1).read_to_end(&mut bytes)).map_err(unreadable)?;
+    if bytes.len() as u64 > MAX_EXPORT_BYTES {
+        return Err(too_big());
+    }
+    Ok(decode_text(&bytes))
+}
+
+/// The rates in a Valet answer for `FXUSDCAD` (`{"observations": [{"d": "2026-10-08", "FXUSDCAD":
+/// {"v": "1.3712"}}]}`): each day and its rate at [`RATE_SCALE`]. An observation that cannot be
+/// read is left out; an answer with none is a refusal.
+fn valet_rates(text: &str) -> Result<Vec<(String, i64)>, String> {
+    let answer: Value = serde_json::from_str(text).map_err(|e| format!("The Bank of Canada's answer is not one Relay reads: {e}"))?;
+    let rates: Vec<(String, i64)> = answer["observations"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|o| {
+            let day = o["d"].as_str().filter(|d| parse_date(d).is_some())?;
+            let rate = match &o["FXUSDCAD"]["v"] {
+                Value::String(v) => parse_scaled(v, RATE_SCALE.ilog10())?,
+                Value::Number(v) => parse_scaled(&v.to_string(), RATE_SCALE.ilog10())?,
+                _ => return None,
+            };
+            (rate.value > 0).then(|| (day.to_string(), rate.value))
+        })
+        .collect();
+    if rates.is_empty() {
+        return Err("The Bank of Canada sent no US dollar rate".into());
+    }
+    Ok(rates)
+}
+
+/// The recent USD → CAD rates, through `curl` under a deadline. Never called under a lock.
+fn fetch_usd_cad(curl: &Path) -> Result<Vec<(String, i64)>, String> {
+    let mut command = Command::new(curl);
+    command.args(["--silent", "--show-error", "--fail", "--proto", "=https", VALET_USD_CAD]);
+    match crate::proc::output_with_timeout(&mut command, FX_TIMEOUT) {
+        Ok(Some(out)) if out.status.success() => valet_rates(&String::from_utf8_lossy(&out.stdout)),
+        Ok(Some(out)) => Err(format!("The Bank of Canada could not be reached: {}", String::from_utf8_lossy(&out.stderr).trim())),
+        Ok(None) => Err(format!("The Bank of Canada did not answer within {} seconds", FX_TIMEOUT.as_secs())),
+        Err(e) => Err(format!("curl could not start: {e}")),
     }
 }
 
@@ -112,8 +208,20 @@ pub fn register(e: &mut Engine) {
         Ok(Empty {})
     });
     e.register::<AccountAdd>(|ctx, p| {
-        let account = ledger(ctx.engine(), |l| l.account_add(&p.name, p.r#type, p.opening_balance.unwrap_or(0)))?;
+        let institution = p.institution.as_deref().unwrap_or("");
+        let account = ledger(ctx.engine(), |l| l.account_add(&p.name, p.r#type, p.opening_balance.unwrap_or(0), p.registration, institution))?;
         ctx.emit("money.changed", json!({}));
+        Ok(account)
+    });
+    e.register::<AccountUpdate>(|ctx, p| {
+        let patch = AccountPatch { name: p.name, registration: p.registration, institution: p.institution, archived: p.archived };
+        let account = ledger(ctx.engine(), |l| l.account_update(p.id, &patch))?;
+        ctx.emit("money.changed", json!({}));
+        Ok(account)
+    });
+    e.register::<ValueSet>(|ctx, p| {
+        let account = ledger(ctx.engine(), |l| l.value_set(p.account_id, &p.date, p.value))?;
+        ctx.emit("money.changed", json!({"account": account.id}));
         Ok(account)
     });
     e.register::<SettingsSet>(|ctx, p| {
@@ -176,4 +284,123 @@ pub fn register(e: &mut Engine) {
         ctx.emit("money.changed", json!({}));
         Ok(Empty {})
     });
+    register_invest(e);
+}
+
+/// Investments (docs/INVESTMENTS.md): the portfolio reading, activities, the Wealthsimple import,
+/// room, prices and rates.
+fn register_invest(e: &mut Engine) {
+    e.register_unlocked::<InvestSummary>(|ctx, p| {
+        let day = today(p.today.as_deref())?;
+        ledger(ctx.engine(), |l| l.portfolio(day))
+    });
+    e.register_unlocked::<InvestList>(|ctx, p| {
+        let q = ActivityQuery { account_id: p.account_id, r#type: p.r#type, since: p.since, limit: p.limit };
+        Ok(InvestListOut { activities: ledger(ctx.engine(), |l| l.invest_list(&q))? })
+    });
+    e.register::<InvestAdd>(|ctx, p| {
+        let input = ActivityInput {
+            account_id: p.account_id, r#type: p.r#type, date: p.date, symbol: p.symbol, currency: p.currency, quantity: p.quantity,
+            amount: p.amount, fee: p.fee, note: p.note, to_amount: p.to_amount, to_currency: p.to_currency,
+        };
+        let activity = ledger(ctx.engine(), |l| l.invest_add(&input))?;
+        ctx.emit("money.changed", json!({"activity": activity.id}));
+        Ok(activity)
+    });
+    e.register::<InvestDelete>(|ctx, p| {
+        ledger(ctx.engine(), |l| l.invest_delete(p.id))?;
+        ctx.emit("money.changed", json!({"activity": p.id, "deleted": true}));
+        Ok(Empty {})
+    });
+    e.register::<InvestRestore>(|ctx, p| {
+        let activity = ledger(ctx.engine(), |l| l.invest_restore(p.id))?;
+        ctx.emit("money.changed", json!({"activity": activity.id}));
+        Ok(activity)
+    });
+    e.register_unlocked::<InvestPreview>(|ctx, p| {
+        let text = read_export(&p.path)?;
+        ledger(ctx.engine(), |l| l.invest_preview(&text, p.account_id))
+    });
+    // The file is read before the transaction opens; the plan and its writes are one short ledger call.
+    e.register_staged::<InvestImport, _>(
+        |_, p| read_export(&p.path),
+        |ctx: &mut Ctx, p, text: String| {
+            let result = ledger(ctx.engine(), |l| l.invest_import(&text, &p.accounts, p.account_id))?;
+            ctx.emit("money.changed", json!({"imported": result.holdings + result.activities}));
+            Ok(result)
+        },
+    );
+    e.register::<InvestRoom>(|ctx, p| {
+        ledger(ctx.engine(), |l| l.room_set(p.registration, p.year, p.amount))?;
+        ctx.emit("money.changed", json!({}));
+        Ok(Empty {})
+    });
+    e.register::<InvestPrice>(|ctx, p| {
+        ledger(ctx.engine(), |l| l.price_set(&p.symbol, &p.date, p.price))?;
+        ctx.emit("money.changed", json!({}));
+        Ok(Empty {})
+    });
+    e.register::<FxSet>(|ctx, p| {
+        ledger(ctx.engine(), |l| l.fx_set(&p.base, &p.quote, &p.date, p.rate, SOURCE_MANUAL))?;
+        ctx.emit("money.changed", json!({}));
+        Ok(Empty {})
+    });
+    // The github.connect shape: answer at once, fetch on a thread of its own once the transaction
+    // is over, write the rates in one short ledger call, then say so with `money.changed`.
+    e.register::<FxFetch>(|ctx, _: Empty| {
+        let curl = which::which("curl").map_err(|_| {
+            BusError::unavailable("money.curl_missing", "curl is not installed or not on PATH").with_hint("install curl, then fetch the rate again")
+        })?;
+        if FX_FETCHING.load(Ordering::SeqCst) {
+            return Ok(FxFetchOut { started: false });
+        }
+        ctx.after_commit(move |engine| {
+            let Some(fetching) = Fetching::start() else { return };
+            let fetch = move || {
+                let written = fetch_usd_cad(&curl).and_then(|rates| {
+                    ledger(&engine, |l| {
+                        for (day, rate) in &rates {
+                            l.fx_set("USD", "CAD", day, *rate, SOURCE_BANK_OF_CANADA)?;
+                        }
+                        Ok(rates.len())
+                    })
+                    .map_err(|e| e.message)
+                });
+                drop(fetching);
+                match written {
+                    Ok(n) => engine.emit_system("money.changed", json!({"fx": n})),
+                    Err(error) => {
+                        tracing::warn!(error = %error, "fetching the Bank of Canada's rates");
+                        engine.emit_system("money.changed", json!({"fx": 0, "error": error}));
+                    }
+                }
+            };
+            // A thread that cannot start drops the fetch, and with it the flag.
+            if let Err(e) = std::thread::Builder::new().name("money-fx".into()).spawn(fetch) {
+                tracing::warn!(error = %e, "starting the Bank of Canada fetch");
+            }
+        });
+        Ok(FxFetchOut { started: true })
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_valet_answer_reads_as_days_and_rates() {
+        let answer = r#"{"terms": {"url": "https://www.bankofcanada.ca/terms/"},
+            "seriesDetail": {"FXUSDCAD": {"label": "USD/CAD", "description": "US dollar to Canadian dollar daily exchange rate"}},
+            "observations": [
+                {"d": "2026-10-07", "FXUSDCAD": {"v": "1.3712"}},
+                {"d": "2026-10-08", "FXUSDCAD": {"v": 1.37125}},
+                {"d": "2026-10-09", "FXUSDCAD": {"v": ""}},
+                {"d": "yesterday", "FXUSDCAD": {"v": "1.37"}},
+                {"d": "2026-10-10", "FXUSDCAD": {"v": "-1"}}
+            ]}"#;
+        assert_eq!(valet_rates(answer).unwrap(), vec![("2026-10-07".to_string(), 137_120_000), ("2026-10-08".to_string(), 137_125_000)]);
+        assert!(valet_rates(r#"{"observations": []}"#).unwrap_err().contains("no US dollar rate"));
+        assert!(valet_rates("<html>Service unavailable</html>").is_err());
+    }
 }

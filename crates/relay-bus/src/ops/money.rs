@@ -5,11 +5,18 @@
 //! Tally's names. Every mutation emits `money.changed`. What replaces or erases the ledger, or
 //! changes its currency, is the person's alone (`Actors::UserOnly`): an agent may read and add
 //! entries, never wipe them.
+//!
+//! Investments (docs/INVESTMENTS.md) are `money.invest.*`, `money.fx.*` and `money.value.set`.
+//! Units held and prices are integers at 1e-8 (`relay_money::invest::QTY_SCALE`, `PRICE_SCALE`),
+//! FX rates units of `quote` per one `base` at 1e-8 (`RATE_SCALE`). What reads a file on the PC or
+//! goes out to the network is the person's alone.
 use crate::registry::{Actors, OpMeta, Scope};
 use crate::{op, Empty};
-use relay_money::model::{AccountType, TxType};
+use relay_money::model::{AccountType, ActivityType, Registration, TxType};
 use relay_money::series::{Series, SeriesQuery};
-use relay_money::views::{AccountView, Change, Lists, Settings, Summary, SyncOut, Tx, TxPage};
+use relay_money::views::{
+    AccountView, ActivityView, Change, ImportAccount, ImportPreview, ImportResult, Lists, Portfolio, Settings, Summary, SyncOut, Tx, TxPage,
+};
 
 payload!(#[schemars(rename = "MoneySummaryIn")] SummaryIn {
     /// The day to read the month from; today in the engine's time zone when absent.
@@ -55,9 +62,26 @@ payload!(#[schemars(rename = "MoneyBudgetSetIn")] BudgetSetIn {
     pub amount: i64,
 });
 op!(BudgetSet, "money.budget.set", BudgetSetIn => Empty, OpMeta::mutation(Scope::Global, 12, "Set or remove a monthly budget").emits(&["money.changed"]));
-payload!(#[schemars(rename = "MoneyAccountAddIn")] AccountAddIn { pub name: String, pub r#type: AccountType, pub opening_balance: Option<i64> });
+payload!(#[schemars(rename = "MoneyAccountAddIn")] AccountAddIn {
+    pub name: String, pub r#type: AccountType, pub opening_balance: Option<i64>,
+    /// Investment accounts only: TFSA, RRSP, FHSA…
+    pub registration: Option<Registration>,
+    /// Where the account is held, e.g. Wealthsimple.
+    pub institution: Option<String>,
+});
 op!(AccountAdd, "money.account.add", AccountAddIn => AccountView,
     OpMeta::mutation(Scope::Global, 12, "Add an account; the first one also seeds Tally's default categories").emits(&["money.changed"]));
+payload!(#[schemars(rename = "MoneyAccountUpdateIn")] AccountUpdateIn {
+    pub id: i64, pub name: Option<String>,
+    /// Investment accounts only.
+    pub registration: Option<Registration>,
+    pub institution: Option<String>, pub archived: Option<bool>,
+});
+op!(AccountUpdate, "money.account.update", AccountUpdateIn => AccountView,
+    OpMeta::mutation(Scope::Global, 12, "Rename an account, set its registration or institution, or archive it; absent fields keep their value").emits(&["money.changed"]));
+payload!(#[schemars(rename = "MoneyValueSetIn")] ValueSetIn { pub account_id: i64, pub date: String, pub value: i64 });
+op!(ValueSet, "money.value.set", ValueSetIn => AccountView,
+    OpMeta::mutation(Scope::Global, 12, "Record what an investment account was worth on a day; a second value the same day replaces the first").emits(&["money.changed"]));
 payload!(#[schemars(rename = "MoneySettingsSetIn")] SettingsSetIn {
     /// An ISO 4217 code, e.g. CAD.
     pub currency: Option<String>,
@@ -99,4 +123,93 @@ payload!(#[schemars(rename = "MoneySyncIn")] SyncIn {
 op!(Sync, "money.sync", SyncIn => SyncOut,
     OpMeta::mutation(Scope::Global, 12, "Tally's two-way sync (docs/MONEY.md): apply the phone's changes, newest edit winning per row, and answer with the PC's changes since the phone's cursor").actors(Actors::UserOnly).emits(&["money.changed"]));
 
-entries!(SummaryOp, ListsOp, TxList, SeriesOp, TxAdd, TxUpdate, TxDelete, TxRestore, BudgetSet, AccountAdd, SettingsSet, Import, Export, Sample, Reset, Sync);
+// ── Investments (docs/INVESTMENTS.md) ─────────────────────────────────────
+
+payload!(#[schemars(rename = "MoneyInvestSummaryIn")] InvestSummaryIn {
+    /// The day to value the portfolio on; today in the engine's time zone when absent.
+    pub today: Option<String>,
+});
+op!(InvestSummary, "money.invest.summary", InvestSummaryIn => Portfolio,
+    OpMeta::query(Scope::Global, 12, "The investments: value, book, gain and income, each account with its money-weighted return, the allocation, holdings, and the TFSA, RRSP and FHSA room left this year"));
+payload!(#[schemars(rename = "MoneyInvestListIn")] InvestListIn {
+    pub account_id: Option<i64>, pub r#type: Option<ActivityType>,
+    /// `YYYY-MM-DD`: activities on or after it.
+    pub since: Option<String>,
+    /// 200 when absent.
+    pub limit: Option<u32>,
+});
+result!(#[schemars(rename = "MoneyInvestListOut")] InvestListOut { pub activities: Vec<ActivityView> });
+op!(InvestList, "money.invest.list", InvestListIn => InvestListOut,
+    OpMeta::query(Scope::Global, 12, "Investment activities (buys, sells, dividends, deposits…), newest first"));
+payload!(#[schemars(rename = "MoneyInvestAddIn")] InvestAddIn {
+    pub account_id: i64, pub r#type: ActivityType, pub date: String,
+    /// The security, e.g. XEQT; it is made when the ledger does not know it yet.
+    pub symbol: Option<String>,
+    /// The ledger's when absent.
+    pub currency: Option<String>,
+    /// Units at 1e-8: 100000000 is one unit.
+    pub quantity: Option<i64>,
+    /// Minor units of `currency`, never negative: the type says which way the money went.
+    pub amount: i64, pub fee: Option<i64>, pub note: Option<String>,
+    /// `FX` only: what the money became, in `to_currency`.
+    pub to_amount: Option<i64>, pub to_currency: Option<String>,
+});
+op!(InvestAdd, "money.invest.add", InvestAddIn => ActivityView,
+    OpMeta::mutation(Scope::Global, 12, "Record an investment activity in an investment account: a buy, sell, dividend, deposit, fee…").emits(&["money.changed"]));
+op!(InvestDelete, "money.invest.delete", IdIn => Empty,
+    OpMeta::mutation(Scope::Global, 12, "Delete an investment activity (kept as a tombstone, so an imported line is never imported again)").emits(&["money.changed"]));
+op!(InvestRestore, "money.invest.restore", IdIn => ActivityView,
+    OpMeta::mutation(Scope::Global, 12, "Bring back a deleted investment activity: the Undo of money.invest.delete").emits(&["money.changed"]));
+payload!(#[schemars(rename = "MoneyInvestPreviewIn")] InvestPreviewIn {
+    /// An absolute path on the PC: a Wealthsimple holdings report, activities export or monthly statement (CSV).
+    pub path: String,
+    /// A statement names no account: the one it would go into, so lines already there count as duplicates.
+    pub account_id: Option<i64>,
+});
+op!(InvestPreview, "money.invest.preview", InvestPreviewIn => ImportPreview,
+    OpMeta::query(Scope::Global, 12, "Read a Wealthsimple file without importing it: its kind, its accounts and the Tally accounts already holding them, and how many lines are new").actors(Actors::UserOnly));
+payload!(#[schemars(rename = "MoneyInvestImportIn")] InvestImportIn {
+    /// An absolute path on the PC.
+    pub path: String,
+    /// Where each of the file's accounts goes, by Wealthsimple's account number: an `account_id`,
+    /// or a new account when it has none. A number not listed goes to the account already holding it.
+    pub accounts: Vec<ImportAccount>,
+    /// A statement only: the account it belongs to.
+    pub account_id: Option<i64>,
+});
+op!(InvestImport, "money.invest.import", InvestImportIn => ImportResult,
+    OpMeta::mutation(Scope::Global, 12, "Import a Wealthsimple file: holdings, activities, prices and the accounts' values. A line already imported, or imported and deleted, is left out").actors(Actors::UserOnly).emits(&["money.changed"]));
+payload!(#[schemars(rename = "MoneyInvestRoomIn")] InvestRoomIn {
+    /// TFSA, RRSP or FHSA.
+    pub registration: Registration,
+    pub year: i32,
+    /// The person's figure from CRA My Account (or the Notice of Assessment for an RRSP), minor units. Zero or less removes it.
+    pub amount: i64,
+});
+op!(InvestRoom, "money.invest.room", InvestRoomIn => Empty,
+    OpMeta::mutation(Scope::Global, 12, "Set or remove the CRA contribution room for a registration and year").emits(&["money.changed"]));
+payload!(#[schemars(rename = "MoneyInvestPriceIn")] InvestPriceIn {
+    pub symbol: String, pub date: String,
+    /// At 1e-8 of the security's currency's major unit: 3812000000 is 38.12.
+    pub price: i64,
+});
+op!(InvestPrice, "money.invest.price", InvestPriceIn => Empty,
+    OpMeta::mutation(Scope::Global, 12, "Record a security's price on a day").emits(&["money.changed"]));
+payload!(#[schemars(rename = "MoneyFxSetIn")] FxSetIn {
+    /// ISO 4217 codes: `rate` is units of `quote` for one `base`, at 1e-8.
+    pub base: String, pub quote: String, pub date: String, pub rate: i64,
+});
+op!(FxSet, "money.fx.set", FxSetIn => Empty,
+    OpMeta::mutation(Scope::Global, 12, "Record an exchange rate on a day").emits(&["money.changed"]));
+result!(#[schemars(rename = "MoneyFxFetchOut")] FxFetchOut {
+    /// False when a fetch is already on its way.
+    pub started: bool,
+});
+op!(FxFetch, "money.fx.fetch", Empty => FxFetchOut,
+    OpMeta::mutation(Scope::Global, 12, "Fetch the US dollar's recent daily rates in Canadian dollars from the Bank of Canada (no key, nothing personal sent) in the background; money.changed follows").actors(Actors::UserOnly).emits(&["money.changed"]));
+
+entries!(
+    SummaryOp, ListsOp, TxList, SeriesOp, TxAdd, TxUpdate, TxDelete, TxRestore, BudgetSet, AccountAdd, AccountUpdate, ValueSet, SettingsSet,
+    Import, Export, Sample, Reset, Sync, InvestSummary, InvestList, InvestAdd, InvestDelete, InvestRestore, InvestPreview, InvestImport,
+    InvestRoom, InvestPrice, FxSet, FxFetch,
+);

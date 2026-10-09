@@ -45,6 +45,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.tally.app.data.prefs.Accent
 import com.tally.app.ui.common.Caption
 import com.tally.app.ui.common.GUTTER
+import com.tally.app.ui.common.HeroNumber
 import com.tally.app.ui.common.Group
 import com.tally.app.ui.common.GroupBlock
 import com.tally.app.ui.common.HeroPanel

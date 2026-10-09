@@ -18,6 +18,9 @@ enum Kind {
     Text,
     Bool,
     OptText,
+    OptInt,
+    /// Text a device from before the column was added leaves out: missing, it reads as empty.
+    TextOrEmpty,
     /// A reference to another table's row, by uid on the wire and by id here.
     Ref(&'static str),
     OptRef(&'static str),
@@ -38,6 +41,8 @@ const TABLES: &[(&str, &[Col])] = &[
     ("accounts", &[
         col("name", "name", Kind::Text), col("type", "type", Kind::Text), col("openingBalance", "opening_balance", Kind::Int),
         col("archived", "archived", Kind::Bool), col("sortOrder", "sort_order", Kind::Int),
+        col("registration", "registration", Kind::OptText), col("institution", "institution", Kind::TextOrEmpty),
+        col("externalRef", "external_ref", Kind::TextOrEmpty),
     ]),
     ("categories", &[
         col("name", "name", Kind::Text), col("kind", "kind", Kind::Text), col("color", "color", Kind::Int),
@@ -71,6 +76,32 @@ const TABLES: &[(&str, &[Col])] = &[
     ("account_values", &[
         col("account", "account_id", Kind::Ref("accounts")), col("date", "date", Kind::Text), col("value", "value", Kind::Int),
     ]),
+    // Investments (docs/INVESTMENTS.md), after what they refer to.
+    ("securities", &[
+        col("symbol", "symbol", Kind::Text), col("name", "name", Kind::TextOrEmpty), col("currency", "currency", Kind::Text),
+        col("kind", "kind", Kind::Text), col("exchange", "exchange", Kind::TextOrEmpty),
+    ]),
+    ("holdings", &[
+        col("account", "account_id", Kind::Ref("accounts")), col("security", "security_id", Kind::Ref("securities")),
+        col("date", "date", Kind::Text), col("quantity", "quantity", Kind::Int), col("book", "book", Kind::Int),
+        col("bookMarket", "book_market", Kind::Int),
+    ]),
+    ("activities", &[
+        col("account", "account_id", Kind::Ref("accounts")), col("security", "security_id", Kind::OptRef("securities")),
+        col("type", "type", Kind::Text), col("date", "date", Kind::Text), col("quantity", "quantity", Kind::Int),
+        col("amount", "amount", Kind::Int), col("fee", "fee", Kind::Int), col("currency", "currency", Kind::Text),
+        col("toAmount", "to_amount", Kind::OptInt), col("toCurrency", "to_currency", Kind::OptText), col("note", "note", Kind::TextOrEmpty),
+        col("source", "source", Kind::Text), col("createdAt", "created_at", Kind::Int),
+    ]),
+    ("prices", &[
+        col("security", "security_id", Kind::Ref("securities")), col("date", "date", Kind::Text), col("price", "price", Kind::Int),
+        col("source", "source", Kind::Text),
+    ]),
+    ("fx_rates", &[
+        col("base", "base", Kind::Text), col("quote", "quote", Kind::Text), col("date", "date", Kind::Text), col("rate", "rate", Kind::Int),
+        col("source", "source", Kind::Text),
+    ]),
+    ("room_facts", &[col("registration", "registration", Kind::Text), col("year", "year", Kind::Int), col("amount", "amount", Kind::Int)]),
 ];
 
 /// The settings that travel; the rest are this device's own.
@@ -101,11 +132,12 @@ fn to_sql(tx: &Transaction, c: &Col, v: Option<&Value>) -> Result<std::result::R
     use rusqlite::types::Value as Sql;
     let v = v.filter(|v| !v.is_null());
     Ok(match (c.kind, v) {
-        (Kind::Int, Some(Value::Number(n))) => n.as_i64().map(Sql::Integer).ok_or(()),
+        (Kind::Int | Kind::OptInt, Some(Value::Number(n))) => n.as_i64().map(Sql::Integer).ok_or(()),
         (Kind::Bool, Some(Value::Bool(b))) => Ok(Sql::Integer(i64::from(*b))),
         (Kind::Text, Some(Value::String(s))) => Ok(Sql::Text(s.clone())),
-        (Kind::OptText, Some(Value::String(s))) => Ok(Sql::Text(s.clone())),
-        (Kind::OptText | Kind::OptRef(_), None) => Ok(Sql::Null),
+        (Kind::OptText | Kind::TextOrEmpty, Some(Value::String(s))) => Ok(Sql::Text(s.clone())),
+        (Kind::OptText | Kind::OptInt | Kind::OptRef(_), None) => Ok(Sql::Null),
+        (Kind::TextOrEmpty, None) => Ok(Sql::Text(String::new())),
         (Kind::Ref(t) | Kind::OptRef(t), Some(Value::String(uid))) => match id_of(tx, t, uid)? {
             Some(id) => Ok(Sql::Integer(id)),
             None => Err(()),
@@ -374,7 +406,7 @@ mod tests {
     #[test]
     fn a_first_sync_makes_this_ledger_the_phones() {
         let mut pc = Ledger::open_in_memory().unwrap();
-        pc.account_add("Old PC account", crate::model::AccountType::Cash, 5_00).unwrap();
+        pc.account_add("Old PC account", crate::model::AccountType::Cash, 5_00, None, "").unwrap();
         let out = pc.sync("Pixel", true, 0, None, &phone(), "2026-10-07T12:00:00Z").unwrap();
         assert!(out.replaced);
         assert_eq!((out.applied, out.skipped), (5, 0), "applied in dependency order, whatever order they came in");

@@ -9,6 +9,7 @@ import com.tally.app.data.db.AccountValueDao
 import com.tally.app.data.db.BudgetDao
 import com.tally.app.data.db.CategoryDao
 import com.tally.app.data.db.GoalDao
+import com.tally.app.data.db.InvestDao
 import com.tally.app.data.db.TallyDatabase
 import com.tally.app.data.db.RecurringDao
 import com.tally.app.data.db.TransactionDao
@@ -35,8 +36,8 @@ object DatabaseModule {
     @Provides @Singleton
     fun database(@ApplicationContext context: Context): TallyDatabase =
         Room.databaseBuilder(context, TallyDatabase::class.java, TallyDatabase.NAME)
-            // Version 2 arrives by Room's auto-migration, version 3 by SyncSchema's (both tested in
-            // MigrationTest), and tally() adds the sync triggers to a fresh install. Never
+            // Version 2 arrives by Room's auto-migration, versions 3 and 4 by SyncSchema's (all
+            // tested in MigrationTest), and tally() adds the sync triggers to a fresh install. Never
             // fallbackToDestructiveMigration on a ledger.
             .tally()
             .build()
@@ -48,6 +49,7 @@ object DatabaseModule {
     @Provides fun recurring(db: TallyDatabase): RecurringDao = db.recurring()
     @Provides fun goals(db: TallyDatabase): GoalDao = db.goals()
     @Provides fun values(db: TallyDatabase): AccountValueDao = db.values()
+    @Provides fun invest(db: TallyDatabase): InvestDao = db.invest()
 
     @Provides @Singleton @AppScope
     fun appScope(): CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)

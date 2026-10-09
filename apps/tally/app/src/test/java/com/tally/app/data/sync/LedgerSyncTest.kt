@@ -11,6 +11,9 @@ import com.tally.app.data.db.TallyDatabase
 import com.tally.app.data.ledgerRepository
 import com.tally.app.data.planRepository
 import com.tally.core.AccountType
+import com.tally.core.ActivityType
+import com.tally.core.Registration
+import com.tally.core.SecurityKind
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
@@ -336,5 +339,143 @@ class LedgerSyncTest {
         assertEquals(listOf("Theirs"), db.accounts().all().map { it.name })
         assertEquals(listOf(100L), db.transactions().all().map { it.updatedAt })
         assertTrue(db.sync().tombstones().isEmpty())
+    }
+
+    // ── Investments (docs/INVESTMENTS.md) ────────────────────────────────────
+
+    /** The PC's investment rows, field for field as sync.rs names them, references as uids. */
+    private val investmentRows = listOf(
+        Change("activities", "imp:1", future, row = buildJsonObject {
+            put("account", "ws:A1"); put("security", "sec:XEQT"); put("type", "BUY"); put("date", "2026-08-18")
+            put("quantity", 1_000_000_000L); put("amount", 381_20L); put("fee", 0L); put("currency", "CAD")
+            put("toAmount", JsonNull); put("toCurrency", JsonNull); put("note", ""); put("source", "WEALTHSIMPLE"); put("createdAt", 100L)
+        }),
+        Change("activities", "fx-1", future, row = buildJsonObject {
+            put("account", "ws:A1"); put("security", JsonNull); put("type", "FX"); put("date", "2026-09-02")
+            put("quantity", 0L); put("amount", 32_93L); put("fee", 0L); put("currency", "CAD")
+            put("toAmount", 24_33L); put("toCurrency", "USD"); put("note", "At the bank"); put("source", "MANUAL"); put("createdAt", 100L)
+        }),
+        Change("holdings", "hold:ws:A1:sec:XEQT:2026-05-08", future, row = buildJsonObject {
+            put("account", "ws:A1"); put("security", "sec:XEQT"); put("date", "2026-05-08")
+            put("quantity", 1_000_000_000L); put("book", 250_00L); put("bookMarket", 250_00L)
+        }),
+        Change("securities", "sec:XEQT", future, row = buildJsonObject {
+            put("symbol", "XEQT"); put("name", "iShares Core Equity ETF Portfolio"); put("currency", "CAD"); put("kind", "ETF"); put("exchange", "TSX")
+        }),
+        Change("accounts", "ws:A1", future, row = buildJsonObject {
+            put("name", "TFSA"); put("type", "INVESTMENT"); put("openingBalance", 0L); put("archived", false); put("sortOrder", 0L)
+            put("registration", "TFSA"); put("institution", "Wealthsimple"); put("externalRef", "A1")
+        }),
+        Change("prices", "px:sec:XEQT:2026-10-01", future, row = buildJsonObject {
+            put("security", "sec:XEQT"); put("date", "2026-10-01"); put("price", 4_000_000_000L); put("source", "MANUAL")
+        }),
+        Change("fx_rates", "fx:USD:CAD:2026-10-01", future, row = buildJsonObject {
+            put("base", "USD"); put("quote", "CAD"); put("date", "2026-10-01"); put("rate", 137_125_000L); put("source", "BANK_OF_CANADA")
+        }),
+        Change("room_facts", "room:TFSA:2026", future, row = buildJsonObject {
+            put("registration", "TFSA"); put("year", 2026L); put("amount", 7_000_00L)
+        }),
+    )
+
+    @Test fun investmentRowsRoundTripFieldForField() = runTest {
+        // Out of order on purpose: each row waits for what it refers to.
+        assertEquals(Applied(8, 0), sync.apply(investmentRows))
+
+        val account = db.accounts().all().single()
+        assertEquals(listOf(Registration.TFSA, "Wealthsimple", "A1"), listOf(account.registration, account.institution, account.externalRef))
+        val security = db.invest().security("sec:XEQT")!!
+        assertEquals(SecurityKind.ETF, security.kind)
+        val holding = db.invest().holdings().single()
+        assertEquals(listOf(account.id, security.id), listOf(holding.accountId, holding.securityId))
+        assertEquals(LocalDate.of(2026, 5, 8), holding.date)
+        val buy = db.invest().activity("imp:1")!!
+        assertEquals(listOf(ActivityType.BUY, security.id, 381_20L), listOf(buy.type, buy.securityId, buy.amount))
+        assertNull(db.invest().activity("fx-1")!!.securityId)
+        assertEquals(LocalDate.of(2026, 10, 1), db.invest().prices().single().date)
+        assertEquals(Registration.TFSA, db.invest().roomFacts().single().registration)
+
+        // What goes back is what came: the same fields, ISO dates, references as uids.
+        val sent = sync.collect(since = null).associateBy { it.table to it.uid }
+        investmentRows.forEach { c ->
+            val back = sent.getValue(c.table to c.uid)
+            assertEquals("${c.table} ${c.uid}", c.row, back.row)
+            assertEquals(c.updatedAt, back.updatedAt)
+        }
+        assertEquals(
+            "In the PC's order, after the values",
+            listOf("accounts", "securities", "holdings", "activities", "activities", "prices", "fx_rates", "room_facts"),
+            sync.collect(since = null).map { it.table },
+        )
+    }
+
+    @Test fun anAccountFromBeforeInvestmentsHasNoRegistration() = runTest {
+        sync.apply(listOf(Change("accounts", "a1", future, row = accountRow("Chequing"))))
+        val account = db.accounts().all().single()
+        assertEquals(listOf(null, "", ""), listOf(account.registration, account.institution, account.externalRef))
+    }
+
+    @Test fun aSecurityDeletedOnThePcTakesItsHoldingsAndPricesButNotItsActivities() = runTest {
+        sync.apply(investmentRows)
+        sync.apply(listOf(Change("securities", "sec:XEQT", future + 1, deleted = true)))
+
+        assertTrue(db.invest().securities().isEmpty())
+        assertTrue(db.invest().holdings().isEmpty())
+        assertTrue(db.invest().prices().isEmpty())
+        assertEquals(2, db.invest().activities().size)
+        assertNull(db.invest().activity("imp:1")!!.securityId)
+        assertEquals(
+            "A derived row stays deleted, at the PC's stamp: no news to send back",
+            future + 1,
+            db.sync().tombstone("securities", "sec:XEQT")?.deletedAt,
+        )
+    }
+
+    /**
+     * A derived row the PC deleted stays deleted here, whether this phone had it or not, as the PC
+     * keeps the ones this phone deletes: the next import of the same file must not bring it back.
+     * Any other row's delete leaves nothing behind, as before.
+     */
+    @Test fun aDerivedRowThePcDeletedStaysDeletedHere() = runTest {
+        sync.apply(investmentRows)
+        sync.apply(
+            listOf(
+                Change("activities", "imp:1", future + 1, deleted = true),
+                Change("activities", "imp:never-here", future + 1, deleted = true),
+                Change("activities", "fx-1", future + 1, deleted = true),
+            )
+        )
+
+        assertTrue(db.invest().activities().isEmpty())
+        val kept = listOf("imp:1" to future + 1, "imp:never-here" to future + 1)
+        assertEquals(kept, db.sync().tombstones().map { it.uid to it.deletedAt }.sortedBy { it.first })
+        sync.pruneTombstones(Long.MAX_VALUE)
+        assertEquals("Pruning keeps them", kept, db.sync().tombstones().map { it.uid to it.deletedAt }.sortedBy { it.first })
+        assertEquals("An older delete does not move them back", Applied(1, 0), sync.apply(listOf(Change("activities", "imp:1", 5, deleted = true))))
+        assertEquals(future + 1, db.sync().tombstone("activities", "imp:1")?.deletedAt)
+    }
+
+    /**
+     * A deleted line an import wrote keeps its tombstone after the PC has heard of it, so the next
+     * import of the same file does not bring it back; any other row's goes once the PC has it.
+     */
+    @Test fun aDeletedImportedLineKeepsItsTombstone() = runTest {
+        sync.apply(investmentRows)
+        db.invest().deleteActivity(db.invest().activity("imp:1")!!.id)
+        db.invest().deleteActivity(db.invest().activity("fx-1")!!.id)
+
+        sync.pruneTombstones(Long.MAX_VALUE)
+
+        assertEquals(listOf("imp:1"), db.sync().tombstones().map { it.uid })
+    }
+
+    @Test fun takingThePcsLedgerWholeKeepsItsDeletedImportedLines() = runTest {
+        sync.replaceWith(
+            listOf(
+                Change("accounts", "a1", 100, row = accountRow("Theirs")),
+                Change("activities", "imp:gone", 100, deleted = true),
+                Change("transactions", "t-gone", 100, deleted = true),
+            )
+        )
+        assertEquals(listOf("activities" to "imp:gone"), db.sync().tombstones().map { it.tableName to it.uid })
     }
 }

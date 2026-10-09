@@ -95,6 +95,27 @@ pub fn scrolled(child: &impl IsA<gtk::Widget>) -> gtk::ScrolledWindow {
         .vexpand(true)
         .build()
 }
+/// Calls `on_width` with `parent`'s width whenever it changes, after layout: a probe of no height
+/// at the top of `parent` reports it. A page sizes its columns from this instead of a fixed
+/// request, so it never holds the window wider than the person made it.
+pub fn watch_width(parent: &gtk::Box, on_width: impl Fn(i32) + 'static) {
+    let probe = gtk::DrawingArea::new();
+    probe.set_content_height(0);
+    probe.set_hexpand(true);
+    probe.set_can_target(false);
+    probe.set_focusable(false);
+    let seen = Rc::new(Cell::new(-1));
+    let on_width = Rc::new(on_width);
+    probe.connect_resize(move |_, width, _| {
+        if seen.replace(width) == width {
+            return;
+        }
+        // Never resize inside size-allocate: the next frame takes the new requests.
+        let on_width = on_width.clone();
+        glib::idle_add_local_once(move || on_width(width));
+    });
+    parent.prepend(&probe);
+}
 pub fn field(caption: &str, widget: &impl IsA<gtk::Widget>, parent: &gtk::Box) {
     parent.append(&label(caption, "dim"));
     parent.append(widget);
@@ -376,6 +397,9 @@ pub fn run(rt: Handle) -> glib::ExitCode {
             settings.set_gtk_xft_hinting(1);
             settings.set_gtk_xft_hintstyle(Some("hintslight"));
             settings.set_gtk_xft_rgba(Some("none"));
+            // Selectable text (a thread's replies, error messages) is read, not edited: a label
+            // reached by Tab would otherwise select all of itself.
+            settings.set_gtk_label_select_on_focus(false);
         }
         let provider = gtk::CssProvider::new();
         provider.connect_parsing_error(|_, _, e| tracing::error!("stylesheet: {e}"));
@@ -1419,6 +1443,10 @@ impl Ui {
             key.set_sensitive(true);
             ui.refresh_page();
         });
+    }
+    /// Whether the engine answers: requests fail at once while it does not.
+    pub fn is_connected(&self) -> bool {
+        self.connected.get()
     }
     fn set_connected(&self, connected: bool) {
         self.connected.set(connected);

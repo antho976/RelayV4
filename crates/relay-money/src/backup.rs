@@ -9,15 +9,17 @@
 //! default, an unknown one ignored, and four-space indentation.
 
 use crate::csv::parse_iso_date;
-use crate::model::{AccountType, CategoryKind, GoalKind, TxType};
+use crate::model::{AccountType, ActivityType, CategoryKind, GoalKind, Registration, SecurityKind, TxType};
 use crate::recurrence::Frequency;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 pub const FORMAT: &str = "tally-backup";
 
-/// 2 added goal kinds, investment accounts and their values. A version 1 file still reads.
-pub const VERSION: i32 = 2;
+/// 2 added goal kinds, investment accounts and their values; 3 added investments (securities,
+/// holdings, activities, prices, rates and room) and an account's registration. Older files still
+/// read.
+pub const VERSION: i32 = 3;
 
 fn default_format() -> String {
     FORMAT.to_string()
@@ -69,6 +71,19 @@ pub struct BackupFile {
     /// What investment accounts were worth on a day, as typed by the owner. Absent before version 2.
     #[serde(default)]
     pub values: Vec<AccountValueDto>,
+    /// The investments: what is held, what was done, prices, rates and room. Absent before version 3.
+    #[serde(default)]
+    pub securities: Vec<SecurityDto>,
+    #[serde(default)]
+    pub holdings: Vec<HoldingDto>,
+    #[serde(default)]
+    pub activities: Vec<ActivityDto>,
+    #[serde(default)]
+    pub prices: Vec<PriceDto>,
+    #[serde(default)]
+    pub fx_rates: Vec<FxRateDto>,
+    #[serde(default)]
+    pub room_facts: Vec<RoomFactDto>,
 }
 
 impl BackupFile {
@@ -89,6 +104,12 @@ impl BackupFile {
             goals: vec![],
             contributions: vec![],
             values: vec![],
+            securities: vec![],
+            holdings: vec![],
+            activities: vec![],
+            prices: vec![],
+            fx_rates: vec![],
+            room_facts: vec![],
         }
     }
 }
@@ -104,6 +125,36 @@ pub struct AccountDto {
     pub archived: bool,
     #[serde(default)]
     pub sort_order: i32,
+    /// An investment account's tax wrapper; `None` on every other account.
+    #[serde(default)]
+    pub registration: Option<Registration>,
+    #[serde(default)]
+    pub institution: String,
+    /// The institution's own number for the account, e.g. Wealthsimple's "HQ7XFMC41CAD".
+    #[serde(default)]
+    pub external_ref: String,
+    /// The row's uid, so a restore keeps the uids an import derived (`ws:`, `sec:`, `imp:`…) and the
+    /// same file imported again adds nothing. Absent (an older file) or blank: a fresh one.
+    #[serde(default)]
+    pub uid: Option<String>,
+}
+
+impl AccountDto {
+    /// An account with every optional field at its Kotlin default.
+    pub fn new(id: i64, name: impl Into<String>, r#type: AccountType, opening_balance: i64) -> Self {
+        AccountDto {
+            id,
+            name: name.into(),
+            r#type,
+            opening_balance,
+            archived: false,
+            sort_order: 0,
+            registration: None,
+            institution: String::new(),
+            external_ref: String::new(),
+            uid: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -243,6 +294,109 @@ pub struct ContributionDto {
     pub note: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SecurityDto {
+    pub id: i64,
+    pub symbol: String,
+    #[serde(default)]
+    pub name: String,
+    pub currency: String,
+    pub kind: SecurityKind,
+    #[serde(default)]
+    pub exchange: String,
+    /// As [`AccountDto::uid`].
+    #[serde(default)]
+    pub uid: Option<String>,
+}
+
+/// A line of an account's holdings snapshot. `book` is in the ledger currency, `book_market` in the security's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HoldingDto {
+    pub id: i64,
+    pub account_id: i64,
+    pub security_id: i64,
+    pub date: String,
+    pub quantity: i64,
+    pub book: i64,
+    pub book_market: i64,
+    /// As [`AccountDto::uid`].
+    #[serde(default)]
+    pub uid: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityDto {
+    pub id: i64,
+    pub account_id: i64,
+    #[serde(default)]
+    pub security_id: Option<i64>,
+    pub r#type: ActivityType,
+    pub date: String,
+    #[serde(default)]
+    pub quantity: i64,
+    pub amount: i64,
+    #[serde(default)]
+    pub fee: i64,
+    pub currency: String,
+    #[serde(default)]
+    pub to_amount: Option<i64>,
+    #[serde(default)]
+    pub to_currency: Option<String>,
+    #[serde(default)]
+    pub note: String,
+    #[serde(default = "manual")]
+    pub source: String,
+    /// As [`AccountDto::uid`].
+    #[serde(default)]
+    pub uid: Option<String>,
+}
+
+fn manual() -> String {
+    "MANUAL".to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PriceDto {
+    pub id: i64,
+    pub security_id: i64,
+    pub date: String,
+    pub price: i64,
+    pub source: String,
+    /// As [`AccountDto::uid`].
+    #[serde(default)]
+    pub uid: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FxRateDto {
+    pub id: i64,
+    pub base: String,
+    pub quote: String,
+    pub date: String,
+    pub rate: i64,
+    pub source: String,
+    /// As [`AccountDto::uid`].
+    #[serde(default)]
+    pub uid: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoomFactDto {
+    pub id: i64,
+    pub registration: Registration,
+    pub year: i32,
+    pub amount: i64,
+    /// As [`AccountDto::uid`].
+    #[serde(default)]
+    pub uid: Option<String>,
+}
+
 /// The file is read once per restore, so it is not boxed to even out the two sizes.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -371,6 +525,48 @@ pub fn problem(file: &BackupFile) -> Option<String> {
         }
         if missing(&categories, b.category_id) {
             return fail("A budget points at a category that is not in the file.");
+        }
+    }
+    let securities: HashSet<i64> = file.securities.iter().map(|s| s.id).collect();
+    for h in &file.holdings {
+        if !accounts.contains(&h.account_id) {
+            return fail("A holding points at an account that is not in the file.");
+        }
+        if !securities.contains(&h.security_id) {
+            return fail("A holding points at a security that is not in the file.");
+        }
+        if !readable(Some(&h.date)) {
+            return fail("A holding has an unreadable date.");
+        }
+    }
+    for a in &file.activities {
+        if a.quantity < 0 || a.amount < 0 || a.fee < 0 || a.to_amount.unwrap_or(0) < 0 {
+            return fail("An activity has a negative amount.");
+        }
+        if !accounts.contains(&a.account_id) {
+            return fail("An activity points at an account that is not in the file.");
+        }
+        if missing(&securities, a.security_id) {
+            return fail("An activity points at a security that is not in the file.");
+        }
+        if !readable(Some(&a.date)) {
+            return fail("An activity has an unreadable date.");
+        }
+    }
+    for p in &file.prices {
+        if !securities.contains(&p.security_id) {
+            return fail("A price points at a security that is not in the file.");
+        }
+        if !readable(Some(&p.date)) {
+            return fail("A price has an unreadable date.");
+        }
+    }
+    for r in &file.fx_rates {
+        if r.rate <= 0 {
+            return fail("An exchange rate is zero or less.");
+        }
+        if !readable(Some(&r.date)) {
+            return fail("An exchange rate has an unreadable date.");
         }
     }
     None
@@ -544,6 +740,87 @@ mod tests {
     }
 
     #[test]
+    fn a_version_2_file_without_investments_still_reads() {
+        let v2 = r#"{"format":"tally-backup","version":2,"exportedAt":"2026-10-04","currency":"CAD",
+            "accounts":[{"id":1,"name":"TFSA","type":"INVESTMENT","openingBalance":0,"archived":false,"sortOrder":0}],
+            "values":[{"id":1,"accountId":1,"date":"2026-10-01","value":500000}]}"#;
+        let read = ok(decode(v2));
+        assert_eq!((None, ""), (read.accounts[0].registration, read.accounts[0].external_ref.as_str()));
+        assert_eq!(None, read.accounts[0].uid, "A file from before uids were kept has none; the restore makes them");
+        assert!(read.securities.is_empty() && read.activities.is_empty() && read.room_facts.is_empty());
+        assert_eq!(1, read.values.len());
+    }
+
+    /// The sample with its TFSA (account 5) holding XEQT, a buy and an exchange, a price, a rate and room.
+    fn invested() -> BackupFile {
+        let mut s = sample();
+        for a in s.accounts.iter_mut().filter(|a| a.r#type == AccountType::Investment) {
+            a.registration = Some(Registration::Tfsa);
+            a.institution = "Wealthsimple".into();
+            a.external_ref = "HQ7XFMC41CAD".into();
+            a.uid = Some("ws:HQ7XFMC41CAD".into());
+        }
+        s.securities = vec![SecurityDto {
+            id: 1, symbol: "XEQT".into(), name: "iShares Core Equity ETF Portfolio".into(), currency: "CAD".into(), kind: SecurityKind::Etf,
+            exchange: "TSX".into(), uid: Some("sec:XEQT".into()),
+        }];
+        s.holdings = vec![HoldingDto {
+            id: 1, account_id: 5, security_id: 1, date: "2026-10-01".into(), quantity: 1_000_000_000, book: 38_120, book_market: 38_120,
+            uid: Some("hold:ws:HQ7XFMC41CAD:sec:XEQT:2026-10-01".into()),
+        }];
+        s.activities = vec![
+            ActivityDto {
+                id: 1, account_id: 5, security_id: Some(1), r#type: ActivityType::Buy, date: "2026-10-02".into(), quantity: 100_000_000, amount: 3_900,
+                fee: 0, currency: "CAD".into(), to_amount: None, to_currency: None, note: String::new(), source: "WEALTHSIMPLE".into(),
+                uid: Some("imp:86fe65d31110bce166befa06e9747e9a".into()),
+            },
+            ActivityDto {
+                id: 2, account_id: 5, security_id: None, r#type: ActivityType::Fx, date: "2026-10-03".into(), quantity: 0, amount: 10_000, fee: 0,
+                currency: "CAD".into(), to_amount: Some(7_300), to_currency: Some("USD".into()), note: String::new(), source: "MANUAL".into(), uid: None,
+            },
+        ];
+        s.prices = vec![PriceDto {
+            id: 1, security_id: 1, date: "2026-10-01".into(), price: 3_812_000_000, source: "IMPORT".into(), uid: Some("px:sec:XEQT:2026-10-01".into()),
+        }];
+        s.fx_rates = vec![FxRateDto {
+            id: 1, base: "USD".into(), quote: "CAD".into(), date: "2026-10-01".into(), rate: 137_125_000, source: "BANK_OF_CANADA".into(),
+            uid: Some("fx:USD:CAD:2026-10-01".into()),
+        }];
+        s.room_facts = vec![RoomFactDto { id: 1, registration: Registration::Tfsa, year: 2026, amount: 700_000, uid: Some("room:TFSA:2026".into()) }];
+        s
+    }
+
+    #[test]
+    fn investments_round_trip() {
+        assert_eq!(5, sample().accounts.iter().find(|a| a.r#type == AccountType::Investment).unwrap().id);
+        let text = encode(&invested());
+        assert_eq!(invested(), ok(decode(&text)), "Uids ride along, a missing one as null");
+        assert!(text.contains("\"externalRef\": \"HQ7XFMC41CAD\",\n            \"uid\": \"ws:HQ7XFMC41CAD\"\n"), "{text}");
+    }
+
+    #[test]
+    fn investments_must_point_at_what_is_in_the_file() {
+        let with = |change: &dyn Fn(&mut BackupFile)| {
+            let mut f = invested();
+            change(&mut f);
+            reason(&f)
+        };
+        let says = |s: &str| Some(s.to_string());
+        assert_eq!(None, reason(&invested()));
+        assert_eq!(says("A holding points at an account that is not in the file."), with(&|f| f.holdings[0].account_id = 404));
+        assert_eq!(says("A holding points at a security that is not in the file."), with(&|f| f.holdings[0].security_id = 404));
+        assert_eq!(says("A holding has an unreadable date."), with(&|f| f.holdings[0].date = "May".into()));
+        assert_eq!(says("An activity has a negative amount."), with(&|f| f.activities.iter_mut().for_each(|a| a.fee = -1)));
+        assert_eq!(says("An activity points at an account that is not in the file."), with(&|f| f.activities.iter_mut().for_each(|a| a.account_id = 404)));
+        assert_eq!(says("An activity points at a security that is not in the file."), with(&|f| f.activities.iter_mut().for_each(|a| a.security_id = Some(404))));
+        assert_eq!(says("An activity has an unreadable date."), with(&|f| f.activities.iter_mut().for_each(|a| a.date = String::new())));
+        assert_eq!(says("A price points at a security that is not in the file."), with(&|f| f.prices[0].security_id = 404));
+        assert_eq!(says("A price has an unreadable date."), with(&|f| f.prices[0].date = "2026-02-30".into()));
+        assert_eq!(says("An exchange rate is zero or less."), with(&|f| f.fx_rates[0].rate = 0));
+        assert_eq!(says("An exchange rate has an unreadable date."), with(&|f| f.fx_rates[0].date = "today".into()));
+    }
+
+    #[test]
     fn ignores_unknown_keys_from_a_future_minor_change() {
         let text = encode(&sample()).replacen('{', "{\"futureField\": true,", 1);
         assert!(matches!(decode(&text), BackupReadResult::Ok(_)));
@@ -552,8 +829,20 @@ mod tests {
     #[test]
     fn writes_every_field_in_kotlin_order_with_nulls_and_four_space_indent() {
         let text = encode(&BackupFile::new("2026-10-04", "CAD"));
-        let want = "{\n    \"format\": \"tally-backup\",\n    \"version\": 2,\n    \"exportedAt\": \"2026-10-04\",\n    \"currency\": \"CAD\",\n    \"monthStartDay\": null,\n    \"weekStartsMonday\": null,\n    \"accounts\": [],\n    \"categories\": [],\n    \"transactions\": [],\n    \"budgets\": [],\n    \"recurring\": [],\n    \"goals\": [],\n    \"contributions\": [],\n    \"values\": []\n}";
+        let want = "{\n    \"format\": \"tally-backup\",\n    \"version\": 3,\n    \"exportedAt\": \"2026-10-04\",\n    \"currency\": \"CAD\",\n    \"monthStartDay\": null,\n    \"weekStartsMonday\": null,\n    \"accounts\": [],\n    \"categories\": [],\n    \"transactions\": [],\n    \"budgets\": [],\n    \"recurring\": [],\n    \"goals\": [],\n    \"contributions\": [],\n    \"values\": [],\n    \"securities\": [],\n    \"holdings\": [],\n    \"activities\": [],\n    \"prices\": [],\n    \"fxRates\": [],\n    \"roomFacts\": []\n}";
         assert_eq!(want, text);
+        let mut account = BackupFile::new("2026-10-04", "CAD");
+        account.accounts.push(AccountDto::new(1, "TFSA", AccountType::Investment, 0));
+        let text = encode(&account);
+        assert!(text.contains("\"sortOrder\": 0,\n            \"registration\": null,\n            \"institution\": \"\",\n            \"externalRef\": \"\",\n            \"uid\": null\n"), "{text}");
+        // Every investment row's uid comes last too.
+        let text = encode(&invested());
+        for tail in ["\"exchange\": \"TSX\",\n            \"uid\": \"sec:XEQT\"\n", "\"bookMarket\": 38120,\n            \"uid\": \"hold:ws:HQ7XFMC41CAD:sec:XEQT:2026-10-01\"\n",
+            "\"source\": \"MANUAL\",\n            \"uid\": null\n", "\"source\": \"IMPORT\",\n            \"uid\": \"px:sec:XEQT:2026-10-01\"\n",
+            "\"source\": \"BANK_OF_CANADA\",\n            \"uid\": \"fx:USD:CAD:2026-10-01\"\n", "\"amount\": 700000,\n            \"uid\": \"room:TFSA:2026\"\n"]
+        {
+            assert!(text.contains(tail), "{tail} in {text}");
+        }
     }
 
     #[test]

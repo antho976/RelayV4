@@ -65,6 +65,14 @@ no servers, no cloud. The one connection it makes is to the owner's own PC, once
 - Sync with the owner's PC (Relay, `docs/MONEY.md` at the repository root): the phone and the PC
   each hold the whole ledger and work as one. Paired in Settings, over the owner's own network
   (LAN or Tailscale); newest edit wins per row; the first sync makes the PC's copy the phone's.
+- Investments (decided 2026-10-09, `docs/INVESTMENTS.md`): **Wealthsimple comes in through its own
+  CSV files** (the holdings report, the activities export, an investment account's monthly
+  statement), read on the phone or the PC, so nothing leaves the owner's devices and principle 4
+  holds. A live connection (SnapTrade, or Wealthsimple's unofficial API) is not built; it would put
+  a third party or a broken-monthly login in the path, and stays the owner's call. Buys, sells and
+  dividends are never spending or income. The room in a TFSA, an RRSP or an FHSA is the owner's
+  CRA figure, minus what Tally sees go in. Investments is a pushed screen, not a tab: a portfolio
+  is not a month *(inferred, from the 2026-10-05 trim to three tabs)*.
 
 ## Brand Commitments
 

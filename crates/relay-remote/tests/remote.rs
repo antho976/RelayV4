@@ -823,15 +823,29 @@ async fn tally_syncs_its_ledger_through_the_door() {
             "date": "2026-10-05", "account": "a1", "toAccount": null, "category": null, "note": "Metro", "recurring": null, "createdAt": 100}},
         {"table": "accounts", "uid": "a1", "updated_at": 100, "deleted": false, "row": {"name": "Chequing", "type": "CHEQUING",
             "openingBalance": 100_000, "archived": false, "sortOrder": 0}},
-        {"table": "settings", "uid": "currency", "updated_at": 100, "deleted": false, "row": {"value": "CAD"}}
+        {"table": "settings", "uid": "currency", "updated_at": 100, "deleted": false, "row": {"value": "CAD"}},
+        // An investment the phone imported travels the same way (docs/INVESTMENTS.md).
+        {"table": "accounts", "uid": "ws:HQ7XFMC41CAD", "updated_at": 100, "deleted": false, "row": {"name": "Wealthsimple TFSA",
+            "type": "INVESTMENT", "openingBalance": 0, "archived": false, "sortOrder": 1, "registration": "TFSA",
+            "institution": "Wealthsimple", "externalRef": "HQ7XFMC41CAD"}},
+        {"table": "securities", "uid": "sec:XEQT", "updated_at": 100, "deleted": false, "row": {"symbol": "XEQT",
+            "name": "iShares Core Equity ETF Portfolio", "currency": "CAD", "kind": "ETF", "exchange": "TSX"}},
+        {"table": "activities", "uid": "imp:aaa32c148f3cea50442cb54fcf9cf2be", "updated_at": 100, "deleted": false, "row": {
+            "account": "ws:HQ7XFMC41CAD", "security": "sec:XEQT", "type": "BUY", "date": "2026-08-08", "quantity": 1_000_000_000,
+            "amount": 38_120, "fee": 0, "currency": "CAD", "toAmount": null, "toCurrency": null, "note": "", "source": "WEALTHSIMPLE",
+            "createdAt": 100}}
     ]})).await;
     assert_eq!(first["ok"], true, "{first}");
-    assert_eq!(first["result"]["applied"], 3);
+    assert_eq!(first["result"]["applied"], 6);
     let cursor = first["result"]["cursor"].clone();
 
     // The PC sees the phone's ledger, and an entry made there goes back on the next sync.
     let home = at_the_pc(&h, "money.summary", json!({"today": "2026-10-07"}));
     assert_eq!((home["spent"].as_i64(), home["accounts"][0]["balance"].as_i64()), (Some(4_250), Some(95_750)));
+    let invest = at_the_pc(&h, "money.invest.summary", json!({"today": "2026-10-07"}));
+    let xeqt = &invest["holdings"][0];
+    assert_eq!((xeqt["symbol"].as_str(), xeqt["quantity"].as_i64(), xeqt["book"].as_i64()), (Some("XEQT"), Some(1_000_000_000), Some(38_120)));
+    assert_eq!(invest["accounts"][0]["registration"], "TFSA");
     at_the_pc(&h, "money.tx.add", json!({"type": "INCOME", "amount": 210_000, "date": "2026-10-06", "account_id": home["accounts"][0]["id"]}));
     let next = call(&mut ws, "money.sync", json!({"device": "Test Phone", "since": cursor, "changes": []})).await;
     let changes = next["result"]["changes"].as_array().unwrap();
@@ -839,7 +853,7 @@ async fn tally_syncs_its_ledger_through_the_door() {
     assert_eq!((changes[0]["row"]["account"].as_str(), changes[0]["row"]["amount"].as_i64()), (Some("a1"), Some(210_000)));
 
     // A phone syncs; it does not read or wipe the ledger through any other door.
-    for op in ["money.summary", "money.reset", "money.import"] {
+    for op in ["money.summary", "money.reset", "money.import", "money.invest.summary", "money.invest.import"] {
         let refused = call(&mut ws, op, json!({})).await;
         assert_eq!(refused["error"]["code"], "remote.op", "{op}: {refused}");
     }

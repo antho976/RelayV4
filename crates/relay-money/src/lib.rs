@@ -13,6 +13,7 @@ pub mod bank_statements;
 pub mod copy;
 pub mod csv;
 pub mod icon_hints;
+pub mod invest;
 #[cfg(feature = "ledger")]
 pub mod ledger;
 pub mod model;
@@ -20,6 +21,8 @@ pub mod money;
 pub mod pace;
 pub mod payees;
 pub mod period;
+#[cfg(feature = "ledger")]
+mod portfolio;
 pub mod recurrence;
 pub mod sample_data;
 pub mod series;
@@ -27,5 +30,6 @@ pub mod series;
 pub mod sync;
 pub mod text_match;
 pub mod views;
+pub mod wealthsimple;
 
 pub use jiff::civil::Date;
