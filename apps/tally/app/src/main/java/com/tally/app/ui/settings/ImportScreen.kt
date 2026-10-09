@@ -639,21 +639,22 @@ private fun StatementIntoGroup(state: ImportState, pending: InvestImport, held: 
         GroupRow(
             "Add an investment account",
             shape,
-            subtitle = "A statement does not name its account: add the one it belongs to, and it shows here",
+            subtitle = if (held.isEmpty()) {
+                "A statement does not name its account: add the one it belongs to, and it shows here"
+            } else {
+                "When it belongs to none of these, add it and it shows here"
+            },
             leading = { GlyphBadge(Icons.Rounded.AddCard) },
             onClick = actions.addAccount,
         )
     }
-    val rows: List<@Composable (Shape) -> Unit> = if (held.isEmpty()) {
-        listOf(add)
-    } else {
-        held.map { a ->
-            val valued = a.valuedOn?.let { " · valued " + Dates.short(it, state.today) }.orEmpty()
-            accountRow(a.name, money.format(a.balance) + valued, a.id == pending.statementAccountId, { AccountBadge(a.type) }) {
-                actions.setStatementAccount(a.id)
-            }
+    // The add row stays under the accounts: a TFSA's statement must not have to go into the RRSP.
+    val rows: List<@Composable (Shape) -> Unit> = held.map { a ->
+        val valued = a.valuedOn?.let { " · valued " + Dates.short(it, state.today) }.orEmpty()
+        accountRow(a.name, money.format(a.balance) + valued, a.id == pending.statementAccountId, { AccountBadge(a.type) }) {
+            actions.setStatementAccount(a.id)
         }
-    }
+    } + add
     Column(Modifier.padding(horizontal = GUTTER).padding(top = 14.dp).selectableGroup()) {
         Group(
             rows = rows,

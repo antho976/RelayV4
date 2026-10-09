@@ -408,8 +408,8 @@ fn ask_key(ui: &Rc<Ui>, question: &str) -> gtk::Button {
     key
 }
 
-/// How a widget follows the page's width (see [`fit`]): DESIGN.md's pages have no breakpoints,
-/// but Tally's must shrink with the window, so its rows of columns and figures stack instead.
+/// How a widget follows the page's width (see [`fit`]): Tally's pages shrink with the window, so
+/// their rows of columns and figures stack instead (DESIGN.md, Layout, records the widths).
 #[derive(Clone, Copy)]
 pub(super) enum Flex {
     /// A row of columns ([`columns`]): stacked below [`STACK_COLUMNS`].
@@ -927,9 +927,11 @@ pub fn install(ui: &Rc<Ui>) {
 }
 
 /// Refills the Entries filters from `money.lists`, keeping the person's choice selected. An
-/// archived account or category stays listed while it is the one chosen.
-fn fill_filters(lists: &Value) {
-    let Some(head) = TX_HEAD.with(|h| h.borrow().clone()) else { return };
+/// archived account or category stays listed while it is the one chosen. A chosen one the ledger
+/// no longer has (a restore or a sync took it away) is dropped, and this says so: the entries were
+/// read through it, and are read again.
+fn fill_filters(lists: &Value) -> bool {
+    let Some(head) = TX_HEAD.with(|h| h.borrow().clone()) else { return false };
     let (account, category) = super::filters();
     let listed = |key: &str, all: &str, chosen: Option<i64>| -> Vec<(Option<i64>, String)> {
         let mut items = vec![(None, all.to_string())];
@@ -942,6 +944,7 @@ fn fill_filters(lists: &Value) {
         items
     };
     head.filling.set(true);
+    let mut gone = false;
     for (picker, rows, items, chosen) in [
         (&head.accounts, &head.account_rows, listed("accounts", "All accounts", account), account),
         (&head.categories, &head.category_rows, listed("categories", "All categories", category), category),
@@ -951,12 +954,19 @@ fn fill_filters(lists: &Value) {
             picker.set_model(Some(&gtk::StringList::new(&names)));
             *rows.borrow_mut() = items;
         }
-        let position = rows.borrow().iter().position(|row| row.0 == chosen).unwrap_or(0) as u32;
+        let found = rows.borrow().iter().position(|row| row.0 == chosen);
+        gone |= found.is_none();
+        let position = found.unwrap_or(0) as u32;
         if picker.selected() != position {
             picker.set_selected(position);
         }
     }
     head.filling.set(false);
+    if gone {
+        let kept = |rows: &RefCell<Vec<(Option<i64>, String)>>, id: Option<i64>| id.filter(|id| rows.borrow().iter().any(|row| row.0 == Some(*id)));
+        super::set_filters(kept(&head.account_rows, account), kept(&head.category_rows, category));
+    }
+    gone
 }
 
 /// What the Entries filters show, as words for the context line: "Dining · Visa".
@@ -998,7 +1008,10 @@ pub async fn refresh(ui: &Rc<Ui>, name: &str) {
             }
             if let Ok(lists) = &lists {
                 remember_currency(lists);
-                fill_filters(lists);
+                if fill_filters(lists) {
+                    ui.refresh_page();
+                    return;
+                }
             }
             match list {
                 Ok(list) => transactions(ui, &page, &list, offset, &query),

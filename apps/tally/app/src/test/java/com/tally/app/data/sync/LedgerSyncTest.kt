@@ -423,7 +423,35 @@ class LedgerSyncTest {
         assertTrue(db.invest().prices().isEmpty())
         assertEquals(2, db.invest().activities().size)
         assertNull(db.invest().activity("imp:1")!!.securityId)
-        assertNull("The PC sent that delete; it is not sent back", db.sync().tombstone("securities", "sec:XEQT"))
+        assertEquals(
+            "A derived row stays deleted, at the PC's stamp: no news to send back",
+            future + 1,
+            db.sync().tombstone("securities", "sec:XEQT")?.deletedAt,
+        )
+    }
+
+    /**
+     * A derived row the PC deleted stays deleted here, whether this phone had it or not, as the PC
+     * keeps the ones this phone deletes: the next import of the same file must not bring it back.
+     * Any other row's delete leaves nothing behind, as before.
+     */
+    @Test fun aDerivedRowThePcDeletedStaysDeletedHere() = runTest {
+        sync.apply(investmentRows)
+        sync.apply(
+            listOf(
+                Change("activities", "imp:1", future + 1, deleted = true),
+                Change("activities", "imp:never-here", future + 1, deleted = true),
+                Change("activities", "fx-1", future + 1, deleted = true),
+            )
+        )
+
+        assertTrue(db.invest().activities().isEmpty())
+        val kept = listOf("imp:1" to future + 1, "imp:never-here" to future + 1)
+        assertEquals(kept, db.sync().tombstones().map { it.uid to it.deletedAt }.sortedBy { it.first })
+        sync.pruneTombstones(Long.MAX_VALUE)
+        assertEquals("Pruning keeps them", kept, db.sync().tombstones().map { it.uid to it.deletedAt }.sortedBy { it.first })
+        assertEquals("An older delete does not move them back", Applied(1, 0), sync.apply(listOf(Change("activities", "imp:1", 5, deleted = true))))
+        assertEquals(future + 1, db.sync().tombstone("activities", "imp:1")?.deletedAt)
     }
 
     /**

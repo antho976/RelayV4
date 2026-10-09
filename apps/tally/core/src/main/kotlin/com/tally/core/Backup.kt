@@ -43,8 +43,8 @@ data class BackupFile(
 
         /**
          * 2 added goal kinds, investment accounts and their values; 3 added investments (securities,
-         * holdings, activities, prices, rates and room) and an account's registration. Older files
-         * still read.
+         * holdings, activities, prices, rates and room), an account's registration, and the uids of
+         * accounts and investment rows. Older files still read.
          */
         const val VERSION = 3
     }
@@ -63,6 +63,12 @@ data class AccountDto(
     val institution: String = "",
     /** The institution's own number for the account, e.g. Wealthsimple's "HQ7XFMC41CAD". */
     val externalRef: String = "",
+    /**
+     * The row's permanent id across devices, as are the investment rows' (docs/INVESTMENTS.md): an
+     * import's `ws:` and `imp:` uids survive a restore, so the same file imported again adds nothing.
+     * Null in a file from before it was kept; a restore keeps a non-blank one and makes one otherwise.
+     */
+    val uid: String? = null,
 )
 
 @Serializable
@@ -158,6 +164,7 @@ data class SecurityDto(
     val currency: String,
     val kind: SecurityKind,
     val exchange: String = "",
+    val uid: String? = null,
 )
 
 /** A line of an account's holdings snapshot. [book] is in the ledger currency, [bookMarket] in the security's. */
@@ -170,6 +177,7 @@ data class HoldingDto(
     val quantity: Long,
     val book: Long,
     val bookMarket: Long,
+    val uid: String? = null,
 )
 
 @Serializable
@@ -187,6 +195,7 @@ data class ActivityDto(
     val toCurrency: String? = null,
     val note: String = "",
     val source: String = "MANUAL",
+    val uid: String? = null,
 )
 
 @Serializable
@@ -196,6 +205,7 @@ data class PriceDto(
     val date: String,
     val price: Long,
     val source: String,
+    val uid: String? = null,
 )
 
 @Serializable
@@ -206,6 +216,7 @@ data class FxRateDto(
     val date: String,
     val rate: Long,
     val source: String,
+    val uid: String? = null,
 )
 
 @Serializable
@@ -214,6 +225,7 @@ data class RoomFactDto(
     val registration: Registration,
     val year: Int,
     val amount: Long,
+    val uid: String? = null,
 )
 
 sealed interface BackupReadResult {

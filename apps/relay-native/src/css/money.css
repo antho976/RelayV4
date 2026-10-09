@@ -142,5 +142,7 @@ button.tally-save { margin: 8px 16px 4px; }
 .tally-figures { font-family: "Geist Mono", monospace; font-size: 11.5px; color: @secondary; font-feature-settings: "tnum"; }
 .tally-left { font-family: "Geist Mono", monospace; font-size: 11.5px; color: @faint; font-feature-settings: "tnum"; }
 
-/* Investments (money_invest.rs): a holding's symbol, in the tile's place. */
+/* Investments (money_invest.rs): a holding's symbol, in the tile's place; the allocation's legend,
+   which wraps on a narrow page. */
 .invest-symbol { min-width: 48px; min-height: 28px; border-radius: 8px; background: @wash; color: @secondary; font-family: "Geist Mono", monospace; font-size: 10.5px; font-weight: 600; }
+.tally-legend flowboxchild { padding: 0; min-height: 0; }

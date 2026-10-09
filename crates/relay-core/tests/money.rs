@@ -195,6 +195,26 @@ fn a_wealthsimple_holdings_report_is_previewed_imported_once_and_read() {
 }
 
 #[test]
+fn a_wealthsimple_file_is_read_as_the_phone_reads_it_and_only_a_file() {
+    let engine = engine();
+    let dir = tempfile::tempdir().unwrap();
+    // Re-saved by a spreadsheet in Windows-1252, as the phone also reads it: "Non enregistré".
+    let path = dir.path().join("holdings-1252.csv");
+    let text = HOLDINGS_REPORT.replace("\"Demo TFSA\",\"TFSA\"", "\"Demo\",\"Non enregistr\u{e9}\"");
+    let bytes: Vec<u8> = text.chars().map(|c| u8::try_from(u32::from(c)).unwrap()).collect();
+    std::fs::write(&path, bytes).unwrap();
+    let preview = ok(&engine, "money.invest.preview", json!({"path": path}));
+    assert_eq!(preview["accounts"][0]["registration"], "NON_REGISTERED");
+
+    let not_a_file = call_as(&engine, Actor::User, "money.invest.preview", json!({"path": dir.path()}));
+    assert_eq!(code(not_a_file), "money.path");
+    let big = dir.path().join("big.csv");
+    std::fs::File::create(&big).unwrap().set_len((16 << 20) + 1).unwrap();
+    assert_eq!(code(call_as(&engine, Actor::User, "money.invest.import", json!({"path": big, "accounts": []}))), "money.import");
+    assert_eq!(ok(&engine, "money.invest.summary", json!({}))["empty"], true, "nothing came in");
+}
+
+#[test]
 fn an_investment_activity_is_recorded_undone_and_restored() {
     let engine = engine();
     let tfsa = ok(&engine, "money.account.add", json!({"name": "TFSA", "type": "INVESTMENT", "registration": "TFSA", "institution": "Wealthsimple"}));

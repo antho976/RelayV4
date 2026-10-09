@@ -12,11 +12,13 @@ use crate::engine::{Ctx, Engine, IntoBus};
 use relay_bus::ops::money::*;
 use relay_bus::{BusError, Empty};
 use relay_money::backup::{self, BackupReadResult};
+use relay_money::bank_statements::decode_text;
 use relay_money::invest::{parse_scaled, RATE_SCALE, SOURCE_BANK_OF_CANADA, SOURCE_MANUAL};
 use relay_money::ledger::{parse_date, Ledger, LedgerError, TxInput, TxPatch, TxQuery};
 use relay_money::money::Locale;
 use relay_money::views::{AccountPatch, ActivityInput, ActivityQuery};
 use serde_json::{json, Value};
+use std::io::Read;
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,6 +36,22 @@ const VALET_USD_CAD: &str = "https://www.bankofcanada.ca/valet/observations/FXUS
 const FX_TIMEOUT: Duration = Duration::from_secs(15);
 /// A fetch of the rates is on its way: a second one asked for meanwhile joins it.
 static FX_FETCHING: AtomicBool = AtomicBool::new(false);
+
+/// Holds [`FX_FETCHING`] for one fetch and lets it go however the fetch ends, a panic included, so
+/// a failed fetch never leaves every later one answering `started: false`.
+struct Fetching;
+
+impl Fetching {
+    fn start() -> Option<Fetching> {
+        (!FX_FETCHING.swap(true, Ordering::SeqCst)).then_some(Fetching)
+    }
+}
+
+impl Drop for Fetching {
+    fn drop(&mut self) {
+        FX_FETCHING.store(false, Ordering::SeqCst);
+    }
+}
 
 fn bus(e: LedgerError) -> BusError {
     match e {
@@ -76,14 +94,27 @@ fn absolute(path: &str) -> Result<&Path, BusError> {
     }
 }
 
-/// A Wealthsimple file the person chose, read whole. Run before any lock is taken.
+/// A Wealthsimple file the person chose, read whole and decoded as the phone decodes it (UTF-8,
+/// UTF-16 by its mark, else Windows-1252), so both read the same text. Run before any lock is
+/// taken. Only a regular file is read, and never more than [`MAX_EXPORT_BYTES`] of it: a pipe or a
+/// device would otherwise hold the request open forever.
 fn read_export(path: &str) -> Result<String, BusError> {
     let path = absolute(path)?;
     let unreadable = |e: std::io::Error| BusError::invalid("money.path", format!("{}: {e}", path.display()));
-    if std::fs::metadata(path).map_err(unreadable)?.len() > MAX_EXPORT_BYTES {
-        return Err(BusError::invalid("money.import", "That file is too big to be a Wealthsimple export"));
+    let too_big = || BusError::invalid("money.import", "That file is too big to be a Wealthsimple export");
+    let meta = std::fs::metadata(path).map_err(unreadable)?;
+    if !meta.is_file() {
+        return Err(BusError::invalid("money.path", format!("{}: not a file", path.display())));
     }
-    std::fs::read_to_string(path).map_err(unreadable)
+    if meta.len() > MAX_EXPORT_BYTES {
+        return Err(too_big());
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path).and_then(|f| f.take(MAX_EXPORT_BYTES + 1).read_to_end(&mut bytes)).map_err(unreadable)?;
+    if bytes.len() as u64 > MAX_EXPORT_BYTES {
+        return Err(too_big());
+    }
+    Ok(decode_text(&bytes))
 }
 
 /// The rates in a Valet answer for `FXUSDCAD` (`{"observations": [{"d": "2026-10-08", "FXUSDCAD":
@@ -324,10 +355,8 @@ fn register_invest(e: &mut Engine) {
             return Ok(FxFetchOut { started: false });
         }
         ctx.after_commit(move |engine| {
-            if FX_FETCHING.swap(true, Ordering::SeqCst) {
-                return;
-            }
-            std::thread::spawn(move || {
+            let Some(fetching) = Fetching::start() else { return };
+            let fetch = move || {
                 let written = fetch_usd_cad(&curl).and_then(|rates| {
                     ledger(&engine, |l| {
                         for (day, rate) in &rates {
@@ -337,7 +366,7 @@ fn register_invest(e: &mut Engine) {
                     })
                     .map_err(|e| e.message)
                 });
-                FX_FETCHING.store(false, Ordering::SeqCst);
+                drop(fetching);
                 match written {
                     Ok(n) => engine.emit_system("money.changed", json!({"fx": n})),
                     Err(error) => {
@@ -345,7 +374,11 @@ fn register_invest(e: &mut Engine) {
                         engine.emit_system("money.changed", json!({"fx": 0, "error": error}));
                     }
                 }
-            });
+            };
+            // A thread that cannot start drops the fetch, and with it the flag.
+            if let Err(e) = std::thread::Builder::new().name("money-fx".into()).spawn(fetch) {
+                tracing::warn!(error = %e, "starting the Bank of Canada fetch");
+            }
         });
         Ok(FxFetchOut { started: true })
     });

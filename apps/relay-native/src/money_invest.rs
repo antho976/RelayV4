@@ -321,17 +321,27 @@ pub(super) fn draw(ui: &Rc<Ui>, page: &Page, p: &Value, activity: Option<&Value>
         let spoken: Vec<String> = allocation.iter().map(|a| format!("{} {}", registration_label(text(a, "registration")), share(n(a, "share_bps")))).collect();
         bar.update_property(&[gtk::accessible::Property::Label(&format!("By registration: {}", spoken.join(", ")))]);
         block.append(&bar);
-        for four in allocation.chunks(4) {
-            let legend = gtk::Box::new(gtk::Orientation::Horizontal, 18);
-            for a in four {
-                let item = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-                item.append(&dot(registration_hue(text(a, "registration"))));
-                item.append(&label(&format!("{} {}", registration_label(text(a, "registration")), share(n(a, "share_bps"))), "tally-figures"));
-                item.set_tooltip_text(Some(&fmt.format_whole(n(a, "value"))));
-                legend.append(&item);
-            }
-            block.append(&legend);
+        // Four to a line, fewer on a narrow page: the scroller clips what does not fit, never
+        // scrolls to it.
+        let legend = gtk::FlowBox::new();
+        legend.add_css_class("tally-legend");
+        legend.set_selection_mode(gtk::SelectionMode::None);
+        legend.set_homogeneous(false);
+        legend.set_column_spacing(18);
+        legend.set_row_spacing(6);
+        legend.set_max_children_per_line(4);
+        legend.set_halign(gtk::Align::Start);
+        for a in &allocation {
+            let item = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            item.append(&dot(registration_hue(text(a, "registration"))));
+            item.append(&label(&format!("{} {}", registration_label(text(a, "registration")), share(n(a, "share_bps"))), "tally-figures"));
+            item.set_tooltip_text(Some(&fmt.format_whole(n(a, "value"))));
+            let child = gtk::FlowBoxChild::new();
+            child.set_child(Some(&item));
+            child.set_focusable(false);
+            legend.insert(&child, -1);
         }
+        block.append(&legend);
         strip_box.append(&block);
     }
 
@@ -502,7 +512,7 @@ fn empty_state(ui: &Rc<Ui>, body: &gtk::Box) {
 
 /// An account no file has filled: nothing held, no cash, no cost. It is valued by hand, so what it
 /// is worth is Tally's balance for it, its newest recorded value.
-fn by_hand(a: &Value) -> bool {
+pub(crate) fn by_hand(a: &Value) -> bool {
     n(a, "holdings") == 0 && n(a, "book") == 0 && n(a, "value") == 0 && n(a, "cash") == 0
 }
 
@@ -924,10 +934,11 @@ fn activity_row(a: &Value) -> gtk::Box {
     icon_row(&tile(glyph), title.trim(), &detail.join(" · "), &figure, class)
 }
 
-/// The page's Import key (and Data's): the import flow, then a toast of what came in.
+/// The page's Import key (and Data's): the import flow, then a toast of what came in. It takes
+/// any of the three files, so none is "asked" for and none is noted as the wrong one.
 pub(super) fn import_from_page(ui: &Rc<Ui>) {
     let weak = Rc::downgrade(ui);
-    import_flow(ui, None, "holdings", move |result| {
+    import_flow(ui, None, "", move |result| {
         if let Some(ui) = weak.upgrade() {
             super::toast(&ui, &import_summary(&result), None);
             ui.refresh_page();
@@ -974,8 +985,8 @@ fn kind_words(kind: &str) -> (&'static str, &'static str) {
 /// `path`, a file chooser first; then a sheet that previews the file (`money.invest.preview`),
 /// maps each account in it to one of Tally's investment accounts or a new one, and imports it
 /// (`money.invest.import`). `expects` (`holdings`, `activities` or `statement`) is the kind of
-/// file asked for. `on_done` gets the `ImportResult` once the import is in; whatever the engine
-/// refuses stays in the sheet, inline.
+/// file asked for, empty when any will do. `on_done` gets the `ImportResult` once the import is
+/// in; whatever the engine refuses stays in the sheet, inline.
 pub(crate) fn import_flow(ui: &Rc<Ui>, path: Option<PathBuf>, expects: &str, on_done: impl Fn(Value) + 'static) {
     let on_done: Rc<dyn Fn(Value)> = Rc::new(on_done);
     let (ui, expects) = (ui.clone(), expects.to_string());

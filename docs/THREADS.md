@@ -102,9 +102,11 @@ that speaks the same stream-json.
   quiet line saying what it did, and an entry the agent added as a card with Undo
   (`money.tx.delete`). Enter sends, Shift+Enter breaks the line; while the agent works the send key
   stops it.
-- **The Tally panel** (the strip's right key hides it): Overview (what is left, budgets, recent
-  entries), Entries (this month) and Budgets. Meters take the category's hue; amber is ahead of
-  pace, red over budget.
+- **The Tally panel** (the strip's right key shows or hides it): Overview (what is left, budgets,
+  recent entries), Entries (this month), Budgets and Invest (below). Meters take the category's hue;
+  amber is ahead of pace, red over budget. On a page narrower than about 1000 pixels the panel hides
+  itself unless the person opened it with that key, which then holds their choice
+  (`threads_view.rs`, `PANEL_FROM`).
 - **Tally's pages** (Overview, Entries, Plan, Data) open from the sidebar's Tally key with their own
   tabs, in Dev's tokens (`css/money.css`); the Money space's warm palette is gone.
 
@@ -158,8 +160,11 @@ the Wealthsimple files and the ops. This is what the PC's engine and the agent d
   an `institution`. Every mutation emits `money.changed`.
 - **Files are the person's.** `money.invest.preview` (an unlocked query) and `money.invest.import`
   (staged: the file is read before the transaction opens) are `UserOnly` and take an absolute path
-  to a Wealthsimple holdings report, activities export or monthly statement. An import writes rows
-  under derived uids, so the same file imported twice, or on the phone and here, adds its lines once.
+  to a Wealthsimple holdings report, activities export or monthly statement: a regular file of at
+  most 16 MiB, decoded as the phone decodes it (UTF-8, UTF-16 by its mark, else Windows-1252). The
+  plan values a holding in US dollars at the ledger's rates, as the phone's does. An import writes
+  rows under derived uids, so the same file imported twice, or on the phone and here, adds its lines
+  once.
 - **Rates from the Bank of Canada.** `money.fx.fetch` (`UserOnly`) answers `{started}` at once, as
   `github.connect` does. After the transaction a thread of its own runs `curl` under a 15-second
   deadline against Valet's `FXUSDCAD` series (no key; the request carries nothing about the person),
@@ -184,6 +189,17 @@ the Wealthsimple files and the ops. This is what the PC's engine and the agent d
   `holdings`, `activities` or `statement`). The card lets the person choose or drop the file,
   previews it (`money.invest.preview`), maps its accounts and imports it; the person's next message
   says what came in. An activity the agent records is a card with Undo (`money.invest.delete`).
+- **In the native client** (`apps/relay-native/src/threads_view.rs`, `money_invest.rs`):
+  - The import card has a "Choose file…" key and takes a dropped file; both run
+    `money_invest::import_flow`, the flow the Investments page's Import key uses (preview, map the
+    accounts, import). When it is done the card says what came in, offers "Open Investments", and
+    sends a message in the person's name naming the kind of file, so the agent carries on.
+  - The Tally panel's fourth tab, **Invest**: the portfolio's value and gain, the allocation, the
+    accounts, the room and the top holdings; with no investment account, "Connect Wealthsimple".
+  - `threads::ask(ui, text)` starts a new thread with the person's own words and sends them.
+    "Connect Wealthsimple", on the Invest tab and on the Investments page, asks "Help me connect my
+    Wealthsimple accounts"; a new thread suggests "Connect my Wealthsimple accounts" while the
+    ledger has no investment account, and "How are my investments doing?" once it has one.
 
 Tests: `crates/relay-core/tests/money.rs` imports the shared holdings report (W1) through the bus
 twice and reads it back, records, undoes and restores an activity, refuses files and the network to

@@ -117,7 +117,7 @@ category_id, category, icon, color, note }`.
 | op | payload | result |
 |---|---|---|
 | `money.summary` | `{ today? }` | above |
-| `money.lists` | `{}` | `{ currency, fraction_digits, accounts: [{id,name,type,balance,archived}], categories: [{id,name,kind,icon,color,archived}] }` |
+| `money.lists` | `{}` | `{ currency, fraction_digits, accounts: [{id,name,type,balance,archived,registration,institution}], categories: [{id,name,kind,icon,color,archived}], devices }` |
 | `money.tx.list` | `{ period_offset?, query?, account_id?, category_id?, limit? }` | `{ period, transactions: [Tx], income, spent }` |
 | `money.tx.add` | `{ type, amount, date, account_id, to_account_id?, category_id?, note? }` | `Tx` |
 | `money.tx.update` | `{ id, type?, amount?, date?, account_id?, to_account_id?, category_id?, note? }` | `Tx` |
@@ -127,6 +127,24 @@ category_id, category, icon, color, note }`.
 | `money.export` | `{ path }` | `{ path, transactions }` |
 | `money.sample` | `{}`: Tally's sample household, only into an empty ledger | `{ transactions }` |
 | `money.reset` | `{}`: erase everything | `{}` |
+| `money.account.add` | `{ name, type, opening_balance?, registration?, institution? }` (a registration on an `INVESTMENT` account only) | `AccountView` |
+| `money.account.update` | `{ id, name?, registration?, institution?, archived? }` | `AccountView` |
+| `money.value.set` | `{ account_id, date, value }`: what an investment account was worth that day; a second value the same day replaces the first | `AccountView` |
+| `money.invest.summary` | `{ today? }` | `Portfolio` (`docs/INVESTMENTS.md`) |
+| `money.invest.list` | `{ account_id?, type?, since?, limit? }` | `{ activities: [Activity] }`, newest first |
+| `money.invest.add` | `{ account_id, type, date, symbol?, currency?, quantity?, amount, fee?, note?, to_amount?, to_currency? }` | `Activity` |
+| `money.invest.delete` | `{ id }` | `{}` |
+| `money.invest.restore` | `{ id }` | `Activity` |
+| `money.invest.preview` | `{ path, account_id? }`: a Wealthsimple file, read without importing (the person's alone) | `ImportPreview` |
+| `money.invest.import` | `{ path, accounts: [{ number, account_id? }], account_id? }` (the person's alone) | `ImportResult` |
+| `money.invest.room` | `{ registration, year, amount }` (TFSA, RRSP or FHSA; ≤ 0 removes) | `{}` |
+| `money.invest.price` | `{ symbol, date, price }` (price at 1e-8) | `{}` |
+| `money.fx.set` | `{ base, quote, date, rate }` (rate at 1e-8) | `{}` |
+| `money.fx.fetch` | `{}`: USD→CAD from the Bank of Canada in the background, then `money.changed` (the person's alone) | `{ started }` |
+
+`AccountView` = `{ id, name, type, balance, archived, registration, institution }`, as
+`money.lists` lists them. The investment ops' shapes, and which of them the thread agent may call,
+are in `docs/INVESTMENTS.md`.
 
 Clients format amounts themselves with `relay_money::money::MoneyFormatter`
 (`currency` from the result, `Locale::from_env()`).

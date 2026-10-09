@@ -11,6 +11,7 @@ use crate::backup::{
     PriceDto, RecurringDto, RoomFactDto, SecurityDto, TransactionDto,
 };
 use crate::copy;
+use crate::csv::kt_is_blank;
 use crate::model::{AccountType, ActivityType, CategoryKind, GoalKind, Registration, SecurityKind, TxType, DEFAULT_CATEGORIES};
 use crate::money::{fraction_digits, Locale, MoneyFormatter};
 use crate::pace::PaceReading;
@@ -22,6 +23,7 @@ use jiff::civil::Date;
 use jiff::ToSpan;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::Path;
 
 /// Bumped with every entry appended to [`MIGRATIONS`]; every earlier version must stay openable.
@@ -873,12 +875,22 @@ impl Ledger {
     }
 
     /// Replaces the whole ledger with a Tally backup, as a restore does on the phone. Ids are kept
-    /// so references hold; every row gets a fresh uid.
+    /// so references hold. Accounts and investment rows keep the uid the file gives them (an
+    /// import's `ws:`, `sec:`, `imp:`… uids, so the same Wealthsimple file imported again adds
+    /// nothing); every other row, and one whose uid is blank or already taken in the file, gets a
+    /// fresh one.
     pub fn import_backup(&mut self, file: &BackupFile) -> Result<usize> {
         if let Some(problem) = crate::backup::problem(file) {
             return invalid(problem);
         }
         let now = now_ms();
+        let mut taken: HashSet<(&str, String)> = HashSet::new();
+        let mut uid = |table: &'static str, kept: &Option<String>| -> String {
+            match kept.as_deref().filter(|u| !kt_is_blank(u)) {
+                Some(u) if taken.insert((table, u.to_string())) => u.to_string(),
+                _ => new_uid(),
+            }
+        };
         let tx = self.conn.transaction()?;
         Ledger::clear(&tx, false)?;
         Ledger::set_setting(&tx, "currency", &file.currency)?;
@@ -893,8 +905,8 @@ impl Ledger {
                 "INSERT INTO accounts (id, uid, name, type, opening_balance, archived, sort_order, registration, institution, external_ref, updated_at)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
             )?.execute(params![
-                a.id, new_uid(), a.name, name_of(&a.r#type), a.opening_balance, a.archived, a.sort_order, a.registration.as_ref().map(name_of),
-                a.institution, a.external_ref, now
+                a.id, uid("accounts", &a.uid), a.name, name_of(&a.r#type), a.opening_balance, a.archived, a.sort_order,
+                a.registration.as_ref().map(name_of), a.institution, a.external_ref, now
             ])?;
         }
         for c in &file.categories {
@@ -939,33 +951,38 @@ impl Ledger {
         }
         for s in &file.securities {
             tx.prepare_cached("INSERT INTO securities (id, uid, symbol, name, currency, kind, exchange, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)")?
-                .execute(params![s.id, new_uid(), s.symbol, s.name, s.currency, name_of(&s.kind), s.exchange, now])?;
+                .execute(params![s.id, uid("securities", &s.uid), s.symbol, s.name, s.currency, name_of(&s.kind), s.exchange, now])?;
         }
         for h in &file.holdings {
             tx.prepare_cached(
                 "INSERT INTO holdings (id, uid, account_id, security_id, date, quantity, book, book_market, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-            )?.execute(params![h.id, new_uid(), h.account_id, h.security_id, h.date, h.quantity, h.book, h.book_market, now])?;
+            )?.execute(params![h.id, uid("holdings", &h.uid), h.account_id, h.security_id, h.date, h.quantity, h.book, h.book_market, now])?;
         }
         for a in &file.activities {
             tx.prepare_cached(
                 "INSERT INTO activities (id, uid, account_id, security_id, type, date, quantity, amount, fee, currency, to_amount, to_currency, note, source, created_at, updated_at)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15)",
             )?.execute(params![
-                a.id, new_uid(), a.account_id, a.security_id, name_of(&a.r#type), a.date, a.quantity, a.amount, a.fee, a.currency, a.to_amount,
-                a.to_currency, a.note, a.source, now
+                a.id, uid("activities", &a.uid), a.account_id, a.security_id, name_of(&a.r#type), a.date, a.quantity, a.amount, a.fee, a.currency,
+                a.to_amount, a.to_currency, a.note, a.source, now
             ])?;
         }
         for p in &file.prices {
             tx.prepare_cached("INSERT INTO prices (id, uid, security_id, date, price, source, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7)")?
-                .execute(params![p.id, new_uid(), p.security_id, p.date, p.price, p.source, now])?;
+                .execute(params![p.id, uid("prices", &p.uid), p.security_id, p.date, p.price, p.source, now])?;
         }
         for r in &file.fx_rates {
             tx.prepare_cached("INSERT INTO fx_rates (id, uid, base, quote, date, rate, source, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)")?
-                .execute(params![r.id, new_uid(), r.base, r.quote, r.date, r.rate, r.source, now])?;
+                .execute(params![r.id, uid("fx_rates", &r.uid), r.base, r.quote, r.date, r.rate, r.source, now])?;
         }
         for r in &file.room_facts {
             tx.prepare_cached("INSERT INTO room_facts (id, uid, registration, year, amount, updated_at) VALUES (?1,?2,?3,?4,?5,?6)")?
-                .execute(params![r.id, new_uid(), name_of(&r.registration), r.year, r.amount, now])?;
+                .execute(params![r.id, uid("room_facts", &r.uid), name_of(&r.registration), r.year, r.amount, now])?;
+        }
+        // A kept uid is live again: the tombstone the erase above left for it must not travel and
+        // erase the restored row on the phone.
+        for t in TABLES {
+            tx.execute(&format!("DELETE FROM tombstones WHERE tbl = '{t}' AND uid IN (SELECT uid FROM {t})"), [])?;
         }
         tx.commit()?;
         Ok(file.transactions.len())
@@ -983,11 +1000,11 @@ impl Ledger {
             let rows = st.query_map([], f)?;
             Ok(rows.collect::<std::result::Result<_, _>>()?)
         }
-        file.accounts = all(c, "SELECT id, name, type, opening_balance, archived, sort_order, registration, institution, external_ref FROM accounts WHERE deleted = 0 ORDER BY id", |r| {
+        file.accounts = all(c, "SELECT id, name, type, opening_balance, archived, sort_order, registration, institution, external_ref, uid FROM accounts WHERE deleted = 0 ORDER BY id", |r| {
             Ok(AccountDto {
                 id: r.get(0)?, name: r.get(1)?, r#type: parse_name(&r.get::<_, String>(2)?).unwrap_or(AccountType::Chequing), opening_balance: r.get(3)?,
                 archived: r.get(4)?, sort_order: r.get(5)?, registration: r.get::<_, Option<String>>(6)?.as_deref().and_then(parse_name),
-                institution: r.get(7)?, external_ref: r.get(8)?,
+                institution: r.get(7)?, external_ref: r.get(8)?, uid: r.get(9)?,
             })
         })?;
         file.categories = all(c, "SELECT id, name, kind, color, icon, archived, sort_order FROM categories WHERE deleted = 0 ORDER BY id", |r| {
@@ -1026,30 +1043,36 @@ impl Ledger {
         file.values = all(c, "SELECT id, account_id, date, value FROM account_values WHERE deleted = 0 ORDER BY id", |r| {
             Ok(AccountValueDto { id: r.get(0)?, account_id: r.get(1)?, date: r.get(2)?, value: r.get(3)? })
         })?;
-        file.securities = all(c, "SELECT id, symbol, name, currency, kind, exchange FROM securities WHERE deleted = 0 ORDER BY id", |r| {
+        file.securities = all(c, "SELECT id, symbol, name, currency, kind, exchange, uid FROM securities WHERE deleted = 0 ORDER BY id", |r| {
             Ok(SecurityDto {
                 id: r.get(0)?, symbol: r.get(1)?, name: r.get(2)?, currency: r.get(3)?,
-                kind: parse_name(&r.get::<_, String>(4)?).unwrap_or(SecurityKind::Other), exchange: r.get(5)?,
+                kind: parse_name(&r.get::<_, String>(4)?).unwrap_or(SecurityKind::Other), exchange: r.get(5)?, uid: r.get(6)?,
             })
         })?;
-        file.holdings = all(c, "SELECT id, account_id, security_id, date, quantity, book, book_market FROM holdings WHERE deleted = 0 ORDER BY id", |r| {
-            Ok(HoldingDto { id: r.get(0)?, account_id: r.get(1)?, security_id: r.get(2)?, date: r.get(3)?, quantity: r.get(4)?, book: r.get(5)?, book_market: r.get(6)? })
+        file.holdings = all(c, "SELECT id, account_id, security_id, date, quantity, book, book_market, uid FROM holdings WHERE deleted = 0 ORDER BY id", |r| {
+            Ok(HoldingDto {
+                id: r.get(0)?, account_id: r.get(1)?, security_id: r.get(2)?, date: r.get(3)?, quantity: r.get(4)?, book: r.get(5)?, book_market: r.get(6)?,
+                uid: r.get(7)?,
+            })
         })?;
-        file.activities = all(c, "SELECT id, account_id, security_id, type, date, quantity, amount, fee, currency, to_amount, to_currency, note, source FROM activities WHERE deleted = 0 ORDER BY id", |r| {
+        file.activities = all(c, "SELECT id, account_id, security_id, type, date, quantity, amount, fee, currency, to_amount, to_currency, note, source, uid FROM activities WHERE deleted = 0 ORDER BY id", |r| {
             Ok(ActivityDto {
                 id: r.get(0)?, account_id: r.get(1)?, security_id: r.get(2)?, r#type: parse_name(&r.get::<_, String>(3)?).unwrap_or(ActivityType::Deposit),
                 date: r.get(4)?, quantity: r.get(5)?, amount: r.get(6)?, fee: r.get(7)?, currency: r.get(8)?, to_amount: r.get(9)?,
-                to_currency: r.get(10)?, note: r.get(11)?, source: r.get(12)?,
+                to_currency: r.get(10)?, note: r.get(11)?, source: r.get(12)?, uid: r.get(13)?,
             })
         })?;
-        file.prices = all(c, "SELECT id, security_id, date, price, source FROM prices WHERE deleted = 0 ORDER BY id", |r| {
-            Ok(PriceDto { id: r.get(0)?, security_id: r.get(1)?, date: r.get(2)?, price: r.get(3)?, source: r.get(4)? })
+        file.prices = all(c, "SELECT id, security_id, date, price, source, uid FROM prices WHERE deleted = 0 ORDER BY id", |r| {
+            Ok(PriceDto { id: r.get(0)?, security_id: r.get(1)?, date: r.get(2)?, price: r.get(3)?, source: r.get(4)?, uid: r.get(5)? })
         })?;
-        file.fx_rates = all(c, "SELECT id, base, quote, date, rate, source FROM fx_rates WHERE deleted = 0 ORDER BY id", |r| {
-            Ok(FxRateDto { id: r.get(0)?, base: r.get(1)?, quote: r.get(2)?, date: r.get(3)?, rate: r.get(4)?, source: r.get(5)? })
+        file.fx_rates = all(c, "SELECT id, base, quote, date, rate, source, uid FROM fx_rates WHERE deleted = 0 ORDER BY id", |r| {
+            Ok(FxRateDto { id: r.get(0)?, base: r.get(1)?, quote: r.get(2)?, date: r.get(3)?, rate: r.get(4)?, source: r.get(5)?, uid: r.get(6)? })
         })?;
-        file.room_facts = all(c, "SELECT id, registration, year, amount FROM room_facts WHERE deleted = 0 ORDER BY id", |r| {
-            Ok(RoomFactDto { id: r.get(0)?, registration: parse_name(&r.get::<_, String>(1)?).unwrap_or(Registration::Other), year: r.get(2)?, amount: r.get(3)? })
+        file.room_facts = all(c, "SELECT id, registration, year, amount, uid FROM room_facts WHERE deleted = 0 ORDER BY id", |r| {
+            Ok(RoomFactDto {
+                id: r.get(0)?, registration: parse_name(&r.get::<_, String>(1)?).unwrap_or(Registration::Other), year: r.get(2)?, amount: r.get(3)?,
+                uid: r.get(4)?,
+            })
         })?;
         Ok(file)
     }
@@ -1261,6 +1284,9 @@ mod tests {
         // The backup does not say these for the sample; the ledger writes its own.
         back.month_start_day = sample.month_start_day;
         back.week_starts_monday = sample.week_starts_monday;
+        // Nor its accounts' uids, which the ledger made when it loaded the sample.
+        assert!(back.accounts.iter().all(|a| a.uid.as_deref().is_some_and(|u| !u.is_empty())));
+        back.accounts.iter_mut().for_each(|a| a.uid = None);
         let (got, want) = (crate::backup::encode(&back), crate::backup::encode(&sample));
         if got != want {
             let _ = std::fs::write(std::env::temp_dir().join("ledger-got.json"), &got);

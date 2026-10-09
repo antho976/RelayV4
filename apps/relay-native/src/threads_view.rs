@@ -626,6 +626,11 @@ fn wire(v: &Rc<View>, delete: &gtk::Button) {
         jump.set_visible(!at_bottom(adj));
         super::chart::load_stale();
     });
+    // The page comes back into view: charts the ledger moved under meanwhile read again, without
+    // waiting for a scroll. The next idle has them laid out.
+    v.scroll.connect_map(|_| {
+        glib::idle_add_local_once(super::chart::load_stale);
+    });
     v.jump.connect_clicked(|_| {
         if let Some(v) = view() {
             stick_to_bottom(&v, true);
@@ -831,6 +836,14 @@ pub fn new_thread(ui: &Rc<Ui>) {
 /// page opens on it and the agent starts. "Connect Wealthsimple" comes here.
 pub(crate) fn ask(ui: &Rc<Ui>, text: &str) {
     new_thread(ui);
+    // Without Claude Code nothing can answer, and the send key is off: the words wait in the
+    // message box, under the notice that says why.
+    if STATE.with(|s| s.claude_missing.get()) {
+        if let Some(v) = view() {
+            v.input.buffer().set_text(text);
+        }
+        return;
+    }
     send(ui, text);
 }
 
@@ -2271,9 +2284,15 @@ pub fn refresh_panel(ui: &Rc<Ui>) {
     }
     let ui = ui.clone();
     glib::spawn_future_local(async move {
+        // The Invest view also reads the balances: an account valued by hand is Tally's balance.
+        let mut lists = None;
         let read = match tab {
             "entries" => ui.call("money.tx.list", json!({"limit": 60})).await,
-            "invest" => ui.call("money.invest.summary", json!({})).await,
+            "invest" => {
+                let (summary, listed) = tokio::join!(ui.call("money.invest.summary", json!({})), ui.call("money.lists", json!({})));
+                lists = listed.ok();
+                summary
+            }
             _ => ui.call("money.summary", json!({})).await,
         };
         if STATE.with(|s| s.panel_serial.get() != serial || s.panel_tab.get() != tab) {
@@ -2285,7 +2304,7 @@ pub fn refresh_panel(ui: &Rc<Ui>) {
             Ok(value) => match tab {
                 "entries" => panel_entries(&ui, &v.panel_body, &value),
                 "budgets" => panel_budgets(&ui, &v.panel_body, &value, usize::MAX),
-                "invest" => panel_invest(&ui, &v.panel_body, &value),
+                "invest" => panel_invest(&ui, &v.panel_body, &value, lists.as_ref()),
                 _ => panel_overview(&ui, &v.panel_body, &value),
             },
             Err(e) => {
@@ -2661,8 +2680,9 @@ fn invest_row(ui: &Rc<Ui>, lead: &gtk::Box, title: &str, detail: &str, value: &s
 }
 
 /// The Invest view (`money.invest.summary`): what the portfolio is worth and has gained, how it is
-/// split, the accounts, the room left this year and the largest holdings.
-fn panel_invest(ui: &Rc<Ui>, body: &gtk::Box, p: &Value) {
+/// split, the accounts, the room left this year and the largest holdings. An account no file has
+/// filled is worth its balance in `lists` (`money.lists`), as the Investments page counts it.
+fn panel_invest(ui: &Rc<Ui>, body: &gtk::Box, p: &Value, lists: Option<&Value>) {
     super::remember_currency(p);
     if p["empty"] == true {
         invest_empty(ui, body);
@@ -2677,7 +2697,10 @@ fn panel_invest(ui: &Rc<Ui>, body: &gtk::Box, p: &Value) {
     let as_of = p["as_of"].as_str().filter(|d| !d.is_empty()).map(|d| format!("As of {}", human_date(d.get(..10).unwrap_or(d))));
     when.append(&label(&as_of.unwrap_or_else(|| String::from("No report imported yet")), "threads-panel-eyebrow"));
     head.append(&when);
-    head.append(&label(&fmt.format_whole(p["value"].as_i64().unwrap_or(0)), "threads-panel-figure"));
+    let balances = lists.map(|l| crate::app::rows(l, "accounts")).unwrap_or_default();
+    let by_hand = |a: &Value| super::invest::by_hand(a).then(|| balances.iter().find(|b| b["id"] == a["id"]).and_then(|b| b["balance"].as_i64())).flatten();
+    let hand: i64 = p["accounts"].as_array().into_iter().flatten().filter_map(&by_hand).sum();
+    head.append(&label(&fmt.format_whole(p["value"].as_i64().unwrap_or(0) + hand), "threads-panel-figure"));
     let gain = p["gain"].as_i64().unwrap_or(0);
     let mut line = format!("{} gain", super::pages::signed_whole(&fmt, gain));
     if let Some(bps) = p["gain_bps"].as_i64() {
@@ -2740,9 +2763,13 @@ fn panel_invest(ui: &Rc<Ui>, body: &gtk::Box, p: &Value) {
             if held > 0 {
                 detail.push(plural(held, "holding"));
             }
+            let hand = by_hand(a);
+            if hand.is_some() {
+                detail.push(String::from("value recorded by hand"));
+            }
             let change = a["gain_bps"].as_i64().map(|bps| (percent(bps), gain_class(bps)));
             let lead = badge_sized("chart", registration_hue(registration), 24);
-            let value = fmt.format_whole(a["value"].as_i64().unwrap_or(0));
+            let value = fmt.format_whole(hand.unwrap_or_else(|| a["value"].as_i64().unwrap_or(0)));
             list.append(&invest_row(ui, &lead, a["name"].as_str().unwrap_or(""), &detail.join(" · "), &value, change));
         }
     }

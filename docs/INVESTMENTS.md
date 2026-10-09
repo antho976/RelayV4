@@ -118,6 +118,15 @@ snake_case, Room and the wire camelCase. **The table name is the same everywhere
 - Backup `VERSION = 3`: `securities`, `holdings`, `activities`, `prices`, `fxRates`, `roomFacts`
   lists after `values`, each defaulting to empty; `AccountDto` gains `registration`, `institution`,
   `externalRef`. DTO class names end in `Dto` (proguard). References are ids, as today.
+- **A backup keeps these rows' uids.** `AccountDto` and the six investment DTOs (`SecurityDto`,
+  `HoldingDto`, `ActivityDto`, `PriceDto`, `FxRateDto`, `RoomFactDto`) end with `uid` (Rust
+  `Option<String>`, `#[serde(default)]`; Kotlin `String? = null`), after every other field. An
+  export writes each row's uid; a restore keeps a present, non-blank uid and gives a fresh one
+  otherwise, as it gives every other row. So an account an import made stays `ws:<number>` and its
+  lines stay `imp:…`, and importing the same Wealthsimple file after a restore adds nothing. The PC
+  also gives a fresh uid to a row whose uid an earlier row of its table in the file already took,
+  and drops the tombstone its erase left for a uid the restore brings back, so the next sync does
+  not erase the restored row on the phone.
 - Money columns that are in the ledger currency (`holdings.book`, `room_facts.amount`) rescale with
   a currency change on the phone; amounts in a security's own currency do not.
 
@@ -330,7 +339,7 @@ price on `as_of`), `values` (each account's market value in CAD on `as_of`, uid 
 | `money.invest.add` | mutation | `{ account_id, type, date, symbol?, currency?, quantity?, amount, fee?, note?, to_amount?, to_currency? }` → `Activity` | yes |
 | `money.invest.delete` | mutation | `{ id }` → `{}` | no |
 | `money.invest.restore` | mutation | `{ id }` → `Activity` | no |
-| `money.invest.preview` | query, unlocked, UserOnly | `{ path }` → `ImportPreview` | no |
+| `money.invest.preview` | query, unlocked, UserOnly | `{ path, account_id? }` (a statement's account, so its lines already there count as duplicates) → `ImportPreview` | no |
 | `money.invest.import` | mutation, staged, UserOnly | `{ path, accounts: [{ number, account_id? }], account_id? }` → `ImportResult` | no |
 | `money.invest.room` | mutation | `{ registration, year, amount }` (≤ 0 removes) → `{}` | no |
 | `money.invest.price` | mutation | `{ symbol, date, price }` (price at `PRICE_SCALE`) → `{}` | no |
@@ -457,6 +466,8 @@ embed the same CSV text.
   option. **W3** an investment monthly statement reads `Bought 10.0000 shares at $38.12` as BUY 10
   at 38.12; a cash statement is refused. **W4** the plan for W1 into account `ws:DEMO0001CAD` gives
   the same uids on both sides (assert them literally).
+- **Backup uids** `a restore keeps investment uids so a re-import adds nothing`: a ledger with W2
+  imported, exported, restored, then W2 planned and imported again adds no activity.
 
 ## Not in this version
 

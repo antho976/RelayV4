@@ -238,6 +238,12 @@ class LedgerSync @Inject constructor(private val db: TallyDatabase) {
                 // The delete trigger wrote a tombstone; the PC is where it came from.
                 dao.forgetTombstone(table, uidOf(local))
             }
+            // A derived row the PC deleted stays deleted here too, had or not, as the PC keeps the
+            // ones this phone deletes: the next import of the same file, or the poster, would bring
+            // it back otherwise (docs/INVESTMENTS.md). At the PC's stamp, so it is no news to the PC.
+            if (SyncTables.isDerived(c.uid) && (dao.tombstone(table, c.uid)?.deletedAt ?: Long.MIN_VALUE) < c.updatedAt) {
+                dao.insertTombstone(TombstoneEntity(table, c.uid, c.updatedAt))
+            }
             return true
         }
         if (local == null) {

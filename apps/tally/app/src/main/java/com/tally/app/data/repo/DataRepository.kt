@@ -19,6 +19,7 @@ import com.tally.app.data.db.RecurringEntity
 import com.tally.app.data.db.RoomFactEntity
 import com.tally.app.data.db.SecurityEntity
 import com.tally.app.data.db.TransactionEntity
+import com.tally.app.data.db.newUid
 import com.tally.app.data.prefs.SettingsRepository
 import com.tally.core.AccountDto
 import com.tally.core.AccountType
@@ -96,7 +97,7 @@ class DataRepository @Inject constructor(
                 accounts = db.accounts().all().map {
                     AccountDto(
                         it.id, it.name, it.type, it.openingBalance, it.archived, it.sortOrder,
-                        registration = it.registration, institution = it.institution, externalRef = it.externalRef,
+                        registration = it.registration, institution = it.institution, externalRef = it.externalRef, uid = it.uid,
                     )
                 },
                 categories = db.categories().all().map { CategoryDto(it.id, it.name, it.kind, it.color, it.icon, it.archived, it.sortOrder) },
@@ -120,29 +121,29 @@ class DataRepository @Inject constructor(
                 contributions = db.goals().allContributions().map { ContributionDto(it.id, it.goalId, it.amount, it.date.toString(), it.note) },
                 values = db.values().all().map { AccountValueDto(it.id, it.accountId, it.date.toString(), it.value) },
                 securities = db.invest().securities().map {
-                    SecurityDto(id = it.id, symbol = it.symbol, name = it.name, currency = it.currency, kind = it.kind, exchange = it.exchange)
+                    SecurityDto(id = it.id, symbol = it.symbol, name = it.name, currency = it.currency, kind = it.kind, exchange = it.exchange, uid = it.uid)
                 },
                 holdings = db.invest().holdings().map {
                     HoldingDto(
                         id = it.id, accountId = it.accountId, securityId = it.securityId, date = it.date.toString(),
-                        quantity = it.quantity, book = it.book, bookMarket = it.bookMarket,
+                        quantity = it.quantity, book = it.book, bookMarket = it.bookMarket, uid = it.uid,
                     )
                 },
                 activities = db.invest().activities().map {
                     ActivityDto(
                         id = it.id, accountId = it.accountId, securityId = it.securityId, type = it.type, date = it.date.toString(),
                         quantity = it.quantity, amount = it.amount, fee = it.fee, currency = it.currency,
-                        toAmount = it.toAmount, toCurrency = it.toCurrency, note = it.note, source = it.source,
+                        toAmount = it.toAmount, toCurrency = it.toCurrency, note = it.note, source = it.source, uid = it.uid,
                     )
                 },
                 prices = db.invest().prices().map {
-                    PriceDto(id = it.id, securityId = it.securityId, date = it.date.toString(), price = it.price, source = it.source)
+                    PriceDto(id = it.id, securityId = it.securityId, date = it.date.toString(), price = it.price, source = it.source, uid = it.uid)
                 },
                 fxRates = db.invest().fxRates().map {
-                    FxRateDto(id = it.id, base = it.base, quote = it.quote, date = it.date.toString(), rate = it.rate, source = it.source)
+                    FxRateDto(id = it.id, base = it.base, quote = it.quote, date = it.date.toString(), rate = it.rate, source = it.source, uid = it.uid)
                 },
                 roomFacts = db.invest().roomFacts().map {
-                    RoomFactDto(id = it.id, registration = it.registration, year = it.year, amount = it.amount)
+                    RoomFactDto(id = it.id, registration = it.registration, year = it.year, amount = it.amount, uid = it.uid)
                 },
             )
         }
@@ -187,11 +188,23 @@ class DataRepository @Inject constructor(
         )
     }
 
+    /**
+     * The uid a restored row takes: the file's, so an import's derived uids (`ws:`, `imp:`, `sec:`…)
+     * outlive the restore and the same file imported again adds nothing (docs/INVESTMENTS.md). A
+     * file without one (older, the sample, or hand-made), or one an earlier row of the same table
+     * already took, gets a fresh uid instead, as every row did before.
+     */
+    private class Uids {
+        private val taken = HashSet<String>()
+        fun keep(uid: String?): String = uid?.takeIf { it.isNotBlank() && taken.add(it) } ?: newUid()
+    }
+
     private suspend fun insertFile(file: BackupFile) {
+        val accountUids = Uids()
         db.accounts().insertAll(file.accounts.map {
             AccountEntity(
                 it.id, it.name, it.type, it.openingBalance, it.archived, it.sortOrder,
-                registration = it.registration, institution = it.institution, externalRef = it.externalRef,
+                registration = it.registration, institution = it.institution, externalRef = it.externalRef, uid = accountUids.keep(it.uid),
             )
         })
         db.categories().insertAll(file.categories.map { CategoryEntity(it.id, it.name, it.kind, it.color, it.icon, it.archived, it.sortOrder) })
@@ -214,30 +227,45 @@ class DataRepository @Inject constructor(
         })
         db.goals().insertContributions(file.contributions.map { ContributionEntity(it.id, it.goalId, it.amount, LocalDate.parse(it.date), it.note) })
         db.values().insertAll(file.values.map { AccountValueEntity(it.id, it.accountId, LocalDate.parse(it.date), it.value) })
+        val securityUids = Uids()
         db.invest().insertSecurities(file.securities.map {
-            SecurityEntity(id = it.id, symbol = it.symbol, name = it.name, currency = it.currency, kind = it.kind, exchange = it.exchange)
+            SecurityEntity(
+                id = it.id, symbol = it.symbol, name = it.name, currency = it.currency, kind = it.kind, exchange = it.exchange,
+                uid = securityUids.keep(it.uid),
+            )
         })
+        val holdingUids = Uids()
         db.invest().insertHoldings(file.holdings.map {
             HoldingEntity(
                 id = it.id, accountId = it.accountId, securityId = it.securityId, date = LocalDate.parse(it.date),
-                quantity = it.quantity, book = it.book, bookMarket = it.bookMarket,
+                quantity = it.quantity, book = it.book, bookMarket = it.bookMarket, uid = holdingUids.keep(it.uid),
             )
         })
+        val activityUids = Uids()
         db.invest().insertActivities(file.activities.map {
             ActivityEntity(
                 id = it.id, accountId = it.accountId, securityId = it.securityId, type = it.type, date = LocalDate.parse(it.date),
                 quantity = it.quantity, amount = it.amount, fee = it.fee, currency = it.currency,
-                toAmount = it.toAmount, toCurrency = it.toCurrency, note = it.note, source = it.source,
+                toAmount = it.toAmount, toCurrency = it.toCurrency, note = it.note, source = it.source, uid = activityUids.keep(it.uid),
             )
         })
+        val priceUids = Uids()
         db.invest().insertPrices(file.prices.map {
-            PriceEntity(id = it.id, securityId = it.securityId, date = LocalDate.parse(it.date), price = it.price, source = it.source)
+            PriceEntity(
+                id = it.id, securityId = it.securityId, date = LocalDate.parse(it.date), price = it.price, source = it.source,
+                uid = priceUids.keep(it.uid),
+            )
         })
+        val rateUids = Uids()
         db.invest().insertFxRates(file.fxRates.map {
-            FxRateEntity(id = it.id, base = it.base, quote = it.quote, date = LocalDate.parse(it.date), rate = it.rate, source = it.source)
+            FxRateEntity(
+                id = it.id, base = it.base, quote = it.quote, date = LocalDate.parse(it.date), rate = it.rate, source = it.source,
+                uid = rateUids.keep(it.uid),
+            )
         })
+        val roomUids = Uids()
         db.invest().insertRoomFacts(file.roomFacts.map {
-            RoomFactEntity(id = it.id, registration = it.registration, year = it.year, amount = it.amount)
+            RoomFactEntity(id = it.id, registration = it.registration, year = it.year, amount = it.amount, uid = roomUids.keep(it.uid))
         })
     }
 

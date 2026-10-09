@@ -104,9 +104,22 @@ fn activity_row(r: &rusqlite::Row) -> rusqlite::Result<ActivityView> {
 }
 
 impl Ledger {
-    /// The investments on `today` (docs/INVESTMENTS.md, "The portfolio reading").
+    /// The investments on `today` (docs/INVESTMENTS.md, "The portfolio reading"). A day whose
+    /// year the room's deadlines or the income months would run off the calendar from is refused.
     pub fn portfolio(&self, today: Date) -> Result<Portfolio> {
+        if !(1..=9998).contains(&today.year()) {
+            return invalid(format!("Not a day to read investments on: {today}"));
+        }
         Ok(invest::portfolio(&self.portfolio_input(today)?))
+    }
+
+    /// The exchange rates the ledger knows: the reading's and an import's, so a holding in US
+    /// dollars is valued the same here as on the phone.
+    fn fx_rows(&self) -> Result<Vec<FxRow>> {
+        rows(&self.conn, "SELECT base, quote, date, rate FROM fx_rates WHERE deleted = 0", |r| {
+            let Some(date) = date_of(r, 2)? else { return Ok(None) };
+            Ok(Some(FxRow { base: r.get(0)?, quote: r.get(1)?, date, rate: r.get(3)? }))
+        })
     }
 
     /// The rows the reading takes: the investment accounts in use and everything touching them.
@@ -167,10 +180,7 @@ impl Ledger {
             let Some(date) = date_of(r, 1)? else { return Ok(None) };
             Ok(Some(PriceRow { security_id: r.get(0)?, date, price: r.get(2)? }))
         })?;
-        let fx_rates = rows(c, "SELECT base, quote, date, rate FROM fx_rates WHERE deleted = 0", |r| {
-            let Some(date) = date_of(r, 2)? else { return Ok(None) };
-            Ok(Some(FxRow { base: r.get(0)?, quote: r.get(1)?, date, rate: r.get(3)? }))
-        })?;
+        let fx_rates = self.fx_rows()?;
         let room_facts = rows(c, "SELECT registration, year, amount FROM room_facts WHERE deleted = 0", |r| {
             let Some(registration) = parse_name::<Registration>(&r.get::<_, String>(0)?) else { return Ok(None) };
             Ok(Some(RoomRow { registration, year: r.get(1)?, amount: r.get(2)? }))
@@ -341,6 +351,7 @@ impl Ledger {
     pub fn invest_preview(&self, text: &str, account_id: Option<i64>) -> Result<ImportPreview> {
         let file = Ledger::read_file(text)?;
         let mut input = PlanInput::new(self.settings()?.currency);
+        input.fx_rates = self.fx_rows()?;
         let mut accounts = Vec::new();
         for a in &file.accounts {
             let found = self.account_by_ref(&a.number)?;
@@ -391,6 +402,7 @@ impl Ledger {
     pub fn invest_import(&mut self, text: &str, accounts: &[ImportAccount], account_id: Option<i64>) -> Result<ImportResult> {
         let file = Ledger::read_file(text)?;
         let mut input = PlanInput::new(self.settings()?.currency);
+        input.fx_rates = self.fx_rows()?;
         let mut remember: Vec<(i64, String, Registration)> = Vec::new();
         for a in &file.accounts {
             match accounts.iter().find(|m| m.number == a.number) {
@@ -816,6 +828,66 @@ mod tests {
         restored.import_backup(&read).unwrap();
         assert_eq!(file, restored.export_backup("2026-10-09").unwrap());
         assert_eq!(l.portfolio(date(2026, 10, 9)).unwrap(), restored.portfolio(date(2026, 10, 9)).unwrap());
+    }
+
+    #[test]
+    fn a_restore_keeps_investment_uids_so_a_re_import_adds_nothing() {
+        let mut l = ledger();
+        l.invest_import(ACTIVITIES_EXPORT, &[], None).unwrap();
+        let file = l.export_backup("2026-10-09").unwrap();
+        assert_eq!(Some("ws:HQ7XFMC41CAD"), file.accounts[0].uid.as_deref());
+        assert!(file.securities.iter().all(|s| s.uid.as_deref().is_some_and(|u| u.starts_with("sec:"))));
+        assert!(file.activities.iter().all(|a| a.uid.as_deref().is_some_and(|u| u.starts_with("imp:"))));
+        let crate::backup::BackupReadResult::Ok(read) = crate::backup::decode(&crate::backup::encode(&file)) else { panic!("the export reads back") };
+        // Restored on a device that never saw the file, and over the ledger that wrote it.
+        for mut restored in [ledger(), l] {
+            restored.import_backup(&read).unwrap();
+            let preview = restored.invest_preview(ACTIVITIES_EXPORT, None).unwrap();
+            assert_eq!((0, 5), (preview.new, preview.duplicates));
+            let again = restored.invest_import(ACTIVITIES_EXPORT, &[], None).unwrap();
+            assert_eq!((0, 0, 0, 5), (again.accounts_created, again.securities, again.activities, again.duplicates));
+            assert_eq!((1, 5), (count(&restored, "SELECT COUNT(*) FROM accounts"), count(&restored, "SELECT COUNT(*) FROM activities")));
+            let buried = "SELECT COUNT(*) FROM tombstones t WHERE EXISTS (SELECT 1 FROM activities a WHERE a.uid = t.uid) AND t.tbl = 'activities'";
+            assert_eq!(0, count(&restored, buried), "a restored row leaves no tombstone that would erase it on the phone");
+        }
+    }
+
+    #[test]
+    fn a_restore_gives_a_blank_or_repeated_uid_a_fresh_one() {
+        let mut l = ledger();
+        l.invest_import(ACTIVITIES_EXPORT, &[], None).unwrap();
+        let mut file = l.export_backup("2026-10-09").unwrap();
+        file.activities[1].uid = file.activities[0].uid.clone();
+        file.activities[2].uid = Some(" ".into());
+        file.activities[3].uid = None;
+        let mut restored = ledger();
+        restored.import_backup(&file).unwrap();
+        assert_eq!(5, count(&restored, "SELECT COUNT(DISTINCT uid) FROM activities"));
+        assert_eq!(2, count(&restored, "SELECT COUNT(*) FROM activities WHERE uid LIKE 'imp:%'"));
+        assert_eq!(3, restored.invest_import(ACTIVITIES_EXPORT, &[], None).unwrap().activities, "the lines whose uid was lost come in again");
+    }
+
+    #[test]
+    fn an_import_values_us_dollars_at_the_ledgers_rate_as_the_phone_does() {
+        let mut l = ledger();
+        l.fx_set("USD", "CAD", "2026-05-01", 130_000_000, SOURCE_MANUAL).unwrap();
+        l.invest_import(HOLDINGS_REPORT, &[], None).unwrap();
+        // AAPL's 1,000.00 USD and ARKK's 50.00 USD at 1.30, and XEQT's 250.00 CAD; not by their book (1,633.33).
+        assert_eq!(1_300_00 + 250_00 + 65_00, l.accounts().unwrap()[0].balance);
+        let file = wealthsimple::read(HOLDINGS_REPORT).unwrap();
+        let mut input = PlanInput::new("CAD");
+        input.fx_rates = l.portfolio_input(date(2026, 5, 8)).unwrap().fx_rates;
+        assert_eq!(1_615_00, wealthsimple::plan(&file, &input).unwrap().values[0].value, "the plan the phone makes with the same rates");
+    }
+
+    #[test]
+    fn a_day_off_the_calendar_is_refused_not_read() {
+        let mut l = ledger();
+        tfsa(&mut l);
+        l.account_add("RRSP", AccountType::Investment, 0, Some(Registration::Rrsp), "").unwrap();
+        assert!(matches!(l.portfolio(date(9999, 6, 1)), Err(LedgerError::Invalid(_))));
+        assert!(matches!(l.portfolio(date(-9999, 1, 5)), Err(LedgerError::Invalid(_))));
+        assert_eq!(2, l.portfolio(date(9998, 6, 1)).unwrap().accounts.len());
     }
 
     #[test]

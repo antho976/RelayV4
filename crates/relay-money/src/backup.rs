@@ -133,6 +133,10 @@ pub struct AccountDto {
     /// The institution's own number for the account, e.g. Wealthsimple's "HQ7XFMC41CAD".
     #[serde(default)]
     pub external_ref: String,
+    /// The row's uid, so a restore keeps the uids an import derived (`ws:`, `sec:`, `imp:`…) and the
+    /// same file imported again adds nothing. Absent (an older file) or blank: a fresh one.
+    #[serde(default)]
+    pub uid: Option<String>,
 }
 
 impl AccountDto {
@@ -148,6 +152,7 @@ impl AccountDto {
             registration: None,
             institution: String::new(),
             external_ref: String::new(),
+            uid: None,
         }
     }
 }
@@ -300,6 +305,9 @@ pub struct SecurityDto {
     pub kind: SecurityKind,
     #[serde(default)]
     pub exchange: String,
+    /// As [`AccountDto::uid`].
+    #[serde(default)]
+    pub uid: Option<String>,
 }
 
 /// A line of an account's holdings snapshot. `book` is in the ledger currency, `book_market` in the security's.
@@ -313,6 +321,9 @@ pub struct HoldingDto {
     pub quantity: i64,
     pub book: i64,
     pub book_market: i64,
+    /// As [`AccountDto::uid`].
+    #[serde(default)]
+    pub uid: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -338,6 +349,9 @@ pub struct ActivityDto {
     pub note: String,
     #[serde(default = "manual")]
     pub source: String,
+    /// As [`AccountDto::uid`].
+    #[serde(default)]
+    pub uid: Option<String>,
 }
 
 fn manual() -> String {
@@ -352,6 +366,9 @@ pub struct PriceDto {
     pub date: String,
     pub price: i64,
     pub source: String,
+    /// As [`AccountDto::uid`].
+    #[serde(default)]
+    pub uid: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -363,6 +380,9 @@ pub struct FxRateDto {
     pub date: String,
     pub rate: i64,
     pub source: String,
+    /// As [`AccountDto::uid`].
+    #[serde(default)]
+    pub uid: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -372,6 +392,9 @@ pub struct RoomFactDto {
     pub registration: Registration,
     pub year: i32,
     pub amount: i64,
+    /// As [`AccountDto::uid`].
+    #[serde(default)]
+    pub uid: Option<String>,
 }
 
 /// The file is read once per restore, so it is not boxed to even out the two sizes.
@@ -723,6 +746,7 @@ mod tests {
             "values":[{"id":1,"accountId":1,"date":"2026-10-01","value":500000}]}"#;
         let read = ok(decode(v2));
         assert_eq!((None, ""), (read.accounts[0].registration, read.accounts[0].external_ref.as_str()));
+        assert_eq!(None, read.accounts[0].uid, "A file from before uids were kept has none; the restore makes them");
         assert!(read.securities.is_empty() && read.activities.is_empty() && read.room_facts.is_empty());
         assert_eq!(1, read.values.len());
     }
@@ -734,32 +758,44 @@ mod tests {
             a.registration = Some(Registration::Tfsa);
             a.institution = "Wealthsimple".into();
             a.external_ref = "HQ7XFMC41CAD".into();
+            a.uid = Some("ws:HQ7XFMC41CAD".into());
         }
         s.securities = vec![SecurityDto {
             id: 1, symbol: "XEQT".into(), name: "iShares Core Equity ETF Portfolio".into(), currency: "CAD".into(), kind: SecurityKind::Etf,
-            exchange: "TSX".into(),
+            exchange: "TSX".into(), uid: Some("sec:XEQT".into()),
         }];
-        s.holdings = vec![HoldingDto { id: 1, account_id: 5, security_id: 1, date: "2026-10-01".into(), quantity: 1_000_000_000, book: 38_120, book_market: 38_120 }];
+        s.holdings = vec![HoldingDto {
+            id: 1, account_id: 5, security_id: 1, date: "2026-10-01".into(), quantity: 1_000_000_000, book: 38_120, book_market: 38_120,
+            uid: Some("hold:ws:HQ7XFMC41CAD:sec:XEQT:2026-10-01".into()),
+        }];
         s.activities = vec![
             ActivityDto {
                 id: 1, account_id: 5, security_id: Some(1), r#type: ActivityType::Buy, date: "2026-10-02".into(), quantity: 100_000_000, amount: 3_900,
                 fee: 0, currency: "CAD".into(), to_amount: None, to_currency: None, note: String::new(), source: "WEALTHSIMPLE".into(),
+                uid: Some("imp:86fe65d31110bce166befa06e9747e9a".into()),
             },
             ActivityDto {
                 id: 2, account_id: 5, security_id: None, r#type: ActivityType::Fx, date: "2026-10-03".into(), quantity: 0, amount: 10_000, fee: 0,
-                currency: "CAD".into(), to_amount: Some(7_300), to_currency: Some("USD".into()), note: String::new(), source: "MANUAL".into(),
+                currency: "CAD".into(), to_amount: Some(7_300), to_currency: Some("USD".into()), note: String::new(), source: "MANUAL".into(), uid: None,
             },
         ];
-        s.prices = vec![PriceDto { id: 1, security_id: 1, date: "2026-10-01".into(), price: 3_812_000_000, source: "IMPORT".into() }];
-        s.fx_rates = vec![FxRateDto { id: 1, base: "USD".into(), quote: "CAD".into(), date: "2026-10-01".into(), rate: 137_125_000, source: "BANK_OF_CANADA".into() }];
-        s.room_facts = vec![RoomFactDto { id: 1, registration: Registration::Tfsa, year: 2026, amount: 700_000 }];
+        s.prices = vec![PriceDto {
+            id: 1, security_id: 1, date: "2026-10-01".into(), price: 3_812_000_000, source: "IMPORT".into(), uid: Some("px:sec:XEQT:2026-10-01".into()),
+        }];
+        s.fx_rates = vec![FxRateDto {
+            id: 1, base: "USD".into(), quote: "CAD".into(), date: "2026-10-01".into(), rate: 137_125_000, source: "BANK_OF_CANADA".into(),
+            uid: Some("fx:USD:CAD:2026-10-01".into()),
+        }];
+        s.room_facts = vec![RoomFactDto { id: 1, registration: Registration::Tfsa, year: 2026, amount: 700_000, uid: Some("room:TFSA:2026".into()) }];
         s
     }
 
     #[test]
     fn investments_round_trip() {
         assert_eq!(5, sample().accounts.iter().find(|a| a.r#type == AccountType::Investment).unwrap().id);
-        assert_eq!(invested(), ok(decode(&encode(&invested()))));
+        let text = encode(&invested());
+        assert_eq!(invested(), ok(decode(&text)), "Uids ride along, a missing one as null");
+        assert!(text.contains("\"externalRef\": \"HQ7XFMC41CAD\",\n            \"uid\": \"ws:HQ7XFMC41CAD\"\n"), "{text}");
     }
 
     #[test]
@@ -798,7 +834,15 @@ mod tests {
         let mut account = BackupFile::new("2026-10-04", "CAD");
         account.accounts.push(AccountDto::new(1, "TFSA", AccountType::Investment, 0));
         let text = encode(&account);
-        assert!(text.contains("\"sortOrder\": 0,\n            \"registration\": null,\n            \"institution\": \"\",\n            \"externalRef\": \"\"\n"), "{text}");
+        assert!(text.contains("\"sortOrder\": 0,\n            \"registration\": null,\n            \"institution\": \"\",\n            \"externalRef\": \"\",\n            \"uid\": null\n"), "{text}");
+        // Every investment row's uid comes last too.
+        let text = encode(&invested());
+        for tail in ["\"exchange\": \"TSX\",\n            \"uid\": \"sec:XEQT\"\n", "\"bookMarket\": 38120,\n            \"uid\": \"hold:ws:HQ7XFMC41CAD:sec:XEQT:2026-10-01\"\n",
+            "\"source\": \"MANUAL\",\n            \"uid\": null\n", "\"source\": \"IMPORT\",\n            \"uid\": \"px:sec:XEQT:2026-10-01\"\n",
+            "\"source\": \"BANK_OF_CANADA\",\n            \"uid\": \"fx:USD:CAD:2026-10-01\"\n", "\"amount\": 700000,\n            \"uid\": \"room:TFSA:2026\"\n"]
+        {
+            assert!(text.contains(tail), "{tail} in {text}");
+        }
     }
 
     #[test]

@@ -466,9 +466,11 @@ pub async fn refresh(ui: &Rc<Ui>, page: &str) {
 /// `money.changed`: the ledger moved, here or elsewhere.
 pub fn changed(ui: &Rc<Ui>) {
     let page = ui.page.borrow().clone();
+    // A thread's charts read again in view; out of it, with another page showing, they wait to
+    // read when they show again (`chart::load_stale`).
+    chart::refresh_all();
     if page == threads::PAGE {
         threads::refresh_panel(ui);
-        chart::refresh_all();
     } else if is_page(&page) {
         ui.refresh_page();
     }
