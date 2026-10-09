@@ -5,10 +5,17 @@ import android.database.sqlite.SQLiteDatabase
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import com.tally.app.data.db.AccountEntity
+import com.tally.app.data.db.ActivityEntity
+import com.tally.app.data.db.HoldingEntity
+import com.tally.app.data.db.SecurityEntity
 import com.tally.app.data.db.TallyDatabase
 import com.tally.app.data.db.TransactionEntity
 import com.tally.app.data.db.tally
 import com.tally.core.AccountType
+import com.tally.core.ActivityType
+import com.tally.core.Invest
+import com.tally.core.Registration
+import com.tally.core.SecurityKind
 import com.tally.core.TxType
 import com.tally.core.GoalKind
 import kotlinx.coroutines.flow.first
@@ -160,5 +167,62 @@ class MigrationTest {
         val id = db.accounts().insert(AccountEntity(name = "Cash", type = AccountType.CASH))
         assertNotEquals(visa.uid, db.accounts().get(id)!!.uid)
         db.transactions().insert(TransactionEntity(type = TxType.EXPENSE, amount = 500, date = LocalDate.of(2026, 10, 2), accountId = id))
+    }
+
+    /**
+     * Version 3 to 4 adds investments (docs/INVESTMENTS.md). Every account a version 3 phone holds
+     * reads as having no registration, institution or number, nothing else about the ledger moves,
+     * the six new tables arrive empty and as Room declares them (it checks on open), and they sync
+     * like the rest: a write is stamped, a delete and its cascade leave tombstones.
+     */
+    @Test fun aVersion3LedgerOpensWithInvestments() = runTest {
+        val file = context.getDatabasePath(name)
+        file.parentFile?.mkdirs()
+        val day = LocalDate.of(2026, 10, 1)
+        SQLiteDatabase.openOrCreateDatabase(file, null).use { v3 ->
+            schemaStatements(3).forEach { v3.execSQL(it) }
+            v3.execSQL(
+                "INSERT INTO accounts (id, name, type, openingBalance, archived, sortOrder, uid, updatedAt) " +
+                    "VALUES (1, 'Chequing', 'CHEQUING', 100000, 0, 0, 'a-chq', 1), (2, 'TFSA', 'INVESTMENT', 500000, 0, 1, 'a-tfsa', 1)"
+            )
+            v3.execSQL(
+                "INSERT INTO transactions (id, type, amount, date, accountId, toAccountId, categoryId, note, recurringId, createdAt, uid, updatedAt) " +
+                    "VALUES (1, 'TRANSFER', 20000, ${day.toEpochDay()}, 1, 2, NULL, '', NULL, 0, 't-1', 1)"
+            )
+            v3.execSQL("INSERT INTO account_values (id, accountId, date, value, uid, updatedAt) VALUES (1, 2, ${day.toEpochDay()}, 610000, 'v-1', 1)")
+            v3.execSQL("INSERT INTO sync_tombstones (tableName, uid, deletedAt, category) VALUES ('transactions', 'bill:r1:2026-09-01', 5, NULL)")
+            v3.version = 3
+        }
+
+        val db = Room.databaseBuilder(context, TallyDatabase::class.java, name).allowMainThreadQueries().tally().build()
+        opened = db
+
+        val accounts = db.accounts().all()
+        assertEquals(listOf("a-chq", "a-tfsa"), accounts.map { it.uid })
+        assertTrue("No account had a registration", accounts.all { it.registration == null && it.institution == "" && it.externalRef == "" })
+        val balances = db.accounts().observeBalances().first().associate { it.name to it.balance }
+        assertEquals(100_000L - 20_000, balances["Chequing"])
+        assertEquals("The value holds the transfer on its own day", 610_000L, balances["TFSA"])
+        assertEquals("A deleted bill's tombstone is kept", listOf("bill:r1:2026-09-01"), db.sync().tombstones().map { it.uid })
+        assertTrue(db.invest().securities().isEmpty() && db.invest().holdings().isEmpty() && db.invest().activities().isEmpty())
+        assertTrue(db.invest().prices().isEmpty() && db.invest().fxRates().isEmpty() && db.invest().roomFacts().isEmpty())
+
+        val tfsa = accounts.single { it.uid == "a-tfsa" }
+        db.accounts().update(tfsa.copy(registration = Registration.TFSA, institution = "Wealthsimple"))
+        assertEquals(Registration.TFSA, db.accounts().get(tfsa.id)!!.registration)
+
+        val xeqt = db.invest().insertSecurity(SecurityEntity(symbol = "XEQT", currency = "CAD", kind = SecurityKind.ETF, uid = "sec:XEQT", updatedAt = 5L))
+        assertTrue("An insert is stamped now, whatever the row said", db.invest().security("sec:XEQT")!!.updatedAt > 5L)
+        db.invest().insertHoldingOrIgnore(
+            HoldingEntity(accountId = tfsa.id, securityId = xeqt, date = day, quantity = 10 * Invest.QTY_SCALE, book = 381_20, bookMarket = 381_20, uid = "hold:a-tfsa:sec:XEQT:2026-10-01")
+        )
+        db.invest().insertActivity(
+            ActivityEntity(accountId = tfsa.id, securityId = xeqt, type = ActivityType.BUY, date = day, quantity = 10 * Invest.QTY_SCALE, amount = 381_20, currency = "CAD")
+        )
+        db.sync().deleteSecurity(xeqt)
+        val gone = db.sync().tombstones().map { it.tableName to it.uid }.toSet()
+        assertTrue(("securities" to "sec:XEQT") in gone)
+        assertTrue("Its holding went with it, and says so", ("holdings" to "hold:a-tfsa:sec:XEQT:2026-10-01") in gone)
+        assertNull("An activity outlives its security", db.invest().activities().single().securityId)
     }
 }

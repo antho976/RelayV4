@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.Uri
 import androidx.test.core.app.ApplicationProvider
 import com.tally.app.data.db.ContributionEntity
+import com.tally.app.data.db.FxRateEntity
 import com.tally.app.data.db.GoalEntity
 import com.tally.app.data.db.RecurringEntity
 import com.tally.app.data.db.TallyDatabase
@@ -21,9 +22,11 @@ import com.tally.core.BackupReadResult
 import com.tally.core.CategoryKind
 import com.tally.core.Defaults
 import com.tally.core.Frequency
+import com.tally.core.Registration
 import com.tally.core.SampleData
 import com.tally.core.TransactionDto
 import com.tally.core.TxType
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import org.junit.After
@@ -90,6 +93,12 @@ class DataRepositoryTest {
         goals = goals.sortedBy { it.id },
         contributions = contributions.sortedBy { it.id },
         values = values.sortedBy { it.id },
+        securities = securities.sortedBy { it.id },
+        holdings = holdings.sortedBy { it.id },
+        activities = activities.sortedBy { it.id },
+        prices = prices.sortedBy { it.id },
+        fxRates = fxRates.sortedBy { it.id },
+        roomFacts = roomFacts.sortedBy { it.id },
     )
 
     /**
@@ -447,5 +456,47 @@ class DataRepositoryTest {
 
         assertEquals(before, amounts())
         assertEquals("JPY", settings.current().currency)
+    }
+
+    // ── Investments (docs/INVESTMENTS.md) ────────────────────────────────────
+
+    @Test fun investmentsAndRegistrationsRideThroughABackup() = runTest {
+        val invest = db.investRepository(clock, settings)
+        invest.import(WsFiles.HOLDINGS_REPORT, emptyMap(), null)
+        invest.import(WsFiles.ACTIVITIES_EXPORT, emptyMap(), null)
+        invest.setRoom(Registration.TFSA, 2026, 7_000_00)
+        db.invest().insertFxRates(listOf(FxRateEntity(base = "USD", quote = "CAD", date = LocalDate.of(2026, 5, 1), rate = 137_125_000, source = "MANUAL")))
+        val portfolio = invest.portfolio().first()
+
+        val file = data.snapshot()
+        assertEquals(listOf(3, 3, 3, 1, 1), listOf(file.securities.size, file.holdings.size, file.prices.size, file.fxRates.size, file.roomFacts.size))
+        assertTrue(file.activities.isNotEmpty())
+        val demo = file.accounts.single { it.externalRef == "DEMO0001CAD" }
+        assertEquals(listOf(Registration.TFSA, "Wealthsimple"), listOf(demo.registration, demo.institution))
+
+        val read = BackupCodec.decode(BackupCodec.encode(file))
+        assertTrue("$read", read is BackupReadResult.Ok)
+        assertTrue(data.restore((read as BackupReadResult.Ok).file) is DataResult.Done)
+        assertEquals(file.byId(), data.snapshot().byId())
+        assertEquals("The same rows read the same", portfolio, invest.portfolio().first())
+    }
+
+    @Test fun aCurrencySwitchRescalesTheBookAndTheRoomButNotWhatIsInASecuritysOwnCurrency() = runTest {
+        val invest = db.investRepository(clock, settings)
+        invest.import(WsFiles.HOLDINGS_REPORT, emptyMap(), null)
+        invest.import(WsFiles.ACTIVITIES_EXPORT, emptyMap(), null)
+        invest.setRoom(Registration.TFSA, 2026, 7_000_50)
+        val activities = db.invest().activities()
+        val prices = db.invest().prices()
+
+        assertEquals("The report's value (1,633.33) and the room's 50 cents round", 2, data.planCurrencyChange("JPY")?.rounded)
+        assertTrue(data.changeCurrency("JPY") is DataResult.Done)
+
+        val held = db.invest().holdings()
+        assertEquals("The ledger's book rescales", listOf(1_000L, 250L, 50L), held.map { it.book })
+        assertEquals("The market's book is the security's own", listOf(750_00L, 250_00L, 50_00L), held.map { it.bookMarket })
+        assertEquals(7_000L, db.invest().roomFacts().single().amount)
+        assertEquals(activities.map { it.amount }, db.invest().activities().map { it.amount })
+        assertEquals(prices.map { it.price }, db.invest().prices().map { it.price })
     }
 }

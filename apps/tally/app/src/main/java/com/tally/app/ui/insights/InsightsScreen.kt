@@ -77,6 +77,7 @@ import com.tally.app.ui.common.EndsRow
 import com.tally.app.ui.common.FIGURE_GAP
 import com.tally.app.ui.common.GUTTER
 import com.tally.app.ui.common.GlyphBadge
+import com.tally.app.ui.common.HeroNumber
 import com.tally.app.ui.common.HeroPanel
 import com.tally.app.ui.common.LedgerRow
 import com.tally.app.ui.common.LegendDot
@@ -91,11 +92,13 @@ import com.tally.app.ui.common.StackedBar
 import com.tally.app.ui.common.StatChip
 import com.tally.app.ui.common.StatTile
 import com.tally.app.ui.common.ThinBar
+import com.tally.app.ui.common.TextAction
 import com.tally.app.ui.common.TopBar
 import com.tally.app.ui.common.bounceClick
 import com.tally.app.ui.nav.AppNav
 import com.tally.app.ui.nav.FAB_CLEARANCE
 import com.tally.app.ui.theme.categoryColor
+import com.tally.core.AccountType
 import com.tally.core.Copy
 import com.tally.core.MoneyFormatter
 import com.tally.core.PaceStatus
@@ -132,6 +135,8 @@ fun InsightsTab(nav: AppNav) {
             },
             openCategory = { nav.transactions(categoryId = it) },
             openEntry = { nav.entry(id = it) },
+            openAccount = { nav.transactions(accountId = it) },
+            openInvestments = nav::investments,
         ),
     )
 }
@@ -145,6 +150,10 @@ data class InsightsActions(
     val openPeriod: (Int) -> Unit = {},
     val openCategory: (Long) -> Unit = {},
     val openEntry: (Long) -> Unit = {},
+    /** An account's entries, from a Worth row. */
+    val openAccount: (Long) -> Unit = {},
+    /** The Investments page, from Worth's investment rows and its Invested reading. */
+    val openInvestments: () -> Unit = {},
 )
 
 /**
@@ -200,7 +209,7 @@ fun InsightsScreen(state: InsightsState, lens: InsightsLens, actions: InsightsAc
                 InsightsLens.MONTH -> monthItems(state, periodName, actions)
                 InsightsLens.TREND -> trendItems(state, actions)
                 InsightsLens.CALENDAR -> calendarItems(state, periodName) { openDay = it.toEpochDay() }
-                InsightsLens.WORTH -> worthItems(state, periodName)
+                InsightsLens.WORTH -> worthItems(state, periodName, actions)
             }
         }
     }
@@ -244,20 +253,6 @@ private fun PeriodStepper(label: String, canGoNext: Boolean, onPrevious: () -> U
 @Composable
 private fun LensHeroLabel(label: String, meta: String?, tint: Color = MaterialTheme.colorScheme.primary) {
     PanelHeader(label, meta = meta, tint = tint)
-}
-
-/**
- * The lit panel's serif figure. Past 1.5x font scale it steps down a rung of the same serif voice,
- * so an amount stays on one line instead of breaking between its digits.
- */
-@Composable
-private fun HeroFigure(text: String) {
-    val large = LocalDensity.current.fontScale > 1.5f
-    Text(
-        text,
-        style = if (large) MaterialTheme.typography.headlineLarge else MaterialTheme.typography.displayLarge,
-        color = MaterialTheme.colorScheme.onBackground,
-    )
 }
 
 /** Two different readings side by side, stacked once the text is too large for two columns. */
@@ -405,7 +400,7 @@ private fun MonthHero(state: InsightsState, modifier: Modifier = Modifier) {
     HeroPanel(modifier) {
         LensHeroLabel(if (state.isCurrentPeriod) "Spent so far" else "Spent", meta, tint)
         Spacer(Modifier.height(14.dp))
-        HeroFigure(money.formatWhole(state.spent))
+        HeroNumber(money.formatWhole(state.spent))
         Text(supporting, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Spacer(Modifier.height(18.dp))
         Text(readout, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onBackground)
@@ -755,7 +750,7 @@ private fun TrendHero(state: InsightsState, modifier: Modifier = Modifier) {
     HeroPanel(modifier) {
         LensHeroLabel("Average month", "LAST $n MONTHS")
         Spacer(Modifier.height(14.dp))
-        HeroFigure(money.formatWhole(t.averageSpent))
+        HeroNumber(money.formatWhole(t.averageSpent))
         Text(supporting, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Spacer(Modifier.height(18.dp))
         if (picked != null) {
@@ -934,7 +929,7 @@ private fun CalendarHero(state: InsightsState, periodName: String, onDay: (Local
     HeroPanel(modifier) {
         LensHeroLabel("Spending days", meta)
         Spacer(Modifier.height(14.dp))
-        HeroFigure(c.activeDays.toString())
+        HeroNumber(c.activeDays.toString())
         Text(supporting, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Spacer(Modifier.height(18.dp))
         HeatGrid(
@@ -1116,11 +1111,11 @@ private fun DaySheet(date: LocalDate, state: InsightsState, onEntry: (Long) -> U
 
 // ── Worth ───────────────────────────────────────────────────────────────────────────────────────
 
-private fun LazyListScope.worthItems(state: InsightsState, periodName: String) {
+private fun LazyListScope.worthItems(state: InsightsState, periodName: String, actions: InsightsActions) {
     item(key = "worth-hero") { WorthHero(state, periodName, Modifier.padding(horizontal = GUTTER)) }
-    item(key = "worth-tiles") { WorthTiles(state, Modifier.padding(horizontal = GUTTER)) }
+    item(key = "worth-tiles") { WorthTiles(state, actions, Modifier.padding(horizontal = GUTTER)) }
     if (state.worth.accounts.isNotEmpty()) {
-        item(key = "worth-accounts") { AccountsPanel(state, Modifier.padding(horizontal = GUTTER)) }
+        item(key = "worth-accounts") { AccountsPanel(state, actions, Modifier.padding(horizontal = GUTTER)) }
         item(key = "worth-months") { WorthListPanel(state, Modifier.padding(horizontal = GUTTER)) }
     }
 }
@@ -1152,7 +1147,7 @@ private fun WorthHero(state: InsightsState, periodName: String, modifier: Modifi
     HeroPanel(modifier) {
         LensHeroLabel("Net worth", if (state.isCurrentPeriod) "TODAY" else "AT MONTH END")
         Spacer(Modifier.height(14.dp))
-        HeroFigure(money.formatWhole(w.worth))
+        HeroNumber(money.formatWhole(w.worth))
         Text(
             if (w.accounts.isEmpty()) "across no accounts yet" else moved,
             style = MaterialTheme.typography.bodyMedium,
@@ -1211,9 +1206,12 @@ private fun WorthBars(points: List<WorthPoint>, labels: List<String>, descriptio
     }
 }
 
-/** What is held against what is owed, then what the period kept and what it put to work. */
+/**
+ * What is held against what is owed, then what the period kept and what it put to work. With an
+ * investment account, the Invested reading leads on to the portfolio itself.
+ */
 @Composable
-private fun WorthTiles(state: InsightsState, modifier: Modifier = Modifier) {
+private fun WorthTiles(state: InsightsState, actions: InsightsActions, modifier: Modifier = Modifier) {
     val money = LocalMoney.current
     val w = state.worth
     val held = w.accounts.count { it.balance > 0L }
@@ -1257,12 +1255,19 @@ private fun WorthTiles(state: InsightsState, modifier: Modifier = Modifier) {
                 )
             },
         )
+        if (w.investmentAccounts > 0) {
+            TextAction("portfolio", actions.openInvestments, Modifier.align(Alignment.End), color = MaterialTheme.colorScheme.primary)
+        }
     }
 }
 
-/** Every open account at the period's close: the ones in credit by their share of what is held, then the debts. */
+/**
+ * Every open account at the period's close: the ones in credit by their share of what is held,
+ * then the debts. A row opens the account's entries; an investment account opens the portfolio,
+ * where its value is read. Owing is a plain amount over a quiet bar: a debt is not "over".
+ */
 @Composable
-private fun AccountsPanel(state: InsightsState, modifier: Modifier = Modifier) {
+private fun AccountsPanel(state: InsightsState, actions: InsightsActions, modifier: Modifier = Modifier) {
     val money = LocalMoney.current
     val w = state.worth
     Panel(modifier) {
@@ -1273,14 +1278,20 @@ private fun AccountsPanel(state: InsightsState, modifier: Modifier = Modifier) {
                 val owed = a.balance < 0L
                 val whole = if (owed) w.debts else w.assets
                 val share = shareText(kotlin.math.abs(a.balance), whole)
-                val valued = a.valuedOn?.let { " · valued " + Dates.short(it, state.today) }.orEmpty()
-                val meta = typeLabel(a.type) + valued
+                val meta = worthAccountMeta(a.name, typeLabel(a.type), a.valuedOn?.let { Dates.short(it, state.today) })
                 val amount = money.formatWhole(a.balance)
+                val investment = a.type == AccountType.INVESTMENT
                 Column(
                     Modifier
                         .fillMaxWidth()
+                        .bounceClick(
+                            label = if (investment) "Open investments" else "${a.name} entries",
+                            focusOutset = ROW_FOCUS_OUTSET,
+                        ) { if (investment) actions.openInvestments() else actions.openAccount(a.id) }
                         .semantics(mergeDescendants = true) {
-                            contentDescription = "${a.name}, $amount, $meta, $share of " + if (owed) "what is owed" else "what is held"
+                            contentDescription = listOf(a.name, amount, meta, "$share of " + if (owed) "what is owed" else "what is held")
+                                .filter { it.isNotEmpty() }
+                                .joinToString(", ")
                         }
                         .heightIn(min = 64.dp)
                         .padding(top = 10.dp, bottom = 6.dp),
@@ -1291,14 +1302,16 @@ private fun AccountsPanel(state: InsightsState, modifier: Modifier = Modifier) {
                             start = {
                                 Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                                     Text(a.name, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onBackground)
-                                    Text(meta, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    if (meta.isNotEmpty()) {
+                                        Text(meta, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    }
                                 }
                             },
                             end = {
                                 Text(
                                     amount,
                                     style = MaterialTheme.typography.titleSmall,
-                                    color = if (owed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onBackground,
+                                    color = MaterialTheme.colorScheme.onBackground,
                                     textAlign = TextAlign.End,
                                 )
                             },
@@ -1308,7 +1321,8 @@ private fun AccountsPanel(state: InsightsState, modifier: Modifier = Modifier) {
                     Spacer(Modifier.height(10.dp))
                     ThinBar(
                         if (whole > 0L) kotlin.math.abs(a.balance).toFloat() / whole else 0f,
-                        if (owed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.tertiary,
+                        // A share of what is held is the accent's reading, as on Accounts; owing is muted, not red.
+                        if (owed) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.primary,
                         description = "$share of " + if (owed) "what is owed" else "what is held",
                     )
                 }
@@ -1349,11 +1363,8 @@ private fun WorthListPanel(state: InsightsState, modifier: Modifier = Modifier) 
                         start = {
                             Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                                 Text(name, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onBackground)
-                                Text(
-                                    meta,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = if ((change ?: 0L) < 0L) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
+                                // A month that fell is not "over": its words say down, in the muted voice.
+                                Text(meta, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
                         },
                         end = {

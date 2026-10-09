@@ -1,7 +1,8 @@
-/* The Threads space's Tally pages (money_pages.rs) and entry sheet, in the dev space's own
-   tokens (DESIGN.md): the two spaces are one app, so nothing here restyles the bars, the sidebar
-   or the switcher. Colour is kept for what it means: a category's hue, money in, over budget.
-   The start screen has its own look, css/start.css. */
+/* The Threads space's Tally pages (money_pages.rs, money_invest.rs) and their sheets, in the dev
+   space's own tokens (DESIGN.md): the two spaces are one app, so nothing here restyles the bars,
+   the sidebar or the switcher. Colour is kept for what it means: a category's or a
+   registration's hue (data, never text), money in, over budget. The start screen has its own
+   look, css/start.css. */
 
 /* Space switcher, beside the brand. */
 .space-switch { background: @screen; border: 1px solid @edge; border-radius: 999px; padding: 2px; }
@@ -10,8 +11,9 @@
 .space-switch button:checked, .space-switch button:checked:hover { background: @ink; color: @wall; }
 .space-switch button:checked label { color: @wall; }
 
+/* The page: a column centred in at most 1200px of content (pages::fit), at DESIGN.md's inset. */
 .money-root, scrolledwindow.money-scroll, scrolledwindow.money-scroll > viewport { background: @wall; color: @ink; }
-.money-page { padding: 22px 32px 40px; }
+.money-page { padding: 20px 32px 40px; }
 
 /* Geist throughout, as in Dev; Geist Mono for figures and labels. */
 .money-title { font-size: 22px; font-weight: 600; color: @ink; letter-spacing: -0.02em; }
@@ -22,45 +24,22 @@
 .money-row-detail { font-size: 12px; color: @faint; font-feature-settings: "tnum"; }
 .money-amount { font-family: "Geist Mono", monospace; font-size: 13px; color: @ink; font-feature-settings: "tnum"; }
 .money-in { color: @live; }
-.money-over { color: #f0786f; }
+.money-over { color: @held_text; }
 .money-ahead { color: @waiting; }
 .money-quiet { color: @faint; }
-.money-day { font-size: 12px; font-weight: 600; color: @faint; margin-top: 6px; }
 .money-period { font-size: 14px; font-weight: 500; color: @ink; }
-.money-problem { color: #f0786f; font-size: 13px; }
+.money-problem { color: @held_text; font-size: 13px; }
 
 /* The Tally pages' own tabs, under the title. */
 .money-tabs { margin-bottom: 4px; }
+.money-controls { margin-top: 10px; }
 
-/* The hero: what is left this period. */
-.money-hero { background: @slab; border: 1px solid @edge; border-radius: 14px; padding: 22px 24px 20px; }
-.money-hero-over { border-color: alpha(#f0786f, 0.45); }
-.money-hero-ahead { border-color: alpha(@waiting, 0.35); }
-.money-hero-figure { font-size: 40px; font-weight: 600; color: @ink; font-feature-settings: "tnum"; letter-spacing: -0.03em; }
-.money-hero-line { font-size: 14px; color: @ink; margin-top: 8px; }
-.money-pace-line { font-size: 13px; color: @faint; }
-.money-tile { background: @slab; border: 1px solid @edge; border-radius: 14px; padding: 14px 16px; }
-.money-tile-figure { font-family: "Geist Mono", monospace; font-size: 18px; color: @ink; font-feature-settings: "tnum"; }
-.money-worth { padding: 14px 4px 0; }
-.money-worth-figure { font-family: "Geist Mono", monospace; font-size: 22px; color: @ink; font-feature-settings: "tnum"; }
-
-.money-section > box:first-child { min-height: 28px; }
-.money-open { margin: 0 2px; }
-.money-open > .money-line, .money-open > .money-budget, .money-open > box > .money-line { padding: 10px 0; }
-.money-open > .money-data-row { padding: 14px 0; }
-.money-budget { padding: 10px 0; }
-
-/* Rows: one card cut into rows, like Dev's lists. */
-.money-group { background: @slab; border: 1px solid @edge; border-radius: 14px; }
-.money-group > .money-row { border-top: 1px solid @line_subtle; }
-.money-group > .money-row:first-child { border-top: 0; border-top-left-radius: 14px; border-top-right-radius: 14px; }
-.money-group > .money-row:last-child { border-bottom-left-radius: 14px; border-bottom-right-radius: 14px; }
-.money-row:hover { background: @wash; }
+/* Row keys: a whole row that opens what it shows. */
 button.money-row-key { background: transparent; border: 0; box-shadow: none; padding: 10px 16px; min-height: 40px; border-radius: inherit; color: @ink; }
 button.money-row-key:hover { background: transparent; }
 button.money-row-key:focus-visible { outline: 2px solid alpha(@ink, 0.35); outline-offset: -2px; }
 button.money-row-delete { margin: 0 8px 0 0; color: @faint; border: 0; background: transparent; border-radius: 10px; }
-button.money-row-delete:hover { color: #f0786f; background: alpha(#f0786f, 0.12); }
+button.money-row-delete:hover { color: @held_text; background: alpha(@held_text, 0.12); }
 
 /* A category's glyph in its hue, on a 15% wash of it. */
 .money-badge { min-width: 34px; min-height: 34px; border-radius: 10px; }
@@ -80,9 +59,12 @@ button.money-row-delete:hover { color: #f0786f; background: alpha(#f0786f, 0.12)
 /* Actions: Dev's keys. The hero action is Dev's primary key. */
 button.money-text-action { background: transparent; border: 0; box-shadow: none; color: @secondary; font-size: 12px; font-weight: 500; padding: 2px 8px; min-height: 26px; }
 button.money-text-action:hover { background: @wash; color: @ink; border-radius: 8px; }
+/* Ask about this: the quietest key on a card, until it is wanted. */
+button.money-text-action.money-ask { color: @faint; }
+button.money-text-action.money-ask:hover, button.money-text-action.money-ask:focus-visible { color: @ink; }
 .money-root button.primary.money-hero-action, .money-sheet button.primary.money-hero-action { min-height: 36px; padding: 0 16px; }
 button.money-secondary, button.money-destructive { min-height: 34px; padding: 0 14px; }
-button.money-destructive { color: #f0786f; }
+button.money-destructive { color: @held_text; }
 button.money-destructive.confirm-armed { background: @held; border-color: @held; color: @wall; }
 button.money-chrome { border-radius: 10px; min-width: 32px; min-height: 32px; }
 
@@ -93,7 +75,7 @@ button.money-chrome { border-radius: 10px; min-width: 32px; min-height: 32px; }
 .money-root entry.money-field, .money-root spinbutton.money-field { font-feature-settings: "tnum"; }
 .money-suffix { font-family: "Geist Mono", monospace; font-size: 12px; color: @faint; }
 
-/* The entry sheet. */
+/* The entry, account, value and import sheets. */
 .money-sheet.app-panel { background: @console; border-left: 1px solid @edge; color: @ink; }
 .money-sheet .panel-heading { padding: 18px 22px 6px; }
 .money-sheet .section-title { font-size: 18px; font-weight: 600; color: @ink; }
@@ -107,16 +89,15 @@ button.money-chrome { border-radius: 10px; min-width: 32px; min-height: 32px; }
 .money-picker stack, .money-picker box { background: transparent; }
 .money-sheet checkbutton { color: @secondary; }
 .money-sheet-actions { margin-top: 12px; }
+.money-sheet .money-import-account { padding: 4px 0; }
 
 /* The Undo toast. */
 .money-toast { background: @slab; border: 1px solid @strong; color: @ink; border-radius: 12px; padding: 6px 8px 6px 16px; box-shadow: 0 6px 18px alpha(black, 0.45); font-size: 13px; }
 
 /* Empty state. */
-.money-empty { padding: 36px 0; }
+.money-empty { padding: 24px; }
 .money-empty-title { font-size: 20px; font-weight: 600; color: @ink; }
-
-.money-controls { margin-top: 10px; }
-.money-data-row { padding: 14px 0; }
+.money-empty button { min-height: 36px; }
 
 /* Cards, strips and rows (money_pages.rs): one card per subject, its rows inside it, a strip of
    figures at the top of each page. Rows carry their own inner padding, so nothing meets an edge. */
@@ -127,6 +108,7 @@ button.money-chrome { border-radius: 10px; min-width: 32px; min-height: 32px; }
 .tally-rows > .tally-row:first-child, .tally-rows > .tally-day + .tally-row, .tally-rows > .tally-th + .tally-row { border-top: 0; }
 .tally-rows > box.tally-entry { padding: 0; }
 .tally-entry > button.money-row-key { padding: 7px 8px 7px 16px; min-height: 34px; border-radius: 0; }
+.tally-entry > button.money-row-key.tally-line-key { padding-right: 16px; }
 .tally-entry:hover { background: @wash; }
 .tally-rows > .tally-entry:last-child { border-bottom-left-radius: 13px; border-bottom-right-radius: 13px; }
 .tally-entry button.money-row-delete { opacity: 0; margin-right: 10px; }
@@ -144,9 +126,13 @@ button.tally-save { margin: 8px 16px 4px; }
 .tally-soon .money-row-detail { color: @waiting; }
 .tally-tile { min-width: 28px; min-height: 28px; border-radius: 8px; background: @wash; color: @secondary; }
 .money-badge-small { min-width: 28px; min-height: 28px; border-radius: 8px; }
+.tally-rows > .tally-note { padding: 10px 16px 6px; border-top: 1px solid @line_subtle; }
+.tally-rows > .tally-bars { padding: 10px 16px 6px; }
 
 .tally-strip { background: @slab; border: 1px solid @edge; border-radius: 14px; padding: 16px 0; }
 .tally-cell { padding: 0 20px; }
+/* A narrow page stacks the strip's figures (pages::fit): each its own short row. */
+.tally-cells.narrow > .tally-cell { padding: 6px 20px; }
 .tally-rule { background: @line_subtle; min-width: 1px; margin: 2px 0; }
 .tally-cell-icon { color: @faint; }
 .tally-cell-caption { font-size: 12px; color: @faint; }
@@ -155,4 +141,6 @@ button.tally-save { margin: 8px 16px 4px; }
 .tally-pace { margin: 0 20px; padding-top: 14px; border-top: 1px solid @line_subtle; }
 .tally-figures { font-family: "Geist Mono", monospace; font-size: 11.5px; color: @secondary; font-feature-settings: "tnum"; }
 .tally-left { font-family: "Geist Mono", monospace; font-size: 11.5px; color: @faint; font-feature-settings: "tnum"; }
-.money-empty { padding: 24px; }
+
+/* Investments (money_invest.rs): a holding's symbol, in the tile's place. */
+.invest-symbol { min-width: 48px; min-height: 28px; border-radius: 8px; background: @wash; color: @secondary; font-family: "Geist Mono", monospace; font-size: 10.5px; font-weight: 600; }

@@ -14,6 +14,7 @@ import com.tally.core.AccountType
 import com.tally.core.CategoryKind
 import com.tally.core.Defaults
 import com.tally.core.Frequency
+import com.tally.core.Registration
 import com.tally.core.TxType
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.runTest
@@ -156,6 +157,21 @@ class LedgerRepositoryTest {
         val renamed = ledger.saveAccount(ledger.account(second)!!.copy(name = "Visa Infinite "))
         assertEquals(second, renamed)
         assertEquals("Visa Infinite", ledger.account(second)?.name)
+    }
+
+    /** The account editor rebuilds a row from its own fields, which do not include what an import set. */
+    @Test fun anEditorThatKnowsNothingOfInvestmentsLeavesThemAsTheyWere() = runTest {
+        val id = db.accounts().insert(
+            AccountEntity(name = "TFSA", type = AccountType.INVESTMENT, registration = Registration.TFSA, institution = "Wealthsimple", externalRef = "HQ7XFMC41CAD")
+        )
+
+        ledger.saveAccount(AccountEntity(id = id, name = " My TFSA ", type = AccountType.INVESTMENT))
+        val renamed = db.accounts().get(id)!!
+        assertEquals("My TFSA", renamed.name)
+        assertEquals(listOf(Registration.TFSA, "Wealthsimple", "HQ7XFMC41CAD"), listOf(renamed.registration, renamed.institution, renamed.externalRef))
+
+        ledger.saveAccount(AccountEntity(id = id, name = "Savings", type = AccountType.SAVINGS))
+        assertNull("Only an investment account has a registration", db.accounts().get(id)!!.registration)
     }
 
     @Test fun deleteAccountTakesItsEntriesWithIt() = runTest {

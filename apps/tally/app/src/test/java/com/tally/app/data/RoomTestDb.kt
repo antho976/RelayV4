@@ -8,6 +8,8 @@ import com.tally.app.data.db.CategoryEntity
 import com.tally.app.data.db.TallyDatabase
 import com.tally.app.data.db.TransactionEntity
 import com.tally.app.data.db.tally
+import com.tally.app.data.prefs.SettingsRepository
+import com.tally.app.data.repo.InvestRepository
 import com.tally.app.data.repo.LedgerRepository
 import com.tally.app.data.repo.PlanRepository
 import com.tally.app.data.repo.RecurringPoster
@@ -45,6 +47,9 @@ fun TallyDatabase.planRepository(clock: Clock): PlanRepository =
 
 fun TallyDatabase.recurringPoster(clock: Clock): RecurringPoster =
     RecurringPoster(this, recurring(), transactions(), clock)
+
+fun TallyDatabase.investRepository(clock: Clock, settings: SettingsRepository): InvestRepository =
+    InvestRepository(this, settings, clock)
 
 // ── Row builders: one line per fact a test sets up ───────────────────────────────────────────
 

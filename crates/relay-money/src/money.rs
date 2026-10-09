@@ -92,7 +92,7 @@ pub fn parse_amount(text: &str, fraction_digits: u32) -> Option<i64> {
 }
 
 /// `n / d` rounded half-even. `d` is positive.
-fn div_half_even(n: i128, d: i128) -> i128 {
+pub(crate) fn div_half_even(n: i128, d: i128) -> i128 {
     let q = n / d;
     let r = n % d;
     let twice = 2 * r.abs();

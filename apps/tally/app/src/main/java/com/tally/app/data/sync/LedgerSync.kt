@@ -3,20 +3,29 @@ package com.tally.app.data.sync
 import androidx.room.withTransaction
 import com.tally.app.data.db.AccountEntity
 import com.tally.app.data.db.AccountValueEntity
+import com.tally.app.data.db.ActivityEntity
 import com.tally.app.data.db.BudgetEntity
 import com.tally.app.data.db.CategoryEntity
 import com.tally.app.data.db.ContributionEntity
+import com.tally.app.data.db.FxRateEntity
 import com.tally.app.data.db.GoalEntity
+import com.tally.app.data.db.HoldingEntity
 import com.tally.app.data.db.IdUid
+import com.tally.app.data.db.PriceEntity
 import com.tally.app.data.db.RecurringEntity
+import com.tally.app.data.db.RoomFactEntity
+import com.tally.app.data.db.SecurityEntity
 import com.tally.app.data.db.SyncDao
 import com.tally.app.data.db.TallyDatabase
 import com.tally.app.data.db.TombstoneEntity
 import com.tally.app.data.db.TransactionEntity
 import com.tally.core.AccountType
+import com.tally.core.ActivityType
 import com.tally.core.CategoryKind
 import com.tally.core.Frequency
 import com.tally.core.GoalKind
+import com.tally.core.Registration
+import com.tally.core.SecurityKind
 import com.tally.core.TxType
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
@@ -78,10 +87,29 @@ object SyncTables {
     const val BUDGETS = "budgets"
     const val CONTRIBUTIONS = "contributions"
     const val VALUES = "account_values"
+    const val SECURITIES = "securities"
+    const val HOLDINGS = "holdings"
+    const val ACTIVITIES = "activities"
+    const val PRICES = "prices"
+    const val FX_RATES = "fx_rates"
+    const val ROOM_FACTS = "room_facts"
 
-    val ORDER = listOf(SETTINGS, ACCOUNTS, CATEGORIES, RECURRING, GOALS, TRANSACTIONS, BUDGETS, CONTRIBUTIONS, VALUES)
+    val ORDER = listOf(
+        SETTINGS, ACCOUNTS, CATEGORIES, RECURRING, GOALS, TRANSACTIONS, BUDGETS, CONTRIBUTIONS, VALUES,
+        SECURITIES, HOLDINGS, ACTIVITIES, PRICES, FX_RATES, ROOM_FACTS,
+    )
 
     fun order(table: String): Int = ORDER.indexOf(table).let { if (it < 0) Int.MAX_VALUE else it }
+
+    /**
+     * The prefixes of uids both devices derive the same way: a posted bill's, and what an import
+     * writes (docs/INVESTMENTS.md). Such a row is written only when its uid is neither present nor
+     * deleted, so a deleted one's tombstone is kept for good (SyncDao.pruneTombstones lists the
+     * same prefixes in SQL).
+     */
+    val DERIVED = listOf("bill:", "imp:", "sec:", "hold:", "px:", "fx:", "room:", "val:", "ws:")
+
+    fun isDerived(uid: String): Boolean = DERIVED.any { uid.startsWith(it) }
 
     /** The Room table a wire table is kept in; only contributions are named differently. */
     fun room(table: String): String = if (table == CONTRIBUTIONS) "goal_contributions" else table
@@ -113,6 +141,7 @@ class LedgerSync @Inject constructor(private val db: TallyDatabase) {
         val categories = dao.categoryUids().byId()
         val bills = dao.recurringUids().byId()
         val goals = dao.goalUids().byId()
+        val securities = dao.securityUids().byId()
         val out = ArrayList<Change>()
         dao.accountsSince(from).forEach { out += it.change() }
         dao.categoriesSince(from).forEach { out += it.change() }
@@ -122,6 +151,12 @@ class LedgerSync @Inject constructor(private val db: TallyDatabase) {
         dao.budgetsSince(from).forEach { b -> b.change(categories)?.let { out += it } }
         dao.contributionsSince(from).forEach { c -> c.change(goals)?.let { out += it } }
         dao.valuesSince(from).forEach { v -> v.change(accounts)?.let { out += it } }
+        dao.securitiesSince(from).forEach { out += it.change() }
+        dao.holdingsSince(from).forEach { h -> h.change(accounts, securities)?.let { out += it } }
+        dao.activitiesSince(from).forEach { a -> a.change(accounts, securities)?.let { out += it } }
+        dao.pricesSince(from).forEach { p -> p.change(securities)?.let { out += it } }
+        dao.fxRatesSince(from).forEach { out += it.change() }
+        dao.roomFactsSince(from).forEach { out += it.change() }
         if (since != null) dao.tombstonesSince(since).forEach { out += it.change() }
         out.sortedBy { SyncTables.order(it.table) }
     }
@@ -141,6 +176,12 @@ class LedgerSync @Inject constructor(private val db: TallyDatabase) {
                 SyncTables.BUDGETS -> applyBudget(c)
                 SyncTables.CONTRIBUTIONS -> applyContribution(c)
                 SyncTables.VALUES -> applyValue(c)
+                SyncTables.SECURITIES -> applySecurity(c)
+                SyncTables.HOLDINGS -> applyHolding(c)
+                SyncTables.ACTIVITIES -> applyActivity(c)
+                SyncTables.PRICES -> applyPrice(c)
+                SyncTables.FX_RATES -> applyFxRate(c)
+                SyncTables.ROOM_FACTS -> applyRoomFact(c)
                 else -> continue
             }
             if (took) applied++ else skipped++
@@ -161,9 +202,10 @@ class LedgerSync @Inject constructor(private val db: TallyDatabase) {
         dao.endApplying()
         val applied = apply(changes.filter { !it.deleted })
         dao.clearTombstones()
-        // A posted bill deleted on the PC stays deleted here: the poster skips its date.
-        changes.filter { it.deleted && it.table == SyncTables.TRANSACTIONS && it.uid.startsWith("bill:") }
-            .forEach { dao.insertTombstone(TombstoneEntity("transactions", it.uid, it.updatedAt)) }
+        // A derived row deleted on the PC stays deleted here: the poster skips a deleted bill's
+        // date, and an import a deleted line.
+        changes.filter { it.deleted && SyncTables.isDerived(it.uid) }
+            .forEach { dao.insertTombstone(TombstoneEntity(SyncTables.room(it.table), it.uid, it.updatedAt)) }
         applied
     }
 
@@ -214,6 +256,7 @@ class LedgerSync @Inject constructor(private val db: TallyDatabase) {
 
     private suspend fun accountId(uid: String?): Long? = uid?.let { dao.account(it)?.id }
     private suspend fun categoryId(uid: String?): Long? = uid?.let { dao.category(it)?.id }
+    private suspend fun securityId(uid: String?): Long? = uid?.let { dao.security(it)?.id }
 
     private suspend fun applyAccount(c: Change): Boolean = merge(
         "accounts", c, dao.account(c.uid), { it.updatedAt }, { it.id }, { it.uid },
@@ -226,6 +269,10 @@ class LedgerSync @Inject constructor(private val db: TallyDatabase) {
                 openingBalance = r.long("openingBalance") ?: 0L,
                 archived = r.bool("archived") ?: false,
                 sortOrder = r.int("sortOrder") ?: 0,
+                // A device from before investments leaves these out: none, and empty.
+                registration = r.enum<Registration>("registration"),
+                institution = r.str("institution") ?: "",
+                externalRef = r.str("externalRef") ?: "",
                 uid = c.uid,
                 updatedAt = c.updatedAt,
             )
@@ -416,6 +463,137 @@ class LedgerSync @Inject constructor(private val db: TallyDatabase) {
         update = { dao.updateValue(it) },
         delete = { dao.deleteValue(it) },
     )
+
+    // ── Investments (docs/INVESTMENTS.md) ────────────────────────────────────
+
+    private suspend fun applySecurity(c: Change): Boolean = merge(
+        "securities", c, dao.security(c.uid), { it.updatedAt }, { it.id }, { it.uid },
+        build = { id ->
+            val r = c.row
+            SecurityEntity(
+                id = id,
+                symbol = r.str("symbol") ?: return@merge null,
+                name = r.str("name") ?: "",
+                currency = r.str("currency") ?: return@merge null,
+                // A kind a newer PC knows and this phone does not still holds its place.
+                kind = r.enum<SecurityKind>("kind") ?: SecurityKind.OTHER,
+                exchange = r.str("exchange") ?: "",
+                uid = c.uid,
+                updatedAt = c.updatedAt,
+            )
+        },
+        insert = { dao.insertSecurity(it) },
+        update = { dao.updateSecurity(it) },
+        delete = { dao.deleteSecurity(it) },
+    )
+
+    private suspend fun applyHolding(c: Change): Boolean = merge(
+        "holdings", c, dao.holding(c.uid), { it.updatedAt }, { it.id }, { it.uid },
+        build = { id ->
+            val r = c.row
+            HoldingEntity(
+                id = id,
+                accountId = accountId(r.str("account")) ?: return@merge null,
+                securityId = securityId(r.str("security")) ?: return@merge null,
+                date = r.date("date") ?: return@merge null,
+                quantity = r.long("quantity") ?: return@merge null,
+                book = r.long("book") ?: return@merge null,
+                bookMarket = r.long("bookMarket") ?: return@merge null,
+                uid = c.uid,
+                updatedAt = c.updatedAt,
+            )
+        },
+        insert = { dao.insertHolding(it) },
+        update = { dao.updateHolding(it) },
+        delete = { dao.deleteHolding(it) },
+    )
+
+    private suspend fun applyActivity(c: Change): Boolean = merge(
+        "activities", c, dao.activity(c.uid), { it.updatedAt }, { it.id }, { it.uid },
+        build = { id ->
+            val r = c.row
+            // No security is fine (a deposit); one this phone does not have is not.
+            val security = r.str("security")?.let { securityId(it) ?: return@merge null }
+            ActivityEntity(
+                id = id,
+                accountId = accountId(r.str("account")) ?: return@merge null,
+                securityId = security,
+                type = r.enum<ActivityType>("type") ?: return@merge null,
+                date = r.date("date") ?: return@merge null,
+                quantity = r.long("quantity") ?: 0L,
+                amount = r.long("amount") ?: return@merge null,
+                fee = r.long("fee") ?: 0L,
+                currency = r.str("currency") ?: return@merge null,
+                toAmount = r.long("toAmount"),
+                toCurrency = r.str("toCurrency"),
+                note = r.str("note") ?: "",
+                source = r.str("source") ?: "MANUAL",
+                createdAt = r.long("createdAt") ?: 0L,
+                uid = c.uid,
+                updatedAt = c.updatedAt,
+            )
+        },
+        insert = { dao.insertActivity(it) },
+        update = { dao.updateActivity(it) },
+        delete = { dao.deleteActivity(it) },
+    )
+
+    private suspend fun applyPrice(c: Change): Boolean = merge(
+        "prices", c, dao.price(c.uid), { it.updatedAt }, { it.id }, { it.uid },
+        build = { id ->
+            val r = c.row
+            PriceEntity(
+                id = id,
+                securityId = securityId(r.str("security")) ?: return@merge null,
+                date = r.date("date") ?: return@merge null,
+                price = r.long("price") ?: return@merge null,
+                source = r.str("source") ?: "MANUAL",
+                uid = c.uid,
+                updatedAt = c.updatedAt,
+            )
+        },
+        insert = { dao.insertPrice(it) },
+        update = { dao.updatePrice(it) },
+        delete = { dao.deletePrice(it) },
+    )
+
+    private suspend fun applyFxRate(c: Change): Boolean = merge(
+        "fx_rates", c, dao.fxRate(c.uid), { it.updatedAt }, { it.id }, { it.uid },
+        build = { id ->
+            val r = c.row
+            FxRateEntity(
+                id = id,
+                base = r.str("base") ?: return@merge null,
+                quote = r.str("quote") ?: return@merge null,
+                date = r.date("date") ?: return@merge null,
+                rate = r.long("rate") ?: return@merge null,
+                source = r.str("source") ?: "MANUAL",
+                uid = c.uid,
+                updatedAt = c.updatedAt,
+            )
+        },
+        insert = { dao.insertFxRate(it) },
+        update = { dao.updateFxRate(it) },
+        delete = { dao.deleteFxRate(it) },
+    )
+
+    private suspend fun applyRoomFact(c: Change): Boolean = merge(
+        "room_facts", c, dao.roomFact(c.uid), { it.updatedAt }, { it.id }, { it.uid },
+        build = { id ->
+            val r = c.row
+            RoomFactEntity(
+                id = id,
+                registration = r.enum<Registration>("registration") ?: return@merge null,
+                year = r.int("year") ?: return@merge null,
+                amount = r.long("amount") ?: return@merge null,
+                uid = c.uid,
+                updatedAt = c.updatedAt,
+            )
+        },
+        insert = { dao.insertRoomFact(it) },
+        update = { dao.updateRoomFact(it) },
+        delete = { dao.deleteRoomFact(it) },
+    )
 }
 
 // ── Rows as the wire carries them ────────────────────────────────────────────
@@ -449,6 +627,9 @@ private fun AccountEntity.change() = change(SyncTables.ACCOUNTS, uid, updatedAt,
     put("openingBalance", openingBalance)
     put("archived", archived)
     put("sortOrder", sortOrder)
+    put("registration", registration?.name)
+    put("institution", institution)
+    put("externalRef", externalRef)
 })
 
 private fun CategoryEntity.change() = change(SyncTables.CATEGORIES, uid, updatedAt, buildJsonObject {
@@ -535,6 +716,71 @@ private fun AccountValueEntity.change(accounts: Map<Long, String>): Change? {
         put("value", value)
     })
 }
+
+private fun SecurityEntity.change() = change(SyncTables.SECURITIES, uid, updatedAt, buildJsonObject {
+    put("symbol", symbol)
+    put("name", name)
+    put("currency", currency)
+    put("kind", kind.name)
+    put("exchange", exchange)
+})
+
+private fun HoldingEntity.change(accounts: Map<Long, String>, securities: Map<Long, String>): Change? {
+    val account = accounts[accountId] ?: return null
+    val security = securities[securityId] ?: return null
+    return change(SyncTables.HOLDINGS, uid, updatedAt, buildJsonObject {
+        put("account", account)
+        put("security", security)
+        put("date", date.toString())
+        put("quantity", quantity)
+        put("book", book)
+        put("bookMarket", bookMarket)
+    })
+}
+
+private fun ActivityEntity.change(accounts: Map<Long, String>, securities: Map<Long, String>): Change? {
+    val account = accounts[accountId] ?: return null
+    val security = securityId?.let { securities[it] ?: return null }
+    return change(SyncTables.ACTIVITIES, uid, updatedAt, buildJsonObject {
+        put("account", account)
+        put("security", security)
+        put("type", type.name)
+        put("date", date.toString())
+        put("quantity", quantity)
+        put("amount", amount)
+        put("fee", fee)
+        put("currency", currency)
+        put("toAmount", toAmount)
+        put("toCurrency", toCurrency)
+        put("note", note)
+        put("source", source)
+        put("createdAt", createdAt)
+    })
+}
+
+private fun PriceEntity.change(securities: Map<Long, String>): Change? {
+    val security = securities[securityId] ?: return null
+    return change(SyncTables.PRICES, uid, updatedAt, buildJsonObject {
+        put("security", security)
+        put("date", date.toString())
+        put("price", price)
+        put("source", source)
+    })
+}
+
+private fun FxRateEntity.change() = change(SyncTables.FX_RATES, uid, updatedAt, buildJsonObject {
+    put("base", base)
+    put("quote", quote)
+    put("date", date.toString())
+    put("rate", rate)
+    put("source", source)
+})
+
+private fun RoomFactEntity.change() = change(SyncTables.ROOM_FACTS, uid, updatedAt, buildJsonObject {
+    put("registration", registration.name)
+    put("year", year)
+    put("amount", amount)
+})
 
 /** A budget's tombstone names its category, which is how the PC finds it; the rest carry none. */
 private fun TombstoneEntity.change(): Change {

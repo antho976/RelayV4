@@ -134,6 +134,14 @@ fn a_message_gets_an_answer_and_a_cold_thread_resumes_by_its_id() {
     assert!(cleared["model"].is_null() && cleared["effort"].is_null());
     let ops = runs[1].split_whitespace().next().unwrap();
     assert!(ops.starts_with("OPS=") && ops.contains("money.tx.add") && !ops.contains("money.reset"), "{ops}");
+    let ops: Vec<&str> = ops.trim_start_matches("OPS=").split(',').collect();
+    for op in ["money.invest.summary", "money.invest.list", "money.invest.add"] {
+        assert!(ops.contains(&op), "{op} in {ops:?}");
+    }
+    for op in ["money.invest.import", "money.invest.preview", "money.invest.delete", "money.fx.fetch", "money.fx.set", "money.invest.room"] {
+        assert!(!ops.contains(&op), "{op} in {ops:?}");
+    }
+    assert!(runs[1].contains("my.wealthsimple.com") && runs[1].contains("```import"), "the prompt carries the Wealthsimple guide");
     ok(&engine, "thread.delete", json!({"id": created["id"]}));
 }
 

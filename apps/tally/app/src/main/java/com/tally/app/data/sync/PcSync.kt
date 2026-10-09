@@ -129,7 +129,9 @@ class PcSync @Inject constructor(
     /**
      * One exchange on an admitted connection: send, receive, merge, remember where it stands.
      * The watermark is taken before anything is read, so an edit made while the sync runs is
-     * sent next time rather than lost.
+     * sent next time rather than lost. The first sync after an update that reads new tables asks
+     * from cursor 0: the PC numbered their rows before this phone could take them, and it is the
+     * merge, newest stamp winning, that leaves every other row as it is.
      */
     private suspend fun exchange(session: RelaySession, prefs: SyncPrefs): SyncOutcome {
         val started = System.currentTimeMillis()
@@ -137,7 +139,7 @@ class PcSync @Inject constructor(
             val replace = !prefs.replaced
             val since = if (replace) null else prefs.watermark
             val local = settingsChanges(since) + ledger.collect(since)
-            var cursor = if (replace) 0L else prefs.cursor
+            var cursor = if (replace || prefs.catchingUp) 0L else prefs.cursor
             // The first sync makes a new generation on the PC; every later one names the last.
             var generation = if (replace) null else prefs.generation
             val received = ArrayList<Change>()

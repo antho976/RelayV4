@@ -2,7 +2,8 @@
 
 Relay gains a second, casual space beside the dev workspace. Money management comes first: Tally,
 the budget and spending tracker, moves into this repository and the PC gets the same ledger.
-Investing and AI-planned trades come later and are not designed here.
+Investments (holdings, their value and registered room) are designed in `docs/INVESTMENTS.md`;
+AI-planned trades come later and are not designed anywhere yet.
 
 Decided with Antho on 2026-10-07:
 
@@ -79,6 +80,8 @@ The first sync makes the PC's ledger the phone's; after that both sides merge.
   from the bill and the date, so the two copies are the same row and merge.
 - **Bank imports.** An imported line's id is derived from the statement line, so importing the
   same CSV on both devices adds it once.
+- **Investment imports.** A Wealthsimple file's lines, snapshot, prices and values take uids derived
+  from what they are (`docs/INVESTMENTS.md`), so the same file imported on both devices adds it once.
 
 ## The ledger on the PC
 
@@ -177,7 +180,8 @@ Change = { table, uid, updated_at, deleted, row }
 - The PC changes the currency only when the decimals stay the same (CAD to USD); Tally converts
   every amount when they differ (CAD to JPY), so that change is made on the phone.
 - `table` is one of `settings`, `accounts`, `categories`, `recurring`, `goals`, `transactions`,
-  `budgets`, `contributions`, `account_values`, applied in that order. `settings` rows have
+  `budgets`, `contributions`, `account_values`, `securities`, `holdings`, `activities`, `prices`,
+  `fx_rates`, `room_facts`, applied in that order. `settings` rows have
   the setting's name as uid (`currency`, `month_start_day`, `week_starts_monday`) and
   `row: { value }`, a string as the PC stores it (`"CAD"`, `"15"`, `"1"`/`"0"`). On the phone
   they live in DataStore, each with the time it last changed.
@@ -186,7 +190,7 @@ Row fields, camelCase as Tally's backup writes them:
 
 | table | row |
 |---|---|
-| accounts | `name, type, openingBalance, archived, sortOrder` |
+| accounts | `name, type, openingBalance, archived, sortOrder, registration, institution, externalRef` (the last three read as null, "" and "" when an older device leaves them out) |
 | categories | `name, kind, color, icon, archived, sortOrder` |
 | recurring | `name, type, amount, account, toAccount, category, frequency, interval, anchorDate, nextDate, endDate, autoPost, active` |
 | goals | `name, target, targetDate, color, archived, kind, account, percent, startDate, startAmount` |
@@ -194,3 +198,20 @@ Row fields, camelCase as Tally's backup writes them:
 | budgets | `category, amount` |
 | contributions | `goal, amount, date, note` |
 | account_values | `account, date, value` |
+| securities | `symbol, name, currency, kind, exchange` |
+| holdings | `account, security, date, quantity, book, bookMarket` |
+| activities | `account, security, type, date, quantity, amount, fee, currency, toAmount, toCurrency, note, source, createdAt` |
+| prices | `security, date, price, source` |
+| fx_rates | `base, quote, date, rate, source` |
+| room_facts | `registration, year, amount` |
+
+## Investments
+
+Holdings, activities, prices, FX rates and the CRA's room figures live in the six tables above,
+with the rules for reading them (positions, value, gains, returns, room) and the Wealthsimple
+import in `docs/INVESTMENTS.md`: `relay_money::invest` and `relay_money::wealthsimple` on the PC,
+`Invest.kt` and `Wealthsimple.kt` on the phone, held to the same shared tests. Positions and totals
+are derived, never stored or synced. The ledger's writes are in `crates/relay-money/src/portfolio.rs`.
+Rows an import or a write derives a uid for (`sec:`, `hold:`, `imp:`, `px:`, `fx:`, `room:`,
+`val:`, `ws:`) are the same rows on both devices, so a file imported on each merges on sync; an
+imported line is added only when its uid is neither present nor deleted, as a posted bill is.

@@ -2,8 +2,9 @@
 //!
 //! No bank offers an open API to an offline app, so the CSV the owner downloads is the bridge:
 //! Desjardins AccèsD (with French or English headers, or its header-less positional layout),
-//! Wealthsimple's monthly statements, and any other bank that writes a date and an amount (or
-//! money out and money in) per line.
+//! Wealthsimple's cash statements, and any other bank that writes a date and an amount (or money
+//! out and money in) per line. Wealthsimple's investment files are handed to
+//! [`crate::wealthsimple`] instead.
 //!
 //! The Kotlin's patterns are Java regexes, where `\d`, `\s` and `.` are narrower than Rust's
 //! defaults; the patterns here spell out the Java classes (`[0-9]`, `[ \t\n\x0B\f\r]`, and `.`
@@ -91,6 +92,10 @@ pub enum StatementRead {
     Ok(Statement),
     /// A file in Tally's own export layout: it names its accounts and types, so the plain CSV import reads it.
     TallyCsv,
+    /// One of Wealthsimple's investment files (a holdings report, an activities export, or a monthly
+    /// statement with buys, sells or dividends): money put to work is not income or spending, so the
+    /// investment import ([`crate::wealthsimple::read`]) reads it.
+    Investments,
     /// The reason is shown as-is, so it names the problem and not the parser.
     Invalid(String),
 }
@@ -102,6 +107,9 @@ pub fn read(text: &str, fraction_digits: u32, day_first: bool) -> StatementRead 
     let body = text.strip_prefix(BOM).unwrap_or(text);
     if kt_is_blank(body) {
         return StatementRead::Invalid("The file is empty.".into());
+    }
+    if crate::wealthsimple::read(body).is_ok() {
+        return StatementRead::Investments;
     }
     let records: Vec<Vec<String>> = parse_records(body, delimiter_of(body))
         .into_iter()
@@ -625,6 +633,16 @@ mod tests {
         assert_eq!(Some("SPEND"), s.rows[0].code.as_deref());
         assert_eq!("Metro", s.rows[0].description);
         assert_eq!(85, s.rows[1].amount);
+    }
+
+    #[test]
+    fn a_wealthsimple_investment_statement_goes_to_the_investment_import() {
+        let text = "date,transaction,description,amount,balance,currency\n".to_string()
+            + "2026-01-02,CONT,Contribution,500.00,500.00,CAD\n"
+            + "2026-01-05,BUY,\"XEQT - iShares Core Equity ETF Portfolio: Bought 10.0000 shares at $38.12 per share\",-381.20,118.80,CAD\n";
+        assert_eq!(StatementRead::Investments, read(&text, 2, true));
+        let cash = "date,transaction,description,amount,balance,currency\n2026-09-01,SPEND,Metro,-42.10,500.00,CAD\n";
+        assert_eq!(StatementFormat::Wealthsimple, ok(cash, true).format, "a cash statement is still the bank import's");
     }
 
     // ── Other banks ──────────────────────────────────────────────────────────

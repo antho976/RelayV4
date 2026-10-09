@@ -1,8 +1,10 @@
 //! Charts in a thread: what an agent's ```` ```chart ```` block draws (docs/THREADS.md).
 //!
 //! A chart keeps its question (a `money.series` payload), never its numbers: it reads them when it
-//! is drawn and again whenever the ledger moves (`refresh_all`, on `money.changed`). Bars and lines
-//! are drawn with cairo; their axis and labels are plain labels around the drawing, in Dev's type.
+//! is drawn and again whenever the ledger moves (`refresh_all`, on `money.changed`). One scrolled
+//! out of view waits until it comes back (`load_stale`), so a long thread does not re-read every
+//! chart it ever drew. Bars and lines are drawn with cairo; their axis and labels are plain labels
+//! around the drawing, in Dev's type.
 //! Colour is the data's: the newest period in Relay's signal, the ones before it in a fixed
 //! palette, and categories in their own hue.
 use super::pages::HUES;
@@ -12,8 +14,9 @@ use gtk4 as gtk;
 use relay_client::thread_view::{ticks, ChartKind, ChartSpec};
 use relay_money::money::{Locale, MoneyFormatter};
 use serde_json::{json, Value};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::f64::consts::{FRAC_PI_2, PI};
+use std::rc::Rc;
 
 /// Series colours, the newest first: Relay's lime, then blue, orange, violet, teal, gold.
 const PALETTE: [&str; 6] = ["#C6F24E", "#6A9FD8", "#E08A5F", "#C27BC0", "#4FA9A0", "#D9A441"];
@@ -23,8 +26,9 @@ const PAD_B: f64 = 8.0;
 /// Room on the left for the axis labels.
 const AXIS_W: i32 = 56;
 
-/// A chart drawn from a question: its body, its legend and the question.
-type Live = (glib::WeakRef<gtk::Box>, glib::WeakRef<gtk::Box>, ChartSpec);
+/// A chart drawn from a question: its body, its legend, the question, and whether the ledger moved
+/// while it was out of view.
+type Live = (glib::WeakRef<gtk::Box>, glib::WeakRef<gtk::Box>, ChartSpec, Rc<Cell<bool>>);
 
 thread_local! {
     /// Charts drawn from a question, to read again when the ledger moves.
@@ -85,7 +89,7 @@ pub fn card(spec: ChartSpec) -> gtk::Box {
         lamp.set_valign(gtk::Align::Center);
         foot.append(&lamp);
         foot.append(&label("Live from Tally, redraws when the ledger changes", "threads-chart-note"));
-        LIVE.with(|l| l.borrow_mut().push((body.downgrade(), legend.downgrade(), spec.clone())));
+        LIVE.with(|l| l.borrow_mut().push((body.downgrade(), legend.downgrade(), spec.clone(), Rc::default())));
     } else {
         foot.append(&label("Numbers as written in the reply", "threads-chart-note"));
     }
@@ -94,15 +98,53 @@ pub fn card(spec: ChartSpec) -> gtk::Box {
     card
 }
 
-/// Read every live chart still on screen again.
+/// The ledger moved: read again every live chart in view, and mark the rest to read when they
+/// come back into view.
 pub fn refresh_all() {
+    let viewport = super::threads::chart_viewport();
     let live: Vec<_> = LIVE.with(|l| {
         let mut l = l.borrow_mut();
-        l.retain(|(body, _, _)| body.upgrade().is_some());
-        l.iter().filter_map(|(b, g, s)| Some((b.upgrade()?, g.upgrade()?, s.clone()))).collect()
+        l.retain(|(body, _, _, _)| body.upgrade().is_some());
+        l.iter().filter_map(|(b, g, s, stale)| Some((b.upgrade()?, g.upgrade()?, s.clone(), stale.clone()))).collect()
     });
-    for (body, legend, spec) in live {
-        load(&body, &legend, &spec);
+    for (body, legend, spec, stale) in live {
+        if in_view(&body, viewport.as_ref()) {
+            stale.set(false);
+            load(&body, &legend, &spec);
+        } else {
+            stale.set(true);
+        }
+    }
+}
+
+/// Read the charts the ledger moved under while they were out of view, now that they show.
+pub fn load_stale() {
+    let viewport = super::threads::chart_viewport();
+    let stale: Vec<_> = LIVE.with(|l| {
+        l.borrow()
+            .iter()
+            .filter(|(_, _, _, stale)| stale.get())
+            .filter_map(|(b, g, s, stale)| Some((b.upgrade()?, g.upgrade()?, s.clone(), stale.clone())))
+            .collect()
+    });
+    for (body, legend, spec, flag) in stale {
+        if in_view(&body, viewport.as_ref()) {
+            flag.set(false);
+            load(&body, &legend, &spec);
+        }
+    }
+}
+
+/// Whether `body` shows in `viewport` (the conversation's scroller); without one, whether it is
+/// mapped at all.
+fn in_view(body: &gtk::Box, viewport: Option<&gtk::Widget>) -> bool {
+    if !body.is_mapped() {
+        return false;
+    }
+    let Some(viewport) = viewport else { return true };
+    match body.compute_bounds(viewport) {
+        Some(rect) => rect.y() + rect.height() >= 0.0 && rect.y() <= viewport.height() as f32,
+        None => true,
     }
 }
 

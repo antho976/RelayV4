@@ -17,6 +17,8 @@ use std::rc::Rc;
 
 #[path = "money_entry.rs"]
 mod entry;
+#[path = "money_invest.rs"]
+pub(crate) mod invest;
 #[path = "money_pages.rs"]
 mod pages;
 #[path = "threads_view.rs"]
@@ -25,10 +27,11 @@ pub(crate) mod threads;
 mod chart;
 
 /// Tally's pages, in tab order: (stack name, caption, glyph).
-pub const PAGES: [(&str, &str, &str); 4] = [
+pub const PAGES: [(&str, &str, &str); 5] = [
     ("money-home", "Overview", "home"),
     ("money-transactions", "Entries", "list"),
     ("money-plan", "Plan", "plan"),
+    ("money-invest", "Investments", "chart"),
     ("money-data", "Data", "data"),
 ];
 
@@ -60,6 +63,8 @@ struct State {
     start: RefCell<Option<gtk::Widget>>,
     period_offset: Cell<i64>,
     query: RefCell<String>,
+    /// Entries' account and category filters.
+    filters: Cell<(Option<i64>, Option<i64>)>,
     currency: RefCell<String>,
 }
 
@@ -104,6 +109,13 @@ pub(crate) fn query() -> String {
 pub(crate) fn set_query(query: &str) {
     STATE.with(|s| *s.query.borrow_mut() = query.to_string());
 }
+/// Entries' filters: (account id, category id), `None` for all.
+pub(crate) fn filters() -> (Option<i64>, Option<i64>) {
+    STATE.with(|s| s.filters.get())
+}
+pub(crate) fn set_filters(account: Option<i64>, category: Option<i64>) {
+    STATE.with(|s| s.filters.set((account, category)));
+}
 
 /// The title bar's Dev | Threads pill. Wired by [`install`].
 pub fn switcher() -> gtk::Box {
@@ -136,7 +148,7 @@ pub fn add_key() -> gtk::Button {
     row.append(&label("Entry", ""));
     key.set_child(Some(&row));
     key.set_valign(gtk::Align::Center);
-    key.set_tooltip_text(Some("Add an entry · Ctrl N"));
+    key.set_tooltip_text(Some("Add an entry"));
     key.set_visible(false);
     STATE.with(|s| s.money_only.borrow_mut().push(key.clone().upcast()));
     key
@@ -168,10 +180,31 @@ pub fn add_pages(content: &gtk::Stack) {
         column.append(&body);
         let scroll = crate::app::scrolled(&column);
         scroll.add_css_class("money-scroll");
-        scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        // External: the column's minimum width never reaches the window, so the window can
+        // shrink; the column follows the width instead (`pages::fit`).
+        scroll.set_policy(gtk::PolicyType::External, gtk::PolicyType::Automatic);
+        // The probe measures the page outside the scroller, where its content cannot widen it.
+        let probe = gtk::DrawingArea::new();
+        probe.set_hexpand(true);
+        probe.set_can_target(false);
+        probe.set_focusable(false);
+        probe.set_accessible_role(gtk::AccessibleRole::Presentation);
+        let fitted = column.downgrade();
+        probe.connect_resize(move |_, width, _| {
+            let fitted = fitted.clone();
+            // Never resize inside an allocation: the next idle applies it.
+            glib::idle_add_local_once(move || {
+                if let Some(column) = fitted.upgrade() {
+                    pages::fit(&column, width);
+                }
+            });
+        });
+        let frame = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        frame.append(&probe);
+        frame.append(&scroll);
         let root = gtk::Overlay::new();
         root.add_css_class("money-root");
-        root.set_child(Some(&scroll));
+        root.set_child(Some(&frame));
         let toast = gtk::Revealer::new();
         toast.set_transition_type(gtk::RevealerTransitionType::SlideUp);
         toast.set_transition_duration(160);
@@ -403,6 +436,16 @@ pub fn add_entry(ui: &Rc<Ui>) {
 
 pub(crate) fn add_account(ui: &Rc<Ui>) {
     entry::account(ui);
+}
+
+/// The add account sheet with Investment chosen, its registration and institution showing.
+pub(crate) fn add_investment_account(ui: &Rc<Ui>) {
+    entry::account_of(ui, Some("INVESTMENT"));
+}
+
+/// The record a value sheet for an investment account (`money.value.set`).
+pub(crate) fn record_value(ui: &Rc<Ui>, account: &Value) {
+    entry::value(ui, account);
 }
 
 pub(crate) fn edit_entry(ui: &Rc<Ui>, tx: Value) {

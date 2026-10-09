@@ -2,8 +2,8 @@
 
 Threads replace the Money space. A thread is a conversation with an agent that works on the data
 of Antho's own apps, shown and editable beside it: agent first, data second. Tally's budget is the
-first source; investment tracking in Tally comes next; the gym app and an AI investing bot are
-later and not designed here.
+first source and its investments the second; the gym app and an AI investing bot are later and not
+designed here.
 
 Decided with Antho on 2026-10-07:
 
@@ -32,8 +32,10 @@ The mockup: https://claude.ai/artifact/GPtaPk6YYLiFCHGpeNPMk4
    still to do.)
 4. **Asking first:** a confirm card for what the agent may not do alone (delete, budgets,
    accounts), run as the person when they approve.
-5. **Investments in Tally:** holdings and their value tracked in the ledger, on the phone and the
-   PC in the same commit (`CLAUDE.md`: a money rule changes on both sides at once).
+5. **Investments in Tally** (built in the PC's engine and for the agent; `docs/INVESTMENTS.md` is
+   the contract): holdings and their value tracked in the ledger, on the phone and the PC in the
+   same commit (`CLAUDE.md`: a money rule changes on both sides at once), and an agent that brings
+   the person's Wealthsimple accounts in through the files Wealthsimple exports.
 
 ## The engine (phase 1)
 
@@ -142,3 +144,48 @@ An agent asks for a chart by writing a fenced block with the language `chart` an
   Plan is one table; Data is a two-column settings list.
 - **The sidebar and the Tally panel can be dragged** wider or narrower (sidebar 200 to 420 pixels;
   the panel opens at 340).
+
+## Investments (phase 5)
+
+`docs/INVESTMENTS.md` is the contract: the ledger's new tables, the rules both devices read them by,
+the Wealthsimple files and the ops. This is what the PC's engine and the agent do with them.
+
+- **Ops** (`crates/relay-bus/src/ops/money.rs`, handlers in `crates/relay-core/src/handlers/money.rs`):
+  `money.invest.summary` (the portfolio reading) and `money.invest.list` (activities, newest first)
+  are unlocked queries. `money.invest.add`, `money.invest.delete`, `money.invest.restore`,
+  `money.invest.room`, `money.invest.price`, `money.fx.set`, `money.value.set` and
+  `money.account.update` are short ledger writes, and `money.account.add` takes a `registration` and
+  an `institution`. Every mutation emits `money.changed`.
+- **Files are the person's.** `money.invest.preview` (an unlocked query) and `money.invest.import`
+  (staged: the file is read before the transaction opens) are `UserOnly` and take an absolute path
+  to a Wealthsimple holdings report, activities export or monthly statement. An import writes rows
+  under derived uids, so the same file imported twice, or on the phone and here, adds its lines once.
+- **Rates from the Bank of Canada.** `money.fx.fetch` (`UserOnly`) answers `{started}` at once, as
+  `github.connect` does. After the transaction a thread of its own runs `curl` under a 15-second
+  deadline against Valet's `FXUSDCAD` series (no key; the request carries nothing about the person),
+  writes the last ten business days' rates as `BANK_OF_CANADA`, and emits `money.changed` with
+  `{"fx": n}`, or `{"fx": 0, "error"}` when it failed. A fetch asked for while one runs answers
+  `started: false`.
+- **The agent** may call `money.invest.summary`, `money.invest.list` and `money.invest.add`
+  (`AGENT_OPS`). Its prompt gives it the units (units held and prices at 1e-8, gains in basis
+  points), tells it to read the summary first, to say the as-of date and that a return is
+  money-weighted, and to leave arithmetic to the tools; walks it through Wealthsimple's Documents
+  menu for the holdings report and the activities export; and keeps it safe: it never takes a
+  password, a two-factor code or a key, only `my.wealthsimple.com` is Wealthsimple, and a live
+  connection (SnapTrade, the unofficial API) is not built. Importing, deleting, room, prices and
+  rates stay the person's.
+- **The import card.** The agent asks for a file with a fenced `import` block:
+
+  ```import
+  {"source": "wealthsimple", "expects": "holdings", "title": "Your holdings report"}
+  ```
+
+  `relay_client::thread_view::import_spec` reads it (`source` must be `wealthsimple`; `expects` is
+  `holdings`, `activities` or `statement`). The card lets the person choose or drop the file,
+  previews it (`money.invest.preview`), maps its accounts and imports it; the person's next message
+  says what came in. An activity the agent records is a card with Undo (`money.invest.delete`).
+
+Tests: `crates/relay-core/tests/money.rs` imports the shared holdings report (W1) through the bus
+twice and reads it back, records, undoes and restores an activity, refuses files and the network to
+an agent, and fetches rates from a stand-in `curl`; `crates/relay-remote/tests/remote.rs` carries an
+imported activity from the phone through `money.sync`.

@@ -41,12 +41,12 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.tally.app.ui.accounts.EmptyNote
 import com.tally.app.ui.accounts.HeroHead
-import com.tally.app.ui.accounts.HeroNumber
 import com.tally.app.ui.accounts.TilePair
 import com.tally.app.ui.common.CategoryBadge
 import com.tally.app.ui.common.ChromeButton
 import com.tally.app.ui.common.Dates
 import com.tally.app.ui.common.GUTTER
+import com.tally.app.ui.common.HeroNumber
 import com.tally.app.ui.common.HeroAction
 import com.tally.app.ui.common.HeroPanel
 import com.tally.app.ui.common.LegendDot

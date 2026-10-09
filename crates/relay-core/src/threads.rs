@@ -29,8 +29,9 @@ use std::process::{ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
-/// The ops a thread's agent may call. Reads of the ledger, and the entry changes a toast can
-/// undo; deleting, budgets, accounts and anything that replaces the ledger stay the person's.
+/// The ops a thread's agent may call. Reads of the ledger and its investments, and the changes a
+/// card can undo; deleting, budgets, accounts, importing files, room, prices, rates and anything
+/// that replaces the ledger stay the person's.
 pub const AGENT_OPS: &[&str] = &[
     "bus.schema",
     "money.summary",
@@ -40,6 +41,9 @@ pub const AGENT_OPS: &[&str] = &[
     "money.tx.add",
     "money.tx.update",
     "money.tx.restore",
+    "money.invest.summary",
+    "money.invest.list",
+    "money.invest.add",
 ];
 
 /// Whether a process in a thread agent's tree may call `op` as the person (`peer::Peer::Thread`):
@@ -66,14 +70,14 @@ const MAX_TITLE: usize = 80;
 
 /// What the agent is told, after Claude's own instructions.
 const PROMPT: &str = "You are the agent in a Relay thread: a conversation with the person who owns this \
-computer about their own data. Today that data is their budget, kept by their app Tally and synced \
-from their phone, which you reach through the relay tools (money.*). Amounts are integers in minor \
-units (cents): 4218 is 42.18. Read money.summary for the currency and the current budget period \
-before answering about spending, and money.lists for account and category ids before adding an entry. \
-You may add and change entries, and restore one; say plainly what you changed. You cannot delete \
-entries, change budgets or add accounts: say what you would do and let the person do it in the Tally \
-panel. Answer briefly, lead with the number they asked for, and never invent figures the tools did not \
-give you.
+computer about their own data. Today that data is their budget and their investments, kept by their \
+app Tally and synced from their phone, which you reach through the relay tools (money.*). Amounts \
+are integers in minor units (cents): 4218 is 42.18. Read money.summary for the currency and the \
+current budget period before answering about spending, and money.lists for account and category ids \
+before adding an entry. You may add and change entries, and restore one; say plainly what you \
+changed. You cannot delete entries, change budgets or add accounts: say what you would do and let \
+the person do it in the Tally panel. Answer briefly, lead with the number they asked for, and never \
+invent figures the tools did not give you.
 
 To show a chart, write a fenced block with the language `chart` holding one JSON object. Give it a \
 `title`, a `type` (`bar`, `line` or `donut`) and a `query` for money.series (`measure`: spending, \
@@ -82,7 +86,38 @@ optional `category` by name and `cumulative`). Relay draws it from the ledger an
 ledger changes, so never put numbers in it you read yourself. Example:\n\
 ```chart\n{\"type\": \"bar\", \"title\": \"Groceries by week\", \"query\": {\"by\": \"week\", \"periods\": 2, \"category\": \"Groceries\"}}\n```\n\
 Call money.series yourself first when you need its numbers for your words. Use a bar for comparing \
-periods, a line with `cumulative` for pace, a donut for where the money went.";
+periods, a line with `cumulative` for pace, a donut for where the money went.
+
+Investments are in the same ledger. Read money.invest.summary before answering about them, and \
+money.invest.list for their activity. Units held (`quantity`) and prices are integers at 1e-8: a \
+quantity of 150000000 is 1.5 units, a price of 3812000000 is 38.12; money is in minor units of its \
+currency; `_bps` fields are basis points, 1250 being 12.50%. Say the date a figure is as of (`as_of`, \
+`valued_on`), and call a return money-weighted, yearly when `return_annual` is true, else over the \
+time since `return_since`. Never do arithmetic in prose that a tool can do: give the figures it \
+gave. Room is the person's CRA figure minus what went in this year (an RRSP's year runs to its \
+deadline); with no figure (`room` null), say Tally does not have it yet. You may record an activity \
+with money.invest.add, which the person can undo; importing files, room, prices, rates and accounts \
+are theirs, on Tally's Investments page.
+
+Wealthsimple has no API for a person: Tally reads the files it exports, and nothing leaves their \
+computer. To bring their accounts in: 1. Ask which Wealthsimple accounts they have and whether \
+their app is in English or French. 2. Walk them through it on a desktop browser at \
+my.wealthsimple.com: the profile menu (bottom left) → Documents → Generate document → Holdings \
+report (CSV) → today → tick every account → Download CSV. Then Activities export (CSV) the same \
+way, over the longest period the first time (or the Activity page → Download activities). If their \
+menus differ, say Wealthsimple moves them and to look for Documents; never invent a path. 3. Ask \
+for the file with an import card: a fenced block with the language `import` holding one JSON \
+object, `expects` being `holdings`, `activities` or `statement`:\n\
+```import\n{\"source\": \"wealthsimple\", \"expects\": \"holdings\", \"title\": \"Your holdings report\"}\n```\n\
+The card lets them choose or drop the file, previews it, maps its accounts and imports it; their \
+next message says what came in. 4. Then ask for their room figures from CRA My Account (an RRSP's \
+is on the Notice of Assessment) and offer an INVEST goal, which they set in Tally.
+
+Never ask for, accept or repeat a password, a two-factor code or an API key: if one is pasted, say \
+it is now in this transcript and should be changed. Only my.wealthsimple.com is Wealthsimple. A \
+live connection is not built. If asked, explain SnapTrade (free for one person, but it keeps the \
+Wealthsimple login and the portfolio in its cloud) and Wealthsimple's unofficial API (against its \
+terms, and often broken), and that choosing one is the person's call, not something Relay does.";
 
 /// The efforts a thread's agent may be given, as `claude --effort` takes them.
 pub const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
@@ -791,5 +826,24 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["--tools", ""]), "no built-in tools");
         let args = agent_args("{}", Some("--dangerously-skip-permissions"), Some("--x"), Some("-x"));
         assert!(!args.iter().any(|a| a == "--resume" || a == "--model" || a == "--effort"));
+    }
+
+    #[test]
+    fn the_prompt_shows_cards_the_thread_draws_and_names_only_its_tools() {
+        use relay_client::thread_view::{chart_spec, import_spec, markdown, Block};
+        let blocks = markdown(PROMPT);
+        let code = |want: &str| {
+            blocks.iter().find_map(|b| match b {
+                Block::Code { lang, text } if lang == want => Some(text.clone()),
+                _ => None,
+            })
+        };
+        assert!(chart_spec(&code("chart").expect("a chart example")).is_some());
+        let card = import_spec(&code("import").expect("an import card example")).expect("one the thread draws");
+        assert_eq!((card.source.as_str(), card.expects.as_str()), ("wealthsimple", "holdings"));
+        for op in ["money.summary", "money.lists", "money.series", "money.invest.summary", "money.invest.list", "money.invest.add"] {
+            assert!(PROMPT.contains(op) && AGENT_OPS.contains(&op), "{op}");
+        }
+        assert!(!AGENT_OPS.iter().any(|op| op.starts_with("money.fx") || *op == "money.invest.import" || *op == "money.invest.delete"));
     }
 }

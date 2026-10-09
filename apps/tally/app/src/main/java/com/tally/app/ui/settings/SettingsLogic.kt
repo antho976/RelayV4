@@ -136,12 +136,12 @@ internal fun monthCsvFileName(start: LocalDate): String = "tally-entries-" + sta
 // ── The Settings list, Avex's way ───────────────────────────────────────────
 
 /** Where a Settings row or search hit goes. */
-enum class SettingsDest { APPEARANCE, FORMAT, ACCOUNTS, CATEGORIES, IMPORT, BACKUP, EXPORT, PC, SAMPLE, ERASE, ABOUT }
+enum class SettingsDest { APPEARANCE, FORMAT, ACCOUNTS, CATEGORIES, IMPORT, BACKUP, EXPORT, PC, SAMPLE, ERASE, ABOUT, INVESTMENTS }
 
 /** The group a destination sits in on the Settings list, a search hit's "In ..." line. */
 internal fun groupOf(dest: SettingsDest): String = when (dest) {
     SettingsDest.APPEARANCE, SettingsDest.FORMAT -> "General"
-    SettingsDest.ACCOUNTS, SettingsDest.CATEGORIES, SettingsDest.IMPORT -> "Money"
+    SettingsDest.ACCOUNTS, SettingsDest.CATEGORIES, SettingsDest.IMPORT, SettingsDest.INVESTMENTS -> "Money"
     SettingsDest.BACKUP, SettingsDest.EXPORT -> "Data"
     SettingsDest.PC -> PC_GROUP
     SettingsDest.SAMPLE, SettingsDest.ERASE -> "Reset"
@@ -172,6 +172,7 @@ internal fun pageName(dest: SettingsDest): String = when (dest) {
     SettingsDest.SAMPLE -> "Load sample data"
     SettingsDest.ERASE -> "Erase everything"
     SettingsDest.ABOUT -> "About Tally"
+    SettingsDest.INVESTMENTS -> "Investments"
 }
 
 /** Every page, and the settings inside them, that the search finds. */
@@ -206,6 +207,15 @@ internal val SETTINGS_ENTRIES: List<SettingsEntry> = listOf(
     SettingsEntry("item:sync", "Sync now", SettingsDest.PC, "update refresh send pc computer"),
     SettingsEntry("item:forget", "Forget this PC", SettingsDest.PC, "unpair disconnect remove stop syncing"),
     SettingsEntry("item:investment", "Investment accounts", SettingsDest.ACCOUNTS, "tfsa rrsp fhsa celi reer wealthsimple value"),
+    // Investments is a page of its own, not a setting; the search finds it by the words people use for it.
+    SettingsEntry(
+        "page:investments",
+        "Investments",
+        SettingsDest.INVESTMENTS,
+        "portfolio holdings stocks etf dividends tfsa celi rrsp reer fhsa celiapp resp reee wealthsimple",
+    ),
+    SettingsEntry("item:room", "Contribution room", SettingsDest.INVESTMENTS, "tfsa rrsp fhsa celi reer celiapp droits cotisation cra limit"),
+    SettingsEntry("item:ws-holdings", "Wealthsimple holdings report", SettingsDest.IMPORT, "investments activities export csv tfsa celi rrsp reer"),
 )
 
 private fun fold(text: String): String = BankStatements.normalize(text)

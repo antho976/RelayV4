@@ -159,6 +159,8 @@ pub fn image_with_stroke(name: &str, size: i32, stroke: f64) -> gtk::Image {
         "pause" => {
             r##"<rect x="3.25" y="2.75" width="3.5" height="10.5" rx="1" /><rect x="9.25" y="2.75" width="3.5" height="10.5" rx="1" />"##
         }
+        // A thread's send key while the agent answers: stopping, not pausing.
+        "stop" => r##"<rect x="4.5" y="4.5" width="7" height="7" rx="1.5" fill="currentColor" />"##,
         "resume" => r##"<path d="M3 8a5 5 0 1 0 1.5-3.5" /><path d="M3 2.5V5h2.5" />"##,
         "copy" => {
             r##"<rect x="5.5" y="5.5" width="8" height="8" /><path d="M10.5 5.5v-3h-8v8h3" />"##
