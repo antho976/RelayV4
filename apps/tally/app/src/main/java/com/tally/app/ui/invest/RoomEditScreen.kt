@@ -126,14 +126,14 @@ private fun RoomHero(state: RoomEditState, modifier: Modifier = Modifier) {
     val pace = roomPaceFraction(state.registration, state.year, state.today)
     val went = money.formatWhole(state.contributed)
     val line = when {
-        minor <= 0L -> "$went in so far this year, with no room to read it against"
+        minor <= 0L -> "$went in so far for ${state.year}, with no room to read it against"
         state.contributed > minor -> money.formatWhole(state.contributed - minor) + " over this room already"
         else -> money.formatWhole(minor - state.contributed) + " left at this room, after $went in"
     }
     val monthly = monthlyToFill(minor - state.contributed, state.today, state.deadline, MoneyFormatter.pow10(money.fractionDigits))
     val existing = state.existing
     HeroPanel(modifier) {
-        PanelHeader("Room this year", meta = money.currency.currencyCode)
+        PanelHeader("Room for ${state.year}", meta = money.currency.currencyCode)
         Spacer(Modifier.height(10.dp))
         HeroNumber(
             formatted,
@@ -149,7 +149,7 @@ private fun RoomHero(state: RoomEditState, modifier: Modifier = Modifier) {
             if (minor > 0L) {
                 "$went in of ${money.formatWhole(minor)}. An even pace would be ${money.formatWhole(Math.round(minor * pace.toDouble()))} by today."
             } else {
-                "No room typed yet. $went in this year."
+                "No room typed yet. $went in for ${state.year}."
             },
             height = 14.dp,
         )

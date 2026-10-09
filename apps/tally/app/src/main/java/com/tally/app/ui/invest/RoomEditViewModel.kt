@@ -13,6 +13,7 @@ import com.tally.app.ui.nav.Args
 import com.tally.app.ui.plan.PadKey
 import com.tally.app.ui.plan.pressed
 import com.tally.core.AmountInput
+import com.tally.core.Invest
 import com.tally.core.MoneyFormatter
 import com.tally.core.Portfolio
 import com.tally.core.Registration
@@ -70,7 +71,8 @@ class RoomEditViewModel @Inject constructor(
     private val registration: Registration =
         registrationNamed(savedStateHandle.get<String>(Args.KIND))?.takeIf { it in ROOM_KINDS } ?: Registration.TFSA
     private val today: LocalDate = clock.today()
-    private val year: Int = today.year
+    // An RRSP's year runs to its deadline: until then, room goes on last year's figure.
+    private val year: Int = Invest.roomYear(registration, today)
 
     private val input = MutableStateFlow(AmountInput())
     private val ready = MutableStateFlow(false)

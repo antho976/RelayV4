@@ -270,7 +270,7 @@ pub(super) fn draw(ui: &Rc<Ui>, page: &Page, p: &Value, activity: Option<&Value>
     let typed = typing(ui, "money-room-");
     clear_rebuilding(&page.body);
     if p["empty"] == true || accounts.is_empty() {
-        empty_state(ui, &page.body);
+        empty_state(ui, &page.body, text(p, "currency"));
         return;
     }
     let holdings = rows(p, "holdings");
@@ -452,23 +452,33 @@ pub(super) fn draw(ui: &Rc<Ui>, page: &Page, p: &Value, activity: Option<&Value>
         }
         Some(items) => {
             for item in &items {
-                list.append(&activity_row(item));
+                list.append(&activity_row(ui, item));
             }
         }
     }
     retype(&page.body, typed);
 }
 
-/// No investment account yet: what the page is for, and the three ways in.
-fn empty_state(ui: &Rc<Ui>, body: &gtk::Box) {
+/// No investment account yet: what the page is for, and the three ways in. Wealthsimple's files
+/// are in Canadian dollars and the engine reads them into no other ledger, so a ledger kept in
+/// `currency` other than CAD is told so and offered only an account by hand.
+fn empty_state(ui: &Rc<Ui>, body: &gtk::Box, currency: &str) {
+    let wealthsimple = currency == "CAD";
     let block = gtk::Box::new(gtk::Orientation::Vertical, 14);
     block.add_css_class("tally-card");
     block.add_css_class("money-empty");
     block.append(&label("No investments yet", "money-empty-title"));
-    let about = label(
-        "Bring in your Wealthsimple accounts to see your TFSA, RRSP and FHSA side by side: what they are worth, what they have earned, and the room left this year. Tally reads the files Wealthsimple lets you download; nothing leaves this PC.",
-        "money-muted",
-    );
+    let about = if wealthsimple {
+        String::from(
+            "Bring in your Wealthsimple accounts to see your TFSA, RRSP and FHSA side by side: what they are worth, what they have earned, and the room left this year. Tally reads the files Wealthsimple lets you download; the files stay on this PC.",
+        )
+    } else {
+        let keeps = if currency.is_empty() { String::new() } else { format!(", and this one keeps {currency}") };
+        format!(
+            "Wealthsimple's files need a ledger kept in Canadian dollars{keeps}, so Tally cannot read them here. Add your investment accounts by hand and record what each is worth from its statement."
+        )
+    };
+    let about = label(&about, "money-muted");
     about.set_wrap(true);
     about.set_max_width_chars(70);
     block.append(&about);
@@ -479,16 +489,22 @@ fn empty_state(ui: &Rc<Ui>, body: &gtk::Box) {
     connect.set_tooltip_text(Some("A thread walks you through downloading your files and bringing them in"));
     let import = button("Import a file…", "");
     import.set_widget_name("money-invest-empty-import");
-    let account = button("Add an account by hand…", "");
+    let account = button("Add an account by hand…", if wealthsimple { "" } else { "primary" });
     account.set_widget_name("money-invest-empty-account");
-    actions.append(&connect);
-    actions.append(&import);
+    if wealthsimple {
+        actions.append(&connect);
+        actions.append(&import);
+    } else {
+        account.add_css_class("money-hero-action");
+    }
     actions.append(&account);
     block.append(&actions);
     flex(&actions, Flex::Controls);
-    let hint = label("Connect opens a thread that guides you, step by step, to your holdings report and activities on my.wealthsimple.com.", "money-row-detail");
-    hint.set_wrap(true);
-    block.append(&hint);
+    if wealthsimple {
+        let hint = label("Connect opens a thread that guides you, step by step, to your holdings report and activities on my.wealthsimple.com.", "money-row-detail");
+        hint.set_wrap(true);
+        block.append(&hint);
+    }
     body.append(&block);
     let weak = Rc::downgrade(ui);
     connect.connect_clicked(move |_| {
@@ -878,8 +894,9 @@ fn income_bars(months: &[Value]) -> gtk::Box {
 }
 
 /// An activity: what happened (to which security), in which account and when, and its amount
-/// in its own currency, signed by the way the cash went.
-fn activity_row(a: &Value) -> gtk::Box {
+/// in its own currency, signed by the way the cash went. Its trash key, shown on hover, deletes
+/// it ([`delete_activity`]): a line imported into the wrong account comes out here.
+fn activity_row(ui: &Rc<Ui>, a: &Value) -> gtk::Box {
     let kind = text(a, "type");
     let symbol = a["symbol"].as_str().unwrap_or("");
     let held = units(n(a, "quantity"));
@@ -931,7 +948,54 @@ fn activity_row(a: &Value) -> gtk::Box {
         "SPLIT" => (String::new(), ""),
         _ => (fmt.format(amount), "money-quiet"),
     };
-    icon_row(&tile(glyph), title.trim(), &detail.join(" · "), &figure, class)
+    let row = icon_row(&tile(glyph), title.trim(), &detail.join(" · "), &figure, class);
+    row.add_css_class("invest-activity");
+    let trash = crate::app::icon_button("trash", "Delete activity");
+    trash.add_css_class("money-row-delete");
+    trash.set_valign(gtk::Align::Center);
+    let weak = Rc::downgrade(ui);
+    let (id, what) = (a["id"].clone(), format!("{} deleted · {}", title.trim(), human_date(text(a, "date"))));
+    trash.connect_clicked(move |_| {
+        if let Some(ui) = weak.upgrade() {
+            delete_activity(&ui, id.clone(), what.clone());
+        }
+    });
+    row.append(&trash);
+    row
+}
+
+/// Deletes activity `id` (`money.invest.delete`) with Undo on a toast rather than a confirmation
+/// first, as Tally deletes an entry. Undo is `money.invest.restore`, the same row back.
+fn delete_activity(ui: &Rc<Ui>, id: Value, what: String) {
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        match ui.call("money.invest.delete", json!({"id":id})).await {
+            Ok(_) => {
+                let weak = Rc::downgrade(&ui);
+                let undo: super::Action = Rc::new(move || {
+                    let Some(ui) = weak.upgrade() else { return };
+                    let id = id.clone();
+                    glib::spawn_future_local(async move {
+                        if let Err(e) = ui.call("money.invest.restore", json!({"id":id})).await {
+                            ui.show_error(&refusal(&e));
+                        }
+                        ui.refresh_page();
+                    });
+                });
+                super::toast(&ui, &what, Some(undo));
+                ui.refresh_page();
+            }
+            Err(e) => ui.show_error(&refusal(&e)),
+        }
+    });
+}
+
+/// A refusal in the engine's own sentence, never its kind and code ("Invalid money.invalid: …").
+fn refusal(error: &Error) -> String {
+    match error {
+        Error::Bus(e) if !matches!(e.code.as_str(), "bus.unknown_op" | "bus.not_implemented") => e.message.clone(),
+        e => unavailable(e),
+    }
 }
 
 /// The page's Import key (and Data's): the import flow, then a toast of what came in. It takes
@@ -968,6 +1032,27 @@ pub(crate) fn import_summary(result: &Value) -> String {
         line += &format!("; {} skipped", copy::plural(count("skipped"), "line"));
     }
     line + "."
+}
+
+/// A preview's counts: "14 holdings · 212 activities · 180 new · 32 already here · 3 lines skipped".
+fn counts_line(v: &Value) -> String {
+    let count = |key: &str| n(v, key).max(0);
+    let skipped = rows(v, "skipped").len() as i64;
+    let mut parts = Vec::new();
+    if count("holdings") > 0 {
+        parts.push(copy::plural(count("holdings"), "holding"));
+    }
+    if count("activities") > 0 {
+        parts.push(copy::plural_as(count("activities"), "activity", "activities"));
+    }
+    parts.push(format!("{} new", count("new")));
+    if count("duplicates") > 0 {
+        parts.push(format!("{} already here", count("duplicates")));
+    }
+    if skipped > 0 {
+        parts.push(format!("{} skipped", copy::plural(skipped, "line")));
+    }
+    parts.join(" · ")
 }
 
 /// A Wealthsimple file's kind, as a title and with its article, by `ImportPreview.kind` or an
@@ -1047,7 +1132,7 @@ fn preview(ui: &Rc<Ui>, panel: &Rc<Panel>, path: PathBuf, expects: String, on_do
         clear(&panel.body);
         match read {
             Ok(v) => sheet_body(&ui, &panel, &path, &expects, &v, lists.as_ref().ok(), on_done),
-            Err(e) => refused(&ui, &panel, &file, &unavailable(&e), &expects, on_done),
+            Err(e) => refused(&ui, &panel, &file, &refusal(&e), &expects, on_done),
         }
     });
 }
@@ -1079,8 +1164,8 @@ fn refused(ui: &Rc<Ui>, panel: &Rc<Panel>, file: &str, why: &str, expects: &str,
 }
 
 /// The preview: the file and what it holds, its accounts each mapped to an investment account or
-/// a new one (a statement names none, so it takes the one it goes into), the lines it skips and
-/// why, and the Import key.
+/// a new one (a statement names none, so the person chooses the one it goes into), the lines it
+/// skips and why, and the Import key.
 fn sheet_body(ui: &Rc<Ui>, panel: &Rc<Panel>, path: &Path, expects: &str, v: &Value, lists: Option<&Value>, on_done: Rc<dyn Fn(Value)>) {
     let body = &panel.body;
     let kind = text(v, "kind");
@@ -1108,38 +1193,19 @@ fn sheet_body(ui: &Rc<Ui>, panel: &Rc<Panel>, path: &Path, expects: &str, v: &Va
         note.set_wrap(true);
         body.append(&note);
     }
-    let count = |key: &str| n(v, key).max(0);
     let skipped = rows(v, "skipped");
-    let mut parts = Vec::new();
-    if count("holdings") > 0 {
-        parts.push(copy::plural(count("holdings"), "holding"));
-    }
-    if count("activities") > 0 {
-        parts.push(copy::plural_as(count("activities"), "activity", "activities"));
-    }
-    parts.push(format!("{} new", count("new")));
-    if count("duplicates") > 0 {
-        parts.push(format!("{} already here", count("duplicates")));
-    }
-    if !skipped.is_empty() {
-        parts.push(format!("{} skipped", copy::plural(skipped.len() as i64, "line")));
-    }
-    let counts = label(&parts.join(" · "), "tally-figures");
+    let counts = label(&counts_line(v), "tally-figures");
     counts.set_wrap(true);
     body.append(&counts);
 
     // Its accounts, mapped to Tally's investment accounts.
-    let investment: Vec<(i64, String)> = lists
-        .map(|l| rows(l, "accounts"))
-        .unwrap_or_default()
-        .iter()
-        .filter(|a| text(a, "type") == "INVESTMENT" && a["archived"] != true)
-        .map(|a| (n(a, "id"), text(a, "name").to_string()))
-        .collect();
+    let held: Vec<Value> =
+        lists.map(|l| rows(l, "accounts")).unwrap_or_default().into_iter().filter(|a| text(a, "type") == "INVESTMENT" && a["archived"] != true).collect();
+    let investment: Vec<(i64, String)> = held.iter().map(|a| (n(a, "id"), text(a, "name").to_string())).collect();
     let found = rows(v, "accounts");
     let statement = kind == "statement";
     let mut mapping: Vec<(String, gtk::DropDown, Vec<Option<i64>>)> = Vec::new();
-    let mut into: Option<gtk::DropDown> = None;
+    let mut into: Option<(gtk::DropDown, Vec<Option<i64>>)> = None;
     if statement && investment.is_empty() {
         let none = label(
             "A statement does not name its account. Add the investment account it belongs to first, then choose the file again.",
@@ -1159,17 +1225,37 @@ fn sheet_body(ui: &Rc<Ui>, panel: &Rc<Panel>, path: &Path, expects: &str, v: &Va
         body.append(&add);
     } else if statement {
         body.append(&label("INTO ACCOUNT", "money-label"));
-        let names: Vec<&str> = investment.iter().map(|(_, name)| name.as_str()).collect();
+        // Nothing is chosen for the person: a drop-down shows its first row, and an RRSP's
+        // statement taken into the TFSA would count against the TFSA's room.
+        let mut ids = vec![None];
+        ids.extend(investment.iter().map(|(id, _)| Some(*id)));
+        let mut names = vec!["Choose an account…"];
+        names.extend(investment.iter().map(|(_, name)| name.as_str()));
         let picker = gtk::DropDown::from_strings(&names);
         picker.add_css_class("money-picker");
         picker.set_widget_name("money-invest-into");
         picker.update_property(&[gtk::accessible::Property::Label("The account this statement goes into")]);
-        let known = found.first().and_then(|a| a["account_id"].as_i64()).and_then(|id| investment.iter().position(|(i, _)| *i == id));
-        if let Some(index) = known {
-            picker.set_selected(index as u32);
-        }
+        // Each choice previews the file again in that account, so "already here" counts its lines.
+        let (ui, counts, shown, chosen, first) = (ui.clone(), counts.downgrade(), path.to_string_lossy().to_string(), ids.clone(), counts_line(v));
+        let serial = Rc::new(Cell::new(0_u32));
+        picker.connect_selected_notify(move |picker| {
+            serial.set(serial.get().wrapping_add(1));
+            let Some(Some(id)) = chosen.get(picker.selected() as usize).copied() else {
+                if let Some(counts) = counts.upgrade() {
+                    counts.set_text(&first);
+                }
+                return;
+            };
+            let (ui, counts, serial, asked, payload) = (ui.clone(), counts.clone(), serial.clone(), serial.get(), json!({"path":shown,"account_id":id}));
+            glib::spawn_future_local(async move {
+                let read = ui.call("money.invest.preview", payload).await;
+                if let (Ok(v), Some(counts)) = (read, counts.upgrade().filter(|_| serial.get() == asked)) {
+                    counts.set_text(&counts_line(&v));
+                }
+            });
+        });
         body.append(&picker);
-        into = Some(picker);
+        into = Some((picker, ids));
     } else {
         body.append(&label("ACCOUNTS IN THE FILE", "money-label"));
         if found.is_empty() {
@@ -1204,6 +1290,25 @@ fn sheet_body(ui: &Rc<Ui>, panel: &Rc<Panel>, path: &Path, expects: &str, v: &Va
             picker.set_selected(known.unwrap_or(0) as u32);
             row.append(&picker);
             body.append(&row);
+            // An account Tally already keeps by hand (or from another institution's files) may be
+            // this one: as a new account it would count twice. Said until another is chosen.
+            let same: Vec<&str> = held
+                .iter()
+                .filter(|t| text(t, "registration") == registration && text(t, "institution") != "Wealthsimple")
+                .map(|t| text(t, "name"))
+                .collect();
+            if known.is_none() && !same.is_empty() {
+                let (is, one) = if same.len() == 1 { ("is", "it") } else { ("are", "one of them") };
+                let hint = label(
+                    &format!("{} {is} already in Tally. If {one} is this account, choose it here; a new account would count it twice.", join_and(&same)),
+                    "money-row-detail",
+                );
+                hint.add_css_class("money-ahead");
+                hint.set_wrap(true);
+                hint.set_margin_start(40);
+                body.append(&hint);
+                picker.connect_selected_notify(move |picker| hint.set_visible(picker.selected() == 0));
+            }
             mapping.push((text(a, "number").to_string(), picker, ids));
         }
     }
@@ -1246,10 +1351,30 @@ fn sheet_body(ui: &Rc<Ui>, panel: &Rc<Panel>, path: &Path, expects: &str, v: &Va
     import.add_css_class("money-hero-action");
     import.set_widget_name("money-invest-import-save");
     import.set_hexpand(true);
-    import.set_sensitive(!statement || into.is_some());
+    // A statement's Import waits for its account to be chosen.
+    import.set_sensitive(!statement || into.as_ref().is_some_and(|(picker, _)| picker.selected() > 0));
     actions.append(&another);
     actions.append(&import);
     body.append(&actions);
+    match &into {
+        Some((picker, _)) => {
+            let key = import.downgrade();
+            picker.connect_selected_notify(move |picker| {
+                // Not while an import runs: its key says so until it ends.
+                if let Some(key) = key.upgrade().filter(|key| key.label().is_some_and(|l| l == "Import")) {
+                    key.set_sensitive(picker.selected() > 0);
+                }
+            });
+            if import.is_sensitive() {
+                import.grab_focus();
+            } else {
+                picker.grab_focus();
+            }
+        }
+        None => {
+            import.grab_focus();
+        }
+    }
     {
         let (ui, sheet, expects, on_done) = (ui.clone(), Rc::downgrade(panel), expects.to_string(), on_done.clone());
         another.connect_clicked(move |_| choose_again(&ui, &sheet, &expects, &on_done));
@@ -1268,9 +1393,9 @@ fn sheet_body(ui: &Rc<Ui>, panel: &Rc<Panel>, path: &Path, expects: &str, v: &Va
             })
             .collect();
         let mut payload = json!({"path":shown,"accounts":accounts});
-        if let Some(picker) = &into {
-            match investment.get(picker.selected() as usize) {
-                Some((id, _)) => payload["account_id"] = json!(id),
+        if let Some((picker, ids)) = &into {
+            match ids.get(picker.selected() as usize).copied().flatten() {
+                Some(id) => payload["account_id"] = json!(id),
                 None => {
                     problem_line.set_text("Choose the account this statement goes into.");
                     problem_line.set_visible(true);
@@ -1291,7 +1416,7 @@ fn sheet_body(ui: &Rc<Ui>, panel: &Rc<Panel>, path: &Path, expects: &str, v: &Va
                     on_done(result);
                 }
                 Err(e) => {
-                    problem.set_text(&e.to_string());
+                    problem.set_text(&refusal(&e));
                     problem.set_visible(true);
                     key.set_label("Import");
                     key.set_sensitive(true);
@@ -1299,5 +1424,4 @@ fn sheet_body(ui: &Rc<Ui>, panel: &Rc<Panel>, path: &Path, expects: &str, v: &Va
             }
         });
     });
-    import.grab_focus();
 }

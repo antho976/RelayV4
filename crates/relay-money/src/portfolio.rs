@@ -21,6 +21,10 @@ use jiff::civil::Date;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 
+/// What the PC says for a Wealthsimple cash statement ([`wealthsimple::NOT_INVESTMENT`]): where it goes.
+const CASH_STATEMENT: &str = "This is a cash account's statement (Wealthsimple Cash or chequing), not an investment account's. \
+Import it with your bank statements in Tally on your phone.";
+
 /// Every row `sql` (no parameters) yields that `f` reads; a row `f` cannot read is left out.
 fn rows<T>(conn: &Connection, sql: &str, mut f: impl FnMut(&rusqlite::Row) -> rusqlite::Result<Option<T>>) -> Result<Vec<T>> {
     let mut st = conn.prepare_cached(sql)?;
@@ -341,8 +345,9 @@ impl Ledger {
             .optional()?)
     }
 
+    /// A Wealthsimple file, read. A cash statement is told where it goes instead.
     fn read_file(text: &str) -> Result<WsFile> {
-        wealthsimple::read(text).map_err(LedgerError::Invalid)
+        wealthsimple::read(text).map_err(|e| LedgerError::Invalid(if e == wealthsimple::NOT_INVESTMENT { CASH_STATEMENT.into() } else { e }))
     }
 
     /// What importing `text` would do: its accounts (each with the Tally account already holding
@@ -454,7 +459,9 @@ impl Ledger {
         };
         for a in &plan.accounts {
             let order: i64 = tx.prepare_cached("SELECT COALESCE(MAX(sort_order), -1) + 1 FROM accounts")?.query_row([], |r| r.get(0))?;
-            let changed = tx.prepare_cached(
+            // "A new account" for a number an earlier import created is that account again, not a new one.
+            let created = id_of(tx, "accounts", &a.uid)?.is_none();
+            tx.prepare_cached(
                 "INSERT INTO accounts (uid, name, type, opening_balance, sort_order, registration, institution, external_ref, updated_at)
                  VALUES (?1, ?2, 'INVESTMENT', 0, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(uid) DO UPDATE SET deleted = 0, type = 'INVESTMENT', registration = excluded.registration,
@@ -462,7 +469,7 @@ impl Ledger {
                      updated_at = MAX(excluded.updated_at, accounts.updated_at + 1)",
             )?.execute(params![a.uid, a.name, order, name_of(&a.registration), a.institution, a.external_ref, now])?;
             unbury(tx, "accounts", &a.uid)?;
-            result.accounts_created += changed;
+            result.accounts_created += usize::from(created);
         }
         let account = |uid: &str| -> Result<i64> { id_of(tx, "accounts", uid)?.ok_or_else(|| LedgerError::NotFound(format!("No account {uid}"))) };
         let mut security_ids: HashMap<&str, i64> = HashMap::new();
@@ -725,6 +732,10 @@ mod tests {
         assert_eq!((0, 0, 0, 5), (again.accounts_created, again.securities, again.activities, again.duplicates));
         assert_eq!(5, count(&l, "SELECT COUNT(*) FROM activities"));
         assert_eq!(1, count(&l, "SELECT COUNT(*) FROM accounts"));
+        // "A new account" for a number an import already created is that account: none is counted.
+        let chosen = l.invest_import(ACTIVITIES_EXPORT, &[ImportAccount { number: "HQ7XFMC41CAD".into(), account_id: None }], None).unwrap();
+        assert_eq!((0, 0, 5), (chosen.accounts_created, chosen.activities, chosen.duplicates));
+        assert_eq!(1, count(&l, "SELECT COUNT(*) FROM accounts"));
         // The same holdings report twice: the value and the prices are written once too.
         l.invest_import(HOLDINGS_REPORT, &[], None).unwrap();
         let twice = l.invest_import(HOLDINGS_REPORT, &[], None).unwrap();
@@ -760,6 +771,12 @@ mod tests {
         assert!(matches!(l.invest_import(statement, &[], None), Err(LedgerError::Invalid(_))), "a statement names no account");
         assert_eq!(3, l.invest_import(statement, &[], Some(mine)).unwrap().activities);
         assert!(matches!(l.invest_import("Date,Amount\n2026-01-01,4\n", &[], None), Err(LedgerError::Invalid(_))));
+        // A cash statement is told where it goes.
+        let cash = "date,transaction,description,amount,balance,currency\n2026-09-01,SPEND,Metro,-42.10,500.00,CAD\n";
+        match l.invest_preview(cash, Some(mine)) {
+            Err(LedgerError::Invalid(why)) => assert_eq!(CASH_STATEMENT, why),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

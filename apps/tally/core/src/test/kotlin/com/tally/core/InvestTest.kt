@@ -359,6 +359,27 @@ class InvestTest {
         assertEquals(200_000L to 20_000L, t.contributed to t.withdrawn)
     }
 
+    @Test fun `in RRSP season the RRSP row reads last year`() {
+        fun rrsp(today: LocalDate): RoomLine {
+            val i = PortfolioInput(
+                "CAD",
+                today,
+                accounts = listOf(InvestAccountRow(1, "a1", "RRSP", Registration.RRSP)),
+                activities = listOf(
+                    // Before 2025's deadline (2026-03-02): it counts for 2025.
+                    act("a", ActivityType.DEPOSIT, date(2026, 2, 20), 0, 30_000, 0),
+                    act("b", ActivityType.DEPOSIT, date(2026, 6, 1), 0, 50_000, 0),
+                    act("c", ActivityType.DEPOSIT, date(2027, 1, 15), 0, 100_000, 0),
+                ),
+            )
+            return Invest.portfolio(i).room.single { it.registration == Registration.RRSP }
+        }
+        val season = rrsp(date(2027, 2, 10))
+        assertEquals(Triple(2026, 150_000L, "2027-03-01"), Triple(season.year, season.contributed, season.deadline))
+        val past = rrsp(date(2027, 3, 2))
+        assertEquals(2027 to 0L, past.year to past.contributed)
+    }
+
     @Test fun `an empty portfolio says so`() {
         val p = Invest.portfolio(PortfolioInput("CAD", date(2026, 10, 9)))
         assertTrue(p.empty)

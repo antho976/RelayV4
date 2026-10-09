@@ -121,7 +121,7 @@ class InvestLogicTest {
             "$2,800 left · $934 a month uses it by 31/12",
             roomText(room(Registration.TFSA, 700_000, 420_000), today, money, short),
         )
-        assertEquals("This year's room is used", roomText(room(Registration.TFSA, 700_000, 700_000), today, money, short))
+        assertEquals("The 2026 room is used", roomText(room(Registration.TFSA, 700_000, 700_000), today, money, short))
         assertEquals(
             "Over by $300. The CRA charges 1% a month on $300",
             roomText(room(Registration.TFSA, 700_000, 730_000, over = 30_000), today, money, short),
@@ -130,7 +130,7 @@ class InvestLogicTest {
             "Over by $1,500, inside the $2,000 an RRSP may go over",
             roomText(room(Registration.RRSP, 2_000_000, 2_150_000, over = 150_000, overTaxed = 0), today, money, short),
         )
-        assertEquals("Add this year's room from CRA My Account", roomText(room(Registration.FHSA, null, 0), today, money, short))
+        assertEquals("Add your 2026 room from CRA My Account", roomText(room(Registration.FHSA, null, 0), today, money, short))
         assertEquals("$4,200 of $7,000", roomReading(room(Registration.TFSA, 700_000, 420_000), money))
         assertEquals("$4,200 in", roomReading(room(Registration.TFSA, null, 420_000), money))
     }

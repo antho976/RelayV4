@@ -250,14 +250,14 @@ internal fun monthlyToFill(left: Long, today: LocalDate, deadline: LocalDate, un
 
 /** The room row's line: what is left and the monthly pace that uses it, or how far over it went and what that costs. */
 internal fun roomText(line: RoomLine, today: LocalDate, money: MoneyFormatter, short: (LocalDate) -> String): String {
-    if (line.room == null) return "Add this year's room from CRA My Account"
+    if (line.room == null) return "Add your ${line.year} room from CRA My Account"
     val left = line.left ?: 0L
     return when {
         line.over > 0L && line.overTaxed == 0L ->
             "Over by " + money.formatWhole(line.over) + ", inside the " + money.formatWhole(RRSP_GRACE) + " an RRSP may go over"
         line.over > 0L ->
             "Over by " + money.formatWhole(line.over) + ". The CRA charges 1% a month on " + money.formatWhole(line.overTaxed)
-        left == 0L -> "This year's room is used"
+        left == 0L -> "The ${line.year} room is used"
         else -> {
             val deadline = roomDeadline(line.registration, line.year)
             val monthly = monthlyToFill(left, today, deadline, MoneyFormatter.pow10(money.fractionDigits))
@@ -277,7 +277,7 @@ internal fun roomReading(line: RoomLine, money: MoneyFormatter): String {
 internal fun roomDescription(line: RoomLine, pace: Float?, money: MoneyFormatter): String {
     val label = registrationLabel(line.registration)
     val room = line.room
-    if (room == null || pace == null) return "$label: " + money.formatWhole(line.contributed) + " in this year, no room set"
+    if (room == null || pace == null) return "$label: " + money.formatWhole(line.contributed) + " in for ${line.year}, no room set"
     val even = Math.round(room.toDouble() * pace)
     return "$label: " + money.formatWhole(line.contributed) + " in of " + money.formatWhole(room) + " room. " +
         "An even pace would be " + money.formatWhole(even) + " by today."

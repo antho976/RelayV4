@@ -590,6 +590,13 @@ pub fn room_window(registration: Registration, year: i32) -> (Date, Date) {
     }
 }
 
+/// The year `registration`'s room reads on `today`: the calendar year, but an RRSP's is last year
+/// until last year's deadline (RRSP season).
+pub fn room_year(registration: Registration, today: Date) -> i32 {
+    let year = i32::from(today.year());
+    if registration == Registration::Rrsp && today <= rrsp_deadline(year - 1) { year - 1 } else { year }
+}
+
 /// What is left of `room` after `contributed`, and what is over it. An RRSP's first $2,000 over is
 /// not taxed.
 pub fn room_line(registration: Registration, year: i32, room: Option<i64>, contributed: i64, withdrawn: i64) -> RoomView {
@@ -963,12 +970,13 @@ fn account_return(input: &PortfolioInput, account: i64, value: i64) -> (Option<i
     }
 }
 
-/// TFSA, RRSP and FHSA room in today's year, for each that has an account or a room figure.
+/// TFSA, RRSP and FHSA room in the year each reads today ([`room_year`]), for each that has an
+/// account or a room figure. In RRSP season an RRSP reads last year: what goes in then counts toward it.
 fn room(input: &PortfolioInput) -> Vec<RoomView> {
-    let year = i32::from(input.today.year());
     let ledger = input.currency.as_str();
     let mut out = Vec::new();
     for registration in ROOM_REGISTRATIONS {
+        let year = room_year(registration, input.today);
         let accounts: Vec<&AccountRow> = input.accounts.iter().filter(|a| a.registration == Some(registration)).collect();
         let fact = input.room_facts.iter().find(|r| r.registration == registration && r.year == year).map(|r| r.amount);
         if accounts.is_empty() && fact.is_none() {
@@ -1387,6 +1395,20 @@ mod tests {
         i.transfers.push(TransferRow { account_id: 1, date: date(2026, 5, 1), amount: -20_000 });
         let r = &portfolio(&i).room[0];
         assert_eq!((r.contributed, r.withdrawn), (200_000, 20_000));
+    }
+
+    #[test]
+    fn in_rrsp_season_the_rrsp_row_reads_last_year() {
+        let mut i = PortfolioInput::new("CAD", date(2027, 2, 10));
+        i.accounts.push(AccountRow { id: 1, uid: "a1".into(), name: "RRSP".into(), registration: Some(Registration::Rrsp), institution: String::new() });
+        i.activities.push(act("before", Deposit, date(2026, 2, 20), 0, 30000, 0));
+        i.activities.push(act("summer", Deposit, date(2026, 6, 1), 0, 50000, 0));
+        i.activities.push(act("season", Deposit, date(2027, 1, 15), 0, 100000, 0));
+        let r = &portfolio(&i).room[0];
+        assert_eq!((r.registration, r.year, r.contributed, r.deadline.as_str()), (Registration::Rrsp, 2026, 150000, "2027-03-01"));
+        i.today = date(2027, 3, 2);
+        let r = &portfolio(&i).room[0];
+        assert_eq!((r.year, r.contributed), (2027, 0));
     }
 
     #[test]

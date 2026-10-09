@@ -190,6 +190,9 @@ struct State {
     one_column: Cell<bool>,
     /// Claude Code is not on this PC: a thread cannot answer, so nothing is sent.
     claude_missing: Cell<bool>,
+    /// What [`tell`] could not send while the agent was still answering in its thread: (thread,
+    /// words), oldest first. Each goes when its thread's turn ends ([`tell_waiting`]).
+    to_tell: RefCell<Vec<(i64, String)>>,
     ui: RefCell<std::rc::Weak<Ui>>,
     /// The model and effort a new thread starts with: the last ones chosen.
     choice: RefCell<(String, String)>,
@@ -928,10 +931,12 @@ fn suggestions(summary: Option<&Value>, invest: Option<&Value>) -> Vec<(String, 
             }
         }
     }
+    // Wealthsimple's files go only into a ledger kept in Canadian dollars.
     match invest {
-        Some(p) if p["empty"] == true => {
+        Some(p) if p["empty"] == true && p["currency"] == "CAD" => {
             out.push((String::from("Connect my Wealthsimple accounts"), String::from("A guided import from the files Wealthsimple gives you")))
         }
+        Some(p) if p["empty"] == true => {}
         Some(_) => out.push((String::from("How are my investments doing?"), String::from("Value, gain and the room left this year"))),
         None => {}
     }
@@ -1867,10 +1872,15 @@ fn import_card(title: &str, expects: &str) -> gtk::Box {
     let thread = current();
     let expects = expects.to_string();
     let (shell, heading, detail, chooser) = (card.downgrade(), heading.downgrade(), detail.downgrade(), key.downgrade());
-    // With no path the flow asks for the file; a drop gives it one.
-    let start: Rc<dyn Fn(Option<PathBuf>)> = Rc::new(move |path: Option<PathBuf>| {
+    // With no path the flow asks for the file; a drop gives it one, and with it the name of the
+    // next file when several were dropped: one is imported at a time.
+    let start: Rc<dyn Fn(Option<PathBuf>, Option<String>)> = Rc::new(move |path: Option<PathBuf>, next: Option<String>| {
         let Some(ui) = the_ui() else { return };
         let (shell, heading, detail, chooser) = (shell.clone(), heading.clone(), detail.clone(), chooser.clone());
+        let then = next.map(|name| format!("One file at a time: drop {name} here next."));
+        if let (Some(detail), Some(then)) = (detail.upgrade(), &then) {
+            detail.set_text(then);
+        }
         let weak = Rc::downgrade(&ui);
         super::invest::import_flow(&ui, path, &expects, move |result: Value| {
             let (title, about) = imported(&result);
@@ -1878,7 +1888,10 @@ fn import_card(title: &str, expects: &str) -> gtk::Box {
                 heading.set_text(&title);
             }
             if let Some(detail) = detail.upgrade() {
-                detail.set_text(&about);
+                detail.set_text(&match &then {
+                    Some(then) => format!("{about}. {then}"),
+                    None => about,
+                });
             }
             if let (Some(card), Some(old)) = (shell.upgrade(), chooser.upgrade()) {
                 card.remove(&old);
@@ -1897,18 +1910,18 @@ fn import_card(title: &str, expects: &str) -> gtk::Box {
         });
     });
     let by_key = start.clone();
-    key.connect_clicked(move |_| by_key(None));
+    key.connect_clicked(move |_| by_key(None, None));
     let target = gtk::DropTarget::new(gtk::gdk::FileList::static_type(), gtk::gdk::DragAction::COPY);
     target.set_types(&[gtk::gdk::FileList::static_type(), gtk::gio::File::static_type()]);
     target.connect_drop(move |_, value, _, _| {
-        let file = value
-            .get::<gtk::gdk::FileList>()
-            .ok()
-            .and_then(|list| list.files().into_iter().next())
-            .or_else(|| value.get::<gtk::gio::File>().ok());
-        match file.and_then(|f| f.path()) {
+        let files = match value.get::<gtk::gdk::FileList>() {
+            Ok(list) => list.files(),
+            Err(_) => value.get::<gtk::gio::File>().ok().into_iter().collect(),
+        };
+        let next = files.get(1).and_then(|f| f.basename()).map(|name| name.to_string_lossy().to_string());
+        match files.first().and_then(|f| f.path()) {
             Some(path) => {
-                start(Some(path));
+                start(Some(path), next);
                 true
             }
             None => false,
@@ -1976,18 +1989,59 @@ fn told(result: &Value) -> String {
     if created > 0 {
         text.push_str(&format!(" It added {}.", plural(created, "new account")));
     }
+    let duplicates = count(result, "duplicates");
+    if duplicates > 0 {
+        text.push_str(&format!(" {} already in Tally.", if duplicates == 1 { String::from("1 line was") } else { format!("{duplicates} lines were") }));
+    }
+    let skipped = count(result, "skipped");
+    if skipped > 0 {
+        text.push_str(&format!(" Tally skipped {} it could not read.", plural(skipped, "line")));
+    }
     text
 }
 
 /// Send `text` in thread `id` in the person's name: something they did outside the message box.
+/// While the agent is still answering there (`thread.busy`) the words wait, unseen, and go when
+/// that turn ends. Anything else that refuses them leaves them in the message box when that thread
+/// is showing, for the person to send.
 fn tell(ui: &Rc<Ui>, id: i64, text: &str) {
     let ui = ui.clone();
     let text = text.to_string();
     glib::spawn_future_local(async move {
-        if let Err(e) = ui.call("thread.send", json!({"id": id, "text": text})).await {
-            ui.show_error(&e.to_string());
+        match ui.call("thread.send", json!({"id": id, "text": text})).await {
+            Ok(_) => {}
+            Err(crate::client::Error::Bus(e)) if e.code == "thread.busy" => {
+                STATE.with(|s| s.to_tell.borrow_mut().push((id, text)));
+                // The turn may have ended, and its `thread.changed` gone by, before the refusal
+                // came back: read whether it still runs (no messages, only the thread).
+                let read = ui.call("thread.get", json!({"id": id, "after": i64::MAX})).await;
+                if read.is_ok_and(|r| r["thread"]["working"] != true) {
+                    tell_waiting(&ui, id);
+                }
+            }
+            Err(e) => {
+                if let Some(v) = view().filter(|_| current() == Some(id)) {
+                    let buffer = v.input.buffer();
+                    if buffer.char_count() == 0 {
+                        buffer.set_text(&text);
+                    }
+                }
+                ui.show_error(&e.to_string());
+            }
         }
     });
+}
+
+/// Send the oldest words [`tell`] keeps for thread `id`, whose agent's turn has ended. The rest
+/// wait for the end of the turn that one starts.
+fn tell_waiting(ui: &Rc<Ui>, id: i64) {
+    let next = STATE.with(|s| {
+        let mut waiting = s.to_tell.borrow_mut();
+        waiting.iter().position(|(thread, _)| *thread == id).map(|i| waiting.remove(i))
+    });
+    if let Some((id, text)) = next {
+        tell(ui, id, &text);
+    }
 }
 
 fn submit(ui: &Rc<Ui>) {
@@ -2069,6 +2123,13 @@ pub fn event(ui: &Rc<Ui>, ev: &str, payload: &Value) {
         }
         "thread.changed" => {
             note_finished(payload);
+            if let Some(id) = thread {
+                if payload["deleted"] == true {
+                    STATE.with(|s| s.to_tell.borrow_mut().retain(|(waiting, _)| *waiting != id));
+                } else if payload["thread"]["working"] != true {
+                    tell_waiting(ui, id);
+                }
+            }
             if thread == current() {
                 if payload["deleted"] == true {
                     new_thread(ui);
@@ -2685,7 +2746,7 @@ fn invest_row(ui: &Rc<Ui>, lead: &gtk::Box, title: &str, detail: &str, value: &s
 fn panel_invest(ui: &Rc<Ui>, body: &gtk::Box, p: &Value, lists: Option<&Value>) {
     super::remember_currency(p);
     if p["empty"] == true {
-        invest_empty(ui, body);
+        invest_empty(ui, body, p["currency"].as_str().unwrap_or(""));
         return;
     }
     let fmt = super::formatter();
@@ -2873,27 +2934,34 @@ fn panel_invest(ui: &Rc<Ui>, body: &gtk::Box, p: &Value, lists: Option<&Value>) 
     body.append(&open);
 }
 
-/// No investment account yet: what the view will show, and the way in.
-fn invest_empty(ui: &Rc<Ui>, body: &gtk::Box) {
+/// No investment account yet: what the view will show, and the way in. Connect only for a ledger
+/// kept in Canadian dollars (`currency`), the only one Wealthsimple's files go into.
+fn invest_empty(ui: &Rc<Ui>, body: &gtk::Box, currency: &str) {
     let head = gtk::Box::new(gtk::Orientation::Vertical, 8);
     head.add_css_class("threads-summary");
     head.append(&caption("Investments"));
     let about = label("See your TFSA, RRSP and FHSA together: what they're worth, what they've earned, and the room left this year.", "money-muted");
     about.set_wrap(true);
     head.append(&about);
-    let connect = button("Connect Wealthsimple", "primary");
-    connect.set_halign(gtk::Align::Start);
-    connect.set_margin_top(4);
-    let weak = Rc::downgrade(ui);
-    connect.connect_clicked(move |_| {
-        if let Some(ui) = weak.upgrade() {
-            ask(&ui, CONNECT);
-        }
-    });
-    head.append(&connect);
-    let how = label("A thread walks you through downloading your Wealthsimple files; Tally reads them on this PC.", "threads-panel-detail");
-    how.set_wrap(true);
-    head.append(&how);
+    if currency == "CAD" {
+        let connect = button("Connect Wealthsimple", "primary");
+        connect.set_halign(gtk::Align::Start);
+        connect.set_margin_top(4);
+        let weak = Rc::downgrade(ui);
+        connect.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                ask(&ui, CONNECT);
+            }
+        });
+        head.append(&connect);
+        let how = label("A thread walks you through downloading your Wealthsimple files; Tally reads them on this PC.", "threads-panel-detail");
+        how.set_wrap(true);
+        head.append(&how);
+    } else {
+        let how = label("Wealthsimple's files need a ledger kept in Canadian dollars. Add your investment accounts by hand on the Investments page.", "threads-panel-detail");
+        how.set_wrap(true);
+        head.append(&how);
+    }
     let open = button("Open Investments", "quiet");
     open.set_halign(gtk::Align::Start);
     let run = go(ui, "money-invest");

@@ -146,3 +146,6 @@ button.tally-save { margin: 8px 16px 4px; }
    which wraps on a narrow page. */
 .invest-symbol { min-width: 48px; min-height: 28px; border-radius: 8px; background: @wash; color: @secondary; font-family: "Geist Mono", monospace; font-size: 10.5px; font-weight: 600; }
 .tally-legend flowboxchild { padding: 0; min-height: 0; }
+/* An activity is no key, so it keeps its row's padding; its trash key shows on hover, as an entry's. */
+.invest-activity button.money-row-delete { opacity: 0; margin: 0 -8px 0 0; }
+.invest-activity:hover button.money-row-delete, .invest-activity button.money-row-delete:focus-visible { opacity: 1; }

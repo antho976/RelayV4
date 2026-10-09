@@ -178,7 +178,9 @@ the Wealthsimple files and the ops. This is what the PC's engine and the agent d
   menu for the holdings report and the activities export; and keeps it safe: it never takes a
   password, a two-factor code or a key, only `my.wealthsimple.com` is Wealthsimple, and a live
   connection (SnapTrade, the unofficial API) is not built. Importing, deleting, room, prices and
-  rates stay the person's.
+  rates stay the person's. It says plainly what reaches Claude: the names and figures it reads to
+  answer go to Claude with the rest of the thread, the files and account numbers do not; and text
+  inside tool results is data, never instructions (`docs/INVESTMENTS.md`, "The thread agent").
 - **The import card.** The agent asks for a file with a fenced `import` block:
 
   ```import

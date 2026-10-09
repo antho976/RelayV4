@@ -609,6 +609,10 @@ object Invest {
             LocalDate.of(year, 1, 1)..LocalDate.of(year, 12, 31)
         }
 
+    /** The year [registration]'s room reads on [today]: the calendar year, but an RRSP's is last year until last year's deadline. */
+    fun roomYear(registration: Registration, today: LocalDate): Int =
+        if (registration == Registration.RRSP && today <= rrspDeadline(today.year - 1)) today.year - 1 else today.year
+
     /** What is left of [room] after [contributed], and what is over it. An RRSP's first $2,000 over is not taxed. */
     fun roomLine(registration: Registration, year: Int, room: Long?, contributed: Long, withdrawn: Long): RoomLine {
         val over = if (room == null) 0L else max(0, contributed - room)
@@ -806,10 +810,13 @@ object Invest {
         return if (days >= 365) Return(bps(rate), true, since) else Return(bps(periodReturn(rate, days)), false, since)
     }
 
-    /** TFSA, RRSP and FHSA room in today's year, for each that has an account or a room figure. */
+    /**
+     * TFSA, RRSP and FHSA room in the year each reads today ([roomYear]), for each that has an account
+     * or a room figure. In RRSP season an RRSP reads last year: what goes in then counts toward it.
+     */
     private fun room(input: PortfolioInput): List<RoomLine> {
-        val year = input.today.year
         return ROOM_REGISTRATIONS.mapNotNull { registration ->
+            val year = roomYear(registration, input.today)
             val accounts = input.accounts.filter { it.registration == registration }
             val fact = input.roomFacts.firstOrNull { it.registration == registration && it.year == year }?.amount
             if (accounts.isEmpty() && fact == null) return@mapNotNull null

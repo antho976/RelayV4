@@ -295,7 +295,8 @@ private fun Figures(view: InvestView, modifier: Modifier = Modifier) {
 @Composable
 private fun RoomPanel(state: InvestState, view: InvestView, actions: InvestActions, modifier: Modifier = Modifier) {
     Panel(modifier) {
-        PanelHeader("Room", meta = view.room.firstOrNull()?.year?.toString())
+        // In RRSP season the RRSP row reads last year, so a year shared by every row is the only one to show.
+        PanelHeader("Room", meta = view.room.map { it.year }.distinct().singleOrNull()?.toString())
         view.room.forEach { line -> key(line.registration) { RoomRow(line, state.today) { actions.setRoom(line.registration) } } }
         Spacer(Modifier.height(10.dp))
         Caption("Your room from CRA My Account, less what went in. The tick is an even pace to the deadline.")
