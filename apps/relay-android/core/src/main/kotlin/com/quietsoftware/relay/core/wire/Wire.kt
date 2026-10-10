@@ -212,14 +212,21 @@ data class BusError(
     val transient: Boolean get() = kind == "unavailable" || code == "link.down" || code == "link.timeout" || code == "app.quitting"
 
     companion object {
-        fun from(o: JsonObject) = BusError(
+        fun from(o: JsonObject): BusError {
+            val code = o.str("code") ?: "unknown"
+            return BusError(
             kind = o.str("kind") ?: "internal",
-            code = o.str("code") ?: "unknown",
-            message = o.str("message").orEmpty(),
+            code = code,
+            // The door's own wording ("… is not open to a paired phone") reads as a fault; it means
+            // the PC runs a Relay older than this app.
+            message = if (code == "remote.op") UPDATE_PC else o.str("message").orEmpty(),
             hint = o.str("hint"),
             details = o["details"] as? JsonObject,
             confirm = o["confirm"] as? JsonObject,
-        )
+            )
+        }
+
+        const val UPDATE_PC = "Your PC runs an older Relay that does not open this to a phone yet. Update Relay on the PC and restart it to use it here."
 
         fun link(code: String, message: String) = BusError("unavailable", code, message)
     }

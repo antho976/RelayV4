@@ -114,15 +114,24 @@ fun TerminalView(
                             awaitFirstDown(requireUnconsumed = false)
                             var travel = 0f
                             var gesture = false
+                            // A pinch scales the size it started from: touches arrive several times
+                            // per frame, faster than the size shown can follow.
+                            var pinchFrom = 0f
+                            var pinch = 0f
                             do {
                                 val event = awaitPointerEvent()
                                 val pressed = event.changes.count { it.pressed }
                                 if (pressed >= 2) {
-                                    val zoom = event.calculateZoom()
-                                    if (zoom != 1f) setFont((fontState * zoom).coerceIn(MIN_SP, MAX_SP))
+                                    if (pinch == 0f) {
+                                        pinchFrom = fontState
+                                        pinch = 1f
+                                    }
+                                    pinch *= event.calculateZoom()
+                                    setFont((pinchFrom * pinch).coerceIn(MIN_SP, MAX_SP))
                                     event.changes.forEach { it.consume() }
                                     gesture = true
                                 } else if (pressed == 1) {
+                                    pinch = 0f
                                     val dy = event.changes.first { it.pressed }.positionChange().y
                                     travel += dy
                                     if (gesture || kotlin.math.abs(travel) > slop) {
