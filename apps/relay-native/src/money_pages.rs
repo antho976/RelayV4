@@ -279,7 +279,7 @@ fn title(head: &gtk::Box, name: &str, context: &str) {
 }
 
 /// A card: its title, an optional text action on the right, and the box its rows go in.
-fn card(parent: &gtk::Box, name: &str, action: Option<(&str, Action)>) -> gtk::Box {
+pub(super) fn card(parent: &gtk::Box, name: &str, action: Option<(&str, Action)>) -> gtk::Box {
     let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
     card.add_css_class("tally-card");
     let head = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -301,7 +301,7 @@ fn card(parent: &gtk::Box, name: &str, action: Option<(&str, Action)>) -> gtk::B
 }
 
 /// `n` columns of equal width under `parent`, side by side.
-fn columns(parent: &gtk::Box, n: usize) -> Vec<gtk::Box> {
+pub(super) fn columns(parent: &gtk::Box, n: usize) -> Vec<gtk::Box> {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 16);
     row.set_homogeneous(true);
     let columns = (0..n)
@@ -371,7 +371,7 @@ pub fn tile(icon: &str) -> gtk::Box {
 }
 
 /// A row of a card: a leading tile, a title over a detail, and a figure at the end.
-fn icon_row(lead: &gtk::Box, title: &str, detail: &str, figure: &str, figure_class: &str) -> gtk::Box {
+pub(super) fn icon_row(lead: &gtk::Box, title: &str, detail: &str, figure: &str, figure_class: &str) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     row.add_css_class("tally-row");
     row.append(lead);
@@ -1143,7 +1143,7 @@ fn budget_row(
 }
 
 /// A settings row: a mark, what it is over a line about it, and its control at the end.
-fn setting_row(list: &gtk::Box, icon: &str, title: &str, about: &str, control: &impl IsA<gtk::Widget>) {
+pub(super) fn setting_row(list: &gtk::Box, icon: &str, title: &str, about: &str, control: &impl IsA<gtk::Widget>) {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     row.add_css_class("tally-row");
     row.add_css_class("tally-setting");

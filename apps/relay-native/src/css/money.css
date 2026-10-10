@@ -10,7 +10,9 @@
 .space-switch button:checked, .space-switch button:checked:hover { background: @ink; color: @wall; }
 .space-switch button:checked label { color: @wall; }
 
-.money-root, scrolledwindow.money-scroll, scrolledwindow.money-scroll > viewport { background: @wall; color: @ink; }
+/* See-through to the wallpaper: the page stack's @wall is the one layer (threads.css). */
+.money-root { color: @ink; }
+.money-root, scrolledwindow.money-scroll, scrolledwindow.money-scroll > viewport { background: transparent; }
 .money-page { padding: 22px 32px 40px; }
 
 /* Geist throughout, as in Dev; Geist Mono for figures and labels. */

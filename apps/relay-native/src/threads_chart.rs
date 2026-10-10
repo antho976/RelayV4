@@ -5,6 +5,11 @@
 //! are drawn with cairo; their axis and labels are plain labels around the drawing, in Dev's type.
 //! Colour is the data's: the newest period in Relay's signal, the ones before it in a fixed
 //! palette, and categories in their own hue.
+//!
+//! A `price` chart is Arbiter's: `{"type": "price", "title", "arbiter": <an arbiter.series
+//! payload>, "cutoff": "2025-03-01"}`. It draws the closes, a strategy's buys (filled green) and
+//! sells (hollow), and, given `cutoff`, where the model's memory ends: what it may remember is
+//! shaded. It reads again on every `arbiter.changed` (`refresh_prices`).
 use super::pages::HUES;
 use crate::app::{clear, label};
 use gtk::prelude::*;
@@ -25,10 +30,14 @@ const AXIS_W: i32 = 56;
 
 /// A chart drawn from a question: its body, its legend and the question.
 type Live = (glib::WeakRef<gtk::Box>, glib::WeakRef<gtk::Box>, ChartSpec);
+/// A price chart on screen: its body, its legend and what it asks Arbiter.
+type PriceLive = (glib::WeakRef<gtk::Box>, glib::WeakRef<gtk::Box>, PriceSpec);
 
 thread_local! {
     /// Charts drawn from a question, to read again when the ledger moves.
     static LIVE: RefCell<Vec<Live>> = const { RefCell::new(Vec::new()) };
+    /// Price charts, to read again when Arbiter moves.
+    static PRICES: RefCell<Vec<PriceLive>> = const { RefCell::new(Vec::new()) };
 }
 
 fn rgb(hex: &str) -> (f64, f64, f64) {
@@ -396,4 +405,362 @@ fn donut(body: &gtk::Box, data: &Data) {
     }
     row.append(&list);
     body.append(&row);
+}
+
+/// The price line: blue, so green and ink stay the buys' and the sells'.
+const PRICE_LINE: &str = "#6A9FD8";
+const BUY: &str = "#2ec469";
+const SELL: &str = "#EDE9E2";
+
+/// A price chart's question: `query` is an `arbiter.series` payload; `cutoff` (Unix seconds) is
+/// where the model's training data ends.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PriceSpec {
+    pub title: String,
+    pub query: Value,
+    pub cutoff: Option<i64>,
+}
+
+/// Read a ```` ```chart ```` block of `"type": "price"`. `None` for any other chart.
+pub fn price_spec(text: &str) -> Option<PriceSpec> {
+    let v: Value = serde_json::from_str(text.trim()).ok()?;
+    if v["type"].as_str() != Some("price") {
+        return None;
+    }
+    let query = v.get("arbiter").filter(|q| q["product"].is_string())?.clone();
+    Some(PriceSpec { title: v["title"].as_str().unwrap_or("").to_string(), query, cutoff: v["cutoff"].as_str().and_then(utc_day) })
+}
+
+/// "2025-03-01" as midnight UTC, or a full RFC 3339 time, in Unix seconds.
+fn utc_day(value: &str) -> Option<i64> {
+    if let Ok(t) = glib::DateTime::from_iso8601(value, Some(&glib::TimeZone::utc())) {
+        return Some(t.to_unix());
+    }
+    let mut parts = value.trim().split('-').map(|p| p.parse::<i32>().ok());
+    let (y, m, d) = (parts.next()??, parts.next()??, parts.next()??);
+    glib::DateTime::from_utc(y, m, d, 0, 0, 0.0).ok().map(|t| t.to_unix())
+}
+
+/// A price card for `spec`, reading its candles now and on every `arbiter.changed`.
+pub fn price_card(spec: PriceSpec) -> gtk::Box {
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    card.add_css_class("threads-chart");
+    let head = gtk::Box::new(gtk::Orientation::Horizontal, 14);
+    let product = spec.query["product"].as_str().unwrap_or("Price").to_string();
+    let title = label(if spec.title.is_empty() { &product } else { &spec.title }, "threads-chart-title");
+    title.set_wrap(true);
+    head.append(&title);
+    let legend = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    legend.set_hexpand(true);
+    legend.set_halign(gtk::Align::End);
+    head.append(&legend);
+    card.append(&head);
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    body.append(&label("Reading prices…", "threads-chart-note"));
+    card.append(&body);
+    let foot = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    foot.add_css_class("threads-chart-foot");
+    let lamp = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    lamp.add_css_class("threads-dot");
+    lamp.set_valign(gtk::Align::Center);
+    foot.append(&lamp);
+    foot.append(&label("Live from Arbiter, redraws when it trades", "threads-chart-note"));
+    card.append(&foot);
+    PRICES.with(|l| {
+        let mut l = l.borrow_mut();
+        l.retain(|(body, _, _)| body.upgrade().is_some());
+        l.push((body.downgrade(), legend.downgrade(), spec.clone()));
+    });
+    load_price(&body, &legend, &spec);
+    card
+}
+
+/// Read every price chart still on screen again.
+pub fn refresh_prices() {
+    let live: Vec<_> = PRICES.with(|l| {
+        let mut l = l.borrow_mut();
+        l.retain(|(body, _, _)| body.upgrade().is_some());
+        l.iter().filter_map(|(b, g, s)| Some((b.upgrade()?, g.upgrade()?, s.clone()))).collect()
+    });
+    for (body, legend, spec) in live {
+        load_price(&body, &legend, &spec);
+    }
+}
+
+fn load_price(body: &gtk::Box, legend: &gtk::Box, spec: &PriceSpec) {
+    let Some(ui) = super::threads::the_ui_pub() else { return };
+    let (body, legend, query, cutoff) = (body.downgrade(), legend.downgrade(), spec.query.clone(), spec.cutoff);
+    glib::spawn_future_local(async move {
+        let read = ui.call("arbiter.series", query).await;
+        let (Some(body), Some(legend)) = (body.upgrade(), legend.upgrade()) else { return };
+        match read {
+            Ok(series) => draw_price(&body, &legend, &series, cutoff),
+            Err(e) => {
+                clear(&body);
+                let message = match &e {
+                    crate::client::Error::Bus(b) => b.message.clone(),
+                    e => e.to_string(),
+                };
+                let note = label(&format!("These prices could not be read: {message}"), "threads-error");
+                note.set_wrap(true);
+                body.append(&note);
+            }
+        }
+    });
+}
+
+/// Round steps for a price axis from `lo` to `hi`: (step, bottom, top).
+fn price_ticks(lo: f64, hi: f64) -> (f64, f64, f64) {
+    let span = (hi - lo).max(hi.abs() * 1e-4).max(1e-9);
+    let rough = span / 4.0;
+    let power = 10_f64.powf(rough.log10().floor());
+    let step = [1.0, 2.0, 2.5, 5.0, 10.0].iter().map(|m| m * power).find(|s| *s >= rough).unwrap_or(10.0 * power);
+    (step, (lo / step).floor() * step, (hi / step).ceil() * step)
+}
+
+/// A price for an axis: grouped, with as many decimals as the step needs.
+fn axis_price(x: f64, step: f64) -> String {
+    let decimals = (-step.log10().floor()).max(0.0) as usize;
+    let text = format!("{x:.decimals$}");
+    let (whole, fraction) = text.split_once('.').map_or((text.as_str(), None), |(w, f)| (w, Some(f)));
+    let (sign, digits) = whole.strip_prefix('-').map_or(("", whole), |d| ("−", d));
+    let mut grouped = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(c);
+    }
+    match fraction {
+        Some(f) => format!("{sign}{grouped}.{f}"),
+        None => format!("{sign}{grouped}"),
+    }
+}
+
+/// A price in a tooltip: cents above 1, six places below.
+fn tip_price(p: f64) -> String {
+    axis_price(p, if p >= 1.0 { 0.01 } else { 0.000_001 })
+}
+
+fn local_time(unix: i64, format: &str) -> String {
+    glib::DateTime::from_unix_local(unix).ok().and_then(|d| d.format(format).ok()).map(|s| s.to_string()).unwrap_or_default()
+}
+
+fn ring(hex: &str, filled: bool) -> gtk::DrawingArea {
+    let (r, g, b) = rgb(hex);
+    let area = gtk::DrawingArea::new();
+    area.set_content_width(10);
+    area.set_content_height(10);
+    area.set_valign(gtk::Align::Center);
+    area.set_draw_func(move |_, cr, w, h| {
+        cr.set_source_rgb(r, g, b);
+        cr.arc(f64::from(w) / 2.0, f64::from(h) / 2.0, 3.6, 0.0, 2.0 * PI);
+        if filled {
+            let _ = cr.fill();
+        } else {
+            cr.set_line_width(1.5);
+            let _ = cr.stroke();
+        }
+    });
+    area
+}
+
+/// The closes as a line over a price axis, the trades on it, and the memory line.
+fn draw_price(body: &gtk::Box, legend: &gtk::Box, v: &Value, cutoff: Option<i64>) {
+    clear(body);
+    clear(legend);
+    let candles: Vec<(i64, f64)> = v["candles"].as_array().into_iter().flatten().filter_map(|c| Some((c["start"].as_i64()?, c["close"].as_f64()?))).collect();
+    if candles.len() < 2 {
+        body.append(&label("No prices to draw yet.", "threads-chart-note"));
+        return;
+    }
+    // (when, a buy, the price).
+    let markers: Vec<(i64, bool, f64)> = v["markers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| Some((m["at"].as_i64()?, m["side"].as_str()? == "buy", m["price"].as_f64()?)))
+        .collect();
+    let product = v["product"].as_str().unwrap_or("Price");
+    let item = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    item.append(&dot(PRICE_LINE));
+    item.append(&label(product, "threads-chart-legend"));
+    legend.append(&item);
+    if markers.iter().any(|m| m.1) {
+        let item = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        item.append(&ring(BUY, true));
+        item.append(&label("Bought", "threads-chart-legend"));
+        legend.append(&item);
+    }
+    if markers.iter().any(|m| !m.1) {
+        let item = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        item.append(&ring(SELL, false));
+        item.append(&label("Sold", "threads-chart-legend"));
+        legend.append(&item);
+    }
+    let (t0, t1) = (candles[0].0, candles[candles.len() - 1].0);
+    let prices = candles.iter().map(|c| c.1).chain(markers.iter().map(|m| m.2));
+    let (lo, hi) = prices.fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p), hi.max(p)));
+    let (step, bottom, top) = price_ticks(lo, hi);
+    let span = (top - bottom).max(1e-9);
+    let y_of = move |value: f64, h: f64| PAD_T + (top - value) / span * (h - PAD_T - PAD_B);
+    let left = f64::from(AXIS_W);
+    let x_of = move |t: i64, w: f64| left + (t - t0) as f64 / (t1 - t0).max(1) as f64 * (w - left - 4.0).max(10.0);
+    // Where the memory line falls: inside the range, or before or after all of it.
+    let memory = cutoff.filter(|c| *c > t0 && *c < t1);
+
+    let overlay = gtk::Overlay::new();
+    let area = gtk::DrawingArea::new();
+    area.set_content_height(PLOT_H);
+    area.set_hexpand(true);
+    overlay.set_child(Some(&area));
+    let ticks = ((top - bottom) / step).round() as i64;
+    for k in 0..=ticks {
+        let value = bottom + k as f64 * step;
+        let tick = label(&axis_price(value, step), "threads-chart-axis");
+        tick.set_halign(gtk::Align::Start);
+        tick.set_valign(gtk::Align::Start);
+        tick.set_margin_top((y_of(value, f64::from(PLOT_H)) - 7.0).max(0.0) as i32);
+        tick.set_can_target(false);
+        overlay.add_overlay(&tick);
+    }
+    if let Some(at) = memory {
+        let words = label("model's memory ends", "threads-chart-memory");
+        words.set_halign(gtk::Align::Start);
+        words.set_valign(gtk::Align::Start);
+        words.set_can_target(false);
+        overlay.add_overlay(&words);
+        // The label sits just right of the line, wherever the width puts it.
+        let placed = words.downgrade();
+        area.connect_resize(move |_, w, _| {
+            if let Some(words) = placed.upgrade() {
+                words.set_margin_start(x_of(at, f64::from(w)) as i32 + 6);
+            }
+        });
+    }
+    body.append(&overlay);
+
+    let drawn = candles.clone();
+    let marks = markers.clone();
+    area.set_draw_func(move |_, cr, width, height| {
+        let (w, h) = (f64::from(width), f64::from(height));
+        for k in 0..=ticks {
+            let y = y_of(bottom + k as f64 * step, h).round() + 0.5;
+            let (r, g, b) = rgb("#242220");
+            cr.set_source_rgb(r, g, b);
+            cr.set_line_width(1.0);
+            cr.move_to(left, y);
+            cr.line_to(w - 4.0, y);
+            let _ = cr.stroke();
+        }
+        if let Some(at) = memory {
+            // What the model may remember, faintly shaded, and the line where it stops.
+            let x = x_of(at, w).round() + 0.5;
+            cr.set_source_rgba(0.93, 0.91, 0.89, 0.05);
+            cr.rectangle(left, 0.0, x - left, h);
+            let _ = cr.fill();
+            let (r, g, b) = rgb("#8C877F");
+            cr.set_source_rgb(r, g, b);
+            cr.set_line_width(1.0);
+            cr.set_dash(&[4.0, 3.0], 0.0);
+            cr.move_to(x, 0.0);
+            cr.line_to(x, h);
+            let _ = cr.stroke();
+            cr.set_dash(&[], 0.0);
+        }
+        let (r, g, b) = rgb(PRICE_LINE);
+        cr.set_source_rgb(r, g, b);
+        cr.set_line_width(2.0);
+        cr.set_line_join(gtk::cairo::LineJoin::Round);
+        for (i, (t, close)) in drawn.iter().enumerate() {
+            let (x, y) = (x_of(*t, w), y_of(*close, h));
+            if i == 0 { cr.move_to(x, y) } else { cr.line_to(x, y) }
+        }
+        let _ = cr.stroke();
+        for (t, buy, price) in &marks {
+            let (x, y) = (x_of(*t, w), y_of(*price, h));
+            if *buy {
+                // A dark ring keeps a dot readable where it sits on the line.
+                let (r, g, b) = rgb("#131211");
+                cr.set_source_rgb(r, g, b);
+                cr.arc(x, y, 5.5, 0.0, 2.0 * PI);
+                let _ = cr.fill();
+                let (r, g, b) = rgb(BUY);
+                cr.set_source_rgb(r, g, b);
+                cr.arc(x, y, 4.0, 0.0, 2.0 * PI);
+                let _ = cr.fill();
+            } else {
+                let (r, g, b) = rgb("#131211");
+                cr.set_source_rgb(r, g, b);
+                cr.arc(x, y, 4.5, 0.0, 2.0 * PI);
+                let _ = cr.fill();
+                let (r, g, b) = rgb(SELL);
+                cr.set_source_rgb(r, g, b);
+                cr.set_line_width(1.75);
+                cr.arc(x, y, 4.0, 0.0, 2.0 * PI);
+                let _ = cr.stroke();
+            }
+        }
+    });
+    // Hovering says the bar's time and close, and the trades on it.
+    area.set_has_tooltip(true);
+    let bar = (t1 - t0) / (candles.len() as i64 - 1).max(1);
+    area.connect_query_tooltip(move |area, x, _, _, tooltip| {
+        let w = f64::from(area.width());
+        let plot_w = (w - left - 4.0).max(10.0);
+        if f64::from(x) < left {
+            return false;
+        }
+        let t = t0 + ((f64::from(x) - left) / plot_w * (t1 - t0) as f64) as i64;
+        let Some((at, close)) = candles.iter().min_by_key(|c| (c.0 - t).abs()) else { return false };
+        let mut lines = vec![local_time(*at, "%a %-d %b %H:%M"), tip_price(*close)];
+        for (when, buy, price) in markers.iter().filter(|m| m.0 >= *at && m.0 < at + bar.max(1)) {
+            lines.push(format!("{} at {} · {}", if *buy { "Bought" } else { "Sold" }, tip_price(*price), local_time(*when, "%H:%M")));
+        }
+        tooltip.set_text(Some(&lines.join("\n")));
+        true
+    });
+
+    // Five times under the plot.
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    row.set_homogeneous(true);
+    row.set_margin_start(AXIS_W);
+    row.set_margin_end(4);
+    let format = if t1 - t0 > 3 * 86_400 { "%-d %b" } else { "%H:%M" };
+    for i in 0..5 {
+        let t = t0 + ((t1 - t0) as f64 * (f64::from(i) + 0.5) / 5.0) as i64;
+        let l = label(&local_time(t, format), "threads-chart-x");
+        l.set_xalign(0.5);
+        row.append(&l);
+    }
+    body.append(&row);
+    match cutoff {
+        Some(c) if c <= t0 => body.append(&label(&format!("Every bar here is after the model's memory ends ({}).", local_time(c, "%-d %b %Y")), "threads-chart-note")),
+        Some(c) if c >= t1 => body.append(&label("The model's memory reaches past every bar here: it may remember how this went.", "threads-chart-note")),
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_price_block_keeps_its_question_and_memory_line() {
+        let spec = price_spec(r#"{"type":"price","title":"ETH","arbiter":{"product":"ETH-CAD","granularity":"ONE_HOUR","bars":300,"strategy_id":2},"cutoff":"2025-03-01"}"#).unwrap();
+        assert_eq!(spec.query["product"], "ETH-CAD");
+        assert_eq!(spec.cutoff, Some(1_740_787_200));
+        assert!(price_spec(r#"{"type":"bar","query":{}}"#).is_none());
+        assert!(price_spec(r#"{"type":"price"}"#).is_none());
+    }
+
+    #[test]
+    fn price_axes_round_and_group() {
+        let (step, bottom, top) = price_ticks(3912.0, 4188.0);
+        assert_eq!(step, 100.0);
+        assert_eq!((bottom, top), (3900.0, 4200.0));
+        assert_eq!(axis_price(4200.0, step), "4,200");
+        assert_eq!(axis_price(0.2134, 0.01), "0.21");
+        assert_eq!(tip_price(4123.456), "4,123.46");
+    }
 }

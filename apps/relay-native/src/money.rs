@@ -23,6 +23,8 @@ mod pages;
 pub(crate) mod threads;
 #[path = "threads_chart.rs"]
 mod chart;
+#[path = "arbiter_pages.rs"]
+mod arbiter;
 
 /// Tally's pages, in tab order: (stack name, caption, glyph).
 pub const PAGES: [(&str, &str, &str); 4] = [
@@ -61,6 +63,8 @@ struct State {
     period_offset: Cell<i64>,
     query: RefCell<String>,
     currency: RefCell<String>,
+    /// An `arbiter.changed` is being waited on: the runner can announce several in a moment.
+    arbiter_pending: Cell<bool>,
 }
 
 thread_local! {
@@ -68,7 +72,7 @@ thread_local! {
 }
 
 pub fn is_page(page: &str) -> bool {
-    page == threads::PAGE || page.starts_with("money-")
+    page == threads::PAGE || page.starts_with("money-") || page.starts_with("arbiter-")
 }
 
 /// Whether the Money space is the one showing.
@@ -153,17 +157,19 @@ pub fn sidebar_keys() -> gtk::Box {
     nav
 }
 
-/// Money's pages, added to the window's content stack.
+/// Money's pages, added to the window's content stack: the threads, Tally's and Arbiter's.
 pub fn add_pages(content: &gtk::Stack) {
     content.add_named(&threads::page(), Some(threads::PAGE));
-    for (name, _, _) in PAGES {
+    let tally = PAGES.iter().map(|(name, _, _)| (*name, tally_tabs(name)));
+    let arbiter = arbiter::ALL.iter().map(|name| (*name, arbiter::tabs(name)));
+    for (name, tabs) in tally.chain(arbiter) {
         let head = gtk::Box::new(gtk::Orientation::Vertical, 4);
         head.add_css_class("money-head");
         let body = gtk::Box::new(gtk::Orientation::Vertical, 16);
         body.add_css_class("money-body");
         let column = gtk::Box::new(gtk::Orientation::Vertical, 18);
         column.add_css_class("money-page");
-        column.append(&tally_tabs(name));
+        column.append(&tabs);
         column.append(&head);
         column.append(&body);
         let scroll = crate::app::scrolled(&column);
@@ -305,13 +311,33 @@ pub fn install(ui: &Rc<Ui>, nav: &gtk::Box, add: &gtk::Button, dev_only: Vec<gtk
         }
     });
     nav.append(&tally_key);
-    let weak = tally_key.downgrade();
+    // Arbiter, Tally's sibling, with a lamp for what its strategies are doing.
+    let arbiter_key = button("", "nav");
+    arbiter_key.set_widget_name("nav-arbiter-home");
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 9);
+    row.append(&arbiter::icon("arbiter", 16));
+    let caption = label("Arbiter", "nav-label");
+    caption.set_hexpand(true);
+    row.append(&caption);
+    row.append(&arbiter::lamp_widget());
+    arbiter_key.set_child(Some(&row));
+    let weak = Rc::downgrade(ui);
+    arbiter_key.connect_clicked(move |_| {
+        if let Some(ui) = weak.upgrade() {
+            ui.navigate("arbiter-home");
+        }
+    });
+    nav.append(&arbiter_key);
+    let keys = [(tally_key.downgrade(), "money-"), (arbiter_key.downgrade(), "arbiter-")];
     ui.content.connect_visible_child_name_notify(move |stack| {
-        if let Some(key) = weak.upgrade() {
-            if stack.visible_child_name().is_some_and(|n| n.starts_with("money-")) {
-                key.add_css_class("selected");
-            } else {
-                key.remove_css_class("selected");
+        let showing = stack.visible_child_name();
+        for (key, prefix) in &keys {
+            if let Some(key) = key.upgrade() {
+                if showing.as_ref().is_some_and(|n| n.starts_with(prefix)) {
+                    key.add_css_class("selected");
+                } else {
+                    key.remove_css_class("selected");
+                }
             }
         }
     });
@@ -323,6 +349,7 @@ pub fn install(ui: &Rc<Ui>, nav: &gtk::Box, add: &gtk::Button, dev_only: Vec<gtk
         }
     });
     pages::install(ui);
+    arbiter::install();
 }
 
 /// Shows `money`'s keys and look. Navigation calls it through [`follow`].
@@ -416,7 +443,11 @@ pub async fn refresh(ui: &Rc<Ui>, page: &str) {
     } else {
         // The sidebar's thread list shows over Tally's pages too.
         threads::refresh_list(ui);
-        pages::refresh(ui, page).await;
+        if page.starts_with("arbiter-") {
+            arbiter::refresh(ui, page).await;
+        } else {
+            pages::refresh(ui, page).await;
+        }
     }
 }
 
@@ -429,6 +460,27 @@ pub fn changed(ui: &Rc<Ui>) {
     } else if is_page(&page) {
         ui.refresh_page();
     }
+}
+
+/// `arbiter.changed`: a strategy, an order or a setting moved. Several in a moment are read once:
+/// the sidebar lamp, the cards in the conversation, and the page showing.
+pub fn arbiter_changed(ui: &Rc<Ui>) {
+    if STATE.with(|s| s.arbiter_pending.replace(true)) {
+        return;
+    }
+    let weak = Rc::downgrade(ui);
+    glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || {
+        STATE.with(|s| s.arbiter_pending.set(false));
+        let Some(ui) = weak.upgrade() else { return };
+        arbiter::changed(&ui);
+        let page = ui.page.borrow().clone();
+        if page == threads::PAGE {
+            threads::refresh_arbiter_panel(&ui);
+            chart::refresh_prices();
+        } else if page.starts_with("arbiter-") {
+            ui.refresh_page();
+        }
+    });
 }
 
 /// A Tally glyph, for the Threads page's own marks.
@@ -457,6 +509,11 @@ pub fn palette_entries() -> Vec<(&'static str, String)> {
     for (name, caption, _) in PAGES {
         entries.push((name, format!("Tally {}", caption.to_lowercase())));
     }
+    for (name, caption) in arbiter::PAGES {
+        entries.push((name, format!("Arbiter {}", caption.to_lowercase())));
+    }
+    // The kill switch, from anywhere (docs/ARBITER.md).
+    entries.push(("arbiter-halt", String::from("Arbiter: halt all")));
     entries
 }
 
@@ -466,6 +523,7 @@ pub fn run_palette(ui: &Rc<Ui>, key: &str) {
         "start" => show_start(ui),
         "thread" => threads::new_thread(ui),
         "add" => add_entry(ui),
+        "arbiter-halt" => arbiter::halt_all(ui),
         page => ui.navigate(page),
     }
 }
@@ -476,6 +534,8 @@ pub fn startup(ui: &Rc<Ui>) {
     if STATE.with(|s| s.started.replace(true)) {
         return;
     }
+    // The sidebar's Arbiter lamp, lit before its page is ever opened.
+    arbiter::read_summary(ui);
     if std::env::var_os("RELAY_NATIVE_SCREENSHOT").is_some() {
         return;
     }

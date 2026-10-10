@@ -4,7 +4,7 @@
   "title": "RELAY v4 command bus",
   "description": "Generated from crates/relay-bus by `relay schema`. Do not edit; see docs/engine/BUS.md.",
   "version": 1,
-  "op_count": 257,
+  "op_count": 280,
   "envelope": {
     "request": {
       "$ref": "#/$defs/Request"
@@ -4991,6 +4991,448 @@
       },
       "result": {
         "$ref": "#/$defs/Empty"
+      }
+    },
+    "arbiter.summary": {
+      "summary": "The Arbiter overview: the exchange connection, paper and live accounts, every strategy and what it is doing, today's use of the limits, what waits for approval, open orders, recent fills and prices",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/Empty"
+      },
+      "result": {
+        "$ref": "#/$defs/ArbiterSummary"
+      }
+    },
+    "arbiter.strategy.get": {
+      "summary": "One strategy: its rule in sentences, limits, latest backtest, paper and live records, decision log, orders and fills",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/ArbiterIdIn"
+      },
+      "result": {
+        "$ref": "#/$defs/ArbiterStrategy"
+      }
+    },
+    "arbiter.order.list": {
+      "summary": "Orders, newest first, each with what decided it",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/ArbiterListIn"
+      },
+      "result": {
+        "$ref": "#/$defs/ArbiterOrdersOut"
+      }
+    },
+    "arbiter.decision.list": {
+      "summary": "The decision log, newest first: every buy, sell, skip, refusal, halt and approval, and why",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/ArbiterListIn"
+      },
+      "result": {
+        "$ref": "#/$defs/ArbiterDecisionsOut"
+      }
+    },
+    "arbiter.products": {
+      "summary": "The exchange's spot products with their sizes, increments, price and 24-hour change. Only these exist: never trade or backtest a product not listed here",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/ArbiterProductsIn"
+      },
+      "result": {
+        "$ref": "#/$defs/ArbiterProductsOut"
+      }
+    },
+    "arbiter.series": {
+      "summary": "A chart's numbers: candles for a product, with a strategy's trades marked",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/ArbiterSeriesIn"
+      },
+      "result": {
+        "$ref": "#/$defs/ArbiterSeries"
+      }
+    },
+    "arbiter.backtest": {
+      "summary": "Backtest a strategy or a draft on the exchange's candles: next-bar fills, the account's fees and slippage, a tuned part and a judged part, beside buying and holding. Counts toward the strategy's versions tried",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/ArbiterBacktestIn"
+      },
+      "result": {
+        "$ref": "#/$defs/ArbiterBacktest"
+      }
+    },
+    "arbiter.proposal.list": {
+      "summary": "Proposals, pending first: agents' suggestions and orders waiting for approval",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/ArbiterProposalListIn"
+      },
+      "result": {
+        "$ref": "#/$defs/ArbiterProposalsOut"
+      }
+    },
+    "arbiter.key.set": {
+      "summary": "Check a Coinbase key with Coinbase and keep it in the system keyring. A key that can transfer money out is refused",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "arbiter.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/ArbiterKeySetIn"
+      },
+      "result": {
+        "$ref": "#/$defs/ArbiterConnection"
+      }
+    },
+    "arbiter.key.remove": {
+      "summary": "Forget the Coinbase key; live strategies stop",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "arbiter.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/Empty"
+      },
+      "result": {
+        "$ref": "#/$defs/ArbiterConnection"
+      }
+    },
+    "arbiter.refresh": {
+      "summary": "Read balances, fees and the key's permissions from the exchange now",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [
+        "arbiter.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/Empty"
+      },
+      "result": {
+        "$ref": "#/$defs/ArbiterConnection"
+      }
+    },
+    "arbiter.strategy.save": {
+      "summary": "Create a strategy or save a new version of one",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "arbiter.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/ArbiterStrategySaveIn"
+      },
+      "result": {
+        "$ref": "#/$defs/ArbiterStrategy"
+      }
+    },
+    "arbiter.strategy.set": {
+      "summary": "Change who decides, paper or live, or start and stop a strategy. Live needs a key that can trade; AI trading needs limits on order size, position and daily loss",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "arbiter.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/ArbiterStrategySetIn"
+      },
+      "result": {
+        "$ref": "#/$defs/ArbiterStrategy"
+      }
+    },
+    "arbiter.strategy.delete": {
+      "summary": "Delete a stopped strategy with nothing held; its history stays in the log",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "arbiter.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/ArbiterIdIn"
+      },
+      "result": {
+        "$ref": "#/$defs/Empty"
+      }
+    },
+    "arbiter.limits.set": {
+      "summary": "Set a strategy's limits or Arbiter's. Agents cannot",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "arbiter.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/ArbiterLimitsSetIn"
+      },
+      "result": {
+        "$ref": "#/$defs/Empty"
+      }
+    },
+    "arbiter.settings.set": {
+      "summary": "Arbiter's own settings: the home currency and the paper account",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "arbiter.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/ArbiterSettingsIn"
+      },
+      "result": {
+        "$ref": "#/$defs/ArbiterSettingsOut"
+      }
+    },
+    "arbiter.settings.get": {
+      "summary": "Arbiter's settings and its Arbiter-wide limits",
+      "kind": "query",
+      "audit": "never",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/Empty"
+      },
+      "result": {
+        "$ref": "#/$defs/ArbiterSettingsOut"
+      }
+    },
+    "arbiter.halt": {
+      "summary": "Halt a strategy, or everything: cancel open orders and place no new ones until the person restarts. Holdings are kept",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [
+        "arbiter.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/ArbiterHaltIn"
+      },
+      "result": {
+        "$ref": "#/$defs/ArbiterHaltOut"
+      }
+    },
+    "arbiter.restart": {
+      "summary": "Lift a halt: one strategy's, or the kill switch",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "arbiter.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/ArbiterRestartIn"
+      },
+      "result": {
+        "$ref": "#/$defs/Empty"
+      }
+    },
+    "arbiter.flatten": {
+      "summary": "Sell everything a strategy holds at the market price, even while halted",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "arbiter.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/ArbiterFlattenIn"
+      },
+      "result": {
+        "$ref": "#/$defs/ArbiterOrder"
+      }
+    },
+    "arbiter.propose": {
+      "summary": "Suggest a new strategy or a change to one. It waits on a card until the person approves it; nothing changes before",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [
+        "arbiter.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/ArbiterProposeIn"
+      },
+      "result": {
+        "$ref": "#/$defs/ArbiterProposal"
+      }
+    },
+    "arbiter.order.place": {
+      "summary": "An agent's order for a strategy. It passes the risk gate like a rule's; it is placed only when the strategy lets the AI trade, and otherwise waits for the person",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "all",
+      "doors": "all",
+      "emits": [
+        "arbiter.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/ArbiterOrderPlaceIn"
+      },
+      "result": {
+        "$ref": "#/$defs/ArbiterOrderPlaceOut"
+      }
+    },
+    "arbiter.proposal.resolve": {
+      "summary": "Approve or dismiss a proposal. Approving an order passes it through the gate again and places it",
+      "kind": "mutation",
+      "audit": "always",
+      "undo": "none",
+      "scope": "global",
+      "actors": "user_only",
+      "doors": "all",
+      "emits": [
+        "arbiter.changed"
+      ],
+      "since": "1.0",
+      "phase": 12,
+      "payload": {
+        "$ref": "#/$defs/ArbiterProposalResolveIn"
+      },
+      "result": {
+        "$ref": "#/$defs/ArbiterProposal"
       }
     }
   },
@@ -17314,6 +17756,2495 @@
       "required": [
         "id",
         "title"
+      ]
+    },
+    "ArbiterSummary": {
+      "type": "object",
+      "properties": {
+        "connection": {
+          "$ref": "#/$defs/ArbiterConnection"
+        },
+        "home": {
+          "type": "string",
+          "description": "The currency totals are in."
+        },
+        "live": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ArbiterAccount"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "paper": {
+          "$ref": "#/$defs/ArbiterAccount"
+        },
+        "strategies": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ArbiterStrategyRow"
+          }
+        },
+        "limits": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ArbiterLimitUse"
+          },
+          "description": "Today's use of the Arbiter-wide limits."
+        },
+        "pending": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ArbiterProposal"
+          }
+        },
+        "open_orders": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ArbiterOrder"
+          }
+        },
+        "fills": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ArbiterFill"
+          }
+        },
+        "prices": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ArbiterPrice"
+          }
+        },
+        "halted": {
+          "type": "boolean",
+          "description": "The kill switch is on."
+        },
+        "halt_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "checked_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The runner's last pass, RFC 3339, and what went wrong in it."
+        },
+        "runner_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "connection",
+        "home",
+        "paper",
+        "strategies",
+        "limits",
+        "pending",
+        "open_orders",
+        "fills",
+        "prices",
+        "halted"
+      ],
+      "description": "The Arbiter overview: the panel and the page draw from this one reading."
+    },
+    "ArbiterConnection": {
+      "type": "object",
+      "properties": {
+        "state": {
+          "type": "string",
+          "description": "`none` (no key saved), `ok`, or `error` (the last check failed; see `error`)."
+        },
+        "exchange": {
+          "type": "string"
+        },
+        "key": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The key's name with its middle hidden: `organizations/…/apiKeys/9a2e…`."
+        },
+        "permissions": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ArbiterPermissions"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "fees": {
+          "$ref": "#/$defs/ArbiterFees",
+          "description": "The account's fee rates; the entry tier until a key reads the real ones."
+        },
+        "checked_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "RFC 3339."
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "state",
+        "exchange",
+        "fees"
+      ],
+      "description": "The exchange connection as last checked."
+    },
+    "ArbiterPermissions": {
+      "type": "object",
+      "properties": {
+        "can_view": {
+          "type": "boolean"
+        },
+        "can_trade": {
+          "type": "boolean"
+        },
+        "can_transfer": {
+          "type": "boolean"
+        },
+        "portfolio_uuid": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The portfolio the key is limited to."
+        },
+        "portfolio_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "can_view",
+        "can_trade",
+        "can_transfer"
+      ],
+      "description": "The key's permissions as the exchange reports them."
+    },
+    "ArbiterFees": {
+      "type": "object",
+      "properties": {
+        "maker": {
+          "type": "string"
+        },
+        "taker": {
+          "type": "string"
+        },
+        "tier": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The tier's name, when known."
+        }
+      },
+      "required": [
+        "maker",
+        "taker"
+      ],
+      "description": "The account's fee rates, as fractions: 0.006 is 0.6%."
+    },
+    "ArbiterAccount": {
+      "type": "object",
+      "properties": {
+        "venue": {
+          "$ref": "#/$defs/ArbiterVenue"
+        },
+        "value": {
+          "type": "string",
+          "description": "Cash plus holdings at the last price, home currency."
+        },
+        "cash": {
+          "type": "string"
+        },
+        "pnl_today": {
+          "type": "string",
+          "description": "Strategies' profit today, realized plus open, after fees."
+        },
+        "pnl_total": {
+          "type": "string"
+        },
+        "fees_month": {
+          "type": "string"
+        },
+        "balances": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ArbiterBalance"
+          },
+          "description": "The exchange's balances (live only; paper holds cash and strategies' positions)."
+        },
+        "equity": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "prefixItems": [
+              {
+                "type": "integer",
+                "format": "int64"
+              },
+              {
+                "type": "number",
+                "format": "double"
+              }
+            ],
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "description": "`[unix seconds, value]`, oldest first."
+        }
+      },
+      "required": [
+        "venue",
+        "value",
+        "cash",
+        "pnl_today",
+        "pnl_total",
+        "fees_month",
+        "balances",
+        "equity"
+      ],
+      "description": "One venue's money: paper's simulated account or the exchange's real one."
+    },
+    "ArbiterVenue": {
+      "type": "string",
+      "enum": [
+        "paper",
+        "live"
+      ],
+      "description": "Paper simulates fills on real prices; live sends orders to the exchange."
+    },
+    "ArbiterBalance": {
+      "type": "object",
+      "properties": {
+        "currency": {
+          "type": "string"
+        },
+        "available": {
+          "type": "string"
+        },
+        "hold": {
+          "type": "string"
+        },
+        "value": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Its worth in the home currency, when a price for it was found.",
+          "default": null
+        }
+      },
+      "required": [
+        "currency",
+        "available",
+        "hold"
+      ],
+      "description": "One currency held on the exchange."
+    },
+    "ArbiterStrategyRow": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "name": {
+          "type": "string"
+        },
+        "product": {
+          "type": "string"
+        },
+        "granularity": {
+          "$ref": "#/$defs/ArbiterGranularity"
+        },
+        "mode": {
+          "$ref": "#/$defs/ArbiterMode"
+        },
+        "venue": {
+          "$ref": "#/$defs/ArbiterVenue"
+        },
+        "state": {
+          "$ref": "#/$defs/ArbiterRunState"
+        },
+        "halt_reason": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Why it is halted."
+        },
+        "version": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "sentences": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "The rule in plain sentences."
+        },
+        "doing": {
+          "type": "string",
+          "description": "What it is doing now: \"Waiting for RSI(14) below 30\", \"Holding: sells at +4%\"."
+        },
+        "held_base": {
+          "type": "string"
+        },
+        "held_cost": {
+          "type": "string"
+        },
+        "pnl_realized": {
+          "type": "string",
+          "description": "Realized profit after fees, quote currency."
+        },
+        "pnl_open": {
+          "type": "string",
+          "description": "What the holding is up or down at the last price, after the fee to sell it."
+        },
+        "pnl_today": {
+          "type": "string"
+        },
+        "trades": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "last_price": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "currency": {
+          "type": "string",
+          "description": "The quote currency its amounts are in."
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "product",
+        "granularity",
+        "mode",
+        "venue",
+        "state",
+        "version",
+        "sentences",
+        "doing",
+        "held_base",
+        "held_cost",
+        "pnl_realized",
+        "pnl_open",
+        "pnl_today",
+        "trades",
+        "currency"
+      ],
+      "description": "A strategy as a list row."
+    },
+    "ArbiterGranularity": {
+      "type": "string",
+      "enum": [
+        "ONE_MINUTE",
+        "FIVE_MINUTE",
+        "FIFTEEN_MINUTE",
+        "THIRTY_MINUTE",
+        "ONE_HOUR",
+        "TWO_HOUR",
+        "SIX_HOUR",
+        "ONE_DAY"
+      ],
+      "description": "A candle's width, as the exchange names it."
+    },
+    "ArbiterMode": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "rules",
+          "description": "The rules place orders within the limits; an agent may only propose."
+        },
+        {
+          "type": "string",
+          "const": "agent",
+          "description": "An agent may place orders itself, within the limits. Needs limits."
+        },
+        {
+          "type": "string",
+          "const": "ask",
+          "description": "Every order, from the rules or an agent, waits for the person."
+        }
+      ],
+      "description": "Who decides, per strategy (docs/ARBITER.md, Autonomy)."
+    },
+    "ArbiterRunState": {
+      "type": "string",
+      "enum": [
+        "stopped",
+        "running",
+        "halted"
+      ],
+      "description": "Running, stopped by the person, or halted by a limit or the kill switch."
+    },
+    "ArbiterLimitUse": {
+      "type": "object",
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "used": {
+          "type": "number",
+          "format": "double"
+        },
+        "limit": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "unit": {
+          "type": "string",
+          "description": "How to show the numbers: `money`, `count` or `percent`."
+        }
+      },
+      "required": [
+        "label",
+        "used",
+        "unit"
+      ],
+      "description": "A limit and how much of it today has used."
+    },
+    "ArbiterProposal": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "kind": {
+          "type": "string",
+          "description": "`order`, `new_strategy` or `change`."
+        },
+        "strategy_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "strategy": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "type": "string",
+          "description": "One line: \"Change the take-profit\", \"Buy 50 CAD of ETH\"."
+        },
+        "why": {
+          "type": "string",
+          "description": "The proposer's reason."
+        },
+        "source": {
+          "$ref": "#/$defs/ArbiterSource"
+        },
+        "status": {
+          "type": "string",
+          "description": "`pending`, `approved`, `dismissed`, `expired` or `failed`."
+        },
+        "outcome": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "What approving it did, or why it failed."
+        },
+        "side": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ArbiterSide"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Orders: the side, amount and pricing."
+        },
+        "product": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "quote": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "base": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "limit": {
+          "type": "boolean"
+        },
+        "venue": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ArbiterVenue"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "draft": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ArbiterDraft"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Strategies: what it would be, and its changes from now as sentences."
+        },
+        "changes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "draft_hash": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The fingerprint approval binds to: the draft approved is the draft shown."
+        },
+        "created_at": {
+          "type": "string",
+          "description": "RFC 3339."
+        },
+        "expires_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "title",
+        "why",
+        "source",
+        "status",
+        "limit",
+        "changes",
+        "created_at"
+      ],
+      "description": "Something waiting for the person: an agent's suggestion, or an order in \"every order asks\"."
+    },
+    "ArbiterSource": {
+      "type": "string",
+      "enum": [
+        "rule",
+        "agent",
+        "person"
+      ],
+      "description": "Who asked for an order."
+    },
+    "ArbiterSide": {
+      "type": "string",
+      "enum": [
+        "buy",
+        "sell"
+      ]
+    },
+    "ArbiterDraft": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "product": {
+          "type": "string"
+        },
+        "granularity": {
+          "$ref": "#/$defs/ArbiterGranularity"
+        },
+        "rule": {
+          "$ref": "#/$defs/ArbiterRule"
+        },
+        "limits": {
+          "$ref": "#/$defs/ArbiterLimits",
+          "default": {
+            "max_order": null,
+            "max_position": null,
+            "daily_loss": null,
+            "orders_per_hour": null,
+            "cooldown_minutes": null
+          }
+        }
+      },
+      "required": [
+        "name",
+        "product",
+        "granularity",
+        "rule"
+      ],
+      "description": "A strategy's name, product, bars, rule and limits: what a proposal would make it."
+    },
+    "ArbiterRule": {
+      "type": "object",
+      "properties": {
+        "entry": {
+          "$ref": "#/$defs/ArbiterEntry"
+        },
+        "buy": {
+          "type": "string",
+          "description": "How much to buy each time, in the product's quote currency."
+        },
+        "pricing": {
+          "$ref": "#/$defs/ArbiterPricing",
+          "default": "market"
+        },
+        "exit": {
+          "$ref": "#/$defs/ArbiterExit",
+          "default": {
+            "take_profit_pct": null,
+            "stop_loss_pct": null,
+            "trailing_pct": null,
+            "max_bars": null,
+            "when": null
+          }
+        }
+      },
+      "required": [
+        "entry",
+        "buy"
+      ],
+      "description": "A strategy's rule: when it buys, how much, and when it sells."
+    },
+    "ArbiterEntry": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "every": {
+              "$ref": "#/$defs/ArbiterEvery"
+            },
+            "hour": {
+              "type": "integer",
+              "format": "uint8",
+              "minimum": 0,
+              "maximum": 255
+            },
+            "weekday": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint8",
+              "minimum": 0,
+              "maximum": 255
+            },
+            "day": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint8",
+              "minimum": 0,
+              "maximum": 255
+            },
+            "kind": {
+              "type": "string",
+              "const": "schedule"
+            }
+          },
+          "required": [
+            "kind",
+            "every",
+            "hour"
+          ],
+          "description": "A scheduled buy (dollar-cost averaging), in UTC: `weekday` 1 (Monday) to 7 for `week`,\n`day` 1 to 28 for `month`."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "when": {
+              "$ref": "#/$defs/ArbiterCondition"
+            },
+            "kind": {
+              "type": "string",
+              "const": "signal"
+            }
+          },
+          "required": [
+            "kind",
+            "when"
+          ],
+          "description": "Buy when the condition holds on a closed bar and nothing is held."
+        }
+      ],
+      "description": "When a strategy buys."
+    },
+    "ArbiterEvery": {
+      "type": "string",
+      "enum": [
+        "day",
+        "week",
+        "month"
+      ]
+    },
+    "ArbiterCondition": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "left": {
+              "$ref": "#/$defs/ArbiterOperand"
+            },
+            "op": {
+              "$ref": "#/$defs/ArbiterCompare"
+            },
+            "right": {
+              "$ref": "#/$defs/ArbiterOperand"
+            },
+            "kind": {
+              "type": "string",
+              "const": "compare"
+            }
+          },
+          "required": [
+            "kind",
+            "left",
+            "op",
+            "right"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "of": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/ArbiterCondition"
+              }
+            },
+            "kind": {
+              "type": "string",
+              "const": "all"
+            }
+          },
+          "required": [
+            "kind",
+            "of"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "of": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/ArbiterCondition"
+              }
+            },
+            "kind": {
+              "type": "string",
+              "const": "any"
+            }
+          },
+          "required": [
+            "kind",
+            "of"
+          ]
+        }
+      ],
+      "description": "When to act. `all`/`any` nest."
+    },
+    "ArbiterOperand": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "price"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "description": "The bar's close."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "period": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "kind": {
+              "type": "string",
+              "const": "sma"
+            }
+          },
+          "required": [
+            "kind",
+            "period"
+          ],
+          "description": "Simple moving average of closes."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "period": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "kind": {
+              "type": "string",
+              "const": "ema"
+            }
+          },
+          "required": [
+            "kind",
+            "period"
+          ],
+          "description": "Exponential moving average of closes."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "period": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "kind": {
+              "type": "string",
+              "const": "rsi"
+            }
+          },
+          "required": [
+            "kind",
+            "period"
+          ],
+          "description": "Wilder's relative strength index, 0 to 100."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "bars": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "kind": {
+              "type": "string",
+              "const": "change"
+            }
+          },
+          "required": [
+            "kind",
+            "bars"
+          ],
+          "description": "Percent change of the close over `bars` bars: 5 is +5%."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "bars": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "kind": {
+              "type": "string",
+              "const": "high"
+            }
+          },
+          "required": [
+            "kind",
+            "bars"
+          ],
+          "description": "Highest high of the `bars` bars before this one."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "bars": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "kind": {
+              "type": "string",
+              "const": "low"
+            }
+          },
+          "required": [
+            "kind",
+            "bars"
+          ],
+          "description": "Lowest low of the `bars` bars before this one."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "value": {
+              "type": "number",
+              "format": "double"
+            },
+            "kind": {
+              "type": "string",
+              "const": "number"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
+        }
+      ],
+      "description": "A value a condition compares: the price, an indicator over the strategy's bars, or a number."
+    },
+    "ArbiterCompare": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "above",
+            "below",
+            "crosses_below"
+          ]
+        },
+        {
+          "type": "string",
+          "const": "crosses_above",
+          "description": "Below or equal on the bar before, above on this one."
+        }
+      ]
+    },
+    "ArbiterPricing": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "market",
+          "description": "Fills at once at the best price on the other side; pays the taker fee."
+        },
+        {
+          "type": "string",
+          "const": "limit",
+          "description": "A post-only limit at the best price on this side; pays the maker fee, may not fill."
+        }
+      ],
+      "description": "How an order is priced."
+    },
+    "ArbiterExit": {
+      "type": "object",
+      "properties": {
+        "take_profit_pct": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "stop_loss_pct": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "trailing_pct": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Sell when the price falls this far below its highest close since the buy.",
+          "default": null
+        },
+        "max_bars": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "Sell after this many bars whatever the price.",
+          "default": null
+        },
+        "when": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ArbiterCondition"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Sell when this holds on a closed bar.",
+          "default": null
+        }
+      },
+      "description": "When a strategy sells what it bought. Percentages are of the average buy price."
+    },
+    "ArbiterLimits": {
+      "type": "object",
+      "properties": {
+        "max_order": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The most one order may spend.",
+          "default": null
+        },
+        "max_position": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The most held at once, at cost.",
+          "default": null
+        },
+        "daily_loss": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "A loss today (realized, plus what open positions are down) that halts until restarted.",
+          "default": null
+        },
+        "orders_per_hour": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "default": null
+        },
+        "cooldown_minutes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "Minutes to wait after a losing sell before buying again.",
+          "default": null
+        }
+      },
+      "description": "What may never be exceeded. Absent means no limit. Amounts are the quote currency."
+    },
+    "ArbiterOrder": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "strategy_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "strategy": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "venue": {
+          "$ref": "#/$defs/ArbiterVenue"
+        },
+        "source": {
+          "$ref": "#/$defs/ArbiterSource"
+        },
+        "side": {
+          "$ref": "#/$defs/ArbiterSide"
+        },
+        "product": {
+          "type": "string"
+        },
+        "quote_size": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "base_size": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "limit_price": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "status": {
+          "$ref": "#/$defs/ArbiterOrderStatus"
+        },
+        "filled_base": {
+          "type": "string"
+        },
+        "average_price": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "fees": {
+          "type": "string"
+        },
+        "why": {
+          "type": "string",
+          "description": "What decided it, in words."
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The exchange's reason, when it failed."
+        },
+        "client_order_id": {
+          "type": "string"
+        },
+        "exchange_order_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "created_at": {
+          "type": "string",
+          "description": "RFC 3339."
+        },
+        "updated_at": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "venue",
+        "source",
+        "side",
+        "product",
+        "status",
+        "filled_base",
+        "fees",
+        "why",
+        "client_order_id",
+        "created_at",
+        "updated_at"
+      ]
+    },
+    "ArbiterOrderStatus": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "open",
+            "filled",
+            "cancelled",
+            "expired",
+            "failed"
+          ]
+        },
+        {
+          "type": "string",
+          "const": "pending",
+          "description": "Sent, not yet acknowledged as open."
+        }
+      ],
+      "description": "An order's state on the exchange."
+    },
+    "ArbiterFill": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "order_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "strategy_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "strategy": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "venue": {
+          "$ref": "#/$defs/ArbiterVenue"
+        },
+        "side": {
+          "$ref": "#/$defs/ArbiterSide"
+        },
+        "product": {
+          "type": "string"
+        },
+        "price": {
+          "type": "string"
+        },
+        "size": {
+          "type": "string",
+          "description": "Base amount."
+        },
+        "fee": {
+          "type": "string"
+        },
+        "pnl": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Sells: the profit it realized after fees.",
+          "default": null
+        },
+        "at": {
+          "type": "string",
+          "description": "RFC 3339."
+        }
+      },
+      "required": [
+        "id",
+        "order_id",
+        "venue",
+        "side",
+        "product",
+        "price",
+        "size",
+        "fee",
+        "at"
+      ]
+    },
+    "ArbiterPrice": {
+      "type": "object",
+      "properties": {
+        "product": {
+          "type": "string"
+        },
+        "price": {
+          "type": "number",
+          "format": "double"
+        },
+        "change_24h": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        }
+      },
+      "required": [
+        "product",
+        "price"
+      ],
+      "description": "A price to show beside the strategies."
+    },
+    "ArbiterIdIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "ArbiterStrategy": {
+      "type": "object",
+      "properties": {
+        "row": {
+          "$ref": "#/$defs/ArbiterStrategyRow"
+        },
+        "rule": {
+          "$ref": "#/$defs/ArbiterRule"
+        },
+        "limits": {
+          "$ref": "#/$defs/ArbiterLimits"
+        },
+        "rule_hash": {
+          "type": "string"
+        },
+        "break_even_pct": {
+          "type": "number",
+          "format": "double",
+          "description": "The move a round trip needs to break even at the account's fees, percent."
+        },
+        "variants_tried": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "description": "How many versions of this rule have been backtested."
+        },
+        "backtest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ArbiterBacktest"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The latest backtest of this version."
+        },
+        "paper": {
+          "$ref": "#/$defs/ArbiterRecord"
+        },
+        "live": {
+          "$ref": "#/$defs/ArbiterRecord"
+        },
+        "decisions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ArbiterDecision"
+          }
+        },
+        "orders": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ArbiterOrder"
+          }
+        },
+        "fills": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ArbiterFill"
+          }
+        }
+      },
+      "required": [
+        "row",
+        "rule",
+        "limits",
+        "rule_hash",
+        "break_even_pct",
+        "variants_tried",
+        "paper",
+        "live",
+        "decisions",
+        "orders",
+        "fills"
+      ]
+    },
+    "ArbiterBacktest": {
+      "type": "object",
+      "properties": {
+        "tuned": {
+          "$ref": "#/$defs/ArbiterBacktestStats"
+        },
+        "judged": {
+          "$ref": "#/$defs/ArbiterBacktestStats"
+        },
+        "whole": {
+          "$ref": "#/$defs/ArbiterBacktestStats"
+        },
+        "trades": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ArbiterBacktestTrade"
+          }
+        },
+        "equity": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "prefixItems": [
+              {
+                "type": "integer",
+                "format": "int64"
+              },
+              {
+                "type": "number",
+                "format": "double"
+              }
+            ],
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "description": "Profit after fees over time, `[unix seconds, quote currency]`, at most 400 points."
+        },
+        "break_even_pct": {
+          "type": "number",
+          "format": "double",
+          "description": "What a round trip costs in fees and slippage, percent: the move a trade needs to break\neven."
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "tuned",
+        "judged",
+        "whole",
+        "trades",
+        "equity",
+        "break_even_pct",
+        "warnings"
+      ]
+    },
+    "ArbiterBacktestStats": {
+      "type": "object",
+      "properties": {
+        "start": {
+          "type": "integer",
+          "format": "int64",
+          "description": "Unix seconds, the first and last bar."
+        },
+        "end": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "return_pct": {
+          "type": "number",
+          "format": "double",
+          "description": "Percent, after fees, on the most in the market at once."
+        },
+        "max_drawdown_pct": {
+          "type": "number",
+          "format": "double",
+          "description": "The largest fall from a high, percent."
+        },
+        "trades": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "won_pct": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "description": "Percent of closed trades that made money; absent with none closed."
+        },
+        "time_in_market_pct": {
+          "type": "number",
+          "format": "double"
+        },
+        "fees": {
+          "type": "number",
+          "format": "double"
+        },
+        "buy_hold_pct": {
+          "type": "number",
+          "format": "double",
+          "description": "Buying at the first bar's open and holding to the last close, percent, after one taker\nfee each way."
+        },
+        "deployed": {
+          "type": "number",
+          "format": "double",
+          "description": "The most in the market at once, quote currency."
+        }
+      },
+      "required": [
+        "start",
+        "end",
+        "return_pct",
+        "max_drawdown_pct",
+        "trades",
+        "time_in_market_pct",
+        "fees",
+        "buy_hold_pct",
+        "deployed"
+      ]
+    },
+    "ArbiterBacktestTrade": {
+      "type": "object",
+      "properties": {
+        "buy_at": {
+          "type": "integer",
+          "format": "int64",
+          "description": "Unix seconds."
+        },
+        "buy_price": {
+          "type": "number",
+          "format": "double"
+        },
+        "sell_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "sell_price": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Why it sold; absent while still held at the end."
+        },
+        "pnl": {
+          "type": "number",
+          "format": "double",
+          "description": "After fees, in the quote currency; open trades are marked at the last close."
+        },
+        "fees": {
+          "type": "number",
+          "format": "double"
+        }
+      },
+      "required": [
+        "buy_at",
+        "buy_price",
+        "pnl",
+        "fees"
+      ]
+    },
+    "ArbiterRecord": {
+      "type": "object",
+      "properties": {
+        "days": {
+          "type": "number",
+          "format": "double",
+          "description": "Days since its first order there."
+        },
+        "trades": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "won_pct": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "pnl": {
+          "type": "string"
+        },
+        "fees": {
+          "type": "string"
+        },
+        "return_pct": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "description": "Profit over the most it held at once, percent."
+        }
+      },
+      "required": [
+        "days",
+        "trades",
+        "pnl",
+        "fees"
+      ],
+      "description": "A strategy's record on one venue."
+    },
+    "ArbiterDecision": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "strategy_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "kind": {
+          "type": "string",
+          "description": "`buy`, `sell`, `skip`, `refused`, `halt`, `restart`, `proposal`, `approved`, `dismissed`,\n`error`, `setting`."
+        },
+        "text": {
+          "type": "string"
+        },
+        "order_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "at": {
+          "type": "string",
+          "description": "RFC 3339."
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "text",
+        "at"
+      ],
+      "description": "One line of the decision log: what a strategy decided, and why."
+    },
+    "ArbiterListIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "strategy_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        }
+      }
+    },
+    "ArbiterOrdersOut": {
+      "type": "object",
+      "properties": {
+        "orders": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ArbiterOrder"
+          }
+        }
+      },
+      "required": [
+        "orders"
+      ]
+    },
+    "ArbiterDecisionsOut": {
+      "type": "object",
+      "properties": {
+        "decisions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ArbiterDecision"
+          }
+        }
+      },
+      "required": [
+        "decisions"
+      ]
+    },
+    "ArbiterProductsIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "quote": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Only products quoted in this currency, e.g. CAD."
+        },
+        "query": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Matches the product id or base currency."
+        }
+      }
+    },
+    "ArbiterProductsOut": {
+      "type": "object",
+      "properties": {
+        "products": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ArbiterProduct"
+          }
+        }
+      },
+      "required": [
+        "products"
+      ]
+    },
+    "ArbiterProduct": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "`BTC-CAD`."
+        },
+        "base": {
+          "type": "string"
+        },
+        "quote": {
+          "type": "string"
+        },
+        "base_increment": {
+          "type": "string"
+        },
+        "quote_increment": {
+          "type": "string"
+        },
+        "price_increment": {
+          "type": "string"
+        },
+        "base_min_size": {
+          "type": "string"
+        },
+        "quote_min_size": {
+          "type": "string"
+        },
+        "price": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "description": "The last price, when the exchange gave one."
+        },
+        "change_24h": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "description": "Percent change over 24 hours."
+        },
+        "tradable": {
+          "type": "boolean",
+          "description": "False when the exchange has trading, or new orders, turned off for it."
+        },
+        "limit_only": {
+          "type": "boolean",
+          "description": "Only limit orders are accepted."
+        }
+      },
+      "required": [
+        "id",
+        "base",
+        "quote",
+        "base_increment",
+        "quote_increment",
+        "price_increment",
+        "base_min_size",
+        "quote_min_size",
+        "tradable",
+        "limit_only"
+      ],
+      "description": "What a tradable product allows, from the exchange."
+    },
+    "ArbiterSeriesIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "product": {
+          "type": "string",
+          "description": "`ETH-CAD`."
+        },
+        "granularity": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ArbiterGranularity"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "bars": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "How many bars back from now, up to 1500. 300 by default."
+        },
+        "strategy_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "Mark this strategy's paper and live trades."
+        }
+      },
+      "required": [
+        "product"
+      ]
+    },
+    "ArbiterSeries": {
+      "type": "object",
+      "properties": {
+        "product": {
+          "type": "string"
+        },
+        "granularity": {
+          "$ref": "#/$defs/ArbiterGranularity"
+        },
+        "candles": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ArbiterCandle"
+          }
+        },
+        "markers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ArbiterMarker"
+          }
+        }
+      },
+      "required": [
+        "product",
+        "granularity",
+        "candles",
+        "markers"
+      ],
+      "description": "A chart's numbers: candles and the trades made on them."
+    },
+    "ArbiterCandle": {
+      "type": "object",
+      "properties": {
+        "start": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "open": {
+          "type": "number",
+          "format": "double"
+        },
+        "high": {
+          "type": "number",
+          "format": "double"
+        },
+        "low": {
+          "type": "number",
+          "format": "double"
+        },
+        "close": {
+          "type": "number",
+          "format": "double"
+        },
+        "volume": {
+          "type": "number",
+          "format": "double"
+        }
+      },
+      "required": [
+        "start",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume"
+      ],
+      "description": "One bar. `start` is Unix seconds."
+    },
+    "ArbiterMarker": {
+      "type": "object",
+      "properties": {
+        "at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "side": {
+          "$ref": "#/$defs/ArbiterSide"
+        },
+        "price": {
+          "type": "number",
+          "format": "double"
+        },
+        "kind": {
+          "type": "string",
+          "description": "`paper`, `live` or `backtest`."
+        }
+      },
+      "required": [
+        "at",
+        "side",
+        "price",
+        "kind"
+      ],
+      "description": "A buy or sell on a chart."
+    },
+    "ArbiterBacktestIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "strategy_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "Backtest this strategy's rule; or give `draft` to try a rule that is not saved."
+        },
+        "draft": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ArbiterDraft"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "days": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "How many days back, up to 730. 180 by default."
+        },
+        "tuned_fraction": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "description": "The fraction of the range the rule was tuned on; the rest is judged. 0.67 by default."
+        }
+      }
+    },
+    "ArbiterProposalListIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "pending": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Only pending ones when true."
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        }
+      }
+    },
+    "ArbiterProposalsOut": {
+      "type": "object",
+      "properties": {
+        "proposals": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ArbiterProposal"
+          }
+        }
+      },
+      "required": [
+        "proposals"
+      ]
+    },
+    "ArbiterKeySetIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "key_name": {
+          "type": "string",
+          "description": "`organizations/{org}/apiKeys/{id}`."
+        },
+        "private_key": {
+          "type": "string",
+          "description": "The ECDSA private key, PEM."
+        }
+      },
+      "required": [
+        "key_name",
+        "private_key"
+      ]
+    },
+    "ArbiterStrategySaveIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "Absent creates a strategy (stopped, on paper, rules mode)."
+        },
+        "draft": {
+          "$ref": "#/$defs/ArbiterDraft"
+        }
+      },
+      "required": [
+        "draft"
+      ]
+    },
+    "ArbiterStrategySetIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "mode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ArbiterMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "venue": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ArbiterVenue"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "running": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Start or stop it. A halted strategy needs `arbiter.restart`."
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "ArbiterLimitsSetIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "strategy_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "A strategy's limits; absent sets Arbiter-wide ones from `global`."
+        },
+        "limits": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ArbiterLimits"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "global": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ArbiterGlobalLimits"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "ArbiterGlobalLimits": {
+      "type": "object",
+      "properties": {
+        "max_exposure": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The most held across every strategy, at cost, in the home currency.",
+          "default": null
+        },
+        "daily_loss": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "A loss today across every strategy that halts them all.",
+          "default": null
+        },
+        "orders_per_hour": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "default": null
+        },
+        "price_band_pct": {
+          "type": "string",
+          "description": "How far from the best price a limit may be placed, percent."
+        },
+        "slippage_pct": {
+          "type": "string",
+          "description": "Slippage assumed for market orders in backtests and paper fills, percent."
+        },
+        "approval_minutes": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "description": "What a pending approval waits before it expires, minutes."
+        }
+      },
+      "required": [
+        "price_band_pct",
+        "slippage_pct",
+        "approval_minutes"
+      ],
+      "description": "Arbiter-wide limits, across every strategy."
+    },
+    "ArbiterSettingsIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "home": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The currency totals are shown in."
+        },
+        "paper_cash": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "What paper trading starts with, in the home currency."
+        },
+        "reset_paper": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Erase every paper order, fill and record, and start paper over."
+        }
+      }
+    },
+    "ArbiterSettingsOut": {
+      "type": "object",
+      "properties": {
+        "home": {
+          "type": "string"
+        },
+        "paper_cash": {
+          "type": "string"
+        },
+        "global": {
+          "$ref": "#/$defs/ArbiterGlobalLimits"
+        }
+      },
+      "required": [
+        "home",
+        "paper_cash",
+        "global"
+      ]
+    },
+    "ArbiterHaltIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "strategy_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "One strategy; absent halts everything (the kill switch)."
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "ArbiterHaltOut": {
+      "type": "object",
+      "properties": {
+        "cancelled": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "description": "Open orders cancelled."
+        },
+        "failed": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Orders that could not be cancelled, and why."
+        }
+      },
+      "required": [
+        "cancelled",
+        "failed"
+      ]
+    },
+    "ArbiterRestartIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "strategy_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        }
+      }
+    },
+    "ArbiterFlattenIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "strategy_id": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "strategy_id"
+      ]
+    },
+    "ArbiterProposeIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "strategy_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "A change to this strategy; absent proposes a new one."
+        },
+        "draft": {
+          "$ref": "#/$defs/ArbiterDraft"
+        },
+        "why": {
+          "type": "string",
+          "description": "Why, in a sentence or two the person reads on the card."
+        },
+        "thread_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "The thread it came from."
+        }
+      },
+      "required": [
+        "draft",
+        "why"
+      ]
+    },
+    "ArbiterOrderPlaceIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "strategy_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "side": {
+          "$ref": "#/$defs/ArbiterSide"
+        },
+        "quote": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Buys: how much quote currency to spend."
+        },
+        "base": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Sells: how much base to sell; absent sells what the strategy holds."
+        },
+        "limit": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "A post-only limit at the best price instead of a market order."
+        },
+        "why": {
+          "type": "string"
+        },
+        "thread_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        }
+      },
+      "required": [
+        "strategy_id",
+        "side",
+        "why"
+      ]
+    },
+    "ArbiterOrderPlaceOut": {
+      "type": "object",
+      "properties": {
+        "outcome": {
+          "type": "string",
+          "description": "`placed` (the gate passed and it went to the venue), `proposed` (waits for the person:\nthe strategy is not in \"AI trades within limits\", or every order asks) or `refused`."
+        },
+        "order": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ArbiterOrder"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "proposal": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ArbiterProposal"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "refusal": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ArbiterRefusal"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "outcome"
+      ]
+    },
+    "ArbiterRefusal": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string",
+          "description": "`arbiter.unknown_product`, `arbiter.over_max_order`…"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ]
+    },
+    "ArbiterProposalResolveIn": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "approve": {
+          "type": "boolean"
+        },
+        "draft_hash": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Approvals bind to what was shown: the proposal's `draft_hash`."
+        }
+      },
+      "required": [
+        "id",
+        "approve"
       ]
     }
   }

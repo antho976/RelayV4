@@ -1,5 +1,5 @@
 //! The Threads page: the thread list in the sidebar, the conversation with its message box, and
-//! the Tally panel beside it (docs/THREADS.md).
+//! the panel beside it, Tally's or Arbiter's (docs/THREADS.md, docs/ARBITER.md).
 //!
 //! Threads are the engine's (`thread.*`); this page draws them and follows `thread.changed`,
 //! `thread.message` and `thread.delta`. The page is one stack page, `threads`, whose middle shows
@@ -47,6 +47,13 @@ const EFFORTS: [(&str, &str); 6] = [
 /// The Tally panel's views: (key, caption).
 const PANEL_TABS: [(&str, &str); 3] = [("overview", "Overview"), ("entries", "Entries"), ("budgets", "Budgets")];
 
+/// The panel's sources, as the message box's chips name them: (key, caption, what it means).
+/// Choosing one shows its panel; the agent reaches both either way.
+const SOURCES: [(&str, &str, &str); 2] = [
+    ("tally", "Tally", "Show Tally beside the thread: the agent reads and changes your budget"),
+    ("arbiter", "Arbiter", "Show Arbiter beside the thread: the agent reads, backtests and proposes; orders follow each strategy's mode"),
+];
+
 struct View {
     title: gtk::Label,
     title_key: gtk::MenuButton,
@@ -68,6 +75,15 @@ struct View {
     panel: gtk::Box,
     panel_body: gtk::Box,
     panel_tabs: Vec<(&'static str, gtk::Button)>,
+    /// The two rows of panel tabs, Tally's and Arbiter's, one shown at a time.
+    tally_tabs: gtk::Box,
+    arbiter_tabs: gtk::Box,
+    arbiter_panel_tabs: Vec<(&'static str, gtk::Button)>,
+    /// The source switch above the panel's tabs, and the message box's chips.
+    sources: Vec<(&'static str, gtk::Button)>,
+    chips: Vec<(&'static str, gtk::Button)>,
+    /// What the agent may do alone, said for the source showing.
+    limits: gtk::Label,
 }
 
 #[derive(Default)]
@@ -84,6 +100,9 @@ struct State {
     /// The box the current agent turn's pieces go in.
     turn: RefCell<Option<gtk::Box>>,
     panel_tab: Cell<&'static str>,
+    /// The panel's source, `tally` or `arbiter`, and Arbiter's tab.
+    source: Cell<&'static str>,
+    arbiter_tab: Cell<&'static str>,
     listing: Cell<bool>,
     ui: RefCell<std::rc::Weak<Ui>>,
     /// The model and effort a new thread starts with: the last ones chosen.
@@ -164,7 +183,7 @@ pub fn page() -> gtk::Box {
     let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     spacer.set_hexpand(true);
     strip.append(&spacer);
-    let panel_key = crate::app::icon_button("sidebar-show-symbolic", "Show or hide the Tally panel");
+    let panel_key = crate::app::icon_button("sidebar-show-symbolic", "Show or hide the panel");
     panel_key.set_widget_name("threads-panel-key");
     strip.append(&panel_key);
     root.append(&strip);
@@ -223,11 +242,7 @@ pub fn page() -> gtk::Box {
     // The open thread: its messages in a centred column, scrolled.
     let column = gtk::Box::new(gtk::Orientation::Vertical, 22);
     column.add_css_class("threads-column");
-    let clamp = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    clamp.set_halign(gtk::Align::Center);
-    column.set_size_request(680, -1);
-    column.set_hexpand(false);
-    clamp.append(&column);
+    let clamp = ReadingClamp::new(&column);
     let scroll = crate::app::scrolled(&clamp);
     scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
     scroll.add_css_class("threads-scroll");
@@ -237,6 +252,7 @@ pub fn page() -> gtk::Box {
     let pending = label("", "threads-reply");
     pending.set_wrap(true);
     pending.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    pending.set_max_width_chars(READING_CHARS);
     pending.set_selectable(false);
     let working = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     working.add_css_class("threads-working");
@@ -258,21 +274,29 @@ pub fn page() -> gtk::Box {
     input_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
     composer.append(&input_scroll);
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    let source = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    source.add_css_class("threads-chip");
-    let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    dot.add_css_class("threads-dot");
-    dot.set_valign(gtk::Align::Center);
-    source.append(&dot);
-    source.append(&label("Tally", ""));
-    source.set_tooltip_text(Some("This thread's agent reads and changes your Tally budget"));
-    row.append(&source);
+    // Tally and Arbiter: which panel shows beside the thread.
+    let mut chips = Vec::new();
+    for (key, caption, about) in SOURCES {
+        let chip = gtk::Button::new();
+        chip.add_css_class("threads-chip");
+        chip.add_css_class("threads-source-chip");
+        chip.set_widget_name(&format!("threads-chip-{key}"));
+        let inner = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        dot.add_css_class("threads-dot");
+        dot.set_valign(gtk::Align::Center);
+        inner.append(&dot);
+        inner.append(&label(caption, ""));
+        chip.set_child(Some(&inner));
+        chip.set_tooltip_text(Some(about));
+        row.append(&chip);
+        chips.push((key, chip));
+    }
     let model = picker("threads-model", "The model this thread's agent runs on", &MODELS, |value| choose(Some(value), None));
     row.append(&model.0);
     let effort = picker("threads-effort", "How hard the agent thinks before answering", &EFFORTS, |value| choose(None, Some(value)));
     row.append(&effort.0);
     let limits = label("Asks before deleting", "threads-chip");
-    limits.set_tooltip_text(Some("It adds and changes entries, each with an Undo. Deleting, budgets and accounts stay yours."));
     row.append(&limits);
     let gap = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     gap.set_hexpand(true);
@@ -293,10 +317,21 @@ pub fn page() -> gtk::Box {
     body.set_resize_start_child(true);
     body.set_shrink_start_child(false);
 
-    // The Tally panel: 340 pixels as it opens, 280 at the least.
+    // The panel: 340 pixels as it opens, 280 at the least. Its source, Tally or Arbiter, above
+    // that source's tabs.
     let side = gtk::Box::new(gtk::Orientation::Vertical, 18);
     side.add_css_class("threads-panel");
     side.set_size_request(280, -1);
+    let source_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    source_row.add_css_class("threads-sources");
+    let mut sources = Vec::new();
+    for (key, caption, _) in SOURCES {
+        let tab = button(caption, "quiet");
+        tab.set_widget_name(&format!("threads-source-{key}"));
+        source_row.append(&tab);
+        sources.push((key, tab));
+    }
+    side.append(&source_row);
     let tabs = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     tabs.add_css_class("view-tabs");
     tabs.set_homogeneous(true);
@@ -308,6 +343,18 @@ pub fn page() -> gtk::Box {
         panel_tabs.push((key, tab));
     }
     side.append(&tabs);
+    let arbiter_tabs = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    arbiter_tabs.add_css_class("view-tabs");
+    arbiter_tabs.set_homogeneous(true);
+    arbiter_tabs.set_visible(false);
+    let mut arbiter_panel_tabs = Vec::new();
+    for (key, caption) in super::arbiter::PANEL_TABS {
+        let tab = button(caption, "quiet");
+        tab.set_widget_name(&format!("threads-panel-{key}"));
+        arbiter_tabs.append(&tab);
+        arbiter_panel_tabs.push((key, tab));
+    }
+    side.append(&arbiter_tabs);
     let panel_body = gtk::Box::new(gtk::Orientation::Vertical, 18);
     let panel_scroll = crate::app::scrolled(&panel_body);
     panel_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
@@ -329,12 +376,16 @@ pub fn page() -> gtk::Box {
     let built = Rc::new(View {
         title, title_key, rename, middle, empty_slot, empty_line, dock, composer, input,
         send: send_key, model, effort, scroll, column, pending, working, panel, panel_body, panel_tabs,
+        tally_tabs: tabs, arbiter_tabs, arbiter_panel_tabs, sources, chips, limits,
     });
     STATE.with(|s| {
         s.panel_tab.set("overview");
+        s.source.set("tally");
+        s.arbiter_tab.set(super::arbiter::PANEL_TABS[0].0);
         *s.view.borrow_mut() = Some(built.clone());
     });
     wire(&built, &delete, &panel_key);
+    show_source(&built);
     show_empty(&built);
     root
 }
@@ -408,6 +459,19 @@ fn wire(v: &Rc<View>, delete: &gtk::Button, panel_key: &gtk::Button) {
             }
         });
     }
+    for (key, tab) in &v.arbiter_panel_tabs {
+        let key = *key;
+        tab.connect_clicked(move |_| {
+            STATE.with(|s| s.arbiter_tab.set(key));
+            if let Some(ui) = the_ui() {
+                refresh_panel(&ui);
+            }
+        });
+    }
+    for (key, tab) in v.sources.iter().chain(&v.chips) {
+        let key = *key;
+        tab.connect_clicked(move |_| set_source(key));
+    }
     v.title_key.connect_notify_local(Some("active"), |key, _| {
         if key.is_active() {
             if let Some(v) = view() {
@@ -415,6 +479,39 @@ fn wire(v: &Rc<View>, delete: &gtk::Button, panel_key: &gtk::Button) {
             }
         }
     });
+}
+
+/// Show `source`'s panel, open, and its chip lit.
+fn set_source(source: &'static str) {
+    let Some(v) = view() else { return };
+    STATE.with(|s| s.source.set(source));
+    show_source(&v);
+    v.panel.set_visible(true);
+    if let Some(ui) = the_ui() {
+        refresh_panel(&ui);
+    }
+}
+
+/// The source showing, on the switch, the tabs and the chips, and what the agent may do alone.
+fn show_source(v: &View) {
+    let source = STATE.with(|s| s.source.get());
+    for (key, tab) in v.sources.iter().chain(&v.chips) {
+        if *key == source {
+            tab.add_css_class("selected");
+        } else {
+            tab.remove_css_class("selected");
+        }
+    }
+    let arbiter = source == "arbiter";
+    v.tally_tabs.set_visible(!arbiter);
+    v.arbiter_tabs.set_visible(arbiter);
+    if arbiter {
+        v.limits.set_text("Proposes, you approve");
+        v.limits.set_tooltip_text(Some("It reads, backtests and proposes. Orders follow each strategy's mode, always within its limits, and only you change those."));
+    } else {
+        v.limits.set_text("Asks before deleting");
+        v.limits.set_tooltip_text(Some("It adds and changes entries, each with an Undo. Deleting, budgets and accounts stay yours."));
+    }
 }
 
 /// The message box goes where the middle is: centred on a new thread, at the foot of an open one.
@@ -691,6 +788,7 @@ fn draw_message(v: &View, m: &Value) {
         "error" => {
             let row = label(body["text"].as_str().unwrap_or("Something went wrong"), "threads-error");
             row.set_wrap(true);
+            row.set_max_width_chars(READING_CHARS);
             turn(v).append(&row);
         }
         _ => {}
@@ -723,6 +821,9 @@ fn draw_reply(parent: &gtk::Box, text: &str) {
                 }
                 list.upcast()
             }
+            Block::Code { lang, text } if lang == "chart" && super::chart::price_spec(&text).is_some() => {
+                super::chart::price_card(super::chart::price_spec(&text).expect("checked")).upcast()
+            }
             Block::Code { lang, text } if lang == "chart" && chart_spec(&text).is_some() => {
                 super::chart::card(chart_spec(&text).expect("checked")).upcast()
             }
@@ -731,6 +832,7 @@ fn draw_reply(parent: &gtk::Box, text: &str) {
                 code.set_selectable(true);
                 code.set_wrap(true);
                 code.set_wrap_mode(gtk::pango::WrapMode::Char);
+                code.set_max_width_chars(READING_CHARS);
                 code.upcast()
             }
             Block::Table(rows) => {
@@ -741,6 +843,7 @@ fn draw_reply(parent: &gtk::Box, text: &str) {
                 for (r, row) in rows.iter().enumerate() {
                     for (c, cell) in row.iter().enumerate() {
                         let l = reply_label(cell, if r == 0 { "threads-table-head" } else { "threads-table-cell" });
+                        l.set_max_width_chars((READING_CHARS / row.len().max(1) as i32).max(12));
                         grid.attach(&l, c as i32, r as i32, 1, 1);
                     }
                 }
@@ -756,11 +859,16 @@ fn draw_reply(parent: &gtk::Box, text: &str) {
     }
 }
 
+/// How wide a reply's text grows, in characters: about `COLUMN_WIDTH` less the column's padding.
+/// A wrapped label otherwise asks for its whole text on one line.
+const READING_CHARS: i32 = 68;
+
 fn reply_label(markup: &str, class: &str) -> gtk::Label {
     let l = label("", class);
     l.set_markup(markup);
     l.set_wrap(true);
     l.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    l.set_max_width_chars(READING_CHARS);
     l.set_selectable(true);
     l
 }
@@ -768,11 +876,14 @@ fn reply_label(markup: &str, class: &str) -> gtk::Label {
 /// A tool call: a quiet line saying what the agent did. Its answer may turn it into a card.
 fn draw_tool(parent: &gtk::Box, block: &Value) {
     let name = block["name"].as_str().unwrap_or("").to_string();
+    let op = tool_op(&name).unwrap_or_default();
     let slot = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     line.add_css_class("threads-tool");
-    line.append(&crate::icons::image(if tool_writes(&name) { "check" } else { "search" }, 13));
-    line.append(&label(&tool_caption(&name), "threads-tool-text"));
+    let writes = tool_writes(&name) || super::arbiter::tool_writes(&op);
+    line.append(&crate::icons::image(if writes { "check" } else { "search" }, 13));
+    let caption = super::arbiter::tool_caption(&op).map_or_else(|| tool_caption(&name), str::to_string);
+    line.append(&label(&caption, "threads-tool-text"));
     if let Some(op) = tool_op(&name) {
         line.set_tooltip_text(Some(&op));
     }
@@ -783,13 +894,27 @@ fn draw_tool(parent: &gtk::Box, block: &Value) {
     }
 }
 
-/// A tool's answer: a refusal marks its line; an entry the agent added becomes a card with Undo.
+/// A tool's answer: a refusal marks its line; an entry the agent added becomes a card with Undo;
+/// an Arbiter proposal becomes a card to approve, and an order placed or refused a line.
 fn draw_tool_answer(body: &Value) {
     let Some((slot, name)) = body["tool_use_id"].as_str().and_then(|id| STATE.with(|s| s.tools.borrow().get(id).cloned())) else { return };
+    let op = tool_op(&name).unwrap_or_default();
     if body["is_error"] == true {
         if let Some(line) = slot.first_child() {
             line.add_css_class("threads-tool-failed");
             line.set_tooltip_text(body["text"].as_str());
+        }
+        // An order or a proposal the engine refused says why in the conversation, not a tooltip.
+        if matches!(op.as_str(), "arbiter.order.place" | "arbiter.propose") {
+            slot.append(&super::arbiter::refusal_line(&super::arbiter::refusal_words(body["text"].as_str().unwrap_or("The engine refused it."))));
+        }
+        return;
+    }
+    if op.starts_with("arbiter.") {
+        let Ok(answer) = serde_json::from_str::<Value>(body["text"].as_str().unwrap_or("")) else { return };
+        if let Some(card) = super::arbiter::tool_card(&op, &answer) {
+            clear(&slot);
+            slot.append(&card);
         }
         return;
     }
@@ -1089,10 +1214,50 @@ pub async fn refresh(ui: &Rc<Ui>) {
     refresh_panel(ui);
 }
 
-/// Re-read the Tally panel's view, if it is open.
+/// `arbiter.changed`: re-read the panel when it shows Arbiter.
+pub fn refresh_arbiter_panel(ui: &Rc<Ui>) {
+    if STATE.with(|s| s.source.get()) == "arbiter" {
+        refresh_panel(ui);
+    }
+}
+
+/// Re-read Arbiter's panel view; one source's read never lands on the other's panel.
+fn refresh_arbiter(ui: &Rc<Ui>, v: &View) {
+    let tab = STATE.with(|s| s.arbiter_tab.get());
+    for (key, button) in &v.arbiter_panel_tabs {
+        if *key == tab {
+            button.add_css_class("selected");
+        } else {
+            button.remove_css_class("selected");
+        }
+    }
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let read = super::arbiter::panel_read(&ui, tab).await;
+        if STATE.with(|s| s.source.get() != "arbiter" || s.arbiter_tab.get() != tab) {
+            return;
+        }
+        let Some(v) = view() else { return };
+        clear(&v.panel_body);
+        match read {
+            Ok(value) => super::arbiter::panel_draw(&ui, &v.panel_body, tab, &value),
+            Err(e) => {
+                let l = label(&super::arbiter::said(&e), "money-muted");
+                l.set_wrap(true);
+                v.panel_body.append(&l);
+            }
+        }
+    });
+}
+
+/// Re-read the panel's view, Tally's or Arbiter's, if it is open.
 pub fn refresh_panel(ui: &Rc<Ui>) {
     let Some(v) = view() else { return };
     if !v.panel.is_visible() {
+        return;
+    }
+    if STATE.with(|s| s.source.get()) == "arbiter" {
+        refresh_arbiter(ui, &v);
         return;
     }
     let tab = STATE.with(|s| s.panel_tab.get());
@@ -1110,7 +1275,7 @@ pub fn refresh_panel(ui: &Rc<Ui>) {
         } else {
             ui.call("money.summary", json!({})).await
         };
-        if STATE.with(|s| s.panel_tab.get()) != tab {
+        if STATE.with(|s| s.panel_tab.get() != tab || s.source.get() == "arbiter") {
             return;
         }
         let Some(v) = view() else { return };
@@ -1404,5 +1569,76 @@ fn panel_entries(body: &gtk::Box, page: &Value) {
             list.append(&entry_row(tx, false));
         }
         start = end;
+    }
+}
+
+/// The width of the conversation's column, padding included.
+const COLUMN_WIDTH: i32 = 680;
+
+glib::wrapper! {
+    /// Holds the conversation's column at `COLUMN_WIDTH`, centred, and asks its height for that
+    /// width. A box or a centred column sizes it for a height instead, where wrapped text asks for
+    /// its whole length on one line, and the column runs past the pane under the Tally panel.
+    pub struct ReadingClamp(ObjectSubclass<clamp::Imp>) @extends gtk::Widget, @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
+}
+
+impl ReadingClamp {
+    fn new(child: &impl IsA<gtk::Widget>) -> Self {
+        let clamp: Self = glib::Object::new();
+        child.set_parent(&clamp);
+        clamp
+    }
+}
+
+mod clamp {
+    use super::COLUMN_WIDTH;
+    use gtk::prelude::*;
+    use gtk::subclass::prelude::*;
+    use gtk4 as gtk;
+
+    #[derive(Default)]
+    pub struct Imp;
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for Imp {
+        const NAME: &'static str = "RelayReadingClamp";
+        type Type = super::ReadingClamp;
+        type ParentType = gtk::Widget;
+    }
+
+    impl ObjectImpl for Imp {
+        fn dispose(&self) {
+            while let Some(child) = self.obj().first_child() {
+                child.unparent();
+            }
+        }
+    }
+
+    /// The child's width in `width`: the column's, or less only when its minimum allows.
+    fn fit(child: &gtk::Widget, width: i32) -> i32 {
+        let (min, _, _, _) = child.measure(gtk::Orientation::Horizontal, -1);
+        width.min(COLUMN_WIDTH).max(min)
+    }
+
+    impl WidgetImpl for Imp {
+        fn request_mode(&self) -> gtk::SizeRequestMode {
+            gtk::SizeRequestMode::HeightForWidth
+        }
+
+        fn measure(&self, orientation: gtk::Orientation, for_size: i32) -> (i32, i32, i32, i32) {
+            let Some(child) = self.obj().first_child() else { return (0, 0, -1, -1) };
+            if orientation == gtk::Orientation::Horizontal {
+                let (min, nat, _, _) = child.measure(orientation, -1);
+                return (min, nat.min(COLUMN_WIDTH).max(min), -1, -1);
+            }
+            let (min, nat, _, _) = child.measure(orientation, fit(&child, if for_size < 0 { COLUMN_WIDTH } else { for_size }));
+            (min, nat, -1, -1)
+        }
+
+        fn size_allocate(&self, width: i32, height: i32, _baseline: i32) {
+            let Some(child) = self.obj().first_child() else { return };
+            let w = fit(&child, width);
+            child.size_allocate(&gtk::Allocation::new((width - w).max(0) / 2, 0, w, height), -1);
+        }
     }
 }

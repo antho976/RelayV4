@@ -1,0 +1,27 @@
+[package]
+name = "relay-arbiter"
+description = "Arbiter: rule-based crypto trading and AI trading research on the person's own exchange account (docs/ARBITER.md). Rules, indicators, the backtester, the paper fill simulator and the risk gate as pure functions; the SQLite book and the Coinbase client behind the `engine` feature."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+jiff.workspace = true
+rust_decimal = { version = "1.43", default-features = false, features = ["std", "serde-with-str"] }
+sha2.workspace = true
+rusqlite = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+ureq = { version = "3", optional = true, default-features = false, features = ["rustls", "json"] }
+ring = { version = "0.17", optional = true }
+base64 = { workspace = true, optional = true }
+
+[features]
+default = ["engine"]
+# The SQLite book and the Coinbase client. Off for crates that only need the arbiter.* contract
+# (relay-bus).
+engine = ["dep:rusqlite", "dep:uuid", "dep:ureq", "dep:ring", "dep:base64"]

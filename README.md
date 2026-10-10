@@ -49,6 +49,11 @@ brought in from its own repository and built by the `tally-*` workflows. Its mon
 ported to `crates/relay-money` for the engine, held to the same tests, so the phone and the PC can
 each keep the whole ledger. The plan is [docs/MONEY.md](docs/MONEY.md).
 
+Arbiter sits beside Tally in the Threads space: rule-based crypto trading and AI trading research
+on your own Coinbase account, on paper or live, every order through one risk gate. Its rules,
+backtester and Coinbase client are `crates/relay-arbiter`; the design is
+[docs/ARBITER.md](docs/ARBITER.md).
+
 Open a repository from the sidebar, then add solo agents or a group of
 one or two builders sharing a reviewer. Code can edit the primary checkout or
 an agent worktree. Board, Notes, Skills, Settings, usage and Android device tools

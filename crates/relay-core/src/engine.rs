@@ -522,6 +522,9 @@ pub struct Engine {
     pub(crate) money: std::sync::Mutex<Option<relay_money::ledger::Ledger>>,
     /// Threads (`threads.db` beside the store, opened on first use) and their running agents.
     pub(crate) threads: crate::threads::Hub,
+    /// Arbiter's desk: its book (`arbiter.db`, opened on first use), the exchange and the lock
+    /// orders are placed under.
+    pub(crate) arbiter: crate::arbiter::Desk,
 }
 
 impl Engine {
@@ -563,6 +566,7 @@ impl Engine {
                 skill_refresh: Default::default(),
                 money: Default::default(),
                 threads: Default::default(),
+                arbiter: Default::default(),
             };
             crate::handlers::register_all(&mut engine);
             engine
