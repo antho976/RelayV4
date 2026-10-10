@@ -4,7 +4,11 @@
    (@held_text) for a refusal. Hues are data: a chart's series, a category's badge, an account's
    registration; never words. */
 
-.threads-root, .threads-scroll, .threads-scroll > viewport, .threads-dock-scroll, .threads-dock-scroll > viewport { background: @wall; color: @ink; }
+/* One layer over the page stack, as the board: the stack paints @wall once, and every stack,
+   scrolled window and viewport nested in it would add another translucent @wall, which
+   compounds to opaque over the wallpaper. */
+.threads-root { color: @ink; }
+.threads-root, .threads-root stack, .threads-root scrolledwindow, .threads-root viewport { background: transparent; }
 
 /* The strip: the thread's name as Dev's project pill, and the panel's key lit while it is open. */
 .threads-strip { border-bottom: 0; }
@@ -92,7 +96,7 @@ button.primary.threads-send { min-width: 34px; min-height: 34px; padding: 0; bor
 .threads-notice-text { font-size: 13px; color: @ink; }
 
 /* The Tally panel. */
-.threads-panel { padding: 0 20px 18px; background: @wall; }
+.threads-panel { padding: 0 20px 18px; background: transparent; }
 paned.threads-split > separator { min-width: 1px; margin: 0 -3px; border-left: 3px solid transparent; border-right: 3px solid transparent; background-clip: content-box; background-color: @edge; }
 paned.threads-split > separator:hover { background-color: @line_focus; }
 .threads-panel .view-tabs button { min-height: 28px; }

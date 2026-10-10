@@ -83,6 +83,10 @@ fn request_timeout(op: &str) -> Duration {
         "project.clone" => Duration::from_secs(1800),
         // A new checkout may hydrate large LFS assets after the bounded fetch.
         "session.create" | "worktree.create" | "task.dispatch" => Duration::from_secs(180),
+        // A backtest reads up to two years of candles from the exchange, 350 at a time.
+        "arbiter.backtest" => Duration::from_secs(180),
+        // These wait on the exchange: a key's check, a market sell, cancelling every order.
+        "arbiter.key.set" | "arbiter.flatten" | "arbiter.halt" | "arbiter.refresh" => Duration::from_secs(60),
         _ => Duration::from_secs(30),
     }
 }

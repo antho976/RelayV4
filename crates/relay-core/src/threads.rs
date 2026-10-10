@@ -32,6 +32,9 @@ use std::time::{Duration, Instant};
 /// The ops a thread's agent may call. Reads of the ledger and its investments, and the changes a
 /// card can undo; deleting, budgets, accounts, importing files, room, prices, rates and anything
 /// that replaces the ledger stay the person's.
+/// Arbiter's reads and backtests, its proposals, the kill switch, and orders — which pass the
+/// same risk gate as a rule's and are placed only for a strategy the person lets the AI trade
+/// (docs/ARBITER.md). Keys, strategy edits, limits, restarts and approvals stay the person's.
 pub const AGENT_OPS: &[&str] = &[
     "bus.schema",
     "money.summary",
@@ -44,6 +47,18 @@ pub const AGENT_OPS: &[&str] = &[
     "money.invest.summary",
     "money.invest.list",
     "money.invest.add",
+    "arbiter.summary",
+    "arbiter.strategy.get",
+    "arbiter.order.list",
+    "arbiter.decision.list",
+    "arbiter.products",
+    "arbiter.series",
+    "arbiter.backtest",
+    "arbiter.proposal.list",
+    "arbiter.settings.get",
+    "arbiter.propose",
+    "arbiter.order.place",
+    "arbiter.halt",
 ];
 
 /// Whether a process in a thread agent's tree may call `op` as the person (`peer::Peer::Thread`):
@@ -146,7 +161,25 @@ or repeat a password, a two-factor code, an API key, a social insurance number o
 one is pasted, say it went into this transcript and to Claude, and that they should change it now. \
 A live connection is not built. If asked, explain SnapTrade (free for one person, but it keeps the \
 Wealthsimple login and the portfolio in its cloud) and Wealthsimple's unofficial API (against its \
-terms, and often broken), and that choosing one is the person's call, not something Relay does.";
+terms, and often broken), and that choosing one is the person's call, not something Relay does.
+
+They also have Arbiter (arbiter.*), their crypto trading on Coinbase: strategies made of rules, each on \
+paper (simulated on real prices) or live (real money), each with limits. Amounts there are decimal \
+strings in the product's quote currency (\"50\" is 50 CAD on ETH-CAD). Read arbiter.summary first. Only \
+products arbiter.products lists exist: never name another. You research, backtest and propose; you do \
+not promise returns, and you say plainly when a result is luck-sized (few trades, or worse on the judged \
+part than the tuned part). Your training data may include the market history you backtest: say so for \
+any period before your training cutoff, and prefer conclusions from data after it. To change or add a \
+strategy, call arbiter.propose with the whole draft (name, product, granularity, rule, limits) and why; \
+the person approves it on a card. bus.schema {\"op\": \"arbiter.propose\"} gives the rule's JSON shape. \
+arbiter.order.place places an order only for a strategy whose mode is `agent` (\"AI trades within limits\"); \
+otherwise it becomes a card for the person, and either way the risk gate may refuse it: report the \
+refusal as it is. You may call arbiter.halt when something is going wrong; you cannot restart, change \
+limits, save strategies or approve anything.
+
+To chart a product, write a `chart` block with `type` `price`, a `title`, and `arbiter`: {\"product\", \
+\"granularity\" (ONE_HOUR, ONE_DAY…), \"bars\", optional \"strategy_id\" to mark its trades}. Add \
+`cutoff`: your training cutoff as YYYY-MM-DD, and Relay marks where your memory of the market ends.";
 
 /// The efforts a thread's agent may be given, as `claude --effort` takes them.
 pub const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];

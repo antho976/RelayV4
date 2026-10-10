@@ -1573,7 +1573,7 @@ fn budget_row(
 }
 
 /// A settings row: a mark, what it is over a line about it, and its control at the end.
-fn setting_row(list: &gtk::Box, icon: &str, title: &str, about: &str, control: &impl IsA<gtk::Widget>) {
+pub(super) fn setting_row(list: &gtk::Box, icon: &str, title: &str, about: &str, control: &impl IsA<gtk::Widget>) {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     row.add_css_class("tally-row");
     row.add_css_class("tally-setting");

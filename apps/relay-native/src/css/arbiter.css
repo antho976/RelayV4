@@ -1,0 +1,80 @@
+/* Arbiter (arbiter_pages.rs) in the dev space's tokens, beside Tally's pages: the same cards,
+   strips, rows and sheets (money.css), and the thread page's panel and cards (threads.css).
+   Colour keeps one meaning here: green a live strategy or money in, amber paper (and Dev's
+   waiting), red a loss, a refusal or a halt. Backgrounds stay see-through: only the window's
+   page stack paints @wall. */
+
+/* Pills and lamps: what a strategy is doing, at a glance. */
+.arbiter-pill { padding: 1px 8px; border-radius: 999px; border: 1px solid @edge; background: @wash; color: @secondary; font-size: 11px; font-weight: 600; }
+.arbiter-pill.arbiter-live { color: @live; background: alpha(@live, 0.12); border-color: alpha(@live, 0.35); }
+.arbiter-pill.arbiter-paper { color: @waiting; background: alpha(@waiting, 0.12); border-color: alpha(@waiting, 0.35); }
+.arbiter-pill.arbiter-halted { color: #f0786f; background: alpha(@held, 0.14); border-color: alpha(@held, 0.4); }
+.arbiter-lamp { min-width: 7px; min-height: 7px; border-radius: 4px; background: @ink_dim; }
+.arbiter-lamp.arbiter-live { background: @live; }
+.arbiter-lamp.arbiter-paper { background: @waiting; }
+.arbiter-lamp.arbiter-halted { background: @held; }
+
+/* The pages. */
+.arbiter-connection .money-context.money-over { color: #f0786f; }
+.arbiter-block { padding: 8px 16px 12px; }
+.arbiter-quiet-row { padding: 8px 16px 10px; }
+.arbiter-figure { font-size: 30px; font-weight: 600; letter-spacing: -0.02em; color: @ink; font-feature-settings: "tnum"; }
+.arbiter-stat { font-family: "Geist Mono", monospace; font-size: 14px; color: @ink; font-feature-settings: "tnum"; }
+.arbiter-stat.money-in, .arbiter-td.money-in, .tally-figures.money-in { color: @live; }
+.arbiter-stat.money-over, .arbiter-td.money-over, .tally-figures.money-over { color: #f0786f; }
+.tally-figures.money-ahead { color: @waiting; }
+.arbiter-banner { padding: 10px 12px 10px 16px; border: 1px solid alpha(@held, 0.5); border-radius: 14px; background: alpha(@held, 0.10); color: #f0786f; }
+.arbiter-banner-text { color: #f0786f; font-size: 13px; font-weight: 500; }
+.arbiter-sentence { font-size: 14px; color: @ink; }
+.arbiter-warning { font-size: 12px; color: @waiting; }
+.arbiter-why { font-size: 13px; color: @secondary; }
+.arbiter-log { font-size: 13px; color: @ink; }
+.arbiter-log.money-over { color: #f0786f; }
+.arbiter-limit { padding: 8px 16px; }
+.tally-rows > .arbiter-limit + .arbiter-limit { border-top: 1px solid @line_subtle; }
+.arbiter-limit-row { padding: 6px 16px; }
+.arbiter-proposal-row { padding: 10px 16px; }
+button.arbiter-small { min-height: 28px; padding: 0 12px; }
+
+/* Backtest, paper, live, side by side. */
+.arbiter-th { font-size: 11px; font-weight: 600; letter-spacing: 0.04em; color: @faint; }
+.arbiter-range { font-family: "Geist Mono", monospace; font-size: 10.5px; color: @faint; }
+.arbiter-rowname { font-size: 12.5px; color: @secondary; }
+.arbiter-td { font-family: "Geist Mono", monospace; font-size: 12.5px; color: @ink; font-feature-settings: "tnum"; }
+
+/* Sheets: the editor, Connect Coinbase, and going live. */
+.arbiter-record { margin: 4px 0 6px; }
+.arbiter-golive-limits { padding: 8px 12px; border: 1px solid @edge; border-radius: 12px; background: @slab; }
+button.arbiter-template { padding: 10px 12px; }
+button.arbiter-template.selected { border-color: @line_focus; background: @wash; }
+.arbiter-form-line { min-height: 34px; }
+.arbiter-form-words { font-size: 13px; color: @secondary; }
+.arbiter-sheet spinbutton { min-width: 0; }
+.arbiter-sheet-limits { border: 1px solid @edge; border-radius: 12px; background: @slab; padding: 4px 0; }
+.arbiter-sheet-limits > .tally-row { padding: 6px 12px; }
+.arbiter-steps { padding: 4px 0 6px; }
+.arbiter-step-number { min-width: 22px; min-height: 22px; border-radius: 11px; background: @wash; border: 1px solid @edge; color: @secondary; font-family: "Geist Mono", monospace; font-size: 11px; }
+.arbiter-step { font-size: 13px; color: @ink; }
+entry.arbiter-mono { font-family: "Geist Mono", monospace; font-size: 12px; }
+.arbiter-secret-frame { border: 1px solid @strong; border-radius: 10px; background: @raised; }
+.arbiter-secret-frame:focus-within { border-color: @line_focus; }
+textview.arbiter-secret, textview.arbiter-secret text { background: transparent; color: @ink; font-family: "Geist Mono", monospace; font-size: 11.5px; padding: 6px 8px; }
+.arbiter-results { padding: 12px 14px; border: 1px solid @edge; border-radius: 12px; background: @slab; }
+.arbiter-result { font-size: 13px; color: @ink; }
+
+/* The thread page: the panel's source switch, the message box's source chips, and cards. */
+.threads-sources { margin-top: 2px; }
+.threads-sources button.quiet { min-height: 26px; padding: 0 8px; border-radius: 8px; color: @faint; font-size: 14px; font-weight: 600; }
+.threads-sources button.quiet:hover { color: @ink; background: transparent; }
+.threads-sources button.quiet.selected { color: @ink; }
+button.threads-chip { min-height: 0; padding: 3px 10px; box-shadow: none; }
+button.threads-chip:hover { background: @wash; color: @ink; }
+button.threads-source-chip .threads-dot { background: @ink_dim; }
+button.threads-source-chip.selected { color: @ink; border-color: @line_focus; }
+button.threads-source-chip.selected .threads-dot { background: @live; }
+button.arbiter-panel-row { padding: 7px 4px; min-height: 0; border: 0; border-top: 1px solid @line_subtle; border-radius: 0; background: transparent; box-shadow: none; }
+button.arbiter-panel-row:hover { background: @wash; }
+.arbiter-proposal.arbiter-asking { border-color: alpha(@waiting, 0.45); }
+.arbiter-changes { padding: 2px 0; }
+.arbiter-change { font-size: 13px; color: @ink; }
+.threads-chart-memory { margin-top: 2px; font-size: 10.5px; color: @faint; }

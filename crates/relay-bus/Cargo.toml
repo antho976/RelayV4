@@ -14,5 +14,7 @@ uuid.workspace = true
 thiserror.workspace = true
 # The money.* contract's shapes; without the SQLite ledger.
 relay-money.workspace = true
+# The arbiter.* contract's shapes; without SQLite or the exchange client.
+relay-arbiter.workspace = true
 
 [dev-dependencies]
